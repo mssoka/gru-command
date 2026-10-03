@@ -69,6 +69,9 @@ async function boot(opts: {
   silasOps?: boolean;
   /** Gate selected minion turns before they settle (in-flight assertions). */
   minionPromptGate?: (text: string) => Promise<void> | undefined;
+  /** The health a minion handle reports AFTER its prompt settles — the
+   * fulfilled-but-error outcome both real adapters can produce. */
+  minionTurnHealth?: (text: string) => 'idle' | 'error';
   /** Provider pacing: the bounded retry settlement to report for a
    * delivered directive/re-brief turn. Absent = no interlock. */
   retrySettlement?: (agentId: string) => Promise<RetrySettlement>;
@@ -99,6 +102,7 @@ async function boot(opts: {
     spawns.push({ role, options: options ?? {} });
     if (role === 'perkins') return hybrid.spawner(role, options);
     const id = `agent-${spawns.length}`;
+    let turnHealth: 'idle' | 'error' = 'idle';
     return {
       role,
       id,
@@ -123,6 +127,7 @@ async function boot(opts: {
           const branch = execFileSync('git', ['-C', options.cwd, 'symbolic-ref', '--short', 'HEAD'], { encoding: 'utf-8' }).trim();
           execFileSync('git', ['-C', options.cwd, 'push', '--quiet', 'origin', `HEAD:refs/heads/${branch}`], { stdio: 'ignore' });
         }
+        turnHealth = opts.minionTurnHealth?.(text) ?? 'idle';
       },
       async steer() {},
       async followUp() {},
@@ -130,7 +135,9 @@ async function boot(opts: {
         return () => {};
       },
       health() {
-        return { state: 'idle', lastActivity: null, sessionFile: null };
+        return turnHealth === 'error'
+          ? { state: 'error' as const, lastActivity: null, sessionFile: null, error: 'runtime settled the turn with an in-band error' }
+          : { state: 'idle' as const, lastActivity: null, sessionFile: null };
       },
       async dispose() {
         // The directive route disposes a freshly spawned fallback minion
@@ -228,6 +235,25 @@ function field<T>(json: unknown, key: string): T {
   return (json as Record<string, unknown>)[key] as T;
 }
 
+/** The directive endpoint now records durable intent first and answers 202:
+ * the async turn settles on the request record — poll it deterministically
+ * (no wall-clock sleeps in the assertions themselves). */
+async function awaitDirectiveTerminal(
+  h: { ledger: LedgerApi },
+  requestId: string,
+  timeoutMs = 10_000,
+): Promise<{ state: string; failReason: string | null }> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const row = h.ledger.getDirective(requestId);
+    if (row !== null && (row.state === 'settled' || row.state === 'failed')) {
+      return { state: row.state, failReason: row.failReason };
+    }
+    if (Date.now() > deadline) throw new Error(`directive ${requestId} did not reach a terminal state`);
+    await new Promise((resolveTick) => setTimeout(resolveTick, 20));
+  }
+}
+
 describe('dispatch server (E8)', () => {
   it('rejects unauthenticated and unconfigured access like the board does', async () => {
     const h = await boot();
@@ -273,6 +299,85 @@ describe('dispatch server (E8)', () => {
       const worktreeRows = field<{ branch: string }[]>(wt.json, 'worktrees');
       expect(worktreeRows).toHaveLength(1);
       expect(worktreeRows[0]?.branch).toBe('gru/http-job');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('dispatches a marked completion phase: the intent is durable before the turn, the response still 202s', async () => {
+    const h = await boot();
+    const repo = makeFixtureRepo('fixture-http-handoff');
+    cleanupRepos.push(repo);
+    try {
+      const res = await call(
+        h.port,
+        'POST',
+        '/api/dispatch',
+        {
+          job_id: 'http-marked',
+          repo_path: repo.path,
+          title: 'marked artifact phase',
+          briefing: 'audit only; no commit expected',
+          completion_handoff: { kind: 'gru-decision', decision: 'rule on the audit' },
+        },
+        TOKEN,
+      );
+      expect(res.status).toBe(202);
+      // The guard row exists BEFORE the minion turn completes, bound to the
+      // spawned worker: the completion observer matches on this identity.
+      const phases = h.ledger.listPhaseHandoffs({ jobId: 'http-marked' });
+      expect(phases).toHaveLength(1);
+      expect(phases[0]).toMatchObject({
+        source: 'dispatch',
+        state: 'awaiting',
+        decision: 'rule on the audit',
+      });
+      expect(phases[0]?.minionId).not.toBeNull();
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('refuses a malformed completion_handoff before any job or phase exists', async () => {
+    const h = await boot();
+    try {
+      const badDispatch = await call(
+        h.port,
+        'POST',
+        '/api/dispatch',
+        {
+          job_id: 'http-bad-handoff',
+          repo_path: '/tmp/not-a-repo',
+          title: 't',
+          briefing: 'b',
+          completion_handoff: { kind: 'owner-decision', decision: 'no' },
+        },
+        TOKEN,
+      );
+      expect(badDispatch.status).toBe(400);
+      expect(h.ledger.getJob('http-bad-handoff')).toBeNull();
+
+      h.ledger.addJob({ id: 'http-bad-directive', repo: 'r', title: 't' });
+      h.ledger.setJobStatus('http-bad-directive', 'working');
+      const badDirective = await call(
+        h.port,
+        'POST',
+        '/api/silas/directive',
+        { job_id: 'http-bad-directive', directive: 'x', completion_handoff: { kind: 'gru-decision' } },
+        TOKEN,
+      );
+      expect(badDirective.status).toBe(400);
+      expect(h.ledger.listPhaseHandoffs({ jobId: 'http-bad-directive' })).toHaveLength(0);
+
+      const badRebrief = await call(
+        h.port,
+        'POST',
+        '/api/silas/rebrief',
+        { job_id: 'http-bad-directive', note: 'n', completion_handoff: 'gru' },
+        TOKEN,
+      );
+      expect(badRebrief.status).toBe(400);
+      expect(h.ledger.listPendingRebriefs({ jobId: 'http-bad-directive' })).toHaveLength(0);
     } finally {
       await h.close();
     }
@@ -645,8 +750,12 @@ describe('dispatch server (E8)', () => {
         directive: 'Fix the null deref at src/a.ts and re-run the suite.',
         blocker_fingerprint: 'correctness::src/a.ts::null deref',
       }, TOKEN);
-      expect(res.status).toBe(200);
-      expect(field<string>(res.json, 'minion_id')).toBe(minionId);
+      // Accepted ≠ admitted: 202 reports the durable intent; the turn settles
+      // on the request record (readback) instead of the HTTP response.
+      expect(res.status).toBe(202);
+      const requestId = field<string>(res.json, 'request_id');
+      expect(field<string>(res.json, 'state')).toBe('dispatching');
+      expect((await awaitDirectiveTerminal(h, requestId)).state).toBe('settled');
       const job = h.ledger.getJob('dir-job');
       expect(job?.status).toBe('working');
       expect(job?.note ?? '').toContain('working');
@@ -654,20 +763,86 @@ describe('dispatch server (E8)', () => {
       expect(event).not.toBeNull();
       expect((event?.payload as { blocker_fingerprint?: string }).blocker_fingerprint).toBe('correctness::src/a.ts::null deref');
       // The follow-up delivery signal: the settled directive turn is recorded
-      // as a delivery carrying the lane's head (no-op minion → unchanged head).
+      // as a delivery carrying the lane's head (no-op minion → unchanged head),
+      // correlated to THIS request so it can only settle this one.
       const lane = h.worktrees.listWorktrees({ jobId: 'dir-job' }).find((candidate) => candidate.kind === 'job');
       const head = execFileSync('git', ['-C', lane!.path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
       const delivered = h.ledger.listJobEvents('dir-job').find((candidate) => candidate.kind === 'job.delivered');
       expect(delivered).not.toBeNull();
-      expect(delivered?.payload).toMatchObject({ agentId: minionId, source: 'silas-directive', sha: head });
-      expect(field<string>(res.json, 'delivered_sha')).toBe(head);
+      expect(delivered?.payload).toMatchObject({ agentId: minionId, source: 'silas-directive', sha: head, request_id: requestId });
+      const readback = h.ledger.getDirective(requestId);
+      expect(readback?.deliverySeq).toBe(delivered?.seq);
+      expect(readback?.admissionMinion).toBe(minionId);
     } finally {
       await h.close();
     }
   });
 
-  it('/api/silas/directive answers undelivered (never a delivery) when the bounded retry exhausts', async () => {
-    const h = await boot({ retrySettlement: async () => 'exhausted' });
+  it('/api/silas/directive records admission but NO delivery or phase completion when the turn settles with an in-band error', async () => {
+    const h = await boot();
+    const repo = makeFixtureRepo('fixture-silas-inband-directive');
+    cleanupRepos.push(repo);
+    try {
+      await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'inband-dir', repo_path: repo.path, title: 'error lane', briefing: 'b',
+      }, TOKEN);
+      const minionId = `agent-${h.spawns.length}`;
+      h.ledger.registerAgent({ id: minionId, role: 'minion', jobId: 'inband-dir' });
+      h.liveHandles.set(minionId, {
+        role: 'minion',
+        id: minionId,
+        sessionFile: null,
+        capabilities: FAKE_CAPABILITIES,
+        prompt: async () => {}, // resolves — the failure is in-band health
+        async steer() {},
+        async followUp() {},
+        subscribe: () => () => {},
+        health: () => ({ state: 'error' as const, lastActivity: null, sessionFile: null, error: 'assistant stopReason error' }),
+        async dispose() {},
+      });
+      h.ledger.setJobStatus('inband-dir', 'in-review');
+      const res = await call(h.port, 'POST', '/api/silas/directive', {
+        job_id: 'inband-dir',
+        directive: 'fix it',
+        completion_handoff: { kind: 'gru-decision', decision: 'never owed by a failed turn' },
+      }, TOKEN);
+      expect(res.status).toBe(202);
+      const requestId = field<string>(res.json, 'request_id');
+      // The turn settled with an error: the request is admitted with a
+      // durable reconcile note and NEVER records a delivery.
+      const deadline = Date.now() + 10_000;
+      while ((h.ledger.getDirective(requestId)?.failReason ?? '').indexOf('in-band runtime error') === -1 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      const readback = h.ledger.getDirective(requestId);
+      expect(readback?.state).toBe('admitted');
+      expect(readback?.deliverySeq).toBeNull();
+      expect(readback?.failReason).toContain('in-band runtime error');
+      // The creation dispatch legitimately recorded its own delivery; the
+      // failed directive turn must not add a REQUEST-sourced delivery.
+      expect(h.ledger.listJobEvents('inband-dir').some((event) =>
+        event.kind === 'job.delivered' && (event.payload as { source?: string }).source === 'silas-directive',
+      )).toBe(false);
+      expect(h.ledger.latestJobEvent('inband-dir', 'job.minion-error')).not.toBeNull();
+      // The marked phase stays awaiting — never completed, never published.
+      const phase = h.ledger.listPhaseHandoffs({ jobId: 'inband-dir' })[0];
+      expect(phase?.state).toBe('awaiting');
+      expect(phase?.completionSeq).toBeNull();
+      expect(h.ledger.getJob('inband-dir')?.status).toBe('in-review'); // no false working flip
+      expect(
+        h.ledger.listNotifications({ limit: 200 }).filter((row) => row.kind.includes('phase-handback')),
+      ).toHaveLength(0);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('/api/silas/directive keeps a superseded post-prompt turn LIVE for reconciliation (never a no-effect failure)', async () => {
+    // The pre-prompt interlock is clean; the retry is superseded AFTER the
+    // prompt call — admission is UNKNOWN, not a no-effect failure (r5
+    // blocker 2).
+    let settleCalls = 0;
+    const h = await boot({ retrySettlement: async () => (++settleCalls === 1 ? 'none' : 'superseded') });
     const repo = makeFixtureRepo('fixture-silas-directive-settle');
     cleanupRepos.push(repo);
     try {
@@ -693,12 +868,68 @@ describe('dispatch server (E8)', () => {
         job_id: 'dir-settle',
         directive: 'Fix the retry settlement path.',
       }, TOKEN);
-      expect(res.status).toBe(502);
-      expect(field<string>(res.json, 'error')).toBe('undelivered');
+      expect(res.status).toBe(202);
+      const requestId = field<string>(res.json, 'request_id');
+      // The reconcile note lands; the request stays dispatching (live).
+      const deadline = Date.now() + 10_000;
+      while (!(h.ledger.getDirective(requestId)?.failReason ?? '').includes('unknown admission') && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      const readback = h.ledger.getDirective(requestId);
+      expect(readback?.state).toBe('dispatching');
+      expect(readback?.failReason).toContain('unknown admission');
+      expect(readback?.failReason).toContain('superseded');
+      // The single-writer guard holds: a different request id is refused.
+      const blocked = await call(h.port, 'POST', '/api/silas/directive', {
+        job_id: 'dir-settle', directive: 'different work', request_id: 'req-other',
+      }, TOKEN);
+      expect(blocked.status).toBe(409);
       expect(h.ledger.listJobEvents('dir-settle').some((event) => event.kind === 'silas.directive-sent')).toBe(false);
       // The creation dispatch legitimately recorded its own delivery; the
       // request must not add a REQUEST-sourced delivery on top of it.
       expect(h.ledger.listJobEvents('dir-settle').some((event) =>
+        event.kind === 'job.delivered' && (event.payload as { source?: string }).source === 'silas-directive',
+      )).toBe(false);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('/api/silas/directive keeps a FRESH-minion post-prompt supersession LIVE too', async () => {
+    // No live handle is registered: the route spawns a fresh minion, prompts
+    // it, and only then learns the retry was superseded. Admission is
+    // UNKNOWN — the request stays live on the fresh path as well.
+    const h = await boot({ retrySettlement: async () => 'superseded' });
+    const repo = makeFixtureRepo('fixture-silas-directive-fresh-settle');
+    cleanupRepos.push(repo);
+    try {
+      await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'dir-fresh', repo_path: repo.path, title: 'fresh settle lane', briefing: 'b',
+      }, TOKEN);
+      // Let the initial dispatch turn settle before the directive starts.
+      const firstTurnDeadline = Date.now() + 10_000;
+      while (h.ledger.latestJobEvent('dir-fresh', 'job.delivered') === null && Date.now() < firstTurnDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      h.ledger.setJobStatus('dir-fresh', 'in-review');
+      const res = await call(h.port, 'POST', '/api/silas/directive', {
+        job_id: 'dir-fresh',
+        directive: 'Fix under fresh supersession.',
+      }, TOKEN);
+      expect(res.status).toBe(202);
+      const requestId = field<string>(res.json, 'request_id');
+      const deadline = Date.now() + 10_000;
+      while (!(h.ledger.getDirective(requestId)?.failReason ?? '').includes('unknown admission') && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      const readback = h.ledger.getDirective(requestId);
+      expect(readback?.state).toBe('dispatching');
+      expect(readback?.failReason).toContain('superseded');
+      const blocked = await call(h.port, 'POST', '/api/silas/directive', {
+        job_id: 'dir-fresh', directive: 'different work', request_id: 'req-other',
+      }, TOKEN);
+      expect(blocked.status).toBe(409);
+      expect(h.ledger.listJobEvents('dir-fresh').some((event) =>
         event.kind === 'job.delivered' && (event.payload as { source?: string }).source === 'silas-directive',
       )).toBe(false);
     } finally {
@@ -794,6 +1025,46 @@ describe('dispatch server (E8)', () => {
     }
   });
 
+  it('/api/silas/rebrief keeps the markers and records NO delivery or phase completion when the turn settles with an in-band error', async () => {
+    const h = await boot({ minionTurnHealth: (text) => (text.startsWith('Re-brief —') ? 'error' : 'idle') });
+    const repo = makeFixtureRepo('fixture-silas-inband-rebrief');
+    cleanupRepos.push(repo);
+    try {
+      const dispatch = await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'inband-rebrief', repo_path: repo.path, title: 'stuck lane', briefing: 'the original contract',
+      }, TOKEN);
+      expect(dispatch.status).toBe(202);
+      // Let the initial (healthy) briefing turn settle first.
+      const firstTurnDeadline = Date.now() + 10_000;
+      while (h.ledger.latestJobEvent('inband-rebrief', 'job.delivered') === null && Date.now() < firstTurnDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const res = await call(h.port, 'POST', '/api/silas/rebrief', {
+        job_id: 'inband-rebrief',
+        note: 'same blocker; try differently',
+        completion_handoff: { kind: 'gru-decision', decision: 'never owed by a failed turn' },
+      }, TOKEN);
+      expect(res.status, JSON.stringify(res.json)).toBe(202);
+      expect(field<string>(res.json, 'state')).toBe('turn-error');
+      // No guarded events landed: the marker pair stays pending for the
+      // boot recovery ladder, and the marked phase stays awaiting.
+      expect(h.ledger.listPendingRebriefs({ jobId: 'inband-rebrief' })).toHaveLength(2);
+      expect(h.ledger.latestJobEvent('inband-rebrief', 'silas.rebrief')).toBeNull();
+      expect(
+        h.ledger.listJobEvents('inband-rebrief').filter((event) => event.kind === 'job.delivered'),
+      ).toHaveLength(1); // the initial dispatch delivery only — no failed-turn delivery
+      expect(h.ledger.latestJobEvent('inband-rebrief', 'job.minion-error')).not.toBeNull();
+      const phase = h.ledger.listPhaseHandoffs({ jobId: 'inband-rebrief' })[0];
+      expect(phase?.state).toBe('awaiting');
+      expect(phase?.completionSeq).toBeNull();
+      expect(
+        h.ledger.listNotifications({ limit: 200 }).filter((row) => row.kind.includes('phase-handback')),
+      ).toHaveLength(0);
+    } finally {
+      await h.close();
+    }
+  });
+
   it('/api/silas/rebrief persists request markers before the worker and clears them only when the events land', async () => {
     let releasePrompt!: () => void;
     const gate = new Promise<void>((resolveGate) => {
@@ -846,18 +1117,23 @@ describe('dispatch server (E8)', () => {
     }
   });
 
-  it('/api/silas/directive on a lane with no reachable minion answers 502 undelivered; terminal jobs refuse', async () => {
+  it('/api/silas/directive on a lane with no reachable minion records a durable no-effect FAILURE; terminal jobs refuse', async () => {
     const h = await boot();
     const repo = makeFixtureRepo('fixture-silas-undelivered');
     cleanupRepos.push(repo);
     try {
-      // a job row with no lane at all
+      // a job row with no lane at all: accepted durably, then the turn has a
+      // POSITIVE no-effect proof (no live minion, no lane) → failed, honestly.
       h.ledger.addJob({ id: 'ghost-job', repo: 'nowhere', title: 't', briefing: 'b' });
       const res = await call(h.port, 'POST', '/api/silas/directive', {
         job_id: 'ghost-job', directive: 'fix it',
       }, TOKEN);
-      expect(res.status).toBe(502);
-      expect(field<string>(res.json, 'error')).toBe('undelivered');
+      expect(res.status).toBe(202);
+      const requestId = field<string>(res.json, 'request_id');
+      const terminal = await awaitDirectiveTerminal(h, requestId);
+      expect(terminal.state).toBe('failed');
+      expect(terminal.failReason).toContain('no implementing minion session and no job lane');
+      expect(h.ledger.latestJobEvent('ghost-job', 'silas.directive-failed')).not.toBeNull();
       // terminal jobs take no directives
       h.ledger.addJob({ id: 'done-job', repo: 'nowhere', title: 't', briefing: 'b' });
       h.ledger.setJobStatus('done-job', 'working');
@@ -919,8 +1195,13 @@ describe('dispatch server (E8)', () => {
       const noop = await call(h.port, 'POST', '/api/silas/directive', {
         job_id: 'fresh-noop', directive: 'fix it',
       }, TOKEN);
-      expect(noop.status).toBe(200);
-      expect(field<string>(noop.json, 'delivered_sha')).toBe(noopHead);
+      expect(noop.status).toBe(202);
+      const noopRequest = field<string>(noop.json, 'request_id');
+      expect((await awaitDirectiveTerminal(h, noopRequest)).state).toBe('settled');
+      const noopDelivered = h.ledger
+        .listJobEvents('fresh-noop')
+        .find((candidate) => candidate.kind === 'job.delivered');
+      expect((noopDelivered?.payload as { sha?: string }).sha).toBe(noopHead);
       expect((await digestOf()).prWithoutReview).toEqual([]);
 
       // (B) a directive whose fallback minion committed: the delivery head
@@ -936,8 +1217,13 @@ describe('dispatch server (E8)', () => {
       const moved = await call(h.port, 'POST', '/api/silas/directive', {
         job_id: 'fresh-moved', directive: 'fix the real thing',
       }, TOKEN);
-      expect(moved.status).toBe(200);
-      const movedSha = field<string>(moved.json, 'delivered_sha');
+      expect(moved.status).toBe(202);
+      const movedRequest = field<string>(moved.json, 'request_id');
+      expect((await awaitDirectiveTerminal(h, movedRequest)).state).toBe('settled');
+      const movedDelivered = h.ledger
+        .listJobEvents('fresh-moved')
+        .find((candidate) => candidate.kind === 'job.delivered');
+      const movedSha = (movedDelivered?.payload as { sha?: string }).sha as string;
       expect(movedSha).not.toBe(reviewedHead);
       expect(movedSha).toBe(headOf(movedLane.path));
       const digest = await digestOf();
@@ -963,11 +1249,13 @@ describe('dispatch server (E8)', () => {
       const res = await call(h.port, 'POST', '/api/silas/directive', {
         job_id: 'dir-fresh', directive: 'Fix the dead lane and re-run the suite.',
       }, TOKEN);
-      expect(res.status).toBe(200);
+      expect(res.status).toBe(202);
+      const requestId = field<string>(res.json, 'request_id');
+      expect((await awaitDirectiveTerminal(h, requestId)).state).toBe('settled');
       const fresh = h.spawns[spawnsBefore];
       expect(fresh?.role).toBe('minion');
       expect(fresh?.options.cwd).toBe(lane?.path);
-      expect(field<string>(res.json, 'minion_id')).toBe(`agent-${h.spawns.length}`);
+      expect(h.ledger.getDirective(requestId)?.admissionMinion).toBe(`agent-${h.spawns.length}`);
       expect(h.disposedHandles).toContain(`agent-${h.spawns.length}`);
     } finally {
       await h.close();
@@ -1066,8 +1354,17 @@ describe('provider pacing worker-gate pass-through on the silas routes (r4 verif
       expect(h.ledger.listJobEvents('gate-dir').some((event) => event.kind === 'silas.directive-sent')).toBe(false);
       holder.release();
       const res = await pending;
-      expect(res.status).toBe(200);
+      // Accepted ≠ admitted (PR136 durable-intent contract): the 202 is the
+      // durable acceptance; the queued turn is admitted on release and its
+      // correlated events land on the request record / lane.
+      expect(res.status).toBe(202);
       expect(field<string>(res.json, 'job_id')).toBe('gate-dir');
+      const gateRequestId = field<string>(res.json, 'request_id');
+      const admitDeadline = Date.now() + 10_000;
+      while (h.ledger.getDirective(gateRequestId)?.state !== 'settled' && Date.now() < admitDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      expect(h.ledger.getDirective(gateRequestId)?.state).toBe('settled');
       expect(h.ledger.listJobEvents('gate-dir').some((event) => event.kind === 'silas.directive-sent')).toBe(true);
       expect(gate.view().worker).toMatchObject({ running: 0, queued: [] });
     } finally {

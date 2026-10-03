@@ -33,7 +33,8 @@ import {
 import { claimProviderRecoveryContinuation } from './provider-recovery/resume.js';
 import { GhCliApi, GitHubSignalPoll, type LaneRemoteResolver } from './dispatch/github-poll.js';
 import { routeFixDirectiveToMinion } from './dispatch/fix-directive.js';
-import { reconcilePendingRebriefs } from './dispatch/rebrief-recovery.js';
+import { reconcilePendingRebriefs, reconcilePendingDirectives } from './dispatch/rebrief-recovery.js';
+import { adoptBlockedLanes, observeFollowUpDelivery, observePhaseCompletion, reconcilePhaseHandoffs, reconcileUnmarkedHandbacks } from './dispatch/obligations.js';
 import { createDispatchServer } from './dispatch/server.js';
 import { createVerificationServer } from './verify/server.js';
 import type { VerificationQueueView } from './verify/scheduler.js';
@@ -619,6 +620,40 @@ async function main(): Promise<number> {
     onNeedsOwner: (notification) => surfaceInChat(notification),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
+  // Durable follow-through observers: (a) an explicitly marked bounded
+  // phase whose VALIDATED correlated completion landed records the owed
+  // Gru decision durably (one obligation + one stable-kind action-required
+  // hand-back on the existing wake path, even with no head move and on a
+  // NONblocked lane); (b) the legacy blocked-only hand-back stays for
+  // unmarked silas deliveries. Registered before boot recovery so
+  // recovered deliveries are observed too. Observer failures are logged,
+  // never bus-breaking.
+  bus.subscribe((event) => {
+    try {
+      observePhaseCompletion(
+        { ledger, notifications, log: (level, msg, fields) => logger.log(level, msg, fields) },
+        event,
+      );
+    } catch (error) {
+      logger.log('error', 'phase-completion observer failed', {
+        kind: event.kind,
+        job: event.jobId,
+        error: String(error),
+      });
+    }
+    try {
+      observeFollowUpDelivery(
+        { ledger, notifications, log: (level, msg, fields) => logger.log(level, msg, fields) },
+        event,
+      );
+    } catch (error) {
+      logger.log('error', 'follow-through observer failed', {
+        kind: event.kind,
+        job: event.jobId,
+        error: String(error),
+      });
+    }
+  });
   const decisionRuntime = new DecisionRuntime(config.decisions, {
     instanceDir: config.instanceDir,
     env: decisionEnvironment,
@@ -1052,6 +1087,69 @@ async function main(): Promise<number> {
       completed: rebriefRecovery.completed,
       redispatched: rebriefRecovery.redispatched,
     });
+  }
+  // Directive-request restart safety (phase 3): a request accepted before
+  // the crash reconciles from correlated evidence when it exists; when
+  // admission or the terminal receipt is UNKNOWN, one bounded escalation
+  // names it for a Gru reconciliation — never an automatic retry
+  // (admission-unknown is not no-effect proof).
+  const directiveRecovery = reconcilePendingDirectives({
+    ledger,
+    notifications,
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  if (directiveRecovery.examined > 0) {
+    logger.info('directive reconciliation', {
+      examined: directiveRecovery.examined,
+      completed: directiveRecovery.completed,
+      escalated: directiveRecovery.escalated,
+    });
+  }
+  // Explicit phase-handoff restart safety (pr136-chief-handoff): closes
+  // crash windows after the correlated delivery commit and before/after
+  // the obligation write and the notification publication. Runs AFTER the
+  // directive/rebrief reconcilers so recovered admissions are visible;
+  // bounded, idempotent, no re-dispatch, no new daemon.
+  const phaseRecovery = reconcilePhaseHandoffs({
+    ledger,
+    notifications,
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  if (phaseRecovery.examined > 0) {
+    logger.info('phase handoff reconciliation', {
+      examined: phaseRecovery.examined,
+      completed: phaseRecovery.completed,
+      published: phaseRecovery.published,
+      closed: phaseRecovery.closed,
+    });
+  }
+  // Unmarked blocked-phase hand-backs (the legacy event-sequence identity):
+  // the boot backstop for the two windows the live observer cannot cover —
+  // a delivery that committed before the observer ran, and an obligation
+  // that committed before its card posted. One stable-kind machine card is
+  // the recovery; nothing re-dispatches, nothing rings the owner.
+  const unmarkedRecovery = reconcileUnmarkedHandbacks({
+    ledger,
+    notifications,
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  if (unmarkedRecovery.deliveries > 0 || unmarkedRecovery.published > 0) {
+    logger.info('unmarked follow-through reconciliation', {
+      deliveries: unmarkedRecovery.deliveries,
+      recovered: unmarkedRecovery.recovered,
+      published: unmarkedRecovery.published,
+    });
+  }
+  // Conservative migration of pre-existing blocked lanes: triage owed to
+  // Gru for lanes with NO obligation history; lanes the live system
+  // already tracks (active or settled) are left exactly as they are.
+  const adoption = adoptBlockedLanes({
+    ledger,
+    notifications,
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  if (adoption.adopted > 0) {
+    logger.info('blocked-lane triage adoption', { scanned: adoption.scanned, adopted: adoption.adopted });
   }
   const bobSlot = supervisorLive.declareSlot({
     id: 'bob-consolidator',
