@@ -50,7 +50,9 @@ mechanical reactions are YOURS — execute them without asking:
 - **One standing gate (freeze-r1).** Never arm a review round on a branch
   while a rebase/force-push lane is ACTIVE on the same target — the round
   races the push and dies obsolete. Wait for the lane delivery (and its
-  push) to settle, then arm. If you cannot tell whether the lane is still
+  push) to settle and for any unresolved re-brief request to finalize or
+  be recovered (a delivery alone does not clear that fence), then arm. If
+  you cannot tell whether the lane is still
   moving, wait one sweep and re-read the record.
 - **Novel failures are not yours to improvise around.** Name what you saw
   with pointers and escalate to the chief; the chief rules, merges, or

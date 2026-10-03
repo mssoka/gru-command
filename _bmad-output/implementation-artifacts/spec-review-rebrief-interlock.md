@@ -90,6 +90,8 @@ Seams owned elsewhere (read-only here):
 
 ## Verification
 
+> **Superseded operational expectations (2026-10-03, phase pr144-followup14-feedback).** The command list below is the ORIGINAL planning text, kept as history; the shipped coverage differs in counts and scopes. Actual shipped coverage at this phase: `test/branch-idle-guard.test.ts` 21 cases (marker unit fence incl. blocked/parked/done rows; arm refusal with late delivery and one-marker-left; freeze race; queued-handoff replay; deferred failing-pre-flight normal + replay; real-finalizer settlement release; held blocked/parked replay; foreign-marker branch isolation; forced fallback admission with exact `['arm','arm']` audit phases; default-reviewer worker-admission and inter-round boundary aborts; missing-lane fail-closed), `test/silas-driver.test.ts` adds the digest first/moved-head and clean-abort fence cases, plus the split report-shape cases and the dispatch-server attribution split in the declared scopes (`review-rebrief-r1-repair`, `whole-review-report-shape`). Fail-before evidence binds through the declared `rebrief-interlock-baseline` scope; its manifest comment records the actual pinned blob (the historical `28779fe` pin ran a pre-integration test blob, not the shipped file). The forced-fallback audit shape is `arm,arm` (fallback re-enters the arm guard) versus the native `arm,freeze`.
+
 **Commands (ops schedules via `/api/verify`; this lane does not run product checks — global scheduler pacing FULL783ac932):**
 - `npx vitest run test/branch-idle-guard.test.ts test/silas-driver.test.ts` — expected: the 6 new cases fail on baseline (`laneIsBusy` ignores markers; digest offers fenced targets), pass at the lane head.
 - `npm run lint && npm run typecheck` — expected clean.

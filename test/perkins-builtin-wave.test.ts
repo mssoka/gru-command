@@ -94,16 +94,29 @@ class DeferredReviewPort implements WorktreePort {
  * git-ops are local), and the job repo's `origin` remote is added exactly
  * as before. Callers that omit the flag keep the historical three-process
  * shape byte-for-byte (phase pr144-t4-second-cost-diagnosis-20261002). */
-function attachOrigin(repo: FixtureRepo, branch: string, root: string, opts?: { readonly batched?: boolean }): void {
+function attachOrigin(repo: FixtureRepo, branch: string, root: string, opts?: { readonly batched?: boolean }): string {
   const origin = join(root, 'origin.git');
   if (opts?.batched === true) {
     execFileSync('git', ['clone', '--bare', '--quiet', repo.path, origin], { stdio: 'ignore' });
     repo.git(['remote', 'add', 'origin', origin]);
+    // Actual equivalence pin (phase pr144-followup14-feedback): the batched
+    // bare must carry refs/heads/<branch> at the intended fixture target —
+    // the same tip the historical init+push shape produces. The extra inert
+    // state a clone carries (source HEAD, bare config, stale refs/heads/main)
+    // is never read by the flow and is deliberately not asserted.
+    const intended = repo.git(['rev-parse', `refs/heads/${branch}`]);
+    const batched = repo.git(['rev-parse', `refs/heads/${branch}`], origin);
+    if (batched.toLowerCase() !== intended.toLowerCase()) {
+      throw new Error(
+        `batched origin refs/heads/${branch} (${batched}) does not match the fixture target (${intended})`,
+      );
+    }
   } else {
     execFileSync('git', ['init', '--bare', '--quiet', origin], { stdio: 'ignore' });
     repo.git(['remote', 'add', 'origin', origin]);
     repo.git(['push', '--quiet', 'origin', `refs/heads/${branch}`]);
   }
+  return origin;
 }
 
 /** Loose-ref fast path (phase pr144-completion-cycle-20261002): the git

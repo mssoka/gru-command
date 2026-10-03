@@ -35,7 +35,7 @@ import type { WorktreeLane } from './worktree-port.js';
  * terminal job must not block an unrelated review or resurrect the job.
  */
 
-export const BRANCH_BUSY_HINT = 'wait for lane delivery or dispatch with force';
+export const BRANCH_BUSY_HINT = 'wait for lane delivery or re-brief request settlement, or dispatch with force';
 
 /** Statuses whose lane may be mid-flight (dispatched = the lane is about to
  * be created and pushed; working = the attempt is open). */

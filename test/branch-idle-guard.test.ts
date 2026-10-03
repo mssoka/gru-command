@@ -8,7 +8,10 @@ import type { AddressInfo } from 'node:net';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi, type EventRecord, type JobRecord, type JobStatus, type PendingRebriefRecord } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
-import { DEFAULT_SILAS_CONFIG, loadConfig } from '../src/config.js';
+import { DEFAULT_SILAS_CONFIG, loadConfig, type Role } from '../src/config.js';
+import type { SpawnOptions } from '../src/runtime/types.js';
+import type { PacingGate } from '../src/runtime/pacing.js';
+import type { FallbackFinding } from '../src/dispatch/review-path.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { DispatchService } from '../src/dispatch/service.js';
 import { WaveRunner } from '../src/dispatch/perkins.js';
@@ -95,6 +98,8 @@ interface Harness {
   readonly fallbackRuns: number[];
   /** Escalation lines raised by the wave (held-handoff and gate audits). */
   readonly escalations: string[];
+  /** Every spawner invocation (role + cwd) the wave attempted. */
+  readonly spawnCalls: { readonly role: string; readonly cwd: string | undefined }[];
   close(): Promise<void>;
 }
 
@@ -103,6 +108,14 @@ async function boot(opts: {
   onPreflight?: () => void | Promise<void>;
   /** The pre-flight resolves as FAILED (routes to the fallback gate). */
   preflightFails?: boolean;
+  /** Per-iteration findings for the custom fallback double (default []). */
+  onFallbackReview?: (iteration: number) => readonly FallbackFinding[];
+  /** Called when the gate routes a fix directive (between rounds). */
+  onFixDirective?: () => void;
+  /** Use the production default fallback reviewer (no custom runFallbackReview). */
+  fallbackDefault?: boolean;
+  /** Worker-turn admission gate forwarded to the wave (default reviewer path). */
+  workerGate?: PacingGate;
 } = {}): Promise<Harness> {
   const dir = mkdtempSync(join(tmpdir(), 'gru-command-branch-idle-'));
   cleanupDirs.push(dir);
@@ -120,7 +133,9 @@ async function boot(opts: {
   const basePort = new InMemoryWorktreePort(join(dir, 'wtroot'));
   const worktrees: WorktreePort =
     opts.onReviewLane !== undefined ? new HookedWorktreePort(basePort, opts.onReviewLane) : basePort;
-  const spawner = async (): Promise<never> => {
+  const spawnCalls: { role: Role; cwd: string | undefined }[] = [];
+  const spawner = async (role: Role, options?: SpawnOptions): Promise<never> => {
+    spawnCalls.push({ role, cwd: options?.cwd });
     throw new Error('the review spawner is not reachable in branch-idle tests');
   };
   const dispatch = new DispatchService({ ledger, worktrees, spawner });
@@ -143,12 +158,20 @@ async function boot(opts: {
     prHeadProbe: originHeadProbe(),
     fallbackGate: {
       skillPath: fallbackSkill,
-      runFallbackReview: async () => {
-        fallbackRuns.push(1);
-        return [];
+      ...(opts.fallbackDefault === true
+        ? {}
+        : {
+            runFallbackReview: async (input) => {
+              fallbackRuns.push(1);
+              return opts.onFallbackReview?.(input.iteration) ?? [];
+            },
+          }),
+      fixDirectiveSink: async () => {
+        opts.onFixDirective?.();
+        return { delivered: true as const };
       },
-      fixDirectiveSink: async () => ({ delivered: true as const }),
     },
+    ...(opts.workerGate !== undefined ? { workerGate: opts.workerGate } : {}),
     ...(opts.onPreflight !== undefined || opts.preflightFails === true
       ? {
           reviewPreflight: async () => {
@@ -197,6 +220,7 @@ async function boot(opts: {
     artifactRoot,
     fallbackRuns,
     escalations,
+    spawnCalls,
     close: async () => {
       await new Promise<void>((resolveClose) => http.close(() => resolveClose()));
       await wave.shutdown();
@@ -560,6 +584,9 @@ describe('branch-idle guard', () => {
       ['delivered-pending', [start, delivery]],
       ['in-review-pending', [start, delivery, toInReview]],
       ['merged-pending', [start, delivery, toInReview, toMerged]],
+      ['blocked-pending', [start]],
+      ['parked-pending', [start]],
+      ['done-pending', [start, delivery, toInReview]],
       ['settled', [start, delivery]],
     ]);
     const pending = new Map<string, PendingRebriefRecord[]>([
@@ -568,6 +595,11 @@ describe('branch-idle guard', () => {
       // Only one of the two guarded markers remains — still unresolved.
       ['in-review-pending', [pendingMarker('in-review-pending', 'job.delivered')]],
       ['merged-pending', [pendingMarker('merged-pending')]],
+      // Recoverable side-states were never busy without a marker; the
+      // resolved request is what fences them now.
+      ['blocked-pending', [pendingMarker('blocked-pending')]],
+      ['parked-pending', [pendingMarker('parked-pending')]],
+      ['done-pending', [pendingMarker('done-pending')]],
     ]);
     const ledger = {
       listJobs: () => [
@@ -575,6 +607,9 @@ describe('branch-idle guard', () => {
         jobRecord('delivered-pending', 'delivered'),
         jobRecord('in-review-pending', 'in-review'),
         jobRecord('merged-pending', 'merged'),
+        jobRecord('blocked-pending', 'blocked'),
+        jobRecord('parked-pending', 'parked'),
+        jobRecord('done-pending', 'done'),
         jobRecord('settled', 'delivered'),
       ],
       latestJobEvent: (jobId: string, kind: string): EventRecord | null =>
@@ -592,6 +627,11 @@ describe('branch-idle guard', () => {
     expect(busy('settled')).toBe(false);
     // A stale marker on a terminal job must not resurrect it as a blocker.
     expect(busy('merged-pending')).toBe(false);
+    // Recoverable side-states are marker-fenced (they carry no attempt);
+    // terminal `done` keeps the terminal short-circuit even with a marker.
+    expect(busy('blocked-pending')).toBe(true);
+    expect(busy('parked-pending')).toBe(true);
+    expect(busy('done-pending')).toBe(false);
   });
 
   it('a pending re-brief refuses the arm before preflight; a late delivery and a partial marker set cannot clear it', async () => {
@@ -986,14 +1026,134 @@ describe('branch-idle guard', () => {
       expect(forced.json).toMatchObject({ route: 'bmad-review-fallback', skill_installed: true });
       await passed;
       expect(h.fallbackRuns).toHaveLength(1);
+      // Exact audit shape: the fallback route re-enters the arm-phase guard
+      // (intake + post-pre-flight) — two `arm` override records, where the
+      // native route records `arm` + `freeze` (pinned in the sibling case).
       const forcedEvents = h.ledger
         .listJobEvents('fallback-force')
         .filter((event) => event.kind === 'branch-idle.forced');
-      expect(forcedEvents.length).toBeGreaterThan(0);
-      expect((forcedEvents[0]?.payload as { phase?: string }).phase).toBe('arm');
-      expect((forcedEvents[0]?.payload as { blockers?: unknown[] }).blockers).toHaveLength(1);
+      expect(
+        forcedEvents.map((event) => (event.payload as { phase?: string }).phase),
+      ).toEqual(['arm', 'arm']);
+      for (const event of forcedEvents) {
+        expect((event.payload as { blockers?: readonly unknown[] }).blockers).toHaveLength(1);
+        expect((event.payload as { forced?: boolean }).forced).toBe(true);
+      }
       expect(h.ledger.listJobEvents('fallback-force').some((event) => event.kind === 'branch-idle.refused')).toBe(true);
     } finally {
+      await h.close();
+    }
+  });
+
+  it('a re-brief admitted between fallback rounds stops the gate before the next reviewer', async () => {
+    const repo = makeFixtureRepo('branch-idle-fallback-interround');
+    cleanupRepos.push(repo);
+    let admitted = false;
+    const h = await boot({
+      preflightFails: true,
+      onFallbackReview: (iteration) =>
+        iteration === 1
+          ? [{
+              title: 'Release-safety blocker',
+              category: 'correctness',
+              location: 'src/a.ts',
+              evidence: 'return 1;',
+              detail: 'The change breaks the contract.',
+            }]
+          : [],
+      onFixDirective: () => {
+        if (!admitted) {
+          admitted = true;
+          h.ledger.beginPendingRebrief({ jobId: 'fallback-interround', note: 'n', briefing: 'b' });
+        }
+      },
+    });
+    try {
+      await createLaneJob(h, repo, { jobId: 'fallback-interround', status: 'delivered' });
+      const abortedPromise = joinJobEvent(
+        h,
+        'fallback-interround',
+        'job.fallback-review',
+        (event) => (event.payload as { phase?: string }).phase === 'aborted',
+      );
+      const review = await postReview(h, { job_id: 'fallback-interround' });
+      expect(review.status).toBe(202);
+      const aborted = await abortedPromise;
+      expect(aborted.payload).toMatchObject({ phase: 'aborted', iteration: 2, clearToMerge: false });
+      expect(String((aborted.payload as { reason?: string }).reason)).toContain('re-brief');
+      // Round 1 ran; round 2 never reached its diff intake or reviewer.
+      expect(h.fallbackRuns).toHaveLength(1);
+      expect(h.escalations.some((line) => line.includes('ABORTED'))).toBe(true);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a re-brief landing in the default reviewer worker-gate wait stops the gate before the spawn', async () => {
+    const repo = makeFixtureRepo('branch-idle-fallback-lease');
+    cleanupRepos.push(repo);
+    const entered = deferred();
+    const leaseGate = deferred();
+    const workerGate = {
+      acquireWorkerTurn: async () => {
+        entered.release();
+        await leaseGate.promise;
+        return { release: () => {}, waitedMs: 0 };
+      },
+    } as unknown as PacingGate;
+    const h = await boot({ preflightFails: true, fallbackDefault: true, workerGate });
+    try {
+      await createLaneJob(h, repo, { jobId: 'fallback-lease', status: 'delivered' });
+      const abortedPromise = joinJobEvent(
+        h,
+        'fallback-lease',
+        'job.fallback-review',
+        (event) => (event.payload as { phase?: string }).phase === 'aborted',
+      );
+      const review = await postReview(h, { job_id: 'fallback-lease' });
+      expect(review.status).toBe(202);
+      await entered.promise;
+      // The gate is queued for a worker turn; a NEW re-brief owns the lane.
+      h.ledger.beginPendingRebrief({ jobId: 'fallback-lease', note: 'n', briefing: 'b' });
+      leaseGate.release();
+      const aborted = await abortedPromise;
+      expect(aborted.payload).toMatchObject({ phase: 'aborted', iteration: 1, clearToMerge: false });
+      expect(String((aborted.payload as { reason?: string }).reason)).toContain('re-brief');
+      // The reviewer never spawned on the revoked lane.
+      expect(h.spawnCalls.filter((call) => call.role === 'minion')).toHaveLength(0);
+    } finally {
+      leaseGate.release();
+      await h.close();
+    }
+  });
+
+  it('a lane deregistered during the awaited pre-flight fails the fallback closed instead of reusing the stale path', async () => {
+    const repo = makeFixtureRepo('branch-idle-fallback-nolane');
+    cleanupRepos.push(repo);
+    const entered = deferred();
+    const gate = deferred();
+    const h = await boot({
+      preflightFails: true,
+      onPreflight: async () => {
+        entered.release();
+        await gate.promise;
+      },
+    });
+    try {
+      await createLaneJob(h, repo, { jobId: 'fallback-nolane', status: 'delivered' });
+      const pending = postReview(h, { job_id: 'fallback-nolane' });
+      await entered.promise;
+      await h.worktrees.release({ worktreeId: 'fallback-nolane' });
+      gate.release();
+      const failed = await pending;
+      expect(failed.status).toBe(400);
+      expect((failed.json as { detail?: string }).detail).toContain('no active job lane');
+      // Fail closed: no fallback reviewer, no round, no gate work.
+      expect(h.fallbackRuns).toHaveLength(0);
+      expect(h.ledger.listRounds('fallback-nolane')).toHaveLength(0);
+      expect(h.ledger.listJobEvents('fallback-nolane').some((event) => event.kind === 'job.fallback-review')).toBe(false);
+    } finally {
+      gate.release();
       await h.close();
     }
   });

@@ -68,7 +68,13 @@ immediately before the freeze, so a lane re-opened mid-setup is refused
 the same way. The same recheck runs after a failed pre-flight and before
 the bmad-review fallback gate admits — a re-brief or lane re-open landing
 during the awaited pre-flight refuses the fallback arm (409, or a queued
-replay re-queue) instead of starting a fallback reviewer. The arm passes
+replay re-queue) instead of starting a fallback reviewer; the fallback
+recheck enters through the same `arm`-phase guard, so a forced fallback
+admission carries two `arm`-phase `branch-idle.forced` records where the
+native route carries `arm` + `freeze`. A running fallback gate also
+re-proves its lane, marker and replay-authorization facts at each round
+intake and after the default reviewer's worker admission, stopping
+fail-closed before a stale diff or reviewer. The arm passes
 only when the target work is genuinely
 settled AND no re-brief request is unresolved — a delivery alone does not
 release a fenced lane. A lane with an unresolved re-brief request counts
