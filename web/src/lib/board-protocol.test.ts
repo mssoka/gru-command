@@ -175,6 +175,45 @@ describe('board server-frame validator', () => {
   });
 
 
+  it('pipeline queue: absent/null tolerated, well-formed accepted, malformed rejected', () => {
+    expect(isValidSnapshot(snapshot())).toBe(true);
+    expect(isValidSnapshot({ ...snapshot(), pipeline: null } as unknown)).toBe(true);
+    const entry = {
+      id: 'pipe-1',
+      repo: 'demo-repo',
+      title: 'Approved queued brief',
+      priority: 5,
+      enqueueSeq: 1,
+      state: 'ready',
+      reason: null,
+      queuedAt: '2026-01-01T00:00:00.000Z',
+    };
+    expect(isValidSnapshot({ ...snapshot(), pipeline: { entries: [entry], pending: 1 } } as unknown)).toBe(true);
+    expect(
+      isValidSnapshot({
+        ...snapshot(),
+        pipeline: { entries: [{ ...entry, state: 'waiting', reason: 'owner hold: deciding' }], pending: 1 },
+      } as unknown),
+    ).toBe(true);
+
+    // A present-but-malformed block is a server bug — reject loudly.
+    for (const broken of [
+      { ...entry, id: '' },
+      { ...entry, state: 'parked' },
+      { ...entry, priority: '5' },
+      { ...entry, enqueueSeq: 0 },
+      { ...entry, reason: 7 },
+      { ...entry, queuedAt: null },
+    ]) {
+      expect(
+        isValidSnapshot({ ...snapshot(), pipeline: { entries: [broken], pending: 1 } } as unknown),
+        JSON.stringify(broken),
+      ).toBe(false);
+    }
+    expect(isValidSnapshot({ ...snapshot(), pipeline: { entries: [entry], pending: -1 } } as unknown)).toBe(false);
+    expect(isValidSnapshot({ ...snapshot(), pipeline: { entries: 'nope', pending: 0 } } as unknown)).toBe(false);
+  });
+
   it('FOR YOU ownerPrs: absent/null tolerated (pre-upgrade servers), well-formed accepted, malformed rejected', () => {
     expect(isValidSnapshot(snapshot())).toBe(true);
     const nullPrs = { ...snapshot(), ownerPrs: null } as unknown;
