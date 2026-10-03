@@ -6,6 +6,7 @@ import type { EventBus } from '../events/bus.js';
 import type { AgentRecord, EventRecord, JobRecord, LedgerApi, RoundRecord } from '../ledger/api.js';
 import type { LogLevel } from '../logger.js';
 import type { AgentHandle, SpawnOptions } from '../runtime/types.js';
+import type { AgentSupervisionView } from '../supervision/supervisor.js';
 import type { GitHubPollTickResult } from './github-poll.js';
 import { pendingRecoveryRows } from '../provider-recovery/sensor.js';
 
@@ -290,6 +291,10 @@ export interface ComputeDigestInput {
   readonly config: Pick<SilasConfig, 'stallThresholdMs' | 'directiveAt' | 'rebriefAt' | 'escalateAt'>;
   readonly trigger: string;
   readonly now?: () => number;
+  /** The supervisor's live per-agent views. A supervision-stopped worker is
+   * waiting on a human re-arm with a recorded cause — the board renders it
+   * as waiting, so the digest must not call the same lane stalled. */
+  readonly supervisionFor?: (agentId: string) => AgentSupervisionView | null;
 }
 
 /** The head sha a delivery event recorded (`job.delivered.payload.sha`) —
@@ -502,21 +507,54 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
 
     // (4) Stalled lane: working with no delivery, minion gone quiet.
     if (job.status === 'working' && delivered === null) {
-      const minion = input.ledger
+      const boundMinions = input.ledger
         .listAgents()
-        .filter((agent) => agent.jobId === job.id && agent.role === 'minion')
-        .sort((a, b) => (b.lastActivity ?? b.createdAt).localeCompare(a.lastActivity ?? a.createdAt))[0];
-      if (minion !== undefined) {
-        const lastMs = Date.parse(minion.lastActivity ?? minion.createdAt);
-        if (Number.isFinite(lastMs) && now() - lastMs >= input.config.stallThresholdMs) {
-          digest.stalledWorking.push({
-            jobId: job.id,
-            repo: job.repo,
-            minionId: minion.id,
-            minionState: minion.state,
-            lastActivity: minion.lastActivity,
-            idleMs: now() - lastMs,
-          });
+        .filter((agent) => agent.jobId === job.id && agent.role === 'minion');
+      // The SAME attribution the board renders (stoppedWorkersByJob): a
+      // bound minion is live unless its supervision view says stopped or
+      // breaker-open, and a disposed unsupervised record is not a worker.
+      // A stop marks the lane only when no live worker exists or the
+      // newest live worker's stamp is KNOWN and strictly older; an
+      // unknown live stamp (a fresh worker registered before its first
+      // activity) favors the live worker. A waiting lane's silence is a
+      // human re-arm — this STALL channel never wakes it (the distinct
+      // minion-error channel below keeps its genuine-failure wakes).
+      const viewOf = (agent: (typeof boundMinions)[number]): AgentSupervisionView | null =>
+        input.supervisionFor?.(agent.id) ?? null;
+      const stopExempt = (agent: (typeof boundMinions)[number]): boolean => {
+        const supervision = viewOf(agent);
+        return supervision !== null && (supervision.state === 'stopped' || supervision.breakerOpen === true);
+      };
+      const stampOf = (agent: (typeof boundMinions)[number]): number =>
+        agent.lastActivity === null ? Number.NaN : Date.parse(agent.lastActivity);
+      const live = boundMinions.filter((agent) => {
+        if (stopExempt(agent)) return false;
+        return viewOf(agent) !== null || agent.state !== 'disposed';
+      });
+      const newestKnown = (stamps: readonly number[]): number | null =>
+        stamps.filter(Number.isFinite).reduce<number | null>((best, at) => (best === null || at > best ? at : best), null);
+      const hasStop = boundMinions.some(stopExempt);
+      const stopAt = newestKnown(boundMinions.filter(stopExempt).map(stampOf));
+      const liveAt = newestKnown(live.map(stampOf));
+      const waiting =
+        hasStop && (live.length === 0 || (stopAt !== null && liveAt !== null && stopAt > liveAt));
+      if (!waiting) {
+        const pool = live.length > 0 ? live : boundMinions.filter((agent) => !stopExempt(agent));
+        const minion = pool.sort((a, b) =>
+          (b.lastActivity ?? b.createdAt).localeCompare(a.lastActivity ?? a.createdAt),
+        )[0];
+        if (minion !== undefined) {
+          const lastMs = Date.parse(minion.lastActivity ?? minion.createdAt);
+          if (Number.isFinite(lastMs) && now() - lastMs > input.config.stallThresholdMs) {
+            digest.stalledWorking.push({
+              jobId: job.id,
+              repo: job.repo,
+              minionId: minion.id,
+              minionState: minion.state,
+              lastActivity: minion.lastActivity,
+              idleMs: now() - lastMs,
+            });
+          }
         }
       }
     }
@@ -610,6 +648,15 @@ export interface GitHubPollPort {
   pollOnce(): Promise<GitHubPollTickResult>;
 }
 
+/** Bind the supervisor's live per-agent views to the digest's lookup. This
+ * is the one seam main.ts wires; it is a factory so the binding is testable
+ * without booting the service (final independent review T2). */
+export function supervisionLookup(
+  supervisor: { readonly viewFor: (agentId: string) => AgentSupervisionView | null } | null,
+): (agentId: string) => AgentSupervisionView | null {
+  return (agentId) => supervisor?.viewFor(agentId) ?? null;
+}
+
 export interface SilasDriverOptions {
   readonly slot: SilasSlot;
   readonly ledger: DigestLedger & Pick<LedgerApi, 'appendCustomEvent'>;
@@ -618,6 +665,9 @@ export interface SilasDriverOptions {
   /** The ops surface Silas acts through: base URL + where the pairing token lives. */
   readonly ops: { readonly baseUrl: string; readonly configPath: string };
   readonly bus?: EventBus;
+  /** The supervisor's live per-agent views — the digest reads the SAME stop
+   * truth the board renders so a stopped lane is never woken as stalled. */
+  readonly supervisionFor?: (agentId: string) => AgentSupervisionView | null;
   /** The fast GitHub signal poll, ticked on `[silas] poll_interval_ms`. */
   readonly githubPoll?: GitHubPollPort;
   /** Operating skills injected into every wake prompt (default: shipped resources). */
@@ -797,6 +847,7 @@ export class SilasDriver {
         config: this.opts.config,
         trigger: trigger.kind,
         now: this.now,
+        ...(this.opts.supervisionFor !== undefined ? { supervisionFor: this.opts.supervisionFor } : {}),
       });
     } catch (error) {
       this.log('error', 'silas digest computation failed', { trigger: trigger.kind, error: String(error) });

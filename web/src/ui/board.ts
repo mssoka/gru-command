@@ -21,6 +21,7 @@
 
 import {
   agentStateTone,
+  isJobConcluded,
   jobChipTone,
   jobStatusTone,
   lensChipState,
@@ -37,12 +38,22 @@ import {
   BAND_ORDER,
   bucketSnapshot,
   settledWindow,
+  stoppedWorkersByJob,
+  workerStopLabel,
   type BandId,
+  type WorkerStopView,
 } from '../lib/board-bands.js';
 import { railChips, type RailChip } from '../lib/board-rail.js';
 import { BOARD_WORDS, heistCount } from '../lib/board-vocabulary.js';
 import { formatAge } from '../lib/board-time.js';
-import { jobSignal, pluralCount, roundSummary, unackedByJob, type RoundSummary } from '../lib/board-signals.js';
+import {
+  jobSignal,
+  pluralCount,
+  roundSummary,
+  terminalBoundNotificationIds,
+  unackedByJob,
+  type RoundSummary,
+} from '../lib/board-signals.js';
 import {
   ownerRows,
   ownerWindow,
@@ -439,13 +450,14 @@ export class BoardView {
         : decisions.reason === null
           ? `Decision routing: ${decisions.status}.`
           : `Decision routing: ${decisions.status} (${decisions.reason}).`;
-    // NEEDS GRU is the machine queue: action-required rows awaiting a
-    // machine disposition. It never rings the owner bell — the FOR YOU
-    // band (bell + toasts) is the only human-facing surface.
+    // NEEDS GRU is the LIVE machine queue: action-required rows awaiting a
+    // machine disposition (terminal-bound rows are closed receipts below).
+    // It never rings the owner bell — the FOR YOU band (bell + toasts) is
+    // the only human-facing surface.
     const needsGru = snapshot.unackedActionRequired;
     this.unackedChip.hidden = needsGru === 0;
     this.unackedChip.textContent = `🛠 ${needsGru} needs Gru`;
-    this.unackedChip.title = `${needsGru} machine-attention notification${needsGru === 1 ? '' : 's'} awaiting a Gru disposition — the machine queue clears itself; the owner bell is not rung.`;
+    this.unackedChip.title = `${needsGru} live machine-attention notification${needsGru === 1 ? '' : 's'} awaiting a Gru disposition — the live queue clears itself; closed receipts stay in the record and the owner bell is not rung.`;
     // Wake tracker: every autonomous wake is a durable `gru.wake` event;
     // the count/last fire stamp makes the wake path visible on the board.
     const wakes = snapshot.wakes;
@@ -519,7 +531,11 @@ export class BoardView {
       return;
     }
     const unacked = unackedByJob(snapshot);
-    const bands = bucketSnapshot(snapshot, { now: Date.now(), unackedByJob: unacked });
+    // Section truth: the live needs-Gru view counts only LIVE rows. The
+    // stopped-worker map carries the supervision stop (waiting-on-rearm)
+    // truth for working lanes; terminal-job notifications stay in the bell.
+    const stoppedWorkers = stoppedWorkersByJob(snapshot.agents);
+    const bands = bucketSnapshot(snapshot, { now: Date.now(), unackedByJob: unacked, stoppedWorkers });
     const seenIds = new Set<string>();
     for (const band of BAND_ORDER) {
       const jobs = bands.find((group) => group.band === band)?.jobs ?? [];
@@ -537,7 +553,15 @@ export class BoardView {
         const window = band === 'settled' ? settledWindow(jobs, this.settledExpanded) : { jobs, hidden: 0 };
         const rows = el('div', 'board-band__rows');
         for (const entry of window.jobs) {
-          rows.append(this.jobRow(entry.job, unacked.get(entry.job.id) ?? 0, entry.stale, band));
+          rows.append(
+            this.jobRow(
+              entry.job,
+              unacked.get(entry.job.id) ?? 0,
+              entry.stale,
+              band,
+              stoppedWorkers.get(entry.job.id) ?? null,
+            ),
+          );
         }
         section.append(rows);
         if (window.hidden > 0) {
@@ -577,11 +601,23 @@ export class BoardView {
    * the summary expands the v3 detail inline — the row is never a card
    * until it is expanded. Error/failing rows carry the alert accent.
    */
-  private jobRow(job: JobView, unackedActionRequired: number, stale: boolean, band: BandId): HTMLElement {
+  private jobRow(
+    job: JobView,
+    unackedActionRequired: number,
+    stale: boolean,
+    band: BandId,
+    workerStop: WorkerStopView | null,
+  ): HTMLElement {
     const row = el('article', 'board-job');
     row.dataset.jobId = job.id;
     row.dataset.band = band;
     row.dataset.status = job.status;
+    // Defect truth (2026-09-29): a supervision-stopped worker is waiting
+    // on a human re-arm — the row says so instead of a bare "working".
+    // The swap is scoped to working lanes (where the status lies); other
+    // statuses keep their true chip, and the agent rail carries the ⛔.
+    const waiting = workerStop !== null && job.status === 'working';
+    if (waiting) row.dataset.workerState = 'waiting';
     if (jobFailing(job)) row.classList.add('board-job--alert');
     // v5: a job that was not on screen slides in (8px); a snapshot push
     // re-rendering known rows stays still.
@@ -610,7 +646,19 @@ export class BoardView {
       chip.title = signal.title;
       toggle.append(chip);
     }
-    toggle.append(el('span', `pp-chip board-job__status ${jobChipTone(job.status)}`, job.status));
+    const status = el(
+      'span',
+      `pp-chip board-job__status ${waiting ? 'pp-chip--park' : jobChipTone(job.status)}`,
+      waiting ? workerStopLabel(workerStop) : job.status,
+    );
+    if (waiting && workerStop !== null) {
+      status.title =
+        `worker stopped by supervision` +
+        (workerStop.reason === null ? '' : ` (${workerStop.reason.replaceAll('_', ' ')})`) +
+        `${workerStop.restarts > 0 ? ` after ${workerStop.restarts} restart${workerStop.restarts === 1 ? '' : 's'}` : ''} — ` +
+        'the lane is not running: resolve the condition, then ack the escalation to re-arm';
+    }
+    toggle.append(status);
     head.append(toggle);
     row.append(head);
 
@@ -685,7 +733,7 @@ export class BoardView {
       body.append(lane);
     }
     if (job.note !== null && job.note !== '') body.append(el('div', 'board-job__note', job.note));
-    const concluded = job.status === 'merged' || job.status === 'done';
+    const concluded = isJobConcluded(job.status);
     const rounds = concluded ? job.rounds.slice(-1) : job.rounds;
     for (const round of rounds) body.append(this.roundRow(round, concluded));
     if (concluded && rounds.length > 0) {
@@ -894,10 +942,16 @@ export class BoardView {
     // the standing feed.
     // A pre-disposition release could Ack machine rows. Those legacy rows
     // are closed receipts, not active NEEDS GRU work, even if unresolved.
+    // A row bound to a TERMINAL job is the same kind of receipt (section
+    // truth, 2026-09-29): the record keeps it — FEED renders it as a
+    // closed receipt — but the live queue never counts or lists it.
     const unresolved = (item: NotificationView): boolean => item.resolvedAt === null && item.ackedAt === null;
-    const needsGru = notifications.filter((item) => item.routing === 'action-required' && unresolved(item));
+    const receipts = terminalBoundNotificationIds(snapshot);
+    const needsGru = notifications.filter(
+      (item) => item.routing === 'action-required' && unresolved(item) && !receipts.has(item.id),
+    );
     const feed = notifications.filter(
-      (item) => item.routing === 'fyi' || !unresolved(item),
+      (item) => item.routing === 'fyi' || !unresolved(item) || receipts.has(item.id),
     );
     if (notifications.length === 0 && (snapshot.ownerPrs ?? []).length === 0) {
       list.append(el('div', 'lbl', 'nothing needs attention'));
@@ -919,8 +973,8 @@ export class BoardView {
       }
     }
     list.append(forYou);
-    this.renderNotificationSection(list, 'NEEDS GRU', needsGru, 'machine queue is clear');
-    if (feed.length > 0) this.renderNotificationSection(list, 'FEED', feed, null);
+    this.renderNotificationSection(list, 'NEEDS GRU', needsGru, 'live machine queue is clear', receipts);
+    if (feed.length > 0) this.renderNotificationSection(list, 'FEED', feed, null, receipts);
   }
 
   private renderNotificationSection(
@@ -928,26 +982,34 @@ export class BoardView {
     label: string,
     rows: readonly NotificationView[],
     empty: string | null,
+    receipts: ReadonlySet<string>,
   ): void {
     const section = el('section', 'board-notification-section');
     section.append(el('div', 'board-notification-section__head lbl', label));
     if (rows.length === 0) {
       if (empty !== null) section.append(el('div', 'board-notification-section__empty lbl', empty));
     } else {
-      for (const item of rows) section.append(this.notificationRow(item));
+      for (const item of rows) section.append(this.notificationRow(item, receipts.has(item.id)));
     }
     list.append(section);
   }
 
-  private notificationRow(item: NotificationView): HTMLElement {
-    const row = el('div', `board-notification board-notification--${item.severity}`);
+  private notificationRow(item: NotificationView, closedReceipt = false): HTMLElement {
+    const row = el(
+      'div',
+      `board-notification board-notification--${item.severity}${closedReceipt ? ' board-notification--receipt' : ''}`,
+    );
+    if (closedReceipt) row.dataset.receipt = 'closed';
     const icon = item.routing === 'needs-owner' ? '🔔' : item.routing === 'action-required' ? '🛠' : item.severity === 'error' ? '🚨' : 'ℹ️';
+    const suffix = closedReceipt
+      ? ' · closed receipt'
+      : item.resolvedAt !== null
+        ? ' · resolved'
+        : item.ackedAt !== null
+          ? ' ✓'
+          : '';
     row.append(
-      el(
-        'div',
-        'board-notification__title',
-        `${icon} ${item.title}${item.resolvedAt !== null ? ' · resolved' : item.ackedAt !== null ? ' ✓' : ''}`,
-      ),
+      el('div', 'board-notification__title', `${icon} ${item.title}${suffix}`),
       el(
         'div',
         'board-notification__meta lbl',
@@ -957,6 +1019,7 @@ export class BoardView {
     // Only an owner stop or FYI row has a human Ack/Mark seen control.
     // Gru records a machine disposition through the authenticated API
     // after acting; a human click must not silently clear NEEDS GRU.
+    // A closed receipt is machine-attention history: same rule, no Ack.
     if (item.routing !== 'action-required' && item.ackedAt === null && item.resolvedAt === null) {
       const ack = document.createElement('button');
       ack.type = 'button';
@@ -1038,8 +1101,10 @@ export class BoardView {
 /** A row is "failing" when the record itself says so: blocked/error
  * status, an aborted newest round, or errored lenses in a round that has
  * not posted a verdict. Conflicting-PR-only rows stay calm — the band
- * already shouts. */
+ * already shouts. A CONCLUDED job (merged/done) is a closed receipt: its
+ * history renders quiescent and never carries the alert accent. */
 export function jobFailing(job: JobView): boolean {
+  if (isJobConcluded(job.status)) return false;
   if (job.status === 'blocked' || job.status === 'error') return true;
   const round = job.rounds.at(-1) ?? null;
   if (round === null) return false;

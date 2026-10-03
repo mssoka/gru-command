@@ -725,6 +725,7 @@ describe('supervisor — watchdog + restart ladder', () => {
     const view = supervisor.viewFor('minion-crashloop') as AgentSupervisionView;
     expect(view.state).toBe('stopped');
     expect(view.breakerOpen).toBe(true);
+    expect(view.stopReason).toBe('crash loop');
 
     // ---- ack re-arms: fresh window, the resume attempt succeeds -------
     registry.spawnImpl = async (role) => new FakeHandle(role, 'minion-crashloop-resumed', null);
@@ -733,6 +734,8 @@ describe('supervisor — watchdog + restart ladder', () => {
     const rearmView = supervisor.viewFor('minion-crashloop-resumed') as AgentSupervisionView;
     expect(rearmView.state).toBe('watching');
     expect(rearmView.breakerOpen).toBe(false);
+    // A re-armed agent is running again — no stop reason lingers.
+    expect(rearmView.stopReason).toBeNull();
     expect(rearmView.restarts).toBe(1); // ring cleared, one fresh rung
     expect(registry.spawnCalls.length).toBe(4);
     // The stopped record for the OLD agent id is gone (new session id) —
@@ -784,6 +787,13 @@ describe('supervisor — workflow-owned review attempts', () => {
     await vi.waitFor(() => expect(handle.disposed).toBe(true));
     expect(h.registry.spawnCalls).toHaveLength(spawns);
     expect(h.api.listEvents({ limit: 20 }).some((event) => event.kind === 'supervision.review-attempt-aborted')).toBe(true);
+    // The abort records its cause on the stopped record the board reads:
+    // the lane renders this exact reason until a re-arm clears it.
+    expect(h.supervisor.viewFor(handle.id)).toMatchObject({
+      state: 'stopped',
+      breakerOpen: false,
+      stopReason: 'review aborted',
+    });
     h.dispose();
   });
 
@@ -802,6 +812,7 @@ describe('supervisor — workflow-owned review attempts', () => {
     expect(h.registry.spawnCalls).toHaveLength(spawns);
     expect(h.api.listEvents({ limit: 20 }).some((event) => event.kind === 'supervision.review-attempt-aborted')).toBe(true);
     expect(h.notificationsOfKind('supervision.native-compaction-wait')).toHaveLength(0);
+    expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', stopReason: 'review aborted' });
     h.dispose();
   });
 });
@@ -953,6 +964,8 @@ describe('supervisor — decision-backed failure guidance', () => {
     handle.emit({ type: 'error', error: 'quota exceeded (HTTP 429)', fatal: false });
     await vi.waitFor(() => expect(handle.disposed).toBe(true));
     expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true, restarts: 0 });
+    // The stop carries its reason so the board can render the truth.
+    expect(h.supervisor.viewFor(handle.id)).toMatchObject({ stopReason: 'quota_wall' });
     expect(h.api.listNotifications({ limit: 20 }).some((row) => row.kind.includes('quota_wall'))).toBe(true);
     h.dispose();
   });
@@ -1711,6 +1724,9 @@ describe('supervisor — Perkins r1 fixes', () => {
     const view = h.supervisor.viewFor('slot-recovered');
     expect(view?.state).toBe('watching');
     expect(view?.breakerOpen).toBe(false);
+    // A re-armed agent is running again — the stop cause clears with the
+    // breaker (final independent review T1).
+    expect(view?.stopReason).toBeNull();
     h.dispose();
   });
 });

@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import type {
+  AgentView,
   JobPrState,
   JobView,
   RoundView,
@@ -14,6 +17,8 @@ import {
   jobRecency,
   needsYouReasons,
   settledWindow,
+  stoppedWorkersByJob,
+  workerStopLabel,
 } from './board-bands.js';
 
 const NOW = new Date(2026, 8, 23, 12, 0, 0).getTime(); // local noon — day-boundary tests stay timezone-robust
@@ -53,6 +58,21 @@ function job(overrides: Partial<JobView> = {}): JobView {
   };
 }
 
+function agentView(id: string, overrides: Partial<AgentView> = {}): AgentView {
+  return {
+    id,
+    role: 'minion',
+    label: null,
+    state: 'idle',
+    lastActivity: null,
+    sessionFile: null,
+    jobId: null,
+    roundId: null,
+    supervision: null,
+    ...overrides,
+  };
+}
+
 describe('board bands — deterministic bucketing', () => {
   it('assigns every status × recency × PR state by the documented rules', () => {
     const statuses = [
@@ -69,15 +89,18 @@ describe('board bands — deterministic bucketing', () => {
     const prStates: (JobPrState | null)[] = [null, 'open', 'conflicting', 'merged'];
 
     /** Independent re-statement of the rules (never import the target's
-     * own helpers here — the point is to pin the behavior). */
+     * own helpers here — the point is to pin the behavior). Terminal jobs
+     * (merged/done) are closed receipts: no signal — conflicting PR
+     * guesses included — can promote them back into NEEDS YOU. */
     function expected(status: string, fresh: boolean, pr: JobPrState | null): string {
+      if (status === 'merged') return fresh ? 'settled' : 'cold';
+      if (status === 'done') return 'cold';
       if (pr === 'conflicting') return 'needs-you';
       if (status === 'blocked' || status === 'error') return 'needs-you';
       if (status === 'dispatched' || status === 'in-review') return 'in-flight';
       if (status === 'working') return fresh ? 'in-flight' : 'cold';
       if (status === 'delivered') return 'settled';
-      if (status === 'merged') return fresh ? 'settled' : 'cold';
-      return 'cold'; // parked, done, unknown
+      return 'cold'; // parked, unknown
     }
 
     for (const status of statuses) {
@@ -125,8 +148,10 @@ describe('board bands — deterministic bucketing', () => {
     expect(isStalledWorking(job({ status: 'parked', lastAgentActivity: ISO(-10 * 3_600_000) }), { now: NOW })).toBe(false);
   });
 
-  it('cascade promoter: a conflicting PR jumps ANY status to NEEDS GRU', () => {
-    for (const status of ['working', 'in-review', 'parked', 'done', 'delivered']) {
+  it('cascade promoter: a conflicting PR jumps any LIVE status to NEEDS GRU', () => {
+    // Terminal jobs are closed receipts (see the section-truth test below)
+    // — the cascade can never pull a merged/done lane back into the queue.
+    for (const status of ['working', 'in-review', 'parked', 'delivered']) {
       const conflicting = job({ status, prState: 'conflicting', prUrl: 'https://example.invalid/pr/1' });
       expect(bandForJob(conflicting, { now: NOW }), status).toBe('needs-you');
     }
@@ -134,7 +159,7 @@ describe('board bands — deterministic bucketing', () => {
 
   it('needs-you causes: unacked action-required, blocked, error, aborted round, failed lens', () => {
     expect(needsYouReasons(job({ status: 'parked' }), 1)).toContain('action-required');
-    expect(bandForJob(job({ status: 'done' }), { now: NOW, unackedByJob: new Map([['job-1', 1]]) })).toBe('needs-you');
+    expect(bandForJob(job({ status: 'parked' }), { now: NOW, unackedByJob: new Map([['job-1', 1]]) })).toBe('needs-you');
     expect(bandForJob(job({ status: 'blocked' }), { now: NOW })).toBe('needs-you');
     expect(bandForJob(job({ status: 'error' }), { now: NOW })).toBe('needs-you');
     expect(bandForJob(job({ status: 'working', rounds: [round({ status: 'aborted' })] }), { now: NOW })).toBe('needs-you');
@@ -248,14 +273,20 @@ describe('board bands — concluded jobs ignore stale review history (owner ruli
     expect(bandForJob(job({ status: 'done', rounds: [failedLensRound] }), { now: NOW })).toBe('cold');
   });
 
-  it('a separate unacked action-required notification still promotes a concluded job', () => {
+  it('a leftover unacked action-required row on a concluded job is a closed receipt — it never promotes the lane', () => {
+    // Section-truth ruling (2026-09-29) supersedes the 2026-09-26
+    // "current-state obligations still promote concluded work" clause:
+    // a merged/done job is a closed receipt, so a terminal-bound
+    // machine row can never make it live NEEDS GRU work again. Snapshot
+    // attribution (unackedByJob) also drops terminal-bound rows, so this
+    // count never reaches the bander in production.
     const merged = job({ status: 'merged', prState: 'merged', updatedAt: ISO(-600_000), rounds: abortedHistory });
-    expect(needsYouReasons(merged, 2)).toEqual(['action-required']);
-    expect(bandForJob(merged, { now: NOW, unackedByJob: new Map([['job-1', 2]]) })).toBe('needs-you');
-    expect(bandForJob(job({ status: 'done', rounds: abortedHistory }), { now: NOW, unackedByJob: new Map([['job-1', 1]]) })).toBe('needs-you');
+    expect(needsYouReasons(merged, 2)).toEqual([]);
+    expect(bandForJob(merged, { now: NOW, unackedByJob: new Map([['job-1', 2]]) })).toBe('settled');
+    expect(bandForJob(job({ status: 'done', rounds: abortedHistory }), { now: NOW, unackedByJob: new Map([['job-1', 1]]) })).toBe('cold');
   });
 
-  it('a conflicting PR keeps promoting even a concluded job (current state, not history)', () => {
+  it('a conflicting PR on a concluded job is history too — a closed receipt never returns to NEEDS GRU', () => {
     const merged = job({
       status: 'merged',
       prState: 'conflicting',
@@ -263,8 +294,8 @@ describe('board bands — concluded jobs ignore stale review history (owner ruli
       updatedAt: ISO(-600_000),
       rounds: abortedHistory,
     });
-    expect(needsYouReasons(merged, 0)).toEqual(['PR conflicting']);
-    expect(bandForJob(merged, { now: NOW })).toBe('needs-you');
+    expect(needsYouReasons(merged, 0)).toEqual([]);
+    expect(bandForJob(merged, { now: NOW })).toBe('settled');
   });
 
   it('delivered/parked jobs keep their existing aborted-round promotion (retained behavior)', () => {
@@ -335,5 +366,267 @@ describe('board bands — settled rolling window (v5)', () => {
 
   it('never needs a window for an empty band', () => {
     expect(settledWindow([], false)).toEqual({ jobs: [], hidden: 0 });
+  });
+});
+
+describe('board bands — section truth: terminal jobs are closed receipts', () => {
+  it('merged/done never re-enter NEEDS YOU, whatever is left over', () => {
+    for (const status of ['merged', 'done']) {
+      const closed = job({
+        id: `closed-${status}`,
+        status,
+        rounds: [round({ status: 'aborted' })], // stale history noise
+      });
+      expect(needsYouReasons(closed, 2)).toEqual([]);
+    }
+    // A merged lane from today with leftover unacked escalations is still
+    // a closed receipt: SETTLED, never the live queue.
+    const mergedToday = job({ id: 'closed-merged', status: 'merged', updatedAt: ISO(-60_000) });
+    expect(bandForJob(mergedToday, { now: NOW, unackedByJob: new Map([['closed-merged', 2]]) })).toBe('settled');
+    // An older done lane sinks to COLD — closed either way.
+    const doneOld = job({ id: 'closed-done', status: 'done', updatedAt: ISO(-26 * 3_600_000) });
+    expect(bandForJob(doneOld, { now: NOW, unackedByJob: new Map([['closed-done', 2]]) })).toBe('cold');
+  });
+});
+
+describe('board bands — stopped-worker truth (waiting, not stalled)', () => {
+  const stop = { reason: 'quota_wall', restarts: 2 };
+
+  it('a supervision-stopped working lane waits in IN FLIGHT with its reason — never COLD/stalled', () => {
+    const stopped = job({ lastAgentActivity: ISO(-(JOB_STALLED_AFTER_MS + 60_000)) });
+    const opts = { now: NOW, stoppedWorkers: new Map([['job-1', stop]]) };
+    // Past the stall window, but the silence has a recorded cause.
+    expect(isStalledWorking(stopped, opts)).toBe(false);
+    expect(bandForJob(stopped, opts)).toBe('in-flight');
+    const [group] = bucketJobs([stopped], opts);
+    expect(group?.band).toBe('in-flight');
+    expect(group?.jobs[0]?.stale).toBe(false);
+  });
+
+  it('the waiting truth never masks other signals: an unacked escalation still cascades to NEEDS YOU', () => {
+    const opts = {
+      now: NOW,
+      stoppedWorkers: new Map([['job-1', stop]]),
+      unackedByJob: new Map([['job-1', 1]]),
+    };
+    expect(bandForJob(job(), opts)).toBe('needs-you');
+  });
+
+  it('COLD stays for genuinely-silent lanes — the stop map never invents silence', () => {
+    const silent = job({ lastAgentActivity: ISO(-(JOB_STALLED_AFTER_MS + 60_000)) });
+    expect(isStalledWorking(silent, { now: NOW })).toBe(true);
+    expect(bandForJob(silent, { now: NOW })).toBe('cold');
+    const [group] = bucketJobs([silent], { now: NOW });
+    expect(group?.jobs[0]?.stale).toBe(true);
+  });
+
+  it('stoppedWorkersByJob reads bound agents only; workerStopLabel renders the reason', () => {
+    const map = stoppedWorkersByJob([
+      agentView('m1', { jobId: 'job-1', supervision: { state: 'stopped', restarts: 2, breakerOpen: true, stopReason: 'quota_wall' } }),
+      // breaker-open alone marks the lane even before the state settles.
+      agentView('m2', { jobId: 'job-2', supervision: { state: 'watching', restarts: 0, breakerOpen: true, stopReason: null } }),
+      agentView('m3', { jobId: 'job-3', supervision: { state: 'watching', restarts: 0, breakerOpen: false, stopReason: null } }),
+      agentView('m4', { jobId: 'job-4', supervision: null }),
+      // An unbound stopped agent stays global — no lane to mark.
+      agentView('m5', { supervision: { state: 'stopped', restarts: 0, breakerOpen: true, stopReason: null } }),
+    ]);
+    expect(map.get('job-1')).toEqual({ reason: 'quota_wall', restarts: 2 });
+    expect(map.get('job-2')).toEqual({ reason: null, restarts: 0 });
+    expect(map.has('job-3')).toBe(false);
+    expect(map.has('job-4')).toBe(false);
+    expect(map.size).toBe(2);
+    expect(workerStopLabel(map.get('job-1')!)).toBe('waiting · quota wall');
+    expect(workerStopLabel({ reason: 'crash loop', restarts: 3 })).toBe('waiting · crash loop');
+    expect(workerStopLabel({ reason: null, restarts: 0 })).toBe('waiting');
+  });
+
+  it('only the lane worker (minion) speaks for the lane — a workflow-owned review stop never does', () => {
+    const map = stoppedWorkersByJob([
+      // Perkins review agents are bound to the job too, but an aborted
+      // isolated attempt ('review aborted', breaker left closed) is owned
+      // by the round workflow — it must never render the working lane as
+      // waiting.
+      agentView('p1', {
+        role: 'perkins',
+        jobId: 'job-1',
+        roundId: 'r1',
+        supervision: { state: 'stopped', restarts: 0, breakerOpen: false, stopReason: 'review aborted' },
+      }),
+      // Even a breaker-open perkins stop stays off the lane: only the
+      // worker's stop says the lane is not running.
+      agentView('p2', {
+        role: 'perkins',
+        jobId: 'job-1',
+        roundId: 'r1',
+        supervision: { state: 'stopped', restarts: 1, breakerOpen: true, stopReason: 'quota_wall' },
+      }),
+      // The lane's minion is working — the lane stays working.
+      agentView('m1', {
+        role: 'minion',
+        jobId: 'job-1',
+        supervision: { state: 'watching', restarts: 0, breakerOpen: false, stopReason: null },
+      }),
+      // And when the lane's own minion stops, the lane waits as before.
+      agentView('m2', {
+        role: 'minion',
+        jobId: 'job-2',
+        supervision: { state: 'stopped', restarts: 2, breakerOpen: true, stopReason: 'quota_wall' },
+      }),
+    ]);
+    expect(map.has('job-1')).toBe(false);
+    expect(map.get('job-2')).toEqual({ reason: 'quota_wall', restarts: 2 });
+    expect(map.size).toBe(1);
+  });
+
+  it('a live re-dispatched worker clears the previous stopped record — the lane is not waiting', () => {
+    const map = stoppedWorkersByJob([
+      // The previous worker stopped; its record survives disposal (the Ack
+      // must find it to re-arm) and stays stopped while the lane is
+      // re-briefed with a fresh worker.
+      agentView('old', {
+        jobId: 'job-1',
+        state: 'idle',
+        supervision: { state: 'stopped', restarts: 1, breakerOpen: true, stopReason: 'quota_wall' },
+      }),
+      // The fresh worker is running: the lane's CURRENT worker decides.
+      agentView('fresh', {
+        jobId: 'job-1',
+        state: 'streaming',
+        supervision: { state: 'watching', restarts: 0, breakerOpen: false, stopReason: null },
+      }),
+    ]);
+    expect(map.has('job-1')).toBe(false);
+  });
+
+  it('stopped records still mark the lane when every bound worker is stopped', () => {
+    const map = stoppedWorkersByJob([
+      agentView('old', {
+        jobId: 'job-1',
+        lastActivity: ISO(-2 * 3_600_000),
+        supervision: { state: 'stopped', restarts: 1, breakerOpen: true, stopReason: 'quota_wall' },
+      }),
+      agentView('newer', {
+        jobId: 'job-1',
+        lastActivity: ISO(-1 * 3_600_000),
+        supervision: { state: 'stopped', restarts: 4, breakerOpen: true, stopReason: 'crash loop' },
+      }),
+    ]);
+    // No live worker remains: the lane waits on its CURRENT (newest) stop —
+    // a superseded worker's reason never masquerades as the live one
+    // (final independent review B1/C0).
+    expect(map.get('job-1')).toEqual({ reason: 'crash loop', restarts: 4 });
+  });
+
+  it('an unsupervised fresh worker still clears an older stopped record', () => {
+    const map = stoppedWorkersByJob([
+      agentView('old', {
+        jobId: 'job-1',
+        supervision: { state: 'stopped', restarts: 1, breakerOpen: true, stopReason: 'quota_wall' },
+      }),
+      // A null supervision view is an unsupervised worker, not a stop: the
+      // live worker decides, so the lane never reads "waiting" from its
+      // previous worker (finding B2, final independent review).
+      agentView('fresh', { jobId: 'job-1', state: 'streaming', supervision: null }),
+    ]);
+    expect(map.has('job-1')).toBe(false);
+  });
+
+  it('a disposed unsupervised record does not clear a current stop', () => {
+    const map = stoppedWorkersByJob([
+      agentView('current', {
+        jobId: 'job-1',
+        supervision: { state: 'stopped', restarts: 1, breakerOpen: true, stopReason: 'quota_wall' },
+      }),
+      // A disposed record has no live worker behind it: it must not erase
+      // the current worker's stop (finding E0, final independent review).
+      agentView('dead', { jobId: 'job-1', state: 'disposed', supervision: null }),
+    ]);
+    expect(map.get('job-1')).toEqual({ reason: 'quota_wall', restarts: 1 });
+  });
+
+  it('a newer stop wins over an older live record', () => {
+    const map = stoppedWorkersByJob([
+      agentView('stale-live', {
+        jobId: 'job-1',
+        lastActivity: ISO(-2 * 3_600_000),
+        supervision: { state: 'watching', restarts: 0, breakerOpen: false, stopReason: null },
+      }),
+      agentView('current-stop', {
+        jobId: 'job-1',
+        lastActivity: ISO(-1 * 3_600_000),
+        supervision: { state: 'stopped', restarts: 1, breakerOpen: true, stopReason: 'quota_wall' },
+      }),
+    ]);
+    // The stopped record is the lane's current worker: an older live
+    // record must not mask it. (The LITERAL cross-surface pin over shared
+    // values lives in the fixture-driven test below.)
+    expect(map.get('job-1')).toEqual({ reason: 'quota_wall', restarts: 1 });
+  });
+
+  it('the shared cross-surface fixture renders exactly what the digest pins', () => {
+    // ONE fixture file is consumed by this suite and by
+    // test/silas-driver.test.ts: same ids/stamps/views for both the web
+    // waiting predicate and the digest stall predicate (followup review
+    // A0/edge0), so a one-sided drift fails here rather than in the field.
+    const fixture = JSON.parse(
+      readFileSync(
+        fileURLToPath(new URL('../../../test/fixtures/stop-attribution.json', import.meta.url)),
+        'utf-8',
+      ),
+    ) as {
+      readonly cases: readonly {
+        readonly name: string;
+        readonly agents: readonly {
+          readonly id: string;
+          readonly jobId: string;
+          readonly state: string;
+          readonly lastActivity: string | null;
+          readonly supervision: AgentView['supervision'];
+        }[];
+        readonly board: { readonly waiting: boolean; readonly reason?: string; readonly restarts?: number };
+      }[];
+    };
+    expect(fixture.cases.length).toBeGreaterThan(2);
+    for (const testCase of fixture.cases) {
+      const map = stoppedWorkersByJob(
+        testCase.agents.map((agent) =>
+          agentView(agent.id, {
+            jobId: agent.jobId,
+            state: agent.state,
+            lastActivity: agent.lastActivity,
+            supervision: agent.supervision,
+          }),
+        ),
+      );
+      if (testCase.board.waiting) {
+        expect(map.get('job-1'), testCase.name).toEqual({
+          reason: testCase.board.reason,
+          restarts: testCase.board.restarts,
+        });
+      } else {
+        expect(map.has('job-1'), testCase.name).toBe(false);
+      }
+    }
+  });
+
+  it('a fresh worker with an unknown stamp never inherits the previous stop', () => {
+    const map = stoppedWorkersByJob([
+      // The superseded worker's stop carries a real stamp...
+      agentView('old-stop', {
+        jobId: 'job-1',
+        lastActivity: ISO(-1 * 3_600_000),
+        supervision: { state: 'stopped', restarts: 1, breakerOpen: true, stopReason: 'quota_wall' },
+      }),
+      // ...but the fresh live worker was just registered: registerAgent
+      // inserts last_activity NULL, so its stamp is unknown. Unknown
+      // favors the live worker — the lane is running, not waiting
+      // (tracked-review A0/E1/V1; registration NULL pair).
+      agentView('fresh-null', {
+        jobId: 'job-1',
+        state: 'spawning',
+        supervision: { state: 'watching', restarts: 0, breakerOpen: false, stopReason: null },
+      }),
+    ]);
+    expect(map.has('job-1')).toBe(false);
   });
 });

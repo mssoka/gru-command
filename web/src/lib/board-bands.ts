@@ -5,7 +5,8 @@
  *   1 NEEDS GRU  — unacked action-required, blocked/error, PR conflicting,
  *                  aborted review, failed lenses in the newest round —
  *                  review-history causes apply only to work that is
- *                  still open (concluded merged/done never revives)
+ *                  still open: a concluded merged/done job earns NO
+ *                  NEEDS GRU causes at all (closed receipt)
  *   2 IN FLIGHT  — dispatched, fresh working, in-review
  *   3 SETTLED    — delivered, merged today
  *   4 COLD       — stalled working (30 min, Silas's default threshold),
@@ -15,7 +16,7 @@
  * every status × freshness × PR-state combination is unit-testable.
  */
 
-import type { BoardSnapshot, JobView } from './board-protocol.js';
+import { isJobConcluded, type AgentView, type BoardSnapshot, type JobView } from './board-protocol.js';
 import { derivedPrState } from './board-kpi.js';
 import { isSameLocalDay } from './board-time.js';
 
@@ -47,6 +48,9 @@ export interface BucketOptions {
   readonly stalledAfterMs?: number;
   /** Unacked action-required counts per job id (from board-signals). */
   readonly unackedByJob?: ReadonlyMap<string, number>;
+  /** Supervision-stopped worker views per job id (from the snapshot's
+   * agent rows) — a stopped lane is waiting, never silent-stalled. */
+  readonly stoppedWorkers?: ReadonlyMap<string, WorkerStopView>;
 }
 
 /** The newest frame-ish stamp on the job: agent activity, else the lane's
@@ -58,10 +62,102 @@ export function jobRecency(job: JobView): string {
   return newest;
 }
 
+/** The stop truth for one lane: the lane's bound minion worker is
+ * supervision-stopped (or breaker-open). Callers decide whether the lane's
+ * status makes the waiting state applicable (the board gates on a working
+ * job). */
+export interface WorkerStopView {
+  /** Failure class the supervisor recorded (e.g. `quota_wall`), null on
+   * pre-reason snapshots — the stop renders without a cause. */
+  readonly reason: string | null;
+  readonly restarts: number;
+}
+
+/** Stopped-worker views keyed by job id, from the snapshot's agent rows:
+ * the LANE'S WORKER (role `minion`) bound to a job whose supervision is
+ * stopped or breaker-open marks the lane. A stopped lane is NOT silently
+ * working — it is waiting on a human re-arm with a recorded reason.
+ * Review agents (role `perkins`) are bound to the job too, but their
+ * stops are workflow-owned (e.g. an aborted isolated attempt with the
+ * breaker closed): they belong to the round lifecycle and must never
+ * make a working lane read as waiting.
+ *
+ * The lane's CURRENT worker decides: a live (non-stopped, non-breaker)
+ * minion bound to the job clears any older stopped record. An
+ * unsupervised worker (null supervision view) is not a supervision
+ * stop — it counts as live, so a re-dispatched lane whose fresh worker
+ * is unsupervised still never reads "waiting" from its previous
+ * worker. A stopped record survives its own disposal (the human Ack
+ * must find it to re-arm). A stopped worker marks the lane only when no
+ * live (non-stopped, non-breaker, non-disposed) worker is NEWER — or
+ * none exists; when several workers are stopped, the NEWEST recorded
+ * stop (by lastActivity) speaks for the lane. A KNOWN live stamp must be
+ * strictly older for the stop to win: an unknown live stamp (a fresh
+ * worker registered before its first activity — last_activity is NULL)
+ * favors the live worker, so a re-dispatched lane never reads waiting
+ * from its previous worker. */
+export function stoppedWorkersByJob(agents: readonly AgentView[]): Map<string, WorkerStopView> {
+  const stopped = new Map<string, { readonly view: WorkerStopView; readonly at: number }>();
+  const liveAt = new Map<string, number>();
+  const stamp = (agent: AgentView): number =>
+    agent.lastActivity === null ? Number.NaN : Date.parse(agent.lastActivity);
+  const bumpLive = (jobId: string, at: number): void => {
+    const existing = liveAt.get(jobId);
+    if (existing === undefined || (Number.isFinite(at) && (!Number.isFinite(existing) || at > existing))) {
+      liveAt.set(jobId, at);
+    }
+  };
+  for (const agent of agents) {
+    if (agent.jobId === null || agent.role !== 'minion') continue;
+    const supervision = agent.supervision;
+    const at = stamp(agent);
+    if (supervision === null || supervision === undefined) {
+      // Unsupervised worker: not a supervision stop. A DISPOSED record is
+      // not a live worker either — only a running unsupervised worker can
+      // clear a stopped record (final independent review E0).
+      if (agent.state === 'disposed') continue;
+      bumpLive(agent.jobId, at);
+      continue;
+    }
+    if (supervision.state !== 'stopped' && supervision.breakerOpen !== true) {
+      bumpLive(agent.jobId, at);
+      continue;
+    }
+    const view: WorkerStopView = { reason: supervision.stopReason ?? null, restarts: supervision.restarts };
+    const existing = stopped.get(agent.jobId);
+    if (existing === undefined || (Number.isFinite(at) && (!Number.isFinite(existing.at) || at > existing.at))) {
+      stopped.set(agent.jobId, { view, at });
+    }
+  }
+  const result = new Map<string, WorkerStopView>();
+  for (const [jobId, entry] of stopped) {
+    const live = liveAt.get(jobId);
+    // The stop marks the lane only when no live worker exists, or the
+    // newest live worker has a KNOWN and strictly older stamp. An unknown
+    // live stamp favors the live worker (registerAgent inserts
+    // last_activity NULL), so the fresh-worker window never inherits the
+    // previous worker's stop (final tracked-review A0/A1/E1/V1).
+    const waiting =
+      live === undefined || (Number.isFinite(entry.at) && Number.isFinite(live) && entry.at > live);
+    if (waiting) result.set(jobId, entry.view);
+  }
+  return result;
+}
+
+/** The status-chip label for a stopped lane: an explicit waiting state
+ * with its reason (`quota_wall` → "waiting · quota wall"). */
+export function workerStopLabel(stop: WorkerStopView): string {
+  const reason = stop.reason === null ? '' : stop.reason.replaceAll('_', ' ').trim();
+  return reason === '' ? 'waiting' : `waiting · ${reason}`;
+}
+
 /** A working lane that has shown no frames past the stall window. No
- * stamp at all is NOT evidence of stalling — never guess. */
+ * stamp at all is NOT evidence of stalling — never guess. A lane whose
+ * worker is supervision-stopped is not stalled either: the silence has a
+ * recorded cause (the stop), and COLD is for genuinely-silent lanes. */
 export function isStalledWorking(job: JobView, opts: BucketOptions = {}): boolean {
   if (job.status !== 'working') return false;
+  if (opts.stoppedWorkers?.has(job.id) === true) return false;
   const threshold = opts.stalledAfterMs ?? JOB_STALLED_AFTER_MS;
   const stamp = job.lastAgentActivity ?? job.lane?.createdAt ?? null;
   if (stamp === null) return false;
@@ -70,21 +166,21 @@ export function isStalledWorking(job: JobView, opts: BucketOptions = {}): boolea
   return (opts.now ?? Date.now()) - then > threshold;
 }
 
-/** Every reason a job earns Band 1 (exported for focused tests). */
+/** Every reason a job earns Band 1 (exported for focused tests). A
+ * terminal job (merged/done) is a closed receipt: neither stale review
+ * history nor leftover current-state rows may promote it back into NEEDS
+ * GRU (section-truth ruling 2026-09-29; the earlier 2026-09-26 guard
+ * suppressed only review history and still let current-state causes
+ * promote a concluded lane). Terminal-bound machine rows are attributed
+ * as receipts upstream (unackedByJob), so no live cause remains. */
 export function needsYouReasons(job: JobView, unacked: number): readonly string[] {
+  if (isJobConcluded(job.status)) return [];
   const reasons: string[] = [];
   if (unacked > 0) reasons.push('action-required');
   if (job.status === 'blocked' || job.status === 'error') reasons.push(job.status);
   if (derivedPrState(job) === 'conflicting') reasons.push('PR conflicting');
-  // Stale review decoration must not revive resolved merged/done work
-  // (owner ruling 2026-09-26): an aborted newest round or failed lenses
-  // are actionable only while the job is still open — on a concluded
-  // job they are ledger history. The current-state causes above still
-  // promote ANY status (unacked action-required, blocked/error,
-  // conflicting PR), so a genuinely separate owner obligation survives.
-  const concluded = job.status === 'merged' || job.status === 'done';
   const round = job.rounds.at(-1) ?? null;
-  if (round !== null && !concluded) {
+  if (round !== null) {
     if (round.status === 'aborted') reasons.push('round aborted');
     else if (round.status !== 'verdict-posted' && round.lenses.some((lens) => lens.state === 'error')) {
       reasons.push('lens failed');

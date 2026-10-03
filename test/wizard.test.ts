@@ -462,23 +462,24 @@ describe('wizard CLI surface', () => {
   it('--answers rejects secrets (token) and non-object JSON with the documented errors', () => {
     const repoRoot = join(import.meta.dirname, '..');
     const wizard = join(repoRoot, 'dist/wizard/main.js');
-    const runWizard = (answers: string): { status: number; stderr: string } => {
+    const runWizard = (answers: string): { status: number; stdout: string; stderr: string } => {
       try {
-        const out = execFileSync('bash', ['-c', `node ${JSON.stringify(wizard)} --answers ${JSON.stringify(answers)}`], {
+        const stdout = execFileSync('bash', ['-c', `node ${JSON.stringify(wizard)} --answers ${JSON.stringify(answers)}`], {
           encoding: 'utf-8',
           stdio: ['ignore', 'pipe', 'pipe'],
           env: { ...process.env, GRU_COMMAND_HOME: tempDir('gru-command-wizard-answers-') },
         });
-        return { status: 0, stderr: out };
+        return { status: 0, stdout, stderr: '' };
       } catch (error) {
-        const err = error as { status?: number; stderr?: string | Buffer };
-        return { status: err.status ?? 1, stderr: String(err.stderr ?? '') };
+        const err = error as { status?: number; stdout?: string | Buffer; stderr?: string | Buffer };
+        return { status: err.status ?? 1, stdout: String(err.stdout ?? ''), stderr: String(err.stderr ?? '') };
       }
     };
     // Secrets are forbidden on the command line (documented contract).
     const secret = runWizard('{"token":"leaky"}');
     expect(secret.status).toBe(1);
     expect(secret.stderr).toContain('secrets are forbidden in --answers: token');
+    expect(secret.stdout).not.toContain('Runtime probe:');
     // Non-object JSON must produce the documented parse error — never a
     // raw TypeError from the round-trip key pre-parse (Perkins R1 warning).
     for (const bad of ['null', '[1,2]', '"str"']) {
@@ -486,7 +487,28 @@ describe('wizard CLI surface', () => {
       expect(res.status, bad).toBe(1);
       expect(res.stderr, bad).toMatch(/must be a JSON object|not valid JSON/);
       expect(res.stderr, bad).not.toContain('TypeError');
+      // Fail-fast ordering: an invalid payload never reaches the runtime
+      // probe (which spawns runtime CLIs and loads the adapter SDKs).
+      expect(res.stdout, bad).not.toContain('Runtime probe:');
     }
+  });
+
+  it('a valid --answers run still prints the runtime probe (fail-fast only skips invalid input)', () => {
+    // Final independent review T0: the fail-fast refactor is asserted
+    // negatively above; this pins the other half — valid runs still probe
+    // (and therefore still print the probe block).
+    const repoRoot = join(import.meta.dirname, '..');
+    const wizard = join(repoRoot, 'dist', 'wizard', 'main.js');
+    const result = spawnSync(
+      process.execPath,
+      [wizard, '--answers', JSON.stringify({ smoke: false, port: 0 })],
+      {
+        encoding: 'utf-8',
+        env: { ...process.env, GRU_COMMAND_HOME: tempDir('gru-command-wizard-valid-') },
+      },
+    );
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(result.stdout).toContain('Runtime probe:');
   });
 
   it('pre-flight port check: an occupied fixed port fails LOUD with stop-first guidance, nothing written (Perkins r2 H2)', async () => {

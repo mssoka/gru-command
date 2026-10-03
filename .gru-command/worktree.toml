@@ -22,6 +22,11 @@ working-flavor = "cd web && npx vitest run src/lib/working-flavor.test.ts src/ui
 compaction-rollback = "npx vitest run test/pi-adapter.test.ts test/supervisor.test.ts test/config.test.ts test/health.test.ts test/board-engine.test.ts test/suite-shape.test.ts"
 native-compaction-wait = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/supervisor.test.ts test/suite-shape.test.ts"
 
+# Board acceptance evidence: mock browser services run under the scheduler,
+# not beside it. Keep each run's screenshots in a distinct artifact root.
+# This focused browser scope supplements FULL; it never replaces npm test.
+board-browser = "npm run build && npm run e2e -w web -- --project mock --grep 'board.*mock feed|cockpit layout|mock controls' --output ../_bmad-output/implementation-artifacts/board-section-truth/browser-$(git rev-parse HEAD)-$(date -u +%Y%m%dT%H%M%SZ)"
+
 # PR136 durable follow-through focused scope: every suite the delta can
 # move — the directive single-writer guard (ledger + HTTP), obligations
 # and hand-backs, the phase-handoff delta, the wake-digest/ops-skill
@@ -102,14 +107,61 @@ r13-review-repairs = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run 
 # exits never masked.
 board-merged-attention = "node tools/patch-vitest-rpc-timeout.mjs && cd web && ../node_modules/.bin/vitest run src/lib/board-bands.test.ts src/ui/board-merged-attention.test.ts"
 
-# T4 diagnosis (2026-10-02): the shared perkins-builtin-wave T4 case sits on
-# the 30s default ceiling under full-suite co-tenant load and has timed out
-# in FULL at multiple heads across lanes (shared fixture cost; the cost
-# repair is owned by the separate review-rebrief-interlock lane, unmerged —
-# never copied here). This scope isolates that single case at the unchanged
-# default ceiling so a FULL timeout can be classified (isolation pass vs
-# deterministic fail); it changes no test, timeout, assertion or gate.
-t4-oracle = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perkins-builtin-wave.test.ts -t \"does not record a reconciled delivery\""
+# T4 diagnosis (2026-10-02; updated 2026-10-03): the shared
+# perkins-builtin-wave T4 case sits on the 30s default ceiling under
+# full-suite co-tenant load and has timed out in FULL at multiple heads
+# across lanes (shared fixture cost; the cost repair is owned by the
+# separate review-rebrief-interlock lane, unmerged — never copied here).
+# The lane's own repair split the combined case into its two legs, so this
+# name-filter scope now runs BOTH legs at the unchanged default ceiling; it
+# changes no test, timeout, assertion or gate and is never a FULL substitute.
+t4-oracle = 'node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perkins-builtin-wave.test.ts -t "does not record a reconciled delivery"'
+
+# PR138 deadline repairs (2026-10-03): the five inherited 30s-default cases
+# that overran under co-tenant load at 92698f2 are repaired in-lane — the
+# wizard fails an invalid --answers payload before any probe work and loads
+# the probe dynamically; the dispatcher attribution case, the two T4 legs
+# and the verdict-shape matrix are one scenario per case; T4's origin is a
+# single batched bare clone and its scripted security evidence is locatable
+# in the fixture's own frozen diff; the installer ownership case drops its
+# redundant setup cycle. This scope re-runs the whole wizard file plus
+# exactly the repaired cases in the other four files, approved j-463 RPC
+# patch first, no timeout/worker/assertion flag — a repair check, never a
+# FULL substitute.
+deadline-repairs = 'node tools/patch-vitest-rpc-timeout.mjs && npm run lint && npm run typecheck && npm run build && npx vitest run test/wizard.test.ts && npx vitest run test/dispatch-server.test.ts test/install-one-line.test.ts test/perkins-builtin-wave.test.ts test/perkins-whole-review.test.ts -t "by=silas on the pr/review|without by, the pr/review|restarts only an owned service|does not record a reconciled delivery|rejects a submission with an empty/missing verdict|rejects an empty report|rejects a report omitting"'
+
+# PR138 final-review repairs (2026-10-03): the four independent lens rounds
+# at 37f0e14/9a58d79/53add5f/6aa20d7 plus the fce17f0 confirmation round
+# produced 61 findings, all triaged; the actionable ones are repaired through
+# this head (stop-truth alignment across supervisor/digest/board, disposed
+# and recency semantics, live-count SQL, cross-build drift alarm, wizard
+# fail-fast positive pin, mock fixture timing). This scope covers the touched
+# backend suites plus the whole web unit suite, with lint/typecheck/build;
+# approved j-463 RPC patch first, no timeout/worker/assertion flag — a repair
+# check, never a FULL substitute.
+final-review-repairs = 'node tools/patch-vitest-rpc-timeout.mjs && npm run lint && npm run typecheck && npm run build && npx vitest run test/silas-driver.test.ts test/supervisor.test.ts test/provider-recovery-seam.test.ts test/health.test.ts test/wizard.test.ts test/suite-shape.test.ts && cd web && ../node_modules/.bin/vitest run'
+
+# PR138 tracked-review repairs (2026-10-03, GC-commissioned jobs on f906):
+# the three tracked returns' accepted findings — board/digest recency and
+# unknown-stamp alignment, supervision-block boundary typing, receipt AA
+# composite, bidirectional terminal alarm, main-assembly wiring alarm, the
+# A4 producer agentId bindings, T4 origin-tip equivalence, and the scoped
+# browser clips. This scope covers the touched backend suites, the two
+# filtered heavy cases, and the whole web unit suite, with
+# lint/typecheck/build; approved j-463 RPC patch first, no
+# timeout/worker/assertion flag — a repair check, never a FULL substitute.
+tracked-review-repairs = 'node tools/patch-vitest-rpc-timeout.mjs && npm run lint && npm run typecheck && npm run build && npx vitest run test/silas-driver.test.ts test/github-poll.test.ts test/rebrief-recovery.test.ts test/supervisor.test.ts test/provider-recovery-seam.test.ts test/health.test.ts test/wizard.test.ts test/suite-shape.test.ts && npx vitest run test/dispatch-server.test.ts -t "silas/escalate posts" && npx vitest run test/perkins-builtin-wave.test.ts -t "does not record a reconciled delivery" && cd web && ../node_modules/.bin/vitest run'
+
+# PR138 A4 wave-alert identity extension (owner-approved journal j-978):
+# WaveRunner escalate context, the escalation-identity resolver/notifier,
+# the main assembly wiring, judgment-tier CI-failure binding, the shared
+# cross-surface stop and live/receipt fixtures, and the doc truth updates.
+# Covers the touched backend suites, the merge-resolved dispatch-server
+# and rebrief-recovery suites, the pinned producer escalations, and the
+# whole web unit suite, with lint/typecheck/build; approved j-463 RPC
+# patch first, no timeout/worker/assertion flag — a repair check, never a
+# FULL substitute.
+a4-wave-identity = 'node tools/patch-vitest-rpc-timeout.mjs && npm run lint && npm run typecheck && npm run build && npx vitest run test/escalation-identity.test.ts test/github-poll.test.ts test/silas-driver.test.ts test/supervisor.test.ts test/board-engine.test.ts test/rebrief-recovery.test.ts test/dispatch-server.test.ts test/suite-shape.test.ts && npx vitest run test/perkins-builtin-wave.test.ts -t "reconciles an interrupted live round|does not record a reconciled delivery" && cd web && ../node_modules/.bin/vitest run'
 
 # Isolated pre-fix baseline: current-main 059c0762 source with the IDENTICAL
 # final behavioral tests from the scheduled head, dependencies linked (no

@@ -88,6 +88,10 @@ export interface AgentSupervisionView {
   /** Restarts inside the current window (the breaker ring size). */
   readonly restarts: number;
   readonly breakerOpen: boolean;
+  /** Why the agent is stopped (failure class, crash loop, …) — null when
+   * running. The board renders this on the job lane instead of a bare
+   * "working" so a stopped lane never reads as live work. */
+  readonly stopReason: string | null;
   readonly openTurn: boolean;
   /** Control operations are always emitted by the real supervisor. */
   readonly openControl?: boolean;
@@ -134,6 +138,8 @@ interface SupervisedAgent {
   restartRing: number[];
   consecutiveFailures: number;
   breakerOpen: boolean;
+  /** Why the agent is stopped (null while running) — cleared on re-arm. */
+  stopReason: string | null;
   breakerNotificationId: string | null;
   /** A restart rung is executing: disposed envelopes must not evict us. */
   inRestart: boolean;
@@ -447,6 +453,7 @@ export class Supervisor {
         // Supervision off: no re-arm semantics — clear the stale breaker
         // state so the slot serves again (pure registry behavior).
         existing.breakerOpen = false;
+        existing.stopReason = null;
         existing.breakerNotificationId = null;
         existing.restartRing = [];
       } else {
@@ -454,6 +461,7 @@ export class Supervisor {
         // the stopped agent rather than serving it unsupervised — and the
         // escalation row resolves with it (acked by the re-arm itself).
         existing.breakerOpen = false;
+        existing.stopReason = null;
         const rearming = existing.breakerNotificationId;
         existing.breakerNotificationId = null;
         existing.restartRing = [];
@@ -537,6 +545,7 @@ export class Supervisor {
         .sort((left, right) => left - right);
       live.consecutiveFailures = Math.max(live.consecutiveFailures, inheritedFailures);
       live.breakerOpen = inheritedBreaker !== undefined;
+      live.stopReason = inheritedBreaker?.stopReason ?? null;
       live.breakerNotificationId =
         inheritedBreaker?.breakerNotificationId ?? live.breakerNotificationId;
     }
@@ -598,6 +607,7 @@ export class Supervisor {
         live.restartRing = [...live.restartRing, ...agent.restartRing].sort((a, b) => a - b);
         if (agent.breakerOpen && !live.breakerOpen) {
           live.breakerOpen = true;
+          live.stopReason = agent.stopReason;
           live.breakerNotificationId = agent.breakerNotificationId;
           live.state = 'stopped';
         }
@@ -808,6 +818,7 @@ export class Supervisor {
       restartRing: [],
       consecutiveFailures: 0,
       breakerOpen: false,
+      stopReason: null,
       breakerNotificationId: null,
       inRestart: false,
       backoffTimer: null,
@@ -1300,6 +1311,7 @@ export class Supervisor {
     agent.handle = null;
     agent.openTurn = false;
     agent.state = 'stopped';
+    agent.stopReason = 'review aborted';
     this.log('warn', 'isolated review attempt aborted for workflow-owned recovery', {
       agent_id: agent.agentId,
       reason,
@@ -1527,6 +1539,7 @@ export class Supervisor {
     if (agent.breakerOpen) return;
     agent.breakerOpen = true;
     agent.state = 'stopped';
+    agent.stopReason = failureClass;
     const handle = agent.handle;
     const captured = this.captureInterruptedTurn(handle, agent);
     if (captured !== null) agent.pendingRecovery = captured;
@@ -1806,6 +1819,12 @@ export class Supervisor {
     adopted.slotGeneration = old.slotGeneration;
     adopted.restartRing = old.restartRing;
     adopted.breakerOpen = old.breakerOpen;
+    // Enforce the copy-site invariant breakerOpen => stopReason: a carried
+    // open breaker keeps its recorded cause, a closed breaker carries none.
+    // (Restart rungs never reach this path with an open breaker, but a
+    // future adopter cannot silently violate the invariant; followup
+    // review, carryOverSupervision.)
+    adopted.stopReason = old.breakerOpen ? old.stopReason : null;
     adopted.breakerNotificationId = old.breakerNotificationId;
     // A turn interrupted by an earlier failed rung (or by the breaker
     // stop) still awaits resume on the next live handle.
@@ -2039,6 +2058,7 @@ export class Supervisor {
     if (agent.breakerOpen) return; // idempotent — one escalation per trip
     agent.breakerOpen = true;
     agent.state = 'stopped';
+    agent.stopReason = 'crash loop';
     const handle = agent.handle;
     // The turn this trip kills must survive as a recovery candidate: the
     // ack re-arm resumes it on the next live handle.
@@ -2097,6 +2117,7 @@ export class Supervisor {
     for (const agent of this.agents.values()) {
       if (agent.breakerNotificationId !== notificationId || !agent.breakerOpen) continue;
       agent.breakerOpen = false;
+      agent.stopReason = null;
       agent.breakerNotificationId = null;
       agent.restartRing = [];
       agent.consecutiveFailures = 0;
@@ -2142,6 +2163,10 @@ export class Supervisor {
     }
     if (!open) return false;
     agent.breakerOpen = false;
+    // The re-arm clears the stop cause with the breaker: a watching agent
+    // must never carry a stale stopReason (the invariant viewFor/health
+    // and the board rely on). Every other re-arm path clears it too.
+    agent.stopReason = null;
     agent.breakerNotificationId = null;
     agent.restartRing = [];
     agent.consecutiveFailures = 0;
@@ -2176,6 +2201,7 @@ export class Supervisor {
         state: agent.state,
         restarts: agent.restartRing.length,
         breakerOpen: agent.breakerOpen,
+        stopReason: agent.stopReason,
         openTurn: agent.openTurn,
         openControl: agent.openControl,
         openToolCalls: agent.openToolCalls.size,
@@ -2197,6 +2223,7 @@ export class Supervisor {
       state: agent.state,
       restarts: agent.restartRing.length,
       breakerOpen: agent.breakerOpen,
+      stopReason: agent.stopReason,
       openTurn: agent.openTurn,
       openControl: agent.openControl,
       openToolCalls: agent.openToolCalls.size,

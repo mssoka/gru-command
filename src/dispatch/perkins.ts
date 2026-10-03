@@ -986,6 +986,16 @@ export class HandoffHeldError extends Error {
   }
 }
 
+/** Bounded identity context for a wave escalation. A call site passes only
+ * values it already holds (its round/job record or a concrete actor id);
+ * title/detail text is never parsed for identity. Absent or contradictory
+ * context leaves the notification unbound and live. */
+export interface EscalationContext {
+  readonly jobId?: string;
+  readonly roundId?: string;
+  readonly agentId?: string;
+}
+
 export interface WaveRunnerOptions {
   readonly ledger: LedgerApi;
   readonly worktrees: WorktreePort;
@@ -1006,7 +1016,7 @@ export interface WaveRunnerOptions {
    * released before the wait so the retry can reacquire admission. */
   readonly retrySettlement?: (agentId: string) => Promise<RetrySettlement>;
   readonly poster?: VerdictPoster;
-  readonly escalate?: (title: string, detail: string) => void;
+  readonly escalate?: (title: string, detail: string, context?: EscalationContext) => void;
   /** Stable service-owned root. Required for every production review. */
   readonly reviewArtifactRoot?: string;
   /** Test/packaging seam. Production always uses the integrity-pinned loader. */
@@ -1108,7 +1118,7 @@ export class WaveRunner {
         this.opts.ledger.appendCustomEvent({ kind: 'job.review-handoff-failed', jobId: job.id,
           payload: { requestSeq: queued.seq, claimedSeq: claimed.seq, error },
         });
-        this.opts.escalate?.(`Queued review handoff for job ${job.id} needs reconciliation`, error);
+        this.opts.escalate?.(`Queued review handoff for job ${job.id} needs reconciliation`, error, { jobId: job.id });
         continue;
       }
       const payload = queued.payload as { input?: unknown } | null;
@@ -1119,7 +1129,7 @@ export class WaveRunner {
         this.opts.ledger.appendCustomEvent({ kind: 'job.review-handoff-failed', jobId: job.id,
           payload: { requestSeq: queued.seq, error },
         });
-        this.opts.escalate?.(`Queued review handoff failed for job ${job.id}`, error);
+        this.opts.escalate?.(`Queued review handoff failed for job ${job.id}`, error, { jobId: job.id });
         continue;
       }
       const pending = this.trackHandoff(input as { jobId: string }, queued.seq);
@@ -1343,6 +1353,7 @@ export class WaveRunner {
         this.opts.escalate?.(
           `Review round ${round.id} carries a posted verdict without a provider-bound receipt`,
           `restart recovery cannot verify the delivery of an unbound round.posted event (${bindingProblem ?? 'the preserved publication artifact did not match the posted digest'}); the round terminalizes as interrupted rather than promoting an unverifiable approval`,
+          { jobId: round.jobId, roundId: round.id },
         );
       }
       const note = 'review interrupted by service restart; required lens/verification proof is incomplete';
@@ -1354,7 +1365,7 @@ export class WaveRunner {
         roundId: round.id,
         payload: { reason: 'service_restart', artifactDirectory: artifacts.directory, reportFile: artifacts.reportFile },
       });
-      this.opts.escalate?.(`Review round ${round.id} is INCOMPLETE after service restart`, note);
+      this.opts.escalate?.(`Review round ${round.id} is INCOMPLETE after service restart`, note, { jobId: round.jobId, roundId: round.id });
       await this.sweepReviewWorktree(lane.id);
       recovered += 1;
       } catch (error) {
@@ -1369,6 +1380,10 @@ export class WaveRunner {
         this.opts.escalate?.(
           `Review round ${String(lane.roundId)} could not be processed during startup recovery`,
           `${String(error)} — the round is left as recorded for inspection; other rounds continue to recover`,
+          {
+            ...(lane.jobId !== null ? { jobId: lane.jobId } : {}),
+            ...(lane.roundId !== null ? { roundId: lane.roundId } : {}),
+          },
         );
       }
     }
@@ -1389,7 +1404,7 @@ export class WaveRunner {
             reportFile: artifacts.reportFile,
           },
         });
-        this.opts.escalate?.(`Review round ${round.id} is INCOMPLETE after service restart`, note);
+        this.opts.escalate?.(`Review round ${round.id} is INCOMPLETE after service restart`, note, { jobId: round.jobId, roundId: round.id });
         recovered += 1;
       }
     }
@@ -1571,6 +1586,7 @@ export class WaveRunner {
         this.opts.escalate?.(
           `Queued review handoff for job ${jobId} is held`,
           `The durable review request can no longer be authorized automatically: job status is ${error.status}. Re-request the review after the hold clears.`,
+          { jobId },
         );
         return;
       }
@@ -1586,7 +1602,7 @@ export class WaveRunner {
       }
       if (!this.shuttingDown) {
         this.opts.ledger.appendCustomEvent({ kind: 'job.review-handoff-failed', jobId, payload: { requestSeq: pending.seq, error: String(error) } });
-        this.opts.escalate?.(`Queued review handoff failed for job ${jobId}`, String(error));
+        this.opts.escalate?.(`Queued review handoff failed for job ${jobId}`, String(error), { jobId });
       }
     } finally {
       pending.starting = false;
@@ -1770,6 +1786,7 @@ export class WaveRunner {
       this.opts.escalate?.(
         `Review for job ${job.id} cannot gate: Perkins is unavailable and the fallback is not installed`,
         message,
+        { jobId: job.id },
       );
       return {
         route: 'bmad-review-fallback', failedLegs, skillInstalled: present, clearToMerge: false,
@@ -1836,6 +1853,7 @@ export class WaveRunner {
     this.opts.escalate?.(
       `Perkins gate unavailable for job ${job.id} — the bmad-review gate is engaged`,
       failedLegs.map((leg) => `${leg.leg}: ${leg.detail}`).join('; '),
+      { jobId: job.id },
     );
     let blockers = 0;
     let notes = 0;
@@ -1887,6 +1905,7 @@ export class WaveRunner {
         this.opts.escalate?.(
           `bmad-review gate PASS for job ${job.id} — clear to merge (merge stays user-held)`,
           `${notes} note(s) across ${iteration} review round(s). Reports: ${state.reportFiles.join(', ')}`,
+          { jobId: job.id },
         );
         return;
       }
@@ -1940,6 +1959,7 @@ export class WaveRunner {
     this.opts.escalate?.(
       `bmad-review gate BLOCKED for job ${jobId}`,
       `${reason}. Reports: ${reports.join(', ')}. Merge is NOT clear; restore the Perkins gate for autonomous gating.`,
+      { jobId },
     );
   }
 
@@ -2323,6 +2343,7 @@ export class WaveRunner {
         this.opts.escalate?.(
           `Perkins review for job ${input.job.id} was blocked before any round: the PR head could not be verified`,
           detail,
+          { jobId: input.job.id },
         );
       }
       throw error;
@@ -2381,6 +2402,7 @@ export class WaveRunner {
           this.opts.escalate?.(
             `Review round ${round.id} disposal failed after completion`,
             `The settled review outcome was preserved, but releasing its resident handles failed: ${String(closeError)}`,
+            { jobId: job.id, roundId: round.id },
           );
         }
       } finally {
@@ -2499,7 +2521,7 @@ export class WaveRunner {
         roundId: round.id,
         payload: { reason: signal.aborted ? 'cancelled' : 'workflow_error', error: detail.slice(0, 500), reportFile },
       });
-      this.opts.escalate?.(`Review round ${round.id} is INCOMPLETE`, detail);
+      this.opts.escalate?.(`Review round ${round.id} is INCOMPLETE`, detail, { jobId: job.id, roundId: round.id });
       return {
         round: this.opts.ledger.getRound(round.id) as RoundRecord,
         results: lenses.map(() => ({ state: 'error' as const, note: detail })),
@@ -2704,6 +2726,7 @@ export class WaveRunner {
                 this.opts.escalate?.(
                   `Perkins report for round ${round.id} reconciled a provider review but did NOT record it`,
                   `${reason}; the remote comment is preserved as unrecorded evidence and the round stays honestly unposted — the changed head was not reviewed`,
+                  { jobId: round.jobId, roundId: round.id },
                 );
                 reconciledDelivery = null;
               } else {
@@ -2722,6 +2745,7 @@ export class WaveRunner {
           this.opts.escalate?.(
             `Perkins report for round ${round.id} was recorded but NOT posted safely to the pull request`,
             String(error),
+            { jobId: round.jobId, roundId: round.id },
           );
           this.log('error', 'Perkins report post failed', { round: round.id, error: String(error) });
         }
@@ -2734,12 +2758,14 @@ export class WaveRunner {
       this.opts.escalate?.(
         `Perkins report for round ${round.id} was recorded but has NO pull request to publish to`,
         'the job has no pull request link; a conclusive review cannot be published',
+        { jobId: round.jobId, roundId: round.id },
       );
     } else if (canonical !== 'INCOMPLETE' && job.prUrl !== null) {
       deliveryError = new Error('the PR poster is unavailable');
       this.opts.escalate?.(
         `Perkins report for round ${round.id} was recorded but NOT posted to the pull request`,
         'the PR poster is unavailable',
+        { jobId: round.jobId, roundId: round.id },
       );
     }
 
@@ -2793,6 +2819,7 @@ export class WaveRunner {
       this.opts.escalate?.(
         `Review round ${round.id} is INCOMPLETE`,
         `required coverage, verification, source stability, or delivery proof did not complete. Report: ${reportFile}`,
+        { jobId: job.id, roundId: round.id },
       );
     }
     return {
@@ -2851,7 +2878,7 @@ export class WaveRunner {
         round: round.id, error: String(ledgerError),
       });
     }
-    this.opts.escalate?.(`Review round ${round.id} is INCOMPLETE`, detail);
+    this.opts.escalate?.(`Review round ${round.id} is INCOMPLETE`, detail, { jobId: job.id, roundId: round.id });
     let moved = true;
     try {
       moved = refMovedSinceFreeze(frozenReview);

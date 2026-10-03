@@ -145,6 +145,8 @@ export interface BoardSnapshot {
   readonly decisions: DecisionRuntimeStatus;
   /** NEEDS GRU: machine-attention rows still awaiting a disposition
    * (self-clearing machine queue; never rings the owner bell). Counted
+   * LIVE: rows bound to a terminal (merged/done) job are closed receipts —
+   * the record keeps them, this count (and the banding) does not. Read
    * from the table, not the 30-row feed window, so the tracker is true. */
   readonly unackedActionRequired: number;
   /** FOR YOU: needs-owner rows still awaiting a human ack — the only
@@ -447,7 +449,7 @@ export class BoardEngine {
       agents,
       notifications: this.notifications(),
       decisions: this.decisionsStatus(),
-      unackedActionRequired: this.ledger.countPendingActionRequired(),
+      unackedActionRequired: this.ledger.countLivePendingActionRequired(),
       unackedNeedsOwner: this.ledger.countPendingNeedsOwner(),
       wakes: {
         count: this.ledger.countEvents('gru.wake'),

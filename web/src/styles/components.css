@@ -2400,6 +2400,23 @@ body {
   color: var(--on-state);
 }
 
+/* A closed receipt is record-only history, never live work: keep it
+ * readable but de-emphasized beside live machine rows. The dashed border
+ * alone marks it — row-level opacity was removed because dimming
+ * composited the title/meta below WCAG AA (the palette-contrast suite
+ * now pins the receipt composite; tracked-review A2). */
+.board-notification--receipt {
+  border-style: dashed;
+}
+
+/* A receipt keeps the error row's readable ink for its meta line: the
+ * rail's faint default on the alert surface composes below the AA floor
+ * the palette suite enforces. */
+.board-notification--error.board-notification--receipt .board-notification__meta {
+  color: var(--on-state);
+  opacity: 1;
+}
+
 .board-notification__title {
   font-weight: 800;
 }
