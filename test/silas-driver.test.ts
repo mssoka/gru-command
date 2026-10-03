@@ -628,6 +628,9 @@ describe('silas skills and wake prompt', () => {
     expect(ops).not.toContain('headless print mode');
     // The owner-held merge rule must live on the loaded skill body itself
     // (loop-1 adoption), not only in the composed wake prompt header.
+    // Fail-before evidence for this block comes from the negative pins: the
+    // base tree already carried the owner-held section, so the POSITIVE pin
+    // is a regression guard, not a fail-before oracle.
     expect(ops).toContain('The owner holds ALL merges');
     expect(ops).toContain('the owner merges gru-command too');
     expect(ops).not.toContain('The chief holds merge authority');
@@ -652,6 +655,11 @@ describe('silas skills and wake prompt', () => {
     // review/fix routing only; READY is still required to present a merge.
     expect(ops).toContain('its PASS is not Perkins READY');
     expect(ops).toContain('escalate the missing Perkins gate');
+    // Corrected completion order (native r3): push -> exact-head CI -> gate,
+    // and the gated head is never moved afterwards.
+    expect(ops).toContain("push the job's own PR branch normally");
+    expect(ops).toContain('let exact-head CI land');
+    expect(ops).toContain('never move the head after the gate');
     expect(ops).not.toContain("carrying that gate's");
     expect(ops).not.toContain('the fallback gate never authorizes one');
     // Outcome truth (owner clarification 2026-10-02).

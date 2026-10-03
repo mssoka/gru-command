@@ -94,6 +94,19 @@ function assertDistCurrent(): void {
         `${error instanceof Error ? error.message : String(error)}`,
     );
   }
+  // The staged layout copies roles/, resources/, and package.json from the
+  // working tree: a dirty checkout at the same HEAD would green over
+  // uncommitted prompt text, so refuse those inputs explicitly.
+  const dirty = execFileSync(
+    'git',
+    ['-C', repoRoot, 'status', '--porcelain', '--', 'roles', 'resources', 'package.json'],
+    { encoding: 'utf-8' },
+  ).trim();
+  if (dirty !== '') {
+    throw new Error(
+      `the installed-layout gate inputs are dirty: ${dirty.split('\n').join('; ')} — commit before running this scope`,
+    );
+  }
   const built = readBuildInfo(repoRoot).rev;
   if (built !== head) {
     throw new Error(
@@ -291,9 +304,10 @@ describe('installed-layout playbook loading (shipped artifact, clean install)', 
     // task-relevant entry is found by its description metadata, and the
     // unrelated sibling is not selected.
     expect(selectImplementationSkills(project)).toEqual(['bmad-delivery-cycle']);
-    // The shipped worker contract is satisfied without the old name: no
-    // catalog name (and no bmad-* skill token at all) is pinned in the
-    // prompt, so a rename cannot strand the playbook.
+    // The shipped worker contract names no entry from the staged catalog
+    // and no bmad-* token at all, so a rename of the installed build skill
+    // cannot strand the playbook. This pins name-absence plus the
+    // metadata-selection clauses; it is prose, not a runtime selector.
     const flat = staged.minion.replace(/\s+/gu, ' ');
     expect(flat).toContain("the PROJECT's actual installed skill catalog and metadata");
     expect(flat).toContain('select by capability from what the project really has installed');

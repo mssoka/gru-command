@@ -693,33 +693,54 @@ describe('nested parent/reviewer admission (shipped playbook contract, j-810/j-8
       expect(spawned).toHaveLength(4);
       expect(gate.view().worker).toMatchObject({ limit: 4, running: 4 });
 
-      // Saturated residency: the nested reviewer stays queued while all four
+      // Saturated residency: the nested reviewers stay queued while all four
       // parent leases are open; no admission, no spawn, limits unchanged.
-      const reviewerPromise = service.dispatch({
+      const reviewerOne = service.dispatch({
+        jobId: 'parent-a-review-blind',
+        repoPath: repo.path,
+        title: 'reviewer one',
+        briefing: 'read-only review brief one',
+      });
+      const reviewerTwo = service.dispatch({
         jobId: 'parent-a-review-verifgap',
         repoPath: repo.path,
-        title: 'reviewer',
-        briefing: 'read-only review brief',
+        title: 'reviewer two',
+        briefing: 'read-only review brief two',
       });
       await flush();
       await flush();
       expect(spawned).toHaveLength(4);
+      // FIFO through the dispatch seam: head waiter first, next waiter behind it.
       expect(gate.view().worker.queued.map((entry) => entry.id)).toEqual([
+        'parent-a-review-blind',
         'parent-a-review-verifgap',
       ]);
       expect(gate.view().worker.running).toBe(4);
 
-      // Any parent settling frees a slot; the reviewer admits into it.
+      // Any parent settling frees a slot; the head waiter admits into it.
       spawned[1]!.settle();
-      const reviewer = await reviewerPromise;
-      expect(reviewer.agentId).not.toBeNull();
+      const first = await reviewerOne;
+      expect(first.agentId).not.toBeNull();
       expect(spawned).toHaveLength(5);
+      expect(spawned[4]!.calls.map((call) => call.text).join('\n')).toContain('review brief one');
+      expect(gate.view().worker.running).toBe(4);
+      // The second waiter is still queued behind the four live leases.
+      expect(gate.view().worker.queued.map((entry) => entry.id)).toEqual([
+        'parent-a-review-verifgap',
+      ]);
+
+      // A second parent settling admits the remaining reviewer in order.
+      spawned[2]!.settle();
+      const second = await reviewerTwo;
+      expect(second.agentId).not.toBeNull();
+      expect(spawned).toHaveLength(6);
+      expect(spawned[5]!.calls.map((call) => call.text).join('\n')).toContain('review brief two');
       expect(gate.view().worker.running).toBe(4);
       expect(gate.view().worker.queued).toHaveLength(0);
-      expect(events.filter((kind) => kind === 'pacing.queued')).toHaveLength(1);
+      expect(events.filter((kind) => kind === 'pacing.queued')).toHaveLength(2);
 
       for (let index = 0; index < spawned.length; index += 1) {
-        if (index !== 1) spawned[index]!.settle();
+        if (index !== 1 && index !== 2) spawned[index]!.settle();
       }
       await vi.waitFor(() => expect(gate.view().worker.running).toBe(0));
     } finally {

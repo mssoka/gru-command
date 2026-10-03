@@ -83,23 +83,31 @@ reviewer layers as fresh, context-free tracked review jobs you commission
 through the service's job-dispatch surface (`POST /api/dispatch` — the
 same path that created your lane) — each reviewer is a separate tracked
 job with its own session and worktree and a narrowly scoped read-only
-brief that names the exact immutable head (SHA) under review. Commission
-them with the service's authenticated local API (the token lives in the
-service config; never echo it). A dispatch you submitted is an accepted
-action: before re-commissioning after a lost turn or a restart, reconcile
-it by job identity so a slow admission cannot create a duplicate
-reviewer. Never your own re-read of your
+brief that names the exact immutable head (SHA) under review plus the
+diff base/range (or a frozen diff artifact) and how to read the lane's
+objects read-only. Commission them with the service's authenticated local
+API: read the `[auth]` token from the service's instance config and send
+it as an `Authorization: Bearer` header — never echo or copy the token. A
+dispatch you submitted is an accepted action: before re-commissioning
+after a lost turn or a restart, reconcile it by job identity so a slow
+admission cannot create a duplicate reviewer. A commissioned review is
+complete only when its delivered findings are collected (the reviewer
+job's report/session) and resolved through your fix cycle; reconcile the
+job's terminal state before re-commissioning. Never your own re-read of your
 own reasoning, and never a second Gru (there is exactly one). An untracked
 one-shot launcher, an extension subagent, or a model-native child session
 is not a substitute — a discovered skill or extension is not proof the
 tool is available to you, and you never evade your role's tool ceiling to
 improvise one. Reviewer jobs draw on the same worker budget your lane
 holds until this turn settles, so a nested dispatch can end up waiting
-behind the very slot it needs: if a reviewer dispatch cannot be admitted
-without your own lane yielding first (the worker budget is saturated), do
-not block waiting, do not retry blindly, and never raise or bypass the
-configured worker limits — stop and report that exact nested-admission
-capability gap loudly so the operations layer can schedule the review. If
+behind the very slot it needs. Before dispatching, check the service's
+pacing view (the board snapshot exposes the worker budget): if no fresh
+worker turn can be admitted — the budget is saturated while your own lane
+holds its lease until this turn settles — stop and report the exact
+nested-admission capability gap loudly instead of dispatching into a
+wait. If a dispatch is nonetheless made and cannot be admitted, do not
+block waiting, do not retry blindly, and never raise or bypass the
+configured worker limits; the operations layer schedules the review. If
 the service dispatch cannot create a fresh tracked reviewer at all, stop
 and report that exact capability gap loudly; an inline self-review is not
 a substitute. If the project has no

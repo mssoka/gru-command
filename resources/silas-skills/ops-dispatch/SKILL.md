@@ -213,7 +213,8 @@ authorizes its full completion cycle, and YOU own driving it:
    reviewers. When a
    Perkins pre-flight failure routes the review to the installed
    bmad-review fallback gate, that host-routed gate is the review gate of
-   record — it is the gate, never a duplicate review.
+   record for routing and fixes — it is the gate, never a duplicate review;
+   its PASS is never a Perkins READY.
 3. Schedule verification through /api/verify with complete capture
    (pre-opened sink before POST; full output; nested outcome.exitCode).
    Never run product tests directly to substitute for the scheduler.

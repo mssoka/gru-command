@@ -163,7 +163,7 @@ route:
 
 All legs pass → Perkins review (the gate). Any leg fails → the request
 routes to the bmad-review skill **if installed** (never bundled with the
-product). The fallback carries FULL GATE semantics: the session returns
+product). The fallback carries the review gate's routing/fix semantics: the session returns
 findings; the host triages them (release-safety categories — correctness,
 security, data loss, broken builds, and related crash/regression/
 vulnerability/injection/secret-leak tags — are BLOCKERS; the rest are
@@ -285,7 +285,7 @@ capacity; when the settled PR head has passed its prerequisites
 head, NEEDS CHANGES routes back to the same implementing minion's fix
 cycle, and the owner merges. When a Perkins pre-flight failure routes the
 review to the installed bmad-review fallback gate (§4b), that host-routed
-gate is the review gate of record — it is the gate, never a duplicate.
+gate is the review gate of record for routing and fixes — it is the gate, never a duplicate.
 
 ## 4f. Continuous completion (owner contract 2026-10-02)
 

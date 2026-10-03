@@ -161,7 +161,7 @@ external pins `cis=v0.3.2`, `tea=v1.27.2`, `gds=v0.7.2`. Runtime bindings
 follow the selected `pi`/Claude tools. Existing/customized installs
 default to **reuse unchanged**; per-repo skip is always available.
 The pinned set carries `bmad-review` out of the box, and it is a gate:
-0 blockers clears the review/fix routing, while blockers route back to the
+0 blockers clear the review/fix routing, while blockers route back to the
 implementing minion as fix directives—never inform-only. Perkins
 (GitHub/GitLab) is the stronger gate with exact-head verdicts; an
 exact-final-head Perkins READY is required before a merge is presented to

@@ -1364,6 +1364,7 @@ describe('packaged product and terminal-frame coverage (N6)', () => {
     expect(stagedMinion).toContain('You own the selected workflow end to end');
     expect(stagedMinion).toContain('fresh, context-free tracked review jobs');
     expect(stagedMinion).not.toContain('pi -p');
+    expect(stagedMinion).not.toContain('claude -p');
     expect(stagedMinion).not.toContain('headless print mode');
     expect(stagedMinion).toContain('an inline self-review is not a substitute');
     expect(stagedMinion).toContain('Project-local BMAD setup');
@@ -1397,7 +1398,11 @@ describe('packaged product and terminal-frame coverage (N6)', () => {
     expect(stagedOps).toContain('never compensate by reopening delivered jobs or building');
     // The shipped worker prompt points at this README section: prove the
     // heading travels in the installed package.
-    expect(readFileSync(join(stage, 'README.md'), 'utf-8')).toContain('### Project-local BMAD setup');
+    const stagedReadme = readFileSync(join(stage, 'README.md'), 'utf-8');
+    expect(stagedReadme).toContain('### Project-local BMAD setup');
+    // The shipped README carries the corrected fallback-gate semantics too.
+    expect(stagedReadme).toContain('its PASS is not a Perkins READY');
+    expect(stagedReadme).not.toContain('0 blockers means clear to merge');
     const stagedOpsTokens = [...stagedOps.matchAll(/bmad-[a-z][a-z-]*/gu)].map((match) => match[0]);
     expect(stagedOpsTokens.every((token) => token === 'bmad-review' || token === 'bmad-review-fallback')).toBe(true);
     expect(() => execFileSync(process.execPath, [join(stage, 'tools', 'verify-perkins-resource.mjs'), stage], {
@@ -1420,6 +1425,7 @@ describe('packaged product and terminal-frame coverage (N6)', () => {
       const gruPrompt = flatten(ROLE_DEFINITIONS.gru.systemPrompt);
       if (!minionPrompt.includes("the PROJECT's actual installed skill catalog and metadata") ||
           !minionPrompt.includes('fresh, context-free tracked review jobs') ||
+          minionPrompt.includes('claude -p') ||
           !minionPrompt.includes('Approved work runs to its end without a new go-ahead') ||
           /bmad-[a-z][a-z-]*/.test(minionPrompt)) {
         throw new Error('staged minion prompt lacks the BMAD workflow playbook');
