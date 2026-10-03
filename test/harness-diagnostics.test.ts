@@ -5,7 +5,9 @@ import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   FixtureStepTimeoutError,
+  activateTestScope,
   currentTestScope,
+  deactivateTestScope,
   disposeScopeProcesses,
   isTimeoutError,
   markFixtureStep,
