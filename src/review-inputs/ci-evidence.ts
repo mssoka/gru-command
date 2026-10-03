@@ -291,6 +291,7 @@ export function renderRecordedCiEvidence(input: CiEvidenceInput): {
       state: 'green', ...base,
       repo: bound.repo, pr: bound.pr, sha: bound.sha, observedAt: bound.ts,
       sourceKind: bound.kind, sourceSeq: bound.seq, checks: boundedList(bound.checks, MAX_RENDERED_CHECKS),
+      reason: null,
     };
     const block = [
       header,
@@ -309,6 +310,7 @@ export function renderRecordedCiEvidence(input: CiEvidenceInput): {
       state: 'pending', ...base,
       repo: bound.repo, pr: bound.pr, sha: bound.sha, observedAt: bound.ts,
       sourceKind: bound.kind, sourceSeq: bound.seq, checks: boundedList(bound.checks, MAX_RENDERED_CHECKS),
+      reason: null,
     };
     const block = [
       header,
@@ -327,6 +329,7 @@ export function renderRecordedCiEvidence(input: CiEvidenceInput): {
     repo: bound.repo, pr: bound.pr, sha: bound.sha, observedAt: bound.ts,
     sourceKind: bound.kind, sourceSeq: bound.seq,
     failures: boundedList(bound.failures, MAX_RENDERED_FAILURES),
+    reason: null,
   };
   const block = [
     header,
