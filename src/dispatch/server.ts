@@ -753,6 +753,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       // semantics) so a terminal lane's leftover escalation is classified
       // as a closed receipt; no bound worker → unbound and live
       // (unknown historical rows are never guessed; tracked-review A4).
+      // Selection is listAgents order, as resolveEscalationAgent documents.
       const boundMinion =
         jobId !== undefined
           ? options.ledger.listAgents().find((agent) => agent.jobId === jobId && agent.role === 'minion')

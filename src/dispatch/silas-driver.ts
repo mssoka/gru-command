@@ -650,11 +650,15 @@ export interface GitHubPollPort {
 
 /** Bind the supervisor's live per-agent views to the digest's lookup. This
  * is the one seam main.ts wires; it is a factory so the binding is testable
- * without booting the service (final independent review T2). */
+ * without booting the service (final independent review T2). The argument
+ * is a GETTER, not the value: the lookup is late-bound exactly like the
+ * engine's inline closure, so a construction-order change (or a
+ * not-yet-assigned handle) can never freeze a null supervisor and silently
+ * disable the stop truth for every lane (twelve-followthrough A4). */
 export function supervisionLookup(
-  supervisor: { readonly viewFor: (agentId: string) => AgentSupervisionView | null } | null,
+  getSupervisor: () => { readonly viewFor: (agentId: string) => AgentSupervisionView | null } | null,
 ): (agentId: string) => AgentSupervisionView | null {
-  return (agentId) => supervisor?.viewFor(agentId) ?? null;
+  return (agentId) => getSupervisor()?.viewFor(agentId) ?? null;
 }
 
 export interface SilasDriverOptions {

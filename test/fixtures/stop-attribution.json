@@ -1,5 +1,5 @@
 {
-  "note": "ONE fixture, TWO surfaces: web stoppedWorkersByJob and backend computeSilasDigest must agree on these exact agents (ids/stamps/views/reason). Consumed by web/src/lib/board-bands.test.ts and test/silas-driver.test.ts \u2014 do not fork the values; a change here must hold for both predicates.",
+  "note": "ONE fixture, TWO surfaces: web stoppedWorkersByJob/isStalledWorking and backend computeSilasDigest must agree on these exact agents (ids/createdAt/stamps/views/reason) AND on the board stall outcome. Consumed by web/src/lib/board-bands.test.ts and test/silas-driver.test.ts — do not fork the values; a change here must hold for both predicates.",
   "digestNow": "2026-09-23T10:00:00.000Z",
   "freshRegistrationAt": "2026-09-23T09:50:00.000Z",
   "cases": [
@@ -11,6 +11,7 @@
           "jobId": "job-1",
           "state": "streaming",
           "lastActivity": "2026-09-23T08:00:00.000Z",
+          "createdAt": "2026-09-23T07:00:00.000Z",
           "supervision": {
             "state": "watching",
             "restarts": 0,
@@ -23,6 +24,7 @@
           "jobId": "job-1",
           "state": "idle",
           "lastActivity": "2026-09-23T09:00:00.000Z",
+          "createdAt": "2026-09-23T08:30:00.000Z",
           "supervision": {
             "state": "stopped",
             "restarts": 1,
@@ -34,7 +36,8 @@
       "board": {
         "waiting": true,
         "reason": "quota_wall",
-        "restarts": 1
+        "restarts": 1,
+        "stalled": false
       },
       "digest": {
         "stalled": false
@@ -48,6 +51,7 @@
           "jobId": "job-1",
           "state": "idle",
           "lastActivity": "2026-09-23T09:00:00.000Z",
+          "createdAt": "2026-09-23T08:30:00.000Z",
           "supervision": {
             "state": "stopped",
             "restarts": 1,
@@ -60,6 +64,7 @@
           "jobId": "job-1",
           "state": "spawning",
           "lastActivity": null,
+          "createdAt": "2026-09-23T09:50:00.000Z",
           "supervision": {
             "state": "watching",
             "restarts": 0,
@@ -69,7 +74,8 @@
         }
       ],
       "board": {
-        "waiting": false
+        "waiting": false,
+        "stalled": false
       },
       "digest": {
         "stalled": false
@@ -83,6 +89,7 @@
           "jobId": "job-1",
           "state": "idle",
           "lastActivity": "2026-09-23T08:00:00.000Z",
+          "createdAt": "2026-09-23T07:30:00.000Z",
           "supervision": {
             "state": "stopped",
             "restarts": 1,
@@ -95,6 +102,7 @@
           "jobId": "job-1",
           "state": "idle",
           "lastActivity": "2026-09-23T09:00:00.000Z",
+          "createdAt": "2026-09-23T08:30:00.000Z",
           "supervision": {
             "state": "stopped",
             "restarts": 4,
@@ -106,7 +114,8 @@
       "board": {
         "waiting": true,
         "reason": "crash loop",
-        "restarts": 4
+        "restarts": 4,
+        "stalled": false
       },
       "digest": {
         "stalled": false
@@ -120,6 +129,7 @@
           "jobId": "job-1",
           "state": "streaming",
           "lastActivity": "2026-09-23T08:00:00.000Z",
+          "createdAt": "2026-09-23T07:00:00.000Z",
           "supervision": {
             "state": "watching",
             "restarts": 0,
@@ -129,7 +139,8 @@
         }
       ],
       "board": {
-        "waiting": false
+        "waiting": false,
+        "stalled": true
       },
       "digest": {
         "stalled": true
@@ -143,6 +154,7 @@
           "jobId": "job-1",
           "state": "idle",
           "lastActivity": "2026-09-23T09:00:00.000Z",
+          "createdAt": "2026-09-23T08:30:00.000Z",
           "supervision": {
             "state": "stopped",
             "restarts": 2,
@@ -155,6 +167,7 @@
           "jobId": "job-1",
           "state": "streaming",
           "lastActivity": "2026-09-23T09:00:00.000Z",
+          "createdAt": "2026-09-23T08:45:00.000Z",
           "supervision": {
             "state": "watching",
             "restarts": 0,
@@ -164,7 +177,8 @@
         }
       ],
       "board": {
-        "waiting": false
+        "waiting": false,
+        "stalled": true
       },
       "digest": {
         "stalled": true
@@ -178,6 +192,7 @@
           "jobId": "job-1",
           "state": "idle",
           "lastActivity": "2026-09-23T09:00:00.000Z",
+          "createdAt": "2026-09-23T08:30:00.000Z",
           "supervision": {
             "state": "stopped",
             "restarts": 1,
@@ -190,6 +205,7 @@
           "jobId": "job-1",
           "state": "idle",
           "lastActivity": "2026-09-23T09:00:00.000Z",
+          "createdAt": "2026-09-23T08:45:00.000Z",
           "supervision": {
             "state": "stopped",
             "restarts": 4,
@@ -201,7 +217,8 @@
       "board": {
         "waiting": true,
         "reason": "quota_wall",
-        "restarts": 1
+        "restarts": 1,
+        "stalled": false
       },
       "digest": {
         "stalled": false
@@ -215,6 +232,7 @@
           "jobId": "job-1",
           "state": "idle",
           "lastActivity": "2026-09-23T09:30:00.000Z",
+          "createdAt": "2026-09-23T08:30:00.000Z",
           "supervision": {
             "state": "stopped",
             "restarts": 1,
@@ -227,6 +245,7 @@
           "jobId": "job-1",
           "state": "streaming",
           "lastActivity": "2026-09-23T09:00:00.000Z",
+          "createdAt": "2026-09-23T08:45:00.000Z",
           "supervision": {
             "state": "watching",
             "restarts": 0,
@@ -239,6 +258,7 @@
           "jobId": "job-1",
           "state": "idle",
           "lastActivity": "2026-09-23T10:00:00.000Z",
+          "createdAt": "2026-09-23T09:30:00.000Z",
           "supervision": {
             "state": "stopped",
             "restarts": 4,
@@ -250,7 +270,48 @@
       "board": {
         "waiting": true,
         "reason": "crash loop",
-        "restarts": 4
+        "restarts": 4,
+        "stalled": false
+      },
+      "digest": {
+        "stalled": false
+      }
+    },
+    {
+      "name": "an unknown-stamp stop newer than a known stop speaks for the lane",
+      "agents": [
+        {
+          "id": "known-stop",
+          "jobId": "job-1",
+          "state": "idle",
+          "lastActivity": "2026-09-23T09:00:00.000Z",
+          "createdAt": "2026-09-23T08:00:00.000Z",
+          "supervision": {
+            "state": "stopped",
+            "restarts": 1,
+            "breakerOpen": true,
+            "stopReason": "quota_wall"
+          }
+        },
+        {
+          "id": "unknown-stop",
+          "jobId": "job-1",
+          "state": "idle",
+          "lastActivity": null,
+          "createdAt": "2026-09-23T09:30:00.000Z",
+          "supervision": {
+            "state": "stopped",
+            "restarts": 4,
+            "breakerOpen": true,
+            "stopReason": "crash loop"
+          }
+        }
+      ],
+      "board": {
+        "waiting": true,
+        "reason": "crash loop",
+        "restarts": 4,
+        "stalled": false
       },
       "digest": {
         "stalled": false

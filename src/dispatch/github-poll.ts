@@ -1089,7 +1089,8 @@ export class GitHubSignalPoll {
 
   /** The lane's current worker id for the existing notification.agentId
    * binding; null when no worker is bound (the row stays unbound and
-   * live). */
+   * live). Selection follows ledger.listAgents() order like the A4
+   * resolver; any same-job minion classifies against the same job. */
   private laneMinionId(jobId: string): string | null {
     return this.ledger.listAgents().find((agent) => agent.jobId === jobId && agent.role === 'minion')?.id ?? null;
   }

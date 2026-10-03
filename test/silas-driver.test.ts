@@ -447,6 +447,7 @@ describe('silas digest (the four actionable states)', () => {
           readonly jobId: string;
           readonly state: string;
           readonly lastActivity: string | null;
+          readonly createdAt: string;
           readonly supervision: {
             readonly state: 'watching' | 'restarting' | 'stopped';
             readonly restarts: number;
@@ -467,7 +468,9 @@ describe('silas digest (the four actionable states)', () => {
         vi.useFakeTimers();
         try {
           for (const agent of testCase.agents) {
-            vi.setSystemTime(new Date(agent.lastActivity ?? fixture.freshRegistrationAt));
+            // Registration stamps the row's createdAt; an inactive worker
+            // keeps last_activity NULL and orders by that createdAt.
+            vi.setSystemTime(new Date(agent.lastActivity ?? agent.createdAt ?? fixture.freshRegistrationAt));
             h.ledger.registerAgent({ id: agent.id, role: 'minion', jobId: agent.jobId });
             if (agent.lastActivity !== null) h.ledger.setAgentState(agent.id, 'idle');
           }
@@ -509,27 +512,33 @@ describe('silas digest (the four actionable states)', () => {
   it('supervisionLookup binds the supervisor views exactly as main.ts wires them', () => {
     // Final independent review T2: the factory is the tested seam; a
     // dropped or broken binding would silently re-enable stall wakes for
-    // stopped lanes.
+    // stopped lanes. Twelve-followthrough A4: the lookup is LATE-BOUND —
+    // the getter is read per call, so a handle assigned after construction
+    // is seen instead of freezing a null supervisor.
     const view: AgentSupervisionView = {
       agentId: 'wired', role: 'minion', slotId: null, state: 'stopped', restarts: 2,
       breakerOpen: true, stopReason: 'quota_wall', openTurn: false, openToolCalls: 0,
       lastEventAt: null, lastFileBytes: null,
     };
-    const lookup = supervisionLookup({ viewFor: (agentId) => (agentId === 'wired' ? view : null) });
+    let current: { readonly viewFor: (agentId: string) => AgentSupervisionView | null } | null = null;
+    const lookup = supervisionLookup(() => current);
+    // A missing supervisor (not yet constructed at boot) reads as no view.
+    expect(lookup('wired')).toBeNull();
+    current = { viewFor: (agentId) => (agentId === 'wired' ? view : null) };
     expect(lookup('wired')).toBe(view);
     expect(lookup('other')).toBeNull();
-    // A missing supervisor (not yet constructed at boot) reads as no view.
-    expect(supervisionLookup(null)('wired')).toBeNull();
+    expect(supervisionLookup(() => null)('wired')).toBeNull();
   });
 
   it('the main assembly wires the supervisor stop truth into the driver (assembly alarm)', () => {
     // Tracked-review V2: the behavior has unit coverage but no assembly
-    // pin — dropping `supervisionFor: supervisionLookup(supervisor)` in
-    // main.ts would silently re-enable stall wakes for stopped lanes and
-    // no behavioral test would fail. This is the repo's established
-    // source-drift alarm pattern.
+    // pin — dropping the supervisionFor wiring in main.ts would silently
+    // re-enable stall wakes for stopped lanes and no behavioral test would
+    // fail. Twelve-followthrough A4: the pin requires the late-bound
+    // getter form, not an early-captured value. This is the repo's
+    // established source-drift alarm pattern.
     const mainSource = readFileSync(join(import.meta.dirname, '..', 'src', 'main.ts'), 'utf8');
-    expect(mainSource).toMatch(/supervisionFor:\s*supervisionLookup\(\s*supervisor\s*\)/);
+    expect(mainSource).toMatch(/supervisionFor:\s*supervisionLookup\(\s*\(\)\s*=>\s*supervisor\s*\)/);
     expect(mainSource).toMatch(/import\s*\{[^}]*\bsupervisionLookup\b[^}]*\}\s*from\s*'\.\/dispatch\/silas-driver\.js'/);
   });
 

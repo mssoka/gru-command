@@ -1616,6 +1616,67 @@ describe('supervisor — Perkins r1 fixes', () => {
     h.dispose();
   });
 
+  it('retiring a dead OPEN-breaker stale slot record carries the stop cause onto the live record (V2)', async () => {
+    const h = boot();
+    const slot = h.supervisor.declareSlot({
+      id: 'gru-open-retire',
+      role: 'gru',
+      spawn: (options) => h.registry.spawn('gru', options),
+    });
+    const first = (await slot.ensure({})) as FakeHandle;
+    // The reachable ensure flows clear a picked open breaker before any
+    // spawn (the slot-use re-arm, pinned by r1-17), so no black-box
+    // sequence hands retirement a STILL-OPEN record. This constructs that
+    // stale shape directly — a dead slot-bound record with an open
+    // breaker whose slot generation has moved on — to pin the defensive
+    // merge: without the stop-cause carry the replacement would render a
+    // bare waiting chip (stopReason null) instead of `waiting · quota wall`.
+    const internals = h.supervisor as unknown as {
+      slots: Map<string, { generation: number }>;
+      agents: Map<string, Record<string, unknown>>;
+    };
+    const internalSlot = internals.slots.get('gru-open-retire')!;
+    internals.agents.set('stale-open-stop', {
+      agentId: 'stale-open-stop',
+      role: 'gru',
+      slot: internalSlot,
+      slotGeneration: internalSlot.generation - 1,
+      handle: null,
+      sessionFile: null,
+      state: 'stopped',
+      openTurn: false,
+      openControl: false,
+      compactionWarned: false,
+      openToolCalls: new Map(),
+      pendingRecovery: null,
+      lastEventAt: 0,
+      lastFileBytes: null,
+      restartRing: [],
+      consecutiveFailures: 0,
+      breakerOpen: true,
+      stopReason: 'quota_wall',
+      breakerNotificationId: null,
+      inRestart: false,
+      backoffTimer: null,
+      activityGeneration: 0,
+      decisionPending: false,
+      failureTerminalPending: false,
+      queuedRecovery: null,
+      rateLimitRetry: null,
+      recoveryAdmission: null,
+    });
+    // The current record dies outside a restart rung; ensure() spawns the
+    // replacement and retires BOTH dead records, merging the open one.
+    await h.registry.disposeHandle(first);
+    const replacement = (await slot.ensure({})) as FakeHandle;
+    expect(h.supervisor.viewFor(replacement.id)).toMatchObject({
+      state: 'stopped',
+      breakerOpen: true,
+      stopReason: 'quota_wall',
+    });
+    h.dispose();
+  });
+
   it('r1-2: supervision.enabled=false gates EVERY side-effect — pure registry behavior', async () => {
     const dir = tmpDir();
     const db = new LedgerDb(dir);

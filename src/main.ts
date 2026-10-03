@@ -1389,8 +1389,10 @@ async function main(): Promise<number> {
       },
       bus,
       // Same live stop truth the board renders: a supervision-stopped
-      // worker is waiting on a human re-arm, never a stalled lane.
-      supervisionFor: supervisionLookup(supervisor),
+      // worker is waiting on a human re-arm, never a stalled lane. The
+      // getter keeps the lookup late-bound like the engine's closure — a
+      // construction-order change can never freeze a null handle (A4).
+      supervisionFor: supervisionLookup(() => supervisor),
       // Chief phase-3 seam: every deterministic Silas pass (bus wake events
       // and sweep ticks) reconsidered pending review handoffs BEFORE any
       // LLM wake — bounded, no-overlap, fence-preserving.

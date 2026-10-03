@@ -23,6 +23,10 @@ import { configPathFor, loadConfig } from '../src/config.js';
 import { RuntimeRegistry } from '../src/runtime/registry.js';
 import { SessionStore } from '../src/sessions/store.js';
 import type { PrHeadProbe } from '../src/dispatch/perkins-review/fresh-head.js';
+import { BoardEngine } from '../src/board/engine.js';
+import { createReviewEscalationNotifier } from '../src/dispatch/escalation-identity.js';
+import { NotificationCenter } from '../src/notifications/center.js';
+import { terminalBoundNotificationIds } from '../web/src/lib/board-signals.js';
 
 /** These suites exercise the Perkins route (no pre-flight configured), so
  * every runRound result must be a wave outcome; the helper pins that. */
@@ -675,6 +679,30 @@ describe('WaveRunner built-in Perkins production path', () => {
     // Producer context: the recovery escalation carries its validated
     // round/job identity for the notification binding (followup A4).
     expect(escalationContexts[0]).toEqual({ jobId: 'job-restart', roundId: round.id });
+    // V1 chain: the REAL producer context above — not a handcrafted one —
+    // flows through the notifier into a live row, and the lane
+    // terminalizing reclassifies that emitted row as a closed receipt on
+    // BOTH surfaces (the ledger's live chip count and the board's
+    // terminal-bound set the bell renders from).
+    ledger.registerAgent({ id: 'minion-restart-receipt', role: 'minion', jobId: job.id });
+    const chainCenter = new NotificationCenter({ ledger, bus: new EventBus() });
+    const liveBefore = ledger.countLivePendingActionRequired();
+    const receiptsBefore = ledger.countPendingActionRequiredIncludingReceipts();
+    createReviewEscalationNotifier(ledger, chainCenter)(
+      'chain: Review round INCOMPLETE',
+      'chain detail',
+      escalationContexts[0],
+    );
+    const chainRow = ledger
+      .listNotifications({ limit: 100 })
+      .find((row) => row.kind === 'review-escalation' && row.title === 'chain: Review round INCOMPLETE');
+    expect(chainRow?.agentId).toBe('minion-restart-receipt');
+    expect(ledger.countLivePendingActionRequired()).toBe(liveBefore + 1);
+    ledger.setJobStatus(job.id, 'merged');
+    expect(ledger.countLivePendingActionRequired()).toBe(liveBefore);
+    expect(ledger.countPendingActionRequiredIncludingReceipts()).toBe(receiptsBefore + 1);
+    const receiptSnapshot = new BoardEngine({ ledger, bus: new EventBus() }).snapshot();
+    expect(terminalBoundNotificationIds(receiptSnapshot)).toContain(chainRow?.id);
     rmSync(root, { recursive: true, force: true });
     rmSync(artifacts, { recursive: true, force: true });
   });

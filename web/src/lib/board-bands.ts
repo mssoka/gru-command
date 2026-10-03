@@ -51,6 +51,12 @@ export interface BucketOptions {
   /** Supervision-stopped worker views per job id (from the snapshot's
    * agent rows) — a stopped lane is waiting, never silent-stalled. */
   readonly stoppedWorkers?: ReadonlyMap<string, WorkerStopView>;
+  /** The stall clock's floor per job: the newest `lastActivity ?? createdAt`
+   * stamp among the lane's LIVE minion workers (from the snapshot's agent
+   * rows via `liveWorkerStampsByJob`). Mirrors the digest's worker pool so
+   * a re-dispatched lane whose fresh worker has no frames yet is never
+   * falsely COLD on the superseded stop's old stamp (A1/E1). */
+  readonly liveWorkerStamps?: ReadonlyMap<string, number>;
 }
 
 /** The newest frame-ish stamp on the job: agent activity, else the lane's
@@ -91,16 +97,29 @@ export interface WorkerStopView {
  * must find it to re-arm). A stopped worker marks the lane only when no
  * live (non-stopped, non-breaker, non-disposed) worker is NEWER — or
  * none exists; when several workers are stopped, the NEWEST recorded
- * stop (by lastActivity) speaks for the lane. A KNOWN live stamp must be
- * strictly older for the stop to win: an unknown live stamp (a fresh
- * worker registered before its first activity — last_activity is NULL)
- * favors the live worker, so a re-dispatched lane never reads waiting
- * from its previous worker. */
+ * stop speaks for the lane — by activity stamp when known, else by its
+ * createdAt registration order, so a stop recorded before its first
+ * frame is never masked by an older known one (A8). A KNOWN live stamp
+ * must be strictly older for the stop to win: an unknown live stamp (a
+ * fresh worker registered before its first activity — last_activity is
+ * NULL) favors the live worker, so a re-dispatched lane never reads
+ * waiting from its previous worker. */
 export function stoppedWorkersByJob(agents: readonly AgentView[]): Map<string, WorkerStopView> {
-  const stopped = new Map<string, { readonly view: WorkerStopView; readonly at: number }>();
+  const stopped = new Map<string, { readonly view: WorkerStopView; readonly orderAt: number }>();
+  const stopKnownAt = new Map<string, number>();
   const liveAt = new Map<string, number>();
+  // The waiting decision compares KNOWN activity stamps only — exactly
+  // the digest's rule (last_activity is NULL for a worker that has not
+  // spoken yet; a fresh registration must not inherit a stop).
   const stamp = (agent: AgentView): number =>
     agent.lastActivity === null ? Number.NaN : Date.parse(agent.lastActivity);
+  // The DISPLAYED stop is the newest by (lastActivity ?? createdAt), so a
+  // stop record with no activity yet still orders by its registration.
+  const orderStamp = (agent: AgentView): number => {
+    const known = stamp(agent);
+    if (Number.isFinite(known)) return known;
+    return agent.createdAt === undefined ? Number.NaN : Date.parse(agent.createdAt);
+  };
   const bumpLive = (jobId: string, at: number): void => {
     const existing = liveAt.get(jobId);
     if (existing === undefined || (Number.isFinite(at) && (!Number.isFinite(existing) || at > existing))) {
@@ -124,9 +143,17 @@ export function stoppedWorkersByJob(agents: readonly AgentView[]): Map<string, W
       continue;
     }
     const view: WorkerStopView = { reason: supervision.stopReason ?? null, restarts: supervision.restarts };
+    const knownPrior = stopKnownAt.get(agent.jobId);
+    if (Number.isFinite(at) && (knownPrior === undefined || at > knownPrior)) {
+      stopKnownAt.set(agent.jobId, at);
+    }
+    const orderAt = orderStamp(agent);
     const existing = stopped.get(agent.jobId);
-    if (existing === undefined || (Number.isFinite(at) && (!Number.isFinite(existing.at) || at > existing.at))) {
-      stopped.set(agent.jobId, { view, at });
+    if (
+      existing === undefined ||
+      (Number.isFinite(orderAt) && (!Number.isFinite(existing.orderAt) || orderAt > existing.orderAt))
+    ) {
+      stopped.set(agent.jobId, { view, orderAt });
     }
   }
   const result = new Map<string, WorkerStopView>();
@@ -136,12 +163,47 @@ export function stoppedWorkersByJob(agents: readonly AgentView[]): Map<string, W
     // newest live worker has a KNOWN and strictly older stamp. An unknown
     // live stamp favors the live worker (registerAgent inserts
     // last_activity NULL), so the fresh-worker window never inherits the
-    // previous worker's stop (final tracked-review A0/A1/E1/V1).
+    // previous worker's stop (final tracked-review A0/A1/E1/V1). The
+    // comparison uses the newest KNOWN stop stamp across the lane's stops
+    // (not the displayed one), so the selected reason can never flip the
+    // waiting outcome vs the digest.
+    const known = stopKnownAt.get(jobId) ?? Number.NaN;
     const waiting =
-      live === undefined || (Number.isFinite(entry.at) && Number.isFinite(live) && entry.at > live);
+      live === undefined || (Number.isFinite(known) && Number.isFinite(live) && known > live);
     if (waiting) result.set(jobId, entry.view);
   }
   return result;
+}
+
+/** The stall clock's per-job floor: the newest `lastActivity ?? createdAt`
+ * stamp among the lane's LIVE minion workers — the same live predicate
+ * `stoppedWorkersByJob` uses (and the digest's `lastActivity ?? createdAt`
+ * pool). A fresh worker registered before its first frame contributes its
+ * createdAt, so a re-dispatched lane is never falsely COLD on the
+ * superseded stop's old stamp; without a live worker the caller falls
+ * back to the job's own recency fields. */
+export function liveWorkerStampsByJob(agents: readonly AgentView[]): Map<string, number> {
+  const stamps = new Map<string, number>();
+  for (const agent of agents) {
+    if (agent.jobId === null || agent.role !== 'minion') continue;
+    const supervision = agent.supervision;
+    if (
+      supervision !== null &&
+      supervision !== undefined &&
+      (supervision.state === 'stopped' || supervision.breakerOpen === true)
+    ) {
+      continue;
+    }
+    // A disposed unsupervised record is not a live worker (mirror E0).
+    if ((supervision === null || supervision === undefined) && agent.state === 'disposed') continue;
+    const raw = agent.lastActivity ?? agent.createdAt ?? null;
+    if (raw === null) continue;
+    const at = Date.parse(raw);
+    if (Number.isNaN(at)) continue;
+    const existing = stamps.get(agent.jobId);
+    if (existing === undefined || at > existing) stamps.set(agent.jobId, at);
+  }
+  return stamps;
 }
 
 /** The status-chip label for a stopped lane: an explicit waiting state
@@ -159,10 +221,20 @@ export function isStalledWorking(job: JobView, opts: BucketOptions = {}): boolea
   if (job.status !== 'working') return false;
   if (opts.stoppedWorkers?.has(job.id) === true) return false;
   const threshold = opts.stalledAfterMs ?? JOB_STALLED_AFTER_MS;
-  const stamp = job.lastAgentActivity ?? job.lane?.createdAt ?? null;
-  if (stamp === null) return false;
-  const then = Date.parse(stamp);
-  if (Number.isNaN(then)) return false;
+  const recorded = job.lastAgentActivity ?? job.lane?.createdAt ?? null;
+  const recordedMs = recorded === null ? null : Date.parse(recorded);
+  const workerMs = opts.liveWorkerStamps?.get(job.id) ?? null;
+  // The stall clock starts at the NEWEST of the lane's recorded activity
+  // and its live worker's registration: a re-dispatched lane's fresh
+  // worker (lastActivity NULL) speaks through its createdAt, exactly as
+  // the digest's `lastActivity ?? createdAt` fallback does (A1/E1).
+  const then =
+    workerMs === null
+      ? recordedMs
+      : recordedMs === null || Number.isNaN(recordedMs)
+        ? workerMs
+        : Math.max(recordedMs, workerMs);
+  if (then === null || Number.isNaN(then)) return false;
   return (opts.now ?? Date.now()) - then > threshold;
 }
 

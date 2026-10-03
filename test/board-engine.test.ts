@@ -796,4 +796,16 @@ describe('board engine — FOR YOU owner-PR projection on the snapshot', () => {
     expect(snap.notifications.find((row) => row.id === 'old-owner-stop')).toMatchObject({ ackedAt: null });
     expect(snap.ownerPrs.map((row) => row.jobId)).toEqual(['job-ready']);
   });
+
+  it('the main assembly binds the supervisor stop truth into the board engine (assembly alarm)', () => {
+    // Twelve-followthrough A3: the waiting-chip truth rides a main.ts
+    // closure; engine unit tests inject their own supervisionFor and the
+    // browser gate runs against the mock, so dropping the production
+    // binding stayed green. This is the repo's established source-drift
+    // alarm pattern (the same shape as the driver/notifier pins).
+    const mainSource = readFileSync(join(import.meta.dirname, '..', 'src', 'main.ts'), 'utf8');
+    expect(mainSource).toMatch(
+      /new BoardEngine\(\{[\s\S]*?supervisionFor:\s*\(agentId\)\s*=>\s*supervisor\?\.viewFor\(agentId\)\s*\?\?\s*null/,
+    );
+  });
 });

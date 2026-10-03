@@ -15,6 +15,7 @@ import {
   bucketJobs,
   isStalledWorking,
   jobRecency,
+  liveWorkerStampsByJob,
   needsYouReasons,
   settledWindow,
   stoppedWorkersByJob,
@@ -574,6 +575,7 @@ describe('board bands — stopped-worker truth (waiting, not stalled)', () => {
         'utf-8',
       ),
     ) as {
+      readonly digestNow: string;
       readonly cases: readonly {
         readonly name: string;
         readonly agents: readonly {
@@ -581,23 +583,29 @@ describe('board bands — stopped-worker truth (waiting, not stalled)', () => {
           readonly jobId: string;
           readonly state: string;
           readonly lastActivity: string | null;
+          readonly createdAt: string;
           readonly supervision: AgentView['supervision'];
         }[];
-        readonly board: { readonly waiting: boolean; readonly reason?: string; readonly restarts?: number };
+        readonly board: {
+          readonly waiting: boolean;
+          readonly reason?: string;
+          readonly restarts?: number;
+          readonly stalled: boolean;
+        };
       }[];
     };
     expect(fixture.cases.length).toBeGreaterThan(2);
     for (const testCase of fixture.cases) {
-      const map = stoppedWorkersByJob(
-        testCase.agents.map((agent) =>
-          agentView(agent.id, {
-            jobId: agent.jobId,
-            state: agent.state,
-            lastActivity: agent.lastActivity,
-            supervision: agent.supervision,
-          }),
-        ),
+      const agents = testCase.agents.map((agent) =>
+        agentView(agent.id, {
+          jobId: agent.jobId,
+          state: agent.state,
+          lastActivity: agent.lastActivity,
+          createdAt: agent.createdAt,
+          supervision: agent.supervision,
+        }),
       );
+      const map = stoppedWorkersByJob(agents);
       if (testCase.board.waiting) {
         expect(map.get('job-1'), testCase.name).toEqual({
           reason: testCase.board.reason,
@@ -606,6 +614,24 @@ describe('board bands — stopped-worker truth (waiting, not stalled)', () => {
       } else {
         expect(map.has('job-1'), testCase.name).toBe(false);
       }
+      // The stall clock pins the same fixture the digest pins: the job
+      // stamp mirrors the engine's newest-known-activity rule, and the
+      // live-worker floor keeps a fresh registration off the cold band
+      // (A1/E1 — the fresh-worker case fails here without the floor).
+      const lastActivity =
+        testCase.agents
+          .map((agent) => agent.lastActivity)
+          .filter((value): value is string => value !== null)
+          .sort()
+          .at(-1) ?? null;
+      const stalled = isStalledWorking(job({ id: 'job-1', lastAgentActivity: lastActivity }), {
+        now: Date.parse(fixture.digestNow),
+        stoppedWorkers: map,
+        liveWorkerStamps: liveWorkerStampsByJob(agents),
+      });
+      expect(stalled, `${testCase.name}: board ${testCase.board.stalled ? 'must' : 'must not'} stall`).toBe(
+        testCase.board.stalled,
+      );
     }
   });
 

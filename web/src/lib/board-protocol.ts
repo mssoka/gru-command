@@ -70,6 +70,9 @@ export interface AgentView {
   readonly label: string | null;
   readonly state: string;
   readonly lastActivity: string | null;
+  /** Row registration stamp. Optional: pre-upgrade servers did not send
+   * it, and the board then falls back to lastActivity-only stall truth. */
+  readonly createdAt?: string;
   readonly sessionFile: string | null;
   readonly jobId: string | null;
   readonly roundId: string | null;
@@ -523,6 +526,8 @@ export function isValidSnapshot(value: unknown): value is BoardSnapshot {
       typeof agent.id === 'string' &&
       typeof agent.role === 'string' &&
       typeof agent.state === 'string' &&
+      // createdAt is optional (pre-upgrade servers); present, it is a string.
+      (agent.createdAt === undefined || agent.createdAt === null || typeof agent.createdAt === 'string') &&
       // supervision is optional (null when the agent is unsupervised);
       // stopReason is optional too (pre-reason servers) — present, it is
       // a nullable string. The whole PRESENT block is typed strictly (A9):

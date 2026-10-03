@@ -1,6 +1,7 @@
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import ts from 'typescript';
 import { afterEach, describe, expect, it } from 'vitest';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
@@ -175,5 +176,63 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       /import\s*\{[^}]*\bcreateReviewEscalationNotifier\b[^}]*\}\s*from\s*'\.\/dispatch\/escalation-identity\.js'/,
     );
     expect(mainSource).toMatch(/escalate:\s*createReviewEscalationNotifier\(\s*ledger\s*,\s*notifications\s*\)/);
+  });
+
+  it('every wave escalation call site carries its bounded identity context — or is an explicit residual (A7/V1 table)', () => {
+    // Twelve-followthrough A7/V1: context coverage is hand-maintained per
+    // call site. This table enumerates every `this.opts.escalate?.()` site
+    // in production with its expected context text, so dropping a context,
+    // changing its identity fields, or adding an unclassed site fails here
+    // instead of silently re-living the terminal-lane receipt defect.
+    const source = readFileSync(join(import.meta.dirname, '..', 'src', 'dispatch', 'perkins.ts'), 'utf8');
+    const file = ts.createSourceFile('perkins.ts', source, ts.ScriptTarget.Latest, true);
+    const normalize = (text: string): string => text.replace(/\s+/g, ' ').trim();
+    const sites: { readonly title: string; readonly context: string | null }[] = [];
+    const visit = (node: ts.Node): void => {
+      if (
+        ts.isCallExpression(node) &&
+        ts.isPropertyAccessExpression(node.expression) &&
+        node.expression.name.text === 'escalate'
+      ) {
+        sites.push({
+          title: normalize(node.arguments[0]!.getText()),
+          context: node.arguments.length >= 3 ? normalize(node.arguments[2]!.getText()) : null,
+        });
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(file);
+    // 21 of 24 sites carry the bounded context; the three null rows are the
+    // sanctioned residuals (shutdown deadline, live-process pause, sweep
+    // error) that stay deliberately context-free and live (A7 rejection
+    // stands; a worktree id is never coerced into a round identity).
+    const expected: readonly (readonly [string, string | null])[] = [
+      ['`Queued review handoff for job ${job.id} needs reconciliation`', '{ jobId: job.id }'],
+      ['`Queued review handoff failed for job ${job.id}`', '{ jobId: job.id }'],
+      ["'Perkins review shutdown deadline exceeded'", null],
+      ['`Review round ${round.id} carries a posted verdict without a provider-bound receipt`', '{ jobId: round.jobId, roundId: round.id }'],
+      ['`Review round ${round.id} is INCOMPLETE after service restart`', '{ jobId: round.jobId, roundId: round.id }'],
+      ['`Review round ${String(lane.roundId)} could not be processed during startup recovery`', '{ ...(lane.jobId !== null ? { jobId: lane.jobId } : {}), ...(lane.roundId !== null ? { roundId: lane.roundId } : {}), }'],
+      ['`Review round ${round.id} is INCOMPLETE after service restart`', '{ jobId: round.jobId, roundId: round.id }'],
+      ['`Queued review handoff for job ${jobId} is held`', '{ jobId }'],
+      ['`Queued review handoff failed for job ${jobId}`', '{ jobId }'],
+      ['`Review for job ${job.id} cannot gate: Perkins is unavailable and the fallback is not installed`', '{ jobId: job.id }'],
+      ['`Perkins gate unavailable for job ${job.id} — the bmad-review gate is engaged`', '{ jobId: job.id }'],
+      ['`bmad-review gate PASS for job ${job.id} — clear to merge (merge stays user-held)`', '{ jobId: job.id }'],
+      ['`bmad-review gate BLOCKED for job ${jobId}`', '{ jobId }'],
+      ['`Perkins review for job ${input.job.id} was blocked before any round: the PR head could not be verified`', '{ jobId: input.job.id }'],
+      ['`Review round ${round.id} disposal failed after completion`', '{ jobId: job.id, roundId: round.id }'],
+      ['`Review round ${round.id} is INCOMPLETE`', '{ jobId: job.id, roundId: round.id }'],
+      ['`Perkins report for round ${round.id} reconciled a provider review but did NOT record it`', '{ jobId: round.jobId, roundId: round.id }'],
+      ['`Perkins report for round ${round.id} was recorded but NOT posted safely to the pull request`', '{ jobId: round.jobId, roundId: round.id }'],
+      ['`Perkins report for round ${round.id} was recorded but has NO pull request to publish to`', '{ jobId: round.jobId, roundId: round.id }'],
+      ['`Perkins report for round ${round.id} was recorded but NOT posted to the pull request`', '{ jobId: round.jobId, roundId: round.id }'],
+      ['`Review round ${round.id} is INCOMPLETE`', '{ jobId: job.id, roundId: round.id }'],
+      ['`Review round ${round.id} is INCOMPLETE`', '{ jobId: job.id, roundId: round.id }'],
+      ['`Review worktree for round ${worktreeId} paused on live processes`', null],
+      ['`Review worktree for round ${worktreeId} could not be swept`', null],
+    ];
+    expect(sites.map((site) => [site.title, site.context])).toEqual(expected);
+    expect(sites.filter((site) => site.context !== null)).toHaveLength(21);
   });
 });

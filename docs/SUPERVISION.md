@@ -155,7 +155,12 @@ computed per-snapshot.
   breaker-open worker leaves the job status working, but the lane renders an
   explicit waiting state with its recorded reason (`waiting · quota wall`);
   the Silas stall channel never wakes such a lane — only genuinely silent
-  live workers stall.
+  live workers stall. The lane's current worker decides whether a stop
+  shows: a newer live worker clears an older stop, a fresh worker
+  registered before its first frame counts as live (its registration
+  stamps the stall clock), and among stops the newest recorded one speaks
+  (activity stamp first, registration order when unknown). A re-dispatched
+  lane is never COLD on the superseded stop's stamp.
 
 **Ack ids — nothing shown is unproven.** Every notification carries a
 stable id (the ack contract). When a client displays one — a toast, the

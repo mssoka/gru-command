@@ -37,6 +37,7 @@ import {
   BAND_LABELS,
   BAND_ORDER,
   bucketSnapshot,
+  liveWorkerStampsByJob,
   settledWindow,
   stoppedWorkersByJob,
   workerStopLabel,
@@ -534,8 +535,17 @@ export class BoardView {
     // Section truth: the live needs-Gru view counts only LIVE rows. The
     // stopped-worker map carries the supervision stop (waiting-on-rearm)
     // truth for working lanes; terminal-job notifications stay in the bell.
+    // The live-worker stamps keep a re-dispatched lane's fresh registration
+    // on the stall clock's floor (never falsely COLD — twelve-followthrough
+    // A1/E1).
     const stoppedWorkers = stoppedWorkersByJob(snapshot.agents);
-    const bands = bucketSnapshot(snapshot, { now: Date.now(), unackedByJob: unacked, stoppedWorkers });
+    const liveWorkerStamps = liveWorkerStampsByJob(snapshot.agents);
+    const bands = bucketSnapshot(snapshot, {
+      now: Date.now(),
+      unackedByJob: unacked,
+      stoppedWorkers,
+      liveWorkerStamps,
+    });
     const seenIds = new Set<string>();
     for (const band of BAND_ORDER) {
       const jobs = bands.find((group) => group.band === band)?.jobs ?? [];

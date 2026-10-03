@@ -41,8 +41,13 @@ export function resolveEscalationAgent(
     return agent.id;
   }
   if (jobId === null) return null;
-  // Bind the lane's current worker: the actor that must act on the alert,
-  // exactly the producer pattern the other machine rows use.
+  // Bind the lane's worker: the actor that must act on the alert, exactly
+  // the producer pattern the other machine rows use. Selection follows
+  // ledger.listAgents() order (most recently updated row first); any
+  // same-job minion yields the same job-level receipt classification, so
+  // a superseded-but-later-touched row stays job-correct. This seam
+  // deliberately does not read supervision and must not grow an
+  // unsupervised "current worker" guess (twelve-followthrough A2).
   return ledger.listAgents().find((agent) => agent.jobId === jobId && agent.role === 'minion')?.id ?? null;
 }
 

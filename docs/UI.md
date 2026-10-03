@@ -323,7 +323,12 @@ Two section-truth rules keep the bands honest (2026-09-29):
   worker is supervision-stopped (breaker open) shows an explicit
   `waiting · <reason>` status chip (e.g. `waiting · quota wall`) instead
   of a bare `working` — the supervisor records why it stopped, and the
-  board relays it. Only the lane's own minion speaks for the lane:
+  board relays it. The lane's CURRENT worker decides: a newer live
+  (non-stopped, non-disposed) worker clears an older stop, a fresh worker
+  registered before its first frame counts as live (its registration
+  stamps the stall clock), and when several stops exist the newest
+  recorded one speaks — by activity stamp, else by registration order.
+  Only the lane's own minion speaks for the lane:
   workflow-owned stops (e.g. an aborted isolated review attempt) belong
   to the round lifecycle and never render a working lane as waiting.
   Such a lane is never flagged `stalled` and never sinks to COLD: COLD

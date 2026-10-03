@@ -173,3 +173,14 @@ a4-wave-identity = 'node tools/patch-vitest-rpc-timeout.mjs && npm run lint && n
 # out, and no branch/worktree holds the sha.
 board-merged-attention-baseline = 'set -e; base=059c076290145d4aae6e0b47c7b3f87156862c43; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-board-merged-attention.XXXXXX"); git archive "$base" | tar -x -C "$d"; git show "$headrev":web/src/lib/board-bands.test.ts > "$d/web/src/lib/board-bands.test.ts"; git show "$headrev":web/src/ui/board-merged-attention.test.ts > "$d/web/src/ui/board-merged-attention.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; ln -s "$root/web/node_modules" "$d/web/node_modules"; printf "board-merged-attention-baseline base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/board-merged-attention-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs && cd web && ../node_modules/.bin/vitest run src/lib/board-bands.test.ts src/ui/board-merged-attention.test.ts'
 finding-dedupe-recency = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perkins-findings-dedupe.test.ts test/suite-shape.test.ts"
+
+# PR138 twelve-followthrough repairs (2026-10-03, silas sweep commission):
+# the A1/E1 stall-stamp floor + shared-fixture board stall pin, A4
+# late-bound supervision lookup and its assembly alarm, A3 engine wiring
+# alarm, A7/V1 producer-context table and the real-producer receipt chain,
+# A8 unknown-stamp stop ordering, V2 stale-slot stop-cause carry, and the
+# docs precedence notes. Covers the touched backend suites, the filtered
+# heavy recovery case, and the whole web unit suite, with
+# lint/typecheck/build; approved j-463 RPC patch first, no
+# timeout/worker/assertion flag — a repair check, never a FULL substitute.
+twelve-followthrough = 'node tools/patch-vitest-rpc-timeout.mjs && npm run lint && npm run typecheck && npm run build && npx vitest run test/escalation-identity.test.ts test/board-engine.test.ts test/silas-driver.test.ts test/supervisor.test.ts test/suite-shape.test.ts && npx vitest run test/perkins-builtin-wave.test.ts -t "reconciles an interrupted live round as durable INCOMPLETE" && cd web && ../node_modules/.bin/vitest run'

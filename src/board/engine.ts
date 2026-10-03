@@ -570,6 +570,9 @@ export class BoardEngine {
       label: agent.label,
       state: agent.state,
       lastActivity: agent.lastActivity,
+      // The row's registration stamp: the board's stall clock floor for a
+      // fresh worker that has not sent its first frame (twelve-followthrough A1/E1).
+      createdAt: agent.createdAt,
       sessionFile: agent.sessionFile,
       jobId: agent.jobId,
       roundId: agent.roundId,
