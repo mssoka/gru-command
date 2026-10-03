@@ -2828,13 +2828,18 @@ describe('bounded lookup growth and link sanity', () => {
     const error = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }).then(() => null, (cause: unknown) => cause as Error);
     expect(error?.message ?? '').toMatch(/delivery stays unproven/u);
     expect(error?.message ?? '').not.toMatch(/did not land/u);
+    // The reordered page-5 bound was read and the POST walk extended toward
+    // it (pages 1 and 2 were already visited; page 5 is the new jump target).
+    const postWalkPages = calls.filter((call) => call.method === 'GET' && call.url.includes('/reviews?'))
+      .map((call) => /[?&]page=(\d+)/u.exec(call.url)?.[1]);
+    expect(postWalkPages).toEqual(['1', '2', '5']);
     await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
       .rejects.toThrow(/delivery stays unresolved/u);
-    // The reordered page-5 bound was read and the walk extended toward it
-    // (pages 1 and 2 were already visited; page 5 is the new jump target).
-    const pages = calls.filter((call) => call.method === 'GET' && call.url.includes('/reviews?'))
+    // The standalone reconcile walks the same list again (the shared call
+    // log now holds both walks); each walk reached the reordered bound.
+    const allWalkPages = calls.filter((call) => call.method === 'GET' && call.url.includes('/reviews?'))
       .map((call) => /[?&]page=(\d+)/u.exec(call.url)?.[1]);
-    expect(pages).toEqual(['1', '2', '5']);
+    expect(allWalkPages).toEqual(['1', '2', '5', '1', '2', '5']);
     expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
   });
 
