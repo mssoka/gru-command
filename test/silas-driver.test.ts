@@ -632,6 +632,10 @@ describe('silas skills and wake prompt', () => {
     expect(ops).toContain('the owner merges gru-command too');
     expect(ops).not.toContain('The chief holds merge authority');
     expect(ops).not.toContain('Gru merges gru-command only');
+    // Fixed build-skill names must not return on the ops surface either,
+    // while the legitimate review tokens stay allowed.
+    const opsTokens = [...ops.matchAll(/bmad-[a-z][a-z-]*/gu)].map((match) => match[0]);
+    expect(opsTokens.every((token) => token === 'bmad-review' || token === 'bmad-review-fallback')).toBe(true);
     expect(ops).toContain('never demand a fixed skill name');
     // Continuous completion contract (owner 2026-10-02) on the loaded skill.
     expect(ops).toContain('Continuous completion (owner contract 2026-10-02)');

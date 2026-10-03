@@ -138,7 +138,8 @@ function runProbe(installedRoot: string): StagedPrompt | StagedFailure {
     },
   });
   const parsed = JSON.parse(stdout) as StagedPrompt | StagedFailure;
-  if (typeof parsed.minion !== 'string' && typeof parsed.loadError !== 'string') {
+  if (parsed.loadError !== undefined) return parsed;
+  if (typeof parsed.minion !== 'string' || typeof parsed.silas !== 'string' || typeof parsed.gru !== 'string') {
     throw new Error(`unexpected probe output: ${stdout.slice(0, 200)}`);
   }
   return parsed;
@@ -266,6 +267,10 @@ describe('installed-layout playbook loading (shipped artifact, clean install)', 
     expect(flat).toContain('an approved verdict clears the review');
     expect(flat).not.toContain('approved merges, changes-requested goes back');
     expect(flat).not.toContain('bmad-build');
+    // Fixed build-skill names must not return on the ops surface either,
+    // while the legitimate review tokens stay allowed.
+    const opsTokens = [...flat.matchAll(/bmad-[a-z][a-z-]*/gu)].map((match) => match[0]);
+    expect(opsTokens.every((token) => token === 'bmad-review' || token === 'bmad-review-fallback')).toBe(true);
   });
 
   it('a renamed/replacement project catalog still satisfies the worker contract (no fixed skill name)', () => {

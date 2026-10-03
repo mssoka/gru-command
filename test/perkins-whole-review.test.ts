@@ -1395,6 +1395,11 @@ describe('packaged product and terminal-frame coverage (N6)', () => {
     expect(stagedOps).toContain('Outcome truth (owner clarification 2026-10-02)');
     expect(stagedOps).toContain('never emit a success-delivery fact because control returned');
     expect(stagedOps).toContain('never compensate by reopening delivered jobs or building');
+    // The shipped worker prompt points at this README section: prove the
+    // heading travels in the installed package.
+    expect(readFileSync(join(stage, 'README.md'), 'utf-8')).toContain('### Project-local BMAD setup');
+    const stagedOpsTokens = [...stagedOps.matchAll(/bmad-[a-z][a-z-]*/gu)].map((match) => match[0]);
+    expect(stagedOpsTokens.every((token) => token === 'bmad-review' || token === 'bmad-review-fallback')).toBe(true);
     expect(() => execFileSync(process.execPath, [join(stage, 'tools', 'verify-perkins-resource.mjs'), stage], {
       encoding: 'utf8',
       env: { PATH: process.env.PATH ?? '', HOME: emptyHome, PI_CODING_AGENT_DIR: join(emptyHome, '.pi', 'agent') },
