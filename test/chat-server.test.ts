@@ -2657,8 +2657,21 @@ describe('chat context controls and durable new-chat boundaries', () => {
         ),
       ).toBeDefined();
       // The post-commit finalizer started retiring the old handle and is stuck
-      // on the test's hold: the result and idle view above arrived regardless.
+      // on the test's hold. The delivery barrier is released independently:
+      // new-epoch work reaches the fresh handle while the retired disposal is
+      // still held, and the retired handle receives nothing.
       await pollUntil(() => h.handle.disposalStarted, 'retired handle disposal started');
+      expect(h.handle.disposed).toBe(false);
+      const retiredCallsBefore = h.handle.calls.length;
+      client.send('delivered while retirement is held', 'retirement-held-delivery');
+      await pollUntil(
+        () =>
+          h.freshHandles[0]?.calls.some(
+            (call) => call.text === 'delivered while retirement is held',
+          ) === true,
+        'fresh-epoch delivery while retirement is held',
+      );
+      expect(h.handle.calls.length).toBe(retiredCallsBefore);
       expect(h.handle.disposed).toBe(false);
       release();
       await pollUntil(() => h.handle.disposed, 'retired handle disposal settled');

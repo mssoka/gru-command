@@ -149,6 +149,8 @@ interface CancellationObservation {
   readonly summarySettledByAbort: boolean;
   readonly stalledSummaryCalls: number;
   readonly continuationReachedModel: boolean;
+  readonly recoveredReplyDelta: boolean;
+  readonly recoveredReplyPersisted: boolean;
   readonly queuedPendingDuringStall: boolean;
   readonly queuedModelCallsDuringStall: number;
   readonly guardMessages: readonly string[];
@@ -213,6 +215,10 @@ async function observeCompactionCancellation(
         usageTokens: 90_000,
       };
     }
+    // Distinctive continuation reply: the recovered answer must be observable
+    // as a delta and as a successful persisted assistant message, not only as
+    // model admission (the broad aborted turn also fulfills admission).
+    if (prompt.includes('[TOOL_RESULT')) return { deltas: ['continuation-recovered'] };
     return { deltas: [`answer-${index}`] };
   });
   const handle = await fx.runtime.spawn('gru');
@@ -228,7 +234,7 @@ async function observeCompactionCancellation(
       abort?: () => Promise<void>;
       abortCompaction?: () => void;
       isIdle: boolean;
-      agent: { state: { messages: Array<{ role: string; stopReason?: string }> } };
+      agent: { state: { messages: Array<{ role: string; stopReason?: string; content?: unknown }> } };
     };
   };
   try {
@@ -351,6 +357,17 @@ async function observeCompactionCancellation(
     const firstSummary = fx.script.calls.find((call) =>
       call.prompt.startsWith('<conversation>'),
     );
+    // The recovered reply must be observable as a delta AND as a successful
+    // persisted assistant message, not only as model admission.
+    const recoveredReplyDelta = events.some(
+      (event) => event.type === 'text_delta' && event.delta === 'continuation-recovered',
+    );
+    const recoveredReplyPersisted = internal.session.agent.state.messages.some(
+      (message) =>
+        message.role === 'assistant' &&
+        message.stopReason === 'stop' &&
+        JSON.stringify(message.content ?? '').includes('continuation-recovered'),
+    );
     const compactionEnds = events.filter(
       (event): event is Extract<RuntimeEvent, { type: 'compaction_end' }> =>
         event.type === 'compaction_end',
@@ -386,6 +403,8 @@ async function observeCompactionCancellation(
       continuationReachedModel: fx.script.calls.some(
         (call) => call.prompt.startsWith('do the work') && call.prompt.includes('[TOOL_RESULT'),
       ),
+      recoveredReplyDelta,
+      recoveredReplyPersisted,
       queuedPendingDuringStall,
       queuedModelCallsDuringStall,
       guardMessages,
@@ -1219,6 +1238,8 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       expect(observation.stateErrors).toBe(1);
       expect(observation.assistantErrors).toBe(1);
       expect(observation.continuationReachedModel).toBe(false);
+      expect(observation.recoveredReplyDelta).toBe(false);
+      expect(observation.recoveredReplyPersisted).toBe(false);
       expect(observation.summarySettledByAbort).toBe(true);
       // The aborted first cycle is superseded by the SDK's immediate
       // prepareNextTurn retry, which completes before the adapter's single
@@ -1258,6 +1279,8 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       expect(observation.stateErrors).toBe(0);
       expect(observation.assistantErrors).toBe(0);
       expect(observation.continuationReachedModel).toBe(true);
+      expect(observation.recoveredReplyDelta).toBe(true);
+      expect(observation.recoveredReplyPersisted).toBe(true);
       expect(observation.summarySettledByAbort).toBe(true);
       // The SDK reports the summary-only cancellation as an aborted
       // compaction; the adapter publishes that failure terminal exactly once.
@@ -1293,6 +1316,8 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       expect(observation.errorMessages[0]).toContain('aborted');
       expect(observation.assistantErrors).toBe(1);
       expect(observation.continuationReachedModel).toBe(false);
+      expect(observation.recoveredReplyDelta).toBe(false);
+      expect(observation.recoveredReplyPersisted).toBe(false);
       expect(observation.summarySettledByAbort).toBe(false);
       expect(observation.abortedEnds).toBe(0);
       expect(observation.successEnds).toBe(1);
@@ -1324,6 +1349,8 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       expect(observation.errorEvents).toBe(0);
       expect(observation.assistantErrors).toBe(0);
       expect(observation.continuationReachedModel).toBe(true);
+      expect(observation.recoveredReplyDelta).toBe(true);
+      expect(observation.recoveredReplyPersisted).toBe(true);
       expect(observation.summarySettledByAbort).toBe(false);
       expect(observation.abortedEnds).toBe(1);
       expect(observation.successEnds).toBe(0);
