@@ -126,7 +126,7 @@ deadline-repairs = 'node tools/patch-vitest-rpc-timeout.mjs && npm run lint && n
 
 # PR138 final-review repairs (2026-10-03): the four independent lens rounds
 # at 37f0e14/9a58d79/53add5f/6aa20d7 plus the fce17f0 confirmation round
-# produced 62 findings, all triaged; the actionable ones are repaired through
+# produced 61 findings, all triaged; the actionable ones are repaired through
 # this head (stop-truth alignment across supervisor/digest/board, disposed
 # and recency semantics, live-count SQL, cross-build drift alarm, wizard
 # fail-fast positive pin, mock fixture timing). This scope covers the touched
