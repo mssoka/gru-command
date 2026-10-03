@@ -586,4 +586,6 @@ export const MIGRATIONS: readonly Migration[] = [
       CREATE UNIQUE INDEX idx_job_amendments_idempotency
         ON job_amendments(job_id, idempotency_key)
         WHERE idempotency_key IS NOT NULL;
+    `,
+  },
 ];

@@ -149,6 +149,7 @@ function optEvidenceField(body: Record<string, unknown>): readonly ReviewEvidenc
       ...(typeof capturedAt === 'string' ? { capturedAt } : {}),
     };
   });
+}
 
 /** The optional explicit completion intent on phase-authorizing requests.
  * Absent = ordinary flow; malformed = fail loud (the handler answers 400
