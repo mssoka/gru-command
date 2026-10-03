@@ -389,10 +389,11 @@ describe('working flavor stylesheet contract', () => {
     // The rotating phrase must stay on ONE line: with the base wrap, the
     // longest approved phrases pushed the controls to a second line and
     // grew the strip (the geometry e2e sweep found 21 phrases doing it).
-    // Console/tablet widths pin the single line; the phone sheet keeps the
-    // wrap so the status takes its own row.
+    // Console/tablet widths pin the single line AND keep the controls
+    // non-shrinkable, so only the status chip absorbs a long phrase. The
+    // phone sheet keeps the wrap so the status takes its own row.
     expect(COMPONENTS_CSS).toMatch(
-      /@media \(min-width: 900px\)\s*\{\s*\.chat-context\s*\{[^}]*flex-wrap:\s*nowrap/,
+      /@media \(min-width: 900px\)\s*\{\s*\.chat-context\s*\{[^}]*flex-wrap:\s*nowrap[\s\S]*?\.chat-context__button\s*\{[^}]*flex:\s*none/,
     );
   });
 });

@@ -1083,6 +1083,12 @@ body {
   .chat-context {
     flex-wrap: nowrap;
   }
+  /* Long phrases shrink/ellipsize the status chip ALONE: the controls keep
+     their intrinsic boxes so a rotating phrase can never narrow them into
+     wrapping their own labels. */
+  .chat-context__button {
+    flex: none;
+  }
 }
 
 .chat-context__status {
