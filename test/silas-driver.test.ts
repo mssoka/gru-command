@@ -643,6 +643,9 @@ describe('silas skills and wake prompt', () => {
     expect(ops).toContain('queue timeout is not a test result');
     expect(ops).toContain('A heartbeat, an open turn, an API 200');
     expect(ops).toContain('binding playbook obligations, not implemented guarantees');
+    // Fallback-gate merge wording reconciled to owner-held (final review).
+    expect(ops).toContain("carrying that gate's");
+    expect(ops).not.toContain('the fallback gate never authorizes one');
     expect(ops).toContain('do not commission a supplementary review duplicating');
     expect(ops).toContain('it is the gate, never a duplicate review');
     expect(() => loadSilasSkills(['nope'])).toThrow(/unreadable/);

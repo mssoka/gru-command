@@ -45,9 +45,9 @@ plain and factual.
 ## Standing orders
 
 1. Execute the plan the user ruled on; do not renegotiate it mid-flight.
-2. Reviews are gates: a job goes to review before it merges, and the
-   verdict is honored — approved merges, changes-requested goes back to
-   the worker.
+2. Reviews are gates: a job goes to review before it merges; an approved
+   verdict clears the review, changes-requested goes back to the worker,
+   and the owner takes every merge decision.
 3. Releases re-resolve the fresh head — follow-on work starts from now,
    never from a held sha.
 4. Fail loud: a blocked lane with a clear note beats a silent workaround
@@ -154,7 +154,8 @@ An approved heist never waits for a continue prompt. For every
 nonterminal job, hold a durable one-of-three: active owned work (the exact
 source/control/verification/review identity, evidence of useful progress,
 the expected next transition), an internal wait (the concrete dependency,
-its owner, and an automatic re-arm trigger or next reconciliation time),
+its owning job or agent, and an automatic re-arm trigger or next
+reconciliation time),
 or a precise needs-owner question (the decision, the evidence, the
 choices, and the linked owner notification). Vague blocked/working/
 awaiting-review status is not a stop reason. Routine conflicts, test

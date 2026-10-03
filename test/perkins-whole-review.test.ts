@@ -1370,6 +1370,8 @@ describe('packaged product and terminal-frame coverage (N6)', () => {
     expect(stagedMinion).toContain('Approved work runs to its end without a new go-ahead');
     expect(stagedMinion).toContain('A failed attempt is not a destroyed undertaking');
     expect(stagedMinion).toContain('binding playbook obligations, not runtime guarantees');
+    expect(stagedMinion).toContain('the review is the gate, and the owner holds every merge');
+    expect(stagedMinion).toContain('reconcile it by job identity');
     expect(stagedMinion).not.toMatch(/bmad-[a-z][a-z-]*/u);
     const stagedOps = readFileSync(join(stage, 'resources', 'silas-skills', 'ops-dispatch', 'SKILL.md'), 'utf-8').replace(/\s+/gu, ' ');
     expect(stagedOps).toContain("own their workflows' built-in review on fresh independent reviewer contexts");
@@ -1386,6 +1388,7 @@ describe('packaged product and terminal-frame coverage (N6)', () => {
     expect(stagedOps).toContain('never hold the fleet behind one long');
     expect(stagedOps).toContain('queue timeout is not a test result');
     expect(stagedOps).toContain('binding playbook obligations, not implemented guarantees');
+    expect(stagedOps).toContain("carrying that gate's");
     expect(() => execFileSync(process.execPath, [join(stage, 'tools', 'verify-perkins-resource.mjs'), stage], {
       encoding: 'utf8',
       env: { PATH: process.env.PATH ?? '', HOME: emptyHome, PI_CODING_AGENT_DIR: join(emptyHome, '.pi', 'agent') },

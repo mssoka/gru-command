@@ -222,6 +222,12 @@ describe('installed-layout playbook loading (shipped artifact, clean install)', 
     expect(flat).toContain('A failed attempt is not a destroyed undertaking');
     expect(flat).toContain('no product PR is owed');
     expect(flat).toContain('binding playbook obligations, not runtime guarantees');
+    // Owner-held merge adoption on the worker surface + accepted-action
+    // reconciliation for dispatched reviewer jobs.
+    expect(flat).toContain('the review is the gate, and the owner holds every merge');
+    expect(flat).toContain('read-only brief that names the exact immutable head');
+    expect(flat).toContain('never echo it');
+    expect(flat).toContain('reconcile it by job identity');
     // Owner clarification j-761: never a fixed skill-name dependency —
     // not just the retired `bmad-build` literal.
     expect(staged.minion).not.toMatch(/bmad-[a-z][a-z-]*/u);
@@ -245,6 +251,9 @@ describe('installed-layout playbook loading (shipped artifact, clean install)', 
     expect(flat).toContain('a queue timeout is not a test result');
     expect(flat).toContain('Artifact-only and investigation jobs complete at their verified artifact handback');
     expect(flat).toContain('binding playbook obligations, not implemented guarantees');
+    // Owner-held merge on the reviews-are-gates standing order.
+    expect(flat).toContain('an approved verdict clears the review');
+    expect(flat).not.toContain('approved merges, changes-requested goes back');
     expect(flat).not.toContain('bmad-build');
   });
 
@@ -287,6 +296,8 @@ describe('installed-layout playbook loading (shipped artifact, clean install)', 
       expect(prompt).not.toContain(repoRoot);
       expect(prompt).not.toMatch(/\/Users\//u);
       expect(prompt).not.toMatch(/\/home\//u);
+      // Home-relative paths must not ship through this seam either.
+      expect(prompt).not.toContain('~/');
     }
     const broken = stageInstalledLayout(false);
     const failure = runProbe(broken) as StagedFailure;

@@ -108,6 +108,12 @@ describe('role definitions (E8)', () => {
     expect(minion).toContain('A failed attempt is not a destroyed undertaking');
     expect(minion).toContain('no product PR is owed');
     expect(minion).toContain('binding playbook obligations, not runtime guarantees');
+    // Owner-held merge adoption on the worker surface + accepted-action
+    // reconciliation for dispatched reviewer jobs.
+    expect(minion).toContain('the review is the gate, and the owner holds every merge');
+    expect(minion).toContain('read-only brief that names the exact immutable head');
+    expect(minion).toContain('never echo it');
+    expect(minion).toContain('reconcile it by job identity');
     // Owner clarification j-761: the shipped policy selects by capability
     // from the project's actual catalog; a fixed skill name is never the
     // normative entry point — not just the retired `bmad-build` literal.
@@ -134,6 +140,9 @@ describe('role definitions (E8)', () => {
     expect(silas).toContain('a queue timeout is not a test result');
     expect(silas).toContain('Artifact-only and investigation jobs complete at their verified artifact handback');
     expect(silas).toContain('binding playbook obligations, not implemented guarantees');
+    // Owner-held merge on the reviews-are-gates standing order.
+    expect(silas).toContain('an approved verdict clears the review');
+    expect(silas).not.toContain('approved merges, changes-requested goes back');
   });
 
   it('maps cwd policy per ruling 17: chat/ops/memory at workspace root, workers rooted in projects', () => {

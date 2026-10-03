@@ -169,14 +169,15 @@ security, data loss, broken builds, and related crash/regression/
 vulnerability/injection/secret-leak tags — are BLOCKERS; the rest are
 notes); BLOCKERS > 0 routes a fix directive to the implementing MINION
 session, the lane's working diff is re-read, and the gate re-reviews after
-fixes (bounded rounds); 0 blockers = PASS reported as clear-to-merge. The
+fixes (bounded rounds); 0 blockers = PASS clears the review gate. The
 fallback session is a full-capability minion by design — it must load the
 ambient BMAD skill — and is instructed never to gate, approve, merge, or
 modify implementation code; every gate decision is the host's. The fallback
-never records a Perkins verdict and never moves merge authority: only an
-exact-head Perkins READY can authorize a merge; the owner holds ALL merges
-— this repository included — and a merge is presented to the owner only
-after that gate. A failed pre-flight is never a silent downgrade — the failed
+never records a Perkins verdict and never authorizes an agent merge: a
+merge is presented to the owner only after the exact-head Perkins gate, or
+— when a pre-flight failure routed the review here — carrying this gate's
+PASS as the review of record. The owner always holds ALL merges — this
+repository included. A failed pre-flight is never a silent downgrade — the failed
 legs, their remediations, and both recovery options (install BMAD via
 onboarding / restore Perkins) are escalated and recorded on the job as
 `job.fallback-review` events. GitLab merge requests get the same SHA-bound
@@ -292,7 +293,7 @@ An approved heist advances without a new continue prompt. Every
 nonterminal job resolves to one of three durable states: active owned
 work (the exact source/control/verification/review identity, progress
 evidence, and expected next transition); an internal wait (the concrete
-dependency, its owner, and an automatic re-arm trigger or next
+dependency, its owning job or agent, and an automatic re-arm trigger or next
 reconciliation time); or a precise needs-owner question (the decision,
 the evidence, the choices, and the linked notification). Routine
 conflicts, test failures, review feedback, in-policy provider recovery,
@@ -312,7 +313,7 @@ their effects can be lost, with idempotency, head/generation binding,
 and single-writer fences. Verification stays scheduler-owned and
 one-shot (one owned accepted producer, exclusive pre-opened captures
 through EOF, honest terminal states); a queue timeout is not a test
-result, a captured failure stays a failure until substantive repair, and
+result, a captured failure stays a failure until real repair, and
 lost logs never justify a rerun. A heartbeat, an open turn, an HTTP 200,
 a delivered prompt, or old-head CI is not progress or readiness.
 Artifact-only and investigation jobs complete at their verified artifact
@@ -328,9 +329,12 @@ store; the board does not carry per-job last-tick/last-completed-
 reconcile, open-turn age, last useful action, and next action; the
 stalled/PR-overdue predicates do not carry deliverable-kind carve-outs
 for artifact-only jobs; and current-phase delivery is not distinct from
-historical `job.delivered` events. Those gaps are tracked as separate
-code work and are not implemented by this document — nothing in this
-section claims those runtime guarantees exist today.
+historical `job.delivered` events. Those gaps are tracked in
+mssoka/gru-command issues #160 (delivery truth), #162 (current-phase
+stalled detection), and #163 (bounded reconciliation while a model turn
+is open); artifact-job classification and board timing are named there as
+further separate concerns. They are not implemented by this document —
+nothing in this section claims those runtime guarantees exist today.
 
 ## 5. Release (the sweep)
 

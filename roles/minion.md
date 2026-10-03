@@ -24,7 +24,8 @@ plain and factual.
   whatever the project's own definition of green is. Unverified work is
   unfinished work.
 - **Commit small, commit honestly.** Your branch is your work log. Never
-  merge your own pull request — merging belongs to the review verdict.
+  merge your own pull request — the review is the gate, and the owner
+  holds every merge.
 - **Report transitions.** Working, blocked, done — the board shows what
   you record, so record what is true.
 - **Close with optional lessons.** If the job taught something a future
@@ -74,8 +75,13 @@ The selected workflow's review is independent by construction: run its
 reviewer layers as fresh, context-free tracked review jobs you commission
 through the service's job-dispatch surface (`POST /api/dispatch` — the
 same path that created your lane) — each reviewer is a separate tracked
-job with its own session and worktree, a narrowly scoped read-only review
-brief, and the immutable diff head. Never your own re-read of your
+job with its own session and worktree and a narrowly scoped read-only
+brief that names the exact immutable head (SHA) under review. Commission
+them with the service's authenticated local API (the token lives in the
+service config; never echo it). A dispatch you submitted is an accepted
+action: before re-commissioning after a lost turn or a restart, reconcile
+it by job identity so a slow admission cannot create a duplicate
+reviewer. Never your own re-read of your
 own reasoning, and never a second Gru (there is exactly one). An untracked
 one-shot launcher, an extension subagent, or a model-native child session
 is not a substitute — a discovered skill or extension is not proof the

@@ -122,10 +122,14 @@ finding-dedupe-recency = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest 
 # authenticated /api/verify scheduler only — no worker/timeout flags, never
 # the npm chain; each scope applies the approved worker-RPC patch first
 # (the same prerequisite `npm test` runs via pretest). The baseline scope
-# overlays THIS lane's new test files onto the pinned pre-playbook tree and
-# expects RED (the baseline prompts predate the shipped policy): the vitest
-# exit status is left intact so the scheduler records outcome.exitCode as
-# evidence; it is never masked into a PASS. Setup failures carry their own
+# overlays the four fast prompt/packaging oracles
+# (roles-installed-playbook, roles-definitions, roles-gru, silas-driver)
+# onto the pinned pre-playbook tree and expects RED (the baseline prompts
+# predate the shipped policy): the vitest exit status is left intact so the
+# scheduler records outcome.exitCode as evidence; it is never masked into a
+# PASS. A GREEN baseline exits 4 (the fail-before claim would be broken);
+# the staged-tarball oracles are covered by the packaged-artifact scope and
+# the pre-change phrase-absence proof, not by this overlay. Setup failures carry their own
 # exit (3) distinct from the expected test RED (1), and the build guard uses
 # exit 99 — never confusable with feature evidence. The snapshot location
 # (dir, base, and the lane head whose tests were overlaid) is recorded in
@@ -134,7 +138,7 @@ finding-dedupe-recency = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest 
 # because the build redirect runs AFTER the cd into the snapshot directory.
 packaged-playbook = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/suite-shape.test.ts test/roles-installed-playbook.test.ts test/roles-definitions.test.ts test/roles-gru.test.ts test/silas-driver.test.ts test/install.test.ts"
 packaged-artifact = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perkins-whole-review.test.ts"
-packaged-playbook-baseline = 'set -e; setup_fail() { echo "baseline setup failed — NOT the expected test RED" >&2; exit 3; }; base=6a00f4e50e7ae970915a9a534c142c1f8a45b57d; root="$PWD"; prep="$root/_bmad-output/gate-prep"; mkdir -p "$prep" || setup_fail; node tools/patch-vitest-rpc-timeout.mjs || setup_fail; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-packaged-playbook.XXXXXX") || setup_fail; git archive "$base" | tar -x -C "$d" || setup_fail; cp test/roles-installed-playbook.test.ts test/roles-definitions.test.ts test/roles-gru.test.ts test/silas-driver.test.ts "$d/test/" || setup_fail; ln -s "$root/node_modules" "$d/node_modules" || setup_fail; head=$(git rev-parse HEAD) || setup_fail; printf "%s base=%s head=%s\n" "$d" "$base" "$head" > "$prep/packaged-playbook-baseline.last-snapshot.txt" || setup_fail; cd "$d" || setup_fail; if ! npm run build > "$prep/packaged-playbook-baseline.build.log" 2>&1; then echo "baseline build failed — NOT the expected test RED" >&2; exit 99; fi; npx vitest run test/roles-installed-playbook.test.ts test/roles-definitions.test.ts test/roles-gru.test.ts test/silas-driver.test.ts'
+packaged-playbook-baseline = 'set -e; setup_fail() { echo "baseline setup failed — NOT the expected test RED" >&2; exit 3; }; base=6a00f4e50e7ae970915a9a534c142c1f8a45b57d; root="$PWD"; prep="$root/_bmad-output/gate-prep"; mkdir -p "$prep" || setup_fail; node tools/patch-vitest-rpc-timeout.mjs || setup_fail; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-packaged-playbook.XXXXXX") || setup_fail; git archive "$base" | tar -x -C "$d" || setup_fail; cp test/roles-installed-playbook.test.ts test/roles-definitions.test.ts test/roles-gru.test.ts test/silas-driver.test.ts "$d/test/" || setup_fail; ln -s "$root/node_modules" "$d/node_modules" || setup_fail; head=$(git rev-parse HEAD) || setup_fail; printf "%s base=%s head=%s\n" "$d" "$base" "$head" > "$prep/packaged-playbook-baseline.last-snapshot.txt" || setup_fail; cd "$d" || setup_fail; if ! npm run build > "$prep/packaged-playbook-baseline.build.log" 2>&1; then echo "baseline build failed — NOT the expected test RED" >&2; exit 99; fi; rc=0; npx vitest run test/roles-installed-playbook.test.ts test/roles-definitions.test.ts test/roles-gru.test.ts test/silas-driver.test.ts || rc=$?; if [ "$rc" -eq 0 ]; then echo "baseline unexpectedly GREEN — fail-before claim broken" >&2; exit 4; fi; exit "$rc"'
 
 
 # Timeout classification (final-review cycle, c80ad0e): the two FULL-run
