@@ -133,7 +133,7 @@ function observationFromEvent(event: EventRecord | null): Observation | null {
       pr: num(payload['pr_number']),
       sha: str(ci['sha']),
       state,
-      checks: parseChecks(ci['checks']),
+      checks: parseChecks(ci['runs'] ?? ci['checks']),
       failures: parseFailures(ci['failures']),
     };
   }

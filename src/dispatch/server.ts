@@ -425,14 +425,11 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       // half-applied. Approval provenance is REQUIRED (missing provenance is
       // an authorization failure, not a default).
       const rawApproval = body['approval'] as Record<string, unknown> | undefined;
-      if (rawApproval === undefined) {
-        json(res, 400, { error: 'improper_authorization', detail: 'approval {by, reference} is required' });
-        return true;
-      }
-      const approvalBy = optStrField(rawApproval, 'by');
-      const approvalReference = optStrField(rawApproval, 'reference');
+      const approvalBy = rawApproval === undefined ? undefined : optStrField(rawApproval, 'by');
+      const approvalReference = rawApproval === undefined ? undefined : optStrField(rawApproval, 'reference');
       const jobId = strField(body, 'job_id');
       if (approvalBy === undefined || approvalReference === undefined) {
+        // An improperly authorized attempt is audited, never silently dropped.
         options.ledger.appendCustomEvent({
           kind: 'job.amendment-rejected',
           jobId,
