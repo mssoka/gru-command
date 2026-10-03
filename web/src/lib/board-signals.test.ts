@@ -225,10 +225,11 @@ describe('unackedByJob', () => {
       }),
     );
     expect([...counts.entries()]).toEqual([['live-1', 1]]);
-    // Pin the concluded set across EVERY job status the web can receive:
-    // the backend and the web share no module, so a terminal status added
-    // on the ledger side must be added here too — this enumeration is the
-    // drift alarm (backend twin: TERMINAL_JOB_STATUSES).
+    // Pin the concluded set across EVERY job status the web can receive.
+    // The backend and the web share no module, so a terminal status added
+    // on the ledger side must be mirrored here too; this enumeration is a
+    // CHECKLIST (not a drift alarm — it cannot compare against the
+    // ledger's TERMINAL_JOB_STATUSES from the web bundle).
     const statuses = ['dispatched', 'working', 'delivered', 'in-review', 'blocked', 'parked', 'merged', 'done'];
     expect(statuses.filter((status) => isJobConcluded(status))).toEqual(['merged', 'done']);
     expect(isJobConcluded('working')).toBe(false);

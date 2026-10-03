@@ -423,8 +423,9 @@ function defaultSampleSnapshot(): unknown {
             lane: null,
             lastAgentActivity: null,
           },
-          // v5 rolling window: 12 settled jobs total (hero + 11 older), so
-          // the mock renders 10 cards + a "+2 older settled" footer.
+          // v5 rolling window: 13 settled jobs total (hero + 11 older + the
+          // merged demo-api receipt), so the mock renders 10 cards + a
+          // "+3 older settled" footer (the e2e pins both).
           ...Array.from({ length: 11 }, (_, index) => ({
             id: `sample-site-settled-${index + 1}`,
             repo: 'sample-site',

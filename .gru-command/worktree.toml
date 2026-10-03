@@ -101,13 +101,14 @@ r13-review-repairs = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run 
 # exits never masked.
 board-merged-attention = "node tools/patch-vitest-rpc-timeout.mjs && cd web && ../node_modules/.bin/vitest run src/lib/board-bands.test.ts src/ui/board-merged-attention.test.ts"
 
-# T4 diagnosis (2026-10-02): the shared perkins-builtin-wave T4 case sits on
-# the 30s default ceiling under full-suite co-tenant load and has timed out
-# in FULL at multiple heads across lanes (shared fixture cost; the cost
-# repair is owned by the separate review-rebrief-interlock lane, unmerged —
-# never copied here). This scope isolates that single case at the unchanged
-# default ceiling so a FULL timeout can be classified (isolation pass vs
-# deterministic fail); it changes no test, timeout, assertion or gate.
+# T4 diagnosis (2026-10-02; updated 2026-10-03): the shared
+# perkins-builtin-wave T4 case sits on the 30s default ceiling under
+# full-suite co-tenant load and has timed out in FULL at multiple heads
+# across lanes (shared fixture cost; the cost repair is owned by the
+# separate review-rebrief-interlock lane, unmerged — never copied here).
+# The lane's own repair split the combined case into its two legs, so this
+# name-filter scope now runs BOTH legs at the unchanged default ceiling; it
+# changes no test, timeout, assertion or gate and is never a FULL substitute.
 t4-oracle = 'node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perkins-builtin-wave.test.ts -t "does not record a reconciled delivery"'
 
 # PR138 deadline repairs (2026-10-03): the five inherited 30s-default cases
