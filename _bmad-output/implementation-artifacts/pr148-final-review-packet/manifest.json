@@ -1,5 +1,5 @@
 {
-  "at": "2026-10-03T09:02:14.221576+00:00",
+  "at": "2026-10-03T09:06:45.340311+00:00",
   "job": "wizard-bmad-deterministic-retry-32",
   "pr": 148,
   "lane_branch": "gru/wizard-bmad-deterministic-retry-32",
@@ -134,8 +134,9 @@
     },
     {
       "path": "repair-lineage/intermediate-red-1bea5c9-focused.output.txt",
-      "bytes": 10169,
-      "sha256": "de244e15ff7e3df0d7a76cb01abbd1a3fc02fe2fe9517e05ea1f6e14ef8ae66e"
+      "bytes": 9885,
+      "sha256": "eb546ace6adcda209ffc6cc38edc732e256c44ff21bcaa64a1a615459804c987",
+      "sanitized": 4
     },
     {
       "path": "repair-lineage/intermediate-red-554e51c.output.txt",
