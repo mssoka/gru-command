@@ -1037,10 +1037,7 @@ export class GitHubSignalPoll {
       // already validated by the poll; no bound worker → unbound and
       // live (unknown historical rows are never guessed; tracked-review
       // A4).
-      agentId:
-        this.ledger
-          .listAgents()
-          .find((agent) => agent.jobId === signal.jobId && agent.role === 'minion')?.id ?? null,
+      agentId: this.laneMinionId(signal.jobId),
     });
     this.log('info', 'github poll: PR conflict observed', {
       job: signal.jobId,
@@ -1077,12 +1074,24 @@ export class GitHubSignalPoll {
       title: `CI failed on ${signal.branch} (${repoFullName(signal.repo)})`,
       detail,
       dedupe: 'unacked',
+      // Judgment-tier rows are machine attention for the lane: bind the
+      // lane's current worker through the existing agentId (the same
+      // pattern as pr-conflict) so a terminal lane's leftover row is a
+      // closed receipt. Mechanical (fyi) rows stay unbound.
+      ...(signal.tier === 'judgment' ? { agentId: this.laneMinionId(signal.jobId) } : {}),
     });
     this.log('info', 'github poll: CI failure observed', {
       job: signal.jobId,
       sha: signal.sha,
       tier: signal.tier,
     });
+  }
+
+  /** The lane's current worker id for the existing notification.agentId
+   * binding; null when no worker is bound (the row stays unbound and
+   * live). */
+  private laneMinionId(jobId: string): string | null {
+    return this.ledger.listAgents().find((agent) => agent.jobId === jobId && agent.role === 'minion')?.id ?? null;
   }
 
   /** CI green: the review-gate signal event (no notification — green is a

@@ -146,6 +146,16 @@ final-review-repairs = 'node tools/patch-vitest-rpc-timeout.mjs && npm run lint 
 # timeout/worker/assertion flag — a repair check, never a FULL substitute.
 tracked-review-repairs = 'node tools/patch-vitest-rpc-timeout.mjs && npm run lint && npm run typecheck && npm run build && npx vitest run test/silas-driver.test.ts test/github-poll.test.ts test/rebrief-recovery.test.ts test/supervisor.test.ts test/provider-recovery-seam.test.ts test/health.test.ts test/wizard.test.ts test/suite-shape.test.ts && npx vitest run test/dispatch-server.test.ts -t "silas/escalate posts" && npx vitest run test/perkins-builtin-wave.test.ts -t "does not record a reconciled delivery" && cd web && ../node_modules/.bin/vitest run'
 
+# PR138 A4 wave-alert identity extension (owner-approved journal j-978):
+# WaveRunner escalate context, the escalation-identity resolver/notifier,
+# the main assembly wiring, judgment-tier CI-failure binding, the shared
+# cross-surface stop and live/receipt fixtures, and the doc truth updates.
+# Covers the touched backend suites, the pinned producer escalations, and
+# the whole web unit suite, with lint/typecheck/build; approved j-463 RPC
+# patch first, no timeout/worker/assertion flag — a repair check, never a
+# FULL substitute.
+a4-wave-identity = 'node tools/patch-vitest-rpc-timeout.mjs && npm run lint && npm run typecheck && npm run build && npx vitest run test/escalation-identity.test.ts test/github-poll.test.ts test/silas-driver.test.ts test/supervisor.test.ts test/board-engine.test.ts test/suite-shape.test.ts && npx vitest run test/perkins-builtin-wave.test.ts -t "reconciles an interrupted live round|does not record a reconciled delivery" && cd web && ../node_modules/.bin/vitest run'
+
 # Isolated pre-fix baseline: current-main 059c0762 source with the IDENTICAL
 # final behavioral tests from the scheduled head, dependencies linked (no
 # download/install), same web config/runner/budgets and RPC prerequisite.

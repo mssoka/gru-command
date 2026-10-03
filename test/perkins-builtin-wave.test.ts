@@ -13,6 +13,7 @@ import {
   WaveRunner,
   hostDisclosureAppendix,
   redactReviewForPublication,
+  type EscalationContext,
   type FallbackGateOutcome,
   type VerdictPoster,
   type WaveOutcome,
@@ -653,12 +654,16 @@ describe('WaveRunner built-in Perkins production path', () => {
     ledger.setRoundStatus(round.id, 'live');
     ledger.markLensLive(round.id, 'blind');
     const escalations: string[] = [];
+    const escalationContexts: (EscalationContext | undefined)[] = [];
     const wave = new WaveRunner({
       ledger,
       worktrees: port,
       spawner: vi.fn() as unknown as AgentSpawner,
       reviewArtifactRoot: artifacts,
-      escalate: (title) => escalations.push(title),
+      escalate: (title, _detail, context) => {
+        escalations.push(title);
+        escalationContexts.push(context);
+      },
     });
     expect(await wave.recoverInterruptedRounds()).toBe(1);
     expect(ledger.getRound(round.id)?.status).toBe('aborted');
@@ -667,6 +672,9 @@ describe('WaveRunner built-in Perkins production path', () => {
     expect(existsSync(join(artifacts, round.id, 'restart-recovery.json'))).toBe(true);
     expect(existsSync(join(artifacts, round.id, 'perkins-report.md'))).toBe(true);
     expect(escalations[0]).toContain('INCOMPLETE');
+    // Producer context: the recovery escalation carries its validated
+    // round/job identity for the notification binding (followup A4).
+    expect(escalationContexts[0]).toEqual({ jobId: 'job-restart', roundId: round.id });
     rmSync(root, { recursive: true, force: true });
     rmSync(artifacts, { recursive: true, force: true });
   });
@@ -1782,10 +1790,14 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
       };
     });
     const escalations: string[] = [];
+    const escalationContexts: (EscalationContext | undefined)[] = [];
     const movedWave = new WaveRunner({
       ledger: moved.ledger, worktrees: moved.port, spawner: makeSpawner(moved.sessions, [], undefined, undefined, '  return 44;'),
       poster: { post, reconcile }, reviewArtifactRoot: moved.artifacts,
-      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      escalate: (title, detail, context) => {
+        escalations.push(`${title}: ${detail}`);
+        escalationContexts.push(context);
+      },
       prHeadProbe: localHeadProbe('feature/t4-moved'),
     });
     const movedOutcome = asWave(await movedWave.runRound({ jobId: moved.job.id }));
@@ -1793,6 +1805,13 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     expect(movedOutcome.verdict).toBeNull();
     expect(movedOutcome.canonicalVerdict).toBe('INCOMPLETE');
     expect(escalations.some((line) => line.includes('reconciled a provider review but did NOT record it'))).toBe(true);
+    // Producer context: the reconciled-unrecorded escalation carries its
+    // validated round/job identity for the notification binding (A4).
+    expect(
+      escalationContexts.some(
+        (context) => context?.jobId === moved.job.id && context.roundId === movedOutcome.round.id,
+      ),
+    ).toBe(true);
     const unrecorded = JSON.parse(readFileSync(join(moved.artifacts, movedOutcome.round.id, 'perkins-report.reconciled-unrecorded.json'), 'utf8')) as { recorded?: boolean; reason?: string; receipt?: { reviewId?: string } };
     expect(unrecorded.recorded).toBe(false);
     expect(unrecorded.reason).toContain('moved while the reconciliation lookup was outstanding');

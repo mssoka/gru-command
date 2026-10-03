@@ -1,0 +1,84 @@
+{
+  "note": "ONE fixture, TWO surfaces: web stoppedWorkersByJob and backend computeSilasDigest must agree on these exact agents (ids/stamps/views/reason). Consumed by web/src/lib/board-bands.test.ts and test/silas-driver.test.ts — do not fork the values; a change here must hold for both predicates.",
+  "digestNow": "2026-09-23T10:00:00.000Z",
+  "freshRegistrationAt": "2026-09-23T09:50:00.000Z",
+  "cases": [
+    {
+      "name": "newer stop wins over an older live worker",
+      "agents": [
+        {
+          "id": "stale-live",
+          "jobId": "job-1",
+          "state": "streaming",
+          "lastActivity": "2026-09-23T08:00:00.000Z",
+          "supervision": { "state": "watching", "restarts": 0, "breakerOpen": false, "stopReason": null }
+        },
+        {
+          "id": "current-stop",
+          "jobId": "job-1",
+          "state": "idle",
+          "lastActivity": "2026-09-23T09:00:00.000Z",
+          "supervision": { "state": "stopped", "restarts": 1, "breakerOpen": true, "stopReason": "quota_wall" }
+        }
+      ],
+      "board": { "waiting": true, "reason": "quota_wall", "restarts": 1 },
+      "digest": { "stalled": false }
+    },
+    {
+      "name": "fresh worker with unknown activity never inherits the stop",
+      "agents": [
+        {
+          "id": "old-stop",
+          "jobId": "job-1",
+          "state": "idle",
+          "lastActivity": "2026-09-23T09:00:00.000Z",
+          "supervision": { "state": "stopped", "restarts": 1, "breakerOpen": true, "stopReason": "quota_wall" }
+        },
+        {
+          "id": "fresh-null",
+          "jobId": "job-1",
+          "state": "spawning",
+          "lastActivity": null,
+          "supervision": { "state": "watching", "restarts": 0, "breakerOpen": false, "stopReason": null }
+        }
+      ],
+      "board": { "waiting": false },
+      "digest": { "stalled": false }
+    },
+    {
+      "name": "all stopped waits on the newest stop",
+      "agents": [
+        {
+          "id": "old-stop",
+          "jobId": "job-1",
+          "state": "idle",
+          "lastActivity": "2026-09-23T08:00:00.000Z",
+          "supervision": { "state": "stopped", "restarts": 1, "breakerOpen": true, "stopReason": "quota_wall" }
+        },
+        {
+          "id": "newer-stop",
+          "jobId": "job-1",
+          "state": "idle",
+          "lastActivity": "2026-09-23T09:00:00.000Z",
+          "supervision": { "state": "stopped", "restarts": 4, "breakerOpen": true, "stopReason": "crash loop" }
+        }
+      ],
+      "board": { "waiting": true, "reason": "crash loop", "restarts": 4 },
+      "digest": { "stalled": false }
+    },
+    {
+      "name": "silent live worker with no stop still stalls",
+      "agents": [
+        {
+          "id": "quiet-live",
+          "jobId": "job-1",
+          "state": "streaming",
+          "lastActivity": "2026-09-23T08:00:00.000Z",
+          "supervision": { "state": "watching", "restarts": 0, "breakerOpen": false, "stopReason": null }
+        }
+      ],
+      "board": { "waiting": false },
+      "digest": { "stalled": true }
+    }
+  ]
+}

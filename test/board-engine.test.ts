@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -289,7 +289,7 @@ describe('board engine — adapter events → ledger events → board state', ()
     });
     const snapshot = supervised.snapshot();
     const row = snapshot.agents.find((a) => a.id === 'stopped-minion');
-    expect(row?.supervision).toMatchObject({ state: 'stopped', restarts: 3, breakerOpen: true });
+    expect(row?.supervision).toMatchObject({ state: 'stopped', restarts: 3, breakerOpen: true, stopReason: 'crash loop' });
     // Unsupervised agents carry null — the UI renders no chip for them.
     const plain = supervised.snapshot().agents.find((a) => a.id === 'gru-main');
     expect(plain?.supervision).toBeNull();
@@ -513,6 +513,56 @@ describe('board engine — liveness-first rail and job trackers', () => {
     api.setJobStatus(live.id, 'in-review');
     api.setJobStatus(live.id, 'merged');
     expect(engine.snapshot().unackedActionRequired).toBe(1); // the unbound global row
+  });
+
+  it('the shared live/receipt fixture classifies identically for the chip and the bands', () => {
+    // ONE fixture file is consumed by this suite and by
+    // web/src/lib/board-signals.test.ts; the SQL live count and the web
+    // attribution must agree on the same rows (followup review A4/V4).
+    const fixture = JSON.parse(
+      readFileSync(join(import.meta.dirname, 'fixtures', 'live-receipt-classification.json'), 'utf-8'),
+    ) as {
+      readonly jobs: readonly { readonly id: string; readonly status: string }[];
+      readonly agents: readonly { readonly id: string; readonly jobId: string }[];
+      readonly notifications: readonly {
+        readonly id: string;
+        readonly kind: string;
+        readonly routing: string;
+        readonly agentId: string | null;
+      }[];
+      readonly expected: { readonly liveCount: number };
+    };
+    const { api } = fresh();
+    for (const job of fixture.jobs) {
+      api.addJob({ id: job.id, repo: 'fixture', title: job.id, briefing: 'b' });
+      if (job.status === 'working') api.setJobStatus(job.id, 'working');
+      if (job.status === 'done') {
+        api.setJobStatus(job.id, 'working');
+        api.setJobStatus(job.id, 'done');
+      }
+      if (job.status === 'merged') {
+        api.setJobStatus(job.id, 'working');
+        api.setJobStatus(job.id, 'delivered');
+        api.setJobStatus(job.id, 'in-review');
+        api.setJobStatus(job.id, 'merged');
+      }
+    }
+    for (const agent of fixture.agents) {
+      api.registerAgent({ id: agent.id, role: 'minion', jobId: agent.jobId });
+    }
+    for (const notification of fixture.notifications) {
+      api.recordNotification({
+        id: notification.id,
+        kind: notification.kind,
+        routing: notification.routing as 'action-required' | 'fyi',
+        severity: 'error',
+        title: notification.id,
+        ...(notification.agentId !== null ? { agentId: notification.agentId } : {}),
+      });
+    }
+    expect(api.countLivePendingActionRequired()).toBe(fixture.expected.liveCount);
+    // The durable record keeps the terminal-bound receipts: live + 2.
+    expect(api.countPendingActionRequiredIncludingReceipts()).toBe(fixture.expected.liveCount + 2);
   });
 
   it('counts needs-owner rows separately (the FOR YOU band never borrows the machine queue)', () => {

@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import type {
   AgentView,
   JobPrState,
@@ -556,11 +558,55 @@ describe('board bands — stopped-worker truth (waiting, not stalled)', () => {
       }),
     ]);
     // The stopped record is the lane's current worker: an older live
-    // record must not mask it. This is the SHARED cross-surface fixture:
-    // test/silas-driver.test.ts pins the same agents (same ids/stamps)
-    // and the digest must NOT stall this waiting lane (tracked-review
-    // A1/E0/V0).
+    // record must not mask it. (The LITERAL cross-surface pin over shared
+    // values lives in the fixture-driven test below.)
     expect(map.get('job-1')).toEqual({ reason: 'quota_wall', restarts: 1 });
+  });
+
+  it('the shared cross-surface fixture renders exactly what the digest pins', () => {
+    // ONE fixture file is consumed by this suite and by
+    // test/silas-driver.test.ts: same ids/stamps/views for both the web
+    // waiting predicate and the digest stall predicate (followup review
+    // A0/edge0), so a one-sided drift fails here rather than in the field.
+    const fixture = JSON.parse(
+      readFileSync(
+        fileURLToPath(new URL('../../../test/fixtures/stop-attribution.json', import.meta.url)),
+        'utf-8',
+      ),
+    ) as {
+      readonly cases: readonly {
+        readonly name: string;
+        readonly agents: readonly {
+          readonly id: string;
+          readonly jobId: string;
+          readonly state: string;
+          readonly lastActivity: string | null;
+          readonly supervision: AgentView['supervision'];
+        }[];
+        readonly board: { readonly waiting: boolean; readonly reason?: string; readonly restarts?: number };
+      }[];
+    };
+    expect(fixture.cases.length).toBeGreaterThan(2);
+    for (const testCase of fixture.cases) {
+      const map = stoppedWorkersByJob(
+        testCase.agents.map((agent) =>
+          agentView(agent.id, {
+            jobId: agent.jobId,
+            state: agent.state,
+            lastActivity: agent.lastActivity,
+            supervision: agent.supervision,
+          }),
+        ),
+      );
+      if (testCase.board.waiting) {
+        expect(map.get('job-1'), testCase.name).toEqual({
+          reason: testCase.board.reason,
+          restarts: testCase.board.restarts,
+        });
+      } else {
+        expect(map.has('job-1'), testCase.name).toBe(false);
+      }
+    }
   });
 
   it('a fresh worker with an unknown stamp never inherits the previous stop', () => {

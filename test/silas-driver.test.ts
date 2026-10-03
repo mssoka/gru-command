@@ -341,22 +341,36 @@ describe('silas digest (the four actionable states)', () => {
       // a blanket mute).
       view = null;
       expect((await digestOf()).stalledWorking).toHaveLength(1);
-      // The SHARED cross-surface fixture (same ids/stamps/reason as the web
-      // test 'a newer stop wins over an older live record'): a stopped
-      // worker newer than the older live record marks the lane WAITING on
-      // the board, so this stall channel must NOT wake it (tracked-review
-      // A1/E0/V0).
-      h.ledger.registerAgent({ id: 'min-other-live', role: 'minion', jobId: 'job-walled' });
-      h.ledger.setAgentState('min-other-live', 'idle');
-      view = { ...base, state: 'stopped', breakerOpen: true, stopReason: 'quota_wall' };
-      // Make the stopped worker the newest record: the stop is the lane's
-      // current worker, and the board pins the same expectation.
-      h.ledger.setAgentState('min-walled', 'idle');
+      // The shared-value arm (literally one fixture file now carries the
+      // ids/stamps for both suites — see the fixture-driven test below):
+      // a stopped worker newer than the older live record marks the lane
+      // WAITING on the board, so this stall channel must NOT wake it.
+      // Stamps are seeded under fake timers so the strict-newer relation
+      // never depends on the wall clock advancing between two writes.
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date('2026-09-23T08:00:00.000Z'));
+        h.ledger.registerAgent({ id: 'min-other-live', role: 'minion', jobId: 'job-walled' });
+        h.ledger.setAgentState('min-other-live', 'idle');
+        view = { ...base, state: 'stopped', breakerOpen: true, stopReason: 'quota_wall' };
+        // Make the stopped worker the newest record: the stop is the lane's
+        // current worker, and the board pins the same expectation.
+        vi.setSystemTime(new Date('2026-09-23T09:00:00.000Z'));
+        h.ledger.setAgentState('min-walled', 'idle');
+      } finally {
+        vi.useRealTimers();
+      }
       const mixed = await digestOf();
       expect(mixed.stalledWorking).toHaveLength(0);
       // The mirrored direction: a stop OLDER than the live worker does not
       // wait, and the live worker's silence stalls again.
-      h.ledger.setAgentState('min-other-live', 'idle');
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date('2026-09-23T10:00:00.000Z'));
+        h.ledger.setAgentState('min-other-live', 'idle');
+      } finally {
+        vi.useRealTimers();
+      }
       const reDispatched = await digestOf();
       expect(reDispatched.stalledWorking).toHaveLength(1);
       expect(reDispatched.stalledWorking[0]?.minionId).toBe('min-other-live');
@@ -412,6 +426,82 @@ describe('silas digest (the four actionable states)', () => {
       ).toHaveLength(1);
     } finally {
       h.cleanup();
+    }
+  });
+
+  it('the shared cross-surface fixture drives the digest exactly as the board pins it', async () => {
+    // ONE fixture file is consumed by this suite and by
+    // web/src/lib/board-bands.test.ts: same ids/stamps/views for both the
+    // web waiting predicate and this digest stall predicate (followup
+    // review A0/edge0/V2). Stamps are seeded deterministically under fake
+    // timers — never by racing the wall clock between two writes.
+    const fixture = JSON.parse(
+      readFileSync(join(import.meta.dirname, 'fixtures', 'stop-attribution.json'), 'utf-8'),
+    ) as {
+      readonly digestNow: string;
+      readonly freshRegistrationAt: string;
+      readonly cases: readonly {
+        readonly name: string;
+        readonly agents: readonly {
+          readonly id: string;
+          readonly jobId: string;
+          readonly state: string;
+          readonly lastActivity: string | null;
+          readonly supervision: {
+            readonly state: 'watching' | 'restarting' | 'stopped';
+            readonly restarts: number;
+            readonly breakerOpen: boolean;
+            readonly stopReason: string | null;
+          };
+        }[];
+        readonly digest: { readonly stalled: boolean };
+      }[];
+    };
+    expect(fixture.cases.length).toBeGreaterThan(2);
+    for (const testCase of fixture.cases) {
+      const h = makeLedger();
+      try {
+        h.ledger.addJob({ id: 'job-1', repo: 'fixture-app', title: testCase.name, briefing: 'b' });
+        h.ledger.setJobStatus('job-1', 'working');
+        const supervisionById = new Map(testCase.agents.map((agent) => [agent.id, agent]));
+        vi.useFakeTimers();
+        try {
+          for (const agent of testCase.agents) {
+            vi.setSystemTime(new Date(agent.lastActivity ?? fixture.freshRegistrationAt));
+            h.ledger.registerAgent({ id: agent.id, role: 'minion', jobId: agent.jobId });
+            if (agent.lastActivity !== null) h.ledger.setAgentState(agent.id, 'idle');
+          }
+        } finally {
+          vi.useRealTimers();
+        }
+        const digest = await computeSilasDigest({
+          ledger: h.ledger,
+          blockersForRound: async () => ({ blockers: [], note: null }),
+          config: DEFAULT_SILAS_CONFIG,
+          trigger: 'sweep',
+          now: () => Date.parse(fixture.digestNow),
+          supervisionFor: (agentId) => {
+            const agent = supervisionById.get(agentId);
+            if (agent === undefined) return null;
+            return {
+              agentId,
+              role: 'minion',
+              slotId: null,
+              ...agent.supervision,
+              openTurn: false,
+              openToolCalls: 0,
+              lastEventAt: null,
+              lastFileBytes: null,
+            } as AgentSupervisionView;
+          },
+        });
+        expect(
+          digest.stalledWorking.length,
+          `${testCase.name}: digest ${testCase.digest.stalled ? 'must' : 'must not'} stall`,
+        ).toBe(testCase.digest.stalled ? 1 : 0);
+      } finally {
+        h.cleanup();
+      }
     }
   });
 

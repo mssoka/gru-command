@@ -315,6 +315,63 @@ describe('unackedByJob', () => {
     expect(terminalBoundNotificationIds(snap).has('n-escal-merged')).toBe(true);
     expect(terminalBoundNotificationIds(snap).has('n-escal-live')).toBe(false);
   });
+
+  it('the shared live/receipt fixture classifies identically for chip and bands', () => {
+    // ONE fixture file is consumed by this suite and by
+    // test/board-engine.test.ts; the SQL live count and this attribution
+    // must agree on the same rows (followup review A4/V4).
+    const fixture = JSON.parse(
+      readFileSync(
+        fileURLToPath(new URL('../../../test/fixtures/live-receipt-classification.json', import.meta.url)),
+        'utf-8',
+      ),
+    ) as {
+      readonly jobs: readonly { readonly id: string; readonly status: string }[];
+      readonly agents: readonly { readonly id: string; readonly jobId: string }[];
+      readonly notifications: readonly {
+        readonly id: string;
+        readonly kind: string;
+        readonly routing: string;
+        readonly agentId: string | null;
+      }[];
+      readonly expected: {
+        readonly liveCount: number;
+        readonly liveByJob: Readonly<Record<string, number>>;
+        readonly receiptIds: readonly string[];
+      };
+    };
+    const snap = snapshot({
+      repos: [
+        {
+          name: 'demo',
+          jobs: fixture.jobs.map((entry) => job({ id: entry.id, status: entry.status })),
+        },
+      ],
+      agents: fixture.agents.map((entry) => ({
+        id: entry.id, role: 'minion', label: null, state: 'idle', lastActivity: null, sessionFile: null,
+        jobId: entry.jobId, roundId: null, supervision: null,
+      })),
+      notifications: fixture.notifications.map((entry) =>
+        notification(entry.id, {
+          kind: entry.kind,
+          routing: entry.routing as 'action-required' | 'fyi',
+          ...(entry.agentId !== null ? { agentId: entry.agentId } : {}),
+        }),
+      ),
+    });
+    expect([...unackedByJob(snap).entries()]).toEqual(Object.entries(fixture.expected.liveByJob));
+    expect([...terminalBoundNotificationIds(snap)].sort()).toEqual([...fixture.expected.receiptIds].sort());
+    // The web live rows mirror the SQL chip count: terminal-bound rows are
+    // receipts; unknown-bound and unbound rows stay live.
+    const liveRows = snap.notifications.filter(
+      (row) =>
+        row.routing === 'action-required' &&
+        row.ackedAt === null &&
+        row.resolvedAt === null &&
+        (row.agentId === null || !terminalBoundNotificationIds(snap).has(row.id)),
+    );
+    expect(liveRows).toHaveLength(fixture.expected.liveCount);
+  });
 });
 
 describe('jobSignal', () => {

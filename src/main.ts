@@ -21,6 +21,7 @@ import { DispatchService } from './dispatch/service.js';
 import { WorktreeManager } from './worktrees/manager.js';
 import { createWorktreeServer } from './worktrees/server.js';
 import { AutoVerdictPoster, WaveRunner } from './dispatch/perkins.js';
+import { createReviewEscalationNotifier } from './dispatch/escalation-identity.js';
 import { BobScheduler } from './dispatch/bob-scheduler.js';
 import { SilasDriver, supervisionLookup } from './dispatch/silas-driver.js';
 import { ProviderRecoverySensor, establishProviderWait } from './provider-recovery/sensor.js';
@@ -1019,9 +1020,10 @@ async function main(): Promise<number> {
         owner: 'bmad-review-gate',
       }),
     },
-    escalate: (title, detail) => {
-      notifications.post({ kind: 'review-escalation', routing: 'action-required', severity: 'error', title, detail });
-    },
+    // Wave escalations carry bounded per-call identity context; the
+    // notifier binds the row through the existing agentId field only when
+    // that identity is consistent (see src/dispatch/escalation-identity.ts).
+    escalate: createReviewEscalationNotifier(ledger, notifications),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   state.wave = wave;
