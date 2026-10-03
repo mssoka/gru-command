@@ -927,15 +927,18 @@ describe('branch-idle guard', () => {
   it('pending markers on one job never block an unrelated target branch', () => {
     const start = eventRecord(1, 'job.status', { from: 'dispatched', to: 'working' });
     const delivery = eventRecord(2, 'job.delivered', { sha: 'sha-1' });
+    // Both lanes are genuinely settled (delivered, no open attempt): the
+    // only busy fact in play is the pending marker, so branch isolation is
+    // exercised without attempt-busyness noise.
     const events = new Map<string, EventRecord[]>([
-      ['marker-owner', [start]],
+      ['marker-owner', [start, delivery]],
       ['plain-lane', [start, delivery]],
     ]);
     const pending = new Map<string, PendingRebriefRecord[]>([
       ['marker-owner', [pendingMarker('marker-owner')]],
     ]);
     const ledger = {
-      listJobs: () => [jobRecord('marker-owner', 'working'), jobRecord('plain-lane', 'delivered')],
+      listJobs: () => [jobRecord('marker-owner', 'delivered'), jobRecord('plain-lane', 'delivered')],
       latestJobEvent: (jobId: string, kind: string): EventRecord | null =>
         (events.get(jobId) ?? []).filter((event) => event.kind === kind).at(-1) ?? null,
       listPendingRebriefs: (opts: { readonly jobId?: string } = {}): readonly PendingRebriefRecord[] =>
