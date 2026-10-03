@@ -173,7 +173,7 @@ export function trackChildProcess(child, { label, captureOutput = true, scope } 
 }
 
 const SECRET_LABEL =
-  /(\\?["']?(?:token|api[_-]?key|secret|password|passwd|authorization|credential)s?\\?["']?\s*\\?[:=]\s*)(?!\[REDACTED\])(?:\\?"((?:[^"\\\n]|\\.){4,})\\?"|'((?:[^'\\\n]|\\.){4,})'|(?:(?:Bearer|Basic)\s+)?(?!\[REDACTED\])(?!(?:Bearer|Basic)(?:\s|$))([^\s"',;}\\\]]{4,}))/gi;
+  /(\\?["']?(?:token|api[_-]?key|secret|password|passwd|authorization|credential)s?\\?["']?\s*\\?[:=]\s*)(?!\[REDACTED\])(?:"((?:[^"\\\n]|\\.){4,})"|\\"((?:[^"\\\n]|\\.){4,})\\"|'((?:[^'\\\n]|\\.){4,})'|\\'((?:[^'\\\n]|\\.){4,})\\'|(?:(?:Bearer|Basic)\s+)?(?!\[REDACTED\])(?!(?:Bearer|Basic)(?:\s|$))([^\s"',;}\\\]]{4,}))/gi;
 // Fail-closed leftover: a label whose value is short, quoted-but-unterminated
 // (to end of line) or otherwise outside the specific shapes above still
 // redacts rather than exposing the remainder.
