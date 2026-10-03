@@ -24,6 +24,13 @@ handoff-wave = "npx vitest run test/perkins-builtin-wave.test.ts test/perkins-wh
 # the authenticated /api/verify scheduler at unchanged budgets/thresholds —
 # a plain vitest invocation with the approved RPC patch prerequisite.
 review-inputs = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/review-evidence-intake.test.ts test/review-ci-evidence.test.ts test/job-amendments.test.ts test/review-inputs-handoff.test.ts test/review-inputs-wave.test.ts test/dispatch-review-inputs.test.ts test/verification-evidence.test.ts test/github-poll.test.ts test/ledger-api.test.ts test/ledger-db.test.ts"
+
+# Review-input handoff lane regression + full-run failure isolation: the
+# seam-adjacent suites, plus the exact files whose timing-sensitive tests
+# went red in this lane's FULL runs (complete captures preserved), run
+# together at one head to establish whether those failures are contention
+# or reproducible. Invoked only via the authenticated /api/verify scheduler.
+review-inputs-regression = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/dispatch-server.test.ts test/attachments.test.ts test/claude-adapter.test.ts test/perkins-whole-review.test.ts test/perkins-builtin-wave.test.ts test/lan-phone-raw-client.test.ts test/chat-server.test.ts test/decisions.test.ts test/suite-shape.test.ts"
 working-flavor = "cd web && npx vitest run src/lib/working-flavor.test.ts src/ui/chat-working-flavor.test.ts src/ui/chat-attachments.test.ts src/ui/chat-composer.test.ts src/ui/chat-console.test.ts src/ui/chat-gfm-invariant.test.ts src/ui/chat-scroll.test.ts src/ui/chat-service-band.test.ts src/ui/chat-tool-turn.test.ts"
 compaction-rollback = "npx vitest run test/pi-adapter.test.ts test/supervisor.test.ts test/config.test.ts test/health.test.ts test/board-engine.test.ts test/suite-shape.test.ts"
 native-compaction-wait = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/supervisor.test.ts test/suite-shape.test.ts"

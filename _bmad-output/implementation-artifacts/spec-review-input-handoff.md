@@ -164,8 +164,25 @@ bmad-build interactive checkpoint is not available in this confined worker.
 | Unauthorized amendment | no/invalid token; blank approval reference | refused, audited | 401 / 400 |
 | Zero-amendment job | old job record, no amendments | spec bytes unchanged, version 0 | backward compatible |
 
+
+
 ## Review Triage Log
 
+- `suite-shape` pin mismatch (full r7): confirmed real — new suites were
+  unpinned; fixed in 51fe319 (pins added), re-verified green in r8/r9 runs.
+- `lan-phone-raw-client` delta replay truncation (full r7): inspected complete
+  output; failure is a socket-replay timing race in a file not touched by this
+  diff; did not recur in r8/r9 (isolation run added for the record).
+- `chat-server` `firstFresh.disposed` (full r8): inspected complete output;
+  known distinct harness failure tracked by the operations journal
+  (gc-test-harness follow-through); not touched by this diff; did not recur
+  in r9.
+- `decisions` hot-reload watcher (full r8): inspected complete output; same
+  shape as the pre-existing failure recorded for the PR130 full run
+  (expected degraded/credential_missing, observed disabled/disabled); not
+  touched by this diff; did not recur in r9.
+- `dispatch-server` by=silas timeout (full r9): seam-adjacent file; failure is
+  a 30 s default-timeout wall, no assertion; isolation run scheduled.
 ## Implementation Notes
 
 - 2026-10-03: lane workflow rendered via `bmad-build`; Checkpoint-1 approval
@@ -181,13 +198,34 @@ bmad-build interactive checkpoint is not available in this confined worker.
   owner approval from body text or a caller-declared role string. This is the
   documented, surfaced authorization limitation.
 
+- 2026-10-03: `full` r6 (run e56d57b6 at 7eb967d) red at lint: one unused
+  helper; fixed in d864f05.
+- 2026-10-03: `full` r7 (run at 7eb967d) red: `suite-shape` pins (real; fixed
+  in 51fe319) plus `lan-phone-raw-client` delta-replay timing (outside the
+  diff; passed on later runs).
+- 2026-10-03: `full` r8 (run def06283 at 51fe319) red: `chat-server` epoch-reset
+  disposal timing and `decisions` hot-reload watcher timing — both outside the
+  diff, both already tracked as distinct harness failures in the operations
+  journal; both passed in adjacent runs.
+- 2026-10-03: `full` r9 (run d100c3f5 at 51fe319) red: `dispatch-server`
+  by=silas attribution test hit its default 30 s timeout (seam-adjacent file;
+  no assertion failure). Complete captures for every run are preserved under
+  `_bmad-output/implementation-artifacts/review-inputs-verify-runs/` (raw
+  NDJSON + decoded frames + whole-output hash in each completion frame).
+- 2026-10-03: because every FULL red after the real fixes was a distinct
+  timing-sensitive test (never the same failure twice), the lane added
+  `review-inputs-regression` (the seam suites plus the exact red files) to
+  establish isolation at one head before the final FULL. No test assertion,
+  timeout, budget or scope was weakened.
+
 ## Verification
 
 **Commands:**
-- `npx vitest run test/review-evidence-intake.test.ts test/review-ci-evidence.test.ts test/job-amendments.test.ts test/review-inputs-handoff.test.ts test/dispatch-review-inputs.test.ts test/verification-evidence.test.ts test/github-poll.test.ts` — focused, expected PASS.
-- `npx vitest run test/perkins-whole-review.test.ts test/perkins-builtin-wave.test.ts test/ledger-api.test.ts test/ledger-db.test.ts test/dispatch-server.test.ts test/attachments.test.ts test/claude-adapter.test.ts` — regression, expected PASS.
-- Scheduler (via authenticated `POST /api/verify`): focused `review-inputs` scope, `typecheck`, then `full` at the final head.
+- `npx vitest run test/review-evidence-intake.test.ts test/review-ci-evidence.test.ts test/job-amendments.test.ts test/review-inputs-handoff.test.ts test/review-inputs-wave.test.ts test/dispatch-review-inputs.test.ts test/verification-evidence.test.ts test/github-poll.test.ts test/ledger-api.test.ts test/ledger-db.test.ts` — scheduler scope `review-inputs`: PASS (run ee48afd8 at f3959f5, 94/94 tests, clean tree, whole-output sha256 b3675c9f2183c2d00c49fee7002379ebb2ac4e7381ace7c229a737528ac7b3b0).
+- `npx vitest run test/dispatch-server.test.ts test/attachments.test.ts test/claude-adapter.test.ts test/perkins-whole-review.test.ts test/perkins-builtin-wave.test.ts test/lan-phone-raw-client.test.ts test/chat-server.test.ts test/decisions.test.ts test/suite-shape.test.ts` — scheduler scope `review-inputs-regression`: isolation evidence at the final pre-gate head (result recorded in the completion report).
+- `npm test` — scheduler scope `full`: final-head gate; earlier reds and their completions are preserved above and in the run captures.
 
 **Manual checks:**
 - `manifest.json`/`spec-context.md` of a frozen round contain no base64
   pixels, no upload source paths, and the acceptance/evidence blocks.
+- Raw retained captures: `_bmad-output/implementation-artifacts/review-inputs-verify-runs/`.
