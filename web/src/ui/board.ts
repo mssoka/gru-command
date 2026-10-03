@@ -706,7 +706,14 @@ export class BoardView {
    * entries are labelled honestly. */
   private pipelineSection(sections: ReturnType<typeof boardSections>): HTMLElement {
     const entries = sections.pipelineEntries;
-    const { section, body, bodyId } = this.sectionShell('pipeline', 'pipeline', 'PIPELINE', `${entries.length} queued`);
+    const { section, body, bodyId } = this.sectionShell(
+      'pipeline',
+      'pipeline',
+      'PIPELINE',
+      // The head carries the FULL pending count (never the loaded slice);
+      // the preview window only bounds the rows.
+      `${sections.counts.pipeline} queued`,
+    );
     if (!sections.pipelineAvailable) {
       body.append(this.emptyLine('pipeline queue unavailable on this server'));
       return section;

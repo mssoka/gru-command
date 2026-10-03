@@ -575,6 +575,7 @@ describe('board v6 — dense job rows', () => {
   it('marks an aborted latest round on the collapsed row', () => {
     const view = new BoardView(() => {});
     view.render(snapshot({ jobs: [baseJob({ rounds: [baseRound({ status: 'aborted', verdict: null })] })] }));
+    expandForGru();
     const signal = document.querySelector('.board-job__signal');
     expect(signal?.textContent).toContain('round 1 aborted');
     expect(signal?.classList.contains('pp-chip--alert')).toBe(true);
@@ -628,6 +629,7 @@ describe('board round progress labels (R9/T14/N8)', () => {
         })],
       })],
     }));
+    expandForGru();
     const row = document.querySelector<HTMLElement>('.board-job');
     if (row === null) throw new Error('row missing');
     // Reveal the round body to render the round header row.
@@ -681,6 +683,8 @@ describe('board lens chips — unused lenses are neutral, never a pass', () => {
   });
 
   function expandFirstRound(): HTMLElement {
+    // A mixed round (errored lens) lands in FOR GRU; reveal it first.
+    expandForGru();
     const row = document.querySelector<HTMLElement>('.board-job');
     if (row === null) throw new Error('job row missing');
     row.querySelector<HTMLElement>('.board-job__meta')?.click();
@@ -965,6 +969,7 @@ describe('board v6 — bands', () => {
         ],
       }),
     );
+    expandForGru();
     expect(document.querySelector('.board-band--needs-you .board-job')?.getAttribute('data-job-id')).toBe('conflicting-job');
     expect(document.querySelector('.board-band--in-flight .board-job')?.getAttribute('data-job-id')).toBe('fresh-job');
     const stalled = document.querySelector<HTMLElement>('.board-band--cold .board-job');
@@ -1069,8 +1074,9 @@ describe('board v6 — bands', () => {
 
   it('renders compact empty states for every section when the board is quiet', () => {
     const view = new BoardView(() => {});
-    // No repos, no jobs, no pipeline: every shortcut keeps a valid target.
-    view.render(snapshot({ repos: [] }));
+    // No repos, no jobs, and a wired-but-empty pipeline: every shortcut
+    // keeps a valid target.
+    view.render(snapshot({ repos: [], pipeline: { entries: [], pending: 0 } }));
     const labels = [...document.querySelectorAll<HTMLElement>('#board-jobs .board-band__label')].map(
       (node) => node.textContent,
     );
