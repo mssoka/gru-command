@@ -1503,6 +1503,16 @@ export class WaveRunner {
       // starts. An explicit `force` keeps its audited escape hatch, and a
       // BranchBusyError keeps its 409 refusal / same-job replay re-queue.
       this.enforceBranchIdleForRequest(input);
+      // Handoff replays additionally re-prove the CURRENT job state through
+      // the same post-await fence the native branch below applies: a job
+      // that flips blocked/parked/cancelled during the awaited pre-flight
+      // is HELD for reconciliation (startHandoff records
+      // job.review-handoff-held and escalates), never routed to a fallback
+      // reviewer on revoked authorization.
+      if (input.fromHandoff === true) {
+        const pending = this.handoffs.get(input.jobId);
+        this.assertHandoffAuthorized(input.jobId, pending?.seq ?? -1);
+      }
       return this.beginFallbackGate(input, result.failures, repoPath);
     }
     // Post-await recheck (handoff replays only): permission is re-proven

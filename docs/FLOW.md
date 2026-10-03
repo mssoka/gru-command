@@ -525,8 +525,10 @@ known failure classes, sweep acks under recorded rules. Gru keeps the
 judgments: rulings, merges, and novel failures. One standing rule from the
 2026-09-23 freeze: never auto-arm a review round on a branch while a
 rebase/force-push lane is active on the same target (the round races the
-push and dies obsolete); arm after the lane delivery settles. Service
-restarts remain manual until self-roll-34 lands.
+push and dies obsolete); arm only after the lane genuinely settles — the
+attempt delivered AND no unresolved re-brief request standing (marker/
+control settlement, not delivery alone; see the branch-idle guard
+section). Service restarts remain manual until self-roll-34 lands.
 
 ## Bob (periodic memory)
 

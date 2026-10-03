@@ -112,9 +112,12 @@ retrying. When the answer is `409` with
 - **Defer the arm to the next sweep.** The service records the refusal
   (`branch-idle.refused`) and, because you pass `"by":"silas"`, your
   deferral as `silas.review-deferred` on the job — that is the deferred-arm
-  note. Retry when the lane is idle: the digest recomputes from the ledger
-  every sweep, so the row stays listed until the arm lands. Never retry in
-  a tight loop inside one sweep.
+  note. Retry when the lane genuinely settles. The digest recomputes from
+  the ledger every sweep: a row busy on a lane attempt stays listed until
+  the arm lands, while a row for a job with unresolved re-brief markers is
+  deliberately withheld and reappears only after those markers settle —
+  never expect a listed retry target while the request stands. Never retry
+  in a tight loop inside one sweep.
 - **Never arm with `"force":true` on your own.** Force is the human
   escape hatch for a deliberate judgment call; a forced round freezes a
   branch that may still be moving and carries the override tag in its

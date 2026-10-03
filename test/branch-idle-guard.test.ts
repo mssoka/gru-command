@@ -93,6 +93,8 @@ interface Harness {
   readonly artifactRoot: string;
   /** Fallback-gate passes that actually started a fallback reviewer. */
   readonly fallbackRuns: number[];
+  /** Escalation lines raised by the wave (held-handoff and gate audits). */
+  readonly escalations: string[];
   close(): Promise<void>;
 }
 
@@ -124,6 +126,7 @@ async function boot(opts: {
   const dispatch = new DispatchService({ ledger, worktrees, spawner });
   const artifactRoot = join(dir, 'reviews');
   const fallbackRuns: number[] = [];
+  const escalations: string[] = [];
   const fallbackSkill = join(dir, 'skills', 'bmad-review', 'SKILL.md');
   mkdirSync(dirname(fallbackSkill), { recursive: true });
   writeFileSync(fallbackSkill, '---\nname: bmad-review\n---\ninstalled skill bytes\n', 'utf8');
@@ -133,6 +136,7 @@ async function boot(opts: {
     spawner,
     reviewArtifactRoot: artifactRoot,
     bus,
+    escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
     // PR-linked rounds verify the live head through the fixture's own bare
     // origin (the same double the dispatch-server suite uses); rounds
     // without a registered PR never consult it.
@@ -192,6 +196,7 @@ async function boot(opts: {
     bus,
     artifactRoot,
     fallbackRuns,
+    escalations,
     close: async () => {
       await new Promise<void>((resolveClose) => http.close(() => resolveClose()));
       await wave.shutdown();
@@ -288,11 +293,12 @@ function pendingMarker(
  * listener is released on resolution and on bound exhaustion; the bus is
  * fixture-local, so nothing outlives the test either way. An event that
  * never lands rejects with a named error — absence is never success. */
-function joinJobEvent(h: Harness, jobId: string, kind: string): Promise<EventRecord> {
+function joinJobEvent(h: Harness, jobId: string, kind: string, where?: (event: EventRecord) => boolean): Promise<EventRecord> {
   return new Promise<EventRecord>((resolve, reject) => {
     let settled = false;
     const unsubscribe = h.bus.subscribe((event) => {
       if (settled || event.kind !== kind || event.jobId !== jobId) return;
+      if (where !== undefined && !where(event)) return;
       settled = true;
       unsubscribe();
       resolve(event);
@@ -828,6 +834,163 @@ describe('branch-idle guard', () => {
       expect(h.ledger.listJobEvents('fallback-replay').some((event) => event.kind === 'job.fallback-review')).toBe(false);
     } finally {
       gate.release();
+      await h.close();
+    }
+  });
+
+  it('a queued replay whose job flips to blocked during a failing pre-flight is HELD, not fallback-reviewed', async () => {
+    const repo = makeFixtureRepo('branch-idle-held-blocked');
+    cleanupRepos.push(repo);
+    const entered = deferred();
+    const gate = deferred();
+    const h = await boot({
+      preflightFails: true,
+      onPreflight: async () => {
+        entered.release();
+        await gate.promise;
+      },
+    });
+    try {
+      await createLaneJob(h, repo, { jobId: 'held-blocked', status: 'working' });
+      const queued = await postReview(h, { job_id: 'held-blocked', by: 'minion' });
+      expect(queued.status).toBe(202);
+      expect(queued.json).toMatchObject({ route: 'queued', job_id: 'held-blocked' });
+
+      // The old attempt settles; the replay's failing pre-flight is awaited
+      // while the job's execution authorization is revoked (blocked) — the
+      // post-await handoff fence must HELD it instead of admitting fallback.
+      h.ledger.setJobStatus('held-blocked', 'delivered');
+      const heldPromise = joinJobEvent(h, 'held-blocked', 'job.review-handoff-held');
+      h.wave.reconcilePendingHandoffs();
+      await entered.promise;
+      h.ledger.setJobStatus('held-blocked', 'blocked');
+      gate.release();
+      const held = await heldPromise;
+      expect(held.jobId).toBe('held-blocked');
+      expect(held.payload).toMatchObject({ reason: 'job-status-blocked' });
+
+      // No fallback reviewer started and nothing was admitted.
+      expect(h.fallbackRuns).toHaveLength(0);
+      expect(h.ledger.listRounds('held-blocked')).toHaveLength(0);
+      expect(h.ledger.listJobEvents('held-blocked').some((event) => event.kind === 'job.fallback-review')).toBe(false);
+      expect(h.ledger.listJobEvents('held-blocked').some((event) => event.kind === 'job.review-handoff-started')).toBe(false);
+      expect(h.escalations.some((line) => line.includes('held'))).toBe(true);
+      // Held stays visible but is not sweep-rearmable without a new request.
+      h.wave.reconcilePendingHandoffs();
+      expect(h.fallbackRuns).toHaveLength(0);
+      expect(h.ledger.listRounds('held-blocked')).toHaveLength(0);
+    } finally {
+      gate.release();
+      await h.close();
+    }
+  });
+
+  it('a queued replay whose job flips to parked during a failing pre-flight is HELD, not fallback-reviewed', async () => {
+    const repo = makeFixtureRepo('branch-idle-held-parked');
+    cleanupRepos.push(repo);
+    const entered = deferred();
+    const gate = deferred();
+    const h = await boot({
+      preflightFails: true,
+      onPreflight: async () => {
+        entered.release();
+        await gate.promise;
+      },
+    });
+    try {
+      await createLaneJob(h, repo, { jobId: 'held-parked', status: 'working' });
+      const queued = await postReview(h, { job_id: 'held-parked', by: 'minion' });
+      expect(queued.status).toBe(202);
+      expect(queued.json).toMatchObject({ route: 'queued', job_id: 'held-parked' });
+
+      h.ledger.setJobStatus('held-parked', 'delivered');
+      const heldPromise = joinJobEvent(h, 'held-parked', 'job.review-handoff-held');
+      h.wave.reconcilePendingHandoffs();
+      await entered.promise;
+      h.ledger.setJobStatus('held-parked', 'parked');
+      gate.release();
+      const held = await heldPromise;
+      expect(held.jobId).toBe('held-parked');
+      expect(held.payload).toMatchObject({ reason: 'job-status-parked' });
+
+      expect(h.fallbackRuns).toHaveLength(0);
+      expect(h.ledger.listRounds('held-parked')).toHaveLength(0);
+      expect(h.ledger.listJobEvents('held-parked').some((event) => event.kind === 'job.fallback-review')).toBe(false);
+      expect(h.ledger.listJobEvents('held-parked').some((event) => event.kind === 'job.review-handoff-started')).toBe(false);
+      expect(h.escalations.some((line) => line.includes('held'))).toBe(true);
+    } finally {
+      gate.release();
+      await h.close();
+    }
+  });
+
+  it('pending markers on one job never block an unrelated target branch', () => {
+    const start = eventRecord(1, 'job.status', { from: 'dispatched', to: 'working' });
+    const delivery = eventRecord(2, 'job.delivered', { sha: 'sha-1' });
+    const events = new Map<string, EventRecord[]>([
+      ['marker-owner', [start]],
+      ['plain-lane', [start, delivery]],
+    ]);
+    const pending = new Map<string, PendingRebriefRecord[]>([
+      ['marker-owner', [pendingMarker('marker-owner')]],
+    ]);
+    const ledger = {
+      listJobs: () => [jobRecord('marker-owner', 'working'), jobRecord('plain-lane', 'delivered')],
+      latestJobEvent: (jobId: string, kind: string): EventRecord | null =>
+        (events.get(jobId) ?? []).filter((event) => event.kind === kind).at(-1) ?? null,
+      listPendingRebriefs: (opts: { readonly jobId?: string } = {}): readonly PendingRebriefRecord[] =>
+        opts.jobId === undefined ? [...pending.values()].flat() : (pending.get(opts.jobId) ?? []),
+    };
+    const lanes = [
+      laneRecord('marker-owner', 'marker-owner', 'gru/marker-owner'),
+      laneRecord('plain-lane', 'plain-lane', 'gru/plain-lane'),
+    ];
+    // The marker fences exactly its own branch...
+    expect(
+      findBusyLanes({ ledger, lanes, targetBranch: 'gru/marker-owner' }).map((blocker) => blocker.jobId),
+    ).toEqual(['marker-owner']);
+    // ...and never an unrelated target on another live branch.
+    expect(findBusyLanes({ ledger, lanes, targetBranch: 'gru/plain-lane' })).toEqual([]);
+    // The reverse direction: a marker on the other job must not leak either.
+    pending.clear();
+    pending.set('plain-lane', [pendingMarker('plain-lane')]);
+    expect(
+      findBusyLanes({ ledger, lanes, targetBranch: 'gru/plain-lane' }).map((blocker) => blocker.jobId),
+    ).toEqual(['plain-lane']);
+    expect(findBusyLanes({ ledger, lanes, targetBranch: 'gru/marker-owner' })).toEqual([]);
+  });
+
+  it('force=true still admits the fallback gate on a failing pre-flight with a pending-marker fence', async () => {
+    const repo = makeFixtureRepo('branch-idle-fallback-force');
+    cleanupRepos.push(repo);
+    const h = await boot({ preflightFails: true });
+    try {
+      await createLaneJob(h, repo, { jobId: 'fallback-force', status: 'delivered' });
+      h.ledger.beginPendingRebrief({ jobId: 'fallback-force', note: 'n', briefing: 'b' });
+      // The fenced request refuses before any fallback work...
+      expect((await postReview(h, { job_id: 'fallback-force' })).status).toBe(409);
+      expect(h.fallbackRuns).toHaveLength(0);
+      // ...while the explicit owner override still admits the fallback gate,
+      // and a fallback reviewer actually starts (audited force tag).
+      const passed = joinJobEvent(
+        h,
+        'fallback-force',
+        'job.fallback-review',
+        (event) => (event.payload as { phase?: string }).phase === 'pass',
+      );
+      const forced = await postReview(h, { job_id: 'fallback-force', force: true });
+      expect(forced.status).toBe(202);
+      expect(forced.json).toMatchObject({ route: 'bmad-review-fallback', skill_installed: true });
+      await passed;
+      expect(h.fallbackRuns).toHaveLength(1);
+      const forcedEvents = h.ledger
+        .listJobEvents('fallback-force')
+        .filter((event) => event.kind === 'branch-idle.forced');
+      expect(forcedEvents.length).toBeGreaterThan(0);
+      expect((forcedEvents[0]?.payload as { phase?: string }).phase).toBe('arm');
+      expect((forcedEvents[0]?.payload as { blockers?: unknown[] }).blockers).toHaveLength(1);
+      expect(h.ledger.listJobEvents('fallback-force').some((event) => event.kind === 'branch-idle.refused')).toBe(true);
+    } finally {
       await h.close();
     }
   });
