@@ -272,6 +272,10 @@ the run's image-capable read tool):
 - **Prior failed attempt preserved:** the first prep run `a8e16b5e` exited 1
   with three timeout-class failures under a loaded host; its complete raw
   capture stays host-side and is not claimed as verification.
+- **Evidence-chain CI:** the first evidence commit (`8a559a7`) failed the
+  repository hygiene gate on one embedded host path; the scrub commit
+  (`4c42ce2`) is green in run `37084328165` (all steps), whose receipt is in
+  the evidence pack.
 - **Structural note:** a commit cannot contain the CI receipt of itself
   (writing the receipt moves the head). The pack therefore binds the reviewed
   code head's receipt and states the exact relationship; the host scheduler

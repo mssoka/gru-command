@@ -31,6 +31,7 @@ prefix, and no horizontal overflow at desktop/phone in light/dark.
 - `vision/crew-light-desktop.txt` — sha256 `e7edbb62bac726f8a5cb3ed4845b66585e9af02273e54df707aa761d803a7354`, 2264 bytes
 - `vision/crew-light-phone.txt` — sha256 `fe7cc5500e6578252d840d19733ee2d9f662817ea3670a7cb9b173bd084fd0aa`, 1309 bytes
 - `ci/ci-run-37083150166-eeb62f091281.json` — sha256 `4125fa3deb814febf7a0c5f1c86e93b8488627875dfc2745421ad5650453707b`, 2805 bytes
+- `ci/ci-run-37084328165-4c42ce2cb1f4.json` — sha256 `96f25abb518a51cb04a70f2b379a6d29756190146cf4f7bcdb36ca658c8aee01`, 2805 bytes
 - `ci/prep-run-b1f96c2e-0377-48d7-a788-7b020a0afc20.json` — sha256 `c1bacdb0a6ef4a36fec104a4865ca2df844247fb713c0cbfe74fc2fcc73f48ce`, 1141 bytes
 
 ## Bound records
@@ -44,6 +45,12 @@ prefix, and no horizontal overflow at desktop/phone in light/dark.
   at head `eeb62f091281d10477ed6be7ba602c171f050173` — ok=True exit=0
   tracked_dirty=False duration_ms=303814
   output_bytes=23705 output_sha256=7272370a1f4b9a6fc40875ce2fe1ceb3f3a27c37bc60b4e2d28278726630ef2a.
+
+- Evidence-chain CI: run `37084328165` (`CI`), head
+  `4c42ce2cb1f4bd8807cab9d342c5731ae1546aba`, conclusion `success`, event
+  `pull_request` — re-validates the evidence-and-spec commits. The first
+  evidence commit failed this repository's hygiene gate on one embedded
+  host path; that field was removed and this run is green.
 - The host scheduler `full` run at the frozen head is executed after this
   evidence commit is created; it is bound in the host ledger to that exact
   SHA, and the host appends the ledger-backed receipt to the frozen
@@ -56,7 +63,7 @@ This directory, the r7 section of `spec-crew-heist-labels.md` and the
 `web/playwright.config.ts`/`.gru-command/worktree.toml` records are the
 only files added after the code head above. A commit cannot contain a
 receipt of itself (writing the receipt moves the head): the attached CI
-receipt binds the reviewed code; the frozen head's own merge-result run
+receipts bind the reviewed code and the evidence chain; the frozen head's own merge-result run
 is recorded on the PR, and the host full receipt is bound by SHA as
 described above.
 
