@@ -150,7 +150,8 @@ interface CancellationObservation {
   readonly stalledSummaryCalls: number;
   readonly continuationReachedModel: boolean;
   readonly recoveredReplyDelta: boolean;
-  readonly recoveredReplyPersisted: boolean;
+  readonly recoveredReplyState: boolean;
+  readonly recoveredReplyDurable: boolean;
   readonly queuedPendingDuringStall: boolean;
   readonly queuedModelCallsDuringStall: number;
   readonly guardMessages: readonly string[];
@@ -358,16 +359,48 @@ async function observeCompactionCancellation(
       call.prompt.startsWith('<conversation>'),
     );
     // The recovered reply must be observable as a delta AND as a successful
-    // persisted assistant message, not only as model admission.
+    // assistant message, not only as model admission. The durable check reads
+    // the session JSONL (the SDK persists asynchronously, so a narrow
+    // variant waits for it); the live SDK state check is kept separately.
     const recoveredReplyDelta = events.some(
       (event) => event.type === 'text_delta' && event.delta === 'continuation-recovered',
     );
-    const recoveredReplyPersisted = internal.session.agent.state.messages.some(
+    const recoveredReplyState = internal.session.agent.state.messages.some(
       (message) =>
         message.role === 'assistant' &&
         message.stopReason === 'stop' &&
         JSON.stringify(message.content ?? '').includes('continuation-recovered'),
     );
+    const readDurableReply = (): boolean => {
+      const file = handle.sessionFile;
+      if (file === null) throw new Error('session file missing for the durable reply check');
+      let text: string;
+      try {
+        text = readFileSync(file, 'utf-8');
+      } catch {
+        return false;
+      }
+      return text.split('\n').some((line) => {
+        if (line.trim() === '') return false;
+        const entry = JSON.parse(line) as {
+          type?: unknown;
+          message?: { role?: unknown; stopReason?: unknown; content?: unknown };
+        };
+        return (
+          entry.type === 'message' &&
+          entry.message?.role === 'assistant' &&
+          entry.message?.stopReason === 'stop' &&
+          JSON.stringify(entry.message?.content ?? '').includes('continuation-recovered')
+        );
+      });
+    };
+    let recoveredReplyDurable = readDurableReply();
+    if (variant === 'narrow') {
+      await waitFor(() => {
+        recoveredReplyDurable = readDurableReply();
+        return recoveredReplyDurable;
+      }, 'durable recovered reply');
+    }
     const compactionEnds = events.filter(
       (event): event is Extract<RuntimeEvent, { type: 'compaction_end' }> =>
         event.type === 'compaction_end',
@@ -404,7 +437,8 @@ async function observeCompactionCancellation(
         (call) => call.prompt.startsWith('do the work') && call.prompt.includes('[TOOL_RESULT'),
       ),
       recoveredReplyDelta,
-      recoveredReplyPersisted,
+      recoveredReplyState,
+      recoveredReplyDurable,
       queuedPendingDuringStall,
       queuedModelCallsDuringStall,
       guardMessages,
@@ -1239,7 +1273,8 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       expect(observation.assistantErrors).toBe(1);
       expect(observation.continuationReachedModel).toBe(false);
       expect(observation.recoveredReplyDelta).toBe(false);
-      expect(observation.recoveredReplyPersisted).toBe(false);
+      expect(observation.recoveredReplyState).toBe(false);
+      expect(observation.recoveredReplyDurable).toBe(false);
       expect(observation.summarySettledByAbort).toBe(true);
       // The aborted first cycle is superseded by the SDK's immediate
       // prepareNextTurn retry, which completes before the adapter's single
@@ -1280,7 +1315,8 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       expect(observation.assistantErrors).toBe(0);
       expect(observation.continuationReachedModel).toBe(true);
       expect(observation.recoveredReplyDelta).toBe(true);
-      expect(observation.recoveredReplyPersisted).toBe(true);
+      expect(observation.recoveredReplyState).toBe(true);
+      expect(observation.recoveredReplyDurable).toBe(true);
       expect(observation.summarySettledByAbort).toBe(true);
       // The SDK reports the summary-only cancellation as an aborted
       // compaction; the adapter publishes that failure terminal exactly once.
@@ -1317,7 +1353,8 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       expect(observation.assistantErrors).toBe(1);
       expect(observation.continuationReachedModel).toBe(false);
       expect(observation.recoveredReplyDelta).toBe(false);
-      expect(observation.recoveredReplyPersisted).toBe(false);
+      expect(observation.recoveredReplyState).toBe(false);
+      expect(observation.recoveredReplyDurable).toBe(false);
       expect(observation.summarySettledByAbort).toBe(false);
       expect(observation.abortedEnds).toBe(0);
       expect(observation.successEnds).toBe(1);
@@ -1350,7 +1387,8 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       expect(observation.assistantErrors).toBe(0);
       expect(observation.continuationReachedModel).toBe(true);
       expect(observation.recoveredReplyDelta).toBe(true);
-      expect(observation.recoveredReplyPersisted).toBe(true);
+      expect(observation.recoveredReplyState).toBe(true);
+      expect(observation.recoveredReplyDurable).toBe(true);
       expect(observation.summarySettledByAbort).toBe(false);
       expect(observation.abortedEnds).toBe(1);
       expect(observation.successEnds).toBe(0);
