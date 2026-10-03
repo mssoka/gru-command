@@ -416,10 +416,18 @@ async function observeCompactionCancellation(
       }
       return text.split('\n').some((line) => {
         if (line.trim() === '') return false;
-        const entry = JSON.parse(line) as {
+        let entry: {
           type?: unknown;
           message?: { role?: unknown; stopReason?: unknown; content?: unknown };
         };
+        try {
+          entry = JSON.parse(line) as typeof entry;
+        } catch {
+          // The SDK persists asynchronously: a partially flushed tail line is
+          // not a durable reply yet, so the poll simply retries (never throws
+          // out of the predicate).
+          return false;
+        }
         return (
           entry.type === 'message' &&
           entry.message?.role === 'assistant' &&

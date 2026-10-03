@@ -2671,10 +2671,17 @@ describe('chat context controls and durable new-chat boundaries', () => {
           ) === true,
         'fresh-epoch delivery while retirement is held',
       );
+      // Exactly-once on the real surface: the fresh handle got the message
+      // once, not merely at least once.
+      const freshDeliveries = (): number =>
+        h.freshHandles[0]!.calls.filter((call) => call.text === 'delivered while retirement is held').length;
+      expect(freshDeliveries()).toBe(1);
       expect(h.handle.calls.length).toBe(retiredCallsBefore);
       expect(h.handle.disposed).toBe(false);
       release();
       await pollUntil(() => h.handle.disposed, 'retired handle disposal settled');
+      // Settlement of the retired handle must not replay the message.
+      expect(freshDeliveries()).toBe(1);
       await client.close();
     } finally {
       release();

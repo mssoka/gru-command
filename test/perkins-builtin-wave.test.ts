@@ -1810,8 +1810,10 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     const abortedOutcome = asWave(await abortedWave.runRound({ jobId: aborted.job.id }));
     expect(abortedOutcome.posted).toBe(false);
     expect(abortedOutcome.verdict).toBeNull();
-    const unrecordedAbort = JSON.parse(readFileSync(join(aborted.artifacts, abortedOutcome.round.id, 'perkins-report.reconciled-unrecorded.json'), 'utf8')) as { reason?: string };
+    const unrecordedAbort = JSON.parse(readFileSync(join(aborted.artifacts, abortedOutcome.round.id, 'perkins-report.reconciled-unrecorded.json'), 'utf8')) as { recorded?: boolean; reason?: string; receipt?: { reviewId?: string } };
+    expect(unrecordedAbort.recorded).toBe(false);
     expect(unrecordedAbort.reason).toContain('aborted while the reconciliation lookup was outstanding');
+    expect(unrecordedAbort.receipt?.reviewId).toBe('9201');
     expect(aborted.ledger.latestRoundEvent(abortedOutcome.round.id, 'round.posted')).toBeNull();
   });
 });
