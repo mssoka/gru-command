@@ -1,0 +1,8 @@
+{
+  "body": "# Wizard: retry offered for deterministic BMAD setup failures\n\n## What happened\n\nDuring first-run wizard BMAD onboarding (v1.0.0), a repo with a pre-existing broken BMAD state\nproduced:\n\n```\n> BMAD setup for RightTenantryAgents failed: BMAD manifest declares missing or unsafe module directory: /Users/moses/code/RightTenancy.../_bmad/core\nRetry or skip this repo? [retry/skip]:\n```\n\nEvery `retry` re-runs the same deterministic check against unchanged repo state and fails\nidentically \u2014 the user retried 3+ times before skipping. (Observed sibling class: \"existing BMAD\ninstall lacks selected runtime binding(s)\" also cannot succeed via retry.)\n\n## Why it's wrong\n\n`retry` only makes sense for transient failures (network, tool download). These failures are\ndeterministic state checks \u2014 retry cannot change the outcome and just loops the user.\n\n## Desired behavior\n\n- Classify BMAD setup failures: transient \u2192 offer retry/skip; deterministic (missing/unsafe module\n  dir, manifest/binding mismatch) \u2192 skip-only, with the actionable escape hatch in the prompt\n  (e.g. \"run `npx bmad-method install` in the repo to deliberately update the install\").\n\n## Acceptance\n\n- A repo whose manifest declares a missing/unsafe module dir yields a skip-only prompt (no retry).\n- The same for the binding-mismatch class.\n- Prompt text names the deliberate-fix path.\n",
+  "labels": [],
+  "number": 32,
+  "title": "Wizard: retry offered for deterministic BMAD setup failures",
+  "updatedAt": "2026-09-21T18:29:49Z",
+  "url": "https://github.com/mssoka/gru-command/issues/32"
+}

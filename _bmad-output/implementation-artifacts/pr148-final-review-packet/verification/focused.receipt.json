@@ -1,0 +1,146 @@
+{
+  "at": "2026-10-03T01:03:53.657113+00:00",
+  "by": "minion",
+  "job": "wizard-bmad-deterministic-retry-32",
+  "scope": "wizard-bmad-retry",
+  "head_expected": "1bac32d4ad2f006e863afa5cf3f480d47e83c9d9",
+  "preflight": {
+    "at": "2026-10-03T01:03:51.344801+00:00",
+    "scope": "wizard-bmad-retry",
+    "head": "1bac32d4ad2f006e863afa5cf3f480d47e83c9d9",
+    "expected_head": "1bac32d4ad2f006e863afa5cf3f480d47e83c9d9",
+    "tracked_dirty": "",
+    "remote_head": "81d3f1081486a6cbb39f1d56876375709ebb087f",
+    "job_status": "working",
+    "live_rounds": [],
+    "live_minions": [
+      "01a0fdf5-dde4-7194-a9fd-496e9cb2f932"
+    ],
+    "pending_rebriefs": 0,
+    "blocking_rebriefs": [],
+    "recent_verifications": [
+      {
+        "seq": 40521,
+        "ts": "2026-10-03T01:03:12.370Z",
+        "kind": "verification.completed"
+      },
+      {
+        "seq": 40513,
+        "ts": "2026-10-03T00:58:11.019Z",
+        "kind": "verification.started"
+      },
+      {
+        "seq": 40484,
+        "ts": "2026-10-03T00:44:51.639Z",
+        "kind": "verification.lock-timeout"
+      },
+      {
+        "seq": 40437,
+        "ts": "2026-10-03T00:29:19.510Z",
+        "kind": "verification.completed"
+      }
+    ],
+    "verify_view": {
+      "lockInUse": true,
+      "activeRuns": 1,
+      "queuedRuns": 3,
+      "workerBudget": 14,
+      "workersPerRun": 14
+    },
+    "free_bytes": 64114933760
+  },
+  "starts": [
+    {
+      "type": "started",
+      "runId": "5f642709-71cd-4722-9142-e3180e32fdb3",
+      "workers": 14,
+      "sha": "1bac32d4ad2f006e863afa5cf3f480d47e83c9d9",
+      "queuedMs": 776166
+    }
+  ],
+  "completed": {
+    "type": "completed",
+    "runId": "5f642709-71cd-4722-9142-e3180e32fdb3",
+    "outcome": {
+      "runId": "5f642709-71cd-4722-9142-e3180e32fdb3",
+      "jobId": "wizard-bmad-deterministic-retry-32",
+      "scope": "wizard-bmad-retry",
+      "command": "npm run build && node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/bmad-onboarding.test.ts test/wizard-interactive.test.ts test/wizard.test.ts test/suite-shape.test.ts",
+      "cwd": "/Users/moses/.gru-command/worktrees/gru-command/job-wizard-bmad-deterministic-retry-32",
+      "ok": true,
+      "exitCode": 0,
+      "signal": null,
+      "timedOut": false,
+      "queuedMs": 776166,
+      "durationMs": 71785,
+      "sha": "1bac32d4ad2f006e863afa5cf3f480d47e83c9d9",
+      "trackedDirty": false,
+      "workers": 14,
+      "outputBytes": 7361,
+      "outputSha256": "6795bdb904302fa6888bff525f4fb04658960a58a730998e63e8b0831bcab9b3",
+      "outputTail": "without a ready record (failure matrix)  436ms\n   \u2713 per-selected-repo BMAD onboarding > interrupted/partial install is refused until repaired, never overwritten (failure matrix)  4381ms\n   \u2713 per-selected-repo BMAD onboarding > rejects malformed existing manifests and symlinked selected repos without mutation  2043ms\n   \u2713 per-selected-repo BMAD onboarding > classifies deterministic state failures as retry-futile and keeps transient failures retryable (gh-32)  6321ms\n   \u2713 per-selected-repo BMAD onboarding > already-onboarded missing declared module directory keeps the installer hint before any fingerprint refusal (gh-32 r1)  895ms\n   \u2713 per-selected-repo BMAD onboarding > already-onboarded symlinked declared module directory keeps the installer hint (gh-32 r1)  788ms\n   \u2713 per-selected-repo BMAD onboarding > already-onboarded deleted recorded runtime binding is deterministic with installer guidance, never a futile retry (gh-32 r1)  675ms\n   \u2713 per-selected-repo BMAD onboarding > valid-but-unreadable BMAD control files stay transient and recover on the SAME collected answers (gh-32 r1)  932ms\n   \u2713 per-selected-repo BMAD onboarding > disposable BMAD preflight output failing safety validation stays transient and the next attempt completes (gh-32 r1)  577ms\n   \u2713 per-selected-repo BMAD onboarding > bootstraps isolated copies into a real fresh worktree and fails when a required source module disappears  8124ms\n \u2713 test/wizard-interactive.test.ts (11 tests) 52556ms\n   \u2713 interactive wizard under a pty (Perkins r2 T1) > all-defaults happy path: prompts answered, config written, smoke green  9313ms\n   \u2713 interactive wizard under a pty (Perkins r2 T1) > Enter accepts the default-on fresh BMAD action and reaches ready state  6287ms\n   \u2713 interactive wizard under a pty (Perkins r2 T1) > deterministic BMAD failure offers skip-only with the deliberate-fix path; Enter skips and setup completes (gh-32)  5138ms\n   \u2713 interactive wizard under a pty (Perkins r2 T1) > transient BMAD failure still offers retry; a successful retried attempt completes (gh-32)  6557ms\n   \u2713 interactive wizard under a pty (Perkins r2 T1) > already-onboarded deleted runtime binding is skip-only deterministic; a typed retry is refused and only skip completes (gh-32 r1)  9716ms\n   \u2713 interactive wizard under a pty (Perkins r2 T1) > every prompt loop retries on invalid input, then accepts the valid answer  3333ms\n   \u2713 interactive wizard under a pty (Perkins r2 T1) > managed-repo multi-pick by INDEX selects exactly that repo  2420ms\n   \u2713 interactive wizard under a pty (Perkins r2 T1) > managed-repo multi-pick by NAME (comma-separated) selects exactly those repos  4088ms\n   \u2713 interactive wizard under a pty (Perkins r2 T1) > bind host rejects y/n tokens and re-prompts; 0.0.0.0 lands in the config (user-found boot bug)  2912ms\n   \u2713 interactive wizard under a pty (Perkins r2 T1) > bind host accepts a resolvable hostname (localhost) end-to-end  2672ms\n \u2713 test/wizard.test.ts (26 tests) 49887ms\n   \u2713 wizard CLI surface > interactive mode without a TTY exits 2 printing the terminal recovery command (Perkins r1 B1)  3357ms\n   \u2713 wizard CLI surface > noninteractive deterministic BMAD failure fails loud without offering retry; explicit skip completes (gh-32)  17228ms\n   \u2713 wizard CLI surface > noninteractive deleted recorded binding after successful onboard fails loud skip-only with the installer hint (gh-32 r1)  9351ms\n   \u2713 wizard CLI surface > --answers without a JSON argument exits 2 with usage  2392ms\n   \u2713 wizard CLI surface > --answers rejects secrets (token) and non-object JSON with the documented errors  12383ms\n   \u2713 wizard CLI surface > pre-flight port check: an occupied fixed port fails LOUD with stop-first guidance, nothing written (Perkins r2 H2)  2510ms\n   \u2713 wizard first-boot smoke \u2014 failure modes (I/O matrix) > a service that never answers /health fails loud NAMING the missing signal  2224ms\n\n Test Files  4 passed (4)\n      Tests  58 passed (58)\n   Start at  02:17:06\n   Duration  55.47s (transform 1.54s, setup 167ms, collect 6.01s, tests 141.38s, environment 1ms, prepare 1.45s)\n\n",
+      "error": null
+    }
+  },
+  "errors": [],
+  "frames": 25,
+  "transport_error": null,
+  "http_status": 200,
+  "queued": {
+    "type": "queued",
+    "runId": "5f642709-71cd-4722-9142-e3180e32fdb3",
+    "position": 4,
+    "active": 1,
+    "limit": 1
+  },
+  "captured_output_bytes": 7361,
+  "captured_output_sha256": "6795bdb904302fa6888bff525f4fb04658960a58a730998e63e8b0831bcab9b3",
+  "raw_ndjson_bytes": 14729,
+  "raw_ndjson_sha256": "6a39fbbe789836daa1cf56081975b42fa9183e226fcfe2684d2680bf206b902d",
+  "terminal_outcome": {
+    "runId": "5f642709-71cd-4722-9142-e3180e32fdb3",
+    "jobId": "wizard-bmad-deterministic-retry-32",
+    "scope": "wizard-bmad-retry",
+    "command": "npm run build && node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/bmad-onboarding.test.ts test/wizard-interactive.test.ts test/wizard.test.ts test/suite-shape.test.ts",
+    "cwd": "/Users/moses/.gru-command/worktrees/gru-command/job-wizard-bmad-deterministic-retry-32",
+    "ok": true,
+    "exitCode": 0,
+    "signal": null,
+    "timedOut": false,
+    "queuedMs": 776166,
+    "durationMs": 71785,
+    "sha": "1bac32d4ad2f006e863afa5cf3f480d47e83c9d9",
+    "trackedDirty": false,
+    "workers": 14,
+    "outputBytes": 7361,
+    "outputSha256": "6795bdb904302fa6888bff525f4fb04658960a58a730998e63e8b0831bcab9b3",
+    "error": null
+  },
+  "capture_matches": true,
+  "post_head": "1bac32d4ad2f006e863afa5cf3f480d47e83c9d9",
+  "post_tracked_dirty": "",
+  "ledger_terminal": {
+    "seq": 40553,
+    "ts": "2026-10-03T01:18:04.742Z",
+    "payload": {
+      "run_id": "5f642709-71cd-4722-9142-e3180e32fdb3",
+      "scope": "wizard-bmad-retry",
+      "command": "npm run build && node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/bmad-onboarding.test.ts test/wizard-interactive.test.ts test/wizard.test.ts test/suite-shape.test.ts",
+      "cwd": "/Users/moses/.gru-command/worktrees/gru-command/job-wizard-bmad-deterministic-retry-32",
+      "sha": "1bac32d4ad2f006e863afa5cf3f480d47e83c9d9",
+      "tracked_dirty": false,
+      "ok": true,
+      "exit_code": 0,
+      "signal": null,
+      "timed_out": false,
+      "queued_ms": 776166,
+      "duration_ms": 71785,
+      "workers": 14,
+      "output_bytes": 7361,
+      "output_sha256": "6795bdb904302fa6888bff525f4fb04658960a58a730998e63e8b0831bcab9b3",
+      "output_tail": "without a ready record (failure matrix)  436ms\n   \u2713 per-selected-repo BMAD onboarding > interrupted/partial install is refused until repaired, never overwritten (failure matrix)  4381ms\n   \u2713 per-selected-repo BMAD onboarding > rejects malformed existing manifests and symlinked selected repos without mutation  2043ms\n   \u2713 per-selected-repo BMAD onboarding > classifies deterministic state failures as retry-futile and keeps transient failures retryable (gh-32)  6321ms\n   \u2713 per-selected-repo BMAD onboarding > already-onboarded missing declared module directory keeps the installer hint before any fingerprint refusal (gh-32 r1)  895ms\n   \u2713 per-selected-repo BMAD onboarding > already-onboarded symlinked declared module directory keeps the installer hint (gh-32 r1)  788ms\n   \u2713 per-selected-repo BMAD onboarding > already-onboarded deleted recorded runtime binding is deterministic with installer guidance, never a futile retry (gh-32 r1)  675ms\n   \u2713 per-selected-repo BMAD onboarding > valid-but-unreadable BMAD control files stay transient and recover on the SAME collected answers (gh-32 r1)  932ms\n   \u2713 per-selected-repo BMAD onboarding > disposable BMAD preflight output failing safety validation stays transient and the next attempt completes (gh-32 r1)  577ms\n   \u2713 per-selected-repo BMAD onboarding > bootstraps isolated copies into a real fresh worktree and fails when a required source module disappears  8124ms\n \u2713 test/wizard-interactive.test.ts (11 tests) 52556ms\n   \u2713 interactive wizard under a pty (Perkins r2 T1) > all-defaults happy path: prompts answered, config written, smoke green  9313ms\n   \u2713 interactive wizard under a pty (Perkins r2 T1) > Enter accepts the default-on fresh BMAD action and reaches ready state  6287ms\n   \u2713 interactive wizard under a pty (Perkins r2 T1) > deterministic BMAD failure offers skip-only with the deliberate-fix path; Enter skips and setup completes (gh-32)  5138ms\n   \u2713 interactive wizard under a pty (Perkins r2 T1) > transient BMAD failure still offers retry; a successful retried attempt completes (gh-32)  6557ms\n   \u2713 interactive wizard under a pty (Perkins r2 T1) > already-onboarded deleted runtime binding is skip-only deterministic; a typed retry is refused and only skip completes (gh-32 r1)  9716ms\n   \u2713 interactive wizard under a pty (Perkins r2 T1) > every prompt loop retries on invalid input, then accepts the valid answer  3333ms\n   \u2713 interactive wizard under a pty (Perkins r2 T1) > managed-repo multi-pick by INDEX selects exactly that repo  2420ms\n   \u2713 interactive wizard under a pty (Perkins r2 T1) > managed-repo multi-pick by NAME (comma-separated) selects exactly those repos  4088ms\n   \u2713 interactive wizard under a pty (Perkins r2 T1) > bind host rejects y/n tokens and re-prompts; 0.0.0.0 lands in the config (user-found boot bug)  2912ms\n   \u2713 interactive wizard under a pty (Perkins r2 T1) > bind host accepts a resolvable hostname (localhost) end-to-end  2672ms\n \u2713 test/wizard.test.ts (26 tests) 49887ms\n   \u2713 wizard CLI surface > interactive mode without a TTY exits 2 printing the terminal recovery command (Perkins r1 B1)  3357ms\n   \u2713 wizard CLI surface > noninteractive deterministic BMAD failure fails loud without offering retry; explicit skip completes (gh-32)  17228ms\n   \u2713 wizard CLI surface > noninteractive deleted recorded binding after successful onboard fails loud skip-only with the installer hint (gh-32 r1)  9351ms\n   \u2713 wizard CLI surface > --answers without a JSON argument exits 2 with usage  2392ms\n   \u2713 wizard CLI surface > --answers rejects secrets (token) and non-object JSON with the documented errors  12383ms\n   \u2713 wizard CLI surface > pre-flight port check: an occupied fixed port fails LOUD with stop-first guidance, nothing written (Perkins r2 H2)  2510ms\n   \u2713 wizard first-boot smoke \u2014 failure modes (I/O matrix) > a service that never answers /health fails loud NAMING the missing signal  2224ms\n\n Test Files  4 passed (4)\n      Tests  58 passed (58)\n   Start at  02:17:06\n   Duration  55.47s (transform 1.54s, setup 167ms, collect 6.01s, tests 141.38s, environment 1ms, prepare 1.45s)\n\n",
+      "error": null
+    }
+  },
+  "ledger_match": true
+}

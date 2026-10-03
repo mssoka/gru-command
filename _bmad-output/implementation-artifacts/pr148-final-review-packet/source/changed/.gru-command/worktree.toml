@@ -1,0 +1,166 @@
+# BEGIN GRU COMMAND BMAD BOOTSTRAP
+[[setup]]
+# Fresh clones have no git-local BMAD source. Only onboarded repositories
+# run the generated copier; a configured but invalid source still fails loud.
+command = "if git config --local --get gru-command.bmad-source >/dev/null 2>&1; then node .gru-command/bmad-bootstrap.mjs; fi"
+# END GRU COMMAND BMAD BOOTSTRAP
+
+# The scheduler runs inside each fresh job lane, never in the source checkout.
+[[setup]]
+command = "npm ci"
+
+[verify]
+full = "npm test"
+typecheck = "npm run typecheck"
+
+# Declared focused verification scopes (phase 4; invoked only via the
+# authenticated /api/verify scheduler at unchanged budgets/thresholds —
+# plain vitest invocations, no worker/timeout flags, never the npm chain).
+residency-runtime = "npx vitest run test/resident-budget.test.ts test/runtime-resident-registry.test.ts test/fix-directive.test.ts test/silas-deterministic-seam.test.ts"
+handoff-wave = "npx vitest run test/perkins-builtin-wave.test.ts test/perkins-whole-review.test.ts test/config.test.ts"
+working-flavor = "cd web && npx vitest run src/lib/working-flavor.test.ts src/ui/chat-working-flavor.test.ts src/ui/chat-attachments.test.ts src/ui/chat-composer.test.ts src/ui/chat-console.test.ts src/ui/chat-gfm-invariant.test.ts src/ui/chat-scroll.test.ts src/ui/chat-service-band.test.ts src/ui/chat-tool-turn.test.ts"
+compaction-rollback = "npx vitest run test/pi-adapter.test.ts test/supervisor.test.ts test/config.test.ts test/health.test.ts test/board-engine.test.ts test/suite-shape.test.ts"
+native-compaction-wait = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/supervisor.test.ts test/suite-shape.test.ts"
+
+# Provider-recovery sensor lane scopes (r4 fix round; invoked only via
+# the authenticated /api/verify scheduler at unchanged budgets/thresholds —
+# plain vitest invocations, no worker/timeout flags, never the npm chain).
+provider-recovery = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/provider-recovery-sensor.test.ts test/provider-recovery-resume.test.ts test/provider-recovery-ledger.test.ts test/provider-recovery-metadata.test.ts test/provider-recovery-composition.test.ts test/provider-recovery-classify.test.ts test/provider-recovery-admission.test.ts test/provider-recovery-seam.test.ts test/suite-shape.test.ts"
+
+# Fails-before comparison for the r4 fix round. Baseline A = the pre-fix
+# lane head; baseline B = the parent of the blocked-settle fix 1073216.
+# Both overlay the CURRENT committed test sources onto a git archive of the
+# pinned pre-fix commits (node_modules bound by symlink, same RPC patch
+# prerequisite) and are EXPECTED RED: the new regressions fail before the
+# fixes. The vitest exit codes are echoed intact so the scheduler captures
+# both as evidence — never masked into a PASS. Snapshot dirs are preserved.
+provider-recovery-r4-baseline = 'root="$PWD"; dA=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-provider-recovery-r4a.XXXXXX"); git archive 8a68970ac56ee05632ca9ab86f54edf6058a19fc | tar -x -C "$dA" || { echo "baseline-A archive failed"; exit 3; }; cp test/provider-recovery-sensor.test.ts test/provider-recovery-ledger.test.ts test/provider-recovery-metadata.test.ts test/provider-recovery-seam.test.ts "$dA/test/"; ln -s "$root/node_modules" "$dA/node_modules"; ( cd "$dA" && node tools/patch-vitest-rpc-timeout.mjs >/dev/null 2>&1; npx vitest run test/provider-recovery-sensor.test.ts test/provider-recovery-ledger.test.ts test/provider-recovery-metadata.test.ts test/provider-recovery-seam.test.ts ); a=$?; echo "baseline-A pre-fix 8a68970 + current tests exit=$a EXPECTED-NONZERO"; dB=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-provider-recovery-blocker.XXXXXX"); git archive 7bbc25de0dc8aa088369cb32fed69e21c78df44b | tar -x -C "$dB" || { echo "baseline-B archive failed"; exit 3; }; cp test/provider-recovery-sensor.test.ts test/provider-recovery-resume.test.ts test/provider-recovery-seam.test.ts "$dB/test/"; ln -s "$root/node_modules" "$dB/node_modules"; ( cd "$dB" && node tools/patch-vitest-rpc-timeout.mjs >/dev/null 2>&1; npx vitest run test/provider-recovery-sensor.test.ts test/provider-recovery-resume.test.ts test/provider-recovery-seam.test.ts ); b=$?; echo "baseline-B pre-fix 7bbc25d + blocker tests exit=$b EXPECTED-NONZERO"; echo "baseline snapshots preserved: A=$dA B=$dB"; if [ "$a" -eq 0 ] || [ "$b" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: a baseline passed unexpectedly"; fi; exit 1'
+
+# Baseline comparison for the lane: identical final test files (git show
+# from the pinned head) run against an isolated baseline snapshot (git
+# archive of the pinned base) using the unchanged baseline Vitest
+# config/budgets and the existing node_modules bound by symlink — no
+# worktree/branch mutation, no dependency install, both sides keep the
+# approved RPC-patch prerequisite. Expected result is RED: the new-policy
+# oracles encode wait-not-restart behavior the baseline lacks. The vitest
+# exit status is left intact so the scheduler captures outcome.exitCode
+# as evidence; it is never masked into a PASS. This scope never deletes
+# snapshot material; the ignored pointer file
+# _bmad-output/gate-prep/native-compaction-wait-baseline.last-snapshot.txt
+# records the latest snapshot location, preserved for inspection.
+native-compaction-wait-baseline = 'set -e; base=2aa836abe262759c651683deb40d05f02c9ede86; headrev=ab11bb327c4ba1ab3e3e3a9cc9e6b3bcaf4a22b3; root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-native-compaction-wait.XXXXXX"); git archive "$base" | tar -x -C "$d"; git show "$headrev":test/supervisor.test.ts > "$d/test/supervisor.test.ts"; git show "$headrev":test/suite-shape.test.ts > "$d/test/suite-shape.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "%s base=%s head=%s\n" "$d" "$base" "$headrev" > "$prep/native-compaction-wait-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/supervisor.test.ts test/suite-shape.test.ts'
+# wizard-bmad-retry builds first so its CLI/pty legs execute the reviewed
+# source's dist, then applies the repo-approved vitest RPC pretest patch
+# (tools/patch-vitest-rpc-timeout.mjs) that `npm test` also runs.
+wizard-bmad-retry = "npm run build && node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/bmad-onboarding.test.ts test/wizard-interactive.test.ts test/wizard.test.ts test/suite-shape.test.ts"
+
+# Feature-specific BASELINE for the gh-32 lane (scheduler-only; never part
+# of `npm test`): identical FINAL tests and suite pins (git show from the
+# pinned final-test commit, captured at admission — never uncommitted
+# bytes, never a circular hardcoded self-SHA) run against an isolated
+# RETAINED snapshot (git archive) of the PRE-REPAIR merge parent
+# cee0ecbe53229d05c13f909dd11d4b31e886db72 (2bf6bc7 + main 6a00f4e) — NOT
+# the unrelated native-compaction baseline. So each split r1 class case
+# (missing module, symlinked module, deleted recorded binding,
+# control-file read+recovery, disposable preflight) REDs independently and
+# attributably against pre-fix source. No worktree/branch mutation, no
+# snapshot deletion, no dependency install (existing node_modules bound by
+# symlink), no cherry-pick or other-lane patch. Baseline dist is BUILT
+# before the dist-driven CLI/pty legs, after the approved RPC-patch
+# prerequisite; no vitest flags — original pools/30s budgets/assertions
+# and the 14-worker scheduler contract are inherited unchanged. vitest has
+# no bail/short-circuit, so every independent case executes; the expected
+# RED is the feature's nonzero exit, left intact (never masked into PASS).
+# Baseline and final focused runs are separate scheduler requests. The
+# ignored pointer file
+# _bmad-output/gate-prep/wizard-bmad-retry-baseline.last-snapshot.txt
+# records base SHA, final-test SHA, per-file test hashes and the latest
+# retained snapshot location (older snapshots are kept for inspection).
+wizard-bmad-retry-baseline = 'set -e; base=cee0ecbe53229d05c13f909dd11d4b31e886db72; headrev=5f61593a87c5fab3fc2e03f2769af03b21e95788; root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-wizard-bmad-retry.XXXXXX"); git archive "$base" | tar -x -C "$d"; for f in test/bmad-onboarding.test.ts test/wizard-interactive.test.ts test/wizard.test.ts test/suite-shape.test.ts; do git show "$headrev:$f" > "$d/$f"; done; { printf "base=%s head=%s snapshot=%s\n" "$base" "$headrev" "$d"; (cd "$d" && shasum -a 256 test/bmad-onboarding.test.ts test/wizard-interactive.test.ts test/wizard.test.ts test/suite-shape.test.ts); } > "$prep/wizard-bmad-retry-baseline.last-snapshot.txt"; ln -s "$root/node_modules" "$d/node_modules"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs && npm run build && npx vitest run test/bmad-onboarding.test.ts test/wizard-interactive.test.ts test/wizard.test.ts test/suite-shape.test.ts'
+
+# Browser-consumer acceptance for the gh-32 lane (owner mandate j-861:
+# scoped/full/browser tests honestly captured through /api/verify at the
+# applicable final head). No web source is touched by this lane; this is
+# the consumer-side gate a backend-only FULL failure would otherwise leave
+# unexecuted: the shipped web shell's compile + unit suite, then both
+# Playwright projects (dev mock and the test-managed real service) against
+# the built merged source. Budgets/thresholds unchanged; approved RPC
+# patch prerequisite first, same as the other witnessed scopes.
+wizard-bmad-browser-consumer = "node tools/patch-vitest-rpc-timeout.mjs && npm run test:web && npm run e2e"
+
+# Browser snapshot repair (2026-10-02, PR148 browser-consumer correction):
+# regenerates the four darwin theme baselines (mock chat-light/dark + real
+# real-chat-light/dark) against the approved current-main UI (FOR YOU owner
+# band, owner chime, collapsed service band) after the fixture repairs.
+# Writes tracked PNGs DELIBERATELY (explicit --update-snapshots, only the
+# two `dark toggle persists` tests); the outputs are reviewed and committed,
+# then wizard-bmad-browser-consumer re-runs as the acceptance scope.
+# Scheduler-only; budgets/tolerances/timeouts unchanged.
+wizard-bmad-snapshot-update = "node tools/patch-vitest-rpc-timeout.mjs && npm run build && npm run build -w web && cd web && node ../node_modules/@playwright/test/cli.js test --update-snapshots=all --grep \"dark toggle persists\""
+
+lens-unused-neutral = "node tools/patch-vitest-rpc-timeout.mjs && cd web && node ../node_modules/vitest/vitest.mjs run src/ui/board.test.ts src/lib/board-signals.test.ts src/lib/board-protocol.test.ts"
+lens-unused-neutral-baseline = 'set -e; base=6a00f4e50e7ae970915a9a534c142c1f8a45b57d; headrev=43e437a2e61b0c25351ed6147639aefbac4ccd77; root="$PWD"; prep=_bmad-output/ops-readiness-repair-20261002; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-lens-unused-neutral.XXXXXX"); git archive "$base" | tar -x -C "$d"; git show "$headrev":web/src/ui/board.test.ts > "$d/web/src/ui/board.test.ts"; git show "$headrev":web/src/lib/board-signals.test.ts > "$d/web/src/lib/board-signals.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; ln -s "$root/web/node_modules" "$d/web/node_modules"; printf "%s base=%s head=%s\n" "$d" "$base" "$headrev" > "$prep/lens-unused-neutral-baseline.last-snapshot.txt"; cd "$d" && node tools/patch-vitest-rpc-timeout.mjs && cd "$d/web" && node "$root/node_modules/vitest/vitest.mjs" run src/ui/board.test.ts src/lib/board-signals.test.ts'
+lens-unused-neutral-browser = "node tools/patch-vitest-rpc-timeout.mjs && cd web && node ../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json && node node_modules/vite/bin/vite.js build && node ../node_modules/@playwright/test/cli.js test --project=lens-pills"
+
+# Provider pacing regression scopes use the same scheduler budget as full.
+pacing-unit = "npx vitest run test/pacing.test.ts test/pacing-admission.test.ts test/rate-limit-retry.test.ts test/config.test.ts test/config-generate.test.ts test/supervisor.test.ts test/patch-vitest-rpc-timeout.test.ts test/suite-shape.test.ts"
+pacing-review = "npx vitest run test/perkins-whole-review.test.ts -t 'provider pacing'"
+# The witnessed settlement/fixture regressions run the approved j-463 RPC
+# patch first (pretest equivalent); still no worker/timeout flags or npm chain.
+pacing-settlement-regressions = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/dispatch-server.test.ts test/supervisor.test.ts test/suite-shape.test.ts"
+
+# PR135 current18 raw-triage regressions (source-only fix pass; runs the
+# approved j-463 RPC patch first, same as the other witnessed scope).
+pacing-current18 = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/pacing.test.ts test/pacing-admission.test.ts test/rate-limit-retry.test.ts test/supervisor.test.ts test/fix-directive.test.ts test/dispatch-server.test.ts test/patch-vitest-rpc-timeout.test.ts test/suite-shape.test.ts"
+
+# PR135 CI typecheck repair (silas-ops-pr135-ci-type-repair-20261001T014506Z):
+# the compiler diagnostics are covered by the [verify] typecheck scope; this
+# focused scope covers the touched seams' runtime regressions and keeps the
+# approved j-463 RPC patch first, same as the other witnessed scopes.
+pr135-ci-type-repair = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/rebrief-recovery.test.ts test/fix-directive.test.ts test/rate-limit-retry.test.ts test/supervisor.test.ts test/pacing.test.ts"
+
+# PR135 runtime CI three-repair (silas-ops-pr135-runtime-ci-three-repair-20261001T014506Z):
+# the job-attribution FK fixture, the T13/R17 settled-wave contract and the
+# shared child-turn budget oracle, plus the pin file; approved RPC patch first.
+pr135-runtime-ci-three-repair = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/supervisor.test.ts test/perkins-whole-review.test.ts test/suite-shape.test.ts"
+
+# PR135 r12 fresh-review repairs (BMAD built-in review 2026-10-02): the
+# null-prototype provider map, fire-and-forget dispose safety, canonical
+# retry payloads and the consumer-level settlement tests the verification
+# gap layer identified; approved RPC patch first.
+r12-review-repairs = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/pacing-admission.test.ts test/fix-directive.test.ts test/supervisor.test.ts test/config.test.ts test/perkins-builtin-wave.test.ts test/rebrief-recovery.test.ts test/suite-shape.test.ts"
+
+# PR135 r13 fresh-review repairs (BMAD blind-hunter on b541e44, 2026-10-02):
+# classifier context for the 429 family, capped-rung jitter spread, settlement
+# precedence over an already-aborted signal, the shared payload error bound,
+# gate job-attribution, the dual-root patch-tool guards and the
+# deterministic-wait conversions; approved RPC patch first.
+r13-review-repairs = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/pacing.test.ts test/pacing-admission.test.ts test/rate-limit-retry.test.ts test/patch-vitest-rpc-timeout.test.ts test/supervisor.test.ts test/fix-directive.test.ts test/dispatch-server.test.ts test/perkins-builtin-wave.test.ts test/config.test.ts test/config-generate.test.ts test/suite-shape.test.ts"
+
+# PR134 verification readiness (2026-10-02): this lane's focused regression
+# and its isolated pre-fix baseline, declared for the authenticated
+# scheduler only — explicit existing installed Vitest CLI invocations
+# (vitest is hoisted at the lane root; web/node_modules has none) under
+# the existing web Vitest config/budgets, approved RPC patch prerequisite,
+# exits never masked.
+board-merged-attention = "node tools/patch-vitest-rpc-timeout.mjs && cd web && ../node_modules/.bin/vitest run src/lib/board-bands.test.ts src/ui/board-merged-attention.test.ts"
+
+# T4 diagnosis (2026-10-02): the shared perkins-builtin-wave T4 case sits on
+# the 30s default ceiling under full-suite co-tenant load and has timed out
+# in FULL at multiple heads across lanes (shared fixture cost; the cost
+# repair is owned by the separate review-rebrief-interlock lane, unmerged —
+# never copied here). This scope isolates that single case at the unchanged
+# default ceiling so a FULL timeout can be classified (isolation pass vs
+# deterministic fail); it changes no test, timeout, assertion or gate.
+t4-oracle = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perkins-builtin-wave.test.ts -t \"does not record a reconciled delivery\""
+
+# Isolated pre-fix baseline: current-main 059c0762 source with the IDENTICAL
+# final behavioral tests from the scheduled head, dependencies linked (no
+# download/install), same web config/runner/budgets and RPC prerequisite.
+# Main059c lacks the concluded-history fix, so assertion RED is expected;
+# compilation/import/setup/harness failure is not RED evidence. The vitest
+# exit is left intact, never masked. The snapshot directory and the ignored
+# pointer file are preserved for inspection; nothing is deleted or checked
+# out, and no branch/worktree holds the sha.
+board-merged-attention-baseline = 'set -e; base=059c076290145d4aae6e0b47c7b3f87156862c43; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-board-merged-attention.XXXXXX"); git archive "$base" | tar -x -C "$d"; git show "$headrev":web/src/lib/board-bands.test.ts > "$d/web/src/lib/board-bands.test.ts"; git show "$headrev":web/src/ui/board-merged-attention.test.ts > "$d/web/src/ui/board-merged-attention.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; ln -s "$root/web/node_modules" "$d/web/node_modules"; printf "board-merged-attention-baseline base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/board-merged-attention-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs && cd web && ../node_modules/.bin/vitest run src/lib/board-bands.test.ts src/ui/board-merged-attention.test.ts'
+finding-dedupe-recency = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perkins-findings-dedupe.test.ts test/suite-shape.test.ts"
