@@ -692,7 +692,10 @@ describe('github signal poll tick', () => {
     try {
       addTrackedJob(h.ledger, 'job-nominion', 'https://github.com/acme/app/pull/13');
       // Another lane's worker ranks first: the unbound lane must NOT
-      // borrow it (followup V1).
+      // borrow it (followup V1). The other lane must exist as a real job
+      // (the agent→job FK); it is not a tracked poll lane (no PR URL).
+      h.ledger.addJob({ id: 'job-elsewhere', repo: 'fixture', title: 'other', briefing: 'b' });
+      h.ledger.setJobStatus('job-elsewhere', 'working');
       h.ledger.registerAgent({ id: 'a-minion-other', role: 'minion', jobId: 'job-elsewhere' });
       const api = new FakeGhApi();
       api.pulls.set('acme/app', [
