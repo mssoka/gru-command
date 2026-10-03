@@ -80,7 +80,7 @@ export interface FrozenEvidenceRuntimeAttachment extends FrozenEvidenceAttachmen
   readonly frozenPath: string;
 }
 
-function controlFree(value: string): boolean {
+function hasControlCharacters(value: string): boolean {
   for (const character of value) {
     const code = character.codePointAt(0) ?? 0;
     if ((code < 32 && character !== '\n' && character !== '\t') || code === 127) return true;
@@ -175,14 +175,14 @@ export function validateEvidenceRequest(
   index: number,
 ): ValidatedEvidenceSource {
   const purpose = request.purpose;
-  if (typeof purpose !== 'string' || purpose.trim() === '' || controlFree(purpose) === false) {
+  if (typeof purpose !== 'string' || purpose.trim() === '' || hasControlCharacters(purpose)) {
     throw new ReviewEvidenceError(`evidence[${index}] purpose must be non-empty printable text`);
   }
   if (purpose.length > REVIEW_EVIDENCE_PURPOSE_MAX_CHARS) {
     throw new ReviewEvidenceError(`evidence[${index}] purpose exceeds ${REVIEW_EVIDENCE_PURPOSE_MAX_CHARS} characters`);
   }
   const consent = request.consentRef;
-  if (typeof consent !== 'string' || consent.trim() === '' || controlFree(consent) === false) {
+  if (typeof consent !== 'string' || consent.trim() === '' || hasControlCharacters(consent)) {
     throw new ReviewEvidenceError(`evidence[${index}] consent_ref must be a non-empty durable reference`);
   }
   if (consent.length > REVIEW_EVIDENCE_CONSENT_MAX_CHARS) {
@@ -190,7 +190,7 @@ export function validateEvidenceRequest(
   }
   const captured = request.capturedAt ?? null;
   if (captured !== null) {
-    if (typeof captured !== 'string' || captured.trim() === '' || controlFree(captured) || captured.length > REVIEW_EVIDENCE_CAPTURED_MAX_CHARS) {
+    if (typeof captured !== 'string' || captured.trim() === '' || hasControlCharacters(captured) || captured.length > REVIEW_EVIDENCE_CAPTURED_MAX_CHARS) {
       throw new ReviewEvidenceError(`evidence[${index}] captured_at must be a bounded printable timestamp`);
     }
   }

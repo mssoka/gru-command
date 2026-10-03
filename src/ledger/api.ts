@@ -792,13 +792,13 @@ export class LedgerApi {
         }
       }
       if (input.expectedContractSha256 !== current.contractSha256) {
-        return {
-          status: 'rejected' as const,
-          code: 'stale' as const,
-          reason: `expected_contract_sha256 does not match the current effective contract (now version ${current.version})`,
-          currentContractSha256: current.contractSha256,
-          currentVersion: current.version,
-        };
+        return this.rejectAmendment(
+          input.jobId,
+          'stale',
+          `expected_contract_sha256 does not match the current effective contract (now version ${current.version})`,
+          input,
+          { currentContractSha256: current.contractSha256, currentVersion: current.version },
+        );
       }
       const draftError = validateAmendmentDraft({
         body: input.body,
@@ -889,6 +889,7 @@ export class LedgerApi {
       readonly expectedContractSha256: string;
       readonly idempotencyKey?: string | null;
     },
+    current?: { readonly currentContractSha256: string; readonly currentVersion: number },
   ): AddJobAmendmentResult {
     this.appendEvent({
       kind: 'job.amendment-rejected',
@@ -903,9 +904,19 @@ export class LedgerApi {
         approval_by: input.approval.by.slice(0, 200),
         approval_reference: input.approval.reference.slice(0, 500),
         ...(input.idempotencyKey != null ? { idempotency_key: input.idempotencyKey.slice(0, 200) } : {}),
+        ...(current !== undefined
+          ? { current_contract_sha256: current.currentContractSha256, current_version: current.currentVersion }
+          : {}),
       },
     });
-    return { status: 'rejected', code, reason };
+    return {
+      status: 'rejected',
+      code,
+      reason,
+      ...(current !== undefined
+        ? { currentContractSha256: current.currentContractSha256, currentVersion: current.currentVersion }
+        : {}),
+    };
   }
 
   private amendmentFromRow(row: Row): JobAmendmentRecord {
