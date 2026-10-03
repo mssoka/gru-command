@@ -207,7 +207,6 @@ export function renderRecordedCiEvidence(input: CiEvidenceInput): {
     observationFromEvent(input.events.ciGreen),
     observationFromEvent(input.events.ciFailed),
   ].filter((entry): entry is Observation => entry !== null);
-  const ts = (observation: Observation | null): string => observation?.ts ?? 'unknown';
 
   const base = {
     repo: null as string | null,
