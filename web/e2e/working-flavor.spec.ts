@@ -162,7 +162,11 @@ test('busy phrases rotate with stable status/control geometry on every surface',
 
   // Phone bottom sheet (< 900px: status takes its own row, controls below).
   await page.setViewportSize({ width: 390, height: 844 });
-  await page.locator('#gru-fab').click();
+  // The tablet drawer stays open across the width change and now covers
+  // the FAB — only tap it when the sheet is actually closed.
+  if ((await page.locator('#chat-sheet').getAttribute('data-open')) !== 'true') {
+    await page.locator('#gru-fab').click();
+  }
   await expect(page.locator('#chat-sheet')).toHaveAttribute('data-open', 'true');
   await expect(flavor).toBeVisible();
   await sweepApprovedLabels(page);
