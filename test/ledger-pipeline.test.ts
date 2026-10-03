@@ -307,6 +307,8 @@ describe('pipeline ledger — evaluation, order and projection', () => {
     ledger.markPipelineAdmitted({ id: 'pipe-a', jobId: 'pipe-a' });
     expect(view().entries.find((entry) => entry.id === 'pipe-b')?.reason).toContain('held by pipe-a');
     ledger.setJobStatus('pipe-a', 'working');
+    ledger.setJobStatus('pipe-a', 'delivered');
+    ledger.setJobStatus('pipe-a', 'in-review');
     ledger.setJobStatus('pipe-a', 'merged');
     expect(view().entries.find((entry) => entry.id === 'pipe-b')?.reason).toBeNull();
     db.close();
