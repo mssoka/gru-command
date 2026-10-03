@@ -73,3 +73,16 @@ are also reported in the PR body and the completion report.
   host-load class) and its cross-lane diagnosis are preserved in the lane
   spec's continuation notes and the operations investigation archive; they
   are not relabeled or re-run for logs.
+
+## Post-merge green set (packet commit head)
+
+Executed through `/api/verify` after the fresh-main integration and the browser-fixture
+repairs; complete outputs and receipts are copied under `verification/post-merge/`.
+
+| scope | run | exit | sha | output | ledger seq |
+|---|---|---|---|---|---|
+| `focused` | `be16f221-1982-4463-a36b-d5ac62bfd7f8` | 0 | `faa69d69264a293296fffa7d773b083b2fa17135` | 7371 B / `3d7ac469a93b0abcf695f3a4d950435dd99fe2a15f5495d8edaf655f7b00ebc3` | 41584 |
+| `full` | `1744e502-4244-4d09-9361-0de64763f457` | 0 | `faa69d69264a293296fffa7d773b083b2fa17135` | 113166 B / `9fe26c5681598154950532f54a19bc2e3225123cf04d005a24d471780aab5e8a` | 41539 |
+| `browser` | `5360af3c-6ba4-44f7-aff5-894ddd732212` | 0 | `faa69d69264a293296fffa7d773b083b2fa17135` | 15041 B / `68249f8d58e42e451cd65ca30be3623d742de0318f279037d11050684e0d0bd8` | 41402 |
+
+Product head at capture: `faa69d69264a293296fffa7d773b083b2fa17135`; these receipt copies are path-sanitized like every packet copy. This evidence was added to the packet by the evidence-only follow-up commit on top of it (packet-files-only delta, verifiable per the manifest).

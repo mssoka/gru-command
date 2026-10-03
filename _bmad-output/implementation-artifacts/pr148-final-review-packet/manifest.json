@@ -1,5 +1,5 @@
 {
-  "at": "2026-10-03T03:38:05.227937+00:00",
+  "at": "2026-10-03T06:57:00.514699+00:00",
   "job": "wizard-bmad-deterministic-retry-32",
   "pr": 148,
   "lane_branch": "gru/wizard-bmad-deterministic-retry-32",
@@ -262,8 +262,8 @@
     },
     {
       "path": "verification/current-evidence.md",
-      "bytes": 4641,
-      "sha256": "ee1eb6c86e3f8311d3e4c006e8445162c3827e76fef58d069097021bd5a5ee4f",
+      "bytes": 5787,
+      "sha256": "cc11650f103954bfcba0948941a44006e4c3eaca3fbd731dc3ecc5cb3d17c545",
       "sanitized": 2
     },
     {
@@ -289,6 +289,42 @@
       "bytes": 12965,
       "sha256": "5a134616b41baca121e2688a83a48d89ba5a07a044f847bb073ae5e17e4324c5",
       "sanitized": 5
+    },
+    {
+      "path": "verification/post-merge/browser.complete-output.txt",
+      "bytes": 14757,
+      "sha256": "fe6f315b81cb3281591cdef1022148623c72802ead4ede32a7f88108054cf888",
+      "sanitized": 4
+    },
+    {
+      "path": "verification/post-merge/browser.receipt.json",
+      "bytes": 13889,
+      "sha256": "7b2f782787ae97bc065bff04665bd7ed206ade767d9c74dfd1c4557f6540084a",
+      "sanitized": 3
+    },
+    {
+      "path": "verification/post-merge/focused.complete-output.txt",
+      "bytes": 7087,
+      "sha256": "e7f9fc4a91f10a24a46598b756fd5523fc663ac5566b4c36c3284baed6a261e0",
+      "sanitized": 4
+    },
+    {
+      "path": "verification/post-merge/focused.receipt.json",
+      "bytes": 13294,
+      "sha256": "e41a50fc305742b30adae1d475b46d738f467cf9123fe13278181f03355ba4dd",
+      "sanitized": 3
+    },
+    {
+      "path": "verification/post-merge/full.complete-output.txt",
+      "bytes": 112811,
+      "sha256": "ad95e790257aeefed038cc6d16698ae6bd755aedf2698989c63b703798dfcfdf",
+      "sanitized": 5
+    },
+    {
+      "path": "verification/post-merge/full.receipt.json",
+      "bytes": 12973,
+      "sha256": "1530128313ba789af3b06e99953ea88c6644bc411a9e07d1e67cdbbb0a54d60d",
+      "sanitized": 5
     }
   ],
   "sanitization": {
@@ -309,84 +345,7 @@
       "verification/full.receipt.json": 5
     }
   },
-  "product_files_at_head": [
-    {
-      "path": ".gru-command/worktree.toml",
-      "blob": "e0e3069e13eebe85ed91a67c96ee50b2552932bd"
-    },
-    {
-      "path": "README.md",
-      "blob": "f956962c347615b4d6c58fa6456e5f16e3f939dc"
-    },
-    {
-      "path": "_bmad-output/implementation-artifacts/spec-gh-32-deterministic-bmad-failure-skip-only.md",
-      "blob": "4f4303a2e85fbee547f3d33b9de949a915f4501c"
-    },
-    {
-      "path": "src/wizard/bmad-onboarding.ts",
-      "blob": "d4ae6ab0fe08ca4c9fad3749e2b1dbcd53c4c9e4"
-    },
-    {
-      "path": "src/wizard/main.ts",
-      "blob": "5bccc0f919cd67a8e726c10f9f66cbd1c84d5077"
-    },
-    {
-      "path": "test/bmad-onboarding.test.ts",
-      "blob": "2d2d96c0c39526100a0f57fcd917c9b7a1081874"
-    },
-    {
-      "path": "test/suite-shape.test.ts",
-      "blob": "b847514cf72f0465822b9de28ea094ea631eb394"
-    },
-    {
-      "path": "test/wizard-interactive.test.ts",
-      "blob": "14c98d2e659d1753683a9185475c73b0d1f43fb4"
-    },
-    {
-      "path": "test/wizard.test.ts",
-      "blob": "3267167c5d6d497375491b3c606595e44e75eb22"
-    },
-    {
-      "path": "web/e2e/real-server.spec.ts",
-      "blob": "a9887b6b316c10ae1e873bcd087f8bc17c66363d"
-    },
-    {
-      "path": "web/e2e/real-server.spec.ts-snapshots/real-chat-dark-darwin.png",
-      "blob": "26dcc85fcda74a63b82720d8d2ac90d45c0f1eca"
-    },
-    {
-      "path": "web/e2e/real-server.spec.ts-snapshots/real-chat-light-darwin.png",
-      "blob": "6645e46795fd14d4e6b09d2f8949971a23aa92d0"
-    },
-    {
-      "path": "web/e2e/smoke.spec.ts",
-      "blob": "8b06ee9b714ebf174aa3582b423cb8e5a058695a"
-    },
-    {
-      "path": "web/e2e/smoke.spec.ts-snapshots/chat-dark-darwin.png",
-      "blob": "26e83769d38899b1d612d9cb382da3cdf2530271"
-    },
-    {
-      "path": "web/e2e/smoke.spec.ts-snapshots/chat-light-darwin.png",
-      "blob": "c50fed21655a93c117374e828601c655aff59c8c"
-    },
-    {
-      "path": "web/e2e/working-flavor.spec.ts",
-      "blob": "a77389ae8eed91d4939c58b67d840f20ceff09f3"
-    },
-    {
-      "path": "web/mock/server.ts",
-      "blob": "1d04e22cb8ed13a9e451c80b1e453525400abf03"
-    },
-    {
-      "path": "web/src/styles/components.css",
-      "blob": "6a145151e01b9b98fa34a9906f74486bc3d2ce59"
-    },
-    {
-      "path": "web/src/ui/chat-working-flavor.test.ts",
-      "blob": "8ac681955b4fa07188606c66561f126f3cdc5d4b"
-    }
-  ],
+  "product_files_at_head": [],
   "lens_instructions": {
     "lens-adversarial": {
       "path": ".agents/skills/bmad-review/references/lens-adversarial.md",
@@ -429,5 +388,49 @@
       "sha": "1bac32d4ad2f006e863afa5cf3f480d47e83c9d9"
     }
   },
-  "note": "packet_files excludes manifest.json (cannot contain its own hash); the manifest hash is stated in the review dispatch briefing."
+  "note": "packet_files excludes manifest.json (cannot contain its own hash); the manifest hash is stated in the review dispatch briefing.",
+  "post_merge_runs": [
+    {
+      "label": "focused",
+      "runId": "be16f221-1982-4463-a36b-d5ac62bfd7f8",
+      "exit": 0,
+      "ok": true,
+      "sha": "faa69d69264a293296fffa7d773b083b2fa17135",
+      "bytes": 7371,
+      "sha256": "3d7ac469a93b0abcf695f3a4d950435dd99fe2a15f5495d8edaf655f7b00ebc3",
+      "queuedMs": 881545,
+      "durationMs": 94462,
+      "ledger_seq": 41584,
+      "capture_matches": true,
+      "ledger_match": true
+    },
+    {
+      "label": "full",
+      "runId": "1744e502-4244-4d09-9361-0de64763f457",
+      "exit": 0,
+      "ok": true,
+      "sha": "faa69d69264a293296fffa7d773b083b2fa17135",
+      "bytes": 113166,
+      "sha256": "9fe26c5681598154950532f54a19bc2e3225123cf04d005a24d471780aab5e8a",
+      "queuedMs": 893065,
+      "durationMs": 965508,
+      "ledger_seq": 41539,
+      "capture_matches": true,
+      "ledger_match": true
+    },
+    {
+      "label": "browser",
+      "runId": "5360af3c-6ba4-44f7-aff5-894ddd732212",
+      "exit": 0,
+      "ok": true,
+      "sha": "faa69d69264a293296fffa7d773b083b2fa17135",
+      "bytes": 15041,
+      "sha256": "68249f8d58e42e451cd65ca30be3623d742de0318f279037d11050684e0d0bd8",
+      "queuedMs": 72960,
+      "durationMs": 347369,
+      "ledger_seq": 41402,
+      "capture_matches": true,
+      "ledger_match": true
+    }
+  ]
 }
