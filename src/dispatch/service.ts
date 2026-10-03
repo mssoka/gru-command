@@ -10,7 +10,7 @@ import type { LessonPointer, LessonsReferencePort } from '../lessons/types.js';
 import type { LessonCapturePort } from '../lessons/capture.js';
 import type { WorktreeLane, WorktreePort, WorktreeSweepResult } from './worktree-port.js';
 import { recordFollowUpDelivery } from './fix-directive.js';
-import { promptVerdictFromHealth, promptWithTerminalVerdict } from '../runtime/prompt-verdict.js';
+import { isPromptTurnVerdict, promptVerdictFromHealth } from '../runtime/prompt-verdict.js';
 import type { PromptTurnVerdict } from '../runtime/types.js';
 import { settleRetries, RetrySettlementUnavailableError, type PacingGate, type PacingLease, type RetrySettlement } from '../runtime/pacing.js';
 import { PR_CREATION_RULE } from './pr-creation.js';
@@ -374,21 +374,31 @@ export class DispatchService {
         this.log('info', 'minion briefing turn completed', { job: job.id, agent: handle.id, disposition });
         return { ok: true as const };
       };
-      const settled = promptWithTerminalVerdict(
-        handle,
-        renderMinionBriefing({
-          jobId: job.id,
-          repoName,
-          branch: worktree.branch ?? `gru/${job.id}`,
-          worktreePath: worktree.path,
-          sha: worktree.sha,
-          briefing: input.briefing,
-          ...(lessons.length > 0 ? { lessons } : {}),
-        }),
-        { owner: `dispatch:${job.id}` },
-      )
+      // The prompt promise resolves with captured per-turn evidence when
+      // the handle attests (`promptWithVerdict`); the fallback handle keeps
+      // the legacy void. The verdict is derived INSIDE this first `.then`
+      // (never an extra helper hop): the worker-admission release below is
+      // settle-leaf ordered and must not gain a microtask.
+      const briefing = renderMinionBriefing({
+        jobId: job.id,
+        repoName,
+        branch: worktree.branch ?? `gru/${job.id}`,
+        worktreePath: worktree.path,
+        sha: worktree.sha,
+        briefing: input.briefing,
+        ...(lessons.length > 0 ? { lessons } : {}),
+      });
+      const promptRun: Promise<unknown> =
+        handle.promptWithVerdict !== undefined
+          ? handle.promptWithVerdict(briefing, { owner: `dispatch:${job.id}` })
+          : handle.prompt(briefing, { owner: `dispatch:${job.id}` });
+      const settled = promptRun
         .then(
-          (verdict) => settleTurn(null, verdict),
+          (value) =>
+            settleTurn(
+              null,
+              isPromptTurnVerdict(value) ? value : promptVerdictFromHealth(handle),
+            ),
           (error: unknown) => settleTurn(error, null),
         )
         .finally(() => {

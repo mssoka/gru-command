@@ -29,10 +29,23 @@ export function promptVerdictFromHealth(handle: Pick<AgentHandle, 'health'>): Pr
   }
 }
 
+/** Structural guard: did this prompt call resolve with captured per-turn
+ * evidence (attesting handle) or with the legacy void (fallback handle)? */
+export function isPromptTurnVerdict(value: unknown): value is PromptTurnVerdict {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    typeof (value as { ok?: unknown }).ok === 'boolean'
+  );
+}
+
 /** Prompt through the best available terminal evidence: the handle's
  * captured per-turn verdict when it attests, otherwise the legacy
- * prompt + settle-time health fallback. Rejections propagate unchanged. */
-export async function promptWithTerminalVerdict(
+ * prompt + settle-time health fallback. Rejections propagate unchanged.
+ * Deliberately NOT an async function: call sites that are sensitive to
+ * settle-path leaf ordering (the worker-admission release) must not pay
+ * an extra promise hop for the fallback path. */
+export function promptWithTerminalVerdict(
   handle: Pick<AgentHandle, 'prompt' | 'health'> & Partial<Pick<AgentHandle, 'promptWithVerdict'>>,
   text: string,
   options?: PromptOptions,
@@ -40,6 +53,5 @@ export async function promptWithTerminalVerdict(
   if (handle.promptWithVerdict !== undefined) {
     return handle.promptWithVerdict(text, options);
   }
-  await handle.prompt(text, options);
-  return promptVerdictFromHealth(handle);
+  return handle.prompt(text, options).then(() => promptVerdictFromHealth(handle));
 }
