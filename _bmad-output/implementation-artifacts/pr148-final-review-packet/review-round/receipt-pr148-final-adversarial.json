@@ -1,0 +1,113 @@
+{
+  "review_id": "pr148-final-adversarial",
+  "phase": "final",
+  "created_utc": "2026-10-03T06:59:01Z",
+  "finalized_utc": "2026-10-03T07:59:00Z",
+  "lens": "lens-adversarial",
+  "contract": {
+    "job": "pr148-final-adversarial",
+    "worktree": "<REVIEWER_WORKTREE_ADVERSARIAL>",
+    "branch": "gru/pr148-final-adversarial",
+    "base_head_at_dispatch": "5d56194a905262231bb0d183292b6d08cbd70810",
+    "artifact_only": true,
+    "product_undertaking": "none",
+    "pr_native_gate_merge": "none",
+    "own_head_is_review_target": false,
+    "no_inherited_implementation_or_sibling_findings": true,
+    "initial_receipt_created_before_substantive_analysis": true
+  },
+  "bindings": {
+    "product_head": "5c0d1d343639c4c96c0e387030f8c3ef6fddd445",
+    "packet_commit": "821ead3f8fd5989e3e05bf80568888d32c40ea44",
+    "base": "5d56194a905262231bb0d183292b6d08cbd70810",
+    "diff_base": "5d56194a905262231bb0d183292b6d08cbd70810",
+    "review_target": "final.patch = git diff base..product_head with packet directory excluded",
+    "product_diff": {
+      "path": "pr148-final-review-packet/final.patch",
+      "bytes": 122261,
+      "sha256_expected": "97f0c0d890b90da7d9b727f3f8e1f5382c6e2ed64f82a4f5579a5c2c4cd3aeb7",
+      "sha256_observed": "97f0c0d890b90da7d9b727f3f8e1f5382c6e2ed64f82a4f5579a5c2c4cd3aeb7",
+      "match": true,
+      "lines": 2017,
+      "files_touched": 20
+    },
+    "packet_dir": "<LANE_WORKTREE>/_bmad-output/implementation-artifacts/pr148-final-review-packet",
+    "manifest_sha256_expected": "76c2eb8001487ea6ab539920c45724e4255901e8ec81caebd6e94bd16275340a",
+    "manifest_sha256_observed": "76c2eb8001487ea6ab539920c45724e4255901e8ec81caebd6e94bd16275340a",
+    "lens": {
+      "path": "<LANE_WORKTREE>/.agents/skills/bmad-review/references/lens-adversarial.md",
+      "sha256_expected": "7c5ce97ab2f3ecb96ceb6aa76417f68c1b7df535edd3cc51666d8e1216e6e557",
+      "sha256_observed": "7c5ce97ab2f3ecb96ceb6aa76417f68c1b7df535edd3cc51666d8e1216e6e557",
+      "bytes_expected": 779
+    },
+    "frozen_source_worktree": "<LANE_WORKTREE>/ (read-only; tracked content used for context and symbol/test search)"
+  },
+  "hash_verification": {
+    "method": "static in-memory shasum -a 256; manifest.packet_files checksums extracted with jq and verified via 'shasum -a 256 -c -' over a pipe (stdout only; no files written); run twice (before and after the read pass), plus manifest self-hash and the named lens file.",
+    "before_sweep": {
+      "at": "2026-10-03T06:59:01Z",
+      "checked": 58,
+      "ok": 58,
+      "mismatched": 0
+    },
+    "after_sweep": {
+      "at": "2026-10-03T07:59:00Z",
+      "checked": 58,
+      "ok": 58,
+      "mismatched": 0
+    },
+    "manifest_match": true,
+    "lens_match": true,
+    "png_header_checks": "all eight PNGs: signature OK (89504e470d0a1a0a) and IHDR 1280x720, before and after",
+    "result": "no packet file changed between the before and after sweeps; no hash mismatch encountered anywhere"
+  },
+  "inputs_read": [
+    "dispatch briefing",
+    "packet README.md and manifest.json (first)",
+    "packet claims/: issue-32.json, spec.md, native-r1-review.md, native-r1-dispositions.md",
+    "packet verification/: current-evidence.md, ci.json, complete outputs and receipts (pre-merge and post-merge), including full receipt JSON bodies for focused/full",
+    "packet repair-lineage/: lineage.md and intermediate RED outputs (skimmed for claims cross-check)",
+    "packet png/: PROVENANCE.md and byte-level header checks of all eight before/after PNGs",
+    "packet source/changed/: bmad-onboarding.ts, main.ts, all test files, web e2e specs, web/mock/server.ts, components.css, chat-working-flavor.test.ts, spec mirror, worktree.toml, README.md",
+    "packet source/context/: package.json, web/package.json, vitest/playwright configs, working-flavor.ts, chat.ts, test helpers",
+    "exactly one lens instruction: .agents/skills/bmad-review/references/lens-adversarial.md",
+    "frozen source worktree (read-only): product sources, tests, .github/workflows/ci.yml, package.json/package-lock for symbol and environment checks",
+    "bible lesson sections: verification-boundaries.md, completion-contract.md, interface-contracts.md (relevant lessons named in the briefing)"
+  ],
+  "method": "Fresh independent static review of the whole product diff (final.patch) plus the full bounded packet and the frozen worktree at head; adversarial lens applied as instructed (missing evidence and gaps, not only errors; findings in the canonical four-field shape; no severity/ranking). Cross-checks: manifest hash verification for every packet file read before and after; static re-derivation of suite-shape pins (bmad-onboarding 19, wizard-interactive 11, wizard 26 vs PINS); static reading of targeted source, tests, e2e specs, CSS cascade, mock timing, and CI/receipt bindings; PNG signature/IHDR checks; residual personal-path scan of packet text files (clean). No execution of tests, builds, scripts, or candidate code.",
+  "limits": [
+    "Static reads only: no test/build/lint/typecheck/script execution; execution evidence was taken from the packet's complete outputs and receipts, not reproduced.",
+    "No git/ref/commit-graph inspection (.git internals out of bounds per briefing), so the run-head to frozen-head tree relationship (faq: faa69d69 vs 5c0d1d3) could not be independently established; this appears as a finding, not as a completed verification.",
+    "PNG baselines assessed via hashes, IHDR dimensions, and the packet provenance only; no visual/pixel inspection was performed.",
+    "Browser e2e behavior was assessed by reading the specs and outputs; the screenshots were not re-examined visually.",
+    "Frozen worktree product files were read as context for symbol/test search and to trace control flow; the review target remains final.patch as frozen."
+  ],
+  "variances": [
+    "None in inputs or hashes: all 58 packet files matched the manifest before and after; manifest and lens hashes matched the dispatch values.",
+    "The briefing permits reading png/before+after; only static header/hash checks were used (conservative reading of the no-media discipline).",
+    "No /tmp or external scratch files were created; all hashing and counting was in-memory/stdout only; no output redirected or teed."
+  ],
+  "findings": {
+    "count": 13,
+    "path": "_bmad-output/implementation-artifacts/ops-review/pr148-final-adversarial/findings.json",
+    "shape": "location / trigger_condition / guard_snippet / potential_consequence",
+    "severity_ranking": "none (per lens and briefing)"
+  },
+  "session": null,
+  "model": null,
+  "session_model_note": "not observable without session/env/config probes, which the briefing forbids; recorded as null",
+  "discipline_observed": {
+    "writes_only_declared_outputs": true,
+    "outputs_ignored": true,
+    "no_git_add_commit_push": true,
+    "no_product_or_input_edits": true,
+    "no_further_agents_or_native_arms": true,
+    "no_network_or_provider_calls": true,
+    "no_test_build_execution": true
+  },
+  "outputs": {
+    "receipt": "_bmad-output/implementation-artifacts/ops-review/pr148-final-adversarial/receipt.json",
+    "findings": "_bmad-output/implementation-artifacts/ops-review/pr148-final-adversarial/findings.json"
+  },
+  "note": "The findings are the review; this receipt is provenance metadata only."
+}

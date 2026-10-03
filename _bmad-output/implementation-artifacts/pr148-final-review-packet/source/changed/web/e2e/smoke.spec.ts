@@ -919,7 +919,12 @@ test.describe('chat pane reflow (owner heist)', () => {
       has: page.locator('.tool-line', { hasText: 'mcp__' }),
     });
     await expect(toolBand).toHaveCount(1);
-    await toolBand.locator('.service-band__head').click();
+    const bandHead = toolBand.locator('.service-band__head');
+    // Guard the toggle state so a future already-expanded default cannot
+    // silently collapse the band (and measure the wrong layout).
+    await expect(bandHead).toHaveAttribute('aria-expanded', 'false');
+    await bandHead.click();
+    await expect(bandHead).toHaveAttribute('aria-expanded', 'true');
     await expect(page.locator('.tool-line', { hasText: 'mcp__' })).toBeVisible();
     await expect(page.locator('.tool-line', { hasText: 'failed:' })).toBeVisible();
   }
@@ -996,10 +1001,25 @@ test.describe('themes', () => {
     await pair(page);
     await sendAndWaitReply(page, 'theme check');
 
+    // The whole-page capture must not race the board's owner band: the
+    // reply wait above covers the chat only (observed RED under load: the
+    // capture missed the band while the DOM already had it). Synchronize
+    // on the band's authoritative rows before the screenshot.
+    await expect(page.locator('#board-owner .board-owner__row')).toHaveCount(2);
+    await expect(
+      page.locator('#board-owner .board-owner__row', { hasText: 'Fix the payment retry loop' }),
+    ).toBeVisible();
+
+    // Whole-page captures must be scroll-invariant: interacting with the
+    // composer can scroll the scrollable shell, and a non-zero page scroll
+    // moves the content (and the sticky band head) under the capture —
+    // observed as RED with the owner band scrolled away. Pin the origin.
+    await page.evaluate(() => window.scrollTo(0, 0));
     await expect(page.locator('html')).not.toHaveClass(/dark/);
     await expect(page).toHaveScreenshot('chat-light.png', { maxDiffPixelRatio: 0.02 });
 
     await page.locator('#theme-toggle').click();
+    await page.evaluate(() => window.scrollTo(0, 0));
     await expect(page.locator('html')).toHaveClass(/dark/);
     await expect(page).toHaveScreenshot('chat-dark.png', { maxDiffPixelRatio: 0.02 });
 

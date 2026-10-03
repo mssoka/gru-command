@@ -9,6 +9,7 @@ import {
   readFileSync,
   readlinkSync,
   readdirSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -1130,6 +1131,10 @@ describe('per-selected-repo BMAD onboarding', () => {
     expect(refused.ready).toBe(false);
     expect(refused.deterministic).toBeUndefined();
     expect(refused.message).toContain('skill binding is a symlink');
+    // The disposable staging path is deleted in finally and must not leak
+    // into user-facing text (final-review finding): the message names the
+    // class, not the vanished temp directory.
+    expect(refused.message).not.toContain('gru-command-bmad-preflight-');
     expect(existsSync(join(preflight.repo, '_bmad'))).toBe(false);
     const retried = onboardBmadRepo(preflight.name, 'install', {
       workspaceRoot: preflight.workspace,
@@ -1311,4 +1316,336 @@ describe('per-selected-repo BMAD onboarding', () => {
     })).rejects.toThrow(/source payload changed|missing required module bmm/);
     git(fixture.repo, ['worktree', 'remove', '--force', brokenWorktree]);
   }, 120_000);
+
+  describe('gh-32 final-review repairs (independent tracked review)', () => {
+    it('unpaired managed-block markers in worktree.toml are deterministic skip-only, never a futile retry', () => {
+      const fixture = fixtureRepo('malformed-managed-block');
+      const installed = onboardBmadRepo(fixture.name, 'install', {
+        workspaceRoot: fixture.workspace,
+        answers: answers(fixture.workspace, fixture.name, 'install'),
+        run: successfulInstaller(fixture.repo, []),
+      });
+      expect(installed.ready, installed.message).toBe(true);
+      const manifestPath = join(fixture.repo, '.gru-command', 'worktree.toml');
+      const broken = readFileSync(manifestPath, 'utf-8').replace('# END GRU COMMAND BMAD BOOTSTRAP', '');
+      expect(broken).not.toContain('# END GRU COMMAND BMAD BOOTSTRAP');
+      writeFileSync(manifestPath, broken);
+      const before = bmadSnapshot(fixture.repo);
+      const result = onboardBmadRepo(fixture.name, 'reuse', {
+        workspaceRoot: fixture.workspace,
+        answers: answers(fixture.workspace, fixture.name, 'reuse'),
+      });
+      expect(result.ready).toBe(false);
+      expect(result.deterministic).toBe(true);
+      expect(result.message).toContain('malformed managed block: expected paired');
+      expect(readFileSync(manifestPath, 'utf-8')).toBe(broken);
+      expect(bmadSnapshot(fixture.repo)).toBe(before);
+    });
+
+    it('fresh-installer output failing post-install validation stays transient (never skip-only)', () => {
+      const fixture = fixtureRepo('fresh-output-flake');
+      let calls = 0;
+      const flaky = ((_command: string, args: string[]) => {
+        calls += 1;
+        const directoryAt = args.indexOf('--directory');
+        const directory = args[directoryAt + 1] ?? fixture.repo;
+        materializeOfficialInstall(directory, '', ['pi']);
+        // The REPO install (second call of the first attempt) omits a
+        // declared module: the installer produced invalid output.
+        if (calls === 2) rmSync(join(directory, '_bmad', 'tea'), { recursive: true, force: true });
+        return { status: 0, signal: null, stdout: '', stderr: '', pid: 1, output: [] };
+      }) as unknown as typeof spawnSync;
+      const first = onboardBmadRepo(fixture.name, 'install', {
+        workspaceRoot: fixture.workspace,
+        answers: answers(fixture.workspace, fixture.name, 'install'),
+        run: flaky,
+      });
+      expect(first.ready).toBe(false);
+      expect(first.deterministic).toBeUndefined();
+      expect(first.message).toContain('official BMAD installer output failed validation');
+      expect(first.message).toContain('missing or unsafe module directory');
+      expect(first.message).toContain('retry this repo or skip');
+      // The failed attempt left a partial install; the operator clears the
+      // wizard's own failed output, then the next attempt can complete.
+      rmSync(join(fixture.repo, '_bmad'), { recursive: true, force: true });
+      rmSync(join(fixture.repo, '.agents'), { recursive: true, force: true });
+      const second = onboardBmadRepo(fixture.name, 'install', {
+        workspaceRoot: fixture.workspace,
+        answers: answers(fixture.workspace, fixture.name, 'install'),
+        run: flaky,
+      });
+      expect(second.ready, second.message).toBe(true);
+    });
+
+    it('missing skills root and ENOTDIR root report the root; EACCES stays transient', () => {
+      const missingRoot = fixtureRepo('missing-skills-root');
+      expect(
+        onboardBmadRepo(missingRoot.name, 'install', {
+          workspaceRoot: missingRoot.workspace,
+          answers: answers(missingRoot.workspace, missingRoot.name, 'install'),
+          run: successfulInstaller(missingRoot.repo, []),
+        }).ready,
+      ).toBe(true);
+      rmSync(join(missingRoot.repo, '.agents', 'skills'), { recursive: true, force: true });
+      const rootGone = onboardBmadRepo(missingRoot.name, 'reuse', {
+        workspaceRoot: missingRoot.workspace,
+        answers: answers(missingRoot.workspace, missingRoot.name, 'reuse'),
+      });
+      expect(rootGone.ready).toBe(false);
+      expect(rootGone.deterministic).toBe(true);
+      expect(rootGone.message).toContain('BMAD pi skills root is missing');
+      expect(rootGone.message).not.toContain('recorded skill binding is missing');
+
+      const notDir = fixtureRepo('enotdir-skills-root');
+      expect(
+        onboardBmadRepo(notDir.name, 'install', {
+          workspaceRoot: notDir.workspace,
+          answers: answers(notDir.workspace, notDir.name, 'install'),
+          run: successfulInstaller(notDir.repo, []),
+        }).ready,
+      ).toBe(true);
+      const agentsDir = join(notDir.repo, '.agents');
+      rmSync(agentsDir, { recursive: true, force: true });
+      writeFileSync(agentsDir, 'not a directory\n');
+      const enotdir = onboardBmadRepo(notDir.name, 'reuse', {
+        workspaceRoot: notDir.workspace,
+        answers: answers(notDir.workspace, notDir.name, 'reuse'),
+      });
+      expect(enotdir.ready).toBe(false);
+      expect(enotdir.deterministic).toBe(true);
+      expect(enotdir.message).toContain('BMAD pi skills root is missing');
+
+      const denied = fixtureRepo('denied-skills-root');
+      expect(
+        onboardBmadRepo(denied.name, 'install', {
+          workspaceRoot: denied.workspace,
+          answers: answers(denied.workspace, denied.name, 'install'),
+          run: successfulInstaller(denied.repo, []),
+        }).ready,
+      ).toBe(true);
+      chmodSync(join(denied.repo, '.agents'), 0o000);
+      try {
+        const deniedResult = onboardBmadRepo(denied.name, 'reuse', {
+          workspaceRoot: denied.workspace,
+          answers: answers(denied.workspace, denied.name, 'reuse'),
+        });
+        expect(deniedResult.ready).toBe(false);
+        expect(deniedResult.deterministic).toBeUndefined();
+      } finally {
+        chmodSync(join(denied.repo, '.agents'), 0o755);
+      }
+      const recovered = onboardBmadRepo(denied.name, 'reuse', {
+        workspaceRoot: denied.workspace,
+        answers: answers(denied.workspace, denied.name, 'reuse'),
+      });
+      expect(recovered.ready, recovered.message).toBe(true);
+    });
+
+    it('control-file refusals are deterministic skip-only without mutation', () => {
+      const fixture = fixtureRepo('control-refusals');
+      const installed = onboardBmadRepo(fixture.name, 'install', {
+        workspaceRoot: fixture.workspace,
+        answers: answers(fixture.workspace, fixture.name, 'install'),
+        run: successfulInstaller(fixture.repo, []),
+      });
+      expect(installed.ready, installed.message).toBe(true);
+      const recordPath = join(fixture.repo, '.gru-command', 'bmad-install.json');
+      const originalRecord = readFileSync(recordPath, 'utf-8');
+      const manifestPath = join(fixture.repo, '.gru-command', 'worktree.toml');
+      const originalManifest = readFileSync(manifestPath, 'utf-8');
+      const reuse = () => onboardBmadRepo(fixture.name, 'reuse', {
+        workspaceRoot: fixture.workspace,
+        answers: answers(fixture.workspace, fixture.name, 'reuse'),
+      });
+
+      rmSync(recordPath);
+      writeFileSync(join(fixture.workspace, 'outside-record.json'), '{"managed_by":"outside"}\n');
+      symlinkSync(join(fixture.workspace, 'outside-record.json'), recordPath);
+      const linked = reuse();
+      expect(linked.deterministic).toBe(true);
+      expect(linked.message).toContain('refusing BMAD control write through unsafe path');
+      rmSync(recordPath);
+
+      writeFileSync(recordPath, 'not json at all\n');
+      const malformed = reuse();
+      expect(malformed.deterministic).toBe(true);
+      expect(malformed.message).toContain('existing BMAD record is malformed');
+
+      writeFileSync(recordPath, '{"managed_by":"someone-else"}\n');
+      const foreign = reuse();
+      expect(foreign.deterministic).toBe(true);
+      expect(foreign.message).toContain('refusing to overwrite non-Gru BMAD record');
+      writeFileSync(recordPath, originalRecord);
+
+      writeFileSync(manifestPath, 'not = = toml\n');
+      const malformedManifest = reuse();
+      expect(malformedManifest.deterministic).toBe(true);
+      expect(malformedManifest.message).toContain('existing worktree manifest is malformed');
+      writeFileSync(manifestPath, originalManifest);
+      expect(reuse().ready).toBe(true);
+    });
+
+    it('validateRepo refusals outside the covered pair are deterministic, and EACCES stays transient', () => {
+      const raced = fixtureRepo('deleted-repo-race');
+      const parsed = answers(raced.workspace, raced.name, 'reuse');
+      rmSync(raced.repo, { recursive: true, force: true });
+      const deleted = onboardBmadRepo(raced.name, 'reuse', {
+        workspaceRoot: raced.workspace,
+        answers: parsed,
+      });
+      expect(deleted.ready).toBe(false);
+      expect(deleted.deterministic).toBe(true);
+      expect(deleted.message).toContain('selected repo no longer exists');
+
+      const fakeBin = tempDir('gru-command-fake-git-');
+      writeFileSync(
+        join(fakeBin, 'git'),
+        '#!/usr/bin/env bash\nif [[ "$*" == *"--show-toplevel"* ]]; then echo "$FAKE_GIT_TOPLEVEL"; exit 0; fi\nexit 1\n',
+        { mode: 0o755 },
+      );
+      const ghost = fixtureRepo('ghost-toplevel');
+      const ghostProbe = onboardBmadRepo(ghost.name, 'reuse', {
+        workspaceRoot: ghost.workspace,
+        answers: answers(ghost.workspace, ghost.name, 'reuse'),
+        env: { PATH: `${fakeBin}:${process.env.PATH ?? ''}`, FAKE_GIT_TOPLEVEL: join(ghost.workspace, 'no-such-toplevel') },
+      });
+      expect(ghostProbe.ready).toBe(false);
+      expect(ghostProbe.deterministic).toBe(true);
+      expect(ghostProbe.message).toContain('invalid top-level path');
+
+      const blockedParent = join(ghost.workspace, 'blocked-parent');
+      mkdirSync(blockedParent);
+      chmodSync(blockedParent, 0o000);
+      try {
+        const deniedProbe = onboardBmadRepo(ghost.name, 'reuse', {
+          workspaceRoot: ghost.workspace,
+          answers: answers(ghost.workspace, ghost.name, 'reuse'),
+          env: { PATH: `${fakeBin}:${process.env.PATH ?? ''}`, FAKE_GIT_TOPLEVEL: join(blockedParent, 'toplevel') },
+        });
+        expect(deniedProbe.ready).toBe(false);
+        expect(deniedProbe.deterministic).toBeUndefined();
+      } finally {
+        chmodSync(blockedParent, 0o755);
+      }
+    });
+
+    it('reuse-path content validator classifications are pinned (final review)', () => {
+      const ambiguous = fixtureRepo('raw-config-tokens');
+      materializeOfficialInstall(ambiguous.repo, '', ['pi']);
+      const ambiguousResult = onboardBmadRepo(ambiguous.name, 'reuse', {
+        workspaceRoot: ambiguous.workspace,
+        answers: answers(ambiguous.workspace, ambiguous.name, 'reuse'),
+      });
+      expect(ambiguousResult.deterministic).toBe(true);
+      expect(ambiguousResult.message).toContain('ambiguous BMM/GDS config token');
+      expect(ambiguousResult.repairHint).toContain('npx bmad-method install');
+
+      const missingSkill = fixtureRepo('missing-build-skill');
+      materializeOfficialInstall(missingSkill.repo, '', ['pi']);
+      rmSync(join(missingSkill.repo, '.agents', 'skills', 'bmad-build', 'SKILL.md'));
+      const missingResult = onboardBmadRepo(missingSkill.name, 'reuse', {
+        workspaceRoot: missingSkill.workspace,
+        answers: answers(missingSkill.workspace, missingSkill.name, 'reuse'),
+      });
+      expect(missingResult.deterministic).toBe(true);
+      expect(missingResult.message).toContain('binding is missing required bmad-build skill');
+      expect(missingResult.repairHint).toContain('npx bmad-method install');
+
+      const symlinkedEntry = fixtureRepo('symlinked-skill-entry');
+      materializeOfficialInstall(symlinkedEntry.repo, '', ['pi']);
+      symlinkSync(tempDir('gru-command-bmad-se-outside-'), join(symlinkedEntry.repo, '.agents', 'skills', 'evil'));
+      const symlinkedResult = onboardBmadRepo(symlinkedEntry.name, 'reuse', {
+        workspaceRoot: symlinkedEntry.workspace,
+        answers: answers(symlinkedEntry.workspace, symlinkedEntry.name, 'reuse'),
+      });
+      expect(symlinkedResult.deterministic).toBe(true);
+      expect(symlinkedResult.message).toContain('BMAD skill binding is a symlink');
+
+      const payloadLink = fixtureRepo('owned-payload-symlink');
+      const payloadInstalled = onboardBmadRepo(payloadLink.name, 'install', {
+        workspaceRoot: payloadLink.workspace,
+        answers: answers(payloadLink.workspace, payloadLink.name, 'install'),
+        run: successfulInstaller(payloadLink.repo, []),
+      });
+      expect(payloadInstalled.ready, payloadInstalled.message).toBe(true);
+      symlinkSync(tempDir('gru-command-bmad-payload-outside-'), join(payloadLink.repo, '_bmad', 'evil-link'));
+      const payloadResult = onboardBmadRepo(payloadLink.name, 'reuse', {
+        workspaceRoot: payloadLink.workspace,
+        answers: answers(payloadLink.workspace, payloadLink.name, 'reuse'),
+      });
+      expect(payloadResult.deterministic).toBe(true);
+      expect(payloadResult.message).toContain('owned payload contains symlink');
+
+      const fileBinding = fixtureRepo('recorded-skill-file');
+      const fileInstalled = onboardBmadRepo(fileBinding.name, 'install', {
+        workspaceRoot: fileBinding.workspace,
+        answers: answers(fileBinding.workspace, fileBinding.name, 'install'),
+        run: successfulInstaller(fileBinding.repo, []),
+      });
+      expect(fileInstalled.ready, fileInstalled.message).toBe(true);
+      const buildSkill = join(fileBinding.repo, '.agents', 'skills', 'bmad-build');
+      rmSync(buildSkill, { recursive: true, force: true });
+      writeFileSync(buildSkill, 'not a directory\n');
+      const fileResult = onboardBmadRepo(fileBinding.name, 'reuse', {
+        workspaceRoot: fileBinding.workspace,
+        answers: answers(fileBinding.workspace, fileBinding.name, 'reuse'),
+      });
+      expect(fileResult.deterministic).toBe(true);
+      expect(fileResult.message).toContain('unsafe BMAD recorded skill path');
+    });
+
+    it('a denied manifest read stays transient and recovers on the SAME collected answers', () => {
+      const fixture = fixtureRepo('denied-manifest-read');
+      const installed = onboardBmadRepo(fixture.name, 'install', {
+        workspaceRoot: fixture.workspace,
+        answers: answers(fixture.workspace, fixture.name, 'install'),
+        run: successfulInstaller(fixture.repo, []),
+      });
+      expect(installed.ready, installed.message).toBe(true);
+      const answersObject = answers(fixture.workspace, fixture.name, 'reuse');
+      const manifestPath = join(fixture.repo, '_bmad', '_config', 'manifest.yaml');
+      chmodSync(manifestPath, 0o000);
+      try {
+        const denied = onboardBmadRepo(fixture.name, 'reuse', {
+          workspaceRoot: fixture.workspace,
+          answers: answersObject,
+        });
+        expect(denied.ready).toBe(false);
+        expect(denied.deterministic).toBeUndefined();
+        expect(denied.message).not.toContain('malformed');
+      } finally {
+        chmodSync(manifestPath, 0o644);
+      }
+      const recovered = onboardBmadRepo(fixture.name, 'reuse', {
+        workspaceRoot: fixture.workspace,
+        answers: answersObject,
+      });
+      expect(recovered.ready, recovered.message).toBe(true);
+    });
+
+    it('ancestor symlink refusals carry the official-installer repair hint for existing installs', () => {
+      const fixture = fixtureRepo('ancestor-symlink-hint');
+      const installed = onboardBmadRepo(fixture.name, 'install', {
+        workspaceRoot: fixture.workspace,
+        answers: answers(fixture.workspace, fixture.name, 'install'),
+        run: successfulInstaller(fixture.repo, []),
+      });
+      expect(installed.ready, installed.message).toBe(true);
+      const bmadDir = join(fixture.repo, '_bmad');
+      const bmadReal = join(fixture.repo, '_bmad-real');
+      renameSync(bmadDir, bmadReal);
+      // Symlink to the REAL content so the manifest still reads; the
+      // ancestor-refusal classification (with the installer hint) is what
+      // this case pins.
+      symlinkSync(bmadReal, bmadDir);
+      const result = onboardBmadRepo(fixture.name, 'reuse', {
+        workspaceRoot: fixture.workspace,
+        answers: answers(fixture.workspace, fixture.name, 'reuse'),
+      });
+      expect(result.ready).toBe(false);
+      expect(result.deterministic).toBe(true);
+      expect(result.message).toContain('refusing BMAD path through symlink');
+      expect(result.repairHint).toContain('npx bmad-method install');
+    });
+  });
 });

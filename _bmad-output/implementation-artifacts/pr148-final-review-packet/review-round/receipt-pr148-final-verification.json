@@ -1,0 +1,135 @@
+{
+  "schema": "ops-review-receipt/1",
+  "job": "pr148-final-verification",
+  "review_id": "pr148-final-verification",
+  "lens": "lens-verification-gap",
+  "lens_title": "Fresh independent exact-head PR148 whole-change review",
+  "phase": "final",
+  "created_at": "2026-10-03T07:01:07Z",
+  "completed_at": "2026-10-03T07:10:16Z",
+  "bindings": {
+    "product_head": "5c0d1d343639c4c96c0e387030f8c3ef6fddd445",
+    "packet_commit": "821ead3f8fd5989e3e05bf80568888d32c40ea44",
+    "base": "5d56194a905262231bb0d183292b6d08cbd70810",
+    "diff_base": "5d56194a905262231bb0d183292b6d08cbd70810",
+    "product_diff": {
+      "path": "final.patch",
+      "bytes": 122261,
+      "sha256": "97f0c0d890b90da7d9b727f3f8e1f5382c6e2ed64f82a4f5579a5c2c4cd3aeb7"
+    },
+    "packet_dir": "<HOME>/.gru-command/worktrees/gru-command/job-wizard-bmad-deterministic-retry-32/_bmad-output/implementation-artifacts/pr148-final-review-packet/",
+    "frozen_source_worktree": "<HOME>/.gru-command/worktrees/gru-command/job-wizard-bmad-deterministic-retry-32/",
+    "own_worktree": "<HOME>/.gru-command/worktrees/gru-command/job-pr148-final-verification/",
+    "own_branch": "gru/pr148-final-verification",
+    "own_head_note": "own HEAD is not the review target",
+    "lens_path": "<HOME>/.gru-command/worktrees/gru-command/job-wizard-bmad-deterministic-retry-32/.agents/skills/bmad-review/references/lens-verification-gap.md",
+    "lens_sha256_expected": "e7123d81171eeeee1b3782d13d94c2988969fe357dd71949131a5eb97803e2c6",
+    "lens_sha256_observed": "e7123d81171eeeee1b3782d13d94c2988969fe357dd71949131a5eb97803e2c6",
+    "manifest_sha256_expected": "76c2eb8001487ea6ab539920c45724e4255901e8ec81caebd6e94bd16275340a",
+    "manifest_sha256_observed": "76c2eb8001487ea6ab539920c45724e4255901e8ec81caebd6e94bd16275340a"
+  },
+  "declared_inputs": {
+    "read_allowed": [
+      "this briefing (dispatch contract)",
+      "every file inside the frozen packet directory above (claims/, verification/, repair-lineage/, png/before, png/after, source/changed/, source/context/, README.md, manifest.json, final.patch)",
+      "the single named lens file",
+      "the frozen source worktree at the frozen tracked content, read-only, for context and symbol/test search"
+    ],
+    "read_forbidden": [
+      "node_modules/",
+      "dist/",
+      "web/dist/",
+      "web/test-results/",
+      ".git/ internals",
+      "_bmad-output/gate-prep/",
+      "other jobs' worktrees",
+      "sessions",
+      "ledgers",
+      "journals",
+      "owner/private/Gru/Silas material",
+      "native review material outside the packet",
+      "wrapper SKILL or skill-directory listings",
+      "alternate/worktree lens copies",
+      "ambient typedefs",
+      "nested skill/agents/reviewers/reporting tools"
+    ]
+  },
+  "write_discipline": {
+    "allowed_writes": [
+      "<OWN_WORKTREE>/_bmad-output/implementation-artifacts/ops-review/pr148-final-verification/receipt.json",
+      "<OWN_WORKTREE>/_bmad-output/implementation-artifacts/ops-review/pr148-final-verification/findings.json"
+    ],
+    "no_scratch_files": true,
+    "no_redirects_or_tee": true,
+    "no_git_add_commit_push": true,
+    "outputs_stay_ignored": true
+  },
+  "execution_discipline": {
+    "static_reads_and_in_memory_metadata_only": true,
+    "no_tests_builds_lint_typecheck": true,
+    "no_node_npm_npx_product_scripts": true,
+    "no_network_http_api_github": true,
+    "no_browser_media_listeners": true,
+    "no_further_agents": true,
+    "no_source_or_input_edits": true,
+    "no_native_arms": true,
+    "no_live_sql_notifications_ack": true,
+    "no_release_removal_merge_deploy_restart_chat": true,
+    "no_ref_movement": true
+  },
+  "method": {
+    "analysis": "Static reads and in-memory metadata only. Read the lens, then the whole packet (final.patch in full; claims, verification metadata, lineage, provenance, changed/context sources); traced every BmadDeterministicSetupError conversion and the wizard deterministic branch; checked each changed behavior against the tests that run it by reading the test files and searching the whole test tree for the exact error messages and symbols; checked that the three changed suite pins (19/11/26) equal static it() counts and the recorded run outputs (58 focused, 1794+409 full, 51/51 browser at the post-merge receipt sha); assessed the web corrections against their unit pin, e2e specs, snapshot comparisons, and provenance notes. No execution of any candidate script or test.",
+    "hash_verification": "shasum -a 256, stdout capture only, no files written. Root pins (manifest.json, lens file) checked against the briefing hashes. Full 59-file packet sweep hashed once before the reading phase and once after all reads; plus an immediate before/after bracket for README.md. Every packet file read lies between its before-hash and after-hash and was compared to manifest.json (packet-file SHA-256 entries).",
+    "coverage_searches": "grep over the frozen test/ tree and repo root for each converted-site message ('missing required bmad-build skill', 'binding escapes selected repo', 'ambiguous BMM/GDS config token', 'skill root is not a directory', 'skill binding is a symlink', 'owned payload contains symlink/unsupported entry', 'unsafe BMAD recorded skill path/tool', 'existing worktree manifest is malformed', 'refusing to overwrite non-Gru BMAD record', 'refusing BMAD control write through unsafe path', 'record is malformed', 'no longer exists', 'escapes the workspace root', 'invalid top-level path', 'not the Git repository root', 'Repair the reported condition deliberately'), plus import/call-site searches for onboardBmadRepo and BmadDeterministicSetupError."
+  },
+  "hash_verification": {
+    "packet_files_hashed_before_read": 59,
+    "packet_files_hashed_after_all_reads": 59,
+    "immediate_single_file_brackets": 2,
+    "root_pin_checks": 2,
+    "total_hash_observations": 122,
+    "packet_file_mismatches": 0,
+    "roots_checked": {
+      "manifest.json": "match (briefing pin)",
+      "lens-verification-gap.md": "match (briefing pin)"
+    },
+    "notes": "manifest.json is excluded from its own packet_files list; it was hashed in both sweeps and matched the briefing pin. All other packet files matched their manifest SHA-256 entries in both sweeps."
+  },
+  "inputs_used": [
+    "dispatch briefing",
+    "lens-verification-gap.md (sha256 verified)",
+    "packet README.md and manifest.json (sha256 verified)",
+    "packet final.patch (all 2017 lines, both passes)",
+    "packet claims/: spec.md, issue-32.json, native-r1-review.md, native-r1-dispositions.md",
+    "packet verification/: current-evidence.md, ci.json, post-merge/focused.receipt.json, post-merge outputs (grep), receipts/outputs across the directory (grep)",
+    "packet repair-lineage/lineage.md; png/PROVENANCE.md",
+    "packet source/changed/: web/e2e/working-flavor.spec.ts, web/mock/server.ts (regions), plus full diff coverage via final.patch",
+    "packet source/context/: package.json, web/package.json, web/playwright.config.ts, web/vitest.config.ts",
+    "frozen worktree (read-only): src/wizard/bmad-onboarding.ts (targeted regions and full throw-site enumeration), src/wizard/main.ts (loop region), test/bmad-onboarding.test.ts (full), test/suite-shape.test.ts (full), test/wizard-interactive.test.ts (head region), repo-root searches"
+  ],
+  "limits": [
+    "No test/build/lint/typecheck/execution of any kind: verification gaps were assessed statically from source, tests, and recorded run evidence; the regression demonstrations are reasoned from the source, not executed.",
+    "No git object access (no .git reads, no ref movement): the relationship between the post-merge run sha faa69d69... and the frozen product head 5c0d1d3... was not independently re-derivable; packet wording was relied upon.",
+    "The manifest carries no product-file blob hashes (product_files_at_head is empty), so frozen-worktree content could not be cross-checked against manifest bindings; only the packet's own files were hash-bound.",
+    "PNG baselines were hash-verified and assessed from png/PROVENANCE.md and the e2e comparisons they feed; no visual read of the images was performed.",
+    "Pre-fix RED runs for the split r1 cases (scheduler-only wizard-bmad-retry-baseline scope) do not appear in the packet and were not reproduced.",
+    "Session/model identifiers are not observable without env/process/session reads, which this job forbids; recorded null."
+  ],
+  "variances": [
+    "The post-merge green-set receipts bind sha faa69d69264a293296fffa7d773b083b2fa17135 (described in the packet as the post-merge 'packet commit head'); the frozen product head binding is 5c0d1d343639c4c96c0e387030f8c3ef6fddd445. The packet asserts the packet-only delta and treats the product tree as unchanged, but parentage was not re-derived (no git access).",
+    "verification/current-evidence.md labels faa69d69... 'Product head at capture' while the frozen binding names 5c0d1d3... - same observation as the first variance entry, restated where the packet makes it; no separate finding raised.",
+    "manifest.json product_files_at_head is an empty array although README.md states the manifest lists per-file blob hashes of diff-touched product files - recorded as the single 'other' finding."
+  ],
+  "findings_count": 6,
+  "findings_breakdown": {
+    "regression-gap": 5,
+    "missing-adoption-gap": 0,
+    "broken-verification-gap": 0,
+    "other": 1
+  },
+  "findings_path": "_bmad-output/implementation-artifacts/ops-review/pr148-final-verification/findings.json",
+  "session": null,
+  "model": null,
+  "session_model_note": "not observable under this job's read disciplines (no env/process/session reads)",
+  "status": "complete"
+}

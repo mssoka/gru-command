@@ -59,10 +59,10 @@ index a642647..e0e3069 100644
  lens-unused-neutral-baseline = 'set -e; base=6a00f4e50e7ae970915a9a534c142c1f8a45b57d; headrev=43e437a2e61b0c25351ed6147639aefbac4ccd77; root="$PWD"; prep=_bmad-output/ops-readiness-repair-20261002; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-lens-unused-neutral.XXXXXX"); git archive "$base" | tar -x -C "$d"; git show "$headrev":web/src/ui/board.test.ts > "$d/web/src/ui/board.test.ts"; git show "$headrev":web/src/lib/board-signals.test.ts > "$d/web/src/lib/board-signals.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; ln -s "$root/web/node_modules" "$d/web/node_modules"; printf "%s base=%s head=%s\n" "$d" "$base" "$headrev" > "$prep/lens-unused-neutral-baseline.last-snapshot.txt"; cd "$d" && node tools/patch-vitest-rpc-timeout.mjs && cd "$d/web" && node "$root/node_modules/vitest/vitest.mjs" run src/ui/board.test.ts src/lib/board-signals.test.ts'
  lens-unused-neutral-browser = "node tools/patch-vitest-rpc-timeout.mjs && cd web && node ../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json && node node_modules/vite/bin/vite.js build && node ../node_modules/@playwright/test/cli.js test --project=lens-pills"
 diff --git a/README.md b/README.md
-index 5f1b0ce..f956962 100644
+index 5f1b0ce..7bb402d 100644
 --- a/README.md
 +++ b/README.md
-@@ -173,8 +173,11 @@ for generated paths. It does not blanket-ignore `.agents/`, `.claude/`,
+@@ -173,8 +173,13 @@ for generated paths. It does not blanket-ignore `.agents/`, `.claude/`,
  or `_bmad-output/`, and never untracks files. Commit the three
  `.gru-command/` bootstrap files so newly-created worktrees can copy an
  isolated project-local BMAD install and discover `bmad-build`; generated
@@ -71,17 +71,19 @@ index 5f1b0ce..f956962 100644
 +skills/output remain local. Network and prerequisite failures name the
 +repo and keep retry or explicit skip; deterministic state failures—a
 +broken or partial install, a missing/unsafe module directory, a missing
-+runtime binding—offer skip-only with the deliberate repair path, never an
-+automatic overwrite. No false-ready state.
++runtime binding—offer skip-only with deliberate repair guidance
++(install-repair classes additionally name the official repair path
++`npx bmad-method install` in that repository), never an automatic
++overwrite. No false-ready state.
  
  You need the selected runtime CLI (`pi` or `claude`) for agents and `uv`
  for BMAD workflows. Missing prerequisites are reported before a repo is
 diff --git a/_bmad-output/implementation-artifacts/spec-gh-32-deterministic-bmad-failure-skip-only.md b/_bmad-output/implementation-artifacts/spec-gh-32-deterministic-bmad-failure-skip-only.md
 new file mode 100644
-index 0000000..4f4303a
+index 0000000..7e15e5a
 --- /dev/null
 +++ b/_bmad-output/implementation-artifacts/spec-gh-32-deterministic-bmad-failure-skip-only.md
-@@ -0,0 +1,193 @@
+@@ -0,0 +1,199 @@
 +---
 +title: 'GH-32: deterministic BMAD setup failures must not offer futile retry'
 +type: 'bugfix'
@@ -256,6 +258,12 @@ index 0000000..4f4303a
 +
 +- Browser correction, third iteration (same cycle): with the strip geometry and the attach hand-off fixed, the geometry sweep passed on the desktop console and the tablet drawer for the first time, then the phone step timed out tapping `#gru-fab` — the tablet drawer stays open across the width change and the open sheet covers the FAB. The phone step now taps the FAB only when the sheet is closed, then asserts open + flavor visible + sweep as before. No assertion, tolerance, timeout or approved UX changed.
 +
++- Browser correction, fourth iteration (same cycle): the fresh-main merged head's browser run (`d480d67e` at `7330e44`) came back RED with the two `themes` whole-page captures missing the owner band (mock: header only, rows absent; real: the band absent) while the failure-time accessibility snapshots show the band fully present, the web tree and snapshots are byte-identical to the green `1bac32d` run, and no web code changed between the two — the capture raced the band's first render/paint under host load, and the tests waited only for the chat reply, not the board. Both themes tests now synchronize on the band's authoritative content before the screenshot (mock: the two owner rows; real: the `nothing needs you` clear row). No oracle, tolerance, timeout, deadline or product behavior changed; the RED receipt and its captures are preserved.
++
++- Browser correction, fifth iteration (same cycle): the r5 synchronization waits held and the follow-up run's complete capture analysis located the actual mechanism. The shell is page-scrollable and composer interaction scrolls it, so the whole-page captures depend on the page scroll origin: at a ~20px scroll every content pane sits 20px higher with perfectly aligned content (measured per-region at dy=-20, residual 0.00), and at the first RED's larger scroll the band's sticky head stays pinned while its rows scroll away — which is exactly what both failing captures showed, while the DOM/accessibility snapshots always contained the band. Both themes tests now pin `window.scrollTo(0, 0)` before each capture; the r5 band waits are retained as correct presence checks. No oracle, tolerance, timeout, deadline or product behavior changed; all RED captures remain preserved.
++
++- Independent tracked whole-change review (2026-10-03, j-861 checkpoint): three fresh service-created review jobs ran the installed bmad-review lenses against the frozen packet (product head `5c0d1d3`, packet commit `821ead3f`): `pr148-final-adversarial` (13 findings), `pr148-final-edge` (lens-edge-case-hunter, 3 findings) and `pr148-final-verification` (lens-verification-gap, 6 findings); each declared its bounded inputs and hash-verified them against the packet manifest before and after analysis. Genuine defects repaired in the same continuation: (1) unpaired managed-block markers in `worktree.toml` were a plain-Error futile retry — now a deterministic skip-only refusal naming the paired markers; (2) fresh-installer OUTPUT validations (post-install module/skill/config checks and the fresh record hash) were classified deterministic although the frozen intent keeps installer-output failures transient — now transient with a named installer-output message (reuse-path validation of unchanged bytes keeps its deterministic classification); (3) `validatedSkillPath` no longer reports a vanished repository or skills root as a "recorded skill binding is missing" — each object gets its own message while keeping the ENOENT/ENOTDIR-vs-other-errno split; (4) the disposable-preflight message no longer leaks the deleted staging path; (5) ancestor symlink refusals on existing installs now carry the official-installer hint; (6) the git-toplevel realpath refusal keeps ENOENT/ENOTDIR deterministic and lets other errno stay transient. Regression coverage added for those classes plus the review-identified gaps (reuse content-validator classifications, control-file refusals, validateRepo terminal refusals, the hint-less neutral fallback, the denied manifest read, the ENOTDIR/rethrow arms, the e2e band-expansion toggle guard, and direct mock turn-hold/reset coverage). The README wording now matches the classes that carry the installer hint. No assertion, oracle, tolerance, timeout or deadline was weakened.
++
 +## Spec Change Log
 +
 +## Review Triage Log
@@ -276,7 +284,7 @@ index 0000000..4f4303a
 +  a real BMAD install, or the network installer.
 +
 diff --git a/src/wizard/bmad-onboarding.ts b/src/wizard/bmad-onboarding.ts
-index 0da9178..d4ae6ab 100644
+index 0da9178..92e7a3e 100644
 --- a/src/wizard/bmad-onboarding.ts
 +++ b/src/wizard/bmad-onboarding.ts
 @@ -62,6 +62,56 @@ export interface BmadRepoResult {
@@ -371,16 +379,29 @@ index 0da9178..d4ae6ab 100644
        'partial BMAD installation detected without a valid _bmad/_config/manifest.yaml; preserve it and repair or choose skip',
      );
    }
-@@ -223,7 +292,7 @@ function assertNoSymlinkComponents(base: string, relativePath: string): void {
+@@ -216,14 +285,14 @@ function expectedFreshModules(summary: BmadManifestSummary): void {
+   }
+ }
+ 
+-function assertNoSymlinkComponents(base: string, relativePath: string): void {
++function assertNoSymlinkComponents(base: string, relativePath: string, repairHint?: string): void {
+   let current = base;
+   for (const part of relativePath.split('/').filter(Boolean)) {
+     current = join(current, part);
      if (!existsSync(current)) return;
      const info = lstatSync(current);
      if (info.isSymbolicLink()) {
 -      throw new Error(`refusing BMAD path through symlink: ${current}`);
-+      throw new BmadDeterministicSetupError(`refusing BMAD path through symlink: ${current}`);
++      throw new BmadDeterministicSetupError(`refusing BMAD path through symlink: ${current}`, repairHint);
      }
    }
  }
-@@ -293,10 +362,16 @@ function verifyModuleDirectories(repoPath: string, summary: BmadManifestSummary)
+@@ -289,14 +358,20 @@ function qualifyFreshSkillConfig(
+ }
+ 
+ function verifyModuleDirectories(repoPath: string, summary: BmadManifestSummary): void {
+-  assertNoSymlinkComponents(repoPath, '_bmad');
++  assertNoSymlinkComponents(repoPath, '_bmad', INSTALLER_REPAIR_HINT);
    for (const module of summary.modules) {
      const path = join(repoPath, '_bmad', module.name);
      if (!existsSync(path) || lstatSync(path).isSymbolicLink() || !statSync(path).isDirectory()) {
@@ -399,8 +420,12 @@ index 0da9178..d4ae6ab 100644
      }
    }
  }
-@@ -307,10 +382,16 @@ function verifySkills(repoPath: string, tools: readonly string[]): void {
-     assertNoSymlinkComponents(repoPath, `${root}/skills/bmad-build`);
+@@ -304,13 +379,19 @@ function verifyModuleDirectories(repoPath: string, summary: BmadManifestSummary)
+ function verifySkills(repoPath: string, tools: readonly string[]): void {
+   for (const tool of tools) {
+     const root = tool === 'claude-code' ? '.claude' : '.agents';
+-    assertNoSymlinkComponents(repoPath, `${root}/skills/bmad-build`);
++    assertNoSymlinkComponents(repoPath, `${root}/skills/bmad-build`, INSTALLER_REPAIR_HINT);
      const skill = join(repoPath, root, 'skills', 'bmad-build', 'SKILL.md');
      if (!existsSync(skill) || lstatSync(skill).isSymbolicLink() || !statSync(skill).isFile()) {
 -      throw new Error(`BMAD ${tool} binding is missing required bmad-build skill: ${skill}`);
@@ -430,7 +455,7 @@ index 0da9178..d4ae6ab 100644
              );
            }
          }
-@@ -391,6 +473,24 @@ function runOfficialInstaller(
+@@ -391,6 +473,50 @@ function runOfficialInstaller(
    }
  }
  
@@ -441,12 +466,38 @@ index 0da9178..d4ae6ab 100644
 + * produce valid output — even though the safety refusal itself stands.
 + * Existing-repo validation keeps its deterministic classification.
 + */
++/**
++ * Fresh-installer OUTPUT that fails validation is not unchanged user
++ * state: the official installer can produce different bytes on a re-run,
++ * so these failures stay transient — retry re-runs the installer (the
++ * spec's fresh-install output contract). Validation of unchanged bytes on
++ * the reuse path keeps its deterministic classification.
++ */
++function asTransientInstallerOutput(error: unknown): never {
++  if (error instanceof BmadDeterministicSetupError) {
++    throw new Error(
++      `official BMAD installer output failed validation: ${(error as Error).message}; retry this repo or skip`,
++    );
++  }
++  throw error;
++}
++
 +function preflightSkillNames(stage: string, tool: string): string[] {
 +  try {
 +    return runtimeSkillNames(stage, tool);
 +  } catch (error) {
 +    if (error instanceof BmadDeterministicSetupError) {
-+      throw new Error(`official BMAD preflight produced an unsafe skill binding: ${(error as Error).message}`);
++      // The staging path is deleted in finally and must never leak into
++      // user-facing text: keep the refusal, name the class, drop the path.
++      const detail = (error as Error).message
++        .split(`${stage}/`)
++        .join('')
++        .split(stage)
++        .join('')
++        .trim();
++      throw new Error(
++        `official BMAD preflight produced an unsafe skill binding${detail === '' ? '' : `: ${detail}`}; retry this repo or skip`,
++      );
 +    }
 +    throw error;
 +  }
@@ -455,7 +506,7 @@ index 0da9178..d4ae6ab 100644
  function installFresh(
    repoPath: string,
    tools: readonly string[],
-@@ -411,7 +511,7 @@ function installFresh(
+@@ -411,7 +537,7 @@ function installFresh(
      if (staged === null) throw new Error('official BMAD preflight wrote no manifest');
      expectedFreshModules(staged.summary);
      for (const tool of tools) {
@@ -464,23 +515,70 @@ index 0da9178..d4ae6ab 100644
        const collisions = generated.filter((name) => beforeSkills[tool]?.includes(name));
        if (collisions.length > 0) {
          throw new Error(
-@@ -490,11 +590,13 @@ function runtimeSkillNames(repoPath: string, tool: string): string[] {
-   assertNoSymlinkComponents(repoPath, `${rootName}/skills`);
+@@ -444,9 +570,13 @@ function installFresh(
+     }
+   }
+   qualifyFreshSkillConfig(repoPath, tools, runtimeSkills);
+-  verifyModuleDirectories(repoPath, installed.summary);
+-  verifySkills(repoPath, tools);
+-  verifyNoAmbiguousSkillConfig(repoPath, tools, installed.summary, runtimeSkills);
++  try {
++    verifyModuleDirectories(repoPath, installed.summary);
++    verifySkills(repoPath, tools);
++    verifyNoAmbiguousSkillConfig(repoPath, tools, installed.summary, runtimeSkills);
++  } catch (error) {
++    asTransientInstallerOutput(error);
++  }
+   return { ...installed, runtimeSkills };
+ }
+ 
+@@ -475,7 +605,12 @@ function managedBlock(
+   const startAt = original.indexOf(start);
+   const endAt = original.indexOf(end);
+   if ((startAt === -1) !== (endAt === -1) || (startAt !== -1 && endAt < startAt)) {
+-    throw new Error(`malformed managed block: expected paired ${start} / ${end}`);
++    // Unpaired/reversed managed markers are unchanged on-disk state: a
++    // retry re-reads the same bytes and fails identically, so this is a
++    // deterministic skip-only refusal (gh-32), not a retryable write.
++    throw new BmadDeterministicSetupError(
++      `malformed managed block: expected paired ${start} / ${end}`,
++    );
+   }
+   const block = `${start}\n${body.join('\n')}\n${end}`;
+   if (startAt !== -1) {
+@@ -485,16 +620,20 @@ function managedBlock(
+   return `${prefix}${prefix === '' ? '' : '\n'}${block}\n`;
+ }
+ 
+-function runtimeSkillNames(repoPath: string, tool: string): string[] {
++function runtimeSkillNames(repoPath: string, tool: string, repairHint?: string): string[] {
+   const rootName = tool === 'claude-code' ? '.claude' : '.agents';
+-  assertNoSymlinkComponents(repoPath, `${rootName}/skills`);
++  assertNoSymlinkComponents(repoPath, `${rootName}/skills`, repairHint);
    const root = runtimeSkillsRoot(repoPath, tool);
    if (!existsSync(root)) return [];
 -  if (!statSync(root).isDirectory()) throw new Error(`BMAD skill root is not a directory: ${root}`);
 +  if (!statSync(root).isDirectory()) {
-+    throw new BmadDeterministicSetupError(`BMAD skill root is not a directory: ${root}`);
++    throw new BmadDeterministicSetupError(`BMAD skill root is not a directory: ${root}`, repairHint);
 +  }
    const names: string[] = [];
    for (const entry of readdirSync(root, { withFileTypes: true })) {
      const path = join(root, entry.name);
 -    if (entry.isSymbolicLink()) throw new Error(`BMAD skill binding is a symlink: ${path}`);
-+    if (entry.isSymbolicLink()) throw new BmadDeterministicSetupError(`BMAD skill binding is a symlink: ${path}`);
++    if (entry.isSymbolicLink()) {
++      throw new BmadDeterministicSetupError(`BMAD skill binding is a symlink: ${path}`, repairHint);
++    }
      if (entry.isDirectory()) names.push(entry.name);
    }
    return names.sort();
-@@ -510,19 +612,40 @@ function observedBmadSkills(repoPath: string, tools: readonly string[]): Runtime
+@@ -504,25 +643,49 @@ function observedBmadSkills(repoPath: string, tools: readonly string[]): Runtime
+   return Object.fromEntries(
+     tools.map((tool) => [
+       tool,
+-      runtimeSkillNames(repoPath, tool).filter((name) => /^(?:bmad|gds|tea|cis)-/.test(name)),
++      runtimeSkillNames(repoPath, tool, INSTALLER_REPAIR_HINT).filter((name) => /^(?:bmad|gds|tea|cis)-/.test(name)),
+     ]),
+   );
  }
  
  function validatedSkillPath(repoPath: string, tool: string, skill: string): string {
@@ -494,32 +592,36 @@ index 0da9178..d4ae6ab 100644
    }
    const root = runtimeSkillsRoot(repoPath, tool);
    const path = join(root, skill);
-   assertNoSymlinkComponents(repoPath, relative(repoPath, path));
+-  assertNoSymlinkComponents(repoPath, relative(repoPath, path));
 -  const realRepo = realpathSync(repoPath);
 -  const realRoot = realpathSync(root);
 -  const realSkill = realpathSync(path);
-+  let realRepo: string;
-+  let realRoot: string;
-+  let realSkill: string;
-+  try {
-+    realRepo = realpathSync(repoPath);
-+    realRoot = realpathSync(root);
-+    realSkill = realpathSync(path);
-+  } catch (error) {
-+    // A MISSING recorded binding/root (ENOENT/ENOTDIR) is unchanged
-+    // on-disk state (gh-32 r1): a retry re-runs the identical check and
-+    // fails identically, so it is deterministic with the installer repair
-+    // path. Other I/O failures (EACCES, …) stay plain errors — permissions
-+    // can recover between attempts, so retry stays available.
-+    if ((error as NodeJS.ErrnoException).code === 'ENOENT' ||
-+        (error as NodeJS.ErrnoException).code === 'ENOTDIR') {
-+      throw new BmadDeterministicSetupError(
-+        `BMAD recorded skill binding is missing: ${path}`,
-+        INSTALLER_REPAIR_HINT,
-+      );
++  assertNoSymlinkComponents(repoPath, relative(repoPath, path), INSTALLER_REPAIR_HINT);
++  // Resolve each operand in its own guarded step so a missing repository,
++  // skills root, or recorded binding is reported for the object that
++  // actually disappeared (all three are unchanged on-disk state).
++  const resolveReal = (target: string, missingMessage: string, hint?: string): string => {
++    try {
++      return realpathSync(target);
++    } catch (error) {
++      const code = (error as NodeJS.ErrnoException).code;
++      if (code === 'ENOENT' || code === 'ENOTDIR') {
++        throw new BmadDeterministicSetupError(missingMessage, hint);
++      }
++      throw error;
 +    }
-+    throw error;
-+  }
++  };
++  const realRepo = resolveReal(repoPath, `BMAD repository directory is missing: ${repoPath}`);
++  const realRoot = resolveReal(
++    root,
++    `BMAD ${tool} skills root is missing: ${root}`,
++    INSTALLER_REPAIR_HINT,
++  );
++  const realSkill = resolveReal(
++    path,
++    `BMAD recorded skill binding is missing: ${path}`,
++    INSTALLER_REPAIR_HINT,
++  );
    if (!insideOrEqual(realRepo, realRoot) || !insideOrEqual(realRoot, realSkill) ||
        !lstatSync(path).isDirectory()) {
 -    throw new Error(`unsafe BMAD recorded skill path: ${path}`);
@@ -527,7 +629,7 @@ index 0da9178..d4ae6ab 100644
    }
    return path;
  }
-@@ -536,7 +659,7 @@ function hashOwnedPayload(repoPath: string, runtimeSkills: RuntimeSkillMap, incl
+@@ -536,7 +699,7 @@ function hashOwnedPayload(repoPath: string, runtimeSkills: RuntimeSkillMap, incl
      if (!includeDerived && (relativePath === '_bmad/render' ||
          (relativePath.startsWith('_bmad/') && relativePath.split('/').includes('__pycache__')))) return;
      const info = lstatSync(path);
@@ -536,7 +638,7 @@ index 0da9178..d4ae6ab 100644
      if (info.isDirectory()) {
        hash.update(`d\0${relativePath}\0`);
        for (const name of readdirSync(path).sort()) visit(join(path, name));
-@@ -545,7 +668,7 @@ function hashOwnedPayload(repoPath: string, runtimeSkills: RuntimeSkillMap, incl
+@@ -545,7 +708,7 @@ function hashOwnedPayload(repoPath: string, runtimeSkills: RuntimeSkillMap, incl
        hash.update(readFileSync(path));
        hash.update('\0');
      } else {
@@ -545,7 +647,7 @@ index 0da9178..d4ae6ab 100644
      }
    };
    visit(join(repoPath, '_bmad'));
-@@ -744,7 +867,7 @@ function updateWorktreeBootstrap(repoPath: string, env: NodeJS.ProcessEnv): void
+@@ -744,7 +907,7 @@ function updateWorktreeBootstrap(repoPath: string, env: NodeJS.ProcessEnv): void
      try {
        parse(original);
      } catch (error) {
@@ -554,7 +656,7 @@ index 0da9178..d4ae6ab 100644
      }
    }
    const next = managedBlock(original, BLOCK_START, BLOCK_END, [
-@@ -755,7 +878,7 @@ function updateWorktreeBootstrap(repoPath: string, env: NodeJS.ProcessEnv): void
+@@ -755,7 +918,7 @@ function updateWorktreeBootstrap(repoPath: string, env: NodeJS.ProcessEnv): void
    ]);
    const bootstrapPath = join(repoPath, BOOTSTRAP_PATH);
    if (existsSync(bootstrapPath) && !readFileSync(bootstrapPath, 'utf-8').includes(BOOTSTRAP_MARKER)) {
@@ -563,7 +665,7 @@ index 0da9178..d4ae6ab 100644
    }
    atomicWrite(bootstrapPath, BOOTSTRAP_SOURCE, 0o755);
    atomicWrite(manifestPath, next);
-@@ -779,7 +902,7 @@ function writeRecord(
+@@ -779,7 +942,7 @@ function writeRecord(
    if (existsSync(path)) {
      const current = JSON.parse(readFileSync(path, 'utf-8')) as { managed_by?: unknown };
      if (current.managed_by !== 'gru-command') {
@@ -572,7 +674,36 @@ index 0da9178..d4ae6ab 100644
      }
    }
    const record = {
-@@ -804,7 +927,7 @@ function assertControlFilesSafe(repoPath: string): void {
+@@ -791,7 +954,7 @@ function writeRecord(
+     tools,
+     runtime_skills: runtimeSkills,
+     official_manifest_sha256: createHash('sha256').update(manifestText).digest('hex'),
+-    source_payload_sha256: hashOwnedPayload(repoPath, runtimeSkills),
++    source_payload_sha256: payloadSha256ForFreshOrReuse(repoPath, runtimeSkills, fresh),
+     source_payload_format: 'without-derived-caches-v1',
+     compatibility_patches: fresh ? ['qualify-bmm-gds-short-config-tokens-v1'] : [],
+   };
+@@ -799,12 +962,27 @@ function writeRecord(
+   return path;
+ }
+ 
++/** Existing-state hashing keeps its deterministic classification; a FRESH
++ * record's payload is installer output, so its failures stay transient. */
++function payloadSha256ForFreshOrReuse(
++  repoPath: string,
++  runtimeSkills: RuntimeSkillMap,
++  fresh: boolean,
++): string {
++  try {
++    return hashOwnedPayload(repoPath, runtimeSkills);
++  } catch (error) {
++    if (fresh) asTransientInstallerOutput(error);
++    throw error;
++  }
++}
++
+ function assertControlFilesSafe(repoPath: string): void {
+   const controlDir = join(repoPath, '.gru-command');
    if (existsSync(controlDir)) {
      const info = lstatSync(controlDir);
      if (info.isSymbolicLink() || !info.isDirectory()) {
@@ -581,7 +712,7 @@ index 0da9178..d4ae6ab 100644
      }
    }
    for (const relativePath of [RECORD_PATH, BOOTSTRAP_PATH, WORKTREE_MANIFEST_PATH]) {
-@@ -812,32 +935,41 @@ function assertControlFilesSafe(repoPath: string): void {
+@@ -812,32 +990,41 @@ function assertControlFilesSafe(repoPath: string): void {
      if (existsSync(path)) {
        const info = lstatSync(path);
        if (info.isSymbolicLink() || !info.isFile()) {
@@ -630,7 +761,7 @@ index 0da9178..d4ae6ab 100644
      }
    }
  }
-@@ -849,32 +981,56 @@ function validateRepo(
+@@ -849,32 +1036,61 @@ function validateRepo(
  ): string {
    const workspace = realpathSync(workspaceRoot);
    const candidate = join(workspace, repoName);
@@ -685,9 +816,15 @@ index 0da9178..d4ae6ab 100644
    let actualRoot: string;
    try {
      actualRoot = realpathSync(gitRoot.stdout.trim());
-   } catch {
+-  } catch {
 -    throw new Error(`selected Git repo reported an invalid top-level path: ${repoPath}`);
-+    throw new BmadDeterministicSetupError(`selected Git repo reported an invalid top-level path: ${repoPath}`);
++  } catch (error) {
++    const code = (error as NodeJS.ErrnoException).code;
++    if (code === 'ENOENT' || code === 'ENOTDIR') {
++      throw new BmadDeterministicSetupError(`selected Git repo reported an invalid top-level path: ${repoPath}`);
++    }
++    // EACCES/EIO and friends can recover between attempts — stay transient.
++    throw error;
    }
    if (actualRoot !== repoPath) {
 -    throw new Error(`selected directory is not the Git repository root: ${repoPath}`);
@@ -695,9 +832,14 @@ index 0da9178..d4ae6ab 100644
    }
    return repoPath;
  }
-@@ -895,27 +1051,39 @@ export function onboardBmadRepo(
-     assertNoSymlinkComponents(repoPath, '_bmad');
-     for (const tool of tools) runtimeSkillNames(repoPath, tool);
+@@ -892,30 +1108,42 @@ export function onboardBmadRepo(
+   try {
+     const repoPath = validateRepo(options.workspaceRoot, repoName, env);
+     assertControlFilesSafe(repoPath);
+-    assertNoSymlinkComponents(repoPath, '_bmad');
+-    for (const tool of tools) runtimeSkillNames(repoPath, tool);
++    assertNoSymlinkComponents(repoPath, '_bmad', INSTALLER_REPAIR_HINT);
++    for (const tool of tools) runtimeSkillNames(repoPath, tool, INSTALLER_REPAIR_HINT);
      assertPrerequisites(tools, env, repoPath, options.prerequisiteCheck ?? commandAvailable);
 -    const existing = manifestFor(repoPath);
 +    const existing = existingManifestFor(repoPath);
@@ -739,7 +881,7 @@ index 0da9178..d4ae6ab 100644
          }
          const raw = prior.runtime_skills;
          if (raw !== undefined && raw !== null && typeof raw === 'object' && !Array.isArray(raw)) {
-@@ -923,7 +1091,9 @@ export function onboardBmadRepo(
+@@ -923,7 +1151,9 @@ export function onboardBmadRepo(
            for (const [tool, names] of Object.entries(raw)) {
              if ((tool !== 'pi' && tool !== 'claude-code') || !Array.isArray(names) ||
                  names.some((name) => typeof name !== 'string')) {
@@ -750,7 +892,7 @@ index 0da9178..d4ae6ab 100644
              }
              for (const name of names as string[]) validatedSkillPath(repoPath, tool, name);
              parsed[tool] = [...names] as string[];
-@@ -931,17 +1101,20 @@ export function onboardBmadRepo(
+@@ -931,17 +1161,20 @@ export function onboardBmadRepo(
            recordedSkills = parsed;
          }
          if (prior.source_payload_format !== undefined && prior.source_payload_format !== 'without-derived-caches-v1') {
@@ -774,7 +916,7 @@ index 0da9178..d4ae6ab 100644
        verifySkills(repoPath, installed.summary.tools);
        verifyNoAmbiguousSkillConfig(
          repoPath,
-@@ -952,9 +1125,10 @@ export function onboardBmadRepo(
+@@ -952,9 +1185,10 @@ export function onboardBmadRepo(
        const existingTools = new Set(installed.summary.tools);
        const missingBindings = tools.filter((tool) => !existingTools.has(tool));
        if (missingBindings.length > 0) {
@@ -786,7 +928,7 @@ index 0da9178..d4ae6ab 100644
          );
        }
      }
-@@ -1000,6 +1174,8 @@ export function onboardBmadRepo(
+@@ -1000,6 +1234,8 @@ export function onboardBmadRepo(
        action,
        ready: false,
        message: String((error as Error).message),
@@ -838,18 +980,20 @@ index c5fe684..5bccc0f 100644
          fail(
            `BMAD setup for ${repo} is not ready: ${result.message}\n` +
 diff --git a/test/bmad-onboarding.test.ts b/test/bmad-onboarding.test.ts
-index 8e5282a..2d2d96c 100644
+index 8e5282a..3f0d3b0 100644
 --- a/test/bmad-onboarding.test.ts
 +++ b/test/bmad-onboarding.test.ts
-@@ -7,6 +7,7 @@ import {
+@@ -7,7 +7,9 @@ import {
    mkdirSync,
    mkdtempSync,
    readFileSync,
 +  readlinkSync,
    readdirSync,
++  renameSync,
    rmSync,
    symlinkSync,
-@@ -123,6 +124,33 @@ function materializeOfficialInstall(
+   writeFileSync,
+@@ -123,6 +125,33 @@ function materializeOfficialInstall(
    }
  }
  
@@ -883,7 +1027,7 @@ index 8e5282a..2d2d96c 100644
  function answers(workspace: string, repo: string, action: 'install' | 'reuse' | 'skip') {
    return parseAnswers(
      JSON.stringify({
-@@ -334,6 +362,7 @@ describe('per-selected-repo BMAD onboarding', () => {
+@@ -334,6 +363,7 @@ describe('per-selected-repo BMAD onboarding', () => {
        answers: answers(fixture.workspace, fixture.name, 'reuse'),
      });
      expect(refused.ready).toBe(false);
@@ -891,7 +1035,7 @@ index 8e5282a..2d2d96c 100644
      expect(refused.message).toContain('source payload changed');
      expect(readFileSync(recordPath, 'utf-8')).toBe(fingerprint);
      // For an old record, even a cache-only mismatch cannot establish which
-@@ -345,6 +374,7 @@ describe('per-selected-repo BMAD onboarding', () => {
+@@ -345,6 +375,7 @@ describe('per-selected-repo BMAD onboarding', () => {
        answers: answers(fixture.workspace, fixture.name, 'reuse'),
      });
      expect(stale.ready).toBe(false);
@@ -899,7 +1043,7 @@ index 8e5282a..2d2d96c 100644
      expect(stale.message).toContain('legacy render caches');
      expect(readFileSync(recordPath, 'utf-8')).toBe(`${JSON.stringify(record)}\n`);
    });
-@@ -370,6 +400,7 @@ describe('per-selected-repo BMAD onboarding', () => {
+@@ -370,6 +401,7 @@ describe('per-selected-repo BMAD onboarding', () => {
      });
      const traversal = reuse();
      expect(traversal.ready).toBe(false);
@@ -907,7 +1051,7 @@ index 8e5282a..2d2d96c 100644
      expect(traversal.message).toContain('unsafe BMAD recorded skill name');
      expect(readFileSync(outside, 'utf-8')).toBe('private outside bytes\n');
  
-@@ -379,11 +410,13 @@ describe('per-selected-repo BMAD onboarding', () => {
+@@ -379,11 +411,13 @@ describe('per-selected-repo BMAD onboarding', () => {
      symlinkSync(fixture.workspace, skill);
      const symlinked = reuse();
      expect(symlinked.ready).toBe(false);
@@ -921,7 +1065,7 @@ index 8e5282a..2d2d96c 100644
      expect(ancestor.message).toMatch(/symlink/);
      expect(readFileSync(recordPath, 'utf-8')).toBe(original);
    });
-@@ -516,6 +549,7 @@ describe('per-selected-repo BMAD onboarding', () => {
+@@ -516,6 +550,7 @@ describe('per-selected-repo BMAD onboarding', () => {
        prerequisiteCheck: (command) => command !== 'uv',
      });
      expect(result.ready).toBe(false);
@@ -929,7 +1073,7 @@ index 8e5282a..2d2d96c 100644
      expect(result.message).toContain('missing BMAD prerequisite(s): uv');
      expect(existsSync(join(fixture.repo, '.gru-command', 'bmad-install.json'))).toBe(false);
    });
-@@ -559,6 +593,9 @@ describe('per-selected-repo BMAD onboarding', () => {
+@@ -559,6 +594,9 @@ describe('per-selected-repo BMAD onboarding', () => {
          run: successfulInstaller(fixture.repo, []),
        });
        expect(result.ready).toBe(false);
@@ -939,7 +1083,7 @@ index 8e5282a..2d2d96c 100644
        expect(result.message).toMatch(/EACCES|permission denied/i);
        expect(existsSync(join(fixture.repo, '.gru-command', 'bmad-install.json'))).toBe(false);
      } finally {
-@@ -577,6 +614,7 @@ describe('per-selected-repo BMAD onboarding', () => {
+@@ -577,6 +615,7 @@ describe('per-selected-repo BMAD onboarding', () => {
          run: successfulInstaller(fixture.repo, []),
        });
        expect(result.ready, `${action}: ${result.message}`).toBe(false);
@@ -947,7 +1091,7 @@ index 8e5282a..2d2d96c 100644
        expect(result.message).toContain('partial BMAD installation detected');
        expect(result.message).toContain('preserve it and repair or choose skip');
        expect(existsSync(join(fixture.repo, '_bmad', 'bmm', 'half-written'))).toBe(true);
-@@ -593,6 +631,7 @@ describe('per-selected-repo BMAD onboarding', () => {
+@@ -593,6 +632,7 @@ describe('per-selected-repo BMAD onboarding', () => {
        answers: answers(malformed.workspace, malformed.name, 'reuse'),
      });
      expect(bad.ready).toBe(false);
@@ -955,7 +1099,7 @@ index 8e5282a..2d2d96c 100644
      expect(bad.message).toContain('malformed');
      expect(existsSync(join(malformed.repo, '.gru-command'))).toBe(false);
  
-@@ -610,6 +649,7 @@ describe('per-selected-repo BMAD onboarding', () => {
+@@ -610,6 +650,7 @@ describe('per-selected-repo BMAD onboarding', () => {
        }) as unknown as typeof spawnSync,
      });
      expect(refused.ready).toBe(false);
@@ -963,7 +1107,7 @@ index 8e5282a..2d2d96c 100644
      expect(refused.message).toContain('non-Gru BMAD bootstrap');
      expect(installerRan).toBe(false);
      expect(readFileSync(foreignBootstrap, 'utf-8')).toBe('// user-owned\n');
-@@ -627,6 +667,7 @@ describe('per-selected-repo BMAD onboarding', () => {
+@@ -627,6 +668,7 @@ describe('per-selected-repo BMAD onboarding', () => {
        }) as unknown as typeof spawnSync,
      });
      expect(unsafe.ready).toBe(false);
@@ -971,7 +1115,7 @@ index 8e5282a..2d2d96c 100644
      expect(unsafe.message).toContain('symlink');
      expect(unsafeInstallerRan).toBe(false);
      expect(existsSync(join(outsideRuntime, 'skills'))).toBe(false);
-@@ -642,6 +683,9 @@ describe('per-selected-repo BMAD onboarding', () => {
+@@ -642,6 +684,9 @@ describe('per-selected-repo BMAD onboarding', () => {
        run: successfulInstaller(collision.repo, collisionCalls),
      });
      expect(collided.ready).toBe(false);
@@ -981,7 +1125,7 @@ index 8e5282a..2d2d96c 100644
      expect(collided.message).toContain('would overwrite existing pi skill(s): bmad-help');
      expect(collisionCalls).toHaveLength(1);
      expect(readFileSync(join(customBmadHelp, 'SKILL.md'), 'utf-8')).toBe(
-@@ -660,10 +704,443 @@ describe('per-selected-repo BMAD onboarding', () => {
+@@ -660,10 +705,447 @@ describe('per-selected-repo BMAD onboarding', () => {
        answers: linkedAnswers,
      });
      expect(linked.ready).toBe(false);
@@ -1411,6 +1555,10 @@ index 8e5282a..2d2d96c 100644
 +    expect(refused.ready).toBe(false);
 +    expect(refused.deterministic).toBeUndefined();
 +    expect(refused.message).toContain('skill binding is a symlink');
++    // The disposable staging path is deleted in finally and must not leak
++    // into user-facing text (final-review finding): the message names the
++    // class, not the vanished temp directory.
++    expect(refused.message).not.toContain('gru-command-bmad-preflight-');
 +    expect(existsSync(join(preflight.repo, '_bmad'))).toBe(false);
 +    const retried = onboardBmadRepo(preflight.name, 'install', {
 +      workspaceRoot: preflight.workspace,
@@ -1425,8 +1573,345 @@ index 8e5282a..2d2d96c 100644
    it('bootstraps isolated copies into a real fresh worktree and fails when a required source module disappears', async () => {
      const fixture = fixtureRepo('worktree-proof');
      const customSkill = join(fixture.repo, '.agents', 'skills', 'user-custom');
+@@ -834,4 +1316,336 @@ describe('per-selected-repo BMAD onboarding', () => {
+     })).rejects.toThrow(/source payload changed|missing required module bmm/);
+     git(fixture.repo, ['worktree', 'remove', '--force', brokenWorktree]);
+   }, 120_000);
++
++  describe('gh-32 final-review repairs (independent tracked review)', () => {
++    it('unpaired managed-block markers in worktree.toml are deterministic skip-only, never a futile retry', () => {
++      const fixture = fixtureRepo('malformed-managed-block');
++      const installed = onboardBmadRepo(fixture.name, 'install', {
++        workspaceRoot: fixture.workspace,
++        answers: answers(fixture.workspace, fixture.name, 'install'),
++        run: successfulInstaller(fixture.repo, []),
++      });
++      expect(installed.ready, installed.message).toBe(true);
++      const manifestPath = join(fixture.repo, '.gru-command', 'worktree.toml');
++      const broken = readFileSync(manifestPath, 'utf-8').replace('# END GRU COMMAND BMAD BOOTSTRAP', '');
++      expect(broken).not.toContain('# END GRU COMMAND BMAD BOOTSTRAP');
++      writeFileSync(manifestPath, broken);
++      const before = bmadSnapshot(fixture.repo);
++      const result = onboardBmadRepo(fixture.name, 'reuse', {
++        workspaceRoot: fixture.workspace,
++        answers: answers(fixture.workspace, fixture.name, 'reuse'),
++      });
++      expect(result.ready).toBe(false);
++      expect(result.deterministic).toBe(true);
++      expect(result.message).toContain('malformed managed block: expected paired');
++      expect(readFileSync(manifestPath, 'utf-8')).toBe(broken);
++      expect(bmadSnapshot(fixture.repo)).toBe(before);
++    });
++
++    it('fresh-installer output failing post-install validation stays transient (never skip-only)', () => {
++      const fixture = fixtureRepo('fresh-output-flake');
++      let calls = 0;
++      const flaky = ((_command: string, args: string[]) => {
++        calls += 1;
++        const directoryAt = args.indexOf('--directory');
++        const directory = args[directoryAt + 1] ?? fixture.repo;
++        materializeOfficialInstall(directory, '', ['pi']);
++        // The REPO install (second call of the first attempt) omits a
++        // declared module: the installer produced invalid output.
++        if (calls === 2) rmSync(join(directory, '_bmad', 'tea'), { recursive: true, force: true });
++        return { status: 0, signal: null, stdout: '', stderr: '', pid: 1, output: [] };
++      }) as unknown as typeof spawnSync;
++      const first = onboardBmadRepo(fixture.name, 'install', {
++        workspaceRoot: fixture.workspace,
++        answers: answers(fixture.workspace, fixture.name, 'install'),
++        run: flaky,
++      });
++      expect(first.ready).toBe(false);
++      expect(first.deterministic).toBeUndefined();
++      expect(first.message).toContain('official BMAD installer output failed validation');
++      expect(first.message).toContain('missing or unsafe module directory');
++      expect(first.message).toContain('retry this repo or skip');
++      // The failed attempt left a partial install; the operator clears the
++      // wizard's own failed output, then the next attempt can complete.
++      rmSync(join(fixture.repo, '_bmad'), { recursive: true, force: true });
++      rmSync(join(fixture.repo, '.agents'), { recursive: true, force: true });
++      const second = onboardBmadRepo(fixture.name, 'install', {
++        workspaceRoot: fixture.workspace,
++        answers: answers(fixture.workspace, fixture.name, 'install'),
++        run: flaky,
++      });
++      expect(second.ready, second.message).toBe(true);
++    });
++
++    it('missing skills root and ENOTDIR root report the root; EACCES stays transient', () => {
++      const missingRoot = fixtureRepo('missing-skills-root');
++      expect(
++        onboardBmadRepo(missingRoot.name, 'install', {
++          workspaceRoot: missingRoot.workspace,
++          answers: answers(missingRoot.workspace, missingRoot.name, 'install'),
++          run: successfulInstaller(missingRoot.repo, []),
++        }).ready,
++      ).toBe(true);
++      rmSync(join(missingRoot.repo, '.agents', 'skills'), { recursive: true, force: true });
++      const rootGone = onboardBmadRepo(missingRoot.name, 'reuse', {
++        workspaceRoot: missingRoot.workspace,
++        answers: answers(missingRoot.workspace, missingRoot.name, 'reuse'),
++      });
++      expect(rootGone.ready).toBe(false);
++      expect(rootGone.deterministic).toBe(true);
++      expect(rootGone.message).toContain('BMAD pi skills root is missing');
++      expect(rootGone.message).not.toContain('recorded skill binding is missing');
++
++      const notDir = fixtureRepo('enotdir-skills-root');
++      expect(
++        onboardBmadRepo(notDir.name, 'install', {
++          workspaceRoot: notDir.workspace,
++          answers: answers(notDir.workspace, notDir.name, 'install'),
++          run: successfulInstaller(notDir.repo, []),
++        }).ready,
++      ).toBe(true);
++      const agentsDir = join(notDir.repo, '.agents');
++      rmSync(agentsDir, { recursive: true, force: true });
++      writeFileSync(agentsDir, 'not a directory\n');
++      const enotdir = onboardBmadRepo(notDir.name, 'reuse', {
++        workspaceRoot: notDir.workspace,
++        answers: answers(notDir.workspace, notDir.name, 'reuse'),
++      });
++      expect(enotdir.ready).toBe(false);
++      expect(enotdir.deterministic).toBe(true);
++      expect(enotdir.message).toContain('BMAD pi skills root is missing');
++
++      const denied = fixtureRepo('denied-skills-root');
++      expect(
++        onboardBmadRepo(denied.name, 'install', {
++          workspaceRoot: denied.workspace,
++          answers: answers(denied.workspace, denied.name, 'install'),
++          run: successfulInstaller(denied.repo, []),
++        }).ready,
++      ).toBe(true);
++      chmodSync(join(denied.repo, '.agents'), 0o000);
++      try {
++        const deniedResult = onboardBmadRepo(denied.name, 'reuse', {
++          workspaceRoot: denied.workspace,
++          answers: answers(denied.workspace, denied.name, 'reuse'),
++        });
++        expect(deniedResult.ready).toBe(false);
++        expect(deniedResult.deterministic).toBeUndefined();
++      } finally {
++        chmodSync(join(denied.repo, '.agents'), 0o755);
++      }
++      const recovered = onboardBmadRepo(denied.name, 'reuse', {
++        workspaceRoot: denied.workspace,
++        answers: answers(denied.workspace, denied.name, 'reuse'),
++      });
++      expect(recovered.ready, recovered.message).toBe(true);
++    });
++
++    it('control-file refusals are deterministic skip-only without mutation', () => {
++      const fixture = fixtureRepo('control-refusals');
++      const installed = onboardBmadRepo(fixture.name, 'install', {
++        workspaceRoot: fixture.workspace,
++        answers: answers(fixture.workspace, fixture.name, 'install'),
++        run: successfulInstaller(fixture.repo, []),
++      });
++      expect(installed.ready, installed.message).toBe(true);
++      const recordPath = join(fixture.repo, '.gru-command', 'bmad-install.json');
++      const originalRecord = readFileSync(recordPath, 'utf-8');
++      const manifestPath = join(fixture.repo, '.gru-command', 'worktree.toml');
++      const originalManifest = readFileSync(manifestPath, 'utf-8');
++      const reuse = () => onboardBmadRepo(fixture.name, 'reuse', {
++        workspaceRoot: fixture.workspace,
++        answers: answers(fixture.workspace, fixture.name, 'reuse'),
++      });
++
++      rmSync(recordPath);
++      writeFileSync(join(fixture.workspace, 'outside-record.json'), '{"managed_by":"outside"}\n');
++      symlinkSync(join(fixture.workspace, 'outside-record.json'), recordPath);
++      const linked = reuse();
++      expect(linked.deterministic).toBe(true);
++      expect(linked.message).toContain('refusing BMAD control write through unsafe path');
++      rmSync(recordPath);
++
++      writeFileSync(recordPath, 'not json at all\n');
++      const malformed = reuse();
++      expect(malformed.deterministic).toBe(true);
++      expect(malformed.message).toContain('existing BMAD record is malformed');
++
++      writeFileSync(recordPath, '{"managed_by":"someone-else"}\n');
++      const foreign = reuse();
++      expect(foreign.deterministic).toBe(true);
++      expect(foreign.message).toContain('refusing to overwrite non-Gru BMAD record');
++      writeFileSync(recordPath, originalRecord);
++
++      writeFileSync(manifestPath, 'not = = toml\n');
++      const malformedManifest = reuse();
++      expect(malformedManifest.deterministic).toBe(true);
++      expect(malformedManifest.message).toContain('existing worktree manifest is malformed');
++      writeFileSync(manifestPath, originalManifest);
++      expect(reuse().ready).toBe(true);
++    });
++
++    it('validateRepo refusals outside the covered pair are deterministic, and EACCES stays transient', () => {
++      const raced = fixtureRepo('deleted-repo-race');
++      const parsed = answers(raced.workspace, raced.name, 'reuse');
++      rmSync(raced.repo, { recursive: true, force: true });
++      const deleted = onboardBmadRepo(raced.name, 'reuse', {
++        workspaceRoot: raced.workspace,
++        answers: parsed,
++      });
++      expect(deleted.ready).toBe(false);
++      expect(deleted.deterministic).toBe(true);
++      expect(deleted.message).toContain('selected repo no longer exists');
++
++      const fakeBin = tempDir('gru-command-fake-git-');
++      writeFileSync(
++        join(fakeBin, 'git'),
++        '#!/usr/bin/env bash\nif [[ "$*" == *"--show-toplevel"* ]]; then echo "$FAKE_GIT_TOPLEVEL"; exit 0; fi\nexit 1\n',
++        { mode: 0o755 },
++      );
++      const ghost = fixtureRepo('ghost-toplevel');
++      const ghostProbe = onboardBmadRepo(ghost.name, 'reuse', {
++        workspaceRoot: ghost.workspace,
++        answers: answers(ghost.workspace, ghost.name, 'reuse'),
++        env: { PATH: `${fakeBin}:${process.env.PATH ?? ''}`, FAKE_GIT_TOPLEVEL: join(ghost.workspace, 'no-such-toplevel') },
++      });
++      expect(ghostProbe.ready).toBe(false);
++      expect(ghostProbe.deterministic).toBe(true);
++      expect(ghostProbe.message).toContain('invalid top-level path');
++
++      const blockedParent = join(ghost.workspace, 'blocked-parent');
++      mkdirSync(blockedParent);
++      chmodSync(blockedParent, 0o000);
++      try {
++        const deniedProbe = onboardBmadRepo(ghost.name, 'reuse', {
++          workspaceRoot: ghost.workspace,
++          answers: answers(ghost.workspace, ghost.name, 'reuse'),
++          env: { PATH: `${fakeBin}:${process.env.PATH ?? ''}`, FAKE_GIT_TOPLEVEL: join(blockedParent, 'toplevel') },
++        });
++        expect(deniedProbe.ready).toBe(false);
++        expect(deniedProbe.deterministic).toBeUndefined();
++      } finally {
++        chmodSync(blockedParent, 0o755);
++      }
++    });
++
++    it('reuse-path content validator classifications are pinned (final review)', () => {
++      const ambiguous = fixtureRepo('raw-config-tokens');
++      materializeOfficialInstall(ambiguous.repo, '', ['pi']);
++      const ambiguousResult = onboardBmadRepo(ambiguous.name, 'reuse', {
++        workspaceRoot: ambiguous.workspace,
++        answers: answers(ambiguous.workspace, ambiguous.name, 'reuse'),
++      });
++      expect(ambiguousResult.deterministic).toBe(true);
++      expect(ambiguousResult.message).toContain('ambiguous BMM/GDS config token');
++      expect(ambiguousResult.repairHint).toContain('npx bmad-method install');
++
++      const missingSkill = fixtureRepo('missing-build-skill');
++      materializeOfficialInstall(missingSkill.repo, '', ['pi']);
++      rmSync(join(missingSkill.repo, '.agents', 'skills', 'bmad-build', 'SKILL.md'));
++      const missingResult = onboardBmadRepo(missingSkill.name, 'reuse', {
++        workspaceRoot: missingSkill.workspace,
++        answers: answers(missingSkill.workspace, missingSkill.name, 'reuse'),
++      });
++      expect(missingResult.deterministic).toBe(true);
++      expect(missingResult.message).toContain('binding is missing required bmad-build skill');
++      expect(missingResult.repairHint).toContain('npx bmad-method install');
++
++      const symlinkedEntry = fixtureRepo('symlinked-skill-entry');
++      materializeOfficialInstall(symlinkedEntry.repo, '', ['pi']);
++      symlinkSync(tempDir('gru-command-bmad-se-outside-'), join(symlinkedEntry.repo, '.agents', 'skills', 'evil'));
++      const symlinkedResult = onboardBmadRepo(symlinkedEntry.name, 'reuse', {
++        workspaceRoot: symlinkedEntry.workspace,
++        answers: answers(symlinkedEntry.workspace, symlinkedEntry.name, 'reuse'),
++      });
++      expect(symlinkedResult.deterministic).toBe(true);
++      expect(symlinkedResult.message).toContain('BMAD skill binding is a symlink');
++
++      const payloadLink = fixtureRepo('owned-payload-symlink');
++      const payloadInstalled = onboardBmadRepo(payloadLink.name, 'install', {
++        workspaceRoot: payloadLink.workspace,
++        answers: answers(payloadLink.workspace, payloadLink.name, 'install'),
++        run: successfulInstaller(payloadLink.repo, []),
++      });
++      expect(payloadInstalled.ready, payloadInstalled.message).toBe(true);
++      symlinkSync(tempDir('gru-command-bmad-payload-outside-'), join(payloadLink.repo, '_bmad', 'evil-link'));
++      const payloadResult = onboardBmadRepo(payloadLink.name, 'reuse', {
++        workspaceRoot: payloadLink.workspace,
++        answers: answers(payloadLink.workspace, payloadLink.name, 'reuse'),
++      });
++      expect(payloadResult.deterministic).toBe(true);
++      expect(payloadResult.message).toContain('owned payload contains symlink');
++
++      const fileBinding = fixtureRepo('recorded-skill-file');
++      const fileInstalled = onboardBmadRepo(fileBinding.name, 'install', {
++        workspaceRoot: fileBinding.workspace,
++        answers: answers(fileBinding.workspace, fileBinding.name, 'install'),
++        run: successfulInstaller(fileBinding.repo, []),
++      });
++      expect(fileInstalled.ready, fileInstalled.message).toBe(true);
++      const buildSkill = join(fileBinding.repo, '.agents', 'skills', 'bmad-build');
++      rmSync(buildSkill, { recursive: true, force: true });
++      writeFileSync(buildSkill, 'not a directory\n');
++      const fileResult = onboardBmadRepo(fileBinding.name, 'reuse', {
++        workspaceRoot: fileBinding.workspace,
++        answers: answers(fileBinding.workspace, fileBinding.name, 'reuse'),
++      });
++      expect(fileResult.deterministic).toBe(true);
++      expect(fileResult.message).toContain('unsafe BMAD recorded skill path');
++    });
++
++    it('a denied manifest read stays transient and recovers on the SAME collected answers', () => {
++      const fixture = fixtureRepo('denied-manifest-read');
++      const installed = onboardBmadRepo(fixture.name, 'install', {
++        workspaceRoot: fixture.workspace,
++        answers: answers(fixture.workspace, fixture.name, 'install'),
++        run: successfulInstaller(fixture.repo, []),
++      });
++      expect(installed.ready, installed.message).toBe(true);
++      const answersObject = answers(fixture.workspace, fixture.name, 'reuse');
++      const manifestPath = join(fixture.repo, '_bmad', '_config', 'manifest.yaml');
++      chmodSync(manifestPath, 0o000);
++      try {
++        const denied = onboardBmadRepo(fixture.name, 'reuse', {
++          workspaceRoot: fixture.workspace,
++          answers: answersObject,
++        });
++        expect(denied.ready).toBe(false);
++        expect(denied.deterministic).toBeUndefined();
++        expect(denied.message).not.toContain('malformed');
++      } finally {
++        chmodSync(manifestPath, 0o644);
++      }
++      const recovered = onboardBmadRepo(fixture.name, 'reuse', {
++        workspaceRoot: fixture.workspace,
++        answers: answersObject,
++      });
++      expect(recovered.ready, recovered.message).toBe(true);
++    });
++
++    it('ancestor symlink refusals carry the official-installer repair hint for existing installs', () => {
++      const fixture = fixtureRepo('ancestor-symlink-hint');
++      const installed = onboardBmadRepo(fixture.name, 'install', {
++        workspaceRoot: fixture.workspace,
++        answers: answers(fixture.workspace, fixture.name, 'install'),
++        run: successfulInstaller(fixture.repo, []),
++      });
++      expect(installed.ready, installed.message).toBe(true);
++      const bmadDir = join(fixture.repo, '_bmad');
++      const bmadReal = join(fixture.repo, '_bmad-real');
++      renameSync(bmadDir, bmadReal);
++      // Symlink to the REAL content so the manifest still reads; the
++      // ancestor-refusal classification (with the installer hint) is what
++      // this case pins.
++      symlinkSync(bmadReal, bmadDir);
++      const result = onboardBmadRepo(fixture.name, 'reuse', {
++        workspaceRoot: fixture.workspace,
++        answers: answers(fixture.workspace, fixture.name, 'reuse'),
++      });
++      expect(result.ready).toBe(false);
++      expect(result.deterministic).toBe(true);
++      expect(result.message).toContain('refusing BMAD path through symlink');
++      expect(result.repairHint).toContain('npx bmad-method install');
++    });
++  });
+ });
 diff --git a/test/suite-shape.test.ts b/test/suite-shape.test.ts
-index b7e6b1a..b847514 100644
+index b7e6b1a..1948c8a 100644
 --- a/test/suite-shape.test.ts
 +++ b/test/suite-shape.test.ts
 @@ -13,7 +13,7 @@ const PINS: Record<string, number> = {
@@ -1434,7 +1919,7 @@ index b7e6b1a..b847514 100644
    'attachments.test.ts': 28,
    'awareness.test.ts': 43,
 -  'bmad-onboarding.test.ts': 13,
-+  'bmad-onboarding.test.ts': 19,
++  'bmad-onboarding.test.ts': 27,
    'board-engine-v4.test.ts': 4,
    'board-engine.test.ts': 31,
    'board-frames.test.ts': 3,
@@ -1446,7 +1931,7 @@ index b7e6b1a..b847514 100644
 +  'wizard-interactive.test.ts': 11,
    'wizard-register.test.ts': 2,
 -  'wizard.test.ts': 24,
-+  'wizard.test.ts': 26,
++  'wizard.test.ts': 27,
    'worktree-manager.test.ts': 66,
    'worktree-manifest.test.ts': 8,
    'worktree-port.test.ts': 4,
@@ -1673,10 +2158,10 @@ index dfc8b82..14c98d2 100644
      const workspace = fixtureWorkspace();
      const instance = tempDir('gru-command-pty-home2-');
 diff --git a/test/wizard.test.ts b/test/wizard.test.ts
-index 4038f5d..3267167 100644
+index 4038f5d..81e2485 100644
 --- a/test/wizard.test.ts
 +++ b/test/wizard.test.ts
-@@ -369,6 +369,189 @@ describe('wizard CLI surface', () => {
+@@ -369,6 +369,221 @@ describe('wizard CLI surface', () => {
      expect(err).toContain('--no-interact');
    });
  
@@ -1801,6 +2286,38 @@ index 4038f5d..3267167 100644
 +    expect(exists.stderr).not.toContain('npx bmad-method install');
 +  }, 120_000);
 +
++  it('noninteractive hint-less deterministic failures name the neutral deliberate repair (gh-32 final review)', () => {
++    const repoRoot = join(import.meta.dirname, '..');
++    const workspace = tempDir('gru-command-wizard-fallback-ws-');
++    const repoA = join(workspace, 'repo-a');
++    mkdirSync(join(repoA, '.git'), { recursive: true });
++    execFileSync('git', ['init', '-q'], { cwd: repoA });
++    // A partial install (_bmad without a manifest) is deterministic with
++    // NO installer hint, so the neutral deliberate-repair fallback renders.
++    mkdirSync(join(repoA, '_bmad', 'bmm'), { recursive: true });
++    const bin = tempDir('gru-command-wizard-fallback-bin-');
++    writeFileSync(join(bin, 'uv'), '#!/usr/bin/env bash\nexit 0\n', { mode: 0o755 });
++    const answersJson = JSON.stringify({
++      workspace_root: workspace,
++      repos: ['repo-a'],
++      bmad: { 'repo-a': 'reuse' },
++      runtime: 'pi',
++      port: 0,
++      smoke: false,
++    });
++    const instance = tempDir('gru-command-wizard-fallback-home-');
++    const failed = spawnSync(
++      process.execPath,
++      [join(repoRoot, 'dist', 'wizard', 'main.js'), '--answers', answersJson],
++      { env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}`, GRU_COMMAND_HOME: instance }, encoding: 'utf-8', timeout: 60_000 },
++    );
++    expect(failed.status, failed.stderr).toBe(1);
++    expect(failed.stderr).toContain('partial BMAD installation detected');
++    expect(failed.stderr).toContain('Repair the reported condition deliberately, then re-run the wizard');
++    expect(failed.stderr).not.toContain('Retry after fixing it');
++    expect(existsSync(join(instance, 'config.toml'))).toBe(false);
++  }, 120_000);
++
 +  it('noninteractive deleted recorded binding after successful onboard fails loud skip-only with the installer hint (gh-32 r1)', () => {
 +    const repoRoot = join(import.meta.dirname, '..');
 +    const workspace = tempDir('gru-command-wizard-unbind-ws-');
@@ -1867,10 +2384,31 @@ index 4038f5d..3267167 100644
      for (const good of ['::', '::1', 'fe80::1', 'fe80::1%en0', '1:2:3:4:5:6:7:8', '::ffff:127.0.0.1']) {
        expect(parseAnswers(JSON.stringify({ host: good })).host, good).toBe(good);
 diff --git a/web/e2e/real-server.spec.ts b/web/e2e/real-server.spec.ts
-index dad93ef..a9887b6 100644
+index dad93ef..3e2f3a3 100644
 --- a/web/e2e/real-server.spec.ts
 +++ b/web/e2e/real-server.spec.ts
-@@ -661,6 +661,10 @@ test.describe('attach flow (SPEC ruling 19) — full gesture', () => {
+@@ -481,10 +481,20 @@ test.describe('themes', () => {
+     await pair(page, `http://127.0.0.1:${themesPort}/`);
+     await sendAndWaitReply(page, 'theme real check');
+ 
++    // The whole-page capture must not race the board's owner band (the
++    // chat wait above does not cover the board snapshot; observed as a RED
++    // capture with the band missing while the DOM already had it).
++    await expect(page.locator('#board-owner')).toBeVisible();
++    await expect(page.locator('#board-owner .board-owner__clear')).toBeVisible();
++
++    // Whole-page captures must be scroll-invariant (see the mock themes
++    // test): pin the page origin before each capture.
++    await page.evaluate(() => window.scrollTo(0, 0));
+     await expect(page.locator('html')).not.toHaveClass(/dark/);
+     await expect(page).toHaveScreenshot('real-chat-light.png', { maxDiffPixelRatio: 0.02 });
+ 
+     await page.locator('#theme-toggle').click();
++    await page.evaluate(() => window.scrollTo(0, 0));
+     await expect(page.locator('html')).toHaveClass(/dark/);
+     await expect(page).toHaveScreenshot('real-chat-dark.png', { maxDiffPixelRatio: 0.02 });
+ 
+@@ -661,6 +671,10 @@ test.describe('attach flow (SPEC ruling 19) — full gesture', () => {
  
      const chip = page.locator('#chat-chips .attach-chip', { hasText: 'camera-roll.png' });
      await expect(chip).toBeVisible();
@@ -1881,7 +2419,7 @@ index dad93ef..a9887b6 100644
  
      await page.locator('#chat-input').fill('what did I just shoot');
      await page.locator('#chat-send').click();
-@@ -698,6 +702,9 @@ test.describe('attach flow (SPEC ruling 19) — full gesture', () => {
+@@ -698,6 +712,9 @@ test.describe('attach flow (SPEC ruling 19) — full gesture', () => {
      });
      const chip = page.locator('#chat-chips .attach-chip', { hasText: 'paste-shot.png' });
      await expect(chip).toBeVisible();
@@ -1898,10 +2436,10 @@ diff --git a/web/e2e/real-server.spec.ts-snapshots/real-chat-light-darwin.png b/
 index 0f4b769..6645e46 100644
 Binary files a/web/e2e/real-server.spec.ts-snapshots/real-chat-light-darwin.png and b/web/e2e/real-server.spec.ts-snapshots/real-chat-light-darwin.png differ
 diff --git a/web/e2e/smoke.spec.ts b/web/e2e/smoke.spec.ts
-index c5d600b..8b06ee9 100644
+index c5d600b..ebf23de 100644
 --- a/web/e2e/smoke.spec.ts
 +++ b/web/e2e/smoke.spec.ts
-@@ -911,6 +911,15 @@ test.describe('chat pane reflow (owner heist)', () => {
+@@ -911,6 +911,20 @@ test.describe('chat pane reflow (owner heist)', () => {
        `reflow-all ${LONG_TOKEN}\n\n\`\`\`\n${LONG_CODE}\n\`\`\`\n\n${LONG_TABLE}\n\ntail after table`,
        'reflow-all',
      );
@@ -1913,10 +2451,41 @@ index c5d600b..8b06ee9 100644
 +      has: page.locator('.tool-line', { hasText: 'mcp__' }),
 +    });
 +    await expect(toolBand).toHaveCount(1);
-+    await toolBand.locator('.service-band__head').click();
++    const bandHead = toolBand.locator('.service-band__head');
++    // Guard the toggle state so a future already-expanded default cannot
++    // silently collapse the band (and measure the wrong layout).
++    await expect(bandHead).toHaveAttribute('aria-expanded', 'false');
++    await bandHead.click();
++    await expect(bandHead).toHaveAttribute('aria-expanded', 'true');
      await expect(page.locator('.tool-line', { hasText: 'mcp__' })).toBeVisible();
      await expect(page.locator('.tool-line', { hasText: 'failed:' })).toBeVisible();
    }
+@@ -987,10 +1001,25 @@ test.describe('themes', () => {
+     await pair(page);
+     await sendAndWaitReply(page, 'theme check');
+ 
++    // The whole-page capture must not race the board's owner band: the
++    // reply wait above covers the chat only (observed RED under load: the
++    // capture missed the band while the DOM already had it). Synchronize
++    // on the band's authoritative rows before the screenshot.
++    await expect(page.locator('#board-owner .board-owner__row')).toHaveCount(2);
++    await expect(
++      page.locator('#board-owner .board-owner__row', { hasText: 'Fix the payment retry loop' }),
++    ).toBeVisible();
++
++    // Whole-page captures must be scroll-invariant: interacting with the
++    // composer can scroll the scrollable shell, and a non-zero page scroll
++    // moves the content (and the sticky band head) under the capture —
++    // observed as RED with the owner band scrolled away. Pin the origin.
++    await page.evaluate(() => window.scrollTo(0, 0));
+     await expect(page.locator('html')).not.toHaveClass(/dark/);
+     await expect(page).toHaveScreenshot('chat-light.png', { maxDiffPixelRatio: 0.02 });
+ 
+     await page.locator('#theme-toggle').click();
++    await page.evaluate(() => window.scrollTo(0, 0));
+     await expect(page.locator('html')).toHaveClass(/dark/);
+     await expect(page).toHaveScreenshot('chat-dark.png', { maxDiffPixelRatio: 0.02 });
+ 
 diff --git a/web/e2e/smoke.spec.ts-snapshots/chat-dark-darwin.png b/web/e2e/smoke.spec.ts-snapshots/chat-dark-darwin.png
 index abf141b..26e8376 100644
 Binary files a/web/e2e/smoke.spec.ts-snapshots/chat-dark-darwin.png and b/web/e2e/smoke.spec.ts-snapshots/chat-dark-darwin.png differ
@@ -1965,6 +2534,83 @@ index d51d8fa..1d04e22 100644
      // Counters may rewind only after every client is detached; otherwise a
      // live browser observes impossible seq/epoch regression.
      for (const socket of server.clients) socket.terminate();
+diff --git a/web/src/lib/mock-server-http.test.ts b/web/src/lib/mock-server-http.test.ts
+index 564d97f..812e865 100644
+--- a/web/src/lib/mock-server-http.test.ts
++++ b/web/src/lib/mock-server-http.test.ts
+@@ -3,7 +3,8 @@ import { readFileSync, readdirSync, rmSync } from 'node:fs';
+ import { createServer } from 'node:http';
+ import { basename, dirname } from 'node:path';
+ import { fileURLToPath } from 'node:url';
+-import { afterEach, describe, expect, it } from 'vitest';
++import { afterEach, describe, expect, it, vi } from 'vitest';
++import { WebSocket } from 'ws';
+ 
+ const TOKEN = 'configured-mock-test-token';
+ const cleanupDirs: string[] = [];
+@@ -136,3 +137,62 @@ describe('dev mock upload endpoint hardening', () => {
+     expect(readdirSync(dirname(first.path))).toHaveLength(2);
+   }, 30_000);
+ });
++
++describe('dev mock turn-hold fixture contract', () => {
++  /** Frame log helper: the mock's chat channel streams JSON frames. */
++  type Frame = Record<string, unknown>;
++
++  async function chatSocket(baseUrl: string): Promise<{ ws: WebSocket; frames: Frame[] }> {
++    const ws = new WebSocket(`${baseUrl.replace('http', 'ws')}/ws`);
++    const frames: Frame[] = [];
++    ws.on('message', (data: Buffer) => frames.push(JSON.parse(String(data)) as Frame));
++    await new Promise<void>((resolve, reject) => {
++      ws.once('open', () => resolve());
++      ws.once('error', reject);
++    });
++    ws.send(JSON.stringify({ type: 'auth', token: TOKEN }));
++    await vi.waitFor(() => expect(frames.some((f) => f['type'] === 'auth_ok')).toBe(true));
++    return { ws, frames };
++  }
++
++  const control = async (baseUrl: string, path: string): Promise<void> => {
++    const res = await fetch(`${baseUrl}${path}`, {
++      method: 'POST',
++      headers: { authorization: `Bearer ${TOKEN}` },
++    });
++    expect(res.ok, path).toBe(true);
++  };
++
++  it('parks the scripted turn until release, and reset settles a parked turn without ghost frames', async () => {
++    const { baseUrl } = await startMock();
++    await control(baseUrl, '/__reset');
++    await control(baseUrl, '/__turn-hold');
++    const first = await chatSocket(baseUrl);
++    first.ws.send(JSON.stringify({ type: 'user', text: 'hold check', client_msg_id: 'hold-1', epoch: 0 }));
++    await vi.waitFor(() => expect(first.frames.some((f) => f['type'] === 'delta')).toBe(true));
++    // Well past the scripted stream duration: a parked turn must NOT end.
++    await new Promise((resolve) => setTimeout(resolve, 2_500));
++    expect(first.frames.some((f) => f['type'] === 'turn' && f['state'] === 'end')).toBe(false);
++    await control(baseUrl, '/__turn-release');
++    await vi.waitFor(() => expect(first.frames.some((f) => f['type'] === 'turn' && f['state'] === 'end')).toBe(true));
++    first.ws.close();
++    await new Promise((resolve) => setTimeout(resolve, 150));
++
++    // Reset WHILE a turn is parked: the parked turn must settle before the
++    // log clears, so a fresh client replays no ghost turn/tool frames.
++    await control(baseUrl, '/__reset');
++    await control(baseUrl, '/__turn-hold');
++    const parked = await chatSocket(baseUrl);
++    parked.ws.send(JSON.stringify({ type: 'user', text: 'reset while parked', client_msg_id: 'hold-2', epoch: 0 }));
++    await vi.waitFor(() => expect(parked.frames.some((f) => f['type'] === 'delta')).toBe(true));
++    await new Promise((resolve) => setTimeout(resolve, 1_500));
++    await control(baseUrl, '/__reset');
++    await new Promise((resolve) => setTimeout(resolve, 200));
++    const fresh = await chatSocket(baseUrl);
++    await new Promise((resolve) => setTimeout(resolve, 250));
++    expect(fresh.frames.some((f) => f['type'] === 'turn' && f['state'] === 'end')).toBe(false);
++    expect(fresh.frames.some((f) => f['type'] === 'tool')).toBe(false);
++    expect(fresh.frames.some((f) => f['type'] === 'delta')).toBe(false);
++    fresh.ws.close();
++  }, 30_000);
++});
 diff --git a/web/src/styles/components.css b/web/src/styles/components.css
 index 8b2ee99..6a14515 100644
 --- a/web/src/styles/components.css

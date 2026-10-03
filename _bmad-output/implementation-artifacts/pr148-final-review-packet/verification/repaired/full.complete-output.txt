@@ -1,0 +1,968 @@
+
+> gru-command@1.0.0 pretest
+> node tools/patch-vitest-rpc-timeout.mjs
+
+vitest-rpc-timeout: already patched node_modules/vitest/dist/chunks/rpc.-pEldfrD.js
+vitest-rpc-timeout: 0 file(s) patched this run, 1 checked
+
+> gru-command@1.0.0 test
+> npm run lint && npm run typecheck && npm run build && vitest run && npm run test:web
+
+
+> gru-command@1.0.0 lint
+> eslint .
+
+
+> gru-command@1.0.0 typecheck
+> tsc --noEmit -p tsconfig.test.json
+
+
+> gru-command@1.0.0 build
+> tsc && node -e "const fs=require('node:fs'); fs.mkdirSync('dist/runtime',{recursive:true}); fs.copyFileSync('src/runtime/review-mcp-server.mjs', 'dist/runtime/review-mcp-server.mjs')" && node tools/verify-perkins-resource.mjs . && node tools/write-build-rev.mjs
+
+{"loadedFile":"<LANE_WORKTREE>/resources/perkins-code-review/policy.json","bridgeFile":"<LANE_WORKTREE>/dist/runtime/review-mcp-server.mjs","policySha256":"5622da6b100dff79cda29147cb7a3ecd8dd5e0e4905b8bcfb4dcd22f58dfb6a9","bridgeSha256":"badd96c16800cffb9e18734f777d40d423b72423b89debed5684ad42c62f2032","canonicalSourceSha256":"f38c28ffb10b4e44fa1f87f260a08507bb0a5c8872de2cf47e05a985c5eb92e7","residueScan":{"scannedBytes":629731,"scannedFiles":33}}
+build rev 9ba863746da8a0af3b6f20c00d3cb08acc95f28c → <LANE_WORKTREE>/dist/build-rev.json
+
+ RUN  v3.2.7 <LANE_WORKTREE>
+
+(node:84049) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:84050) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:84047) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ test/perkins-freeze-freshhead.test.ts (24 tests) 160100ms
+   ✓ fresh PR head resolution (freeze source of truth) > uses the freshly fetched origin tip when the recorded local branch is stale  4805ms
+   ✓ fresh PR head resolution (freeze source of truth) > keeps the happy path intact when recorded == fetched == PR head  2711ms
+   ✓ fresh PR head resolution (freeze source of truth) > rejects a fetched tip that disagrees with the live code-host head  4056ms
+   ✓ fresh PR head resolution (freeze source of truth) > freezes the PR head branch even when the lane candidate names another branch  3630ms
+   ✓ fresh PR head resolution (freeze source of truth) > fails closed when the branch cannot be fetched fresh  1515ms
+   ✓ fresh PR head resolution (freeze source of truth) > wraps a failing host probe as probe-failed  2024ms
+   ✓ fresh PR head resolution (freeze source of truth) > classifies branch candidates and leaves SHAs, tags, and expressions as pins  3624ms
+   ✓ freeze-time integration on PR rounds > runs a PR round against the fetched origin tip, not the recorded lane ref  10572ms
+   ✓ freeze-time integration on PR rounds > aborts a PR round before any lens when the code-host head disagrees with the fetched tip  5084ms
+   ✓ freeze-time integration on PR rounds > keeps an explicit commit pin reviewable without fetching or probing the host  7023ms
+   ✓ freeze-time integration on PR rounds > freezes a rebase-style lane on the PR head branch, not the un-pushed job lane  10621ms
+   ✓ freeze-time integration on PR rounds > keeps the lane-local resolution for a job with no linked PR  5410ms
+   ✓ freeze-time integration on PR rounds > a non-PR origin/topic target FREEZES the fetched tip, never the stale local tracking ref (Perkins blocker)  12526ms
+   ✓ freeze-time integration on PR rounds > a non-PR origin/topic that was NEVER tracked locally still freezes the remote tip  9624ms
+   ✓ freeze-time integration on PR rounds > a non-PR origin/topic whose fetch fails REFUSES before any round exists  5064ms
+   ✓ freeze-time integration on PR rounds > an explicit HEAD target freezes the LANE commit when host and lane HEADs diverged (Perkins R3)  6340ms
+   ✓ freeze-time integration on PR rounds > a remote-only origin/topic on a linked PR NEVER bypasses PR-head verification — the PR head is frozen (Perkins R3)  10423ms
+   ✓ freeze-time integration on PR rounds > an origin-prefixed REVISION PIN (origin/feature/lane~1) on a linked PR freezes the named ancestor, never the live PR tip (Perkins R4)  9124ms
+   ✓ freeze-time integration on PR rounds > an origin-prefixed REVISION PIN (origin/feature/lane~1) on a non-PR round resolves the named ancestor — no literal branch fetch (Perkins R4)  8903ms
+   ✓ freeze-time integration on PR rounds > a SHORT origin/topic spelling COLLIDING with a real remote branch follows PR verification — the local tag never bypasses it (Perkins r6 B2)  9820ms
+   ✓ freeze-time integration on PR rounds > a FULLY QUALIFIED refs/tags/origin/topic pin is preserved even when the remote branch collides (Perkins r6 B2)  8291ms
+   ✓ freeze-time integration on PR rounds > an explicit TAG pin origin/v1 on a linked PR stays frozen — never silently replaced by the live PR head (Perkins R5)  8130ms
+   ✓ freeze-time integration on PR rounds > an explicit TAG pin origin/v1 on a non-PR round freezes the tag — consistent routing  8219ms
+   ✓ freeze-time integration on PR rounds > aborts before any round when the resolved PR head ref fetches nothing  2551ms
+Cloning into '/var/folders/nq/6t6pwfkn64lg6tmkf8pky3wh0000gn/T/gru-command-fixture-home-4majkx/gru-command'...
+Cloning into '/var/folders/nq/6t6pwfkn64lg6tmkf8pky3wh0000gn/T/gru-command-fixture-home-pwIztm/gru-command'...
+install.sh: build did not produce dist/runtime/review-mcp-server.mjs
+Cloning into '/var/folders/nq/6t6pwfkn64lg6tmkf8pky3wh0000gn/T/gru-command-fixture-home-Li26Xm/gru-command'...
+Cloning into '/var/folders/nq/6t6pwfkn64lg6tmkf8pky3wh0000gn/T/gru-command-fixture-home-pkGPK7/gru-command'...
+From file:///var/folders/nq/6t6pwfkn64lg6tmkf8pky3wh0000gn/T/gru-command-fixture-src-VRvMHI
+   5b182c1..0713fba  main       -> origin/main
+From file:///var/folders/nq/6t6pwfkn64lg6tmkf8pky3wh0000gn/T/gru-command-fixture-src-C9GhDP
+   2f08f5e..e8d16bc  main       -> origin/main
+Cloning into '/var/folders/nq/6t6pwfkn64lg6tmkf8pky3wh0000gn/T/gru-command-fixture-home-CSV9xW/gru-command'...
+install.sh: refusing to update a dirty checkout: /var/folders/nq/6t6pwfkn64lg6tmkf8pky3wh0000gn/T/gru-command-fixture-home-CSV9xW/gru-command
+install.sh: commit, stash, or remove local changes first; nothing was pulled
+Cloning into '/var/folders/nq/6t6pwfkn64lg6tmkf8pky3wh0000gn/T/gru-command-fixture-home-ycd97r/gru-command'...
+From file:///var/folders/nq/6t6pwfkn64lg6tmkf8pky3wh0000gn/T/gru-command-fixture-src-smM1q8
+   f2d498d..50b4b5b  main       -> origin/main
+hint: Diverging branches can't be fast-forwarded, you need to either:
+hint:
+hint: 	git merge --no-ff
+hint:
+hint: or:
+hint:
+hint: 	git rebase
+hint:
+hint: Disable this message with "git config set advice.diverging false"
+fatal: Not possible to fast-forward, aborting.
+install.sh: fast-forward-only update failed; resolve divergence manually (no reset was attempted)
+Cloning into '/var/folders/nq/6t6pwfkn64lg6tmkf8pky3wh0000gn/T/gru-command-fixture-home-bykTAr/gru-command'...
+install.sh: refusing to restart unrelated service unit: /var/folders/nq/6t6pwfkn64lg6tmkf8pky3wh0000gn/T/gru-command-fixture-home-bykTAr/Library/LaunchAgents/com.gru-command.service.plist
+
+> gru-command@1.0.0 prepack
+> node -e "const fs=require('node:fs'); for (const path of ['dist','web/dist']) fs.rmSync(path,{recursive:true,force:true})" && npm run build:web && npm run build
+
+
+> gru-command@1.0.0 build:web
+> npm run build -w web
+
+
+> @gru-command/web@1.0.0 build
+> tsc --noEmit -p tsconfig.json && vite build
+
+
+> gru-command@1.0.0 build
+> tsc && node -e "const fs=require('node:fs'); fs.mkdirSync('dist/runtime',{recursive:true}); fs.copyFileSync('src/runtime/review-mcp-server.mjs', 'dist/runtime/review-mcp-server.mjs')" && node tools/verify-perkins-resource.mjs . && node tools/write-build-rev.mjs
+
+install.sh: refusing to overwrite unrelated service unit: /var/folders/nq/6t6pwfkn64lg6tmkf8pky3wh0000gn/T/gru-command-fixture-home-DTu4x4/Library/LaunchAgents/com.gru-command.service.plist
+install.sh: the installed unit does not target repo /var/folders/nq/6t6pwfkn64lg6tmkf8pky3wh0000gn/T/gru-command-fixture-src-faWkPZ and instance /var/folders/nq/6t6pwfkn64lg6tmkf8pky3wh0000gn/T/gru-command-fixture-home-DTu4x4/.gru-command
+install.sh: refusing to uninstall unrelated service unit: /var/folders/nq/6t6pwfkn64lg6tmkf8pky3wh0000gn/T/gru-command-fixture-home-DTu4x4/Library/LaunchAgents/com.gru-command.service.plist
+install.sh: refusing to uninstall unrelated service unit: /var/folders/nq/6t6pwfkn64lg6tmkf8pky3wh0000gn/T/gru-command-fixture-home-DTu4x4/Library/LaunchAgents/com.gru-command.service.plist
+install.sh: refusing to uninstall unrelated service unit: /var/folders/nq/6t6pwfkn64lg6tmkf8pky3wh0000gn/T/gru-command-fixture-home-DTu4x4/Library/LaunchAgents/com.gru-command.service.plist
+stdout | test/perkins-builtin-wave.test.ts > repair pass 3: GitHub receipt identity, state, and pagination (R4/R5/R6/R13) > finds a correctly bound authored match beyond page one (R4)
+P3PAGE calls: [[],["user"],["repos/acme/widget/pulls/42/reviews?per_page=100&page=1"],["repos/acme/widget/pulls/42/reviews?per_page=100&page=2"]]
+
+install.sh: --answers is only valid with setup mode, but mode is --print — pass --answers alone (setup is the default)
+install.sh: --answers is only valid with setup mode, but mode is --print — pass --answers alone (setup is the default)
+install.sh: --update requires an existing configured instance at /var/folders/nq/6t6pwfkn64lg6tmkf8pky3wh0000gn/T/gru-command-update-no-config-home-xtWwIE/.gru-command/config.toml
+install.sh: run setup without --update for a fresh installation
+install.sh: refusing to update checkout with unexpected origin: /var/folders/nq/6t6pwfkn64lg6tmkf8pky3wh0000gn/T/gru-command-fixture-home-Qt8Ybr/gru-command
+install.sh: expected: file:///var/folders/nq/6t6pwfkn64lg6tmkf8pky3wh0000gn/T/gru-command-fixture-src-A5zbR3
+install.sh: actual:   file:///var/folders/nq/6t6pwfkn64lg6tmkf8pky3wh0000gn/T/gru-command-fixture-src-MrfUOW
+Cloning into '/var/folders/nq/6t6pwfkn64lg6tmkf8pky3wh0000gn/T/gru-command-clonefail-home-ErOUt8/gru-command'...
+fatal: '/var/folders/nq/6t6pwfkn64lg6tmkf8pky3wh0000gn/T/gru-command-clonefail-home-ErOUt8/no-such-origin-repo' does not appear to be a git repository
+fatal: Could not read from remote repository.
+
+Please make sure you have the correct access rights
+and the repository exists.
+install.sh: re-exec landed outside a product checkout: /var/folders/nq/6t6pwfkn64lg6tmkf8pky3wh0000gn/T/gru-command-reexec-bare-JtAwWY
+install.sh: (the clone target must be a Gru Command checkout: package.json named gru-command + src/ + install.sh + .git)
+install.sh: unknown flag: --bogus (valid: --update, --no-interact, --answers <json>, --force, --service, --print, --uninstall, -h|--help)
+install.sh: dist/main.js not found — run 'npm install && npm run build' in /var/folders/nq/6t6pwfkn64lg6tmkf8pky3wh0000gn/T/gru-command-fixture-src-1Qmt6b first
+install.sh: --answers was given an empty value — for full defaults pass --answers '{}'
+install.sh: node >= 22.19 required, found v18.20.0 — upgrade Node.js first
+install.sh: node >= 22.19 required, found v18.20.0 — upgrade Node.js first
+ ✓ test/install-one-line.test.ts (35 tests | 4 skipped) 197014ms
+   ✓ install.sh setup mode (one-line path) > piped install: clones when absent → deps → build → wizard (marker written)  7608ms
+   ✓ install.sh setup mode (one-line path) > fails closed before setup when the built Perkins MCP bridge is missing  7032ms
+   ✓ install.sh setup mode (one-line path) > a newly recreated clone preserves a retained instance config instead of rerunning setup  7539ms
+   ✓ install.sh setup mode (one-line path) > literal cat|bash install keeps prompts on /dev/tty and completes in one invocation  6533ms
+   ✓ install.sh setup mode (one-line path) > second run fast-forwards the existing clean checkout, preserves config, and does not re-run wizard  13420ms
+   ✓ install.sh setup mode (one-line path) > fast-forwards an old target before executing target-local installer logic  7696ms
+   ✓ install.sh setup mode (one-line path) > refuses a dirty existing checkout before pull/build and preserves its config  7965ms
+   ✓ install.sh setup mode (one-line path) > refuses a non-fast-forward divergent checkout without reset  9688ms
+   ✓ install.sh setup mode (one-line path) > restarts only an owned service and refuses a foreign unit with the same public name  21492ms
+   ✓ install.sh setup mode (one-line path) > --no-interact + absent unit: the updater REGISTERS the service (unit written + manager called)  10529ms
+   ✓ install.sh setup mode (one-line path) > interactive + absent unit + default answer: prompts, then REGISTERS the service  12635ms
+   ✓ install.sh setup mode (one-line path) > interactive + absent unit + decline: NO install, recovery hint, exit success  11861ms
+   ✓ install.sh setup mode (one-line path) > piped cat|bash updater + absent unit: prompt reads the TTY, not the script pipe (decline)  13910ms
+   ✓ install.sh setup mode (one-line path) > headless run (no terminal, no --no-interact): defaults to REGISTER with a stderr notice  10911ms
+   ✓ install.sh setup mode (one-line path) > in-service restart delegates to gru-service roll and never unload/loads  736ms
+   ✓ install.sh setup mode (one-line path) > in-service pty update (absent unit): no prompt hang — auto-registers with a notice  8452ms
+   ✓ install.sh setup mode (one-line path) > direct --service/--uninstall also enforce exact unit ownership  10733ms
+   ✓ install.sh setup mode (one-line path) > inside a clone: no flags clone the product — deps+build+wizard only  6098ms
+   ✓ install.sh setup mode (one-line path) > --no-interact alone completes with documented defaults and never opens the TTY  5705ms
+   ✓ install.sh setup mode (one-line path) > --answers=<json> equals-form parses identically (wizard marker written)  5776ms
+   ✓ install.sh setup mode (one-line path) > rejects update without a config and refuses a pre-positioned checkout from another origin  3523ms
+   ✓ install.sh setup mode (one-line path) > clone failure (bad GRU_COMMAND_ORIGIN) exits non-zero with a named error  1142ms
+   ✓ install.sh setup mode (one-line path) > re-exec guard: GRU_COMMAND_REEXEC=1 outside a checkout exits 1, named  380ms
+   ✓ install.sh E7 flag contracts (re-pinned) > --print renders the platform unit absolutely; changes nothing  409ms
+   ✓ install.sh E7 flag contracts (re-pinned) > --service refuses loudly when dist/main.js is missing  1227ms
+   ✓ node version gate (>= 22.19) — Perkins r1 W11 > --service mode gates before unit registration  525ms
+(node:2545) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ test/worktree-manager.test.ts (72 tests) 367950ms
+   ✓ worktree manager: creation (ruling 18a/b/d/e) > creates a job worktree on its own branch at the CURRENT fresh head, registered in the ledger  2331ms
+   ✓ worktree manager: creation (ruling 18a/b/d/e) > applies the bootstrap manifest automatically at creation  1888ms
+   ✓ worktree manager: creation (ruling 18a/b/d/e) > provisions full verification in a fresh job lane without local BMAD onboarding  8651ms
+   ✓ worktree manager: creation (ruling 18a/b/d/e) > rejects a configured but invalid BMAD source rather than skipping bootstrap  3198ms
+   ✓ worktree manager: creation (ruling 18a/b/d/e) > rolls the worktree back when the bootstrap manifest fails  1865ms
+   ✓ worktree manager: creation (ruling 18a/b/d/e) > resolves a FRESH head per creation — a later job starts at the advanced head, not a held sha  3210ms
+   ✓ worktree manager: creation (ruling 18a/b/d/e) > serializes same-repo creation (ruling 18e): concurrent creates all land, each own lane  3710ms
+   ✓ worktree manager: creation (ruling 18a/b/d/e) > creates review worktrees DETACHED — no branch, ever (ruling 18d)  3065ms
+   ✓ worktree manager: creation (ruling 18a/b/d/e) > refuses a reused branch or path for a second job lane  2548ms
+   ✓ base resolution (owner incident 2026-09-23): the lane branches from FETCHED origin, never the host clone > freshHead fetches origin, then the created lane branches from the fetched sha  5773ms
+   ✓ base resolution (owner incident 2026-09-23): the lane branches from FETCHED origin, never the host clone > resolves the repo default branch (remote HEAD) — never a hardcoded main  5596ms
+   ✓ base resolution (owner incident 2026-09-23): the lane branches from FETCHED origin, never the host clone > fetch failure falls back to local HEAD with the degrade VISIBLE (registry + event + FYI sink)  3155ms
+   ✓ base resolution (owner incident 2026-09-23): the lane branches from FETCHED origin, never the host clone > review lanes never check out a stale origin tip: the tracking ref is fetched first  5605ms
+   ✓ base resolution (owner incident 2026-09-23): the lane branches from FETCHED origin, never the host clone > a review ref that names origin REFUSES to degrade silently when the fetch fails  2492ms
+   ✓ base resolution (owner incident 2026-09-23): the lane branches from FETCHED origin, never the host clone > a review ref naming origin/HEAD resolves through the fetched default branch  5285ms
+   ✓ base resolution (owner incident 2026-09-23): the lane branches from FETCHED origin, never the host clone > release re-resolves the FETCHED origin head — follow-on work starts from the fetched tip  6101ms
+   ✓ base resolution (owner incident 2026-09-23): the lane branches from FETCHED origin, never the host clone > a remote default RENAME wins over the stale cached origin/HEAD (Perkins blocker)  5639ms
+   ✓ base resolution (owner incident 2026-09-23): the lane branches from FETCHED origin, never the host clone > a checked-out FEATURE branch is never taken for the default (no cached origin/HEAD, origin unreachable)  2285ms
+   ✓ base resolution (owner incident 2026-09-23): the lane branches from FETCHED origin, never the host clone > a SUCCESSFUL probe without a HEAD symref is authoritative — the stale cached default is never fetched or labeled origin (Perkins R5)  4981ms
+   ✓ base resolution (owner incident 2026-09-23): the lane branches from FETCHED origin, never the host clone > a FAILED live probe with a FETCHABLE cached default is declared fallback — never mislabeled origin (Perkins r6 B1)  6071ms
+   ✓ base resolution (owner incident 2026-09-23): the lane branches from FETCHED origin, never the host clone > an UNTOUCHED lane based ahead of the host releases with its branch DELETED (Perkins r6 W1)  7336ms
+   ✓ base resolution (owner incident 2026-09-23): the lane branches from FETCHED origin, never the host clone > a credential-bearing fetch failure is REDACTED in the fallback FYI (Perkins r6 W3)  2384ms
+   ✓ base resolution (owner incident 2026-09-23): the lane branches from FETCHED origin, never the host clone > a review ref naming origin/HEAD REFUSES an UNVERIFIED cache-guessed default (the r6 B1 review arm, pinned)  2623ms
+   ✓ base resolution (owner incident 2026-09-23): the lane branches from FETCHED origin, never the host clone > a review ref naming origin/HEAD REFUSES when the default is unresolvable (the refusal arm, pinned)  1688ms
+   ✓ base resolution (owner incident 2026-09-23): the lane branches from FETCHED origin, never the host clone > a force-pushed remote orphans the lane base — the branch is RETAINED and the old tip stays reachable (Perkins R7)  8562ms
+   ✓ base resolution (owner incident 2026-09-23): the lane branches from FETCHED origin, never the host clone > an OFFLINE force-push release retains — the stale tracking ref witnesses nothing (Perkins R8)  9135ms
+   ✓ base resolution (owner incident 2026-09-23): the lane branches from FETCHED origin, never the host clone > a DELETED remote default on release retains — the stale tracking ref witnesses nothing (Perkins R8)  6800ms
+   ✓ base resolution (owner incident 2026-09-23): the lane branches from FETCHED origin, never the host clone > a force-push through the SWEPT-ROW retry retains — fresh remote state is resolved before disposal (Perkins R8)  8217ms
+   ✓ base resolution (owner incident 2026-09-23): the lane branches from FETCHED origin, never the host clone > a force-push through MISSING-TREE reconciliation retains — fresh remote state is resolved before disposal (Perkins R8)  8142ms
+   ✓ base resolution (owner incident 2026-09-23): the lane branches from FETCHED origin, never the host clone > a RENAMED default never lets the stale old default witness release (Perkins R8)  8393ms
+   ✓ base resolution (owner incident 2026-09-23): the lane branches from FETCHED origin, never the host clone > a STALE lane upstream cannot bypass containment via git branch -d (Perkins R8)  8871ms
+   ✓ base resolution (owner incident 2026-09-23): the lane branches from FETCHED origin, never the host clone > an explicit STALE remote base cannot bypass containment during an offline release (Perkins R8)  8529ms
+   ✓ base resolution (owner incident 2026-09-23): the lane branches from FETCHED origin, never the host clone > an UNREACHABLE origin still consults the cached origin/HEAD as its declared offline guess (retained)  4577ms
+   ✓ base resolution (owner incident 2026-09-23): the lane branches from FETCHED origin, never the host clone > a LOCAL BRANCH named origin/topic cannot shadow the remote — the fetched tip is frozen (Perkins R5)  5544ms
+   ✓ base resolution (owner incident 2026-09-23): the lane branches from FETCHED origin, never the host clone > a TAG named origin/topic cannot shadow the remote — the fetched tip is frozen (Perkins R5)  4778ms
+   ✓ worktree manager: sweep (ruling 18c) > PAUSES on live processes, escalates, and never kills silently  2450ms
+   ✓ worktree manager: sweep (ruling 18c) > confirmKill kills EXACTLY the enumerated pids after re-check, then completes the sweep  3190ms
+   ✓ worktree manager: sweep (ruling 18c) > preserves untracked deliverables FIRST, then removes the tree  3083ms
+   ✓ worktree manager: sweep (ruling 18c) > deletes a merged branch (containment-verified) but RETAINS an unmerged one  6082ms
+   ✓ worktree manager: sweep (ruling 18c) > re-resolves the fresh head at release (follow-on work starts from now)  3744ms
+   ✓ default process enumeration (the pause-and-ask mechanism, ruling 18c) > finds a live process whose command line references the registered tree, and only that tree  5707ms
+   ✓ Perkins r1 B1: quoted deliverables are never destroyed > preserves untracked files with spaces, quotes, and non-ASCII names exactly (--porcelain -z)  1740ms
+   ✓ Perkins r1 B1: quoted deliverables are never destroyed > aborts the sweep (tree intact) when a deliverable cannot be preserved — never sacrifices it  2054ms
+   ✓ Perkins r1 B2: argv matching is path-boundary, sibling lanes are untouchable > a live process rooted in the SIBLING lane is invisible to this lane (real ps)  6263ms
+   ✓ Perkins r1 B3: cwd-rooted processes are caught even with clean argv > finds a process whose working directory is the tree but whose argv names no path  4110ms
+   ✓ Perkins r1 B4: the pause-and-ask join against the DEFAULT enumerator > release() pauses on a real cwd-rooted process: tree intact, no kill, registry evidence  9788ms
+   ✓ Perkins r2 B1: failed bootstrap rollback un-wedges the job id > a failed setup deletes the branch it created — the SAME job id retries cleanly  5315ms
+   ✓ Perkins r2 B2/B3: confirmed kills hit exactly the acknowledged set, for real > kill-confirmed event names the paused pid; the real process dies; the sweep completes  10004ms
+   ✓ Perkins r2 B2/B3: confirmed kills hit exactly the acknowledged set, for real > a SIGTERM-trapping process gets the grace escalation: TERM ignored → SIGKILL → swept  8906ms
+   ✓ Perkins r2 B2/B3: confirmed kills hit exactly the acknowledged set, for real > survivors of BOTH signals re-pause the sweep (branch leg, OS-failure shape)  4087ms
+   ✓ Perkins r2 B2/B3: confirmed kills hit exactly the acknowledged set, for real > confirmKill is NEVER honored without a recorded pause — the ask comes first  4202ms
+   ✓ Perkins r3: the kill contract discriminators (recorded set, not the living set) > DISCRIMINATOR: confirm kills ONLY the acknowledged pid — a later arrival gets its own ask  22706ms
+   ✓ Perkins r3: the kill contract discriminators (recorded set, not the living set) > DISCRIMINATOR: an acknowledged pid that left on its own kills nothing; the newcomer still re-asks  16999ms
+   ✓ Perkins r4 B1: manifest [[link]] lanes are releasable (the link is a deliverable) > DISCRIMINATOR: a symlinked dir lane releases; the link is preserved as a link, not fatal  4999ms
+   ✓ owner incident 2026-09-23: the sweep reaps its OWN spawned services > DISCRIMINATOR: a registry-tracked lane service is reaped on release — no ask, killed for real  9293ms
+   ✓ owner incident 2026-09-23: the sweep reaps its OWN spawned services > NEVER signals a tracked pid that is alive but no longer rooted in the tree (pid-reuse guard)  3787ms
+   ✓ WorktreePort contract: the real WorktreeManager > JOB LANES: id === jobId, kind/status/branch per contract, real directory  1156ms
+   ✓ WorktreePort contract: the real WorktreeManager > DISCOVERY: listWorktrees({jobId}) scopes the job lane + linked review lanes; never id-guessing  1803ms
+   ✓ WorktreePort contract: the real WorktreeManager > RELEASE: sweeps the lane (tree gone, status swept), idempotent on repeat  6137ms
+   ✓ WorktreePort contract: the real WorktreeManager > cleanup  477ms
+   ✓ Perkins lane-B r1: creation registration sits INSIDE the rollback guard > DISCRIMINATOR: a registration failure rolls back tree AND branch — no unregistered debris  3295ms
+   ✓ Perkins lane-B r1: the sweep tail can never strand a non-swept row over a removed tree > DISCRIMINATOR: a tail failure after removal still flips the row swept — no eternal wedge  5664ms
+   ✓ Perkins lane-B r1: the sweep tail can never strand a non-swept row over a removed tree > DISCRIMINATOR: base_branch flows through the confirm-kill tail (no stranded lane on a detached repo)  4037ms
+   ✓ Perkins lane-B r2: the sweep-tail catch leg is PINNED (fires on a real git failure) > DISCRIMINATOR: a post-removal branch-delete failure still flips swept + records sweep-tail-failed  5713ms
+   ✓ Perkins lane-B r2/r3: crash-window reconciliation (row stranded over a removed tree) > DISCRIMINATOR: a CONTAINED lane reconciles swept WITH its branch deleted — no debris, no wedge  5449ms
+   ✓ Perkins lane-B r2/r3: crash-window reconciliation (row stranded over a removed tree) > DISCRIMINATOR: an UNCONTAINED lane reconciles swept with its branch RETAINED — never over-deleted  3910ms
+   ✓ Perkins lane-B r4: a swept row with a surviving branch HEALS on release (no silent debris) > DISCRIMINATOR: swept + tree gone + branch present → release disposes it and reports the true outcome  6205ms
+   ✓ Perkins lane-B r4: a swept row with a surviving branch HEALS on release (no silent debris) > DISCRIMINATOR: a disposal FAILURE during the heal is loud (tail-failed event) and heals on a later retry  6288ms
+ ✓ test/perkins-whole-review.test.ts (77 tests) 403660ms
+   ✓ whole-PR freeze (no chunk partitioning) > freezes a formerly oversized multi-directory diff as ONE whole review with no chunk artifacts  3766ms
+   ✓ whole-PR freeze (no chunk partitioning) > fails closed on UTF-8 byte bounds for frozen diff and spec  5758ms
+   ✓ whole-PR freeze (no chunk partitioning) > rejects writeReviewArtifact traversal and unsafe round ids, and refuses a symlinked frozen tree  4503ms
+   ✓ whole-PR freeze (no chunk partitioning) > rejects freezeReviewInputs ingress conflicts (spec+noSpec, neither) and an empty diff  2424ms
+   ✓ review base resolution > resolves explicit base, origin/HEAD, main fallback, and fails closed with no base  2547ms
+   ✓ Perkins whole-PR lead engine > one lead reviews the whole diff inline, uses no specialists, and completes READY TO MERGE  3584ms
+   ✓ Perkins whole-PR lead engine > specialists see the WHOLE change from their lens and stay isolated children  3867ms
+   ✓ Perkins whole-PR lead engine > uses exactly six specialists in explicit no-spec mode  4077ms
+   ✓ Perkins whole-PR lead engine > a REQUEST_CHANGES review is successful completion, not an orchestration failure  4751ms
+   ✓ Perkins whole-PR lead engine > the verdict is the reviewer's judgment — the host runs no blocker arithmetic  4246ms
+   ✓ Perkins whole-PR lead engine > a coherent report publishes without verbatim per-finding field duplication  4627ms
+   ✓ Perkins whole-PR lead engine > revisits prior findings by judgment alone: a cross-file fix needs no fix_location proof shape  6192ms
+   ✓ Perkins whole-PR lead engine > accepts a same-file additive fix guarded by a helper that is INVOKED, not merely read (N10/R20)  6326ms
+   ✓ Perkins whole-PR lead engine > still-present priors carry their original round marker and are not double-counted  5189ms
+   ✓ Perkins whole-PR lead engine > demands exactly one disposition per prior finding and reports every gap at once  5987ms
+   ✓ Perkins whole-PR lead engine > rejects schema violations exhaustively: bad verdict, bad source, missing keys, bad severity  4217ms
+   ✓ Perkins whole-PR lead engine > rejects an empty/missing verdict, an empty report, and a report omitting the verdict line or frozen identity  15085ms
+   ✓ Perkins whole-PR lead engine > preflight is free and exhaustive; a rejected submission is corrected and accepted within the real attempt bound  5369ms
+   ✓ Perkins whole-PR lead engine > the third real terminal submission is refused even when preflights were free  6913ms
+   ✓ Perkins whole-PR lead engine > a lead that never submits fails the review without approval  3236ms
+   ✓ Perkins whole-PR lead engine > cancellation is always INCOMPLETE, never approval  3461ms
+   ✓ Perkins whole-PR lead engine > a moved source ref rejects a conclusive verdict and accepts only INCOMPLETE  4822ms
+   ✓ Perkins whole-PR lead engine > a failed specialist run is an honest execution fact — never a missing reviewer and never a block  4555ms
+   ✓ Perkins whole-PR lead engine > bounds specialist attempts per lens: a third run after two failures is refused  4207ms
+   ✓ Perkins whole-PR lead engine > refuses duplicate lenses inside one run call and the lead proceeds with one real run  3927ms
+   ✓ Perkins whole-PR lead engine > refuses a specialist rerun of a lens that already has a valid result  3628ms
+   ✓ Perkins whole-PR lead engine > a child citing evidence from another file fails its attempt and a corrected retry is accepted  3940ms
+   ✓ Perkins whole-PR lead engine > serves the exact host rejection as a corrective instruction on the specialist retry  4098ms
+   ✓ Perkins whole-PR lead engine > native-tool specialists submit only through perkins_submit_findings; text is never parsed back  3763ms
+   ✓ Perkins whole-PR lead engine > recovers fenced and preamble-wrapped output for text-path specialists  3973ms
+   ✓ Perkins whole-PR lead engine > exposes a bounded prior-revision reader only on re-review and reads real frozen deltas  9278ms
+   ✓ Perkins whole-PR lead engine > exposes bounded store-artifact and refuses duplicates  4059ms
+   ✓ Perkins whole-PR lead engine > loads a legacy schemaVersion-2 hybrid prior record read-only and requires honest dispositions  6231ms
+   ✓ whole-PR engine: independent-review repairs > an over-bound specialist batch commits its real runs and never hides them as unused (B7)  5952ms
+   ✓ whole-PR engine: independent-review repairs > refusals that a child would satisfy are checked before any spawn (B7)  3364ms
+   ✓ whole-PR engine: independent-review repairs > a terminal submission is serialized behind an in-flight specialist batch and seals the complete run record (B8)  5087ms
+   ✓ whole-PR engine: independent-review repairs > rejects a lead finding attributed to a lens that never ran (N1)  3777ms
+   ✓ whole-PR engine: independent-review repairs > accepts a provenance-clean lead finding and rejects an unknown source  7594ms
+   ✓ whole-PR engine: independent-review repairs > allows a still-present prior to refresh its citation and severity while keeping its origin (N2)  5350ms
+   ✓ whole-PR engine: independent-review repairs > strips legacy v2 chunk fields from newly written v3 records (N9)  5636ms
+   ✓ whole-PR engine: independent-review repairs > rejects a report that reads issue-free beside retained findings (B10 coherence)  3919ms
+   ✓ whole-PR engine: independent-review repairs > bounds the report by exact UTF-8 bytes including multibyte overflow (C123)  6449ms
+   ✓ whole-PR engine: independent-review repairs > marks a native-tool child that never calls the tool invalid even with finding-shaped text (C079)  4261ms
+   ✓ whole-PR engine: independent-review repairs > prior-revision listing is truthful for added and deleted files (N3/E1)  7559ms
+   ✓ whole-PR engine: independent-review repairs > prior-revision path reads defeat -diff attributes and refuse ambiguous selections (N3/H7/H8)  9014ms
+   ✓ whole-PR engine: six-blocker specialist-cleanup repairs (T13) > keeps a settled valid result when its dispose rejects, recording the cleanup failure distinctly  5692ms
+   ✓ whole-PR engine: six-blocker specialist-cleanup repairs (T13) > records a failed child alongside its cleanup error without faking success  3787ms
+   ✓ whole-PR engine: six-blocker specialist-cleanup repairs (T13) > commits successful siblings when another sibling dispose rejects  4518ms
+   ✓ whole-PR engine: six-blocker specialist-cleanup repairs (T13) > seals a terminal submission only after a gated sibling batch with a dispose rejection commits  4130ms
+   ✓ packaged product and terminal-frame coverage (N6) > packs, extracts, verifies, and MCP-smokes the rebuilt source-free product under an empty home  63467ms
+   ✓ whole-PR engine: repair pass 3 > keeps a settled valid result when recording its dispose failure ALSO fails, disclosing the recording gap (R10)  4584ms
+   ✓ whole-PR engine: repair pass 3 > durably marks over-bound specialist batches as findings never delivered to the lead (R17)  5142ms
+   ✓ whole-PR engine: repair pass 3 > refuses to credit a valid-but-empty lens for a lead-invented finding (R12)  5430ms
+   ✓ whole-PR engine: repair pass 3 > rejects a clean-claiming report that names only one of several retained findings (T11)  4786ms
+   ✓ whole-PR engine: repair pass 3 > accepts nuanced prose that still accounts for every retained finding (T11)  4269ms
+   ✓ whole-PR engine: repair pass 3 > handles Git-quoted prior paths and refuses nonexistent or directory-masquerading selections (R11)  7757ms
+   ✓ whole-PR engine: repair pass 3 > lists a deleted prior file truthfully as {status:"D"} with newPath null (T15)  5380ms
+   ✓ whole-PR engine: repair pass 3 > delivers the LAST-file sentinel of a >3000-line multi-file diff to BOTH the lead and specialist prompts (R18)  5339ms
+   ✓ wave refusals never consume lens or round budget (H1) > a refused batch keeps its full attempt budget: re-batched invalid run still gets its policy retry  4119ms
+   ✓ wave refusals never consume lens or round budget (H1) > repeated refusals from a stubborn lead exhaust nothing: every lens still runs  4212ms
+   ✓ provider pacing: combined review-turn gate (owner heist 2026-09-29) > a lead waiting on its lens wave yields its slot: the round cannot wedge and the cap still holds (r5 liveness)  3755ms
+   ✓ provider pacing: combined review-turn gate (owner heist 2026-09-29) > runs an unlimited review gate without any queue events (behavior-preserving default)  4787ms
+   ✓ provider pacing: combined review-turn gate (owner heist 2026-09-29) > a failed lead-slot re-acquire keeps the settled lens runs committed (T13/R17)  4032ms
+   ✓ provider pacing: workflow rate-limit retry and cleanup > lead and lens in-band rate limits retry automatically, release slots during backoff, and record evidence  4634ms
+   ✓ provider pacing: workflow rate-limit retry and cleanup > lead rate-limit retries exhaust at the configured bound and retain the original failure  3774ms
+   ✓ provider pacing: workflow rate-limit retry and cleanup > non-rate-limit lead errors are not retried  3431ms
+   ✓ provider pacing: workflow rate-limit retry and cleanup > rejecting lead disposal still returns every pacing lease  4324ms
+   ✓ provider pacing: workflow rate-limit retry and cleanup > disabled pacing keeps the normal lens fan-out even with configured caps  4034ms
+   ✓ provider pacing: workflow rate-limit retry and cleanup > a failed lead re-acquire ends the round instead of running later turns ungated (r5 edge#0)  3348ms
+   ✓ provider pacing: workflow rate-limit retry and cleanup > shares one turn budget across retries: an elapsed retry never invokes the model (r4 verification#1)  4262ms
+ ✓ test/wizard.test.ts (27 tests) 90856ms
+   ✓ wizard CLI surface > interactive mode without a TTY exits 2 printing the terminal recovery command (Perkins r1 B1)  5352ms
+   ✓ wizard CLI surface > noninteractive deterministic BMAD failure fails loud without offering retry; explicit skip completes (gh-32)  27572ms
+   ✓ wizard CLI surface > noninteractive hint-less deterministic failures name the neutral deliberate repair (gh-32 final review)  7735ms
+   ✓ wizard CLI surface > noninteractive deleted recorded binding after successful onboard fails loud skip-only with the installer hint (gh-32 r1)  15288ms
+   ✓ wizard CLI surface > --answers without a JSON argument exits 2 with usage  5189ms
+   ✓ wizard CLI surface > --answers rejects secrets (token) and non-object JSON with the documented errors  21379ms
+   ✓ wizard CLI surface > pre-flight port check: an occupied fixed port fails LOUD with stop-first guidance, nothing written (Perkins r2 H2)  5150ms
+   ✓ wizard first-boot smoke — failure modes (I/O matrix) > a service that never answers /health fails loud NAMING the missing signal  2257ms
+   ✓ wizard first-boot smoke — failure modes (I/O matrix) > a service that exits before listening fails loud naming the exit  420ms
+ ✓ test/dispatch-server.test.ts (24 tests) 105360ms
+   ✓ dispatch server (E8) > dispatches a job: 202 with the lane, minion spawned in the worktree, board record lives  2167ms
+   ✓ dispatch server (E8) > returns a durable 202 review receipt to an implementing minion without waiting on its open turn  2984ms
+   ✓ dispatch server (E8) > records the PR link and kicks a review wave  12097ms
+   ✓ dispatch server (E8) > accepts explicit no_spec=true as six lenses and rejects non-boolean no_spec  8141ms
+   ✓ dispatch server (E8) > rejects traversal and overlong job ids while accepting the 128-character boundary  2705ms
+   ✓ dispatch server (E8) > routes a failed pre-flight to the bmad-review fallback gate over HTTP  3460ms
+   ✓ dispatch server (E8) > keeps the Perkins route annotated when the pre-flight passes  7172ms
+   ✓ dispatch server (E8) > by=silas on the pr/review endpoints records silas attribution events; without by it does not  20321ms
+   ✓ dispatch server (E8) > re-arms one proven same-head service-restart abort through the guarded Silas review API  11892ms
+   ✓ dispatch server (E8) > /api/silas/directive routes to the live minion, flips the lane back to working, records the event  4276ms
+   ✓ dispatch server (E8) > /api/silas/directive answers undelivered (never a delivery) when the bounded retry exhausts  2954ms
+   ✓ dispatch server (E8) > /api/silas/rebrief keeps its durable markers pending when the bounded retry exhausts  3069ms
+   ✓ dispatch server (E8) > /api/silas/rebrief retires the live minion and re-briefs a FRESH one on the same lane  4097ms
+   ✓ dispatch server (E8) > /api/silas/rebrief persists request markers before the worker and clears them only when the events land  3874ms
+   ✓ dispatch server (E8) > /api/silas/directive on a lane with no reachable minion answers 502 undelivered; terminal jobs refuse  1347ms
+   ✓ dispatch server (E8) > the follow-up delivery signal arms the re-review only when the lane head moved past the reviewed target  4846ms
+   ✓ dispatch server (E8) > /api/silas/directive on a lane with no live minion spawns a fresh one, delivers, and disposes it  3323ms
+   ✓ provider pacing worker-gate pass-through on the silas routes (r4 verification#2) > /api/silas/directive queues at the cap and is admitted on release  2585ms
+   ✓ provider pacing worker-gate pass-through on the silas routes (r4 verification#2) > /api/silas/rebrief queues at the cap and is admitted on release  3267ms
+Preparing worktree (detached HEAD fbbd2ea)
+ ✓ test/perkins-builtin-wave.test.ts (92 tests) 469554ms
+   ✓ GitHub SHA-bound Perkins delivery > delivers on head equality even when the recorded base is stale, and refuses a moved head  1943ms
+   ✓ GitHub SHA-bound Perkins delivery > refuses a zero-exit POST with no parsable or unbound receipt, and reconciles an ambiguous post by head+body  5310ms
+   ✓ GitHub SHA-bound Perkins delivery > requires a provider commit binding on GitHub creation and reconciliation (T5)  8542ms
+   ✓ WaveRunner built-in Perkins production path > acknowledges a busy implementing minion without an open review turn, and restores the queued handoff after restart  1282ms
+   ✓ WaveRunner built-in Perkins production path > holds a reserved round pending while admission waits, admits to live, and cancels cleanly  6443ms
+   ✓ WaveRunner built-in Perkins production path > fails closed on bundled-policy setup errors before a round or reviewer spawn  1126ms
+   ✓ WaveRunner built-in Perkins production path > rejects an empty/unreviewable diff before promising a live round and releases setup state  3186ms
+   ✓ WaveRunner built-in Perkins production path > shutdown waits for active setup, aborts its pending round, and releases the created lane  2202ms
+   ✓ WaveRunner built-in Perkins production path > shutdown aborts an active blocked lead with durable INCOMPLETE proof and lane cleanup  4448ms
+   ✓ WaveRunner built-in Perkins production path > reconciles an interrupted live round as durable INCOMPLETE before startup continues  2294ms
+   ✓ WaveRunner built-in Perkins production path > does not let a swept lane hide an interrupted pending round during recovery  1656ms
+   ✓ WaveRunner built-in Perkins production path > sweeps a detached review lane left behind after its round was already terminalized  2355ms
+   ✓ WaveRunner built-in Perkins production path > completes a delivered verdict after restart without reposting or marking it incomplete  4687ms
+   ✓ WaveRunner built-in Perkins production path > terminalizes a workflow schema exception and preserves an INCOMPLETE report before sweep  12482ms
+   ✓ WaveRunner built-in Perkins production path > records an honest lens error when every specialist attempt fails, while the lead-owned review still completes  8215ms
+   ✓ WaveRunner built-in Perkins production path > audits the last complete predecessor across an incomplete middle round  17721ms
+   ✓ WaveRunner built-in Perkins production path > withholds a built-in verdict when PR delivery rejects or is absent  17350ms
+   ✓ WaveRunner built-in Perkins production path > freezes a detached tree, runs one lead plus tracked children, posts the exact-head report, and sweeps  9717ms
+   ✓ WaveRunner built-in Perkins production path > freezes recorded verification evidence into the review spec context (tests lens ground truth)  6346ms
+   ✓ WaveRunner built-in Perkins production path > invalidates a round when the source ref moves during lead work and never posts approval  6728ms
+   ✓ WaveRunner delivery receipts, reconciliation, prior selection, and disclosure > refuses a poster receipt that is not bound to the reviewed head or body (B2/B5)  45569ms
+   ✓ WaveRunner delivery receipts, reconciliation, prior selection, and disclosure > reconciles an ambiguous post failure against provider evidence without a duplicate post (B3)  9791ms
+   ✓ WaveRunner delivery receipts, reconciliation, prior selection, and disclosure > stays honestly unposted when reconciliation finds no matching provider review (B3)  7993ms
+   ✓ WaveRunner delivery receipts, reconciliation, prior selection, and disclosure > fails loudly when the newest completed predecessor record is missing (B9)  11835ms
+   ✓ WaveRunner delivery receipts, reconciliation, prior selection, and disclosure > publishes the host-owned execution/findings disclosure appendix with the review (B10)  7680ms
+   ✓ WaveRunner delivery receipts, reconciliation, prior selection, and disclosure > reconciles an ambiguous post through the PRODUCTION adapter: same provider selection, single POST (T1)  10111ms
+   ✓ WaveRunner delivery receipts, reconciliation, prior selection, and disclosure > recovers a REAL writer round.posted event after a crash between publication and verdict (T2)  11540ms
+   ✓ WaveRunner delivery receipts, reconciliation, prior selection, and disclosure > refuses recovery promotion without the preserved publication artifact and digest (T3)  11355ms
+   ✓ WaveRunner delivery receipts, reconciliation, prior selection, and disclosure > does not record a reconciled delivery when the ref moved or the run aborted during the lookup (T4)  27007ms
+   ✓ bmad-review fallback gate (user amendment 2026-09-20, fork-3) > routes a native preflight failure to persisted fallback history and forwards a recovered snapshot  13574ms
+   ✓ bmad-review fallback gate (user amendment 2026-09-20, fork-3) > triages, routes the blocker fix directive to the minion, re-reviews, and passes clean  5981ms
+   ✓ bmad-review fallback gate (user amendment 2026-09-20, fork-3) > terminates blocked when blockers survive the review bound  8753ms
+   ✓ bmad-review fallback gate (user amendment 2026-09-20, fork-3) > reports both options when the skill is not installed and never reviews  1950ms
+   ✓ bmad-review fallback gate (user amendment 2026-09-20, fork-3) > refuses a direct beginRound when the pre-flight routes to the fallback gate  2800ms
+   ✓ GitLab SHA-bound merge-request delivery > delivers on head equality with a verified note receipt — the recorded base is refreshed, never a refusal  684ms
+   ✓ GitLab SHA-bound merge-request delivery > fails closed on a moved head — before and under the note — plus missing token, origin mismatch, and HTTP failure  2072ms
+   ✓ orphan review-lane recovery > sweeps a review lane whose ledger round is missing  1858ms
+   ✓ WaveRunner request guards > rejects terminal jobs and lane-less jobs at request time without touching state  1860ms
+   ✓ WaveRunner request guards > never completes a conclusive verdict without a PR link: publication is required (B4)  6560ms
+   ✓ poster transport negatives and fallback-gate terminals > resolves the GitLab token as GITLAB_TOKEN falling back to GL_TOKEN  738ms
+   ✓ poster transport negatives and fallback-gate terminals > reports the not-configured variant when no fallbackGate option exists  1062ms
+   ✓ production defaultFallbackReview (BLOCKER-1 fix) > spawns a minion with the skill prompt, parses findings, and reports clear-to-merge on clean  2296ms
+   ✓ production defaultFallbackReview (BLOCKER-1 fix) > the production fallback review takes a worker pacing slot before it spawns  2894ms
+   ✓ production defaultFallbackReview (BLOCKER-1 fix) > a fallback rejection whose automatic retry recovers is parsed as delivered  2642ms
+   ✓ production defaultFallbackReview (BLOCKER-1 fix) > a fallback resolution whose bounded retry exhausts is recorded blocked, never delivered  2522ms
+   ✓ production defaultFallbackReview (BLOCKER-1 fix) > terminalizes blocked when the minion never writes the report file  1768ms
+   ✓ fallback diff includes untracked files (V3 revert-mutation pin) > round-2 diff includes new-file fixes created by the fix directive  3164ms
+   ✓ repair pass 3: GitHub receipt identity, state, and pagination (R4/R5/R6/R13) > refuses a null provider review id instead of stringifying it (R13)  1276ms
+   ✓ repair pass 3: GitHub receipt identity, state, and pagination (R4/R5/R6/R13) > refuses a POST response whose enacted state is not COMMENTED (R6)  1312ms
+   ✓ repair pass 3: GitHub receipt identity, state, and pagination (R4/R5/R6/R13) > refuses a receipt authored by another account than the authenticated poster (R5)  1278ms
+   ✓ repair pass 3: GitHub receipt identity, state, and pagination (R4/R5/R6/R13) > does not reconcile a copied review from another author even on the right commit (R5)  1586ms
+   ✓ repair pass 3: GitHub receipt identity, state, and pagination (R4/R5/R6/R13) > finds a correctly bound authored match beyond page one (R4)  1560ms
+   ✓ repair pass 3: GitHub receipt identity, state, and pagination (R4/R5/R6/R13) > treats an exhausted pagination bound as unresolved, not proof of absence (R4)  3005ms
+   ✓ repair pass 3: GitHub receipt identity, state, and pagination (R4/R5/R6/R13) > resolves the authenticated login PER HOST — two hosts, two accounts (B3)  2961ms
+   ✓ repair pass 3: GitHub receipt identity, state, and pagination (R4/R5/R6/R13) > skips PENDING drafts: only an authored COMMENTED publication reconciles (R6/R5)  1311ms
+   ✓ repair pass 3: provider forms and posting-account discipline > refuses a GitLab POST note authored by another account than the token (V1)  451ms
+   ✓ repair pass 3: GitLab note reconciliation fails closed (R3/T7) > throws unresolved on ANY body-matching authored note: the creation head cannot be proved (R3)  573ms
+   ✓ repair pass 3: GitLab note reconciliation fails closed (R3/T7) > fails closed even when the matching note sits beyond page one (R3/R4)  456ms
+   ✓ repair pass 3: GitLab note reconciliation fails closed (R3/T7) > returns null only when exhaustive pagination finds no authored body match (R4)  479ms
+   ✓ repair pass 3: GitLab note reconciliation fails closed (R3/T7) > treats an exhausted pagination bound as unresolved, never as absence (R4)  503ms
+   ✓ repair pass 3: restart recovery binding contract (R1/R2/R21) > a null or malformed receipt interrupts its own round without crashing recovery of the rest (R1)  3997ms
+   ✓ repair pass 3: restart recovery binding contract (R1/R2/R21) > a matching digest at a FOREIGN path is not this round's publication evidence (R21)  1669ms
+   ✓ repair pass 3: restart recovery binding contract (R1/R2/R21) > a symlinked canonical publication path is refused as an alias (R21)  2170ms
+   ✓ repair pass 3: restart recovery binding contract (R1/R2/R21) > a receipt with an unknown enacted event or foreign PR URL never promotes (R2)  18163ms
+   ✓ repair pass 3: restart recovery binding contract (R1/R2/R21) > promotes ONLY the correctly bound event of the same round (R2 happy path)  2485ms
+   ✓ repair pass 3: publication completeness, GitLab wording, and v2 integration > refuses to publish an over-limit body and preserves complete local evidence (R8)  9851ms
+   ✓ repair pass 3: publication completeness, GitLab wording, and v2 integration > enforces the limit on the FINAL REDACTED bytes — redaction expansion also refuses to publish (B2/E1)  8907ms
+   ✓ repair pass 3: publication completeness, GitLab wording, and v2 integration > persists the NOT-delivered fact on the ledger lens note for an over-bound batch (R17/V2)  10428ms
+   ✓ repair pass 3: publication completeness, GitLab wording, and v2 integration > describes a GitLab delivery as a merge-request note, and pins its persisted receipt actor/event (R7/R16)  9662ms
+   ✓ repair pass 3: publication completeness, GitLab wording, and v2 integration > a REAL WaveRunner round selects and consumes the newest v2 predecessor, leaving it unchanged (N5)  9167ms
+   ✓ repair pass 3: real child-process crash recovery (R19/R16) > recovers a SIGKILLed child between posted event and verdict — unswept lane, no republish  16692ms
+   ✓ durable handoff admission: perkins route, re-busy re-queue, crash/terminal reconciliation > admits a queued handoff to a real perkins round on the default route  5318ms
+   ✓ durable handoff admission: perkins route, re-busy re-queue, crash/terminal reconciliation > re-queues a replay that meets its own lane busy again, then admits on the next delivery  2193ms
+   ✓ durable handoff admission: perkins route, re-busy re-queue, crash/terminal reconciliation > fails closed on a claimed handoff with no terminal marker (crash window) instead of blind replay  1645ms
+   ✓ durable handoff admission: perkins route, re-busy re-queue, crash/terminal reconciliation > reconsiders pending handoffs on the deterministic pass alone — no second API call, no follow-through feature  1582ms
+   ✓ durable handoff admission: perkins route, re-busy re-queue, crash/terminal reconciliation > HOLDS a handoff on a post-intake status flip and rearms only via a genuinely new validated request  1773ms
+   ✓ durable handoff admission: perkins route, re-busy re-queue, crash/terminal reconciliation > boot: a matching REQUEUED after CLAIM is proven no-admission (re-armable); an unmatched CLAIM stays ambiguous fail-closed  3702ms
+   ✓ durable handoff admission: perkins route, re-busy re-queue, crash/terminal reconciliation > reconciles an un-armed handoff on the next genuine observation when the lane went idle without delivery  1771ms
+   ✓ durable handoff admission: perkins route, re-busy re-queue, crash/terminal reconciliation > skips replay for a terminal job truthfully, without failure or escalation  1498ms
+   ✓ provider pacing through WaveRunner > passes review admission and retry policy to the native workflow with round-bound ledger events  9811ms
+(node:54698) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ test/wizard-interactive.test.ts (11 tests) 86214ms
+   ✓ interactive wizard under a pty (Perkins r2 T1) > all-defaults happy path: prompts answered, config written, smoke green  12278ms
+   ✓ interactive wizard under a pty (Perkins r2 T1) > Enter accepts the default-on fresh BMAD action and reaches ready state  8095ms
+   ✓ interactive wizard under a pty (Perkins r2 T1) > deterministic BMAD failure offers skip-only with the deliberate-fix path; Enter skips and setup completes (gh-32)  9820ms
+   ✓ interactive wizard under a pty (Perkins r2 T1) > transient BMAD failure still offers retry; a successful retried attempt completes (gh-32)  11681ms
+   ✓ interactive wizard under a pty (Perkins r2 T1) > already-onboarded deleted runtime binding is skip-only deterministic; a typed retry is refused and only skip completes (gh-32 r1)  16053ms
+   ✓ interactive wizard under a pty (Perkins r2 T1) > every prompt loop retries on invalid input, then accepts the valid answer  5555ms
+   ✓ interactive wizard under a pty (Perkins r2 T1) > managed-repo multi-pick by INDEX selects exactly that repo  5468ms
+   ✓ interactive wizard under a pty (Perkins r2 T1) > managed-repo multi-pick by NAME (comma-separated) selects exactly those repos  5308ms
+   ✓ interactive wizard under a pty (Perkins r2 T1) > bind host rejects y/n tokens and re-prompts; 0.0.0.0 lands in the config (user-found boot bug)  5501ms
+   ✓ interactive wizard under a pty (Perkins r2 T1) > bind host accepts a resolvable hostname (localhost) end-to-end  6067ms
+(node:59522) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ test/verification-server.test.ts (12 tests) 38209ms
+   ✓ POST /api/verify > runs the declared command in the lane worktree and records the outcome + duration  3469ms
+   ✓ POST /api/verify > enforces the global worker budget in the run environment  3583ms
+   ✓ POST /api/verify > records a failed run as an outcome and leaves the job status alone  3475ms
+   ✓ POST /api/verify > surfaces a lock-wait timeout as a loud error frame plus a ledger record  4950ms
+   ✓ POST /api/verify > serializes runs across different jobs/lanes: the second queues until the first releases  6287ms
+   ✓ POST /api/verify > answers 404 for an unknown job  3045ms
+   ✓ POST /api/verify > answers 400 naming the declared scopes for an unknown scope  3011ms
+   ✓ POST /api/verify > answers 409 when the job has no active lane  2735ms
+   ✓ POST /api/verify > answers 409 when the repository declares no verify command  1873ms
+   ✓ POST /api/verify > requires the pairing token  2850ms
+   ✓ POST /api/verify > rejects non-POST methods  2900ms
+Preparing worktree (detached HEAD ff1f14c)
+Preparing worktree (detached HEAD ff1f14c)
+Preparing worktree (detached HEAD ff1f14c)
+Preparing worktree (detached HEAD ff1f14c)
+Preparing worktree (detached HEAD ff1f14c)
+Preparing worktree (detached HEAD ff1f14c)
+Preparing worktree (detached HEAD ff1f14c)
+Preparing worktree (detached HEAD ff1f14c)
+ ✓ test/silas-followthrough.test.ts (2 tests) 32205ms
+   ✓ silas follow-through (no human input) > delivered job → PR registered → review round requested, driven only by the ledger event  11472ms
+   ✓ silas follow-through (no human input) > first NEEDS CHANGES verdict → fix directive → follow-up delivery → re-review → approved, with no human  20728ms
+Preparing worktree (detached HEAD ff1f14c)
+ ✓ test/claude-adapter.test.ts (89 tests) 56105ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > round-trips a prompt: ordered deltas, turn lifecycle, raw frames in the transcript  651ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > runs native /compact in a dedicated resumed process without leaking command text  789ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > dispose kills a held native compact before unlocking and the session resumes  984ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > a native compact failure is bounded and the Claude conversation remains usable  1078ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > does not fake compact success when the slash command succeeds but native compaction fails  2268ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > emits thinking deltas before text when the model reasons  430ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > without partial messages, text and thinking arrive exactly once from complete frames  408ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > maps a tool loop: tool_start once (partials vs complete frame deduped), updates, tool_end  430ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > E7 follow-up: a held-open tool call heartbeats and reports a live process  767ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > reassembles frames split mid-line and mid-multibyte-character (chunked stdout)  600ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > skips blank/garbage lines with a warn log and drops a torn tail at EOF  443ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > in-band error: result is_error resolves the prompt, sticky error state, next turn recovers  773ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > transport failure: non-zero exit without a result frame rejects with the stderr tail  731ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > a turn with no init frame is a protocol violation (identity never verified)  394ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > protocol violation: exit 0 without a result frame rejects loudly  403ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > session-id mismatch on init kills the process and rejects (never a foreign session)  473ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > a concurrent prompt on the raw handle rejects loudly (the wrapper is the serializer)  450ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > dispose mid-turn SIGTERMs the process: prompt rejects disposed, lock released  394ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > a SIGTERM-immune process gets SIGKILL after the grace window  485ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > rejects an empty prompt loudly before any process spawns  501ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > a mid-life binary vanish rejects the turn, latches down, and re-probes on recovery  1211ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > a model-metadata cache failure declines vision but does not block the Claude CLI spawn  392ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > maps "default" to no flags and "provider/model" + level to --model/--effort  1104ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > preflight and spawn pass identical native CLI model tokens without pi metadata  3473ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > pins the user settings-selected default and env credential for probe, lead and lens without ambient settings  1164ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > runs a relative credential helper only in the trusted settings directory, never in the review tree  1335ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > preserves settings OAuth credentials through probe, lead and lens without an inherited API key  867ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > direct isolated overrides honor native model tokens and pin the supplied snapshot  1399ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > cleans credential-bearing probe and failed bridge settings without spawning a session  4170ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > keeps concurrent and successive review proofs independent on the same Claude adapter  1501ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > lets Claude select native defaults in precedence order and keeps slash-containing settings IDs intact  1131ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > rejects an installed CLI that exits nonzero with an auth or model error on stderr  307ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > registry preflight uses the perkins runtime override, not the default pi adapter  673ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > fails loud on malformed model references  432ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > sends images as base64 content blocks in the stdin frame; plain text stays a string  690ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > plumbs cwd, permission mode, role tools, and the role system prompt into argv  741ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > enforces isolated-review tools and disables ambient Claude resources in argv  468ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > starts a scoped bridge for an isolated lens child declaring native tools, exposing exactly them  474ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > starts no bridge and no native allow-list for an isolated review declaring no native tools  431ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > keeps one bridge per child session and closes every bridge on dispose  1931ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > runs a whole-PR Perkins lead through the real Claude adapter and scoped MCP bridge  6058ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > gives an isolated child its own scoped bridge exposing exactly its declared native tools  652ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > resumes a previous session file: --resume pinned, same file appended, history intact  905ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > a spawned-but-never-prompted transcript resumes by adopting the filename uuid  563ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > double-resume of one session file in one process is rejected loudly  479ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > resume of a file locked by another process rejects without touching it  424ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > LockBusyError import sanity: the adapter surfaces the store error type  500ms
+   ✓ ClaudeCodeRuntime over the stubbed CLI double > a second runtime instance sharing one store cannot re-host a live file  640ms
+   ✓ RuntimeRegistry + claude-code (fallback-wrapped) > spawns through the registry with steer wrapped to queued, and reports adapter status  617ms
+   ✓ RuntimeRegistry + claude-code (fallback-wrapped) > steer mid-turn queues (steer-unable) and delivers as a SECOND process after idle  988ms
+   ✓ RuntimeRegistry + claude-code (fallback-wrapped) > followUp mid-turn queues with reason single-writer  644ms
+   ✓ RuntimeRegistry + claude-code (fallback-wrapped) > config-driven ruling-16 policy flows through the registry into argv  1103ms
+   ✓ ReviewMcpBridge bounded protocol failures > cleans the owned temporary directory when chmod fails during startup  1320ms
+   ✓ spawn cwd (SPEC ruling 17 — dispatch roots in the project) > runs the CLI with the explicit project cwd, not the workspace root  731ms
+Preparing worktree (detached HEAD ff1f14c)
+ ✓ test/attachments.test.ts (29 tests) 25319ms
+   ✓ materializeUpload (ruling 19(c): bytes → uploads dir → THAT path) > a hung FOREIGN writer keeps its claimed slot while alive; the slot returns once it dies (r2 W1)  1014ms
+   ✓ materializeUpload (ruling 19(c): bytes → uploads dir → THAT path) > self-owned claim residue is reclaimed immediately — a failed release cannot strand the slot (r2 W2)  990ms
+   ✓ materializeUpload (ruling 19(c): bytes → uploads dir → THAT path) > an abandoned claim (dead owner, aged) is reclaimed and its slot reused  980ms
+   ✓ materializeUpload (ruling 19(c): bytes → uploads dir → THAT path) > legacy reservation markers count until aged, then only dead owners are reclaimed  969ms
+   ✓ materializeUpload (ruling 19(c): bytes → uploads dir → THAT path) > S1 — two real racers at the last slot: exactly one winner (both claims visible to both election scans)  2017ms
+   ✓ materializeUpload (ruling 19(c): bytes → uploads dir → THAT path) > S2 — natural, uninstrumented races keep the hard invariants on every run  6088ms
+   ✓ materializeUpload (ruling 19(c): bytes → uploads dir → THAT path) > S3 — an election scan that misses the peer claim still never overbooks (audit discriminator)  2688ms
+   ✓ materializeUpload (ruling 19(c): bytes → uploads dir → THAT path) > enforces the file-count quota (review r1: unbounded accumulation)  1193ms
+   ✓ browseWorkspace (ruling 19(c): on-disk = PATH, metadata only) > caps the listing and reports truncation (review r1)  563ms
+   ✓ attachments HTTP surface (/api/attach) > maps decoded oversize and raw-body overflow to observable HTTP 413 responses  387ms
+   ✓ attachments HTTP surface (/api/attach) > maps the uploads file-count quota to HTTP 507  1172ms
+(node:78877) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ test/pi-adapter.test.ts (65 tests) 21372ms
+   ✓ PiRuntime over the stub model (offline SDK round-trip) > spawns a session persisted under the instance sessions dir  551ms
+   ✓ PiRuntime over the stub model (offline SDK round-trip) > runs a whole-PR Perkins lead through the production registry and real Pi adapter  5307ms
+   ✓ PiRuntime over the stub model (offline SDK round-trip) > rejects resume for isolated reviews so ambient history cannot cross the boundary  307ms
+   ✓ PiRuntime over the stub model (offline SDK round-trip) > exposes native context usage and a failed native compact keeps the same session usable  366ms
+   ✓ PiRuntime over the stub model (offline SDK round-trip) > successfully compacts through the installed Pi SDK without changing session identity  323ms
+   ✓ PiRuntime over the stub model (offline SDK round-trip) > single-writer: a second owner while a turn is live queues, then delivers in order  312ms
+   ✓ PiRuntime over the stub model (offline SDK round-trip) > pi queue honors opt-in timeoutMs: the caller rejects, the queue survives  340ms
+   ✓ PiRuntime over the stub model (offline SDK round-trip) > resumes a previous session file with history intact (process restart)  365ms
+   ✓ PiRuntime over the stub model (offline SDK round-trip) > does not share a provider-scoped refresh with another provider while preflight and spawn overlap  328ms
+   ✓ Perkins r1 regressions > W6: tool lifecycle events map through (tool_start/tool_end with callId)  311ms
+   ✓ Perkins r1 regressions > E7 follow-up: a long quiet bash run heartbeats and reports a live process  807ms
+   ✓ Perkins r1 regressions > W10: registry status aggregates streaming while a turn is live  328ms
+   ✓ Perkins r1 regressions > B4: double-resume of one session file in one process is rejected loudly  421ms
+   ✓ Perkins r1 regressions > N17: adapter health goes down on infrastructure failure and recovers  438ms
+   ✓ Perkins r2: concurrent double-resume race (B4-race) > the loser never deletes the winner's lock; a foreign writer stays locked out; health stays ok  637ms
+   ✓ Perkins r3: gated-twin scenario (winner-ensures-lock leg) > the surviving twin re-acquires the released lock before hosting  640ms
+real-service: test service: refusing the instance port 7665 — spawn with an ephemeral port (0) or a high-range explicit REAL_SERVICE_PORT override
+real-service: test service: refusing privileged port 80 — use 0 or a high-range explicit override
+real-service: test service: port must be an integer 0-65535, got NaN
+ ✓ test/bmad-onboarding.test.ts (27 tests) 88022ms
+   ✓ per-selected-repo BMAD onboarding > runs the pinned official headless installer with all four defaults and writes narrow idempotent bindings  1744ms
+   ✓ per-selected-repo BMAD onboarding > onboarding and reuse keep fresh clones usable without Git-local BMAD source  2804ms
+   ✓ per-selected-repo BMAD onboarding > explicit reuse upgrades only a verified legacy fingerprint, not changed tooling or legacy caches  3421ms
+   ✓ per-selected-repo BMAD onboarding > refuses traversal and symlinked skill paths before hashing a recorded binding  1794ms
+   ✓ per-selected-repo BMAD onboarding > reuses an existing customized install without changing custom bytes, modules, versions, or local excludes  961ms
+   ✓ per-selected-repo BMAD onboarding > installs both project-local runtime bindings for mixed Pi and Claude role policy  1078ms
+   ✓ per-selected-repo BMAD onboarding > skip touches nothing; partial/network failure remains visible and never writes a ready record  1203ms
+   ✓ per-selected-repo BMAD onboarding > missing-prerequisite failure names the missing tool and never marks ready (failure matrix)  647ms
+   ✓ per-selected-repo BMAD onboarding > the PRODUCTION prerequisite probe executes and detects a missing binary (mutation-kill)  3226ms
+   ✓ per-selected-repo BMAD onboarding > read-only repo fails visibly without a ready record (failure matrix)  734ms
+   ✓ per-selected-repo BMAD onboarding > interrupted/partial install is refused until repaired, never overwritten (failure matrix)  5960ms
+   ✓ per-selected-repo BMAD onboarding > rejects malformed existing manifests and symlinked selected repos without mutation  4653ms
+   ✓ per-selected-repo BMAD onboarding > classifies deterministic state failures as retry-futile and keeps transient failures retryable (gh-32)  12338ms
+   ✓ per-selected-repo BMAD onboarding > already-onboarded missing declared module directory keeps the installer hint before any fingerprint refusal (gh-32 r1)  1417ms
+   ✓ per-selected-repo BMAD onboarding > already-onboarded symlinked declared module directory keeps the installer hint (gh-32 r1)  1239ms
+   ✓ per-selected-repo BMAD onboarding > already-onboarded deleted recorded runtime binding is deterministic with installer guidance, never a futile retry (gh-32 r1)  1227ms
+   ✓ per-selected-repo BMAD onboarding > valid-but-unreadable BMAD control files stay transient and recover on the SAME collected answers (gh-32 r1)  1837ms
+   ✓ per-selected-repo BMAD onboarding > disposable BMAD preflight output failing safety validation stays transient and the next attempt completes (gh-32 r1)  1754ms
+   ✓ per-selected-repo BMAD onboarding > bootstraps isolated copies into a real fresh worktree and fails when a required source module disappears  15911ms
+   ✓ per-selected-repo BMAD onboarding > gh-32 final-review repairs (independent tracked review) > unpaired managed-block markers in worktree.toml are deterministic skip-only, never a futile retry  1784ms
+   ✓ per-selected-repo BMAD onboarding > gh-32 final-review repairs (independent tracked review) > fresh-installer output failing post-install validation stays transient (never skip-only)  1534ms
+   ✓ per-selected-repo BMAD onboarding > gh-32 final-review repairs (independent tracked review) > missing skills root and ENOTDIR root report the root; EACCES stays transient  4181ms
+   ✓ per-selected-repo BMAD onboarding > gh-32 final-review repairs (independent tracked review) > control-file refusals are deterministic skip-only without mutation  2516ms
+   ✓ per-selected-repo BMAD onboarding > gh-32 final-review repairs (independent tracked review) > validateRepo refusals outside the covered pair are deterministic, and EACCES stays transient  1751ms
+   ✓ per-selected-repo BMAD onboarding > gh-32 final-review repairs (independent tracked review) > reuse-path content validator classifications are pinned (final review)  5377ms
+   ✓ per-selected-repo BMAD onboarding > gh-32 final-review repairs (independent tracked review) > a denied manifest read stays transient and recovers on the SAME collected answers  1933ms
+   ✓ per-selected-repo BMAD onboarding > gh-32 final-review repairs (independent tracked review) > ancestor symlink refusals carry the official-installer repair hint for existing installs  1775ms
+ ✓ test/rehearsal.test.ts (4 tests | 2 skipped) 23759ms
+   ✓ hygiene grep (always-on) > scripts/hygiene-grep.sh exists and the tree is clean  10862ms
+   ✓ hygiene grep (always-on) > the gate has teeth: planted personal paths fail it — including allowlist lookalikes (Perkins r2 note)  12890ms
+(node:83945) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ test/branch-idle-guard.test.ts (6 tests) 31044ms
+   ✓ branch-idle guard > refuses the arm with 409 branch_busy while a working lane owns the branch, then passes once it delivers  6085ms
+   ✓ branch-idle guard > force=true overrides the refusal, tags the frozen manifest, and records the override in the event log  7553ms
+   ✓ branch-idle guard > refuses at freeze time when a lane re-opens between arm and freeze  4935ms
+   ✓ branch-idle guard > resolves an explicit target_ref and blocks on a foreign busy lane that owns it  9713ms
+   ✓ branch-idle guard > records a silas.review-deferred note when the auto-arm answers 409  2740ms
+ ✓ test/service-port-guard.test.ts (14 tests) 24344ms
+   ✓ worktree-context service spawns (the acceptance shape) > spawns from a worktree context, picks an EPHEMERAL port, and never touches 7665  8996ms
+   ✓ worktree-context service spawns (the acceptance shape) > REFUSES a worktree-context listen on the configured instance port — loud, named, before binding  4424ms
+   ✓ worktree-context service spawns (the acceptance shape) > honors an explicit GRU_SERVICE_PORT override from a worktree context  10692ms
+(node:89762) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ test/shutdown.test.ts (4 tests) 28578ms
+   ✓ graceful shutdown > a corrupt chat frame log refuses boot — named, before listening  5282ms
+   ✓ graceful shutdown > SIGTERM: stop accepting, exit 0, structured shutdown lines in the data dir log  8781ms
+   ✓ graceful shutdown > SIGINT: same graceful path, exit 0  8967ms
+   ✓ graceful shutdown > invalid config: service refuses to start, exits non-zero with a clear error  5505ms
+(node:90796) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ test/dispatch-e2e.test.ts (5 tests) 32842ms
+   ✓ end-to-end dispatch (E8 story 4) > runs the full heist arc on a fixture repo: briefing → minion on a worktree → board → PR → wave → release  17420ms
+   ✓ end-to-end dispatch (E8 story 4) > blocks the job loudly when the minion cannot be spawned (no half lanes)  4945ms
+   ✓ end-to-end dispatch (E8 story 4) > honors the minion’s briefing completion and failure transitions on the record  3130ms
+   ✓ end-to-end dispatch (E8 story 4) > a PR registered before the turn settles wins: the settle leaves in-review in place  5216ms
+   ✓ end-to-end dispatch (E8 story 4) > a PR link never resurrects a blocked lane (recording only)  2124ms
+real-service: service exited during boot (code 1)
+{"service":"gru-command","version":"1.0.0","pid":93022,"workspace_root":"/var/folders/nq/6t6pwfkn64lg6tmkf8pky3wh0000gn/T/gru-wake-refused-space-9PppFP","data_dir":"/var/folders/nq/6t6pwfkn64lg6tmkf8pky3wh0000gn/T/gru-wake-refused-4ETlNF","config_file":"/var/folders/nq/6t6pwfkn64lg6tmkf8pky3wh0000gn/T/gru-wake-refused-4ETlNF/config.toml","config_loaded":true,"default_runtime":"claude-code","install_id":"f33f1c55-c30b-48d6-9619-25d29f26223c","build_sha":"9ba863746da8a0af3b6f20c00d3cb08acc95f28c","ts":"2026-10-03T08:25:50.603Z","level":"info","msg":"boot"}
+{"path":"/var/folders/nq/6t6pwfkn64lg6tmkf8pky3wh0000gn/T/gru-wake-refused-4ETlNF/uploads","ts":"2026-10-03T08:25:50.609Z","level":"info","msg":"uploads_dir"}
+{"sessions_dir":"/var/folders/nq/6t6pwfkn64lg6tmkf8pky3wh0000gn/T/gru-wake-refused-4ETlNF/sessions","growth_findings":0,"ts":"2026-10-03T08:25:50.620Z","level":"info","msg":"session store ready"}
+{"migrations":10,"applied":10,"ts":"2026-10-03T08:25:50.628Z","level":"info","msg":"ledger schema up to date"}
+{"db_path":"/var/folders/nq/6t6pwfkn64lg6tmkf8pky3wh0000gn/T/gru-wake-refused-4ETlNF/ledger/ledger.db","ts":"2026-10-03T08:25:50.784Z","level":"info","msg":"ledger ready"}
+(node:93022) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+{"host":"127.0.0.1","port":57381,"foreign_pid":90796,"foreign_command":"node","detected":"before","ts":"2026-10-03T08:25:51.547Z","level":"error","msg":"foreign listener owns the instance port — refusing to serve"}
+{"notification_id":"e35cf0e6-aef4-4bf4-a533-367ca5f28bda","routing":"needs-owner","severity":"error","reason":"routing","ts":"2026-10-03T08:25:51.556Z","level":"debug","msg":"gru wake suppressed"}
+{"id":"e35cf0e6-aef4-4bf4-a533-367ca5f28bda","kind":"port-squat","routing":"needs-owner","severity":"error","title":"Foreign process holds port 57381 (pid 90796)","agent_id":null,"ts":"2026-10-03T08:25:51.558Z","level":"warn","msg":"notification posted"}
+
+ ✓ test/worktrees-server.test.ts (3 tests) 22195ms
+   ✓ worktree lane release endpoint (r4) > unauthenticated access is rejected like every product surface  304ms
+   ✓ worktree lane release endpoint (r4) > unknown lanes are honest 404s; a swept lane is not re-releasable  8547ms
+   ✓ worktree lane release endpoint (r4) > ROUND ARM: the paused payload carries the pid list and the ask — pinned  13340ms
+ ✓ test/uploads-dir.test.ts (3 tests) 24067ms
+   ✓ uploads dir scaffolding (SPEC ruling 19) > boot creates <data_dir>/uploads/ and logs an uploads_dir boot line  9622ms
+   ✓ uploads dir scaffolding (SPEC ruling 19) > uploads-path obstruction fails boot LOUD and named (exit 1, no raw stack) — Perkins r1 W14  5339ms
+   ✓ uploads dir scaffolding (SPEC ruling 19) > W-D (E9 r3 carry): a PRE-EXISTING 0755 uploads dir is hardened to 0700 at boot  9038ms
+ ✓ test/wake-e2e.test.ts (3 tests) 23473ms
+   ✓ wake-on-alert real service (offline) > boots a seeded machine backlog only after the live disposition API is available  8367ms
+   ✓ wake-on-alert real service (offline) > refused foreign-listener startup never consumes a seeded wake  6877ms
+   ✓ wake-on-alert real service (offline) > an injected action-required notification opens a Gru turn with its payload  8225ms
+(node:94848) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ test/lan-phone-raw-client.test.ts (6 tests) 17557ms
+   ✓ W5 — LAN-phone send path over the real socket > the desktop pairs, sends, and streams the reply in seq order  767ms
+   ✓ W5 — LAN-phone send path over the real socket > pen promotes when the desktop leaves: the phone send path works  1814ms
+   ✓ W5 — LAN-phone send path over the real socket > the phone reconnects with last_seen_seq: only missed frames replay  433ms
+   ✓ B1 — resolved model inputs drive the real-service vision gate > an image sent to a declared text-only model emits the decline and never-guess prompt  7648ms
+ ✓ test/wizard-register.test.ts (2 tests) 15562ms
+   ✓ wizard service registration (Perkins r1 W9) > register_service spawns bash <repo>/install.sh --service (the E7 path, one mechanism)  7752ms
+   ✓ wizard service registration (Perkins r1 W9) > a failing registration fails the wizard loud (named exit)  7270ms
+ ✓ test/fix-directive.test.ts (12 tests) 15859ms
+   ✓ recordFollowUpDelivery (the loop-closing signal) > records job.delivered with the lane head the settled turn produced  3210ms
+   ✓ recordFollowUpDelivery (the loop-closing signal) > still records the delivery when no head can be resolved — loud note, no fabricated sha  412ms
+   ✓ recordFollowUpDelivery (the loop-closing signal) > resolves the head from the ACTIVE job lane, never a swept one  3158ms
+   ✓ eviction-safe fix directives (phase 3) > falls through a typed eviction rejection and resumes the FAILING logical session  6691ms
+   ✓ eviction-safe fix directives (phase 3) > a successful resume prompts the directive itself; only a failed resume re-briefs from the original contract  2186ms
+(node:97286) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ test/patch-vitest-rpc-timeout.test.ts (11 tests) 17299ms
+   ✓ vitest rpc-timeout patch tool > applies the upstream fix and is idempotent on a second run  431ms
+   ✓ vitest rpc-timeout patch tool > still propagates real test failures under the patched runner  15037ms
+ ✓ test/pacing-admission.test.ts (14 tests) 28960ms
+   ✓ worker admission through dispatch (FIFO queue, honest queue note, release) > queues the second dispatch at the cap, notes the lane, and admits it on the first turn’s settle  4262ms
+   ✓ pacing plumbing and failure cleanup > a post-spawn bookkeeping throw releases the worker slot  2267ms
+   ✓ pacing plumbing and failure cleanup > a refused spawn releases the worker slot too  2779ms
+   ✓ pacing plumbing and failure cleanup > re-brief spawn queues and the board snapshot exposes its identity and honest reason  2836ms
+   ✓ pacing plumbing and failure cleanup > a re-brief turn whose bounded retry exhausts fails loud instead of recording a delivery  3457ms
+   ✓ worker delivery settlement through the dispatcher > marks the lane blocked when the bounded retry budget is spent  3134ms
+   ✓ worker delivery settlement through the dispatcher > a rejected briefing turn whose retry recovers is still reported delivered  4808ms
+   ✓ worker delivery settlement through the dispatcher > a settlement cancelled by shutdown blocks the lane and never records delivery  3093ms
+   ✓ worker delivery settlement through the dispatcher > a settlement-hook fault blocks the lane with the internal error instead of narrating retries  2274ms
+(node:1703) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ test/provider-recovery-resume.test.ts (14 tests) 17374ms
+   ✓ guarded claim — happy path > resumes the interrupted session and re-delivers the continuation prompt  2818ms
+   ✓ guarded claim — happy path > a missing session file falls back to a fresh worker on the same lane  1223ms
+   ✓ guarded claim — every recheck fails visible > a cancelled/terminal job skips the claim and retires the wait  1984ms
+   ✓ guarded claim — every recheck fails visible > an owner hold placed JUST before admission cancels the continuation  2530ms
+   ✓ guarded claim — every recheck fails visible > a wall-settled blocked job resumes instead of cancelling, and the lane re-opens (r4)  1103ms
+   ✓ guarded claim — every recheck fails visible > a blocked job with no wall-settled attribution still cancels at claim (owner/ops hold)  1188ms
+   ✓ guarded claim — every recheck fails visible > stale recovery evidence (marker cleared) skips the claim  1141ms
+   ✓ guarded claim — every recheck fails visible > a live replacement minion supersedes the wait (already-live replacement)  1310ms
+   ✓ guarded claim — every recheck fails visible > the original actor being live again supersedes the wait  882ms
+   ✓ guarded claim — every recheck fails visible > a swept lane cancels the wait (nothing to resume into)  1524ms
+   ✓ guarded claim — every recheck fails visible > a wait that never recovered answers not-recovered  982ms
+Preparing worktree (new branch 'fixture-worktree')
+ ✓ test/decisions-service-integration.test.ts (1 test) 19158ms
+   ✓ compiled service Jev credential lifecycle > boots and restarts from a CLI-stored key, drives a real caller, then disables with zero further requests  19147ms
+(node:2555) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ test/install.test.ts (13 tests) 11693ms
+   ✓ install.sh --print rendering > renders the platform unit with every placeholder substituted absolutely  707ms
+   ✓ install.sh --print rendering > renders a launchd PATH with stable Node/npm after the session bin disappears  1870ms
+   ✓ install.sh --print rendering > honors GRU_COMMAND_HOME for the instance dir  663ms
+   ✓ install.sh --print rendering > a repo path containing spaces survives rendering (macOS plists; systemd quotes)  574ms
+   ✓ inside_checkout heuristic (W-B) > accepts a full Gru Command checkout (positive control)  1788ms
+   ✓ inside_checkout heuristic (W-B) > accepts a real git WORKTREE (.git is a valid gitdir file)  2081ms
+   ✓ inside_checkout heuristic (W-B) > rejects a foreign manifest even when a nested name says gru-command  1417ms
+   ✓ inside_checkout heuristic (W-B) > rejects empty and stale .git shapes that are not a checkout with HEAD  816ms
+   ✓ inside_checkout heuristic (W-B) > rejects a saved copy WITHOUT .git ( Gru Command name, tarball/download shape)  489ms
+   ✓ inside_checkout heuristic (W-B) > rejects the name+git combo without the checkout layout (no src/)  916ms
+ ✓ test/rebrief-recovery.test.ts (10 tests) 9110ms
+   ✓ re-brief restart safety (durable markers) > boot reconciles a fresh marker pair to the recorded events and clears the markers  1713ms
+   ✓ re-brief restart safety (durable markers) > the re-dispatched re-brief waits for a worker pacing slot before spawning  767ms
+   ✓ re-brief restart safety (durable markers) > boot resumes the interrupted worker session when one exists on disk  1039ms
+   ✓ re-brief restart safety (durable markers) > double-boot does not double-dispatch: in-flight claims and consumed markers are idempotent  997ms
+   ✓ re-brief restart safety (durable markers) > a failed re-dispatch escalates action-required and keeps the markers for the next boot  625ms
+   ✓ re-brief restart safety (durable markers) > a shutdown-cancelled settlement keeps the markers pending for the next boot  580ms
+   ✓ re-brief restart safety (durable markers) > records only the lost delivery when silas.rebrief already landed  828ms
+   ✓ re-brief restart safety (durable markers) > does not reconcile markers younger than the boot  778ms
+   ✓ re-brief restart safety (durable markers) > finalize is idempotent: a replayed finalize appends no duplicate events  910ms
+ ✓ test/supervisor.test.ts (82 tests) 12014ms
+   ✓ supervisor — watchdog + restart ladder > compaction_end clears the wait state; a later genuine episode may warn once again  328ms
+   ✓ supervisor — watchdog + restart ladder > a synchronous warning-post failure before persistence never duplicates attempts or restarts  391ms
+   ✓ supervisor — watchdog + restart ladder > a synchronous warning-post failure after persistence never duplicates rows or restarts  387ms
+   ✓ supervisor — watchdog + restart ladder > breaker trips after 3 failed rungs in the window: stop + needs-owner + board mark  625ms
+   ✓ supervisor — hang-loop breaker flavor (successful restarts that keep dying) > the stopped record SURVIVES the trip dispose; the ack re-arms and resumes  475ms
+   ✓ supervisor — Perkins r1 fixes > autonomous slot use cannot re-arm or Ack an owner-held Gru breaker  335ms
+   ✓ supervisor — Perkins r1 fixes > r1-17/#24: slot use on an open breaker re-arms supervision AND acks the escalation row  366ms
+   ✓ worker delivery settlement under automatic rate-limit retry > an initial dispatch keeps its delivery pending until an in-band 429 retry recovers  1710ms
+ ✓ test/worktree-manifest.test.ts (8 tests) 9726ms
+   ✓ worktree bootstrap manifest (E8, ruling 18a) > is a no-op warn when the repo ships no manifest  980ms
+   ✓ worktree bootstrap manifest (E8, ruling 18a) > applies links, copies, and setup commands to a fresh worktree  1313ms
+   ✓ worktree bootstrap manifest (E8, ruling 18a) > fails loud when a setup command exits non-zero (never half-bootstrapped)  1592ms
+   ✓ worktree bootstrap manifest (E8, ruling 18a) > keeps the event loop responsive while a setup command sleeps past its timeout  3284ms
+   ✓ worktree bootstrap manifest (E8, ruling 18a) > refuses to overwrite anything already present in the worktree  2512ms
+ ✓ test/resident-saturation.test.ts (2 tests) 12066ms
+   ✓ four-busy-minion saturation and complete whole-PR Perkins coverage > keeps busy work and durable lanes intact, admits the lead+child ahead of new arrivals, and runs every lens within four slots  5132ms
+   ✓ four-busy-minion saturation and complete whole-PR Perkins coverage > completes the whole-PR review serially at global 2 / child 1 while a newcomer waits, without missing lenses  6931ms
+ ✓ test/chat-server.test.ts (83 tests) 8794ms
+   ✓ chat server (real sockets, stub Gru) > a persistently broken spawn backs off: a reconnect within the window does not retry it  883ms
+(node:9059) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ test/listener-probe.test.ts (5 tests) 7502ms
+   ✓ defaultListenerProbe: the real platform probe > finds this process listening on an OS-assigned port  406ms
+   ✓ defaultListenerProbe: the real platform probe > finds a FOREIGN child listener by pid (the squatter shape)  1205ms
+   ✓ defaultListenerProbe: the real platform probe > returns no owners for a free port  395ms
+   ✓ the boot guard: a coexisting foreign wildcard listener (the incident shape) > a service that binds alongside the squatter refuses loud instead of serving loopback 503s  5463ms
+ ✓ test/native-tools-parity.test.ts (2 tests) 7601ms
+   ✓ native-tools harness parity (whole double → both real adapters) > every policy the whole-PR engine declares maps to identical tool semantics on pi and claude  6360ms
+   ✓ native-tools harness parity (whole double → both real adapters) > a lens child declaring one native tool exposes exactly that tool on both harnesses  752ms
+(node:9404) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ test/perkins-lead-schema-compat.test.ts (6 tests | 1 skipped) 6346ms
+   ✓ declared native tool schemas are provider-compatible > the exact lead wire payload carries an object root for every declared function  764ms
+ ✓ test/verify-perkins-resource.test.ts (3 tests) 4282ms
+   ✓ perkins residue verifier — sibling artifacts are scanned > a clean product root passes (baseline for the residue injections)  1035ms
+   ✓ perkins residue verifier — sibling artifacts are scanned > jev residue in the perkins .js.map sibling fails closed  1295ms
+   ✓ perkins residue verifier — sibling artifacts are scanned > jev residue in the perkins .d.ts sibling fails closed  1149ms
+ ✓ test/worktree-port.test.ts (10 tests) 4895ms
+   ✓ WorktreePort contract: in-memory test double > JOB LANES: id === jobId, kind/status/branch per contract, real directory  2287ms
+   ✓ WorktreePort contract: in-memory test double > DISCOVERY: listWorktrees({jobId}) scopes the job lane + linked review lanes; never id-guessing  461ms
+   ✓ WorktreePort contract: in-memory test double > RELEASE: sweeps the lane (tree gone, status swept), idempotent on repeat  504ms
+   ✓ UnavailableWorktreePort: fail-loud on EVERY surface (r5 B2/B3) > dispatch through the unavailable port fails LOUD, blocks the job, names the subsystem  1303ms
+(node:10794) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ test/verification-scheduler.test.ts (18 tests) 3962ms
+   ✓ verification scheduler — global budget > enforces the worker count in the child environment and records a completed run  587ms
+   ✓ verification scheduler — global budget > turns a non-zero exit into a recorded failed outcome, never a thrown error  819ms
+   ✓ verification scheduler — global budget > kills the process group on run timeout and persists an emptied holder file  786ms
+   ✓ verification scheduler — global budget > dispose terminates active runs and refuses new work  348ms
+   ✓ verification scheduler — global budget > reports the spawned child (pid + argv) to onSpawn/onSettled so lane teardown can reap it  609ms
+ ✓ test/dispatch-joins.test.ts (2 tests) 4890ms
+   ✓ dispatch → minion: the real spawn join (ruling 17) > the minion is a REAL session rooted under the worktree path, briefing delivered, arc on the record  3077ms
+   ✓ Bob: the real consolidation knock > tick prompts a REAL bob session at the workspace root  1811ms
+(node:11626) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ test/awareness.test.ts (43 tests) 3889ms
+   ✓ gru awareness — wake policy > restarts without re-waking the oldest of 257 unresolved delivered alerts  489ms
+ ✓ test/config-generate.test.ts (10 tests) 4145ms
+   ✓ config-generate CLI > writes the complete teaching config to the actual application read path  439ms
+   ✓ config-generate CLI > emitted reference carries EVERY documented section plus the per-runtime semantics inline  306ms
+   ✓ config-generate CLI > round trip: a --force re-run preserves user-set values and hand-tuned sections, with backup  315ms
+   ✓ config-generate CLI > round trip preserves an active [pacing] section (caps + backoff, never silently dropped)  314ms
+   ✓ config-generate CLI > data_dir is emitted ~-anchored for home-under instances (restore-on-new-machine portability)  802ms
+   ✓ config-generate CLI > --force on a FRESH instance dir writes the config instead of throwing (Perkins R1 blocker 3)  305ms
+   ✓ config-generate CLI > refuses overwrite without --force and creates a timestamped 0600 backup with force  1048ms
+(node:11708) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ test/decisions-cli.test.ts (4 tests) 3193ms
+   ✓ compiled decisions CLI seam > emits the complete default-off fragment and --enabled changes only that flag  566ms
+   ✓ compiled decisions CLI seam > stores one stdin-only key atomically, never echoes it, and resolves it after a fresh process restart  1147ms
+   ✓ compiled decisions CLI seam > disabled check is successful/offline; enabled missing-key is sanitized degraded/nonzero  1065ms
+   ✓ compiled decisions CLI seam > rejects literal-key argv and embedded newlines without leaking input  410ms
+ ✓ test/provider-recovery-sensor.test.ts (50 tests) 3600ms
+ ✓ test/decisions.test.ts (43 tests) 2369ms
+   ✓ runtime startup, degradation and generation safety > hot reload observes atomic config replacement without a restart  1023ms
+ ✓ test/config.test.ts (70 tests) 1890ms
+(node:11905) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ test/health.test.ts (19 tests) 1997ms
+   ✓ GET /health > uptime resets across restarts (fresh hrtime baseline)  306ms
+ ✓ test/board-engine.test.ts (31 tests) 2195ms
+   ✓ board engine — adapter events → ledger events → board state > a blocked job notification row is durable — it outlives the event window  302ms
+(node:12046) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:12038) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ test/runtime-probe.test.ts (7 tests) 2586ms
+   ✓ probeRuntimes on fixture PATHs > reports installed runtimes with parsed versions and declared capabilities  734ms
+   ✓ probeRuntimes on fixture PATHs > a partially installed machine reports each runtime independently  337ms
+   ✓ probeRuntimes on fixture PATHs > a binary that exits non-zero or crashes is not installed (path still reported)  498ms
+   ✓ probeRuntimes on fixture PATHs > keeps the raw version line when no semver token parses  696ms
+ ✓ test/silas-driver.test.ts (33 tests) 1294ms
+ ✓ test/review-path.test.ts (24 tests) 2236ms
+   ✓ four-leg review pre-flight > routes the production native model leg through the same registry used by isolated children  966ms
+   ✓ GitHub code-host probe and host classification > passes when gh reads the repo and fails on unavailable/failed gh  1118ms
+(node:12153) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:12188) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:12191) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ test/notifications.test.ts (19 tests) 1329ms
+ ✓ test/lessons-injection.test.ts (6 tests) 1122ms
+   ✓ progressive-disclosure injection > injects pointers into a dispatched minion prompt automatically  616ms
+ ✓ test/provider-recovery-seam.test.ts (8 tests) 1182ms
+   ✓ real DispatchService ⇄ supervisor ⇄ sensor seam (issue #154) > a wall-settled dispatch block still resumes: settle → wait → recovery → one continuation  410ms
+ ✓ test/board-server.test.ts (17 tests) 1529ms
+(node:12394) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:12434) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ test/lessons-server.test.ts (5 tests) 957ms
+   ✓ lessons server > round-trips a journal entry: POST stores it, GET lists it back  327ms
+ ✓ test/provider-recovery-ledger.test.ts (18 tests) 1292ms
+ ✓ test/github-poll.test.ts (24 tests) 1031ms
+(node:12518) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ test/roll-server.test.ts (7 tests) 885ms
+   ✓ POST /api/roll > answers 503 when no pairing token is configured (locked door)  312ms
+ ✓ test/roll-controller.test.ts (11 tests) 731ms
+ ✓ test/roll-cli.test.ts (15 tests) 538ms
+ ✓ test/static.test.ts (10 tests) 522ms
+(node:12605) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ test/lessons-e2e.test.ts (2 tests | 1 skipped) 692ms
+   ✓ minion-style lessons e2e (stubbed session path) > the briefing carries a pointer, the agent reads the section, and the answer comes from it  670ms
+ ✓ test/ledger-api.test.ts (23 tests) 472ms
+(node:12609) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ test/lessons-capture.test.ts (5 tests) 1072ms
+   ✓ minion lessons capture > wires capture into the dispatch settle path  972ms
+ ✓ test/chat-frame-log.test.ts (20 tests) 452ms
+ ✓ test/lessons-bible.test.ts (13 tests) 281ms
+(node:12730) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ test/ledger-db.test.ts (6 tests) 380ms
+ ✓ test/lessons-dream.test.ts (12 tests) 306ms
+(node:12736) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ test/board-engine-v4.test.ts (4 tests) 285ms
+ ✓ test/session-store.test.ts (14 tests) 383ms
+ ✓ test/runtime-resident-registry.test.ts (21 tests) 387ms
+ ✓ test/stub-runtime.test.ts (14 tests) 227ms
+{"i":0,"ts":"2026-10-03T08:27:36.728Z","level":"info","msg":"still-alive"}
+{"i":1,"ts":"2026-10-03T08:27:36.731Z","level":"info","msg":"still-alive"}
+{"i":2,"ts":"2026-10-03T08:27:36.734Z","level":"info","msg":"still-alive"}
+{"i":3,"ts":"2026-10-03T08:27:36.737Z","level":"info","msg":"still-alive"}
+{"i":4,"ts":"2026-10-03T08:27:36.742Z","level":"info","msg":"still-alive"}
+ ✓ test/logger.test.ts (3 tests) 129ms
+(node:12744) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ test/silas-deterministic-seam.test.ts (1 test) 106ms
+(node:12746) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ test/owner-actions.test.ts (28 tests) 74ms
+ ✓ test/suite-shape.test.ts (2 tests) 106ms
+ ✓ test/transcripts.test.ts (13 tests) 241ms
+ ✓ test/deploy-drift.test.ts (10 tests) 108ms
+ ✓ test/roll-state.test.ts (7 tests) 85ms
+ ✓ test/pacing.test.ts (28 tests) 146ms
+ ✓ test/roles-definitions.test.ts (10 tests) 85ms
+ ✓ test/chat-session-state.test.ts (6 tests) 101ms
+ ✓ test/rate-limit-retry.test.ts (6 tests) 81ms
+ ✓ test/perkins-findings-dedupe.test.ts (11 tests) 92ms
+ ✓ test/lessons-journal.test.ts (5 tests) 82ms
+ ✓ test/lessons-references.test.ts (5 tests) 89ms
+ ✓ test/resident-budget.test.ts (7 tests) 67ms
+ ✓ test/provider-recovery-classify.test.ts (25 tests) 25ms
+ ✓ test/provider-recovery-metadata.test.ts (24 tests) 44ms
+ ✓ test/bob-scheduler.test.ts (5 tests) 21ms
+ ✓ test/provider-recovery-composition.test.ts (9 tests) 86ms
+ ✓ test/board-frames.test.ts (3 tests) 14ms
+ ✓ test/build-info.test.ts (5 tests) 53ms
+ ✓ test/identity.test.ts (3 tests) 54ms
+ ✓ test/wake-policy.test.ts (17 tests) 60ms
+ ✓ test/tool-heartbeat.test.ts (2 tests) 22ms
+ ✓ test/chat-frames.test.ts (4 tests) 53ms
+ ✓ test/spec-rulings-drift.test.ts (5 tests) 18ms
+ ✓ test/verification-evidence.test.ts (5 tests) 15ms
+ ✓ test/roles-gru.test.ts (4 tests) 8ms
+ ✓ test/runtime-cessation-evidence.test.ts (4 tests) 12ms
+ ✓ test/spawn-backoff.test.ts (5 tests) 16ms
+ ✓ test/provider-recovery-admission.test.ts (4 tests) 9ms
+(node:13174) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ test/pr-creation-policy.test.ts (5 tests) 11ms
+ ↓ test/perkins-crash-child.test.ts (1 test | 1 skipped)
+ ↓ test/roll-e2e.test.ts (1 test | 1 skipped)
+ ↓ test/smoke-claude.test.ts (1 test | 1 skipped)
+ ↓ test/smoke-real-model.test.ts (1 test | 1 skipped)
+
+ Test Files  107 passed | 4 skipped (111)
+      Tests  1803 passed | 12 skipped (1815)
+   Start at  09:15:49
+   Duration  721.30s (transform 14.16s, setup 1.69s, collect 118.94s, tests 2634.46s, environment 94ms, prepare 44.64s)
+
+
+> gru-command@1.0.0 test:web
+> npm run test -w web
+
+
+> @gru-command/web@1.0.0 test
+> tsc --noEmit -p tsconfig.json && vitest run
+
+
+ RUN  v3.2.7 <LANE_WORKTREE>/web
+
+ ✓ src/lib/working-flavor.test.ts (9 tests) 179ms
+ ✓ src/lib/uuid.test.ts (5 tests) 66ms
+ ✓ src/lib/board-bands.test.ts (20 tests) 54ms
+ ✓ src/lib/owner-band.test.ts (11 tests) 43ms
+ ✓ src/lib/board-client.test.ts (9 tests) 2526ms
+   ✓ board client > detects a silently-dead socket via the liveness clock and recovers without a manual reload  956ms
+   ✓ board client > keepalive ping frames refresh the liveness clock — a quiet-but-live socket is never reopened  330ms
+   ✓ board client > wake() refetches the snapshot unconditionally and reopens a socket silent past the window  1014ms
+ ✓ src/lib/board-protocol.test.ts (13 tests) 25ms
+ ✓ src/lib/mock-safety.test.ts (11 tests) 46ms
+ ✓ src/lib/protocol.test.ts (18 tests) 23ms
+ ✓ src/lib/board-rail.test.ts (7 tests) 36ms
+ ✓ src/lib/board-health.test.ts (13 tests) 24ms
+ ✓ src/lib/chat-client-insecure-uuid.test.ts (2 tests) 19ms
+ ✓ src/lib/command-ticker.test.ts (6 tests) 13ms
+ ✓ src/lib/console-layout.test.ts (8 tests) 22ms
+ ✓ src/lib/mock-server-http.test.ts (2 tests) 6964ms
+   ✓ dev mock upload endpoint hardening > materializes safely and pins raw/decoded caps, quota, UTF-8 names, and collisions  1109ms
+   ✓ dev mock turn-hold fixture contract > parks the scripted turn until release, and reset settles a parked turn without ghost frames  5845ms
+ ✓ src/lib/board-kpi.test.ts (6 tests) 25ms
+ ✓ src/lib/board-signals.test.ts (16 tests) 31ms
+ ✓ src/styles/theme-surfaces.test.ts (4 tests) 45ms
+ ✓ src/lib/board-vocabulary.test.ts (3 tests) 12ms
+ ✓ src/lib/chat-storage.test.ts (4 tests) 17ms
+ ✓ src/lib/board-collapse.test.ts (4 tests) 24ms
+ ✓ src/lib/palette-contrast.test.ts (3 tests) 12ms
+ ✓ src/lib/board-time.test.ts (4 tests) 10ms
+ ✓ src/theme.test.ts (3 tests) 12ms
+ ✓ src/ui/pairing.test.ts (2 tests) 7ms
+stderr | src/lib/chat-client.test.ts > ChatClient > malformed frames are ignored without killing the session
+gru-chat: ignoring malformed frame {"type":
+
+ ✓ src/lib/chat-client.test.ts (30 tests) 11990ms
+   ✓ ChatClient > reports an honest unknown compact outcome after its terminal result is lost  910ms
+   ✓ ChatClient > recovers a pending new chat when reconnect first observes resetting  925ms
+   ✓ ChatClient > treats an advanced resetting epoch as committed success when the result was lost  925ms
+   ✓ ChatClient > surfaces an inferred failed New chat when its result is lost on reconnect  934ms
+   ✓ ChatClient > socket drop mid-session reconnects with last_seen_seq (no full replay)  1089ms
+   ✓ ChatClient > closes and retries when auth_ok is not followed by required context  870ms
+   ✓ ChatClient > bad token → fatal error, no reconnect loop  328ms
+   ✓ ChatClient > server log reset is detected and resynced with a full replay  2522ms
+   ✓ ChatClient > LIVENESS: a socket silent past the window force-reconnects and replays missed history exactly once  1069ms
+   ✓ ChatClient > LIVENESS: wake() re-opens a socket silent past the window without waiting out the backoff  1022ms
+ ✓ src/ui/owner-chime.test.ts (26 tests) 617ms
+ ✓ src/ui/chat-gfm-invariant.test.ts (7 tests) 500ms
+ ✓ src/ui/board.test.ts (51 tests) 1995ms
+ ✓ src/ui/chat-attachments.test.ts (11 tests) 468ms
+ ✓ src/lib/markdown.test.ts (21 tests) 313ms
+ ✓ src/ui/board-merged-attention.test.ts (5 tests) 346ms
+ ✓ src/ui/chat-scroll.test.ts (8 tests) 176ms
+ ✓ src/ui/decisions-status.test.ts (4 tests) 270ms
+ ✓ src/ui/chat-working-flavor.test.ts (9 tests) 179ms
+ ✓ src/ui/chat-tool-turn.test.ts (8 tests) 312ms
+ ✓ src/ui/chat-service-band.test.ts (8 tests) 180ms
+ ✓ src/ui/chat-composer.test.ts (6 tests) 147ms
+ ✓ src/ui/splitters.test.ts (10 tests) 95ms
+ ✓ src/ui/chat-console.test.ts (4 tests) 96ms
+ ✓ src/ui/console.test.ts (7 tests) 103ms
+ ✓ src/ui/rail-tabs.test.ts (3 tests) 66ms
+ ✓ src/lib/attach-client.test.ts (4 tests) 30ms
+ ✓ src/ui/chat-reflow.test.ts (5 tests) 29ms
+
+ Test Files  43 passed (43)
+      Tests  410 passed (410)
+   Start at  09:28:02
+   Duration  27.88s (transform 3.58s, setup 0ms, collect 7.69s, tests 28.15s, environment 26.64s, prepare 16.20s)
+

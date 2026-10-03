@@ -1,0 +1,22 @@
+{
+  "reviews": [
+    {
+      "job_id": "pr148-final-adversarial",
+      "agent_id": "01a1008e-398e-7194-a9fd-4a9558aa3504",
+      "lens": "lens-adversarial",
+      "findings_count": 13
+    },
+    {
+      "job_id": "pr148-final-edge",
+      "agent_id": "01a1008f-4850-7194-a9fd-4a9af634b9d1",
+      "lens": "lens-edge-case-hunter",
+      "findings_count": 3
+    },
+    {
+      "job_id": "pr148-final-verification",
+      "agent_id": "01a10090-43fd-7194-a9fd-4a9de43d2b9d",
+      "lens": "lens-verification-gap",
+      "findings_count": 6
+    }
+  ]
+}

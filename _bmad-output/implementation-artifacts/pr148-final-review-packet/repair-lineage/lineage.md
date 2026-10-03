@@ -72,5 +72,35 @@ contexts and the repository history before any edit.
 Merge commit `5c0d1d3` (parents `1bac32d` + `origin/main 5d56194`,
 PR #149) — normal, history-preserving, auto-merged; see
 `../verification/current-evidence.md` for the merge file list and the
-pre-check qualifications. Post-merge scopes for this head are run through
-the scheduler and appended as evidence before this packet is presented.
+pre-check qualifications.
+
+## 5. Post-merge browser corrections (r5/r6)
+
+The post-merge browser runs came back RED twice on the two `themes`
+whole-page captures with the owner band missing while the DOM contained it.
+Capture analysis (per-region alignment, diff and error-context comparison)
+located the mechanism: the shell is page-scrollable and composer
+interaction scrolls it, so the captures depended on the page scroll origin —
+at ~20px every content pane sat 20px higher with the rest byte-aligned, and
+at a larger offset the band's sticky head stayed pinned while its rows
+scrolled away. Repairs: r5 (`1b9fafd`) synchronizes the tests on the band's
+authoritative rows before the screenshot; r6 (`faa69d6`) pins
+`window.scrollTo(0, 0)` before each capture. Post-merge green set: focused
+`be16f221`, full `1744e502`, browser `5360af3c`.
+
+## 6. Final independent review round and repairs (r2)
+
+Three fresh tracked review jobs (`review-round/`) ran the installed
+bmad-review lenses against packet v2 and returned 13 + 3 + 6 findings.
+Genuine defects were repaired at `1bea5c9` and `9ba8637`: deterministic
+managed-block refusal; transient fresh-installer output semantics (reuse
+unchanged); per-object missing-path attribution; preflight message hygiene;
+ancestor-refusal installer hints; git-toplevel errno discrimination; plus
+the review-identified regression coverage (reuse content validators,
+control-file refusals, validateRepo refusals, hint-less fallback, denied
+manifest read, ENOTDIR/rethrow arms, e2e toggle guard, direct mock
+turn-hold coverage) and the README wording fix. One focused RED
+(`eef4dd0c` at `1bea5c9`) exposed the pre-action ancestor-check ordering and
+was followed by the `9ba8637` follow-up; then focused `02a41d78`,
+typecheck `5e262d98`, full `443c4247` and browser `59980235` all passed.
+Per-finding dispositions: `../claims/final-review-dispositions.md`.
