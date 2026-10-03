@@ -323,6 +323,9 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         json(res, 202, {
           route: outcome.route,
           ...(ruleId !== undefined ? { rule_id: ruleId, source_round_id: sourceRoundId } : {}),
+          // Fallback gate only: `clearToMerge` means the review/fix ROUTING
+          // was cleared — it is never a Perkins READY and never merge
+          // clearance (merges stay owner-held).
           clear_to_merge: outcome.clearToMerge,
           skill_installed: outcome.skillInstalled,
           failed_legs: outcome.failedLegs.map((leg) => ({ leg: leg.leg, detail: leg.detail, remediation: leg.remediation })),

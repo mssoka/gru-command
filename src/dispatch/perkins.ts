@@ -1885,7 +1885,7 @@ export class WaveRunner {
         state.clearToMerge = true;
         fallbackEvent({ phase: 'pass', iteration, notes, reportFile, clearToMerge: true, merge: 'user-held' });
         this.opts.escalate?.(
-          `bmad-review gate PASS for job ${job.id} — clear to merge (merge stays user-held)`,
+          `bmad-review gate PASS for job ${job.id} — review/fix routing cleared (missing Perkins gate escalated; merge stays user-held)`,
           `${notes} note(s) across ${iteration} review round(s). Reports: ${state.reportFiles.join(', ')}`,
         );
         return;
