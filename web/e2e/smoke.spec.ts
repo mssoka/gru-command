@@ -657,10 +657,13 @@ test.describe('board (E6, mock feed)', () => {
       // is taken under sticky chrome that can occlude the IN FLIGHT band,
       // so the NEEDS GRU band and the waiting row get their own clips — the
       // band shows the closed-receipt exclusion, the row shows the
-      // stopped-lane waiting state directly.
-      await page
-        .locator('.board-band--needs-you')
-        .screenshot({ path: testInfo.outputPath(`board-truth-needs-gru-${theme}.png`) });
+      // stopped-lane waiting state directly. The band sits directly under
+      // the sticky chip rail, so center each element before its clip — a
+      // minimal scroll would leave the rail overlaying the capture.
+      const needsGruBand = page.locator('.board-band--needs-you');
+      await needsGruBand.evaluate((node) => node.scrollIntoView({ block: 'center' }));
+      await needsGruBand.screenshot({ path: testInfo.outputPath(`board-truth-needs-gru-${theme}.png`) });
+      await walled.evaluate((node) => node.scrollIntoView({ block: 'center' }));
       await walled.screenshot({ path: testInfo.outputPath(`board-truth-waiting-${theme}.png`) });
       await page.screenshot({ path: testInfo.outputPath(`board-truth-${theme}.png`), fullPage: true });
 
