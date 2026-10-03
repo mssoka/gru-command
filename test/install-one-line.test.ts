@@ -667,6 +667,7 @@ describe('install.sh setup mode (one-line path)', () => {
 
     const renderedOwned = run(join(target, 'install.sh'), ['--print'], env);
     expect(renderedOwned.status, renderedOwned.stderr).toBe(0);
+    mkdirSync(dirname(unit), { recursive: true });
     writeFileSync(unit, renderedOwned.stdout);
     const owned = run(join(bare, 'install.sh'), [], env);
     expect(owned.status, `${owned.stdout}\n${owned.stderr}`).toBe(0);
