@@ -340,25 +340,23 @@ undertaking.
 
 **Policy vs implemented.** These obligations ship in the installed
 playbook, but the runtime does not yet enforce all of them. Still
-missing in code: accepted requests/actions are not a restart-durable
-store; the board does not carry per-job last-tick/last-completed-
-reconcile, open-turn age, last useful action, and next action; the
-stalled/PR-overdue predicates do not carry deliverable-kind carve-outs
-for artifact-only jobs; and current-phase delivery is not distinct from
-historical `job.delivered` events. Those gaps are tracked in
+missing in code: the stalled/PR-overdue predicates do not carry
+deliverable-kind carve-outs for artifact-only jobs; and current-phase
+delivery is not distinct from historical `job.delivered` events
+(`stalledWorking` still keys on the absence of any historical delivery).
+Those gaps, plus board cadence/next-action truth, are tracked in
 mssoka/gru-command issues #160 (delivery truth), #162 (current-phase
 stalled detection), and #163 (bounded reconciliation while a model turn
 is open); artifact-job classification and board timing are named there as
-further separate concerns. The outcome/phase machinery itself is the
-`durable-blocked-followthrough` work (PR #136): it covers durable
-directive intent, request idempotency, marked phase handoffs, and boot
-reconciliation, but its native r4 verdict is NEEDS CHANGES at the
-inspected head — resolve-but-error turns can still publish a completed
-phase, unmarked crash windows are not recovered, and the phase reconciler
-starves past its page budget. Reuse/fix that mechanism; do not build a
-parallel outcome system. `/api/verify` admission/re-arm (#159) is also
-missing. They are not implemented by this document — nothing in this
-section claims those runtime guarantees exist today.
+further separate concerns. The outcome/phase machinery itself is
+`durable-blocked-followthrough` (PR #136, **merged into main**): durable
+directive intent, request-id idempotency with single-writer refusal,
+marked phase handoffs with correlated completion, per-turn terminal
+outcome validation (`src/runtime/prompt-verdict.ts`), and boot
+reconciliation. That is the mechanism to extend — do not build a parallel
+outcome system. `/api/verify` admission/re-arm (#159) is still missing.
+Nothing in this section claims those remaining runtime guarantees exist
+today.
 
 ## 5. Release (the sweep)
 
