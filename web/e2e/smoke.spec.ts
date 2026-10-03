@@ -1,4 +1,6 @@
-import { expect, test, type Page } from '@playwright/test';
+import fs from 'node:fs';
+import path from 'node:path';
+import { expect, test, type Locator, type Page } from '@playwright/test';
 import { WebSocket, type RawData } from 'ws';
 
 /** The mock's token — same env knob the mock itself reads (GRU_MOCK_TOKEN, default 'dev-token'). */
@@ -25,6 +27,39 @@ async function pairMobile(page: Page): Promise<void> {
   await page.locator('#pair-token').fill(MOCK_TOKEN);
   await page.locator('#pair-submit').click();
   await expect(page.locator('#board-view')).toBeVisible();
+}
+
+/** Private browser-evidence for the PR-number label (j-982): the actual
+ * row in light/dark, desktop/phone. The capture root is gitignored; the
+ * files stay in the lane worktree for the human/vision review. */
+const PR_NUMBER_CAPTURE_DIR = path.join(
+  import.meta.dirname,
+  '..',
+  '..',
+  '_bmad-output',
+  'board-pr-number-links',
+  'captures',
+);
+
+async function capturePrNumberRow(row: Locator, name: string): Promise<void> {
+  fs.mkdirSync(PR_NUMBER_CAPTURE_DIR, { recursive: true });
+  await row.scrollIntoViewIfNeeded();
+  await row.screenshot({ path: path.join(PR_NUMBER_CAPTURE_DIR, `${name}.png`) });
+}
+
+/** The numbered label must be visible as text, inside the row meta line
+ * and never clipped (j-982 acceptance D). */
+async function expectPrLabelFits(row: Locator): Promise<void> {
+  const link = row.locator('.board-job__pr');
+  await expect(link).toBeVisible();
+  const meta = row.locator('.board-job__meta');
+  const [labelBox, metaBox] = await Promise.all([link.boundingBox(), meta.boundingBox()]);
+  expect(labelBox, 'numbered PR link has a box').not.toBeNull();
+  expect(metaBox, 'row meta line has a box').not.toBeNull();
+  expect(labelBox!.x).toBeGreaterThanOrEqual(metaBox!.x - 1);
+  expect(labelBox!.x + labelBox!.width).toBeLessThanOrEqual(metaBox!.x + metaBox!.width + 1);
+  const clipped = await link.evaluate((node) => node.scrollWidth > node.clientWidth + 1);
+  expect(clipped, 'label not clipped inside the link').toBe(false);
 }
 
 async function sendAndWaitReply(page: Page, text: string): Promise<void> {
@@ -532,6 +567,89 @@ test.describe('board (E6, mock feed)', () => {
     await page.locator('#notification-bell').click();
     await expect(page.locator('.board-notification').first()).toBeVisible();
     await page.locator('#notification-bell').click();
+  });
+
+  test('PR numbers: each heist link shows its canonical request number', async ({
+    page,
+  }) => {
+    await pair(page);
+    await expect(page.locator('#board-view')).toBeVisible();
+    // GitHub /pull/ route: the number rides the visible label; href,
+    // new-tab target and noreferrer semantics are untouched.
+    const gh = page.locator('.board-job', { hasText: 'Merge main into the retry branch' });
+    await expect(gh.locator('.board-job__pr')).toHaveText('PR #43 ↗');
+    await expect(gh.locator('.board-job__pr')).toHaveAttribute(
+      'href',
+      'https://github.com/acme/demo-api/pull/43',
+    );
+    await expect(gh.locator('.board-job__pr')).toHaveAttribute('target', '_blank');
+    await expect(gh.locator('.board-job__pr')).toHaveAttribute('rel', 'noreferrer');
+    // GitLab /-/merge_requests/ route: same contract, its own number —
+    // no shared/stale constant across heists.
+    const gl = page.locator('.board-job', { hasText: 'Landing copy refresh' });
+    await expect(gl.locator('.board-job__pr')).toHaveText('PR #42 ↗');
+    await expect(gl.locator('.board-job__pr')).toHaveAttribute(
+      'href',
+      'https://gitlab.demo.invalid/sample/sample-site/-/merge_requests/42',
+    );
+  });
+
+  test('a numbered PR link keeps external navigation and never toggles the heist disclosure', async ({
+    page,
+  }) => {
+    // Fixture links must never hit the network from a test run.
+    await page.context().route('https://github.com/**', (route) => route.abort());
+    await pair(page);
+    await expect(page.locator('#board-view')).toBeVisible();
+    const row = page.locator('.board-job', { hasText: 'Merge main into the retry branch' });
+    const link = row.locator('.board-job__pr');
+    await expect(row).toHaveAttribute('data-expanded', 'false');
+    await expect(link).toHaveText('PR #43 ↗');
+    // Keyboard activation opens the external destination in a new tab and
+    // leaves the disclosure closed (the click must not bubble to the row).
+    await link.focus();
+    const popupPromise = page.waitForEvent('popup');
+    await page.keyboard.press('Enter');
+    const popup = await popupPromise;
+    await popup.close();
+    await expect(row).toHaveAttribute('data-expanded', 'false');
+    // Pointer activation behaves the same.
+    const pointerPopupPromise = page.waitForEvent('popup');
+    await link.click();
+    const pointerPopup = await pointerPopupPromise;
+    await pointerPopup.close();
+    await expect(row).toHaveAttribute('data-expanded', 'false');
+    // The heist name/status face is untouched by the label change.
+    await expect(row.locator('.board-job__name')).toHaveText('Merge main into the retry branch');
+    await expect(row.locator('.board-job__status')).toHaveText('in-review');
+  });
+
+  test('PR number label: row captures in light/dark, desktop/phone (private evidence)', async ({ page }) => {
+    await pair(page);
+    await expect(page.locator('#board-view')).toBeVisible();
+    const row = page.locator('.board-job', { hasText: 'Merge main into the retry branch' });
+    await expect(row.locator('.board-job__pr')).toHaveText('PR #43 ↗');
+    // Desktop, light first.
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await expect(page.locator('html')).not.toHaveClass(/dark/);
+    await expectPrLabelFits(row);
+    await capturePrNumberRow(row, 'pr-number-desktop-light');
+    await page.locator('#theme-toggle').click();
+    await expect(page.locator('html')).toHaveClass(/dark/);
+    await expectPrLabelFits(row);
+    await capturePrNumberRow(row, 'pr-number-desktop-dark');
+    // Back to light before the phone pair so each capture sits in one theme.
+    await page.locator('#theme-toggle').click();
+    await expect(page.locator('html')).not.toHaveClass(/dark/);
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expect(page.locator('#board-view')).toBeVisible();
+    await expect(row.locator('.board-job__pr')).toHaveText('PR #43 ↗');
+    await expectPrLabelFits(row);
+    await capturePrNumberRow(row, 'pr-number-phone-light');
+    await page.locator('#theme-toggle').click();
+    await expect(page.locator('html')).toHaveClass(/dark/);
+    await expectPrLabelFits(row);
+    await capturePrNumberRow(row, 'pr-number-phone-dark');
   });
 
   test('v6: the chip rail carries the v4 health row + folded KPI counts, bands stay ordered', async ({ page }) => {
