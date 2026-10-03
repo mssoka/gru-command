@@ -73,6 +73,7 @@ describe('role definitions (E8)', () => {
 
   it('pins the task-relevant BMAD workflow playbook on the worker prompt', () => {
     const minion = ROLE_DEFINITIONS['minion'].systemPrompt.replace(/\s+/gu, ' ');
+    expect(minion).toContain("explicitly select the project's installed build-workflow skill");
     expect(minion).toContain("the PROJECT's actual installed skill catalog and metadata");
     expect(minion).toContain('select by what the project really has installed for the task');
     expect(minion).toContain('never by a fixed skill name, a remembered file path, or a hand-maintained rename table');
@@ -81,6 +82,11 @@ describe('role definitions (E8)', () => {
     expect(minion).toContain("fresh, context-free tracked review jobs you commission through the service's job-dispatch surface");
     expect(minion).toContain('`POST /api/dispatch` — the same path that created your lane');
     expect(minion).toContain('each reviewer is a separate tracked job with its own session and worktree');
+    // Native round 1 (admission-cycle blocker): a nested reviewer dispatch
+    // that cannot be admitted must stop loud, never deadlock or bypass caps.
+    expect(minion).toContain('nested-admission capability gap');
+    expect(minion).toContain('do not block waiting');
+    expect(minion).toContain('never raise or bypass the configured worker limits');
     // j-810/j-811: the retired untracked headless-launcher wording must never return.
     expect(minion).not.toContain('pi -p');
     expect(minion).not.toContain('claude -p');

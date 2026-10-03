@@ -1370,6 +1370,7 @@ describe('packaged product and terminal-frame coverage (N6)', () => {
     const stagedOps = readFileSync(join(stage, 'resources', 'silas-skills', 'ops-dispatch', 'SKILL.md'), 'utf-8').replace(/\s+/gu, ' ');
     expect(stagedOps).toContain("own their workflows' built-in review on fresh independent reviewer contexts");
     expect(stagedOps).toContain('separately tracked review jobs');
+    expect(stagedOps).toContain('nested-admission capability gap');
     expect(stagedOps).toContain('The owner holds ALL merges');
     expect(stagedOps).not.toContain('The chief holds merge authority');
     expect(stagedOps).toContain('never demand a fixed skill name');

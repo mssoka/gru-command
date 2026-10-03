@@ -194,12 +194,18 @@ describe('installed-layout playbook loading (shipped artifact, clean install)', 
 
   it('the installed worker prompt carries the BMAD workflow playbook', () => {
     const flat = staged.minion.replace(/\s+/gu, ' ');
+    expect(flat).toContain("explicitly select the project's installed build-workflow skill");
     expect(flat).toContain("the PROJECT's actual installed skill catalog and metadata");
     expect(flat).toContain('select by what the project really has installed for the task');
     expect(flat).toContain('never by a fixed skill name, a remembered file path, or a hand-maintained rename table');
     expect(flat).toContain('You own the selected workflow end to end');
     expect(flat).toContain("fresh, context-free tracked review jobs you commission through the service's job-dispatch surface");
     expect(flat).toContain('each reviewer is a separate tracked job with its own session and worktree');
+    // Native round 1 (admission-cycle blocker): a nested reviewer dispatch
+    // that cannot be admitted must stop loud, never deadlock or bypass caps.
+    expect(flat).toContain('nested-admission capability gap');
+    expect(flat).toContain('do not block waiting');
+    expect(flat).toContain('never raise or bypass the configured worker limits');
     // j-810/j-811: the retired untracked headless-launcher wording must never return.
     expect(flat).not.toContain('pi -p');
     expect(flat).not.toContain('claude -p');

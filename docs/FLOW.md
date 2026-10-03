@@ -269,7 +269,12 @@ fixed skill name. The selected workflow's built-in review runs on fresh,
 context-free reviewer contexts the minion commissions as separately
 tracked review jobs — each with its own session and worktree, a read-only
 brief, and the immutable diff head; never an untracked launcher, an
-extension subagent, or a model-native child session. The minion owns
+extension subagent, or a model-native child session. Those reviewer jobs
+share the worker budget with the lane that commissions them, so a
+nested-admission gap (a dispatch that cannot be admitted while its lane
+holds its slot) stops the lane loudly and is scheduled by ops under the
+configured limits — never a limit change or an untracked substitute. The
+minion owns
 finding resolution, verification, and the authorized ordinary PR, and the
 ops layer does not pull the work back between phases or commission a
 supplementary review duplicating the built-in one. Expensive suites

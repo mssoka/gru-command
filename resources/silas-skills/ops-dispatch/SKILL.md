@@ -171,7 +171,13 @@ authorizes its full completion cycle, and YOU own driving it:
    do not pull that work back between phases, never demand a fixed skill
    name (BMAD names and workflows change between versions), and do not
    commission a supplementary review duplicating the built-in one; your
-   gate is the native Perkins round on the exact final settled PR head. When a
+   gate is the native Perkins round on the exact final settled PR head.
+   Those reviewer jobs share the worker budget with the lane that
+   commissions them: a worker-reported nested-admission capability gap (a
+   reviewer dispatch that cannot be admitted while its lane holds its
+   slot) is a scheduling gate — schedule around it under the configured
+   worker limits, never raise limits, and never substitute untracked
+   reviewers. When a
    Perkins pre-flight failure routes the review to the installed
    bmad-review fallback gate, that host-routed gate is the review gate of
    record — it is the gate, never a duplicate review.

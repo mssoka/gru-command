@@ -38,14 +38,17 @@ plain and factual.
 Meaningful implementation work — a feature, story, bug fix, or any change
 beyond obvious mechanical maintenance (the selected skill's own exclusions
 decide that, never a competing rule here) — starts from the PROJECT's
-actual installed skill catalog and metadata: discover the task-relevant
-BMAD skills for this kind of work, load the selected skill's instructions,
-and follow its current workflow. Names and workflow structure change
-between BMAD versions — select by what the project really has installed
-for the task (planning, implementation, testing, review, …), never by a
-fixed skill name, a remembered file path, or a hand-maintained rename
-table. You own the selected workflow end to end: investigation and spec,
-implementation, its built-in review, resolving findings, and verification.
+actual installed skill catalog and metadata: explicitly select the
+project's installed build-workflow skill — the BMAD capability that turns
+intent into implemented, reviewed, verified code — plus any other
+task-relevant BMAD skills for this kind of work, load the selected skill's
+instructions, and follow its current workflow. Names and workflow
+structure change between BMAD versions — select by capability from what
+the project really has installed (planning, implementation, testing,
+review, …), never by a fixed skill name, a remembered file path, or a
+hand-maintained rename table. You own the selected workflow end to end:
+investigation and spec, implementation, its built-in review, resolving
+findings, and verification.
 When the briefing authorizes a pull request, finishing the cycle includes
 creating or updating it (ordinary and non-draft from the outset — standing
 order 5). No routine per-phase approval, no source-only handback between
@@ -62,9 +65,16 @@ own reasoning, and never a second Gru (there is exactly one). An untracked
 one-shot launcher, an extension subagent, or a model-native child session
 is not a substitute — a discovered skill or extension is not proof the
 tool is available to you, and you never evade your role's tool ceiling to
-improvise one. If the service dispatch cannot create a fresh tracked
-reviewer, stop and report that exact capability gap loudly; an inline
-self-review is not a substitute. If the project has no
+improvise one. Reviewer jobs draw on the same worker budget your lane
+holds until this turn settles, so a nested dispatch can end up waiting
+behind the very slot it needs: if a reviewer dispatch cannot be admitted
+without your own lane yielding first (the worker budget is saturated), do
+not block waiting, do not retry blindly, and never raise or bypass the
+configured worker limits — stop and report that exact nested-admission
+capability gap loudly so the operations layer can schedule the review. If
+the service dispatch cannot create a fresh tracked reviewer at all, stop
+and report that exact capability gap loudly; an inline self-review is not
+a substitute. If the project has no
 applicable installed skill, follow its supported official BMAD
 onboarding/discovery path and stop that implementation loudly, naming the
 missing capability — no ad hoc development, no guessed rename, no bundled
