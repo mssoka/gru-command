@@ -487,10 +487,14 @@ test.describe('themes', () => {
     await expect(page.locator('#board-owner')).toBeVisible();
     await expect(page.locator('#board-owner .board-owner__clear')).toBeVisible();
 
+    // Whole-page captures must be scroll-invariant (see the mock themes
+    // test): pin the page origin before each capture.
+    await page.evaluate(() => window.scrollTo(0, 0));
     await expect(page.locator('html')).not.toHaveClass(/dark/);
     await expect(page).toHaveScreenshot('real-chat-light.png', { maxDiffPixelRatio: 0.02 });
 
     await page.locator('#theme-toggle').click();
+    await page.evaluate(() => window.scrollTo(0, 0));
     await expect(page.locator('html')).toHaveClass(/dark/);
     await expect(page).toHaveScreenshot('real-chat-dark.png', { maxDiffPixelRatio: 0.02 });
 

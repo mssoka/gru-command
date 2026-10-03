@@ -1005,10 +1005,16 @@ test.describe('themes', () => {
       page.locator('#board-owner .board-owner__row', { hasText: 'Fix the payment retry loop' }),
     ).toBeVisible();
 
+    // Whole-page captures must be scroll-invariant: interacting with the
+    // composer can scroll the scrollable shell, and a non-zero page scroll
+    // moves the content (and the sticky band head) under the capture —
+    // observed as RED with the owner band scrolled away. Pin the origin.
+    await page.evaluate(() => window.scrollTo(0, 0));
     await expect(page.locator('html')).not.toHaveClass(/dark/);
     await expect(page).toHaveScreenshot('chat-light.png', { maxDiffPixelRatio: 0.02 });
 
     await page.locator('#theme-toggle').click();
+    await page.evaluate(() => window.scrollTo(0, 0));
     await expect(page.locator('html')).toHaveClass(/dark/);
     await expect(page).toHaveScreenshot('chat-dark.png', { maxDiffPixelRatio: 0.02 });
 
