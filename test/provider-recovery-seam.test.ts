@@ -494,9 +494,13 @@ describe('supervisor ⇄ sensor seam', () => {
     h.ledger.setProviderWaitStatus(wait.id, 'recovered-pending');
     const rearmed = h.supervisor.ownedProviderReArm(handle.id, wait.id);
     expect(rearmed).toBe(true);
-    // ...and the re-arm clears it with the breaker: a watching agent must
-    // never carry a stale stopReason (final independent review A0/E0).
-    expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'watching', breakerOpen: false, stopReason: null });
+    // ...and the re-arm clears it with the breaker: a restarted agent must
+    // never carry a stale stopReason (final independent review A0/E0). The
+    // restart rung starts synchronously, so the state may already read
+    // 'restarting' here — the durable truth is the cleared breaker/cause.
+    const rearmedView = h.supervisor.viewFor(handle.id);
+    expect(rearmedView).toMatchObject({ breakerOpen: false, stopReason: null });
+    expect(rearmedView?.state).not.toBe('stopped');
     const events = h.ledger.listEvents({ limit: 20 }).filter((e) => e.kind === 'supervision.rearmed');
     expect(events.some((e) => e.payload !== null && typeof e.payload === 'object' && (e.payload as { by?: string }).by === 'provider-recovery')).toBe(true);
     // A wrong wait id (not this agent's open wait) is refused.
