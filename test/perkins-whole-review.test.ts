@@ -1398,7 +1398,9 @@ describe('packaged product and terminal-frame coverage (N6)', () => {
     expect(stagedOps).toContain('never compensate by reopening delivered jobs or building');
     // The shipped worker prompt points at this README section: prove the
     // heading travels in the installed package.
-    const stagedReadme = readFileSync(join(stage, 'README.md'), 'utf-8');
+    // README phrases may wrap across markdown lines — flatten first (same
+    // rule as the staged persona/ops checks above).
+    const stagedReadme = readFileSync(join(stage, 'README.md'), 'utf-8').replace(/\s+/gu, ' ');
     expect(stagedReadme).toContain('### Project-local BMAD setup');
     // The shipped README carries the corrected fallback-gate semantics too.
     expect(stagedReadme).toContain('its PASS is not a Perkins READY');
