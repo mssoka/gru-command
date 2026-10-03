@@ -32,7 +32,7 @@ review-rebrief-interlock = "node tools/patch-vitest-rpc-timeout.mjs && npx vites
 # regression (deterministic settled-lane wait), the digest fence and the
 # recomputed pins — unchanged configs/budgets, the approved RPC patch first,
 # plain vitest; scheduled only via /api/verify.
-review-rebrief-r1-repair = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/branch-idle-guard.test.ts test/dispatch-server.test.ts test/worktree-port.test.ts test/silas-driver.test.ts test/suite-shape.test.ts"
+review-rebrief-r1-repair = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/branch-idle-guard.test.ts test/dispatch-server.test.ts test/worktree-port.test.ts test/silas-driver.test.ts test/suite-shape.test.ts && npx vitest run test/perkins-whole-review.test.ts -t \"report rejection\""
 
 # Integrated-head report-shape scope (phase pr144-r1-main-integration-20261003):
 # the perkins-whole-review report-validation cases split one-per-case after the
