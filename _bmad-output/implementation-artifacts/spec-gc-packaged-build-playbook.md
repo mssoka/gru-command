@@ -162,6 +162,17 @@ checkout, home paths, journal, or global custom instructions).
       subagent/extension bypass are forbidden, and the loud
       capability-gap stop stays. Tests negative-pin the retired wording
       at every loader surface.
+- [x] outcome-truth clarification (owner clarification 2026-10-02,
+      consumed 2026-10-03): `roles/minion.md`, `roles/silas.md`,
+      `roles/gru.md`, `resources/silas-skills/ops-dispatch/SKILL.md`,
+      `docs/FLOW.md` -- a fulfilled call/HTTP 200/tool return/turn
+      ending/receipt is not delivery; failed or unknown outcomes keep
+      error evidence and a GC-owned repair obligation; delivered,
+      terminal, and parked jobs are never reopened to compensate;
+      artifact jobs complete at their artifact handback; current phase
+      is distinct from historical delivery events; a failed attempt does
+      not destroy the undertaking. Pins at the loader, installed-layout,
+      staged-tarball, and raw gru seams.
 - [x] baseline fixture repair: `.gru-command/worktree.toml` -- the
       packaged-playbook baseline `prep` path is anchored at "$root" so
       the build-log redirect lands after the `cd` into the snapshot
@@ -308,6 +319,24 @@ checkout, home paths, journal, or global custom instructions).
   `prep="$root/_bmad-output/gate-prep"`. The snapshot pointer, build
   guard, overlaid test files, and expected-RED intent are unchanged; the
   prior exit-99 receipt and snapshot remain preserved as evidence.
+
+- 2026-10-03 outcome-truth clarification (owner clarification
+  2026-10-02, delivery-truth; supersedes any reading that would reopen
+  genuinely delivered jobs). Amended: `roles/minion.md`,
+  `roles/silas.md`, `roles/gru.md`,
+  `resources/silas-skills/ops-dispatch/SKILL.md`, `docs/FLOW.md` — a
+  fulfilled call, HTTP 200, tool return, turn ending, or receipt is not
+  delivery; failed/unknown outcomes keep their error evidence and a
+  GC-owned repair/retry obligation; genuinely delivered, terminal, and
+  parked jobs are never reopened to compensate; current phase is distinct
+  from historical delivery events; a failed attempt does not destroy the
+  undertaking. Policy vs implemented extended with the outcome/phase
+  state: `durable-blocked-followthrough` / PR #136 carries the durable
+  directive/phase machinery but its native r4 verdict is NEEDS CHANGES
+  at the inspected head (resolve-but-error turns, unmarked crash
+  windows, reconciler starvation); `/api/verify` admission/re-arm (#159)
+  is missing; no parallel outcome system is authorized. KEEP: continuous
+  completion, worker/owner boundaries, exact-head gates, no caps.
 
 - 2026-10-03 native round 3 fix (trigger: Perkins round
   `gc-packaged-build-playbook-20261002-r3` NEEDS CHANGES on 60cfbd8 — 1
