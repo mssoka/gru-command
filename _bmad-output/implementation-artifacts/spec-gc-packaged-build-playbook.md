@@ -440,6 +440,33 @@ bad_spec).
   blockers against the fixed head; a fresh exact-head round is requested
   after the re-verification of the fix commits.
 
+- Round `gc-packaged-build-playbook-20261002-r2` frozen at target
+  `ff2f49d` (base `5d56194`; diff base `5d56194`), seven lenses; verdict
+  **NEEDS CHANGES** — 1 blocker + 2 warnings, posted to PR #165:
+  - Prior finding 1 (nested admission) **fixed/accepted**: the reviewer
+    confirms the prompt-level fail-loud alternative, the ops scheduling
+    wording, and the new pins; no nonblocking-dispatch implementation is
+    claimed.
+  - Prior finding 0 **carried**: the canonical briefing supplied to the
+    round still contains the original `bmad-build` acceptance while the
+    shipped contract selects by capability. The reviewer's resolution:
+    "Freeze the actual owner-approved amendment into the canonical
+    briefing/acceptance and re-review against that consistent contract."
+    This is an operations/owner action: the review's spec source is
+    `job.briefing` (`src/dispatch/perkins.ts:2041`) and no worker or ops
+    HTTP surface can amend it (`LedgerApi.setJobBriefing` has no caller),
+    so the worker cannot resolve it in-lane. Surface to the chief/ops with
+    pointers; do not request another round until the amendment is frozen.
+  - Warning 1 (onboarding pointer) **patched**: `roles/minion.md` now
+    names the setup wizard's project-local BMAD install step and the
+    README's "Project-local BMAD setup" section; pins added at the worker,
+    installed-layout, and staged-tarball seams.
+  - Warning 2 (baseline setup exit) **patched**: `.gru-command/worktree.toml`
+    defines `setup_fail` first and guards every setup step (mkdir, RPC
+    patch, mktemp, archive/extract, overlay, link, head, pointer write,
+    cd) with the distinct exit 3, so a setup failure can never read as the
+    expected test RED.
+
 ## Verification
 
 **Commands (all through the authenticated `/api/verify` scheduler — the
