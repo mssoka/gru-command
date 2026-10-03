@@ -320,6 +320,23 @@ checkout, home paths, journal, or global custom instructions).
   guard, overlaid test files, and expected-RED intent are unchanged; the
   prior exit-99 receipt and snapshot remain preserved as evidence.
 
+- 2026-10-03 base-conflict continuation (amendment
+  `gru-pr165-base-conflict-20261003-once`): origin/main advanced to
+  `9bb51b0` (PR #136 durable-blocked-followthrough merged; PR #149
+  earlier), making PR #165 DIRTY on the then-head `7a7702a`.
+  History-preserving merge integrated origin/main at `27576fb`; the only
+  conflict was `_bmad-output/implementation-artifacts/deferred-work.md`
+  (both sides' entries kept). `docs/FLOW.md` policy-vs-implemented
+  updated truthfully: PR #136 is now merged (durable directives,
+  request-id idempotency, marked phase handoffs, per-turn terminal
+  outcome validation in `src/runtime/prompt-verdict.ts`, boot
+  reconciliation); the remaining open gaps stay named
+  (#159/#160/#162/#163 — `stalledWorking` still keys on historical
+  delivery) and no runtime guarantee is claimed. All prior controls and
+  amendments preserved; the continuous-completion and outcome-truth
+  contract remains shipped. Failed FULLs `c16457f6` (b3a204a) and the
+  earlier failures/capture gaps remain preserved.
+
 - 2026-10-03 outcome-truth clarification (owner clarification
   2026-10-02, delivery-truth; supersedes any reading that would reopen
   genuinely delivered jobs). Amended: `roles/minion.md`,
