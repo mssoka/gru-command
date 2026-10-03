@@ -1004,6 +1004,7 @@ async function main(): Promise<number> {
     maxConcurrentChildren: config.review.maxConcurrentChildren,
     bus,
     reviewArtifactRoot: join(config.dataDir, 'reviews'),
+    evidenceUploadsDir: join(config.dataDir, 'uploads'),
     reviewPreflight: (input) => reviewPreflightCheck(config, registry, input.repoPath),
     fallbackGate: {
       skillPath: resolveBmadReviewSkillPath(),

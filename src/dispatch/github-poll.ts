@@ -138,6 +138,12 @@ export interface CiFailure {
   readonly url: string | null;
 }
 
+/** One completed check run's identity (name + optional run/details URL). */
+export interface CiCheckRun {
+  readonly name: string;
+  readonly url: string | null;
+}
+
 export interface CiState {
   readonly sha: string;
   readonly status: CiStatus;
@@ -146,6 +152,9 @@ export interface CiState {
   readonly signature: string;
   readonly failures: readonly CiFailure[];
   readonly checks: readonly string[];
+  /** Completed check-run identities with their URLs when the host exposed
+   * them. Present on freshly summarized states; absent on legacy payloads. */
+  readonly runs?: readonly CiCheckRun[];
 }
 
 export interface NormalizedBranchState {
@@ -186,11 +195,15 @@ export function summarizeCheckRuns(sha: string, runs: readonly GhCheckRun[]): Ci
     .filter((run) => run.conclusion !== null && FAILURE_CONCLUSIONS.has(run.conclusion))
     .map((run) => ({ name: run.name, conclusion: run.conclusion as string, url: run.url }));
   const pending = runs.some((run) => run.status !== 'completed');
-  const checks = runs.filter((run) => run.status === 'completed').map((run) => run.name).sort();
+  const completed = runs
+    .filter((run) => run.status === 'completed')
+    .map((run) => ({ name: run.name, url: run.url }))
+    .sort((left, right) => left.name.localeCompare(right.name));
+  const checks = completed.map((run) => run.name);
   const signature = failures.map((failure) => failure.name).sort().join('|');
-  if (failures.length > 0) return { sha, status: 'failed', signature, failures, checks };
-  if (pending) return { sha, status: 'pending', signature: '', failures: [], checks };
-  return { sha, status: 'green', signature: '', failures: [], checks };
+  if (failures.length > 0) return { sha, status: 'failed', signature, failures, checks, runs: completed };
+  if (pending) return { sha, status: 'pending', signature: '', failures: [], checks, runs: completed };
+  return { sha, status: 'green', signature: '', failures: [], checks, runs: completed };
 }
 
 /** Mechanical checks are build/test/lint-style kinds a lane can fix; every
@@ -320,6 +333,8 @@ export interface CiGreenSignal extends GitHubSignalBase {
   readonly kind: 'ci-green';
   readonly sha: string;
   readonly checks: readonly string[];
+  /** Completed check-run identities/URLs when observed. */
+  readonly runs?: readonly CiCheckRun[];
 }
 
 export type GitHubSignal = PrMergedSignal | PrConflictSignal | CiFailedSignal | CiGreenSignal;
@@ -368,7 +383,7 @@ export function diffBranchState(
   if (ci !== null && ci.status === 'green') {
     const alreadyApplied = prev?.ci != null && prev.ci.sha === ci.sha && prev.ci.status === 'green';
     if (!alreadyApplied) {
-      signals.push({ kind: 'ci-green', ...base, sha: ci.sha, checks: ci.checks });
+      signals.push({ kind: 'ci-green', ...base, sha: ci.sha, checks: ci.checks, ...(ci.runs !== undefined ? { runs: ci.runs } : {}) });
     }
   }
   return signals;
@@ -694,6 +709,7 @@ export function branchStatePayload(lane: TrackedLane, state: NormalizedBranchSta
             signature: state.ci.signature,
             failures: state.ci.failures,
             checks: state.ci.checks,
+            ...(state.ci.runs !== undefined ? { runs: state.ci.runs } : {}),
           },
   };
 }
@@ -735,6 +751,15 @@ export function readBranchState(ledger: Pick<GitHubPollLedger, 'latestJobEvent'>
           checks: Array.isArray(ciRaw['checks'])
             ? (ciRaw['checks'] as unknown[]).filter((entry): entry is string => typeof entry === 'string')
             : [],
+          ...(Array.isArray(ciRaw['runs'])
+            ? {
+                runs: (ciRaw['runs'] as unknown[]).flatMap((entry): CiCheckRun[] => {
+                  const run = record(entry);
+                  const name = run !== null ? strOrNull(run['name']) : null;
+                  return run === null || name === null ? [] : [{ name, url: strOrNull(run['url']) }];
+                }),
+              }
+            : {}),
         };
   return {
     sha: strOrNull(payload['sha']),
@@ -1083,6 +1108,7 @@ export class GitHubSignalPoll {
         pr: signal.prNumber,
         sha: signal.sha,
         checks: signal.checks,
+        ...(signal.runs !== undefined ? { runs: signal.runs } : {}),
       },
     });
     this.log('info', 'github poll: CI green signal recorded', {

@@ -13,6 +13,7 @@ import { BranchBusyError } from './branch-idle.js';
 import { deliveredTargetSha } from './silas-driver.js';
 import type { WorktreePort } from './worktree-port.js';
 import type { PacingGate, RetrySettlement } from '../runtime/pacing.js';
+import { REVIEW_EVIDENCE_MAX_FILES, type ReviewEvidenceRequest } from '../review-inputs/evidence.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -99,6 +100,53 @@ function optStrArray(body: Record<string, unknown>, field: string): readonly str
     throw new Error(`${field} must be an array of non-empty strings`);
   }
   return value as readonly string[];
+}
+
+/** Arm-time private evidence references: service-managed upload identities
+ * with an honest purpose and a consent reference. Shape/bounds are checked
+ * here; identity/media/bytes are validated at freeze (where a failure can
+ * never leave partial evidence). */
+function optEvidenceField(body: Record<string, unknown>): readonly ReviewEvidenceRequest[] | undefined {
+  const value = body['evidence'];
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new Error('evidence must be a non-empty array when supplied');
+  }
+  if (value.length > REVIEW_EVIDENCE_MAX_FILES) {
+    throw new Error(`evidence carries more than ${REVIEW_EVIDENCE_MAX_FILES} attachments`);
+  }
+  return value.map((entry, index) => {
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+      throw new Error(`evidence[${index}] must be an object`);
+    }
+    const object = entry as Record<string, unknown>;
+    const allowed = new Set(['upload_path', 'purpose', 'consent_ref', 'captured_at']);
+    for (const key of Object.keys(object)) {
+      if (!allowed.has(key)) throw new Error(`evidence[${index}] has unknown field "${key}"`);
+    }
+    const uploadPath = object['upload_path'];
+    const purpose = object['purpose'];
+    const consentRef = object['consent_ref'];
+    const capturedAt = object['captured_at'];
+    if (typeof uploadPath !== 'string' || uploadPath.trim() === '') {
+      throw new Error(`evidence[${index}].upload_path must be a non-empty string`);
+    }
+    if (typeof purpose !== 'string' || purpose.trim() === '') {
+      throw new Error(`evidence[${index}].purpose must be a non-empty string`);
+    }
+    if (typeof consentRef !== 'string' || consentRef.trim() === '') {
+      throw new Error(`evidence[${index}].consent_ref must be a non-empty string`);
+    }
+    if (capturedAt !== undefined && (typeof capturedAt !== 'string' || capturedAt.trim() === '')) {
+      throw new Error(`evidence[${index}].captured_at must be a non-empty string when supplied`);
+    }
+    return {
+      uploadPath,
+      purpose,
+      consentRef,
+      ...(typeof capturedAt === 'string' ? { capturedAt } : {}),
+    };
+  });
 }
 
 export function createDispatchServer(options: DispatchServerOptions): DispatchServer {
@@ -228,6 +276,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       const force = optBoolField(body, 'force');
       const ruleId = optStrField(body, 'rule_id');
       const sourceRoundId = optStrField(body, 'source_round_id');
+      const evidenceRefs = optEvidenceField(body);
       if ((ruleId === undefined) !== (sourceRoundId === undefined) ||
           (ruleId !== undefined && (by !== 'silas' || ruleId !== 'clean-abort-service-restart'))) {
         throw new Error('rule_id/source_round_id must be paired and only silas may use clean-abort-service-restart');
@@ -238,6 +287,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         ...(optStrArray(body, 'lenses') !== undefined ? { lenses: optStrArray(body, 'lenses') } : {}),
         ...(optBoolField(body, 'no_spec') !== undefined ? { noSpec: optBoolField(body, 'no_spec') } : {}),
         ...(force !== undefined ? { force } : {}),
+        ...(evidenceRefs !== undefined ? { evidence: evidenceRefs } : {}),
         ...(by === 'minion' ? { handoff: true } : {}),
       };
       if (sourceRoundId !== undefined) {
@@ -332,6 +382,107 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       if (!authed(req, res)) return true;
       const rows = options.dispatch.worktreesFor(decodeURIComponent(worktreesMatch[1] ?? ''));
       json(res, 200, { worktrees: rows });
+      return true;
+    }
+    // Canonical job amendments (owner ruling j-969): authenticated,
+    // append-only, expected-contract-hash concurrency, audited provenance.
+    // The bearer token is the service authority; approval provenance is
+    // recorded but never inferred from body text or a caller-declared role.
+    const contractMatch = /^\/api\/dispatch\/jobs\/([^/]+)\/contract$/.exec(path);
+    if (req.method === 'GET' && contractMatch !== null) {
+      if (!authed(req, res)) return true;
+      const jobId = decodeURIComponent(contractMatch[1] ?? '');
+      const job = options.ledger.getJob(jobId);
+      if (job === null) {
+        json(res, 404, { error: 'job_not_found', detail: `job "${jobId}" not found` });
+        return true;
+      }
+      const contract = options.ledger.effectiveContract(jobId);
+      const amendments = options.ledger.listJobAmendments(jobId);
+      json(res, 200, {
+        job_id: jobId,
+        version: contract?.version ?? 0,
+        base_sha256: contract?.baseSha256 ?? null,
+        contract_sha256: contract?.contractSha256 ?? null,
+        effective_contract: contract?.text ?? null,
+        amendments: amendments.map((amendment) => ({
+          id: amendment.id,
+          version: amendment.version,
+          created_at: amendment.createdAt,
+          body_sha256: amendment.bodySha256,
+          supersedes: amendment.supersedes,
+          approval: amendment.approval,
+          previous_contract_sha256: amendment.previousContractSha256,
+          contract_sha256: amendment.contractSha256,
+        })),
+      });
+      return true;
+    }
+    if (req.method === 'POST' && path === '/api/dispatch/amendment') {
+      if (!authed(req, res)) return true;
+      const body = await readBody(req);
+      // Parse BEFORE any mutation: a malformed request is refused, never
+      // half-applied. Approval provenance is REQUIRED (missing provenance is
+      // an authorization failure, not a default).
+      const rawApproval = body['approval'] as Record<string, unknown> | undefined;
+      if (rawApproval === undefined) {
+        json(res, 400, { error: 'improper_authorization', detail: 'approval {by, reference} is required' });
+        return true;
+      }
+      const approvalBy = optStrField(rawApproval, 'by');
+      const approvalReference = optStrField(rawApproval, 'reference');
+      const jobId = strField(body, 'job_id');
+      if (approvalBy === undefined || approvalReference === undefined) {
+        options.ledger.appendCustomEvent({
+          kind: 'job.amendment-rejected',
+          jobId,
+          payload: { code: 'improper-authorization', reason: 'approval {by, reference} is required' },
+        });
+        json(res, 400, { error: 'improper_authorization', detail: 'approval {by, reference} is required' });
+        return true;
+      }
+      const result = options.ledger.addJobAmendment({
+        jobId,
+        body: strField(body, 'body'),
+        ...(optStrArray(body, 'supersedes') !== undefined ? { supersedes: optStrArray(body, 'supersedes') } : {}),
+        approval: { by: approvalBy, reference: approvalReference },
+        expectedContractSha256: strField(body, 'expected_contract_sha256'),
+        ...(optStrField(body, 'idempotency_key') !== undefined ? { idempotencyKey: optStrField(body, 'idempotency_key') } : {}),
+      });
+      if (result.status === 'accepted') {
+        json(res, 200, {
+          status: 'accepted',
+          idempotent: result.idempotent,
+          amendment: {
+            id: result.amendment.id,
+            version: result.amendment.version,
+            created_at: result.amendment.createdAt,
+            body_sha256: result.amendment.bodySha256,
+            supersedes: result.amendment.supersedes,
+            approval: result.amendment.approval,
+            previous_contract_sha256: result.amendment.previousContractSha256,
+            contract_sha256: result.amendment.contractSha256,
+          },
+          contract: {
+            version: result.contract.version,
+            base_sha256: result.contract.baseSha256,
+            contract_sha256: result.contract.contractSha256,
+          },
+        });
+        return true;
+      }
+      const status = result.code === 'job-not-found'
+        ? 404
+        : result.code === 'stale' || result.code === 'idempotency-conflict'
+          ? 409
+          : 400;
+      json(res, status, {
+        status: 'rejected',
+        error: result.code,
+        detail: result.reason,
+        ...(result.currentContractSha256 !== undefined ? { current_contract_sha256: result.currentContractSha256 } : {}),
+        ...(result.currentVersion !== undefined ? { current_version: result.currentVersion } : {}),
+      });
       return true;
     }
     if (req.method === 'POST' && path === '/api/silas/directive') {

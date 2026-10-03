@@ -30,8 +30,20 @@ import {
   resolveReviewBaseRef,
   reviewArtifactDirectory,
   writeReviewArtifact,
+  FROZEN_SPEC_MAX_BYTES,
+  type FreezeReviewInput,
   type FrozenReview,
 } from './perkins-review/artifacts.js';
+import { renderEffectiveContract } from '../review-inputs/amendments.js';
+import {
+  appendCiEvidence,
+  renderRecordedCiEvidence,
+  CI_BRANCH_STATE_EVENT,
+  CI_FAILED_EVENT,
+  CI_GREEN_EVENT,
+} from '../review-inputs/ci-evidence.js';
+import type { ReviewEvidenceRequest } from '../review-inputs/evidence.js';
+import { parseGitHubPrUrl } from './github-poll.js';
 import {
   boundedDiff,
   isGitHubRemote,
@@ -1009,6 +1021,10 @@ export interface WaveRunnerOptions {
   readonly escalate?: (title: string, detail: string) => void;
   /** Stable service-owned root. Required for every production review. */
   readonly reviewArtifactRoot?: string;
+  /** The service uploads dir (`<data_dir>/uploads`): the ONLY namespace an
+   * arm may select private review evidence from. Absent = evidence intake
+   * refuses loudly. */
+  readonly evidenceUploadsDir?: string;
   /** Test/packaging seam. Production always uses the integrity-pinned loader. */
   readonly reviewPolicyLoader?: () => PerkinsPolicy;
   /** Fail-closed four-leg capability pre-flight, evaluated per review request
@@ -1042,7 +1058,7 @@ export class WaveRunner {
   private readonly activeControllers = new Set<AbortController>();
   private readonly activeFallbackGates = new Set<string>();
   private readonly handoffs = new Map<string, {
-    readonly input: { jobId: string; targetRef?: string; lenses?: readonly string[]; noSpec?: boolean; force?: boolean };
+    readonly input: { jobId: string; targetRef?: string; lenses?: readonly string[]; noSpec?: boolean; force?: boolean; evidence?: readonly ReviewEvidenceRequest[] };
     readonly seq: number;
     starting: boolean;
     /** Post-intake hold: visible obligation, NOT sweep-rearmable. */
@@ -1432,6 +1448,8 @@ export class WaveRunner {
     lenses?: readonly string[];
     noSpec?: boolean;
     force?: boolean;
+    /** Authorized private evidence attachments (service upload identities). */
+    evidence?: readonly ReviewEvidenceRequest[];
     /** Worker tool handoff: acknowledge without waiting for its own turn. */
     handoff?: boolean;
     /** Internal replay marker; never accepted from the public HTTP endpoint. */
@@ -1453,7 +1471,8 @@ export class WaveRunner {
         const differs =
           (input.lenses !== undefined && JSON.stringify(input.lenses) !== JSON.stringify((existing.input as { lenses?: readonly string[] }).lenses ?? undefined)) ||
           (input.targetRef !== undefined && input.targetRef !== (existing.input as { targetRef?: string }).targetRef) ||
-          (input.noSpec !== undefined && input.noSpec !== (existing.input as { noSpec?: boolean }).noSpec);
+          (input.noSpec !== undefined && input.noSpec !== (existing.input as { noSpec?: boolean }).noSpec) ||
+          (input.evidence !== undefined && JSON.stringify(input.evidence) !== JSON.stringify((existing.input as { evidence?: readonly ReviewEvidenceRequest[] }).evidence ?? undefined));
         if (differs) {
           this.opts.ledger.appendCustomEvent({
             kind: 'job.review-handoff-conflict', jobId: input.jobId,
@@ -1461,6 +1480,7 @@ export class WaveRunner {
               ...(input.lenses !== undefined ? { lenses: input.lenses } : {}),
               ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
               ...(input.noSpec !== undefined ? { noSpec: input.noSpec } : {}),
+              ...(input.evidence !== undefined ? { evidence_count: input.evidence.length } : {}),
             } },
           });
         }
@@ -1474,6 +1494,7 @@ export class WaveRunner {
         ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
         ...(input.lenses !== undefined ? { lenses: input.lenses } : {}),
         ...(input.noSpec !== undefined ? { noSpec: input.noSpec } : {}),
+        ...(input.evidence !== undefined ? { evidence: input.evidence } : {}),
       };
       const event = this.opts.ledger.appendCustomEvent({ kind: 'job.review-handoff-queued', jobId: input.jobId, payload: { input: safeInput } });
       const pending = this.trackHandoff(safeInput, event.seq);
@@ -1505,7 +1526,7 @@ export class WaveRunner {
     return { route: 'perkins', round: begun.round, run: begun.run };
   }
 
-  private trackHandoff(input: { jobId: string; targetRef?: string; lenses?: readonly string[]; noSpec?: boolean; force?: boolean }, seq: number) {
+  private trackHandoff(input: { jobId: string; targetRef?: string; lenses?: readonly string[]; noSpec?: boolean; force?: boolean; evidence?: readonly ReviewEvidenceRequest[] }, seq: number) {
     let resolve!: () => void;
     const run = new Promise<void>((done) => { resolve = done; });
     const pending = { input, seq, starting: false, held: false, run, resolve };
@@ -1639,6 +1660,7 @@ export class WaveRunner {
     lenses?: readonly string[];
     noSpec?: boolean;
     force?: boolean;
+    evidence?: readonly ReviewEvidenceRequest[];
   }): Promise<{ readonly round: RoundRecord; readonly run: Promise<WaveOutcome> }> {
     this.enforceBranchIdleForRequest(input);
     let reviewModel: ReviewPreflightResult['reviewModel'];
@@ -1734,6 +1756,7 @@ export class WaveRunner {
     lenses?: readonly string[];
     noSpec?: boolean;
     force?: boolean;
+    evidence?: readonly ReviewEvidenceRequest[];
     reviewModel?: ReviewPreflightResult['reviewModel'];
   }): Promise<{ readonly round: RoundRecord; readonly run: Promise<WaveOutcome> }> {
     if (this.shuttingDown) throw new Error('Perkins review service is shutting down');
@@ -2001,6 +2024,7 @@ export class WaveRunner {
     lenses?: readonly string[];
     noSpec?: boolean;
     force?: boolean;
+    evidence?: readonly ReviewEvidenceRequest[];
     reviewModel?: ReviewPreflightResult['reviewModel'];
   }, setupSignal: AbortSignal): Promise<{ readonly round: RoundRecord; readonly run: Promise<WaveOutcome> }> {
     if (this.shuttingDown || setupSignal.aborted) throw new Error('Perkins review service is shutting down');
@@ -2034,12 +2058,40 @@ export class WaveRunner {
       explicitTarget: input.targetRef !== undefined && input.targetRef.trim() !== '',
     });
     const baseRef = resolveReviewBaseRef(jobWorktree.path, job.baseBranch);
+    // Effective acceptance (owner ruling j-969): the original briefing
+    // rendered with the job's accepted canonical amendments. Zero amendments
+    // render the original bytes exactly — legacy jobs are unaffected.
+    const amendments = this.opts.ledger.listJobAmendments(job.id);
+    const contract = renderEffectiveContract(job.briefing, amendments);
+    let spec = contract.text ?? undefined;
+    let acceptance: FreezeReviewInput['acceptance'];
+    // Exact-target CI evidence (owner ruling j-969): a host-recorded,
+    // repo/PR/sha-bound observation is rendered beside the scheduler block;
+    // absence/staleness/another repo renders an explicit limitation, never a
+    // PASS. The structured record freezes into the manifest even when no
+    // spec is supplied (explicit no-spec reviews keep their mode).
+    const prIdentity = job.prUrl !== null ? parseGitHubPrUrl(job.prUrl) : null;
+    const ci = renderRecordedCiEvidence({
+      events: {
+        branchState: this.opts.ledger.latestJobEvent(job.id, CI_BRANCH_STATE_EVENT),
+        ciGreen: this.opts.ledger.latestJobEvent(job.id, CI_GREEN_EVENT),
+        ciFailed: this.opts.ledger.latestJobEvent(job.id, CI_FAILED_EVENT),
+      },
+      targetSha,
+      expectedRepo: prIdentity !== null ? `${prIdentity.owner}/${prIdentity.repo}` : null,
+      expectedPr: prIdentity?.number ?? null,
+    });
     // Recorded verification evidence (2026-09-22 fix): a completed
     // scheduler run on the exact frozen target (clean tree) is handed to
     // the review as ledger-backed context, so the tests lens weighs the
     // host's record over any pasted report. No binding run -> no block.
-    let spec = job.briefing ?? undefined;
     if (input.noSpec !== true && spec !== undefined) {
+      acceptance = {
+        contractText: contract.text as string,
+        version: contract.version,
+        baseSha256: contract.baseSha256,
+        amendmentIds: contract.amendmentIds,
+      };
       const evidence = renderRecordedVerification(
         this.opts.ledger.latestJobEvent(job.id, VERIFICATION_COMPLETED_EVENT),
         targetSha,
@@ -2051,6 +2103,12 @@ export class WaveRunner {
           log: (level, msg, fields) => this.log(level, msg, { job: job.id, ...fields }),
         });
       }
+      spec = appendCiEvidence({
+        spec,
+        block: ci.block,
+        maxBytes: FROZEN_SPEC_MAX_BYTES,
+        log: (level, msg, fields) => this.log(level, msg, { job: job.id, ...fields }),
+      });
     }
     const flippedFrom = job.status === 'working' || job.status === 'blocked' ? job.status : null;
     let round: RoundRecord;
@@ -2093,9 +2151,33 @@ export class WaveRunner {
         targetRef: targetSha,
         movementRef,
         ...(input.noSpec === true ? { noSpec: true } : { spec }),
+        jobId: job.id,
+        ...(acceptance !== undefined ? { acceptance } : {}),
+        ...(input.evidence !== undefined && input.evidence.length > 0 ? { evidence: input.evidence } : {}),
+        ...(this.opts.evidenceUploadsDir !== undefined ? { evidenceUploadsDir: this.opts.evidenceUploadsDir } : {}),
+        ciEvidence: ci.record,
         ...(input.force === true
           ? { branchIdle: { forced: true as const, targetBranch: idle.targetBranch, blockers: idle.blockers } }
           : {}),
+      });
+      // Frozen-input audit trail: metadata hashes/provenance only (no
+      // pixels, no upload paths, no contract body duplication).
+      this.opts.ledger.appendCustomEvent({
+        kind: 'round.review-inputs-frozen',
+        jobId: job.id,
+        roundId: round.id,
+        payload: {
+          acceptance: frozenReview.manifest.acceptance ?? null,
+          evidence: (frozenReview.manifest.reviewEvidence?.attachments ?? []).map((attachment) => ({
+            id: attachment.id,
+            purpose: attachment.purpose,
+            media_type: attachment.mediaType,
+            bytes: attachment.bytes,
+            sha256: attachment.sha256,
+            consent_ref: attachment.consentRef,
+          })),
+          ci: frozenReview.manifest.reviewEvidence?.ci ?? null,
+        },
       });
       if (this.opts.reserveReviewRound === undefined) this.opts.ledger.setRoundStatus(round.id, 'live');
     } catch (error) {
