@@ -32,7 +32,7 @@ import { promptVerdictFromHealth } from '../src/runtime/prompt-verdict.js';
 import type { PromptTurnVerdict } from '../src/runtime/types.js';
 import { DispatchService } from '../src/dispatch/service.js';
 import { routeFixDirectiveToMinion } from '../src/dispatch/fix-directive.js';
-import { PR_CREATION_RULE } from '../src/dispatch/pr-creation.js';
+import { appendWorkerRules } from '../src/dispatch/worker-rules.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { makeFixtureRepo } from './helpers/fixture-repo.js';
 import type { WorktreePort } from '../src/dispatch/worktree-port.js';
@@ -237,6 +237,10 @@ function boot(
     workerGate?: PacingGate;
     sleep?: (ms: number) => Promise<void>;
     jitter?: (capMs: number) => number;
+    /** Watchdog silence window override (default 50 ms; long-run tests
+     * simulate hours with a realistic window instead of flake-prone
+     * microsecond beats). */
+    turnSilenceMs?: number;
   } = {},
 ): Harness {
   const dir = tmpDir();
@@ -269,7 +273,7 @@ function boot(
   const supervisor = new Supervisor({
     config: {
       enabled: true,
-      turnSilenceMs: 50,
+      turnSilenceMs: opts.turnSilenceMs ?? 50,
       restartWindowMs: 600_000,
       maxRestarts: 3,
       restartBackoffMs: 1,
@@ -1852,6 +1856,92 @@ describe('supervisor — live tools, sleep/wake, and interrupted-turn recovery',
     h.dispose();
   });
 
+  it('progress past the historical 28/36 call counts never trips a cap, quarantine, or hand-back (issue #158)', async () => {
+    const h = boot();
+    const handle = new FakeHandle('minion', 'minion-no-call-cap', null);
+    h.registry.adopt(handle);
+    const spawns = h.registry.spawnCalls.length;
+    const notificationsBefore = h.api.listNotifications({ limit: 200 }).length;
+    hang(handle);
+    // Forty calls — past the historical 28-call phase ceiling and the
+    // 36-call session count. Every call is open with a live process
+    // (activity), heartbeats while it runs, and returns; one in thirteen
+    // errors. The count is telemetry: never a stall, stop, or compliance
+    // signal by itself.
+    for (let call = 0; call < 40; call += 1) {
+      const callId = `call-${call}`;
+      handle.emit({ type: 'tool_start', callId, tool: 'bash' });
+      handle.liveProcess = true;
+      h.advance(30); // under the 50 ms silence window
+      handle.emit({ type: 'tool_update', callId });
+      h.advance(10);
+      handle.liveProcess = false;
+      handle.emit({ type: 'tool_end', callId, isError: call % 13 === 0 });
+    }
+    await sleep(60);
+    const view = h.supervisor.viewFor('minion-no-call-cap');
+    expect(handle.disposed).toBe(false);
+    expect(h.registry.spawnCalls).toHaveLength(spawns);
+    expect(view?.state).toBe('watching');
+    expect(view?.stopReason ?? null).toBeNull();
+    expect(view?.breakerOpen).toBe(false);
+    expect(view?.restarts).toBe(0);
+    expect(view?.openToolCalls).toBe(0);
+    // No cap-only noncompliance flag, no quarantine escalation, no forced
+    // source hand-back: the round produced no supervision event at all.
+    expect(h.notificationsOfKind('supervision.hang')).toHaveLength(0);
+    expect(h.notificationsOfKind('supervision.breaker')).toHaveLength(0);
+    expect(h.notificationsOfKind('supervision.fatal')).toHaveLength(0);
+    expect(h.api.listNotifications({ limit: 200 }).length).toBe(notificationsBefore);
+    // The turn then settles normally; a settled turn is not a stall.
+    handle.setState('idle');
+    handle.emit({ type: 'turn_end' });
+    h.advance(120);
+    await sleep(60);
+    expect(handle.disposed).toBe(false);
+    expect(h.registry.spawnCalls).toHaveLength(spawns);
+    expect(h.api.listNotifications({ limit: 200 }).length).toBe(notificationsBefore);
+    h.dispose();
+  });
+
+  it('six simulated hours of continuous progress and a compaction boundary never trip a count or time quota', async () => {
+    // A one-minute watchdog window so simulated time can cover hours in
+    // bounded (sub-sleep-gap) beats — no wall-clock waiting in CI.
+    const h = boot(undefined, { turnSilenceMs: 60_000 });
+    const handle = new FakeHandle('minion', 'minion-long-run', null);
+    h.registry.adopt(handle);
+    const spawns = h.registry.spawnCalls.length;
+    handle.setState('streaming');
+    handle.emit({ type: 'turn_start' });
+    let openCall = 'run-0';
+    handle.emit({ type: 'tool_start', callId: openCall, tool: 'bash' });
+    let completedCalls = 0;
+    // 6 h: each 20 s beat carries activity; every other beat closes the
+    // open call and opens the next (~540 calls total, no transcript growth).
+    for (let beat = 0; beat < 1080; beat += 1) {
+      h.advance(20_000);
+      handle.emit({ type: 'tool_update', callId: openCall });
+      if (beat % 2 === 1) {
+        handle.emit({ type: 'tool_end', callId: openCall, isError: false });
+        completedCalls += 1;
+        openCall = `run-${completedCalls}`;
+        handle.emit({ type: 'tool_start', callId: openCall, tool: 'bash' });
+      }
+      // A resumable context boundary mid-run (native compaction) opens,
+      // stays open across beats, and completes — never a quota trigger.
+      if (beat === 400) handle.emit({ type: 'compaction_start' });
+      if (beat === 460) handle.emit({ type: 'compaction_end', success: true });
+    }
+    await sleep(60);
+    expect(completedCalls).toBe(540);
+    expect(handle.disposed).toBe(false);
+    expect(h.registry.spawnCalls).toHaveLength(spawns);
+    expect(h.supervisor.viewFor('minion-long-run')?.state).toBe('watching');
+    expect(h.notificationsOfKind('supervision.hang')).toHaveLength(0);
+    expect(h.notificationsOfKind('supervision.breaker')).toHaveLength(0);
+    h.dispose();
+  });
+
   it('a killed open turn is re-delivered on the resumed session under its owner', async () => {
     const h = boot();
     const handle = new FakeHandle('minion', 'minion-resume', null);
@@ -2687,8 +2777,8 @@ describe('worker delivery settlement under automatic rate-limit retry', () => {
       await sleeper.release();
       await expect(routing).resolves.toMatchObject({ delivered: true, minionId: 'minion-fresh-directive' });
       expect(handle!.promptCalls).toEqual([
-        { text: `fix the thing\n\n${PR_CREATION_RULE}`, owner: 'fix-directive' },
-        { text: `fix the thing\n\n${PR_CREATION_RULE}`, owner: 'fix-directive' },
+        { text: appendWorkerRules('fix the thing'), owner: 'fix-directive' },
+        { text: appendWorkerRules('fix the thing'), owner: 'fix-directive' },
       ]);
       expect(handle!.disposed).toBe(true);
     } finally { h.dispose(); }

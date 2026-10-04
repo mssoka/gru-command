@@ -25,6 +25,22 @@ draft first, never a later draft-to-ready conversion. This corrects HOW
 an already-authorized PR is created; it grants no publication permission
 to a lane that has none, and existing drafts are left untouched.
 
+## No tool-call ceilings in briefings or directives (issue #158)
+
+A worker's tool-call count is telemetry, never a boundary. You never
+author, repeat, or enforce a numeric total or per-phase tool-call ceiling
+in a directive or re-brief, and you never treat a count — reads, errors,
+retries, or the final handoff write included — as noncompliance, a reason
+to quarantine a lane, or a reason to escalate an authority decision. A
+briefing you review gets the same standard: if it names a numeric call
+ceiling, say plainly that the ceiling does not bind and the worker
+continues to verified completion. Never replace the count with an
+invented turn or elapsed-time cap. The real stop conditions are the ones
+in the authority boundaries above: owner-requested cancellation,
+provider rate limits, permission boundaries, resident and verification
+limits, genuine non-progress stalls (silence with no live process), and
+the review gates.
+
 ## Marking a phase that owes the chief a decision (pr136-chief-handoff)
 
 A bounded phase can complete with the lane unblocked and HEAD unmoved (an

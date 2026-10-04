@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { rebriefFreshMinion, recordFollowUpDelivery, renderRebriefPrompt, routeFixDirectiveToMinion } from '../src/dispatch/fix-directive.js';
 import { withFallbacks } from '../src/runtime/fallbacks.js';
 import type { AgentRuntime } from '../src/runtime/types.js';
-import { PR_CREATION_RULE } from '../src/dispatch/pr-creation.js';
+import { appendWorkerRules } from '../src/dispatch/worker-rules.js';
 import type { WorktreeLane } from '../src/dispatch/worktree-port.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
@@ -261,7 +261,7 @@ describe('eviction-safe fix directives (phase 3)', () => {
       registry: registry as never, ledger: ledger as never, worktrees,
       jobId: 'job-resume', directive: 'fix the blocker', signal: controller.signal,
     });
-    expect(prompted[0]).toBe(`fix the blocker\n\n${PR_CREATION_RULE}`); // resumed session gets the directive (never the re-brief wrapper), now carrying the current non-draft PR rule
+    expect(prompted[0]).toBe(appendWorkerRules('fix the blocker')); // resumed session gets the directive (never the re-brief wrapper), now carrying the current non-draft PR and no-call-budget rules
     rmSync(root, { recursive: true, force: true });
   });
 });

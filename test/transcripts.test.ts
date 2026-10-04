@@ -112,6 +112,27 @@ describe('transcript service', () => {
     expect(tool?.toolName).toBe('bash');
   });
 
+  it('records tool-call counts truthfully and never gates on them (issue #158)', () => {
+    const { dir, svc } = tmpStore();
+    const file = join(dir, 'sessions', 'minion', 'd', 's.jsonl');
+    mkdirSync(join(dir, 'sessions', 'minion', 'd'), { recursive: true });
+    const entries: Record<string, unknown>[] = [header(), userEntry('m1', null, 'do the work')];
+    let parent = 'm1';
+    for (let i = 0; i < 40; i += 1) {
+      entries.push(userEntry(`u${i}`, parent, `step ${i}`));
+      entries.push(toolEntry(`t${i}`, parent, 'bash', `result ${i}`));
+      parent = `u${i}`;
+    }
+    writeFileSync(file, sessionFile(entries));
+    // 40 tool calls — past the historical 28-call phase ceiling — all parse
+    // and serve: the count is telemetry, not a limit on what the record
+    // shows or how much of it a reader may see.
+    const page = svc.page('minion/d/s.jsonl', { limit: 200 });
+    expect(page.entries.filter((e) => e.kind === 'tool_result')).toHaveLength(40);
+    expect(page.entries.filter((e) => e.kind === 'user')).toHaveLength(41);
+    expect(page.entries.find((e) => e.kind === 'tool_result')?.toolName).toBe('bash');
+  });
+
   it('paginates newest-first with a nextCursor and bounded limits', () => {
     const { dir, svc } = tmpStore();
     const file = join(dir, 'sessions', 'gru', 'd', 's.jsonl');
