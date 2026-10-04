@@ -591,6 +591,12 @@ checkout, home paths, journal, or global custom instructions).
 | 75 | edge | low | Timeout scope skipped the second leg when the first failed → patch: both legs run and both rc values are reported |
 | 76 | edge | false, carried | Tasks text "full bmad-build cycle" vs name-free shipped prompts: the task wording is amended and the substance is the standing Acceptance-1 disposition (rows 58/previous) — owner/ops action |
 | 77 | edge | low | Owner-held positive pins pass pre-change → patch: fail-before provenance clarified in the test comment (the negative pins carry the fail-before evidence) |
+| 78 | native r5 | blocker (new) | Reviewer-commissioning precheck claimed the board pacing view covers the worker budget; pacing (turn pools) and the resident-session ceiling (default 4) are separate constraints — four busy parents pass the precheck and wait on reviewer POSTs while preventing their own admission (`roles/minion.md:103-110`) → patch: both constraints named; resident admission must be established (finish the turn with the review commission as its explicit next action, or stop loudly); submitted-dispatch reconciliation bounded by job identity; deterministic regression through DispatchService + real RuntimeRegistry at unlimited pacing/saturated residency + source/installed prompt pins |
+| 79 | native r5 | warning | `packaged-playbook-timeouts` returned PASS after the RPC patch prerequisite failed (`; rc1=0` shape) → patch: patch guarded with a distinct setup-failure exit (3), never a masked test result |
+| 80 | native r5 | warning | Baseline build log written to a truncating shared path outside the snapshot directory → patch: per-attempt log inside the unique snapshot dir; the pointer records the log path |
+| 81 | native r5 | note (verification limits) | The timeout diagnostic inherited the heavy config's 120s ceiling, replacing the original 30s isolation claim → patch: explicit `--testTimeout=30000 --hookTimeout=30000` overrides pin the original budgets; comment states the config/override split truthfully |
+| 82 | native r5 | prior fixed | Canonical-briefing acceptance conflict: the amended `job.briefing` supplies the j-761 owner amendment and the shipped capability contract; reviewer confirms resolved by the amendment, not a repository note |
+| 83 | native r5 | publication | Report not posted — ambiguous app publication; manual review-list verification confirms no r5 publication (0 after r4); conservative non-retry per the publication-recovery contract; report preserved locally, no fabricated verdict comment |
 
 
 ### Final-review cycle (2026-10-02, continuation)
@@ -715,6 +721,65 @@ bad_spec).
   (`gc-playbook-integrated-review-{blind,edge,verifgap}-810f471`) findings
   were repaired in `ad98f1a`; head gates and receipt identities are bound
   in the completion handoff.
+
+### Owner/ops disposition executed + r5 (2026-10-04)
+
+- Canonical-briefing amendment executed through the audited ingress:
+  `LedgerApi.setJobBriefing` updated `job.briefing` (7253 → 9400 bytes;
+  audit event `job.briefing` seq 44020, 17:29:25.792Z) appending the
+  j-761 owner amendment (provenance: journal seq 761,
+  2026-10-02T09:23:40.605Z, source gru; verified ruling JSON preserved
+  in the silas-sweep bundle). The frozen dispatch-time record
+  (`briefings/.../briefing.md`) is preserved unmodified; the amended
+  mirror and amendment record sit beside it. No raw SQL, no worker/ops
+  HTTP surface existed for this (r2 verification).
+- Base re-integration: origin/main advanced to `962a41b` (PRs #192/#193/
+  #194); history-preserving merge `3fbfbf1` resolved conflicts
+  keep-both (worktree.toml scopes — phase-split aligned for the j-829
+  heavy classification; deferred-work entries; FLOW routing table;
+  ops-dispatch step 2+3). FLOW §4f updated: #159 shipped via PR #192;
+  #160/#162/#163 remain named. Semantic integration repair `2fa4d13`:
+  PR #138's A7/V1 escalation table pinned the pre-correction fallback
+  title (`clear to merge`); the table now pins this lane's r4-accepted
+  corrected title (`review/fix routing cleared …`).
+- Exact-head gates on `2fa4d13` through the authenticated `/api/verify`
+  scheduler: `packaged-playbook` PASS (fast 67 + heavy install 13;
+  receipt sha 33adbc87; one earlier attempt failed loud on the
+  `assertDistCurrent` stale-`dist` guard and was repaired by a rebuild —
+  preserved), `packaged-artifact` PASS (90 tests, tarball smoke;
+  ledger-recorded outcome reconciled via status after the capture
+  client's stream was lost — never replayed). CI on `2fa4d13` run
+  `37221337144` green.
+- Round `gc-packaged-build-playbook-20261002-r5` frozen at target
+  `2fa4d13` (base `962a41b`), seven lenses; review verdict NEEDS
+  CHANGES; publication aborted (`report_not_posted` — ambiguous app
+  post, conservative non-retry). Manual review-list verification:
+  0 publications after r4; the r5 report never reached PR #165 and is
+  preserved locally. **Prior 0 (canonical-briefing conflict) fixed/
+  accepted**: the supplied specification now carries the owner
+  amendment j-761 and the reviewer confirms the former conflict is
+  resolved by the amendment, not by a repository note. New findings:
+  (1) blocker — the reviewer-commissioning precheck claimed the board
+  pacing view covers the worker budget, but pacing (turn pools) and the
+  resident-session ceiling (default 4) are separate constraints; four
+  busy parents pass the precheck and wait on POSTs while blocking their
+  own admission. Fixed: `roles/minion.md` names both constraints,
+  requires establishing resident admission (finish the turn with the
+  review commission as its explicit next action or stop loudly), and
+  bounds submitted-dispatch reconciliation by job identity; new
+  deterministic regression `test/pacing-admission.test.ts` exercises
+  DispatchService through a real RuntimeRegistry with unlimited pacing
+  and saturated residency (no spawn/resolve until a resident slot
+  frees; FIFO; cap unchanged), plus prompt pins (source + installed).
+  (2) warning — `packaged-playbook-timeouts` could PASS after an RPC
+  patch failure: guarded (setup failure exit 3, never a masked result),
+  and the 30s isolation budgets pinned via explicit --testTimeout/
+  --hookTimeout overrides (the heavy config's 120s ceiling had replaced
+  the claim — r5 verification note). (3) warning — the baseline build
+  log was written to a truncating shared path: each attempt now writes
+  inside its unique snapshot directory and the pointer records the log
+  path. No r6 is requested before the corrections land on a new exact
+  head.
 
 ## Verification
 

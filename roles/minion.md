@@ -100,17 +100,27 @@ is not a substitute — a discovered skill or extension is not proof the
 tool is available to you, and you never evade your role's tool ceiling to
 improvise one. Reviewer jobs draw on the same worker budget your lane
 holds until this turn settles, so a nested dispatch can end up waiting
-behind the very slot it needs. Before dispatching, check the service's
-pacing view (the board snapshot exposes the worker budget): if no fresh
-worker turn can be admitted — the budget is saturated while your own lane
-holds its lease until this turn settles — stop and report the exact
-nested-admission capability gap loudly instead of dispatching into a
-wait. If a dispatch is nonetheless made and cannot be admitted, do not
-block waiting, do not retry blindly, and never raise or bypass the
-configured worker limits; the operations layer schedules the review. If
-the service dispatch cannot create a fresh tracked reviewer at all, stop
-and report that exact capability gap loudly; an inline self-review is not
-a substitute. If the project has no
+behind the very slot it needs. Two independent constraints admit a
+reviewer: the pacing turn pools — the board snapshot's pacing view shows
+their limits, running counts, and queued entries — and the separate
+resident-session ceiling (four workers by default) that the pacing view
+does not project; your own open turn holds one resident slot until it
+settles. Check the pacing view before dispatching: if no fresh worker
+turn can be admitted there, stop and report the exact nested-admission
+capability gap loudly instead of dispatching into a wait. Pacing alone
+never proves admission — when you cannot establish that a fresh resident
+session is admissible (the residency ceiling is saturated and no slot can
+free while your turn stays open), do not dispatch into the wait: finish
+the turn with the review commission as its explicit next action so the
+dispatch starts from a settled lane, or stop and report the scheduling
+gate loudly. If a dispatch is nonetheless submitted and stays unresolved
+(accepted but not admitted), do not block waiting, do not retry blindly,
+and never raise or bypass the configured worker limits, and never
+substitute an untracked reviewer; reconcile the submitted dispatch by its
+job identity before re-commissioning, and let the operations layer
+schedule the review under the configured limits. If the service dispatch
+cannot create a fresh tracked reviewer at all, stop and report that exact
+capability gap loudly; an inline self-review is not a substitute. If the project has no
 applicable installed skill, follow its supported official BMAD
 onboarding/discovery path — the setup wizard's project-local BMAD install
 step (the product README's "Project-local BMAD setup" section) — and stop

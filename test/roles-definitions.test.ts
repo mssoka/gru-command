@@ -87,6 +87,12 @@ describe('role definitions (E8)', () => {
     expect(minion).toContain('nested-admission capability gap');
     expect(minion).toContain('do not block waiting');
     expect(minion).toContain('never raise or bypass the configured worker limits');
+    // Native round 5 (resident-ceiling blocker): the pacing view is not the
+    // worker budget — the separate resident-session ceiling must be named,
+    // and an unprovable admission must never become a dispatch into a wait.
+    expect(minion).toContain('resident-session ceiling');
+    expect(minion).toContain('Pacing alone never proves admission');
+    expect(minion).toContain('reconcile the submitted dispatch by its job identity');
     // j-810/j-811: the retired untracked headless-launcher wording must never return.
     expect(minion).not.toContain('pi -p');
     expect(minion).not.toContain('claude -p');

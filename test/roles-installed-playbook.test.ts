@@ -220,6 +220,12 @@ describe('installed-layout playbook loading (shipped artifact, clean install)', 
     expect(flat).toContain('nested-admission capability gap');
     expect(flat).toContain('do not block waiting');
     expect(flat).toContain('never raise or bypass the configured worker limits');
+    // Native round 5 (resident-ceiling blocker): the pacing view is not the
+    // worker budget — the separate resident-session ceiling must travel into
+    // the installed prompt, and the bounded reconciliation rule with it.
+    expect(flat).toContain('resident-session ceiling');
+    expect(flat).toContain('Pacing alone never proves admission');
+    expect(flat).toContain('reconcile the submitted dispatch by its job identity');
     // j-810/j-811: the retired untracked headless-launcher wording must never return.
     expect(flat).not.toContain('pi -p');
     expect(flat).not.toContain('claude -p');

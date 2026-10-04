@@ -10,8 +10,11 @@ import { routeFixDirectiveToMinion, rebriefFreshMinion } from '../src/dispatch/f
 import { PR_CREATION_RULE } from '../src/dispatch/pr-creation.js';
 import { WorkerDisposalInProgressError } from '../src/runtime/worker-errors.js';
 import { PacingGate } from '../src/runtime/pacing.js';
+import { RuntimeRegistry } from '../src/runtime/registry.js';
+import { loadConfig, type Role, type RuntimeId } from '../src/config.js';
 import { BoardEngine } from '../src/board/engine.js';
-import type { AgentHandle } from '../src/runtime/types.js';
+import type { AgentHandle, AgentRuntime, SpawnOptions } from '../src/runtime/types.js';
+import type { SessionStore } from '../src/sessions/store.js';
 import type { WorktreeLane, WorktreePort } from '../src/dispatch/worktree-port.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
@@ -741,6 +744,126 @@ describe('nested parent/reviewer admission (shipped playbook contract, j-810/j-8
 
       for (let index = 0; index < spawned.length; index += 1) {
         if (index !== 1 && index !== 2) spawned[index]!.settle();
+      }
+      await vi.waitFor(() => expect(gate.view().worker.running).toBe(0));
+    } finally {
+      close();
+    }
+  });
+
+  // Native r5 blocker regression: the shipped precheck claimed the board
+  // pacing view covers the worker budget. Pacing and residency are separate
+  // constraints (defaults: unlimited pacing, four resident workers), so this
+  // exercises DispatchService through a REAL RuntimeRegistry with unlimited
+  // pacing and saturated residency: the pacing view reports open while the
+  // nested reviewer waits on the resident-session ceiling, and admission
+  // comes only from a freed resident slot under the unchanged cap.
+  it('unlimited pacing + saturated residency: the pacing view reports open while a nested reviewer waits on the resident ceiling', async () => {
+    const repo = makeFixtureRepo('pacing-residency-divergence');
+    repos.push(repo);
+    const laneRoot = mkdtempSync(join(tmpdir(), 'gru-pacing-residency-lanes-'));
+    dirs.push(laneRoot);
+    const home = mkdtempSync(join(tmpdir(), 'gru-pacing-residency-home-'));
+    dirs.push(home);
+    const { api, close } = ledgerIn();
+    try {
+      const worktrees = new InMemoryWorktreePort(laneRoot);
+      const config = {
+        ...loadConfig({ GRU_COMMAND_HOME: home }),
+        concurrency: { maxWorkers: 4 },
+      };
+      const caps = { streaming: false, steer: 'queued' as const, resume: 'file' as const, images: false, thinking: false, thinkingLevelControl: false, followUp: false };
+      const residents: Array<{ settle: () => void; handle: AgentHandle }> = [];
+      const adapter: AgentRuntime = {
+        id: 'pi',
+        capabilities: caps,
+        health: () => ({ state: 'ok' }),
+        dispose: async () => {},
+        spawn: async (role: Role): Promise<AgentHandle> => {
+          let settle!: () => void;
+          const turn = new Promise<void>((resolve) => { settle = resolve; });
+          let disposed = false;
+          const id = `resident-${residents.length + 1}`;
+          const handle = {
+            id,
+            role,
+            sessionFile: join(home, `${id}.jsonl`),
+            capabilities: caps,
+            health: () => ({ state: disposed ? 'disposed' : 'idle' }),
+            subscribe: () => () => {},
+            prompt: () => turn,
+            steer: async () => {},
+            followUp: async () => {},
+            hasLiveProcess: () => disposed === false,
+            isCompacting: () => false,
+            dispose: async () => { disposed = true; },
+          } as unknown as AgentHandle;
+          residents.push({ settle, handle });
+          return handle;
+        },
+      };
+      class ResidencyRegistry extends RuntimeRegistry {
+        override runtimeIdFor(_role: Role): RuntimeId { return 'pi'; }
+        override runtimeFor(_id: RuntimeId): AgentRuntime { return adapter; }
+      }
+      const registry = new ResidencyRegistry({
+        config,
+        store: {} as SessionStore,
+        canReclaim: () => false,
+      });
+      const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 0, maxConcurrentReviewTurns: 0 });
+      const service = new DispatchService({
+        ledger: api,
+        worktrees,
+        workerGate: gate,
+        spawner: (role: Role, options?: SpawnOptions) => registry.spawn(role, options),
+      });
+
+      // Four parent lanes, each holding one resident slot with an open turn.
+      const parents: Awaited<ReturnType<DispatchService['dispatch']>>[] = [];
+      for (const id of ['parent-a', 'parent-b', 'parent-c', 'parent-d']) {
+        parents.push(await service.dispatch({ jobId: id, repoPath: repo.path, title: id, briefing: `brief ${id}` }));
+      }
+      expect(residents).toHaveLength(4);
+      // The pacing view reports OPEN (unlimited): running 4, nothing queued.
+      expect(gate.view().worker).toMatchObject({ limit: 0, running: 4 });
+      expect(gate.view().worker.queued).toHaveLength(0);
+
+      // The nested reviewer passes pacing instantly and waits on the
+      // separate resident-session ceiling: no spawn, no resolution.
+      let reviewerResolved = false;
+      const reviewer = service
+        .dispatch({
+          jobId: 'parent-a-review-blind',
+          repoPath: repo.path,
+          title: 'nested reviewer',
+          briefing: 'read-only review brief at the frozen head',
+        })
+        .then((outcome) => {
+          reviewerResolved = true;
+          return outcome;
+        });
+      await flush();
+      await flush();
+      expect(reviewerResolved).toBe(false);
+      expect(residents).toHaveLength(4);
+      expect(registry.residents.queued).toBe(1);
+
+      // A settled parent turn frees its resident slot: the waiter admits
+      // FIFO under the unchanged cap, never by raising or bypassing it.
+      residents[0]!.settle();
+      await registry.getHandle(parents[0]!.agentId!)!.dispose();
+      const admitted = await reviewer;
+      expect(admitted.agentId).not.toBeNull();
+      expect(residents).toHaveLength(5);
+      expect(gate.view().worker.running).toBe(4);
+      expect(registry.residents.queued).toBe(0);
+
+      // Teardown: settle and dispose the survivors through the registry.
+      for (const resident of residents) resident.settle();
+      for (const parent of [...parents, admitted]) {
+        const handle = parent.agentId === null ? null : registry.getHandle(parent.agentId);
+        if (handle !== null) await handle.dispose();
       }
       await vi.waitFor(() => expect(gate.view().worker.running).toBe(0));
     } finally {
