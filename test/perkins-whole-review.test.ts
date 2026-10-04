@@ -578,6 +578,33 @@ describe('Perkins whole-PR lead engine', () => {
     expect(existsSync(join(directory, 'consolidated.json'))).toBe(false);
   });
 
+  it('#87 refuses an identical retry if the already-published report bytes changed', async () => {
+    let directory = '';
+    let tamperedReport = '';
+    const h = wholeHarness({
+      ...ALL_CLEAN, submitRetries: 1,
+      beforeSubmit: () => { mkdirSync(join(directory, 'consolidated.json')); },
+      submitPayload: (attempt, submission) => {
+        if (attempt === 2) {
+          rmSync(join(directory, 'consolidated.json'), { recursive: true });
+          const file = join(directory, 'perkins-report.md');
+          tamperedReport = readFileSync(file, 'utf8').replace(
+            '**Verdict: READY TO MERGE**', '**Verdict: NEEDS CHANGES**',
+          );
+          writeFileSync(file, tamperedReport);
+        }
+        return submission;
+      },
+    });
+    directory = h.frozen.directory;
+    const error = await h.run().then(() => { throw new Error('expected retry to fail'); }, (failure: Error) => failure);
+    expect(error.message).toMatch(/EEXIST/);
+    expect(tamperedReport).toContain('**Verdict: NEEDS CHANGES**');
+    expect(readFileSync(join(directory, 'perkins-report.md'), 'utf8')).toBe(tamperedReport);
+    expect(existsSync(join(directory, 'consolidated.json'))).toBe(false);
+    expect(h.toolErrors.filter((entry) => entry.tool === 'perkins_submit_review')).toHaveLength(2);
+  });
+
   it('#87 rejects changed findings despite byte-identical report on partial retry', async () => {
     let directory = '';
     const h = wholeHarness({
@@ -2166,7 +2193,24 @@ describe('provider pacing: workflow rate-limit retry and cleanup', () => {
     expect(gate.view().review).toMatchObject({ running: 0, queued: [] });
   });
 
-  it('#86 preserves a sealed review even when cleanup evidence cannot be written', async () => {
+  it('#86 keeps the receipt-write failure primary when lead disposal also rejects', async () => {
+    let directory = '';
+    const h = wholeHarness({
+      ...ALL_CLEAN,
+      beforeSubmit: () => { mkdirSync(join(directory, 'lead/receipt.json'), { recursive: true }); },
+      disposeRejects: (call) => call.options.reviewLead !== undefined,
+    });
+    directory = h.frozen.directory;
+    const error = await h.run().then(() => { throw new Error('expected receipt failure'); }, (failure: NodeJS.ErrnoException) => failure);
+    expect(error.message).toMatch(/EEXIST/);
+    expect(error.message).toContain('lead/receipt.json');
+    expect(existsSync(join(directory, 'consolidated.json'))).toBe(true);
+    expect(JSON.parse(readFileSync(join(directory, 'lead/dispose-error.json'), 'utf8'))).toEqual({
+      error: 'simulated session dispose failure', agentId: h.leadCalls[0]!.agentId,
+    });
+  });
+
+  it('#86 records a distinct cleanup fallback when the primary path collides', async () => {
     let directory = '';
     const log = vi.spyOn(console, 'error').mockImplementation(() => {});
     const h = wholeHarness({
@@ -2183,7 +2227,35 @@ describe('provider pacing: workflow rate-limit retry and cleanup', () => {
       expect(result.canonicalVerdict).toBe('READY TO MERGE');
       expect(existsSync(join(directory, 'consolidated.json'))).toBe(true);
       expect(readdirSync(join(directory, 'lead/dispose-error.json'))).toEqual([]);
-      expect(log).toHaveBeenCalledWith(expect.stringMatching(/Perkins lead disposal failed:.*could not record cleanup evidence:.*EEXIST/));
+      expect(JSON.parse(readFileSync(join(directory, 'lead/dispose-error-fallback.json'), 'utf8'))).toEqual({
+        error: 'simulated session dispose failure',
+        agentId: h.leadCalls[0]!.agentId,
+        recordingError: expect.stringMatching(/EEXIST/),
+      });
+      expect(log).not.toHaveBeenCalled();
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('#86 preserves acceptance and logs both recording failures when fallback also collides', async () => {
+    let directory = '';
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const h = wholeHarness({
+      ...ALL_CLEAN,
+      disposeRejects: (call) => {
+        if (call.options.reviewLead === undefined) return false;
+        mkdirSync(join(directory, 'lead/dispose-error.json'));
+        mkdirSync(join(directory, 'lead/dispose-error-fallback.json'));
+        return true;
+      },
+    });
+    directory = h.frozen.directory;
+    try {
+      const result = await h.run();
+      expect(result.canonicalVerdict).toBe('READY TO MERGE');
+      expect(existsSync(join(directory, 'consolidated.json'))).toBe(true);
+      expect(log).toHaveBeenCalledWith(expect.stringMatching(/Perkins lead disposal failed:.*could not record cleanup evidence:.*fallback:.*EEXIST/));
     } finally {
       log.mockRestore();
     }

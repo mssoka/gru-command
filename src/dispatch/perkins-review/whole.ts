@@ -747,7 +747,6 @@ export class PerkinsWholeReview {
     let terminalAttempts = 0;
     let publishedSubmission: string | null = null;
     let accepted: PerkinsWholeResult | null = null;
-    let returningAccepted = false;
 
     const registerIsolatedHandle = (handle: AgentHandle, phase: 'lead' | 'specialist'): void => {
       if (handle.reviewIsolation !== true) throw new Error(`${phase} handle is not review-isolated`);
@@ -1681,16 +1680,24 @@ export class PerkinsWholeReview {
       try {
         await lead?.dispose();
       } catch (disposeError) {
-        if (!returningAccepted) throw disposeError;
-        // The sealed result outranks cleanup, including a failure to record
-        // the cleanup failure. Keep the error visible to operators if the
-        // artifact store itself cannot accept the note.
+        // Before settlement, the disposal failure still rejects the round.
+        // After settlement, preserve either the accepted return OR the
+        // primary receipt-write failure instead of replacing it with cleanup.
+        if (accepted === null) throw disposeError;
+        const cleanup = { error: sanitizeError(disposeError), agentId: lead!.id };
         try {
-          writeReviewArtifact(review, 'lead/dispose-error.json', {
-            error: sanitizeError(disposeError), agentId: lead!.id,
-          });
+          writeReviewArtifact(review, 'lead/dispose-error.json', cleanup);
         } catch (recordingError) {
-          console.error(`Perkins lead disposal failed: ${sanitizeError(disposeError)}; could not record cleanup evidence: ${sanitizeError(recordingError)}`);
+          // A collision at the primary path must not erase cleanup evidence
+          // while the lead directory can still accept a distinct write-once
+          // artifact. If both paths fail, disclose both recording errors.
+          try {
+            writeReviewArtifact(review, 'lead/dispose-error-fallback.json', {
+              ...cleanup, recordingError: sanitizeError(recordingError),
+            });
+          } catch (fallbackError) {
+            console.error(`Perkins lead disposal failed: ${cleanup.error}; could not record cleanup evidence: ${sanitizeError(recordingError)}; fallback: ${sanitizeError(fallbackError)}`);
+          }
         }
       }
     };
@@ -1729,7 +1736,6 @@ export class PerkinsWholeReview {
         specialistRuns: specialistsStarted,
         nativeTools: leadTools.map((tool) => tool.name),
       });
-      returningAccepted = true;
       return accepted;
     } finally {
       try {
