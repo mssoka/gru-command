@@ -132,6 +132,9 @@ test('busy phrases rotate with stable status/control geometry on every surface',
   await expect(page.locator('#chat-compact')).toBeDisabled();
   await expect(page.locator('#chat-new')).toBeDisabled();
 
+  // Wait until the mock finishes streaming its text before measuring layout:
+  // otherwise growth of the reply, not rotation, moves the controls.
+  await expect(page.locator('.msg--gru').last()).toContainText('echo with pride.');
   // One real rotation under the hold, with the controls pinned as it lands.
   const controlsBefore = await page.locator('.chat-context__button').evaluateAll((nodes) =>
     nodes.map((node) => {
@@ -139,10 +142,15 @@ test('busy phrases rotate with stable status/control geometry on every surface',
       return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
     }),
   );
-  await expect(flavor).not.toHaveText(first, { timeout: 8000 });
+  // Disappearing at turn:end is not a rotation. Require a new approved,
+  // nonempty phrase while the authoritative busy state remains in force.
+  await expect.poll(async () => {
+    const text = (await flavor.textContent()) ?? '';
+    return text !== first && text.endsWith('…') && WORKING_FLAVOR_PHRASES.includes(text.slice(0, -1));
+  }, { timeout: 8000 }).toBe(true);
   const second = (await flavor.textContent())!;
-  expect(second).not.toBe(first);
   expect(WORKING_FLAVOR_PHRASES).toContain(second.slice(0, -1));
+  await expect(status).toHaveAttribute('aria-label', 'Gru is working; context controls are busy');
   const controlsAfter = await page.locator('.chat-context__button').evaluateAll((nodes) =>
     nodes.map((node) => {
       const rect = node.getBoundingClientRect();
@@ -160,9 +168,9 @@ test('busy phrases rotate with stable status/control geometry on every surface',
   await expect(flavor).toBeVisible();
   await sweepApprovedLabels(page);
 
-  // Phone bottom sheet (< 900px: status takes its own row, controls below).
+  // The open tablet drawer becomes the phone bottom sheet on resize; no
+  // second FAB click is needed (the sheet covers it while already open).
   await page.setViewportSize({ width: 390, height: 844 });
-  await page.locator('#gru-fab').click();
   await expect(page.locator('#chat-sheet')).toHaveAttribute('data-open', 'true');
   await expect(flavor).toBeVisible();
   await sweepApprovedLabels(page);

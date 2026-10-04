@@ -1095,6 +1095,13 @@ body {
   white-space: nowrap;
 }
 
+/* Reserve the same flexible slot for every phrase. With an intrinsic flex
+   basis, a long phrase can move the buttons onto another row despite the
+   ellipsis inside the chip. Phone layout overrides the basis to 100%. */
+.chat-context__status--busy {
+  flex: 1 1 0;
+}
+
 .chat-context__status--busy .chat-context__status-label {
   position: absolute;
   width: 1px;
