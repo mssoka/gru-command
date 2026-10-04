@@ -6,6 +6,7 @@ import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { SilasDriver } from '../src/dispatch/silas-driver.js';
+import { createDurableReconcileHook } from '../src/dispatch/durable-reconcile.js';
 import { WaveRunner } from '../src/dispatch/perkins.js';
 import { preflightFailure } from '../src/dispatch/review-path.js';
 import { GitReviewPort } from './helpers/git-review-port.js';
@@ -59,9 +60,15 @@ describe('Silas deterministic-pass seam drives actual handoff reconsideration', 
       now: () => 0,
       setInterval: ((cb: () => void) => { sweep.cb = cb; return 1; }) as unknown as typeof setInterval,
       clearInterval: (() => {}) as never,
-      onDeterministicPass: () => {
+      // The PRODUCTION factory, with the real wave reconciler bound the
+      // same way main.ts binds it (behavioral composition coverage).
+      onDeterministicPass: (context: { trigger: string; wakeInFlight: boolean }) => {
         order.push('hook');
-        wave.reconcilePendingHandoffs();
+        return createDurableReconcileHook({
+          ledger,
+          notifications: { postIncident: () => ({ id: 'seam-notice' }) },
+          wave: { reconcilePendingHandoffs: () => wave.reconcilePendingHandoffs() },
+        })(context as Parameters<ReturnType<typeof createDurableReconcileHook>>[0]);
       },
     });
     driver.start();

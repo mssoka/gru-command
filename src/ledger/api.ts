@@ -834,19 +834,45 @@ export class LedgerApi {
     if (kinds.length === 0) throw new Error('latestJobEventsByPayloadScope requires at least one kind');
     const limit = opts.limit ?? 200;
     const placeholders = kinds.map(() => '?').join(', ');
+    // One grouped pass over the job's events (no per-row correlated MAX),
+    // so a long-lived lane's verification history stays linear per digest.
     const rows = this.db
       .prepare(
         `SELECT e.* FROM events e
-          WHERE e.job_id = ? AND e.kind IN (${placeholders})
-            AND e.seq = (
-              SELECT MAX(s.seq) FROM events s
-               WHERE s.job_id = e.job_id AND s.kind = e.kind
-                 AND json_extract(s.payload, '$.scope') IS json_extract(e.payload, '$.scope')
-            )
+          WHERE e.seq IN (
+            SELECT MAX(s.seq) FROM events s
+             WHERE s.job_id = ? AND s.kind IN (${placeholders})
+             GROUP BY s.kind, json_extract(s.payload, '$.scope')
+          )
           ORDER BY e.seq DESC LIMIT ?`,
       )
       .all(jobId, ...(kinds as string[]), limit) as Row[];
     return rows.map((row) => this.eventFromRow(row));
+  }
+
+  /** Does a job event of one of these kinds exist after `sinceSeq` with an
+   * EXACT payload key/value match? The identity check for retirement
+   * fences: a matching fingerprint/head/request is found no matter how
+   * much newer same-kind traffic carries other identities. */
+  hasJobEventWithPayloadValue(
+    jobId: string,
+    kinds: readonly string[],
+    key: string,
+    value: string,
+    sinceSeq: number,
+  ): boolean {
+    if (kinds.length === 0) throw new Error('hasJobEventWithPayloadValue requires at least one kind');
+    if (key.trim() === '') throw new Error('hasJobEventWithPayloadValue requires a non-empty payload key');
+    const placeholders = kinds.map(() => '?').join(', ');
+    const row = this.db
+      .prepare(
+        `SELECT 1 AS found FROM events
+          WHERE job_id = ? AND kind IN (${placeholders}) AND seq > ?
+            AND json_extract(payload, '$.' || ?) = ?
+          LIMIT 1`,
+      )
+      .get(jobId, ...(kinds as string[]), sinceSeq, key, value) as Row | undefined;
+    return row !== undefined;
   }
 
   /** Newest event among an explicit kind set (board health cards: the

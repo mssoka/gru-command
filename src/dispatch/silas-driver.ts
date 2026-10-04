@@ -151,6 +151,15 @@ export interface DigestLedger {
     kinds: readonly string[],
     opts?: { limit?: number },
   ): readonly EventRecord[];
+  /** Exact payload identity query (retirement fences): found however much
+   * newer same-kind traffic carries other identities. */
+  hasJobEventWithPayloadValue(
+    jobId: string,
+    kinds: readonly string[],
+    key: string,
+    value: string,
+    sinceSeq: number,
+  ): boolean;
   latestJobEvent(jobId: string, kind: string): EventRecord | null;
   latestRoundEvent(roundId: string, kind: string): EventRecord | null;
   listAgents(): readonly AgentRecord[];
@@ -467,10 +476,6 @@ function latestAnsweringReviewRequest(ledger: DigestLedger, jobId: string): Even
   return winner;
 }
 
-/** Bus events that carry a repair rung (a failed verification may retire
- * only on a rung that names that exact failure). */
-const REPAIR_RUNG_KINDS: readonly string[] = ['silas.directive-sent', 'silas.rebrief', 'silas.escalated'];
-
 /** Verification event kinds that prove a FRESH SUBMISSION exists — the
  * retirement evidence for failure/wait rows (never a rerun authority). A
  * `verification.reconciled` replay of an older run is deliberately
@@ -480,6 +485,21 @@ const VERIFICATION_ACTIVITY_KINDS: readonly string[] = [
   'verification.started',
   'verification.attached',
 ];
+
+/** A submission/attempt at an EXACT head, by identity query (the payload
+ * key differs per scheduler event kind). */
+function verificationActivityAtHead(
+  ledger: DigestLedger,
+  jobId: string,
+  head: string,
+  sinceSeq: number,
+): boolean {
+  return (
+    ledger.hasJobEventWithPayloadValue(jobId, ['verification.requested'], 'head', head, sinceSeq) ||
+    ledger.hasJobEventWithPayloadValue(jobId, ['verification.attached'], 'head', head, sinceSeq) ||
+    ledger.hasJobEventWithPayloadValue(jobId, ['verification.started'], 'sha', head, sinceSeq)
+  );
+}
 
 function payloadRecord(event: EventRecord): Record<string, unknown> {
   return typeof event.payload === 'object' && event.payload !== null
@@ -499,25 +519,6 @@ function payloadNumber(event: EventRecord, key: string): number | null {
 
 function payloadFlag(event: EventRecord, key: string, expected: boolean): boolean {
   return payloadRecord(event)[key] === expected;
-}
-
-/** Does a repair rung retire THIS failed verification? Only an explicitly
- * scoped rung can: `verification-failure:<scope>[@<runId>]` with an EXACT
- * scope token and, when the failure carries a run id, the exact run id.
- * A rung without a fingerprint — or with a bare word like
- * "verification" — names no failure and retires none (an unrelated
- * rebrief/escalation/directive must never hide a still-unresolved
- * failure). */
-function rungOwnsFailure(rung: EventRecord, scope: string | null, runId: string | null): boolean {
-  const fingerprint = payloadString(rung, 'blocker_fingerprint');
-  if (fingerprint === null || scope === null) return false;
-  const marker = 'verification-failure:';
-  const at = fingerprint.indexOf(marker);
-  if (at === -1) return false;
-  const [fpScope, fpRun] = fingerprint.slice(at + marker.length).split('@', 2);
-  if (fpScope !== scope) return false;
-  if (runId !== null && fpRun !== runId) return false;
-  return true;
 }
 
 /** A one-line honest reason a verification failed (never a fabricated
@@ -833,41 +834,66 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
           latestActivity.set(scope, event);
         }
       }
-      // ALL post-failure rungs of each kind — a later unrelated rung must
-      // not make an earlier matching rung invisible.
-      const rungEvents = input.ledger.listJobEventsByKinds(job.id, REPAIR_RUNG_KINDS, { limit: 200 });
-      for (const [scope, completed] of latestCompleted) {
+      // Exact identity retirement: a repair rung retires only the failure
+      // whose canonical fingerprint it carries, found by an identity query
+      // (no newest-N window can age a landed disposition out of view).
+      for (const [scopeKey, completed] of latestCompleted) {
         if (payloadFlag(completed, 'ok', true)) continue;
-        const activity = latestActivity.get(scope);
-        if (activity !== undefined && activity.seq > completed.seq) continue; // retry already in flight
         const runId = payloadString(completed, 'run_id');
-        const scopeName = payloadString(completed, 'scope');
-        const repaired = rungEvents.some(
-          (rung) => rung.seq > completed.seq && rungOwnsFailure(rung, scopeName, runId),
+        const scopeLabel = payloadString(completed, 'scope');
+        const head = payloadString(completed, 'sha');
+        const fingerprints: string[] = [];
+        if (scopeLabel !== null) {
+          fingerprints.push(
+            runId === null ? `verification-failure:${scopeLabel}` : `verification-failure:${scopeLabel}@${runId}`,
+          );
+        }
+        const repaired = fingerprints.some((fingerprint) =>
+          input.ledger.hasJobEventWithPayloadValue(
+            job.id,
+            ['silas.directive-sent'],
+            'blocker_fingerprint',
+            fingerprint,
+            completed.seq,
+          ),
         );
-        if (repaired) continue;
+        // A retry at the FAILED head retires the row (a still-failing retry
+        // re-arms it with the newer result); another head does not answer
+        // this failure.
+        const retryInFlight =
+          head === null
+            ? (latestActivity.get(scopeKey)?.seq ?? -1) > completed.seq
+            : verificationActivityAtHead(input.ledger, job.id, head, completed.seq);
+        if (repaired || retryInFlight) continue;
         digest.verificationFailures.push({
           jobId: job.id,
           repo: job.repo,
-          scope: scopeName,
+          scope: scopeLabel,
           runId,
-          head: payloadString(completed, 'sha'),
+          head,
           at: completed.ts,
           detail: verificationFailureDetail(completed),
         });
       }
-      for (const [scope, timeout] of latestTimeout) {
+      for (const [scopeKey, timeout] of latestTimeout) {
         const head = payloadString(timeout, 'head');
-        const completed = latestCompleted.get(scope);
-        const activity = latestActivity.get(scope);
-        // A fresh submission supersedes the wait (a new attempt, whatever
-        // head); a completion retires it only when it is the pinned attempt
-        // (same head) or the row predates head recording.
-        const resubmitted = activity !== undefined && activity.seq > timeout.seq;
+        // A fresh submission at the PINNED head supersedes the wait; a
+        // completion answers it only for the pinned attempt. Another head
+        // is a different attempt and does not retire this reconsideration.
+        const resubmitted =
+          head === null
+            ? (latestActivity.get(scopeKey)?.seq ?? -1) > timeout.seq
+            : verificationActivityAtHead(input.ledger, job.id, head, timeout.seq);
         const completedSameHead =
-          completed !== undefined &&
-          completed.seq > timeout.seq &&
-          (head === null || payloadString(completed, 'sha') === head);
+          head === null
+            ? (latestCompleted.get(scopeKey)?.seq ?? -1) > timeout.seq
+            : input.ledger.hasJobEventWithPayloadValue(
+                job.id,
+                ['verification.completed'],
+                'sha',
+                head,
+                timeout.seq,
+              );
         if (resubmitted || completedSameHead) continue;
         digest.verificationWaits.push({
           jobId: job.id,
@@ -1264,12 +1290,15 @@ export class SilasDriver {
       // A fresh observation arrived while the pass ran: the in-flight pass
       // may already have read the ledger before this trigger's event was
       // committed, so ONE follow-up pass is owed. All coalesced triggers
-      // share it — the first resumer starts it, the rest observe that it
-      // covers them (it starts after every waiter arrived).
+      // await it: the first resumer starts it, the rest join the running
+      // follow-up so nobody proceeds to the wake path ahead of it.
       this.passRequeued = true;
       await this.passInFlight;
       if (this.disposed) return { ok: true, counts: null, error: null, durationMs: 0 };
-      if (!this.passRequeued) return this.lastPassOutcome ?? { ok: true, counts: null, error: null, durationMs: 0 };
+      if (!this.passRequeued) {
+        if (this.passInFlight !== null) return this.passInFlight;
+        return this.lastPassOutcome ?? { ok: true, counts: null, error: null, durationMs: 0 };
+      }
       this.passRequeued = false;
       return this.runDeterministicPass(trigger, wakeInFlight);
     }

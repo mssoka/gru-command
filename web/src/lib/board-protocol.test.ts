@@ -177,6 +177,8 @@ describe('board server-frame validator', () => {
     for (const [field, broken] of [
       ['build', { ...(wired as { build: object }).build, commitsBehind: '43' }],
       ['silas', { ...(wired as { silas: object }).silas, reconciliationsToday: -1 }],
+      ['silas', { ...(wired as { silas: object }).silas, reconcileFailedNewer: 'no' }],
+      ['silas', { ...(wired as { silas: object }).silas, reconcileFailedNewer: undefined }],
       ['verify', { ...(wired as { verify: object }).verify, lockInUse: 'yes' }],
       ['selfHeal', { ...(wired as { selfHeal: object }).selfHeal, sessionsResumed: 1.5 }],
     ] as const) {

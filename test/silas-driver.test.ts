@@ -1235,11 +1235,12 @@ describe('silas digest (the four actionable states)', () => {
       expect(digest.verificationWaits.map((row) => row.scope).sort()).toEqual(['focused', 'full']);
       expect(digest.verificationWaits.map((row) => row.head).sort()).toEqual(['head-a', 'head-b']);
 
-      // Resubmitting only the newer (focused) scope retires only its row.
+      // Resubmitting only the newer (focused) scope AT ITS PINNED HEAD
+      // retires only its row.
       h.ledger.appendCustomEvent({
         kind: 'verification.requested',
         jobId: 'job-scopes',
-        payload: { scope: 'focused', request_id: 'req-c' },
+        payload: { scope: 'focused', request_id: 'req-c', head: 'head-b' },
       });
       const after = await computeSilasDigest({
         ledger: h.ledger,
@@ -2381,6 +2382,51 @@ describe('silas deterministic pass observation (issue #163)', () => {
       ).toHaveLength(0);
       expect(h.ledger.listObligations({ jobId: 'job-mech' }).every((row) => row.claim === null)).toBe(true);
       expect(report.ok).toBe(true); // the pass completed without touching mechanical debt
+    } finally {
+      h.cleanup();
+    }
+  });
+  it('only the EXACT canonical fingerprint retires a failed run; embedded or suffixed markers do not', async () => {
+    const h = makeLedger();
+    try {
+      h.ledger.addJob({ id: 'job-exact', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('job-exact', 'working');
+      h.ledger.appendCustomEvent({
+        kind: 'verification.completed',
+        jobId: 'job-exact',
+        payload: { ok: false, scope: 'full', run_id: 'run-9', exit_code: 1 },
+      });
+      for (const fingerprint of [
+        'lint:verification-failure:full@run-9',
+        'verification-failure:full@run-9@extra',
+        'verification-failure:full@run-90',
+      ]) {
+        h.ledger.appendCustomEvent({
+          kind: 'silas.directive-sent',
+          jobId: 'job-exact',
+          payload: { request_id: `req-${fingerprint}`, blocker_fingerprint: fingerprint },
+        });
+      }
+      const embedded = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(embedded.verificationFailures.map((row) => row.scope)).toEqual(['full']);
+
+      h.ledger.appendCustomEvent({
+        kind: 'silas.directive-sent',
+        jobId: 'job-exact',
+        payload: { request_id: 'req-exact', blocker_fingerprint: 'verification-failure:full@run-9' },
+      });
+      const exact = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(exact.verificationFailures).toEqual([]);
     } finally {
       h.cleanup();
     }

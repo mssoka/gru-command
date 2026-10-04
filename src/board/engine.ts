@@ -279,6 +279,18 @@ const SILAS_ACTION_KINDS = [
   'silas.escalated',
 ] as const;
 
+/** Durable machine follow-through the deterministic pass finishes (issue
+ * #163): phase hand-backs and obligation writes/settlements are machine
+ * reconciliations even though they are not `silas.*` events. Counted and
+ * surfaced consistently with the actions above (the card labels them
+ * "machine reconciliations"). */
+const MACHINE_ACTION_KINDS = [
+  'job.phase-handoff-completed',
+  'job.obligation-recorded',
+  'job.obligation-settled',
+] as const;
+const RECONCILE_ACTION_KINDS = [...SILAS_ACTION_KINDS, ...MACHINE_ACTION_KINDS] as const;
+
 /** PR state from the record: a terminal `merged` job is merged; a
  * registered URL is open. `conflicting` has no writer yet — the PR-state
  * sweep will land it, and the board already buckets on it. */
@@ -633,9 +645,9 @@ export class BoardEngine {
       lastReconcileFailedAt: reconcileFailed?.ts ?? null,
       reconcileFailedNewer:
         reconcileFailed !== null && (reconcileOk === null || reconcileFailed.seq > reconcileOk.seq),
-      lastUsefulActionAt: this.ledger.latestEventOfKinds(SILAS_ACTION_KINDS)?.ts ?? null,
+      lastUsefulActionAt: this.ledger.latestEventOfKinds(RECONCILE_ACTION_KINDS)?.ts ?? null,
       openTurnSince: openTurn ? (wake?.ts ?? null) : null,
-      reconciliationsToday: this.ledger.countEventsSince(SILAS_ACTION_KINDS, dayStart.toISOString()),
+      reconciliationsToday: this.ledger.countEventsSince(RECONCILE_ACTION_KINDS, dayStart.toISOString()),
       checkedAt: new Date(now).toISOString(),
     };
   }
