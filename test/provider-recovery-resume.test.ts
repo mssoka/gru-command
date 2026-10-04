@@ -262,6 +262,27 @@ describe('guarded claim — happy path', () => {
     expect(events.some((event) => event.kind === 'job.minion-error')).toBe(true);
     expect(events.some((event) => event.kind === 'job.delivered')).toBe(false);
     expect(h.ledger.getProviderWait(waitId)?.status).toBe('claimed');
+    // The lane does not stay 'working' with nobody driving it (#160).
+    expect(h.ledger.getJob(jobId)?.status).toBe('blocked');
+  });
+
+  it('a deterministic spawn failure after the claim records the error durably and blocks the lane (#160)', async () => {
+    const h = new ClaimHarness();
+    const jobId = 'j-spawnfail';
+    const waitId = await h.recoveredMinionWait({ sessionFile: null, jobId });
+    h.registry.spawnImpl = () => {
+      throw new Error('spawn exploded');
+    };
+    const result = await claimProviderRecoveryContinuation(h.deps(), waitId, 'silas');
+    expect(result.outcome).toBe('skipped');
+    expect(result.outcome === 'skipped' ? result.why : '').toContain('no automatic replay');
+    // Both failure paths leave the same durable non-success evidence.
+    const events = h.ledger.listJobEvents(jobId, { limit: 50 });
+    expect(events.some((event) => event.kind === 'provider.continuation-failed')).toBe(true);
+    expect(events.some((event) => event.kind === 'job.minion-error')).toBe(true);
+    expect(events.some((event) => event.kind === 'job.delivered')).toBe(false);
+    expect(h.ledger.getProviderWait(waitId)?.status).toBe('claimed');
+    expect(h.ledger.getJob(jobId)?.status).toBe('blocked');
   });
 
   it('a missing session file falls back to a fresh worker on the same lane', async () => {

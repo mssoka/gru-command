@@ -28,6 +28,8 @@ import type {
 } from '../src/runtime/types.js';
 import type { AgentEventEnvelope } from '../src/runtime/registry.js';
 import { PacingGate, type RateLimitBackoffPolicy } from '../src/runtime/pacing.js';
+import { promptVerdictFromHealth } from '../src/runtime/prompt-verdict.js';
+import type { PromptTurnVerdict } from '../src/runtime/types.js';
 import { DispatchService } from '../src/dispatch/service.js';
 import { routeFixDirectiveToMinion } from '../src/dispatch/fix-directive.js';
 import { PR_CREATION_RULE } from '../src/dispatch/pr-creation.js';
@@ -100,6 +102,18 @@ class FakeHandle implements AgentHandle {
   }
   /** Scripted per-delivery transport outcome (tests drive failures). */
   promptHook: ((text: string, options?: PromptOptions) => Promise<void> | void) | null = null;
+  /** Per-turn terminal evidence, exactly like the attesting adapters. OPT-IN
+   * (the #160 tests): absent by default so fixtures without scripted
+   * verdicts keep the legacy prompt + settle-time-health delivery path and
+   * its settle-leaf ordering. */
+  verdictHook: (() => PromptTurnVerdict) | null = null;
+  promptWithVerdict: ((text: string, options?: PromptOptions) => Promise<PromptTurnVerdict>) | undefined = undefined;
+  enableVerdictAttestation(): void {
+    this.promptWithVerdict = async (text = '', options?: PromptOptions) => {
+      await this.prompt(text, options);
+      return this.verdictHook !== null ? this.verdictHook() : promptVerdictFromHealth(this);
+    };
+  }
   async steer(): Promise<void> {}
   async followUp(): Promise<void> {}
   /** E7 live-work probe: a fake scheduler can declare a live child process. */
@@ -1864,6 +1878,41 @@ describe('supervisor — live tools, sleep/wake, and interrupted-turn recovery',
     h.dispose();
   });
 
+  it('a resumed turn that does not attest success orphans honestly instead of recording resumed (#160)', async () => {
+    const h = boot();
+    h.api.addJob({ id: 'job-resume-abort', repo: 'gru-command', title: 'resume abort' });
+    h.api.setJobStatus('job-resume-abort', 'working');
+    h.api.registerAgent({ id: 'minion-resume-abort', role: 'minion', jobId: 'job-resume-abort' });
+    const handle = new FakeHandle('minion', 'minion-resume-abort', null);
+    handle.pendingTurnSnapshot = { text: 'finish the briefing', owner: 'dispatch:job-resume-abort' };
+    h.registry.adopt(handle);
+    // The restarted session re-delivers the prompt, but its turn settles
+    // without attesting success (transport abort): no fabricated 'resumed'.
+    h.registry.spawnImpl = async (role, options) => {
+      const resumed = new FakeHandle(role, 'minion-resume-abort-2', options?.resumeFile ?? null);
+      resumed.verdictHook = () => ({
+        ok: false,
+        error: 'turn settled without a successful completion (stopReason: aborted): This operation was aborted',
+      });
+      resumed.enableVerdictAttestation();
+      return resumed;
+    };
+    hang(handle);
+    h.advance(60);
+    await vi.waitFor(() => {
+      expect(h.notificationsOfKind('supervision.turn-orphaned.minion-resume-abort')).toHaveLength(1);
+    }, { timeout: 5_000 });
+    const recovery = h.api
+      .listEvents({ limit: 100 })
+      .filter((event) => event.kind === 'supervision.turn-recovery');
+    expect(recovery.some((event) => (event.payload as Record<string, unknown>)['disposition'] === 'resumed')).toBe(false);
+    expect(recovery.some((event) => (event.payload as Record<string, unknown>)['disposition'] === 'orphaned')).toBe(true);
+    const note = h.notificationsOfKind('supervision.turn-orphaned.minion-resume-abort')[0]!;
+    expect(note.routing).toBe('action-required');
+    expect(note.detail).toContain('This operation was aborted');
+    h.dispose();
+  });
+
   it('a restart that cannot snapshot the turn posts a durable recoverable-lane note with job + branch + phase', async () => {
     const h = boot();
     h.api.addJob({ id: 'job-orphan', repo: 'gru-command', title: 'orphan lane' });
@@ -2551,6 +2600,52 @@ describe('worker delivery settlement under automatic rate-limit retry', () => {
       expect(h.api.getJob('job-dispatch-retry')?.status).toBe('delivered');
       expect(h.api.listEvents({ limit: 100 }).some((event) => event.kind === 'job.delivered')).toBe(true);
       expect(gate.view().worker).toMatchObject({ running: 0, queued: [] });
+    } finally { h.dispose(); }
+  });
+
+  it('a retry that resolves without attesting success is a failed attempt, never a recovery (#160)', async () => {
+    const sleeper = new ManualSleeper();
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const h = boot(undefined, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep, jitter: () => 0, workerGate: gate });
+    const repo = makeFixtureRepo('pacing-dispatch-retry-abort');
+    cleanupDirs.push(repo.path);
+    const root = tmpDir();
+    try {
+      const handle = new FakeHandle('minion', 'minion-retry-abort', null);
+      handle.pendingTurnSnapshot = { text: 'retry me', owner: 'dispatch:job-retry-abort' };
+      let failed = false;
+      handle.promptHook = () => {
+        if (failed) return;
+        failed = true;
+        handle.emit({ type: 'error', error: '429 too many requests', fatal: false });
+      };
+      // The re-delivered turn resolves but attests NO positive completion
+      // (the transport aborted it): resolution alone must not be recovery.
+      handle.verdictHook = () => handle.promptCalls.length <= 1
+        ? { ok: true, error: null }
+        : { ok: false, error: 'turn settled without a successful completion (stopReason: aborted): This operation was aborted' };
+      handle.enableVerdictAttestation();
+      h.registry.adopt(handle);
+      const service = new DispatchService({
+        ledger: h.api,
+        worktrees: new InMemoryWorktreePort(root),
+        spawner: async () => handle,
+        workerGate: gate,
+        retrySettlement: (agentId) => h.supervisor.awaitRetrySettlement(agentId),
+      });
+      const outcome = await service.dispatch({
+        jobId: 'job-retry-abort', repoPath: repo.path, title: 'retry', briefing: 'brief',
+      });
+      await vi.waitFor(() => expect(sleeper.delays).toEqual([100]));
+      await sleeper.release();
+      const settled = await outcome.settled;
+      // No fabricated recovery: the retry attempt failed, the lane blocks
+      // with its error on the record, and no delivery is minted.
+      expect(settled).toMatchObject({ ok: false });
+      expect(h.api.listEvents({ limit: 100 }).some((event) => event.kind === 'pacing.auto-retry-recovered')).toBe(false);
+      expect(h.api.listEvents({ limit: 100 }).some((event) => event.kind === 'job.delivered')).toBe(false);
+      expect(h.api.listEvents({ limit: 100 }).some((event) => event.kind === 'job.minion-error')).toBe(true);
+      expect(h.api.getJob('job-retry-abort')?.status).toBe('blocked');
     } finally { h.dispose(); }
   });
 

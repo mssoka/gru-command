@@ -53,4 +53,10 @@ describe('promptVerdictFromHealth (#160)', () => {
       error: 'runtime terminal health unreadable: Error: health probe exploded',
     });
   });
+
+  it('a handle that exposes no health attests nothing — the settled turn is unproven', () => {
+    const verdict = promptVerdictFromHealth({} as { health(): AgentHealth });
+    expect(verdict.ok).toBe(false);
+    expect(verdict.error).toContain('no terminal health evidence');
+  });
 });

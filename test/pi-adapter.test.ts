@@ -2750,6 +2750,19 @@ describe('Perkins r1 regressions', () => {
     }
   });
 
+  it('W7d: a length-truncated completion is not positive completion evidence (#160)', async () => {
+    const fx = await fixture([{ deltas: ['partial answer'], stopReason: 'length' }]);
+    const handle = await fx.runtime.spawn('gru');
+    try {
+      const verdict = await handle.promptWithVerdict!('truncate me', { owner: 'alice' });
+      expect(verdict.ok).toBe(false);
+      expect(verdict.error).toContain('length');
+    } finally {
+      await handle.dispose();
+      await fx.runtime.dispose();
+    }
+  });
+
   it('W10: registry status aggregates streaming while a turn is live', async () => {
     let release!: () => void;
     const fx = await fixture();

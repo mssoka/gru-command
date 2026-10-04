@@ -17,11 +17,17 @@ import type { AgentHandle, PromptOptions, PromptTurnVerdict } from './types.js';
  * structural/test doubles). Positive completion requires the runtime's
  * terminal state to be `idle`; an in-band `error` carries its detail, and
  * every other state (`streaming`/`spawning`/`disposed`) is an unknown
- * terminal outcome that never becomes success (#160). Missing health carries
- * no failure evidence; a throwing health read is unproven and never becomes
- * success. */
+ * terminal outcome that never becomes success (#160). A handle that
+ * exposes no health at all attests nothing, so its settled turn is
+ * unproven and never becomes success either; a throwing health read is
+ * unproven the same way. */
 export function promptVerdictFromHealth(handle: Pick<AgentHandle, 'health'>): PromptTurnVerdict {
-  if (typeof handle.health !== 'function') return { ok: true, error: null };
+  if (typeof handle.health !== 'function') {
+    return {
+      ok: false,
+      error: 'runtime exposes no terminal health evidence — the settled turn is unproven',
+    };
+  }
   try {
     const health = handle.health();
     if (health.state === 'idle') return { ok: true, error: null };
