@@ -1379,9 +1379,9 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         movementRef: 'feature/review', noSpec: false,
       });
       expect(result.canonicalVerdict).toBe('READY TO MERGE');
-      expect(result.specialistRuns.filter((run) => run.status === 'valid')).toHaveLength(7);
+      expect(result.specialistRuns.filter((run) => run.status === 'valid')).toHaveLength(9);
       const invocations = doubleInvocations(fx);
-      expect(invocations).toHaveLength(8);
+      expect(invocations).toHaveLength(10);
       const lead = invocations.find((record) => record.prompt.includes('COMPLETE FROZEN DIFF (the whole change under review)'));
       expect(lead).toBeDefined();
       const configFile = lead!.argv[lead!.argv.indexOf('--mcp-config') + 1];

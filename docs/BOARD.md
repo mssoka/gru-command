@@ -190,7 +190,7 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
 
 `npm run dev:web` proxies `/api` + `/board/ws` to the dev-only mock
 (`web/mock/server.ts`), which serves a GENERIC sample snapshot
-(`demo-api`, `sample-site`, one live 7-lens round in mixed states) —
+(`demo-api`, `sample-site`, one live 9-lens round in mixed states) —
 `POST /__pulse` on the mock port pushes a fresh copy. No real project
 names anywhere, ever.
 

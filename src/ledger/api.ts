@@ -84,7 +84,8 @@ type Row = Record<string, unknown>;
  * current state. The board rebuilds entirely from here after any restart.
  */
 
-/** The standard 7-lens review set (briefing: 7 chips per round). */
+/** The standard 9-lens whole-change catalog (future-round fallback only;
+ * production rounds pass the pinned policy's applicable catalog). */
 export const DEFAULT_LENSES = [
   'blind',
   'edge',
@@ -93,6 +94,8 @@ export const DEFAULT_LENSES = [
   'architecture',
   'codebase',
   'tests',
+  'performance',
+  'operations',
 ] as const;
 
 export interface JobRecord {

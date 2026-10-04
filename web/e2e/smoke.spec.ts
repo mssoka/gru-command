@@ -773,7 +773,7 @@ test.describe('board (E6, mock feed)', () => {
 
     // Round header: lens count, blockers, elapsed; chips behind the row.
     const round = card.locator('.board-round__toggle');
-    await expect(round).toContainText('/7 lenses');
+    await expect(round).toContainText('/9 lenses');
     await expect(round.locator('.board-round__blockers')).toContainText('1 blocker');
     await expect(round.locator('.board-round__elapsed')).toContainText('elapsed');
     await round.click();

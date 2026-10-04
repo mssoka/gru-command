@@ -254,7 +254,7 @@ describe('board server — HTTP API', () => {
       jobId: 'api-job',
     });
     expect(round.status).toBe(201);
-    expect((round.body as { lenses: { lens: string }[] }).lenses.length).toBe(7);
+    expect((round.body as { lenses: { lens: string }[] }).lenses.length).toBe(9);
     const illegal = await postJson(harness.port, '/api/jobs/api-job/status', 'board-test-token', {
       status: 'merged',
     });

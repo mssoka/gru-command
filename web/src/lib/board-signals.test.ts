@@ -112,6 +112,41 @@ describe('roundSummary', () => {
     expect(summary).toEqual({ done: 3, used: 1, unused: 2, ran: 2, total: 4, blockers: 1, failures: 1 });
   });
 
+  it('derives truthful coverage for a nine-lens catalog round and an eight-lens explicit no-spec round', () => {
+    const full = roundSummary(round({
+      lensAttempts: [{ lens: 'tests', attempts: 2 }, { lens: 'performance', attempts: 2 }],
+      lenses: [
+        { lens: 'blind', state: 'done', agentId: null, note: null, verdict: 'clean' },
+        { lens: 'edge', state: 'done', agentId: null, note: null, verdict: 'clean' },
+        { lens: 'acceptance', state: 'done', agentId: null, note: 'not used — lead-owned whole-PR review', verdict: 'clean' },
+        { lens: 'security', state: 'done', agentId: null, note: 'blocker — found', verdict: 'blocker' },
+        { lens: 'architecture', state: 'done', agentId: null, note: 'not used — lead-owned whole-PR review', verdict: 'clean' },
+        { lens: 'codebase', state: 'done', agentId: null, note: null, verdict: 'clean' },
+        { lens: 'tests', state: 'error', agentId: null, note: 'specialist attempts failed: a1 output; a2 output', verdict: null },
+        { lens: 'performance', state: 'done', agentId: null, note: 'note — found; earlier failed attempt recorded', verdict: 'note' },
+        { lens: 'operations', state: 'done', agentId: null, note: 'not used — lead-owned whole-PR review', verdict: 'clean' },
+      ],
+    }));
+    expect(full).toEqual({ done: 8, used: 5, unused: 3, ran: 6, total: 9, blockers: 0, failures: 1 });
+
+    // Explicit no-spec: acceptance is absent from the round's own chips, so
+    // availability is 8 — never a backfilled historical seven or a forced nine.
+    const noSpec = roundSummary(round({
+      lensAttempts: [{ lens: 'performance', attempts: 1 }],
+      lenses: [
+        { lens: 'blind', state: 'done', agentId: null, note: 'not used — lead-owned whole-PR review', verdict: 'clean' },
+        { lens: 'edge', state: 'done', agentId: null, note: 'not used — lead-owned whole-PR review', verdict: 'clean' },
+        { lens: 'security', state: 'done', agentId: null, note: 'blocker — found', verdict: 'blocker' },
+        { lens: 'architecture', state: 'done', agentId: null, note: 'not used — lead-owned whole-PR review', verdict: 'clean' },
+        { lens: 'codebase', state: 'done', agentId: null, note: 'not used — lead-owned whole-PR review', verdict: 'clean' },
+        { lens: 'tests', state: 'done', agentId: null, note: 'not used — lead-owned whole-PR review', verdict: 'clean' },
+        { lens: 'performance', state: 'error', agentId: null, note: 'specialist attempts failed: a1 timeout', verdict: null },
+        { lens: 'operations', state: 'done', agentId: null, note: 'not used — lead-owned whole-PR review', verdict: 'clean' },
+      ],
+    }));
+    expect(noSpec).toEqual({ done: 7, used: 1, unused: 6, ran: 2, total: 8, blockers: 1, failures: 1 });
+  });
+
   it('counts lenses that RAN AND FAILED inside `ran` — an error lens is real work, not "not ran" (R9/N8)', () => {
     const summary = roundSummary(
       round({
