@@ -1073,23 +1073,23 @@ body {
   background: var(--card);
 }
 
-/* Working-flavor geometry: from the console through the tablet drawer the
-   strip must stay ONE line — a long rotating phrase ellipsizes inside the
-   shrinkable status chip instead of wrapping the controls onto a second
-   row (which moved them and grew the strip). The phone sheet below 900px
-   keeps the wrap so the status takes its own row. */
-@media (min-width: 900px) {
-  .chat-context {
-    flex-wrap: nowrap;
-  }
-}
-
 .chat-context__status {
   margin-right: auto;
   max-width: 100%;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* Working-flavor geometry: the busy chip must own the strip's flexible
+   slot. With an intrinsic flex-basis a long rotating phrase makes the
+   line overflow, so the shrink cascades into the buttons — they narrow
+   below their one-line width and wrap their labels — and their boxes
+   depend on the phrase. Basis 0 + grow 1 gives the chip the same slot for
+   every phrase and ellipsizes the phrase inside it. The phone sheet
+   overrides the basis to 100% so the status takes its own row. */
+.chat-context__status--busy {
+  flex: 1 1 0;
 }
 
 /* Working flavor (owner-approved 2026-10-01): the chip shows either the
