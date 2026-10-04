@@ -2,7 +2,7 @@
 title: 'review-input-handoff: private frozen evidence, exact-target CI receipts, audited canonical amendments'
 type: 'feature'
 created: '2026-10-03'
-status: 'in-review'
+status: 'done'
 route: 'dispatch'
 review_loop_iteration: 0
 baseline_commit: '5d56194a905262231bb0d183292b6d08cbd70810'
