@@ -1525,11 +1525,23 @@ describe('board — compact owner-first presentation (j-1064)', () => {
   });
 
   it('In flight previews 5 of 6 in the authoritative order, then Show all / Show fewer', () => {
+    // One shared clock for every recency input: updatedAt carries the
+    // intended strict 60s ordering while agent activity and lane age stay
+    // strictly older, so jobRecency can never tie at `now - 2m` (the
+    // baseJob default let wall-clock drift reorder the band).
+    const now = Date.now();
     const jobs = Array.from({ length: 6 }, (_, index) =>
       baseJob({
         id: `flight-${index}`,
         status: 'in-review',
-        updatedAt: new Date(Date.now() - index * 60_000).toISOString(),
+        updatedAt: new Date(now - index * 60_000).toISOString(),
+        lastAgentActivity: new Date(now - 24 * 3_600_000).toISOString(),
+        lane: {
+          branch: `gru/flight-${index}`,
+          sha: 'abc1234deadbeef',
+          status: 'active',
+          createdAt: new Date(now - 48 * 3_600_000).toISOString(),
+        },
       }),
     );
     const view = new BoardView(() => {});
