@@ -309,7 +309,7 @@ r7-timeout-cliff = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --
 # both heads. This scope isolates the whole file at the unchanged default
 # ceiling so the timeout can be classified (isolation pass vs deterministic
 # fail); it changes no test, timeout, assertion or gate.
-installer-isolation = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/install-one-line.test.ts"
+installer-isolation = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/install-one-line.test.ts"
 
 # Isolated pre-fix baseline: current-main 059c0762 source with the IDENTICAL
 # final behavioral tests from the scheduled head, dependencies linked (no
