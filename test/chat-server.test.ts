@@ -2614,7 +2614,12 @@ describe('chat context controls and durable new-chat boundaries', () => {
         ),
       ).toMatchObject({ ok: true, epoch: 2 });
       expect(new GruSessionPointer(h.chatDir).current()).toMatchObject({ epoch: 2 });
-      expect(firstFresh.disposed).toBe(true);
+      // Post-commit supervision settles AFTER the control result is released
+      // (finalizeCommittedNewChat: "never pin the reset barrier behind ...
+      // retired-handle cleanup"), so the retired fresh handle's disposal is
+      // asynchronous — poll for it exactly as this test does for the first
+      // retired handle above.
+      await pollUntil(() => firstFresh.disposed, 'first fresh handle disposal');
       await reconnect.close();
       await client.close();
     } finally {

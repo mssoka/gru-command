@@ -9,7 +9,7 @@ import type { NotificationCenter } from '../notifications/center.js';
 import type { DispatchService } from './service.js';
 import type { WaveRunner } from './perkins.js';
 import { flipJobToWorking, rebriefFreshMinion, recordFollowUpDelivery, routeFixDirectiveToMinion, type DirectiveRegistry } from './fix-directive.js';
-import { finalizeRebriefRequest } from './rebrief-recovery.js';
+import { checkRebriefTurn, finalizeRebriefRequest, RebriefTurnCancelled } from './rebrief-recovery.js';
 import type { LessonsReferencePort } from '../lessons/types.js';
 import { BranchBusyError } from './branch-idle.js';
 import { deliveredTargetSha } from './silas-driver.js';
@@ -669,6 +669,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           jobId,
           note,
           briefing: job.briefing,
+          beforeTurnSideEffect: () => checkRebriefTurn(options.ledger, jobId, markers),
           onSpawned: (worker) => {
             options.ledger.bindPendingRebriefWorker({
               ids: markers.map((marker) => marker.id),
@@ -678,6 +679,26 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           },
           ...(options.lessons !== undefined ? { lessons: options.lessons } : {}),
         });
+      } catch (error) {
+        if (!(error instanceof RebriefTurnCancelled)) throw error;
+        const cancelled = finalizeRebriefRequest({
+          ledger: options.ledger, worktrees: ops.worktrees, jobId,
+          minionId: null, lanePath: null, note, expectedMarkers: markers,
+        });
+        log('info', 'silas re-brief cancelled before admission', {
+          job: jobId, reason: error.reason, retired: cancelled.retired,
+          superseded: cancelled.superseded,
+          ...(cancelled.retirement !== null
+            ? { refused: cancelled.retirement.refused, skipped: cancelled.retirement.skippedIds } : {}),
+        });
+        json(res, 200, {
+          job_id: jobId, minion_id: null, delivered_sha: null,
+          ...(cancelled.retired ? { retired: true } : {}),
+          ...(cancelled.superseded ? { superseded: true } : {}),
+          ...(cancelled.retirement !== null
+            ? { retirement: { refused: cancelled.retirement.refused, skipped_ids: cancelled.retirement.skippedIds } } : {}),
+        });
+        return true;
       } finally {
         directiveControllers.delete(controller);
       }
@@ -719,7 +740,31 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         lanePath: result.lanePath,
         note,
         expectedPhaseId: rebriefPhaseId,
+        expectedMarkers: markers,
       });
+      if (followUp.retired) {
+        // The job reached terminal while the turn was in flight: the
+        // request was administratively retired; no events were fabricated.
+        // A partial retirement carries its kept-marker ids here too — the
+        // response already carries `retirement`, and this log must not
+        // silently drop the same disposition.
+        log('info', 'silas re-brief retired: job went terminal before the turn settled', {
+          job: jobId,
+          minion_id: result.minionId,
+          ...(followUp.retirement !== null
+            ? { refused: followUp.retirement.refused, skipped: followUp.retirement.skippedIds }
+            : {}),
+        });
+      } else if (followUp.retirement !== null) {
+        // A defensive boundary refused the retirement or the marker identity
+        // drifted: the markers stay for the next pass and nothing was
+        // fabricated. Surface it instead of an unexplained ordinary 200.
+        log('warn', 'silas re-brief retirement incomplete: markers kept for the next pass', {
+          job: jobId,
+          refused: followUp.retirement.refused,
+          skipped: followUp.retirement.skippedIds,
+        });
+      }
       if (followUp.superseded) {
         log('warn', 're-brief request superseded while its turn ran — newer request owns the lane', {
           job: jobId,
@@ -733,7 +778,17 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           note: followUp.deliveryNote,
         });
       }
-      json(res, 200, { job_id: jobId, minion_id: result.minionId, lane: result.lanePath, delivered_sha: followUp.deliveredSha });
+      json(res, 200, {
+        job_id: jobId,
+        minion_id: result.minionId,
+        lane: result.lanePath,
+        delivered_sha: followUp.deliveredSha,
+        ...(followUp.retired ? { retired: true } : {}),
+        ...(followUp.superseded ? { superseded: true } : {}),
+        ...(followUp.retirement !== null
+          ? { retirement: { refused: followUp.retirement.refused, skipped_ids: followUp.retirement.skippedIds } }
+          : {}),
+      });
       return true;
     }
     if (req.method === 'POST' && path === '/api/silas/escalate') {

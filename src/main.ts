@@ -1085,6 +1085,7 @@ async function main(): Promise<number> {
       examined: rebriefRecovery.examined,
       completed: rebriefRecovery.completed,
       redispatched: rebriefRecovery.redispatched,
+      retired: rebriefRecovery.retired,
     });
   }
   // Directive-request restart safety (phase 3): a request accepted before

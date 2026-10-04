@@ -391,7 +391,16 @@ the judgment; the dispatch surface is the mechanical hand.
   re-dispatches a fresh worker on the same lane) and records the missing
   events when that turn settles; a failed recovery escalates
   action-required and keeps the markers for the next boot, so the lane
-  can never stall silently on a lost turn.
+  can never stall silently on a lost turn. A leftover marker whose job
+  has since reached terminal (`merged`/`done`) before the request was
+  honored cannot be served: the boot scan — or a settling turn or
+  re-dispatch boundary that meets the terminal job — retires it
+  administratively (the identity-checked deletion and one
+  `silas.rebrief-retired` audit commit together, with no spawn and no
+  escalation); spent markers (both guarded events already landed) still
+  clear as a completion, with no retirement audit. The boot summary
+  counts `examined` in markers but `completed`/`redispatched`/`retired`
+  in jobs, so one retired pair reads `examined: 2 … retired: 1` by design.
 - **Authority boundaries are unchanged** (`roles/silas.md`): dispatch,
   track, close; never product code; never merge; preserve before remove;
   escalate with pointers. Silas acts only through the authenticated ops

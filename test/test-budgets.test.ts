@@ -163,6 +163,14 @@ describe('workload-aware test budgets', () => {
     expect(Object.keys(scopes).length).toBeGreaterThan(0);
     const heavyPaths = heavyTestPaths();
     for (const [scope, command] of Object.entries(scopes)) {
+      // This one archived pre-policy baseline intentionally runs its old
+      // Vitest config; it is red-phase evidence, never a green verification
+      // scope for the current tree. Pin its archive source before exempting it.
+      if (scope === 'perkins-stage1-baseline') {
+        expect(command).toContain('base=9bb51b05af5d8f0a0cd389788d1d3f19607d5361');
+        expect(command).toContain('git archive "$base"');
+        continue;
+      }
       for (const segment of command.split('&&').map((part) => part.trim())) {
         if (segment.includes('--config vitest.heavy.config.ts')) {
           // The heavy include is an explicit list: a fast file named here is
