@@ -130,10 +130,27 @@ function doubleInvocations(fx: Fixture): {
   stdin: string;
 }[] {
   if (!existsSync(fx.doubleLog)) return [];
-  return readFileSync(fx.doubleLog, 'utf-8')
-    .trim()
-    .split('\n')
-    .map((line) => JSON.parse(line) as never);
+  const records: {
+    argv: string[];
+    cwd: string;
+    prompt: string;
+    images: number;
+    sessionId: string;
+    stdin: string;
+  }[] = [];
+  for (const raw of readFileSync(fx.doubleLog, 'utf-8').split('\n')) {
+    const line = raw.trim();
+    if (line === '') continue;
+    try {
+      records.push(JSON.parse(line) as never);
+    } catch {
+      // A concurrent appendFileSync can expose a partially written trailing
+      // record; the callers' waitFor loops retry until the write completes
+      // (code review: the CI Full suite crashed on a mid-append read).
+      break;
+    }
+  }
+  return records;
 }
 
 /** Direct bridge-socket probe: the same newline-delimited wire the bundled
@@ -920,37 +937,52 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       config: loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester'), store: fx.store,
       binary: DOUBLE, reviewSettingsFile: settingsFile,
     });
-    const reviewDirs = () => readdirSync(tmpdir()).filter((name) => name.startsWith('gru-claude-review-')).sort();
-    const before = new Set(reviewDirs());
-    const newlyRetained = () => reviewDirs().filter((name) => !before.has(name));
-    process.env['CLAUDE_DOUBLE_EXPECT_REVIEW_AUTH'] = 'env';
-    writeFileSync(settingsFile, JSON.stringify({ env: { ANTHROPIC_API_KEY: 'bad-key' } }));
-    await expect(runtime.prepareReviewModel('perkins')).rejects.toThrow(/not configured\/authed/);
-    expect(newlyRetained()).toEqual([]);
-    writeFileSync(settingsFile, JSON.stringify({ env: { ANTHROPIC_API_KEY: 'test-key' } }));
-    const snapshot = await runtime.prepareReviewModel('perkins');
-    expect(newlyRetained()).toEqual([]);
-    const goodProbe = doubleInvocations(fx)[0]!;
-    const settingsPath = goodProbe.argv[goodProbe.argv.indexOf('--settings') + 1]!;
-    expect(existsSync(settingsPath)).toBe(false);
-    await expect(runtime.spawn('perkins', {
-      reviewModel: { ...snapshot, role: 'gru' },
-      isolatedReview: { systemPrompt: 'lens', tools: [] },
-    })).rejects.toThrow(/snapshot belongs to gru/);
-    await expect(runtime.spawn('perkins', {
-      reviewModel: snapshot,
-      reviewLead: { systemPrompt: 'lead', tools: [], nativeTools: [
-        { name: 'invalid', description: 'rejected', inputSchema: {}, execute: async () => ({ text: '' }) },
-      ] },
-    })).rejects.toThrow(/invalid or duplicate native review tool name/);
-    expect(newlyRetained()).toEqual([]);
-    expect(doubleInvocations(fx)).toHaveLength(1);
-    const recovered = await runtime.spawn('perkins', {
-      reviewModel: snapshot, isolatedReview: { systemPrompt: 'lens', tools: [] },
-    });
-    try { await recovered.prompt('review'); } finally { await recovered.dispose(); }
-    expect(newlyRetained()).toEqual([]);
-    expect(doubleInvocations(fx)).toHaveLength(2);
+    // Confine credential settings dirs to this test's own TMPDIR: the
+    // machine tmpdir is shared with other suites, other lanes, and the
+    // live service, so a concurrent producer's live dir must never read
+    // as this runtime's leak (same ownership rule as the bridge tests).
+    const ownedTmp = mkdtempSync(join(tmpdir(), 'claude-settings-tmp-'));
+    cleanupDirs.push(ownedTmp);
+    const previousTmpdir = process.env['TMPDIR'];
+    process.env['TMPDIR'] = ownedTmp;
+    try {
+      const newlyRetained = () =>
+        readdirSync(ownedTmp).filter((name) => name.startsWith('gru-claude-review-')).sort();
+      process.env['CLAUDE_DOUBLE_EXPECT_REVIEW_AUTH'] = 'env';
+      writeFileSync(settingsFile, JSON.stringify({ env: { ANTHROPIC_API_KEY: 'bad-key' } }));
+      await expect(runtime.prepareReviewModel('perkins')).rejects.toThrow(/not configured\/authed/);
+      expect(newlyRetained()).toEqual([]);
+      writeFileSync(settingsFile, JSON.stringify({ env: { ANTHROPIC_API_KEY: 'test-key' } }));
+      const snapshot = await runtime.prepareReviewModel('perkins');
+      expect(newlyRetained()).toEqual([]);
+      const goodProbe = doubleInvocations(fx)[0]!;
+      const settingsPath = goodProbe.argv[goodProbe.argv.indexOf('--settings') + 1]!;
+      // The probe must have used the owned root, or the scoped scan above
+      // could go blind instead of catching a genuine retained dir.
+      expect(settingsPath.startsWith(ownedTmp)).toBe(true);
+      expect(existsSync(settingsPath)).toBe(false);
+      await expect(runtime.spawn('perkins', {
+        reviewModel: { ...snapshot, role: 'gru' },
+        isolatedReview: { systemPrompt: 'lens', tools: [] },
+      })).rejects.toThrow(/snapshot belongs to gru/);
+      await expect(runtime.spawn('perkins', {
+        reviewModel: snapshot,
+        reviewLead: { systemPrompt: 'lead', tools: [], nativeTools: [
+          { name: 'invalid', description: 'rejected', inputSchema: {}, execute: async () => ({ text: '' }) },
+        ] },
+      })).rejects.toThrow(/invalid or duplicate native review tool name/);
+      expect(newlyRetained()).toEqual([]);
+      expect(doubleInvocations(fx)).toHaveLength(1);
+      const recovered = await runtime.spawn('perkins', {
+        reviewModel: snapshot, isolatedReview: { systemPrompt: 'lens', tools: [] },
+      });
+      try { await recovered.prompt('review'); } finally { await recovered.dispose(); }
+      expect(newlyRetained()).toEqual([]);
+      expect(doubleInvocations(fx)).toHaveLength(2);
+    } finally {
+      if (previousTmpdir === undefined) delete process.env['TMPDIR'];
+      else process.env['TMPDIR'] = previousTmpdir;
+    }
   });
 
   it('keeps concurrent and successive review proofs independent on the same Claude adapter', async () => {

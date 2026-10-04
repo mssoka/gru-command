@@ -327,8 +327,10 @@ relaying it. Two mechanisms share one boundary:
 
 The client-facing `notice` frame is now the needs-owner channel only:
 action-required rows never render in a human-facing band or ring the owner
-bell — they wake Gru and live in the board's NEEDS GRU machine queue,
-while needs-owner rows ("🔔 For you: …") stay the human's durable banner.
+bell — they wake Gru and live in the board's NEEDS GRU machine queue
+(live rows only: rows bound to a terminal merged/done lane are closed
+receipts rendered under FEED), while needs-owner rows (“🔔 For you: …”) stay
+the human's durable banner.
 
 **Clean-chat rendering** (owner clause 2026-09-23): consecutive
 service-context frames (tool lines + product notices) render as ONE

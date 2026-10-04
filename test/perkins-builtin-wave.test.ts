@@ -1,6 +1,7 @@
 import { PacingGate, type RetrySettlement } from '../src/runtime/pacing.js';
 import { execFileSync, spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, generateKeyPairSync } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -13,15 +14,25 @@ import {
   WaveRunner,
   hostDisclosureAppendix,
   redactReviewForPublication,
+  type EscalationContext,
   type FallbackGateOutcome,
   type VerdictPoster,
   type WaveOutcome,
 } from '../src/dispatch/perkins.js';
+import { PerkinsAppPrPoster, type AppFetch, type AppFetchInit } from '../src/dispatch/perkins-github-app.js';
 import { preflightFailure, runRuntimeReviewPreflight, type FallbackFinding } from '../src/dispatch/review-path.js';
 import { configPathFor, loadConfig } from '../src/config.js';
 import { RuntimeRegistry } from '../src/runtime/registry.js';
 import { SessionStore } from '../src/sessions/store.js';
 import type { PrHeadProbe } from '../src/dispatch/perkins-review/fresh-head.js';
+import { BoardEngine } from '../src/board/engine.js';
+import { createReviewEscalationNotifier } from '../src/dispatch/escalation-identity.js';
+import { NotificationCenter } from '../src/notifications/center.js';
+import {
+  isValidSnapshot,
+  type BoardSnapshot as WireBoardSnapshot,
+} from '../web/src/lib/board-protocol.js';
+import { terminalBoundNotificationIds } from '../web/src/lib/board-signals.js';
 
 /** These suites exercise the Perkins route (no pre-flight configured), so
  * every runRound result must be a wave outcome; the helper pins that. */
@@ -46,7 +57,7 @@ import type { AgentHandle } from '../src/runtime/types.js';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
-import { lensAgentLabel } from '../src/dispatch/perkins.js';
+import { FALLBACK_REVIEW_TIMEOUT_MS, lensAgentLabel } from '../src/dispatch/perkins.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 import { fakeWholeSpawner, type WholeLeadOptions } from './helpers/perkins-whole-double.js';
 import { GitReviewPort } from './helpers/git-review-port.js';
@@ -84,12 +95,53 @@ class DeferredReviewPort implements WorktreePort {
 
 /** Attach a fetchable bare origin inside the test's port root and push the
  * reviewed branch: the fresh-head freeze reads THIS tip, never the local
- * ref left behind by the fixture. */
-function attachOrigin(repo: FixtureRepo, branch: string, root: string): void {
+ * ref left behind by the fixture. `opts.batched` (T4 only) replaces
+ * `init --bare` + `push` with ONE `clone --bare` of the repo at the same
+ * commit: the bare carries refs/heads/<branch> at the identical sha (plus
+ * inert extra state nothing in the flow reads — the bare's HEAD, its own
+ * config, and a stale refs/heads/main copy; the head probe reads the LOCAL
+ * ref, review worktrees are created from the job repo, and the reconcile
+ * git-ops are local), and the job repo's `origin` remote is added exactly
+ * as before. Callers that omit the flag keep the historical three-process
+ * shape byte-for-byte (phase pr144-t4-second-cost-diagnosis-20261002). */
+function attachOrigin(repo: FixtureRepo, branch: string, root: string, opts?: { readonly batched?: boolean }): string {
   const origin = join(root, 'origin.git');
-  execFileSync('git', ['init', '--bare', '--quiet', origin], { stdio: 'ignore' });
-  repo.git(['remote', 'add', 'origin', origin]);
-  repo.git(['push', '--quiet', 'origin', `refs/heads/${branch}`]);
+  if (opts?.batched === true) {
+    execFileSync('git', ['clone', '--bare', '--quiet', repo.path, origin], { stdio: 'ignore' });
+    repo.git(['remote', 'add', 'origin', origin]);
+    // Actual equivalence pin (phase pr144-followup14-feedback): the batched
+    // bare must carry refs/heads/<branch> at the intended fixture target —
+    // the same tip the historical init+push shape produces. The extra inert
+    // state a clone carries (source HEAD, bare config, stale refs/heads/main)
+    // is never read by the flow and is deliberately not asserted.
+    const intended = repo.git(['rev-parse', `refs/heads/${branch}`]);
+    const batched = repo.git(['rev-parse', `refs/heads/${branch}`], origin);
+    if (batched.toLowerCase() !== intended.toLowerCase()) {
+      throw new Error(
+        `batched origin refs/heads/${branch} (${batched}) does not match the fixture target (${intended})`,
+      );
+    }
+  } else {
+    execFileSync('git', ['init', '--bare', '--quiet', origin], { stdio: 'ignore' });
+    repo.git(['remote', 'add', 'origin', origin]);
+    repo.git(['push', '--quiet', 'origin', `refs/heads/${branch}`]);
+  }
+  return origin;
+}
+
+/** Loose-ref fast path (phase pr144-completion-cycle-20261002): the git
+ * command that just ran wrote `.git/refs/heads/<branch>` as a loose ref,
+ * so reading it is value-identical to `git rev-parse refs/heads/<branch>`
+ * and saves one git spawn per call in the load-amplified T4 window. Any
+ * read failure (worktree gitdir files, packed refs, missing file) falls
+ * back to the real rev-parse, so non-loose layouts keep exact behavior.
+ * Dispatch only — the resolved value is never altered. */
+function looseRefOrRevParse(repoPath: string, ref: string): string {
+  try {
+    return readFileSync(join(repoPath, '.git', ref), 'utf-8').trim();
+  } catch {
+    return execFileSync('git', ['-C', repoPath, 'rev-parse', ref], { encoding: 'utf-8' }).trim();
+  }
 }
 
 /** Probe double for PR rounds: report the reviewed branch's local tip (the
@@ -97,7 +149,7 @@ function attachOrigin(repo: FixtureRepo, branch: string, root: string): void {
 function localHeadProbe(branch: string): PrHeadProbe {
   return async ({ repoPath }) => ({
     headRefName: branch,
-    headSha: execFileSync('git', ['-C', repoPath, 'rev-parse', `refs/heads/${branch}`], { encoding: 'utf-8' }).trim(),
+    headSha: looseRefOrRevParse(repoPath, `refs/heads/${branch}`),
   });
 }
 
@@ -116,6 +168,16 @@ function makeSpawner(
   order: string[],
   onLeadStart?: () => void,
   answerOverride?: (prompt: string) => string | undefined,
+  /** Canonical security-blocker evidence the scripted lead cites on its
+   * second attempt. Defaults to the historical `return 43;` snippet the
+   * pre-existing fixtures commit; T4's fixture commits `return 44;`, so it
+   * passes the snippet its frozen diff actually contains — the locatable-
+   * evidence contract (whole.ts evidenceAtCitedLocation) then accepts the
+   * canonical attempt instead of burning it. The malformed first attempt
+   * and the two-run attempt coverage are unchanged, and every caller that
+   * omits this behaves byte-for-byte as before
+   * (phase pr144-t4-cost-repair-20261001). */
+  securityEvidence?: string,
 ): AgentSpawner {
   let securityAttempts = 0;
   const brain: WholeLeadOptions = {
@@ -131,7 +193,7 @@ function makeSpawner(
         : source === 'security'
           ? JSON.stringify([{
               source: 'security', severity: 'blocker', category: 'auth', title: 'Verified security defect',
-              location: 'src/main.ts:2', evidence: '  return 43;', detail: 'The changed line demonstrates the security defect.',
+              location: 'src/main.ts:2', evidence: securityEvidence ?? '  return 43;', detail: 'The changed line demonstrates the security defect.',
               recommended_fix: 'Correct the implementation and add a regression test.',
             }])
           : '[]');
@@ -143,10 +205,40 @@ function makeSpawner(
 const repos: FixtureRepo[] = [];
 const dbs: LedgerDb[] = [];
 const dirs: string[] = [];
+// T4 attribution state (phase pr144-t4-deep-attribution-20261001; test-local,
+// observation only): the afterEach close/cleanup loop runs OUTSIDE the test
+// body and its inherited 30000 ms bound. When the T4 case arms the observer,
+// that loop's cost is measured and labelled here — never inferred, never
+// summed into in-test phases. Non-T4 tests arm nothing and behave identically.
+let t4Observe = false;
+let t4StartAt: number | null = null;
+// True only when the test body reached its end. False proves only that the
+// body did NOT complete — a timeout abandonment or an already-thrown
+// assertion — never that the body is still settling.
+let t4BodyCompleted = false;
 afterEach(() => {
-  while (dbs.length > 0) dbs.pop()!.close();
-  while (repos.length > 0) repos.pop()!.cleanup();
-  while (dirs.length > 0) rmSync(dirs.pop()!, { recursive: true, force: true });
+  const observing = t4Observe;
+  t4Observe = false;
+  const cleanupStarted = performance.now();
+  try {
+    while (dbs.length > 0) dbs.pop()!.close();
+    while (repos.length > 0) repos.pop()!.cleanup();
+    while (dirs.length > 0) rmSync(dirs.pop()!, { recursive: true, force: true });
+  } finally {
+    // Observational finalization is exception-safe: it runs even when a
+    // cleanup call throws, WITHOUT catching, swallowing, or replacing the
+    // original cleanup error, which still propagates to the runner unchanged.
+    if (observing && t4StartAt !== null) {
+      console.log(`T4-ATTR ${JSON.stringify({
+        leg: 'suite', phase: 'outside-test-cleanup', boundary: 'end',
+        absMs: Math.round(performance.now() - t4StartAt),
+        elapsedMs: Math.round(performance.now() - cleanupStarted),
+        outcome: t4BodyCompleted ? 'completed' : 'test-body-incomplete',
+        note: 'db.close + repo.cleanup(prune+rm) + rmSync run in afterEach, OUTSIDE the test body and its inherited 30000 ms bound; observed even when cleanup throws; test-body-incomplete means only that the body did not complete',
+      })}`);
+      t4StartAt = null;
+    }
+  }
 });
 
 describe('GitHub SHA-bound Perkins delivery', () => {
@@ -631,12 +723,16 @@ describe('WaveRunner built-in Perkins production path', () => {
     ledger.setRoundStatus(round.id, 'live');
     ledger.markLensLive(round.id, 'blind');
     const escalations: string[] = [];
+    const escalationContexts: (EscalationContext | undefined)[] = [];
     const wave = new WaveRunner({
       ledger,
       worktrees: port,
       spawner: vi.fn() as unknown as AgentSpawner,
       reviewArtifactRoot: artifacts,
-      escalate: (title) => escalations.push(title),
+      escalate: (title, _detail, context) => {
+        escalations.push(title);
+        escalationContexts.push(context);
+      },
     });
     expect(await wave.recoverInterruptedRounds()).toBe(1);
     expect(ledger.getRound(round.id)?.status).toBe('aborted');
@@ -645,6 +741,38 @@ describe('WaveRunner built-in Perkins production path', () => {
     expect(existsSync(join(artifacts, round.id, 'restart-recovery.json'))).toBe(true);
     expect(existsSync(join(artifacts, round.id, 'perkins-report.md'))).toBe(true);
     expect(escalations[0]).toContain('INCOMPLETE');
+    // Producer context: the recovery escalation carries its validated
+    // round/job identity for the notification binding (followup A4).
+    expect(escalationContexts[0]).toEqual({ jobId: 'job-restart', roundId: round.id });
+    // V1 chain: the REAL producer context above — not a handcrafted one —
+    // flows through the notifier into a live row, and the lane
+    // terminalizing reclassifies that emitted row as a closed receipt on
+    // BOTH surfaces (the ledger's live chip count and the board's
+    // terminal-bound set the bell renders from).
+    ledger.registerAgent({ id: 'minion-restart-receipt', role: 'minion', jobId: job.id });
+    const chainCenter = new NotificationCenter({ ledger, bus: new EventBus() });
+    const liveBefore = ledger.countLivePendingActionRequired();
+    const receiptsBefore = ledger.countPendingActionRequiredIncludingReceipts();
+    createReviewEscalationNotifier(ledger, chainCenter)(
+      'chain: Review round INCOMPLETE',
+      'chain detail',
+      escalationContexts[0],
+    );
+    const chainRow = ledger
+      .listNotifications({ limit: 100 })
+      .find((row) => row.kind === 'review-escalation' && row.title === 'chain: Review round INCOMPLETE');
+    expect(chainRow?.agentId).toBe('minion-restart-receipt');
+    expect(ledger.countLivePendingActionRequired()).toBe(liveBefore + 1);
+    ledger.setJobStatus(job.id, 'merged');
+    expect(ledger.countLivePendingActionRequired()).toBe(liveBefore);
+    expect(ledger.countPendingActionRequiredIncludingReceipts()).toBe(receiptsBefore + 1);
+    // The engine's server-side snapshot and the web's wire type are
+    // separate namespaces: cross them the way the wire does — serialize,
+    // validate with the web parser, then classify. A shape drift fails the
+    // validator here instead of silently changing the board's truth.
+    const wireValue: unknown = JSON.parse(JSON.stringify(new BoardEngine({ ledger, bus: new EventBus() }).snapshot()));
+    expect(isValidSnapshot(wireValue)).toBe(true);
+    expect(terminalBoundNotificationIds(wireValue as WireBoardSnapshot)).toContain(chainRow?.id);
     rmSync(root, { recursive: true, force: true });
     rmSync(artifacts, { recursive: true, force: true });
   });
@@ -1496,6 +1624,143 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     expect(securityChip?.note).toContain('earlier failed attempts: a1 output');
   });
 
+  it('a REAL App publisher reconciling a failed POST never credits a stale identical review — no round.posted, no verdict (App seam)', async () => {
+    // r1 finding 2 end-to-end: WaveRunner calls poster.reconcile after the
+    // failed post; the App publisher's attempt-constrained second lookup
+    // must leave the provider's stale identical review uncredited, so the
+    // round stays honestly unposted (no round.posted event, no recorded
+    // verdict, no approval completion).
+    const { privateKey } = generateKeyPairSync('rsa', {
+      modulusLength: 2048,
+      privateKeyEncoding: { type: 'pkcs1', format: 'pem' },
+      publicKeyEncoding: { type: 'spki', format: 'pem' },
+    });
+    const home = mkdtempSync(join(tmpdir(), 'perkins-app-seam-home-'));
+    dirs.push(home);
+    mkdirSync(join(home, 'perkins'), { recursive: true });
+    chmodSync(join(home, 'perkins'), 0o700);
+    writeFileSync(join(home, 'perkins', 'app-key.pem'), privateKey, 'utf8');
+    chmodSync(join(home, 'perkins', 'app-key.pem'), 0o600);
+    const configPath = join(home, 'perkins', 'config');
+    writeFileSync(configPath, 'app_id=424242\nkey_path="app-key.pem"\ninstallation_id_acme=164552969\n', 'utf8');
+    chmodSync(configPath, 0o600);
+
+    const repo = makeFixtureRepo('perkins-app-seam');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/app-seam']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    // The App publisher binds credentials to the PR URL's origin: an
+    // ssh-form github.com origin satisfies the identity check. The freeze
+    // and drift checks still FETCH that origin and cross-check the local
+    // head probe, so the fixture binds the ssh transport to a local bare
+    // repo via core.sshCommand — every production freshness check runs,
+    // with no network. The delivery itself rides the mocked fetch.
+    const originRoot = mkdtempSync(join(tmpdir(), 'perkins-app-seam-origin-'));
+    dirs.push(originRoot);
+    const origin = join(originRoot, 'origin.git');
+    execFileSync('git', ['init', '--bare', '--quiet', origin], { stdio: 'ignore' });
+    repo.git(['remote', 'add', 'origin', 'git@github.com:acme/widget.git']);
+    repo.git(['push', '--quiet', origin, 'refs/heads/feature/app-seam']);
+    const sshDouble = join(originRoot, 'ssh-double.sh');
+    writeFileSync(sshDouble, `#!/bin/sh\nexec git-upload-pack ${JSON.stringify(origin)}\n`, 'utf8');
+    chmodSync(sshDouble, 0o755);
+    repo.git(['config', 'core.sshCommand', sshDouble]);
+
+    const NOW = 1_800_000_000_000;
+    let postCount = 0;
+    let lookupCount = 0;
+    let allRequests = 0;
+    let deliveredBody = '';
+    const fetchImpl: AppFetch = async (url, init: AppFetchInit = {}) => {
+      const method = init.method ?? 'GET';
+      allRequests += 1;
+      const json = (status: number, body: unknown) => ({
+        ok: status >= 200 && status < 300,
+        status,
+        text: async () => JSON.stringify(body),
+      });
+      if (method === 'GET' && /\/app$/.test(url)) {
+        return json(200, { id: 424242, slug: 'perkins-review', owner: { login: 'solarity-services' } });
+      }
+      if (method === 'POST' && /\/app\/installations\/164552969\/access_tokens$/.test(url)) {
+        return json(201, {
+          token: `ghs_${'S'.repeat(36)}`,
+          expires_at: new Date(NOW + 3_600_000).toISOString(),
+          permissions: { 'pull_requests': 'write', 'metadata': 'read' },
+          repositories: [{ full_name: 'acme/widget', id: 1 }],
+        });
+      }
+      if (method === 'GET' && /\/repos\/acme\/widget\/pulls\/7$/.test(url)) {
+        return json(200, { number: 7, head: { sha: target }, base: { sha: 'b'.repeat(40) } });
+      }
+      if (method === 'POST' && /\/repos\/acme\/widget\/pulls\/7\/reviews$/.test(url)) {
+        postCount += 1;
+        deliveredBody = typeof init.body === 'string' ? (JSON.parse(init.body) as { body?: string }).body ?? '' : '';
+        throw new Error('socket hang up after send');
+      }
+      if (method === 'GET' && /\/repos\/acme\/widget\/pulls\/7\/reviews\?/.test(url)) {
+        lookupCount += 1;
+        // ONLY a stale identical App review: submitted an hour before this
+        // round's POST. An unconstrained second lookup would credit it.
+        return json(200, [{
+          id: 555666,
+          user: { login: 'perkins-review[bot]', type: 'Bot', id: 308038895 },
+          commit_id: target,
+          state: 'COMMENTED',
+          body: deliveredBody,
+          submitted_at: new Date(NOW - 3_600_000).toISOString(),
+        }]);
+      }
+      return json(404, { message: `no test route for ${method} ${url}` });
+    };
+    // The REAL production path: AutoVerdictPoster selecting the real App
+    // publisher — so the post-failure caller context must travel through
+    // AutoVerdictPoster.reconcile to the same selected backend, not just
+    // to a directly injected double.
+    const poster = new AutoVerdictPoster(new PerkinsAppPrPoster({ instanceDir: home, fetchImpl, now: () => NOW }));
+
+    const root = mkdtempSync(join(tmpdir(), 'perkins-app-seam-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-app-seam-artifacts-'));
+    const sessions = mkdtempSync(join(tmpdir(), 'perkins-app-seam-sessions-'));
+    dirs.push(root, artifacts, sessions);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-app-seam-db-')));
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/app-seam', target);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-app-seam' });
+    const job = ledger.addJob({ id: 'job-app-seam', repo: 'fixture', title: 'app seam', baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://github.com/acme/widget/pull/7');
+    const escalations: string[] = [];
+    const wave = new WaveRunner({
+      ledger, worktrees: port, spawner: makeSpawner(sessions, []), poster, reviewArtifactRoot: artifacts,
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      prHeadProbe: localHeadProbe('feature/app-seam') as ReturnType<typeof localHeadProbe>,
+    });
+    const outcome = asWave(await wave.runRound({ jobId: job.id }));
+    // Exactly one POST (never a duplicate) and exactly ONE reviews lookup:
+    // post()'s own bounded strict-window reconciliation. A second lookup
+    // would prove the post-failure context never reached the selected App
+    // (ordinary recovery would then also CREDIT the stale review and
+    // record round.posted).
+    expect(postCount).toBe(1);
+    expect(lookupCount).toBe(1);
+    // The WHOLE provider interaction is exactly the five requests of one
+    // post attempt (App identity, token mint, PR identity, the failed
+    // POST, and post()'s single strict-window lookup): any additional
+    // request — including anything the live second lookup might have sent
+    // — fails this pin.
+    expect(allRequests).toBe(5);
+    // The stale identical review is NOT credited: honestly unposted.
+    expect(outcome.posted).toBe(false);
+    expect(outcome.round.status).not.toBe('verdict-posted');
+    expect(ledger.latestRoundEvent(outcome.round.id, 'round.posted')).toBeNull();
+    expect(ledger.latestRoundEvent(outcome.round.id, 'round.perkins-incomplete')).not.toBeNull();
+    expect(outcome.verdict ?? null).toBeNull();
+    expect(escalations.length).toBeGreaterThanOrEqual(1);
+  });
+
   it('reconciles an ambiguous post through the PRODUCTION adapter: same provider selection, single POST (T1)', async () => {
     const repo = makeFixtureRepo('perkins-adapter-reconcile');
     repos.push(repo);
@@ -1702,89 +1967,333 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     }
   });
 
-  it('does not record a reconciled delivery when the ref moved or the run aborted during the lookup (T4)', async () => {
-    const prepare = async (name: string, branch: string) => {
-      const repo = makeFixtureRepo(name);
+  it('does not record a reconciled delivery when the ref moved during the lookup (T4a)', async () => {
+    // Split from the former composite T4 (moved + aborted in one body): each
+    // scenario runs under its own unchanged body ceiling with its assertions
+    // intact; main's observation-only T4-PHASE/T4-ATTR instrumentation is
+    // retained per leg.
+    // T4 phase evidence (phase pr144-t4-phase-evidence-20261001; test-local,
+    // observation only): monotonic elapsed per named boundary, emitted as
+    // bounded JSON lines so partial evidence survives an exceptional exit or
+    // the unchanged 30000 ms bound. Emits stdout lines only; never alters
+    // refs, ordering, mocks, or assertions.
+    const t4Mark = (kase: 'moved' | 'aborted', phase: string, boundary: 'start' | 'end', outcome: string, elapsedMs?: number): void => {
+      console.log(`T4-PHASE ${JSON.stringify({ case: kase, phase, boundary, outcome, ...(elapsedMs !== undefined ? { elapsedMs: Math.round(elapsedMs) } : {}) })}`);
+    };
+    const t4Timed = async <T>(kase: 'moved' | 'aborted', phase: string, run: () => Promise<T>): Promise<T> => {
+      const started = performance.now();
+      t4Mark(kase, phase, 'start', 'begin');
+      try {
+        const result = await run();
+        t4Mark(kase, phase, 'end', 'completed', performance.now() - started);
+        return result;
+      } catch (error) {
+        t4Mark(kase, phase, 'end', error instanceof Error ? `rejected:${error.name}` : 'rejected', performance.now() - started);
+        throw error;
+      }
+    };
+    // Finer attribution (phase pr144-t4-deep-attribution-20261001; test-local,
+    // observation only): T4-ATTR carries the absolute elapsed relative to this
+    // test's monotonic start on EVERY boundary plus per-phase elapsed, and
+    // subdivides fixture prep, the review-lifecycle boundaries this test
+    // drives (head probe, native lead start, reconciliation lookup), and the
+    // outside-body cleanup (emitted from the gated afterEach). Every real
+    // call is forwarded exactly once; ordering, mocks, refs, and assertions
+    // are untouched. The T4-PHASE marks above are emitted unchanged.
+    // Nested intervals (reconcile-lookup inside wave-round) are reported
+    // separately and are never summed into totals.
+    const t4Start = performance.now();
+    t4StartAt = t4Start;
+    t4Observe = true;
+    t4BodyCompleted = false;
+    const t4Attr = (leg: 'moved' | 'aborted' | 'suite', phase: string, boundary: 'start' | 'end', extra?: { elapsedMs?: number; outcome?: string; note?: string }): void => {
+      console.log(`T4-ATTR ${JSON.stringify({
+        leg, phase, boundary, absMs: Math.round(performance.now() - t4Start),
+        ...(extra?.elapsedMs !== undefined ? { elapsedMs: Math.round(extra.elapsedMs) } : {}),
+        ...(extra?.outcome !== undefined ? { outcome: extra.outcome } : {}),
+        ...(extra?.note !== undefined ? { note: extra.note } : {}),
+      })}`);
+    };
+    // run() may settle synchronously (plain value) or asynchronously
+    // (thenable); the awaited result is forwarded with its exact value and
+    // type, exactly one invocation, unchanged error propagation and ordering.
+    const t4Step = async <T>(leg: 'moved' | 'aborted', phase: string, run: () => T | Promise<T>): Promise<Awaited<T>> => {
+      t4Attr(leg, phase, 'start');
+      const started = performance.now();
+      try {
+        const result = await run();
+        t4Attr(leg, phase, 'end', { elapsedMs: performance.now() - started, outcome: 'completed' });
+        return result;
+      } catch (error) {
+        t4Attr(leg, phase, 'end', { elapsedMs: performance.now() - started, outcome: error instanceof Error ? `rejected:${error.name}` : 'rejected' });
+        throw error;
+      }
+    };
+    const t4Probe = (leg: 'moved' | 'aborted', branch: string): PrHeadProbe => {
+      const inner = localHeadProbe(branch);
+      return (input) => t4Step(leg, 'wave/head-probe', () => inner(input));
+    };
+    t4Attr('suite', 'test-start', 'start', { note: 'split T4a: moved discriminator, inherited 30000 ms bound unchanged; nested intervals are never summed' });
+    const prepare = async (name: string, branch: string, leg: 'moved' | 'aborted') => {
+      const repo = await t4Step(leg, 'fixture/repo-init', async () => makeFixtureRepo(name, (step) => t4Attr(leg, `fixture/repo-init.${step}`, 'end', { outcome: 'completed' })));
       repos.push(repo);
-      repo.git(['checkout', '-b', branch]);
-      const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 44;\n}\n');
-      const root = mkdtempSync(join(tmpdir(), `${name}-port-`));
-      const artifacts = mkdtempSync(join(tmpdir(), `${name}-artifacts-`));
-      const sessions = mkdtempSync(join(tmpdir(), `${name}-sessions-`));
-      dirs.push(root, artifacts, sessions);
-      const db = new LedgerDb(mkdtempSync(join(tmpdir(), `${name}-db-`)));
-      dbs.push(db);
-      const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+      await t4Step(leg, 'fixture/branch-create', async () => { repo.git(['checkout', '-b', branch]); });
+      const target = await t4Step(leg, 'fixture/target-commit', () => {
+        // Batched equivalent of commitFile's add+commit (phase
+        // pr144-t4-cost-repair-20261001): one git process stages the file
+        // and commits (`commit --include`), removing a Node-to-git spawn
+        // per leg while keeping the identical Fixture Tests identity, the
+        // identical default message, parent, and resulting tree/HEAD, and
+        // the same loud non-zero failure propagation on any git error.
+        const file = join(repo.path, 'src/main.ts');
+        mkdirSync(dirname(file), { recursive: true });
+        writeFileSync(file, 'export function answer(): number {\n  return 44;\n}\n');
+        repo.git([
+          '-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid',
+          'commit', '--include', 'src/main.ts', '-m', 'fixture: update src/main.ts',
+        ]);
+        // The branch ref was just written loose by the commit above; the
+        // loose read is value-identical to `git rev-parse HEAD` (HEAD is
+        // the branch here) with an exact rev-parse fallback.
+        return looseRefOrRevParse(repo.path, `refs/heads/${branch}`);
+      });
+      const temps = await t4Step(leg, 'fixture/tempdirs', () => {
+        const root = mkdtempSync(join(tmpdir(), `${name}-port-`));
+        const artifacts = mkdtempSync(join(tmpdir(), `${name}-artifacts-`));
+        const sessions = mkdtempSync(join(tmpdir(), `${name}-sessions-`));
+        dirs.push(root, artifacts, sessions);
+        return { root, artifacts, sessions };
+      });
+      const root = temps.root;
+      const artifacts = temps.artifacts;
+      const sessions = temps.sessions;
+      const ledger = await t4Step(leg, 'fixture/ledger-open', () => {
+        const db = new LedgerDb(mkdtempSync(join(tmpdir(), `${name}-db-`)));
+        dbs.push(db);
+        return new LedgerApi(db.handle, { bus: new EventBus() });
+      });
       const port = new GitReviewPort(root, branch, target);
-      await port.createJobWorktree({ repoPath: repo.path, jobId: `job-${name}` });
-      const job = ledger.addJob({ id: `job-${name}`, repo: 'fixture', title: name, baseBranch: 'main', briefing: 'review' });
-      ledger.setJobStatus(job.id, 'working');
-      settleLane(ledger, job.id);
-      ledger.setJobPr(job.id, `https://git.example.invalid/acme/fixture/pull/${name.length}`);
-      attachOrigin(repo, branch, root);
+      await t4Step(leg, 'fixture/worktree-create', () => port.createJobWorktree({ repoPath: repo.path, jobId: `job-${name}` }));
+      const job = await t4Step(leg, 'fixture/lane-register', () => {
+        const job = ledger.addJob({ id: `job-${name}`, repo: 'fixture', title: name, baseBranch: 'main', briefing: 'review' });
+        ledger.setJobStatus(job.id, 'working');
+        settleLane(ledger, job.id);
+        ledger.setJobPr(job.id, `https://git.example.invalid/acme/fixture/pull/${name.length}`);
+        return job;
+      });
+      await t4Step(leg, 'fixture/origin-push', async () => { attachOrigin(repo, branch, root, { batched: true }); });
       return { repo, ledger, port, artifacts, sessions, target, job, root };
     };
-    // (a) The movement ref advances while the reconciliation lookup is
+    // The movement ref advances while the reconciliation lookup is
     // outstanding: the receipt is preserved, never recorded as delivery.
-    const moved = await prepare('perkins-t4-moved', 'feature/t4-moved');
+    const moved = await t4Timed('moved', 'fixture-prep', () => prepare('perkins-t4-moved', 'feature/t4-moved', 'moved'));
     const post = vi.fn(async () => { throw new Error('gh api review delivery exited 1: timeout'); });
     const reconcile = vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => {
-      // The frozen BASE drifts while the lookup is outstanding — the
-      // stale-source guard refMovedSinceFreeze must refuse the recording.
-      // commit-tree needs an explicit identity: CI runners have no global
-      // git user (commitFile passes one the same way).
-      const newMain = moved.repo.git([
-        '-c', 'user.name=T4 Fixture', '-c', 'user.email=t4@example.invalid',
-        'commit-tree', 'main^{tree}', '-m', 'base moves during lookup',
-      ]).trim();
-      moved.repo.git(['branch', '-f', 'main', newMain]);
-      return {
-        reviewId: '9200', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
-        headSha: call.targetSha, baseSha: 'b'.repeat(40),
-        bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
-      };
+      return t4Timed('moved', 'reconcile-lookup', async () => {
+        // The frozen BASE drifts while the lookup is outstanding — the
+        // stale-source guard refMovedSinceFreeze must refuse the recording.
+        // commit-tree needs an explicit identity: CI runners have no global
+        // git user (commitFile passes one the same way).
+        const gitStarted = performance.now();
+        t4Mark('moved', 'git-ops', 'start', 'begin');
+        const newMain = moved.repo.git([
+          '-c', 'user.name=T4 Fixture', '-c', 'user.email=t4@example.invalid',
+          'commit-tree', 'main^{tree}', '-m', 'base moves during lookup',
+        ]).trim();
+        moved.repo.git(['branch', '-f', 'main', newMain]);
+        t4Mark('moved', 'git-ops', 'end', 'completed', performance.now() - gitStarted);
+        return {
+          reviewId: '9200', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+          headSha: call.targetSha, baseSha: 'b'.repeat(40),
+          bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
+        };
+      });
     });
     const escalations: string[] = [];
+    const escalationContexts: (EscalationContext | undefined)[] = [];
     const movedWave = new WaveRunner({
-      ledger: moved.ledger, worktrees: moved.port, spawner: makeSpawner(moved.sessions, []),
+      ledger: moved.ledger, worktrees: moved.port, spawner: makeSpawner(moved.sessions, [], () => t4Attr('moved', 'wave/lead-start', 'end', { outcome: 'completed', note: 'native lead child start on the original production path' }), undefined, '  return 44;'),
       poster: { post, reconcile }, reviewArtifactRoot: moved.artifacts,
-      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
-      prHeadProbe: localHeadProbe('feature/t4-moved'),
+      escalate: (title, detail, context) => {
+        escalations.push(`${title}: ${detail}`);
+        escalationContexts.push(context);
+      },
+      prHeadProbe: t4Probe('moved', 'feature/t4-moved'),
     });
-    const movedOutcome = asWave(await movedWave.runRound({ jobId: moved.job.id }));
+    const movedOutcome = asWave(await t4Timed('moved', 'wave-round', () => movedWave.runRound({ jobId: moved.job.id })));
     expect(movedOutcome.posted).toBe(false);
     expect(movedOutcome.verdict).toBeNull();
     expect(movedOutcome.canonicalVerdict).toBe('INCOMPLETE');
     expect(escalations.some((line) => line.includes('reconciled a provider review but did NOT record it'))).toBe(true);
+    // Producer context: the reconciled-unrecorded escalation carries its
+    // validated round/job identity for the notification binding (A4).
+    expect(
+      escalationContexts.some(
+        (context) => context?.jobId === moved.job.id && context.roundId === movedOutcome.round.id,
+      ),
+    ).toBe(true);
     const unrecorded = JSON.parse(readFileSync(join(moved.artifacts, movedOutcome.round.id, 'perkins-report.reconciled-unrecorded.json'), 'utf8')) as { recorded?: boolean; reason?: string; receipt?: { reviewId?: string } };
     expect(unrecorded.recorded).toBe(false);
     expect(unrecorded.reason).toContain('moved while the reconciliation lookup was outstanding');
     expect(unrecorded.receipt?.reviewId).toBe('9200');
     expect(moved.ledger.latestRoundEvent(movedOutcome.round.id, 'round.posted')).toBeNull();
+    t4Attr('moved', 'leg', 'end', { outcome: 'completed', note: 'fixture-prep + wave-round + assertions; reconcile-lookup/git-ops are NESTED in wave-round — never summed' });
+    t4BodyCompleted = true;
+    t4Attr('suite', 'test-end', 'end', { outcome: 'completed' });
+  });
+
+  it('does not record a reconciled delivery when the run aborted during the lookup (T4b)', async () => {
+    // Split from the former composite T4 (moved + aborted in one body): each
+    // scenario runs under its own unchanged body ceiling with its assertions
+    // intact; main's observation-only T4-PHASE/T4-ATTR instrumentation is
+    // retained per leg.
+    // T4 phase evidence (phase pr144-t4-phase-evidence-20261001; test-local,
+    // observation only): monotonic elapsed per named boundary, emitted as
+    // bounded JSON lines so partial evidence survives an exceptional exit or
+    // the unchanged 30000 ms bound. Emits stdout lines only; never alters
+    // refs, ordering, mocks, or assertions.
+    const t4Mark = (kase: 'moved' | 'aborted', phase: string, boundary: 'start' | 'end', outcome: string, elapsedMs?: number): void => {
+      console.log(`T4-PHASE ${JSON.stringify({ case: kase, phase, boundary, outcome, ...(elapsedMs !== undefined ? { elapsedMs: Math.round(elapsedMs) } : {}) })}`);
+    };
+    const t4Timed = async <T>(kase: 'moved' | 'aborted', phase: string, run: () => Promise<T>): Promise<T> => {
+      const started = performance.now();
+      t4Mark(kase, phase, 'start', 'begin');
+      try {
+        const result = await run();
+        t4Mark(kase, phase, 'end', 'completed', performance.now() - started);
+        return result;
+      } catch (error) {
+        t4Mark(kase, phase, 'end', error instanceof Error ? `rejected:${error.name}` : 'rejected', performance.now() - started);
+        throw error;
+      }
+    };
+    // Finer attribution (phase pr144-t4-deep-attribution-20261001; test-local,
+    // observation only): T4-ATTR carries the absolute elapsed relative to this
+    // test's monotonic start on EVERY boundary plus per-phase elapsed, and
+    // subdivides fixture prep, the review-lifecycle boundaries this test
+    // drives (head probe, native lead start, reconciliation lookup), and the
+    // outside-body cleanup (emitted from the gated afterEach). Every real
+    // call is forwarded exactly once; ordering, mocks, refs, and assertions
+    // are untouched. The T4-PHASE marks above are emitted unchanged.
+    // Nested intervals (reconcile-lookup inside wave-round) are reported
+    // separately and are never summed into totals.
+    const t4Start = performance.now();
+    t4StartAt = t4Start;
+    t4Observe = true;
+    t4BodyCompleted = false;
+    const t4Attr = (leg: 'moved' | 'aborted' | 'suite', phase: string, boundary: 'start' | 'end', extra?: { elapsedMs?: number; outcome?: string; note?: string }): void => {
+      console.log(`T4-ATTR ${JSON.stringify({
+        leg, phase, boundary, absMs: Math.round(performance.now() - t4Start),
+        ...(extra?.elapsedMs !== undefined ? { elapsedMs: Math.round(extra.elapsedMs) } : {}),
+        ...(extra?.outcome !== undefined ? { outcome: extra.outcome } : {}),
+        ...(extra?.note !== undefined ? { note: extra.note } : {}),
+      })}`);
+    };
+    // run() may settle synchronously (plain value) or asynchronously
+    // (thenable); the awaited result is forwarded with its exact value and
+    // type, exactly one invocation, unchanged error propagation and ordering.
+    const t4Step = async <T>(leg: 'moved' | 'aborted', phase: string, run: () => T | Promise<T>): Promise<Awaited<T>> => {
+      t4Attr(leg, phase, 'start');
+      const started = performance.now();
+      try {
+        const result = await run();
+        t4Attr(leg, phase, 'end', { elapsedMs: performance.now() - started, outcome: 'completed' });
+        return result;
+      } catch (error) {
+        t4Attr(leg, phase, 'end', { elapsedMs: performance.now() - started, outcome: error instanceof Error ? `rejected:${error.name}` : 'rejected' });
+        throw error;
+      }
+    };
+    const t4Probe = (leg: 'moved' | 'aborted', branch: string): PrHeadProbe => {
+      const inner = localHeadProbe(branch);
+      return (input) => t4Step(leg, 'wave/head-probe', () => inner(input));
+    };
+    t4Attr('suite', 'test-start', 'start', { note: 'split T4b: aborted discriminator, inherited 30000 ms bound unchanged; nested intervals are never summed' });
+    const prepare = async (name: string, branch: string, leg: 'moved' | 'aborted') => {
+      const repo = await t4Step(leg, 'fixture/repo-init', async () => makeFixtureRepo(name, (step) => t4Attr(leg, `fixture/repo-init.${step}`, 'end', { outcome: 'completed' })));
+      repos.push(repo);
+      await t4Step(leg, 'fixture/branch-create', async () => { repo.git(['checkout', '-b', branch]); });
+      const target = await t4Step(leg, 'fixture/target-commit', () => {
+        // Batched equivalent of commitFile's add+commit (phase
+        // pr144-t4-cost-repair-20261001): one git process stages the file
+        // and commits (`commit --include`), removing a Node-to-git spawn
+        // per leg while keeping the identical Fixture Tests identity, the
+        // identical default message, parent, and resulting tree/HEAD, and
+        // the same loud non-zero failure propagation on any git error.
+        const file = join(repo.path, 'src/main.ts');
+        mkdirSync(dirname(file), { recursive: true });
+        writeFileSync(file, 'export function answer(): number {\n  return 44;\n}\n');
+        repo.git([
+          '-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid',
+          'commit', '--include', 'src/main.ts', '-m', 'fixture: update src/main.ts',
+        ]);
+        // The branch ref was just written loose by the commit above; the
+        // loose read is value-identical to `git rev-parse HEAD` (HEAD is
+        // the branch here) with an exact rev-parse fallback.
+        return looseRefOrRevParse(repo.path, `refs/heads/${branch}`);
+      });
+      const temps = await t4Step(leg, 'fixture/tempdirs', () => {
+        const root = mkdtempSync(join(tmpdir(), `${name}-port-`));
+        const artifacts = mkdtempSync(join(tmpdir(), `${name}-artifacts-`));
+        const sessions = mkdtempSync(join(tmpdir(), `${name}-sessions-`));
+        dirs.push(root, artifacts, sessions);
+        return { root, artifacts, sessions };
+      });
+      const root = temps.root;
+      const artifacts = temps.artifacts;
+      const sessions = temps.sessions;
+      const ledger = await t4Step(leg, 'fixture/ledger-open', () => {
+        const db = new LedgerDb(mkdtempSync(join(tmpdir(), `${name}-db-`)));
+        dbs.push(db);
+        return new LedgerApi(db.handle, { bus: new EventBus() });
+      });
+      const port = new GitReviewPort(root, branch, target);
+      await t4Step(leg, 'fixture/worktree-create', () => port.createJobWorktree({ repoPath: repo.path, jobId: `job-${name}` }));
+      const job = await t4Step(leg, 'fixture/lane-register', () => {
+        const job = ledger.addJob({ id: `job-${name}`, repo: 'fixture', title: name, baseBranch: 'main', briefing: 'review' });
+        ledger.setJobStatus(job.id, 'working');
+        settleLane(ledger, job.id);
+        ledger.setJobPr(job.id, `https://git.example.invalid/acme/fixture/pull/${name.length}`);
+        return job;
+      });
+      await t4Step(leg, 'fixture/origin-push', async () => { attachOrigin(repo, branch, root, { batched: true }); });
+      return { repo, ledger, port, artifacts, sessions, target, job, root };
+    };
     // (b) The run's abort signal fires while the lookup is outstanding.
-    const aborted = await prepare('perkins-t4-aborted', 'feature/t4-aborted');
+    const aborted = await t4Timed('aborted', 'fixture-prep', () => prepare('perkins-t4-aborted', 'feature/t4-aborted', 'aborted'));
     const abortPost = vi.fn(async () => { throw new Error('gh api review delivery exited 1: timeout'); });
     const abortReconcile = vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => {
-      for (const controller of (abortedWave as unknown as { activeControllers: Set<AbortController> }).activeControllers) controller.abort();
-      return {
-        reviewId: '9201', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
-        headSha: call.targetSha, baseSha: 'b'.repeat(40),
-        bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
-      };
+      return t4Timed('aborted', 'reconcile-lookup', async () => {
+        for (const controller of (abortedWave as unknown as { activeControllers: Set<AbortController> }).activeControllers) controller.abort();
+        return {
+          reviewId: '9201', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+          headSha: call.targetSha, baseSha: 'b'.repeat(40),
+          bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
+        };
+      });
     });
     const abortEscalations: string[] = [];
     const abortedWave = new WaveRunner({
-      ledger: aborted.ledger, worktrees: aborted.port, spawner: makeSpawner(aborted.sessions, []),
+      ledger: aborted.ledger, worktrees: aborted.port, spawner: makeSpawner(aborted.sessions, [], () => t4Attr('aborted', 'wave/lead-start', 'end', { outcome: 'completed', note: 'native lead child start on the original production path' }), undefined, '  return 44;'),
       poster: { post: abortPost, reconcile: abortReconcile }, reviewArtifactRoot: aborted.artifacts,
       escalate: (title, detail) => abortEscalations.push(`${title}: ${detail}`),
-      prHeadProbe: localHeadProbe('feature/t4-aborted'),
+      prHeadProbe: t4Probe('aborted', 'feature/t4-aborted'),
     });
-    const abortedOutcome = asWave(await abortedWave.runRound({ jobId: aborted.job.id }));
+    const abortedOutcome = asWave(await t4Timed('aborted', 'wave-round', () => abortedWave.runRound({ jobId: aborted.job.id })));
     expect(abortedOutcome.posted).toBe(false);
     expect(abortedOutcome.verdict).toBeNull();
-    const unrecordedAbort = JSON.parse(readFileSync(join(aborted.artifacts, abortedOutcome.round.id, 'perkins-report.reconciled-unrecorded.json'), 'utf8')) as { reason?: string };
+    const unrecordedAbort = JSON.parse(readFileSync(join(aborted.artifacts, abortedOutcome.round.id, 'perkins-report.reconciled-unrecorded.json'), 'utf8')) as { recorded?: boolean; reason?: string; receipt?: { reviewId?: string } };
+    expect(unrecordedAbort.recorded).toBe(false);
     expect(unrecordedAbort.reason).toContain('aborted while the reconciliation lookup was outstanding');
+    expect(unrecordedAbort.receipt?.reviewId).toBe('9201');
     expect(aborted.ledger.latestRoundEvent(abortedOutcome.round.id, 'round.posted')).toBeNull();
+    // T4a parity: the production abort branch escalates the unrecorded
+    // reconciled review; recording without asserting it would hide a lost
+    // operator notification.
+    expect(abortEscalations.some((line) => line.includes('reconciled a provider review but did NOT record it'))).toBe(true);
+    t4Attr('aborted', 'leg', 'end', { outcome: 'completed', note: 'fixture-prep + wave-round + assertions; reconcile-lookup is NESTED in wave-round — never summed' });
+    t4BodyCompleted = true;
+    t4Attr('suite', 'test-end', 'end', { outcome: 'completed' });
   });
 });
 
@@ -2395,6 +2904,9 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
     /** Make the fallback turn reject after writing its report (a transport
      * rejection whose automatic retry may still recover the delivery). */
     failPrompt?: boolean;
+    /** Hold every fallback minion turn open until the test releases it, so a
+     * transport wait slice can expire while the review is genuinely live. */
+    promptHold?: { readonly release: Promise<void> };
   }): Promise<{
     wave: WaveRunner;
     job: { readonly id: string };
@@ -2408,6 +2920,7 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
     prompts: string[];
     spawnCwds: string[];
     escalations: string[];
+    disposed: string[];
   }> {
     const repo = makeFixtureRepo('perkins-prod-gate');
     repos.push(repo);
@@ -2430,6 +2943,7 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
     const prompts: string[] = [];
     const spawnCwds: string[] = [];
     const escalations: string[] = [];
+    const disposed: string[] = [];
     const spawner: AgentSpawner = async (role, spawnOptions = {}) => {
       spawnCwds.push(spawnOptions.cwd ?? '');
       const file = join(sessions, `prod-${spawnCwds.length}.jsonl`);
@@ -2447,13 +2961,14 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
           if (reportMatch !== null) {
             writeFileSync(reportMatch[1]!, JSON.stringify(options.findingToWrite), 'utf8');
           }
+          if (options.promptHold !== undefined) await options.promptHold.release;
           if (options.failPrompt === true) throw new Error('429 too many requests');
         },
         async steer() {},
         async followUp() {},
         subscribe() { return () => {}; },
         health() { return { state: 'idle', lastActivity: null, sessionFile: file }; },
-        async dispose() {},
+        async dispose() { disposed.push(`prod-minion-${spawnCwds.length}`); },
       };
     };
     const wave = new WaveRunner({
@@ -2474,7 +2989,7 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
       },
       escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
     });
-    return { wave, job, ledger, port, root, artifacts, sessions, repo, skillPath, prompts, spawnCwds, escalations };
+    return { wave, job, ledger, port, root, artifacts, sessions, repo, skillPath, prompts, spawnCwds, escalations, disposed };
   }
 
   it('spawns a minion with the skill prompt, parses findings, and reports clear-to-merge on clean', async () => {
@@ -2495,6 +3010,38 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
         .reverse();
       expect(phases).toEqual(['started', 'triaged', 'pass']);
     } finally {
+      rmSync(h.root, { recursive: true, force: true });
+      rmSync(h.artifacts, { recursive: true, force: true });
+      rmSync(h.sessions, { recursive: true, force: true });
+    }
+  });
+
+  it('a fallback review turn open at the transport wait is reported still-running, kept alive and reattached (j-1065 acceptance 2)', async () => {
+    let release!: () => void;
+    const hold = { release: new Promise<void>((resolve) => { release = resolve; }) };
+    const h = await makeProductionGateHarness({ findingToWrite: [], promptHold: hold });
+    vi.useFakeTimers();
+    try {
+      const running = h.wave.runRound({ jobId: h.job.id });
+      await vi.advanceTimersByTimeAsync(FALLBACK_REVIEW_TIMEOUT_MS + 1);
+      // The wait slice expired while the review turn was genuinely live: a
+      // durable still-running report exists and the minion was NOT disposed.
+      const phases = h.ledger.listEvents({ limit: 100 })
+        .filter((event) => event.kind === 'job.fallback-review')
+        .map((event) => (event.payload as { phase?: string }).phase)
+        .reverse();
+      expect(phases).toContain('still-running');
+      expect(h.disposed).toEqual([]);
+      expect(h.prompts).toHaveLength(1);
+      release();
+      const outcome = await running;
+      if (!('route' in outcome)) throw new Error('expected fallback route');
+      expect(outcome.clearToMerge).toBe(true);
+      // The SAME session delivered the review; it was disposed only after.
+      expect(h.prompts).toHaveLength(1);
+      expect(h.disposed).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
       rmSync(h.root, { recursive: true, force: true });
       rmSync(h.artifacts, { recursive: true, force: true });
       rmSync(h.sessions, { recursive: true, force: true });
@@ -2679,8 +3226,8 @@ describe('fallback diff includes untracked files (V3 revert-mutation pin)', () =
   });
 });
 
-describe('fallback review timeout constant is exported and positive (V4 pin)', () => {
-  it('pins the 15-minute wall-clock bound', async () => {
+describe('fallback review wait constant is the still-running report slice (V4 pin)', () => {
+  it('pins the 15-minute transport wait slice', async () => {
     const { FALLBACK_REVIEW_TIMEOUT_MS } = await import('../src/dispatch/perkins.js');
     expect(FALLBACK_REVIEW_TIMEOUT_MS).toBe(15 * 60 * 1_000);
     expect(FALLBACK_REVIEW_TIMEOUT_MS).toBeGreaterThan(0);

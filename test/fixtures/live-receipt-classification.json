@@ -1,0 +1,79 @@
+{
+  "note": "ONE fixture, TWO implementations: LedgerApi.countLivePendingActionRequired (SQL over the ledger) and the web live attribution (unackedByJob / terminalBoundNotificationIds) must classify these rows identically. Consumed by test/board-engine.test.ts and web/src/lib/board-signals.test.ts \u2014 do not fork the values. notifications.agent_id has NO foreign key, so the ghost-agent bound row (a-ghost exists nowhere) is representable and must stay live on both surfaces; an agent bound to a missing JOB remains unreachable through the ledger API (the agents.job_id FK), so that case is not representable here.",
+  "jobs": [
+    {
+      "id": "job-live",
+      "status": "working"
+    },
+    {
+      "id": "job-merged",
+      "status": "merged"
+    },
+    {
+      "id": "job-done",
+      "status": "done"
+    }
+  ],
+  "agents": [
+    {
+      "id": "a-live",
+      "jobId": "job-live"
+    },
+    {
+      "id": "a-merged",
+      "jobId": "job-merged"
+    },
+    {
+      "id": "a-done",
+      "jobId": "job-done"
+    }
+  ],
+  "notifications": [
+    {
+      "id": "n-bound-live",
+      "agentId": "a-live",
+      "kind": "review-escalation",
+      "routing": "action-required"
+    },
+    {
+      "id": "n-bound-merged",
+      "agentId": "a-merged",
+      "kind": "review-escalation",
+      "routing": "action-required"
+    },
+    {
+      "id": "n-bound-done",
+      "agentId": "a-done",
+      "kind": "pr-conflict:job-done",
+      "routing": "action-required"
+    },
+    {
+      "id": "n-unbound",
+      "agentId": null,
+      "kind": "silas.escalation",
+      "routing": "action-required"
+    },
+    {
+      "id": "n-fyi-merged",
+      "agentId": "a-merged",
+      "kind": "fyi.merged",
+      "routing": "fyi"
+    },
+    {
+      "id": "n-ghost-agent",
+      "agentId": "a-ghost",
+      "kind": "review-escalation",
+      "routing": "action-required"
+    }
+  ],
+  "expected": {
+    "liveCount": 3,
+    "liveByJob": {
+      "job-live": 1
+    },
+    "receiptIds": [
+      "n-bound-merged",
+      "n-bound-done"
+    ]
+  }
+}

@@ -3,9 +3,17 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { SilasConfig } from '../config.js';
 import type { EventBus } from '../events/bus.js';
-import type { AgentRecord, EventRecord, JobRecord, LedgerApi, RoundRecord } from '../ledger/api.js';
+import type {
+  AgentRecord,
+  EventRecord,
+  JobRecord,
+  LedgerApi,
+  PendingRebriefRecord,
+  RoundRecord,
+} from '../ledger/api.js';
 import type { LogLevel } from '../logger.js';
 import type { AgentHandle, SpawnOptions } from '../runtime/types.js';
+import type { AgentSupervisionView } from '../supervision/supervisor.js';
 import type { GitHubPollTickResult } from './github-poll.js';
 import { pendingRecoveryRows } from '../provider-recovery/sensor.js';
 
@@ -135,6 +143,9 @@ export interface DigestLedger {
   latestJobEvent(jobId: string, kind: string): EventRecord | null;
   latestRoundEvent(roundId: string, kind: string): EventRecord | null;
   listAgents(): readonly AgentRecord[];
+  /** Durable re-brief markers; any row for a job is an unresolved request
+   * that fences the job's review-eligibility rows (see the digest below). */
+  listPendingRebriefs(opts?: { readonly jobId?: string }): readonly PendingRebriefRecord[];
   listProviderWaits?(opts?: { status?: string }): readonly unknown[];
   listPendingProviderRecoveries?(): readonly unknown[];
 }
@@ -290,6 +301,10 @@ export interface ComputeDigestInput {
   readonly config: Pick<SilasConfig, 'stallThresholdMs' | 'directiveAt' | 'rebriefAt' | 'escalateAt'>;
   readonly trigger: string;
   readonly now?: () => number;
+  /** The supervisor's live per-agent views. A supervision-stopped worker is
+   * waiting on a human re-arm with a recorded cause — the board renders it
+   * as waiting, so the digest must not call the same lane stalled. */
+  readonly supervisionFor?: (agentId: string) => AgentSupervisionView | null;
 }
 
 /** The head sha a delivery event recorded (`job.delivered.payload.sha`) —
@@ -349,7 +364,11 @@ function latestReviewRequest(ledger: DigestLedger, jobId: string): EventRecord |
  *    already reviewed warrants no new round. A review already REQUESTED
  *    for the current state retires the row: the bmad-review fallback route
  *    creates no round, and without its request event the row would re-fire
- *    every sweep and re-trigger a gate that owns its own fix loop.
+ *    every sweep and re-trigger a gate that owns its own fix loop. An
+ *    UNRESOLVED re-brief request (durable pending markers) suppresses every
+ *    review row for the target: the lane's open re-brief work must not be
+ *    offered for review on an older delivery, and only genuine marker
+ *    settlement (finalize/recovery) releases it.
  * 3. verdictsAwaitingDirective — the newest round recorded NEEDS CHANGES
  *    and no silas follow-through has landed since that verdict: deliver the
  *    first fix directive per blocker, then the ladder's rung (directive →
@@ -381,6 +400,12 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     minionErrors: [],
     providerRecoveryPending: [],
   };
+  // One unresolved re-brief request fences the target: a marker exists while
+  // a re-brief worker runs (or a restart-recovered request waits for boot
+  // reconciliation), and clears only when the request genuinely settles.
+  // The review-eligibility rows below never offer such a target on an OLDER
+  // delivery — the worker may push a new head at any moment.
+  const pendingRebriefJobIds = new Set(input.ledger.listPendingRebriefs().map((marker) => marker.jobId));
   for (const job of input.ledger.listJobs()) {
     if (job.status === 'merged' || job.status === 'done') continue;
     const rounds = [...input.ledger.listRounds(job.id)].sort((a, b) => b.seq - a.seq);
@@ -427,26 +452,30 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     // that owes a review counts: `working` (a PR linked row-side),
     // `delivered` (settled before the PR landed) and `in-review` (the
     // register-PR hop lands there). Blocked/parked/terminal lanes do not.
+    // An unresolved re-brief fences every row: the open re-brief turn is the
+    // lane's target-owned work, so an OLDER delivery is never offered for
+    // first review, re-review or clean-abort rearm.
     const reviewPending = job.status === 'working' || job.status === 'delivered' || job.status === 'in-review';
-    if (job.prUrl !== null && reviewPending && cleanAbort && newestRound !== null) {
-      digest.prWithoutReview.push({ jobId: job.id, repo: job.repo, prUrl: job.prUrl,
-        priorRounds: rounds.length, cleanAbort: { roundId: newestRound.id, ruleId: 'clean-abort-service-restart' } });
-    } else if (job.prUrl !== null && reviewPending && newestRound === null && !reviewAlreadyRequested) {
-      digest.prWithoutReview.push({ jobId: job.id, repo: job.repo, prUrl: job.prUrl, priorRounds: 0 });
-    } else if (
-      job.prUrl !== null &&
-      reviewPending &&
-      newestRound !== null &&
-      delivered !== null &&
-      followUpChangedTarget(delivered, newestRound) &&
-      !reviewAlreadyRequested
-    ) {
-      digest.prWithoutReview.push({
-        jobId: job.id,
-        repo: job.repo,
-        prUrl: job.prUrl,
-        priorRounds: rounds.length,
-      });
+    const rebriefPending = pendingRebriefJobIds.has(job.id);
+    if (job.prUrl !== null && reviewPending && !rebriefPending) {
+      if (cleanAbort && newestRound !== null) {
+        digest.prWithoutReview.push({ jobId: job.id, repo: job.repo, prUrl: job.prUrl,
+          priorRounds: rounds.length, cleanAbort: { roundId: newestRound.id, ruleId: 'clean-abort-service-restart' } });
+      } else if (newestRound === null && !reviewAlreadyRequested) {
+        digest.prWithoutReview.push({ jobId: job.id, repo: job.repo, prUrl: job.prUrl, priorRounds: 0 });
+      } else if (
+        newestRound !== null &&
+        delivered !== null &&
+        followUpChangedTarget(delivered, newestRound) &&
+        !reviewAlreadyRequested
+      ) {
+        digest.prWithoutReview.push({
+          jobId: job.id,
+          repo: job.repo,
+          prUrl: job.prUrl,
+          priorRounds: rounds.length,
+        });
+      }
     }
 
     // (3) NEEDS CHANGES verdict awaiting follow-through.
@@ -502,21 +531,71 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
 
     // (4) Stalled lane: working with no delivery, minion gone quiet.
     if (job.status === 'working' && delivered === null) {
-      const minion = input.ledger
+      const boundMinions = input.ledger
         .listAgents()
-        .filter((agent) => agent.jobId === job.id && agent.role === 'minion')
-        .sort((a, b) => (b.lastActivity ?? b.createdAt).localeCompare(a.lastActivity ?? a.createdAt))[0];
-      if (minion !== undefined) {
-        const lastMs = Date.parse(minion.lastActivity ?? minion.createdAt);
-        if (Number.isFinite(lastMs) && now() - lastMs >= input.config.stallThresholdMs) {
-          digest.stalledWorking.push({
-            jobId: job.id,
-            repo: job.repo,
-            minionId: minion.id,
-            minionState: minion.state,
-            lastActivity: minion.lastActivity,
-            idleMs: now() - lastMs,
-          });
+        .filter((agent) => agent.jobId === job.id && agent.role === 'minion');
+      // The SAME attribution the board renders (stoppedWorkersByJob): a
+      // bound minion is live unless its supervision view says stopped or
+      // breaker-open, and a disposed unsupervised record is not a worker.
+      // A stop marks the lane only when no live worker exists or the
+      // newest live worker's stamp is KNOWN and strictly older; an
+      // unknown live stamp (a fresh worker registered before its first
+      // activity) favors the live worker. A waiting lane's silence is a
+      // human re-arm — this STALL channel never wakes it (the distinct
+      // minion-error channel below keeps its genuine-failure wakes).
+      const viewOf = (agent: (typeof boundMinions)[number]): AgentSupervisionView | null =>
+        input.supervisionFor?.(agent.id) ?? null;
+      const stopExempt = (agent: (typeof boundMinions)[number]): boolean => {
+        const supervision = viewOf(agent);
+        return supervision !== null && (supervision.state === 'stopped' || supervision.breakerOpen === true);
+      };
+      const stampOf = (agent: (typeof boundMinions)[number]): number =>
+        agent.lastActivity === null ? Number.NaN : Date.parse(agent.lastActivity);
+      // Stop recency follows the recorded stop time when the supervisor
+      // view provides it, else the last frame (code review 2026-10-04).
+      const stopStampOf = (agent: (typeof boundMinions)[number]): number => {
+        const iso = viewOf(agent)?.stoppedAt ?? null;
+        if (iso !== null) {
+          const at = Date.parse(iso);
+          if (Number.isFinite(at)) return at;
+        }
+        return stampOf(agent);
+      };
+      const live = boundMinions.filter((agent) => {
+        if (stopExempt(agent)) return false;
+        // A disposed record is not a live worker, supervised or not (A2).
+        return agent.state !== 'disposed';
+      });
+      const newestKnown = (stamps: readonly number[]): number | null =>
+        stamps.filter(Number.isFinite).reduce<number | null>((best, at) => (best === null || at > best ? at : best), null);
+      const hasStop = boundMinions.some(stopExempt);
+      const stopAt = newestKnown(boundMinions.filter(stopExempt).map(stopStampOf));
+      const liveAt = newestKnown(live.map(stampOf));
+      // A live worker whose activity is still unknown favors live: the
+      // stop never marks the lane (the re-dispatch window), exactly like
+      // the board's stoppedWorkersByJob (code review 2026-10-04).
+      const hasUnknownLive = live.some((agent) => !Number.isFinite(stampOf(agent)));
+      const waiting =
+        hasStop &&
+        !hasUnknownLive &&
+        (live.length === 0 || (stopAt !== null && liveAt !== null && stopAt > liveAt));
+      if (!waiting) {
+        const pool = live.length > 0 ? live : boundMinions.filter((agent) => !stopExempt(agent));
+        const minion = pool.sort((a, b) =>
+          (b.lastActivity ?? b.createdAt).localeCompare(a.lastActivity ?? a.createdAt),
+        )[0];
+        if (minion !== undefined) {
+          const lastMs = Date.parse(minion.lastActivity ?? minion.createdAt);
+          if (Number.isFinite(lastMs) && now() - lastMs > input.config.stallThresholdMs) {
+            digest.stalledWorking.push({
+              jobId: job.id,
+              repo: job.repo,
+              minionId: minion.id,
+              minionState: minion.state,
+              lastActivity: minion.lastActivity,
+              idleMs: now() - lastMs,
+            });
+          }
         }
       }
     }
@@ -543,7 +622,17 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       ...pendingRecoveryRows(input.ledger as Parameters<typeof pendingRecoveryRows>[0]),
     ];
   }
-  return digest;
+  // A prior job's blocker history may have awaited after another candidate
+  // was already offered. Recheck every proposed review at the final publish
+  // boundary — not only the jobs visited after an await. No await follows.
+  return {
+    ...digest,
+    prWithoutReview: digest.prWithoutReview.filter((row) => {
+      const job = input.ledger.getJob(row.jobId);
+      return job !== null && job.status !== 'merged' && job.status !== 'done' &&
+        input.ledger.listPendingRebriefs({ jobId: row.jobId }).length === 0;
+    }),
+  };
 }
 
 // ------------------------------------------------------------------
@@ -558,6 +647,10 @@ export interface SkillModule {
 /** `<package>/resources/silas-skills/` — src/ and dist/ both sit two levels
  * below the package root, so one relative path serves dev and built layouts. */
 const SKILLS_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'resources', 'silas-skills');
+
+/** The compiled verification capture helper (issue #159) shipped in `dist/`,
+ * named absolutely in the wake prompt so lanes never hand-roll watchers. */
+export const CAPTURE_HELPER_PATH = join(SKILLS_DIR, '..', '..', 'dist', 'verify', 'capture-cli.js');
 
 export const SILAS_SKILL_NAMES = ['ops-dispatch', 'ledger-closeout'] as const;
 
@@ -610,6 +703,19 @@ export interface GitHubPollPort {
   pollOnce(): Promise<GitHubPollTickResult>;
 }
 
+/** Bind the supervisor's live per-agent views to the digest's lookup. This
+ * is the one seam main.ts wires; it is a factory so the binding is testable
+ * without booting the service (final independent review T2). The argument
+ * is a GETTER, not the value: the lookup is late-bound exactly like the
+ * engine's inline closure, so a construction-order change (or a
+ * not-yet-assigned handle) can never freeze a null supervisor and silently
+ * disable the stop truth for every lane (twelve-followthrough A4). */
+export function supervisionLookup(
+  getSupervisor: () => { readonly viewFor: (agentId: string) => AgentSupervisionView | null } | null,
+): (agentId: string) => AgentSupervisionView | null {
+  return (agentId) => getSupervisor()?.viewFor(agentId) ?? null;
+}
+
 export interface SilasDriverOptions {
   readonly slot: SilasSlot;
   readonly ledger: DigestLedger & Pick<LedgerApi, 'appendCustomEvent'>;
@@ -618,6 +724,9 @@ export interface SilasDriverOptions {
   /** The ops surface Silas acts through: base URL + where the pairing token lives. */
   readonly ops: { readonly baseUrl: string; readonly configPath: string };
   readonly bus?: EventBus;
+  /** The supervisor's live per-agent views — the digest reads the SAME stop
+   * truth the board renders so a stopped lane is never woken as stalled. */
+  readonly supervisionFor?: (agentId: string) => AgentSupervisionView | null;
   /** The fast GitHub signal poll, ticked on `[silas] poll_interval_ms`. */
   readonly githubPoll?: GitHubPollPort;
   /** Operating skills injected into every wake prompt (default: shipped resources). */
@@ -797,6 +906,7 @@ export class SilasDriver {
         config: this.opts.config,
         trigger: trigger.kind,
         now: this.now,
+        ...(this.opts.supervisionFor !== undefined ? { supervisionFor: this.opts.supervisionFor } : {}),
       });
     } catch (error) {
       this.log('error', 'silas digest computation failed', { trigger: trigger.kind, error: String(error) });
@@ -872,6 +982,20 @@ export function buildWakePrompt(input: {
     'A 401 means re-read the token. A 4xx carries a detail message — fix the',
     'request, never retry blind. Pass "by":"silas" so the ledger records the',
     'action as yours.',
+    '',
+    '## Verification capture helper',
+    '',
+    'Every verification submission uses the shipped helper (never a',
+    'hand-rolled background watcher). It opens a unique exclusive sink',
+    'BEFORE the POST, streams every NDJSON frame to EOF, and writes a',
+    'receipt binding run id, head/dirty state, exit/outcome and output',
+    'length/hash. A lost connection is `unknown`, reconciled by request',
+    'identity — never replayed blind:',
+    '',
+    `  node ${CAPTURE_HELPER_PATH} run --job <job> --scope <scope> \\`,
+    `    --sink <data-dir>/captures/<job>-<scope>-<head>.ndjson \\`,
+    `    --request-id <stable-id> --expected-head <head-to-verify> \\`,
+    `    --url ${input.ops.baseUrl} --config ${input.ops.configPath}`,
     '',
     '## Operating skills',
     '',

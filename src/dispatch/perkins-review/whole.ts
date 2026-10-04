@@ -31,15 +31,13 @@ export type { CanonicalReviewVerdict } from './types.js';
  * config.ts — this constant never overrides it. */
 export const STANDALONE_SPECIALIST_CONCURRENCY = 4;
 const CHILD_SPAWN_TIMEOUT_MS = 60 * 1_000;
-const CHILD_TURN_TIMEOUT_MS = 10 * 60 * 1_000;
 const LEAD_SPAWN_TIMEOUT_MS = 60 * 1_000;
 /** Wall-clock bound on the whole lead run (one prompt = many turns). */
 const LEAD_TOTAL_TIMEOUT_MS = 4 * 60 * 60 * 1_000;
 const MAX_LEAD_TURNS = 80;
-/** Specialists per tool call, aligned with the Claude MCP bridge's
- * 15-minute tool-execution bound: one call runs at most one concurrency-4
- * wave (each child bounded by a 10-minute turn budget), so a full call
- * stays inside the transport. The lead issues multiple calls for more. */
+/** Specialists per tool call. The batch size is a scheduling bound, not a
+ * lifetime: a wave that outlives the transport wait reports still-running
+ * and is re-attached by an identical call, so this never cuts a run short. */
 const MAX_TOOL_RUNS = 4;
 const MAX_SPECIALISTS_PER_ROUND = 16;
 const MAX_TOTAL_FINDINGS = 500;
@@ -568,7 +566,9 @@ function blindEvidenceCorrection(previous: SpecialistAttemptFailure): string {
 }
 
 /** A review turn exceeded its host budget. Classified separately from output
- * failures so the audit distinguishes load from a rejected output. */
+ * failures so the audit distinguishes load from a rejected output. Only the
+ * lead still holds a whole-run wall-clock budget; specialist turns carry no
+ * lifetime deadline — host supervision owns stall diagnosis for them. */
 class ReviewTurnTimeoutError extends Error {
   constructor(readonly timeoutMs: number) {
     super(`review turn timed out after ${timeoutMs}ms`);
@@ -579,7 +579,7 @@ class ReviewTurnTimeoutError extends Error {
 async function boundedPrompt(
   handle: AgentHandle,
   prompt: string,
-  timeoutMs: number,
+  timeoutMs: number | null,
   signals: readonly (AbortSignal | undefined)[] = [],
   images?: PromptOptions['images'],
 ): Promise<void> {
@@ -611,10 +611,12 @@ async function boundedPrompt(
         owner: REVIEW_OWNER,
         ...(images !== undefined && images.length > 0 ? { images } : {}),
       }),
-      new Promise<never>((_resolve, reject) => {
-        timer = setTimeout(() => reject(new ReviewTurnTimeoutError(timeoutMs)), timeoutMs);
-        timer.unref?.();
-      }),
+      ...(timeoutMs === null
+        ? []
+        : [new Promise<never>((_resolve, reject) => {
+            timer = setTimeout(() => reject(new ReviewTurnTimeoutError(timeoutMs)), timeoutMs);
+            timer.unref?.();
+          })]),
       abort,
     ]);
     if (failure !== null) throw new Error(failure);
@@ -783,25 +785,25 @@ export class PerkinsWholeReview {
     };
 
     const retryPrompt = async (
-      handle: AgentHandle, prompt: string, budgetMs: number, label: string,
+      handle: AgentHandle, prompt: string, budgetMs: number | null, label: string,
       signals: readonly (AbortSignal | undefined)[], acquire: () => Promise<void>, release: () => void,
       hasSubmission: () => boolean, images?: PromptOptions['images'],
     ): Promise<void> => {
       const now = this.pacingOptions.pacingNow ?? Date.now;
-      let remaining = budgetMs;
+      let remaining = budgetMs ?? 0;
       await withRateLimitRetries(async () => {
         await acquire();
         const start = now();
         try {
-          if (remaining <= 0) throw new ReviewTurnTimeoutError(budgetMs);
-          await boundedPrompt(handle, prompt, remaining, signals, images);
+          if (budgetMs !== null && remaining <= 0) throw new ReviewTurnTimeoutError(budgetMs);
+          await boundedPrompt(handle, prompt, budgetMs === null ? null : remaining, signals, images);
         } catch (error) {
           // A terminal native submission outranks later transport noise.
           if (hasSubmission()) return;
           release();
           throw error;
         } finally {
-          remaining -= Math.max(0, now() - start);
+          if (budgetMs !== null) remaining -= Math.max(0, now() - start);
         }
       }, {
         policy: this.pacingOptions.rateLimitBackoff ?? null,
@@ -905,6 +907,10 @@ export class PerkinsWholeReview {
         // native-tool child is tool-only, a text child (non-pi runtimes)
         // keeps the tolerant text path. The request alone proves nothing.
         nativeSubmit = handle.reviewTools?.includes(FINDINGS_TOOL_NAME) === true;
+        // A specialist turn has no wall-clock lifetime deadline: the host
+        // supervisor owns stall diagnosis (silence + live-tool/compaction
+        // evidence) and the workflow waits for the child's settled turn or
+        // an explicit cancellation. Visible prose silence is not idleness.
         // Blind children never receive the evidence (isolation); every other
         // child receives the same frozen bytes as the lead or refuses loudly.
         const childImages = lens === 'blind' ? undefined : evidenceImages();
@@ -915,7 +921,7 @@ export class PerkinsWholeReview {
             this.policy, review, lens, nativeSubmit ? 'nativeTool' : 'text',
             attempt > 1 && previous !== undefined ? { attempt, previous } : undefined,
           ),
-          CHILD_TURN_TIMEOUT_MS, `lens:${lens}#${attempt}`,
+          null, `lens:${lens}#${attempt}`,
           [signal, input.signal],
           async () => { reviewLease ??= await this.acquireReviewTurnSlot(`lens:${lens}#${attempt}`, signal ?? input.signal); },
           () => { const lease = reviewLease; reviewLease = null; lease?.release(); },
@@ -1102,7 +1108,7 @@ export class PerkinsWholeReview {
 
     const runTool: NativeAgentTool = {
       name: 'perkins_run_specialists',
-      description: `Start and await 1-${Math.max(MAX_TOOL_RUNS, this.maxConcurrentChildren)} host-tracked specialist children. Each run names one lens and reviews the WHOLE change in isolation. One call starts all its runs together: the host admits at most this round's resident wave per call (a smaller wave is refused with a split-the-batch error, never a lens failure) and the round is bounded to ${MAX_SPECIALISTS_PER_ROUND} total runs. The host enforces isolation, attempt bounds, concurrency, output validation, durability and ownership. Specialists are optional: use the lenses that help this change.`,
+      description: `Start and await 1-${Math.max(MAX_TOOL_RUNS, this.maxConcurrentChildren)} host-tracked specialist children. Each run names one lens and reviews the WHOLE change in isolation. One call starts all its runs together: the host admits at most this round's resident wave per call (a smaller wave is refused with a split-the-batch error, never a lens failure) and the round is bounded to ${MAX_SPECIALISTS_PER_ROUND} total runs. The host enforces isolation, attempt bounds, concurrency, output validation, durability and ownership. If a call reports the wave still running at the transport wait, call this same tool again with the SAME runs to attach to the running wave and collect its results; never start a second run for a lens that is already running. Specialists are optional: use the lenses that help this change.`,
       inputSchema: {
         type: 'object', additionalProperties: false, required: ['runs'],
         properties: {

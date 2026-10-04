@@ -1,17 +1,21 @@
 import { spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   VerificationDisposedError,
+  VerificationDuplicateError,
   VerificationLockTimeoutError,
+  VerificationRequestConflictError,
+  VerificationRequestExpiredError,
   VerificationScheduler,
   pidAlive,
   verificationEnvironment,
   type VerificationProgress,
   type VerificationRecord,
 } from '../src/verify/scheduler.js';
+import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 
 /**
  * The verification scheduler (contention fix, 2026-09-22): one global test
@@ -21,9 +25,34 @@ import {
  */
 
 const dirs: string[] = [];
+const repos: FixtureRepo[] = [];
 afterEach(() => {
+  while (repos.length > 0) repos.pop()!.cleanup();
   while (dirs.length > 0) rmSync(dirs.pop()!, { recursive: true, force: true });
 });
+
+/** A real fixture repo: the spawn-time exact-head check reads its true HEAD. */
+function makeRepo(): FixtureRepo {
+  const repo = makeFixtureRepo('verify-scheduler-fixture');
+  repos.push(repo);
+  return repo;
+}
+
+/** A submission against a fixture repo with its real, current head by default. */
+function repoSpec(
+  repo: FixtureRepo,
+  jobId: string,
+  overrides: Partial<Parameters<VerificationScheduler['submit']>[0]> = {},
+): Parameters<VerificationScheduler['submit']>[0] {
+  return {
+    jobId,
+    scope: 'full',
+    command: 'node -e "process.exit(0)"',
+    cwd: repo.path,
+    head: repo.head(),
+    ...overrides,
+  };
+}
 
 function tempDir(): string {
   const dir = mkdtempSync(join(tmpdir(), 'gru-verify-scheduler-'));
@@ -65,6 +94,23 @@ function makeScheduler(opts: {
 
 function spec(jobId: string, command = 'node -e "process.exit(0)"'): Parameters<VerificationScheduler['run']>[0] {
   return { jobId, scope: 'full', command, cwd: process.cwd() };
+}
+
+/** A spec with an explicit head so single-flight keys are deterministic. */
+function headedSpec(
+  jobId: string,
+  head: string,
+  command = 'node -e "process.exit(0)"',
+  requestId?: string,
+): Parameters<VerificationScheduler['submit']>[0] {
+  return {
+    jobId,
+    scope: 'full',
+    command,
+    cwd: process.cwd(),
+    head,
+    ...(requestId === undefined ? {} : { requestId }),
+  };
 }
 
 async function waitFor(predicate: () => boolean, timeoutMs = 4_000): Promise<void> {
@@ -422,6 +468,420 @@ describe('verification scheduler — global budget', () => {
     expect(settled).toHaveLength(1);
     expect(settled[0]?.pid).toBe(spawnedPid);
     expect(pidAlive(spawnedPid as number)).toBe(false); // settled means exited
+  });
+
+  it('single-flight: a simultaneous duplicate attaches to ONE producer, never a second execution', async () => {
+    const repo = makeRepo();
+    const { scheduler, records } = makeScheduler({ maxConcurrent: 2 });
+    scheduler.start();
+    const command = 'node -e "setTimeout(() => console.log(\'done\'), 250)"';
+    const firstFrames: VerificationProgress[] = [];
+    const secondFrames: VerificationProgress[] = [];
+    const first = scheduler.submit(repoSpec(repo, 'job-dup', { command }), (frame) => {
+      firstFrames.push(frame);
+    });
+    const second = scheduler.submit(repoSpec(repo, 'job-dup', { command }), (frame) => {
+      secondFrames.push(frame);
+    });
+    const [firstOutcome, secondOutcome] = await Promise.all([first, second]);
+    expect(secondOutcome.runId).toBe(firstOutcome.runId);
+    expect(firstOutcome.ok).toBe(true);
+    expect(secondFrames[0]?.type).toBe('attached');
+    const attached = secondFrames[0] as Extract<VerificationProgress, { type: 'attached' }>;
+    expect(attached.runId).toBe(firstOutcome.runId);
+    expect(['queued', 'running']).toContain(attached.state);
+    // The acknowledgement is private to the attacher: the existing stream
+    // never receives another client's request identity.
+    expect(firstFrames.some((frame) => frame.type === 'attached')).toBe(false);
+    expect(records.filter((record) => record.kind === 'verification.started')).toHaveLength(1);
+    expect(records.filter((record) => record.kind === 'verification.completed')).toHaveLength(1);
+    expect(records.filter((record) => record.kind === 'verification.attached')).toHaveLength(1);
+    expect(scheduler.inFlightCount()).toBe(0);
+    expect(scheduler.activeCount()).toBe(0);
+  });
+
+  it('single-flight: an identical duplicate queued behind a held budget still attaches to ONE producer', async () => {
+    const repo = makeRepo();
+    const { scheduler, records } = makeScheduler({ maxConcurrent: 1 });
+    scheduler.start();
+    const holder = await scheduler.acquire(spec('job-holder-queue'));
+    const command = 'node -e "process.exit(0)"';
+    const first = scheduler.submit(repoSpec(repo, 'job-queued', { command }));
+    const secondFrames: VerificationProgress[] = [];
+    const second = scheduler.submit(repoSpec(repo, 'job-queued', { command }), (frame) => {
+      secondFrames.push(frame);
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(scheduler.queuedCount()).toBe(1); // one queued producer; the duplicate attached
+    scheduler.release(holder);
+    const [firstOutcome, secondOutcome] = await Promise.all([first, second]);
+    expect(secondOutcome.runId).toBe(firstOutcome.runId);
+    expect(firstOutcome.ok).toBe(true);
+    expect(secondFrames[0]?.type).toBe('attached');
+    expect(records.filter((record) => record.kind === 'verification.started')).toHaveLength(1);
+  });
+
+  it('delivers a terminal frame to a duplicate that attaches during terminal delivery', async () => {
+    const repo = makeRepo();
+    const { scheduler } = makeScheduler({ maxConcurrent: 2 });
+    scheduler.start();
+    let releaseCompleted!: () => void;
+    const completedGate = new Promise<void>((resolve) => {
+      releaseCompleted = resolve;
+    });
+    let signalCompleted!: () => void;
+    const completedSeen = new Promise<void>((resolve) => {
+      signalCompleted = resolve;
+    });
+    const first = scheduler.submit(repoSpec(repo, 'job-late'), async (frame) => {
+      if (frame.type === 'completed') {
+        signalCompleted();
+        await completedGate; // hold the terminal delivery in flight
+      }
+    });
+    await completedSeen;
+    const secondFrames: VerificationProgress[] = [];
+    const second = scheduler.submit(repoSpec(repo, 'job-late'), (frame) => {
+      secondFrames.push(frame);
+    });
+    releaseCompleted();
+    const [firstOutcome, secondOutcome] = await Promise.all([first, second]);
+    expect(secondOutcome.runId).toBe(firstOutcome.runId);
+    expect(secondFrames[0]?.type).toBe('attached');
+    expect(secondFrames[secondFrames.length - 1]?.type).toBe('completed');
+    expect(secondFrames.filter((frame) => frame.type === 'completed')).toHaveLength(1);
+  });
+
+  it('single-flight: a request_id replay of a completed run reconciles the recorded outcome without a rerun', async () => {
+    const repo = makeRepo();
+    const { scheduler, records } = makeScheduler();
+    scheduler.start();
+    const specWithId = repoSpec(repo, 'job-replay', { requestId: 'req-replay-1' });
+    const first = await scheduler.run(specWithId);
+    expect(first.ok).toBe(true);
+    const replayFrames: VerificationProgress[] = [];
+    const replay = await scheduler.submit(specWithId, (frame) => {
+      replayFrames.push(frame);
+    });
+    expect(replay.runId).toBe(first.runId);
+    expect(replayFrames).toHaveLength(1);
+    expect(replayFrames[0]).toMatchObject({ type: 'completed', reconciled: true, runId: first.runId });
+    expect(records.filter((record) => record.kind === 'verification.started')).toHaveLength(1);
+    expect(records.filter((record) => record.kind === 'verification.completed')).toHaveLength(1);
+    expect(records.filter((record) => record.kind === 'verification.reconciled')).toHaveLength(1);
+    // A completed FAILED run is likewise never rerun under the same id.
+    const failedSpec = repoSpec(repo, 'job-replay', { command: 'node -e "process.exit(9)"' });
+    const failed = await scheduler.run({ ...failedSpec, requestId: 'req-replay-2' });
+    expect(failed.ok).toBe(false);
+    const failedReplay = await scheduler.submit({ ...failedSpec, requestId: 'req-replay-2' });
+    expect(failedReplay.runId).toBe(failed.runId);
+    expect(records.filter((record) => record.kind === 'verification.completed')).toHaveLength(2);
+  });
+
+  it('binds an attached duplicate\'s request identity so IT can reconcile the shared outcome', async () => {
+    const repo = makeRepo();
+    const { scheduler } = makeScheduler({ maxConcurrent: 2 });
+    scheduler.start();
+    const command = 'node -e "setTimeout(() => process.exit(0), 300)"';
+    const primary = scheduler.submit(repoSpec(repo, 'job-attach-id', { command }));
+    const duplicate = scheduler.submit(
+      repoSpec(repo, 'job-attach-id', { command, requestId: 'req-attach-own' }),
+      () => {},
+    );
+    await waitFor(() => scheduler.attemptStatus({ requestId: 'req-attach-own' }).state === 'running');
+    const [firstOutcome, secondOutcome] = await Promise.all([primary, duplicate]);
+    expect(secondOutcome.runId).toBe(firstOutcome.runId);
+    const status = scheduler.attemptStatus({ requestId: 'req-attach-own' });
+    expect(status).toMatchObject({ state: 'completed', runId: firstOutcome.runId, started: true });
+    expect(status.outcome?.outputSha256).toBe(firstOutcome.outputSha256);
+  });
+
+  it('refuses an in-flight request_id bound to a different job, and attaches through head drift', async () => {
+    const repo = makeRepo();
+    const { scheduler } = makeScheduler({ maxConcurrent: 1 });
+    scheduler.start();
+    const command = 'node -e "setTimeout(() => process.exit(0), 300)"';
+    const first = scheduler.submit(repoSpec(repo, 'job-bound', { command, requestId: 'req-bound' }));
+    const conflict = await scheduler
+      .submit(repoSpec(repo, 'job-other', { command, requestId: 'req-bound' }))
+      .catch((error: unknown) => error);
+    expect(conflict).toBeInstanceOf(VerificationRequestConflictError);
+    // Head drift while the accepted run is live: the same identity attaches
+    // to the accepted execution instead of minting a second producer.
+    const drifted = scheduler.submit(
+      repoSpec(repo, 'job-bound', { command, head: 'f'.repeat(40), requestId: 'req-bound' }),
+      () => {},
+    );
+    const [firstOutcome, secondOutcome] = await Promise.all([first, drifted]);
+    expect(secondOutcome.runId).toBe(firstOutcome.runId);
+    expect(firstOutcome.ok).toBe(true);
+  });
+
+  it('single-flight: a changed head or a fresh request_id is a NEW producer (no permanent suppression)', async () => {
+    const repo = makeRepo();
+    const { scheduler, records } = makeScheduler();
+    scheduler.start();
+    const first = await scheduler.run(repoSpec(repo, 'job-change', { requestId: 'req-head-a' }));
+    const headB = repo.commitFile('moved.txt', 'moved\n');
+    const changedHead = await scheduler.run(
+      repoSpec(repo, 'job-change', { head: headB, requestId: 'req-head-a' }),
+    ).catch((error: unknown) => error);
+    expect(changedHead).toBeInstanceOf(VerificationRequestConflictError);
+    const newHeadRun = await scheduler.run(
+      repoSpec(repo, 'job-change', { head: headB, requestId: 'req-head-b' }),
+    );
+    expect(newHeadRun.runId).not.toBe(first.runId);
+    expect(records.filter((record) => record.kind === 'verification.started')).toHaveLength(2);
+    // A repaired lane mints a NEW request id: it runs, it does not replay.
+    const repaired = await scheduler.run(
+      repoSpec(repo, 'job-change', { head: headB, requestId: 'req-repair' }),
+    );
+    expect(repaired.ok).toBe(true);
+    expect(records.filter((record) => record.kind === 'verification.started')).toHaveLength(3);
+  });
+
+  it('fails a queued run whose lane moved before spawn instead of verifying the new head', async () => {
+    const repo = makeRepo();
+    const { scheduler, records } = makeScheduler({ maxConcurrent: 1 });
+    scheduler.start();
+    const holder = await scheduler.acquire(spec('job-holder-drift'));
+    const command = 'node -e "require(\'node:fs\').writeFileSync(\'spawned.txt\', \'x\')"';
+    const queued = scheduler.submit(repoSpec(repo, 'job-drift', { command }));
+    const moved = repo.commitFile('moved.txt', 'moved\n');
+    scheduler.release(holder);
+    const outcome = await queued;
+    expect(outcome.ok).toBe(false);
+    expect(String(outcome.error)).toContain('head_changed');
+    expect(outcome.sha).toBe(moved);
+    expect(existsSync(join(repo.path, 'spawned.txt'))).toBe(false);
+    const completed = records.filter((record) => record.kind === 'verification.completed');
+    expect(completed[0]?.payload).toMatchObject({ ok: false, sha: moved });
+  });
+
+  it('reconciles accepted/running/completed/dirty states by request identity', async () => {
+    const repo = makeRepo();
+    const head = repo.head();
+    const { scheduler } = makeScheduler({ maxConcurrent: 2 });
+    scheduler.start();
+    expect(scheduler.attemptStatus({ requestId: 'req-unknown' }).state).toBe('unknown');
+    const slow = 'node -e "setTimeout(() => {}, 800)"';
+    const promise = scheduler.submit(repoSpec(repo, 'job-status', { command: slow, requestId: 'req-status' }));
+    await waitFor(() => scheduler.attemptStatus({ requestId: 'req-status' }).state === 'running');
+    expect(scheduler.attemptStatus({ requestId: 'req-status' })).toMatchObject({
+      state: 'running',
+      jobId: 'job-status',
+      head,
+      started: true,
+    });
+    // An EXPLICIT unknown identity never borrows another attempt's state
+    // through the job fallback.
+    expect(
+      scheduler.attemptStatus({ requestId: 'req-other-unknown', jobId: 'job-status', head }).state,
+    ).toBe('unknown');
+    // By job/scope/head lookup, without the request id.
+    expect(scheduler.attemptStatus({ jobId: 'job-status', scope: 'full', head }).state).toBe('running');
+    const outcome = await promise;
+    expect(outcome.ok).toBe(true);
+    expect(scheduler.attemptStatus({ requestId: 'req-status' }).state).toBe('completed');
+  });
+
+  it('reconciles an accepted run across a fake-clock 15-minute outage without multiplying producers', async () => {
+    const repo = makeRepo();
+    const storageDir = join(tempDir(), 'verify');
+    const records: VerificationRecord[] = [];
+    let clock = 1_000_000;
+    const scheduler = new VerificationScheduler({
+      storageDir,
+      now: () => clock,
+      limits: { maxConcurrent: 1, workerBudget: 4, lockWaitTimeoutMs: 5_000, runTimeoutMs: 20_000 },
+      record: (record) => records.push(record),
+      sweepIntervalMs: 20,
+    });
+    scheduler.start();
+    const command = 'node -e "setTimeout(() => process.exit(0), 400)"';
+    const first = scheduler.submit(repoSpec(repo, 'job-outage', { command, requestId: 'req-outage' }));
+    await waitFor(() => scheduler.attemptStatus({ requestId: 'req-outage' }).state === 'running');
+    clock += 15 * 60 * 1000; // the approved outage window
+    expect(scheduler.attemptStatus({ requestId: 'req-outage' })).toMatchObject({ state: 'running' });
+    const secondFrames: VerificationProgress[] = [];
+    const second = scheduler.submit(repoSpec(repo, 'job-outage', { command, requestId: 'req-outage' }), (frame) => {
+      secondFrames.push(frame);
+    });
+    const [firstOutcome, secondOutcome] = await Promise.all([first, second]);
+    expect(secondOutcome.runId).toBe(firstOutcome.runId);
+    expect(firstOutcome.ok).toBe(true);
+    expect(secondFrames[0]?.type).toBe('attached');
+    expect(records.filter((record) => record.kind === 'verification.started')).toHaveLength(1);
+    await scheduler.dispose();
+  });
+
+  it('allows retrying a never-started admission failure under the SAME request_id', async () => {
+    const repo = makeRepo();
+    const { scheduler, records } = makeScheduler({ maxConcurrent: 1, lockWaitTimeoutMs: 120 });
+    scheduler.start();
+    const holder = await scheduler.acquire(spec('job-holder-admit'));
+    const timedOut = await scheduler
+      .submit(repoSpec(repo, 'job-admit', { requestId: 'req-admit' }))
+      .catch((error: unknown) => error);
+    expect(timedOut).toBeInstanceOf(VerificationLockTimeoutError);
+    expect(scheduler.attemptStatus({ requestId: 'req-admit' })).toMatchObject({
+      state: 'admission-failed',
+      started: false,
+    });
+    scheduler.release(holder);
+    const retried = await scheduler.submit(repoSpec(repo, 'job-admit', { requestId: 'req-admit' }));
+    expect(retried.ok).toBe(true);
+    expect(scheduler.attemptStatus({ requestId: 'req-admit' }).state).toBe('completed');
+    const timeouts = records.filter((record) => record.kind === 'verification.lock-timeout');
+    expect(timeouts[0]?.payload['request_id']).toBe('req-admit');
+  });
+
+  it('never reruns an evicted terminal identity: status reports it and resubmission is refused', async () => {
+    const storageDir = join(tempDir(), 'verify');
+    mkdirSync(storageDir, { recursive: true });
+    appendFileSync(
+      join(storageDir, 'requests.ndjson'),
+      `${JSON.stringify({
+        request_id: 'req-evicted',
+        run_id: 'old-run',
+        state: 'completed',
+        job_id: 'job-expired',
+        scope: 'full',
+        command: 'node -e "process.exit(0)"',
+        cwd: '/tmp/old-lane',
+        head: 'a'.repeat(40),
+        started: true,
+        completed_at: 1,
+      })}\n`,
+    );
+    const scheduler = new VerificationScheduler({
+      storageDir,
+      limits: { maxConcurrent: 1, workerBudget: 4, lockWaitTimeoutMs: 5_000, runTimeoutMs: 20_000 },
+      sweepIntervalMs: 20,
+    });
+    scheduler.start();
+    const status = scheduler.attemptStatus({ requestId: 'req-evicted' });
+    expect(status).toMatchObject({ state: 'completed', runId: 'old-run', started: true });
+    expect(status.outcome).toBeUndefined();
+    const resubmit = await scheduler
+      .submit(headedSpec('job-expired', 'a'.repeat(40), undefined, 'req-evicted'))
+      .catch((error: unknown) => error);
+    expect(resubmit).toBeInstanceOf(VerificationRequestExpiredError);
+    // A NEW identity is the sanctioned path for a re-verification.
+    const fresh = await scheduler.run(spec('job-expired'));
+    expect(fresh.ok).toBe(true);
+    await scheduler.dispose();
+  });
+
+  it('marks a crash-interrupted orphan identity interrupted and refuses its replay', async () => {
+    const storageDir = join(tempDir(), 'verify');
+    const dead = await deadPid();
+    seedPersistedSlot(storageDir, {
+      run_id: 'interrupted-run',
+      pid: dead,
+      job_id: 'job-interrupted',
+      scope: 'full',
+      command: 'node -e "process.exit(0)"',
+      cwd: process.cwd(),
+      head: null,
+      request_ids: ['req-interrupted'],
+      granted_at: Date.now(),
+    });
+    const scheduler = new VerificationScheduler({
+      storageDir,
+      limits: { maxConcurrent: 1, workerBudget: 4, lockWaitTimeoutMs: 5_000, runTimeoutMs: 20_000 },
+      sweepIntervalMs: 20,
+    });
+    scheduler.start();
+    expect(scheduler.attemptStatus({ requestId: 'req-interrupted' })).toMatchObject({
+      state: 'interrupted',
+      runId: 'interrupted-run',
+      started: true,
+    });
+    const resubmit = await scheduler
+      .submit(headedSpec('job-interrupted', 'a'.repeat(40), undefined, 'req-interrupted'))
+      .catch((error: unknown) => error);
+    expect(resubmit).toBeInstanceOf(VerificationRequestExpiredError);
+    await scheduler.dispose();
+  });
+
+  it('refuses to mint a producer over a restart orphan holder (typed duplicate)', async () => {
+    const storageDir = join(tempDir(), 'verify');
+    seedPersistedSlot(storageDir, {
+      run_id: 'orphan-run',
+      pid: process.pid, // alive: the runner may still be executing
+      job_id: 'job-orphan',
+      scope: 'full',
+      command: 'node -e "process.exit(0)"',
+      cwd: process.cwd(),
+      head: 'a'.repeat(40),
+      request_ids: ['req-orphan'],
+      granted_at: Date.now(),
+    });
+    const records: VerificationRecord[] = [];
+    const loaded = new VerificationScheduler({
+      storageDir,
+      limits: { maxConcurrent: 1, workerBudget: 4, lockWaitTimeoutMs: 150, runTimeoutMs: 20_000 },
+      record: (record) => records.push(record),
+      sweepIntervalMs: 20,
+    });
+    loaded.start();
+    const duplicate = await loaded
+      .submit(headedSpec('job-orphan', 'a'.repeat(40)))
+      .catch((error: unknown) => error);
+    expect(duplicate).toBeInstanceOf(VerificationDuplicateError);
+    expect((duplicate as VerificationDuplicateError).runId).toBe('orphan-run');
+    expect(records.filter((record) => record.kind === 'verification.started')).toHaveLength(0);
+    expect(loaded.attemptStatus({ jobId: 'job-orphan', head: 'a'.repeat(40) })).toMatchObject({
+      state: 'running',
+      runId: 'orphan-run',
+    });
+    // Reconnect by request identity after a restart still names the run.
+    expect(loaded.attemptStatus({ requestId: 'req-orphan' })).toMatchObject({
+      state: 'running',
+      runId: 'orphan-run',
+    });
+    // A DIFFERENT command is not the identical run: the orphan must not
+    // masquerade as a duplicate. (It still holds the only slot, so the fresh
+    // submission queues to its lock timeout.)
+    const changedCommand = await loaded
+      .submit(headedSpec('job-orphan', 'a'.repeat(40), 'node -e "process.exit(1)"'))
+      .catch((error: unknown) => error);
+    expect(changedCommand).toBeInstanceOf(VerificationLockTimeoutError);
+    expect(changedCommand).not.toBeInstanceOf(VerificationDuplicateError);
+    await loaded.dispose();
+  });
+
+  it('persists completed request identities across restart for reconnect reconciliation', async () => {
+    const repo = makeRepo();
+    const storageDir = join(tempDir(), 'verify');
+    const make = (): VerificationScheduler =>
+      new VerificationScheduler({
+        storageDir,
+        limits: { maxConcurrent: 1, workerBudget: 4, lockWaitTimeoutMs: 5_000, runTimeoutMs: 20_000 },
+        sweepIntervalMs: 20,
+      });
+    const first = make();
+    first.start();
+    const outcome = await first.run(repoSpec(repo, 'job-restart', { requestId: 'req-restart' }));
+    await first.dispose();
+    const second = make();
+    second.start();
+    const status = second.attemptStatus({ requestId: 'req-restart' });
+    expect(status.state).toBe('completed');
+    expect(status.runId).toBe(outcome.runId);
+    expect(status.outcome?.outputSha256).toBe(outcome.outputSha256);
+    await second.dispose();
+  });
+
+  it('rejects a malformed request_id loud, before any admission', async () => {
+    const { scheduler } = makeScheduler();
+    scheduler.start();
+    await expect(
+      scheduler.submit(headedSpec('job-bad-id', 'a'.repeat(40), undefined, 'bad id!')),
+    ).rejects.toThrow(/request_id/);
+    expect(scheduler.inFlightCount()).toBe(0);
+    expect(scheduler.activeCount()).toBe(0);
   });
 
   it('starts idempotently and keeps the holder file inside the instance storage dir', async () => {

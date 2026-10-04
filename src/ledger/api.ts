@@ -9,10 +9,12 @@ import {
   assertObligationTransition,
   assertRoundTransition,
   isJobStatus,
+  isJobTerminal,
   isLensState,
   isObligationState,
   isRoundStatus,
   isRoundVerdict,
+  TERMINAL_JOB_STATUSES,
   type JobStatus,
   type LensState,
   type ObligationState,
@@ -252,6 +254,14 @@ export class RecordNotFound extends Error {
   }
 }
 
+/** A guarded re-brief write lost its admitted request or the job closed. */
+export class PendingRebriefNoLongerCurrent extends Error {
+  constructor(readonly reason: 'terminal' | 'superseded') {
+    super(`pending re-brief is no longer current: ${reason}`);
+    this.name = 'PendingRebriefNoLongerCurrent';
+  }
+}
+
 /** A continuation was fenced out: the obligation moved to a different
  * generation (a newer distinct incident superseded the caller's view) or
  * the request does not own the current claim. Never retried blind —
@@ -403,7 +413,9 @@ export interface WorktreeRecord {
 // request marker written BEFORE a re-brief worker is spawned. Each marker
 // guards ONE ledger event; it clears only when that event lands. A boot
 // reconciliation consumes any marker whose event never landed, so a
-// service restart mid-turn can never silence the lane.
+// service restart mid-turn can never silence the lane. A terminal job
+// takes no fresh markers, and its obsolete markers are retired through
+// `retirePendingRebriefs` (audit + deletion, one transaction).
 // ------------------------------------------------------------------
 
 export const PENDING_REBRIEF_KINDS = ['silas.rebrief', 'job.delivered'] as const;
@@ -537,6 +549,34 @@ export interface PendingRebriefRecord {
    * delivery event must carry it). Null = ordinary re-brief. */
   readonly phaseId: string | null;
   readonly requestedAt: string;
+}
+
+/** A marker snapshot examined by a caller that wants to retire a request.
+ * The row is deleted ONLY while it still matches this identity. The audit's
+ * `guarded_event_landed` flag is recomputed from the ledger's own events at
+ * transaction time, never taken from this snapshot. */
+export interface PendingRebriefRetireCandidate {
+  readonly id: string;
+  readonly kind: PendingRebriefKind;
+  /** sha256 of the exact request payload — identity half. */
+  readonly payloadHash: string;
+  /** Request-time event watermark — identity half. */
+  readonly baselineSeq: number;
+}
+
+/** The outcome of one terminal-retirement attempt. A refusal or a full
+ * identity skip leaves the markers in place and appends NO ledger row —
+ * that disposition is log-only by design; only an actual retirement is
+ * audited (`silas.rebrief-retired`). */
+export interface PendingRebriefRetirement {
+  /** The markers this call deleted (identity matched at the boundary). */
+  readonly retired: readonly PendingRebriefRecord[];
+  /** Candidate ids whose current row no longer matches the examined
+   * identity (a newer request generation, or an already-consumed marker).
+   * Empty on a boundary refusal: no row was read or compared there. */
+  readonly skippedIds: readonly string[];
+  /** The boundary refusal: nothing was deleted or recorded. */
+  readonly refused: 'job-missing' | 'job-not-terminal' | 'events-already-landed' | null;
 }
 
 function nowIso(): string {
@@ -730,6 +770,16 @@ export class LedgerApi {
     const row = this.db
       .prepare('SELECT * FROM events WHERE job_id = ? AND kind = ? ORDER BY seq DESC LIMIT 1')
       .get(jobId, kind) as Row | undefined;
+    return row === undefined ? null : this.eventFromRow(row);
+  }
+
+  /** A marked request's guarded event, however many newer unrelated job
+   * events exist. The request's watermark and phase must both match. */
+  latestJobPhaseEvent(jobId: string, kind: string, phaseId: string, baselineSeq: number): EventRecord | null {
+    const row = this.db.prepare(
+      `SELECT * FROM events WHERE job_id = ? AND kind = ? AND seq > ?
+       AND json_extract(payload, '$.phase_id') = ? ORDER BY seq DESC LIMIT 1`,
+    ).get(jobId, kind, baselineSeq, phaseId) as Row | undefined;
     return row === undefined ? null : this.eventFromRow(row);
   }
 
@@ -1635,6 +1685,55 @@ export class LedgerApi {
     });
   }
 
+  /**
+   * Durable supervision stop truth for restart hydration (code review
+   * 2026-10-04): the latest supervision lifecycle event per agent, kept
+   * only when that latest event is a STOP. A re-arm event clears the stop,
+   * so an acked/re-armed agent never reads stopped after a restart.
+   */
+  durableSupervisionStops(): Map<
+    string,
+    { readonly role: Role; readonly reason: string | null; readonly restarts: number }
+  > {
+    const rows = this.db
+      .prepare(
+        `SELECT e.agent_id AS agent_id, a.role AS role, e.kind AS kind, e.payload AS payload
+           FROM events e
+           JOIN (
+             SELECT agent_id, MAX(seq) AS seq
+               FROM events
+              WHERE agent_id IS NOT NULL
+                AND kind IN ('supervision.escalated', 'supervision.breaker', 'supervision.rearmed')
+              GROUP BY agent_id
+           ) latest ON latest.agent_id = e.agent_id AND latest.seq = e.seq
+           JOIN agents a ON a.id = e.agent_id
+          WHERE e.kind IN ('supervision.escalated', 'supervision.breaker')`,
+      )
+      .all() as Array<{ agent_id: string; role: Role; payload: string }>;
+    const stops = new Map<string, { role: Role; reason: string | null; restarts: number }>();
+    for (const row of rows) {
+      let payload: Record<string, unknown> = {};
+      try {
+        payload = JSON.parse(row.payload) as Record<string, unknown>;
+      } catch {
+        // A malformed payload still yields a cause-less stop: the presence
+        // of the stop event is the authoritative fact.
+      }
+      const reason =
+        typeof payload['class'] === 'string'
+          ? payload['class']
+          : typeof payload['reason'] === 'string'
+            ? payload['reason']
+            : null;
+      const restarts =
+        typeof payload['restarts'] === 'number' && Number.isFinite(payload['restarts'])
+          ? payload['restarts']
+          : 0;
+      stops.set(row.agent_id, { role: row.role, reason, restarts });
+    }
+    return stops;
+  }
+
   /** Attach a live agent to its job lane (E8 dispatch wiring; the spawn
    * envelope carries no job context — this is the one call that binds).
    * (Superseded in the dispatch path by registerAgent-with-jobId, which
@@ -1688,6 +1787,26 @@ export class LedgerApi {
     );
   }
 
+  /** Delivery-only crash recovery: check the exact admitted markers and
+   * job status under the SAME write transaction as the event. A concurrent
+   * terminal commit cannot slip between the guard and a fabricated delivery. */
+  appendCustomEventIfCurrentRebrief(
+    fields: Parameters<LedgerApi['appendCustomEvent']>[0],
+    expected: readonly PendingRebriefRecord[],
+  ): BusEvent {
+    const jobId = fields.jobId;
+    if (jobId === undefined || jobId === null) throw new Error('guarded re-brief event requires a job id');
+    return this.transaction(() => {
+      if (!this.matchesPendingRebriefGeneration(jobId, expected)) {
+        throw new PendingRebriefNoLongerCurrent('superseded');
+      }
+      const job = this.getJob(jobId);
+      if (job === null) throw new RecordNotFound(`job "${jobId}" no longer exists — guarded re-brief delivery refused`);
+      if (isJobTerminal(job.status)) throw new PendingRebriefNoLongerCurrent('terminal');
+      return this.appendEvent(fields);
+    });
+  }
+
   // ------------------------------------------------------------------
   // Pending re-briefs (see the type block above)
   // ------------------------------------------------------------------
@@ -1709,14 +1828,20 @@ export class LedgerApi {
     /** Explicit completion intent; omitted = ordinary re-brief (no phase). */
     handoff?: CompletionHandoffIntent;
   }): readonly PendingRebriefRecord[] {
-    if (this.getJob(input.jobId) === null) {
-      throw new RecordNotFound(`job "${input.jobId}" not found — a re-brief marker belongs to a real job`);
-    }
     const payload = JSON.stringify({ note: input.note, briefing: input.briefing });
     const payloadHash = createHash('sha256').update(payload).digest('hex');
-    const baselineSeq = this.latestEventSeq();
-    const ts = nowIso();
     return this.transaction(() => {
+      // The HTTP caller pre-checks, but admission is the boundary of
+      // record: a terminal transition between that check and the write is
+      // refused HERE, so a terminal lane can never receive a fresh marker
+      // (refused before any handoff row is created below).
+      const job = this.getJob(input.jobId);
+      if (job === null) {
+        throw new RecordNotFound(`job "${input.jobId}" not found — a re-brief marker belongs to a real job`);
+      }
+      if (isJobTerminal(job.status)) {
+        throw new Error(`job "${input.jobId}" is ${job.status} — terminal lanes are never re-briefed`);
+      }
       let phaseId: string | null = null;
       if (input.handoff !== undefined) {
         for (const prior of this.listPhaseHandoffs({
@@ -1735,6 +1860,8 @@ export class LedgerApi {
           intent: input.handoff,
         }).record.phaseId;
       }
+      const baselineSeq = this.latestEventSeq();
+      const ts = nowIso();
       const upsert = this.db.prepare(
         `INSERT INTO pending_rebriefs
            (id, job_id, kind, payload, payload_hash, baseline_seq, agent_id, session_file, phase_id, requested_at, updated_at)
@@ -1791,6 +1918,128 @@ export class LedgerApi {
     this.transaction(() => {
       const remove = this.db.prepare('DELETE FROM pending_rebriefs WHERE id = ?');
       for (const id of ids) remove.run(id);
+    });
+  }
+
+  /** Complete only the still-admitted generation. Delivery event publication
+   * can re-enter the ledger and replace markers before the caller clears them. */
+  clearPendingRebriefsIfCurrent(expected: readonly PendingRebriefRecord[]): boolean {
+    const jobId = expected[0]?.jobId;
+    if (jobId === undefined) throw new Error('clearing a re-brief generation requires markers');
+    return this.transaction(() => {
+      if (!this.matchesPendingRebriefGeneration(jobId, expected)) return false;
+      this.clearPendingRebriefs(expected.map((marker) => marker.id));
+      return true;
+    });
+  }
+
+  private matchesPendingRebriefGeneration(jobId: string, expected: readonly PendingRebriefRecord[]): boolean {
+    if (expected.length === 0 || expected.some((marker) => marker.jobId !== jobId)) return false;
+    const current = this.listPendingRebriefs({ jobId });
+    return current.length === expected.length && expected.every((marker) => current.some((row) =>
+      row.id === marker.id && row.kind === marker.kind && row.payloadHash === marker.payloadHash &&
+      row.baselineSeq === marker.baselineSeq && row.phaseId === marker.phaseId));
+  }
+
+  /** Retire pending re-brief markers whose request can never be honored:
+   * the job is terminal, so no turn will ever record the guarded events
+   * and no re-dispatch is legal. Unlike `clearPendingRebriefs` (success:
+   * the guarded events landed), retirement is an administrative
+   * cancellation, so the audit event and the deletion commit in ONE
+   * transaction. A candidate retires ONLY while its row still matches the
+   * examined identity (id + kind + payload hash + baseline watermark): an
+   * older pass can never erase a newer request generation, and a replay
+   * (or a concurrent pass) finds nothing to delete and records nothing.
+   * The audit's `guarded_event_landed` flags are the ledger's own event
+   * truth at transaction time — never a caller snapshot. */
+  retirePendingRebriefs(input: {
+    jobId: string;
+    reason: string;
+    candidates: readonly PendingRebriefRetireCandidate[];
+  }): PendingRebriefRetirement {
+    return this.transaction(() => {
+      const refused = (why: NonNullable<PendingRebriefRetirement['refused']>): PendingRebriefRetirement => ({
+        retired: [],
+        // Refusal is a boundary outcome, not identity drift: no row was read
+        // or compared, so nothing is "skipped" — the `refused` discriminator
+        // carries the state and the markers stay untouched.
+        skippedIds: [],
+        refused: why,
+      });
+      // Boundary recheck: the caller saw terminal, but the deletion is
+      // irreversible, so the record re-verifies inside the transaction.
+      const job = this.getJob(input.jobId);
+      if (job === null) return refused('job-missing');
+      if (!isJobTerminal(job.status)) return refused('job-not-terminal');
+
+      const rows = this.listPendingRebriefs({ jobId: input.jobId });
+      const retired: PendingRebriefRecord[] = [];
+      const skippedIds: string[] = [];
+      // Duplicate candidate ids are deduplicated before any row work: one
+      // marker id retires once and the audit names it once, so a caller-side
+      // duplicate can never overstate the deletion or double-list the audit.
+      const seen = new Set<string>();
+      // The landed flag is ledger truth, recomputed here: a caller snapshot
+      // could otherwise write a permanently untruthful audit row (e.g.
+      // "never landed" for a delivery that did land).
+      const guardedEventLanded = new Map<string, boolean>();
+      for (const candidate of input.candidates) {
+        if (seen.has(candidate.id)) continue;
+        seen.add(candidate.id);
+        const row = rows.find((current) => current.id === candidate.id);
+        if (
+          row === undefined ||
+          row.kind !== candidate.kind ||
+          row.payloadHash !== candidate.payloadHash ||
+          row.baselineSeq !== candidate.baselineSeq
+        ) {
+          skippedIds.push(candidate.id);
+          continue;
+        }
+        const landed = row.phaseId === null
+          ? (this.latestJobEvent(row.jobId, row.kind)?.seq ?? 0) > row.baselineSeq
+          : this.db.prepare(
+            `SELECT 1 FROM events
+             WHERE job_id = ? AND kind = ? AND seq > ? AND json_extract(payload, '$.phase_id') = ?
+             LIMIT 1`,
+          ).get(row.jobId, row.kind, row.baselineSeq, row.phaseId) !== undefined;
+        guardedEventLanded.set(row.id, landed);
+        retired.push(row);
+      }
+      if (retired.length === 0) {
+        return { retired: [], skippedIds, refused: null };
+      }
+      // A fully honored pair is a completion, not an administrative
+      // cancellation. Check ledger event truth inside this transaction,
+      // before either the deletion or its retirement audit can commit.
+      if (retired.length === 2 && skippedIds.length === 0 &&
+          PENDING_REBRIEF_KINDS.every((kind) => retired.some((row) => row.kind === kind)) &&
+          retired.every((row) => guardedEventLanded.get(row.id) === true)) {
+        return refused('events-already-landed');
+      }
+      const remove = this.db.prepare('DELETE FROM pending_rebriefs WHERE id = ?');
+      for (const row of retired) remove.run(row.id);
+      this.appendEvent({
+        kind: 'silas.rebrief-retired',
+        jobId: input.jobId,
+        payload: {
+          job_status: job.status,
+          reason: input.reason,
+          retired: retired.map((row) => ({
+            id: row.id,
+            kind: row.kind,
+            payload_hash: row.payloadHash,
+            baseline_seq: row.baselineSeq,
+            note: row.note,
+            agent_id: row.agentId,
+            session_file: row.sessionFile,
+            requested_at: row.requestedAt,
+            guarded_event_landed: guardedEventLanded.get(row.id) ?? false,
+          })),
+          skipped_ids: skippedIds,
+        },
+      });
+      return { retired, skippedIds, refused: null };
     });
   }
 
@@ -2295,15 +2544,43 @@ export class LedgerApi {
   }
 
   /** Count action-required notifications still awaiting a machine
-   * disposition — the NEEDS GRU queue (self-clearing; the human bell is
-   * not rung by these). Read straight from the TABLE — not the bounded
-   * feed window — so the tracker stays true. */
-  countPendingActionRequired(): number {
+   * disposition, INCLUDING terminal-bound closed receipts. Read straight
+   * from the TABLE — not the bounded feed window. Receipts belong to the
+   * record and the bell; the live NEEDS GRU queue is
+   * `countLivePendingActionRequired` — prefer that one for anything the
+   * board renders as live work. This accessor is DIAGNOSTIC/TEST-ONLY
+   * (the durable receipt record); production paths should use the live
+   * count or `listNotifications` directly. */
+  countPendingActionRequiredIncludingReceipts(): number {
     const row = this.db
       .prepare(
         "SELECT COUNT(*) AS n FROM notifications WHERE routing = 'action-required' AND acked_at IS NULL AND resolved_at IS NULL",
       )
       .get() as Row;
+    return Number(row.n);
+  }
+
+  /** The LIVE form of the count above: unacked action-required rows whose
+   * agent binding does NOT belong to a terminal (merged/done) job. A row
+   * bound to a terminal job is a closed receipt — the record keeps it
+   * (nothing is acked or resolved here), but it is not live Gru work, so
+   * the queue count does not count it. Rows with no agent binding stay
+   * global (no job → cannot be terminal). Same table-read discipline as
+   * `countPendingActionRequiredIncludingReceipts` — never the feed window.
+   * The terminal statuses derive from `TERMINAL_JOB_STATUSES` so this SQL
+   * can never drift from `isJobTerminal`. */
+  countLivePendingActionRequired(): number {
+    const terminalPlaceholders = TERMINAL_JOB_STATUSES.map(() => '?').join(', ');
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM notifications
+         WHERE routing = 'action-required' AND acked_at IS NULL AND resolved_at IS NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM agents JOIN jobs ON agents.job_id = jobs.id
+             WHERE agents.id = notifications.agent_id AND jobs.status IN (${terminalPlaceholders})
+           )`,
+      )
+      .get(...TERMINAL_JOB_STATUSES) as Row;
     return Number(row.n);
   }
 
