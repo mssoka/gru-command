@@ -665,6 +665,7 @@ describe('install.sh setup mode (one-line path)', () => {
     };
     expect((await run(join(bare, 'install.sh'), ['--answers', '{}'], env)).status).toBe(0);
 
+    const managerCallsBefore = existsSync(managerLog) ? readFileSync(managerLog, 'utf-8') : '';
     mkdirSync(dirname(unit), { recursive: true });
     writeFileSync(unit, '/someone/else/dist/main.js\n/someone/else/.gru-command\n');
     // The foreign-unit refusal is a public-entry contract: exercise the
@@ -674,6 +675,9 @@ describe('install.sh setup mode (one-line path)', () => {
     expect(foreign.status).toBe(1);
     expect(foreign.stderr).toContain('refusing to restart unrelated service unit');
     expect(readFileSync(unit, 'utf-8')).toContain('/someone/else');
+    // The refusal must not reach the service manager: the call log is
+    // unchanged, so the foreign unit is never restarted.
+    expect(existsSync(managerLog) ? readFileSync(managerLog, 'utf-8') : '').toBe(managerCallsBefore);
   });
 
   it('restarts only an owned service unit', async () => {

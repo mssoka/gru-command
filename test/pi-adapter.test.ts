@@ -158,6 +158,7 @@ interface CancellationObservation {
   readonly queuedModelCallsAfterCancel: number | null;
   readonly continuationCallsAfterCancel: number | null;
   readonly postCancelGuardMessages: readonly string[] | null;
+  readonly postCancelGuardModelCalls: number | null;
   readonly guardMessages: readonly string[];
   readonly guardModelCallsDuringStall: number;
   readonly guardModelCalls: number;
@@ -387,6 +388,12 @@ async function observeCompactionCancellation(
     const guardModelCalls = fx.script.calls.filter((call) =>
       call.prompt.includes('during compaction'),
     ).length;
+    // r8: a guard that rejects but also enqueues would deliver the rejected
+    // request after the transport settles. Re-count the held-cancel prompts
+    // after settlement so the rejection text cannot mask that delivery.
+    const postCancelGuardModelCalls = fx.script.calls.filter((call) =>
+      call.prompt.includes('during held cancel'),
+    ).length;
     // Anchor the abort-settlement marker to the FIRST summary call (the
     // stalled one), not any later summary that the same signal could abort.
     const firstSummary = fx.script.calls.find((call) =>
@@ -487,6 +494,7 @@ async function observeCompactionCancellation(
       queuedModelCallsAfterCancel,
       continuationCallsAfterCancel,
       postCancelGuardMessages,
+      postCancelGuardModelCalls,
       guardMessages,
       guardModelCallsDuringStall,
       guardModelCalls,
@@ -510,9 +518,12 @@ interface NativeQueueObservation {
   readonly pendingAfterCancel: number | null;
   readonly modelCallsAfterCancel: number | null;
   readonly postCancelGuardMessages: readonly string[] | null;
+  readonly postCancelGuardModelCalls: number | null;
   readonly turn: string;
   readonly errorEvents: number;
   readonly continuationReachedModel: boolean;
+  readonly followUpReplyDelta: boolean;
+  readonly followUpReplyState: boolean;
   readonly delivered: number;
   readonly pendingAfterSettlement: number;
   readonly abortedEnds: number;
@@ -564,6 +575,9 @@ async function observeNativeFollowUpCancellation(
         hold: toolGate,
       };
     }
+    // A distinctive reply for the queued follow-up: model admission alone
+    // cannot prove the delivered message produced a successful answer.
+    if (prompt === 'native follow-up') return { deltas: ['native-follow-up-answered'] };
     return { deltas: [`answer-${index}`] };
   });
   const handle = await fx.runtime.spawn('gru');
@@ -667,13 +681,29 @@ async function observeNativeFollowUpCancellation(
     );
     await waitFor(() => pendingCount() === 0, 'native queue drained');
     const internal = handle as unknown as {
-      session: { isIdle: boolean };
+      session: {
+        isIdle: boolean;
+        agent: { state: { messages: Array<{ role: string; stopReason?: string; content?: unknown }> } };
+      };
     };
     await waitFor(() => internal.session.isIdle || handle.health().state === 'disposed', 'session settle');
+    // The delivered follow-up must produce a successful answer on the event
+    // surface, not only a model admission count.
+    await waitFor(
+      () =>
+        events.some(
+          (event) => event.type === 'text_delta' && event.delta === 'native-follow-up-answered',
+        ),
+      'native follow-up reply',
+      8_000,
+    );
     const compactionEnds = events.filter(
       (event): event is Extract<RuntimeEvent, { type: 'compaction_end' }> =>
         event.type === 'compaction_end',
     );
+    const postCancelGuardModelCalls = fx.script.calls.filter((call) =>
+      call.prompt.includes('during held cancel'),
+    ).length;
     return {
       summaryMode,
       pendingAfterAdmission,
@@ -682,6 +712,16 @@ async function observeNativeFollowUpCancellation(
       pendingAfterCancel,
       modelCallsAfterCancel,
       postCancelGuardMessages,
+      postCancelGuardModelCalls,
+      followUpReplyDelta: events.some(
+        (event) => event.type === 'text_delta' && event.delta === 'native-follow-up-answered',
+      ),
+      followUpReplyState: internal.session.agent.state.messages.some(
+        (message) =>
+          message.role === 'assistant' &&
+          message.stopReason === 'stop' &&
+          JSON.stringify(message.content ?? '').includes('native-follow-up-answered'),
+      ),
       turn: turnOutcome,
       errorEvents: events.filter((event) => event.type === 'error').length,
       continuationReachedModel: fx.script.calls.some(
@@ -1464,6 +1504,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
         'agent session is compacting; steer requires an idle session',
         'agent session is compacting; follow-up requires an idle session',
       ]);
+      expect(observation.postCancelGuardModelCalls).toBe(0);
     });
 
     it('late terminal under narrow cancellation: the run recovers and no terminal duplicates publish', async () => {
@@ -1509,6 +1550,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
         'agent session is compacting; steer requires an idle session',
         'agent session is compacting; follow-up requires an idle session',
       ]);
+      expect(observation.postCancelGuardModelCalls).toBe(0);
     });
 
     it('explicit stop context: dispose aborts the live stream, rejects queued work, and releases the session', async () => {
@@ -1556,7 +1598,9 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
         expect(prompts).toEqual(['live turn']);
         // The aborted live turn settles (no wedged run); its stream-abort
         // settlement is pinned above, and disposal owns the terminal state.
-        await live;
+        // Pin the outcome too: an unexpected provider failure must not pass
+        // behind the successful stream-abort check.
+        expect(await live).toBe('resolved');
       } finally {
         release();
         await live.catch(() => {});
@@ -1716,6 +1760,8 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       expect(observation.summarySettledByAbort).toBe(true);
       expect(observation.idle).toBe(true);
       expect(observation.disposed).toBe(false);
+      expect(observation.followUpReplyDelta).toBe(true);
+      expect(observation.followUpReplyState).toBe(true);
     });
 
     it('native SDK follow-up: late transport settlement still delivers the pending message exactly once', async () => {
@@ -1744,6 +1790,9 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
         'agent session is compacting; steer requires an idle session',
         'agent session is compacting; follow-up requires an idle session',
       ]);
+      expect(observation.postCancelGuardModelCalls).toBe(0);
+      expect(observation.followUpReplyDelta).toBe(true);
+      expect(observation.followUpReplyState).toBe(true);
     });
   });
 

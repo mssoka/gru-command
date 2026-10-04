@@ -259,6 +259,7 @@ export async function makeStubModelRuntime(
           // listener is detached when the hold wins, so a settled stream can
           // never read a later abort as its own.
           let abortedBySignal = false;
+          let holdRejected = false;
           await new Promise<void>((resolve) => {
             if (signal.aborted) {
               abortedBySignal = true;
@@ -276,6 +277,7 @@ export async function makeStubModelRuntime(
                 resolve();
               },
               () => {
+                holdRejected = true;
                 signal.removeEventListener('abort', onAbort);
                 resolve();
               },
@@ -290,6 +292,13 @@ export async function makeStubModelRuntime(
             } as unknown as AssistantMessage;
             stream.push({ type: 'error', reason: 'aborted', error: aborted });
             stream.end(aborted);
+            return;
+          }
+          if (holdRejected) {
+            // A failed transport must not resolve as a successful stream: the
+            // signal did not cause the hold's rejection.
+            stream.push({ type: 'error', reason: 'error', error: final });
+            stream.end(final);
             return;
           }
         } else {

@@ -2662,7 +2662,14 @@ describe('chat context controls and durable new-chat boundaries', () => {
       await pollUntil(() => h.handle.disposalStarted, 'retired handle disposal started');
       expect(h.handle.disposed).toBe(false);
       const retiredCallsBefore = h.handle.calls.length;
+      const deliveredTurn = nextTurnEnd(client);
       client.send('delivered while retirement is held', 'retirement-held-delivery');
+      // The client sees the delivery end-to-end while retirement is still
+      // held: its ack and completed turn, not only the fresh handle's call.
+      await deliveredTurn;
+      expect(client.frames).toContainEqual(
+        expect.objectContaining({ type: 'ack', client_msg_id: 'retirement-held-delivery' }),
+      );
       await pollUntil(
         () =>
           h.freshHandles[0]?.calls.some(

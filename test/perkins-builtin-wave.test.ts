@@ -2231,6 +2231,10 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     expect(unrecordedAbort.reason).toContain('aborted while the reconciliation lookup was outstanding');
     expect(unrecordedAbort.receipt?.reviewId).toBe('9201');
     expect(aborted.ledger.latestRoundEvent(abortedOutcome.round.id, 'round.posted')).toBeNull();
+    // T4a parity: the production abort branch escalates the unrecorded
+    // reconciled review; recording without asserting it would hide a lost
+    // operator notification.
+    expect(abortEscalations.some((line) => line.includes('reconciled a provider review but did NOT record it'))).toBe(true);
     t4Attr('aborted', 'leg', 'end', { outcome: 'completed', note: 'fixture-prep + wave-round + assertions; reconcile-lookup is NESTED in wave-round — never summed' });
     t4BodyCompleted = true;
     t4Attr('suite', 'test-end', 'end', { outcome: 'completed' });
