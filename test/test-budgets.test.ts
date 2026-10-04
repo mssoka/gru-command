@@ -44,7 +44,11 @@ const OBSERVED_TIMEOUTS: readonly { readonly file: string; readonly name: string
   },
   {
     file: 'install-one-line.test.ts',
-    name: 'restarts only an owned service and refuses a foreign unit with the same public name',
+    name: 'refuses a foreign unit with the same public name',
+  },
+  {
+    file: 'install-one-line.test.ts',
+    name: 'restarts only an owned service unit',
   },
   {
     file: 'perkins-builtin-wave.test.ts',
@@ -56,7 +60,11 @@ const OBSERVED_TIMEOUTS: readonly { readonly file: string; readonly name: string
   },
   {
     file: 'perkins-builtin-wave.test.ts',
-    name: 'does not record a reconciled delivery when the ref moved or the run aborted during the lookup (T4)',
+    name: 'does not record a reconciled delivery when the ref moved during the lookup (T4a)',
+  },
+  {
+    file: 'perkins-builtin-wave.test.ts',
+    name: 'does not record a reconciled delivery when the run aborted during the lookup (T4b)',
   },
   {
     file: 'perkins-freeze-freshhead.test.ts',
