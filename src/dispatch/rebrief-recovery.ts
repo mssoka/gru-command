@@ -799,6 +799,18 @@ function escalateRecoveryFailure(
   error: unknown,
 ): void {
   const kinds = group.map((marker) => marker.kind).join(', ');
+  // Bind the row to the CURRENTLY recorded re-brief worker when one exists
+  // (existing agentId semantics) so the escalation is classified as a
+  // closed receipt once the lane goes terminal; the in-memory group is a
+  // pre-dispatch snapshot and may predate onSpawned's binding, so re-read
+  // the markers first (code review 2026-10-04). A lane with no recorded
+  // worker stays unbound and live (tracked-review A4).
+  const boundAgent =
+    deps.ledger
+      .listPendingRebriefs({ jobId })
+      .find((marker) => marker.agentId !== null)?.agentId ??
+    group.find((marker) => marker.agentId !== null)?.agentId ??
+    null;
   try {
     deps.notifications.postIncident({
       kind: `silas.rebrief-unreconciled.${jobId}`,
@@ -810,6 +822,7 @@ function escalateRecoveryFailure(
         `safely complete the request: ${String(error)}. Pending markers (${kinds}) remain; the ` +
         'next boot retries — or re-brief the lane once the cause is cleared.',
       dedupe: 'unacked',
+      agentId: boundAgent,
     });
   } catch (notificationError) {
     deps.log?.('error', 're-brief recovery escalation could not be posted', {
@@ -896,6 +909,11 @@ export function reconcilePendingDirectives(deps: ReconcileDirectivesDeps): Direc
           : `The request was admitted${current.admissionMinion === null ? '' : ` to minion ${current.admissionMinion}`} ` +
             'but no correlated terminal receipt exists after restart. The turn may still be completing in its ' +
             'session: do not re-dispatch; reconcile the actual completion before recording anything.',
+        // Bind through the recorded admission worker when one exists so a
+        // terminal lane classifies the row as a closed receipt; a request
+        // that crashed before admission stays unbound and live (code
+        // review 2026-10-04, owner decision D2).
+        ...(current.admissionMinion !== null ? { agentId: current.admissionMinion } : {}),
         dedupe: 'unacked',
       });
       escalated += 1;

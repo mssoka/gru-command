@@ -848,12 +848,22 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       if (jobId !== undefined && options.ledger.getJob(jobId) === null) {
         throw new Error(`job "${jobId}" not found`);
       }
+      // Bind the row to the lane's current worker (existing agentId
+      // semantics) so a terminal lane's leftover escalation is classified
+      // as a closed receipt; no bound worker → unbound and live
+      // (unknown historical rows are never guessed; tracked-review A4).
+      // Selection is listAgents order, as resolveEscalationAgent documents.
+      const boundMinion =
+        jobId !== undefined
+          ? options.ledger.listAgents().find((agent) => agent.jobId === jobId && agent.role === 'minion')
+          : undefined;
       const notification = ops.notifications.post({
         kind: 'silas.escalation',
         routing: 'action-required',
         severity: 'error',
         title,
         ...(detail !== undefined ? { detail } : {}),
+        ...(boundMinion !== undefined ? { agentId: boundMinion.id } : {}),
       });
       options.ledger.appendCustomEvent({
         kind: 'silas.escalated',

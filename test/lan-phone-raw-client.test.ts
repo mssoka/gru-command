@@ -198,8 +198,12 @@ describe('W5 — LAN-phone send path over the real socket', () => {
     const authOk = await phone.waitFor((frame) => frame.type === 'auth_ok', 'auth_ok');
     expect(authOk.seq).toBeGreaterThan(0); // the desktop's history exists
 
-    // Full replay restores both sides of the conversation.
-    await phone.waitFor(
+    // Full replay restores both sides of the conversation. The delta set is
+    // only complete once the replayed turn-end frame lands: the user frame
+    // can surface first while the rest of the replay is still in flight
+    // (frames arrive in seq order, one socket message at a time), so a
+    // check placed right after the user frame races the tail of the replay.
+    const replayedUser = await phone.waitFor(
       (frame) => frame.type === 'user' && frame.client_msg_id === 'w5-desktop-1',
       'replayed own-side user frame',
     );
@@ -209,8 +213,15 @@ describe('W5 — LAN-phone send path over the real socket', () => {
     // arrived: the 2026-10-02 FULL failed here ('' vs the expected echo),
     // and the identical signature recurred cross-lane (provider-pacing
     // 2026-09-30) — a load-sensitive arrival-order race, not a product
-    // regression.
-    await phone.waitFor((frame) => frame.type === 'turn' && frame.state === 'end', 'replayed desktop turn end');
+    // regression. Correlate on the replayed user frame's seq so an earlier
+    // turn frame can never satisfy the barrier.
+    await phone.waitFor(
+      (frame) =>
+        frame.type === 'turn' &&
+        frame.state === 'end' &&
+        (frame.seq ?? 0) > (replayedUser.seq ?? 0),
+      'replayed turn end (delta set complete)',
+    );
     expect(deltaText(phone.frames)).toBe('echo: hello from the desktop');
 
     // The phone's send while another client holds the pen: a per-client

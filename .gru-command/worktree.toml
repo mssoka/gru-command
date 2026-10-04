@@ -87,7 +87,12 @@ native-compaction-wait = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest 
 # scope still runs every test exactly once. The policy guard
 # (test/test-budgets.test.ts) pins these names to the heavy classification,
 # each case's file to this command, and the approved j-463 RPC patch first.
-ten-timeout-cases = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts -t \"by=silas on the pr/review|without by, the pr/review|second run fast-forwards|refuses a non-fast-forward|restarts only an owned|terminalizes a workflow schema|newest completed predecessor|does not record a reconciled delivery|non-PR origin/topic target FREEZES|report rejection|answers rejects secrets\" test/dispatch-server.test.ts test/install-one-line.test.ts test/perkins-builtin-wave.test.ts test/perkins-freeze-freshhead.test.ts test/perkins-whole-review.test.ts test/wizard.test.ts"
+ten-timeout-cases = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts -t \"by=silas on the pr/review|without by, the pr/review|second run fast-forwards|refuses a non-fast-forward|restarts only an owned|refuses a foreign unit|terminalizes a workflow schema|newest completed predecessor|does not record a reconciled delivery|non-PR origin/topic target FREEZES|report rejection|answers rejects secrets\" test/dispatch-server.test.ts test/install-one-line.test.ts test/perkins-builtin-wave.test.ts test/perkins-freeze-freshhead.test.ts test/perkins-whole-review.test.ts test/wizard.test.ts"
+
+# Board acceptance evidence: mock browser services run under the scheduler,
+# not beside it. Keep each run's screenshots in a distinct artifact root.
+# This focused browser scope supplements FULL; it never replaces npm test.
+board-browser = "npm run build && npm run e2e -w web -- --project mock --grep 'board.*mock feed|cockpit layout|mock controls' --output ../_bmad-output/implementation-artifacts/board-section-truth/browser-$(git rev-parse HEAD)-$(date -u +%Y%m%dT%H%M%SZ)"
 
 # PR136 durable follow-through focused scope: every suite the delta can
 # move — the directive single-writer guard (ledger + HTTP), obligations
@@ -122,6 +127,13 @@ provider-recovery-r4-baseline = 'root="$PWD"; dA=$(mktemp -d "${TMPDIR:-/tmp}/gr
 # _bmad-output/gate-prep/native-compaction-wait-baseline.last-snapshot.txt
 # records the latest snapshot location, preserved for inspection.
 native-compaction-wait-baseline = 'set -e; base=2aa836abe262759c651683deb40d05f02c9ede86; headrev=ab11bb327c4ba1ab3e3e3a9cc9e6b3bcaf4a22b3; root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-native-compaction-wait.XXXXXX"); git archive "$base" | tar -x -C "$d"; git show "$headrev":test/supervisor.test.ts > "$d/test/supervisor.test.ts"; git show "$headrev":test/suite-shape.test.ts > "$d/test/suite-shape.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "%s base=%s head=%s\n" "$d" "$base" "$headrev" > "$prep/native-compaction-wait-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/supervisor.test.ts test/suite-shape.test.ts'
+# PR145 focused regression surface: the cancellation-boundary fixtures, the
+# chat held-retirement boundary and the suite pins, under the RPC prerequisite.
+compaction-timeout = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/pi-adapter.test.ts test/chat-server.test.ts test/suite-shape.test.ts"
+# W5 LAN-phone replay-barrier repair: the real-socket phone replay test,
+# runnable via the scheduler so the barrier fix has committed evidence; the
+# backend build its fixture needs runs before the heavy-classified suite.
+lan-phone-w5 = "node tools/patch-vitest-rpc-timeout.mjs && npm run build && npx vitest run --config vitest.heavy.config.ts test/lan-phone-raw-client.test.ts"
 
 # Baseline fail-before proof for the review-rebrief-interlock digest fence
 # (phase pr144-baseline-proof-readiness-20261002; blob pin corrected
@@ -159,7 +171,6 @@ native-compaction-wait-baseline = 'set -e; base=2aa836abe262759c651683deb40d05f0
 pr144-full-red-followthrough = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/chat-server.test.ts && npx vitest run --config vitest.heavy.config.ts test/install-one-line.test.ts"
 
 rebrief-interlock-baseline = 'set -e; base=6a00f4e50e7ae970915a9a534c142c1f8a45b57d; headrev=ec2a490de91fd5e6ace2870e97a80e5a115007c0; root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-review-rebrief-interlock.XXXXXX"); git archive "$base" | tar -x -C "$d"; git show "$headrev":test/silas-driver.test.ts > "$d/test/silas-driver.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "%s base=%s head=%s\n" "$d" "$base" "$headrev" > "$prep/review-rebrief-interlock-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/silas-driver.test.ts'
-
 lens-unused-neutral = "node tools/patch-vitest-rpc-timeout.mjs && cd web && node ../node_modules/vitest/vitest.mjs run src/ui/board.test.ts src/lib/board-signals.test.ts src/lib/board-protocol.test.ts"
 lens-unused-neutral-baseline = 'set -e; base=6a00f4e50e7ae970915a9a534c142c1f8a45b57d; headrev=43e437a2e61b0c25351ed6147639aefbac4ccd77; root="$PWD"; prep=_bmad-output/ops-readiness-repair-20261002; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-lens-unused-neutral.XXXXXX"); git archive "$base" | tar -x -C "$d"; git show "$headrev":web/src/ui/board.test.ts > "$d/web/src/ui/board.test.ts"; git show "$headrev":web/src/lib/board-signals.test.ts > "$d/web/src/lib/board-signals.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; ln -s "$root/web/node_modules" "$d/web/node_modules"; printf "%s base=%s head=%s\n" "$d" "$base" "$headrev" > "$prep/lens-unused-neutral-baseline.last-snapshot.txt"; cd "$d" && node tools/patch-vitest-rpc-timeout.mjs && cd "$d/web" && node "$root/node_modules/vitest/vitest.mjs" run src/ui/board.test.ts src/lib/board-signals.test.ts'
 lens-unused-neutral-browser = "node tools/patch-vitest-rpc-timeout.mjs && cd web && node ../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json && node node_modules/vite/bin/vite.js build && node ../node_modules/@playwright/test/cli.js test --project=lens-pills"
@@ -210,11 +221,12 @@ board-merged-attention = "node tools/patch-vitest-rpc-timeout.mjs && cd web && .
 # T4 diagnosis (2026-10-02): the shared perkins-builtin-wave T4 case sits on
 # the 30s default ceiling under full-suite co-tenant load and has timed out
 # in FULL at multiple heads across lanes (shared fixture cost; the cost
-# repair is owned by the separate review-rebrief-interlock lane, unmerged —
-# never copied here). This scope isolates that single case under the
-# classified heavy budget (120s, min(2, pin) workers) so a FULL timeout
-# can be classified (isolation pass vs deterministic fail); it changes no
-# test, assertion or gate.
+# repair has since landed on main, and the r7 split bounds each body —
+# never copied here). This scope isolates the reconciliation cases under the
+# classified heavy budget (120s, min(2, pin) workers) so a FULL timeout can
+# be classified (isolation pass vs deterministic fail); since the r7 split it
+# covers BOTH T4 bodies (moved and aborted), which is the whole T4 oracle
+# family either way. It changes no test, timeout, assertion or gate.
 t4-oracle = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/perkins-builtin-wave.test.ts -t \"does not record a reconciled delivery\""
 
 # r2 repair-generation diagnosis (native perkins-github-app-publisher-r2
@@ -223,6 +235,59 @@ t4-oracle = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config 
 # intact and composed into one evidence exit (never masked into a PASS).
 # The full gate remains the final head's FULL run.
 r2-timeout-isolation = 'node tools/patch-vitest-rpc-timeout.mjs || exit 3; echo "r2-timeout-isolation leg 1 dispatch-server: by=silas"; npx vitest run --config vitest.heavy.config.ts test/dispatch-server.test.ts -t "by=silas on the pr/review endpoints"; a=$?; echo "r2-timeout-isolation leg 2 install-one-line: restarts only an owned service"; npx vitest run --config vitest.heavy.config.ts test/install-one-line.test.ts -t "restarts only an owned service"; b=$?; echo "r2-timeout-isolation leg 3 wave: T4 reconciled delivery"; npx vitest run --config vitest.heavy.config.ts test/perkins-builtin-wave.test.ts -t "does not record a reconciled delivery"; c=$?; echo "r2-timeout-isolation exits: dispatch-server=$a install-one-line=$b wave-t4=$c"; if [ "$a" -ne 0 ] || [ "$b" -ne 0 ] || [ "$c" -ne 0 ]; then exit 1; fi'
+
+# PR138 deadline repairs (2026-10-03): the five inherited 30s-default cases
+# that overran under co-tenant load at 92698f2 are repaired in-lane — the
+# wizard fails an invalid --answers payload before any probe work and loads
+# the probe dynamically; the dispatcher attribution case, the two T4 legs
+# and the verdict-shape matrix are one scenario per case; T4's origin is a
+# single batched bare clone and its scripted security evidence is locatable
+# in the fixture's own frozen diff; the installer ownership case drops its
+# redundant setup cycle. This scope re-runs the whole wizard file plus
+# exactly the repaired cases in the other four files, approved j-463 RPC
+# patch first, no timeout/worker/assertion flag — a repair check, never a
+# FULL substitute.
+deadline-repairs = 'node tools/patch-vitest-rpc-timeout.mjs && npm run lint && npm run typecheck && npm run build && npx vitest run --config vitest.heavy.config.ts test/wizard.test.ts && npx vitest run --config vitest.heavy.config.ts test/dispatch-server.test.ts test/install-one-line.test.ts test/perkins-builtin-wave.test.ts test/perkins-whole-review.test.ts -t "by=silas on the pr/review|without by, the pr/review|restarts only an owned service|does not record a reconciled delivery|report rejection: a missing verdict|report rejection: an empty report|report rejection: a report omitting"'
+
+# PR138 final-review repairs (2026-10-03): the four independent lens rounds
+# at 37f0e14/9a58d79/53add5f/6aa20d7 plus the fce17f0 confirmation round
+# produced 61 findings, all triaged; the actionable ones are repaired through
+# this head (stop-truth alignment across supervisor/digest/board, disposed
+# and recency semantics, live-count SQL, cross-build drift alarm, wizard
+# fail-fast positive pin, mock fixture timing). This scope covers the touched
+# backend suites plus the whole web unit suite, with lint/typecheck/build;
+# approved j-463 RPC patch first, no timeout/worker/assertion flag — a repair
+# check, never a FULL substitute.
+final-review-repairs = 'node tools/patch-vitest-rpc-timeout.mjs && npm run lint && npm run typecheck && npm run build && npx vitest run test/silas-driver.test.ts test/supervisor.test.ts test/provider-recovery-seam.test.ts test/health.test.ts test/suite-shape.test.ts && npx vitest run --config vitest.heavy.config.ts test/wizard.test.ts && cd web && ../node_modules/.bin/vitest run'
+
+# PR138 tracked-review repairs (2026-10-03, GC-commissioned jobs on f906):
+# the three tracked returns' accepted findings — board/digest recency and
+# unknown-stamp alignment, supervision-block boundary typing, receipt AA
+# composite, bidirectional terminal alarm, main-assembly wiring alarm, the
+# A4 producer agentId bindings, T4 origin-tip equivalence, and the scoped
+# browser clips. This scope covers the touched backend suites, the two
+# filtered heavy cases, and the whole web unit suite, with
+# lint/typecheck/build; approved j-463 RPC patch first, no
+# timeout/worker/assertion flag — a repair check, never a FULL substitute.
+tracked-review-repairs = 'node tools/patch-vitest-rpc-timeout.mjs && npm run lint && npm run typecheck && npm run build && npx vitest run test/silas-driver.test.ts test/github-poll.test.ts test/rebrief-recovery.test.ts test/supervisor.test.ts test/provider-recovery-seam.test.ts test/health.test.ts test/suite-shape.test.ts && npx vitest run --config vitest.heavy.config.ts test/wizard.test.ts && npx vitest run --config vitest.heavy.config.ts test/dispatch-server.test.ts -t "silas/escalate posts" && npx vitest run --config vitest.heavy.config.ts test/perkins-builtin-wave.test.ts -t "does not record a reconciled delivery" && cd web && ../node_modules/.bin/vitest run'
+
+# PR138 A4 wave-alert identity extension (owner-approved journal j-978):
+# WaveRunner escalate context, the escalation-identity resolver/notifier,
+# the main assembly wiring, judgment-tier CI-failure binding, the shared
+# cross-surface stop and live/receipt fixtures, and the doc truth updates.
+# Covers the touched backend suites, the merge-resolved dispatch-server
+# and rebrief-recovery suites, the pinned producer escalations, and the
+# whole web unit suite, with lint/typecheck/build; approved j-463 RPC
+# patch first, no timeout/worker/assertion flag — a repair check, never a
+# FULL substitute.
+a4-wave-identity = 'node tools/patch-vitest-rpc-timeout.mjs && npm run lint && npm run typecheck && npm run build && npx vitest run test/escalation-identity.test.ts test/github-poll.test.ts test/silas-driver.test.ts test/supervisor.test.ts test/board-engine.test.ts test/rebrief-recovery.test.ts test/suite-shape.test.ts && npx vitest run --config vitest.heavy.config.ts test/dispatch-server.test.ts && npx vitest run --config vitest.heavy.config.ts test/perkins-builtin-wave.test.ts -t "reconciles an interrupted live round|does not record a reconciled delivery" && cd web && ../node_modules/.bin/vitest run'
+
+# r7 timeout-cliff checks: the two 30s test-body timeouts from the d1395b8
+# FULL, routed through the classified heavy runner (main's budget policy);
+# the install one-liner scenarios and the two T4 reconciliation scenarios are
+# each split so no single test body carries two full installer cycles / two
+# full round fixtures. No test deadline, assertion or gate is changed.
+r7-timeout-cliff = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/install-one-line.test.ts test/perkins-builtin-wave.test.ts -t \"restarts only an owned service|refuses a foreign unit with the same public name|does not record a reconciled delivery\""
 
 # Isolated pre-fix baseline: current-main 059c0762 source with the IDENTICAL
 # final behavioral tests from the scheduled head, dependencies linked (no
@@ -234,6 +299,17 @@ r2-timeout-isolation = 'node tools/patch-vitest-rpc-timeout.mjs || exit 3; echo 
 # out, and no branch/worktree holds the sha.
 board-merged-attention-baseline = 'set -e; base=059c076290145d4aae6e0b47c7b3f87156862c43; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-board-merged-attention.XXXXXX"); git archive "$base" | tar -x -C "$d"; git show "$headrev":web/src/lib/board-bands.test.ts > "$d/web/src/lib/board-bands.test.ts"; git show "$headrev":web/src/ui/board-merged-attention.test.ts > "$d/web/src/ui/board-merged-attention.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; ln -s "$root/web/node_modules" "$d/web/node_modules"; printf "board-merged-attention-baseline base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/board-merged-attention-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs && cd web && ../node_modules/.bin/vitest run src/lib/board-bands.test.ts src/ui/board-merged-attention.test.ts'
 finding-dedupe-recency = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perkins-findings-dedupe.test.ts test/suite-shape.test.ts"
+
+# PR138 twelve-followthrough repairs (2026-10-03, silas sweep commission):
+# the A1/E1 stall-stamp floor + shared-fixture board stall pin, A4
+# late-bound supervision lookup and its assembly alarm, A3 engine wiring
+# alarm, A7/V1 producer-context table and the real-producer receipt chain,
+# A8 unknown-stamp stop ordering, V2 stale-slot stop-cause carry, and the
+# docs precedence notes. Covers the touched backend suites, the filtered
+# heavy recovery case, and the whole web unit suite, with
+# lint/typecheck/build; approved j-463 RPC patch first, no
+# timeout/worker/assertion flag — a repair check, never a FULL substitute.
+twelve-followthrough = 'node tools/patch-vitest-rpc-timeout.mjs && npm run lint && npm run typecheck && npm run build && npx vitest run test/escalation-identity.test.ts test/board-engine.test.ts test/silas-driver.test.ts test/supervisor.test.ts test/suite-shape.test.ts && npx vitest run --config vitest.heavy.config.ts test/perkins-builtin-wave.test.ts -t "reconciles an interrupted live round as durable INCOMPLETE" && cd web && ../node_modules/.bin/vitest run'
 
 # PR130 r3 native-repair regressions (silas-ops PR130 r3 follow-through):
 # malformed nested author fields, a failed 4xx body read staying a definitive
@@ -281,3 +357,4 @@ perkins-stage1-baseline = 'root="$PWD"; prep=_bmad-output/gate-prep/perkins-reli
 # the recomputed suite-shape pins — plain installed Vitest invocations at
 # unchanged budgets, exit codes never masked.
 verification-single-flight = "npx vitest run test/verification-scheduler.test.ts test/verification-capture.test.ts test/verification-evidence.test.ts test/silas-driver.test.ts && npx vitest run --config vitest.heavy.config.ts test/verification-server.test.ts && npx vitest run test/suite-shape.test.ts"
+
