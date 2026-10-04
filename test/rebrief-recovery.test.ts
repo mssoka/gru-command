@@ -1015,6 +1015,28 @@ describe('terminal re-brief retirement', () => {
     expect(h.ledger.listNotifications()).toHaveLength(0);
   });
 
+  it('a spent but incomplete terminal pair is escalated, never audited as cancelled', async () => {
+    const h = makeHarness();
+    const jobId = 'terminal-spent-incomplete';
+    await seedPendingRebrief({ h, jobId });
+    const pair = h.ledger.listPendingRebriefs({ jobId });
+    h.ledger.appendCustomEvent({ kind: 'silas.rebrief', jobId });
+    h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId });
+    h.ledger.clearPendingRebriefs(pair.filter((row) => row.kind === 'job.delivered').map((row) => row.id));
+    merge(h, jobId);
+    const report = await reconcilePendingRebriefs(deps(h), { bootAt: new Date(Date.now() + 60_000) });
+    await report.settled;
+    expect(report.completed).toBe(0);
+    expect(report.retired).toBe(0);
+    expect(h.registry.workers).toHaveLength(0);
+    expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(1);
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-retired')).toBeNull();
+    expect(h.ledger.listNotifications().some((row) => row.kind === `silas.rebrief-unreconciled.${jobId}` && (row.detail ?? '').includes('incomplete marker pair'))).toBe(true);
+    expect(() => finalizeRebriefRequest({
+      ledger: h.ledger, worktrees: h.worktrees, jobId, minionId: 'worker', lanePath: h.lanePath, note: 'n',
+    })).toThrow(/incomplete marker pair/u);
+  });
+
   it('spent marked events beyond the newest thousand stay completed at terminal boot and finalization', async () => {
     const h = makeHarness();
     for (const jobId of ['phase-spent-boot', 'phase-spent-finalize']) {

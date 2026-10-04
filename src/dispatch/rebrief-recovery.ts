@@ -222,16 +222,16 @@ export function finalizeRebriefRequest(input: {
       };
     }
   }
+  if (!isCompleteRebriefPair(markers)) throw incompleteRebriefPairError(input.jobId);
   const missing = markers.filter((marker) => !pendingRebriefEventLanded(input.ledger, marker));
-  const completePair = isCompleteRebriefPair(markers);
   const job = input.ledger.getJob(input.jobId);
-  if ((missing.length > 0 || !completePair) && job === null) {
+  if (missing.length > 0 && job === null) {
     // Fail closed: a marker whose job row is gone can never be finalized
     // truthfully — recording guarded events would mint history for an
     // absent job. The markers stay for the next honest boundary.
     throw new Error(`job "${input.jobId}" no longer exists — pending re-brief markers cannot be finalized`);
   }
-  if ((missing.length > 0 || !completePair) && job !== null && isJobTerminal(job.status)) {
+  if (missing.length > 0 && job !== null && isJobTerminal(job.status)) {
     // The job went terminal under the turn's feet: the guarded events can
     // no longer be honored truthfully. Retire the request instead of
     // recording a stale late completion (no reopen, no fabricated
@@ -268,7 +268,6 @@ export function finalizeRebriefRequest(input: {
       superseded: false,
     };
   }
-  if (!completePair) throw new Error(`job "${input.jobId}" has an incomplete marker pair — pending re-brief cannot be recovered`);
   const rebriefMarker = markers.find((marker) => marker.kind === 'silas.rebrief') ?? null;
   const deliveryMarker = markers.find((marker) => marker.kind === 'job.delivered') ?? null;
   // Host-owned phase identity: when this request carried an explicit
@@ -346,6 +345,17 @@ function isCompleteRebriefPair(markers: readonly PendingRebriefRecord[]): boolea
     markers.some((marker) => marker.kind === 'job.delivered');
 }
 
+class IncompleteRebriefPairError extends Error {
+  constructor(jobId: string) {
+    super(`job "${jobId}" has an incomplete marker pair — pending re-brief cannot be recovered or retired`);
+    this.name = 'IncompleteRebriefPairError';
+  }
+}
+
+function incompleteRebriefPairError(jobId: string): IncompleteRebriefPairError {
+  return new IncompleteRebriefPairError(jobId);
+}
+
 /** A replaced pair cannot be bound, completed, or retired by an older turn. */
 function sameRebriefGeneration(current: readonly PendingRebriefRecord[], expected: readonly PendingRebriefRecord[]): boolean {
   return current.length === expected.length && expected.every((marker) => current.some((row) =>
@@ -408,7 +418,14 @@ export async function reconcilePendingRebriefs(
     const groupPhaseId = group.find((marker) => marker.phaseId !== null)?.phaseId ?? null;
     const missing = group.filter((marker) => pendingRebriefGuardedEvent(deps.ledger, marker, groupPhaseId) === null);
     const completePair = isCompleteRebriefPair(group);
-    if (missing.length === 0 && completePair) {
+    if (!completePair) {
+      // Without both marker kinds we cannot prove completion OR justify an
+      // administrative cancellation. Keep the anomaly visible even if the
+      // job is terminal and the surviving guarded event already landed.
+      escalateRecoveryFailure(deps, jobId, group, incompleteRebriefPairError(jobId));
+      continue;
+    }
+    if (missing.length === 0) {
       if (deps.ledger.clearPendingRebriefsIfCurrent(group)) completed += 1;
       else deps.log?.('warn', 're-brief spent markers superseded before clearing', { job: jobId });
       continue;
@@ -519,6 +536,10 @@ async function redispatchGroup(
       // Defensive second boundary: the pass that queued this group saw a
       // nonterminal job. If terminality landed anyway, retire (never
       // re-dispatch, never escalate an unhonorable request).
+      const currentMarkers = deps.ledger.listPendingRebriefs({ jobId });
+      if (currentMarkers.length > 0 && !isCompleteRebriefPair(currentMarkers)) {
+        throw incompleteRebriefPairError(jobId);
+      }
       const retirement = retireTerminalRebriefs(deps.ledger, job, group);
       if (retirement.retired.length > 0) {
         deps.log?.('info', 're-brief request retired: job terminal before re-dispatch', {
@@ -535,9 +556,7 @@ async function redispatchGroup(
       }
       return;
     }
-    if (!isCompleteRebriefPair(group)) {
-      throw new Error(`job "${jobId}" has an incomplete marker pair — pending re-brief cannot be recovered`);
-    }
+    if (!isCompleteRebriefPair(group)) throw incompleteRebriefPairError(jobId);
     const lane = deps.worktrees
       .listWorktrees({ jobId })
       .find((candidate) => candidate.kind === 'job' && candidate.status !== 'swept');
@@ -635,6 +654,11 @@ async function redispatchGroup(
     });
   } catch (error) {
     const currentJob = deps.ledger.getJob(jobId);
+    const currentMarkers = deps.ledger.listPendingRebriefs({ jobId });
+    if (error instanceof IncompleteRebriefPairError || (currentMarkers.length > 0 && !isCompleteRebriefPair(currentMarkers))) {
+      escalateRecoveryFailure(deps, jobId, group, incompleteRebriefPairError(jobId));
+      return;
+    }
     if (error instanceof RebriefTurnCancelled || (currentJob !== null && isJobTerminal(currentJob.status))) {
       // A failed turn after a terminal flip is no longer actionable. Close
       // only the admitted generation; the failure must not resurrect its
@@ -770,7 +794,7 @@ function escalateRecoveryFailure(
       title: `Re-brief recovery failed: job ${jobId}`,
       detail:
         `A re-brief request was mid-flight at service restart and boot recovery could not ` +
-        `re-dispatch the worker: ${String(error)}. Pending markers (${kinds}) remain; the ` +
+        `safely complete the request: ${String(error)}. Pending markers (${kinds}) remain; the ` +
         'next boot retries — or re-brief the lane once the cause is cleared.',
       dedupe: 'unacked',
     });
