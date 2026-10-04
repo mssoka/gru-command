@@ -262,6 +262,33 @@ verification budget.
   that waits past `lock_wait_timeout_ms` (default 15 min) fails LOUD: the
   lane receives a typed `error` frame and the ledger a
   `verification.lock-timeout` record — nothing hangs silently.
+- **Identical submissions are single-flight, never duplicate producers**
+  (issue #159). Same job + lane + scope + head + command shares ONE run:
+  the duplicate stream gets an `attached` frame naming the run and then
+  receives the same terminal outcome; a restart orphan that already
+  represents the submission answers with a typed `duplicate_in_flight`
+  error instead of a second producer. A completed run, a failed-run
+  repair, or a changed head is never permanently suppressed — a fresh
+  submission runs.
+- **A submission can carry durable identity.** `POST /api/verify` accepts
+  an optional client `request_id` (and `expected_head`; a lane that moved
+  answers 409 `head_changed` before any producer exists). Replaying the
+  same `request_id` attaches to the in-flight run or replays the recorded
+  terminal outcome — a lost response is reconciled, never replayed blind.
+  `GET /api/verify/status?request_id=…` answers
+  `unknown | accepted | running | completed | admission-failed`; only a
+  task confirmed never-started (typed `lock_wait_timeout`, no `started`
+  frame) may be retried under its old identity.
+- **Capture is exclusive and receipted.** The shipped capture helper
+  (`dist/verify/capture-cli.js`, named in Silas's wake prompt) opens a
+  unique `wx` sink BEFORE the POST, streams every NDJSON frame to EOF,
+  and writes `<sink>.receipt.json` binding run id, true head/dirty state,
+  exit/outcome and output length/hash. A stream without a valid terminal
+  completion (or with torn records) is `unknown` and is never promoted to
+  success. Owned helpers are withdrawn only with identity validation
+  (pid + start time + command/cwd); malformed pid records, crashes and
+  stale owners are cleared without touching unrelated processes, and
+  sinks/receipts are preserved.
 - **One worker budget across runs.** Total test workers stay within
   `[verify] worker_budget` (default: CPU cores − 2), enforced by the run
   wrapper through the vitest pool knobs and `GRU_VERIFY_*` variables for

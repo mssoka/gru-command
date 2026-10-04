@@ -7,8 +7,13 @@ import type { LedgerApi } from '../ledger/api.js';
 import type { WorktreePort } from '../dispatch/worktree-port.js';
 import { loadWorktreeManifest, resolveVerifyCommand } from '../worktrees/manifest.js';
 import {
+  VerificationDuplicateError,
   VerificationLockTimeoutError,
+  VerificationRequestConflictError,
   VerificationScheduler,
+  isValidVerificationRequestId,
+  readGitState,
+  type VerificationAttemptStatus,
   type VerificationLease,
   type VerificationProgress,
   type VerificationQueueView,
@@ -27,6 +32,12 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  * ledger so review's tests lens consumes recorded evidence, not pasted
  * reports. Lock-wait timeouts surface as a typed `error` frame (and a
  * `verification.lock-timeout` ledger record) — never a silent hang.
+ *
+ * Single-flight + reconcile (issue #159): an optional client `request_id`
+ * gives the submission durable identity; identical (job, lane, scope, head,
+ * command) submissions share one producer and a duplicate stream attaches.
+ * `GET /api/verify/status` answers accepted/running/completed/unknown by
+ * request identity so a lost response is reconciled, never replayed blind.
  */
 
 export interface VerificationServerOptions {
@@ -39,7 +50,7 @@ export interface VerificationServerOptions {
 }
 
 export interface VerificationServer {
-  /** First-mounted hook: claims POST /api/verify, passes everything else. */
+  /** First-mounted hook: claims POST /api/verify and GET /api/verify/status. */
   requestHook(req: IncomingMessage, res: ServerResponse, path: string): boolean;
   /** Board health row (board UX v4): live lock/queue/budget counters. */
   view(): VerificationQueueView;
@@ -201,6 +212,22 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
     const body = await readBody(req);
     const jobId = strField(body, 'job_id');
     const scope = optStrField(body, 'scope') ?? DEFAULT_VERIFY_SCOPE;
+    const requestId = optStrField(body, 'request_id');
+    if (requestId !== undefined && !isValidVerificationRequestId(requestId)) {
+      json(res, 400, {
+        error: 'bad_request',
+        detail: 'request_id must be 1-128 URL-safe characters ([A-Za-z0-9._:-])',
+      });
+      return;
+    }
+    const expectedHead = optStrField(body, 'expected_head');
+    if (expectedHead !== undefined && !/^[0-9a-f]{40}$/iu.test(expectedHead)) {
+      json(res, 400, {
+        error: 'bad_request',
+        detail: 'expected_head must be the full 40-character commit sha',
+      });
+      return;
+    }
 
     const job = ledger.getJob(jobId);
     if (job === null) {
@@ -239,6 +266,22 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
       return;
     }
 
+    // Exact-head evidence (issue #159): when the caller names the head it
+    // intends to verify, a lane that moved is refused before any producer
+    // exists. The run itself still binds the true head it reads at spawn.
+    const git = readGitState(lane.path);
+    if (expectedHead !== undefined && git.sha !== expectedHead) {
+      json(res, 409, {
+        error: 'head_changed',
+        detail:
+          `lane head is ${git.sha ?? 'unknown'}, expected ${expectedHead} — ` +
+          'a changed head is a new verification, never a replay',
+        expected_head: expectedHead,
+        current_head: git.sha,
+      });
+      return;
+    }
+
     // Streaming begins here: 200 + NDJSON frames. A lock-wait timeout can
     // only land as an `error` frame once the stream has started — the frame
     // is the loud surface, and the ledger carries the record.
@@ -268,7 +311,14 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
 
     try {
       await scheduler.run(
-        { jobId, scope, command, cwd: lane.path },
+        {
+          jobId,
+          scope,
+          command,
+          cwd: lane.path,
+          head: git.sha,
+          ...(requestId === undefined ? {} : { requestId }),
+        },
         writeFrame,
       );
     } catch (error) {
@@ -280,6 +330,24 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
           wait_ms: error.waitMs,
           active: error.active,
           queued: error.queued,
+          request_id: requestId ?? null,
+          started: false,
+        });
+      } else if (error instanceof VerificationDuplicateError) {
+        await writeFrame({
+          type: 'error',
+          code: error.code,
+          detail: error.message,
+          run_id: error.runId,
+          state: error.state,
+          request_id: requestId ?? null,
+        });
+      } else if (error instanceof VerificationRequestConflictError) {
+        await writeFrame({
+          type: 'error',
+          code: error.code,
+          detail: error.message,
+          request_id: error.requestId,
         });
       } else {
         await writeFrame({
@@ -293,12 +361,54 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
     }
   }
 
+  /**
+   * Reconcile surface (issue #159): never streams a producer. `unknown` is
+   * a real answer — the client learns its submission has no record instead
+   * of replaying it blind.
+   */
+  function handleStatus(req: IncomingMessage, res: ServerResponse, url: URL): void {
+    if (!authed(req, res)) return;
+    const requestId = url.searchParams.get('request_id') ?? undefined;
+    const jobId = url.searchParams.get('job_id') ?? undefined;
+    if ((requestId ?? '') === '' && (jobId ?? '') === '') {
+      json(res, 400, {
+        error: 'bad_request',
+        detail: 'request_id or job_id query parameter is required',
+      });
+      return;
+    }
+    if (requestId !== undefined && !isValidVerificationRequestId(requestId)) {
+      json(res, 400, { error: 'bad_request', detail: 'request_id is not a valid identity' });
+      return;
+    }
+    const scope = url.searchParams.get('scope') ?? undefined;
+    const cwd = url.searchParams.get('cwd') ?? undefined;
+    const head = url.searchParams.get('head') ?? undefined;
+    const status: VerificationAttemptStatus = scheduler.attemptStatus({
+      ...(requestId === undefined ? {} : { requestId }),
+      ...(jobId === undefined ? {} : { jobId }),
+      ...(scope === undefined ? {} : { scope }),
+      ...(cwd === undefined ? {} : { cwd }),
+      ...(head === undefined ? {} : { head }),
+    });
+    json(res, 200, status);
+  }
+
   return {
     view(): VerificationQueueView {
       return scheduler.view();
     },
 
     requestHook(req, res, path): boolean {
+      if (path === '/api/verify/status') {
+        if (req.method !== 'GET') {
+          req.resume();
+          json(res, 405, { error: 'method_not_allowed', allowed: ['GET'] });
+          return true;
+        }
+        handleStatus(req, res, new URL(req.url ?? '/api/verify/status', 'http://localhost'));
+        return true;
+      }
       if (path !== '/api/verify') return false;
       if (req.method !== 'POST') {
         req.resume();

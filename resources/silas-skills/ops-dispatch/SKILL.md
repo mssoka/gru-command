@@ -207,9 +207,34 @@ authorizes its full completion cycle, and YOU own driving it:
    verification output before acting).
 2. Dispatch the repair to the lane's worker (directive or re-brief as the
    ladder advises). Ordinary private commits on the lane are normal work.
-3. Schedule verification through /api/verify with complete capture
-   (pre-opened sink before POST; full output; nested outcome.exitCode).
-   Never run product tests directly to substitute for the scheduler.
+3. Schedule verification through the shipped capture helper — never a
+   hand-rolled background watcher. The helper path is named in your wake
+   prompt ("Verification capture helper"):
+
+     node <capture-helper> run --job <job> --scope full \
+       --sink <data-dir>/captures/<job>-<scope>-<head>.ndjson \
+       --request-id <stable-id> --url <base> --config <configPath>
+
+   The helper opens a UNIQUE EXCLUSIVE sink before the POST (an existing
+   sink is a typed refusal — never truncated or shared), streams every
+   NDJSON frame to EOF, and writes `<sink>.receipt.json` binding run id,
+   true head/dirty state, exit/outcome and output length/hash. It exits 0
+   only for a clean exact-head PASS; a lost connection is `unknown`
+   (exit 3), reconciled with `status --request-id <id>` — never replayed
+   blind. Reuse the SAME request-id only to reconnect (the server attaches
+   or replays the recorded outcome); a repair or a moved head uses a NEW
+   request-id. A typed `lock_wait_timeout` with no started frame (exit 4)
+   is the one retryable admission failure. Never run product tests
+   directly to substitute for the scheduler.
+
+   Withdraw an obsolete owned helper only through the helper itself:
+
+     node <capture-helper> withdraw --owner <sink>.owner.json
+
+   Identity is validated (pid + start time + command/cwd); malformed PID
+   records, crashes and stale owners are recovered without touching
+   unrelated sessions, the service, or owner cancellation controls, and
+   existing sink/receipt files are preserved.
 4. On failure: read the complete output, repair the real cause, re-run.
    Repeat while each cycle makes genuine progress. Never weaken
    tests/timeouts/assertions, never bypass review, never rerun solely to

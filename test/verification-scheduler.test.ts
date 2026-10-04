@@ -5,7 +5,9 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   VerificationDisposedError,
+  VerificationDuplicateError,
   VerificationLockTimeoutError,
+  VerificationRequestConflictError,
   VerificationScheduler,
   pidAlive,
   verificationEnvironment,
@@ -65,6 +67,23 @@ function makeScheduler(opts: {
 
 function spec(jobId: string, command = 'node -e "process.exit(0)"'): Parameters<VerificationScheduler['run']>[0] {
   return { jobId, scope: 'full', command, cwd: process.cwd() };
+}
+
+/** A spec with an explicit head so single-flight keys are deterministic. */
+function headedSpec(
+  jobId: string,
+  head: string,
+  command = 'node -e "process.exit(0)"',
+  requestId?: string,
+): Parameters<VerificationScheduler['submit']>[0] {
+  return {
+    jobId,
+    scope: 'full',
+    command,
+    cwd: process.cwd(),
+    head,
+    ...(requestId === undefined ? {} : { requestId }),
+  };
 }
 
 async function waitFor(predicate: () => boolean, timeoutMs = 4_000): Promise<void> {
@@ -422,6 +441,207 @@ describe('verification scheduler — global budget', () => {
     expect(settled).toHaveLength(1);
     expect(settled[0]?.pid).toBe(spawnedPid);
     expect(pidAlive(spawnedPid as number)).toBe(false); // settled means exited
+  });
+
+  it('single-flight: a simultaneous duplicate attaches to ONE producer, never a second execution', async () => {
+    const { scheduler, records } = makeScheduler({ maxConcurrent: 2 });
+    scheduler.start();
+    const command = 'node -e "setTimeout(() => console.log(\'done\'), 250)"';
+    const firstFrames: VerificationProgress[] = [];
+    const secondFrames: VerificationProgress[] = [];
+    const first = scheduler.submit(headedSpec('job-dup', 'a'.repeat(40), command), (frame) => {
+      firstFrames.push(frame);
+    });
+    const second = scheduler.submit(headedSpec('job-dup', 'a'.repeat(40), command), (frame) => {
+      secondFrames.push(frame);
+    });
+    const [firstOutcome, secondOutcome] = await Promise.all([first, second]);
+    expect(secondOutcome.runId).toBe(firstOutcome.runId);
+    expect(firstOutcome.ok).toBe(true);
+    expect(secondFrames[0]?.type).toBe('attached');
+    const attached = secondFrames[0] as Extract<VerificationProgress, { type: 'attached' }>;
+    expect(attached.runId).toBe(firstOutcome.runId);
+    expect(['queued', 'running']).toContain(attached.state);
+    expect(records.filter((record) => record.kind === 'verification.started')).toHaveLength(1);
+    expect(records.filter((record) => record.kind === 'verification.completed')).toHaveLength(1);
+    expect(records.filter((record) => record.kind === 'verification.attached')).toHaveLength(1);
+    expect(scheduler.inFlightCount()).toBe(0);
+    expect(scheduler.activeCount()).toBe(0);
+  });
+
+  it('single-flight: a request_id replay of a completed run reconciles the recorded outcome without a rerun', async () => {
+    const { scheduler, records } = makeScheduler();
+    scheduler.start();
+    const specWithId = headedSpec('job-replay', 'b'.repeat(40), undefined, 'req-replay-1');
+    const first = await scheduler.run(specWithId);
+    expect(first.ok).toBe(true);
+    const replayFrames: VerificationProgress[] = [];
+    const replay = await scheduler.submit(specWithId, (frame) => {
+      replayFrames.push(frame);
+    });
+    expect(replay.runId).toBe(first.runId);
+    expect(replayFrames).toHaveLength(1);
+    expect(replayFrames[0]).toMatchObject({ type: 'completed', reconciled: true, runId: first.runId });
+    expect(records.filter((record) => record.kind === 'verification.started')).toHaveLength(1);
+    expect(records.filter((record) => record.kind === 'verification.completed')).toHaveLength(1);
+    expect(records.filter((record) => record.kind === 'verification.reconciled')).toHaveLength(1);
+    // A completed FAILED run is likewise never rerun under the same id.
+    const failedSpec = headedSpec('job-replay', 'b'.repeat(40), 'node -e "process.exit(9)"');
+    const failed = await scheduler.run({ ...failedSpec, requestId: 'req-replay-2' });
+    expect(failed.ok).toBe(false);
+    const failedReplay = await scheduler.submit({ ...failedSpec, requestId: 'req-replay-2' });
+    expect(failedReplay.runId).toBe(failed.runId);
+    expect(records.filter((record) => record.kind === 'verification.completed')).toHaveLength(2);
+  });
+
+  it('binds an attached duplicate\'s request identity so IT can reconcile the shared outcome', async () => {
+    const { scheduler } = makeScheduler({ maxConcurrent: 2 });
+    scheduler.start();
+    const command = 'node -e "setTimeout(() => process.exit(0), 300)"';
+    const primary = scheduler.submit(headedSpec('job-attach-id', '7'.repeat(40), command));
+    const duplicate = scheduler.submit(
+      headedSpec('job-attach-id', '7'.repeat(40), command, 'req-attach-own'),
+      () => {},
+    );
+    await waitFor(() => scheduler.attemptStatus({ requestId: 'req-attach-own' }).state === 'running');
+    const [firstOutcome, secondOutcome] = await Promise.all([primary, duplicate]);
+    expect(secondOutcome.runId).toBe(firstOutcome.runId);
+    const status = scheduler.attemptStatus({ requestId: 'req-attach-own' });
+    expect(status).toMatchObject({ state: 'completed', runId: firstOutcome.runId, started: true });
+    expect(status.outcome?.outputSha256).toBe(firstOutcome.outputSha256);
+  });
+
+  it('single-flight: a changed head or a fresh request_id is a NEW producer (no permanent suppression)', async () => {
+    const { scheduler, records } = makeScheduler();
+    scheduler.start();
+    const first = await scheduler.run(headedSpec('job-change', 'c'.repeat(40), undefined, 'req-head-a'));
+    const changedHead = await scheduler.run(
+      headedSpec('job-change', 'd'.repeat(40), undefined, 'req-head-a'),
+    ).catch((error: unknown) => error);
+    expect(changedHead).toBeInstanceOf(VerificationRequestConflictError);
+    const newHeadRun = await scheduler.run(
+      headedSpec('job-change', 'd'.repeat(40), undefined, 'req-head-b'),
+    );
+    expect(newHeadRun.runId).not.toBe(first.runId);
+    expect(records.filter((record) => record.kind === 'verification.started')).toHaveLength(2);
+    // A repaired lane mints a NEW request id: it runs, it does not replay.
+    const repaired = await scheduler.run(
+      headedSpec('job-change', 'd'.repeat(40), 'node -e "process.exit(0)"', 'req-repair'),
+    );
+    expect(repaired.ok).toBe(true);
+    expect(records.filter((record) => record.kind === 'verification.started')).toHaveLength(3);
+  });
+
+  it('reconciles accepted/running/completed/dirty states by request identity', async () => {
+    const { scheduler } = makeScheduler({ maxConcurrent: 2 });
+    scheduler.start();
+    expect(scheduler.attemptStatus({ requestId: 'req-unknown' }).state).toBe('unknown');
+    const slow = 'node -e "setTimeout(() => {}, 800)"';
+    const promise = scheduler.submit(headedSpec('job-status', 'e'.repeat(40), slow, 'req-status'));
+    await waitFor(() => scheduler.attemptStatus({ requestId: 'req-status' }).state === 'running');
+    expect(scheduler.attemptStatus({ requestId: 'req-status' })).toMatchObject({
+      state: 'running',
+      jobId: 'job-status',
+      head: 'e'.repeat(40),
+      started: true,
+    });
+    // By job/scope/head lookup, without the request id.
+    expect(
+      scheduler.attemptStatus({ jobId: 'job-status', scope: 'full', head: 'e'.repeat(40) }).state,
+    ).toBe('running');
+    const outcome = await promise;
+    expect(outcome.ok).toBe(true);
+    expect(scheduler.attemptStatus({ requestId: 'req-status' }).state).toBe('completed');
+  });
+
+  it('allows retrying a never-started admission failure under the SAME request_id', async () => {
+    const { scheduler, records } = makeScheduler({ maxConcurrent: 1, lockWaitTimeoutMs: 120 });
+    scheduler.start();
+    const holder = await scheduler.acquire(headedSpec('job-holder-admit', 'f'.repeat(40)));
+    const timedOut = await scheduler
+      .submit(headedSpec('job-admit', 'f'.repeat(40), undefined, 'req-admit'))
+      .catch((error: unknown) => error);
+    expect(timedOut).toBeInstanceOf(VerificationLockTimeoutError);
+    expect(scheduler.attemptStatus({ requestId: 'req-admit' })).toMatchObject({
+      state: 'admission-failed',
+      started: false,
+    });
+    scheduler.release(holder);
+    const retried = await scheduler.submit(headedSpec('job-admit', 'f'.repeat(40), undefined, 'req-admit'));
+    expect(retried.ok).toBe(true);
+    expect(scheduler.attemptStatus({ requestId: 'req-admit' }).state).toBe('completed');
+    const timeouts = records.filter((record) => record.kind === 'verification.lock-timeout');
+    expect(timeouts[0]?.payload['request_id']).toBe('req-admit');
+  });
+
+  it('refuses to mint a producer over a restart orphan holder (typed duplicate)', async () => {
+    const storageDir = join(tempDir(), 'verify');
+    seedPersistedSlot(storageDir, {
+      run_id: 'orphan-run',
+      pid: process.pid, // alive: the runner may still be executing
+      job_id: 'job-orphan',
+      scope: 'full',
+      command: 'node -e "process.exit(0)"',
+      cwd: process.cwd(),
+      head: 'a'.repeat(40),
+      request_ids: ['req-orphan'],
+      granted_at: Date.now(),
+    });
+    const records: VerificationRecord[] = [];
+    const loaded = new VerificationScheduler({
+      storageDir,
+      limits: { maxConcurrent: 1, workerBudget: 4, lockWaitTimeoutMs: 5_000, runTimeoutMs: 20_000 },
+      record: (record) => records.push(record),
+      sweepIntervalMs: 20,
+    });
+    loaded.start();
+    const duplicate = await loaded
+      .submit(headedSpec('job-orphan', 'a'.repeat(40)))
+      .catch((error: unknown) => error);
+    expect(duplicate).toBeInstanceOf(VerificationDuplicateError);
+    expect((duplicate as VerificationDuplicateError).runId).toBe('orphan-run');
+    expect(records.filter((record) => record.kind === 'verification.started')).toHaveLength(0);
+    expect(loaded.attemptStatus({ jobId: 'job-orphan', head: 'a'.repeat(40) })).toMatchObject({
+      state: 'running',
+      runId: 'orphan-run',
+    });
+    // Reconnect by request identity after a restart still names the run.
+    expect(loaded.attemptStatus({ requestId: 'req-orphan' })).toMatchObject({
+      state: 'running',
+      runId: 'orphan-run',
+    });
+    await loaded.dispose();
+  });
+
+  it('persists completed request identities across restart for reconnect reconciliation', async () => {
+    const storageDir = join(tempDir(), 'verify');
+    const make = (): VerificationScheduler =>
+      new VerificationScheduler({
+        storageDir,
+        limits: { maxConcurrent: 1, workerBudget: 4, lockWaitTimeoutMs: 5_000, runTimeoutMs: 20_000 },
+        sweepIntervalMs: 20,
+      });
+    const first = make();
+    first.start();
+    const outcome = await first.run(headedSpec('job-restart', '9'.repeat(40), undefined, 'req-restart'));
+    await first.dispose();
+    const second = make();
+    second.start();
+    const status = second.attemptStatus({ requestId: 'req-restart' });
+    expect(status.state).toBe('completed');
+    expect(status.runId).toBe(outcome.runId);
+    expect(status.outcome?.outputSha256).toBe(outcome.outputSha256);
+    await second.dispose();
+  });
+
+  it('rejects a malformed request_id loud, before any admission', async () => {
+    const { scheduler } = makeScheduler();
+    scheduler.start();
+    await expect(
+      scheduler.submit(headedSpec('job-bad-id', 'a'.repeat(40), undefined, 'bad id!')),
+    ).rejects.toThrow(/request_id/);
+    expect(scheduler.inFlightCount()).toBe(0);
+    expect(scheduler.activeCount()).toBe(0);
   });
 
   it('starts idempotently and keeps the holder file inside the instance storage dir', async () => {

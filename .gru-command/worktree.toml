@@ -272,3 +272,12 @@ perkins-stage1-adapters = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest
 # baseline that passes is called out as a broken fail-before claim. The
 # snapshot directory and ignored pointer file are preserved for inspection.
 perkins-stage1-baseline = 'root="$PWD"; prep=_bmad-output/gate-prep/perkins-reliability-stage1; mkdir -p "$prep"; base=9bb51b05af5d8f0a0cd389788d1d3f19607d5361; headrev=$(git rev-parse HEAD); d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-perkins-reliability-stage1.XXXXXX"); git archive "$base" | tar -x -C "$d" || { echo "baseline archive failed"; exit 3; }; cp test/review-mcp-transport.test.ts test/perkins-whole-review.test.ts test/perkins-builtin-wave.test.ts "$d/test/"; ln -s "$root/node_modules" "$d/node_modules"; printf "perkins-reliability-stage1-baseline base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/perkins-reliability-stage1-baseline.last-snapshot.txt"; ( cd "$d" && node tools/patch-vitest-rpc-timeout.mjs >/dev/null 2>&1; npx vitest run test/review-mcp-transport.test.ts test/perkins-whole-review.test.ts test/perkins-builtin-wave.test.ts -t "count-bounded|crossing the retired|open at the transport wait|join an identical|wait-expired|malformed wait" ); a=$?; echo "baseline pre-change $base + current tests exit=$a EXPECTED-NONZERO"; if [ "$a" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: baseline passed unexpectedly"; fi; exit 1'
+
+# Verification single-flight + exclusive capture (issue #159): the
+# scheduler's single-flight/reconcile/attach admission suites, the capture
+# helper's exclusive-sink/receipt/owner-withdrawal units, the completeness
+# gate in review evidence, the server reconcile surface (heavy: real child
+# runs through /api/verify), the wake prompt naming the shipped helper, and
+# the recomputed suite-shape pins — plain installed Vitest invocations at
+# unchanged budgets, exit codes never masked.
+verification-single-flight = "npx vitest run test/verification-scheduler.test.ts test/verification-capture.test.ts test/verification-evidence.test.ts test/silas-driver.test.ts && npx vitest run --config vitest.heavy.config.ts test/verification-server.test.ts && npx vitest run test/suite-shape.test.ts"

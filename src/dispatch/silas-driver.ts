@@ -593,6 +593,10 @@ export interface SkillModule {
  * below the package root, so one relative path serves dev and built layouts. */
 const SKILLS_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'resources', 'silas-skills');
 
+/** The compiled verification capture helper (issue #159) shipped in `dist/`,
+ * named absolutely in the wake prompt so lanes never hand-roll watchers. */
+export const CAPTURE_HELPER_PATH = join(SKILLS_DIR, '..', '..', 'dist', 'verify', 'capture-cli.js');
+
 export const SILAS_SKILL_NAMES = ['ops-dispatch', 'ledger-closeout'] as const;
 
 /**
@@ -906,6 +910,20 @@ export function buildWakePrompt(input: {
     'A 401 means re-read the token. A 4xx carries a detail message — fix the',
     'request, never retry blind. Pass "by":"silas" so the ledger records the',
     'action as yours.',
+    '',
+    '## Verification capture helper',
+    '',
+    'Every verification submission uses the shipped helper (never a',
+    'hand-rolled background watcher). It opens a unique exclusive sink',
+    'BEFORE the POST, streams every NDJSON frame to EOF, and writes a',
+    'receipt binding run id, head/dirty state, exit/outcome and output',
+    'length/hash. A lost connection is `unknown`, reconciled by request',
+    'identity — never replayed blind:',
+    '',
+    `  node ${CAPTURE_HELPER_PATH} run --job <job> --scope <scope> \\`,
+    `    --sink <data-dir>/captures/<job>-<scope>-<head>.ndjson \\`,
+    `    --request-id <stable-id> --url ${input.ops.baseUrl} \\`,
+    `    --config ${input.ops.configPath}`,
     '',
     '## Operating skills',
     '',
