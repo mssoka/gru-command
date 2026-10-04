@@ -3,6 +3,7 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { mkdtempSync } from 'node:fs';
+import { markFixtureStep } from './harness-diagnostics.mjs';
 
 /**
  * Local fixture git repo for worktree/dispatch tests (EPICS E8 story 4).
@@ -28,6 +29,7 @@ export function attachBareOrigin(repo: FixtureRepo): string {
   const origin = join(dirname(repo.path), `${basename(repo.path)}-origin.git`);
   execFileSync('git', ['init', '--bare', '--quiet', origin], { stdio: 'ignore' });
   repo.git(['remote', 'add', 'origin', origin]);
+  markFixtureStep('fixture bare origin attached');
   return origin;
 }
 
@@ -66,6 +68,7 @@ export function makeFixtureRepo(
   git([...GIT_IDENTITY, 'add', '.']);
   git([...GIT_IDENTITY, 'commit', '-m', 'fixture: initial state']);
   onStep?.('initial-commit');
+  markFixtureStep(`fixture repo initialized: ${name}`);
 
   const repo: FixtureRepo = {
     path,
@@ -76,7 +79,9 @@ export function makeFixtureRepo(
       writeFileSync(file, content);
       git([...GIT_IDENTITY, 'add', rel]);
       git([...GIT_IDENTITY, 'commit', '-m', message ?? `fixture: update ${rel}`]);
-      return git(['rev-parse', 'HEAD']);
+      const sha = git(['rev-parse', 'HEAD']);
+      markFixtureStep(`fixture commit: ${rel}`);
+      return sha;
     },
     head(): string {
       return git(['rev-parse', 'HEAD']);

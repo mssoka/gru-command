@@ -2026,7 +2026,7 @@ describe('provider pacing: workflow rate-limit retry and cleanup', () => {
     expect(gate.view().review).toMatchObject({ running: 0, queued: [] });
   });
 
-  it('shares one turn budget across retries: an elapsed retry never invokes the model (r4 verification#1)', async () => {
+  it('specialist retries are count-bounded, never stopped by elapsed wall clock (j-1065)', async () => {
     let clock = 1_000_000_000;
     let firstChild: string | null = null;
     const promptsByChild = new Map<string, number>();
@@ -2037,11 +2037,10 @@ describe('provider pacing: workflow rate-limit retry and cleanup', () => {
           if (firstChild === null) firstChild = call.agentId;
           promptsByChild.set(call.agentId, (promptsByChild.get(call.agentId) ?? 0) + 1);
           if (call.agentId === firstChild) {
-            // Consume 400000 ms of the 600000 ms (10-minute) child turn
-            // budget on each model call and stay in the rate-limit class so
-            // the bounded retry runs: after call 1 the retry still has room,
-            // after call 2 the elapsed third iteration is stopped BEFORE the
-            // model runs.
+            // Each model call burns 400000 ms of wall clock and stays in the
+            // rate-limit class. The retired 600000 ms turn budget would have
+            // stopped the third call; the retry policy's COUNT bound (1 + 3)
+            // must be what governs now.
             clock += 400_000;
             throw new Error('429 too many requests');
           }
@@ -2061,13 +2060,42 @@ describe('provider pacing: workflow rate-limit retry and cleanup', () => {
     );
     const result = await h.run();
     expect(result.canonicalVerdict).toBe('READY TO MERGE');
-    // First attempt: exactly TWO model invocations — the shared budget guard
-    // stopped the third BEFORE the model ran. The lead's attempt-2 child
-    // then succeeds (one more invocation), so the round still completes.
+    // First attempt: exactly FOUR model invocations (initial + three bounded
+    // retries). Elapsed clock never stops a retry — the attempt fails on the
+    // retry-count bound with the provider error, not a fabricated timeout.
     const firstChildId = [...promptsByChild.keys()][0]!;
-    expect(promptsByChild.get(firstChildId)).toBe(2);
-    expect([...promptsByChild.values()].reduce((sum, count) => sum + count, 0)).toBe(3);
+    expect(promptsByChild.get(firstChildId)).toBe(4);
+    expect([...promptsByChild.values()].reduce((sum, count) => sum + count, 0)).toBe(5);
     const envelope = result.lensEnvelopes.find((entry) => entry.lens === 'blind' && entry.attempt === 1);
-    expect(envelope?.failureKind).toBe('timeout');
+    expect(envelope?.failureKind).toBe('error');
+    expect(envelope?.error).toContain('429');
+  });
+
+  it('a healthy specialist crossing the retired 600000 ms deadline completes valid and exactly once (j-1065 acceptance 1)', async () => {
+    const h = wholeHarness({
+      specialists: ['blind'],
+      // The child turn settles at 700 s of DETERMINISTIC fake time — past the
+      // retired 10-minute lifetime — with a perfectly ordinary empty result.
+      childAnswer: () => new Promise<string>((resolve) => {
+        setTimeout(() => resolve('[]'), 700_000);
+      }),
+    });
+    vi.useFakeTimers();
+    try {
+      const run = h.run();
+      await vi.advanceTimersByTimeAsync(1_500_000);
+      const result = await run;
+      expect(result.canonicalVerdict).toBe('READY TO MERGE');
+      const envelopes = result.lensEnvelopes.filter((entry) => entry.lens === 'blind');
+      // Exactly one attempt, valid, no timeout classification: the run was
+      // neither killed at 600 s nor duplicated into a retry.
+      expect(envelopes).toHaveLength(1);
+      expect(envelopes[0]).toMatchObject({ lens: 'blind', attempt: 1, status: 'valid' });
+      expect(envelopes[0]?.failureKind).toBeUndefined();
+      expect(h.childCalls).toHaveLength(1);
+      expect(h.childCalls[0]?.disposed).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

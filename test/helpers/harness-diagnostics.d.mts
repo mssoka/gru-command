@@ -1,0 +1,121 @@
+/**
+ * Type surface of test/helpers/harness-diagnostics.mjs for TS consumers
+ * (NodeNext resolution pairs the .mjs with this adjacent .d.mts).
+ */
+import type { ChildProcess } from 'node:child_process';
+
+export interface FixtureStep {
+  readonly label: string;
+  readonly completedAt: number;
+}
+
+export interface TrackedProcess {
+  readonly child: ChildProcess;
+  readonly pid: number | null;
+  readonly label: string;
+  readonly startedAt: number;
+  exitedAt: number | null;
+  exitCode: number | null;
+  signal: NodeJS.Signals | null;
+  spawnError: string | null;
+  output: { stdout: string; stderr: string };
+  outputTruncated: { stdout: boolean; stderr: boolean };
+  openCredential: { stdout: boolean; stderr: boolean };
+}
+
+export interface DiagnosticsScope {
+  readonly file: string;
+  readonly name: string;
+  readonly startedAt: number;
+  readonly clock: () => number;
+  readonly steps: FixtureStep[];
+  readonly processes: TrackedProcess[];
+  readonly parent: DiagnosticsScope | null;
+}
+
+export declare class FixtureStepTimeoutError extends Error {
+  readonly stepLabel: string;
+  readonly deadlineMs: number;
+  diagnostics: string;
+}
+
+export declare class OwnedCommandTimeoutError extends Error {
+  constructor(label: string, deadlineMs: number);
+  readonly label: string;
+  readonly deadlineMs: number;
+  stdout: string;
+  stderr: string;
+}
+
+export declare function createTestScope(input: {
+  file: string;
+  name: string;
+  now?: () => number;
+  parent?: DiagnosticsScope | null;
+}): DiagnosticsScope;
+
+/** Returns the displaced scope (if one was active). */
+export declare function activateTestScope(scope: DiagnosticsScope): DiagnosticsScope | null;
+export declare function currentTestScope(): DiagnosticsScope | null;
+export declare function deactivateTestScope(scope: DiagnosticsScope): void;
+
+export declare function markFixtureStep(label: string, scope?: DiagnosticsScope | null): void;
+
+export declare function trackChildProcess(
+  child: ChildProcess,
+  options?: { label?: string; captureOutput?: boolean; scope?: DiagnosticsScope | null },
+): TrackedProcess | null;
+
+export declare function redactDiagnosticText(text: string): string;
+export declare function isTimeoutError(error: unknown): boolean;
+
+export declare function renderFailureDiagnostics(
+  scope: DiagnosticsScope | null,
+  error: unknown,
+  options?: { timedOut?: boolean },
+): string;
+
+export interface TeardownResult {
+  readonly label: string;
+  readonly pid: number | null;
+  readonly disposition: string;
+}
+
+export declare function disposeScopeProcesses(
+  scope: DiagnosticsScope | null,
+  options?: { graceMs?: number; killGraceMs?: number; totalMs?: number },
+): Promise<TeardownResult[]>;
+
+/** One "UNREAPED" line per owned child that survived the bounded teardown. */
+export declare function renderTeardownReport(
+  scope: DiagnosticsScope | null,
+  results: readonly TeardownResult[],
+): string[];
+
+export declare function runBoundedFixtureStep<T>(
+  label: string,
+  fn: () => T | Promise<T>,
+  options?: { deadlineMs?: number; scope?: DiagnosticsScope | null },
+): Promise<T>;
+
+export declare function runOwnedCommand(
+  command: string,
+  args: readonly string[],
+  options?: {
+    label?: string;
+    cwd?: string;
+    env?: NodeJS.ProcessEnv;
+    input?: string;
+    deadlineMs?: number;
+    scope?: DiagnosticsScope | null;
+    killGraceMs?: number;
+  },
+): Promise<{
+  status: number | null;
+  signal: NodeJS.Signals | null;
+  stdout: string;
+  stderr: string;
+  outputTruncated: boolean;
+  spawnError: string | null;
+  tracked: TrackedProcess | null;
+}>;

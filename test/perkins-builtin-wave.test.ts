@@ -47,7 +47,7 @@ import type { AgentHandle } from '../src/runtime/types.js';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
-import { lensAgentLabel } from '../src/dispatch/perkins.js';
+import { FALLBACK_REVIEW_TIMEOUT_MS, lensAgentLabel } from '../src/dispatch/perkins.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 import { fakeWholeSpawner, type WholeLeadOptions } from './helpers/perkins-whole-double.js';
 import { GitReviewPort } from './helpers/git-review-port.js';
@@ -2579,6 +2579,9 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
     /** Make the fallback turn reject after writing its report (a transport
      * rejection whose automatic retry may still recover the delivery). */
     failPrompt?: boolean;
+    /** Hold every fallback minion turn open until the test releases it, so a
+     * transport wait slice can expire while the review is genuinely live. */
+    promptHold?: { readonly release: Promise<void> };
   }): Promise<{
     wave: WaveRunner;
     job: { readonly id: string };
@@ -2592,6 +2595,7 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
     prompts: string[];
     spawnCwds: string[];
     escalations: string[];
+    disposed: string[];
   }> {
     const repo = makeFixtureRepo('perkins-prod-gate');
     repos.push(repo);
@@ -2614,6 +2618,7 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
     const prompts: string[] = [];
     const spawnCwds: string[] = [];
     const escalations: string[] = [];
+    const disposed: string[] = [];
     const spawner: AgentSpawner = async (role, spawnOptions = {}) => {
       spawnCwds.push(spawnOptions.cwd ?? '');
       const file = join(sessions, `prod-${spawnCwds.length}.jsonl`);
@@ -2631,13 +2636,14 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
           if (reportMatch !== null) {
             writeFileSync(reportMatch[1]!, JSON.stringify(options.findingToWrite), 'utf8');
           }
+          if (options.promptHold !== undefined) await options.promptHold.release;
           if (options.failPrompt === true) throw new Error('429 too many requests');
         },
         async steer() {},
         async followUp() {},
         subscribe() { return () => {}; },
         health() { return { state: 'idle', lastActivity: null, sessionFile: file }; },
-        async dispose() {},
+        async dispose() { disposed.push(`prod-minion-${spawnCwds.length}`); },
       };
     };
     const wave = new WaveRunner({
@@ -2658,7 +2664,7 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
       },
       escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
     });
-    return { wave, job, ledger, port, root, artifacts, sessions, repo, skillPath, prompts, spawnCwds, escalations };
+    return { wave, job, ledger, port, root, artifacts, sessions, repo, skillPath, prompts, spawnCwds, escalations, disposed };
   }
 
   it('spawns a minion with the skill prompt, parses findings, and reports clear-to-merge on clean', async () => {
@@ -2679,6 +2685,38 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
         .reverse();
       expect(phases).toEqual(['started', 'triaged', 'pass']);
     } finally {
+      rmSync(h.root, { recursive: true, force: true });
+      rmSync(h.artifacts, { recursive: true, force: true });
+      rmSync(h.sessions, { recursive: true, force: true });
+    }
+  });
+
+  it('a fallback review turn open at the transport wait is reported still-running, kept alive and reattached (j-1065 acceptance 2)', async () => {
+    let release!: () => void;
+    const hold = { release: new Promise<void>((resolve) => { release = resolve; }) };
+    const h = await makeProductionGateHarness({ findingToWrite: [], promptHold: hold });
+    vi.useFakeTimers();
+    try {
+      const running = h.wave.runRound({ jobId: h.job.id });
+      await vi.advanceTimersByTimeAsync(FALLBACK_REVIEW_TIMEOUT_MS + 1);
+      // The wait slice expired while the review turn was genuinely live: a
+      // durable still-running report exists and the minion was NOT disposed.
+      const phases = h.ledger.listEvents({ limit: 100 })
+        .filter((event) => event.kind === 'job.fallback-review')
+        .map((event) => (event.payload as { phase?: string }).phase)
+        .reverse();
+      expect(phases).toContain('still-running');
+      expect(h.disposed).toEqual([]);
+      expect(h.prompts).toHaveLength(1);
+      release();
+      const outcome = await running;
+      if (!('route' in outcome)) throw new Error('expected fallback route');
+      expect(outcome.clearToMerge).toBe(true);
+      // The SAME session delivered the review; it was disposed only after.
+      expect(h.prompts).toHaveLength(1);
+      expect(h.disposed).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
       rmSync(h.root, { recursive: true, force: true });
       rmSync(h.artifacts, { recursive: true, force: true });
       rmSync(h.sessions, { recursive: true, force: true });
@@ -2863,8 +2901,8 @@ describe('fallback diff includes untracked files (V3 revert-mutation pin)', () =
   });
 });
 
-describe('fallback review timeout constant is exported and positive (V4 pin)', () => {
-  it('pins the 15-minute wall-clock bound', async () => {
+describe('fallback review wait constant is the still-running report slice (V4 pin)', () => {
+  it('pins the 15-minute transport wait slice', async () => {
     const { FALLBACK_REVIEW_TIMEOUT_MS } = await import('../src/dispatch/perkins.js');
     expect(FALLBACK_REVIEW_TIMEOUT_MS).toBe(15 * 60 * 1_000);
     expect(FALLBACK_REVIEW_TIMEOUT_MS).toBeGreaterThan(0);
