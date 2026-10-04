@@ -151,6 +151,9 @@ function scriptedReply(socket: WebSocket, userText: string, attachments?: readon
     if (chunk === undefined) {
       if (holdNextTurn) {
         holdNextTurn = false;
+        // Stop polling exhausted tokens while held: otherwise the next
+        // interval tick falls through to finish() without a release.
+        clearInterval(timer);
         releaseHeldTurn = finish;
         return;
       }

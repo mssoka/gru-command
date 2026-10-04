@@ -911,6 +911,14 @@ test.describe('chat pane reflow (owner heist)', () => {
       `reflow-all ${LONG_TOKEN}\n\n\`\`\`\n${LONG_CODE}\n\`\`\`\n\n${LONG_TABLE}\n\ntail after table`,
       'reflow-all',
     );
+    // Service machinery is intentionally collapsed after the reply; open
+    // its band so the long tool name participates in the reflow checks.
+    const toolBand = page.locator('.service-band', {
+      has: page.locator('.tool-line', { hasText: 'mcp__' }),
+    });
+    await expect(toolBand).toHaveCount(1);
+    await toolBand.locator('.service-band__head').click();
+    await expect(toolBand.locator('.service-band__head')).toHaveAttribute('aria-expanded', 'true');
     await expect(page.locator('.tool-line', { hasText: 'mcp__' })).toBeVisible();
     await expect(page.locator('.tool-line', { hasText: 'failed:' })).toBeVisible();
   }
