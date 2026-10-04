@@ -648,6 +648,12 @@ export const MIGRATIONS: readonly Migration[] = [
     // branch-local next-contiguous number for an UNSHIPPED feature; if
     // owner-merged main lands first, re-number ONLY this never-applied
     // migration (never a hole).
+    //
+    // PRECONDITION (review round 2): this migration id was edited while
+    // the feature was still unmerged/unshipped. It must never be applied
+    // by an intermediate commit of this branch on a persisted ledger. No
+    // release build carried it; if that precondition is ever broken,
+    // ship an additive follow-up migration instead of editing this id.
     id: 15,
     name: 'child-workers',
     // The worktrees table is rebuilt to widen its kind CHECK; the runner
@@ -684,11 +690,6 @@ export const MIGRATIONS: readonly Migration[] = [
       ALTER TABLE agents ADD COLUMN parent_agent_id TEXT REFERENCES agents(id);
       ALTER TABLE agents ADD COLUMN parentage TEXT CHECK (parentage IN ('top-level','child'));
       CREATE INDEX idx_agents_parent ON agents(parent_agent_id);
-      -- Scoped parent capability (issue #161): the hash of the token a
-      -- top-level minion presents to commission/read/cancel ITS OWN
-      -- children. The operator pairing token remains a superset authority;
-      -- this one is bound to exactly one parent agent.
-      ALTER TABLE agents ADD COLUMN child_request_token_hash TEXT;
 
       CREATE TABLE child_workers (
         id              TEXT PRIMARY KEY,

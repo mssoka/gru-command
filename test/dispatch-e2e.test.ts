@@ -116,7 +116,9 @@ function makeDispatchHarness(opts: {
       engine.onRuntimeEvent({ agentId: handle.id, role, sessionFile: handle.sessionFile, phase: 'spawned' });
       return handle;
     }
-    const id = `agent-${++n}`;
+    // Issue #161: product-owned parent ids are honored (production
+    // adapters bind the handle id to SpawnOptions.agentId).
+    const id = options?.agentId ?? `agent-${++n}`;
     const cwd = options?.cwd ?? '';
     const handle = makeHandle(
       id,
@@ -139,11 +141,16 @@ function makeDispatchHarness(opts: {
     ledger,
     worktrees,
     spawner,
-    // Issue #161: every dispatched parent gets a scoped child-request
-    // capability file named in its briefing.
-    parentCredentials: {
-      issueParentCredential: (agentId) => ({ tokenFile: join(reviewSessions, `${agentId}.token`) }),
-    },
+    // Issue #161: every dispatched parent gets the GC-mediated child
+    // tools bound to its product-owned identity by closure.
+    parentTools: (agentId) => [
+      {
+        name: 'request_child_worker',
+        description: 'commission one tracked child',
+        inputSchema: { type: 'object', properties: {} },
+        execute: async () => ({ text: JSON.stringify({ child_id: `child-of-${agentId}`, state: 'queued' }) }),
+      },
+    ],
   });
   const poster = { post: vi.fn(async (input: { readonly targetSha: string; readonly body: string }) => ({ reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: input.targetSha, headSha: input.targetSha, baseSha: 'e2e-delivered-base', bodySha256: createHash('sha256').update(input.body, 'utf8').digest('hex') })) };
   const wave = new WaveRunner({
@@ -206,12 +213,19 @@ describe('end-to-end dispatch (E8 story 4)', () => {
     expect(minion?.prompts[0]?.text).toContain('Dispatch briefing — job widget-polish');
     expect(minion?.prompts[0]?.text).toContain('Acceptance: tests pass.');
     expect(minion?.prompts[0]?.text).toContain(outcome.worktree.branch!);
-    // Issue #161: the parent learns its own identity and the scoped
-    // capability file — never the operator token.
+    // Issue #161: the parent learns its own identity and the GC-mediated
+    // child tools — never the operator token.
     expect(minion?.prompts[0]?.text).toContain(`Your agent id: ${minion!.id}`);
-    expect(minion?.prompts[0]?.text).toContain('POST /api/dispatch/child');
-    expect(minion?.prompts[0]?.text).toContain(`${minion!.id}.token`);
-    expect(minion?.prompts[0]?.text).not.toContain('pairing token value');
+    expect(minion?.prompts[0]?.text).toContain('request_child_worker');
+    expect(minion?.prompts[0]?.text).toContain('list_child_workers');
+    expect(minion?.prompts[0]?.text).not.toContain('pairing token');
+    // The spawned session actually carries the tools bound to THAT id.
+    const nativeTools = minionSpawn?.options.nativeTools ?? [];
+    expect(nativeTools.map((tool) => tool.name)).toEqual(['request_child_worker']);
+    expect(minionSpawn?.options.agentId).toBe(minion!.id);
+    expect(JSON.parse((await nativeTools[0]!.execute({})).text)).toMatchObject({
+      child_id: `child-of-${minion!.id}`,
+    });
     // The production registration path declares the parent TOP-LEVEL (a
     // legacy/unknown row would render the wrong parentage).
     expect(h.ledger.getAgent(minion!.id)?.parentage).toBe('top-level');

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { createServer } from 'node:http';
@@ -128,11 +128,31 @@ interface Harness {
   close(): void;
 }
 
+function appendToolResult(path: string): void {
+  appendFileSync(
+    path,
+    `${JSON.stringify({
+      type: 'message',
+      id: `t-${Date.now()}`,
+      parentId: null,
+      timestamp: '2026-01-01T00:00:02.000Z',
+      message: { role: 'toolResult', content: 'tool output', toolName: 'bash', timestamp: Date.now() },
+    })}\n`,
+    'utf-8',
+  );
+}
+
 function makeHarness(
   opts: {
     workerGate?: PacingGate;
-    residentProbe?: () => { readonly available: number; readonly idleMinionIds: readonly string[] };
+    residentProbe?: () => { readonly available: number; readonly reclaimable: number };
     retrySettlement?: (agentId: string) => Promise<'none' | 'recovered' | 'exhausted' | 'superseded'>;
+    /** dispose() rejects and health stays non-disposed (unproven stop). */
+    failDispose?: boolean;
+    /** The turn writes an interim message followed by a tool result. */
+    interimOnly?: boolean;
+    /** The session file path never exists (unreadable baseline). */
+    unreadableSession?: boolean;
   } = {},
 ): Harness {
   const repo = makeFixtureRepo('fixture-child');
@@ -159,6 +179,7 @@ function makeHarness(
   const handles: FakeHandle[] = [];
   let n = 0;
   let turnGate: Promise<void> | null = null;
+  const failDispose = opts.failDispose === true;
   let releaseGate: (() => void) | null = null;
   let spawnGate: Promise<void> | null = null;
 
@@ -208,7 +229,6 @@ function makeHarness(
   harness.service = new ChildWorkerService({
     ledger,
     worktrees,
-    credentialsDir: join(dir, 'child-credentials'),
     ...(opts.workerGate !== undefined ? { workerGate: opts.workerGate } : {}),
     ...(opts.residentProbe !== undefined ? { residentProbe: opts.residentProbe } : {}),
     ...(opts.retrySettlement !== undefined ? { retrySettlement: opts.retrySettlement } : {}),
@@ -219,11 +239,18 @@ function makeHarness(
       if (options.signal?.aborted) throw new Error('resident admission cancelled before spawn');
       // Issue #161: the product-owned identity is bound BEFORE the session.
       const id = options.agentId ?? `agent-${++n}`;
-      const sessionFile = join(sessionDir, `${id}.jsonl`);
-      writeSession(sessionFile, []);
+      const sessionFile = opts.unreadableSession === true
+        ? join(sessionDir, `${id}-missing.jsonl`)
+        : join(sessionDir, `${id}.jsonl`);
+      if (opts.unreadableSession !== true) writeSession(sessionFile, []);
       const prompts: string[] = [];
       let state: AgentState = 'idle';
       const writeReport = (): void => {
+        if (opts.interimOnly === true) {
+          appendAssistant(sessionFile, 'interim planning note — still working');
+          appendToolResult(sessionFile);
+          return;
+        }
         if (harness.reportText !== null) appendAssistant(sessionFile, harness.reportText);
       };
       const handle: FakeHandle = {
@@ -258,11 +285,12 @@ function makeHarness(
           return { state, lastActivity: new Date().toISOString(), sessionFile };
         },
         async dispose() {
-          state = 'disposed';
-          handle.disposed = true;
           // A real adapter settles the open turn on disposal; the fake
           // releases its gate so the run can observe the cancellation.
           releaseGate?.();
+          if (failDispose) throw new Error('dispose rejected (unproven cessation)');
+          state = 'disposed';
+          handle.disposed = true;
         },
       };
       handles.push(handle);
@@ -502,7 +530,7 @@ describe('tracked child workers: admission (issue #161)', () => {
   });
 
   it('refuses admission with a named budget precondition when resident capacity is exhausted and unreclaimable', () => {
-    const h = makeHarness({ residentProbe: () => ({ available: 0, idleMinionIds: [] }) });
+    const h = makeHarness({ residentProbe: () => ({ available: 0, reclaimable: 0 }) });
     const refusalOf = (): ChildWorkerRefusal => {
       try {
         h.request();
@@ -619,23 +647,110 @@ describe('tracked child workers: lifecycle, results and recovery', () => {
     h.close();
   });
 
-  it('supervision restarts a child in its own lane with bounded tools, or refuses once terminal', async () => {
+  it('does not publish an interim message as the final report', async () => {
+    const h = makeHarness({ interimOnly: true });
+    const admission = h.request();
+    await waitForChild(h, admission.record.id, (state) => state === 'error');
+    const record = h.ledger.getChildWorker(admission.record.id)!;
+    expect(record.resultState).toBe('error');
+    expect(record.resultSummary).toContain('no final report');
+    expect(record.resultSummary).not.toContain('interim planning note');
+    h.close();
+  });
+
+  it('refuses to anchor a report when the transcript baseline is unreadable', async () => {
+    const h = makeHarness({ unreadableSession: true });
+    const admission = h.request();
+    await waitForChild(h, admission.record.id, (state) => state === 'error');
+    const record = h.ledger.getChildWorker(admission.record.id)!;
+    expect(record.resultSummary).toContain('baseline is unreadable');
+    expect(h.spawns).toHaveLength(1);
+    h.close();
+  });
+
+  it('refuses supervision restart for a tracked child (single-run logical worker)', async () => {
     const h = makeHarness();
     h.setTurnGate();
     const admission = h.request();
     await waitForChild(h, admission.record.id, (state) => state === 'active');
     const policy = h.service.restartPolicy(admission.record.id, 'minion');
     expect(policy).toBeDefined();
-    expect(policy !== undefined && 'options' in policy).toBe(true);
-    const options = (policy as { options: import('../src/runtime/types.js').SpawnOptions }).options;
-    expect(options.cwd).toBe(h.worktrees.getWorktree(admission.record.id)!.path);
-    expect(options.roleTools).toEqual(READ_ONLY_CHILD_TOOLS);
-    expect(options.agentId).toBe(admission.record.id);
+    expect(policy !== undefined && 'refuse' in policy).toBe(true);
+    expect((policy as { refuse: string }).refuse).toContain('single-run');
+    // The refusal terminalizes honestly (no fabricated done) and sweeps the
+    // read-only lane (the session cannot safely be replaced).
+    await waitFor(() => h.ledger.getChildWorker(admission.record.id)?.resultState === 'error', 'the refusal result');
+    expect(h.ledger.getChildWorker(admission.record.id)!.resultSummary).toContain('restart refused');
     // A non-child agent is not specialized (undefined = default restart).
     expect(h.service.restartPolicy('parent-1', 'minion')).toBeUndefined();
-    await h.service.cancel(admission.record.id, 'restart-policy test done');
-    const after = h.service.restartPolicy(admission.record.id, 'minion');
-    expect(after !== undefined && 'refuse' in after).toBe(true);
+    h.close();
+  });
+
+  it('records an unproven stop as non-terminal debt instead of a false terminal', async () => {
+    const h = makeHarness({ failDispose: true });
+    h.setTurnGate();
+    const admission = h.request();
+    await waitForChild(h, admission.record.id, (state) => state === 'active');
+    // A cancel whose disposal cannot prove cessation must NOT terminalize.
+    const afterCancel = await h.service.cancel(admission.record.id, 'owner stop with rejected dispose');
+    expect(afterCancel.resultState).toBeNull();
+    expect(afterCancel.state).not.toBe('cancelled');
+    expect(h.ledger.latestEventOfKind('child.stop-unproven')).not.toBeNull();
+    h.close();
+  });
+
+  it('serves the parent through GC-mediated tools bound to its identity', async () => {
+    const h = makeHarness();
+    const tools = h.service.parentTools('parent-1');
+    expect(tools.map((tool) => tool.name)).toEqual([
+      'request_child_worker',
+      'list_child_workers',
+      'cancel_child_worker',
+    ]);
+    const requestTool = tools.find((tool) => tool.name === 'request_child_worker')!;
+    const created = JSON.parse(
+      (await requestTool.execute({
+        purpose: 'tool-driven admission',
+        authority: 'read-only',
+        task: 'audit via the tool',
+        idempotency_key: 'k-tool',
+      })).text,
+    ) as { child_id: string; state: string };
+    expect(created.state).toBe('queued');
+    // The SAME call replays (idempotent) rather than admitting a second child.
+    const replay = JSON.parse(
+      (await requestTool.execute({
+        purpose: 'tool-driven admission',
+        authority: 'read-only',
+        task: 'audit via the tool',
+        idempotency_key: 'k-tool',
+      })).text,
+    ) as { child_id: string; idempotent: boolean };
+    expect(replay.child_id).toBe(created.child_id);
+    expect(replay.idempotent).toBe(true);
+    await waitForChild(h, created.child_id, (state) => state === 'done');
+    const listTool = tools.find((tool) => tool.name === 'list_child_workers')!;
+    const listed = JSON.parse((await listTool.execute({})).text) as {
+      children: { child_id: string; result_state: string | null; result_summary: string | null }[];
+    };
+    expect(listed.children).toHaveLength(1);
+    expect(listed.children[0]!.result_state).toBe('done');
+    expect(listed.children[0]!.result_summary).toContain('child report');
+    // ANOTHER parent's tools cannot cancel this child.
+    h.ledger.registerAgent({ id: 'parent-2', role: 'minion', jobId: 'job-1', parentage: 'top-level' });
+    const foreignCancel = h.service
+      .parentTools('parent-2')
+      .find((tool) => tool.name === 'cancel_child_worker')!;
+    const denied = JSON.parse((await foreignCancel.execute({ child_id: created.child_id })).text) as {
+      error: string;
+    };
+    expect(denied.error).toBe('unknown_parent');
+    // The owning parent still sees the terminal (immutable) result.
+    const ownCancel = tools.find((tool) => tool.name === 'cancel_child_worker')!;
+    const cancelled = JSON.parse((await ownCancel.execute({ child_id: created.child_id })).text) as {
+      result_state: string;
+    };
+    expect(cancelled.result_state).toBe('done');
     h.close();
   });
 
@@ -905,30 +1020,9 @@ describe('tracked child workers: board and API surfaces', () => {
     expect(malformed.status).toBe(400);
     expect(malformed.json!['error']).toBe('invalid_request');
 
-    // Issue #161 scoped capability: a parent-bound token alone (no operator
-    // token) drives exactly that parent's request/read/cancel surface, and
-    // never another parent's.
-    h.ledger.registerAgent({ id: 'parent-2', role: 'minion', jobId: 'job-1', parentage: 'top-level' });
-    const capability = h.service.issueParentCredential('parent-1');
-    const otherCapability = h.service.issueParentCredential('parent-2');
-    const token1 = readFileSync(capability.tokenFile, 'utf-8').trim();
-    const token2 = readFileSync(otherCapability.tokenFile, 'utf-8').trim();
-    expect(token1).not.toBe(token2);
-    const scopedBody = { ...body, idempotency_key: 'k-http-scoped' };
-    const scoped = await call('/api/dispatch/child', scopedBody, token1);
-    expect(scoped.status).toBe(202);
-    const scopedId = (scoped.json!['child'] as Record<string, unknown>)['id'] as string;
-    // Cross-parent denial: parent-2's capability cannot act as parent-1.
-    const crossPost = await call('/api/dispatch/child', { ...body, idempotency_key: 'k-http-cross' }, token2);
-    expect(crossPost.status).toBe(401);
-    expect((await call(`/api/dispatch/children/${scopedId}`, undefined, token2)).status).toBe(401);
-    expect((await call(`/api/dispatch/children/${scopedId}`, undefined, token1)).status).toBe(200);
-    expect((await call('/api/dispatch/agents/parent-2/children', undefined, token1)).status).toBe(401);
-    expect((await call('/api/dispatch/jobs/job-1/children', undefined, token1)).status).toBe(401);
-    const scopedCancel = await call(`/api/dispatch/children/${scopedId}/cancel`, { reason: 'parent stop' }, token1);
-    expect(scopedCancel.status).toBe(200);
-    expect((scopedCancel.json!['child'] as Record<string, unknown>)['result_state']).not.toBeNull();
-
+    // Issue #161: the minion-facing path is GC-mediated — the HTTP surface
+    // is the operator pairing token only, and parent sessions get the
+    // in-process tools instead (asserted separately below).
     const cancel = await call(`/api/dispatch/children/${childId}/cancel`, { reason: 'operator stop' });
     expect(cancel.status).toBe(200);
     expect((cancel.json!['child'] as Record<string, unknown>)['result_state']).toBe('done'); // terminal is immutable

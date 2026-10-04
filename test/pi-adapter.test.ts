@@ -1244,6 +1244,28 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     } finally {
       await handle.dispose();
     }
+
+    // Issue #161: a product-owned child id is NOT session-identity drift.
+    // The native session id is compared, so an unchanged compaction on a
+    // child handle settles instead of disposing the session.
+    const childFx = await fixture([{ deltas: ['child answer'] }, { deltas: ['## Goal\nchild summary'] }]);
+    writeFileSync(
+      join(childFx.agentDir, 'settings.json'),
+      `${JSON.stringify({ compaction: { keepRecentTokens: 1, reserveTokens: 100 } })}\n`,
+      'utf-8',
+    );
+    const child = await childFx.runtime.spawn('minion', { agentId: 'child-compact-id' });
+    try {
+      expect(child.id).toBe('child-compact-id');
+      await child.prompt('child turn');
+      const childFile = child.sessionFile;
+      await child.compact?.();
+      expect(child.id).toBe('child-compact-id');
+      expect(child.sessionFile).toBe(childFile);
+      expect(child.health().state).not.toBe('disposed');
+    } finally {
+      await child.dispose();
+    }
   });
 
   it('resolves native compaction terminal failure when dispose races compact', async () => {

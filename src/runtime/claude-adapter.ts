@@ -424,11 +424,14 @@ export class ClaudeCodeRuntime implements AgentRuntime {
       if (reviewConfiguration !== undefined) {
         reviewSettings = privateClaudeReviewSettings(reviewConfiguration.settings);
       }
-      // ANY isolated-review session that declares native tools gets its own
-      // scoped bridge exposing exactly the declared set — leads and lens
-      // children ride the same seam (SPEC ruling 4: no harness split).
-      if (reviewMode !== undefined && reviewMode.nativeTools !== undefined) {
-        reviewBridge = await ReviewMcpBridge.start(reviewMode.nativeTools);
+      // ANY session that declares native tools gets its own scoped bridge
+      // exposing exactly the declared set — review leads/lens children AND
+      // (issue #161) ordinary parent sessions ride the same seam (SPEC
+      // ruling 4: no harness split).
+      const declaredNativeTools =
+        reviewMode !== undefined ? reviewMode.nativeTools : options.nativeTools;
+      if (declaredNativeTools !== undefined && declaredNativeTools.length > 0) {
+        reviewBridge = await ReviewMcpBridge.start(declaredNativeTools);
       }
       const nativeTools = reviewBridge?.toolNames.map((name) => `mcp__gru_perkins__${name}`) ?? [];
       const tools = [...fileTools, ...nativeTools];

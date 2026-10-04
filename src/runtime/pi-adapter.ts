@@ -84,8 +84,10 @@ function confinedReviewTools(cwd: string, requested: readonly IsolatedToolName[]
 function nativeReviewTools(definitions: readonly NativeAgentTool[]): ToolDefinition[] {
   const names = new Set<string>();
   return definitions.map((definition) => {
-    if (!/^perkins_[a-z0-9_]{1,48}$/.test(definition.name) || names.has(definition.name)) {
-      throw new Error(`invalid or duplicate native review tool name: ${definition.name}`);
+    // Product-native tool names (review leads and, since issue #161,
+    // non-review parent sessions): a lowercase snake-ish identifier.
+    if (!/^[a-z][a-z0-9_]{1,63}$/.test(definition.name) || names.has(definition.name)) {
+      throw new Error(`invalid or duplicate native tool name: ${definition.name}`);
     }
     names.add(definition.name);
     return {
@@ -662,7 +664,13 @@ export class PiRuntime implements AgentRuntime {
       // Declared native tools ride the SAME helper for leads and lens
       // children: the ADAPTER translates the declaration to in-process
       // tools, so callers never branch on harness (SPEC ruling 4).
-      const nativeTools = reviewMode === undefined ? [] : nativeReviewTools(reviewMode.nativeTools ?? []);
+      // Product-native tools ride the SAME helper for review leads and
+      // (issue #161) ordinary parent sessions: the adapter translates the
+      // declaration to in-process tools, so callers never branch on
+      // harness and no secret ever leaves the host process.
+      const declaredNativeTools =
+        reviewMode !== undefined ? (reviewMode.nativeTools ?? []) : (options.nativeTools ?? []);
+      const nativeTools = nativeReviewTools(declaredNativeTools);
       // Issue #161: a declared role-tool override narrows (never widens)
       // the role's own set — an unknown name fails loud here instead of
       // silently spawning with the wrong authority.
@@ -678,7 +686,7 @@ export class PiRuntime implements AgentRuntime {
         }
       }
       const tools = isolatedTools === null
-        ? declaredRoleTools
+        ? [...declaredRoleTools, ...nativeTools.map((tool) => tool.name)]
         : [...isolatedTools.names, ...nativeTools.map((tool) => tool.name)];
       const { session } = await createAgentSession({
         cwd,
@@ -687,7 +695,11 @@ export class PiRuntime implements AgentRuntime {
         ...(thinkingLevel !== undefined ? { thinkingLevel } : {}),
         ...(reviewMode !== undefined ? { noTools: 'all' as const } : {}),
         tools: [...tools],
-        ...(isolatedTools !== null ? { customTools: [...isolatedTools.tools, ...nativeTools] } : {}),
+        ...(isolatedTools !== null
+          ? { customTools: [...isolatedTools.tools, ...nativeTools] }
+          : nativeTools.length > 0
+            ? { customTools: [...nativeTools] }
+            : {}),
         resourceLoader: loader,
         ...(isolatedSettings !== undefined ? { settingsManager: isolatedSettings } : {}),
         sessionManager,
@@ -791,6 +803,8 @@ function mapImages(images: PromptOptions['images']): unknown[] | undefined {
 export class PiAgentHandle implements AgentHandle {
   readonly role: Role;
   readonly id: string;
+  /** The SDK session id at construction (== `id` for ordinary handles). */
+  private readonly nativeSessionId: string;
   readonly sessionFile: string;
   readonly reviewIsolation?: true;
   readonly reviewTools?: readonly string[];
@@ -872,6 +886,10 @@ export class PiAgentHandle implements AgentHandle {
     agentId?: string,
   ) {
     this.role = role;
+    // The SDK-minted session identity, retained separately from the
+    // product-owned handle id (issue #161): identity drift checks compare
+    // NATIVE ids, never the product id.
+    this.nativeSessionId = session.sessionId;
     this.id = agentId ?? session.sessionId;
     this.sessionFile = sessionFile;
     this.capabilities = capabilities;
@@ -1026,7 +1044,10 @@ export class PiAgentHandle implements AgentHandle {
     ) {
       throw new Error('agent session is busy; compaction requires an idle session');
     }
-    const id = this.id;
+    // The NATIVE session identity captured at construction, never the
+    // product-owned handle id (issue #161) and never a fresh read that a
+    // swapped/foreign session could satisfy.
+    const id = this.nativeSessionId;
     const file = this.sessionFile;
     let resolveTerminal!: (
       event: Extract<RuntimeEvent, { type: 'compaction_end' }>,

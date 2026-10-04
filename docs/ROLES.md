@@ -47,7 +47,9 @@ adapters enforce the same policy natively.
 
 Tracked child workers (issue #161) are a RELATIONSHIP over minion-role
 sessions, not a sixth role: a top-level minion can commission a child
-through the authenticated dispatch surface, and the child's row carries
+through the GC-mediated `request_child_worker` / `list_child_workers` /
+`cancel_child_worker` tools (bound to its own agent id by closure; the
+HTTP surface stays the operator's), and the child's row carries
 `parentage = 'child'`. The declared `authority` narrows the runtime's own
 tool set (`read-only` children get read/grep/find/ls; `writer` children
 get the minion set and their own branch), children cannot commission

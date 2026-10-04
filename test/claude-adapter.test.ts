@@ -968,9 +968,11 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       await expect(runtime.spawn('perkins', {
         reviewModel: snapshot,
         reviewLead: { systemPrompt: 'lead', tools: [], nativeTools: [
-          { name: 'invalid', description: 'rejected', inputSchema: {}, execute: async () => ({ text: '' }) },
+          // A general native name is allowed since #161; a malformed one
+          // (space/case) is still rejected at bridge start.
+          { name: 'bad name!', description: 'rejected', inputSchema: {}, execute: async () => ({ text: '' }) },
         ] },
-      })).rejects.toThrow(/invalid or duplicate native review tool name/);
+      })).rejects.toThrow(/invalid or duplicate native tool name/);
       expect(newlyRetained()).toEqual([]);
       expect(doubleInvocations(fx)).toHaveLength(1);
       const recovered = await runtime.spawn('perkins', {
@@ -2271,12 +2273,12 @@ describe('ReviewMcpBridge fail-closed guards', () => {
   it('rejects invalid or duplicate native tool names at start', async () => {
     await expect(ReviewMcpBridge.start([{
       name: 'not-perkins-prefixed', description: 'x', inputSchema: { type: 'object' }, execute: async () => ({ text: '' }),
-    }])).rejects.toThrow(/invalid or duplicate native review tool name/u);
+    }])).rejects.toThrow(/invalid or duplicate native tool name/u);
     const tool = {
       name: 'perkins_ok', description: 'x', inputSchema: { type: 'object' }, execute: async () => ({ text: '' }),
     };
     await expect(ReviewMcpBridge.start([tool, { ...tool, name: 'perkins_ok' }]))
-      .rejects.toThrow(/invalid or duplicate native review tool name/u);
+      .rejects.toThrow(/invalid or duplicate native tool name/u);
   });
 
   it('rejects a tampered bundled MCP server before launching it', async () => {

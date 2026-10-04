@@ -151,6 +151,16 @@ export interface SpawnOptions {
    */
   readonly agentId?: string;
   /**
+   * Product-owned narrow tools for a NON-review session (issue #161): the
+   * GC-mediated parent-worker control plane. The adapter exposes exactly
+   * these (pi: in-process custom tools; claude-code: the same scoped MCP
+   * bridge review sessions use) and records the wired names on the handle
+   * (`reviewTools`). Identity is bound by the CLOSURE the caller builds —
+   * no bearer secret ever reaches the session's filesystem or context.
+   * Omitted = none.
+   */
+  readonly nativeTools?: readonly NativeAgentTool[];
+  /**
    * Product-controlled tool subset for this spawn (issue #161): a child
    * worker's bounded task authority is enforced by the runtime itself —
    * a `read-only` child is spawned with the read-only role tools, a

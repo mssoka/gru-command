@@ -206,50 +206,24 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
     return match === null ? null : match[1] ?? null;
   }
 
-  /** The operator pairing token (the superset service authority). */
-  function hasOperatorToken(req: IncomingMessage): boolean {
-    if (!configured) return false;
-    const token = bearerToken(req);
-    return token !== null && tokenMatches(token, tokenHash);
-  }
-
+  /**
+   * The pairing token is the ONLY HTTP authority for the child-worker
+   * routes. Issue #161's parent-facing surface is GC-mediated instead: a
+   * parent session gets the `request_child_worker` / `list_child_workers`
+   * / `cancel_child_worker` tools bound to its identity by closure, so no
+   * bearer secret is ever written into (or readable from) session space.
+   */
   function authed(req: IncomingMessage, res: ServerResponse): boolean {
     if (!configured) {
       json(res, 503, { error: 'not_configured', detail: 'no pairing token configured' });
       return false;
     }
-    if (!hasOperatorToken(req)) {
+    const token = bearerToken(req);
+    if (token === null || !tokenMatches(token, tokenHash)) {
       json(res, 401, { error: 'unauthorized' });
       return false;
     }
     return true;
-  }
-
-  /** Issue #161: operator token OR the scoped parent capability bound to
-   * `parentAgentId`. The capability authorizes exactly one parent's
-   * children — never another parent's. */
-  function authedForParent(
-    req: IncomingMessage,
-    res: ServerResponse,
-    parentAgentId: string | null,
-  ): boolean {
-    if (!configured) {
-      json(res, 503, { error: 'not_configured', detail: 'no pairing token configured' });
-      return false;
-    }
-    if (hasOperatorToken(req)) return true;
-    const service = options.childWorkers;
-    const token = bearerToken(req);
-    if (
-      service !== undefined &&
-      parentAgentId !== null &&
-      token !== null &&
-      service.authorizeParent(parentAgentId, token)
-    ) {
-      return true;
-    }
-    json(res, 401, { error: 'unauthorized' });
-    return false;
   }
 
   function readBody(req: IncomingMessage): Promise<Record<string, unknown>> {
@@ -358,10 +332,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
     // admission and answers named refusal preconditions. A replay with the
     // same key returns the existing child (never a second worker).
     if (req.method === 'POST' && path === '/api/dispatch/child') {
-      if (!configured) {
-        json(res, 503, { error: 'not_configured', detail: 'no pairing token configured' });
-        return true;
-      }
+      if (!authed(req, res)) return true;
       const service = options.childWorkers;
       if (service === undefined) {
         json(res, 503, {
@@ -376,9 +347,6 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       // `invalid_request` with the field name, never a generic parse fault.
       const rawField = (field: string): string =>
         typeof body[field] === 'string' ? (body[field] as string) : '';
-      // Authorization is parent-scoped: the operator token, or the scoped
-      // capability issued to exactly this parent (never another's).
-      if (!authedForParent(req, res, rawField('parent_agent_id'))) return true;
       try {
         const admission = service.request({
           parentAgentId: rawField('parent_agent_id'),
@@ -562,8 +530,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         json(res, 404, { error: 'child_not_found', detail: 'no such tracked child worker' });
         return true;
       }
-      // A parent capability reads only ITS OWN children.
-      if (!authedForParent(req, res, record.parentAgentId)) return true;
+      if (!authed(req, res)) return true;
       json(res, 200, { child: childView(record) });
       return true;
     }
@@ -581,14 +548,13 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         });
         return true;
       }
+      if (!authed(req, res)) return true;
       const childId = decodeURIComponent(childCancelMatch[1] ?? '');
       const existing = options.ledger.getChildWorker(childId);
       if (existing === null) {
         json(res, 404, { error: 'child_not_found', detail: 'no such tracked child worker' });
         return true;
       }
-      // A parent capability cancels only ITS OWN children.
-      if (!authedForParent(req, res, existing.parentAgentId)) return true;
       const body = await readBody(req);
       const reason = optStrField(body, 'reason') ?? 'cancelled by the owner';
       try {
@@ -621,9 +587,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         json(res, 404, { error: 'agent_not_found', detail: `agent "${parentAgentId}" not found` });
         return true;
       }
-      // The parent's own discovery path: operator token OR the scoped
-      // capability for exactly this parent.
-      if (!authedForParent(req, res, parentAgentId)) return true;
+      if (!authed(req, res)) return true;
       json(res, 200, {
         children: options.ledger.listChildWorkers({ parentAgentId }).map(childView),
       });
@@ -864,6 +828,9 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
             ...(options.workerGate !== undefined ? { workerGate: options.workerGate } : {}),
             ...(options.retrySettlement !== undefined ? { retrySettlement: options.retrySettlement } : {}),
             ...(options.lessons !== undefined ? { lessons: options.lessons } : {}),
+            ...(options.childWorkers !== undefined
+              ? { parentTools: (agentId: string) => options.childWorkers!.parentTools(agentId) }
+              : {}),
           });
         } catch (error) {
           // The turn errored with no positive outcome. A prompt may or may
@@ -1110,6 +1077,9 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           signal: controller.signal,
           ...(options.workerGate !== undefined ? { workerGate: options.workerGate } : {}),
           ...(options.retrySettlement !== undefined ? { retrySettlement: options.retrySettlement } : {}),
+          ...(options.childWorkers !== undefined
+            ? { parentTools: (agentId: string) => options.childWorkers!.parentTools(agentId) }
+            : {}),
           jobId,
           note,
           briefing: job.briefing,

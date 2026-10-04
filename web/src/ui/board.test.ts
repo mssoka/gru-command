@@ -1252,6 +1252,10 @@ describe('board agent rail — dense rows, tabs count, disposed collapse', () =>
     expect(document.querySelectorAll('#board-agents .board-agent')).toHaveLength(1);
     const link = document.querySelector<HTMLButtonElement>('.board-agent__parent-link');
     expect(link?.tagName).toBe('BUTTON');
+    // Keys pressed ON the nested link must not be hijacked by the row's
+    // transcript action (Enter bubbles; target !== row → ignored).
+    link?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    expect(opened).toEqual([]);
     link?.click();
     const rows = [...document.querySelectorAll<HTMLElement>('#board-agents .board-agent')];
     expect(rows).toHaveLength(2);

@@ -22,6 +22,7 @@ import {
 } from './fix-directive.js';
 import type { WorktreePort } from './worktree-port.js';
 import type { PacingGate, RetrySettlement } from '../runtime/pacing.js';
+import type { NativeAgentTool } from '../runtime/types.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -82,6 +83,9 @@ export interface ReconcileRebriefDeps {
    * production). The recovery records delivered only for
    * 'none'/'recovered'. */
   readonly retrySettlement?: (agentId: string) => Promise<RetrySettlement>;
+  /** Issue #161: GC-mediated child-worker tools for a re-dispatched parent
+   * session (boot recovery must not strip a parent's commissioning path). */
+  readonly parentTools?: (agentId: string) => readonly NativeAgentTool[];
   /** Service-stopping signal: aborts a QUEUED re-brief admission wait and
    * lets the retry-settlement race observe cancellation instead of hanging
    * shutdown. Absent = settlement remains hook-owned. */
@@ -720,6 +724,7 @@ function runRebriefTurn(
     worktrees: deps.worktrees,
     ...(deps.workerGate !== undefined ? { workerGate: deps.workerGate } : {}),
     ...(deps.retrySettlement !== undefined ? { retrySettlement: deps.retrySettlement } : {}),
+    ...(deps.parentTools !== undefined ? { parentTools: deps.parentTools } : {}),
     ...(deps.stopSignal !== undefined ? { signal: deps.stopSignal } : {}),
     jobId: input.jobId,
     note: input.note,

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { WorktreePort } from '../../src/dispatch/worktree-port.js';
@@ -97,7 +97,15 @@ export function runWorktreePortContract(name: string, make: () => Promise<PortCo
         advancedHead = execFileSync('git', ['-C', jobLane!.path, 'rev-parse', 'HEAD'], {
           encoding: 'utf-8',
         }).trim();
-      } catch {
+      } catch (error) {
+        // Only the lightweight in-memory harness (whose fixture repo is
+        // cleaned up between contract tests) may skip the advance. A real
+        // git fixture that cannot commit is a broken guarantee — fail loud
+        // rather than silently dropping the base assertion.
+        const isGitWorktree = spawnSync('git', ['-C', jobLane!.path, 'rev-parse', '--is-inside-work-tree'], {
+          stdio: 'ignore',
+        }).status === 0;
+        if (isGitWorktree) throw error;
         advancedHead = null;
       }
       const readOnly = await h.port.createChildWorktree({

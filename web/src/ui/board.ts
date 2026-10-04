@@ -1009,6 +1009,9 @@ export class BoardView {
     };
     row.addEventListener('click', openTranscript);
     row.addEventListener('keydown', (event) => {
+      // Keys on the nested parent-navigation button belong to THAT button:
+      // the row must not hijack Enter/Space bubbling from a descendant.
+      if (event.target !== row) return;
       if (event.key === 'Enter' || event.key === ' ') {
         event.preventDefault();
         openTranscript();

@@ -1044,20 +1044,20 @@ async function main(): Promise<number> {
   const childWorkers = new ChildWorkerService({
     ledger,
     worktrees: worktreeManager,
-    spawner: (role: Role, spawnOptions?: SpawnOptions) => registry.spawn(role, spawnOptions ?? {}),
+    spawner: (role: Role, spawnOptions?: SpawnOptions, residentRelease?: () => void) =>
+      residentRelease !== undefined
+        ? registry.spawnWithResident(role, spawnOptions ?? {}, residentRelease)
+        : registry.spawn(role, spawnOptions ?? {}),
     workerGate: pacing.gate,
     retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
     stopSignal: serviceStop.signal,
-    credentialsDir: join(config.dataDir, 'child-credentials'),
-    residentProbe: () => {
-      const snapshot = registry.residencySnapshot();
-      return {
-        available: snapshot.capacity - snapshot.occupied,
-        idleMinionIds: snapshot.handles
-          .filter((handle) => handle.role === 'minion' && handle.state === 'idle')
-          .map((handle) => handle.agentId),
-      };
-    },
+    reserveResident: (signal) => registry.reserveResident(signal),
+    residentProbe: () => ({
+      // The REAL budget eligibility (idle + its own reclaim predicate),
+      // never a bare health-state guess.
+      available: registry.residents.available,
+      reclaimable: registry.residents.eligibleIdleCount(),
+    }),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   state.childWorkers = childWorkers;
@@ -1072,7 +1072,7 @@ async function main(): Promise<number> {
     workerGate: pacing.gate,
     retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
     stopSignal: serviceStop.signal,
-    parentCredentials: childWorkers,
+    parentTools: (agentId) => childWorkers.parentTools(agentId),
     ...(config.lessons.enabled ? { lessons: lessonReferences, lessonsCapture } : {}),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
@@ -1103,6 +1103,7 @@ async function main(): Promise<number> {
         directive: directiveInput.directive,
         signal: directiveInput.signal,
         owner: 'bmad-review-gate',
+        parentTools: (agentId: string) => childWorkers.parentTools(agentId),
       }),
     },
     // Wave escalations carry bounded per-call identity context; the
@@ -1128,6 +1129,7 @@ async function main(): Promise<number> {
     notifications,
     workerGate: pacing.gate,
     retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
+    parentTools: (agentId) => childWorkers.parentTools(agentId),
     stopSignal: serviceStop.signal,
     log: (level, msg, fields) => logger.log(level, msg, fields),
     stopping: () => shuttingDown,

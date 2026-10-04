@@ -1,6 +1,5 @@
-import { createHash, randomUUID } from 'node:crypto';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import type { LogLevel } from '../logger.js';
 import {
   ChildWorkerConflictError,
@@ -10,7 +9,7 @@ import {
   type LedgerApi,
 } from '../ledger/api.js';
 import { isJobTerminal } from '../ledger/states.js';
-import type { AgentHandle, SpawnOptions } from '../runtime/types.js';
+import type { AgentHandle, NativeAgentTool, SpawnOptions } from '../runtime/types.js';
 import { promptWithTerminalVerdict } from '../runtime/prompt-verdict.js';
 import {
   settleRetries,
@@ -19,7 +18,7 @@ import {
   type RetrySettlement,
 } from '../runtime/pacing.js';
 import { parseTranscriptContent } from '../transcripts/service.js';
-import type { AgentSpawner } from './service.js';
+import type { Role } from '../config.js';
 import type { WorktreeLane, WorktreePort } from './worktree-port.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
@@ -117,6 +116,13 @@ export interface ChildWorkerAdmission {
   readonly idempotent: boolean;
 }
 
+/** A child-worker spawn may carry a pre-reserved resident permit. */
+export type ChildWorkerSpawner = (
+  role: Role,
+  options: SpawnOptions,
+  residentRelease?: () => void,
+) => Promise<AgentHandle>;
+
 /** The supervisor's per-agent restart policy (late-bound). */
 export type ChildRestartPolicy =
   | { readonly options: SpawnOptions }
@@ -125,7 +131,7 @@ export type ChildRestartPolicy =
 export interface ChildWorkerServiceOptions {
   readonly ledger: LedgerApi;
   readonly worktrees: WorktreePort;
-  readonly spawner: AgentSpawner;
+  readonly spawner: ChildWorkerSpawner;
   /** Provider pacing: a child turn consumes the same worker pool as any
    * other minion turn (FIFO; never preempted). Absent = off. */
   readonly workerGate?: PacingGate;
@@ -138,15 +144,17 @@ export interface ChildWorkerServiceOptions {
   /** Service-stopping signal: aborts queued admission, disposes live child
    * handles and marks non-terminal children cancelled with the stop named. */
   readonly stopSignal?: AbortSignal;
-  /** Directory for scoped parent-capability files (0600). main wires the
-   * instance data dir; test harnesses pass a temp dir. */
-  readonly credentialsDir?: string;
-  /** Resident-budget probe for the admission deadlock fence (main wires
-   * the runtime registry's residency snapshot). Absent = no probe. */
+  /** Resident-budget probe for the admission deadlock fence. `available`
+   * is free capacity; `reclaimable` is the budget's OWN eligible-idle
+   * count (never a bare health-state guess). Absent = no probe. */
   readonly residentProbe?: () => {
     readonly available: number;
-    readonly idleMinionIds: readonly string[];
+    readonly reclaimable: number;
   };
+  /** Atomic resident reservation (the same FIFO pool spawn charges): a
+   * child reserves its permit at run start, so a free-seat probe race can
+   * never admit an unsatisfiable queue. Absent = the spawner charges. */
+  readonly reserveResident?: (signal?: AbortSignal) => Promise<() => void>;
   readonly log?: Log;
 }
 
@@ -195,39 +203,54 @@ export function renderChildBriefing(input: {
 }
 
 /** Count assistant entries in a session transcript (the anchor for
- * "this turn's report"). Unreadable/absent transcript → 0. */
-export function countAssistantEntries(sessionFile: string | null): number {
-  if (sessionFile === null) return 0;
+ * "this turn's report"). NULL = unreadable/absent: a failed baseline is
+ * never treated as an empty session (a later readable transcript could
+ * otherwise donate a prior turn's report). */
+export function countAssistantEntries(sessionFile: string | null): number | null {
+  if (sessionFile === null) return null;
   try {
     const { entries } = parseTranscriptContent(readFileSync(sessionFile, 'utf-8'));
     return entries.filter((entry) => entry.kind === 'assistant').length;
   } catch {
-    return 0;
+    return null;
   }
 }
 
 /**
- * Extract the child's own final report text from the transcript suffix
- * after `fromAssistantIndex` — the entries THIS child turn produced.
- * Returns null when no assistant text followed the anchor (the result then
- * records a named report-collection failure rather than inventing one, and
- * a resumed session's stale prior-turn text is never returned).
+ * Extract the child's own FINAL report from the transcript suffix after
+ * `fromAssistantIndex` — the entries THIS child turn produced. The report
+ * must be the turn's LAST transcript entry (a trailing assistant message):
+ * an interim progress message followed by more work (or by no closing
+ * message) is NOT a completion report and returns null, so the result
+ * records a named collection failure instead of publishing commentary as
+ * a durable result. `fromAssistantIndex` null = an unreadable baseline,
+ * which also refuses (the anchor cannot be proven).
  */
-export function extractFinalReport(sessionFile: string | null, fromAssistantIndex: number): string | null {
-  if (sessionFile === null) return null;
+export function extractFinalReport(
+  sessionFile: string | null,
+  fromAssistantIndex: number | null,
+): string | null {
+  if (sessionFile === null || fromAssistantIndex === null) return null;
   try {
     const { entries } = parseTranscriptContent(readFileSync(sessionFile, 'utf-8'));
-    const assistant = entries.filter((entry) => entry.kind === 'assistant');
-    for (let index = assistant.length - 1; index >= fromAssistantIndex; index -= 1) {
-      const entry = assistant[index];
-      if (entry !== undefined && entry.text.trim() !== '') {
-        const text = entry.text.trim();
-        return text.length > CHILD_RESULT_SUMMARY_MAX_CHARS
-          ? `${text.slice(0, CHILD_RESULT_SUMMARY_MAX_CHARS)}…`
-          : text;
-      }
-    }
-    return null;
+    const last = entries.at(-1);
+    // Trailing non-message frames (claude raw stream frames) are inert:
+    // the final message itself must still be the assistant report.
+    let candidateIndex = entries.length - 1;
+    while (candidateIndex >= 0 && entries[candidateIndex]?.kind === 'other') candidateIndex -= 1;
+    const candidate = entries[candidateIndex];
+    if (last === undefined || candidate === undefined || candidate.kind !== 'assistant') return null;
+    // Count assistant entries up to and including the candidate — it must
+    // sit at or after this turn's anchor.
+    const assistantUpTo = entries
+      .slice(0, candidateIndex + 1)
+      .filter((entry) => entry.kind === 'assistant').length;
+    if (assistantUpTo <= fromAssistantIndex) return null;
+    const text = candidate.text.trim();
+    if (text === '') return null;
+    return text.length > CHILD_RESULT_SUMMARY_MAX_CHARS
+      ? `${text.slice(0, CHILD_RESULT_SUMMARY_MAX_CHARS)}…`
+      : text;
   } catch {
     return null;
   }
@@ -264,32 +287,142 @@ export class ChildWorkerService {
   }
 
   // ------------------------------------------------------------------
-  // Scoped parent capabilities (the minion-facing credential)
+  // GC-mediated parent tools (the minion-facing request surface)
   // ------------------------------------------------------------------
 
   /**
-   * Mint the scoped parent capability and materialize it as a private
-   * credential file (0600). Returns the file path for the briefing; the
-   * plaintext token is stored hashed and never returned by this API.
+   * The product-native tools injected into a PARENT session (issue #161):
+   * request/list/cancel bound to one agent id by CLOSURE. No bearer secret
+   * reaches the session or its filesystem — the runtime executes these in
+   * the service process, so a sibling worker cannot impersonate the
+   * parent the way a readable credential file would allow.
    */
-  issueParentCredential(agentId: string): { readonly tokenFile: string } {
-    if (this.opts.credentialsDir === undefined) {
-      throw new Error(
-        'child-worker credentialsDir is not configured — refusing to issue a parent capability without a private location',
-      );
-    }
-    const token = this.opts.ledger.issueChildRequestToken(agentId);
-    mkdirSync(this.opts.credentialsDir, { recursive: true, mode: 0o700 });
-    const tokenFile = join(this.opts.credentialsDir, `${credentialFileName(agentId)}.token`);
-    writeFileSync(tokenFile, `${token}\n`, { encoding: 'utf-8', mode: 0o600 });
-    return { tokenFile };
-  }
-
-  /** Scoped-capability authorization for one parent (constant-time check
-   * in the ledger; the operator pairing token is handled by the caller). */
-  authorizeParent(agentId: string, token: string): boolean {
-    if (agentId === '' || token === '') return false;
-    return this.opts.ledger.verifyChildRequestToken(agentId, token);
+  parentTools(agentId: string): readonly NativeAgentTool[] {
+    const stringField = (input: Record<string, unknown>, field: string): string => {
+      const value = input[field];
+      if (typeof value !== 'string' || value.trim() === '') {
+        throw new ChildWorkerRefusal('invalid_request', 400, `${field} must be a non-empty string`);
+      }
+      return value;
+    };
+    const toolInput = (input: unknown): Record<string, unknown> =>
+      typeof input === 'object' && input !== null && !Array.isArray(input)
+        ? (input as Record<string, unknown>)
+        : {};
+    const failureText = (error: unknown): string => {
+      const refusal = childRefusalStatus(error);
+      return JSON.stringify({
+        error: refusal?.code ?? 'failed',
+        detail: refusal?.detail ?? String(error instanceof Error ? error.message : error),
+      });
+    };
+    return [
+      {
+        name: 'request_child_worker',
+        description:
+          'Commission ONE independent GC-tracked child worker (a bounded minion) for this session\'s job. ' +
+          'The child gets its own lane, session and durable result; read-only authority cannot write, ' +
+          'writer authority gets its own branch. Children cannot spawn children. Use the returned child_id ' +
+          'with list_child_workers to discover the result.',
+        inputSchema: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['purpose', 'authority', 'task', 'idempotency_key'],
+          properties: {
+            purpose: { type: 'string', description: 'Why this child is needed (bounded, <=500 chars).' },
+            authority: { type: 'string', enum: ['read-only', 'writer'], description: 'Bounded task authority.' },
+            task: { type: 'string', description: 'The task the child executes (bounded, <=8000 chars).' },
+            idempotency_key: { type: 'string', description: 'Caller-supplied key; a retry with the same key returns the same child.' },
+            label: { type: 'string', description: 'Optional short label.' },
+          },
+        },
+        execute: async (input) => {
+          try {
+            const fields = toolInput(input);
+            const parent = this.opts.ledger.getAgent(agentId);
+            if (parent === null || parent.jobId === null) {
+              throw new ChildWorkerRefusal('unknown_parent', 404, `parent agent "${agentId}" is not a bound minion session`);
+            }
+            const admission = this.request({
+              parentAgentId: agentId,
+              jobId: parent.jobId,
+              purpose: stringField(fields, 'purpose'),
+              authority: stringField(fields, 'authority'),
+              task: stringField(fields, 'task'),
+              idempotencyKey: stringField(fields, 'idempotency_key'),
+              ...(typeof fields['label'] === 'string' && fields['label'].trim() !== '' ? { label: fields['label'] } : {}),
+            });
+            return {
+              text: JSON.stringify({
+                child_id: admission.record.id,
+                state: admission.record.state,
+                authority: admission.record.authority,
+                idempotent: admission.idempotent,
+              }),
+              details: { childId: admission.record.id, state: admission.record.state },
+            };
+          } catch (error) {
+            return { text: failureText(error) };
+          }
+        },
+      },
+      {
+        name: 'list_child_workers',
+        description:
+          'List this session\'s GC-tracked child workers with their lifecycle state and durable result ' +
+          '(result_state, result_summary, result_ref). This is how a parent discovers completion or failure.',
+        inputSchema: { type: 'object', additionalProperties: false, properties: {} },
+        execute: async () => {
+          const children = this.opts.ledger.listChildWorkers({ parentAgentId: agentId }).map((child) => ({
+            child_id: child.id,
+            purpose: child.purpose,
+            authority: child.authority,
+            state: child.state,
+            result_state: child.resultState,
+            result_summary: child.resultSummary,
+            result_ref: child.resultRef,
+          }));
+          return { text: JSON.stringify({ children }), details: { count: children.length } };
+        },
+      },
+      {
+        name: 'cancel_child_worker',
+        description:
+          'Cancel one of this session\'s child workers (by child_id). Terminal children are immutable. ' +
+          'Cancellation is proof-aware: a session that cannot prove cessation stays non-terminal.',
+        inputSchema: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['child_id'],
+          properties: {
+            child_id: { type: 'string', description: 'The child id returned by request_child_worker.' },
+            reason: { type: 'string', description: 'Optional reason recorded with the cancellation.' },
+          },
+        },
+        execute: async (input) => {
+          try {
+            const fields = toolInput(input);
+            const childId = stringField(fields, 'child_id');
+            const child = this.opts.ledger.getChildWorker(childId);
+            if (child === null || child.parentAgentId !== agentId) {
+              throw new ChildWorkerRefusal('unknown_parent', 404, `child "${childId}" is not owned by this session`);
+            }
+            const record = await this.cancel(
+              childId,
+              typeof fields['reason'] === 'string' && fields['reason'].trim() !== ''
+                ? fields['reason']
+                : 'cancelled by the parent session',
+            );
+            return {
+              text: JSON.stringify({ child_id: record.id, state: record.state, result_state: record.resultState }),
+              details: { childId: record.id, state: record.state },
+            };
+          } catch (error) {
+            return { text: failureText(error) };
+          }
+        },
+      },
+    ];
   }
 
   // ------------------------------------------------------------------
@@ -459,11 +592,11 @@ export class ChildWorkerService {
     // budget/capacity refusal instead of an unsatisfiable queue (a parent
     // blocked on its child would otherwise hold the last seats forever).
     const probe = this.opts.residentProbe?.();
-    if (probe !== undefined && probe.available < 1 && probe.idleMinionIds.length === 0) {
+    if (probe !== undefined && probe.available < 1 && probe.reclaimable < 1) {
       throw new ChildWorkerRefusal(
         'budget',
         429,
-        'resident worker capacity is fully occupied and no idle minion can be reclaimed — ' +
+        'resident worker capacity is fully occupied and no eligible idle minion can be reclaimed — ' +
           'retry once capacity frees (children consume the same [concurrency] max_workers pool)',
       );
     }
@@ -509,6 +642,7 @@ export class ChildWorkerService {
     let lane: WorktreeLane | null = null;
     let handle: AgentHandle | null = null;
     let lease: { release(): void } | null = null;
+    let residentRelease: (() => void) | null = null;
     let engineFailure: string | null = null;
     /** The child briefing was actually delivered to the model. */
     let delivered = false;
@@ -538,13 +672,29 @@ export class ChildWorkerService {
       // Spawn BEFORE provider pacing: the session waits for the resident
       // permit (a durable FIFO admission), and only then does it take a
       // scarce provider turn slot — a child blocked on capacity can never
-      // hold the pacing pool hostage.
-      handle = await this.opts.spawner('minion', {
-        cwd: lane.path,
-        agentId: record.id,
-        ...(isReadOnly ? { roleTools: READ_ONLY_CHILD_TOOLS } : {}),
-        signal: childController.signal,
-      });
+      // hold the pacing pool hostage. Issue #161 round 2: the permit is
+      // RESERVED up front through the budget, so two racing admissions can
+      // never both act on one free-seat observation.
+      if (this.opts.reserveResident !== undefined) {
+        residentRelease = await this.opts.reserveResident(childController.signal);
+      }
+      try {
+        handle = await this.opts.spawner(
+          'minion',
+          {
+            cwd: lane.path,
+            agentId: record.id,
+            ...(isReadOnly ? { roleTools: READ_ONLY_CHILD_TOOLS } : {}),
+            signal: childController.signal,
+          },
+          residentRelease ?? undefined,
+        );
+        residentRelease = null; // ownership passed to the spawned handle
+      } catch (error) {
+        residentRelease?.();
+        residentRelease = null;
+        throw error;
+      }
       run.handle = handle;
       // The admission row already carries the identity; bind the session
       // file and (idempotently) refresh the parent link.
@@ -556,7 +706,6 @@ export class ChildWorkerService {
         sessionFile: handle.sessionFile,
         parentAgentId: record.parentAgentId,
       });
-      this.opts.ledger.markChildStarted(record.id, { sessionFile: handle.sessionFile });
       // Resident admission may have waited a long time: revalidate once
       // more before the model acts.
       const postAdmission = this.ineligibility(record);
@@ -575,6 +724,26 @@ export class ChildWorkerService {
       if (run.cancelReason !== null || childController.signal.aborted || this.signal.aborted) {
         throw new Error(run.cancelReason ?? 'stopped before delivery');
       }
+      // The pacing wait is asynchronous too: revalidate AFTER it, so a
+      // parent/job that expired while the turn slot was queued fences the
+      // child before any briefing is delivered.
+      const postPacing = this.ineligibility(record);
+      if (postPacing !== null) {
+        this.opts.ledger.recordChildResult(record.id, { state: 'error', summary: postPacing, ref: handle.sessionFile });
+        return;
+      }
+      const assistantBefore = countAssistantEntries(handle.sessionFile);
+      if (assistantBefore === null) {
+        this.opts.ledger.recordChildResult(record.id, {
+          state: 'error',
+          summary: 'the child transcript baseline is unreadable — refusing to anchor a report to an unknown suffix',
+          ref: handle.sessionFile,
+        });
+        return;
+      }
+      // The child is `active` only when its briefing is actually about to
+      // be delivered (a pacing wait is still queued/admitted truth).
+      this.opts.ledger.markChildStarted(record.id, { sessionFile: handle.sessionFile });
       this.log('info', 'child worker started', {
         child: record.id,
         agent: handle.id,
@@ -583,7 +752,6 @@ export class ChildWorkerService {
         authority: record.authority,
         lane: lane.path,
       });
-      const assistantBefore = countAssistantEntries(handle.sessionFile);
       const briefing = renderChildBriefing({
         childId: record.id,
         parentAgentId: record.parentAgentId,
@@ -680,8 +848,8 @@ export class ChildWorkerService {
       this.log('error', 'child worker run failed', { child: record.id, error: engineFailure });
     } finally {
       this.signal.removeEventListener('abort', abortFromService);
-      this.live.delete(record.id);
       lease?.release();
+      let ceased = handle === null;
       if (handle !== null) {
         try {
           await handle.dispose();
@@ -694,20 +862,36 @@ export class ChildWorkerService {
             error: String(disposeError),
           });
         }
+        ceased = safeHealthState(handle) === 'disposed';
       }
-      // A recorded result is final; the cancelled path proves cessation
-      // before it terminalizes.
+      // A recorded result is final. The cancelled path terminalizes ONLY
+      // with proven cessation; an unproven stop stays NON-TERMINAL (the
+      // session may still be live), records durable stop debt, and keeps
+      // its live run so a later cancel can retry the proof-aware stop.
       try {
         const current = this.opts.ledger.getChildWorker(record.id);
         if (current !== null && current.resultState === null) {
           const cancelled = run.cancelReason !== null || this.signal.aborted;
-          if (cancelled) {
-            const ceased = handle === null || safeHealthState(handle) === 'disposed';
+          if (cancelled && !ceased) {
+            this.opts.ledger.appendCustomEvent({
+              kind: 'child.stop-unproven',
+              agentId: handle?.id ?? null,
+              jobId: record.jobId,
+              payload: {
+                childId: record.id,
+                reason: run.cancelReason ?? 'service stopped',
+                health: safeHealthState(handle),
+                note: 'cancellation could not prove cessation; the record stays non-terminal and the permit remains counted debt',
+              },
+            });
+            this.log('warn', 'child stop could not prove cessation — record stays non-terminal', {
+              child: record.id,
+              health: safeHealthState(handle),
+            });
+          } else if (cancelled) {
             this.opts.ledger.recordChildResult(record.id, {
-              state: ceased ? 'cancelled' : 'error',
-              summary: ceased
-                ? (engineFailure ?? run.cancelReason ?? 'cancelled')
-                : `cancel requested (${run.cancelReason ?? 'service stopped'}) but the session did not prove cessation (${safeHealthState(handle)}) — permit retained as debt`,
+              state: 'cancelled',
+              summary: engineFailure ?? run.cancelReason ?? 'cancelled',
               ref: current.resultRef ?? current.sessionFile,
             });
           } else {
@@ -724,13 +908,21 @@ export class ChildWorkerService {
           error: String(resultError),
         });
       }
+      const terminal = this.opts.ledger.getChildWorker(record.id)?.resultState !== null;
+      if (terminal) this.live.delete(record.id);
+      else if (handle !== null) run.handle = handle; // stop debt: keep the handle for a proof-aware retry
       // Read-only children leave nothing behind: their detached lane is
       // swept once the run is terminal. A child whose turn was never
       // delivered (fenced, cancelled or aborted before the prompt) has no
       // deliverables either, whatever its authority. Writer children that
       // actually delivered keep their lane (branch deliverables) — release
-      // stays an explicit owner action.
-      if (lane !== null && (record.authority === 'read-only' || !delivered)) {
+      // stays an explicit owner action. An UNPROVEN stop never releases:
+      // the session may still own the checkout.
+      if (
+        lane !== null &&
+        (record.authority === 'read-only' || !delivered) &&
+        this.opts.ledger.getChildWorker(record.id)?.resultState !== null
+      ) {
         await this.releaseLaneQuietly(record.id);
       }
     }
@@ -776,10 +968,10 @@ export class ChildWorkerService {
 
   /**
    * Cancel a child worker (owner stop or parent cancellation). Awaiting
-   * THIS call proves the outcome: a live session is disposed and its
-   * cessation checked before `cancelled` is recorded; an unproven
-   * cessation records a named error (the permit stays counted debt).
-   * A terminal child is immutable — the call replays its result.
+   * THIS call resolves after the run's proof-aware finalization: `cancelled`
+   * is recorded ONLY when cessation is proven; an unproven stop returns the
+   * still-non-terminal record (durable `child.stop-unproven` debt), and a
+   * later cancel retries the disposal. A terminal child is immutable.
    */
   async cancel(childId: string, reason: string): Promise<ChildWorkerRecord> {
     const record = this.opts.ledger.getChildWorker(childId);
@@ -789,7 +981,7 @@ export class ChildWorkerService {
     if (record.resultState !== null) return record;
     const run = this.live.get(childId);
     if (run === undefined) {
-      // No live run (not started yet, or already settling): record the
+      // No live run (not started yet, or already finalized): record the
       // cancellation; a not-yet-started run's revalidation sees the
       // terminal record before it can deliver anything.
       return this.opts.ledger.cancelChildWorker(childId, { reason });
@@ -807,7 +999,9 @@ export class ChildWorkerService {
       }
     }
     if (run.task !== null) await run.task;
-    return this.opts.ledger.getChildWorker(childId) ?? this.opts.ledger.cancelChildWorker(childId, { reason });
+    // Only the run's own finalizer terminalizes: an unproven stop stays
+    // non-terminal, and the caller sees that honestly.
+    return this.opts.ledger.getChildWorker(childId) as ChildWorkerRecord;
   }
 
   /**
@@ -869,37 +1063,21 @@ export class ChildWorkerService {
     const record = this.opts.ledger.childWorkerByAgent(agentId);
     if (record === null) return undefined; // not a tracked child
     if (record.resultState !== null) return { refuse: `child worker "${record.id}" is already terminal` };
-    const reason = this.ineligibility(record);
-    if (reason !== null) {
-      this.opts.ledger.recordChildResult(record.id, {
-        state: 'error',
-        summary: `supervision restart refused: ${reason}`,
-        ref: record.sessionFile,
-      });
-      if (record.authority === 'read-only') void this.releaseLaneQuietly(record.id);
-      return { refuse: reason };
-    }
-    let lane: WorktreeLane | null = null;
-    try {
-      lane = this.opts.worktrees.getWorktree(record.id);
-    } catch {
-      lane = null;
-    }
-    if (lane === null || lane.status === 'swept') {
-      this.opts.ledger.recordChildResult(record.id, {
-        state: 'error',
-        summary: 'supervision restart refused: the child lane is gone',
-        ref: record.sessionFile,
-      });
-      return { refuse: 'the child lane is gone' };
-    }
-    return {
-      options: {
-        cwd: lane.path,
-        agentId: record.id,
-        ...(record.authority === 'read-only' ? { roleTools: READ_ONLY_CHILD_TOOLS } : {}),
-      },
-    };
+    // SETTLED DECISION (issue #161 review round 2): a tracked child is a
+    // SINGLE-RUN logical worker. A supervision restart would create a
+    // second live session under one logical-child result, with two writers
+    // to the same lane and no owner for the restarted turn's outcome — so
+    // the restart is refused and the child terminalizes honestly (stopped,
+    // with the reason recorded); the parent requests a NEW child instead.
+    // The supervisor's breaker/stop/ownership still apply in full.
+    const reason = this.ineligibility(record) ?? 'child workers are single-run; a replacement session would duplicate the logical child';
+    this.opts.ledger.recordChildResult(record.id, {
+      state: 'error',
+      summary: `supervision restart refused: ${reason}`,
+      ref: record.sessionFile,
+    });
+    if (record.authority === 'read-only') void this.releaseLaneQuietly(record.id);
+    return { refuse: reason };
   }
 
   private track(promise: Promise<unknown>): void {
@@ -941,11 +1119,6 @@ export class ChildWorkerService {
       }),
     ]);
   }
-}
-
-function credentialFileName(agentId: string): string {
-  // Collision-free file naming for arbitrary (manually registered) ids.
-  return `parent-${createHash('sha256').update(agentId, 'utf-8').digest('hex').slice(0, 32)}`;
 }
 
 function safeHealthState(handle: AgentHandle | null): string {

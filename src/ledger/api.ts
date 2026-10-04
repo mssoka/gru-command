@@ -1,5 +1,4 @@
-import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
-import { hashToken } from '../auth.js';
+import { createHash, randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import type { BusEvent, EventBus } from '../events/bus.js';
 import type { Role } from '../config.js';
@@ -2090,46 +2089,6 @@ export class LedgerApi {
       .prepare('SELECT * FROM child_workers WHERE agent_id = ? ORDER BY created_at DESC LIMIT 1')
       .get(agentId) as Row | undefined;
     return row === undefined ? null : this.childWorkerFromRow(row);
-  }
-
-  /**
-   * Mint (or re-mint, replacing the prior hash) the scoped parent
-   * capability for a top-level minion. Returns the plaintext exactly once;
-   * only its SHA-256 is stored. The capability authorizes child requests,
-   * reads and cancels for THIS parent only.
-   */
-  issueChildRequestToken(agentId: string): string {
-    const agent = this.getAgent(agentId);
-    if (agent === null) throw new RecordNotFound(`agent "${agentId}" not found — a capability needs a real session`);
-    if (agent.parentage === 'child') {
-      throw new ChildWorkerConflictError(`agent "${agentId}" is a child worker — children never commission children`);
-    }
-    const token = randomBytes(32).toString('base64url');
-    this.transaction(() => {
-      this.db
-        .prepare('UPDATE agents SET child_request_token_hash = ?, updated_at = ? WHERE id = ?')
-        .run(hashToken(token).toString('hex'), nowIso(), agentId);
-      this.appendEvent({
-        kind: 'agent.capability-issued',
-        agentId,
-        jobId: agent.jobId,
-        payload: { capability: 'child-request' },
-      });
-    });
-    return token;
-  }
-
-  /** Constant-time scoped-capability check. Unknown/legacy agents (no
-   * stored hash) never authorize. */
-  verifyChildRequestToken(agentId: string, token: string): boolean {
-    const row = this.db
-      .prepare('SELECT child_request_token_hash FROM agents WHERE id = ?')
-      .get(agentId) as Row | undefined;
-    const stored = row === undefined ? null : nstr(row.child_request_token_hash);
-    if (stored === null) return false;
-    const storedBuf = Buffer.from(stored, 'hex');
-    const candidateBuf = hashToken(token);
-    return storedBuf.length === candidateBuf.length && timingSafeEqual(storedBuf, candidateBuf);
   }
 
   listChildWorkers(

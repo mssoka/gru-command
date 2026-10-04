@@ -1,9 +1,10 @@
+import { randomUUID } from 'node:crypto';
 import type { LogLevel } from '../logger.js';
 import type { LedgerApi, JobRecord } from '../ledger/api.js';
 import type { CompletionHandoffIntent } from '../ledger/obligations.js';
 import { isJobTerminal } from '../ledger/states.js';
 import type { Role } from '../config.js';
-import type { AgentHandle, SpawnOptions } from '../runtime/types.js';
+import type { AgentHandle, NativeAgentTool, SpawnOptions } from '../runtime/types.js';
 import { requireSpawnCwd } from '../roles.js';
 import { renderLessonsSection } from '../lessons/references.js';
 import type { LessonPointer, LessonsReferencePort } from '../lessons/types.js';
@@ -63,12 +64,10 @@ export interface DispatchServiceOptions {
   readonly lessons?: LessonsReferencePort;
   /** Extracts a minion's opt-in lessons block at delivery settle. */
   readonly lessonsCapture?: LessonCapturePort;
-  /** Issue #161: scoped child-request capability issuance for a dispatched
-   * parent (the returned file path is named in the briefing). Absent = no
-   * child-request instructions are rendered. */
-  readonly parentCredentials?: {
-    issueParentCredential(agentId: string): { readonly tokenFile: string };
-  };
+  /** Issue #161: the GC-mediated parent tools injected into a dispatched
+   * parent session (request/list/cancel child workers, bound to the
+   * parent's agent id by closure). Absent = no child-request path. */
+  readonly parentTools?: (agentId: string) => readonly NativeAgentTool[];
   readonly log?: Log;
 }
 
@@ -86,8 +85,8 @@ export function renderMinionBriefing(input: {
   agentId?: string;
   /** Progressive-disclosure reference lines (no chapter bodies). */
   lessons?: readonly LessonPointer[];
-  /** Issue #161: the parent-scoped capability file for child requests. */
-  credentialFile?: string;
+  /** Issue #161: this parent has GC-mediated child-worker tools wired. */
+  childWorkerTools?: boolean;
 }): string {
   const lessonsSection = renderLessonsSection(input.lessons ?? []);
   return [
@@ -103,18 +102,17 @@ export function renderMinionBriefing(input: {
     '',
     PR_CREATION_RULE,
     '',
-    ...(input.agentId === undefined || input.credentialFile === undefined
-      ? []
-      : [
+    ...(input.childWorkerTools === true
+      ? [
           'Independent capacity: if the briefing calls for one independent worker',
-          '(e.g. read-only verification), request a GC-tracked child worker through',
-          'the service\'s authenticated child surface:',
-          `  POST /api/dispatch/child with \`Authorization: Bearer <contents of ${input.credentialFile}>\``,
-          '  and `parent_agent_id` set to YOUR agent id above.',
-          'That credential is scoped to this session — never use or quote the operator',
-          'pairing token. Never launch external or headless agents yourself.',
+          '(e.g. read-only verification), use the GC-owned `request_child_worker`',
+          'tool to commission one tracked child, `list_child_workers` to discover',
+          'its durable result, and `cancel_child_worker` to stop it. Children',
+          'cannot commission children; never launch external or headless agents',
+          'yourself.',
           '',
-        ]),
+        ]
+      : []),
     'Execute the briefing inside this worktree. Standing orders: work only',
     'inside this tree; commit your work to the branch; verify it (build,',
     'tests, lint — whatever this project calls green) before finishing;',
@@ -232,7 +230,18 @@ export class DispatchService {
       let handle: AgentHandle;
       try {
         const cwd = requireSpawnCwd('minion', worktree.path);
-        handle = await this.opts.spawner('minion', { cwd });
+        // Issue #161: a dispatched parent gets a product-owned identity and
+        // the GC-mediated child tools bound to it — no bearer secret ever
+        // reaches the session (the tools execute in the service process).
+        const parentAgentId =
+          this.opts.parentTools === undefined ? undefined : `minion_${randomUUID()}`;
+        handle = await this.opts.spawner('minion', {
+          cwd,
+          ...(parentAgentId !== undefined ? { agentId: parentAgentId } : {}),
+          ...(parentAgentId !== undefined
+            ? { nativeTools: this.opts.parentTools!(parentAgentId) }
+            : {}),
+        });
       } catch (error) {
         // The lane cannot start — release the pacing slot, sweep the fresh
         // worktree (preserve first, per ruling 18c) and block the job.
@@ -407,13 +416,6 @@ export class DispatchService {
       // the legacy void. The verdict is derived INSIDE this first `.then`
       // (never an extra helper hop): the worker-admission release below is
       // settle-leaf ordered and must not gain a microtask.
-      // Issue #161: mint the parent's scoped child-request capability BEFORE
-      // the briefing that names it (the session can then commission children
-      // without ever touching the operator token).
-      const credentialFile =
-        this.opts.parentCredentials === undefined
-          ? undefined
-          : this.opts.parentCredentials.issueParentCredential(handle.id).tokenFile;
       const briefing = renderMinionBriefing({
         jobId: job.id,
         repoName,
@@ -422,7 +424,7 @@ export class DispatchService {
         sha: worktree.sha,
         briefing: input.briefing,
         agentId: handle.id,
-        ...(credentialFile !== undefined ? { credentialFile } : {}),
+        ...(this.opts.parentTools !== undefined ? { childWorkerTools: true } : {}),
         ...(lessons.length > 0 ? { lessons } : {}),
       });
       const promptRun: Promise<unknown> =
@@ -534,8 +536,18 @@ export class DispatchService {
     jobId: string,
     opts: { confirmKill?: boolean; baseBranch?: string } = {},
   ): Promise<WorktreeSweepResult | null> {
-    // Issue #161: only the JOB's own lane — a linked child (or review) lane
-    // that shares the job scope must never be swept in its place.
+    // Issue #161: a job release never abandons a live child worker.
+    const outstanding = this.opts.ledger
+      .listChildWorkers({ jobId })
+      .filter((child) => child.resultState === null);
+    if (outstanding.length > 0) {
+      throw new Error(
+        `job "${jobId}" has ${outstanding.length} non-terminal child worker(s) — cancel them first ` +
+          '(POST /api/dispatch/children/:id/cancel)',
+      );
+    }
+    // Only the JOB's own lane — a linked child (or review) lane that shares
+    // the job scope must never be swept in its place.
     const lanes = this.opts.worktrees.listWorktrees({ jobId });
     const active = lanes.find((lane) => lane.kind === 'job' && lane.status !== 'swept');
     if (active === undefined) return null;

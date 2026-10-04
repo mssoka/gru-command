@@ -1,6 +1,7 @@
+import { randomUUID } from 'node:crypto';
 import type { Role } from '../config.js';
 import type { LedgerApi } from '../ledger/api.js';
-import type { AgentHandle, SpawnOptions } from '../runtime/types.js';
+import type { AgentHandle, NativeAgentTool, SpawnOptions } from '../runtime/types.js';
 import { WorkerDisposalInProgressError } from '../runtime/worker-errors.js';
 import { requireSpawnCwd } from '../roles.js';
 import { appendLessonPointers, renderLessonsSection } from '../lessons/references.js';
@@ -20,6 +21,27 @@ import { settleRetries, type PacingGate, type PacingLease, type RetrySettlement 
  * between them.
  */
 
+/** The product-owned identity + GC-mediated child tools for a
+ * (re)dispatched parent session (issue #161). A resumed row keeps its id
+ * (one logical worker, one identity); a fresh replacement mints one. */
+function parentIdentitySpawnOptions(
+  input: {
+    readonly parentTools?: (agentId: string) => readonly NativeAgentTool[];
+    readonly ledger: Pick<LedgerApi, 'listAgents'>;
+  },
+  resumeFile: string | null,
+): Pick<SpawnOptions, 'agentId' | 'nativeTools'> {
+  const resumed =
+    resumeFile === null
+      ? undefined
+      : input.ledger.listAgents().find((agent) => agent.sessionFile === resumeFile);
+  const agentId = resumed?.id ?? `minion_${randomUUID()}`;
+  return {
+    agentId,
+    ...(input.parentTools !== undefined ? { nativeTools: input.parentTools(agentId) } : {}),
+  };
+}
+
 /** The registry surface directive routing needs (structural — the real
  * RuntimeRegistry satisfies it; tests drive a controllable fake). */
 export interface DirectiveRegistry {
@@ -34,6 +56,9 @@ export interface DirectiveRoutingDeps {
   readonly worktrees: WorktreePort;
   /** Book of Lessons injection: pointer lines only, never chapter bodies. */
   readonly lessons?: LessonsReferencePort;
+  /** Issue #161: GC-mediated child-worker tools for a (re)dispatched parent
+   * session, bound to its product-owned agent id by closure. */
+  readonly parentTools?: (agentId: string) => readonly NativeAgentTool[];
   /** Provider pacing: worker (minion turn) admission gate. Absent = off. */
   readonly workerGate?: PacingGate;
   /** Provider pacing: the bounded settlement of an automatic rate-limit
@@ -194,11 +219,16 @@ export async function routeFixDirectiveToMinion(
       ? ([...minions].reverse().find((minion) => minion.sessionFile !== null)?.sessionFile ?? null)
       : null;
     const resumeFile = evictedSessionFile ?? fallback;
+    // Issue #161: the (re)dispatched parent keeps one product-owned id
+    // (the resumed row's id, else a fresh one) and receives the GC-mediated
+    // child tools bound to it — re-briefed parents stay able to commission.
+    const identity = parentIdentitySpawnOptions(input, resumeFile);
     let prompt = directive;
     try {
       handle = await input.registry.spawn('minion', {
         cwd: lane.path, signal: input.signal,
         ...(resumeFile !== null ? { resumeFile } : {}),
+        ...identity,
       });
     } catch (error) {
       if (resumeFile === null || input.signal.aborted) throw error;
@@ -206,7 +236,7 @@ export async function routeFixDirectiveToMinion(
       if (job == null || job.briefing == null) {
         throw new Error(`cannot resume prior minion session for job ${input.jobId} and no original briefing is available to re-brief: ${String(error)}`);
       }
-      handle = await input.registry.spawn('minion', { cwd: lane.path, signal: input.signal });
+      handle = await input.registry.spawn('minion', { cwd: lane.path, signal: input.signal, ...identity });
       prompt = `Fresh minion re-brief for job ${input.jobId}. Original contract:\n${job.briefing}\n\nCurrent fix directive:\n${directive}`;
     }
     let promptError: unknown = null;
@@ -447,9 +477,16 @@ export async function rebriefFreshMinion(
       input.beforeTurnSideEffect?.();
     }
     input.beforeTurnSideEffect?.();
+    // Issue #161: a fresh/resumed re-brief parent keeps a product-owned id
+    // (the resumed row's id, else a fresh one) plus the child tools.
+    const identity = parentIdentitySpawnOptions(
+      input,
+      input.resumeFile !== undefined && input.resumeFile !== null ? input.resumeFile : null,
+    );
     const handle = await input.registry.spawn('minion', {
       cwd,
       ...(input.resumeFile !== undefined && input.resumeFile !== null ? { resumeFile: input.resumeFile } : {}),
+      ...identity,
     });
     let prompt: string;
     try {
