@@ -69,6 +69,7 @@ function wholeHarness(
     beforeFreeze?: (repo: FixtureRepo) => void;
     reviewGate?: PacingGate;
     pacing?: Pick<PerkinsWholeReviewOptions, 'rateLimitBackoff' | 'recordPacing' | 'pacingSleep' | 'pacingJitter' | 'pacingNow'>;
+    onProgress?: PerkinsWholeReviewOptions['onProgress'];
   },
 ): WholeHarness {
   const fixture = makeReviewRepo();
@@ -94,6 +95,7 @@ function wholeHarness(
     policy: loadPerkinsPolicy(),
     ...(options?.reviewGate !== undefined ? { reviewGate: options.reviewGate } : {}),
     ...(options?.pacing ?? {}),
+    ...(options?.onProgress !== undefined ? { onProgress: options.onProgress } : {}),
   });
   return {
     ...fixture,
@@ -533,6 +535,115 @@ describe('Perkins whole-PR lead engine', () => {
     }
     expect(existsSync(join(h.frozen.directory, 'lead/preflight-attempt-1.json'))).toBe(true);
     expect(existsSync(join(h.frozen.directory, 'lead/preflight-attempt-2.json'))).toBe(true);
+  });
+
+  it('#87 resumes an identical terminal submission after report publication but before consolidation', async () => {
+    let directory = '';
+    const h = wholeHarness({
+      ...ALL_CLEAN,
+      submitRetries: 1,
+      beforeSubmit: () => { mkdirSync(join(directory, 'consolidated.json')); },
+      submitPayload: (attempt, submission) => {
+        if (attempt === 2) rmSync(join(directory, 'consolidated.json'), { recursive: true });
+        return submission;
+      },
+    });
+    directory = h.frozen.directory;
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    expect(h.toolErrors.filter((entry) => entry.tool === 'perkins_submit_review')).toHaveLength(1);
+    expect(readFileSync(result.reportFile, 'utf8')).toContain('**Verdict: READY TO MERGE**');
+    expect(existsSync(join(directory, 'consolidated.json'))).toBe(true);
+    expect(existsSync(join(directory, 'lead/submission-attempt-2.json'))).toBe(true);
+  });
+
+  it('#87 rejects a changed terminal report after partial publication without overwriting it', async () => {
+    let directory = '';
+    const h = wholeHarness({
+      ...ALL_CLEAN,
+      submitRetries: 1,
+      beforeSubmit: () => { mkdirSync(join(directory, 'consolidated.json')); },
+      submitPayload: (attempt, submission) => {
+        if (attempt === 2) {
+          rmSync(join(directory, 'consolidated.json'), { recursive: true });
+          return { ...submission, report_markdown: `${submission.report_markdown}\nchanged report` };
+        }
+        return submission;
+      },
+    });
+    directory = h.frozen.directory;
+    await expect(h.run()).rejects.toThrow(/terminal retry differs from the published submission/);
+    const original = readFileSync(join(directory, 'perkins-report.md'), 'utf8');
+    expect(original).not.toContain('changed report');
+    expect(existsSync(join(directory, 'consolidated.json'))).toBe(false);
+  });
+
+  it('#87 refuses an identical retry if the already-published report bytes changed', async () => {
+    let directory = '';
+    let tamperedReport = '';
+    const h = wholeHarness({
+      ...ALL_CLEAN, submitRetries: 1,
+      beforeSubmit: () => { mkdirSync(join(directory, 'consolidated.json')); },
+      submitPayload: (attempt, submission) => {
+        if (attempt === 2) {
+          rmSync(join(directory, 'consolidated.json'), { recursive: true });
+          const file = join(directory, 'perkins-report.md');
+          tamperedReport = readFileSync(file, 'utf8').replace(
+            '**Verdict: READY TO MERGE**', '**Verdict: NEEDS CHANGES**',
+          );
+          writeFileSync(file, tamperedReport);
+        }
+        return submission;
+      },
+    });
+    directory = h.frozen.directory;
+    const error = await h.run().then(() => { throw new Error('expected retry to fail'); }, (failure: Error) => failure);
+    expect(error.message).toMatch(/EEXIST/);
+    expect(tamperedReport).toContain('**Verdict: NEEDS CHANGES**');
+    expect(readFileSync(join(directory, 'perkins-report.md'), 'utf8')).toBe(tamperedReport);
+    expect(existsSync(join(directory, 'consolidated.json'))).toBe(false);
+    expect(h.toolErrors.filter((entry) => entry.tool === 'perkins_submit_review')).toHaveLength(2);
+  });
+
+  it('#87 rejects changed findings despite byte-identical report on partial retry', async () => {
+    let directory = '';
+    const h = wholeHarness({
+      ...ALL_CLEAN, submitRetries: 1,
+      leadFinding: groundedFinding('lead', 'note'),
+      beforeSubmit: () => { mkdirSync(join(directory, 'consolidated.json')); },
+      submitPayload: (attempt, submission) => {
+        if (attempt === 2) {
+          rmSync(join(directory, 'consolidated.json'), { recursive: true });
+          return { ...submission, findings: submission.findings.map((finding) => ({ ...finding, detail: 'Changed detail without changing the report.' })) };
+        }
+        return submission;
+      },
+    });
+    directory = h.frozen.directory;
+    await expect(h.run()).rejects.toThrow(/terminal retry differs from the published submission/);
+    expect(existsSync(join(directory, 'consolidated.json'))).toBe(false);
+    expect(readFileSync(join(directory, 'lead/submission-attempt-1.json'), 'utf8')).not.toContain('Changed detail without changing the report.');
+  });
+
+  it('#87 rejects trailing-whitespace-only report changes without touching published bytes', async () => {
+    let directory = '';
+    let originalReport = '';
+    const h = wholeHarness({
+      ...ALL_CLEAN, submitRetries: 1,
+      beforeSubmit: () => { mkdirSync(join(directory, 'consolidated.json')); },
+      submitPayload: (attempt, submission) => {
+        if (attempt === 2) {
+          originalReport = readFileSync(join(directory, 'perkins-report.md'), 'utf8');
+          rmSync(join(directory, 'consolidated.json'), { recursive: true });
+          return { ...submission, report_markdown: `${submission.report_markdown} ` };
+        }
+        return submission;
+      },
+    });
+    directory = h.frozen.directory;
+    await expect(h.run()).rejects.toThrow(/terminal retry differs from the published submission/);
+    expect(readFileSync(join(directory, 'perkins-report.md'), 'utf8')).toBe(originalReport);
+    expect(existsSync(join(directory, 'consolidated.json'))).toBe(false);
   });
 
   it('the third real terminal submission is refused even when preflights were free', async () => {
@@ -1165,6 +1276,122 @@ describe('whole-PR engine: independent-review repairs', () => {
     // A file replaced by a directory is ambiguous: refuse, never silently
     // return descendant hunks.
     await expect(tool.execute({ path: 'src/replaced.txt' })).rejects.toThrow(/ambiguous/);
+  });
+});
+
+describe('Stage 2 specialist accounting', () => {
+  it('#79 seals a settled valid sibling as undelivered when another child rejects the batch', async () => {
+    let rejectEdge = true;
+    const h = wholeHarness({
+      specialists: ['security', 'edge'],
+      childAnswer: (prompt) => prompt.includes('"source": "security"')
+        ? JSON.stringify([groundedFinding('security', 'warning')]) : '[]',
+    }, {
+      onProgress: (event) => {
+        if (event.lens === 'edge' && event.state === 'running' && rejectEdge) {
+          rejectEdge = false;
+          throw new Error('edge batch rejected');
+        }
+      },
+    });
+    const directory = h.frozen.directory;
+    const result = await h.run();
+    expect(h.toolErrors.some((entry) => entry.tool === 'perkins_run_specialists' && /edge batch rejected/.test(entry.error))).toBe(true);
+    const validSibling = result.specialistRuns.find((run) => run.lens === 'security');
+    expect(validSibling).toMatchObject({ status: 'valid', findingsDelivered: false });
+    const consolidated = JSON.parse(readFileSync(join(directory, 'consolidated.json'), 'utf8')) as { specialistRuns: Array<{ lens: string; findingsDelivered?: boolean }> };
+    expect(consolidated.specialistRuns.find((run) => run.lens === 'security')?.findingsDelivered).toBe(false);
+    expect(result.findings).toEqual([]);
+  });
+
+  it('#80 consumes a failed started child despite rejected primary evidence writes', async () => {
+    let directory = '';
+    const h = wholeHarness({
+      specialists: ['edge'],
+      childAnswer: (prompt) => {
+        if (prompt.includes('RETRY CORRECTION')) {
+          rmSync(join(directory, 'specialists'));
+          return '[]';
+        }
+        // A regular file is never an artifact directory, even for a
+        // privileged runner that could write through chmod restrictions.
+        writeFileSync(join(directory, 'specialists'), 'blocked');
+        throw new Error('edge turn failed');
+      },
+    });
+    directory = h.frozen.directory;
+    const result = await h.run();
+    const runs = result.specialistRuns.filter((run) => run.lens === 'edge');
+    expect(runs).toMatchObject([
+      { attempt: 1, status: 'failed', failureKind: 'error', error: 'edge turn failed', evidenceRecordingError: expect.stringMatching(/real directory/) },
+      { attempt: 2, status: 'valid' },
+    ]);
+    const consolidated = JSON.parse(readFileSync(join(directory, 'consolidated.json'), 'utf8')) as { specialistRuns: typeof runs };
+    expect(consolidated.specialistRuns).toMatchObject(runs);
+    const receipt = JSON.parse(readFileSync(join(directory, 'lead/receipt.json'), 'utf8')) as { specialistRuns: number };
+    expect(receipt.specialistRuns).toBe(2);
+    const fallbackFile = readdirSync(join(directory, 'children')).find((name) => name.startsWith('failed-edge-a1-'));
+    expect(fallbackFile).toBeDefined();
+    const fallback = JSON.parse(readFileSync(join(directory, 'children', fallbackFile!), 'utf8')) as typeof runs[number];
+    expect(fallback).toMatchObject({
+      lens: 'edge', attempt: 1, status: 'failed', failureKind: 'error',
+      error: 'edge turn failed', evidenceRecordingError: expect.stringMatching(/real directory/),
+    });
+  });
+
+  it('keeps a validated child valid when its raw evidence write fails', async () => {
+    let directory = '';
+    const h = wholeHarness({
+      specialists: ['edge'],
+      childAnswer: () => {
+        writeFileSync(join(directory, 'specialists'), 'blocked');
+        return JSON.stringify([groundedFinding('edge', 'warning')]);
+      },
+    });
+    directory = h.frozen.directory;
+    const result = await h.run();
+    expect(result.specialistRuns).toMatchObject([{ lens: 'edge', attempt: 1, status: 'valid', evidenceRecordingError: expect.stringMatching(/real directory/) }]);
+    expect(result.findings).toHaveLength(1);
+    expect(h.childCalls).toHaveLength(1);
+    const consolidated = JSON.parse(readFileSync(join(directory, 'consolidated.json'), 'utf8')) as { specialistRuns: Array<{ status: string; evidenceRecordingError?: string }> };
+    expect(consolidated.specialistRuns[0]).toMatchObject({ status: 'valid', evidenceRecordingError: expect.stringMatching(/real directory/) });
+  });
+
+  it('retains valid raw/envelope and writes a distinct fallback if the child record fails', async () => {
+    let directory = '';
+    const h = wholeHarness({
+      specialists: ['edge'],
+      childAnswer: (_prompt, call) => {
+        const id = `edge-a1-${createHash('sha256').update(call.agentId).digest('hex').slice(0, 16)}`;
+        mkdirSync(join(directory, 'children', `${id}.json`), { recursive: true });
+        return JSON.stringify([groundedFinding('edge', 'warning')]);
+      },
+    });
+    directory = h.frozen.directory;
+    const result = await h.run();
+    expect(result.specialistRuns).toMatchObject([{ lens: 'edge', status: 'valid', evidenceRecordingError: expect.stringMatching(/children.*EEXIST/) }]);
+    const files = readdirSync(join(directory, 'specialists')).filter((name) => name.startsWith('edge.'));
+    expect(files.filter((name) => name.endsWith('.raw.json'))).toHaveLength(1);
+    const envelopeFile = files.find((name) => name.endsWith('.envelope.json'))!;
+    const envelope = JSON.parse(readFileSync(join(directory, 'specialists', envelopeFile), 'utf8')) as { status: string; findings: unknown[] };
+    expect(envelope).toMatchObject({ status: 'valid', findings: [groundedFinding('edge', 'warning')] });
+    const fallbackFile = readdirSync(join(directory, 'children')).find((name) => name.includes('.recording-error-'))!;
+    const fallback = JSON.parse(readFileSync(join(directory, 'children', fallbackFile), 'utf8')) as { status: string; evidenceRecordingError: string; findings: unknown[] };
+    expect(fallback).toMatchObject({ status: 'valid', evidenceRecordingError: expect.stringMatching(/EEXIST/), findings: [groundedFinding('edge', 'warning')] });
+    expect(result.findings).toHaveLength(1);
+  });
+
+  it('accounts a settled valid child when the done-progress observer throws', async () => {
+    const h = wholeHarness({ specialists: ['edge'], childAnswer: () => '[]' }, {
+      onProgress: (event) => { if (event.state === 'done') throw new Error('progress observer unavailable'); },
+    });
+    const result = await h.run();
+    expect(h.childCalls).toHaveLength(1);
+    expect(result.specialistRuns).toMatchObject([{ lens: 'edge', attempt: 1, status: 'valid', progressError: 'progress observer unavailable' }]);
+    const consolidated = JSON.parse(readFileSync(join(result.artifactDirectory, 'consolidated.json'), 'utf8')) as { specialistRuns: Array<{ progressError?: string }> };
+    expect(consolidated.specialistRuns[0]?.progressError).toBe('progress observer unavailable');
+    const receipt = JSON.parse(readFileSync(join(result.artifactDirectory, 'lead/receipt.json'), 'utf8')) as { specialistRuns: number };
+    expect(receipt.specialistRuns).toBe(1);
   });
 });
 
@@ -1955,11 +2182,89 @@ describe('provider pacing: workflow rate-limit retry and cleanup', () => {
     expect(sleep).not.toHaveBeenCalled();
   });
 
-  it('rejecting lead disposal still returns every pacing lease', async () => {
+  it('#86 preserves an accepted review despite lead disposal failure and records the failure', async () => {
     const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 0, maxConcurrentReviewTurns: 1 });
     const h = wholeHarness({ childAnswer: () => '[]', specialists: [], disposeRejects: (call) => call.options.reviewLead !== undefined }, { reviewGate: gate });
-    await expect(h.run()).rejects.toThrow('simulated session dispose failure');
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    expect(existsSync(join(result.artifactDirectory, 'consolidated.json'))).toBe(true);
+    const cleanup = JSON.parse(readFileSync(join(result.artifactDirectory, 'lead/dispose-error.json'), 'utf8')) as { error: string; agentId: string };
+    expect(cleanup).toEqual({ error: 'simulated session dispose failure', agentId: h.leadCalls[0]!.agentId });
     expect(gate.view().review).toMatchObject({ running: 0, queued: [] });
+  });
+
+  it('#86 keeps the receipt-write failure primary when lead disposal also rejects', async () => {
+    let directory = '';
+    const h = wholeHarness({
+      ...ALL_CLEAN,
+      beforeSubmit: () => { mkdirSync(join(directory, 'lead/receipt.json'), { recursive: true }); },
+      disposeRejects: (call) => call.options.reviewLead !== undefined,
+    });
+    directory = h.frozen.directory;
+    const error = await h.run().then(() => { throw new Error('expected receipt failure'); }, (failure: NodeJS.ErrnoException) => failure);
+    expect(error.message).toMatch(/EEXIST/);
+    expect(error.message).toContain('lead/receipt.json');
+    expect(existsSync(join(directory, 'consolidated.json'))).toBe(true);
+    expect(JSON.parse(readFileSync(join(directory, 'lead/dispose-error.json'), 'utf8'))).toEqual({
+      error: 'simulated session dispose failure', agentId: h.leadCalls[0]!.agentId,
+    });
+  });
+
+  it('#86 records a distinct cleanup fallback when the primary path collides', async () => {
+    let directory = '';
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const h = wholeHarness({
+      ...ALL_CLEAN,
+      disposeRejects: (call) => {
+        if (call.options.reviewLead === undefined) return false;
+        mkdirSync(join(directory, 'lead/dispose-error.json'));
+        return true;
+      },
+    });
+    directory = h.frozen.directory;
+    try {
+      const result = await h.run();
+      expect(result.canonicalVerdict).toBe('READY TO MERGE');
+      expect(existsSync(join(directory, 'consolidated.json'))).toBe(true);
+      expect(readdirSync(join(directory, 'lead/dispose-error.json'))).toEqual([]);
+      expect(JSON.parse(readFileSync(join(directory, 'lead/dispose-error-fallback.json'), 'utf8'))).toEqual({
+        error: 'simulated session dispose failure',
+        agentId: h.leadCalls[0]!.agentId,
+        recordingError: expect.stringMatching(/EEXIST/),
+      });
+      expect(log).not.toHaveBeenCalled();
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('#86 preserves acceptance and logs both recording failures when fallback also collides', async () => {
+    let directory = '';
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const h = wholeHarness({
+      ...ALL_CLEAN,
+      disposeRejects: (call) => {
+        if (call.options.reviewLead === undefined) return false;
+        mkdirSync(join(directory, 'lead/dispose-error.json'));
+        mkdirSync(join(directory, 'lead/dispose-error-fallback.json'));
+        return true;
+      },
+    });
+    directory = h.frozen.directory;
+    try {
+      const result = await h.run();
+      expect(result.canonicalVerdict).toBe('READY TO MERGE');
+      expect(existsSync(join(directory, 'consolidated.json'))).toBe(true);
+      expect(log).toHaveBeenCalledWith(expect.stringMatching(/Perkins lead disposal failed:.*could not record cleanup evidence:.*fallback:.*EEXIST/));
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('#86 propagates lead disposal failure when no terminal submission was accepted', async () => {
+    const h = wholeHarness({ ...ALL_CLEAN, neverSubmit: true, disposeRejects: (call) => call.options.reviewLead !== undefined });
+    await expect(h.run()).rejects.toThrow('simulated session dispose failure');
+    expect(existsSync(join(h.frozen.directory, 'consolidated.json'))).toBe(false);
   });
 
   it('disabled pacing keeps the normal lens fan-out even with configured caps', async () => {

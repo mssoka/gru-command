@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, linkSync, lstatSync, mkdirSync, realpathSync, unlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, fstatSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, unlinkSync, writeFileSync, constants } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { BranchIdleTag } from '../branch-idle.js';
 
@@ -383,6 +383,22 @@ export function refMovedSinceFreeze(review: FrozenReview): boolean {
     return false;
   } catch {
     return true;
+  }
+}
+
+/** Only the terminal retry may compare a previously published report. A
+ * no-follow descriptor and byte bound keep this check inside the same safe
+ * round directory without relaxing write-once artifact publication. */
+export function publishedReportMatches(review: FrozenReview, expected: string): boolean {
+  const root = ensureDirectoryWithoutSymlinks(review.directory);
+  const descriptor = openSync(join(root, 'perkins-report.md'), constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const info = fstatSync(descriptor);
+    const bytes = Buffer.from(expected, 'utf8');
+    if (!info.isFile() || info.size !== bytes.length) return false;
+    return readFileSync(descriptor).equals(bytes);
+  } finally {
+    closeSync(descriptor);
   }
 }
 

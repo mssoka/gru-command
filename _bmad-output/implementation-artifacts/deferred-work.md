@@ -16,3 +16,9 @@
 - source_spec: `_bmad-output/implementation-artifacts/pr136-chief-handoff/plan.md`
   summary: `reconcilePendingRebriefs` delivery-only branch may append a `silas.rebrief-recovered` event for a marker group replaced by a newer request mid-boot
   evidence: Markers are read as a boot snapshot; a newer re-brief request can replace them while recovery runs. The `expectedPhaseId` fence added by this delta prevents any phase completion from the stale group (and nothing is cleared), but the recovered-history event is still appended as noise.
+- source_spec: none
+  summary: Investigate and resolve five unrelated UI screenshot/reflow failures in `npm run e2e`.
+  evidence: The Stage 2 run at cd8965c34b88e87fd32037025f86b3b698941afc had 46 e2e passes and five UI failures; this is independently shippable from the Stage 1 verify-scope routing fix and must not silently enter the Stage 2 behavior change.
+- source_spec: none
+  summary: Obtain scheduled full `/api/verify` receipts, exact-head CI, and native Perkins READY for the final Stage 2 head.
+  evidence: These operational gates require a final clean head and authenticated job/receipt context and are independent of repairing the Stage 1 verify-scope command; run them after the code and test fixes are finalized.
