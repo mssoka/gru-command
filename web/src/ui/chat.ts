@@ -158,6 +158,11 @@ export class ChatView {
   private pendingResetView: PendingResetView | null = null;
   private controlsConnected = false;
   private requestControl: ((action: ControlAction) => boolean) | null = null;
+  /** True while an Enter press that was intercepted (sent) is still held
+   * down: its auto-repeats must keep suppressing the native default even
+   * when modifiers change mid-hold (an Enter hold followed by Shift). A
+   * hold that started as Shift+Enter keeps its native newline repeats. */
+  private enterPressSent = false;
 
   constructor(
     private readonly onSend: (
@@ -178,17 +183,28 @@ export class ChatView {
     // composing (isComposing; keyCode 229 is the legacy composition code
     // some browsers still emit).
     this.input.addEventListener('keydown', (event) => {
-      if (event.key !== 'Enter' || event.shiftKey) return;
+      if (event.key !== 'Enter') return;
+      if (event.repeat) {
+        // The repeat belongs to the held Enter that just sent: keep its
+        // native default suppressed even if Shift was pressed during the
+        // hold, or the repeats type newlines into the cleared composer.
+        if (this.enterPressSent) event.preventDefault();
+        return;
+      }
+      this.enterPressSent = false;
+      if (event.shiftKey) return;
       if (this.coarse.matches) return;
       if (event.altKey || event.ctrlKey || event.metaKey) return;
       if (event.isComposing || event.keyCode === 229) return;
-      // Every intercepted press blocks the native default — including
-      // auto-repeats: the first press just sent and cleared the composer,
-      // so a still-held Enter's default would type stray newlines into
-      // the fresh draft. Submit only the first press.
+      // The intercepted press blocks the native default and submits: the
+      // composer clears, and every later repeat of this held key is caught
+      // above so nothing refills the fresh draft.
       event.preventDefault();
-      if (event.repeat) return;
+      this.enterPressSent = true;
       this.form.requestSubmit();
+    });
+    this.input.addEventListener('keyup', (event) => {
+      if (event.key === 'Enter') this.enterPressSent = false;
     });
     // Auto-grow with content; the CSS max-height is the hard cap (the
     // textarea scrolls internally past it) and this keeps height honest.
@@ -845,6 +861,11 @@ export class ChatView {
   addFrame(frame: LoggedFrame, live: boolean): void {
     switch (frame.type) {
       case 'user': {
+        // A user frame is conversation: it ends any open service run, even
+        // on replay where the bubble may already be pre-rendered (main.ts
+        // renders pending messages before a full replay). upsertMessage's
+        // own close covers the optimistic-send path only.
+        this.closeServiceBand();
         this.upsertMessage(
           {
             client_msg_id: frame.client_msg_id,

@@ -285,4 +285,28 @@ describe('service band — consecutive service frames collapse', () => {
     expect(bands).toHaveLength(2);
     expect(bands[1]?.querySelectorAll('.tool-line')).toHaveLength(1);
   });
+
+  it('a replayed user frame closes the run even when its bubble was pre-rendered (#118 replay)', () => {
+    const view = new ChatView(() => true);
+    view.reset();
+    // Full replay: main.ts re-renders locally pending bubbles before the
+    // replayed frames arrive, so the frame's bubble already exists.
+    view.upsertMessage(
+      { client_msg_id: 'pending-1', text: 'queued words', status: 'queued' },
+      true,
+    );
+    view.addFrame(tool('start', 'read_file'), true);
+    view.addFrame(tool('end', 'read_file'), true);
+    // The replay reaches the logged user frame for that same message.
+    view.addFrame(
+      { type: 'user', client_msg_id: 'pending-1', text: 'queued words', seq: (seq += 1) },
+      false,
+    );
+    view.addFrame(notice('replayed wake'), false);
+
+    const bands = log().querySelectorAll('.service-band');
+    expect(bands).toHaveLength(2);
+    expect(bands[0]?.querySelectorAll('.tool-line')).toHaveLength(1);
+    expect(bands[1]?.querySelectorAll('.notice-line')).toHaveLength(1);
+  });
 });
