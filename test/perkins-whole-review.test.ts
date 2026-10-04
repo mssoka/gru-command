@@ -1168,6 +1168,64 @@ describe('whole-PR engine: independent-review repairs', () => {
   });
 });
 
+describe('Stage 2 specialist accounting', () => {
+  it('#79 seals a settled valid sibling as undelivered when another child rejects the batch', async () => {
+    let directory = '';
+    const h = wholeHarness({
+      specialists: ['security', 'edge'],
+      childAnswer: async (prompt) => {
+        if (prompt.includes('"source": "security"')) return JSON.stringify([groundedFinding('security', 'warning')]);
+        if (prompt.includes('RETRY CORRECTION')) {
+          chmodSync(join(directory, 'specialists'), 0o700);
+          return '[]';
+        }
+        await vi.waitFor(() => expect(existsSync(join(directory, 'children')) &&
+          readdirSync(join(directory, 'children')).some((name) => name.startsWith('security-a1-'))).toBe(true));
+        chmodSync(join(directory, 'specialists'), 0o500);
+        throw new Error('edge turn failed');
+      },
+      beforeSubmit: () => { chmodSync(join(directory, 'specialists'), 0o700); },
+    });
+    directory = h.frozen.directory;
+    const result = await h.run();
+    expect(h.toolErrors.some((entry) => entry.tool === 'perkins_run_specialists' && /EACCES/.test(entry.error))).toBe(true);
+    const validSibling = result.specialistRuns.find((run) => run.lens === 'security');
+    expect(validSibling).toMatchObject({ status: 'valid', findingsDelivered: false });
+    const consolidated = JSON.parse(readFileSync(join(directory, 'consolidated.json'), 'utf8')) as { specialistRuns: Array<{ lens: string; findingsDelivered?: boolean }> };
+    expect(consolidated.specialistRuns.find((run) => run.lens === 'security')?.findingsDelivered).toBe(false);
+    expect(result.findings).toEqual([]);
+  });
+
+  it('#80 consumes a failed started child despite rejected primary evidence writes', async () => {
+    let directory = '';
+    const h = wholeHarness({
+      specialists: ['edge'],
+      childAnswer: (prompt) => {
+        if (prompt.includes('RETRY CORRECTION')) {
+          chmodSync(join(directory, 'specialists'), 0o700);
+          return '[]';
+        }
+        mkdirSync(join(directory, 'specialists'), { recursive: true });
+        chmodSync(join(directory, 'specialists'), 0o500);
+        throw new Error('edge turn failed');
+      },
+      beforeSubmit: () => { chmodSync(join(directory, 'specialists'), 0o700); },
+    });
+    directory = h.frozen.directory;
+    const result = await h.run();
+    const runs = result.specialistRuns.filter((run) => run.lens === 'edge');
+    expect(runs).toMatchObject([
+      { attempt: 1, status: 'failed', failureKind: 'error', error: 'edge turn failed', evidenceRecordingError: expect.stringMatching(/EACCES/) },
+      { attempt: 2, status: 'valid' },
+    ]);
+    const consolidated = JSON.parse(readFileSync(join(directory, 'consolidated.json'), 'utf8')) as { specialistRuns: typeof runs };
+    expect(consolidated.specialistRuns).toMatchObject(runs);
+    const receipt = JSON.parse(readFileSync(join(directory, 'lead/receipt.json'), 'utf8')) as { specialistRuns: number };
+    expect(receipt.specialistRuns).toBe(2);
+    expect(readdirSync(join(directory, 'children')).some((name) => name.startsWith('failed-edge-a1-'))).toBe(true);
+  });
+});
+
 describe('whole-PR engine: six-blocker specialist-cleanup repairs (T13)', () => {
   const childOnly = (call: WholeSpawnCall): boolean => call.options.reviewLead === undefined;
   const securityOnly = (call: WholeSpawnCall): boolean =>

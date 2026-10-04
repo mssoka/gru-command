@@ -1201,12 +1201,12 @@ export class PerkinsWholeReview {
           // The lead receives NO response for this batch either: every
           // committed valid run's findings were not delivered (R17), and
           // the durable record must say so.
+          commitSettled();
           for (const result of committed) {
             if (result.findingsDelivered !== false) {
               results.set(result.resultId, { ...result, findingsDelivered: false });
             }
           }
-          commitSettled();
           // Only lenses that produced NO result never ran: restore their
           // attempt budget and started count. Lenses that ran keep their
           // accounted state — their evidence already stands.
