@@ -1628,7 +1628,7 @@ export class WaveRunner {
         recovered += 1;
         continue;
       }
-      const note = 'review interrupted by service restart; required lens/verification proof is incomplete';
+      const note = 'review interrupted by service restart; selected lens/verification proof is incomplete';
       this.abortRound(round, note);
       const artifacts = this.writeInterruptedArtifacts(round.id, 'service_restart', note);
       this.opts.ledger.appendCustomEvent({

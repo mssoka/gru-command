@@ -1286,8 +1286,9 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     const handles: AgentHandle[] = [];
     const configFiles: string[] = [];
     try {
-      // Concurrency note: a hybrid round runs up to seven lens children at
-      // once; each gets its OWN bridge, and none may outlive its session.
+      // Concurrency note: a hybrid round runs as many concurrent lens
+      // children as its admitted wave allows (the catalog has nine lenses);
+      // each gets its OWN bridge, and none may outlive its session.
       for (let index = 0; index < 7; index += 1) {
         const handle = await fx.runtime.spawn('perkins', {
           cwd: fx.workspace,

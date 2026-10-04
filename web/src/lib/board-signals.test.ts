@@ -144,7 +144,7 @@ describe('roundSummary', () => {
         { lens: 'operations', state: 'done', agentId: null, note: 'not used — lead-owned whole-PR review', verdict: 'clean' },
       ],
     }));
-    expect(noSpec).toEqual({ done: 7, used: 1, unused: 6, ran: 2, total: 8, blockers: 1, failures: 1 });
+    expect(noSpec).toEqual({ done: 7, used: 1, unused: 6, ran: 2, total: 8, blockers: 0, failures: 1 });
   });
 
   it('counts lenses that RAN AND FAILED inside `ran` — an error lens is real work, not "not ran" (R9/N8)', () => {

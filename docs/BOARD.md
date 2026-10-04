@@ -30,7 +30,7 @@ record.
 | `GET /api/transcripts/file?file=<rel>[&q=&before=&limit=]` | one transcript: paged entries (`before` = exclusive upper index, newest-first, `nextCursor`) or case-insensitive search — newest-first scan under a bounded cap, `scanned`/`total` disclose truncation |
 | `POST /api/jobs` | `{id, repo, title, baseBranch?}` → job (`dispatched`) |
 | `POST /api/jobs/:id/status` | `{status}` — validated against the [job machine](./LEDGER.md) |
-| `POST /api/rounds` | `{jobId, lenses? (default 7), targetRef?}` → round (`pending`) |
+| `POST /api/rounds` | `{jobId, lenses? (default 9), targetRef?}` → round (`pending`) |
 | `POST /api/rounds/:id/status` / `:id/verdict` | `{status}` / `{verdict}` |
 | `POST /api/agents` | `{id, role, label?, jobId?, roundId?, sessionFile?}` (upsert) |
 | `POST /api/agents/state` | `{id, state}` |
