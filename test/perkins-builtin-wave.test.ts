@@ -1,7 +1,7 @@
 import { PacingGate, type RetrySettlement } from '../src/runtime/pacing.js';
 import { execFileSync, spawn } from 'node:child_process';
+import { createHash, generateKeyPairSync } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
-import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -18,6 +18,7 @@ import {
   type VerdictPoster,
   type WaveOutcome,
 } from '../src/dispatch/perkins.js';
+import { PerkinsAppPrPoster, type AppFetch, type AppFetchInit } from '../src/dispatch/perkins-github-app.js';
 import { preflightFailure, runRuntimeReviewPreflight, type FallbackFinding } from '../src/dispatch/review-path.js';
 import { configPathFor, loadConfig } from '../src/config.js';
 import { RuntimeRegistry } from '../src/runtime/registry.js';
@@ -1576,6 +1577,143 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     const securityChip = ledger.getRound(outcome.round.id)?.lenses.find((chip) => chip.lens === 'security');
     expect(securityChip?.state).toBe('done');
     expect(securityChip?.note).toContain('earlier failed attempts: a1 output');
+  });
+
+  it('a REAL App publisher reconciling a failed POST never credits a stale identical review — no round.posted, no verdict (App seam)', async () => {
+    // r1 finding 2 end-to-end: WaveRunner calls poster.reconcile after the
+    // failed post; the App publisher's attempt-constrained second lookup
+    // must leave the provider's stale identical review uncredited, so the
+    // round stays honestly unposted (no round.posted event, no recorded
+    // verdict, no approval completion).
+    const { privateKey } = generateKeyPairSync('rsa', {
+      modulusLength: 2048,
+      privateKeyEncoding: { type: 'pkcs1', format: 'pem' },
+      publicKeyEncoding: { type: 'spki', format: 'pem' },
+    });
+    const home = mkdtempSync(join(tmpdir(), 'perkins-app-seam-home-'));
+    dirs.push(home);
+    mkdirSync(join(home, 'perkins'), { recursive: true });
+    chmodSync(join(home, 'perkins'), 0o700);
+    writeFileSync(join(home, 'perkins', 'app-key.pem'), privateKey, 'utf8');
+    chmodSync(join(home, 'perkins', 'app-key.pem'), 0o600);
+    const configPath = join(home, 'perkins', 'config');
+    writeFileSync(configPath, 'app_id=424242\nkey_path="app-key.pem"\ninstallation_id_acme=164552969\n', 'utf8');
+    chmodSync(configPath, 0o600);
+
+    const repo = makeFixtureRepo('perkins-app-seam');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/app-seam']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    // The App publisher binds credentials to the PR URL's origin: an
+    // ssh-form github.com origin satisfies the identity check. The freeze
+    // and drift checks still FETCH that origin and cross-check the local
+    // head probe, so the fixture binds the ssh transport to a local bare
+    // repo via core.sshCommand — every production freshness check runs,
+    // with no network. The delivery itself rides the mocked fetch.
+    const originRoot = mkdtempSync(join(tmpdir(), 'perkins-app-seam-origin-'));
+    dirs.push(originRoot);
+    const origin = join(originRoot, 'origin.git');
+    execFileSync('git', ['init', '--bare', '--quiet', origin], { stdio: 'ignore' });
+    repo.git(['remote', 'add', 'origin', 'git@github.com:acme/widget.git']);
+    repo.git(['push', '--quiet', origin, 'refs/heads/feature/app-seam']);
+    const sshDouble = join(originRoot, 'ssh-double.sh');
+    writeFileSync(sshDouble, `#!/bin/sh\nexec git-upload-pack ${JSON.stringify(origin)}\n`, 'utf8');
+    chmodSync(sshDouble, 0o755);
+    repo.git(['config', 'core.sshCommand', sshDouble]);
+
+    const NOW = 1_800_000_000_000;
+    let postCount = 0;
+    let lookupCount = 0;
+    let allRequests = 0;
+    let deliveredBody = '';
+    const fetchImpl: AppFetch = async (url, init: AppFetchInit = {}) => {
+      const method = init.method ?? 'GET';
+      allRequests += 1;
+      const json = (status: number, body: unknown) => ({
+        ok: status >= 200 && status < 300,
+        status,
+        text: async () => JSON.stringify(body),
+      });
+      if (method === 'GET' && /\/app$/.test(url)) {
+        return json(200, { id: 424242, slug: 'perkins-review', owner: { login: 'solarity-services' } });
+      }
+      if (method === 'POST' && /\/app\/installations\/164552969\/access_tokens$/.test(url)) {
+        return json(201, {
+          token: `ghs_${'S'.repeat(36)}`,
+          expires_at: new Date(NOW + 3_600_000).toISOString(),
+          permissions: { 'pull_requests': 'write', 'metadata': 'read' },
+          repositories: [{ full_name: 'acme/widget', id: 1 }],
+        });
+      }
+      if (method === 'GET' && /\/repos\/acme\/widget\/pulls\/7$/.test(url)) {
+        return json(200, { number: 7, head: { sha: target }, base: { sha: 'b'.repeat(40) } });
+      }
+      if (method === 'POST' && /\/repos\/acme\/widget\/pulls\/7\/reviews$/.test(url)) {
+        postCount += 1;
+        deliveredBody = typeof init.body === 'string' ? (JSON.parse(init.body) as { body?: string }).body ?? '' : '';
+        throw new Error('socket hang up after send');
+      }
+      if (method === 'GET' && /\/repos\/acme\/widget\/pulls\/7\/reviews\?/.test(url)) {
+        lookupCount += 1;
+        // ONLY a stale identical App review: submitted an hour before this
+        // round's POST. An unconstrained second lookup would credit it.
+        return json(200, [{
+          id: 555666,
+          user: { login: 'perkins-review[bot]', type: 'Bot', id: 308038895 },
+          commit_id: target,
+          state: 'COMMENTED',
+          body: deliveredBody,
+          submitted_at: new Date(NOW - 3_600_000).toISOString(),
+        }]);
+      }
+      return json(404, { message: `no test route for ${method} ${url}` });
+    };
+    // The REAL production path: AutoVerdictPoster selecting the real App
+    // publisher — so the post-failure caller context must travel through
+    // AutoVerdictPoster.reconcile to the same selected backend, not just
+    // to a directly injected double.
+    const poster = new AutoVerdictPoster(new PerkinsAppPrPoster({ instanceDir: home, fetchImpl, now: () => NOW }));
+
+    const root = mkdtempSync(join(tmpdir(), 'perkins-app-seam-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-app-seam-artifacts-'));
+    const sessions = mkdtempSync(join(tmpdir(), 'perkins-app-seam-sessions-'));
+    dirs.push(root, artifacts, sessions);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-app-seam-db-')));
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/app-seam', target);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-app-seam' });
+    const job = ledger.addJob({ id: 'job-app-seam', repo: 'fixture', title: 'app seam', baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://github.com/acme/widget/pull/7');
+    const escalations: string[] = [];
+    const wave = new WaveRunner({
+      ledger, worktrees: port, spawner: makeSpawner(sessions, []), poster, reviewArtifactRoot: artifacts,
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      prHeadProbe: localHeadProbe('feature/app-seam') as ReturnType<typeof localHeadProbe>,
+    });
+    const outcome = asWave(await wave.runRound({ jobId: job.id }));
+    // Exactly one POST (never a duplicate) and exactly ONE reviews lookup:
+    // post()'s own bounded strict-window reconciliation. A second lookup
+    // would prove the post-failure context never reached the selected App
+    // (ordinary recovery would then also CREDIT the stale review and
+    // record round.posted).
+    expect(postCount).toBe(1);
+    expect(lookupCount).toBe(1);
+    // The WHOLE provider interaction is exactly the five requests of one
+    // post attempt (App identity, token mint, PR identity, the failed
+    // POST, and post()'s single strict-window lookup): any additional
+    // request — including anything the live second lookup might have sent
+    // — fails this pin.
+    expect(allRequests).toBe(5);
+    // The stale identical review is NOT credited: honestly unposted.
+    expect(outcome.posted).toBe(false);
+    expect(outcome.round.status).not.toBe('verdict-posted');
+    expect(ledger.latestRoundEvent(outcome.round.id, 'round.posted')).toBeNull();
+    expect(ledger.latestRoundEvent(outcome.round.id, 'round.perkins-incomplete')).not.toBeNull();
+    expect(outcome.verdict ?? null).toBeNull();
+    expect(escalations.length).toBeGreaterThanOrEqual(1);
   });
 
   it('reconciles an ambiguous post through the PRODUCTION adapter: same provider selection, single POST (T1)', async () => {

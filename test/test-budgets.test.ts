@@ -172,20 +172,22 @@ describe('workload-aware test budgets', () => {
     expect(heavy).toContain('include: heavyTestPaths()');
   });
 
-  it('routes every declared scope segment that names a heavy file through the heavy config, and only heavy files', () => {
+  it('routes live scope segments that name heavy files through the heavy config, and only heavy files', () => {
     const manifest = parseToml(
       readFileSync(join(import.meta.dirname, '..', '.gru-command', 'worktree.toml'), 'utf-8'),
     ) as { verify?: Record<string, string> };
     const scopes = manifest.verify ?? {};
     expect(Object.keys(scopes).length).toBeGreaterThan(0);
+    expect(scopes['perkins-stage1-baseline']).toBeDefined();
     const heavyPaths = heavyTestPaths();
     for (const [scope, command] of Object.entries(scopes)) {
-      // This diagnostic intentionally runs inside a 9bb51b0 git archive,
-      // before the heavy config existed. It is an expected-RED baseline,
-      // not a current-tree verification segment; every live scope stays
-      // subject to the routing guard below.
+      // This diagnostic intentionally runs inside a pinned pre-policy git
+      // archive without a heavy config. It is an expected-RED baseline,
+      // not a current-tree verification segment; live scopes stay guarded.
       if (scope === 'perkins-stage1-baseline') {
         expect(command).toContain('git archive "$base"');
+        expect(command).toContain('base=9bb51b05af5d8f0a0cd389788d1d3f19607d5361');
+        expect(command).toContain('exit 1');
         continue;
       }
       for (const segment of command.split('&&').map((part) => part.trim())) {

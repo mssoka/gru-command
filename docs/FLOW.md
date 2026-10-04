@@ -200,9 +200,12 @@ route:
    claude-code runtime this is a CLI-availability probe; on pi it checks
    model resolution plus provider auth.
 3. **Code-host integration** — a GitHub (`gh`) or GitLab (`GITLAB_TOKEN`)
-   token valid for the exact repository remote, used for SHA-bound verdict
-   delivery. Only GitHub and GitLab hosts are supported; other origins fail
-   the leg closed (credentials are never sent to unknown hosts).
+   token valid for the exact repository remote: the preflight leg. Verdict
+   delivery rides the `gh` token only when no Perkins App bundle is
+   installed; with a bundle, github.com publication is App-authored (see
+   [PERKINS-APP-PUBLICATION.md](./PERKINS-APP-PUBLICATION.md)). Only GitHub
+   and GitLab hosts are supported; other origins fail the leg closed
+   (credentials are never sent to unknown hosts).
 4. **Review policy enabled** — `[review] enabled = true` in config.
 
 All legs pass → Perkins review (the gate). Any leg fails → the request
@@ -228,8 +231,11 @@ delivery discipline as GitHub (the frozen HEAD is verified before a note is
 posted; a PR's recorded base is refreshed into the delivery record rather
 than gating, since a pinned base is expected to trail a moving main), and
 the GitLab probe and poster resolve their token
-identically (`GITLAB_TOKEN`, falling back to `GL_TOKEN`); GitHub
-authenticates through the `gh` CLI.
+identically (`GITLAB_TOKEN`, falling back to `GL_TOKEN`). GitHub
+**publication** authenticates through the `gh` CLI when no Perkins App
+bundle is installed; with a bundle, github.com publication is App-authored
+while the review preflight still probes remotes through `gh` (see
+[PERKINS-APP-PUBLICATION.md](./PERKINS-APP-PUBLICATION.md)).
 
 Report artifacts persist before delivery, but the local round verdict is
 recorded only after SHA-bound delivery proof succeeds; delivery failure
