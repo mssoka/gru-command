@@ -4,6 +4,7 @@ import type { GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { LedgerApi } from '../ledger/api.js';
 import { AmbiguousDirectiveError, DirectiveConflictError, PhaseHandoffConflictError } from '../ledger/api.js';
+import { isJobTerminal } from '../ledger/states.js';
 import { parseCompletionHandoffIntent, type CompletionHandoffIntent } from '../ledger/obligations.js';
 import type { NotificationCenter } from '../notifications/center.js';
 import type { DispatchService } from './service.js';
@@ -655,6 +656,22 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         ...(completionHandoff !== undefined ? { handoff: completionHandoff } : {}),
       });
       const rebriefPhaseId = markers.find((marker) => marker.phaseId !== null)?.phaseId ?? null;
+      const closeFailedTerminalTurn = (error: unknown): ReturnType<typeof finalizeRebriefRequest> | null => {
+        const currentJob = options.ledger.getJob(jobId);
+        if (currentJob === null || !isJobTerminal(currentJob.status)) return null;
+        // Failure evidence remains, but the obsolete request cannot be
+        // retried on a terminal job. Close only the admitted generation.
+        const closed = finalizeRebriefRequest({
+          ledger: options.ledger, worktrees: ops.worktrees, jobId,
+          minionId: null, lanePath: null, note, expectedMarkers: markers,
+        });
+        log('info', 'silas re-brief failed after terminality — request closed', {
+          job: jobId, error: String(error), retired: closed.retired,
+          superseded: closed.superseded,
+          ...(closed.retirement !== null ? { refused: closed.retirement.refused, skipped: closed.retirement.skippedIds } : {}),
+        });
+        return closed;
+      };
       const controller = new AbortController();
       directiveControllers.add(controller);
       let result: Awaited<ReturnType<typeof rebriefFreshMinion>>;
@@ -680,7 +697,10 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           ...(options.lessons !== undefined ? { lessons: options.lessons } : {}),
         });
       } catch (error) {
-        if (!(error instanceof RebriefTurnCancelled)) throw error;
+        if (!(error instanceof RebriefTurnCancelled)) {
+          closeFailedTerminalTurn(error);
+          throw error;
+        }
         const cancelled = finalizeRebriefRequest({
           ledger: options.ledger, worktrees: ops.worktrees, jobId,
           minionId: null, lanePath: null, note, expectedMarkers: markers,
@@ -713,19 +733,27 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           jobId,
           payload: { agentId: result.minionId, error: result.error ?? 'runtime error' },
         });
-        log('warn', 're-brief turn settled with an in-band error — markers kept, no delivery recorded', {
+        const closed = closeFailedTerminalTurn(result.error ?? 'runtime error');
+        log('warn', 're-brief turn settled with an in-band error — no delivery recorded', {
           job: jobId,
           minion: result.minionId,
           error: result.error ?? null,
+          retired: closed?.retired ?? false,
         });
         json(res, 202, {
           job_id: jobId,
           minion_id: result.minionId,
           state: 'turn-error',
           error: result.error ?? null,
+          ...(closed?.retired === true ? { retired: true } : {}),
+          ...(closed?.superseded === true ? { superseded: true } : {}),
+          ...(closed?.retirement !== undefined && closed.retirement !== null
+            ? { retirement: { refused: closed.retirement.refused, skipped_ids: closed.retirement.skippedIds } } : {}),
           note:
             'the re-brief turn settled with an in-band runtime error; no delivery or phase completion ' +
-            'was recorded and the request markers stay pending for restart reconciliation',
+            (closed?.retired === true
+              ? 'was recorded and the terminal request was retired'
+              : 'was recorded and the request markers stay pending for restart reconciliation'),
         });
         return true;
       }

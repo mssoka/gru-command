@@ -1247,6 +1247,60 @@ describe('dispatch server (E8)', () => {
     }
   });
 
+  it('/api/silas/rebrief retires failed turns that settle after their job goes terminal', async () => {
+    for (const mode of ['in-band', 'rejected'] as const) {
+      let releasePrompt!: () => void;
+      const gate = new Promise<void>((resolve) => { releasePrompt = resolve; });
+      const jobId = `terminal-failed-http-${mode}`;
+      const h = await boot({
+        minionPromptGate: (text) => text.startsWith('Re-brief —')
+          ? mode === 'rejected' ? gate.then(() => { throw new Error('synthetic prompt rejection'); }) : gate
+          : undefined,
+        minionTurnHealth: (text) => mode === 'in-band' && text.startsWith('Re-brief —') ? 'error' : 'idle',
+      });
+      const repo = makeFixtureRepo(`fixture-terminal-failed-http-${mode}`);
+      cleanupRepos.push(repo);
+      try {
+        await call(h.port, 'POST', '/api/dispatch', {
+          job_id: jobId, repo_path: repo.path, title: 'lane', briefing: 'contract',
+        }, TOKEN);
+        const initialDeadline = Date.now() + 10_000;
+        while (h.ledger.latestJobEvent(jobId, 'job.delivered') === null && Date.now() < initialDeadline) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        const pending = call(h.port, 'POST', '/api/silas/rebrief', { job_id: jobId, note: 'retry' }, TOKEN);
+        const deadline = Date.now() + 10_000;
+        while (!h.minionTurnTexts.some((text) => text.startsWith(`Re-brief — job ${jobId}`)) && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        expect(h.minionTurnTexts.some((text) => text.startsWith(`Re-brief — job ${jobId}`))).toBe(true);
+        const markers = h.ledger.listPendingRebriefs({ jobId });
+        expect(markers).toHaveLength(2);
+        const baseline = markers[0]!.baselineSeq;
+        h.ledger.setJobStatus(jobId, 'in-review');
+        h.ledger.setJobStatus(jobId, 'merged');
+        releasePrompt();
+        const response = await pending;
+        if (mode === 'in-band') {
+          expect(response.status).toBe(202);
+          expect(field<string>(response.json, 'state')).toBe('turn-error');
+          expect(field<boolean>(response.json, 'retired')).toBe(true);
+          expect(h.ledger.latestJobEvent(jobId, 'job.minion-error')).not.toBeNull();
+        } else {
+          expect(response.status).toBe(400);
+          expect(field<string>(response.json, 'detail')).toContain('synthetic prompt rejection');
+        }
+        expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(0);
+        expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-retired')).not.toBeNull();
+        expect(h.ledger.listJobEvents(jobId).filter((event) =>
+          (event.kind === 'silas.rebrief' || event.kind === 'job.delivered') && event.seq > baseline)).toHaveLength(0);
+      } finally {
+        releasePrompt();
+        await h.close();
+      }
+    }
+  });
+
   it('/api/silas/rebrief reports an administrative retirement when the job goes terminal mid-turn', async () => {
     let releasePrompt!: () => void;
     const gate = new Promise<void>((resolveGate) => {
