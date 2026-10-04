@@ -1314,7 +1314,7 @@ describe('board v6 — section truth: closed receipts never queue, stopped lanes
       snapshot({
         jobs: [baseJob({ id: 'reworking', status: 'working', rounds: [] })],
         agents: [
-          agent('minion-working', { role: 'minion', jobId: 'reworking', state: 'streaming' }),
+          agent('minion-working', { role: 'minion', jobId: 'reworking', state: 'streaming', lastActivity: new Date().toISOString() }),
           agent('perkins-aborted', {
             role: 'perkins',
             roundId: 'r1',
@@ -1332,6 +1332,61 @@ describe('board v6 — section truth: closed receipts never queue, stopped lanes
     expect(row?.getAttribute('data-worker-state')).toBeNull();
     expect(row?.querySelector('.board-job__status')?.textContent).toBe('working');
     expect(row?.getAttribute('data-band')).toBe('in-flight');
+  });
+
+  it('a recent non-minion frame never keeps a silent minion out of COLD (code review V1)', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        jobs: [baseJob({ id: 'mixed-role', status: 'working', rounds: [] })],
+        agents: [
+          // The minion has been silent past the window...
+          agent('minion-silent', {
+            role: 'minion',
+            jobId: 'mixed-role',
+            state: 'streaming',
+            lastActivity: new Date(Date.now() - 45 * 60_000).toISOString(),
+          }),
+          // ...while a bound review agent spoke seconds ago. The digest
+          // watches minions only, so the board must agree: COLD + stalled.
+          agent('perkins-recent', {
+            role: 'perkins',
+            roundId: 'r1',
+            jobId: 'mixed-role',
+            lastActivity: new Date().toISOString(),
+          }),
+        ],
+      }),
+    );
+    const row = document.querySelector<HTMLElement>('.board-job');
+    expect(row?.getAttribute('data-band')).toBe('cold');
+    expect(row?.querySelector('.board-job__stale')?.textContent).toBe('stalled');
+  });
+
+  it('loads older receipts on demand and merges them into FEED (D3)', async () => {
+    const older = notification('older-receipt');
+    const client = {
+      ackNotification: vi.fn(() => Promise.resolve()),
+      markNotificationShown: vi.fn(() => Promise.resolve(true)),
+      fetchReceipts: vi.fn(() => Promise.resolve({ receipts: [older], nextOffset: 1, hasMore: false })),
+    } as unknown as import('../lib/board-client.js').BoardClient;
+    const view = new BoardView(() => {});
+    view.bindClient(client);
+    view.render(
+      snapshot({
+        jobs: [baseJob({ id: 'receipt-lane', status: 'merged', rounds: [] })],
+        agents: [agent('minion-receipt-lane', { role: 'minion', jobId: 'receipt-lane' })],
+        notifications: [notification('snapshot-receipt', { agentId: 'minion-receipt-lane' })],
+      }),
+    );
+    const more = document.querySelector<HTMLButtonElement>('.board-notification__more');
+    expect(more).not.toBeNull();
+    expect(document.getElementById('notification-list')?.textContent).not.toContain('Notice older-receipt');
+    more!.click();
+    await vi.waitFor(() =>
+      expect(document.getElementById('notification-list')?.textContent).toContain('Notice older-receipt'),
+    );
+    expect(client.fetchReceipts).toHaveBeenCalledWith(0);
   });
 
   it('a stopped lane with an unacked escalation sits in NEEDS GRU — waiting chip, honest section', () => {

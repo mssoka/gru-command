@@ -18,6 +18,10 @@ import {
 } from '../ledger/api.js';
 import type { JobStatus } from '../ledger/states.js';
 
+/** Newest closed receipts kept in every snapshot (D3): older ones are
+ * served by the paged `GET /api/notifications/receipts` route. */
+const RECEIPT_WINDOW = 30;
+
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
 /**
@@ -436,6 +440,19 @@ export class BoardEngine {
         attemptsByRound.set(agent.roundId, perLens);
       }
     }
+    // Closed-receipt rule (owner decisions D1/D3): a machine row bound
+    // through an agent to a merged/done job is a receipt, not live work.
+    const concludedJobs = new Set(
+      jobs.filter((job) => job.status === 'merged' || job.status === 'done').map((job) => job.id),
+    );
+    const agentJob = new Map(
+      agentRows.filter((agent) => agent.jobId !== null).map((agent) => [agent.id, agent.jobId as string]),
+    );
+    const isReceipt = (agentId: string | null): boolean => {
+      if (agentId === null || concludedJobs.size === 0) return false;
+      const jobId = agentJob.get(agentId);
+      return jobId !== undefined && concludedJobs.has(jobId);
+    };
     const repos = [...this.jobViews(jobs, activityByJob, attemptsByRound).entries()]
       .map(([name, group]) => ({ name, jobs: group }))
       .sort((a, b) => a.name.localeCompare(b.name));
@@ -450,7 +467,7 @@ export class BoardEngine {
     return {
       repos,
       agents,
-      notifications: this.notifications(),
+      notifications: this.notifications(isReceipt),
       decisions: this.decisionsStatus(),
       unackedActionRequired: this.ledger.countLivePendingActionRequired(),
       unackedNeedsOwner: this.ledger.countPendingNeedsOwner(),
@@ -584,20 +601,52 @@ export class BoardEngine {
   }
 
   /**
+   * The closed-receipt rule (owner decisions D1/D3) for out-of-band
+   * callers (the paged receipt route): a row bound through an agent to a
+   * merged/done job. The snapshot scan uses a map-built predicate instead
+   * so the unbounded walk stays one query per page.
+   */
+  isClosedReceipt(agentId: string | null): boolean {
+    if (agentId === null) return false;
+    const agent = this.ledger.getAgent(agentId);
+    if (agent === null || agent.jobId === null) return false;
+    const job = this.ledger.getJob(agent.jobId);
+    return job !== null && (job.status === 'merged' || job.status === 'done');
+  }
+
+  /**
    * Notification center feed (E7): the durable notification log, newest
    * first. Since E7 the feed is the LEDGER's notifications table —
    * FYI rows derive once at event time (the notification center posts
    * them), action-required rows carry acks; nothing is computed here.
+   *
+   * Boundedness (owner decision D3, code review 2026-10-04): closed
+   * receipts stay unacked forever by design, so the unbounded pending scan
+   * now carries LIVE rows only; the newest RECEIPT_WINDOW receipts stay in
+   * the snapshot and older ones are served by the paged receipt route.
    */
-  notifications(limit = 30): readonly NotificationView[] {
-    // The recent feed is bounded, but neither pending attention queue is.
-    // Old machine incidents remain visible until Gru dispositions them;
-    // owner stops remain in FOR YOU until the owner's Ack.
+  notifications(isReceipt?: (agentId: string | null) => boolean, limit = 30): readonly NotificationView[] {
+    // The snapshot passes its map-built predicate (one query per page);
+    // direct callers keep the single-row lookup fallback.
+    const receiptOf =
+      isReceipt ?? ((agentId: string | null): boolean => this.isClosedReceipt(agentId));
     const byId = new Map(this.ledger.listNotifications({ limit }).map((row) => [row.id, row]));
     for (const routing of ['needs-owner', 'action-required'] as const) {
+      let retainedReceipts = 0;
       for (let offset = 0;; offset += 50) {
         const page = this.ledger.listNotifications({ unackedOnly: true, routing, limit: 50, offset });
-        for (const row of page) byId.set(row.id, row);
+        for (const row of page) {
+          // needs-owner rows stay on the owner path by contract; only
+          // action-required rows participate in the receipt rule.
+          if (routing === 'action-required' && receiptOf(row.agentId)) {
+            if (retainedReceipts < RECEIPT_WINDOW) {
+              byId.set(row.id, row);
+              retainedReceipts += 1;
+            }
+            continue;
+          }
+          byId.set(row.id, row);
+        }
         if (page.length < 50) break;
       }
     }

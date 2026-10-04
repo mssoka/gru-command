@@ -6,6 +6,7 @@ import { EventBus } from '../src/events/bus.js';
 import { LedgerApi, type NotificationRecord } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { NotificationCenter } from '../src/notifications/center.js';
+import { BoardEngine } from '../src/board/engine.js';
 import {
   Supervisor,
   type AgentSupervisionView,
@@ -2829,6 +2830,63 @@ describe('pacing settlement across rejection, recovery, and slot retirement', ()
       await expect(settled).resolves.toBe('superseded');
     } finally {
       h.dispose();
+    }
+  });
+
+  it('restart hydration restores a durable stop into viewFor and the board snapshot (P6)', () => {
+    // Code review 2026-10-04: the supervisor is in-process only. A stop
+    // that survived the previous process must still read waiting after a
+    // restart (and must not wake as stalled).
+    const dir = mkdtempSync(join(tmpdir(), 'gru-hydrate-'));
+    const db = new LedgerDb(dir);
+    const bus = new EventBus();
+    const api = new LedgerApi(db.handle, { bus });
+    try {
+      api.addJob({ id: 'job-hydrate', repo: 'r', title: 'Hydrate', briefing: 'b' });
+      api.setJobStatus('job-hydrate', 'working');
+      api.registerAgent({ id: 'minion-hydrate', role: 'minion', jobId: 'job-hydrate' });
+      api.appendCustomEvent({
+        kind: 'supervision.escalated',
+        agentId: 'minion-hydrate',
+        payload: { class: 'quota_wall', restarts: 2 },
+      });
+      const registry = { onAgentEvent: () => () => {} } as unknown as SupervisorRegistry;
+      const center = new NotificationCenter({ ledger: api, bus });
+      const supervisor = new Supervisor({
+        config: {
+          enabled: true,
+          turnSilenceMs: 50,
+          restartWindowMs: 600_000,
+          maxRestarts: 3,
+          restartBackoffMs: 1,
+        },
+        registry,
+        ledger: api,
+        notifications: center,
+        tickMs: 5,
+      });
+      supervisor.start();
+      try {
+        expect(supervisor.viewFor('minion-hydrate')).toMatchObject({
+          state: 'stopped',
+          stopReason: 'quota_wall',
+          restarts: 2,
+        });
+        // The production board closure reads the same view: the snapshot's
+        // agent row carries the stop truth after the restart.
+        const engine = new BoardEngine({
+          ledger: api,
+          bus,
+          supervisionFor: (agentId) => supervisor.viewFor(agentId),
+        });
+        const agentView = engine.snapshot().agents.find((agent) => agent.id === 'minion-hydrate');
+        expect(agentView?.supervision).toMatchObject({ state: 'stopped', stopReason: 'quota_wall' });
+      } finally {
+        supervisor.dispose();
+      }
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });

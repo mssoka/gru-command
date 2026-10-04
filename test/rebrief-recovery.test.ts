@@ -374,6 +374,49 @@ describe('re-brief restart safety (durable markers)', () => {
     expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).toBeNull();
   });
 
+  it('a terminal lane settles its stale markers and posts the bound escalation once', async () => {
+    // Code review 2026-10-04: a merged/done lane can never be re-briefed,
+    // so its markers must not survive every boot as a retry loop.
+    const h = makeHarness();
+    const jobId = 'terminal-rebrief-job';
+    await seedPendingRebrief({
+      h,
+      jobId,
+      bindWorker: { agentId: 'rebrief-worker', sessionFile: null },
+    });
+    h.ledger.setJobStatus(jobId, 'delivered');
+    h.ledger.setJobStatus(jobId, 'in-review');
+    h.ledger.setJobStatus(jobId, 'merged');
+    const report = await reconcilePendingRebriefs(
+      {
+        registry: h.registry,
+        ledger: h.ledger,
+        worktrees: h.worktrees,
+        notifications: h.notifications,
+      },
+      { bootAt: new Date(Date.now() + 60_000) },
+    );
+    await report.settled;
+    const notification = h.ledger
+      .listNotifications()
+      .find((row) => row.kind === `silas.rebrief-unreconciled.${jobId}`);
+    expect(notification?.agentId).toBe('rebrief-worker');
+    expect(notification?.detail).toContain('terminal lanes are never re-briefed');
+    // The markers are settled: the next boot has nothing to retry.
+    expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(0);
+    const second = await reconcilePendingRebriefs(
+      {
+        registry: h.registry,
+        ledger: h.ledger,
+        worktrees: h.worktrees,
+        notifications: h.notifications,
+      },
+      { bootAt: new Date(Date.now() + 120_000) },
+    );
+    await second.settled;
+    expect(second.examined).toBe(0);
+  });
+
   it('a shutdown-cancelled settlement keeps the markers pending for the next boot', async () => {
     const h = makeHarness();
     const jobId = 'shutdown-settlement-job';

@@ -808,4 +808,44 @@ describe('board engine — FOR YOU owner-PR projection on the snapshot', () => {
       /new BoardEngine\(\{[\s\S]*?supervisionFor:\s*\(agentId\)\s*=>\s*supervisor\?\.viewFor\(agentId\)\s*\?\?\s*null/,
     );
   });
+
+  it('bounds the snapshot to the newest receipt window while live rows stay complete (D3)', () => {
+    // Owner decision D3: closed receipts stay unacked forever by design, so
+    // the unbounded scan must carry live rows only plus a bounded receipt
+    // window; the paged route serves older receipts on demand.
+    const dir = mkdtempSync(join(tmpdir(), 'gru-d3-'));
+    const db = new LedgerDb(dir);
+    const bus = new EventBus();
+    const ledger = new LedgerApi(db.handle, { bus });
+    try {
+      ledger.addJob({ id: 'job-d3', repo: 'r', title: 'D3', briefing: 'b' });
+      ledger.setJobStatus('job-d3', 'working');
+      ledger.registerAgent({ id: 'minion-d3', role: 'minion', jobId: 'job-d3' });
+      const center = new NotificationCenter({ ledger, bus });
+      for (let i = 0; i < 35; i += 1) {
+        center.post({
+          kind: `receipt-${i}`,
+          routing: 'action-required',
+          severity: 'error',
+          title: `receipt ${i}`,
+          agentId: 'minion-d3',
+        });
+      }
+      center.post({ kind: 'live-row', routing: 'action-required', severity: 'error', title: 'live row' });
+      ledger.setJobStatus('job-d3', 'delivered');
+      ledger.setJobStatus('job-d3', 'in-review');
+      ledger.setJobStatus('job-d3', 'merged');
+      const engine = new BoardEngine({ ledger, bus });
+      const snapshot = engine.snapshot();
+      expect(
+        snapshot.notifications.filter((row) => row.agentId === 'minion-d3' && row.ackedAt === null),
+      ).toHaveLength(30);
+      expect(snapshot.notifications.some((row) => row.title === 'live row')).toBe(true);
+      expect(engine.isClosedReceipt('minion-d3')).toBe(true);
+      expect(engine.isClosedReceipt(null)).toBe(false);
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

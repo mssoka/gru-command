@@ -527,17 +527,34 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       };
       const stampOf = (agent: (typeof boundMinions)[number]): number =>
         agent.lastActivity === null ? Number.NaN : Date.parse(agent.lastActivity);
+      // Stop recency follows the recorded stop time when the supervisor
+      // view provides it, else the last frame (code review 2026-10-04).
+      const stopStampOf = (agent: (typeof boundMinions)[number]): number => {
+        const iso = viewOf(agent)?.stoppedAt ?? null;
+        if (iso !== null) {
+          const at = Date.parse(iso);
+          if (Number.isFinite(at)) return at;
+        }
+        return stampOf(agent);
+      };
       const live = boundMinions.filter((agent) => {
         if (stopExempt(agent)) return false;
-        return viewOf(agent) !== null || agent.state !== 'disposed';
+        // A disposed record is not a live worker, supervised or not (A2).
+        return agent.state !== 'disposed';
       });
       const newestKnown = (stamps: readonly number[]): number | null =>
         stamps.filter(Number.isFinite).reduce<number | null>((best, at) => (best === null || at > best ? at : best), null);
       const hasStop = boundMinions.some(stopExempt);
-      const stopAt = newestKnown(boundMinions.filter(stopExempt).map(stampOf));
+      const stopAt = newestKnown(boundMinions.filter(stopExempt).map(stopStampOf));
       const liveAt = newestKnown(live.map(stampOf));
+      // A live worker whose activity is still unknown favors live: the
+      // stop never marks the lane (the re-dispatch window), exactly like
+      // the board's stoppedWorkersByJob (code review 2026-10-04).
+      const hasUnknownLive = live.some((agent) => !Number.isFinite(stampOf(agent)));
       const waiting =
-        hasStop && (live.length === 0 || (stopAt !== null && liveAt !== null && stopAt > liveAt));
+        hasStop &&
+        !hasUnknownLive &&
+        (live.length === 0 || (stopAt !== null && liveAt !== null && stopAt > liveAt));
       if (!waiting) {
         const pool = live.length > 0 ? live : boundMinions.filter((agent) => !stopExempt(agent));
         const minion = pool.sort((a, b) =>

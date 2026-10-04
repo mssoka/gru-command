@@ -137,6 +137,11 @@ export class BoardView {
   /** Toast + browser-notification surface (E7). */
   private onToast: ((notification: NotificationView) => void) | null = null;
   private snapshot: BoardSnapshot | null = null;
+  /** D3: older receipt pages fetched on demand (merged into FEED). */
+  private extraReceipts: NotificationView[] = [];
+  private receiptsNextOffset = 0;
+  private receiptsLoading = false;
+  private receiptsExhausted = false;
   /** Owner notification ids seen in the panel; every pending owner stop,
    * including informational destructive-op asks, earns a bell badge. */
   private readonly seenOwnerIds = new Set<string>();
@@ -960,9 +965,12 @@ export class BoardView {
     const needsGru = notifications.filter(
       (item) => item.routing === 'action-required' && unresolved(item) && !receipts.has(item.id),
     );
-    const feed = notifications.filter(
-      (item) => item.routing === 'fyi' || !unresolved(item) || receipts.has(item.id),
-    );
+    const feed = [
+      ...notifications.filter(
+        (item) => item.routing === 'fyi' || !unresolved(item) || receipts.has(item.id),
+      ),
+      ...this.extraReceipts.filter((extra) => !notifications.some((item) => item.id === extra.id)),
+    ];
     if (notifications.length === 0 && (snapshot.ownerPrs ?? []).length === 0) {
       list.append(el('div', 'lbl', 'nothing needs attention'));
       return;
@@ -984,7 +992,49 @@ export class BoardView {
     }
     list.append(forYou);
     this.renderNotificationSection(list, 'NEEDS GRU', needsGru, 'live machine queue is clear', receipts);
-    if (feed.length > 0) this.renderNotificationSection(list, 'FEED', feed, null, receipts);
+    if (feed.length > 0) {
+      this.renderNotificationSection(list, 'FEED', feed, null, receipts);
+      // D3: the snapshot carries the newest receipt window only; older
+      // receipts are fetched on demand. The control appears only when a
+      // receipt is actually on screen.
+      if (
+        this.boardClient !== null &&
+        !this.receiptsExhausted &&
+        feed.some((item) => receipts.has(item.id) || this.extraReceipts.some((extra) => extra.id === item.id))
+      ) {
+        const more = el(
+          'button',
+          'board-notification__more lbl',
+          this.receiptsLoading ? 'loading older receipts…' : 'load older receipts',
+        );
+        more.type = 'button';
+        (more as HTMLButtonElement).disabled = this.receiptsLoading;
+        more.addEventListener('click', () => void this.loadOlderReceipts());
+        list.append(more);
+      }
+    }
+  }
+
+  /** D3: fetch the next page of closed receipts and merge it into FEED.
+   * A failed page is non-fatal: the control stays for retry. */
+  private async loadOlderReceipts(): Promise<void> {
+    const client = this.boardClient;
+    if (client === null || this.receiptsLoading) return;
+    this.receiptsLoading = true;
+    if (this.snapshot !== null) this.renderNotifications(this.snapshot);
+    try {
+      const page = await client.fetchReceipts(this.receiptsNextOffset);
+      for (const row of page.receipts) {
+        if (!this.extraReceipts.some((existing) => existing.id === row.id)) this.extraReceipts.push(row);
+      }
+      this.receiptsNextOffset = page.nextOffset;
+      if (!page.hasMore) this.receiptsExhausted = true;
+    } catch {
+      // The button remains; a later click retries the same cursor.
+    } finally {
+      this.receiptsLoading = false;
+      if (this.snapshot !== null) this.renderNotifications(this.snapshot);
+    }
   }
 
   private renderNotificationSection(
@@ -1004,8 +1054,7 @@ export class BoardView {
     list.append(section);
   }
 
-  private notificationRow(item: NotificationView, closedReceipt = false): HTMLElement {
-    const row = el(
+  private notificationRow(item: NotificationView, closedReceipt = false): HTMLElement {    const row = el(
       'div',
       `board-notification board-notification--${item.severity}${closedReceipt ? ' board-notification--receipt' : ''}`,
     );

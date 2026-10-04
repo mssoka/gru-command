@@ -538,4 +538,42 @@ describe('board server — empty token config locks every door', () => {
     expect(client.frames.some((f) => f.type === 'error' && (f.message ?? '').includes('not configured'))).toBe(true);
     await harness.close();
   });
+
+  it('pages closed receipts on demand, newest-first, with the raw offset cursor (D3)', async () => {
+    const harness = await boot('board-test-token');
+    try {
+      harness.api.addJob({ id: 'job-receipts', repo: 'r', title: 'Receipts', briefing: 'b' });
+      harness.api.setJobStatus('job-receipts', 'working');
+      harness.api.registerAgent({ id: 'minion-receipts', role: 'minion', jobId: 'job-receipts' });
+      const center = new NotificationCenter({ ledger: harness.api, bus: harness.bus });
+      for (let i = 0; i < 3; i += 1) {
+        center.post({
+          kind: `receipt-page-${i}`,
+          routing: 'action-required',
+          severity: 'error',
+          title: `receipt ${i}`,
+          agentId: 'minion-receipts',
+        });
+      }
+      harness.api.setJobStatus('job-receipts', 'delivered');
+      harness.api.setJobStatus('job-receipts', 'in-review');
+      harness.api.setJobStatus('job-receipts', 'merged');
+      expect((await getJson(harness.port, '/api/notifications/receipts', null)).status).toBe(401);
+      const first = await getJson(harness.port, '/api/notifications/receipts?limit=2', 'board-test-token');
+      expect(first.status).toBe(200);
+      const firstBody = first.body as { receipts: { id: string }[]; nextOffset: number; hasMore: boolean };
+      expect(firstBody.receipts).toHaveLength(2);
+      expect(firstBody.hasMore).toBe(true);
+      const second = await getJson(
+        harness.port,
+        `/api/notifications/receipts?offset=${firstBody.nextOffset}&limit=2`,
+        'board-test-token',
+      );
+      const secondBody = second.body as { receipts: { id: string }[]; hasMore: boolean };
+      expect(secondBody.receipts).toHaveLength(1);
+      expect(secondBody.hasMore).toBe(false);
+    } finally {
+      await harness.close();
+    }
+  });
 });

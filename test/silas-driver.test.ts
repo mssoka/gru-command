@@ -453,6 +453,7 @@ describe('silas digest (the four actionable states)', () => {
             readonly restarts: number;
             readonly breakerOpen: boolean;
             readonly stopReason: string | null;
+            readonly stoppedAt?: string | null;
           };
         }[];
         readonly digest: { readonly stalled: boolean };

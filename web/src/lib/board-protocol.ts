@@ -77,12 +77,15 @@ export interface AgentView {
   readonly jobId: string | null;
   readonly roundId: string | null;
   /** E7 supervision view (null when unsupervised). `stopReason` is absent
-   * on pre-reason servers — the board renders the stop without a cause. */
+   * on pre-reason servers — the board renders the stop without a cause;
+   * `stoppedAt` is absent on pre-stop-time servers and null/ignored while
+   * running. */
   readonly supervision: {
     readonly state: 'watching' | 'restarting' | 'stopped';
     readonly restarts: number;
     readonly breakerOpen: boolean;
     readonly stopReason?: string | null;
+    readonly stoppedAt?: string | null;
   } | null;
 }
 
@@ -526,8 +529,12 @@ export function isValidSnapshot(value: unknown): value is BoardSnapshot {
       typeof agent.id === 'string' &&
       typeof agent.role === 'string' &&
       typeof agent.state === 'string' &&
-      // createdAt is optional (pre-upgrade servers); present, it is a string.
-      (agent.createdAt === undefined || agent.createdAt === null || typeof agent.createdAt === 'string') &&
+      // createdAt is optional (pre-upgrade servers); present, it must be
+      // a parseable date — the stall floor reads it directly and a junk
+      // string would silently remove the floor (code review 2026-10-04).
+      (agent.createdAt === undefined ||
+        agent.createdAt === null ||
+        (typeof agent.createdAt === 'string' && Number.isFinite(Date.parse(agent.createdAt)))) &&
       // supervision is optional (null when the agent is unsupervised);
       // stopReason is optional too (pre-reason servers) — present, it is
       // a nullable string. The whole PRESENT block is typed strictly (A9):
@@ -541,7 +548,10 @@ export function isValidSnapshot(value: unknown): value is BoardSnapshot {
           isRestartCount(agent.supervision.restarts) &&
           (agent.supervision.stopReason === undefined ||
             agent.supervision.stopReason === null ||
-            typeof agent.supervision.stopReason === 'string'))),
+            typeof agent.supervision.stopReason === 'string') &&
+          (agent.supervision.stoppedAt === undefined ||
+            agent.supervision.stoppedAt === null ||
+            typeof agent.supervision.stoppedAt === 'string'))),
   );
   const notificationsOk = value.notifications.every(
     (notification) =>

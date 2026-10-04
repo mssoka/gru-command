@@ -1,5 +1,5 @@
 {
-  "note": "ONE fixture, TWO surfaces: web stoppedWorkersByJob/isStalledWorking and backend computeSilasDigest must agree on these exact agents (ids/createdAt/stamps/views/reason) AND on the board stall outcome. Consumed by web/src/lib/board-bands.test.ts and test/silas-driver.test.ts — do not fork the values; a change here must hold for both predicates.",
+  "note": "ONE fixture, TWO surfaces: web stoppedWorkersByJob/isStalledWorking and backend computeSilasDigest must agree on these exact agents (ids/createdAt/stamps/views/reason) AND on the board stall outcome. Consumed by web/src/lib/board-bands.test.ts and test/silas-driver.test.ts \u2014 do not fork the values; a change here must hold for both predicates.",
   "digestNow": "2026-09-23T10:00:00.000Z",
   "freshRegistrationAt": "2026-09-23T09:50:00.000Z",
   "cases": [
@@ -311,6 +311,138 @@
         "waiting": true,
         "reason": "crash loop",
         "restarts": 4,
+        "stalled": false
+      },
+      "digest": {
+        "stalled": false
+      }
+    },
+    {
+      "name": "a fresh unstamped live worker beside an older stamped live worker favors live",
+      "agents": [
+        {
+          "id": "older-live",
+          "jobId": "job-1",
+          "state": "streaming",
+          "lastActivity": "2026-09-23T09:00:00.000Z",
+          "createdAt": "2026-09-23T08:00:00.000Z",
+          "supervision": {
+            "state": "watching",
+            "restarts": 0,
+            "breakerOpen": false,
+            "stopReason": null
+          }
+        },
+        {
+          "id": "current-stop",
+          "jobId": "job-1",
+          "state": "idle",
+          "lastActivity": "2026-09-23T09:10:00.000Z",
+          "createdAt": "2026-09-23T08:30:00.000Z",
+          "supervision": {
+            "state": "stopped",
+            "restarts": 1,
+            "breakerOpen": true,
+            "stopReason": "quota_wall"
+          }
+        },
+        {
+          "id": "fresh-live",
+          "jobId": "job-1",
+          "state": "spawning",
+          "lastActivity": null,
+          "createdAt": "2026-09-23T09:50:00.000Z",
+          "supervision": {
+            "state": "watching",
+            "restarts": 0,
+            "breakerOpen": false,
+            "stopReason": null
+          }
+        }
+      ],
+      "board": {
+        "waiting": false,
+        "stalled": false
+      },
+      "digest": {
+        "stalled": false
+      }
+    },
+    {
+      "name": "a disposed supervised worker never clears a stop",
+      "agents": [
+        {
+          "id": "current-stop",
+          "jobId": "job-1",
+          "state": "idle",
+          "lastActivity": "2026-09-23T09:00:00.000Z",
+          "createdAt": "2026-09-23T08:00:00.000Z",
+          "supervision": {
+            "state": "stopped",
+            "restarts": 2,
+            "breakerOpen": true,
+            "stopReason": "crash loop"
+          }
+        },
+        {
+          "id": "disposed-live",
+          "jobId": "job-1",
+          "state": "disposed",
+          "lastActivity": "2026-09-23T09:30:00.000Z",
+          "createdAt": "2026-09-23T08:30:00.000Z",
+          "supervision": {
+            "state": "watching",
+            "restarts": 0,
+            "breakerOpen": false,
+            "stopReason": null
+          }
+        }
+      ],
+      "board": {
+        "waiting": true,
+        "reason": "crash loop",
+        "restarts": 2,
+        "stalled": false
+      },
+      "digest": {
+        "stalled": false
+      }
+    },
+    {
+      "name": "a recorded stop time after a later frame still marks the lane waiting",
+      "agents": [
+        {
+          "id": "live-worker",
+          "jobId": "job-1",
+          "state": "streaming",
+          "lastActivity": "2026-09-23T09:40:00.000Z",
+          "createdAt": "2026-09-23T08:00:00.000Z",
+          "supervision": {
+            "state": "watching",
+            "restarts": 0,
+            "breakerOpen": false,
+            "stopReason": null
+          }
+        },
+        {
+          "id": "late-stop",
+          "jobId": "job-1",
+          "state": "idle",
+          "lastActivity": "2026-09-23T09:30:00.000Z",
+          "createdAt": "2026-09-23T08:30:00.000Z",
+          "supervision": {
+            "state": "stopped",
+            "restarts": 3,
+            "breakerOpen": true,
+            "stopReason": "quota_wall",
+            "stoppedAt": "2026-09-23T09:45:00.000Z"
+          }
+        }
+      ],
+      "board": {
+        "waiting": true,
+        "reason": "quota_wall",
+        "restarts": 3,
         "stalled": false
       },
       "digest": {

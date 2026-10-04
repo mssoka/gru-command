@@ -107,45 +107,71 @@ export interface WorkerStopView {
 export function stoppedWorkersByJob(agents: readonly AgentView[]): Map<string, WorkerStopView> {
   const stopped = new Map<string, { readonly view: WorkerStopView; readonly orderAt: number }>();
   const stopKnownAt = new Map<string, number>();
-  const liveAt = new Map<string, number>();
-  // The waiting decision compares KNOWN activity stamps only — exactly
-  // the digest's rule (last_activity is NULL for a worker that has not
+  // A `null` value means at least one live worker's activity stamp is
+  // UNKNOWN; that worker favors live and can never be masked by another
+  // worker's finite stamp (code review 2026-10-04).
+  const liveAt = new Map<string, number | null>();
+  // The waiting decision compares KNOWN stamps only — exactly the
+  // digest's rule (last_activity is NULL for a worker that has not
   // spoken yet; a fresh registration must not inherit a stop).
   const stamp = (agent: AgentView): number =>
     agent.lastActivity === null ? Number.NaN : Date.parse(agent.lastActivity);
-  // The DISPLAYED stop is the newest by (lastActivity ?? createdAt), so a
-  // stop record with no activity yet still orders by its registration.
+  // Stop recency: the recorded stop time when the server provides it
+  // (code review 2026-10-04), else the last frame. A stop AFTER a later
+  // frame still wins the lane's displayed cause.
+  const stopStamp = (agent: AgentView): number => {
+    const view = agent.supervision;
+    if (view !== null && view !== undefined && view.stoppedAt !== null && view.stoppedAt !== undefined) {
+      const at = Date.parse(view.stoppedAt);
+      if (Number.isFinite(at)) return at;
+    }
+    return stamp(agent);
+  };
+  // The DISPLAYED stop is the newest by stop time, else activity, else
+  // registration order, so a stop recorded before its first frame is
+  // never masked by an older known one (A8).
   const orderStamp = (agent: AgentView): number => {
-    const known = stamp(agent);
+    const known = stopStamp(agent);
     if (Number.isFinite(known)) return known;
     return agent.createdAt === undefined ? Number.NaN : Date.parse(agent.createdAt);
   };
   const bumpLive = (jobId: string, at: number): void => {
     const existing = liveAt.get(jobId);
-    if (existing === undefined || (Number.isFinite(at) && (!Number.isFinite(existing) || at > existing))) {
-      liveAt.set(jobId, at);
+    if (existing === undefined) {
+      liveAt.set(jobId, Number.isFinite(at) ? at : null);
+      return;
     }
+    if (existing === null || !Number.isFinite(at)) {
+      // An unknown-stamp live worker always favors live; once present it
+      // can never be replaced by another worker's finite stamp.
+      liveAt.set(jobId, null);
+      return;
+    }
+    if (at > existing) liveAt.set(jobId, at);
   };
   for (const agent of agents) {
     if (agent.jobId === null || agent.role !== 'minion') continue;
     const supervision = agent.supervision;
-    const at = stamp(agent);
     if (supervision === null || supervision === undefined) {
       // Unsupervised worker: not a supervision stop. A DISPOSED record is
       // not a live worker either — only a running unsupervised worker can
       // clear a stopped record (final independent review E0).
       if (agent.state === 'disposed') continue;
-      bumpLive(agent.jobId, at);
+      bumpLive(agent.jobId, stamp(agent));
       continue;
     }
     if (supervision.state !== 'stopped' && supervision.breakerOpen !== true) {
-      bumpLive(agent.jobId, at);
+      // A disposed record is not a live worker whether or not the
+      // supervisor still returns a view for it (code review 2026-10-04 A2).
+      if (agent.state === 'disposed') continue;
+      bumpLive(agent.jobId, stamp(agent));
       continue;
     }
     const view: WorkerStopView = { reason: supervision.stopReason ?? null, restarts: supervision.restarts };
+    const known = stopStamp(agent);
     const knownPrior = stopKnownAt.get(agent.jobId);
-    if (Number.isFinite(at) && (knownPrior === undefined || at > knownPrior)) {
-      stopKnownAt.set(agent.jobId, at);
+    if (Number.isFinite(known) && (knownPrior === undefined || known > knownPrior)) {
+      stopKnownAt.set(agent.jobId, known);
     }
     const orderAt = orderStamp(agent);
     const existing = stopped.get(agent.jobId);
@@ -159,17 +185,16 @@ export function stoppedWorkersByJob(agents: readonly AgentView[]): Map<string, W
   const result = new Map<string, WorkerStopView>();
   for (const [jobId, entry] of stopped) {
     const live = liveAt.get(jobId);
-    // The stop marks the lane only when no live worker exists, or the
-    // newest live worker has a KNOWN and strictly older stamp. An unknown
-    // live stamp favors the live worker (registerAgent inserts
-    // last_activity NULL), so the fresh-worker window never inherits the
-    // previous worker's stop (final tracked-review A0/A1/E1/V1). The
+    // No live worker at all → the stop speaks. A live worker with an
+    // unknown stamp favors live. Otherwise the newest KNOWN stop stamp
+    // must be strictly newer than the newest known live stamp. The
     // comparison uses the newest KNOWN stop stamp across the lane's stops
     // (not the displayed one), so the selected reason can never flip the
     // waiting outcome vs the digest.
     const known = stopKnownAt.get(jobId) ?? Number.NaN;
     const waiting =
-      live === undefined || (Number.isFinite(known) && Number.isFinite(live) && known > live);
+      live === undefined ||
+      (live !== null && Number.isFinite(known) && Number.isFinite(live) && known > live);
     if (waiting) result.set(jobId, entry.view);
   }
   return result;
@@ -194,8 +219,10 @@ export function liveWorkerStampsByJob(agents: readonly AgentView[]): Map<string,
     ) {
       continue;
     }
-    // A disposed unsupervised record is not a live worker (mirror E0).
-    if ((supervision === null || supervision === undefined) && agent.state === 'disposed') continue;
+    // A disposed record is not a live worker, supervised or not: its
+    // registration stamp must not keep a stopped lane warm (code review
+    // 2026-10-04 A2).
+    if (agent.state === 'disposed') continue;
     const raw = agent.lastActivity ?? agent.createdAt ?? null;
     if (raw === null) continue;
     const at = Date.parse(raw);
@@ -224,16 +251,12 @@ export function isStalledWorking(job: JobView, opts: BucketOptions = {}): boolea
   const recorded = job.lastAgentActivity ?? job.lane?.createdAt ?? null;
   const recordedMs = recorded === null ? null : Date.parse(recorded);
   const workerMs = opts.liveWorkerStamps?.get(job.id) ?? null;
-  // The stall clock starts at the NEWEST of the lane's recorded activity
-  // and its live worker's registration: a re-dispatched lane's fresh
-  // worker (lastActivity NULL) speaks through its createdAt, exactly as
-  // the digest's `lastActivity ?? createdAt` fallback does (A1/E1).
-  const then =
-    workerMs === null
-      ? recordedMs
-      : recordedMs === null || Number.isNaN(recordedMs)
-        ? workerMs
-        : Math.max(recordedMs, workerMs);
+  // The stall clock follows the digest's live-worker pool when one exists
+  // (newest live minion `lastActivity ?? createdAt`): a recent frame from
+  // a non-minion role can no longer keep a silent minion out of COLD
+  // (code review 2026-10-04). With no live worker the lane's own recency
+  // still applies, exactly as before.
+  const then = workerMs !== null ? workerMs : recordedMs;
   if (then === null || Number.isNaN(then)) return false;
   return (opts.now ?? Date.now()) - then > threshold;
 }
