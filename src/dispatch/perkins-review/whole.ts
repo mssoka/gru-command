@@ -9,7 +9,7 @@ import { withRateLimitRetries, type RateLimitRetryOptions } from '../../runtime/
 import { assertFrozenPromptBounds, sourceMovementSinceFreeze, writeReviewArtifact, type FrozenReview, type SourceMovement } from './artifacts.js';
 import { readFrozenEvidenceBytes, renderEvidencePromptSection } from '../../review-inputs/evidence.js';
 import { finalAssistantText } from './session-output.js';
-import { PERKINS_FINDING_SOURCES, type PerkinsFindingSource, type PerkinsLens, type PerkinsPolicy } from './policy.js';
+import { PERKINS_FINDING_SOURCES, PERKINS_LENSES, type PerkinsFindingSource, type PerkinsLens, type PerkinsPolicy } from './policy.js';
 import {
   dedupeVerifiedFindings,
   parseFindingsSubmission,
@@ -449,7 +449,7 @@ function provenanceLocation(location: string): string {
 const TERMINAL_CLEAN_CLAIM_PATTERNS: readonly RegExp[] = [
   /\bno (?:remaining |outstanding |unresolved )*(?:issues?|problems?|findings?|defects?|bugs?|concerns?|regressions?|blockers?|failures?)\b(?:[^.;!?]{0,80}?\b(?:remain|remains|remained|left|found|detected|identified|exists?|existed|present|outstanding|stands?|observed|reported|known|noted|applicable|arise|arose)\b|\s+to (?:fix|address|resolve|change|report)\b|\s*$)/iu,
   /\bthere (?:are|were|is|was) no (?:remaining |outstanding |unresolved )*(?:issues?|problems?|findings?|defects?|bugs?|concerns?|regressions?|blockers?|failures?)\b/iu,
-  /\bno (?:remaining |outstanding |unresolved )*(?:issues?|problems?|findings?|defects?|bugs?|concerns?) (?:in|for|on|with) (?:this|the) (?:change|pr|pull request|diff|patch|branch|review|submission|work|implementation|code)\b/iu,
+  /\bno (?:remaining |outstanding |unresolved )*(?:issues?|problems?|findings?|defects?|bugs?|concerns?|blockers?) (?:in|for|on|with) (?:(?:this|the) )?(?:change|pr|pull request|diff|patch|branch|review|submission|work|implementation|code)\b/iu,
   /\bnothing (?:further |else |more )?(?:remains?|remained|(?:is|was) left|left|(?:is|was) found|found|to (?:fix|address|resolve|change|do|report|raise)|(?:requires?|needs?) (?:fixing|changes?|attention)|(?:is|are|was|were) (?:needed|required|necessary))/iu,
   /\bno (?:changes?|modifications?|edits?) (?:are |is |were |was )?(?:needed|required|necessary)\b/iu,
   /\b(?:the |this |that )?(?:change|pr|pull request|diff|patch|branch|review|submission|work|implementation|code) (?:requires?|needs?) no (?:further |additional |more )?(?:changes?|fixes|work|attention)\b/iu,
@@ -460,32 +460,32 @@ const TERMINAL_CLEAN_CLAIM_PATTERNS: readonly RegExp[] = [
   /\b(?:lgtm|looks good to me)\b/iu,
 ];
 
+/** A direct whole-change assertion cannot be scoped by a file or lens merely
+ * mentioned elsewhere in the same clause. Exceptions and blocker-qualified
+ * claims are handled separately below. */
+const GLOBAL_CHANGE_CLAIM = /\b(?:no (?:remaining |outstanding |unresolved )*(?:issues?|problems?|findings?|defects?|bugs?|concerns?|blockers?)(?:\s+\w+){0,3}?\s+(?:in|for|on|with)\s+(?:(?:this|the|whole|overall)\s+)?(?:change|pr|pull request|diff|patch|branch|review|submission|work|implementation|code)\b|(?:the|this|that|our)\s+(?:change|pr|pull request|diff|patch|branch|review|submission|work|implementation|codebase|code)\s+(?:is|was|looks|looked|appears|appeared|reads|read|remains|remained|requires?|needs?)\s+(?:clean|issue[- ]free|problem[- ]free|defect[- ]free|bug[- ]free|no\b))/iu;
+
+const LENS_SCOPE = new RegExp(`\\b(?:${PERKINS_LENSES.join('|')})\\s+(?:lens|lenses|review|reviewer|specialist|run|process|report)\\s+(?:found|reported|saw|identified|has|had|detected)\\s+no\\b|\\bno\\s+(?:issues?|findings?|problems?)\\b[^.;!?]{0,80}\\b(?:in|for|from)\\s+(?:the\\s+)?(?:${PERKINS_LENSES.join('|')})\\s+(?:lens|lenses|review|reviewer|specialist|run|process|report)\\b`, 'iu');
+
 /** The bounded scope cues that make a clean claim legitimate beside retained
  * findings: a named lens/process, a file/area, or a possessive "own" claim.
  * An unscoped claim concludes the whole change and remains a contradiction. */
 function scopedCleanClaim(
   segment: string, retainedLocations: readonly string[], retainedBlocker: boolean, retainedPrior: boolean,
 ): boolean {
-  if (/\b(?:its|their|our|my|your) own\b|\bown (?:findings?|review|area|lens|scope|judgment|report)\b/iu.test(segment)) return true;
-  // Explicit exceptions scope the claim to what is left out.
-  if (/\b(?:except|aside from|apart from|other than|besides)\b/u.test(segment)) return true;
-  // The prior round's own outcome is not the present change's conclusion —
-  // unless the prior findings are still retained, where the claim contradicts them.
+  // Explicit exceptions leave retained findings in view, even if a whole
+  // change is mentioned. A bare all-files claim is not a limited scope.
+  if (/\b(?:except|aside from|apart from|other than|besides)\b/iu.test(segment)) return true;
+  if (/\b(?:that|which) (?:block|blocks|prevent|prevents|hinder|hinders|require|requires)\b/iu.test(segment)) return !retainedBlocker;
+  if (GLOBAL_CHANGE_CLAIM.test(segment) || /\b(?:any|all|every|each)\s+(?:files?|areas?|parts?|sections?)\b/iu.test(segment)) return false;
+  // The prior round's own outcome is not the present change's conclusion.
   if (!retainedPrior && /\b(?:prior|previous|earlier|last|preceding)\s+(?:review|round|report|submission|pass|revision)\b/iu.test(segment)) return true;
-  // "no issues remain that block merge" claims only unimpeded progress.
-  if (/\b(?:that|which) (?:block|blocks|prevent|prevents|hinder|hinders|require|requires)\b/u.test(segment)) return !retainedBlocker;
   // A named path scopes a claim only if no retained finding cites that file.
-  // Git paths can have arbitrary extensions (or be dotfiles) and internal
-  // whitespace is significant, just as it is for provenance locations.
-  const paths = [...segment.matchAll(/\b(?:in|within|for|on|file:)\s+([.\w@/-]*\.[\w-]+)/giu)].map((match) => match[1]!);
+  // Accept both extensionless and space-containing Git paths, not "any files".
+  const paths = [...segment.matchAll(/\b(?:in|within|for|on|file:)\s+((?:[.\w@-]+\/)+[.\w@-]+(?:\s+(?!with\b|and\b|but\b|though\b|including\b|except\b|that\b|which\b|is\b)[.\w@-]+)*|[.\w@-]*\.[\w-]+)/giu)].map((match) => match[1]!);
   if (paths.length > 0) return paths.every((path) => !retainedLocations.includes(path));
-  if (/\b(?:in|within|for|regarding|concerning|about|on)\s+(?:this|that|the|another|each|every|any|its|their|our|my)?\s*(?:\w+\s+){0,3}?(?:files?|functions?|methods?|modules?|sections?|lenses?|areas?|paths?|helpers?|components?|classes?|hunks?|categories?|scopes?|parts?|regions?|tests?)\b/iu.test(segment)) return true;
-  // Lens attribution: a claim about what one specialist did or saw.
-  for (const match of segment.matchAll(/\b(?:blind|edge|acceptance|security|architecture|codebase|tests)\b/giu)) {
-    const index = match.index ?? 0;
-    const around = segment.slice(Math.max(0, index - 60), Math.min(segment.length, index + match[0].length + 60));
-    if (/\b(?:lenses?|specialists?|reviewers?|children|child|runs?|reviews?|reviewed|process(?:es)?|reports?|reported)\b/iu.test(around)) return true;
-  }
+  if (LENS_SCOPE.test(segment)) return true;
+  if (/\b(?:in|within|for|regarding|concerning|about|on)\s+(?:this|that|the|another|its|their|our|my)?\s*(?:\w+\s+){0,3}?(?:files?|functions?|methods?|modules?|sections?|areas?|paths?|helpers?|components?|classes?|hunks?|categories?|scopes?|parts?|regions?|tests?)\b/iu.test(segment)) return true;
   return false;
 }
 
@@ -494,29 +494,45 @@ function scopedCleanClaim(
 function findTerminalCleanClaim(
   report: string, retainedLocations: readonly string[], retainedBlocker: boolean, retainedPrior: boolean,
 ): string | null {
-  // Quoted examples and fenced snippets are evidence, not the report's own
-  // conclusion. The title-presence check still sees those visible lines.
-  let fenced = false;
-  let inPriorSection = false;
-  const visible = report.replace(/<!--[\s\S]*?-->/gu, '');
-  for (const line of visible.split('\n')) {
-    if (/^\s*(```|~~~)/u.test(line)) { fenced = !fenced; continue; }
-    if (fenced || /^\s*>/u.test(line)) continue;
-    if (/^\s*#{1,6}\s+/u.test(line)) {
-      inPriorSection = /\b(?:prior|previous|earlier|last)\b/iu.test(line);
+  // Rendered line wraps are prose, whereas headings, quotes and fenced code
+  // have distinct Markdown roles. Check heading TEXT as well as paragraphs.
+  const paragraphs: Array<{ text: string; priorOnly: boolean }> = [];
+  let pending: string[] = [];
+  let priorOnly = false;
+  let fence: { marker: string; length: number } | null = null;
+  const flush = (): void => {
+    if (pending.length > 0) paragraphs.push({ text: pending.join(' '), priorOnly });
+    pending = [];
+  };
+  for (const line of report.replace(/<!--[\s\S]*?-->/gu, '').split('\n')) {
+    const marker = /^\s*(`{3,}|~{3,})(.*)$/u.exec(line);
+    if (fence !== null) {
+      if (marker !== null && marker[1]![0] === fence.marker && marker[1]!.length >= fence.length && marker[2]!.trim() === '') fence = null;
       continue;
     }
-    // A prior-only section can report its own resolution, not globally
-    // declare the present change clean merely by sitting under that heading.
-    if (inPriorSection && !retainedPrior &&
-      !/\b(?:the|this|whole|overall)\s+(?:change|pr|pull request|diff|branch|work|implementation)\b/iu.test(line)) continue;
-    // A historical or expressly disallowed quotation is not an assertion by
-    // this report. A bare quoted conclusion still counts as its own prose.
-    const prose = line.replace(/\b(?:(?:the )?(?:prior reviewer|earlier report|previous report) (?:wrote|said|claimed|asserted)|do not say|don't say)\s*["'“‘][^"'“”‘’]{0,200}["'”’]/giu, '');
+    if (marker !== null) { flush(); fence = { marker: marker[1]![0]!, length: marker[1]!.length }; continue; }
+    if (line.trim() === '' || /^\s*>|^ {4,}\S/u.test(line)) { flush(); continue; }
+    const heading = /^\s*#{1,6}\s+(.+)$/u.exec(line);
+    if (heading !== null) {
+      flush();
+      priorOnly = /\b(?:prior|previous|earlier|last)\b/iu.test(heading[1]!);
+      paragraphs.push({ text: heading[1]!, priorOnly });
+      continue;
+    }
+    pending.push(line);
+  }
+  flush();
+  for (const paragraph of paragraphs) {
+    // A resolved prior-only section may describe its own history, not
+    // silently certify the current PR. Global subjects are always checked.
+    if (paragraph.priorOnly && !retainedPrior &&
+      !/\b(?:the|this|whole|overall)\s+(?:change|pr|pull request|diff|branch|work|implementation)\b|\b(?:in|for|on|with)\s+(?:(?:this|the|whole)\s+)?(?:pr|pull request|change|diff|branch)\b/iu.test(paragraph.text)) continue;
+    // Attributed past judgments and explicitly disallowed quotations are
+    // evidence, not this report's own conclusion. Bare quotes still count.
+    const prose = paragraph.text.replace(/\b(?:(?:the )?(?:prior|previous|earlier) (?:reviewer|report) (?:incorrectly |wrongly )?(?:wrote|said|claimed|asserted)\s+(?:["'“‘][^"'“”‘’]{0,200}["'”’]|[^,;.!?]{0,200})|(?:do not say|don't say)\s*["'“‘][^"'“”‘’]{0,200}["'”’])/giu, '');
     for (const raw of prose.split(/[;!?]+|\.(?=\s|$)/u)) {
-      // Evaluate independent clauses separately: a lens or file mentioned
-      // later cannot scope a global clean conclusion earlier in the sentence.
-      for (const clause of raw.split(/,\s*(?:and|but)\s+|\s+but\s+|\s+and\s+(?=(?:the|this|no|nothing|everything)\b)/iu)) {
+      // A cue about one lens/file cannot scope another independent claim.
+      for (const clause of raw.split(/,\s*(?=(?:and|but|though|although|however|the|this|no|nothing|everything|security|blind|edge)\b)|\s+(?:but|though|although|however)\s+|\s+and\s+(?=(?:the|this|no|nothing|everything)\b)/iu)) {
         const segment = clause.replace(/[*_`~#]+/gu, '').replace(/\s+/gu, ' ').trim();
         if (segment === '') continue;
         if (/\b(?:it is|that's|this is) (?:not true|false|wrong|incorrect) (?:that|to say)\b/iu.test(segment)) continue;

@@ -1934,6 +1934,17 @@ describe('whole-PR engine: repair pass 3', () => {
       '\nThe change is clean, and security review still lists a blocker.\n',
       '\nIt is not true that the change is clean, and no issues remain.\n',
       '\n## Prior review\nThe change is clean.\n',
+      '\n## Summary — The change is clean\n',
+      '\nNo\nissues remain.\n',
+      '\nThe change is\nclean.\n',
+      '\nNo issues remain in any files.\n',
+      '\nNo issues remain in this PR for src/other.ts.\n',
+      '\nNo issues remain in this change, including in src/other.ts.\n',
+      '\nSecurity review found a blocker, the change is clean.\n',
+      '\nThe change is clean on its own merits.\n',
+      '\nThe change is clean because the blind lens found no issues of its own.\n',
+      '\n## Prior review\nNo issues remain in PR.\n',
+      '\nNo issues remain in this change, though the security specialist found a warning.\n',
     ];
     const scoped = [
       '\nThe blind lens found no issues of its own.\n',
@@ -1947,6 +1958,15 @@ describe('whole-PR engine: repair pass 3', () => {
       '\nNo issues remain in app.vue.\n',
       '\nNo issues remain in .gitignore.\n',
       '\nNo issues remain from the previous round.\n',
+      '\nNo issues remain EXCEPT the retained finding above.\n',
+      '\nNo issues remain in scripts/build.\n',
+      '\nNo issues remain in src/other file.ts.\n',
+      '\nThe security lens found no issues.\n',
+      '\nThe performance review reported no issues.\n',
+      '\nThe operations review reported no issues.\n',
+      '\nThe previous reviewer said the change is clean, but broken guard remains.\n',
+      '\nThe prior reviewer incorrectly said the change is clean, but broken guard remains.\n',
+      '\n````\n```\nNo issues remain.\n````\n',
       '\nNo blockers remain; the retained finding is only a warning.\n',
       '\nLGTM.\n',
       '\nLGTM; the retained finding is only a warning.\n',
@@ -2048,14 +2068,16 @@ describe('whole-PR engine: repair pass 3', () => {
     expect((await h.run()).findings).toHaveLength(1);
   });
 
-  it('refuses a no-blockers claim while a blocker remains', async () => {
-    const h = wholeHarness({
-      childAnswer: (prompt) => (prompt.includes('"source": "edge"')
-        ? JSON.stringify([groundedFinding('edge', 'blocker')]) : '[]'),
-      specialists: ['edge'], submitRetries: 0,
-      transformReport: (report) => `${report}\nNo blockers remain.\n`,
-    });
-    await expect(h.run()).rejects.toThrow(/report-coherence/u);
+  it('refuses no-blockers claims while a blocker remains', async () => {
+    for (const claim of ['No blockers remain.', 'No blockers in this PR.']) {
+      const h = wholeHarness({
+        childAnswer: (prompt) => (prompt.includes('"source": "edge"')
+          ? JSON.stringify([groundedFinding('edge', 'blocker')]) : '[]'),
+        specialists: ['edge'], submitRetries: 0,
+        transformReport: (report) => `${report}\n${claim}\n`,
+      });
+      await expect(h.run()).rejects.toThrow(/report-coherence/u);
+    }
   });
 
   it('does not collapse internal whitespace in a specialist-provenance filename (R38)', async () => {
@@ -2070,6 +2092,18 @@ describe('whole-PR engine: repair pass 3', () => {
       repo.commitFile('src/two  spaces.ts', 'export const guard = 43;\n');
       repo.commitFile('src/two spaces.ts', 'export const guard = 43;\n');
     } });
+    await expect(h.run()).rejects.toThrow(/finding-source/u);
+  });
+
+  it('keeps specialist path case significant (R38)', async () => {
+    const h = wholeHarness({
+      childAnswer: (prompt) => (prompt.includes('"source": "edge"')
+        ? JSON.stringify([groundedFinding('edge', 'warning', {
+          title: 'case-sensitive path', location: 'src/main.ts:1', evidence: 'export function answer(): number {',
+        })]) : '[]'),
+      specialists: ['edge'], submitRetries: 0,
+      findings: (findings) => findings.map((finding) => ({ ...finding, location: 'src/Main.ts:1' })),
+    });
     await expect(h.run()).rejects.toThrow(/finding-source/u);
   });
 
