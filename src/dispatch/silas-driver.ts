@@ -5,13 +5,16 @@ import type { SilasConfig } from '../config.js';
 import type { EventBus } from '../events/bus.js';
 import type {
   AgentRecord,
+  DirectiveRequestRecord,
   EventRecord,
   JobRecord,
   LedgerApi,
   PendingRebriefRecord,
   RoundRecord,
 } from '../ledger/api.js';
+import { LIVE_DIRECTIVE_STATES, type DirectiveState } from '../ledger/directives.js';
 import type { LogLevel } from '../logger.js';
+import { openAttemptStartSeq } from './branch-idle.js';
 import type { AgentHandle, SpawnOptions } from '../runtime/types.js';
 import type { AgentSupervisionView } from '../supervision/supervisor.js';
 import type { GitHubPollTickResult } from './github-poll.js';
@@ -146,6 +149,13 @@ export interface DigestLedger {
   /** Durable re-brief markers; any row for a job is an unresolved request
    * that fences the job's review-eligibility rows (see the digest below). */
   listPendingRebriefs(opts?: { readonly jobId?: string }): readonly PendingRebriefRecord[];
+  /** Accepted directive requests still owing completion (`dispatching` or
+   * `admitted`). Presence is the lane's single-writer fence: no competing
+   * continuation may be offered while one may still be driving the lane. */
+  listPendingDirectives(opts?: {
+    readonly jobId?: string;
+    readonly states?: readonly DirectiveState[];
+  }): readonly DirectiveRequestRecord[];
   listProviderWaits?(opts?: { status?: string }): readonly unknown[];
   listPendingProviderRecoveries?(): readonly unknown[];
 }
@@ -420,6 +430,57 @@ function latestAnsweringReviewRequest(ledger: DigestLedger, jobId: string): Even
   return winner;
 }
 
+/** The newest explicit start of the job's CURRENT work phase that the digest
+ * can read: the attempt start review admission uses (`openAttemptStartSeq` —
+ * the latest `working` hop, never a `delivered → in-review` flip), plus the
+ * explicit repair starts that never flip status — a directive request
+ * accepted for dispatch (`silas.directive-intent`) and a claimed provider
+ * continuation (`provider.recovery-claimed`). An older `job.delivered` at or
+ * before this watermark is history from a previous phase, not proof that the
+ * current phase delivered (issue #162). */
+function currentPhaseStart(ledger: DigestLedger, jobId: string): EventRecord | null {
+  const startSeq = openAttemptStartSeq(ledger, jobId);
+  const statusEvent = ledger.latestJobEvent(jobId, 'job.status');
+  let newestSeq = startSeq;
+  let newest: EventRecord | null = statusEvent !== null && statusEvent.seq === startSeq ? statusEvent : null;
+  for (const kind of ['silas.directive-intent', 'provider.recovery-claimed']) {
+    const event = ledger.latestJobEvent(jobId, kind);
+    if (event !== null && event.seq > newestSeq) {
+      newestSeq = event.seq;
+      newest = event;
+    }
+  }
+  return newest;
+}
+
+/** Verification lifecycle kinds that mean a run currently owns the checkout
+ * (submitted or started), and the kinds that settle that ownership. */
+const VERIFICATION_OPEN_EVENTS = ['verification.requested', 'verification.started'] as const;
+const VERIFICATION_SETTLED_EVENTS = [
+  'verification.completed',
+  'verification.attached',
+  'verification.stale-released',
+  'verification.reconciled',
+  'verification.lock-timeout',
+] as const;
+
+/** True while a verification owns the lane: its newest lifecycle event is an
+ * un-settled request/start (a submitted or running run holds the checkout; a
+ * lock timeout, completion, attach or reconciliation settles it). */
+function verificationInFlight(ledger: DigestLedger, jobId: string): boolean {
+  let openSeq = 0;
+  for (const kind of VERIFICATION_OPEN_EVENTS) {
+    const event = ledger.latestJobEvent(jobId, kind);
+    if (event !== null && event.seq > openSeq) openSeq = event.seq;
+  }
+  if (openSeq === 0) return false;
+  for (const kind of VERIFICATION_SETTLED_EVENTS) {
+    const event = ledger.latestJobEvent(jobId, kind);
+    if (event !== null && event.seq > openSeq) return false;
+  }
+  return true;
+}
+
 /**
  * The compact digest of actionable ops states, computed from the ledger
  * alone (the ledger is the record; no runtime or filesystem probing beyond
@@ -443,8 +504,12 @@ function latestAnsweringReviewRequest(ledger: DigestLedger, jobId: string): Even
  *    and no silas follow-through has landed since that verdict: deliver the
  *    first fix directive per blocker, then the ladder's rung (directive →
  *    re-brief → escalate) for recurrences.
- * 4. stalledWorking — job working with no delivery while its minion has
- *    shown no activity past the stall threshold: assess the lane.
+ * 4. stalledWorking — job working while its CURRENT phase (the latest
+ *    `working` hop or explicit repair start, never an older delivery) has
+ *    not delivered and its minion has shown no activity past the stall
+ *    threshold: assess the lane. Accepted operations that still own the
+ *    lane — an unresolved re-brief, a live directive request, an in-flight
+ *    verification, an answering review — fence the row.
  *
  * plus minionErrors — a minion turn that failed more recently than any
  * delivery — so an error wake always carries its context.
@@ -600,8 +665,29 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       }
     }
 
-    // (4) Stalled lane: working with no delivery, minion gone quiet.
-    if (job.status === 'working' && delivered === null) {
+    // (4) Stalled lane: the CURRENT phase has not delivered and its worker
+    // has gone quiet. The current-phase comparison is the shared attempt
+    // start (issue #162): a truthful older delivery never proves the current
+    // repair phase delivered. Accepted operations that own the lane keep
+    // their fences — an unresolved re-brief request, a live directive
+    // request (`dispatching` = admission unknown, `admitted` = turn in
+    // flight; both reconcile, never duplicate), an in-flight verification,
+    // or a review genuinely answering the current phase (the clean-abort
+    // re-arm included). Ownership the digest cannot read fails closed: no
+    // competing continuation is offered for a phase another operation may
+    // still be driving.
+    const phaseStart = job.status === 'working' ? currentPhaseStart(input.ledger, job.id) : null;
+    const stallOperationOwns = job.status !== 'working' ||
+      pendingRebriefJobIds.has(job.id) ||
+      input.ledger.listPendingDirectives({ jobId: job.id, states: LIVE_DIRECTIVE_STATES }).length > 0 ||
+      verificationInFlight(input.ledger, job.id) ||
+      cleanAbort ||
+      (answeringRequest !== null && answeringRequest.seq > (phaseStart?.seq ?? 0));
+    if (
+      job.status === 'working' &&
+      !(delivered !== null && delivered.seq > (phaseStart?.seq ?? 0)) &&
+      !stallOperationOwns
+    ) {
       const boundMinions = input.ledger
         .listAgents()
         .filter((agent) => agent.jobId === job.id && agent.role === 'minion');
@@ -665,6 +751,23 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
               minionState: minion.state,
               lastActivity: minion.lastActivity,
               idleMs: now() - lastMs,
+            });
+          }
+        } else if (boundMinions.length === 0 && phaseStart !== null) {
+          // No worker record at all (never registered, or the record was
+          // lost): the phase start is the only honest clock. Past the same
+          // grace the lane is surfaced with absent coordinates — Silas
+          // assesses; nothing spawns here. Accepted startup windows are
+          // covered by the operation fences above and by this very window.
+          const startedMs = Date.parse(phaseStart.ts);
+          if (Number.isFinite(startedMs) && now() - startedMs > input.config.stallThresholdMs) {
+            digest.stalledWorking.push({
+              jobId: job.id,
+              repo: job.repo,
+              minionId: null,
+              minionState: null,
+              lastActivity: null,
+              idleMs: now() - startedMs,
             });
           }
         }
