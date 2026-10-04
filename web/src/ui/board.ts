@@ -210,10 +210,16 @@ export class BoardView {
     this.onToast = handler;
   }
 
-  /** E7: bind the board client (receipts + acks) — rebound on re-pair. */
+  /** E7: bind the board client (receipts + acks) — rebound on re-pair.
+   * Receipt paging is per-connection state: a re-pair must not surface the
+   * previous server's fetched receipts or resume its pagination cursor. */
   bindClient(client: BoardClient): void {
     this.boardClient = client;
     this.sentShown.clear();
+    this.extraReceipts = [];
+    this.receiptsNextOffset = 0;
+    this.receiptsExhausted = false;
+    this.receiptsLoading = false;
   }
 
   render(snapshot: BoardSnapshot): void {
@@ -1075,10 +1081,9 @@ export class BoardView {
       ),
       ...this.extraReceipts.filter((extra) => !notifications.some((item) => item.id === extra.id)),
     ];
-    if (notifications.length === 0 && (snapshot.ownerPrs ?? []).length === 0) {
-      list.append(el('div', 'lbl', 'nothing needs attention'));
-      return;
-    }
+    // Every snapshot renders the full band structure — an empty feed is
+    // good news, not absence. No early return may skip FOR YOU / NEEDS GRU
+    // and their clear states (g9).
     // FOR YOU parity (FOR YOU r1): the bell renders the SAME authoritative
     // owner projection the board band renders — pending acks AND ready PRs
     // — so the two surfaces can never disagree about what the owner owes.
@@ -1128,6 +1133,8 @@ export class BoardView {
     if (this.snapshot !== null) this.renderNotifications(this.snapshot);
     try {
       const page = await client.fetchReceipts(this.receiptsNextOffset);
+      // Re-paired mid-fetch: the page belongs to the previous server's record.
+      if (this.boardClient !== client) return;
       for (const row of page.receipts) {
         if (!this.extraReceipts.some((existing) => existing.id === row.id)) this.extraReceipts.push(row);
       }
@@ -1136,8 +1143,10 @@ export class BoardView {
     } catch {
       // The button remains; a later click retries the same cursor.
     } finally {
-      this.receiptsLoading = false;
-      if (this.snapshot !== null) this.renderNotifications(this.snapshot);
+      if (this.boardClient === client) {
+        this.receiptsLoading = false;
+        if (this.snapshot !== null) this.renderNotifications(this.snapshot);
+      }
     }
   }
 
@@ -1220,7 +1229,8 @@ export class BoardView {
       // Only needs-owner rings the shoulder; machine/fyi rows live in the
       // panel bands and reach Gru through the wake path instead.
       if (notification.routing !== 'needs-owner') continue;
-      if (firstRender || notification.resolvedAt !== null) continue; // history/resolved — no toast spam
+      // History and already-handled rows (acked on ANY device) never toast.
+      if (firstRender || notification.ackedAt !== null || notification.resolvedAt !== null) continue;
       this.onToast?.(notification);
       this.sendShown(notification, 'web-toast');
     }

@@ -13,7 +13,7 @@ import { recordFollowUpDelivery } from './fix-directive.js';
 import { isPromptTurnVerdict, promptVerdictFromHealth } from '../runtime/prompt-verdict.js';
 import type { PromptTurnVerdict } from '../runtime/types.js';
 import { settleRetries, RetrySettlementUnavailableError, type PacingGate, type PacingLease, type RetrySettlement } from '../runtime/pacing.js';
-import { PR_CREATION_RULE } from './pr-creation.js';
+import { WORKER_RULE_BLOCKS } from './worker-rules.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -87,8 +87,7 @@ export function renderMinionBriefing(input: {
     'BRIEFING:',
     input.briefing,
     ...(lessonsSection === '' ? [] : ['', lessonsSection]),
-    '',
-    PR_CREATION_RULE,
+    ...WORKER_RULE_BLOCKS.flatMap((block) => ['', block]),
     '',
     'Execute the briefing inside this worktree. Standing orders: work only',
     'inside this tree; commit your work to the branch; verify it (build,',

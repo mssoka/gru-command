@@ -5,13 +5,16 @@ import type { SilasConfig } from '../config.js';
 import type { EventBus } from '../events/bus.js';
 import type {
   AgentRecord,
+  DirectiveRequestRecord,
   EventRecord,
   JobRecord,
   LedgerApi,
   PendingRebriefRecord,
   RoundRecord,
 } from '../ledger/api.js';
+import { LIVE_DIRECTIVE_STATES, type DirectiveState } from '../ledger/directives.js';
 import type { LogLevel } from '../logger.js';
+import { openAttemptStartSeq } from './branch-idle.js';
 import type { AgentHandle, SpawnOptions } from '../runtime/types.js';
 import type { AgentSupervisionView } from '../supervision/supervisor.js';
 import type { GitHubPollTickResult } from './github-poll.js';
@@ -164,6 +167,16 @@ export interface DigestLedger {
   /** Durable re-brief markers; any row for a job is an unresolved request
    * that fences the job's review-eligibility rows (see the digest below). */
   listPendingRebriefs(opts?: { readonly jobId?: string }): readonly PendingRebriefRecord[];
+  /** Accepted directive requests still owing completion (`dispatching` or
+   * `admitted`). Presence is the lane's single-writer fence: no competing
+   * continuation may be offered while one may still be driving the lane. */
+  listPendingDirectives(opts?: {
+    readonly jobId?: string;
+    readonly states?: readonly DirectiveState[];
+  }): readonly DirectiveRequestRecord[];
+  /** True while any verification run for the job is unsettled (its newest
+   * open event is newer than the same run's newest terminal event). */
+  hasUnsettledVerificationRun(jobId: string): boolean;
   listProviderWaits?(opts?: { status?: string }): readonly unknown[];
   listPendingProviderRecoveries?(): readonly unknown[];
 }
@@ -534,6 +547,134 @@ function verificationFailureDetail(event: EventRecord): string {
   return 'failed with no exit status';
 }
 
+/** The job's current phase-opening evidence. */
+interface CurrentPhaseStart {
+  /** Newest phase-opening event (the `working` hop or an explicit repair
+   * start); null when the ledger carries no phase-opening event. */
+  readonly event: EventRecord | null;
+  /** Event-sequence watermark of the newest phase-opening evidence. */
+  readonly seq: number;
+  /** Newest explicit repair start that need not flip status — a directive
+   * ADMISSION (`silas.directive-sent`, not the mere acceptance intent) or a
+   * claimed provider continuation; 0 when none. */
+  readonly repairStartSeq: number;
+}
+
+/** The newest explicit start of the job's CURRENT work phase that the digest
+ * can read: the attempt start review admission uses (`openAttemptStartSeq` —
+ * the latest `working` hop, never a `delivered → in-review` flip), plus the
+ * explicit repair starts that never flip status — a directive turn admitted
+ * for dispatch (`silas.directive-sent`; an acceptance intent that never
+ * admitted work is not a phase) and a claimed provider continuation
+ * (`provider.recovery-claimed`). An older `job.delivered` at or before this
+ * watermark is history from a previous phase, not proof that the current
+ * phase delivered (issue #162). */
+function currentPhaseStart(ledger: DigestLedger, jobId: string): CurrentPhaseStart {
+  const statusHopSeq = openAttemptStartSeq(ledger, jobId);
+  const statusEvent = ledger.latestJobEvent(jobId, 'job.status');
+  let seq = statusHopSeq;
+  let event: EventRecord | null = statusEvent !== null && statusEvent.seq === statusHopSeq ? statusEvent : null;
+  let repairStartSeq = 0;
+  for (const kind of ['silas.directive-sent', 'provider.recovery-claimed']) {
+    const repair = ledger.latestJobEvent(jobId, kind);
+    if (repair !== null && repair.seq > repairStartSeq) repairStartSeq = repair.seq;
+    if (repair !== null && repair.seq > seq) {
+      seq = repair.seq;
+      event = repair;
+    }
+  }
+  return { event, seq, repairStartSeq };
+}
+
+/** True while a verification owns the lane. Identity-scoped at the ledger
+ * (one run's settlement never resolves another run) and window-free: a busy
+ * activity tail can never hide an unsettled run. An unsettled
+ * request/start keeps the fence until the scheduler records a terminal
+ * event — ownership the digest cannot read fails closed rather than
+ * guessing a queue's cessation from age. */
+function verificationInFlight(ledger: DigestLedger, jobId: string): boolean {
+  return ledger.hasUnsettledVerificationRun(jobId);
+}
+
+/** The newest effective activity stamp for one worker: the ledger stamp or
+ * the supervisor's own event clock, whichever is newer, falling back to the
+ * registration time when neither is known (NaN only when all are absent). */
+function effectiveWorkerStamp(input: ComputeDigestInput, agent: AgentRecord): number {
+  const ledgerMs = agent.lastActivity === null ? Number.NaN : Date.parse(agent.lastActivity);
+  const supervisionIso = input.supervisionFor?.(agent.id)?.lastEventAt ?? null;
+  const supervisionMs = supervisionIso === null ? Number.NaN : Date.parse(supervisionIso);
+  const known = Number.isFinite(supervisionMs) && (!Number.isFinite(ledgerMs) || supervisionMs > ledgerMs)
+    ? supervisionMs
+    : ledgerMs;
+  return Number.isFinite(known) ? known : Date.parse(agent.createdAt);
+}
+
+/** Final publish-boundary recheck for a proposed stalled row: the lane may
+ * have delivered, gone terminal, opened a new phase, or gained an owner
+ * while a later job's blocker history was awaited. Recomputes the cheap
+ * ownership facts only; a stale offer is retracted, never published (no
+ * duplicate writers). The silence comparison uses the row's COMPUTE-TIME
+ * floor, never a floor reconstructed from a later clock reading. */
+function stallStillEligible(
+  input: ComputeDigestInput,
+  row: StalledWorkingRow,
+  phaseSeqAtCompute: number,
+  silenceFloorAtCompute: number,
+  jobSeqAtCompute: number,
+): boolean {
+  const ledger = input.ledger;
+  const jobId = row.jobId;
+  const job = ledger.getJob(jobId);
+  if (job === null || (job.status !== 'working' && job.status !== 'in-review')) return false;
+  // Any event landing during the await (a delivery, a request, an agent
+  // state change) makes the computed offer stale; the next sweep re-derives.
+  if ((ledger.listJobEvents(jobId, { limit: 1 })[0]?.seq ?? 0) !== jobSeqAtCompute) return false;
+  const phaseStart = currentPhaseStart(ledger, jobId);
+  if (phaseStart.seq !== phaseSeqAtCompute) return false;
+  const delivered = ledger.latestJobEvent(jobId, 'job.delivered');
+  if (delivered !== null && delivered.seq > phaseStart.seq) return false;
+  if (ledger.listPendingRebriefs({ jobId }).length > 0) return false;
+  if (ledger.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES }).length > 0) return false;
+  if (verificationInFlight(ledger, jobId)) return false;
+  const review = latestAnsweringReviewRequest(ledger, jobId);
+  if (review !== null && review.seq > phaseStart.seq) return false;
+  // Worker revalidation across the WHOLE current set: a stop arriving while
+  // the await was open moves the lane to the separately handled
+  // waiting/re-arm state; a worker that became live, active, or open-turn
+  // makes it owned again.
+  const minions = ledger.listAgents().filter((agent) => agent.jobId === jobId && agent.role === 'minion');
+  for (const agent of minions) {
+    const view = input.supervisionFor?.(agent.id) ?? null;
+    if (view === null || (view.state !== 'stopped' && view.breakerOpen !== true)) continue;
+    const stopIso = view.stoppedAt ?? null;
+    const stopMs = stopIso === null ? effectiveWorkerStamp(input, agent) : Date.parse(stopIso);
+    if (!Number.isFinite(stopMs) || stopMs > silenceFloorAtCompute) return false;
+  }
+  const live = minions.filter((agent) => {
+    if (agent.state === 'disposed') return false;
+    const view = input.supervisionFor?.(agent.id) ?? null;
+    return view === null || (view.state !== 'stopped' && view.breakerOpen !== true);
+  });
+  for (const agent of live) {
+    const view = input.supervisionFor?.(agent.id) ?? null;
+    if (view !== null && (view.openTurn || view.openControl === true || view.openToolCalls > 0)) return false;
+    const effective = effectiveWorkerStamp(input, agent);
+    if (Number.isFinite(effective) && effective > silenceFloorAtCompute) return false;
+  }
+  if (row.minionId === null) {
+    // A no-record offer is answered by any live worker appearing.
+    if (live.length > 0) return false;
+  } else if (!minions.some((agent) => agent.id === row.minionId)) {
+    return false; // the named worker record vanished entirely
+  } else if (live.length > 0 && !live.some((agent) => agent.id === row.minionId)) {
+    // A different live worker now owns the lane; the named worker's own
+    // silence no longer decides.
+    return false;
+  }
+  return true;
+
+}
+
 /**
  * The compact digest of actionable ops states, computed from the ledger
  * alone (the ledger is the record; no runtime or filesystem probing beyond
@@ -557,8 +698,12 @@ function verificationFailureDetail(event: EventRecord): string {
  *    and no silas follow-through has landed since that verdict: deliver the
  *    first fix directive per blocker, then the ladder's rung (directive →
  *    re-brief → escalate) for recurrences.
- * 4. stalledWorking — job working with no delivery while its minion has
- *    shown no activity past the stall threshold: assess the lane.
+ * 4. stalledWorking — job working while its CURRENT phase (the latest
+ *    `working` hop or explicit repair start, never an older delivery) has
+ *    not delivered and its minion has shown no activity past the stall
+ *    threshold: assess the lane. Accepted operations that still own the
+ *    lane — an unresolved re-brief, a live directive request, an in-flight
+ *    verification, an answering review — fence the row.
  *
  * plus minionErrors — a minion turn that failed more recently than any
  * delivery — so an error wake always carries its context; and the
@@ -598,6 +743,18 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
   // The review-eligibility rows below never offer such a target on an OLDER
   // delivery — the worker may push a new head at any moment.
   const pendingRebriefJobIds = new Set(input.ledger.listPendingRebriefs().map((marker) => marker.jobId));
+  // Phase identity per job, for the publish-boundary rechecks: a phase that
+  // opened during a later job's blocker-history await invalidates any row
+  // computed against the previous phase.
+  const phaseSeqByJob = new Map<string, number>();
+  // Per-job newest event sequence at compute time: any event landing during
+  // a later job's blocker-history await (delivery, request, agent state)
+  // makes the computed rows stale, so the publish boundary retracts them.
+  const jobSeqAtComputeByJob = new Map<string, number>();
+  // Each proposed stalled row's COMPUTE-TIME silence floor, so the publish
+  // recheck compares activity against the immutable floor rather than a
+  // floor reconstructed from a later clock reading.
+  const stallSilenceFloorByJob = new Map<string, number>();
   for (const job of input.ledger.listJobs()) {
     if (job.status === 'merged' || job.status === 'done') continue;
     const rounds = [...input.ledger.listRounds(job.id)].sort((a, b) => b.seq - a.seq);
@@ -624,8 +781,32 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       deliveredTargetSha(delivered) !== null && deliveredTargetSha(delivered) === newestRound.targetRef &&
       !(answeringRequest !== null && answeringRequest.seq > (abortProof?.seq ?? 0));
 
+    // The CURRENT phase's opening evidence: the shared attempt start plus
+    // explicit repair starts (issue #162). A `job.delivered` at/before this
+    // watermark is history; only a newer delivery proves the current phase
+    // delivered. Computed for EVERY non-terminal status because an explicit
+    // repair start (a claimed provider continuation) can arrive while the
+    // status still reads `delivered` — the old head must not remain
+    // review-ready. Rows (1) and (2) use the same fact, so a reopened
+    // repair is never offered a PR/review step for the old head.
+    const phaseStart = currentPhaseStart(input.ledger, job.id);
+    const phaseStartSeq = phaseStart.seq;
+    const repairStartSeq = phaseStart.repairStartSeq;
+    phaseSeqByJob.set(job.id, phaseStartSeq);
+    jobSeqAtComputeByJob.set(job.id, input.ledger.listJobEvents(job.id, { limit: 1 })[0]?.seq ?? 0);
+    const currentPhaseDelivered = delivered !== null && delivered.seq > phaseStartSeq;
+    // Accepted or unresolved operations fence the PR/review offers too: a
+    // live directive may already be prompting a minion (admission not yet
+    // recorded), an in-flight verification owns the checkout, and an
+    // unresolved re-brief owns the lane.
+    const rebriefPending = pendingRebriefJobIds.has(job.id);
+    const liveDirectiveOwns = input.ledger
+      .listPendingDirectives({ jobId: job.id, states: LIVE_DIRECTIVE_STATES }).length > 0;
+    const reviewPending = job.status === 'working' || job.status === 'delivered' || job.status === 'in-review';
+
     // (1) Delivered, no PR yet.
-    if (delivered !== null && job.prUrl === null && rounds.length === 0) {
+    if (delivered !== null && currentPhaseDelivered && reviewPending && !rebriefPending && !liveDirectiveOwns &&
+        job.prUrl === null && rounds.length === 0) {
       const lane = (input.worktrees?.listWorktrees({ jobId: job.id }) ?? []).find((candidate) => candidate.kind === 'job');
       const minion = input.ledger
         .listAgents()
@@ -648,9 +829,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     // An unresolved re-brief fences every row: the open re-brief turn is the
     // lane's target-owned work, so an OLDER delivery is never offered for
     // first review, re-review or clean-abort rearm.
-    const reviewPending = job.status === 'working' || job.status === 'delivered' || job.status === 'in-review';
-    const rebriefPending = pendingRebriefJobIds.has(job.id);
-    if (job.prUrl !== null && reviewPending && !rebriefPending) {
+    if (currentPhaseDelivered && !liveDirectiveOwns && job.prUrl !== null && reviewPending && !rebriefPending) {
       if (cleanAbort && newestRound !== null) {
         digest.prWithoutReview.push({ jobId: job.id, repo: job.repo, prUrl: job.prUrl,
           priorRounds: rounds.length, cleanAbort: { roundId: newestRound.id, ruleId: 'clean-abort-service-restart' } });
@@ -722,8 +901,28 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       }
     }
 
-    // (4) Stalled lane: working with no delivery, minion gone quiet.
-    if (job.status === 'working' && delivered === null) {
+    // (4) Stalled lane: the CURRENT phase has not delivered and its worker
+    // has gone quiet. The current-phase comparison is the shared attempt
+    // start (issue #162): a truthful older delivery never proves the current
+    // repair phase delivered. Accepted operations that own the lane keep
+    // their fences — an unresolved re-brief request, a live directive
+    // request (`dispatching` = admission unknown, `admitted` = turn in
+    // flight; both reconcile, never duplicate), an in-flight verification,
+    // or a review genuinely answering the current phase (the clean-abort
+    // re-arm included). Ownership the digest cannot read fails closed: no
+    // competing continuation is offered for a phase another operation may
+    // still be driving.
+    // An open attempt can live under `in-review` too: a PR link flips a
+    // still-working attempt before its delivery settles, and `laneIsBusy`
+    // keeps refusing review for exactly that shape — the stall channel must
+    // still assess it. A SETTLED in-review (delivered) is review-owned.
+    const stallEligible = job.status === 'working' || (job.status === 'in-review' && !currentPhaseDelivered);
+    const stallOperationOwns = !stallEligible ||
+      rebriefPending ||
+      liveDirectiveOwns ||
+      verificationInFlight(input.ledger, job.id) ||
+      (answeringRequest !== null && answeringRequest.seq > phaseStartSeq);
+    if (stallEligible && !currentPhaseDelivered && !stallOperationOwns) {
       const boundMinions = input.ledger
         .listAgents()
         .filter((agent) => agent.jobId === job.id && agent.role === 'minion');
@@ -742,8 +941,39 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
         const supervision = viewOf(agent);
         return supervision !== null && (supervision.state === 'stopped' || supervision.breakerOpen === true);
       };
-      const stampOf = (agent: (typeof boundMinions)[number]): number =>
-        agent.lastActivity === null ? Number.NaN : Date.parse(agent.lastActivity);
+      // Issue #171 parity: the silence clock is the newest of the ledger
+      // stamp and the supervisor's own event clock — a long turn whose row
+      // was not rewritten still has fresh supervision evidence.
+      const stampOf = (agent: (typeof boundMinions)[number]): number => {
+        const ledgerMs = agent.lastActivity === null ? Number.NaN : Date.parse(agent.lastActivity);
+        const supervision = viewOf(agent)?.lastEventAt ?? null;
+        const supervisionMs = supervision === null ? Number.NaN : Date.parse(supervision);
+        if (Number.isFinite(supervisionMs) && (!Number.isFinite(ledgerMs) || supervisionMs > ledgerMs)) {
+          return supervisionMs;
+        }
+        return ledgerMs;
+      };
+      // Positive live ownership: an open turn, control phase or tool call is
+      // live work (the board's derivedStatus treats it as streaming), never
+      // a lost worker — the stall channel must never duplicate it.
+      const hasOpenWork = (agent: (typeof boundMinions)[number]): boolean => {
+        const supervision = viewOf(agent);
+        return supervision !== null &&
+          (supervision.openTurn || supervision.openControl === true || supervision.openToolCalls > 0);
+      };
+      // A REPAIR phase's own opening is the grace floor: a worker stamp
+      // from before the reopen must not make the fresh phase look silent.
+      // An initial phase keeps its worker's own registration/activity as
+      // the floor (there is no reopen to bound against).
+      const repairPhase = repairStartSeq > 0 || (delivered !== null && delivered.seq <= phaseStartSeq);
+      const phaseStartMs = repairPhase && phaseStart?.event !== null && phaseStart?.event !== undefined
+        ? Date.parse(phaseStart.event.ts)
+        : Number.NaN;
+      const boundedClock = (agentMs: number): number => {
+        if (!Number.isFinite(phaseStartMs)) return agentMs;
+        if (!Number.isFinite(agentMs)) return phaseStartMs;
+        return Math.max(agentMs, phaseStartMs);
+      };
       // Stop recency follows the recorded stop time when the supervisor
       // view provides it, else the last frame (code review 2026-10-04).
       const stopStampOf = (agent: (typeof boundMinions)[number]): number => {
@@ -759,6 +989,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
         // A disposed record is not a live worker, supervised or not (A2).
         return agent.state !== 'disposed';
       });
+      const openWork = live.some(hasOpenWork);
       const newestKnown = (stamps: readonly number[]): number | null =>
         stamps.filter(Number.isFinite).reduce<number | null>((best, at) => (best === null || at > best ? at : best), null);
       const hasStop = boundMinions.some(stopExempt);
@@ -772,14 +1003,26 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
         hasStop &&
         !hasUnknownLive &&
         (live.length === 0 || (stopAt !== null && liveAt !== null && stopAt > liveAt));
-      if (!waiting) {
+      // A repair phase whose worker record is missing (never registered, or
+      // lost) is surfaced after its own grace. An initial dispatch with no
+      // record stays fail-closed: its startup is owned by the dispatch
+      // turn, which blocks the lane with error evidence if it fails — a
+      // crashed dispatch is restart recovery, a separate concern (issue
+      // #162); its accepted startup must never be called lost work.
+      if (!waiting && !openWork) {
         const pool = live.length > 0 ? live : boundMinions.filter((agent) => !stopExempt(agent));
-        const minion = pool.sort((a, b) =>
-          (b.lastActivity ?? b.createdAt).localeCompare(a.lastActivity ?? a.createdAt),
-        )[0];
+        // The selection and the silence clock use the same supervision-aware
+        // stamp as the attribution above (issue #171 parity), falling back
+        // to the row's creation when no stamp is known.
+        const clockOf = (agent: (typeof boundMinions)[number]): number => {
+          const stamped = stampOf(agent);
+          return boundedClock(Number.isFinite(stamped) ? stamped : Date.parse(agent.createdAt));
+        };
+        const minion = pool.sort((a, b) => clockOf(b) - clockOf(a))[0];
         if (minion !== undefined) {
-          const lastMs = Date.parse(minion.lastActivity ?? minion.createdAt);
+          const lastMs = clockOf(minion);
           if (Number.isFinite(lastMs) && now() - lastMs > input.config.stallThresholdMs) {
+            stallSilenceFloorByJob.set(job.id, lastMs);
             digest.stalledWorking.push({
               jobId: job.id,
               repo: job.repo,
@@ -787,6 +1030,24 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
               minionState: minion.state,
               lastActivity: minion.lastActivity,
               idleMs: now() - lastMs,
+            });
+          }
+        } else if (boundMinions.length === 0 && phaseStart.event !== null && repairPhase) {
+          // A REPAIR phase whose worker record is missing (never registered,
+          // or lost) is surfaced after its own grace. An initial dispatch
+          // with no record stays fail-closed: its startup is owned by the
+          // dispatch turn (which blocks the lane on failure), and a crashed
+          // dispatch is restart recovery — a separate concern (issue #162).
+          const startedMs = Date.parse(phaseStart.event.ts);
+          if (Number.isFinite(startedMs) && now() - startedMs > input.config.stallThresholdMs) {
+            stallSilenceFloorByJob.set(job.id, startedMs);
+            digest.stalledWorking.push({
+              jobId: job.id,
+              repo: job.repo,
+              minionId: null,
+              minionState: null,
+              lastActivity: null,
+              idleMs: now() - startedMs,
             });
           }
         }
@@ -911,12 +1172,46 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
   // A prior job's blocker history may have awaited after another candidate
   // was already offered. Recheck every proposed review at the final publish
   // boundary — not only the jobs visited after an await. No await follows.
+  const phaseUnchanged = (jobId: string): boolean => {
+    if (!phaseSeqByJob.has(jobId)) return false;
+    const job = input.ledger.getJob(jobId);
+    const current = job !== null && (job.status === 'working' || job.status === 'in-review')
+      ? currentPhaseStart(input.ledger, jobId).seq
+      : 0;
+    return phaseSeqByJob.get(jobId) === current;
+  };
+  const jobSeqUnchanged = (jobId: string): boolean =>
+    (input.ledger.listJobEvents(jobId, { limit: 1 })[0]?.seq ?? 0) === (jobSeqAtComputeByJob.get(jobId) ?? -1);
+  const reviewOfferFencesHold = (jobId: string): boolean => {
+    const job = input.ledger.getJob(jobId);
+    return job !== null && job.status !== 'merged' && job.status !== 'done' &&
+      phaseUnchanged(jobId) &&
+      jobSeqUnchanged(jobId) &&
+      !verificationInFlight(input.ledger, jobId) &&
+      input.ledger.listPendingRebriefs({ jobId }).length === 0 &&
+      input.ledger.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES }).length === 0;
+  };
   return {
     ...digest,
-    prWithoutReview: digest.prWithoutReview.filter((row) => {
+    deliveredWithoutPr: digest.deliveredWithoutPr.filter((row) => {
+      if (!reviewOfferFencesHold(row.jobId)) return false;
       const job = input.ledger.getJob(row.jobId);
-      return job !== null && job.status !== 'merged' && job.status !== 'done' &&
-        input.ledger.listPendingRebriefs({ jobId: row.jobId }).length === 0;
+      return job !== null && job.prUrl === null;
+    }),
+    prWithoutReview: digest.prWithoutReview.filter((row) => {
+      if (!reviewOfferFencesHold(row.jobId)) return false;
+      const job = input.ledger.getJob(row.jobId);
+      // A review admitted for a new state flips the job (working/delivered →
+      // in-review), which the phase-identity recheck above already catches;
+      // the row-specific precondition here is only the PR link it names.
+      return job !== null && job.prUrl !== null;
+    }),
+    stalledWorking: digest.stalledWorking.filter((row) => {
+      const phaseSeq = phaseSeqByJob.get(row.jobId);
+      const silenceFloor = stallSilenceFloorByJob.get(row.jobId);
+      const jobSeq = jobSeqAtComputeByJob.get(row.jobId);
+      return phaseSeq !== undefined && silenceFloor !== undefined && jobSeq !== undefined &&
+        stallStillEligible(input, row, phaseSeq, silenceFloor, jobSeq);
     }),
   };
 }

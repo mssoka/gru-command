@@ -210,6 +210,18 @@ describe('board view resolved-notification rendering', () => {
     expect(sections[2]?.querySelector('.board-notification__ack')).toBeNull();
   });
 
+  it('g9: an empty notification feed renders the healthy FOR YOU / NEEDS GRU clear bands, never a bare skip', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({ notifications: [] }));
+    const panel = document.getElementById('notification-list')!;
+    expect(panel.textContent).not.toContain('nothing needs attention');
+    const heads = [...panel.querySelectorAll('.board-notification-section__head')].map((head) => head.textContent);
+    expect(heads).toEqual(['FOR YOU', 'NEEDS GRU']);
+    const sections = [...panel.querySelectorAll('.board-notification-section')];
+    expect(sections[0]?.textContent).toContain('nothing needs you');
+    expect(sections[1]?.textContent).toContain('live machine queue is clear');
+  });
+
   it('routing split: machine rows never ring the bell or toast; needs-owner rows do', () => {
     const toast = vi.fn();
     const view = new BoardView(() => {});
@@ -1631,6 +1643,73 @@ describe('board v6 — section truth: closed receipts never queue, stopped lanes
     expect(client.fetchReceipts).toHaveBeenCalledWith(0);
   });
 
+  it('a re-pair clears fetched older receipts instead of leaking them into the new server FEED', async () => {
+    const older = notification('older-receipt');
+    const clientA = {
+      ackNotification: vi.fn(() => Promise.resolve()),
+      markNotificationShown: vi.fn(() => Promise.resolve(true)),
+      fetchReceipts: vi.fn(() => Promise.resolve({ receipts: [older], nextOffset: 1, hasMore: false })),
+    } as unknown as import('../lib/board-client.js').BoardClient;
+    const view = new BoardView(() => {});
+    view.bindClient(clientA);
+    view.render(
+      snapshot({
+        jobs: [baseJob({ id: 'receipt-lane', status: 'merged', rounds: [] })],
+        agents: [agent('minion-receipt-lane', { role: 'minion', jobId: 'receipt-lane' })],
+        notifications: [notification('snapshot-receipt', { agentId: 'minion-receipt-lane' })],
+      }),
+    );
+    document.querySelector<HTMLButtonElement>('.board-notification__more')!.click();
+    await vi.waitFor(() =>
+      expect(document.getElementById('notification-list')?.textContent).toContain('Notice older-receipt'),
+    );
+
+    // A re-pair mints a fresh server: the old page is not this server's record.
+    const clientB = {
+      ackNotification: vi.fn(() => Promise.resolve()),
+      markNotificationShown: vi.fn(() => Promise.resolve(true)),
+      fetchReceipts: vi.fn(() => Promise.resolve({ receipts: [], nextOffset: 0, hasMore: true })),
+    } as unknown as import('../lib/board-client.js').BoardClient;
+    view.bindClient(clientB);
+    view.render(snapshot({ notifications: [] }));
+    expect(document.getElementById('notification-list')?.textContent).not.toContain('Notice older-receipt');
+  });
+
+  it('a re-pair during an in-flight receipt fetch drops the stale page instead of merging it', async () => {
+    const older = notification('older-receipt');
+    let resolvePage: (page: { receipts: NotificationView[]; nextOffset: number; hasMore: boolean }) => void = () => {};
+    const pending = new Promise<{ receipts: NotificationView[]; nextOffset: number; hasMore: boolean }>((resolve) => {
+      resolvePage = resolve;
+    });
+    const clientA = {
+      ackNotification: vi.fn(() => Promise.resolve()),
+      markNotificationShown: vi.fn(() => Promise.resolve(true)),
+      fetchReceipts: vi.fn(() => pending),
+    } as unknown as import('../lib/board-client.js').BoardClient;
+    const view = new BoardView(() => {});
+    view.bindClient(clientA);
+    view.render(
+      snapshot({
+        jobs: [baseJob({ id: 'receipt-lane', status: 'merged', rounds: [] })],
+        agents: [agent('minion-receipt-lane', { role: 'minion', jobId: 'receipt-lane' })],
+        notifications: [notification('snapshot-receipt', { agentId: 'minion-receipt-lane' })],
+      }),
+    );
+    document.querySelector<HTMLButtonElement>('.board-notification__more')!.click();
+    expect(clientA.fetchReceipts).toHaveBeenCalledTimes(1);
+
+    const clientB = {
+      ackNotification: vi.fn(() => Promise.resolve()),
+      markNotificationShown: vi.fn(() => Promise.resolve(true)),
+      fetchReceipts: vi.fn(() => Promise.resolve({ receipts: [], nextOffset: 0, hasMore: true })),
+    } as unknown as import('../lib/board-client.js').BoardClient;
+    view.bindClient(clientB);
+    view.render(snapshot({ notifications: [] }));
+    resolvePage({ receipts: [older], nextOffset: 1, hasMore: false });
+    await pending;
+    expect(document.getElementById('notification-list')?.textContent).not.toContain('Notice older-receipt');
+  });
+
   it('a stopped lane with an unacked escalation sits in NEEDS GRU — waiting chip, honest section', () => {
     const view = new BoardView(() => {});
     view.render(
@@ -1851,6 +1930,22 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     const refocused = document.getElementById('board-owner')!.querySelector<HTMLElement>('[data-action-id="owner-ack:focus-me"]');
     expect(document.activeElement).toBe(refocused);
     expect((document.activeElement as HTMLElement)?.dataset.actionId).toBe('owner-ack:focus-me');
+  });
+
+  it('g10: an owner row already acked on another device arrives with no toast and no web-toast receipt', () => {
+    const toast = vi.fn();
+    const client = stubClient();
+    const view = new BoardView(() => {}, client);
+    view.setToastHandler(toast);
+    view.render(snapshot({ notifications: [] })); // first snapshot primes history: nothing toasts yet
+    const acked = notification('acked-elsewhere', { routing: 'needs-owner', ackedAt: '2026-01-01T00:05:00.000Z' });
+    view.render(snapshot({ notifications: [acked] }));
+    expect(toast).not.toHaveBeenCalled();
+    expect(client.markNotificationShown).not.toHaveBeenCalledWith('acked-elsewhere', 'web-toast');
+    // Scoped to handled rows: a fresh owner arrival in the same push still toasts.
+    view.render(snapshot({ notifications: [acked, notification('fresh-owner', { routing: 'needs-owner' })] }));
+    expect(toast).toHaveBeenCalledTimes(1);
+    expect(toast).toHaveBeenCalledWith(expect.objectContaining({ id: 'fresh-owner' }));
   });
 
   it('FOR YOU r1 parity: a PR-only obligation shows on BOTH the board band and the bell — never a contradiction', () => {
