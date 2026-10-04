@@ -567,7 +567,17 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       ...pendingRecoveryRows(input.ledger as Parameters<typeof pendingRecoveryRows>[0]),
     ];
   }
-  return digest;
+  // A prior job's blocker history may have awaited after another candidate
+  // was already offered. Recheck every proposed review at the final publish
+  // boundary — not only the jobs visited after an await. No await follows.
+  return {
+    ...digest,
+    prWithoutReview: digest.prWithoutReview.filter((row) => {
+      const job = input.ledger.getJob(row.jobId);
+      return job !== null && job.status !== 'merged' && job.status !== 'done' &&
+        input.ledger.listPendingRebriefs({ jobId: row.jobId }).length === 0;
+    }),
+  };
 }
 
 // ------------------------------------------------------------------

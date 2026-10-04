@@ -216,6 +216,9 @@ export function findBusyLanes(input: {
   const target = normalizeBranch(input.targetBranch);
   const blockers: BranchIdleBlocker[] = [];
   for (const job of input.ledger.listJobs()) {
+    // A historical pre-review status is only valid while the job is still
+    // nonterminal. A concurrent done/merged transition is authoritative.
+    if (isJobTerminal(job.status)) continue;
     const status =
       input.reviewedStatus !== undefined && input.reviewedStatus.jobId === job.id
         ? input.reviewedStatus.status

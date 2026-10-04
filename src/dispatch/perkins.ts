@@ -12,6 +12,7 @@ import type { WorktreeLane, WorktreePort } from './worktree-port.js';
 import {
   BranchBusyError,
   findBusyLanes,
+  laneIsBusy,
   laneBranch,
   normalizeBranch,
   resolveReviewTargetBranch,
@@ -1053,6 +1054,19 @@ class FallbackSafetyRefusal extends Error {
   }
 }
 
+/** A late delivered STATUS after an already-recorded delivery is harmless.
+ * A working hop hidden by a later status is not: the old diff is obsolete.
+ * If the bounded history cannot prove no hop occurred, fail closed. */
+function fallbackWorkingStartedSince(ledger: LedgerApi, jobId: string, baselineSeq: number): boolean {
+  const latest = ledger.latestJobEvent(jobId, 'job.status');
+  if (latest === null || latest.seq <= baselineSeq) return false;
+  const events = ledger.listJobEvents(jobId, { limit: 1000 });
+  if (events.length === 1000 && events[events.length - 1]!.seq > baselineSeq) return true;
+  return events.some((event) => event.seq > baselineSeq && event.kind === 'job.status' &&
+    typeof event.payload === 'object' && event.payload !== null &&
+    (event.payload as { to?: unknown }).to === 'working');
+}
+
 export class WaveRunner {
   private readonly opts: WaveRunnerOptions;
   private readonly log: Log;
@@ -1518,6 +1532,34 @@ export class WaveRunner {
       return { route: 'queued', jobId: input.jobId, requestSeq: pendingHandoff.seq, run: pendingHandoff.run };
     }
     const repoPath = this.resolveReviewRequestRepo(input);
+    // Force authorizes only blockers present NOW, before the awaited
+    // preflight. A marker admitted during that wait was never audited.
+    const lanesAtArm = this.opts.worktrees.listWorktrees();
+    const jobLaneAtArm = lanesAtArm.find((lane) => lane.kind === 'job' && lane.jobId === input.jobId && lane.status !== 'swept') ?? null;
+    const targetBranch = resolveReviewTargetBranch({
+      jobId: input.jobId,
+      ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
+      lanePath: jobLaneAtArm?.path ?? null,
+      laneBranch: jobLaneAtArm?.branch ?? null,
+    });
+    const branchOwners = lanesAtArm.filter((lane) => lane.kind === 'job' && lane.status !== 'swept' &&
+      lane.jobId !== null && normalizeBranch(lane.branch ?? laneBranch(lane.jobId)) === targetBranch)
+      .map((lane) => ({
+        jobId: lane.jobId!, path: lane.path,
+        statusSeq: this.opts.ledger.latestJobEvent(lane.jobId!, 'job.status')?.seq ?? 0,
+        deliverySeq: this.opts.ledger.latestJobEvent(lane.jobId!, 'job.delivered')?.seq ?? 0,
+        markerIds: this.opts.ledger.listPendingRebriefs({ jobId: lane.jobId! }).map((marker) => marker.id),
+      }));
+    const fallbackBaseline = {
+      targetBranch,
+      branchOwners,
+      busyJobIds: findBusyLanes({ ledger: this.opts.ledger, lanes: lanesAtArm, targetBranch })
+        .map((blocker) => blocker.jobId),
+      markerIds: this.opts.ledger.listPendingRebriefs({ jobId: input.jobId }).map((marker) => marker.id),
+      deliverySeq: this.opts.ledger.latestJobEvent(input.jobId, 'job.delivered')?.seq ?? 0,
+      statusSeq: this.opts.ledger.latestJobEvent(input.jobId, 'job.status')?.seq ?? 0,
+      settlementSeq: this.opts.ledger.latestJobEvent(input.jobId, 'silas.rebrief-settled')?.seq ?? 0,
+    };
     const preflight = this.opts.reviewPreflight;
     const result: ReviewPreflightResult = preflight !== undefined && repoPath !== null
       ? await preflight({ repoPath })
@@ -1538,19 +1580,29 @@ export class WaveRunner {
       // arm intake and the native freeze use — before any fallback reviewer
       // starts. An explicit `force` keeps its audited escape hatch, and a
       // BranchBusyError keeps its 409 refusal / same-job replay re-queue.
-      this.enforceBranchIdleForRequest(input);
+      // Non-forced requests retain the shared 409/re-queue behavior.
+      // A forced request must FIRST reject newly arrived blockers; logging
+      // another override before that proof would misstate what the owner
+      // authorized at the original arm.
+      if (input.force !== true) this.enforceBranchIdleForRequest(input);
       // The shared guard early-returns without a job lane, so re-prove the
       // CURRENT lane/marker/authorization facts directly at this seam
       // (fail closed on a missing lane instead of reusing the pre-await
       // repoPath), and hand the same re-proof to the gate's own async
       // boundaries: before each round's diff intake, and after the default
       // reviewer's worker-gate wait before it spawns.
-      this.assertFallbackAdmissionCurrent(input);
+      const lanePath = this.assertFallbackAdmissionCurrent(input);
       if (input.fromHandoff === true) {
         const pending = this.handoffs.get(input.jobId);
         this.assertHandoffAuthorized(input.jobId, pending?.seq ?? -1);
       }
-      return this.beginFallbackGate(input, result.failures, repoPath, () => this.assertFallbackIterationCurrent(input));
+      if (repoPath !== lanePath) {
+        throw new FallbackSafetyRefusal(`job "${input.jobId}" replaced its checkout during fallback preflight — retry on the current lane`);
+      }
+      const admission = { lanePath, ...fallbackBaseline };
+      this.assertFallbackIterationCurrent(input, admission);
+      if (input.force === true) this.enforceBranchIdleForRequest(input);
+      return this.beginFallbackGate(input, result.failures, lanePath, () => this.assertFallbackIterationCurrent(input, admission));
     }
     // Post-await recheck (handoff replays only): permission is re-proven
     // after preflight/capacity waits, BEFORE freeze/admission effects.
@@ -1836,7 +1888,7 @@ export class WaveRunner {
     targetRef?: string | undefined;
     force?: boolean | undefined;
     fromHandoff?: boolean | undefined;
-  }): void {
+  }): string {
     const lane = this.opts.worktrees
       .listWorktrees({ jobId: input.jobId })
       .find((candidate) => candidate.kind === 'job' && candidate.status !== 'swept') ?? null;
@@ -1872,6 +1924,7 @@ export class WaveRunner {
       const pending = this.handoffs.get(input.jobId);
       this.assertHandoffAuthorized(input.jobId, pending?.seq ?? -1);
     }
+    return lane.path;
   }
 
   /** Re-proof for a RUNNING fallback gate at its concrete async boundaries
@@ -1880,11 +1933,27 @@ export class WaveRunner {
    * unresolved re-brief stops a non-forced gate, and a replay must still be
    * authorized. A forced admission carries the operator's explicit audited
    * acceptance of the marker fence through the gate run; the lane and
-   * authorization facts still fail closed. */
+   * authorization facts still fail closed. The override is restricted to
+   * request generations present at its audited arm; later work is not waived. */
   private assertFallbackIterationCurrent(input: {
     jobId: string;
     force?: boolean | undefined;
     fromHandoff?: boolean | undefined;
+  }, admission: {
+    readonly lanePath: string;
+    readonly targetBranch: string;
+    readonly branchOwners: readonly {
+      readonly jobId: string;
+      readonly path: string;
+      readonly statusSeq: number;
+      readonly deliverySeq: number;
+      readonly markerIds: readonly string[];
+    }[];
+    readonly busyJobIds: readonly string[];
+    readonly markerIds: readonly string[];
+    readonly deliverySeq: number;
+    readonly statusSeq: number;
+    readonly settlementSeq: number;
   }): void {
     const jobNow = this.opts.ledger.getJob(input.jobId);
     if (jobNow !== null && isJobTerminal(jobNow.status)) {
@@ -1900,13 +1969,25 @@ export class WaveRunner {
         `job "${input.jobId}" lost its active job lane — the fallback gate stops fail-closed`,
       );
     }
-    if (input.force !== true) {
-      const markers = this.opts.ledger.listPendingRebriefs({ jobId: input.jobId });
-      if (markers.length > 0) {
-        throw new FallbackSafetyRefusal(
-          `an unresolved re-brief request owns job "${input.jobId}" — the fallback gate stops before the next review round`,
-        );
-      }
+    if (lane.path !== admission.lanePath) {
+      throw new FallbackSafetyRefusal(
+        `job "${input.jobId}" replaced its admitted job lane — the fallback gate stops fail-closed`,
+      );
+    }
+    const markers = this.opts.ledger.listPendingRebriefs({ jobId: input.jobId });
+    if (markers.some((marker) => !admission.markerIds.includes(marker.id)) ||
+        (input.force !== true && markers.length > 0)) {
+      throw new FallbackSafetyRefusal(
+        `a new or unresolved re-brief request owns job "${input.jobId}" — the fallback gate stops before the next review round`,
+      );
+    }
+    if (fallbackWorkingStartedSince(this.opts.ledger, input.jobId, admission.statusSeq) ||
+        (this.opts.ledger.latestJobEvent(input.jobId, 'job.delivered')?.seq ?? 0) !== admission.deliverySeq ||
+        (this.opts.ledger.latestJobEvent(input.jobId, 'silas.rebrief-settled')?.seq ?? 0) !== admission.settlementSeq ||
+        (input.force !== true && jobNow !== null && laneIsBusy(this.opts.ledger, jobNow))) {
+      throw new FallbackSafetyRefusal(
+        `job "${input.jobId}" changed or reopened after fallback admission — the old diff cannot pass`,
+      );
     }
     if (input.fromHandoff === true) {
       const pending = this.handoffs.get(input.jobId);
@@ -1917,6 +1998,27 @@ export class WaveRunner {
           `the review handoff for job "${input.jobId}" is no longer authorized: ${error instanceof Error ? error.message : String(error)}`,
         );
       }
+    }
+    const lanesNow = this.opts.worktrees.listWorktrees();
+    const ownersNow = lanesNow.filter((candidate) => candidate.kind === 'job' && candidate.status !== 'swept' &&
+      candidate.jobId !== null && normalizeBranch(candidate.branch ?? laneBranch(candidate.jobId)) === admission.targetBranch);
+    if (ownersNow.length !== admission.branchOwners.length || ownersNow.some((candidate) => {
+      const owner = admission.branchOwners.find((entry) => entry.jobId === candidate.jobId && entry.path === candidate.path);
+      if (owner === undefined) return true;
+      return fallbackWorkingStartedSince(this.opts.ledger, owner.jobId, owner.statusSeq) ||
+        (this.opts.ledger.latestJobEvent(owner.jobId, 'job.delivered')?.seq ?? 0) !== owner.deliverySeq ||
+        JSON.stringify(this.opts.ledger.listPendingRebriefs({ jobId: owner.jobId }).map((marker) => marker.id)) !==
+          JSON.stringify(owner.markerIds);
+    })) {
+      throw new FallbackSafetyRefusal(
+        `a lane on branch "${admission.targetBranch}" changed after fallback admission — the old diff cannot pass`,
+      );
+    }
+    const busyNow = findBusyLanes({ ledger: this.opts.ledger, lanes: lanesNow, targetBranch: admission.targetBranch });
+    if (busyNow.some((blocker) => input.force !== true || !admission.busyJobIds.includes(blocker.jobId))) {
+      throw new FallbackSafetyRefusal(
+        `a new busy lane owns branch "${admission.targetBranch}" — the fallback gate stops before the next review round`,
+      );
     }
   }
 
@@ -2344,7 +2446,9 @@ export class WaveRunner {
       if (flippedFrom !== null) this.opts.ledger.setJobStatus(job.id, 'in-review');
       round = this.opts.ledger.addRound({ jobId: job.id, lenses: canonicalLenses, targetRef: targetSha });
     } catch (error) {
-      if (flippedFrom !== null) this.opts.ledger.setJobStatus(job.id, flippedFrom);
+      if (flippedFrom !== null && !isJobTerminal(this.opts.ledger.getJob(job.id)?.status ?? job.status)) {
+        this.opts.ledger.setJobStatus(job.id, flippedFrom);
+      }
       throw error;
     }
 
@@ -2359,6 +2463,10 @@ export class WaveRunner {
       });
       if (this.shuttingDown || setupSignal.aborted) {
         throw new Error('Perkins review service shut down during review setup');
+      }
+      const jobAtFreeze = this.opts.ledger.getJob(job.id);
+      if (jobAtFreeze !== null && isJobTerminal(jobAtFreeze.status)) {
+        throw new Error(`job "${job.id}" is ${jobAtFreeze.status} — terminal lanes do not go back under review`);
       }
       // Freeze-time close of the race window: a lane may have re-opened
       // between the arm intake and this freeze. The same refusal applies.
@@ -2415,7 +2523,7 @@ export class WaveRunner {
           failures.push(cleanupError);
         }
       }
-      if (flippedFrom !== null) {
+      if (flippedFrom !== null && !isJobTerminal(this.opts.ledger.getJob(job.id)?.status ?? job.status)) {
         try {
           this.opts.ledger.setJobStatus(job.id, flippedFrom);
         } catch (restoreError) {

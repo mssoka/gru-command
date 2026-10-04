@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -22,7 +22,7 @@ import { originHeadProbe } from './helpers/pr-head-probe.js';
 import type { WorktreeLane, WorktreePort, WorktreeSweepResult } from '../src/dispatch/worktree-port.js';
 import type { WorktreeBaseSource } from '../src/ledger/api.js';
 import { BRANCH_BUSY_HINT, findBusyLanes, laneIsBusy, normalizeBranch } from '../src/dispatch/branch-idle.js';
-import { finalizeRebriefRequest } from '../src/dispatch/rebrief-recovery.js';
+import { finalizeRebriefRequest, reconcilePendingRebriefs } from '../src/dispatch/rebrief-recovery.js';
 import { computeSilasDigest } from '../src/dispatch/silas-driver.js';
 
 /**
@@ -93,6 +93,7 @@ interface Harness {
   readonly worktrees: InMemoryWorktreePort;
   readonly wave: WaveRunner;
   readonly bus: EventBus;
+  readonly notifications: NotificationCenter;
   readonly artifactRoot: string;
   /** Fallback-gate passes that actually started a fallback reviewer. */
   readonly fallbackRuns: number[];
@@ -220,6 +221,7 @@ async function boot(opts: {
     worktrees: basePort,
     wave,
     bus,
+    notifications,
     artifactRoot,
     fallbackRuns,
     escalations,
@@ -774,6 +776,25 @@ describe('branch-idle guard', () => {
     }
   });
 
+  it('a terminal transition during review worktree creation cannot become branch_busy or roll back to working', async () => {
+    const repo = makeFixtureRepo('branch-idle-terminal-freeze');
+    cleanupRepos.push(repo);
+    let complete: (() => void) | null = null;
+    const h = await boot({ onReviewLane: () => complete?.() });
+    try {
+      await createLaneJob(h, repo, { jobId: 'terminal-freeze', status: 'working' });
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'terminal-freeze', payload: { sha: 'old-head' } });
+      complete = () => { h.ledger.setJobStatus('terminal-freeze', 'done'); };
+      const result = await postReview(h, { job_id: 'terminal-freeze' });
+      expect(result.status).not.toBe(202);
+      expect(h.ledger.getJob('terminal-freeze')?.status).toBe('done');
+      expect(h.ledger.listRounds('terminal-freeze')).toMatchObject([{ status: 'aborted' }]);
+      expect(h.ledger.listJobEvents('terminal-freeze').some((event) => event.kind === 'branch-idle.refused')).toBe(false);
+      expect(findBusyLanes({ ledger: h.ledger, lanes: h.worktrees.listWorktrees(),
+        targetBranch: 'gru/terminal-freeze', reviewedStatus: { jobId: 'terminal-freeze', status: 'working' } })).toEqual([]);
+    } finally { await h.close(); }
+  });
+
   it('a queued review handoff re-queues while the re-brief is unresolved and arms after settlement', async () => {
     const repo = makeFixtureRepo('branch-idle-rebrief-handoff');
     cleanupRepos.push(repo);
@@ -835,6 +856,118 @@ describe('branch-idle guard', () => {
     } finally {
       await h.close();
     }
+  });
+
+  it('a replaced checkout during failing preflight is refused instead of reviewing the stale path', async () => {
+    const oldRepo = makeFixtureRepo('branch-idle-fallback-old-path');
+    const newRepo = makeFixtureRepo('branch-idle-fallback-new-path');
+    cleanupRepos.push(oldRepo, newRepo);
+    const entered = deferred();
+    const release = deferred();
+    const h = await boot({ preflightFails: true,
+      onPreflight: async () => { entered.release(); await release.promise; } });
+    try {
+      const old = await createLaneJob(h, oldRepo, { jobId: 'fallback-new-path', status: 'delivered' });
+      const pending = postReview(h, { job_id: 'fallback-new-path' });
+      await entered.promise;
+      const originalList = h.worktrees.listWorktrees.bind(h.worktrees);
+      vi.spyOn(h.worktrees, 'listWorktrees').mockImplementation((opts = {}) =>
+        originalList(opts).map((lane) => lane.id === old.id ? { ...lane, path: newRepo.path } : lane));
+      release.release();
+      const refused = await pending;
+      expect(refused.status).not.toBe(202);
+      expect(h.fallbackRuns).toHaveLength(0);
+      expect(newRepo.path).not.toBe(old.path);
+      expect(h.ledger.listJobEvents('fallback-new-path').some((event) =>
+        event.kind === 'job.fallback-review' && (event.payload as { phase?: string }).phase === 'pass')).toBe(false);
+    } finally { release.release(); await h.close(); }
+  });
+
+  it('a running fallback for a foreign target aborts if its reviewed checkout is replaced', async () => {
+    const repo = makeFixtureRepo('branch-idle-fallback-review-path');
+    const replacement = makeFixtureRepo('branch-idle-fallback-review-replacement');
+    cleanupRepos.push(repo, replacement);
+    const entered = deferred();
+    const release = deferred();
+    const h = await boot({ preflightFails: true,
+      onFallbackReview: async () => { entered.release(); await release.promise; return []; } });
+    try {
+      const old = await createLaneJob(h, repo, { jobId: 'fallback-review-path', status: 'delivered' });
+      await createLaneJob(h, repo, { jobId: 'fallback-review-target', status: 'delivered' });
+      const abortedPromise = joinJobEvent(h, 'fallback-review-path', 'job.fallback-review',
+        (event) => (event.payload as { phase?: string }).phase === 'aborted');
+      expect((await postReview(h, { job_id: 'fallback-review-path', target_ref: 'gru/fallback-review-target' })).status).toBe(202);
+      await entered.promise;
+      const originalList = h.worktrees.listWorktrees.bind(h.worktrees);
+      vi.spyOn(h.worktrees, 'listWorktrees').mockImplementation((opts = {}) =>
+        originalList(opts).map((lane) => lane.id === old.id ? { ...lane, path: replacement.path } : lane));
+      release.release();
+      expect((await abortedPromise).payload).toMatchObject({ clearToMerge: false });
+      expect(h.ledger.listJobEvents('fallback-review-path').some((event) =>
+        event.kind === 'job.fallback-review' && (event.payload as { phase?: string }).phase === 'pass')).toBe(false);
+    } finally { release.release(); await h.close(); }
+  });
+
+  it('a re-brief admitted during a forced preflight is not covered by the earlier audited override', async () => {
+    const repo = makeFixtureRepo('branch-idle-fallback-force-preflight');
+    cleanupRepos.push(repo);
+    const entered = deferred();
+    const release = deferred();
+    const h = await boot({ preflightFails: true,
+      onPreflight: async () => { entered.release(); await release.promise; } });
+    try {
+      await createLaneJob(h, repo, { jobId: 'fallback-force-preflight', status: 'delivered' });
+      const pending = postReview(h, { job_id: 'fallback-force-preflight', force: true });
+      await entered.promise;
+      h.ledger.beginPendingRebrief({ jobId: 'fallback-force-preflight', note: 'new request', briefing: 'b' });
+      release.release();
+      expect((await pending).status).not.toBe(202);
+      expect(h.fallbackRuns).toHaveLength(0);
+      // Only the original arm was authorized. A second forced audit row
+      // would falsely claim the owner waived the newer request.
+      const forced = h.ledger.listJobEvents('fallback-force-preflight')
+        .filter((event) => event.kind === 'branch-idle.forced');
+      expect(forced).toHaveLength(1);
+      expect(forced[0]?.payload).toMatchObject({ phase: 'arm', blockers: [] });
+    } finally { release.release(); await h.close(); }
+  });
+
+  async function assertBootRecoveryReplay(path: 'already-landed' | 'delivery-only'): Promise<void> {
+    const repo = makeFixtureRepo(`branch-idle-boot-replay-${path}`);
+    cleanupRepos.push(repo);
+    const h = await boot();
+    const jobId = `boot-replay-${path}`;
+    try {
+      const lane = await createLaneJob(h, repo, { jobId, status: 'working' });
+      expect((await postReview(h, { job_id: jobId, by: 'minion' })).json).toMatchObject({ route: 'queued' });
+      h.ledger.setJobStatus(jobId, 'delivered');
+      h.ledger.beginPendingRebrief({ jobId, note: 'recover', briefing: 'b' });
+      h.ledger.appendCustomEvent({ kind: 'silas.rebrief', jobId, payload: { minion_id: 'restored' } });
+      if (path === 'already-landed') {
+        const sha = execFileSync('git', ['-C', lane.path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+        h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { sha, source: 'silas-rebrief' } });
+      }
+      const startedPromise = joinJobEvent(h, jobId, 'job.review-handoff-started');
+      const report = await reconcilePendingRebriefs({
+        ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications,
+        registry: { getHandle: () => null,
+          spawn: async () => { throw new Error('boot recovery must not spawn a minion on this path'); },
+          disposeHandle: async () => {} },
+      }, { bootAt: new Date(Date.now() + 60_000) });
+      await report.settled;
+      expect(report.completed).toBe(1);
+      expect((await startedPromise).jobId).toBe(jobId);
+      expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(0);
+      expect(h.ledger.listRounds(jobId)).toHaveLength(1);
+    } finally { await h.close(); }
+  }
+
+  it('already-landed boot recovery starts a queued handoff without a manual sweep', async () => {
+    await assertBootRecoveryReplay('already-landed');
+  });
+
+  it('delivery-only boot recovery starts a queued handoff without a manual sweep', async () => {
+    await assertBootRecoveryReplay('delivery-only');
   });
 
   it('a re-brief admitted during a failing pre-flight refuses the fallback arm (normal request)', async () => {
@@ -1117,6 +1250,92 @@ describe('branch-idle guard', () => {
       release.release();
       await h.close();
     }
+  });
+
+  it('a new undelivered working attempt during a fallback reviewer invalidates the old diff', async () => {
+    const repo = makeFixtureRepo('branch-idle-fallback-reopened');
+    cleanupRepos.push(repo);
+    const entered = deferred();
+    const release = deferred();
+    const h = await boot({ preflightFails: true,
+      onFallbackReview: async () => { entered.release(); await release.promise; return []; } });
+    try {
+      await createLaneJob(h, repo, { jobId: 'fallback-reopened', status: 'delivered' });
+      const abortedPromise = joinJobEvent(h, 'fallback-reopened', 'job.fallback-review',
+        (event) => (event.payload as { phase?: string }).phase === 'aborted');
+      expect((await postReview(h, { job_id: 'fallback-reopened' })).status).toBe(202);
+      await entered.promise;
+      h.ledger.setJobStatus('fallback-reopened', 'working');
+      release.release();
+      expect((await abortedPromise).payload).toMatchObject({ clearToMerge: false });
+      expect(h.ledger.listJobEvents('fallback-reopened').some((event) =>
+        event.kind === 'job.fallback-review' && (event.payload as { phase?: string }).phase === 'pass')).toBe(false);
+    } finally { release.release(); await h.close(); }
+  });
+
+  it('a reopened attempt hidden by a later in-review status cannot approve the old fallback diff', async () => {
+    const repo = makeFixtureRepo('branch-idle-fallback-hidden-attempt');
+    cleanupRepos.push(repo);
+    const entered = deferred();
+    const release = deferred();
+    const h = await boot({ preflightFails: true,
+      onFallbackReview: async () => { entered.release(); await release.promise; return []; } });
+    try {
+      await createLaneJob(h, repo, { jobId: 'fallback-hidden-attempt', status: 'delivered' });
+      const abortedPromise = joinJobEvent(h, 'fallback-hidden-attempt', 'job.fallback-review',
+        (event) => (event.payload as { phase?: string }).phase === 'aborted');
+      expect((await postReview(h, { job_id: 'fallback-hidden-attempt' })).status).toBe(202);
+      await entered.promise;
+      h.ledger.setJobStatus('fallback-hidden-attempt', 'working');
+      h.ledger.setJobStatus('fallback-hidden-attempt', 'in-review');
+      release.release();
+      expect((await abortedPromise).payload).toMatchObject({ clearToMerge: false });
+      expect(h.ledger.listJobEvents('fallback-hidden-attempt').some((event) =>
+        event.kind === 'job.fallback-review' && (event.payload as { phase?: string }).phase === 'pass')).toBe(false);
+    } finally { release.release(); await h.close(); }
+  });
+
+  it('a new re-brief admitted during a forced fallback is not included in the earlier override', async () => {
+    const repo = makeFixtureRepo('branch-idle-fallback-force-new');
+    cleanupRepos.push(repo);
+    const entered = deferred();
+    const release = deferred();
+    const h = await boot({ preflightFails: true,
+      onFallbackReview: async () => { entered.release(); await release.promise; return []; } });
+    try {
+      await createLaneJob(h, repo, { jobId: 'fallback-force-new', status: 'delivered' });
+      const abortedPromise = joinJobEvent(h, 'fallback-force-new', 'job.fallback-review',
+        (event) => (event.payload as { phase?: string }).phase === 'aborted');
+      expect((await postReview(h, { job_id: 'fallback-force-new', force: true })).status).toBe(202);
+      await entered.promise;
+      h.ledger.beginPendingRebrief({ jobId: 'fallback-force-new', note: 'new request', briefing: 'b' });
+      release.release();
+      expect((await abortedPromise).payload).toMatchObject({ clearToMerge: false });
+    } finally { release.release(); await h.close(); }
+  });
+
+  it('force cannot waive a foreign branch owner admitted while the fallback reviewer waits', async () => {
+    const repo = makeFixtureRepo('branch-idle-fallback-force-foreign');
+    cleanupRepos.push(repo);
+    const entered = deferred();
+    const release = deferred();
+    const h = await boot({ preflightFails: true,
+      onFallbackReview: async () => { entered.release(); await release.promise; return []; } });
+    try {
+      await createLaneJob(h, repo, { jobId: 'fallback-force-foreign', status: 'delivered' });
+      const abortedPromise = joinJobEvent(h, 'fallback-force-foreign', 'job.fallback-review',
+        (event) => (event.payload as { phase?: string }).phase === 'aborted');
+      expect((await postReview(h, { job_id: 'fallback-force-foreign', force: true })).status).toBe(202);
+      await entered.promise;
+      const foreign = await createLaneJob(h, repo, { jobId: 'new-foreign-owner', status: 'working' });
+      const originalList = h.worktrees.listWorktrees.bind(h.worktrees);
+      vi.spyOn(h.worktrees, 'listWorktrees').mockImplementation((opts = {}) =>
+        originalList(opts).map((lane) => lane.id === foreign.id ? { ...lane, branch: 'gru/fallback-force-foreign' } : lane));
+      release.release();
+      expect((await abortedPromise).payload).toMatchObject({ clearToMerge: false });
+      expect(h.ledger.listJobEvents('fallback-force-foreign').some((event) =>
+        event.kind === 'job.fallback-review' && (event.payload as { phase?: string }).phase === 'pass')).toBe(false);
+    } finally { release.release(); await h.close(); }
   });
 
   it('a re-brief that begins AND settles during a fallback reviewer still invalidates its old diff', async () => {

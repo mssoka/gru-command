@@ -396,6 +396,90 @@ describe('silas digest (the four actionable states)', () => {
     }
   });
 
+  it('does not offer a later job whose re-brief was admitted during an earlier blocker-history wait', async () => {
+    const h = makeLedger();
+    let release!: () => void;
+    let entered!: () => void;
+    const wait = new Promise<void>((resolve) => { release = resolve; });
+    const waiting = new Promise<void>((resolve) => { entered = resolve; });
+    try {
+      // listJobs orders by updated_at DESC: create the offered job first,
+      // then update the verdict job so its awaited history runs first.
+      addJobWithDelivery(h.ledger, 'later', { prUrl: 'https://git.example.invalid/pull/2' });
+      addJobWithDelivery(h.ledger, 'earlier', { prUrl: 'https://git.example.invalid/pull/1' });
+      const round = h.ledger.addRound({ jobId: 'earlier' });
+      h.ledger.setRoundStatus(round.id, 'live');
+      h.ledger.setRoundStatus(round.id, 'verdict-posted');
+      h.ledger.setRoundVerdict(round.id, 'changes-requested');
+      h.ledger.setJobStatus('earlier', 'in-review');
+      h.ledger.appendCustomEvent({ kind: 'round.verdict', jobId: 'earlier', roundId: round.id, payload: {} });
+      const digestPromise = computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => { entered(); await wait; return { blockers: [], note: null }; },
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      await waiting;
+      h.ledger.beginPendingRebrief({ jobId: 'later', note: 'new work', briefing: 'b' });
+      release();
+      expect((await digestPromise).prWithoutReview.map((row) => row.jobId)).not.toContain('later');
+    } finally { release(); h.cleanup(); }
+  });
+
+  it('retracts a previously accumulated review offer if its job becomes terminal during a later history wait', async () => {
+    const h = makeLedger();
+    let release!: () => void;
+    let entered!: () => void;
+    const wait = new Promise<void>((resolve) => { release = resolve; });
+    const waiting = new Promise<void>((resolve) => { entered = resolve; });
+    try {
+      addJobWithDelivery(h.ledger, 'history-wait', { prUrl: 'https://git.example.invalid/pull/4' });
+      const round = h.ledger.addRound({ jobId: 'history-wait' });
+      h.ledger.setRoundStatus(round.id, 'live');
+      h.ledger.setRoundStatus(round.id, 'verdict-posted');
+      h.ledger.setRoundVerdict(round.id, 'changes-requested');
+      h.ledger.setJobStatus('history-wait', 'in-review');
+      h.ledger.appendCustomEvent({ kind: 'round.verdict', jobId: 'history-wait', roundId: round.id, payload: {} });
+      // The newer job is visited and offered before the older history wait.
+      addJobWithDelivery(h.ledger, 'terminal-offer', { prUrl: 'https://git.example.invalid/pull/5' });
+      const digest = computeSilasDigest({ ledger: h.ledger,
+        blockersForRound: async () => { entered(); await wait; return { blockers: [], note: null }; },
+        config: DEFAULT_SILAS_CONFIG, trigger: 'sweep' });
+      await waiting;
+      h.ledger.setJobStatus('terminal-offer', 'done');
+      release();
+      expect((await digest).prWithoutReview.map((row) => row.jobId)).not.toContain('terminal-offer');
+    } finally { release(); h.cleanup(); }
+  });
+
+  it('retracts an earlier review offer when its own blocker-history wait admits a re-brief', async () => {
+    const h = makeLedger();
+    let release!: () => void;
+    let entered!: () => void;
+    const wait = new Promise<void>((resolve) => { release = resolve; });
+    const waiting = new Promise<void>((resolve) => { entered = resolve; });
+    try {
+      addJobWithDelivery(h.ledger, 'same-job', { prUrl: 'https://git.example.invalid/pull/3' });
+      const round = h.ledger.addRound({ jobId: 'same-job', targetRef: 'old-sha' });
+      h.ledger.setRoundStatus(round.id, 'live');
+      h.ledger.setRoundStatus(round.id, 'verdict-posted');
+      h.ledger.setRoundVerdict(round.id, 'changes-requested');
+      h.ledger.setJobStatus('same-job', 'in-review');
+      h.ledger.appendCustomEvent({ kind: 'round.verdict', jobId: 'same-job', roundId: round.id, payload: {} });
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'same-job', payload: { sha: 'new-sha' } });
+      const digestPromise = computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => { entered(); await wait; return { blockers: [], note: null }; },
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      await waiting;
+      h.ledger.beginPendingRebrief({ jobId: 'same-job', note: 'reopen', briefing: 'b' });
+      release();
+      expect((await digestPromise).prWithoutReview).toEqual([]);
+    } finally { release(); h.cleanup(); }
+  });
+
   it('an unresolved re-brief suppresses the proven clean-abort rearm until the request settles', async () => {
     const h = makeLedger();
     try {
