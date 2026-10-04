@@ -374,6 +374,7 @@ export function flipJobToWorking(
  * pending prompt) instead of minting a fresh one. */
 export async function rebriefFreshMinion(
   input: DirectiveRoutingDeps & {
+    readonly ledger: Pick<LedgerApi, 'setAgentState'>;
     jobId: string;
     note: string;
     briefing: string | null;
@@ -461,6 +462,21 @@ export async function rebriefFreshMinion(
         ? { lessons: input.lessons.referencesFor(`${input.note}\n${input.briefing ?? ''}`) }
         : {}),
     });
+    // registerAgent publishes agent.spawned after COMMIT. A subscriber can
+    // close the job or replace this request before the prompt is sent; the
+    // last fence must sit AFTER that publication and immediately before the
+    // prompt call, with no await between the check and the side effect.
+    try {
+      input.beforeTurnSideEffect?.();
+    } catch (error) {
+      try {
+        await handle.dispose();
+        input.ledger.setAgentState(handle.id, 'disposed');
+      } catch (cleanupError) {
+        throw new Error(`could not dispose minion ${handle.id} after a cancelled re-brief: ${String(cleanupError)}`, { cause: error });
+      }
+      throw error;
+    }
     let promptError: unknown = null;
     let verdict: PromptTurnVerdict | null = null;
     try {

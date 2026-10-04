@@ -573,6 +573,38 @@ describe('terminal re-brief retirement', () => {
     }
   });
 
+  it('an agent.spawned subscriber terminalizing the job cancels before prompt and disposes the handle', async () => {
+    const h = makeHarness();
+    const jobId = 'terminal-on-agent-spawned';
+    await seedPendingRebrief({ h, jobId });
+    h.bus.subscribe((event) => { if (event.kind === 'agent.spawned' && event.jobId === jobId) merge(h, jobId); });
+    const report = await reconcilePendingRebriefs(deps(h), { bootAt: new Date(Date.now() + 60_000) });
+    await report.settled;
+    expect(h.registry.workers[0]?.prompts).toHaveLength(0);
+    expect(h.registry.disposedSpawned).toEqual(['worker-1']);
+    expect(h.ledger.getAgent('worker-1')?.state).toBe('disposed');
+    expect(retiredAudit(h, jobId)).toHaveLength(2);
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-recovered')).toBeNull();
+  });
+
+  it('an agent.spawned subscriber replacing the request cannot prompt the stale turn', async () => {
+    const h = makeHarness();
+    const jobId = 'superseded-on-agent-spawned';
+    await seedPendingRebrief({ h, jobId });
+    h.bus.subscribe((event) => {
+      if (event.kind === 'agent.spawned' && event.jobId === jobId) {
+        h.ledger.beginPendingRebrief({ jobId, note: 'new request', briefing: 'new contract' });
+      }
+    });
+    const report = await reconcilePendingRebriefs(deps(h), { bootAt: new Date(Date.now() + 60_000) });
+    await report.settled;
+    expect(h.registry.workers[0]?.prompts).toHaveLength(0);
+    expect(h.registry.disposedSpawned).toEqual(['worker-1']);
+    expect(h.ledger.getAgent('worker-1')?.state).toBe('disposed');
+    expect(h.ledger.listPendingRebriefs({ jobId }).map((row) => row.note)).toEqual(['new request', 'new request']);
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-recovered')).toBeNull();
+  });
+
   it('terminality during asynchronous spawn prevents binding and prompting the spawned worker', async () => {
     const h = makeHarness();
     const jobId = 'spawn-terminal-job';
@@ -589,6 +621,25 @@ describe('terminal re-brief retirement', () => {
     expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief')).toBeNull();
     expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).toBeNull();
     expect(h.ledger.listNotifications().filter((row) => row.kind === `silas.rebrief-unreconciled.${jobId}`)).toHaveLength(0);
+  });
+
+  it('an incomplete marker pair stays visible and escalates without claiming recovery', async () => {
+    const h = makeHarness();
+    const jobId = 'incomplete-rebrief-pair';
+    await seedPendingRebrief({ h, jobId });
+    const pair = h.ledger.listPendingRebriefs({ jobId });
+    h.ledger.clearPendingRebriefs(pair.filter((row) => row.kind === 'job.delivered').map((row) => row.id));
+    const report = await reconcilePendingRebriefs(deps(h), { bootAt: new Date(Date.now() + 60_000) });
+    await report.settled;
+    expect(report.completed).toBe(0);
+    expect(h.registry.workers).toHaveLength(0);
+    expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(1);
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-recovered')).toBeNull();
+    expect(h.ledger.listNotifications().some((row) => row.kind === `silas.rebrief-unreconciled.${jobId}`)).toBe(true);
+    expect(() => finalizeRebriefRequest({
+      ledger: h.ledger, worktrees: h.worktrees, jobId, minionId: 'worker', lanePath: h.lanePath, note: 'n',
+    })).toThrow(/incomplete marker pair/u);
+    expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).toBeNull();
   });
 
   it('same-generation nonterminal finalization records both guarded events once', async () => {

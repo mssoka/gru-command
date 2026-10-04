@@ -223,14 +223,15 @@ export function finalizeRebriefRequest(input: {
     }
   }
   const missing = markers.filter((marker) => !pendingRebriefEventLanded(input.ledger, marker));
+  const completePair = isCompleteRebriefPair(markers);
   const job = input.ledger.getJob(input.jobId);
-  if (missing.length > 0 && job === null) {
+  if ((missing.length > 0 || !completePair) && job === null) {
     // Fail closed: a marker whose job row is gone can never be finalized
     // truthfully — recording guarded events would mint history for an
     // absent job. The markers stay for the next honest boundary.
     throw new Error(`job "${input.jobId}" no longer exists — pending re-brief markers cannot be finalized`);
   }
-  if (missing.length > 0 && job !== null && isJobTerminal(job.status)) {
+  if ((missing.length > 0 || !completePair) && job !== null && isJobTerminal(job.status)) {
     // The job went terminal under the turn's feet: the guarded events can
     // no longer be honored truthfully. Retire the request instead of
     // recording a stale late completion (no reopen, no fabricated
@@ -267,6 +268,7 @@ export function finalizeRebriefRequest(input: {
       superseded: false,
     };
   }
+  if (!completePair) throw new Error(`job "${input.jobId}" has an incomplete marker pair — pending re-brief cannot be recovered`);
   const rebriefMarker = markers.find((marker) => marker.kind === 'silas.rebrief') ?? null;
   const deliveryMarker = markers.find((marker) => marker.kind === 'job.delivered') ?? null;
   // Host-owned phase identity: when this request carried an explicit
@@ -338,6 +340,12 @@ export function finalizeRebriefRequest(input: {
   return { minionId: input.minionId, deliveredSha, deliveryNote, rebriefRecorded, deliveryRecorded, retired: false, retirement: null, superseded: false };
 }
 
+/** Never clear or claim recovery for only half a request. */
+function isCompleteRebriefPair(markers: readonly PendingRebriefRecord[]): boolean {
+  return markers.length === 2 && markers.some((marker) => marker.kind === 'silas.rebrief') &&
+    markers.some((marker) => marker.kind === 'job.delivered');
+}
+
 /** A replaced pair cannot be bound, completed, or retired by an older turn. */
 function sameRebriefGeneration(current: readonly PendingRebriefRecord[], expected: readonly PendingRebriefRecord[]): boolean {
   return current.length === expected.length && expected.every((marker) => current.some((row) =>
@@ -399,7 +407,8 @@ export async function reconcilePendingRebriefs(
   for (const [jobId, group] of byJob) {
     const groupPhaseId = group.find((marker) => marker.phaseId !== null)?.phaseId ?? null;
     const missing = group.filter((marker) => pendingRebriefGuardedEvent(deps.ledger, marker, groupPhaseId) === null);
-    if (missing.length === 0) {
+    const completePair = isCompleteRebriefPair(group);
+    if (missing.length === 0 && completePair) {
       if (deps.ledger.clearPendingRebriefsIfCurrent(group)) completed += 1;
       else deps.log?.('warn', 're-brief spent markers superseded before clearing', { job: jobId });
       continue;
@@ -438,7 +447,7 @@ export async function reconcilePendingRebriefs(
     // A missing job row must NOT take this shortcut (it would mint a
     // delivery for a job that does not exist): it falls through to the
     // re-dispatch boundary, which escalates honestly with the markers kept.
-    if (job !== null && missing.every((marker) => marker.kind === 'job.delivered')) {
+    if (job !== null && completePair && missing.every((marker) => marker.kind === 'job.delivered')) {
       const anchor = group.find((marker) => marker.kind === 'job.delivered') ?? group[0];
       const phaseId = group.find((marker) => marker.phaseId !== null)?.phaseId ?? null;
       let followUp: ReturnType<typeof recordFollowUpDelivery>;
@@ -525,6 +534,9 @@ async function redispatchGroup(
         });
       }
       return;
+    }
+    if (!isCompleteRebriefPair(group)) {
+      throw new Error(`job "${jobId}" has an incomplete marker pair — pending re-brief cannot be recovered`);
     }
     const lane = deps.worktrees
       .listWorktrees({ jobId })

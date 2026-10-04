@@ -81,7 +81,7 @@ const PINS: Record<string, number> = {
   'provider-recovery-resume.test.ts': 14,
   'provider-recovery-seam.test.ts': 8,
   'provider-recovery-sensor.test.ts': 50,
-  'rebrief-recovery.test.ts': 40,
+  'rebrief-recovery.test.ts': 43,
   'rehearsal.test.ts': 4,
   'resident-budget.test.ts': 7,
   'resident-saturation.test.ts': 2,
