@@ -7,6 +7,7 @@ import {
   adviseRecurrence,
   blockerFingerprint,
   buildWakePrompt,
+  CAPTURE_HELPER_PATH,
   computeSilasDigest,
   consecutiveRecurrence,
   consolidatedBlockersFor,
@@ -1056,6 +1057,12 @@ describe('silas skills and wake prompt', () => {
     expect(prompt).toContain('clean-abort-service-restart');
     expect(prompt).toContain('source_round_id');
     expect(prompt).not.toContain('human holds the merge);');
+    // Verification capture (issue #159): the wake prompt names the shipped
+    // helper absolutely so no lane hand-rolls a watcher — the resolved path
+    // must be the package's own compiled CLI, not merely a matching basename.
+    expect(prompt).toContain('Verification capture helper');
+    expect(CAPTURE_HELPER_PATH).toBe(join(import.meta.dirname, '..', 'dist', 'verify', 'capture-cli.js'));
+    expect(prompt).toContain(`${CAPTURE_HELPER_PATH} run --job`);
   });
 
   it('the wake prompt carries skills, ops surface, digest, and the no-cap ladder', () => {

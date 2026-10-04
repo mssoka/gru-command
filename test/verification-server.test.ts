@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer, type Server as HttpServer } from 'node:http';
@@ -10,6 +10,12 @@ import { LedgerDb } from '../src/ledger/db.js';
 import { EventBus } from '../src/events/bus.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { createVerificationServer, type VerificationServer } from '../src/verify/server.js';
+import {
+  captureReceiptPath,
+  captureReceiptSucceeded,
+  readCaptureReceipt,
+} from '../src/verify/capture.js';
+import { runCaptureCli, type CaptureCliDeps } from '../src/verify/capture-cli.js';
 import { loadWorktreeManifest, resolveVerifyCommand } from '../src/worktrees/manifest.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 
@@ -359,6 +365,220 @@ describe('POST /api/verify', () => {
     const { status, json } = await call(harness.port, undefined, { method: 'GET' });
     expect(status).toBe(405);
     expect(json).toMatchObject({ error: 'method_not_allowed' });
+    await harness.close();
+  });
+});
+
+async function statusCall(
+  port: number,
+  query: string,
+  opts: { method?: string; token?: string | null } = {},
+): Promise<{ status: number; json: unknown }> {
+  const res = await fetch(`http://127.0.0.1:${port}/api/verify/status?${query}`, {
+    method: opts.method ?? 'GET',
+    headers: opts.token === null ? {} : { authorization: `Bearer ${opts.token ?? TOKEN}` },
+  });
+  const text = await res.text();
+  return { status: res.status, json: text === '' ? null : JSON.parse(text) };
+}
+
+describe('verification single-flight + reconcile (issue #159)', () => {
+  it('simultaneous POSTs for the same job/head/scope share ONE producer; the duplicate attaches', async () => {
+    const harness = await boot({ maxConcurrent: 2 });
+    const first = call(harness.port, { job_id: harness.jobId, scope: 'slow' });
+    const second = call(harness.port, { job_id: harness.jobId, scope: 'slow' });
+    const [firstResult, secondResult] = await Promise.all([first, second]);
+    const firstOutcome = outcomeOf(completedFrame(firstResult.frames));
+    const secondOutcome = outcomeOf(completedFrame(secondResult.frames));
+    expect(secondResult.frames[0]?.['type']).toBe('attached');
+    expect(secondOutcome['runId']).toBe(firstOutcome['runId']);
+    const started = harness.ledger
+      .listJobEvents(harness.jobId)
+      .filter((event) => event.kind === 'verification.started');
+    const completed = harness.ledger
+      .listJobEvents(harness.jobId)
+      .filter((event) => event.kind === 'verification.completed');
+    expect(started).toHaveLength(1);
+    expect(completed).toHaveLength(1);
+    await harness.close();
+  });
+
+  it('replays a completed request_id instead of rerunning, and reconciles unknown → running → completed', async () => {
+    const harness = await boot({ maxConcurrent: 2 });
+    const requestId = 'req-server-replay';
+    const unknown = await statusCall(harness.port, `request_id=${requestId}`);
+    expect(unknown.status).toBe(200);
+    expect(unknown.json).toMatchObject({ state: 'unknown', requestId });
+
+    const first = await call(harness.port, { job_id: harness.jobId, scope: 'slow', request_id: requestId });
+    const firstOutcome = outcomeOf(completedFrame(first.frames));
+    expect(firstOutcome['ok']).toBe(true);
+
+    const done = await statusCall(harness.port, `request_id=${requestId}`);
+    expect(done.json).toMatchObject({
+      state: 'completed',
+      runId: firstOutcome['runId'],
+      started: true,
+    });
+
+    const replay = await call(harness.port, { job_id: harness.jobId, scope: 'slow', request_id: requestId });
+    expect(replay.frames).toHaveLength(1);
+    expect(replay.frames[0]).toMatchObject({ type: 'completed', reconciled: true });
+    expect(outcomeOf(replay.frames[0]!)['runId']).toBe(firstOutcome['runId']);
+
+    const started = harness.ledger
+      .listJobEvents(harness.jobId)
+      .filter((event) => event.kind === 'verification.started');
+    expect(started).toHaveLength(1);
+    await harness.close();
+  });
+
+  it('treats a lost response as unknown and reconciles by request identity before resubmission', async () => {
+    const harness = await boot({ maxConcurrent: 2 });
+    const requestId = 'req-server-lost';
+    const controller = new AbortController();
+    const response = await fetch(`http://127.0.0.1:${harness.port}/api/verify`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ job_id: harness.jobId, scope: 'slow', request_id: requestId }),
+      signal: controller.signal,
+    });
+    expect(response.status).toBe(200);
+    const reader = response.body!.getReader();
+    const decoder = new TextDecoder();
+    let seen = '';
+    // Read until the run has genuinely started, then drop the connection:
+    // the client's outcome is now UNKNOWN, not replay authority.
+    while (!seen.includes('"type":"started"')) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      seen += decoder.decode(value, { stream: true });
+    }
+    expect(seen).toContain('started');
+    controller.abort();
+
+    const running = await statusCall(harness.port, `request_id=${requestId}`);
+    expect(running.json).toMatchObject({ state: 'running', started: true });
+
+    // Reconnecting with the SAME identity attaches to the one producer.
+    const resumed = await call(harness.port, { job_id: harness.jobId, scope: 'slow', request_id: requestId });
+    expect(resumed.frames[0]?.['type']).toBe('attached');
+    expect(outcomeOf(completedFrame(resumed.frames))['ok']).toBe(true);
+    const started = harness.ledger
+      .listJobEvents(harness.jobId)
+      .filter((event) => event.kind === 'verification.started');
+    expect(started).toHaveLength(1);
+    await harness.close();
+  });
+
+  it('refuses a submission whose named head no longer matches the lane (409, before any producer)', async () => {
+    const harness = await boot();
+    const stale = await call(harness.port, {
+      job_id: harness.jobId,
+      scope: 'full',
+      expected_head: '0'.repeat(40),
+    });
+    expect(stale.status).toBe(409);
+    expect(stale.json).toMatchObject({ error: 'head_changed', current_head: harness.repo.head() });
+    expect(
+      harness.ledger.listJobEvents(harness.jobId).filter((event) => event.kind === 'verification.started'),
+    ).toHaveLength(0);
+    const exact = await call(harness.port, {
+      job_id: harness.jobId,
+      scope: 'full',
+      expected_head: harness.repo.head(),
+    });
+    expect(outcomeOf(completedFrame(exact.frames))['sha']).toBe(harness.repo.head());
+    await harness.close();
+  });
+
+  it('status requires auth, a valid identity, and GET', async () => {
+    const harness = await boot();
+    expect((await statusCall(harness.port, 'request_id=req-x', { token: null })).status).toBe(401);
+    expect((await statusCall(harness.port, 'job_id=')).status).toBe(400);
+    expect((await statusCall(harness.port, 'request_id=bad%20id')).status).toBe(400);
+    const wrongMethod = await statusCall(harness.port, 'request_id=req-x', { method: 'POST' });
+    expect(wrongMethod.status).toBe(405);
+    await harness.close();
+  });
+
+  it('capture CLI writes a unique exclusive sink + receipt bound to the recorded run, never truncating', async () => {
+    const harness = await boot();
+    const sinkPath = join(harness.lanePath, 'verify-capture.ndjson');
+    const cliDeps: CaptureCliDeps = {
+      probe: () => ({
+        alive: true,
+        startTime: 'Mon Oct  6 12:00:00 2026',
+        cwd: harness.lanePath,
+        command: 'node capture-cli run',
+      }),
+      argv: ['capture-cli', 'run'],
+      stdout: () => {},
+      stderr: () => {},
+    };
+    const args = [
+      'run',
+      '--job',
+      harness.jobId,
+      '--scope',
+      'full',
+      '--sink',
+      sinkPath,
+      '--request-id',
+      'req-e2e-capture',
+      '--url',
+      `http://127.0.0.1:${harness.port}`,
+      '--token',
+      TOKEN,
+    ];
+    expect(await runCaptureCli(args, cliDeps)).toBe(0);
+    const receipt = readCaptureReceipt(captureReceiptPath(sinkPath));
+    expect(receipt).not.toBeNull();
+    expect(captureReceiptSucceeded(receipt!)).toBe(true);
+    const recorded = harness.ledger.latestJobEvent(harness.jobId, 'verification.completed');
+    expect(receipt!.run_id).toBe((recorded?.payload as Record<string, unknown> | undefined)?.['run_id']);
+    expect(receipt!.head).toBe(harness.repo.head());
+    expect(receipt!.capture_sha256).toMatch(/^[0-9a-f]{64}$/);
+    const captured = readFileSync(sinkPath, 'utf-8');
+    expect(captured).toContain('"type":"completed"');
+
+    // A second capture for the same sink is refused without truncation.
+    const secondArgs = [...args];
+    secondArgs[secondArgs.indexOf('req-e2e-capture')] = 'req-e2e-second';
+    const second = await runCaptureCli(secondArgs, cliDeps);
+    expect(second).toBe(2);
+    expect(readFileSync(sinkPath, 'utf-8')).toBe(captured);
+
+    // Reconnecting with the SAME request identity replays the recorded run
+    // into a fresh sink: no second execution, and the replay is honestly
+    // marked as an unpromotable partial capture (the run's outcome is
+    // known; the original full logs are NOT reconstructable).
+    const replaySink = join(harness.lanePath, 'verify-capture-replay.ndjson');
+    const replayArgs = [...args];
+    replayArgs[replayArgs.indexOf(sinkPath)] = replaySink;
+    expect(await runCaptureCli(replayArgs, cliDeps)).toBe(1);
+    const replayReceipt = readCaptureReceipt(captureReceiptPath(replaySink));
+    expect(replayReceipt!.run_id).toBe(receipt!.run_id);
+    expect(replayReceipt!.reconciled).toBe(true);
+    expect(captureReceiptSucceeded(replayReceipt!)).toBe(false);
+    const started = harness.ledger
+      .listJobEvents(harness.jobId)
+      .filter((event) => event.kind === 'verification.started');
+    expect(started).toHaveLength(1);
+
+    // The helper's --expected-head travels to the server: a stale named head
+    // is refused BEFORE any producer exists (exit 2, no started event).
+    const staleSink = join(harness.lanePath, 'verify-capture-stale.ndjson');
+    const staleArgs = [...args];
+    staleArgs[staleArgs.indexOf(sinkPath)] = staleSink;
+    staleArgs[staleArgs.indexOf('req-e2e-capture')] = 'req-e2e-stale';
+    staleArgs.push('--expected-head', '0'.repeat(40));
+    expect(await runCaptureCli(staleArgs, cliDeps)).toBe(2);
+    const staleReceipt = readCaptureReceipt(captureReceiptPath(staleSink));
+    expect(staleReceipt!.error).toContain('head_changed');
+    expect(
+      harness.ledger.listJobEvents(harness.jobId).filter((event) => event.kind === 'verification.started'),
+    ).toHaveLength(1);
     await harness.close();
   });
 });

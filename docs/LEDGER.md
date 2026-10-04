@@ -98,7 +98,9 @@ publishes it on the in-process event bus (`src/events/bus.ts`).
 | `lens.bound` / `lens.status` | agentId / from→to (+note) |
 | `agent.spawned` / `agent.state` / `agent.error` | role, label / from→to (+error) / error, fatal |
 | `verification.started` / `verification.completed` | run id, scope, command, sha, workers, queued ms / ok, exit code, duration, bounded output hash+tail |
-| `verification.lock-timeout` / `verification.stale-released` | wait ms + holder counts / pid, reason (`holder-dead` \| `no-runner` \| `max-age`), age |
+| `verification.requested` / `verification.attached` | admitted single-flight attempt: request id, run id, dedupe key (job+lane+scope+head+command) / a duplicate submission attached to that producer |
+| `verification.reconciled` | a completed request identity replayed its recorded outcome — no rerun |
+| `verification.lock-timeout` / `verification.stale-released` | wait ms + holder counts + request id / pid, reason (`holder-dead` \| `no-runner` \| `max-age`), age, interrupted request ids |
 | `branch-idle.refused` / `branch-idle.forced` | phase (`arm`/`freeze`), targetBranch, blockers — the review-arm branch-idle guard (forced rounds also carry the tag in their frozen manifest). The fallback route's two RECORD-EMITTING arm checks are the intake guard and the post-pre-flight re-entry, so a forced fallback admission records TWO `arm`-phase override records where the native route records `arm` + `freeze`. The running gate's boundary re-proofs (round intake, default-reviewer worker admission) emit NO branch-idle rows — a stop there is a `job.fallback-review` phase `aborted` |
 | `silas.review-deferred` | target_branch, phase, blockers — Silas defers a refused arm to its next sweep |
 
