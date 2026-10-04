@@ -531,10 +531,19 @@ function verificationInFlight(
  * have delivered, gone terminal, or gained an owner while a later job's
  * blocker history was awaited. Recomputes the cheap ownership facts only;
  * a stale offer is retracted, never published (no duplicate writers). */
-function stallStillEligible(input: ComputeDigestInput, jobId: string, nowMs: number): boolean {
+function stallStillEligible(
+  input: ComputeDigestInput,
+  row: StalledWorkingRow,
+  nowMs: number,
+): boolean {
   const ledger = input.ledger;
+  const jobId = row.jobId;
   const job = ledger.getJob(jobId);
   if (job === null || job.status !== 'working') return false;
+  // A no-record row is answered by any worker record appearing meanwhile;
+  // the lane is no longer ownerless.
+  if (row.minionId === null && ledger.listAgents().some((agent) =>
+    agent.jobId === jobId && agent.role === 'minion' && agent.state !== 'disposed')) return false;
   const delivered = ledger.latestJobEvent(jobId, 'job.delivered');
   const phaseStart = currentPhaseStart(ledger, jobId);
   if (delivered !== null && delivered.seq > phaseStart.seq) return false;
@@ -914,7 +923,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       return job !== null && job.status !== 'merged' && job.status !== 'done' &&
         input.ledger.listPendingRebriefs({ jobId: row.jobId }).length === 0;
     }),
-    stalledWorking: digest.stalledWorking.filter((row) => stallStillEligible(input, row.jobId, now())),
+    stalledWorking: digest.stalledWorking.filter((row) => stallStillEligible(input, row, now())),
   };
 }
 
