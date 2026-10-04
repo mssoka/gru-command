@@ -659,6 +659,9 @@ export class ChildWorkerService {
     let lease: { release(): void } | null = null;
     let residentRelease: (() => void) | null = null;
     let engineFailure: string | null = null;
+    /** The session file this run's outcome refers to (the finally records
+     * it even when the run failed before `markChildStarted`). */
+    let resultRef: string | null = null;
     /** The child briefing was actually delivered to the model. */
     let delivered = false;
     const childController = new AbortController();
@@ -670,7 +673,7 @@ export class ChildWorkerService {
     try {
       const preLane = this.ineligibility(record);
       if (preLane !== null) {
-        this.opts.ledger.recordChildResult(record.id, { state: 'error', summary: preLane, ref: null });
+        engineFailure = preLane;
         return;
       }
       lane = await this.ensureLane(record);
@@ -680,7 +683,7 @@ export class ChildWorkerService {
       // The lane creation awaited: revalidate before spending a session.
       const postLane = this.ineligibility(record);
       if (postLane !== null) {
-        this.opts.ledger.recordChildResult(record.id, { state: 'error', summary: postLane, ref: null });
+        engineFailure = postLane;
         return;
       }
       const isReadOnly = record.authority === 'read-only';
@@ -711,6 +714,7 @@ export class ChildWorkerService {
         throw error;
       }
       run.handle = handle;
+      resultRef = handle.sessionFile;
       // The admission row already carries the identity; bind the session
       // file and (idempotently) refresh the parent link.
       this.opts.ledger.registerAgent({
@@ -725,7 +729,7 @@ export class ChildWorkerService {
       // more before the model acts.
       const postAdmission = this.ineligibility(record);
       if (postAdmission !== null) {
-        this.opts.ledger.recordChildResult(record.id, { state: 'error', summary: postAdmission, ref: handle.sessionFile });
+        engineFailure = postAdmission;
         return;
       }
       if (this.opts.workerGate !== undefined) {
@@ -744,16 +748,12 @@ export class ChildWorkerService {
       // child before any briefing is delivered.
       const postPacing = this.ineligibility(record);
       if (postPacing !== null) {
-        this.opts.ledger.recordChildResult(record.id, { state: 'error', summary: postPacing, ref: handle.sessionFile });
+        engineFailure = postPacing;
         return;
       }
       const assistantBefore = countAssistantEntries(handle.sessionFile);
       if (assistantBefore === null) {
-        this.opts.ledger.recordChildResult(record.id, {
-          state: 'error',
-          summary: 'the child transcript baseline is unreadable — refusing to anchor a report to an unknown suffix',
-          ref: handle.sessionFile,
-        });
+        engineFailure = 'the child transcript baseline is unreadable — refusing to anchor a report to an unknown suffix';
         return;
       }
       // The child is `active` only when its briefing is actually about to
@@ -805,11 +805,7 @@ export class ChildWorkerService {
       if (!settlement.ok) {
         if (!(settlement.error instanceof RetrySettlementUnavailableError)) throw settlement.error;
         const detail = String(settlement.error);
-        this.opts.ledger.recordChildResult(record.id, {
-          state: 'error',
-          summary: `pacing settlement unavailable — internal error: ${detail.slice(0, 200)}`,
-          ref: handle.sessionFile,
-        });
+        engineFailure = `pacing settlement unavailable — internal error: ${detail.slice(0, 200)}`;
         return;
       }
       if (settlement.value === 'cancelled') {
@@ -817,11 +813,7 @@ export class ChildWorkerService {
         return;
       }
       if (settlement.value === 'exhausted' || settlement.value === 'superseded') {
-        this.opts.ledger.recordChildResult(record.id, {
-          state: 'error',
-          summary: `automatic rate-limit retry ${settlement.value} — the child turn did not deliver`,
-          ref: handle.sessionFile,
-        });
+        engineFailure = `automatic rate-limit retry ${settlement.value} — the child turn did not deliver`;
         this.log('warn', 'child worker did not survive its automatic retries', {
           child: record.id,
           agent: handle.id,
@@ -831,11 +823,7 @@ export class ChildWorkerService {
       }
       const evidence = settlement.value === 'recovered' ? { ok: true, error: null } : verdict;
       if (!evidence.ok) {
-        this.opts.ledger.recordChildResult(record.id, {
-          state: 'error',
-          summary: evidence.error ?? 'the child turn settled without positive completion evidence',
-          ref: handle.sessionFile,
-        });
+        engineFailure = evidence.error ?? 'the child turn settled without positive completion evidence';
         this.log('warn', 'child worker errored', { child: record.id, agent: handle.id, error: evidence.error });
         return;
       }
@@ -844,11 +832,7 @@ export class ChildWorkerService {
       // result-collection failure, never a fully reported `done`.
       const summary = extractFinalReport(handle.sessionFile, assistantBefore);
       if (summary === null) {
-        this.opts.ledger.recordChildResult(record.id, {
-          state: 'error',
-          summary: 'the child turn completed but no final report followed it in the transcript — transcript retained',
-          ref: handle.sessionFile,
-        });
+        engineFailure = 'the child turn completed but no final report followed it in the transcript — transcript retained';
         this.log('warn', 'child worker completed without a collectable report', { child: record.id, agent: handle.id });
         return;
       }
@@ -887,16 +871,21 @@ export class ChildWorkerService {
         const current = this.opts.ledger.getChildWorker(record.id);
         if (current !== null && current.resultState === null) {
           const cancelled = run.cancelReason !== null || this.signal.aborted;
-          if (cancelled && !ceased) {
+          if (!ceased) {
+            // The session may STILL be live (a failed/slow dispose, a
+            // supervision interruption whose old handle did not cease): no
+            // terminal result may be recorded, and no lane may be released.
+            // The debt is durable and a later cancel retries the stop.
             this.opts.ledger.appendCustomEvent({
               kind: 'child.stop-unproven',
               agentId: handle?.id ?? null,
               jobId: record.jobId,
               payload: {
                 childId: record.id,
-                reason: run.cancelReason ?? 'service stopped',
+                reason: run.cancelReason ?? engineFailure ?? 'child run ended without proven cessation',
+                cancelled: run.cancelReason !== null || this.signal.aborted,
                 health: safeHealthState(handle),
-                note: 'cancellation could not prove cessation; the record stays non-terminal and the permit remains counted debt',
+                note: 'cessation was not proven; the record stays non-terminal and the permit remains counted debt',
               },
             });
             this.log('warn', 'child stop could not prove cessation — record stays non-terminal', {
@@ -907,13 +896,13 @@ export class ChildWorkerService {
             this.opts.ledger.recordChildResult(record.id, {
               state: 'cancelled',
               summary: engineFailure ?? run.cancelReason ?? 'cancelled',
-              ref: current.resultRef ?? current.sessionFile,
+              ref: current.resultRef ?? current.sessionFile ?? resultRef,
             });
           } else {
             this.opts.ledger.recordChildResult(record.id, {
               state: 'error',
               summary: engineFailure ?? 'the child run ended without a terminal outcome',
-              ref: current.sessionFile,
+              ref: current.sessionFile ?? resultRef,
             });
           }
         }

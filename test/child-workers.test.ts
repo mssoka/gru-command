@@ -704,6 +704,22 @@ describe('tracked child workers: lifecycle, results and recovery', () => {
     h.close();
   });
 
+  it('keeps an uncancelled failed run non-terminal when cessation is unproven', async () => {
+    const h = makeHarness({ failDispose: true });
+    h.nextVerdict = { ok: false, error: 'model refused the task' };
+    const admission = h.request();
+    await waitFor(
+      () => h.ledger.latestEventOfKind('child.stop-unproven') !== null,
+      'the durable stop-unproven debt',
+    );
+    const record = h.ledger.getChildWorker(admission.record.id)!;
+    expect(record.resultState).toBeNull();
+    expect(record.state).not.toBe('error');
+    // No lane may be released while the session's cessation is unproven.
+    expect(h.worktrees.getWorktree(admission.record.id)?.status).not.toBe('swept');
+    h.close();
+  });
+
   it('records an unproven stop as non-terminal debt instead of a false terminal', async () => {
     const h = makeHarness({ failDispose: true });
     h.setTurnGate();
@@ -929,14 +945,20 @@ describe('tracked child workers: migration and storage', () => {
       task: 't',
       idempotencyKey: 'k-old',
     });
+    // Simulate the true intermediate shape: the unspawned child had NO
+    // agent row and a NULL binding (the FK would reject a bare rebind).
     v15.handle.prepare('UPDATE child_workers SET agent_id = NULL WHERE id = ?').run(admission.record.id);
+    v15.handle.prepare('DELETE FROM agents WHERE id = ?').run(admission.record.id);
     v15.close();
-    // The shipped build applies 16: the row converges to the final binding
-    // and the agent lookup is answerable.
+    // The shipped build applies 16: the admission agent row is
+    // reconstructed (parentage child), the binding converges, and the
+    // agent lookup is answerable.
     const full = new LedgerDb(dir);
     const after = new LedgerApi(full.handle, {});
     expect(after.getChildWorker('child_old')?.agentId).toBe('child_old');
     expect(after.childWorkerByAgent('child_old')?.id).toBe('child_old');
+    expect(after.getAgent('child_old')?.parentage).toBe('child');
+    expect(after.getAgent('child_old')?.parentAgentId).toBe('parent-1');
     full.close();
   });
 });

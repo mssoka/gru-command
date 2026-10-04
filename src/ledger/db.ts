@@ -744,6 +744,22 @@ export const MIGRATIONS: readonly Migration[] = [
     name: 'child-workers-agent-binding',
     sql: `
       CREATE INDEX IF NOT EXISTS idx_child_workers_agent ON child_workers(agent_id);
+      -- The intermediate shape left unspawned rows with NO agent row at
+      -- all. Reconstruct the admission agent row BEFORE rebinding, or the
+      -- foreign key on child_workers.agent_id would reject the update.
+      INSERT INTO agents
+        (id, role, label, job_id, round_id, state, last_activity, session_file, parent_agent_id, parentage, created_at, updated_at)
+      SELECT cw.id, 'minion', cw.label, cw.job_id, NULL,
+             CASE cw.state
+               WHEN 'done' THEN 'idle'
+               WHEN 'error' THEN 'error'
+               WHEN 'cancelled' THEN 'disposed'
+               ELSE 'spawning'
+             END,
+             NULL, cw.session_file, cw.parent_agent_id, 'child', cw.created_at, cw.updated_at
+        FROM child_workers cw
+       WHERE cw.agent_id IS NULL
+         AND NOT EXISTS (SELECT 1 FROM agents a WHERE a.id = cw.id);
       UPDATE child_workers SET agent_id = id WHERE agent_id IS NULL;
     `,
   },
