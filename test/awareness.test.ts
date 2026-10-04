@@ -174,6 +174,15 @@ describe('gru awareness — passive injection', () => {
     ]);
   });
 
+  it('names the source-movement cause when present and preserves legacy head-moved wording without it', () => {
+    const rig = boot();
+    rig.api.appendCustomEvent({ kind: 'round.head-moved', jobId: 'j1', roundId: 'j1-r1', payload: { cause: 'base-rewritten', detail: 'merge-base lost' } });
+    rig.api.appendCustomEvent({ kind: 'round.head-moved', jobId: 'j1', roundId: 'j1-r2', payload: {} });
+    const block = rig.awareness.prepare();
+    expect(block?.text).toContain('round j1-r1: review source changed after freeze (base-rewritten) — verdict invalidated');
+    expect(block?.text).toContain('round j1-r2: head moved after freeze — verdict invalidated');
+  });
+
   it('renders verdict blocker counts from the fallback gate triage and Perkins rounds', () => {
     const rig = boot();
     rig.api.appendCustomEvent({

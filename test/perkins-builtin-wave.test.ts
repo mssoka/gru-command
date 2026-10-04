@@ -251,15 +251,17 @@ describe('GitHub SHA-bound Perkins delivery', () => {
     execFileSync('git', ['-C', repoPath, 'remote', 'add', 'origin', 'https://git.example.test/acme/widget.git']);
     const head = '1'.repeat(40);
     const base = '2'.repeat(40);
+    const advancedBase = '5'.repeat(40);
+    const baseState = join(root, 'base.sha');
+    writeFileSync(baseState, base);
     const review = { id: 9001, user: { login: 'gru-bot' }, state: 'COMMENTED', commit_id: head, body: 'review body\n' };
-    writeFileSync(binary, `#!/usr/bin/env node\nimport { appendFileSync, readFileSync } from 'node:fs';\nconst input = readFileSync(0, 'utf8');\nappendFileSync(${JSON.stringify(log)}, JSON.stringify({ argv: process.argv.slice(2), input }) + '\\n');\nconst argv = process.argv.slice(2);\nif (argv.includes('--method') && argv.includes('POST')) {\n  const body = JSON.parse(input);\n  process.stdout.write(JSON.stringify({ id: 9001, user: { login: 'gru-bot' }, state: 'COMMENTED', commit_id: body.commit_id, body: body.body }));\n} else if (argv.some((entry) => entry.includes('/reviews?'))) {\n  process.stdout.write(JSON.stringify([{ id: 8000, user: { login: 'someone' }, state: 'COMMENTED', commit_id: 'f'.repeat(40), body: 'other' }, ${JSON.stringify(review)}]));\n} else if (argv.includes('user') && !argv.some((entry) => entry.includes('/'))) {\n  process.stdout.write('gru-bot');\n} else {\n  process.stdout.write(${JSON.stringify(`${head}\t${base}\n`)});\n}\n`, 'utf8');
+    writeFileSync(binary, `#!/usr/bin/env node\nimport { appendFileSync, readFileSync, writeFileSync } from 'node:fs';\nconst input = readFileSync(0, 'utf8');\nappendFileSync(${JSON.stringify(log)}, JSON.stringify({ argv: process.argv.slice(2), input }) + '\\n');\nconst argv = process.argv.slice(2);\nif (argv.includes('--method') && argv.includes('POST')) {\n  const body = JSON.parse(input);\n  writeFileSync(${JSON.stringify(baseState)}, ${JSON.stringify(advancedBase)});\n  process.stdout.write(JSON.stringify({ id: 9001, user: { login: 'gru-bot' }, state: 'COMMENTED', commit_id: body.commit_id, body: body.body }));\n} else if (argv.some((entry) => entry.includes('/reviews?'))) {\n  process.stdout.write(JSON.stringify([{ id: 8000, user: { login: 'someone' }, state: 'COMMENTED', commit_id: 'f'.repeat(40), body: 'other' }, ${JSON.stringify(review)}]));\n} else if (argv.includes('user') && !argv.some((entry) => entry.includes('/'))) {\n  process.stdout.write('gru-bot');\n} else {\n  process.stdout.write(${JSON.stringify(`${head}\t`)} + readFileSync(${JSON.stringify(baseState)}, 'utf8') + '\\n');\n}\n`, 'utf8');
     chmodSync(binary, 0o755);
     const poster = new GhPrPoster(binary);
-    // (a) The PR's recorded base (GitHub pins it at open/link time) trails
-    // the frozen base as main moves during a long round; head equality is
-    // the delivery invariant, so a stale recorded base must NOT refuse.
-    // The receipt binds the provider review id/actor/event, the commit and
-    // the echoed body digest.
+    // (a) The base may advance inside POST, after the GitHub identity probe.
+    // The receipt carries the base observed by that probe, not a later tip;
+    // head equality remains the delivery invariant and the recorded base
+    // must NOT refuse a commit-bound review.
     await expect(poster.post({
       prUrl: 'https://git.example.test/acme/widget/pull/42', host: 'git.example.test', repoPath,
       body: 'review body\n', targetSha: head, baseSha: '3'.repeat(40),
@@ -268,6 +270,7 @@ describe('GitHub SHA-bound Perkins delivery', () => {
       headSha: head, baseSha: base,
       bodySha256: createHash('sha256').update('review body\n', 'utf8').digest('hex'),
     });
+    expect(readFileSync(baseState, 'utf8')).toBe(advancedBase);
     const calls = readFileSync(log, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as { argv: string[]; input: string });
     // identity probe, authenticated-account probe (R32: BEFORE the
     // irreversible POST), commit-bound POST (R5).
@@ -1351,13 +1354,21 @@ describe('WaveRunner built-in Perkins production path', () => {
     attachOrigin(repo, 'feature/review', root);
     let moved = false;
     const poster = { post: vi.fn(async () => ({ headSha: 'unused-head', baseSha: 'unused-base' })) } as unknown as VerdictPoster;
-    const spawner = makeSpawner(sessions, [], () => {
-      if (moved) return;
-      moved = true;
-      repo.commitFile('src/later.ts', 'export const later = true;\n', 'move during review');
-      // The PR head MOVES: origin advances past the frozen tip.
-      repo.git(['push', '--quiet', 'origin', 'feature/review']);
-    });
+    const spawner = fakeWholeSpawner(sessions, {
+      onLeadStart: () => {
+        if (moved) return;
+        moved = true;
+        repo.commitFile('src/later.ts', 'export const later = true;\n', 'move during review');
+        // The PR head MOVES: origin advances past the frozen tip.
+        repo.git(['push', '--quiet', 'origin', 'feature/review']);
+      },
+      childAnswer: () => '[]',
+      submitRetries: 1,
+      submitPayload: (attempt, submission) => attempt === 1 ? submission : {
+        ...submission, verdict: 'INCOMPLETE',
+        report_markdown: submission.report_markdown.replace(/\*\*Verdict: [^*]+\*\*/, '**Verdict: INCOMPLETE**'),
+      },
+    }).spawner;
     const wave = new WaveRunner({
       ledger, worktrees: port, spawner, poster, reviewArtifactRoot: artifacts,
       prHeadProbe: localHeadProbe('feature/review'),
@@ -1372,6 +1383,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     expect(poster.post).not.toHaveBeenCalled();
     expect(readFileSync(outcome.reportFile, 'utf8')).toContain('INCOMPLETE');
     expect(ledger.latestRoundEvent(outcome.round.id, 'round.posted')).toBeNull();
+    expect(ledger.latestRoundEvent(outcome.round.id, 'round.head-moved')?.payload).toMatchObject({ cause: 'target-moved' });
     expect(port.getWorktree(outcome.round.id)?.status).toBe('swept');
     rmSync(root, { recursive: true, force: true });
     rmSync(artifacts, { recursive: true, force: true });
@@ -1557,6 +1569,232 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     expect(incomplete?.error).toContain('reconciliation after the ambiguous post ALSO failed');
     expect(incomplete?.error).toContain('exceeded the 10-page lookup bound');
     expect(incomplete?.error).toContain('verify manually before any retry');
+  });
+
+  /** Advance local `main` by one commit without touching the reviewed
+   * branch or any checkout: a merge landing on the base mid-round. */
+  function advanceMain(repo: FixtureRepo): string {
+    const next = repo.git([
+      '-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid',
+      'commit-tree', 'main^{tree}', '-p', 'main', '-m', 'main advances during review',
+    ]);
+    repo.git(['update-ref', 'refs/heads/main', next]);
+    return next;
+  }
+
+  async function baseAdvanceFixture(name: string, branch: string, pr: number) {
+    const repo = makeFixtureRepo(name);
+    repos.push(repo);
+    const base = repo.head();
+    repo.git(['checkout', '-b', branch]);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), `${name}-port-`));
+    const artifacts = mkdtempSync(join(tmpdir(), `${name}-artifacts-`));
+    const sessions = mkdtempSync(join(tmpdir(), `${name}-sessions-`));
+    dirs.push(root, artifacts, sessions);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), `${name}-db-`)));
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, branch, target);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: `job-${name}` });
+    const job = ledger.addJob({ id: `job-${name}`, repo: 'fixture', title: name, baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, `https://git.example.invalid/acme/fixture/pull/${pr}`);
+    attachOrigin(repo, branch, root);
+    return { repo, base, target, ledger, port, artifacts, sessions, job };
+  }
+
+  /** A provider receipt for the reviewed head carrying the live base at
+   * its identity probe, not a subsequent advance during delivery. */
+  function liveBaseReceipt(reviewId: string, call: { readonly body: string; readonly targetSha: string }, liveBase: string) {
+    return {
+      reviewId, actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+      headSha: call.targetSha, baseSha: liveBase,
+      bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
+    };
+  }
+
+  function expectRecordedWithFrozenBase(
+    fixture: Awaited<ReturnType<typeof baseAdvanceFixture>>,
+    outcome: WaveOutcome,
+    expected: { readonly reviewId: string; readonly reconciled: boolean; readonly observedBase: string },
+  ): void {
+    const liveBase = fixture.repo.git(['rev-parse', 'main']);
+    expect(liveBase).not.toBe(fixture.base);
+    expect(outcome.headMoved).toBe(false);
+    expect(outcome.posted).toBe(true);
+    expect(outcome.verdict).toBe('changes-requested');
+    expect(outcome.canonicalVerdict).toBe('NEEDS CHANGES');
+    expect(outcome.round.status).toBe('verdict-posted');
+    const posted = fixture.ledger.latestRoundEvent(outcome.round.id, 'round.posted')?.payload as {
+      targetSha?: string; baseSha?: string; reconciled?: boolean; receipt?: { reviewId?: string; baseSha?: string };
+    } | undefined;
+    expect(posted?.receipt?.reviewId).toBe(expected.reviewId);
+    expect(posted?.reconciled).toBe(expected.reconciled);
+    // Delivery stays bound to the reviewed target; the receipt carries the
+    // base observed before POST/reconciliation, while the frozen base stays
+    // provenance and main may advance again before the record is written.
+    expect(posted?.targetSha).toBe(fixture.target);
+    expect(posted?.baseSha).toBe(expected.observedBase);
+    expect(posted?.receipt?.baseSha).toBe(expected.observedBase);
+    expect(posted?.baseSha).not.toBe(liveBase);
+    const recorded = fixture.ledger.latestRoundEvent(outcome.round.id, 'round.perkins-review')?.payload as Record<string, unknown> | undefined;
+    expect(recorded).toMatchObject({
+      targetSha: fixture.target, baseRefSha: fixture.base, diffBaseSha: fixture.base, headMoved: false, complete: true,
+    });
+    const manifest = JSON.parse(readFileSync(join(outcome.artifactDirectory, 'manifest.json'), 'utf8')) as Record<string, unknown>;
+    expect(manifest).toMatchObject({ baseRef: 'main', baseRefSha: fixture.base, diffBaseSha: fixture.base, targetSha: fixture.target });
+    expect(existsSync(join(outcome.artifactDirectory, 'perkins-report.reconciled-unrecorded.json'))).toBe(false);
+  }
+
+  it('reports base-rewritten when main is replaced by an orphan during lead work', async () => {
+    const fixture = await baseAdvanceFixture('perkins-base-rewrite-lead', 'feature/base-rewrite-lead', 40);
+    const post = vi.fn(async () => { throw new Error('a rewritten base must not post'); });
+    let rewritten = false;
+    const spawner = fakeWholeSpawner(fixture.sessions, {
+      onLeadStart: () => {
+        const orphan = fixture.repo.git([
+          '-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid',
+          'commit-tree', 'main^{tree}', '-m', 'base rewritten during review',
+        ]);
+        fixture.repo.git(['update-ref', 'refs/heads/main', orphan]);
+        rewritten = true;
+      },
+      childAnswer: () => '[]',
+      submitRetries: 1,
+      submitPayload: (attempt, submission) => attempt === 1 ? submission : {
+        ...submission, verdict: 'INCOMPLETE',
+        report_markdown: submission.report_markdown.replace(/\*\*Verdict: [^*]+\*\*/, '**Verdict: INCOMPLETE**'),
+      },
+    }).spawner;
+    const wave = new WaveRunner({
+      ledger: fixture.ledger, worktrees: fixture.port, spawner,
+      poster: { post }, reviewArtifactRoot: fixture.artifacts,
+      prHeadProbe: localHeadProbe('feature/base-rewrite-lead'),
+    });
+    const outcome = asWave(await wave.runRound({ jobId: fixture.job.id }));
+    expect(rewritten).toBe(true);
+    expect(outcome.canonicalVerdict).toBe('INCOMPLETE');
+    expect(outcome.headMoved).toBe(true);
+    expect(outcome.posted).toBe(false);
+    expect(post).not.toHaveBeenCalled();
+    expect(fixture.ledger.latestRoundEvent(outcome.round.id, 'round.head-moved')?.payload).toMatchObject({
+      cause: 'base-rewritten',
+      detail: expect.stringContaining('no longer descends'),
+    });
+  });
+
+  it('records a conclusive review when only the base advances during lead work and inside POST', async () => {
+    const fixture = await baseAdvanceFixture('perkins-base-advance-post', 'feature/base-advance-post', 36);
+    let advancedDuringLead = false;
+    let observedBase = '';
+    const post = vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => {
+      observedBase = fixture.repo.git(['rev-parse', 'main']);
+      advanceMain(fixture.repo);
+      return liveBaseReceipt('9300', call, observedBase);
+    });
+    const escalations: string[] = [];
+    const wave = new WaveRunner({
+      ledger: fixture.ledger, worktrees: fixture.port,
+      spawner: makeSpawner(fixture.sessions, [], () => {
+        advanceMain(fixture.repo);
+        advancedDuringLead = true;
+      }),
+      poster: { post }, reviewArtifactRoot: fixture.artifacts,
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      prHeadProbe: localHeadProbe('feature/base-advance-post'),
+    });
+    const outcome = asWave(await wave.runRound({ jobId: fixture.job.id }));
+    expect(advancedDuringLead).toBe(true);
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(observedBase).not.toBe(fixture.base); // lead advance was visible at the identity probe
+    expectRecordedWithFrozenBase(fixture, outcome, { reviewId: '9300', reconciled: false, observedBase });
+    expect(escalations).toEqual([]);
+  });
+
+  it('records a reconciled delivery when POST throws and the base advances inside the reconcile lookup', async () => {
+    const fixture = await baseAdvanceFixture('perkins-base-advance-reconcile', 'feature/base-advance-reconcile', 37);
+    const post = vi.fn(async () => { throw new Error('gh api review delivery exited 1: simulated timeout after commit'); });
+    let observedBase = '';
+    const reconcile = vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => {
+      observedBase = fixture.repo.git(['rev-parse', 'main']);
+      advanceMain(fixture.repo);
+      return liveBaseReceipt('9301', call, observedBase);
+    });
+    const escalations: string[] = [];
+    const wave = new WaveRunner({
+      ledger: fixture.ledger, worktrees: fixture.port, spawner: makeSpawner(fixture.sessions, []),
+      poster: { post, reconcile }, reviewArtifactRoot: fixture.artifacts,
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      prHeadProbe: localHeadProbe('feature/base-advance-reconcile'),
+    });
+    const outcome = asWave(await wave.runRound({ jobId: fixture.job.id }));
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(reconcile).toHaveBeenCalledTimes(1);
+    expect(observedBase).toBe(fixture.base); // the base advanced only after reconciliation began
+    expectRecordedWithFrozenBase(fixture, outcome, { reviewId: '9301', reconciled: true, observedBase });
+    expect(escalations).toEqual([]);
+  });
+
+  /** Push a new commit (same tree, parent = frozen target) to origin's PR
+   * branch: the reviewed target moves on the host mid-delivery. */
+  function pushMovedTarget(fixture: Awaited<ReturnType<typeof baseAdvanceFixture>>, branch: string): void {
+    const next = fixture.repo.git([
+      '-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid',
+      'commit-tree', `${fixture.target}^{tree}`, '-p', fixture.target, '-m', 'target moves during delivery',
+    ]);
+    fixture.repo.git(['push', '--quiet', 'origin', `${next}:refs/heads/${branch}`]);
+  }
+
+  it('refuses to record a delivery when the target is pushed inside POST or inside the reconcile lookup', async () => {
+    // (a) POST returns a valid receipt, but the target moved while it was
+    // outstanding: the post-delivery guard refuses the recording.
+    const inPost = await baseAdvanceFixture('perkins-target-push-post', 'feature/target-push-post', 38);
+    const post = vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => {
+      pushMovedTarget(inPost, 'feature/target-push-post');
+      return liveBaseReceipt('9302', call, inPost.base);
+    });
+    const postEscalations: string[] = [];
+    const postWave = new WaveRunner({
+      ledger: inPost.ledger, worktrees: inPost.port, spawner: makeSpawner(inPost.sessions, []),
+      poster: { post }, reviewArtifactRoot: inPost.artifacts,
+      escalate: (title, detail) => postEscalations.push(`${title}: ${detail}`),
+      prHeadProbe: localHeadProbe('feature/target-push-post'),
+    });
+    const postOutcome = asWave(await postWave.runRound({ jobId: inPost.job.id }));
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(postOutcome.posted).toBe(false);
+    expect(postOutcome.verdict).toBeNull();
+    expect(postOutcome.canonicalVerdict).toBe('INCOMPLETE');
+    expect(postOutcome.headMoved).toBe(true);
+    expect(inPost.ledger.latestRoundEvent(postOutcome.round.id, 'round.posted')).toBeNull();
+    expect(postEscalations.some((line) => line.includes('source changed while the report was being delivered (target-moved:'))).toBe(true);
+    // (b) POST throws; the target moves while the reconcile lookup is
+    // outstanding: the found receipt is kept unrecorded with the exact reason.
+    const inReconcile = await baseAdvanceFixture('perkins-target-push-reconcile', 'feature/target-push-reconcile', 39);
+    const failingPost = vi.fn(async () => { throw new Error('gh api review delivery exited 1: simulated timeout after commit'); });
+    const reconcile = vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => {
+      pushMovedTarget(inReconcile, 'feature/target-push-reconcile');
+      return liveBaseReceipt('9303', call, inReconcile.base);
+    });
+    const reconcileWave = new WaveRunner({
+      ledger: inReconcile.ledger, worktrees: inReconcile.port, spawner: makeSpawner(inReconcile.sessions, []),
+      poster: { post: failingPost, reconcile }, reviewArtifactRoot: inReconcile.artifacts,
+      prHeadProbe: localHeadProbe('feature/target-push-reconcile'),
+    });
+    const reconcileOutcome = asWave(await reconcileWave.runRound({ jobId: inReconcile.job.id }));
+    expect(reconcile).toHaveBeenCalledTimes(1);
+    expect(reconcileOutcome.posted).toBe(false);
+    expect(reconcileOutcome.canonicalVerdict).toBe('INCOMPLETE');
+    expect(reconcileOutcome.headMoved).toBe(true);
+    expect(inReconcile.ledger.latestRoundEvent(reconcileOutcome.round.id, 'round.posted')).toBeNull();
+    const unrecorded = JSON.parse(readFileSync(join(reconcileOutcome.artifactDirectory, 'perkins-report.reconciled-unrecorded.json'), 'utf8')) as {
+      recorded?: boolean; reason?: string; receipt?: { reviewId?: string };
+    };
+    expect(unrecorded.recorded).toBe(false);
+    expect(unrecorded.reason).toMatch(/^source changed while the reconciliation lookup was outstanding \(target-moved: .+\)$/);
+    expect(unrecorded.receipt?.reviewId).toBe('9303');
   });
 
   it('fails loudly when the newest completed predecessor record is missing (B9)', async () => {
@@ -2131,14 +2369,16 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
       await t4Step(leg, 'fixture/origin-push', async () => { attachOrigin(repo, branch, root, { batched: true }); });
       return { repo, ledger, port, artifacts, sessions, target, job, root };
     };
-    // The movement ref advances while the reconciliation lookup is
+    // T4a: the base is rewritten (orphan) while the reconciliation lookup is
     // outstanding: the receipt is preserved, never recorded as delivery.
     const moved = await t4Timed('moved', 'fixture-prep', () => prepare('perkins-t4-moved', 'feature/t4-moved', 'moved'));
     const post = vi.fn(async () => { throw new Error('gh api review delivery exited 1: timeout'); });
     const reconcile = vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => {
       return t4Timed('moved', 'reconcile-lookup', async () => {
-        // The frozen BASE drifts while the lookup is outstanding — the
-        // stale-source guard refMovedSinceFreeze must refuse the recording.
+        // The base is rewritten (orphan) while the lookup is outstanding:
+        // commit-tree without -p, so the new `main` no longer descends from
+        // the frozen merge-base — the stale-source guard refMovedSinceFreeze
+        // must refuse the recording.
         // commit-tree needs an explicit identity: CI runners have no global
         // git user (commitFile passes one the same way).
         const gitStarted = performance.now();
@@ -2181,7 +2421,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     ).toBe(true);
     const unrecorded = JSON.parse(readFileSync(join(moved.artifacts, movedOutcome.round.id, 'perkins-report.reconciled-unrecorded.json'), 'utf8')) as { recorded?: boolean; reason?: string; receipt?: { reviewId?: string } };
     expect(unrecorded.recorded).toBe(false);
-    expect(unrecorded.reason).toContain('moved while the reconciliation lookup was outstanding');
+    expect(unrecorded.reason).toMatch(/^source changed while the reconciliation lookup was outstanding \(base-rewritten: .+\)$/);
     expect(unrecorded.receipt?.reviewId).toBe('9200');
     expect(moved.ledger.latestRoundEvent(movedOutcome.round.id, 'round.posted')).toBeNull();
     t4Attr('moved', 'leg', 'end', { outcome: 'completed', note: 'fixture-prep + wave-round + assertions; reconcile-lookup/git-ops are NESTED in wave-round — never summed' });
