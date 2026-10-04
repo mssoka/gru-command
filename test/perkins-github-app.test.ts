@@ -2322,6 +2322,163 @@ describe('bounded lookup growth and link sanity', () => {
   const link = (page: string, rel: string, base = 'https://api.github.com/repos/acme/widget/pulls/7/reviews') =>
     `<${base}?per_page=100&page=${page}>; rel="${rel}"`;
 
+  const reviewPages = (calls: ReadonlyArray<{ readonly method: string; readonly url: string }>) =>
+    calls.filter((call) => call.method === 'GET' && call.url.includes('/reviews?'))
+      .map((call) => Number(new URL(call.url).searchParams.get('page')));
+
+  it('follows next-only page 1→3 within two requests and credits the exact review on both routes', async () => {
+    const fixture = bundleFixture();
+    const { poster, calls } = posterWith(fixture, [
+      { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+      { method: 'GET', test: /\/reviews\?/, handler: async (call) => ({
+        status: 200, body: /[?&]page=3$/u.test(call.url) ? [MATCHING_REVIEW] : fullPage,
+        ...(/[?&]page=1$/u.test(call.url) ? { headers: { link: link('3', 'next') } } : {}),
+      }) },
+    ], { maxReconciliationPages: 2 });
+    const input = { ...PR_INPUT, repoPath: repoPathOf(fixture) };
+    await expect(poster.post(input)).resolves.toEqual(RECEIPT);
+    await expect(poster.reconcile(input)).resolves.toEqual(RECEIPT);
+    expect(reviewPages(calls)).toEqual([1, 3, 1, 3]);
+    expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
+  });
+
+  it('never certifies the skipped page after a next-only jump exhausts two requests', async () => {
+    const fixture = bundleFixture();
+    const { poster, calls } = posterWith(fixture, [
+      { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+      { method: 'GET', test: /\/reviews\?/, handler: async (call) => /[?&]page=1$/u.test(call.url)
+        ? { status: 200, body: fullPage, headers: { link: link('3', 'next') } }
+        : { status: 200, body: [] } },
+    ], { maxReconciliationPages: 2 });
+    const input = { ...PR_INPUT, repoPath: repoPathOf(fixture) };
+    await expect(poster.post(input)).rejects.toThrow(/delivery stays unproven/u);
+    await expect(poster.reconcile(input)).rejects.toThrow(/delivery stays unresolved/u);
+    expect(reviewPages(calls)).toEqual([1, 3, 1, 3]);
+    expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
+  });
+
+  it('backfills a next-only skipped page with spare budget for a match or complete negative proof', async () => {
+    const fixture = bundleFixture();
+    for (const pageTwo of [[MATCHING_REVIEW], fullPage]) {
+      const { poster, calls } = posterWith(fixture, [
+        { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+        { method: 'GET', test: /\/reviews\?/, handler: async (call) => ({
+          status: 200,
+          body: /[?&]page=1$/u.test(call.url) ? fullPage : /[?&]page=3$/u.test(call.url) ? [] : pageTwo,
+          ...(/[?&]page=1$/u.test(call.url) ? { headers: { link: link('3', 'next') } } : {}),
+        }) },
+      ], { maxReconciliationPages: 3 });
+      const input = { ...PR_INPUT, repoPath: repoPathOf(fixture) };
+      if (pageTwo.length === 1) {
+        await expect(poster.post(input)).resolves.toEqual(RECEIPT);
+        await expect(poster.reconcile(input)).resolves.toEqual(RECEIPT);
+      } else {
+        await expect(poster.post(input)).rejects.toThrow(/POST did not land/u);
+        await expect(poster.reconcile(input)).resolves.toBeNull();
+      }
+      expect(reviewPages(calls)).toEqual([1, 3, 2, 1, 3, 2]);
+      expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
+    }
+  });
+
+  it('backfills page 2 after a next jump and later last=4 with four requests', async () => {
+    const fixture = bundleFixture();
+    for (const pageTwo of [[MATCHING_REVIEW], fullPage]) {
+      const { poster, calls } = posterWith(fixture, [
+        { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+        { method: 'GET', test: /\/reviews\?/, handler: async (call) => {
+          const page = Number(new URL(call.url).searchParams.get('page'));
+          return { status: 200, body: page === 2 ? pageTwo : fullPage,
+            headers: { link: page === 1 ? link('3', 'next') : link('4', 'last') } };
+        } },
+      ], { maxReconciliationPages: 4 });
+      const input = { ...PR_INPUT, repoPath: repoPathOf(fixture) };
+      if (pageTwo.length === 1) {
+        await expect(poster.post(input)).resolves.toEqual(RECEIPT);
+        await expect(poster.reconcile(input)).resolves.toEqual(RECEIPT);
+      } else {
+        await expect(poster.post(input)).rejects.toThrow(/POST did not land/u);
+        await expect(poster.reconcile(input)).resolves.toBeNull();
+      }
+      expect(reviewPages(calls)).toEqual([1, 3, 4, 2, 1, 3, 4, 2]);
+      expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
+    }
+  });
+
+  it('accepts canonical-case routes and same-route bare Link metadata but rejects foreign bare routes', async () => {
+    const fixture = bundleFixture();
+    for (const finalLink of [link('1', 'prev', 'https://api.github.com/repos/ACME/WIDGET/pulls/7/reviews'),
+      '<https://api.github.com/repos/acme/widget/pulls/7/reviews?per_page=100&page=1>',
+      '<https://api.github.com/repos/acme/widget/pulls/8/reviews?per_page=100&page=1>']) {
+      const { poster, calls } = posterWith(fixture, [
+        { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+        { method: 'GET', test: /\/reviews\?/, handler: async (call) => ({
+          status: 200, body: fullPage,
+          headers: { link: /[?&]page=1$/u.test(call.url)
+            ? link('2', 'last', 'https://api.github.com/repos/ACME/WIDGET/pulls/7/reviews') : finalLink },
+        }) },
+      ], { maxReconciliationPages: 2 });
+      const input = { ...PR_INPUT, repoPath: repoPathOf(fixture) };
+      if (finalLink.includes('/pulls/8/')) {
+        await expect(poster.post(input)).rejects.toThrow(/delivery stays unproven/u);
+        await expect(poster.reconcile(input)).rejects.toThrow(/delivery stays unresolved/u);
+      } else {
+        await expect(poster.post(input)).rejects.toThrow(/POST did not land/u);
+        await expect(poster.reconcile(input)).resolves.toBeNull();
+      }
+      expect(reviewPages(calls)).toEqual([1, 2, 1, 2]);
+    }
+  });
+
+  it('does not certify a visited page outside a later last=2 bound', async () => {
+    const fixture = bundleFixture();
+    const { poster, calls } = posterWith(fixture, [
+      { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+      { method: 'GET', test: /\/reviews\?/, handler: async (call) => ({ status: 200, body: fullPage,
+        ...(/[?&]page=3$/u.test(call.url) ? { headers: { link: link('2', 'last') } } : {}),
+      }) },
+    ], { maxReconciliationPages: 3 });
+    const input = { ...PR_INPUT, repoPath: repoPathOf(fixture) };
+    await expect(poster.post(input)).rejects.toThrow(/delivery stays unproven/u);
+    await expect(poster.reconcile(input)).rejects.toThrow(/delivery stays unresolved/u);
+    expect(reviewPages(calls)).toEqual([1, 2, 3, 1, 2, 3]);
+  });
+
+  it('keeps pages 1,3,2 unresolved when page 3 later claims last=2', async () => {
+    const fixture = bundleFixture();
+    const { poster, calls } = posterWith(fixture, [
+      { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+      { method: 'GET', test: /\/reviews\?/, handler: async (call) => {
+        const page = Number(new URL(call.url).searchParams.get('page'));
+        return { status: 200, body: fullPage,
+          headers: { link: page === 1 ? link('3', 'next') : link('2', 'last') } };
+      } },
+    ], { maxReconciliationPages: 3 });
+    const input = { ...PR_INPUT, repoPath: repoPathOf(fixture) };
+    await expect(poster.post(input)).rejects.toThrow(/delivery stays unproven/u);
+    await expect(poster.reconcile(input)).rejects.toThrow(/delivery stays unresolved/u);
+    expect(reviewPages(calls)).toEqual([1, 3, 2, 1, 3, 2]);
+  });
+
+  it('accepts reordered multi-token next and same-entry last+next for covered lists', async () => {
+    const fixture = bundleFixture();
+    for (const firstLink of [
+      `${link('2', 'next alternate').replace('; rel="next alternate"', '')}; title="metadata"; rel="alternate next"`,
+      link('2', 'last next'),
+    ]) {
+      const { poster, calls } = posterWith(fixture, [
+        { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+        { method: 'GET', test: /\/reviews\?/, handler: async (call) => /[?&]page=1$/u.test(call.url)
+          ? { status: 200, body: fullPage, headers: { link: firstLink } }
+          : { status: 200, body: [] } },
+      ], { maxReconciliationPages: 2 });
+      const input = { ...PR_INPUT, repoPath: repoPathOf(fixture) };
+      await expect(poster.post(input)).rejects.toThrow(/POST did not land/u);
+      await expect(poster.reconcile(input)).resolves.toBeNull();
+      expect(reviewPages(calls)).toEqual([1, 2, 1, 2]);
+    }
+  });
+
   it('refuses contradictory next and last pagination on both lookup routes', async () => {
     const fixture = bundleFixture();
     const scenarios: ReadonlyArray<[string, string, string]> = [

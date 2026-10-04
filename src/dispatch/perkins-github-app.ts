@@ -1133,7 +1133,7 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     let next: number | null = null;
     for (const entry of entries) {
       const fields = split(entry, ';');
-      if (fields === null || fields.length < 2) return { kind: 'contradictory' };
+      if (fields === null) return { kind: 'contradictory' };
       const urlMatch = /^<([^<>]+)>$/u.exec(fields[0]!);
       if (urlMatch === null) return { kind: 'contradictory' };
       let relation: string | null = null;
@@ -1145,14 +1145,18 @@ export class PerkinsAppPrPoster implements VerdictPoster {
           relation = (param[2] ?? param[3] ?? '').replace(/\\(.)/gu, '$1').toLowerCase();
         }
       }
-      if (relation === null) continue;
-      const relations = relation.split(/\s+/u);
-      if (!relations.includes('last') && !relations.includes('next')) continue;
       let url: URL;
       try { url = new URL(urlMatch[1]!); } catch { return { kind: 'contradictory' }; }
+      // GitHub repository owner/name spelling is case-insensitive; the PR
+      // identity and all other URL constraints are not.
+      const linkRoute = /^\/repos\/([^/]+)\/([^/]+)\/pulls\/([^/]+)\/reviews$/u.exec(url.pathname);
+      const expectedRoute = /^\/repos\/([^/]+)\/([^/]+)\/pulls\/([^/]+)\/reviews$/u.exec(route);
+      const sameRoute = linkRoute !== null && expectedRoute !== null &&
+        linkRoute[1]!.toLowerCase() === expectedRoute[1]!.toLowerCase() &&
+        linkRoute[2]!.toLowerCase() === expectedRoute[2]!.toLowerCase() && linkRoute[3] === expectedRoute[3];
       const params = [...url.searchParams.keys()];
       if (url.origin !== API_ROOT || url.username !== '' || url.password !== '' ||
-          url.pathname !== route || url.hash !== '' || params.length !== 2 ||
+          !sameRoute || url.hash !== '' || params.length !== 2 ||
           params.filter((key) => key === 'page').length !== 1 ||
           params.filter((key) => key === 'per_page').length !== 1 ||
           url.searchParams.get('per_page') !== '100') return { kind: 'contradictory' };
@@ -1160,6 +1164,9 @@ export class PerkinsAppPrPoster implements VerdictPoster {
       if (!/^\d+$/u.test(value)) return { kind: 'contradictory' };
       const page = Number(value);
       if (!Number.isSafeInteger(page) || page < 1) return { kind: 'contradictory' };
+      // A relation-free entry is neutral metadata, not permission to skip
+      // validating its URL. Likewise first/prev convey no page bound.
+      const relations = relation?.split(/\s+/u) ?? [];
       if (relations.includes('last')) {
         if (last !== null && last !== page) return { kind: 'contradictory' };
         last = page;
@@ -1232,7 +1239,8 @@ export class PerkinsAppPrPoster implements VerdictPoster {
   /** Shared bounded review-list walk. GitHub lists reviews oldest-first
    * and the review being reconciled is the newest, so once the Link
    * header reveals the last page the window jumps there and then walks
-   * backward (without a Link header the walk stays sequential).
+   * backward; a validated next can jump forward when last is unknown.
+   * Skipped pages are backfilled within the same request bound.
    * `notBeforeMs` bounds credit to this round's submissions when given;
    * null matches any identical publication (the idempotent recovery
    * seam). `provablyAbsent` is true ONLY when the walk provably covered
@@ -1263,7 +1271,16 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     let contradictoryPagination = false;
     const observedNextPages = new Set<number>();
     let page = 1;
-    let sequentialEnd = false;
+    let shortEndPage: number | null = null;
+    // Search only within the number of requests already made, never across
+    // a provider-sized page number. This finds a skipped page when a jump
+    // leaves a gap and there is still a request in the budget.
+    const missingPageThrough = (bound: number): number | null => {
+      for (let candidate = 1; candidate <= Math.min(bound, visited.size + 1); candidate += 1) {
+        if (!visited.has(candidate)) return candidate;
+      }
+      return null;
+    };
     let matchedButUnreceiptable = false;
     for (let fetched = 0; fetched < this.maxReconciliationPages; fetched += 1) {
       visited.add(page);
@@ -1322,6 +1339,9 @@ export class PerkinsAppPrPoster implements VerdictPoster {
         // newest page — fail-closed, since the max-tracked bound then keeps
         // any growth-uncovered state unresolved.
         next = visited.has(lastPage) || page >= lastPage ? page - 1 : lastPage;
+        if (next < 1 || visited.has(next)) {
+          next = missingPageThrough(lastPage) ?? 0;
+        }
       } else {
         // The classic short-page end-of-list heuristic applies ONLY when no
         // Link header is present at all. A Link header that exists but
@@ -1329,10 +1349,14 @@ export class PerkinsAppPrPoster implements VerdictPoster {
         // intermediary could be rewriting it — so that walk stays unresolved
         // rather than certifying absence from a short page.
         if (linkHeader === null && reviews.length < 100) {
-          sequentialEnd = true;
-          break;
+          shortEndPage = Math.max(shortEndPage ?? 0, page);
         }
-        next = page + 1;
+        if (shortEndPage !== null) {
+          next = missingPageThrough(shortEndPage) ?? 0;
+        } else {
+          next = seenPagination.kind === 'parsed' && seenPagination.next !== null &&
+            !visited.has(seenPagination.next) ? seenPagination.next : page + 1;
+        }
       }
       if (next < 1 || visited.has(next)) break;
       page = next;
@@ -1340,11 +1364,11 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     // Coverage is bounded by actual requests, never an allocation sized by
     // a provider-supplied page count. Even a short final page cannot erase
     // an earlier next link to a page we did not visit.
-    const covered = lastPage !== null && visited.size >= lastPage &&
-      [...visited].every((visitedPage) => visitedPage <= lastPage);
+    const coveredThrough = (bound: number): boolean => visited.size >= bound &&
+      [...visited].every((visitedPage) => visitedPage <= bound);
     const provablyAbsent = !contradictoryPagination &&
       [...observedNextPages].every((nextPage) => visited.has(nextPage) && (lastPage === null || nextPage <= lastPage)) &&
-      (lastPage !== null ? covered : sequentialEnd);
+      (lastPage !== null ? coveredThrough(lastPage) : shortEndPage !== null && coveredThrough(shortEndPage));
     return { matched: null, provablyAbsent, matchedButUnreceiptable };
   }
 }

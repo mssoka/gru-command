@@ -147,13 +147,19 @@ Absence is certified only by full coverage: the walk visits every page up
 to the largest `rel="last"` page number any response reported — a list
 that grows mid-walk stays unresolved while the grown list is not covered
 within the lookup bound — or, without a last bound, it reaches a short
-final page with no Link header (fewer than 100 reviews). An observed
-`rel="next"` to an unvisited page blocks absence even if a later page
-reports a smaller last bound or has no Link header. Next links must advance
-past their response page; contradictory next targets, malformed Link
-parameters, and last/next URLs outside this PR's `api.github.com` reviews
-route with `per_page=100` make absence unprovable. First/prev targets are
-not used as proof of completeness. A Link header without a usable
+final page with no Link header (fewer than 100 reviews) **and has visited
+all pages from 1 through that page**. A validated forward `rel="next"`
+can jump to a later page even without a last bound; when requests remain,
+the walk backfills skipped pages after reaching a short end or a visited
+predecessor. An unvisited gap blocks absence even if a later page reports
+a smaller last bound or has no Link header. Next links must advance past
+their response page; contradictory next targets, malformed Link parameters,
+and Link URLs outside this PR's `api.github.com` reviews route with
+`per_page=100` make absence unprovable. Owner/repository spelling in that
+route is case-insensitive; the PR number, origin and query are not. A
+well-formed relation-free Link entry is neutral metadata, but its URL must
+still validate. First/prev targets are not used as proof of completeness.
+A Link header without a usable
 `rel="last"` is not an end-of-list signal; malformed or contradictory
 last/next pagination evidence poisons completeness even if an earlier bound
 looked valid. A Link header longer than 16,384 characters also leaves
