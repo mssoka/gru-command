@@ -1075,10 +1075,9 @@ export class BoardView {
       ),
       ...this.extraReceipts.filter((extra) => !notifications.some((item) => item.id === extra.id)),
     ];
-    if (notifications.length === 0 && (snapshot.ownerPrs ?? []).length === 0) {
-      list.append(el('div', 'lbl', 'nothing needs attention'));
-      return;
-    }
+    // Every snapshot renders the full band structure — an empty feed is
+    // good news, not absence. No early return may skip FOR YOU / NEEDS GRU
+    // and their clear states (g9).
     // FOR YOU parity (FOR YOU r1): the bell renders the SAME authoritative
     // owner projection the board band renders — pending acks AND ready PRs
     // — so the two surfaces can never disagree about what the owner owes.

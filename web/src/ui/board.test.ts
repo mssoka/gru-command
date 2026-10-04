@@ -210,6 +210,18 @@ describe('board view resolved-notification rendering', () => {
     expect(sections[2]?.querySelector('.board-notification__ack')).toBeNull();
   });
 
+  it('g9: an empty notification feed renders the healthy FOR YOU / NEEDS GRU clear bands, never a bare skip', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({ notifications: [] }));
+    const panel = document.getElementById('notification-list')!;
+    expect(panel.textContent).not.toContain('nothing needs attention');
+    const heads = [...panel.querySelectorAll('.board-notification-section__head')].map((head) => head.textContent);
+    expect(heads).toEqual(['FOR YOU', 'NEEDS GRU']);
+    const sections = [...panel.querySelectorAll('.board-notification-section')];
+    expect(sections[0]?.textContent).toContain('nothing needs you');
+    expect(sections[1]?.textContent).toContain('live machine queue is clear');
+  });
+
   it('routing split: machine rows never ring the bell or toast; needs-owner rows do', () => {
     const toast = vi.fn();
     const view = new BoardView(() => {});
