@@ -575,6 +575,14 @@ async function main(): Promise<number> {
     ledger,
     bus,
     supervisionFor: (agentId) => supervisor?.viewFor(agentId) ?? null,
+    // Issue #171 truthful agent status: the live registry's handle set is
+    // the authoritative current-runtime ownership probe. Together with the
+    // supervision feed (adoptions + hydrated durable stops) it classifies
+    // every ledger row as current / historical / unverified — stale rows
+    // left by an unclean stop no longer read as live crew.
+    runtimeOwnership: () => ({
+      ownedAgentIds: new Set(registry.listHandles().map((handle) => handle.id)),
+    }),
     pacing: () => (config.pacing.enabled ? pacing.gate.view() : null),
     decisionsStatus: () => decisions?.status() ?? {
       enabled: false,

@@ -16,7 +16,13 @@
  * every status × freshness × PR-state combination is unit-testable.
  */
 
-import { isJobConcluded, type AgentView, type BoardSnapshot, type JobView } from './board-protocol.js';
+import {
+  agentRuntimeOf,
+  isJobConcluded,
+  type AgentView,
+  type BoardSnapshot,
+  type JobView,
+} from './board-protocol.js';
 import { derivedPrState } from './board-kpi.js';
 import { isSameLocalDay } from './board-time.js';
 
@@ -151,6 +157,11 @@ export function stoppedWorkersByJob(agents: readonly AgentView[]): Map<string, W
   };
   for (const agent of agents) {
     if (agent.jobId === null || agent.role !== 'minion') continue;
+    // Issue #171: a VERIFIED-historical record is neither a live worker
+    // nor a stop source — it belongs to a previous run/import and must
+    // not keep a dead lane warm or mask a current stop. Rows without the
+    // classification (pre-upgrade servers) keep the legacy read.
+    if (agentRuntimeOf(agent) === 'historical') continue;
     const supervision = agent.supervision;
     if (supervision === null || supervision === undefined) {
       // Unsupervised worker: not a supervision stop. A DISPOSED record is
@@ -211,6 +222,9 @@ export function liveWorkerStampsByJob(agents: readonly AgentView[]): Map<string,
   const stamps = new Map<string, number>();
   for (const agent of agents) {
     if (agent.jobId === null || agent.role !== 'minion') continue;
+    // Issue #171: a verified-historical minion is not a live worker — its
+    // frozen stamp must not keep a superseded lane warm.
+    if (agentRuntimeOf(agent) === 'historical') continue;
     const supervision = agent.supervision;
     if (
       supervision !== null &&

@@ -1189,6 +1189,129 @@ describe('board agent rail — dense rows, tabs count, disposed collapse', () =>
   });
 });
 
+describe('board agent rail — truthful runtime status (#171)', () => {
+  beforeEach(mountBoardDom);
+
+  it('verified-historical sessions never count or sort as live crew; their transcripts stay reachable', () => {
+    const opened: { file: string }[] = [];
+    const view = new BoardView((_request) => {
+      opened.push(_request);
+    });
+    view.render(
+      snapshot({
+        agents: [
+          // The observed defect: a September Silas frozen in `streaming`
+          // next to the one live Silas, plus a stale lens worker.
+          agent('silas-sept', { role: 'silas', state: 'streaming', runtime: 'historical', lastActivity: '2026-09-29T00:00:00.000Z' }),
+          agent('lens-sept', { state: 'streaming', runtime: 'historical', lastActivity: '2026-09-29T00:00:00.000Z' }),
+          agent('silas-now', { role: 'silas', state: 'idle', runtime: 'current' }),
+          agent('gru-old', { role: 'gru', state: 'disposed' }),
+        ],
+      }),
+    );
+    // Live rail = current rows only; history and graveyard sit behind
+    // their own disclosures; the CREW count agrees with the rail.
+    const rail = document.getElementById('board-agents')!;
+    expect(rail.querySelectorAll('.board-agent:not(.board-agent--disposed):not(.board-agent--historical)')).toHaveLength(1);
+    expect(document.getElementById('rail-agents-count')?.textContent).toBe('1');
+    const historyToggle = [
+      ...rail.querySelectorAll<HTMLButtonElement>('.board-agent-toggle'),
+    ].find((toggle) => toggle.textContent?.includes('history'))!;
+    expect(historyToggle.textContent).toContain('2 history');
+    expect(historyToggle.getAttribute('aria-expanded')).toBe('false');
+    expect(rail.querySelectorAll('.board-agent--historical')).toHaveLength(0);
+
+    historyToggle.click();
+    const historicalRows = [...rail.querySelectorAll<HTMLElement>('.board-agent--historical')];
+    expect(historicalRows).toHaveLength(2);
+    // The history marker is explicit, and the transcript click survives.
+    for (const row of historicalRows) {
+      expect(row.querySelector('.board-agent__runtime--historical')?.textContent).toBe('🕘 history');
+      expect(row.title).toContain('historical');
+    }
+    historicalRows[0]?.click();
+    expect(opened).toHaveLength(1); // the transcript history stays accessible
+  });
+
+  it('a raw-idle agent with open supervision work shows the work it is doing', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        agents: [
+          agent('silas-working', {
+            role: 'silas',
+            state: 'idle',
+            status: 'streaming',
+            runtime: 'current',
+            lastActivity: '2026-09-29T00:00:00.000Z',
+            supervision: {
+              state: 'watching',
+              restarts: 0,
+              breakerOpen: false,
+              openTurn: true,
+              lastEventAt: new Date(Date.now() - 30_000).toISOString(),
+            },
+          }),
+        ],
+      }),
+    );
+    const row = document.querySelector<HTMLElement>('#board-agents .board-agent');
+    // Chip + subline + dataset read the DERIVED status; the stale ledger
+    // stamp never shows days-quiet while supervision sees fresh events.
+    expect(row?.dataset.state).toBe('streaming');
+    expect(row?.querySelector('.board-agent__state')?.textContent).toBe('streaming');
+    expect(row?.querySelector('.board-agent__role')?.textContent).toContain('silas · streaming');
+    const age = row?.querySelector('.board-agent__age')?.textContent ?? '';
+    expect(age).toMatch(/^\d+s quiet$/);
+  });
+
+  it('ambiguous ownership renders an explicit unverified mark — never hidden, never claimed dead', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        agents: [
+          // Pre-#171 server: no runtime field at all.
+          agent('legacy-row', { state: 'idle' }),
+          agent('probed-row', { state: 'idle', runtime: 'unverified' }),
+        ],
+      }),
+    );
+    const rows = [...document.querySelectorAll<HTMLElement>('#board-agents .board-agent')];
+    expect(rows).toHaveLength(2); // conservative: stays visible
+    expect(document.getElementById('rail-agents-count')?.textContent).toBe('2');
+    for (const row of rows) {
+      expect(row.querySelector('.board-agent__runtime--unknown')?.textContent).toBe('❓ unverified');
+    }
+    // No history/disposed disclosures were fabricated from ambiguity.
+    expect(document.querySelector('.board-agent-toggle')).toBeNull();
+  });
+
+  it('a genuine duplicate current singleton owner is surfaced as an anomaly; a historical epoch is not', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        agents: [
+          agent('silas-a', { role: 'silas', state: 'idle', runtime: 'current' }),
+          agent('silas-b', { role: 'silas', state: 'idle', runtime: 'current' }),
+          agent('silas-sept', { role: 'silas', state: 'streaming', runtime: 'historical' }),
+          agent('minion-1', { role: 'minion', state: 'idle', runtime: 'current' }),
+          agent('minion-2', { role: 'minion', state: 'idle', runtime: 'current' }),
+        ],
+      }),
+    );
+    const flagged = [...document.querySelectorAll<HTMLElement>('#board-agents .board-agent')].filter(
+      (row) => row.querySelector('.board-agent__runtime--alert') !== null,
+    );
+    // Both CURRENT Silas owners carry the anomaly; the historical epoch
+    // and the two minions never do.
+    expect(flagged.map((row) => row.querySelector('.board-agent__name')?.textContent)).toEqual([
+      'silas-a',
+      'silas-b',
+    ]);
+    expect(flagged[0]?.title).toContain('more than one current silas');
+  });
+});
+
 describe('board v6 — job status tones', () => {
   beforeEach(mountBoardDom);
 
@@ -1361,6 +1484,72 @@ describe('board v6 — section truth: closed receipts never queue, stopped lanes
     const row = document.querySelector<HTMLElement>('.board-job');
     expect(row?.getAttribute('data-band')).toBe('cold');
     expect(row?.querySelector('.board-job__stale')?.textContent).toBe('stalled');
+  });
+
+  it('a verified-historical minion stamp never keeps a dead lane warm (#171)', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        jobs: [
+          baseJob({
+            id: 'stale-lane',
+            status: 'working',
+            rounds: [],
+            lastAgentActivity: new Date(Date.now() - 45 * 60_000).toISOString(),
+          }),
+        ],
+        agents: [
+          // The only minion record is a VERIFIED-historical session whose
+          // frozen September stamp is recent-looking. It is not live work:
+          // the lane reads on its own recency — COLD + stalled.
+          agent('minion-sept', {
+            role: 'minion',
+            jobId: 'stale-lane',
+            state: 'streaming',
+            runtime: 'historical',
+            lastActivity: new Date(Date.now() - 60_000).toISOString(),
+          }),
+        ],
+      }),
+    );
+    const row = document.querySelector<HTMLElement>('.board-job');
+    expect(row?.getAttribute('data-band')).toBe('cold');
+    expect(row?.querySelector('.board-job__stale')?.textContent).toBe('stalled');
+  });
+
+  it('a verified-historical minion never masks a current stop as live work (#171)', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        jobs: [
+          baseJob({
+            id: 'stopped-lane',
+            status: 'working',
+            rounds: [],
+            lastAgentActivity: new Date(Date.now() - 45 * 60_000).toISOString(),
+          }),
+        ],
+        agents: [
+          agent('minion-stopped', {
+            role: 'minion',
+            jobId: 'stopped-lane',
+            supervision: { state: 'stopped', restarts: 2, breakerOpen: true, stopReason: 'quota_wall' },
+          }),
+          // A stale historical epoch of the same lane, frozen mid-stream,
+          // must not clear the stop with its frozen stamp.
+          agent('minion-epoch', {
+            role: 'minion',
+            jobId: 'stopped-lane',
+            state: 'streaming',
+            runtime: 'historical',
+            lastActivity: new Date(Date.now() - 30_000).toISOString(),
+          }),
+        ],
+      }),
+    );
+    const row = document.querySelector<HTMLElement>('.board-job');
+    expect(row?.getAttribute('data-worker-state')).toBe('waiting');
+    expect(row?.querySelector('.board-job__status')?.textContent).toBe('waiting · quota wall');
   });
 
   it('loads older receipts on demand and merges them into FEED (D3)', async () => {

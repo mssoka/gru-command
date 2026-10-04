@@ -19,7 +19,11 @@ The engine maps adapter events to ledger rows/events (spawn → agent
 registered; state → agent state; turn lifecycle → activity + lens-chip
 derivation; fatal error → lens error + notification). Every snapshot is
 read straight from the ledger — a restart can never diverge from the
-record.
+record. Agent rows additionally carry the #171 runtime classification
+(`current` / `historical` / `unverified`) derived per snapshot from live
+ownership evidence (registry handles ∪ supervision views) and a
+supervision-corrected `status` — pure reads, so startup, reconnect and
+restart produce the same truth without data edits.
 
 ## HTTP API (token-authed: `Authorization: Bearer <pairing-token>`)
 
@@ -134,18 +138,32 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   Round rows carry per-lens chips (`○ pending` gray · `◉ live` yellow ·
   `✓ done` green · `✕ error` red · `— not used` neutral gray, no pass mark)
   behind a click.
-- **Crew rail:** CREW (n) / TRANSCRIPTS tabs above dense rows — a
-  status dot + name + short hash, a `role · state` subline (with turn
-  age and supervision marks), and a right-aligned state chip; error rows
-  carry the alert accent; disposed rows collapse behind a dashed `+N
-  disposed` footer. Clicking an agent with a session file opens its
-  transcript. The silas chip is LIVE when
-  `[silas] enabled` (default): the hosted ops session (`silas-ops` slot)
-  appears there whenever its wake turns run, and its follow-through lands
-  on the ledger as `silas.*` events (`silas.pr-registered`,
-  `silas.review-triggered`, `silas.directive-sent`, `silas.rebrief`,
-  `silas.escalated`, `silas.wake`) — visible in the event stream like
-  every other transition.
+- **Crew rail (#171 truthful agent status):** CREW (n) / TRANSCRIPTS
+  tabs above dense rows — a status dot + name + short hash, a
+  `role · state` subline (with turn age, supervision marks and runtime
+  marks), and a right-aligned state chip; error rows carry the alert
+  accent; disposed rows collapse behind a dashed `+N disposed` footer.
+  Liveness is runtime ownership, not the raw stored state: each row
+  carries a `runtime` classification — `current` (the live runtime owns
+  it: registry handle, supervision adoption or a hydrated durable stop —
+  a stopped/restoring lane stays current), `historical` (ownership probes
+  are wired and no live runtime owns the record — a previous run or
+  import left it; collapsed behind a `+N history` disclosure with
+  transcripts intact, never counted or sorted as crew) or `unverified`
+  (no ownership evidence — visible and explicitly marked, never guessed
+  dead). The chip reads the DERIVED `status`: a raw `idle` with an open
+  supervision turn/control/tool call presents the work it is doing
+  (`streaming`), and the quiet clock prefers the supervision event
+  stream. A duplicated CURRENT singleton-role owner is marked `⚠
+  duplicate` — an anomaly surfaced, never silently discarded. Clicking
+  an agent with a session file opens its transcript. The silas chip is
+  LIVE when `[silas] enabled` (default): the hosted ops session
+  (`silas-ops` slot) appears there whenever its wake turns run, and its
+  follow-through lands on the ledger as `silas.*` events
+  (`silas.pr-registered`, `silas.review-triggered`,
+  `silas.directive-sent`, `silas.rebrief`, `silas.escalated`,
+  `silas.wake`) — visible in the event stream like every other
+  transition.
 - **Notification center (E7; routing split 2026-09-23; section truth
   2026-09-29):** the bell panel renders the durable notification log in
   three bands — FOR YOU (all pending needs-owner rows, even older than the

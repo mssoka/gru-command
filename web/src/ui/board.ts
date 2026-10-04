@@ -20,7 +20,10 @@
  */
 
 import {
+  agentActivityOf,
+  agentRuntimeOf,
   agentStateTone,
+  agentStatusOf,
   isJobConcluded,
   jobChipTone,
   jobStatusTone,
@@ -126,6 +129,10 @@ export class BoardView {
   /** Disposed rows are collapsed by default; the toggle state survives
    * snapshot pushes so a live board does not re-open the graveyard. */
   private disposedExpanded = false;
+  /** Issue #171: verified-historical rows are collapsed behind their own
+   * disclosure (past sessions), separate from the disposed graveyard;
+   * the toggle state survives snapshot pushes. */
+  private historyExpanded = false;
   /** Age counters (lane age, round elapsed, streaming turn age): registered
    * per render and refreshed by one shared ticker. */
   private readonly ageNodes = new Set<HTMLElement>();
@@ -851,16 +858,59 @@ export class BoardView {
     const rail = mustGet('board-agents');
     rail.replaceChildren();
     this.ensureAgeTicker();
-    const live = agents.filter((agent) => agent.state !== 'disposed');
+    // Issue #171 truthful agent status: liveness is RUNTIME OWNERSHIP,
+    // not the raw stored state. The live crew = current members plus
+    // explicitly-ambiguous unverified rows (missing evidence is never
+    // death — the row stays visible and marked). Verified-historical
+    // records (a previous run/import left them; the live runtime owns
+    // none of them) collapse behind a history disclosure with their
+    // transcripts intact, and disposed rows keep their graveyard.
     const disposed = agents.filter((agent) => agent.state === 'disposed');
+    const historical = agents.filter(
+      (agent) => agent.state !== 'disposed' && agentRuntimeOf(agent) === 'historical',
+    );
+    const live = agents.filter(
+      (agent) => agent.state !== 'disposed' && agentRuntimeOf(agent) !== 'historical',
+    );
     this.agentsCount.textContent = String(live.length);
     if (agents.length === 0) {
       rail.append(el('div', 'lbl', 'no crew yet'));
       return;
     }
-    // Liveness-first order arrives from the server; disposed rows collapse
+    // Membership-first order arrives from the server; disposed rows collapse
     // behind a toggle so the graveyard never crowds live work.
-    for (const agent of live) rail.append(this.agentRow(agent, false));
+    // A genuine duplicate CURRENT singleton-role owner is an anomaly the
+    // service must surface, never silently discard: mark every row of a
+    // duplicated singleton role so the operator can investigate (#171).
+    const duplicateRoles = duplicatedSingletonRoles(live);
+    for (const agent of live) {
+      rail.append(this.agentRow(agent, 'live', duplicateRoles.has(agent.id)));
+    }
+    if (historical.length > 0) {
+      const toggle = el(
+        'button',
+        'board-agent-toggle',
+        `${this.historyExpanded ? '−' : '+'}${historical.length} history`,
+      );
+      toggle.type = 'button';
+      toggle.setAttribute('aria-expanded', String(this.historyExpanded));
+      toggle.setAttribute('data-section', 'history');
+      toggle.title =
+        'verified historical sessions — no current runtime owner; transcripts stay accessible';
+      toggle.addEventListener('click', () => {
+        this.historyExpanded = !this.historyExpanded;
+        this.renderAgents(agents);
+        if (this.historyExpanded) {
+          rail
+            .querySelector<HTMLElement>('.board-agent--historical')
+            ?.scrollIntoView?.({ block: 'nearest' });
+        }
+      });
+      rail.append(toggle);
+      if (this.historyExpanded) {
+        for (const agent of historical) rail.append(this.agentRow(agent, 'historical', false));
+      }
+    }
     if (disposed.length > 0) {
       const toggle = el(
         'button',
@@ -869,6 +919,7 @@ export class BoardView {
       );
       toggle.type = 'button';
       toggle.setAttribute('aria-expanded', String(this.disposedExpanded));
+      toggle.setAttribute('data-section', 'disposed');
       toggle.addEventListener('click', () => {
         this.disposedExpanded = !this.disposedExpanded;
         this.renderAgents(agents);
@@ -880,24 +931,38 @@ export class BoardView {
       });
       rail.append(toggle);
       if (this.disposedExpanded) {
-        for (const agent of disposed) rail.append(this.agentRow(agent, true));
+        for (const agent of disposed) rail.append(this.agentRow(agent, 'disposed', false));
       }
     }
   }
 
   /** One dense agent row: status dot, name + short hash, role·state
    * subline, right-aligned status chip. Error rows carry the alert
-   * accent (tint + left border) so a fault never hides in the list. */
-  private agentRow(agent: AgentView, disposed: boolean): HTMLElement {
-    const row = el('button', `board-agent${disposed ? ' board-agent--disposed' : ''}`);
+   * accent (tint + left border) so a fault never hides in the list.
+   * Issue #171: the chip and subline read the DERIVED status (a raw-idle
+   * agent with open supervision work shows the work it is doing), and
+   * historical rows are marked as past sessions rather than live crew. */
+  private agentRow(
+    agent: AgentView,
+    section: 'live' | 'historical' | 'disposed',
+    duplicateSingleton: boolean,
+  ): HTMLElement {
+    const row = el(
+      'button',
+      `board-agent${section === 'disposed' ? ' board-agent--disposed' : ''}${section === 'historical' ? ' board-agent--historical' : ''}`,
+    );
     row.type = 'button';
-    row.dataset.state = agent.state;
+    const status = agentStatusOf(agent);
+    row.dataset.state = status;
     row.dataset.role = agent.role;
-    if (agent.state === 'error') row.classList.add('board-agent--error');
+    if (status === 'error') row.classList.add('board-agent--error');
     row.title =
       agent.sessionFile !== null
         ? `${agent.id} — open transcript`
         : `${agent.id} — no session file yet`;
+    if (section === 'historical') {
+      row.title += ' · historical: no current runtime owner — record retained';
+    }
     row.addEventListener('click', () => {
       if (agent.sessionFile !== null) {
         this.onOpenTranscript({ file: agent.sessionFile ?? '', label: agentLabel(agent) });
@@ -912,12 +977,29 @@ export class BoardView {
     const subline = el('span', 'board-agent__sub lbl');
     subline.append(
       el('span', 'board-agent__emoji', ROLE_EMOJI[agent.role] ?? '🤖'),
-      el('span', 'board-agent__role', `${agent.role} · ${agent.state}`),
+      el('span', 'board-agent__role', `${agent.role} · ${status}`),
     );
-    // Turn-age counter: a streaming agent shows how long its current turn
-    // has been quiet — the operator's "is it stuck?" glance.
-    if (agent.state === 'streaming') {
-      subline.append(this.ageNode('board-agent__age lbl', agent.lastActivity, '', ' quiet'));
+    // Turn-age counter: a working agent shows how long its current turn
+    // has been quiet — the operator's "is it stuck?" glance. The clock
+    // prefers the supervision event stream (#171): deltas never touch the
+    // ledger's last_activity, so a busy turn must not read as days-quiet.
+    if (status === 'streaming') {
+      subline.append(this.ageNode('board-agent__age lbl', agentActivityOf(agent), '', ' quiet'));
+    }
+    // Issue #171: ambiguous ownership is explicit — an unverified row is
+    // visible, marked, and never claimed active or dead by the board.
+    if (section === 'live' && agentRuntimeOf(agent) === 'unverified') {
+      subline.append(el('span', 'board-agent__runtime board-agent__runtime--unknown', '❓ unverified'));
+      row.title += ' · runtime ownership unverified (no ownership evidence)';
+    }
+    if (section === 'historical') {
+      subline.append(el('span', 'board-agent__runtime board-agent__runtime--historical', '🕘 history'));
+    }
+    // Issue #171: a duplicated CURRENT singleton-role owner is surfaced as
+    // an anomaly (the service supervises one of each) — never discarded.
+    if (duplicateSingleton) {
+      subline.append(el('span', 'board-agent__runtime board-agent__runtime--alert', '⚠ duplicate'));
+      row.title += ` · anomaly: more than one current ${agent.role} owner — investigate`;
     }
     // E7: supervision mark — a stopped (breaker-tripped) or restarting
     // agent carries its supervision state on the subline (the right chip
@@ -937,7 +1019,7 @@ export class BoardView {
     }
     body.append(top, subline);
     row.append(el('span', 'board-agent__dot'), body);
-    row.append(el('span', `pp-chip board-agent__state ${agentStateTone(agent.state)}`, agent.state));
+    row.append(el('span', `pp-chip board-agent__state ${agentStateTone(status)}`, status));
     return row;
   }
 
@@ -1175,6 +1257,30 @@ export function jobFailing(job: JobView): boolean {
 function agentLabel(agent: AgentView): string {
   if (agent.label !== null && agent.label !== '') return agent.label;
   return `${agent.role} · ${agent.id.slice(0, 12)}`;
+}
+
+/** Roles the service hosts ONE of (the standing crew + bob); minions are
+ * a pool and never duplicate. */
+const SINGLETON_ROLES: ReadonlySet<string> = new Set(['gru', 'silas', 'perkins', 'bob']);
+
+/** Issue #171: agent ids of the live rail's rows whose singleton role has
+ * MORE THAN ONE current owner — an unexpected concurrent owner is an
+ * anomaly to surface, never to silently discard. Only explicitly-current
+ * rows count (unverified rows are already marked ambiguous; a historical
+ * epoch of the same role is expected, not an anomaly). */
+function duplicatedSingletonRoles(liveAgents: readonly AgentView[]): Set<string> {
+  const counts = new Map<string, string[]>();
+  for (const agent of liveAgents) {
+    if (agentRuntimeOf(agent) !== 'current' || !SINGLETON_ROLES.has(agent.role)) continue;
+    const ids = counts.get(agent.role) ?? [];
+    ids.push(agent.id);
+    counts.set(agent.role, ids);
+  }
+  const duplicated = new Set<string>();
+  for (const ids of counts.values()) {
+    if (ids.length > 1) for (const id of ids) duplicated.add(id);
+  }
+  return duplicated;
 }
 
 function formatTs(iso: string): string {
