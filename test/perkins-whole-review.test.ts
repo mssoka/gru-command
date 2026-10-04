@@ -21,7 +21,7 @@ import { DEFAULT_REVIEW_CHILDREN } from '../src/config.js';
 import { PerkinsWholeReview, STANDALONE_SPECIALIST_CONCURRENCY, type PerkinsWholeResult, type PerkinsWholeReviewOptions } from '../src/dispatch/perkins-review/whole.js';
 import { ReviewMcpBridge } from '../src/runtime/review-mcp-bridge.js';
 import { finalAssistantText } from '../src/dispatch/perkins-review/session-output.js';
-import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
+import { attachBareOrigin, makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 import { PacingGate, type PacingAcquireInput, type PacingLease } from '../src/runtime/pacing.js';
 import { fakeWholeSpawner, groundedFinding, type WholeLeadOptions, type WholeSpawnCall } from './helpers/perkins-whole-double.js';
 import type { NativeAgentTool } from '../src/runtime/types.js';
@@ -67,6 +67,9 @@ function wholeHarness(
     spec?: string;
     priorConsolidatedFile?: string;
     beforeFreeze?: (repo: FixtureRepo) => void;
+    /** Named base ref to freeze (`main`, `origin/main`); default pins the
+     * base by SHA, which can never advance. */
+    baseRef?: string;
     reviewGate?: PacingGate;
     pacing?: Pick<PerkinsWholeReviewOptions, 'rateLimitBackoff' | 'recordPacing' | 'pacingSleep' | 'pacingJitter' | 'pacingNow'>;
   },
@@ -74,14 +77,14 @@ function wholeHarness(
   const fixture = makeReviewRepo();
   repos.push(fixture.repo);
   options?.beforeFreeze?.(fixture.repo);
-  const base = fixture.repo.git(['rev-parse', 'main']);
+  const base = fixture.repo.git(['rev-parse', options?.baseRef ?? 'main']);
   const target = fixture.repo.head();
   const root = temp('perkins-whole-test-');
   const frozen = freezeReviewInputs({
     roundId: 'whole-round',
     repoPath: fixture.repo.path,
     artifactRoot: root,
-    baseRef: base,
+    baseRef: options?.baseRef ?? base,
     targetRef: target,
     movementRef: 'feature/review',
     ...(options?.noSpec === true
@@ -120,6 +123,44 @@ function wholeHarness(
 }
 
 const ALL_CLEAN: WholeLeadOptions = { childAnswer: () => '[]', specialists: [] };
+
+/** Advance `branch` by one commit without touching any checkout (a merge
+ * landing on the base mid-review). `cwd` targets another repository, e.g.
+ * the bare origin, so only its advertised tip moves. */
+function advanceBranch(repo: FixtureRepo, branch: string, cwd?: string): string {
+  const next = repo.git([
+    '-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid',
+    'commit-tree', `${branch}^{tree}`, '-p', branch, '-m', `${branch} advances during review`,
+  ], cwd);
+  repo.git(['update-ref', `refs/heads/${branch}`, next], cwd);
+  return next;
+}
+
+/** Attempt 1 submits the conclusive verdict; attempt 2 falls back to INCOMPLETE. */
+function incompleteOnRetry(attempt: number, submission: { verdict: string; report_markdown: string }): unknown {
+  return attempt === 1
+    ? submission
+    : { ...submission, verdict: 'INCOMPLETE', report_markdown: submission.report_markdown.replace(/\*\*Verdict: [^*]+\*\*/, '**Verdict: INCOMPLETE**') };
+}
+
+/** A base-only advance leaves the frozen target valid: preflight ok, the
+ * conclusive verdict accepted first time, and the frozen base kept as
+ * provenance (never rewritten to the live tip). */
+function expectBaseAdvanceAccepted(h: WholeHarness, result: PerkinsWholeResult): void {
+  expect(h.preflightResults).toHaveLength(1);
+  expect(JSON.parse(h.preflightResults[0]!.text)).toMatchObject({ ok: true, errorCount: 0 });
+  expect(h.toolErrors.filter((entry) => entry.tool === 'perkins_submit_review')).toEqual([]);
+  expect(result.canonicalVerdict).toBe('READY TO MERGE');
+  expect(result.headMoved).toBe(false);
+  const consolidated = JSON.parse(readFileSync(join(result.artifactDirectory, 'consolidated.json'), 'utf8')) as {
+    complete: boolean; headMoved: boolean; frozen: Record<string, unknown>;
+  };
+  expect(consolidated.complete).toBe(true);
+  expect(consolidated.headMoved).toBe(false);
+  const frozenProvenance = { baseRefSha: h.base, diffBaseSha: h.base, targetSha: h.target, diffSha256: h.frozen.manifest.diffSha256 };
+  expect(consolidated.frozen).toMatchObject(frozenProvenance);
+  expect(JSON.parse(readFileSync(join(h.frozen.directory, 'manifest.json'), 'utf8'))).toMatchObject(frozenProvenance);
+}
 
 describe('bundled Perkins policy (whole-PR contract)', () => {
   it('loads the integrity-pinned whole-PR policy with the lead workflow and no chunk rule', () => {
@@ -611,6 +652,181 @@ describe('Perkins whole-PR lead engine', () => {
     expect(result.headMoved).toBe(true);
     const first = h.toolErrors.find((entry) => entry.tool === 'perkins_submit_review');
     expect(first?.error).toMatch(/head-moved/);
+  });
+
+  it('a local base advance alone keeps the frozen target valid: preflight ok, READY accepted, base provenance kept', async () => {
+    const h = wholeHarness({
+      ...ALL_CLEAN,
+      preflight: { calls: 1 },
+      // `main` advances (a merge lands) before preflight and submit; the
+      // reviewed branch and the checkout are untouched.
+      beforeSubmit: () => { advanceBranch(h.repo, 'main'); },
+    }, { baseRef: 'main' });
+    const result = await h.run();
+    expect(h.repo.git(['rev-parse', 'main'])).not.toBe(h.base);
+    expect(h.frozen.manifest.baseRef).toBe('main');
+    expectBaseAdvanceAccepted(h, result);
+  });
+
+  it('an advertised remote base advance alone keeps the frozen target valid', async () => {
+    let origin = '';
+    const h = wholeHarness({
+      ...ALL_CLEAN,
+      preflight: { calls: 1 },
+      // origin's main advances on the host only: the local tracking ref
+      // stays at the frozen base, so the advertised tip alone moved.
+      beforeSubmit: () => { advanceBranch(h.repo, 'main', origin); },
+    }, {
+      baseRef: 'origin/main',
+      beforeFreeze: (repo) => {
+        origin = attachBareOrigin(repo);
+        repo.git(['push', '--quiet', 'origin', 'refs/heads/main']);
+      },
+    });
+    const result = await h.run();
+    expect(h.repo.git(['rev-parse', 'refs/remotes/origin/main'])).toBe(h.base);
+    expect(h.repo.git(['ls-remote', 'origin', 'refs/heads/main']).split(/\s+/u)[0]).not.toBe(h.base);
+    expect(h.frozen.manifest.baseRef).toBe('origin/main');
+    expectBaseAdvanceAccepted(h, result);
+  });
+
+  it('a target move alongside a base advance still rejects a conclusive verdict', async () => {
+    const h = wholeHarness({
+      ...ALL_CLEAN,
+      beforeSubmit: () => {
+        advanceBranch(h.repo, 'main');
+        advanceBranch(h.repo, 'feature/review');
+      },
+      submitRetries: 1,
+      submitPayload: incompleteOnRetry,
+    }, { baseRef: 'main' });
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('INCOMPLETE');
+    expect(result.headMoved).toBe(true);
+    const first = h.toolErrors.find((entry) => entry.tool === 'perkins_submit_review');
+    expect(first?.error).toMatch(/head-moved.*target-moved/);
+  });
+
+  it('an untracked file in the review checkout rejects a conclusive verdict as head-moved', async () => {
+    const h = wholeHarness({
+      ...ALL_CLEAN,
+      beforeSubmit: () => { writeFileSync(join(h.repo.path, 'stray.txt'), 'outside the target commit\n'); },
+      submitRetries: 1,
+      submitPayload: incompleteOnRetry,
+    }, { baseRef: 'main' });
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('INCOMPLETE');
+    expect(result.headMoved).toBe(true);
+    const first = h.toolErrors.find((entry) => entry.tool === 'perkins_submit_review');
+    expect(first?.error).toMatch(/head-moved.*checkout-changed/);
+  });
+
+  it('a rewritten base (main replaced by an orphan commit) still rejects a conclusive verdict', async () => {
+    let orphan = '';
+    const h = wholeHarness({
+      ...ALL_CLEAN,
+      // A force-push that drops the frozen merge-base: the new `main` does
+      // not descend from diffBaseSha, so the PR delta can exceed the frozen
+      // diff even though the reviewed branch is untouched.
+      beforeSubmit: () => {
+        orphan = h.repo.git([
+          '-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid',
+          'commit-tree', 'main^{tree}', '-m', 'main rewritten during review',
+        ]);
+        h.repo.git(['update-ref', 'refs/heads/main', orphan]);
+      },
+      submitRetries: 1,
+      submitPayload: incompleteOnRetry,
+    }, { baseRef: 'main' });
+    const result = await h.run();
+    expect(h.repo.git(['rev-parse', 'main'])).toBe(orphan);
+    expect(h.repo.git(['rev-list', '--max-parents=0', 'main'])).toBe(orphan);
+    expect(result.canonicalVerdict).toBe('INCOMPLETE');
+    expect(result.headMoved).toBe(true);
+    const first = h.toolErrors.find((entry) => entry.tool === 'perkins_submit_review');
+    expect(first?.error).toMatch(/head-moved.*base-rewritten/);
+  });
+
+  it('a deleted base ref still rejects a conclusive verdict', async () => {
+    const h = wholeHarness({
+      ...ALL_CLEAN,
+      // The frozen base no longer resolves (deleted or retargeted away):
+      // reviewed-target validity cannot be shown, so it fails closed.
+      beforeSubmit: () => { h.repo.git(['update-ref', '-d', 'refs/heads/main']); },
+      submitRetries: 1,
+      submitPayload: incompleteOnRetry,
+    }, { baseRef: 'main' });
+    const result = await h.run();
+    expect(() => h.repo.git(['rev-parse', '--verify', '--quiet', 'refs/heads/main'])).toThrow();
+    expect(result.canonicalVerdict).toBe('INCOMPLETE');
+    expect(result.headMoved).toBe(true);
+    const first = h.toolErrors.find((entry) => entry.tool === 'perkins_submit_review');
+    expect(first?.error).toMatch(/head-moved.*base-unresolvable/);
+  });
+
+  it('a git remote lookup failure rejects a conclusive verdict with its error', async () => {
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    const shimDir = temp('perkins-git-shim-');
+    const shim = join(shimDir, 'git');
+    const credentialUrl = 'https://user:secret-token@code.example.invalid/acme/fixture?access_token=another-secret';
+    writeFileSync(shim, `#!/bin/sh\ncase " $* " in *" remote "*) printf '%s\\n' "fatal: unable to access '${credentialUrl}': simulated remote listing failure" >&2; exit 2;; esac\nexec "${realGit}" "$@"\n`);
+    chmodSync(shim, 0o755);
+    const h = wholeHarness({ ...ALL_CLEAN, submitRetries: 1, submitPayload: incompleteOnRetry });
+    const oldPath = process.env.PATH;
+    try {
+      process.env.PATH = `${shimDir}:${oldPath ?? ''}`;
+      const result = await h.run();
+      expect(result.canonicalVerdict).toBe('INCOMPLETE');
+      expect(result.headMoved).toBe(true);
+      const first = h.toolErrors.find((entry) => entry.tool === 'perkins_submit_review');
+      expect(first?.error).toMatch(/head-moved.*check-failed.*simulated remote listing failure/);
+      expect(first?.error).not.toContain('secret-token');
+      expect(first?.error).not.toContain('another-secret');
+      expect(result.sourceMovement).toEqual({
+        cause: 'check-failed',
+        detail: "fatal: unable to access '[REDACTED URL]': simulated remote listing failure",
+      });
+    } finally {
+      if (oldPath === undefined) delete process.env.PATH;
+      else process.env.PATH = oldPath;
+    }
+  });
+
+  it('a base rewound to the frozen merge-base still contains it and keeps the frozen target valid', async () => {
+    let mergeBase = '';
+    const h = wholeHarness({
+      ...ALL_CLEAN,
+      preflight: { calls: 1 },
+      // `main` is rewound below the frozen base tip but still contains the
+      // frozen merge-base: the ancestry anchor is diffBaseSha, not baseRefSha.
+      beforeSubmit: () => { h.repo.git(['update-ref', 'refs/heads/main', h.frozen.manifest.diffBaseSha]); },
+    }, {
+      baseRef: 'main',
+      // `main` is already ahead of the branch point at freeze time, so the
+      // frozen base tip and the frozen merge-base differ.
+      beforeFreeze: (repo) => {
+        mergeBase = repo.git(['rev-parse', 'main']);
+        advanceBranch(repo, 'main');
+      },
+    });
+    expect(h.frozen.manifest.baseRefSha).toBe(h.base);
+    expect(h.frozen.manifest.diffBaseSha).toBe(mergeBase);
+    expect(h.frozen.manifest.baseRefSha).not.toBe(h.frozen.manifest.diffBaseSha);
+    const result = await h.run();
+    expect(h.repo.git(['rev-parse', 'main'])).toBe(mergeBase);
+    expect(h.preflightResults).toHaveLength(1);
+    expect(JSON.parse(h.preflightResults[0]!.text)).toMatchObject({ ok: true, errorCount: 0 });
+    expect(h.toolErrors.filter((entry) => entry.tool === 'perkins_submit_review')).toEqual([]);
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    expect(result.headMoved).toBe(false);
+    const consolidated = JSON.parse(readFileSync(join(result.artifactDirectory, 'consolidated.json'), 'utf8')) as {
+      complete: boolean; headMoved: boolean; frozen: Record<string, unknown>;
+    };
+    expect(consolidated.complete).toBe(true);
+    expect(consolidated.headMoved).toBe(false);
+    const frozenProvenance = { baseRefSha: h.base, diffBaseSha: mergeBase, targetSha: h.target, diffSha256: h.frozen.manifest.diffSha256 };
+    expect(consolidated.frozen).toMatchObject(frozenProvenance);
+    expect(JSON.parse(readFileSync(join(h.frozen.directory, 'manifest.json'), 'utf8'))).toMatchObject(frozenProvenance);
   });
 
   it('a failed specialist run is an honest execution fact — never a missing reviewer and never a block', async () => {
