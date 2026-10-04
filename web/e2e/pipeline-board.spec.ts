@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { expect, test, type Page, type WebSocketRoute } from '@playwright/test';
+import { createHash } from 'node:crypto';
+import { expect, test, type Browser, type Page, type WebSocketRoute } from '@playwright/test';
 import {
   isValidSnapshot,
   parseBoardServerFrame,
@@ -17,23 +18,101 @@ import {
  * pairing flow runs against the real dev mock. No product/mock/fixture
  * code is touched by this spec, and no real owner control is clicked.
  *
- * Captures land in the ignored evidence root
- * `_bmad-output/silas-in-pipeline-queue-20261003/captures/`. This spec is
- * authored, never run, by the source worker: scheduling belongs to
- * operations via the `pipeline-board-browser` [verify] scope. Declared
- * UNRUN — not a PASS.
+ * Capture discipline (acceptance E): two honest kinds, both recorded in
+ * `capture-manifest.json` with per-file sha256:
+ *   - `viewport-*`          live viewport screenshots — the claimed
+ *                           visibility/occlusion state (hit-tested).
+ *   - `stitched-fullpage-*` Playwright fullPage renders of the expanded
+ *                           document. Kept for continuity, labelled as
+ *                           NOT viewport-visibility evidence: sticky
+ *                           chrome and off-screen fixed overlays can
+ *                           render at non-runtime positions by capture
+ *                           mechanics alone (observed on the prior
+ *                           attempt's images).
+ *
+ * Every attempt writes to its own uniquely named root (env override
+ * `PIPELINE_BOARD_CAPTURE_ROOT`, else a UTC stamp + pid under the ignored
+ * evidence base); the exact root is printed to the run output, so a later
+ * gate attempt can never overwrite an earlier attempt's screenshots.
+ *
+ * This spec is authored, never run, by the source worker: scheduling
+ * belongs to operations via the `pipeline-board-browser` [verify] scope.
+ * Declared UNRUN — not a PASS.
  */
 
 const MOCK_TOKEN = process.env.GRU_MOCK_TOKEN ?? 'dev-token';
 
-const CAPTURE_DIR = path.join(
+const CAPTURE_BASE = path.join(
   import.meta.dirname,
   '..',
   '..',
   '_bmad-output',
   'silas-in-pipeline-queue-20261003',
-  'captures',
 );
+const CAPTURE_ENV_ROOT = process.env.PIPELINE_BOARD_CAPTURE_ROOT;
+const ATTEMPT_ROOT =
+  CAPTURE_ENV_ROOT !== undefined && CAPTURE_ENV_ROOT.trim() !== ''
+    ? path.resolve(CAPTURE_ENV_ROOT.trim())
+    : path.join(CAPTURE_BASE, 'attempts', `${new Date().toISOString().replace(/[:.]/gu, '-')}-${process.pid}`);
+const MANIFEST_PATH = path.join(ATTEMPT_ROOT, 'capture-manifest.json');
+// One line in the scheduled run output: the exact per-attempt root ops
+// must read to find this attempt's captures and manifest.
+console.log(`[pipeline-board] capture root: ${ATTEMPT_ROOT}`);
+
+interface CaptureRecord {
+  readonly file: string;
+  readonly kind: 'viewport' | 'stitched-fullpage';
+  readonly test: string;
+  readonly viewport: string;
+  readonly theme: string;
+  readonly state: string;
+  readonly bytes: number;
+  readonly sha256: string;
+}
+const captureRecords: CaptureRecord[] = [];
+
+function writeCaptureManifest(): void {
+  fs.mkdirSync(ATTEMPT_ROOT, { recursive: true });
+  fs.writeFileSync(
+    MANIFEST_PATH,
+    `${JSON.stringify(
+      {
+        attemptRoot: ATTEMPT_ROOT,
+        note:
+          'viewport-* = live viewport screenshots (the claimed visibility/occlusion state); ' +
+          'stitched-fullpage-* = Playwright fullPage renders of the expanded/stitched document, ' +
+          'NOT viewport-visibility evidence (sticky chrome and off-screen fixed overlays can render at non-runtime positions).',
+        captures: captureRecords,
+      },
+      null,
+      2,
+    )}\n`,
+  );
+}
+
+/** Record one produced capture with runtime viewport/theme and its hash. */
+async function recordCapture(
+  page: Page,
+  file: string,
+  kind: CaptureRecord['kind'],
+  state: string,
+): Promise<void> {
+  const runtime = await page.evaluate(() => ({
+    viewport: `${window.innerWidth}x${window.innerHeight}`,
+    theme: document.documentElement.classList.contains('dark') ? 'dark' : 'light',
+  }));
+  captureRecords.push({
+    file: path.relative(ATTEMPT_ROOT, file),
+    kind,
+    test: test.info().title,
+    viewport: runtime.viewport,
+    theme: runtime.theme,
+    state,
+    bytes: fs.statSync(file).size,
+    sha256: createHash('sha256').update(fs.readFileSync(file)).digest('hex'),
+  });
+  writeCaptureManifest();
+}
 
 const T0 = '2026-10-03T00:00:00.000Z';
 
@@ -128,6 +207,60 @@ interface Seed {
   push(snapshot: BoardSnapshot): void;
 }
 
+const LONG_TOKEN = 'x'.repeat(120);
+
+/** Large-count + long-label fixture (acceptance E: "exercise long labels,
+ * large counts"): In flight 26, Pipeline 26, For Gru 9, Settled 21, Cold
+ * 12, For you 1 — every section above its preview limit, with an
+ * unbreakable token in titles/reasons to prove `overflow-wrap` reflow. */
+function largeSnapshot(): BoardSnapshot {
+  const stamp = (index: number): string => new Date(Date.parse(T0) + (1000 - index) * 60_000).toISOString();
+  const longLabel = (index: number): string => `Long-label heist ${index} — ${LONG_TOKEN} — one wrapping row`;
+  const jobs: JobView[] = [
+    ...Array.from({ length: 26 }, (_, index) => job(`flight-${index}`, 'in-review', longLabel(index), stamp(index))),
+    ...Array.from({ length: 9 }, (_, index) => job(`machine-${index}`, 'blocked', longLabel(100 + index), stamp(100 + index))),
+    ...Array.from({ length: 21 }, (_, index) => job(`settled-${index}`, 'delivered', longLabel(200 + index), stamp(200 + index))),
+    ...Array.from({ length: 12 }, (_, index) => job(`cold-${index}`, 'parked', longLabel(300 + index), stamp(300 + index))),
+  ];
+  const waitingReasons = [
+    `owner hold: deciding on ${LONG_TOKEN}`,
+    `waiting for p-ghost — not enqueued (${LONG_TOKEN})`,
+    `prerequisite p-dead cancelled after ${LONG_TOKEN}`,
+    `dependency cycle: p4 → p5 → p4 (${LONG_TOKEN})`,
+    `exclusive scope "repo:${LONG_TOKEN}" held by p1`,
+  ];
+  const entries: PipelineEntryView[] = Array.from({ length: 26 }, (_, index) =>
+    entry(`p${index + 1}`, {
+      priority: index % 5,
+      enqueueSeq: index + 1,
+      state: index === 0 ? 'ready' : 'waiting',
+      reason: index === 0 ? null : waitingReasons[index % waitingReasons.length] ?? null,
+      title: `Approved brief ${index + 1} — ${LONG_TOKEN}`,
+    }),
+  );
+  return {
+    repos: [{ name: 'pipeline-proof', jobs }],
+    agents: [],
+    notifications: [OWNER_NOTICE],
+    decisions: {
+      enabled: false,
+      status: 'disabled',
+      reason: 'disabled',
+      model: '~typesafe/jev-latest',
+      endpoint: 'https://openrouter.ai/api/alpha/decisions',
+      credentialPresent: false,
+      credentialSource: 'none',
+      checkedAt: null,
+      incarnation: 'pipeline-proof-incarnation',
+      generation: 0,
+    },
+    unackedActionRequired: 0,
+    unackedNeedsOwner: 1,
+    wakes: { count: 0, lastAt: null },
+    pipeline: { entries, pending: entries.length },
+  };
+}
+
 /** Seed BOTH board channels so a later HTTP refetch cannot replace the
  * synthetic board, and keep the socket for deliberate re-pushes. */
 async function seedBoard(page: Page, initial: BoardSnapshot): Promise<Seed> {
@@ -172,9 +305,52 @@ async function bodyOverflow(page: Page): Promise<number> {
   return page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
 }
 
-async function capture(page: Page, name: string): Promise<void> {
-  fs.mkdirSync(CAPTURE_DIR, { recursive: true });
-  await page.screenshot({ path: path.join(CAPTURE_DIR, `${name}.png`), fullPage: true });
+/** Stitched full-document capture (continuity only): fullPage renders are
+ * explicitly NOT viewport-visibility evidence. */
+async function capture(page: Page, name: string, state = 'full-document render'): Promise<void> {
+  fs.mkdirSync(ATTEMPT_ROOT, { recursive: true });
+  const file = path.join(ATTEMPT_ROOT, `stitched-fullpage-${name}.png`);
+  await page.screenshot({ path: file, fullPage: true });
+  await recordCapture(page, file, 'stitched-fullpage', state);
+}
+
+/** Live viewport capture: the claimed on-screen state at this moment. */
+async function captureViewport(page: Page, name: string, state = 'viewport'): Promise<void> {
+  fs.mkdirSync(ATTEMPT_ROOT, { recursive: true });
+  const file = path.join(ATTEMPT_ROOT, `viewport-${name}.png`);
+  await page.screenshot({ path: file, fullPage: false });
+  await recordCapture(page, file, 'viewport', state);
+}
+
+interface HitTarget {
+  readonly found: boolean;
+  readonly inViewport: boolean;
+  readonly hit: boolean;
+}
+
+/** Center hit-target + viewport containment for one selector: the live
+ * occlusion check (sticky chrome, drawer or any other element covering
+ * the control fails the hit test). */
+async function hitTarget(page: Page, selector: string): Promise<HitTarget> {
+  return page.evaluate((sel) => {
+    const element = document.querySelector<HTMLElement>(sel);
+    if (element === null) return { found: false, inViewport: false, hit: false };
+    const rect = element.getBoundingClientRect();
+    const topmost = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+    return {
+      found: true,
+      inViewport:
+        rect.left >= 0 && rect.top >= 0 && rect.right <= window.innerWidth && rect.bottom <= window.innerHeight,
+      hit: topmost !== null && (topmost === element || element.contains(topmost)),
+    };
+  }, selector);
+}
+
+async function expectReachable(page: Page, selector: string): Promise<void> {
+  const target = await hitTarget(page, selector);
+  expect(target.found, `missing ${selector}`).toBe(true);
+  expect(target.inViewport, `${selector} fully inside the viewport`).toBe(true);
+  expect(target.hit, `${selector} center is the topmost hit target (not covered)`).toBe(true);
 }
 
 /** The six-section order as the DOM presents it (owner mount first). */
@@ -188,6 +364,147 @@ async function sectionOrder(page: Page): Promise<string[]> {
     }
     return order;
   });
+}
+
+const NAV_IDS = ['for-you', 'in-flight', 'pipeline', 'for-gru', 'settled', 'cold'] as const;
+
+interface ViewportCase {
+  readonly name: string;
+  readonly width: number;
+  readonly height: number;
+}
+
+/** One real-viewport proof: order, default density, sticky reachability at
+ * an anchor jump, disclosure expansion and focused-target occlusion — with
+ * live viewport captures at every claimed state (plus one labelled stitched
+ * render for continuity). Phone cases also exercise the EXISTING chat
+ * overlay controls (FAB opens, grip closes) with both states recorded; no
+ * chat policy, header or drawer design is changed. */
+async function viewportProof(browser: Browser, viewportCase: ViewportCase, theme: 'light' | 'dark'): Promise<void> {
+  const { name, width, height } = viewportCase;
+  const page = await browser.newPage({ viewport: { width, height } });
+  try {
+    const seed = await seedBoard(page, proofSnapshot());
+    await pairAndOpenBoard(page);
+    if (theme === 'dark') {
+      await page.locator('#theme-toggle').click();
+      await expect(page.locator('html')).toHaveClass(/dark/);
+    }
+    expect(seed.pageErrors).toEqual([]);
+    expect(await sectionOrder(page)).toEqual([...NAV_IDS]);
+
+    // The existing chat drawer is CLOSED here (the fixture never opens it
+    // and the spec does not click an opener): record the state rather than
+    // assume it; the stitched artifact of a prior attempt rendered it at a
+    // non-runtime position, which is why viewport captures are the proof.
+    const sheetState = (await page.locator('#chat-sheet').getAttribute('data-open')) ?? 'missing';
+    expect(sheetState).toBe('false');
+    await expect.poll(() => bodyOverflow(page)).toBeLessThanOrEqual(0);
+    for (const nav of NAV_IDS) await expectReachable(page, `#board-nav .board-nav__link[data-nav="${nav}"]`);
+    await captureViewport(page, `${name}-${theme}-defaults`, `default density viewport (chat sheet data-open=${sheetState})`);
+    await capture(page, `${name}-${theme}-defaults`, 'stitched full-document render (not viewport evidence)');
+
+    // Sticky reachability: an anchor jump lands the settled head below the
+    // pinned strip, and the shortcut itself stays an uncovered hit target.
+    await page.locator('#board-nav .board-nav__link[data-nav="settled"]').click();
+    await expect
+      .poll(async () => {
+        const navBox = await page.locator('#board-nav').boundingBox();
+        const headBox = await page.locator('#board-section-settled .board-band__head').boundingBox();
+        if (navBox === null || headBox === null) return Number.NaN;
+        return headBox.y - (navBox.y + navBox.height);
+      })
+      .toBeGreaterThanOrEqual(-2);
+    await expectReachable(page, '#board-nav .board-nav__link[data-nav="settled"]');
+    await expectReachable(page, '.board-band--settled .board-band__head');
+    await captureViewport(page, `${name}-${theme}-settled-jump`, 'scrolled anchor-jump viewport');
+
+    // Disclosure state: the clicks themselves are actionability/occlusion
+    // checks; the expanded rows and the focused toggle must stay uncovered.
+    await page.locator('.board-band--pipeline .board-band__more').click();
+    await expect(page.locator('.board-band--pipeline .board-pipeline')).toHaveCount(6);
+    await page.locator('.board-band--cold .board-band__more').click();
+    await expect(page.locator('.board-band--cold .board-job')).toHaveCount(4);
+    await page.locator('.board-band--cold .board-job').first().scrollIntoViewIfNeeded();
+    await expectReachable(page, '.board-band--cold .board-job');
+    await page.locator('.board-band--cold .board-band__more').focus();
+    await expect(page.locator('.board-band--cold .board-band__more')).toBeFocused();
+    await expectReachable(page, '.board-band--cold .board-band__more');
+    // Every section disclosure control, focused in turn: a focused target
+    // that a sticky chrome/drawer covered would fail its hit test.
+    for (const [label, band] of [
+      ['in-flight', '.board-band--in-flight'],
+      ['pipeline', '.board-band--pipeline'],
+      ['for-gru', '.board-band--needs-you'],
+      ['settled', '.board-band--settled'],
+      ['cold', '.board-band--cold'],
+    ] as const) {
+      const selector = `${band} .board-band__more`;
+      await page.locator(selector).focus();
+      await expect(page.locator(selector), `${label} toggle focus`).toBeFocused();
+      await expectReachable(page, selector);
+    }
+    await captureViewport(page, `${name}-${theme}-expanded-focus`, 'expanded + focused-target viewport');
+
+    if (name.startsWith('phone')) {
+      // Existing overlay controls, exercised with both states recorded.
+      await page.locator('#gru-fab').click();
+      await expect(page.locator('#chat-sheet')).toHaveAttribute('data-open', 'true');
+      await captureViewport(page, `${name}-${theme}-chat-open-recorded`, 'recorded overlay state (chat open via FAB; not a board defect state)');
+      await page.locator('#chat-sheet-grip').click();
+      await expect(page.locator('#chat-sheet')).toHaveAttribute('data-open', 'false');
+      await expectReachable(page, '#board-nav .board-nav__link[data-nav="cold"]');
+      await captureViewport(page, `${name}-${theme}-chat-closed`, 'overlay closed via grip; board controls reachable');
+    }
+  } finally {
+    await page.close();
+  }
+}
+
+/** Large-count + long-label proof for one viewport (acceptance E). */
+async function largeCountsProof(browser: Browser, viewportCase: ViewportCase): Promise<void> {
+  const page = await browser.newPage({ viewport: { width: viewportCase.width, height: viewportCase.height } });
+  try {
+    const seed = await seedBoard(page, largeSnapshot());
+    await pairAndOpenBoard(page);
+    expect(seed.pageErrors).toEqual([]);
+    expect(await sectionOrder(page)).toEqual([...NAV_IDS]);
+
+    // Full authoritative counts (26/26/9/21/12) with bounded previews
+    // (5/5/3/0/0) and an unbreakable 120-char token in every label.
+    await expect(page.locator('.board-band--in-flight .board-band__count')).toHaveText('26 heists');
+    await expect(page.locator('.board-band--pipeline .board-band__count')).toHaveText('26 queued');
+    await expect(page.locator('.board-band--needs-you .board-band__count')).toHaveText('9 heists');
+    await expect(page.locator('.board-band--settled .board-band__count')).toHaveText('21 heists');
+    await expect(page.locator('.board-band--cold .board-band__count')).toHaveText('12 heists');
+    await expect(page.locator('#board-nav .board-nav__link[data-nav="pipeline"] .board-nav__count')).toHaveText('26');
+    await expect(page.locator('.board-band--in-flight .board-job')).toHaveCount(5);
+    await expect(page.locator('.board-band--pipeline .board-pipeline')).toHaveCount(5);
+    await expect(page.locator('.board-band--settled .board-job')).toHaveCount(3);
+    await expect(page.locator('.board-band--needs-you .board-job')).toHaveCount(0);
+    await expect(page.locator('.board-band--cold .board-job')).toHaveCount(0);
+    await expect.poll(() => bodyOverflow(page)).toBeLessThanOrEqual(0);
+    await captureViewport(page, `${viewportCase.name}-light-largecounts-defaults`, 'large counts default density viewport');
+    await capture(page, `${viewportCase.name}-light-largecounts-defaults`, 'stitched full-document render (not viewport evidence)');
+
+    // Reversible disclosures reach every hidden row; long labels never
+    // force horizontal overflow.
+    await page.locator('.board-band--in-flight .board-band__more').click();
+    await expect(page.locator('.board-band--in-flight .board-job')).toHaveCount(26);
+    await page.locator('.board-band--pipeline .board-band__more').click();
+    await expect(page.locator('.board-band--pipeline .board-pipeline')).toHaveCount(26);
+    await page.locator('.board-band--needs-you .board-band__more').click();
+    await expect(page.locator('.board-band--needs-you .board-job')).toHaveCount(9);
+    await page.locator('.board-band--settled .board-band__more').click();
+    await expect(page.locator('.board-band--settled .board-job')).toHaveCount(21);
+    await page.locator('.board-band--cold .board-band__more').click();
+    await expect(page.locator('.board-band--cold .board-job')).toHaveCount(12);
+    await expect.poll(() => bodyOverflow(page)).toBeLessThanOrEqual(0);
+    await expectReachable(page, '#board-nav .board-nav__link[data-nav="pipeline"]');
+    await captureViewport(page, `${viewportCase.name}-light-largecounts-expanded`, 'large counts fully expanded viewport');
+  } finally {
+    await page.close();
+  }
 }
 
 test.describe('compact owner-first board — synthetic geometry proof', () => {
@@ -360,5 +677,65 @@ test.describe('compact owner-first board — synthetic geometry proof', () => {
     expect(requests.filter((entry) => entry.includes('/api/pipeline'))).toEqual([]);
     expect(requests.filter((entry) => entry.includes('/api/board/notifications'))).toEqual([]);
     expect(seed.pageErrors).toEqual([]);
+  });
+
+  test('viewport visibility + hit targets: desktop 1440 (light)', async ({ browser }) => {
+    await viewportProof(browser, { name: 'desktop-1440', width: 1440, height: 900 }, 'light');
+  });
+
+  test('viewport visibility + hit targets: tablet 768 (light)', async ({ browser }) => {
+    await viewportProof(browser, { name: 'tablet-768', width: 768, height: 1024 }, 'light');
+  });
+
+  test('viewport visibility + hit targets: phone 390 (light, overlay controls recorded)', async ({ browser }) => {
+    await viewportProof(browser, { name: 'phone-390', width: 390, height: 844 }, 'light');
+  });
+
+  test('viewport visibility + hit targets: phone 360 (light, overlay controls recorded)', async ({ browser }) => {
+    await viewportProof(browser, { name: 'phone-360', width: 360, height: 800 }, 'light');
+  });
+
+  test('viewport visibility + hit targets: tablet 768 (dark)', async ({ browser }) => {
+    await viewportProof(browser, { name: 'tablet-768', width: 768, height: 1024 }, 'dark');
+  });
+
+  test('viewport visibility + hit targets: phone 390 (dark, overlay controls recorded)', async ({ browser }) => {
+    await viewportProof(browser, { name: 'phone-390', width: 390, height: 844 }, 'dark');
+  });
+
+  test('large counts + long labels: desktop 1440 (full counts, bounded previews, reversible disclosures)', async ({ browser }) => {
+    await largeCountsProof(browser, { name: 'desktop-1440', width: 1440, height: 900 });
+  });
+
+  test('large counts + long labels: tablet 768 (full counts, bounded previews, reversible disclosures)', async ({ browser }) => {
+    await largeCountsProof(browser, { name: 'tablet-768', width: 768, height: 1024 });
+  });
+
+  test('large counts + long labels: phone 390 (full counts, bounded previews, reversible disclosures)', async ({ browser }) => {
+    await largeCountsProof(browser, { name: 'phone-390', width: 390, height: 844 });
+  });
+
+  test('zoom emulation 200% (disclosed): large counts reflow with full counts, bounded previews and reachable controls', async ({ browser }) => {
+    // Disclosed method: browser-chrome zoom has no direct Playwright API;
+    // the web-content equivalent is a halved CSS viewport at 2x device
+    // pixel ratio (1440x900 physical at 200% zoom => 720x450 CSS pixels)
+    // — a genuine reflow test, not a claim about the zoom UI itself.
+    const context = await browser.newContext({ viewport: { width: 720, height: 450 }, deviceScaleFactor: 2 });
+    const page = await context.newPage();
+    try {
+      const seed = await seedBoard(page, largeSnapshot());
+      await pairAndOpenBoard(page);
+      expect(seed.pageErrors).toEqual([]);
+      expect(await sectionOrder(page)).toEqual([...NAV_IDS]);
+      await expect(page.locator('.board-band--in-flight .board-band__count')).toHaveText('26 heists');
+      await expect(page.locator('.board-band--in-flight .board-job')).toHaveCount(5);
+      await expect(page.locator('.board-band--pipeline .board-pipeline')).toHaveCount(5);
+      await expect(page.locator('.board-band--settled .board-job')).toHaveCount(3);
+      await expect.poll(() => bodyOverflow(page)).toBeLessThanOrEqual(0);
+      for (const nav of NAV_IDS) await expectReachable(page, `#board-nav .board-nav__link[data-nav="${nav}"]`);
+      await captureViewport(page, 'zoom200-720x450-dpr2-light-defaults', 'disclosed 200% zoom emulation (halved CSS viewport, 2x DPR)');
+    } finally {
+      await context.close();
+    }
   });
 });
