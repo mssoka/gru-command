@@ -770,6 +770,28 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     }
   });
 
+  it('an ordinary task spawn asks the SDK for no step, turn, or tool-call cap (issue #158)', async () => {
+    const fx = await fixture();
+    const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+    try {
+      const options = twinGate.lastOptions as Record<string, unknown> | null;
+      expect(options).not.toBeNull();
+      // Capture sanity: the adapter really passed its session setup through.
+      expect(Array.isArray(options?.tools)).toBe(true);
+      // Pin that a provider/SDK step, turn, iteration, or tool-call ceiling is
+      // never invented for a task turn: a cap-only stop was the #158 incident.
+      for (const key of Object.keys(options ?? {})) {
+        expect(key).not.toMatch(/(?:max|limit|budget).*(?:step|turn|tool|call|iteration)/iu);
+        expect(key).not.toMatch(/(?:step|turn|tool|call|iteration).*(?:max|limit|budget)/iu);
+      }
+      for (const banned of ['maxSteps', 'maxTurns', 'maxToolCalls', 'maxIterations', 'stepLimit', 'turnLimit', 'toolCallLimit', 'maxBudgetUsd']) {
+        expect(options).not.toHaveProperty(banned);
+      }
+    } finally {
+      await handle.dispose();
+    }
+  });
+
   it('enforces isolated-review tools and strips ambient Pi resources', async () => {
     const fx = await fixture();
     writeFileSync(join(fx.workspace, 'AGENTS.md'), 'PROJECT-CONTEXT-CANARY', 'utf8');

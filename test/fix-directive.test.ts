@@ -262,6 +262,10 @@ describe('eviction-safe fix directives (phase 3)', () => {
       jobId: 'job-resume', directive: 'fix the blocker', signal: controller.signal,
     });
     expect(prompted[0]).toBe(appendWorkerRules('fix the blocker')); // resumed session gets the directive (never the re-brief wrapper), now carrying the current non-draft PR and no-call-budget rules
+    // Literal clause pin (not helper-derived): a routed directive must itself
+    // carry the no-call-budget rule, whatever the helper composes.
+    expect(prompted[0]).toContain('no total or per-phase tool-call budget binds');
+    expect(prompted[0]).toContain('it does not bind');
     rmSync(root, { recursive: true, force: true });
   });
 });

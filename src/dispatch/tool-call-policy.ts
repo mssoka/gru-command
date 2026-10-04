@@ -36,9 +36,3 @@ export const TOOL_CALL_POLICY = [
   'genuine non-progress stalls (silence with no live process), verification',
   'budgets owned by the verify scheduler, and required review/test gates.',
 ].join('\n');
-
-/** Append the no-call-budget rule to an assembled worker prompt or
- * directive (its own paragraph; the separator is always one blank line). */
-export function appendToolCallPolicy(text: string): string {
-  return `${text}\n\n${TOOL_CALL_POLICY}`;
-}

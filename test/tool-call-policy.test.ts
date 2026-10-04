@@ -130,7 +130,10 @@ describe('no-call-budget prompt contract (issue #158)', () => {
  */
 const CALL_TOKEN = /\b(?:tool[- ]?calls?|calls?|turns?)\b/iu;
 const BOUND_TOKEN =
-  /\b(?:at most|no more than|maximum|max|limiting|limit(?:ed)?|cap(?:ped)?|ceil(?:ing)?|budget(?:ed)?|reserve(?:d)?|within|under|only|up to)\b/iu;
+  /\b(?:at most|no more than|maximum|max|limiting|limit(?:ed)?|cap(?:ped)?|ceil(?:ing)?|budget(?:ed)?|reserve(?:d)?|within|under|only|up to|stop(?:ping)? after|not before)\b/iu;
+/** Explicitly historical/voided wording — an explanation of a removed
+ * ceiling is not a ceiling (issue #158 says records keep the old wording). */
+const VOID_CAP_TOKEN = /\b(?:no longer|is void|are void|never applies|does not bind|non-?binding)\b/iu;
 
 function numericCallCeilings(text: string): string[] {
   const hits: string[] = [];
@@ -138,6 +141,7 @@ function numericCallCeilings(text: string): string[] {
     if (!/\d/u.test(sentence)) continue;
     if (!CALL_TOKEN.test(sentence)) continue;
     if (!BOUND_TOKEN.test(sentence)) continue;
+    if (VOID_CAP_TOKEN.test(sentence)) continue;
     hits.push(flat(sentence).trim());
   }
   return hits;
@@ -169,12 +173,17 @@ describe('shipped instruction assets (issue #158)', () => {
     ).toHaveLength(1);
     expect(numericCallCeilings('The hard ceiling of 36 calls applies to the phase.')).toHaveLength(1);
     expect(numericCallCeilings('Cap the phase at 28 calls.')).toHaveLength(1);
+    expect(numericCallCeilings('Stop after 36 calls.')).toHaveLength(1);
+    expect(numericCallCeilings('Limit the repair phase to 12 calls.')).toHaveLength(1);
     expect(numericCallCeilings('There is no round cap for evolving blockers.')).toEqual([]);
     expect(numericCallCeilings('No total or per-phase tool-call budget binds this task.')).toEqual(
       [],
     );
     expect(numericCallCeilings('At most one factual FYI attempt per episode.')).toEqual([]);
     expect(numericCallCeilings('Escalate after three genuine repair attempts.')).toEqual([]);
+    // Historical/explanatory wording about a removed ceiling is not a cap.
+    expect(numericCallCeilings('The previous limit of 28 calls no longer applies.')).toEqual([]);
+    expect(numericCallCeilings('The old ceiling of 36 calls is void.')).toEqual([]);
   });
 
   it('no shipped role or ops skill demands or permits a numeric call ceiling', () => {
