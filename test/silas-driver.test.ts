@@ -1235,17 +1235,188 @@ describe('silas digest: stalled current phases (issue #162)', () => {
     }
   });
 
-  it('an in-flight verification owns the checkout; its settlement releases the lane', async () => {
+  it('an in-flight verification owns the checkout; only its own run settlement releases it', async () => {
     const h = makeLedger();
     try {
       reopenRepairPhase(h, 'job-verify');
-      h.ledger.appendCustomEvent({ kind: 'verification.requested', jobId: 'job-verify', payload: { run_id: 'run-1', scope: 'full' } });
+      // A started run owns the checkout regardless of how old it is.
+      h.ledger.appendCustomEvent({ kind: 'verification.started', jobId: 'job-verify', payload: { run_id: 'run-1', scope: 'full' } });
       const at = farFuture();
       expect((await digestAt(h, at)).stalledWorking).toEqual([]);
-      h.ledger.appendCustomEvent({ kind: 'verification.started', jobId: 'job-verify', payload: { run_id: 'run-1', scope: 'full' } });
+      // A duplicate caller attaching to the same attempt is NOT a settlement.
+      h.ledger.appendCustomEvent({ kind: 'verification.attached', jobId: 'job-verify', payload: { run_id: 'run-1', scope: 'full', state: 'running' } });
       expect((await digestAt(h, at)).stalledWorking).toEqual([]);
+      // Run 2 starts while run 1 is open; run 1's later settlement must not
+      // release run 2's checkout (per-run identity, not job-level order).
+      h.ledger.appendCustomEvent({ kind: 'verification.requested', jobId: 'job-verify', payload: { run_id: 'run-2', scope: 'web' } });
+      h.ledger.appendCustomEvent({ kind: 'verification.started', jobId: 'job-verify', payload: { run_id: 'run-2', scope: 'web' } });
       h.ledger.appendCustomEvent({ kind: 'verification.completed', jobId: 'job-verify', payload: { run_id: 'run-1', scope: 'full' } });
+      expect((await digestAt(h, at)).stalledWorking).toEqual([]);
+      // Run 2's own settlement releases the lane.
+      h.ledger.appendCustomEvent({ kind: 'verification.completed', jobId: 'job-verify', payload: { run_id: 'run-2', scope: 'web' } });
       expect((await digestAt(h, at)).stalledWorking.map((row) => row.jobId)).toEqual(['job-verify']);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a queued verification that never reached a runner owns the lane only inside the stall grace', async () => {
+    const h = makeLedger();
+    try {
+      reopenRepairPhase(h, 'job-queue');
+      const requested = h.ledger.appendCustomEvent({
+        kind: 'verification.requested', jobId: 'job-queue', payload: { run_id: 'run-dead', scope: 'full' },
+      });
+      const at = Date.parse(requested.ts);
+      // Inside the grace: the queued submission still owns the checkout.
+      expect((await digestAt(h, at + DEFAULT_SILAS_CONFIG.stallThresholdMs)).stalledWorking).toEqual([]);
+      // Past it: a request that never started is a ceased queue (a shutdown
+      // or disposal records no settlement), not a permanent owner.
+      expect(
+        (await digestAt(h, at + DEFAULT_SILAS_CONFIG.stallThresholdMs + 1)).stalledWorking.map((row) => row.jobId),
+      ).toEqual(['job-queue']);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a claimed provider continuation opens a repair phase without a status hop', async () => {
+    const h = makeLedger();
+    try {
+      // Delivered lane that never left `working` (fallback-review shape).
+      addJobWithDelivery(h.ledger, 'job-recovered');
+      const claim = h.ledger.appendCustomEvent({
+        kind: 'provider.recovery-claimed', jobId: 'job-recovered', payload: { wait_id: 'w-1', path: 'resumed' },
+      });
+      const claimedAt = Date.parse(claim.ts);
+      expect((await digestAt(h, claimedAt + DEFAULT_SILAS_CONFIG.stallThresholdMs)).stalledWorking).toEqual([]);
+      expect(
+        (await digestAt(h, claimedAt + DEFAULT_SILAS_CONFIG.stallThresholdMs + 1)).stalledWorking.map((row) => row.jobId),
+      ).toEqual(['job-recovered']);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a directive intent that never admitted work cannot reopen a genuinely delivered phase', async () => {
+    const h = makeLedger();
+    try {
+      addJobWithDelivery(h.ledger, 'job-noop');
+      const intent = h.ledger.beginDirectiveIntent({ jobId: 'job-noop', directive: 'no-op', holder: 'silas-ops' });
+      h.ledger.failDirective({ requestId: intent.record.requestId, reason: 'no lane and no minion' });
+      // Delivery is newer than the working hop and no admission ever landed:
+      // the phase is still delivered, not stalled.
+      expect((await digestAt(h, farFuture())).stalledWorking).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a fresh dispatch with no worker record is accepted startup, not lost work', async () => {
+    const h = makeLedger();
+    try {
+      h.ledger.addJob({ id: 'job-dispatch', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('job-dispatch', 'working');
+      const startedAt = Date.parse(h.ledger.latestJobEvent('job-dispatch', 'job.status')!.ts);
+      // Past the threshold: the dispatch turn still owns its accepted startup
+      // (a failed dispatch blocks the lane with error evidence). A crashed
+      // dispatch is restart recovery, a separate concern — never guessed as
+      // lost work here.
+      expect((await digestAt(h, startedAt + DEFAULT_SILAS_CONFIG.stallThresholdMs + 1)).stalledWorking).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a reopened phase binds its grace to the phase start, not the old idle worker stamp', async () => {
+    const h = makeLedger();
+    try {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date('2026-10-04T00:00:00.000Z'));
+        addJobWithDelivery(h.ledger, 'job-grace');
+        h.ledger.registerAgent({ id: 'min-old', role: 'minion', jobId: 'job-grace' });
+        h.ledger.setAgentState('min-old', 'idle');
+        const workerIdleAt = idleAt(h, 'min-old');
+        // Reopen five minutes later: the old idle stamp is older than the
+        // phase opening, so the fresh grace starts at the reopen.
+        vi.setSystemTime(new Date(workerIdleAt + 5 * 60_000));
+        h.ledger.setJobStatus('job-grace', 'delivered');
+        h.ledger.setJobStatus('job-grace', 'working');
+        const reopenedAt = Date.parse(h.ledger.latestJobEvent('job-grace', 'job.status')!.ts);
+        expect((await digestAt(h, reopenedAt + DEFAULT_SILAS_CONFIG.stallThresholdMs)).stalledWorking).toEqual([]);
+        // One millisecond past the reopen's own grace: visible.
+        expect(
+          (await digestAt(h, reopenedAt + DEFAULT_SILAS_CONFIG.stallThresholdMs + 1)).stalledWorking.map((row) => row.jobId),
+        ).toEqual(['job-grace']);
+      } finally {
+        vi.useRealTimers();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a supervised open turn owns the lane even when the ledger stamp is old; closing it lets the stall surface', async () => {
+    const h = makeLedger();
+    try {
+      reopenRepairPhase(h, 'job-open-turn');
+      h.ledger.registerAgent({ id: 'min-open', role: 'minion', jobId: 'job-open-turn' });
+      h.ledger.setAgentState('min-open', 'idle');
+      const at = farFuture();
+      const base: AgentSupervisionView = {
+        agentId: 'min-open', role: 'minion', slotId: null, state: 'watching', restarts: 0,
+        breakerOpen: false, stopReason: null, openTurn: true, openToolCalls: 0,
+        lastEventAt: null, lastFileBytes: null,
+      };
+      const digestOf = (view: AgentSupervisionView | null) =>
+        computeSilasDigest({
+          ledger: h.ledger,
+          blockersForRound: async () => ({ blockers: [], note: null }),
+          config: DEFAULT_SILAS_CONFIG,
+          trigger: 'sweep',
+          now: () => at,
+          supervisionFor: (agentId) => (agentId === 'min-open' ? view : null),
+        });
+      // A live open turn is active work, never a lost worker.
+      expect((await digestOf(base)).stalledWorking).toEqual([]);
+      // The same worker with the turn closed and only a stale stamp is silent.
+      expect((await digestOf({ ...base, openTurn: false })).stalledWorking.map((row) => row.jobId)).toEqual(['job-open-turn']);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a stalled offer is retracted when an owner lands while another job\'s blocker history is awaited', async () => {
+    const h = makeLedger();
+    try {
+      // The other job is created FIRST so its blocker report is awaited
+      // AFTER job-race (the more recently updated row) is visited.
+      h.ledger.addJob({ id: 'job-other', repo: 'fixture-app', title: 'other', briefing: 'b' });
+      h.ledger.setJobStatus('job-other', 'working');
+      const round = h.ledger.addRound({ jobId: 'job-other', lenses: ['blind'] });
+      h.ledger.setRoundStatus(round.id, 'live');
+      h.ledger.setRoundVerdict(round.id, 'changes-requested');
+      h.ledger.setJobStatus('job-other', 'in-review');
+      reopenRepairPhase(h, 'job-race');
+      const at = farFuture();
+      let raced = false;
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => {
+          if (!raced) {
+            raced = true;
+            // An accepted directive owns job-race while the await is open.
+            h.ledger.beginDirectiveIntent({ jobId: 'job-race', directive: 'repair', holder: 'silas-ops' });
+          }
+          return { blockers: [], note: null };
+        },
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+        now: () => at,
+      });
+      expect(raced).toBe(true);
+      expect(digest.stalledWorking).toEqual([]);
     } finally {
       h.cleanup();
     }

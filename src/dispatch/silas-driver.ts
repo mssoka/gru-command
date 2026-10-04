@@ -430,54 +430,119 @@ function latestAnsweringReviewRequest(ledger: DigestLedger, jobId: string): Even
   return winner;
 }
 
+/** The job's current phase-opening evidence. */
+interface CurrentPhaseStart {
+  /** Newest phase-opening event (the `working` hop or an explicit repair
+   * start); null when the ledger carries no phase-opening event. */
+  readonly event: EventRecord | null;
+  /** Event-sequence watermark of the newest phase-opening evidence. */
+  readonly seq: number;
+  /** Newest explicit repair start that need not flip status — a directive
+   * ADMISSION (`silas.directive-sent`, not the mere acceptance intent) or a
+   * claimed provider continuation; 0 when none. */
+  readonly repairStartSeq: number;
+}
+
 /** The newest explicit start of the job's CURRENT work phase that the digest
  * can read: the attempt start review admission uses (`openAttemptStartSeq` —
  * the latest `working` hop, never a `delivered → in-review` flip), plus the
- * explicit repair starts that never flip status — a directive request
- * accepted for dispatch (`silas.directive-intent`) and a claimed provider
- * continuation (`provider.recovery-claimed`). An older `job.delivered` at or
- * before this watermark is history from a previous phase, not proof that the
- * current phase delivered (issue #162). */
-function currentPhaseStart(ledger: DigestLedger, jobId: string): EventRecord | null {
-  const startSeq = openAttemptStartSeq(ledger, jobId);
+ * explicit repair starts that never flip status — a directive turn admitted
+ * for dispatch (`silas.directive-sent`; an acceptance intent that never
+ * admitted work is not a phase) and a claimed provider continuation
+ * (`provider.recovery-claimed`). An older `job.delivered` at or before this
+ * watermark is history from a previous phase, not proof that the current
+ * phase delivered (issue #162). */
+function currentPhaseStart(ledger: DigestLedger, jobId: string): CurrentPhaseStart {
+  const statusHopSeq = openAttemptStartSeq(ledger, jobId);
   const statusEvent = ledger.latestJobEvent(jobId, 'job.status');
-  let newestSeq = startSeq;
-  let newest: EventRecord | null = statusEvent !== null && statusEvent.seq === startSeq ? statusEvent : null;
-  for (const kind of ['silas.directive-intent', 'provider.recovery-claimed']) {
-    const event = ledger.latestJobEvent(jobId, kind);
-    if (event !== null && event.seq > newestSeq) {
-      newestSeq = event.seq;
-      newest = event;
+  let seq = statusHopSeq;
+  let event: EventRecord | null = statusEvent !== null && statusEvent.seq === statusHopSeq ? statusEvent : null;
+  let repairStartSeq = 0;
+  for (const kind of ['silas.directive-sent', 'provider.recovery-claimed']) {
+    const repair = ledger.latestJobEvent(jobId, kind);
+    if (repair !== null && repair.seq > repairStartSeq) repairStartSeq = repair.seq;
+    if (repair !== null && repair.seq > seq) {
+      seq = repair.seq;
+      event = repair;
     }
   }
-  return newest;
+  return { event, seq, repairStartSeq };
 }
 
-/** Verification lifecycle kinds that mean a run currently owns the checkout
- * (submitted or started), and the kinds that settle that ownership. */
-const VERIFICATION_OPEN_EVENTS = ['verification.requested', 'verification.started'] as const;
-const VERIFICATION_SETTLED_EVENTS = [
+/** Verification lifecycle kinds that own the checkout while they are a run's
+ * newest event, and the kinds that settle that run. `verification.attached`
+ * is deliberately neither: the scheduler emits it when a second caller joins
+ * a still queued/running attempt (issue #159), so it can never settle one. */
+const VERIFICATION_OPEN_EVENTS: ReadonlySet<string> = new Set([
+  'verification.requested',
+  'verification.started',
+]);
+const VERIFICATION_SETTLED_EVENTS: ReadonlySet<string> = new Set([
   'verification.completed',
-  'verification.attached',
   'verification.stale-released',
   'verification.reconciled',
   'verification.lock-timeout',
-] as const;
+]);
 
-/** True while a verification owns the lane: its newest lifecycle event is an
- * un-settled request/start (a submitted or running run holds the checkout; a
- * lock timeout, completion, attach or reconciliation settles it). */
-function verificationInFlight(ledger: DigestLedger, jobId: string): boolean {
-  let openSeq = 0;
-  for (const kind of VERIFICATION_OPEN_EVENTS) {
-    const event = ledger.latestJobEvent(jobId, kind);
-    if (event !== null && event.seq > openSeq) openSeq = event.seq;
+/** The run id a verification lifecycle event is keyed by (null when the
+ * payload carries none — such an event cannot name an owner). */
+function verificationRunId(event: EventRecord): string | null {
+  if (typeof event.payload !== 'object' || event.payload === null) return null;
+  const runId = (event.payload as { run_id?: unknown }).run_id;
+  return typeof runId === 'string' && runId !== '' ? runId : null;
+}
+
+/** True while a verification owns the lane. Runs are tracked by run id: one
+ * run's settlement never releases another run's checkout. A `started` run
+ * owns until its own terminal event (the scheduler's stale sweep settles an
+ * orphan). A `requested` run that never reached `started` owns only inside
+ * the stall grace: past it the submission is a ceased queue (a shutdown or
+ * disposal before admission records no settlement), not a checkout owner. */
+function verificationInFlight(
+  ledger: DigestLedger,
+  jobId: string,
+  nowMs: number,
+  stallThresholdMs: number,
+): boolean {
+  const openByRun = new Map<string, EventRecord>();
+  const settledSeqByRun = new Map<string, number>();
+  for (const event of ledger.listJobEvents(jobId, { limit: 400 })) {
+    if (!event.kind.startsWith('verification.')) continue;
+    const runId = verificationRunId(event);
+    if (runId === null) continue;
+    if (VERIFICATION_OPEN_EVENTS.has(event.kind)) {
+      const current = openByRun.get(runId);
+      if (current === undefined || event.seq > current.seq) openByRun.set(runId, event);
+    } else if (VERIFICATION_SETTLED_EVENTS.has(event.kind)) {
+      const current = settledSeqByRun.get(runId);
+      if (current === undefined || event.seq > current) settledSeqByRun.set(runId, event.seq);
+    }
   }
-  if (openSeq === 0) return false;
-  for (const kind of VERIFICATION_SETTLED_EVENTS) {
-    const event = ledger.latestJobEvent(jobId, kind);
-    if (event !== null && event.seq > openSeq) return false;
+  for (const [runId, open] of openByRun) {
+    if ((settledSeqByRun.get(runId) ?? 0) > open.seq) continue; // this run settled
+    if (open.kind === 'verification.started') return true;
+    const at = Date.parse(open.ts);
+    if (!Number.isFinite(at) || nowMs - at <= stallThresholdMs) return true;
   }
+  return false;
+}
+
+/** Final publish-boundary recheck for a proposed stalled row: the lane may
+ * have delivered, gone terminal, or gained an owner while a later job's
+ * blocker history was awaited. Recomputes the cheap ownership facts only;
+ * a stale offer is retracted, never published (no duplicate writers). */
+function stallStillEligible(input: ComputeDigestInput, jobId: string, nowMs: number): boolean {
+  const ledger = input.ledger;
+  const job = ledger.getJob(jobId);
+  if (job === null || job.status !== 'working') return false;
+  const delivered = ledger.latestJobEvent(jobId, 'job.delivered');
+  const phaseStart = currentPhaseStart(ledger, jobId);
+  if (delivered !== null && delivered.seq > phaseStart.seq) return false;
+  if (ledger.listPendingRebriefs({ jobId }).length > 0) return false;
+  if (ledger.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES }).length > 0) return false;
+  if (verificationInFlight(ledger, jobId, nowMs, input.config.stallThresholdMs)) return false;
+  const review = latestAnsweringReviewRequest(ledger, jobId);
+  if (review !== null && review.seq > phaseStart.seq) return false;
   return true;
 }
 
@@ -567,8 +632,24 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       deliveredTargetSha(delivered) !== null && deliveredTargetSha(delivered) === newestRound.targetRef &&
       !(answeringRequest !== null && answeringRequest.seq > (abortProof?.seq ?? 0));
 
+    // The CURRENT phase's opening evidence: the shared attempt start plus
+    // explicit repair starts (issue #162). A `job.delivered` at/before this
+    // watermark is history; only a newer delivery — or the clean
+    // service-restart abort on the unchanged delivered head, until an
+    // explicit repair start supersedes that state — proves the current
+    // phase delivered. Rows (1) and (2) use the same fact, so a reopened
+    // repair is never offered a PR/review step for the old head while the
+    // current phase is open.
+    const phaseStart = job.status === 'working' ? currentPhaseStart(input.ledger, job.id) : null;
+    const phaseStartSeq = phaseStart?.seq ?? 0;
+    const repairStartSeq = phaseStart?.repairStartSeq ?? 0;
+    const currentPhaseDelivered = delivered !== null && (
+      delivered.seq > phaseStartSeq ||
+      (cleanAbort && repairStartSeq <= (abortProof?.seq ?? 0))
+    );
+
     // (1) Delivered, no PR yet.
-    if (delivered !== null && job.prUrl === null && rounds.length === 0) {
+    if (delivered !== null && currentPhaseDelivered && job.prUrl === null && rounds.length === 0) {
       const lane = (input.worktrees?.listWorktrees({ jobId: job.id }) ?? []).find((candidate) => candidate.kind === 'job');
       const minion = input.ledger
         .listAgents()
@@ -593,7 +674,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     // first review, re-review or clean-abort rearm.
     const reviewPending = job.status === 'working' || job.status === 'delivered' || job.status === 'in-review';
     const rebriefPending = pendingRebriefJobIds.has(job.id);
-    if (job.prUrl !== null && reviewPending && !rebriefPending) {
+    if (currentPhaseDelivered && job.prUrl !== null && reviewPending && !rebriefPending) {
       if (cleanAbort && newestRound !== null) {
         digest.prWithoutReview.push({ jobId: job.id, repo: job.repo, prUrl: job.prUrl,
           priorRounds: rounds.length, cleanAbort: { roundId: newestRound.id, ruleId: 'clean-abort-service-restart' } });
@@ -676,18 +757,12 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     // re-arm included). Ownership the digest cannot read fails closed: no
     // competing continuation is offered for a phase another operation may
     // still be driving.
-    const phaseStart = job.status === 'working' ? currentPhaseStart(input.ledger, job.id) : null;
     const stallOperationOwns = job.status !== 'working' ||
       pendingRebriefJobIds.has(job.id) ||
       input.ledger.listPendingDirectives({ jobId: job.id, states: LIVE_DIRECTIVE_STATES }).length > 0 ||
-      verificationInFlight(input.ledger, job.id) ||
-      cleanAbort ||
-      (answeringRequest !== null && answeringRequest.seq > (phaseStart?.seq ?? 0));
-    if (
-      job.status === 'working' &&
-      !(delivered !== null && delivered.seq > (phaseStart?.seq ?? 0)) &&
-      !stallOperationOwns
-    ) {
+      verificationInFlight(input.ledger, job.id, now(), input.config.stallThresholdMs) ||
+      (answeringRequest !== null && answeringRequest.seq > phaseStartSeq);
+    if (job.status === 'working' && !currentPhaseDelivered && !stallOperationOwns) {
       const boundMinions = input.ledger
         .listAgents()
         .filter((agent) => agent.jobId === job.id && agent.role === 'minion');
@@ -706,8 +781,39 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
         const supervision = viewOf(agent);
         return supervision !== null && (supervision.state === 'stopped' || supervision.breakerOpen === true);
       };
-      const stampOf = (agent: (typeof boundMinions)[number]): number =>
-        agent.lastActivity === null ? Number.NaN : Date.parse(agent.lastActivity);
+      // Issue #171 parity: the silence clock is the newest of the ledger
+      // stamp and the supervisor's own event clock — a long turn whose row
+      // was not rewritten still has fresh supervision evidence.
+      const stampOf = (agent: (typeof boundMinions)[number]): number => {
+        const ledgerMs = agent.lastActivity === null ? Number.NaN : Date.parse(agent.lastActivity);
+        const supervision = viewOf(agent)?.lastEventAt ?? null;
+        const supervisionMs = supervision === null ? Number.NaN : Date.parse(supervision);
+        if (Number.isFinite(supervisionMs) && (!Number.isFinite(ledgerMs) || supervisionMs > ledgerMs)) {
+          return supervisionMs;
+        }
+        return ledgerMs;
+      };
+      // Positive live ownership: an open turn, control phase or tool call is
+      // live work (the board's derivedStatus treats it as streaming), never
+      // a lost worker — the stall channel must never duplicate it.
+      const hasOpenWork = (agent: (typeof boundMinions)[number]): boolean => {
+        const supervision = viewOf(agent);
+        return supervision !== null &&
+          (supervision.openTurn || supervision.openControl === true || supervision.openToolCalls > 0);
+      };
+      // A REPAIR phase's own opening is the grace floor: a worker stamp
+      // from before the reopen must not make the fresh phase look silent.
+      // An initial phase keeps its worker's own registration/activity as
+      // the floor (there is no reopen to bound against).
+      const repairPhase = repairStartSeq > 0 || (delivered !== null && delivered.seq <= phaseStartSeq);
+      const phaseStartMs = repairPhase && phaseStart?.event !== null && phaseStart?.event !== undefined
+        ? Date.parse(phaseStart.event.ts)
+        : Number.NaN;
+      const boundedClock = (agentMs: number): number => {
+        if (!Number.isFinite(phaseStartMs)) return agentMs;
+        if (!Number.isFinite(agentMs)) return phaseStartMs;
+        return Math.max(agentMs, phaseStartMs);
+      };
       // Stop recency follows the recorded stop time when the supervisor
       // view provides it, else the last frame (code review 2026-10-04).
       const stopStampOf = (agent: (typeof boundMinions)[number]): number => {
@@ -723,6 +829,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
         // A disposed record is not a live worker, supervised or not (A2).
         return agent.state !== 'disposed';
       });
+      const openWork = live.some(hasOpenWork);
       const newestKnown = (stamps: readonly number[]): number | null =>
         stamps.filter(Number.isFinite).reduce<number | null>((best, at) => (best === null || at > best ? at : best), null);
       const hasStop = boundMinions.some(stopExempt);
@@ -736,13 +843,19 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
         hasStop &&
         !hasUnknownLive &&
         (live.length === 0 || (stopAt !== null && liveAt !== null && stopAt > liveAt));
-      if (!waiting) {
+      // A repair phase whose worker record is missing (never registered, or
+      // lost) is surfaced after its own grace. An initial dispatch with no
+      // record stays fail-closed: its startup is owned by the dispatch
+      // turn, which blocks the lane with error evidence if it fails — a
+      // crashed dispatch is restart recovery, a separate concern (issue
+      // #162); its accepted startup must never be called lost work.
+      if (!waiting && !openWork) {
         const pool = live.length > 0 ? live : boundMinions.filter((agent) => !stopExempt(agent));
         const minion = pool.sort((a, b) =>
           (b.lastActivity ?? b.createdAt).localeCompare(a.lastActivity ?? a.createdAt),
         )[0];
         if (minion !== undefined) {
-          const lastMs = Date.parse(minion.lastActivity ?? minion.createdAt);
+          const lastMs = boundedClock(Date.parse(minion.lastActivity ?? minion.createdAt));
           if (Number.isFinite(lastMs) && now() - lastMs > input.config.stallThresholdMs) {
             digest.stalledWorking.push({
               jobId: job.id,
@@ -753,13 +866,8 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
               idleMs: now() - lastMs,
             });
           }
-        } else if (boundMinions.length === 0 && phaseStart !== null) {
-          // No worker record at all (never registered, or the record was
-          // lost): the phase start is the only honest clock. Past the same
-          // grace the lane is surfaced with absent coordinates — Silas
-          // assesses; nothing spawns here. Accepted startup windows are
-          // covered by the operation fences above and by this very window.
-          const startedMs = Date.parse(phaseStart.ts);
+        } else if (boundMinions.length === 0 && phaseStart !== null && phaseStart.event !== null && repairPhase) {
+          const startedMs = Date.parse(phaseStart.event.ts);
           if (Number.isFinite(startedMs) && now() - startedMs > input.config.stallThresholdMs) {
             digest.stalledWorking.push({
               jobId: job.id,
@@ -806,6 +914,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       return job !== null && job.status !== 'merged' && job.status !== 'done' &&
         input.ledger.listPendingRebriefs({ jobId: row.jobId }).length === 0;
     }),
+    stalledWorking: digest.stalledWorking.filter((row) => stallStillEligible(input, row.jobId, now())),
   };
 }
 
