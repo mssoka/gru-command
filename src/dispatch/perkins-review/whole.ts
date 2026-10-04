@@ -1647,11 +1647,16 @@ export class PerkinsWholeReview {
         await lead?.dispose();
       } catch (disposeError) {
         if (!returningAccepted) throw disposeError;
-        // The sealed result outranks cleanup, but cleanup failure must
-        // remain independently visible beside the accepted record.
-        writeReviewArtifact(review, 'lead/dispose-error.json', {
-          error: sanitizeError(disposeError), agentId: lead!.id,
-        });
+        // The sealed result outranks cleanup, including a failure to record
+        // the cleanup failure. Keep the error visible to operators if the
+        // artifact store itself cannot accept the note.
+        try {
+          writeReviewArtifact(review, 'lead/dispose-error.json', {
+            error: sanitizeError(disposeError), agentId: lead!.id,
+          });
+        } catch (recordingError) {
+          console.error(`Perkins lead disposal failed: ${sanitizeError(disposeError)}; could not record cleanup evidence: ${sanitizeError(recordingError)}`);
+        }
       }
     };
     try {

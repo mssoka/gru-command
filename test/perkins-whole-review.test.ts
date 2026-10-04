@@ -2064,6 +2064,30 @@ describe('provider pacing: workflow rate-limit retry and cleanup', () => {
     expect(gate.view().review).toMatchObject({ running: 0, queued: [] });
   });
 
+  it('#86 preserves a sealed review even when cleanup evidence cannot be written', async () => {
+    let directory = '';
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const h = wholeHarness({
+      ...ALL_CLEAN,
+      disposeRejects: (call) => {
+        if (call.options.reviewLead === undefined) return false;
+        chmodSync(join(directory, 'lead'), 0o500);
+        return true;
+      },
+    });
+    directory = h.frozen.directory;
+    try {
+      const result = await h.run();
+      expect(result.canonicalVerdict).toBe('READY TO MERGE');
+      expect(existsSync(join(directory, 'consolidated.json'))).toBe(true);
+      expect(existsSync(join(directory, 'lead/dispose-error.json'))).toBe(false);
+      expect(log).toHaveBeenCalledWith(expect.stringMatching(/Perkins lead disposal failed:.*could not record cleanup evidence:.*EACCES/));
+    } finally {
+      chmodSync(join(directory, 'lead'), 0o700);
+      log.mockRestore();
+    }
+  });
+
   it('#86 propagates lead disposal failure when no terminal submission was accepted', async () => {
     const h = wholeHarness({ ...ALL_CLEAN, neverSubmit: true, disposeRejects: (call) => call.options.reviewLead !== undefined });
     await expect(h.run()).rejects.toThrow('simulated session dispose failure');
