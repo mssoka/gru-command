@@ -213,7 +213,12 @@ authorizes its full completion cycle, and YOU own driving it:
 
      node <capture-helper> run --job <job> --scope full \
        --sink <data-dir>/captures/<job>-<scope>-<head>.ndjson \
-       --request-id <stable-id> --url <base> --config <configPath>
+       --request-id <stable-id> --expected-head <head-to-verify> \
+       --url <base> --config <configPath>
+
+   Pin the head you intend to verify (`git -C <lane> rev-parse HEAD`): a
+   lane that moves while the request waits fails `head_changed` instead of
+   silently verifying the new revision.
 
    The helper opens a UNIQUE EXCLUSIVE sink before the POST (an existing
    sink is a typed refusal — never truncated or shared), streams every

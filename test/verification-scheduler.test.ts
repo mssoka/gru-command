@@ -490,6 +490,9 @@ describe('verification scheduler — global budget', () => {
     const attached = secondFrames[0] as Extract<VerificationProgress, { type: 'attached' }>;
     expect(attached.runId).toBe(firstOutcome.runId);
     expect(['queued', 'running']).toContain(attached.state);
+    // The acknowledgement is private to the attacher: the existing stream
+    // never receives another client's request identity.
+    expect(firstFrames.some((frame) => frame.type === 'attached')).toBe(false);
     expect(records.filter((record) => record.kind === 'verification.started')).toHaveLength(1);
     expect(records.filter((record) => record.kind === 'verification.completed')).toHaveLength(1);
     expect(records.filter((record) => record.kind === 'verification.attached')).toHaveLength(1);

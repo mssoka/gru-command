@@ -1304,7 +1304,9 @@ export class VerificationScheduler {
         state: attempt.started ? 'running' : 'queued',
       },
     });
-    await this.broadcast(attempt, {
+    // The attach acknowledgement is for THIS caller only — existing
+    // subscribers must not receive another client's request identity.
+    await this.broadcastTo(attempt, sink, {
       type: 'attached',
       runId: attempt.runId,
       state: attempt.started ? 'running' : 'queued',
@@ -1315,14 +1317,38 @@ export class VerificationScheduler {
     // A terminal frame is enqueued with a snapshot of the sinks that existed
     // at that instant. An attach whose `attached` frame was queued after that
     // snapshot would otherwise end at EOF without a completed frame: deliver
-    // the recorded outcome to this sink explicitly.
+    // the recorded outcome to this sink explicitly (still queue-ordered).
     if (attempt.outcome !== null) {
-      await this.writeFrame(sink, {
+      await this.broadcastTo(attempt, sink, {
         type: 'completed',
         runId: attempt.runId,
         outcome: attempt.outcome,
       });
     }
+  }
+
+  /**
+   * Queue a frame for ONE sink only, preserving this attempt's frame order.
+   * Used by attach() so the acknowledgement and a late terminal frame stay
+   * private to the attaching caller while output frames go to every sink.
+   */
+  private broadcastTo(
+    attempt: Attempt,
+    sink: VerificationProgressSink,
+    frame: VerificationProgress,
+  ): Promise<void> {
+    attempt.queue = attempt.queue.then(async () => {
+      try {
+        await sink(frame);
+      } catch (error) {
+        attempt.sinks.delete(sink);
+        this.log('warn', 'verification sink write failed; sink dropped', {
+          run: attempt.runId,
+          error: String(error),
+        });
+      }
+    });
+    return attempt.queue;
   }
 
   /**
