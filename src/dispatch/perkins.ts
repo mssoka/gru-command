@@ -30,6 +30,7 @@ import { loadPerkinsPolicy, type PerkinsLens, type PerkinsPolicy } from './perki
 import {
   freezeReviewInputs,
   refMovedSinceFreeze,
+  sourceMovementSinceFreeze,
   resolveGitCommit,
   resolveReviewBaseRef,
   reviewArtifactDirectory,
@@ -2922,7 +2923,8 @@ export class WaveRunner {
     try {
       if (signal.aborted) throw new Error('review operation aborted before finalization');
       const results = this.recordLensResults(round, lenses, review);
-      const headMoved = review.headMoved || refMovedSinceFreeze(frozenReview);
+      const sourceMovement = review.sourceMovement ?? sourceMovementSinceFreeze(frozenReview);
+      const headMoved = review.headMoved || sourceMovement !== null;
     const canonical: CanonicalReviewVerdict = headMoved ? 'INCOMPLETE' : review.canonicalVerdict;
     let reportFile = review.reportFile;
     if (headMoved && review.canonicalVerdict !== 'INCOMPLETE') {
@@ -2931,7 +2933,7 @@ export class WaveRunner {
         '',
         '**Verdict: INCOMPLETE**',
         '',
-        `The source ref \`${movementRef}\` or frozen checkout changed after target \`${review.targetSha}\` was frozen.`,
+        `The review source changed after target \`${review.targetSha}\` was frozen (${sourceMovement?.cause ?? 'check-failed'}: ${sourceMovement?.detail ?? 'source movement was observed at submission'}).`,
         'The lead-authored report remains preserved as `perkins-report.md`, but it cannot authorize approval or posting.',
         '',
       ].join('\n'));
@@ -2946,7 +2948,7 @@ export class WaveRunner {
         kind: 'round.head-moved',
         jobId: job.id,
         roundId: round.id,
-        payload: { frozenTarget: review.targetSha, observedRef: movementRef },
+        payload: { frozenTarget: review.targetSha, observedRef: movementRef, cause: sourceMovement?.cause ?? 'check-failed', detail: sourceMovement?.detail ?? 'source movement was observed at submission' },
       });
     }
 
@@ -3035,7 +3037,8 @@ export class WaveRunner {
       };
       try {
         if (signal.aborted) throw new Error('review operation aborted before report delivery');
-        if (refMovedSinceFreeze(frozenReview)) throw new Error('source head/base moved immediately before report delivery');
+        const beforeDelivery = sourceMovementSinceFreeze(frozenReview);
+        if (beforeDelivery !== null) throw new Error(`source changed immediately before report delivery (${beforeDelivery.cause}: ${beforeDelivery.detail})`);
         const { prUrl, publicationBody } = deliveryInput();
         const publicationFile = writeReviewArtifact(frozenReview, 'perkins-report.publication.md', publicationBody);
         const publicationSha256 = createHash('sha256').update(publicationBody).digest('hex');
@@ -3051,7 +3054,8 @@ export class WaveRunner {
           { targetSha: review.targetSha, bodySha256: publicationSha256 },
         );
         if (signal.aborted) throw new Error('review operation aborted while the report was being delivered');
-        if (refMovedSinceFreeze(frozenReview)) throw new Error('source head/base moved while the report was being delivered');
+        const duringDelivery = sourceMovementSinceFreeze(frozenReview);
+        if (duringDelivery !== null) throw new Error(`source changed while the report was being delivered (${duringDelivery.cause}: ${duringDelivery.detail})`);
         recordDelivery(delivered, publicationFile, publicationSha256, false);
       } catch (error) {
         // Ambiguous publication (the provider may have committed our POST
@@ -3094,10 +3098,11 @@ export class WaveRunner {
               // (T4): a receipt discovered while the ref moved (or the
               // operation aborted) is preserved as evidence but never
               // recorded as delivery — the changed head was not reviewed.
-              if (signal.aborted || refMovedSinceFreeze(frozenReview)) {
+              const duringReconciliation = signal.aborted ? null : sourceMovementSinceFreeze(frozenReview);
+              if (signal.aborted || duringReconciliation !== null) {
                 const reason = signal.aborted
                   ? 'review operation aborted while the reconciliation lookup was outstanding'
-                  : 'source head/base moved while the reconciliation lookup was outstanding';
+                  : `source changed while the reconciliation lookup was outstanding (${duringReconciliation!.cause}: ${duringReconciliation!.detail})`;
                 try {
                   writeReviewArtifact(frozenReview, 'perkins-report.reconciled-unrecorded.json', {
                     recorded: false, reconciled: true, reason,
