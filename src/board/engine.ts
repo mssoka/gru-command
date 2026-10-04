@@ -18,6 +18,7 @@ import {
 } from '../ledger/api.js';
 import { LIVE_DIRECTIVE_STATES } from '../ledger/directives.js';
 import type { JobStatus } from '../ledger/states.js';
+import type { EventRecord } from '../ledger/api.js';
 
 /** Newest closed receipts kept in every snapshot (D3): older ones are
  * served by the paged `GET /api/notifications/receipts` route. */
@@ -281,10 +282,10 @@ const SILAS_ACTION_KINDS = [
   'silas.directive-settled',
   'silas.rebrief',
   'silas.escalated',
-  // Pass-owned marked-phase completion: machine follow-through the
-  // deterministic pass finishes (a generic obligation write by an
-  // unrelated lane is deliberately NOT counted here).
-  'job.phase-handoff-completed',
+  // Pass-ATTRIBUTED progress: emitted only by the deterministic pass when
+  // it actually advanced durable work (a generic phase-completion or
+  // obligation event from an unrelated lane is deliberately NOT counted).
+  'silas.reconcile-advanced',
 ] as const;
 
 /** PR state from the record: a terminal `merged` job is merged; a
@@ -650,30 +651,75 @@ export class BoardEngine {
   }
 
   /** The oldest live debt as the durable next action (issue #163): a live
-   * obligation, else a live directive request (admission-unknown or
-   * awaiting receipt). Verification waits and failures are carried by the
-   * digest; the card never claims "no action owed" — it says no tracked
-   * obligation. Per-row-isolated decode: one malformed obligation must
-   * never blind the whole board. */
+   * obligation, else a live directive request, else the newest recorded
+   * verification wait its own scope has not answered. Every read is
+   * state-filtered before any bound and per-row isolated, so settled
+   * history or one damaged row can never blank the board's projection. */
   private nextActionProjection(): string | null {
-    const obligations = this.ledger.listObligationsDetailed({ limit: 50 }).readable;
-    const obligation = obligations.find((row) => row.state === 'open' || row.state === 'waiting');
-    if (obligation !== undefined) {
-      const next = obligation.nextAction;
-      const detail =
-        next.kind === 'silas-mechanical'
-          ? next.action
-          : next.kind === 'external-wait'
-            ? next.condition
-            : next.decision;
-      const bounded = detail.length > 120 ? `${detail.slice(0, 117)}...` : detail;
-      return `${next.kind}: ${bounded} (${obligation.jobId})`;
+    for (const state of ['open', 'waiting'] as const) {
+      const row = this.ledger.listObligationsDetailed({ state, limit: 5 }).readable[0];
+      if (row !== undefined) {
+        const next = row.nextAction;
+        const detail =
+          next.kind === 'silas-mechanical'
+            ? next.action
+            : next.kind === 'external-wait'
+              ? next.condition
+              : next.decision;
+        const bounded = detail.length > 120 ? `${detail.slice(0, 117)}...` : detail;
+        return `${next.kind}: ${bounded} (${row.jobId})`;
+      }
     }
-    const directive = this.ledger.listPendingDirectives({ states: LIVE_DIRECTIVE_STATES, limit: 1 })[0];
-    if (directive !== undefined) {
-      return `directive ${directive.requestId}: ${directive.state} (${directive.jobId})`;
+    try {
+      const directive = this.ledger.listPendingDirectives({ states: LIVE_DIRECTIVE_STATES, limit: 1 })[0];
+      if (directive !== undefined) {
+        return `directive ${directive.requestId}: ${directive.state} (${directive.jobId})`;
+      }
+    } catch (error) {
+      // One malformed directive row must never take the board down; the
+      // malformed debt stays visible to the boot reconciler instead.
+      this.log?.('error', 'silas health: live directive read failed', { error: String(error) });
     }
-    return null;
+    return this.verificationWaitProjection();
+  }
+
+  /** The newest recorded verification wait that its own scope has not
+   * answered (a newer same-scope completion/request retires it). */
+  private verificationWaitProjection(): string | null {
+    const timeout = this.ledger.latestEventOfKinds(['verification.lock-timeout']);
+    if (timeout === null || timeout.jobId === null) return null;
+    const scope =
+      typeof timeout.payload === 'object' && timeout.payload !== null
+        ? ((timeout.payload as { scope?: unknown }).scope ?? null)
+        : null;
+    const scopeLabel = typeof scope === 'string' && scope !== '' ? scope : null;
+    const scoped = this.ledger.latestJobEventsByPayloadScope(timeout.jobId, [
+      'verification.completed',
+      'verification.lock-timeout',
+      'verification.requested',
+    ]);
+    let latestTimeout: EventRecord | null = null;
+    let latestAnswer: EventRecord | null = null;
+    for (const event of scoped) {
+      const eventScope =
+        typeof event.payload === 'object' && event.payload !== null
+          ? (event.payload as { scope?: unknown }).scope
+          : undefined;
+      if (scopeLabel !== null && eventScope !== scopeLabel) continue;
+      if (event.kind === 'verification.lock-timeout') {
+        if (latestTimeout === null || event.seq > latestTimeout.seq) latestTimeout = event;
+      } else if (latestAnswer === null || event.seq > latestAnswer.seq) {
+        latestAnswer = event;
+      }
+    }
+    if (latestTimeout === null) return null;
+    if (latestAnswer !== null && latestAnswer.seq > latestTimeout.seq) return null;
+    const head =
+      typeof latestTimeout.payload === 'object' && latestTimeout.payload !== null
+        ? (latestTimeout.payload as { head?: unknown }).head
+        : null;
+    const headLabel = typeof head === 'string' && head !== '' ? head : 'head unrecorded';
+    return `verification wait: ${scopeLabel ?? 'scope unrecorded'}@${headLabel} (${timeout.jobId})`;
   }
 
   /** Repo-grouped job views (the group map preserves ledger job order). */

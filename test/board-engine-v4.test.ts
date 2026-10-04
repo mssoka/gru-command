@@ -177,10 +177,58 @@ describe('board engine — v4 snapshot blocks', () => {
     expect(silas.lastUsefulActionAt).toBe(settled.ts);
     expect(silas.reconciliationsToday).toBe(1);
 
-    // Pass-owned marked-phase completion is machine follow-through too.
-    const phase = api.appendCustomEvent({ kind: 'job.phase-handoff-completed', jobId: job.id, payload: {} });
+    // Pass-ATTRIBUTED progress is machine follow-through too; a generic
+    // phase/obligation event from another lane is not credited to Silas.
+    const advanced = api.appendCustomEvent({ kind: 'silas.reconcile-advanced', jobId: job.id, payload: { advanced: 1 } });
     const afterPhase = engine.snapshot().silas;
-    expect(afterPhase.lastUsefulActionAt).toBe(phase.ts);
+    expect(afterPhase.lastUsefulActionAt).toBe(advanced.ts);
     expect(afterPhase.reconciliationsToday).toBe(2);
+  });
+
+  it('keeps the durable next action visible behind settled history and names a verification wait (#163 review)', () => {
+    const { api, engine } = fresh({ now: () => Date.now() });
+    api.addJob({ id: 'job-history', repo: 'demo', title: 't', briefing: 'b' });
+    api.setJobStatus('job-history', 'working');
+    // 50 dispositioned (suspended) obligations precede the live one.
+    for (let i = 0; i < 50; i += 1) {
+      const row = api.recordBlockedObservation('job-history', {
+        logicalStep: 'operation',
+        category: { kind: 'unknown' },
+        incidentKey: `settled-${i}`,
+        observedAtSeq: api.latestEventSeq(),
+      });
+      api.suspendObligation(row.id, 'dispositioned history');
+    }
+    api.addJob({ id: 'job-live-next', repo: 'demo', title: 't', briefing: 'b' });
+    api.setJobStatus('job-live-next', 'working');
+    api.recordBlockedObservation('job-live-next', {
+      logicalStep: 'operation',
+      category: { kind: 'unknown' },
+      observedAtSeq: api.latestEventSeq(),
+    });
+    const projected = engine.snapshot().silas.nextAction;
+    expect(projected).toContain('job-live-next');
+    expect(projected).toContain('gru-decision');
+
+    // A recorded verification wait with no same-scope answer is named as
+    // the wait reason.
+    const { api: waitApi, engine: waitEngine } = fresh({ now: () => Date.now() });
+    waitApi.addJob({ id: 'job-wait-health', repo: 'demo', title: 't', briefing: 'b' });
+    waitApi.setJobStatus('job-wait-health', 'working');
+    waitApi.appendCustomEvent({
+      kind: 'verification.lock-timeout',
+      jobId: 'job-wait-health',
+      payload: { scope: 'full', request_id: 'req-h', head: 'head-h', wait_ms: 1_000 },
+    });
+    const waiting = waitEngine.snapshot().silas.nextAction;
+    expect(waiting).toContain('verification wait');
+    expect(waiting).toContain('full@head-h');
+    // A same-scope completion answers it.
+    waitApi.appendCustomEvent({
+      kind: 'verification.completed',
+      jobId: 'job-wait-health',
+      payload: { ok: true, scope: 'full', run_id: 'run-h', sha: 'head-h' },
+    });
+    expect(waitEngine.snapshot().silas.nextAction).toBeNull();
   });
 });

@@ -490,9 +490,10 @@ function verificationResubmitted(
   head: string | null,
   sinceSeq: number,
 ): boolean {
-  if (scope === null) {
-    return (ledger.latestJobEvent(jobId, 'verification.requested')?.seq ?? -1) > sinceSeq;
-  }
+  // No recorded scope means no correlated identity: an unrelated scoped
+  // request must NEVER retire this debt (it stays until a completion in
+  // its own recorded scope, if any).
+  if (scope === null) return false;
   const values: { readonly key: string; readonly value: string }[] = [{ key: 'scope', value: scope }];
   if (head !== null) values.push({ key: 'head', value: head });
   return ledger.hasJobEventWithPayloadValues(jobId, ['verification.requested'], values, sinceSeq);
@@ -1327,6 +1328,12 @@ export class SilasDriver {
           wake_in_flight: wakeInFlight,
           ...(outcome.counts === null ? {} : { counts: outcome.counts }),
         });
+        // Pass-ATTRIBUTED progress: only the deterministic pass emits this
+        // marker, so health never credits unrelated lanes' transitions.
+        const advanced = outcome.counts === null ? 0 : outcome.counts['advanced'];
+        if (typeof advanced === 'number' && advanced > 0) {
+          this.recordHealthEvent('silas.reconcile-advanced', { trigger, advanced });
+        }
       } else {
         // A failed pass is recorded under its own kind so the board's
         // completed-reconciliation timestamp can never be advanced by a

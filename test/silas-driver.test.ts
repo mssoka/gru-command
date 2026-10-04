@@ -2490,4 +2490,118 @@ describe('silas deterministic pass observation (issue #163)', () => {
       h.cleanup();
     }
   });
+  it('records pass-attributed progress only when the pass actually advanced work', async () => {
+    const h = makeDriver({
+      onDeterministicPass: (context) => ({ ok: true, advanced: context.trigger === 'sweep' ? 1 : 0 }),
+    });
+    try {
+      addJobWithDelivery(h.ledger, 'job-advanced');
+      await h.driver.trigger({ kind: 'sweep' });
+      const marks = h.ledger.listEvents({ limit: 100 }).filter((event) => event.kind === 'silas.reconcile-advanced');
+      expect(marks).toHaveLength(1);
+      expect(marks[0]?.payload).toMatchObject({ trigger: 'sweep', advanced: 1 });
+      await h.driver.trigger({ kind: 'job.delivered', jobId: 'job-advanced' });
+      expect(h.ledger.listEvents({ limit: 100 }).filter((event) => event.kind === 'silas.reconcile-advanced')).toHaveLength(1);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('attachments and pre-existing attempts starting do NOT answer a headless verification debt', async () => {
+    const h = makeLedger();
+    try {
+      h.ledger.addJob({ id: 'job-started', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('job-started', 'working');
+      h.ledger.appendCustomEvent({
+        kind: 'verification.completed',
+        jobId: 'job-started',
+        payload: { ok: false, scope: 'full', run_id: 'run-s', exit_code: 1 },
+      });
+      h.ledger.appendCustomEvent({
+        kind: 'verification.lock-timeout',
+        jobId: 'job-started',
+        payload: { scope: 'full', request_id: 'req-s', wait_ms: 1_000 },
+      });
+      for (const kind of ['verification.started', 'verification.attached']) {
+        h.ledger.appendCustomEvent({ kind, jobId: 'job-started', payload: { scope: 'full', run_id: 'run-old' } });
+      }
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(digest.verificationFailures.map((row) => row.scope)).toEqual(['full']);
+      expect(digest.verificationWaits.map((row) => row.requestId)).toEqual(['req-s']);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a same-head completion in another scope does not answer a wait; the matching completion does', async () => {
+    const h = makeLedger();
+    try {
+      h.ledger.addJob({ id: 'job-wait-scope', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('job-wait-scope', 'working');
+      h.ledger.appendCustomEvent({
+        kind: 'verification.lock-timeout',
+        jobId: 'job-wait-scope',
+        payload: { scope: 'full', request_id: 'req-full-wait', head: 'head-w', wait_ms: 1_000 },
+      });
+      h.ledger.appendCustomEvent({
+        kind: 'verification.completed',
+        jobId: 'job-wait-scope',
+        payload: { ok: true, scope: 'focused', run_id: 'run-f', sha: 'head-w' },
+      });
+      const otherScope = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(otherScope.verificationWaits.map((row) => row.requestId)).toEqual(['req-full-wait']);
+
+      h.ledger.appendCustomEvent({
+        kind: 'verification.completed',
+        jobId: 'job-wait-scope',
+        payload: { ok: true, scope: 'full', run_id: 'run-ok', sha: 'head-w' },
+      });
+      const answered = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(answered.verificationWaits).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a scoped request never retires a scope-less (legacy) verification debt', async () => {
+    const h = makeLedger();
+    try {
+      h.ledger.addJob({ id: 'job-scopeless', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('job-scopeless', 'working');
+      h.ledger.appendCustomEvent({
+        kind: 'verification.completed',
+        jobId: 'job-scopeless',
+        payload: { ok: false, run_id: 'run-noscope', exit_code: 1 },
+      });
+      h.ledger.appendCustomEvent({
+        kind: 'verification.requested',
+        jobId: 'job-scopeless',
+        payload: { scope: 'full', request_id: 'req-other-scope' },
+      });
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(digest.verificationFailures).toHaveLength(1);
+    } finally {
+      h.cleanup();
+    }
+  });
 });
