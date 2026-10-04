@@ -139,7 +139,9 @@ limits, dispatch the lane's recorded next-action review commission once the
 lane's turn has settled (the reviewer's own submission is what triggers
 the demand-driven reclamation of a safe idle resident — never wait for a
 pre-freed permit), reconcile any uncertain submitted dispatch by its
-job identity before dispatching a replacement, do not advance the lane
+job identity before dispatching a replacement (a queued or working row
+is left to admit; a blocked row is a failed attempt to repair or
+escalate, never one to wait on), do not advance the lane
 past its recorded review commission (PR discovery and the native gate
 come after its findings are delivered), and never substitute untracked
 reviewers. Skill

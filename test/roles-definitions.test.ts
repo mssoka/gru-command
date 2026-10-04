@@ -94,6 +94,7 @@ describe('role definitions (E8)', () => {
     expect(minion).toContain('pacing never proves resident admission');
     expect(minion).toContain('a settled turn alone does not release it');
     expect(minion).toContain('never wait for a pre-freed permit');
+    expect(minion).toContain("read the row's status and failure evidence");
     expect(minion).toContain('reconcile the submitted dispatch by its job identity');
     // j-810/j-811: the retired untracked headless-launcher wording must never return.
     expect(minion).not.toContain('pi -p');

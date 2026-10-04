@@ -269,6 +269,27 @@ Review against `origin/main` 28c3dd2b; four fresh `openai-codex/gpt-6-sol` layer
 - Blind 9 — **false, rejected**: the focused scopes do not include the new fallback and awareness tests, but the required full suite does include them; exact-head CI run 37232532408 passed `npm test` on `795b0b69`.
 - Acceptance 12 — **false, rejected**: exact-head CI run 37232532408 passed lint/typecheck/build and `npm test` on `795b0b69`; `test/rehearsal.test.ts:25-49` invokes the hygiene gate in that suite. The older receipt in the spec does not negate newer CI evidence.
 
+### Review Findings — PR #165 at e89cac7 (2026-10-04, round 2)
+
+Full branch diff from `origin/main` 28c3dd2b; four fresh `openai-codex/gpt-6-sol` layers completed. The seven round-one dispositions at 795b0b6 were checked against the fix delta: four decisions are bounded or documented (not runtime-enforced), and all three patches are present. Exact-head CI run 37234795700 passed lint, typecheck, build, full suite and the hygiene test. Both patches were resolved in the same continuation (owner directive: no deferral).
+
+- [x] [Review][Patch] Reconcile a blocked review-job row rather than leaving it to admit [roles/minion.md:114-123; src/dispatch/service.ts:127-159,409-416] — **medium** (edge-case-hunter) — fixed: the worker prompt now requires reading the row's status and failure evidence (queued/working = left to admit; blocked = a failed attempt to repair or escalate, never a lane to wait on; absent = ops reconciliation, never a blind re-POST), with the same distinction added to the silas and ops-dispatch surfaces and pinned at the source, installed, and staged seams.
+- [x] [Review][Patch] Attribute baseline RED to each intended prompt assertion [`.gru-command/worktree.toml:351`] — **low** (blind-hunter) — fixed: each overlaid oracle is now bound to its expected failing test title (roles-installed-playbook: “installed worker prompt carries the BMAD workflow playbook”; roles-definitions: “pins the task-relevant BMAD workflow playbook on the worker prompt”; roles-gru: “plan-before-heist standing orders”; silas-driver: “loads both shipped skills from repo resources”), so an unrelated suite failure cannot satisfy the four-oracle claim; setup/build/green exits keep their distinct codes.
+- [x] [Review][Defer] Reviewer/artifact jobs appear as PR-overdue deliveries [src/dispatch/silas-driver.ts:509-522; resources/silas-skills/ops-dispatch/SKILL.md:97-119] — **medium** (blind-hunter). Pre-existing missing deliverable-kind carve-out, already named in `docs/FLOW.md` §4f and #160/#162/#163: a delivered read-only reviewer job with no PR is listed under `deliveredWithoutPr`, where ops searches for a PR and may escalate unnecessarily. New reviewer use increases exposure, but the predicate is unchanged by this PR; a durable kind/relationship is future runtime work, not part of this playbook-only lane.
+- [x] [Review][Defer] Review-commission re-arm lacks a structured digest row [roles/minion.md:123-135; src/dispatch/silas-driver.ts:425-548] — **medium** (blind-hunter). Known round-one decision: ops now must not advance past the recorded commission, but automated discovery/re-arm from the handback remains unenforced until board next-action truth is implemented. Pre-existing policy-vs-runtime gap, not a fresh promise of machine enforcement at this head.
+- [x] [Review][Defer] Failed fallback PASS notification has no owned retry [src/dispatch/perkins.ts:2515-2540; docs/FLOW.md:482-490] — **medium** (blind-hunter). Previously adjudicated round-one gap, now explicitly documented as policy-only; notifier failure remains truthful in the event and digest but no automatic deduplicated retry exists. No new runtime/outcome subsystem authorized in this PR.
+- [x] [Review][Defer] PASS notification precedes durable PASS event [src/dispatch/perkins.ts:2520-2538; src/notifications/center.ts:116-140] — **medium** (blind-hunter). Previously adjudicated round-one visibility gap, documented in `docs/FLOW.md` §4f: synchronous notification observers may see the earlier `triaged` phase. Recording posted success before the callback would reintroduce r7's false claim; an attempt/outcome sequence is future runtime work.
+
+#### Rejected (individual verdicts)
+
+- Blind 1 — **low, rejected**: the spec's fast-config `install.test.ts` example is stale; the actual `.gru-command/worktree.toml:351` scope uses the heavy config. Its fix edits the spec under review.
+- Blind 2 — **low, rejected**: the spec's `perkins-whole-review.test.ts` example omits the heavy config; the operative artifact scope uses it. Same spec-edit exclusion.
+- Blind 3 — **low, rejected**: the spec's timeout example omits the heavy config/30-second flags; the operative diagnostic scope supplies both. Same spec-edit exclusion.
+- Blind 4 — **false, rejected**: the reviewer brief is read-only and `PR_CREATION_RULE` explicitly says that read-only contracts authorize no publication (`src/dispatch/pr-creation.ts:1-26`); with no reviewer edits there is nothing to commit. The ordinary worker tool capability without enforced confinement was explicitly accepted in the prior round.
+- Blind 10 — **false, rejected**: [CI run 37234795700](https://github.com/mssoka/gru-command/actions/runs/37234795700) passed the full suite on exact head e89cac78, not merely the earlier fast-phase record in the spec.
+- Acceptance 12 — **false, rejected**: the same exact-head CI run passed lint, typecheck, build and `npm test`; its fast suite includes `test/rehearsal.test.ts` running the hygiene gate.
+- Acceptance 13 — **low, rejected**: the heavy-config documentation mismatch is real but duplicates blind 1/2 and requires editing the spec under review, excluded by this review workflow.
+
 ## Implementation Notes
 
 - Runtime capability verified on this lane: `pi` CLI v0.99.1 on PATH,
@@ -909,6 +930,22 @@ bad_spec).
   on the head remains the authoritative full gate and the native
   clearance formality is unavailable by the owner's choice; the merge
   stays owner-held.
+
+- Independent `bmad-code-review` round 2 on the `e89cac7` head (same
+  multiplexer router, four fresh `openai-codex/gpt-6-sol` layers; report
+  at `~/.gru-command/reviews/gc-packaged-build-playbook-20261002-bmad-code-review-e89cac7/report.md`):
+  all seven prior findings verified present; 2 new patches + 4 known
+  runtime gaps carried + 7 rejected. Both patches fixed in the same
+  continuation: the worker/ops reconciliation now distinguishes a
+  queued/working row (left to admit) from a service-marked blocked row
+  (a failed attempt to repair or escalate, never one to wait on) with
+  source/installed/staged pins; and each baseline fail-before oracle is
+  bound to its expected failing test title instead of a filename-only
+  marker. The four carried gaps (reviewer PR-overdue classification;
+  machine-visible commission re-arm; failed-PASS-notifier retry; alert
+  before the durable PASS event) are documented as policy-only runtime
+  gaps in `docs/FLOW.md` §4f and recorded in `deferred-work.md` for their
+  runtime owners — no new promise of enforcement.
 
 - Base re-integration #2 (2026-10-04): origin/main advanced to `f29a4b3`
   (PR #198 agent-status-truth #171, PR #199 ops-contracts #125/#128,

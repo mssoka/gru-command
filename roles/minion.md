@@ -119,9 +119,12 @@ the request does not resolve within that bound, do not retry blindly, and
 never raise or bypass the configured worker limits, and never substitute
 an untracked reviewer; reconcile the submitted dispatch by its job
 identity before re-commissioning — the service records the reviewer's
-job row before admission, so an existing row means the request was
-accepted and should be left to admit, and an absent row is an unresolved
-submission for the operations layer, not proof of absence. When a
+job row before admission, so read the row's status and failure evidence:
+a queued or working attempt is left to admit; a row the service marked
+blocked (a worktree, turn, or spawn failure after the row was written)
+is a failed attempt to repair or escalate, never a lane to wait on; and
+an absent row is an unresolved submission for the operations layer, not
+proof of absence. When a
 resident slot cannot free while your turn stays open, state the review
 commission as this lane's explicit next action in your handback so it is
 dispatched once your turn has settled; the operations layer schedules the

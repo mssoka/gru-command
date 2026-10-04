@@ -235,6 +235,7 @@ describe('installed-layout playbook loading (shipped artifact, clean install)', 
     expect(flat).toContain('pacing never proves resident admission');
     expect(flat).toContain('a settled turn alone does not release it');
     expect(flat).toContain('never wait for a pre-freed permit');
+    expect(flat).toContain("read the row's status and failure evidence");
     expect(flat).toContain('reconcile the submitted dispatch by its job identity');
     // j-810/j-811: the retired untracked headless-launcher wording must never return.
     expect(flat).not.toContain('pi -p');

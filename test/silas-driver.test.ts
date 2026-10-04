@@ -1165,6 +1165,8 @@ describe('silas skills and wake prompt', () => {
     expect(ops).toContain('nested-admission capability gap');
     expect(ops).toContain('never wait for a pre-freed permit');
     expect(ops).toContain('do not advance the lane past its recorded review commission');
+    expect(ops).toContain('a blocked row');
+    expect(ops).toContain('never one to wait on');
     // j-810/j-811: the retired untracked headless-launcher wording must never return.
     expect(ops).not.toContain('pi -p');
     expect(ops).not.toContain('headless print mode');
