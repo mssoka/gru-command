@@ -2132,7 +2132,7 @@ describe('provider pacing: workflow rate-limit retry and cleanup', () => {
       ...ALL_CLEAN,
       disposeRejects: (call) => {
         if (call.options.reviewLead === undefined) return false;
-        chmodSync(join(directory, 'lead'), 0o500);
+        mkdirSync(join(directory, 'lead/dispose-error.json'));
         return true;
       },
     });
