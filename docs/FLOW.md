@@ -68,11 +68,21 @@ endpoints (`POST /api/dispatch/amendment`,
 [REVIEW-INPUTS.md](./REVIEW-INPUTS.md); a private-evidence arm is refused on
 the bmad-review fallback route rather than silently reviewed without it. The arm
 first passes the **branch-idle guard**: while any lane is actively
-working/pushing the target branch (`dispatched`/`working` with no settled
-delivery for its current attempt), the API answers `409 branch_busy` with
+working/pushing the target branch (`dispatched`/`working`/`in-review`
+with no settled delivery for its current attempt — a PR link flips a lane
+to `in-review` mid-attempt, so that status alone is not proof of
+settlement; a `delivered → in-review` flip starts no attempt), the API
+answers `409 branch_busy` with
 `blockers: [{job_id, status, branch}]` and the same check re-runs
 immediately before the freeze, so a lane re-opened mid-setup is refused
-the same way. The same recheck runs after a failed pre-flight and before
+the same way. The guard compares a lane's RECORDED branch (or the
+`gru/<jobId>` branch a `dispatched` job is about to create). A lane that
+checks out its own branch but pushes a FOREIGN PR branch (a rebase/
+salvage lane) is invisible to that comparison — no lane declares a push
+target yet (issue #121 records the evidence and the declared-push-target
+extension). Silas's standing freeze-r1 rule — never arm while a known
+rebase/force-push lane is active on the target — is the control for that
+class. The same recheck runs after a failed pre-flight and before
 the bmad-review fallback gate admits — a re-brief or lane re-open landing
 during the awaited pre-flight refuses the fallback arm (409, or a queued
 replay re-queue) instead of starting a fallback reviewer; the fallback
@@ -466,9 +476,25 @@ the judgment; the dispatch surface is the mechanical hand.
   round's reviewed target (first review AND re-review after a fix round);
   or a proven `service_restart` abort on the unchanged delivered head,
   once per source round under `clean-abort-service-restart`. Other aborts
-  and unchanged heads warrant no round. A review already REQUESTED for
-  the current state retires the row — including the bmad-review fallback
-  route, which creates no round and owns its own fix loop. NEEDS CHANGES
+  and unchanged heads warrant no round. The re-arm is bound to the proved
+  delivered head: an explicit `target_ref` must name that sha and an
+  omitted one freezes it — a moved live PR head is never substituted — and
+  the freeze boundary re-proves the delivered head is still the recorded
+  one: a newer delivery during the awaited pre-flight refuses the stale
+  re-arm (the next sweep offers the changed-head re-review instead). A
+  review already REQUESTED for the current state retires the row —
+  including the bmad-review fallback route, which creates no round and
+  owns its own fix loop; a fallback that never engaged (`unavailable`)
+  retires nothing, so a missing/again-repaired gate leaves the row due. A
+  queued handoff that ends `failed`/`held`/`skipped` without arming a
+  round answers nothing either. The clean-abort row retires only on a
+  state that answered it: an armed Perkins round records the consuming
+  `silas.review-triggered` rule/round receipt (a fallback, queued or
+  unavailable route does not), while any other ACCEPTED review request
+  still withdraws the offer. Failed attempts stay eligible: a 409
+  deferral and a fallback that never engaged (`unavailable`) or ended
+  `blocked`/`aborted` answer nothing, so the same abort reappears for the
+  next sweep. NEEDS CHANGES
   verdicts awaiting follow-through, with per-blocker recurrence analysis;
   working lanes whose minion has been silent past `stall_threshold_ms`;
   plus recent minion errors for context.
