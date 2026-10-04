@@ -25,7 +25,7 @@ import { createReviewEscalationNotifier } from './dispatch/escalation-identity.j
 import { createStartupVerdictPoster } from './dispatch/perkins-github-app.js';
 import { BobScheduler } from './dispatch/bob-scheduler.js';
 import { SilasDriver, supervisionLookup } from './dispatch/silas-driver.js';
-import { createDurableReconcileHook, waveReconcileBinding } from './dispatch/durable-reconcile.js';
+import { createProductionDeterministicPass } from './dispatch/durable-reconcile.js';
 import { ProviderRecoverySensor, establishProviderWait } from './provider-recovery/sensor.js';
 import { ModelRuntimeProbe } from './provider-recovery/probe.js';
 import {
@@ -1415,11 +1415,11 @@ async function main(): Promise<number> {
       // LLM wake. The factory is behaviorally tested with a real ledger
       // and driver; a wiring regression fails a behavioral test, not just
       // a source regex.
-      onDeterministicPass: createDurableReconcileHook({
+      onDeterministicPass: createProductionDeterministicPass({
         ledger,
         notifications,
         log: (level, msg, fields) => logger.log(level, msg, fields),
-        wave: waveReconcileBinding(() => state.wave),
+        getWave: () => state.wave,
       }),
       githubPoll: new GitHubSignalPoll({
         ledger,

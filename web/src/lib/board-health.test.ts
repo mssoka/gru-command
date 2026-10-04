@@ -182,6 +182,16 @@ describe('the remaining health cards render truthfully or n/a', () => {
     expect(open.detail).toBe('reconciled 1m ago · 0 machine actions today');
   });
 
+  it('Silas: a non-null next action renders in the card tooltip (#163 review)', () => {
+    const card = silasCard(
+      { ...silasBase, lastReconcileAt: ISO(-60_000), nextAction: 'gru-decision: rule on the audit (job-x)' },
+      NOW.getTime(),
+    );
+    expect(card.titleAttr).toContain('next owed: gru-decision: rule on the audit (job-x)');
+    const none = silasCard({ ...silasBase, nextAction: null }, NOW.getTime());
+    expect(none.titleAttr).toContain('no tracked obligation');
+  });
+
   it('Silas: a pass that failed after the last success is louder than every healthy state (#163)', () => {
     const failed = silasCard(
       {

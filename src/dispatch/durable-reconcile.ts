@@ -157,6 +157,33 @@ export function waveReconcileBinding(
   return { reconcilePendingHandoffs: () => getWave()?.reconcilePendingHandoffs() };
 }
 
+export interface ProductionDeterministicPassDeps {
+  readonly ledger: LedgerApi;
+  readonly notifications: FollowThroughNotifications;
+  readonly log?: Log;
+  /** Reads the live wave handle at each pass (late-bound). */
+  readonly getWave: () => { reconcilePendingHandoffs(): void } | undefined;
+  readonly budget?: DurableReconcileBudget;
+}
+
+/**
+ * The EXACT production Silas option assembly (issue #163 review): startup
+ * builds the deterministic hook through this function, and the
+ * deterministic-seam test drives it with a real queued WaveRunner — so a
+ * disconnected wave getter fails behaviorally, never only a source regex.
+ */
+export function createProductionDeterministicPass(
+  deps: ProductionDeterministicPassDeps,
+): DeterministicPassHook {
+  return createDurableReconcileHook({
+    ledger: deps.ledger,
+    notifications: deps.notifications,
+    ...(deps.log !== undefined ? { log: deps.log } : {}),
+    wave: waveReconcileBinding(deps.getWave),
+    ...(deps.budget !== undefined ? { budget: deps.budget } : {}),
+  });
+}
+
 export function createDurableReconcileHook(deps: DurableReconcileHookDeps): DeterministicPassHook {
   return () => {
     deps.wave?.reconcilePendingHandoffs();

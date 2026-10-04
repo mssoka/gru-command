@@ -179,7 +179,7 @@ export function silasCard(silas: SilasView | null | undefined, now = Date.now())
     silas.lastUsefulActionAt === null
       ? 'no corrective action yet'
       : `last action ${formatAge(silas.lastUsefulActionAt, now)} ago`,
-    silas.nextAction === null ? 'no action owed' : `next owed: ${silas.nextAction}`,
+    silas.nextAction === null ? 'no tracked obligation' : `next owed: ${silas.nextAction}`,
     `${silas.reconciliationsToday} machine actions today`,
   ].join(' · ');
   return card(

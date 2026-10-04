@@ -16,6 +16,7 @@ import {
   type JobRecord,
   type RoundRecord,
 } from '../ledger/api.js';
+import { LIVE_DIRECTIVE_STATES } from '../ledger/directives.js';
 import type { JobStatus } from '../ledger/states.js';
 
 /** Newest closed receipts kept in every snapshot (D3): older ones are
@@ -280,6 +281,10 @@ const SILAS_ACTION_KINDS = [
   'silas.directive-settled',
   'silas.rebrief',
   'silas.escalated',
+  // Pass-owned marked-phase completion: machine follow-through the
+  // deterministic pass finishes (a generic obligation write by an
+  // unrelated lane is deliberately NOT counted here).
+  'job.phase-handoff-completed',
 ] as const;
 
 /** PR state from the record: a terminal `merged` job is merged; a
@@ -644,22 +649,31 @@ export class BoardEngine {
     };
   }
 
-  /** The oldest live obligation as the durable next action (issue #163):
-   * an admission-unknown request, a phase hand-back or a verification
-   * debt all land as obligations, so the board can name what is owed
-   * without recomputing the digest. */
+  /** The oldest live debt as the durable next action (issue #163): a live
+   * obligation, else a live directive request (admission-unknown or
+   * awaiting receipt). Verification waits and failures are carried by the
+   * digest; the card never claims "no action owed" — it says no tracked
+   * obligation. Per-row-isolated decode: one malformed obligation must
+   * never blind the whole board. */
   private nextActionProjection(): string | null {
-    const row = this.ledger.listObligations({ states: ['open', 'waiting'], limit: 1 })[0];
-    if (row === undefined) return null;
-    const next = row.nextAction;
-    const detail =
-      next.kind === 'silas-mechanical'
-        ? next.action
-        : next.kind === 'external-wait'
-          ? next.condition
-          : next.decision;
-    const bounded = detail.length > 120 ? `${detail.slice(0, 117)}...` : detail;
-    return `${next.kind}: ${bounded} (${row.jobId})`;
+    const obligations = this.ledger.listObligationsDetailed({ limit: 50 }).readable;
+    const obligation = obligations.find((row) => row.state === 'open' || row.state === 'waiting');
+    if (obligation !== undefined) {
+      const next = obligation.nextAction;
+      const detail =
+        next.kind === 'silas-mechanical'
+          ? next.action
+          : next.kind === 'external-wait'
+            ? next.condition
+            : next.decision;
+      const bounded = detail.length > 120 ? `${detail.slice(0, 117)}...` : detail;
+      return `${next.kind}: ${bounded} (${obligation.jobId})`;
+    }
+    const directive = this.ledger.listPendingDirectives({ states: LIVE_DIRECTIVE_STATES, limit: 1 })[0];
+    if (directive !== undefined) {
+      return `directive ${directive.requestId}: ${directive.state} (${directive.jobId})`;
+    }
+    return null;
   }
 
   /** Repo-grouped job views (the group map preserves ledger job order). */

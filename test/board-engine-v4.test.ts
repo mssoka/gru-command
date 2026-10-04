@@ -176,5 +176,11 @@ describe('board engine — v4 snapshot blocks', () => {
     const silas = engine.snapshot().silas;
     expect(silas.lastUsefulActionAt).toBe(settled.ts);
     expect(silas.reconciliationsToday).toBe(1);
+
+    // Pass-owned marked-phase completion is machine follow-through too.
+    const phase = api.appendCustomEvent({ kind: 'job.phase-handoff-completed', jobId: job.id, payload: {} });
+    const afterPhase = engine.snapshot().silas;
+    expect(afterPhase.lastUsefulActionAt).toBe(phase.ts);
+    expect(afterPhase.reconciliationsToday).toBe(2);
   });
 });

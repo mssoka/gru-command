@@ -474,36 +474,28 @@ function latestAnsweringReviewRequest(ledger: DigestLedger, jobId: string): Even
   return winner;
 }
 
-/** Verification event kinds that prove a FRESH SUBMISSION exists — the
- * retirement evidence for failure/wait rows (never a rerun authority). A
- * `verification.reconciled` replay of an older run is deliberately
- * excluded: it ran nothing new and cannot answer a debt. */
-const VERIFICATION_ACTIVITY_KINDS: readonly string[] = [
-  'verification.requested',
-  'verification.started',
-  'verification.attached',
-];
+/** Verification event kinds whose latest event per scope the reduction
+ * needs (retirement is a separate identity query). */
+const VERIFICATION_SCOPE_KINDS: readonly string[] = ['verification.completed', 'verification.lock-timeout'];
 
 /** A fresh PRODUCER submission at an exact (scope, head), by identity
- * query. `verification.attached` and `verification.started` are
- * deliberately excluded: attaching/starting joins a pre-existing attempt
- * and is not a new submission that answers a debt. */
-function verificationResubmittedAtHead(
+ * query. Only `verification.requested` counts: `verification.attached`
+ * and `verification.started` join a pre-existing attempt and are not a
+ * new submission that answers a debt. A missing scope/head falls back to
+ * any new producer request. */
+function verificationResubmitted(
   ledger: DigestLedger,
   jobId: string,
-  scope: string,
-  head: string,
+  scope: string | null,
+  head: string | null,
   sinceSeq: number,
 ): boolean {
-  return ledger.hasJobEventWithPayloadValues(
-    jobId,
-    ['verification.requested'],
-    [
-      { key: 'scope', value: scope },
-      { key: 'head', value: head },
-    ],
-    sinceSeq,
-  );
+  if (scope === null) {
+    return (ledger.latestJobEvent(jobId, 'verification.requested')?.seq ?? -1) > sinceSeq;
+  }
+  const values: { readonly key: string; readonly value: string }[] = [{ key: 'scope', value: scope }];
+  if (head !== null) values.push({ key: 'head', value: head });
+  return ledger.hasJobEventWithPayloadValues(jobId, ['verification.requested'], values, sinceSeq);
 }
 
 function payloadRecord(event: EventRecord): Record<string, unknown> {
@@ -820,29 +812,22 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     const verificationCompleted = input.ledger.latestJobEvent(job.id, 'verification.completed');
     const verificationTimeout = input.ledger.latestJobEvent(job.id, 'verification.lock-timeout');
     if (verificationCompleted !== null || verificationTimeout !== null) {
-      const scopedEvents = input.ledger.latestJobEventsByPayloadScope(job.id, [
-        'verification.completed',
-        'verification.lock-timeout',
-        ...VERIFICATION_ACTIVITY_KINDS,
-      ]);
+      const scopedEvents = input.ledger.latestJobEventsByPayloadScope(job.id, VERIFICATION_SCOPE_KINDS);
       const scopeOf = (event: EventRecord): string => payloadString(event, 'scope') ?? '(unknown-scope)';
       const latestCompleted = new Map<string, EventRecord>();
-      const latestActivity = new Map<string, EventRecord>();
       const latestTimeout = new Map<string, EventRecord>();
       for (const event of scopedEvents) {
         const scope = scopeOf(event);
         if (event.kind === 'verification.completed') {
           if (!latestCompleted.has(scope)) latestCompleted.set(scope, event);
-        } else if (event.kind === 'verification.lock-timeout') {
-          if (!latestTimeout.has(scope)) latestTimeout.set(scope, event);
-        } else if (!latestActivity.has(scope)) {
-          latestActivity.set(scope, event);
+        } else if (!latestTimeout.has(scope)) {
+          latestTimeout.set(scope, event);
         }
       }
       // Exact identity retirement: a repair rung retires only the failure
       // whose canonical fingerprint it carries, found by an identity query
       // (no newest-N window can age a landed disposition out of view).
-      for (const [scopeKey, completed] of latestCompleted) {
+      for (const completed of latestCompleted.values()) {
         if (payloadFlag(completed, 'ok', true)) continue;
         const runId = payloadString(completed, 'run_id');
         const scopeLabel = payloadString(completed, 'scope');
@@ -864,10 +849,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
         // A NEW submission at the FAILED (scope, head) retires the row (a
         // still-failing retry re-arms it with the newer result); another
         // scope or head does not answer this failure.
-        const retryInFlight =
-          head === null || scopeLabel === null
-            ? (latestActivity.get(scopeKey)?.seq ?? -1) > completed.seq
-            : verificationResubmittedAtHead(input.ledger, job.id, scopeLabel, head, completed.seq);
+        const retryInFlight = verificationResubmitted(input.ledger, job.id, scopeLabel, head, completed.seq);
         if (repaired || retryInFlight) continue;
         digest.verificationFailures.push({
           jobId: job.id,
@@ -885,11 +867,9 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
         // A fresh PRODUCER submission at the PINNED (scope, head)
         // supersedes the wait; a completion answers it only for the pinned
         // attempt. Another scope or head is a different operation and does
-        // not retire this reconsideration.
-        const resubmitted =
-          head === null || scopeLabel === null
-            ? (latestActivity.get(scopeKey)?.seq ?? -1) > timeout.seq
-            : verificationResubmittedAtHead(input.ledger, job.id, scopeLabel, head, timeout.seq);
+        // not retire this reconsideration. An attachment or a pre-existing
+        // attempt starting is NOT a resubmission.
+        const resubmitted = verificationResubmitted(input.ledger, job.id, scopeLabel, head, timeout.seq);
         const completedSameHead =
           head === null || scopeLabel === null
             ? (latestCompleted.get(scopeKey)?.seq ?? -1) > timeout.seq

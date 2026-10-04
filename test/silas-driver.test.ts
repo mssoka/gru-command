@@ -1142,7 +1142,7 @@ describe('silas digest (the four actionable states)', () => {
         payload: { ok: false, scope: 'focused', run_id: 'run-1' },
       });
       h.ledger.appendCustomEvent({
-        kind: 'verification.started',
+        kind: 'verification.requested',
         jobId: 'job-verify-2',
         payload: { scope: 'focused', run_id: 'run-2' },
       });
@@ -2178,13 +2178,10 @@ describe('silas deterministic pass observation (issue #163)', () => {
   it('the main assembly wires the durable reconciliation pass into the driver (assembly alarm)', () => {
     const mainSource = readFileSync(join(import.meta.dirname, '..', 'src', 'main.ts'), 'utf8');
     expect(mainSource).toMatch(
-      /import\s*\{[^}]*\bcreateDurableReconcileHook\b[^}]*\}\s*from\s*'\.\/dispatch\/durable-reconcile\.js'/,
+      /import\s*\{[^}]*\bcreateProductionDeterministicPass\b[^}]*\}\s*from\s*'\.\/dispatch\/durable-reconcile\.js'/,
     );
-    expect(mainSource).toMatch(/onDeterministicPass:\s*createDurableReconcileHook\(\{/);
-    expect(mainSource).toMatch(/wave:\s*waveReconcileBinding\(/);
-    expect(mainSource).toMatch(
-      /import\s*\{[^}]*\bwaveReconcileBinding\b[^}]*\}\s*from\s*'\.\/dispatch\/durable-reconcile\.js'/,
-    );
+    expect(mainSource).toMatch(/onDeterministicPass:\s*createProductionDeterministicPass\(\{/);
+    expect(mainSource).toMatch(/getWave:\s*\(\)\s*=>\s*state\.wave/);
   });
   it('a wait row is bound to its pinned head: another head cannot retire it, the same head can', async () => {
     const h = makeLedger();
@@ -2440,6 +2437,55 @@ describe('silas deterministic pass observation (issue #163)', () => {
         trigger: 'sweep',
       });
       expect(exact.verificationFailures).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+  it('a same-head but different-scope submission does not retire a failure or wait', async () => {
+    const h = makeLedger();
+    try {
+      h.ledger.addJob({ id: 'job-samehead', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('job-samehead', 'working');
+      h.ledger.appendCustomEvent({
+        kind: 'verification.completed',
+        jobId: 'job-samehead',
+        payload: { ok: false, scope: 'full', run_id: 'run-full', sha: 'head-h', exit_code: 1 },
+      });
+      h.ledger.appendCustomEvent({
+        kind: 'verification.lock-timeout',
+        jobId: 'job-samehead',
+        payload: { scope: 'focused', request_id: 'req-focused', head: 'head-h', wait_ms: 1_000 },
+      });
+      // A focused request at the SAME head is another operation, not a
+      // full retry or an answer to the focused wait.
+      h.ledger.appendCustomEvent({
+        kind: 'verification.requested',
+        jobId: 'job-samehead',
+        payload: { scope: 'focused', request_id: 'req-focused-2', head: 'head-h' },
+      });
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(digest.verificationFailures.map((row) => row.scope)).toEqual(['full']);
+      // The focused wait IS retired by the focused request (same scope+head).
+      expect(digest.verificationWaits).toEqual([]);
+
+      // A full-scope request at the same head retires the full failure.
+      h.ledger.appendCustomEvent({
+        kind: 'verification.requested',
+        jobId: 'job-samehead',
+        payload: { scope: 'full', request_id: 'req-full-2', head: 'head-h' },
+      });
+      const retried = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(retried.verificationFailures).toEqual([]);
     } finally {
       h.cleanup();
     }
