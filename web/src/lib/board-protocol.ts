@@ -70,14 +70,22 @@ export interface AgentView {
   readonly label: string | null;
   readonly state: string;
   readonly lastActivity: string | null;
+  /** Row registration stamp. Optional: pre-upgrade servers did not send
+   * it, and the board then falls back to lastActivity-only stall truth. */
+  readonly createdAt?: string;
   readonly sessionFile: string | null;
   readonly jobId: string | null;
   readonly roundId: string | null;
-  /** E7 supervision view (null when unsupervised). */
+  /** E7 supervision view (null when unsupervised). `stopReason` is absent
+   * on pre-reason servers — the board renders the stop without a cause;
+   * `stoppedAt` is absent on pre-stop-time servers and null/ignored while
+   * running. */
   readonly supervision: {
     readonly state: 'watching' | 'restarting' | 'stopped';
     readonly restarts: number;
     readonly breakerOpen: boolean;
+    readonly stopReason?: string | null;
+    readonly stoppedAt?: string | null;
   } | null;
 }
 
@@ -195,7 +203,8 @@ export interface BoardSnapshot {
   readonly agents: readonly AgentView[];
   readonly notifications: readonly NotificationView[];
   readonly decisions: DecisionStatusView;
-  /** NEEDS GRU: machine-attention rows awaiting a disposition. */
+  /** NEEDS GRU: LIVE machine-attention rows awaiting a disposition
+   * (terminal-bound rows are closed receipts and are not counted here). */
   readonly unackedActionRequired: number;
   /** FOR YOU: needs-owner rows awaiting a human ack (the bell class). */
   readonly unackedNeedsOwner: number;
@@ -298,6 +307,21 @@ export function parseBoardServerFrame(raw: unknown): BoardServerFrame | null {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
+}
+
+const SUPERVISION_STATES = ['watching', 'restarting', 'stopped'] as const;
+
+/** The E7 supervision block's known states: an unknown state is a server
+ * bug, never a silently tolerated value. */
+function isSupervisionState(value: unknown): value is (typeof SUPERVISION_STATES)[number] {
+  return typeof value === 'string' && (SUPERVISION_STATES as readonly string[]).includes(value);
+}
+
+/** A restart count must be a finite non-negative number. A malformed value
+ * must not reach the chip/stop predicate as a false-live read (tracked-
+ * review A9). */
+function isRestartCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0;
 }
 
 /** Parse one OUTBOUND client frame (the auth frame clients send); null on
@@ -505,10 +529,29 @@ export function isValidSnapshot(value: unknown): value is BoardSnapshot {
       typeof agent.id === 'string' &&
       typeof agent.role === 'string' &&
       typeof agent.state === 'string' &&
-      // supervision is optional (null when the agent is unsupervised)
+      // createdAt is optional (pre-upgrade servers); present, it must be
+      // a parseable date — the stall floor reads it directly and a junk
+      // string would silently remove the floor (code review 2026-10-04).
+      (agent.createdAt === undefined ||
+        agent.createdAt === null ||
+        (typeof agent.createdAt === 'string' && Number.isFinite(Date.parse(agent.createdAt)))) &&
+      // supervision is optional (null when the agent is unsupervised);
+      // stopReason is optional too (pre-reason servers) — present, it is
+      // a nullable string. The whole PRESENT block is typed strictly (A9):
+      // known state, boolean breakerOpen, finite non-negative restarts —
+      // a truthy non-boolean breaker must never read as a false-live lane.
       (agent.supervision === null ||
         agent.supervision === undefined ||
-        (isRecord(agent.supervision) && typeof agent.supervision.state === 'string')),
+        (isRecord(agent.supervision) &&
+          isSupervisionState(agent.supervision.state) &&
+          typeof agent.supervision.breakerOpen === 'boolean' &&
+          isRestartCount(agent.supervision.restarts) &&
+          (agent.supervision.stopReason === undefined ||
+            agent.supervision.stopReason === null ||
+            typeof agent.supervision.stopReason === 'string') &&
+          (agent.supervision.stoppedAt === undefined ||
+            agent.supervision.stoppedAt === null ||
+            typeof agent.supervision.stoppedAt === 'string'))),
   );
   const notificationsOk = value.notifications.every(
     (notification) =>
@@ -645,6 +688,15 @@ export function agentStateTone(state: string): string {
     default:
       return 'pp-chip--park';
   }
+}
+
+/** A terminal job (merged/done) is a closed receipt: it can never be live
+ * Gru work, so no leftover unacked escalation row, aborted historical
+ * round, or stale lens noise may promote it back into NEEDS YOU. Shared
+ * by the banding and signal derivations — the web twin of the ledger's
+ * `isJobTerminal` (separate builds; keep the two in step). */
+export function isJobConcluded(status: string): boolean {
+  return status === 'merged' || status === 'done';
 }
 
 export { str as boardStr, nstr as boardNstr };

@@ -53,6 +53,10 @@ export function renderRecordedVerification(
   const outputSha256 = str(payload['output_sha256']);
   const runId = str(payload['run_id']);
   const runError = str(payload['error']);
+  // Complete receipt only (issue #159): run identity plus output
+  // length/hash are the bindings a torn or synthesized capture lacks.
+  // Half-evidence never renders.
+  if (runId === null || outputBytes === null || outputSha256 === null || outputSha256 === '') return null;
 
   const result = timedOut
     ? 'FAIL (timed out)'
@@ -74,9 +78,9 @@ export function renderRecordedVerification(
   ];
   if (durationMs !== null) lines.push(`duration_ms: ${durationMs}`);
   if (workers !== null) lines.push(`workers: ${workers}`);
-  if (runId !== null) lines.push(`run_id: ${runId}`);
-  if (outputBytes !== null) lines.push(`output_bytes: ${outputBytes}`);
-  if (outputSha256 !== null) lines.push(`output_sha256: ${outputSha256}`);
+  lines.push(`run_id: ${runId}`);
+  lines.push(`output_bytes: ${String(outputBytes)}`);
+  lines.push(`output_sha256: ${outputSha256}`);
   if (runError !== null) lines.push(`error: ${runError.slice(0, 300)}`);
   lines.push('--- END HOST-RECORDED VERIFICATION ---');
   return lines.join('\n');

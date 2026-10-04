@@ -5,7 +5,7 @@ import { hashToken, tokenConfigured, tokenMatches } from '../auth.js';
 import { ROLES, type GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { EventBus } from '../events/bus.js';
-import { LedgerApi, RecordNotFound } from '../ledger/api.js';
+import { LedgerApi, RecordNotFound, type NotificationRecord } from '../ledger/api.js';
 import { isJobStatus, isRoundStatus, isRoundVerdict } from '../ledger/states.js';
 import { isAgentState } from '../runtime/types.js';
 import type { NotificationCenter } from '../notifications/center.js';
@@ -197,6 +197,47 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
         if (req.method === 'GET' && path === '/api/board') {
           if (!authed(req, res)) return;
           json(res, 200, engine.snapshot());
+          return;
+        }
+        if (req.method === 'GET' && path === '/api/notifications/receipts') {
+          if (!authed(req, res)) return;
+          // Paged closed-receipt history (owner decision D3): the snapshot
+          // keeps only the newest window; this route serves older receipts
+          // on demand, newest-first, with a raw-row offset cursor.
+          const url = new URL(req.url ?? '/', 'http://localhost');
+          const offsetRaw = Number(url.searchParams.get('offset') ?? '0');
+          const limitRaw = Number(url.searchParams.get('limit') ?? '30');
+          const offset = Number.isSafeInteger(offsetRaw) && offsetRaw >= 0 ? offsetRaw : 0;
+          const limit = Math.min(
+            Math.max(Number.isSafeInteger(limitRaw) && limitRaw > 0 ? limitRaw : 30, 1),
+            100,
+          );
+          const receipts: NotificationRecord[] = [];
+          let consumed = offset;
+          for (;;) {
+            const page = ledger.listNotifications({
+              unackedOnly: true,
+              routing: 'action-required',
+              limit: 100,
+              offset: consumed,
+            });
+            let examined = 0;
+            for (const row of page) {
+              examined += 1;
+              if (!engine.isClosedReceipt(row.agentId)) continue;
+              receipts.push(row);
+              if (receipts.length >= limit) break;
+            }
+            // Resume AFTER the last examined raw row: a page cut by the
+            // limit must not skip the rows that follow it.
+            consumed += examined;
+            if (receipts.length >= limit || page.length < 100) break;
+          }
+          json(res, 200, {
+            receipts,
+            nextOffset: consumed,
+            hasMore: receipts.length >= limit,
+          });
           return;
         }
         if (req.method === 'GET' && path === '/api/decisions/status') {

@@ -146,12 +146,15 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   `silas.review-triggered`, `silas.directive-sent`, `silas.rebrief`,
   `silas.escalated`, `silas.wake`) — visible in the event stream like
   every other transition.
-- **Notification center (E7; routing split 2026-09-23):** the bell panel
-  renders the durable notification log in three bands — FOR YOU
-  (all pending needs-owner rows, even older than the bounded latest feed:
-  owner-only decisions and stops whose ack re-arms supervision), NEEDS GRU
-  (all pending machine rows, including those older than the recent feed;
-  it wakes Gru once and refuses human Ack), and FEED (FYI rows). The bell
+- **Notification center (E7; routing split 2026-09-23; section truth
+  2026-09-29):** the bell panel renders the durable notification log in
+  three bands — FOR YOU (all pending needs-owner rows, even older than the
+  bounded latest feed: owner-only decisions and stops whose ack re-arms
+  supervision), NEEDS GRU (all pending machine rows, including those older
+  than the recent feed; it wakes Gru once and refuses human Ack. Rows bound
+  to a terminal merged/done lane are CLOSED RECEIPTS: they render under
+  FEED, never as live queue entries, and the live unacked chip does not
+  count them), and FEED (FYI rows plus closed receipts). The bell
   is the alert/history surface: it shares the SAME authoritative owner
   projection as the board's permanent FOR YOU band — pending acks AND
   ready PRs, so the two surfaces never disagree about what the owner

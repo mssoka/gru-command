@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -279,6 +279,7 @@ describe('board engine — adapter events → ledger events → board state', ()
               state: 'stopped',
               restarts: 3,
               breakerOpen: true,
+              stopReason: 'crash loop',
               openTurn: false,
               openToolCalls: 0,
               lastEventAt: '2026-09-18T00:00:00.000Z',
@@ -288,7 +289,7 @@ describe('board engine — adapter events → ledger events → board state', ()
     });
     const snapshot = supervised.snapshot();
     const row = snapshot.agents.find((a) => a.id === 'stopped-minion');
-    expect(row?.supervision).toMatchObject({ state: 'stopped', restarts: 3, breakerOpen: true });
+    expect(row?.supervision).toMatchObject({ state: 'stopped', restarts: 3, breakerOpen: true, stopReason: 'crash loop' });
     // Unsupervised agents carry null — the UI renders no chip for them.
     const plain = supervised.snapshot().agents.find((a) => a.id === 'gru-main');
     expect(plain?.supervision).toBeNull();
@@ -448,6 +449,120 @@ describe('board engine — liveness-first rail and job trackers', () => {
     api.resolveNotificationsByKindPrefix('test.', 'runtime');
     expect(api.getNotification(resolved.id)?.resolvedAt).not.toBeNull();
     expect(engine.snapshot().unackedActionRequired).toBe(0);
+  });
+
+  it('unackedActionRequired counts LIVE rows only — rows bound to merged/done jobs are closed receipts', () => {
+    const { api, engine } = fresh();
+    // An unbound row stays global (no job → cannot be terminal).
+    api.recordNotification({ id: 'n-global', kind: 'test.notice', routing: 'action-required', severity: 'error', title: 'Global' });
+
+    const live = api.addJob({ id: 'live-job', repo: 'demo-repo', title: 'Live lane' });
+    api.setJobStatus(live.id, 'working');
+    api.registerAgent({ id: 'live-minion', role: 'minion', jobId: live.id });
+    api.recordNotification({
+      id: 'n-live',
+      kind: 'test.live.notice',
+      routing: 'action-required',
+      severity: 'error',
+      title: 'Agent live-minion stopped: quota wall',
+      agentId: 'live-minion',
+    });
+    expect(engine.snapshot().unackedActionRequired).toBe(2);
+
+    const merged = api.addJob({ id: 'merged-job', repo: 'demo-repo', title: 'Merged lane' });
+    api.registerAgent({ id: 'merged-minion', role: 'minion', jobId: merged.id });
+    api.recordNotification({
+      id: 'n-merged',
+      kind: 'test.merged.notice',
+      routing: 'action-required',
+      severity: 'error',
+      title: 'Leftover escalation on a merged lane',
+      agentId: 'merged-minion',
+    });
+    api.setJobStatus(merged.id, 'working');
+    api.setJobStatus(merged.id, 'delivered');
+    api.setJobStatus(merged.id, 'in-review');
+    api.setJobStatus(merged.id, 'merged');
+    // The merged lane's leftover escalation is a closed receipt: the live
+    // count drops it while the row itself stays durable in the bell.
+    expect(engine.snapshot().unackedActionRequired).toBe(2); // global + live
+
+    const done = api.addJob({ id: 'done-job', repo: 'demo-repo', title: 'Done lane' });
+    api.registerAgent({ id: 'done-minion', role: 'minion', jobId: done.id });
+    api.recordNotification({
+      id: 'n-done',
+      kind: 'test.notice',
+      routing: 'action-required',
+      severity: 'error',
+      title: 'Leftover on a done lane',
+      agentId: 'done-minion',
+    });
+    api.setJobStatus(done.id, 'working');
+    api.setJobStatus(done.id, 'done');
+    expect(engine.snapshot().unackedActionRequired).toBe(2);
+
+    // Nothing was acked or resolved — the record keeps the receipts.
+    for (const id of ['n-merged', 'n-done']) {
+      const row = api.getNotification(id);
+      expect(row?.ackedAt).toBeNull();
+      expect(row?.resolvedAt).toBeNull();
+    }
+
+    // Merging the live job closes its row the same way.
+    api.setJobStatus(live.id, 'delivered');
+    api.setJobStatus(live.id, 'in-review');
+    api.setJobStatus(live.id, 'merged');
+    expect(engine.snapshot().unackedActionRequired).toBe(1); // the unbound global row
+  });
+
+  it('the shared live/receipt fixture classifies identically for the chip and the bands', () => {
+    // ONE fixture file is consumed by this suite and by
+    // web/src/lib/board-signals.test.ts; the SQL live count and the web
+    // attribution must agree on the same rows (followup review A4/V4).
+    const fixture = JSON.parse(
+      readFileSync(join(import.meta.dirname, 'fixtures', 'live-receipt-classification.json'), 'utf-8'),
+    ) as {
+      readonly jobs: readonly { readonly id: string; readonly status: string }[];
+      readonly agents: readonly { readonly id: string; readonly jobId: string }[];
+      readonly notifications: readonly {
+        readonly id: string;
+        readonly kind: string;
+        readonly routing: string;
+        readonly agentId: string | null;
+      }[];
+      readonly expected: { readonly liveCount: number };
+    };
+    const { api } = fresh();
+    for (const job of fixture.jobs) {
+      api.addJob({ id: job.id, repo: 'fixture', title: job.id, briefing: 'b' });
+      if (job.status === 'working') api.setJobStatus(job.id, 'working');
+      if (job.status === 'done') {
+        api.setJobStatus(job.id, 'working');
+        api.setJobStatus(job.id, 'done');
+      }
+      if (job.status === 'merged') {
+        api.setJobStatus(job.id, 'working');
+        api.setJobStatus(job.id, 'delivered');
+        api.setJobStatus(job.id, 'in-review');
+        api.setJobStatus(job.id, 'merged');
+      }
+    }
+    for (const agent of fixture.agents) {
+      api.registerAgent({ id: agent.id, role: 'minion', jobId: agent.jobId });
+    }
+    for (const notification of fixture.notifications) {
+      api.recordNotification({
+        id: notification.id,
+        kind: notification.kind,
+        routing: notification.routing as 'action-required' | 'fyi',
+        severity: 'error',
+        title: notification.id,
+        ...(notification.agentId !== null ? { agentId: notification.agentId } : {}),
+      });
+    }
+    expect(api.countLivePendingActionRequired()).toBe(fixture.expected.liveCount);
+    // The durable record keeps the terminal-bound receipts: live + 2.
+    expect(api.countPendingActionRequiredIncludingReceipts()).toBe(fixture.expected.liveCount + 2);
   });
 
   it('counts needs-owner rows separately (the FOR YOU band never borrows the machine queue)', () => {
@@ -680,5 +795,57 @@ describe('board engine — FOR YOU owner-PR projection on the snapshot', () => {
     expect(snap.unackedNeedsOwner).toBe(1);
     expect(snap.notifications.find((row) => row.id === 'old-owner-stop')).toMatchObject({ ackedAt: null });
     expect(snap.ownerPrs.map((row) => row.jobId)).toEqual(['job-ready']);
+  });
+
+  it('the main assembly binds the supervisor stop truth into the board engine (assembly alarm)', () => {
+    // Twelve-followthrough A3: the waiting-chip truth rides a main.ts
+    // closure; engine unit tests inject their own supervisionFor and the
+    // browser gate runs against the mock, so dropping the production
+    // binding stayed green. This is the repo's established source-drift
+    // alarm pattern (the same shape as the driver/notifier pins).
+    const mainSource = readFileSync(join(import.meta.dirname, '..', 'src', 'main.ts'), 'utf8');
+    expect(mainSource).toMatch(
+      /new BoardEngine\(\{[\s\S]*?supervisionFor:\s*\(agentId\)\s*=>\s*supervisor\?\.viewFor\(agentId\)\s*\?\?\s*null/,
+    );
+  });
+
+  it('bounds the snapshot to the newest receipt window while live rows stay complete (D3)', () => {
+    // Owner decision D3: closed receipts stay unacked forever by design, so
+    // the unbounded scan must carry live rows only plus a bounded receipt
+    // window; the paged route serves older receipts on demand.
+    const dir = mkdtempSync(join(tmpdir(), 'gru-d3-'));
+    const db = new LedgerDb(dir);
+    const bus = new EventBus();
+    const ledger = new LedgerApi(db.handle, { bus });
+    try {
+      ledger.addJob({ id: 'job-d3', repo: 'r', title: 'D3', briefing: 'b' });
+      ledger.setJobStatus('job-d3', 'working');
+      ledger.registerAgent({ id: 'minion-d3', role: 'minion', jobId: 'job-d3' });
+      const center = new NotificationCenter({ ledger, bus });
+      for (let i = 0; i < 35; i += 1) {
+        center.post({
+          kind: `receipt-${i}`,
+          routing: 'action-required',
+          severity: 'error',
+          title: `receipt ${i}`,
+          agentId: 'minion-d3',
+        });
+      }
+      center.post({ kind: 'live-row', routing: 'action-required', severity: 'error', title: 'live row' });
+      ledger.setJobStatus('job-d3', 'delivered');
+      ledger.setJobStatus('job-d3', 'in-review');
+      ledger.setJobStatus('job-d3', 'merged');
+      const engine = new BoardEngine({ ledger, bus });
+      const snapshot = engine.snapshot();
+      expect(
+        snapshot.notifications.filter((row) => row.agentId === 'minion-d3' && row.ackedAt === null),
+      ).toHaveLength(30);
+      expect(snapshot.notifications.some((row) => row.title === 'live row')).toBe(true);
+      expect(engine.isClosedReceipt('minion-d3')).toBe(true);
+      expect(engine.isClosedReceipt(null)).toBe(false);
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

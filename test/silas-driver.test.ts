@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -7,6 +7,7 @@ import {
   adviseRecurrence,
   blockerFingerprint,
   buildWakePrompt,
+  CAPTURE_HELPER_PATH,
   computeSilasDigest,
   consecutiveRecurrence,
   consolidatedBlockersFor,
@@ -15,6 +16,7 @@ import {
   followUpChangedTarget,
   loadSilasSkills,
   SilasDriver,
+  supervisionLookup,
   type DigestLedger,
   type GitHubPollPort,
   type RoundBlocker,
@@ -26,6 +28,7 @@ import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { DEFAULT_SILAS_CONFIG } from '../src/config.js';
 import type { AgentCapabilities, AgentHandle } from '../src/runtime/types.js';
+import type { AgentSupervisionView } from '../src/supervision/supervisor.js';
 import type { EventRecord, JobRecord, RoundRecord } from '../src/ledger/api.js';
 import type { Role } from '../src/config.js';
 
@@ -290,6 +293,255 @@ describe('silas digest (the four actionable states)', () => {
     } finally {
       h.cleanup();
     }
+  });
+
+  it('a supervision-stopped worker waits, never stalls — and a live worker still flags', async () => {
+    const h = makeLedger();
+    try {
+      h.ledger.addJob({ id: 'job-walled', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('job-walled', 'working');
+      h.ledger.registerAgent({ id: 'min-walled', role: 'minion', jobId: 'job-walled' });
+      h.ledger.setAgentState('min-walled', 'idle');
+      const now = Date.now();
+      const base = {
+        agentId: 'min-walled',
+        role: 'minion' as const,
+        slotId: null,
+        restarts: 2,
+        openTurn: false,
+        openToolCalls: 0,
+        lastEventAt: null,
+        lastFileBytes: null,
+      };
+      let view: AgentSupervisionView | null = {
+        ...base,
+        state: 'stopped',
+        breakerOpen: true,
+        stopReason: 'quota_wall',
+      };
+      const digestOf = () =>
+        computeSilasDigest({
+          ledger: h.ledger,
+          blockersForRound: async () => ({ blockers: [], note: null }),
+          config: DEFAULT_SILAS_CONFIG,
+          trigger: 'sweep',
+          now: () => now + DEFAULT_SILAS_CONFIG.stallThresholdMs + 1_000,
+          supervisionFor: (agentId) =>
+            (agentId === 'min-other-live' || agentId === 'min-disposed' || agentId === 'min-only-dead'
+              ? null
+              : view),
+        });
+
+      // Stopped worker: waiting on a human re-arm with a recorded cause —
+      // the board says waiting, so the digest must not fire a stall wake.
+      expect((await digestOf()).stalledWorking).toHaveLength(0);
+      // Breaker-open alone is the same wait even before the state settles.
+      view = { ...base, state: 'watching', breakerOpen: true, stopReason: null };
+      expect((await digestOf()).stalledWorking).toHaveLength(0);
+      // No stop record: the genuine stall still flags (the exemption is not
+      // a blanket mute).
+      view = null;
+      expect((await digestOf()).stalledWorking).toHaveLength(1);
+      // The shared-value arm (literally one fixture file now carries the
+      // ids/stamps for both suites — see the fixture-driven test below):
+      // a stopped worker newer than the older live record marks the lane
+      // WAITING on the board, so this stall channel must NOT wake it.
+      // Stamps are seeded under fake timers so the strict-newer relation
+      // never depends on the wall clock advancing between two writes.
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date('2026-09-23T08:00:00.000Z'));
+        h.ledger.registerAgent({ id: 'min-other-live', role: 'minion', jobId: 'job-walled' });
+        h.ledger.setAgentState('min-other-live', 'idle');
+        view = { ...base, state: 'stopped', breakerOpen: true, stopReason: 'quota_wall' };
+        // Make the stopped worker the newest record: the stop is the lane's
+        // current worker, and the board pins the same expectation.
+        vi.setSystemTime(new Date('2026-09-23T09:00:00.000Z'));
+        h.ledger.setAgentState('min-walled', 'idle');
+      } finally {
+        vi.useRealTimers();
+      }
+      const mixed = await digestOf();
+      expect(mixed.stalledWorking).toHaveLength(0);
+      // The mirrored direction: a stop OLDER than the live worker does not
+      // wait, and the live worker's silence stalls again.
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date('2026-09-23T10:00:00.000Z'));
+        h.ledger.setAgentState('min-other-live', 'idle');
+      } finally {
+        vi.useRealTimers();
+      }
+      const reDispatched = await digestOf();
+      expect(reDispatched.stalledWorking).toHaveLength(1);
+      expect(reDispatched.stalledWorking[0]?.minionId).toBe('min-other-live');
+      // A DISPOSED unsupervised record is not a live worker: a lane with a
+      // current stopped worker plus a dead record stays waiting and is
+      // never woken as stalled (round-3 finding).
+      h.ledger.addJob({ id: 'job-dead', repo: 'fixture-app', title: 'dead', briefing: 'b' });
+      h.ledger.setJobStatus('job-dead', 'working');
+      h.ledger.registerAgent({ id: 'min-stopped-dead', role: 'minion', jobId: 'job-dead' });
+      h.ledger.setAgentState('min-stopped-dead', 'idle');
+      h.ledger.registerAgent({ id: 'min-disposed', role: 'minion', jobId: 'job-dead' });
+      h.ledger.setAgentState('min-disposed', 'disposed');
+      const dead = await digestOf();
+      expect(dead.stalledWorking.filter((row) => row.jobId === 'job-dead')).toHaveLength(0);
+      // A lane whose ONLY worker is a dead record has no stop to wait on:
+      // the board shows COLD and the digest still wakes — both surfaces
+      // agree the lane is not running (round-4 definition).
+      h.ledger.addJob({ id: 'job-only-dead', repo: 'fixture-app', title: 'dead-only', briefing: 'b' });
+      h.ledger.setJobStatus('job-only-dead', 'working');
+      h.ledger.registerAgent({ id: 'min-only-dead', role: 'minion', jobId: 'job-only-dead' });
+      h.ledger.setAgentState('min-only-dead', 'disposed');
+      const onlyDead = await digestOf();
+      expect(onlyDead.stalledWorking.filter((row) => row.jobId === 'job-only-dead')).toHaveLength(1);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('the stall boundary matches the board (>): exactly at the threshold is not stalled', async () => {
+    const h = makeLedger();
+    try {
+      h.ledger.addJob({ id: 'job-edge', repo: 'fixture-app', title: 'edge', briefing: 'b' });
+      h.ledger.setJobStatus('job-edge', 'working');
+      h.ledger.registerAgent({ id: 'min-edge', role: 'minion', jobId: 'job-edge' });
+      h.ledger.setAgentState('min-edge', 'idle');
+      const activity = h.ledger.getAgent('min-edge')!.lastActivity!;
+      const at = Date.parse(activity);
+      const digestAt = (nowMs: number) =>
+        computeSilasDigest({
+          ledger: h.ledger,
+          blockersForRound: async () => ({ blockers: [], note: null }),
+          config: DEFAULT_SILAS_CONFIG,
+          trigger: 'sweep',
+          now: () => nowMs,
+        });
+      // The board's isStalledWorking uses `>` ("past the window"); the
+      // digest must agree exactly at the boundary (round-5 finding).
+      expect(
+        (await digestAt(at + DEFAULT_SILAS_CONFIG.stallThresholdMs)).stalledWorking,
+      ).toHaveLength(0);
+      expect(
+        (await digestAt(at + DEFAULT_SILAS_CONFIG.stallThresholdMs + 1)).stalledWorking,
+      ).toHaveLength(1);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('the shared cross-surface fixture drives the digest exactly as the board pins it', async () => {
+    // ONE fixture file is consumed by this suite and by
+    // web/src/lib/board-bands.test.ts: same ids/stamps/views for both the
+    // web waiting predicate and this digest stall predicate (followup
+    // review A0/edge0/V2). Stamps are seeded deterministically under fake
+    // timers — never by racing the wall clock between two writes.
+    const fixture = JSON.parse(
+      readFileSync(join(import.meta.dirname, 'fixtures', 'stop-attribution.json'), 'utf-8'),
+    ) as {
+      readonly digestNow: string;
+      readonly freshRegistrationAt: string;
+      readonly cases: readonly {
+        readonly name: string;
+        readonly agents: readonly {
+          readonly id: string;
+          readonly jobId: string;
+          readonly state: string;
+          readonly lastActivity: string | null;
+          readonly createdAt: string;
+          readonly supervision: {
+            readonly state: 'watching' | 'restarting' | 'stopped';
+            readonly restarts: number;
+            readonly breakerOpen: boolean;
+            readonly stopReason: string | null;
+            readonly stoppedAt?: string | null;
+          };
+        }[];
+        readonly digest: { readonly stalled: boolean };
+      }[];
+    };
+    expect(fixture.cases.length).toBeGreaterThan(2);
+    for (const testCase of fixture.cases) {
+      const h = makeLedger();
+      try {
+        h.ledger.addJob({ id: 'job-1', repo: 'fixture-app', title: testCase.name, briefing: 'b' });
+        h.ledger.setJobStatus('job-1', 'working');
+        const supervisionById = new Map(testCase.agents.map((agent) => [agent.id, agent]));
+        vi.useFakeTimers();
+        try {
+          for (const agent of testCase.agents) {
+            // Registration stamps the row's createdAt; an inactive worker
+            // keeps last_activity NULL and orders by that createdAt.
+            vi.setSystemTime(new Date(agent.lastActivity ?? agent.createdAt ?? fixture.freshRegistrationAt));
+            h.ledger.registerAgent({ id: agent.id, role: 'minion', jobId: agent.jobId });
+            if (agent.lastActivity !== null) h.ledger.setAgentState(agent.id, 'idle');
+          }
+        } finally {
+          vi.useRealTimers();
+        }
+        const digest = await computeSilasDigest({
+          ledger: h.ledger,
+          blockersForRound: async () => ({ blockers: [], note: null }),
+          config: DEFAULT_SILAS_CONFIG,
+          trigger: 'sweep',
+          now: () => Date.parse(fixture.digestNow),
+          supervisionFor: (agentId) => {
+            const agent = supervisionById.get(agentId);
+            if (agent === undefined) return null;
+            const view: AgentSupervisionView = {
+              agentId,
+              role: 'minion',
+              slotId: null,
+              ...agent.supervision,
+              openTurn: false,
+              openToolCalls: 0,
+              lastEventAt: null,
+              lastFileBytes: null,
+            };
+            return view;
+          },
+        });
+        expect(
+          digest.stalledWorking.length,
+          `${testCase.name}: digest ${testCase.digest.stalled ? 'must' : 'must not'} stall`,
+        ).toBe(testCase.digest.stalled ? 1 : 0);
+      } finally {
+        h.cleanup();
+      }
+    }
+  });
+
+  it('supervisionLookup binds the supervisor views exactly as main.ts wires them', () => {
+    // Final independent review T2: the factory is the tested seam; a
+    // dropped or broken binding would silently re-enable stall wakes for
+    // stopped lanes. Twelve-followthrough A4: the lookup is LATE-BOUND —
+    // the getter is read per call, so a handle assigned after construction
+    // is seen instead of freezing a null supervisor.
+    const view: AgentSupervisionView = {
+      agentId: 'wired', role: 'minion', slotId: null, state: 'stopped', restarts: 2,
+      breakerOpen: true, stopReason: 'quota_wall', openTurn: false, openToolCalls: 0,
+      lastEventAt: null, lastFileBytes: null,
+    };
+    let current: { readonly viewFor: (agentId: string) => AgentSupervisionView | null } | null = null;
+    const lookup = supervisionLookup(() => current);
+    // A missing supervisor (not yet constructed at boot) reads as no view.
+    expect(lookup('wired')).toBeNull();
+    current = { viewFor: (agentId) => (agentId === 'wired' ? view : null) };
+    expect(lookup('wired')).toBe(view);
+    expect(lookup('other')).toBeNull();
+    expect(supervisionLookup(() => null)('wired')).toBeNull();
+  });
+
+  it('the main assembly wires the supervisor stop truth into the driver (assembly alarm)', () => {
+    // Tracked-review V2: the behavior has unit coverage but no assembly
+    // pin — dropping the supervisionFor wiring in main.ts would silently
+    // re-enable stall wakes for stopped lanes and no behavioral test would
+    // fail. Twelve-followthrough A4: the pin requires the late-bound
+    // getter form, not an early-captured value. This is the repo's
+    // established source-drift alarm pattern.
+    const mainSource = readFileSync(join(import.meta.dirname, '..', 'src', 'main.ts'), 'utf8');
+    expect(mainSource).toMatch(/supervisionFor:\s*supervisionLookup\(\s*\(\)\s*=>\s*supervisor\s*\)/);
+    expect(mainSource).toMatch(/import\s*\{[^}]*\bsupervisionLookup\b[^}]*\}\s*from\s*'\.\/dispatch\/silas-driver\.js'/);
   });
 
   it('a fresh delivery after a changes-requested verdict is re-review due, not directive-due', async () => {
@@ -805,6 +1057,12 @@ describe('silas skills and wake prompt', () => {
     expect(prompt).toContain('clean-abort-service-restart');
     expect(prompt).toContain('source_round_id');
     expect(prompt).not.toContain('human holds the merge);');
+    // Verification capture (issue #159): the wake prompt names the shipped
+    // helper absolutely so no lane hand-rolls a watcher — the resolved path
+    // must be the package's own compiled CLI, not merely a matching basename.
+    expect(prompt).toContain('Verification capture helper');
+    expect(CAPTURE_HELPER_PATH).toBe(join(import.meta.dirname, '..', 'dist', 'verify', 'capture-cli.js'));
+    expect(prompt).toContain(`${CAPTURE_HELPER_PATH} run --job`);
   });
 
   it('the wake prompt carries skills, ops surface, digest, and the no-cap ladder', () => {
@@ -861,6 +1119,10 @@ function makeDriver(opts: {
     setInterval: typeof setInterval;
     clearInterval: typeof clearInterval;
   };
+  /** The board's live stop truth, wired through to the digest the same way
+   * main.ts wires it (final independent review T0). */
+  supervisionFor?: (agentId: string) => AgentSupervisionView | null;
+  now?: () => number;
 } = {}): DriverHarness {
   const h = makeLedger();
   const prompts: { text: string; owner?: string }[] = [];
@@ -906,6 +1168,8 @@ function makeDriver(opts: {
     ...(opts.githubPoll !== undefined ? { githubPoll: opts.githubPoll } : {}),
     ...(opts.skills !== undefined ? { skills: opts.skills } : {}),
     ...(opts.timers !== undefined ? { setInterval: opts.timers.setInterval, clearInterval: opts.timers.clearInterval } : {}),
+    ...(opts.supervisionFor !== undefined ? { supervisionFor: opts.supervisionFor } : {}),
+    ...(opts.now !== undefined ? { now: opts.now } : {}),
     log: () => {},
   });
   return {
@@ -1025,6 +1289,47 @@ describe('silas driver wakes', () => {
       expect(h.prompts).toHaveLength(0);
       await h.driver.trigger({ kind: 'sweep' });
       expect(h.prompts).toHaveLength(1);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('the supervisionFor wiring reaches the digest: a stopped worker never wakes as stalled', async () => {
+    // main.ts injects the supervisor views into the DRIVER; a broken wiring
+    // would silently re-enable stall wakes for stopped lanes (final
+    // independent review T0). The stop truth travels the real path here.
+    const realNow = Date.now();
+    const future = (): number => realNow + DEFAULT_SILAS_CONFIG.stallThresholdMs + 1_000;
+    const base = {
+      agentId: 'min-wired',
+      role: 'minion' as const,
+      slotId: null,
+      restarts: 1,
+      openTurn: false,
+      openToolCalls: 0,
+      lastEventAt: null,
+      lastFileBytes: null,
+    };
+    let view: AgentSupervisionView | null = {
+      ...base,
+      state: 'stopped',
+      breakerOpen: true,
+      stopReason: 'quota_wall',
+    };
+    const h = makeDriver({ now: future, supervisionFor: (agentId) => (agentId === 'min-wired' ? view : null) });
+    try {
+      h.ledger.addJob({ id: 'job-wired', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('job-wired', 'working');
+      h.ledger.registerAgent({ id: 'min-wired', role: 'minion', jobId: 'job-wired' });
+      h.ledger.setAgentState('min-wired', 'idle');
+      // A waiting lane: the sweep has nothing to wake Silas about.
+      await h.driver.trigger({ kind: 'sweep' });
+      expect(h.prompts).toHaveLength(0);
+      expect(h.ledger.listEvents({ limit: 50 }).filter((event) => event.kind === 'silas.wake')).toHaveLength(0);
+      // The same wiring with no stop record: the genuine stall wakes.
+      view = null;
+      await h.driver.trigger({ kind: 'sweep' });
+      await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
     } finally {
       h.cleanup();
     }

@@ -458,7 +458,7 @@ describe('wizard CLI surface', () => {
   it('--answers rejects secrets (token) and non-object JSON with the documented errors', async () => {
     const repoRoot = join(import.meta.dirname, '..');
     const wizard = join(repoRoot, 'dist/wizard/main.js');
-    const runWizard = async (answers: string): Promise<{ status: number; stderr: string }> => {
+    const runWizard = async (answers: string): Promise<{ status: number; stdout: string; stderr: string }> => {
       try {
         const res = await runOwnedCommand(process.execPath, [wizard, '--answers', answers], {
           label: 'wizard --answers <json>',
@@ -470,7 +470,7 @@ describe('wizard CLI surface', () => {
         markFixtureStep(`wizard --answers <json> → exit ${status}`);
         // Preserve the historical shape: the success branch surfaced stdout
         // through `stderr` (assertions only read the failure branch).
-        return { status, stderr: status === 0 ? res.stdout : res.stderr };
+        return { status, stdout: res.stdout, stderr: status === 0 ? res.stdout : res.stderr };
       } catch (error) {
         // A deadline overrun fails loud rather than posing as exit 1.
         if (error instanceof OwnedCommandTimeoutError) markFixtureStep('wizard --answers <json> → timeout');
@@ -481,6 +481,7 @@ describe('wizard CLI surface', () => {
     const secret = await runWizard('{"token":"leaky"}');
     expect(secret.status).toBe(1);
     expect(secret.stderr).toContain('secrets are forbidden in --answers: token');
+    expect(secret.stdout).not.toContain('Runtime probe:');
     // Non-object JSON must produce the documented parse error — never a
     // raw TypeError from the round-trip key pre-parse (Perkins R1 warning).
     for (const bad of ['null', '[1,2]', '"str"']) {
@@ -488,7 +489,29 @@ describe('wizard CLI surface', () => {
       expect(res.status, bad).toBe(1);
       expect(res.stderr, bad).toMatch(/must be a JSON object|not valid JSON/);
       expect(res.stderr, bad).not.toContain('TypeError');
+      // Fail-fast ordering: an invalid payload never reaches the runtime
+      // probe (which spawns runtime CLIs and loads the adapter SDKs).
+      expect(res.stdout, bad).not.toContain('Runtime probe:');
     }
+  });
+
+  it('a valid --answers run still prints the runtime probe (fail-fast only skips invalid input)', async () => {
+    // Final independent review T0: the fail-fast refactor is asserted
+    // negatively above; this pins the other half — valid runs still probe
+    // (and therefore still print the probe block).
+    const repoRoot = join(import.meta.dirname, '..');
+    const wizard = join(repoRoot, 'dist', 'wizard', 'main.js');
+    const result = await runOwnedCommand(
+      process.execPath,
+      [wizard, '--answers', JSON.stringify({ smoke: false, port: 0 })],
+      {
+        label: 'wizard valid --answers probe',
+        deadlineMs: 30_000,
+        env: { ...process.env, GRU_COMMAND_HOME: tempDir('gru-command-wizard-valid-') },
+      },
+    );
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(result.stdout).toContain('Runtime probe:');
   });
 
   it('pre-flight port check: an occupied fixed port fails LOUD with stop-first guidance, nothing written (Perkins r2 H2)', async () => {

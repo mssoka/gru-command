@@ -4,6 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { configPathFor } from '../src/config.js';
+import { LedgerApi } from '../src/ledger/api.js';
+import { LedgerDb } from '../src/ledger/db.js';
 
 const cleanupDirs: string[] = [];
 afterAll(() => {
@@ -201,5 +203,64 @@ describe('graceful shutdown', () => {
     expect(stderr).toContain('configuration invalid');
     expect(stderr).toContain('workspace_root');
     expect(stderr).toContain(configPathFor(home));
+  });
+
+  it('boot reconciliation summary pins the actual counter mapping (examined markers, retired jobs)', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'gru-command-rebrief-summary-'));
+    cleanupDirs.push(home);
+    writeFileSync(configPathFor(home), '[server]\nhost = "127.0.0.1"\nport = 0\n', 'utf-8');
+    // Seed the production incident shape (2026-09-30 08:03Z boot): TWO
+    // merged jobs, each with an admitted re-brief pair that can never be
+    // honored. Admission MUST happen while each job is still nonterminal —
+    // the real terminal intake guard refuses markers on merged/done lanes —
+    // and the job merges afterwards, exactly how the stale production
+    // markers were created. Same data dir the service opens; temp ledger,
+    // ephemeral port, no real instance/credentials.
+    const seed = new LedgerDb(home);
+    const seeded = new LedgerApi(seed.handle);
+    for (const jobId of ['merged-pr-one', 'merged-pr-two']) {
+      seeded.addJob({ id: jobId, repo: 'fixture', title: 't', briefing: 'b' });
+      seeded.setJobStatus(jobId, 'working');
+      seeded.beginPendingRebrief({ jobId, note: 'n', briefing: 'b' });
+      seeded.setJobStatus(jobId, 'in-review');
+      seeded.setJobStatus(jobId, 'merged');
+    }
+    seed.close();
+
+    const { child, getStderr } = spawnService(home);
+    try {
+      await waitForHealthyPort(home, getStderr);
+      // The summary mixes units BY DESIGN (main.ts emits the existing
+      // mapping): `examined` counts MARKERS while completed/redispatched/
+      // retired count JOBS — two retired pairs read examined: 4, retired: 2,
+      // not a partial failure.
+      const summary = await waitFor(
+        () => readLogLines(home).find((line) => line.msg === 're-brief reconciliation'),
+        15_000,
+        're-brief reconciliation summary',
+      );
+      expect(summary?.['examined']).toBe(4);
+      expect(summary?.['completed']).toBe(0);
+      expect(summary?.['redispatched']).toBe(0);
+      expect(summary?.['retired']).toBe(2);
+
+      const exitCode = await new Promise<number | null>((resolveExit) => {
+        child.on('exit', (code) => resolveExit(code));
+        child.kill('SIGTERM');
+      });
+      expect(exitCode).toBe(0);
+      // The boot pass itself did the retirement: markers gone, one audit
+      // per job carrying that job's terminal status.
+      const verifyDb = new LedgerDb(home);
+      const verify = new LedgerApi(verifyDb.handle);
+      for (const jobId of ['merged-pr-one', 'merged-pr-two']) {
+        expect(verify.listPendingRebriefs({ jobId })).toHaveLength(0);
+        const audit = verify.latestJobEvent(jobId, 'silas.rebrief-retired');
+        expect((audit?.payload as { job_status?: string }).job_status).toBe('merged');
+      }
+      verifyDb.close();
+    } finally {
+      if (child.exitCode === null) child.kill('SIGKILL');
+    }
   });
 });

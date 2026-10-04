@@ -98,7 +98,9 @@ publishes it on the in-process event bus (`src/events/bus.ts`).
 | `lens.bound` / `lens.status` | agentId / from→to (+note) |
 | `agent.spawned` / `agent.state` / `agent.error` | role, label / from→to (+error) / error, fatal |
 | `verification.started` / `verification.completed` | run id, scope, command, sha, workers, queued ms / ok, exit code, duration, bounded output hash+tail |
-| `verification.lock-timeout` / `verification.stale-released` | wait ms + holder counts / pid, reason (`holder-dead` \| `no-runner` \| `max-age`), age |
+| `verification.requested` / `verification.attached` | admitted single-flight attempt: request id, run id, dedupe key (job+lane+scope+head+command) / a duplicate submission attached to that producer |
+| `verification.reconciled` | a completed request identity replayed its recorded outcome — no rerun |
+| `verification.lock-timeout` / `verification.stale-released` | wait ms + holder counts + request id / pid, reason (`holder-dead` \| `no-runner` \| `max-age`), age, interrupted request ids |
 | `branch-idle.refused` / `branch-idle.forced` | phase (`arm`/`freeze`), targetBranch, blockers — the review-arm branch-idle guard (forced rounds also carry the tag in their frozen manifest). The fallback route's two RECORD-EMITTING arm checks are the intake guard and the post-pre-flight re-entry, so a forced fallback admission records TWO `arm`-phase override records where the native route records `arm` + `freeze`. The running gate's boundary re-proofs (round intake, default-reviewer worker admission) emit NO branch-idle rows — a stop there is a `job.fallback-review` phase `aborted` |
 | `silas.review-deferred` | target_branch, phase, blockers — Silas defers a refused arm to its next sweep |
 
@@ -120,7 +122,9 @@ row, appends the event, and (with a bus attached) publishes it:
 - agents: `registerAgent` (upsert) · `setAgentState`
 - events: `appendCustomEvent` · `listEvents`
 - re-briefs: `beginPendingRebrief` · `bindPendingRebriefWorker` ·
-  `listPendingRebriefs` · `clearPendingRebriefs`
+  `listPendingRebriefs` · `clearPendingRebriefs` · `retirePendingRebriefs`
+  (the only cancellation seam: identity-checked deletion + one terminal
+  `silas.rebrief-retired` audit in the same transaction)
 - reads: `getJob` · `listJobs(repo?)` · `getRound` · `listRounds` ·
   `getAgent` · `listAgents`
 
@@ -156,12 +160,31 @@ event — `kind` is `silas.rebrief` or `job.delivered` — with `job_id`,
 the request `payload` (note + briefing) and its sha256 `payload_hash`,
 the `baseline_seq` event watermark the request must post-date, the bound
 worker (`agent_id`, `session_file`), and `requested_at`. The marker pair
-is written BEFORE any worker spawns and cleared ONLY when its events
-land; `UNIQUE (job_id, kind)` means a newer request supersedes an older
+is written BEFORE any worker spawns and cleared when its events land — or
+retired administratively when the job is already `merged`/`done` (below);
+`UNIQUE (job_id, kind)` means a newer request supersedes an older
 marker. Boot reconciliation (`src/dispatch/rebrief-recovery.ts`)
 consumes leftovers: resume the interrupted session (or re-dispatch fresh
 on the same lane), record the missing events, or escalate
-action-required when recovery fails.
+action-required when recovery fails. A leftover whose job has since
+reached `merged`/`done` is instead retired administratively: the
+identity-checked marker deletion and a single `silas.rebrief-retired`
+audit commit in one transaction, with no spawn and no escalation.
+Retirement fires wherever the terminal state is met — the boot scan, a
+settling turn, or the re-dispatch boundary — not only at boot. Spent
+markers (both guarded events already landed) are the exception: they
+clear as the completed request they are, with no retirement audit. A
+malformed pair (missing kind or mismatched phase id, payload hash, or
+watermark) stays visible and escalates for repair instead of being
+completed or retired, even when terminal. A completed pair publishes
+`silas.rebrief-settled` after its markers clear; retirement and escalation
+do not publish settlement. The boot summary's units are mixed by design:
+`examined` counts markers while `completed`/`redispatched`/`retired` count
+jobs, so one retired
+marker pair reads `examined: 2 … retired: 1` — not a partial failure. A
+group counts once per scan in which at least one of its markers retires;
+a group partially retired by one scan and completed by a later scan is
+counted by each scan that retired part of it.
 
 ### Residency admission + durable review handoffs (custom events)
 
