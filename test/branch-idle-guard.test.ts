@@ -1529,12 +1529,13 @@ describe('branch-idle guard', () => {
     try {
       // merged reaches terminal via in-review; done is reachable directly.
       await createLaneJob(h, repo, { jobId: 'terminal-merged', status: 'delivered' });
+      h.ledger.beginPendingRebrief({ jobId: 'terminal-merged', note: 'n', briefing: 'b' });
       h.ledger.setJobStatus('terminal-merged', 'in-review');
       h.ledger.setJobStatus('terminal-merged', 'merged');
       await createLaneJob(h, repo, { jobId: 'terminal-done', status: 'delivered' });
+      h.ledger.beginPendingRebrief({ jobId: 'terminal-done', note: 'n', briefing: 'b' });
       h.ledger.setJobStatus('terminal-done', 'done');
       for (const [jobId, status] of [['terminal-merged', 'merged'], ['terminal-done', 'done']] as const) {
-        h.ledger.beginPendingRebrief({ jobId, note: 'n', briefing: 'b' });
         const refused = await postReview(h, { job_id: jobId });
         expect(refused.status).toBe(400);
         expect((refused.json as { detail?: string }).detail).toContain(

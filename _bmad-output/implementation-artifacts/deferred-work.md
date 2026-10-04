@@ -16,3 +16,36 @@
 - source_spec: `_bmad-output/implementation-artifacts/pr136-chief-handoff/plan.md`
   summary: `reconcilePendingRebriefs` delivery-only branch may append a `silas.rebrief-recovered` event for a marker group replaced by a newer request mid-boot
   evidence: Markers are read as a boot snapshot; a newer re-brief request can replace them while recovery runs. The `expectedPhaseId` fence added by this delta prevents any phase completion from the stale group (and nothing is cleared), but the recovered-history event is still appended as noise.
+- source_spec: `_bmad-output/implementation-artifacts/spec-pr142-review-verdict-closure.md`
+  summary: App review reconciliation can certify absence from a review-list record missing delivery-predicate fields.
+  evidence: Inherited from main e75ca3d; `isDecidableReviewEntry` permits absent state/commit_id/body/submitted_at, while a short `lookupMatchingReview` page can certify non-delivery. Blind 1, Edge 2 and Verification Other 1 share this defect.
+- source_spec: `_bmad-output/implementation-artifacts/spec-pr142-review-verdict-closure.md`
+  summary: App reconciliation refuses otherwise matching provider-quoted review IDs accepted by the receipt contract.
+  evidence: Inherited from main e75ca3d; `usableProviderReviewId` accepts string IDs but `isDecidableReviewEntry` rejects them before matching, leaving an ambiguous POST unresolved.
+- source_spec: `_bmad-output/implementation-artifacts/spec-pr142-review-verdict-closure.md`
+  summary: An unrelated malformed App review-list entry prevents crediting a complete matching review on the same page.
+  evidence: Inherited from main e75ca3d; the whole-page `list.some(!isDecidableReviewEntry)` throws before `reviews.find(isMatchingAppReview)` runs, even though positive identity is independently verifiable.
+- source_spec: `_bmad-output/implementation-artifacts/spec-pr142-review-verdict-closure.md`
+  summary: App installation token is not rechecked for expiry immediately before the irreversible review POST.
+  evidence: Inherited from main e75ca3d; the pre-mint check permits roughly 30 seconds of remaining life, but the identity and PR probes can together consume that window before the POST.
+- source_spec: `_bmad-output/implementation-artifacts/spec-pr142-review-verdict-closure.md`
+  summary: A direct fallback review may pass after its job is blocked or parked during the reviewer turn.
+  evidence: Inherited from main e75ca3d; the post-await guard only rejects terminal state/working hops and checks review authorization for handoffs, not direct gates. Blind 6 and Edge 3 share this defect.
+- source_spec: `_bmad-output/implementation-artifacts/spec-pr142-review-verdict-closure.md`
+  summary: Silas digest may publish a stale review candidate after it becomes blocked or parked during another candidate's awaited history.
+  evidence: Inherited from main e75ca3d; `prWithoutReview` intake requires review-eligible status, but final filtering excludes only merged/done and pending markers.
+- source_spec: `_bmad-output/implementation-artifacts/spec-pr142-review-verdict-closure.md`
+  summary: A fallback review can pass a working-tree diff changed during its asynchronous reviewer turn.
+  evidence: Inherited from main e75ca3d; `recheckRound` watches ledger markers/status/settlement, but not the captured diff or HEAD; an independent lane edit with no ledger event can obsolete the reviewed bytes.
+- source_spec: `_bmad-output/implementation-artifacts/spec-pr142-review-verdict-closure.md`
+  summary: Completed re-brief markers can clear without publishing the durable settlement wake when the append fails.
+  evidence: Inherited from main e75ca3d; completion clears markers in one transaction, then appends `silas.rebrief-settled` separately; no pending markers remain to trigger another recovery pass or live queued-handoff retry if append fails.
+- source_spec: `_bmad-output/implementation-artifacts/spec-pr142-review-verdict-closure.md`
+  summary: Historical App baseline scope labels an intermediate pinned test version as the final current contract.
+  evidence: Inherited from main e75ca3d; `tools/app-contract-baseline.sh` overlays `0c4e129` tests and suite pin, so registration is self-consistent but newer current App oracles do not run against the historical baseline.
+- source_spec: `_bmad-output/implementation-artifacts/spec-pr142-review-verdict-closure.md`
+  summary: App publication runbook calls an unproven ambiguous POST safe to retry after a visual review check.
+  evidence: Inherited from main e75ca3d; `docs/PERKINS-APP-PUBLICATION.md` states that otherwise it was not delivered, even though incomplete lists and eventual provider visibility cannot prove absence.
+- source_spec: `_bmad-output/implementation-artifacts/spec-pr142-review-verdict-closure.md`
+  summary: Owned-service one-line-wrapper success path lost its dedicated installer regression oracle.
+  evidence: Inherited from main e75ca3d; the success leg in `test/install-one-line.test.ts` now runs `target/install.sh`, while only the foreign-service refusal still exercises `bare/install.sh`.

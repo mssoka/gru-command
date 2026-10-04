@@ -25,6 +25,13 @@ handoff-wave = "npx vitest run --config vitest.heavy.config.ts test/perkins-buil
 working-flavor = "cd web && npx vitest run src/lib/working-flavor.test.ts src/ui/chat-working-flavor.test.ts src/ui/chat-attachments.test.ts src/ui/chat-composer.test.ts src/ui/chat-console.test.ts src/ui/chat-gfm-invariant.test.ts src/ui/chat-scroll.test.ts src/ui/chat-service-band.test.ts src/ui/chat-tool-turn.test.ts"
 compaction-rollback = "npx vitest run test/pi-adapter.test.ts test/supervisor.test.ts test/config.test.ts test/health.test.ts test/board-engine.test.ts test/suite-shape.test.ts"
 
+# Retained PR142 worktree-specific verification scopes.
+terminal-rebrief = "node tools/patch-vitest-rpc-timeout.mjs && npx tsc && node -e \"const fs=require('node:fs'); fs.mkdirSync('dist/runtime',{recursive:true}); fs.copyFileSync('src/runtime/review-mcp-server.mjs','dist/runtime/review-mcp-server.mjs')\" && node tools/verify-perkins-resource.mjs . && node tools/write-build-rev.mjs && npx vitest run --config vitest.heavy.config.ts test/dispatch-server.test.ts test/shutdown.test.ts && npx vitest run test/rebrief-recovery.test.ts test/ledger-api.test.ts test/suite-shape.test.ts"
+pr142-static-preflight = "npx eslint . && npx tsc --noEmit -p tsconfig.test.json"
+pr142-review-triage = "node tools/patch-vitest-rpc-timeout.mjs && npx tsc && node -e \"const fs=require('node:fs'); fs.mkdirSync('dist/runtime',{recursive:true}); fs.copyFileSync('src/runtime/review-mcp-server.mjs','dist/runtime/review-mcp-server.mjs')\" && node tools/verify-perkins-resource.mjs . && node tools/write-build-rev.mjs && npx vitest run --config vitest.heavy.config.ts test/dispatch-server.test.ts test/shutdown.test.ts && npx vitest run test/rebrief-recovery.test.ts test/ledger-api.test.ts test/runtime-probe.test.ts test/suite-shape.test.ts"
+runtime-capability-decoupling = "node tools/patch-vitest-rpc-timeout.mjs && npx tsc && node -e \"const fs=require('node:fs'); fs.mkdirSync('dist/runtime',{recursive:true}); fs.copyFileSync('src/runtime/review-mcp-server.mjs','dist/runtime/review-mcp-server.mjs')\" && node tools/verify-perkins-resource.mjs . && node tools/write-build-rev.mjs && npx vitest run --config vitest.heavy.config.ts test/claude-adapter.test.ts test/wizard.test.ts && npx vitest run test/runtime-probe.test.ts test/suite-shape.test.ts"
+claude-adapter-cleanup = "npx vitest run --config vitest.heavy.config.ts test/claude-adapter.test.ts && npx vitest run test/suite-shape.test.ts"
+
 # One narrow FAILED-FULL discriminator at the frozen head (diagnostic,
 # not a gate): the named cases now use the current heavy-file budget,
 # not the historical 30 s ceiling. The approved RPC pretest runs first.
