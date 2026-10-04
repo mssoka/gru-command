@@ -1286,9 +1286,10 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     const handles: AgentHandle[] = [];
     const configFiles: string[] = [];
     try {
-      // Concurrency note: a hybrid round runs up to seven lens children at
-      // once; each gets its OWN bridge, and none may outlive its session.
-      for (let index = 0; index < 7; index += 1) {
+      // Concurrency note: a hybrid round runs as many concurrent lens
+      // children as its admitted wave allows (the catalog has nine lenses);
+      // each gets its OWN bridge, and none may outlive its session.
+      for (let index = 0; index < 9; index += 1) {
         const handle = await fx.runtime.spawn('perkins', {
           cwd: fx.workspace,
           isolatedReview: {
@@ -1311,8 +1312,8 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         expect(existsSync(dirname(configFile))).toBe(true);
       }
       // Distinct bridges, one per child — never a shared cross-child bridge.
-      expect(new Set(configFiles).size).toBe(7);
-      for (let index = 0; index < 7; index += 1) {
+      expect(new Set(configFiles).size).toBe(9);
+      for (let index = 0; index < 9; index += 1) {
         const listed = await bridgeProbe(configFiles[index]!, '__list__', {}) as Array<{ name: string }>;
         expect(listed.map((tool) => tool.name)).toEqual([`perkins_child_${index}`]);
       }
@@ -1379,9 +1380,9 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         movementRef: 'feature/review', noSpec: false,
       });
       expect(result.canonicalVerdict).toBe('READY TO MERGE');
-      expect(result.specialistRuns.filter((run) => run.status === 'valid')).toHaveLength(7);
+      expect(result.specialistRuns.filter((run) => run.status === 'valid')).toHaveLength(9);
       const invocations = doubleInvocations(fx);
-      expect(invocations).toHaveLength(8);
+      expect(invocations).toHaveLength(10);
       const lead = invocations.find((record) => record.prompt.includes('COMPLETE FROZEN DIFF (the whole change under review)'));
       expect(lead).toBeDefined();
       const configFile = lead!.argv[lead!.argv.indexOf('--mcp-config') + 1];

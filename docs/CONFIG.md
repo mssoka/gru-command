@@ -368,7 +368,9 @@ max_workers = 4
 enabled = true
 # Simultaneous lens children inside the global resident pool (not extra slots).
 # Positive integer <= 32 (review-gated bound); effective concurrency also
-# depends on spare global slots.
+# depends on spare global slots. Specialists are lead-selected whole-change
+# lenses run in explicit batches inside ONE round; the round stays bounded
+# to 16 real runs and two attempts per lens regardless of this ceiling.
 max_concurrent_children = 2
 
 [verify]

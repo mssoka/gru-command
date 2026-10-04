@@ -852,6 +852,15 @@ bad_spec).
 - Lane records updated: spec status back to `in-review`; deferred-work
   block converted to a resolved record with dispositions.
 
+- Base re-integration #2 (2026-10-04): origin/main advanced to `f29a4b3`
+  (PR #198 agent-status-truth #171, PR #199 ops-contracts #125/#128,
+  PR #202 rearm-ownership-guards), making PR #165 DIRTY and suppressing
+  its pull_request CI runs. History-preserving merge; one conflict in
+  `test/silas-driver.test.ts` resolved keep-both (the lane's corrected
+  fallback/completion pins plus main's issue-#125 lens-retry pins).
+  Auto-merged src/dispatch/silas-driver.ts and the whole-review/suite-shape
+  test files; full fast phase green (1658 passed) on the merged tree.
+
 - Deferral clearing (owner directive: no deferral, clear the backlog):
   row 36 implemented — the tarball smoke now imports the staged compiled
   `dist/dispatch/silas-driver.js` and asserts `loadSilasSkills()` resolves

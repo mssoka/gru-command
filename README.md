@@ -25,13 +25,16 @@ waves), and OS service install — see [docs/EPICS.md](docs/EPICS.md).
   review rounds with per-lens live chips, notification center
   ([BOARD.md](docs/BOARD.md)).
 - **Dispatch flow** — briefing → per-job git worktrees → minions →
-  adversarial hybrid review waves → SHA-bound PR verdicts. Perkins runs seven
-  required lens types per frozen chunk (six only for explicit no-spec), with
-  malformed attempts retryable within a pinned bound. Its install-relative,
-  integrity-pinned policy is the sole prompt authority; repository text is
-  untrusted evidence. Claude leads alone receive a fresh scoped MCP bridge for
-  the same narrow native tools ([FLOW.md](docs/FLOW.md),
-  [WORKTREES.md](docs/WORKTREES.md)).
+  adversarial hybrid review waves → SHA-bound PR verdicts. One Perkins lead
+  reviews the complete frozen change and selects optional specialist lenses
+  from the nine-lens whole-change catalog (eight for explicit no-spec).
+  Specialists run in lead-submitted batches inside ONE round, bounded to 16
+  real runs, two attempts per lens, and two terminal submissions, with
+  failed and unused lenses reported as real coverage facts rather than a
+  mandatory gate. Its install-relative, integrity-pinned policy is the sole
+  prompt authority; repository text is untrusted evidence. Claude leads alone
+  receive a fresh scoped MCP bridge for the same narrow native tools
+  ([FLOW.md](docs/FLOW.md), [WORKTREES.md](docs/WORKTREES.md)).
 - **Hosted ops (Silas)** — the operations role runs as a supervised session
   that closes the follow-through loop without a human ping (delivered job →
   PR registered → review wave) and breaks recurring blocker loops: same

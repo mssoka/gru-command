@@ -1,3 +1,9 @@
+- source_spec: `_bmad-output/implementation-artifacts/spec-review-input-handoff.md`
+  summary: The non-blind specialist child's fail-closed `capabilities.images` check has no test that can observe it (the test double applies one capability to lead and children alike).
+  evidence: Verification-gap layer 2026-10-04; deleting `assertEvidenceCapability(handle, childImages, ...)` at `src/dispatch/perkins-review/whole.ts` keeps every test green, but today the lead and children resolve to the same review model/capabilities (`src/dispatch/perkins.ts` passes `reviewModel` to both), so the child branch is unreachable with heterogeneous capabilities. Closing it needs a per-handle capability seam on `fakeWholeSpawner` plus a case asserting the lens fails closed while the lead reviews.
+- source_spec: `_bmad-output/implementation-artifacts/spec-review-input-handoff.md`
+  summary: A canonical amendment body can reproduce host marker lines (`## Amendment #N`, `status: EFFECTIVE`, the frozen-spec delimiter) inside the rendered effective contract.
+  evidence: Blind-hunter layer 2026-10-04; `renderEffectiveContract` interpolates the approved body verbatim at column 0. Only the authenticated writer (pairing token) can append bodies, so the practical risk is low, but a future renderer hardening should quote/indent bodies or escape host marker prefixes; no unauthenticated path exists.
 - source_spec: `_bmad-output/implementation-artifacts/spec-gh-97-owner-stop-routing.md`
   summary: Add a decisions.degraded.* variant of the fresh-owner-row regression (unacked legacy machine row of a degraded kind)
   evidence: The postIncident mechanism is kind-agnostic and covered via the provider-wall kind; the degraded producer merely shares it, so this is adjacent coverage, not a defect.

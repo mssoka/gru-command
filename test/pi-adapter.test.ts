@@ -881,11 +881,20 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
             deltas: [],
             toolCall: {
               id: 'lead-run-2', name: 'perkins_run_specialists',
-              args: { runs: ['architecture', 'codebase', 'tests'].map((lens) => ({ lens })) },
+              args: { runs: ['architecture', 'codebase', 'tests', 'performance'].map((lens) => ({ lens })) },
             },
           };
         }
-        if (leadTurns >= 4) return { deltas: ['whole-PR lead complete'] };
+        if (leadTurns === 3) {
+          return {
+            deltas: [],
+            toolCall: {
+              id: 'lead-run-3', name: 'perkins_run_specialists',
+              args: { runs: ['operations'].map((lens) => ({ lens })) },
+            },
+          };
+        }
+        if (leadTurns >= 5) return { deltas: ['whole-PR lead complete'] };
         const targetSha = /^Frozen target SHA: (.+)$/m.exec(prompt)?.[1] ?? '';
         const baseSha = /^Frozen diff base SHA: (.+)$/m.exec(prompt)?.[1] ?? '';
         return {
@@ -902,7 +911,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
                 '**Verdict: READY TO MERGE**',
                 `Target: ${targetSha}`,
                 `Base: ${baseSha}`,
-                'Specialists: blind edge acceptance security architecture codebase tests',
+                'Specialists: blind edge acceptance security architecture codebase tests performance operations',
                 'warning Verified adapter finding src/main.ts:2',
                 'warning Changed behavior lacks test tracing src/main.ts:2 — add an assertion for the changed return value.',
                 'Retain verification coverage for this path.',
@@ -911,7 +920,7 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
           },
         };
       }
-      const lens = /Your lens id is "(blind|edge|acceptance|security|architecture|codebase|tests)"/u.exec(prompt)?.[1];
+      const lens = /Your lens id is "(blind|edge|acceptance|security|architecture|codebase|tests|performance|operations)"/u.exec(prompt)?.[1];
       // Native-tool children submit structured findings through the product
       // tool; assistant text is never the findings channel on pi.
       const childFindings = lens === 'security'
@@ -967,13 +976,13 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
         movementRef: 'feature/review', noSpec: false,
       });
       expect(result.canonicalVerdict).toBe('READY TO MERGE');
-      expect(result.specialistRuns.filter((run) => run.status === 'valid')).toHaveLength(7);
-      expect(leadTurns).toBe(3);
-      expect(fx.script.calls.filter((call) => !call.prompt.includes('COMPLETE FROZEN DIFF (the whole change under review)'))).toHaveLength(7);
+      expect(result.specialistRuns.filter((run) => run.status === 'valid')).toHaveLength(9);
+      expect(leadTurns).toBe(4);
+      expect(fx.script.calls.filter((call) => !call.prompt.includes('COMPLETE FROZEN DIFF (the whole change under review)'))).toHaveLength(9);
       expect(result.findings).toHaveLength(2);
-      expect(owned).toHaveLength(8);
-      expect(new Set(owned.map((handle) => handle.id)).size).toBe(8);
-      expect(new Set(owned.map((handle) => handle.sessionFile)).size).toBe(8);
+      expect(owned).toHaveLength(10);
+      expect(new Set(owned.map((handle) => handle.id)).size).toBe(10);
+      expect(new Set(owned.map((handle) => handle.sessionFile)).size).toBe(10);
       expect(owned.every((handle) => handle.reviewIsolation === true)).toBe(true);
       expect(registry.status().activeSessions).toBe(0);
     } finally {
@@ -2726,6 +2735,37 @@ describe('Perkins r1 regressions', () => {
       // ...but the errored turn's own captured verdict is preserved.
       expect(verdict.ok).toBe(false);
       expect(verdict.error).toContain('queued-race exploded');
+    } finally {
+      await handle.dispose();
+      await fx.runtime.dispose();
+    }
+  });
+
+  it('W7c: a turn aborted mid-flight by disposal never attests success (#160)', async () => {
+    const fx = await fixture([{ deltas: [], hold: new Promise<void>(() => {}), honorAbort: true }]);
+    const handle = await fx.runtime.spawn('gru');
+    try {
+      const pending = handle.promptWithVerdict!('aborted mid-flight', { owner: 'alice' });
+      await vi.waitFor(() => expect(fx.script.calls).toHaveLength(1));
+      // Disposal aborts the live transport turn; the prompt resolves with
+      // the transport's aborted terminal message.
+      await handle.dispose();
+      const verdict = await pending;
+      expect(verdict.ok).toBe(false);
+      expect(verdict.error).toBeTruthy();
+      expect(fx.script.calls[0]?.aborted).toBe(true);
+    } finally {
+      await fx.runtime.dispose();
+    }
+  });
+
+  it('W7d: a length-truncated completion is not positive completion evidence (#160)', async () => {
+    const fx = await fixture([{ deltas: ['partial answer'], stopReason: 'length' }]);
+    const handle = await fx.runtime.spawn('gru');
+    try {
+      const verdict = await handle.promptWithVerdict!('truncate me', { owner: 'alice' });
+      expect(verdict.ok).toBe(false);
+      expect(verdict.error).toContain('length');
     } finally {
       await handle.dispose();
       await fx.runtime.dispose();

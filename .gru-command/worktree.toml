@@ -22,6 +22,19 @@ typecheck = "npm run typecheck"
 # segment that names a classified heavy file to the heavy config.
 residency-runtime = "npx vitest run --config vitest.heavy.config.ts test/fix-directive.test.ts && npx vitest run test/resident-budget.test.ts test/runtime-resident-registry.test.ts test/silas-deterministic-seam.test.ts"
 handoff-wave = "npx vitest run --config vitest.heavy.config.ts test/perkins-builtin-wave.test.ts test/perkins-whole-review.test.ts && npx vitest run test/config.test.ts"
+
+# Review-input handoff lane (owner ruling j-969): private frozen evidence,
+# exact-target CI receipts, audited canonical amendments. Invoked only via
+# the authenticated /api/verify scheduler at unchanged budgets/thresholds —
+# a plain vitest invocation with the approved RPC patch prerequisite.
+review-inputs = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/review-evidence-intake.test.ts test/review-ci-evidence.test.ts test/job-amendments.test.ts test/review-inputs-handoff.test.ts test/review-inputs-wave.test.ts test/dispatch-review-inputs.test.ts test/verification-evidence.test.ts test/github-poll.test.ts test/ledger-api.test.ts test/ledger-db.test.ts"
+
+# Review-input handoff lane regression + full-run failure isolation: the
+# seam-adjacent suites, plus the exact files whose timing-sensitive tests
+# went red in this lane's FULL runs (complete captures preserved), run
+# together at one head to establish whether those failures are contention
+# or reproducible. Heavy-classified files route through the heavy config.
+review-inputs-regression = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/dispatch-server.test.ts test/attachments.test.ts test/claude-adapter.test.ts test/perkins-whole-review.test.ts test/perkins-builtin-wave.test.ts test/lan-phone-raw-client.test.ts && npx vitest run test/chat-server.test.ts test/decisions.test.ts test/suite-shape.test.ts"
 working-flavor = "cd web && npx vitest run src/lib/working-flavor.test.ts src/ui/chat-working-flavor.test.ts src/ui/chat-attachments.test.ts src/ui/chat-composer.test.ts src/ui/chat-console.test.ts src/ui/chat-gfm-invariant.test.ts src/ui/chat-scroll.test.ts src/ui/chat-service-band.test.ts src/ui/chat-tool-turn.test.ts"
 compaction-rollback = "npx vitest run test/pi-adapter.test.ts test/supervisor.test.ts test/config.test.ts test/health.test.ts test/board-engine.test.ts test/suite-shape.test.ts"
 
@@ -288,6 +301,15 @@ a4-wave-identity = 'node tools/patch-vitest-rpc-timeout.mjs && npm run lint && n
 # each split so no single test body carries two full installer cycles / two
 # full round fixtures. No test deadline, assertion or gate is changed.
 r7-timeout-cliff = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/install-one-line.test.ts test/perkins-builtin-wave.test.ts -t \"restarts only an owned service|refuses a foreign unit with the same public name|does not record a reconciled delivery\""
+
+# Installer one-line classification (2026-10-03, review-input-handoff resume):
+# the FULL at 13b8734 hit the same 30s default ceiling on the installer
+# owned/foreign-service case (31.3s) that passed at 19.6s on the previous
+# green head (cea7bbf) — the test file and install.sh are byte-identical at
+# both heads. This scope isolates the whole file at the unchanged default
+# ceiling so the timeout can be classified (isolation pass vs deterministic
+# fail); it changes no test, timeout, assertion or gate.
+installer-isolation = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/install-one-line.test.ts"
 
 # Isolated pre-fix baseline: current-main 059c0762 source with the IDENTICAL
 # final behavioral tests from the scheduled head, dependencies linked (no

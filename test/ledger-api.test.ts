@@ -129,11 +129,15 @@ describe('ledger api — the record of state', () => {
     expect(api.listEvents().some((e) => e.kind === 'job.pr' && e.jobId === 'docs-pass')).toBe(true);
   });
 
-  it('addRound defaults to exactly the 7 standard lenses, all pending', () => {
+  it('addRound defaults to exactly the nine-lens standard catalog, all pending', () => {
     const round = api.addRound({ jobId: 'fix-login-flow', targetRef: 'abc123' });
     expect(round.seq).toBe(1);
     expect(round.id).toBe('fix-login-flow-r1');
-    expect(round.lenses.map((chip) => chip.lens)).toEqual([...DEFAULT_LENSES]);
+    // The exact names and order are asserted independently of DEFAULT_LENSES:
+    // a swap inside the constant must not silently pass this test.
+    expect(round.lenses.map((chip) => chip.lens)).toEqual([
+      'blind', 'edge', 'acceptance', 'security', 'architecture', 'codebase', 'tests', 'performance', 'operations',
+    ]);
     expect(round.lenses.every((chip) => chip.state === 'pending')).toBe(true);
     expect(round.targetRef).toBe('abc123');
   });
@@ -144,6 +148,25 @@ describe('ledger api — the record of state', () => {
     expect(() => api.addRound({ jobId: 'fix-login-flow', lenses: ['alpha', 'alpha'] })).toThrow(/unique/u);
     expect(() => api.addRound({ jobId: 'fix-login-flow', lenses: [''] })).toThrow(/non-empty/u);
     expect(() => api.addRound({ jobId: 'nope', lenses: ['a'] })).toThrow(/not found/u);
+  });
+
+  it('a historical seven-chip round keeps its own recorded lenses when a later round gets the expanded catalog', () => {
+    api.addJob({ id: 'catalog-expansion', repo: 'billing-api', title: 'catalog expansion' });
+    const historical = api.addRound({
+      jobId: 'catalog-expansion',
+      lenses: ['blind', 'edge', 'acceptance', 'security', 'architecture', 'codebase', 'tests'],
+      targetRef: 'before-expansion',
+    });
+    const current = api.addRound({ jobId: 'catalog-expansion', targetRef: 'after-expansion' });
+    expect(historical.lenses.map((chip) => chip.lens)).toEqual(
+      ['blind', 'edge', 'acceptance', 'security', 'architecture', 'codebase', 'tests'],
+    );
+    expect(current.lenses.map((chip) => chip.lens)).toEqual([...DEFAULT_LENSES]);
+    // The persisted historical round stays exactly as recorded: the
+    // expansion is never backfilled onto a record created before it.
+    expect(api.getRound(historical.id)?.lenses.map((chip) => chip.lens)).toEqual(
+      ['blind', 'edge', 'acceptance', 'security', 'architecture', 'codebase', 'tests'],
+    );
   });
 
   it('round seq numbers continue within a job; verdicts are validated', () => {

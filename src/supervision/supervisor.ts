@@ -18,6 +18,7 @@ import {
   type RateLimitBackoffPolicy, type RetrySettlement,
 } from '../runtime/pacing.js';
 import { WorkerDisposalInProgressError } from '../runtime/worker-errors.js';
+import { promptWithTerminalVerdict } from '../runtime/prompt-verdict.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -1248,10 +1249,17 @@ export class Supervisor {
       });
       let rejection: unknown = null;
       try {
-        await handle.prompt(incident.pending.text, {
+        // Delivery truth (#160): a retry that RESOLVES is not a recovery
+        // unless the re-delivered turn itself attests success. The verdict
+        // is captured per turn; an aborted/unknown/in-band-error settle is
+        // a failed attempt and falls to the existing failure ladder below.
+        const verdict = await promptWithTerminalVerdict(handle, incident.pending.text, {
           ...(incident.pending.owner !== null ? { owner: incident.pending.owner } : {}),
           ...(incident.pending.images !== undefined ? { images: incident.pending.images } : {}),
         });
+        if (!verdict.ok) {
+          rejection = new Error(verdict.error ?? 'runtime settled the retry turn with an in-band error');
+        }
       } catch (error) {
         rejection = error;
       }
@@ -1958,10 +1966,18 @@ export class Supervisor {
         });
         if (!stillCurrent()) return;
       }
-      await handle.prompt(pending.text, {
+      // Delivery truth (#160): the recovered turn must attest its own
+      // success. A resolved re-delivery that settled aborted or in-band
+      // error is thrown to the catch below, which consults the retry
+      // settlement and — when nothing carried the turn — posts the honest
+      // recoverable-lane note instead of recording a fabricated 'resumed'.
+      const verdict = await promptWithTerminalVerdict(handle, pending.text, {
         ...(pending.owner !== null ? { owner: pending.owner } : {}),
         ...(pending.images !== undefined ? { images: pending.images } : {}),
       });
+      if (!verdict.ok) {
+        throw new Error(verdict.error ?? 'runtime settled the recovered turn with an in-band error');
+      }
       if (!stillCurrent()) return;
       // Release the slot before waiting on a bounded rate-limit retry so
       // the retry can reacquire admission for its next attempt.

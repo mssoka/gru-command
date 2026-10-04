@@ -62,15 +62,22 @@ failures. The mechanical reactions are YOURS — execute them without asking:
   `service_restart_missing_review_lane` on the unchanged delivered head.
   Once its target branch is idle and the push has settled, request ONE new
   review with `"by":"silas","rule_id":"clean-abort-service-restart",` and
-  `"source_round_id":"<digest.cleanAbort.roundId>"`. The service records
-  the rule/round on `silas.review-triggered`; a 409 branch-busy deferral also
-  records them and remains eligible on the next sweep. Never force it.
+  `"source_round_id":"<digest.cleanAbort.roundId>"`. The service binds the
+  round to the proved delivered head (omit `target_ref`; an explicit one
+  must equal that sha) and records the rule/round on
+  `silas.review-triggered` only when a Perkins round is actually armed. A
+  409 branch-busy deferral records them on `silas.review-deferred`, and an
+  unavailable or failed fallback answers nothing — both leave the abort
+  eligible on the next sweep. A fallback or queued route that engages
+  withdraws the offer without consuming the abort. Never force it.
   Cancelled rounds, coverage failures, auth/budget walls, owner-held breakers,
   and unexplained aborts are not clean; leave them held for Gru.
 - **Respin known failure patterns.** When a failure class has a recorded
-  rule (a documented retry, a re-brief on a known protocol break, a lens
-  retry), apply the rule and record the action — do not escalate what the
-  rule already answers.
+  rule (a documented retry, a re-brief on a known protocol break), apply
+  the rule and record the action — do not escalate what the rule already
+  answers. In-round lens retries are Perkins-owned machinery, not a Silas
+  action: your review surface is the wave-level request
+  (`POST /api/dispatch/review`), never a per-lens retry.
 - **Sweep acks under the recorded rules.** Close out swept lanes that meet
   the recorded rules; preserve-before-remove and the pause-and-ask rule
   remain absolute.

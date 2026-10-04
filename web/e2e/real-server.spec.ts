@@ -287,7 +287,7 @@ test.describe('board (E6)', () => {
     const round = await page.request.post(`http://127.0.0.1:${REAL_PORT}/api/rounds`, { headers: base, data: { jobId: job.id } });
     expect(round.status()).toBe(201);
     const lenses = (await round.json()).lenses as { lens: string; state: string }[];
-    expect(lenses.length).toBe(7);
+    expect(lenses.length).toBe(9);
 
     await pair(page);
     await expect(page.locator('#board-view')).toBeVisible();
@@ -295,12 +295,12 @@ test.describe('board (E6)', () => {
     const jobCard = page.locator('.board-job', { hasText: 'Board e2e job' });
     await expect(jobCard).toBeVisible();
     await expect(jobCard.locator('.board-job__repo')).toHaveText('📦 e2e-repo');
-    // Collapsed by default; the round's 7 lens chips are behind the disclosures.
+    // Collapsed by default; the round's 9 lens chips are behind the disclosures.
     await expect(jobCard).toHaveAttribute('data-expanded', 'false');
     await expect(jobCard.locator('.board-lens')).toHaveCount(0);
     await jobCard.locator('.board-job__toggle').click();
     await jobCard.locator('.board-round__toggle').click();
-    await expect(jobCard.locator('.board-lens')).toHaveCount(7);
+    await expect(jobCard.locator('.board-lens')).toHaveCount(9);
 
     // A status transition through the API pushes a fresh snapshot live.
     const blocked = await page.request.post(`http://127.0.0.1:${REAL_PORT}/api/jobs/e2e-board-job/status`, { headers: base, data: { status: 'working' } });

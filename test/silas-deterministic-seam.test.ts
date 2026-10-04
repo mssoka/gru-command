@@ -19,8 +19,13 @@ describe('Silas deterministic-pass seam drives actual handoff reconsideration', 
   it('a bus wake event arms an idle-lane handoff with NO second API call, before any slot wake, without double start', async () => {
     const root = mkdtempSync(join(tmpdir(), 'seam-comp-port-')); dirs.push(root);
     const dbDir = mkdtempSync(join(tmpdir(), 'seam-comp-db-')); const db = new LedgerDb(dbDir); dirs.push(dbDir);
+    // Two buses: the ledger publishes on its own; the wave and driver share
+    // the control bus. A real delivery settles the lane without waking the
+    // wave's own listener, so only the deterministic pass can arm the
+    // handoff in this test.
     const bus = new EventBus();
-    const ledger = new LedgerApi(db.handle, { bus });
+    const ledgerBus = new EventBus();
+    const ledger = new LedgerApi(db.handle, { bus: ledgerBus });
     const port = new GitReviewPort(root, 'main', 'a'.repeat(40));
     const job = ledger.addJob({ id: 'job-seam', repo: 'fixture', title: 'seam', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
@@ -33,10 +38,12 @@ describe('Silas deterministic-pass seam drives actual handoff reconsideration', 
     });
     const accepted = await wave.requestReview({ jobId: job.id, handoff: true });
     expect(accepted.route).toBe('queued');
-    // The lane goes idle WITHOUT any delivery: the status leaves the busy
-    // set but stays review-authorizable, so the deterministic pass — not a
-    // second API request — may arm the queued handoff.
-    ledger.setJobStatus(job.id, 'in-review');
+    // The lane settles for real (a recorded delivery), while the CONTROL
+    // bus never sees it: the wave's own delivery listener stays silent, so
+    // the deterministic pass — not a second API request — may arm the
+    // queued handoff. The status stays working: a settled delivery is the
+    // review-ready point, not a status flip.
+    ledger.appendCustomEvent({ kind: 'job.delivered', jobId: job.id, payload: { sha: 'seam-settled' } });
     const sweep: { cb: (() => void) | null } = { cb: null };
     const driver = new SilasDriver({
       slot: {

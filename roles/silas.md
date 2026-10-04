@@ -67,8 +67,12 @@ without asking:
 - Re-arm only a proven service-restart clean abort on the unchanged delivered
   head, once its target branch is idle and its push settled. Include the
   digest's clean-abort rule and source round in the authenticated request;
-  never force or repeat a recorded re-arm. Cancelled, novel and owner-held
-  failures stay with the chief.
+  never force or repeat a recorded re-arm. The service binds the round to
+  the proved delivered head and records the consuming rule/round receipt
+  only when a Perkins round is armed; a 409 deferral or an unavailable
+  fallback answers nothing and leaves the abort eligible, while an engaged
+  fallback or queued handoff withdraws the offer without consuming it.
+  Cancelled, novel and owner-held failures stay with the chief.
 - Respin a known failure pattern according to its recorded rule rather than
   escalating what the rule already answers.
 - Close out sweeps under the recorded rules; preserve-before-remove and the

@@ -14,7 +14,8 @@ whole arc live.
                       │                           briefing turn …
                       │                           deliverable + PR link ◄─┤
                       │                                                   one lead
-                      │                                                   7/6 lens types × chunks
+                      │                                                   9/8 whole-change lenses
+                      │                                                   (lead-selected batches)
                       │                                                   verify + audit
                       │                                                   report → PR comment
  release ◄─────────── sweep (preserve-first)                            (chips live on the board)
@@ -58,14 +59,30 @@ groups by repo; the phone is board-first.
 
 ## 4. Review waves (Perkins)
 
-`POST /api/dispatch/review` `{job_id, target_ref?, no_spec?}` freezes one
-exact target/base/diff/spec set in a detached review worktree. The arm
+`POST /api/dispatch/review` `{job_id, target_ref?, no_spec?, evidence?}`
+freezes one exact target/base/diff/spec set in a detached review worktree. An
+arm may carry private evidence uploads; the frozen round binds the effective
+amended acceptance and the exact-target CI receipt, and the amendment/contract
+endpoints (`POST /api/dispatch/amendment`,
+`GET /api/dispatch/jobs/<id>/contract`) manage that acceptance. See
+[REVIEW-INPUTS.md](./REVIEW-INPUTS.md); a private-evidence arm is refused on
+the bmad-review fallback route rather than silently reviewed without it. The arm
 first passes the **branch-idle guard**: while any lane is actively
-working/pushing the target branch (`dispatched`/`working` with no settled
-delivery for its current attempt), the API answers `409 branch_busy` with
+working/pushing the target branch (`dispatched`/`working`/`in-review`
+with no settled delivery for its current attempt — a PR link flips a lane
+to `in-review` mid-attempt, so that status alone is not proof of
+settlement; a `delivered → in-review` flip starts no attempt), the API
+answers `409 branch_busy` with
 `blockers: [{job_id, status, branch}]` and the same check re-runs
 immediately before the freeze, so a lane re-opened mid-setup is refused
-the same way. The same recheck runs after a failed pre-flight and before
+the same way. The guard compares a lane's RECORDED branch (or the
+`gru/<jobId>` branch a `dispatched` job is about to create). A lane that
+checks out its own branch but pushes a FOREIGN PR branch (a rebase/
+salvage lane) is invisible to that comparison — no lane declares a push
+target yet (issue #121 records the evidence and the declared-push-target
+extension). Silas's standing freeze-r1 rule — never arm while a known
+rebase/force-push lane is active on the target — is the control for that
+class. The same recheck runs after a failed pre-flight and before
 the bmad-review fallback gate admits — a re-brief or lane re-open landing
 during the awaited pre-flight refuses the fallback arm (409, or a queued
 replay re-queue) instead of starting a fallback reviewer; the fallback
@@ -122,17 +139,26 @@ pull/merge-request head. A resolved ref that fetches nothing, a moved
 head, or an unverifiable host answer aborts the request before a round or
 lens exists (an action-required escalation names the resolved mismatch).
 A round has
-one real Perkins lead and exactly seven required lens types per frozen diff
-chunk (blind, edge, acceptance, security, architecture, codebase, tests), or
-six types per chunk only when `no_spec: true` explicitly removes acceptance.
-Each lens/chunk attempt is a distinct tracked child; malformed attempts are
-retryable up to the policy limit, so the total child-session count may exceed
-the required coverage cardinality.
+one real Perkins lead reviewing the complete frozen change. The pinned
+policy's catalog makes nine whole-change specialist lenses available (blind,
+edge, acceptance, security, architecture, codebase, tests, performance,
+operations) — eight when `no_spec: true` explicitly removes the
+spec-dependent acceptance lens. The lead SELECTS which specialists help the
+change: availability is never a mandatory coverage gate, and a subset (or
+none) is a valid review. Specialists run in explicit tool-call batches
+bounded by the round's admitted resident wave and provider pacing; the lead
+splits oversized work across calls, and any number of batches completes
+inside the SAME round, frozen target and lead. A round is bounded to 16 real
+specialist runs (retries included), two attempts per lens, and two real
+terminal submissions (free preflight is distinct); failed attempts count and
+stay recorded, and a completed lens cannot be rerun for a second opinion.
+Lenses the lead did not use are reported as `not used`, never as coverage.
 
-- The lead receives only six product-native tools: read a frozen chunk,
-  run tracked lens children, store bounded notes, record a candidate
-  decision, preflight a candidate terminal submission, and submit terminal
-  proof. It owns delegation,
+- The lead receives only its declared product-native tools: four
+  whole-change orchestration tools (run tracked specialist children, store
+  bounded notes, preflight a candidate terminal submission, submit terminal
+  proof) plus the bounded prior-revision reader on a re-review. It reads the
+  complete frozen change with its confined read tools and owns delegation,
   investigation, verification, deduplication, prior audit, verdict
   calculation, and report authorship. Recording runs the exact terminal
   decision validator at store time; preflight uses the exact terminal
@@ -148,9 +174,9 @@ the required coverage cardinality.
   may declare product-native tools, and the ADAPTER exposes exactly those
   declared tools on every harness: pi injects them in-process, claude-code
   attaches a session-scoped, product-owned MCP bridge. The lead declares
-  its six orchestration tools; a lens child that declares native tools
-  gets only its own (the `perkins_submit_findings` channel) and never sees
-  the lead's six. That seam is harness-independent by design — review
+  its whole-change orchestration tools; a lens child that declares native
+  tools gets only its own (the `perkins_submit_findings` channel) and never
+  sees the lead's. That seam is harness-independent by design — review
   isolation and tool exposure live in the adapter implementation, never in
   caller branches on harness.
 - Child findings are evidence-paired at envelope construction: a finding that
@@ -168,15 +194,18 @@ the required coverage cardinality.
   and child review behavior; interpolated repository/spec/convention text is
   untrusted evidence, never instruction. The host bounds attempts,
   concurrency, candidate/report bytes, and wall time; records every child;
-  verifies exact coverage, candidate ownership,
+  verifies exact run accounting (selected lenses, attempts, round budget),
+  candidate ownership,
   frozen-commit evidence, prior audit, source stability, report contents,
   delivery, and canonical blocker arithmetic. Zero blockers is READY TO
   MERGE, 1–3 is NEEDS CHANGES, and 4+ is MAJOR REWORK NEEDED. Warnings and
   notes never block.
 - A malformed child output consumes one attempt and may be retried within the
-  pinned bound. Any exhausted attempt, cancellation, restart, changed
-  source/checkout, unsupported evidence, invalid audit, missing coverage,
-  or delivery failure durably terminalizes the round as INCOMPLETE. It can
+  pinned bound; a failed or exhausted specialist attempt is recorded
+  lens-failure truth and never terminalizes the round by itself.
+  Cancellation, restart, changed
+  source/checkout, unsupported evidence, invalid audit, or delivery failure
+  durably terminalizes the round as INCOMPLETE. It can
   neither post nor record approval. Startup reconciliation marks interrupted
   rounds INCOMPLETE and releases their owned detached lanes.
 - The base is changed source only when the locally resolved base ref no
@@ -547,9 +576,25 @@ the judgment; the dispatch surface is the mechanical hand.
   round's reviewed target (first review AND re-review after a fix round);
   or a proven `service_restart` abort on the unchanged delivered head,
   once per source round under `clean-abort-service-restart`. Other aborts
-  and unchanged heads warrant no round. A review already REQUESTED for
-  the current state retires the row — including the bmad-review fallback
-  route, which creates no round and owns its own fix loop. NEEDS CHANGES
+  and unchanged heads warrant no round. The re-arm is bound to the proved
+  delivered head: an explicit `target_ref` must name that sha and an
+  omitted one freezes it — a moved live PR head is never substituted — and
+  the freeze boundary re-proves the delivered head is still the recorded
+  one: a newer delivery during the awaited pre-flight refuses the stale
+  re-arm (the next sweep offers the changed-head re-review instead). A
+  review already REQUESTED for the current state retires the row —
+  including the bmad-review fallback route, which creates no round and
+  owns its own fix loop; a fallback that never engaged (`unavailable`)
+  retires nothing, so a missing/again-repaired gate leaves the row due. A
+  queued handoff that ends `failed`/`held`/`skipped` without arming a
+  round answers nothing either. The clean-abort row retires only on a
+  state that answered it: an armed Perkins round records the consuming
+  `silas.review-triggered` rule/round receipt (a fallback, queued or
+  unavailable route does not), while any other ACCEPTED review request
+  still withdraws the offer. Failed attempts stay eligible: a 409
+  deferral and a fallback that never engaged (`unavailable`) or ended
+  `blocked`/`aborted` answer nothing, so the same abort reappears for the
+  next sweep. NEEDS CHANGES
   verdicts awaiting follow-through, with per-blocker recurrence analysis;
   working lanes whose minion has been silent past `stall_threshold_ms`;
   plus recent minion errors for context.
