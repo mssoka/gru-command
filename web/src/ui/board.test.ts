@@ -1643,6 +1643,73 @@ describe('board v6 — section truth: closed receipts never queue, stopped lanes
     expect(client.fetchReceipts).toHaveBeenCalledWith(0);
   });
 
+  it('a re-pair clears fetched older receipts instead of leaking them into the new server FEED', async () => {
+    const older = notification('older-receipt');
+    const clientA = {
+      ackNotification: vi.fn(() => Promise.resolve()),
+      markNotificationShown: vi.fn(() => Promise.resolve(true)),
+      fetchReceipts: vi.fn(() => Promise.resolve({ receipts: [older], nextOffset: 1, hasMore: false })),
+    } as unknown as import('../lib/board-client.js').BoardClient;
+    const view = new BoardView(() => {});
+    view.bindClient(clientA);
+    view.render(
+      snapshot({
+        jobs: [baseJob({ id: 'receipt-lane', status: 'merged', rounds: [] })],
+        agents: [agent('minion-receipt-lane', { role: 'minion', jobId: 'receipt-lane' })],
+        notifications: [notification('snapshot-receipt', { agentId: 'minion-receipt-lane' })],
+      }),
+    );
+    document.querySelector<HTMLButtonElement>('.board-notification__more')!.click();
+    await vi.waitFor(() =>
+      expect(document.getElementById('notification-list')?.textContent).toContain('Notice older-receipt'),
+    );
+
+    // A re-pair mints a fresh server: the old page is not this server's record.
+    const clientB = {
+      ackNotification: vi.fn(() => Promise.resolve()),
+      markNotificationShown: vi.fn(() => Promise.resolve(true)),
+      fetchReceipts: vi.fn(() => Promise.resolve({ receipts: [], nextOffset: 0, hasMore: true })),
+    } as unknown as import('../lib/board-client.js').BoardClient;
+    view.bindClient(clientB);
+    view.render(snapshot({ notifications: [] }));
+    expect(document.getElementById('notification-list')?.textContent).not.toContain('Notice older-receipt');
+  });
+
+  it('a re-pair during an in-flight receipt fetch drops the stale page instead of merging it', async () => {
+    const older = notification('older-receipt');
+    let resolvePage: (page: { receipts: NotificationView[]; nextOffset: number; hasMore: boolean }) => void = () => {};
+    const pending = new Promise<{ receipts: NotificationView[]; nextOffset: number; hasMore: boolean }>((resolve) => {
+      resolvePage = resolve;
+    });
+    const clientA = {
+      ackNotification: vi.fn(() => Promise.resolve()),
+      markNotificationShown: vi.fn(() => Promise.resolve(true)),
+      fetchReceipts: vi.fn(() => pending),
+    } as unknown as import('../lib/board-client.js').BoardClient;
+    const view = new BoardView(() => {});
+    view.bindClient(clientA);
+    view.render(
+      snapshot({
+        jobs: [baseJob({ id: 'receipt-lane', status: 'merged', rounds: [] })],
+        agents: [agent('minion-receipt-lane', { role: 'minion', jobId: 'receipt-lane' })],
+        notifications: [notification('snapshot-receipt', { agentId: 'minion-receipt-lane' })],
+      }),
+    );
+    document.querySelector<HTMLButtonElement>('.board-notification__more')!.click();
+    expect(clientA.fetchReceipts).toHaveBeenCalledTimes(1);
+
+    const clientB = {
+      ackNotification: vi.fn(() => Promise.resolve()),
+      markNotificationShown: vi.fn(() => Promise.resolve(true)),
+      fetchReceipts: vi.fn(() => Promise.resolve({ receipts: [], nextOffset: 0, hasMore: true })),
+    } as unknown as import('../lib/board-client.js').BoardClient;
+    view.bindClient(clientB);
+    view.render(snapshot({ notifications: [] }));
+    resolvePage({ receipts: [older], nextOffset: 1, hasMore: false });
+    await pending;
+    expect(document.getElementById('notification-list')?.textContent).not.toContain('Notice older-receipt');
+  });
+
   it('a stopped lane with an unacked escalation sits in NEEDS GRU — waiting chip, honest section', () => {
     const view = new BoardView(() => {});
     view.render(
