@@ -1219,7 +1219,8 @@ export class BoardView {
       // Only needs-owner rings the shoulder; machine/fyi rows live in the
       // panel bands and reach Gru through the wake path instead.
       if (notification.routing !== 'needs-owner') continue;
-      if (firstRender || notification.resolvedAt !== null) continue; // history/resolved — no toast spam
+      // History and already-handled rows (acked on ANY device) never toast.
+      if (firstRender || notification.ackedAt !== null || notification.resolvedAt !== null) continue;
       this.onToast?.(notification);
       this.sendShown(notification, 'web-toast');
     }

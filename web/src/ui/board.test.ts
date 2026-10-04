@@ -1865,6 +1865,22 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect((document.activeElement as HTMLElement)?.dataset.actionId).toBe('owner-ack:focus-me');
   });
 
+  it('g10: an owner row already acked on another device arrives with no toast and no web-toast receipt', () => {
+    const toast = vi.fn();
+    const client = stubClient();
+    const view = new BoardView(() => {}, client);
+    view.setToastHandler(toast);
+    view.render(snapshot({ notifications: [] })); // first snapshot primes history: nothing toasts yet
+    const acked = notification('acked-elsewhere', { routing: 'needs-owner', ackedAt: '2026-01-01T00:05:00.000Z' });
+    view.render(snapshot({ notifications: [acked] }));
+    expect(toast).not.toHaveBeenCalled();
+    expect(client.markNotificationShown).not.toHaveBeenCalledWith('acked-elsewhere', 'web-toast');
+    // Scoped to handled rows: a fresh owner arrival in the same push still toasts.
+    view.render(snapshot({ notifications: [acked, notification('fresh-owner', { routing: 'needs-owner' })] }));
+    expect(toast).toHaveBeenCalledTimes(1);
+    expect(toast).toHaveBeenCalledWith(expect.objectContaining({ id: 'fresh-owner' }));
+  });
+
   it('FOR YOU r1 parity: a PR-only obligation shows on BOTH the board band and the bell — never a contradiction', () => {
     const view = new BoardView(() => {});
     view.render(snapshot({ notifications: [], ownerPrs: [ownerPr('job-only-pr')] }));
