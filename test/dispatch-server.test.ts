@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { createServer, type Server as HttpServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { EventBus } from '../src/events/bus.js';
@@ -252,6 +252,41 @@ async function waitForDelivery(h: ServerHarness, jobId: string): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
   expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).not.toBeNull();
+}
+
+/** Prepare a proven clean service-restart abort: dispatch, settle the
+ * delivery, link the PR, and abort the newest round on the unchanged head. */
+async function prepareCleanAbort(
+  h: ServerHarness,
+  repo: FixtureRepo,
+  jobId: string,
+): Promise<{ lanePath: string; sha: string; roundId: string }> {
+  await call(h.port, 'POST', '/api/dispatch', {
+    job_id: jobId, repo_path: repo.path, title: jobId, briefing: 'b',
+  }, TOKEN);
+  await waitForDelivery(h, jobId);
+  expect((await call(h.port, 'POST', '/api/dispatch/pr', { job_id: jobId, url: PR_URL }, TOKEN)).status).toBe(200);
+  const lane = h.worktrees.listWorktrees({ jobId }).find((row) => row.kind === 'job')!;
+  const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: lane.path, encoding: 'utf8' }).trim();
+  expect(h.ledger.latestJobEvent(jobId, 'job.delivered')?.payload).toMatchObject({ sha, source: 'dispatch' });
+  const round = h.ledger.addRound({ jobId, targetRef: sha, lenses: ['blind'] });
+  h.ledger.setRoundStatus(round.id, 'aborted');
+  h.ledger.appendCustomEvent({
+    kind: 'round.perkins-incomplete', jobId, roundId: round.id, payload: { reason: 'service_restart' },
+  });
+  return { lanePath: lane.path, sha, roundId: round.id };
+}
+
+/** Advance and publish a lane branch past the recorded delivery — the live
+ * PR head the clean-abort re-arm must never silently freeze. */
+function movePublishedHead(lanePath: string, branch: string): string {
+  execFileSync('git', [
+    '-C', lanePath, '-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid',
+    'commit', '--allow-empty', '-m', 'fixture: moved live head',
+  ], { stdio: 'ignore' });
+  const moved = execFileSync('git', ['-C', lanePath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+  execFileSync('git', ['-C', lanePath, 'push', '--quiet', 'origin', `HEAD:refs/heads/${branch}`], { stdio: 'ignore' });
+  return moved;
 }
 
 /** The directive endpoint now records durable intent first and answers 202:
@@ -754,6 +789,86 @@ describe('dispatch server (E8)', () => {
         rule_id: 'clean-abort-service-restart', source_round_id: round.id, round_id: 'clean-abort-r2',
       });
       expect((await call(h.port, 'POST', '/api/dispatch/review', body, TOKEN)).status).toBe(400);
+    } finally { await h.close(); }
+  }, 90_000);
+
+  it('binds a clean-abort re-arm to the proved delivered head, never a moved live PR head', async () => {
+    const h = await boot();
+    const repo = makeFixtureRepo('fixture-clean-abort-target');
+    cleanupRepos.push(repo);
+    attachBareOrigin(repo);
+    try {
+      const { lanePath, sha, roundId } = await prepareCleanAbort(h, repo, 'clean-abort-target');
+      const body = {
+        job_id: 'clean-abort-target', by: 'silas',
+        rule_id: 'clean-abort-service-restart', source_round_id: roundId,
+      };
+      const moved = movePublishedHead(lanePath, 'gru/clean-abort-target');
+      expect(moved).not.toBe(sha);
+
+      // An explicit target_ref naming anything but the proved delivered sha
+      // is refused before any round or receipt exists.
+      const refused = await call(h.port, 'POST', '/api/dispatch/review', { ...body, target_ref: moved }, TOKEN);
+      expect(refused.status).toBe(400);
+      expect(h.ledger.listRounds('clean-abort-target')).toHaveLength(1);
+      expect(h.ledger.latestJobEvent('clean-abort-target', 'silas.review-triggered')).toBeNull();
+
+      // With no target_ref the re-arm freezes the PROVED delivered sha; the
+      // moved live head is never silently substituted.
+      const review = await call(h.port, 'POST', '/api/dispatch/review', body, TOKEN);
+      expect(review).toMatchObject({
+        status: 202,
+        json: { route: 'perkins', rule_id: 'clean-abort-service-restart', source_round_id: roundId },
+      });
+      const armed = h.ledger.getRound((review.json as { round_id: string }).round_id);
+      expect(armed?.targetRef).toBe(sha);
+      expect(armed?.targetRef).not.toBe(moved);
+    } finally { await h.close(); }
+  }, 90_000);
+
+  it('a clean-abort re-arm that cannot engage the fallback consumes nothing', async () => {
+    const missingSkill = join(mkdtempSync(join(tmpdir(), 'bmad-review-missing-')), 'SKILL.md');
+    cleanupDirs.push(dirname(missingSkill));
+    const h = await boot({
+      reviewPreflight: async () => ({
+        ok: false,
+        failures: [{
+          leg: 'review-policy',
+          detail: 'the Perkins review gate is disabled in config',
+          remediation: 'Enable the Perkins review gate in config: set [review] enabled = true in the instance config.',
+        }],
+      }),
+      fallbackGate: { skillPath: missingSkill, fixDirectiveSink: async () => ({ delivered: true }) },
+    });
+    const repo = makeFixtureRepo('fixture-clean-abort-unavailable');
+    cleanupRepos.push(repo);
+    attachBareOrigin(repo);
+    try {
+      const { sha, roundId } = await prepareCleanAbort(h, repo, 'clean-abort-unavailable');
+      const body = {
+        job_id: 'clean-abort-unavailable', by: 'silas',
+        rule_id: 'clean-abort-service-restart', source_round_id: roundId,
+      };
+      const first = await call(h.port, 'POST', '/api/dispatch/review', body, TOKEN);
+      expect(first).toMatchObject({ status: 202, json: { route: 'bmad-review-fallback', skill_installed: false } });
+      // No consuming source-round receipt: the trigger kind stays absent and
+      // the deferral records why nothing reviewed the unchanged head.
+      expect(h.ledger.listJobEvents('clean-abort-unavailable').filter((event) => event.kind === 'silas.review-triggered')).toEqual([]);
+      expect(h.ledger.latestJobEvent('clean-abort-unavailable', 'silas.review-deferred')?.payload).toMatchObject({
+        reason: 'fallback_unavailable', rule_id: 'clean-abort-service-restart', source_round_id: roundId,
+      });
+      // The abort stays eligible for the next sweep...
+      const digest = await computeSilasDigest({
+        ledger: h.ledger, blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG, trigger: 'sweep',
+      });
+      expect(digest.prWithoutReview).toMatchObject([{
+        jobId: 'clean-abort-unavailable', cleanAbort: { roundId, ruleId: 'clean-abort-service-restart' },
+      }]);
+      // ...and a second re-arm is accepted again, never refused as consumed.
+      const second = await call(h.port, 'POST', '/api/dispatch/review', body, TOKEN);
+      expect(second).toMatchObject({ status: 202, json: { route: 'bmad-review-fallback', skill_installed: false } });
+      expect(h.ledger.getRound(roundId)?.targetRef).toBe(sha);
     } finally { await h.close(); }
   }, 90_000);
 

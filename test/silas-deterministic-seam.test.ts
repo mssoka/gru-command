@@ -33,10 +33,12 @@ describe('Silas deterministic-pass seam drives actual handoff reconsideration', 
     });
     const accepted = await wave.requestReview({ jobId: job.id, handoff: true });
     expect(accepted.route).toBe('queued');
-    // The lane goes idle WITHOUT any delivery: the status leaves the busy
-    // set but stays review-authorizable, so the deterministic pass — not a
-    // second API request — may arm the queued handoff.
-    ledger.setJobStatus(job.id, 'in-review');
+    // The lane settles WITHOUT a delivery event reaching the shared bus:
+    // the status leaves the busy set but stays review-authorizable, so the
+    // deterministic pass — not a second API request — may arm the queued
+    // handoff. (A `job.delivered` event would already wake the wave's own
+    // listener; this test isolates the Silas hook.)
+    ledger.setJobStatus(job.id, 'delivered');
     const sweep: { cb: (() => void) | null } = { cb: null };
     const driver = new SilasDriver({
       slot: {

@@ -350,6 +350,29 @@ function latestReviewRequest(ledger: DigestLedger, jobId: string): EventRecord |
   return candidates.sort((a, b) => b.seq - a.seq)[0] ?? null;
 }
 
+/** Fallback-gate lifecycle phases that answer nothing: the gate never
+ * started (`unavailable`), gave up (`blocked`) or was interrupted
+ * (`aborted`). A clean-abort re-arm stays eligible after these. */
+const FALLBACK_FAILED_PHASES: ReadonlySet<string> = new Set(['unavailable', 'blocked', 'aborted']);
+
+/** The latest review request that genuinely answers the target's current
+ * state: an accepted Silas trigger (any route the server admitted), or a
+ * fallback-gate event while the gate is live or passed. A terminal fallback
+ * failure newer than the trigger negates it — a failed attempt keeps the
+ * clean-abort row eligible (g4). A 409 deferral is a different event kind
+ * and never counts. */
+function latestAnsweringReviewRequest(ledger: DigestLedger, jobId: string): EventRecord | null {
+  const trigger = ledger.latestJobEvent(jobId, 'silas.review-triggered');
+  const fallback = ledger.latestJobEvent(jobId, 'job.fallback-review');
+  if (fallback === null) return trigger;
+  const phase = typeof fallback.payload === 'object' && fallback.payload !== null
+    ? (fallback.payload as { phase?: unknown }).phase : undefined;
+  const failed = typeof phase === 'string' && FALLBACK_FAILED_PHASES.has(phase);
+  if (failed && (trigger === null || fallback.seq > trigger.seq)) return null;
+  if (trigger === null) return fallback;
+  return trigger.seq >= fallback.seq ? trigger : fallback;
+}
+
 /**
  * The compact digest of actionable ops states, computed from the ledger
  * alone (the ledger is the record; no runtime or filesystem probing beyond
@@ -421,15 +444,16 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       ? input.ledger.latestRoundEvent(newestRound.id, 'round.perkins-incomplete') : null;
     const abortReason = abortProof !== null && abortProof.roundId === newestRound?.id && typeof abortProof.payload === 'object' && abortProof.payload !== null
       ? (abortProof.payload as { reason?: unknown }).reason : null;
+    // The clean-abort row retires on the state it was answered by: an armed
+    // Perkins round (the consuming source-round receipt) OR any other
+    // accepted review request on the target. A 409 deferral and a terminal
+    // fallback failure answer nothing and keep the row eligible (g4).
+    const answeringRequest = latestAnsweringReviewRequest(input.ledger, job.id);
     const cleanAbort = newestRound !== null && delivered !== null &&
       newestRound.status === 'aborted' &&
       (abortReason === 'service_restart' || abortReason === 'service_restart_missing_review_lane') &&
       deliveredTargetSha(delivered) !== null && deliveredTargetSha(delivered) === newestRound.targetRef &&
-      !(reviewRequest !== null && reviewRequest.kind === 'silas.review-triggered' &&
-        reviewRequest.seq > (abortProof?.seq ?? 0) &&
-        typeof reviewRequest.payload === 'object' && reviewRequest.payload !== null &&
-        (reviewRequest.payload as { source_round_id?: unknown; rule_id?: unknown }).source_round_id === newestRound.id &&
-        (reviewRequest.payload as { rule_id?: unknown }).rule_id === 'clean-abort-service-restart');
+      !(answeringRequest !== null && answeringRequest.seq > (abortProof?.seq ?? 0));
 
     // (1) Delivered, no PR yet.
     if (delivered !== null && job.prUrl === null && rounds.length === 0) {

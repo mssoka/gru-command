@@ -414,11 +414,16 @@ describe('branch-idle guard', () => {
     const start = eventRecord(1, 'job.status', { from: 'dispatched', to: 'working' });
     const delivery = eventRecord(2, 'job.delivered', { sha: 'sha-1' });
     const reopen = eventRecord(3, 'job.status', { from: 'in-review', to: 'working' });
+    const midTurnLink = eventRecord(2, 'job.status', { from: 'working', to: 'in-review' });
+    const settledLink = eventRecord(3, 'job.status', { from: 'delivered', to: 'in-review' });
     const events = new Map<string, EventRecord[]>([
       ['never-started', []],
       ['settled', [start, delivery]],
       ['reopened', [start, delivery, reopen]],
       ['open', [start]],
+      ['linked-mid-turn', [start, midTurnLink]],
+      ['linked-mid-turn-late-delivery', [start, midTurnLink, eventRecord(4, 'job.delivered', { sha: 'sha-2' })]],
+      ['linked-after-delivery', [start, delivery, settledLink]],
     ]);
     const ledger = {
       listJobs: () => [
@@ -427,9 +432,14 @@ describe('branch-idle guard', () => {
         jobRecord('reopened', 'working'),
         jobRecord('open', 'working'),
         jobRecord('delivered', 'delivered'),
+        jobRecord('linked-mid-turn', 'in-review'),
+        jobRecord('linked-mid-turn-late-delivery', 'in-review'),
+        jobRecord('linked-after-delivery', 'in-review'),
       ],
       latestJobEvent: (jobId: string, kind: string): EventRecord | null =>
         (events.get(jobId) ?? []).filter((event) => event.kind === kind).at(-1) ?? null,
+      listJobEvents: (jobId: string): readonly EventRecord[] =>
+        [...(events.get(jobId) ?? [])].reverse(),
       listPendingRebriefs: (): readonly PendingRebriefRecord[] => [],
     };
     const busy = (id: string): boolean => laneIsBusy(ledger, ledger.listJobs().find((job) => job.id === id)!);
@@ -438,6 +448,12 @@ describe('branch-idle guard', () => {
     expect(busy('reopened')).toBe(true);
     expect(busy('open')).toBe(true);
     expect(busy('delivered')).toBe(false);
+    // A PR link moves an OPEN attempt to in-review before it settles: the
+    // lane is still a writer until its delivery lands.
+    expect(busy('linked-mid-turn')).toBe(true);
+    expect(busy('linked-mid-turn-late-delivery')).toBe(false);
+    // A delivered → in-review flip starts no attempt at all.
+    expect(busy('linked-after-delivery')).toBe(false);
 
     const lanes = [laneRecord('reopened', 'reopened', 'gru/reopened'), laneRecord('settled', 'settled', 'gru/settled')];
     expect(findBusyLanes({ ledger, lanes, targetBranch: 'gru/reopened' }).map((blocker) => blocker.jobId)).toEqual([
@@ -480,6 +496,33 @@ describe('branch-idle guard', () => {
       expect(passed.status).toBe(202);
       expect(passed.json['round_id']).toBe('busy-lane-r1');
       expect(h.ledger.listRounds('busy-lane')).toHaveLength(1);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('refuses the arm while a PR link moved the lane to in-review before its delivery, then passes on the settled head', async () => {
+    const repo = makeFixtureRepo('branch-idle-in-review');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    try {
+      const lane = await createLaneJob(h, repo, { jobId: 'mid-turn-link', status: 'in-review' });
+      const refused = await postReview(h, { job_id: 'mid-turn-link' });
+      expect(refused.status).toBe(409);
+      expect(refused.json).toEqual({
+        error: 'branch_busy',
+        blockers: [{ job_id: 'mid-turn-link', status: 'in-review', branch: 'gru/mid-turn-link' }],
+        hint: BRANCH_BUSY_HINT,
+      });
+      expect(h.ledger.listRounds('mid-turn-link')).toHaveLength(0);
+      expect(h.worktrees.listWorktrees({ jobId: 'mid-turn-link' }).filter((row) => row.kind === 'review')).toHaveLength(0);
+
+      // The open attempt settles: the same arm now passes on that head.
+      const sha = execFileSync('git', ['-C', lane.path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'mid-turn-link', payload: { sha } });
+      const passed = await postReview(h, { job_id: 'mid-turn-link' });
+      expect(passed.status).toBe(202);
+      expect(passed.json['round_id']).toBe('mid-turn-link-r1');
     } finally {
       await h.close();
     }
@@ -633,6 +676,8 @@ describe('branch-idle guard', () => {
       ],
       latestJobEvent: (jobId: string, kind: string): EventRecord | null =>
         (events.get(jobId) ?? []).filter((event) => event.kind === kind).at(-1) ?? null,
+      listJobEvents: (jobId: string): readonly EventRecord[] =>
+        [...(events.get(jobId) ?? [])].reverse(),
       listPendingRebriefs: (opts: { readonly jobId?: string } = {}): readonly PendingRebriefRecord[] =>
         opts.jobId === undefined ? [...pending.values()].flat() : (pending.get(opts.jobId) ?? []),
     };
@@ -1156,6 +1201,8 @@ describe('branch-idle guard', () => {
       listJobs: () => [jobRecord('marker-owner', 'delivered'), jobRecord('plain-lane', 'delivered')],
       latestJobEvent: (jobId: string, kind: string): EventRecord | null =>
         (events.get(jobId) ?? []).filter((event) => event.kind === kind).at(-1) ?? null,
+      listJobEvents: (jobId: string): readonly EventRecord[] =>
+        [...(events.get(jobId) ?? [])].reverse(),
       listPendingRebriefs: (opts: { readonly jobId?: string } = {}): readonly PendingRebriefRecord[] =>
         opts.jobId === undefined ? [...pending.values()].flat() : (pending.get(opts.jobId) ?? []),
     };

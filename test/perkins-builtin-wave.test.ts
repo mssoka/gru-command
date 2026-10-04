@@ -4944,11 +4944,12 @@ describe('durable handoff admission: perkins route, re-busy re-queue, crash/term
     const accepted = await wave.requestReview({ jobId: 'job-handoff-sweep', handoff: true });
     expect(accepted.route).toBe('queued');
     expect(f.ledger.latestJobEvent('job-handoff-sweep', 'job.review-handoff-requeued')).toBeNull();
-    // The lane goes idle WITHOUT a delivery and WITHOUT any second request:
-    // the authorized status leaves the busy set, so only the deterministic-
-    // pass reconciler (exactly what main wires into the Silas seam) may
-    // reconsider it.
-    f.ledger.setJobStatus('job-handoff-sweep', 'in-review');
+    // The lane settles into an authorized idle status WITHOUT a delivery
+    // event on the shared bus: only the deterministic-pass reconciler
+    // (exactly what main wires into the Silas seam) may reconsider it.
+    // (`in-review` reached from a still-open attempt is a WRITER since
+    // g25/#121 — the settle must be spelled as the delivered status.)
+    f.ledger.setJobStatus('job-handoff-sweep', 'delivered');
     wave.reconcilePendingHandoffs(); // the wired callback target — no API call, no timer, no follow-through lane
     await tickUntil(() => f.ledger.latestJobEvent('job-handoff-sweep', 'job.review-handoff-failed') !== null
       || f.ledger.latestJobEvent('job-handoff-sweep', 'job.review-handoff-started') !== null);
@@ -4979,7 +4980,7 @@ describe('durable handoff admission: perkins route, re-busy re-queue, crash/term
     expect(again.route).toBe('queued');
     // The lane settles into an authorized-but-idle status: the rearmed
     // intent may now reach its terminal outcome on the next pass.
-    f.ledger.setJobStatus('job-handoff-held', 'in-review');
+    f.ledger.setJobStatus('job-handoff-held', 'delivered');
     wave.reconcilePendingHandoffs();
     await tickUntil(() => f.ledger.latestJobEvent('job-handoff-held', 'job.review-handoff-failed') !== null
       || f.ledger.latestJobEvent('job-handoff-held', 'job.review-handoff-started') !== null);
@@ -5028,9 +5029,10 @@ describe('durable handoff admission: perkins route, re-busy re-queue, crash/term
     const wave = new WaveRunner({ ledger: f.ledger, worktrees: f.port, spawner: vi.fn() as unknown as AgentSpawner, bus: f.bus, reviewPreflight: failingPreflight });
     const accepted = await wave.requestReview({ jobId: 'job-handoff-idle', handoff: true });
     expect(accepted.route).toBe('queued'); // busy lane, durable 202 receipt
-    // The turn ends WITHOUT a delivery event (abort/failure): the lane goes
-    // idle and a later genuine observation must ARM the review — no skip.
-    f.ledger.setJobStatus('job-handoff-idle', 'in-review');
+    // The turn ends WITHOUT a delivery event (abort/failure): the lane
+    // settles into an authorized idle status and a later genuine
+    // observation must ARM the review — no skip.
+    f.ledger.setJobStatus('job-handoff-idle', 'delivered');
     const second = await wave.requestReview({ jobId: 'job-handoff-idle' });
     expect(second.route).toBe('queued'); // the receipt stays truthful while admission reconciles
     await tickUntil(() => f.ledger.latestJobEvent('job-handoff-idle', 'job.review-handoff-failed') !== null

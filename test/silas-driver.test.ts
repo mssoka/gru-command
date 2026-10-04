@@ -599,6 +599,49 @@ describe('silas digest (the four actionable states)', () => {
     } finally { h.cleanup(); }
   });
 
+  it('retires a clean-abort re-arm on the state it was answered by, keeping failed and deferred attempts eligible', async () => {
+    const h = makeLedger();
+    try {
+      const digestOf = () => computeSilasDigest({ ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG, trigger: 'sweep' });
+      const abortProof = (jobId: string, sha: string): ReturnType<LedgerApi['addRound']> => {
+        addJobWithDelivery(h.ledger, jobId, { prUrl: `https://git.example.invalid/pull/${jobId}` });
+        h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { sha } });
+        const round = h.ledger.addRound({ jobId, targetRef: sha });
+        h.ledger.setRoundStatus(round.id, 'live');
+        h.ledger.setJobStatus(jobId, 'in-review');
+        h.ledger.setRoundStatus(round.id, 'aborted');
+        h.ledger.appendCustomEvent({ kind: 'round.perkins-incomplete', jobId, roundId: round.id, payload: { reason: 'service_restart' } });
+        return round;
+      };
+
+      // Failed fallback attempts and 409 deferrals answer nothing.
+      const answered = abortProof('clean-answered', 'sha-answered');
+      expect((await digestOf()).prWithoutReview).toMatchObject([{ jobId: 'clean-answered', cleanAbort: { roundId: answered.id } }]);
+      h.ledger.appendCustomEvent({ kind: 'job.fallback-review', jobId: 'clean-answered', payload: { gate: true, phase: 'unavailable' } });
+      expect((await digestOf()).prWithoutReview).toMatchObject([{ jobId: 'clean-answered' }]);
+      h.ledger.appendCustomEvent({ kind: 'job.fallback-review', jobId: 'clean-answered', payload: { gate: true, phase: 'blocked' } });
+      expect((await digestOf()).prWithoutReview).toMatchObject([{ jobId: 'clean-answered' }]);
+      h.ledger.appendCustomEvent({ kind: 'silas.review-deferred', jobId: 'clean-answered', payload: {
+        reason: 'fallback_unavailable', rule_id: 'clean-abort-service-restart', source_round_id: answered.id,
+      } });
+      expect((await digestOf()).prWithoutReview).toMatchObject([{ jobId: 'clean-answered' }]);
+
+      // An intervening ACCEPTED request without the rule receipt retires it.
+      h.ledger.appendCustomEvent({ kind: 'silas.review-triggered', jobId: 'clean-answered', payload: { route: 'bmad-review-fallback' } });
+      expect((await digestOf()).prWithoutReview).toEqual([]);
+
+      // A fallback that engaged and then failed releases the row again.
+      const lost = abortProof('clean-gate-lost', 'sha-lost');
+      h.ledger.appendCustomEvent({ kind: 'silas.review-triggered', jobId: 'clean-gate-lost', payload: { route: 'bmad-review-fallback' } });
+      h.ledger.appendCustomEvent({ kind: 'job.fallback-review', jobId: 'clean-gate-lost', payload: { gate: true, phase: 'started' } });
+      expect((await digestOf()).prWithoutReview).toEqual([]);
+      h.ledger.appendCustomEvent({ kind: 'job.fallback-review', jobId: 'clean-gate-lost', payload: { gate: true, phase: 'blocked' } });
+      expect((await digestOf()).prWithoutReview).toMatchObject([{ jobId: 'clean-gate-lost', cleanAbort: { roundId: lost.id } }]);
+    } finally { h.cleanup(); }
+  });
+
   it('an unresolved re-brief fences first and changed-head reviews; a late delivery cannot clear it', async () => {
     const h = makeLedger();
     try {
