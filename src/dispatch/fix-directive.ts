@@ -374,6 +374,7 @@ export function flipJobToWorking(
  * pending prompt) instead of minting a fresh one. */
 export async function rebriefFreshMinion(
   input: DirectiveRoutingDeps & {
+    readonly ledger: Pick<LedgerApi, 'setAgentState'>;
     jobId: string;
     note: string;
     briefing: string | null;
@@ -387,6 +388,9 @@ export async function rebriefFreshMinion(
      * delivered — the durable re-brief marker binds the worker here, so a
      * crash mid-turn leaves a resumable pointer behind. */
     onSpawned?: (worker: { readonly id: string; readonly sessionFile: string | null }) => void;
+    /** Recheck request ownership and terminality at the last asynchronous
+     * admission boundaries; a running prompt is allowed to settle. */
+    beforeTurnSideEffect?: () => void;
   },
 ): Promise<{
   minionId: string;
@@ -399,18 +403,6 @@ export async function rebriefFreshMinion(
   outcome: 'completed' | 'error';
   error?: string;
 }> {
-  const jobMinions = input.ledger
-    .listAgents()
-    .filter((agent) => agent.jobId === input.jobId && agent.role === 'minion');
-  for (const minion of jobMinions) {
-    const handle = input.registry.getHandle(minion.id);
-    if (handle === null) continue;
-    await input.registry.disposeHandle(handle).catch((error: unknown) => {
-      throw new Error(
-        `could not retire the prior minion session ${minion.id} before re-briefing: ${String(error)}`,
-      );
-    });
-  }
   const lane = input.worktrees
     .listWorktrees({ jobId: input.jobId })
     .find((candidate) => candidate.kind === 'job' && candidate.status !== 'swept');
@@ -428,25 +420,60 @@ export async function rebriefFreshMinion(
     });
   }
   try {
+    input.beforeTurnSideEffect?.();
+    const jobMinions = input.ledger
+      .listAgents()
+      .filter((agent) => agent.jobId === input.jobId && agent.role === 'minion');
+    for (const minion of jobMinions) {
+      const prior = input.registry.getHandle(minion.id);
+      if (prior === null) continue;
+      await input.registry.disposeHandle(prior).catch((error: unknown) => {
+        throw new Error(
+          `could not retire the prior minion session ${minion.id} before re-briefing: ${String(error)}`,
+        );
+      });
+      input.beforeTurnSideEffect?.();
+    }
+    input.beforeTurnSideEffect?.();
     const handle = await input.registry.spawn('minion', {
       cwd,
       ...(input.resumeFile !== undefined && input.resumeFile !== null ? { resumeFile: input.resumeFile } : {}),
     });
-    input.ledger.registerAgent({
-      id: handle.id,
-      role: 'minion',
-      sessionFile: handle.sessionFile,
-      jobId: input.jobId,
-    });
-    input.onSpawned?.({ id: handle.id, sessionFile: handle.sessionFile });
-    const prompt = renderRebriefPrompt({
-      jobId: input.jobId,
-      briefing: input.briefing,
-      note: input.note,
-      ...(input.lessons !== undefined
-        ? { lessons: input.lessons.referencesFor(`${input.note}\n${input.briefing ?? ''}`) }
-        : {}),
-    });
+    let prompt: string;
+    try {
+      input.beforeTurnSideEffect?.();
+      input.ledger.registerAgent({
+        id: handle.id,
+        role: 'minion',
+        sessionFile: handle.sessionFile,
+        jobId: input.jobId,
+      });
+      input.onSpawned?.({ id: handle.id, sessionFile: handle.sessionFile });
+      prompt = renderRebriefPrompt({
+        jobId: input.jobId,
+        briefing: input.briefing,
+        note: input.note,
+        ...(input.lessons !== undefined
+          ? { lessons: input.lessons.referencesFor(`${input.note}\n${input.briefing ?? ''}`) }
+          : {}),
+      });
+      // registerAgent publishes agent.spawned after COMMIT. A subscriber
+      // can close the job or replace this request before the prompt; no
+      // await may separate this last fence from prompt delivery.
+      input.beforeTurnSideEffect?.();
+    } catch (error) {
+      try {
+        await handle.dispose();
+        // Registration can commit and then throw from its publication
+        // listener. Check the row rather than assuming a returned call.
+        if (input.ledger.listAgents().some((agent) => agent.id === handle.id)) {
+          input.ledger.setAgentState(handle.id, 'disposed');
+        }
+      } catch (cleanupError) {
+        throw new Error(`could not dispose minion ${handle.id} after failed re-brief setup: ${String(cleanupError)}`, { cause: error });
+      }
+      throw error;
+    }
     let promptError: unknown = null;
     let verdict: PromptTurnVerdict | null = null;
     try {

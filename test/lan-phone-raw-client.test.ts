@@ -207,6 +207,14 @@ describe('W5 — LAN-phone send path over the real socket', () => {
       (frame) => frame.type === 'user' && frame.client_msg_id === 'w5-desktop-1',
       'replayed own-side user frame',
     );
+    // Replay ends at the settled turn — only then is the delta set complete
+    // (the rule this file's reconnect case below documents). Asserting
+    // directly after the user frame assumed the echo deltas had already
+    // arrived: the 2026-10-02 FULL failed here ('' vs the expected echo),
+    // and the identical signature recurred cross-lane (provider-pacing
+    // 2026-09-30) — a load-sensitive arrival-order race, not a product
+    // regression. Correlate on the replayed user frame's seq so an earlier
+    // turn frame can never satisfy the barrier.
     await phone.waitFor(
       (frame) =>
         frame.type === 'turn' &&
