@@ -49,3 +49,20 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-pr142-review-verdict-closure.md`
   summary: Owned-service one-line-wrapper success path lost its dedicated installer regression oracle.
   evidence: Inherited from main e75ca3d; the success leg in `test/install-one-line.test.ts` now runs `target/install.sh`, while only the foreign-service refusal still exercises `bare/install.sh`.
+
+## Deferred from: code review (2026-10-03)
+- source_spec: none — BMAD code review of PR #170 (gru/gc-test-harness-budgets-20261002 @ 3540500), no-spec mode
+  summary: Diagnostic redaction is over-broad and destroys the evidence it exists to keep (medium, test/helpers/harness-diagnostics.mjs:1205-1236)
+  evidence: Probed on the PR head: case-insensitive Bearer|Basic + any word ("running basic checks" → "basic [REDACTED]"), label match without a word boundary ("max_tokens: 4096", "secrets: none configured"), \bAKIA/i ("Akiane"). A chunk ending in "…running basic setup" opens the streaming fail-closed state and discards the rest of the line, dropping " FAILED: ENOENT /missing/file". Deferred: tightening trades leak-safety for signal and contradicts the r1-pinned lowercase-bearer case — needs an owner call on the leak/noise trade-off.
+- source_spec: none — BMAD code review of PR #170 (head 3540500)
+  summary: runOwnedCommand and disposeScopeProcesses signal only the direct child; grandchildren of `bash install.sh` (npm/git/node) are orphaned on deadline or teardown (medium, test/helpers/harness-diagnostics.mjs:1397-1430,1486-1550)
+  evidence: No detached spawn or process-group kill; SIGTERM to bash does not propagate. execFileSync's timeout behaved the same, but the new teardown claims to reap owned children. Deferred: the obvious fix (detached + kill(-pid)) puts the child in a new session with no controlling terminal, which changes the /dev/tty semantics the install.sh TTY tests assert — needs a design decision.
+- source_spec: none — BMAD code review of PR #170 (head 3540500)
+  summary: A timed-out async test body keeps running and spawns its remaining install.sh/wizard commands during the next test, tracked in that test's scope (medium, test/install-one-line.test.ts:1931-1968)
+  evidence: Converting execFileSync to awaited runOwnedCommand means Vitest moves on after a timeout while the abandoned body continues; activeScope is the next test's scope, so the orphan runs add co-tenant load and appear in the wrong test's diagnostics. Vitest 3.2.7 aborts context.signal on timeout; threading it through ~35 run() call sites is a design choice. Deferred.
+- source_spec: none — BMAD code review of PR #170 (head 3540500)
+  summary: `npm test` chains the phases with &&, so any fast-phase failure hides every heavy-phase result for that run (low, package.json:161)
+  evidence: Previously one `vitest run` reported all backend failures; CI now needs an extra round to see heavy regressions (no false green). The RPC patch also runs three times (pretest + both phase pretests), which is idempotent. Deferred: aggregating exit codes changes the chain shape pinned by harness-routing.test.ts.
+- source_spec: none — BMAD code review of PR #170 (head 3540500)
+  summary: AGENTS.md and other docs don't mention the phase split; `npx vitest run test/<heavy>.test.ts` now exits "No test files found" (low)
+  evidence: README documents test:backend:heavy, but agent guidance does not, so minions running a heavy file directly hit an exit-1 trap (it fails loud, not silently). Deferred: the fix edits agent-context files.
