@@ -701,6 +701,21 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     this.postTimeoutMs = requestedPostTimeout ?? 30_000;
   }
 
+  /** Restart-recovery evidence (R30): the verified App bot account this
+   * poster publishes as, proven from the installed bundle through the
+   * SAME identity chain the live prepare/post path uses. Recovery must
+   * never credit a persisted actor on its own authority. */
+  async authenticatedActor(host: string): Promise<string> {
+    if (host !== 'github.com') {
+      throw new PerkinsAppError(
+        `Perkins App publication is configured, but host "${sanitize(host)}" is not github.com — the App's credentials are bound to api.github.com and cannot evidence an account for this host`,
+      );
+    }
+    const { config, privateKeyPem } = loadPerkinsAppBundle(this.options.instanceDir);
+    const jwt = mintAppJwt(config.appId, privateKeyPem, this.now());
+    return this.verifyAppIdentity(jwt, config.appId);
+  }
+
   async post(input: VerdictPosterInput): Promise<PostedReviewReceipt> {
     const { grant, botLogin, owner, repo, prNumber, headSha, baseSha } = await this.prepare(input);
     const postStartMs = this.now();

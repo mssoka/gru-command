@@ -1916,6 +1916,55 @@ describe('whole-PR engine: repair pass 3', () => {
     expect(deleted).toEqual({ status: 'D', oldPath: 'src/gone.ts', newPath: null });
   });
 
+  it('lists a type-change prior entry truthfully as {status:"T"} at the same path (R33)', async () => {
+    const repo = makeFixtureRepo('whole-reader-typechange');
+    repos.push(repo);
+    const base = repo.head();
+    repo.git(['checkout', '-b', 'feature/typechange']);
+    repo.commitFile('src/typed.ts', 'export const typed = 1;\n');
+    // PRIOR revision: a gitlink (mode 160000) at src/typed.ts. A gitlink
+    // is invisible to the freeze symlink guard, and the target revision
+    // restored below is a regular file, so the frozen tree stays clean.
+    repo.git(['rm', '-q', 'src/typed.ts']);
+    repo.git(['update-index', '--add', '--cacheinfo', `160000,${repo.head()},src/typed.ts`]);
+    repo.git(['-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '-m', 'fixture: gitlink state']);
+    const priorTarget = repo.head();
+    // TARGET revision: the same path is a regular file again.
+    repo.git(['rm', '--cached', '-q', 'src/typed.ts']);
+    writeFileSync(join(repo.path, 'src/typed.ts'), 'export const typed = 2;\n', 'utf8');
+    repo.git(['-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'add', 'src/typed.ts']);
+    repo.git(['-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '-m', 'fixture: regular file again']);
+    const root = temp('perkins-typechange-');
+    const priorFile = join(root, 'prior.json');
+    writeFileSync(priorFile, JSON.stringify({
+      schemaVersion: 3,
+      architecture: 'perkins-whole-pr',
+      canonicalVerdict: 'NEEDS CHANGES', complete: true, headMoved: false,
+      findings: [],
+      frozen: { targetSha: priorTarget, diffBaseSha: base },
+    }));
+    const frozen = freezeReviewInputs({
+      roundId: 'typechange-round', repoPath: repo.path, artifactRoot: root,
+      baseRef: base, targetRef: repo.head(), movementRef: 'feature/typechange', spec: 'type change reader',
+    });
+    const fake = fakeWholeSpawner(temp('perkins-typechange-sessions-'), {
+      childAnswer: () => '[]',
+      specialists: [],
+      onPriorRevision: () => {},
+    });
+    const engine = new PerkinsWholeReview({ spawner: fake.spawner, policy: loadPerkinsPolicy() });
+    await engine.run({
+      roundId: 'typechange-round', roundNumber: 2, frozenReview: frozen,
+      movementRef: 'feature/typechange', noSpec: false, priorConsolidatedFile: priorFile,
+    });
+    const tool = fake.leadCalls[0]!.options.reviewLead!.nativeTools
+      .find((entry) => entry.name === 'perkins_read_prior_revision') as NativeAgentTool;
+    const listing = JSON.parse((await tool.execute({})).text) as { changes: Array<{ status: string; oldPath: string | null; newPath: string | null }> };
+    // Before the fix the `T` entry fell into the silent-skip branch and the
+    // re-reviewer saw an incomplete changed-path list.
+    expect(listing.changes).toContainEqual({ status: 'T', oldPath: 'src/typed.ts', newPath: 'src/typed.ts' });
+  });
+
   it('delivers the LAST-file sentinel of a >3000-line multi-file diff to BOTH the lead and specialist prompts (R18)', async () => {
     const sentinel = 'P3-SENTINEL-LAST-FILE-4902';
     const h = wholeHarness({

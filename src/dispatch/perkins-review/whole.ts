@@ -1369,18 +1369,21 @@ export class PerkinsWholeReview {
             '-C', review.manifest.repoPath, 'diff', '--no-ext-diff', '--no-color', '--find-renames',
             '--name-status', '-z', priorTargetSha, review.manifest.targetSha, '--',
           ], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: GIT_PROOF_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] });
-          // Truthful per-status parsing: an added file has NO old path and a
-          // deleted file has NO new path — a re-reviewer must not be shown a
-          // prior version of a file that did not exist.
+          // Truthful per-status parsing covers every name-status letter
+          // git emits for two committed trees (R33): A/D/M/T are
+          // single-path entries (T is a type change at the SAME path,
+          // present at both revisions), R###/C### are two-path entries,
+          // and anything else fails loudly rather than silently dropping
+          // a changed path from the re-reviewer's delta.
           const fields = listing.split('\0').filter(Boolean);
           const changes: { status: string; oldPath: string | null; newPath: string | null }[] = [];
           for (let i = 0; i < fields.length;) {
             const status = fields[i++]!;
-            if (/^R[0-9]{1,3}$/u.test(status)) {
+            if (/^[RC][0-9]{1,3}$/u.test(status)) {
               const oldPath = fields[i++];
               const newPath = fields[i++];
-              if (oldPath !== undefined && newPath !== undefined) changes.push({ status: 'R', oldPath, newPath });
-            } else if (status === 'A' || status === 'D' || status === 'M') {
+              if (oldPath !== undefined && newPath !== undefined) changes.push({ status: status[0]!, oldPath, newPath });
+            } else if (status === 'A' || status === 'D' || status === 'M' || status === 'T') {
               const path = fields[i++];
               if (path !== undefined) {
                 changes.push({
@@ -1390,7 +1393,7 @@ export class PerkinsWholeReview {
                 });
               }
             } else {
-              i += 1; // unknown types are skipped without mislabeling others
+              throw new Error(`git diff reported an unhandled name-status "${status}" — refusing an incomplete prior-revision listing`);
             }
           }
           payload = JSON.stringify({ priorTargetSha, targetSha: review.manifest.targetSha, changes });
