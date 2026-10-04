@@ -42,7 +42,7 @@ Native round r7 (frozen `d1395b8dc6deb7d429c0bd320d12b08bc55dd6e3`, verdict-post
 
 ### Blocker — the full gate was red at `d1395b8` (2 × 30 s test-body timeouts)
 
-Complete `e19f81a7` output read (113293 B, sha256 `c38b0aea…`, 959 lines; preserved at `/Users/moses/.gru-command/investigations/silas-sweep-20261003T100543Z/pr145-r7-original-full-red/`). Both failures were composite tests carrying two-plus budget-sized scenarios in one 30 s body:
+Complete `e19f81a7` output read (113293 B, sha256 `c38b0aea…`, 959 lines; preserved in the lane's ignored investigation evidence outside the tracked tree — the run id identifies it). Both failures were composite tests carrying two-plus budget-sized scenarios in one 30 s body:
 
 - `install-one-line` "restarts only an owned service and refuses a foreign unit with the same public name" ran three full installer cycles (setup + foreign refusal + owned restart): CI nominal 3363 ms, 21146 ms in the ff4634c local FULL, 33291 ms timeout at `d1395b8`.
 - `perkins-builtin-wave` T4 ran two full moved/aborted round fixtures: CI nominal 818 ms, 26554 ms local at ff4634c, 33724 ms timeout at `d1395b8`.
@@ -60,3 +60,17 @@ Repaired: both late-terminal cancellation probes (adapter queue and native SDK q
 ### Fresh in-lane review and remaining gates
 
 The bmad step-04 layers were re-run as fresh contexts on the merged diff (`20386e1`; outputs `review-20386e1-*`); their findings were triaged and the applied/rejected dispositions are logged in the spec's review triage log (T4b oracle parity, JSONL tail tolerance, chat exactly-once count, scope comments applied; rejected items evidenced there). Remaining gates: the final integrated head's focused/typecheck/FULL receipts, current-head CI, and exact-head native Perkins clearance. Merge stays owner-held.
+
+### r8 reconciliation and current-main integration (2026-10-04)
+
+Round r8 (frozen `d1395b8`, verdict-posted NEEDS CHANGES) raised one blocker and two warnings. The blocker (full gate red at `d1395b8`) was dispositioned by the r7 repairs above; the CI run on the repaired head `2d33967` confirms it cleared the timeout class — run `37135057205` finished 1869 passed / 9 skipped with exactly one failure. That single failure was this document: `scripts/hygiene-grep.sh` flagged an absolute personal evidence path on line 45 (the always-on hygiene gate, SPEC ruling 8). Repaired by removing the path from the tracked document; the same gate is locally clean (`scripts/hygiene-grep.sh` exit 0). The W5 build-prerequisite warning is the `npm run build` prefix above, and the late-summary warning is the post-cancel held-transport checkpoint above.
+
+The PR had also become CONFLICTING/DIRTY against `origin/main` (`40f9867`, the history-preserving integrations of PRs #142/#144/#130 and the j-829 workload-aware budget policy). Integrated in merge `84d7dbc` with both intents kept:
+
+- `perkins-builtin-wave` T4 keeps the reviewed r7 split (T4a moved / T4b aborted, per-scenario bodies) and adopts main's batched fixture cost repair plus the observation-only T4-PHASE/T4-ATTR instrumentation per leg; suite pin 95 (main 94 + one split).
+- `install-one-line` keeps the r7 foreign/owned split, moved onto main's async `run()` helper with every call awaited (same titles, bodies and assertions).
+- `lan-phone-raw-client` W5 keeps the seq-correlated replayed-turn barrier (this lane's reviewed predicate) with main's arrival-order rationale.
+- `chat-server` held retirement takes main's bounded poll plus the explicit disposed oracle.
+- `.gru-command/worktree.toml` keeps the PR145 scopes and main's added scopes; every contract scope that names a main-classified heavy file now routes through `--config vitest.heavy.config.ts`, `lan-phone-w5` keeps its build prerequisite, and `test/test-budgets.ts` observed-timeout pins name the split descendants (all guarded by `test/test-budgets.test.ts`).
+
+Exact-head local FULL at `84d7dbc`: `npm test` exit 0 — fast 1506 passed / 6 skipped, heavy 662 passed / 6 skipped, web 408 passed, hygiene clean. Focused: `compaction-timeout` 161/161 (pi-adapter 75, chat-server 84, suite-shape 2); T4a/T4b and both split installer scenarios green under the heavy runner. Remaining gates: exact-head CI and native Perkins clearance; merge stays owner-held. A receipt bound to a successor head cannot be written inside this revision; the CI result for the pushed head is the authoritative current-head receipt, supplied with the PR.

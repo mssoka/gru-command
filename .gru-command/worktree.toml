@@ -87,7 +87,7 @@ native-compaction-wait = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest 
 # scope still runs every test exactly once. The policy guard
 # (test/test-budgets.test.ts) pins these names to the heavy classification,
 # each case's file to this command, and the approved j-463 RPC patch first.
-ten-timeout-cases = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts -t \"by=silas on the pr/review|without by, the pr/review|second run fast-forwards|refuses a non-fast-forward|restarts only an owned|terminalizes a workflow schema|newest completed predecessor|does not record a reconciled delivery|non-PR origin/topic target FREEZES|report rejection|answers rejects secrets\" test/dispatch-server.test.ts test/install-one-line.test.ts test/perkins-builtin-wave.test.ts test/perkins-freeze-freshhead.test.ts test/perkins-whole-review.test.ts test/wizard.test.ts"
+ten-timeout-cases = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts -t \"by=silas on the pr/review|without by, the pr/review|second run fast-forwards|refuses a non-fast-forward|restarts only an owned|refuses a foreign unit|terminalizes a workflow schema|newest completed predecessor|does not record a reconciled delivery|non-PR origin/topic target FREEZES|report rejection|answers rejects secrets\" test/dispatch-server.test.ts test/install-one-line.test.ts test/perkins-builtin-wave.test.ts test/perkins-freeze-freshhead.test.ts test/perkins-whole-review.test.ts test/wizard.test.ts"
 
 # PR136 durable follow-through focused scope: every suite the delta can
 # move — the directive single-writer guard (ledger + HTTP), obligations
@@ -126,8 +126,9 @@ native-compaction-wait-baseline = 'set -e; base=2aa836abe262759c651683deb40d05f0
 # chat held-retirement boundary and the suite pins, under the RPC prerequisite.
 compaction-timeout = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/pi-adapter.test.ts test/chat-server.test.ts test/suite-shape.test.ts"
 # W5 LAN-phone replay-barrier repair: the real-socket phone replay test,
-# runnable via the scheduler so the barrier fix has committed evidence.
-lan-phone-w5 = "node tools/patch-vitest-rpc-timeout.mjs && npm run build && npx vitest run test/lan-phone-raw-client.test.ts"
+# runnable via the scheduler so the barrier fix has committed evidence; the
+# backend build its fixture needs runs before the heavy-classified suite.
+lan-phone-w5 = "node tools/patch-vitest-rpc-timeout.mjs && npm run build && npx vitest run --config vitest.heavy.config.ts test/lan-phone-raw-client.test.ts"
 
 # Baseline fail-before proof for the review-rebrief-interlock digest fence
 # (phase pr144-baseline-proof-readiness-20261002; blob pin corrected
@@ -231,10 +232,11 @@ t4-oracle = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config 
 r2-timeout-isolation = 'node tools/patch-vitest-rpc-timeout.mjs || exit 3; echo "r2-timeout-isolation leg 1 dispatch-server: by=silas"; npx vitest run --config vitest.heavy.config.ts test/dispatch-server.test.ts -t "by=silas on the pr/review endpoints"; a=$?; echo "r2-timeout-isolation leg 2 install-one-line: restarts only an owned service"; npx vitest run --config vitest.heavy.config.ts test/install-one-line.test.ts -t "restarts only an owned service"; b=$?; echo "r2-timeout-isolation leg 3 wave: T4 reconciled delivery"; npx vitest run --config vitest.heavy.config.ts test/perkins-builtin-wave.test.ts -t "does not record a reconciled delivery"; c=$?; echo "r2-timeout-isolation exits: dispatch-server=$a install-one-line=$b wave-t4=$c"; if [ "$a" -ne 0 ] || [ "$b" -ne 0 ] || [ "$c" -ne 0 ]; then exit 1; fi'
 
 # r7 timeout-cliff checks: the two 30s test-body timeouts from the d1395b8
-# FULL, run under their unchanged deadline. The install one-liner scenarios
-# and the two T4 reconciliation scenarios are each split so no single test
-# body carries two full installer cycles / two full round fixtures.
-r7-timeout-cliff = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/install-one-line.test.ts test/perkins-builtin-wave.test.ts -t \"restarts only an owned service|refuses a foreign unit with the same public name|does not record a reconciled delivery\""
+# FULL, routed through the classified heavy runner (main's budget policy);
+# the install one-liner scenarios and the two T4 reconciliation scenarios are
+# each split so no single test body carries two full installer cycles / two
+# full round fixtures. No test deadline, assertion or gate is changed.
+r7-timeout-cliff = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/install-one-line.test.ts test/perkins-builtin-wave.test.ts -t \"restarts only an owned service|refuses a foreign unit with the same public name|does not record a reconciled delivery\""
 
 # Isolated pre-fix baseline: current-main 059c0762 source with the IDENTICAL
 # final behavioral tests from the scheduled head, dependencies linked (no
