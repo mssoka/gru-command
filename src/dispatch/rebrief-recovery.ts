@@ -1079,7 +1079,11 @@ function completeDirectiveFromEvidence(ledger: LedgerApi, row: DirectiveRequestR
 }
 
 /** Newest event of one kind whose payload is correlated to the request
- * id and passes the caller's watermark predicate. */
+ * id, by IDENTITY (SQL on `request_id`) rather than a newest-N window:
+ * however many newer same-kind events carry other request ids, the
+ * correlated receipt is still found. The newest correlated event failing
+ * the watermark predicate means every older one fails too, so no walk is
+ * needed. */
 function findCorrelatedEvent(
   ledger: LedgerApi,
   jobId: string,
@@ -1087,16 +1091,7 @@ function findCorrelatedEvent(
   kind: string,
   accept: (event: EventRecord) => boolean,
 ): EventRecord | null {
-  // Kind-scoped, bounded read: unrelated job traffic can never push the
-  // correlated receipt out of the fixed window (per-tick passes re-read
-  // this evidence for every live request).
-  const events = ledger.listJobEventsByKinds(jobId, [kind], { limit: 1000 });
-  for (const event of events) {
-    if (event.kind !== kind) continue;
-    const payload = (typeof event.payload === 'object' && event.payload !== null ? event.payload : {}) as Record<string, unknown>;
-    if (payload['request_id'] !== requestId) continue;
-    if (!accept(event)) continue;
-    return event;
-  }
-  return null;
+  const event = ledger.latestJobEventByRequestId(jobId, kind, requestId);
+  if (event === null || !accept(event)) return null;
+  return event;
 }

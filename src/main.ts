@@ -25,7 +25,7 @@ import { createReviewEscalationNotifier } from './dispatch/escalation-identity.j
 import { createStartupVerdictPoster } from './dispatch/perkins-github-app.js';
 import { BobScheduler } from './dispatch/bob-scheduler.js';
 import { SilasDriver, supervisionLookup } from './dispatch/silas-driver.js';
-import { reconcileDurableWork } from './dispatch/durable-reconcile.js';
+import { createDurableReconcileHook } from './dispatch/durable-reconcile.js';
 import { ProviderRecoverySensor, establishProviderWait } from './provider-recovery/sensor.js';
 import { ModelRuntimeProbe } from './provider-recovery/probe.js';
 import {
@@ -1409,19 +1409,18 @@ async function main(): Promise<number> {
       // getter keeps the lookup late-bound like the engine's closure — a
       // construction-order change can never freeze a null handle (A4).
       supervisionFor: supervisionLookup(() => supervisor),
-      // Chief phase-3 seam: every deterministic Silas pass (bus wake events
-      // and sweep ticks) reconsiders pending review handoffs AND runs the
-      // bounded durable reconciliation (issue #163) BEFORE any LLM wake —
-      // directive/phase/hand-back transitions keep advancing even while a
-      // long model turn is open. Bounded, fence-preserving, no dispatch.
-      onDeterministicPass: () => {
-        state.wave?.reconcilePendingHandoffs();
-        return reconcileDurableWork({
-          ledger,
-          notifications,
-          log: (level, msg, fields) => logger.log(level, msg, fields),
-        });
-      },
+      // Chief phase-3 seam: every deterministic Silas pass runs the
+      // production hook — the in-memory review-handoff reconsideration
+      // plus the bounded durable reconciliation (issue #163) — BEFORE any
+      // LLM wake. The factory is behaviorally tested with a real ledger
+      // and driver; a wiring regression fails a behavioral test, not just
+      // a source regex.
+      onDeterministicPass: createDurableReconcileHook({
+        ledger,
+        notifications,
+        log: (level, msg, fields) => logger.log(level, msg, fields),
+        wave: { reconcilePendingHandoffs: () => state.wave?.reconcilePendingHandoffs() },
+      }),
       githubPoll: new GitHubSignalPoll({
         ledger,
         notifications,

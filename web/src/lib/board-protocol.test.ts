@@ -162,6 +162,7 @@ describe('board server-frame validator', () => {
         lastTickAt: null,
         lastReconcileAt: null,
         lastReconcileFailedAt: null,
+        reconcileFailedNewer: false,
         lastUsefulActionAt: null,
         openTurnSince: null,
         reconciliationsToday: 2,

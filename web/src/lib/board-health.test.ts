@@ -142,6 +142,7 @@ describe('the remaining health cards render truthfully or n/a', () => {
     lastTickAt: null as string | null,
     lastReconcileAt: null as string | null,
     lastReconcileFailedAt: null as string | null,
+    reconcileFailedNewer: false,
     lastUsefulActionAt: null as string | null,
     openTurnSince: null as string | null,
     reconciliationsToday: 0,
@@ -187,6 +188,7 @@ describe('the remaining health cards render truthfully or n/a', () => {
         lastWakeAt: ISO(-3_600_000),
         lastReconcileAt: ISO(-600_000),
         lastReconcileFailedAt: ISO(-60_000),
+        reconcileFailedNewer: true,
       },
       NOW.getTime(),
     );
@@ -279,6 +281,7 @@ describe('the health row — fixed order over the snapshot', () => {
         lastTickAt: ISO(-30_000),
         lastReconcileAt: null,
         lastReconcileFailedAt: null,
+        reconcileFailedNewer: false,
         lastUsefulActionAt: null,
         openTurnSince: null,
         reconciliationsToday: 1,

@@ -170,6 +170,10 @@ export interface SilasView {
   /** Newest FAILED deterministic reconciliation pass (never counted as
    * completion). */
   readonly lastReconcileFailedAt: string | null;
+  /** True when the newest pass failure is NEWER than the newest pass
+   * success (compared by durable event sequence, so same-millisecond
+   * passes cannot tie-break wrongly). */
+  readonly reconcileFailedNewer: boolean;
   /** Newest state-correction action (register PR, trigger review,
    * directive, rebrief, escalation). */
   readonly lastUsefulActionAt: string | null;
@@ -263,23 +267,16 @@ const SILAS_WAKE_KINDS = ['silas.wake'] as const;
 const SILAS_TICK_KINDS = ['silas.tick'] as const;
 const SILAS_RECONCILE_KINDS = ['silas.reconcile'] as const;
 const SILAS_RECONCILE_FAILED_KINDS = ['silas.reconcile-failed'] as const;
-/** State-correction events that moved the board (registering a PR,
- * triggering review, directives, rebriefs, escalations). */
+/** State-correction and machine-action events that moved the board
+ * (registering a PR, triggering review, directives, settlements,
+ * rebriefs, escalations). */
 const SILAS_ACTION_KINDS = [
   'silas.pr-registered',
   'silas.review-triggered',
   'silas.directive-sent',
+  'silas.directive-settled',
   'silas.rebrief',
   'silas.escalated',
-] as const;
-
-/** Durable machine follow-through the deterministic pass finishes (issue
- * #163): phase hand-backs and obligation writes/settlements count as
- * useful actions even though they are not `silas.*` events. */
-const MACHINE_ACTION_KINDS = [
-  'job.phase-handoff-completed',
-  'job.obligation-recorded',
-  'job.obligation-settled',
 ] as const;
 
 /** PR state from the record: a terminal `merged` job is merged; a
@@ -625,14 +622,18 @@ export class BoardEngine {
     const dayStart = new Date(now);
     dayStart.setHours(0, 0, 0, 0);
     const wake = this.ledger.latestEventOfKinds(SILAS_WAKE_KINDS);
+    const reconcileOk = this.ledger.latestEventOfKinds(SILAS_RECONCILE_KINDS);
+    const reconcileFailed = this.ledger.latestEventOfKinds(SILAS_RECONCILE_FAILED_KINDS);
     return {
       lastWakeAt: wake?.ts ?? null,
       lastTickAt: this.ledger.latestEventOfKinds(SILAS_TICK_KINDS)?.ts ?? null,
       // The success timestamp only ever advances on a completed pass; a
       // later failure does not erase it, and a failure never sets it.
-      lastReconcileAt: this.ledger.latestEventOfKinds(SILAS_RECONCILE_KINDS)?.ts ?? null,
-      lastReconcileFailedAt: this.ledger.latestEventOfKinds(SILAS_RECONCILE_FAILED_KINDS)?.ts ?? null,
-      lastUsefulActionAt: this.ledger.latestEventOfKinds([...SILAS_ACTION_KINDS, ...MACHINE_ACTION_KINDS])?.ts ?? null,
+      lastReconcileAt: reconcileOk?.ts ?? null,
+      lastReconcileFailedAt: reconcileFailed?.ts ?? null,
+      reconcileFailedNewer:
+        reconcileFailed !== null && (reconcileOk === null || reconcileFailed.seq > reconcileOk.seq),
+      lastUsefulActionAt: this.ledger.latestEventOfKinds(SILAS_ACTION_KINDS)?.ts ?? null,
       openTurnSince: openTurn ? (wake?.ts ?? null) : null,
       reconciliationsToday: this.ledger.countEventsSince(SILAS_ACTION_KINDS, dayStart.toISOString()),
       checkedAt: new Date(now).toISOString(),

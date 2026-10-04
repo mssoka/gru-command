@@ -804,6 +804,51 @@ export class LedgerApi {
     return row === undefined ? null : this.eventFromRow(row);
   }
 
+  /** A request-correlated event by identity, not recency: the correlated
+   * receipt is found however many newer same-kind events carry other
+   * request ids (restart-safe admission/delivery reconciliation). */
+  latestJobEventByRequestId(
+    jobId: string,
+    kind: string,
+    requestId: string,
+    opts: { sinceSeq?: number } = {},
+  ): EventRecord | null {
+    if (requestId.trim() === '') throw new Error('latestJobEventByRequestId requires a non-empty requestId');
+    const row = this.db
+      .prepare(
+        `SELECT * FROM events WHERE job_id = ? AND kind = ? AND seq > ?
+         AND json_extract(payload, '$.request_id') = ? ORDER BY seq DESC LIMIT 1`,
+      )
+      .get(jobId, kind, opts.sinceSeq ?? -1, requestId) as Row | undefined;
+    return row === undefined ? null : this.eventFromRow(row);
+  }
+
+  /** The newest event per (kind, scope) for a job. The verification
+   * follow-through reduction rides this so an unresolved scope can never
+   * age out behind newer traffic from other scopes (no newest-N window). */
+  latestJobEventsByPayloadScope(
+    jobId: string,
+    kinds: readonly string[],
+    opts: { limit?: number } = {},
+  ): readonly EventRecord[] {
+    if (kinds.length === 0) throw new Error('latestJobEventsByPayloadScope requires at least one kind');
+    const limit = opts.limit ?? 200;
+    const placeholders = kinds.map(() => '?').join(', ');
+    const rows = this.db
+      .prepare(
+        `SELECT e.* FROM events e
+          WHERE e.job_id = ? AND e.kind IN (${placeholders})
+            AND e.seq = (
+              SELECT MAX(s.seq) FROM events s
+               WHERE s.job_id = e.job_id AND s.kind = e.kind
+                 AND json_extract(s.payload, '$.scope') IS json_extract(e.payload, '$.scope')
+            )
+          ORDER BY e.seq DESC LIMIT ?`,
+      )
+      .all(jobId, ...(kinds as string[]), limit) as Row[];
+    return rows.map((row) => this.eventFromRow(row));
+  }
+
   /** Newest event among an explicit kind set (board health cards: the
    * last Silas wake). An empty kind set is a caller bug — throw loudly. */
   latestEventOfKinds(kinds: readonly string[]): EventRecord | null {
@@ -2950,6 +2995,22 @@ export class LedgerApi {
    * write and the notification). A published card — even a resolved/acked
    * one — removes the row from the candidate set. */
   listHandbacksMissingCards(limit: number, opts: { cursor?: number } = {}): readonly ObligationRecord[] {
+    return this.listHandbacksMissingCardsDetailed(limit, opts).readable;
+  }
+
+  /** Window-B candidates with per-row decode isolation: one malformed
+   * obligation row is reported (never re-thrown into a bounded pass) while
+   * the readable rows stay available and the cursor can advance past the
+   * malformed prefix. */
+  listHandbacksMissingCardsDetailed(
+    limit: number,
+    opts: { cursor?: number } = {},
+  ): {
+    readonly readable: readonly ObligationRecord[];
+    readonly malformed: number;
+    readonly lastRowid: number | null;
+    readonly exhausted: boolean;
+  } {
     if (!Number.isSafeInteger(limit) || limit < 1) {
       throw new Error(`listHandbacksMissingCards requires a positive integer limit, got ${String(limit)}`);
     }
@@ -2958,7 +3019,7 @@ export class LedgerApi {
     }
     const rows = this.db
       .prepare(
-        `SELECT o.* FROM job_obligations o
+        `SELECT o.rowid AS _rowid, o.* FROM job_obligations o
           WHERE o.logical_step = 'operation'
             AND o.incident_key LIKE 'phase-handback@%'
             AND o.state IN ('open', 'waiting')
@@ -2971,7 +3032,22 @@ export class LedgerApi {
           LIMIT ?`,
       )
       .all(opts.cursor ?? 0, limit) as Row[];
-    return rows.map((row) => this.obligationFromRow(row));
+    const readable: ObligationRecord[] = [];
+    let malformed = 0;
+    for (const row of rows) {
+      try {
+        readable.push(this.obligationFromRow(row));
+      } catch {
+        malformed += 1;
+      }
+    }
+    const last = rows[rows.length - 1];
+    return {
+      readable,
+      malformed,
+      lastRowid: last === undefined ? null : Number(last._rowid),
+      exhausted: rows.length < limit,
+    };
   }
 
   getObligation(id: string): ObligationRecord | null {
@@ -4643,6 +4719,13 @@ export class LedgerApi {
       this.db
         .prepare("UPDATE pending_directives SET state = 'settled', delivery_seq = ?, updated_at = ? WHERE request_id = ?")
         .run(input.eventSeq, nowIso(), input.requestId);
+      // Durable action marker: a settlement is machine follow-through and
+      // must be visible to health/action projections (issue #163 review).
+      this.appendEvent({
+        kind: 'silas.directive-settled',
+        jobId: row.jobId,
+        payload: { request_id: input.requestId, delivery_seq: input.eventSeq },
+      });
       return this.getDirective(input.requestId) as DirectiveRequestRecord;
     });
   }

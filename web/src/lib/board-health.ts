@@ -150,11 +150,9 @@ export function silasCard(silas: SilasView | null | undefined, now = Date.now())
   // reconciliation heartbeat, never the wake-start age alone — a healthy
   // long model turn must not read as a stalled scheduler. A pass that
   // FAILED after the last success is louder than every healthy state; the
-  // success and failure stamps share the canonical ISO shape, so string
-  // comparison is the correct ordering.
-  const failedNewer =
-    silas.lastReconcileFailedAt !== null &&
-    (silas.lastReconcileAt === null || silas.lastReconcileFailedAt > silas.lastReconcileAt);
+  // engine compares durable event ORDER, so same-millisecond passes cannot
+  // tie-break wrongly.
+  const failedNewer = silas.reconcileFailedNewer;
   const value = failedNewer
     ? `pass failed ${formatAge(silas.lastReconcileFailedAt, now)} ago`
     : silas.openTurnSince !== null

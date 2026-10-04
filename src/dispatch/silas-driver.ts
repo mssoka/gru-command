@@ -144,6 +144,13 @@ export interface DigestLedger {
    * verification follow-through read rides this so unrelated job traffic
    * cannot age the observed kind out of a fixed window. */
   listJobEventsByKinds(jobId: string, kinds: readonly string[], opts?: { limit?: number }): readonly EventRecord[];
+  /** The newest event per (kind, scope): the per-scope verification
+   * reduction without a newest-N window. */
+  latestJobEventsByPayloadScope(
+    jobId: string,
+    kinds: readonly string[],
+    opts?: { limit?: number },
+  ): readonly EventRecord[];
   latestJobEvent(jobId: string, kind: string): EventRecord | null;
   latestRoundEvent(roundId: string, kind: string): EventRecord | null;
   listAgents(): readonly AgentRecord[];
@@ -460,13 +467,18 @@ function latestAnsweringReviewRequest(ledger: DigestLedger, jobId: string): Even
   return winner;
 }
 
-/** Verification event kinds that prove a submission/attempt exists — the
- * retirement evidence for failure/wait rows (never a rerun authority). */
+/** Bus events that carry a repair rung (a failed verification may retire
+ * only on a rung that names that exact failure). */
+const REPAIR_RUNG_KINDS: readonly string[] = ['silas.directive-sent', 'silas.rebrief', 'silas.escalated'];
+
+/** Verification event kinds that prove a FRESH SUBMISSION exists — the
+ * retirement evidence for failure/wait rows (never a rerun authority). A
+ * `verification.reconciled` replay of an older run is deliberately
+ * excluded: it ran nothing new and cannot answer a debt. */
 const VERIFICATION_ACTIVITY_KINDS: readonly string[] = [
   'verification.requested',
   'verification.started',
   'verification.attached',
-  'verification.reconciled',
 ];
 
 function payloadRecord(event: EventRecord): Record<string, unknown> {
@@ -489,16 +501,23 @@ function payloadFlag(event: EventRecord, key: string, expected: boolean): boolea
   return payloadRecord(event)[key] === expected;
 }
 
-/** Does a repair rung retire THIS failed verification? A rung without a
- * blocker fingerprint is legacy/global and owns the follow-through; a
- * fingerprinted rung must name the failed scope or run (or verification
- * broadly) so an unrelated repair cannot hide an unresolved failure. */
+/** Does a repair rung retire THIS failed verification? Only an explicitly
+ * scoped rung can: `verification-failure:<scope>[@<runId>]` with an EXACT
+ * scope token and, when the failure carries a run id, the exact run id.
+ * A rung without a fingerprint — or with a bare word like
+ * "verification" — names no failure and retires none (an unrelated
+ * rebrief/escalation/directive must never hide a still-unresolved
+ * failure). */
 function rungOwnsFailure(rung: EventRecord, scope: string | null, runId: string | null): boolean {
   const fingerprint = payloadString(rung, 'blocker_fingerprint');
-  if (fingerprint === null) return true;
-  if (scope !== null && fingerprint.includes(scope)) return true;
-  if (runId !== null && fingerprint.includes(runId)) return true;
-  return fingerprint.includes('verification');
+  if (fingerprint === null || scope === null) return false;
+  const marker = 'verification-failure:';
+  const at = fingerprint.indexOf(marker);
+  if (at === -1) return false;
+  const [fpScope, fpRun] = fingerprint.slice(at + marker.length).split('@', 2);
+  if (fpScope !== scope) return false;
+  if (runId !== null && fpRun !== runId) return false;
+  return true;
 }
 
 /** A one-line honest reason a verification failed (never a fabricated
@@ -786,17 +805,16 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     }
 
     // (5)+(6) Verification follow-through (issue #163): reduce the job's
-    // verification traffic PER SCOPE so an unrelated scope's PASS can never
-    // hide a failed scope, every timed-out scope stays visible, and a
-    // same-scope retry retires only its own row. The kind-scoped read is
-    // bounded by verification events, not unrelated job traffic; the repair
-    // rungs are read by indexed kind queries, so no fixed recent-event
-    // window can age a landed repair out of view. Terminal lanes are
+    // verification traffic PER SCOPE (latest event per kind+scope, no
+    // newest-N window) so an unrelated scope's PASS can never hide a failed
+    // scope, every timed-out scope stays visible, and a same-scope retry
+    // retires only its own row. Repair rungs are read kind-scoped and a
+    // rung retires only the exact failure it names. Terminal lanes are
     // skipped by the loop's terminal guard above.
     const verificationCompleted = input.ledger.latestJobEvent(job.id, 'verification.completed');
     const verificationTimeout = input.ledger.latestJobEvent(job.id, 'verification.lock-timeout');
     if (verificationCompleted !== null || verificationTimeout !== null) {
-      const verificationEvents = input.ledger.listJobEventsByKinds(
+      const scopedEvents = input.ledger.latestJobEventsByPayloadScope(
         job.id,
         ['verification.completed', 'verification.lock-timeout', ...VERIFICATION_ACTIVITY_KINDS],
         { limit: 500 },
@@ -805,7 +823,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       const latestCompleted = new Map<string, EventRecord>();
       const latestActivity = new Map<string, EventRecord>();
       const latestTimeout = new Map<string, EventRecord>();
-      for (const event of verificationEvents) {
+      for (const event of scopedEvents) {
         const scope = scopeOf(event);
         if (event.kind === 'verification.completed') {
           if (!latestCompleted.has(scope)) latestCompleted.set(scope, event);
@@ -815,16 +833,16 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
           latestActivity.set(scope, event);
         }
       }
-      const repairRungs = (['silas.directive-sent', 'silas.rebrief', 'silas.escalated'] as const)
-        .map((kind) => input.ledger.latestJobEvent(job.id, kind))
-        .filter((event): event is EventRecord => event !== null);
+      // ALL post-failure rungs of each kind — a later unrelated rung must
+      // not make an earlier matching rung invisible.
+      const rungEvents = input.ledger.listJobEventsByKinds(job.id, REPAIR_RUNG_KINDS, { limit: 200 });
       for (const [scope, completed] of latestCompleted) {
         if (payloadFlag(completed, 'ok', true)) continue;
         const activity = latestActivity.get(scope);
         if (activity !== undefined && activity.seq > completed.seq) continue; // retry already in flight
         const runId = payloadString(completed, 'run_id');
         const scopeName = payloadString(completed, 'scope');
-        const repaired = repairRungs.some(
+        const repaired = rungEvents.some(
           (rung) => rung.seq > completed.seq && rungOwnsFailure(rung, scopeName, runId),
         );
         if (repaired) continue;
@@ -839,18 +857,24 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
         });
       }
       for (const [scope, timeout] of latestTimeout) {
+        const head = payloadString(timeout, 'head');
         const completed = latestCompleted.get(scope);
         const activity = latestActivity.get(scope);
-        const retired =
-          (completed !== undefined && completed.seq > timeout.seq) ||
-          (activity !== undefined && activity.seq > timeout.seq);
-        if (retired) continue;
+        // A fresh submission supersedes the wait (a new attempt, whatever
+        // head); a completion retires it only when it is the pinned attempt
+        // (same head) or the row predates head recording.
+        const resubmitted = activity !== undefined && activity.seq > timeout.seq;
+        const completedSameHead =
+          completed !== undefined &&
+          completed.seq > timeout.seq &&
+          (head === null || payloadString(completed, 'sha') === head);
+        if (resubmitted || completedSameHead) continue;
         digest.verificationWaits.push({
           jobId: job.id,
           repo: job.repo,
           scope: payloadString(timeout, 'scope'),
           requestId: payloadString(timeout, 'request_id'),
-          head: payloadString(timeout, 'head'),
+          head,
           waitMs: payloadNumber(timeout, 'wait_ms'),
           at: timeout.ts,
         });
@@ -1065,6 +1089,9 @@ export class SilasDriver {
   private wakeInFlight: Promise<void> | null = null;
   private queuedTrigger: SilasTrigger | null = null;
   private passInFlight: Promise<DeterministicPassOutcome> | null = null;
+  /** One follow-up pass owed for observations that arrived mid-pass. */
+  private passRequeued = false;
+  private lastPassOutcome: DeterministicPassOutcome | null = null;
   private disposed = false;
 
   constructor(opts: SilasDriverOptions) {
@@ -1236,15 +1263,27 @@ export class SilasDriver {
     if (this.passInFlight !== null) {
       // A fresh observation arrived while the pass ran: the in-flight pass
       // may already have read the ledger before this trigger's event was
-      // committed, so a follow-up pass is owed — an event is never silently
-      // dropped from reconciliation just because another pass was running.
+      // committed, so ONE follow-up pass is owed. All coalesced triggers
+      // share it — the first resumer starts it, the rest observe that it
+      // covers them (it starts after every waiter arrived).
+      this.passRequeued = true;
       await this.passInFlight;
       if (this.disposed) return { ok: true, counts: null, error: null, durationMs: 0 };
+      if (!this.passRequeued) return this.lastPassOutcome ?? { ok: true, counts: null, error: null, durationMs: 0 };
+      this.passRequeued = false;
       return this.runDeterministicPass(trigger, wakeInFlight);
     }
     const startedAt = this.now();
     const duration = (): number => Math.max(0, this.now() - startedAt);
+    // The sentinel is installed BEFORE the hook runs: a hook whose
+    // synchronous portion re-enters trigger() (e.g. publishes a wake-kind
+    // event) must coalesce onto this pass, never start a second one.
+    let releaseGate!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseGate = resolve;
+    });
     const run = (async (): Promise<DeterministicPassOutcome> => {
+      await gate;
       try {
         const outcome = await hook({ trigger, wakeInFlight });
         const counts =
@@ -1259,8 +1298,10 @@ export class SilasDriver {
       }
     })();
     this.passInFlight = run;
+    releaseGate();
     try {
       const outcome = await run;
+      this.lastPassOutcome = outcome;
       if (outcome.ok) {
         this.recordHealthEvent('silas.reconcile', {
           trigger,

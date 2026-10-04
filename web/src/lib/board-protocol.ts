@@ -155,6 +155,7 @@ export interface SilasView {
   readonly lastTickAt: string | null;
   readonly lastReconcileAt: string | null;
   readonly lastReconcileFailedAt: string | null;
+  readonly reconcileFailedNewer: boolean;
   readonly lastUsefulActionAt: string | null;
   readonly openTurnSince: string | null;
   readonly reconciliationsToday: number;
@@ -446,6 +447,7 @@ function isSilasView(value: unknown): value is SilasView {
     (value.lastTickAt === null || typeof value.lastTickAt === 'string') &&
     (value.lastReconcileAt === null || typeof value.lastReconcileAt === 'string') &&
     (value.lastReconcileFailedAt === null || typeof value.lastReconcileFailedAt === 'string') &&
+    typeof value.reconcileFailedNewer === 'boolean' &&
     (value.lastUsefulActionAt === null || typeof value.lastUsefulActionAt === 'string') &&
     (value.openTurnSince === null || typeof value.openTurnSince === 'string') &&
     typeof value.reconciliationsToday === 'number' &&

@@ -1,5 +1,6 @@
 import type { LedgerApi } from '../ledger/api.js';
 import type { LogLevel } from '../logger.js';
+import type { DeterministicPassHook } from './silas-driver.js';
 import {
   reconcilePhaseHandoffs,
   reconcileUnmarkedHandbacks,
@@ -125,5 +126,29 @@ export function reconcileDurableWork(
       handbacks.recovered +
       handbacks.published,
     failures,
+  };
+}
+
+export interface DurableReconcileHookDeps extends DurableReconcileDeps {
+  /** The in-memory review-intake reconsideration (wave) run alongside. The
+   * wave handoff owns its own durable lifecycle (`job.review-handoff-*`
+   * markers + boot `resumeQueuedHandoffs`); its asynchronous outcomes are
+   * NOT claimed by this pass's health, which reports the durable
+   * reconciliation only. */
+  readonly wave?: { reconcilePendingHandoffs(): void };
+  readonly budget?: DurableReconcileBudget;
+}
+
+/**
+ * The production deterministic-pass hook (issue #163): the wave review
+ * reconsideration plus the bounded durable reconciliation. Extracted as a
+ * factory so the exact startup composition is exercised behaviorally by
+ * tests with a real LedgerApi and driver — never by a source-text-only
+ * alarm.
+ */
+export function createDurableReconcileHook(deps: DurableReconcileHookDeps): DeterministicPassHook {
+  return () => {
+    deps.wave?.reconcilePendingHandoffs();
+    return reconcileDurableWork(deps, deps.budget ?? {});
   };
 }

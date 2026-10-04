@@ -82,6 +82,10 @@ describe('durable reconciliation pass (issue #163)', () => {
     expect(first.directives.completed).toBe(1);
     expect(first.advanced).toBe(1);
     expect(api.getDirective('req-1')?.state).toBe('settled');
+    // A settlement is a durable machine action marker (health projection).
+    expect(
+      api.listEvents({ limit: 50 }).filter((event) => event.kind === 'silas.directive-settled'),
+    ).toHaveLength(1);
 
     // A replay performs no further transition and posts nothing new.
     const second: DurableReconcileReport = reconcileDurableWork({
@@ -284,5 +288,75 @@ describe('durable reconciliation pass (issue #163)', () => {
     reconcileDurableWork({ ledger: api, notifications }, { handbackLimit: 1 });
     expect(posts.some((post) => post.title.includes('job-hb-1'))).toBe(true);
   });
-});
+  it('counts a phase-card failure as a failed pass (ok:false), never a green heartbeat', () => {
+    const { api } = freshLedger();
+    const posts: Post[] = [];
+    const job = api.addJob({ id: 'job-phase-fail', repo: 'demo', title: 't', briefing: 'b' });
+    api.setJobStatus(job.id, 'working');
+    const phase = api.beginPhaseHandoff({
+      jobId: job.id,
+      source: 'silas-rebrief',
+      intent: { kind: 'gru-decision', decision: 'rule after the card backend recovers' },
+    }).record;
+    api.appendCustomEvent({ kind: 'silas.rebrief', jobId: job.id, payload: { phase_id: phase.phaseId } });
+    api.appendCustomEvent({
+      kind: 'job.delivered',
+      jobId: job.id,
+      payload: { phase_id: phase.phaseId, source: 'silas-rebrief' },
+    });
+    const center = new NotificationCenter({ ledger: api, bus: new EventBus() });
+    const notifications: FollowThroughNotifications = {
+      postIncident: (input) => {
+        if (input.kind.includes('job-phase-fail')) throw new Error('card backend down');
+        posts.push({ kind: input.kind, routing: input.routing, title: input.title });
+        return center.postIncident(input);
+      },
+    };
+    const report = reconcileDurableWork({ ledger: api, notifications });
+    expect(report.phases.failed).toBeGreaterThanOrEqual(1);
+    expect(report.ok).toBe(false);
+    expect(report.failures).toBeGreaterThanOrEqual(1);
+    expect(posts).toHaveLength(0);
+  });
 
+  it('counts a directive-evidence failure as a failed pass (ok:false)', () => {
+    const { api } = freshLedger();
+    const posts: Post[] = [];
+    api.addJob({ id: 'job-dir-fail', repo: 'demo', title: 't', briefing: 'b' });
+    api.setJobStatus('job-dir-fail', 'working');
+    api.beginDirectiveIntent({ jobId: 'job-dir-fail', directive: 'waiting', holder: 'silas-ops', requestId: 'req-fail' });
+    // A ledger read failure for the evidence lookup: the row failure is
+    // counted (never a green heartbeat) and stays live for the next pass.
+    const failing = new Proxy(api, {
+      get(target, prop, receiver) {
+        if (prop === 'latestJobEventByRequestId') {
+          return () => {
+            throw new Error('ledger scan failed');
+          };
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    }) as LedgerApi;
+    const report = reconcileDurableWork({ ledger: failing, notifications: fakeNotifications(posts) });
+    expect(report.directives.failed).toBeGreaterThanOrEqual(1);
+    expect(report.ok).toBe(false);
+    expect(api.getDirective('req-fail')?.state).toBe('dispatching'); // untouched, retried next pass
+  });
+
+  it('counts a malformed hand-back obligation as failed instead of silently skipping it', () => {
+    const { api } = freshLedger();
+    const posts: Post[] = [];
+    api.addJob({ id: 'job-malformed', repo: 'demo', title: 't', briefing: 'b' });
+    api.setJobStatus('job-malformed', 'working');
+    api.recordBlockedObservation('job-malformed', {
+      logicalStep: 'operation',
+      category: { kind: 'unknown' },
+      incidentKey: 'phase-handback@not-a-seq',
+      observedAtSeq: api.latestEventSeq(),
+    });
+    const report = reconcileDurableWork({ ledger: api, notifications: fakeNotifications(posts) });
+    expect(report.handbacks.failed).toBeGreaterThanOrEqual(1);
+    expect(report.ok).toBe(false);
+    expect(posts).toHaveLength(0);
+  });
+});

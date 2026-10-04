@@ -251,13 +251,28 @@ export function reconcileUnmarkedHandbacks(
       });
     }
   }
-  const cardRows = deps.ledger.listHandbacksMissingCards(limit, {
+  const cardPage = deps.ledger.listHandbacksMissingCardsDetailed(limit, {
     cursor: opts.cardsCursor ?? 0,
   });
-  for (const obligation of cardRows) {
-    cards += 1;
+  cards += cardPage.readable.length + cardPage.malformed;
+  // A malformed row is a failed reconciliation, not a silent skip: it is
+  // counted and logged while the cursor still advances past it.
+  failed += cardPage.malformed;
+  if (cardPage.malformed > 0) {
+    deps.log?.('error', 'unmarked hand-back card rows could not be decoded', {
+      malformed: cardPage.malformed,
+    });
+  }
+  for (const obligation of cardPage.readable) {
     const seq = Number(obligation.incidentKey.slice('phase-handback@'.length));
-    if (!Number.isSafeInteger(seq) || seq <= 0) continue;
+    if (!Number.isSafeInteger(seq) || seq <= 0) {
+      failed += 1;
+      deps.log?.('error', 'unmarked hand-back obligation has a malformed incident key', {
+        obligation: obligation.id,
+        incident_key: obligation.incidentKey,
+      });
+      continue;
+    }
     // The delivery event is the source of the card's detail; a missing
     // event still publishes the same stable-kind card (the obligation is
     // the durable debt — the card must not be lost to a lookup).
@@ -286,13 +301,11 @@ export function reconcileUnmarkedHandbacks(
     }
   }
   const lastDelivery = deliveryRows[deliveryRows.length - 1];
-  const lastCard = cardRows[cardRows.length - 1];
   const deliveriesCursor =
     deliveryRows.length < limit || lastDelivery === undefined
       ? null
       : lastDelivery.seq;
-  const cardRowid = lastCard === undefined ? null : deps.ledger.obligationRowid(lastCard.id);
-  const cardsCursor = cardRows.length < limit || lastCard === undefined ? null : cardRowid;
+  const cardsCursor = cardPage.exhausted ? null : cardPage.lastRowid;
   return { deliveries, cards, recovered, published, failed, deliveriesCursor, cardsCursor };
 }
 

@@ -207,10 +207,11 @@ license:
   row carries `scope`, `head`, `run_id` and the honest `detail`: timeout,
   signal, spawn/runner error, or exit status). Read the complete recorded
   output, repair the real cause through the normal directive path, then
-  re-verify with a NEW request id at the repaired head. Put the failed
-  `scope`/`run_id` in the directive's `blocker_fingerprint` so the digest
-  retires this exact debt when your rung lands; never rerun an unchanged
-  head merely to recover logs, and never weaken the gate.
+  re-verify with a NEW request id at the repaired head. Pass the exact
+  fingerprint `verification-failure:<scope>@<run_id>` as the directive's
+  `blocker_fingerprint` so the digest retires this exact debt when your
+  rung lands (an unrelated or unscoped rung never retires it); never rerun
+  an unchanged head merely to recover logs, and never weaken the gate.
 - `verificationWaits` — a submission's queue wait timed out
   (`verification.lock-timeout`, with `scope`, `request_id`, `head`,
   `wait_ms`). That is capacity, not a test result: when the budget is

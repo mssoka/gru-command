@@ -37,6 +37,7 @@ describe('board engine — v4 snapshot blocks', () => {
       lastTickAt: null,
       lastReconcileAt: null,
       lastReconcileFailedAt: null,
+      reconcileFailedNewer: false,
       lastUsefulActionAt: null,
       openTurnSince: null,
       reconciliationsToday: 0,
@@ -128,6 +129,7 @@ describe('board engine — v4 snapshot blocks', () => {
     expect(down.lastTickAt).toBe(tick.ts);
     expect(down.lastReconcileAt).toBeNull(); // a failed pass is never a completed reconciliation
     expect(down.lastReconcileFailedAt).not.toBeNull();
+    expect(down.reconcileFailedNewer).toBe(true); // a newer failure outranks the old success
     expect(down.lastUsefulActionAt).toBe(action.ts);
     expect(down.openTurnSince).toBe(wake.ts);
 
@@ -135,6 +137,7 @@ describe('board engine — v4 snapshot blocks', () => {
     const recovered = engine.snapshot().silas;
     expect(recovered.lastReconcileAt).not.toBeNull();
     expect(recovered.lastReconcileFailedAt).not.toBeNull(); // history stays honest
+    expect(recovered.reconcileFailedNewer).toBe(false); // the newest pass is the success
   });
 
   it('derives PR state from the record: none → open → merged (conflicting awaits its sweep)', () => {
