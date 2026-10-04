@@ -715,6 +715,24 @@ describe('startup poster selection (the seam main wires)', () => {
 // Publication flow
 // ---------------------------------------------------------------------------
 
+describe('App restart-recovery identity evidence (R30)', () => {
+  it('evidences the verified App bot login from the installed bundle', async () => {
+    const fixture = bundleFixture();
+    const { poster, calls } = posterWith(fixture);
+    await expect(poster.authenticatedActor('github.com')).resolves.toBe('perkins-review[bot]');
+    // The identity chain is the SAME one the live prepare/post path proves:
+    // mint an App JWT and ask /app for the verified slug.
+    expect(calls.map((call) => `${call.method} ${call.url}`)).toEqual(['GET https://api.github.com/app']);
+  });
+
+  it('refuses to evidence an account for a host the App credentials cannot serve', async () => {
+    const fixture = bundleFixture();
+    const { poster, calls } = posterWith(fixture);
+    await expect(poster.authenticatedActor('github.example.test')).rejects.toThrow(/not github.com/u);
+    expect(calls).toHaveLength(0);
+  });
+});
+
 describe('App publication happy path', () => {
   it('publishes a COMMENT review as the verified App bot with least-scope tokens and a valid RS256 JWT', async () => {
     const fixture = bundleFixture();

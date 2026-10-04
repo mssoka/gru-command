@@ -287,6 +287,16 @@ export interface VerdictPoster {
    * ambiguous failure honestly unposted. The optional context distinguishes
    * a live post-failure second lookup from ordinary recovery. */
   reconcile?(input: VerdictPosterInput, context?: VerdictReconcileContext): Promise<PostedReviewReceipt | null>;
+  /** Restart-recovery evidence (R30): the provider account this poster
+   * posts as on `host` RIGHT NOW, resolved through the same credential the
+   * live posting path uses. `recoverInterruptedRounds` only credits a
+   * posted receipt whose actor matches this evidenced account — a locally
+   * persisted actor is never taken on its own authority. Optional: a
+   * poster that cannot evidence its posting account leaves an otherwise
+   * reclaimable round honestly unresolved instead of promoting an
+   * unverified identity. Implementations must fail loudly when the
+   * credential cannot be resolved. */
+  authenticatedActor?(host: string): Promise<string>;
 }
 
 /** Bounded pagination for ambiguous-delivery lookups (R4): both providers
@@ -401,6 +411,11 @@ export function verifyPostedReceipt(
       `provider receipt is bound to commit ${receipt.commitId}, not the reviewed commit ${expected.targetSha} — delivery not recorded`,
     );
   }
+  // The shared restart reader requires a nonempty base, so a receipt
+  // without one can never become a readable round.posted event (R34).
+  if (receipt.baseSha.trim() === '') {
+    throw new Error('provider receipt is missing the base binding — delivery not recorded');
+  }
   if (receipt.bodySha256 !== expected.bodySha256) {
     throw new Error('provider receipt body digest does not match the published body — delivery not recorded');
   }
@@ -416,18 +431,17 @@ export function verifyPostedReceipt(
 /** GitHub poster using a commit-bound pull-request review, not an unbound
  * comment. The API's commit_id makes a head race rejectable server-side. */
 export class GhPrPoster implements VerdictPoster {
-  /** Login per host: one poster instance may serve several GitHub hosts,
-   * each authenticating a different account. */
-  private readonly authenticatedLogins = new Map<string, string>();
-
   constructor(private readonly binary = 'gh') {}
 
   /** The account gh actually authenticates as on this host — the ONLY
-   * identity a receipt's actor may match (R5). Resolved once per poster
-   * instance; no account is hard-coded and no new credential path exists. */
+   * identity a receipt's actor may match (R5). Resolved once per posting
+   * operation and deliberately NEVER cached across operations: gh's
+   * credential can rotate under a long-lived service (R29), and only a
+   * fresh resolution can evidence which account is posting now. One
+   * operation still probes once, so a stable credential costs exactly one
+   * call per post/reconcile. No account is hard-coded and no new
+   * credential path exists. */
   private resolveAuthenticatedLogin(host: string): string {
-    const cached = this.authenticatedLogins.get(host);
-    if (cached !== undefined) return cached;
     const who = spawnSync(
       this.binary,
       ['api', '--hostname', host, 'user', '--jq', '.login'],
@@ -438,8 +452,13 @@ export class GhPrPoster implements VerdictPoster {
     }
     const login = (who.stdout ?? '').trim();
     if (login === '') throw new Error(`gh authenticated account on ${host} is unknown — delivery not recorded`);
-    this.authenticatedLogins.set(host, login);
     return login;
+  }
+
+  /** Restart-recovery evidence (R30): the account gh authenticates as on
+   * the host now — the same resolution the live posting path enforces. */
+  async authenticatedActor(host: string): Promise<string> {
+    return this.resolveAuthenticatedLogin(host);
   }
 
   /** Provider review ids are integers (or provider-quoted strings); a null
@@ -453,6 +472,11 @@ export class GhPrPoster implements VerdictPoster {
 
   async post(input: VerdictPosterInput): Promise<PostedReviewReceipt> {
     const { apiPath, observedHead, observedBase } = this.githubPrIdentity(input);
+    // R32: resolve the authenticated account BEFORE the irreversible POST.
+    // A credential hiccup must refuse delivery loudly with no review
+    // created (or stranded unrecorded); the post-POST receipt-actor
+    // comparison below remains the enforcement step.
+    const authenticatedLogin = this.resolveAuthenticatedLogin(input.host);
     const result = spawnSync(
       this.binary,
       ['api', '--hostname', input.host, '--method', 'POST', `${apiPath}/reviews`, '--input', '-'],
@@ -487,7 +511,6 @@ export class GhPrPoster implements VerdictPoster {
     if (event !== 'COMMENTED') {
       throw new Error(`provider enacted review state ${event === '' ? '(none)' : event} instead of COMMENTED — delivery not recorded`);
     }
-    const authenticatedLogin = this.resolveAuthenticatedLogin(input.host);
     if (actor.toLowerCase() !== authenticatedLogin.toLowerCase()) {
       throw new Error(`provider receipt actor ${actor === '' ? '(none)' : actor} is not the authenticated posting account ${authenticatedLogin} — delivery not recorded`);
     }
@@ -538,34 +561,63 @@ export class GhPrPoster implements VerdictPoster {
       reviews.push(...pageReviews);
       if (pageReviews.length < 100) break;
       if (page === MAX_RECONCILE_PAGES) {
+        // R28: hitting the bound is an exhaustion signal, not authority to
+        // discard evidence already collected. A fully bound match from any
+        // page returned so far IS delivery evidence; only a bounded lookup
+        // with no verified match anywhere is unresolved.
+        const collectedMatch = this.boundMatchFrom(reviews, input, authenticatedLogin, observedHead, observedBase);
+        if (collectedMatch !== null) return collectedMatch;
         throw new Error(
           `GitHub review reconciliation exceeded the ${MAX_RECONCILE_PAGES}-page lookup bound without exhausting the review list; delivery stays unresolved — verify manually before any retry, never assume absence`,
         );
       }
     }
+    return this.boundMatchFrom(reviews, input, authenticatedLogin, observedHead, observedBase);
+  }
+
+  /** The single GitHub bound-match selection shared by the ordinary exit
+   * and the R28 bound-hit exit: an existing provider review bound to the
+   * frozen head whose body is byte-identical to ours, authored by the
+   * authenticated account in the enacted COMMENTED state. Returns null
+   * when no such review exists among the collected pages. */
+  private boundMatchFrom(
+    reviews: ReadonlyArray<{ id?: unknown; user?: { login?: unknown }; state?: unknown; commit_id?: unknown; body?: unknown }>,
+    input: VerdictPosterInput,
+    authenticatedLogin: string,
+    observedHead: string,
+    observedBase: string,
+  ): PostedReviewReceipt | null {
     const matches = reviews.filter((review) =>
       review.commit_id === input.targetSha &&
       typeof review.body === 'string' && receiptDigest(review.body) === receiptDigest(input.body) &&
       typeof review.user?.login === 'string' && review.user.login.toLowerCase() === authenticatedLogin.toLowerCase() &&
       review.state === 'COMMENTED');
-    if (matches.length === 0) return null;
-    const found = matches[matches.length - 1]!;
-    // The filter already demands commit equality; keep the construction
-    // honest too — a review without a usable string commit_id is never
-    // turned into a bound receipt (T5).
-    if (typeof found.commit_id !== 'string' || found.commit_id.trim() === '') return null;
-    return verifyPostedReceipt(
-      {
-        reviewId: GhPrPoster.reviewIdOf(found.id),
-        actor: typeof found.user?.login === 'string' ? found.user.login : '',
-        event: typeof found.state === 'string' ? found.state : '',
-        commitId: typeof found.commit_id === 'string' ? found.commit_id : null,
-        headSha: observedHead,
-        baseSha: observedBase,
-        bodySha256: receiptDigest(input.body),
-      },
-      { targetSha: input.targetSha, bodySha256: receiptDigest(input.body) },
-    );
+    // Newest usable match wins; a later match with an unusable review id
+    // must not mask an earlier fully bound one (R13/R28). If EVERY match
+    // carries an unusable id, refuse loudly instead of reporting absence.
+    let sawUnusableId = false;
+    for (let index = matches.length - 1; index >= 0; index -= 1) {
+      const found = matches[index]!;
+      const reviewId = GhPrPoster.reviewIdOf(found.id);
+      if (reviewId === '') {
+        sawUnusableId = true;
+        continue;
+      }
+      return verifyPostedReceipt(
+        {
+          reviewId,
+          actor: typeof found.user?.login === 'string' ? found.user.login : '',
+          event: typeof found.state === 'string' ? found.state : '',
+          commitId: typeof found.commit_id === 'string' ? found.commit_id : null,
+          headSha: observedHead,
+          baseSha: observedBase,
+          bodySha256: receiptDigest(input.body),
+        },
+        { targetSha: input.targetSha, bodySha256: receiptDigest(input.body) },
+      );
+    }
+    if (sawUnusableId) throw new Error('provider receipt is missing a review id — delivery not recorded');
+    return null;
   }
 
   /** URL/origin checks plus the live pre-POST PR identity probe. Only HEAD
@@ -619,6 +671,13 @@ export class GhPrPoster implements VerdictPoster {
         `got ${observedHead || 'unknown'})`,
       );
     }
+    // R34 shape symmetry: the shared restart reader requires a nonempty
+    // receipt base, so no writer path may record a receipt without one.
+    // Every provider that reports a head also reports a usable base; an
+    // empty base is a malformed identity and is refused BEFORE any POST.
+    if (observedBase.trim() === '') {
+      throw new Error('pull request identity response is missing the base sha — refusing an unrecordable receipt; review not delivered');
+    }
     return { apiPath, observedHead, observedBase };
   }
 }
@@ -637,9 +696,11 @@ export class GitLabMrPoster implements VerdictPoster {
   private readonly tokenResolver: () => string | undefined;
   private readonly fetchImpl: (input: string, init?: { method?: string; headers?: Record<string, string>; body?: string; signal?: AbortSignal }) => Promise<{ ok: boolean; status: number; text(): Promise<string> }>;
   private readonly gitBinary: string;
-  /** Username per host: one poster instance may serve several GitLab
-   * hosts, each with its own token and account. */
-  private readonly authenticatedUsers = new Map<string, string>();
+  /** Username per host, bound to the credential that proved it: ONE entry
+   * per host holding only a sha256 discriminator (never the plaintext
+   * token), so a rotated token replaces the stale identity instead of
+   * accumulating retired secrets (R29). */
+  private readonly authenticatedUsers = new Map<string, { readonly credentialSha256: string; readonly username: string }>();
 
   constructor(options: GitLabMrPosterOptions = {}) {
     this.token = options.token;
@@ -650,10 +711,12 @@ export class GitLabMrPoster implements VerdictPoster {
 
   /** The account the PRIVATE-TOKEN authenticates as on this host — the only
    * author whose notes this service may claim (R5). Resolved once per
-   * poster instance through the SAME token, no new credential path. */
+   * (host, token) credential through the SAME token, no new credential
+   * path; a rotated token is a different key and probes again (R29). */
   private async resolveAuthenticatedUser(host: string, headers: { readonly 'PRIVATE-TOKEN': string; readonly 'CONTENT-TYPE': string }): Promise<string> {
+    const credentialSha256 = createHash('sha256').update(headers['PRIVATE-TOKEN']).digest('hex');
     const cached = this.authenticatedUsers.get(host);
-    if (cached !== undefined) return cached;
+    if (cached !== undefined && cached.credentialSha256 === credentialSha256) return cached.username;
     let response: Awaited<ReturnType<typeof this.fetchImpl>>;
     try {
       response = await this.fetchImpl(`https://${host}/api/v4/user`, { headers, signal: AbortSignal.timeout(15_000) });
@@ -671,12 +734,32 @@ export class GitLabMrPoster implements VerdictPoster {
     }
     const username = typeof user.username === 'string' ? user.username.trim() : '';
     if (username === '') throw new Error('GitLab token authenticates no named account — delivery stays unresolved');
-    this.authenticatedUsers.set(host, username);
+    this.authenticatedUsers.set(host, { credentialSha256, username });
     return username;
   }
 
+  /** Restart-recovery evidence (R30): the account the configured GitLab
+   * token authenticates as on the host now, resolved through the same
+   * token resolver the live posting path uses. */
+  async authenticatedActor(host: string): Promise<string> {
+    const token = this.token ?? this.tokenResolver();
+    if (token === undefined || token.trim() === '') {
+      throw new Error('GitLab delivery requires GITLAB_TOKEN — the posting account cannot be evidenced');
+    }
+    return this.resolveAuthenticatedUser(host, { 'PRIVATE-TOKEN': token, 'CONTENT-TYPE': 'application/json' });
+  }
+
+  /** Provider note ids are integers (or provider-quoted strings); a null,
+   * absent or otherwise unusable id must never be stringified into a
+   * receipt (R27), mirroring `GhPrPoster.reviewIdOf` (R13). */
+  private static reviewIdOf(id: unknown): string {
+    if (typeof id === 'number' && Number.isSafeInteger(id)) return String(id);
+    if (typeof id === 'string' && id.trim() !== '') return id;
+    return '';
+  }
+
   async post(input: VerdictPosterInput): Promise<PostedReviewReceipt> {
-    const { mrUrl, headers } = await this.gitLabIdentity(input);
+    const { mrUrl, headers, observedBase } = await this.gitLabIdentity(input);
     // Resolve the token's account BEFORE creating anything (V1/R5): the
     // note's echoed author must match it, and an unnamed account refuses
     // delivery before a note exists.
@@ -703,7 +786,7 @@ export class GitLabMrPoster implements VerdictPoster {
     } catch {
       throw new Error('GitLab note delivery returned no parsable note receipt — delivery not recorded');
     }
-    const reviewId = created.id !== undefined ? String(created.id) : '';
+    const reviewId = GitLabMrPoster.reviewIdOf(created.id);
     const actor = typeof created.author?.username === 'string' ? created.author.username : '';
     const echoedBody = typeof created.body === 'string' ? created.body : null;
     if (echoedBody === null || receiptDigest(echoedBody) !== receiptDigest(input.body)) {
@@ -712,7 +795,7 @@ export class GitLabMrPoster implements VerdictPoster {
     if (actor.toLowerCase() !== author.toLowerCase()) {
       throw new Error(`provider receipt actor ${actor === '' ? '(none)' : actor} is not the authenticated posting account ${author} — delivery not recorded`);
     }
-    const confirmed = await this.confirmHead(mrUrl, headers, input.targetSha);
+    const confirmed = await this.confirmHead(mrUrl, headers, input.targetSha, observedBase);
     // GitLab notes are not commit-bound server-side; the post-delivery head
     // re-probe IS the binding, and the refresh record carries whatever base
     // the MR now reports so a moving main never refuses a proven head.
@@ -736,7 +819,10 @@ export class GitLabMrPoster implements VerdictPoster {
   async reconcile(input: VerdictPosterInput): Promise<PostedReviewReceipt | null> {
     const { mrUrl, headers } = await this.gitLabIdentity(input);
     const author = await this.resolveAuthenticatedUser(input.host, headers);
-    const matches: ReadonlyArray<{ body?: unknown }> = [];
+    const authoredMatches: Array<{ id?: unknown; body?: unknown }> = [];
+    const foreignMatches: Array<{ id?: unknown; body?: unknown }> = [];
+    const foreignAuthors = new Set<string>();
+    let listExhausted = false;
     for (let page = 1; page <= MAX_RECONCILE_PAGES; page += 1) {
       let listResponse: Awaited<ReturnType<typeof this.fetchImpl>>;
       try {
@@ -758,22 +844,47 @@ export class GitLabMrPoster implements VerdictPoster {
       } catch {
         throw new Error('GitLab note reconciliation response was not a note list');
       }
-      const pageMatches = notes.filter((note) =>
-        typeof note.body === 'string' && receiptDigest(note.body) === receiptDigest(input.body) &&
-        typeof note.author?.username === 'string' && note.author.username.trim().toLowerCase() === author.toLowerCase());
-      (matches as Array<{ body?: unknown }>).push(...pageMatches);
-      if (notes.length < 100) break;
-      if (page === MAX_RECONCILE_PAGES) {
-        throw new Error(
-          `GitLab note reconciliation exceeded the ${MAX_RECONCILE_PAGES}-page lookup bound without exhausting the note list; delivery stays unresolved — verify manually before any retry, never assume absence`,
-        );
+      // Body matches are classified by author, not filtered away: an
+      // identical note by ANOTHER account is ambiguity (R35), never
+      // absence. A body match with an unusable author is unattributed and
+      // therefore also ambiguity, not proof this service posted.
+      for (const note of notes) {
+        if (typeof note.body !== 'string' || receiptDigest(note.body) !== receiptDigest(input.body)) continue;
+        const noteAuthor = typeof note.author?.username === 'string' ? note.author.username.trim() : '';
+        if (noteAuthor !== '' && noteAuthor.toLowerCase() === author.toLowerCase()) {
+          authoredMatches.push(note);
+        } else {
+          foreignMatches.push(note);
+          foreignAuthors.add(noteAuthor === '' ? '(unattributed)' : `@${noteAuthor}`);
+        }
       }
+      if (notes.length < 100) {
+        listExhausted = true;
+        break;
+      }
+      if (page === MAX_RECONCILE_PAGES) break;
     }
-    if (matches.length === 0) return null;
-    throw new Error(
-      `GitLab reconciliation found a body-matching note by ${author}, but GitLab notes carry no server-side commit binding — ` +
-      'the note\'s creation head and creating attempt cannot be proved, so this historical match is NOT delivery evidence (fail closed); the round stays honestly unposted',
-    );
+    // Body matches decide the outcome before an exhausted-page bound does
+    // (same ordering discipline as R28 on the GitHub side): the bound is
+    // not authority to discard a decisive match already collected.
+    if (authoredMatches.length > 0) {
+      throw new Error(
+        `GitLab reconciliation found a body-matching note by ${author}, but GitLab notes carry no server-side commit binding — ` +
+        'the note\'s creation head and creating attempt cannot be proved, so this historical match is NOT delivery evidence (fail closed); the round stays honestly unposted',
+      );
+    }
+    if (foreignMatches.length > 0) {
+      throw new Error(
+        `GitLab reconciliation found ${foreignMatches.length} body-identical note(s) by ${[...foreignAuthors].sort().join(', ')} but none authored by ${author} — ` +
+        'delivery is AMBIGUOUS, not absent (the authenticated account may or may not have posted); never attribute another account\'s note as this service\'s delivery — verify manually before any retry, never assume absence',
+      );
+    }
+    if (!listExhausted) {
+      throw new Error(
+        `GitLab note reconciliation exceeded the ${MAX_RECONCILE_PAGES}-page lookup bound without exhausting the note list; delivery stays unresolved — verify manually before any retry, never assume absence`,
+      );
+    }
+    return null;
   }
 
   /** URL/origin/token checks plus the live pre-POST MR identity probe. Only
@@ -782,6 +893,7 @@ export class GitLabMrPoster implements VerdictPoster {
   private async gitLabIdentity(input: VerdictPosterInput): Promise<{
     readonly mrUrl: string;
     readonly headers: { readonly 'PRIVATE-TOKEN': string; readonly 'CONTENT-TYPE': string };
+    readonly observedBase: string;
   }> {
     const token = this.token ?? this.tokenResolver();
     if (token === undefined || token.trim() === '') {
@@ -826,7 +938,7 @@ export class GitLabMrPoster implements VerdictPoster {
     if (!identityResponse.ok) {
       throw new Error(`GitLab merge request identity probe exited HTTP ${identityResponse.status} — review not delivered`);
     }
-    let identity: { sha?: unknown };
+    let identity: { sha?: unknown; diff_refs?: { base_sha?: unknown } | null };
     try {
       identity = JSON.parse((await identityResponse.text()).slice(0, 4 * 1024 * 1024)) as typeof identity;
     } catch {
@@ -838,14 +950,28 @@ export class GitLabMrPoster implements VerdictPoster {
         `merge request identity moved before delivery (expected head ${input.targetSha}, got ${observedHead || 'unknown'})`,
       );
     }
-    return { mrUrl, headers };
+    // R34 shape symmetry: the shared restart reader requires a nonempty
+    // receipt base, so the base must be proven usable BEFORE the note POST
+    // (the base itself is only informational — it need not equal the
+    // frozen base as main moves). A missing diff_refs.base_sha is refused
+    // loudly here, never persisted into an event recovery cannot read.
+    const observedBase = typeof identity.diff_refs?.base_sha === 'string' ? identity.diff_refs.base_sha : '';
+    if (observedBase.trim() === '') {
+      throw new Error('merge request identity response is missing the base sha (diff_refs.base_sha) — refusing an unrecordable receipt; review not delivered');
+    }
+    return { mrUrl, headers, observedBase };
   }
 
-  /** Live MR identity probe with HEAD equality enforced. */
+  /** Live MR identity probe with HEAD equality enforced. The base is
+   * informational and was already proven usable for this SAME head by the
+   * pre-POST probe, so a transiently absent post-delivery base falls back
+   * to the proven one instead of stranding a note that already exists
+   * (R34). A confirmed base, when present, is preferred. */
   private async confirmHead(
     mrUrl: string,
     headers: { readonly 'PRIVATE-TOKEN': string; readonly 'CONTENT-TYPE': string },
     targetSha: string,
+    provenBaseSha: string,
   ): Promise<{ readonly headSha: string; readonly baseSha: string }> {
     let response: Awaited<ReturnType<typeof this.fetchImpl>>;
     try {
@@ -868,7 +994,12 @@ export class GitLabMrPoster implements VerdictPoster {
         `merge request identity moved (expected head ${targetSha}, got ${headSha || 'unknown'}) — delivery not recorded`,
       );
     }
-    return { headSha, baseSha: typeof identity.diff_refs?.base_sha === 'string' ? identity.diff_refs.base_sha : '' };
+    const confirmedBaseSha = typeof identity.diff_refs?.base_sha === 'string' ? identity.diff_refs.base_sha : '';
+    const baseSha = confirmedBaseSha.trim() === '' ? provenBaseSha : confirmedBaseSha;
+    if (baseSha.trim() === '') {
+      throw new Error('merge request identity response is missing the base sha (diff_refs.base_sha) — refusing an unrecordable receipt; delivery not recorded');
+    }
+    return { headSha, baseSha };
   }
 }
 
@@ -898,6 +1029,26 @@ export class AutoVerdictPoster implements VerdictPoster {
     return poster.reconcile(input, context);
   }
 
+  /** Restart-recovery evidence (R30) through the SAME host selection the
+   * post used: the account the selected backend would post as right now.
+   * A backend that cannot evidence its account leaves the receipt actor
+   * unverified rather than silently trusted. */
+  async authenticatedActor(host: string): Promise<string> {
+    const poster = this.selectByHost(host);
+    if (typeof poster.authenticatedActor !== 'function') {
+      throw new Error(`the selected ${host} poster cannot evidence its authenticated posting account — the receipt actor stays unverified`);
+    }
+    return poster.authenticatedActor(host);
+  }
+
+  private selectByHost(host: string): VerdictPoster {
+    if (isGitHubRemote(host)) return this.github;
+    if (isGitLabRemote(host)) return this.gitlab;
+    throw new Error(
+      `unsupported code host for verdict delivery: ${host} — the review gate supports GitHub (gh) and GitLab (GITLAB_TOKEN) remotes`,
+    );
+  }
+
   private select(input: VerdictPosterInput): VerdictPoster {
     let host = '';
     try {
@@ -905,11 +1056,7 @@ export class AutoVerdictPoster implements VerdictPoster {
     } catch {
       throw new Error(`cannot parse pull request URL: ${input.prUrl}`);
     }
-    if (isGitHubRemote(host)) return this.github;
-    if (isGitLabRemote(host)) return this.gitlab;
-    throw new Error(
-      `unsupported code host for verdict delivery: ${host} — the review gate supports GitHub (gh) and GitLab (GITLAB_TOKEN) remotes`,
-    );
+    return this.selectByHost(host);
   }
 }
 
@@ -1290,6 +1437,19 @@ export class WaveRunner {
     if (job === null || job.prUrl === null || event.url !== job.prUrl) {
       return 'posted event URL does not match the job\'s recorded pull request';
     }
+    // The persisted host is a SEPARATE field and must equal the validated
+    // PR URL's host: recovery resolves the authenticated account through
+    // this host, so an unbound host could point a credential probe at an
+    // attacker-controlled provider.
+    let prHost: string;
+    try {
+      prHost = new URL(event.url).host;
+    } catch {
+      return 'posted event URL is unparsable';
+    }
+    if (event.host.toLowerCase() !== prHost.toLowerCase()) {
+      return 'posted event host does not match its pull request URL';
+    }
     if (!/^[A-Za-z0-9._:-]{1,200}$/u.test(event.receipt.reviewId)) {
       return 'receipt review id is malformed';
     }
@@ -1325,6 +1485,116 @@ export class WaveRunner {
     return null;
   }
 
+  /** R30 account binding: restart recovery only credits a posted receipt
+   * whose actor matches the account the poster can evidence RIGHT NOW, on
+   * the same provider credential the live posting path uses. The policy
+   * decision (owner-reviewed finding R30): the persisted actor is
+   * self-declared and therefore carries no authority after restart; a
+   * poster that cannot evidence its account — no resolver, an unreachable
+   * provider, or a failed probe — leaves the round unresolved rather than
+   * promoting an identity nobody can corroborate. Account comparison is
+   * case-insensitive exactly as the live writer paths compare it. */
+  private async receiptActorBindingProblem(event: PostedEventPayload): Promise<string | null> {
+    const poster = this.opts.poster;
+    if (poster === undefined || typeof poster.authenticatedActor !== 'function') {
+      return 'the poster cannot evidence the posting account after restart, so the receipt actor stays unverified';
+    }
+    let authenticated: string;
+    try {
+      authenticated = await poster.authenticatedActor(event.host);
+    } catch (error) {
+      return `the posting account could not be evidenced after restart (${String(error).slice(0, 200)}), so the receipt actor stays unverified`;
+    }
+    if (authenticated.trim() === '') {
+      return 'the poster evidenced no authenticated posting account after restart, so the receipt actor stays unverified';
+    }
+    if (event.receipt.actor.toLowerCase() !== authenticated.toLowerCase()) {
+      return `receipt actor "${event.receipt.actor}" is not the account the poster evidences as authenticated ("${authenticated}")`;
+    }
+    return null;
+  }
+
+  /** Attempt to promote a round whose `round.posted` event is fully bound,
+   * actor-evidenced, and backed by the round's own canonical publication
+   * artifact. Returns 'promoted' after recording the verdict (sweeping
+   * `laneId` when a lane exists), 'unbound' when a posted verdict exists
+   * but cannot be credited (an escalation is raised), or 'no-event' when
+   * there is nothing to recover. The missing-lane branch calls this with
+   * `laneId === null`: a lost worktree registration must not discard a
+   * genuinely delivered publication.
+   *
+   * A delivered verdict is only recoverable when the posted event parses
+   * through the SAME shared contract the writer emits and the receipt is
+   * correctly bound to this round, this job's actual pull request, a known
+   * enacted provider event, and the round's OWN canonical publication
+   * artifact (R1/R2/R21). A bare, malformed or unbound local event —
+   * forged, corrupted, or written by an older build — is NOT promoted; it
+   * terminalizes honestly as an interrupted round instead. Completed
+   * historical rounds are never rewritten, and one malformed round never
+   * aborts the recovery of the rest. */
+  private async promotePostedRound(round: RoundRecord, laneId: string | null): Promise<'promoted' | 'unbound' | 'no-event'> {
+    const posted = this.opts.ledger.latestRoundEvent(round.id, 'round.posted');
+    const payload = posted?.payload;
+    const postedVerdict = typeof payload === 'object' && payload !== null
+      ? (payload as { verdict?: unknown }).verdict
+      : undefined;
+    if (postedVerdict !== 'approved' && postedVerdict !== 'changes-requested') return 'no-event';
+    const event = parsePostedEventPayload(payload);
+    const bindingProblem = event === null
+      ? 'the round.posted payload is malformed (receipt, publication or identity fields missing or mistyped)'
+      : this.postedEventBindingProblem(event, round);
+    // R30: the persisted actor is self-declared and is only credited when
+    // the poster can evidence the SAME account right now. The probe is
+    // skipped when an earlier binding already failed.
+    const actorProblem = event !== null && bindingProblem === null
+      ? await this.receiptActorBindingProblem(event)
+      : null;
+    // The preserved publication artifact is REQUIRED evidence, not an
+    // optional extra: promotion verifies the round's OWN canonical
+    // publication file still exists as a regular non-symlink file and
+    // carries exactly the digested bytes (T3/R21).
+    let bound = false;
+    if (event !== null && bindingProblem === null && actorProblem === null) {
+      bound = true;
+      try {
+        const canonical = join(reviewArtifactDirectory(this.artifactRoot(), round.id), 'perkins-report.publication.md');
+        const info = lstatSync(canonical);
+        if (!info.isFile() || info.isSymbolicLink()) {
+          bound = false;
+        } else {
+          const digest = createHash('sha256').update(readFileSync(canonical, 'utf8')).digest('hex');
+          bound = digest === event.publicationSha256 && digest === event.receipt.bodySha256;
+        }
+      } catch {
+        bound = false;
+      }
+    }
+    if (bound && event !== null) {
+      this.opts.ledger.setRoundVerdict(round.id, postedVerdict);
+      this.opts.ledger.appendCustomEvent({
+        kind: 'round.post-recovered',
+        jobId: round.jobId,
+        roundId: round.id,
+        payload: {
+          verdict: postedVerdict,
+          postedEventSeq: posted?.seq ?? null,
+          receipt: {
+            reviewId: event.receipt.reviewId, actor: event.receipt.actor, event: event.receipt.event,
+            headSha: event.receipt.headSha, bodySha256: event.receipt.bodySha256,
+          },
+        },
+      });
+      if (laneId !== null) await this.sweepReviewWorktree(laneId);
+      return 'promoted';
+    }
+    this.opts.escalate?.(
+      `Review round ${round.id} carries a posted verdict without a provider-bound receipt`,
+      `restart recovery cannot verify the delivery of an unbound round.posted event (${bindingProblem ?? actorProblem ?? 'the preserved publication artifact did not match the posted digest'}); the round terminalizes as interrupted rather than promoting an unverifiable approval`,
+      { jobId: round.jobId, roundId: round.id },
+    );
+    return 'unbound';
+  }
+
   /** Mark crash-interrupted proof INCOMPLETE and release every owned lane. */
   async recoverInterruptedRounds(): Promise<number> {
     let recovered = 0;
@@ -1348,70 +1618,10 @@ export class WaveRunner {
         recovered += 1;
         continue;
       }
-      const posted = this.opts.ledger.latestRoundEvent(round.id, 'round.posted');
-      const payload = posted?.payload;
-      const postedVerdict = typeof payload === 'object' && payload !== null
-        ? (payload as { verdict?: unknown }).verdict
-        : undefined;
-      // A delivered verdict is only recoverable when the posted event
-      // parses through the SAME shared contract the writer emits and the
-      // receipt is correctly bound to this round, this job's actual pull
-      // request, a known enacted provider event, and the round's OWN
-      // canonical publication artifact (R1/R2/R21). A bare, malformed or
-      // unbound local event — forged, corrupted, or written by an older
-      // build — is NOT promoted; it terminalizes honestly as an
-      // interrupted round instead. Completed historical rounds are never
-      // rewritten, and one malformed round never aborts the recovery of
-      // the rest.
-      if (postedVerdict === 'approved' || postedVerdict === 'changes-requested') {
-        const event = parsePostedEventPayload(payload);
-        const bindingProblem = event === null
-          ? 'the round.posted payload is malformed (receipt, publication or identity fields missing or mistyped)'
-          : this.postedEventBindingProblem(event, round);
-        // The preserved publication artifact is REQUIRED evidence, not an
-        // optional extra: promotion verifies the round's OWN canonical
-        // publication file still exists as a regular non-symlink file and
-        // carries exactly the digested bytes (T3/R21).
-        let bound = false;
-        if (event !== null && bindingProblem === null) {
-          bound = true;
-          try {
-            const canonical = join(reviewArtifactDirectory(this.artifactRoot(), round.id), 'perkins-report.publication.md');
-            const info = lstatSync(canonical);
-            if (!info.isFile() || info.isSymbolicLink()) {
-              bound = false;
-            } else {
-              const digest = createHash('sha256').update(readFileSync(canonical, 'utf8')).digest('hex');
-              bound = digest === event.publicationSha256 && digest === event.receipt.bodySha256;
-            }
-          } catch {
-            bound = false;
-          }
-        }
-        if (bound && event !== null) {
-          this.opts.ledger.setRoundVerdict(round.id, postedVerdict);
-          this.opts.ledger.appendCustomEvent({
-            kind: 'round.post-recovered',
-            jobId: round.jobId,
-            roundId: round.id,
-            payload: {
-              verdict: postedVerdict,
-              postedEventSeq: posted?.seq ?? null,
-              receipt: {
-                reviewId: event.receipt.reviewId, actor: event.receipt.actor, event: event.receipt.event,
-                headSha: event.receipt.headSha, bodySha256: event.receipt.bodySha256,
-              },
-            },
-          });
-          await this.sweepReviewWorktree(lane.id);
-          recovered += 1;
-          continue;
-        }
-        this.opts.escalate?.(
-          `Review round ${round.id} carries a posted verdict without a provider-bound receipt`,
-          `restart recovery cannot verify the delivery of an unbound round.posted event (${bindingProblem ?? 'the preserved publication artifact did not match the posted digest'}); the round terminalizes as interrupted rather than promoting an unverifiable approval`,
-          { jobId: round.jobId, roundId: round.id },
-        );
+      const promotion = await this.promotePostedRound(round, lane.id);
+      if (promotion === 'promoted') {
+        recovered += 1;
+        continue;
       }
       const note = 'review interrupted by service restart; required lens/verification proof is incomplete';
       this.abortRound(round, note);
@@ -1448,6 +1658,15 @@ export class WaveRunner {
     for (const job of this.opts.ledger.listJobs()) {
       for (const round of this.opts.ledger.listRounds(job.id)) {
         if ((round.status !== 'pending' && round.status !== 'live') || registeredRoundIds.has(round.id)) continue;
+        // A round whose review lane registration was lost can still carry a
+        // fully bound, actor-evidenced round.posted event: recover the
+        // publication first, and only terminalize when there is nothing
+        // promotable.
+        const promotion = await this.promotePostedRound(round, null);
+        if (promotion === 'promoted') {
+          recovered += 1;
+          continue;
+        }
         const note = 'review interrupted before its detached worktree was durably registered; required proof is incomplete';
         this.abortRound(round, note);
         const artifacts = this.writeInterruptedArtifacts(round.id, 'service_restart_missing_review_lane', note);
@@ -3051,6 +3270,13 @@ export class WaveRunner {
             },
             reconciled,
         };
+        // R34 writer/reader symmetry invariant: the event about to be
+        // persisted MUST parse through the SAME shared contract restart
+        // recovery reads. A receipt shape the reader would reject is
+        // refused here instead of becoming a round that can never recover.
+        if (parsePostedEventPayload(postedPayload) === null) {
+          throw new Error('internal: refusing to persist a round.posted payload that restart recovery cannot parse');
+        }
         this.opts.ledger.appendCustomEvent({
           kind: 'round.posted',
           jobId: job.id,
@@ -3088,6 +3314,8 @@ export class WaveRunner {
         // match becomes the receipt — no duplicate post. Anything else
         // stays honestly unposted.
         let reconciledDelivery: PostedReviewReceipt | null = null;
+        let reconciliationFailure: unknown;
+        let recordFailure: unknown;
         if (typeof poster.reconcile === 'function' && !signal.aborted) {
           try {
             const { prUrl, publicationBody } = deliveryInput();
@@ -3147,24 +3375,51 @@ export class WaveRunner {
                 );
                 reconciledDelivery = null;
               } else {
-                recordDelivery(reconciledDelivery, publicationFile, publicationSha256, true);
-                this.log('info', 'Perkins report delivery reconciled against provider evidence', {
-                  round: round.id, reviewId: reconciledDelivery.reviewId,
-                });
+                // Recording is the commit point: if the shared
+                // writer/reader guard refuses the payload, the candidate
+                // must not survive as if it had been recorded (R31).
+                const toRecord = reconciledDelivery;
+                reconciledDelivery = null;
+                try {
+                  recordDelivery(toRecord, publicationFile, publicationSha256, true);
+                  reconciledDelivery = toRecord;
+                  this.log('info', 'Perkins report delivery reconciled against provider evidence', {
+                    round: round.id, reviewId: toRecord.reviewId,
+                  });
+                } catch (recordError) {
+                  recordFailure = recordError;
+                  this.log('error', 'Perkins report delivery reconciled a receipt that could not be recorded', {
+                    round: round.id, error: String(recordError),
+                  });
+                }
               }
             }
           } catch (reconcileError) {
+            reconciliationFailure = reconcileError;
             this.log('error', 'Perkins report delivery reconciliation failed', { round: round.id, error: String(reconcileError) });
           }
         }
         if (reconciledDelivery === null) {
-          deliveryError = error;
+          // R31: an unresolved ambiguous post must always carry the
+          // manual-verification warning — a following lookup that found
+          // nothing, could not run, or could not be recorded does not make
+          // a blind retry safe. When a follow-up step ALSO failed, its
+          // detail joins the durable record.
+          const caution = 'verify manually before any retry — an unresolved lookup is not proof of absence, and a retry could duplicate a real publication';
+          const followUpFailure = reconciliationFailure !== undefined
+            ? `reconciliation after the ambiguous post ALSO failed: ${String(reconciliationFailure)}`
+            : recordFailure !== undefined
+              ? `recording the reconciled delivery ALSO failed: ${String(recordFailure)}`
+              : null;
+          deliveryError = followUpFailure === null
+            ? new Error(`${String(error)}; ${caution}`)
+            : new Error(`${caution}; ${followUpFailure}; original post failure: ${String(error)}`);
           this.opts.escalate?.(
             `Perkins report for round ${round.id} was recorded but NOT posted safely to the pull request`,
-            String(error),
+            String(deliveryError),
             { jobId: round.jobId, roundId: round.id },
           );
-          this.log('error', 'Perkins report post failed', { round: round.id, error: String(error) });
+          this.log('error', 'Perkins report post failed', { round: round.id, error: String(deliveryError) });
         }
       }
     } else if (canonical !== 'INCOMPLETE' && job.prUrl === null) {
@@ -3186,7 +3441,14 @@ export class WaveRunner {
       );
     }
 
-    if (signal.aborted) deliveryError = new Error('review operation aborted during finalization');
+    if (signal.aborted) {
+      // Preserve any earlier durable detail (e.g. the R31 manual-verification
+      // warning) instead of overwriting it with the abort alone.
+      const abortDetail = 'review operation aborted during finalization';
+      deliveryError = deliveryError === undefined
+        ? new Error(abortDetail)
+        : new Error(`${String(deliveryError)}; ${abortDetail}`);
+    }
     // Publication is required for ANY conclusive verdict: an unposted review
     // is never complete, with or without a linked PR.
     const recordedVerdict = verdict !== null && posted && !signal.aborted ? verdict : null;
