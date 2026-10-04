@@ -163,6 +163,16 @@ describe('workload-aware test budgets', () => {
     expect(Object.keys(scopes).length).toBeGreaterThan(0);
     const heavyPaths = heavyTestPaths();
     for (const [scope, command] of Object.entries(scopes)) {
+      if (scope === 'perkins-stage1-baseline') {
+        // This fails-before check runs in an archived pre-budget tree, not
+        // the current checkout. Its pinned base predates the heavy config;
+        // requiring that absent config would turn a valid RED into a setup
+        // failure. Keep the exception tied to the actual archived baseline.
+        expect(command).toContain('base=9bb51b05af5d8f0a0cd389788d1d3f19607d5361');
+        expect(command).toContain('git archive "$base"');
+        expect(command).toContain('cd "$d"');
+        continue;
+      }
       for (const segment of command.split('&&').map((part) => part.trim())) {
         if (segment.includes('--config vitest.heavy.config.ts')) {
           // The heavy include is an explicit list: a fast file named here is
