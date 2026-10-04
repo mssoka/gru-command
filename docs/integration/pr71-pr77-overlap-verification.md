@@ -4,25 +4,25 @@ The independent PR71 review pinned ten files as the #71/#77 integration
 overlap. This record is the verification of that integration event: which
 files needed edits, which passed as-is, and the evidence for both. It is a
 verification record, not a repair ticket — the individual #71 defects are
-their own issues.
+their own issues. Where the record describes today's behavior, it says so;
+the integration event and current main are kept separate.
 
 ## Verdict
 
 - Exactly **one** of the ten files needed integration edits:
   `test/suite-shape.test.ts` (the single content conflict; its PINS table
-  was regenerated from the actual merged tree).
+  was regenerated from the actual merged tree at integration time).
 - The other **nine auto-merged untouched**: every line added by each side
   (relative to the shared base `128412db`) is present verbatim in the
-  integrated tree.
-- `test/suite-shape.test.ts` passes on the current tree, so the pins equal
-  the actual registered-test union.
-- The board snapshot/classifier chain agrees across engine, web protocol,
-  signals and UI — including the terminal-job set, which has a dedicated
-  cross-build drift alarm.
-- The guarded clean-abort tests re-run green against the post-#77 runtime.
-- The full suite was green on the integration merge, the PR77 head and the
-  merge into main (exact-head GitHub CI), and remains green on current main;
-  focused suites re-ran green locally on current main.
+  integrated tree `5da02249`.
+- All ten files' assertions ran green on the combined tree: the merge
+  result was tested by PR-event CI and the merged commits by push-event CI.
+- The guarded clean-abort path re-ran green against the post-#77 runtime,
+  and both accepted restart reasons now have regressions (the missing
+  second-reason test is closed in this PR as #113).
+- Current main has since evolved the board chain (later board work), so the
+  board section below states the integration state at `5da02249` separately
+  from current-main semantics; current-main focused suites are green.
 
 ## Refs
 
@@ -45,16 +45,20 @@ their own issues.
    #71 side (`git diff -U0 128412db 6249e98`) and by the #77 side
    (`git diff -U0 128412db 2540538`) was checked for an exact full-line
    match in the integrated tree `5da02249`. All present, both sides.
-3. **Pins.** `suite-shape` regenerates `PINS` from the actual `test/`
-   listing and compares every file's registered `it(` count; it passes.
-4. **Board chain.** Read engine snapshot fields, the web protocol
-   validator, the signal derivations and the UI consumers; run their
-   suites. The terminal set carries a cross-build alarm that reads
+3. **Pins.** `test/suite-shape.test.ts` was regenerated at integration time
+   from the actual merged listing; the committed test is a static guard, not
+   a regenerator: it compares the `PINS` table with the `test/` directory
+   listing and each file's registered `it(`/`it.skipIf(` count. It passes.
+4. **Board chain.** Read engine snapshot fields, the web protocol validator,
+   the signal derivations and the UI consumers; run their suites. The
+   current terminal set carries a cross-build alarm that reads
    `src/ledger/states.ts` directly.
-5. **Clean-abort.** Run `test/dispatch-server.test.ts` (heavy config) on
-   the current tree — the guarded same-head re-arm test runs against the
-   post-#77 WaveRunner.
-6. **Full suite.** GitHub CI check runs at the exact integration SHAs.
+5. **Clean-abort.** Run `test/dispatch-server.test.ts` (heavy config) on the
+   current tree — the guarded same-head re-arm runs against the post-#77
+   WaveRunner, for both accepted restart reasons.
+6. **Full suite.** GitHub CI check runs at the integration SHAs, read
+   together with the checkout log (PR-event runs test a synthetic merge
+   commit; push-event runs test the exact commit).
 
 ## Per-file record
 
@@ -71,51 +75,76 @@ their own issues.
 | `web/src/ui/board.test.ts` | 90 / 61 | yes | none |
 | `web/src/ui/board.ts` | 114 / 16 | yes | none |
 
-Both sides kept: #71 pending/wake snapshot fields, pagination and
-owner/machine split; #77 whole-PR lens classification (`used`/`unused`/
-`ran`, settled progress) and the review runtime. Nothing from either side
-was dropped to make the merge.
+Both sides kept: #71 pending/wake snapshot fields, pagination and the
+owner/machine split; #77 whole-PR lens classification and the review
+runtime. Nothing from either side was dropped to make the merge.
 
 ## Board snapshot / classifier agreement
 
-- **Engine** (`src/board/engine.ts`): `BoardSnapshot` carries
-  `unackedActionRequired` (NEEDS GRU live machine queue),
-  `unackedNeedsOwner` (FOR YOU bell class) and `wakes`; notifications
-  paginate both pending routings and keep the receipt window; routing is
+**At the integration event (`5da02249`):** the snapshot carried #71's
+`unackedActionRequired`, `unackedNeedsOwner`, `wakes` and both pending
+queues, alongside #77's whole-PR lens classification. That state still
+counted terminal-bound machine rows in `unackedActionRequired`
+(`countPendingActionRequired`) and still rendered attention pills on
+concluded cards — the receipt rule came later.
+
+**On current main (`6190487`), after later board work (#138):**
+
+- **Engine** (`src/board/engine.ts`): `unackedActionRequired` is the live
+  NEEDS GRU machine queue (terminal-bound receipts excluded via
+  `countLivePendingActionRequired`), `unackedNeedsOwner` is the FOR YOU
+  bell class, `wakes` counts durable Gru wake events; notifications
+  paginate both pending routings under the receipt window; routing is
   `'fyi' | 'action-required' | 'needs-owner'`.
-- **Protocol** (`web/src/lib/board-protocol.ts`): mirrors the routing
-  union and both counters plus `wakes` and rejects malformed snapshots, so
-  a shape drift fails the client loudly.
+- **Protocol** (`web/src/lib/board-protocol.ts`): mirrors the routing union
+  and both counters plus `wakes` and rejects malformed snapshots, so a
+  shape drift fails the client loudly.
 - **Signals** (`web/src/lib/board-signals.ts`): `unackedByJob` counts
   unacked machine rows bound to non-terminal jobs;
   `terminalBoundNotificationIds` classifies terminal-bound rows as closed
-  receipts; `roundSummary` derives `used`/`unused`/`ran`/settled; 
+  receipts; `roundSummary` derives `used`/`unused`/`ran`/settled;
   `jobSignal` orders attention before liveness and returns null for
   concluded jobs.
 - **UI** (`web/src/ui/board.ts`): NEEDS GRU renders the live machine queue
-  and never rings the bell; the bell badge and toasts ride needs-owner
-  rows only; concluded rows cannot re-enter NEEDS GRU.
+  and never rings the bell; the bell badge and toasts ride needs-owner rows
+  only; concluded rows cannot re-enter NEEDS GRU.
 - **Terminal-set agreement:** the ledger's `JOB_TERMINAL` is
   `{merged, done}` and the web's `isJobConcluded` is `{merged, done}`;
   `web/src/lib/board-signals.test.ts` reads `src/ledger/states.ts` and
   fails if the two ever drift.
 
-## Verification runs (current main `6190487`)
+## Guarded clean-abort
 
-- backend fast: `test/board-engine.test.ts` (35), `test/roles-definitions.test.ts` (10),
-  `test/suite-shape.test.ts` (2) — 47 passed.
-- backend heavy: `test/dispatch-e2e.test.ts`, `test/dispatch-server.test.ts` —
-  44 passed, including *"re-arms one proven same-head service-restart abort
-  through the guarded Silas review API"*.
-- web: `board-protocol` (14), `board-bands` (33), `board-health` (13),
-  `board-signals` (21), `board` UI (62) — 143 passed.
+- The guarded same-head re-arm accepts two reasons
+  (`service_restart`, `service_restart_missing_review_lane`).
+- `test/dispatch-server.test.ts` covers `service_restart` end-to-end at the
+  HTTP boundary, including the force/role negatives and the duplicate
+  refusal.
+- This PR adds the missing `service_restart_missing_review_lane` regression
+  (issue #113) in both the digest (`test/silas-driver.test.ts`) and the
+  guarded endpoint (`test/dispatch-server.test.ts`).
+- Mutation check: deleting the second predicate from
+  `src/dispatch/server.ts` fails the new endpoint test; deleting it from the
+  digest classifier in `src/dispatch/silas-driver.ts` fails the new digest
+  test. Both mutations were applied in a scratch run and reverted.
 
 ## Full-suite evidence (GitHub CI `Full suite (Node 22)`, all `success`)
 
-- `234b1e9` — the integration merge.
-- `5da02249` — the PR77 head merged to main.
-- `4845b1a` — the merge into main.
-- `6190487` — current main.
+- `234b1e9` — PR-event check on the synthetic merge result `81bdea0`
+  (`234b1e9` merged into `6249e98`), i.e. the combined tree.
+- `5da02249` — PR-event check on the synthetic merge result `0af5093`
+  (`5da02249` merged into `6249e98`).
+- `4845b1a` — push-event check on the exact merge commit.
+- `6190487` — push-event check on current main.
+
+## Verification runs (current main `6190487`)
+
+- backend fast: `test/board-engine.test.ts` (35), `test/roles-definitions.test.ts` (10),
+  `test/suite-shape.test.ts` (2), `test/silas-driver.test.ts` (45) — green.
+- backend heavy: `test/dispatch-e2e.test.ts`, `test/dispatch-server.test.ts`
+  (40, both restart reasons) — green.
+- web: `board-protocol` (14), `board-bands` (33), `board-health` (13),
+  `board-signals` (21), `board` UI (62) — 143 passed.
 
 ## Notes
 

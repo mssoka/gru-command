@@ -757,6 +757,35 @@ describe('dispatch server (E8)', () => {
     } finally { await h.close(); }
   }, 90_000);
 
+  it('re-arms a proven same-head service_restart_missing_review_lane abort too (#113)', async () => {
+    const h = await boot();
+    const repo = makeFixtureRepo('fixture-clean-abort-lane');
+    cleanupRepos.push(repo);
+    attachBareOrigin(repo);
+    try {
+      await call(h.port, 'POST', '/api/dispatch', { job_id: 'clean-abort-lane', repo_path: repo.path, title: 'clean', briefing: 'b' }, TOKEN);
+      const deadline = Date.now() + 10_000;
+      while (h.ledger.latestJobEvent('clean-abort-lane', 'job.delivered') === null && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      expect(h.ledger.latestJobEvent('clean-abort-lane', 'job.delivered')).not.toBeNull();
+      expect((await call(h.port, 'POST', '/api/dispatch/pr', { job_id: 'clean-abort-lane', url: PR_URL }, TOKEN)).status).toBe(200);
+      const lane = h.worktrees.listWorktrees({ jobId: 'clean-abort-lane' }).find((row) => row.kind === 'job')!;
+      const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: lane.path, encoding: 'utf8' }).trim();
+      const round = h.ledger.addRound({ jobId: 'clean-abort-lane', targetRef: sha, lenses: ['blind'] });
+      h.ledger.setRoundStatus(round.id, 'aborted');
+      const body = { job_id: 'clean-abort-lane', by: 'silas', rule_id: 'clean-abort-service-restart', source_round_id: round.id };
+      h.ledger.appendCustomEvent({ kind: 'round.perkins-incomplete', jobId: 'clean-abort-lane', roundId: round.id, payload: { reason: 'service_restart_missing_review_lane' } });
+      const review = await call(h.port, 'POST', '/api/dispatch/review', body, TOKEN);
+      expect(review).toMatchObject({ status: 202, json: { route: 'perkins', round_id: 'clean-abort-lane-r2',
+        rule_id: 'clean-abort-service-restart', source_round_id: round.id } });
+      expect(h.ledger.latestJobEvent('clean-abort-lane', 'silas.review-triggered')?.payload).toMatchObject({
+        rule_id: 'clean-abort-service-restart', source_round_id: round.id, round_id: 'clean-abort-lane-r2',
+      });
+      expect((await call(h.port, 'POST', '/api/dispatch/review', body, TOKEN)).status).toBe(400);
+    } finally { await h.close(); }
+  }, 90_000);
+
   it('/api/silas/directive routes to the live minion, flips the lane back to working, records the event', async () => {
     const h = await boot();
     const repo = makeFixtureRepo('fixture-silas-directive');
