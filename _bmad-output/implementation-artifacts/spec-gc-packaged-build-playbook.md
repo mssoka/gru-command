@@ -831,7 +831,7 @@ bad_spec).
   Root cause found and fixed: the Perkins App credential directory
   `~/.gru-command/perkins` was 0755, so the hardened publication path
   refused it (`credential-directory permissions`) — now 0700.
-- Independent `bmad-code-review` (owner-requested via herdr, reviewers on
+- Independent `bmad-code-review` (owner-requested independent review, reviewers on
   `openai-codex/gpt-6-sol`; report at
   `~/.gru-command/reviews/gc-packaged-build-playbook-20261002-bmad-code-review-4af6aab/report.md`):
   4 decisions + 7 patches + 1 pre-existing + 4 rejected. All resolved
