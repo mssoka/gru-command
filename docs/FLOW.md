@@ -65,8 +65,52 @@ working/pushing the target branch (`dispatched`/`working` with no settled
 delivery for its current attempt), the API answers `409 branch_busy` with
 `blockers: [{job_id, status, branch}]` and the same check re-runs
 immediately before the freeze, so a lane re-opened mid-setup is refused
-the same way. The arm passes once the lane delivers. `force: true` is the
-human override; a forced round is tagged in its frozen manifest
+the same way. The same recheck runs after a failed pre-flight and before
+the bmad-review fallback gate admits — a re-brief or lane re-open landing
+during the awaited pre-flight refuses the fallback arm (409, or a queued
+replay re-queue) instead of starting a fallback reviewer; the fallback
+recheck enters through the same `arm`-phase guard, so a forced fallback
+admission carries two `arm`-phase `branch-idle.forced` records where the
+native route carries `arm` + `freeze`. A running fallback gate also
+re-proves its lane, marker and replay-authorization facts at each round
+intake, after the default reviewer's worker admission and asynchronous
+spawn, and after the reviewer returns. It compares the current attempt,
+delivery and branch owners to the audited admission snapshot: a new working
+attempt, newly busy foreign lane, or replaced checkout cannot approve the
+old diff. `force` in the fallback covers only blockers present at the
+original arm, not a new request during preflight or an active reviewer.
+It also compares the durable re-brief settlement watermark from admission
+and each round's diff intake: a request that begins and settles while the
+reviewer runs cannot approve the old diff. Those boundary re-proofs
+emit no branch-idle audit rows: at admission a replay whose job is
+blocked/parked is HELD (`job.review-handoff-held` plus escalation,
+requiring a new validated request), while after admission the gate stops
+as `job.fallback-review` phase `aborted` with a free-text reason and no
+held identity. Terminal (`merged`/`done`) jobs take the canonical
+terminal refusal before any busy check — a stale marker never answers
+`branch_busy` and never resurrects the job. The reviewed job's OWN
+unresolved request fences the review regardless of an explicit
+`target_ref` naming another lane; unrelated foreign lanes keep their own
+branch-matched busy semantics. A `blocked` gate terminal reports the
+failing round in `iterations`; an `aborted` terminal reports only
+completed rounds (the aborted event's `iteration` names the round not
+taken). The arm passes
+only when the target work is genuinely
+settled AND no re-brief request is unresolved — a delivery alone does not
+release a fenced lane. A lane with an unresolved re-brief request counts
+busy the same way: the durable pending markers written before a re-brief
+worker spawns (cleared only when the request genuinely settles, via
+finalization or boot recovery) fence the target regardless of an older
+delivery or a status flip — the fence can coexist with a delivered or
+in-review status — and the Silas digest rechecks every proposed review
+at final publication, after any async blocker-history work. A live re-brief
+finalizer matches the exact admitted marker IDs as well as any phase ID:
+ordinary requests have no phase ID, so an older turn cannot consume a
+newer request's markers. Settlement publishes `silas.rebrief-settled`
+after marker retirement, so a queued handoff that re-queued on the
+earlier delivery can retry without waiting for another sweep. `force: true` is the owner's explicit override —
+never an automatic operations action; a forced round is tagged in its
+frozen manifest
 (`branchIdle`) and the event log (`branch-idle.forced`), refusals land as
 `branch-idle.refused`, and a Silas auto-arm deferral lands as
 `silas.review-deferred` (retry on the next sweep). For a job
@@ -135,6 +179,10 @@ the required coverage cardinality.
   or delivery failure durably terminalizes the round as INCOMPLETE. It can
   neither post nor record approval. Startup reconciliation marks interrupted
   rounds INCOMPLETE and releases their owned detached lanes.
+- The base is changed source only when the locally resolved base ref no
+  longer contains the frozen merge-base (rewritten past it) or no longer
+  resolves; nothing is fetched, so a host-side rewrite counts once it is
+  visible locally, and the frozen base stays recorded as provenance.
 - Installed builds load the integrity-pinned policy and Claude MCP server
   relative to the compiled package. Missing, tampered, symlinked, or
   source-fallback resources fail closed.
@@ -156,9 +204,12 @@ route:
    claude-code runtime this is a CLI-availability probe; on pi it checks
    model resolution plus provider auth.
 3. **Code-host integration** — a GitHub (`gh`) or GitLab (`GITLAB_TOKEN`)
-   token valid for the exact repository remote, used for SHA-bound verdict
-   delivery. Only GitHub and GitLab hosts are supported; other origins fail
-   the leg closed (credentials are never sent to unknown hosts).
+   token valid for the exact repository remote: the preflight leg. Verdict
+   delivery rides the `gh` token only when no Perkins App bundle is
+   installed; with a bundle, github.com publication is App-authored (see
+   [PERKINS-APP-PUBLICATION.md](./PERKINS-APP-PUBLICATION.md)). Only GitHub
+   and GitLab hosts are supported; other origins fail the leg closed
+   (credentials are never sent to unknown hosts).
 4. **Review policy enabled** — `[review] enabled = true` in config.
 
 All legs pass → Perkins review (the gate). Any leg fails → the request
@@ -185,8 +236,11 @@ delivery discipline as GitHub (the frozen HEAD is verified before a note is
 posted; a PR's recorded base is refreshed into the delivery record rather
 than gating, since a pinned base is expected to trail a moving main), and
 the GitLab probe and poster resolve their token
-identically (`GITLAB_TOKEN`, falling back to `GL_TOKEN`); GitHub
-authenticates through the `gh` CLI.
+identically (`GITLAB_TOKEN`, falling back to `GL_TOKEN`). GitHub
+**publication** authenticates through the `gh` CLI when no Perkins App
+bundle is installed; with a bundle, github.com publication is App-authored
+while the review preflight still probes remotes through `gh` (see
+[PERKINS-APP-PUBLICATION.md](./PERKINS-APP-PUBLICATION.md)).
 
 Report artifacts persist before delivery, but the local round verdict is
 recorded only after SHA-bound delivery proof succeeds; delivery failure
@@ -213,10 +267,52 @@ verification budget.
   that waits past `lock_wait_timeout_ms` (default 15 min) fails LOUD: the
   lane receives a typed `error` frame and the ledger a
   `verification.lock-timeout` record — nothing hangs silently.
+- **Identical submissions are single-flight, never duplicate producers**
+  (issue #159). Same job + lane + scope + head + command shares ONE run:
+  the duplicate stream gets an `attached` frame naming the run and then
+  receives the same terminal outcome; a restart orphan that already
+  represents the submission answers with a typed `duplicate_in_flight`
+  error instead of a second producer. A completed run, a failed-run
+  repair, or a changed head is never permanently suppressed — a fresh
+  submission runs.
+- **A submission can carry durable identity.** `POST /api/verify` accepts
+  an optional client `request_id` (and `expected_head`; a lane that moved
+  answers 409 `head_changed` before any producer exists). Replaying the
+  same `request_id` attaches to the in-flight run or replays the recorded
+  terminal outcome — a lost response is reconciled, never replayed blind.
+  The run's exact head is re-read at spawn: a lane that moved while the
+  request waited fails as `head_changed` instead of verifying the new
+  revision. `GET /api/verify/status?request_id=…` answers
+  `unknown | accepted | running | completed | admission-failed |
+  interrupted`; only a task confirmed never-started (typed
+  `lock_wait_timeout`, no `started` frame) may be retried under its old
+  identity. Terminal identities append to `<data_dir>/verify/requests.ndjson`,
+  so history eviction and crash/restart never turn a completed or
+  interrupted identity into `unknown`: it reports its terminal state and
+  refuses a rerun — a re-verification mints a NEW request id.
+- **Capture is exclusive and receipted.** The shipped capture helper
+  (`dist/verify/capture-cli.js`, named in Silas's wake prompt) opens a
+  unique `wx` sink BEFORE the POST, streams every NDJSON frame to EOF,
+  and writes `<sink>.receipt.json` binding run id, true head/dirty state,
+  exit/outcome and output length/hash. A stream without a valid terminal
+  completion, with torn/foreign records, or whose single run identity does
+  not hold across the whole stream is `unknown` and is never promoted to
+  success; a replayed terminal receipt is marked `reconciled` and is an
+  honest failure (the outcome is known, the original full capture is not
+  reconstructable, and a rerun to recover logs is refused). Owned helpers are withdrawn only with identity validation
+  (pid + start time + command/cwd); malformed pid records, crashes and
+  stale owners are cleared without touching unrelated processes, and
+  sinks/receipts are preserved.
 - **One worker budget across runs.** Total test workers stay within
   `[verify] worker_budget` (default: CPU cores − 2), enforced by the run
   wrapper through the vitest pool knobs and `GRU_VERIFY_*` variables for
   other runners.
+- **Project harness budgets compose with the run budget.** A repo may
+  classify process-heavy integration files with their own finite ceilings
+  and a smaller worker cap (gru-command: 120s and two workers, see
+  `test/helpers/test-budgets.ts`). The classified phase runs sequentially
+  after the fast phase inside the declared `full` command, so the two
+  phases never overlap and a smaller scheduler pin still wins.
 - **Holders are durable and self-healing.** Active holders persist at
   `<data_dir>/verify/scheduler.json` with the runner pid; a persisted
   holder whose pid is dead — or was never recorded — is released
@@ -354,8 +450,9 @@ directive intent, request-id idempotency with single-writer refusal,
 marked phase handoffs with correlated completion, per-turn terminal
 outcome validation (`src/runtime/prompt-verdict.ts`), and boot
 reconciliation. That is the mechanism to extend — do not build a parallel
-outcome system. `/api/verify` admission/re-arm (#159) is still missing.
-Nothing in this section claims those remaining runtime guarantees exist
+outcome system. `/api/verify` single-flight admission/re-arm with the
+exclusive-capture helper (#159) has since shipped (PR #192).
+Nothing in this section claims the remaining runtime guarantees exist
 today.
 
 ## 5. Release (the sweep)
@@ -484,7 +581,19 @@ the judgment; the dispatch surface is the mechanical hand.
   re-dispatches a fresh worker on the same lane) and records the missing
   events when that turn settles; a failed recovery escalates
   action-required and keeps the markers for the next boot, so the lane
-  can never stall silently on a lost turn.
+  can never stall silently on a lost turn. A leftover marker whose job
+  has since reached terminal (`merged`/`done`) before the request was
+  honored cannot be served: the boot scan — or a settling turn or
+  re-dispatch boundary that meets the terminal job — retires it
+  administratively (the identity-checked deletion and one
+  `silas.rebrief-retired` audit commit together, with no spawn and no
+  escalation); spent markers (both guarded events already landed) still
+  clear as a completion, with no retirement audit. A malformed pair
+  (missing kind or mismatched phase id, payload hash, or watermark) is
+  instead retained and escalated for repair, even on a terminal job; it
+  cannot be treated as one request or retired. The boot summary
+  counts `examined` in markers but `completed`/`redispatched`/`retired`
+  in jobs, so one retired pair reads `examined: 2 … retired: 1` by design.
 - **Authority boundaries are unchanged** (`roles/silas.md`): dispatch,
   track, close; never product code; never merge; preserve before remove;
   escalate with pointers. Silas acts only through the authenticated ops
@@ -573,7 +682,7 @@ next user-directed context block:
 
 | routing | meaning | surface |
 |---|---|---|
-| `action-required` | machine attention: Gru resolves/acts in-turn | NEEDS GRU queue; wakes Gru; never rings the owner bell |
+| `action-required` | machine attention: Gru resolves/acts in-turn | NEEDS GRU queue (live rows only; terminal-job rows are closed receipts under FEED); wakes Gru; never rings the owner bell |
 | `needs-owner` | owner-only decisions (merges everywhere, budget, destructive ops) and anything Gru escalates | FOR YOU band + owner bell + morning digest |
 | `fyi` | standing feed | board feed only |
 
@@ -612,8 +721,10 @@ known failure classes, sweep acks under recorded rules. Gru keeps the
 judgments: rulings, merge escalations, and novel failures. One standing rule from the
 2026-09-23 freeze: never auto-arm a review round on a branch while a
 rebase/force-push lane is active on the same target (the round races the
-push and dies obsolete); arm after the lane delivery settles. Service
-restarts remain manual until self-roll-34 lands.
+push and dies obsolete); arm only after the lane genuinely settles — the
+attempt delivered AND no unresolved re-brief request standing (marker/
+control settlement, not delivery alone; see the branch-idle guard
+section). Service restarts remain manual until self-roll-34 lands.
 
 ## Bob (periodic memory)
 

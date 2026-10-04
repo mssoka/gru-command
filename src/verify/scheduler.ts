@@ -1,6 +1,6 @@
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { availableParallelism } from 'node:os';
 import { join } from 'node:path';
 import type { Readable } from 'node:stream';
@@ -45,6 +45,20 @@ export interface VerificationRunSpec {
   readonly scope: string;
   readonly command: string;
   readonly cwd: string;
+  /**
+   * Client-minted idempotency key (issue #159): the SAME request_id always
+   * reconciles to the same attempt — an in-flight submission attaches, a
+   * completed one replays its recorded terminal outcome, and a typed
+   * never-started admission failure may be retried. Omitted = no durable
+   * identity beyond the single-flight key.
+   */
+  readonly requestId?: string;
+  /**
+   * Tracked HEAD resolved at submission; part of the single-flight key so
+   * a changed head is a NEW verification, never a duplicate attach. The
+   * outcome still binds the true head execute() reads at spawn.
+   */
+  readonly head?: string | null;
 }
 
 export interface VerificationLease {
@@ -53,6 +67,7 @@ export interface VerificationLease {
   readonly scope: string;
   readonly command: string;
   readonly cwd: string;
+  readonly head: string | null;
   readonly queuedAt: number;
   readonly grantedAt: number;
 }
@@ -89,6 +104,14 @@ export type VerificationProgress =
       readonly limit: number;
     }
   | {
+      readonly type: 'attached';
+      readonly runId: string;
+      readonly state: 'queued' | 'running';
+      readonly requestId: string | null;
+      readonly head: string | null;
+      readonly dedupeKey: string;
+    }
+  | {
       readonly type: 'started';
       readonly runId: string;
       readonly workers: number;
@@ -101,7 +124,14 @@ export type VerificationProgress =
       readonly stream: 'stdout' | 'stderr';
       readonly text: string;
     }
-  | { readonly type: 'completed'; readonly runId: string; readonly outcome: VerificationOutcome };
+  | {
+      readonly type: 'completed';
+      readonly runId: string;
+      readonly outcome: VerificationOutcome;
+      /** True when a replayed request_id returned the recorded outcome
+       * instead of running a new producer. */
+      readonly reconciled?: boolean;
+    };
 
 export type VerificationProgressSink = (progress: VerificationProgress) => void | Promise<void>;
 
@@ -139,6 +169,99 @@ export class VerificationDisposedError extends Error {
   }
 }
 
+/**
+ * Raised when an identical (job, lane, scope, head, command) submission is
+ * already represented by a holder THIS process does not own — a restart
+ * orphan whose runner may still be alive. The caller reconciles against the
+ * named run; a second producer is never minted (issue #159).
+ */
+export class VerificationDuplicateError extends Error {
+  readonly code = 'duplicate_in_flight';
+  constructor(
+    readonly runId: string,
+    readonly state: 'queued' | 'running',
+    detail?: string,
+  ) {
+    super(detail ?? `an identical verification is already in flight as run ${runId} (${state})`);
+    this.name = 'VerificationDuplicateError';
+  }
+}
+
+/** Raised when a request_id is replayed with a different job/scope/head. */
+export class VerificationRequestConflictError extends Error {
+  readonly code = 'request_id_conflict';
+  constructor(readonly requestId: string) {
+    super(`request_id "${requestId}" is bound to a different verification spec — mint a new request_id`);
+    this.name = 'VerificationRequestConflictError';
+  }
+}
+
+/**
+ * Raised when a terminal request identity is no longer retained for replay
+ * (its full outcome was evicted from the bounded history cache, or a crash
+ * interrupted it): replaying it would be an unknown-authority rerun. The
+ * ledger keeps the run's record; the caller mints a fresh identity.
+ */
+export class VerificationRequestExpiredError extends Error {
+  readonly code = 'request_id_expired';
+  constructor(
+    readonly requestId: string,
+    readonly runId: string,
+    readonly terminalState: 'completed' | 'interrupted',
+  ) {
+    super(
+      `request_id "${requestId}" reached a terminal ${terminalState} state (run ${runId}) whose outcome is not retained for replay — ` +
+        'refusing to rerun; inspect the ledger verification.completed record and mint a NEW request_id for any re-verification',
+    );
+    this.name = 'VerificationRequestExpiredError';
+  }
+}
+
+/** The client-supplied request identity grammar (bounded; URL-safe). */
+export const VERIFICATION_REQUEST_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
+
+export function isValidVerificationRequestId(value: string): boolean {
+  return VERIFICATION_REQUEST_ID_PATTERN.test(value);
+}
+
+export type VerificationAttemptState =
+  | 'unknown'
+  | 'accepted'
+  | 'running'
+  | 'completed'
+  | 'admission-failed'
+  /** Started before a crash/restart; its outcome was never recorded and it
+   * is not replayable — a re-verification uses a NEW request identity. */
+  | 'interrupted';
+
+/** The reconcile answer for `GET /api/verify/status` (issue #159). */
+export interface VerificationAttemptStatus {
+  readonly state: VerificationAttemptState;
+  readonly requestId: string | null;
+  readonly runId: string | null;
+  readonly jobId: string | null;
+  readonly scope: string | null;
+  readonly command: string | null;
+  readonly cwd: string | null;
+  readonly head: string | null;
+  readonly trackedDirty: boolean | null;
+  /** True once the run's child exists (a `started` frame was emitted).
+   * An admission failure with started=false may be retried. */
+  readonly started: boolean;
+  /** Terminal outcome, present only for state 'completed'. */
+  readonly outcome?: VerificationOutcome;
+  /** Typed failure for 'admission-failed'. */
+  readonly error?: { readonly code: string; readonly detail: string };
+}
+
+export interface VerificationAttemptLookup {
+  readonly requestId?: string;
+  readonly jobId?: string;
+  readonly scope?: string;
+  readonly cwd?: string;
+  readonly head?: string | null;
+}
+
 /** A spawn/settle callback payload: the lease plus the spawned child. */
 export interface VerificationSpawnInfo {
   readonly lease: VerificationLease;
@@ -167,12 +290,83 @@ interface PersistedSlot {
   readonly scope: string;
   readonly command: string;
   readonly cwd: string;
+  readonly head?: string | null;
+  /** Client request identities bound to this holder (reconcile across restart). */
+  readonly request_ids?: readonly string[];
   readonly granted_at: number;
+}
+
+interface PersistedAttempt {
+  readonly request_id: string;
+  readonly run_id: string;
+  readonly job_id: string;
+  readonly scope: string;
+  readonly command: string;
+  readonly cwd: string;
+  readonly head: string | null;
+  readonly tracked_dirty: boolean;
+  readonly started: boolean;
+  readonly state: 'completed' | 'admission-failed';
+  readonly completed_at: number;
+  readonly outcome: Record<string, unknown> | null;
+  readonly error: { readonly code: string; readonly detail: string } | null;
 }
 
 interface PersistedState {
   readonly version: 1;
   readonly slots: readonly PersistedSlot[];
+  readonly attempts?: readonly PersistedAttempt[];
+}
+
+/**
+ * Durable terminal identity (append-only `requests.ndjson`). The bounded
+ * in-memory history carries replayable outcomes; this index guarantees an
+ * identity is NEVER silently forgotten and rerun — an evicted or
+ * crash-interrupted identity answers as terminal and refuses replay.
+ */
+type TerminalIdentityState = 'completed' | 'admission-failed' | 'interrupted';
+
+interface TerminalIdentity {
+  readonly request_id: string;
+  readonly run_id: string;
+  readonly state: TerminalIdentityState;
+  readonly job_id: string;
+  readonly scope: string;
+  readonly command: string;
+  readonly cwd: string;
+  readonly head: string | null;
+  readonly started: boolean;
+  readonly completed_at: number;
+}
+
+/** One in-flight single-flight attempt: the shared producer plus every attached sink. */
+interface Attempt {
+  readonly key: string;
+  readonly runId: string;
+  readonly spec: VerificationRunSpec;
+  readonly head: string | null;
+  /** Every client request identity bound to this producer (primary + attached). */
+  readonly requestIds: Set<string>;
+  readonly sinks: Set<VerificationProgressSink>;
+  readonly promise: Promise<VerificationOutcome>;
+  resolve(outcome: VerificationOutcome): void;
+  reject(error: Error): void;
+  /** Serialized fan-out: an `attached` frame can never overtake a terminal one. */
+  queue: Promise<void>;
+  started: boolean;
+  outcome: VerificationOutcome | null;
+  lease: VerificationLease | null;
+}
+
+/** Terminal request_id evidence kept (bounded) for reconnect reconciliation. */
+interface RequestHistoryEntry {
+  readonly state: 'completed' | 'admission-failed';
+  readonly spec: VerificationRunSpec;
+  readonly head: string | null;
+  readonly completedAt: number;
+  readonly outcome: VerificationOutcome | null;
+  readonly started: boolean;
+  readonly error: { readonly code: string; readonly detail: string } | null;
 }
 
 interface ActiveSlot {
@@ -182,6 +376,8 @@ interface ActiveSlot {
   readonly owned: boolean;
   pid: number | null;
   child: ChildProcess | null;
+  /** Client request identities bound to this holder. */
+  requestIds: readonly string[];
 }
 
 interface Waiter {
@@ -226,8 +422,86 @@ export interface VerificationSchedulerOptions {
 }
 
 const STATE_FILE = 'scheduler.json';
+/** Append-only terminal request identities (outlives bounded outcome history). */
+const REQUEST_LOG_FILE = 'requests.ndjson';
 /** Bound on the per-run output tail carried in the outcome/ledger. */
 const OUTPUT_TAIL_MAX_BYTES = 4 * 1024;
+/** Bound on completed/admission-failed request records kept for reconciliation. */
+const MAX_REQUEST_HISTORY = 64;
+/** The output tail retained in a persisted request record (bounded state file). */
+const PERSISTED_TAIL_CHARS = 512;
+
+function normalizeRequestId(value: string | undefined): string | null {
+  if (value === undefined) return null;
+  if (!VERIFICATION_REQUEST_ID_PATTERN.test(value)) {
+    throw new Error(
+      `verification request_id must match ${String(VERIFICATION_REQUEST_ID_PATTERN)} (≤128 URL-safe chars), got ${JSON.stringify(value)}`,
+    );
+  }
+  return value;
+}
+
+/** The single-flight identity: same job + lane + scope + head + command. */
+function attemptKey(spec: VerificationRunSpec, head: string | null): string {
+  return [spec.jobId, spec.cwd, spec.scope, head ?? 'no-head', spec.command].join('\u0000');
+}
+
+function sameSubmission(
+  left: Pick<VerificationRunSpec, 'jobId' | 'scope' | 'cwd' | 'command'>,
+  leftHead: string | null,
+  right: Pick<VerificationRunSpec, 'jobId' | 'scope' | 'cwd' | 'command'>,
+  rightHead: string | null,
+): boolean {
+  return (
+    left.jobId === right.jobId &&
+    left.scope === right.scope &&
+    left.cwd === right.cwd &&
+    left.command === right.command &&
+    leftHead === rightHead
+  );
+}
+
+/** Validate one append-only terminal identity line. */
+function parseTerminalIdentity(value: unknown): TerminalIdentity | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const requestId = record['request_id'];
+  const runId = record['run_id'];
+  const state = record['state'];
+  const jobId = record['job_id'];
+  const scope = record['scope'];
+  const command = record['command'];
+  const cwd = record['cwd'];
+  const head = record['head'];
+  const started = record['started'];
+  const completedAt = record['completed_at'];
+  if (typeof requestId !== 'string' || !VERIFICATION_REQUEST_ID_PATTERN.test(requestId)) return null;
+  if (typeof runId !== 'string' || runId === '') return null;
+  if (state !== 'completed' && state !== 'admission-failed' && state !== 'interrupted') return null;
+  if (
+    typeof jobId !== 'string' ||
+    typeof scope !== 'string' ||
+    typeof command !== 'string' ||
+    typeof cwd !== 'string'
+  ) {
+    return null;
+  }
+  if (head !== null && typeof head !== 'string') return null;
+  if (typeof started !== 'boolean') return null;
+  if (typeof completedAt !== 'number' || !Number.isFinite(completedAt)) return null;
+  return {
+    request_id: requestId,
+    run_id: runId,
+    state,
+    job_id: jobId,
+    scope,
+    command,
+    cwd,
+    head,
+    started,
+    completed_at: completedAt,
+  };
+}
 /** Cap on one streamed output frame (bytes of text). */
 const OUTPUT_FRAME_MAX_BYTES = 8 * 1024;
 
@@ -282,8 +556,8 @@ function splitFrames(text: string): readonly string[] {
   return frames;
 }
 
-/** Tracked HEAD state at run start (evidence binding). */
-function readGitState(cwd: string): { sha: string | null; trackedDirty: boolean } {
+/** Tracked HEAD state at submission and at run start (evidence binding). */
+export function readGitState(cwd: string): { sha: string | null; trackedDirty: boolean } {
   try {
     const sha = execFileSync('git', ['-C', cwd, 'rev-parse', 'HEAD'], {
       encoding: 'utf-8',
@@ -352,7 +626,16 @@ export class VerificationScheduler {
   private readonly disposeGraceMs: number;
   private readonly sweepIntervalMs: number;
   private readonly stateFile: string;
+  private readonly requestLogFile: string;
   private readonly slots = new Map<string, ActiveSlot>();
+  /** In-flight single-flight attempts by dedupe key (issue #159). */
+  private readonly attempts = new Map<string, Attempt>();
+  /** The same attempts by client request identity. */
+  private readonly attemptsByRequest = new Map<string, Attempt>();
+  /** Bounded terminal request history for reconnect reconciliation. */
+  private readonly requestHistory = new Map<string, RequestHistoryEntry>();
+  /** Append-only terminal identities: NEVER silently forgotten -> never rerun. */
+  private readonly requestIndex = new Map<string, TerminalIdentity>();
   private waiters: Waiter[] = [];
   private sweepTimer: NodeJS.Timeout | null = null;
   private started = false;
@@ -383,6 +666,7 @@ export class VerificationScheduler {
     this.disposeGraceMs = opts.disposeGraceMs ?? 3_000;
     this.sweepIntervalMs = opts.sweepIntervalMs ?? 15_000;
     this.stateFile = join(opts.storageDir, STATE_FILE);
+    this.requestLogFile = join(opts.storageDir, REQUEST_LOG_FILE);
   }
 
   /** Total workers allowed across all concurrent runs. */
@@ -427,7 +711,26 @@ export class VerificationScheduler {
     if (this.started) return;
     if (this.disposed) throw new VerificationDisposedError();
     mkdirSync(this.opts.storageDir, { recursive: true, mode: 0o700 });
-    for (const slot of this.loadState().slots) {
+    this.loadRequestIndex();
+    const persisted = this.loadState();
+    for (const attempt of persisted.attempts ?? []) {
+      this.requestHistory.set(attempt.request_id, {
+        state: attempt.state,
+        spec: {
+          jobId: attempt.job_id,
+          scope: attempt.scope,
+          command: attempt.command,
+          cwd: attempt.cwd,
+          head: attempt.head,
+        },
+        head: attempt.head,
+        completedAt: attempt.completed_at,
+        outcome: attempt.state === 'completed' ? outcomeFromPersisted(attempt) : null,
+        started: attempt.started,
+        error: attempt.error,
+      });
+    }
+    for (const slot of persisted.slots) {
       // A persisted slot never has an in-process child (this is a fresh
       // scheduler): it is an orphan candidate until proven dead or aged out.
       this.slots.set(slot.run_id, {
@@ -437,12 +740,14 @@ export class VerificationScheduler {
           scope: slot.scope,
           command: slot.command,
           cwd: slot.cwd,
+          head: slot.head ?? null,
           queuedAt: slot.granted_at,
           grantedAt: slot.granted_at,
         },
         pid: slot.pid,
         owned: false,
         child: null,
+        requestIds: slot.request_ids ?? [],
       });
     }
     this.reconcileStale();
@@ -481,6 +786,10 @@ export class VerificationScheduler {
         reason = 'max-age';
       }
       if (reason === null) continue;
+      // A started orphan's outcome is unrecorded: mark every bound identity
+      // interrupted so a reconnect reports the truth and refuses a rerun.
+      const interrupted =
+        slot.pid === null ? [] : this.markInterruptedIdentities(slot);
       this.slots.delete(runId);
       released.push({ runId, jobId: slot.lease.jobId, pid: slot.pid, reason, ageMs });
       this.safeRecord({
@@ -492,6 +801,7 @@ export class VerificationScheduler {
           scope: slot.lease.scope,
           reason,
           age_ms: ageMs,
+          interrupted_request_ids: interrupted,
         },
       });
       this.log('warn', 'stale verification holder released', {
@@ -515,18 +825,27 @@ export class VerificationScheduler {
    * atomically (no await between them), so racing callers can never both
    * pass a check for the last free slot.
    */
-  async acquire(spec: VerificationRunSpec, sink: VerificationProgressSink = () => {}): Promise<VerificationLease> {
+  async acquire(
+    spec: VerificationRunSpec,
+    sink: VerificationProgressSink = () => {},
+    runId: string = randomUUID(),
+  ): Promise<VerificationLease> {
     if (this.disposed) throw new VerificationDisposedError();
     if (!this.started) this.start();
     this.reconcileStale();
-    const runId = randomUUID();
     const queuedAt = this.now();
     if (this.slots.size < this.concurrencyLimit) {
       // Claim BEFORE the frame: the check and the insert must not be
       // separated by an await, or two racing callers could both pass.
       const lease = this.mintLease(runId, spec, queuedAt);
       const active = this.slots.size;
-      this.slots.set(runId, { lease, owned: true, pid: null, child: null });
+      this.slots.set(runId, {
+        lease,
+        owned: true,
+        pid: null,
+        child: null,
+        requestIds: spec.requestId === undefined ? [] : [spec.requestId],
+      });
       try {
         await sink({ type: 'queued', runId, position: 0, active, limit: this.concurrencyLimit });
       } catch (error) {
@@ -565,6 +884,7 @@ export class VerificationScheduler {
           jobId: spec.jobId,
           payload: {
             run_id: runId,
+            request_id: spec.requestId ?? null,
             scope: spec.scope,
             command: spec.command,
             wait_ms: waitMs,
@@ -611,23 +931,276 @@ export class VerificationScheduler {
   }
 
   /**
-   * The production entry: acquire, run the command in its lane worktree
-   * under the global budget, stream progress, release. The returned
-   * outcome is always produced (a failed/timed-out run is an outcome,
-   * a lock-wait timeout throws {@link VerificationLockTimeoutError}).
+   * The production entry: single-flight admission, run the command in its
+   * lane worktree under the global budget, stream progress, release. The
+   * returned outcome is always produced (a failed/timed-out run is an
+   * outcome, a lock-wait timeout throws {@link VerificationLockTimeoutError}).
+   *
+   * Identical submissions share ONE producer (issue #159): a duplicate
+   * attaches to the in-flight attempt and receives the same terminal
+   * outcome; a `request_id` replay of a completed attempt returns the
+   * RECORDED outcome (no rerun); a typed never-started admission failure
+   * may be retried. A changed head or a completed run is never permanently
+   * suppressed — a fresh submission mints a fresh producer.
    */
+  async submit(
+    spec: VerificationRunSpec,
+    sink: VerificationProgressSink = () => {},
+  ): Promise<VerificationOutcome> {
+    if (this.disposed) throw new VerificationDisposedError();
+    if (!this.started) this.start();
+    // A dead/orphaned holder must not masquerade as an in-flight duplicate.
+    this.reconcileStale();
+    const requestId = normalizeRequestId(spec.requestId);
+    const head = spec.head !== undefined ? spec.head : readGitState(spec.cwd).sha;
+    const resolvedSpec: VerificationRunSpec = { ...spec, head };
+    const key = attemptKey(resolvedSpec, head);
+
+    // Durable request identity first: a replay reconciles to the recorded
+    // terminal state instead of minting a second producer.
+    if (requestId !== null) {
+      const history = this.requestHistory.get(requestId);
+      if (history !== undefined) {
+        if (!sameSubmission(history.spec, history.head, resolvedSpec, head)) {
+          throw new VerificationRequestConflictError(requestId);
+        }
+        if (history.state === 'completed') {
+          if (history.outcome === null) {
+            // Recorded completion without a replayable outcome: rerunning
+            // would be a replay of unknown authority — refuse loud instead.
+            throw new Error(
+              `recorded outcome for request_id "${requestId}" is unreadable — refusing to rerun; inspect the ledger verification.completed record`,
+            );
+          }
+          await this.writeFrame(sink, {
+            type: 'completed',
+            runId: history.outcome.runId,
+            outcome: history.outcome,
+            reconciled: true,
+          });
+          this.safeRecord({
+            kind: 'verification.reconciled',
+            jobId: resolvedSpec.jobId,
+            payload: {
+              request_id: requestId,
+              run_id: history.outcome.runId,
+              state: 'completed',
+              scope: resolvedSpec.scope,
+              head,
+            },
+          });
+          return history.outcome;
+        }
+        // Admission failure with no started run: the retry is explicitly
+        // allowed — drop the record and admit a fresh attempt.
+        this.requestHistory.delete(requestId);
+        this.persistBestEffort();
+      }
+      // A live producer bound to this identity wins even when the head or
+      // command drifted while it waited: the accepted execution is the run
+      // the reconnect must reconcile with (its spawn-time head check
+      // reports any real drift honestly).
+      const bound = this.attemptsByRequest.get(requestId);
+      if (bound !== undefined) {
+        if (
+          bound.spec.jobId !== resolvedSpec.jobId ||
+          bound.spec.scope !== resolvedSpec.scope ||
+          bound.spec.cwd !== resolvedSpec.cwd
+        ) {
+          throw new VerificationRequestConflictError(requestId);
+        }
+        await this.attach(bound, sink, requestId);
+        return bound.promise;
+      }
+      // A terminal identity whose full outcome is no longer retained (evicted
+      // from the bounded history, or crash-interrupted) is NEVER rerun: the
+      // ledger holds the record; the caller mints a new identity.
+      const known = this.requestIndex.get(requestId);
+      if (known !== undefined) {
+        if (known.state === 'admission-failed') {
+          this.requestIndex.delete(requestId);
+        } else {
+          throw new VerificationRequestExpiredError(requestId, known.run_id, known.state);
+        }
+      }
+    }
+
+    const inFlight = this.attempts.get(key);
+    if (inFlight !== undefined) {
+      await this.attach(inFlight, sink, requestId);
+      return inFlight.promise;
+    }
+
+    // A persisted holder THIS process does not own already represents an
+    // identical submission (a restart orphan whose runner may be alive):
+    // refuse to mint a producer and name the run for reconciliation.
+    for (const slot of this.slots.values()) {
+      if (slot.owned) continue;
+      if (
+        slot.lease.jobId === resolvedSpec.jobId &&
+        slot.lease.scope === resolvedSpec.scope &&
+        slot.lease.cwd === resolvedSpec.cwd &&
+        slot.lease.command === resolvedSpec.command &&
+        (slot.lease.head == null || slot.lease.head === head)
+      ) {
+        throw new VerificationDuplicateError(slot.lease.runId, 'running');
+      }
+    }
+
+    const attempt = this.createAttempt(key, resolvedSpec, head, requestId, sink);
+    this.attempts.set(key, attempt);
+    for (const id of attempt.requestIds) this.attemptsByRequest.set(id, attempt);
+    this.safeRecord({
+      kind: 'verification.requested',
+      jobId: resolvedSpec.jobId,
+      payload: {
+        request_id: requestId,
+        run_id: attempt.runId,
+        scope: resolvedSpec.scope,
+        command: resolvedSpec.command,
+        cwd: resolvedSpec.cwd,
+        head,
+        dedupe_key: key,
+      },
+    });
+    void this.executeAttempt(attempt);
+    return attempt.promise;
+  }
+
+  /** Back-compat production entry; identical to {@link submit}. */
   async run(
     spec: VerificationRunSpec,
     sink: VerificationProgressSink = () => {},
   ): Promise<VerificationOutcome> {
-    const lease = await this.acquire(spec, sink);
-    try {
-      const outcome = await this.execute(lease, sink);
-      await sink({ type: 'completed', runId: lease.runId, outcome });
-      return outcome;
-    } finally {
-      this.release(lease);
+    return this.submit(spec, sink);
+  }
+
+  /**
+   * Reconcile surface (issue #159): answer accepted/running/completed/
+   * admission-failed for a request identity, or for a job/scope/head
+   * lookup. A completed attempt replays its recorded outcome; a started
+   * attempt is never replayable as a new run.
+   */
+  attemptStatus(lookup: VerificationAttemptLookup): VerificationAttemptStatus {
+    if (this.started) this.reconcileStale();
+    const requestId = normalizeRequestId(lookup.requestId);
+    if (requestId !== null) {
+      const inFlight = this.attemptsByRequest.get(requestId);
+      if (inFlight !== undefined) return statusFromAttempt(inFlight, requestId);
+      const history = this.requestHistory.get(requestId);
+      if (history !== undefined) {
+        return {
+          state: history.state,
+          requestId,
+          runId: history.outcome?.runId ?? null,
+          jobId: history.spec.jobId,
+          scope: history.spec.scope,
+          command: history.spec.command,
+          cwd: history.spec.cwd,
+          head: history.head,
+          trackedDirty: history.outcome?.trackedDirty ?? null,
+          started: history.started,
+          ...(history.outcome !== null ? { outcome: history.outcome } : {}),
+          ...(history.error !== null ? { error: history.error } : {}),
+        };
+      }
+      // A restart orphan keeps the request identity on its persisted holder
+      // so a reconnect still reconciles to the run instead of replaying.
+      for (const slot of this.slots.values()) {
+        if (!slot.requestIds.includes(requestId)) continue;
+        return {
+          state: slot.pid === null ? 'accepted' : 'running',
+          requestId,
+          runId: slot.lease.runId,
+          jobId: slot.lease.jobId,
+          scope: slot.lease.scope,
+          command: slot.lease.command,
+          cwd: slot.lease.cwd,
+          head: slot.lease.head,
+          trackedDirty: null,
+          started: slot.pid !== null,
+        };
+      }
+      // Durable terminal identities survive outcome eviction and restarts:
+      // report the terminal state (without the evicted outcome), never
+      // `unknown` — an unknown answer is not replay authority.
+      const known = this.requestIndex.get(requestId);
+      if (known !== undefined) {
+        return {
+          state: known.state,
+          requestId,
+          runId: known.run_id,
+          jobId: known.job_id,
+          scope: known.scope,
+          command: known.command,
+          cwd: known.cwd,
+          head: known.head,
+          trackedDirty: null,
+          started: known.started,
+        };
+      }
+      // An explicit unknown request identity never borrows another
+      // attempt's state through a job fallback.
+      return {
+        state: 'unknown',
+        requestId,
+        runId: null,
+        jobId: lookup.jobId ?? null,
+        scope: lookup.scope ?? null,
+        command: null,
+        cwd: lookup.cwd ?? null,
+        head: lookup.head ?? null,
+        trackedDirty: null,
+        started: false,
+      };
     }
+
+    const jobId = lookup.jobId !== undefined && lookup.jobId !== '' ? lookup.jobId : null;
+    if (jobId !== null) {
+      for (const attempt of this.attempts.values()) {
+        if (attempt.spec.jobId !== jobId) continue;
+        if (lookup.scope !== undefined && attempt.spec.scope !== lookup.scope) continue;
+        if (lookup.cwd !== undefined && attempt.spec.cwd !== lookup.cwd) continue;
+        if (lookup.head !== undefined && attempt.head !== lookup.head) continue;
+        return statusFromAttempt(attempt, null);
+      }
+      for (const slot of this.slots.values()) {
+        if (slot.owned || slot.lease.jobId !== jobId) continue;
+        if (lookup.scope !== undefined && slot.lease.scope !== lookup.scope) continue;
+        if (lookup.cwd !== undefined && slot.lease.cwd !== lookup.cwd) continue;
+        if (lookup.head !== undefined && slot.lease.head !== lookup.head) continue;
+        return {
+          state: 'running',
+          requestId: null,
+          runId: slot.lease.runId,
+          jobId: slot.lease.jobId,
+          scope: slot.lease.scope,
+          command: slot.lease.command,
+          cwd: slot.lease.cwd,
+          head: slot.lease.head,
+          trackedDirty: null,
+          started: true,
+        };
+      }
+    }
+
+    return {
+      state: 'unknown',
+      requestId,
+      runId: null,
+      jobId,
+      scope: lookup.scope ?? null,
+      command: null,
+      cwd: lookup.cwd ?? null,
+      head: lookup.head ?? null,
+      trackedDirty: null,
+      started: false,
+    };
+  }
+
+  /** In-flight attempt count by dedupe key (board/tests). */
+  inFlightCount(): number {
+    return this.attempts.size;
   }
 
   /** Terminate active runs and refuse new work (service shutdown). */
@@ -675,6 +1248,320 @@ export class VerificationScheduler {
   // Internals
   // ------------------------------------------------------------------
 
+  /** Mint the shared producer for one dedupe key. */
+  private createAttempt(
+    key: string,
+    spec: VerificationRunSpec,
+    head: string | null,
+    requestId: string | null,
+    sink: VerificationProgressSink,
+  ): Attempt {
+    let resolveAttempt!: (outcome: VerificationOutcome) => void;
+    let rejectAttempt!: (error: Error) => void;
+    const promise = new Promise<VerificationOutcome>((resolve, reject) => {
+      resolveAttempt = resolve;
+      rejectAttempt = reject;
+    });
+    return {
+      key,
+      runId: randomUUID(),
+      spec,
+      head,
+      requestIds: new Set(requestId === null ? [] : [requestId]),
+      sinks: new Set([sink]),
+      promise,
+      resolve: resolveAttempt,
+      reject: rejectAttempt,
+      queue: Promise.resolve(),
+      started: false,
+      outcome: null,
+      lease: null,
+    };
+  }
+
+  /** Attach a duplicate submission to the in-flight producer (issue #159). */
+  private async attach(
+    attempt: Attempt,
+    sink: VerificationProgressSink,
+    requestId: string | null,
+  ): Promise<void> {
+    attempt.sinks.add(sink);
+    if (requestId !== null) {
+      attempt.requestIds.add(requestId);
+      this.attemptsByRequest.set(requestId, attempt);
+      const slot = this.slots.get(attempt.runId);
+      if (slot !== undefined) slot.requestIds = [...attempt.requestIds];
+      this.persistBestEffort();
+    }
+    this.safeRecord({
+      kind: 'verification.attached',
+      jobId: attempt.spec.jobId,
+      payload: {
+        request_id: requestId,
+        run_id: attempt.runId,
+        scope: attempt.spec.scope,
+        head: attempt.head,
+        state: attempt.started ? 'running' : 'queued',
+      },
+    });
+    // The attach acknowledgement is for THIS caller only — existing
+    // subscribers must not receive another client's request identity.
+    await this.broadcastTo(attempt, sink, {
+      type: 'attached',
+      runId: attempt.runId,
+      state: attempt.started ? 'running' : 'queued',
+      requestId,
+      head: attempt.head,
+      dedupeKey: attempt.key,
+    });
+    // A terminal frame is enqueued with a snapshot of the sinks that existed
+    // at that instant. An attach whose `attached` frame was queued after that
+    // snapshot would otherwise end at EOF without a completed frame: deliver
+    // the recorded outcome to this sink explicitly (still queue-ordered).
+    if (attempt.outcome !== null) {
+      await this.broadcastTo(attempt, sink, {
+        type: 'completed',
+        runId: attempt.runId,
+        outcome: attempt.outcome,
+      });
+    }
+  }
+
+  /**
+   * Queue a frame for ONE sink only, preserving this attempt's frame order.
+   * Used by attach() so the acknowledgement and a late terminal frame stay
+   * private to the attaching caller while output frames go to every sink.
+   */
+  private broadcastTo(
+    attempt: Attempt,
+    sink: VerificationProgressSink,
+    frame: VerificationProgress,
+  ): Promise<void> {
+    attempt.queue = attempt.queue.then(async () => {
+      try {
+        await sink(frame);
+      } catch (error) {
+        attempt.sinks.delete(sink);
+        this.log('warn', 'verification sink write failed; sink dropped', {
+          run: attempt.runId,
+          error: String(error),
+        });
+      }
+    });
+    return attempt.queue;
+  }
+
+  /**
+   * Serialized fan-out to every sink of one attempt. `attached` frames are
+   * enqueued behind any terminal frame already queued; a sink that throws
+   * is dropped without failing the run (the ledger outcome is the record).
+   */
+  private broadcast(attempt: Attempt, frame: VerificationProgress): Promise<void> {
+    // Snapshot the sinks at enqueue time: a sink that attaches AFTER an
+    // already-queued frame must not receive that frame out of order — its
+    // first frame is the `attached` one enqueued by attach().
+    const targets = [...attempt.sinks];
+    attempt.queue = attempt.queue.then(async () => {
+      for (const sink of targets) {
+        try {
+          await sink(frame);
+        } catch (error) {
+          attempt.sinks.delete(sink);
+          this.log('warn', 'verification sink write failed; sink dropped', {
+            run: attempt.runId,
+            error: String(error),
+          });
+        }
+      }
+    });
+    return attempt.queue;
+  }
+
+  /** Best-effort single-sink write (reconcile replay). */
+  private async writeFrame(sink: VerificationProgressSink, frame: VerificationProgress): Promise<void> {
+    try {
+      await sink(frame);
+    } catch (error) {
+      this.log('warn', 'verification sink write failed', {
+        run: frame.runId,
+        error: String(error),
+      });
+    }
+  }
+
+  /** Run one admitted attempt and settle every attached caller exactly once. */
+  private async executeAttempt(attempt: Attempt): Promise<void> {
+    try {
+      const lease = await this.acquire(
+        attempt.spec,
+        (frame) => this.broadcast(attempt, frame),
+        attempt.runId,
+      );
+      attempt.lease = lease;
+      // Sync every request identity bound while the attempt was queued so a
+      // restart orphan still reconciles by request id, not just by key.
+      const slot = this.slots.get(lease.runId);
+      if (slot !== undefined) slot.requestIds = [...attempt.requestIds];
+      this.persistBestEffort();
+      const outcome = await this.execute(lease, (frame) => {
+        if (frame.type === 'started') attempt.started = true;
+        return this.broadcast(attempt, frame);
+      });
+      attempt.outcome = outcome;
+      await this.broadcast(attempt, { type: 'completed', runId: lease.runId, outcome });
+      this.rememberHistory(attempt, { state: 'completed', outcome, error: null });
+      attempt.resolve(outcome);
+    } catch (error) {
+      const failure = error instanceof Error ? error : new Error(String(error));
+      this.rememberHistory(attempt, {
+        state: failure instanceof VerificationLockTimeoutError ? 'admission-failed' : null,
+        outcome: null,
+        error:
+          failure instanceof VerificationLockTimeoutError
+            ? { code: failure.code, detail: failure.message }
+            : failure instanceof VerificationDisposedError || failure instanceof VerificationDuplicateError
+              ? null
+              : { code: 'verification_failed', detail: failure.message },
+      });
+      attempt.reject(failure);
+    } finally {
+      this.attempts.delete(attempt.key);
+      for (const requestId of attempt.requestIds) this.attemptsByRequest.delete(requestId);
+      if (attempt.lease !== null) this.release(attempt.lease);
+    }
+  }
+
+  /** Record (or forget) every bound request identity for reconciliation. */
+  private rememberHistory(
+    attempt: Attempt,
+    terminal: {
+      readonly state: 'completed' | 'admission-failed' | null;
+      readonly outcome: VerificationOutcome | null;
+      readonly error: { code: string; detail: string } | null;
+    },
+  ): void {
+    if (attempt.requestIds.size === 0) return;
+    for (const requestId of attempt.requestIds) {
+      if (terminal.state === null) {
+        this.requestHistory.delete(requestId);
+        continue;
+      }
+      const completedAt = this.now();
+      this.requestHistory.set(requestId, {
+        state: terminal.state,
+        spec: attempt.spec,
+        head: attempt.head,
+        completedAt,
+        outcome: terminal.outcome,
+        started: attempt.started,
+        error: terminal.error,
+      });
+      this.appendTerminalIdentity({
+        request_id: requestId,
+        run_id: attempt.outcome?.runId ?? attempt.runId,
+        state: terminal.state,
+        job_id: attempt.spec.jobId,
+        scope: attempt.spec.scope,
+        command: attempt.spec.command,
+        cwd: attempt.spec.cwd,
+        head: attempt.head,
+        started: attempt.started,
+        completed_at: completedAt,
+      });
+    }
+    while (this.requestHistory.size > MAX_REQUEST_HISTORY) {
+      const oldest = this.requestHistory.keys().next().value;
+      if (oldest === undefined) break;
+      this.requestHistory.delete(oldest);
+    }
+    this.persistBestEffort();
+  }
+
+  /** Load the append-only terminal identity index (torn tails skipped loud). */
+  private loadRequestIndex(): void {
+    let text: string;
+    try {
+      text = readFileSync(this.requestLogFile, 'utf-8');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+      throw new Error(`verification request log ${this.requestLogFile} is unreadable: ${String(error)}`);
+    }
+    for (const line of text.split('\n')) {
+      if (line.trim() === '') continue;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        this.log('warn', 'verification request log line skipped: not valid JSON', {
+          path: this.requestLogFile,
+        });
+        continue;
+      }
+      const record = parseTerminalIdentity(parsed);
+      if (record === null) {
+        this.log('warn', 'verification request log line skipped: unsupported shape', {
+          path: this.requestLogFile,
+        });
+        continue;
+      }
+      this.requestIndex.set(record.request_id, record);
+    }
+  }
+
+  /** Append one terminal identity (append-only; the log is never rewritten). */
+  private appendTerminalIdentity(record: TerminalIdentity): void {
+    this.requestIndex.set(record.request_id, record);
+    try {
+      appendFileSync(this.requestLogFile, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+    } catch (error) {
+      this.log('error', 'verification request identity append failed', {
+        path: this.requestLogFile,
+        request: record.request_id,
+        error: String(error),
+      });
+    }
+  }
+
+  /** Mark a released orphan's bound identities interrupted (started, no outcome). */
+  private markInterruptedIdentities(slot: ActiveSlot): string[] {
+    const marked: string[] = [];
+    for (const requestId of slot.requestIds) {
+      if (this.requestIndex.has(requestId)) continue;
+      this.appendTerminalIdentity({
+        request_id: requestId,
+        run_id: slot.lease.runId,
+        state: 'interrupted',
+        job_id: slot.lease.jobId,
+        scope: slot.lease.scope,
+        command: slot.lease.command,
+        cwd: slot.lease.cwd,
+        head: slot.lease.head,
+        started: slot.pid !== null,
+        completed_at: this.now(),
+      });
+      marked.push(requestId);
+    }
+    return marked;
+  }
+
+  private persistedAttempts(): PersistedAttempt[] {
+    return [...this.requestHistory.entries()].map(([requestId, entry]) => ({
+      request_id: requestId,
+      run_id: entry.outcome?.runId ?? '',
+      job_id: entry.spec.jobId,
+      scope: entry.spec.scope,
+      command: entry.spec.command,
+      cwd: entry.spec.cwd,
+      head: entry.head,
+      tracked_dirty: entry.outcome?.trackedDirty ?? false,
+      started: entry.started,
+      state: entry.state,
+      completed_at: entry.completedAt,
+      outcome: entry.outcome === null ? null : compactOutcome(entry.outcome),
+      error: entry.error,
+    }));
+  }
+
   private mintLease(runId: string, spec: VerificationRunSpec, queuedAt: number): VerificationLease {
     return {
       runId,
@@ -682,6 +1569,7 @@ export class VerificationScheduler {
       scope: spec.scope,
       command: spec.command,
       cwd: spec.cwd,
+      head: spec.head ?? null,
       queuedAt,
       grantedAt: this.now(),
     };
@@ -705,7 +1593,13 @@ export class VerificationScheduler {
       waiter.settled = true;
       if (waiter.timer !== null) clearTimeout(waiter.timer);
       const lease = this.mintLease(waiter.runId, waiter.spec, waiter.queuedAt);
-      this.slots.set(waiter.runId, { lease, owned: true, pid: null, child: null });
+      this.slots.set(waiter.runId, {
+        lease,
+        owned: true,
+        pid: null,
+        child: null,
+        requestIds: waiter.spec.requestId === undefined ? [] : [waiter.spec.requestId],
+      });
       waiter.resolve(lease);
     }
   }
@@ -718,6 +1612,39 @@ export class VerificationScheduler {
     const git = readGitState(lease.cwd);
     const slot = this.slots.get(lease.runId);
     if (slot === undefined) throw new VerificationDisposedError(); // disposed between grant and spawn
+    // Exact-head evidence: a queue wait can span a push. Running the new
+    // head under the old submission would silently verify the wrong
+    // revision, so fail honestly instead (no spawn, no false PASS).
+    if (lease.head !== null && git.sha !== lease.head) {
+      const outcome: VerificationOutcome = {
+        runId: lease.runId,
+        jobId: lease.jobId,
+        scope: lease.scope,
+        command: lease.command,
+        cwd: lease.cwd,
+        ok: false,
+        exitCode: null,
+        signal: null,
+        timedOut: false,
+        queuedMs: this.now() - lease.queuedAt,
+        durationMs: 0,
+        sha: git.sha,
+        trackedDirty: git.trackedDirty,
+        workers,
+        outputBytes: 0,
+        outputSha256: createHash('sha256').digest('hex'),
+        outputTail: '',
+        error:
+          `head_changed: lane moved from ${lease.head} to ${git.sha ?? 'unknown'} before the run started — ` +
+          'a changed head is a new verification, never a replay',
+      };
+      this.safeRecord({
+        kind: 'verification.completed',
+        jobId: lease.jobId,
+        payload: outcomePayload(outcome),
+      });
+      return outcome;
+    }
     const child = spawn('/bin/sh', ['-c', lease.command], {
       cwd: lease.cwd,
       env: verificationEnvironment(process.env, {
@@ -871,7 +1798,14 @@ export class VerificationScheduler {
     if (state === null || typeof state !== 'object' || state.version !== 1 || !Array.isArray(state.slots)) {
       throw new Error(`verification scheduler state ${this.stateFile} has an unsupported shape (version must be 1)`);
     }
-    return { version: 1, slots: state.slots as readonly PersistedSlot[] };
+    if (state.attempts !== undefined && !Array.isArray(state.attempts)) {
+      throw new Error(`verification scheduler state ${this.stateFile} has an unsupported attempts shape`);
+    }
+    return {
+      version: 1,
+      slots: state.slots as readonly PersistedSlot[],
+      attempts: (state.attempts ?? []) as readonly PersistedAttempt[],
+    };
   }
 
   /** Atomic persist: the file is replaced whole, never half-written. */
@@ -885,8 +1819,11 @@ export class VerificationScheduler {
         scope: slot.lease.scope,
         command: slot.lease.command,
         cwd: slot.lease.cwd,
+        head: slot.lease.head,
+        request_ids: slot.requestIds,
         granted_at: slot.lease.grantedAt,
       })),
+      attempts: this.persistedAttempts(),
     };
     const temporary = `${this.stateFile}.tmp-${process.pid}-${this.now()}`;
     writeFileSync(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
@@ -926,6 +1863,62 @@ export class VerificationScheduler {
       this.log('error', `verification ${name} callback failed`, { error: String(error) });
     }
   }
+}
+
+/** The reconcile status for one in-flight attempt. */
+function statusFromAttempt(attempt: Attempt, requestId: string | null): VerificationAttemptStatus {
+  return {
+    state: attempt.started ? 'running' : 'accepted',
+    requestId,
+    runId: attempt.runId,
+    jobId: attempt.spec.jobId,
+    scope: attempt.spec.scope,
+    command: attempt.spec.command,
+    cwd: attempt.spec.cwd,
+    head: attempt.head,
+    trackedDirty: null,
+    started: attempt.started,
+  };
+}
+
+/** Bound the persisted output tail (the full tail lives in the ledger). */
+function compactOutcome(outcome: VerificationOutcome): Record<string, unknown> {
+  return { ...outcome, outputTail: outcome.outputTail.slice(-PERSISTED_TAIL_CHARS) };
+}
+
+/** Reconstruct a persisted completed outcome; null when the record is unreadable. */
+function outcomeFromPersisted(attempt: PersistedAttempt): VerificationOutcome | null {
+  const payload = attempt.outcome;
+  if (payload === null || attempt.run_id === '') return null;
+  const text = (key: string): string | null => (typeof payload[key] === 'string' ? (payload[key] as string) : null);
+  const number = (key: string): number | null =>
+    typeof payload[key] === 'number' && Number.isFinite(payload[key]) ? (payload[key] as number) : null;
+  const flag = (key: string, fallback: boolean): boolean =>
+    typeof payload[key] === 'boolean' ? (payload[key] as boolean) : fallback;
+  const scope = text('scope');
+  const command = text('command');
+  const cwd = text('cwd');
+  if (scope === null || command === null || cwd === null) return null;
+  return {
+    runId: attempt.run_id,
+    jobId: attempt.job_id,
+    scope,
+    command,
+    cwd,
+    ok: flag('ok', false),
+    exitCode: number('exitCode'),
+    signal: text('signal'),
+    timedOut: flag('timedOut', false),
+    queuedMs: number('queuedMs') ?? 0,
+    durationMs: number('durationMs') ?? 0,
+    sha: text('sha'),
+    trackedDirty: flag('trackedDirty', false),
+    workers: number('workers') ?? 1,
+    outputBytes: number('outputBytes') ?? 0,
+    outputSha256: text('outputSha256') ?? '',
+    outputTail: text('outputTail') ?? '',
+    error: text('error'),
+  };
 }
 
 /** The ledger payload for a completed run (also what review evidence reads). */

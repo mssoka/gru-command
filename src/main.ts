@@ -20,9 +20,11 @@ import { TranscriptService } from './transcripts/service.js';
 import { DispatchService } from './dispatch/service.js';
 import { WorktreeManager } from './worktrees/manager.js';
 import { createWorktreeServer } from './worktrees/server.js';
-import { AutoVerdictPoster, WaveRunner } from './dispatch/perkins.js';
+import { WaveRunner } from './dispatch/perkins.js';
+import { createReviewEscalationNotifier } from './dispatch/escalation-identity.js';
+import { createStartupVerdictPoster } from './dispatch/perkins-github-app.js';
 import { BobScheduler } from './dispatch/bob-scheduler.js';
-import { SilasDriver } from './dispatch/silas-driver.js';
+import { SilasDriver, supervisionLookup } from './dispatch/silas-driver.js';
 import { ProviderRecoverySensor, establishProviderWait } from './provider-recovery/sensor.js';
 import { ModelRuntimeProbe } from './provider-recovery/probe.js';
 import {
@@ -1034,7 +1036,7 @@ async function main(): Promise<number> {
     workerGate: pacing.gate,
     rateLimitBackoff: pacing.backoff,
     retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
-    poster: new AutoVerdictPoster(),
+    poster: createStartupVerdictPoster(config),
     reserveReviewRound: (signal) => registry.reserveReviewRound(signal),
     maxConcurrentChildren: config.review.maxConcurrentChildren,
     bus,
@@ -1054,9 +1056,10 @@ async function main(): Promise<number> {
         owner: 'bmad-review-gate',
       }),
     },
-    escalate: (title, detail) => {
-      notifications.post({ kind: 'review-escalation', routing: 'action-required', severity: 'error', title, detail });
-    },
+    // Wave escalations carry bounded per-call identity context; the
+    // notifier binds the row through the existing agentId field only when
+    // that identity is consistent (see src/dispatch/escalation-identity.ts).
+    escalate: createReviewEscalationNotifier(ledger, notifications),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   state.wave = wave;
@@ -1085,6 +1088,7 @@ async function main(): Promise<number> {
       examined: rebriefRecovery.examined,
       completed: rebriefRecovery.completed,
       redispatched: rebriefRecovery.redispatched,
+      retired: rebriefRecovery.retired,
     });
   }
   // Directive-request restart safety (phase 3): a request accepted before
@@ -1386,6 +1390,11 @@ async function main(): Promise<number> {
         configPath: configPathFor(config.instanceDir),
       },
       bus,
+      // Same live stop truth the board renders: a supervision-stopped
+      // worker is waiting on a human re-arm, never a stalled lane. The
+      // getter keeps the lookup late-bound like the engine's closure — a
+      // construction-order change can never freeze a null handle (A4).
+      supervisionFor: supervisionLookup(() => supervisor),
       // Chief phase-3 seam: every deterministic Silas pass (bus wake events
       // and sweep ticks) reconsidered pending review handoffs BEFORE any
       // LLM wake — bounded, no-overlap, fence-preserving.

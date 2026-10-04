@@ -113,6 +113,7 @@ export type GruAwarenessLedger = Pick<
   | 'recordNotification'
   | 'resolveNotificationById'
   | 'listJobs'
+  | 'listAgents'
 >;
 
 export interface GruAwarenessOptions {
@@ -243,7 +244,12 @@ const DIGEST_RULES: Readonly<Record<string, (event: EventRecord) => string | nul
     const verdict = textOf(payloadOf(event).canonicalVerdict);
     return `round ${event.roundId ?? '?'}: report posted to the pull request${verdict !== null ? ` (${verdict})` : ''}`;
   },
-  'round.head-moved': (event) => `round ${event.roundId ?? '?'}: head moved after freeze — verdict invalidated`,
+  'round.head-moved': (event) => {
+    const cause = textOf(payloadOf(event).cause);
+    return cause === null
+      ? `round ${event.roundId ?? '?'}: head moved after freeze — verdict invalidated`
+      : `round ${event.roundId ?? '?'}: review source changed after freeze (${cause}) — verdict invalidated`;
+  },
   'round.post-recovered': (event) => {
     const verdict = textOf(payloadOf(event).postedVerdict);
     return `round ${event.roundId ?? '?'}: recorded verdict recovered after restart${verdict !== null ? ` (${verdict})` : ''}`;
@@ -485,18 +491,36 @@ export class GruAwareness {
     // A delivered context block is not a disposition. Open machine and
     // owner stops remain in subsequent user turns even after the event
     // cursor advanced; only an active wake uses its exclusive bounded batch.
-    const openAttention = (() => {
-      if (exclusiveWake) return [];
+    // Closed receipts (owner decision D1, code review 2026-10-04): machine
+    // rows bound through an agent to a merged/done job are the board's
+    // receipts. They are LABELED here and rendered under their own
+    // section, never counted as machine attention and never wake seeds.
+    const attention = (() => {
+      if (exclusiveWake) return { live: [] as NotificationRecord[], receipts: [] as NotificationRecord[] };
       const owners = this.ledger.listNotifications({ routing: 'needs-owner', unackedOnly: true, limit: this.limits.maxActionNotes });
-      const machines = this.ledger.listNotifications({ routing: 'action-required', unackedOnly: true, limit: this.limits.maxActionNotes });
+      const machineRows = this.ledger.listNotifications({
+        routing: 'action-required',
+        unackedOnly: true,
+        // Overfetch so receipts cannot crowd live rows out of the page;
+        // each side is then sliced to the block's bounded slots.
+        limit: Math.max(this.limits.maxActionNotes * 4, 16),
+      });
+      const { receipts, live } = this.classifyNotifications(machineRows);
+      const receiptRows = machineRows
+        .filter((row) => receipts.has(row.id))
+        .slice(0, this.limits.maxActionNotes);
       // Keep both queues represented in a bounded user block. One busy
       // category must not silently crowd out the other indefinitely.
-      const ownerSlots = machines.length > 0 && this.limits.maxActionNotes > 1
+      const ownerSlots = live.length > 0 && this.limits.maxActionNotes > 1
         ? Math.ceil(this.limits.maxActionNotes / 2) : this.limits.maxActionNotes;
       const selectedOwners = owners.slice(0, ownerSlots);
-      return [...selectedOwners, ...machines.slice(0, this.limits.maxActionNotes - selectedOwners.length),
-        ...owners.slice(ownerSlots, this.limits.maxActionNotes)];
+      return {
+        live: [...selectedOwners, ...live.slice(0, this.limits.maxActionNotes - selectedOwners.length),
+          ...owners.slice(ownerSlots, this.limits.maxActionNotes)],
+        receipts: receiptRows,
+      };
     })();
+    const openAttention = attention.live;
     if (latest <= this.cursor && this.pendingWakeIds.size === 0 && morning === null && openAttention.length === 0) return null;
 
     const reverse = <T>(items: readonly T[]): T[] => [...items].reverse();
@@ -528,6 +552,7 @@ export class GruAwareness {
     // have covered an event before the wake policy was enabled. The active
     // batch is exclusive — never include/claim an unrelated new row in it.
     const notes: { id: string; line: string }[] = [];
+    const receiptNotes: { id: string; line: string }[] = [];
     const seenIds = new Set<string>();
     const addNote = (id: string): void => {
       if (seenIds.has(id) || notes.length >= this.limits.maxActionNotes) return;
@@ -541,11 +566,31 @@ export class GruAwareness {
       const icon = row.routing === 'action-required' ? '⚠' : row.routing === 'needs-owner' ? '🔔' : 'ℹ';
       notes.push({ id, line: `- ${icon} [${id}] title=${JSON.stringify(row.title)}${detail} (routing: ${row.routing})` });
     };
+    const addReceipt = (id: string): void => {
+      if (receiptNotes.length >= this.limits.maxActionNotes) return;
+      const row = this.ledger.getNotification(id);
+      if (row === null || row.ackedAt !== null || row.resolvedAt !== null) return;
+      const detail = row.detail !== null && row.detail !== '' ? ` — ${JSON.stringify(row.detail)}` : '';
+      receiptNotes.push({
+        id,
+        line: `- 🧾 [${id}] title=${JSON.stringify(row.title)}${detail} (closed receipt — no action required)`,
+      });
+    };
     if (exclusiveWake) {
       for (const id of this.activeWakeIds ?? []) addNote(id);
     } else {
       for (const row of openAttention) addNote(row.id);
-      for (const id of this.pendingWakeIds) addNote(id);
+      for (const row of attention.receipts) addReceipt(row.id);
+      for (const id of this.pendingWakeIds) {
+        const row = this.ledger.getNotification(id);
+        if (row !== null && this.isReceiptNotification(row.agentId)) {
+          // A stored seed for a row that became a receipt (or predates
+          // this rule) is dropped here, never woken.
+          this.pendingWakeIds.delete(id);
+          continue;
+        }
+        addNote(id);
+      }
     }
     if (!exclusiveWake && notes.length < this.limits.maxActionNotes) {
       // The event scan covers newly triaged rows as well as the SQL-backed
@@ -559,9 +604,12 @@ export class GruAwareness {
         .filter((event) => payloadOf(event)['routing'] === 'action-required' || payloadOf(event)['routing'] === 'needs-owner')
         .map((event) => textOf(payloadOf(event)['id']))
         .filter((id): id is string => id !== null);
-      for (const id of [...eventIds].reverse()) addNote(id);
+      for (const id of [...eventIds].reverse()) {
+        if (this.isReceiptNotification(this.ledger.getNotification(id)?.agentId ?? null)) continue;
+        addNote(id);
+      }
     }
-    const rendered = this.render(notes, digestLines, overflow, morning);
+    const rendered = this.render(notes, receiptNotes, digestLines, overflow, morning);
     if (rendered === null) return null;
     if (exclusiveWake && rendered.ids.length === 0) {
       this.log('error', 'wake context has no visible notification IDs; increase awareness line/byte limits', {
@@ -698,6 +746,7 @@ export class GruAwareness {
 
   private render(
     actionNotes: readonly { id: string; line: string }[],
+    receiptNotes: readonly { id: string; line: string }[],
     digestLines: readonly string[],
     overflow: boolean,
     morning: readonly string[] | null,
@@ -725,6 +774,11 @@ export class GruAwareness {
       for (const note of actionNotes) {
         // Never claim an ID whose identifier was clipped by the line/byte
         // bounds. A truncated title is fine; an invisible ID is not.
+        if (push(note.line) && parts.at(-1)?.includes(`[${note.id}]`)) ids.push(note.id);
+      }
+    }
+    if (receiptNotes.length > 0 && push('Closed receipts (no action required; kept for reference):')) {
+      for (const note of receiptNotes) {
         if (push(note.line) && parts.at(-1)?.includes(`[${note.id}]`)) ids.push(note.id);
       }
     }
@@ -823,9 +877,15 @@ export class GruAwareness {
     const payload = payloadOf(event);
     const id = textOf(payload['id']);
     if (id === null) return;
-    // Terminal rows never wake — the human already closed the item.
+    // Terminal rows never wake — the human already closed the item. A row
+    // that is now a closed receipt is not wake-eligible either; drop any
+    // stored seed it may hold (owner decision D1).
     const row = this.ledger.getNotification(id);
     if (row === null || row.ackedAt !== null || row.resolvedAt !== null) return;
+    if (this.isReceiptNotification(row.agentId)) {
+      if (this.pendingWakeIds.delete(row.id)) this.persistWakeState();
+      return;
+    }
     this.considerCandidate({ id: row.id, routing: row.routing, severity: row.severity });
   }
 
@@ -908,7 +968,13 @@ export class GruAwareness {
           unackedOnly: true, ...(this.wakeMode === 'action-required' ? { routing: 'action-required' as const } : {}),
           limit: MAX_BACKLOG_SEED, offset,
         });
-        for (const row of rows) {
+        const { receipts, live } = this.classifyNotifications(rows);
+        // A closed receipt is never a wake seed; a stored seed for one is
+        // dropped (owner decision D1, code review 2026-10-04).
+        for (const row of receipts) {
+          if (this.pendingWakeIds.delete(row)) seeded = true;
+        }
+        for (const row of live) {
           if (this.wakePolicy.decide({ id: row.id, routing: row.routing, severity: row.severity }, this.now()).action === 'skip') continue;
           this.pendingWakeIds.add(row.id);
           seeded = true;
@@ -921,6 +987,46 @@ export class GruAwareness {
     }
     if (seeded) this.persistWakeState();
     this.flushPendingWakes();
+  }
+
+  /** The ONE receipt rule for every Gru-facing reader (owner decision D1):
+   * a machine row bound through an agent to a merged/done job is a closed
+   * receipt, not live machine attention. The same rule the board renders;
+   * unknown/unbound rows stay live. */
+  private classifyNotifications<T extends { readonly id: string; readonly agentId: string | null }>(
+    rows: readonly T[],
+  ): { readonly receipts: Set<string>; readonly live: T[] } {
+    const concluded = new Set(
+      this.ledger
+        .listJobs()
+        .filter((job) => job.status === 'merged' || job.status === 'done')
+        .map((job) => job.id),
+    );
+    if (concluded.size === 0) return { receipts: new Set(), live: [...rows] };
+    const agentJob = new Map(
+      this.ledger
+        .listAgents()
+        .filter((agent) => agent.jobId !== null)
+        .map((agent) => [agent.id, agent.jobId as string]),
+    );
+    const receipts = new Set<string>();
+    const live: T[] = [];
+    for (const row of rows) {
+      const jobId = row.agentId === null ? null : agentJob.get(row.agentId) ?? null;
+      if (jobId !== null && concluded.has(jobId)) receipts.add(row.id);
+      else live.push(row);
+    }
+    return { receipts, live };
+  }
+
+  /** Single-row form of {@link classifyNotifications} for event-time and
+   * stored-seed checks. */
+  private isReceiptNotification(agentId: string | null): boolean {
+    if (agentId === null) return false;
+    const agent = this.ledger.listAgents().find((candidate) => candidate.id === agentId);
+    if (agent === undefined || agent.jobId === null) return false;
+    const job = this.ledger.listJobs().find((candidate) => candidate.id === agent.jobId);
+    return job !== undefined && (job.status === 'merged' || job.status === 'done');
   }
 
   /** Release the pending batch as ONE turn when the schedule allows; while

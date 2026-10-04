@@ -25,3 +25,53 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-gc-packaged-build-playbook.md`
   summary: The fallback response field `clear_to_merge` keeps its historical name while meaning only "review/fix routing cleared" (never a Perkins READY or merge clearance).
   evidence: Renaming is a wire-API change with external consumers; the meaning is documented at the emission site and the owner-held merge marker plus the absence of a Perkins round are now pinned, but the field name itself remains naming debt. Final-review row 73 (blind), deferred 2026-10-03 at head 718249d.
+- source_spec: `_bmad-output/implementation-artifacts/spec-pr142-review-verdict-closure.md`
+  summary: App review reconciliation can certify absence from a review-list record missing delivery-predicate fields.
+  evidence: Inherited from main e75ca3d; `isDecidableReviewEntry` permits absent state/commit_id/body/submitted_at, while a short `lookupMatchingReview` page can certify non-delivery. Blind 1, Edge 2 and Verification Other 1 share this defect.
+- source_spec: `_bmad-output/implementation-artifacts/spec-pr142-review-verdict-closure.md`
+  summary: App reconciliation refuses otherwise matching provider-quoted review IDs accepted by the receipt contract.
+  evidence: Inherited from main e75ca3d; `usableProviderReviewId` accepts string IDs but `isDecidableReviewEntry` rejects them before matching, leaving an ambiguous POST unresolved.
+- source_spec: `_bmad-output/implementation-artifacts/spec-pr142-review-verdict-closure.md`
+  summary: An unrelated malformed App review-list entry prevents crediting a complete matching review on the same page.
+  evidence: Inherited from main e75ca3d; the whole-page `list.some(!isDecidableReviewEntry)` throws before `reviews.find(isMatchingAppReview)` runs, even though positive identity is independently verifiable.
+- source_spec: `_bmad-output/implementation-artifacts/spec-pr142-review-verdict-closure.md`
+  summary: App installation token is not rechecked for expiry immediately before the irreversible review POST.
+  evidence: Inherited from main e75ca3d; the pre-mint check permits roughly 30 seconds of remaining life, but the identity and PR probes can together consume that window before the POST.
+- source_spec: `_bmad-output/implementation-artifacts/spec-pr142-review-verdict-closure.md`
+  summary: A direct fallback review may pass after its job is blocked or parked during the reviewer turn.
+  evidence: Inherited from main e75ca3d; the post-await guard only rejects terminal state/working hops and checks review authorization for handoffs, not direct gates. Blind 6 and Edge 3 share this defect.
+- source_spec: `_bmad-output/implementation-artifacts/spec-pr142-review-verdict-closure.md`
+  summary: Silas digest may publish a stale review candidate after it becomes blocked or parked during another candidate's awaited history.
+  evidence: Inherited from main e75ca3d; `prWithoutReview` intake requires review-eligible status, but final filtering excludes only merged/done and pending markers.
+- source_spec: `_bmad-output/implementation-artifacts/spec-pr142-review-verdict-closure.md`
+  summary: A fallback review can pass a working-tree diff changed during its asynchronous reviewer turn.
+  evidence: Inherited from main e75ca3d; `recheckRound` watches ledger markers/status/settlement, but not the captured diff or HEAD; an independent lane edit with no ledger event can obsolete the reviewed bytes.
+- source_spec: `_bmad-output/implementation-artifacts/spec-pr142-review-verdict-closure.md`
+  summary: Completed re-brief markers can clear without publishing the durable settlement wake when the append fails.
+  evidence: Inherited from main e75ca3d; completion clears markers in one transaction, then appends `silas.rebrief-settled` separately; no pending markers remain to trigger another recovery pass or live queued-handoff retry if append fails.
+- source_spec: `_bmad-output/implementation-artifacts/spec-pr142-review-verdict-closure.md`
+  summary: Historical App baseline scope labels an intermediate pinned test version as the final current contract.
+  evidence: Inherited from main e75ca3d; `tools/app-contract-baseline.sh` overlays `0c4e129` tests and suite pin, so registration is self-consistent but newer current App oracles do not run against the historical baseline.
+- source_spec: `_bmad-output/implementation-artifacts/spec-pr142-review-verdict-closure.md`
+  summary: App publication runbook calls an unproven ambiguous POST safe to retry after a visual review check.
+  evidence: Inherited from main e75ca3d; `docs/PERKINS-APP-PUBLICATION.md` states that otherwise it was not delivered, even though incomplete lists and eventual provider visibility cannot prove absence.
+- source_spec: `_bmad-output/implementation-artifacts/spec-pr142-review-verdict-closure.md`
+  summary: Owned-service one-line-wrapper success path lost its dedicated installer regression oracle.
+  evidence: Inherited from main e75ca3d; the success leg in `test/install-one-line.test.ts` now runs `target/install.sh`, while only the foreign-service refusal still exercises `bare/install.sh`.
+
+## Deferred from: code review (2026-10-03)
+- source_spec: none — BMAD code review of PR #170 (gru/gc-test-harness-budgets-20261002 @ 3540500), no-spec mode
+  summary: Diagnostic redaction is over-broad and destroys the evidence it exists to keep (medium, test/helpers/harness-diagnostics.mjs:1205-1236)
+  evidence: Probed on the PR head: case-insensitive Bearer|Basic + any word ("running basic checks" → "basic [REDACTED]"), label match without a word boundary ("max_tokens: 4096", "secrets: none configured"), \bAKIA/i ("Akiane"). A chunk ending in "…running basic setup" opens the streaming fail-closed state and discards the rest of the line, dropping " FAILED: ENOENT /missing/file". Deferred: tightening trades leak-safety for signal and contradicts the r1-pinned lowercase-bearer case — needs an owner call on the leak/noise trade-off.
+- source_spec: none — BMAD code review of PR #170 (head 3540500)
+  summary: runOwnedCommand and disposeScopeProcesses signal only the direct child; grandchildren of `bash install.sh` (npm/git/node) are orphaned on deadline or teardown (medium, test/helpers/harness-diagnostics.mjs:1397-1430,1486-1550)
+  evidence: No detached spawn or process-group kill; SIGTERM to bash does not propagate. execFileSync's timeout behaved the same, but the new teardown claims to reap owned children. Deferred: the obvious fix (detached + kill(-pid)) puts the child in a new session with no controlling terminal, which changes the /dev/tty semantics the install.sh TTY tests assert — needs a design decision.
+- source_spec: none — BMAD code review of PR #170 (head 3540500)
+  summary: A timed-out async test body keeps running and spawns its remaining install.sh/wizard commands during the next test, tracked in that test's scope (medium, test/install-one-line.test.ts:1931-1968)
+  evidence: Converting execFileSync to awaited runOwnedCommand means Vitest moves on after a timeout while the abandoned body continues; activeScope is the next test's scope, so the orphan runs add co-tenant load and appear in the wrong test's diagnostics. Vitest 3.2.7 aborts context.signal on timeout; threading it through ~35 run() call sites is a design choice. Deferred.
+- source_spec: none — BMAD code review of PR #170 (head 3540500)
+  summary: `npm test` chains the phases with &&, so any fast-phase failure hides every heavy-phase result for that run (low, package.json:161)
+  evidence: Previously one `vitest run` reported all backend failures; CI now needs an extra round to see heavy regressions (no false green). The RPC patch also runs three times (pretest + both phase pretests), which is idempotent. Deferred: aggregating exit codes changes the chain shape pinned by harness-routing.test.ts.
+- source_spec: none — BMAD code review of PR #170 (head 3540500)
+  summary: AGENTS.md and other docs don't mention the phase split; `npx vitest run test/<heavy>.test.ts` now exits "No test files found" (low)
+  evidence: README documents test:backend:heavy, but agent guidance does not, so minions running a heavy file directly hit an exit-1 trap (it fails loud, not silently). Deferred: the fix edits agent-context files.

@@ -174,6 +174,15 @@ describe('gru awareness — passive injection', () => {
     ]);
   });
 
+  it('names the source-movement cause when present and preserves legacy head-moved wording without it', () => {
+    const rig = boot();
+    rig.api.appendCustomEvent({ kind: 'round.head-moved', jobId: 'j1', roundId: 'j1-r1', payload: { cause: 'base-rewritten', detail: 'merge-base lost' } });
+    rig.api.appendCustomEvent({ kind: 'round.head-moved', jobId: 'j1', roundId: 'j1-r2', payload: {} });
+    const block = rig.awareness.prepare();
+    expect(block?.text).toContain('round j1-r1: review source changed after freeze (base-rewritten) — verdict invalidated');
+    expect(block?.text).toContain('round j1-r2: head moved after freeze — verdict invalidated');
+  });
+
   it('renders verdict blocker counts from the fallback gate triage and Perkins rounds', () => {
     const rig = boot();
     rig.api.appendCustomEvent({
@@ -957,5 +966,37 @@ describe('gru awareness — morning digest (owner ruling 2026-09-23)', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('a terminal-bound machine row is a labeled receipt, never machine attention or a wake seed (D1)', () => {
+    const dir = tmpDir();
+    let receiptId = '';
+    {
+      const first = boot({ dir, wakeMode: 'never' });
+      first.api.addJob({ id: 'job-terminal', repo: 'r', title: 'Terminal job', briefing: 'b' });
+      first.api.setJobStatus('job-terminal', 'working');
+      first.api.registerAgent({ id: 'minion-terminal', role: 'minion', jobId: 'job-terminal' });
+      const row = first.notifications.post({
+        kind: 'review-escalation',
+        routing: 'action-required',
+        severity: 'error',
+        title: 'Round INCOMPLETE',
+        agentId: 'minion-terminal',
+      });
+      receiptId = row.id;
+        first.api.setJobStatus('job-terminal', 'delivered');
+      first.api.setJobStatus('job-terminal', 'in-review');
+      first.api.setJobStatus('job-terminal', 'merged');
+    }
+    const rig = boot({ dir, wakeMode: 'action-required', wakeMinIntervalMs: 0 });
+    const injection = rig.awareness.prepare('chat');
+    // Labeled as a receipt under its own section, never as machine
+    // attention that reads like live work.
+    expect(injection?.text).toContain('Closed receipts (no action required; kept for reference):');
+    expect(injection?.text).toContain(`[${receiptId}]`);
+    expect(injection?.text).not.toContain('Action required (unacknowledged):');
+    // The boot backlog never seeded it: with a zero interval a seeded row
+    // would have fired a wake turn through the sink.
+    expect(rig.woke).toHaveLength(0);
   });
 });

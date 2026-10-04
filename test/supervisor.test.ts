@@ -6,6 +6,7 @@ import { EventBus } from '../src/events/bus.js';
 import { LedgerApi, type NotificationRecord } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { NotificationCenter } from '../src/notifications/center.js';
+import { BoardEngine } from '../src/board/engine.js';
 import {
   Supervisor,
   type AgentSupervisionView,
@@ -725,6 +726,7 @@ describe('supervisor — watchdog + restart ladder', () => {
     const view = supervisor.viewFor('minion-crashloop') as AgentSupervisionView;
     expect(view.state).toBe('stopped');
     expect(view.breakerOpen).toBe(true);
+    expect(view.stopReason).toBe('crash loop');
 
     // ---- ack re-arms: fresh window, the resume attempt succeeds -------
     registry.spawnImpl = async (role) => new FakeHandle(role, 'minion-crashloop-resumed', null);
@@ -733,6 +735,8 @@ describe('supervisor — watchdog + restart ladder', () => {
     const rearmView = supervisor.viewFor('minion-crashloop-resumed') as AgentSupervisionView;
     expect(rearmView.state).toBe('watching');
     expect(rearmView.breakerOpen).toBe(false);
+    // A re-armed agent is running again — no stop reason lingers.
+    expect(rearmView.stopReason).toBeNull();
     expect(rearmView.restarts).toBe(1); // ring cleared, one fresh rung
     expect(registry.spawnCalls.length).toBe(4);
     // The stopped record for the OLD agent id is gone (new session id) —
@@ -784,6 +788,13 @@ describe('supervisor — workflow-owned review attempts', () => {
     await vi.waitFor(() => expect(handle.disposed).toBe(true));
     expect(h.registry.spawnCalls).toHaveLength(spawns);
     expect(h.api.listEvents({ limit: 20 }).some((event) => event.kind === 'supervision.review-attempt-aborted')).toBe(true);
+    // The abort records its cause on the stopped record the board reads:
+    // the lane renders this exact reason until a re-arm clears it.
+    expect(h.supervisor.viewFor(handle.id)).toMatchObject({
+      state: 'stopped',
+      breakerOpen: false,
+      stopReason: 'review aborted',
+    });
     h.dispose();
   });
 
@@ -802,6 +813,7 @@ describe('supervisor — workflow-owned review attempts', () => {
     expect(h.registry.spawnCalls).toHaveLength(spawns);
     expect(h.api.listEvents({ limit: 20 }).some((event) => event.kind === 'supervision.review-attempt-aborted')).toBe(true);
     expect(h.notificationsOfKind('supervision.native-compaction-wait')).toHaveLength(0);
+    expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', stopReason: 'review aborted' });
     h.dispose();
   });
 });
@@ -953,6 +965,8 @@ describe('supervisor — decision-backed failure guidance', () => {
     handle.emit({ type: 'error', error: 'quota exceeded (HTTP 429)', fatal: false });
     await vi.waitFor(() => expect(handle.disposed).toBe(true));
     expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true, restarts: 0 });
+    // The stop carries its reason so the board can render the truth.
+    expect(h.supervisor.viewFor(handle.id)).toMatchObject({ stopReason: 'quota_wall' });
     expect(h.api.listNotifications({ limit: 20 }).some((row) => row.kind.includes('quota_wall'))).toBe(true);
     h.dispose();
   });
@@ -1603,6 +1617,67 @@ describe('supervisor — Perkins r1 fixes', () => {
     h.dispose();
   });
 
+  it('retiring a dead OPEN-breaker stale slot record carries the stop cause onto the live record (V2)', async () => {
+    const h = boot();
+    const slot = h.supervisor.declareSlot({
+      id: 'gru-open-retire',
+      role: 'gru',
+      spawn: (options) => h.registry.spawn('gru', options),
+    });
+    const first = (await slot.ensure({})) as FakeHandle;
+    // The reachable ensure flows clear a picked open breaker before any
+    // spawn (the slot-use re-arm, pinned by r1-17), so no black-box
+    // sequence hands retirement a STILL-OPEN record. This constructs that
+    // stale shape directly — a dead slot-bound record with an open
+    // breaker whose slot generation has moved on — to pin the defensive
+    // merge: without the stop-cause carry the replacement would render a
+    // bare waiting chip (stopReason null) instead of `waiting · quota wall`.
+    const internals = h.supervisor as unknown as {
+      slots: Map<string, { generation: number }>;
+      agents: Map<string, Record<string, unknown>>;
+    };
+    const internalSlot = internals.slots.get('gru-open-retire')!;
+    internals.agents.set('stale-open-stop', {
+      agentId: 'stale-open-stop',
+      role: 'gru',
+      slot: internalSlot,
+      slotGeneration: internalSlot.generation - 1,
+      handle: null,
+      sessionFile: null,
+      state: 'stopped',
+      openTurn: false,
+      openControl: false,
+      compactionWarned: false,
+      openToolCalls: new Map(),
+      pendingRecovery: null,
+      lastEventAt: 0,
+      lastFileBytes: null,
+      restartRing: [],
+      consecutiveFailures: 0,
+      breakerOpen: true,
+      stopReason: 'quota_wall',
+      breakerNotificationId: null,
+      inRestart: false,
+      backoffTimer: null,
+      activityGeneration: 0,
+      decisionPending: false,
+      failureTerminalPending: false,
+      queuedRecovery: null,
+      rateLimitRetry: null,
+      recoveryAdmission: null,
+    });
+    // The current record dies outside a restart rung; ensure() spawns the
+    // replacement and retires BOTH dead records, merging the open one.
+    await h.registry.disposeHandle(first);
+    const replacement = (await slot.ensure({})) as FakeHandle;
+    expect(h.supervisor.viewFor(replacement.id)).toMatchObject({
+      state: 'stopped',
+      breakerOpen: true,
+      stopReason: 'quota_wall',
+    });
+    h.dispose();
+  });
+
   it('r1-2: supervision.enabled=false gates EVERY side-effect — pure registry behavior', async () => {
     const dir = tmpDir();
     const db = new LedgerDb(dir);
@@ -1711,6 +1786,9 @@ describe('supervisor — Perkins r1 fixes', () => {
     const view = h.supervisor.viewFor('slot-recovered');
     expect(view?.state).toBe('watching');
     expect(view?.breakerOpen).toBe(false);
+    // A re-armed agent is running again — the stop cause clears with the
+    // breaker (final independent review T1).
+    expect(view?.stopReason).toBeNull();
     h.dispose();
   });
 });
@@ -2752,6 +2830,63 @@ describe('pacing settlement across rejection, recovery, and slot retirement', ()
       await expect(settled).resolves.toBe('superseded');
     } finally {
       h.dispose();
+    }
+  });
+
+  it('restart hydration restores a durable stop into viewFor and the board snapshot (P6)', () => {
+    // Code review 2026-10-04: the supervisor is in-process only. A stop
+    // that survived the previous process must still read waiting after a
+    // restart (and must not wake as stalled).
+    const dir = mkdtempSync(join(tmpdir(), 'gru-hydrate-'));
+    const db = new LedgerDb(dir);
+    const bus = new EventBus();
+    const api = new LedgerApi(db.handle, { bus });
+    try {
+      api.addJob({ id: 'job-hydrate', repo: 'r', title: 'Hydrate', briefing: 'b' });
+      api.setJobStatus('job-hydrate', 'working');
+      api.registerAgent({ id: 'minion-hydrate', role: 'minion', jobId: 'job-hydrate' });
+      api.appendCustomEvent({
+        kind: 'supervision.escalated',
+        agentId: 'minion-hydrate',
+        payload: { class: 'quota_wall', restarts: 2 },
+      });
+      const registry = { onAgentEvent: () => () => {} } as unknown as SupervisorRegistry;
+      const center = new NotificationCenter({ ledger: api, bus });
+      const supervisor = new Supervisor({
+        config: {
+          enabled: true,
+          turnSilenceMs: 50,
+          restartWindowMs: 600_000,
+          maxRestarts: 3,
+          restartBackoffMs: 1,
+        },
+        registry,
+        ledger: api,
+        notifications: center,
+        tickMs: 5,
+      });
+      supervisor.start();
+      try {
+        expect(supervisor.viewFor('minion-hydrate')).toMatchObject({
+          state: 'stopped',
+          stopReason: 'quota_wall',
+          restarts: 2,
+        });
+        // The production board closure reads the same view: the snapshot's
+        // agent row carries the stop truth after the restart.
+        const engine = new BoardEngine({
+          ledger: api,
+          bus,
+          supervisionFor: (agentId) => supervisor.viewFor(agentId),
+        });
+        const agentView = engine.snapshot().agents.find((agent) => agent.id === 'minion-hydrate');
+        expect(agentView?.supervision).toMatchObject({ state: 'stopped', stopReason: 'quota_wall' });
+      } finally {
+        supervisor.dispose();
+      }
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });

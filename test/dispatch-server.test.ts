@@ -69,6 +69,11 @@ async function boot(opts: {
   silasOps?: boolean;
   /** Gate selected minion turns before they settle (in-flight assertions). */
   minionPromptGate?: (text: string) => Promise<void> | undefined;
+  /** Capture service log lines (with their fields) for operator-surface assertions. */
+  log?: (level: 'debug' | 'info' | 'warn' | 'error', msg: string, fields?: Record<string, unknown>) => void;
+  /** Test-only seam: wrap the ledger the server and dispatch see, so
+   * defensive ledger dispositions can be forced deterministically. */
+  wrapLedger?: (ledger: LedgerApi) => LedgerApi;
   /** The health a minion handle reports AFTER its prompt settles — the
    * fulfilled-but-error outcome both real adapters can produce. */
   minionTurnHealth?: (text: string) => 'idle' | 'error';
@@ -91,7 +96,8 @@ async function boot(opts: {
   const cfg = loadConfig({ GRU_COMMAND_HOME: dir }, '/home/tester');
   const db = new LedgerDb(dir);
   const bus = new EventBus({});
-  const ledger = new LedgerApi(db.handle, { bus });
+  const rawLedger = new LedgerApi(db.handle, { bus });
+  const ledger = opts.wrapLedger === undefined ? rawLedger : opts.wrapLedger(rawLedger);
   const notifications = new NotificationCenter({ ledger, bus });
   const worktrees = new InMemoryWorktreePort(join(dir, 'wtroot'));
   const spawns: { role: Role; options: SpawnOptions }[] = [];
@@ -116,7 +122,7 @@ async function boot(opts: {
         if (gate !== undefined) await gate;
         // idempotent per prompt: a fresh file per turn, so a second minion
         // turn on the same lane (silas re-brief) always has a commit to make.
-        const file = join(options.cwd, `http-deliverable-${spawns.length}.txt`);
+        const file = join(options.cwd, `http-deliverable-${id}.txt`);
         writeFileSync(file, 'review me\n');
         execFileSync('git', ['-C', options.cwd, 'add', file]);
         execFileSync('git', ['-C', options.cwd, '-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '-m', 'test: http deliverable'], { stdio: 'ignore' });
@@ -167,6 +173,7 @@ async function boot(opts: {
     dispatch,
     wave,
     ledger,
+    ...(opts.log !== undefined ? { log: opts.log } : {}),
     ...(opts.retrySettlement !== undefined ? { retrySettlement: opts.retrySettlement } : {}),
     ...(opts.workerGate !== undefined ? { workerGate: opts.workerGate } : {}),
     ...(opts.silasOps === false
@@ -233,6 +240,18 @@ async function call(
 function field<T>(json: unknown, key: string): T {
   if (typeof json !== 'object' || json === null) throw new Error(`no json for field ${key}`);
   return (json as Record<string, unknown>)[key] as T;
+}
+
+/** Wait for the dispatched minion's briefing turn to settle on the record
+ * before a PR/review request reads the lane: the review freeze reads the
+ * pushed origin tip, which only exists after the turn. Deadline keeps the
+ * failure honest (no unbounded wait), matching the file's other cases. */
+async function waitForDelivery(h: ServerHarness, jobId: string): Promise<void> {
+  const deadline = Date.now() + 10_000;
+  while (h.ledger.latestJobEvent(jobId, 'job.delivered') === null && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).not.toBeNull();
 }
 
 /** The directive endpoint now records durable intent first and answers 202:
@@ -643,7 +662,7 @@ describe('dispatch server (E8)', () => {
     }
   });
 
-  it('by=silas on the pr/review endpoints records silas attribution events; without by it does not', async () => {
+  it('by=silas on the pr/review endpoints records silas attribution events', async () => {
     const h = await boot();
     const repo = makeFixtureRepo('fixture-silas-by');
     cleanupRepos.push(repo);
@@ -652,6 +671,7 @@ describe('dispatch server (E8)', () => {
       await call(h.port, 'POST', '/api/dispatch', {
         job_id: 'by-silas-job', repo_path: repo.path, title: 'attribution', briefing: 'b',
       }, TOKEN);
+      await waitForDelivery(h, 'by-silas-job');
       const pr = await call(h.port, 'POST', '/api/dispatch/pr', {
         job_id: 'by-silas-job', url: PR_URL, by: 'silas',
       }, TOKEN);
@@ -665,12 +685,29 @@ describe('dispatch server (E8)', () => {
       expect(kinds).toContain('silas.review-triggered');
       const reviewEvent = h.ledger.listJobEvents('by-silas-job').find((event) => event.kind === 'silas.review-triggered');
       expect((reviewEvent?.payload as { route?: string }).route).toBe('perkins');
-      // and an unattributed job stays clean of silas events
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('without by, the pr/review endpoints record no silas attribution events', async () => {
+    // One scenario per case: the combined form ran two complete review
+    // setups under one inherited 30s default and overran it under
+    // co-tenant load. This arm proves the absence on a fully processed
+    // request (PR 200, review 202), never on a silently failed call.
+    const h = await boot();
+    const repo = makeFixtureRepo('fixture-silas-none');
+    cleanupRepos.push(repo);
+    attachBareOrigin(repo);
+    try {
       await call(h.port, 'POST', '/api/dispatch', {
         job_id: 'by-none-job', repo_path: repo.path, title: 'plain', briefing: 'b',
       }, TOKEN);
-      await call(h.port, 'POST', '/api/dispatch/pr', { job_id: 'by-none-job', url: PR_URL }, TOKEN);
-      await call(h.port, 'POST', '/api/dispatch/review', { job_id: 'by-none-job' }, TOKEN);
+      await waitForDelivery(h, 'by-none-job');
+      const pr = await call(h.port, 'POST', '/api/dispatch/pr', { job_id: 'by-none-job', url: PR_URL }, TOKEN);
+      expect(pr.status).toBe(200);
+      const review = await call(h.port, 'POST', '/api/dispatch/review', { job_id: 'by-none-job' }, TOKEN);
+      expect(review.status).toBe(202);
       const plainKinds = h.ledger.listJobEvents('by-none-job').map((event) => event.kind);
       expect(plainKinds).not.toContain('silas.pr-registered');
       expect(plainKinds).not.toContain('silas.review-triggered');
@@ -1117,6 +1154,466 @@ describe('dispatch server (E8)', () => {
     }
   });
 
+  it('/api/silas/rebrief reports a superseded ordinary turn without consuming newer markers', async () => {
+    let releasePrompt!: () => void;
+    const gate = new Promise<void>((resolve) => { releasePrompt = resolve; });
+    const h = await boot({ minionPromptGate: (text) => text.startsWith('Re-brief —') ? gate : undefined });
+    const repo = makeFixtureRepo('fixture-rebrief-superseded-http');
+    cleanupRepos.push(repo);
+    try {
+      await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'superseded-http', repo_path: repo.path, title: 'lane', briefing: 'contract',
+      }, TOKEN);
+      const initialDeadline = Date.now() + 10_000;
+      while (h.ledger.latestJobEvent('superseded-http', 'job.delivered') === null && Date.now() < initialDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const pending = call(h.port, 'POST', '/api/silas/rebrief', { job_id: 'superseded-http', note: 'older' }, TOKEN);
+      const deadline = Date.now() + 10_000;
+      while (!h.minionTurnTexts.some((text) => text.startsWith('Re-brief —')) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(h.minionTurnTexts.some((text) => text.startsWith('Re-brief —'))).toBe(true);
+      const newer = h.ledger.beginPendingRebrief({ jobId: 'superseded-http', note: 'newer', briefing: 'contract' });
+      h.ledger.setJobStatus('superseded-http', 'in-review');
+      releasePrompt();
+      const response = await pending;
+      expect(response.status).toBe(200);
+      expect(field<boolean>(response.json, 'superseded')).toBe(true);
+      expect(h.ledger.listPendingRebriefs({ jobId: 'superseded-http' })).toEqual(newer);
+      expect(h.ledger.getJob('superseded-http')?.status).toBe('in-review');
+      expect(h.ledger.latestJobEvent('superseded-http', 'silas.rebrief')).toBeNull();
+    } finally {
+      releasePrompt();
+      await h.close();
+    }
+  });
+
+  it('/api/silas/rebrief cancels a queued terminal request before disposing or spawning', async () => {
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const h = await boot({ workerGate: gate });
+    const repo = makeFixtureRepo('fixture-queued-terminal-http');
+    cleanupRepos.push(repo);
+    let holder: Awaited<ReturnType<PacingGate['acquireWorkerTurn']>> | null = null;
+    try {
+      await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'queued-terminal-http', repo_path: repo.path, title: 'lane', briefing: 'contract',
+      }, TOKEN);
+      const deadline = Date.now() + 10_000;
+      while (h.ledger.latestJobEvent('queued-terminal-http', 'job.delivered') === null && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      holder = await gate.acquireWorkerTurn({ id: 'holder', label: 'holder' });
+      const beforeSpawns = h.spawns.length;
+      const pending = call(h.port, 'POST', '/api/silas/rebrief', { job_id: 'queued-terminal-http', note: 'queued' }, TOKEN);
+      while (h.ledger.listPendingRebriefs({ jobId: 'queued-terminal-http' }).length !== 2 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(h.ledger.listPendingRebriefs({ jobId: 'queued-terminal-http' })).toHaveLength(2);
+      h.ledger.setJobStatus('queued-terminal-http', 'in-review');
+      h.ledger.setJobStatus('queued-terminal-http', 'merged');
+      holder.release();
+      holder = null;
+      const response = await pending;
+      expect(response.status).toBe(200);
+      expect(field<boolean>(response.json, 'retired')).toBe(true);
+      expect(h.spawns).toHaveLength(beforeSpawns);
+      expect(h.disposedHandles).toHaveLength(0);
+      expect(h.ledger.listPendingRebriefs({ jobId: 'queued-terminal-http' })).toHaveLength(0);
+      expect(h.ledger.listJobEvents('queued-terminal-http').filter((event) => event.kind === 'silas.rebrief-retired')).toHaveLength(1);
+    } finally {
+      holder?.release();
+      await h.close();
+    }
+  });
+
+  it('/api/silas/rebrief cancels a queued superseded unmarked request before disposal or spawn', async () => {
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const h = await boot({ workerGate: gate });
+    const repo = makeFixtureRepo('fixture-queued-superseded-http');
+    cleanupRepos.push(repo);
+    let holder: Awaited<ReturnType<PacingGate['acquireWorkerTurn']>> | null = null;
+    try {
+      await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'queued-superseded-http', repo_path: repo.path, title: 'lane', briefing: 'contract',
+      }, TOKEN);
+      const deadline = Date.now() + 10_000;
+      while (h.ledger.latestJobEvent('queued-superseded-http', 'job.delivered') === null && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const resident = h.ledger.listAgents().find((agent) => agent.jobId === 'queued-superseded-http' && agent.role === 'minion');
+      expect(resident).toBeDefined();
+      h.liveHandles.set(resident!.id, {
+        id: resident!.id, role: 'minion', sessionFile: null, capabilities: FAKE_CAPABILITIES,
+        async prompt() {}, async steer() {}, async followUp() {},
+        subscribe: () => () => {},
+        health: () => ({ state: 'idle', lastActivity: null, sessionFile: null }),
+        async dispose() {},
+      });
+      holder = await gate.acquireWorkerTurn({ id: 'holder', label: 'holder' });
+      const beforeSpawns = h.spawns.length;
+      const beforePrompts = h.minionTurnTexts.length;
+      const pending = call(h.port, 'POST', '/api/silas/rebrief', { job_id: 'queued-superseded-http', note: 'older' }, TOKEN);
+      while (h.ledger.listPendingRebriefs({ jobId: 'queued-superseded-http' }).length !== 2 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(h.ledger.listPendingRebriefs({ jobId: 'queued-superseded-http' })).toHaveLength(2);
+      const newer = h.ledger.beginPendingRebrief({ jobId: 'queued-superseded-http', note: 'newer', briefing: 'contract' });
+      h.ledger.setJobStatus('queued-superseded-http', 'in-review');
+      holder.release();
+      holder = null;
+      const response = await pending;
+      expect(response.status).toBe(200);
+      expect(field<boolean>(response.json, 'superseded')).toBe(true);
+      expect(h.ledger.listPendingRebriefs({ jobId: 'queued-superseded-http' })).toEqual(newer);
+      expect(h.ledger.getJob('queued-superseded-http')?.status).toBe('in-review');
+      expect(h.spawns).toHaveLength(beforeSpawns);
+      expect(h.disposedHandles).toHaveLength(0);
+      expect(h.minionTurnTexts).toHaveLength(beforePrompts);
+      expect(h.ledger.latestJobEvent('queued-superseded-http', 'silas.rebrief')).toBeNull();
+    } finally {
+      holder?.release();
+      await h.close();
+    }
+  });
+
+  it('/api/silas/rebrief retires failed turns that settle after their job goes terminal', async () => {
+    for (const mode of ['in-band', 'rejected'] as const) {
+      let releasePrompt!: () => void;
+      const gate = new Promise<void>((resolve) => { releasePrompt = resolve; });
+      const jobId = `terminal-failed-http-${mode}`;
+      const h = await boot({
+        minionPromptGate: (text) => text.startsWith('Re-brief —')
+          ? mode === 'rejected' ? gate.then(() => { throw new Error('synthetic prompt rejection'); }) : gate
+          : undefined,
+        minionTurnHealth: (text) => mode === 'in-band' && text.startsWith('Re-brief —') ? 'error' : 'idle',
+      });
+      const repo = makeFixtureRepo(`fixture-terminal-failed-http-${mode}`);
+      cleanupRepos.push(repo);
+      try {
+        await call(h.port, 'POST', '/api/dispatch', {
+          job_id: jobId, repo_path: repo.path, title: 'lane', briefing: 'contract',
+        }, TOKEN);
+        const initialDeadline = Date.now() + 10_000;
+        while (h.ledger.latestJobEvent(jobId, 'job.delivered') === null && Date.now() < initialDeadline) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        const pending = call(h.port, 'POST', '/api/silas/rebrief', { job_id: jobId, note: 'retry' }, TOKEN);
+        const deadline = Date.now() + 10_000;
+        while (!h.minionTurnTexts.some((text) => text.startsWith(`Re-brief — job ${jobId}`)) && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        expect(h.minionTurnTexts.some((text) => text.startsWith(`Re-brief — job ${jobId}`))).toBe(true);
+        const markers = h.ledger.listPendingRebriefs({ jobId });
+        expect(markers).toHaveLength(2);
+        const baseline = markers[0]!.baselineSeq;
+        h.ledger.setJobStatus(jobId, 'in-review');
+        h.ledger.setJobStatus(jobId, 'merged');
+        releasePrompt();
+        const response = await pending;
+        if (mode === 'in-band') {
+          expect(response.status).toBe(202);
+          expect(field<string>(response.json, 'state')).toBe('turn-error');
+          expect(field<boolean>(response.json, 'retired')).toBe(true);
+          expect(h.ledger.latestJobEvent(jobId, 'job.minion-error')).not.toBeNull();
+        } else {
+          expect(response.status).toBe(400);
+          expect(field<string>(response.json, 'detail')).toContain('synthetic prompt rejection');
+          expect(field<boolean>(response.json, 'retired')).toBe(true);
+        }
+        expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(0);
+        expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-retired')).not.toBeNull();
+        expect(h.ledger.listJobEvents(jobId).filter((event) =>
+          (event.kind === 'silas.rebrief' || event.kind === 'job.delivered') && event.seq > baseline)).toHaveLength(0);
+      } finally {
+        releasePrompt();
+        await h.close();
+      }
+    }
+  });
+
+  it('/api/silas/rebrief reports an administrative retirement when the job goes terminal mid-turn', async () => {
+    let releasePrompt!: () => void;
+    const gate = new Promise<void>((resolveGate) => {
+      releasePrompt = resolveGate;
+    });
+    const logs: string[] = [];
+    const h = await boot({
+      minionPromptGate: (text) => (text.startsWith('Re-brief —') ? gate : undefined),
+      log: (level, msg) => {
+        logs.push(`${level}:${msg}`);
+      },
+    });
+    const repo = makeFixtureRepo('fixture-silas-rebrief-terminal');
+    cleanupRepos.push(repo);
+    try {
+      await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'terminal-rebrief-job', repo_path: repo.path, title: 'stuck lane', briefing: 'the original contract',
+      }, TOKEN);
+      // Let the initial briefing turn settle before the re-brief (same shape
+      // as the marker test above).
+      const firstTurnDeadline = Date.now() + 10_000;
+      while (h.ledger.latestJobEvent('terminal-rebrief-job', 'job.delivered') === null && Date.now() < firstTurnDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const pending = call(h.port, 'POST', '/api/silas/rebrief', {
+        job_id: 'terminal-rebrief-job', note: 'fold the rebase',
+      }, TOKEN);
+      // Wait until the re-brief turn is in flight (its markers bound), and
+      // capture the request watermark: a guarded event after this baseline
+      // would answer the retired request.
+      const deadline = Date.now() + 10_000;
+      while (h.ledger.listPendingRebriefs({ jobId: 'terminal-rebrief-job' }).length !== 2 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const markers = h.ledger.listPendingRebriefs({ jobId: 'terminal-rebrief-job' });
+      expect(markers).toHaveLength(2);
+      const rebriefMarker = markers.find((marker) => marker.kind === 'silas.rebrief');
+      expect(rebriefMarker).toBeDefined();
+      const baseline = rebriefMarker?.baselineSeq ?? Number.NaN;
+      // The job reaches terminal while the turn is gated (owner merged it).
+      h.ledger.setJobStatus('terminal-rebrief-job', 'in-review');
+      h.ledger.setJobStatus('terminal-rebrief-job', 'merged');
+      releasePrompt();
+      const res = await pending;
+      expect(res.status, JSON.stringify(res.json)).toBe(200);
+      // The disposition is in-band: retired, no fabricated delivery.
+      expect(field<boolean>(res.json, 'retired')).toBe(true);
+      expect(field<string | null>(res.json, 'delivered_sha')).toBeNull();
+      // No POST-BOUNDARY delivery/re-brief was fabricated for the retired
+      // request. The initial briefing turn's own `job.delivered` (source
+      // `dispatch`) legitimately predates the request watermark and is
+      // retained — history is preserved, never erased to satisfy a test.
+      const delivered = h.ledger.latestJobEvent('terminal-rebrief-job', 'job.delivered');
+      expect(delivered === null || delivered.seq <= baseline).toBe(true);
+      if (delivered !== null) expect(delivered.payload).toMatchObject({ source: 'dispatch' });
+      const rebrief = h.ledger.latestJobEvent('terminal-rebrief-job', 'silas.rebrief');
+      expect(rebrief === null || rebrief.seq <= baseline).toBe(true);
+      expect(h.ledger.latestJobEvent('terminal-rebrief-job', 'silas.rebrief-recovered')).toBeNull();
+      // The audit is durable and the obsolete markers are gone; the lane stays terminal.
+      expect(h.ledger.latestJobEvent('terminal-rebrief-job', 'silas.rebrief-retired')).not.toBeNull();
+      expect(h.ledger.listPendingRebriefs({ jobId: 'terminal-rebrief-job' })).toHaveLength(0);
+      expect(h.ledger.getJob('terminal-rebrief-job')?.status).toBe('merged');
+      // The operator surface carries the disposition, not just the response.
+      expect(logs).toContain('info:silas re-brief retired: job went terminal before the turn settled');
+    } finally {
+      releasePrompt();
+      await h.close();
+    }
+  });
+
+  it('/api/silas/rebrief surfaces a retirement that retired nothing, keeping the markers', async () => {
+    let releasePrompt!: () => void;
+    const gate = new Promise<void>((resolveGate) => {
+      releasePrompt = resolveGate;
+    });
+    const logs: string[] = [];
+    const h = await boot({
+      minionPromptGate: (text) => (text.startsWith('Re-brief —') ? gate : undefined),
+      wrapLedger: (ledger) => {
+        const view = Object.create(ledger) as LedgerApi;
+        Object.defineProperty(view, 'retirePendingRebriefs', {
+          value: () => ({ retired: [], skippedIds: ['stale-generation'], refused: null }),
+        });
+        return view;
+      },
+      log: (level, msg) => {
+        logs.push(`${level}:${msg}`);
+      },
+    });
+    const repo = makeFixtureRepo('fixture-silas-rebrief-incomplete');
+    cleanupRepos.push(repo);
+    try {
+      await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'incomplete-rebrief-job', repo_path: repo.path, title: 'stuck lane', briefing: 'the original contract',
+      }, TOKEN);
+      // Let the initial briefing turn settle before the re-brief (same shape
+      // as the retirement test above).
+      const firstTurnDeadline = Date.now() + 10_000;
+      while (h.ledger.latestJobEvent('incomplete-rebrief-job', 'job.delivered') === null && Date.now() < firstTurnDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const pending = call(h.port, 'POST', '/api/silas/rebrief', {
+        job_id: 'incomplete-rebrief-job', note: 'fold the rebase',
+      }, TOKEN);
+      const markerDeadline = Date.now() + 10_000;
+      while (h.ledger.listPendingRebriefs({ jobId: 'incomplete-rebrief-job' }).length !== 2 && Date.now() < markerDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(h.ledger.listPendingRebriefs({ jobId: 'incomplete-rebrief-job' })).toHaveLength(2);
+      // The job reaches terminal while the turn is gated (owner merged it).
+      h.ledger.setJobStatus('incomplete-rebrief-job', 'in-review');
+      h.ledger.setJobStatus('incomplete-rebrief-job', 'merged');
+      releasePrompt();
+      const res = await pending;
+      expect(res.status, JSON.stringify(res.json)).toBe(200);
+      // The incomplete disposition is in-band and the markers survive for
+      // the next pass; nothing claims a recovery or a retirement.
+      expect(res.json).toMatchObject({ retirement: { refused: null, skipped_ids: ['stale-generation'] } });
+      // The wire must not conflate the disposition with a retirement: on
+      // the all-skip path `retired` is absent (examined-vs-retired truth).
+      expect(field(res.json, 'retired')).toBeUndefined();
+      expect(h.ledger.latestJobEvent('incomplete-rebrief-job', 'silas.rebrief-retired')).toBeNull();
+      expect(h.ledger.latestJobEvent('incomplete-rebrief-job', 'silas.rebrief-recovered')).toBeNull();
+      expect(h.ledger.listPendingRebriefs({ jobId: 'incomplete-rebrief-job' })).toHaveLength(2);
+      // The operator-facing warn line is part of this contract: an all-skip
+      // disposition must be visible in the log, not only in the 200 body.
+      expect(logs).toContain('warn:silas re-brief retirement incomplete: markers kept for the next pass');
+    } finally {
+      releasePrompt();
+      await h.close();
+    }
+  });
+
+  it('/api/silas/rebrief surfaces a PARTIAL retirement: retired plus the kept-marker ids', async () => {
+    let releasePrompt!: () => void;
+    const gate = new Promise<void>((resolveGate) => {
+      releasePrompt = resolveGate;
+    });
+    const logs: { level: string; msg: string; fields?: Record<string, unknown> }[] = [];
+    const h = await boot({
+      minionPromptGate: (text) => (text.startsWith('Re-brief —') ? gate : undefined),
+      wrapLedger: (ledger) => {
+        const view = Object.create(ledger) as LedgerApi;
+        Object.defineProperty(view, 'retirePendingRebriefs', {
+          value: (input: { jobId: string }) => {
+            const rows = ledger.listPendingRebriefs({ jobId: input.jobId });
+            // One marker retires; the other's identity drifted (kept).
+            return { retired: [rows[0]!], skippedIds: [rows[1]!.id], refused: null };
+          },
+        });
+        return view;
+      },
+      log: (level, msg, fields) => {
+        logs.push({ level, msg, fields });
+      },
+    });
+    const repo = makeFixtureRepo('fixture-silas-rebrief-partial');
+    cleanupRepos.push(repo);
+    try {
+      await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'partial-rebrief-job', repo_path: repo.path, title: 'stuck lane', briefing: 'the original contract',
+      }, TOKEN);
+      const firstTurnDeadline = Date.now() + 10_000;
+      while (h.ledger.latestJobEvent('partial-rebrief-job', 'job.delivered') === null && Date.now() < firstTurnDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const pending = call(h.port, 'POST', '/api/silas/rebrief', {
+        job_id: 'partial-rebrief-job', note: 'fold the rebase',
+      }, TOKEN);
+      const markerDeadline = Date.now() + 10_000;
+      while (h.ledger.listPendingRebriefs({ jobId: 'partial-rebrief-job' }).length !== 2 && Date.now() < markerDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const markers = h.ledger.listPendingRebriefs({ jobId: 'partial-rebrief-job' });
+      expect(markers).toHaveLength(2);
+      h.ledger.setJobStatus('partial-rebrief-job', 'in-review');
+      h.ledger.setJobStatus('partial-rebrief-job', 'merged');
+      releasePrompt();
+      const res = await pending;
+      expect(res.status, JSON.stringify(res.json)).toBe(200);
+      // Partial means BOTH facts on the wire: retired true AND the kept
+      // marker ids named — a consumer keying on either alone reads it right.
+      expect((res.json as { retired?: unknown }).retired).toBe(true);
+      expect((res.json as { retirement?: unknown }).retirement)
+        .toEqual({ refused: null, skipped_ids: [markers[1]!.id] });
+      const retiredLog = logs.find((line) => line.msg === 'silas re-brief retired: job went terminal before the turn settled');
+      expect(retiredLog?.level).toBe('info');
+      expect(retiredLog?.fields?.['skipped']).toEqual([markers[1]!.id]);
+    } finally {
+      releasePrompt();
+      await h.close();
+    }
+  });
+
+  it('/api/silas/rebrief refuses at the admission boundary when the job merges before the marker write', async () => {
+    const h = await boot({
+      wrapLedger: (ledger) => {
+        const view = Object.create(ledger) as LedgerApi;
+        Object.defineProperty(view, 'beginPendingRebrief', {
+          value: (input: Parameters<LedgerApi['beginPendingRebrief']>[0]) => {
+            // The owner merges the lane between the HTTP guard and the
+            // marker write: the in-transaction admission boundary must
+            // refuse — never write a marker for a terminal lane.
+            ledger.setJobStatus(input.jobId, 'in-review');
+            ledger.setJobStatus(input.jobId, 'merged');
+            return ledger.beginPendingRebrief(input);
+          },
+        });
+        return view;
+      },
+    });
+    try {
+      h.ledger.addJob({ id: 'admission-race-job', repo: 'nowhere', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('admission-race-job', 'working');
+      const res = await call(h.port, 'POST', '/api/silas/rebrief', {
+        job_id: 'admission-race-job', note: 'n',
+      }, TOKEN);
+      // The named in-transaction refusal maps to the caller-visible 400 the
+      // spec's admission-race edge row promises.
+      expect(res.status, JSON.stringify(res.json)).toBe(400);
+      expect(field<string>(res.json, 'error')).toBe('bad_request');
+      expect(field<string>(res.json, 'detail')).toMatch(/terminal lanes are never re-briefed/u);
+      // No marker row was written and no worker was spawned.
+      expect(h.ledger.listPendingRebriefs({ jobId: 'admission-race-job' })).toHaveLength(0);
+      expect(h.spawns.filter((spawn) => spawn.role === 'minion')).toHaveLength(0);
+      expect(h.ledger.getJob('admission-race-job')?.status).toBe('merged');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('overlapping ordinary re-brief HTTP turns settle only the newest marker generation', async () => {
+    let releaseOld!: () => void;
+    let releaseNew!: () => void;
+    let enteredOld!: () => void;
+    let enteredNew!: () => void;
+    const oldGate = new Promise<void>((resolve) => { releaseOld = resolve; });
+    const newGate = new Promise<void>((resolve) => { releaseNew = resolve; });
+    const oldStarted = new Promise<void>((resolve) => { enteredOld = resolve; });
+    const newStarted = new Promise<void>((resolve) => { enteredNew = resolve; });
+    let turns = 0;
+    const h = await boot({ minionPromptGate: (text) => {
+      if (!text.startsWith('Re-brief —')) return undefined;
+      turns += 1;
+      if (turns === 1) { enteredOld(); return oldGate; }
+      enteredNew();
+      return newGate;
+    } });
+    const repo = makeFixtureRepo('fixture-ordinary-rebrief-overlap');
+    cleanupRepos.push(repo);
+    const jobId = 'ordinary-overlap';
+    try {
+      await call(h.port, 'POST', '/api/dispatch', { job_id: jobId, repo_path: repo.path,
+        title: 'overlapping turns', briefing: 'the original contract' }, TOKEN);
+      const initialDeadline = Date.now() + 10_000;
+      while (h.ledger.latestJobEvent(jobId, 'job.delivered') === null && Date.now() < initialDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).not.toBeNull();
+      const oldTurn = call(h.port, 'POST', '/api/silas/rebrief', { job_id: jobId, note: 'same note' }, TOKEN);
+      await oldStarted;
+      const oldIds = h.ledger.listPendingRebriefs({ jobId }).map((marker) => marker.id);
+      expect(oldIds).toHaveLength(2);
+      const newTurn = call(h.port, 'POST', '/api/silas/rebrief', { job_id: jobId, note: 'same note' }, TOKEN);
+      await newStarted;
+      const newIds = h.ledger.listPendingRebriefs({ jobId }).map((marker) => marker.id);
+      expect(newIds).toHaveLength(2);
+      expect(newIds).not.toEqual(oldIds);
+      releaseOld();
+      const stale = await oldTurn;
+      expect(stale.status).toBe(200);
+      expect(field<string | null>(stale.json, 'delivered_sha')).toBeNull();
+      expect(h.ledger.listPendingRebriefs({ jobId }).map((marker) => marker.id)).toEqual(newIds);
+      expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief')).toBeNull();
+      expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-settled')).toBeNull();
+      releaseNew();
+      expect((await newTurn).status).toBe(200);
+      expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(0);
+      expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-settled')).not.toBeNull();
+    } finally { releaseOld(); releaseNew(); await h.close(); }
+  });
+
   it('/api/silas/directive on a lane with no reachable minion records a durable no-effect FAILURE; terminal jobs refuse', async () => {
     const h = await boot();
     const repo = makeFixtureRepo('fixture-silas-undelivered');
@@ -1292,6 +1789,9 @@ describe('dispatch server (E8)', () => {
     const h = await boot();
     try {
       h.ledger.addJob({ id: 'esc-job', repo: 'r', title: 't', briefing: 'b' });
+      // The lane's bound minion is the existing agentId binding the row
+      // carries (tracked-review A4): validated job + actual identity.
+      h.ledger.registerAgent({ id: 'esc-minion', role: 'minion', jobId: 'esc-job' });
       const res = await call(h.port, 'POST', '/api/silas/escalate', {
         title: 'Same blocker recurred past the ladder',
         detail: 'job esc-job: fingerprint correctness::src/a.ts::null deref, 4 consecutive rounds',
@@ -1305,6 +1805,14 @@ describe('dispatch server (E8)', () => {
       const notification = h.ledger.listNotifications().find((row) => row.id === notificationId);
       expect(notification?.routing).toBe('action-required');
       expect(notification?.severity).toBe('error');
+      expect(notification?.agentId).toBe('esc-minion');
+      // A job-less escalation stays unbound (never guessed).
+      const noJob = await call(h.port, 'POST', '/api/silas/escalate', { title: 'no lane' }, TOKEN);
+      expect(noJob.status).toBe(200);
+      const noJobNotification = h.ledger
+        .listNotifications()
+        .find((row) => row.id === field<string>(noJob.json, 'notification_id'));
+      expect(noJobNotification?.agentId).toBeNull();
       // unknown job id fails loud; empty title fails loud
       const unknown = await call(h.port, 'POST', '/api/silas/escalate', { title: 'x', job_id: 'nope' }, TOKEN);
       expect(unknown.status).toBe(400);

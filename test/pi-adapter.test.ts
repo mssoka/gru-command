@@ -122,6 +122,634 @@ async function rejection(promise: Promise<unknown>): Promise<Error> {
   throw new Error('expected the promise to reject');
 }
 
+/** Poll a condition until it holds; throws with the label on timeout. */
+async function waitFor(predicate: () => boolean, label: string, timeoutMs = 4_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+interface CancellationObservation {
+  readonly variant: 'broad' | 'narrow';
+  readonly summaryMode: 'abort-settles' | 'late-terminal';
+  readonly cancellations: number;
+  readonly abortOutcome: string | null;
+  readonly turn: string;
+  readonly queued: string;
+  readonly errorEvents: number;
+  readonly errorMessages: readonly string[];
+  readonly stateErrors: number;
+  readonly assistantErrors: number;
+  readonly abortedEnds: number;
+  readonly successEnds: number;
+  readonly terminalEnds: readonly { readonly success: boolean; readonly error: string | null }[];
+  readonly rawSdkCompactionEnds: number;
+  readonly summarySettledByAbort: boolean;
+  readonly stalledSummaryCalls: number;
+  readonly continuationReachedModel: boolean;
+  readonly recoveredReplyDelta: boolean;
+  readonly recoveredReplyState: boolean;
+  readonly recoveredReplyDurable: boolean;
+  readonly queuedPendingDuringStall: boolean;
+  readonly queuedModelCallsDuringStall: number;
+  readonly queuedSettledAfterCancel: boolean | null;
+  readonly queuedModelCallsAfterCancel: number | null;
+  readonly continuationCallsAfterCancel: number | null;
+  readonly postCancelGuardMessages: readonly string[] | null;
+  readonly postCancelGuardModelCalls: number | null;
+  readonly guardMessages: readonly string[];
+  readonly guardModelCallsDuringStall: number;
+  readonly guardModelCalls: number;
+  readonly queuedDelivered: number;
+  readonly afterSettle: string;
+  readonly afterSettleDelivered: number;
+  readonly disposed: boolean;
+  readonly idle: boolean;
+}
+
+/**
+ * Drive one real mid-run threshold compaction into a stall, then apply the
+ * cancellation a bound would apply — broad `session.abort()` or summary-only
+ * `session.abortCompaction()` — through the public SDK session and measure the
+ * outcome. No product code is modified and no adapter deadline is armed: the
+ * cancellation is invoked through the public SDK session, so this contract
+ * holds for any future (or owner-controlled) bound that needs it. The
+ * adapter's former #137 deadline is gone (rollback of PR #137), which is
+ * exactly why the boundary is pinned here instead of at the deleted call site.
+ *
+ * The first cycle is measured alone before any follow-up starts: the adapter
+ * keeps one pending terminal slot, and a second adjacent cycle would race the
+ * publication poll. Other-owner work is admitted while the measured turn is
+ * live and BEFORE native compaction opens, so its pending-to-delivered
+ * transition is proven through the stall and the cancellation instead of
+ * being submitted after settlement; one post-settlement request is kept as a
+ * separate usability check. While the summary is held, fresh prompt/steer/
+ * followUp requests must be refused by the compacting admission guard. Only
+ * the FIRST summary stalls; later cycles summarize normally so exactly-once
+ * delivery is not conflated with an open-ended provider stall.
+ *
+ * `abort-settles`: a faithful transport — the held summary stream ends when
+ * its request signal aborts. `late-terminal`: the signal is ignored and the
+ * transport settles only when the test releases it (after the cancellation).
+ */
+async function observeCompactionCancellation(
+  variant: 'broad' | 'narrow',
+  summaryMode: 'abort-settles' | 'late-terminal',
+): Promise<CancellationObservation> {
+  const history = 'history '.repeat(12_000); // ~24k estimated tokens: forces a discarding cut point
+  let releaseSummary: () => void = () => {};
+  const summaryHold = new Promise<void>((resolve) => {
+    releaseSummary = resolve;
+  });
+  let summaryCalls = 0;
+  const fx = await fixture((prompt, index) => {
+    if (prompt.startsWith('<conversation>')) {
+      summaryCalls += 1;
+      return summaryCalls === 1
+        ? { deltas: [], hold: summaryHold, honorAbort: summaryMode === 'abort-settles' }
+        : { deltas: ['summary'] };
+    }
+    if (index === 0) return { deltas: [history] };
+    if (index === 1) {
+      // The tool call keeps the run live through prepareNextTurnWithContext,
+      // where pi runs native threshold compaction mid-run.
+      return {
+        deltas: [],
+        toolCall: { id: 'call-1', name: 'read', args: { path: 'missing.txt' } },
+        usageTokens: 90_000,
+      };
+    }
+    // Distinctive continuation reply: the recovered answer must be observable
+    // as a delta and as a successful persisted assistant message, not only as
+    // model admission (the broad aborted turn also fulfills admission).
+    if (prompt.includes('[TOOL_RESULT')) return { deltas: ['continuation-recovered'] };
+    return { deltas: [`answer-${index}`] };
+  });
+  const handle = await fx.runtime.spawn('gru');
+  const events = collect(handle);
+  const rawSdkEvents: string[] = [];
+  const sdkSession = (handle as unknown as {
+    session: { subscribe?: (listener: (event: unknown) => void) => () => void };
+  }).session;
+  if (sdkSession.subscribe === undefined) throw new Error('SDK session is missing subscribe()');
+  sdkSession.subscribe((event) => rawSdkEvents.push(String((event as { type?: unknown }).type)));
+  const internal = handle as unknown as {
+    session: {
+      abort?: () => Promise<void>;
+      abortCompaction?: () => void;
+      isIdle: boolean;
+      agent: { state: { messages: Array<{ role: string; stopReason?: string; content?: unknown }> } };
+    };
+  };
+  try {
+    await handle.prompt('start');
+    const turn = handle.prompt('do the work').then(
+      () => 'resolved',
+      (error: Error) => `rejected:${error.message}`,
+    );
+    // Admit other-owner work while the turn is live and before native
+    // compaction opens: single-writer must hold it pending, and it must
+    // deliver exactly once after genuine settlement.
+    const queued = handle.prompt('queued work', { owner: 'other' }).then(
+      () => 'resolved',
+      (error: Error) => `rejected:${error.message}`,
+    );
+    let queuedSettled = false;
+    void queued.then(() => {
+      queuedSettled = true;
+    });
+    await waitFor(
+      () => events.some((event) => event.type === 'compaction_start'),
+      'compaction_start',
+    );
+    // Pending through the held summary: the queued item must not reach the
+    // model while compaction is in progress, and fresh execution requests
+    // against the compacting session must be refused by the admission guard.
+    const queuedPendingDuringStall = !queuedSettled;
+    const queuedModelCallsDuringStall = fx.script.calls.filter(
+      (call) => call.prompt === 'queued work',
+    ).length;
+    const guardOutcomes = await Promise.all([
+      handle.prompt('during compaction', { owner: 'other' }).then(
+        () => 'resolved',
+        (error: Error) => error.message,
+      ),
+      handle.steer('during compaction', { owner: 'other' }).then(
+        () => 'resolved',
+        (error: Error) => error.message,
+      ),
+      handle.followUp('during compaction', { owner: 'other' }).then(
+        () => 'resolved',
+        (error: Error) => error.message,
+      ),
+    ]);
+    // Pin each guard's rejection text and prove none of them reached the
+    // model: a single regex count would let any wording containing
+    // "compacting" pass, and a guard that rejects after enqueueing would be
+    // invisible without the model-call check. The stall-time count is kept
+    // AND the final count is re-taken after all work settles (a rejected but
+    // enqueued request could deliver later without changing a cached zero).
+    const guardMessages = guardOutcomes;
+    const guardModelCallsDuringStall = fx.script.calls.filter((call) =>
+      call.prompt.includes('during compaction'),
+    ).length;
+    // The cancellation seam under test: exactly one call, summary-only or broad.
+    let cancellations = 0;
+    let abortSettled: Promise<string> | null = null;
+    if (variant === 'broad') {
+      const abort = internal.session.abort;
+      if (abort === undefined) throw new Error('SDK session is missing abort()');
+      cancellations += 1;
+      // Capture the SDK abort promise instead of discarding it: a rejection
+      // must fail at this seam, not surface as an unhandled rejection.
+      abortSettled = abort.call(internal.session).then(
+        () => 'resolved',
+        (error: Error) => `rejected:${error.message}`,
+      );
+    } else {
+      const abortCompaction = internal.session.abortCompaction;
+      if (abortCompaction === undefined) throw new Error('SDK session is missing abortCompaction()');
+      cancellations += 1;
+      abortCompaction.call(internal.session);
+    }
+    let queuedSettledAfterCancel: boolean | null = null;
+    let queuedModelCallsAfterCancel: number | null = null;
+    let continuationCallsAfterCancel: number | null = null;
+    let postCancelGuardMessages: readonly string[] | null = null;
+    if (summaryMode === 'late-terminal') {
+      // The transport ignores the request signal: give the SDK abort path a
+      // bounded probe window for its own terminal, then settle the transport
+      // late. The probe never gates a pin — it only orders the release after
+      // the cancellation to define this mode.
+      const until = Date.now() + 2_000;
+      while (Date.now() < until && !rawSdkEvents.includes('compaction_end')) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      // Post-cancellation held-transport checkpoint: while the cancelled
+      // transport is STILL held (the release is below), the pending work must
+      // remain owed, nothing may reach the model, and the admission guard
+      // must still refuse fresh execution — the zero-premature-delivery
+      // interval is measured on the actual surface, not only before cancel.
+      queuedSettledAfterCancel = queuedSettled;
+      queuedModelCallsAfterCancel = fx.script.calls.filter(
+        (call) => call.prompt === 'queued work',
+      ).length;
+      continuationCallsAfterCancel = fx.script.calls.filter(
+        (call) => call.prompt.startsWith('do the work') && call.prompt.includes('[TOOL_RESULT'),
+      ).length;
+      postCancelGuardMessages = await Promise.all([
+        handle.prompt('during held cancel', { owner: 'other' }).then(
+          () => 'resolved',
+          (error: Error) => error.message,
+        ),
+        handle.steer('during held cancel', { owner: 'other' }).then(
+          () => 'resolved',
+          (error: Error) => error.message,
+        ),
+        handle.followUp('during held cancel', { owner: 'other' }).then(
+          () => 'resolved',
+          (error: Error) => error.message,
+        ),
+      ]);
+    }
+    releaseSummary(); // no-op for an already-aborted stream; settles a late one
+    await waitFor(
+      () => events.some((event) => event.type === 'compaction_end'),
+      'compaction_end',
+      8_000,
+    );
+    const turnOutcome = await turn;
+    const queuedOutcome = await queued;
+    await waitFor(
+      () => fx.script.calls.some((call) => call.prompt === 'queued work'),
+      'queued delivery',
+      8_000,
+    );
+    // Separate post-settlement usability check: fresh work on the settled
+    // session delivers exactly once, on its own.
+    const afterSettle = handle.prompt('after settle', { owner: 'other' }).then(
+      () => 'resolved',
+      (error: Error) => `rejected:${error.message}`,
+    );
+    const afterSettleOutcome = await afterSettle;
+    await waitFor(
+      () => fx.script.calls.some((call) => call.prompt === 'after settle'),
+      'post-settlement delivery',
+      8_000,
+    );
+    await waitFor(() => internal.session.isIdle || handle.health().state === 'disposed', 'session settle');
+    // The broad abort promise must resolve (session reached idle), never
+    // reject; the summary-only path has no broad abort at all.
+    const abortOutcome = abortSettled === null ? null : await abortSettled;
+    // Final guarded-prompt count AFTER the measured turn, queued work, and
+    // post-settlement request have all settled.
+    const guardModelCalls = fx.script.calls.filter((call) =>
+      call.prompt.includes('during compaction'),
+    ).length;
+    // r8: a guard that rejects but also enqueues would deliver the rejected
+    // request after the transport settles. Re-count the held-cancel prompts
+    // after settlement so the rejection text cannot mask that delivery.
+    const postCancelGuardModelCalls = fx.script.calls.filter((call) =>
+      call.prompt.includes('during held cancel'),
+    ).length;
+    // Anchor the abort-settlement marker to the FIRST summary call (the
+    // stalled one), not any later summary that the same signal could abort.
+    const firstSummary = fx.script.calls.find((call) =>
+      call.prompt.startsWith('<conversation>'),
+    );
+    // The recovered reply must be observable as a delta AND as a successful
+    // assistant message, not only as model admission. The durable check reads
+    // the session JSONL (the SDK persists asynchronously, so a narrow
+    // variant waits for it); the live SDK state check is kept separately.
+    const recoveredReplyDelta = events.some(
+      (event) => event.type === 'text_delta' && event.delta === 'continuation-recovered',
+    );
+    const recoveredReplyState = internal.session.agent.state.messages.some(
+      (message) =>
+        message.role === 'assistant' &&
+        message.stopReason === 'stop' &&
+        JSON.stringify(message.content ?? '').includes('continuation-recovered'),
+    );
+    const readDurableReply = (): boolean => {
+      const file = handle.sessionFile;
+      if (file === null) throw new Error('session file missing for the durable reply check');
+      let text: string;
+      try {
+        text = readFileSync(file, 'utf-8');
+      } catch {
+        return false;
+      }
+      return text.split('\n').some((line) => {
+        if (line.trim() === '') return false;
+        let entry: {
+          type?: unknown;
+          message?: { role?: unknown; stopReason?: unknown; content?: unknown };
+        };
+        try {
+          entry = JSON.parse(line) as typeof entry;
+        } catch {
+          // The SDK persists asynchronously: a partially flushed tail line is
+          // not a durable reply yet, so the poll simply retries (never throws
+          // out of the predicate).
+          return false;
+        }
+        return (
+          entry.type === 'message' &&
+          entry.message?.role === 'assistant' &&
+          entry.message?.stopReason === 'stop' &&
+          JSON.stringify(entry.message?.content ?? '').includes('continuation-recovered')
+        );
+      });
+    };
+    let recoveredReplyDurable = readDurableReply();
+    if (variant === 'narrow') {
+      await waitFor(() => {
+        recoveredReplyDurable = readDurableReply();
+        return recoveredReplyDurable;
+      }, 'durable recovered reply');
+    }
+    const compactionEnds = events.filter(
+      (event): event is Extract<RuntimeEvent, { type: 'compaction_end' }> =>
+        event.type === 'compaction_end',
+    );
+    return {
+      variant,
+      summaryMode,
+      cancellations,
+      abortOutcome,
+      turn: turnOutcome,
+      queued: queuedOutcome,
+      errorEvents: events.filter((event) => event.type === 'error').length,
+      errorMessages: events
+        .filter((event): event is Extract<RuntimeEvent, { type: 'error' }> => event.type === 'error')
+        .map((event) => event.error),
+      stateErrors: events.filter((event) => event.type === 'state' && event.state === 'error').length,
+      assistantErrors: internal.session.agent.state.messages.filter(
+        (message) => message.role === 'assistant' && message.stopReason === 'error',
+      ).length,
+      abortedEnds: compactionEnds.filter(
+        (event) => !event.success && event.error === 'compaction aborted',
+      ).length,
+      successEnds: compactionEnds.filter((event) => event.success).length,
+      terminalEnds: compactionEnds.map((event) => ({
+        success: event.success,
+        error: event.error ?? null,
+      })),
+      rawSdkCompactionEnds: rawSdkEvents.filter((type) => type === 'compaction_end').length,
+      summarySettledByAbort: firstSummary?.aborted === true,
+      stalledSummaryCalls: fx.script.calls.filter((call) =>
+        call.prompt.startsWith('<conversation>'),
+      ).length,
+      continuationReachedModel: fx.script.calls.some(
+        (call) => call.prompt.startsWith('do the work') && call.prompt.includes('[TOOL_RESULT'),
+      ),
+      recoveredReplyDelta,
+      recoveredReplyState,
+      recoveredReplyDurable,
+      queuedPendingDuringStall,
+      queuedModelCallsDuringStall,
+      queuedSettledAfterCancel,
+      queuedModelCallsAfterCancel,
+      continuationCallsAfterCancel,
+      postCancelGuardMessages,
+      postCancelGuardModelCalls,
+      guardMessages,
+      guardModelCallsDuringStall,
+      guardModelCalls,
+      queuedDelivered: fx.script.calls.filter((call) => call.prompt === 'queued work').length,
+      afterSettle: afterSettleOutcome,
+      afterSettleDelivered: fx.script.calls.filter((call) => call.prompt === 'after settle').length,
+      disposed: handle.health().state === 'disposed',
+      idle: internal.session.isIdle,
+    };
+  } finally {
+    releaseSummary();
+    await handle.dispose();
+  }
+}
+
+interface NativeQueueObservation {
+  readonly summaryMode: 'abort-settles' | 'late-terminal';
+  readonly pendingAfterAdmission: number;
+  readonly pendingDuringStall: number;
+  readonly modelCallsDuringStall: number;
+  readonly pendingAfterCancel: number | null;
+  readonly modelCallsAfterCancel: number | null;
+  readonly postCancelGuardMessages: readonly string[] | null;
+  readonly postCancelGuardModelCalls: number | null;
+  readonly turn: string;
+  readonly errorEvents: number;
+  readonly continuationReachedModel: boolean;
+  readonly followUpReplyDelta: boolean;
+  readonly followUpReplyState: boolean;
+  readonly delivered: number;
+  readonly pendingAfterSettlement: number;
+  readonly abortedEnds: number;
+  readonly successEnds: number;
+  readonly terminalEnds: readonly { readonly success: boolean; readonly error: string | null }[];
+  readonly summarySettledByAbort: boolean;
+  readonly idle: boolean;
+  readonly disposed: boolean;
+}
+
+/**
+ * Acceptance C for the NATIVE channel (the adapter-queue path is covered
+ * separately by observeCompactionCancellation): a same-owner SDK followUp is
+ * admitted while the measured run is live and BEFORE native threshold
+ * compaction opens (a tool-call stream gate), stays pending through the held
+ * summary, survives summary-only cancellation, and delivers exactly once
+ * after genuine settlement. The native surface itself proves admission:
+ * `pendingMessageCount` moves 0 -> 1 -> 0 and the followUp call is counted
+ * through the public SDK session, never the adapter queue.
+ */
+async function observeNativeFollowUpCancellation(
+  summaryMode: 'abort-settles' | 'late-terminal',
+): Promise<NativeQueueObservation> {
+  const history = 'history '.repeat(12_000); // ~24k estimated tokens: forces a discarding cut point
+  let releaseSummary: () => void = () => {};
+  const summaryHold = new Promise<void>((resolve) => {
+    releaseSummary = resolve;
+  });
+  let releaseToolCall: () => void = () => {};
+  const toolGate = new Promise<void>((resolve) => {
+    releaseToolCall = resolve;
+  });
+  let summaryCalls = 0;
+  const fx = await fixture((prompt, index) => {
+    if (prompt.startsWith('<conversation>')) {
+      summaryCalls += 1;
+      return summaryCalls === 1
+        ? { deltas: [], hold: summaryHold, honorAbort: summaryMode === 'abort-settles' }
+        : { deltas: ['summary'] };
+    }
+    if (index === 0) return { deltas: [history] };
+    if (index === 1) {
+      // Gate the tool-call stream: the test admits the native follow-up while
+      // the run is live and before prepareNextTurnWithContext can compact.
+      return {
+        deltas: [],
+        toolCall: { id: 'call-1', name: 'read', args: { path: 'missing.txt' } },
+        usageTokens: 90_000,
+        hold: toolGate,
+      };
+    }
+    // A distinctive reply for the queued follow-up: model admission alone
+    // cannot prove the delivered message produced a successful answer.
+    if (prompt === 'native follow-up') return { deltas: ['native-follow-up-answered'] };
+    return { deltas: [`answer-${index}`] };
+  });
+  const handle = await fx.runtime.spawn('gru');
+  const events = collect(handle);
+  const rawSdkEvents: string[] = [];
+  const sdkSession = (handle as unknown as {
+    session: {
+      subscribe?: (listener: (event: unknown) => void) => () => void;
+      followUp?: (text: string, images?: unknown) => Promise<void>;
+      pendingMessageCount?: number;
+      abortCompaction?: () => void;
+      isIdle: boolean;
+    };
+  }).session;
+  if (
+    sdkSession.subscribe === undefined ||
+    sdkSession.followUp === undefined ||
+    sdkSession.pendingMessageCount === undefined ||
+    sdkSession.abortCompaction === undefined
+  ) {
+    throw new Error('SDK session is missing a required native surface');
+  }
+  sdkSession.subscribe((event) => rawSdkEvents.push(String((event as { type?: unknown }).type)));
+  const pendingCount = (): number => {
+    const count = sdkSession.pendingMessageCount;
+    if (count === undefined) throw new Error('SDK session lost pendingMessageCount');
+    return count;
+  };
+  try {
+    await handle.prompt('start');
+    const turn = handle.prompt('do the work').then(
+      () => 'resolved',
+      (error: Error) => `rejected:${error.message}`,
+    );
+    await waitFor(
+      () => fx.script.calls.some((call) => call.prompt === 'do the work'),
+      'tool-call turn started',
+    );
+    // Same-owner native admission while the run is live: the adapter routes
+    // this to the SDK queue (counted by the proxy), never to its own queue.
+    await handle.followUp('native follow-up');
+    const pendingAfterAdmission = pendingCount();
+    releaseToolCall();
+    await waitFor(
+      () => events.some((event) => event.type === 'compaction_start'),
+      'compaction_start',
+    );
+    // Pending through the stall: nothing reaches the model while compaction is
+    // open, and the SDK still holds the message.
+    const pendingDuringStall = pendingCount();
+    const modelCallsDuringStall = fx.script.calls.filter(
+      (call) => call.prompt === 'native follow-up',
+    ).length;
+    // The cancellation seam under test: summary-only.
+    sdkSession.abortCompaction!();
+    let pendingAfterCancel: number | null = null;
+    let modelCallsAfterCancel: number | null = null;
+    let postCancelGuardMessages: readonly string[] | null = null;
+    if (summaryMode === 'late-terminal') {
+      // The transport ignores the request signal: give the SDK abort path a
+      // bounded probe window for its own terminal, then settle the transport
+      // late — the definition of this mode.
+      const until = Date.now() + 2_000;
+      while (Date.now() < until && !rawSdkEvents.includes('compaction_end')) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      // r7: post-cancellation held-transport checkpoint — the native queue's
+      // pending work must remain owed, nothing may reach the model, and the
+      // admission guard must still refuse fresh execution while the cancelled
+      // transport is still held (the release is below).
+      pendingAfterCancel = pendingCount();
+      modelCallsAfterCancel = fx.script.calls.filter(
+        (call) => call.prompt === 'native follow-up',
+      ).length;
+      postCancelGuardMessages = await Promise.all([
+        handle.prompt('during held cancel', { owner: 'other' }).then(
+          () => 'resolved',
+          (error: Error) => error.message,
+        ),
+        handle.steer('during held cancel', { owner: 'other' }).then(
+          () => 'resolved',
+          (error: Error) => error.message,
+        ),
+        handle.followUp('during held cancel', { owner: 'other' }).then(
+          () => 'resolved',
+          (error: Error) => error.message,
+        ),
+      ]);
+    }
+    releaseSummary();
+    await waitFor(
+      () => events.some((event) => event.type === 'compaction_end'),
+      'compaction_end',
+      8_000,
+    );
+    const turnOutcome = await turn;
+    await waitFor(
+      () => fx.script.calls.some((call) => call.prompt === 'native follow-up'),
+      'native follow-up delivery',
+      8_000,
+    );
+    await waitFor(() => pendingCount() === 0, 'native queue drained');
+    const internal = handle as unknown as {
+      session: {
+        isIdle: boolean;
+        agent: { state: { messages: Array<{ role: string; stopReason?: string; content?: unknown }> } };
+      };
+    };
+    await waitFor(() => internal.session.isIdle || handle.health().state === 'disposed', 'session settle');
+    // The delivered follow-up must produce a successful answer on the event
+    // surface, not only a model admission count.
+    await waitFor(
+      () =>
+        events.some(
+          (event) => event.type === 'text_delta' && event.delta === 'native-follow-up-answered',
+        ),
+      'native follow-up reply',
+      8_000,
+    );
+    const compactionEnds = events.filter(
+      (event): event is Extract<RuntimeEvent, { type: 'compaction_end' }> =>
+        event.type === 'compaction_end',
+    );
+    const postCancelGuardModelCalls = fx.script.calls.filter((call) =>
+      call.prompt.includes('during held cancel'),
+    ).length;
+    return {
+      summaryMode,
+      pendingAfterAdmission,
+      pendingDuringStall,
+      modelCallsDuringStall,
+      pendingAfterCancel,
+      modelCallsAfterCancel,
+      postCancelGuardMessages,
+      postCancelGuardModelCalls,
+      followUpReplyDelta: events.some(
+        (event) => event.type === 'text_delta' && event.delta === 'native-follow-up-answered',
+      ),
+      followUpReplyState: internal.session.agent.state.messages.some(
+        (message) =>
+          message.role === 'assistant' &&
+          message.stopReason === 'stop' &&
+          JSON.stringify(message.content ?? '').includes('native-follow-up-answered'),
+      ),
+      turn: turnOutcome,
+      errorEvents: events.filter((event) => event.type === 'error').length,
+      continuationReachedModel: fx.script.calls.some(
+        (call) => call.prompt.startsWith('do the work') && call.prompt.includes('[TOOL_RESULT'),
+      ),
+      delivered: fx.script.calls.filter((call) => call.prompt === 'native follow-up').length,
+      pendingAfterSettlement: pendingCount(),
+      abortedEnds: compactionEnds.filter(
+        (event) => !event.success && event.error === 'compaction aborted',
+      ).length,
+      successEnds: compactionEnds.filter((event) => event.success).length,
+      terminalEnds: compactionEnds.map((event) => ({
+        success: event.success,
+        error: event.error ?? null,
+      })),
+      summarySettledByAbort: fx.script.calls.some(
+        (call) => call.prompt.startsWith('<conversation>') && call.aborted,
+      ),
+      idle: internal.session.isIdle,
+      disposed: handle.health().state === 'disposed',
+    };
+  } finally {
+    releaseSummary();
+    releaseToolCall();
+    await handle.dispose();
+  }
+}
+
 describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
   it('spawns a session persisted under the instance sessions dir', async () => {
     const fx = await fixture();
@@ -745,6 +1373,427 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       internal.session = nativeSession;
       await handle.dispose();
     }
+  });
+
+  describe('compaction cancellation boundary: summary-only vs broad (test-only seam, no product change)', () => {
+    it('broad cancellation: the live pending turn is cancelled and surfaces the SDK abort error', async () => {
+      const observation = await observeCompactionCancellation('broad', 'abort-settles');
+      expect(observation.cancellations).toBe(1);
+      expect(observation.abortOutcome).toBe('resolved');
+      expect(observation.turn).toBe('resolved');
+      expect(observation.errorEvents).toBe(1);
+      // The surfaced error is the SDK abort message, not an anonymous failure:
+      // the test title's claim is pinned to the actual text.
+      expect(observation.errorMessages).toHaveLength(1);
+      expect(observation.errorMessages[0]).toContain('aborted');
+      expect(observation.stateErrors).toBe(1);
+      expect(observation.assistantErrors).toBe(1);
+      expect(observation.continuationReachedModel).toBe(false);
+      expect(observation.recoveredReplyDelta).toBe(false);
+      expect(observation.recoveredReplyState).toBe(false);
+      expect(observation.recoveredReplyDurable).toBe(false);
+      expect(observation.summarySettledByAbort).toBe(true);
+      // The aborted first cycle is superseded by the SDK's immediate
+      // prepareNextTurn retry, which completes before the adapter's single
+      // pending-terminal slot has an idle gate to publish: consumers see the
+      // eventual success exactly once, never a duplicate or a wedged slot.
+      expect(observation.abortedEnds).toBe(0);
+      expect(observation.successEnds).toBe(1);
+      // Acceptance D: the COMPLETE external terminal list, not just success
+      // and the one exact failure text — a differently-worded extra terminal
+      // can no longer escape this oracle.
+      expect(observation.terminalEnds).toEqual([{ success: true, error: null }]);
+      expect(observation.rawSdkCompactionEnds).toBeGreaterThanOrEqual(1);
+      expect(observation.queuedDelivered).toBe(1);
+      expect(observation.queued).toBe('resolved');
+      expect(observation.queuedPendingDuringStall).toBe(true);
+      expect(observation.queuedModelCallsDuringStall).toBe(0);
+      expect(observation.guardMessages).toEqual([
+        'agent session is compacting; prompt requires an idle session',
+        'agent session is compacting; steer requires an idle session',
+        'agent session is compacting; follow-up requires an idle session',
+      ]);
+      expect(observation.guardModelCallsDuringStall).toBe(0);
+      expect(observation.guardModelCalls).toBe(0);
+      expect(observation.stalledSummaryCalls).toBeGreaterThanOrEqual(1);
+      expect(observation.afterSettle).toBe('resolved');
+      expect(observation.afterSettleDelivered).toBe(1);
+      expect(observation.idle).toBe(true);
+      expect(observation.disposed).toBe(false);
+    });
+
+    it('narrow cancellation: the pending turn answers, no error events, follow-up work exactly once', async () => {
+      const observation = await observeCompactionCancellation('narrow', 'abort-settles');
+      expect(observation.cancellations).toBe(1);
+      expect(observation.abortOutcome).toBeNull();
+      expect(observation.turn).toBe('resolved');
+      expect(observation.errorEvents).toBe(0);
+      expect(observation.stateErrors).toBe(0);
+      expect(observation.assistantErrors).toBe(0);
+      expect(observation.continuationReachedModel).toBe(true);
+      expect(observation.recoveredReplyDelta).toBe(true);
+      expect(observation.recoveredReplyState).toBe(true);
+      expect(observation.recoveredReplyDurable).toBe(true);
+      expect(observation.summarySettledByAbort).toBe(true);
+      // The SDK reports the summary-only cancellation as an aborted
+      // compaction; the adapter publishes that failure terminal exactly once.
+      expect(observation.abortedEnds).toBe(1);
+      expect(observation.successEnds).toBe(0);
+      expect(observation.terminalEnds).toEqual([{ success: false, error: 'compaction aborted' }]);
+      expect(observation.rawSdkCompactionEnds).toBeGreaterThanOrEqual(1);
+      expect(observation.queuedDelivered).toBe(1);
+      expect(observation.queued).toBe('resolved');
+      expect(observation.queuedPendingDuringStall).toBe(true);
+      expect(observation.queuedModelCallsDuringStall).toBe(0);
+      expect(observation.guardMessages).toEqual([
+        'agent session is compacting; prompt requires an idle session',
+        'agent session is compacting; steer requires an idle session',
+        'agent session is compacting; follow-up requires an idle session',
+      ]);
+      expect(observation.guardModelCallsDuringStall).toBe(0);
+      expect(observation.guardModelCalls).toBe(0);
+      expect(observation.stalledSummaryCalls).toBeGreaterThanOrEqual(1);
+      expect(observation.afterSettle).toBe('resolved');
+      expect(observation.afterSettleDelivered).toBe(1);
+      expect(observation.idle).toBe(true);
+      expect(observation.disposed).toBe(false);
+    });
+
+    it('late terminal under broad cancellation: the cancelled run stays cancelled; one terminal publishes', async () => {
+      const observation = await observeCompactionCancellation('broad', 'late-terminal');
+      expect(observation.cancellations).toBe(1);
+      expect(observation.abortOutcome).toBe('resolved');
+      expect(observation.turn).toBe('resolved');
+      expect(observation.errorEvents).toBe(1);
+      expect(observation.errorMessages).toHaveLength(1);
+      expect(observation.errorMessages[0]).toContain('aborted');
+      expect(observation.assistantErrors).toBe(1);
+      expect(observation.continuationReachedModel).toBe(false);
+      expect(observation.recoveredReplyDelta).toBe(false);
+      expect(observation.recoveredReplyState).toBe(false);
+      expect(observation.recoveredReplyDurable).toBe(false);
+      expect(observation.summarySettledByAbort).toBe(false);
+      expect(observation.abortedEnds).toBe(0);
+      expect(observation.successEnds).toBe(1);
+      expect(observation.terminalEnds).toEqual([{ success: true, error: null }]);
+      expect(observation.rawSdkCompactionEnds).toBeGreaterThanOrEqual(1);
+      expect(observation.queuedDelivered).toBe(1);
+      expect(observation.queued).toBe('resolved');
+      expect(observation.queuedPendingDuringStall).toBe(true);
+      expect(observation.queuedModelCallsDuringStall).toBe(0);
+      expect(observation.guardMessages).toEqual([
+        'agent session is compacting; prompt requires an idle session',
+        'agent session is compacting; steer requires an idle session',
+        'agent session is compacting; follow-up requires an idle session',
+      ]);
+      expect(observation.guardModelCallsDuringStall).toBe(0);
+      expect(observation.guardModelCalls).toBe(0);
+      expect(observation.stalledSummaryCalls).toBeGreaterThanOrEqual(1);
+      expect(observation.afterSettle).toBe('resolved');
+      expect(observation.afterSettleDelivered).toBe(1);
+      expect(observation.idle).toBe(true);
+      expect(observation.disposed).toBe(false);
+      // r7: the zero-premature-delivery interval is pinned AFTER cancellation
+      // while the transport is still held: work stays owed on the actual
+      // surface, nothing reached the model, and fresh execution is refused.
+      expect(observation.queuedSettledAfterCancel).toBe(false);
+      expect(observation.queuedModelCallsAfterCancel).toBe(0);
+      expect(observation.continuationCallsAfterCancel).toBe(0);
+      expect(observation.postCancelGuardMessages).toEqual([
+        'agent session is compacting; prompt requires an idle session',
+        'agent session is compacting; steer requires an idle session',
+        'agent session is compacting; follow-up requires an idle session',
+      ]);
+      expect(observation.postCancelGuardModelCalls).toBe(0);
+    });
+
+    it('late terminal under narrow cancellation: the run recovers and no terminal duplicates publish', async () => {
+      const observation = await observeCompactionCancellation('narrow', 'late-terminal');
+      expect(observation.cancellations).toBe(1);
+      expect(observation.abortOutcome).toBeNull();
+      expect(observation.turn).toBe('resolved');
+      expect(observation.errorEvents).toBe(0);
+      expect(observation.assistantErrors).toBe(0);
+      expect(observation.continuationReachedModel).toBe(true);
+      expect(observation.recoveredReplyDelta).toBe(true);
+      expect(observation.recoveredReplyState).toBe(true);
+      expect(observation.recoveredReplyDurable).toBe(true);
+      expect(observation.summarySettledByAbort).toBe(false);
+      expect(observation.abortedEnds).toBe(1);
+      expect(observation.successEnds).toBe(0);
+      expect(observation.terminalEnds).toEqual([{ success: false, error: 'compaction aborted' }]);
+      expect(observation.rawSdkCompactionEnds).toBeGreaterThanOrEqual(1);
+      expect(observation.queuedDelivered).toBe(1);
+      expect(observation.queued).toBe('resolved');
+      expect(observation.queuedPendingDuringStall).toBe(true);
+      expect(observation.queuedModelCallsDuringStall).toBe(0);
+      expect(observation.guardMessages).toEqual([
+        'agent session is compacting; prompt requires an idle session',
+        'agent session is compacting; steer requires an idle session',
+        'agent session is compacting; follow-up requires an idle session',
+      ]);
+      expect(observation.guardModelCallsDuringStall).toBe(0);
+      expect(observation.guardModelCalls).toBe(0);
+      expect(observation.stalledSummaryCalls).toBeGreaterThanOrEqual(1);
+      expect(observation.afterSettle).toBe('resolved');
+      expect(observation.afterSettleDelivered).toBe(1);
+      expect(observation.idle).toBe(true);
+      expect(observation.disposed).toBe(false);
+      // r7: the zero-premature-delivery interval is pinned AFTER cancellation
+      // while the transport is still held: work stays owed on the actual
+      // surface, nothing reached the model, and fresh execution is refused.
+      expect(observation.queuedSettledAfterCancel).toBe(false);
+      expect(observation.queuedModelCallsAfterCancel).toBe(0);
+      expect(observation.continuationCallsAfterCancel).toBe(0);
+      expect(observation.postCancelGuardMessages).toEqual([
+        'agent session is compacting; prompt requires an idle session',
+        'agent session is compacting; steer requires an idle session',
+        'agent session is compacting; follow-up requires an idle session',
+      ]);
+      expect(observation.postCancelGuardModelCalls).toBe(0);
+    });
+
+    it('explicit stop context: dispose aborts the live stream, rejects queued work, and releases the session', async () => {
+      let release!: () => void;
+      const hold = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      // The live stream honors the request signal: disposal must settle it by
+      // abort instead of waiting on a hold only the test can release.
+      const fx = await fixture([
+        { deltas: ['live'], hold, honorAbort: true },
+        { deltas: ['never'] },
+      ]);
+      const handle = await fx.runtime.spawn('gru');
+      expect(handle.sessionFile).not.toBeNull();
+      const sessionFile = handle.sessionFile!;
+      const live = handle.prompt('live turn').then(
+        () => 'resolved',
+        (error: Error) => `rejected:${error.message}`,
+      );
+      const queued = handle.prompt('queued behind live', { owner: 'other' }).then(
+        () => 'resolved',
+        (error: Error) => `rejected:${error.message}`,
+      );
+      try {
+        await waitFor(
+          () => fx.script.calls.some((call) => call.prompt === 'live turn'),
+          'live turn admitted',
+        );
+        await handle.dispose();
+        // Disposal settled the live stream by abort — never left it held.
+        await waitFor(
+          () => fx.script.calls[0]?.aborted === true,
+          'live stream abort settlement',
+        );
+        expect(fx.script.calls[0]?.aborted).toBe(true);
+        expect(await queued).toMatch(
+          /rejected:agent session disposed before queued message was delivered/,
+        );
+        expect(handle.health().state).toBe('disposed');
+        expect(existsSync(`${sessionFile}.lock`)).toBe(false);
+        // The queued request never reached the model; only the live one did.
+        const prompts = fx.script.calls.map((call) => call.prompt);
+        expect(prompts).not.toContain('queued behind live');
+        expect(prompts).toEqual(['live turn']);
+        // The aborted live turn settles (no wedged run); its stream-abort
+        // settlement is pinned above, and disposal owns the terminal state.
+        // Pin the outcome too: an unexpected provider failure must not pass
+        // behind the successful stream-abort check.
+        expect(await live).toBe('resolved');
+      } finally {
+        release();
+        await live.catch(() => {});
+        await handle.dispose();
+      }
+    });
+
+    it('a stuck native gate after its terminal reconciles at the 5s bound: one failed terminal, then disposal', async () => {
+      const fx = await fixture([{ deltas: ['prime'] }]);
+      const handle = await fx.runtime.spawn('gru');
+      const events = collect(handle);
+      const internal = handle as unknown as {
+        session: { isCompacting: boolean };
+        onPiEvent(event: unknown): void;
+      };
+      const nativeSession = internal.session;
+      try {
+        await handle.prompt('prime');
+        // Pi dispatches compaction_end before the session clears isCompacting;
+        // hold that gate closed to pin the adapter's bounded reconciliation.
+        internal.session = new Proxy(nativeSession, {
+          get(target, key) {
+            if (key === 'isCompacting') return true;
+            return Reflect.get(target, key, target);
+          },
+        });
+        // Fake timers AFTER the real session is primed: the reconcile bound is
+        // then pinned deterministically instead of measuring host scheduling
+        // (a delayed worker could otherwise resume the negative check after
+        // the bound, or the positive check after a wall-clock ceiling, despite
+        // correct behavior).
+        vi.useFakeTimers();
+        try {
+          internal.onPiEvent({ type: 'compaction_start' });
+          internal.onPiEvent({ type: 'compaction_end', aborted: true });
+          // Nothing publishes before the bound.
+          await vi.advanceTimersByTimeAsync(4_999);
+          expect(events.some((event) => event.type === 'compaction_end')).toBe(false);
+          // Crossing the 5,000ms bound (with one second of fake-clock slack so
+          // a widened constant still fails while a poll-cadence change does
+          // not) publishes exactly one failed terminal.
+          await vi.advanceTimersByTimeAsync(1_000);
+          const ends = events.filter(
+            (event): event is Extract<RuntimeEvent, { type: 'compaction_end' }> =>
+              event.type === 'compaction_end',
+          );
+          expect(ends).toHaveLength(1);
+          expect(ends[0]!.success).toBe(false);
+          expect(ends[0]!.error).toBe('native compaction state did not settle after its terminal event');
+          // Drain any disposal timers while the fake clock is still installed.
+          await vi.advanceTimersByTimeAsync(60_000);
+        } finally {
+          vi.useRealTimers();
+        }
+        // The reconcile path disposes instead of wedging on the stuck gate.
+        await waitFor(() => handle.health().state === 'disposed', 'reconciled disposal');
+        expect(handle.sessionFile).not.toBeNull();
+        expect(existsSync(`${handle.sessionFile!}.lock`)).toBe(false);
+      } finally {
+        internal.session = nativeSession;
+        await handle.dispose();
+      }
+    });
+
+    it('a signal-ignoring summary keeps compaction open until disposal: one failed terminal, no duplicates', async () => {
+      let releaseSummary: () => void = () => {};
+      const summaryHold = new Promise<void>((resolve) => {
+        releaseSummary = resolve;
+      });
+      const fx = await fixture((prompt, index) => {
+        if (prompt.startsWith('<conversation>')) return { deltas: [], hold: summaryHold };
+        if (index === 0) return { deltas: ['history '.repeat(12_000)] };
+        if (index === 1) {
+          return {
+            deltas: [],
+            toolCall: { id: 'call-1', name: 'read', args: { path: 'missing.txt' } },
+            usageTokens: 90_000,
+          };
+        }
+        return { deltas: [`answer-${index}`] };
+      });
+      const handle = await fx.runtime.spawn('gru');
+      const events = collect(handle);
+      const internal = handle as unknown as {
+        session: { abortCompaction?: () => void };
+      };
+      let disposal: Promise<void> | null = null;
+      try {
+        await handle.prompt('start');
+        const turn = handle.prompt('do the work').then(
+          () => 'resolved',
+          (error: Error) => `rejected:${error.message}`,
+        );
+        await waitFor(
+          () => events.some((event) => event.type === 'compaction_start'),
+          'compaction_start',
+        );
+        if (internal.session.abortCompaction === undefined) {
+          throw new Error('SDK session is missing abortCompaction()');
+        }
+        internal.session.abortCompaction();
+        // The transport ignores the cancellation: no terminal is fabricated
+        // while the summary stays open.
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        expect(events.some((event) => event.type === 'compaction_end')).toBe(false);
+        // Disposal is the way out of a truly stuck provider summary. Its
+        // failed terminal is published synchronously, before disposal awaits
+        // SDK session-level idle (which can wait on the held summary), so
+        // start disposal without awaiting it, inspect that terminal while the
+        // stream is still held, then release the stream and await the ORIGINAL
+        // disposal promise. A second dispose() call returns early and does not
+        // join the first, so cleanup keeps this promise.
+        disposal = handle.dispose();
+        const endsWhileHeld = events.filter(
+          (event): event is Extract<RuntimeEvent, { type: 'compaction_end' }> =>
+            event.type === 'compaction_end',
+        );
+        expect(endsWhileHeld).toHaveLength(1);
+        expect(endsWhileHeld[0]!.success).toBe(false);
+        expect(endsWhileHeld[0]!.error).toBe('agent session disposed during native compaction');
+        // No second terminal while the summary remains open.
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        expect(
+          events.filter((event) => event.type === 'compaction_end'),
+        ).toHaveLength(1);
+        releaseSummary();
+        await disposal;
+        await turn.catch(() => {});
+        expect(handle.health().state).toBe('disposed');
+        expect(handle.sessionFile).not.toBeNull();
+        expect(existsSync(`${handle.sessionFile!}.lock`)).toBe(false);
+        // A late transport settlement adds no second terminal.
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(
+          events.filter((event) => event.type === 'compaction_end'),
+        ).toHaveLength(1);
+      } finally {
+        releaseSummary();
+        if (disposal !== null) await disposal.catch(() => {});
+        else await handle.dispose().catch(() => {});
+      }
+    });
+
+    it('native SDK follow-up: admitted before compaction, pending through the stall, delivered once (signal settles)', async () => {
+      const observation = await observeNativeFollowUpCancellation('abort-settles');
+      expect(observation.pendingAfterAdmission).toBe(1);
+      expect(observation.pendingDuringStall).toBe(1);
+      expect(observation.modelCallsDuringStall).toBe(0);
+      expect(observation.turn).toBe('resolved');
+      expect(observation.errorEvents).toBe(0);
+      expect(observation.continuationReachedModel).toBe(true);
+      expect(observation.delivered).toBe(1);
+      expect(observation.pendingAfterSettlement).toBe(0);
+      expect(observation.abortedEnds).toBe(1);
+      expect(observation.successEnds).toBe(0);
+      expect(observation.terminalEnds).toEqual([{ success: false, error: 'compaction aborted' }]);
+      expect(observation.summarySettledByAbort).toBe(true);
+      expect(observation.idle).toBe(true);
+      expect(observation.disposed).toBe(false);
+      expect(observation.followUpReplyDelta).toBe(true);
+      expect(observation.followUpReplyState).toBe(true);
+    });
+
+    it('native SDK follow-up: late transport settlement still delivers the pending message exactly once', async () => {
+      const observation = await observeNativeFollowUpCancellation('late-terminal');
+      expect(observation.pendingAfterAdmission).toBe(1);
+      expect(observation.pendingDuringStall).toBe(1);
+      expect(observation.modelCallsDuringStall).toBe(0);
+      expect(observation.turn).toBe('resolved');
+      expect(observation.errorEvents).toBe(0);
+      expect(observation.continuationReachedModel).toBe(true);
+      expect(observation.delivered).toBe(1);
+      expect(observation.pendingAfterSettlement).toBe(0);
+      expect(observation.abortedEnds).toBe(1);
+      expect(observation.successEnds).toBe(0);
+      expect(observation.terminalEnds).toEqual([{ success: false, error: 'compaction aborted' }]);
+      expect(observation.summarySettledByAbort).toBe(false);
+      expect(observation.idle).toBe(true);
+      expect(observation.disposed).toBe(false);
+      // r7: the held-transport interval is pinned AFTER cancellation too: the
+      // native queue still owes the message on its real surface, nothing
+      // reached the model, and fresh execution is refused.
+      expect(observation.pendingAfterCancel).toBe(1);
+      expect(observation.modelCallsAfterCancel).toBe(0);
+      expect(observation.postCancelGuardMessages).toEqual([
+        'agent session is compacting; prompt requires an idle session',
+        'agent session is compacting; steer requires an idle session',
+        'agent session is compacting; follow-up requires an idle session',
+      ]);
+      expect(observation.postCancelGuardModelCalls).toBe(0);
+      expect(observation.followUpReplyDelta).toBe(true);
+      expect(observation.followUpReplyState).toBe(true);
+    });
   });
 
   it('emits thinking deltas before text when the model reasons', async () => {
