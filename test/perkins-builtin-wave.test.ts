@@ -1523,6 +1523,54 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     expect(outcome.verdict).toBeNull();
     expect(outcome.canonicalVerdict).toBe('INCOMPLETE');
     expect(escalations.some((line) => line.includes('NOT posted safely'))).toBe(true);
+    // Even an exhausted lookup with NO match keeps the do-not-retry
+    // caution: a just-created review can lag a provider listing, so null
+    // absence is not permission to retry blindly (R31).
+    expect(escalations.some((line) => line.includes('verify manually before any retry'))).toBe(true);
+  });
+
+  it('refuses a provider receipt without a base binding and stays honestly unposted (R34)', async () => {
+    const repo = makeFixtureRepo('perkins-missing-base-receipt');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/missing-base-receipt']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-mbase-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-mbase-artifacts-'));
+    const sessions = mkdtempSync(join(tmpdir(), 'perkins-mbase-sessions-'));
+    dirs.push(root, artifacts, sessions);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-mbase-db-')));
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/missing-base-receipt', target);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-mbase' });
+    const job = ledger.addJob({ id: 'job-mbase', repo: 'fixture', title: 'missing base receipt', baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/41');
+    attachOrigin(repo, 'feature/missing-base-receipt', root);
+    // An otherwise valid receipt whose base is the shape the shared restart
+    // reader rejects: the writer must refuse it, never persist an event
+    // recovery cannot parse.
+    const post = vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
+      reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+      headSha: call.targetSha, baseSha: '',
+      bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
+    }));
+    const escalations: string[] = [];
+    const wave = new WaveRunner({
+      ledger, worktrees: port, spawner: makeSpawner(sessions, []), poster: { post }, reviewArtifactRoot: artifacts,
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      prHeadProbe: localHeadProbe('feature/missing-base-receipt'),
+    });
+    const outcome = asWave(await wave.runRound({ jobId: job.id }));
+    expect(outcome.posted).toBe(false);
+    expect(outcome.verdict).toBeNull();
+    expect(outcome.canonicalVerdict).toBe('INCOMPLETE');
+    expect(ledger.latestRoundEvent(outcome.round.id, 'round.posted')).toBeNull();
+    const incomplete = ledger.latestRoundEvent(outcome.round.id, 'round.perkins-incomplete')?.payload as { reason?: string; error?: string };
+    expect(incomplete?.reason).toBe('report_not_posted');
+    expect(incomplete?.error).toContain('missing the base binding');
+    expect(escalations.some((line) => line.includes('missing the base binding'))).toBe(true);
   });
 
   it('carries the reconciliation failure and its manual-verification warning into the durable record (R31)', async () => {
@@ -3666,6 +3714,17 @@ describe('repair pass 3: GitHub receipt identity, state, and pagination (R4/R5/R
     await expect(poster.reconcile!(input(repoPath))).resolves.toMatchObject({ reviewId: '9200', actor: 'gru-bot', event: 'COMMENTED', commitId: head });
   });
 
+  it('returns an earlier usable bound match when a later match carries an unusable id (R13/R28)', async () => {
+    const unusable = { id: null, user: { login: 'gru-bot' }, state: 'COMMENTED', commit_id: head, body };
+    const usable = { id: 9101, user: { login: 'gru-bot' }, state: 'COMMENTED', commit_id: head, body };
+    const mixed = makeDouble({ reviewPages: [[usable, unusable]] });
+    await expect(mixed.poster.reconcile!(input(mixed.repoPath))).resolves.toMatchObject({ reviewId: '9101', commitId: head });
+    // If EVERY collected match is unusable the outcome is a loud refusal,
+    // never reported as absence (which could invite a duplicate POST).
+    const allUnusable = makeDouble({ reviewPages: [[unusable]] });
+    await expect(allUnusable.poster.reconcile!(input(allUnusable.repoPath))).rejects.toThrow(/missing a review id/);
+  });
+
   it('probes the authenticated account BEFORE the irreversible POST (R32)', async () => {
     const { poster, log, repoPath } = makeDouble({ loginProbeFails: true });
     await expect(poster.post(input(repoPath))).rejects.toThrow(/cannot resolve the authenticated gh account/);
@@ -3877,11 +3936,18 @@ describe('repair pass 3: GitLab note reconciliation fails closed (R3/T7)', () =>
     expect(missing.calls.some((call) => call.url.includes('/notes'))).toBe(false);
 
     // A base that vanishes between the pre-POST probe and the post-delivery
-    // confirmation is refused the same way rather than persisted as a
-    // receipt the restart reader must reject.
+    // confirmation falls back to the base PROVEN for this same head by the
+    // pre-POST probe instead of stranding a note that already exists.
     const vanished = gitlabDouble({ mrBaseShaAfterPost: null, noteCreated: { id: 57, body, author: { username: 'gru-bot' } } });
-    await expect(vanished.poster.post(input(vanished.repoPath))).rejects.toThrow(/missing the base sha/);
+    await expect(vanished.poster.post(input(vanished.repoPath))).resolves.toMatchObject({ reviewId: '57', baseSha: base });
     expect(vanished.calls.some((call) => call.url.includes('/notes') && !call.url.includes('?'))).toBe(true);
+
+    // A whitespace-only base is as unusable as a missing one (the shared
+    // reader trims): it is refused BEFORE the note exists.
+    const whitespace = gitlabDouble({ mrBaseSha: '   ' });
+    await expect(whitespace.poster.post(input(whitespace.repoPath))).rejects.toThrow(/missing the base sha/);
+    expect(whitespace.calls).toHaveLength(1);
+    expect(whitespace.calls.some((call) => call.url.includes('/notes'))).toBe(false);
   });
 
   it('treats a body-identical note by another author as ambiguity, never as absence (R35)', async () => {
@@ -3896,6 +3962,16 @@ describe('repair pass 3: GitLab note reconciliation fails closed (R3/T7)', () =>
     }));
     const late = gitlabDouble({ notePages: [filler, [{ id: 78, body, author: { username: 'someone-else' } }]] });
     await expect(late.poster.reconcile!(input(late.repoPath))).rejects.toThrow(/AMBIGUOUS/);
+
+    // ...and at the page cap itself: ten FULL pages where the only body
+    // match is foreign must still report ambiguity, not the generic bound.
+    const capped = gitlabDouble({
+      notePages: [
+        ...Array.from({ length: 9 }, () => filler),
+        [...filler.slice(1), { id: 80, body, author: { username: 'someone-else' } }],
+      ],
+    });
+    await expect(capped.poster.reconcile!(input(capped.repoPath))).rejects.toThrow(/AMBIGUOUS/);
 
     // A body match with no usable author is unattributed: ambiguity too,
     // never assumed to be this service's note.
@@ -3954,7 +4030,7 @@ describe('repair pass 3: restart recovery binding contract (R1/R2/R21)', () => {
       publicationFile,
       sha,
       payload: {
-        verdict: 'changes-requested', canonicalVerdict: 'NEEDS CHANGES', url: prUrl, host: 'git.example.invalid',
+        verdict: 'changes-requested', canonicalVerdict: 'NEEDS CHANGES', url: prUrl, host: new URL(prUrl).host,
         targetSha, baseSha: '2'.repeat(40),
         publicationFile, publicationSha256: sha,
         receipt: { reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: targetSha, headSha: targetSha, baseSha: '2'.repeat(40), bodySha256: sha },
@@ -4169,6 +4245,88 @@ describe('repair pass 3: restart recovery binding contract (R1/R2/R21)', () => {
       expect(ledger.getRound(roundId)?.verdict, label).toBeNull();
       expect(escalations.some((line) => line.includes('did not match the posted digest')), label).toBe(true);
     }
+  });
+
+  it('refuses a posted event whose host is not its pull request URL host, without probing it (R30)', async () => {
+    const { ledger, port, artifacts, job, roundId, targetSha } = await recoveryFixture('p3-r30-host-binding');
+    const good = healthyEvent(roundId, artifacts, job!.prUrl!, targetSha);
+    ledger.appendCustomEvent({
+      kind: 'round.posted', jobId: job!.id, roundId,
+      payload: { ...good.payload, host: 'gitlab.attacker.test' },
+    });
+    const escalations: string[] = [];
+    const poster = { post: vi.fn(), authenticatedActor: vi.fn(async () => 'gru-bot') };
+    const wave = new WaveRunner({
+      ledger, worktrees: port, spawner: vi.fn() as unknown as AgentSpawner,
+      poster, reviewArtifactRoot: artifacts,
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+    });
+    expect(await wave.recoverInterruptedRounds()).toBe(1);
+    expect(ledger.getRound(roundId)).toMatchObject({ status: 'aborted', verdict: null });
+    // The forged host never reaches the identity probe with a credential.
+    expect(poster.authenticatedActor).not.toHaveBeenCalled();
+    expect(escalations.some((line) => line.includes('host does not match its pull request URL'))).toBe(true);
+  });
+
+  it('recovers a fully bound posted event even when the review lane registration was lost (R30/R1)', async () => {
+    const { ledger, port, artifacts, job, roundId, targetSha } = await recoveryFixture('p3-r30-missing-lane');
+    const good = healthyEvent(roundId, artifacts, job!.prUrl!, targetSha);
+    ledger.appendCustomEvent({ kind: 'round.posted', jobId: job!.id, roundId, payload: good.payload });
+    // Present the lost-registration state through the same port interface:
+    // the round exists in the ledger but has no lane row at all.
+    const laneLessPort: WorktreePort = {
+      createJobWorktree: (input) => port.createJobWorktree(input),
+      resolveReviewTarget: (input) => port.resolveReviewTarget(input),
+      createReviewWorktree: (input) => port.createReviewWorktree(input),
+      getWorktree: (id) => port.getWorktree(id),
+      listWorktrees: (opts) => port.listWorktrees(opts).filter((lane) => lane.roundId !== roundId),
+      release: (input) => port.release(input),
+    };
+    const poster = { post: vi.fn(), authenticatedActor: async () => 'gru-bot' };
+    const wave = new WaveRunner({
+      ledger, worktrees: laneLessPort, spawner: vi.fn() as unknown as AgentSpawner,
+      poster, reviewArtifactRoot: artifacts,
+    });
+    expect(await wave.recoverInterruptedRounds()).toBe(1);
+    expect(ledger.getRound(roundId)).toMatchObject({ status: 'verdict-posted', verdict: 'changes-requested' });
+    expect(ledger.latestRoundEvent(roundId, 'round.post-recovered')?.payload).toMatchObject({ verdict: 'changes-requested' });
+    expect(poster.post).not.toHaveBeenCalled();
+  });
+
+  it('routes restart-recovery identity evidence through the host-selected composite (R30)', async () => {
+    const gitlabUrl = 'https://gitlab.example.test/acme/fixture/-/merge_requests/7';
+    const makeGitlabPost = async (name: string, evidencedAccount: string) => {
+      const fixture = await recoveryFixture(name);
+      fixture.ledger.setJobPr(fixture.job!.id, gitlabUrl);
+      const good = healthyEvent(fixture.roundId, fixture.artifacts, gitlabUrl, fixture.targetSha);
+      const payload = {
+        ...good.payload,
+        receipt: { ...(good.payload.receipt as Record<string, unknown>), event: 'note', commitId: null },
+      };
+      fixture.ledger.appendCustomEvent({ kind: 'round.posted', jobId: fixture.job!.id, roundId: fixture.roundId, payload });
+      const github = { post: vi.fn(), authenticatedActor: vi.fn(async () => 'github-bot') };
+      const gitlab = { post: vi.fn(), authenticatedActor: vi.fn(async () => evidencedAccount) };
+      const poster = new AutoVerdictPoster(github as unknown as VerdictPoster, gitlab as unknown as VerdictPoster);
+      const escalations: string[] = [];
+      const wave = new WaveRunner({
+        ledger: fixture.ledger, worktrees: fixture.port, spawner: vi.fn() as unknown as AgentSpawner,
+        poster, reviewArtifactRoot: fixture.artifacts,
+        escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      });
+      expect(await wave.recoverInterruptedRounds()).toBe(1);
+      return { fixture, github, gitlab, escalations };
+    };
+    const matched = await makeGitlabPost('p3-r30-auto-match', 'gru-bot');
+    expect(matched.fixture.ledger.getRound(matched.fixture.roundId)).toMatchObject({ status: 'verdict-posted', verdict: 'changes-requested' });
+    // The GitLab leg (the PR's host) evidenced the account; the GitHub leg
+    // was never consulted.
+    expect(matched.gitlab.authenticatedActor).toHaveBeenCalledWith('gitlab.example.test');
+    expect(matched.github.authenticatedActor).not.toHaveBeenCalled();
+    // The composite refuses when the SELECTED backend evidences a different
+    // account than the persisted receipt actor.
+    const mismatched = await makeGitlabPost('p3-r30-auto-mismatch', 'someone-else');
+    expect(mismatched.fixture.ledger.getRound(mismatched.fixture.roundId)).toMatchObject({ status: 'aborted', verdict: null });
+    expect(mismatched.escalations.some((line) => line.includes('someone-else') && line.includes('gru-bot'))).toBe(true);
   });
 });
 
