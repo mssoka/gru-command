@@ -1041,6 +1041,12 @@ describe('silas skills and wake prompt', () => {
     const ops = skills.find((skill) => skill.name === 'ops-dispatch')!.body.replace(/\s+/gu, ' ');
     expect(ops).toContain('New pull requests are ordinary');
     expect(ops).toContain('`gh pr create` without `--draft`/`-d`');
+    // Issue #125: the skill must not promise a per-lens retry — in-round
+    // lens retries are Perkins-owned machinery; Silas only has the
+    // wave-level review request.
+    expect(ops).not.toContain('a lens retry');
+    expect(ops).toContain('In-round lens retries are Perkins-owned machinery');
+    expect(ops).toContain('wave-level request (`POST /api/dispatch/review`)');
     expect(() => loadSilasSkills(['nope'])).toThrow(/unreadable/);
   });
 
@@ -1056,6 +1062,9 @@ describe('silas skills and wake prompt', () => {
     expect(prompt).toContain('owner holds merges elsewhere');
     expect(prompt).toContain('clean-abort-service-restart');
     expect(prompt).toContain('source_round_id');
+    // Issue #125: the assembled prompt never instructs the phantom action.
+    expect(prompt).not.toContain('a lens retry');
+    expect(prompt).toContain('In-round lens retries are Perkins-owned machinery');
     expect(prompt).not.toContain('human holds the merge);');
     // Verification capture (issue #159): the wake prompt names the shipped
     // helper absolutely so no lane hand-rolls a watcher — the resolved path
