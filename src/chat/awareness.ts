@@ -270,7 +270,12 @@ const DIGEST_RULES: Readonly<Record<string, (event: EventRecord) => string | nul
         return `job ${event.jobId ?? '?'}: fix directive${payload.delivered === false ? ' NOT delivered' : ' delivered'} (${blockers} blocker(s))`;
       }
       case 'pass':
-        return `job ${event.jobId ?? '?'}: bmad-review PASS — review/fix routing cleared (missing Perkins gate escalated; merge stays user-held)`;
+        // Escalation truth (bmad-review 4af6aab): "escalated" is a fact about
+        // the runtime, not a phrase — a runner with no escalation notifier
+        // must not render a claim that an escalation was posted.
+        return payload.escalated === true
+          ? `job ${event.jobId ?? '?'}: bmad-review PASS — review/fix routing cleared (missing Perkins gate escalated; merge stays user-held)`
+          : `job ${event.jobId ?? '?'}: bmad-review PASS — review/fix routing cleared (missing Perkins gate NOT escalated — no escalation notifier configured; merge stays user-held)`;
       case 'blocked':
         return `job ${event.jobId ?? '?'}: bmad-review BLOCKED${textOf(payload.reason) !== null ? ` — ${textOf(payload.reason)!}` : ''}`;
       case 'unavailable':

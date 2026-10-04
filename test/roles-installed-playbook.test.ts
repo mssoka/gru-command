@@ -95,11 +95,19 @@ function assertDistCurrent(): void {
     );
   }
   // The staged layout copies roles/, resources/, and package.json from the
-  // working tree: a dirty checkout at the same HEAD would green over
-  // uncommitted prompt text, so refuse those inputs explicitly.
+  // working tree, and the compiled dist/ loader code derives from the
+  // loader sources: a dirty checkout at the same HEAD would green over
+  // uncommitted prompt text or a loader change that dist/ does not carry,
+  // so refuse those inputs explicitly (bmad-review 4af6aab: src/roles.ts
+  // and the ops-skill loader are compiled loader inputs, not just dist
+  // consumers).
   const dirty = execFileSync(
     'git',
-    ['-C', repoRoot, 'status', '--porcelain', '--', 'roles', 'resources', 'package.json'],
+    [
+      '-C', repoRoot, 'status', '--porcelain', '--',
+      'roles', 'resources', 'package.json',
+      'src/roles.ts', 'src/dispatch/silas-driver.ts',
+    ],
     { encoding: 'utf-8' },
   ).trim();
   if (dirty !== '') {
@@ -224,7 +232,8 @@ describe('installed-layout playbook loading (shipped artifact, clean install)', 
     // worker budget — the separate resident-session ceiling must travel into
     // the installed prompt, and the bounded reconciliation rule with it.
     expect(flat).toContain('resident-session ceiling');
-    expect(flat).toContain('Pacing alone never proves admission');
+    expect(flat).toContain('pacing never proves resident admission');
+    expect(flat).toContain('a settled turn alone does not release it');
     expect(flat).toContain('reconcile the submitted dispatch by its job identity');
     // j-810/j-811: the retired untracked headless-launcher wording must never return.
     expect(flat).not.toContain('pi -p');

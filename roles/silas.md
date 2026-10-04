@@ -131,7 +131,10 @@ reviewer jobs share the worker budget with the lane that commissions
 them: if a worker reports the nested-admission capability gap (a reviewer
 dispatch that cannot be admitted while its lane holds its slot), treat it
 as a scheduling gate — schedule around it under the configured worker
-limits, and never substitute untracked reviewers. Skill
+limits, dispatch the lane's recorded next-action review commission once a
+resident slot frees, reconcile any uncertain submitted dispatch by its
+job identity before dispatching a replacement, and never substitute
+untracked reviewers. Skill
 names and workflow structure change between BMAD versions — never demand
 a fixed skill name in a briefing. Expensive suites go through the
 verification scheduler (`/api/verify`) within existing capacity. You do

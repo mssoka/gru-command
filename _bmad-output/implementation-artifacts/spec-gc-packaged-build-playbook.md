@@ -226,6 +226,30 @@ checkout, home paths, journal, or global custom instructions).
 - Given the full suite, lint, typecheck, build, and the hygiene gate, all
   pass on the final head.
 
+### Review Findings — PR #165 at 4af6aab (2026-10-04)
+
+Review target: `962a41bd888343e73ea1fc9bf0ca4e37da1258cd..4af6aab396737e165dbda502bb10e28938d2e3aa`. Four independent layers completed on `openai-codex/gpt-6-sol`. All four owner-scope choices and all seven patch items below were resolved in the same continuation (owner directive 2026-10-04 to clear the backlog; no deferral). Full-suite CI [run 37224038766](https://github.com/mssoka/gru-command/actions/runs/37224038766) passed at the exact head.
+
+- [x] [Review][Resolved] Resident-capacity observability is not exposed to the worker [roles/minion.md:104-114] — disposition: no new runtime/API surface is added (declared scope); the shipped prompt states the truth that the pacing view does not project the resident-session ceiling, treats the dispatch request itself as the admission gate, and assigns the scheduling resolve to the operations layer (the continuous-completion capacity-wait contract). Implemented in `roles/minion.md` ("which that view does not project and which you cannot observe before the fact").
+- [x] [Review][Resolved] Review commissioning after a settled turn has no re-arm [roles/minion.md:113-115; roles/silas.md:131-136] — disposition: the commission is recorded as the lane's explicit next action and the operations layer dispatches it when a resident slot frees (`roles/silas.md`, `resources/silas-skills/ops-dispatch/SKILL.md`). The prompt no longer implies that ending the turn re-arms the commission; a settled turn only makes the worker reclaimable. Implemented and pinned.
+- [x] [Review][Resolved] Submitted reviewer dispatch lacks a durable acceptance identity [roles/minion.md:90-96; src/dispatch/server.ts:199-221] — disposition: no new dispatch protocol is added (declared scope); the policy is qualified — the service records the reviewer's job row before admission, so an existing row means the request was accepted and is left to admit; an absent row is an unresolved submission handed to the operations layer, never blind-retried and never treated as proof of absence. Implemented in `roles/minion.md`.
+- [x] [Review][Resolved] A review-only brief does not enforce read-only tools [roles/minion.md:82-88; src/roles.ts:74-79] — disposition (decision): the prompt-only read-only boundary is explicitly accepted for this change; no new runtime role or tool confinement is added. The brief instructs read-only review and the worker must confirm the reviewed head is unchanged when collecting findings. Implemented in `roles/minion.md`.
+- [x] [Review][Patch] Qualify the fallback PASS digest when no escalation was posted [src/chat/awareness.ts:273; src/dispatch/perkins.ts:2456-2461] — fixed: the pass event carries `escalated: this.opts.escalate !== undefined`; the digest renders the escalated wording only when true, else "NOT escalated — no escalation notifier configured". Covered by both variants in `test/awareness.test.ts`.
+- [x] [Review][Patch] Correct the settled-turn resident-release claim and test [roles/minion.md:107-115; test/pacing-admission.test.ts:852-856] — fixed: the prompt states a permit frees only on reclaim/cessation; the regression now proves settle-without-dispose does NOT admit (no spawn, no resolution) before disposal admits the waiter.
+- [x] [Review][Patch] Give the baseline archive an attempt-specific path [`.gru-command/worktree.toml:332`] — fixed: the snapshot tar lives inside the unique attempt directory and the pointer records it.
+- [x] [Review][Patch] Verify that expected baseline RED is the intended prompt-oracle failure [`.gru-command/worktree.toml:332`] — fixed: the vitest log is captured inside the attempt directory, replayed to the scheduler capture, and an unattributable nonzero exit (no `FAIL test/<overlay>.test.ts` marker) exits 5 instead of counting as fail-before evidence.
+- [x] [Review][Patch] Reject dirty loader source before trusting compiled `dist/` [test/roles-installed-playbook.test.ts:83-115] — fixed: the dirty-input guard now covers `src/roles.ts` and `src/dispatch/silas-driver.ts` (the compiled loader sources) alongside roles/, resources/, package.json.
+- [x] [Review][Patch] Bound the precheck-to-POST admission race and reconcile timed-out dispatches [roles/minion.md:108-120] — fixed with the same bounded-wait/job-identity reconciliation wording as the resident-observability disposition; a precheck is advisory, the request is the gate, and an unresolved submission is an ops reconciliation item.
+- [x] [Review][Patch] Test residency FIFO with two queued reviewers, not one [test/pacing-admission.test.ts:835-856] — fixed: two reviewers queue behind the four parents; the first admits on the first released slot, the second stays queued until the next release, and admission order is asserted (`resident-5`, `resident-6`).
+- [x] [Review][Defer, standing] Ambiguous `clear_to_merge` fallback wire field [src/dispatch/perkins.ts:2455; src/dispatch/server.ts:330] — standing disposition (not new backlog): the wire name is kept for compatibility, its narrowed meaning is documented and pinned, and a rename remains a separate compatibility decision (triage row 73). No owner decision is pending.
+
+#### Rejected
+
+- **Blind: spec verification commands omit heavy config/30 s overrides (low, rejected).** The claim is true at `_bmad-output/implementation-artifacts/spec-gc-packaged-build-playbook.md:788-807`, but correcting a spec under review is expressly excluded by this workflow; the declared scope commands in `.gru-command/worktree.toml:330-349` are the operative commands.
+- **Blind: staged tarball never imports `loadSilasSkills()` (low, rejected).** `test/perkins-whole-review.test.ts:1620-1682` verifies shipped file presence and staged role loading; `test/silas-driver.test.ts:1034-1095` verifies the unchanged skill loader. An additional staged-loader probe is a heavier duplicate for an unlikely unchanged-path defect (also deferred in prior spec triage row 36).
+- **Blind: renamed-catalog fixture does not exercise product selector (false).** There is no product skill-selection function: `test/roles-installed-playbook.test.ts:309-324` expressly pins prompt clauses and name absence, while `selectImplementationSkills()` is only a test demonstration; the spec prohibits a new runtime selector.
+- **Acceptance: no final-head full-suite verification (false).** GitHub Actions full-suite run 37224038766 is SUCCESS at head `4af6aab396737e165dbda502bb10e28938d2e3aa`; `.github/workflows/ci.yml:50` invokes `npm test`.
+
 ## Implementation Notes
 
 - Runtime capability verified on this lane: `pi` CLI v0.99.1 on PATH,
@@ -597,6 +621,17 @@ checkout, home paths, journal, or global custom instructions).
 | 81 | native r5 | note (verification limits) | The timeout diagnostic inherited the heavy config's 120s ceiling, replacing the original 30s isolation claim → patch: explicit `--testTimeout=30000 --hookTimeout=30000` overrides pin the original budgets; comment states the config/override split truthfully |
 | 82 | native r5 | prior fixed | Canonical-briefing acceptance conflict: the amended `job.briefing` supplies the j-761 owner amendment and the shipped capability contract; reviewer confirms resolved by the amendment, not a repository note |
 | 83 | native r5 | publication | Report not posted — ambiguous app publication; manual review-list verification confirms no r5 publication (0 after r4); conservative non-retry per the publication-recovery contract; report preserved locally, no fabricated verdict comment |
+| 84 | native r6 | verdict | READY TO MERGE on 4af6aab — 0 blockers; prior canonical-briefing blocker confirmed fixed by the amended briefing; report preserved locally (publication aborted, second `report_not_posted`) |
+| 85 | native r6 | warning (fixed) | Baseline build-log redirect breaks under a relative TMPDIR (the `$d`-relative blog doubled after `cd`) → patch: snapshot dir normalized absolute immediately after mktemp; pointer/log/archive paths derived from it |
+| 86 | native r5/r6 | ops root cause (fixed) | Perkins App publication refused because `~/.gru-command/perkins` was 0755 (hardened path requires owner-only 0700) → fixed by chmod 700; r7 will exercise publication on the corrected head |
+| 87 | bmad-review | decision (resolved) | Resident-capacity observability: no new runtime surface; prompt states non-observability, POST-as-admission-gate, bounded wait, ops-owned scheduling |
+| 88 | bmad-review | decision (resolved) | Post-turn re-arm: commission recorded as the lane's explicit next action; ops dispatches when a resident slot frees (silas + ops skill aligned) |
+| 89 | bmad-review | decision (resolved) | Submitted-dispatch acceptance: job-row readback qualification (row recorded before admission; absent row → ops, never blind re-POST) |
+| 90 | bmad-review | decision (resolved) | Read-only brief boundary: prompt-only accepted explicitly; no tool confinement/new role; tree cleanliness verified at collection |
+| 91 | bmad-review | patch (fixed) | Fallback PASS digest claimed escalation unconditionally → pass event carries `escalated`; digest renders both variants; awareness tests pin both |
+| 92 | bmad-review | patch (fixed) | Settled-turn resident-release claim false → prompt corrected; regression proves settle-without-dispose does not admit |
+| 93 | bmad-review | patch (fixed) | Baseline archive shared path + unattributable RED → attempt-specific archive inside the snapshot dir; vitest log captured/replayed; exit 5 on unattributable red |
+| 94 | bmad-review | patch (fixed) | Loader-source dirty guard + precheck-to-POST bound + two-waiter FIFO → guard covers src/roles.ts + src/dispatch/silas-driver.ts; bounded-wait wording; FIFO asserted with two queued reviewers |
 
 
 ### Final-review cycle (2026-10-02, continuation)
@@ -780,6 +815,42 @@ bad_spec).
   inside its unique snapshot directory and the pointer records the log
   path. No r6 is requested before the corrections land on a new exact
   head.
+
+### r6 + bmad-code-review cycle (2026-10-04, owner directive: clear the backlog)
+
+- Exact-head gates on `4af6aab` through the authenticated `/api/verify`
+  scheduler: `packaged-playbook` PASS (fast 67 + heavy install 13;
+  receipt sha via request pp165-playbook-4af6aab), `packaged-artifact`
+  PASS (90 tests; pp165-artifact-4af6aab), CI run `37224038766` green.
+- Round `gc-packaged-build-playbook-20261002-r6` frozen at `4af6aab`:
+  **verdict READY TO MERGE — 0 blockers**, one nonblocking warning
+  (baseline build-log redirect breaks under a relative `TMPDIR`; the
+  r5 fix's `$d`-relative `blog` doubled the path after `cd`).
+  Publication aborted a second time (`report_not_posted`, ambiguous app
+  post, conservative non-retry; manually verified absent from the PR).
+  Root cause found and fixed: the Perkins App credential directory
+  `~/.gru-command/perkins` was 0755, so the hardened publication path
+  refused it (`credential-directory permissions`) — now 0700.
+- Independent `bmad-code-review` (owner-requested via herdr, reviewers on
+  `openai-codex/gpt-6-sol`; report at
+  `~/.gru-command/reviews/gc-packaged-build-playbook-20261002-bmad-code-review-4af6aab/report.md`):
+  4 decisions + 7 patches + 1 pre-existing + 4 rejected. All resolved
+  in the same continuation (spec Review Findings; no deferral):
+  (1) resident observability → no new surface; the prompt states
+  non-observability, POST-as-gate, bounded wait, ops-owned scheduling;
+  (2) post-turn re-arm → commission is the lane's explicit next action,
+  dispatched by ops when a slot frees (roles/silas.md + ops skill);
+  (3) submitted-dispatch identity → job-row readback qualification, no
+  blind re-POST; (4) read-only brief → prompt-only boundary explicitly
+  accepted, no tool confinement; patches: conditional escalation digest
+  (`escalated` payload + awareness variants), settle≠release truth +
+  regression (settle-without-dispose does not admit), attempt-specific
+  baseline archive + attributable-RED evidence (exit 5 on unattributable
+  red), loader-source dirty guard (src/roles.ts +
+  src/dispatch/silas-driver.ts), bounded precheck-to-POST wording,
+  two-waiter FIFO regression (resident-5/resident-6 order).
+- Lane records updated: spec status back to `in-review`; deferred-work
+  block converted to a resolved record with dispositions.
 
 ## Verification
 

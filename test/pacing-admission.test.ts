@@ -849,19 +849,64 @@ describe('nested parent/reviewer admission (shipped playbook contract, j-810/j-8
       expect(residents).toHaveLength(4);
       expect(registry.residents.queued).toBe(1);
 
-      // A settled parent turn frees its resident slot: the waiter admits
-      // FIFO under the unchanged cap, never by raising or bypassing it.
+      // A settled turn does NOT release the resident permit (bmad-review
+      // 4af6aab): settling only makes the worker idle/reclaimable; the
+      // permit frees on disposal/cessation. Assert the false-release
+      // assumption fails before the real release arrives.
       residents[0]!.settle();
+      await flush();
+      await flush();
+      expect(reviewerResolved).toBe(false);
+      expect(residents).toHaveLength(4);
+      expect(registry.residents.queued).toBe(1);
+
+      // A second reviewer queues behind the first: FIFO is asserted below.
+      let secondResolved = false;
+      const reviewerTwo = service
+        .dispatch({
+          jobId: 'parent-a-review-verifgap',
+          repoPath: repo.path,
+          title: 'nested reviewer two',
+          briefing: 'read-only review brief two at the frozen head',
+        })
+        .then((outcome) => {
+          secondResolved = true;
+          return outcome;
+        });
+      await flush();
+      await flush();
+      expect(secondResolved).toBe(false);
+      expect(registry.residents.queued).toBe(2);
+
+      // Only a released resident slot admits the head waiter, FIFO under
+      // the unchanged cap: reviewer one admits first, reviewer two stays
+      // queued until the next slot frees.
       await registry.getHandle(parents[0]!.agentId!)!.dispose();
       const admitted = await reviewer;
       expect(admitted.agentId).not.toBeNull();
       expect(residents).toHaveLength(5);
+      // Pacing leases are held from dispatch: parents b,c,d + reviewer one
+      // + reviewer two (still residency-queued) = 5.
+      expect(gate.view().worker.running).toBe(5);
+      expect(secondResolved).toBe(false);
+      expect(registry.residents.queued).toBe(1);
+
+      residents[1]!.settle();
+      await registry.getHandle(parents[1]!.agentId!)!.dispose();
+      const admittedTwo = await reviewerTwo;
+      expect(admittedTwo.agentId).not.toBeNull();
+      expect(residents).toHaveLength(6);
+      // Parents c,d + both admitted reviewers = 4.
       expect(gate.view().worker.running).toBe(4);
       expect(registry.residents.queued).toBe(0);
+      // FIFO proof: the resident agents admit in spawn order (parents 1-4,
+      // then reviewer one, then reviewer two).
+      expect(admitted.agentId).toBe('resident-5');
+      expect(admittedTwo.agentId).toBe('resident-6');
 
       // Teardown: settle and dispose the survivors through the registry.
       for (const resident of residents) resident.settle();
-      for (const parent of [...parents, admitted]) {
+      for (const parent of [...parents, admitted, admittedTwo]) {
         const handle = parent.agentId === null ? null : registry.getHandle(parent.agentId);
         if (handle !== null) await handle.dispose();
       }

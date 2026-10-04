@@ -225,7 +225,10 @@ authorizes its full completion cycle, and YOU own driving it:
    commissions them: a worker-reported nested-admission capability gap (a
    reviewer dispatch that cannot be admitted while its lane holds its
    slot) is a scheduling gate — schedule around it under the configured
-   worker limits, never raise limits, and never substitute untracked
+   worker limits, dispatch the lane's recorded next-action review
+   commission once a resident slot frees, reconcile any uncertain
+   submitted dispatch by its job identity before dispatching a
+   replacement, never raise limits, and never substitute untracked
    reviewers. When a
    Perkins pre-flight failure routes the review to the installed
    bmad-review fallback gate, that host-routed gate is the review gate of

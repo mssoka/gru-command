@@ -85,7 +85,10 @@ same path that created your lane) — each reviewer is a separate tracked
 job with its own session and worktree and a narrowly scoped read-only
 brief that names the exact immutable head (SHA) under review plus the
 diff base/range (or a frozen diff artifact) and how to read the lane's
-objects read-only. Commission them with the service's authenticated local
+objects read-only. Read-only scope is a brief-level instruction, not an
+enforced tool restriction: the tracked reviewer runs the ordinary worker
+session, so treat any write by a reviewer as a contract violation and
+confirm the reviewed head is unchanged when you collect its findings. Commission them with the service's authenticated local
 API: read the `[auth]` token from the service's instance config and send
 it as an `Authorization: Bearer` header — never echo or copy the token. A
 dispatch you submitted is an accepted action: before re-commissioning
@@ -103,24 +106,30 @@ holds until this turn settles, so a nested dispatch can end up waiting
 behind the very slot it needs. Two independent constraints admit a
 reviewer: the pacing turn pools — the board snapshot's pacing view shows
 their limits, running counts, and queued entries — and the separate
-resident-session ceiling (four workers by default) that the pacing view
-does not project; your own open turn holds one resident slot until it
-settles. Check the pacing view before dispatching: if no fresh worker
-turn can be admitted there, stop and report the exact nested-admission
-capability gap loudly instead of dispatching into a wait. Pacing alone
-never proves admission — when you cannot establish that a fresh resident
-session is admissible (the residency ceiling is saturated and no slot can
-free while your turn stays open), do not dispatch into the wait: finish
-the turn with the review commission as its explicit next action so the
-dispatch starts from a settled lane, or stop and report the scheduling
-gate loudly. If a dispatch is nonetheless submitted and stays unresolved
-(accepted but not admitted), do not block waiting, do not retry blindly,
-and never raise or bypass the configured worker limits, and never
-substitute an untracked reviewer; reconcile the submitted dispatch by its
-job identity before re-commissioning, and let the operations layer
-schedule the review under the configured limits. If the service dispatch
-cannot create a fresh tracked reviewer at all, stop and report that exact
-capability gap loudly; an inline self-review is not a substitute. If the project has no
+resident-session ceiling (four workers by default), which that view does
+not project and which you cannot observe before the fact; your own open
+turn holds one resident slot, and a permit frees only when its worker is
+reclaimed or ceases — a settled turn alone does not release it. Because
+pacing never proves resident admission, treat the dispatch request itself
+as the admission gate and use a bounded wait: if the pacing view shows no
+free turn, stop and report the exact nested-admission capability gap
+loudly instead of dispatching into a wait; if it is open, submit with a
+bounded client wait and do not block waiting on an unbounded answer. If
+the request does not resolve within that bound, do not retry blindly, and
+never raise or bypass the configured worker limits, and never substitute
+an untracked reviewer; reconcile the submitted dispatch by its job
+identity before re-commissioning — the service records the reviewer's
+job row before admission, so an existing row means the request was
+accepted and should be left to admit, and an absent row is an unresolved
+submission for the operations layer, not proof of absence. When a
+resident slot cannot free while your turn stays open, state the review
+commission as this lane's explicit next action in your handback so it is
+dispatched when capacity frees; the operations layer schedules the review
+under the configured limits — ending your turn makes your own worker
+reclaimable, but it does not itself re-arm the commission. If the service
+dispatch cannot create a fresh tracked reviewer at all, stop and report
+that exact capability gap loudly; an inline self-review is not a
+substitute. If the project has no
 applicable installed skill, follow its supported official BMAD
 onboarding/discovery path — the setup wizard's project-local BMAD install
 step (the product README's "Project-local BMAD setup" section) — and stop

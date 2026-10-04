@@ -75,3 +75,24 @@
 - source_spec: none — BMAD code review of PR #170 (head 3540500)
   summary: AGENTS.md and other docs don't mention the phase split; `npx vitest run test/<heavy>.test.ts` now exits "No test files found" (low)
   evidence: README documents test:backend:heavy, but agent guidance does not, so minions running a heavy file directly hit an exit-1 trap (it fails loud, not silently). Deferred: the fix edits agent-context files.
+
+## Resolved: code review of spec-gc-packaged-build-playbook.md (2026-10-04)
+
+All findings from the bmad-code-review of PR #165 at 4af6aab were resolved in the
+same continuation — no owner decision remains pending and no patch item was
+deferred. Dispositions (owner directive 2026-10-04, "do not defer"):
+- Resident-capacity observability: no new runtime/API surface; the shipped prompt
+  states that the pacing view does not project the resident ceiling, treats the
+  POST as the admission gate with a bounded wait, and assigns scheduling to ops.
+- Post-turn re-arm: the commission is the lane's explicit next action; the ops
+  layer dispatches it when a resident slot frees.
+- Submitted-dispatch acceptance: qualified policy — job-row readback (recorded
+  before admission); an absent row goes to ops, never a blind re-POST.
+- Read-only brief: prompt-only boundary explicitly accepted; no tool confinement
+  or new role added; reviewers must not modify the tree.
+- Patches: escalation-truth digest, settled-turn release truth + regression,
+  attempt-specific baseline archive, attributable baseline RED, loader-source
+  dirty guard, bounded precheck-to-POST race wording, two-waiter FIFO regression.
+- clear_to_merge wire name: standing compatibility decision (triage row 73), not
+  a pending owner item.
+Full record: the spec's "Review Findings — PR #165 at 4af6aab" section.
