@@ -176,6 +176,8 @@ export interface SpecialistRun {
    * recorded durably — the settled work stands, the recording gap is
    * disclosed (R10). */
   readonly cleanupRecordingError?: string;
+  /** Failure evidence could not be written; the executed attempt still counts. */
+  readonly evidenceRecordingError?: string;
 }
 
 export interface PerkinsWholeResult {
@@ -976,31 +978,40 @@ export class PerkinsWholeReview {
           outputSha256: outputBytes === null ? null : hash(outputBytes), findings: [], failureKind, error: message,
         };
         envelopes.push(envelope);
-        if (outputBytes !== null) {
-          // The try block may have already written this exact run-token path
-          // before a later step threw; tolerate the collision (write-once).
-          try {
-            writeReviewArtifact(review, `specialists/${lens}.attempt-${attempt}-${runToken}.raw.json`, `${outputBytes}\n`);
-          } catch (writeError) {
-            if (!(writeError instanceof Error && 'code' in writeError && (writeError as { code?: string }).code === 'EEXIST')) throw writeError;
-          }
-        }
-        for (const [suffix, value] of [
-          [`.error.json`, { error: message } as unknown],
-          [`.envelope.json`, envelope as unknown],
-        ] as const) {
-          try {
-            writeReviewArtifact(review, `specialists/${lens}.attempt-${attempt}-${runToken}${suffix}`, value);
-          } catch (writeError) {
-            if (!(writeError instanceof Error && 'code' in writeError && (writeError as { code?: string }).code === 'EEXIST')) throw writeError;
-          }
-        }
-        this.onProgress({ lens, state: 'error', note: `${failureKind}: ${message}` });
+        // Settle before fallible evidence writes: a rejected write cannot
+        // turn a started attempt into an undefined pool slot (and a refund).
         settled = {
-          resultId: `failed-${lens}-a${attempt}`,
+          resultId: `failed-${lens}-a${attempt}-${runToken}`,
           agentId: handle?.id ?? 'spawn-failed', lens, attempt,
           status, findings: [], failureKind, error: message,
         };
+        const recordingErrors: string[] = [];
+        const recordFailureEvidence = (suffix: string, value: unknown): void => {
+          try {
+            writeReviewArtifact(review, `specialists/${lens}.attempt-${attempt}-${runToken}${suffix}`, value);
+          } catch (writeError) {
+            // A valid output's raw/envelope may already exist when a later
+            // artifact fails; never overwrite those write-once bytes.
+            if (!(writeError instanceof Error && 'code' in writeError && (writeError as { code?: string }).code === 'EEXIST')) {
+              recordingErrors.push(`${suffix}: ${sanitizeError(writeError)}`);
+            }
+          }
+        };
+        if (outputBytes !== null) recordFailureEvidence('.raw.json', `${outputBytes}\n`);
+        recordFailureEvidence('.error.json', { error: message });
+        recordFailureEvidence('.envelope.json', envelope);
+        if (recordingErrors.length > 0) {
+          settled = { ...settled, evidenceRecordingError: recordingErrors.join('; ') };
+          // The specialist directory may be unavailable while the round's
+          // children directory still accepts the best available audit state.
+          try {
+            writeReviewArtifact(review, `children/${settled.resultId}.json`, settled);
+          } catch (writeError) {
+            settled = { ...settled, evidenceRecordingError:
+              `${settled.evidenceRecordingError}; children fallback: ${sanitizeError(writeError)}` };
+          }
+        }
+        this.onProgress({ lens, state: 'error', note: `${failureKind}: ${message}${recordingErrors.length > 0 ? ` (evidence recording failed: ${recordingErrors.join('; ')})` : ''}` });
       } finally {
         // Cleanup is best-effort by design (T13): a rejected dispose must
         // never discard the settled result above it. The cleanup failure
@@ -1564,6 +1575,7 @@ export class PerkinsWholeReview {
             ...(result.error !== undefined ? { error: result.error } : {}),
             ...(result.findingsDelivered === false ? { findingsDelivered: false } : {}),
             ...(result.cleanupRecordingError !== undefined ? { cleanupRecordingError: result.cleanupRecordingError } : {}),
+            ...(result.evidenceRecordingError !== undefined ? { evidenceRecordingError: result.evidenceRecordingError } : {}),
           }));
           writeReviewArtifact(review, 'consolidated.json', {
             schemaVersion: 3,

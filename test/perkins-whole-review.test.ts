@@ -69,6 +69,7 @@ function wholeHarness(
     beforeFreeze?: (repo: FixtureRepo) => void;
     reviewGate?: PacingGate;
     pacing?: Pick<PerkinsWholeReviewOptions, 'rateLimitBackoff' | 'recordPacing' | 'pacingSleep' | 'pacingJitter' | 'pacingNow'>;
+    onProgress?: PerkinsWholeReviewOptions['onProgress'];
   },
 ): WholeHarness {
   const fixture = makeReviewRepo();
@@ -94,6 +95,7 @@ function wholeHarness(
     policy: loadPerkinsPolicy(),
     ...(options?.reviewGate !== undefined ? { reviewGate: options.reviewGate } : {}),
     ...(options?.pacing ?? {}),
+    ...(options?.onProgress !== undefined ? { onProgress: options.onProgress } : {}),
   });
   return {
     ...fixture,
@@ -1170,25 +1172,22 @@ describe('whole-PR engine: independent-review repairs', () => {
 
 describe('Stage 2 specialist accounting', () => {
   it('#79 seals a settled valid sibling as undelivered when another child rejects the batch', async () => {
-    let directory = '';
+    let rejectEdge = true;
     const h = wholeHarness({
       specialists: ['security', 'edge'],
-      childAnswer: async (prompt) => {
-        if (prompt.includes('"source": "security"')) return JSON.stringify([groundedFinding('security', 'warning')]);
-        if (prompt.includes('RETRY CORRECTION')) {
-          chmodSync(join(directory, 'specialists'), 0o700);
-          return '[]';
+      childAnswer: (prompt) => prompt.includes('"source": "security"')
+        ? JSON.stringify([groundedFinding('security', 'warning')]) : '[]',
+    }, {
+      onProgress: (event) => {
+        if (event.lens === 'edge' && event.state === 'running' && rejectEdge) {
+          rejectEdge = false;
+          throw new Error('edge batch rejected');
         }
-        await vi.waitFor(() => expect(existsSync(join(directory, 'children')) &&
-          readdirSync(join(directory, 'children')).some((name) => name.startsWith('security-a1-'))).toBe(true));
-        chmodSync(join(directory, 'specialists'), 0o500);
-        throw new Error('edge turn failed');
       },
-      beforeSubmit: () => { chmodSync(join(directory, 'specialists'), 0o700); },
     });
-    directory = h.frozen.directory;
+    const directory = h.frozen.directory;
     const result = await h.run();
-    expect(h.toolErrors.some((entry) => entry.tool === 'perkins_run_specialists' && /EACCES/.test(entry.error))).toBe(true);
+    expect(h.toolErrors.some((entry) => entry.tool === 'perkins_run_specialists' && /edge batch rejected/.test(entry.error))).toBe(true);
     const validSibling = result.specialistRuns.find((run) => run.lens === 'security');
     expect(validSibling).toMatchObject({ status: 'valid', findingsDelivered: false });
     const consolidated = JSON.parse(readFileSync(join(directory, 'consolidated.json'), 'utf8')) as { specialistRuns: Array<{ lens: string; findingsDelivered?: boolean }> };
