@@ -2690,7 +2690,7 @@ describe('bmad-review fallback gate (user amendment 2026-09-20, fork-3)', () => 
     repo: FixtureRepo;
   }
 
-  function gateHarness(rounds: FallbackFinding[][]): GateHarness {
+  function gateHarness(rounds: FallbackFinding[][], escalateMode: 'posted' | 'absent' | 'throwing' = 'posted'): GateHarness {
     const repo = makeFixtureRepo('perkins-fallback-gate');
     repos.push(repo);
     repo.git(['checkout', '-b', 'feature/fallback']);
@@ -2729,7 +2729,18 @@ describe('bmad-review fallback gate (user amendment 2026-09-20, fork-3)', () => 
           return { delivered: true, minionId: 'minion-1' };
         },
       },
-      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      escalate:
+        escalateMode === 'absent'
+          ? undefined
+          : escalateMode === 'throwing'
+            ? (title) => {
+                // Throw only on the PASS escalation: the entry/route
+                // escalations must not mask the PASS-path behavior under
+                // test (native r7 warning).
+                if (title.includes('gate PASS')) throw new Error('notifier exploded');
+                escalations.push(title);
+              }
+            : (title, detail) => escalations.push(`${title}: ${detail}`),
     });
     const job = ledger.addJob({ id: 'job-fallback-gate', repo: 'fixture', title: 'fallback', baseBranch: 'main' });
     settleLane(ledger, job.id);
@@ -2808,6 +2819,33 @@ describe('bmad-review fallback gate (user amendment 2026-09-20, fork-3)', () => 
       rmSync(workspace, { recursive: true, force: true });
     }
   }, 60_000);
+
+  it('records the fallback PASS escalation outcome truthfully for absent, posted, and throwing notifiers', async () => {
+    const absent = gateHarness([[]], 'absent');
+    const posted = gateHarness([[]], 'posted');
+    const throwing = gateHarness([[]], 'throwing');
+    try {
+      for (const harness of [absent, posted, throwing]) {
+        await harness.port.createJobWorktree({ repoPath: harness.repo.path, jobId: harness.job.id });
+        const outcome = await harness.wave.runRound({ jobId: harness.job.id });
+        if (!('route' in outcome)) throw new Error('expected the bmad-review fallback route');
+        expect(outcome.clearToMerge).toBe(true);
+      }
+      const passOf = (harness: GateHarness): Record<string, unknown> | undefined =>
+        gateEvents(harness).find((payload) => payload['phase'] === 'pass');
+      // Escalation truth (native r7): the durable pass event records what
+      // actually happened — absent config, a completed notifier call, or a
+      // throwing notifier (the pass itself still stands).
+      expect(passOf(absent)?.['escalation']).toBe('not-configured');
+      expect(passOf(posted)?.['escalation']).toBe('posted');
+      expect(posted.escalations.filter((line) => line.includes('review/fix routing cleared'))).toHaveLength(1);
+      expect(passOf(throwing)?.['escalation']).toBe('failed');
+      expect(throwing.escalations.some((line) => line.includes('review/fix routing cleared'))).toBe(false);
+      expect(passOf(throwing)?.['clearToMerge']).toBe(true);
+    } finally {
+      for (const harness of [absent, posted, throwing]) cleanupGate(harness);
+    }
+  });
 
   it('triages, routes the blocker fix directive to the minion, re-reviews, and passes clean', async () => {
     const harness = gateHarness([

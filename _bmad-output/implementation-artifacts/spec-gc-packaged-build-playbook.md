@@ -632,6 +632,10 @@ Review target: `962a41bd888343e73ea1fc9bf0ca4e37da1258cd..4af6aab396737e165dbda5
 | 92 | bmad-review | patch (fixed) | Settled-turn resident-release claim false → prompt corrected; regression proves settle-without-dispose does not admit |
 | 93 | bmad-review | patch (fixed) | Baseline archive shared path + unattributable RED → attempt-specific archive inside the snapshot dir; vitest log captured/replayed; exit 5 on unattributable red |
 | 94 | bmad-review | patch (fixed) | Loader-source dirty guard + precheck-to-POST bound + two-waiter FIFO → guard covers src/roles.ts + src/dispatch/silas-driver.ts; bounded-wait wording; FIFO asserted with two queued reviewers |
+| 95 | native r7 | verdict | NEEDS CHANGES on eeb3c50 — published to PR #165 (publication permissions fixed); prior 0 (canonical briefing) again confirmed fixed; 1 blocker + 2 warnings, all repaired in-lane |
+| 96 | native r7 | blocker (fixed) | Ops instructions waited for a pre-freed resident permit, but reclamation is demand-driven (drain returns with no queued request) — the deferred commission could strand after all parents yield → patch: both ops surfaces and the worker prompt now say the submission itself triggers the demand-driven reclaim once the lane's turn has settled; never wait for a pre-freed permit; new regression covers the no-prior-POST sequence through the real registry (yield → submit → reclaim → admit) |
+| 97 | native r7 | warning (fixed) | Legacy PASS events (no escalation field) rendered as "no escalation notifier configured" → patch: four-way rendering (posted / failed / not-configured / unrecorded legacy) with fail-before tests for each |
+| 98 | native r7 | warning (fixed) | Escalation recorded as successful before the notifier ran → patch: the pass event is emitted after the attempt and records posted / failed / not-configured; fallback-path test covers absent, posted, and throwing PASS notifiers |
 
 
 ### Final-review cycle (2026-10-02, continuation)
@@ -851,6 +855,25 @@ bad_spec).
   two-waiter FIFO regression (resident-5/resident-6 order).
 - Lane records updated: spec status back to `in-review`; deferred-work
   block converted to a resolved record with dispositions.
+
+- Round `gc-packaged-build-playbook-20261002-r7` frozen at `eeb3c50`:
+  verdict NEEDS CHANGES, **published to PR #165** (the credential-dir fix
+  restored publication); prior 0 confirmed fixed again. Findings all
+  repaired in-lane: (a) blocker — ops "once a resident slot frees" waited
+  for a permit whose release requires the very dispatch it was deferring
+  (reclamation is demand-driven; drain returns with no queued request):
+  both ops surfaces plus the worker prompt now dispatch once the lane's
+  turn has settled and state that the submission itself triggers the
+  demand-driven reclaim; new regression covers the no-prior-POST
+  yield→submit→reclaim→admit sequence through the real registry;
+  (b) warning — legacy PASS events now render "escalation unrecorded"
+  instead of falsely diagnosing absent configuration (four-way renderer +
+  tests); (c) warning — the pass event records the escalation outcome
+  after the notifier attempt (posted/failed/not-configured) instead of
+  inferring success from callback presence (fallback-path test covers
+  absent, posted, and throwing PASS notifiers).
+- Round `gc-packaged-build-playbook-20261002-r8` requested on the
+  corrected head after the r7 fix cycle.
 
 - Base re-integration #2 (2026-10-04): origin/main advanced to `f29a4b3`
   (PR #198 agent-status-truth #171, PR #199 ops-contracts #125/#128,

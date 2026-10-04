@@ -203,23 +203,30 @@ describe('gru awareness — passive injection', () => {
     });
     const block = rig.awareness.prepare();
     expect(block?.text).toContain('job j1: bmad-review round 2 — 3 blocker(s), 1 note(s)');
-    // Escalation truth (bmad-review 4af6aab): a pass event without recorded
-    // escalation must not claim one was posted.
-    expect(block?.text).toContain('job j1: bmad-review PASS — review/fix routing cleared (missing Perkins gate NOT escalated — no escalation notifier configured; merge stays user-held)');
+    // Escalation truth (native r7): a LEGACY pass event without the field is
+    // unrecorded — it must never be rendered as "no notifier configured".
+    expect(block?.text).toContain('job j1: bmad-review PASS — review/fix routing cleared (missing Perkins gate escalation unrecorded (legacy event); merge stays user-held)');
     // The fallback PASS never reports merge clearance (native r3 alignment).
     expect(block?.text).not.toContain('clear to merge');
     expect(block?.text).toContain('round j1-r1: Perkins NEEDS CHANGES — 2 blocker(s) (proof complete)');
   });
 
-  it('renders the escalation as recorded when the pass event carries it', () => {
-    const rig = boot();
-    rig.api.appendCustomEvent({
-      kind: 'job.fallback-review',
-      jobId: 'j1',
-      payload: { gate: true, phase: 'pass', iteration: 1, notes: 0, clearToMerge: true, escalated: true },
-    });
-    const block = rig.awareness.prepare();
-    expect(block?.text).toContain('job j1: bmad-review PASS — review/fix routing cleared (missing Perkins gate escalated; merge stays user-held)');
+  it('renders the recorded escalation outcome (posted / failed / not-configured)', () => {
+    const cases: Array<{ escalation: string; expected: string }> = [
+      { escalation: 'posted', expected: 'missing Perkins gate escalated; merge stays user-held' },
+      { escalation: 'failed', expected: 'missing Perkins gate escalation FAILED; merge stays user-held' },
+      { escalation: 'not-configured', expected: 'missing Perkins gate NOT escalated — no escalation notifier configured; merge stays user-held' },
+    ];
+    for (const { escalation, expected } of cases) {
+      const rig = boot();
+      rig.api.appendCustomEvent({
+        kind: 'job.fallback-review',
+        jobId: 'j1',
+        payload: { gate: true, phase: 'pass', iteration: 1, notes: 0, clearToMerge: true, escalation },
+      });
+      const block = rig.awareness.prepare();
+      expect(block?.text).toContain(`job j1: bmad-review PASS — review/fix routing cleared (${expected})`);
+    }
   });
 
   it('keeps an older escalation visible even when newer events overflow the digest window', () => {

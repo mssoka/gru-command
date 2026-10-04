@@ -915,4 +915,124 @@ describe('nested parent/reviewer admission (shipped playbook contract, j-810/j-8
       close();
     }
   });
+
+  // Native r7 blocker regression: the ops instructions must not wait for a
+  // pre-freed resident permit. Reclamation is demand-driven — with no
+  // queued request, drain() returns and idle residents keep their permits;
+  // the deferred commission's own POST is what triggers the safe reclaim
+  // and admission. This covers the exact no-prior-POST sequence: four
+  // parents yield (turns settled, no reviewer submitted), then the ops
+  // submission admits by reclaiming an idle resident on demand.
+  it('no prior POST: after the parents yield, the ops submission reclaims an idle resident on demand and admits', async () => {
+    const repo = makeFixtureRepo('pacing-reclaim-on-demand');
+    repos.push(repo);
+    const laneRoot = mkdtempSync(join(tmpdir(), 'gru-pacing-reclaim-lanes-'));
+    dirs.push(laneRoot);
+    const home = mkdtempSync(join(tmpdir(), 'gru-pacing-reclaim-home-'));
+    dirs.push(home);
+    const { api, close } = ledgerIn();
+    try {
+      const worktrees = new InMemoryWorktreePort(laneRoot);
+      const config = {
+        ...loadConfig({ GRU_COMMAND_HOME: home }),
+        concurrency: { maxWorkers: 4 },
+      };
+      const caps = { streaming: false, steer: 'queued' as const, resume: 'file' as const, images: false, thinking: false, thinkingLevelControl: false, followUp: false };
+      const residents: Array<{ id: string; settle: () => void }> = [];
+      const settled = new Map<string, boolean>();
+      const adapter: AgentRuntime = {
+        id: 'pi',
+        capabilities: caps,
+        health: () => ({ state: 'ok' }),
+        dispose: async () => {},
+        spawn: async (role: Role): Promise<AgentHandle> => {
+          let settle!: () => void;
+          const turn = new Promise<void>((resolve) => { settle = resolve; });
+          let disposed = false;
+          const id = `resident-${residents.length + 1}`;
+          const handle = {
+            id,
+            role,
+            sessionFile: join(home, `${id}.jsonl`),
+            capabilities: caps,
+            health: () => ({ state: disposed ? 'disposed' : 'idle' }),
+            subscribe: () => () => {},
+            prompt: () => {
+              void turn.then(() => settled.set(id, true));
+              return turn;
+            },
+            steer: async () => {},
+            followUp: async () => {},
+            // Reclaim eligibility requires EXPLICIT live-process absence
+            // (the supervisor's probe semantics): this fake worker has no
+            // live process once its turn has settled.
+            hasLiveProcess: () => false,
+            isCompacting: () => false,
+            dispose: async () => { disposed = true; },
+          } as unknown as AgentHandle;
+          residents.push({ id, settle });
+          return handle;
+        },
+      };
+      class ReclaimRegistry extends RuntimeRegistry {
+        override runtimeIdFor(_role: Role): RuntimeId { return 'pi'; }
+        override runtimeFor(_id: RuntimeId): AgentRuntime { return adapter; }
+      }
+      const registry = new ReclaimRegistry({
+        config,
+        store: {} as SessionStore,
+        // Production-shaped reclaimability: a minion is reclaimable once
+        // its turn has settled (the supervisor's openTurn=false probe).
+        canReclaim: (id: string) => settled.get(id) === true,
+      });
+      const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 0, maxConcurrentReviewTurns: 0 });
+      const service = new DispatchService({
+        ledger: api,
+        worktrees,
+        workerGate: gate,
+        spawner: (role: Role, options?: SpawnOptions) => registry.spawn(role, options),
+      });
+
+      // Four parents work; no reviewer is submitted yet.
+      const parents: Awaited<ReturnType<DispatchService['dispatch']>>[] = [];
+      for (const id of ['parent-a', 'parent-b', 'parent-c', 'parent-d']) {
+        parents.push(await service.dispatch({ jobId: id, repoPath: repo.path, title: id, briefing: `brief ${id}` }));
+      }
+      expect(residents).toHaveLength(4);
+      expect(registry.residents.queued).toBe(0);
+
+      // All parents yield: turns settle, residents stay allocated (no
+      // queued request means no drain-driven reclaim happens).
+      for (const resident of residents) resident.settle();
+      await flush();
+      await flush();
+      expect(registry.residents.queued).toBe(0);
+      expect(registry.getHandle(parents[0]!.agentId!)).not.toBeNull();
+
+      // The ops submission is the trigger: admission reclaims the oldest
+      // safe idle resident on demand — no pre-freed permit, no manual
+      // disposal, cap unchanged.
+      const admitted = await service.dispatch({
+        jobId: 'parent-a-review-blind',
+        repoPath: repo.path,
+        title: 'nested reviewer',
+        briefing: 'read-only review brief at the frozen head',
+      });
+      expect(admitted.agentId).not.toBeNull();
+      expect(residents).toHaveLength(5);
+      expect(registry.residents.queued).toBe(0);
+      expect(registry.getHandle(parents[0]!.agentId!)).toBeNull();
+      expect(gate.view().worker.running).toBe(1);
+
+      // Teardown: settle and dispose the survivors through the registry.
+      for (const resident of residents) resident.settle();
+      for (const parent of [...parents, admitted]) {
+        const handle = parent.agentId === null ? null : registry.getHandle(parent.agentId);
+        if (handle !== null) await handle.dispose();
+      }
+      await vi.waitFor(() => expect(gate.view().worker.running).toBe(0));
+    } finally {
+      close();
+    }
+  });
 });

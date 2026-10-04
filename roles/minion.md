@@ -124,9 +124,11 @@ accepted and should be left to admit, and an absent row is an unresolved
 submission for the operations layer, not proof of absence. When a
 resident slot cannot free while your turn stays open, state the review
 commission as this lane's explicit next action in your handback so it is
-dispatched when capacity frees; the operations layer schedules the review
-under the configured limits — ending your turn makes your own worker
-reclaimable, but it does not itself re-arm the commission. If the service
+dispatched once your turn has settled; the operations layer schedules the
+review under the configured limits — the submission itself is what
+triggers the demand-driven reclamation of a safe idle resident, so never
+wait for a pre-freed permit, and ending your turn does not by itself
+re-arm the commission. If the service
 dispatch cannot create a fresh tracked reviewer at all, stop and report
 that exact capability gap loudly; an inline self-review is not a
 substitute. If the project has no

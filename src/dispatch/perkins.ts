@@ -2513,12 +2513,28 @@ export class WaveRunner {
       fallbackEvent({ phase: 'triaged', iteration, blockers, notes, reportFile });
       if (blockers === 0) {
         state.clearToMerge = true;
-        fallbackEvent({ phase: 'pass', iteration, notes, reportFile, clearToMerge: true, merge: 'user-held', escalated: this.opts.escalate !== undefined });
-        this.opts.escalate?.(
-          `bmad-review gate PASS for job ${job.id} — review/fix routing cleared (missing Perkins gate escalated; merge stays user-held)`,
-          `${notes} note(s) across ${iteration} review round(s). Reports: ${state.reportFiles.join(', ')}`,
-          { jobId: job.id },
-        );
+        // Escalation truth (native r7): record what actually happened AFTER
+        // the notifier attempt — a configured notifier that throws is a
+        // failed escalation, not a posted one; absent configuration is its
+        // own state; a legacy event without this field stays unrecorded.
+        let escalation: 'posted' | 'failed' | 'not-configured' = 'not-configured';
+        if (this.opts.escalate !== undefined) {
+          try {
+            this.opts.escalate(
+              `bmad-review gate PASS for job ${job.id} — review/fix routing cleared (missing Perkins gate escalated; merge stays user-held)`,
+              `${notes} note(s) across ${iteration} review round(s). Reports: ${state.reportFiles.join(', ')}`,
+              { jobId: job.id },
+            );
+            escalation = 'posted';
+          } catch (error) {
+            escalation = 'failed';
+            this.log('error', 'fallback PASS escalation notifier threw', {
+              job: job.id,
+              error: String(error),
+            });
+          }
+        }
+        fallbackEvent({ phase: 'pass', iteration, notes, reportFile, clearToMerge: true, merge: 'user-held', escalation });
         return;
       }
       if (iteration === maxRounds) break;

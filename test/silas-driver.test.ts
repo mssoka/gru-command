@@ -1163,6 +1163,7 @@ describe('silas skills and wake prompt', () => {
     expect(ops).toContain("own their workflows' built-in review on fresh independent reviewer contexts");
     expect(ops).toContain('separately tracked review jobs');
     expect(ops).toContain('nested-admission capability gap');
+    expect(ops).toContain('never wait for a pre-freed permit');
     // j-810/j-811: the retired untracked headless-launcher wording must never return.
     expect(ops).not.toContain('pi -p');
     expect(ops).not.toContain('headless print mode');

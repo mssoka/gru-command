@@ -135,8 +135,10 @@ reviewer jobs share the worker budget with the lane that commissions
 them: if a worker reports the nested-admission capability gap (a reviewer
 dispatch that cannot be admitted while its lane holds its slot), treat it
 as a scheduling gate — schedule around it under the configured worker
-limits, dispatch the lane's recorded next-action review commission once a
-resident slot frees, reconcile any uncertain submitted dispatch by its
+limits, dispatch the lane's recorded next-action review commission once the
+lane's turn has settled (the reviewer's own submission is what triggers
+the demand-driven reclamation of a safe idle resident — never wait for a
+pre-freed permit), reconcile any uncertain submitted dispatch by its
 job identity before dispatching a replacement, and never substitute
 untracked reviewers. Skill
 names and workflow structure change between BMAD versions — never demand
