@@ -1564,6 +1564,20 @@ body {
   scroll-margin-top: calc(var(--chrome-h, 100px) + var(--board-nav-h, 0px) + 40px);
 }
 
+/* Focusable controls inside the bands scroll into view like the sections
+   themselves: a programmatic/restored focus must clear the measured sticky
+   chrome (command bar + chip rail), the shortcut strip AND the sticky band
+   head that pins under them — otherwise the browser aligns the target flush
+   to the viewport top, underneath the header (tablet 768-wide focus
+   evidence: button rect y0 with html scroll-padding auto). The same
+   clearance as the section jump above keeps a focused control at the
+   position an anchor jump would give its section. */
+.board-band__more,
+.board-job__toggle,
+.board-round__toggle {
+  scroll-margin-top: calc(var(--chrome-h, 100px) + var(--board-nav-h, 0px) + 40px);
+}
+
 /* A sticky band separator: the label + count pin under the global chrome
    AND the section shortcut strip while the rows scroll beneath them. */
 .board-band__head {
