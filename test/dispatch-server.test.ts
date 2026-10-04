@@ -508,7 +508,7 @@ describe('dispatch server (E8)', () => {
       if (review.status !== 202) throw new Error(`review failed: ${JSON.stringify(review)}`);
       expect(review.status).toBe(202);
       expect(field<string>(review.json, 'round_id')).toBe('http-review-r1');
-      expect(field<string[]>(review.json, 'lenses')).toHaveLength(7);
+      expect(field<string[]>(review.json, 'lenses')).toHaveLength(9);
       const deadline = Date.now() + 5_000;
       while (h.ledger.getRound('http-review-r1')?.verdict !== 'approved' && Date.now() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 20));
@@ -520,7 +520,7 @@ describe('dispatch server (E8)', () => {
   });
 
 
-  it('accepts explicit no_spec=true as six lenses and rejects non-boolean no_spec', async () => {
+  it('accepts explicit no_spec=true as eight lenses and rejects non-boolean no_spec', async () => {
     const h = await boot();
     const repo = makeFixtureRepo('fixture-http-no-spec');
     cleanupRepos.push(repo);
@@ -541,7 +541,7 @@ describe('dispatch server (E8)', () => {
       }, TOKEN);
       expect(review.status).toBe(202);
       expect(field<string[]>(review.json, 'lenses')).toEqual([
-        'blind', 'edge', 'security', 'architecture', 'codebase', 'tests',
+        'blind', 'edge', 'security', 'architecture', 'codebase', 'tests', 'performance', 'operations',
       ]);
     } finally {
       await h.close();
@@ -1006,6 +1006,35 @@ describe('dispatch server (E8)', () => {
       expect(digest.prWithoutReview).toMatchObject([{ jobId: 'clean-abort-moved', priorRounds: 2 }]);
       expect(digest.prWithoutReview[0]?.cleanAbort).toBeUndefined();
     } finally { releasePreflight(); await h.close(); }
+  }, 90_000);
+
+  it('re-arms a proven same-head service_restart_missing_review_lane abort too (#113)', async () => {
+    const h = await boot();
+    const repo = makeFixtureRepo('fixture-clean-abort-lane');
+    cleanupRepos.push(repo);
+    attachBareOrigin(repo);
+    try {
+      await call(h.port, 'POST', '/api/dispatch', { job_id: 'clean-abort-lane', repo_path: repo.path, title: 'clean', briefing: 'b' }, TOKEN);
+      const deadline = Date.now() + 10_000;
+      while (h.ledger.latestJobEvent('clean-abort-lane', 'job.delivered') === null && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      expect(h.ledger.latestJobEvent('clean-abort-lane', 'job.delivered')).not.toBeNull();
+      expect((await call(h.port, 'POST', '/api/dispatch/pr', { job_id: 'clean-abort-lane', url: PR_URL }, TOKEN)).status).toBe(200);
+      const lane = h.worktrees.listWorktrees({ jobId: 'clean-abort-lane' }).find((row) => row.kind === 'job')!;
+      const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: lane.path, encoding: 'utf8' }).trim();
+      const round = h.ledger.addRound({ jobId: 'clean-abort-lane', targetRef: sha, lenses: ['blind'] });
+      h.ledger.setRoundStatus(round.id, 'aborted');
+      const body = { job_id: 'clean-abort-lane', by: 'silas', rule_id: 'clean-abort-service-restart', source_round_id: round.id };
+      h.ledger.appendCustomEvent({ kind: 'round.perkins-incomplete', jobId: 'clean-abort-lane', roundId: round.id, payload: { reason: 'service_restart_missing_review_lane' } });
+      const review = await call(h.port, 'POST', '/api/dispatch/review', body, TOKEN);
+      expect(review).toMatchObject({ status: 202, json: { route: 'perkins', round_id: 'clean-abort-lane-r2',
+        rule_id: 'clean-abort-service-restart', source_round_id: round.id } });
+      expect(h.ledger.latestJobEvent('clean-abort-lane', 'silas.review-triggered')?.payload).toMatchObject({
+        rule_id: 'clean-abort-service-restart', source_round_id: round.id, round_id: 'clean-abort-lane-r2',
+      });
+      expect((await call(h.port, 'POST', '/api/dispatch/review', body, TOKEN)).status).toBe(400);
+    } finally { await h.close(); }
   }, 90_000);
 
   it('/api/silas/directive routes to the live minion, flips the lane back to working, records the event', async () => {

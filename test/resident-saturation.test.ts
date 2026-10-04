@@ -134,8 +134,8 @@ describe('four-busy-minion saturation and complete whole-PR Perkins coverage', (
         movementRef: 'feature/review', noSpec: false,
       });
       expect(result.canonicalVerdict).toBe('READY TO MERGE');
-      expect(script.childCalls).toHaveLength(7);
-      expect(result.specialistRuns).toHaveLength(7);
+      expect(script.childCalls).toHaveLength(9);
+      expect(result.specialistRuns).toHaveLength(9);
       expect(peak).toBe(4);
       for (const minion of retained) {
         expect(registry.getHandle(minion.id)).toBe(minion);
@@ -248,8 +248,8 @@ describe('four-busy-minion saturation and complete whole-PR Perkins coverage', (
         movementRef: 'feature/review', noSpec: false,
       });
       expect(result.canonicalVerdict).toBe('READY TO MERGE');
-      expect(script.childCalls).toHaveLength(7);
-      expect(result.specialistRuns).toHaveLength(7);
+      expect(script.childCalls).toHaveLength(9);
+      expect(result.specialistRuns).toHaveLength(9);
       // Lead + one serial child never exceed the two-slot global pool.
       expect(peak).toBe(2);
     } finally {

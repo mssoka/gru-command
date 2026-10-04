@@ -535,6 +535,14 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
           send(client.socket, { type: 'ping' });
         }
       }
+      // Issue #171: supervision activity (a raw-idle agent opening a turn,
+      // a control phase or a tool call) can change without any ledger
+      // event, and ownership classification changes (hydration, runtime
+      // transitions) have no ledger event either. The bus-driven push
+      // would leave a connected board stale; refresh on the existing
+      // heartbeat cadence so the derived status, quiet clock and
+      // membership can never drift beyond one interval.
+      if (clients.size > 0 && [...clients].some((client) => client.authed)) schedulePush();
     }, heartbeatMs);
     heartbeat.unref();
   }

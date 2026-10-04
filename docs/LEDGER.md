@@ -81,9 +81,12 @@ lens:   pending → live → done | error               (terminal: the last two)
   (idempotent); `done`/`error` are explicit outcomes (the wave runner or
   error derivation sets them).
 
-**Default lens set** (`DEFAULT_LENSES`, 7): blind, edge, acceptance,
-security, architecture, codebase, tests — every new round carries all
-seven chips unless created with an explicit list.
+**Default lens set** (`DEFAULT_LENSES`, 9): blind, edge, acceptance,
+security, architecture, codebase, tests, performance, operations — the
+fallback for a future round created without an explicit list. Production
+rounds pass the pinned policy's applicable catalog (9, or 8 for explicit
+no-spec) at creation; every new round carries those chips, and historical
+rounds keep exactly the chips they recorded.
 
 ## Event kinds
 

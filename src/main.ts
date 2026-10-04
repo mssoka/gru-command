@@ -575,6 +575,14 @@ async function main(): Promise<number> {
     ledger,
     bus,
     supervisionFor: (agentId) => supervisor?.viewFor(agentId) ?? null,
+    // Issue #171 truthful agent status: the live registry's handle set is
+    // the authoritative current-runtime ownership probe. Together with the
+    // supervision feed (adoptions + hydrated durable stops) it classifies
+    // every ledger row as current / historical / unverified — stale rows
+    // left by an unclean stop no longer read as live crew.
+    runtimeOwnership: () => ({
+      ownedAgentIds: new Set(registry.listHandles().map((handle) => handle.id)),
+    }),
     pacing: () => (config.pacing.enabled ? pacing.gate.view() : null),
     decisionsStatus: () => decisions?.status() ?? {
       enabled: false,
@@ -1333,6 +1341,11 @@ async function main(): Promise<number> {
       return 1;
     }
   }
+  // Issue #171: supervision hydration (restored durable stops) must land
+  // BEFORE the listener serves snapshots — the ownership probe is wired
+  // and answering from the first request, so a not-yet-hydrated stop
+  // would classify as historical until some later push corrected it.
+  supervisorLive.start();
   state.handle = await service.start();
   const handle = state.handle;
   chat.attach(handle.httpServer);
@@ -1363,7 +1376,6 @@ async function main(): Promise<number> {
   }
   awareness.setWakeSink(() => chat.wakeAwareness());
   chat.warmup();
-  supervisorLive.start();
   bob.start();
   if (config.lessons.enabled) dream.start();
   else logger.info('lesson dream disabled by config', {});

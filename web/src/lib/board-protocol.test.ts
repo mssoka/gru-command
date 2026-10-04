@@ -211,6 +211,40 @@ describe('board server-frame validator', () => {
     expect(isValidSnapshot(withSupervision({ state: 'watching', restarts: Number.NaN, breakerOpen: false }))).toBe(false);
   });
 
+  it('#171 agent classification fields validate strictly at the parse boundary (unknown class/status/lastEventAt reject)', () => {
+    const withAgent = (patch: Record<string, unknown>): unknown => {
+      const candidate = snapshot();
+      Object.assign(candidate.agents[0] as unknown as Record<string, unknown>, patch);
+      return candidate;
+    };
+    // Accept: absent (pre-upgrade), the three known classes, a known
+    // derived status, and a parseable supervision event clock.
+    expect(isValidSnapshot(snapshot())).toBe(true);
+    expect(isValidSnapshot(withAgent({ runtime: 'current' }))).toBe(true);
+    expect(isValidSnapshot(withAgent({ runtime: 'historical' }))).toBe(true);
+    expect(isValidSnapshot(withAgent({ runtime: 'unverified' }))).toBe(true);
+    expect(isValidSnapshot(withAgent({ status: 'streaming' }))).toBe(true);
+    expect(
+      isValidSnapshot(
+        withAgent({ supervision: { state: 'watching', restarts: 0, breakerOpen: false, lastEventAt: '2026-01-01T00:00:00.000Z' } }),
+      ),
+    ).toBe(true);
+    // Reject: an unknown ownership class or display status must never be
+    // silently tolerated (a junk class would render as live crew; a junk
+    // status would reach the chip).
+    expect(isValidSnapshot(withAgent({ runtime: 'archived' }))).toBe(false);
+    expect(isValidSnapshot(withAgent({ runtime: 'CURRENT' }))).toBe(false);
+    expect(isValidSnapshot(withAgent({ status: 'vibing' }))).toBe(false);
+    expect(isValidSnapshot(withAgent({ status: 7 }))).toBe(false);
+    // Reject: an unparseable supervision event clock would silently
+    // displace the valid ledger age in the quiet counter.
+    expect(
+      isValidSnapshot(
+        withAgent({ supervision: { state: 'watching', restarts: 0, breakerOpen: false, lastEventAt: 'not-a-date' } }),
+      ),
+    ).toBe(false);
+  });
+
   it('FOR YOU ownerPrs: absent/null tolerated (pre-upgrade servers), well-formed accepted, malformed rejected', () => {
     expect(isValidSnapshot(snapshot())).toBe(true);
     const nullPrs = { ...snapshot(), ownerPrs: null } as unknown;

@@ -365,7 +365,8 @@ Two section-truth rules keep the bands honest (2026-09-29):
   above, then attention-banded dense job rows + the CREW (n) /
   TRANSCRIPTS rail. At ≥1100px the chat pane joins it on the left with
   drag splitters; below that the board is the full page and chat
-  overlays. Round rows carry 7 per-lens live chips behind the row's
+  overlays. Round rows carry their per-lens live chips (the round's own
+  recorded catalog; 9 for a current full round) behind the row's
   disclosure; the notification center rides the bell, and the header
   speaker enables/mutes the `needs-owner` owner chime (see
   [BOARD.md](./BOARD.md)). **Phone:** board-first (SPEC ruling 11) — the
