@@ -232,15 +232,16 @@ export class DispatchService {
         const cwd = requireSpawnCwd('minion', worktree.path);
         // Issue #161: a dispatched parent gets a product-owned identity and
         // the GC-mediated child tools bound to it — no bearer secret ever
-        // reaches the session (the tools execute in the service process).
+        // reaches the session (the tools execute in the service process;
+        // a runtime that cannot host them returns none).
         const parentAgentId =
           this.opts.parentTools === undefined ? undefined : `minion_${randomUUID()}`;
+        const parentNativeTools =
+          parentAgentId === undefined ? [] : (this.opts.parentTools?.(parentAgentId) ?? []);
         handle = await this.opts.spawner('minion', {
           cwd,
           ...(parentAgentId !== undefined ? { agentId: parentAgentId } : {}),
-          ...(parentAgentId !== undefined
-            ? { nativeTools: this.opts.parentTools!(parentAgentId) }
-            : {}),
+          ...(parentNativeTools.length > 0 ? { nativeTools: parentNativeTools } : {}),
         });
       } catch (error) {
         // The lane cannot start — release the pacing slot, sweep the fresh
@@ -424,7 +425,9 @@ export class DispatchService {
         sha: worktree.sha,
         briefing: input.briefing,
         agentId: handle.id,
-        ...(this.opts.parentTools !== undefined ? { childWorkerTools: true } : {}),
+        ...(this.opts.parentTools !== undefined && this.opts.parentTools(handle.id).length > 0
+          ? { childWorkerTools: true }
+          : {}),
         ...(lessons.length > 0 ? { lessons } : {}),
       });
       const promptRun: Promise<unknown> =

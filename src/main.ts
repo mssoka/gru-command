@@ -77,7 +77,7 @@ import {
 } from './dispatch/review-path.js';
 import { loadPerkinsPolicy } from './dispatch/perkins-review/policy.js';
 import { getAgentDir } from '@earendil-works/pi-coding-agent';
-import type { SpawnOptions } from './runtime/types.js';
+import type { NativeAgentTool, SpawnOptions } from './runtime/types.js';
 
 /** Locate the installed bmad-review skill: check both the pi agent dir
  * and ~/.agents (the BMAD default install root) for maximum compatibility. */
@@ -1044,6 +1044,7 @@ async function main(): Promise<number> {
   const childWorkers = new ChildWorkerService({
     ledger,
     worktrees: worktreeManager,
+    hostParentTools: registry.runtimeIdFor('minion') === 'pi',
     spawner: (role: Role, spawnOptions?: SpawnOptions, residentRelease?: () => void) =>
       residentRelease !== undefined
         ? registry.spawnWithResident(role, spawnOptions ?? {}, residentRelease)
@@ -1065,6 +1066,13 @@ async function main(): Promise<number> {
   // tools — never the default role spawn (which would widen a read-only
   // child and move it out of its worktree).
   supervisorLive.setRestartPolicy((agentId, role) => childWorkers.restartPolicy(agentId, role));
+  // Issue #161 declared capability gap: parent child-worker tools are
+  // in-process and therefore only hosted on runtimes that execute tools in
+  // the service process (pi). A claude-code minion receives no parent
+  // tools rather than a same-uid-discoverable bridge (see the adapter's
+  // refusal).
+  const parentToolsFor = (agentId: string): readonly NativeAgentTool[] =>
+    childWorkers.parentTools(agentId);
   const dispatcher = new DispatchService({
     ledger,
     worktrees: worktreeManager,
@@ -1072,7 +1080,7 @@ async function main(): Promise<number> {
     workerGate: pacing.gate,
     retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
     stopSignal: serviceStop.signal,
-    parentTools: (agentId) => childWorkers.parentTools(agentId),
+    parentTools: parentToolsFor,
     ...(config.lessons.enabled ? { lessons: lessonReferences, lessonsCapture } : {}),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
@@ -1103,7 +1111,7 @@ async function main(): Promise<number> {
         directive: directiveInput.directive,
         signal: directiveInput.signal,
         owner: 'bmad-review-gate',
-        parentTools: (agentId: string) => childWorkers.parentTools(agentId),
+        parentTools: parentToolsFor,
       }),
     },
     // Wave escalations carry bounded per-call identity context; the
@@ -1129,7 +1137,7 @@ async function main(): Promise<number> {
     notifications,
     workerGate: pacing.gate,
     retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
-    parentTools: (agentId) => childWorkers.parentTools(agentId),
+    parentTools: parentToolsFor,
     stopSignal: serviceStop.signal,
     log: (level, msg, fields) => logger.log(level, msg, fields),
     stopping: () => shuttingDown,

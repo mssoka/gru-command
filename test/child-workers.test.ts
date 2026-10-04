@@ -451,6 +451,22 @@ describe('tracked child workers: admission (issue #161)', () => {
         }),
       ).code,
     ).toBe('parent_expired');
+    // An ERRORED parent has no live authority either (it may be dead or
+    // awaiting supervision; neither can own a new child honestly).
+    h.ledger.registerAgent({ id: 'parent-3', role: 'minion', jobId: 'job-1', parentage: 'top-level' });
+    h.ledger.setAgentState('parent-3', 'error');
+    expect(
+      refusalOf(() =>
+        h.service.request({
+          parentAgentId: 'parent-3',
+          jobId: 'job-1',
+          purpose: 'p',
+          authority: 'read-only',
+          task: 't',
+          idempotencyKey: 'k-error-parent',
+        }),
+      ).code,
+    ).toBe('parent_expired');
     // Bounded fanout: the cap names itself, and children never spawn children.
     for (let index = 0; index < MAX_CHILDREN_PER_PARENT; index += 1) {
       h.request({ idempotencyKey: `k-cap-${index}` });
@@ -668,7 +684,7 @@ describe('tracked child workers: lifecycle, results and recovery', () => {
     h.close();
   });
 
-  it('refuses supervision restart for a tracked child (single-run logical worker)', async () => {
+  it('refuses supervision restart for a tracked child without faking a terminal result', async () => {
     const h = makeHarness();
     h.setTurnGate();
     const admission = h.request();
@@ -677,12 +693,14 @@ describe('tracked child workers: lifecycle, results and recovery', () => {
     expect(policy).toBeDefined();
     expect(policy !== undefined && 'refuse' in policy).toBe(true);
     expect((policy as { refuse: string }).refuse).toContain('single-run');
-    // The refusal terminalizes honestly (no fabricated done) and sweeps the
-    // read-only lane (the session cannot safely be replaced).
-    await waitFor(() => h.ledger.getChildWorker(admission.record.id)?.resultState === 'error', 'the refusal result');
-    expect(h.ledger.getChildWorker(admission.record.id)!.resultSummary).toContain('restart refused');
+    // The refusal is DURABLE evidence, not a terminal result: the old
+    // handle may still be live, so the child's own finalizer owns
+    // terminalization (proof-aware).
+    expect(h.ledger.latestEventOfKind('child.restart-refused')).not.toBeNull();
+    expect(h.ledger.getChildWorker(admission.record.id)!.resultState).toBeNull();
     // A non-child agent is not specialized (undefined = default restart).
     expect(h.service.restartPolicy('parent-1', 'minion')).toBeUndefined();
+    await h.service.cancel(admission.record.id, 'restart-policy test cleanup');
     h.close();
   });
 
@@ -891,6 +909,35 @@ describe('tracked child workers: migration and storage', () => {
     after.registerAgent({ id: 'legacy-minion', role: 'minion', jobId: 'job-1' });
     expect(after.getAgent('legacy-minion')?.parentage).toBeNull();
     upgraded.close();
+  });
+
+  it('migration 16 backfills unbound child rows and guarantees the agent lookup index', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-child-bind-'));
+    cleanupDirs.push(dir);
+    // A ledger shaped through migration 15 (the intermediate branch shape),
+    // carrying an unspawned child whose agent binding was still NULL.
+    const v15 = new LedgerDb(dir, { migrations: MIGRATIONS.filter((migration) => migration.id <= 15) });
+    const before = new LedgerApi(v15.handle, {});
+    before.addJob({ id: 'job-1', repo: 'r', title: 'legacy', briefing: 'b' });
+    before.registerAgent({ id: 'parent-1', role: 'minion', jobId: 'job-1', parentage: 'top-level' });
+    const admission = before.admitChildWorker({
+      id: 'child_old',
+      parentAgentId: 'parent-1',
+      jobId: 'job-1',
+      purpose: 'intermediate shape',
+      authority: 'read-only',
+      task: 't',
+      idempotencyKey: 'k-old',
+    });
+    v15.handle.prepare('UPDATE child_workers SET agent_id = NULL WHERE id = ?').run(admission.record.id);
+    v15.close();
+    // The shipped build applies 16: the row converges to the final binding
+    // and the agent lookup is answerable.
+    const full = new LedgerDb(dir);
+    const after = new LedgerApi(full.handle, {});
+    expect(after.getChildWorker('child_old')?.agentId).toBe('child_old');
+    expect(after.childWorkerByAgent('child_old')?.id).toBe('child_old');
+    full.close();
   });
 });
 

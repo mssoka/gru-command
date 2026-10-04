@@ -395,12 +395,18 @@ admission, identity, lifecycle, cancellation and the result record.
 **GC-mediated parent tools.** A dispatched top-level minion receives
 three product-native tools bound to its own agent id by closure —
 `request_child_worker`, `list_child_workers` and `cancel_child_worker`.
-They execute inside the GC service process (pi: in-process custom tools;
-claude-code: the same session-scoped MCP bridge review sessions use), so
-no bearer secret is written into session space and a sibling worker
-cannot impersonate the parent by reading a file. The HTTP child
-endpoints remain the operator surface (pairing token) and are not the
-minion-facing path.
+They execute INSIDE the GC service process, so no bearer secret is
+written into session space and a sibling worker cannot impersonate the
+parent by reading a file. The HTTP child endpoints remain the operator
+surface (pairing token) and are not the minion-facing path.
+
+Declared capability gap (review round 3): the tools are hosted only on
+runtimes that execute them in the service process (**pi**). A
+claude-code session's tools ride a discoverable same-uid loopback bridge,
+which another worker process could call to impersonate the parent — so
+the claude-code adapter REFUSES non-review product tools loudly, and a
+claude-code minion receives no parent-tool surface (the board, HTTP and
+ledger surfaces remain runtime-agnostic).
 
 - **Parentage is a relationship, not a sixth role.** A child is a
   minion-role session whose agent row carries `parentage = 'child'` and

@@ -424,12 +424,22 @@ export class ClaudeCodeRuntime implements AgentRuntime {
       if (reviewConfiguration !== undefined) {
         reviewSettings = privateClaudeReviewSettings(reviewConfiguration.settings);
       }
-      // ANY session that declares native tools gets its own scoped bridge
-      // exposing exactly the declared set — review leads/lens children AND
-      // (issue #161) ordinary parent sessions ride the same seam (SPEC
-      // ruling 4: no harness split).
-      const declaredNativeTools =
-        reviewMode !== undefined ? reviewMode.nativeTools : options.nativeTools;
+      // Review sessions (leads/lens children) get their scoped bridge
+      // exactly as before. Issue #161 DECLARED CAPABILITY GAP: a
+      // non-review parent session must NOT be given product-native tools
+      // on this runtime — the MCP bridge is a same-UID-discoverable
+      // loopback socket, and another worker process under the service uid
+      // could invoke the parent's tools (impersonation) and bypass nested-
+      // delegation bounds. Parent child-worker tools are hosted in-process
+      // on runtimes that can execute them in the service process (pi), and
+      // this refusal is loud rather than silently unhosted.
+      if (reviewMode === undefined && options.nativeTools !== undefined && options.nativeTools.length > 0) {
+        throw new Error(
+          'claude-code cannot host product-native non-review tools: its session bridge is a discoverable same-uid socket ' +
+            '(use the pi runtime for parent child-worker tools — declared capability gap, issue #161)',
+        );
+      }
+      const declaredNativeTools = reviewMode !== undefined ? reviewMode.nativeTools : undefined;
       if (declaredNativeTools !== undefined && declaredNativeTools.length > 0) {
         reviewBridge = await ReviewMcpBridge.start(declaredNativeTools);
       }

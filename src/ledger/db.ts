@@ -649,11 +649,13 @@ export const MIGRATIONS: readonly Migration[] = [
     // owner-merged main lands first, re-number ONLY this never-applied
     // migration (never a hole).
     //
-    // PRECONDITION (review round 2): this migration id was edited while
-    // the feature was still unmerged/unshipped. It must never be applied
-    // by an intermediate commit of this branch on a persisted ledger. No
-    // release build carried it; if that precondition is ever broken,
-    // ship an additive follow-up migration instead of editing this id.
+    // UPGRADE NOTE (review rounds 2-3): this id was edited while the
+    // feature was still unmerged/unshipped. A ledger made by an
+    // intermediate commit of this branch (old id-15 shape) is upgraded by
+    // the additive migration 16, which backfills the child/agent binding
+    // and guarantees the lookup index; the retired capability column is
+    // retained here so fresh and upgraded schemas converge. No release
+    // build carried either intermediate shape.
     id: 15,
     name: 'child-workers',
     // The worktrees table is rebuilt to widen its kind CHECK; the runner
@@ -690,6 +692,13 @@ export const MIGRATIONS: readonly Migration[] = [
       ALTER TABLE agents ADD COLUMN parent_agent_id TEXT REFERENCES agents(id);
       ALTER TABLE agents ADD COLUMN parentage TEXT CHECK (parentage IN ('top-level','child'));
       CREATE INDEX idx_agents_parent ON agents(parent_agent_id);
+      -- RETIRED (issue #161 round 3): the parent capability is GC-mediated
+      -- (in-process native tools), so no bearer column is used by the
+      -- code. The column is retained in the schema so a ledger created by
+      -- an earlier, unshipped commit of this branch CONVERGES with a fresh
+      -- one (a later additive migration must never have to guess which
+      -- shape it is upgrading).
+      ALTER TABLE agents ADD COLUMN child_request_token_hash TEXT;
 
       CREATE TABLE child_workers (
         id              TEXT PRIMARY KEY,
@@ -720,6 +729,22 @@ export const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX idx_child_workers_job ON child_workers(job_id);
       CREATE INDEX idx_child_workers_state ON child_workers(state);
       CREATE INDEX idx_child_workers_agent ON child_workers(agent_id);
+    `,
+  },
+  {
+    // Issue #161 round-3 convergence: an intermediate, unshipped commit of
+    // this branch created child_workers rows whose `agent_id` was bound
+    // later at spawn (a runtime-minted id) or left NULL. The final model
+    // makes `agent_id` equal the admission id from the start, so this
+    // additive migration backfills the unbound rows and guarantees the
+    // lookup index — a database made by EITHER pre-merge shape upgrades to
+    // the same final schema. (Migration 15 keeps the retired capability
+    // column for the same convergence reason; nothing reads it.)
+    id: 16,
+    name: 'child-workers-agent-binding',
+    sql: `
+      CREATE INDEX IF NOT EXISTS idx_child_workers_agent ON child_workers(agent_id);
+      UPDATE child_workers SET agent_id = id WHERE agent_id IS NULL;
     `,
   },
 ];

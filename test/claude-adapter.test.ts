@@ -1187,6 +1187,21 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     await expect(
       fx.runtime.spawn('perkins', { roleTools: ['undeclared-tool'] }),
     ).rejects.toThrowError(/role tool override names "undeclared-tool"/);
+    // Issue #161 declared capability gap: non-review product-native tools
+    // cannot be hosted on claude-code (the MCP bridge is a discoverable
+    // same-uid socket); the refusal is loud, never a silent unhosted tool.
+    await expect(
+      fx.runtime.spawn('minion', {
+        nativeTools: [
+          {
+            name: 'request_child_worker',
+            description: 'x',
+            inputSchema: { type: 'object' },
+            execute: async () => ({ text: '' }),
+          },
+        ],
+      }),
+    ).rejects.toThrowError(/cannot host product-native non-review tools/);
     // The role prompt is the perkins/minion definition's own:
     expect(review!.argv[review!.argv.indexOf('--append-system-prompt') + 1]).toContain(
       'Whole-PR Review Lead',

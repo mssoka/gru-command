@@ -155,6 +155,11 @@ export interface ChildWorkerServiceOptions {
    * child reserves its permit at run start, so a free-seat probe race can
    * never admit an unsatisfiable queue. Absent = the spawner charges. */
   readonly reserveResident?: (signal?: AbortSignal) => Promise<() => void>;
+  /** Issue #161 declared capability gap: parent tools are in-process and
+   * therefore only hosted on runtimes that execute tools in the service
+   * process (pi). false = parentTools() returns an empty list, so no
+   * session is offered a same-uid-discoverable bridge. Default true. */
+  readonly hostParentTools?: boolean;
   readonly log?: Log;
 }
 
@@ -209,7 +214,10 @@ export function renderChildBriefing(input: {
 export function countAssistantEntries(sessionFile: string | null): number | null {
   if (sessionFile === null) return null;
   try {
-    const { entries } = parseTranscriptContent(readFileSync(sessionFile, 'utf-8'));
+    const { entries, tornLines } = parseTranscriptContent(readFileSync(sessionFile, 'utf-8'));
+    // A torn/corrupt transcript must not anchor at zero: the parser's
+    // tolerance would otherwise hide a partial prior turn.
+    if (tornLines > 0) return null;
     return entries.filter((entry) => entry.kind === 'assistant').length;
   } catch {
     return null;
@@ -232,7 +240,8 @@ export function extractFinalReport(
 ): string | null {
   if (sessionFile === null || fromAssistantIndex === null) return null;
   try {
-    const { entries } = parseTranscriptContent(readFileSync(sessionFile, 'utf-8'));
+    const { entries, tornLines } = parseTranscriptContent(readFileSync(sessionFile, 'utf-8'));
+    if (tornLines > 0) return null;
     const last = entries.at(-1);
     // Trailing non-message frames (claude raw stream frames) are inert:
     // the final message itself must still be the assistant report.
@@ -298,6 +307,7 @@ export class ChildWorkerService {
    * parent the way a readable credential file would allow.
    */
   parentTools(agentId: string): readonly NativeAgentTool[] {
+    if (this.opts.hostParentTools === false) return [];
     const stringField = (input: Record<string, unknown>, field: string): string => {
       const value = input[field];
       if (typeof value !== 'string' || value.trim() === '') {
@@ -558,11 +568,11 @@ export class ChildWorkerService {
         `job "${jobId}" is ${job.status} — an expired lane admits no fresh child worker`,
       );
     }
-    if (parent.state === 'disposed') {
+    if (parent.state === 'disposed' || parent.state === 'error') {
       throw new ChildWorkerRefusal(
         'parent_expired',
         409,
-        `parent agent "${parentAgentId}" is disposed — a stopped session cannot commission workers`,
+        `parent agent "${parentAgentId}" is ${parent.state} — a stopped session cannot commission workers`,
       );
     }
     const admittedChildren = this.opts.ledger.listChildWorkers({ parentAgentId });
@@ -624,7 +634,12 @@ export class ChildWorkerService {
     if (parent.parentage === 'child' || parent.parentAgentId !== null) {
       return `parent agent "${record.parentAgentId}" is itself a child worker`;
     }
-    if (parent.state === 'disposed') return `parent agent "${record.parentAgentId}" is disposed`;
+    // A disposed OR errored parent has no live authority to delegate — an
+    // `error` session may be dead or awaiting supervision, and neither can
+    // own a new worker honestly.
+    if (parent.state === 'disposed' || parent.state === 'error') {
+      return `parent agent "${record.parentAgentId}" is ${parent.state}`;
+    }
     const job = this.opts.ledger.getJob(record.jobId);
     if (job === null) return `job "${record.jobId}" no longer exists`;
     if (isJobTerminal(job.status)) return `job "${record.jobId}" is ${job.status} — the lane expired`;
@@ -1071,12 +1086,16 @@ export class ChildWorkerService {
     // with the reason recorded); the parent requests a NEW child instead.
     // The supervisor's breaker/stop/ownership still apply in full.
     const reason = this.ineligibility(record) ?? 'child workers are single-run; a replacement session would duplicate the logical child';
-    this.opts.ledger.recordChildResult(record.id, {
-      state: 'error',
-      summary: `supervision restart refused: ${reason}`,
-      ref: record.sessionFile,
+    // A restart refusal is NOT a terminal result: the old handle may still
+    // be live (the supervisor disposes before consulting policy, and that
+    // disposal can fail). The child's own run finalizer owns terminalization
+    // — with proven cessation, or non-terminal debt when unproven.
+    this.opts.ledger.appendCustomEvent({
+      kind: 'child.restart-refused',
+      agentId,
+      jobId: record.jobId,
+      payload: { childId: record.id, reason },
     });
-    if (record.authority === 'read-only') void this.releaseLaneQuietly(record.id);
     return { refuse: reason };
   }
 
@@ -1096,24 +1115,26 @@ export class ChildWorkerService {
    * the tracked runs to land their terminal records. */
   async dispose(): Promise<void> {
     this.controller.abort();
+    const disposals: Promise<void>[] = [];
     for (const run of this.live.values()) {
       run.cancelReason ??= 'service stopped before the child settled';
       run.controller.abort();
       if (run.handle !== null) {
-        void run.handle.dispose().catch((error: unknown) => {
+        disposals.push(run.handle.dispose().catch((error: unknown) => {
           this.log('error', 'child dispose during shutdown failed — permit retained as debt', {
             error: String(error),
           });
-        });
+        }));
       }
     }
-    const pending = [...this.inFlight];
+    const pending = [...this.inFlight, ...disposals];
     if (pending.length === 0) return;
     await Promise.race([
       Promise.allSettled(pending),
       new Promise<void>((resolve) => {
         // Stays inside the service's 5 s shutdown force-exit window: the
-        // registry's own dispose still owns the handles past this bound.
+        // registry's own dispose still owns the handles past this bound,
+        // and unproven stops stay non-terminal (never a false finished).
         const timer = setTimeout(resolve, 3_000);
         timer.unref?.();
       }),

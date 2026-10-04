@@ -36,9 +36,13 @@ function parentIdentitySpawnOptions(
       ? undefined
       : input.ledger.listAgents().find((agent) => agent.sessionFile === resumeFile);
   const agentId = resumed?.id ?? `minion_${randomUUID()}`;
+  const nativeTools = input.parentTools?.(agentId) ?? [];
   return {
     agentId,
-    ...(input.parentTools !== undefined ? { nativeTools: input.parentTools(agentId) } : {}),
+    // A runtime that cannot host parent tools returns none: no empty array
+    // is forwarded (the adapter would treat a declared-but-empty set the
+    // same, but an omission is the honest declaration).
+    ...(nativeTools.length > 0 ? { nativeTools } : {}),
   };
 }
 
