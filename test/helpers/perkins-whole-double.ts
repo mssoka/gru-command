@@ -32,6 +32,8 @@ export interface WholeSpawnCall {
   readonly agentId: string;
   readonly sessionFile: string;
   prompt?: string;
+  /** Images attached to the prompt, when the review path supplied them. */
+  images?: ReadonlyArray<{ readonly mediaType: string; readonly data: string }>;
   disposed?: boolean;
   disposeRejected?: boolean;
 }
@@ -134,6 +136,9 @@ export interface WholeLeadOptions {
   readonly submitRetries?: number;
   /** Build the exact real-submission payload per attempt (1-based). */
   readonly submitPayload?: (attempt: number, submission: WholeSubmission, findings: readonly WholeFindingView[]) => unknown;
+  /** Declare image input capability on spawned handles (default false: the
+   * offline double is text-only unless a test exercises vision delivery). */
+  readonly images?: boolean;
 }
 
 const SEVERITY_RANK: Record<string, number> = { blocker: 3, warning: 2, note: 1 };
@@ -459,11 +464,12 @@ export function fakeWholeSpawner(
       role: 'perkins',
       id: agentId,
       sessionFile: file,
-      capabilities: CAPS,
+      capabilities: { ...CAPS, images: options.images === true },
       reviewIsolation: true,
       ...(declaresNativeTools ? { reviewTools: requestedNativeTools.map((tool) => tool.name) } : {}),
-      async prompt(prompt) {
+      async prompt(prompt, promptOptions) {
         call.prompt = prompt;
+        if (promptOptions?.images !== undefined) call.images = promptOptions.images;
         const error = options.promptError?.(call) ?? null;
         if (error !== null) {
           for (const listener of listeners) listener({ type: 'error', error, fatal: false });

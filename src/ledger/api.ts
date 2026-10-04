@@ -22,6 +22,17 @@ import {
   type RoundVerdict,
 } from './states.js';
 import {
+  AMENDMENT_CONTRACT_MAX_BYTES,
+  AMENDMENT_MAX_IDEMPOTENCY_KEY_CHARS,
+  amendmentBodySha256,
+  amendmentRequestSha256,
+  renderEffectiveContract,
+  validateAmendmentDraft,
+  type EffectiveContract,
+  type JobAmendmentApproval,
+  type JobAmendmentRecord,
+} from '../review-inputs/amendments.js';
+import {
   canonicalIsoTimestamp,
   categoryKey,
   defaultFiringRule,
@@ -106,11 +117,41 @@ export interface JobRecord {
   readonly baseBranch: string | null;
   readonly prUrl: string | null;
   readonly note: string | null;
-  /** The briefing this job executes (E8; Gru-authored, Silas-executed). */
+  /** The briefing this job executes (E8; Gru-authored, Silas-executed).
+   * IMMUTABLE history: canonical amendments are appended separately and
+   * rendered into the effective acceptance at review freeze. */
   readonly briefing: string | null;
   readonly createdAt: string;
   readonly updatedAt: string;
 }
+
+/** Why an amendment write was refused (each refusal is audited as a
+ * `job.amendment-rejected` ledger event). */
+export type AddJobAmendmentRejectionCode =
+  | 'job-not-found'
+  | 'job-terminal'
+  | 'no-briefing'
+  | 'invalid'
+  | 'stale'
+  | 'idempotency-conflict';
+
+/** Result of one amendment write: accepted (with the effective contract) or
+ * a named refusal. Stale/idempotency conflicts carry the current contract so
+ * a caller can re-read and retry deterministically. */
+export type AddJobAmendmentResult =
+  | {
+      readonly status: 'accepted';
+      readonly amendment: JobAmendmentRecord;
+      readonly contract: EffectiveContract;
+      readonly idempotent: boolean;
+    }
+  | {
+      readonly status: 'rejected';
+      readonly code: AddJobAmendmentRejectionCode;
+      readonly reason: string;
+      readonly currentContractSha256?: string;
+      readonly currentVersion?: number;
+    };
 
 export interface LensChipRecord {
   readonly lens: string;
@@ -916,10 +957,274 @@ export class LedgerApi {
     return this.transaction(() => {
       const current = this.getJob(id);
       if (current === null) throw new RecordNotFound(`job "${id}" not found`);
+      // Canonical amendments hang off the ORIGINAL briefing bytes: once any
+      // amendment is accepted, the briefing is history and cannot be
+      // rewritten (append a new amendment instead).
+      if (this.listJobAmendments(id).length > 0) {
+        throw new Error(`job "${id}" has accepted canonical amendments; the briefing cannot be rewritten`);
+      }
       this.db.prepare('UPDATE jobs SET briefing = ?, updated_at = ? WHERE id = ?').run(briefing, nowIso(), id);
       this.appendEvent({ kind: 'job.briefing', jobId: id, payload: { bytes: briefing.length } });
       return this.getJob(id) as JobRecord;
     });
+  }
+
+  // ------------------------------------------------------------------
+  // Canonical job amendments (owner ruling j-969)
+  // ------------------------------------------------------------------
+
+  /** Every accepted amendment for a job, in version order (append-only). */
+  listJobAmendments(jobId: string): readonly JobAmendmentRecord[] {
+    const rows = this.db
+      .prepare('SELECT * FROM job_amendments WHERE job_id = ? ORDER BY version')
+      .all(jobId) as Row[];
+    return rows.map((row) => this.amendmentFromRow(row));
+  }
+
+  /** The job's effective acceptance: original briefing + accepted amendments. */
+  effectiveContract(jobId: string): EffectiveContract | null {
+    const job = this.getJob(jobId);
+    if (job === null) return null;
+    return renderEffectiveContract(job.briefing, this.listJobAmendments(jobId));
+  }
+
+  /**
+   * Accept one append-only amendment. Optimistic concurrency binds the
+   * request to the effective contract hash the writer read; a stale write is
+   * rejected (and audited), never merged. An idempotency key makes retries
+   * deterministic: the same key + same request fingerprint returns the
+   * already-accepted amendment; the same key with a different request is a
+   * conflict. The original briefing is never rewritten.
+   */
+  addJobAmendment(input: {
+    readonly jobId: string;
+    readonly body: string;
+    readonly supersedes?: readonly string[];
+    readonly approval: JobAmendmentApproval;
+    readonly expectedContractSha256: string;
+    readonly idempotencyKey?: string | null;
+  }): AddJobAmendmentResult {
+    return this.transaction(() => {
+      const job = this.getJob(input.jobId);
+      if (job === null) {
+        // events.job_id carries no foreign key, so the refusal stays visible
+        // even when the named job never existed.
+        return this.rejectAmendment(input.jobId, 'job-not-found', `job "${input.jobId}" not found`, input);
+      }
+      if (job.status === 'merged' || job.status === 'done') {
+        return this.rejectAmendment(input.jobId, 'job-terminal', `job "${input.jobId}" is ${job.status} — terminal lanes take no amendments`, input);
+      }
+      if (job.briefing === null || job.briefing.trim() === '') {
+        return this.rejectAmendment(input.jobId, 'no-briefing', 'job has no recorded briefing to amend', input);
+      }
+      const briefing = job.briefing;
+      const existing = this.listJobAmendments(input.jobId);
+      const current = renderEffectiveContract(briefing, existing);
+      const supersedes = input.supersedes ?? [];
+      const idempotencyKey = input.idempotencyKey ?? null;
+      if (idempotencyKey !== null) {
+        if (
+          idempotencyKey.trim() === '' ||
+          idempotencyKey.length > AMENDMENT_MAX_IDEMPOTENCY_KEY_CHARS ||
+          [...idempotencyKey].some((character) => {
+            const code = character.codePointAt(0) ?? 0;
+            return (code < 32 && character !== '\n' && character !== '\t') || code === 127;
+          })
+        ) {
+          return this.rejectAmendment(input.jobId, 'invalid', 'idempotency_key must be bounded printable text', input);
+        }
+      }
+      const requestSha = amendmentRequestSha256({
+        body: input.body,
+        supersedes,
+        approval: input.approval,
+        expectedContractSha256: input.expectedContractSha256,
+      });
+      // Retry determinism outranks staleness: the same idempotency key and
+      // request fingerprint always resolves to the same accepted amendment,
+      // even when later amendments have since moved the contract.
+      if (idempotencyKey !== null) {
+        const priorRow = this.db
+          .prepare('SELECT * FROM job_amendments WHERE job_id = ? AND idempotency_key = ?')
+          .get(input.jobId, idempotencyKey) as Row | undefined;
+        if (priorRow !== undefined) {
+          const prior = this.amendmentFromRow(priorRow);
+          if (prior.requestSha256 === requestSha) {
+            return { status: 'accepted' as const, amendment: prior, contract: current, idempotent: true };
+          }
+          return this.rejectAmendment(
+            input.jobId,
+            'idempotency-conflict',
+            'idempotency_key was already used for a different amendment request',
+            input,
+          );
+        }
+      }
+      if (input.expectedContractSha256 !== current.contractSha256) {
+        return this.rejectAmendment(
+          input.jobId,
+          'stale',
+          `expected_contract_sha256 does not match the current effective contract (now version ${current.version})`,
+          input,
+          { currentContractSha256: current.contractSha256, currentVersion: current.version },
+        );
+      }
+      const draftError = validateAmendmentDraft({
+        body: input.body,
+        supersedes,
+        approval: input.approval,
+        existingAmendmentIds: existing.map((amendment) => amendment.id),
+      });
+      if (draftError !== null) {
+        return this.rejectAmendment(input.jobId, 'invalid', draftError, input);
+      }
+      // An original:<anchor> supersession is a claim about the briefing: the
+      // anchor must actually occur there, or the recorded provenance is false.
+      const missingAnchor = supersedes.find(
+        (entry) => entry.startsWith('original:') && !briefing.includes(entry.slice('original:'.length)),
+      );
+      if (missingAnchor !== undefined) {
+        return this.rejectAmendment(
+          input.jobId,
+          'invalid',
+          `supersedes anchor "${missingAnchor.slice('original:'.length)}" does not occur in the original briefing`,
+          input,
+        );
+      }
+      const createdAt = nowIso();
+      const provisional: JobAmendmentRecord = {
+        id: randomUUID(),
+        jobId: input.jobId,
+        version: existing.length + 1,
+        body: input.body,
+        bodySha256: amendmentBodySha256(input.body),
+        supersedes: [...supersedes],
+        approval: { by: input.approval.by, reference: input.approval.reference },
+        previousContractSha256: current.contractSha256,
+        contractSha256: '',
+        requestSha256: requestSha,
+        idempotencyKey,
+        createdAt,
+      };
+      const rendered = renderEffectiveContract(briefing, [...existing, provisional]);
+      const contractSha256 = rendered.contractSha256;
+      if (Buffer.byteLength(rendered.text ?? '', 'utf8') > AMENDMENT_CONTRACT_MAX_BYTES) {
+        return this.rejectAmendment(
+          input.jobId,
+          'invalid',
+          `the rendered effective contract would exceed ${AMENDMENT_CONTRACT_MAX_BYTES} UTF-8 bytes`,
+          input,
+        );
+      }
+      const amendment: JobAmendmentRecord = { ...provisional, contractSha256 };
+      this.db
+        .prepare(
+          `INSERT INTO job_amendments (
+             id, job_id, version, body, body_sha256, supersedes,
+             approval_by, approval_reference, previous_contract_sha256,
+             contract_sha256, request_sha256, idempotency_key, created_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          amendment.id,
+          amendment.jobId,
+          amendment.version,
+          amendment.body,
+          amendment.bodySha256,
+          JSON.stringify(amendment.supersedes),
+          amendment.approval.by,
+          amendment.approval.reference,
+          amendment.previousContractSha256,
+          amendment.contractSha256,
+          amendment.requestSha256,
+          amendment.idempotencyKey,
+          amendment.createdAt,
+        );
+      this.appendEvent({
+        kind: 'job.amendment-accepted',
+        jobId: input.jobId,
+        payload: {
+          amendment_id: amendment.id,
+          version: amendment.version,
+          body_sha256: amendment.bodySha256,
+          body_bytes: Buffer.byteLength(amendment.body, 'utf8'),
+          previous_contract_sha256: amendment.previousContractSha256,
+          contract_sha256: amendment.contractSha256,
+          supersedes: amendment.supersedes,
+          approval_by: amendment.approval.by,
+          approval_reference: amendment.approval.reference,
+          idempotency_key: amendment.idempotencyKey,
+        },
+      });
+      return { status: 'accepted' as const, amendment, contract: rendered, idempotent: false };
+    });
+  }
+
+  private rejectAmendment(
+    jobId: string,
+    code: AddJobAmendmentRejectionCode,
+    reason: string,
+    input: {
+      readonly body: string;
+      readonly supersedes?: readonly string[];
+      readonly approval: JobAmendmentApproval;
+      readonly expectedContractSha256: string;
+      readonly idempotencyKey?: string | null;
+    },
+    current?: { readonly currentContractSha256: string; readonly currentVersion: number },
+  ): AddJobAmendmentResult {
+    this.appendEvent({
+      kind: 'job.amendment-rejected',
+      jobId,
+      payload: {
+        code,
+        reason: reason.slice(0, 500),
+        body_sha256: amendmentBodySha256(input.body),
+        body_bytes: Buffer.byteLength(input.body, 'utf8'),
+        supersedes: input.supersedes ?? [],
+        expected_contract_sha256: input.expectedContractSha256,
+        approval_by: input.approval.by.slice(0, 200),
+        approval_reference: input.approval.reference.slice(0, 500),
+        ...(input.idempotencyKey != null ? { idempotency_key: input.idempotencyKey.slice(0, 200) } : {}),
+        ...(current !== undefined
+          ? { current_contract_sha256: current.currentContractSha256, current_version: current.currentVersion }
+          : {}),
+      },
+    });
+    return {
+      status: 'rejected',
+      code,
+      reason,
+      ...(current !== undefined
+        ? { currentContractSha256: current.currentContractSha256, currentVersion: current.currentVersion }
+        : {}),
+    };
+  }
+
+  private amendmentFromRow(row: Row): JobAmendmentRecord {
+    let supersedes: unknown;
+    try {
+      supersedes = JSON.parse(str(row.supersedes));
+    } catch (error) {
+      throw new Error(`job_amendments row ${str(row.id)} supersedes is not valid JSON: ${String(error)}`);
+    }
+    if (!Array.isArray(supersedes) || supersedes.some((entry) => typeof entry !== 'string')) {
+      throw new Error(`job_amendments row ${str(row.id)} supersedes must be a JSON string array`);
+    }
+    return {
+      id: str(row.id),
+      jobId: str(row.job_id),
+      version: Number(row.version),
+      body: str(row.body),
+      bodySha256: str(row.body_sha256),
+      supersedes: supersedes as string[],
+      approval: { by: str(row.approval_by), reference: str(row.approval_reference) },
+      previousContractSha256: str(row.previous_contract_sha256),
+      contractSha256: str(row.contract_sha256),
+      requestSha256: str(row.request_sha256),
+      idempotencyKey: nstr(row.idempotency_key),
+      createdAt: str(row.created_at),
+    };
   }
 
   // ------------------------------------------------------------------

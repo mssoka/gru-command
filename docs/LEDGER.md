@@ -106,6 +106,9 @@ publishes it on the in-process event bus (`src/events/bus.ts`).
 | `verification.lock-timeout` / `verification.stale-released` | wait ms + holder counts + request id / pid, reason (`holder-dead` \| `no-runner` \| `max-age`), age, interrupted request ids |
 | `branch-idle.refused` / `branch-idle.forced` | phase (`arm`/`freeze`), targetBranch, blockers — the review-arm branch-idle guard (forced rounds also carry the tag in their frozen manifest). The fallback route's two RECORD-EMITTING arm checks are the intake guard and the post-pre-flight re-entry, so a forced fallback admission records TWO `arm`-phase override records where the native route records `arm` + `freeze`. The running gate's boundary re-proofs (round intake, default-reviewer worker admission) emit NO branch-idle rows — a stop there is a `job.fallback-review` phase `aborted` |
 | `silas.review-deferred` | target_branch, phase, blockers — Silas defers a refused arm to its next sweep |
+| `job.amendment-accepted` / `job.amendment-rejected` | amendment id, version, body sha256+bytes, supersedes, approval by/reference, previous/effective contract hashes, idempotency key / refusal code+reason + current hash/version |
+| `round.review-inputs-frozen` | acceptance version/base+effective hashes/amendment ids, evidence attachment hashes (no pixels, no paths), bound CI record state |
+| `job.review-handoff-conflict` / `job.review-handoff-superseded` | request seq + folded scope; a differing evidence set is recorded as count + opaque request fingerprint, never paths |
 
 Events are appended for **state changes**; idempotent enrichment writes
 (re-registering an agent, same-state activity refreshes) update rows
@@ -128,6 +131,8 @@ row, appends the event, and (with a bus attached) publishes it:
   `listPendingRebriefs` · `clearPendingRebriefs` · `retirePendingRebriefs`
   (the only cancellation seam: identity-checked deletion + one terminal
   `silas.rebrief-retired` audit in the same transaction)
+- amendments: `addJobAmendment` · `listJobAmendments` · `effectiveContract`
+  (append-only, expected-contract-hash concurrency, per-refusal audit)
 - reads: `getJob` · `listJobs(repo?)` · `getRound` · `listRounds` ·
   `getAgent` · `listAgents`
 
@@ -406,3 +411,21 @@ from the first actionable row”. A cursor is operational state, never a
 write license: it only decides WHICH bounded slice of already-authorized
 reconciliation runs next. Migration 13 is additive and carries the same
 landing-collision convention as migrations 10/11.
+
+### Canonical job amendments (migration 14, review-input handoff)
+
+One append-only table carries the effective acceptance for later Perkins
+rounds. The original briefing row is never rewritten.
+
+**`job_amendments`** — `id` (TEXT PRIMARY KEY), `job_id` (FK to `jobs`),
+`version` (INTEGER; `UNIQUE (job_id, version)`), `body` + `body_sha256`,
+`supersedes` (JSON array of `original:<anchor>` / `amendment:<id>`),
+`approval_by` + `approval_reference`, `previous_contract_sha256`,
+`contract_sha256`, `request_sha256` (the exact-request fingerprint that backs
+idempotent retry), `idempotency_key` (partial `UNIQUE (job_id,
+idempotency_key)` index where not null) and `created_at`. Writers present the
+contract hash they read; a stale writer is refused and audited, never merged.
+See [REVIEW-INPUTS.md](./REVIEW-INPUTS.md) for the HTTP surface and
+[`src/review-inputs/amendments.ts`](../src/review-inputs/amendments.ts) for the
+renderer. Migration 14 is additive and carries the same landing-collision
+convention as migrations 10-13.

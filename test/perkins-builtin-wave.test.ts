@@ -61,6 +61,7 @@ import { LedgerDb } from '../src/ledger/db.js';
 import { FALLBACK_REVIEW_TIMEOUT_MS, lensAgentLabel } from '../src/dispatch/perkins.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 import { fakeWholeSpawner, type WholeLeadOptions } from './helpers/perkins-whole-double.js';
+import { minimalPng } from './helpers/images.js';
 import { GitReviewPort } from './helpers/git-review-port.js';
 import { PersistedReviewPort } from './helpers/persisted-review-port.js';
 
@@ -4908,6 +4909,55 @@ describe('durable handoff admission: perkins route, re-busy re-queue, crash/term
     expect(started?.payload).toMatchObject({ route: 'perkins' });
     const roundId = (started?.payload as { roundId?: string }).roundId;
     expect(f.ledger.listRounds('job-handoff-pr').some((round) => round.id === roundId)).toBe(true);
+    await wave.shutdown();
+  }, 120_000);
+
+  it('carries private evidence through the queued handoff into the frozen round', async () => {
+    const f = await handoffFixture('handoff-evidence', 'job-handoff-evidence');
+    const uploads = mkdtempSync(join(tmpdir(), 'handoff-evidence-uploads-'));
+    dirs.push(uploads);
+    const uploadPath = join(uploads, '1791057000000-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee-reference.png');
+    writeFileSync(uploadPath, minimalPng(Buffer.from('handoff-pixels')));
+    const sessions = mkdtempSync(join(tmpdir(), 'handoff-evidence-sessions-'));
+    dirs.push(sessions);
+    const fake = fakeWholeSpawner(sessions, { images: true, childAnswer: () => '[]' });
+    const wave = new WaveRunner({ ledger: f.ledger, worktrees: f.port, spawner: fake.spawner, reviewArtifactRoot: f.artifacts, evidenceUploadsDir: uploads, bus: f.bus });
+    const accepted = await wave.requestReview({
+      jobId: 'job-handoff-evidence',
+      handoff: true,
+      evidence: [{ uploadPath, purpose: 'owner reference; NOT rendered at the frozen revision', consentRef: 'owner approval j-969' }],
+    });
+    expect(accepted.route).toBe('queued');
+    expect(f.ledger.listRounds('job-handoff-evidence')).toHaveLength(0);
+    const queued = f.ledger.latestJobEvent('job-handoff-evidence', 'job.review-handoff-queued');
+    expect((queued?.payload as { input?: { evidence?: unknown[] } }).input?.evidence).toHaveLength(1);
+    f.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-handoff-evidence', payload: { sha: f.target } });
+    await tickUntil(() => f.ledger.latestJobEvent('job-handoff-evidence', 'job.review-handoff-started') !== null);
+    const started = f.ledger.latestJobEvent('job-handoff-evidence', 'job.review-handoff-started');
+    expect(started?.payload).toMatchObject({ route: 'perkins' });
+    const roundId = (started?.payload as { roundId?: string }).roundId;
+    expect(typeof roundId).toBe('string');
+    const manifest = JSON.parse(readFileSync(join(f.artifacts, roundId!, 'manifest.json'), 'utf8')) as {
+      reviewEvidence: { attachments: Array<{ purpose: string }> };
+    };
+    expect(manifest.reviewEvidence.attachments).toHaveLength(1);
+    expect(manifest.reviewEvidence.attachments[0]!.purpose).toContain('owner reference');
+    const audit = f.ledger.latestRoundEvent(roundId!, 'round.review-inputs-frozen');
+    expect((audit?.payload as { evidence?: unknown[] }).evidence).toHaveLength(1);
+    await tickUntil(() => fake.leadCalls.length > 0, 5000);
+    expect(fake.leadCalls[0]!.images).toHaveLength(1);
+    await wave.shutdown();
+  }, 120_000);
+
+  it('refuses a private-evidence arm on the bmad-review fallback route instead of dropping the pixels', async () => {
+    const f = await handoffFixture('fallback-evidence-refusal', 'job-fallback-evidence');
+    f.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-fallback-evidence', payload: { sha: f.target } });
+    const wave = new WaveRunner({ ledger: f.ledger, worktrees: f.port, spawner: vi.fn() as unknown as AgentSpawner, bus: f.bus, reviewPreflight: failingPreflight });
+    await expect(wave.requestReview({
+      jobId: 'job-fallback-evidence',
+      evidence: [{ uploadPath: '/data/uploads/1-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee-ref.png', purpose: 'p', consentRef: 'c' }],
+    })).rejects.toThrow(/bmad-review fallback route/u);
+    expect(f.ledger.listRounds('job-fallback-evidence')).toHaveLength(0);
     await wave.shutdown();
   }, 120_000);
 

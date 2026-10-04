@@ -2741,6 +2741,37 @@ describe('Perkins r1 regressions', () => {
     }
   });
 
+  it('W7c: a turn aborted mid-flight by disposal never attests success (#160)', async () => {
+    const fx = await fixture([{ deltas: [], hold: new Promise<void>(() => {}), honorAbort: true }]);
+    const handle = await fx.runtime.spawn('gru');
+    try {
+      const pending = handle.promptWithVerdict!('aborted mid-flight', { owner: 'alice' });
+      await vi.waitFor(() => expect(fx.script.calls).toHaveLength(1));
+      // Disposal aborts the live transport turn; the prompt resolves with
+      // the transport's aborted terminal message.
+      await handle.dispose();
+      const verdict = await pending;
+      expect(verdict.ok).toBe(false);
+      expect(verdict.error).toBeTruthy();
+      expect(fx.script.calls[0]?.aborted).toBe(true);
+    } finally {
+      await fx.runtime.dispose();
+    }
+  });
+
+  it('W7d: a length-truncated completion is not positive completion evidence (#160)', async () => {
+    const fx = await fixture([{ deltas: ['partial answer'], stopReason: 'length' }]);
+    const handle = await fx.runtime.spawn('gru');
+    try {
+      const verdict = await handle.promptWithVerdict!('truncate me', { owner: 'alice' });
+      expect(verdict.ok).toBe(false);
+      expect(verdict.error).toContain('length');
+    } finally {
+      await handle.dispose();
+      await fx.runtime.dispose();
+    }
+  });
+
   it('W10: registry status aggregates streaming while a turn is live', async () => {
     let release!: () => void;
     const fx = await fixture();

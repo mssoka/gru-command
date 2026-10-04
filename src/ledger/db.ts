@@ -558,4 +558,38 @@ export const MIGRATIONS: readonly Migration[] = [
       );
     `,
   },
+  {
+    // Canonical job amendments (owner ruling j-969): append-only versioned
+    // acceptance amendments with explicit approval provenance, expected-
+    // contract-hash concurrency and idempotency. The original job briefing is
+    // never rewritten; later review rounds render the effective contract.
+    // LANDING COLLISION (same convention as migrations 10-13): id 14 is a
+    // branch-local next-contiguous number for an UNSHIPPED feature; if
+    // owner-merged main lands first, re-number ONLY this never-applied
+    // migration (never a hole).
+    id: 14,
+    name: 'job-amendments',
+    sql: `
+      CREATE TABLE job_amendments (
+        id                        TEXT PRIMARY KEY,
+        job_id                    TEXT NOT NULL REFERENCES jobs(id),
+        version                   INTEGER NOT NULL,
+        body                      TEXT NOT NULL,
+        body_sha256               TEXT NOT NULL,
+        supersedes                TEXT NOT NULL,
+        approval_by               TEXT NOT NULL,
+        approval_reference        TEXT NOT NULL,
+        previous_contract_sha256  TEXT NOT NULL,
+        contract_sha256           TEXT NOT NULL,
+        request_sha256            TEXT NOT NULL,
+        idempotency_key           TEXT,
+        created_at                TEXT NOT NULL,
+        UNIQUE (job_id, version)
+      );
+      CREATE INDEX idx_job_amendments_job ON job_amendments(job_id);
+      CREATE UNIQUE INDEX idx_job_amendments_idempotency
+        ON job_amendments(job_id, idempotency_key)
+        WHERE idempotency_key IS NOT NULL;
+    `,
+  },
 ];

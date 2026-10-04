@@ -28,6 +28,9 @@ export interface StubTurn {
   readonly honorAbort?: boolean;
   /** Fail the turn with an error after the deltas. */
   readonly error?: string;
+  /** Override the terminal assistant stop reason (e.g. 'length' for a
+   * truncated completion) instead of deriving it from error/toolCall. */
+  readonly stopReason?: 'stop' | 'error' | 'toolUse' | 'length';
   /** Emit a tool call (the session executes the tool, then calls again). */
   readonly toolCall?: { readonly id: string; readonly name: string; readonly args: Record<string, unknown> };
   /** Reported assistant usage tokens — drives native compaction thresholds. */
@@ -87,7 +90,7 @@ function countedUsage(inputTokens: number) {
 
 function makeMessage(
   text: string,
-  stopReason: 'stop' | 'error' | 'toolUse',
+  stopReason: 'stop' | 'error' | 'toolUse' | 'length',
   errorMessage?: string,
   toolCall?: { id: string; name: string; args: Record<string, unknown> },
   usageTokens?: number,
@@ -217,7 +220,7 @@ export async function makeStubModelRuntime(
       const isTool = turn.toolCall !== undefined;
       const final = makeMessage(
         text,
-        turn.error !== undefined ? 'error' : isTool ? 'toolUse' : 'stop',
+        turn.stopReason ?? (turn.error !== undefined ? 'error' : isTool ? 'toolUse' : 'stop'),
         turn.error,
         turn.toolCall,
         turn.usageTokens,
@@ -312,7 +315,7 @@ export async function makeStubModelRuntime(
       }
       stream.push({
         type: 'done',
-        reason: isTool ? 'toolUse' : 'stop',
+        reason: final.stopReason as 'stop' | 'toolUse' | 'length',
         message: final,
       });
       stream.end(final);
