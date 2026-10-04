@@ -1073,6 +1073,17 @@ body {
   background: var(--card);
 }
 
+/* Working-flavor geometry: from the console through the tablet drawer the
+   strip must stay ONE line — a long rotating phrase ellipsizes inside the
+   shrinkable status chip instead of wrapping the controls onto a second
+   row (which moved them and grew the strip). The phone sheet below 900px
+   keeps the wrap so the status takes its own row. */
+@media (min-width: 900px) {
+  .chat-context {
+    flex-wrap: nowrap;
+  }
+}
+
 .chat-context__status {
   margin-right: auto;
   max-width: 100%;
