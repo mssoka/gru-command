@@ -8,7 +8,7 @@
   },
   "portableContract": {
     "findingSchema": {
-      "source": "the originating lens (blind | edge | acceptance | security | architecture | codebase | tests) or \"lead\" for the lead's own finding",
+      "source": "the originating lens (blind | edge | acceptance | security | architecture | codebase | tests | performance | operations) or \"lead\" for the lead's own finding",
       "severity": "blocker | warning | note",
       "category": "short tag",
       "title": "one-line summary",
@@ -33,7 +33,9 @@
       "security": "Perform an OWASP-oriented boundary review of the whole change: auth/authz, input validation, secrets/tokens, client/log exposure, injection, path traversal, SSRF, unsafe deserialization, CSRF, session handling and insecure defaults.",
       "architecture": "Review architectural fit of the whole change: existing patterns, dependency direction, module boundaries, coupling, simpler equivalent designs, complexity proportionality, technical debt and future change cost.",
       "codebase": "Reality-check the whole change against the frozen codebase. Verify referenced symbols and APIs, naming/style, duplicate helpers, dependency availability, existing tests likely affected, and orphaned exports. Read files; never assume.",
-      "tests": "Trace every behavior change in the whole diff to tests and classify FULL/PARTIAL/NONE. Report critical-path and state-transition gaps, auth negatives, DB/API integration gaps, and wrong test-level mixes as ordinary findings with concrete locations. Missing or failing coverage is a finding about the change — never a claim that the review itself did not run."
+      "tests": "Trace every behavior change in the whole diff to tests and classify FULL/PARTIAL/NONE. Report critical-path and state-transition gaps, auth negatives, DB/API integration gaps, and wrong test-level mixes as ordinary findings with concrete locations. Missing or failing coverage is a finding about the change — never a claim that the review itself did not run.",
+      "performance": "Review the whole change for concrete resource and cost risks: retained memory or sessions, growing collections or queues, missing backpressure, leaked listeners/processes/files, blocking hot paths, I/O amplification, and violations of existing resource or protocol budgets. Anchor every finding to a cited mechanism and a demonstrable growth/leak/amplification or to the violated contract. Do not raise speculative benchmark claims, micro-optimization or style noise, or arbitrary work-duration/tool-call caps. Large legitimate or input-proportional work is not automatically a defect; prefer justified cleanup, streaming, or backpressure over capping approved work. Architecture taste belongs to architecture, ordinary boundary correctness to edge, coverage claims to tests.",
+      "operations": "Review the end-to-end ability to detect, diagnose, and recover the changed behavior: interrupted operations, durable outcome truth, restart/reconciliation convergence, idempotency, persisted-state/schema compatibility, failure cleanup, and logs/events/status that truthfully distinguish success, failure, internal wait, and required owner action. Require a cited site and an operator-visible consequence against an existing or specified operational contract. Do not demand unrelated rollback/restart features, assume every change needs new operations infrastructure, repeat edge/security/architecture/tests responsibilities, or grant autonomous destructive action."
     },
     "rules": {
       "fullLenses": [
@@ -43,7 +45,9 @@
         "security",
         "architecture",
         "codebase",
-        "tests"
+        "tests",
+        "performance",
+        "operations"
       ],
       "noSpecLenses": [
         "blind",
@@ -51,7 +55,9 @@
         "security",
         "architecture",
         "codebase",
-        "tests"
+        "tests",
+        "performance",
+        "operations"
       ],
       "maxLensAttempts": 2,
       "verdicts": {

@@ -25,7 +25,7 @@ import type { ResidentReviewRound } from '../runtime/registry.js';
 import { settleRetries, type PacingGate, type PacingLease, type RateLimitBackoffPolicy, type RetrySettlement } from '../runtime/pacing.js';
 import { isExactOriginBranchSpelling } from '../worktrees/manager.js';
 import type { CanonicalReviewVerdict, VerifiedFinding } from './perkins-review/types.js';
-import { PerkinsWholeReview, type PerkinsWholeResult } from './perkins-review/whole.js';
+import { PerkinsWholeReview, type PerkinsWholeResult, type RoundBudgetRefusal } from './perkins-review/whole.js';
 import { loadPerkinsPolicy, type PerkinsLens, type PerkinsPolicy } from './perkins-review/policy.js';
 import {
   freezeReviewInputs,
@@ -158,8 +158,13 @@ export function hostDisclosureAppendix(
     readonly findings: ReadonlyArray<{ readonly severity: string; readonly title: string; readonly location: string; readonly source: string }>;
     readonly specialistRuns: ReadonlyArray<{ readonly lens: string; readonly status: string; readonly findingsDelivered?: boolean; readonly cleanupRecordingError?: string }>;
     readonly priorDispositions: ReadonlyArray<{ readonly status: string }>;
+    readonly budgetRefusals?: ReadonlyArray<RoundBudgetRefusal>;
   },
-  provider: PublicationProviderKind = 'github',
+  provider: PublicationProviderKind,
+  /** The round's APPLICABLE catalog (full or explicit no-spec): the
+   * not-used accounting is derived from what this round could run, never
+   * from a historical or future catalog. */
+  lenses: readonly string[],
 ): string {
   const counts = new Map<string, number>();
   for (const finding of review.findings) counts.set(finding.severity, (counts.get(finding.severity) ?? 0) + 1);
@@ -184,8 +189,7 @@ export function hostDisclosureAppendix(
   const failed = ran.filter(([, entry]) => entry.failed > 0);
   const undelivered = ran.filter(([, entry]) => entry.undelivered);
   const cleanupGaps = ran.filter(([, entry]) => entry.cleanupGap);
-  const notUsed = ['blind', 'edge', 'acceptance', 'security', 'architecture', 'codebase', 'tests']
-    .filter((lens) => !byLens.has(lens));
+  const notUsed = lenses.filter((lens) => !byLens.has(lens));
   const prior = review.priorDispositions;
   const priorFixed = prior.filter((disposition) => disposition.status === 'fixed').length;
   const priorStill = prior.length - priorFixed;
@@ -201,8 +205,12 @@ export function hostDisclosureAppendix(
     '',
     `- Retained findings: ${review.findings.length}${severityLine === '' ? '' : ` (${severityLine})`}`,
     ...findingsLines,
+    `- Available specialist lenses this round: ${lenses.length}`,
     `- Specialists run: ${ran.length === 0 ? 'none (lead-owned whole-change review)' : ran.map(([lens, entry]) => `${lens}${entry.failed > 0 ? ` (attempts: ${entry.valid} valid, ${entry.failed} failed)` : ''}`).join(', ')}`,
     ...(failed.length > 0 ? [`- Failed specialist attempts: ${failed.map(([lens, entry]) => `${lens} ×${entry.failed}`).join(', ')} — the lead judged the change on its own whole-change verification`] : []),
+    ...(review.budgetRefusals !== undefined && review.budgetRefusals.length > 0
+      ? [`- Round specialist budget: ${review.budgetRefusals.length} run call(s) refused by the ${review.budgetRefusals[0]!.cap}-run cap before any child started (${[...new Set(review.budgetRefusals.flatMap((refusal) => refusal.lenses))].join(', ')})`]
+      : []),
     ...(undelivered.length > 0 ? [`- Specialist findings were NOT delivered to the lead: ${undelivered.map(([lens]) => lens).join(', ')} — those runs completed but the transport response failed, so the lead judged without their findings`] : []),
     ...(cleanupGaps.length > 0 ? [`- Specialist cleanup failures that could not be recorded durably: ${cleanupGaps.map(([lens]) => lens).join(', ')}`] : []),
     ...(notUsed.length > 0 ? [`- Lenses not used this round: ${notUsed.join(', ')}`]: []),
@@ -224,8 +232,9 @@ export function publicationBodyFor(
   reportText: string,
   review: Parameters<typeof hostDisclosureAppendix>[0],
   provider: PublicationProviderKind,
+  lenses: readonly string[],
 ): string {
-  const body = `${reportText.trimEnd()}\n\n${hostDisclosureAppendix(review, provider)}\n`;
+  const body = `${reportText.trimEnd()}\n\n${hostDisclosureAppendix(review, provider, lenses)}\n`;
   if (Buffer.byteLength(body, 'utf8') > PUBLICATION_BODY_MAX_BYTES) {
     throw new Error(
       `publication body (${Buffer.byteLength(body, 'utf8')} bytes) exceeds the provider review-body limit (${PUBLICATION_BODY_MAX_BYTES} bytes); ` +
@@ -1639,7 +1648,7 @@ export class WaveRunner {
         recovered += 1;
         continue;
       }
-      const note = 'review interrupted by service restart; required lens/verification proof is incomplete';
+      const note = 'review interrupted by service restart; selected lens/verification proof is incomplete';
       this.abortRound(round, note);
       const artifacts = this.writeInterruptedArtifacts(round.id, 'service_restart', note);
       this.opts.ledger.appendCustomEvent({
@@ -3326,7 +3335,7 @@ export class WaveRunner {
         // the full evidence is preserved locally instead (R8).
         let publicationBody: string;
         try {
-          publicationBody = publicationBodyFor(readFileSync(reportFile, 'utf8'), review, providerKind);
+          publicationBody = publicationBodyFor(readFileSync(reportFile, 'utf8'), review, providerKind, lenses);
         } catch (overflow) {
           if (!(overflow instanceof Error) || !overflow.message.includes('exceeds the provider review-body limit')) throw overflow;
           writeReviewArtifact(frozenReview, 'perkins-report.publication-overflow.json', {
@@ -3611,7 +3620,7 @@ export class WaveRunner {
       });
       this.opts.escalate?.(
         `Review round ${round.id} is INCOMPLETE`,
-        `required coverage, verification, source stability, or delivery proof did not complete. Report: ${reportFile}`,
+        `coverage of the round's selected lenses, verification, source stability, or delivery proof did not complete. Report: ${reportFile}`,
         { jobId: job.id, roundId: round.id },
       );
     }

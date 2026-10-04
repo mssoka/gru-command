@@ -2241,6 +2241,32 @@ body {
   color: var(--muted);
 }
 
+/* Issue #171 runtime-ownership marks: ambiguous (unverified) ownership,
+ * verified historical sessions, and duplicate singleton owners. */
+.board-agent__runtime {
+  flex: none;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.board-agent__runtime--unknown {
+  color: var(--muted);
+  font-weight: 800;
+}
+
+.board-agent__runtime--historical {
+  color: var(--muted);
+}
+
+.board-agent__runtime--alert {
+  color: var(--band-needs-you-ink);
+  font-weight: 800;
+}
+
+.board-agent--historical {
+  opacity: 0.72;
+}
+
 .board-agent__state {
   font-size: 9.5px;
   padding: 1px 6px;

@@ -176,7 +176,7 @@ probe_timeout_ms = 30000          # finite timeout for one probe I/O / reservati
 glm_generation_fallback = false   # GLM bounded generation fallback; overlay: disabled in production
 
 [review]
-max_concurrent_children = 2     # lens children within the pool (<= 32, review-gated)
+max_concurrent_children = 2     # lead-selected lens-children ceiling in the pool (<= 32); a round still caps at 16 runs / 2 attempts per lens
 # Review gate policy (user amendment 2026-09-20). Optional; enabled by default.
 # enabled: false routes every review request to the bmad-review fallback gate
 # (when installed; otherwise escalate-only). true keeps Perkins as the primary

@@ -96,11 +96,39 @@ export interface JobView {
   readonly lastAgentActivity: string | null;
 }
 
+/** Issue #171 runtime ownership: the agent ids the LIVE process owns
+ * (registry handles ∪ supervision records ∪ durable stops — the caller
+ * unions them). `null` from the probe means "cannot answer" (unwired),
+ * which the board reports as `unverified` — never a guessed class. */
+export interface RuntimeOwnership {
+  readonly ownedAgentIds: ReadonlySet<string>;
+}
+
+/** Issue #171 membership classification for one agent record:
+ * - `current` — the live runtime owns the record (live handle,
+ *   supervision adoption, or a hydrated durable stop — a stopped or
+ *   restoring lane stays current, never retired);
+ * - `historical` — ownership probes are wired and the record is NOT in
+ *   the live ownership set: a previous run/import left it. Transcripts
+ *   stay accessible; it is never counted or sorted as an active worker;
+ * - `unverified` — no ownership evidence either way (probes unwired or
+ *   unavailable): an explicit conservative state, never fabricated
+ *   certainty in either direction. */
+export type AgentRuntimeClass = 'current' | 'historical' | 'unverified';
+
 export interface AgentView {
   readonly id: string;
   readonly role: Role;
   readonly label: string | null;
   readonly state: AgentState;
+  /** Issue #171 truthful display status: the raw adapter state corrected
+   * by supervision activity evidence — a raw `idle` with an open turn,
+   * open control or open tool call is WORKING and reads `streaming`, so a
+   * live agent never presents a settled idle turn. `state` keeps the raw
+   * record for the transcript/archaeology surface. */
+  readonly status: AgentState;
+  /** Issue #171 runtime ownership classification (AgentRuntimeClass). */
+  readonly runtime: AgentRuntimeClass;
   readonly lastActivity: string | null;
   /** Row registration stamp: the board's stall clock floor for a fresh
    * worker that has not sent its first frame (twelve-followthrough A1/E1). */
@@ -182,10 +210,21 @@ export interface BoardSnapshot {
 /** Agent-rail ordering: the standing crew first, workers after. */
 const ROLE_ORDER: Readonly<Record<Role, number>> = { gru: 0, silas: 1, perkins: 2, minion: 3, bob: 4 };
 
-/** Liveness-first rail order: agents actively working float to the top,
- * the graveyard sinks. Liveness IS the primary key — an old disposed chat
- * epoch must never outrank a streaming lens (role order and recency are
- * only tiebreakers inside one liveness band). */
+/** Issue #171 membership bands come FIRST — a historical record must
+ * never outrank any current or unverified row, whatever stale state it
+ * froze in. `unverified` sits between: not claimed active, not retired. */
+const RUNTIME_ORDER: Readonly<Record<AgentRuntimeClass, number>> = {
+  current: 0,
+  unverified: 1,
+  historical: 2,
+};
+
+/** Liveness-first rail order INSIDE a membership band: agents actively
+ * working float to the top, the graveyard sinks. Liveness IS the primary
+ * key inside the band — an old disposed chat epoch must never outrank a
+ * streaming lens (role order and recency are only tiebreakers inside one
+ * liveness band). Keyed on the DERIVED status (#171): a raw-idle agent
+ * with an open supervision turn sorts as the live work it is. */
 const STATE_ORDER: Readonly<Record<AgentState, number>> = {
   streaming: 0,
   spawning: 1,
@@ -229,6 +268,19 @@ function lensVerdictFromNote(note: string | null): string | null {
   return null;
 }
 
+/** Issue #171 truthful status: supervision activity evidence wins over a
+ * raw `idle` — an open turn, an open control phase or an open tool call
+ * IS live work (fresh events/growing session file), never a settled idle
+ * turn. Only positive evidence upgrades; absence of supervision never
+ * downgrades a raw `streaming` (no hang diagnosis from silence — the
+ * watchdog owns that call). */
+function derivedStatus(state: AgentState, supervision: AgentSupervisionView | null): AgentState {
+  if (supervision === null || state !== 'idle') return state;
+  const openWork =
+    supervision.openTurn || supervision.openControl === true || supervision.openToolCalls > 0;
+  return openWork ? 'streaming' : state;
+}
+
 /** Whole-PR review specialists mint bare `lens` labels; a retry appends
  * `#attempt` (`blind#2`). Legacy chunk-era `lens:chunk` labels are still
  * parsed so historical agent rows keep resolving. */
@@ -248,6 +300,10 @@ export interface BoardEngineOptions {
   /** E7: live supervision views per agent id (late-bound — main wires it
    * to the supervisor after both exist). */
   readonly supervisionFor?: (agentId: string) => AgentSupervisionView | null;
+  /** Issue #171: current-runtime ownership probe (live registry handles).
+   * Wiring EITHER probe makes absence-of-evidence authoritative for
+   * `historical` classification; wiring NEITHER yields `unverified`. */
+  readonly runtimeOwnership?: () => RuntimeOwnership | null;
   readonly decisionsStatus?: () => DecisionRuntimeStatus;
   /** Board UX v4: deploy drift view (late-bound tracker). */
   readonly buildDrift?: () => DeployDriftView | null;
@@ -273,6 +329,8 @@ export class BoardEngine {
     this.bus = opts.bus;
     this.log = opts.log ?? (() => {});
     this.supervisionFor = opts.supervisionFor ?? (() => null);
+    this.ownershipProbe = opts.runtimeOwnership ?? null;
+    this.membershipWired = opts.supervisionFor !== undefined || opts.runtimeOwnership !== undefined;
     this.decisionsStatus = opts.decisionsStatus ?? (() => ({
       enabled: false,
       status: 'disabled',
@@ -294,6 +352,11 @@ export class BoardEngine {
   }
 
   private readonly supervisionFor: (agentId: string) => AgentSupervisionView | null;
+  /** Issue #171: the registry-handle ownership probe (null when unwired). */
+  private readonly ownershipProbe: (() => RuntimeOwnership | null) | null;
+  /** Issue #171: whether ANY ownership probe is wired (supervision feed or
+   * the registry probe) — without one, membership is `unverified`. */
+  private readonly membershipWired: boolean;
   private readonly decisionsStatus: () => DecisionRuntimeStatus;
   private readonly buildDrift: () => DeployDriftView | null;
   private readonly verifyQueue: () => VerificationQueueView | null;
@@ -423,13 +486,28 @@ export class BoardEngine {
   snapshot(): BoardSnapshot {
     const jobs = this.ledger.listJobs();
     const agentRows = this.ledger.listAgents();
+    // Issue #171: ONE ownership read per snapshot (the probe rebuilds a
+    // set of every live handle) and ONE supervision lookup per row — the
+    // same evidence serves the activity projection and the agent views.
+    const ownership = this.ownershipProbe?.() ?? null;
+    const supervisionById = new Map<string, AgentSupervisionView | null>(
+      agentRows.map((agent) => [agent.id, this.supervisionFor(agent.id)]),
+    );
+    const runtimeClassOf = (agent: AgentRecord): AgentRuntimeClass =>
+      this.classifyRuntime(agent.id, supervisionById.get(agent.id) ?? null, ownership);
     // Per-job newest agent activity and per-round lens attempt counts are
     // derived once per snapshot from the same agent rows (ISO stamps
     // compare lexicographically; lens children mint `lens:chunk` labels).
     const activityByJob = new Map<string, string>();
     const attemptsByRound = new Map<string, Map<string, number>>();
     for (const agent of agentRows) {
-      if (agent.jobId !== null && agent.lastActivity !== null) {
+      // Issue #171: a verified-historical record's frozen stamp is not
+      // current activity — it must never warm the lane's stall clock.
+      if (
+        agent.jobId !== null &&
+        agent.lastActivity !== null &&
+        runtimeClassOf(agent) !== 'historical'
+      ) {
         const newest = activityByJob.get(agent.jobId);
         if (newest === undefined || agent.lastActivity > newest) activityByJob.set(agent.jobId, agent.lastActivity);
       }
@@ -457,10 +535,11 @@ export class BoardEngine {
       .map(([name, group]) => ({ name, jobs: group }))
       .sort((a, b) => a.name.localeCompare(b.name));
     const agents = agentRows
-      .map((agent) => this.agentView(agent))
+      .map((agent) => this.agentView(agent, supervisionById.get(agent.id) ?? null, ownership))
       .sort(
         (a, b) =>
-          STATE_ORDER[a.state] - STATE_ORDER[b.state] ||
+          RUNTIME_ORDER[a.runtime] - RUNTIME_ORDER[b.runtime] ||
+          STATE_ORDER[a.status] - STATE_ORDER[b.status] ||
           (ROLE_ORDER[a.role] ?? 99) - (ROLE_ORDER[b.role] ?? 99) ||
           (b.lastActivity ?? '').localeCompare(a.lastActivity ?? ''),
       );
@@ -583,12 +662,18 @@ export class BoardEngine {
     };
   }
 
-  private agentView(agent: AgentRecord): AgentView {
+  private agentView(
+    agent: AgentRecord,
+    supervision: AgentSupervisionView | null,
+    ownership: RuntimeOwnership | null,
+  ): AgentView {
     return {
       id: agent.id,
       role: agent.role,
       label: agent.label,
       state: agent.state,
+      status: derivedStatus(agent.state, supervision),
+      runtime: this.classifyRuntime(agent.id, supervision, ownership),
       lastActivity: agent.lastActivity,
       // The row's registration stamp: the board's stall clock floor for a
       // fresh worker that has not sent its first frame (twelve-followthrough A1/E1).
@@ -596,8 +681,35 @@ export class BoardEngine {
       sessionFile: agent.sessionFile,
       jobId: agent.jobId,
       roundId: agent.roundId,
-      supervision: this.supervisionFor(agent.id),
+      supervision,
     };
+  }
+
+  /** Issue #171 membership for one record. A supervision view (live
+   * adoption or a hydrated durable stop — a stopped/restoring lane is
+   * OWNED, never retired) or a live registry handle proves `current`.
+   * With a probe wired and ANSWERING, absence from the ownership set is
+   * VERIFIED non-membership → `historical` (the record predates this
+   * runtime: unclean stop, restart, or import). A wired probe answering
+   * `null` (temporarily unavailable) is missing evidence → `unverified`,
+   * as is a board with no witness wired at all. */
+  private classifyRuntime(
+    agentId: string,
+    supervision: AgentSupervisionView | null,
+    ownership: RuntimeOwnership | null,
+  ): AgentRuntimeClass {
+    if (supervision !== null) return 'current';
+    if (this.ownershipProbe !== null) {
+      // The registry probe is the wired witness: an ANSWER classifies
+      // (member → current, verified absence → historical); a null answer
+      // is missing evidence → unverified, never a guessed class.
+      if (ownership === null) return 'unverified';
+      return ownership.ownedAgentIds.has(agentId) ? 'current' : 'historical';
+    }
+    // No registry probe: the supervision feed (which sees every spawn via
+    // the registry tap) is the sole wired witness — its verified absence
+    // is authoritative. With no witness at all, unverified.
+    return this.membershipWired ? 'historical' : 'unverified';
   }
 
   /**

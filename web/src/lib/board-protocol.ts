@@ -69,6 +69,15 @@ export interface AgentView {
   readonly role: string;
   readonly label: string | null;
   readonly state: string;
+  /** Issue #171 truthful display status: the raw adapter state corrected
+   * by supervision activity evidence (raw `idle` + open turn →
+   * `streaming`). Optional: pre-upgrade servers omit it and the board
+   * falls back to the raw `state`. */
+  readonly status?: string;
+  /** Issue #171 runtime ownership classification. Optional: pre-upgrade
+   * servers omit it and the board treats membership as `unverified`
+   * (visible, explicitly ambiguous — never guessed historical). */
+  readonly runtime?: 'current' | 'historical' | 'unverified';
   readonly lastActivity: string | null;
   /** Row registration stamp. Optional: pre-upgrade servers did not send
    * it, and the board then falls back to lastActivity-only stall truth. */
@@ -79,13 +88,18 @@ export interface AgentView {
   /** E7 supervision view (null when unsupervised). `stopReason` is absent
    * on pre-reason servers — the board renders the stop without a cause;
    * `stoppedAt` is absent on pre-stop-time servers and null/ignored while
-   * running. */
+   * running. Issue #171 activity fields (`openTurn`, `openControl`,
+   * `openToolCalls`, `lastEventAt`) are optional on pre-#171 servers. */
   readonly supervision: {
     readonly state: 'watching' | 'restarting' | 'stopped';
     readonly restarts: number;
     readonly breakerOpen: boolean;
     readonly stopReason?: string | null;
     readonly stoppedAt?: string | null;
+    readonly openTurn?: boolean;
+    readonly openControl?: boolean;
+    readonly openToolCalls?: number;
+    readonly lastEventAt?: string | null;
   } | null;
 }
 
@@ -311,6 +325,23 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 const SUPERVISION_STATES = ['watching', 'restarting', 'stopped'] as const;
 
+/** Issue #171 runtime membership classes: an unknown value is a server
+ * bug, never a silently tolerated value. */
+const RUNTIME_CLASSES = ['current', 'historical', 'unverified'] as const;
+
+function isRuntimeClass(value: unknown): value is (typeof RUNTIME_CLASSES)[number] {
+  return typeof value === 'string' && (RUNTIME_CLASSES as readonly string[]).includes(value);
+}
+
+/** Issue #171: the known agent display states. An unknown `status` is a
+ * server bug, never a silently tolerated value (mirrors the supervision
+ * state validation rule). */
+const AGENT_STATE_NAMES = ['spawning', 'idle', 'streaming', 'error', 'disposed'] as const;
+
+function isAgentStateName(value: unknown): value is (typeof AGENT_STATE_NAMES)[number] {
+  return typeof value === 'string' && (AGENT_STATE_NAMES as readonly string[]).includes(value);
+}
+
 /** The E7 supervision block's known states: an unknown state is a server
  * bug, never a silently tolerated value. */
 function isSupervisionState(value: unknown): value is (typeof SUPERVISION_STATES)[number] {
@@ -529,6 +560,11 @@ export function isValidSnapshot(value: unknown): value is BoardSnapshot {
       typeof agent.id === 'string' &&
       typeof agent.role === 'string' &&
       typeof agent.state === 'string' &&
+      // Issue #171 fields are optional (pre-upgrade servers); present,
+      // they are typed strictly — a junk runtime class or an unknown
+      // status string must never reach the rail split as a false read.
+      (agent.status === undefined || isAgentStateName(agent.status)) &&
+      (agent.runtime === undefined || agent.runtime === null || isRuntimeClass(agent.runtime)) &&
       // createdAt is optional (pre-upgrade servers); present, it must be
       // a parseable date — the stall floor reads it directly and a junk
       // string would silently remove the floor (code review 2026-10-04).
@@ -551,7 +587,16 @@ export function isValidSnapshot(value: unknown): value is BoardSnapshot {
             typeof agent.supervision.stopReason === 'string') &&
           (agent.supervision.stoppedAt === undefined ||
             agent.supervision.stoppedAt === null ||
-            typeof agent.supervision.stoppedAt === 'string'))),
+            typeof agent.supervision.stoppedAt === 'string') &&
+          (agent.supervision.openTurn === undefined ||
+            typeof agent.supervision.openTurn === 'boolean') &&
+          (agent.supervision.openControl === undefined ||
+            typeof agent.supervision.openControl === 'boolean') &&
+          (agent.supervision.openToolCalls === undefined || isRestartCount(agent.supervision.openToolCalls)) &&
+          (agent.supervision.lastEventAt === undefined ||
+            agent.supervision.lastEventAt === null ||
+            (typeof agent.supervision.lastEventAt === 'string' &&
+              Number.isFinite(Date.parse(agent.supervision.lastEventAt)))))),
   );
   const notificationsOk = value.notifications.every(
     (notification) =>
@@ -614,6 +659,70 @@ export function isValidSnapshot(value: unknown): value is BoardSnapshot {
 /** Shape helpers shared by the views (defensive against schema drift). */
 export function agentViewOf(agent: AgentView): { id: string; role: string; state: string } {
   return { id: agent.id, role: agent.role, state: agent.state };
+}
+
+/** Issue #171 runtime membership, with the pre-upgrade fallback: a
+ * server that cannot classify reports nothing and the board keeps the
+ * row visible and explicitly ambiguous (`unverified`) — it never guesses
+ * the record historical (visible-only evidence is not death evidence). */
+export function agentRuntimeOf(agent: AgentView): 'current' | 'historical' | 'unverified' {
+  return agent.runtime ?? 'unverified';
+}
+
+/** Issue #171 truthful display status, with the pre-upgrade fallback to
+ * the raw adapter state. */
+export function agentStatusOf(agent: AgentView): string {
+  return agent.status ?? agent.state;
+}
+
+/** Issue #171: whether this snapshot carries runtime classification AT ALL
+ * (a pre-upgrade server sends none on any row). The board then keeps the
+ * legacy attribution rules — every non-disposed row is live crew — so an
+ * unclassified board never silently drops rows from its counts. */
+export function hasRuntimeClassification(agents: readonly AgentView[]): boolean {
+  return agents.some((agent) => agent.runtime !== undefined);
+}
+
+/** Issue #171: the rail band one agent renders in. An owner-held stop or
+ * restart (supervision view present) stays in the LIVE crew even when the
+ * released handle left the ledger state `disposed`: the current runtime
+ * still owns the lane and waits on the owner's re-arm. */
+export function agentRailBand(agent: AgentView): 'live' | 'historical' | 'disposed' {
+  const supervision = agent.supervision;
+  const ownerHeld =
+    supervision !== null &&
+    supervision !== undefined &&
+    (supervision.state === 'stopped' || supervision.state === 'restarting');
+  if (agent.state === 'disposed' && !ownerHeld) return 'disposed';
+  if (agentRuntimeOf(agent) === 'historical') return 'historical';
+  return 'live';
+}
+
+/** Issue #171: whether a live-band row counts as CONFIRMED crew. On a
+ * classifying server only `current` owners count — an unverified row is
+ * visible with its explicit mark but is never claimed active, so the
+ * active count cannot overstate what the runtime proves. A pre-upgrade
+ * server (no classification at all) keeps today's attribution. */
+export function isCountedCrewAgent(agent: AgentView, classificationPresent: boolean): boolean {
+  if (!classificationPresent) return true;
+  return agentRuntimeOf(agent) === 'current';
+}
+
+/** Issue #171: the freshest known activity stamp for a working row — the
+ * newer of the ledger's last_activity and the supervision event clock
+ * (deltas never touch the ledger, and a ledger write can lag the event
+ * stream; the newer parseable stamp wins). */
+export function agentActivityOf(agent: AgentView): string | null {
+  const supervision = agent.supervision;
+  const eventAt =
+    supervision !== null && supervision !== undefined ? (supervision.lastEventAt ?? null) : null;
+  if (eventAt === null) return agent.lastActivity;
+  if (agent.lastActivity === null) return eventAt;
+  const ledgerMs = Date.parse(agent.lastActivity);
+  const eventMs = Date.parse(eventAt);
+  if (!Number.isFinite(eventMs)) return agent.lastActivity;
+  if (!Number.isFinite(ledgerMs)) return eventAt;
+  return eventMs >= ledgerMs ? eventAt : agent.lastActivity;
 }
 
 /** One presentation classification for every lens chip. A lens recorded

@@ -129,11 +129,11 @@ describe('board engine — adapter events → ledger events → board state', ()
     expect(api.getAgent('bob-dream')?.role).toBe('bob');
   });
 
-  it('lens-chip lifecycle: pending → live on turn_start → done on outcome; 7 chips by default', () => {
+  it('lens-chip lifecycle: pending → live on turn_start → done on outcome; 9 chips by default', () => {
     const job = api.addJob({ id: 'engine-job', repo: 'demo-repo', title: 'Lifecycle job' });
     api.setJobStatus(job.id, 'working');
     const round = api.addRound({ jobId: job.id, targetRef: 'sha-abc' });
-    expect(round.lenses.length).toBe(7);
+    expect(round.lenses.length).toBe(9);
     // Spawn + bind lens agents for two lenses.
     engine.onRuntimeEvent({ agentId: 'lens-blind', role: 'perkins', sessionFile: null, phase: 'spawned' });
     engine.onRuntimeEvent({ agentId: 'lens-edge', role: 'perkins', sessionFile: null, phase: 'spawned' });

@@ -64,9 +64,11 @@ mechanical reactions are YOURS — execute them without asking:
   Cancelled rounds, coverage failures, auth/budget walls, owner-held breakers,
   and unexplained aborts are not clean; leave them held for Gru.
 - **Respin known failure patterns.** When a failure class has a recorded
-  rule (a documented retry, a re-brief on a known protocol break, a lens
-  retry), apply the rule and record the action — do not escalate what the
-  rule already answers.
+  rule (a documented retry, a re-brief on a known protocol break), apply
+  the rule and record the action — do not escalate what the rule already
+  answers. In-round lens retries are Perkins-owned machinery, not a Silas
+  action: your review surface is the wave-level request
+  (`POST /api/dispatch/review`), never a per-lens retry.
 - **Sweep acks under the recorded rules.** Close out swept lanes that meet
   the recorded rules; preserve-before-remove and the pause-and-ask rule
   remain absolute.

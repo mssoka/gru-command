@@ -599,6 +599,30 @@ describe('silas digest (the four actionable states)', () => {
     } finally { h.cleanup(); }
   });
 
+  it('treats service_restart_missing_review_lane as the same proven clean abort (#113)', async () => {
+    const h = makeLedger();
+    try {
+      const digestOf = () => computeSilasDigest({ ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG, trigger: 'sweep' });
+      addJobWithDelivery(h.ledger, 'lane-missing', { prUrl: 'https://git.example.invalid/pull/lane-missing' });
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'lane-missing', payload: { sha: 'sha-lane' } });
+      const round = h.ledger.addRound({ jobId: 'lane-missing', targetRef: 'sha-lane' });
+      h.ledger.setRoundStatus(round.id, 'live');
+      h.ledger.setJobStatus('lane-missing', 'in-review');
+      h.ledger.appendCustomEvent({ kind: 'silas.review-triggered', jobId: 'lane-missing', payload: { route: 'perkins', round_id: round.id } });
+      h.ledger.setRoundStatus(round.id, 'aborted');
+      h.ledger.appendCustomEvent({ kind: 'round.perkins-incomplete', jobId: 'lane-missing', roundId: round.id, payload: { reason: 'service_restart_missing_review_lane' } });
+      expect((await digestOf()).prWithoutReview).toMatchObject([
+        { jobId: 'lane-missing', cleanAbort: { roundId: round.id, ruleId: 'clean-abort-service-restart' } },
+      ]);
+      h.ledger.appendCustomEvent({ kind: 'silas.review-triggered', jobId: 'lane-missing', payload: {
+        route: 'perkins', rule_id: 'clean-abort-service-restart', source_round_id: round.id,
+      } });
+      expect((await digestOf()).prWithoutReview).toEqual([]);
+    } finally { h.cleanup(); }
+  });
+
   it('an unresolved re-brief fences first and changed-head reviews; a late delivery cannot clear it', async () => {
     const h = makeLedger();
     try {
@@ -1041,6 +1065,14 @@ describe('silas skills and wake prompt', () => {
     const ops = skills.find((skill) => skill.name === 'ops-dispatch')!.body.replace(/\s+/gu, ' ');
     expect(ops).toContain('New pull requests are ordinary');
     expect(ops).toContain('`gh pr create` without `--draft`/`-d`');
+    // Issue #125: the skill must not promise a per-lens retry — in-round
+    // lens retries are Perkins-owned machinery; Silas only has the
+    // wave-level review request. The rule list is pinned verbatim so a
+    // retry variant cannot reappear under different wording.
+    expect(ops).not.toContain('a lens retry');
+    expect(ops).toContain('recorded rule (a documented retry, a re-brief on a known protocol break)');
+    expect(ops).toContain('In-round lens retries are Perkins-owned machinery');
+    expect(ops).toContain('wave-level request (`POST /api/dispatch/review`)');
     expect(() => loadSilasSkills(['nope'])).toThrow(/unreadable/);
   });
 
@@ -1056,6 +1088,11 @@ describe('silas skills and wake prompt', () => {
     expect(prompt).toContain('owner holds merges elsewhere');
     expect(prompt).toContain('clean-abort-service-restart');
     expect(prompt).toContain('source_round_id');
+    // Issue #125: the assembled prompt never instructs the phantom action
+    // (whitespace-normalized, so a line-broken spelling cannot slip past).
+    const flatPrompt = prompt.replace(/\s+/gu, ' ');
+    expect(flatPrompt).not.toContain('a lens retry');
+    expect(flatPrompt).toContain('In-round lens retries are Perkins-owned machinery');
     expect(prompt).not.toContain('human holds the merge);');
     // Verification capture (issue #159): the wake prompt names the shipped
     // helper absolutely so no lane hand-rolls a watcher — the resolved path

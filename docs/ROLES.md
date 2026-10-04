@@ -38,7 +38,7 @@ specialist delegation, a bounded prior-revision reader, bounded note
 storage, submission preflight, terminal submit, and confined tree reads;
 the complete frozen diff and the exact reviewed snapshot are its review
 unit. Non-blind specialists get confined read/grep/find/list; blind gets no
-tools. Specialists are optional and each reviews the WHOLE change (six
+tools. Specialists are optional and each reviews the WHOLE change (eight
 available only for explicit no-spec); each failed specialist attempt may
 be retried within the policy limit as a new tracked child. No reviewer
 gets bash, edit, write, general tasks, or nested delegation. Minions get

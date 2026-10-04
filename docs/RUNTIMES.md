@@ -30,9 +30,8 @@ branch on harness. The ADAPTER implements the declaration:
   isolated-review session that declares native tools and exposes EXACTLY
   that declared set over a private 0700 Unix socket; the CLI sees it via
   `--mcp-config` + `--allowedTools`. The bridge lives and dies with its
-  handle — closed on dispose and on failed-spawn cleanup — so the up-to-
-  seven concurrent lens children of a round each own one bridge and none
-  leaks.
+  handle — closed on dispose and on failed-spawn cleanup — so every
+  concurrent lens child of a round owns one bridge and none leaks.
 
 Every other adapter difference (steer channel, resume mechanics, context
 accounting) remains a declared adapter-level capability; none of it changes

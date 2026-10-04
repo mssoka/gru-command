@@ -14,7 +14,8 @@ whole arc live.
                       │                           briefing turn …
                       │                           deliverable + PR link ◄─┤
                       │                                                   one lead
-                      │                                                   7/6 lens types × chunks
+                      │                                                   9/8 whole-change lenses
+                      │                                                   (lead-selected batches)
                       │                                                   verify + audit
                       │                                                   report → PR comment
  release ◄─────────── sweep (preserve-first)                            (chips live on the board)
@@ -128,17 +129,26 @@ pull/merge-request head. A resolved ref that fetches nothing, a moved
 head, or an unverifiable host answer aborts the request before a round or
 lens exists (an action-required escalation names the resolved mismatch).
 A round has
-one real Perkins lead and exactly seven required lens types per frozen diff
-chunk (blind, edge, acceptance, security, architecture, codebase, tests), or
-six types per chunk only when `no_spec: true` explicitly removes acceptance.
-Each lens/chunk attempt is a distinct tracked child; malformed attempts are
-retryable up to the policy limit, so the total child-session count may exceed
-the required coverage cardinality.
+one real Perkins lead reviewing the complete frozen change. The pinned
+policy's catalog makes nine whole-change specialist lenses available (blind,
+edge, acceptance, security, architecture, codebase, tests, performance,
+operations) — eight when `no_spec: true` explicitly removes the
+spec-dependent acceptance lens. The lead SELECTS which specialists help the
+change: availability is never a mandatory coverage gate, and a subset (or
+none) is a valid review. Specialists run in explicit tool-call batches
+bounded by the round's admitted resident wave and provider pacing; the lead
+splits oversized work across calls, and any number of batches completes
+inside the SAME round, frozen target and lead. A round is bounded to 16 real
+specialist runs (retries included), two attempts per lens, and two real
+terminal submissions (free preflight is distinct); failed attempts count and
+stay recorded, and a completed lens cannot be rerun for a second opinion.
+Lenses the lead did not use are reported as `not used`, never as coverage.
 
-- The lead receives only six product-native tools: read a frozen chunk,
-  run tracked lens children, store bounded notes, record a candidate
-  decision, preflight a candidate terminal submission, and submit terminal
-  proof. It owns delegation,
+- The lead receives only its declared product-native tools: four
+  whole-change orchestration tools (run tracked specialist children, store
+  bounded notes, preflight a candidate terminal submission, submit terminal
+  proof) plus the bounded prior-revision reader on a re-review. It reads the
+  complete frozen change with its confined read tools and owns delegation,
   investigation, verification, deduplication, prior audit, verdict
   calculation, and report authorship. Recording runs the exact terminal
   decision validator at store time; preflight uses the exact terminal
@@ -154,9 +164,9 @@ the required coverage cardinality.
   may declare product-native tools, and the ADAPTER exposes exactly those
   declared tools on every harness: pi injects them in-process, claude-code
   attaches a session-scoped, product-owned MCP bridge. The lead declares
-  its six orchestration tools; a lens child that declares native tools
-  gets only its own (the `perkins_submit_findings` channel) and never sees
-  the lead's six. That seam is harness-independent by design — review
+  its whole-change orchestration tools; a lens child that declares native
+  tools gets only its own (the `perkins_submit_findings` channel) and never
+  sees the lead's. That seam is harness-independent by design — review
   isolation and tool exposure live in the adapter implementation, never in
   caller branches on harness.
 - Child findings are evidence-paired at envelope construction: a finding that
@@ -174,15 +184,18 @@ the required coverage cardinality.
   and child review behavior; interpolated repository/spec/convention text is
   untrusted evidence, never instruction. The host bounds attempts,
   concurrency, candidate/report bytes, and wall time; records every child;
-  verifies exact coverage, candidate ownership,
+  verifies exact run accounting (selected lenses, attempts, round budget),
+  candidate ownership,
   frozen-commit evidence, prior audit, source stability, report contents,
   delivery, and canonical blocker arithmetic. Zero blockers is READY TO
   MERGE, 1–3 is NEEDS CHANGES, and 4+ is MAJOR REWORK NEEDED. Warnings and
   notes never block.
 - A malformed child output consumes one attempt and may be retried within the
-  pinned bound. Any exhausted attempt, cancellation, restart, changed
-  source/checkout, unsupported evidence, invalid audit, missing coverage,
-  or delivery failure durably terminalizes the round as INCOMPLETE. It can
+  pinned bound; a failed or exhausted specialist attempt is recorded
+  lens-failure truth and never terminalizes the round by itself.
+  Cancellation, restart, changed
+  source/checkout, unsupported evidence, invalid audit, or delivery failure
+  durably terminalizes the round as INCOMPLETE. It can
   neither post nor record approval. Startup reconciliation marks interrupted
   rounds INCOMPLETE and releases their owned detached lanes.
 - The base is changed source only when the locally resolved base ref no

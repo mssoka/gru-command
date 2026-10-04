@@ -195,7 +195,7 @@ function scriptedReply(socket: WebSocket, userText: string, attachments?: readon
  * the standing crew on the agent rail, one blocked-job notification.
  * The board WS pushes a fresh copy after auth and on every /__pulse.
  */
-const LENSES = ['blind', 'edge', 'acceptance', 'security', 'architecture', 'codebase', 'tests'] as const;
+const LENSES = ['blind', 'edge', 'acceptance', 'security', 'architecture', 'codebase', 'tests', 'performance', 'operations'] as const;
 
 /** Board fixture mode (tests only): the default sample board, or a variant
  * with no live machine rows and no needs-you job causes so the empty
@@ -448,14 +448,26 @@ function defaultSampleSnapshot(): unknown {
       },
     ],
     agents: [
-      { id: 'mock-gru', role: 'gru', label: 'gru · chat', state: 'idle', lastActivity: new Date().toISOString(), createdAt: new Date(Date.now() - 3_600_000).toISOString(), sessionFile: 'gru/--demo--aa111111/mock-session.jsonl', jobId: null, roundId: null, supervision: { state: 'watching', restarts: 0, breakerOpen: false } },
-      { id: 'mock-silas', role: 'silas', label: 'silas · ops', state: 'streaming', lastActivity: new Date(Date.now() - 12_000).toISOString(), createdAt: new Date(Date.now() - 900_000).toISOString(), sessionFile: null, jobId: null, roundId: null, supervision: { state: 'watching', restarts: 1, breakerOpen: false } },
-      { id: 'mock-lens-blind', role: 'perkins', label: 'blind:001', state: 'idle', lastActivity: new Date(Date.now() - 300_000).toISOString(), createdAt: new Date(Date.now() - 600_000).toISOString(), sessionFile: null, jobId: null, roundId: 'demo-api-payment-fix-r2', supervision: null },
-      { id: 'mock-minion', role: 'minion', label: 'demo-api-payment-fix', state: 'idle', lastActivity: null, createdAt: new Date(Date.now() - 3_600_000).toISOString(), sessionFile: null, jobId: 'demo-api-payment-fix', roundId: null, supervision: { state: 'stopped', restarts: 3, breakerOpen: true, stopReason: 'crash loop' } },
-      { id: 'mock-minion-quota', role: 'minion', label: 'demo-api-quota-walled', state: 'idle', lastActivity: new Date(Date.now() - 45 * 60_000).toISOString(), createdAt: new Date(Date.now() - 1_800_000).toISOString(), sessionFile: null, jobId: 'demo-api-quota-walled', roundId: null, supervision: { state: 'stopped', restarts: 2, breakerOpen: true, stopReason: 'quota_wall' } },
-      { id: 'mock-minion-merged', role: 'minion', label: 'demo-api-merged-leftover', state: 'idle', lastActivity: null, createdAt: new Date(Date.now() - 1_800_000).toISOString(), sessionFile: null, jobId: 'demo-api-merged-leftover', roundId: null, supervision: { state: 'watching', restarts: 0, breakerOpen: false, stopReason: null } },
-      { id: 'mock-bob', role: 'bob', label: 'bob · memory', state: 'idle', lastActivity: null, createdAt: new Date(Date.now() - 5_400_000).toISOString(), sessionFile: null, jobId: null, roundId: null, supervision: null },
-      { id: 'mock-gru-old', role: 'gru', label: 'gru · chat (retired)', state: 'disposed', lastActivity: new Date(Date.now() - 7_200_000).toISOString(), createdAt: new Date(Date.now() - 10_800_000).toISOString(), sessionFile: null, jobId: null, roundId: null, supervision: null },
+      // #171 truthful agent status fixtures: every row carries its runtime
+      // classification. The gru row shows the misleading-idle correction
+      // (raw idle, open supervision turn → derived `streaming`); the two
+      // September rows are verified-historical sessions behind the
+      // history disclosure; the rest are the current crew.
+      { id: 'mock-gru', role: 'gru', label: 'gru · chat', state: 'idle', status: 'streaming', runtime: 'current', lastActivity: new Date(Date.now() - 3_600_000).toISOString(), createdAt: new Date(Date.now() - 3_600_000).toISOString(), sessionFile: 'gru/--demo--aa111111/mock-session.jsonl', jobId: null, roundId: null, supervision: { state: 'watching', restarts: 0, breakerOpen: false, openTurn: true, openToolCalls: 1, lastEventAt: new Date(Date.now() - 25_000).toISOString() } },
+      { id: 'mock-silas', role: 'silas', label: 'silas · ops', state: 'streaming', status: 'streaming', runtime: 'current', lastActivity: new Date(Date.now() - 12_000).toISOString(), createdAt: new Date(Date.now() - 900_000).toISOString(), sessionFile: null, jobId: null, roundId: null, supervision: { state: 'watching', restarts: 1, breakerOpen: false } },
+      { id: 'mock-silas-sept', role: 'silas', label: 'silas · ops (Sept 29)', state: 'streaming', status: 'streaming', runtime: 'historical', lastActivity: '2026-09-29T18:04:00.000Z', createdAt: '2026-09-29T17:00:00.000Z', sessionFile: null, jobId: null, roundId: null, supervision: null },
+      { id: 'mock-lens-blind', role: 'perkins', label: 'blind:001', state: 'idle', status: 'idle', runtime: 'current', lastActivity: new Date(Date.now() - 300_000).toISOString(), createdAt: new Date(Date.now() - 600_000).toISOString(), sessionFile: null, jobId: null, roundId: 'demo-api-payment-fix-r2', supervision: null },
+      { id: 'mock-minion', role: 'minion', label: 'demo-api-payment-fix', state: 'idle', status: 'idle', runtime: 'current', lastActivity: null, createdAt: new Date(Date.now() - 3_600_000).toISOString(), sessionFile: null, jobId: 'demo-api-payment-fix', roundId: null, supervision: { state: 'stopped', restarts: 3, breakerOpen: true, stopReason: 'crash loop' } },
+      { id: 'mock-minion-quota', role: 'minion', label: 'demo-api-quota-walled', state: 'idle', status: 'idle', runtime: 'current', lastActivity: new Date(Date.now() - 45 * 60_000).toISOString(), createdAt: new Date(Date.now() - 1_800_000).toISOString(), sessionFile: null, jobId: 'demo-api-quota-walled', roundId: null, supervision: { state: 'stopped', restarts: 2, breakerOpen: true, stopReason: 'quota_wall' } },
+      { id: 'mock-minion-merged', role: 'minion', label: 'demo-api-merged-leftover', state: 'idle', status: 'idle', runtime: 'current', lastActivity: null, createdAt: new Date(Date.now() - 1_800_000).toISOString(), sessionFile: null, jobId: 'demo-api-merged-leftover', roundId: null, supervision: { state: 'watching', restarts: 0, breakerOpen: false, stopReason: null } },
+      // #171 owner-held stop: the breaker released the handle (ledger state
+      // disposed) while the current supervisor still owns the lane — the
+      // rail keeps it in the live crew with its stopped mark, never in the
+      // graveyard.
+      { id: 'mock-minion-held', role: 'minion', label: 'held-after-breaker', state: 'disposed', status: 'disposed', runtime: 'current', lastActivity: new Date(Date.now() - 600_000).toISOString(), createdAt: new Date(Date.now() - 2_400_000).toISOString(), sessionFile: null, jobId: null, roundId: null, supervision: { state: 'stopped', restarts: 3, breakerOpen: true, stopReason: 'crash loop' } },
+      { id: 'mock-minion-sept', role: 'minion', label: 'sample-site-copy-pass (Sept 29)', state: 'streaming', status: 'streaming', runtime: 'historical', lastActivity: '2026-09-29T21:12:00.000Z', createdAt: '2026-09-29T20:00:00.000Z', sessionFile: null, jobId: 'sample-site-copy-pass', roundId: null, supervision: null },
+      { id: 'mock-bob', role: 'bob', label: 'bob · memory', state: 'idle', status: 'idle', runtime: 'current', lastActivity: null, createdAt: new Date(Date.now() - 5_400_000).toISOString(), sessionFile: null, jobId: null, roundId: null, supervision: null },
+      { id: 'mock-gru-old', role: 'gru', label: 'gru · chat (retired)', state: 'disposed', status: 'disposed', runtime: 'historical', lastActivity: new Date(Date.now() - 7_200_000).toISOString(), createdAt: new Date(Date.now() - 10_800_000).toISOString(), sessionFile: null, jobId: null, roundId: null, supervision: null },
     ],
     notifications: [
       { id: 'mock-n1', ts: new Date().toISOString(), kind: 'job.status', routing: 'fyi', severity: 'error', title: 'Job demo-api-payment-fix blocked', detail: 'waiting on the base sync', agentId: null, shownAt: null, ackedAt: null, resolvedAt: null, resolvedBy: null },
