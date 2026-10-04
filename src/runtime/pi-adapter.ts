@@ -23,6 +23,7 @@ import { normalizeSessionPath, SessionAlreadyActiveError } from './session-paths
 // consumers of the pi adapter's surface keep working.
 export { normalizeSessionPath, SessionAlreadyActiveError };
 import { capabilitiesForModelInput } from './types.js';
+import { PI_CAPABILITIES } from './capabilities.js';
 import { extractProviderRejectionEvidence } from '../provider-recovery/classify.js';
 import type {
   AgentCapabilities,
@@ -161,19 +162,10 @@ export function typedFromProviderMessageLine(
     ...(parsed.bodyCode !== undefined ? { bodyCode: parsed.bodyCode } : {}),
   };
 }
-/** pi adapter capabilities, hoisted so the runtime probe can report them
- * without constructing the adapter (E3 story 3). */
-export const PI_CAPABILITIES: AgentCapabilities = {
-  streaming: true,
-  steer: 'native',
-  resume: 'file',
-  // Adapter transport support. A spawned handle overrides this from the
-  // resolved model's declared input modalities (B1).
-  images: true,
-  thinking: true,
-  thinkingLevelControl: true,
-  followUp: true,
-};
+// The declaration now lives in the dependency-light `capabilities.js` so the
+// runtime probe can report it without loading this adapter's SDK graph; the
+// re-export keeps every existing import surface (and object identity) intact.
+export { PI_CAPABILITIES };
 
 export interface PiRuntimeOptions {
   readonly config: GruCommandConfig;

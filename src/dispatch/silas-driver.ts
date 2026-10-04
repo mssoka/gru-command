@@ -3,7 +3,14 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { SilasConfig } from '../config.js';
 import type { EventBus } from '../events/bus.js';
-import type { AgentRecord, EventRecord, JobRecord, LedgerApi, RoundRecord } from '../ledger/api.js';
+import type {
+  AgentRecord,
+  EventRecord,
+  JobRecord,
+  LedgerApi,
+  PendingRebriefRecord,
+  RoundRecord,
+} from '../ledger/api.js';
 import type { LogLevel } from '../logger.js';
 import type { AgentHandle, SpawnOptions } from '../runtime/types.js';
 import type { AgentSupervisionView } from '../supervision/supervisor.js';
@@ -136,6 +143,9 @@ export interface DigestLedger {
   latestJobEvent(jobId: string, kind: string): EventRecord | null;
   latestRoundEvent(roundId: string, kind: string): EventRecord | null;
   listAgents(): readonly AgentRecord[];
+  /** Durable re-brief markers; any row for a job is an unresolved request
+   * that fences the job's review-eligibility rows (see the digest below). */
+  listPendingRebriefs(opts?: { readonly jobId?: string }): readonly PendingRebriefRecord[];
   listProviderWaits?(opts?: { status?: string }): readonly unknown[];
   listPendingProviderRecoveries?(): readonly unknown[];
 }
@@ -354,7 +364,11 @@ function latestReviewRequest(ledger: DigestLedger, jobId: string): EventRecord |
  *    already reviewed warrants no new round. A review already REQUESTED
  *    for the current state retires the row: the bmad-review fallback route
  *    creates no round, and without its request event the row would re-fire
- *    every sweep and re-trigger a gate that owns its own fix loop.
+ *    every sweep and re-trigger a gate that owns its own fix loop. An
+ *    UNRESOLVED re-brief request (durable pending markers) suppresses every
+ *    review row for the target: the lane's open re-brief work must not be
+ *    offered for review on an older delivery, and only genuine marker
+ *    settlement (finalize/recovery) releases it.
  * 3. verdictsAwaitingDirective — the newest round recorded NEEDS CHANGES
  *    and no silas follow-through has landed since that verdict: deliver the
  *    first fix directive per blocker, then the ladder's rung (directive →
@@ -386,6 +400,12 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     minionErrors: [],
     providerRecoveryPending: [],
   };
+  // One unresolved re-brief request fences the target: a marker exists while
+  // a re-brief worker runs (or a restart-recovered request waits for boot
+  // reconciliation), and clears only when the request genuinely settles.
+  // The review-eligibility rows below never offer such a target on an OLDER
+  // delivery — the worker may push a new head at any moment.
+  const pendingRebriefJobIds = new Set(input.ledger.listPendingRebriefs().map((marker) => marker.jobId));
   for (const job of input.ledger.listJobs()) {
     if (job.status === 'merged' || job.status === 'done') continue;
     const rounds = [...input.ledger.listRounds(job.id)].sort((a, b) => b.seq - a.seq);
@@ -432,26 +452,30 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     // that owes a review counts: `working` (a PR linked row-side),
     // `delivered` (settled before the PR landed) and `in-review` (the
     // register-PR hop lands there). Blocked/parked/terminal lanes do not.
+    // An unresolved re-brief fences every row: the open re-brief turn is the
+    // lane's target-owned work, so an OLDER delivery is never offered for
+    // first review, re-review or clean-abort rearm.
     const reviewPending = job.status === 'working' || job.status === 'delivered' || job.status === 'in-review';
-    if (job.prUrl !== null && reviewPending && cleanAbort && newestRound !== null) {
-      digest.prWithoutReview.push({ jobId: job.id, repo: job.repo, prUrl: job.prUrl,
-        priorRounds: rounds.length, cleanAbort: { roundId: newestRound.id, ruleId: 'clean-abort-service-restart' } });
-    } else if (job.prUrl !== null && reviewPending && newestRound === null && !reviewAlreadyRequested) {
-      digest.prWithoutReview.push({ jobId: job.id, repo: job.repo, prUrl: job.prUrl, priorRounds: 0 });
-    } else if (
-      job.prUrl !== null &&
-      reviewPending &&
-      newestRound !== null &&
-      delivered !== null &&
-      followUpChangedTarget(delivered, newestRound) &&
-      !reviewAlreadyRequested
-    ) {
-      digest.prWithoutReview.push({
-        jobId: job.id,
-        repo: job.repo,
-        prUrl: job.prUrl,
-        priorRounds: rounds.length,
-      });
+    const rebriefPending = pendingRebriefJobIds.has(job.id);
+    if (job.prUrl !== null && reviewPending && !rebriefPending) {
+      if (cleanAbort && newestRound !== null) {
+        digest.prWithoutReview.push({ jobId: job.id, repo: job.repo, prUrl: job.prUrl,
+          priorRounds: rounds.length, cleanAbort: { roundId: newestRound.id, ruleId: 'clean-abort-service-restart' } });
+      } else if (newestRound === null && !reviewAlreadyRequested) {
+        digest.prWithoutReview.push({ jobId: job.id, repo: job.repo, prUrl: job.prUrl, priorRounds: 0 });
+      } else if (
+        newestRound !== null &&
+        delivered !== null &&
+        followUpChangedTarget(delivered, newestRound) &&
+        !reviewAlreadyRequested
+      ) {
+        digest.prWithoutReview.push({
+          jobId: job.id,
+          repo: job.repo,
+          prUrl: job.prUrl,
+          priorRounds: rounds.length,
+        });
+      }
     }
 
     // (3) NEEDS CHANGES verdict awaiting follow-through.
@@ -598,7 +622,17 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       ...pendingRecoveryRows(input.ledger as Parameters<typeof pendingRecoveryRows>[0]),
     ];
   }
-  return digest;
+  // A prior job's blocker history may have awaited after another candidate
+  // was already offered. Recheck every proposed review at the final publish
+  // boundary — not only the jobs visited after an await. No await follows.
+  return {
+    ...digest,
+    prWithoutReview: digest.prWithoutReview.filter((row) => {
+      const job = input.ledger.getJob(row.jobId);
+      return job !== null && job.status !== 'merged' && job.status !== 'done' &&
+        input.ledger.listPendingRebriefs({ jobId: row.jobId }).length === 0;
+    }),
+  };
 }
 
 // ------------------------------------------------------------------

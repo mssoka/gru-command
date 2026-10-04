@@ -20,8 +20,9 @@ import { TranscriptService } from './transcripts/service.js';
 import { DispatchService } from './dispatch/service.js';
 import { WorktreeManager } from './worktrees/manager.js';
 import { createWorktreeServer } from './worktrees/server.js';
-import { AutoVerdictPoster, WaveRunner } from './dispatch/perkins.js';
+import { WaveRunner } from './dispatch/perkins.js';
 import { createReviewEscalationNotifier } from './dispatch/escalation-identity.js';
+import { createStartupVerdictPoster } from './dispatch/perkins-github-app.js';
 import { BobScheduler } from './dispatch/bob-scheduler.js';
 import { SilasDriver, supervisionLookup } from './dispatch/silas-driver.js';
 import { ProviderRecoverySensor, establishProviderWait } from './provider-recovery/sensor.js';
@@ -1035,7 +1036,7 @@ async function main(): Promise<number> {
     workerGate: pacing.gate,
     rateLimitBackoff: pacing.backoff,
     retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
-    poster: new AutoVerdictPoster(),
+    poster: createStartupVerdictPoster(config),
     reserveReviewRound: (signal) => registry.reserveReviewRound(signal),
     maxConcurrentChildren: config.review.maxConcurrentChildren,
     bus,
@@ -1087,6 +1088,7 @@ async function main(): Promise<number> {
       examined: rebriefRecovery.examined,
       completed: rebriefRecovery.completed,
       redispatched: rebriefRecovery.redispatched,
+      retired: rebriefRecovery.retired,
     });
   }
   // Directive-request restart safety (phase 3): a request accepted before

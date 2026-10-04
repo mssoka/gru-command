@@ -202,7 +202,7 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       ts.forEachChild(node, visit);
     };
     visit(file);
-    // 21 of 24 sites carry the bounded context; the three null rows are the
+    // 22 of 25 sites carry the bounded context; the three null rows are the
     // sanctioned residuals (shutdown deadline, live-process pause, sweep
     // error) that stay deliberately context-free and live (A7 rejection
     // stands; a worktree id is never coerced into a round identity).
@@ -220,6 +220,7 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       ['`Perkins gate unavailable for job ${job.id} — the bmad-review gate is engaged`', '{ jobId: job.id }'],
       ['`bmad-review gate PASS for job ${job.id} — clear to merge (merge stays user-held)`', '{ jobId: job.id }'],
       ['`bmad-review gate BLOCKED for job ${jobId}`', '{ jobId }'],
+      ['`bmad-review gate ABORTED for job ${jobId}`', '{ jobId }'],
       ['`Perkins review for job ${input.job.id} was blocked before any round: the PR head could not be verified`', '{ jobId: input.job.id }'],
       ['`Review round ${round.id} disposal failed after completion`', '{ jobId: job.id, roundId: round.id }'],
       ['`Review round ${round.id} is INCOMPLETE`', '{ jobId: job.id, roundId: round.id }'],
@@ -233,6 +234,7 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       ['`Review worktree for round ${worktreeId} could not be swept`', null],
     ];
     expect(sites.map((site) => [site.title, site.context])).toEqual(expected);
-    expect(sites.filter((site) => site.context !== null)).toHaveLength(21);
+    expect(sites).toHaveLength(25);
+    expect(sites.filter((site) => site.context !== null)).toHaveLength(22);
   });
 });

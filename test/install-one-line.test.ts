@@ -3,6 +3,7 @@ import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpat
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
+import { markFixtureStep, OwnedCommandTimeoutError, runOwnedCommand } from './helpers/harness-diagnostics.mjs';
 
 /**
  * install.sh setup mode (E9): the one-line-install pipeline exercised
@@ -26,27 +27,62 @@ function tempDir(prefix: string): string {
   return dir;
 }
 
+// Cost repair (a6 FULL-red follow-through): each simulated installation fans
+// out into node/npm/child chains, and the heaviest leg (three full installer
+// runs) can cross the unchanged 30s body deadline on a loaded vitest worker.
+// Quiet npm startup removes the update-notifier child and progress work from
+// every spawned installation; no installer behavior or assertion changes.
+
 let lastStderr = '';
 
-function run(
+/** Flags only — never echo answer values or fixture paths into diagnostics. */
+function commandLabel(args: readonly string[]): string {
+  return args
+    .map((arg) => (arg.startsWith('--') ? (arg.split('=')[0] ?? arg) : '<arg>'))
+    .slice(0, 6)
+    .join(' ');
+}
+
+/**
+ * Below the 120s heavy ceiling every run() caller uses, so a stalled
+ * installer surfaces as its own deadline error (owned child reaped, partial
+ * output in the diagnostics) instead of a bare test-level timeout.
+ */
+const INSTALL_DEADLINE_MS = 100_000;
+
+async function run(
   script: string,
   args: string[],
   env: NodeJS.ProcessEnv,
-): { stdout: string; stderr: string; status: number } {
+): Promise<{ stdout: string; stderr: string; status: number }> {
+  const label = `install.sh ${commandLabel(args)}`;
   try {
-    const stdout = execFileSync('bash', [script, ...args], {
-      encoding: 'utf-8',
+    const result = await runOwnedCommand('bash', [script, ...args], {
+      label,
+      deadlineMs: INSTALL_DEADLINE_MS,
       // Each simulated installation owns its config home even when the test
       // runner supplies an XDG_CONFIG_HOME outside the fixture's HOME.
-      env: { ...process.env, ...env, ...(env.HOME ? { XDG_CONFIG_HOME: join(env.HOME, '.config') } : {}) },
-      timeout: 120_000,
+      env: {
+        ...process.env,
+        ...env,
+        ...(env.HOME ? { XDG_CONFIG_HOME: join(env.HOME, '.config') } : {}),
+        npm_config_update_notifier: 'false',
+        npm_config_progress: 'false',
+      },
     });
-    lastStderr = '';
-    return { stdout, stderr: '', status: 0 };
+    const status = result.status ?? 1;
+    lastStderr = status === 0 ? '' : result.stderr;
+    markFixtureStep(`install.sh ${commandLabel(args)} → exit ${status}`);
+    return { stdout: result.stdout, stderr: status === 0 ? '' : result.stderr, status };
   } catch (error) {
-    const err = error as { stdout?: string; stderr?: string; status?: number };
-    lastStderr = err.stderr ?? '';
-    return { stdout: err.stdout ?? '', stderr: err.stderr ?? '', status: err.status ?? 1 };
+    // A deadline overrun fails loud: mapping it to exit 1 would let a
+    // stalled installer pass as an expected refusal. The helper already
+    // SIGTERMed/SIGKILLed the owned child.
+    if (error instanceof OwnedCommandTimeoutError) {
+      lastStderr = error.stderr;
+      markFixtureStep(`${label} → timeout`);
+    }
+    throw error;
   }
 }
 
@@ -337,7 +373,7 @@ function ptyUpdaterLauncher(home: string, target: string, instance: string, seam
 }
 
 describe('install.sh setup mode (one-line path)', () => {
-  it('piped install: clones when absent → deps → build → wizard (marker written)', () => {
+  it('piped install: clones when absent → deps → build → wizard (marker written)', async () => {
     const { fixture, home } = buildFixtureRepo();
     gitInitCommit(fixture);
     // The one-liner case: a bare directory holding ONLY install.sh
@@ -347,7 +383,7 @@ describe('install.sh setup mode (one-line path)', () => {
     const target = join(home, 'gru-command');
     const verifyLog = join(home, 'perkins-verify.log');
 
-    const { stdout, status } = run(
+    const { stdout, status } = await run(
       join(bare, 'install.sh'),
       ['--answers', '{"token":"fixture-token"}'],
       {
@@ -377,13 +413,13 @@ describe('install.sh setup mode (one-line path)', () => {
     expect(readFileSync(verifyLog, 'utf-8').trim()).toBe(realpathSync(target));
   });
 
-  it('fails closed before setup when the built Perkins MCP bridge is missing', () => {
+  it('fails closed before setup when the built Perkins MCP bridge is missing', async () => {
     const { fixture, home } = buildFixtureRepo();
     gitInitCommit(fixture);
     const bare = tempDir('gru-command-missing-mcp-bare-');
     copyFileSync(join(repoRoot, 'install.sh'), join(bare, 'install.sh'));
     const instance = join(home, '.gru-command');
-    const result = run(join(bare, 'install.sh'), ['--no-interact'], {
+    const result = await run(join(bare, 'install.sh'), ['--no-interact'], {
       HOME: home,
       GRU_COMMAND_HOME: instance,
       GRU_COMMAND_ORIGIN: `file://${fixture}`,
@@ -395,7 +431,7 @@ describe('install.sh setup mode (one-line path)', () => {
     expect(existsSync(join(instance, 'config.toml'))).toBe(false);
   });
 
-  it('a newly recreated clone preserves a retained instance config instead of rerunning setup', () => {
+  it('a newly recreated clone preserves a retained instance config instead of rerunning setup', async () => {
     const { fixture, home } = buildFixtureRepo();
     gitInitCommit(fixture);
     const bare = tempDir('gru-command-retained-config-bare-');
@@ -406,7 +442,7 @@ describe('install.sh setup mode (one-line path)', () => {
     const seam = serviceManagerSeam(home);
     // --no-interact: the retained instance's ABSENT unit is auto-registered
     // (user-ruled update contract) — asserted by REAL effect below.
-    const result = run(join(bare, 'install.sh'), ['--no-interact'], {
+    const result = await run(join(bare, 'install.sh'), ['--no-interact'], {
       HOME: home,
       GRU_COMMAND_HOME: instance,
       GRU_COMMAND_ORIGIN: `file://${fixture}`,
@@ -465,7 +501,7 @@ describe('install.sh setup mode (one-line path)', () => {
     );
   }, 180_000);
 
-  it('second run fast-forwards the existing clean checkout, preserves config, and does not re-run wizard', () => {
+  it('second run fast-forwards the existing clean checkout, preserves config, and does not re-run wizard', async () => {
     const { fixture, home } = buildFixtureRepo();
     gitInitCommit(fixture);
     const bare = tempDir('gru-command-bare2-');
@@ -478,7 +514,7 @@ describe('install.sh setup mode (one-line path)', () => {
       GRU_COMMAND_ORIGIN: `file://${fixture}`,
       GRU_COMMAND_TARGET: target,
     };
-    expect(run(join(bare, 'install.sh'), ['--answers', '{"token":"preserved"}'], env).status).toBe(0);
+    expect((await run(join(bare, 'install.sh'), ['--answers', '{"token":"preserved"}'], env)).status).toBe(0);
     const before = readFileSync(join(instance, 'config.toml'), 'utf-8');
     writeFileSync(join(fixture, 'remote-update.txt'), 'pulled', 'utf-8');
     writeFileSync(
@@ -495,7 +531,7 @@ describe('install.sh setup mode (one-line path)', () => {
     ]);
 
     const seam = serviceManagerSeam(home);
-    const second = run(join(bare, 'install.sh'), ['--no-interact'], { ...env, ...seam.env });
+    const second = await run(join(bare, 'install.sh'), ['--no-interact'], { ...env, ...seam.env });
     expect(second.status, `${second.stdout}\n${second.stderr}`).toBe(0);
     expectRegisteredUnit(seam.managerLog, seam.unit, target, instance);
     expect(existsSync(join(target, 'remote-update.txt'))).toBe(true);
@@ -509,7 +545,7 @@ describe('install.sh setup mode (one-line path)', () => {
     expect(second.stdout).not.toContain('WIZARD-RAN');
   });
 
-  it('fast-forwards an old target before executing target-local installer logic', () => {
+  it('fast-forwards an old target before executing target-local installer logic', async () => {
     const { fixture, home } = buildFixtureRepo();
     const currentInstaller = readFileSync(join(fixture, 'install.sh'), 'utf-8');
     writeFileSync(
@@ -533,7 +569,7 @@ describe('install.sh setup mode (one-line path)', () => {
     writeFileSync(join(instance, 'config.toml'), 'preserved\n');
     const oldMarker = join(home, 'old-installer-ran');
     const seam = serviceManagerSeam(home);
-    const result = run(join(bare, 'install.sh'), ['--no-interact'], {
+    const result = await run(join(bare, 'install.sh'), ['--no-interact'], {
       HOME: home,
       GRU_COMMAND_HOME: instance,
       GRU_COMMAND_ORIGIN: `file://${fixture}`,
@@ -547,7 +583,7 @@ describe('install.sh setup mode (one-line path)', () => {
     expectRegisteredUnit(seam.managerLog, seam.unit, target, instance);
   });
 
-  it('refuses a dirty existing checkout before pull/build and preserves its config', () => {
+  it('refuses a dirty existing checkout before pull/build and preserves its config', async () => {
     const { fixture, home } = buildFixtureRepo();
     gitInitCommit(fixture);
     const bare = tempDir('gru-command-dirty-bare-');
@@ -560,17 +596,17 @@ describe('install.sh setup mode (one-line path)', () => {
       GRU_COMMAND_ORIGIN: `file://${fixture}`,
       GRU_COMMAND_TARGET: target,
     };
-    expect(run(join(bare, 'install.sh'), ['--answers', '{"token":"keep-me"}'], env).status).toBe(0);
+    expect((await run(join(bare, 'install.sh'), ['--answers', '{"token":"keep-me"}'], env)).status).toBe(0);
     const before = readFileSync(join(instance, 'config.toml'), 'utf-8');
     writeFileSync(join(target, 'local-untracked.txt'), 'do not delete', 'utf-8');
-    const updated = run(join(bare, 'install.sh'), [], env);
+    const updated = await run(join(bare, 'install.sh'), [], env);
     expect(updated.status).toBe(1);
     expect(updated.stderr).toContain('refusing to update a dirty checkout');
     expect(readFileSync(join(target, 'local-untracked.txt'), 'utf-8')).toBe('do not delete');
     expect(readFileSync(join(instance, 'config.toml'), 'utf-8')).toBe(before);
   });
 
-  it('refuses a non-fast-forward divergent checkout without reset', () => {
+  it('refuses a non-fast-forward divergent checkout without reset', async () => {
     const { fixture, home } = buildFixtureRepo();
     gitInitCommit(fixture);
     const bare = tempDir('gru-command-diverged-bare-');
@@ -582,7 +618,7 @@ describe('install.sh setup mode (one-line path)', () => {
       GRU_COMMAND_ORIGIN: `file://${fixture}`,
       GRU_COMMAND_TARGET: target,
     };
-    expect(run(join(bare, 'install.sh'), ['--answers', '{}'], env).status).toBe(0);
+    expect((await run(join(bare, 'install.sh'), ['--answers', '{}'], env)).status).toBe(0);
     writeFileSync(join(target, 'local-commit.txt'), 'local', 'utf-8');
     execFileSync('git', ['-C', target, 'add', 'local-commit.txt']);
     execFileSync('git', [
@@ -595,13 +631,13 @@ describe('install.sh setup mode (one-line path)', () => {
       '-C', fixture, '-c', 'user.email=fixture@example.invalid', '-c', 'user.name=fixture',
       'commit', '-qm', 'remote divergence',
     ]);
-    const updated = run(join(bare, 'install.sh'), [], env);
+    const updated = await run(join(bare, 'install.sh'), [], env);
     expect(updated.status).toBe(1);
     expect(updated.stderr).toContain('fast-forward-only update failed');
     expect(existsSync(join(target, 'local-commit.txt'))).toBe(true);
   });
 
-  it('restarts only an owned service and refuses a foreign unit with the same public name', () => {
+  it('restarts only an owned service and refuses a foreign unit with the same public name', async () => {
     const { fixture, home } = buildFixtureRepo();
     gitInitCommit(fixture);
     const bare = tempDir('gru-command-service-update-bare-');
@@ -626,26 +662,22 @@ describe('install.sh setup mode (one-line path)', () => {
       GRU_COMMAND_LAUNCHCTL: manager,
       GRU_COMMAND_SYSTEMCTL: manager,
     };
-    // Provision the retained instance directly (the pattern the neighbouring
-    // update cases use). The contract under test is service ownership on the
-    // update path; the bare first run below still exercises clone-when-absent
-    // and build before the restart decision, so the setup+wizard cycle this
-    // replaces only duplicated coverage the file already carries and pushed
-    // the case past its inherited 30s default under co-tenant load.
-    mkdirSync(instance, { recursive: true });
-    writeFileSync(join(instance, 'config.toml'), 'retained-user-config\n');
+    expect((await run(join(bare, 'install.sh'), ['--answers', '{}'], env)).status).toBe(0);
 
     mkdirSync(dirname(unit), { recursive: true });
     writeFileSync(unit, '/someone/else/dist/main.js\n/someone/else/.gru-command\n');
-    const foreign = run(join(bare, 'install.sh'), [], env);
+    // The foreign-unit refusal is a public-entry contract: exercise the
+    // one-line wrapper's existing-checkout update path, not only the
+    // checkout-local installer. The owned-service leg below stays local.
+    const foreign = await run(join(bare, 'install.sh'), [], env);
     expect(foreign.status).toBe(1);
     expect(foreign.stderr).toContain('refusing to restart unrelated service unit');
     expect(readFileSync(unit, 'utf-8')).toContain('/someone/else');
 
-    const renderedOwned = run(join(target, 'install.sh'), ['--print'], env);
+    const renderedOwned = await run(join(target, 'install.sh'), ['--print'], env);
     expect(renderedOwned.status, renderedOwned.stderr).toBe(0);
     writeFileSync(unit, renderedOwned.stdout);
-    const owned = run(join(bare, 'install.sh'), [], env);
+    const owned = await run(join(target, 'install.sh'), [], env);
     expect(owned.status, `${owned.stdout}\n${owned.stderr}`).toBe(0);
     expect(owned.stdout).toContain('restarting owned Gru Command service');
     const managerCalls = readFileSync(managerLog, 'utf-8');
@@ -657,7 +689,7 @@ describe('install.sh setup mode (one-line path)', () => {
     expect(readFileSync(unit, 'utf-8')).toContain(`${target}/dist/main.js`);
   });
 
-  it.skipIf(process.platform !== 'linux')('systemd unit retains stable Node/npm PATH after a version-manager session expires', () => {
+  it.skipIf(process.platform !== 'linux')('systemd unit retains stable Node/npm PATH after a version-manager session expires', async () => {
     const { fixture, home } = buildFixtureRepo();
     // Direct --service requires an already-built service entrypoint.
     mkdirSync(join(fixture, 'dist'), { recursive: true });
@@ -668,7 +700,7 @@ describe('install.sh setup mode (one-line path)', () => {
     const stableBin = dirname(realpathSync(process.execPath));
     expect(existsSync(join(stableBin, 'npm'))).toBe(true);
     const seam = serviceManagerSeam(home);
-    const result = run(join(fixture, 'install.sh'), ['--service'], {
+    const result = await run(join(fixture, 'install.sh'), ['--service'], {
       HOME: home,
       GRU_COMMAND_HOME: join(home, '.gru-command'),
       PATH: `${sessionBin}:/usr/local/bin:/usr/bin:/bin`,
@@ -687,28 +719,28 @@ describe('install.sh setup mode (one-line path)', () => {
     expect(realpathSync(npm.stdout.split('\n')[0]!)).toBe(realpathSync(join(stableBin, 'npm')));
   });
 
-  it.skipIf(process.platform !== 'linux')('systemd PATH escapes quotes, backslashes and percent specifiers without losing the stable bin', () => {
+  it.skipIf(process.platform !== 'linux')('systemd PATH escapes quotes, backslashes and percent specifiers without losing the stable bin', async () => {
     const home = tempDir('gru-command-path-escape-');
     const odd = join(home, 'quoted"back\\slash%bin');
     const supplied = `${process.env.PATH ?? '/usr/bin:/bin'}:${odd}`;
-    const result = run(join(repoRoot, 'install.sh'), ['--print'], { HOME: home, PATH: supplied });
+    const result = await run(join(repoRoot, 'install.sh'), ['--print'], { HOME: home, PATH: supplied });
     expect(result.status, result.stderr).toBe(0);
     const encoded = supplied.replaceAll('\\', '\\\\').replaceAll('"', '\\"').replaceAll('%', '%%');
     expect(result.stdout).toContain(`Environment="PATH=${dirname(realpathSync(process.execPath))}:${encoded}:/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin"`);
     expect(result.stdout).not.toContain('{{PATH}}');
   });
 
-  it.skipIf(process.platform !== 'linux')('newline PATH fails before writing a unit or calling the service manager', () => {
+  it.skipIf(process.platform !== 'linux')('newline PATH fails before writing a unit or calling the service manager', async () => {
     const { fixture, home } = buildFixtureRepo();
     mkdirSync(join(fixture, 'dist'), { recursive: true });
     writeFileSync(join(fixture, 'dist', 'main.js'), '// fixture service\n');
     const seam = serviceManagerSeam(home);
     const env = { HOME: home, GRU_COMMAND_HOME: join(home, '.gru-command'), ...seam.env };
-    const rendered = run(join(fixture, 'install.sh'), ['--print'], env);
+    const rendered = await run(join(fixture, 'install.sh'), ['--print'], env);
     expect(rendered.status, rendered.stderr).toBe(0);
     mkdirSync(dirname(seam.unit), { recursive: true });
     writeFileSync(seam.unit, rendered.stdout);
-    const result = run(join(fixture, 'install.sh'), ['--service'], {
+    const result = await run(join(fixture, 'install.sh'), ['--service'], {
       ...env,
       PATH: `${process.env.PATH ?? '/usr/bin:/bin'}\nmalformed`,
     });
@@ -719,13 +751,13 @@ describe('install.sh setup mode (one-line path)', () => {
     expect(existsSync(seam.managerLog)).toBe(false);
   });
 
-  it.skipIf(process.platform !== 'linux')('fixture HOME contains service units even with a foreign XDG config home', () => {
+  it.skipIf(process.platform !== 'linux')('fixture HOME contains service units even with a foreign XDG config home', async () => {
     const home = tempDir('gru-command-sandbox-home-');
     const outside = tempDir('gru-command-foreign-xdg-');
     const outsideUnit = join(outside, 'systemd', 'user', 'gru-command.service');
     mkdirSync(dirname(outsideUnit), { recursive: true });
     writeFileSync(outsideUnit, 'unrelated-user-unit\n');
-    const result = run(join(repoRoot, 'install.sh'), ['--uninstall'], {
+    const result = await run(join(repoRoot, 'install.sh'), ['--uninstall'], {
       HOME: home,
       XDG_CONFIG_HOME: outside,
     });
@@ -734,9 +766,9 @@ describe('install.sh setup mode (one-line path)', () => {
     expect(readFileSync(outsideUnit, 'utf-8')).toBe('unrelated-user-unit\n');
   });
 
-  it('--no-interact + absent unit: the updater REGISTERS the service (unit written + manager called)', () => {
+  it('--no-interact + absent unit: the updater REGISTERS the service (unit written + manager called)', async () => {
     const { home, target, instance, seam } = stageConfiguredAbsentUnit();
-    const result = run(join(target, 'install.sh'), ['--no-interact'], {
+    const result = await run(join(target, 'install.sh'), ['--no-interact'], {
       HOME: home,
       GRU_COMMAND_HOME: instance,
       ...seam.env,
@@ -882,7 +914,7 @@ describe('install.sh setup mode (one-line path)', () => {
     expectRegisteredUnit(seam.managerLog, seam.unit, target, instance);
   }, 400_000);
 
-  it('in-service restart delegates to gru-service roll and never unload/loads', () => {
+  it('in-service restart delegates to gru-service roll and never unload/loads', async () => {
     // Function-level pin for the delegation branch: the in-service process
     // group IS detected (fake manager reports our own pgid), the unit IS
     // owned, and the served restart must be the roll CLI — never the unit
@@ -979,7 +1011,7 @@ describe('install.sh setup mode (one-line path)', () => {
     expectRegisteredUnit(seam.managerLog, seam.unit, target, instance);
   }, 340_000);
 
-  it('direct --service/--uninstall also enforce exact unit ownership', () => {
+  it('direct --service/--uninstall also enforce exact unit ownership', async () => {
     const { fixture, home } = buildFixtureRepo();
     gitInitCommit(fixture);
     const instance = join(home, '.gru-command');
@@ -996,20 +1028,20 @@ describe('install.sh setup mode (one-line path)', () => {
       GRU_COMMAND_LAUNCHCTL: manager,
       GRU_COMMAND_SYSTEMCTL: manager,
     };
-    expect(run(join(fixture, 'install.sh'), ['--answers', '{"smoke":false}'], env).status).toBe(0);
+    expect((await run(join(fixture, 'install.sh'), ['--answers', '{"smoke":false}'], env)).status).toBe(0);
     const unit = process.platform === 'darwin'
       ? join(home, 'Library', 'LaunchAgents', 'com.gru-command.service.plist')
       : join(home, '.config', 'systemd', 'user', 'gru-command.service');
     mkdirSync(dirname(unit), { recursive: true });
     writeFileSync(unit, 'foreign-user-unit\n');
-    const refusedRegister = run(join(fixture, 'install.sh'), ['--service'], env);
+    const refusedRegister = await run(join(fixture, 'install.sh'), ['--service'], env);
     expect(refusedRegister.status).not.toBe(0);
     expect(readFileSync(unit, 'utf-8')).toBe('foreign-user-unit\n');
-    const refusedUninstall = run(join(fixture, 'install.sh'), ['--uninstall'], env);
+    const refusedUninstall = await run(join(fixture, 'install.sh'), ['--uninstall'], env);
     expect(refusedUninstall.status).not.toBe(0);
     expect(readFileSync(unit, 'utf-8')).toBe('foreign-user-unit\n');
 
-    const rendered = run(join(fixture, 'install.sh'), ['--print'], env);
+    const rendered = await run(join(fixture, 'install.sh'), ['--print'], env);
     expect(rendered.status, rendered.stderr).toBe(0);
     const unmarked = process.platform === 'darwin'
       ? rendered.stdout.replace(
@@ -1018,7 +1050,7 @@ describe('install.sh setup mode (one-line path)', () => {
         )
       : rendered.stdout.replace('X-GruCommandManagedBy=gru-command-install-v2\n', '');
     writeFileSync(unit, unmarked);
-    expect(run(join(fixture, 'install.sh'), ['--uninstall'], env).status).not.toBe(0);
+    expect((await run(join(fixture, 'install.sh'), ['--uninstall'], env)).status).not.toBe(0);
     expect(readFileSync(unit, 'utf-8')).toBe(unmarked);
     if (process.platform === 'darwin') {
       const wrongExecutable = rendered.stdout.replace(
@@ -1027,26 +1059,26 @@ describe('install.sh setup mode (one-line path)', () => {
       );
       expect(wrongExecutable).not.toBe(rendered.stdout);
       writeFileSync(unit, wrongExecutable);
-      expect(run(join(fixture, 'install.sh'), ['--uninstall'], env).status).not.toBe(0);
+      expect((await run(join(fixture, 'install.sh'), ['--uninstall'], env)).status).not.toBe(0);
       expect(readFileSync(unit, 'utf-8')).toBe(wrongExecutable);
     }
     const previousNode = rendered.stdout.replace(process.execPath, '/opt/previous-node/bin/node');
     expect(previousNode).not.toBe(rendered.stdout);
     writeFileSync(unit, previousNode);
-    expect(run(join(fixture, 'install.sh'), ['--uninstall'], env).status).toBe(0);
+    expect((await run(join(fixture, 'install.sh'), ['--uninstall'], env)).status).toBe(0);
     expect(existsSync(unit)).toBe(false);
     writeFileSync(unit, rendered.stdout);
-    expect(run(join(fixture, 'install.sh'), ['--uninstall'], env).status).toBe(0);
+    expect((await run(join(fixture, 'install.sh'), ['--uninstall'], env)).status).toBe(0);
     expect(existsSync(unit)).toBe(false);
-    expect(run(join(fixture, 'install.sh'), ['--service'], env).status).toBe(0);
+    expect((await run(join(fixture, 'install.sh'), ['--service'], env)).status).toBe(0);
     expect(readFileSync(unit, 'utf-8')).toBe(rendered.stdout);
   });
 
-  it('inside a clone: no flags clone the product — deps+build+wizard only', () => {
+  it('inside a clone: no flags clone the product — deps+build+wizard only', async () => {
     const { fixture, home } = buildFixtureRepo();
     gitInitCommit(fixture);
     const elsewhere = join(home, 'should-not-exist');
-    const { stdout, status } = run(join(fixture, 'install.sh'), ['--answers', '{}'], {
+    const { stdout, status } = await run(join(fixture, 'install.sh'), ['--answers', '{}'], {
       HOME: home,
       GRU_COMMAND_HOME: join(home, '.gru-command'),
       GRU_COMMAND_TARGET: elsewhere,
@@ -1058,10 +1090,10 @@ describe('install.sh setup mode (one-line path)', () => {
     expect(existsSync(join(home, '.gru-command', 'config.toml'))).toBe(true);
   });
 
-  it('--no-interact alone completes with documented defaults and never opens the TTY', () => {
+  it('--no-interact alone completes with documented defaults and never opens the TTY', async () => {
     const { fixture, home } = buildFixtureRepo();
     gitInitCommit(fixture);
-    const result = run(join(fixture, 'install.sh'), ['--no-interact'], {
+    const result = await run(join(fixture, 'install.sh'), ['--no-interact'], {
       HOME: home,
       GRU_COMMAND_HOME: join(home, '.gru-command'),
     });
@@ -1069,10 +1101,10 @@ describe('install.sh setup mode (one-line path)', () => {
     expect(result.stdout).toContain('WIZARD-RAN --no-interact');
   });
 
-  it('--answers=<json> equals-form parses identically (wizard marker written)', () => {
+  it('--answers=<json> equals-form parses identically (wizard marker written)', async () => {
     const { fixture, home } = buildFixtureRepo();
     gitInitCommit(fixture);
-    const { stdout, status } = run(join(fixture, 'install.sh'), ['--answers={}'], {
+    const { stdout, status } = await run(join(fixture, 'install.sh'), ['--answers={}'], {
       HOME: home,
       GRU_COMMAND_HOME: join(home, '.gru-command'),
     });
@@ -1081,21 +1113,21 @@ describe('install.sh setup mode (one-line path)', () => {
     expect(existsSync(join(home, '.gru-command', 'config.toml'))).toBe(true);
   });
 
-  it('--answers combined with --print exits 2 with a named mode-conflict error', () => {
+  it('--answers combined with --print exits 2 with a named mode-conflict error', async () => {
     for (const args of [['--answers', '{}', '--print'], ['--print', '--answers', '{}']]) {
-      const { status, stderr } = run(join(repoRoot, 'install.sh'), args, {});
+      const { status, stderr } = await run(join(repoRoot, 'install.sh'), args, {});
       expect(status, String(args)).toBe(2);
       expect(stderr).toContain('--answers is only valid with setup mode');
       expect(stderr).toContain('--print');
     }
   });
 
-  it('rejects update without a config and refuses a pre-positioned checkout from another origin', () => {
+  it('rejects update without a config and refuses a pre-positioned checkout from another origin', async () => {
     const noConfigHome = tempDir('gru-command-update-no-config-home-');
     const noConfigBare = tempDir('gru-command-update-no-config-bare-');
     copyFileSync(join(repoRoot, 'install.sh'), join(noConfigBare, 'install.sh'));
     const noConfigTarget = join(noConfigHome, 'gru-command');
-    const noConfig = run(join(noConfigBare, 'install.sh'), ['--update'], {
+    const noConfig = await run(join(noConfigBare, 'install.sh'), ['--update'], {
       HOME: noConfigHome,
       GRU_COMMAND_HOME: join(noConfigHome, '.gru-command'),
       GRU_COMMAND_TARGET: noConfigTarget,
@@ -1115,7 +1147,7 @@ describe('install.sh setup mode (one-line path)', () => {
     writeFileSync(join(instance, 'config.toml'), 'preserved\n');
     const bare = tempDir('gru-command-origin-guard-bare-');
     copyFileSync(join(repoRoot, 'install.sh'), join(bare, 'install.sh'));
-    const wrongOrigin = run(join(bare, 'install.sh'), [], {
+    const wrongOrigin = await run(join(bare, 'install.sh'), [], {
       HOME: first.home,
       GRU_COMMAND_HOME: instance,
       GRU_COMMAND_TARGET: target,
@@ -1126,11 +1158,11 @@ describe('install.sh setup mode (one-line path)', () => {
     expect(readFileSync(join(instance, 'config.toml'), 'utf-8')).toBe('preserved\n');
   });
 
-  it('clone failure (bad GRU_COMMAND_ORIGIN) exits non-zero with a named error', () => {
+  it('clone failure (bad GRU_COMMAND_ORIGIN) exits non-zero with a named error', async () => {
     const home = tempDir('gru-command-clonefail-home-');
     const bare = tempDir('gru-command-clonefail-bare-');
     copyFileSync(join(repoRoot, 'install.sh'), join(bare, 'install.sh'));
-    const { stdout, status } = run(
+    const { stdout, status } = await run(
       join(bare, 'install.sh'),
       ['--answers', '{}'],
       {
@@ -1148,11 +1180,11 @@ describe('install.sh setup mode (one-line path)', () => {
     expect(existsSync(join(home, 'gru-command'))).toBe(false);
   });
 
-  it('re-exec guard: GRU_COMMAND_REEXEC=1 outside a checkout exits 1, named', () => {
+  it('re-exec guard: GRU_COMMAND_REEXEC=1 outside a checkout exits 1, named', async () => {
     const home = tempDir('gru-command-reexec-home-');
     const bare = tempDir('gru-command-reexec-bare-');
     copyFileSync(join(repoRoot, 'install.sh'), join(bare, 'install.sh'));
-    const { stderr, status } = run(join(bare, 'install.sh'), ['--answers', '{}'], {
+    const { stderr, status } = await run(join(bare, 'install.sh'), ['--answers', '{}'], {
       HOME: home,
       GRU_COMMAND_HOME: join(home, '.gru-command'),
       GRU_COMMAND_REEXEC: '1',
@@ -1164,14 +1196,14 @@ describe('install.sh setup mode (one-line path)', () => {
 });
 
 describe('install.sh E7 flag contracts (re-pinned)', () => {
-  it('unknown flags exit 2 with usage', () => {
-    const { status, stderr } = run(join(repoRoot, 'install.sh'), ['--bogus'], {});
+  it('unknown flags exit 2 with usage', async () => {
+    const { status, stderr } = await run(join(repoRoot, 'install.sh'), ['--bogus'], {});
     expect(status).toBe(2);
     expect(stderr).toContain('unknown flag');
   });
 
-  it('--print renders the platform unit absolutely; changes nothing', () => {
-    const { stdout, status } = run(join(repoRoot, 'install.sh'), ['--print'], {});
+  it('--print renders the platform unit absolutely; changes nothing', async () => {
+    const { stdout, status } = await run(join(repoRoot, 'install.sh'), ['--print'], {});
     expect(status).toBe(0);
     expect(stdout).not.toContain('{{NODE}}');
     expect(stdout).not.toContain('{{REPO_ROOT}}');
@@ -1179,23 +1211,23 @@ describe('install.sh E7 flag contracts (re-pinned)', () => {
     expect(stdout).not.toContain('{{PATH}}');
   });
 
-  it('--uninstall on a clean machine reports not-installed, exit 0', () => {
+  it('--uninstall on a clean machine reports not-installed, exit 0', async () => {
     const home = tempDir('gru-command-uninstall-');
-    const { stdout, status } = run(join(repoRoot, 'install.sh'), ['--uninstall'], { HOME: home });
+    const { stdout, status } = await run(join(repoRoot, 'install.sh'), ['--uninstall'], { HOME: home });
     expect(status, stdout).toBe(0);
     expect(stdout).toMatch(/not installed/);
   });
 
-  it('--service refuses loudly when dist/main.js is missing', () => {
+  it('--service refuses loudly when dist/main.js is missing', async () => {
     const { fixture, home } = buildFixtureRepo();
     gitInitCommit(fixture);
-    const { stderr, status } = run(join(fixture, 'install.sh'), ['--service'], { HOME: home });
+    const { stderr, status } = await run(join(fixture, 'install.sh'), ['--service'], { HOME: home });
     expect(status).toBe(1);
     expect(stderr).toContain('dist/main.js not found');
   });
 
-  it('--answers= (empty) exits 2 — never a silent flip to interactive (Perkins r2 note)', () => {
-    const { status, stderr } = run(join(repoRoot, 'install.sh'), ['--answers='], {});
+  it('--answers= (empty) exits 2 — never a silent flip to interactive (Perkins r2 note)', async () => {
+    const { status, stderr } = await run(join(repoRoot, 'install.sh'), ['--answers='], {});
     expect(status).toBe(2);
     expect(stderr).toContain("--answers was given an empty value");
     expect(stderr).toContain("--answers '{}'");
@@ -1216,9 +1248,9 @@ describe('node version gate (>= 22.19) — Perkins r1 W11', () => {
     return dir;
   }
 
-  it('--service mode gates before unit registration', () => {
+  it('--service mode gates before unit registration', async () => {
     const shim = oldNodeShim();
-    const { stderr, status } = run(join(repoRoot, 'install.sh'), ['--service'], {
+    const { stderr, status } = await run(join(repoRoot, 'install.sh'), ['--service'], {
       PATH: `${shim}:${process.env.PATH ?? ''}`,
     });
     expect(status).toBe(1);
@@ -1226,9 +1258,9 @@ describe('node version gate (>= 22.19) — Perkins r1 W11', () => {
     expect(stderr).toContain('v18.20.0');
   });
 
-  it('setup mode (inside a checkout) gates before deps/build', () => {
+  it('setup mode (inside a checkout) gates before deps/build', async () => {
     const shim = oldNodeShim();
-    const { stderr, status } = run(join(repoRoot, 'install.sh'), [], {
+    const { stderr, status } = await run(join(repoRoot, 'install.sh'), [], {
       PATH: `${shim}:${process.env.PATH ?? ''}`,
       // A answers-free run would exec the wizard after the gate — the
       // gate must stop it long before that.
