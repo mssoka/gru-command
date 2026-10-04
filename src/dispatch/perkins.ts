@@ -229,10 +229,11 @@ type ReviewLensResult =
 
 /** The PR identity a verdict delivery was proven against. HEAD equality is
  * the delivery invariant: `headSha` is the round's frozen target on any
- * successful delivery, while `baseSha` is the PR's LIVE base at delivery —
- * a pinned PR base is recorded at open/link time and is expected to trail
- * a moving main, so base age never gates delivery. The receipt is what the
- * ledger refreshes the round's recorded delivery identity from. */
+ * successful delivery, while `baseSha` is the live PR base observed by the
+ * poster's identity probe (before POST/reconciliation on GitHub, after the
+ * note on GitLab). The base may advance after that probe; base age never
+ * gates delivery. The receipt is what the ledger records, not a claim that
+ * the base was sampled atomically with the provider review. */
 export interface PrIdentity {
   readonly headSha: string;
   readonly baseSha: string;
@@ -3017,8 +3018,8 @@ export class WaveRunner {
             // poster PROVED: the provider review id, the actual actor and
             // event (an authenticated COMMENT — never a formal
             // APPROVED/CHANGES_REQUESTED claim), the commit binding, the
-            // frozen head delivered against and the PR's live base at
-            // delivery.
+            // frozen head delivered against and the base observed by the
+            // poster's identity probe (which may precede delivery).
             targetSha: delivered.headSha, baseSha: delivered.baseSha,
             publicationFile, publicationSha256,
             receipt: {

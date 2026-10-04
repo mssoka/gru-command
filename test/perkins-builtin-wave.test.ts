@@ -242,15 +242,17 @@ describe('GitHub SHA-bound Perkins delivery', () => {
     execFileSync('git', ['-C', repoPath, 'remote', 'add', 'origin', 'https://git.example.test/acme/widget.git']);
     const head = '1'.repeat(40);
     const base = '2'.repeat(40);
+    const advancedBase = '5'.repeat(40);
+    const baseState = join(root, 'base.sha');
+    writeFileSync(baseState, base);
     const review = { id: 9001, user: { login: 'gru-bot' }, state: 'COMMENTED', commit_id: head, body: 'review body\n' };
-    writeFileSync(binary, `#!/usr/bin/env node\nimport { appendFileSync, readFileSync } from 'node:fs';\nconst input = readFileSync(0, 'utf8');\nappendFileSync(${JSON.stringify(log)}, JSON.stringify({ argv: process.argv.slice(2), input }) + '\\n');\nconst argv = process.argv.slice(2);\nif (argv.includes('--method') && argv.includes('POST')) {\n  const body = JSON.parse(input);\n  process.stdout.write(JSON.stringify({ id: 9001, user: { login: 'gru-bot' }, state: 'COMMENTED', commit_id: body.commit_id, body: body.body }));\n} else if (argv.some((entry) => entry.includes('/reviews?'))) {\n  process.stdout.write(JSON.stringify([{ id: 8000, user: { login: 'someone' }, state: 'COMMENTED', commit_id: 'f'.repeat(40), body: 'other' }, ${JSON.stringify(review)}]));\n} else if (argv.includes('user') && !argv.some((entry) => entry.includes('/'))) {\n  process.stdout.write('gru-bot');\n} else {\n  process.stdout.write(${JSON.stringify(`${head}\t${base}\n`)});\n}\n`, 'utf8');
+    writeFileSync(binary, `#!/usr/bin/env node\nimport { appendFileSync, readFileSync, writeFileSync } from 'node:fs';\nconst input = readFileSync(0, 'utf8');\nappendFileSync(${JSON.stringify(log)}, JSON.stringify({ argv: process.argv.slice(2), input }) + '\\n');\nconst argv = process.argv.slice(2);\nif (argv.includes('--method') && argv.includes('POST')) {\n  const body = JSON.parse(input);\n  writeFileSync(${JSON.stringify(baseState)}, ${JSON.stringify(advancedBase)});\n  process.stdout.write(JSON.stringify({ id: 9001, user: { login: 'gru-bot' }, state: 'COMMENTED', commit_id: body.commit_id, body: body.body }));\n} else if (argv.some((entry) => entry.includes('/reviews?'))) {\n  process.stdout.write(JSON.stringify([{ id: 8000, user: { login: 'someone' }, state: 'COMMENTED', commit_id: 'f'.repeat(40), body: 'other' }, ${JSON.stringify(review)}]));\n} else if (argv.includes('user') && !argv.some((entry) => entry.includes('/'))) {\n  process.stdout.write('gru-bot');\n} else {\n  process.stdout.write(${JSON.stringify(`${head}\t`)} + readFileSync(${JSON.stringify(baseState)}, 'utf8') + '\\n');\n}\n`, 'utf8');
     chmodSync(binary, 0o755);
     const poster = new GhPrPoster(binary);
-    // (a) The PR's recorded base (GitHub pins it at open/link time) trails
-    // the frozen base as main moves during a long round; head equality is
-    // the delivery invariant, so a stale recorded base must NOT refuse.
-    // The receipt binds the provider review id/actor/event, the commit and
-    // the echoed body digest.
+    // (a) The base may advance inside POST, after the GitHub identity probe.
+    // The receipt carries the base observed by that probe, not a later tip;
+    // head equality remains the delivery invariant and the recorded base
+    // must NOT refuse a commit-bound review.
     await expect(poster.post({
       prUrl: 'https://git.example.test/acme/widget/pull/42', host: 'git.example.test', repoPath,
       body: 'review body\n', targetSha: head, baseSha: '3'.repeat(40),
@@ -259,6 +261,7 @@ describe('GitHub SHA-bound Perkins delivery', () => {
       headSha: head, baseSha: base,
       bodySha256: createHash('sha256').update('review body\n', 'utf8').digest('hex'),
     });
+    expect(readFileSync(baseState, 'utf8')).toBe(advancedBase);
     const calls = readFileSync(log, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as { argv: string[]; input: string });
     // identity probe, commit-bound POST, authenticated-account probe (R5).
     expect(calls).toHaveLength(3);
@@ -1510,8 +1513,8 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     return { repo, base, target, ledger, port, artifacts, sessions, job };
   }
 
-  /** A provider receipt for the reviewed head that reports the PR's LIVE
-   * base, read after `main` advanced. */
+  /** A provider receipt for the reviewed head carrying the live base at
+   * its identity probe, not a subsequent advance during delivery. */
   function liveBaseReceipt(reviewId: string, call: { readonly body: string; readonly targetSha: string }, liveBase: string) {
     return {
       reviewId, actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
@@ -1523,7 +1526,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
   function expectRecordedWithFrozenBase(
     fixture: Awaited<ReturnType<typeof baseAdvanceFixture>>,
     outcome: WaveOutcome,
-    expected: { readonly reviewId: string; readonly reconciled: boolean },
+    expected: { readonly reviewId: string; readonly reconciled: boolean; readonly observedBase: string },
   ): void {
     const liveBase = fixture.repo.git(['rev-parse', 'main']);
     expect(liveBase).not.toBe(fixture.base);
@@ -1533,14 +1536,17 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     expect(outcome.canonicalVerdict).toBe('NEEDS CHANGES');
     expect(outcome.round.status).toBe('verdict-posted');
     const posted = fixture.ledger.latestRoundEvent(outcome.round.id, 'round.posted')?.payload as {
-      targetSha?: string; baseSha?: string; reconciled?: boolean; receipt?: { reviewId?: string };
+      targetSha?: string; baseSha?: string; reconciled?: boolean; receipt?: { reviewId?: string; baseSha?: string };
     } | undefined;
     expect(posted?.receipt?.reviewId).toBe(expected.reviewId);
     expect(posted?.reconciled).toBe(expected.reconciled);
     // Delivery stays bound to the reviewed target; the receipt carries the
-    // live base while the frozen base stays recorded as provenance.
+    // base observed before POST/reconciliation, while the frozen base stays
+    // provenance and main may advance again before the record is written.
     expect(posted?.targetSha).toBe(fixture.target);
-    expect(posted?.baseSha).toBe(liveBase);
+    expect(posted?.baseSha).toBe(expected.observedBase);
+    expect(posted?.receipt?.baseSha).toBe(expected.observedBase);
+    expect(posted?.baseSha).not.toBe(liveBase);
     const recorded = fixture.ledger.latestRoundEvent(outcome.round.id, 'round.perkins-review')?.payload as Record<string, unknown> | undefined;
     expect(recorded).toMatchObject({
       targetSha: fixture.target, baseRefSha: fixture.base, diffBaseSha: fixture.base, headMoved: false, complete: true,
@@ -1590,8 +1596,12 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
   it('records a conclusive review when only the base advances during lead work and inside POST', async () => {
     const fixture = await baseAdvanceFixture('perkins-base-advance-post', 'feature/base-advance-post', 36);
     let advancedDuringLead = false;
-    const post = vi.fn(async (call: { readonly body: string; readonly targetSha: string }) =>
-      liveBaseReceipt('9300', call, advanceMain(fixture.repo)));
+    let observedBase = '';
+    const post = vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => {
+      observedBase = fixture.repo.git(['rev-parse', 'main']);
+      advanceMain(fixture.repo);
+      return liveBaseReceipt('9300', call, observedBase);
+    });
     const escalations: string[] = [];
     const wave = new WaveRunner({
       ledger: fixture.ledger, worktrees: fixture.port,
@@ -1606,15 +1616,20 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     const outcome = asWave(await wave.runRound({ jobId: fixture.job.id }));
     expect(advancedDuringLead).toBe(true);
     expect(post).toHaveBeenCalledTimes(1);
-    expectRecordedWithFrozenBase(fixture, outcome, { reviewId: '9300', reconciled: false });
+    expect(observedBase).not.toBe(fixture.base); // lead advance was visible at the identity probe
+    expectRecordedWithFrozenBase(fixture, outcome, { reviewId: '9300', reconciled: false, observedBase });
     expect(escalations).toEqual([]);
   });
 
   it('records a reconciled delivery when POST throws and the base advances inside the reconcile lookup', async () => {
     const fixture = await baseAdvanceFixture('perkins-base-advance-reconcile', 'feature/base-advance-reconcile', 37);
     const post = vi.fn(async () => { throw new Error('gh api review delivery exited 1: simulated timeout after commit'); });
-    const reconcile = vi.fn(async (call: { readonly body: string; readonly targetSha: string }) =>
-      liveBaseReceipt('9301', call, advanceMain(fixture.repo)));
+    let observedBase = '';
+    const reconcile = vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => {
+      observedBase = fixture.repo.git(['rev-parse', 'main']);
+      advanceMain(fixture.repo);
+      return liveBaseReceipt('9301', call, observedBase);
+    });
     const escalations: string[] = [];
     const wave = new WaveRunner({
       ledger: fixture.ledger, worktrees: fixture.port, spawner: makeSpawner(fixture.sessions, []),
@@ -1625,7 +1640,8 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     const outcome = asWave(await wave.runRound({ jobId: fixture.job.id }));
     expect(post).toHaveBeenCalledTimes(1);
     expect(reconcile).toHaveBeenCalledTimes(1);
-    expectRecordedWithFrozenBase(fixture, outcome, { reviewId: '9301', reconciled: true });
+    expect(observedBase).toBe(fixture.base); // the base advanced only after reconciliation began
+    expectRecordedWithFrozenBase(fixture, outcome, { reviewId: '9301', reconciled: true, observedBase });
     expect(escalations).toEqual([]);
   });
 
