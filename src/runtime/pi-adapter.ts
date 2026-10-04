@@ -791,6 +791,10 @@ export class PiAgentHandle implements AgentHandle {
   /** The text/images behind the live turn — supervision's resume snapshot. */
   private livePromptText: string | null = null;
   private livePromptImages: PromptOptions['images'] | undefined;
+  /** Terminal evidence of the live turn's LAST assistant message: the only
+   * positive completion proof (`stopReason: 'stop'`). Reset per turn; the
+   * settle capture reads it before `drain()` starts a successor. */
+  private liveTurnStop: { stopReason: string | null; error: string | null } | null = null;
   /** Long-tool heartbeats: an open tool call keeps the event surface alive. */
   private readonly toolHeartbeat: ToolHeartbeat;
   private readonly queue: QueuedMessage[] = [];
@@ -1191,6 +1195,7 @@ export class PiAgentHandle implements AgentHandle {
     this.liveOwner = owner;
     this.livePromptText = text;
     this.livePromptImages = images;
+    this.liveTurnStop = { stopReason: null, error: null };
     const promptOptions: Record<string, unknown> = {};
     const mapped = mapImages(images);
     if (mapped !== undefined) promptOptions['images'] = mapped;
@@ -1223,11 +1228,29 @@ export class PiAgentHandle implements AgentHandle {
         if (this.liveTurn === turn) {
           // Capture THIS turn's terminal evidence BEFORE `drain()` can start
           // a queued successor: the successor's state must never be read as
-          // this turn's outcome (r5 blocker 1).
+          // this turn's outcome (r5 blocker 1). A resolved prompt is not a
+          // successful turn: only the turn's own LAST assistant message with
+          // `stopReason: 'stop'` is positive completion proof. An in-band
+          // error, an abort/disposal, or any other stop reason (#160) is a
+          // failed/unknown terminal outcome and must never mint delivery.
+          const terminal = this.liveTurnStop;
+          this.liveTurnStop = null;
           captured =
             this.state === 'error'
-              ? { ok: false, error: this.stateError ?? 'runtime settled the turn with an in-band error' }
-              : { ok: true, error: null };
+              ? { ok: false, error: this.stateError ?? terminal?.error ?? 'runtime settled the turn with an in-band error' }
+              : terminal?.stopReason === 'stop'
+                ? { ok: true, error: null }
+                : {
+                    ok: false,
+                    error:
+                      `turn settled without a successful completion (` +
+                      (terminal?.stopReason == null
+                        ? this.disposed
+                          ? 'session disposed before a terminal assistant message'
+                          : 'no terminal assistant message'
+                        : `stopReason: ${terminal.stopReason}`) +
+                      (terminal?.error == null ? ')' : `: ${terminal.error})`),
+                  };
           this.liveTurn = null;
           this.liveOwner = null;
           this.livePromptText = null;
@@ -1336,36 +1359,46 @@ export class PiAgentHandle implements AgentHandle {
         }
         return;
       case 'message_end': {
-        // pi reports in-band model errors as an assistant message with
-        // stopReason 'error' — surface it as a runtime error event.
         const msg = e['message'] as Record<string, unknown> | undefined;
-        if (msg !== undefined && msg['role'] === 'assistant' && msg['stopReason'] === 'error') {
-          const detail = String(msg['errorMessage'] ?? 'model error');
-          // The provider terminal message IS the typed origin: its
-          // machine-composed line was built by the transport from the real
-          // response (pi-ai formatProviderError). Strict parse only.
-          const typed = typedFromProviderMessageLine(
-            detail,
-            typeof msg['provider'] === 'string' ? msg['provider'] : this.session.model?.provider ?? '',
-            typeof msg['model'] === 'string' ? msg['model'] : this.session.model?.id ?? '',
-          );
-          this.emit({
-            type: 'error',
-            error: detail,
-            fatal: false,
-            ...(typeof msg['provider'] === 'string'
-              ? { provider: msg['provider'] }
-              : this.session.model !== undefined
-                ? { provider: this.session.model.provider }
-                : {}),
-            ...(typeof msg['model'] === 'string'
-              ? { model: msg['model'] }
-              : this.session.model !== undefined
-                ? { model: this.session.model.id }
-                : {}),
-            ...(typed !== null ? { typed } : {}),
-          });
-          this.setState('error', detail);
+        if (msg !== undefined && msg['role'] === 'assistant') {
+          // Per-turn terminal evidence for the live prompt: every assistant
+          // message updates it; the LAST one decides success vs failure.
+          if (this.liveTurnStop !== null) {
+            this.liveTurnStop = {
+              stopReason: typeof msg['stopReason'] === 'string' ? msg['stopReason'] : null,
+              error: typeof msg['errorMessage'] === 'string' ? msg['errorMessage'] : null,
+            };
+          }
+          // pi reports in-band model errors as an assistant message with
+          // stopReason 'error' — surface it as a runtime error event.
+          if (msg['stopReason'] === 'error') {
+            const detail = String(msg['errorMessage'] ?? 'model error');
+            // The provider terminal message IS the typed origin: its
+            // machine-composed line was built by the transport from the real
+            // response (pi-ai formatProviderError). Strict parse only.
+            const typed = typedFromProviderMessageLine(
+              detail,
+              typeof msg['provider'] === 'string' ? msg['provider'] : this.session.model?.provider ?? '',
+              typeof msg['model'] === 'string' ? msg['model'] : this.session.model?.id ?? '',
+            );
+            this.emit({
+              type: 'error',
+              error: detail,
+              fatal: false,
+              ...(typeof msg['provider'] === 'string'
+                ? { provider: msg['provider'] }
+                : this.session.model !== undefined
+                  ? { provider: this.session.model.provider }
+                  : {}),
+              ...(typeof msg['model'] === 'string'
+                ? { model: msg['model'] }
+                : this.session.model !== undefined
+                  ? { model: this.session.model.id }
+                  : {}),
+              ...(typed !== null ? { typed } : {}),
+            });
+            this.setState('error', detail);
+          }
         }
         return;
       }
