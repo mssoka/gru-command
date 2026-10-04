@@ -73,8 +73,11 @@ recheck enters through the same `arm`-phase guard, so a forced fallback
 admission carries two `arm`-phase `branch-idle.forced` records where the
 native route carries `arm` + `freeze`. A running fallback gate also
 re-proves its lane, marker and replay-authorization facts at each round
-intake and after the default reviewer's worker admission, stopping
-fail-closed before a stale diff or reviewer. Those boundary re-proofs
+intake, after the default reviewer's worker admission and asynchronous
+spawn, and after the reviewer returns. It also compares the durable
+re-brief settlement watermark from diff intake: a request that begins
+and settles while the reviewer runs cannot approve the old diff. Those
+boundary re-proofs
 emit no branch-idle audit rows: at admission a replay whose job is
 blocked/parked is HELD (`job.review-handoff-held` plus escalation,
 requiring a new validated request), while after admission the gate stops
@@ -96,7 +99,9 @@ worker spawns (cleared only when the request genuinely settles, via
 finalization or boot recovery) fence the target regardless of an older
 delivery or a status flip — the fence can coexist with a delivered or
 in-review status — and the Silas digest does not offer the target for
-review while they stand. `force: true` is the owner's explicit override —
+review while they stand. Settlement publishes `silas.rebrief-settled`
+after marker retirement, so a queued handoff that re-queued on the
+earlier delivery can retry without waiting for another sweep. `force: true` is the owner's explicit override —
 never an automatic operations action; a forced round is tagged in its
 frozen manifest
 (`branchIdle`) and the event log (`branch-idle.forced`), refusals land as

@@ -382,7 +382,8 @@ describe('silas digest (the four actionable states)', () => {
       h.ledger.setJobStatus('job-first', 'in-review');
       expect((await digestOf()).prWithoutReview).toEqual([]);
 
-      // Genuine settlement releases exactly that target; the other stays fenced.
+      // Marker retirement releases exactly this projection; the real
+      // finalizer's delivery/settlement is exercised by the guard suite.
       h.ledger.clearPendingRebriefs(
         h.ledger.listPendingRebriefs({ jobId: 'job-first' }).map((marker) => marker.id),
       );

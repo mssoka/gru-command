@@ -1062,6 +1062,7 @@ export class WaveRunner {
     starting: boolean;
     /** Post-intake hold: visible obligation, NOT sweep-rearmable. */
     held: boolean;
+    settlementReplayRequested: boolean;
     readonly run: Promise<void>;
     readonly resolve: () => void;
   }>();
@@ -1072,9 +1073,18 @@ export class WaveRunner {
     this.opts = opts;
     this.log = opts.log ?? (() => {});
     this.stopHandoffListener = opts.bus?.subscribe((event) => {
-      if (event.kind !== 'job.delivered' || event.jobId === null) return;
+      if (event.jobId === null) return;
       const pending = this.handoffs.get(event.jobId);
-      if (pending !== undefined && event.seq > pending.seq) void this.startHandoff(event.jobId, pending);
+      if (pending === undefined) return;
+      if (event.kind === 'silas.rebrief-settled') {
+        // The delivery was published while its durable markers still stood.
+        // A replay may already be unwinding that busy refusal; retry only
+        // after it has released its starting flag.
+        if (pending.starting) pending.settlementReplayRequested = true;
+        else void this.startHandoff(event.jobId, pending);
+      } else if (event.kind === 'job.delivered' && event.seq > pending.seq) {
+        void this.startHandoff(event.jobId, pending);
+      }
     }) ?? (() => {});
   }
 
@@ -1552,7 +1562,7 @@ export class WaveRunner {
   private trackHandoff(input: { jobId: string; targetRef?: string; lenses?: readonly string[]; noSpec?: boolean; force?: boolean }, seq: number) {
     let resolve!: () => void;
     const run = new Promise<void>((done) => { resolve = done; });
-    const pending = { input, seq, starting: false, held: false, run, resolve };
+    const pending = { input, seq, starting: false, held: false, settlementReplayRequested: false, run, resolve };
     this.handoffs.set(input.jobId, pending);
     return pending;
   }
@@ -1637,6 +1647,13 @@ export class WaveRunner {
       if (!requeued && !held) {
         if (this.handoffs.get(jobId) === pending) this.handoffs.delete(jobId);
         pending.resolve();
+      }
+      // A settlement signal that arrived during the old delivery's busy
+      // replay is not lost: its marker-free retry starts after this attempt
+      // releases the in-flight flag. Held requests never auto-rearm.
+      if (requeued && pending.settlementReplayRequested && this.handoffs.get(jobId) === pending) {
+        pending.settlementReplayRequested = false;
+        void this.startHandoff(jobId, pending);
       }
       // requeued: stays pending and re-armable. held: stays pending and
       // VISIBLE but not sweep-rearmable — only a new validated request
@@ -2018,6 +2035,18 @@ export class WaveRunner {
           throw error;
         }
       }
+      // Presence catches an open request; this durable settlement watermark
+      // also catches a request that both began and finished during an async
+      // reviewer turn. Its old diff cannot be approved after that turn.
+      const settlementSeq = this.opts.ledger.latestJobEvent(job.id, 'silas.rebrief-settled')?.seq ?? 0;
+      const recheckRound = (): void => {
+        recheck?.();
+        if ((this.opts.ledger.latestJobEvent(job.id, 'silas.rebrief-settled')?.seq ?? 0) !== settlementSeq) {
+          throw new FallbackSafetyRefusal(
+            `a re-brief request settled during fallback round ${iteration} for job "${job.id}" — the old diff cannot pass`,
+          );
+        }
+      };
       const reportFile = join(directory, `review-${iteration}.json`);
       // Re-read the lane's working diff every round: the fix directive may
       // have changed the tree, and the next review must see those bytes.
@@ -2044,7 +2073,10 @@ export class WaveRunner {
       try {
         findings = gate.runFallbackReview !== undefined
           ? await gate.runFallbackReview({ jobId: job.id, lanePath, baseRef, diff, skillPath: gate.skillPath, reportFile, iteration, signal })
-          : await this.defaultFallbackReview({ jobId: job.id, lanePath, baseRef, diff, skillPath: gate.skillPath, reportFile, iteration, signal }, recheck);
+          : await this.defaultFallbackReview({ jobId: job.id, lanePath, baseRef, diff, skillPath: gate.skillPath, reportFile, iteration, signal }, recheckRound);
+        // A completed review of an older diff is not a PASS on a lane that
+        // acquired and possibly settled a newer request while it ran.
+        recheckRound();
       } catch (error) {
         if (existsSync(reportFile)) state.reportFiles.push(reportFile);
         if (error instanceof FallbackSafetyRefusal) {
@@ -2153,6 +2185,9 @@ export class WaveRunner {
       // throw.
       if (recheck !== undefined) recheck();
       handle = await this.opts.spawner('minion', { cwd: input.lanePath, signal: input.signal });
+      // Spawning is asynchronous too: a newly owned lane must not receive
+      // an obsolete review prompt just because the worker was allocated.
+      recheck?.();
       const prompt = [
         `Read ${input.skillPath} completely and follow it to review the CURRENT working diff of this repository against base ${input.baseRef}.`,
         'This session runs ONE review pass inside a release gate. The host performs triage and every gate decision afterwards: do NOT approve, merge, or gate anything yourself, and do not modify implementation code.',
