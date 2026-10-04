@@ -32,7 +32,7 @@ export interface JobSignal {
 export function roundSummary(round: RoundView): RoundSummary {
   // Whole-PR rounds: a lens the lead never used is done as "not used", not
   // as coverage. `used` counts lenses that actually ran; `unused` is shown
-  // separately so a lead-only round never reads as 7/7 specialist coverage.
+  // separately so a lead-only round never reads as full-catalog specialist coverage.
   // `ran` additionally counts lenses that RAN AND FAILED (R9): a specialist
   // that executed and errored is real work and must not vanish from the
   // "lenses ran" count — only error lenses WITHOUT any recorded attempt

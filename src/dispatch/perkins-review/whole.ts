@@ -179,6 +179,15 @@ export interface SpecialistRun {
   readonly cleanupRecordingError?: string;
 }
 
+/** One pre-start refusal caused solely by the round's specialist-run cap:
+ * the requested run call could not fit the remaining round budget and no
+ * child started for it, so no attempt or budget was charged. */
+export interface RoundBudgetRefusal {
+  readonly lenses: readonly string[];
+  readonly cap: number;
+  readonly accountedRuns: number;
+}
+
 export interface PerkinsWholeResult {
   readonly canonicalVerdict: CanonicalReviewVerdict;
   readonly findings: readonly VerifiedFinding[];
@@ -191,6 +200,7 @@ export interface PerkinsWholeResult {
   readonly headMoved: boolean;
   readonly sourceMovement?: SourceMovement;
   readonly lensEnvelopes: readonly LensEnvelope[];
+  readonly budgetRefusals?: readonly RoundBudgetRefusal[];
 }
 
 interface SpecialistResult extends SpecialistRun {
@@ -773,6 +783,7 @@ export class PerkinsWholeReview {
       }
     };
     let specialistsStarted = 0;
+    const budgetRefusals: RoundBudgetRefusal[] = [];
     let preflightAttempts = 0;
     let terminalAttempts = 0;
     let accepted: PerkinsWholeResult | null = null;
@@ -1153,6 +1164,7 @@ export class PerkinsWholeReview {
         // Capacity is checked BEFORE any child starts: a bound the host
         // could have known up front must never strand started children.
         if (specialistsStarted + scheduled.length > MAX_SPECIALISTS_PER_ROUND) {
+          budgetRefusals.push({ lenses: [...lensesRun], cap: MAX_SPECIALISTS_PER_ROUND, accountedRuns: specialistsStarted });
           throw new Error(`review exceeds ${MAX_SPECIALISTS_PER_ROUND} specialist runs; finish with what has run`);
         }
         for (const run of scheduled) attempts.set(run.lens, run.attempt);
@@ -1628,6 +1640,7 @@ export class PerkinsWholeReview {
             specialistRuns, artifactDirectory: review.directory, reportFile,
             targetSha: review.manifest.targetSha, diffBaseSha: review.manifest.diffBaseSha,
             headMoved, ...(headMovedAtSubmit !== null ? { sourceMovement: headMovedAtSubmit } : {}), lensEnvelopes: [...envelopes],
+            ...(budgetRefusals.length > 0 ? { budgetRefusals: [...budgetRefusals] } : {}),
           };
           return {
             text: JSON.stringify({ accepted: true, canonicalVerdict: submission.verdict, findingCount: findings.length }),

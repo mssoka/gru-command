@@ -195,7 +195,7 @@ function scriptedReply(socket: WebSocket, userText: string, attachments?: readon
  * the standing crew on the agent rail, one blocked-job notification.
  * The board WS pushes a fresh copy after auth and on every /__pulse.
  */
-const LENSES = ['blind', 'edge', 'acceptance', 'security', 'architecture', 'codebase', 'tests'] as const;
+const LENSES = ['blind', 'edge', 'acceptance', 'security', 'architecture', 'codebase', 'tests', 'performance', 'operations'] as const;
 
 /** Board fixture mode (tests only): the default sample board, or a variant
  * with no live machine rows and no needs-you job causes so the empty

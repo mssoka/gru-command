@@ -535,15 +535,15 @@ test.describe('board (E6, mock feed)', () => {
     await expect(signal).toContainText('1 blocker');
     await expect(page.locator('#board-unacked')).toContainText('needs Gru');
 
-    // Expand the row, then the round row: all 7 lens chips appear.
+    // Expand the row, then the round row: all 9 lens chips appear.
     await job.locator('.board-job__toggle').click();
     await expect(job).toHaveAttribute('data-expanded', 'true');
     await expect(job.locator('.board-lane')).toBeVisible();
     const round = job.locator('.board-round__toggle');
-    await expect(round).toContainText('3/7 lenses');
+    await expect(round).toContainText('3/9 lenses');
     await expect(round).toContainText('1 blocker');
     await round.click();
-    await expect(page.locator('.board-lens')).toHaveCount(7);
+    await expect(page.locator('.board-lens')).toHaveCount(9);
     // The standing crew is on the rail.
     await expect(page.locator('#board-agents .board-agent', { hasText: 'silas' })).toBeVisible();
     // The notification center opens with the sample feed.
@@ -773,7 +773,7 @@ test.describe('board (E6, mock feed)', () => {
 
     // Round header: lens count, blockers, elapsed; chips behind the row.
     const round = card.locator('.board-round__toggle');
-    await expect(round).toContainText('/7 lenses');
+    await expect(round).toContainText('/9 lenses');
     await expect(round.locator('.board-round__blockers')).toContainText('1 blocker');
     await expect(round.locator('.board-round__elapsed')).toContainText('elapsed');
     await round.click();

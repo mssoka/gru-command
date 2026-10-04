@@ -57,6 +57,9 @@ interface WholeHarness {
   readonly childCalls: ReturnType<typeof fakeWholeSpawner>['childCalls'];
   readonly toolErrors: ReturnType<typeof fakeWholeSpawner>['toolErrors'];
   readonly preflightResults: ReturnType<typeof fakeWholeSpawner>['preflightResults'];
+  readonly attemptedBatches: ReturnType<typeof fakeWholeSpawner>['attemptedBatches'];
+  readonly runBatches: ReturnType<typeof fakeWholeSpawner>['runBatches'];
+  readonly probeOutcomes: ReturnType<typeof fakeWholeSpawner>['probeOutcomes'];
   run(input?: { noSpec?: boolean; priorConsolidatedFile?: string }): Promise<PerkinsWholeResult>;
 }
 
@@ -109,6 +112,9 @@ function wholeHarness(
     childCalls: fake.childCalls,
     toolErrors: fake.toolErrors,
     preflightResults: fake.preflightResults,
+    attemptedBatches: fake.attemptedBatches,
+    runBatches: fake.runBatches,
+    probeOutcomes: fake.probeOutcomes,
     run: (input = {}) => engine.run({
       roundId: 'whole-round',
       roundNumber: 1,
@@ -376,7 +382,7 @@ describe('Perkins whole-PR lead engine', () => {
     });
     const result = await h.run();
     expect(result.canonicalVerdict).toBe('READY TO MERGE');
-    expect(h.childCalls).toHaveLength(7);
+    expect(h.childCalls).toHaveLength(9);
     for (const call of h.childCalls) {
       expect(call.options.isolatedReview).toBeDefined();
       expect(call.options.reviewLead).toBeUndefined();
@@ -396,11 +402,33 @@ describe('Perkins whole-PR lead engine', () => {
     }
   });
 
-  it('uses exactly six specialists in explicit no-spec mode', async () => {
+  it('uses exactly eight specialists in explicit no-spec mode, omitting only acceptance', async () => {
     const h = wholeHarness({ childAnswer: () => '[]' }, { noSpec: true });
     await h.run();
-    expect(h.childCalls).toHaveLength(6);
+    expect(h.childCalls).toHaveLength(8);
     expect(h.childCalls.some((call) => call.prompt!.includes('EXPLICIT NO-SPEC REVIEW'))).toBe(true);
+    // The spec-dependent lens is the ONLY omission: the two spec-independent
+    // newcomers (performance, operations) are available and run.
+    expect(h.childCalls.some((call) => call.prompt!.includes('"source": "acceptance"'))).toBe(false);
+    expect(h.childCalls.some((call) => call.prompt!.includes('"source": "performance"'))).toBe(true);
+    expect(h.childCalls.some((call) => call.prompt!.includes('"source": "operations"'))).toBe(true);
+  });
+
+  it('a performance and an operations finding survive child validation, lead submission and attribution', async () => {
+    const h = wholeHarness({
+      childAnswer: (prompt) => {
+        const source = /"source": "(performance|operations)"/u.exec(prompt)?.[1];
+        return source === undefined ? '[]' : JSON.stringify([groundedFinding(source, 'warning')]);
+      },
+    });
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    // Attribution is by the NEW source ids and nothing else: each finding
+    // crossed child validation, lead consolidation and the submission schema.
+    expect(result.findings.map((finding) => finding.source).sort()).toEqual(['operations', 'performance']);
+    expect(result.specialistRuns
+      .filter((run) => run.lens === 'performance' || run.lens === 'operations')
+      .every((run) => run.status === 'valid' && run.attempt === 1)).toBe(true);
   });
 
   it('a REQUEST_CHANGES review is successful completion, not an orchestration failure', async () => {
@@ -902,6 +930,24 @@ describe('Perkins whole-PR lead engine', () => {
     )).toBe(true);
     // The refused rerun spawned nothing new.
     expect(h.childCalls).toHaveLength(1);
+  });
+
+  it('refuses an unknown lens before any spawn or attempt charge, and a later valid call still runs', async () => {
+    const h = wholeHarness({
+      childAnswer: () => '[]',
+      specialists: ['blind', 'mystery'],
+      probes: [['blind']],
+    });
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    expect(h.toolErrors.some((entry) =>
+      entry.tool === 'perkins_run_specialists' && /not in this review's specialist catalog/.test(entry.error),
+    )).toBe(true);
+    // The refused call spawned nothing and charged nothing: the only real
+    // child is the post-refusal valid call, on attempt 1.
+    expect(h.childCalls).toHaveLength(1);
+    expect(result.specialistRuns).toMatchObject([{ lens: 'blind', attempt: 1, status: 'valid' }]);
+    expect(h.probeOutcomes).toEqual([{ lenses: ['blind'], ok: true }]);
   });
 
   it('a child citing evidence from another file fails its attempt and a corrected retry is accepted', async () => {
@@ -2039,9 +2085,9 @@ describe('wave refusals never consume lens or round budget (H1)', () => {
       movementRef: 'feature/review', noSpec: false,
     });
     expect(result.canonicalVerdict).toBe('READY TO MERGE');
-    expect(h.fake.childCalls).toHaveLength(8); // 7 lenses + security's invalid attempt
+    expect(h.fake.childCalls).toHaveLength(10); // 9 lenses + security's invalid attempt
     const valid = result.specialistRuns.filter((run) => run.status === 'valid');
-    expect(valid).toHaveLength(7); // every required lens still ran
+    expect(valid).toHaveLength(9); // every catalog lens still ran
     const securityValid = valid.find((run) => run.lens === 'security');
     expect(securityValid?.attempt).toBe(2); // retry survived the refusal
   }, 120_000);
@@ -2053,10 +2099,90 @@ describe('wave refusals never consume lens or round budget (H1)', () => {
       movementRef: 'feature/review', noSpec: false,
     });
     expect(result.canonicalVerdict).toBe('READY TO MERGE');
-    expect(result.specialistRuns).toHaveLength(7);
-    expect(h.fake.childCalls).toHaveLength(7);
+    expect(result.specialistRuns).toHaveLength(9);
+    expect(h.fake.childCalls).toHaveLength(9);
     const refusals = h.fake.toolErrors.filter((entry) => entry.error.includes('admitted wave'));
     expect(refusals.length).toBeGreaterThanOrEqual(3); // the stubborn re-issues happened
+  }, 120_000);
+
+  it('schedules seven selected lenses as 3+3+1 and nine as 3+3+3 at admitted width 3 inside one lead and frozen target', async () => {
+    const catalog = [...PERKINS_LENSES];
+    const cases: ReadonlyArray<{ selected: readonly string[]; expected: ReadonlyArray<readonly string[]> }> = [
+      { selected: catalog.slice(0, 7), expected: [catalog.slice(0, 3), catalog.slice(3, 6), catalog.slice(6, 7)] },
+      { selected: catalog, expected: [catalog.slice(0, 3), catalog.slice(3, 6), catalog.slice(6, 9)] },
+    ];
+    for (const { selected, expected } of cases) {
+      const h = waveHarness({
+        childAnswer: (prompt) => {
+          const source = /"source": "(blind|tests)"/u.exec(prompt)?.[1];
+          return source === undefined ? '[]' : JSON.stringify([groundedFinding(source, 'warning')]);
+        },
+        specialists: selected,
+      }, 3);
+      const result = await h.engine.run({
+        roundId: 'wave-refusal-round', roundNumber: 1, frozenReview: h.frozen,
+        movementRef: 'feature/review', noSpec: false,
+      });
+      expect(result.canonicalVerdict).toBe('READY TO MERGE');
+      // One lead, one frozen target: batches and retries never mint another.
+      expect(h.fake.leadCalls).toHaveLength(1);
+      expect(result.targetSha).toBe(h.frozen.manifest.targetSha);
+      expect(h.fake.childCalls).toHaveLength(selected.length);
+      expect(result.specialistRuns).toHaveLength(selected.length);
+      expect(result.specialistRuns.every((run) => run.status === 'valid' && run.attempt === 1)).toBe(true);
+      // Findings delivered by the FIRST and LAST batch survive together: a
+      // batch split is a transport detail, never a dropped or duplicated review.
+      expect(result.findings.map((finding) => finding.source).sort()).toEqual(['blind', 'tests']);
+      // Every batch is accounted in the SAME single lead receipt: no later
+      // batch or retry creates a second round or lead.
+      const receipt = JSON.parse(readFileSync(join(result.artifactDirectory, 'lead/receipt.json'), 'utf8')) as { specialistRuns: number };
+      expect(receipt.specialistRuns).toBe(selected.length);
+      expect(result.artifactDirectory).toContain('wave-refusal-round');
+      // The scripted lead opens with the schema-maximum 4-run call at an
+      // admitted wave of 3: refused before any child starts and fully
+      // restored (each lens still lands on attempt 1), then re-batched.
+      expect(h.fake.attemptedBatches[0]).toHaveLength(4);
+      expect(h.fake.toolErrors.filter((entry) => entry.error.includes('admitted wave of 3'))).toHaveLength(1);
+      expect(h.fake.runBatches).toEqual(expected.map((batch) => [...batch]));
+    }
+  }, 120_000);
+
+  it('accounts sixteen real runs and refuses an otherwise eligible seventeenth by the round cap, distinct from per-lens exhaustion', async () => {
+    const h = wholeHarness({
+      childAnswer: () => 'not json',
+      specialists: [...PERKINS_LENSES],
+      probeExhausted: 'acceptance',
+    });
+    const result = await h.run();
+    // Nine initial attempts fail, then retries interleave with the remaining
+    // first attempts; the round stops at exactly 16 accounted runs.
+    expect(h.childCalls).toHaveLength(16);
+    expect(result.specialistRuns).toHaveLength(16);
+    expect(result.specialistRuns.every((run) => run.status !== 'valid')).toBe(true);
+    expect(result.specialistRuns.every((run) => run.attempt === 1 || run.attempt === 2)).toBe(true);
+    const receipt = JSON.parse(readFileSync(join(result.artifactDirectory, 'lead/receipt.json'), 'utf8')) as { specialistRuns: number };
+    expect(receipt.specialistRuns).toBe(16);
+    // The refusal is durable coverage truth, not only a transient tool error:
+    // the result carries the refused call, the cap, and the runs accounted at
+    // refusal time so a report can disclose budget-limited coverage.
+    expect(result.budgetRefusals).toMatchObject([{ lenses: ['performance', 'operations'], cap: 16, accountedRuns: 16 }]);
+    // The refused call was otherwise per-lens eligible — performance and
+    // operations still had one attempt each — and the ROUND budget refuses
+    // it before any spawn: both keep their single recorded attempt.
+    expect(h.attemptedBatches.at(-1)).toEqual(['performance', 'operations']);
+    for (const lens of ['performance', 'operations']) {
+      expect(result.specialistRuns.filter((run) => run.lens === lens)).toHaveLength(1);
+    }
+    const roundRefusals = h.toolErrors.filter((entry) => /exceeds 16 specialist runs/.test(entry.error));
+    expect(roundRefusals).toHaveLength(1);
+    expect(roundRefusals[0]).toMatchObject({ tool: 'perkins_run_specialists' });
+    expect(roundRefusals.every((entry) => !/exhausted its attempts/.test(entry.error))).toBe(true);
+    // The per-lens cause stays distinct: an exhausted lens names itself, not
+    // the round budget, and its completed attempts remain recorded.
+    const lensRefusal = h.toolErrors.find((entry) => /specialist acceptance exhausted its attempts/.test(entry.error));
+    expect(lensRefusal).toBeDefined();
+    expect(lensRefusal?.error).not.toMatch(/exceeds 16 specialist runs/);
+    expect(result.specialistRuns.filter((run) => run.lens === 'acceptance')).toHaveLength(2);
   }, 120_000);
 });
 

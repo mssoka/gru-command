@@ -473,7 +473,7 @@ describe('dispatch server (E8)', () => {
       if (review.status !== 202) throw new Error(`review failed: ${JSON.stringify(review)}`);
       expect(review.status).toBe(202);
       expect(field<string>(review.json, 'round_id')).toBe('http-review-r1');
-      expect(field<string[]>(review.json, 'lenses')).toHaveLength(7);
+      expect(field<string[]>(review.json, 'lenses')).toHaveLength(9);
       const deadline = Date.now() + 5_000;
       while (h.ledger.getRound('http-review-r1')?.verdict !== 'approved' && Date.now() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 20));
@@ -485,7 +485,7 @@ describe('dispatch server (E8)', () => {
   });
 
 
-  it('accepts explicit no_spec=true as six lenses and rejects non-boolean no_spec', async () => {
+  it('accepts explicit no_spec=true as eight lenses and rejects non-boolean no_spec', async () => {
     const h = await boot();
     const repo = makeFixtureRepo('fixture-http-no-spec');
     cleanupRepos.push(repo);
@@ -506,7 +506,7 @@ describe('dispatch server (E8)', () => {
       }, TOKEN);
       expect(review.status).toBe(202);
       expect(field<string[]>(review.json, 'lenses')).toEqual([
-        'blind', 'edge', 'security', 'architecture', 'codebase', 'tests',
+        'blind', 'edge', 'security', 'architecture', 'codebase', 'tests', 'performance', 'operations',
       ]);
     } finally {
       await h.close();
