@@ -704,6 +704,19 @@ describe('tracked child workers: lifecycle, results and recovery', () => {
     h.close();
   });
 
+  it('records done but keeps the lane and durable cleanup debt when cessation is unproven', async () => {
+    const h = makeHarness({ failDispose: true });
+    const admission = h.request();
+    await waitForChild(h, admission.record.id, (state) => state === 'done');
+    // The successful turn's work outcome is truthful and recorded...
+    expect(h.ledger.getChildWorker(admission.record.id)!.resultSummary).toContain('child report');
+    // ...but ownership is NOT claimed clean: debt is durable and the
+    // read-only lane is not released underneath a possibly-live session.
+    expect(h.ledger.latestEventOfKind('child.cleanup-debt')).not.toBeNull();
+    expect(h.worktrees.getWorktree(admission.record.id)?.status).not.toBe('swept');
+    h.close();
+  });
+
   it('keeps an uncancelled failed run non-terminal when cessation is unproven', async () => {
     const h = makeHarness({ failDispose: true });
     h.nextVerdict = { ok: false, error: 'model refused the task' };

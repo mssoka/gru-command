@@ -913,17 +913,35 @@ export class ChildWorkerService {
         });
       }
       const terminal = this.opts.ledger.getChildWorker(record.id)?.resultState !== null;
+      // A terminal result with UNPROVEN cessation is still durable cleanup
+      // debt: the work outcome is recorded (a successful turn is a
+      // successful turn), but the process/lane ownership is not claimed
+      // clean. Visible, retriable, never silently dropped.
+      if (terminal && !ceased && handle !== null) {
+        this.opts.ledger.appendCustomEvent({
+          kind: 'child.cleanup-debt',
+          agentId: handle.id,
+          jobId: record.jobId,
+          payload: {
+            childId: record.id,
+            health: safeHealthState(handle),
+            note: 'terminal result recorded, but the session did not prove cessation — permit retained as debt and the lane is not released',
+          },
+        });
+      }
       if (terminal) this.live.delete(record.id);
       else if (handle !== null) run.handle = handle; // stop debt: keep the handle for a proof-aware retry
       // Read-only children leave nothing behind: their detached lane is
-      // swept once the run is terminal. A child whose turn was never
-      // delivered (fenced, cancelled or aborted before the prompt) has no
-      // deliverables either, whatever its authority. Writer children that
-      // actually delivered keep their lane (branch deliverables) — release
-      // stays an explicit owner action. An UNPROVEN stop never releases:
-      // the session may still own the checkout.
+      // swept once the run is terminal AND cessation is proven. A child
+      // whose turn was never delivered (fenced, cancelled or aborted
+      // before the prompt) has no deliverables either, whatever its
+      // authority. Writer children that actually delivered keep their lane
+      // (branch deliverables) — release stays an explicit owner action. An
+      // UNPROVEN stop never releases the checkout: the session may still
+      // own it.
       if (
         lane !== null &&
+        ceased &&
         (record.authority === 'read-only' || !delivered) &&
         this.opts.ledger.getChildWorker(record.id)?.resultState !== null
       ) {
