@@ -2,7 +2,6 @@ import { describe, expect, it } from 'vitest';
 import type { BoardSnapshot, JobView, PipelineEntryView } from './board-protocol.js';
 import {
   boardSections,
-  inFlightWindow,
   pipelineStateLabel,
   pipelineStateTone,
   pipelineWindow,
