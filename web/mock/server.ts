@@ -197,7 +197,62 @@ function scriptedReply(socket: WebSocket, userText: string, attachments?: readon
  */
 const LENSES = ['blind', 'edge', 'acceptance', 'security', 'architecture', 'codebase', 'tests'] as const;
 
+/** Board fixture mode (tests only): the default sample board, or a variant
+ * with no live machine rows and no needs-you job causes so the empty
+ * NEEDS GRU clear state is assertable in both themes. /__reset restores. */
+type BoardMode = 'default' | 'clear-needs-you';
+let boardMode: BoardMode = 'default';
+
+/** A stamp 20 minutes ago, clamped to stay inside the current LOCAL day:
+ * the merged-receipt fixture must keep bucketing SETTLED even when the
+ * mock boots just after midnight (the rolling-window pins depend on it). */
+function mergedReceiptStamp(): string {
+  const startOfToday = new Date();
+  startOfToday.setHours(0, 0, 0, 0);
+  // Never in the future: just after local midnight the 20-minute lookback
+  // crosses yesterday, so the clamp to today+60s would run ahead of
+  // Date.now() and skew recency ordering. Cap at now.
+  return new Date(
+    Math.min(Date.now(), Math.max(Date.now() - 20 * 60_000, startOfToday.getTime() + 60_000)),
+  ).toISOString();
+}
+
 function sampleSnapshot(): unknown {
+  const snapshot = defaultSampleSnapshot();
+  return boardMode === 'clear-needs-you' ? clearNeedsYouVariant(snapshot) : snapshot;
+}
+
+/** The clear variant: drop the live machine row, settle the needs-you
+ * causes of the two remaining fixture jobs (a failed lens and a conflicting
+ * PR), and zero the queue count — the board then renders the calm green
+ * "nothing needs Gru" state. Everything else is unchanged. */
+function clearNeedsYouVariant(snapshot: unknown): unknown {
+  const snap = snapshot as {
+    repos: Array<{ jobs: Array<Record<string, unknown>> }>;
+    notifications: Array<Record<string, unknown>>;
+    unackedActionRequired: number;
+  };
+  snap.notifications = snap.notifications.filter((row) => row.id !== 'mock-n5');
+  snap.unackedActionRequired = 0;
+  for (const repo of snap.repos) {
+    for (const job of repo.jobs) {
+      if (job.id === 'demo-api-payment-fix' && Array.isArray(job.rounds)) {
+        for (const round of job.rounds as Array<{ lenses?: Array<Record<string, unknown>> }>) {
+          for (const lens of round.lenses ?? []) {
+            if (lens.state === 'error') {
+              lens.state = 'done';
+              lens.note = null;
+            }
+          }
+        }
+      }
+      if (job.id === 'demo-api-conflict-probe') job.prState = 'open';
+    }
+  }
+  return snap;
+}
+
+function defaultSampleSnapshot(): unknown {
   return {
     repos: [
       {
@@ -265,6 +320,48 @@ function sampleSnapshot(): unknown {
             lastAgentActivity: null,
           },
           {
+            // Section truth: a merged lane with a leftover unacked
+            // escalation row is a closed receipt — SETTLED, never NEEDS
+            // YOU, and the unacked chip does not count it.
+            id: 'demo-api-merged-leftover',
+            repo: 'demo-api',
+            title: 'Rotate the staging tokens',
+            status: 'merged',
+            updatedAt: mergedReceiptStamp(),
+            prUrl: 'https://example.invalid/pr/41',
+            prState: 'merged',
+            baseBranch: 'main',
+            note: 'merged — the leftover escalation row is a closed receipt, not live work',
+            rounds: [],
+            lane: null,
+            lastAgentActivity: null,
+          },
+          {
+            // Stopped-worker truth: the supervisor walled this lane on a
+            // provider quota — it waits with its reason, it is not "working".
+            id: 'demo-api-quota-walled',
+            repo: 'demo-api',
+            title: 'Migrate the search index',
+            status: 'working',
+            updatedAt: new Date(Date.now() - 12 * 60_000).toISOString(),
+            prUrl: null,
+            prState: null,
+            baseBranch: 'main',
+            note: 'worker stopped by supervision — waiting on provider',
+            rounds: [],
+            lane: {
+              branch: 'gru/demo-api-quota-walled',
+              sha: 'ccc3333ddd4444',
+              status: 'active',
+              createdAt: new Date(Date.now() - 40 * 60_000).toISOString(),
+            },
+            // Backdated past the 30-minute stall window so the e2e's 'not
+            // COLD' assertion actually exercises the stop exemption: the
+            // lane is IN FLIGHT only because its stopped worker is waiting
+            // on a re-arm, not because its stamp is fresh (review B4).
+            lastAgentActivity: new Date(Date.now() - 45 * 60_000).toISOString(),
+          },
+          {
             id: 'demo-api-conflict-probe',
             repo: 'demo-api',
             title: 'Merge main into the retry branch',
@@ -330,8 +427,9 @@ function sampleSnapshot(): unknown {
             lane: null,
             lastAgentActivity: null,
           },
-          // v5 rolling window: 12 settled jobs total (hero + 11 older), so
-          // the mock renders 10 cards + a "+2 older settled" footer.
+          // v5 rolling window: 13 settled jobs total (hero + 11 older + the
+          // merged demo-api receipt), so the mock renders 10 cards + a
+          // "+3 older settled" footer (the e2e pins both).
           ...Array.from({ length: 11 }, (_, index) => ({
             id: `sample-site-settled-${index + 1}`,
             repo: 'sample-site',
@@ -350,20 +448,27 @@ function sampleSnapshot(): unknown {
       },
     ],
     agents: [
-      { id: 'mock-gru', role: 'gru', label: 'gru · chat', state: 'idle', lastActivity: new Date().toISOString(), sessionFile: 'gru/--demo--aa111111/mock-session.jsonl', jobId: null, roundId: null, supervision: { state: 'watching', restarts: 0, breakerOpen: false } },
-      { id: 'mock-silas', role: 'silas', label: 'silas · ops', state: 'streaming', lastActivity: new Date(Date.now() - 12_000).toISOString(), sessionFile: null, jobId: null, roundId: null, supervision: { state: 'watching', restarts: 1, breakerOpen: false } },
-      { id: 'mock-lens-blind', role: 'perkins', label: 'blind:001', state: 'idle', lastActivity: new Date(Date.now() - 300_000).toISOString(), sessionFile: null, jobId: null, roundId: 'demo-api-payment-fix-r2', supervision: null },
-      { id: 'mock-minion', role: 'minion', label: 'demo-api-payment-fix', state: 'idle', lastActivity: null, sessionFile: null, jobId: 'demo-api-payment-fix', roundId: null, supervision: { state: 'stopped', restarts: 3, breakerOpen: true } },
-      { id: 'mock-bob', role: 'bob', label: 'bob · memory', state: 'idle', lastActivity: null, sessionFile: null, jobId: null, roundId: null, supervision: null },
-      { id: 'mock-gru-old', role: 'gru', label: 'gru · chat (retired)', state: 'disposed', lastActivity: new Date(Date.now() - 7_200_000).toISOString(), sessionFile: null, jobId: null, roundId: null, supervision: null },
+      { id: 'mock-gru', role: 'gru', label: 'gru · chat', state: 'idle', lastActivity: new Date().toISOString(), createdAt: new Date(Date.now() - 3_600_000).toISOString(), sessionFile: 'gru/--demo--aa111111/mock-session.jsonl', jobId: null, roundId: null, supervision: { state: 'watching', restarts: 0, breakerOpen: false } },
+      { id: 'mock-silas', role: 'silas', label: 'silas · ops', state: 'streaming', lastActivity: new Date(Date.now() - 12_000).toISOString(), createdAt: new Date(Date.now() - 900_000).toISOString(), sessionFile: null, jobId: null, roundId: null, supervision: { state: 'watching', restarts: 1, breakerOpen: false } },
+      { id: 'mock-lens-blind', role: 'perkins', label: 'blind:001', state: 'idle', lastActivity: new Date(Date.now() - 300_000).toISOString(), createdAt: new Date(Date.now() - 600_000).toISOString(), sessionFile: null, jobId: null, roundId: 'demo-api-payment-fix-r2', supervision: null },
+      { id: 'mock-minion', role: 'minion', label: 'demo-api-payment-fix', state: 'idle', lastActivity: null, createdAt: new Date(Date.now() - 3_600_000).toISOString(), sessionFile: null, jobId: 'demo-api-payment-fix', roundId: null, supervision: { state: 'stopped', restarts: 3, breakerOpen: true, stopReason: 'crash loop' } },
+      { id: 'mock-minion-quota', role: 'minion', label: 'demo-api-quota-walled', state: 'idle', lastActivity: new Date(Date.now() - 45 * 60_000).toISOString(), createdAt: new Date(Date.now() - 1_800_000).toISOString(), sessionFile: null, jobId: 'demo-api-quota-walled', roundId: null, supervision: { state: 'stopped', restarts: 2, breakerOpen: true, stopReason: 'quota_wall' } },
+      { id: 'mock-minion-merged', role: 'minion', label: 'demo-api-merged-leftover', state: 'idle', lastActivity: null, createdAt: new Date(Date.now() - 1_800_000).toISOString(), sessionFile: null, jobId: 'demo-api-merged-leftover', roundId: null, supervision: { state: 'watching', restarts: 0, breakerOpen: false, stopReason: null } },
+      { id: 'mock-bob', role: 'bob', label: 'bob · memory', state: 'idle', lastActivity: null, createdAt: new Date(Date.now() - 5_400_000).toISOString(), sessionFile: null, jobId: null, roundId: null, supervision: null },
+      { id: 'mock-gru-old', role: 'gru', label: 'gru · chat (retired)', state: 'disposed', lastActivity: new Date(Date.now() - 7_200_000).toISOString(), createdAt: new Date(Date.now() - 10_800_000).toISOString(), sessionFile: null, jobId: null, roundId: null, supervision: null },
     ],
     notifications: [
       { id: 'mock-n1', ts: new Date().toISOString(), kind: 'job.status', routing: 'fyi', severity: 'error', title: 'Job demo-api-payment-fix blocked', detail: 'waiting on the base sync', agentId: null, shownAt: null, ackedAt: null, resolvedAt: null, resolvedBy: null },
       { id: 'mock-n2', ts: new Date(Date.now() - 120_000).toISOString(), kind: 'round.verdict', routing: 'fyi', severity: 'info', title: 'Round r1 verdict', detail: 'approved', agentId: null, shownAt: new Date().toISOString(), ackedAt: new Date().toISOString(), resolvedAt: null, resolvedBy: null },
-      // Needs-owner stops (ack re-arms supervision) ring the FOR YOU band.
+      // Needs-owner stops (ack re-arms supervision) ring the FOR YOU band / bell.
       { id: 'mock-n3', ts: new Date(Date.now() - 240_000).toISOString(), kind: 'supervision.breaker', routing: 'needs-owner', severity: 'error', title: 'Crash-loop breaker tripped: agent mock-minion stopped', detail: '3 restarts within 600s. The agent is STOPPED — ack this notification to re-arm supervision and resume.', agentId: 'mock-minion', shownAt: new Date().toISOString(), ackedAt: null, resolvedAt: null, resolvedBy: null },
-      // Machine attention lives in the self-clearing NEEDS GRU queue.
-      { id: 'mock-n4', ts: new Date(Date.now() - 300_000).toISOString(), kind: 'review-escalation', routing: 'action-required', severity: 'error', title: 'Review round demo-api-payment-fix-r1 is INCOMPLETE', detail: 'lead session aborted — the lane can be re-armed', agentId: null, shownAt: null, ackedAt: null, resolvedAt: null, resolvedBy: null },
+      // Provider-wall stops are owner-held too: resolve the provider, then ack to re-arm.
+      { id: 'mock-n4', ts: new Date(Date.now() - 900_000).toISOString(), kind: 'supervision.provider-wall.demo-api-quota-walled.quota_wall', routing: 'needs-owner', severity: 'error', title: 'Agent mock-minion-quota stopped: quota wall', detail: 'Blind restart is withheld. Resolve the provider condition, then ack to re-arm the deterministic restart ladder.', agentId: 'mock-minion-quota', shownAt: new Date().toISOString(), ackedAt: null, resolvedAt: null, resolvedBy: null },
+      // Machine attention lives in the self-clearing NEEDS GRU queue — a live global row keeps the tracker legible.
+      { id: 'mock-n5', ts: new Date(Date.now() - 300_000).toISOString(), kind: 'review-escalation', routing: 'action-required', severity: 'error', title: 'Review round demo-api-payment-fix-r1 is INCOMPLETE', detail: 'lead session aborted — the lane can be re-armed', agentId: null, shownAt: null, ackedAt: null, resolvedAt: null, resolvedBy: null },
+      // Section truth: a leftover MACHINE row bound to the merged lane is a
+      // closed receipt — the record keeps it, the live count does not.
+      { id: 'mock-n6', ts: new Date(Date.now() - 2_400_000).toISOString(), kind: 'review-escalation', routing: 'action-required', severity: 'error', title: 'Leftover machine escalation on the merged lane', detail: 'The lane merged anyway. Closed receipt: kept for the record, never live queue.', agentId: 'mock-minion-merged', shownAt: new Date().toISOString(), ackedAt: null, resolvedAt: null, resolvedBy: null },
     ],
     decisions: {
       enabled: true,
@@ -377,8 +482,13 @@ function sampleSnapshot(): unknown {
       incarnation: 'mock-incarnation',
       generation: 1,
     },
+    // LIVE machine rows only: the global review escalation (n5) counts;
+    // the merged lane's leftover n6 is a closed receipt — the record keeps
+    // it, this count (and NEEDS GRU) does not.
     unackedActionRequired: 1,
-    unackedNeedsOwner: 1,
+    // Owner stops ring the bell (FOR YOU): the crash-loop stop and the
+    // provider-wall stop await the owner's ack.
+    unackedNeedsOwner: 2,
     // FOR YOU (owner approval 2026-09-28): one evidence-bound ready PR.
     // Generic sample data only — the readiness story is exact-head
     // (approved round + clean + green CI at the same sha); the row's
@@ -717,6 +827,30 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
     res.end('{"ok":true}\n');
     return;
   }
+  if (req.method === 'POST' && req.url === '/__board-mode') {
+    if (req.headers.authorization !== `Bearer ${TOKEN}`) {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.end('{"error":"unauthorized"}\n');
+      return;
+    }
+    let body = '';
+    req.on('data', (chunk: Buffer) => {
+      body += chunk.toString('utf-8');
+    });
+    req.on('end', () => {
+      try {
+        const parsed = JSON.parse(body) as { mode?: string };
+        if (parsed.mode !== 'default' && parsed.mode !== 'clear-needs-you') throw new Error('bad mode');
+        boardMode = parsed.mode;
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end('{"ok":true}\n');
+      } catch {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end('{"error":"mode must be default|clear-needs-you"}\n');
+      }
+    });
+    return;
+  }
   if (req.method === 'POST' && req.url === '/__stress') {
     if (req.headers.authorization !== `Bearer ${TOKEN}`) {
       res.writeHead(401, { 'content-type': 'application/json' });
@@ -763,6 +897,7 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
     releaseHeldTurn = null;
     stressTool = null;
     stressError = null;
+    boardMode = 'default';
     compactGeneration += 1;
     newChatGeneration += 1;
     deferredUsers.length = 0;

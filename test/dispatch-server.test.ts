@@ -242,6 +242,18 @@ function field<T>(json: unknown, key: string): T {
   return (json as Record<string, unknown>)[key] as T;
 }
 
+/** Wait for the dispatched minion's briefing turn to settle on the record
+ * before a PR/review request reads the lane: the review freeze reads the
+ * pushed origin tip, which only exists after the turn. Deadline keeps the
+ * failure honest (no unbounded wait), matching the file's other cases. */
+async function waitForDelivery(h: ServerHarness, jobId: string): Promise<void> {
+  const deadline = Date.now() + 10_000;
+  while (h.ledger.latestJobEvent(jobId, 'job.delivered') === null && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).not.toBeNull();
+}
+
 /** The directive endpoint now records durable intent first and answers 202:
  * the async turn settles on the request record — poll it deterministically
  * (no wall-clock sleeps in the assertions themselves). */
@@ -659,7 +671,7 @@ describe('dispatch server (E8)', () => {
       await call(h.port, 'POST', '/api/dispatch', {
         job_id: 'by-silas-job', repo_path: repo.path, title: 'attribution', briefing: 'b',
       }, TOKEN);
-      await vi.waitFor(() => expect(h.ledger.latestJobEvent('by-silas-job', 'job.delivered')).not.toBeNull(), { timeout: 10_000 });
+      await waitForDelivery(h, 'by-silas-job');
       const pr = await call(h.port, 'POST', '/api/dispatch/pr', {
         job_id: 'by-silas-job', url: PR_URL, by: 'silas',
       }, TOKEN);
@@ -679,6 +691,10 @@ describe('dispatch server (E8)', () => {
   });
 
   it('without by, the pr/review endpoints record no silas attribution events', async () => {
+    // One scenario per case: the combined form ran two complete review
+    // setups under one inherited 30s default and overran it under
+    // co-tenant load. This arm proves the absence on a fully processed
+    // request (PR 200, review 202), never on a silently failed call.
     const h = await boot();
     const repo = makeFixtureRepo('fixture-silas-none');
     cleanupRepos.push(repo);
@@ -687,9 +703,11 @@ describe('dispatch server (E8)', () => {
       await call(h.port, 'POST', '/api/dispatch', {
         job_id: 'by-none-job', repo_path: repo.path, title: 'plain', briefing: 'b',
       }, TOKEN);
-      await vi.waitFor(() => expect(h.ledger.latestJobEvent('by-none-job', 'job.delivered')).not.toBeNull(), { timeout: 10_000 });
-      expect((await call(h.port, 'POST', '/api/dispatch/pr', { job_id: 'by-none-job', url: PR_URL }, TOKEN)).status).toBe(200);
-      expect((await call(h.port, 'POST', '/api/dispatch/review', { job_id: 'by-none-job' }, TOKEN)).status).toBe(202);
+      await waitForDelivery(h, 'by-none-job');
+      const pr = await call(h.port, 'POST', '/api/dispatch/pr', { job_id: 'by-none-job', url: PR_URL }, TOKEN);
+      expect(pr.status).toBe(200);
+      const review = await call(h.port, 'POST', '/api/dispatch/review', { job_id: 'by-none-job' }, TOKEN);
+      expect(review.status).toBe(202);
       const plainKinds = h.ledger.listJobEvents('by-none-job').map((event) => event.kind);
       expect(plainKinds).not.toContain('silas.pr-registered');
       expect(plainKinds).not.toContain('silas.review-triggered');
@@ -1771,6 +1789,9 @@ describe('dispatch server (E8)', () => {
     const h = await boot();
     try {
       h.ledger.addJob({ id: 'esc-job', repo: 'r', title: 't', briefing: 'b' });
+      // The lane's bound minion is the existing agentId binding the row
+      // carries (tracked-review A4): validated job + actual identity.
+      h.ledger.registerAgent({ id: 'esc-minion', role: 'minion', jobId: 'esc-job' });
       const res = await call(h.port, 'POST', '/api/silas/escalate', {
         title: 'Same blocker recurred past the ladder',
         detail: 'job esc-job: fingerprint correctness::src/a.ts::null deref, 4 consecutive rounds',
@@ -1784,6 +1805,14 @@ describe('dispatch server (E8)', () => {
       const notification = h.ledger.listNotifications().find((row) => row.id === notificationId);
       expect(notification?.routing).toBe('action-required');
       expect(notification?.severity).toBe('error');
+      expect(notification?.agentId).toBe('esc-minion');
+      // A job-less escalation stays unbound (never guessed).
+      const noJob = await call(h.port, 'POST', '/api/silas/escalate', { title: 'no lane' }, TOKEN);
+      expect(noJob.status).toBe(200);
+      const noJobNotification = h.ledger
+        .listNotifications()
+        .find((row) => row.id === field<string>(noJob.json, 'notification_id'));
+      expect(noJobNotification?.agentId).toBeNull();
       // unknown job id fails loud; empty title fails loud
       const unknown = await call(h.port, 'POST', '/api/silas/escalate', { title: 'x', job_id: 'nope' }, TOKEN);
       expect(unknown.status).toBe(400);

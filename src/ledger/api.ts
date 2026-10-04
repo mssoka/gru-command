@@ -14,6 +14,7 @@ import {
   isObligationState,
   isRoundStatus,
   isRoundVerdict,
+  TERMINAL_JOB_STATUSES,
   type JobStatus,
   type LensState,
   type ObligationState,
@@ -1401,6 +1402,55 @@ export class LedgerApi {
     });
   }
 
+  /**
+   * Durable supervision stop truth for restart hydration (code review
+   * 2026-10-04): the latest supervision lifecycle event per agent, kept
+   * only when that latest event is a STOP. A re-arm event clears the stop,
+   * so an acked/re-armed agent never reads stopped after a restart.
+   */
+  durableSupervisionStops(): Map<
+    string,
+    { readonly role: Role; readonly reason: string | null; readonly restarts: number }
+  > {
+    const rows = this.db
+      .prepare(
+        `SELECT e.agent_id AS agent_id, a.role AS role, e.kind AS kind, e.payload AS payload
+           FROM events e
+           JOIN (
+             SELECT agent_id, MAX(seq) AS seq
+               FROM events
+              WHERE agent_id IS NOT NULL
+                AND kind IN ('supervision.escalated', 'supervision.breaker', 'supervision.rearmed')
+              GROUP BY agent_id
+           ) latest ON latest.agent_id = e.agent_id AND latest.seq = e.seq
+           JOIN agents a ON a.id = e.agent_id
+          WHERE e.kind IN ('supervision.escalated', 'supervision.breaker')`,
+      )
+      .all() as Array<{ agent_id: string; role: Role; payload: string }>;
+    const stops = new Map<string, { role: Role; reason: string | null; restarts: number }>();
+    for (const row of rows) {
+      let payload: Record<string, unknown> = {};
+      try {
+        payload = JSON.parse(row.payload) as Record<string, unknown>;
+      } catch {
+        // A malformed payload still yields a cause-less stop: the presence
+        // of the stop event is the authoritative fact.
+      }
+      const reason =
+        typeof payload['class'] === 'string'
+          ? payload['class']
+          : typeof payload['reason'] === 'string'
+            ? payload['reason']
+            : null;
+      const restarts =
+        typeof payload['restarts'] === 'number' && Number.isFinite(payload['restarts'])
+          ? payload['restarts']
+          : 0;
+      stops.set(row.agent_id, { role: row.role, reason, restarts });
+    }
+    return stops;
+  }
+
   /** Attach a live agent to its job lane (E8 dispatch wiring; the spawn
    * envelope carries no job context — this is the one call that binds).
    * (Superseded in the dispatch path by registerAgent-with-jobId, which
@@ -2211,15 +2261,43 @@ export class LedgerApi {
   }
 
   /** Count action-required notifications still awaiting a machine
-   * disposition — the NEEDS GRU queue (self-clearing; the human bell is
-   * not rung by these). Read straight from the TABLE — not the bounded
-   * feed window — so the tracker stays true. */
-  countPendingActionRequired(): number {
+   * disposition, INCLUDING terminal-bound closed receipts. Read straight
+   * from the TABLE — not the bounded feed window. Receipts belong to the
+   * record and the bell; the live NEEDS GRU queue is
+   * `countLivePendingActionRequired` — prefer that one for anything the
+   * board renders as live work. This accessor is DIAGNOSTIC/TEST-ONLY
+   * (the durable receipt record); production paths should use the live
+   * count or `listNotifications` directly. */
+  countPendingActionRequiredIncludingReceipts(): number {
     const row = this.db
       .prepare(
         "SELECT COUNT(*) AS n FROM notifications WHERE routing = 'action-required' AND acked_at IS NULL AND resolved_at IS NULL",
       )
       .get() as Row;
+    return Number(row.n);
+  }
+
+  /** The LIVE form of the count above: unacked action-required rows whose
+   * agent binding does NOT belong to a terminal (merged/done) job. A row
+   * bound to a terminal job is a closed receipt — the record keeps it
+   * (nothing is acked or resolved here), but it is not live Gru work, so
+   * the queue count does not count it. Rows with no agent binding stay
+   * global (no job → cannot be terminal). Same table-read discipline as
+   * `countPendingActionRequiredIncludingReceipts` — never the feed window.
+   * The terminal statuses derive from `TERMINAL_JOB_STATUSES` so this SQL
+   * can never drift from `isJobTerminal`. */
+  countLivePendingActionRequired(): number {
+    const terminalPlaceholders = TERMINAL_JOB_STATUSES.map(() => '?').join(', ');
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM notifications
+         WHERE routing = 'action-required' AND acked_at IS NULL AND resolved_at IS NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM agents JOIN jobs ON agents.job_id = jobs.id
+             WHERE agents.id = notifications.agent_id AND jobs.status IN (${terminalPlaceholders})
+           )`,
+      )
+      .get(...TERMINAL_JOB_STATUSES) as Row;
     return Number(row.n);
   }
 

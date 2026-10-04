@@ -14,6 +14,7 @@ import {
   WaveRunner,
   hostDisclosureAppendix,
   redactReviewForPublication,
+  type EscalationContext,
   type FallbackGateOutcome,
   type VerdictPoster,
   type WaveOutcome,
@@ -24,6 +25,14 @@ import { configPathFor, loadConfig } from '../src/config.js';
 import { RuntimeRegistry } from '../src/runtime/registry.js';
 import { SessionStore } from '../src/sessions/store.js';
 import type { PrHeadProbe } from '../src/dispatch/perkins-review/fresh-head.js';
+import { BoardEngine } from '../src/board/engine.js';
+import { createReviewEscalationNotifier } from '../src/dispatch/escalation-identity.js';
+import { NotificationCenter } from '../src/notifications/center.js';
+import {
+  isValidSnapshot,
+  type BoardSnapshot as WireBoardSnapshot,
+} from '../web/src/lib/board-protocol.js';
+import { terminalBoundNotificationIds } from '../web/src/lib/board-signals.js';
 
 /** These suites exercise the Perkins route (no pre-flight configured), so
  * every runRound result must be a wave outcome; the helper pins that. */
@@ -714,12 +723,16 @@ describe('WaveRunner built-in Perkins production path', () => {
     ledger.setRoundStatus(round.id, 'live');
     ledger.markLensLive(round.id, 'blind');
     const escalations: string[] = [];
+    const escalationContexts: (EscalationContext | undefined)[] = [];
     const wave = new WaveRunner({
       ledger,
       worktrees: port,
       spawner: vi.fn() as unknown as AgentSpawner,
       reviewArtifactRoot: artifacts,
-      escalate: (title) => escalations.push(title),
+      escalate: (title, _detail, context) => {
+        escalations.push(title);
+        escalationContexts.push(context);
+      },
     });
     expect(await wave.recoverInterruptedRounds()).toBe(1);
     expect(ledger.getRound(round.id)?.status).toBe('aborted');
@@ -728,6 +741,38 @@ describe('WaveRunner built-in Perkins production path', () => {
     expect(existsSync(join(artifacts, round.id, 'restart-recovery.json'))).toBe(true);
     expect(existsSync(join(artifacts, round.id, 'perkins-report.md'))).toBe(true);
     expect(escalations[0]).toContain('INCOMPLETE');
+    // Producer context: the recovery escalation carries its validated
+    // round/job identity for the notification binding (followup A4).
+    expect(escalationContexts[0]).toEqual({ jobId: 'job-restart', roundId: round.id });
+    // V1 chain: the REAL producer context above — not a handcrafted one —
+    // flows through the notifier into a live row, and the lane
+    // terminalizing reclassifies that emitted row as a closed receipt on
+    // BOTH surfaces (the ledger's live chip count and the board's
+    // terminal-bound set the bell renders from).
+    ledger.registerAgent({ id: 'minion-restart-receipt', role: 'minion', jobId: job.id });
+    const chainCenter = new NotificationCenter({ ledger, bus: new EventBus() });
+    const liveBefore = ledger.countLivePendingActionRequired();
+    const receiptsBefore = ledger.countPendingActionRequiredIncludingReceipts();
+    createReviewEscalationNotifier(ledger, chainCenter)(
+      'chain: Review round INCOMPLETE',
+      'chain detail',
+      escalationContexts[0],
+    );
+    const chainRow = ledger
+      .listNotifications({ limit: 100 })
+      .find((row) => row.kind === 'review-escalation' && row.title === 'chain: Review round INCOMPLETE');
+    expect(chainRow?.agentId).toBe('minion-restart-receipt');
+    expect(ledger.countLivePendingActionRequired()).toBe(liveBefore + 1);
+    ledger.setJobStatus(job.id, 'merged');
+    expect(ledger.countLivePendingActionRequired()).toBe(liveBefore);
+    expect(ledger.countPendingActionRequiredIncludingReceipts()).toBe(receiptsBefore + 1);
+    // The engine's server-side snapshot and the web's wire type are
+    // separate namespaces: cross them the way the wire does — serialize,
+    // validate with the web parser, then classify. A shape drift fails the
+    // validator here instead of silently changing the board's truth.
+    const wireValue: unknown = JSON.parse(JSON.stringify(new BoardEngine({ ledger, bus: new EventBus() }).snapshot()));
+    expect(isValidSnapshot(wireValue)).toBe(true);
+    expect(terminalBoundNotificationIds(wireValue as WireBoardSnapshot)).toContain(chainRow?.id);
     rmSync(root, { recursive: true, force: true });
     rmSync(artifacts, { recursive: true, force: true });
   });
@@ -2065,10 +2110,14 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
       });
     });
     const escalations: string[] = [];
+    const escalationContexts: (EscalationContext | undefined)[] = [];
     const movedWave = new WaveRunner({
       ledger: moved.ledger, worktrees: moved.port, spawner: makeSpawner(moved.sessions, [], () => t4Attr('moved', 'wave/lead-start', 'end', { outcome: 'completed', note: 'native lead child start on the original production path' }), undefined, '  return 44;'),
       poster: { post, reconcile }, reviewArtifactRoot: moved.artifacts,
-      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      escalate: (title, detail, context) => {
+        escalations.push(`${title}: ${detail}`);
+        escalationContexts.push(context);
+      },
       prHeadProbe: t4Probe('moved', 'feature/t4-moved'),
     });
     const movedOutcome = asWave(await t4Timed('moved', 'wave-round', () => movedWave.runRound({ jobId: moved.job.id })));
@@ -2076,6 +2125,13 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     expect(movedOutcome.verdict).toBeNull();
     expect(movedOutcome.canonicalVerdict).toBe('INCOMPLETE');
     expect(escalations.some((line) => line.includes('reconciled a provider review but did NOT record it'))).toBe(true);
+    // Producer context: the reconciled-unrecorded escalation carries its
+    // validated round/job identity for the notification binding (A4).
+    expect(
+      escalationContexts.some(
+        (context) => context?.jobId === moved.job.id && context.roundId === movedOutcome.round.id,
+      ),
+    ).toBe(true);
     const unrecorded = JSON.parse(readFileSync(join(moved.artifacts, movedOutcome.round.id, 'perkins-report.reconciled-unrecorded.json'), 'utf8')) as { recorded?: boolean; reason?: string; receipt?: { reviewId?: string } };
     expect(unrecorded.recorded).toBe(false);
     expect(unrecorded.reason).toContain('moved while the reconciliation lookup was outstanding');
