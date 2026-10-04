@@ -33,6 +33,7 @@ import {
 } from '../src/dispatch/github-poll.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
+import { renderRecordedCiEvidence } from '../src/review-inputs/ci-evidence.js';
 
 /**
  * GitHub signal ingestion, POLL-ONLY (owner ruling 2026-09-23):
@@ -662,6 +663,48 @@ describe('github signal poll tick', () => {
       expect(eventCount(h.ledger, 'job-green', 'github.ci-green')).toBe(firstCounts.greenEvents);
       expect(eventCount(h.ledger, 'job-conflict', BRANCH_STATE_EVENT)).toBe(firstCounts.cursorEvents);
       expect(notifications.posts).toHaveLength(firstCounts.posts);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('carries polled check-run URLs into the recorded event and the frozen CI receipt', async () => {
+    const h = makeLedger();
+    try {
+      addTrackedJob(h.ledger, 'job-runs', 'https://github.com/acme/app/pull/50');
+      const api = new FakeGhApi();
+      api.pulls.set('acme/app', [pull({ number: 50, headRef: 'gru/job-runs', headSha: 'sha-50' })]);
+      api.details.set('acme/app#50', pull({ number: 50, headRef: 'gru/job-runs', headSha: 'sha-50', mergeableState: 'clean' }));
+      api.checks.set('acme/app@sha-50', [{
+        name: 'Full suite (Node 22)',
+        status: 'completed',
+        conclusion: 'success',
+        url: 'https://github.com/acme/app/actions/runs/37084763772',
+      }]);
+      const poll = makePoll({ ledger: h.ledger, api });
+      await poll.pollOnce();
+      const green = h.ledger.latestJobEvent('job-runs', 'github.ci-green');
+      expect(green).not.toBeNull();
+      expect((green!.payload as { runs?: Array<{ name: string; url: string }> }).runs).toEqual([
+        { name: 'Full suite (Node 22)', url: 'https://github.com/acme/app/actions/runs/37084763772' },
+      ]);
+      // The cursor round-trip keeps the run identity too, so later ticks and
+      // carried-forward states do not silently drop the URL.
+      expect(readBranchState(h.ledger, 'job-runs')?.ci?.runs).toEqual([
+        { name: 'Full suite (Node 22)', url: 'https://github.com/acme/app/actions/runs/37084763772' },
+      ]);
+      const receipt = renderRecordedCiEvidence({
+        events: {
+          branchState: h.ledger.latestJobEvent('job-runs', BRANCH_STATE_EVENT),
+          ciGreen: green,
+          ciFailed: null,
+        },
+        targetSha: 'sha-50',
+        expectedRepo: 'acme/app',
+        expectedPr: 50,
+      });
+      expect(receipt.record.state).toBe('green');
+      expect(receipt.block).toContain('https://github.com/acme/app/actions/runs/37084763772');
     } finally {
       h.cleanup();
     }

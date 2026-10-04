@@ -3,11 +3,35 @@ import { createHash } from 'node:crypto';
 import { existsSync, linkSync, lstatSync, mkdirSync, realpathSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { BranchIdleTag } from '../branch-idle.js';
+import type { CiEvidenceRecord } from '../../review-inputs/ci-evidence.js';
+import {
+  freezeEvidenceAttachments,
+  type FrozenEvidenceAttachment,
+  type FrozenEvidenceRuntimeAttachment,
+  type ReviewEvidenceRequest,
+} from '../../review-inputs/evidence.js';
 
 const GIT_MAX_BUFFER = 128 * 1024 * 1024;
 export const FROZEN_DIFF_MAX_BYTES = 8 * 1024 * 1024;
 export const FROZEN_SPEC_MAX_BYTES = 256 * 1024;
 export const FROZEN_CONVENTIONS_MAX_BYTES = 256 * 1024;
+
+export interface FrozenAcceptance {
+  readonly version: number;
+  /** sha256 of the original briefing bytes ('' when none was recorded). */
+  readonly baseSha256: string;
+  /** sha256 of the frozen effective acceptance text. */
+  readonly contractSha256: string;
+  readonly amendmentIds: readonly string[];
+}
+
+export interface FrozenReviewEvidenceManifest {
+  /** Frozen attachment metadata (round-relative paths, no bytes). */
+  readonly attachments: readonly FrozenEvidenceAttachment[];
+  /** The exact-target CI record as bound at freeze, or null when none was
+   * requested/recorded. Historical: late results never rewrite it. */
+  readonly ci: CiEvidenceRecord | null;
+}
 
 export interface FrozenReviewInputs {
   readonly schemaVersion: 1;
@@ -25,6 +49,12 @@ export interface FrozenReviewInputs {
   readonly createdAt: string;
   /** Changed file paths of the frozen diff (the whole-PR review unit). */
   readonly changedFiles: readonly string[];
+  /** Effective acceptance binding: which contract version/hashes and which
+   * amendment ids the frozen spec was rendered from. Present for supplied
+   * specs (version 0 = original briefing only). */
+  readonly acceptance?: FrozenAcceptance;
+  /** Private frozen evidence + exact-target CI, when any was supplied. */
+  readonly reviewEvidence?: FrozenReviewEvidenceManifest;
   /** Present only for a `force: true` arm: the branch-idle blockers the
    * override bypassed (the audit tag for a forced round). */
   readonly branchIdle?: BranchIdleTag;
@@ -43,6 +73,22 @@ export interface FreezeReviewInput {
   readonly now?: () => Date;
   /** Forced-arm tag (branch-idle override) recorded in the manifest. */
   readonly branchIdle?: BranchIdleTag;
+  /** Owning job id, recorded in the private evidence receipt when known. */
+  readonly jobId?: string;
+  /** Effective-contract binding: the exact contract text the supplied spec
+   * starts with, plus its version/hashes/provenance ids. */
+  readonly acceptance?: {
+    readonly contractText: string;
+    readonly version: number;
+    readonly baseSha256: string;
+    readonly amendmentIds: readonly string[];
+  };
+  /** Authorized private evidence attachments to freeze this round. */
+  readonly evidence?: readonly ReviewEvidenceRequest[];
+  /** The configured service uploads dir (required when evidence is present). */
+  readonly evidenceUploadsDir?: string;
+  /** Bound exact-target CI record (from the ledger), stored in the manifest. */
+  readonly ciEvidence?: CiEvidenceRecord | null;
 }
 
 export interface FrozenReview {
@@ -53,6 +99,12 @@ export interface FrozenReview {
   readonly projectConventions: string;
   /** Changed file paths of the complete frozen diff. */
   readonly changedFiles: readonly string[];
+  /** Frozen private evidence (empty attachments when none was supplied) and
+   * the bound exact-target CI record. */
+  readonly evidence: {
+    readonly attachments: readonly FrozenEvidenceRuntimeAttachment[];
+    readonly ci: CiEvidenceRecord | null;
+  };
 }
 
 function gitRaw(repoPath: string, args: readonly string[]): string {
@@ -280,12 +332,52 @@ export function freezeReviewInputs(input: FreezeReviewInput): FrozenReview {
   const changedFiles = changedFilePaths(input.repoPath, diffBaseSha, targetSha);
   if (changedFiles.length === 0) throw new Error(`frozen review diff is empty for ${diffBaseSha}..${targetSha}`);
 
-  const specContext = input.noSpec === true ? 'EXPLICIT NO-SPEC REVIEW' : input.spec!.trimEnd();
+  const specContext = input.noSpec === true ? 'EXPLICIT NO-SPEC REVIEW' : input.spec!;
   const specBytes = `${specContext}\n`;
   const projectConventions = readConventions(input.repoPath, targetSha, changedFiles);
   assertFrozenPromptBounds({ diff, specContext, projectConventions });
+  // The effective acceptance must be the prefix the caller says it is: a
+  // mismatched binding refuses rather than freezing a spec whose provenance
+  // record would be a lie.
+  let acceptance: FrozenAcceptance | undefined;
+  if (input.acceptance !== undefined) {
+    const contractText = input.acceptance.contractText.trimEnd();
+    if (!specContext.startsWith(contractText)) {
+      throw new Error('frozen spec context does not start with the bound effective contract; refusing to freeze a mismatched acceptance');
+    }
+    acceptance = {
+      version: input.acceptance.version,
+      baseSha256: input.acceptance.baseSha256,
+      contractSha256: hash(input.acceptance.contractText),
+      amendmentIds: [...input.acceptance.amendmentIds],
+    };
+  }
   const directory = reviewArtifactDirectory(input.artifactRoot, input.roundId);
   ensureDirectoryWithoutSymlinks(directory);
+  // Private review evidence freezes FIRST (all requests validate before any
+  // byte is published): a refused intake leaves the round directory without
+  // partial evidence a later reader could mistake for a frozen record.
+  const requestedEvidence = input.evidence ?? [];
+  let frozenEvidence: {
+    readonly attachments: readonly FrozenEvidenceRuntimeAttachment[];
+    readonly receipt: readonly FrozenEvidenceAttachment[];
+  } | null = null;
+  if (requestedEvidence.length > 0) {
+    if (input.evidenceUploadsDir === undefined || input.evidenceUploadsDir.trim() === '') {
+      throw new Error('review evidence was requested but no evidence uploads directory is configured');
+    }
+    const frozen = freezeEvidenceAttachments({
+      requests: requestedEvidence,
+      uploadsDir: input.evidenceUploadsDir,
+      roundDirectory: directory,
+      roundId: input.roundId,
+      jobId: input.jobId ?? null,
+      targetSha,
+      ...(input.now !== undefined ? { now: input.now } : {}),
+    });
+    frozenEvidence = { attachments: frozen.attachments, receipt: frozen.receipt };
+  }
+  const ciEvidence = input.ciEvidence ?? null;
   atomicWrite(join(directory, 'diff.patch'), diff, directory);
   atomicWrite(join(directory, 'spec-context.md'), specBytes, directory);
   atomicWrite(join(directory, 'project-conventions.md'), projectConventions, directory);
@@ -306,10 +398,27 @@ export function freezeReviewInputs(input: FreezeReviewInput): FrozenReview {
     conventionsSha256: hash(projectConventions),
     createdAt: (input.now ?? (() => new Date()))().toISOString(),
     changedFiles,
+    ...(acceptance !== undefined ? { acceptance } : {}),
+    ...(frozenEvidence !== null || ciEvidence !== null
+      ? {
+          reviewEvidence: {
+            attachments: frozenEvidence?.receipt ?? [],
+            ci: ciEvidence,
+          },
+        }
+      : {}),
     ...(input.branchIdle !== undefined ? { branchIdle: input.branchIdle } : {}),
   };
   atomicWrite(join(directory, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, directory);
-  return { directory, manifest, diff, specContext, projectConventions, changedFiles };
+  return {
+    directory,
+    manifest,
+    diff,
+    specContext,
+    projectConventions,
+    changedFiles,
+    evidence: { attachments: frozenEvidence?.attachments ?? [], ci: ciEvidence },
+  };
 }
 
 export type SourceMovementCause = 'target-moved' | 'base-rewritten' | 'base-unresolvable' | 'checkout-changed' | 'check-failed';

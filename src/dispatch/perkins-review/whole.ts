@@ -3,10 +3,11 @@ import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, statSync } from 'node:fs';
 import { isAbsolute, resolve } from 'node:path';
 import type { AgentSpawner } from '../service.js';
-import type { AgentHandle, NativeAgentTool } from '../../runtime/types.js';
+import type { AgentHandle, NativeAgentTool, PromptOptions } from '../../runtime/types.js';
 import type { PacingGate, PacingLease, PacingEventRecorder, RateLimitBackoffPolicy } from '../../runtime/pacing.js';
 import { withRateLimitRetries, type RateLimitRetryOptions } from '../../runtime/rate-limit-retry.js';
 import { assertFrozenPromptBounds, sourceMovementSinceFreeze, writeReviewArtifact, type FrozenReview, type SourceMovement } from './artifacts.js';
+import { readFrozenEvidenceBytes, renderEvidencePromptSection } from '../../review-inputs/evidence.js';
 import { finalAssistantText } from './session-output.js';
 import { PERKINS_FINDING_SOURCES, type PerkinsFindingSource, type PerkinsLens, type PerkinsPolicy } from './policy.js';
 import {
@@ -491,7 +492,10 @@ function renderSpecialistPrompt(
   const template = lens === 'blind' ? policy.portableContract.blindPrompt : policy.portableContract.sharedPrompt;
   if (!template.includes('{{OUTPUT_CONTRACT}}')) throw new Error('policy prompt is missing the output contract placeholder');
   const rendered = template.replace('{{OUTPUT_CONTRACT}}', () => contract);
-  const prompt = lens === 'blind'
+  // Non-blind paths receive the promised frozen evidence as untrusted text
+  // beside the attachment images the host attaches to the same prompt.
+  const evidenceSection = lens === 'blind' ? '' : renderEvidencePromptSection(review.evidence.attachments, review.manifest.targetSha);
+  const prompt = (lens === 'blind'
     ? renderTemplateOnce(rendered, {
       // The blind child's only grounding: the exact paths its location
       // fields may cite, alongside the whole diff those citations are
@@ -505,7 +509,7 @@ function renderSpecialistPrompt(
       '{{SPEC_CONTEXT}}': review.specContext,
       '{{LENS_BRIEF}}': policy.portableContract.lenses[lens],
       '{{LENS}}': lens,
-    });
+    })) + (evidenceSection === '' ? '' : `\n\n${evidenceSection}`);
   // A retry is corrective, not a blind repeat: the host delivers the previous
   // attempt's exact failure class and reason in the child's own contract.
   if (retry === undefined || retry.attempt <= 1) return prompt;
@@ -514,6 +518,29 @@ function renderSpecialistPrompt(
   // Blind children cannot re-read anything, so their retry restates the
   // locatable-evidence contract on top of the exact rejection.
   return `${prompt}\n\n--- RETRY CORRECTION (attempt ${retry.attempt}) ---\n${correction}\n${blindEvidenceCorrection(retry.previous)}`;
+}
+
+/** Exact frozen evidence pixels for one prompt, re-verified against the
+ * frozen hash/size on every read (a mutated frozen copy refuses loudly). */
+function reviewEvidenceImages(review: FrozenReview): PromptOptions['images'] {
+  return review.evidence.attachments.map((attachment) => ({
+    mediaType: attachment.mediaType,
+    data: readFrozenEvidenceBytes(attachment).toString('base64'),
+  }));
+}
+
+/** The promise is delivery of the frozen content or a named refusal — never a
+ * text-only substitute for material the model cannot see. */
+function assertEvidenceCapability(
+  handle: AgentHandle,
+  images: PromptOptions['images'] | undefined,
+  what: string,
+): void {
+  if (images === undefined || images.length === 0) return;
+  if (handle.capabilities.images === true) return;
+  throw new Error(
+    `${what} does not declare image input; refusing to deliver the ${images.length} frozen evidence attachment(s) as an unverified text-only substitute`,
+  );
 }
 
 /** The reason carried by an abort signal, or the generic cancellation error
@@ -557,6 +584,7 @@ async function boundedPrompt(
   prompt: string,
   timeoutMs: number | null,
   signals: readonly (AbortSignal | undefined)[] = [],
+  images?: PromptOptions['images'],
 ): Promise<void> {
   let failure: string | null = null;
   const unsubscribe = handle.subscribe((event) => {
@@ -582,7 +610,10 @@ async function boundedPrompt(
   });
   try {
     await Promise.race([
-      handle.prompt(prompt, { owner: REVIEW_OWNER }),
+      handle.prompt(prompt, {
+        owner: REVIEW_OWNER,
+        ...(images !== undefined && images.length > 0 ? { images } : {}),
+      }),
       ...(timeoutMs === null
         ? []
         : [new Promise<never>((_resolve, reject) => {
@@ -759,7 +790,7 @@ export class PerkinsWholeReview {
     const retryPrompt = async (
       handle: AgentHandle, prompt: string, budgetMs: number | null, label: string,
       signals: readonly (AbortSignal | undefined)[], acquire: () => Promise<void>, release: () => void,
-      hasSubmission: () => boolean,
+      hasSubmission: () => boolean, images?: PromptOptions['images'],
     ): Promise<void> => {
       const now = this.pacingOptions.pacingNow ?? Date.now;
       let remaining = budgetMs ?? 0;
@@ -768,7 +799,7 @@ export class PerkinsWholeReview {
         const start = now();
         try {
           if (budgetMs !== null && remaining <= 0) throw new ReviewTurnTimeoutError(budgetMs);
-          await boundedPrompt(handle, prompt, budgetMs === null ? null : remaining, signals);
+          await boundedPrompt(handle, prompt, budgetMs === null ? null : remaining, signals, images);
         } catch (error) {
           // A terminal native submission outranks later transport noise.
           if (hasSubmission()) return;
@@ -792,6 +823,11 @@ export class PerkinsWholeReview {
         },
       });
     };
+
+    // Frozen evidence pixels are read and hash-verified from the frozen copy
+    // on EVERY prompt (a mutated copy refuses that prompt loudly); no
+    // cross-prompt byte memoization.
+    const evidenceImages = (): PromptOptions['images'] => reviewEvidenceImages(review);
 
     const runSpecialist = async (
       lens: PerkinsLens,
@@ -875,6 +911,10 @@ export class PerkinsWholeReview {
         // supervisor owns stall diagnosis (silence + live-tool/compaction
         // evidence) and the workflow waits for the child's settled turn or
         // an explicit cancellation. Visible prose silence is not idleness.
+        // Blind children never receive the evidence (isolation); every other
+        // child receives the same frozen bytes as the lead or refuses loudly.
+        const childImages = lens === 'blind' ? undefined : evidenceImages();
+        assertEvidenceCapability(handle, childImages, `specialist lens ${lens}`);
         await retryPrompt(
           handle,
           renderSpecialistPrompt(
@@ -886,6 +926,7 @@ export class PerkinsWholeReview {
           async () => { reviewLease ??= await this.acquireReviewTurnSlot(`lens:${lens}#${attempt}`, signal ?? input.signal); },
           () => { const lease = reviewLease; reviewLease = null; lease?.release(); },
           () => capturedSubmission() !== null,
+          childImages,
         );
         promptResolved = true;
       } catch (error) {
@@ -1640,10 +1681,15 @@ export class PerkinsWholeReview {
           if (turns > MAX_LEAD_TURNS) void lead?.dispose().catch(() => {});
         }
       });
+      // The lead owns the verdict: if the frozen evidence cannot be delivered
+      // as pixels, the round refuses to run text-only instead of pretending.
+      const leadImages = evidenceImages();
+      assertEvidenceCapability(lead, leadImages, 'review lead');
       await retryPrompt(lead, initialPrompt, LEAD_TOTAL_TIMEOUT_MS, 'lead', [input.signal],
         async () => { reviewLease ??= await this.acquireReviewTurnSlot('lead', input.signal); },
         () => { const lease = reviewLease; reviewLease = null; lease?.release(); },
         () => accepted !== null,
+        leadImages,
       );
       if (input.signal?.aborted === true) throw new Error('review operation aborted');
       if (turns > MAX_LEAD_TURNS) throw new Error(`Perkins lead exceeded ${MAX_LEAD_TURNS} turns`);
@@ -1899,6 +1945,7 @@ export class PerkinsWholeReview {
   }
 
   private leadPrompt(review: FrozenReview, prior: readonly VerifiedFinding[], priorTargetSha: string | null): string {
+    const evidenceSection = renderEvidencePromptSection(review.evidence.attachments, review.manifest.targetSha);
     return [
       'Conduct the complete Perkins review of this whole change as the lead. You own investigation, verification, prior-finding revisiting, the final report, and the verdict. The host owns safety and terminal validation.',
       '',
@@ -1907,6 +1954,7 @@ export class PerkinsWholeReview {
       ...(priorTargetSha === null ? [] : [`Frozen prior target SHA: ${priorTargetSha}`]),
       `Spec mode: ${review.manifest.specMode}`,
       `Changed files (${review.changedFiles.length}): ${review.changedFiles.join(', ')}`,
+      ...(evidenceSection === '' ? [] : ['', evidenceSection]),
       '',
       '--- FROZEN SPECIFICATION / CONTEXT ---',
       review.specContext,

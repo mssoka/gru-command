@@ -99,7 +99,7 @@ export function appendRecordedVerification(input: {
 }): string {
   const { spec, evidence } = input;
   if (evidence === null) return spec;
-  const combined = `${spec.trimEnd()}\n\n${evidence}`;
+  const combined = `${spec}\n\n${evidence}`;
   const bytes = Buffer.byteLength(`${combined}\n`, 'utf8');
   if (bytes > FROZEN_SPEC_MAX_BYTES) {
     input.log?.('warn', 'recorded verification evidence skipped: frozen spec bound exceeded', {

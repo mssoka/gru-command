@@ -58,8 +58,14 @@ groups by repo; the phone is board-first.
 
 ## 4. Review waves (Perkins)
 
-`POST /api/dispatch/review` `{job_id, target_ref?, no_spec?}` freezes one
-exact target/base/diff/spec set in a detached review worktree. The arm
+`POST /api/dispatch/review` `{job_id, target_ref?, no_spec?, evidence?}`
+freezes one exact target/base/diff/spec set in a detached review worktree. An
+arm may carry private evidence uploads; the frozen round binds the effective
+amended acceptance and the exact-target CI receipt, and the amendment/contract
+endpoints (`POST /api/dispatch/amendment`,
+`GET /api/dispatch/jobs/<id>/contract`) manage that acceptance. See
+[REVIEW-INPUTS.md](./REVIEW-INPUTS.md); a private-evidence arm is refused on
+the bmad-review fallback route rather than silently reviewed without it. The arm
 first passes the **branch-idle guard**: while any lane is actively
 working/pushing the target branch (`dispatched`/`working` with no settled
 delivery for its current attempt), the API answers `409 branch_busy` with
