@@ -217,6 +217,20 @@ export function openAttemptStartSeq(ledger: BranchIdleLedger, jobId: string): nu
   return 0;
 }
 
+/** Newest explicit repair start that need not flip status: an admitted
+ * directive turn (`silas.directive-sent`) or a claimed provider
+ * continuation (`provider.recovery-claimed`). The digest's stalled-phase
+ * detector reads the same events; review admission must not arm on a head
+ * whose repair is still open (issue #162). */
+function latestRepairStartSeq(ledger: Pick<BranchIdleLedger, 'latestJobEvent'>, jobId: string): number {
+  let newest = 0;
+  for (const kind of ['silas.directive-sent', 'provider.recovery-claimed']) {
+    const event = ledger.latestJobEvent(jobId, kind);
+    if (event !== null && event.seq > newest) newest = event.seq;
+  }
+  return newest;
+}
+
 /** The busy predicate: the attempt is open and has not delivered yet, or a
  * newer re-brief request is still unresolved. */
 export function laneIsBusy(ledger: BranchIdleLedger, job: JobRecord): boolean {
@@ -231,7 +245,10 @@ export function laneIsBusy(ledger: BranchIdleLedger, job: JobRecord): boolean {
   if (!BRANCH_BUSY_STATUSES.includes(job.status)) return false;
   const delivered = ledger.latestJobEvent(job.id, 'job.delivered');
   if (delivered === null) return true;
-  return delivered.seq <= openAttemptStartSeq(ledger, job.id);
+  if (delivered.seq <= openAttemptStartSeq(ledger, job.id)) return true;
+  // A repair admitted after the delivery keeps the lane busy even when no
+  // status hop recorded it (fallback-review flows stay `working`).
+  return delivered.seq <= latestRepairStartSeq(ledger, job.id);
 }
 
 /** Every busy lane whose branch is the reviewed target. The reviewed job is

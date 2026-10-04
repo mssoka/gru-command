@@ -758,9 +758,26 @@ export class LedgerApi {
     return row === undefined ? null : this.eventFromRow(row);
   }
 
-  /** One job's events, newest first (ops digest scans; bounded). */
-  listJobEvents(jobId: string, opts: { limit?: number } = {}): readonly EventRecord[] {
+  /** One job's events, newest first (ops digest scans; bounded). An explicit
+   * `kinds` filter is the lifecycle scan: one sparse event stream can be
+   * read far past a busy job's activity tail without paging the whole
+   * history. */
+  listJobEvents(
+    jobId: string,
+    opts: { limit?: number; kinds?: readonly string[] } = {},
+  ): readonly EventRecord[] {
     const limit = opts.limit ?? 200;
+    if (opts.kinds !== undefined) {
+      if (opts.kinds.length === 0) throw new Error('listJobEvents "kinds" filter must not be empty');
+      return (
+        this.db
+          .prepare(
+            `SELECT * FROM events WHERE job_id = ? AND kind IN (${opts.kinds.map(() => '?').join(', ')})` +
+              ' ORDER BY seq DESC LIMIT ?',
+          )
+          .all(jobId, ...(opts.kinds as never[]), limit) as Row[]
+      ).map((row) => this.eventFromRow(row));
+    }
     return (
       this.db
         .prepare('SELECT * FROM events WHERE job_id = ? ORDER BY seq DESC LIMIT ?')
