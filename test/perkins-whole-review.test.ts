@@ -1681,6 +1681,17 @@ describe('packaged product and terminal-frame coverage (N6)', () => {
       if (!gruPrompt.includes('Hand workers the whole build')) {
         throw new Error('staged gru prompt lacks the whole-build handoff');
       }
+      // Staged compiled ops-skill loader probe (bmad-review deferral row 36):
+      // the ops skill must load through its own module-relative loader from
+      // the tarball extract, not only be present as text or loaded from the
+      // checkout.
+      const { loadSilasSkills } = await import('./dist/dispatch/silas-driver.js');
+      const opsSkills = loadSilasSkills();
+      if (opsSkills.length !== 2 ||
+          opsSkills.some((skill) => skill.body.length === 0) ||
+          !opsSkills[0].body.includes('Continuous completion (owner contract 2026-10-02)')) {
+        throw new Error('staged ops skills did not load through the compiled loader');
+      }
       const bridge = await ReviewMcpBridge.start([{
         name: 'perkins_probe', description: 'staged probe', inputSchema: { type: 'object' },
         execute: async () => ({ text: 'stage-ok' }),

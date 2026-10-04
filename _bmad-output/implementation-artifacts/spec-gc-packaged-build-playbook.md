@@ -241,7 +241,7 @@ Review target: `962a41bd888343e73ea1fc9bf0ca4e37da1258cd..4af6aab396737e165dbda5
 - [x] [Review][Patch] Reject dirty loader source before trusting compiled `dist/` [test/roles-installed-playbook.test.ts:83-115] — fixed: the dirty-input guard now covers `src/roles.ts` and `src/dispatch/silas-driver.ts` (the compiled loader sources) alongside roles/, resources/, package.json.
 - [x] [Review][Patch] Bound the precheck-to-POST admission race and reconcile timed-out dispatches [roles/minion.md:108-120] — fixed with the same bounded-wait/job-identity reconciliation wording as the resident-observability disposition; a precheck is advisory, the request is the gate, and an unresolved submission is an ops reconciliation item.
 - [x] [Review][Patch] Test residency FIFO with two queued reviewers, not one [test/pacing-admission.test.ts:835-856] — fixed: two reviewers queue behind the four parents; the first admits on the first released slot, the second stays queued until the next release, and admission order is asserted (`resident-5`, `resident-6`).
-- [x] [Review][Defer, standing] Ambiguous `clear_to_merge` fallback wire field [src/dispatch/perkins.ts:2455; src/dispatch/server.ts:330] — standing disposition (not new backlog): the wire name is kept for compatibility, its narrowed meaning is documented and pinned, and a rename remains a separate compatibility decision (triage row 73). No owner decision is pending.
+- [x] [Review][Resolved] Ambiguous `clear_to_merge` fallback wire field [src/dispatch/perkins.ts:2455; src/dispatch/server.ts:330] — disposition: retain the pre-existing wire name for compatibility; its routing-only meaning is documented and pinned, and renaming is outside PR #165 (prior triage row 73). This review creates no deferred PR #165 action or pending owner decision.
 
 #### Rejected
 
@@ -554,7 +554,7 @@ Review target: `962a41bd888343e73ea1fc9bf0ca4e37da1258cd..4af6aab396737e165dbda5
 | 14 | verif-gap | low | gru.md escalate bullet — same root cause as 2 → G1 |
 | 15 | verif-gap | low | docs/FLOW.md tier-2 mandate + routing table stale — same root cause as 1 → G1 |
 | 16 | verif-gap | low | ops-dispatch internal Authority/step-5 vs 2026-09-29 section contradiction — same root cause as 13 → G1 |
-| 17 | blind | low, deferred | `src/wizard/bmad-onboarding.ts` still validates the pinned installer's `bmad-build` names — verified present; pre-existing, version-pinned onboarding integration the intent keeps authoritative (original acceptance 7; spec Code Map), not caused by this change. A future renamed BMAD release is a versioned onboarding update → defer |
+| 17 | blind | low, resolved (standing) | `src/wizard/bmad-onboarding.ts` validates the pinned installer's own output names — a version-pinned integration, not a defect: the wizard installs and verifies exactly `bmad-method@6.12.0` and fails loud on any unknown layout (the playbook's loud-stop onboarding rule); when the pinned installer version bumps, its expected names are updated with it (existing release process). The capability-selection contract governs runtime selection, not the pinned installer's verification. No pending owner action |
 | 18 | blind | low | `docs/FLOW.md` had no minion-owned-cycle section; verified absent → patch (added §4e) |
 | 19 | blind | low | `docs/ROLES.md` Gru row "dispatch, verify" read against gru.md's no-re-review rule; verified → patch (row wording: "gate the sequence") |
 | 20 | blind | low | `roles/silas.md` 10-02 cycle section sat between the two 09-29 sections; verified (lines 108/131) → patch (moved below the merge-authority section) |
@@ -573,7 +573,7 @@ Review target: `962a41bd888343e73ea1fc9bf0ca4e37da1258cd..4af6aab396737e165dbda5
 | 33 | blind, edge | low | the three new scopes omitted the approved worker-RPC patch `npm test` applies via pretest, so a harness-level nonzero could masquerade as expected RED → patch (patch prerequisite first in all three scopes) |
 | 34 | blind | false | renamed-catalog probe "is the test's own algorithm, not the product": no shipped selection code exists — selection is prompt-level by design and the intent forbids a new runtime; the deterministic metadata selector plus name-absence pins are the available fail-before oracle → false |
 | 35 | blind | low, rejected | `assertDistCurrent` binds only `dist/` while roles/resources stage from the working tree; the gated paths (scheduler, CI) always run committed-clean trees, and binding text files adds staging machinery beyond a direct correction → reject |
-| 36 | blind | low, deferred | no staged `loadSilasSkills()` probe from an installed/tarball layout; file presence and loader resolution are separately covered and the loader path is unchanged by this change → defer (deferred-work.md) |
+| 36 | blind | low, resolved | no staged `loadSilasSkills()` probe from an installed/tarball layout → cleared: the tarball smoke now imports the staged compiled `dist/dispatch/silas-driver.js` and asserts `loadSilasSkills()` resolves both shipped skills through its module-relative path from the package extract |
 | 37 | blind | low | packed-files expectation omitted `roles/bob.md` though the smoke loads `ROLE_DEFINITIONS` (all five persona files) → patch |
 | 38 | blind | medium | the shipped worker prompt carried no verification-scheduler reference, so its verification duty read as licence for competing full suites against the one global budget → patch (scheduler clause + pin) |
 | 39 | blind | low | reviewer-commissioning wording did not name the mechanism; the tracked review jobs come from the job-dispatch surface (`POST /api/dispatch`, the PR135/j-810 precedent), not the Perkins review wave → patch (name the dispatch path in the minion prompt) |
@@ -610,7 +610,7 @@ Review target: `962a41bd888343e73ea1fc9bf0ca4e37da1258cd..4af6aab396737e165dbda5
 | 70 | blind | low | README grammar + no README/FLOW fallback pin → patch: "0 blockers clear..."; tarball README pins the corrected sentence and negative-pins the retired phrase |
 | 71 | blind | low | Corrected ops completion order unpinned → patch: "let exact-head CI land" / "never move the head after the gate" pins added |
 | 72 | blind | low, rejected | Worker `bmad-*` blanket negative vs ops review-token allowlist asymmetry: intentional (j-761 forbids the fixed build name on the worker; review tokens are ops-only). `claude -p` negative added to the tarball smoke |
-| 73 | blind | low, deferred | `clear_to_merge` wire-field name debt → deferred (rename is a wire break; semantics documented and the owner-held marker pinned) |
+| 73 | blind | low, resolved (standing) | `clear_to_merge` wire-field name debt → decision: keep the historical wire name for compatibility; its narrowed meaning (review/fix routing only, never a Perkins READY or merge clearance) is documented at the emission site and pinned (owner-held marker, PASS-never-clearance rendering, awareness negative pin). A rename happens only with a commissioned consumer migration — no pending action |
 | 74 | blind | low | Spec verification pointer/frontmatter/deferred traceability stale → patch: status in-review; deferred entries carry heads; receipt summary completed at close |
 | 75 | edge | low | Timeout scope skipped the second leg when the first failed → patch: both legs run and both rc values are reported |
 | 76 | edge | false, carried | Tasks text "full bmad-build cycle" vs name-free shipped prompts: the task wording is amended and the substance is the standing Acceptance-1 disposition (rows 58/previous) — owner/ops action |
@@ -851,6 +851,16 @@ bad_spec).
   two-waiter FIFO regression (resident-5/resident-6 order).
 - Lane records updated: spec status back to `in-review`; deferred-work
   block converted to a resolved record with dispositions.
+
+- Deferral clearing (owner directive: no deferral, clear the backlog):
+  row 36 implemented — the tarball smoke now imports the staged compiled
+  `dist/dispatch/silas-driver.js` and asserts `loadSilasSkills()` resolves
+  both shipped skills through its module-relative path from the package
+  extract (empty HOME, no checkout access); rows 17 and 73 formalized as
+  resolved standing decisions (version-pinned installer validation; the
+  `clear_to_merge` wire name kept with pinned semantics and no pending
+  owner action). All three deferred-work entries converted to resolved
+  records. No deferred item remains for this lane.
 
 ## Verification
 
