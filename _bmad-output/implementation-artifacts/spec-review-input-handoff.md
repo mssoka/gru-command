@@ -204,6 +204,91 @@ bmad-build interactive checkpoint is not available in this confined worker.
   lane helper `.mjs` scripts under the linted (gitignored) runs directory
   failed `no-undef`; tooling relocated out of the tree. This red was not a
   product regression and never reached the suite.
+
+### 2026-10-04 independent review layers at `7beb58f` (patches at `b247de6`)
+
+Verdicts are the parent's; reviewer-assigned severities were disregarded.
+
+- Migration-number mismatch in the Code Map/Tasks (spec said 11, code ships
+  14) — `low`; patched (spec corrected to 14).
+- `CI_EVIDENCE_MAX_BYTES` declared and never enforced — `low`; patched
+  (constant removed; the real bounds are the rendered-list caps and the
+  frozen-spec bound, now documented).
+- An oversize CI block was dropped to silence — `medium`; patched
+  (`appendCiEvidence` renders an explicit `UNAVAILABLE — CI EVIDENCE OMITTED`
+  notice and logs; the structured record stays in the manifest) + test.
+- Binding note claimed a repository check the code did not perform — `low`;
+  patched to "repository unverified (no PR URL was resolvable)" + test.
+- A PR-less observation could bind as the expected PR's receipt — `medium`;
+  patched (exact PR match required when the job names a PR) + tests.
+- `original:<anchor>` supersession was cosmetic and unvalidated — `low`;
+  patched (the anchor must occur in the original briefing; refusal audited)
+  + test.
+- `NO_BRIEFING_MARKER` was unreachable and would invent text if reached —
+  `low`; patched (named refusal).
+- The frozen acceptance hash bound untrimmed contract text while the
+  freeze trimmed it — `medium`; patched (the frozen spec now keeps the
+  contract text byte-exact so the hash and prefix agree) + tests.
+- "Byte-identical specs" acceptance and the `reviewEvidence` doc comment
+  overclaimed — `low`; patched (acceptance scoped to the contract slice;
+  always-present CI record documented).
+- The queued-handoff payload persists the absolute upload path against the
+  lane's no-paths discipline — `low`; patched (documented as private-ledger
+  replay state; public artifacts/logs stay path-free).
+- A differing evidence set on a queued/held handoff was discarded without an
+  auditable identity — `medium`; patched (`job.review-handoff-conflict` and
+  `job.review-handoff-superseded` carry count + opaque request fingerprint;
+  first-wins documented) + handoff-replay test.
+- Evidence capability was only checked mid-round — `low`; patched (runbook:
+  check the review model's image capability before arming).
+- Frozen private material/upload quota had no retention story — `low`;
+  patched (runbook retention/quota section).
+- No read surface for the frozen receipt — `low`; patched (runbook states the
+  host-file-only limitation).
+- Prompt-block delimiters were spoofable by newline-bearing
+  purpose/consent/check fields — `medium`; patched (control characters
+  collapsed in both renderers) + tests.
+- Rendered amendment bodies can reproduce host marker lines — `low`;
+  deferred (authenticated-writer-only; `deferred-work.md`).
+- `docs/FLOW.md` and `docs/LEDGER.md` were not updated — `low`; patched.
+- Migration 14 lacked the collision-convention comment — `low`; patched.
+- Check-name ordering became locale-dependent — `low`; patched
+  (deterministic comparator).
+- Malformed amendment requests were unaudited and leaked parse errors —
+  `medium`; patched (boundary audits, generic 400) + tests.
+- "Two writers race -> 409" called unverified — `false` (the ledger
+  transaction is synchronous and single-writer; the losing write presents a
+  stale hash and is the covered 409; no interleaving exists to test).
+- Runbook over/under-documentation (response shape, bounds, grammar,
+  retention, receipt) — `low`; patched.
+- New suites missing the riskiest paths — `medium`; patched (poll->receipt,
+  wave NOT-MATCHED, handoff replay, HTTP idempotency-conflict/null-approval/
+  404/arity, anchor validation, hash normalization, sanitization).
+- `review-inputs-wave.test.ts` not classified heavy — `low`; rejected
+  (observed 1-2 s against the 30 s fast ceiling; classification churn not
+  warranted).
+- Diagnostic lane scopes in the shared manifest contradicting "ONE scope" —
+  `low`; patched (spec Code Map lists the durable scope + retained
+  diagnostics).
+- Shipped runbook without its repo-doc neighbours — `low`; rejected (the
+  runbook is the deliberate operator deliverable; it stands alone and links
+  the repo docs).
+- Fallback `bmad-review` route silently dropped armed evidence — `high`;
+  patched (named refusal before the fallback; no round, no drop) + test.
+- `job-not-found` amendment refusal was unaudited — `medium`; patched + test.
+- Verification gap: no test proves polled run URLs reach the receipt —
+  `medium`; patched (github-poll -> renderRecordedCiEvidence test).
+- Verification gap: no test proves the wave call site binds
+  expectedRepo/expectedPr — `medium`; patched (second-round NOT-MATCHED wave
+  test).
+- Verification gap: no test proves evidence survives the queued handoff —
+  `medium`; patched (handoff replay test asserts receipt/manifest/lead
+  images).
+- Verification gap: child-lens capability refusal unobservable — `low`;
+  deferred (unreachable under the single review model; `deferred-work.md`).
+- Verification gap: HTTP `idempotency-conflict` -> 409 unasserted —
+  `medium`; patched + test.
+
 ## Implementation Notes
 
 - 2026-10-03: lane workflow rendered via `bmad-build`; Checkpoint-1 approval
@@ -308,12 +393,62 @@ bmad-build interactive checkpoint is not available in this confined worker.
   typed `verification.lock-timeout` and the next attempt is separately
   accounted; capacity, not policy, is the constraint.
 
+### 2026-10-04 owner-directed resumption, main integration and independent review
+
+- Ownership reconciled before any edit: no live producer or session for the
+  lane (the previous session ended 2026-10-03T20:57Z; the host service was
+  SIGTERM'd at 19:57:31Z mid-`m11-full`, whose `verification.started` has no
+  completion), clean tree, branch local-only, no PR. The interactive
+  session took the lane.
+- History-preserving merge of the then-current `origin/main` (`b9f83e1`) as
+  `305fcdf`: conflicts resolved in `.gru-command/worktree.toml` (kept main's
+  workload-aware scopes; the lane's `review-inputs` and
+  `review-inputs-regression` scopes route classified heavy files through
+  `vitest.heavy.config.ts`), `src/dispatch/perkins-review/whole.ts` (main's
+  nullable specialist timeout kept alongside the evidence-image delivery),
+  and `test/suite-shape.test.ts` (main's pins + the new suites).
+  `installer-isolation` was routed through the heavy config at `7beb58f`.
+- Full gate at `7beb58f`: `npm test` exit 0 — lint, typecheck, build, fast
+  backend 1603 passed/6 skipped (99 files), heavy backend 669 passed/6
+  skipped (29 files), web 440 passed (43 files); capture
+  `review-inputs-verify-runs/m12-full-direct-7beb58f.log` (sha256
+  e93cb70a9912837cd561ec3aad46dd978822cd5a7a13ff3bb47331b14c7ead25). This
+  was a direct in-lane run because the host service was down; the scheduler
+  run protocol is unchanged for the next lane.
+- Three fresh-context independent review layers (blind hunter, edge-case
+  hunter, verification gap) ran at `7beb58f` (raw outputs:
+  `~/.gru-command/investigations/review-input-handoff-review-20261004/`).
+  Triage is recorded above; patches landed at `b247de6`; two findings were
+  deferred with rationale in `deferred-work.md`.
+- Full gate at the patch head `b247de6`: `npm test` exit 0 — fast backend
+  1612 passed/6 skipped, heavy backend 671 passed/6 skipped, web 440
+  passed; capture `review-inputs-verify-runs/m13-full-direct-b247de6.log`
+  (sha256 ea7b0abf1199a536b6b0703b4905f66f8ce57b20afe1536cba367b1dfbc76395).
+- The final-head full gate after this spec update is recorded in the
+  completion report and ledger (not rewritten into the head it proves).
+
 ## Verification
 
 **Commands:**
-- `npx vitest run test/review-evidence-intake.test.ts test/review-ci-evidence.test.ts test/job-amendments.test.ts test/review-inputs-handoff.test.ts test/review-inputs-wave.test.ts test/dispatch-review-inputs.test.ts test/verification-evidence.test.ts test/github-poll.test.ts test/ledger-api.test.ts test/ledger-db.test.ts` — scheduler scope `review-inputs`: PASS (run ee48afd8 at f3959f5, 94/94 tests, clean tree, whole-output sha256 b3675c9f2183c2d00c49fee7002379ebb2ac4e7381ace7c229a737528ac7b3b0).
-- `npx vitest run test/dispatch-server.test.ts test/attachments.test.ts test/claude-adapter.test.ts test/perkins-whole-review.test.ts test/perkins-builtin-wave.test.ts test/lan-phone-raw-client.test.ts test/chat-server.test.ts test/decisions.test.ts test/suite-shape.test.ts` — scheduler scope `review-inputs-regression`: 444/445 passed at 8e033f9; sole red is the pre-existing `decisions` hot-reload timing test (reproduced without this lane's suites in scope).
-- `npm test` — scheduler scope `full`: final-head gate; earlier reds and their completions are preserved above and in the run captures.
+- `npm test` — full gate at the post-review patch head `b247de6` (direct
+  in-lane run; host service down): exit 0 — lint, typecheck, build, fast
+  backend 1612 passed / 6 skipped (99 files), heavy backend 671 passed / 6
+  skipped (29 files), web 440 passed (43 files). Capture
+  `review-inputs-verify-runs/m13-full-direct-b247de6.log`, sha256
+  ea7b0abf1199a536b6b0703b4905f66f8ce57b20afe1536cba367b1dfbc76395.
+  Full gate at `7beb58f` (pre-patch): exit 0 — 1603/6 + 669/6 + 440.
+- Heavy seam suites at the patched head (`perkins-builtin-wave` 97,
+  `perkins-whole-review` 81, `dispatch-server` 39): 217 green.
+- Focused feature suites + guards at the patched head (9 files including
+  `suite-shape` and `test-budgets`): 81 tests green.
+- Pre-review scheduler evidence (superseded heads, preserved): scope
+  `review-inputs` PASS (run ee48afd8 at f3959f5, 94/94 tests, whole-output
+  sha256 b3675c9f2183c2d00c49fee7002379ebb2ac4e7381ace7c229a737528ac7b3b0);
+  scope `review-inputs-regression` 444/445 at 8e033f9 (sole red the
+  pre-existing `decisions` hot-reload timing, reproduced without this lane's
+  suites).
+- Final-head gate at the spec-updated head: recorded in the completion
+  report and ledger (not rewritten into the head it proves).
 
 **Manual checks:**
 - `manifest.json`/`spec-context.md` of a frozen round contain no base64
