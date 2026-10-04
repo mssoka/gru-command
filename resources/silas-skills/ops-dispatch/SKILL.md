@@ -73,7 +73,9 @@ mechanical reactions are YOURS — execute them without asking:
 - **One standing gate (freeze-r1).** Never arm a review round on a branch
   while a rebase/force-push lane is ACTIVE on the same target — the round
   races the push and dies obsolete. Wait for the lane delivery (and its
-  push) to settle, then arm. If you cannot tell whether the lane is still
+  push) to settle and for any unresolved re-brief request to finalize or
+  be recovered (a delivery alone does not clear that fence), then arm. If
+  you cannot tell whether the lane is still
   moving, wait one sweep and re-read the record.
 - **Novel failures are not yours to improvise around.** Name what you saw
   with pointers and escalate to the chief; the chief rules, merges, or
@@ -122,24 +124,38 @@ mechanical reactions are YOURS — execute them without asking:
 
 A review arm is refused while a lane is actively working/pushing the
 branch it would freeze: the round would race the push and die obsolete.
-The API owns this guard — your arm path needs NO special logic. When the
-answer is `409` with `{"error":"branch_busy","blockers":[...]}`:
+The API owns this guard — your arm path needs NO special logic. An
+unresolved re-brief also answers `branch_busy` for that job: its durable
+pending markers (written before the re-brief worker spawns) stay until the
+request genuinely settles, and the digest does not list the job for review
+while they stand. The fence is independent of lane status — a delivered or
+in-review lane stays fenced while a request stands, and a delivery alone
+cannot clear it. Wait for the re-brief's own settlement instead of
+retrying. When the answer is `409` with
+`{"error":"branch_busy","blockers":[...]}`:
 
 - **Defer the arm to the next sweep.** The service records the refusal
   (`branch-idle.refused`) and, because you pass `"by":"silas"`, your
   deferral as `silas.review-deferred` on the job — that is the deferred-arm
-  note. Retry when the lane is idle: the digest recomputes from the ledger
-  every sweep, so the row stays listed until the arm lands. Never retry in
-  a tight loop inside one sweep.
+  note. Retry when the lane genuinely settles. The digest recomputes from
+  the ledger every sweep: a row busy on a lane attempt stays listed until
+  the arm lands, while a row for a job with unresolved re-brief markers is
+  deliberately withheld and reappears only after those markers settle —
+  never expect a listed retry target while the request stands. Never retry
+  in a tight loop inside one sweep.
 - **Never arm with `"force":true` on your own.** Force is the human
   escape hatch for a deliberate judgment call; a forced round freezes a
   branch that may still be moving and carries the override tag in its
-  manifest for exactly that reason. If a lane looks wedged, escalate — do
+  manifest (`branchIdle`) plus `branch-idle.forced` events for exactly
+  that reason. Force is an explicit, audited human decision — never an
+  automatic operations action — and forcing a round does not settle the
+  pending re-brief request itself. If a lane looks wedged, escalate — do
   not force the gate.
 - The blockers name each busy lane (`job_id`, `status`, `branch`); a
   blocker on the reviewed job itself means its fix loop has not delivered
-  yet. Wait for that delivery — that delivery is what re-arms the
-  re-review.
+  yet, or an unresolved re-brief request still fences it. Release needs
+  BOTH settled target work AND no pending re-brief markers — a delivery
+  alone cannot lift the marker fence.
 
 3. **NEEDS CHANGES verdict awaiting follow-through.** The digest lists the
    round's blockers with `consecutive_rounds` and the advised rung:

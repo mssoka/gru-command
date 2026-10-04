@@ -7,10 +7,13 @@ import type { LogLevel } from '../logger.js';
 import { DEFAULT_REVIEW_CHILDREN } from '../config.js';
 import type { JobStatus, LedgerApi, RoundRecord, RoundVerdict } from '../ledger/api.js';
 import { requireSafeRecordId } from '../ledger/api.js';
+import { isJobTerminal } from '../ledger/states.js';
 import type { WorktreeLane, WorktreePort } from './worktree-port.js';
 import {
   BranchBusyError,
   findBusyLanes,
+  laneBranch,
+  normalizeBranch,
   resolveReviewTargetBranch,
   type BranchIdleBlocker,
   type BranchIdlePhase,
@@ -1038,6 +1041,18 @@ export interface WaveOutcome {
   readonly headMoved: boolean;
 }
 
+/** Bounded fallback-gate safety refusal: a re-brief request or revoked
+ * handoff authorization appeared at a concrete async boundary of a running
+ * bmad-review gate (iteration intake, or the default reviewer's worker-gate
+ * admission). The gate stops fail-closed before the next diff intake or
+ * reviewer spawn; it is never a partial round. */
+class FallbackSafetyRefusal extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'FallbackSafetyRefusal';
+  }
+}
+
 export class WaveRunner {
   private readonly opts: WaveRunnerOptions;
   private readonly log: Log;
@@ -1050,6 +1065,7 @@ export class WaveRunner {
     starting: boolean;
     /** Post-intake hold: visible obligation, NOT sweep-rearmable. */
     held: boolean;
+    settlementReplayRequested: boolean;
     readonly run: Promise<void>;
     readonly resolve: () => void;
   }>();
@@ -1060,9 +1076,18 @@ export class WaveRunner {
     this.opts = opts;
     this.log = opts.log ?? (() => {});
     this.stopHandoffListener = opts.bus?.subscribe((event) => {
-      if (event.kind !== 'job.delivered' || event.jobId === null) return;
+      if (event.jobId === null) return;
       const pending = this.handoffs.get(event.jobId);
-      if (pending !== undefined && event.seq > pending.seq) void this.startHandoff(event.jobId, pending);
+      if (pending === undefined) return;
+      if (event.kind === 'silas.rebrief-settled') {
+        // The delivery was published while its durable markers still stood.
+        // A replay may already be unwinding that busy refusal; retry only
+        // after it has released its starting flag.
+        if (pending.starting) pending.settlementReplayRequested = true;
+        else void this.startHandoff(event.jobId, pending);
+      } else if (event.kind === 'job.delivered' && event.seq > pending.seq) {
+        void this.startHandoff(event.jobId, pending);
+      }
     }) ?? (() => {});
   }
 
@@ -1497,7 +1522,36 @@ export class WaveRunner {
     const result: ReviewPreflightResult = preflight !== undefined && repoPath !== null
       ? await preflight({ repoPath })
       : { ok: true, failures: [] };
-    if (!result.ok) return this.beginFallbackGate(input, result.failures, repoPath);
+    if (!result.ok) {
+      // The canonical terminal refusal owns terminal lanes FIRST: terminal
+      // jobs are never busy, so a stale pending marker must not mask the
+      // refusal as branch_busy, and no branch-idle audit row is written
+      // for a job that can never be reviewed again.
+      const jobNow = this.opts.ledger.getJob(input.jobId);
+      if (jobNow !== null && isJobTerminal(jobNow.status)) {
+        throw new Error(`job "${input.jobId}" is ${jobNow.status} — terminal lanes do not go back under review`);
+      }
+      // The fallback gate has no freeze leg of its own: the awaited
+      // pre-flight is an asynchronous admission window, and a re-brief (or
+      // lane re-open) admitted while it ran must fence fallback admission
+      // too. Re-prove branch idleness through the SAME shared guard the
+      // arm intake and the native freeze use — before any fallback reviewer
+      // starts. An explicit `force` keeps its audited escape hatch, and a
+      // BranchBusyError keeps its 409 refusal / same-job replay re-queue.
+      this.enforceBranchIdleForRequest(input);
+      // The shared guard early-returns without a job lane, so re-prove the
+      // CURRENT lane/marker/authorization facts directly at this seam
+      // (fail closed on a missing lane instead of reusing the pre-await
+      // repoPath), and hand the same re-proof to the gate's own async
+      // boundaries: before each round's diff intake, and after the default
+      // reviewer's worker-gate wait before it spawns.
+      this.assertFallbackAdmissionCurrent(input);
+      if (input.fromHandoff === true) {
+        const pending = this.handoffs.get(input.jobId);
+        this.assertHandoffAuthorized(input.jobId, pending?.seq ?? -1);
+      }
+      return this.beginFallbackGate(input, result.failures, repoPath, () => this.assertFallbackIterationCurrent(input));
+    }
     // Post-await recheck (handoff replays only): permission is re-proven
     // after preflight/capacity waits, BEFORE freeze/admission effects.
     if (input.fromHandoff === true) {
@@ -1511,7 +1565,7 @@ export class WaveRunner {
   private trackHandoff(input: { jobId: string; targetRef?: string; lenses?: readonly string[]; noSpec?: boolean; force?: boolean }, seq: number) {
     let resolve!: () => void;
     const run = new Promise<void>((done) => { resolve = done; });
-    const pending = { input, seq, starting: false, held: false, run, resolve };
+    const pending = { input, seq, starting: false, held: false, settlementReplayRequested: false, run, resolve };
     this.handoffs.set(input.jobId, pending);
     return pending;
   }
@@ -1596,6 +1650,13 @@ export class WaveRunner {
       if (!requeued && !held) {
         if (this.handoffs.get(jobId) === pending) this.handoffs.delete(jobId);
         pending.resolve();
+      }
+      // A settlement signal that arrived during the old delivery's busy
+      // replay is not lost: its marker-free retry starts after this attempt
+      // releases the in-flight flag. Held requests never auto-rearm.
+      if (requeued && pending.settlementReplayRequested && this.handoffs.get(jobId) === pending) {
+        pending.settlementReplayRequested = false;
+        void this.startHandoff(jobId, pending);
       }
       // requeued: stays pending and re-armable. held: stays pending and
       // VISIBLE but not sweep-rearmable — only a new validated request
@@ -1714,12 +1775,33 @@ export class WaveRunner {
       lanePath: input.jobLane?.path ?? null,
       laneBranch: input.jobLane?.branch ?? null,
     });
-    const blockers = findBusyLanes({
+    const laneMatched = findBusyLanes({
       ledger: this.opts.ledger,
       lanes: this.opts.worktrees.listWorktrees(),
       targetBranch,
       ...(input.reviewedStatus !== undefined ? { reviewedStatus: input.reviewedStatus } : {}),
     });
+    // A reviewed job's OWN unresolved re-brief fences the review regardless
+    // of which branch the request targets: an explicit `target_ref` naming
+    // another lane must not bypass the job's own newer request. Foreign
+    // lanes keep the existing branch-match semantics, and terminal jobs are
+    // never busy (the canonical terminal refusal owns them).
+    const blockers: BranchIdleBlocker[] = [...laneMatched];
+    const jobNow = this.opts.ledger.getJob(input.job.id);
+    if (
+      jobNow !== null &&
+      !isJobTerminal(jobNow.status) &&
+      !blockers.some((blocker) => blocker.jobId === input.job.id) &&
+      this.opts.ledger.listPendingRebriefs({ jobId: input.job.id }).length > 0
+    ) {
+      blockers.push({
+        jobId: input.job.id,
+        status: jobNow.status,
+        branch: input.jobLane?.branch != null && input.jobLane.branch.trim() !== ''
+          ? normalizeBranch(input.jobLane.branch)
+          : laneBranch(input.job.id),
+      });
+    }
     if (blockers.length === 0 && input.force !== true) return { targetBranch, blockers };
     this.opts.ledger.appendCustomEvent({
       kind: input.force === true ? 'branch-idle.forced' : 'branch-idle.refused',
@@ -1744,10 +1826,105 @@ export class WaveRunner {
     return this.track(this.setupRound(input, controller.signal), controller);
   }
 
+  /** Direct, lane-independent re-proof of the CURRENT fallback-admission
+   * facts (the shared guard early-returns without a job lane): the job's
+   * own lane must still exist, no unresolved re-brief may stand without an
+   * explicit audited force, and a replay must still be authorized. Bounded
+   * to the fallback seam; native arm/freeze are unchanged. */
+  private assertFallbackAdmissionCurrent(input: {
+    jobId: string;
+    targetRef?: string | undefined;
+    force?: boolean | undefined;
+    fromHandoff?: boolean | undefined;
+  }): void {
+    const lane = this.opts.worktrees
+      .listWorktrees({ jobId: input.jobId })
+      .find((candidate) => candidate.kind === 'job' && candidate.status !== 'swept') ?? null;
+    if (lane === null) {
+      throw new Error(`job "${input.jobId}" has no active job lane in the registry — the fallback review cannot start`);
+    }
+    if (input.force !== true) {
+      const job = this.opts.ledger.getJob(input.jobId);
+      // Terminal jobs are never busy (mirrors laneIsBusy): the canonical
+      // terminal guard wins over a stale marker, handled before this call.
+      if (job === null || !isJobTerminal(job.status)) {
+        const markers = this.opts.ledger.listPendingRebriefs({ jobId: input.jobId });
+        if (markers.length > 0) {
+          const targetBranch = resolveReviewTargetBranch({
+            jobId: input.jobId,
+            ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
+            lanePath: lane.path,
+            laneBranch: lane.branch,
+          });
+          const blockers: readonly BranchIdleBlocker[] = [
+            { jobId: input.jobId, status: job?.status ?? 'working', branch: targetBranch },
+          ];
+          this.opts.ledger.appendCustomEvent({
+            kind: 'branch-idle.refused',
+            jobId: input.jobId,
+            payload: { phase: 'arm', forced: false, targetBranch, blockers },
+          });
+          throw new BranchBusyError(targetBranch, blockers, 'arm');
+        }
+      }
+    }
+    if (input.fromHandoff === true) {
+      const pending = this.handoffs.get(input.jobId);
+      this.assertHandoffAuthorized(input.jobId, pending?.seq ?? -1);
+    }
+  }
+
+  /** Re-proof for a RUNNING fallback gate at its concrete async boundaries
+   * (before each round's diff intake, and after the default reviewer's
+   * worker-gate admission before it spawns): the lane must still exist, an
+   * unresolved re-brief stops a non-forced gate, and a replay must still be
+   * authorized. A forced admission carries the operator's explicit audited
+   * acceptance of the marker fence through the gate run; the lane and
+   * authorization facts still fail closed. */
+  private assertFallbackIterationCurrent(input: {
+    jobId: string;
+    force?: boolean | undefined;
+    fromHandoff?: boolean | undefined;
+  }): void {
+    const jobNow = this.opts.ledger.getJob(input.jobId);
+    if (jobNow !== null && isJobTerminal(jobNow.status)) {
+      throw new FallbackSafetyRefusal(
+        `job "${input.jobId}" is ${jobNow.status} — terminal lanes do not continue under fallback review`,
+      );
+    }
+    const lane = this.opts.worktrees
+      .listWorktrees({ jobId: input.jobId })
+      .find((candidate) => candidate.kind === 'job' && candidate.status !== 'swept') ?? null;
+    if (lane === null) {
+      throw new FallbackSafetyRefusal(
+        `job "${input.jobId}" lost its active job lane — the fallback gate stops fail-closed`,
+      );
+    }
+    if (input.force !== true) {
+      const markers = this.opts.ledger.listPendingRebriefs({ jobId: input.jobId });
+      if (markers.length > 0) {
+        throw new FallbackSafetyRefusal(
+          `an unresolved re-brief request owns job "${input.jobId}" — the fallback gate stops before the next review round`,
+        );
+      }
+    }
+    if (input.fromHandoff === true) {
+      const pending = this.handoffs.get(input.jobId);
+      try {
+        this.assertHandoffAuthorized(input.jobId, pending?.seq ?? -1);
+      } catch (error) {
+        throw new FallbackSafetyRefusal(
+          `the review handoff for job "${input.jobId}" is no longer authorized: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+  }
+
   private async beginFallbackGate(
     input: { jobId: string },
     failedLegs: readonly ReviewCapabilityFailure[],
     repoPath: string | null,
+    recheck?: () => void,
   ): Promise<FallbackGateOutcome> {
     const job = this.opts.ledger.getJob(input.jobId);
     if (job === null || repoPath === null) throw new Error(`job "${input.jobId}" not found — nothing to review`);
@@ -1790,7 +1967,7 @@ export class WaveRunner {
     };
     this.activeFallbackGates.add(job.id);
     const run = this.track(
-      this.runFallbackGate(job, repoPath, baseRef, failedLegs, gate, controller.signal, state)
+      this.runFallbackGate(job, repoPath, baseRef, failedLegs, gate, controller.signal, state, recheck)
         .finally(() => this.activeFallbackGates.delete(job.id)),
       controller,
     );
@@ -1828,6 +2005,7 @@ export class WaveRunner {
     gate: FallbackGateOptions,
     signal: AbortSignal,
     state: FallbackGateState,
+    recheck?: () => void,
   ): Promise<void> {
     const maxRounds = gate.maxReviewRounds ?? 4;
     const directory = join(this.artifactRoot(), 'fallback-gate', `${job.id}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
@@ -1844,6 +2022,34 @@ export class WaveRunner {
     let notes = 0;
     for (let iteration = 1; iteration <= maxRounds; iteration += 1) {
       if (signal.aborted) throw new Error('review operation aborted');
+      // The gate can outlive its admission by many rounds (review → fix
+      // directive → re-review). Re-prove the CURRENT lane/marker/
+      // authorization facts before this round's diff intake: a re-brief
+      // request admitted mid-gate owns the lane and must stop the gate
+      // before its working tree is read or another reviewer is spawned.
+      if (recheck !== undefined) {
+        try {
+          recheck();
+        } catch (error) {
+          if (error instanceof FallbackSafetyRefusal) {
+            this.terminalFallbackAborted(job.id, error.message, iteration, [...state.reportFiles], fallbackEvent, state);
+            return;
+          }
+          throw error;
+        }
+      }
+      // Presence catches an open request; this durable settlement watermark
+      // also catches a request that both began and finished during an async
+      // reviewer turn. Its old diff cannot be approved after that turn.
+      const settlementSeq = this.opts.ledger.latestJobEvent(job.id, 'silas.rebrief-settled')?.seq ?? 0;
+      const recheckRound = (): void => {
+        recheck?.();
+        if ((this.opts.ledger.latestJobEvent(job.id, 'silas.rebrief-settled')?.seq ?? 0) !== settlementSeq) {
+          throw new FallbackSafetyRefusal(
+            `a re-brief request settled during fallback round ${iteration} for job "${job.id}" — the old diff cannot pass`,
+          );
+        }
+      };
       const reportFile = join(directory, `review-${iteration}.json`);
       // Re-read the lane's working diff every round: the fix directive may
       // have changed the tree, and the next review must see those bytes.
@@ -1870,9 +2076,16 @@ export class WaveRunner {
       try {
         findings = gate.runFallbackReview !== undefined
           ? await gate.runFallbackReview({ jobId: job.id, lanePath, baseRef, diff, skillPath: gate.skillPath, reportFile, iteration, signal })
-          : await this.defaultFallbackReview({ jobId: job.id, lanePath, baseRef, diff, skillPath: gate.skillPath, reportFile, iteration, signal });
+          : await this.defaultFallbackReview({ jobId: job.id, lanePath, baseRef, diff, skillPath: gate.skillPath, reportFile, iteration, signal }, recheckRound);
+        // A completed review of an older diff is not a PASS on a lane that
+        // acquired and possibly settled a newer request while it ran.
+        recheckRound();
       } catch (error) {
         if (existsSync(reportFile)) state.reportFiles.push(reportFile);
+        if (error instanceof FallbackSafetyRefusal) {
+          this.terminalFallbackAborted(job.id, error.message, iteration, [...state.reportFiles], fallbackEvent, state);
+          return;
+        }
         this.terminalFallbackBlocked(job.id, `bmad-review round ${iteration} failed: ${sanitizeErrorLog(error)}`, iteration, [...state.reportFiles], fallbackEvent, state);
         return;
       }
@@ -1946,13 +2159,38 @@ export class WaveRunner {
     );
   }
 
-  private async defaultFallbackReview(input: FallbackReviewRunInput): Promise<readonly FallbackFinding[]> {
+  private terminalFallbackAborted(
+    jobId: string,
+    reason: string,
+    iteration: number,
+    reports: readonly string[],
+    fallbackEvent: (payload: Record<string, unknown>) => void,
+    state?: FallbackGateState,
+  ): void {
+    if (state !== undefined) state.note = `bmad-review gate aborted: ${reason}`;
+    fallbackEvent({ phase: 'aborted', iteration, reason, reports, clearToMerge: false });
+    this.opts.escalate?.(
+      `bmad-review gate ABORTED for job ${jobId}`,
+      `${reason}. No further review round ran; merge is NOT clear. Restore the Perkins gate for autonomous gating.`,
+    );
+  }
+
+  private async defaultFallbackReview(input: FallbackReviewRunInput, recheck?: () => void): Promise<readonly FallbackFinding[]> {
     let lease: PacingLease | null = this.opts.workerGate === undefined ? null : await this.opts.workerGate.acquireWorkerTurn({
       id: input.jobId, label: `fallback review → ${input.jobId}`, jobId: input.jobId, signal: input.signal,
     });
     let handle: AgentHandle | null = null;
     try {
+      // The worker-gate wait is an async admission window: re-prove the
+      // current facts AFTER the slot is granted and BEFORE the reviewer
+      // spawns, so a request or revocation landing in the queue cannot
+      // start an obsolete reviewer. The lease releases in the finally on
+      // throw.
+      if (recheck !== undefined) recheck();
       handle = await this.opts.spawner('minion', { cwd: input.lanePath, signal: input.signal });
+      // Spawning is asynchronous too: a newly owned lane must not receive
+      // an obsolete review prompt just because the worker was allocated.
+      recheck?.();
       const prompt = [
         `Read ${input.skillPath} completely and follow it to review the CURRENT working diff of this repository against base ${input.baseRef}.`,
         'This session runs ONE review pass inside a release gate. The host performs triage and every gate decision afterwards: do NOT approve, merge, or gate anything yourself, and do not modify implementation code.',

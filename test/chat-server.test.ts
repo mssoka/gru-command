@@ -2614,6 +2614,11 @@ describe('chat context controls and durable new-chat boundaries', () => {
         ),
       ).toMatchObject({ ok: true, epoch: 2 });
       expect(new GruSessionPointer(h.chatDir).current()).toMatchObject({ epoch: 2 });
+      // Post-commit retirement is deliberately released after this control's
+      // result (the reset barrier never waits on best-effort cleanup), so
+      // observe the retirement through the same bounded poll the first reset
+      // uses; the oracle still requires disposed to become true.
+      await pollUntil(() => firstFresh.disposed, 'fresh handle disposal after second reset');
       expect(firstFresh.disposed).toBe(true);
       await reconnect.close();
       await client.close();

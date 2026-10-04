@@ -142,6 +142,13 @@ function pendingRebriefGuardedEvent(
   return null;
 }
 
+function publishRebriefSettlement(ledger: LedgerApi, jobId: string): void {
+  // Unlike job.delivered, this event is published AFTER marker retirement.
+  // Queued review handoffs can now retry without treating an old delivery
+  // as proof that a newer re-brief has settled.
+  ledger.appendCustomEvent({ kind: 'silas.rebrief-settled', jobId });
+}
+
 /**
  * Record a settled re-brief turn's events and clear its markers. Idempotent
  * per marker: an event that already landed since the request watermark is
@@ -242,6 +249,7 @@ export function finalizeRebriefRequest(input: {
 
   // Markers clear ONLY now — every guarded event exists.
   input.ledger.clearPendingRebriefs(markers.map((marker) => marker.id));
+  publishRebriefSettlement(input.ledger, input.jobId);
   return { minionId: input.minionId, deliveredSha, deliveryNote, rebriefRecorded, deliveryRecorded, superseded: false };
 }
 
@@ -282,6 +290,7 @@ export async function reconcilePendingRebriefs(
     const missing = group.filter((marker) => pendingRebriefGuardedEvent(deps.ledger, marker, groupPhaseId) === null);
     if (missing.length === 0) {
       deps.ledger.clearPendingRebriefs(group.map((marker) => marker.id));
+      publishRebriefSettlement(deps.ledger, jobId);
       completed += 1;
       continue;
     }
@@ -300,6 +309,7 @@ export async function reconcilePendingRebriefs(
         ...(phaseId !== null ? { phaseId } : {}),
       });
       deps.ledger.clearPendingRebriefs(group.map((marker) => marker.id));
+      publishRebriefSettlement(deps.ledger, jobId);
       deps.ledger.appendCustomEvent({
         kind: 'silas.rebrief-recovered',
         jobId,

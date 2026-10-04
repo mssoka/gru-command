@@ -235,6 +235,18 @@ function field<T>(json: unknown, key: string): T {
   return (json as Record<string, unknown>)[key] as T;
 }
 
+/** The minion's briefing turn runs in the background; a review request must
+ * observe the SETTLED lane (the same wait the fallback-gate case below
+ * documents). Otherwise the branch-idle guard can refuse the arm with 409
+ * and the pushed origin tip may not exist yet for the freeze — a real race
+ * under co-tenant load, not a product behavior. */
+async function waitForDelivery(h: ServerHarness, jobId: string): Promise<void> {
+  await vi.waitFor(
+    () => expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).not.toBeNull(),
+    { timeout: 10_000 },
+  );
+}
+
 /** The directive endpoint now records durable intent first and answers 202:
  * the async turn settles on the request record — poll it deterministically
  * (no wall-clock sleeps in the assertions themselves). */
@@ -643,7 +655,7 @@ describe('dispatch server (E8)', () => {
     }
   });
 
-  it('by=silas on the pr/review endpoints records silas attribution events; without by it does not', async () => {
+  it('by=silas on the pr/review endpoints records silas attribution events', async () => {
     const h = await boot();
     const repo = makeFixtureRepo('fixture-silas-by');
     cleanupRepos.push(repo);
@@ -652,6 +664,7 @@ describe('dispatch server (E8)', () => {
       await call(h.port, 'POST', '/api/dispatch', {
         job_id: 'by-silas-job', repo_path: repo.path, title: 'attribution', briefing: 'b',
       }, TOKEN);
+      await waitForDelivery(h, 'by-silas-job');
       const pr = await call(h.port, 'POST', '/api/dispatch/pr', {
         job_id: 'by-silas-job', url: PR_URL, by: 'silas',
       }, TOKEN);
@@ -665,12 +678,29 @@ describe('dispatch server (E8)', () => {
       expect(kinds).toContain('silas.review-triggered');
       const reviewEvent = h.ledger.listJobEvents('by-silas-job').find((event) => event.kind === 'silas.review-triggered');
       expect((reviewEvent?.payload as { route?: string }).route).toBe('perkins');
-      // and an unattributed job stays clean of silas events
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('without by, the pr/review endpoints record no silas attribution events', async () => {
+    // One scenario per case (the inherited combined case ran two full
+    // review setups under one 30s default and timed out under co-tenant
+    // load). This arm keeps its own bound, waits for the settled turn and
+    // asserts the unattributed review's 202 so the absence of silas events
+    // is proven on a request that was actually processed to completion.
+    const h = await boot();
+    const repo = makeFixtureRepo('fixture-silas-none');
+    cleanupRepos.push(repo);
+    attachBareOrigin(repo);
+    try {
       await call(h.port, 'POST', '/api/dispatch', {
         job_id: 'by-none-job', repo_path: repo.path, title: 'plain', briefing: 'b',
       }, TOKEN);
-      await call(h.port, 'POST', '/api/dispatch/pr', { job_id: 'by-none-job', url: PR_URL }, TOKEN);
-      await call(h.port, 'POST', '/api/dispatch/review', { job_id: 'by-none-job' }, TOKEN);
+      await waitForDelivery(h, 'by-none-job');
+      expect((await call(h.port, 'POST', '/api/dispatch/pr', { job_id: 'by-none-job', url: PR_URL }, TOKEN)).status).toBe(200);
+      const review = await call(h.port, 'POST', '/api/dispatch/review', { job_id: 'by-none-job' }, TOKEN);
+      expect(review.status).toBe(202);
       const plainKinds = h.ledger.listJobEvents('by-none-job').map((event) => event.kind);
       expect(plainKinds).not.toContain('silas.pr-registered');
       expect(plainKinds).not.toContain('silas.review-triggered');

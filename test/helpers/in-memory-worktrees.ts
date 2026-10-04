@@ -29,6 +29,9 @@ export class InMemoryWorktreePort implements WorktreePort {
     // Git-backed fixtures resolve with the production discipline; the
     // non-git contract fixtures keep the fabricated identity this double
     // guarantees every other method (their lanes are plain directories).
+    // Deliberately probed per call: a path's git-ness is not cached — the
+    // contract suite deletes its fixture between tests and expects the
+    // double to fall back exactly as it would for a never-git directory.
     const probe = spawnSync('git', ['-C', input.repoPath, 'rev-parse', '--is-inside-work-tree'], {
       stdio: 'ignore',
     });
