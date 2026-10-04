@@ -17,6 +17,7 @@
  */
 
 import {
+  agentActivityOf,
   agentRuntimeOf,
   isJobConcluded,
   type AgentView,
@@ -237,7 +238,11 @@ export function liveWorkerStampsByJob(agents: readonly AgentView[]): Map<string,
     // registration stamp must not keep a stopped lane warm (code review
     // 2026-10-04 A2).
     if (agent.state === 'disposed') continue;
-    const raw = agent.lastActivity ?? agent.createdAt ?? null;
+    // Issue #171: the stall clock prefers the supervision event clock —
+    // a long-running turn whose ledger row has not been rewritten still
+    // has fresh supervision activity, and the crew rail reads that same
+    // clock (the job must not read cold while its worker shows quiet).
+    const raw = agentActivityOf(agent) ?? agent.createdAt ?? null;
     if (raw === null) continue;
     const at = Date.parse(raw);
     if (Number.isNaN(at)) continue;

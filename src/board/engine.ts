@@ -486,13 +486,28 @@ export class BoardEngine {
   snapshot(): BoardSnapshot {
     const jobs = this.ledger.listJobs();
     const agentRows = this.ledger.listAgents();
+    // Issue #171: ONE ownership read per snapshot (the probe rebuilds a
+    // set of every live handle) and ONE supervision lookup per row — the
+    // same evidence serves the activity projection and the agent views.
+    const ownership = this.ownershipProbe?.() ?? null;
+    const supervisionById = new Map<string, AgentSupervisionView | null>(
+      agentRows.map((agent) => [agent.id, this.supervisionFor(agent.id)]),
+    );
+    const runtimeClassOf = (agent: AgentRecord): AgentRuntimeClass =>
+      this.classifyRuntime(agent.id, supervisionById.get(agent.id) ?? null, ownership);
     // Per-job newest agent activity and per-round lens attempt counts are
     // derived once per snapshot from the same agent rows (ISO stamps
     // compare lexicographically; lens children mint `lens:chunk` labels).
     const activityByJob = new Map<string, string>();
     const attemptsByRound = new Map<string, Map<string, number>>();
     for (const agent of agentRows) {
-      if (agent.jobId !== null && agent.lastActivity !== null) {
+      // Issue #171: a verified-historical record's frozen stamp is not
+      // current activity — it must never warm the lane's stall clock.
+      if (
+        agent.jobId !== null &&
+        agent.lastActivity !== null &&
+        runtimeClassOf(agent) !== 'historical'
+      ) {
         const newest = activityByJob.get(agent.jobId);
         if (newest === undefined || agent.lastActivity > newest) activityByJob.set(agent.jobId, agent.lastActivity);
       }
@@ -520,7 +535,7 @@ export class BoardEngine {
       .map(([name, group]) => ({ name, jobs: group }))
       .sort((a, b) => a.name.localeCompare(b.name));
     const agents = agentRows
-      .map((agent) => this.agentView(agent))
+      .map((agent) => this.agentView(agent, supervisionById.get(agent.id) ?? null, ownership))
       .sort(
         (a, b) =>
           RUNTIME_ORDER[a.runtime] - RUNTIME_ORDER[b.runtime] ||
@@ -647,15 +662,18 @@ export class BoardEngine {
     };
   }
 
-  private agentView(agent: AgentRecord): AgentView {
-    const supervision = this.supervisionFor(agent.id);
+  private agentView(
+    agent: AgentRecord,
+    supervision: AgentSupervisionView | null,
+    ownership: RuntimeOwnership | null,
+  ): AgentView {
     return {
       id: agent.id,
       role: agent.role,
       label: agent.label,
       state: agent.state,
       status: derivedStatus(agent.state, supervision),
-      runtime: this.runtimeClassOf(agent.id, supervision),
+      runtime: this.classifyRuntime(agent.id, supervision, ownership),
       lastActivity: agent.lastActivity,
       // The row's registration stamp: the board's stall clock floor for a
       // fresh worker that has not sent its first frame (twelve-followthrough A1/E1).
@@ -675,16 +693,16 @@ export class BoardEngine {
    * runtime: unclean stop, restart, or import). A wired probe answering
    * `null` (temporarily unavailable) is missing evidence → `unverified`,
    * as is a board with no witness wired at all. */
-  private runtimeClassOf(
+  private classifyRuntime(
     agentId: string,
     supervision: AgentSupervisionView | null,
+    ownership: RuntimeOwnership | null,
   ): AgentRuntimeClass {
     if (supervision !== null) return 'current';
     if (this.ownershipProbe !== null) {
       // The registry probe is the wired witness: an ANSWER classifies
       // (member → current, verified absence → historical); a null answer
       // is missing evidence → unverified, never a guessed class.
-      const ownership = this.ownershipProbe() ?? null;
       if (ownership === null) return 'unverified';
       return ownership.ownedAgentIds.has(agentId) ? 'current' : 'historical';
     }

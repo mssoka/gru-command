@@ -146,17 +146,28 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   Liveness is runtime ownership, not the raw stored state: each row
   carries a `runtime` classification — `current` (the live runtime owns
   it: registry handle, supervision adoption or a hydrated durable stop —
-  a stopped/restoring lane stays current), `historical` (ownership probes
-  are wired and no live runtime owns the record — a previous run or
-  import left it; collapsed behind a `+N history` disclosure with
-  transcripts intact, never counted or sorted as crew) or `unverified`
-  (no ownership evidence — visible and explicitly marked, never guessed
-  dead). The chip reads the DERIVED `status`: a raw `idle` with an open
-  supervision turn/control/tool call presents the work it is doing
-  (`streaming`), and the quiet clock prefers the supervision event
-  stream. A duplicated CURRENT singleton-role owner is marked `⚠
-  duplicate` — an anomaly surfaced, never silently discarded. Clicking
-  an agent with a session file opens its transcript. The silas chip is
+  a stopped/restarting lane stays current, and an owner-held stop keeps
+  its live-crew row even after the released handle left the record
+  `disposed`), `historical` (ownership probes are wired and no live
+  runtime owns the record — a previous run or import left it; collapsed
+  behind a `+N history` disclosure with transcripts intact, never
+  counted or sorted as crew) or `unverified` (no ownership evidence —
+  visible and explicitly marked, never guessed dead; on a classifying
+  server an ambiguous row stays visible but is NOT claimed in the CREW
+  count). A pre-upgrade server (no classification on any row) keeps the
+  legacy attribution and counting. The chip reads the DERIVED `status`:
+  a raw `idle` with an open supervision turn/control/tool call presents
+  the work it is doing (`streaming`), and the quiet clock reads the newer
+  of the ledger stamp and the supervision event stream. A duplicated
+  CURRENT singleton-role owner (`gru`/`silas`/`bob`) is marked `⚠
+  duplicate` — an anomaly surfaced, never silently discarded; a review
+  pool (`perkins`) runs lead + specialists concurrently and never
+  triggers the mark. The TRACKERS crew counts follow the same
+  classification and derived status, so the strip and the rail cannot
+  disagree. Clicking an agent with a session file opens its transcript.
+  Supervision activity (open turn/control/tool calls) changes without a
+  ledger event, so the board also refreshes every heartbeat interval —
+  a connected rail can never stay stale. The silas chip is
   LIVE when `[silas] enabled` (default): the hosted ops session
   (`silas-ops` slot) appears there whenever its wake turns run, and its
   follow-through lands on the ledger as `silas.*` events

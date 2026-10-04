@@ -812,7 +812,7 @@ test.describe('board (E6, mock feed)', () => {
     // sorted into it, disclosed behind their own history toggle.
     await expect
       .poll(async () => (await page.locator('#rail-tab-agents').textContent())?.trim() ?? '')
-      .toBe('CREW (7)');
+      .toBe('CREW (8)');
     await expect(rail.locator('.board-agent--historical')).toHaveCount(0);
     const historyToggle = rail.locator(".board-agent-toggle[data-section='history']");
     await expect(historyToggle).toContainText('2 history');
@@ -830,6 +830,31 @@ test.describe('board (E6, mock feed)', () => {
     const gru = rail.locator('.board-agent', { hasText: 'gru · chat' });
     await expect(gru.locator('.board-agent__state')).toHaveText('streaming');
     await expect(gru.locator('.board-agent__age')).toContainText(/quiet/);
+
+    // Owner-held stop: the released handle left the record disposed, but
+    // the live crew keeps the lane with its stopped mark (never the
+    // graveyard behind the disposed toggle).
+    const held = rail.locator('.board-agent', { hasText: 'held-after-breaker' });
+    await expect(held.locator('.board-agent__supervision--alert')).toHaveText('⛔ stopped');
+    await expect(rail.locator(".board-agent-toggle[data-section='disposed']")).toContainText('1 disposed');
+
+    // Acceptance evidence: the same truth under the dark theme.
+    await page.locator('#theme-toggle').click();
+    await expect(page.locator('html')).toHaveClass(/dark/);
+    await expect(gru.locator('.board-agent__state')).toHaveText('streaming');
+    await expect(historyToggle).toContainText('2 history');
+    await expect(historical).toHaveCount(2);
+    await page.locator('#theme-toggle').click();
+
+    // Acceptance evidence: the same truth in a narrow phone viewport.
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expect(gru.locator('.board-agent__state')).toHaveText('streaming');
+    await expect(historical).toHaveCount(2);
+    await expect(historical.first().locator('.board-agent__runtime--historical')).toContainText('history');
+    const fits = await page.evaluate(
+      () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
+    );
+    expect(fits).toBe(true);
   });
 
   test('trackers render in dark theme and on a narrow phone viewport', async ({ page }) => {

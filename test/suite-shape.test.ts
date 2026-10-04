@@ -17,7 +17,7 @@ const PINS: Record<string, number> = {
   'board-engine-v4.test.ts': 4,
   'board-engine.test.ts': 35,
   'board-frames.test.ts': 3,
-  'board-runtime-truth.test.ts': 12,
+  'board-runtime-truth.test.ts': 14,
   'board-server.test.ts': 18,
   'bob-scheduler.test.ts': 5,
   'branch-idle-guard.test.ts': 41,

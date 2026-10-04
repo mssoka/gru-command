@@ -1265,28 +1265,77 @@ describe('board agent rail — truthful runtime status (#171)', () => {
     expect(age).toMatch(/^\d+s quiet$/);
   });
 
-  it('ambiguous ownership renders an explicit unverified mark — never hidden, never claimed dead', () => {
+  it('ambiguous ownership stays visible and marked, but only confirmed current owners count as crew', () => {
     const view = new BoardView(() => {});
     view.render(
       snapshot({
         agents: [
-          // Pre-#171 server: no runtime field at all.
+          // A classifying snapshot (some row carries runtime) with one
+          // row missing the field and one explicitly unverified, plus a
+          // confirmed current owner.
           agent('legacy-row', { state: 'idle' }),
           agent('probed-row', { state: 'idle', runtime: 'unverified' }),
+          agent('current-row', { state: 'idle', runtime: 'current' }),
         ],
       }),
     );
     const rows = [...document.querySelectorAll<HTMLElement>('#board-agents .board-agent')];
-    expect(rows).toHaveLength(2); // conservative: stays visible
-    expect(document.getElementById('rail-agents-count')?.textContent).toBe('2');
-    for (const row of rows) {
+    expect(rows).toHaveLength(3); // conservative: ambiguous rows stay visible
+    // The active count claims only what the runtime proves (AC5).
+    expect(document.getElementById('rail-agents-count')?.textContent).toBe('1');
+    const marked = rows.filter((row) => row.querySelector('.board-agent__runtime--unknown') !== null);
+    expect(marked).toHaveLength(2);
+    for (const row of marked) {
       expect(row.querySelector('.board-agent__runtime--unknown')?.textContent).toBe('❓ unverified');
     }
     // No history/disposed disclosures were fabricated from ambiguity.
     expect(document.querySelector('.board-agent-toggle')).toBeNull();
   });
 
-  it('a genuine duplicate current singleton owner is surfaced as an anomaly; a historical epoch is not', () => {
+  it('a pre-upgrade snapshot (no runtime classification at all) keeps the legacy board: every live row counts and none is marked', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        agents: [agent('old-a', { state: 'idle' }), agent('old-b', { role: 'minion', state: 'streaming' })],
+      }),
+    );
+    expect(document.getElementById('rail-agents-count')?.textContent).toBe('2');
+    expect(document.querySelector('.board-agent__runtime--unknown')).toBeNull();
+    expect(document.querySelector('.board-agent-toggle')).toBeNull();
+  });
+
+  it('an owner-held stop stays in the live crew and counts even when the released handle left the record disposed', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        agents: [
+          // Breaker trip: handle disposed → ledger state disposed, while
+          // the current supervisor still owns the lane awaiting re-arm.
+          agent('minion-stopped', {
+            role: 'minion',
+            state: 'disposed',
+            runtime: 'current',
+            supervision: { state: 'stopped', restarts: 3, breakerOpen: true, stopReason: 'crash loop' },
+          }),
+          // A genuinely disposed past record keeps the graveyard.
+          agent('minion-old', { role: 'minion', state: 'disposed', runtime: 'historical' }),
+        ],
+      }),
+    );
+    const rail = document.getElementById('board-agents')!;
+    const liveRow = rail.querySelector<HTMLElement>('.board-agent:not(.board-agent--disposed):not(.board-agent--historical)');
+    expect(liveRow?.textContent).toContain('minion-stopped');
+    expect(liveRow?.querySelector('.board-agent__supervision--alert')?.textContent).toBe('⛔ stopped');
+    // The active count includes the held lane; the graveyard toggle does
+    // not.
+    expect(document.getElementById('rail-agents-count')?.textContent).toBe('1');
+    const disposedToggle = [...rail.querySelectorAll<HTMLButtonElement>('.board-agent-toggle')].find(
+      (toggle) => toggle.textContent?.includes('disposed'),
+    );
+    expect(disposedToggle?.textContent).toContain('1 disposed');
+  });
+
+  it('a genuine duplicate current singleton owner is surfaced as an anomaly; a historical epoch or review pool is not', () => {
     const view = new BoardView(() => {});
     view.render(
       snapshot({
@@ -1296,14 +1345,18 @@ describe('board agent rail — truthful runtime status (#171)', () => {
           agent('silas-sept', { role: 'silas', state: 'streaming', runtime: 'historical' }),
           agent('minion-1', { role: 'minion', state: 'idle', runtime: 'current' }),
           agent('minion-2', { role: 'minion', state: 'idle', runtime: 'current' }),
+          // A review round legitimately runs lead + specialists under the
+          // same role concurrently — never a duplicate-owner anomaly.
+          agent('perkins-lead', { role: 'perkins', state: 'idle', runtime: 'current' }),
+          agent('perkins-blind', { role: 'perkins', state: 'idle', runtime: 'current' }),
         ],
       }),
     );
     const flagged = [...document.querySelectorAll<HTMLElement>('#board-agents .board-agent')].filter(
       (row) => row.querySelector('.board-agent__runtime--alert') !== null,
     );
-    // Both CURRENT Silas owners carry the anomaly; the historical epoch
-    // and the two minions never do.
+    // Both CURRENT Silas owners carry the anomaly; the historical epoch,
+    // the minions and the concurrent Perkins review pool never do.
     expect(flagged.map((row) => row.querySelector('.board-agent__name')?.textContent)).toEqual([
       'silas-a',
       'silas-b',

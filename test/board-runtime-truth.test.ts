@@ -314,3 +314,57 @@ describe('board engine — runtime event feed keeps classification surfaces fed 
     expect(agent?.state).toBe('disposed'); // the graveyard keeps the record
   });
 });
+
+describe('board engine — historical stamps never warm a lane (#171)', () => {
+  it('job.lastAgentActivity reads current-runtime agents only: a frozen historical stamp is not current activity', async () => {
+    const db = new LedgerDb(tmpDir());
+    const bus = new EventBus();
+    const api = new LedgerApi(db.handle, { bus });
+    api.addJob({ id: 'lane-1', repo: 'demo', title: 'Lane truth' });
+    // The current worker speaks first...
+    api.registerAgent({ id: 'minion-now', role: 'minion', jobId: 'lane-1' });
+    api.setAgentState('minion-now', 'idle');
+    const currentStamp = api.getAgent('minion-now')?.lastActivity ?? null;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    // ...then the stale September session's frozen record carries the
+    // NEWER stamp (an unclean stop froze it mid-stream). It is not the
+    // lane's current activity — only the owned worker's stamp may warm
+    // the stall clock.
+    api.registerAgent({ id: 'minion-sept', role: 'minion', jobId: 'lane-1' });
+    api.setAgentState('minion-sept', 'streaming');
+    const historicalStamp = api.getAgent('minion-sept')?.lastActivity ?? null;
+    expect(currentStamp).not.toBeNull();
+    expect(historicalStamp).not.toBeNull();
+    expect(historicalStamp! > currentStamp!).toBe(true); // newer in wall-clock terms
+
+    const engine = new BoardEngine({
+      ledger: api,
+      bus,
+      runtimeOwnership: () => owned('minion-now'),
+    });
+    const job = engine.snapshot().repos.flatMap((repo) => repo.jobs).find((view) => view.id === 'lane-1');
+    expect(job?.lastAgentActivity).toBe(currentStamp);
+  });
+
+  it('the ownership probe answers at most once per snapshot, whatever the ledger size', () => {
+    const db = new LedgerDb(tmpDir());
+    const bus = new EventBus();
+    const api = new LedgerApi(db.handle, { bus });
+    for (let index = 0; index < 25; index += 1) {
+      api.registerAgent({ id: `bulk-${index}`, role: 'minion' });
+    }
+    let calls = 0;
+    const engine = new BoardEngine({
+      ledger: api,
+      bus,
+      runtimeOwnership: () => {
+        calls += 1;
+        return owned('bulk-0');
+      },
+    });
+    engine.snapshot();
+    expect(calls).toBe(1);
+    engine.snapshot();
+    expect(calls).toBe(2);
+  });
+});

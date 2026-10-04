@@ -6,6 +6,13 @@
  */
 
 import type { AgentView, BoardSnapshot, JobPrState, JobView } from './board-protocol.js';
+import {
+  agentActivityOf,
+  agentRailBand,
+  agentStatusOf,
+  hasRuntimeClassification,
+  isCountedCrewAgent,
+} from './board-protocol.js';
 import { isSameLocalDay } from './board-time.js';
 
 export interface JobStatusCounts {
@@ -95,18 +102,27 @@ export function prCounts(jobs: readonly JobView[], now = new Date()): PrCounts {
 }
 
 export function laneCounts(agents: readonly AgentView[]): LaneCounts {
-  const midTurn = agents.filter((agent) => agent.state === 'streaming');
+  // Issue #171: the KPI strip agrees with the crew rail — only confirmed
+  // live-band rows count (verified-historical rows never do, and on a
+  // classifying server an ambiguous unverified row is not claimed active).
+  // A pre-upgrade snapshot (no classification at all) keeps the legacy
+  // attribution so an unclassified board never silently drops rows.
+  const classificationPresent = hasRuntimeClassification(agents);
+  const active = agents.filter(
+    (agent) => agentRailBand(agent) === 'live' && isCountedCrewAgent(agent, classificationPresent),
+  );
+  const midTurn = active.filter((agent) => agentStatusOf(agent) === 'streaming');
   let oldest: string | null = null;
   for (const agent of midTurn) {
-    const stamp = agent.lastActivity;
+    const stamp = agentActivityOf(agent);
     if (stamp === null) continue;
     if (oldest === null || stamp < oldest) oldest = stamp;
   }
   return {
-    liveMinions: agents.filter((agent) => agent.role === 'minion' && agent.state !== 'disposed').length,
+    liveMinions: active.filter((agent) => agent.role === 'minion').length,
     midTurn: midTurn.length,
     midTurnOldestAt: oldest,
-    disposed: agents.filter((agent) => agent.state === 'disposed').length,
+    disposed: agents.filter((agent) => agentRailBand(agent) === 'disposed').length,
   };
 }
 

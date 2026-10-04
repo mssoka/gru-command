@@ -21,9 +21,12 @@
 
 import {
   agentActivityOf,
+  agentRailBand,
   agentRuntimeOf,
   agentStateTone,
   agentStatusOf,
+  hasRuntimeClassification,
+  isCountedCrewAgent,
   isJobConcluded,
   jobChipTone,
   jobStatusTone,
@@ -861,18 +864,28 @@ export class BoardView {
     // Issue #171 truthful agent status: liveness is RUNTIME OWNERSHIP,
     // not the raw stored state. The live crew = current members plus
     // explicitly-ambiguous unverified rows (missing evidence is never
-    // death — the row stays visible and marked). Verified-historical
-    // records (a previous run/import left them; the live runtime owns
-    // none of them) collapse behind a history disclosure with their
-    // transcripts intact, and disposed rows keep their graveyard.
-    const disposed = agents.filter((agent) => agent.state === 'disposed');
-    const historical = agents.filter(
-      (agent) => agent.state !== 'disposed' && agentRuntimeOf(agent) === 'historical',
+    // death — the row stays visible and marked); on a classifying server
+    // only CONFIRMED current rows count toward CREW (n), so the count
+    // never claims ambiguous ownership as active. Owner-held stops or
+    // restarts stay in the live crew even when the released handle left
+    // the ledger state disposed — the current runtime still owns the
+    // lane. Verified-historical records (a previous run/import left them)
+    // collapse behind a history disclosure with their transcripts intact;
+    // fully disposed rows keep their graveyard. A pre-upgrade snapshot
+    // (no classification at all) keeps today's attribution and counting.
+    const classificationPresent = hasRuntimeClassification(agents);
+    const disposed: AgentView[] = [];
+    const historical: AgentView[] = [];
+    const live: AgentView[] = [];
+    for (const agent of agents) {
+      const band = agentRailBand(agent);
+      if (band === 'disposed') disposed.push(agent);
+      else if (band === 'historical') historical.push(agent);
+      else live.push(agent);
+    }
+    this.agentsCount.textContent = String(
+      live.filter((agent) => isCountedCrewAgent(agent, classificationPresent)).length,
     );
-    const live = agents.filter(
-      (agent) => agent.state !== 'disposed' && agentRuntimeOf(agent) !== 'historical',
-    );
-    this.agentsCount.textContent = String(live.length);
     if (agents.length === 0) {
       rail.append(el('div', 'lbl', 'no crew yet'));
       return;
@@ -884,7 +897,14 @@ export class BoardView {
     // duplicated singleton role so the operator can investigate (#171).
     const duplicateRoles = duplicatedSingletonRoles(live);
     for (const agent of live) {
-      rail.append(this.agentRow(agent, 'live', duplicateRoles.has(agent.id)));
+      rail.append(
+        this.agentRow(
+          agent,
+          'live',
+          duplicateRoles.has(agent.id),
+          classificationPresent && agentRuntimeOf(agent) === 'unverified',
+        ),
+      );
     }
     if (historical.length > 0) {
       const toggle = el(
@@ -908,7 +928,7 @@ export class BoardView {
       });
       rail.append(toggle);
       if (this.historyExpanded) {
-        for (const agent of historical) rail.append(this.agentRow(agent, 'historical', false));
+        for (const agent of historical) rail.append(this.agentRow(agent, 'historical', false, false));
       }
     }
     if (disposed.length > 0) {
@@ -931,7 +951,7 @@ export class BoardView {
       });
       rail.append(toggle);
       if (this.disposedExpanded) {
-        for (const agent of disposed) rail.append(this.agentRow(agent, 'disposed', false));
+        for (const agent of disposed) rail.append(this.agentRow(agent, 'disposed', false, false));
       }
     }
   }
@@ -946,6 +966,7 @@ export class BoardView {
     agent: AgentView,
     section: 'live' | 'historical' | 'disposed',
     duplicateSingleton: boolean,
+    ambiguousOwnership: boolean,
   ): HTMLElement {
     const row = el(
       'button',
@@ -987,8 +1008,9 @@ export class BoardView {
       subline.append(this.ageNode('board-agent__age lbl', agentActivityOf(agent), '', ' quiet'));
     }
     // Issue #171: ambiguous ownership is explicit — an unverified row is
-    // visible, marked, and never claimed active or dead by the board.
-    if (section === 'live' && agentRuntimeOf(agent) === 'unverified') {
+    // visible, marked, and never claimed active or dead by the board (on
+    // a pre-upgrade server no row is marked: the whole board is legacy).
+    if (ambiguousOwnership) {
       subline.append(el('span', 'board-agent__runtime board-agent__runtime--unknown', '❓ unverified'));
       row.title += ' · runtime ownership unverified (no ownership evidence)';
     }
@@ -1259,9 +1281,11 @@ function agentLabel(agent: AgentView): string {
   return `${agent.role} · ${agent.id.slice(0, 12)}`;
 }
 
-/** Roles the service hosts ONE of (the standing crew + bob); minions are
- * a pool and never duplicate. */
-const SINGLETON_ROLES: ReadonlySet<string> = new Set(['gru', 'silas', 'perkins', 'bob']);
+/** Roles the service hosts ONE of (the standing crew + bob). Minions are
+ * a pool and never duplicate — and NEITHER is perkins: a review round
+ * runs its lead alongside specialist children under the same role, so a
+ * concurrent-review fan-out is normal, not a duplicate-owner anomaly. */
+const SINGLETON_ROLES: ReadonlySet<string> = new Set(['gru', 'silas', 'bob']);
 
 /** Issue #171: agent ids of the live rail's rows whose singleton role has
  * MORE THAN ONE current owner — an unexpected concurrent owner is an
