@@ -14,16 +14,24 @@ import type { AgentHandle, PromptOptions, PromptTurnVerdict } from './types.js';
  */
 
 /** Settle-time health fallback for handles without per-turn capture (and
- * structural/test doubles). Missing health carries no failure evidence;
- * a throwing health read is unproven and never becomes success. */
+ * structural/test doubles). Positive completion requires the runtime's
+ * terminal state to be `idle`; an in-band `error` carries its detail, and
+ * every other state (`streaming`/`spawning`/`disposed`) is an unknown
+ * terminal outcome that never becomes success (#160). Missing health carries
+ * no failure evidence; a throwing health read is unproven and never becomes
+ * success. */
 export function promptVerdictFromHealth(handle: Pick<AgentHandle, 'health'>): PromptTurnVerdict {
   if (typeof handle.health !== 'function') return { ok: true, error: null };
   try {
     const health = handle.health();
+    if (health.state === 'idle') return { ok: true, error: null };
     if (health.state === 'error') {
       return { ok: false, error: health.error ?? 'runtime settled the turn with an in-band error' };
     }
-    return { ok: true, error: null };
+    return {
+      ok: false,
+      error: `runtime settled the turn without positive completion evidence (state: ${health.state})`,
+    };
   } catch (error) {
     return { ok: false, error: `runtime terminal health unreadable: ${String(error)}` };
   }

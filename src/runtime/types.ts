@@ -243,9 +243,12 @@ export interface PendingTurn {
  * transport IN its settle path, before any queued successor turn can start
  * (single-writer queues pump inside the settle path, ahead of the caller's
  * continuation) — so the caller can never mistake a successor's health for
- * this turn's outcome. `ok:false` = the turn ended in an in-band runtime
- * error (Claude `result.isError`, Pi assistant `stopReason: 'error'`),
- * which is NOT a successful delivery merely because the Promise resolved. */
+ * this turn's outcome. `ok:true` requires the turn's own LAST assistant
+ * message to prove a successful completion (`stopReason: 'stop'`);
+ * `ok:false` covers an in-band runtime error (Claude `result.isError`, Pi
+ * assistant `stopReason: 'error'`), an abort/disposal, and any other
+ * failed/unknown terminal outcome — none of which is a successful delivery
+ * merely because the Promise resolved. */
 export interface PromptTurnVerdict {
   readonly ok: boolean;
   readonly error: string | null;

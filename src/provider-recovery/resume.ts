@@ -251,6 +251,36 @@ async function claimJobMinion(
     });
     return { outcome: 'skipped', waitId: wait.id, why: 'continuation spawn failed after atomic claim (recorded; no automatic replay)' };
   }
+  // Guarded continuation turn truth (#160): a prompt that settles with an
+  // in-band runtime error was admitted but is NOT a continuation. The atomic
+  // claim stays the durable record (never replayed automatically); the
+  // failure is surfaced where the digest and settle attribution see it.
+  // A delivery must never be minted from a settled-but-failed turn.
+  if (result.outcome === 'error') {
+    const detail = result.error ?? 'runtime settled the continuation turn with an in-band error';
+    deps.ledger.appendCustomEvent({
+      kind: 'provider.continuation-failed',
+      jobId: wait.jobId,
+      agentId: result.minionId,
+      payload: { wait_id: wait.id, by, stage: 'turn', error: detail.slice(0, 300) },
+    });
+    deps.ledger.appendCustomEvent({
+      kind: 'job.minion-error',
+      jobId: wait.jobId,
+      payload: { agentId: result.minionId, error: detail },
+    });
+    deps.log?.('error', 'provider recovery continuation settled with an in-band error — claim kept, no delivery', {
+      wait_id: wait.id,
+      job: wait.jobId,
+      minion: result.minionId,
+      error: detail,
+    });
+    return {
+      outcome: 'skipped',
+      waitId: wait.id,
+      why: 'continuation turn settled with an in-band error (recorded; no automatic replay)',
+    };
+  }
   deps.log?.('info', 'provider recovery continuation started', {
     wait_id: wait.id,
     job: wait.jobId,

@@ -62,6 +62,9 @@ class FakeHandle implements AgentHandle {
   readonly capabilities = FAKE_CAPABILITIES;
   promptCount = 0;
   disposed = false;
+  /** Settle-time terminal health the fallback verdict reads (#160 tests). */
+  healthState: 'idle' | 'error' = 'idle';
+  healthError: string | null = null;
   private readonly listeners = new Set<RuntimeEventListener>();
 
   constructor(role: Role, id: string, sessionFile: string | null) {
@@ -87,7 +90,12 @@ class FakeHandle implements AgentHandle {
     };
   }
   health(): AgentHealth {
-    return { state: 'idle', lastActivity: new Date().toISOString(), sessionFile: this.sessionFile };
+    return {
+      state: this.healthState,
+      lastActivity: new Date().toISOString(),
+      sessionFile: this.sessionFile,
+      ...(this.healthError === null ? {} : { error: this.healthError }),
+    };
   }
   async dispose(): Promise<void> {
     this.disposed = true;
@@ -227,6 +235,33 @@ describe('guarded claim — happy path', () => {
     // The continuation prompt was delivered exactly once.
     const spawned = [...h.registry.handles.values()].find((handle) => handle.promptCount > 0);
     expect(spawned?.promptCount).toBe(1);
+  });
+
+  it('a continuation turn that settles with an in-band error is recorded, never reported as continued (#160)', async () => {
+    const h = new ClaimHarness();
+    const sessionDir = mkdtempSync(join(tmpdir(), 'pr-session-inband-'));
+    cleanupDirs.push(sessionDir);
+    const sessionFile = join(sessionDir, 'minion.jsonl');
+    writeFileSync(sessionFile, '{}\n');
+    const jobId = 'j-inband';
+    const waitId = await h.recoveredMinionWait({ sessionFile, jobId });
+    h.registry.spawnImpl = (resumeFile) => {
+      const handle = new FakeHandle('minion', `agent-inband-${h.registry.handles.size + 1}`, resumeFile);
+      handle.healthState = 'error';
+      handle.healthError = 'assistant stopReason error';
+      h.registry.handles.set(handle.id, handle);
+      return handle;
+    };
+    const result = await claimProviderRecoveryContinuation(h.deps(), waitId, 'silas');
+    // The prompt settled but the turn failed in-band: NOT a continuation.
+    expect(result.outcome).toBe('skipped');
+    expect(result.outcome === 'skipped' ? result.why : '').toContain('in-band');
+    // Durable non-success evidence, no delivery, claim kept (no replay).
+    const events = h.ledger.listJobEvents(jobId, { limit: 50 });
+    expect(events.some((event) => event.kind === 'provider.continuation-failed')).toBe(true);
+    expect(events.some((event) => event.kind === 'job.minion-error')).toBe(true);
+    expect(events.some((event) => event.kind === 'job.delivered')).toBe(false);
+    expect(h.ledger.getProviderWait(waitId)?.status).toBe('claimed');
   });
 
   it('a missing session file falls back to a fresh worker on the same lane', async () => {
