@@ -181,9 +181,13 @@ export class ChatView {
       if (event.key !== 'Enter' || event.shiftKey) return;
       if (this.coarse.matches) return;
       if (event.altKey || event.ctrlKey || event.metaKey) return;
-      if (event.repeat) return;
       if (event.isComposing || event.keyCode === 229) return;
+      // Every intercepted press blocks the native default — including
+      // auto-repeats: the first press just sent and cleared the composer,
+      // so a still-held Enter's default would type stray newlines into
+      // the fresh draft. Submit only the first press.
       event.preventDefault();
+      if (event.repeat) return;
       this.form.requestSubmit();
     });
     // Auto-grow with content; the CSS max-height is the hard cap (the
@@ -804,11 +808,14 @@ export class ChatView {
   /** User message status changes: queued → sent → acked. `live` is false
    * for replayed frames: the viewport settle coalesces those. */
   upsertMessage(message: ChatMessage, live = true): void {
-    // A user message is conversation: it ends any open service run.
-    this.closeServiceBand();
     let bubble = this.bubbles.get(message.client_msg_id);
     const fresh = bubble === undefined;
     if (bubble === undefined) {
+      // A genuinely NEW user message is conversation: it ends any open
+      // service run. A status update to an already-rendered bubble is not
+      // a boundary — closing there split one consecutive service run into
+      // two bands (g22/#118).
+      this.closeServiceBand();
       bubble = el('div', 'msg msg--user');
       this.bubbles.set(message.client_msg_id, bubble);
       this.log.append(bubble);

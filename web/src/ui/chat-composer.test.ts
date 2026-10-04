@@ -276,6 +276,39 @@ describe('multi-line composer', () => {
     expect(submits()).toBe(1);
   });
 
+  it('a held Enter auto-repeat is default-prevented so it cannot insert newlines', () => {
+    const view = new ChatView(() => true);
+    view.bindAttach(null);
+    const form = document.getElementById('chat-form') as HTMLFormElement;
+    const submits = countedSubmit(form);
+
+    input().value = 'hold to send';
+    const first = new KeyboardEvent('keydown', {
+      key: 'Enter',
+      bubbles: true,
+      cancelable: true,
+    });
+    input().dispatchEvent(first);
+    expect(first.defaultPrevented).toBe(true);
+    expect(submits()).toBe(1);
+    expect(input().value).toBe('');
+
+    // Enter is still held: the browser fires auto-repeats after the first
+    // press already sent and cleared the composer. A repeat must not
+    // re-submit AND must not keep the native default — that default is
+    // what types a stray newline into the fresh draft (#26).
+    const repeat = new KeyboardEvent('keydown', {
+      key: 'Enter',
+      repeat: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    input().dispatchEvent(repeat);
+    expect(repeat.defaultPrevented).toBe(true);
+    expect(submits()).toBe(1);
+    expect(input().value).toBe('');
+  });
+
   it('auto-grows with content and collapses back after a successful send', () => {
     pinGeometry(40, 6);
     const view = new ChatView(() => true);
