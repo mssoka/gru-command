@@ -144,6 +144,7 @@ describe('the remaining health cards render truthfully or n/a', () => {
     lastReconcileFailedAt: null as string | null,
     reconcileFailedNewer: false,
     lastUsefulActionAt: null as string | null,
+    nextAction: null as string | null,
     openTurnSince: null as string | null,
     reconciliationsToday: 0,
     checkedAt: ISO(0),
@@ -155,7 +156,7 @@ describe('the remaining health cards render truthfully or n/a', () => {
       NOW.getTime(),
     );
     expect(wired.value).toBe('wake 4m ago');
-    expect(wired.detail).toBe('3 machine reconciliations today');
+    expect(wired.detail).toBe('3 machine actions today');
     const never = silasCard({ ...silasBase }, NOW.getTime());
     expect(never.value).toBe('no wakes yet');
     expect(silasCard(null, NOW.getTime()).value).toBe('n/a');
@@ -178,7 +179,7 @@ describe('the remaining health cards render truthfully or n/a', () => {
     );
     expect(open.value).toBe('turn open 1h');
     // An open turn must not hide whether the loop is still moving.
-    expect(open.detail).toBe('reconciled 1m ago · 0 machine reconciliations today');
+    expect(open.detail).toBe('reconciled 1m ago · 0 machine actions today');
   });
 
   it('Silas: a pass that failed after the last success is louder than every healthy state (#163)', () => {
@@ -283,6 +284,7 @@ describe('the health row — fixed order over the snapshot', () => {
         lastReconcileFailedAt: null,
         reconcileFailedNewer: false,
         lastUsefulActionAt: null,
+        nextAction: null,
         openTurnSince: null,
         reconciliationsToday: 1,
         checkedAt: ISO(0),

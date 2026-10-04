@@ -14,7 +14,7 @@ const PINS: Record<string, number> = {
   'attachments.test.ts': 28,
   'awareness.test.ts': 45,
   'bmad-onboarding.test.ts': 13,
-  'board-engine-v4.test.ts': 5,
+  'board-engine-v4.test.ts': 6,
   'board-engine.test.ts': 35,
   'board-frames.test.ts': 3,
   'board-runtime-truth.test.ts': 14,

@@ -25,7 +25,7 @@ import { createReviewEscalationNotifier } from './dispatch/escalation-identity.j
 import { createStartupVerdictPoster } from './dispatch/perkins-github-app.js';
 import { BobScheduler } from './dispatch/bob-scheduler.js';
 import { SilasDriver, supervisionLookup } from './dispatch/silas-driver.js';
-import { createDurableReconcileHook } from './dispatch/durable-reconcile.js';
+import { createDurableReconcileHook, waveReconcileBinding } from './dispatch/durable-reconcile.js';
 import { ProviderRecoverySensor, establishProviderWait } from './provider-recovery/sensor.js';
 import { ModelRuntimeProbe } from './provider-recovery/probe.js';
 import {
@@ -1419,7 +1419,7 @@ async function main(): Promise<number> {
         ledger,
         notifications,
         log: (level, msg, fields) => logger.log(level, msg, fields),
-        wave: { reconcilePendingHandoffs: () => state.wave?.reconcilePendingHandoffs() },
+        wave: waveReconcileBinding(() => state.wave),
       }),
       githubPoll: new GitHubSignalPoll({
         ledger,

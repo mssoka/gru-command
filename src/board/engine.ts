@@ -175,8 +175,11 @@ export interface SilasView {
    * passes cannot tie-break wrongly). */
   readonly reconcileFailedNewer: boolean;
   /** Newest state-correction action (register PR, trigger review,
-   * directive, rebrief, escalation). */
+   * directive, settlement, rebrief, escalation). */
   readonly lastUsefulActionAt: string | null;
+  /** The oldest live obligation's durable next action, pre-rendered: the
+   * truthful "what is owed next" projection (null when none is live). */
+  readonly nextAction: string | null;
   /** The current open model turn's start (latest wake marker while
    * supervision reports an open turn); null when no turn is open. */
   readonly openTurnSince: string | null;
@@ -278,18 +281,6 @@ const SILAS_ACTION_KINDS = [
   'silas.rebrief',
   'silas.escalated',
 ] as const;
-
-/** Durable machine follow-through the deterministic pass finishes (issue
- * #163): phase hand-backs and obligation writes/settlements are machine
- * reconciliations even though they are not `silas.*` events. Counted and
- * surfaced consistently with the actions above (the card labels them
- * "machine reconciliations"). */
-const MACHINE_ACTION_KINDS = [
-  'job.phase-handoff-completed',
-  'job.obligation-recorded',
-  'job.obligation-settled',
-] as const;
-const RECONCILE_ACTION_KINDS = [...SILAS_ACTION_KINDS, ...MACHINE_ACTION_KINDS] as const;
 
 /** PR state from the record: a terminal `merged` job is merged; a
  * registered URL is open. `conflicting` has no writer yet — the PR-state
@@ -645,11 +636,30 @@ export class BoardEngine {
       lastReconcileFailedAt: reconcileFailed?.ts ?? null,
       reconcileFailedNewer:
         reconcileFailed !== null && (reconcileOk === null || reconcileFailed.seq > reconcileOk.seq),
-      lastUsefulActionAt: this.ledger.latestEventOfKinds(RECONCILE_ACTION_KINDS)?.ts ?? null,
+      lastUsefulActionAt: this.ledger.latestEventOfKinds(SILAS_ACTION_KINDS)?.ts ?? null,
+      nextAction: this.nextActionProjection(),
       openTurnSince: openTurn ? (wake?.ts ?? null) : null,
-      reconciliationsToday: this.ledger.countEventsSince(RECONCILE_ACTION_KINDS, dayStart.toISOString()),
+      reconciliationsToday: this.ledger.countEventsSince(SILAS_ACTION_KINDS, dayStart.toISOString()),
       checkedAt: new Date(now).toISOString(),
     };
+  }
+
+  /** The oldest live obligation as the durable next action (issue #163):
+   * an admission-unknown request, a phase hand-back or a verification
+   * debt all land as obligations, so the board can name what is owed
+   * without recomputing the digest. */
+  private nextActionProjection(): string | null {
+    const row = this.ledger.listObligations({ states: ['open', 'waiting'], limit: 1 })[0];
+    if (row === undefined) return null;
+    const next = row.nextAction;
+    const detail =
+      next.kind === 'silas-mechanical'
+        ? next.action
+        : next.kind === 'external-wait'
+          ? next.condition
+          : next.decision;
+    const bounded = detail.length > 120 ? `${detail.slice(0, 117)}...` : detail;
+    return `${next.kind}: ${bounded} (${row.jobId})`;
   }
 
   /** Repo-grouped job views (the group map preserves ledger job order). */

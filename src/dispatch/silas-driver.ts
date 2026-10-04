@@ -149,15 +149,13 @@ export interface DigestLedger {
   latestJobEventsByPayloadScope(
     jobId: string,
     kinds: readonly string[],
-    opts?: { limit?: number },
   ): readonly EventRecord[];
-  /** Exact payload identity query (retirement fences): found however much
-   * newer same-kind traffic carries other identities. */
-  hasJobEventWithPayloadValue(
+  /** Exact multi-payload identity query (retirement fences): found however
+   * much newer same-kind traffic carries other identities. */
+  hasJobEventWithPayloadValues(
     jobId: string,
     kinds: readonly string[],
-    key: string,
-    value: string,
+    values: readonly { readonly key: string; readonly value: string }[],
     sinceSeq: number,
   ): boolean;
   latestJobEvent(jobId: string, kind: string): EventRecord | null;
@@ -486,18 +484,25 @@ const VERIFICATION_ACTIVITY_KINDS: readonly string[] = [
   'verification.attached',
 ];
 
-/** A submission/attempt at an EXACT head, by identity query (the payload
- * key differs per scheduler event kind). */
-function verificationActivityAtHead(
+/** A fresh PRODUCER submission at an exact (scope, head), by identity
+ * query. `verification.attached` and `verification.started` are
+ * deliberately excluded: attaching/starting joins a pre-existing attempt
+ * and is not a new submission that answers a debt. */
+function verificationResubmittedAtHead(
   ledger: DigestLedger,
   jobId: string,
+  scope: string,
   head: string,
   sinceSeq: number,
 ): boolean {
-  return (
-    ledger.hasJobEventWithPayloadValue(jobId, ['verification.requested'], 'head', head, sinceSeq) ||
-    ledger.hasJobEventWithPayloadValue(jobId, ['verification.attached'], 'head', head, sinceSeq) ||
-    ledger.hasJobEventWithPayloadValue(jobId, ['verification.started'], 'sha', head, sinceSeq)
+  return ledger.hasJobEventWithPayloadValues(
+    jobId,
+    ['verification.requested'],
+    [
+      { key: 'scope', value: scope },
+      { key: 'head', value: head },
+    ],
+    sinceSeq,
   );
 }
 
@@ -815,11 +820,11 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     const verificationCompleted = input.ledger.latestJobEvent(job.id, 'verification.completed');
     const verificationTimeout = input.ledger.latestJobEvent(job.id, 'verification.lock-timeout');
     if (verificationCompleted !== null || verificationTimeout !== null) {
-      const scopedEvents = input.ledger.latestJobEventsByPayloadScope(
-        job.id,
-        ['verification.completed', 'verification.lock-timeout', ...VERIFICATION_ACTIVITY_KINDS],
-        { limit: 500 },
-      );
+      const scopedEvents = input.ledger.latestJobEventsByPayloadScope(job.id, [
+        'verification.completed',
+        'verification.lock-timeout',
+        ...VERIFICATION_ACTIVITY_KINDS,
+      ]);
       const scopeOf = (event: EventRecord): string => payloadString(event, 'scope') ?? '(unknown-scope)';
       const latestCompleted = new Map<string, EventRecord>();
       const latestActivity = new Map<string, EventRecord>();
@@ -849,21 +854,20 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
           );
         }
         const repaired = fingerprints.some((fingerprint) =>
-          input.ledger.hasJobEventWithPayloadValue(
+          input.ledger.hasJobEventWithPayloadValues(
             job.id,
             ['silas.directive-sent'],
-            'blocker_fingerprint',
-            fingerprint,
+            [{ key: 'blocker_fingerprint', value: fingerprint }],
             completed.seq,
           ),
         );
-        // A retry at the FAILED head retires the row (a still-failing retry
-        // re-arms it with the newer result); another head does not answer
-        // this failure.
+        // A NEW submission at the FAILED (scope, head) retires the row (a
+        // still-failing retry re-arms it with the newer result); another
+        // scope or head does not answer this failure.
         const retryInFlight =
-          head === null
+          head === null || scopeLabel === null
             ? (latestActivity.get(scopeKey)?.seq ?? -1) > completed.seq
-            : verificationActivityAtHead(input.ledger, job.id, head, completed.seq);
+            : verificationResubmittedAtHead(input.ledger, job.id, scopeLabel, head, completed.seq);
         if (repaired || retryInFlight) continue;
         digest.verificationFailures.push({
           jobId: job.id,
@@ -877,21 +881,25 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       }
       for (const [scopeKey, timeout] of latestTimeout) {
         const head = payloadString(timeout, 'head');
-        // A fresh submission at the PINNED head supersedes the wait; a
-        // completion answers it only for the pinned attempt. Another head
-        // is a different attempt and does not retire this reconsideration.
+        const scopeLabel = payloadString(timeout, 'scope');
+        // A fresh PRODUCER submission at the PINNED (scope, head)
+        // supersedes the wait; a completion answers it only for the pinned
+        // attempt. Another scope or head is a different operation and does
+        // not retire this reconsideration.
         const resubmitted =
-          head === null
+          head === null || scopeLabel === null
             ? (latestActivity.get(scopeKey)?.seq ?? -1) > timeout.seq
-            : verificationActivityAtHead(input.ledger, job.id, head, timeout.seq);
+            : verificationResubmittedAtHead(input.ledger, job.id, scopeLabel, head, timeout.seq);
         const completedSameHead =
-          head === null
+          head === null || scopeLabel === null
             ? (latestCompleted.get(scopeKey)?.seq ?? -1) > timeout.seq
-            : input.ledger.hasJobEventWithPayloadValue(
+            : input.ledger.hasJobEventWithPayloadValues(
                 job.id,
                 ['verification.completed'],
-                'sha',
-                head,
+                [
+                  { key: 'scope', value: scopeLabel },
+                  { key: 'sha', value: head },
+                ],
                 timeout.seq,
               );
         if (resubmitted || completedSameHead) continue;

@@ -164,6 +164,7 @@ describe('board server-frame validator', () => {
         lastReconcileFailedAt: null,
         reconcileFailedNewer: false,
         lastUsefulActionAt: null,
+        nextAction: null,
         openTurnSince: null,
         reconciliationsToday: 2,
         checkedAt: '2026-01-01T00:00:00.000Z',
@@ -179,6 +180,7 @@ describe('board server-frame validator', () => {
       ['silas', { ...(wired as { silas: object }).silas, reconciliationsToday: -1 }],
       ['silas', { ...(wired as { silas: object }).silas, reconcileFailedNewer: 'no' }],
       ['silas', { ...(wired as { silas: object }).silas, reconcileFailedNewer: undefined }],
+      ['silas', { ...(wired as { silas: object }).silas, nextAction: 7 }],
       ['verify', { ...(wired as { verify: object }).verify, lockInUse: 'yes' }],
       ['selfHeal', { ...(wired as { selfHeal: object }).selfHeal, sessionsResumed: 1.5 }],
     ] as const) {

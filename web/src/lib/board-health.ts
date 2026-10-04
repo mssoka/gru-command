@@ -166,8 +166,8 @@ export function silasCard(silas: SilasView | null | undefined, now = Date.now())
   // moving: the detail carries the reconcile freshness beside the count.
   const detail =
     silas.openTurnSince !== null && silas.lastReconcileAt !== null
-      ? `reconciled ${formatAge(silas.lastReconcileAt, now)} ago · ${silas.reconciliationsToday} machine reconciliations today`
-      : `${silas.reconciliationsToday} machine reconciliations today`;
+      ? `reconciled ${formatAge(silas.lastReconcileAt, now)} ago · ${silas.reconciliationsToday} machine actions today`
+      : `${silas.reconciliationsToday} machine actions today`;
   const full = [
     `last wake ${formatAge(silas.lastWakeAt, now)} ago (start marker)`,
     `last reconcile ${silas.lastReconcileAt === null ? 'never' : `${formatAge(silas.lastReconcileAt, now)} ago`}`,
@@ -179,7 +179,8 @@ export function silasCard(silas: SilasView | null | undefined, now = Date.now())
     silas.lastUsefulActionAt === null
       ? 'no corrective action yet'
       : `last action ${formatAge(silas.lastUsefulActionAt, now)} ago`,
-    `${silas.reconciliationsToday} machine reconciliations today`,
+    silas.nextAction === null ? 'no action owed' : `next owed: ${silas.nextAction}`,
+    `${silas.reconciliationsToday} machine actions today`,
   ].join(' · ');
   return card(
     'silas',

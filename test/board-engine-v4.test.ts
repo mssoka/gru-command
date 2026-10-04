@@ -39,6 +39,7 @@ describe('board engine — v4 snapshot blocks', () => {
       lastReconcileFailedAt: null,
       reconcileFailedNewer: false,
       lastUsefulActionAt: null,
+      nextAction: null,
       openTurnSince: null,
       reconciliationsToday: 0,
       checkedAt: '2026-09-23T12:00:00.000Z',
@@ -152,5 +153,28 @@ describe('board engine — v4 snapshot blocks', () => {
 
     api.setJobStatus(job.id, 'merged');
     expect(engine.snapshot().repos.flatMap((r) => r.jobs).find((j) => j.id === job.id)?.prState).toBe('merged');
+  });
+  it('attributes only Silas-issued actions and projects the durable next action (#163 review)', () => {
+    const { api, engine } = fresh({ now: () => Date.now() });
+    const job = api.addJob({ id: 'job-next', repo: 'demo', title: 't', briefing: 'b' });
+    api.setJobStatus(job.id, 'working');
+    // An unrelated obligation write is machine debt, never a Silas action.
+    api.recordBlockedObservation(job.id, {
+      logicalStep: 'operation',
+      category: { kind: 'unknown' },
+      observedAtSeq: api.latestEventSeq(),
+    });
+    const machine = engine.snapshot().silas;
+    expect(machine.lastUsefulActionAt).toBeNull();
+    expect(machine.reconciliationsToday).toBe(0);
+    expect(machine.nextAction).toContain('gru-decision');
+    expect(machine.nextAction).toContain(job.id);
+
+    // A Silas-issued machine action advances both the timestamp and today's
+    // count.
+    const settled = api.appendCustomEvent({ kind: 'silas.directive-settled', jobId: job.id, payload: {} });
+    const silas = engine.snapshot().silas;
+    expect(silas.lastUsefulActionAt).toBe(settled.ts);
+    expect(silas.reconciliationsToday).toBe(1);
   });
 });

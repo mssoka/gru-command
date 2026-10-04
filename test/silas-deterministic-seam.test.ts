@@ -6,7 +6,7 @@ import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { SilasDriver } from '../src/dispatch/silas-driver.js';
-import { createDurableReconcileHook } from '../src/dispatch/durable-reconcile.js';
+import { createDurableReconcileHook, waveReconcileBinding } from '../src/dispatch/durable-reconcile.js';
 import { WaveRunner } from '../src/dispatch/perkins.js';
 import { preflightFailure } from '../src/dispatch/review-path.js';
 import { GitReviewPort } from './helpers/git-review-port.js';
@@ -67,7 +67,7 @@ describe('Silas deterministic-pass seam drives actual handoff reconsideration', 
         return createDurableReconcileHook({
           ledger,
           notifications: { postIncident: () => ({ id: 'seam-notice' }) },
-          wave: { reconcilePendingHandoffs: () => wave.reconcilePendingHandoffs() },
+          wave: waveReconcileBinding(() => wave),
         })(context as Parameters<ReturnType<typeof createDurableReconcileHook>>[0]);
       },
     });

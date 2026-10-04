@@ -829,13 +829,13 @@ export class LedgerApi {
   latestJobEventsByPayloadScope(
     jobId: string,
     kinds: readonly string[],
-    opts: { limit?: number } = {},
   ): readonly EventRecord[] {
     if (kinds.length === 0) throw new Error('latestJobEventsByPayloadScope requires at least one kind');
-    const limit = opts.limit ?? 200;
+    // One grouped pass over the job's events (no per-row correlated MAX)
+    // and NO cap: the result set is one row per (kind, scope), bounded by
+    // the configured scope set, so an older unresolved scope can never be
+    // dropped by a newest-N cutoff.
     const placeholders = kinds.map(() => '?').join(', ');
-    // One grouped pass over the job's events (no per-row correlated MAX),
-    // so a long-lived lane's verification history stays linear per digest.
     const rows = this.db
       .prepare(
         `SELECT e.* FROM events e
@@ -844,34 +844,35 @@ export class LedgerApi {
              WHERE s.job_id = ? AND s.kind IN (${placeholders})
              GROUP BY s.kind, json_extract(s.payload, '$.scope')
           )
-          ORDER BY e.seq DESC LIMIT ?`,
+          ORDER BY e.seq DESC`,
       )
-      .all(jobId, ...(kinds as string[]), limit) as Row[];
+      .all(jobId, ...(kinds as string[])) as Row[];
     return rows.map((row) => this.eventFromRow(row));
   }
 
-  /** Does a job event of one of these kinds exist after `sinceSeq` with an
-   * EXACT payload key/value match? The identity check for retirement
-   * fences: a matching fingerprint/head/request is found no matter how
-   * much newer same-kind traffic carries other identities. */
-  hasJobEventWithPayloadValue(
+  /** Does a job event of one of these kinds exist after `sinceSeq` with
+   * EXACT payload key/value matches for every pair? The identity check for
+   * retirement fences: a matching fingerprint/head/scope/request is found
+   * no matter how much newer same-kind traffic carries other identities. */
+  hasJobEventWithPayloadValues(
     jobId: string,
     kinds: readonly string[],
-    key: string,
-    value: string,
+    values: readonly { readonly key: string; readonly value: string }[],
     sinceSeq: number,
   ): boolean {
-    if (kinds.length === 0) throw new Error('hasJobEventWithPayloadValue requires at least one kind');
-    if (key.trim() === '') throw new Error('hasJobEventWithPayloadValue requires a non-empty payload key');
+    if (kinds.length === 0) throw new Error('hasJobEventWithPayloadValues requires at least one kind');
+    if (values.length === 0) throw new Error('hasJobEventWithPayloadValues requires at least one payload match');
     const placeholders = kinds.map(() => '?').join(', ');
+    const matches = values.map(() => `json_extract(payload, '$.' || ?) = ?`).join(' AND ');
+    const params: unknown[] = [jobId, ...(kinds as string[]), sinceSeq];
+    for (const { key, value } of values) params.push(key, value);
     const row = this.db
       .prepare(
         `SELECT 1 AS found FROM events
-          WHERE job_id = ? AND kind IN (${placeholders}) AND seq > ?
-            AND json_extract(payload, '$.' || ?) = ?
+          WHERE job_id = ? AND kind IN (${placeholders}) AND seq > ? AND ${matches}
           LIMIT 1`,
       )
-      .get(jobId, ...(kinds as string[]), sinceSeq, key, value) as Row | undefined;
+      .get(...(params as never[])) as Row | undefined;
     return row !== undefined;
   }
 

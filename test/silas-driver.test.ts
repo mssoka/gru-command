@@ -2181,7 +2181,10 @@ describe('silas deterministic pass observation (issue #163)', () => {
       /import\s*\{[^}]*\bcreateDurableReconcileHook\b[^}]*\}\s*from\s*'\.\/dispatch\/durable-reconcile\.js'/,
     );
     expect(mainSource).toMatch(/onDeterministicPass:\s*createDurableReconcileHook\(\{/);
-    expect(mainSource).toMatch(/wave:\s*\{\s*reconcilePendingHandoffs:/);
+    expect(mainSource).toMatch(/wave:\s*waveReconcileBinding\(/);
+    expect(mainSource).toMatch(
+      /import\s*\{[^}]*\bwaveReconcileBinding\b[^}]*\}\s*from\s*'\.\/dispatch\/durable-reconcile\.js'/,
+    );
   });
   it('a wait row is bound to its pinned head: another head cannot retire it, the same head can', async () => {
     const h = makeLedger();
@@ -2365,7 +2368,16 @@ describe('silas deterministic pass observation (issue #163)', () => {
     const h = makeLedger();
     try {
       h.ledger.addJob({ id: 'job-mech', repo: 'fixture-app', title: 't', briefing: 'b' });
-      h.ledger.recordBlockedObservation('job-mech', {
+      // A VALID chief ruling makes the authority verifiable/executable in
+      // the ledger — the pass still does not claim it, because no executor
+      // port exists for any closed mechanical action (the missing piece is
+      // an execution port, not the reconciliation).
+      h.ledger.appendCustomEvent({
+        kind: 'ruling.recorded',
+        jobId: 'job-mech',
+        payload: { ref: 'r-mech', version: '1' },
+      });
+      const obligation = h.ledger.recordBlockedObservation('job-mech', {
         logicalStep: 'implementation',
         category: { kind: 'known', category: 'quality-gate' },
         incidentKey: 'mechanical-pin',
@@ -2373,6 +2385,7 @@ describe('silas deterministic pass observation (issue #163)', () => {
         nextAction: { kind: 'silas-mechanical', action: 'register-pr' },
         authority: { source: 'chief-ruling', rulingRef: 'r-mech', version: '1' },
       });
+      expect(h.ledger.verifyObligationAuthority(obligation.id).executable).toBe(true);
       const report = reconcileDurableWork({
         ledger: h.ledger,
         notifications: { postIncident: () => ({ id: 'notice-pin' }) },

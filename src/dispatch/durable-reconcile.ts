@@ -146,6 +146,17 @@ export interface DurableReconcileHookDeps extends DurableReconcileDeps {
  * tests with a real LedgerApi and driver — never by a source-text-only
  * alarm.
  */
+/** Late-bound wave reconciliation binding (production composition seam):
+ * the callback reads the live wave handle at every pass, so a
+ * construction-order change (or a not-yet-assigned wave) can never freeze
+ * a null. Extracted so the exact production binding is behaviorally
+ * exercised by tests with a real queued WaveRunner. */
+export function waveReconcileBinding(
+  getWave: () => { reconcilePendingHandoffs(): void } | undefined,
+): { reconcilePendingHandoffs(): void } {
+  return { reconcilePendingHandoffs: () => getWave()?.reconcilePendingHandoffs() };
+}
+
 export function createDurableReconcileHook(deps: DurableReconcileHookDeps): DeterministicPassHook {
   return () => {
     deps.wave?.reconcilePendingHandoffs();
