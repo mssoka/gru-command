@@ -90,7 +90,9 @@ function writeCaptureManifest(): void {
   );
 }
 
-/** Record one produced capture with runtime viewport/theme and its hash. */
+/** Record one produced capture with runtime viewport/theme and its hash.
+ * Refuses a second record for the same relative file: one file identity,
+ * one claim (the earlier attempt's overwritten-identity defect). */
 async function recordCapture(
   page: Page,
   file: string,
@@ -101,8 +103,12 @@ async function recordCapture(
     viewport: `${window.innerWidth}x${window.innerHeight}`,
     theme: document.documentElement.classList.contains('dark') ? 'dark' : 'light',
   }));
+  const relative = path.relative(ATTEMPT_ROOT, file);
+  if (captureRecords.some((record) => record.file === relative)) {
+    throw new Error(`duplicate capture identity ${relative} — every capture must be unique within an attempt`);
+  }
   captureRecords.push({
-    file: path.relative(ATTEMPT_ROOT, file),
+    file: relative,
     kind,
     test: test.info().title,
     viewport: runtime.viewport,
@@ -112,6 +118,29 @@ async function recordCapture(
     sha256: createHash('sha256').update(fs.readFileSync(file)).digest('hex'),
   });
   writeCaptureManifest();
+}
+
+/** Stable per-test slug for file identities: the full title path plus a
+ * short digest, so two tests can never compose the same output path. */
+function testSlug(): string {
+  const titlePath = test.info().titlePath.join(' > ');
+  const base = titlePath.toLowerCase().replace(/[^a-z0-9]+/gu, '-').replace(/^-+|-+$/gu, '').slice(0, 48);
+  return `${base}-${createHash('sha1').update(titlePath).digest('hex').slice(0, 8)}`;
+}
+
+function selectorSlug(selector: string): string {
+  return selector.toLowerCase().replace(/[^a-z0-9]+/gu, '-').replace(/^-+|-+$/gu, '').slice(0, 48) || 'target';
+}
+
+/** Unique-within-attempt capture path; an existing path is a hard error —
+ * never a silent re-use or overwrite of an earlier artifact. */
+function uniqueCapturePath(kind: CaptureRecord['kind'], name: string): string {
+  fs.mkdirSync(ATTEMPT_ROOT, { recursive: true });
+  const file = path.join(ATTEMPT_ROOT, `${kind}-${testSlug()}-${name}.png`);
+  if (fs.existsSync(file)) {
+    throw new Error(`capture output already exists — refusing to overwrite an earlier artifact: ${file}`);
+  }
+  return file;
 }
 
 const T0 = '2026-10-03T00:00:00.000Z';
@@ -308,16 +337,14 @@ async function bodyOverflow(page: Page): Promise<number> {
 /** Stitched full-document capture (continuity only): fullPage renders are
  * explicitly NOT viewport-visibility evidence. */
 async function capture(page: Page, name: string, state = 'full-document render'): Promise<void> {
-  fs.mkdirSync(ATTEMPT_ROOT, { recursive: true });
-  const file = path.join(ATTEMPT_ROOT, `stitched-fullpage-${name}.png`);
+  const file = uniqueCapturePath('stitched-fullpage', name);
   await page.screenshot({ path: file, fullPage: true });
   await recordCapture(page, file, 'stitched-fullpage', state);
 }
 
 /** Live viewport capture: the claimed on-screen state at this moment. */
 async function captureViewport(page: Page, name: string, state = 'viewport'): Promise<void> {
-  fs.mkdirSync(ATTEMPT_ROOT, { recursive: true });
-  const file = path.join(ATTEMPT_ROOT, `viewport-${name}.png`);
+  const file = uniqueCapturePath('viewport', name);
   await page.screenshot({ path: file, fullPage: false });
   await recordCapture(page, file, 'viewport', state);
 }
@@ -348,9 +375,110 @@ async function hitTarget(page: Page, selector: string): Promise<HitTarget> {
 
 async function expectReachable(page: Page, selector: string): Promise<void> {
   const target = await hitTarget(page, selector);
+  if (!target.found || !target.inViewport || !target.hit) {
+    // Evidence FIRST (a unique live viewport capture + geometry/occluder
+    // sidecar at the failing instant), then the strict oracle still fails
+    // the test: diagnostics never mask a genuinely covered target.
+    await collectFailureContext(page, selector);
+  }
   expect(target.found, `missing ${selector}`).toBe(true);
   expect(target.inViewport, `${selector} fully inside the viewport`).toBe(true);
   expect(target.hit, `${selector} center is the topmost hit target (not covered)`).toBe(true);
+}
+
+/** Failure-instant evidence for a covered/unreachable target: which
+ * element is topmost at the center and the full hit stack, target/chrome/
+ * nav/band-head rectangles, scroll offsets and computed scroll styles,
+ * plus a two-frame re-measure that distinguishes a stale measurement from
+ * real coverage. Written only when the strict oracle is about to fail. */
+async function collectFailureContext(page: Page, selector: string): Promise<void> {
+  fs.mkdirSync(ATTEMPT_ROOT, { recursive: true });
+  const base = path.join(
+    ATTEMPT_ROOT,
+    `failure-${testSlug()}-${selectorSlug(selector)}-${Date.now()}`,
+  );
+  if (fs.existsSync(`${base}.json`) || fs.existsSync(`${base}.png`)) {
+    throw new Error(`failure-context path already exists — refusing to overwrite: ${base}`);
+  }
+  const probe = await page.evaluate((sel) => {
+    const describe = (element: Element | null): string => {
+      if (element === null) return 'null';
+      const id = element.id === '' ? '' : `#${element.id}`;
+      const classes =
+        typeof element.className === 'string' && element.className.trim() !== ''
+          ? `.${element.className.trim().split(/\s+/u).join('.')}`
+          : '';
+      return `${element.tagName.toLowerCase()}${id}${classes}`;
+    };
+    const rectOf = (element: Element | null): { x: number; y: number; width: number; height: number } | null => {
+      if (element === null) return null;
+      const box = element.getBoundingClientRect();
+      return { x: box.x, y: box.y, width: box.width, height: box.height };
+    };
+    const target = document.querySelector<HTMLElement>(sel);
+    if (target === null) {
+      return { selector: sel, target: null, note: 'target missing at failure time' };
+    }
+    const box = target.getBoundingClientRect();
+    const cx = box.left + box.width / 2;
+    const cy = box.top + box.height / 2;
+    const band = target.closest('.board-band');
+    const head = band?.querySelector('.board-band__head') ?? null;
+    const targetStyle = getComputedStyle(target);
+    const htmlStyle = getComputedStyle(document.documentElement);
+    return {
+      selector: sel,
+      target: {
+        element: describe(target),
+        rect: rectOf(target),
+        isActiveElement: document.activeElement === target,
+        scrollMarginTop: targetStyle.scrollMarginTop,
+        position: targetStyle.position,
+      },
+      center: { x: cx, y: cy },
+      hitStack: document.elementsFromPoint(cx, cy).slice(0, 8).map((element) => ({
+        element: describe(element),
+        rect: rectOf(element),
+      })),
+      scroll: {
+        x: window.scrollX,
+        y: window.scrollY,
+        documentHeight: document.documentElement.scrollHeight,
+        viewport: { width: window.innerWidth, height: window.innerHeight },
+      },
+      chrome: {
+        commandBar: rectOf(document.getElementById('command-bar')),
+        chipRail: rectOf(document.getElementById('chip-rail')),
+        nav: rectOf(document.getElementById('board-nav')),
+      },
+      bandHead: head === null ? null : { element: describe(head), rect: rectOf(head) },
+      activeElement: describe(document.activeElement),
+      html: {
+        scrollPaddingTop: htmlStyle.scrollPaddingTop,
+        scrollBehavior: htmlStyle.scrollBehavior,
+      },
+    };
+  }, selector);
+  const settled = await page.evaluate(async (sel) => {
+    await new Promise<void>((resolve) => {
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+    });
+    const target = document.querySelector<HTMLElement>(sel);
+    if (target === null) return { rect: null, topmost: null, hit: false };
+    const box = target.getBoundingClientRect();
+    const topmost = document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2);
+    return {
+      rect: { x: box.x, y: box.y, width: box.width, height: box.height },
+      topmost: topmost === null ? null : `${topmost.tagName.toLowerCase()}${topmost.id === '' ? '' : `#${topmost.id}`}`,
+      hit: topmost !== null && (topmost === target || target.contains(topmost)),
+    };
+  }, selector);
+  fs.writeFileSync(
+    `${base}.json`,
+    `${JSON.stringify({ capturedAt: new Date().toISOString(), test: test.info().title, probe, settled }, null, 2)}\n`,
+  );
+  await page.screenshot({ path: `${base}.png`, fullPage: false });
+  await recordCapture(page, `${base}.png`, 'viewport', `failure context for ${selector} (sidecar ${path.basename(base)}.json)`);
 }
 
 /** The six-section order as the DOM presents it (owner mount first). */
