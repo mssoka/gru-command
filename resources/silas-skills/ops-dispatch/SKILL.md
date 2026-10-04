@@ -223,9 +223,12 @@ authorizes its full completion cycle, and YOU own driving it:
    (exit 3), reconciled with `status --request-id <id>` — never replayed
    blind. Reuse the SAME request-id only to reconnect (the server attaches
    or replays the recorded outcome); a repair or a moved head uses a NEW
-   request-id. A typed `lock_wait_timeout` with no started frame (exit 4)
-   is the one retryable admission failure. Never run product tests
-   directly to substitute for the scheduler.
+   request-id. A replayed terminal receipt is marked `reconciled` and exits
+   1: the run's outcome is known but the ORIGINAL full capture is gone —
+   read the ledger, do not rerun to recover logs. A typed
+   `lock_wait_timeout` with no started frame (exit 4) is the one retryable
+   admission failure. Never run product tests directly to substitute for
+   the scheduler.
 
    Withdraw an obsolete owned helper only through the helper itself:
 

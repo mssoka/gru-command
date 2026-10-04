@@ -281,24 +281,45 @@ export async function withdrawCaptureOwner(
   deps.signal(record.pid, 'SIGTERM');
   await deps.sleep(deps.killGraceMs);
   const after = deps.probe(record.pid);
-  if (after.alive) deps.signal(record.pid, 'SIGKILL');
+  if (!after.alive) {
+    removeCaptureOwner(ownerPath);
+    return { verdict: 'withdrawn', reason: 'owner identity validated and withdrawn', pid: record.pid };
+  }
+  // The pid may have been recycled during the grace window: revalidate the
+  // SAME identity before escalating — an unrelated replacement is never
+  // signalled.
+  const afterMismatch = identityMismatch(record, after);
+  if (afterMismatch !== null) {
+    removeCaptureOwner(ownerPath);
+    return {
+      verdict: 'stale-cleared',
+      reason: `owner exited during the grace period; replacement left untouched (${afterMismatch})`,
+      pid: record.pid,
+    };
+  }
+  deps.signal(record.pid, 'SIGKILL');
   removeCaptureOwner(ownerPath);
   return { verdict: 'withdrawn', reason: 'owner identity validated and withdrawn', pid: record.pid };
 }
 
-/** Compare a live probe against the recorded identity, or null when it matches. */
+/**
+ * Compare a live probe against the recorded identity, or null when the
+ * identity is PROVEN. Start time and command are required: when either
+ * side cannot be read, the identity is unverifiable and the caller must
+ * refuse rather than signal a possibly-recycled pid.
+ */
 export function identityMismatch(record: CaptureOwnerRecord, probe: ProcessProbe): string | null {
-  const comparisons: { field: string; recorded: string; live: string | null }[] = [];
-  if (record.start_time !== null) {
-    comparisons.push({ field: 'start time', recorded: record.start_time, live: probe.startTime });
+  if (record.start_time === null || probe.startTime === null || probe.command === null) {
+    return `owner identity for pid ${String(record.pid)} is unverifiable (start time/command unavailable) — no signal sent`;
   }
-  comparisons.push({ field: 'command', recorded: record.command, live: probe.command });
-  comparisons.push({ field: 'cwd', recorded: record.cwd, live: probe.cwd });
-  const comparable = comparisons.filter((comparison) => comparison.live !== null);
-  if (comparable.length === 0) {
-    return `live process ${String(record.pid)} exposes no start time/command/cwd — identity is unverifiable`;
+  const comparisons: { readonly field: string; readonly recorded: string; readonly live: string }[] = [
+    { field: 'start time', recorded: record.start_time, live: probe.startTime },
+    { field: 'command', recorded: record.command, live: probe.command },
+  ];
+  if (probe.cwd !== null) {
+    comparisons.push({ field: 'cwd', recorded: record.cwd, live: probe.cwd });
   }
-  for (const comparison of comparable) {
+  for (const comparison of comparisons) {
     if (comparison.recorded !== comparison.live) {
       return `owner identity mismatch on ${comparison.field} for pid ${String(record.pid)} — no signal sent`;
     }
@@ -317,6 +338,9 @@ export interface CaptureReceipt {
   readonly request_id: string;
   readonly sink: string;
   readonly outcome: CaptureOutcome;
+  /** True when the terminal frame was a recorded-outcome replay: the run's
+   * outcome is known, but this sink is NOT the original full capture. */
+  readonly reconciled: boolean;
   readonly frames: number;
   readonly capture_bytes: number;
   readonly capture_sha256: string;
@@ -361,14 +385,17 @@ export function readCaptureReceipt(path: string): CaptureReceipt | null {
 
 /**
  * The ONLY success predicate. A completed run is promoted to success only
- * when the terminal outcome binds run id, a real head, a clean tracked
- * tree, an output hash, and an ok exit; an unknown/admission-failed stream
- * or a caller-named head that no longer matches is never success.
+ * when the terminal outcome binds run id, a real clean head, a zero exit
+ * and an output hash, was not a recorded-outcome replay, and the
+ * caller-named head (when given) matches; an unknown/admission-failed
+ * stream is never success.
  */
 export function captureReceiptSucceeded(receipt: CaptureReceipt): boolean {
   return (
     receipt.outcome === 'completed' &&
+    receipt.reconciled !== true &&
     receipt.ok === true &&
+    receipt.exit_code === 0 &&
     receipt.run_id !== null &&
     receipt.head !== null &&
     receipt.tracked_dirty === false &&
@@ -384,66 +411,146 @@ export function captureReceiptSucceeded(receipt: CaptureReceipt): boolean {
 // ------------------------------------------------------------------
 
 export interface CapturedNdjson {
-  readonly frames: readonly Record<string, unknown>[];
+  readonly frames: number;
   readonly malformed: number;
-  /** The last `completed` frame's outcome payload, if a valid one arrived. */
+  /** The terminal `completed` frame's outcome payload, if a valid one arrived. */
   readonly outcome: Record<string, unknown> | null;
+  /** True when that terminal frame was a recorded-outcome replay. */
+  readonly reconciled: boolean;
   readonly started: boolean;
   readonly errorCode: string | null;
   readonly errorDetail: string | null;
 }
 
+/** Bound on a single buffered line before it is treated as a torn record. */
+const MAX_PARTIAL_LINE_BYTES = 1024 * 1024;
+
 /**
- * Parse an NDJSON body into complete frames, counting torn/malformed lines.
- * A malformed line is preserved as a count (never silently dropped): a
- * capture with malformed records is not a clean single-run stream and must
- * not be promoted to success.
+ * Incremental NDJSON capture reader. Parses line by line so a long output
+ * never accumulates in memory, enforces ONE run identity and exactly one
+ * terminal frame at the END of the stream, and counts torn/foreign records
+ * instead of silently accepting them. A capture with malformed records, a
+ * second run's frames, or frames after the terminal frame is not a clean
+ * single-run stream and must never be promoted to success.
  */
-export function parseCapturedNdjson(text: string): CapturedNdjson {
-  const frames: Record<string, unknown>[] = [];
-  let malformed = 0;
-  let outcome: Record<string, unknown> | null = null;
-  let started = false;
-  let errorCode: string | null = null;
-  let errorDetail: string | null = null;
-  for (const line of text.split('\n')) {
-    if (line.trim() === '') continue;
+export class NdjsonCaptureReader {
+  private buffer = '';
+  private frames = 0;
+  private malformed = 0;
+  private outcome: Record<string, unknown> | null = null;
+  private reconciled = false;
+  private started = false;
+  private errorCode: string | null = null;
+  private errorDetail: string | null = null;
+  private runId: string | null = null;
+  private terminalSeen = false;
+
+  push(text: string): void {
+    this.buffer += text;
+    for (let newline = this.buffer.indexOf('\n'); newline >= 0; newline = this.buffer.indexOf('\n')) {
+      const line = this.buffer.slice(0, newline);
+      this.buffer = this.buffer.slice(newline + 1);
+      this.acceptLine(line);
+    }
+    if (Buffer.byteLength(this.buffer, 'utf8') > MAX_PARTIAL_LINE_BYTES) {
+      this.malformed += 1;
+      this.buffer = '';
+    }
+  }
+
+  finish(): CapturedNdjson {
+    if (this.buffer.trim() !== '') {
+      const line = this.buffer;
+      this.buffer = '';
+      this.acceptLine(line);
+    }
+    return {
+      frames: this.frames,
+      malformed: this.malformed,
+      outcome: this.outcome,
+      reconciled: this.reconciled,
+      started: this.started,
+      errorCode: this.errorCode,
+      errorDetail: this.errorDetail,
+    };
+  }
+
+  private acceptLine(line: string): void {
+    if (line.trim() === '') return;
     let parsed: unknown;
     try {
       parsed = JSON.parse(line);
     } catch {
-      malformed += 1;
-      continue;
+      this.malformed += 1;
+      return;
     }
     if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-      malformed += 1;
-      continue;
+      this.malformed += 1;
+      return;
     }
-    const frame = parsed as Record<string, unknown>;
-    frames.push(frame);
+    this.acceptFrame(parsed as Record<string, unknown>);
+  }
+
+  private acceptFrame(frame: Record<string, unknown>): void {
+    if (this.terminalSeen) {
+      // Frames after the terminal frame are a concatenated/foreign stream.
+      this.malformed += 1;
+      return;
+    }
+    this.frames += 1;
+    const frameRunId =
+      typeof frame['runId'] === 'string' && frame['runId'] !== '' ? frame['runId'] : null;
+    if (frameRunId !== null) {
+      if (this.runId === null) {
+        this.runId = frameRunId;
+      } else if (this.runId !== frameRunId) {
+        this.malformed += 1;
+        return;
+      }
+    }
     const type = frame['type'];
-    if (type === 'started' || (type === 'attached' && frame['state'] === 'running')) started = true;
-    if (type === 'completed' && typeof frame['outcome'] === 'object' && frame['outcome'] !== null) {
-      const candidate = frame['outcome'] as Record<string, unknown>;
+    if (type === 'started' || (type === 'attached' && frame['state'] === 'running')) this.started = true;
+    if (type === 'completed') {
+      this.terminalSeen = true;
+      if (frame['reconciled'] === true) this.reconciled = true;
+      const candidate = frame['outcome'];
+      if (typeof candidate !== 'object' || candidate === null || Array.isArray(candidate)) {
+        this.malformed += 1;
+        return;
+      }
+      const outcome = candidate as Record<string, unknown>;
+      const outcomeRunId = typeof outcome['runId'] === 'string' ? outcome['runId'] : '';
+      const sha = outcome['sha'];
       if (
-        typeof candidate['runId'] === 'string' &&
-        typeof candidate['ok'] === 'boolean' &&
-        typeof candidate['trackedDirty'] === 'boolean' &&
-        typeof candidate['outputBytes'] === 'number' &&
-        typeof candidate['outputSha256'] === 'string' &&
-        candidate['outputSha256'] !== ''
+        outcomeRunId !== '' &&
+        (this.runId === null || outcomeRunId === this.runId) &&
+        typeof outcome['ok'] === 'boolean' &&
+        typeof outcome['trackedDirty'] === 'boolean' &&
+        typeof outcome['outputBytes'] === 'number' &&
+        Number.isFinite(outcome['outputBytes']) &&
+        typeof outcome['outputSha256'] === 'string' &&
+        outcome['outputSha256'] !== '' &&
+        typeof sha === 'string' &&
+        sha !== ''
       ) {
-        outcome = candidate;
+        this.runId = outcomeRunId;
+        this.outcome = outcome;
       } else {
-        malformed += 1;
+        this.malformed += 1;
       }
     }
     if (type === 'error') {
-      if (typeof frame['code'] === 'string') errorCode = frame['code'];
-      if (typeof frame['detail'] === 'string') errorDetail = frame['detail'];
+      if (typeof frame['code'] === 'string') this.errorCode = frame['code'];
+      if (typeof frame['detail'] === 'string') this.errorDetail = frame['detail'];
     }
   }
-  return { frames, malformed, outcome, started, errorCode, errorDetail };
+}
+
+/** One-shot wrapper over {@link NdjsonCaptureReader} (tests, small bodies). */
+export function parseCapturedNdjson(text: string): CapturedNdjson {
+  const reader = new NdjsonCaptureReader();
+  reader.push(text.endsWith('\n') ? text : `${text}\n`);
+  return reader.finish();
 }
 
 /** The receipt identity fields read out of a terminal outcome payload. */

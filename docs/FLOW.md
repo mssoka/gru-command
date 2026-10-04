@@ -275,17 +275,26 @@ verification budget.
   answers 409 `head_changed` before any producer exists). Replaying the
   same `request_id` attaches to the in-flight run or replays the recorded
   terminal outcome — a lost response is reconciled, never replayed blind.
-  `GET /api/verify/status?request_id=…` answers
-  `unknown | accepted | running | completed | admission-failed`; only a
-  task confirmed never-started (typed `lock_wait_timeout`, no `started`
-  frame) may be retried under its old identity.
+  The run's exact head is re-read at spawn: a lane that moved while the
+  request waited fails as `head_changed` instead of verifying the new
+  revision. `GET /api/verify/status?request_id=…` answers
+  `unknown | accepted | running | completed | admission-failed |
+  interrupted`; only a task confirmed never-started (typed
+  `lock_wait_timeout`, no `started` frame) may be retried under its old
+  identity. Terminal identities append to `<data_dir>/verify/requests.ndjson`,
+  so history eviction and crash/restart never turn a completed or
+  interrupted identity into `unknown`: it reports its terminal state and
+  refuses a rerun — a re-verification mints a NEW request id.
 - **Capture is exclusive and receipted.** The shipped capture helper
   (`dist/verify/capture-cli.js`, named in Silas's wake prompt) opens a
   unique `wx` sink BEFORE the POST, streams every NDJSON frame to EOF,
   and writes `<sink>.receipt.json` binding run id, true head/dirty state,
   exit/outcome and output length/hash. A stream without a valid terminal
-  completion (or with torn records) is `unknown` and is never promoted to
-  success. Owned helpers are withdrawn only with identity validation
+  completion, with torn/foreign records, or whose single run identity does
+  not hold across the whole stream is `unknown` and is never promoted to
+  success; a replayed terminal receipt is marked `reconciled` and is an
+  honest failure (the outcome is known, the original full capture is not
+  reconstructable, and a rerun to recover logs is refused). Owned helpers are withdrawn only with identity validation
   (pid + start time + command/cwd); malformed pid records, crashes and
   stale owners are cleared without touching unrelated processes, and
   sinks/receipts are preserved.

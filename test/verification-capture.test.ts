@@ -19,7 +19,12 @@ import {
   type CaptureReceipt,
   type ProcessProbe,
 } from '../src/verify/capture.js';
-import { CAPTURE_EXIT, runCaptureCli, type CaptureCliDeps } from '../src/verify/capture-cli.js';
+import {
+  CAPTURE_EXIT,
+  parsePsOutput,
+  runCaptureCli,
+  type CaptureCliDeps,
+} from '../src/verify/capture-cli.js';
 
 /**
  * Verification capture (issue #159): exclusive sinks, honest receipts,
@@ -114,6 +119,7 @@ describe('capture receipts', () => {
       request_id: 'req-receipt',
       sink: '/tmp/a.ndjson',
       outcome: 'completed',
+      reconciled: false,
       frames: 4,
       capture_bytes: 512,
       capture_sha256: 'c'.repeat(64),
@@ -145,16 +151,35 @@ describe('capture receipts', () => {
     expect(captureReceiptSucceeded(receipt({ error: 'partial stream' }))).toBe(false);
     expect(captureReceiptSucceeded(receipt({ expected_head: 'd'.repeat(40) }))).toBe(false);
     expect(captureReceiptSucceeded(receipt({ expected_head: 'a'.repeat(40) }))).toBe(true);
+    // A replay of a recorded outcome is NOT a promotable full capture, and
+    // a completed run without a zero exit is not success either.
+    expect(captureReceiptSucceeded(receipt({ reconciled: true }))).toBe(false);
+    expect(captureReceiptSucceeded(receipt({ exit_code: null }))).toBe(false);
+    expect(captureReceiptSucceeded(receipt({ exit_code: 7, ok: false }))).toBe(false);
   });
 
-  it('counts torn/malformed records instead of silently accepting the stream', () => {
+  it('counts torn/malformed records, foreign run ids, and post-terminal frames', () => {
     const parsed = parseCapturedNdjson(
       `${completedNdjson()}not-json-at-all\n{"type":"output"\n`,
     );
-    expect(parsed.frames).toHaveLength(4);
-    expect(parsed.malformed).toBe(2);
+    expect(parsed.frames).toBe(4);
+    expect(parsed.malformed).toBe(2); // the torn line + the frame after terminal
     expect(parsed.outcome?.['runId']).toBe('run-capture-1');
     expect(parsed.started).toBe(true);
+
+    // A concatenated second run's frames are malformed, never merged.
+    const foreign = parseCapturedNdjson(
+      [
+        JSON.stringify({ type: 'started', runId: 'run-a' }),
+        JSON.stringify({ type: 'output', runId: 'run-b', stream: 'stdout', text: 'x' }),
+      ].join('\n'),
+    );
+    expect(foreign.malformed).toBe(1);
+    expect(foreign.outcome).toBeNull();
+
+    // A second terminal frame is a concatenated stream, not a capture.
+    const twoTerminals = parseCapturedNdjson(`${completedNdjson()}${completedNdjson()}`);
+    expect(twoTerminals.malformed).toBeGreaterThan(0);
   });
 
   it('rejects a completed frame whose outcome lacks the receipt bindings', () => {
@@ -272,11 +297,46 @@ describe('owner records and identity-validated withdrawal', () => {
     expect(signals).toEqual([]);
   });
 
-  it('reports the exact mismatching identity field', () => {
+  it('reports the exact mismatching identity field and refuses an unverifiable one', () => {
     const record = ownerRecord('/tmp/x.ndjson');
     expect(identityMismatch(record, liveProbe)).toBeNull();
     expect(identityMismatch(record, { ...liveProbe, command: 'node unrelated.js' })).toContain('command');
     expect(identityMismatch(record, { ...liveProbe, cwd: '/tmp/elsewhere' })).toContain('cwd');
+    // Start time missing on either side makes withdrawal unverifiable.
+    expect(identityMismatch(record, { ...liveProbe, startTime: null })).toContain('unverifiable');
+    expect(identityMismatch({ ...record, start_time: null }, liveProbe)).toContain('unverifiable');
+  });
+
+  it('never SIGKILLs a recycled pid: escalation revalidates the owner identity', async () => {
+    const dir = tempDir();
+    const sinkPath = join(dir, 'recycled.ndjson');
+    const ownerPath = captureOwnerPath(sinkPath);
+    writeCaptureOwner(ownerPath, ownerRecord(sinkPath));
+    const signals: string[] = [];
+    let probes = 0;
+    const result = await withdrawCaptureOwner(ownerPath, {
+      probe: () => {
+        probes += 1;
+        // First probe: the true owner. Post-grace probe: a recycled,
+        // unrelated process with the same pid.
+        return probes === 1
+          ? liveProbe
+          : { alive: true, startTime: 'Tue Oct  7 09:00:00 2026', cwd: '/tmp/lane', command: liveProbe.command };
+      },
+      signal: (_pid, signal) => signals.push(signal),
+      sleep: async () => {},
+      killGraceMs: 1,
+    });
+    expect(signals).toEqual(['SIGTERM']);
+    expect(result.verdict).toBe('stale-cleared');
+    expect(existsSync(ownerPath)).toBe(false);
+  });
+
+  it('parses BSD-style lstart output with variable whitespace', () => {
+    const parsed = parsePsOutput('Sun  4 Oct 15:53:22 2026 node dist/verify/capture-cli.js run\n');
+    expect(parsed.startTime).toBe('Sun  4 Oct 15:53:22 2026');
+    expect(parsed.command).toBe('node dist/verify/capture-cli.js run');
+    expect(parsePsOutput('   ')).toEqual({ startTime: null, command: null });
   });
 });
 
@@ -347,6 +407,60 @@ describe('capture CLI run: exclusive sink + honest outcome', () => {
     expect(captureReceiptSucceeded(receipt)).toBe(false);
     // The identity trail is preserved for a reconcile/withdraw decision.
     expect(existsSync(captureOwnerPath(sinkPath))).toBe(true);
+  });
+
+  it('treats a connection severed after a completed-looking frame as UNKNOWN, never success', async () => {
+    const dir = tempDir();
+    const sinkPath = join(dir, 'severed.ndjson');
+    const body = completedNdjson();
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(body));
+        controller.error(new Error('socket reset before EOF'));
+      },
+    });
+    const code = await runCaptureCli(
+      [...BASE_ARGS, '--sink', sinkPath, '--request-id', 'req-cli-severed', '--url', 'http://127.0.0.1:9', '--token', 't'],
+      deps({ fetchImpl: async () => new Response(stream, { status: 200 }), stdout: () => {} }),
+    );
+    expect(code).toBe(CAPTURE_EXIT.unknown);
+    const receipt = JSON.parse(readFileSync(captureReceiptPath(sinkPath), 'utf-8')) as CaptureReceipt;
+    expect(receipt.outcome).toBe('unknown');
+    expect(receipt.error).toContain('socket reset');
+    expect(captureReceiptSucceeded(receipt)).toBe(false);
+  });
+
+  it('marks a reconciled terminal replay as an unpromotable capture (exit 1, no rerun)', async () => {
+    const dir = tempDir();
+    const sinkPath = join(dir, 'replay.ndjson');
+    const body = `${JSON.stringify({ type: 'completed', runId: 'run-capture-1', reconciled: true, outcome: COMPLETED_OUTCOME })}\n`;
+    const code = await runCaptureCli(
+      [...BASE_ARGS, '--sink', sinkPath, '--request-id', 'req-cli-replay', '--url', 'http://127.0.0.1:9', '--token', 't'],
+      deps({ fetchImpl: async () => new Response(body, { status: 200 }), stdout: () => {} }),
+    );
+    expect(code).toBe(CAPTURE_EXIT.failed);
+    const receipt = JSON.parse(readFileSync(captureReceiptPath(sinkPath), 'utf-8')) as CaptureReceipt;
+    expect(receipt.outcome).toBe('completed');
+    expect(receipt.reconciled).toBe(true);
+    expect(captureReceiptSucceeded(receipt)).toBe(false);
+    expect(receipt.error).toContain('replayed terminal receipt');
+  });
+
+  it('exits 1 when a completed frame lacks the full success bindings (no exit code)', async () => {
+    const dir = tempDir();
+    const sinkPath = join(dir, 'unbound.ndjson');
+    const body = `${JSON.stringify({
+      type: 'completed',
+      runId: 'run-capture-1',
+      outcome: { ...COMPLETED_OUTCOME, exitCode: null },
+    })}\n`;
+    const code = await runCaptureCli(
+      [...BASE_ARGS, '--sink', sinkPath, '--request-id', 'req-cli-unbound', '--url', 'http://127.0.0.1:9', '--token', 't'],
+      deps({ fetchImpl: async () => new Response(body, { status: 200 }), stdout: () => {} }),
+    );
+    expect(code).toBe(CAPTURE_EXIT.failed);
+    const receipt = JSON.parse(readFileSync(captureReceiptPath(sinkPath), 'utf-8')) as CaptureReceipt;
+    expect(captureReceiptSucceeded(receipt)).toBe(false);
   });
 
   it('marks a typed never-started lock_wait_timeout as retryable admission failure', async () => {

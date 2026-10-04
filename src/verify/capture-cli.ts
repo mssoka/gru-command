@@ -9,11 +9,12 @@ import {
   CAPTURE_RECEIPT_VERSION,
   CaptureOwnerExistsError,
   CaptureSinkExistsError,
+  NdjsonCaptureReader,
   captureOwnerPath,
   captureReceiptPath,
+  captureReceiptSucceeded,
   capturedOutcomeFields,
   openExclusiveCaptureSink,
-  parseCapturedNdjson,
   readCaptureOwner,
   removeCaptureOwner,
   withdrawCaptureOwner,
@@ -151,6 +152,20 @@ function resolveOps(flags: Map<string, string>): { baseUrl: string; token: strin
   return { baseUrl, token };
 }
 
+/**
+ * Parse `ps -o lstart=,command=` output. BSD/macOS lstart uses variable
+ * whitespace (`Sun  4 Oct ...`), so the five date fields split on runs of
+ * whitespace — a single-space pattern would silently yield no identity.
+ */
+export function parsePsOutput(output: string): {
+  readonly startTime: string | null;
+  readonly command: string | null;
+} {
+  const match = /^(\S+\s+\S+\s+\S+\s+\S+\s+\S+)\s+(.*)$/u.exec(output.trim());
+  if (match === null) return { startTime: null, command: null };
+  return { startTime: match[1] ?? null, command: match[2] ?? null };
+}
+
 /** Best-effort live probe: aliveness, start time, command, cwd. */
 export function systemProcessProbe(pid: number): ProcessProbe {
   if (!pidAlive(pid)) return { alive: false, startTime: null, cwd: null, command: null };
@@ -160,14 +175,10 @@ export function systemProcessProbe(pid: number): ProcessProbe {
     const output = execFileSync('ps', ['-o', 'lstart=,command=', '-p', String(pid)], {
       encoding: 'utf-8',
       timeout: 5_000,
-    }).trim();
-    const match = /^(\S+ \S+ \S+ \S+ \S+)\s+(.*)$/u.exec(output);
-    if (match !== null) {
-      startTime = match[1] ?? null;
-      command = match[2] ?? null;
-    }
+    });
+    ({ startTime, command } = parsePsOutput(output));
   } catch {
-    /* start time/command unavailable — identity stays partially comparable */
+    /* start time/command unavailable — identity stays unverifiable */
   }
   let cwd: string | null = null;
   try {
@@ -209,7 +220,9 @@ function writeOwnerFor(
     pid: process.pid,
     start_time: self.startTime,
     cwd,
-    command: argv.join(' '),
+    // The OS-reported command is the one withdrawal compares against; the
+    // local argv is only a fallback when the probe cannot read it.
+    command: self.command ?? argv.join(' '),
     request_id: requestId,
     sink: sinkPath,
     run_id: null,
@@ -283,7 +296,7 @@ async function commandRun(
     throw error;
   }
 
-  let body = '';
+  const captureReader = new NdjsonCaptureReader();
   let httpError: string | null = null;
   let transportError: string | null = null;
   try {
@@ -312,20 +325,20 @@ async function commandRun(
         if (value !== undefined) {
           const text = decoder.decode(value, { stream: true });
           sink.write(text);
-          body += text;
+          captureReader.push(text);
         }
       }
       const tail = decoder.decode();
       if (tail !== '') {
         sink.write(tail);
-        body += tail;
+        captureReader.push(tail);
       }
     }
   } catch (error) {
     transportError = String(error instanceof Error ? error.message : error);
   }
   const digest = sink.close();
-  const parsed = parseCapturedNdjson(body);
+  const parsed = captureReader.finish();
   const fields = parsed.outcome === null ? null : capturedOutcomeFields(parsed.outcome);
 
   let outcome: CaptureOutcome;
@@ -335,6 +348,12 @@ async function commandRun(
     outcome = 'unknown';
     exitCode = CAPTURE_EXIT.usage;
     error = httpError;
+  } else if (transportError !== null) {
+    // A connection severed before clean EOF is UNKNOWN, even when a
+    // completed-looking frame arrived: the stream never finished.
+    outcome = 'unknown';
+    exitCode = CAPTURE_EXIT.unknown;
+    error = transportError;
   } else if (fields !== null && parsed.malformed === 0) {
     outcome = 'completed';
     exitCode = fields.ok ? CAPTURE_EXIT.ok : CAPTURE_EXIT.failed;
@@ -353,19 +372,19 @@ async function commandRun(
     outcome = 'unknown';
     exitCode = CAPTURE_EXIT.unknown;
     error =
-      transportError ??
       parsed.errorDetail ??
       (parsed.malformed > 0
         ? `capture stream held ${String(parsed.malformed)} malformed record(s) — not a single-run capture`
         : 'stream ended without a terminal completed frame');
   }
 
-  const receipt: CaptureReceipt = {
+  const baseReceipt: CaptureReceipt = {
     version: CAPTURE_RECEIPT_VERSION,
     request_id: requestId,
     sink: sinkPath,
     outcome,
-    frames: parsed.frames.length,
+    reconciled: parsed.reconciled,
+    frames: parsed.frames,
     capture_bytes: digest.bytes,
     capture_sha256: digest.sha256,
     run_id: fields?.runId ?? null,
@@ -382,10 +401,20 @@ async function commandRun(
     error,
     completed_at: new Date(now()).toISOString(),
   };
+  // Exit 0 ONLY for the complete success predicate (clean exact head, zero
+  // exit, bound output, not a replay). A completed run that fails it is an
+  // honest exit 1 with a receipt that cannot be promoted to evidence.
+  if (outcome === 'completed' && !captureReceiptSucceeded(baseReceipt)) {
+    exitCode = CAPTURE_EXIT.failed;
+    error ??= baseReceipt.reconciled
+      ? 'replayed terminal receipt is not a promotable full capture — the ledger holds the run; do not rerun to recover logs'
+      : 'completed run is not a promotable exact-head PASS';
+  }
+  const receipt: CaptureReceipt = { ...baseReceipt, error };
   writeCaptureReceipt(captureReceiptPath(sinkPath), receipt);
   if (outcome === 'completed') removeCaptureOwner(ownerPath);
   stdout(`${JSON.stringify(receipt, null, 2)}\n`);
-  if (error !== null && outcome !== 'completed') stderr(`capture: ${error}\n`);
+  if (error !== null) stderr(`capture: ${error}\n`);
   return exitCode;
 }
 

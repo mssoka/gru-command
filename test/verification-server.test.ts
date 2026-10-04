@@ -550,18 +550,35 @@ describe('verification single-flight + reconcile (issue #159)', () => {
     expect(readFileSync(sinkPath, 'utf-8')).toBe(captured);
 
     // Reconnecting with the SAME request identity replays the recorded run
-    // into a fresh sink: no second execution.
+    // into a fresh sink: no second execution, and the replay is honestly
+    // marked as an unpromotable partial capture (the run's outcome is
+    // known; the original full logs are NOT reconstructable).
     const replaySink = join(harness.lanePath, 'verify-capture-replay.ndjson');
     const replayArgs = [...args];
     replayArgs[replayArgs.indexOf(sinkPath)] = replaySink;
-    expect(await runCaptureCli(replayArgs, cliDeps)).toBe(0);
+    expect(await runCaptureCli(replayArgs, cliDeps)).toBe(1);
     const replayReceipt = readCaptureReceipt(captureReceiptPath(replaySink));
     expect(replayReceipt!.run_id).toBe(receipt!.run_id);
-    expect(captureReceiptSucceeded(replayReceipt!)).toBe(true);
+    expect(replayReceipt!.reconciled).toBe(true);
+    expect(captureReceiptSucceeded(replayReceipt!)).toBe(false);
     const started = harness.ledger
       .listJobEvents(harness.jobId)
       .filter((event) => event.kind === 'verification.started');
     expect(started).toHaveLength(1);
+
+    // The helper's --expected-head travels to the server: a stale named head
+    // is refused BEFORE any producer exists (exit 2, no started event).
+    const staleSink = join(harness.lanePath, 'verify-capture-stale.ndjson');
+    const staleArgs = [...args];
+    staleArgs[staleArgs.indexOf(sinkPath)] = staleSink;
+    staleArgs[staleArgs.indexOf('req-e2e-capture')] = 'req-e2e-stale';
+    staleArgs.push('--expected-head', '0'.repeat(40));
+    expect(await runCaptureCli(staleArgs, cliDeps)).toBe(2);
+    const staleReceipt = readCaptureReceipt(captureReceiptPath(staleSink));
+    expect(staleReceipt!.error).toContain('head_changed');
+    expect(
+      harness.ledger.listJobEvents(harness.jobId).filter((event) => event.kind === 'verification.started'),
+    ).toHaveLength(1);
     await harness.close();
   });
 });

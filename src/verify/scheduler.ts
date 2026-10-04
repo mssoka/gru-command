@@ -1,6 +1,6 @@
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { availableParallelism } from 'node:os';
 import { join } from 'node:path';
 import type { Readable } from 'node:stream';
@@ -196,6 +196,27 @@ export class VerificationRequestConflictError extends Error {
   }
 }
 
+/**
+ * Raised when a terminal request identity is no longer retained for replay
+ * (its full outcome was evicted from the bounded history cache, or a crash
+ * interrupted it): replaying it would be an unknown-authority rerun. The
+ * ledger keeps the run's record; the caller mints a fresh identity.
+ */
+export class VerificationRequestExpiredError extends Error {
+  readonly code = 'request_id_expired';
+  constructor(
+    readonly requestId: string,
+    readonly runId: string,
+    readonly terminalState: 'completed' | 'interrupted',
+  ) {
+    super(
+      `request_id "${requestId}" reached a terminal ${terminalState} state (run ${runId}) whose outcome is not retained for replay — ` +
+        'refusing to rerun; inspect the ledger verification.completed record and mint a NEW request_id for any re-verification',
+    );
+    this.name = 'VerificationRequestExpiredError';
+  }
+}
+
 /** The client-supplied request identity grammar (bounded; URL-safe). */
 export const VERIFICATION_REQUEST_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
 
@@ -208,7 +229,10 @@ export type VerificationAttemptState =
   | 'accepted'
   | 'running'
   | 'completed'
-  | 'admission-failed';
+  | 'admission-failed'
+  /** Started before a crash/restart; its outcome was never recorded and it
+   * is not replayable — a re-verification uses a NEW request identity. */
+  | 'interrupted';
 
 /** The reconcile answer for `GET /api/verify/status` (issue #159). */
 export interface VerificationAttemptStatus {
@@ -294,6 +318,27 @@ interface PersistedState {
   readonly attempts?: readonly PersistedAttempt[];
 }
 
+/**
+ * Durable terminal identity (append-only `requests.ndjson`). The bounded
+ * in-memory history carries replayable outcomes; this index guarantees an
+ * identity is NEVER silently forgotten and rerun — an evicted or
+ * crash-interrupted identity answers as terminal and refuses replay.
+ */
+type TerminalIdentityState = 'completed' | 'admission-failed' | 'interrupted';
+
+interface TerminalIdentity {
+  readonly request_id: string;
+  readonly run_id: string;
+  readonly state: TerminalIdentityState;
+  readonly job_id: string;
+  readonly scope: string;
+  readonly command: string;
+  readonly cwd: string;
+  readonly head: string | null;
+  readonly started: boolean;
+  readonly completed_at: number;
+}
+
 /** One in-flight single-flight attempt: the shared producer plus every attached sink. */
 interface Attempt {
   readonly key: string;
@@ -377,6 +422,8 @@ export interface VerificationSchedulerOptions {
 }
 
 const STATE_FILE = 'scheduler.json';
+/** Append-only terminal request identities (outlives bounded outcome history). */
+const REQUEST_LOG_FILE = 'requests.ndjson';
 /** Bound on the per-run output tail carried in the outcome/ledger. */
 const OUTPUT_TAIL_MAX_BYTES = 4 * 1024;
 /** Bound on completed/admission-failed request records kept for reconciliation. */
@@ -412,6 +459,48 @@ function sameSubmission(
     left.command === right.command &&
     leftHead === rightHead
   );
+}
+
+/** Validate one append-only terminal identity line. */
+function parseTerminalIdentity(value: unknown): TerminalIdentity | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const requestId = record['request_id'];
+  const runId = record['run_id'];
+  const state = record['state'];
+  const jobId = record['job_id'];
+  const scope = record['scope'];
+  const command = record['command'];
+  const cwd = record['cwd'];
+  const head = record['head'];
+  const started = record['started'];
+  const completedAt = record['completed_at'];
+  if (typeof requestId !== 'string' || !VERIFICATION_REQUEST_ID_PATTERN.test(requestId)) return null;
+  if (typeof runId !== 'string' || runId === '') return null;
+  if (state !== 'completed' && state !== 'admission-failed' && state !== 'interrupted') return null;
+  if (
+    typeof jobId !== 'string' ||
+    typeof scope !== 'string' ||
+    typeof command !== 'string' ||
+    typeof cwd !== 'string'
+  ) {
+    return null;
+  }
+  if (head !== null && typeof head !== 'string') return null;
+  if (typeof started !== 'boolean') return null;
+  if (typeof completedAt !== 'number' || !Number.isFinite(completedAt)) return null;
+  return {
+    request_id: requestId,
+    run_id: runId,
+    state,
+    job_id: jobId,
+    scope,
+    command,
+    cwd,
+    head,
+    started,
+    completed_at: completedAt,
+  };
 }
 /** Cap on one streamed output frame (bytes of text). */
 const OUTPUT_FRAME_MAX_BYTES = 8 * 1024;
@@ -537,6 +626,7 @@ export class VerificationScheduler {
   private readonly disposeGraceMs: number;
   private readonly sweepIntervalMs: number;
   private readonly stateFile: string;
+  private readonly requestLogFile: string;
   private readonly slots = new Map<string, ActiveSlot>();
   /** In-flight single-flight attempts by dedupe key (issue #159). */
   private readonly attempts = new Map<string, Attempt>();
@@ -544,6 +634,8 @@ export class VerificationScheduler {
   private readonly attemptsByRequest = new Map<string, Attempt>();
   /** Bounded terminal request history for reconnect reconciliation. */
   private readonly requestHistory = new Map<string, RequestHistoryEntry>();
+  /** Append-only terminal identities: NEVER silently forgotten -> never rerun. */
+  private readonly requestIndex = new Map<string, TerminalIdentity>();
   private waiters: Waiter[] = [];
   private sweepTimer: NodeJS.Timeout | null = null;
   private started = false;
@@ -574,6 +666,7 @@ export class VerificationScheduler {
     this.disposeGraceMs = opts.disposeGraceMs ?? 3_000;
     this.sweepIntervalMs = opts.sweepIntervalMs ?? 15_000;
     this.stateFile = join(opts.storageDir, STATE_FILE);
+    this.requestLogFile = join(opts.storageDir, REQUEST_LOG_FILE);
   }
 
   /** Total workers allowed across all concurrent runs. */
@@ -618,6 +711,7 @@ export class VerificationScheduler {
     if (this.started) return;
     if (this.disposed) throw new VerificationDisposedError();
     mkdirSync(this.opts.storageDir, { recursive: true, mode: 0o700 });
+    this.loadRequestIndex();
     const persisted = this.loadState();
     for (const attempt of persisted.attempts ?? []) {
       this.requestHistory.set(attempt.request_id, {
@@ -692,6 +786,10 @@ export class VerificationScheduler {
         reason = 'max-age';
       }
       if (reason === null) continue;
+      // A started orphan's outcome is unrecorded: mark every bound identity
+      // interrupted so a reconnect reports the truth and refuses a rerun.
+      const interrupted =
+        slot.pid === null ? [] : this.markInterruptedIdentities(slot);
       this.slots.delete(runId);
       released.push({ runId, jobId: slot.lease.jobId, pid: slot.pid, reason, ageMs });
       this.safeRecord({
@@ -703,6 +801,7 @@ export class VerificationScheduler {
           scope: slot.lease.scope,
           reason,
           age_ms: ageMs,
+          interrupted_request_ids: interrupted,
         },
       });
       this.log('warn', 'stale verification holder released', {
@@ -897,6 +996,33 @@ export class VerificationScheduler {
         this.requestHistory.delete(requestId);
         this.persistBestEffort();
       }
+      // A live producer bound to this identity wins even when the head or
+      // command drifted while it waited: the accepted execution is the run
+      // the reconnect must reconcile with (its spawn-time head check
+      // reports any real drift honestly).
+      const bound = this.attemptsByRequest.get(requestId);
+      if (bound !== undefined) {
+        if (
+          bound.spec.jobId !== resolvedSpec.jobId ||
+          bound.spec.scope !== resolvedSpec.scope ||
+          bound.spec.cwd !== resolvedSpec.cwd
+        ) {
+          throw new VerificationRequestConflictError(requestId);
+        }
+        await this.attach(bound, sink, requestId);
+        return bound.promise;
+      }
+      // A terminal identity whose full outcome is no longer retained (evicted
+      // from the bounded history, or crash-interrupted) is NEVER rerun: the
+      // ledger holds the record; the caller mints a new identity.
+      const known = this.requestIndex.get(requestId);
+      if (known !== undefined) {
+        if (known.state === 'admission-failed') {
+          this.requestIndex.delete(requestId);
+        } else {
+          throw new VerificationRequestExpiredError(requestId, known.run_id, known.state);
+        }
+      }
     }
 
     const inFlight = this.attempts.get(key);
@@ -914,6 +1040,7 @@ export class VerificationScheduler {
         slot.lease.jobId === resolvedSpec.jobId &&
         slot.lease.scope === resolvedSpec.scope &&
         slot.lease.cwd === resolvedSpec.cwd &&
+        slot.lease.command === resolvedSpec.command &&
         (slot.lease.head == null || slot.lease.head === head)
       ) {
         throw new VerificationDuplicateError(slot.lease.runId, 'running');
@@ -994,6 +1121,38 @@ export class VerificationScheduler {
           started: slot.pid !== null,
         };
       }
+      // Durable terminal identities survive outcome eviction and restarts:
+      // report the terminal state (without the evicted outcome), never
+      // `unknown` — an unknown answer is not replay authority.
+      const known = this.requestIndex.get(requestId);
+      if (known !== undefined) {
+        return {
+          state: known.state,
+          requestId,
+          runId: known.run_id,
+          jobId: known.job_id,
+          scope: known.scope,
+          command: known.command,
+          cwd: known.cwd,
+          head: known.head,
+          trackedDirty: null,
+          started: known.started,
+        };
+      }
+      // An explicit unknown request identity never borrows another
+      // attempt's state through a job fallback.
+      return {
+        state: 'unknown',
+        requestId,
+        runId: null,
+        jobId: lookup.jobId ?? null,
+        scope: lookup.scope ?? null,
+        command: null,
+        cwd: lookup.cwd ?? null,
+        head: lookup.head ?? null,
+        trackedDirty: null,
+        started: false,
+      };
     }
 
     const jobId = lookup.jobId !== undefined && lookup.jobId !== '' ? lookup.jobId : null;
@@ -1153,6 +1312,17 @@ export class VerificationScheduler {
       head: attempt.head,
       dedupeKey: attempt.key,
     });
+    // A terminal frame is enqueued with a snapshot of the sinks that existed
+    // at that instant. An attach whose `attached` frame was queued after that
+    // snapshot would otherwise end at EOF without a completed frame: deliver
+    // the recorded outcome to this sink explicitly.
+    if (attempt.outcome !== null) {
+      await this.writeFrame(sink, {
+        type: 'completed',
+        runId: attempt.runId,
+        outcome: attempt.outcome,
+      });
+    }
   }
 
   /**
@@ -1250,14 +1420,27 @@ export class VerificationScheduler {
         this.requestHistory.delete(requestId);
         continue;
       }
+      const completedAt = this.now();
       this.requestHistory.set(requestId, {
         state: terminal.state,
         spec: attempt.spec,
         head: attempt.head,
-        completedAt: this.now(),
+        completedAt,
         outcome: terminal.outcome,
         started: attempt.started,
         error: terminal.error,
+      });
+      this.appendTerminalIdentity({
+        request_id: requestId,
+        run_id: attempt.outcome?.runId ?? attempt.runId,
+        state: terminal.state,
+        job_id: attempt.spec.jobId,
+        scope: attempt.spec.scope,
+        command: attempt.spec.command,
+        cwd: attempt.spec.cwd,
+        head: attempt.head,
+        started: attempt.started,
+        completed_at: completedAt,
       });
     }
     while (this.requestHistory.size > MAX_REQUEST_HISTORY) {
@@ -1266,6 +1449,73 @@ export class VerificationScheduler {
       this.requestHistory.delete(oldest);
     }
     this.persistBestEffort();
+  }
+
+  /** Load the append-only terminal identity index (torn tails skipped loud). */
+  private loadRequestIndex(): void {
+    let text: string;
+    try {
+      text = readFileSync(this.requestLogFile, 'utf-8');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+      throw new Error(`verification request log ${this.requestLogFile} is unreadable: ${String(error)}`);
+    }
+    for (const line of text.split('\n')) {
+      if (line.trim() === '') continue;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        this.log('warn', 'verification request log line skipped: not valid JSON', {
+          path: this.requestLogFile,
+        });
+        continue;
+      }
+      const record = parseTerminalIdentity(parsed);
+      if (record === null) {
+        this.log('warn', 'verification request log line skipped: unsupported shape', {
+          path: this.requestLogFile,
+        });
+        continue;
+      }
+      this.requestIndex.set(record.request_id, record);
+    }
+  }
+
+  /** Append one terminal identity (append-only; the log is never rewritten). */
+  private appendTerminalIdentity(record: TerminalIdentity): void {
+    this.requestIndex.set(record.request_id, record);
+    try {
+      appendFileSync(this.requestLogFile, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+    } catch (error) {
+      this.log('error', 'verification request identity append failed', {
+        path: this.requestLogFile,
+        request: record.request_id,
+        error: String(error),
+      });
+    }
+  }
+
+  /** Mark a released orphan's bound identities interrupted (started, no outcome). */
+  private markInterruptedIdentities(slot: ActiveSlot): string[] {
+    const marked: string[] = [];
+    for (const requestId of slot.requestIds) {
+      if (this.requestIndex.has(requestId)) continue;
+      this.appendTerminalIdentity({
+        request_id: requestId,
+        run_id: slot.lease.runId,
+        state: 'interrupted',
+        job_id: slot.lease.jobId,
+        scope: slot.lease.scope,
+        command: slot.lease.command,
+        cwd: slot.lease.cwd,
+        head: slot.lease.head,
+        started: slot.pid !== null,
+        completed_at: this.now(),
+      });
+      marked.push(requestId);
+    }
+    return marked;
   }
 
   private persistedAttempts(): PersistedAttempt[] {
@@ -1336,6 +1586,39 @@ export class VerificationScheduler {
     const git = readGitState(lease.cwd);
     const slot = this.slots.get(lease.runId);
     if (slot === undefined) throw new VerificationDisposedError(); // disposed between grant and spawn
+    // Exact-head evidence: a queue wait can span a push. Running the new
+    // head under the old submission would silently verify the wrong
+    // revision, so fail honestly instead (no spawn, no false PASS).
+    if (lease.head !== null && git.sha !== lease.head) {
+      const outcome: VerificationOutcome = {
+        runId: lease.runId,
+        jobId: lease.jobId,
+        scope: lease.scope,
+        command: lease.command,
+        cwd: lease.cwd,
+        ok: false,
+        exitCode: null,
+        signal: null,
+        timedOut: false,
+        queuedMs: this.now() - lease.queuedAt,
+        durationMs: 0,
+        sha: git.sha,
+        trackedDirty: git.trackedDirty,
+        workers,
+        outputBytes: 0,
+        outputSha256: createHash('sha256').digest('hex'),
+        outputTail: '',
+        error:
+          `head_changed: lane moved from ${lease.head} to ${git.sha ?? 'unknown'} before the run started — ` +
+          'a changed head is a new verification, never a replay',
+      };
+      this.safeRecord({
+        kind: 'verification.completed',
+        jobId: lease.jobId,
+        payload: outcomePayload(outcome),
+      });
+      return outcome;
+    }
     const child = spawn('/bin/sh', ['-c', lease.command], {
       cwd: lease.cwd,
       env: verificationEnvironment(process.env, {
