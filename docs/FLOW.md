@@ -216,6 +216,12 @@ verification budget.
   `[verify] worker_budget` (default: CPU cores − 2), enforced by the run
   wrapper through the vitest pool knobs and `GRU_VERIFY_*` variables for
   other runners.
+- **Project harness budgets compose with the run budget.** A repo may
+  classify process-heavy integration files with their own finite ceilings
+  and a smaller worker cap (gru-command: 120s and two workers, see
+  `test/helpers/test-budgets.ts`). The classified phase runs sequentially
+  after the fast phase inside the declared `full` command, so the two
+  phases never overlap and a smaller scheduler pin still wins.
 - **Holders are durable and self-healing.** Active holders persist at
   `<data_dir>/verify/scheduler.json` with the runner pid; a persisted
   holder whose pid is dead — or was never recorded — is released
