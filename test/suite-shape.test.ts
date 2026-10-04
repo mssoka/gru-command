@@ -71,7 +71,7 @@ const PINS: Record<string, number> = {
   'perkins-github-app.test.ts': 149,
   'perkins-freeze-freshhead.test.ts': 24,
   'perkins-lead-schema-compat.test.ts': 6,
-  'perkins-whole-review.test.ts': 81,
+  'perkins-whole-review.test.ts': 82,
   'phase-handoffs.test.ts': 13,
   'pi-adapter.test.ts': 75,
   'pr-creation-policy.test.ts': 5,
