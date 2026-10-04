@@ -1967,7 +1967,11 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     }
   });
 
-  it('does not record a reconciled delivery when the ref moved or the run aborted during the lookup (T4)', async () => {
+  it('does not record a reconciled delivery when the ref moved during the lookup (T4a)', async () => {
+    // Split from the former composite T4 (moved + aborted in one body): each
+    // scenario runs under its own unchanged body ceiling with its assertions
+    // intact; main's observation-only T4-PHASE/T4-ATTR instrumentation is
+    // retained per leg.
     // T4 phase evidence (phase pr144-t4-phase-evidence-20261001; test-local,
     // observation only): monotonic elapsed per named boundary, emitted as
     // bounded JSON lines so partial evidence survives an exceptional exit or
@@ -2029,7 +2033,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
       const inner = localHeadProbe(branch);
       return (input) => t4Step(leg, 'wave/head-probe', () => inner(input));
     };
-    t4Attr('suite', 'test-start', 'start', { note: 'single case, both discriminators, inherited 30000 ms bound unchanged; nested intervals are never summed' });
+    t4Attr('suite', 'test-start', 'start', { note: 'split T4a: moved discriminator, inherited 30000 ms bound unchanged; nested intervals are never summed' });
     const prepare = async (name: string, branch: string, leg: 'moved' | 'aborted') => {
       const repo = await t4Step(leg, 'fixture/repo-init', async () => makeFixtureRepo(name, (step) => t4Attr(leg, `fixture/repo-init.${step}`, 'end', { outcome: 'completed' })));
       repos.push(repo);
@@ -2080,7 +2084,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
       await t4Step(leg, 'fixture/origin-push', async () => { attachOrigin(repo, branch, root, { batched: true }); });
       return { repo, ledger, port, artifacts, sessions, target, job, root };
     };
-    // (a) The movement ref advances while the reconciliation lookup is
+    // The movement ref advances while the reconciliation lookup is
     // outstanding: the receipt is preserved, never recorded as delivery.
     const moved = await t4Timed('moved', 'fixture-prep', () => prepare('perkins-t4-moved', 'feature/t4-moved', 'moved'));
     const post = vi.fn(async () => { throw new Error('gh api review delivery exited 1: timeout'); });
@@ -2134,6 +2138,127 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     expect(unrecorded.receipt?.reviewId).toBe('9200');
     expect(moved.ledger.latestRoundEvent(movedOutcome.round.id, 'round.posted')).toBeNull();
     t4Attr('moved', 'leg', 'end', { outcome: 'completed', note: 'fixture-prep + wave-round + assertions; reconcile-lookup/git-ops are NESTED in wave-round — never summed' });
+    t4BodyCompleted = true;
+    t4Attr('suite', 'test-end', 'end', { outcome: 'completed' });
+  });
+
+  it('does not record a reconciled delivery when the run aborted during the lookup (T4b)', async () => {
+    // Split from the former composite T4 (moved + aborted in one body): each
+    // scenario runs under its own unchanged body ceiling with its assertions
+    // intact; main's observation-only T4-PHASE/T4-ATTR instrumentation is
+    // retained per leg.
+    // T4 phase evidence (phase pr144-t4-phase-evidence-20261001; test-local,
+    // observation only): monotonic elapsed per named boundary, emitted as
+    // bounded JSON lines so partial evidence survives an exceptional exit or
+    // the unchanged 30000 ms bound. Emits stdout lines only; never alters
+    // refs, ordering, mocks, or assertions.
+    const t4Mark = (kase: 'moved' | 'aborted', phase: string, boundary: 'start' | 'end', outcome: string, elapsedMs?: number): void => {
+      console.log(`T4-PHASE ${JSON.stringify({ case: kase, phase, boundary, outcome, ...(elapsedMs !== undefined ? { elapsedMs: Math.round(elapsedMs) } : {}) })}`);
+    };
+    const t4Timed = async <T>(kase: 'moved' | 'aborted', phase: string, run: () => Promise<T>): Promise<T> => {
+      const started = performance.now();
+      t4Mark(kase, phase, 'start', 'begin');
+      try {
+        const result = await run();
+        t4Mark(kase, phase, 'end', 'completed', performance.now() - started);
+        return result;
+      } catch (error) {
+        t4Mark(kase, phase, 'end', error instanceof Error ? `rejected:${error.name}` : 'rejected', performance.now() - started);
+        throw error;
+      }
+    };
+    // Finer attribution (phase pr144-t4-deep-attribution-20261001; test-local,
+    // observation only): T4-ATTR carries the absolute elapsed relative to this
+    // test's monotonic start on EVERY boundary plus per-phase elapsed, and
+    // subdivides fixture prep, the review-lifecycle boundaries this test
+    // drives (head probe, native lead start, reconciliation lookup), and the
+    // outside-body cleanup (emitted from the gated afterEach). Every real
+    // call is forwarded exactly once; ordering, mocks, refs, and assertions
+    // are untouched. The T4-PHASE marks above are emitted unchanged.
+    // Nested intervals (reconcile-lookup inside wave-round) are reported
+    // separately and are never summed into totals.
+    const t4Start = performance.now();
+    t4StartAt = t4Start;
+    t4Observe = true;
+    t4BodyCompleted = false;
+    const t4Attr = (leg: 'moved' | 'aborted' | 'suite', phase: string, boundary: 'start' | 'end', extra?: { elapsedMs?: number; outcome?: string; note?: string }): void => {
+      console.log(`T4-ATTR ${JSON.stringify({
+        leg, phase, boundary, absMs: Math.round(performance.now() - t4Start),
+        ...(extra?.elapsedMs !== undefined ? { elapsedMs: Math.round(extra.elapsedMs) } : {}),
+        ...(extra?.outcome !== undefined ? { outcome: extra.outcome } : {}),
+        ...(extra?.note !== undefined ? { note: extra.note } : {}),
+      })}`);
+    };
+    // run() may settle synchronously (plain value) or asynchronously
+    // (thenable); the awaited result is forwarded with its exact value and
+    // type, exactly one invocation, unchanged error propagation and ordering.
+    const t4Step = async <T>(leg: 'moved' | 'aborted', phase: string, run: () => T | Promise<T>): Promise<Awaited<T>> => {
+      t4Attr(leg, phase, 'start');
+      const started = performance.now();
+      try {
+        const result = await run();
+        t4Attr(leg, phase, 'end', { elapsedMs: performance.now() - started, outcome: 'completed' });
+        return result;
+      } catch (error) {
+        t4Attr(leg, phase, 'end', { elapsedMs: performance.now() - started, outcome: error instanceof Error ? `rejected:${error.name}` : 'rejected' });
+        throw error;
+      }
+    };
+    const t4Probe = (leg: 'moved' | 'aborted', branch: string): PrHeadProbe => {
+      const inner = localHeadProbe(branch);
+      return (input) => t4Step(leg, 'wave/head-probe', () => inner(input));
+    };
+    t4Attr('suite', 'test-start', 'start', { note: 'split T4b: aborted discriminator, inherited 30000 ms bound unchanged; nested intervals are never summed' });
+    const prepare = async (name: string, branch: string, leg: 'moved' | 'aborted') => {
+      const repo = await t4Step(leg, 'fixture/repo-init', async () => makeFixtureRepo(name, (step) => t4Attr(leg, `fixture/repo-init.${step}`, 'end', { outcome: 'completed' })));
+      repos.push(repo);
+      await t4Step(leg, 'fixture/branch-create', async () => { repo.git(['checkout', '-b', branch]); });
+      const target = await t4Step(leg, 'fixture/target-commit', () => {
+        // Batched equivalent of commitFile's add+commit (phase
+        // pr144-t4-cost-repair-20261001): one git process stages the file
+        // and commits (`commit --include`), removing a Node-to-git spawn
+        // per leg while keeping the identical Fixture Tests identity, the
+        // identical default message, parent, and resulting tree/HEAD, and
+        // the same loud non-zero failure propagation on any git error.
+        const file = join(repo.path, 'src/main.ts');
+        mkdirSync(dirname(file), { recursive: true });
+        writeFileSync(file, 'export function answer(): number {\n  return 44;\n}\n');
+        repo.git([
+          '-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid',
+          'commit', '--include', 'src/main.ts', '-m', 'fixture: update src/main.ts',
+        ]);
+        // The branch ref was just written loose by the commit above; the
+        // loose read is value-identical to `git rev-parse HEAD` (HEAD is
+        // the branch here) with an exact rev-parse fallback.
+        return looseRefOrRevParse(repo.path, `refs/heads/${branch}`);
+      });
+      const temps = await t4Step(leg, 'fixture/tempdirs', () => {
+        const root = mkdtempSync(join(tmpdir(), `${name}-port-`));
+        const artifacts = mkdtempSync(join(tmpdir(), `${name}-artifacts-`));
+        const sessions = mkdtempSync(join(tmpdir(), `${name}-sessions-`));
+        dirs.push(root, artifacts, sessions);
+        return { root, artifacts, sessions };
+      });
+      const root = temps.root;
+      const artifacts = temps.artifacts;
+      const sessions = temps.sessions;
+      const ledger = await t4Step(leg, 'fixture/ledger-open', () => {
+        const db = new LedgerDb(mkdtempSync(join(tmpdir(), `${name}-db-`)));
+        dbs.push(db);
+        return new LedgerApi(db.handle, { bus: new EventBus() });
+      });
+      const port = new GitReviewPort(root, branch, target);
+      await t4Step(leg, 'fixture/worktree-create', () => port.createJobWorktree({ repoPath: repo.path, jobId: `job-${name}` }));
+      const job = await t4Step(leg, 'fixture/lane-register', () => {
+        const job = ledger.addJob({ id: `job-${name}`, repo: 'fixture', title: name, baseBranch: 'main', briefing: 'review' });
+        ledger.setJobStatus(job.id, 'working');
+        settleLane(ledger, job.id);
+        ledger.setJobPr(job.id, `https://git.example.invalid/acme/fixture/pull/${name.length}`);
+        return job;
+      });
+      await t4Step(leg, 'fixture/origin-push', async () => { attachOrigin(repo, branch, root, { batched: true }); });
+      return { repo, ledger, port, artifacts, sessions, target, job, root };
+    };
     // (b) The run's abort signal fires while the lookup is outstanding.
     const aborted = await t4Timed('aborted', 'fixture-prep', () => prepare('perkins-t4-aborted', 'feature/t4-aborted', 'aborted'));
     const abortPost = vi.fn(async () => { throw new Error('gh api review delivery exited 1: timeout'); });
@@ -2157,9 +2282,15 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     const abortedOutcome = asWave(await t4Timed('aborted', 'wave-round', () => abortedWave.runRound({ jobId: aborted.job.id })));
     expect(abortedOutcome.posted).toBe(false);
     expect(abortedOutcome.verdict).toBeNull();
-    const unrecordedAbort = JSON.parse(readFileSync(join(aborted.artifacts, abortedOutcome.round.id, 'perkins-report.reconciled-unrecorded.json'), 'utf8')) as { reason?: string };
+    const unrecordedAbort = JSON.parse(readFileSync(join(aborted.artifacts, abortedOutcome.round.id, 'perkins-report.reconciled-unrecorded.json'), 'utf8')) as { recorded?: boolean; reason?: string; receipt?: { reviewId?: string } };
+    expect(unrecordedAbort.recorded).toBe(false);
     expect(unrecordedAbort.reason).toContain('aborted while the reconciliation lookup was outstanding');
+    expect(unrecordedAbort.receipt?.reviewId).toBe('9201');
     expect(aborted.ledger.latestRoundEvent(abortedOutcome.round.id, 'round.posted')).toBeNull();
+    // T4a parity: the production abort branch escalates the unrecorded
+    // reconciled review; recording without asserting it would hide a lost
+    // operator notification.
+    expect(abortEscalations.some((line) => line.includes('reconciled a provider review but did NOT record it'))).toBe(true);
     t4Attr('aborted', 'leg', 'end', { outcome: 'completed', note: 'fixture-prep + wave-round + assertions; reconcile-lookup is NESTED in wave-round — never summed' });
     t4BodyCompleted = true;
     t4Attr('suite', 'test-end', 'end', { outcome: 'completed' });
