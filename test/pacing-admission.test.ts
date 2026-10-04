@@ -657,7 +657,7 @@ describe('nested parent/reviewer admission (shipped playbook contract, j-810/j-8
     }
   });
 
-  it('default 4 saturated: a nested reviewer waits for a free slot and admits FIFO when any parent settles', async () => {
+  it('default 4 pacing cap: a nested reviewer waits for a free pacing slot and admits FIFO when any parent settles', async () => {
     const repo = makeFixtureRepo('pacing-nested-cap4');
     repos.push(repo);
     const laneRoot = mkdtempSync(join(tmpdir(), 'gru-pacing-nested-cap4-lanes-'));
@@ -696,8 +696,10 @@ describe('nested parent/reviewer admission (shipped playbook contract, j-810/j-8
       expect(spawned).toHaveLength(4);
       expect(gate.view().worker).toMatchObject({ limit: 4, running: 4 });
 
-      // Saturated residency: the nested reviewers stay queued while all four
-      // parent leases are open; no admission, no spawn, limits unchanged.
+      // Saturated pacing pool (fake PacingGate leases — the real resident
+      // ceiling is covered by the registry-backed tests below): the nested
+      // reviewers stay queued while all four parent leases are open; no
+      // admission, no spawn, limits unchanged.
       const reviewerOne = service.dispatch({
         jobId: 'parent-a-review-blind',
         repoPath: repo.path,
@@ -720,7 +722,7 @@ describe('nested parent/reviewer admission (shipped playbook contract, j-810/j-8
       ]);
       expect(gate.view().worker.running).toBe(4);
 
-      // Any parent settling frees a slot; the head waiter admits into it.
+      // Any parent settling frees a pacing slot; the head waiter admits into it.
       spawned[1]!.settle();
       const first = await reviewerOne;
       expect(first.agentId).not.toBeNull();

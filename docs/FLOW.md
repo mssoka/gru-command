@@ -481,8 +481,12 @@ outcome validation (`src/runtime/prompt-verdict.ts`), and boot
 reconciliation. That is the mechanism to extend — do not build a parallel
 outcome system. `/api/verify` single-flight admission/re-arm with the
 exclusive-capture helper (#159) has since shipped (PR #192).
-Nothing in this section claims the remaining runtime guarantees exist
-today.
+Fallback-PASS escalation follow-through is likewise policy-only: the pass
+event records a failed notifier truthfully, but no owned retry is
+scheduled for it, and the notifier posts before the pass event is
+appended, so a notification-triggered wake can observe the alert ahead of
+its durable event row. Nothing in this section claims the remaining
+runtime guarantees exist today.
 
 ## 5. Release (the sweep)
 

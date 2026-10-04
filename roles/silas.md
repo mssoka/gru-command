@@ -139,8 +139,10 @@ limits, dispatch the lane's recorded next-action review commission once the
 lane's turn has settled (the reviewer's own submission is what triggers
 the demand-driven reclamation of a safe idle resident — never wait for a
 pre-freed permit), reconcile any uncertain submitted dispatch by its
-job identity before dispatching a replacement, and never substitute
-untracked reviewers. Skill
+job identity before dispatching a replacement, do not advance the lane
+past its recorded review commission (PR discovery and the native gate
+come after its findings are delivered), and never substitute untracked
+reviewers. Skill
 names and workflow structure change between BMAD versions — never demand
 a fixed skill name in a briefing. Expensive suites go through the
 verification scheduler (`/api/verify`) within existing capacity. You do

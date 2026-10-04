@@ -1667,6 +1667,7 @@ describe('packaged product and terminal-frame coverage (N6)', () => {
     expect(stagedOps).toContain("own their workflows' built-in review on fresh independent reviewer contexts");
     expect(stagedOps).toContain('separately tracked review jobs');
     expect(stagedOps).toContain('nested-admission capability gap');
+    expect(stagedOps).toContain('do not advance the lane past its recorded review commission');
     expect(stagedOps).toContain('The owner holds ALL merges');
     expect(stagedOps).not.toContain('The chief holds merge authority');
     expect(stagedOps).toContain('never demand a fixed skill name');
@@ -1737,6 +1738,12 @@ describe('packaged product and terminal-frame coverage (N6)', () => {
           opsSkills.some((skill) => skill.body.length === 0) ||
           !opsSkills[0].body.includes('Continuous completion (owner contract 2026-10-02)')) {
         throw new Error('staged ops skills did not load through the compiled loader');
+      }
+      // The second staged skill's BODY is the shipped ledger-closeout
+      // instruction, not merely a nonempty file (bmad-review 795b0b6).
+      if (opsSkills[1].name !== 'ledger-closeout' ||
+          !opsSkills[1].body.includes('If it is not in the ledger, it did not happen')) {
+        throw new Error('staged ledger-closeout skill body is not the shipped skill');
       }
       const bridge = await ReviewMcpBridge.start([{
         name: 'perkins_probe', description: 'staged probe', inputSchema: { type: 'object' },

@@ -237,7 +237,9 @@ authorizes its full completion cycle, and YOU own driving it:
    submission is what triggers the demand-driven reclamation of a safe
    idle resident — never wait for a pre-freed permit), reconcile any
    uncertain submitted dispatch by its job identity before dispatching a
-   replacement, never raise limits, and never substitute untracked
+   replacement, do not advance the lane past its recorded review
+   commission (PR discovery and the native gate come after its findings
+   are delivered), never raise limits, and never substitute untracked
    reviewers. When a
    Perkins pre-flight failure routes the review to the installed
    bmad-review fallback gate, that host-routed gate is the review gate of

@@ -250,6 +250,25 @@ Review target: `962a41bd888343e73ea1fc9bf0ca4e37da1258cd..4af6aab396737e165dbda5
 - **Blind: renamed-catalog fixture does not exercise product selector (false).** There is no product skill-selection function: `test/roles-installed-playbook.test.ts:309-324` expressly pins prompt clauses and name absence, while `selectImplementationSkills()` is only a test demonstration; the spec prohibits a new runtime selector.
 - **Acceptance: no final-head full-suite verification (false).** GitHub Actions full-suite run 37224038766 is SUCCESS at head `4af6aab396737e165dbda502bb10e28938d2e3aa`; `.github/workflows/ci.yml:50` invokes `npm test`.
 
+### Review Findings — PR #165 at 795b0b6 (2026-10-04)
+
+Review against `origin/main` 28c3dd2b; four fresh `openai-codex/gpt-6-sol` layers completed. All four decisions and all three patch items below were resolved in the same continuation (owner directive: no deferral; the PR's declared scope excludes new runtime).
+
+- [x] [Review][Decision] Re-arm deferred reviewer commissions [roles/minion.md:120-126; roles/silas.md:130-142; src/dispatch/silas-driver.ts:425-548] — **medium** (blind-hunter) — resolved by bounding the promise (no new runtime): the ops surfaces now rule that the lane is not advanced past its recorded review commission (PR discovery and the native gate come after its findings are delivered), so the handback cannot silently upgrade into a skipped review. The missing machine-visible digest row stays named as a runtime gap in `docs/FLOW.md` §4f.'
+- [x] [Review][Decision] Recover failed fallback PASS escalation [src/dispatch/perkins.ts:2515-2540] — **medium** (blind-hunter) — resolved as a named runtime gap: the pass event and the awareness digest carry the truthful `failed` outcome, but an owned deduplicated retry is a new runtime obligation excluded by the declared scope; `docs/FLOW.md` §4f now names it (policy-only follow-through, no claimed guarantee).
+- [x] [Review][Decision] Establish the fallback PASS/notification visibility order [src/dispatch/perkins.ts:2515-2540; src/notifications/center.ts:116-140] — **medium** (blind-hunter) — resolved: the notifier-first order is deliberate because the durable event must record the real outcome, and the alternative (claiming success before the call) is the false-success bug r7 fixed; the visibility race is documented as a named runtime gap in `docs/FLOW.md` §4f (an attempt/outcome event sequence is future runtime work, not this PR).
+- [x] [Review][Decision] Separate clean installed-layout gate from ordinary dirty-worktree test runs [test/roles-installed-playbook.test.ts:83-122] — **medium** (blind-hunter) — resolved (decision): the commit-first workflow is intentional. The gate is a release-integrity invariant — a compiled-`dist` gate over staged inputs must not green on uncommitted role/loader changes — and a dev-mode split would add a second gate semantic without a demonstrated need; ordinary uncommitted iteration remains covered by the focused in-tree suites.
+- [x] [Review][Patch] Require each claimed fail-before oracle to fail, not any one of four [`.gru-command/worktree.toml:351`] — fixed: the baseline scope now checks each of the four overlaid files for its own `FAIL` marker and exits 5 naming any missing oracle.
+- [x] [Review][Patch] Distinguish pacing-only fake leases from resident permit reclamation [test/pacing-admission.test.ts:587-747] — fixed: the fake-`PacingGate` test now reads “default 4 pacing cap” and its comments name the pacing pool explicitly, pointing at the registry-backed tests for the resident ceiling; assertions unchanged.
+- [x] [Review][Patch] Assert the second staged Silas skill's body, not merely nonempty content [test/perkins-whole-review.test.ts:1731-1741] — fixed: the tarball smoke now asserts entry 2 is named `ledger-closeout` and its body carries the shipped record-is-the-work clause (`If it is not in the ledger, it did not happen`).
+
+#### Rejected (individual verdicts)
+
+- Blind 7 — **low, rejected**: the spec's example fast-config commands at lines 901-902 differ from the declared heavy scopes, but the requested fix edits the spec under review; the operative commands are `.gru-command/worktree.toml:350-351`.
+- Blind 8 — **low, rejected**: the spec's timeout-diagnostic example at line 908 omits heavy config/30-second flags; same spec-under-review exclusion, while `.gru-command/worktree.toml:367` holds the operative flags.
+- Blind 9 — **false, rejected**: the focused scopes do not include the new fallback and awareness tests, but the required full suite does include them; exact-head CI run 37232532408 passed `npm test` on `795b0b69`.
+- Acceptance 12 — **false, rejected**: exact-head CI run 37232532408 passed lint/typecheck/build and `npm test` on `795b0b69`; `test/rehearsal.test.ts:25-49` invokes the hygiene gate in that suite. The older receipt in the spec does not negate newer CI evidence.
+
 ## Implementation Notes
 
 - Runtime capability verified on this lane: `pi` CLI v0.99.1 on PATH,
@@ -873,7 +892,23 @@ bad_spec).
   inferring success from callback presence (fallback-path test covers
   absent, posted, and throwing PASS notifiers).
 - Round `gc-packaged-build-playbook-20261002-r8` requested on the
-  corrected head after the r7 fix cycle.
+  corrected head after the r7 fix cycle; **aborted by the owner's service
+  shutdown** (the owner stopped GC intentionally and directed review via
+  the multiplexer skill; evidence preserved).
+- Independent `bmad-code-review` on `795b0b6` (router: the operator's
+  terminal multiplexer, four fresh `openai-codex/gpt-6-sol` layers; report
+  at `~/.gru-command/reviews/gc-packaged-build-playbook-20261002-bmad-code-review-795b0b6/report.md`):
+  4 medium decisions + 3 low patches + 4 rejected; none a regression in
+  the r7 corrections. All resolved in the same continuation: decisions
+  bounded/documented without new runtime (lane not advanced past its
+  recorded review commission; failed-PASS-notifier retry and the
+  notification/PASS visibility order named as known runtime gaps in
+  `docs/FLOW.md` §4f; commit-first installed-layout integrity intended);
+  patches fixed (per-oracle baseline failures, pacing-vs-residency test
+  wording, staged `ledger-closeout` body pin). With GC stopped, GitHub CI
+  on the head remains the authoritative full gate and the native
+  clearance formality is unavailable by the owner's choice; the merge
+  stays owner-held.
 
 - Base re-integration #2 (2026-10-04): origin/main advanced to `f29a4b3`
   (PR #198 agent-status-truth #171, PR #199 ops-contracts #125/#128,
