@@ -465,11 +465,17 @@ the judgment; the dispatch surface is the mechanical hand.
   once per source round under `clean-abort-service-restart`. Other aborts
   and unchanged heads warrant no round. The re-arm is bound to the proved
   delivered head: an explicit `target_ref` must name that sha and an
-  omitted one freezes it — a moved live PR head is never substituted. A
+  omitted one freezes it — a moved live PR head is never substituted — and
+  the freeze boundary re-proves the delivered head is still the recorded
+  one: a newer delivery during the awaited pre-flight refuses the stale
+  re-arm (the next sweep offers the changed-head re-review instead). A
   review already REQUESTED for the current state retires the row —
   including the bmad-review fallback route, which creates no round and
-  owns its own fix loop. The clean-abort row retires only on a state that
-  answered it: an armed Perkins round records the consuming
+  owns its own fix loop; a fallback that never engaged (`unavailable`)
+  retires nothing, so a missing/again-repaired gate leaves the row due. A
+  queued handoff that ends `failed`/`held`/`skipped` without arming a
+  round answers nothing either. The clean-abort row retires only on a
+  state that answered it: an armed Perkins round records the consuming
   `silas.review-triggered` rule/round receipt (a fallback, queued or
   unavailable route does not), while any other ACCEPTED review request
   still withdraws the offer. Failed attempts stay eligible: a 409

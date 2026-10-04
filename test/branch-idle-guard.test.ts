@@ -416,6 +416,11 @@ describe('branch-idle guard', () => {
     const reopen = eventRecord(3, 'job.status', { from: 'in-review', to: 'working' });
     const midTurnLink = eventRecord(2, 'job.status', { from: 'working', to: 'in-review' });
     const settledLink = eventRecord(3, 'job.status', { from: 'delivered', to: 'in-review' });
+    // A prior attempt delivered, a fix loop reopened the lane, and a PR
+    // link moved that still-open attempt to in-review.
+    const firstLink = eventRecord(3, 'job.status', { from: 'working', to: 'in-review' });
+    const reopened = eventRecord(4, 'job.status', { from: 'in-review', to: 'working' });
+    const reopenedLink = eventRecord(5, 'job.status', { from: 'working', to: 'in-review' });
     const events = new Map<string, EventRecord[]>([
       ['never-started', []],
       ['settled', [start, delivery]],
@@ -424,6 +429,7 @@ describe('branch-idle guard', () => {
       ['linked-mid-turn', [start, midTurnLink]],
       ['linked-mid-turn-late-delivery', [start, midTurnLink, eventRecord(4, 'job.delivered', { sha: 'sha-2' })]],
       ['linked-after-delivery', [start, delivery, settledLink]],
+      ['reopened-mid-turn', [start, delivery, firstLink, reopened, reopenedLink]],
     ]);
     const ledger = {
       listJobs: () => [
@@ -435,6 +441,7 @@ describe('branch-idle guard', () => {
         jobRecord('linked-mid-turn', 'in-review'),
         jobRecord('linked-mid-turn-late-delivery', 'in-review'),
         jobRecord('linked-after-delivery', 'in-review'),
+        jobRecord('reopened-mid-turn', 'in-review'),
       ],
       latestJobEvent: (jobId: string, kind: string): EventRecord | null =>
         (events.get(jobId) ?? []).filter((event) => event.kind === kind).at(-1) ?? null,
@@ -454,6 +461,9 @@ describe('branch-idle guard', () => {
     expect(busy('linked-mid-turn-late-delivery')).toBe(false);
     // A delivered → in-review flip starts no attempt at all.
     expect(busy('linked-after-delivery')).toBe(false);
+    // The prior delivery settled attempt 1; the reopened attempt (working)
+    // is still open after the PR link flipped it to in-review.
+    expect(busy('reopened-mid-turn')).toBe(true);
 
     const lanes = [laneRecord('reopened', 'reopened', 'gru/reopened'), laneRecord('settled', 'settled', 'gru/settled')];
     expect(findBusyLanes({ ledger, lanes, targetBranch: 'gru/reopened' }).map((blocker) => blocker.jobId)).toEqual([
@@ -467,6 +477,45 @@ describe('branch-idle guard', () => {
     ]);
     expect(normalizeBranch('refs/remotes/origin/gru/x')).toBe('gru/x');
     expect(normalizeBranch('refs/heads/gru/x')).toBe('gru/x');
+  });
+
+  it('resolves the attempt hop beyond the first page and clears an unreachable history on delivery', () => {
+    // 255 events newer than the flip push the working hop past the first
+    // 200-event page; the paged lookup must keep walking.
+    const pagedHistory = [
+      eventRecord(1, 'job.status', { from: 'dispatched', to: 'working' }),
+      ...Array.from({ length: 255 }, (_, i) => eventRecord(i + 2, 'job.note', {})),
+      eventRecord(257, 'job.status', { from: 'working', to: 'in-review' }),
+      eventRecord(400, 'job.delivered', { sha: 'sha-paged' }),
+    ];
+    const paged = {
+      listJobs: () => [jobRecord('paged', 'in-review')],
+      latestJobEvent: (_jobId: string, kind: string): EventRecord | null =>
+        pagedHistory.filter((event) => event.kind === kind).at(-1) ?? null,
+      listJobEvents: (_jobId: string, opts?: { readonly limit?: number }): readonly EventRecord[] =>
+        [...pagedHistory].reverse().slice(0, opts?.limit ?? 200),
+      listPendingRebriefs: (): readonly PendingRebriefRecord[] => [],
+    };
+    expect(laneIsBusy(paged, paged.listJobs()[0]!)).toBe(false);
+
+    // A history whose hop is unreachable within the page cap: a delivery
+    // newer than the flip still clears the attempt (never permanent busy).
+    const fillerCount = 12_900;
+    const cappedHistory = [
+      eventRecord(1, 'job.status', { from: 'dispatched', to: 'working' }),
+      eventRecord(2, 'job.status', { from: 'working', to: 'in-review' }),
+      ...Array.from({ length: fillerCount }, (_, i) => eventRecord(i + 3, 'job.note', {})),
+      eventRecord(fillerCount + 3, 'job.delivered', { sha: 'sha-late' }),
+    ];
+    const capped = {
+      listJobs: () => [jobRecord('capped', 'in-review')],
+      latestJobEvent: (_jobId: string, kind: string): EventRecord | null =>
+        cappedHistory.filter((event) => event.kind === kind).at(-1) ?? null,
+      listJobEvents: (_jobId: string, opts?: { readonly limit?: number }): readonly EventRecord[] =>
+        [...cappedHistory].reverse().slice(0, opts?.limit ?? 200),
+      listPendingRebriefs: (): readonly PendingRebriefRecord[] => [],
+    };
+    expect(laneIsBusy(capped, capped.listJobs()[0]!)).toBe(false);
   });
 
   it('refuses the arm with 409 branch_busy while a working lane owns the branch, then passes once it delivers', async () => {

@@ -24,6 +24,7 @@ import type { EventBus } from '../events/bus.js';
 import type { ResidentReviewRound } from '../runtime/registry.js';
 import { settleRetries, type PacingGate, type PacingLease, type RateLimitBackoffPolicy, type RetrySettlement } from '../runtime/pacing.js';
 import { isExactOriginBranchSpelling } from '../worktrees/manager.js';
+import { deliveredTargetSha } from './silas-driver.js';
 import type { CanonicalReviewVerdict, VerifiedFinding } from './perkins-review/types.js';
 import { PerkinsWholeReview, type PerkinsWholeResult } from './perkins-review/whole.js';
 import { loadPerkinsPolicy, type PerkinsLens, type PerkinsPolicy } from './perkins-review/policy.js';
@@ -1736,6 +1737,9 @@ export class WaveRunner {
   async requestReview(input: {
     jobId: string;
     targetRef?: string;
+    /** Internal: a clean-abort re-arm's request-time delivered head; the
+     * freeze boundary refuses when a newer delivery superseded it. */
+    boundDeliveredSha?: string;
     lenses?: readonly string[];
     noSpec?: boolean;
     force?: boolean;
@@ -2161,6 +2165,9 @@ export class WaveRunner {
   private async beginPerkinsRound(input: {
     jobId: string;
     targetRef?: string;
+    /** Clean-abort re-arm: the exact delivered head proved at request time;
+     * re-proved at the freeze boundary before any lens runs. */
+    boundDeliveredSha?: string;
     lenses?: readonly string[];
     noSpec?: boolean;
     force?: boolean;
@@ -2685,6 +2692,9 @@ export class WaveRunner {
   private async setupRound(input: {
     jobId: string;
     targetRef?: string;
+    /** Clean-abort re-arm: the exact delivered head proved at request time;
+     * re-proved at the freeze boundary before any lens runs. */
+    boundDeliveredSha?: string;
     lenses?: readonly string[];
     noSpec?: boolean;
     force?: boolean;
@@ -2821,6 +2831,21 @@ export class WaveRunner {
         roundId: round.id,
         ...(flippedFrom !== null ? { reviewedStatus: { jobId: job.id, status: flippedFrom } } : {}),
       });
+      // A clean-abort re-arm proved ONE delivered head at request time; the
+      // awaited pre-flight/capacity/setup window can admit a newer delivery.
+      // Re-prove the unchanged-head precondition here, at the last boundary
+      // before the freeze, so the round never reviews a superseded head
+      // under the clean-abort provenance (the next digest sweep offers the
+      // changed-head re-review instead).
+      if (input.boundDeliveredSha !== undefined) {
+        const deliveredNow = this.opts.ledger.latestJobEvent(job.id, 'job.delivered');
+        const shaNow = deliveredNow === null ? null : deliveredTargetSha(deliveredNow);
+        if (shaNow !== input.boundDeliveredSha) {
+          throw new Error(
+            `the clean-abort delivered head moved during review setup (${input.boundDeliveredSha} -> ${shaNow ?? 'none'}) — request the review again`,
+          );
+        }
+      }
       // Late binding: amendments/CI/verification are read NOW, after every
       // await in setup, so the frozen round carries the newest records.
       assembleReviewInputs();

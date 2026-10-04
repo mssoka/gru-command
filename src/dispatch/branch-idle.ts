@@ -206,8 +206,13 @@ export function openAttemptStartSeq(ledger: BranchIdleLedger, jobId: string): nu
   if (payload.to === 'working') return latest.seq;
   if (payload.to === 'in-review' && payload.from === 'working') {
     const hop = previousStatusSeq(ledger, jobId, latest.seq);
-    if (hop === null) return Number.MAX_SAFE_INTEGER; // history unreachable — fail closed
-    return hop;
+    if (hop !== null) return hop;
+    // The status history is unreachable past the page cap. A delivery newer
+    // than the flip settles the attempt the flip belongs to, so the lane
+    // clears; otherwise fail closed and treat the attempt as open (a later
+    // delivery clears it — never a permanent busy).
+    const delivered = ledger.latestJobEvent(jobId, 'job.delivered');
+    return delivered !== null && delivered.seq > latest.seq ? 0 : Number.MAX_SAFE_INTEGER;
   }
   return 0;
 }

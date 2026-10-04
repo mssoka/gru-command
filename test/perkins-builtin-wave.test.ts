@@ -4793,7 +4793,7 @@ describe('durable handoff admission: perkins route, re-busy re-queue, crash/term
   const HANDOFF_CAPS = { streaming: false, steer: 'queued' as const, resume: 'file' as const, images: false, thinking: false, thinkingLevelControl: false, followUp: false };
   const failingPreflight = async () => ({ ok: false as const, failures: [preflightFailure('review-policy', 'disabled')] });
 
-  async function handoffFixture(name: string, jobId: string) {
+  async function handoffFixture(name: string, jobId: string, opts: { isolateLedgerBus?: boolean } = {}) {
     const repo = makeFixtureRepo(name);
     repos.push(repo);
     repo.git(['checkout', '-b', 'feature/review']);
@@ -4805,7 +4805,10 @@ describe('durable handoff admission: perkins route, re-busy re-queue, crash/term
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), `handoff-${name}-db-`)));
     dbs.push(db);
     const bus = new EventBus();
-    const ledger = new LedgerApi(db.handle, { bus });
+    // With an isolated ledger bus a test can record a REAL delivery without
+    // waking the wave's own listener, then drive the deterministic pass
+    // itself — the realistic settled-lane fixture.
+    const ledger = new LedgerApi(db.handle, { bus: opts.isolateLedgerBus === true ? new EventBus() : bus });
     const port = new GitReviewPort(root, 'feature/review', target);
     await port.createJobWorktree({ repoPath: repo.path, jobId });
     const job = ledger.addJob({ id: jobId, repo: 'fixture', title: name, baseBranch: 'main', briefing: 'review this' });
@@ -4939,17 +4942,15 @@ describe('durable handoff admission: perkins route, re-busy re-queue, crash/term
   }, 120_000);
 
   it('reconsiders pending handoffs on the deterministic pass alone — no second API call, no follow-through feature', async () => {
-    const f = await handoffFixture('handoff-sweep-reconcile', 'job-handoff-sweep');
+    const f = await handoffFixture('handoff-sweep-reconcile', 'job-handoff-sweep', { isolateLedgerBus: true });
     const wave = new WaveRunner({ ledger: f.ledger, worktrees: f.port, spawner: vi.fn() as unknown as AgentSpawner, bus: f.bus, reviewPreflight: failingPreflight });
     const accepted = await wave.requestReview({ jobId: 'job-handoff-sweep', handoff: true });
     expect(accepted.route).toBe('queued');
     expect(f.ledger.latestJobEvent('job-handoff-sweep', 'job.review-handoff-requeued')).toBeNull();
-    // The lane settles into an authorized idle status WITHOUT a delivery
-    // event on the shared bus: only the deterministic-pass reconciler
+    // The lane settles with a REAL delivery that never reaches the wave's
+    // listener (isolated ledger bus): only the deterministic-pass reconciler
     // (exactly what main wires into the Silas seam) may reconsider it.
-    // (`in-review` reached from a still-open attempt is a WRITER since
-    // g25/#121 — the settle must be spelled as the delivered status.)
-    f.ledger.setJobStatus('job-handoff-sweep', 'delivered');
+    f.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-handoff-sweep', payload: { sha: f.target } });
     wave.reconcilePendingHandoffs(); // the wired callback target — no API call, no timer, no follow-through lane
     await tickUntil(() => f.ledger.latestJobEvent('job-handoff-sweep', 'job.review-handoff-failed') !== null
       || f.ledger.latestJobEvent('job-handoff-sweep', 'job.review-handoff-started') !== null);
@@ -4961,7 +4962,7 @@ describe('durable handoff admission: perkins route, re-busy re-queue, crash/term
   }, 120_000);
 
   it('HOLDS a handoff on a post-intake status flip and rearms only via a genuinely new validated request', async () => {
-    const f = await handoffFixture('handoff-held-rearm', 'job-handoff-held');
+    const f = await handoffFixture('handoff-held-rearm', 'job-handoff-held', { isolateLedgerBus: true });
     const wave = new WaveRunner({ ledger: f.ledger, worktrees: f.port, spawner: vi.fn() as unknown as AgentSpawner, bus: f.bus, reviewPreflight: failingPreflight });
     const first = await wave.requestReview({ jobId: 'job-handoff-held', handoff: true });
     expect(first.route).toBe('queued');
@@ -4978,9 +4979,9 @@ describe('durable handoff admission: perkins route, re-busy re-queue, crash/term
     // A NEW validated review request rearms the held intent.
     const again = await wave.requestReview({ jobId: 'job-handoff-held', handoff: true });
     expect(again.route).toBe('queued');
-    // The lane settles into an authorized-but-idle status: the rearmed
-    // intent may now reach its terminal outcome on the next pass.
-    f.ledger.setJobStatus('job-handoff-held', 'delivered');
+    // The lane settles with a real delivery the control bus never sees: the
+    // rearmed intent may now reach its terminal outcome on the next pass.
+    f.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-handoff-held', payload: { sha: f.target } });
     wave.reconcilePendingHandoffs();
     await tickUntil(() => f.ledger.latestJobEvent('job-handoff-held', 'job.review-handoff-failed') !== null
       || f.ledger.latestJobEvent('job-handoff-held', 'job.review-handoff-started') !== null);
@@ -5025,14 +5026,14 @@ describe('durable handoff admission: perkins route, re-busy re-queue, crash/term
   }, 120_000);
 
   it('reconciles an un-armed handoff on the next genuine observation when the lane went idle without delivery', async () => {
-    const f = await handoffFixture('handoff-idle-reconcile', 'job-handoff-idle');
+    const f = await handoffFixture('handoff-idle-reconcile', 'job-handoff-idle', { isolateLedgerBus: true });
     const wave = new WaveRunner({ ledger: f.ledger, worktrees: f.port, spawner: vi.fn() as unknown as AgentSpawner, bus: f.bus, reviewPreflight: failingPreflight });
     const accepted = await wave.requestReview({ jobId: 'job-handoff-idle', handoff: true });
     expect(accepted.route).toBe('queued'); // busy lane, durable 202 receipt
-    // The turn ends WITHOUT a delivery event (abort/failure): the lane
-    // settles into an authorized idle status and a later genuine
-    // observation must ARM the review — no skip.
-    f.ledger.setJobStatus('job-handoff-idle', 'delivered');
+    // The turn ends with a real, recorded delivery the control bus never
+    // sees: the lane goes idle and a later genuine observation must ARM the
+    // review — no skip.
+    f.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-handoff-idle', payload: { sha: f.target } });
     const second = await wave.requestReview({ jobId: 'job-handoff-idle' });
     expect(second.route).toBe('queued'); // the receipt stays truthful while admission reconciles
     await tickUntil(() => f.ledger.latestJobEvent('job-handoff-idle', 'job.review-handoff-failed') !== null

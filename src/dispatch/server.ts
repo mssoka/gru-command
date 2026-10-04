@@ -328,12 +328,22 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       const input = {
         jobId,
         ...(boundTargetRef !== undefined ? { targetRef: boundTargetRef } : {}),
+        // The freeze boundary re-proves this delivered head; a newer
+        // delivery during the awaited setup refuses the stale re-arm.
+        ...(sourceRoundId !== undefined && boundTargetRef !== undefined ? { boundDeliveredSha: boundTargetRef } : {}),
         ...(optStrArray(body, 'lenses') !== undefined ? { lenses: optStrArray(body, 'lenses') } : {}),
         ...(optBoolField(body, 'no_spec') !== undefined ? { noSpec: optBoolField(body, 'no_spec') } : {}),
         ...(force !== undefined ? { force } : {}),
         ...(evidenceRefs !== undefined ? { evidence: evidenceRefs } : {}),
         ...(by === 'minion' ? { handoff: true } : {}),
       };
+      // The fallback gate can append a terminal phase BEFORE this handler
+      // records its request receipt (a synchronous diff failure inside
+      // beginFallbackGate reaches `blocked` before returning). Baseline the
+      // job's fallback trail so a failure that belongs to THIS request is
+      // recognized by its post-baseline phase, never by event order against
+      // a receipt that does not exist yet.
+      const fallbackBaselineSeq = options.ledger.latestJobEvent(jobId, 'job.fallback-review')?.seq ?? 0;
       let outcome: Awaited<ReturnType<WaveRunner['requestReview']>>;
       try {
         outcome = await options.wave.requestReview(input);
@@ -364,15 +374,21 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         // The consuming source-round receipt is ONLY an armed Perkins round.
         // Fallback/queued routes answer no round, so the clean-abort re-arm
         // stays eligible (g24); their trigger still retires the generic
-        // review-overdue row because the route owns the lane. An unavailable
-        // fallback engages nothing at all: record a non-consuming deferral.
+        // review-overdue row because the route owns the lane. A fallback
+        // that never engaged or already terminated this request engages
+        // nothing at all: record a non-consuming deferral instead.
         const armed = outcome.route === 'perkins';
-        if (outcome.route === 'bmad-review-fallback' && !outcome.skillInstalled) {
+        const latestFallback = options.ledger.latestJobEvent(input.jobId, 'job.fallback-review');
+        const fallbackPhase = latestFallback !== null && typeof latestFallback.payload === 'object' && latestFallback.payload !== null
+          ? (latestFallback.payload as { phase?: unknown }).phase : undefined;
+        const fallbackFailedNow = latestFallback !== null && latestFallback.seq > fallbackBaselineSeq &&
+          (fallbackPhase === 'unavailable' || fallbackPhase === 'blocked' || fallbackPhase === 'aborted');
+        if (outcome.route === 'bmad-review-fallback' && (!outcome.skillInstalled || fallbackFailedNow)) {
           options.ledger.appendCustomEvent({
             kind: 'silas.review-deferred',
             jobId: input.jobId,
             payload: {
-              reason: 'fallback_unavailable',
+              reason: outcome.skillInstalled ? 'fallback_failed' : 'fallback_unavailable',
               ...(ruleId !== undefined ? { rule_id: ruleId, source_round_id: sourceRoundId } : {}),
               note: outcome.note,
             },

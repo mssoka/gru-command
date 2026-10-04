@@ -642,6 +642,56 @@ describe('silas digest (the four actionable states)', () => {
     } finally { h.cleanup(); }
   });
 
+  it('an unavailable fallback does not retire the generic review-overdue row; a blocked gate still does', async () => {
+    const h = makeLedger();
+    try {
+      const digestOf = () => computeSilasDigest({ ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG, trigger: 'sweep' });
+      addJobWithDelivery(h.ledger, 'job-unavailable', { prUrl: 'https://git.example.invalid/o/r/pull/31' });
+      addJobWithDelivery(h.ledger, 'job-gate-blocked', { prUrl: 'https://git.example.invalid/o/r/pull/32' });
+      const due = async (): Promise<string[]> =>
+        (await digestOf()).prWithoutReview.map((row) => row.jobId).sort();
+      expect(await due()).toEqual(['job-gate-blocked', 'job-unavailable']);
+      // The gate never engaged: nothing reviewed the state, the row stays.
+      h.ledger.appendCustomEvent({ kind: 'job.fallback-review', jobId: 'job-unavailable', payload: { gate: true, phase: 'unavailable' } });
+      expect(await due()).toEqual(['job-gate-blocked', 'job-unavailable']);
+      // The gate engaged and owns the lane even when it gives up.
+      h.ledger.appendCustomEvent({ kind: 'job.fallback-review', jobId: 'job-gate-blocked', payload: { gate: true, phase: 'blocked' } });
+      expect(await due()).toEqual(['job-unavailable']);
+    } finally { h.cleanup(); }
+  });
+
+  it('a queued-route trigger answers only while its handoff arms a review', async () => {
+    const h = makeLedger();
+    try {
+      const digestOf = () => computeSilasDigest({ ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG, trigger: 'sweep' });
+      addJobWithDelivery(h.ledger, 'clean-queued', { prUrl: 'https://git.example.invalid/pull/clean-queued' });
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'clean-queued', payload: { sha: 'sha-queued' } });
+      const round = h.ledger.addRound({ jobId: 'clean-queued', targetRef: 'sha-queued' });
+      h.ledger.setRoundStatus(round.id, 'live');
+      h.ledger.setJobStatus('clean-queued', 'in-review');
+      h.ledger.setRoundStatus(round.id, 'aborted');
+      h.ledger.appendCustomEvent({ kind: 'round.perkins-incomplete', jobId: 'clean-queued', roundId: round.id, payload: { reason: 'service_restart' } });
+      expect((await digestOf()).prWithoutReview).toMatchObject([{ jobId: 'clean-queued', cleanAbort: { roundId: round.id } }]);
+
+      // A queued handoff owns the intent while it is pending...
+      h.ledger.appendCustomEvent({ kind: 'silas.review-triggered', jobId: 'clean-queued', payload: { route: 'queued' } });
+      expect((await digestOf()).prWithoutReview).toEqual([]);
+      // ...but a handoff that ended without arming answers nothing.
+      h.ledger.appendCustomEvent({ kind: 'job.review-handoff-failed', jobId: 'clean-queued', payload: { error: 'no fallback gate' } });
+      expect((await digestOf()).prWithoutReview).toMatchObject([{ jobId: 'clean-queued', cleanAbort: { roundId: round.id } }]);
+      // A NEWER queued request is not negated by the older handoff failure.
+      h.ledger.appendCustomEvent({ kind: 'silas.review-triggered', jobId: 'clean-queued', payload: { route: 'queued' } });
+      expect((await digestOf()).prWithoutReview).toEqual([]);
+      // An armed handoff is the authoritative answer.
+      h.ledger.appendCustomEvent({ kind: 'job.review-handoff-started', jobId: 'clean-queued', payload: { requestSeq: 1, route: 'perkins' } });
+      expect((await digestOf()).prWithoutReview).toEqual([]);
+    } finally { h.cleanup(); }
+  });
+
   it('an unresolved re-brief fences first and changed-head reviews; a late delivery cannot clear it', async () => {
     const h = makeLedger();
     try {

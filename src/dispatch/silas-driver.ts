@@ -334,19 +334,28 @@ export function followUpChangedTarget(
   return sha !== null && target !== null && target !== '' && sha !== target;
 }
 
+/** The phase a fallback lifecycle event recorded (payload.phase). */
+function fallbackPhaseOf(event: EventRecord): unknown {
+  return typeof event.payload === 'object' && event.payload !== null
+    ? (event.payload as { phase?: unknown }).phase
+    : undefined;
+}
+
 /**
  * The review-request receipts the digest can read: the silas trigger that
  * asked for a wave, and the bmad-review fallback gate's own lifecycle
  * event. The fallback route creates no round, so the review-overdue row
  * must retire on these — otherwise it re-fires every sweep and Silas
- * re-triggers a gate that already owns the lane.
+ * re-triggers a gate that already owns the lane. An `unavailable` phase is
+ * the exception: the gate never engaged, nothing reviewed the state, and
+ * the row must stay eligible for a later repair.
  */
 function latestReviewRequest(ledger: DigestLedger, jobId: string): EventRecord | null {
   const candidates: EventRecord[] = [];
-  for (const kind of ['silas.review-triggered', 'job.fallback-review']) {
-    const event = ledger.latestJobEvent(jobId, kind);
-    if (event !== null) candidates.push(event);
-  }
+  const trigger = ledger.latestJobEvent(jobId, 'silas.review-triggered');
+  if (trigger !== null) candidates.push(trigger);
+  const fallback = ledger.latestJobEvent(jobId, 'job.fallback-review');
+  if (fallback !== null && fallbackPhaseOf(fallback) !== 'unavailable') candidates.push(fallback);
   return candidates.sort((a, b) => b.seq - a.seq)[0] ?? null;
 }
 
@@ -355,22 +364,60 @@ function latestReviewRequest(ledger: DigestLedger, jobId: string): EventRecord |
  * (`aborted`). A clean-abort re-arm stays eligible after these. */
 const FALLBACK_FAILED_PHASES: ReadonlySet<string> = new Set(['unavailable', 'blocked', 'aborted']);
 
+/** Handoff lifecycle kinds that prove a queued review intent never armed a
+ * review. `job.review-handoff-started` is the authoritative success;
+ * queued/claimed/requeued states are still pending. */
+const HANDOFF_UNARMED_KINDS: ReadonlySet<string> = new Set([
+  'job.review-handoff-failed',
+  'job.review-handoff-held',
+  'job.review-handoff-skipped',
+]);
+
+/** The job's latest handoff lifecycle event (null when none was recorded). */
+function latestHandoffEvent(ledger: DigestLedger, jobId: string): EventRecord | null {
+  const kinds = [
+    'job.review-handoff-started',
+    'job.review-handoff-failed',
+    'job.review-handoff-held',
+    'job.review-handoff-skipped',
+    'job.review-handoff-requeued',
+  ];
+  return kinds
+    .map((kind) => ledger.latestJobEvent(jobId, kind))
+    .filter((event): event is EventRecord => event !== null)
+    .sort((a, b) => b.seq - a.seq)[0] ?? null;
+}
+
+/** A Silas trigger answers only if it actually owns a review state: a
+ * queued-route trigger is answered by its handoff, so a handoff that ended
+ * without arming a round (failed/held/skipped) AFTER this trigger answers
+ * nothing. An older handoff outcome belongs to a previous request. */
+function triggerAnswers(ledger: DigestLedger, jobId: string, trigger: EventRecord): boolean {
+  const route = typeof trigger.payload === 'object' && trigger.payload !== null
+    ? (trigger.payload as { route?: unknown }).route : undefined;
+  if (route !== 'queued') return true;
+  const handoff = latestHandoffEvent(ledger, jobId);
+  if (handoff === null || handoff.seq < trigger.seq) return true;
+  return !HANDOFF_UNARMED_KINDS.has(handoff.kind);
+}
+
 /** The latest review request that genuinely answers the target's current
  * state: an accepted Silas trigger (any route the server admitted), or a
  * fallback-gate event while the gate is live or passed. A terminal fallback
- * failure newer than the trigger negates it — a failed attempt keeps the
+ * failure newer than the winner negates it — a failed attempt keeps the
  * clean-abort row eligible (g4). A 409 deferral is a different event kind
  * and never counts. */
 function latestAnsweringReviewRequest(ledger: DigestLedger, jobId: string): EventRecord | null {
   const trigger = ledger.latestJobEvent(jobId, 'silas.review-triggered');
   const fallback = ledger.latestJobEvent(jobId, 'job.fallback-review');
-  if (fallback === null) return trigger;
-  const phase = typeof fallback.payload === 'object' && fallback.payload !== null
-    ? (fallback.payload as { phase?: unknown }).phase : undefined;
-  const failed = typeof phase === 'string' && FALLBACK_FAILED_PHASES.has(phase);
-  if (failed && (trigger === null || fallback.seq > trigger.seq)) return null;
-  if (trigger === null) return fallback;
-  return trigger.seq >= fallback.seq ? trigger : fallback;
+  const phase = fallback === null ? undefined : fallbackPhaseOf(fallback);
+  const fallbackFailed = fallback !== null && typeof phase === 'string' && FALLBACK_FAILED_PHASES.has(phase);
+  const candidates: EventRecord[] = [];
+  if (trigger !== null && triggerAnswers(ledger, jobId, trigger)) candidates.push(trigger);
+  if (fallback !== null && !fallbackFailed) candidates.push(fallback);
+  const winner = candidates.sort((a, b) => b.seq - a.seq)[0] ?? null;
+  if (fallbackFailed && fallback !== null && (winner === null || fallback.seq > winner.seq)) return null;
+  return winner;
 }
 
 /**
