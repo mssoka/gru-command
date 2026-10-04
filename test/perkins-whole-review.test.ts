@@ -1824,6 +1824,134 @@ describe('whole-PR engine: repair pass 3', () => {
     expect(result.findings).toHaveLength(2);
   });
 
+  it('rejects an all-titles report that explicitly concludes the change is issue-free (R37)', async () => {
+    const h = wholeHarness({
+      childAnswer: (prompt) => (prompt.includes('"source": "edge"')
+        ? JSON.stringify([groundedFinding('edge', 'blocker', { title: 'broken guard' })])
+        : '[]'),
+      specialists: ['edge'],
+      submitRetries: 0,
+      transformReport: (report) => report
+        .concat('\n**In summary, no issues remain in this change; no changes needed; the change is clean.**\n'),
+    });
+    const rejection = await h.run().then(
+      () => { throw new Error('expected rejection'); },
+      (error: Error) => error.message,
+    );
+    expect(rejection).toContain('report-coherence');
+    // The rejection names the contradiction, not just the prose.
+    expect(rejection).toMatch(/issue-free|clean-slate/u);
+    expect(rejection).toMatch(/contradict/u);
+  });
+
+  it('accepts a lens-scoped clean statement beside retained findings (R37)', async () => {
+    const h = wholeHarness({
+      childAnswer: (prompt) => (prompt.includes('"source": "edge"')
+        ? JSON.stringify([groundedFinding('edge', 'warning')])
+        : '[]'),
+      specialists: ['edge'],
+      transformReport: (report) => report
+        .concat('\nNote: the security and codebase lenses found no issues of their own.\n'),
+    });
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    expect(result.findings).toHaveLength(1);
+  });
+
+  it('accepts a clean statement scoped by an explicit exception (R37)', async () => {
+    const h = wholeHarness({
+      childAnswer: (prompt) => (prompt.includes('"source": "edge"')
+        ? JSON.stringify([groundedFinding('edge', 'warning')])
+        : '[]'),
+      specialists: ['edge'],
+      transformReport: (report) => report
+        .concat('\nNo issues remain in this change except the retained finding listed above.\n'),
+    });
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    expect(result.findings).toHaveLength(1);
+  });
+
+  it('classifies clean-slate prose against retained findings (R37 table)', async () => {
+    const terminal = [
+      '\nNo issues remain.\n',
+      '\nNo changes needed.\n',
+      '\nThe change is clean.\n',
+      '\nNothing needs fixing.\n',
+      '\nEverything looks good.\n',
+      '\nLGTM.\n',
+    ];
+    const scoped = [
+      '\nThe blind lens found no issues of its own.\n',
+      '\nNo issues remain in src/other.ts.\n',
+      '\nNo issues remain except the retained finding above.\n',
+      '\nNo new issues were found; the retained finding stands.\n',
+    ];
+    const variants = [...terminal, ...scoped];
+    let call = 0;
+    const h = wholeHarness({
+      childAnswer: (prompt) => (prompt.includes('"source": "edge"')
+        ? JSON.stringify([groundedFinding('edge', 'warning', { title: 'broken guard' })])
+        : '[]'),
+      specialists: ['edge'],
+      submitRetries: 0,
+      preflight: {
+        calls: variants.length,
+        mutate: (submission) => ({ ...submission, report_markdown: submission.report_markdown + variants[call++]! }),
+      },
+    });
+    const result = await h.run();
+    const verdicts = h.preflightResults.map((entry) => (JSON.parse(entry.text) as { ok: boolean }).ok);
+    expect(verdicts.slice(0, terminal.length)).toEqual(terminal.map(() => false));
+    expect(verdicts.slice(terminal.length)).toEqual(scoped.map(() => true));
+    // The unmutated submission itself stays accepted.
+    expect(result.findings).toHaveLength(1);
+  });
+
+  it('applies no clean-conclusion rule when nothing is retained (R37)', async () => {
+    const h = wholeHarness({
+      ...ALL_CLEAN,
+      transformReport: (report) => report.concat('\nNo issues remain; nothing needs changing; the change is clean.\n'),
+    });
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    expect(result.findings).toHaveLength(0);
+  });
+
+  it('credits a specialist finding at the location it delivered (R38)', async () => {
+    const h = wholeHarness({
+      childAnswer: (prompt) => (prompt.includes('"source": "edge"')
+        ? JSON.stringify([groundedFinding('edge', 'blocker', { title: 'broken guard' })])
+        : '[]'),
+      specialists: ['edge'],
+    });
+    const result = await h.run();
+    expect(result.findings).toHaveLength(1);
+    expect(result.findings[0]).toMatchObject({ source: 'edge', title: 'broken guard', location: 'src/main.ts:1' });
+  });
+
+  it('refuses to credit a lens for a same-title finding the lead relocated (R38)', async () => {
+    const h = wholeHarness({
+      childAnswer: (prompt) => (prompt.includes('"source": "edge"')
+        ? JSON.stringify([groundedFinding('edge', 'blocker', { title: 'broken guard' })])
+        : '[]'),
+      specialists: ['edge'],
+      submitRetries: 0,
+      findings: (findings) => findings.map((finding) => ({
+        ...finding,
+        location: 'src/other.ts:7',
+        evidence: 'const unrelated = true;',
+      })),
+    });
+    const rejection = await h.run().then(
+      () => { throw new Error('expected rejection'); },
+      (error: Error) => error.message,
+    );
+    expect(rejection).toContain('finding-source');
+    expect(rejection).toMatch(/broken guard/u);
+    expect(rejection).toMatch(/delivered/u);
+  });
+
   it('handles Git-quoted prior paths and refuses nonexistent or directory-masquerading selections (R11)', async () => {
     const repo = makeFixtureRepo('whole-reader-quoted');
     repos.push(repo);
