@@ -243,6 +243,8 @@ describe('re-brief restart safety (durable markers)', () => {
     const sha = (delivered?.payload as { sha?: string }).sha;
     expect(sha).toMatch(/^[0-9a-f]{40}$/u);
     expect(h.ledger.listPendingRebriefs()).toHaveLength(0);
+    const settlement = h.ledger.latestJobEvent(jobId, 'silas.rebrief-settled');
+    expect(settlement?.seq).toBeGreaterThan(delivered?.seq ?? 0);
 
     // The recovery itself is on the record.
     const recovered = h.ledger.latestJobEvent(jobId, 'silas.rebrief-recovered');
@@ -341,6 +343,36 @@ describe('re-brief restart safety (durable markers)', () => {
     expect(h.registry.workers).toHaveLength(1);
   });
 
+  it('a held boot-redispatched ordinary turn cannot finalize a replacement request', async () => {
+    const h = makeHarness();
+    const jobId = 'recovered-superseded';
+    const { markers: oldMarkers } = await seedPendingRebrief({ h, jobId, note: 'same note' });
+    let release!: () => void;
+    h.registry.gate = new Promise<void>((resolve) => { release = resolve; });
+    const deps = { registry: h.registry, ledger: h.ledger,
+      worktrees: h.worktrees, notifications: h.notifications };
+    try {
+      const first = await reconcilePendingRebriefs(deps, { bootAt: new Date(Date.now() + 60_000) });
+      expect(first.redispatched).toBe(1);
+      expect(h.registry.workers).toHaveLength(1);
+      const replacement = h.ledger.beginPendingRebrief({ jobId, note: 'same note', briefing: 'the original contract' });
+      expect(replacement.map((marker) => marker.id)).not.toEqual(oldMarkers.map((marker) => marker.id));
+      release();
+      await first.settled;
+      expect(h.ledger.listPendingRebriefs({ jobId }).map((marker) => marker.id)).toEqual(
+        replacement.map((marker) => marker.id));
+      expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief')).toBeNull();
+      expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).toBeNull();
+      expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-settled')).toBeNull();
+      h.registry.gate = null;
+      const second = await reconcilePendingRebriefs(deps, { bootAt: new Date(Date.now() + 120_000) });
+      await second.settled;
+      expect(second.redispatched).toBe(1);
+      expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(0);
+      expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-settled')).not.toBeNull();
+    } finally { release(); }
+  });
+
   it('a failed re-dispatch escalates action-required and keeps the markers for the next boot', async () => {
     const h = makeHarness();
     const jobId = 'failed-job';
@@ -394,7 +426,30 @@ describe('re-brief restart safety (durable markers)', () => {
     expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(2);
     expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief')).toBeNull();
     expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).toBeNull();
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-settled')).toBeNull();
     expect(h.ledger.listNotifications().some((row) => row.kind === `silas.rebrief-unreconciled.${jobId}`)).toBe(false);
+  });
+
+  it('boot retires already-proven markers and signals settlement only after retirement', async () => {
+    const h = makeHarness();
+    const jobId = 'already-proven-job';
+    await seedPendingRebrief({ h, jobId });
+    h.ledger.appendCustomEvent({ kind: 'silas.rebrief', jobId });
+    const delivered = h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { sha: 'settled-head' } });
+    const report = await reconcilePendingRebriefs({
+      registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications,
+    }, { bootAt: new Date(Date.now() + 60_000) });
+    await report.settled;
+    expect(report.completed).toBe(1);
+    expect(h.registry.workers).toHaveLength(0);
+    expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(0);
+    const settlement = h.ledger.latestJobEvent(jobId, 'silas.rebrief-settled');
+    expect(settlement?.seq).toBeGreaterThan(delivered.seq);
+    const again = await reconcilePendingRebriefs({
+      registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications,
+    }, { bootAt: new Date(Date.now() + 120_000) });
+    expect(again.examined).toBe(0);
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-settled')?.seq).toBe(settlement?.seq);
   });
 
   it('records only the lost delivery when silas.rebrief already landed', async () => {
@@ -420,6 +475,9 @@ describe('re-brief restart safety (durable markers)', () => {
     expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief')?.payload).toMatchObject({ minion_id: 'worker-1' });
     expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).not.toBeNull();
     expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-recovered')?.payload).toMatchObject({ path: 'delivery-only' });
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-settled')?.seq).toBeGreaterThan(
+      h.ledger.latestJobEvent(jobId, 'job.delivered')?.seq ?? 0,
+    );
     expect(h.ledger.listPendingRebriefs()).toHaveLength(0);
   });
 
@@ -470,6 +528,32 @@ describe('re-brief restart safety (durable markers)', () => {
     await report.settled;
     expect(h.registry.workers).toHaveLength(0);
     expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(2);
+  });
+
+  it('an older ordinary turn cannot consume newer markers with the same null phase and payload', async () => {
+    const h = makeHarness();
+    const jobId = 'ordinary-superseded';
+    const { markers: first } = await seedPendingRebrief({ h, jobId, note: 'same note' });
+    const second = h.ledger.beginPendingRebrief({ jobId, note: 'same note', briefing: 'the original contract' });
+    expect(second.map((marker) => marker.id)).not.toEqual(first.map((marker) => marker.id));
+    expect(second.every((marker) => marker.phaseId === null)).toBe(true);
+    const input = {
+      ledger: h.ledger, worktrees: h.worktrees, jobId,
+      minionId: 'older-minion', lanePath: h.lanePath, note: 'same note',
+    };
+    expect(finalizeRebriefRequest({ ...input, expectedPhaseId: null,
+      expectedMarkerIds: first.map((marker) => marker.id) })).toMatchObject({
+      superseded: true, rebriefRecorded: false, deliveryRecorded: false,
+    });
+    expect(h.ledger.listPendingRebriefs({ jobId }).map((marker) => marker.id)).toEqual(second.map((marker) => marker.id));
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief')).toBeNull();
+    expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).toBeNull();
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-settled')).toBeNull();
+    expect(finalizeRebriefRequest({ ...input, minionId: 'newer-minion', expectedPhaseId: null,
+      expectedMarkerIds: second.map((marker) => marker.id) })).toMatchObject({
+      superseded: false, rebriefRecorded: true, deliveryRecorded: true,
+    });
+    expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(0);
   });
 
   it('finalize is idempotent: a replayed finalize appends no duplicate events', async () => {

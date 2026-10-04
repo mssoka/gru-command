@@ -55,13 +55,32 @@ app-contract-baseline = "sh tools/app-contract-baseline.sh"
 # Evidence only: the full gate remains the final head's FULL run.
 full-fail-diagnosis = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/dispatch-e2e.test.ts test/dispatch-server.test.ts test/install-one-line.test.ts test/perkins-builtin-wave.test.ts test/wizard.test.ts && npx vitest run test/decisions.test.ts"
 
+uploads-boot = "npx vitest run --config vitest.heavy.config.ts test/uploads-dir.test.ts"
+# Narrow review-rebrief-interlock scope (phase pr144-independent-feedback-20261002):
+# the RPC patch prerequisite, then the fence's own suites — unchanged
+# configs/budgets, heavy branch-idle suite and fast digest/pin suites;
+# scheduled only via /api/verify by ops after the source settles.
+review-rebrief-interlock = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/branch-idle-guard.test.ts && npx vitest run test/silas-driver.test.ts test/suite-shape.test.ts"
+
+# R1 correction-cycle focused scope (phase pr144-r1-needs-changes-20261002):
+# the fallback-admission shared-guard repair, the dispatcher attribution
+# regression (deterministic settled-lane wait), the digest fence and the
+# recomputed pins — unchanged configs/budgets, the approved RPC patch first,
+# classified heavy suites through their own phase; scheduled only via /api/verify.
+review-rebrief-r1-repair = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/branch-idle-guard.test.ts test/dispatch-server.test.ts && npx vitest run test/worktree-port.test.ts test/silas-driver.test.ts test/suite-shape.test.ts && npx vitest run --config vitest.heavy.config.ts test/perkins-whole-review.test.ts -t \"report rejection\""
+
+# Integrated-head report-shape scope (phase pr144-r1-main-integration-20261003):
+# the perkins-whole-review report-validation cases split one-per-case after the
+# integrated FULL timed out the inherited four-case block at the unchanged 30s
+# bound; filtered run of exactly those cases, approved RPC patch first.
+whole-review-report-shape = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/perkins-whole-review.test.ts -t \"report rejection\""
 native-compaction-wait = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/supervisor.test.ts test/suite-shape.test.ts"
 # The ten externally observed 30s timeouts (failed host run on 78724dc)
 # exercised by exact test name through the heavy config first; the FULL
 # scope still runs every test exactly once. The policy guard
 # (test/test-budgets.test.ts) pins these names to the heavy classification,
 # each case's file to this command, and the approved j-463 RPC patch first.
-ten-timeout-cases = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts -t \"by=silas on the pr/review|second run fast-forwards|refuses a non-fast-forward|restarts only an owned|terminalizes a workflow schema|newest completed predecessor|does not record a reconciled delivery|non-PR origin/topic target FREEZES|rejects an empty/missing verdict|answers rejects secrets\" test/dispatch-server.test.ts test/install-one-line.test.ts test/perkins-builtin-wave.test.ts test/perkins-freeze-freshhead.test.ts test/perkins-whole-review.test.ts test/wizard.test.ts"
+ten-timeout-cases = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts -t \"by=silas on the pr/review|without by, the pr/review|second run fast-forwards|refuses a non-fast-forward|restarts only an owned|terminalizes a workflow schema|newest completed predecessor|does not record a reconciled delivery|non-PR origin/topic target FREEZES|report rejection|answers rejects secrets\" test/dispatch-server.test.ts test/install-one-line.test.ts test/perkins-builtin-wave.test.ts test/perkins-freeze-freshhead.test.ts test/perkins-whole-review.test.ts test/wizard.test.ts"
 
 # PR136 durable follow-through focused scope: every suite the delta can
 # move — the directive single-writer guard (ledger + HTTP), obligations
@@ -96,6 +115,44 @@ provider-recovery-r4-baseline = 'root="$PWD"; dA=$(mktemp -d "${TMPDIR:-/tmp}/gr
 # _bmad-output/gate-prep/native-compaction-wait-baseline.last-snapshot.txt
 # records the latest snapshot location, preserved for inspection.
 native-compaction-wait-baseline = 'set -e; base=2aa836abe262759c651683deb40d05f02c9ede86; headrev=ab11bb327c4ba1ab3e3e3a9cc9e6b3bcaf4a22b3; root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-native-compaction-wait.XXXXXX"); git archive "$base" | tar -x -C "$d"; git show "$headrev":test/supervisor.test.ts > "$d/test/supervisor.test.ts"; git show "$headrev":test/suite-shape.test.ts > "$d/test/suite-shape.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "%s base=%s head=%s\n" "$d" "$base" "$headrev" > "$prep/native-compaction-wait-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/supervisor.test.ts test/suite-shape.test.ts'
+
+# Baseline fail-before proof for the review-rebrief-interlock digest fence
+# (phase pr144-baseline-proof-readiness-20261002; blob pin corrected
+# 2026-10-03, phase pr144-followup14-feedback): the WHOLE 35-test
+# test/silas-driver.test.ts extracted from the pinned shipped revision
+# (headrev ec2a490; blob f722a377f8dd5b1c3c2a665493e09a13b2cb34df, byte-equal
+# to the current head's file; static check: every import resolves at the base,
+# so an expected RED is an assertion RED, not a setup/type failure; the
+# historical 28779fe pin pointed at a PRE-integration blob whose file differs
+# from the shipped one by +2/-1: the two providerRecoveryPending literals
+# added by the current-main integration, so it was not the identical final
+# suite) runs against an isolated pre-fix baseline snapshot (git archive of
+# the pinned base) using the unchanged baseline config/budgets and the
+# existing root node_modules bound by symlink — no worktree/branch mutation,
+# no dependency install, only the EXISTING installed Vitest CLI (npx
+# resolves the symlinked local install; never a download) behind the
+# original RPC-patch prerequisite. The vitest exit status is left intact so
+# the scheduler captures outcome.exitCode as evidence; it is never masked
+# into a PASS. Expected result is RED by ASSERTION (never a setup/collect/
+# import failure): the pre-fix digest offers marker-fenced targets, so the
+# fence cases fail while the unchanged cases pass — the final file imports
+# only pre-existing APIs, including LedgerApi.listPendingRebriefs, which
+# already exists at the base. No product branch-idle/silas-driver/helper
+# code is replaced at the baseline, and no baseline suite-shape is copied:
+# the base's own unchanged count pins differ intentionally and would only
+# produce mechanical RED, not proof. This scope never deletes snapshot
+# material; the ignored pointer file
+# _bmad-output/gate-prep/review-rebrief-interlock-baseline.last-snapshot.txt
+# records the latest snapshot location, preserved for inspection.
+# a6 FULL-red causal follow-through (phase pr144-a6-full-red-20261003):
+# the two files whose deadlined bodies crossed under worker load — the
+# chat-server post-commit retirement synchronization and the installer
+# fixture cost repair. Approved RPC patch first; fast chat and heavy
+# installer phases keep their classified budgets and run sequentially.
+pr144-full-red-followthrough = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/chat-server.test.ts && npx vitest run --config vitest.heavy.config.ts test/install-one-line.test.ts"
+
+rebrief-interlock-baseline = 'set -e; base=6a00f4e50e7ae970915a9a534c142c1f8a45b57d; headrev=ec2a490de91fd5e6ace2870e97a80e5a115007c0; root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-review-rebrief-interlock.XXXXXX"); git archive "$base" | tar -x -C "$d"; git show "$headrev":test/silas-driver.test.ts > "$d/test/silas-driver.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "%s base=%s head=%s\n" "$d" "$base" "$headrev" > "$prep/review-rebrief-interlock-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/silas-driver.test.ts'
+
 lens-unused-neutral = "node tools/patch-vitest-rpc-timeout.mjs && cd web && node ../node_modules/vitest/vitest.mjs run src/ui/board.test.ts src/lib/board-signals.test.ts src/lib/board-protocol.test.ts"
 lens-unused-neutral-baseline = 'set -e; base=6a00f4e50e7ae970915a9a534c142c1f8a45b57d; headrev=43e437a2e61b0c25351ed6147639aefbac4ccd77; root="$PWD"; prep=_bmad-output/ops-readiness-repair-20261002; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-lens-unused-neutral.XXXXXX"); git archive "$base" | tar -x -C "$d"; git show "$headrev":web/src/ui/board.test.ts > "$d/web/src/ui/board.test.ts"; git show "$headrev":web/src/lib/board-signals.test.ts > "$d/web/src/lib/board-signals.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; ln -s "$root/web/node_modules" "$d/web/node_modules"; printf "%s base=%s head=%s\n" "$d" "$base" "$headrev" > "$prep/lens-unused-neutral-baseline.last-snapshot.txt"; cd "$d" && node tools/patch-vitest-rpc-timeout.mjs && cd "$d/web" && node "$root/node_modules/vitest/vitest.mjs" run src/ui/board.test.ts src/lib/board-signals.test.ts'
 lens-unused-neutral-browser = "node tools/patch-vitest-rpc-timeout.mjs && cd web && node ../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json && node node_modules/vite/bin/vite.js build && node ../node_modules/@playwright/test/cli.js test --project=lens-pills"
@@ -189,9 +246,9 @@ perkins-stage1-static = "node tools/patch-vitest-rpc-timeout.mjs && npm run lint
 # retention, explicit abort, spawned-server still-running/re-attach), the
 # whole-PR engine deadline coverage, the fallback gate still-running slice,
 # the pi/claude adapter parity replay and the adjacent engine suites —
-# separate installed heavy/fast Vitest CLI invocations, no worker/timeout
+# Separate installed fast/heavy Vitest CLI invocations, no worker/timeout
 # flags and never the npm chain; exits never masked.
-perkins-stage1-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/perkins-whole-review.test.ts test/perkins-builtin-wave.test.ts && npx vitest run test/review-mcp-transport.test.ts test/native-tools-parity.test.ts test/perkins-lead-schema-compat.test.ts test/perkins-crash-child.test.ts test/tool-heartbeat.test.ts"
+perkins-stage1-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/review-mcp-transport.test.ts test/native-tools-parity.test.ts test/perkins-lead-schema-compat.test.ts test/perkins-crash-child.test.ts test/tool-heartbeat.test.ts && npx vitest run --config vitest.heavy.config.ts test/perkins-whole-review.test.ts test/perkins-builtin-wave.test.ts"
 
 # Stage 1 adapter/transport integration: the real Claude adapter suites
 # (session-scoped MCP bridge + CLI double), the supervisor whose stall

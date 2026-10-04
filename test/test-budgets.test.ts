@@ -23,11 +23,16 @@ import {
  * rename surfaces here instead of silently dropping out of the policy.
  */
 
-/** The ten Test-timed-out cases from the failed host run on 78724dc. */
+/** The ten timed-out cases from 78724dc, including every explicit
+ * descendant of the two formerly grouped cases split on this branch. */
 const OBSERVED_TIMEOUTS: readonly { readonly file: string; readonly name: string }[] = [
   {
     file: 'dispatch-server.test.ts',
-    name: 'by=silas on the pr/review endpoints records silas attribution events; without by it does not',
+    name: 'by=silas on the pr/review endpoints records silas attribution events',
+  },
+  {
+    file: 'dispatch-server.test.ts',
+    name: 'without by, the pr/review endpoints record no silas attribution events',
   },
   {
     file: 'install-one-line.test.ts',
@@ -59,7 +64,19 @@ const OBSERVED_TIMEOUTS: readonly { readonly file: string; readonly name: string
   },
   {
     file: 'perkins-whole-review.test.ts',
-    name: 'rejects an empty/missing verdict, an empty report, and a report omitting the verdict line or frozen identity',
+    name: 'report rejection: a missing verdict is refused',
+  },
+  {
+    file: 'perkins-whole-review.test.ts',
+    name: 'report rejection: an empty report is refused',
+  },
+  {
+    file: 'perkins-whole-review.test.ts',
+    name: 'report rejection: a report omitting the verdict line is refused',
+  },
+  {
+    file: 'perkins-whole-review.test.ts',
+    name: 'report rejection: a report omitting the frozen identity is refused',
   },
   {
     file: 'wizard.test.ts',
@@ -164,9 +181,9 @@ describe('workload-aware test budgets', () => {
     expect(scopes['perkins-stage1-baseline']).toBeDefined();
     const heavyPaths = heavyTestPaths();
     for (const [scope, command] of Object.entries(scopes)) {
-      // This single expected-RED witness archives an immutable pre-policy
-      // baseline without vitest.heavy.config.ts. Do not rewrite its runner
-      // or interpret its archived test paths as live verification scopes.
+      // This diagnostic intentionally runs inside a pinned pre-policy git
+      // archive without a heavy config. It is an expected-RED baseline,
+      // not a current-tree verification segment; live scopes stay guarded.
       if (scope === 'perkins-stage1-baseline') {
         expect(command).toContain('git archive "$base"');
         expect(command).toContain('base=9bb51b05af5d8f0a0cd389788d1d3f19607d5361');
