@@ -414,6 +414,11 @@ describe('board server — WS push', () => {
       // The server pings every 40 ms; the JSON ping frame is how the
       // browser client refreshes its stale clock.
       await client.waitFor((f) => f.type === 'ping', 'app ping');
+      // Issue #171: the same cadence refreshes the snapshot — supervision
+      // activity and ownership classification can change without a ledger
+      // event, so a connected board must not stay stale.
+      client.frames.length = 0;
+      await client.waitFor((f) => f.type === 'board', 'heartbeat snapshot refresh');
       await client.close();
     } finally {
       await env.close();

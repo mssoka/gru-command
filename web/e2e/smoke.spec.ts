@@ -794,12 +794,67 @@ test.describe('board (E6, mock feed)', () => {
       .toMatch(/^CREW \(\d+\)$/);
     await expect(page.locator('.agents-rail__tabs')).toHaveAttribute('aria-label', 'Crew and transcripts');
     await expect(rail.locator('.board-agent--disposed')).toHaveCount(0);
-    const toggle = rail.locator('.board-agent-toggle');
+    const toggle = rail.locator(".board-agent-toggle[data-section='disposed']");
     await expect(toggle).toContainText('1 disposed');
     await toggle.click();
     await expect(rail.locator('.board-agent--disposed')).toHaveCount(1);
     // Streaming silas carries the client-side turn-age counter.
     await expect(rail.locator('.board-agent__age').first()).toContainText('quiet');
+  });
+
+  test('crew rail truth (#171): historical sessions collapse behind history; raw-idle open work reads streaming', async ({ page }) => {
+    await pair(page);
+    await expect(page.locator('#board-view')).toBeVisible();
+    const rail = page.locator('#board-agents');
+
+    // One live Silas (mock-silas) — the September Silas epoch and the
+    // September minion are VERIFIED-HISTORICAL: not counted as crew, not
+    // sorted into it, disclosed behind their own history toggle.
+    await expect
+      .poll(async () => (await page.locator('#rail-tab-agents').textContent())?.trim() ?? '')
+      .toBe('CREW (8)');
+    await expect(rail.locator('.board-agent--historical')).toHaveCount(0);
+    const historyToggle = rail.locator(".board-agent-toggle[data-section='history']");
+    await expect(historyToggle).toContainText('2 history');
+    await historyToggle.click();
+    const historical = rail.locator('.board-agent--historical');
+    await expect(historical).toHaveCount(2);
+    await expect(historical.filter({ hasText: 'Sept 29' }).first()).toBeVisible();
+    // The history rows disclose their classification explicitly.
+    await expect(historical.first().locator('.board-agent__runtime--historical')).toContainText('history');
+
+    // The misleading-idle defect: mock-gru's raw adapter state is `idle`
+    // while supervision sees an open turn + fresh events — the rail must
+    // present the work it is doing (streaming + a fresh quiet clock),
+    // never a settled idle chip.
+    const gru = rail.locator('.board-agent', { hasText: 'gru · chat' });
+    await expect(gru.locator('.board-agent__state')).toHaveText('streaming');
+    await expect(gru.locator('.board-agent__age')).toContainText(/quiet/);
+
+    // Owner-held stop: the released handle left the record disposed, but
+    // the live crew keeps the lane with its stopped mark (never the
+    // graveyard behind the disposed toggle).
+    const held = rail.locator('.board-agent', { hasText: 'held-after-breaker' });
+    await expect(held.locator('.board-agent__supervision--alert')).toHaveText('⛔ stopped');
+    await expect(rail.locator(".board-agent-toggle[data-section='disposed']")).toContainText('1 disposed');
+
+    // Acceptance evidence: the same truth under the dark theme.
+    await page.locator('#theme-toggle').click();
+    await expect(page.locator('html')).toHaveClass(/dark/);
+    await expect(gru.locator('.board-agent__state')).toHaveText('streaming');
+    await expect(historyToggle).toContainText('2 history');
+    await expect(historical).toHaveCount(2);
+    await page.locator('#theme-toggle').click();
+
+    // Acceptance evidence: the same truth in a narrow phone viewport.
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expect(gru.locator('.board-agent__state')).toHaveText('streaming');
+    await expect(historical).toHaveCount(2);
+    await expect(historical.first().locator('.board-agent__runtime--historical')).toContainText('history');
+    const fits = await page.evaluate(
+      () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
+    );
+    expect(fits).toBe(true);
   });
 
   test('trackers render in dark theme and on a narrow phone viewport', async ({ page }) => {
