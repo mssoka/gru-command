@@ -152,6 +152,12 @@ function scriptedReply(socket: WebSocket, userText: string, attachments?: readon
       if (holdNextTurn) {
         holdNextTurn = false;
         releaseHeldTurn = finish;
+        // Park genuinely: stop the stream interval, or its next tick sees
+        // holdNextTurn cleared and finishes the turn ~45ms later — the
+        // busy state then ends before the browser spec can observe the
+        // 4s rotation the hold exists to protect. Release and socket
+        // close still settle through the idempotent finish().
+        clearInterval(timer);
         return;
       }
       finish();
