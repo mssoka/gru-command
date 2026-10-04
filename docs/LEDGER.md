@@ -99,7 +99,7 @@ publishes it on the in-process event bus (`src/events/bus.ts`).
 | `agent.spawned` / `agent.state` / `agent.error` | role, label / from→to (+error) / error, fatal |
 | `verification.started` / `verification.completed` | run id, scope, command, sha, workers, queued ms / ok, exit code, duration, bounded output hash+tail |
 | `verification.lock-timeout` / `verification.stale-released` | wait ms + holder counts / pid, reason (`holder-dead` \| `no-runner` \| `max-age`), age |
-| `branch-idle.refused` / `branch-idle.forced` | phase (`arm`/`freeze`), targetBranch, blockers — the review-arm branch-idle guard (forced rounds also carry the tag in their frozen manifest) |
+| `branch-idle.refused` / `branch-idle.forced` | phase (`arm`/`freeze`), targetBranch, blockers — the review-arm branch-idle guard (forced rounds also carry the tag in their frozen manifest). The fallback route's two RECORD-EMITTING arm checks are the intake guard and the post-pre-flight re-entry, so a forced fallback admission records TWO `arm`-phase override records where the native route records `arm` + `freeze`. The running gate's boundary re-proofs (round intake, default-reviewer worker admission) emit NO branch-idle rows — a stop there is a `job.fallback-review` phase `aborted` |
 | `silas.review-deferred` | target_branch, phase, blockers — Silas defers a refused arm to its next sweep |
 
 Events are appended for **state changes**; idempotent enrichment writes
@@ -174,8 +174,11 @@ markers (both guarded events already landed) are the exception: they
 clear as the completed request they are, with no retirement audit. A
 malformed pair (missing kind or mismatched phase id, payload hash, or
 watermark) stays visible and escalates for repair instead of being
-completed or retired, even when terminal. The boot summary's units are mixed by design: `examined` counts markers
-while `completed`/`redispatched`/`retired` count jobs, so one retired
+completed or retired, even when terminal. A completed pair publishes
+`silas.rebrief-settled` after its markers clear; retirement and escalation
+do not publish settlement. The boot summary's units are mixed by design:
+`examined` counts markers while `completed`/`redispatched`/`retired` count
+jobs, so one retired
 marker pair reads `examined: 2 … retired: 1` — not a partial failure. A
 group counts once per scan in which at least one of its markers retires;
 a group partially retired by one scan and completed by a later scan is

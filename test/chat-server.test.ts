@@ -2614,12 +2614,12 @@ describe('chat context controls and durable new-chat boundaries', () => {
         ),
       ).toMatchObject({ ok: true, epoch: 2 });
       expect(new GruSessionPointer(h.chatDir).current()).toMatchObject({ epoch: 2 });
-      // Post-commit supervision settles AFTER the control result is released
-      // (finalizeCommittedNewChat: "never pin the reset barrier behind ...
-      // retired-handle cleanup"), so the retired fresh handle's disposal is
-      // asynchronous — poll for it exactly as this test does for the first
-      // retired handle above.
-      await pollUntil(() => firstFresh.disposed, 'first fresh handle disposal');
+      // Post-commit retirement is deliberately released after this control's
+      // result (the reset barrier never waits on best-effort cleanup), so
+      // observe the retirement through the same bounded poll the first reset
+      // uses; the oracle still requires disposed to become true.
+      await pollUntil(() => firstFresh.disposed, 'fresh handle disposal after second reset');
+      expect(firstFresh.disposed).toBe(true);
       await reconnect.close();
       await client.close();
     } finally {
@@ -2775,6 +2775,11 @@ describe('chat context controls and durable new-chat boundaries', () => {
         (frame) => frame.type === 'control_result' && frame.request_id === 'adopt-fresh',
         'fresh adoption result',
       );
+      // Post-commit adoption is intentionally started on the next event-loop
+      // turn AFTER the control result is released (chat/server.ts postCommit
+      // timer), so waiting for the result alone still races the server's
+      // timer under load. Wait for the adoption itself before asserting.
+      await pollUntil(() => adopted !== null, 'fresh handle adoption');
       expect(adopted).toBe(h.freshHandles[0]);
       expect(new GruSessionPointer(h.chatDir).current()?.sessionFile).toBe(
         h.freshHandles[0]?.sessionFile,

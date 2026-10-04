@@ -175,6 +175,12 @@ function pendingRebriefGuardedEvent(
   return ledger.latestJobPhaseEvent(marker.jobId, marker.kind, phaseId, marker.baselineSeq);
 }
 
+function publishRebriefSettlement(ledger: LedgerApi, jobId: string): void {
+  // Only after identity-checked completion clears the markers: a queued
+  // review handoff can now retry, never on a superseded or retired turn.
+  ledger.appendCustomEvent({ kind: 'silas.rebrief-settled', jobId });
+}
+
 /**
  * Record a settled re-brief turn's events and clear its markers. Idempotent
  * per marker: an event that already landed since the request watermark is
@@ -336,6 +342,7 @@ export function finalizeRebriefRequest(input: {
   if (!input.ledger.clearPendingRebriefsIfCurrent(markers)) {
     return { minionId: input.minionId, deliveredSha, deliveryNote, rebriefRecorded, deliveryRecorded, retired: false, retirement: null, superseded: true };
   }
+  publishRebriefSettlement(input.ledger, input.jobId);
   return { minionId: input.minionId, deliveredSha, deliveryNote, rebriefRecorded, deliveryRecorded, retired: false, retirement: null, superseded: false };
 }
 
@@ -429,8 +436,10 @@ export async function reconcilePendingRebriefs(
     }
     const missing = group.filter((marker) => !pendingRebriefEventLanded(deps.ledger, marker));
     if (missing.length === 0) {
-      if (deps.ledger.clearPendingRebriefsIfCurrent(group)) completed += 1;
-      else deps.log?.('warn', 're-brief spent markers superseded before clearing', { job: jobId });
+      if (deps.ledger.clearPendingRebriefsIfCurrent(group)) {
+        publishRebriefSettlement(deps.ledger, jobId);
+        completed += 1;
+      } else deps.log?.('warn', 're-brief spent markers superseded before clearing', { job: jobId });
       continue;
     }
     // A terminal job can never honor the request. Retire it
@@ -502,6 +511,7 @@ export async function reconcilePendingRebriefs(
         deps.log?.('warn', 're-brief delivery recorded but request was superseded before clearing', { job: jobId });
         continue;
       }
+      publishRebriefSettlement(deps.ledger, jobId);
       deps.ledger.appendCustomEvent({
         kind: 'silas.rebrief-recovered',
         jobId,

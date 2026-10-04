@@ -122,7 +122,7 @@ async function boot(opts: {
         if (gate !== undefined) await gate;
         // idempotent per prompt: a fresh file per turn, so a second minion
         // turn on the same lane (silas re-brief) always has a commit to make.
-        const file = join(options.cwd, `http-deliverable-${spawns.length}.txt`);
+        const file = join(options.cwd, `http-deliverable-${id}.txt`);
         writeFileSync(file, 'review me\n');
         execFileSync('git', ['-C', options.cwd, 'add', file]);
         execFileSync('git', ['-C', options.cwd, '-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '-m', 'test: http deliverable'], { stdio: 'ignore' });
@@ -650,7 +650,7 @@ describe('dispatch server (E8)', () => {
     }
   });
 
-  it('by=silas on the pr/review endpoints records silas attribution events; without by it does not', async () => {
+  it('by=silas on the pr/review endpoints records silas attribution events', async () => {
     const h = await boot();
     const repo = makeFixtureRepo('fixture-silas-by');
     cleanupRepos.push(repo);
@@ -659,6 +659,7 @@ describe('dispatch server (E8)', () => {
       await call(h.port, 'POST', '/api/dispatch', {
         job_id: 'by-silas-job', repo_path: repo.path, title: 'attribution', briefing: 'b',
       }, TOKEN);
+      await vi.waitFor(() => expect(h.ledger.latestJobEvent('by-silas-job', 'job.delivered')).not.toBeNull(), { timeout: 10_000 });
       const pr = await call(h.port, 'POST', '/api/dispatch/pr', {
         job_id: 'by-silas-job', url: PR_URL, by: 'silas',
       }, TOKEN);
@@ -672,12 +673,23 @@ describe('dispatch server (E8)', () => {
       expect(kinds).toContain('silas.review-triggered');
       const reviewEvent = h.ledger.listJobEvents('by-silas-job').find((event) => event.kind === 'silas.review-triggered');
       expect((reviewEvent?.payload as { route?: string }).route).toBe('perkins');
-      // and an unattributed job stays clean of silas events
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('without by, the pr/review endpoints record no silas attribution events', async () => {
+    const h = await boot();
+    const repo = makeFixtureRepo('fixture-silas-none');
+    cleanupRepos.push(repo);
+    attachBareOrigin(repo);
+    try {
       await call(h.port, 'POST', '/api/dispatch', {
         job_id: 'by-none-job', repo_path: repo.path, title: 'plain', briefing: 'b',
       }, TOKEN);
-      await call(h.port, 'POST', '/api/dispatch/pr', { job_id: 'by-none-job', url: PR_URL }, TOKEN);
-      await call(h.port, 'POST', '/api/dispatch/review', { job_id: 'by-none-job' }, TOKEN);
+      await vi.waitFor(() => expect(h.ledger.latestJobEvent('by-none-job', 'job.delivered')).not.toBeNull(), { timeout: 10_000 });
+      expect((await call(h.port, 'POST', '/api/dispatch/pr', { job_id: 'by-none-job', url: PR_URL }, TOKEN)).status).toBe(200);
+      expect((await call(h.port, 'POST', '/api/dispatch/review', { job_id: 'by-none-job' }, TOKEN)).status).toBe(202);
       const plainKinds = h.ledger.listJobEvents('by-none-job').map((event) => event.kind);
       expect(plainKinds).not.toContain('silas.pr-registered');
       expect(plainKinds).not.toContain('silas.review-triggered');
@@ -1531,6 +1543,57 @@ describe('dispatch server (E8)', () => {
     } finally {
       await h.close();
     }
+  });
+
+  it('overlapping ordinary re-brief HTTP turns settle only the newest marker generation', async () => {
+    let releaseOld!: () => void;
+    let releaseNew!: () => void;
+    let enteredOld!: () => void;
+    let enteredNew!: () => void;
+    const oldGate = new Promise<void>((resolve) => { releaseOld = resolve; });
+    const newGate = new Promise<void>((resolve) => { releaseNew = resolve; });
+    const oldStarted = new Promise<void>((resolve) => { enteredOld = resolve; });
+    const newStarted = new Promise<void>((resolve) => { enteredNew = resolve; });
+    let turns = 0;
+    const h = await boot({ minionPromptGate: (text) => {
+      if (!text.startsWith('Re-brief —')) return undefined;
+      turns += 1;
+      if (turns === 1) { enteredOld(); return oldGate; }
+      enteredNew();
+      return newGate;
+    } });
+    const repo = makeFixtureRepo('fixture-ordinary-rebrief-overlap');
+    cleanupRepos.push(repo);
+    const jobId = 'ordinary-overlap';
+    try {
+      await call(h.port, 'POST', '/api/dispatch', { job_id: jobId, repo_path: repo.path,
+        title: 'overlapping turns', briefing: 'the original contract' }, TOKEN);
+      const initialDeadline = Date.now() + 10_000;
+      while (h.ledger.latestJobEvent(jobId, 'job.delivered') === null && Date.now() < initialDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).not.toBeNull();
+      const oldTurn = call(h.port, 'POST', '/api/silas/rebrief', { job_id: jobId, note: 'same note' }, TOKEN);
+      await oldStarted;
+      const oldIds = h.ledger.listPendingRebriefs({ jobId }).map((marker) => marker.id);
+      expect(oldIds).toHaveLength(2);
+      const newTurn = call(h.port, 'POST', '/api/silas/rebrief', { job_id: jobId, note: 'same note' }, TOKEN);
+      await newStarted;
+      const newIds = h.ledger.listPendingRebriefs({ jobId }).map((marker) => marker.id);
+      expect(newIds).toHaveLength(2);
+      expect(newIds).not.toEqual(oldIds);
+      releaseOld();
+      const stale = await oldTurn;
+      expect(stale.status).toBe(200);
+      expect(field<string | null>(stale.json, 'delivered_sha')).toBeNull();
+      expect(h.ledger.listPendingRebriefs({ jobId }).map((marker) => marker.id)).toEqual(newIds);
+      expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief')).toBeNull();
+      expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-settled')).toBeNull();
+      releaseNew();
+      expect((await newTurn).status).toBe(200);
+      expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(0);
+      expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-settled')).not.toBeNull();
+    } finally { releaseOld(); releaseNew(); await h.close(); }
   });
 
   it('/api/silas/directive on a lane with no reachable minion records a durable no-effect FAILURE; terminal jobs refuse', async () => {
