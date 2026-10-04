@@ -426,6 +426,16 @@ Verdicts are the parent's; reviewer-assigned severities were disregarded.
   (sha256 ea7b0abf1199a536b6b0703b4905f66f8ce57b20afe1536cba367b1dfbc76395).
 - The final-head full gate after this spec update is recorded in the
   completion report and ledger (not rewritten into the head it proves).
+- 2026-10-04: second history-preserving main integration (PR193,
+  `origin/main` `e792768`) merged after the review patches as `e9c5b54`;
+  conflicts resolved in `src/dispatch/perkins-review/whole.ts` (kept main's
+  `sourceMovementSinceFreeze`/`SourceMovement` import alongside the
+  evidence-delivery imports) and `test/suite-shape.test.ts`
+  (`perkins-builtin-wave` 101 = main's 99 + this lane's 2). Focused suites
+  (126 tests, 12 files) and the heavy seam suites (229 tests, 3 files)
+  re-ran green at the merged head before the final full gate.
+- The final-head full gate after this spec update is recorded in the
+  completion report and ledger (not rewritten into the head it proves).
 
 ## Verification
 
