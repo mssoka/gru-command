@@ -9,7 +9,7 @@ import { withRateLimitRetries, type RateLimitRetryOptions } from '../../runtime/
 import { assertFrozenPromptBounds, sourceMovementSinceFreeze, writeReviewArtifact, type FrozenReview, type SourceMovement } from './artifacts.js';
 import { readFrozenEvidenceBytes, renderEvidencePromptSection } from '../../review-inputs/evidence.js';
 import { finalAssistantText } from './session-output.js';
-import { PERKINS_FINDING_SOURCES, type PerkinsFindingSource, type PerkinsLens, type PerkinsPolicy } from './policy.js';
+import { PERKINS_FINDING_SOURCES, PERKINS_LENSES, type PerkinsFindingSource, type PerkinsLens, type PerkinsPolicy } from './policy.js';
 import {
   dedupeVerifiedFindings,
   parseFindingsSubmission,
@@ -242,11 +242,13 @@ interface SubmissionValidationContext {
   /** Lenses with a committed VALID specialist result; a lead finding may
    * never be attributed to a lens that did not actually run. */
   readonly validLenses: ReadonlySet<PerkinsLens>;
-  /** Per lens, the exact titles of the findings its valid runs actually
-   * DELIVERED to the lead (R12): crediting a lens requires the specialist
-   * to have reported that finding — a valid-but-empty (or undelivered)
-   * result cannot originate a lead-invented finding. */
-  readonly deliveredLensFindingTitles: ReadonlyMap<PerkinsLens, ReadonlySet<string>>;
+  /** Per lens, title -> delivered locations of the findings its valid runs
+   * actually DELIVERED to the lead (R12/R38): crediting a lens requires the
+   * specialist to have reported that finding AT that location — a
+   * valid-but-empty (or undelivered) result cannot originate a
+   * lead-invented finding, and a same-title finding the lead relocated is
+   * the lead's own judgment, not the specialist's. */
+  readonly deliveredLensFindings: ReadonlyMap<PerkinsLens, ReadonlyMap<string, ReadonlySet<string>>>;
 }
 
 interface SubmissionValidationSuccess {
@@ -430,6 +432,121 @@ function evidenceAtCitedLocation(review: FrozenReview, finding: ReviewFinding, e
   const path = findingPath(finding);
   if (path === null) return false;
   return frozenBlobContains(review, path, evidence) || frozenPathDiff(review, path).includes(evidence);
+}
+
+/** Whitespace-normalized location key used for specialist provenance (R38).
+ * Case is preserved: a file path is case-sensitive evidence. */
+function provenanceLocation(location: string): string {
+  // Internal spaces can distinguish two real Git paths. Normalize only the
+  // presentation padding around a location, not the path it identifies.
+  return location.trim();
+}
+
+/** Sentence frames that assert the WHOLE change has no issues left (R37).
+ * Novelty-scoped phrases ("no new issues") are deliberately absent: they do
+ * not claim residual issue-freeness. Scope handling below keeps per-lens,
+ * per-area and prior-only statements legitimate. */
+const TERMINAL_CLEAN_CLAIM_PATTERNS: readonly RegExp[] = [
+  /\bno (?:remaining |outstanding |unresolved )*(?:issues?|problems?|findings?|defects?|bugs?|concerns?|regressions?|blockers?|failures?)\b(?:[^.;!?]{0,80}?\b(?:remain|remains|remained|left|found|detected|identified|exists?|existed|present|outstanding|stands?|observed|reported|known|noted|applicable|arise|arose)\b|\s+to (?:fix|address|resolve|change|report)\b|\s*$)/iu,
+  /\bthere (?:are|were|is|was) no (?:remaining |outstanding |unresolved )*(?:issues?|problems?|findings?|defects?|bugs?|concerns?|regressions?|blockers?|failures?)\b/iu,
+  /\bno (?:remaining |outstanding |unresolved )*(?:issues?|problems?|findings?|defects?|bugs?|concerns?|blockers?) (?:in|for|on|with) (?:(?:this|the) )?(?:change|pr|pull request|diff|patch|branch|review|submission|work|implementation|code)\b/iu,
+  /\bnothing (?:further |else |more )?(?:remains?|remained|(?:is|was) left|left|(?:is|was) found|found|to (?:fix|address|resolve|change|do|report|raise)|(?:requires?|needs?) (?:fixing|changes?|attention)|(?:is|are|was|were) (?:needed|required|necessary))/iu,
+  /\bno (?:changes?|modifications?|edits?) (?:are |is |were |was )?(?:needed|required|necessary)\b/iu,
+  /\b(?:the |this |that )?(?:change|pr|pull request|diff|patch|branch|review|submission|work|implementation|code) (?:requires?|needs?) no (?:further |additional |more )?(?:changes?|fixes|work|attention)\b/iu,
+  /\b(?:the |this |that |our )?(?:change|pr|pull request|diff|patch|branch|review|submission|work|implementation|codebase|code) (?:is|was|looks|looked|appears|appeared|reads|read|remains|remained) (?:clean|issue[- ]free|problem[- ]free|defect[- ]free|bug[- ]free|free of (?:issues?|problems?|findings?|defects?|bugs?|concerns?)|ready as is)\b/iu,
+  /\b(?:has|have|had) no (?:remaining |outstanding |unresolved )*(?:issues?|problems?|findings?|defects?|bugs?|concerns?|regressions?|blockers?)\b/iu,
+  /\b(?:find|found|identified|detected|observed|reported|reports) no (?:remaining |outstanding |unresolved )*(?:issues?|problems?|findings?|defects?|bugs?|concerns?|regressions?|blockers?)\b/iu,
+  /\b(?:everything|all) (?:is|was|looks|looked|appears|appeared) (?:good|fine|clean|clear|issue[- ]free|problem[- ]free)\b/iu,
+  /\b(?:lgtm|looks good to me)\b/iu,
+];
+
+/** A direct whole-change assertion cannot be scoped by a file or lens merely
+ * mentioned elsewhere in the same clause. Exceptions and blocker-qualified
+ * claims are handled separately below. */
+const GLOBAL_CHANGE_CLAIM = /\b(?:no (?:remaining |outstanding |unresolved )*(?:issues?|problems?|findings?|defects?|bugs?|concerns?|blockers?)(?:\s+\w+){0,3}?\s+(?:in|for|on|with)\s+(?:(?:this|the|whole|overall)\s+)?(?:change|pr|pull request|diff|patch|branch|review|submission|work|implementation|code)\b|(?:the|this|that|our)\s+(?:change|pr|pull request|diff|patch|branch|review|submission|work|implementation|codebase|code)\s+(?:is|was|looks|looked|appears|appeared|reads|read|remains|remained|requires?|needs?)\s+(?:clean|issue[- ]free|problem[- ]free|defect[- ]free|bug[- ]free|no\b))/iu;
+
+const LENS_SCOPE = new RegExp(`\\b(?:${PERKINS_LENSES.join('|')})\\s+(?:lens|lenses|review|reviewer|specialist|run|process|report)\\s+(?:found|reported|saw|identified|has|had|detected)\\s+no\\b|\\bno\\s+(?:issues?|findings?|problems?)\\b[^.;!?]{0,80}\\b(?:in|for|from)\\s+(?:the\\s+)?(?:${PERKINS_LENSES.join('|')})\\s+(?:lens|lenses|review|reviewer|specialist|run|process|report)\\b`, 'iu');
+
+/** The bounded scope cues that make a clean claim legitimate beside retained
+ * findings: a named lens/process, a file/area, or a possessive "own" claim.
+ * An unscoped claim concludes the whole change and remains a contradiction. */
+function scopedCleanClaim(
+  segment: string, retainedLocations: readonly string[], retainedBlocker: boolean, retainedPrior: boolean,
+): boolean {
+  // Explicit exceptions leave retained findings in view, even if a whole
+  // change is mentioned. A bare all-files claim is not a limited scope.
+  if (/\b(?:except|aside from|apart from|other than|besides)\b/iu.test(segment)) return true;
+  if (/\b(?:that|which) (?:block|blocks|prevent|prevents|hinder|hinders|require|requires)\b/iu.test(segment)) return !retainedBlocker;
+  if (GLOBAL_CHANGE_CLAIM.test(segment) || /\b(?:any|all|every|each)\s+(?:files?|areas?|parts?|sections?)\b/iu.test(segment)) return false;
+  // The prior round's own outcome is not the present change's conclusion.
+  if (!retainedPrior && /\b(?:prior|previous|earlier|last|preceding)\s+(?:review|round|report|submission|pass|revision)\b/iu.test(segment)) return true;
+  // A named path scopes a claim only if no retained finding cites that file.
+  // Accept both extensionless and space-containing Git paths, not "any files".
+  const paths = [...segment.matchAll(/\b(?:in|within|for|on|file:)\s+((?:[.\w@-]+\/)+[.\w@-]+(?:\s+(?!with\b|and\b|but\b|though\b|including\b|except\b|that\b|which\b|is\b)[.\w@-]+)*|[.\w@-]*\.[\w-]+)/giu)].map((match) => match[1]!);
+  if (paths.length > 0) return paths.every((path) => !retainedLocations.includes(path));
+  if (LENS_SCOPE.test(segment)) return true;
+  if (/\b(?:in|within|for|regarding|concerning|about|on)\s+(?:this|that|the|another|its|their|our|my)?\s*(?:\w+\s+){0,3}?(?:files?|functions?|methods?|modules?|sections?|areas?|paths?|helpers?|components?|classes?|hunks?|categories?|scopes?|parts?|regions?|tests?)\b/iu.test(segment)) return true;
+  return false;
+}
+
+/** The first unscoped terminal clean-slate claim in the report's visible
+ * prose (R37), or null. Markdown noise never turns a claim on or off. */
+function findTerminalCleanClaim(
+  report: string, retainedLocations: readonly string[], retainedBlocker: boolean, retainedPrior: boolean,
+): string | null {
+  // Rendered line wraps are prose, whereas headings, quotes and fenced code
+  // have distinct Markdown roles. Check heading TEXT as well as paragraphs.
+  const paragraphs: Array<{ text: string; priorOnly: boolean }> = [];
+  let pending: string[] = [];
+  let priorOnly = false;
+  let fence: { marker: string; length: number } | null = null;
+  const flush = (): void => {
+    if (pending.length > 0) paragraphs.push({ text: pending.join(' '), priorOnly });
+    pending = [];
+  };
+  for (const line of report.replace(/<!--[\s\S]*?-->/gu, '').split('\n')) {
+    const marker = /^\s*(`{3,}|~{3,})(.*)$/u.exec(line);
+    if (fence !== null) {
+      if (marker !== null && marker[1]![0] === fence.marker && marker[1]!.length >= fence.length && marker[2]!.trim() === '') fence = null;
+      continue;
+    }
+    if (marker !== null) { flush(); fence = { marker: marker[1]![0]!, length: marker[1]!.length }; continue; }
+    if (line.trim() === '' || /^\s*>|^ {4,}\S/u.test(line)) { flush(); continue; }
+    const heading = /^\s*#{1,6}\s+(.+)$/u.exec(line);
+    if (heading !== null) {
+      flush();
+      priorOnly = /\b(?:prior|previous|earlier|last)\b/iu.test(heading[1]!);
+      paragraphs.push({ text: heading[1]!, priorOnly });
+      continue;
+    }
+    pending.push(line);
+  }
+  flush();
+  for (const paragraph of paragraphs) {
+    // A resolved prior-only section may describe its own history, not
+    // silently certify the current PR. Global subjects are always checked.
+    if (paragraph.priorOnly && !retainedPrior &&
+      !/\b(?:the|this|whole|overall)\s+(?:change|pr|pull request|diff|branch|work|implementation)\b|\b(?:in|for|on|with)\s+(?:(?:this|the|whole)\s+)?(?:pr|pull request|change|diff|branch)\b/iu.test(paragraph.text)) continue;
+    // Attributed past judgments and explicitly disallowed quotations are
+    // evidence, not this report's own conclusion. Bare quotes still count.
+    const prose = paragraph.text.replace(/\b(?:(?:the )?(?:prior|previous|earlier) (?:reviewer|report) (?:incorrectly |wrongly )?(?:wrote|said|claimed|asserted)\s+(?:["'“‘][^"'“”‘’]{0,200}["'”’]|[^,;.!?]{0,200})|(?:do not say|don't say)\s*["'“‘][^"'“”‘’]{0,200}["'”’])/giu, '');
+    for (const raw of prose.split(/[;!?]+|\.(?=\s|$)/u)) {
+      // A cue about one lens/file cannot scope another independent claim.
+      for (const clause of raw.split(/,\s*(?=(?:and|but|though|although|however|the|this|no|nothing|everything|security|blind|edge)\b)|\s+(?:but|though|although|however)\s+|\s+and\s+(?=(?:the|this|no|nothing|everything)\b)/iu)) {
+        const segment = clause.replace(/[*_`~#]+/gu, '').replace(/\s+/gu, ' ').trim();
+        if (segment === '') continue;
+        if (/\b(?:it is|that's|this is) (?:not true|false|wrong|incorrect) (?:that|to say)\b/iu.test(segment)) continue;
+        if (!TERMINAL_CLEAN_CLAIM_PATTERNS.some((pattern) => pattern.test(segment))) continue;
+        // "No blockers" and LGTM speak to merge readiness; a warning or
+        // note can remain without contradicting either claim.
+        if (!retainedBlocker && (/\bno (?:remaining |outstanding |unresolved )*blockers?\b/iu.test(segment) || /\b(?:lgtm|looks good to me)\b/iu.test(segment)) &&
+          !/\b(?:issues?|findings?|defects?|problems?|bugs?|clean|no changes?)\b/iu.test(segment)) continue;
+        if (scopedCleanClaim(segment, retainedLocations, retainedBlocker, retainedPrior)) continue;
+        return segment.length > 200 ? `${segment.slice(0, 200)}…` : segment;
+      }
+    }
+  }
+  return null;
 }
 
 interface PriorReview {
@@ -1489,13 +1606,18 @@ export class PerkinsWholeReview {
         }
         return valid;
       },
-      get deliveredLensFindingTitles() {
-        const byLens = new Map<PerkinsLens, ReadonlySet<string>>();
+      get deliveredLensFindings() {
+        const byLens = new Map<PerkinsLens, Map<string, Set<string>>>();
         for (const result of results.values()) {
           if (result.status !== 'valid' || result.findingsDelivered === false) continue;
-          const titles = byLens.get(result.lens) ?? new Set<string>();
-          for (const finding of result.findings) (titles as Set<string>).add(finding.title.trim());
-          byLens.set(result.lens, titles);
+          const byTitle = byLens.get(result.lens) ?? new Map<string, Set<string>>();
+          for (const finding of result.findings) {
+            const title = finding.title.trim();
+            const locations = byTitle.get(title) ?? new Set<string>();
+            locations.add(provenanceLocation(finding.location));
+            byTitle.set(title, locations);
+          }
+          byLens.set(result.lens, byTitle);
         }
         return byLens;
       },
@@ -1791,17 +1913,23 @@ export class PerkinsWholeReview {
         const evidence = collectBoundedString(candidate.evidence, `${subject} evidence`, 4_000, subject, 'finding-evidence', issues);
         const detail = collectBoundedString(candidate.detail, `${subject} detail`, 320, subject, 'finding-detail', issues);
         const fix = collectBoundedString(candidate.recommended_fix, `${subject} recommended_fix`, 320, subject, 'finding-fix', issues);
-        // Provenance (R12): crediting a lens requires that specialist to
-        // have actually DELIVERED a finding with this exact title — a
-        // valid-but-empty or undelivered run cannot originate a
-        // lead-invented finding; the lead's own judgments source "lead".
+        // Provenance (R12/R38): crediting a lens requires that specialist to
+        // have actually DELIVERED a finding with this exact title AT the
+        // cited location — a valid-but-empty or undelivered run cannot
+        // originate a lead-invented finding, and a same-title finding the
+        // lead relocated is the lead's own judgment; the lead's own
+        // judgments source "lead".
         if (
           title !== null && typeof candidate.source === 'string' && candidate.source !== 'lead' &&
           sources.has(candidate.source) && context.validLenses.has(candidate.source as PerkinsLens)
         ) {
-          const deliveredTitles = context.deliveredLensFindingTitles.get(candidate.source as PerkinsLens);
-          if (deliveredTitles === undefined || !deliveredTitles.has(title.trim())) {
+          const deliveredLocations = context.deliveredLensFindings
+            .get(candidate.source as PerkinsLens)?.get(title.trim());
+          if (deliveredLocations === undefined) {
             push(subject, 'finding-source', `${subject} source "${candidate.source}" did not report a finding titled "${title.trim().slice(0, 120)}"; keep the specialist's exact title to credit it, or attribute your own judgment to "lead"`);
+          } else if (location !== null && !deliveredLocations.has(provenanceLocation(location))) {
+            const delivered = [...deliveredLocations].slice(0, 3).map((item) => `"${item.slice(0, 160)}"`).join(', ');
+            push(subject, 'finding-source', `${subject} source "${candidate.source}" delivered "${title.trim().slice(0, 120)}" at ${delivered === '' ? 'a different location' : delivered}, not "${location.slice(0, 160)}"; cite the delivered location and evidence, or attribute your own judgment to "lead"`);
           }
         }
         if (
@@ -1928,7 +2056,8 @@ export class PerkinsWholeReview {
       if (retainedTitles.length > 0) {
         // Hidden HTML comments are not visible prose: titles buried there
         // do not account for a finding the reader can see (E6).
-        const normalizedReport = report.replace(/<!--[\s\S]*?-->/gu, '').replace(/\s+/gu, ' ');
+        const visibleReport = report.replace(/<!--[\s\S]*?-->/gu, '');
+        const normalizedReport = visibleReport.replace(/\s+/gu, ' ');
         const uniqueRetained = [...new Set(retainedTitles)];
         const missing = uniqueRetained.filter((title) => !normalizedReport.includes(title.replace(/\s+/gu, ' ')));
         if (missing.length > 0) {
@@ -1938,6 +2067,28 @@ export class PerkinsWholeReview {
             'report-coherence',
             `the report prose does not account for ${missing.length} of ${uniqueRetained.length} retained finding(s) — missing ${shown.join(', ')}${missing.length > 5 ? ` (+${missing.length - 5} more)` : ''}; ` +
               'a coherent report references every retained finding (quote or restate its title, including still-present priors), or honestly resolves it in the dispositions',
+          );
+        }
+        // R37: naming every title is still compatible with prose that
+        // explicitly concludes the change is issue-free. A terminal
+        // clean-slate claim beside retained findings contradicts the report's
+        // own record; per-lens/per-area scoping stays legitimate prose.
+        const retainedPriors = (dispositions ?? []).filter((disposition) => disposition.status === 'still-present');
+        const retainedLocations = [
+          ...(findings ?? []).map((finding) => findingPath(finding)),
+          ...retainedPriors.map((disposition) => findingPath({
+            location: disposition.refresh?.location ?? context.prior[disposition.prior_index]?.location ?? '',
+          })),
+        ].filter((path): path is string => path !== null);
+        const retainedBlocker = (findings ?? []).some((finding) => finding.severity === 'blocker') ||
+          retainedPriors.some((disposition) =>
+            (disposition.refresh?.severity ?? context.prior[disposition.prior_index]?.severity) === 'blocker');
+        const cleanClaim = findTerminalCleanClaim(visibleReport, retainedLocations, retainedBlocker, retainedPriors.length > 0);
+        if (cleanClaim !== null) {
+          push(
+            'report',
+            'report-coherence',
+            `the report concludes the change is issue-free ("${cleanClaim}") while ${uniqueRetained.length} finding(s) remain retained — a terminal clean-slate conclusion contradicts the retained findings; remove it or scope the claim to the lens/file it actually describes`,
           );
         }
       }
