@@ -25,6 +25,8 @@ import {
   type SkillModule,
 } from '../src/dispatch/silas-driver.js';
 import { EventBus } from '../src/events/bus.js';
+import { reconcileDurableWork } from '../src/dispatch/durable-reconcile.js';
+import type { FollowThroughNotifications } from '../src/dispatch/obligations.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { DEFAULT_SILAS_CONFIG } from '../src/config.js';
@@ -1193,6 +1195,129 @@ describe('silas digest (the four actionable states)', () => {
       h.cleanup();
     }
   });
+
+  it('tracks failures and waits per scope: an unrelated PASS or resubmission cannot hide another scope', async () => {
+    const h = makeLedger();
+    try {
+      h.ledger.addJob({ id: 'job-scopes', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('job-scopes', 'working');
+      h.ledger.appendCustomEvent({
+        kind: 'verification.completed',
+        jobId: 'job-scopes',
+        payload: { ok: false, scope: 'full', run_id: 'run-full', exit_code: 1 },
+      });
+      h.ledger.appendCustomEvent({
+        kind: 'verification.completed',
+        jobId: 'job-scopes',
+        payload: { ok: true, scope: 'focused', run_id: 'run-focused', exit_code: 0 },
+      });
+      h.ledger.appendCustomEvent({
+        kind: 'verification.lock-timeout',
+        jobId: 'job-scopes',
+        payload: { scope: 'full', request_id: 'req-a', head: 'head-a', wait_ms: 1_000 },
+      });
+      h.ledger.appendCustomEvent({
+        kind: 'verification.lock-timeout',
+        jobId: 'job-scopes',
+        payload: { scope: 'focused', request_id: 'req-b', head: 'head-b', wait_ms: 2_000 },
+      });
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      // The focused PASS does not hide the failed full scope, and both
+      // timed-out scopes stay visible.
+      expect(digest.verificationFailures.map((row) => row.scope)).toEqual(['full']);
+      expect(digest.verificationWaits.map((row) => row.scope).sort()).toEqual(['focused', 'full']);
+      expect(digest.verificationWaits.map((row) => row.head).sort()).toEqual(['head-a', 'head-b']);
+
+      // Resubmitting only the newer (focused) scope retires only its row.
+      h.ledger.appendCustomEvent({
+        kind: 'verification.requested',
+        jobId: 'job-scopes',
+        payload: { scope: 'focused', request_id: 'req-c' },
+      });
+      const after = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(after.verificationWaits.map((row) => row.scope)).toEqual(['full']);
+      expect(after.verificationFailures.map((row) => row.scope)).toEqual(['full']);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a fingerprinted repair rung retires only its own failed scope; an unrelated rung cannot', async () => {
+    const h = makeLedger();
+    try {
+      h.ledger.addJob({ id: 'job-rung', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('job-rung', 'working');
+      h.ledger.appendCustomEvent({
+        kind: 'verification.completed',
+        jobId: 'job-rung',
+        payload: { ok: false, scope: 'full', run_id: 'run-77', exit_code: 1 },
+      });
+      h.ledger.appendCustomEvent({
+        kind: 'silas.directive-sent',
+        jobId: 'job-rung',
+        payload: { request_id: 'req-other', blocker_fingerprint: 'lint:src/other.ts' },
+      });
+      const unrelated = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(unrelated.verificationFailures.map((row) => row.scope)).toEqual(['full']);
+
+      h.ledger.appendCustomEvent({
+        kind: 'silas.directive-sent',
+        jobId: 'job-rung',
+        payload: { request_id: 'req-verify', blocker_fingerprint: 'verification-failed:full@run-77' },
+      });
+      const handled = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(handled.verificationFailures).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('reports the real failure detail: timeout/signal/error outrank a zero exit code', async () => {
+    const h = makeLedger();
+    try {
+      for (const [id, payload] of [
+        ['job-detail-1', { ok: false, scope: 'full', exit_code: 0, error: 'spawn ENOENT' }],
+        ['job-detail-2', { ok: false, scope: 'full', exit_code: 0, signal: 'SIGKILL' }],
+        ['job-detail-3', { ok: false, scope: 'full', exit_code: 0, timed_out: true }],
+      ] as const) {
+        h.ledger.addJob({ id, repo: 'fixture-app', title: 't', briefing: 'b' });
+        h.ledger.setJobStatus(id, 'working');
+        h.ledger.appendCustomEvent({ kind: 'verification.completed', jobId: id, payload });
+      }
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      const detail = new Map(digest.verificationFailures.map((row) => [row.jobId, row.detail]));
+      expect(detail.get('job-detail-1')).toBe('spawn ENOENT');
+      expect(detail.get('job-detail-2')).toBe('signal SIGKILL');
+      expect(detail.get('job-detail-3')).toBe('timed out');
+    } finally {
+      h.cleanup();
+    }
+  });
 });
 
 // ------------------------------------------------------------------
@@ -1930,5 +2055,126 @@ describe('silas deterministic pass observation (issue #163)', () => {
     } finally {
       h.cleanup();
     }
+  });
+  it('a partial pass (ok:false with failures) is recorded as failed, never as a completed reconciliation', async () => {
+    const h = makeDriver({
+      onDeterministicPass: () => ({ ok: false, failures: 2, advanced: 1 }),
+    });
+    try {
+      addJobWithDelivery(h.ledger, 'job-partial-pass');
+      await h.driver.trigger({ kind: 'sweep' });
+      expect(kinds(h, 'silas.reconcile')).toHaveLength(0);
+      const failed = kinds(h, 'silas.reconcile-failed');
+      expect(failed).toHaveLength(1);
+      expect(failed[0]?.payload).toMatchObject({ ok: false, counts: { ok: false, failures: 2, advanced: 1 } });
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('the REAL durable pass advances an approved lane while the model prompt is held open', async () => {
+    // Production composition: the hook is exactly the reconcileDurableWork
+    // call main.ts wires. A completion that lands DURING the open turn is
+    // settled by the independent pass; one coalesced wake follows.
+    const posts: { kind: string }[] = [];
+    const notifications: FollowThroughNotifications = {
+      postIncident: (input) => {
+        posts.push({ kind: input.kind });
+        return { id: `notice-${posts.length}` };
+      },
+    };
+    const h = makeDriver({
+      onDeterministicPass: () => reconcileDurableWork({ ledger: h.ledger, notifications }),
+    });
+    try {
+      const job = h.ledger.addJob({ id: 'job-midturn', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus(job.id, 'working');
+      const phase = h.ledger.beginPhaseHandoff({
+        jobId: job.id,
+        source: 'silas-rebrief',
+        intent: { kind: 'gru-decision', decision: 'rule on the mid-turn completion' },
+      }).record;
+      h.ledger.appendCustomEvent({ kind: 'silas.rebrief', jobId: job.id, payload: { phase_id: phase.phaseId } });
+      // An actionable lane so the one queued wake after settlement prompts.
+      addJobWithDelivery(h.ledger, 'job-open-wake');
+      h.hold();
+      const first = h.driver.trigger({ kind: 'job.delivered', jobId: 'job-open-wake' });
+      await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
+
+      // The correlated completion lands while the prompt is unresolved.
+      h.ledger.appendCustomEvent({
+        kind: 'job.delivered',
+        jobId: job.id,
+        payload: { phase_id: phase.phaseId, source: 'silas-rebrief' },
+      });
+      await h.driver.trigger({ kind: 'sweep' });
+      expect(h.ledger.getPhaseHandoff(phase.phaseId)?.state).toBe('completed');
+      expect(h.ledger.listObligations({ jobId: job.id })).toHaveLength(1);
+      expect(posts).toHaveLength(1);
+      expect(h.prompts).toHaveLength(1); // still the one held turn
+
+      h.settle();
+      await first;
+      await vi.waitFor(() => expect(h.prompts).toHaveLength(2));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(h.prompts).toHaveLength(2); // exactly one coalesced wake, no second session
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('wakes on a failed verification or capacity timeout, never on a routine PASS', async () => {
+    const h = makeDriver();
+    try {
+      h.driver.start();
+      const publish = (kind: string, payload: unknown): void => {
+        h.bus.publish({
+          seq: 1,
+          ts: new Date().toISOString(),
+          kind,
+          agentId: null,
+          jobId: 'job-verify-wake',
+          roundId: null,
+          lens: null,
+          payload,
+        });
+      };
+      publish('verification.completed', { ok: true, scope: 'full' });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(h.prompts).toHaveLength(0);
+      publish('verification.completed', { ok: false, scope: 'full' });
+      await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
+      publish('verification.lock-timeout', { scope: 'full', request_id: 'req-wake' });
+      await vi.waitFor(() => expect(h.prompts).toHaveLength(2));
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a lone verification timeout is actionable on a sweep (no unrelated event needed)', async () => {
+    const h = makeDriver();
+    try {
+      h.ledger.addJob({ id: 'job-wait-wake', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('job-wait-wake', 'working');
+      h.ledger.appendCustomEvent({
+        kind: 'verification.lock-timeout',
+        jobId: 'job-wait-wake',
+        payload: { scope: 'full', request_id: 'req-lone', head: 'head-lone', wait_ms: 900_000 },
+      });
+      await h.driver.trigger({ kind: 'sweep' });
+      await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
+      expect(h.prompts[0]?.text).toContain('req-lone');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('the main assembly wires the durable reconciliation pass into the driver (assembly alarm)', () => {
+    const mainSource = readFileSync(join(import.meta.dirname, '..', 'src', 'main.ts'), 'utf8');
+    expect(mainSource).toMatch(
+      /import\s*\{[^}]*\breconcileDurableWork\b[^}]*\}\s*from\s*'\.\/dispatch\/durable-reconcile\.js'/,
+    );
+    expect(mainSource).toMatch(/onDeterministicPass:\s*\(\)\s*=>\s*\{[\s\S]*?reconcileDurableWork\(/);
+    expect(mainSource).toMatch(/onDeterministicPass:\s*\(\)\s*=>\s*\{[\s\S]*?reconcilePendingHandoffs\(/);
   });
 });

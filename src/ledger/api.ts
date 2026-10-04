@@ -776,6 +776,24 @@ export class LedgerApi {
     return row === undefined ? null : this.eventFromRow(row);
   }
 
+  /** Job events restricted to an explicit kind set (newest first). Digest
+   * and reconcile read paths use it so unrelated job traffic cannot push
+   * the observed kind out of a fixed newest-N window. */
+  listJobEventsByKinds(
+    jobId: string,
+    kinds: readonly string[],
+    opts: { limit?: number } = {},
+  ): readonly EventRecord[] {
+    if (kinds.length === 0) throw new Error('listJobEventsByKinds requires at least one kind');
+    const limit = opts.limit ?? 200;
+    const placeholders = kinds.map(() => '?').join(', ');
+    return (
+      this.db
+        .prepare(`SELECT * FROM events WHERE job_id = ? AND kind IN (${placeholders}) ORDER BY seq DESC LIMIT ?`)
+        .all(jobId, ...(kinds as string[]), limit) as Row[]
+    ).map((row) => this.eventFromRow(row));
+  }
+
   /** A marked request's guarded event, however many newer unrelated job
    * events exist. The request's watermark and phase must both match. */
   latestJobPhaseEvent(jobId: string, kind: string, phaseId: string, baselineSeq: number): EventRecord | null {
@@ -2882,9 +2900,12 @@ export class LedgerApi {
    * with no provable blocked episode is excluded. Already-tracked
    * deliveries (and deliveries owned by an existing marked phase row) are
    * excluded BY the query, so bounded passes always reach the tail. */
-  listUnmarkedHandbackDeliveries(limit: number): readonly EventRecord[] {
+  listUnmarkedHandbackDeliveries(limit: number, opts: { cursor?: number } = {}): readonly EventRecord[] {
     if (!Number.isSafeInteger(limit) || limit < 1) {
       throw new Error(`listUnmarkedHandbackDeliveries requires a positive integer limit, got ${String(limit)}`);
+    }
+    if (opts.cursor !== undefined && (!Number.isSafeInteger(opts.cursor) || opts.cursor < 0)) {
+      throw new Error('listUnmarkedHandbackDeliveries cursor must be a safe non-negative event seq');
     }
     const rows = this.db
       .prepare(
@@ -2893,6 +2914,7 @@ export class LedgerApi {
           WHERE e.kind = 'job.delivered'
             AND j.status = 'blocked'
             AND json_valid(e.payload)
+            AND e.seq > ?
             AND json_extract(e.payload, '$.source') IN ('silas-directive', 'silas-rebrief')
             AND COALESCE((
               SELECT json_extract(s.payload, '$.to')
@@ -2918,7 +2940,7 @@ export class LedgerApi {
           ORDER BY e.seq ASC
           LIMIT ?`,
       )
-      .all(limit) as Row[];
+      .all(opts.cursor ?? 0, limit) as Row[];
     return rows.map((row) => this.eventFromRow(row));
   }
 
@@ -2927,9 +2949,12 @@ export class LedgerApi {
    * action-required card was never published (crash between the obligation
    * write and the notification). A published card — even a resolved/acked
    * one — removes the row from the candidate set. */
-  listHandbacksMissingCards(limit: number): readonly ObligationRecord[] {
+  listHandbacksMissingCards(limit: number, opts: { cursor?: number } = {}): readonly ObligationRecord[] {
     if (!Number.isSafeInteger(limit) || limit < 1) {
       throw new Error(`listHandbacksMissingCards requires a positive integer limit, got ${String(limit)}`);
+    }
+    if (opts.cursor !== undefined && (!Number.isSafeInteger(opts.cursor) || opts.cursor < 0)) {
+      throw new Error('listHandbacksMissingCards cursor must be a safe non-negative rowid');
     }
     const rows = this.db
       .prepare(
@@ -2937,6 +2962,7 @@ export class LedgerApi {
           WHERE o.logical_step = 'operation'
             AND o.incident_key LIKE 'phase-handback@%'
             AND o.state IN ('open', 'waiting')
+            AND o.rowid > ?
             AND NOT EXISTS (
               SELECT 1 FROM notifications n
                WHERE n.kind = 'silas.phase-handback.' || o.job_id || '@' || substr(o.incident_key, 16)
@@ -2944,7 +2970,7 @@ export class LedgerApi {
           ORDER BY o.rowid ASC
           LIMIT ?`,
       )
-      .all(limit) as Row[];
+      .all(opts.cursor ?? 0, limit) as Row[];
     return rows.map((row) => this.obligationFromRow(row));
   }
 

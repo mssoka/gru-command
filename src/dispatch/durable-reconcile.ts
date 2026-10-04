@@ -13,6 +13,14 @@ import { settleDirectivesFromEvidence, type DirectiveEvidenceReport } from './re
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
 /**
+ * Durable round-robin cursor scopes for the unmarked hand-back windows
+ * (issue #163 review): a persistently failing prefix must not starve the
+ * later eligible deliveries/cards. Both windows page independently.
+ */
+const UNMARKED_DELIVERIES_SCOPE = 'unmarked-handback-deliveries';
+const UNMARKED_CARDS_SCOPE = 'unmarked-handback-cards';
+
+/**
  * The bounded, non-LLM durable reconciliation pass (issue #163).
  *
  * A Silas model turn can run for a long time; the fleet's routine
@@ -32,8 +40,8 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  * reopens delivered/parked/terminal work. Every step is idempotent, so a
  * duplicate trigger or an overlapping process coalesces onto at most one
  * accepted next action per phase. Bounded page budgets with durable
- * round-robin cursors keep old/dispositioned rows from starving later
- * eligible work.
+ * round-robin cursors keep old/failing/dispositioned rows from starving
+ * later eligible work.
  *
  * The boot-time reconcilers keep their richer judgment (escalation notes
  * and cards for admission-unknown requests); this pass only advances on
@@ -52,19 +60,24 @@ export interface DurableReconcileBudget {
   /** Phase-handoff pages. Default 100 × 4 per tick. */
   readonly phasePageSize?: number;
   readonly phaseMaxPages?: number;
-  /** Unmarked hand-back candidates per pass. Default 100. */
+  /** Unmarked hand-back candidates per pass and window. Default 100. */
   readonly handbackLimit?: number;
 }
 
 export interface DurableReconcileReport extends Record<string, unknown> {
+  /** false when at least one row/transition failed — the driver records a
+   * failed pass, never a completed-reconciliation success. */
+  readonly ok: boolean;
   readonly directives: DirectiveEvidenceReport;
   readonly phases: PhaseReconcileReport;
   readonly handbacks: UnmarkedReconcileReport;
-  /** Rows examined across all three passes. */
+  /** Rows examined across all passes and windows. */
   readonly examined: number;
   /** Durable transitions this pass completed (settlements, hand-backs,
    * publications, stale-intent closes). */
   readonly advanced: number;
+  /** Per-row failures this pass could not finish (retried next pass). */
+  readonly failures: number;
 }
 
 export function reconcileDurableWork(
@@ -86,12 +99,24 @@ export function reconcileDurableWork(
   });
   const handbacks = reconcileUnmarkedHandbacks(followThrough, {
     limit: budget.handbackLimit ?? 100,
+    deliveriesCursor: deps.ledger.readReconcileCursor(UNMARKED_DELIVERIES_SCOPE) ?? 0,
+    cardsCursor: deps.ledger.readReconcileCursor(UNMARKED_CARDS_SCOPE) ?? 0,
   });
+  deps.ledger.writeReconcileCursor({
+    scope: UNMARKED_DELIVERIES_SCOPE,
+    cursor: handbacks.deliveriesCursor ?? 0,
+  });
+  deps.ledger.writeReconcileCursor({
+    scope: UNMARKED_CARDS_SCOPE,
+    cursor: handbacks.cardsCursor ?? 0,
+  });
+  const failures = directives.failed + phases.failed + handbacks.failed;
   return {
+    ok: failures === 0,
     directives,
     phases,
     handbacks,
-    examined: directives.examined + phases.examined + handbacks.deliveries,
+    examined: directives.examined + phases.examined + handbacks.deliveries + handbacks.cards,
     advanced:
       directives.completed +
       phases.completed +
@@ -99,5 +124,6 @@ export function reconcileDurableWork(
       phases.closed +
       handbacks.recovered +
       handbacks.published,
+    failures,
   };
 }

@@ -140,6 +140,10 @@ export interface DigestLedger {
   getJob(id: string): JobRecord | null;
   listRounds(jobId: string): readonly RoundRecord[];
   listJobEvents(jobId: string, opts?: { limit?: number }): readonly EventRecord[];
+  /** Job events restricted to an explicit kind set (newest first) — the
+   * verification follow-through read rides this so unrelated job traffic
+   * cannot age the observed kind out of a fixed window. */
+  listJobEventsByKinds(jobId: string, kinds: readonly string[], opts?: { limit?: number }): readonly EventRecord[];
   latestJobEvent(jobId: string, kind: string): EventRecord | null;
   latestRoundEvent(roundId: string, kind: string): EventRecord | null;
   listAgents(): readonly AgentRecord[];
@@ -272,6 +276,9 @@ export interface VerificationWaitingRow {
   readonly repo: string;
   readonly scope: string | null;
   readonly requestId: string | null;
+  /** The head pinned at submission (null when the timeout predates the
+   * head-recording form); re-submission must target exactly this head. */
+  readonly head: string | null;
   readonly waitMs: number | null;
   readonly at: string | null;
 }
@@ -482,23 +489,30 @@ function payloadFlag(event: EventRecord, key: string, expected: boolean): boolea
   return payloadRecord(event)[key] === expected;
 }
 
-/** Same verification scope (a missing scope on either event matches any). */
-function sameScope(event: EventRecord, scope: string | null): boolean {
-  if (scope === null) return true;
-  return payloadString(event, 'scope') === scope;
+/** Does a repair rung retire THIS failed verification? A rung without a
+ * blocker fingerprint is legacy/global and owns the follow-through; a
+ * fingerprinted rung must name the failed scope or run (or verification
+ * broadly) so an unrelated repair cannot hide an unresolved failure. */
+function rungOwnsFailure(rung: EventRecord, scope: string | null, runId: string | null): boolean {
+  const fingerprint = payloadString(rung, 'blocker_fingerprint');
+  if (fingerprint === null) return true;
+  if (scope !== null && fingerprint.includes(scope)) return true;
+  if (runId !== null && fingerprint.includes(runId)) return true;
+  return fingerprint.includes('verification');
 }
 
 /** A one-line honest reason a verification failed (never a fabricated
- * exit status). */
+ * exit status): a timeout or signal outranks an exit code, and a recorded
+ * spawn/runner error outranks a misleading zero exit. */
 function verificationFailureDetail(event: EventRecord): string {
   const payload = payloadRecord(event);
   if (payload['timed_out'] === true) return 'timed out';
-  const exitCode = payload['exit_code'];
-  if (typeof exitCode === 'number' && Number.isFinite(exitCode)) return `exit ${exitCode}`;
   const signal = payload['signal'];
   if (typeof signal === 'string' && signal !== '') return `signal ${signal}`;
   const error = payload['error'];
   if (typeof error === 'string' && error !== '') return error.slice(0, 200);
+  const exitCode = payload['exit_code'];
+  if (typeof exitCode === 'number' && Number.isFinite(exitCode)) return `exit ${exitCode}`;
   return 'failed with no exit status';
 }
 
@@ -771,62 +785,76 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       });
     }
 
-    // (5) A failed verification owes a repair decision (issue #163). The
-    // row retires on a repair rung after the failure, on newer verification
-    // activity for the same scope (a retry already in flight) or on a later
-    // PASS; the skill routes the repair through the existing directive
-    // machinery, never an unchanged-head green rerun. Terminal lanes are
+    // (5)+(6) Verification follow-through (issue #163): reduce the job's
+    // verification traffic PER SCOPE so an unrelated scope's PASS can never
+    // hide a failed scope, every timed-out scope stays visible, and a
+    // same-scope retry retires only its own row. The kind-scoped read is
+    // bounded by verification events, not unrelated job traffic; the repair
+    // rungs are read by indexed kind queries, so no fixed recent-event
+    // window can age a landed repair out of view. Terminal lanes are
     // skipped by the loop's terminal guard above.
     const verificationCompleted = input.ledger.latestJobEvent(job.id, 'verification.completed');
-    if (verificationCompleted !== null && !payloadFlag(verificationCompleted, 'ok', true)) {
-      const completedScope = payloadString(verificationCompleted, 'scope');
-      const repairLanded = input.ledger
-        .listJobEvents(job.id, { limit: 50 })
-        .some(
-          (event) =>
-            (event.kind === 'silas.directive-sent' || event.kind === 'silas.rebrief' || event.kind === 'silas.escalated') &&
-            event.seq > verificationCompleted.seq,
+    const verificationTimeout = input.ledger.latestJobEvent(job.id, 'verification.lock-timeout');
+    if (verificationCompleted !== null || verificationTimeout !== null) {
+      const verificationEvents = input.ledger.listJobEventsByKinds(
+        job.id,
+        ['verification.completed', 'verification.lock-timeout', ...VERIFICATION_ACTIVITY_KINDS],
+        { limit: 500 },
+      );
+      const scopeOf = (event: EventRecord): string => payloadString(event, 'scope') ?? '(unknown-scope)';
+      const latestCompleted = new Map<string, EventRecord>();
+      const latestActivity = new Map<string, EventRecord>();
+      const latestTimeout = new Map<string, EventRecord>();
+      for (const event of verificationEvents) {
+        const scope = scopeOf(event);
+        if (event.kind === 'verification.completed') {
+          if (!latestCompleted.has(scope)) latestCompleted.set(scope, event);
+        } else if (event.kind === 'verification.lock-timeout') {
+          if (!latestTimeout.has(scope)) latestTimeout.set(scope, event);
+        } else if (!latestActivity.has(scope)) {
+          latestActivity.set(scope, event);
+        }
+      }
+      const repairRungs = (['silas.directive-sent', 'silas.rebrief', 'silas.escalated'] as const)
+        .map((kind) => input.ledger.latestJobEvent(job.id, kind))
+        .filter((event): event is EventRecord => event !== null);
+      for (const [scope, completed] of latestCompleted) {
+        if (payloadFlag(completed, 'ok', true)) continue;
+        const activity = latestActivity.get(scope);
+        if (activity !== undefined && activity.seq > completed.seq) continue; // retry already in flight
+        const runId = payloadString(completed, 'run_id');
+        const scopeName = payloadString(completed, 'scope');
+        const repaired = repairRungs.some(
+          (rung) => rung.seq > completed.seq && rungOwnsFailure(rung, scopeName, runId),
         );
-      const retryLanded = VERIFICATION_ACTIVITY_KINDS.some((kind) => {
-        const event = input.ledger.latestJobEvent(job.id, kind);
-        return event !== null && event.seq > verificationCompleted.seq && sameScope(event, completedScope);
-      });
-      if (!repairLanded && !retryLanded) {
+        if (repaired) continue;
         digest.verificationFailures.push({
           jobId: job.id,
           repo: job.repo,
-          scope: completedScope,
-          runId: payloadString(verificationCompleted, 'run_id'),
-          head: payloadString(verificationCompleted, 'sha'),
-          at: verificationCompleted.ts,
-          detail: verificationFailureDetail(verificationCompleted),
+          scope: scopeName,
+          runId,
+          head: payloadString(completed, 'sha'),
+          at: completed.ts,
+          detail: verificationFailureDetail(completed),
         });
       }
-    }
-
-    // (6) A queue wait that timed out is a capacity wait awaiting
-    // reconsideration, not a result (issue #163). Retires when newer
-    // verification activity for the same scope lands or the lane closes.
-    const verificationTimeout = input.ledger.latestJobEvent(job.id, 'verification.lock-timeout');
-    if (
-      verificationTimeout !== null &&
-      !VERIFICATION_ACTIVITY_KINDS.some((kind) => {
-        const event = input.ledger.latestJobEvent(job.id, kind);
-        return (
-          event !== null &&
-          event.seq > verificationTimeout.seq &&
-          sameScope(event, payloadString(verificationTimeout, 'scope'))
-        );
-      })
-    ) {
-      digest.verificationWaits.push({
-        jobId: job.id,
-        repo: job.repo,
-        scope: payloadString(verificationTimeout, 'scope'),
-        requestId: payloadString(verificationTimeout, 'request_id'),
-        waitMs: payloadNumber(verificationTimeout, 'wait_ms'),
-        at: verificationTimeout.ts,
-      });
+      for (const [scope, timeout] of latestTimeout) {
+        const completed = latestCompleted.get(scope);
+        const activity = latestActivity.get(scope);
+        const retired =
+          (completed !== undefined && completed.seq > timeout.seq) ||
+          (activity !== undefined && activity.seq > timeout.seq);
+        if (retired) continue;
+        digest.verificationWaits.push({
+          jobId: job.id,
+          repo: job.repo,
+          scope: payloadString(timeout, 'scope'),
+          requestId: payloadString(timeout, 'request_id'),
+          head: payloadString(timeout, 'head'),
+          waitMs: payloadNumber(timeout, 'wait_ms'),
+          at: timeout.ts,
+        });
+      }
     }
   }
   // Provider-recovery lanes awaiting a guarded continuation claim: the
@@ -910,7 +938,15 @@ export interface SilasSlot {
   ensure(options?: SpawnOptions): Promise<AgentHandle>;
 }
 
-export type SilasTriggerKind = 'job.delivered' | 'job.minion-error' | 'round.verdict' | 'round.perkins-incomplete' | 'provider.restored' | 'sweep';
+export type SilasTriggerKind =
+  | 'job.delivered'
+  | 'job.minion-error'
+  | 'round.verdict'
+  | 'round.perkins-incomplete'
+  | 'provider.restored'
+  | 'verification.completed'
+  | 'verification.lock-timeout'
+  | 'sweep';
 
 export interface SilasTrigger {
   readonly kind: SilasTriggerKind;
@@ -973,11 +1009,19 @@ export interface DeterministicPassContext {
   readonly wakeInFlight: boolean;
 }
 
+/** A bounded no-LLM pass result. `ok: false` marks an incomplete/failed
+ * pass (e.g. partial row failures) without a throw; the driver records it
+ * as a failed pass and never as a completed reconciliation. Any other
+ * entries become the recorded pass counts. */
+export interface DeterministicPassResult extends Record<string, unknown> {
+  readonly ok?: boolean;
+}
+
 /** A bounded no-LLM pass. A plain-object return value is recorded as the
  * pass counts on the `silas.reconcile` health event; void records none. */
 export type DeterministicPassHook = (
   context: DeterministicPassContext,
-) => void | Record<string, unknown> | Promise<void | Record<string, unknown>>;
+) => void | DeterministicPassResult | Promise<void | DeterministicPassResult>;
 
 interface DeterministicPassOutcome {
   readonly ok: boolean;
@@ -987,6 +1031,25 @@ interface DeterministicPassOutcome {
 }
 
 const SILAS_WAKE_EVENTS: readonly string[] = ['job.delivered', 'job.minion-error', 'round.verdict', 'round.perkins-incomplete', 'provider.restored'];
+
+/** A bus event worth waking Silas for: the standing kinds unconditionally;
+ * verification traffic only when it is a failure or a capacity timeout. A
+ * routine PASS must not mint an event wake (it would prompt on every green
+ * run), but a failed completed run or a dropped queue waiter is exactly
+ * the dependency transition the digest must reconsider.
+ */
+export function silasWakeEvent(event: { readonly kind: string; readonly payload?: unknown }): boolean {
+  if (SILAS_WAKE_EVENTS.includes(event.kind)) return true;
+  if (event.kind === 'verification.lock-timeout') return true;
+  if (event.kind === 'verification.completed') {
+    const payload =
+      typeof event.payload === 'object' && event.payload !== null
+        ? (event.payload as Record<string, unknown>)
+        : {};
+    return payload['ok'] !== true;
+  }
+  return false;
+}
 
 export class SilasDriver {
   private readonly opts: SilasDriverOptions;
@@ -1013,7 +1076,7 @@ export class SilasDriver {
     this.clearIntervalImpl = opts.clearInterval ?? clearInterval;
     if (opts.bus !== undefined) {
       this.unsubscribe = opts.bus.subscribe((event) => {
-        if (!SILAS_WAKE_EVENTS.includes(event.kind)) return;
+        if (!silasWakeEvent(event)) return;
         void this.trigger({ kind: event.kind as SilasTriggerKind, jobId: event.jobId ?? undefined });
       });
     }
@@ -1126,6 +1189,7 @@ export class SilasDriver {
     // Deterministic, bounded reconsideration happens before any LLM wake:
     // pending-duty reconciliation never waits for a model turn.
     await this.runDeterministicPass(trigger.kind, wakeInFlight);
+    if (this.disposed) return;
     if (this.wakeInFlight !== null) {
       this.queuedTrigger = trigger;
       return;
@@ -1169,7 +1233,15 @@ export class SilasDriver {
   ): Promise<DeterministicPassOutcome> {
     const hook = this.opts.onDeterministicPass;
     if (hook === undefined) return { ok: true, counts: null, error: null, durationMs: 0 };
-    if (this.passInFlight !== null) return this.passInFlight;
+    if (this.passInFlight !== null) {
+      // A fresh observation arrived while the pass ran: the in-flight pass
+      // may already have read the ledger before this trigger's event was
+      // committed, so a follow-up pass is owed — an event is never silently
+      // dropped from reconciliation just because another pass was running.
+      await this.passInFlight;
+      if (this.disposed) return { ok: true, counts: null, error: null, durationMs: 0 };
+      return this.runDeterministicPass(trigger, wakeInFlight);
+    }
     const startedAt = this.now();
     const duration = (): number => Math.max(0, this.now() - startedAt);
     const run = (async (): Promise<DeterministicPassOutcome> => {
@@ -1179,7 +1251,9 @@ export class SilasDriver {
           typeof outcome === 'object' && outcome !== null && !Array.isArray(outcome)
             ? (outcome as Record<string, unknown>)
             : null;
-        return { ok: true, counts, error: null, durationMs: duration() };
+        // A hook that returns `ok:false` had partial row failures: record
+        // the honest failed pass, never a completed reconciliation.
+        return { ok: counts === null || counts['ok'] !== false, counts, error: null, durationMs: duration() };
       } catch (error) {
         return { ok: false, counts: null, error: String(error).slice(0, 300), durationMs: duration() };
       }
@@ -1204,9 +1278,13 @@ export class SilasDriver {
           ok: false,
           duration_ms: outcome.durationMs,
           wake_in_flight: wakeInFlight,
+          ...(outcome.counts === null ? {} : { counts: outcome.counts }),
           error: outcome.error,
         });
-        this.log('error', 'deterministic pass hook failed', { error: outcome.error });
+        this.log('error', 'deterministic pass incomplete', {
+          error: outcome.error,
+          ...(outcome.counts === null ? {} : { failures: outcome.counts['failures'] }),
+        });
       }
       return outcome;
     } finally {

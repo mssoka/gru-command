@@ -176,7 +176,24 @@ describe('the remaining health cards render truthfully or n/a', () => {
       NOW.getTime(),
     );
     expect(open.value).toBe('turn open 1h');
-    expect(open.detail).toBe('0 reconciliations today');
+    // An open turn must not hide whether the loop is still moving.
+    expect(open.detail).toBe('reconciled 1m ago · 0 reconciliations today');
+  });
+
+  it('Silas: a pass that failed after the last success is louder than every healthy state (#163)', () => {
+    const failed = silasCard(
+      {
+        ...silasBase,
+        lastWakeAt: ISO(-3_600_000),
+        lastReconcileAt: ISO(-600_000),
+        lastReconcileFailedAt: ISO(-60_000),
+      },
+      NOW.getTime(),
+    );
+    expect(failed.value).toBe('pass failed 1m ago');
+    expect(failed.tone).toBe('alert');
+    expect(failed.flag).toBe('FAILED');
+    expect(failed.titleAttr).toContain('last failed pass 1m ago');
   });
 
   it('Alerts: unacked count with the ack flag', () => {

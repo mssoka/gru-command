@@ -185,10 +185,20 @@ function publishUnmarkedHandbackCard(
 export interface UnmarkedReconcileReport {
   /** Window-A candidates examined (delivery committed, observer never ran). */
   readonly deliveries: number;
+  /** Window-B candidates examined (obligation live, card never posted). */
+  readonly cards: number;
   /** Hand-back obligations recorded by this pass. */
   readonly recovered: number;
   /** Stable-kind cards newly posted by this pass (either window). */
   readonly published: number;
+  /** Rows whose recovery threw — counted so a partial pass is never
+   * reported as fully reconciled (the row stays for the next pass). */
+  readonly failed: number;
+  /** Next rowid/seq cursor for each window, or null when the pass reached
+   * the tail (the next pass starts over). Durable fairness: a persistently
+   * failing prefix cannot starve later eligible hand-backs. */
+  readonly deliveriesCursor: number | null;
+  readonly cardsCursor: number | null;
 }
 
 /**
@@ -209,13 +219,18 @@ export interface UnmarkedReconcileReport {
  */
 export function reconcileUnmarkedHandbacks(
   deps: FollowThroughDeps,
-  opts: { limit?: number } = {},
+  opts: { limit?: number; deliveriesCursor?: number; cardsCursor?: number } = {},
 ): UnmarkedReconcileReport {
   const limit = Math.min(Math.max(1, opts.limit ?? 200), 1000);
   let deliveries = 0;
+  let cards = 0;
   let recovered = 0;
   let published = 0;
-  for (const event of deps.ledger.listUnmarkedHandbackDeliveries(limit)) {
+  let failed = 0;
+  const deliveryRows = deps.ledger.listUnmarkedHandbackDeliveries(limit, {
+    cursor: opts.deliveriesCursor ?? 0,
+  });
+  for (const event of deliveryRows) {
     if (event.jobId === null) continue;
     deliveries += 1;
     const payload = (event.payload ?? {}) as Record<string, unknown>;
@@ -226,8 +241,9 @@ export function reconcileUnmarkedHandbacks(
       if (result.created) recovered += 1;
       if (result.posted) published += 1;
     } catch (error) {
-      // One malformed/conflicting row stays visible and never takes the
-      // boot pass down: the next boot retries it from durable state.
+      // One malformed/conflicting row stays VISIBLE and never takes the
+      // pass down: the next pass retries it from durable state.
+      failed += 1;
       deps.log?.('error', 'unmarked hand-back recovery failed', {
         job: event.jobId,
         seq: event.seq,
@@ -235,7 +251,11 @@ export function reconcileUnmarkedHandbacks(
       });
     }
   }
-  for (const obligation of deps.ledger.listHandbacksMissingCards(limit)) {
+  const cardRows = deps.ledger.listHandbacksMissingCards(limit, {
+    cursor: opts.cardsCursor ?? 0,
+  });
+  for (const obligation of cardRows) {
+    cards += 1;
     const seq = Number(obligation.incidentKey.slice('phase-handback@'.length));
     if (!Number.isSafeInteger(seq) || seq <= 0) continue;
     // The delivery event is the source of the card's detail; a missing
@@ -257,6 +277,7 @@ export function reconcileUnmarkedHandbacks(
         });
       }
     } catch (error) {
+      failed += 1;
       deps.log?.('error', 'unmarked hand-back card recovery failed', {
         job: obligation.jobId,
         seq,
@@ -264,7 +285,15 @@ export function reconcileUnmarkedHandbacks(
       });
     }
   }
-  return { deliveries, recovered, published };
+  const lastDelivery = deliveryRows[deliveryRows.length - 1];
+  const lastCard = cardRows[cardRows.length - 1];
+  const deliveriesCursor =
+    deliveryRows.length < limit || lastDelivery === undefined
+      ? null
+      : lastDelivery.seq;
+  const cardRowid = lastCard === undefined ? null : deps.ledger.obligationRowid(lastCard.id);
+  const cardsCursor = cardRows.length < limit || lastCard === undefined ? null : cardRowid;
+  return { deliveries, cards, recovered, published, failed, deliveriesCursor, cardsCursor };
 }
 
 export interface AdoptionReport {
@@ -562,6 +591,9 @@ export interface PhaseReconcileReport {
   readonly published: number;
   /** Awaiting phases closed WITHOUT a hand-back by a durable guard. */
   readonly closed: number;
+  /** Rows whose reconciliation threw — a partial pass must never be
+   * reported as fully reconciled. */
+  readonly failed: number;
 }
 
 /** The durable round-robin cursor scope the phase sweep persists under. */
@@ -587,6 +619,7 @@ export function reconcilePhaseHandoffs(
   let completed = 0;
   let published = 0;
   let closed = 0;
+  let failed = 0;
   // Durable round-robin cursor (PR136 r4 blocker 3). A pass reads only
   // ACTIONABLE rows — awaiting intents and completed rows missing their
   // obligation/card — so satisfied publication history never consumes its
@@ -620,6 +653,7 @@ export function reconcilePhaseHandoffs(
       } catch (error) {
         // One malformed/conflicting row stays VISIBLE and never takes the
         // boot pass down: the next boot retries it from durable state.
+        failed += 1;
         deps.log?.('error', 'phase handoff reconciliation row failed', {
           phase: listed.phaseId,
           error: String(error),
@@ -647,7 +681,7 @@ export function reconcilePhaseHandoffs(
   } else if (lastRowid !== null) {
     deps.ledger.writeReconcileCursor({ scope: PHASE_RECONCILE_SCOPE, cursor: lastRowid });
   }
-  return { examined, completed, published, closed };
+  return { examined, completed, published, closed, failed };
 }
 
 /** Reconcile one phase; the counter bumps are reported to the caller. */

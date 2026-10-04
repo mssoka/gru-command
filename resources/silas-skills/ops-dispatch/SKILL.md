@@ -204,17 +204,20 @@ Two digest rows report the verification dependency; neither is a rerun
 license:
 
 - `verificationFailures` — the newest completed verification FAILED (the
-  row carries `scope`, `head`, `run_id` and the honest `detail`: exit
-  status, signal, timeout or error). Read the complete recorded output,
-  repair the real cause through the normal directive path, then re-verify
-  with a NEW request id at the repaired head. Never rerun an unchanged
+  row carries `scope`, `head`, `run_id` and the honest `detail`: timeout,
+  signal, spawn/runner error, or exit status). Read the complete recorded
+  output, repair the real cause through the normal directive path, then
+  re-verify with a NEW request id at the repaired head. Put the failed
+  `scope`/`run_id` in the directive's `blocker_fingerprint` so the digest
+  retires this exact debt when your rung lands; never rerun an unchanged
   head merely to recover logs, and never weaken the gate.
 - `verificationWaits` — a submission's queue wait timed out
-  (`verification.lock-timeout`, with `scope`, `request_id`, `wait_ms`).
-  That is capacity, not a test result: when the budget is free, re-submit
-  the same scope at the same pinned head with a new request id through the
-  shipped capture helper; otherwise leave it and say why. Capacity release
-  needs no watcher — this digest row is the reconsideration.
+  (`verification.lock-timeout`, with `scope`, `request_id`, `head`,
+  `wait_ms`). That is capacity, not a test result: when the budget is
+  free, re-submit the same scope at the row's pinned `head` (pass it as
+  `--expected-head`) with a new request id through the shipped capture
+  helper; otherwise leave it and say why. Capacity release needs no
+  watcher — this digest row is the reconsideration.
 
 ## Closing out
 

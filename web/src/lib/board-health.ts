@@ -148,16 +148,28 @@ export function silasCard(silas: SilasView | null | undefined, now = Date.now())
   if (silas === null || silas === undefined) return notAvailable('silas', 'silas');
   // Issue #163: the headline answers "is the loop alive?" with the
   // reconciliation heartbeat, never the wake-start age alone — a healthy
-  // long model turn must not read as a stalled scheduler.
-  const value =
-    silas.openTurnSince !== null
+  // long model turn must not read as a stalled scheduler. A pass that
+  // FAILED after the last success is louder than every healthy state; the
+  // success and failure stamps share the canonical ISO shape, so string
+  // comparison is the correct ordering.
+  const failedNewer =
+    silas.lastReconcileFailedAt !== null &&
+    (silas.lastReconcileAt === null || silas.lastReconcileFailedAt > silas.lastReconcileAt);
+  const value = failedNewer
+    ? `pass failed ${formatAge(silas.lastReconcileFailedAt, now)} ago`
+    : silas.openTurnSince !== null
       ? `turn open ${formatAge(silas.openTurnSince, now)}`
       : silas.lastReconcileAt !== null
         ? `reconciled ${formatAge(silas.lastReconcileAt, now)} ago`
         : silas.lastWakeAt === null
           ? 'no wakes yet'
           : `wake ${formatAge(silas.lastWakeAt, now)} ago`;
-  const detail = `${silas.reconciliationsToday} reconciliations today`;
+  // An open turn must not hide whether the deterministic loop is still
+  // moving: the detail carries the reconcile freshness beside the count.
+  const detail =
+    silas.openTurnSince !== null && silas.lastReconcileAt !== null
+      ? `reconciled ${formatAge(silas.lastReconcileAt, now)} ago · ${silas.reconciliationsToday} reconciliations today`
+      : `${silas.reconciliationsToday} reconciliations today`;
   const full = [
     `last wake ${formatAge(silas.lastWakeAt, now)} ago (start marker)`,
     `last reconcile ${silas.lastReconcileAt === null ? 'never' : `${formatAge(silas.lastReconcileAt, now)} ago`}`,
@@ -171,7 +183,15 @@ export function silasCard(silas: SilasView | null | undefined, now = Date.now())
       : `last action ${formatAge(silas.lastUsefulActionAt, now)} ago`,
     `${silas.reconciliationsToday} reconciliations today`,
   ].join(' · ');
-  return card('silas', 'silas', value, detail, 'muted', null, full);
+  return card(
+    'silas',
+    'silas',
+    value,
+    detail,
+    failedNewer ? 'alert' : 'muted',
+    failedNewer ? 'FAILED' : null,
+    full,
+  );
 }
 
 export function alertsCard(unacked: number): HealthCardView {

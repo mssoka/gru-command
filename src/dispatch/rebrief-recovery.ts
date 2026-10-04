@@ -938,6 +938,9 @@ export interface DirectiveEvidenceReport {
   readonly examined: number;
   /** Requests completed from their own correlated evidence this pass. */
   readonly completed: number;
+  /** Rows whose evidence lookup/reconciliation threw — a partial pass must
+   * never be reported as fully reconciled. */
+  readonly failed: number;
 }
 
 /**
@@ -961,6 +964,7 @@ export function settleDirectivesFromEvidence(
   if (!Number.isSafeInteger(cursor) || cursor < 0) cursor = 0;
   let examined = 0;
   let completed = 0;
+  let failed = 0;
   let lastRowid: number | null = null;
   let reachedEnd = false;
   for (let page = 0; page < maxPages; page += 1) {
@@ -989,6 +993,7 @@ export function settleDirectivesFromEvidence(
       } catch (error) {
         // One malformed/conflicting row stays VISIBLE and never takes the
         // pass down: the next pass retries it from durable state.
+        failed += 1;
         deps.log?.('error', 'directive evidence reconciliation row failed', {
           request: row.requestId,
           error: String(error),
@@ -1014,7 +1019,7 @@ export function settleDirectivesFromEvidence(
   } else if (lastRowid !== null) {
     deps.ledger.writeReconcileCursor({ scope: DIRECTIVE_EVIDENCE_SCOPE, cursor: lastRowid });
   }
-  return { examined, completed };
+  return { examined, completed, failed };
 }
 
 /** Page size for the boot pass: small enough to bound one query, large
@@ -1082,7 +1087,10 @@ function findCorrelatedEvent(
   kind: string,
   accept: (event: EventRecord) => boolean,
 ): EventRecord | null {
-  const events = ledger.listJobEvents(jobId, { limit: 500 });
+  // Kind-scoped, bounded read: unrelated job traffic can never push the
+  // correlated receipt out of the fixed window (per-tick passes re-read
+  // this evidence for every live request).
+  const events = ledger.listJobEventsByKinds(jobId, [kind], { limit: 1000 });
   for (const event of events) {
     if (event.kind !== kind) continue;
     const payload = (typeof event.payload === 'object' && event.payload !== null ? event.payload : {}) as Record<string, unknown>;

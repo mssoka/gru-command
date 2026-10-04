@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { EventBus } from '../src/events/bus.js';
+import { NotificationCenter } from '../src/notifications/center.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import {
@@ -244,4 +245,44 @@ describe('durable reconciliation pass (issue #163)', () => {
     expect(api.getPhaseHandoff(phase.phaseId)?.state).toBe('awaiting');
     expect(posts).toHaveLength(0);
   });
+  it('reports partial hand-back failures honestly and rotates the cursor past a failing prefix', () => {
+    const { api } = freshLedger();
+    const posts: Post[] = [];
+    for (const id of ['job-hb-1', 'job-hb-2', 'job-hb-3']) {
+      api.addJob({ id, repo: 'demo', title: 't', briefing: 'b' });
+      api.setJobStatus(id, 'blocked');
+      api.appendCustomEvent({ kind: 'job.delivered', jobId: id, payload: { source: 'silas-directive', sha: `sha-${id}` } });
+    }
+    let failing = true;
+    // The real NotificationCenter persists the card row (window-B dedupe is
+    // ledger truth); the wrapper fails only the first candidate's backend.
+    const center = new NotificationCenter({ ledger: api, bus: new EventBus() });
+    const notifications: FollowThroughNotifications = {
+      postIncident: (input) => {
+        if (failing && input.title.includes('job-hb-1')) throw new Error('card backend down');
+        posts.push({ kind: input.kind, routing: input.routing, title: input.title });
+        return center.postIncident(input);
+      },
+    };
+
+    // Pass 1: the first candidate's card backend fails. The report says so
+    // (never ok:true) and the durable cursor moves past it.
+    const first = reconcileDurableWork({ ledger: api, notifications }, { handbackLimit: 1 });
+    expect(first.ok).toBe(false);
+    expect(first.failures).toBeGreaterThanOrEqual(1);
+    expect(first.examined).toBeGreaterThanOrEqual(2); // window A + window B
+    expect(posts.some((post) => post.title.includes('job-hb-2'))).toBe(false);
+
+    // Pass 2: the recovery works; the SAME failing prefix cannot starve the
+    // later eligible hand-back.
+    failing = false;
+    const second = reconcileDurableWork({ ledger: api, notifications }, { handbackLimit: 1 });
+    expect(second.handbacks.recovered + second.handbacks.published).toBeGreaterThanOrEqual(1);
+    expect(posts.some((post) => post.title.includes('job-hb-2'))).toBe(true);
+
+    // Pass 3: the skipped first obligation is retried once the window wraps.
+    reconcileDurableWork({ ledger: api, notifications }, { handbackLimit: 1 });
+    expect(posts.some((post) => post.title.includes('job-hb-1'))).toBe(true);
+  });
 });
+
