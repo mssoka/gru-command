@@ -218,7 +218,7 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       ['`Queued review handoff failed for job ${jobId}`', '{ jobId }'],
       ['`Review for job ${job.id} cannot gate: Perkins is unavailable and the fallback is not installed`', '{ jobId: job.id }'],
       ['`Perkins gate unavailable for job ${job.id} — the bmad-review gate is engaged`', '{ jobId: job.id }'],
-      ['`bmad-review gate PASS for job ${job.id} — clear to merge (merge stays user-held)`', '{ jobId: job.id }'],
+      ['`bmad-review gate PASS for job ${job.id} — review/fix routing cleared (missing Perkins gate escalated; merge stays user-held)`', '{ jobId: job.id }'],
       ['`bmad-review gate BLOCKED for job ${jobId}`', '{ jobId }'],
       ['`bmad-review gate ABORTED for job ${jobId}`', '{ jobId }'],
       ['`Perkins review for job ${input.job.id} was blocked before any round: the PR head could not be verified`', '{ jobId: input.job.id }'],
