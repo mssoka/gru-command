@@ -408,6 +408,28 @@ describe('pending re-brief terminal retirement (ledger boundary)', () => {
     expect(api.listJobEvents(jobId).filter((event) => event.kind === 'silas.rebrief-retired')).toHaveLength(1);
   });
 
+  it('retirement audit insertion failure rolls back marker deletion, then a retry commits once', () => {
+    const jobId = 'retire-audit-rollback';
+    api.addJob({ id: jobId, repo: 'terminal-retirement', title: 'rollback' });
+    api.setJobStatus(jobId, 'working');
+    const markers = api.beginPendingRebrief({ jobId, note: 'n', briefing: 'b' });
+    api.setJobStatus(jobId, 'in-review');
+    api.setJobStatus(jobId, 'merged');
+    db.handle.exec(`CREATE TRIGGER fail_retirement_audit BEFORE INSERT ON events
+      WHEN NEW.kind = 'silas.rebrief-retired' BEGIN SELECT RAISE(ABORT, 'audit blocked'); END`);
+    try {
+      expect(() => api.retirePendingRebriefs({ jobId, reason: 'terminal', candidates: candidatesOf(markers) }))
+        .toThrow(/audit blocked/u);
+      expect(api.listPendingRebriefs({ jobId }).map((row) => row.id)).toEqual(markers.map((row) => row.id));
+      expect(api.latestJobEvent(jobId, 'silas.rebrief-retired')).toBeNull();
+    } finally {
+      db.handle.exec('DROP TRIGGER fail_retirement_audit');
+    }
+    expect(api.retirePendingRebriefs({ jobId, reason: 'terminal', candidates: candidatesOf(markers) }).retired).toHaveLength(2);
+    expect(api.listPendingRebriefs({ jobId })).toHaveLength(0);
+    expect(api.listJobEvents(jobId).filter((event) => event.kind === 'silas.rebrief-retired')).toHaveLength(1);
+  });
+
   it('a stale snapshot never erases a newer request generation; nonterminal and missing jobs are refused', () => {
     const jobId = 'retire-generation';
     api.addJob({ id: jobId, repo: 'terminal-retirement', title: 'generation guard' });
@@ -487,6 +509,47 @@ describe('pending re-brief terminal retirement (ledger boundary)', () => {
     const audited = (audit?.payload as { retired?: readonly { id: string }[] }).retired ?? [];
     expect(audited.map((row) => row.id).sort()).toEqual(markers.map((marker) => marker.id).sort());
     expect(audited).toHaveLength(2); // one audit row per real marker, not per candidate
+  });
+
+  it('a marked retirement audits its own landed phase despite a newer foreign-phase event', () => {
+    const jobId = 'retire-phase-audit';
+    api.addJob({ id: jobId, repo: 'terminal-retirement', title: 'phase evidence' });
+    api.setJobStatus(jobId, 'working');
+    const markers = api.beginPendingRebrief({
+      jobId, note: 'n', briefing: 'b', handoff: { kind: 'gru-decision', decision: 'review' },
+    });
+    const phaseId = markers[0]!.phaseId;
+    expect(phaseId).not.toBeNull();
+    api.appendCustomEvent({ kind: 'silas.rebrief', jobId, payload: { phase_id: phaseId } });
+    api.appendCustomEvent({ kind: 'silas.rebrief', jobId, payload: { phase_id: 'foreign' } });
+    api.setJobStatus(jobId, 'in-review');
+    api.setJobStatus(jobId, 'merged');
+    api.retirePendingRebriefs({ jobId, reason: 'terminal', candidates: candidatesOf(markers) });
+    const retired = (api.latestJobEvent(jobId, 'silas.rebrief-retired')?.payload as {
+      retired: readonly { kind: string; guarded_event_landed: boolean }[];
+    }).retired;
+    expect(retired.find((row) => row.kind === 'silas.rebrief')?.guarded_event_landed).toBe(true);
+    expect(retired.find((row) => row.kind === 'job.delivered')?.guarded_event_landed).toBe(false);
+  });
+
+  it('a marked retirement audits its own event beyond the newest thousand unrelated job events', () => {
+    const jobId = 'retire-phase-window';
+    api.addJob({ id: jobId, repo: 'terminal-retirement', title: 'old phase evidence' });
+    api.setJobStatus(jobId, 'working');
+    const markers = api.beginPendingRebrief({
+      jobId, note: 'n', briefing: 'b', handoff: { kind: 'gru-decision', decision: 'review' },
+    });
+    api.appendCustomEvent({ kind: 'silas.rebrief', jobId, payload: { phase_id: markers[0]!.phaseId } });
+    api.appendCustomEvent({ kind: 'silas.rebrief', jobId, payload: { phase_id: 'foreign' } });
+    for (let i = 0; i < 1001; i++) api.appendCustomEvent({ kind: 'job.note', jobId, payload: { index: i } });
+    api.setJobStatus(jobId, 'in-review');
+    api.setJobStatus(jobId, 'merged');
+    api.retirePendingRebriefs({ jobId, reason: 'terminal', candidates: candidatesOf(markers) });
+    const retired = (api.latestJobEvent(jobId, 'silas.rebrief-retired')?.payload as {
+      retired: readonly { kind: string; guarded_event_landed: boolean }[];
+    }).retired;
+    expect(retired.find((row) => row.kind === 'silas.rebrief')?.guarded_event_landed).toBe(true);
+    expect(retired.find((row) => row.kind === 'job.delivered')?.guarded_event_landed).toBe(false);
   });
 
   it('the retirement audit recomputes guarded_event_landed from the ledger, not the caller', () => {

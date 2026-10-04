@@ -1124,6 +1124,129 @@ describe('dispatch server (E8)', () => {
     }
   });
 
+  it('/api/silas/rebrief reports a superseded ordinary turn without consuming newer markers', async () => {
+    let releasePrompt!: () => void;
+    const gate = new Promise<void>((resolve) => { releasePrompt = resolve; });
+    const h = await boot({ minionPromptGate: (text) => text.startsWith('Re-brief —') ? gate : undefined });
+    const repo = makeFixtureRepo('fixture-rebrief-superseded-http');
+    cleanupRepos.push(repo);
+    try {
+      await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'superseded-http', repo_path: repo.path, title: 'lane', briefing: 'contract',
+      }, TOKEN);
+      const initialDeadline = Date.now() + 10_000;
+      while (h.ledger.latestJobEvent('superseded-http', 'job.delivered') === null && Date.now() < initialDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const pending = call(h.port, 'POST', '/api/silas/rebrief', { job_id: 'superseded-http', note: 'older' }, TOKEN);
+      const deadline = Date.now() + 10_000;
+      while (!h.minionTurnTexts.some((text) => text.startsWith('Re-brief —')) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(h.minionTurnTexts.some((text) => text.startsWith('Re-brief —'))).toBe(true);
+      const newer = h.ledger.beginPendingRebrief({ jobId: 'superseded-http', note: 'newer', briefing: 'contract' });
+      h.ledger.setJobStatus('superseded-http', 'in-review');
+      releasePrompt();
+      const response = await pending;
+      expect(response.status).toBe(200);
+      expect(field<boolean>(response.json, 'superseded')).toBe(true);
+      expect(h.ledger.listPendingRebriefs({ jobId: 'superseded-http' })).toEqual(newer);
+      expect(h.ledger.getJob('superseded-http')?.status).toBe('in-review');
+      expect(h.ledger.latestJobEvent('superseded-http', 'silas.rebrief')).toBeNull();
+    } finally {
+      releasePrompt();
+      await h.close();
+    }
+  });
+
+  it('/api/silas/rebrief cancels a queued terminal request before disposing or spawning', async () => {
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const h = await boot({ workerGate: gate });
+    const repo = makeFixtureRepo('fixture-queued-terminal-http');
+    cleanupRepos.push(repo);
+    let holder: Awaited<ReturnType<PacingGate['acquireWorkerTurn']>> | null = null;
+    try {
+      await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'queued-terminal-http', repo_path: repo.path, title: 'lane', briefing: 'contract',
+      }, TOKEN);
+      const deadline = Date.now() + 10_000;
+      while (h.ledger.latestJobEvent('queued-terminal-http', 'job.delivered') === null && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      holder = await gate.acquireWorkerTurn({ id: 'holder', label: 'holder' });
+      const beforeSpawns = h.spawns.length;
+      const pending = call(h.port, 'POST', '/api/silas/rebrief', { job_id: 'queued-terminal-http', note: 'queued' }, TOKEN);
+      while (h.ledger.listPendingRebriefs({ jobId: 'queued-terminal-http' }).length !== 2 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(h.ledger.listPendingRebriefs({ jobId: 'queued-terminal-http' })).toHaveLength(2);
+      h.ledger.setJobStatus('queued-terminal-http', 'in-review');
+      h.ledger.setJobStatus('queued-terminal-http', 'merged');
+      holder.release();
+      holder = null;
+      const response = await pending;
+      expect(response.status).toBe(200);
+      expect(field<boolean>(response.json, 'retired')).toBe(true);
+      expect(h.spawns).toHaveLength(beforeSpawns);
+      expect(h.disposedHandles).toHaveLength(0);
+      expect(h.ledger.listPendingRebriefs({ jobId: 'queued-terminal-http' })).toHaveLength(0);
+      expect(h.ledger.listJobEvents('queued-terminal-http').filter((event) => event.kind === 'silas.rebrief-retired')).toHaveLength(1);
+    } finally {
+      holder?.release();
+      await h.close();
+    }
+  });
+
+  it('/api/silas/rebrief cancels a queued superseded unmarked request before disposal or spawn', async () => {
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const h = await boot({ workerGate: gate });
+    const repo = makeFixtureRepo('fixture-queued-superseded-http');
+    cleanupRepos.push(repo);
+    let holder: Awaited<ReturnType<PacingGate['acquireWorkerTurn']>> | null = null;
+    try {
+      await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'queued-superseded-http', repo_path: repo.path, title: 'lane', briefing: 'contract',
+      }, TOKEN);
+      const deadline = Date.now() + 10_000;
+      while (h.ledger.latestJobEvent('queued-superseded-http', 'job.delivered') === null && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const resident = h.ledger.listAgents().find((agent) => agent.jobId === 'queued-superseded-http' && agent.role === 'minion');
+      expect(resident).toBeDefined();
+      h.liveHandles.set(resident!.id, {
+        id: resident!.id, role: 'minion', sessionFile: null, capabilities: FAKE_CAPABILITIES,
+        async prompt() {}, async steer() {}, async followUp() {},
+        subscribe: () => () => {},
+        health: () => ({ state: 'idle', lastActivity: null, sessionFile: null }),
+        async dispose() {},
+      });
+      holder = await gate.acquireWorkerTurn({ id: 'holder', label: 'holder' });
+      const beforeSpawns = h.spawns.length;
+      const beforePrompts = h.minionTurnTexts.length;
+      const pending = call(h.port, 'POST', '/api/silas/rebrief', { job_id: 'queued-superseded-http', note: 'older' }, TOKEN);
+      while (h.ledger.listPendingRebriefs({ jobId: 'queued-superseded-http' }).length !== 2 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(h.ledger.listPendingRebriefs({ jobId: 'queued-superseded-http' })).toHaveLength(2);
+      const newer = h.ledger.beginPendingRebrief({ jobId: 'queued-superseded-http', note: 'newer', briefing: 'contract' });
+      h.ledger.setJobStatus('queued-superseded-http', 'in-review');
+      holder.release();
+      holder = null;
+      const response = await pending;
+      expect(response.status).toBe(200);
+      expect(field<boolean>(response.json, 'superseded')).toBe(true);
+      expect(h.ledger.listPendingRebriefs({ jobId: 'queued-superseded-http' })).toEqual(newer);
+      expect(h.ledger.getJob('queued-superseded-http')?.status).toBe('in-review');
+      expect(h.spawns).toHaveLength(beforeSpawns);
+      expect(h.disposedHandles).toHaveLength(0);
+      expect(h.minionTurnTexts).toHaveLength(beforePrompts);
+      expect(h.ledger.latestJobEvent('queued-superseded-http', 'silas.rebrief')).toBeNull();
+    } finally {
+      holder?.release();
+      await h.close();
+    }
+  });
+
   it('/api/silas/rebrief reports an administrative retirement when the job goes terminal mid-turn', async () => {
     let releasePrompt!: () => void;
     const gate = new Promise<void>((resolveGate) => {

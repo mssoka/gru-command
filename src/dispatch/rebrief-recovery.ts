@@ -154,11 +154,10 @@ export interface ReconcileReport {
  * marker (an older/other receipt cannot complete or cancel it).
  */
 export function pendingRebriefEventLanded(
-  ledger: Pick<LedgerApi, 'latestJobEvent'>,
+  ledger: Pick<LedgerApi, 'latestJobEvent' | 'listJobEvents'>,
   marker: PendingRebriefRecord,
 ): boolean {
-  const event = ledger.latestJobEvent(marker.jobId, marker.kind);
-  return event !== null && event.seq > marker.baselineSeq;
+  return pendingRebriefGuardedEvent(ledger, marker, marker.phaseId) !== null;
 }
 
 /** The marker's own guarded event, correlated to the phase when marked.
@@ -194,17 +193,21 @@ export function finalizeRebriefRequest(input: {
   readonly minionId: string | null;
   readonly lanePath: string | null;
   readonly note: string | null;
-  /** The phase identity this turn was started under (host-owned). When the
-   * markers now carry a DIFFERENT identity, a newer request replaced them
-   * mid-turn: skip recording entirely. Omitted = legacy callers (no fence). */
+  /** Request-generation snapshot from admission. Both marker ids and their
+   * payload/watermark identity must still match, including unmarked turns. */
+  readonly expectedMarkers?: readonly PendingRebriefRecord[];
+  /** Legacy phase-only callers; new turn callers pass expectedMarkers. */
   readonly expectedPhaseId?: string | null;
 }): PendingRebriefFinalize {
   const markers = input.ledger.listPendingRebriefs({ jobId: input.jobId });
   if (markers.length === 0) {
-    // No markers means the request already finalized (events landed) — a
-    // replay is a no-op, never a duplicate event. Every live re-brief
-    // begins its markers before it can reach here.
-    return { minionId: input.minionId, deliveredSha: null, deliveryNote: null, rebriefRecorded: false, deliveryRecorded: false, retired: false, retirement: null, superseded: false };
+    // No markers means there is nothing to finalize: a replay is a no-op.
+    // A turn with an admitted generation cannot claim recovery from this
+    // absence (the markers may have been retired or consumed elsewhere).
+    return { minionId: input.minionId, deliveredSha: null, deliveryNote: null, rebriefRecorded: false, deliveryRecorded: false, retired: false, retirement: null, superseded: input.expectedMarkers !== undefined };
+  }
+  if (input.expectedMarkers !== undefined && !sameRebriefGeneration(markers, input.expectedMarkers)) {
+    return { minionId: input.minionId, deliveredSha: null, deliveryNote: null, rebriefRecorded: false, deliveryRecorded: false, retired: false, retirement: null, superseded: true };
   }
   if (input.expectedPhaseId !== undefined) {
     const currentPhaseId = markers.find((marker) => marker.phaseId !== null)?.phaseId ?? null;
@@ -322,6 +325,29 @@ export function finalizeRebriefRequest(input: {
   // Markers clear ONLY now — every guarded event exists.
   input.ledger.clearPendingRebriefs(markers.map((marker) => marker.id));
   return { minionId: input.minionId, deliveredSha, deliveryNote, rebriefRecorded, deliveryRecorded, retired: false, retirement: null, superseded: false };
+}
+
+/** A replaced pair cannot be bound, completed, or retired by an older turn. */
+function sameRebriefGeneration(current: readonly PendingRebriefRecord[], expected: readonly PendingRebriefRecord[]): boolean {
+  return current.length === expected.length && expected.every((marker) => current.some((row) =>
+    row.id === marker.id && row.kind === marker.kind && row.payloadHash === marker.payloadHash &&
+    row.baselineSeq === marker.baselineSeq && row.phaseId === marker.phaseId));
+}
+
+export class RebriefTurnCancelled extends Error {
+  constructor(readonly reason: 'terminal' | 'superseded') {
+    super(`re-brief turn cancelled before admission: ${reason}`);
+    this.name = 'RebriefTurnCancelled';
+  }
+}
+
+/** Checked just before disposal/spawn and again after spawn, before prompt.
+ * No await may separate the check from the corresponding side effect. */
+export function checkRebriefTurn(ledger: Pick<LedgerApi, 'getJob' | 'listPendingRebriefs'>, jobId: string, expected: readonly PendingRebriefRecord[]): void {
+  if (!sameRebriefGeneration(ledger.listPendingRebriefs({ jobId }), expected)) throw new RebriefTurnCancelled('superseded');
+  const job = ledger.getJob(jobId);
+  if (job === null) throw new Error(`job "${jobId}" no longer exists — pending re-brief markers cannot be admitted`);
+  if (isJobTerminal(job.status)) throw new RebriefTurnCancelled('terminal');
 }
 
 /** Markers this process is actively recovering — a second reconcile pass
@@ -488,7 +514,7 @@ async function redispatchGroup(
       throwIfTurnInBandError(result);
       path = resumeFile !== null ? 'resumed' : 'redispatched';
     } catch (error) {
-      if (resumeFile === null) throw error;
+      if (resumeFile === null || error instanceof RebriefTurnCancelled) throw error;
       deps.log?.('warn', 're-brief resume failed — retrying with a fresh worker', {
         job: jobId,
         resume_file: resumeFile,
@@ -505,6 +531,7 @@ async function redispatchGroup(
       lanePath: result.lanePath,
       note,
       expectedPhaseId,
+      expectedMarkers: group,
     });
     if (finalized.retired) {
       // The job reached terminal while the recovered turn was in flight:
@@ -561,6 +588,18 @@ async function redispatchGroup(
       minion_id: result.minionId,
     });
   } catch (error) {
+    if (error instanceof RebriefTurnCancelled) {
+      const finalized = finalizeRebriefRequest({
+        ledger: deps.ledger, worktrees: deps.worktrees, jobId,
+        minionId: null, lanePath: null, note: null, expectedMarkers: group,
+      });
+      deps.log?.('info', 're-brief recovery cancelled before admission', {
+        job: jobId, reason: error.reason, retired: finalized.retired,
+        superseded: finalized.superseded,
+        ...(finalized.retirement !== null ? { refused: finalized.retirement.refused, skipped: finalized.retirement.skippedIds } : {}),
+      });
+      return;
+    }
     if (deps.stopping?.() === true) {
       // Shutdown killed the turn, not a recovery failure: markers stay for
       // the next boot, and no incident is posted for a planned restart.
@@ -599,6 +638,7 @@ function runRebriefTurn(
     note: input.note,
     briefing: input.briefing,
     ...(input.resumeFile !== undefined ? { resumeFile: input.resumeFile } : {}),
+    beforeTurnSideEffect: () => checkRebriefTurn(deps.ledger, input.jobId, input.group),
     onSpawned: (worker) => {
       deps.ledger.bindPendingRebriefWorker({
         ids: input.group.map((marker) => marker.id),

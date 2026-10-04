@@ -52,7 +52,9 @@ afterAll(() => {
 class FakeAgents implements DirectiveRegistry {
   readonly workers: { id: string; role: Role; options: SpawnOptions; prompts: string[] }[] = [];
   readonly disposed: string[] = [];
+  readonly disposedSpawned: string[] = [];
   failSpawn: Error | null = null;
+  afterSpawn: (() => void) | null = null;
   failPrompt: Error | null = null;
   /** When set, every handle's health() reports an in-band runtime error —
    * the fulfilled-but-failed outcome both real adapters can produce. */
@@ -76,6 +78,7 @@ class FakeAgents implements DirectiveRegistry {
     const id = `worker-${this.workers.length + 1}`;
     const record = { id, role, options, prompts: [] as string[] };
     this.workers.push(record);
+    this.afterSpawn?.();
     return this.handleFor(record);
   }
 
@@ -88,6 +91,7 @@ class FakeAgents implements DirectiveRegistry {
     const failPrompt = (): Error | null => this.failPrompt;
     const healthState = (): 'idle' | 'error' => this.healthState;
     const healthError = (): string | null => this.healthError;
+    const disposedSpawned = this.disposedSpawned;
     return {
       role: record.role,
       id: record.id,
@@ -111,7 +115,7 @@ class FakeAgents implements DirectiveRegistry {
           ? { state: 'error' as const, lastActivity: null, sessionFile: null, ...(error === null ? {} : { error }) }
           : { state: 'idle' as const, lastActivity: null, sessionFile: null };
       },
-      async dispose(): Promise<void> {},
+      async dispose(): Promise<void> { disposedSpawned.push(record.id); },
     };
   }
 }
@@ -497,6 +501,105 @@ describe('re-brief restart safety (durable markers)', () => {
 });
 
 describe('terminal re-brief retirement', () => {
+  it('an older unmarked turn cannot complete or consume a newer ordinary request', async () => {
+    const h = makeHarness();
+    const jobId = 'unmarked-generation-job';
+    await seedPendingRebrief({ h, jobId });
+    const older = h.ledger.listPendingRebriefs({ jobId });
+    const newer = h.ledger.beginPendingRebrief({ jobId, note: 'new request', briefing: 'the original contract' });
+    h.ledger.setJobStatus(jobId, 'in-review');
+    const result = finalizeRebriefRequest({
+      ledger: h.ledger, worktrees: h.worktrees, jobId, minionId: 'old-worker',
+      lanePath: h.lanePath, note: 'old request', expectedMarkers: older,
+    });
+    expect(result.superseded).toBe(true);
+    expect(h.ledger.listPendingRebriefs({ jobId })).toEqual(newer);
+    expect(h.ledger.getJob(jobId)?.status).toBe('in-review');
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief')).toBeNull();
+    expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).toBeNull();
+  });
+
+  it('terminal finalization ignores foreign-phase events and retires its own markers', async () => {
+    const h = makeHarness();
+    const jobId = 'foreign-phase-finalize';
+    await seedPendingRebrief({ h, jobId });
+    const markers = h.ledger.beginPendingRebrief({
+      jobId, note: 'phase request', briefing: 'the original contract',
+      handoff: { kind: 'gru-decision', decision: 'keep going' },
+    });
+    h.ledger.appendCustomEvent({ kind: 'silas.rebrief', jobId, payload: { phase_id: 'foreign' } });
+    h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { phase_id: 'foreign' } });
+    merge(h, jobId);
+    const result = finalizeRebriefRequest({
+      ledger: h.ledger, worktrees: h.worktrees, jobId, minionId: 'worker',
+      lanePath: h.lanePath, note: 'phase request', expectedMarkers: markers,
+    });
+    expect(result.retired).toBe(true);
+    expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(0);
+    expect(retiredAudit(h, jobId)).toHaveLength(2);
+    expect(retiredAudit(h, jobId).every((row) => row.guarded_event_landed === false)).toBe(true);
+    expect(h.ledger.listJobEvents(jobId).filter((event) =>
+      event.kind === 'silas.rebrief' || event.kind === 'job.delivered')).toHaveLength(2);
+    expect(h.ledger.getJob(jobId)?.status).toBe('merged');
+  });
+
+  it('terminality while queued for a worker slot cancels before disposal or spawn and audits once', async () => {
+    const h = makeHarness();
+    const jobId = 'queued-terminal-job';
+    await seedPendingRebrief({ h, jobId });
+    h.ledger.registerAgent({ id: 'resident', role: 'minion', jobId });
+    await h.registry.spawn('minion');
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const holder = await gate.acquireWorkerTurn({ id: 'holder', label: 'holder' });
+    let released = false;
+    try {
+      const report = await reconcilePendingRebriefs({ ...deps(h), workerGate: gate }, { bootAt: new Date(Date.now() + 60_000) });
+      expect(report.redispatched).toBe(1);
+      merge(h, jobId);
+      holder.release();
+      released = true;
+      await report.settled;
+      expect(h.registry.workers).toHaveLength(1);
+      expect(h.registry.disposed).toHaveLength(0);
+      expect(h.registry.workers[0]?.prompts).toHaveLength(0);
+      expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(0);
+      expect(h.ledger.listJobEvents(jobId).filter((event) => event.kind === 'silas.rebrief-retired')).toHaveLength(1);
+      expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-recovered')).toBeNull();
+      expect(h.ledger.listNotifications().filter((row) => row.kind === `silas.rebrief-unreconciled.${jobId}`)).toHaveLength(0);
+    } finally {
+      if (!released) holder.release();
+    }
+  });
+
+  it('terminality during asynchronous spawn prevents binding and prompting the spawned worker', async () => {
+    const h = makeHarness();
+    const jobId = 'spawn-terminal-job';
+    await seedPendingRebrief({ h, jobId });
+    h.registry.afterSpawn = () => merge(h, jobId);
+    const report = await reconcilePendingRebriefs(deps(h), { bootAt: new Date(Date.now() + 60_000) });
+    await report.settled;
+    expect(h.registry.workers).toHaveLength(1);
+    expect(h.registry.workers[0]?.prompts).toHaveLength(0);
+    expect(h.registry.disposedSpawned).toEqual(['worker-1']);
+    expect(h.ledger.listAgents().find((agent) => agent.id === 'worker-1')).toBeUndefined();
+    expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(0);
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-retired')).not.toBeNull();
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief')).toBeNull();
+    expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).toBeNull();
+    expect(h.ledger.listNotifications().filter((row) => row.kind === `silas.rebrief-unreconciled.${jobId}`)).toHaveLength(0);
+  });
+
+  it('same-generation nonterminal finalization records both guarded events once', async () => {
+    const h = makeHarness();
+    const jobId = 'same-generation-job';
+    await seedPendingRebrief({ h, jobId });
+    const markers = h.ledger.listPendingRebriefs({ jobId });
+    const input = { ledger: h.ledger, worktrees: h.worktrees, jobId, minionId: 'worker', lanePath: h.lanePath, note: 'n', expectedMarkers: markers };
+    expect(finalizeRebriefRequest(input)).toMatchObject({ rebriefRecorded: true, deliveryRecorded: true, superseded: false });
+    expect(finalizeRebriefRequest(input)).toMatchObject({ rebriefRecorded: false, deliveryRecorded: false });
+    expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(0);
+    expect(h.ledger.listJobEvents(jobId).filter((event) => event.kind === 'silas.rebrief' || event.kind === 'job.delivered')).toHaveLength(2);
+  });
   function deps(h: Harness): {
     registry: FakeAgents;
     ledger: LedgerApi;

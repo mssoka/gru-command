@@ -387,6 +387,9 @@ export async function rebriefFreshMinion(
      * delivered — the durable re-brief marker binds the worker here, so a
      * crash mid-turn leaves a resumable pointer behind. */
     onSpawned?: (worker: { readonly id: string; readonly sessionFile: string | null }) => void;
+    /** Recheck request ownership and terminality at the last asynchronous
+     * admission boundaries; a running prompt is allowed to settle. */
+    beforeTurnSideEffect?: () => void;
   },
 ): Promise<{
   minionId: string;
@@ -399,18 +402,6 @@ export async function rebriefFreshMinion(
   outcome: 'completed' | 'error';
   error?: string;
 }> {
-  const jobMinions = input.ledger
-    .listAgents()
-    .filter((agent) => agent.jobId === input.jobId && agent.role === 'minion');
-  for (const minion of jobMinions) {
-    const handle = input.registry.getHandle(minion.id);
-    if (handle === null) continue;
-    await input.registry.disposeHandle(handle).catch((error: unknown) => {
-      throw new Error(
-        `could not retire the prior minion session ${minion.id} before re-briefing: ${String(error)}`,
-      );
-    });
-  }
   const lane = input.worktrees
     .listWorktrees({ jobId: input.jobId })
     .find((candidate) => candidate.kind === 'job' && candidate.status !== 'swept');
@@ -428,10 +419,33 @@ export async function rebriefFreshMinion(
     });
   }
   try {
+    input.beforeTurnSideEffect?.();
+    const jobMinions = input.ledger
+      .listAgents()
+      .filter((agent) => agent.jobId === input.jobId && agent.role === 'minion');
+    for (const minion of jobMinions) {
+      const prior = input.registry.getHandle(minion.id);
+      if (prior === null) continue;
+      await input.registry.disposeHandle(prior).catch((error: unknown) => {
+        throw new Error(
+          `could not retire the prior minion session ${minion.id} before re-briefing: ${String(error)}`,
+        );
+      });
+      input.beforeTurnSideEffect?.();
+    }
+    input.beforeTurnSideEffect?.();
     const handle = await input.registry.spawn('minion', {
       cwd,
       ...(input.resumeFile !== undefined && input.resumeFile !== null ? { resumeFile: input.resumeFile } : {}),
     });
+    try {
+      input.beforeTurnSideEffect?.();
+    } catch (error) {
+      // Spawn completed but admission did not: do not orphan an unbound
+      // handle when terminality or a newer request cancels this turn.
+      await handle.dispose();
+      throw error;
+    }
     input.ledger.registerAgent({
       id: handle.id,
       role: 'minion',

@@ -1606,8 +1606,14 @@ export class LedgerApi {
           skippedIds.push(candidate.id);
           continue;
         }
-        const latest = this.latestJobEvent(row.jobId, row.kind);
-        guardedEventLanded.set(row.id, latest !== null && latest.seq > row.baselineSeq);
+        const landed = row.phaseId === null
+          ? (this.latestJobEvent(row.jobId, row.kind)?.seq ?? 0) > row.baselineSeq
+          : this.db.prepare(
+            `SELECT 1 FROM events
+             WHERE job_id = ? AND kind = ? AND seq > ? AND json_extract(payload, '$.phase_id') = ?
+             LIMIT 1`,
+          ).get(row.jobId, row.kind, row.baselineSeq, row.phaseId) !== undefined;
+        guardedEventLanded.set(row.id, landed);
         retired.push(row);
       }
       if (retired.length === 0) {
