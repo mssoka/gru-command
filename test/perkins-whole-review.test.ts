@@ -414,6 +414,23 @@ describe('Perkins whole-PR lead engine', () => {
     expect(h.childCalls.some((call) => call.prompt!.includes('"source": "operations"'))).toBe(true);
   });
 
+  it('a performance and an operations finding survive child validation, lead submission and attribution', async () => {
+    const h = wholeHarness({
+      childAnswer: (prompt) => {
+        const source = /"source": "(performance|operations)"/u.exec(prompt)?.[1];
+        return source === undefined ? '[]' : JSON.stringify([groundedFinding(source, 'warning')]);
+      },
+    });
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    // Attribution is by the NEW source ids and nothing else: each finding
+    // crossed child validation, lead consolidation and the submission schema.
+    expect(result.findings.map((finding) => finding.source).sort()).toEqual(['operations', 'performance']);
+    expect(result.specialistRuns
+      .filter((run) => run.lens === 'performance' || run.lens === 'operations')
+      .every((run) => run.status === 'valid' && run.attempt === 1)).toBe(true);
+  });
+
   it('a REQUEST_CHANGES review is successful completion, not an orchestration failure', async () => {
     const h = wholeHarness({
       childAnswer: (prompt) => (prompt.includes('"source": "security"')
@@ -2095,7 +2112,13 @@ describe('wave refusals never consume lens or round budget (H1)', () => {
       { selected: catalog, expected: [catalog.slice(0, 3), catalog.slice(3, 6), catalog.slice(6, 9)] },
     ];
     for (const { selected, expected } of cases) {
-      const h = waveHarness({ childAnswer: () => '[]', specialists: selected }, 3);
+      const h = waveHarness({
+        childAnswer: (prompt) => {
+          const source = /"source": "(blind|tests)"/u.exec(prompt)?.[1];
+          return source === undefined ? '[]' : JSON.stringify([groundedFinding(source, 'warning')]);
+        },
+        specialists: selected,
+      }, 3);
       const result = await h.engine.run({
         roundId: 'wave-refusal-round', roundNumber: 1, frozenReview: h.frozen,
         movementRef: 'feature/review', noSpec: false,
@@ -2107,6 +2130,14 @@ describe('wave refusals never consume lens or round budget (H1)', () => {
       expect(h.fake.childCalls).toHaveLength(selected.length);
       expect(result.specialistRuns).toHaveLength(selected.length);
       expect(result.specialistRuns.every((run) => run.status === 'valid' && run.attempt === 1)).toBe(true);
+      // Findings delivered by the FIRST and LAST batch survive together: a
+      // batch split is a transport detail, never a dropped or duplicated review.
+      expect(result.findings.map((finding) => finding.source).sort()).toEqual(['blind', 'tests']);
+      // Every batch is accounted in the SAME single lead receipt: no later
+      // batch or retry creates a second round or lead.
+      const receipt = JSON.parse(readFileSync(join(result.artifactDirectory, 'lead/receipt.json'), 'utf8')) as { specialistRuns: number };
+      expect(receipt.specialistRuns).toBe(selected.length);
+      expect(result.artifactDirectory).toContain('wave-refusal-round');
       // The scripted lead opens with the schema-maximum 4-run call at an
       // admitted wave of 3: refused before any child starts and fully
       // restored (each lens still lands on attempt 1), then re-batched.
@@ -2131,6 +2162,10 @@ describe('wave refusals never consume lens or round budget (H1)', () => {
     expect(result.specialistRuns.every((run) => run.attempt === 1 || run.attempt === 2)).toBe(true);
     const receipt = JSON.parse(readFileSync(join(result.artifactDirectory, 'lead/receipt.json'), 'utf8')) as { specialistRuns: number };
     expect(receipt.specialistRuns).toBe(16);
+    // The refusal is durable coverage truth, not only a transient tool error:
+    // the result carries the refused call, the cap, and the runs accounted at
+    // refusal time so a report can disclose budget-limited coverage.
+    expect(result.budgetRefusals).toMatchObject([{ lenses: ['performance', 'operations'], cap: 16, accountedRuns: 16 }]);
     // The refused call was otherwise per-lens eligible — performance and
     // operations still had one attempt each — and the ROUND budget refuses
     // it before any spawn: both keep their single recorded attempt.

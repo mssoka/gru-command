@@ -485,7 +485,7 @@ describe('dispatch server (E8)', () => {
   });
 
 
-  it('accepts explicit no_spec=true as six lenses and rejects non-boolean no_spec', async () => {
+  it('accepts explicit no_spec=true as eight lenses and rejects non-boolean no_spec', async () => {
     const h = await boot();
     const repo = makeFixtureRepo('fixture-http-no-spec');
     cleanupRepos.push(repo);

@@ -1289,7 +1289,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       // Concurrency note: a hybrid round runs as many concurrent lens
       // children as its admitted wave allows (the catalog has nine lenses);
       // each gets its OWN bridge, and none may outlive its session.
-      for (let index = 0; index < 7; index += 1) {
+      for (let index = 0; index < 9; index += 1) {
         const handle = await fx.runtime.spawn('perkins', {
           cwd: fx.workspace,
           isolatedReview: {
@@ -1312,8 +1312,8 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         expect(existsSync(dirname(configFile))).toBe(true);
       }
       // Distinct bridges, one per child — never a shared cross-child bridge.
-      expect(new Set(configFiles).size).toBe(7);
-      for (let index = 0; index < 7; index += 1) {
+      expect(new Set(configFiles).size).toBe(9);
+      for (let index = 0; index < 9; index += 1) {
         const listed = await bridgeProbe(configFiles[index]!, '__list__', {}) as Array<{ name: string }>;
         expect(listed.map((tool) => tool.name)).toEqual([`perkins_child_${index}`]);
       }

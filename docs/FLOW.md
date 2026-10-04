@@ -178,15 +178,18 @@ Lenses the lead did not use are reported as `not used`, never as coverage.
   and child review behavior; interpolated repository/spec/convention text is
   untrusted evidence, never instruction. The host bounds attempts,
   concurrency, candidate/report bytes, and wall time; records every child;
-  verifies exact coverage, candidate ownership,
+  verifies exact run accounting (selected lenses, attempts, round budget),
+  candidate ownership,
   frozen-commit evidence, prior audit, source stability, report contents,
   delivery, and canonical blocker arithmetic. Zero blockers is READY TO
   MERGE, 1–3 is NEEDS CHANGES, and 4+ is MAJOR REWORK NEEDED. Warnings and
   notes never block.
 - A malformed child output consumes one attempt and may be retried within the
-  pinned bound. Any exhausted attempt, cancellation, restart, changed
-  source/checkout, unsupported evidence, invalid audit, missing coverage,
-  or delivery failure durably terminalizes the round as INCOMPLETE. It can
+  pinned bound; a failed or exhausted specialist attempt is recorded
+  lens-failure truth and never terminalizes the round by itself.
+  Cancellation, restart, changed
+  source/checkout, unsupported evidence, invalid audit, or delivery failure
+  durably terminalizes the round as INCOMPLETE. It can
   neither post nor record approval. Startup reconciliation marks interrupted
   rounds INCOMPLETE and releases their owned detached lanes.
 - The base is changed source only when the locally resolved base ref no
