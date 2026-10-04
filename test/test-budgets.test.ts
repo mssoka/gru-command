@@ -23,11 +23,16 @@ import {
  * rename surfaces here instead of silently dropping out of the policy.
  */
 
-/** The ten Test-timed-out cases from the failed host run on 78724dc. */
+/** The ten timed-out cases from 78724dc, including every explicit
+ * descendant of the two formerly grouped cases split on this branch. */
 const OBSERVED_TIMEOUTS: readonly { readonly file: string; readonly name: string }[] = [
   {
     file: 'dispatch-server.test.ts',
-    name: 'by=silas on the pr/review endpoints records silas attribution events; without by it does not',
+    name: 'by=silas on the pr/review endpoints records silas attribution events',
+  },
+  {
+    file: 'dispatch-server.test.ts',
+    name: 'without by, the pr/review endpoints record no silas attribution events',
   },
   {
     file: 'install-one-line.test.ts',
@@ -59,7 +64,19 @@ const OBSERVED_TIMEOUTS: readonly { readonly file: string; readonly name: string
   },
   {
     file: 'perkins-whole-review.test.ts',
-    name: 'rejects an empty/missing verdict, an empty report, and a report omitting the verdict line or frozen identity',
+    name: 'report rejection: a missing verdict is refused',
+  },
+  {
+    file: 'perkins-whole-review.test.ts',
+    name: 'report rejection: an empty report is refused',
+  },
+  {
+    file: 'perkins-whole-review.test.ts',
+    name: 'report rejection: a report omitting the verdict line is refused',
+  },
+  {
+    file: 'perkins-whole-review.test.ts',
+    name: 'report rejection: a report omitting the frozen identity is refused',
   },
   {
     file: 'wizard.test.ts',
@@ -163,6 +180,14 @@ describe('workload-aware test budgets', () => {
     expect(Object.keys(scopes).length).toBeGreaterThan(0);
     const heavyPaths = heavyTestPaths();
     for (const [scope, command] of Object.entries(scopes)) {
+      // This diagnostic intentionally runs inside a 9bb51b0 git archive,
+      // before the heavy config existed. It is an expected-RED baseline,
+      // not a current-tree verification segment; every live scope stays
+      // subject to the routing guard below.
+      if (scope === 'perkins-stage1-baseline') {
+        expect(command).toContain('git archive "$base"');
+        continue;
+      }
       for (const segment of command.split('&&').map((part) => part.trim())) {
         if (segment.includes('--config vitest.heavy.config.ts')) {
           // The heavy include is an explicit list: a fast file named here is

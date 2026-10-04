@@ -33,8 +33,19 @@ export function attachBareOrigin(repo: FixtureRepo): string {
   return origin;
 }
 
-export function makeFixtureRepo(name = 'fixture-app'): FixtureRepo {
+/** Fixture-prep primitive steps reported by makeFixtureRepo's optional
+ * `onStep` observer (T4 attribution, phase pr144-t4-deep-attribution-20261001).
+ * Each pip fires AFTER its primitive completes; callers derive durations from
+ * the monotonic gaps. Pure observation — bytes, ordering, and git behavior
+ * are identical for every caller that omits it (all pre-existing callers do). */
+export type FixtureRepoStep = 'tempdir' | 'git-init' | 'seed-files' | 'initial-commit';
+
+export function makeFixtureRepo(
+  name = 'fixture-app',
+  onStep?: (step: FixtureRepoStep) => void,
+): FixtureRepo {
   const dir = mkdtempSync(join(tmpdir(), 'gru-command-fixture-'));
+  onStep?.('tempdir');
   const path = join(dir, name);
   mkdirSync(path, { recursive: true });
   const git = (args: readonly string[], cwd: string = path): string =>
@@ -45,11 +56,18 @@ export function makeFixtureRepo(name = 'fixture-app'): FixtureRepo {
       stdio: ['ignore', 'pipe', 'pipe'],
     }).trim();
   git(['init', '-b', 'main']);
+  onStep?.('git-init');
   writeFileSync(join(path, 'README.md'), `# ${name}\n\nFixture repository for dispatch-flow tests.\n`);
   mkdirSync(join(path, 'src'), { recursive: true });
   writeFileSync(join(path, 'src', 'main.ts'), 'export function answer(): number {\n  return 42;\n}\n');
+  onStep?.('seed-files');
+  // Historical two-process shape (restored 2026-10-02): `git commit --include .`
+  // cannot stage untracked files on a fresh repository — it failed the 26e32a8
+  // FULL with "pathspec '.' did not match any file(s) known to git" — so the
+  // initial commit keeps `git add .` + `git commit` exactly as authored.
   git([...GIT_IDENTITY, 'add', '.']);
   git([...GIT_IDENTITY, 'commit', '-m', 'fixture: initial state']);
+  onStep?.('initial-commit');
   markFixtureStep(`fixture repo initialized: ${name}`);
 
   const repo: FixtureRepo = {

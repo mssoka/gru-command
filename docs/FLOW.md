@@ -65,8 +65,52 @@ working/pushing the target branch (`dispatched`/`working` with no settled
 delivery for its current attempt), the API answers `409 branch_busy` with
 `blockers: [{job_id, status, branch}]` and the same check re-runs
 immediately before the freeze, so a lane re-opened mid-setup is refused
-the same way. The arm passes once the lane delivers. `force: true` is the
-human override; a forced round is tagged in its frozen manifest
+the same way. The same recheck runs after a failed pre-flight and before
+the bmad-review fallback gate admits — a re-brief or lane re-open landing
+during the awaited pre-flight refuses the fallback arm (409, or a queued
+replay re-queue) instead of starting a fallback reviewer; the fallback
+recheck enters through the same `arm`-phase guard, so a forced fallback
+admission carries two `arm`-phase `branch-idle.forced` records where the
+native route carries `arm` + `freeze`. A running fallback gate also
+re-proves its lane, marker and replay-authorization facts at each round
+intake, after the default reviewer's worker admission and asynchronous
+spawn, and after the reviewer returns. It compares the current attempt,
+delivery and branch owners to the audited admission snapshot: a new working
+attempt, newly busy foreign lane, or replaced checkout cannot approve the
+old diff. `force` in the fallback covers only blockers present at the
+original arm, not a new request during preflight or an active reviewer.
+It also compares the durable re-brief settlement watermark from admission
+and each round's diff intake: a request that begins and settles while the
+reviewer runs cannot approve the old diff. Those boundary re-proofs
+emit no branch-idle audit rows: at admission a replay whose job is
+blocked/parked is HELD (`job.review-handoff-held` plus escalation,
+requiring a new validated request), while after admission the gate stops
+as `job.fallback-review` phase `aborted` with a free-text reason and no
+held identity. Terminal (`merged`/`done`) jobs take the canonical
+terminal refusal before any busy check — a stale marker never answers
+`branch_busy` and never resurrects the job. The reviewed job's OWN
+unresolved request fences the review regardless of an explicit
+`target_ref` naming another lane; unrelated foreign lanes keep their own
+branch-matched busy semantics. A `blocked` gate terminal reports the
+failing round in `iterations`; an `aborted` terminal reports only
+completed rounds (the aborted event's `iteration` names the round not
+taken). The arm passes
+only when the target work is genuinely
+settled AND no re-brief request is unresolved — a delivery alone does not
+release a fenced lane. A lane with an unresolved re-brief request counts
+busy the same way: the durable pending markers written before a re-brief
+worker spawns (cleared only when the request genuinely settles, via
+finalization or boot recovery) fence the target regardless of an older
+delivery or a status flip — the fence can coexist with a delivered or
+in-review status — and the Silas digest rechecks every proposed review
+at final publication, after any async blocker-history work. A live re-brief
+finalizer matches the exact admitted marker IDs as well as any phase ID:
+ordinary requests have no phase ID, so an older turn cannot consume a
+newer request's markers. Settlement publishes `silas.rebrief-settled`
+after marker retirement, so a queued handoff that re-queued on the
+earlier delivery can retry without waiting for another sweep. `force: true` is the owner's explicit override —
+never an automatic operations action; a forced round is tagged in its
+frozen manifest
 (`branchIdle`) and the event log (`branch-idle.forced`), refusals land as
 `branch-idle.refused`, and a Silas auto-arm deferral lands as
 `silas.review-deferred` (retry on the next sweep). For a job
@@ -518,8 +562,10 @@ known failure classes, sweep acks under recorded rules. Gru keeps the
 judgments: rulings, merges, and novel failures. One standing rule from the
 2026-09-23 freeze: never auto-arm a review round on a branch while a
 rebase/force-push lane is active on the same target (the round races the
-push and dies obsolete); arm after the lane delivery settles. Service
-restarts remain manual until self-roll-34 lands.
+push and dies obsolete); arm only after the lane genuinely settles — the
+attempt delivered AND no unresolved re-brief request standing (marker/
+control settlement, not delivery alone; see the branch-idle guard
+section). Service restarts remain manual until self-roll-34 lands.
 
 ## Bob (periodic memory)
 

@@ -23,7 +23,7 @@ import { ReviewMcpBridge } from '../src/runtime/review-mcp-bridge.js';
 import { finalAssistantText } from '../src/dispatch/perkins-review/session-output.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 import { PacingGate, type PacingAcquireInput, type PacingLease } from '../src/runtime/pacing.js';
-import { fakeWholeSpawner, groundedFinding, type WholeLeadOptions, type WholeSpawnCall, type WholeSubmission } from './helpers/perkins-whole-double.js';
+import { fakeWholeSpawner, groundedFinding, type WholeLeadOptions, type WholeSpawnCall } from './helpers/perkins-whole-double.js';
 import type { NativeAgentTool } from '../src/runtime/types.js';
 
 const repos: FixtureRepo[] = [];
@@ -497,21 +497,46 @@ describe('Perkins whole-PR lead engine', () => {
     expect(preflight.errors.map((error) => error.rule)).toContain('submission-verdict');
   });
 
-  it('rejects an empty/missing verdict, an empty report, and a report omitting the verdict line or frozen identity', async () => {
-    const cases: ReadonlyArray<{ name: string; mutate: (submission: WholeSubmission) => Record<string, unknown>; pattern: RegExp }> = [
-      { name: 'missing verdict', mutate: (s) => ({ ...s, verdict: undefined }), pattern: /submission-verdict/ },
-      { name: 'empty report', mutate: (s) => ({ ...s, report_markdown: '' }), pattern: /report-shape/ },
-      { name: 'verdict line missing', mutate: (s) => ({ ...s, report_markdown: s.report_markdown.replace(/\*\*Verdict: READY TO MERGE\*\*/, '**Verdict: UNKNOWN**') }), pattern: /report-verdict/ },
-      { name: 'frozen identity missing', mutate: (s) => ({ ...s, report_markdown: s.report_markdown.replace(/^Frozen target: .+$/m, 'Frozen target: redacted') }), pattern: /report-identity/ },
-    ];
-    for (const testCase of cases) {
-      const h = wholeHarness({
-        ...ALL_CLEAN,
-        submitPayload: (_attempt, submission) => testCase.mutate(submission) as never,
-        submitRetries: 0,
-      });
-      await expect(h.run()).rejects.toThrow(testCase.pattern);
-    }
+  it('report rejection: a missing verdict is refused', async () => {
+    const h = wholeHarness({
+      ...ALL_CLEAN,
+      submitPayload: (_attempt, submission) => ({ ...submission, verdict: undefined }) as never,
+      submitRetries: 0,
+    });
+    await expect(h.run()).rejects.toThrow(/submission-verdict/);
+  });
+
+  it('report rejection: an empty report is refused', async () => {
+    const h = wholeHarness({
+      ...ALL_CLEAN,
+      submitPayload: (_attempt, submission) => ({ ...submission, report_markdown: '' }) as never,
+      submitRetries: 0,
+    });
+    await expect(h.run()).rejects.toThrow(/report-shape/);
+  });
+
+  it('report rejection: a report omitting the verdict line is refused', async () => {
+    const h = wholeHarness({
+      ...ALL_CLEAN,
+      submitPayload: (_attempt, submission) => ({
+        ...submission,
+        report_markdown: submission.report_markdown.replace(/\*\*Verdict: READY TO MERGE\*\*/, '**Verdict: UNKNOWN**'),
+      }) as never,
+      submitRetries: 0,
+    });
+    await expect(h.run()).rejects.toThrow(/report-verdict/);
+  });
+
+  it('report rejection: a report omitting the frozen identity is refused', async () => {
+    const h = wholeHarness({
+      ...ALL_CLEAN,
+      submitPayload: (_attempt, submission) => ({
+        ...submission,
+        report_markdown: submission.report_markdown.replace(/^Frozen target: .+$/m, 'Frozen target: redacted'),
+      }) as never,
+      submitRetries: 0,
+    });
+    await expect(h.run()).rejects.toThrow(/report-identity/);
   });
 
   it('preflight is free and exhaustive; a rejected submission is corrected and accepted within the real attempt bound', async () => {

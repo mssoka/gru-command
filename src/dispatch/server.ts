@@ -719,6 +719,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         lanePath: result.lanePath,
         note,
         expectedPhaseId: rebriefPhaseId,
+        expectedMarkerIds: markers.map((marker) => marker.id),
       });
       if (followUp.superseded) {
         log('warn', 're-brief request superseded while its turn ran — newer request owns the lane', {

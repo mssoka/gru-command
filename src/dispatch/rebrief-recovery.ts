@@ -142,6 +142,13 @@ function pendingRebriefGuardedEvent(
   return null;
 }
 
+function publishRebriefSettlement(ledger: LedgerApi, jobId: string): void {
+  // Unlike job.delivered, this event is published AFTER marker retirement.
+  // Queued review handoffs can now retry without treating an old delivery
+  // as proof that a newer re-brief has settled.
+  ledger.appendCustomEvent({ kind: 'silas.rebrief-settled', jobId });
+}
+
 /**
  * Record a settled re-brief turn's events and clear its markers. Idempotent
  * per marker: an event that already landed since the request watermark is
@@ -159,6 +166,9 @@ export function finalizeRebriefRequest(input: {
    * markers now carry a DIFFERENT identity, a newer request replaced them
    * mid-turn: skip recording entirely. Omitted = legacy callers (no fence). */
   readonly expectedPhaseId?: string | null;
+  /** The exact marker generation admitted for this turn. Ordinary requests
+   * have no phase ID, so phase comparison alone cannot fence a replacement. */
+  readonly expectedMarkerIds?: readonly string[];
 }): PendingRebriefFinalize {
   const markers = input.ledger.listPendingRebriefs({ jobId: input.jobId });
   if (markers.length === 0) {
@@ -174,9 +184,12 @@ export function finalizeRebriefRequest(input: {
       superseded: false,
     };
   }
-  if (input.expectedPhaseId !== undefined) {
+  if (input.expectedPhaseId !== undefined || input.expectedMarkerIds !== undefined) {
     const currentPhaseId = markers.find((marker) => marker.phaseId !== null)?.phaseId ?? null;
-    if (currentPhaseId !== input.expectedPhaseId) {
+    const expectedIds = input.expectedMarkerIds;
+    const markerIdsMatch = expectedIds === undefined ||
+      (markers.length === expectedIds.length && markers.every((marker) => expectedIds.includes(marker.id)));
+    if ((input.expectedPhaseId !== undefined && currentPhaseId !== input.expectedPhaseId) || !markerIdsMatch) {
       // A newer request's markers own the lane now: this settled turn's
       // events must NOT be recorded against them (an older receipt cannot
       // complete a newer phase), and the newer markers must stay pending.
@@ -242,6 +255,7 @@ export function finalizeRebriefRequest(input: {
 
   // Markers clear ONLY now — every guarded event exists.
   input.ledger.clearPendingRebriefs(markers.map((marker) => marker.id));
+  publishRebriefSettlement(input.ledger, input.jobId);
   return { minionId: input.minionId, deliveredSha, deliveryNote, rebriefRecorded, deliveryRecorded, superseded: false };
 }
 
@@ -282,6 +296,7 @@ export async function reconcilePendingRebriefs(
     const missing = group.filter((marker) => pendingRebriefGuardedEvent(deps.ledger, marker, groupPhaseId) === null);
     if (missing.length === 0) {
       deps.ledger.clearPendingRebriefs(group.map((marker) => marker.id));
+      publishRebriefSettlement(deps.ledger, jobId);
       completed += 1;
       continue;
     }
@@ -300,6 +315,7 @@ export async function reconcilePendingRebriefs(
         ...(phaseId !== null ? { phaseId } : {}),
       });
       deps.ledger.clearPendingRebriefs(group.map((marker) => marker.id));
+      publishRebriefSettlement(deps.ledger, jobId);
       deps.ledger.appendCustomEvent({
         kind: 'silas.rebrief-recovered',
         jobId,
@@ -374,6 +390,7 @@ async function redispatchGroup(
       lanePath: result.lanePath,
       note,
       expectedPhaseId,
+      expectedMarkerIds: group.map((marker) => marker.id),
     });
     if (finalized.superseded) {
       // A newer re-brief request replaced the markers while this recovery
