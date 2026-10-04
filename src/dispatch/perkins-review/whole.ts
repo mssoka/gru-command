@@ -745,7 +745,7 @@ export class PerkinsWholeReview {
     let specialistsStarted = 0;
     let preflightAttempts = 0;
     let terminalAttempts = 0;
-    let reportPublished = false;
+    let publishedSubmission: string | null = null;
     let accepted: PerkinsWholeResult | null = null;
     let returningAccepted = false;
 
@@ -1564,13 +1564,16 @@ export class PerkinsWholeReview {
           let reportFile: string;
           try {
             reportFile = writeReviewArtifact(review, 'perkins-report.md', reportBytes);
-            reportPublished = true;
+            publishedSubmission = JSON.stringify(submission);
           } catch (writeError) {
             if (
-              !reportPublished || attempt <= 1 ||
-              !(writeError instanceof Error && 'code' in writeError && (writeError as { code?: string }).code === 'EEXIST') ||
-              !publishedReportMatches(review, reportBytes)
+              publishedSubmission === null || attempt <= 1 ||
+              !(writeError instanceof Error && 'code' in writeError && (writeError as { code?: string }).code === 'EEXIST')
             ) throw writeError;
+            if (JSON.stringify(submission) !== publishedSubmission) {
+              throw new Error('terminal retry differs from the published submission');
+            }
+            if (!publishedReportMatches(review, reportBytes)) throw writeError;
             reportFile = resolve(review.directory, 'perkins-report.md');
           }
           const headMoved = headMovedAtSubmit;

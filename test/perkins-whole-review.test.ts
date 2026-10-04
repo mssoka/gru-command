@@ -572,9 +572,50 @@ describe('Perkins whole-PR lead engine', () => {
       },
     });
     directory = h.frozen.directory;
-    await expect(h.run()).rejects.toThrow(/EEXIST|different.*report/);
+    await expect(h.run()).rejects.toThrow(/terminal retry differs from the published submission/);
     const original = readFileSync(join(directory, 'perkins-report.md'), 'utf8');
     expect(original).not.toContain('changed report');
+    expect(existsSync(join(directory, 'consolidated.json'))).toBe(false);
+  });
+
+  it('#87 rejects changed findings despite byte-identical report on partial retry', async () => {
+    let directory = '';
+    const h = wholeHarness({
+      ...ALL_CLEAN, submitRetries: 1,
+      leadFinding: groundedFinding('lead', 'note'),
+      beforeSubmit: () => { mkdirSync(join(directory, 'consolidated.json')); },
+      submitPayload: (attempt, submission) => {
+        if (attempt === 2) {
+          rmSync(join(directory, 'consolidated.json'), { recursive: true });
+          return { ...submission, findings: submission.findings.map((finding) => ({ ...finding, detail: 'Changed detail without changing the report.' })) };
+        }
+        return submission;
+      },
+    });
+    directory = h.frozen.directory;
+    await expect(h.run()).rejects.toThrow(/terminal retry differs from the published submission/);
+    expect(existsSync(join(directory, 'consolidated.json'))).toBe(false);
+    expect(readFileSync(join(directory, 'lead/submission-attempt-1.json'), 'utf8')).not.toContain('Changed detail without changing the report.');
+  });
+
+  it('#87 rejects trailing-whitespace-only report changes without touching published bytes', async () => {
+    let directory = '';
+    let originalReport = '';
+    const h = wholeHarness({
+      ...ALL_CLEAN, submitRetries: 1,
+      beforeSubmit: () => { mkdirSync(join(directory, 'consolidated.json')); },
+      submitPayload: (attempt, submission) => {
+        if (attempt === 2) {
+          originalReport = readFileSync(join(directory, 'perkins-report.md'), 'utf8');
+          rmSync(join(directory, 'consolidated.json'), { recursive: true });
+          return { ...submission, report_markdown: `${submission.report_markdown} ` };
+        }
+        return submission;
+      },
+    });
+    directory = h.frozen.directory;
+    await expect(h.run()).rejects.toThrow(/terminal retry differs from the published submission/);
+    expect(readFileSync(join(directory, 'perkins-report.md'), 'utf8')).toBe(originalReport);
     expect(existsSync(join(directory, 'consolidated.json'))).toBe(false);
   });
 
