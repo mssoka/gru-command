@@ -123,6 +123,7 @@ class FakeAgents implements DirectiveRegistry {
 interface Harness {
   dir: string;
   db: LedgerDb;
+  bus: EventBus;
   ledger: LedgerApi;
   notifications: NotificationCenter;
   worktrees: InMemoryWorktreePort;
@@ -144,6 +145,7 @@ function makeHarness(opts: { repo?: FixtureRepo | null; sessionFile?: string | n
   const harness: Harness = {
     dir,
     db,
+    bus,
     ledger,
     notifications,
     worktrees,
@@ -600,6 +602,69 @@ describe('terminal re-brief retirement', () => {
     expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(0);
     expect(h.ledger.listJobEvents(jobId).filter((event) => event.kind === 'silas.rebrief' || event.kind === 'job.delivered')).toHaveLength(2);
   });
+  it('finalization retires the admitted request when the lane lookup turns terminal before delivery', async () => {
+    const h = makeHarness();
+    const jobId = 'terminal-during-finalize-delivery';
+    await seedPendingRebrief({ h, jobId });
+    const markers = h.ledger.listPendingRebriefs({ jobId });
+    const original = h.worktrees.listWorktrees.bind(h.worktrees);
+    const worktrees = Object.create(h.worktrees) as InMemoryWorktreePort;
+    worktrees.listWorktrees = (opts) => {
+      merge(h, jobId);
+      return original(opts);
+    };
+    const result = finalizeRebriefRequest({
+      ledger: h.ledger, worktrees, jobId, minionId: 'worker', lanePath: h.lanePath,
+      note: 'n', expectedMarkers: markers,
+    });
+    expect(result.retired).toBe(true);
+    expect(result.deliveryRecorded).toBe(false);
+    expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).toBeNull();
+    expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(0);
+    expect(retiredAudit(h, jobId).find((row) => row.kind === 'job.delivered')?.guarded_event_landed).toBe(false);
+  });
+
+  it('finalization does not deliver the old turn after a new request replaces its markers during lane lookup', async () => {
+    const h = makeHarness();
+    const jobId = 'superseded-during-finalize-delivery';
+    await seedPendingRebrief({ h, jobId });
+    const markers = h.ledger.listPendingRebriefs({ jobId });
+    const original = h.worktrees.listWorktrees.bind(h.worktrees);
+    const worktrees = Object.create(h.worktrees) as InMemoryWorktreePort;
+    worktrees.listWorktrees = (opts) => {
+      h.ledger.beginPendingRebrief({ jobId, note: 'new request', briefing: 'new contract' });
+      return original(opts);
+    };
+    const result = finalizeRebriefRequest({
+      ledger: h.ledger, worktrees, jobId, minionId: 'worker', lanePath: h.lanePath,
+      note: 'n', expectedMarkers: markers,
+    });
+    expect(result.superseded).toBe(true);
+    expect(result.deliveryRecorded).toBe(false);
+    expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).toBeNull();
+    expect(h.ledger.listPendingRebriefs({ jobId }).map((row) => row.note)).toEqual(['new request', 'new request']);
+  });
+
+  it('a delivery subscriber replacing the request cannot clear or claim its heir', async () => {
+    const h = makeHarness();
+    const jobId = 'superseded-on-delivery-publication';
+    await seedPendingRebrief({ h, jobId });
+    const markers = h.ledger.listPendingRebriefs({ jobId });
+    h.bus.subscribe((event) => {
+      if (event.jobId === jobId && event.kind === 'job.delivered') {
+        h.ledger.beginPendingRebrief({ jobId, note: 'new request', briefing: 'new contract' });
+      }
+    });
+    const result = finalizeRebriefRequest({
+      ledger: h.ledger, worktrees: h.worktrees, jobId, minionId: 'worker', lanePath: h.lanePath,
+      note: 'n', expectedMarkers: markers,
+    });
+    expect(result.superseded).toBe(true);
+    expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).not.toBeNull();
+    expect(h.ledger.listPendingRebriefs({ jobId }).map((row) => row.note)).toEqual(['new request', 'new request']);
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-recovered')).toBeNull();
+  });
+
   function deps(h: Harness): {
     registry: FakeAgents;
     ledger: LedgerApi;
@@ -929,6 +994,26 @@ describe('terminal re-brief retirement', () => {
       expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(0);
       expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-retired')).toBeNull();
     }
+  });
+
+  it('boot does not report a spent generation completed after another request replaces it at clear', async () => {
+    const h = makeHarness();
+    const jobId = 'spent-superseded-at-clear';
+    await seedPendingRebrief({ h, jobId });
+    h.ledger.appendCustomEvent({ kind: 'silas.rebrief', jobId });
+    h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId });
+    const view = Object.create(h.ledger) as LedgerApi;
+    Object.defineProperty(view, 'clearPendingRebriefsIfCurrent', {
+      value: (expected: Parameters<LedgerApi['clearPendingRebriefsIfCurrent']>[0]) => {
+        h.ledger.beginPendingRebrief({ jobId, note: 'new request', briefing: 'new contract' });
+        return h.ledger.clearPendingRebriefsIfCurrent(expected);
+      },
+    });
+    const report = await reconcilePendingRebriefs({ ...deps(h), ledger: view }, { bootAt: new Date(Date.now() + 60_000) });
+    await report.settled;
+    expect(report.completed).toBe(0);
+    expect(report.retired).toBe(0);
+    expect(h.ledger.listPendingRebriefs({ jobId }).map((row) => row.note)).toEqual(['new request', 'new request']);
   });
 
   it('a parked job keeps the existing recovery path — not terminal cleanup', async () => {

@@ -1465,10 +1465,7 @@ export class LedgerApi {
     const jobId = fields.jobId;
     if (jobId === undefined || jobId === null) throw new Error('guarded re-brief event requires a job id');
     return this.transaction(() => {
-      const current = this.listPendingRebriefs({ jobId });
-      if (current.length !== expected.length || !expected.every((marker) => current.some((row) =>
-        row.id === marker.id && row.kind === marker.kind && row.payloadHash === marker.payloadHash &&
-        row.baselineSeq === marker.baselineSeq && row.phaseId === marker.phaseId))) {
+      if (!this.matchesPendingRebriefGeneration(jobId, expected)) {
         throw new PendingRebriefNoLongerCurrent('superseded');
       }
       const job = this.getJob(jobId);
@@ -1590,6 +1587,26 @@ export class LedgerApi {
       const remove = this.db.prepare('DELETE FROM pending_rebriefs WHERE id = ?');
       for (const id of ids) remove.run(id);
     });
+  }
+
+  /** Complete only the still-admitted generation. Delivery event publication
+   * can re-enter the ledger and replace markers before the caller clears them. */
+  clearPendingRebriefsIfCurrent(expected: readonly PendingRebriefRecord[]): boolean {
+    const jobId = expected[0]?.jobId;
+    if (jobId === undefined) throw new Error('clearing a re-brief generation requires markers');
+    return this.transaction(() => {
+      if (!this.matchesPendingRebriefGeneration(jobId, expected)) return false;
+      this.clearPendingRebriefs(expected.map((marker) => marker.id));
+      return true;
+    });
+  }
+
+  private matchesPendingRebriefGeneration(jobId: string, expected: readonly PendingRebriefRecord[]): boolean {
+    if (expected.length === 0 || expected.some((marker) => marker.jobId !== jobId)) return false;
+    const current = this.listPendingRebriefs({ jobId });
+    return current.length === expected.length && expected.every((marker) => current.some((row) =>
+      row.id === marker.id && row.kind === marker.kind && row.payloadHash === marker.payloadHash &&
+      row.baselineSeq === marker.baselineSeq && row.phaseId === marker.phaseId));
   }
 
   /** Retire pending re-brief markers whose request can never be honored:

@@ -275,50 +275,66 @@ export function finalizeRebriefRequest(input: {
   const phaseId = markers.find((marker) => marker.phaseId !== null)?.phaseId ?? null;
 
   let rebriefRecorded = false;
-  if (rebriefMarker === null || pendingRebriefGuardedEvent(input.ledger, rebriefMarker, phaseId) === null) {
-    input.ledger.appendCustomEvent({
-      kind: 'silas.rebrief',
-      jobId: input.jobId,
-      payload: {
-        minion_id: input.minionId,
-        lane: input.lanePath,
-        note: input.note,
-        ...(phaseId !== null ? { phase_id: phaseId } : {}),
-      },
-    });
-    rebriefRecorded = true;
-  }
-  flipJobToWorking(input.ledger, input.jobId);
-
   let deliveredSha: string | null = null;
   let deliveryNote: string | null = null;
   let deliveryRecorded = false;
-  const landedDelivery = deliveryMarker === null ? null : pendingRebriefGuardedEvent(input.ledger, deliveryMarker, phaseId);
-  if (landedDelivery === null) {
-    const followUp = recordFollowUpDelivery({
-      ledger: input.ledger,
-      worktrees: input.worktrees,
-      jobId: input.jobId,
-      agentId: input.minionId,
-      source: 'silas-rebrief',
-      ...(phaseId !== null ? { phaseId } : {}),
-    });
-    deliveredSha = followUp.sha;
-    deliveryNote = followUp.note;
-    deliveryRecorded = true;
-  } else {
-    // The delivery already landed (reconcile caught a crash window): report
-    // the recorded head without appending a duplicate — read from the
-    // phase-correlated event, never from an unrelated delivery.
-    const payload = landedDelivery.payload;
-    if (typeof payload === 'object' && payload !== null) {
-      const sha = (payload as { sha?: unknown }).sha;
-      deliveredSha = typeof sha === 'string' && sha !== '' ? sha : null;
+  try {
+    if (rebriefMarker !== null && pendingRebriefGuardedEvent(input.ledger, rebriefMarker, phaseId) === null) {
+      input.ledger.appendCustomEventIfCurrentRebrief({
+        kind: 'silas.rebrief',
+        jobId: input.jobId,
+        payload: {
+          minion_id: input.minionId,
+          lane: input.lanePath,
+          note: input.note,
+          ...(phaseId !== null ? { phase_id: phaseId } : {}),
+        },
+      }, markers);
+      rebriefRecorded = true;
     }
+    if (missing.length > 0) {
+      // The re-brief event publishes after COMMIT. Its subscribers may
+      // terminalize or supersede this request before the next side effect.
+      checkRebriefTurn(input.ledger, input.jobId, markers);
+      flipJobToWorking(input.ledger, input.jobId);
+    }
+
+    const landedDelivery = deliveryMarker === null ? null : pendingRebriefGuardedEvent(input.ledger, deliveryMarker, phaseId);
+    if (deliveryMarker !== null && landedDelivery === null) {
+      const followUp = recordFollowUpDelivery({
+        ledger: {
+          appendCustomEvent: (fields) => input.ledger.appendCustomEventIfCurrentRebrief(fields, markers),
+        },
+        worktrees: input.worktrees,
+        jobId: input.jobId,
+        agentId: input.minionId,
+        source: 'silas-rebrief',
+        ...(phaseId !== null ? { phaseId } : {}),
+      });
+      deliveredSha = followUp.sha;
+      deliveryNote = followUp.note;
+      deliveryRecorded = true;
+    } else if (landedDelivery !== null) {
+      // Reconcile caught a crash window: read the phase-correlated head,
+      // never an unrelated delivery, without appending a duplicate.
+      const payload = landedDelivery.payload;
+      if (typeof payload === 'object' && payload !== null) {
+        const sha = (payload as { sha?: unknown }).sha;
+        deliveredSha = typeof sha === 'string' && sha !== '' ? sha : null;
+      }
+    }
+  } catch (error) {
+    if (!(error instanceof PendingRebriefNoLongerCurrent || error instanceof RebriefTurnCancelled)) throw error;
+    // Re-derive whether the events were honored before terminality, or the
+    // exact admitted generation must be retired. Never operate on its heir.
+    return finalizeRebriefRequest({ ...input, expectedMarkers: markers });
   }
 
-  // Markers clear ONLY now — every guarded event exists.
-  input.ledger.clearPendingRebriefs(markers.map((marker) => marker.id));
+  // Event publication may have replaced the markers after delivery. The
+  // identity-checked clear must not claim that older turn recovered an heir.
+  if (!input.ledger.clearPendingRebriefsIfCurrent(markers)) {
+    return { minionId: input.minionId, deliveredSha, deliveryNote, rebriefRecorded, deliveryRecorded, retired: false, retirement: null, superseded: true };
+  }
   return { minionId: input.minionId, deliveredSha, deliveryNote, rebriefRecorded, deliveryRecorded, retired: false, retirement: null, superseded: false };
 }
 
@@ -384,8 +400,8 @@ export async function reconcilePendingRebriefs(
     const groupPhaseId = group.find((marker) => marker.phaseId !== null)?.phaseId ?? null;
     const missing = group.filter((marker) => pendingRebriefGuardedEvent(deps.ledger, marker, groupPhaseId) === null);
     if (missing.length === 0) {
-      deps.ledger.clearPendingRebriefs(group.map((marker) => marker.id));
-      completed += 1;
+      if (deps.ledger.clearPendingRebriefsIfCurrent(group)) completed += 1;
+      else deps.log?.('warn', 're-brief spent markers superseded before clearing', { job: jobId });
       continue;
     }
     // A terminal job can never honor the request. Retire it
@@ -453,7 +469,10 @@ export async function reconcilePendingRebriefs(
         });
         continue;
       }
-      deps.ledger.clearPendingRebriefs(group.map((marker) => marker.id));
+      if (!deps.ledger.clearPendingRebriefsIfCurrent(group)) {
+        deps.log?.('warn', 're-brief delivery recorded but request was superseded before clearing', { job: jobId });
+        continue;
+      }
       deps.ledger.appendCustomEvent({
         kind: 'silas.rebrief-recovered',
         jobId,
