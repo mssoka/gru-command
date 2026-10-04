@@ -1280,13 +1280,17 @@ describe('silas digest: stalled current phases (issue #162)', () => {
     }
   });
 
-  it('a busy activity tail cannot push an active verification run out of the ownership scan', async () => {
+  it('a busy verification history cannot hide an unsettled run from the ownership query', async () => {
     const h = makeLedger();
     try {
       reopenRepairPhase(h, 'job-tail');
       h.ledger.appendCustomEvent({ kind: 'verification.started', jobId: 'job-tail', payload: { run_id: 'run-active', scope: 'full' } });
-      // 450 newer non-verification events: the lifecycle-only scan still sees
-      // the open run, so the lane stays fenced.
+      // 650 newer lifecycle events (325 settled runs) plus a busy activity
+      // tail: the durable per-run query still sees the open run.
+      for (let index = 0; index < 325; index += 1) {
+        h.ledger.appendCustomEvent({ kind: 'verification.requested', jobId: 'job-tail', payload: { run_id: `run-${index}`, scope: 'web' } });
+        h.ledger.appendCustomEvent({ kind: 'verification.completed', jobId: 'job-tail', payload: { run_id: `run-${index}`, scope: 'web' } });
+      }
       for (let index = 0; index < 450; index += 1) {
         h.ledger.appendCustomEvent({ kind: 'agent.state', jobId: 'job-tail', payload: { index } });
       }
@@ -1331,17 +1335,20 @@ describe('silas digest: stalled current phases (issue #162)', () => {
     }
   });
 
-  it('a fresh dispatch with no worker record is accepted startup, not lost work', async () => {
+  it('a fresh dispatch with no worker record is surfaced past its grace window', async () => {
     const h = makeLedger();
     try {
       h.ledger.addJob({ id: 'job-dispatch', repo: 'fixture-app', title: 't', briefing: 'b' });
       h.ledger.setJobStatus('job-dispatch', 'working');
       const startedAt = Date.parse(h.ledger.latestJobEvent('job-dispatch', 'job.status')!.ts);
-      // Past the threshold: the dispatch turn still owns its accepted startup
-      // (a failed dispatch blocks the lane with error evidence). A crashed
-      // dispatch is restart recovery, a separate concern — never guessed as
-      // lost work here.
-      expect((await digestAt(h, startedAt + DEFAULT_SILAS_CONFIG.stallThresholdMs + 1)).stalledWorking).toEqual([]);
+      // The grace IS the accepted startup window: inside it, no offer.
+      expect((await digestAt(h, startedAt + DEFAULT_SILAS_CONFIG.stallThresholdMs)).stalledWorking).toEqual([]);
+      // Past it, a missing source record no longer hides the lane: Silas
+      // assesses (a live dispatch turn keeps owning it; a lost one is
+      // surfaced) — nothing is spawned or reopened by the detector.
+      expect(
+        (await digestAt(h, startedAt + DEFAULT_SILAS_CONFIG.stallThresholdMs + 1)).stalledWorking,
+      ).toMatchObject([{ jobId: 'job-dispatch', minionId: null, minionState: null, lastActivity: null }]);
     } finally {
       h.cleanup();
     }

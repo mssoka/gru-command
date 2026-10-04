@@ -1,6 +1,7 @@
 import { spawnSync } from 'node:child_process';
-import type { EventRecord, JobRecord, PendingRebriefRecord } from '../ledger/api.js';
+import type { DirectiveRequestRecord, EventRecord, JobRecord, PendingRebriefRecord } from '../ledger/api.js';
 import { isJobTerminal, type JobStatus } from '../ledger/states.js';
+import { LIVE_DIRECTIVE_STATES, type DirectiveState } from '../ledger/directives.js';
 import type { WorktreeLane } from './worktree-port.js';
 
 /**
@@ -116,6 +117,12 @@ export interface BranchIdleLedger {
   /** Durable re-brief markers; any row for a job is an unresolved
    * target-owned request (presence is the fact — see laneIsBusy). */
   listPendingRebriefs(opts?: { readonly jobId?: string }): readonly PendingRebriefRecord[];
+  /** Accepted directive requests still owing completion (`dispatching` or
+   * `admitted`): they may already own the lane before admission lands. */
+  listPendingDirectives(opts?: {
+    readonly jobId?: string;
+    readonly states?: readonly DirectiveState[];
+  }): readonly DirectiveRequestRecord[];
 }
 
 /** The branch a job lane is created on (worktree manager convention; also
@@ -242,6 +249,9 @@ export function laneIsBusy(ledger: BranchIdleLedger, job: JobRecord): boolean {
   // presence-based — a late delivery event from the previous worker cannot
   // answer a newer request, so it must not release this fence.
   if (ledger.listPendingRebriefs({ jobId: job.id }).length > 0) return true;
+  // An accepted directive request may already be prompting a writer before
+  // its admission event lands: review must not arm on that head (issue #162).
+  if (ledger.listPendingDirectives({ jobId: job.id, states: LIVE_DIRECTIVE_STATES }).length > 0) return true;
   if (!BRANCH_BUSY_STATUSES.includes(job.status)) return false;
   const delivered = ledger.latestJobEvent(job.id, 'job.delivered');
   if (delivered === null) return true;

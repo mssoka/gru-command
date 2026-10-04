@@ -20,7 +20,7 @@ const PINS: Record<string, number> = {
   'board-runtime-truth.test.ts': 14,
   'board-server.test.ts': 18,
   'bob-scheduler.test.ts': 5,
-  'branch-idle-guard.test.ts': 43,
+  'branch-idle-guard.test.ts': 44,
   'build-info.test.ts': 5,
   'chat-frame-log.test.ts': 20,
   'chat-frames.test.ts': 4,

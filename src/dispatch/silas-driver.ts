@@ -142,7 +142,7 @@ export interface DigestLedger {
   listJobs(): readonly JobRecord[];
   getJob(id: string): JobRecord | null;
   listRounds(jobId: string): readonly RoundRecord[];
-  listJobEvents(jobId: string, opts?: { limit?: number; kinds?: readonly string[] }): readonly EventRecord[];
+  listJobEvents(jobId: string, opts?: { limit?: number }): readonly EventRecord[];
   latestJobEvent(jobId: string, kind: string): EventRecord | null;
   latestRoundEvent(roundId: string, kind: string): EventRecord | null;
   listAgents(): readonly AgentRecord[];
@@ -156,6 +156,9 @@ export interface DigestLedger {
     readonly jobId?: string;
     readonly states?: readonly DirectiveState[];
   }): readonly DirectiveRequestRecord[];
+  /** True while any verification run for the job is unsettled (its newest
+   * open event is newer than the same run's newest terminal event). */
+  hasUnsettledVerificationRun(jobId: string): boolean;
   listProviderWaits?(opts?: { status?: string }): readonly unknown[];
   listPendingProviderRecoveries?(): readonly unknown[];
 }
@@ -469,72 +472,40 @@ function currentPhaseStart(ledger: DigestLedger, jobId: string): CurrentPhaseSta
   return { event, seq, repairStartSeq };
 }
 
-/** Verification lifecycle kinds that own the checkout while they are a run's
- * newest event, and the kinds that settle that run. `verification.attached`
- * is deliberately neither: the scheduler emits it when a second caller joins
- * a still queued/running attempt (issue #159), so it can never settle one. */
-const VERIFICATION_OPEN_EVENTS: ReadonlySet<string> = new Set([
-  'verification.requested',
-  'verification.started',
-]);
-const VERIFICATION_SETTLED_EVENTS: ReadonlySet<string> = new Set([
-  'verification.completed',
-  'verification.stale-released',
-  'verification.reconciled',
-  'verification.lock-timeout',
-]);
-const VERIFICATION_SCAN_KINDS: readonly string[] = [
-  ...VERIFICATION_OPEN_EVENTS,
-  ...VERIFICATION_SETTLED_EVENTS,
-];
-
-/** The run id a verification lifecycle event is keyed by (null when the
- * payload carries none — such an event cannot name an owner). */
-function verificationRunId(event: EventRecord): string | null {
-  if (typeof event.payload !== 'object' || event.payload === null) return null;
-  const runId = (event.payload as { run_id?: unknown }).run_id;
-  return typeof runId === 'string' && runId !== '' ? runId : null;
+/** True while a verification owns the lane. Identity-scoped at the ledger
+ * (one run's settlement never resolves another run) and window-free: a busy
+ * activity tail can never hide an unsettled run. An unsettled
+ * request/start keeps the fence until the scheduler records a terminal
+ * event — ownership the digest cannot read fails closed rather than
+ * guessing a queue's cessation from age. */
+function verificationInFlight(ledger: DigestLedger, jobId: string): boolean {
+  return ledger.hasUnsettledVerificationRun(jobId);
 }
 
-/** True while a verification owns the lane. Runs are tracked by run id: a
- * settlement releases only its own run. `verification.attached` never
- * settles (issue #159 — a duplicate caller joining the attempt), and an
- * unsettled request/start keeps the fence until the scheduler records a
- * terminal event: ownership the digest cannot read fails closed rather
- * than guessing a queue's cessation from age. The scan reads only the
- * verification lifecycle kinds, so a busy job's activity tail can never
- * push an active run out of the window. */
-function verificationInFlight(ledger: DigestLedger, jobId: string): boolean {
-  const openByRun = new Map<string, EventRecord>();
-  const settledSeqByRun = new Map<string, number>();
-  for (const event of ledger.listJobEvents(jobId, { limit: 500, kinds: VERIFICATION_SCAN_KINDS })) {
-    const runId = verificationRunId(event);
-    if (runId === null) continue;
-    if (VERIFICATION_OPEN_EVENTS.has(event.kind)) {
-      const current = openByRun.get(runId);
-      if (current === undefined || event.seq > current.seq) openByRun.set(runId, event);
-    } else if (VERIFICATION_SETTLED_EVENTS.has(event.kind)) {
-      const current = settledSeqByRun.get(runId);
-      if (current === undefined || event.seq > current) settledSeqByRun.set(runId, event.seq);
-    }
-  }
-  for (const [runId, open] of openByRun) {
-    if ((settledSeqByRun.get(runId) ?? 0) > open.seq) continue; // this run settled
-    return true;
-  }
-  return false;
+/** The newest effective activity stamp for one worker: the ledger stamp or
+ * the supervisor's own event clock, whichever is newer, falling back to the
+ * registration time when neither is known (NaN only when all are absent). */
+function effectiveWorkerStamp(input: ComputeDigestInput, agent: AgentRecord): number {
+  const ledgerMs = agent.lastActivity === null ? Number.NaN : Date.parse(agent.lastActivity);
+  const supervisionIso = input.supervisionFor?.(agent.id)?.lastEventAt ?? null;
+  const supervisionMs = supervisionIso === null ? Number.NaN : Date.parse(supervisionIso);
+  const known = Number.isFinite(supervisionMs) && (!Number.isFinite(ledgerMs) || supervisionMs > ledgerMs)
+    ? supervisionMs
+    : ledgerMs;
+  return Number.isFinite(known) ? known : Date.parse(agent.createdAt);
 }
 
 /** Final publish-boundary recheck for a proposed stalled row: the lane may
  * have delivered, gone terminal, opened a new phase, or gained an owner
  * while a later job's blocker history was awaited. Recomputes the cheap
  * ownership facts only; a stale offer is retracted, never published (no
- * duplicate writers). */
+ * duplicate writers). The silence comparison uses the row's COMPUTE-TIME
+ * floor, never a floor reconstructed from a later clock reading. */
 function stallStillEligible(
   input: ComputeDigestInput,
   row: StalledWorkingRow,
   phaseSeqAtCompute: number,
-  nowMs: number,
+  silenceFloorAtCompute: number,
 ): boolean {
   const ledger = input.ledger;
   const jobId = row.jobId;
@@ -551,34 +522,40 @@ function stallStillEligible(
   if (verificationInFlight(ledger, jobId)) return false;
   const review = latestAnsweringReviewRequest(ledger, jobId);
   if (review !== null && review.seq > phaseStart.seq) return false;
-  // Worker revalidation: an open supervision phase, a resumed turn, or a
-  // freshly appearing worker means the lane is owned again.
+  // Worker revalidation across the WHOLE current set: a worker that
+  // became live, active, or open-turn while the await was open makes the
+  // lane owned again.
   const minions = ledger.listAgents().filter((agent) => agent.jobId === jobId && agent.role === 'minion');
-  for (const agent of minions) {
-    if (agent.state === 'disposed') continue;
+  const live = minions.filter((agent) => {
+    if (agent.state === 'disposed') return false;
+    const view = input.supervisionFor?.(agent.id) ?? null;
+    return view === null || (view.state !== 'stopped' && view.breakerOpen !== true);
+  });
+  for (const agent of live) {
     const view = input.supervisionFor?.(agent.id) ?? null;
     if (view !== null && (view.openTurn || view.openControl === true || view.openToolCalls > 0)) return false;
+    const effective = effectiveWorkerStamp(input, agent);
+    if (Number.isFinite(effective) && effective > silenceFloorAtCompute) return false;
   }
   if (row.minionId === null) {
-    return !minions.some((agent) => agent.state !== 'disposed');
+    // A no-record offer is answered by any live worker appearing.
+    if (live.length > 0) return false;
+  } else if (!minions.some((agent) => agent.id === row.minionId)) {
+    return false; // the named worker record vanished entirely
+  } else if (live.length > 0 && !live.some((agent) => agent.id === row.minionId)) {
+    // A different live worker now owns the lane; the named worker's own
+    // silence no longer decides.
+    return false;
   }
-  const agent = minions.find((candidate) => candidate.id === row.minionId);
-  if (agent === undefined) return false; // the named worker record vanished
-  const raw = agent.lastActivity === null ? Number.NaN : Date.parse(agent.lastActivity);
-  const supervisionMs = viewLastEventAt(input, agent.id);
-  const effective = Number.isFinite(supervisionMs) && (!Number.isFinite(raw) || supervisionMs > raw)
-    ? supervisionMs
-    : raw;
-  // The row's silence floor at compute time: any effective stamp newer than
-  // it is new activity.
-  const observedFloor = nowMs - row.idleMs;
-  return !Number.isFinite(effective) || effective <= observedFloor;
-}
-
-/** The supervisor's own event clock for one agent (NaN when absent). */
-function viewLastEventAt(input: ComputeDigestInput, agentId: string): number {
-  const iso = input.supervisionFor?.(agentId)?.lastEventAt ?? null;
-  return iso === null ? Number.NaN : Date.parse(iso);
+  // With no live worker, the row stands only when the lane is not in the
+  // separately handled waiting/re-arm state.
+  if (live.length === 0) {
+    return !minions.some((agent) => {
+      const view = input.supervisionFor?.(agent.id) ?? null;
+      return view !== null && (view.state === 'stopped' || view.breakerOpen === true);
+    });
+  }
+  return true;
 }
 
 /**
@@ -645,6 +622,10 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
   // opened during a later job's blocker-history await invalidates any row
   // computed against the previous phase.
   const phaseSeqByJob = new Map<string, number>();
+  // Each proposed stalled row's COMPUTE-TIME silence floor, so the publish
+  // recheck compares activity against the immutable floor rather than a
+  // floor reconstructed from a later clock reading.
+  const stallSilenceFloorByJob = new Map<string, number>();
   for (const job of input.ledger.listJobs()) {
     if (job.status === 'merged' || job.status === 'done') continue;
     const rounds = [...input.ledger.listRounds(job.id)].sort((a, b) => b.seq - a.seq);
@@ -918,6 +899,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
         if (minion !== undefined) {
           const lastMs = clockOf(minion);
           if (Number.isFinite(lastMs) && now() - lastMs > input.config.stallThresholdMs) {
+            stallSilenceFloorByJob.set(job.id, lastMs);
             digest.stalledWorking.push({
               jobId: job.id,
               repo: job.repo,
@@ -927,9 +909,15 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
               idleMs: now() - lastMs,
             });
           }
-        } else if (boundMinions.length === 0 && phaseStart !== null && phaseStart.event !== null && repairPhase) {
+        } else if (boundMinions.length === 0 && phaseStart !== null && phaseStart.event !== null) {
+          // No worker record at all (never registered, or the record was
+          // lost): the phase start is the only honest clock. Past the same
+          // grace the lane is surfaced with absent coordinates — Silas
+          // assesses; nothing spawns here. The grace itself is the accepted
+          // startup window; accepted operations fence above.
           const startedMs = Date.parse(phaseStart.event.ts);
           if (Number.isFinite(startedMs) && now() - startedMs > input.config.stallThresholdMs) {
+            stallSilenceFloorByJob.set(job.id, startedMs);
             digest.stalledWorking.push({
               jobId: job.id,
               repo: job.repo,
@@ -985,11 +973,24 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
   };
   return {
     ...digest,
-    deliveredWithoutPr: digest.deliveredWithoutPr.filter((row) => reviewOfferFencesHold(row.jobId)),
-    prWithoutReview: digest.prWithoutReview.filter((row) => reviewOfferFencesHold(row.jobId)),
+    deliveredWithoutPr: digest.deliveredWithoutPr.filter((row) => {
+      if (!reviewOfferFencesHold(row.jobId)) return false;
+      const job = input.ledger.getJob(row.jobId);
+      return job !== null && job.prUrl === null;
+    }),
+    prWithoutReview: digest.prWithoutReview.filter((row) => {
+      if (!reviewOfferFencesHold(row.jobId)) return false;
+      const job = input.ledger.getJob(row.jobId);
+      // A review admitted for a new state flips the job (working/delivered →
+      // in-review), which the phase-identity recheck above already catches;
+      // the row-specific precondition here is only the PR link it names.
+      return job !== null && job.prUrl !== null;
+    }),
     stalledWorking: digest.stalledWorking.filter((row) => {
       const phaseSeq = phaseSeqByJob.get(row.jobId);
-      return phaseSeq !== undefined && stallStillEligible(input, row, phaseSeq, now());
+      const silenceFloor = stallSilenceFloorByJob.get(row.jobId);
+      return phaseSeq !== undefined && silenceFloor !== undefined &&
+        stallStillEligible(input, row, phaseSeq, silenceFloor);
     }),
   };
 }
