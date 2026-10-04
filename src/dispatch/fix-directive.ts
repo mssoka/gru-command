@@ -439,41 +439,38 @@ export async function rebriefFreshMinion(
       cwd,
       ...(input.resumeFile !== undefined && input.resumeFile !== null ? { resumeFile: input.resumeFile } : {}),
     });
+    let prompt: string;
     try {
       input.beforeTurnSideEffect?.();
-    } catch (error) {
-      // Spawn completed but admission did not: do not orphan an unbound
-      // handle when terminality or a newer request cancels this turn.
-      await handle.dispose();
-      throw error;
-    }
-    input.ledger.registerAgent({
-      id: handle.id,
-      role: 'minion',
-      sessionFile: handle.sessionFile,
-      jobId: input.jobId,
-    });
-    input.onSpawned?.({ id: handle.id, sessionFile: handle.sessionFile });
-    const prompt = renderRebriefPrompt({
-      jobId: input.jobId,
-      briefing: input.briefing,
-      note: input.note,
-      ...(input.lessons !== undefined
-        ? { lessons: input.lessons.referencesFor(`${input.note}\n${input.briefing ?? ''}`) }
-        : {}),
-    });
-    // registerAgent publishes agent.spawned after COMMIT. A subscriber can
-    // close the job or replace this request before the prompt is sent; the
-    // last fence must sit AFTER that publication and immediately before the
-    // prompt call, with no await between the check and the side effect.
-    try {
+      input.ledger.registerAgent({
+        id: handle.id,
+        role: 'minion',
+        sessionFile: handle.sessionFile,
+        jobId: input.jobId,
+      });
+      input.onSpawned?.({ id: handle.id, sessionFile: handle.sessionFile });
+      prompt = renderRebriefPrompt({
+        jobId: input.jobId,
+        briefing: input.briefing,
+        note: input.note,
+        ...(input.lessons !== undefined
+          ? { lessons: input.lessons.referencesFor(`${input.note}\n${input.briefing ?? ''}`) }
+          : {}),
+      });
+      // registerAgent publishes agent.spawned after COMMIT. A subscriber
+      // can close the job or replace this request before the prompt; no
+      // await may separate this last fence from prompt delivery.
       input.beforeTurnSideEffect?.();
     } catch (error) {
       try {
         await handle.dispose();
-        input.ledger.setAgentState(handle.id, 'disposed');
+        // Registration can commit and then throw from its publication
+        // listener. Check the row rather than assuming a returned call.
+        if (input.ledger.listAgents().some((agent) => agent.id === handle.id)) {
+          input.ledger.setAgentState(handle.id, 'disposed');
+        }
       } catch (cleanupError) {
-        throw new Error(`could not dispose minion ${handle.id} after a cancelled re-brief: ${String(cleanupError)}`, { cause: error });
+        throw new Error(`could not dispose minion ${handle.id} after failed re-brief setup: ${String(cleanupError)}`, { cause: error });
       }
       throw error;
     }

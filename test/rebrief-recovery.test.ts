@@ -642,6 +642,57 @@ describe('terminal re-brief retirement', () => {
     expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).toBeNull();
   });
 
+  async function assertMixedPairStaysVisible(column: 'phase_id' | 'payload_hash' | 'baseline_seq'): Promise<void> {
+    const h = makeHarness();
+    const jobId = `mixed-${column}`;
+    await seedPendingRebrief({ h, jobId });
+    const pair = h.ledger.listPendingRebriefs({ jobId });
+    h.db.handle.prepare(`UPDATE pending_rebriefs SET ${column} = ? WHERE id = ?`)
+      .run(column === 'phase_id' ? 'foreign-phase' : column === 'payload_hash' ? 'foreign-hash' : pair[0]!.baselineSeq + 1, pair[0]!.id);
+    merge(h, jobId);
+    const report = await reconcilePendingRebriefs(deps(h), { bootAt: new Date(Date.now() + 60_000) });
+    await report.settled;
+    expect(report).toMatchObject({ completed: 0, redispatched: 0, retired: 0 });
+    expect(h.registry.workers).toHaveLength(0);
+    expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(2);
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-retired')).toBeNull();
+    expect(h.ledger.listNotifications().some((row) => row.kind === `silas.rebrief-unreconciled.${jobId}` && (row.detail ?? '').includes('incoherent marker pair'))).toBe(true);
+    expect(() => finalizeRebriefRequest({ ledger: h.ledger, worktrees: h.worktrees, jobId, minionId: 'worker', lanePath: h.lanePath, note: 'n' }))
+      .toThrow(/incoherent marker pair/u);
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief')).toBeNull();
+    expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).toBeNull();
+  }
+
+  it('a mixed phase pair stays visible at boot and finalization', async () => {
+    await assertMixedPairStaysVisible('phase_id');
+  });
+  it('a mixed hash pair stays visible at boot and finalization', async () => {
+    await assertMixedPairStaysVisible('payload_hash');
+  });
+  it('a mixed watermark pair stays visible at boot and finalization', async () => {
+    await assertMixedPairStaysVisible('baseline_seq');
+  });
+
+  it('a rebrief publication subscriber superseding the pair prevents delivery and reopen', async () => {
+    const h = makeHarness();
+    const jobId = 'superseded-on-rebrief-publication';
+    await seedPendingRebrief({ h, jobId });
+    const old = h.ledger.listPendingRebriefs({ jobId });
+    let newer = old;
+    h.bus.subscribe((event) => {
+      if (event.jobId === jobId && event.kind === 'silas.rebrief') {
+        newer = h.ledger.beginPendingRebrief({ jobId, note: 'new request', briefing: 'new contract' });
+        h.ledger.setJobStatus(jobId, 'in-review');
+      }
+    });
+    const result = finalizeRebriefRequest({ ledger: h.ledger, worktrees: h.worktrees, jobId, minionId: 'worker', lanePath: h.lanePath, note: 'old', expectedMarkers: old });
+    expect(result.superseded).toBe(true);
+    expect(result.deliveryRecorded).toBe(false);
+    expect(h.ledger.listPendingRebriefs({ jobId })).toEqual(newer);
+    expect(h.ledger.getJob(jobId)?.status).toBe('in-review');
+    expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).toBeNull();
+  });
+
   it('same-generation nonterminal finalization records both guarded events once', async () => {
     const h = makeHarness();
     const jobId = 'same-generation-job';

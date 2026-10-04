@@ -1289,6 +1289,7 @@ describe('dispatch server (E8)', () => {
         } else {
           expect(response.status).toBe(400);
           expect(field<string>(response.json, 'detail')).toContain('synthetic prompt rejection');
+          expect(field<boolean>(response.json, 'retired')).toBe(true);
         }
         expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(0);
         expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-retired')).not.toBeNull();

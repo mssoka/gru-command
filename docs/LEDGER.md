@@ -171,8 +171,10 @@ audit commit in one transaction, with no spawn and no escalation.
 Retirement fires wherever the terminal state is met — the boot scan, a
 settling turn, or the re-dispatch boundary — not only at boot. Spent
 markers (both guarded events already landed) are the exception: they
-clear as the completed request they are, with no retirement audit. The
-boot summary's units are mixed by design: `examined` counts markers
+clear as the completed request they are, with no retirement audit. A
+malformed pair (missing kind or mismatched phase id, payload hash, or
+watermark) stays visible and escalates for repair instead of being
+completed or retired, even when terminal. The boot summary's units are mixed by design: `examined` counts markers
 while `completed`/`redispatched`/`retired` count jobs, so one retired
 marker pair reads `examined: 2 … retired: 1` — not a partial failure. A
 group counts once per scan in which at least one of its markers retires;

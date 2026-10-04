@@ -402,6 +402,60 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
     expect(gate.view().worker).toMatchObject({ running: 0, queued: [] });
   });
 
+  async function assertUnpromptedWorkerDisposed(failure: 'registration' | 'registration-publication' | 'binding' | 'rendering' | 'ownership'): Promise<void> {
+    const disposed: string[] = [];
+    const states: string[] = [];
+    const prompted: string[] = [];
+    let registered = false;
+    const original = new Error(`${failure} failed`);
+    const handle = {
+      id: 'setup-worker', sessionFile: null,
+      prompt: async (text: string) => { prompted.push(text); },
+      dispose: async () => { disposed.push('setup-worker'); },
+    };
+    await expect(rebriefFreshMinion({
+      registry: { getHandle: () => null, spawn: async () => handle as never, disposeHandle: async () => {} },
+      ledger: {
+        listAgents: () => registered ? [minionRecord('setup-worker', 'job-cancel', null)] : [],
+        registerAgent: (input) => {
+          if (failure === 'registration') throw original;
+          registered = true;
+          if (failure === 'registration-publication') throw original;
+          return minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null);
+        },
+        getJob: () => null,
+        setAgentState: (id, state) => { states.push(`${id}:${state}`); return minionRecord(id, 'job-cancel', null); },
+      },
+      worktrees: { listWorktrees: () => [lane] } as never,
+      jobId: 'job-cancel', note: 'resume', briefing: 'contract',
+      ...(failure === 'binding' ? { onSpawned: () => { throw original; } } : {}),
+      ...(failure === 'rendering' ? { lessons: { referencesFor: () => { throw original; } } as never } : {}),
+      ...(failure === 'ownership' ? { beforeTurnSideEffect: (() => {
+        let checks = 0;
+        return () => { if (++checks === 3) throw original; };
+      })() } : {}),
+    })).rejects.toBe(original);
+    expect(disposed).toEqual(['setup-worker']);
+    expect(states).toEqual(registered ? ['setup-worker:disposed'] : []);
+    expect(prompted).toEqual([]);
+  }
+
+  it('disposes an unprompted worker when registration fails', async () => {
+    await assertUnpromptedWorkerDisposed('registration');
+  });
+  it('marks a committed row disposed when registration publication fails', async () => {
+    await assertUnpromptedWorkerDisposed('registration-publication');
+  });
+  it('disposes an unprompted worker when marker binding fails', async () => {
+    await assertUnpromptedWorkerDisposed('binding');
+  });
+  it('disposes an unprompted worker when prompt rendering fails', async () => {
+    await assertUnpromptedWorkerDisposed('rendering');
+  });
+  it('disposes an unprompted worker when final ownership fails', async () => {
+    await assertUnpromptedWorkerDisposed('ownership');
+  });
+
   it('a post-prompt abort on the re-brief path rejects before any delivery is recorded', async () => {
     const controller = new AbortController();
     const prompted: string[] = [];

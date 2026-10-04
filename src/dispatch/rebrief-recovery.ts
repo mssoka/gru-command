@@ -339,15 +339,19 @@ export function finalizeRebriefRequest(input: {
   return { minionId: input.minionId, deliveredSha, deliveryNote, rebriefRecorded, deliveryRecorded, retired: false, retirement: null, superseded: false };
 }
 
-/** Never clear or claim recovery for only half a request. */
+/** Both guarded events must belong to the same request, not merely have
+ * the right kinds. Persisted mismatches stay visible for operator repair. */
 function isCompleteRebriefPair(markers: readonly PendingRebriefRecord[]): boolean {
-  return markers.length === 2 && markers.some((marker) => marker.kind === 'silas.rebrief') &&
-    markers.some((marker) => marker.kind === 'job.delivered');
+  if (markers.length !== 2 || !markers.some((marker) => marker.kind === 'silas.rebrief') ||
+      !markers.some((marker) => marker.kind === 'job.delivered')) return false;
+  const [first, second] = markers;
+  return first !== undefined && second !== undefined && first.phaseId === second.phaseId &&
+    first.payloadHash === second.payloadHash && first.baselineSeq === second.baselineSeq;
 }
 
 class IncompleteRebriefPairError extends Error {
   constructor(jobId: string) {
-    super(`job "${jobId}" has an incomplete marker pair — pending re-brief cannot be recovered or retired`);
+    super(`job "${jobId}" has an incomplete marker pair or incoherent marker pair — pending re-brief cannot be recovered or retired; inspect phase id, payload hash and baseline watermark for repair`);
     this.name = 'IncompleteRebriefPairError';
   }
 }
@@ -415,8 +419,6 @@ export async function reconcilePendingRebriefs(
   let retired = 0;
   const background: Promise<void>[] = [];
   for (const [jobId, group] of byJob) {
-    const groupPhaseId = group.find((marker) => marker.phaseId !== null)?.phaseId ?? null;
-    const missing = group.filter((marker) => pendingRebriefGuardedEvent(deps.ledger, marker, groupPhaseId) === null);
     const completePair = isCompleteRebriefPair(group);
     if (!completePair) {
       // Without both marker kinds we cannot prove completion OR justify an
@@ -425,6 +427,7 @@ export async function reconcilePendingRebriefs(
       escalateRecoveryFailure(deps, jobId, group, incompleteRebriefPairError(jobId));
       continue;
     }
+    const missing = group.filter((marker) => !pendingRebriefEventLanded(deps.ledger, marker));
     if (missing.length === 0) {
       if (deps.ledger.clearPendingRebriefsIfCurrent(group)) completed += 1;
       else deps.log?.('warn', 're-brief spent markers superseded before clearing', { job: jobId });

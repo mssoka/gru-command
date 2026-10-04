@@ -398,7 +398,10 @@ the judgment; the dispatch surface is the mechanical hand.
   administratively (the identity-checked deletion and one
   `silas.rebrief-retired` audit commit together, with no spawn and no
   escalation); spent markers (both guarded events already landed) still
-  clear as a completion, with no retirement audit. The boot summary
+  clear as a completion, with no retirement audit. A malformed pair
+  (missing kind or mismatched phase id, payload hash, or watermark) is
+  instead retained and escalated for repair, even on a terminal job; it
+  cannot be treated as one request or retired. The boot summary
   counts `examined` in markers but `completed`/`redispatched`/`retired`
   in jobs, so one retired pair reads `examined: 2 … retired: 1` by design.
 - **Authority boundaries are unchanged** (`roles/silas.md`): dispatch,

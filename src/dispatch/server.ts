@@ -698,8 +698,24 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         });
       } catch (error) {
         if (!(error instanceof RebriefTurnCancelled)) {
-          closeFailedTerminalTurn(error);
-          throw error;
+          let closed: ReturnType<typeof finalizeRebriefRequest> | null = null;
+          try {
+            closed = closeFailedTerminalTurn(error);
+          } catch (closureError) {
+            log('error', 'silas re-brief failure could not close terminal request', {
+              job: jobId, error: String(error), closure_error: String(closureError),
+            });
+          }
+          if (closed === null && !isJobTerminal(options.ledger.getJob(jobId)?.status ?? 'working')) throw error;
+          json(res, 400, {
+            error: 'bad_request',
+            detail: String(error instanceof Error ? error.message : error),
+            ...(closed?.retired === true ? { retired: true } : {}),
+            ...(closed?.superseded === true ? { superseded: true } : {}),
+            ...(closed?.retirement !== undefined && closed.retirement !== null
+              ? { retirement: { refused: closed.retirement.refused, skipped_ids: closed.retirement.skippedIds } } : {}),
+          });
+          return true;
         }
         const cancelled = finalizeRebriefRequest({
           ledger: options.ledger, worktrees: ops.worktrees, jobId,

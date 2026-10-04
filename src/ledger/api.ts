@@ -533,9 +533,8 @@ export interface PendingRebriefRetirement {
    * identity (a newer request generation, or an already-consumed marker).
    * Empty on a boundary refusal: no row was read or compared there. */
   readonly skippedIds: readonly string[];
-  /** The boundary refusal when the job was not terminal at retirement
-   * time — nothing was deleted or recorded then. */
-  readonly refused: 'job-missing' | 'job-not-terminal' | null;
+  /** The boundary refusal: nothing was deleted or recorded. */
+  readonly refused: 'job-missing' | 'job-not-terminal' | 'events-already-landed' | null;
 }
 
 function nowIso(): string {
@@ -1626,7 +1625,7 @@ export class LedgerApi {
     candidates: readonly PendingRebriefRetireCandidate[];
   }): PendingRebriefRetirement {
     return this.transaction(() => {
-      const refused = (why: 'job-missing' | 'job-not-terminal'): PendingRebriefRetirement => ({
+      const refused = (why: NonNullable<PendingRebriefRetirement['refused']>): PendingRebriefRetirement => ({
         retired: [],
         // Refusal is a boundary outcome, not identity drift: no row was read
         // or compared, so nothing is "skipped" — the `refused` discriminator
@@ -1676,6 +1675,14 @@ export class LedgerApi {
       }
       if (retired.length === 0) {
         return { retired: [], skippedIds, refused: null };
+      }
+      // A fully honored pair is a completion, not an administrative
+      // cancellation. Check ledger event truth inside this transaction,
+      // before either the deletion or its retirement audit can commit.
+      if (retired.length === 2 && skippedIds.length === 0 &&
+          PENDING_REBRIEF_KINDS.every((kind) => retired.some((row) => row.kind === kind)) &&
+          retired.every((row) => guardedEventLanded.get(row.id) === true)) {
+        return refused('events-already-landed');
       }
       const remove = this.db.prepare('DELETE FROM pending_rebriefs WHERE id = ?');
       for (const row of retired) remove.run(row.id);

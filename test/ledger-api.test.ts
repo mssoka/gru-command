@@ -408,6 +408,23 @@ describe('pending re-brief terminal retirement (ledger boundary)', () => {
     expect(api.listJobEvents(jobId).filter((event) => event.kind === 'silas.rebrief-retired')).toHaveLength(1);
   });
 
+  it('refuses direct retirement of a fully landed terminal request without an audit', () => {
+    const jobId = 'retire-spent-refusal';
+    api.addJob({ id: jobId, repo: 'terminal-retirement', title: 'completed request' });
+    api.setJobStatus(jobId, 'working');
+    const markers = api.beginPendingRebrief({ jobId, note: 'n', briefing: 'b' });
+    api.appendCustomEvent({ kind: 'silas.rebrief', jobId });
+    api.appendCustomEvent({ kind: 'job.delivered', jobId });
+    api.setJobStatus(jobId, 'in-review');
+    api.setJobStatus(jobId, 'merged');
+    const result = api.retirePendingRebriefs({ jobId, reason: 'terminal', candidates: candidatesOf(markers) });
+    expect(result).toMatchObject({ retired: [], skippedIds: [], refused: 'events-already-landed' });
+    expect(api.listPendingRebriefs({ jobId })).toEqual(markers);
+    expect(api.latestJobEvent(jobId, 'silas.rebrief-retired')).toBeNull();
+    expect(api.clearPendingRebriefsIfCurrent(markers)).toBe(true);
+    expect(api.listPendingRebriefs({ jobId })).toHaveLength(0);
+  });
+
   it('retirement audit insertion failure rolls back marker deletion, then a retry commits once', () => {
     const jobId = 'retire-audit-rollback';
     api.addJob({ id: jobId, repo: 'terminal-retirement', title: 'rollback' });
