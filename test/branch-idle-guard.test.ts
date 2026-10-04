@@ -6,7 +6,7 @@ import { dirname, join } from 'node:path';
 import { createServer, type Server as HttpServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { EventBus } from '../src/events/bus.js';
-import { LedgerApi, type EventRecord, type JobRecord, type JobStatus, type PendingRebriefRecord } from '../src/ledger/api.js';
+import { LedgerApi, type DirectiveRequestRecord, type EventRecord, type JobRecord, type JobStatus, type PendingRebriefRecord } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { DEFAULT_SILAS_CONFIG, loadConfig, type Role } from '../src/config.js';
 import type { AgentHandle, SpawnOptions } from '../src/runtime/types.js';
@@ -421,6 +421,8 @@ describe('branch-idle guard', () => {
     const firstLink = eventRecord(3, 'job.status', { from: 'working', to: 'in-review' });
     const reopened = eventRecord(4, 'job.status', { from: 'in-review', to: 'working' });
     const reopenedLink = eventRecord(5, 'job.status', { from: 'working', to: 'in-review' });
+    // Issue #162: an explicit repair start without a status hop.
+    const repairStart = eventRecord(3, 'silas.directive-sent', { request_id: 'r1' });
     const events = new Map<string, EventRecord[]>([
       ['never-started', []],
       ['settled', [start, delivery]],
@@ -430,6 +432,10 @@ describe('branch-idle guard', () => {
       ['linked-mid-turn-late-delivery', [start, midTurnLink, eventRecord(4, 'job.delivered', { sha: 'sha-2' })]],
       ['linked-after-delivery', [start, delivery, settledLink]],
       ['reopened-mid-turn', [start, delivery, firstLink, reopened, reopenedLink]],
+      ['repair-start', [start, delivery, repairStart]],
+      ['repair-delivered', [start, delivery, repairStart, eventRecord(4, 'job.delivered', { sha: 'sha-2' })]],
+      ['recovery-claim', [start, delivery, eventRecord(3, 'provider.recovery-claimed', { wait_id: 'w' })]],
+      ['dispatch-live', [start, delivery]],
     ]);
     const ledger = {
       listJobs: () => [
@@ -442,12 +448,21 @@ describe('branch-idle guard', () => {
         jobRecord('linked-mid-turn-late-delivery', 'in-review'),
         jobRecord('linked-after-delivery', 'in-review'),
         jobRecord('reopened-mid-turn', 'in-review'),
+        jobRecord('repair-start', 'working'),
+        jobRecord('repair-delivered', 'working'),
+        jobRecord('recovery-claim', 'working'),
+        jobRecord('dispatch-live', 'working'),
       ],
       latestJobEvent: (jobId: string, kind: string): EventRecord | null =>
         (events.get(jobId) ?? []).filter((event) => event.kind === kind).at(-1) ?? null,
       listJobEvents: (jobId: string): readonly EventRecord[] =>
         [...(events.get(jobId) ?? [])].reverse(),
       listPendingRebriefs: (): readonly PendingRebriefRecord[] => [],
+      listPendingDirectives: (opts: { readonly jobId?: string } = {}): readonly DirectiveRequestRecord[] =>
+        opts.jobId === 'dispatch-live'
+          ? ([{ requestId: 'r-live', jobId: opts.jobId, state: 'dispatching' }] as unknown as readonly DirectiveRequestRecord[])
+          : [],
+      hasUnsettledVerificationRun: (): boolean => false,
     };
     const busy = (id: string): boolean => laneIsBusy(ledger, ledger.listJobs().find((job) => job.id === id)!);
     expect(busy('never-started')).toBe(true);
@@ -464,10 +479,25 @@ describe('branch-idle guard', () => {
     // The prior delivery settled attempt 1; the reopened attempt (working)
     // is still open after the PR link flipped it to in-review.
     expect(busy('reopened-mid-turn')).toBe(true);
+    // A directive admission or provider-recovery claim after the delivery
+    // is a repair phase even without a status hop — review must wait for it.
+    expect(busy('repair-start')).toBe(true);
+    expect(busy('recovery-claim')).toBe(true);
+    // A delivery newer than the repair start settles that phase.
+    expect(busy('repair-delivered')).toBe(false);
+    // An accepted but not-yet-admitted directive already owns the lane.
+    expect(busy('dispatch-live')).toBe(true);
 
-    const lanes = [laneRecord('reopened', 'reopened', 'gru/reopened'), laneRecord('settled', 'settled', 'gru/settled')];
+    const lanes = [
+      laneRecord('reopened', 'reopened', 'gru/reopened'),
+      laneRecord('settled', 'settled', 'gru/settled'),
+      laneRecord('repair-start', 'repair-start', 'gru/repair-start'),
+    ];
     expect(findBusyLanes({ ledger, lanes, targetBranch: 'gru/reopened' }).map((blocker) => blocker.jobId)).toEqual([
       'reopened',
+    ]);
+    expect(findBusyLanes({ ledger, lanes, targetBranch: 'gru/repair-start' }).map((blocker) => blocker.jobId)).toEqual([
+      'repair-start',
     ]);
     expect(findBusyLanes({ ledger, lanes, targetBranch: 'refs/heads/gru/settled' })).toEqual([]);
     // A dispatched job without a registry row compares as the branch it is
@@ -495,6 +525,8 @@ describe('branch-idle guard', () => {
       listJobEvents: (_jobId: string, opts?: { readonly limit?: number }): readonly EventRecord[] =>
         [...pagedHistory].reverse().slice(0, opts?.limit ?? 200),
       listPendingRebriefs: (): readonly PendingRebriefRecord[] => [],
+      listPendingDirectives: (): readonly DirectiveRequestRecord[] => [],
+      hasUnsettledVerificationRun: (): boolean => false,
     };
     expect(laneIsBusy(paged, paged.listJobs()[0]!)).toBe(false);
 
@@ -514,6 +546,8 @@ describe('branch-idle guard', () => {
       listJobEvents: (_jobId: string, opts?: { readonly limit?: number }): readonly EventRecord[] =>
         [...cappedHistory].reverse().slice(0, opts?.limit ?? 200),
       listPendingRebriefs: (): readonly PendingRebriefRecord[] => [],
+      listPendingDirectives: (): readonly DirectiveRequestRecord[] => [],
+      hasUnsettledVerificationRun: (): boolean => false,
     };
     expect(laneIsBusy(capped, capped.listJobs()[0]!)).toBe(false);
   });
@@ -729,6 +763,8 @@ describe('branch-idle guard', () => {
         [...(events.get(jobId) ?? [])].reverse(),
       listPendingRebriefs: (opts: { readonly jobId?: string } = {}): readonly PendingRebriefRecord[] =>
         opts.jobId === undefined ? [...pending.values()].flat() : (pending.get(opts.jobId) ?? []),
+      listPendingDirectives: (): readonly DirectiveRequestRecord[] => [],
+      hasUnsettledVerificationRun: (): boolean => false,
     };
     const busy = (id: string): boolean => laneIsBusy(ledger, ledger.listJobs().find((job) => job.id === id)!);
     expect(busy('working-pending')).toBe(true);
@@ -784,6 +820,25 @@ describe('branch-idle guard', () => {
       // (rebrief-recovery owns that lifecycle seam). The genuine
       // finalizer-driven release is covered in its own case below.
       expect(h.ledger.listPendingRebriefs({ jobId: 'rebrief-arm' })).toHaveLength(1);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a live directive intent refuses the arm before its admission lands', async () => {
+    const repo = makeFixtureRepo('branch-idle-directive-arm');
+    cleanupRepos.push(repo);
+    let preflights = 0;
+    const h = await boot({ onPreflight: () => { preflights += 1; } });
+    try {
+      await createLaneJob(h, repo, { jobId: 'directive-arm', status: 'delivered' });
+      // dispatching: side effects are possible, admission is not recorded yet.
+      h.ledger.beginDirectiveIntent({ jobId: 'directive-arm', directive: 'fix it', holder: 'silas-ops' });
+      const refused = await postReview(h, { job_id: 'directive-arm' });
+      expect(refused.status).toBe(409);
+      expect(refused.json).toMatchObject({ error: 'branch_busy', blockers: [{ job_id: 'directive-arm' }] });
+      expect(preflights).toBe(0);
+      expect(h.ledger.listRounds('directive-arm')).toHaveLength(0);
     } finally {
       await h.close();
     }
@@ -1254,6 +1309,8 @@ describe('branch-idle guard', () => {
         [...(events.get(jobId) ?? [])].reverse(),
       listPendingRebriefs: (opts: { readonly jobId?: string } = {}): readonly PendingRebriefRecord[] =>
         opts.jobId === undefined ? [...pending.values()].flat() : (pending.get(opts.jobId) ?? []),
+      listPendingDirectives: (): readonly DirectiveRequestRecord[] => [],
+      hasUnsettledVerificationRun: (): boolean => false,
     };
     const lanes = [
       laneRecord('marker-owner', 'marker-owner', 'gru/marker-owner'),

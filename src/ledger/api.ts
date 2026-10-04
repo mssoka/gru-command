@@ -768,6 +768,31 @@ export class LedgerApi {
     ).map((row) => this.eventFromRow(row));
   }
 
+  /** True while any verification RUN for the job is unsettled: its latest
+   * open lifecycle event (`requested`/`started`) is newer than the latest
+   * settlement for that SAME run id. Identity-scoped and window-free — one
+   * run's completion never resolves another run, and a long activity tail
+   * can never hide an open run. `verification.attached` settles nothing
+   * (issue #159). */
+  hasUnsettledVerificationRun(jobId: string): boolean {
+    const row = this.db
+      .prepare(
+        `SELECT 1 AS unsettled FROM (
+           SELECT json_extract(payload, '$.run_id') AS run_id,
+                  MAX(CASE WHEN kind IN ('verification.requested', 'verification.started') THEN seq ELSE 0 END) AS open_seq,
+                  MAX(CASE WHEN kind IN ('verification.completed', 'verification.stale-released', 'verification.reconciled', 'verification.lock-timeout') THEN seq ELSE 0 END) AS settled_seq
+           FROM events
+           WHERE job_id = ? AND kind IN (
+             'verification.requested', 'verification.started', 'verification.completed',
+             'verification.stale-released', 'verification.reconciled', 'verification.lock-timeout'
+           )
+           GROUP BY run_id
+         ) WHERE open_seq > settled_seq LIMIT 1`,
+      )
+      .get(jobId) as Row | undefined;
+    return row !== undefined;
+  }
+
   /** Latest durable event for one job/kind (ops follow-through checks). */
   latestJobEvent(jobId: string, kind: string): EventRecord | null {
     const row = this.db

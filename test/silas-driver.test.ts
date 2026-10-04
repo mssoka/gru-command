@@ -1084,6 +1084,678 @@ describe('silas digest (the four actionable states)', () => {
 });
 
 // ------------------------------------------------------------------
+// Stalled CURRENT phase (issue #162): phase-aware, fence-preserving
+// ------------------------------------------------------------------
+
+describe('silas digest: stalled current phases (issue #162)', () => {
+  /** Open a repair phase on top of a truthful older delivery: the job
+   * delivered once (the historical event), then an explicit repair
+   * transition put it back to `working`. The old `delivered === null`
+   * predicate could never see this lane. */
+  const reopenRepairPhase = (h: Harness, jobId: string): void => {
+    addJobWithDelivery(h.ledger, jobId);
+    h.ledger.setJobStatus(jobId, 'delivered');
+    h.ledger.setJobStatus(jobId, 'working');
+  };
+
+  const digestAt = (h: Harness, at: number) =>
+    computeSilasDigest({
+      ledger: h.ledger,
+      blockersForRound: async () => ({ blockers: [], note: null }),
+      config: DEFAULT_SILAS_CONFIG,
+      trigger: 'sweep',
+      now: () => at,
+    });
+
+  const idleAt = (h: Harness, minionId: string): number =>
+    Date.parse(h.ledger.getAgent(minionId)!.lastActivity!);
+
+  /** A clock far past every stamp the fixture just wrote (fence tests do
+   * not care about the exact boundary; the boundary tests above do). */
+  const farFuture = (): number => Date.now() + DEFAULT_SILAS_CONFIG.stallThresholdMs * 2;
+
+  it('the original blind spot: a legitimately reopened phase with an older delivery becomes visible past the stall threshold', async () => {
+    const h = makeLedger();
+    try {
+      reopenRepairPhase(h, 'job-repair');
+      expect(h.ledger.getJob('job-repair')?.status).toBe('working');
+      expect(h.ledger.latestJobEvent('job-repair', 'job.delivered')).not.toBeNull();
+      h.ledger.registerAgent({ id: 'min-repair', role: 'minion', jobId: 'job-repair' });
+      h.ledger.setAgentState('min-repair', 'idle');
+      const idle = idleAt(h, 'min-repair');
+      // Inside the grace window: nothing is offered.
+      expect((await digestAt(h, idle + DEFAULT_SILAS_CONFIG.stallThresholdMs)).stalledWorking).toEqual([]);
+      // Past it: the CURRENT repair phase is surfaced despite the older delivery.
+      const past = await digestAt(h, idle + DEFAULT_SILAS_CONFIG.stallThresholdMs + 1);
+      expect(past.stalledWorking.map((row) => row.jobId)).toEqual(['job-repair']);
+      expect(past.stalledWorking[0]?.minionId).toBe('min-repair');
+      // Historical delivery evidence is preserved, never deleted or rewritten.
+      expect(h.ledger.listJobEvents('job-repair').filter((event) => event.kind === 'job.delivered')).toHaveLength(1);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a genuinely current delivery stays excluded — a worker exiting after delivery is normal', async () => {
+    const h = makeLedger();
+    try {
+      addJobWithDelivery(h.ledger, 'job-current');
+      h.ledger.registerAgent({ id: 'min-current', role: 'minion', jobId: 'job-current' });
+      h.ledger.setAgentState('min-current', 'idle');
+      const digest = await digestAt(h, idleAt(h, 'min-current') + DEFAULT_SILAS_CONFIG.stallThresholdMs + 1);
+      expect(digest.stalledWorking).toEqual([]);
+      // The state still reaches its real owner: the delivery-without-PR row.
+      expect(digest.deliveredWithoutPr.map((row) => row.jobId)).toEqual(['job-current']);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('terminal, parked, blocked and delivered lanes are never offered for stalled recovery', async () => {
+    const h = makeLedger();
+    try {
+      const jobs: readonly { id: string; status: string[] }[] = [
+        { id: 'job-terminal-done', status: ['done'] },
+        { id: 'job-terminal-merged', status: ['in-review', 'merged'] },
+        { id: 'job-parked', status: ['parked'] },
+        { id: 'job-blocked', status: ['blocked'] },
+        { id: 'job-delivered', status: ['delivered'] },
+      ];
+      for (const { id, status } of jobs) {
+        addJobWithDelivery(h.ledger, id, { prUrl: 'https://git.example.invalid/o/r/pull/1' });
+        for (const step of status) h.ledger.setJobStatus(id, step);
+        h.ledger.registerAgent({ id: `min-${id}`, role: 'minion', jobId: id });
+        h.ledger.setAgentState(`min-${id}`, 'idle');
+      }
+      const far = Math.max(...jobs.map(({ id }) => idleAt(h, `min-${id}`))) + DEFAULT_SILAS_CONFIG.stallThresholdMs + 1;
+      const digest = await digestAt(h, far);
+      expect(digest.stalledWorking).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('the no-minion-record variant is visible past the grace window, never silently invisible', async () => {
+    const h = makeLedger();
+    try {
+      reopenRepairPhase(h, 'job-no-worker');
+      const startedAt = Date.parse(h.ledger.latestJobEvent('job-no-worker', 'job.status')!.ts);
+      // Exactly at the grace boundary is not stalled; past it the absent
+      // worker record no longer hides the phase.
+      expect((await digestAt(h, startedAt + DEFAULT_SILAS_CONFIG.stallThresholdMs)).stalledWorking).toEqual([]);
+      const past = await digestAt(h, startedAt + DEFAULT_SILAS_CONFIG.stallThresholdMs + 1);
+      expect(past.stalledWorking).toEqual([
+        {
+          jobId: 'job-no-worker',
+          repo: 'fixture-app',
+          minionId: null,
+          minionState: null,
+          lastActivity: null,
+          idleMs: DEFAULT_SILAS_CONFIG.stallThresholdMs + 1,
+        },
+      ]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a pending re-brief request owns the lane: accepted work awaiting startup is never called lost', async () => {
+    const h = makeLedger();
+    try {
+      reopenRepairPhase(h, 'job-rebrief');
+      h.ledger.beginPendingRebrief({ jobId: 'job-rebrief', note: 'retry the repair', briefing: 'b' });
+      const startedAt = Date.parse(h.ledger.latestJobEvent('job-rebrief', 'job.status')!.ts);
+      expect((await digestAt(h, startedAt + DEFAULT_SILAS_CONFIG.stallThresholdMs + 1)).stalledWorking).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a live directive request fences the lane while ownership is uncertain, in BOTH live states', async () => {
+    const h = makeLedger();
+    try {
+      reopenRepairPhase(h, 'job-directive');
+      const intent = h.ledger.beginDirectiveIntent({ jobId: 'job-directive', directive: 'fix it', holder: 'silas-ops' });
+      const at = farFuture();
+      // `dispatching` = side effects possible, admission unknown: reconcile, never duplicate.
+      expect((await digestAt(h, at)).stalledWorking).toEqual([]);
+      const sent = h.ledger.appendCustomEvent({
+        kind: 'silas.directive-sent',
+        jobId: 'job-directive',
+        payload: { request_id: intent.record.requestId, minion_id: 'min-live' },
+      });
+      h.ledger.recordDirectiveAdmission({ requestId: intent.record.requestId, minionId: 'min-live', eventSeq: sent.seq });
+      // `admitted` = a bound turn is still in flight: same fence.
+      expect((await digestAt(h, at)).stalledWorking).toEqual([]);
+      // A durable failure with positive no-effect proof releases the fence.
+      h.ledger.failDirective({ requestId: intent.record.requestId, reason: 'no lane and no minion' });
+      expect((await digestAt(h, at)).stalledWorking.map((row) => row.jobId)).toEqual(['job-directive']);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('an in-flight verification owns the checkout; only its own run settlement releases it', async () => {
+    const h = makeLedger();
+    try {
+      reopenRepairPhase(h, 'job-verify');
+      // A started run owns the checkout regardless of how old it is.
+      h.ledger.appendCustomEvent({ kind: 'verification.started', jobId: 'job-verify', payload: { run_id: 'run-1', scope: 'full' } });
+      const at = farFuture();
+      expect((await digestAt(h, at)).stalledWorking).toEqual([]);
+      // A duplicate caller attaching to the same attempt is NOT a settlement.
+      h.ledger.appendCustomEvent({ kind: 'verification.attached', jobId: 'job-verify', payload: { run_id: 'run-1', scope: 'full', state: 'running' } });
+      expect((await digestAt(h, at)).stalledWorking).toEqual([]);
+      // Run 2 starts while run 1 is open; run 1's later settlement must not
+      // release run 2's checkout (per-run identity, not job-level order).
+      h.ledger.appendCustomEvent({ kind: 'verification.requested', jobId: 'job-verify', payload: { run_id: 'run-2', scope: 'web' } });
+      h.ledger.appendCustomEvent({ kind: 'verification.started', jobId: 'job-verify', payload: { run_id: 'run-2', scope: 'web' } });
+      h.ledger.appendCustomEvent({ kind: 'verification.completed', jobId: 'job-verify', payload: { run_id: 'run-1', scope: 'full' } });
+      expect((await digestAt(h, at)).stalledWorking).toEqual([]);
+      // Run 2's own settlement releases the lane.
+      h.ledger.appendCustomEvent({ kind: 'verification.completed', jobId: 'job-verify', payload: { run_id: 'run-2', scope: 'web' } });
+      expect((await digestAt(h, at)).stalledWorking.map((row) => row.jobId)).toEqual(['job-verify']);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('an unsettled queued verification keeps its ownership fence (uncertain ownership fails closed)', async () => {
+    const h = makeLedger();
+    try {
+      reopenRepairPhase(h, 'job-queue');
+      const requested = h.ledger.appendCustomEvent({
+        kind: 'verification.requested', jobId: 'job-queue', payload: { run_id: 'run-queued', scope: 'full' },
+      });
+      const at = Date.parse(requested.ts) + 3 * DEFAULT_SILAS_CONFIG.stallThresholdMs;
+      // Long past the stall threshold the accepted queue still owns the
+      // checkout: the scheduler's lock-timeout/stale record is the terminal
+      // evidence, and guessing cessation would risk competing writers.
+      expect((await digestAt(h, at)).stalledWorking).toEqual([]);
+      // The scheduler's own terminal record for THIS run releases it.
+      h.ledger.appendCustomEvent({ kind: 'verification.lock-timeout', jobId: 'job-queue', payload: { run_id: 'run-queued', scope: 'full' } });
+      expect((await digestAt(h, at)).stalledWorking.map((row) => row.jobId)).toEqual(['job-queue']);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a busy verification history cannot hide an unsettled run from the ownership query', async () => {
+    const h = makeLedger();
+    try {
+      reopenRepairPhase(h, 'job-tail');
+      h.ledger.appendCustomEvent({ kind: 'verification.started', jobId: 'job-tail', payload: { run_id: 'run-active', scope: 'full' } });
+      // 650 newer lifecycle events (325 settled runs) plus a busy activity
+      // tail: the durable per-run query still sees the open run.
+      for (let index = 0; index < 325; index += 1) {
+        h.ledger.appendCustomEvent({ kind: 'verification.requested', jobId: 'job-tail', payload: { run_id: `run-${index}`, scope: 'web' } });
+        h.ledger.appendCustomEvent({ kind: 'verification.completed', jobId: 'job-tail', payload: { run_id: `run-${index}`, scope: 'web' } });
+      }
+      for (let index = 0; index < 450; index += 1) {
+        h.ledger.appendCustomEvent({ kind: 'agent.state', jobId: 'job-tail', payload: { index } });
+      }
+      const at = farFuture();
+      expect((await digestAt(h, at)).stalledWorking).toEqual([]);
+      h.ledger.appendCustomEvent({ kind: 'verification.completed', jobId: 'job-tail', payload: { run_id: 'run-active', scope: 'full' } });
+      expect((await digestAt(h, at)).stalledWorking.map((row) => row.jobId)).toEqual(['job-tail']);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a claimed provider continuation opens a repair phase without a status hop', async () => {
+    const h = makeLedger();
+    try {
+      // Delivered lane that never left `working` (fallback-review shape).
+      addJobWithDelivery(h.ledger, 'job-recovered');
+      const claim = h.ledger.appendCustomEvent({
+        kind: 'provider.recovery-claimed', jobId: 'job-recovered', payload: { wait_id: 'w-1', path: 'resumed' },
+      });
+      const claimedAt = Date.parse(claim.ts);
+      expect((await digestAt(h, claimedAt + DEFAULT_SILAS_CONFIG.stallThresholdMs)).stalledWorking).toEqual([]);
+      expect(
+        (await digestAt(h, claimedAt + DEFAULT_SILAS_CONFIG.stallThresholdMs + 1)).stalledWorking.map((row) => row.jobId),
+      ).toEqual(['job-recovered']);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a directive intent that never admitted work cannot reopen a genuinely delivered phase', async () => {
+    const h = makeLedger();
+    try {
+      addJobWithDelivery(h.ledger, 'job-noop');
+      const intent = h.ledger.beginDirectiveIntent({ jobId: 'job-noop', directive: 'no-op', holder: 'silas-ops' });
+      h.ledger.failDirective({ requestId: intent.record.requestId, reason: 'no lane and no minion' });
+      // Delivery is newer than the working hop and no admission ever landed:
+      // the phase is still delivered, not stalled.
+      expect((await digestAt(h, farFuture())).stalledWorking).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a fresh dispatch with no worker record is accepted startup, not lost work', async () => {
+    const h = makeLedger();
+    try {
+      h.ledger.addJob({ id: 'job-dispatch', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('job-dispatch', 'working');
+      const startedAt = Date.parse(h.ledger.latestJobEvent('job-dispatch', 'job.status')!.ts);
+      // The dispatch turn owns its accepted startup (a queued worker-gate
+      // admission is not lost work); a deterministic failure blocks the
+      // lane with error evidence instead. Repair phases are the case where
+      // a missing record means lost work — covered above.
+      expect((await digestAt(h, startedAt + DEFAULT_SILAS_CONFIG.stallThresholdMs + 1)).stalledWorking).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('an in-review attempt that never delivered is still assessed when its worker dies', async () => {
+    const h = makeLedger();
+    try {
+      // A PR link flips a still-working attempt to in-review before its
+      // delivery: laneIsBusy still treats it as a writer, so the stall
+      // channel must not strand it behind the in-review status.
+      h.ledger.addJob({ id: 'job-linked', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('job-linked', 'working');
+      h.ledger.setJobPr('job-linked', 'https://git.example.invalid/o/r/pull/3');
+      h.ledger.setJobStatus('job-linked', 'in-review');
+      h.ledger.registerAgent({ id: 'min-linked', role: 'minion', jobId: 'job-linked' });
+      h.ledger.setAgentState('min-linked', 'idle');
+      const at = idleAt(h, 'min-linked') + DEFAULT_SILAS_CONFIG.stallThresholdMs + 1;
+      expect((await digestAt(h, at)).stalledWorking.map((row) => row.jobId)).toEqual(['job-linked']);
+      // Once the attempt delivers, the review owns it: no stall offer.
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-linked', payload: { sha: 'sha-linked' } });
+      expect((await digestAt(h, at)).stalledWorking).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a reopened phase binds its grace to the phase start, not the old idle worker stamp', async () => {
+    const h = makeLedger();
+    try {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date('2026-10-04T00:00:00.000Z'));
+        addJobWithDelivery(h.ledger, 'job-grace');
+        h.ledger.registerAgent({ id: 'min-old', role: 'minion', jobId: 'job-grace' });
+        h.ledger.setAgentState('min-old', 'idle');
+        const workerIdleAt = idleAt(h, 'min-old');
+        // Reopen five minutes later: the old idle stamp is older than the
+        // phase opening, so the fresh grace starts at the reopen.
+        vi.setSystemTime(new Date(workerIdleAt + 5 * 60_000));
+        h.ledger.setJobStatus('job-grace', 'delivered');
+        h.ledger.setJobStatus('job-grace', 'working');
+        const reopenedAt = Date.parse(h.ledger.latestJobEvent('job-grace', 'job.status')!.ts);
+        expect((await digestAt(h, reopenedAt + DEFAULT_SILAS_CONFIG.stallThresholdMs)).stalledWorking).toEqual([]);
+        // One millisecond past the reopen's own grace: visible.
+        expect(
+          (await digestAt(h, reopenedAt + DEFAULT_SILAS_CONFIG.stallThresholdMs + 1)).stalledWorking.map((row) => row.jobId),
+        ).toEqual(['job-grace']);
+      } finally {
+        vi.useRealTimers();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a supervised open turn owns the lane even when the ledger stamp is old; closing it lets the stall surface', async () => {
+    const h = makeLedger();
+    try {
+      reopenRepairPhase(h, 'job-open-turn');
+      h.ledger.registerAgent({ id: 'min-open', role: 'minion', jobId: 'job-open-turn' });
+      h.ledger.setAgentState('min-open', 'idle');
+      const at = farFuture();
+      const base: AgentSupervisionView = {
+        agentId: 'min-open', role: 'minion', slotId: null, state: 'watching', restarts: 0,
+        breakerOpen: false, stopReason: null, openTurn: true, openToolCalls: 0,
+        lastEventAt: null, lastFileBytes: null,
+      };
+      const digestOf = (view: AgentSupervisionView | null) =>
+        computeSilasDigest({
+          ledger: h.ledger,
+          blockersForRound: async () => ({ blockers: [], note: null }),
+          config: DEFAULT_SILAS_CONFIG,
+          trigger: 'sweep',
+          now: () => at,
+          supervisionFor: (agentId) => (agentId === 'min-open' ? view : null),
+        });
+      // A live open turn is active work, never a lost worker.
+      expect((await digestOf(base)).stalledWorking).toEqual([]);
+      // Each independent ownership field fences on its own.
+      expect((await digestOf({ ...base, openTurn: false, openControl: true })).stalledWorking).toEqual([]);
+      expect((await digestOf({ ...base, openTurn: false, openControl: false, openToolCalls: 1 })).stalledWorking).toEqual([]);
+      // The same worker with the turn closed and only a stale stamp is silent.
+      expect((await digestOf({ ...base, openTurn: false })).stalledWorking.map((row) => row.jobId)).toEqual(['job-open-turn']);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('fresh supervisor activity keeps a closed-turn worker out of its silent window', async () => {
+    const h = makeLedger();
+    try {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date('2026-10-04T00:00:00.000Z'));
+        addJobWithDelivery(h.ledger, 'job-sup');
+        h.ledger.registerAgent({ id: 'min-sup', role: 'minion', jobId: 'job-sup' });
+        h.ledger.setAgentState('min-sup', 'idle');
+        const idle = idleAt(h, 'min-sup');
+        vi.setSystemTime(new Date(idle + 10 * 60_000));
+        h.ledger.setJobStatus('job-sup', 'delivered');
+        h.ledger.setJobStatus('job-sup', 'working');
+        const reopenedAt = Date.parse(h.ledger.latestJobEvent('job-sup', 'job.status')!.ts);
+        const base: AgentSupervisionView = {
+          agentId: 'min-sup', role: 'minion', slotId: null, state: 'watching', restarts: 0,
+          breakerOpen: false, stopReason: null, openTurn: false, openToolCalls: 0,
+          lastEventAt: null, lastFileBytes: null,
+        };
+        const digestOf = (view: AgentSupervisionView | null, at: number) =>
+          computeSilasDigest({
+            ledger: h.ledger,
+            blockersForRound: async () => ({ blockers: [], note: null }),
+            config: DEFAULT_SILAS_CONFIG,
+            trigger: 'sweep',
+            now: () => at,
+            supervisionFor: (agentId) => (agentId === 'min-sup' ? view : null),
+          });
+        // The ledger stamp is past the threshold, but the supervisor's own
+        // event clock is inside the silence window.
+        const fresh = { ...base, lastEventAt: new Date(idle + 20 * 60_000).toISOString() };
+        expect((await digestOf(fresh, reopenedAt + 35 * 60_000)).stalledWorking).toEqual([]);
+        // The supervisor clock itself ages past the window: silent again.
+        expect((await digestOf(fresh, reopenedAt + 55 * 60_000)).stalledWorking.map((row) => row.jobId)).toEqual(['job-sup']);
+      } finally {
+        vi.useRealTimers();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a later working hop is a genuine repair even when a clean abort is on the record', async () => {
+    const h = makeLedger();
+    try {
+      addJobWithDelivery(h.ledger, 'job-abort', { prUrl: 'https://git.example.invalid/o/r/pull/9' });
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-abort', payload: { sha: 'sha-same' } });
+      const round = h.ledger.addRound({ jobId: 'job-abort', targetRef: 'sha-same' });
+      h.ledger.setRoundStatus(round.id, 'live');
+      h.ledger.setJobStatus('job-abort', 'in-review');
+      h.ledger.setRoundStatus(round.id, 'aborted');
+      h.ledger.appendCustomEvent({
+        kind: 'round.perkins-incomplete', jobId: 'job-abort', roundId: round.id, payload: { reason: 'service_restart' },
+      });
+      // The in-review → working restore leaves the lane on an old head the
+      // branch guard refuses to re-arm (the restore hop keeps the attempt
+      // open): the lane is surfaced for assessment, never offered an
+      // unarmable clean-abort review row.
+      h.ledger.setJobStatus('job-abort', 'working');
+      const rearmed = await digestAt(h, farFuture());
+      expect(rearmed.prWithoutReview).toEqual([]);
+      expect(rearmed.stalledWorking.map((row) => row.jobId)).toEqual(['job-abort']);
+      // A LATER delivered → working hop is a genuine reopen: the old abort
+      // must not hide it, and the old head must not be offered for review.
+      h.ledger.setJobStatus('job-abort', 'delivered');
+      h.ledger.setJobStatus('job-abort', 'working');
+      h.ledger.registerAgent({ id: 'min-abort', role: 'minion', jobId: 'job-abort' });
+      h.ledger.setAgentState('min-abort', 'idle');
+      const reopened = await digestAt(h, idleAt(h, 'min-abort') + DEFAULT_SILAS_CONFIG.stallThresholdMs + 1);
+      expect(reopened.stalledWorking.map((row) => row.jobId)).toEqual(['job-abort']);
+      expect(reopened.prWithoutReview).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a live directive or pending re-brief fences the PR/review offers on a delivered lane', async () => {
+    const h = makeLedger();
+    try {
+      // Row (1): delivered, no PR yet.
+      addJobWithDelivery(h.ledger, 'job-offer1');
+      expect((await digestAt(h, farFuture())).deliveredWithoutPr.map((row) => row.jobId)).toEqual(['job-offer1']);
+      const intent = h.ledger.beginDirectiveIntent({ jobId: 'job-offer1', directive: 'no-op', holder: 'silas-ops' });
+      expect((await digestAt(h, farFuture())).deliveredWithoutPr).toEqual([]);
+      h.ledger.failDirective({ requestId: intent.record.requestId, reason: 'no lane and no minion' });
+      expect((await digestAt(h, farFuture())).deliveredWithoutPr.map((row) => row.jobId)).toEqual(['job-offer1']);
+      h.ledger.beginPendingRebrief({ jobId: 'job-offer1', note: 'retry', briefing: 'b' });
+      expect((await digestAt(h, farFuture())).deliveredWithoutPr).toEqual([]);
+      // Row (2): PR-linked, review due.
+      addJobWithDelivery(h.ledger, 'job-offer2', { prUrl: 'https://git.example.invalid/o/r/pull/2' });
+      expect((await digestAt(h, farFuture())).prWithoutReview.map((row) => row.jobId)).toEqual(['job-offer2']);
+      h.ledger.beginDirectiveIntent({ jobId: 'job-offer2', directive: 'no-op', holder: 'silas-ops' });
+      expect((await digestAt(h, farFuture())).prWithoutReview).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a stalled offer is retracted when a new repair phase opens during the await', async () => {
+    const h = makeLedger();
+    try {
+      // The await job is created first and the stalled candidate a second
+      // later, so the candidate is deterministically visited first.
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-10-04T10:00:00.000Z'));
+      h.ledger.addJob({ id: 'job-other3', repo: 'fixture-app', title: 'other', briefing: 'b' });
+      h.ledger.setJobStatus('job-other3', 'working');
+      const round = h.ledger.addRound({ jobId: 'job-other3', lenses: ['blind'] });
+      h.ledger.setRoundStatus(round.id, 'live');
+      h.ledger.setRoundVerdict(round.id, 'changes-requested');
+      h.ledger.setJobStatus('job-other3', 'in-review');
+      vi.setSystemTime(new Date('2026-10-04T10:00:01.000Z'));
+      reopenRepairPhase(h, 'job-race-claim');
+      h.ledger.registerAgent({ id: 'min-race-claim', role: 'minion', jobId: 'job-race-claim' });
+      h.ledger.setAgentState('min-race-claim', 'idle');
+      vi.useRealTimers();
+      let raced = false;
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => {
+          if (!raced) {
+            raced = true;
+            h.ledger.appendCustomEvent({ kind: 'provider.recovery-claimed', jobId: 'job-race-claim', payload: { wait_id: 'w' } });
+          }
+          return { blockers: [], note: null };
+        },
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+        now: () => farFuture(),
+      });
+      expect(raced).toBe(true);
+      expect(digest.stalledWorking).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a stalled offer is retracted when its worker resumes activity during the await', async () => {
+    const h = makeLedger();
+    try {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-10-04T10:00:00.000Z'));
+      h.ledger.addJob({ id: 'job-other4', repo: 'fixture-app', title: 'other', briefing: 'b' });
+      h.ledger.setJobStatus('job-other4', 'working');
+      const round = h.ledger.addRound({ jobId: 'job-other4', lenses: ['blind'] });
+      h.ledger.setRoundStatus(round.id, 'live');
+      h.ledger.setRoundVerdict(round.id, 'changes-requested');
+      h.ledger.setJobStatus('job-other4', 'in-review');
+      vi.setSystemTime(new Date('2026-10-04T10:00:01.000Z'));
+      reopenRepairPhase(h, 'job-race-worker');
+      h.ledger.registerAgent({ id: 'min-race-worker', role: 'minion', jobId: 'job-race-worker' });
+      h.ledger.setAgentState('min-race-worker', 'idle');
+      vi.useRealTimers();
+      let raced = false;
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => {
+          if (!raced) {
+            raced = true;
+            // The worker resumed while the digest awaited the other job.
+            h.ledger.setAgentState('min-race-worker', 'idle');
+          }
+          return { blockers: [], note: null };
+        },
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+        now: () => farFuture(),
+      });
+      expect(raced).toBe(true);
+      expect(digest.stalledWorking).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a stalled offer is retracted when an owner lands while another job\'s blocker history is awaited', async () => {
+    const h = makeLedger();
+    try {
+      // The other job is created FIRST so its blocker report is awaited
+      // AFTER job-race (the more recently updated row) is visited.
+      h.ledger.addJob({ id: 'job-other', repo: 'fixture-app', title: 'other', briefing: 'b' });
+      h.ledger.setJobStatus('job-other', 'working');
+      const round = h.ledger.addRound({ jobId: 'job-other', lenses: ['blind'] });
+      h.ledger.setRoundStatus(round.id, 'live');
+      h.ledger.setRoundVerdict(round.id, 'changes-requested');
+      h.ledger.setJobStatus('job-other', 'in-review');
+      reopenRepairPhase(h, 'job-race');
+      const at = farFuture();
+      let raced = false;
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => {
+          if (!raced) {
+            raced = true;
+            // An accepted directive owns job-race while the await is open.
+            h.ledger.beginDirectiveIntent({ jobId: 'job-race', directive: 'repair', holder: 'silas-ops' });
+          }
+          return { blockers: [], note: null };
+        },
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+        now: () => at,
+      });
+      expect(raced).toBe(true);
+      expect(digest.stalledWorking).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('an answering review request fences the phase; a failed fallback request does not', async () => {
+    const h = makeLedger();
+    try {
+      reopenRepairPhase(h, 'job-review');
+      const at = farFuture();
+      h.ledger.appendCustomEvent({ kind: 'silas.review-triggered', jobId: 'job-review', payload: { route: 'perkins' } });
+      expect((await digestAt(h, at)).stalledWorking).toEqual([]);
+      // A terminal fallback failure newer than the trigger answers nothing.
+      h.ledger.appendCustomEvent({ kind: 'job.fallback-review', jobId: 'job-review', payload: { phase: 'blocked' } });
+      expect((await digestAt(h, at)).stalledWorking.map((row) => row.jobId)).toEqual(['job-review']);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a stalled offer is retracted when its phase delivers during the await', async () => {
+    const h = makeLedger();
+    try {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-10-04T10:00:00.000Z'));
+      h.ledger.addJob({ id: 'job-other5', repo: 'fixture-app', title: 'other', briefing: 'b' });
+      h.ledger.setJobStatus('job-other5', 'working');
+      const round = h.ledger.addRound({ jobId: 'job-other5', lenses: ['blind'] });
+      h.ledger.setRoundStatus(round.id, 'live');
+      h.ledger.setRoundVerdict(round.id, 'changes-requested');
+      h.ledger.setJobStatus('job-other5', 'in-review');
+      vi.setSystemTime(new Date('2026-10-04T10:00:01.000Z'));
+      reopenRepairPhase(h, 'job-race-delivery');
+      h.ledger.registerAgent({ id: 'min-race-delivery', role: 'minion', jobId: 'job-race-delivery' });
+      h.ledger.setAgentState('min-race-delivery', 'idle');
+      vi.useRealTimers();
+      let raced = false;
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => {
+          if (!raced) {
+            raced = true;
+            h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-race-delivery', payload: { sha: 'sha-delivered' } });
+          }
+          return { blockers: [], note: null };
+        },
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+        now: () => farFuture(),
+      });
+      expect(raced).toBe(true);
+      expect(digest.stalledWorking).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a stalled offer is retracted when verification takes ownership during the await', async () => {
+    const h = makeLedger();
+    try {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-10-04T10:00:00.000Z'));
+      h.ledger.addJob({ id: 'job-other6', repo: 'fixture-app', title: 'other', briefing: 'b' });
+      h.ledger.setJobStatus('job-other6', 'working');
+      const round = h.ledger.addRound({ jobId: 'job-other6', lenses: ['blind'] });
+      h.ledger.setRoundStatus(round.id, 'live');
+      h.ledger.setRoundVerdict(round.id, 'changes-requested');
+      h.ledger.setJobStatus('job-other6', 'in-review');
+      vi.setSystemTime(new Date('2026-10-04T10:00:01.000Z'));
+      reopenRepairPhase(h, 'job-race-verify');
+      h.ledger.registerAgent({ id: 'min-race-verify', role: 'minion', jobId: 'job-race-verify' });
+      h.ledger.setAgentState('min-race-verify', 'idle');
+      vi.useRealTimers();
+      let raced = false;
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => {
+          if (!raced) {
+            raced = true;
+            h.ledger.appendCustomEvent({ kind: 'verification.requested', jobId: 'job-race-verify', payload: { run_id: 'run-race', scope: 'full' } });
+          }
+          return { blockers: [], note: null };
+        },
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+        now: () => farFuture(),
+      });
+      expect(raced).toBe(true);
+      expect(digest.stalledWorking).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('repeated sweeps report one row for the phase and add no writers of their own; an accepted continuation retires it', async () => {
+    const h = makeLedger();
+    try {
+      reopenRepairPhase(h, 'job-repeat');
+      const at = farFuture();
+      const first = await digestAt(h, at);
+      const eventsBefore = h.ledger.listJobEvents('job-repeat', { limit: 200 }).length;
+      const second = await digestAt(h, at);
+      expect(first.stalledWorking.map((row) => row.jobId)).toEqual(['job-repeat']);
+      expect(second.stalledWorking.map((row) => row.jobId)).toEqual(['job-repeat']);
+      // The detector is read-only: no delivery, directive or rebrief event is minted.
+      expect(h.ledger.listJobEvents('job-repeat', { limit: 200 }).length).toBe(eventsBefore);
+      // The existing guarded continuation path (Silas' accepted directive) owns the phase from here.
+      h.ledger.beginDirectiveIntent({ jobId: 'job-repeat', directive: 'repair', holder: 'silas-ops' });
+      expect((await digestAt(h, at)).stalledWorking).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+// ------------------------------------------------------------------
 // Consolidated blockers port (the digest's first-fix input)
 // ------------------------------------------------------------------
 
@@ -1166,6 +1838,11 @@ describe('silas skills and wake prompt', () => {
     expect(ops).toContain('recorded rule (a documented retry, a re-brief on a known protocol break)');
     expect(ops).toContain('In-round lens retries are Perkins-owned machinery');
     expect(ops).toContain('wave-level request (`POST /api/dispatch/review`)');
+    // Issue #162: the stalled guidance is phase-aware — an older delivery is
+    // history, accepted operations fence the lane, and a null-minion row
+    // (no worker record at all) is named for the lane inspection path.
+    expect(ops).toContain('A truthful older delivery is history, not proof the current repair phase delivered');
+    expect(ops).toContain('A row with `minionId: null` has no worker record at all');
     expect(() => loadSilasSkills(['nope'])).toThrow(/unreadable/);
   });
 

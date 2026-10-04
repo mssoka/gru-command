@@ -208,11 +208,18 @@ retrying. When the answer is `409` with
 
 ## Stalled lanes and minion errors
 
-A working job whose minion has been silent past the stall threshold, or a
-minion turn that errored, is yours to assess: read the minion transcript,
-check the lane (`git -C <lane> status`), and decide: wait (say why in your
-completion note), re-brief a fresh minion, or escalate. Never kill a live
-session yourself.
+A working job whose CURRENT phase has not delivered and whose minion has
+been silent past the stall threshold, or a minion turn that errored, is
+yours to assess: read the minion transcript, check the lane
+(`git -C <lane> status`), and decide: wait (say why in your completion
+note), re-brief a fresh minion, or escalate. A truthful older delivery is
+history, not proof the current repair phase delivered; a phase whose
+latest delivery is current, or whose lane is owned by a pending
+directive/re-brief request, an in-flight verification or an answering
+review, is not offered as stalled. A row with `minionId: null` has no
+worker record at all: inspect the lane and the last status hop, then use
+the normal guarded repair surfaces (directive, re-brief, escalate). Never
+kill a live session yourself.
 
 ## Closing out
 
