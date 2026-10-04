@@ -421,78 +421,102 @@ export function freezeReviewInputs(input: FreezeReviewInput): FrozenReview {
   };
 }
 
-export function baseMovedSinceFreeze(review: FrozenReview): boolean {
+export type SourceMovementCause = 'target-moved' | 'base-rewritten' | 'base-unresolvable' | 'checkout-changed' | 'check-failed';
+export interface SourceMovement {
+  readonly cause: SourceMovementCause;
+  readonly detail: string;
+}
+
+function movement(cause: SourceMovementCause, detail: string): SourceMovement {
+  // Git can echo a credential-bearing remote URL in stderr. Mask it before
+  // bounding the detail that is persisted in reports, events and errors.
+  const safeDetail = detail.replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>]+/giu, '[REDACTED URL]');
+  return { cause, detail: safeDetail.replace(/[\r\n]+/gu, ' ').slice(0, 300) };
+}
+
+function gitErrorDetail(error: unknown): string {
+  const stderr = (error as { stderr?: unknown } | null)?.stderr;
+  const text = stderr instanceof Buffer ? stderr.toString('utf8') : typeof stderr === 'string' ? stderr : '';
+  return text.trim() || (error instanceof Error ? error.message : String(error));
+}
+
+/** Only the local base is read: an advance is valid while the frozen
+ * merge-base remains reachable; no remote base tip is consulted or fetched. */
+function baseMovementSinceFreeze(review: FrozenReview): SourceMovement | null {
+  const { repoPath, baseRef, baseRefSha, diffBaseSha } = review.manifest;
+  let live: string;
   try {
-    if (resolveGitCommit(review.manifest.repoPath, review.manifest.baseRef) !== review.manifest.baseRefSha) return true;
-    // Only a configured remote's branch can drift remotely. A local branch
-    // like `feature/x` is NOT remote/branch — treating the first segment as
-    // a remote silently skipped the drift check.
-    const slash = review.manifest.baseRef.indexOf('/');
-    if (slash !== -1 && !review.manifest.baseRef.startsWith('refs/remotes/')) {
-      const remote = review.manifest.baseRef.slice(0, slash);
-      const branch = review.manifest.baseRef.slice(slash + 1);
-      let configured = false;
-      try {
-        configured = git(review.manifest.repoPath, ['remote']).split('\n').includes(remote);
-      } catch {
-        configured = false;
-      }
-      if (configured) {
-        const advertised = gitRaw(review.manifest.repoPath, ['ls-remote', '--exit-code', remote, `refs/heads/${branch}`]).trim();
-        const remoteSha = advertised.split(/\s+/u)[0] ?? '';
-        if (remoteSha !== '') return remoteSha !== review.manifest.baseRefSha;
-      }
+    live = resolveGitCommit(repoPath, baseRef);
+  } catch (error) {
+    return movement('base-unresolvable', `base ${baseRef} cannot resolve: ${gitErrorDetail(error)}`);
+  }
+  if (live === baseRefSha) return null;
+  try {
+    gitRaw(repoPath, ['merge-base', '--is-ancestor', diffBaseSha, live]);
+    return null;
+  } catch (error) {
+    if ((error as { status?: unknown } | null)?.status === 1) {
+      return movement('base-rewritten', `base ${baseRef} no longer descends from ${diffBaseSha}`);
     }
-    return false;
-  } catch {
-    return true;
+    return movement('check-failed', gitErrorDetail(error));
   }
 }
 
 /** The configured-remote branch a movement ref names, or null when the ref
  * is not a remote-tracking ref (a SHA, a tag, or a local branch whose
  * leading segment is not a configured remote — a local `feature/x` is NOT
- * `remote feature`). Mirrors the base-drift rule for target refs. */
+ * `remote feature`). */
 function advertisedRemoteBranch(repoPath: string, ref: string): { remote: string; branch: string } | null {
   const remoteRef = ref.startsWith('refs/remotes/') ? ref.slice('refs/remotes/'.length) : ref;
   const slash = remoteRef.indexOf('/');
   if (slash <= 0 || slash === remoteRef.length - 1) return null;
   const remote = remoteRef.slice(0, slash);
   const branch = remoteRef.slice(slash + 1);
-  let configured = false;
+  return git(repoPath, ['remote']).split('\n').includes(remote) ? { remote, branch } : null;
+}
+
+/** Compare the locally resolved base ancestry, movement ref (local and
+ * advertised target tip), HEAD and pristine checkout with the frozen target.
+ * A base advance is not movement; frozen SHAs stay provenance. Any failed
+ * check returns a cause, so the boolean wrapper fails closed on every error. */
+export function sourceMovementSinceFreeze(review: FrozenReview): SourceMovement | null {
+  const { repoPath, targetRef, targetSha } = review.manifest;
   try {
-    configured = git(repoPath, ['remote']).split('\n').includes(remote);
-  } catch {
+    const base = baseMovementSinceFreeze(review);
+    if (base !== null) return base;
+    let localTarget: string;
+    try {
+      localTarget = resolveGitCommit(repoPath, targetRef);
+    } catch (error) {
+      return movement('target-moved', `target ${targetRef} cannot resolve: ${gitErrorDetail(error)}`);
+    }
+    if (localTarget !== targetSha) return movement('target-moved', `target ${targetRef} is ${localTarget}, frozen at ${targetSha}`);
+    // A push may move the host tip without moving the local tracking ref.
+    const remoteTarget = advertisedRemoteBranch(repoPath, targetRef);
+    if (remoteTarget !== null) {
+      const advertised = gitRaw(repoPath, ['ls-remote', '--exit-code', remoteTarget.remote, `refs/heads/${remoteTarget.branch}`]).trim();
+      const tip = advertised.split(/\s+/u)[0] ?? '';
+      if (tip !== targetSha) return movement('target-moved', `advertised ${remoteTarget.remote}/${remoteTarget.branch} is ${tip}, frozen at ${targetSha}`);
+    }
+    if (resolveGitCommit(repoPath, 'HEAD') !== targetSha) {
+      return movement('checkout-changed', `review checkout HEAD no longer matches ${targetSha}`);
+    }
+    try {
+      assertReviewCheckoutClean(repoPath);
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith('detached review checkout is not pristine')) {
+        return movement('checkout-changed', error.message);
+      }
+      throw error;
+    }
     return null;
+  } catch (error) {
+    return movement('check-failed', gitErrorDetail(error));
   }
-  return configured ? { remote, branch } : null;
 }
 
 export function refMovedSinceFreeze(review: FrozenReview): boolean {
-  try {
-    if (baseMovedSinceFreeze(review)) return true;
-    if (git(review.manifest.repoPath, ['rev-parse', '--verify', `${review.manifest.targetRef}^{commit}`]) !== review.manifest.targetSha) {
-      return true;
-    }
-    // A remote-tracking movement ref can move on the host without the local
-    // ref moving (a push during the round): verify the live advertised tip,
-    // mirroring the base drift check. Fail closed on an unreachable remote.
-    const remoteTarget = advertisedRemoteBranch(review.manifest.repoPath, review.manifest.targetRef);
-    if (remoteTarget !== null) {
-      const advertised = gitRaw(review.manifest.repoPath, ['ls-remote', '--exit-code', remoteTarget.remote, `refs/heads/${remoteTarget.branch}`]).trim();
-      if ((advertised.split(/\s+/u)[0] ?? '') !== review.manifest.targetSha) return true;
-    }
-    if (git(review.manifest.repoPath, ['rev-parse', '--verify', 'HEAD^{commit}']) !== review.manifest.targetSha) {
-      return true;
-    }
-    // The detached review checkout is a frozen input too. Any tracked,
-    // staged, untracked, or ignored byte is outside the target commit and
-    // invalidates proof.
-    assertReviewCheckoutClean(review.manifest.repoPath);
-    return false;
-  } catch {
-    return true;
-  }
+  return sourceMovementSinceFreeze(review) !== null;
 }
 
 export function writeReviewArtifact(review: FrozenReview, relativePath: string, value: unknown): string {

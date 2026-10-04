@@ -244,7 +244,12 @@ const DIGEST_RULES: Readonly<Record<string, (event: EventRecord) => string | nul
     const verdict = textOf(payloadOf(event).canonicalVerdict);
     return `round ${event.roundId ?? '?'}: report posted to the pull request${verdict !== null ? ` (${verdict})` : ''}`;
   },
-  'round.head-moved': (event) => `round ${event.roundId ?? '?'}: head moved after freeze — verdict invalidated`,
+  'round.head-moved': (event) => {
+    const cause = textOf(payloadOf(event).cause);
+    return cause === null
+      ? `round ${event.roundId ?? '?'}: head moved after freeze — verdict invalidated`
+      : `round ${event.roundId ?? '?'}: review source changed after freeze (${cause}) — verdict invalidated`;
+  },
   'round.post-recovered': (event) => {
     const verdict = textOf(payloadOf(event).postedVerdict);
     return `round ${event.roundId ?? '?'}: recorded verdict recovered after restart${verdict !== null ? ` (${verdict})` : ''}`;

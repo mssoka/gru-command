@@ -185,6 +185,10 @@ the required coverage cardinality.
   or delivery failure durably terminalizes the round as INCOMPLETE. It can
   neither post nor record approval. Startup reconciliation marks interrupted
   rounds INCOMPLETE and releases their owned detached lanes.
+- The base is changed source only when the locally resolved base ref no
+  longer contains the frozen merge-base (rewritten past it) or no longer
+  resolves; nothing is fetched, so a host-side rewrite counts once it is
+  visible locally, and the frozen base stays recorded as provenance.
 - Installed builds load the integrity-pinned policy and Claude MCP server
   relative to the compiled package. Missing, tampered, symlinked, or
   source-fallback resources fail closed.

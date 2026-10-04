@@ -6,7 +6,7 @@ import type { AgentSpawner } from '../service.js';
 import type { AgentHandle, NativeAgentTool, PromptOptions } from '../../runtime/types.js';
 import type { PacingGate, PacingLease, PacingEventRecorder, RateLimitBackoffPolicy } from '../../runtime/pacing.js';
 import { withRateLimitRetries, type RateLimitRetryOptions } from '../../runtime/rate-limit-retry.js';
-import { assertFrozenPromptBounds, refMovedSinceFreeze, writeReviewArtifact, type FrozenReview } from './artifacts.js';
+import { assertFrozenPromptBounds, sourceMovementSinceFreeze, writeReviewArtifact, type FrozenReview, type SourceMovement } from './artifacts.js';
 import { readFrozenEvidenceBytes, renderEvidencePromptSection } from '../../review-inputs/evidence.js';
 import { finalAssistantText } from './session-output.js';
 import { PERKINS_FINDING_SOURCES, type PerkinsFindingSource, type PerkinsLens, type PerkinsPolicy } from './policy.js';
@@ -189,6 +189,7 @@ export interface PerkinsWholeResult {
   readonly targetSha: string;
   readonly diffBaseSha: string;
   readonly headMoved: boolean;
+  readonly sourceMovement?: SourceMovement;
   readonly lensEnvelopes: readonly LensEnvelope[];
 }
 
@@ -260,19 +261,21 @@ function sanitizeError(error: unknown): string {
   return (error instanceof Error ? error.message : String(error)).replace(/[\r\n]+/g, ' ').slice(0, 500);
 }
 
-function headMovedSinceFreeze(review: FrozenReview, movementRef: string): boolean {
-  // The frozen inputs — target ref, base drift, HEAD, and the pristine
-  // detached checkout — must ALL still be exactly what was frozen; unknown
-  // movement can never authorize the now-different head.
-  if (refMovedSinceFreeze(review)) return true;
-  if (movementRef === review.manifest.targetSha || movementRef === review.manifest.targetRef) return false;
+function headMovedSinceFreeze(review: FrozenReview, movementRef: string): SourceMovement | null {
+  // The target ref, HEAD, and the pristine detached checkout must ALL still
+  // be exactly what was frozen, and the base must not have been rewritten
+  // past the frozen merge-base; unknown movement can never authorize the
+  // now-different head.
+  const observed = sourceMovementSinceFreeze(review);
+  if (observed !== null) return observed;
+  if (movementRef === review.manifest.targetSha || movementRef === review.manifest.targetRef) return null;
   try {
     return execFileSync(
       'git', ['-C', review.manifest.repoPath, 'rev-parse', '--verify', `${movementRef}^{commit}`],
       { encoding: 'utf8', timeout: GIT_PROOF_TIMEOUT_MS },
-    ).trim() !== review.manifest.targetSha;
+    ).trim() === review.manifest.targetSha ? null : { cause: 'target-moved', detail: `movement ref ${movementRef} no longer matches ${review.manifest.targetSha}` };
   } catch {
-    return true;
+    return { cause: 'target-moved', detail: `movement ref ${movementRef} cannot resolve` };
   }
 }
 
@@ -1561,7 +1564,7 @@ export class PerkinsWholeReview {
           const submission = validation.submission;
           writeReviewArtifact(review, `lead/submission-attempt-${attempt}.json`, submission);
           const reportFile = writeReviewArtifact(review, 'perkins-report.md', submission.report_markdown.endsWith('\n') ? submission.report_markdown : `${submission.report_markdown}\n`);
-          const headMoved = headMovedAtSubmit;
+          const headMoved = headMovedAtSubmit !== null;
           // The reviewer owns the verdict; the host owns assembly of the
           // durable record from the accepted submission.
           const leadFindings: VerifiedFinding[] = submission.findings.map((finding) => ({
@@ -1624,7 +1627,7 @@ export class PerkinsWholeReview {
             canonicalVerdict: submission.verdict, findings, priorDispositions: submission.prior_dispositions,
             specialistRuns, artifactDirectory: review.directory, reportFile,
             targetSha: review.manifest.targetSha, diffBaseSha: review.manifest.diffBaseSha,
-            headMoved, lensEnvelopes: [...envelopes],
+            headMoved, ...(headMovedAtSubmit !== null ? { sourceMovement: headMovedAtSubmit } : {}), lensEnvelopes: [...envelopes],
           };
           return {
             text: JSON.stringify({ accepted: true, canonicalVerdict: submission.verdict, findingCount: findings.length }),
@@ -1723,7 +1726,7 @@ export class PerkinsWholeReview {
   private validateSubmission(
     context: SubmissionValidationContext,
     raw: unknown,
-    headMovedObserved: boolean,
+    headMovedObserved: SourceMovement | null,
   ): SubmissionValidation {
     const issues: SubmissionValidationIssue[] = [];
     const push = (subject: string, rule: string, message: string): void => {
@@ -1931,9 +1934,8 @@ export class PerkinsWholeReview {
     // submission can be accepted against a moved ref. The observation is
     // supplied by the caller (one per submission) so validation and the
     // sealed artifact can never disagree.
-    const headMoved = headMovedObserved;
-    if (headMoved && verdict !== null && verdict !== 'INCOMPLETE') {
-      push('submission', 'head-moved', `the source ref moved after target ${context.review.manifest.targetSha} was frozen; only an INCOMPLETE submission can be accepted`);
+    if (headMovedObserved !== null && verdict !== null && verdict !== 'INCOMPLETE') {
+      push('submission', 'head-moved', `source changed after target ${context.review.manifest.targetSha} was frozen (${headMovedObserved.cause}: ${headMovedObserved.detail}); only an INCOMPLETE submission can be accepted`);
     }
     if (issues.length > 0) return { ok: false, issues };
     if (verdict === null || findings === null || dispositions === null) {
