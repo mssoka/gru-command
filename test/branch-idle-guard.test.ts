@@ -462,6 +462,7 @@ describe('branch-idle guard', () => {
         opts.jobId === 'dispatch-live'
           ? ([{ requestId: 'r-live', jobId: opts.jobId, state: 'dispatching' }] as unknown as readonly DirectiveRequestRecord[])
           : [],
+      hasUnsettledVerificationRun: (): boolean => false,
     };
     const busy = (id: string): boolean => laneIsBusy(ledger, ledger.listJobs().find((job) => job.id === id)!);
     expect(busy('never-started')).toBe(true);
@@ -525,6 +526,7 @@ describe('branch-idle guard', () => {
         [...pagedHistory].reverse().slice(0, opts?.limit ?? 200),
       listPendingRebriefs: (): readonly PendingRebriefRecord[] => [],
       listPendingDirectives: (): readonly DirectiveRequestRecord[] => [],
+      hasUnsettledVerificationRun: (): boolean => false,
     };
     expect(laneIsBusy(paged, paged.listJobs()[0]!)).toBe(false);
 
@@ -545,6 +547,7 @@ describe('branch-idle guard', () => {
         [...cappedHistory].reverse().slice(0, opts?.limit ?? 200),
       listPendingRebriefs: (): readonly PendingRebriefRecord[] => [],
       listPendingDirectives: (): readonly DirectiveRequestRecord[] => [],
+      hasUnsettledVerificationRun: (): boolean => false,
     };
     expect(laneIsBusy(capped, capped.listJobs()[0]!)).toBe(false);
   });
@@ -761,6 +764,7 @@ describe('branch-idle guard', () => {
       listPendingRebriefs: (opts: { readonly jobId?: string } = {}): readonly PendingRebriefRecord[] =>
         opts.jobId === undefined ? [...pending.values()].flat() : (pending.get(opts.jobId) ?? []),
       listPendingDirectives: (): readonly DirectiveRequestRecord[] => [],
+      hasUnsettledVerificationRun: (): boolean => false,
     };
     const busy = (id: string): boolean => laneIsBusy(ledger, ledger.listJobs().find((job) => job.id === id)!);
     expect(busy('working-pending')).toBe(true);
@@ -1306,6 +1310,7 @@ describe('branch-idle guard', () => {
       listPendingRebriefs: (opts: { readonly jobId?: string } = {}): readonly PendingRebriefRecord[] =>
         opts.jobId === undefined ? [...pending.values()].flat() : (pending.get(opts.jobId) ?? []),
       listPendingDirectives: (): readonly DirectiveRequestRecord[] => [],
+      hasUnsettledVerificationRun: (): boolean => false,
     };
     const lanes = [
       laneRecord('marker-owner', 'marker-owner', 'gru/marker-owner'),

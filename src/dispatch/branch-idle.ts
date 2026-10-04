@@ -123,6 +123,9 @@ export interface BranchIdleLedger {
     readonly jobId?: string;
     readonly states?: readonly DirectiveState[];
   }): readonly DirectiveRequestRecord[];
+  /** True while any verification run for the job is unsettled: it owns the
+   * checkout and no review may freeze the same head. */
+  hasUnsettledVerificationRun(jobId: string): boolean;
 }
 
 /** The branch a job lane is created on (worktree manager convention; also
@@ -252,13 +255,18 @@ export function laneIsBusy(ledger: BranchIdleLedger, job: JobRecord): boolean {
   // An accepted directive request may already be prompting a writer before
   // its admission event lands: review must not arm on that head (issue #162).
   if (ledger.listPendingDirectives({ jobId: job.id, states: LIVE_DIRECTIVE_STATES }).length > 0) return true;
-  if (!BRANCH_BUSY_STATUSES.includes(job.status)) return false;
+  // A verification run owns the checkout for its whole life; a review must
+  // not freeze the head it is verifying.
+  if (ledger.hasUnsettledVerificationRun(job.id)) return true;
   const delivered = ledger.latestJobEvent(job.id, 'job.delivered');
-  if (delivered === null) return true;
-  if (delivered.seq <= openAttemptStartSeq(ledger, job.id)) return true;
   // A repair admitted after the delivery keeps the lane busy even when no
-  // status hop recorded it (fallback-review flows stay `working`).
-  return delivered.seq <= latestRepairStartSeq(ledger, job.id);
+  // status hop recorded it, and even while the stale status still reads
+  // `delivered` (a claimed provider continuation) — fallback and recovery
+  // flows do not always flip the row.
+  if (delivered !== null && delivered.seq <= latestRepairStartSeq(ledger, job.id)) return true;
+  if (!BRANCH_BUSY_STATUSES.includes(job.status)) return false;
+  if (delivered === null) return true;
+  return delivered.seq <= openAttemptStartSeq(ledger, job.id);
 }
 
 /** Every busy lane whose branch is the reviewed target. The reviewed job is

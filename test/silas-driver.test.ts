@@ -1335,20 +1335,39 @@ describe('silas digest: stalled current phases (issue #162)', () => {
     }
   });
 
-  it('a fresh dispatch with no worker record is surfaced past its grace window', async () => {
+  it('a fresh dispatch with no worker record is accepted startup, not lost work', async () => {
     const h = makeLedger();
     try {
       h.ledger.addJob({ id: 'job-dispatch', repo: 'fixture-app', title: 't', briefing: 'b' });
       h.ledger.setJobStatus('job-dispatch', 'working');
       const startedAt = Date.parse(h.ledger.latestJobEvent('job-dispatch', 'job.status')!.ts);
-      // The grace IS the accepted startup window: inside it, no offer.
-      expect((await digestAt(h, startedAt + DEFAULT_SILAS_CONFIG.stallThresholdMs)).stalledWorking).toEqual([]);
-      // Past it, a missing source record no longer hides the lane: Silas
-      // assesses (a live dispatch turn keeps owning it; a lost one is
-      // surfaced) — nothing is spawned or reopened by the detector.
-      expect(
-        (await digestAt(h, startedAt + DEFAULT_SILAS_CONFIG.stallThresholdMs + 1)).stalledWorking,
-      ).toMatchObject([{ jobId: 'job-dispatch', minionId: null, minionState: null, lastActivity: null }]);
+      // The dispatch turn owns its accepted startup (a queued worker-gate
+      // admission is not lost work); a deterministic failure blocks the
+      // lane with error evidence instead. Repair phases are the case where
+      // a missing record means lost work — covered above.
+      expect((await digestAt(h, startedAt + DEFAULT_SILAS_CONFIG.stallThresholdMs + 1)).stalledWorking).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('an in-review attempt that never delivered is still assessed when its worker dies', async () => {
+    const h = makeLedger();
+    try {
+      // A PR link flips a still-working attempt to in-review before its
+      // delivery: laneIsBusy still treats it as a writer, so the stall
+      // channel must not strand it behind the in-review status.
+      h.ledger.addJob({ id: 'job-linked', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('job-linked', 'working');
+      h.ledger.setJobPr('job-linked', 'https://git.example.invalid/o/r/pull/3');
+      h.ledger.setJobStatus('job-linked', 'in-review');
+      h.ledger.registerAgent({ id: 'min-linked', role: 'minion', jobId: 'job-linked' });
+      h.ledger.setAgentState('min-linked', 'idle');
+      const at = idleAt(h, 'min-linked') + DEFAULT_SILAS_CONFIG.stallThresholdMs + 1;
+      expect((await digestAt(h, at)).stalledWorking.map((row) => row.jobId)).toEqual(['job-linked']);
+      // Once the attempt delivers, the review owns it: no stall offer.
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-linked', payload: { sha: 'sha-linked' } });
+      expect((await digestAt(h, at)).stalledWorking).toEqual([]);
     } finally {
       h.cleanup();
     }
@@ -1470,12 +1489,14 @@ describe('silas digest: stalled current phases (issue #162)', () => {
       h.ledger.appendCustomEvent({
         kind: 'round.perkins-incomplete', jobId: 'job-abort', roundId: round.id, payload: { reason: 'service_restart' },
       });
-      // The abort's in-review → working restore is the delivered head's
-      // review re-arm: no stall offer, and the clean-abort row stands.
+      // The in-review → working restore leaves the lane on an old head the
+      // branch guard refuses to re-arm (the restore hop keeps the attempt
+      // open): the lane is surfaced for assessment, never offered an
+      // unarmable clean-abort review row.
       h.ledger.setJobStatus('job-abort', 'working');
       const rearmed = await digestAt(h, farFuture());
-      expect(rearmed.stalledWorking).toEqual([]);
-      expect(rearmed.prWithoutReview.map((row) => row.jobId)).toEqual(['job-abort']);
+      expect(rearmed.prWithoutReview).toEqual([]);
+      expect(rearmed.stalledWorking.map((row) => row.jobId)).toEqual(['job-abort']);
       // A LATER delivered → working hop is a genuine reopen: the old abort
       // must not hide it, and the old head must not be offered for review.
       h.ledger.setJobStatus('job-abort', 'delivered');
@@ -1634,6 +1655,80 @@ describe('silas digest: stalled current phases (issue #162)', () => {
       // A terminal fallback failure newer than the trigger answers nothing.
       h.ledger.appendCustomEvent({ kind: 'job.fallback-review', jobId: 'job-review', payload: { phase: 'blocked' } });
       expect((await digestAt(h, at)).stalledWorking.map((row) => row.jobId)).toEqual(['job-review']);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a stalled offer is retracted when its phase delivers during the await', async () => {
+    const h = makeLedger();
+    try {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-10-04T10:00:00.000Z'));
+      h.ledger.addJob({ id: 'job-other5', repo: 'fixture-app', title: 'other', briefing: 'b' });
+      h.ledger.setJobStatus('job-other5', 'working');
+      const round = h.ledger.addRound({ jobId: 'job-other5', lenses: ['blind'] });
+      h.ledger.setRoundStatus(round.id, 'live');
+      h.ledger.setRoundVerdict(round.id, 'changes-requested');
+      h.ledger.setJobStatus('job-other5', 'in-review');
+      vi.setSystemTime(new Date('2026-10-04T10:00:01.000Z'));
+      reopenRepairPhase(h, 'job-race-delivery');
+      h.ledger.registerAgent({ id: 'min-race-delivery', role: 'minion', jobId: 'job-race-delivery' });
+      h.ledger.setAgentState('min-race-delivery', 'idle');
+      vi.useRealTimers();
+      let raced = false;
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => {
+          if (!raced) {
+            raced = true;
+            h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-race-delivery', payload: { sha: 'sha-delivered' } });
+          }
+          return { blockers: [], note: null };
+        },
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+        now: () => farFuture(),
+      });
+      expect(raced).toBe(true);
+      expect(digest.stalledWorking).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a stalled offer is retracted when verification takes ownership during the await', async () => {
+    const h = makeLedger();
+    try {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-10-04T10:00:00.000Z'));
+      h.ledger.addJob({ id: 'job-other6', repo: 'fixture-app', title: 'other', briefing: 'b' });
+      h.ledger.setJobStatus('job-other6', 'working');
+      const round = h.ledger.addRound({ jobId: 'job-other6', lenses: ['blind'] });
+      h.ledger.setRoundStatus(round.id, 'live');
+      h.ledger.setRoundVerdict(round.id, 'changes-requested');
+      h.ledger.setJobStatus('job-other6', 'in-review');
+      vi.setSystemTime(new Date('2026-10-04T10:00:01.000Z'));
+      reopenRepairPhase(h, 'job-race-verify');
+      h.ledger.registerAgent({ id: 'min-race-verify', role: 'minion', jobId: 'job-race-verify' });
+      h.ledger.setAgentState('min-race-verify', 'idle');
+      vi.useRealTimers();
+      let raced = false;
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => {
+          if (!raced) {
+            raced = true;
+            h.ledger.appendCustomEvent({ kind: 'verification.requested', jobId: 'job-race-verify', payload: { run_id: 'run-race', scope: 'full' } });
+          }
+          return { blockers: [], note: null };
+        },
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+        now: () => farFuture(),
+      });
+      expect(raced).toBe(true);
+      expect(digest.stalledWorking).toEqual([]);
     } finally {
       h.cleanup();
     }
