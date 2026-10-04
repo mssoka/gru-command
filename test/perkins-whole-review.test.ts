@@ -1242,27 +1242,88 @@ describe('Stage 2 specialist accounting', () => {
       specialists: ['edge'],
       childAnswer: (prompt) => {
         if (prompt.includes('RETRY CORRECTION')) {
-          chmodSync(join(directory, 'specialists'), 0o700);
+          rmSync(join(directory, 'specialists'));
           return '[]';
         }
-        mkdirSync(join(directory, 'specialists'), { recursive: true });
-        chmodSync(join(directory, 'specialists'), 0o500);
+        // A regular file is never an artifact directory, even for a
+        // privileged runner that could write through chmod restrictions.
+        writeFileSync(join(directory, 'specialists'), 'blocked');
         throw new Error('edge turn failed');
       },
-      beforeSubmit: () => { chmodSync(join(directory, 'specialists'), 0o700); },
     });
     directory = h.frozen.directory;
     const result = await h.run();
     const runs = result.specialistRuns.filter((run) => run.lens === 'edge');
     expect(runs).toMatchObject([
-      { attempt: 1, status: 'failed', failureKind: 'error', error: 'edge turn failed', evidenceRecordingError: expect.stringMatching(/EACCES/) },
+      { attempt: 1, status: 'failed', failureKind: 'error', error: 'edge turn failed', evidenceRecordingError: expect.stringMatching(/real directory/) },
       { attempt: 2, status: 'valid' },
     ]);
     const consolidated = JSON.parse(readFileSync(join(directory, 'consolidated.json'), 'utf8')) as { specialistRuns: typeof runs };
     expect(consolidated.specialistRuns).toMatchObject(runs);
     const receipt = JSON.parse(readFileSync(join(directory, 'lead/receipt.json'), 'utf8')) as { specialistRuns: number };
     expect(receipt.specialistRuns).toBe(2);
-    expect(readdirSync(join(directory, 'children')).some((name) => name.startsWith('failed-edge-a1-'))).toBe(true);
+    const fallbackFile = readdirSync(join(directory, 'children')).find((name) => name.startsWith('failed-edge-a1-'));
+    expect(fallbackFile).toBeDefined();
+    const fallback = JSON.parse(readFileSync(join(directory, 'children', fallbackFile!), 'utf8')) as typeof runs[number];
+    expect(fallback).toMatchObject({
+      lens: 'edge', attempt: 1, status: 'failed', failureKind: 'error',
+      error: 'edge turn failed', evidenceRecordingError: expect.stringMatching(/real directory/),
+    });
+  });
+
+  it('keeps a validated child valid when its raw evidence write fails', async () => {
+    let directory = '';
+    const h = wholeHarness({
+      specialists: ['edge'],
+      childAnswer: () => {
+        writeFileSync(join(directory, 'specialists'), 'blocked');
+        return JSON.stringify([groundedFinding('edge', 'warning')]);
+      },
+    });
+    directory = h.frozen.directory;
+    const result = await h.run();
+    expect(result.specialistRuns).toMatchObject([{ lens: 'edge', attempt: 1, status: 'valid', evidenceRecordingError: expect.stringMatching(/real directory/) }]);
+    expect(result.findings).toHaveLength(1);
+    expect(h.childCalls).toHaveLength(1);
+    const consolidated = JSON.parse(readFileSync(join(directory, 'consolidated.json'), 'utf8')) as { specialistRuns: Array<{ status: string; evidenceRecordingError?: string }> };
+    expect(consolidated.specialistRuns[0]).toMatchObject({ status: 'valid', evidenceRecordingError: expect.stringMatching(/real directory/) });
+  });
+
+  it('retains valid raw/envelope and writes a distinct fallback if the child record fails', async () => {
+    let directory = '';
+    const h = wholeHarness({
+      specialists: ['edge'],
+      childAnswer: (_prompt, call) => {
+        const id = `edge-a1-${createHash('sha256').update(call.agentId).digest('hex').slice(0, 16)}`;
+        mkdirSync(join(directory, 'children', `${id}.json`), { recursive: true });
+        return JSON.stringify([groundedFinding('edge', 'warning')]);
+      },
+    });
+    directory = h.frozen.directory;
+    const result = await h.run();
+    expect(result.specialistRuns).toMatchObject([{ lens: 'edge', status: 'valid', evidenceRecordingError: expect.stringMatching(/children.*EEXIST/) }]);
+    const files = readdirSync(join(directory, 'specialists')).filter((name) => name.startsWith('edge.'));
+    expect(files.filter((name) => name.endsWith('.raw.json'))).toHaveLength(1);
+    const envelopeFile = files.find((name) => name.endsWith('.envelope.json'))!;
+    const envelope = JSON.parse(readFileSync(join(directory, 'specialists', envelopeFile), 'utf8')) as { status: string; findings: unknown[] };
+    expect(envelope).toMatchObject({ status: 'valid', findings: [groundedFinding('edge', 'warning')] });
+    const fallbackFile = readdirSync(join(directory, 'children')).find((name) => name.includes('.recording-error-'))!;
+    const fallback = JSON.parse(readFileSync(join(directory, 'children', fallbackFile), 'utf8')) as { status: string; evidenceRecordingError: string; findings: unknown[] };
+    expect(fallback).toMatchObject({ status: 'valid', evidenceRecordingError: expect.stringMatching(/EEXIST/), findings: [groundedFinding('edge', 'warning')] });
+    expect(result.findings).toHaveLength(1);
+  });
+
+  it('accounts a settled valid child when the done-progress observer throws', async () => {
+    const h = wholeHarness({ specialists: ['edge'], childAnswer: () => '[]' }, {
+      onProgress: (event) => { if (event.state === 'done') throw new Error('progress observer unavailable'); },
+    });
+    const result = await h.run();
+    expect(h.childCalls).toHaveLength(1);
+    expect(result.specialistRuns).toMatchObject([{ lens: 'edge', attempt: 1, status: 'valid', progressError: 'progress observer unavailable' }]);
+    const consolidated = JSON.parse(readFileSync(join(result.artifactDirectory, 'consolidated.json'), 'utf8')) as { specialistRuns: Array<{ progressError?: string }> };
+    expect(consolidated.specialistRuns[0]?.progressError).toBe('progress observer unavailable');
+    const receipt = JSON.parse(readFileSync(join(result.artifactDirectory, 'lead/receipt.json'), 'utf8')) as { specialistRuns: number };
+    expect(receipt.specialistRuns).toBe(1);
   });
 });
 

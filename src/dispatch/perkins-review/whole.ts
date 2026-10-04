@@ -178,6 +178,8 @@ export interface SpecialistRun {
   readonly cleanupRecordingError?: string;
   /** Failure evidence could not be written; the executed attempt still counts. */
   readonly evidenceRecordingError?: string;
+  /** A progress observer failed after this attempt settled; work still counts. */
+  readonly progressError?: string;
 }
 
 export interface PerkinsWholeResult {
@@ -804,6 +806,7 @@ export class PerkinsWholeReview {
       let handle: AgentHandle | null = null;
       let reviewLease: PacingLease | null = null;
       let settled: SpecialistResult | null = null;
+      let settledProgress: ReviewProgress | null = null;
       let disposeArtifactError: unknown | null = null;
       let raw: string | null = null;
       /** Set only when the child's own output failed recovery/validation or
@@ -946,14 +949,33 @@ export class PerkinsWholeReview {
           ...(recovery !== undefined ? { recovery } : {}),
         };
         envelopes.push(envelope);
-        writeReviewArtifact(review, `specialists/${lens}.attempt-${attempt}-${runToken}.raw.json`, `${outputBytes}\n`);
-        writeReviewArtifact(review, `specialists/${lens}.attempt-${attempt}-${runToken}.envelope.json`, envelope);
-        const result: SpecialistResult = {
-          resultId, agentId: handle.id, lens, attempt, status: 'valid', findings: reviewFindings,
-        };
-        writeReviewArtifact(review, `children/${resultId}.json`, result);
-        this.onProgress({ lens, state: 'done', note: `${reviewFindings.length} finding(s)` });
-        settled = result;
+        settled = { resultId, agentId: handle.id, lens, attempt, status: 'valid', findings: reviewFindings };
+        // The validated output remains valid even when storage rejects one
+        // of its evidence files. Record each independent piece where possible.
+        const recordingErrors: string[] = [];
+        for (const [path, value] of [
+          [`specialists/${lens}.attempt-${attempt}-${runToken}.raw.json`, `${outputBytes}\n`],
+          [`specialists/${lens}.attempt-${attempt}-${runToken}.envelope.json`, envelope],
+          [`children/${resultId}.json`, settled],
+        ] as const) {
+          try {
+            writeReviewArtifact(review, path, value);
+          } catch (writeError) {
+            recordingErrors.push(`${path}: ${sanitizeError(writeError)}`);
+          }
+        }
+        if (recordingErrors.length > 0) {
+          settled = { ...settled, evidenceRecordingError: recordingErrors.join('; ') };
+          // A previously published valid raw/envelope must never be replaced
+          // with a failure envelope when only the child-result write failed.
+          try {
+            writeReviewArtifact(review, `children/${resultId}.recording-error-${runToken}.json`, settled);
+          } catch (writeError) {
+            settled = { ...settled, evidenceRecordingError:
+              `${settled.evidenceRecordingError}; children fallback: ${sanitizeError(writeError)}` };
+          }
+        }
+        settledProgress = { lens, state: 'done', note: `${reviewFindings.length} finding(s)${recordingErrors.length > 0 ? ` (evidence recording failed: ${recordingErrors.join('; ')})` : ''}` };
       } catch (error) {
         const message = sanitizeError(error);
         // A tool-capable child that finished its turn without submitting still
@@ -1013,7 +1035,7 @@ export class PerkinsWholeReview {
               `${settled.evidenceRecordingError}; children fallback: ${sanitizeError(writeError)}` };
           }
         }
-        this.onProgress({ lens, state: 'error', note: `${failureKind}: ${message}${recordingErrors.length > 0 ? ` (evidence recording failed: ${recordingErrors.join('; ')})` : ''}` });
+        settledProgress = { lens, state: 'error', note: `${failureKind}: ${message}${recordingErrors.length > 0 ? ` (evidence recording failed: ${recordingErrors.join('; ')})` : ''}` };
       } finally {
         // Cleanup is best-effort by design (T13): a rejected dispose must
         // never discard the settled result above it. The cleanup failure
@@ -1057,6 +1079,15 @@ export class PerkinsWholeReview {
           ...settled,
           cleanupRecordingError: `could not record the dispose failure durably: ${sanitizeError(disposeArtifactError)}`,
         };
+      }
+      if (settledProgress !== null) {
+        try {
+          this.onProgress(settledProgress);
+        } catch (error) {
+          // Observability must not reject a settled pool slot and refund a
+          // child that actually ran; disclose the observer failure instead.
+          settled = { ...settled!, progressError: sanitizeError(error) };
+        }
       }
       return settled as SpecialistResult;
     };
@@ -1590,6 +1621,7 @@ export class PerkinsWholeReview {
             ...(result.findingsDelivered === false ? { findingsDelivered: false } : {}),
             ...(result.cleanupRecordingError !== undefined ? { cleanupRecordingError: result.cleanupRecordingError } : {}),
             ...(result.evidenceRecordingError !== undefined ? { evidenceRecordingError: result.evidenceRecordingError } : {}),
+            ...(result.progressError !== undefined ? { progressError: result.progressError } : {}),
           }));
           writeReviewArtifact(review, 'consolidated.json', {
             schemaVersion: 3,
