@@ -4494,6 +4494,10 @@ export class LedgerApi {
       states?: readonly DirectiveState[];
       limit?: number;
       cursor?: string;
+      /** Integer rowid cursor (reconcile pagination): continues AFTER the
+       * given rowid in insertion order. Mutually exclusive with the string
+       * request-id cursor. */
+      rowidCursor?: number;
     } = {},
   ): readonly DirectiveRequestRecord[] {
     if (opts.state !== undefined && opts.states !== undefined) {
@@ -4519,12 +4523,33 @@ export class LedgerApi {
       where.push(`state IN (${opts.states.map(() => '?').join(', ')})`);
       params.push(...opts.states);
     }
+    if (opts.cursor !== undefined && opts.rowidCursor !== undefined) {
+      throw new Error('listPendingDirectives takes either the request-id cursor or the rowid cursor, never both');
+    }
     if (opts.cursor !== undefined) {
       where.push('request_id > ?');
       params.push(opts.cursor);
     }
-    const sql = `SELECT * FROM pending_directives${where.length > 0 ? ` WHERE ${where.join(' AND ')}` : ''} ORDER BY request_id LIMIT ?`;
+    if (opts.rowidCursor !== undefined) {
+      if (!Number.isSafeInteger(opts.rowidCursor) || opts.rowidCursor < 0) {
+        throw new Error('listPendingDirectives rowidCursor must be a safe non-negative rowid');
+      }
+      where.push('rowid > ?');
+      params.push(opts.rowidCursor);
+    }
+    const order = opts.rowidCursor !== undefined ? 'rowid' : 'request_id';
+    const sql = `SELECT * FROM pending_directives${where.length > 0 ? ` WHERE ${where.join(' AND ')}` : ''} ORDER BY ${order} LIMIT ?`;
     return (this.db.prepare(sql).all(...(params as never[]), limit) as Row[]).map((row) => this.directiveFromRow(row));
+  }
+
+  /** The rowid cursor for one directive request (reconcile pagination
+   * anchor). */
+  directiveRowid(requestId: string): number | null {
+    if (requestId.trim() === '') throw new Error('directiveRowid requires a non-empty requestId');
+    const row = this.db.prepare('SELECT rowid AS _rowid FROM pending_directives WHERE request_id = ?').get(requestId) as
+      | Row
+      | undefined;
+    return row === undefined ? null : Number(row._rowid);
   }
 
   /** Bind a request to its ACTUAL native admission: the correlated

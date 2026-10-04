@@ -34,6 +34,11 @@ describe('board engine — v4 snapshot blocks', () => {
     expect(snapshot.selfHeal).toBeNull();
     expect(snapshot.silas).toEqual({
       lastWakeAt: null,
+      lastTickAt: null,
+      lastReconcileAt: null,
+      lastReconcileFailedAt: null,
+      lastUsefulActionAt: null,
+      openTurnSince: null,
       reconciliationsToday: 0,
       checkedAt: '2026-09-23T12:00:00.000Z',
     });
@@ -87,6 +92,49 @@ describe('board engine — v4 snapshot blocks', () => {
     });
     expect(forwarded.snapshot().silas.reconciliationsToday).toBe(0);
     expect(forwarded.snapshot().silas.lastWakeAt).not.toBeNull(); // the record outlives the day
+  });
+
+  it('separates tick/reconcile health by outcome and reports an open turn from supervision (#163)', () => {
+    const stamp = '2026-09-23T12:00:00.000Z';
+    const { api, engine } = fresh({
+      now: () => Date.parse(stamp),
+      // A live silas record with an open turn is the only source of
+      // openTurnSince; the wake marker supplies the start timestamp.
+      supervisionFor: (agentId) =>
+        agentId === 'silas-live'
+          ? {
+              agentId,
+              role: 'silas',
+              slotId: 'silas-ops',
+              state: 'watching',
+              restarts: 0,
+              breakerOpen: false,
+              stopReason: null,
+              openTurn: true,
+              openControl: false,
+              openToolCalls: 0,
+              lastEventAt: stamp,
+              lastFileBytes: 1,
+            }
+          : null,
+    });
+    api.registerAgent({ id: 'silas-live', role: 'silas' });
+    api.setAgentState('silas-live', 'streaming');
+    const wake = api.appendCustomEvent({ kind: 'silas.wake', payload: { trigger: 'sweep', actionable: 1 } });
+    const tick = api.appendCustomEvent({ kind: 'silas.tick', payload: { trigger: 'sweep', wake_in_flight: true } });
+    api.appendCustomEvent({ kind: 'silas.reconcile-failed', payload: { trigger: 'sweep', ok: false, error: 'oh no' } });
+    const action = api.appendCustomEvent({ kind: 'silas.escalated', jobId: null, payload: {} });
+    const down = engine.snapshot().silas;
+    expect(down.lastTickAt).toBe(tick.ts);
+    expect(down.lastReconcileAt).toBeNull(); // a failed pass is never a completed reconciliation
+    expect(down.lastReconcileFailedAt).not.toBeNull();
+    expect(down.lastUsefulActionAt).toBe(action.ts);
+    expect(down.openTurnSince).toBe(wake.ts);
+
+    api.appendCustomEvent({ kind: 'silas.reconcile', payload: { trigger: 'sweep', ok: true, counts: {} } });
+    const recovered = engine.snapshot().silas;
+    expect(recovered.lastReconcileAt).not.toBeNull();
+    expect(recovered.lastReconcileFailedAt).not.toBeNull(); // history stays honest
   });
 
   it('derives PR state from the record: none → open → merged (conflicting awaits its sweep)', () => {

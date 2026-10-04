@@ -25,6 +25,7 @@ import { createReviewEscalationNotifier } from './dispatch/escalation-identity.j
 import { createStartupVerdictPoster } from './dispatch/perkins-github-app.js';
 import { BobScheduler } from './dispatch/bob-scheduler.js';
 import { SilasDriver, supervisionLookup } from './dispatch/silas-driver.js';
+import { reconcileDurableWork } from './dispatch/durable-reconcile.js';
 import { ProviderRecoverySensor, establishProviderWait } from './provider-recovery/sensor.js';
 import { ModelRuntimeProbe } from './provider-recovery/probe.js';
 import {
@@ -1409,9 +1410,18 @@ async function main(): Promise<number> {
       // construction-order change can never freeze a null handle (A4).
       supervisionFor: supervisionLookup(() => supervisor),
       // Chief phase-3 seam: every deterministic Silas pass (bus wake events
-      // and sweep ticks) reconsidered pending review handoffs BEFORE any
-      // LLM wake — bounded, no-overlap, fence-preserving.
-      onDeterministicPass: () => state.wave?.reconcilePendingHandoffs(),
+      // and sweep ticks) reconsiders pending review handoffs AND runs the
+      // bounded durable reconciliation (issue #163) BEFORE any LLM wake —
+      // directive/phase/hand-back transitions keep advancing even while a
+      // long model turn is open. Bounded, fence-preserving, no dispatch.
+      onDeterministicPass: () => {
+        state.wave?.reconcilePendingHandoffs();
+        return reconcileDurableWork({
+          ledger,
+          notifications,
+          log: (level, msg, fields) => logger.log(level, msg, fields),
+        });
+      },
       githubPoll: new GitHubSignalPoll({
         ledger,
         notifications,

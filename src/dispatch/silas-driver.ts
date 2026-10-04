@@ -247,6 +247,35 @@ export interface MinionErrorRow {
   readonly at: string | null;
 }
 
+/** A lane whose newest completed verification FAILED and no repair rung
+ * has landed since (issue #163): the next step is a repair decision routed
+ * through the existing directive machinery, never an unchanged-head green
+ * rerun. Retires on a repair rung, a newer verification activity for the
+ * same scope, or a later PASS. */
+export interface VerificationFailureRow {
+  readonly jobId: string;
+  readonly repo: string;
+  readonly scope: string | null;
+  readonly runId: string | null;
+  readonly head: string | null;
+  readonly at: string | null;
+  readonly detail: string;
+}
+
+/** A verification submission whose queue wait timed out (issue #163):
+ * capacity, not the lane, answered. The row asks for reconsideration at
+ * the same head — never an automatic rerun, never a detached watcher.
+ * Retires when a newer verification activity lands for the same scope or
+ * the lane is terminal. */
+export interface VerificationWaitingRow {
+  readonly jobId: string;
+  readonly repo: string;
+  readonly scope: string | null;
+  readonly requestId: string | null;
+  readonly waitMs: number | null;
+  readonly at: string | null;
+}
+
 /** A provider-recovered lane awaiting its guarded continuation claim
  * (provider-recovery sensor): Silas drives these through the recovery
  * claim endpoint — one continuation per claim, fan-out after actual model
@@ -267,6 +296,8 @@ export interface SilasOpsDigest {
   readonly verdictsAwaitingDirective: readonly VerdictAwaitingDirectiveRow[];
   readonly stalledWorking: readonly StalledWorkingRow[];
   readonly minionErrors: readonly MinionErrorRow[];
+  readonly verificationFailures: readonly VerificationFailureRow[];
+  readonly verificationWaits: readonly VerificationWaitingRow[];
   readonly providerRecoveryPending: readonly ProviderRecoveryPendingRow[];
 }
 
@@ -278,6 +309,8 @@ export function digestActionCount(digest: SilasOpsDigest): number {
     digest.verdictsAwaitingDirective.length +
     digest.stalledWorking.length +
     digest.minionErrors.length +
+    digest.verificationFailures.length +
+    digest.verificationWaits.length +
     digest.providerRecoveryPending.length
   );
 }
@@ -420,6 +453,55 @@ function latestAnsweringReviewRequest(ledger: DigestLedger, jobId: string): Even
   return winner;
 }
 
+/** Verification event kinds that prove a submission/attempt exists — the
+ * retirement evidence for failure/wait rows (never a rerun authority). */
+const VERIFICATION_ACTIVITY_KINDS: readonly string[] = [
+  'verification.requested',
+  'verification.started',
+  'verification.attached',
+  'verification.reconciled',
+];
+
+function payloadRecord(event: EventRecord): Record<string, unknown> {
+  return typeof event.payload === 'object' && event.payload !== null
+    ? (event.payload as Record<string, unknown>)
+    : {};
+}
+
+function payloadString(event: EventRecord, key: string): string | null {
+  const value = payloadRecord(event)[key];
+  return typeof value === 'string' && value !== '' ? value : null;
+}
+
+function payloadNumber(event: EventRecord, key: string): number | null {
+  const value = payloadRecord(event)[key];
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function payloadFlag(event: EventRecord, key: string, expected: boolean): boolean {
+  return payloadRecord(event)[key] === expected;
+}
+
+/** Same verification scope (a missing scope on either event matches any). */
+function sameScope(event: EventRecord, scope: string | null): boolean {
+  if (scope === null) return true;
+  return payloadString(event, 'scope') === scope;
+}
+
+/** A one-line honest reason a verification failed (never a fabricated
+ * exit status). */
+function verificationFailureDetail(event: EventRecord): string {
+  const payload = payloadRecord(event);
+  if (payload['timed_out'] === true) return 'timed out';
+  const exitCode = payload['exit_code'];
+  if (typeof exitCode === 'number' && Number.isFinite(exitCode)) return `exit ${exitCode}`;
+  const signal = payload['signal'];
+  if (typeof signal === 'string' && signal !== '') return `signal ${signal}`;
+  const error = payload['error'];
+  if (typeof error === 'string' && error !== '') return error.slice(0, 200);
+  return 'failed with no exit status';
+}
+
 /**
  * The compact digest of actionable ops states, computed from the ledger
  * alone (the ledger is the record; no runtime or filesystem probing beyond
@@ -447,7 +529,11 @@ function latestAnsweringReviewRequest(ledger: DigestLedger, jobId: string): Even
  *    shown no activity past the stall threshold: assess the lane.
  *
  * plus minionErrors — a minion turn that failed more recently than any
- * delivery — so an error wake always carries its context.
+ * delivery — so an error wake always carries its context; and the
+ * verification follow-through rows (issue #163) — a failed completed run
+ * awaiting a repair decision and a queue wait that timed out awaiting
+ * reconsideration — so completion/dependency transitions reach the sweep
+ * without a fresh owner message.
  */
 export async function computeSilasDigest(input: ComputeDigestInput): Promise<SilasOpsDigest> {
   const now = input.now ?? Date.now;
@@ -459,6 +545,8 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     verdictsAwaitingDirective: VerdictAwaitingDirectiveRow[];
     stalledWorking: StalledWorkingRow[];
     minionErrors: MinionErrorRow[];
+    verificationFailures: VerificationFailureRow[];
+    verificationWaits: VerificationWaitingRow[];
     providerRecoveryPending: ProviderRecoveryPendingRow[];
   } = {
     computedAt: new Date(now()).toISOString(),
@@ -468,6 +556,8 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     verdictsAwaitingDirective: [],
     stalledWorking: [],
     minionErrors: [],
+    verificationFailures: [],
+    verificationWaits: [],
     providerRecoveryPending: [],
   };
   // One unresolved re-brief request fences the target: a marker exists while
@@ -680,6 +770,64 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
         at: minionError.ts,
       });
     }
+
+    // (5) A failed verification owes a repair decision (issue #163). The
+    // row retires on a repair rung after the failure, on newer verification
+    // activity for the same scope (a retry already in flight) or on a later
+    // PASS; the skill routes the repair through the existing directive
+    // machinery, never an unchanged-head green rerun. Terminal lanes are
+    // skipped by the loop's terminal guard above.
+    const verificationCompleted = input.ledger.latestJobEvent(job.id, 'verification.completed');
+    if (verificationCompleted !== null && !payloadFlag(verificationCompleted, 'ok', true)) {
+      const completedScope = payloadString(verificationCompleted, 'scope');
+      const repairLanded = input.ledger
+        .listJobEvents(job.id, { limit: 50 })
+        .some(
+          (event) =>
+            (event.kind === 'silas.directive-sent' || event.kind === 'silas.rebrief' || event.kind === 'silas.escalated') &&
+            event.seq > verificationCompleted.seq,
+        );
+      const retryLanded = VERIFICATION_ACTIVITY_KINDS.some((kind) => {
+        const event = input.ledger.latestJobEvent(job.id, kind);
+        return event !== null && event.seq > verificationCompleted.seq && sameScope(event, completedScope);
+      });
+      if (!repairLanded && !retryLanded) {
+        digest.verificationFailures.push({
+          jobId: job.id,
+          repo: job.repo,
+          scope: completedScope,
+          runId: payloadString(verificationCompleted, 'run_id'),
+          head: payloadString(verificationCompleted, 'sha'),
+          at: verificationCompleted.ts,
+          detail: verificationFailureDetail(verificationCompleted),
+        });
+      }
+    }
+
+    // (6) A queue wait that timed out is a capacity wait awaiting
+    // reconsideration, not a result (issue #163). Retires when newer
+    // verification activity for the same scope lands or the lane closes.
+    const verificationTimeout = input.ledger.latestJobEvent(job.id, 'verification.lock-timeout');
+    if (
+      verificationTimeout !== null &&
+      !VERIFICATION_ACTIVITY_KINDS.some((kind) => {
+        const event = input.ledger.latestJobEvent(job.id, kind);
+        return (
+          event !== null &&
+          event.seq > verificationTimeout.seq &&
+          sameScope(event, payloadString(verificationTimeout, 'scope'))
+        );
+      })
+    ) {
+      digest.verificationWaits.push({
+        jobId: job.id,
+        repo: job.repo,
+        scope: payloadString(verificationTimeout, 'scope'),
+        requestId: payloadString(verificationTimeout, 'request_id'),
+        waitMs: payloadNumber(verificationTimeout, 'wait_ms'),
+        at: verificationTimeout.ts,
+      });
+    }
   }
   // Provider-recovery lanes awaiting a guarded continuation claim: the
   // durable pending-delivery rows ARE the restart-safe handoff — every
@@ -804,15 +952,38 @@ export interface SilasDriverOptions {
   readonly skills?: readonly SkillModule[];
   readonly blockersForRound?: BlockersForRound;
   readonly log?: Log;
-  /** Deterministic no-LLM pass hook (chief phase-3 seam): invoked at the top
-   * of every trigger — bus wake events and sweep ticks alike — BEFORE any
-   * slot wake/LLM work. Must be bounded and no-overlap by construction; a
-   * thrown error is logged and never breaks the driver. */
-  readonly onDeterministicPass?: () => void;
+  /** Deterministic no-LLM pass hook (chief phase-3 seam, issue #163):
+   * invoked at the top of every trigger — bus wake events and sweep ticks
+   * alike — BEFORE any slot wake/LLM work. The pass must be bounded; the
+   * driver serializes overlapping passes (one pass per observed state) and
+   * records the outcome as a durable `silas.reconcile` health event (a
+   * failure lands as `silas.reconcile-failed`, never as a completed pass).
+   * A thrown error is logged and never breaks the driver. */
+  readonly onDeterministicPass?: DeterministicPassHook;
   /** Clock + timer seams for tests. */
   readonly setInterval?: typeof setInterval;
   readonly clearInterval?: typeof clearInterval;
   readonly now?: () => number;
+}
+
+/** One deterministic pass observation: which trigger woke the driver and
+ * whether a model turn was already open at that instant. */
+export interface DeterministicPassContext {
+  readonly trigger: SilasTriggerKind;
+  readonly wakeInFlight: boolean;
+}
+
+/** A bounded no-LLM pass. A plain-object return value is recorded as the
+ * pass counts on the `silas.reconcile` health event; void records none. */
+export type DeterministicPassHook = (
+  context: DeterministicPassContext,
+) => void | Record<string, unknown> | Promise<void | Record<string, unknown>>;
+
+interface DeterministicPassOutcome {
+  readonly ok: boolean;
+  readonly counts: Record<string, unknown> | null;
+  readonly error: string | null;
+  readonly durationMs: number;
 }
 
 const SILAS_WAKE_EVENTS: readonly string[] = ['job.delivered', 'job.minion-error', 'round.verdict', 'round.perkins-incomplete', 'provider.restored'];
@@ -830,6 +1001,7 @@ export class SilasDriver {
   private pollInFlight = false;
   private wakeInFlight: Promise<void> | null = null;
   private queuedTrigger: SilasTrigger | null = null;
+  private passInFlight: Promise<DeterministicPassOutcome> | null = null;
   private disposed = false;
 
   constructor(opts: SilasDriverOptions) {
@@ -933,19 +1105,27 @@ export class SilasDriver {
    * is open queues ONE slot (latest wins — the next digest supersedes the
    * stale one) and runs after the open turn settles. A failed wake is
    * logged loud; the next sweep or event retries it.
+   *
+   * Every trigger records a durable `silas.tick` observation and then runs
+   * the deterministic pass (coalescing onto an already-running pass, never
+   * stacking a second) before the serialized wake path — so routine
+   * follow-through keeps advancing while a long model turn is open, and
+   * the health projection can tell a busy turn from a stopped scheduler.
    */
   async trigger(trigger: SilasTrigger): Promise<void> {
     if (this.disposed) return;
     if (!this.opts.config.enabled) return;
+    const wakeInFlight = this.wakeInFlight !== null;
+    // The tick is the durable proof a timer/event observation happened —
+    // independent of whether it led, queued or coalesced into a wake.
+    this.recordHealthEvent('silas.tick', {
+      trigger: trigger.kind,
+      wake_in_flight: wakeInFlight,
+      pass_in_flight: this.passInFlight !== null,
+    });
     // Deterministic, bounded reconsideration happens before any LLM wake:
     // pending-duty reconciliation never waits for a model turn.
-    if (this.opts.onDeterministicPass !== undefined) {
-      try {
-        this.opts.onDeterministicPass();
-      } catch (error) {
-        this.log('error', 'deterministic pass hook failed', { error: String(error) });
-      }
-    }
+    await this.runDeterministicPass(trigger.kind, wakeInFlight);
     if (this.wakeInFlight !== null) {
       this.queuedTrigger = trigger;
       return;
@@ -961,6 +1141,76 @@ export class SilasDriver {
       if (queued !== null && !this.disposed) {
         void this.trigger(queued).catch(() => {});
       }
+    }
+  }
+
+  /** Persist one health observation; the ledger failing must never break
+   * the driver (the next tick re-observes). */
+  private recordHealthEvent(kind: string, payload: Record<string, unknown>): void {
+    try {
+      this.opts.ledger.appendCustomEvent({ kind, payload });
+    } catch (error) {
+      this.log('error', 'silas health event could not be persisted', { kind, error: String(error).slice(0, 300) });
+    }
+  }
+
+  /**
+   * Run the injected deterministic pass with one-pass-in-flight semantics:
+   * a trigger arriving while a pass runs COALESCES onto that pass instead
+   * of starting a second one. Only the pass's starter records the outcome:
+   * `silas.reconcile` on success, `silas.reconcile-failed` on failure —
+   * never a completed-reconciliation timestamp for a failed pass. When no
+   * hook is wired the pass is a no-op and no reconcile event is emitted
+   * (there is no reconciliation to claim).
+   */
+  private async runDeterministicPass(
+    trigger: SilasTriggerKind,
+    wakeInFlight: boolean,
+  ): Promise<DeterministicPassOutcome> {
+    const hook = this.opts.onDeterministicPass;
+    if (hook === undefined) return { ok: true, counts: null, error: null, durationMs: 0 };
+    if (this.passInFlight !== null) return this.passInFlight;
+    const startedAt = this.now();
+    const duration = (): number => Math.max(0, this.now() - startedAt);
+    const run = (async (): Promise<DeterministicPassOutcome> => {
+      try {
+        const outcome = await hook({ trigger, wakeInFlight });
+        const counts =
+          typeof outcome === 'object' && outcome !== null && !Array.isArray(outcome)
+            ? (outcome as Record<string, unknown>)
+            : null;
+        return { ok: true, counts, error: null, durationMs: duration() };
+      } catch (error) {
+        return { ok: false, counts: null, error: String(error).slice(0, 300), durationMs: duration() };
+      }
+    })();
+    this.passInFlight = run;
+    try {
+      const outcome = await run;
+      if (outcome.ok) {
+        this.recordHealthEvent('silas.reconcile', {
+          trigger,
+          ok: true,
+          duration_ms: outcome.durationMs,
+          wake_in_flight: wakeInFlight,
+          ...(outcome.counts === null ? {} : { counts: outcome.counts }),
+        });
+      } else {
+        // A failed pass is recorded under its own kind so the board's
+        // completed-reconciliation timestamp can never be advanced by a
+        // failure while the last failure stays queryable on its own.
+        this.recordHealthEvent('silas.reconcile-failed', {
+          trigger,
+          ok: false,
+          duration_ms: outcome.durationMs,
+          wake_in_flight: wakeInFlight,
+          error: outcome.error,
+        });
+        this.log('error', 'deterministic pass hook failed', { error: outcome.error });
+      }
+      return outcome;
+    } finally {
+      this.passInFlight = null;
     }
   }
 

@@ -146,16 +146,32 @@ export function reviewCard(jobs: readonly JobView[], now = Date.now()): HealthCa
 
 export function silasCard(silas: SilasView | null | undefined, now = Date.now()): HealthCardView {
   if (silas === null || silas === undefined) return notAvailable('silas', 'silas');
-  const value = silas.lastWakeAt === null ? 'no wakes yet' : `wake ${formatAge(silas.lastWakeAt, now)} ago`;
-  return card(
-    'silas',
-    'silas',
-    value,
+  // Issue #163: the headline answers "is the loop alive?" with the
+  // reconciliation heartbeat, never the wake-start age alone — a healthy
+  // long model turn must not read as a stalled scheduler.
+  const value =
+    silas.openTurnSince !== null
+      ? `turn open ${formatAge(silas.openTurnSince, now)}`
+      : silas.lastReconcileAt !== null
+        ? `reconciled ${formatAge(silas.lastReconcileAt, now)} ago`
+        : silas.lastWakeAt === null
+          ? 'no wakes yet'
+          : `wake ${formatAge(silas.lastWakeAt, now)} ago`;
+  const detail = `${silas.reconciliationsToday} reconciliations today`;
+  const full = [
+    `last wake ${formatAge(silas.lastWakeAt, now)} ago (start marker)`,
+    `last reconcile ${silas.lastReconcileAt === null ? 'never' : `${formatAge(silas.lastReconcileAt, now)} ago`}`,
+    silas.lastReconcileFailedAt === null
+      ? 'no failed pass'
+      : `last failed pass ${formatAge(silas.lastReconcileFailedAt, now)} ago`,
+    silas.lastTickAt === null ? 'no ticks recorded' : `last tick ${formatAge(silas.lastTickAt, now)} ago`,
+    silas.openTurnSince === null ? 'no turn open' : `turn open ${formatAge(silas.openTurnSince, now)}`,
+    silas.lastUsefulActionAt === null
+      ? 'no corrective action yet'
+      : `last action ${formatAge(silas.lastUsefulActionAt, now)} ago`,
     `${silas.reconciliationsToday} reconciliations today`,
-    'muted',
-    null,
-    `last Silas wake ${formatAge(silas.lastWakeAt, now)} ago (sweeps wake only on actionable work) · ${silas.reconciliationsToday} reconciliations today`,
-  );
+  ].join(' · ');
+  return card('silas', 'silas', value, detail, 'muted', null, full);
 }
 
 export function alertsCard(unacked: number): HealthCardView {

@@ -155,11 +155,27 @@ export interface NotificationView {
   readonly resolvedBy: string | null;
 }
 
-/** Silas ops health (board UX v4): the newest wake (sweep or event) and
- * how many reconciliation events landed today. Derived from the durable
- * event stream — the ledger is the record. */
+/** Silas ops health (board UX v4, issue #163): the newest wake (sweep or
+ * event), the newest accepted tick/reconciliation observations, the
+ * current open model-turn start, and today's state-correction actions —
+ * all derived from the durable event stream. `lastWakeAt` is deliberately
+ * the wake START marker, never a completed scan; `lastReconcileAt` only
+ * advances on a successfully completed deterministic pass. */
 export interface SilasView {
   readonly lastWakeAt: string | null;
+  /** Newest accepted trigger (timer tick or bus event). */
+  readonly lastTickAt: string | null;
+  /** Newest SUCCESSFUL deterministic reconciliation pass. */
+  readonly lastReconcileAt: string | null;
+  /** Newest FAILED deterministic reconciliation pass (never counted as
+   * completion). */
+  readonly lastReconcileFailedAt: string | null;
+  /** Newest state-correction action (register PR, trigger review,
+   * directive, rebrief, escalation). */
+  readonly lastUsefulActionAt: string | null;
+  /** The current open model turn's start (latest wake marker while
+   * supervision reports an open turn); null when no turn is open. */
+  readonly openTurnSince: string | null;
   readonly reconciliationsToday: number;
   readonly checkedAt: string;
 }
@@ -243,7 +259,13 @@ const LENS_VERDICTS = ['blocker', 'warning', 'note', 'clean'] as const;
  * board (registering a PR, triggering review, directives, rebriefs,
  * escalations). */
 const SILAS_WAKE_KINDS = ['silas.wake'] as const;
-const SILAS_RECONCILE_KINDS = [
+/** Tick observations and deterministic-pass outcomes (issue #163). */
+const SILAS_TICK_KINDS = ['silas.tick'] as const;
+const SILAS_RECONCILE_KINDS = ['silas.reconcile'] as const;
+const SILAS_RECONCILE_FAILED_KINDS = ['silas.reconcile-failed'] as const;
+/** State-correction events that moved the board (registering a PR,
+ * triggering review, directives, rebriefs, escalations). */
+const SILAS_ACTION_KINDS = [
   'silas.pr-registered',
   'silas.review-triggered',
   'silas.directive-sent',
@@ -543,6 +565,12 @@ export class BoardEngine {
           (ROLE_ORDER[a.role] ?? 99) - (ROLE_ORDER[b.role] ?? 99) ||
           (b.lastActivity ?? '').localeCompare(a.lastActivity ?? ''),
       );
+    // Issue #163: the open-turn start is a led+supervision fact, never a
+    // wake-marker age. A silas record whose live supervision says an open
+    // turn exists is the only source of "a turn is open right now".
+    const silasTurnOpen = agentRows.some(
+      (agent) => agent.role === 'silas' && supervisionById.get(agent.id)?.openTurn === true,
+    );
     return {
       repos,
       agents,
@@ -555,7 +583,7 @@ export class BoardEngine {
         lastAt: this.ledger.latestEventOfKind('gru.wake')?.ts ?? null,
       },
       build: this.buildDrift(),
-      silas: this.silasView(),
+      silas: this.silasView(silasTurnOpen),
       verify: this.verifyQueue(),
       pacing: this.pacing(),
       selfHeal: this.selfHeal(),
@@ -578,15 +606,26 @@ export class BoardEngine {
       .sort((left, right) => left.jobId.localeCompare(right.jobId));
   }
 
-  /** Silas ops health from the durable event stream: newest wake + today's
-   * reconciliations (state-correction events, not the wake itself). */
-  private silasView(): SilasView {
+  /** Silas ops health from the durable event stream: newest wake (start
+   * marker), newest accepted tick, newest successful/failed deterministic
+   * pass, newest corrective action and — when supervision says a turn is
+   * open — that turn's start (issue #163). `reconciliationsToday` stays the
+   * state-correction count; a tick or a failed pass never claims it. */
+  private silasView(openTurn: boolean): SilasView {
     const now = this.now();
     const dayStart = new Date(now);
     dayStart.setHours(0, 0, 0, 0);
+    const wake = this.ledger.latestEventOfKinds(SILAS_WAKE_KINDS);
     return {
-      lastWakeAt: this.ledger.latestEventOfKinds(SILAS_WAKE_KINDS)?.ts ?? null,
-      reconciliationsToday: this.ledger.countEventsSince(SILAS_RECONCILE_KINDS, dayStart.toISOString()),
+      lastWakeAt: wake?.ts ?? null,
+      lastTickAt: this.ledger.latestEventOfKinds(SILAS_TICK_KINDS)?.ts ?? null,
+      // The success timestamp only ever advances on a completed pass; a
+      // later failure does not erase it, and a failure never sets it.
+      lastReconcileAt: this.ledger.latestEventOfKinds(SILAS_RECONCILE_KINDS)?.ts ?? null,
+      lastReconcileFailedAt: this.ledger.latestEventOfKinds(SILAS_RECONCILE_FAILED_KINDS)?.ts ?? null,
+      lastUsefulActionAt: this.ledger.latestEventOfKinds(SILAS_ACTION_KINDS)?.ts ?? null,
+      openTurnSince: openTurn ? (wake?.ts ?? null) : null,
+      reconciliationsToday: this.ledger.countEventsSince(SILAS_ACTION_KINDS, dayStart.toISOString()),
       checkedAt: new Date(now).toISOString(),
     };
   }

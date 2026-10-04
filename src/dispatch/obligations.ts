@@ -336,6 +336,9 @@ export interface PhaseCompletionResult {
   /** true when THIS call completed an awaiting phase (recorded the debt);
    * false when it finished/replayed an already-completed phase. */
   readonly created: boolean;
+  /** true when a durable terminal/parked guard closed the phase without a
+   * hand-back (the debt suspended/settled instead of published). */
+  readonly closed: boolean;
 }
 
 function payloadOf(event: DeliveryEventLike): Record<string, unknown> {
@@ -510,7 +513,7 @@ function finishPhaseHandoff(
       reason: `job reached ${job.status} before the hand-back could be published`,
     });
     deps.log?.('info', 'phase handoff closed by terminal job', { phase: phase.phaseId, job: phase.jobId });
-    return { phaseId: phase.phaseId, jobId: phase.jobId, obligationId, notificationId: null, created };
+    return { phaseId: phase.phaseId, jobId: phase.jobId, obligationId, notificationId: null, created, closed: true };
   }
   if (job.status === 'parked') {
     if (obligation.state === 'open' || obligation.state === 'waiting') {
@@ -524,10 +527,10 @@ function finishPhaseHandoff(
       reason: 'job parked before the hand-back could be published — debt suspended for explicit resume',
     });
     deps.log?.('info', 'phase handoff suspended by parked job', { phase: phase.phaseId, job: phase.jobId });
-    return { phaseId: phase.phaseId, jobId: phase.jobId, obligationId, notificationId: null, created };
+    return { phaseId: phase.phaseId, jobId: phase.jobId, obligationId, notificationId: null, created, closed: true };
   }
   if (phase.notificationId !== null) {
-    return { phaseId: phase.phaseId, jobId: phase.jobId, obligationId, notificationId: phase.notificationId, created };
+    return { phaseId: phase.phaseId, jobId: phase.jobId, obligationId, notificationId: phase.notificationId, created, closed: false };
   }
   const card = deps.notifications.postIncident({
     kind: `silas.phase-handback.${phase.phaseId}`,
@@ -548,7 +551,7 @@ function finishPhaseHandoff(
     obligation: obligationId,
     notification: card.id,
   });
-  return { phaseId: phase.phaseId, jobId: phase.jobId, obligationId, notificationId: card.id, created };
+  return { phaseId: phase.phaseId, jobId: phase.jobId, obligationId, notificationId: card.id, created, closed: false };
 }
 
 export interface PhaseReconcileReport {
@@ -665,6 +668,7 @@ function reconcileOnePhase(
       if (result !== null) {
         if (result.created) bump('completed');
         if (result.notificationId !== null && before === null) bump('published');
+        if (result.closed) bump('closed');
       }
       return;
     }
@@ -684,4 +688,5 @@ function reconcileOnePhase(
   const before = phase.notificationId;
   const result = finishPhaseHandoff(deps, phase, false);
   if (result !== null && result.notificationId !== null && before === null) bump('published');
+  if (result !== null && result.closed && phase.state === 'completed') bump('closed');
 }

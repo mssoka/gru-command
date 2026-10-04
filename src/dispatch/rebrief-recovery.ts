@@ -927,6 +927,96 @@ export function reconcilePendingDirectives(deps: ReconcileDirectivesDeps): Direc
   return { examined: live.length, completed, escalated };
 }
 
+/** Durable round-robin cursor scope for the bounded per-pass evidence
+ * sweep (issue #163): successive passes continue past the examined prefix,
+ * so a fixed prefix of live-but-unsettled requests cannot starve the rows
+ * behind it. */
+const DIRECTIVE_EVIDENCE_SCOPE = 'directive-evidence';
+
+export interface DirectiveEvidenceReport {
+  /** Live requests examined this pass. */
+  readonly examined: number;
+  /** Requests completed from their own correlated evidence this pass. */
+  readonly completed: number;
+}
+
+/**
+ * Bounded per-pass directive reconciliation (issue #163): complete the
+ * live requests whose correlated evidence already landed, WITHOUT the boot
+ * pass's escalation notes/cards. The boot pass judges and escalates; this
+ * pass only advances a request on positive durable evidence (a matching
+ * `silas.directive-sent` admission, then a matching `job.delivered`
+ * terminal receipt), so it is safe to run from the Silas deterministic
+ * pass on every tick — including while a model turn is open. An
+ * admission-unknown request is left exactly where it is (visible, live,
+ * never replayed); escalation stays a boot/restart judgment.
+ */
+export function settleDirectivesFromEvidence(
+  deps: Pick<ReconcileDirectivesDeps, 'ledger' | 'log'>,
+  opts: { pageSize?: number; maxPages?: number } = {},
+): DirectiveEvidenceReport {
+  const pageSize = Math.min(Math.max(1, opts.pageSize ?? 200), 1000);
+  const maxPages = Math.min(Math.max(1, opts.maxPages ?? 5), 1000);
+  let cursor = deps.ledger.readReconcileCursor(DIRECTIVE_EVIDENCE_SCOPE) ?? 0;
+  if (!Number.isSafeInteger(cursor) || cursor < 0) cursor = 0;
+  let examined = 0;
+  let completed = 0;
+  let lastRowid: number | null = null;
+  let reachedEnd = false;
+  for (let page = 0; page < maxPages; page += 1) {
+    const rows = deps.ledger.listPendingDirectives({
+      states: LIVE_DIRECTIVE_STATES,
+      limit: pageSize,
+      rowidCursor: cursor,
+    });
+    if (rows.length === 0) {
+      reachedEnd = true;
+      break;
+    }
+    for (const row of rows) {
+      examined += 1;
+      try {
+        const recovered = completeDirectiveFromEvidence(deps.ledger, row);
+        if (recovered !== null) {
+          completed += 1;
+          deps.log?.('info', 'directive request settled from correlated evidence', {
+            request: recovered.requestId,
+            job: recovered.jobId,
+            admission_seq: recovered.admissionSeq,
+            delivery_seq: recovered.deliverySeq,
+          });
+        }
+      } catch (error) {
+        // One malformed/conflicting row stays VISIBLE and never takes the
+        // pass down: the next pass retries it from durable state.
+        deps.log?.('error', 'directive evidence reconciliation row failed', {
+          request: row.requestId,
+          error: String(error),
+        });
+      }
+    }
+    const last = rows[rows.length - 1];
+    lastRowid = last === undefined ? null : (deps.ledger.directiveRowid(last.requestId) ?? null);
+    if (rows.length < pageSize) {
+      reachedEnd = true; // the factual tail — the next pass starts over
+      break;
+    }
+    if (lastRowid === null) {
+      deps.log?.('error', 'directive evidence cursor could not advance — pass stopped', {
+        request: last?.requestId ?? null,
+      });
+      break;
+    }
+    cursor = lastRowid;
+  }
+  if (reachedEnd) {
+    if (cursor !== 0) deps.ledger.writeReconcileCursor({ scope: DIRECTIVE_EVIDENCE_SCOPE, cursor: 0 });
+  } else if (lastRowid !== null) {
+    deps.ledger.writeReconcileCursor({ scope: DIRECTIVE_EVIDENCE_SCOPE, cursor: lastRowid });
+  }
+  return { examined, completed };
+}
+
 /** Page size for the boot pass: small enough to bound one query, large
  * enough that the common case is one page. */
 const DIRECTIVE_RECONCILE_PAGE = 200;

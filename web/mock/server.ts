@@ -528,6 +528,11 @@ function defaultSampleSnapshot(): unknown {
     },
     silas: {
       lastWakeAt: new Date(Date.now() - 240_000).toISOString(),
+      lastTickAt: new Date(Date.now() - 60_000).toISOString(),
+      lastReconcileAt: new Date(Date.now() - 60_000).toISOString(),
+      lastReconcileFailedAt: null,
+      lastUsefulActionAt: new Date(Date.now() - 120_000).toISOString(),
+      openTurnSince: new Date(Date.now() - 240_000).toISOString(),
       reconciliationsToday: 2,
       checkedAt: new Date().toISOString(),
     },

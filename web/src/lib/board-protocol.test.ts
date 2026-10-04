@@ -157,7 +157,16 @@ describe('board server-frame validator', () => {
         checkedAt: '2026-01-01T00:00:00.000Z',
         checkError: null,
       },
-      silas: { lastWakeAt: null, reconciliationsToday: 2, checkedAt: '2026-01-01T00:00:00.000Z' },
+      silas: {
+        lastWakeAt: null,
+        lastTickAt: null,
+        lastReconcileAt: null,
+        lastReconcileFailedAt: null,
+        lastUsefulActionAt: null,
+        openTurnSince: null,
+        reconciliationsToday: 2,
+        checkedAt: '2026-01-01T00:00:00.000Z',
+      },
       verify: { lockInUse: true, activeRuns: 1, queuedRuns: 0, workerBudget: 8, workersPerRun: 4 },
       selfHeal: { sessionsResumed: 1, sessionsOrphaned: 0, since: null },
     } as unknown;

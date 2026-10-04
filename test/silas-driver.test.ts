@@ -17,6 +17,7 @@ import {
   loadSilasSkills,
   SilasDriver,
   supervisionLookup,
+  type DeterministicPassHook,
   type DigestLedger,
   type GitHubPollPort,
   type RoundBlocker,
@@ -1081,6 +1082,117 @@ describe('silas digest (the four actionable states)', () => {
       h.cleanup();
     }
   });
+
+  it('surfaces a failed verification as repair-due and retires it on a repair rung or a later pass', async () => {
+    const h = makeLedger();
+    try {
+      h.ledger.addJob({ id: 'job-verify', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('job-verify', 'working');
+      h.ledger.appendCustomEvent({
+        kind: 'verification.completed',
+        jobId: 'job-verify',
+        payload: { ok: false, exit_code: 1, scope: 'full', run_id: 'run-1', sha: 'head-1' },
+      });
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(digest.verificationFailures).toHaveLength(1);
+      expect(digest.verificationFailures[0]).toMatchObject({
+        jobId: 'job-verify',
+        scope: 'full',
+        runId: 'run-1',
+        head: 'head-1',
+        detail: 'exit 1',
+      });
+      expect(digestActionCount(digest)).toBe(1);
+
+      // A repair rung after the failure retires the row.
+      h.ledger.appendCustomEvent({
+        kind: 'silas.directive-sent',
+        jobId: 'job-verify',
+        payload: { request_id: 'req-1', minion_id: 'm1' },
+      });
+      const handled = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(handled.verificationFailures).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a later same-scope verification activity retires the failed row; a PASS never re-arms it', async () => {
+    const h = makeLedger();
+    try {
+      h.ledger.addJob({ id: 'job-verify-2', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('job-verify-2', 'working');
+      h.ledger.appendCustomEvent({
+        kind: 'verification.completed',
+        jobId: 'job-verify-2',
+        payload: { ok: false, scope: 'focused', run_id: 'run-1' },
+      });
+      h.ledger.appendCustomEvent({
+        kind: 'verification.started',
+        jobId: 'job-verify-2',
+        payload: { scope: 'focused', run_id: 'run-2' },
+      });
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(digest.verificationFailures).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('names a verification queue timeout as reconsideration-due, distinct from a failure', async () => {
+    const h = makeLedger();
+    try {
+      h.ledger.addJob({ id: 'job-wait', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('job-wait', 'working');
+      h.ledger.appendCustomEvent({
+        kind: 'verification.lock-timeout',
+        jobId: 'job-wait',
+        payload: { scope: 'full', request_id: 'req-9', wait_ms: 900_000 },
+      });
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(digest.verificationWaits).toEqual([
+        expect.objectContaining({ jobId: 'job-wait', scope: 'full', requestId: 'req-9', waitMs: 900_000 }),
+      ]);
+      expect(digest.verificationFailures).toEqual([]);
+
+      // A newer submission for the same scope is the reconsideration: the
+      // wait row retires (never an automatic rerun).
+      h.ledger.appendCustomEvent({
+        kind: 'verification.requested',
+        jobId: 'job-wait',
+        payload: { scope: 'full', request_id: 'req-10' },
+      });
+      const resubmitted = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(resubmitted.verificationWaits).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
 });
 
 // ------------------------------------------------------------------
@@ -1173,7 +1285,8 @@ describe('silas skills and wake prompt', () => {
     const prompt = buildWakePrompt({ digest: { computedAt: '2026-09-24T00:00:00Z', trigger: 'sweep',
       deliveredWithoutPr: [], prWithoutReview: [{ jobId: 'clean', repo: 'gru-command', prUrl: 'https://example.invalid/1',
         priorRounds: 1, cleanAbort: { roundId: 'clean-r1', ruleId: 'clean-abort-service-restart' } }],
-      verdictsAwaitingDirective: [], stalledWorking: [], minionErrors: [], providerRecoveryPending: [] },
+      verdictsAwaitingDirective: [], stalledWorking: [], minionErrors: [],
+      verificationFailures: [], verificationWaits: [], providerRecoveryPending: [] },
       trigger: { kind: 'sweep' }, skills: loadSilasSkills(), ops: { baseUrl: 'http://127.0.0.1:1', configPath: '/tmp/test-config' } });
     expect(prompt).toContain('You NEVER merge a pull request');
     expect(prompt).toContain('Gru may merge gru-command only');
@@ -1206,6 +1319,8 @@ describe('silas skills and wake prompt', () => {
         verdictsAwaitingDirective: [],
         stalledWorking: [],
         minionErrors: [],
+        verificationFailures: [],
+        verificationWaits: [],
         providerRecoveryPending: [],
       },
       trigger: { kind: 'job.delivered', jobId: 'job-a' },
@@ -1253,6 +1368,7 @@ function makeDriver(opts: {
    * main.ts wires it (final independent review T0). */
   supervisionFor?: (agentId: string) => AgentSupervisionView | null;
   now?: () => number;
+  onDeterministicPass?: DeterministicPassHook;
 } = {}): DriverHarness {
   const h = makeLedger();
   const prompts: { text: string; owner?: string }[] = [];
@@ -1300,6 +1416,7 @@ function makeDriver(opts: {
     ...(opts.timers !== undefined ? { setInterval: opts.timers.setInterval, clearInterval: opts.timers.clearInterval } : {}),
     ...(opts.supervisionFor !== undefined ? { supervisionFor: opts.supervisionFor } : {}),
     ...(opts.now !== undefined ? { now: opts.now } : {}),
+    ...(opts.onDeterministicPass !== undefined ? { onDeterministicPass: opts.onDeterministicPass } : {}),
     log: () => {},
   });
   return {
@@ -1694,6 +1811,122 @@ describe('silas driver github signal poll', () => {
       ticks[0]?.();
       await vi.waitFor(() => expect(polls).toBe(2));
       expect(h.driver.pollRunning).toBe(true);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+// ------------------------------------------------------------------
+
+// Deterministic pass health + open-turn independence (issue #163)
+// ------------------------------------------------------------------
+
+describe('silas deterministic pass observation (issue #163)', () => {
+  const kinds = (h: DriverHarness, kind: string): EventRecord[] =>
+    h.ledger.listEvents({ limit: 200 }).filter((event) => event.kind === kind);
+
+  it('keeps reconciling while a model prompt is held open; one queued wake follows settlement', async () => {
+    const passes: { trigger: string; wakeInFlight: boolean }[] = [];
+    const h = makeDriver({
+      onDeterministicPass: (context) => {
+        passes.push({ trigger: context.trigger, wakeInFlight: context.wakeInFlight });
+        return { examined: 1, advanced: 1 };
+      },
+    });
+    try {
+      // An actionable row so the coalesced wake after settlement actually prompts.
+      addJobWithDelivery(h.ledger, 'job-open');
+      h.hold();
+      const first = h.driver.trigger({ kind: 'job.delivered', jobId: 'job-open' });
+      await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
+
+      // Two sweep ticks land while the prompt is unresolved. The pass runs
+      // for each (there is no in-flight pass to coalesce onto), the wake is
+      // not stacked, and no second prompt exists.
+      await h.driver.trigger({ kind: 'sweep' });
+      await h.driver.trigger({ kind: 'sweep' });
+      expect(h.prompts).toHaveLength(1);
+      expect(passes.map((p) => p.trigger)).toEqual(['job.delivered', 'sweep', 'sweep']);
+      expect(passes[1]?.wakeInFlight).toBe(true);
+      // Every tick left a durable observation and every pass a completed
+      // reconciliation; the open turn cannot hide either.
+      const ticks = kinds(h, 'silas.tick');
+      expect(ticks).toHaveLength(3);
+      expect(ticks[1]?.payload).toMatchObject({ trigger: 'sweep', wake_in_flight: true });
+      const reconciles = kinds(h, 'silas.reconcile');
+      expect(reconciles).toHaveLength(3);
+      expect(reconciles.every((event) => (event.payload as { ok?: unknown }).ok === true)).toBe(true);
+      expect((reconciles[1]?.payload as { counts?: unknown }).counts).toEqual({ examined: 1, advanced: 1 });
+      // The wake marker still means "wake start": only the first wake exists.
+      expect(kinds(h, 'silas.wake')).toHaveLength(1);
+
+      h.settle();
+      await first;
+      // Exactly ONE coalesced wake runs at settlement — no stacked wakes.
+      await vi.waitFor(() => expect(h.prompts).toHaveLength(2));
+      expect(kinds(h, 'silas.wake')).toHaveLength(2);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(h.prompts).toHaveLength(2);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('coalesces overlapping passes onto ONE execution and never spawns a second turn', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let invocations = 0;
+    const h = makeDriver({
+      onDeterministicPass: async () => {
+        invocations += 1;
+        await gate;
+        return { examined: 0, advanced: 0 };
+      },
+    });
+    try {
+      addJobWithDelivery(h.ledger, 'job-overlap');
+      const first = h.driver.trigger({ kind: 'job.delivered', jobId: 'job-overlap' });
+      await vi.waitFor(() => expect(kinds(h, 'silas.tick')).toHaveLength(1));
+      const second = h.driver.trigger({ kind: 'sweep' });
+      await vi.waitFor(() => expect(kinds(h, 'silas.tick')).toHaveLength(2));
+      // Both triggers are blocked on the SAME pass: one execution, zero
+      // wake markers, zero completed reconciliations yet.
+      expect(invocations).toBe(1);
+      expect(kinds(h, 'silas.wake')).toHaveLength(0);
+      expect(kinds(h, 'silas.reconcile')).toHaveLength(0);
+      release();
+      await first;
+      await second;
+      // One wake plus exactly one coalesced wake at settlement; no third.
+      await vi.waitFor(() => expect(h.prompts).toHaveLength(2));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(h.prompts).toHaveLength(2);
+      expect(kinds(h, 'silas.reconcile')).toHaveLength(2); // one per accepted trigger, never a stacked pass
+    } finally {
+      release();
+      h.cleanup();
+    }
+  });
+
+  it('records a failed pass as ok:false and never as a completed reconciliation', async () => {
+    const h = makeDriver({
+      onDeterministicPass: () => {
+        throw new Error('ledger exploded');
+      },
+    });
+    try {
+      addJobWithDelivery(h.ledger, 'job-fail-pass');
+      await h.driver.trigger({ kind: 'sweep' });
+      const reconciles = kinds(h, 'silas.reconcile-failed');
+      expect(reconciles).toHaveLength(1);
+      expect(reconciles[0]?.payload).toMatchObject({ ok: false, error: 'Error: ledger exploded' });
+      // A failure is never recorded as a completed reconciliation.
+      expect(kinds(h, 'silas.reconcile')).toHaveLength(0);
+      // The failed pass never blocks the wake path.
+      await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
     } finally {
       h.cleanup();
     }
