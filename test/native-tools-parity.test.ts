@@ -114,8 +114,18 @@ async function claudeExposure(rt: ClaudeCodeRuntime, workspace: string, seam: Re
   try {
     await handle.prompt('parity probe');
     const log = process.env['CLAUDE_DOUBLE_LOG']!;
-    const records = readFileSync(log, 'utf8').trim().split('\n')
-      .map((line) => JSON.parse(line) as { argv: string[] });
+    const records: { argv: string[] }[] = [];
+    for (const raw of readFileSync(log, 'utf8').split('\n')) {
+      const line = raw.trim();
+      if (line === '') continue;
+      try {
+        records.push(JSON.parse(line) as { argv: string[] });
+      } catch {
+        // Tolerate a partially appended trailing record (same flake class
+        // as the claude-adapter double reader).
+        break;
+      }
+    }
     const record = records[records.length - 1]!;
     const argv = record.argv;
     // `--tools` carries the enabled list including the bridged MCP names;

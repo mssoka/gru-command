@@ -130,10 +130,27 @@ function doubleInvocations(fx: Fixture): {
   stdin: string;
 }[] {
   if (!existsSync(fx.doubleLog)) return [];
-  return readFileSync(fx.doubleLog, 'utf-8')
-    .trim()
-    .split('\n')
-    .map((line) => JSON.parse(line) as never);
+  const records: {
+    argv: string[];
+    cwd: string;
+    prompt: string;
+    images: number;
+    sessionId: string;
+    stdin: string;
+  }[] = [];
+  for (const raw of readFileSync(fx.doubleLog, 'utf-8').split('\n')) {
+    const line = raw.trim();
+    if (line === '') continue;
+    try {
+      records.push(JSON.parse(line) as never);
+    } catch {
+      // A concurrent appendFileSync can expose a partially written trailing
+      // record; the callers' waitFor loops retry until the write completes
+      // (code review: the CI Full suite crashed on a mid-append read).
+      break;
+    }
+  }
+  return records;
 }
 
 /** Direct bridge-socket probe: the same newline-delimited wire the bundled
