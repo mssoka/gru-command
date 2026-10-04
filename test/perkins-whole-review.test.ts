@@ -537,6 +537,47 @@ describe('Perkins whole-PR lead engine', () => {
     expect(existsSync(join(h.frozen.directory, 'lead/preflight-attempt-2.json'))).toBe(true);
   });
 
+  it('#87 resumes an identical terminal submission after report publication but before consolidation', async () => {
+    let directory = '';
+    const h = wholeHarness({
+      ...ALL_CLEAN,
+      submitRetries: 1,
+      beforeSubmit: () => { mkdirSync(join(directory, 'consolidated.json')); },
+      submitPayload: (attempt, submission) => {
+        if (attempt === 2) rmSync(join(directory, 'consolidated.json'), { recursive: true });
+        return submission;
+      },
+    });
+    directory = h.frozen.directory;
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    expect(h.toolErrors.filter((entry) => entry.tool === 'perkins_submit_review')).toHaveLength(1);
+    expect(readFileSync(result.reportFile, 'utf8')).toContain('**Verdict: READY TO MERGE**');
+    expect(existsSync(join(directory, 'consolidated.json'))).toBe(true);
+    expect(existsSync(join(directory, 'lead/submission-attempt-2.json'))).toBe(true);
+  });
+
+  it('#87 rejects a changed terminal report after partial publication without overwriting it', async () => {
+    let directory = '';
+    const h = wholeHarness({
+      ...ALL_CLEAN,
+      submitRetries: 1,
+      beforeSubmit: () => { mkdirSync(join(directory, 'consolidated.json')); },
+      submitPayload: (attempt, submission) => {
+        if (attempt === 2) {
+          rmSync(join(directory, 'consolidated.json'), { recursive: true });
+          return { ...submission, report_markdown: `${submission.report_markdown}\nchanged report` };
+        }
+        return submission;
+      },
+    });
+    directory = h.frozen.directory;
+    await expect(h.run()).rejects.toThrow(/EEXIST|different.*report/);
+    const original = readFileSync(join(directory, 'perkins-report.md'), 'utf8');
+    expect(original).not.toContain('changed report');
+    expect(existsSync(join(directory, 'consolidated.json'))).toBe(false);
+  });
+
   it('the third real terminal submission is refused even when preflights were free', async () => {
     const h = wholeHarness({
       ...ALL_CLEAN,

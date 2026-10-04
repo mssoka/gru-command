@@ -6,7 +6,7 @@ import type { AgentSpawner } from '../service.js';
 import type { AgentHandle, NativeAgentTool } from '../../runtime/types.js';
 import type { PacingGate, PacingLease, PacingEventRecorder, RateLimitBackoffPolicy } from '../../runtime/pacing.js';
 import { withRateLimitRetries, type RateLimitRetryOptions } from '../../runtime/rate-limit-retry.js';
-import { assertFrozenPromptBounds, refMovedSinceFreeze, writeReviewArtifact, type FrozenReview } from './artifacts.js';
+import { assertFrozenPromptBounds, publishedReportMatches, refMovedSinceFreeze, writeReviewArtifact, type FrozenReview } from './artifacts.js';
 import { finalAssistantText } from './session-output.js';
 import { PERKINS_FINDING_SOURCES, type PerkinsFindingSource, type PerkinsLens, type PerkinsPolicy } from './policy.js';
 import {
@@ -743,6 +743,7 @@ export class PerkinsWholeReview {
     let specialistsStarted = 0;
     let preflightAttempts = 0;
     let terminalAttempts = 0;
+    let reportPublished = false;
     let accepted: PerkinsWholeResult | null = null;
     let returningAccepted = false;
 
@@ -1528,7 +1529,19 @@ export class PerkinsWholeReview {
           }
           const submission = validation.submission;
           writeReviewArtifact(review, `lead/submission-attempt-${attempt}.json`, submission);
-          const reportFile = writeReviewArtifact(review, 'perkins-report.md', submission.report_markdown.endsWith('\n') ? submission.report_markdown : `${submission.report_markdown}\n`);
+          const reportBytes = submission.report_markdown.endsWith('\n') ? submission.report_markdown : `${submission.report_markdown}\n`;
+          let reportFile: string;
+          try {
+            reportFile = writeReviewArtifact(review, 'perkins-report.md', reportBytes);
+            reportPublished = true;
+          } catch (writeError) {
+            if (
+              !reportPublished || attempt <= 1 ||
+              !(writeError instanceof Error && 'code' in writeError && (writeError as { code?: string }).code === 'EEXIST') ||
+              !publishedReportMatches(review, reportBytes)
+            ) throw writeError;
+            reportFile = resolve(review.directory, 'perkins-report.md');
+          }
           const headMoved = headMovedAtSubmit;
           // The reviewer owns the verdict; the host owns assembly of the
           // durable record from the accepted submission.
@@ -1629,6 +1642,18 @@ export class PerkinsWholeReview {
     let reviewLease: PacingLease | null = null;
     let unsubscribe = (): void => {};
     let turns = 0;
+    const disposeLead = async (): Promise<void> => {
+      try {
+        await lead?.dispose();
+      } catch (disposeError) {
+        if (!returningAccepted) throw disposeError;
+        // The sealed result outranks cleanup, but cleanup failure must
+        // remain independently visible beside the accepted record.
+        writeReviewArtifact(review, 'lead/dispose-error.json', {
+          error: sanitizeError(disposeError), agentId: lead!.id,
+        });
+      }
+    };
     try {
       reviewLease = await this.acquireReviewTurnSlot('lead', input.signal);
       lead = await boundedSpawn(() => this.spawner('perkins', {
@@ -1669,16 +1694,7 @@ export class PerkinsWholeReview {
     } finally {
       try {
         unsubscribe();
-        try {
-          await lead?.dispose();
-        } catch (disposeError) {
-          if (!returningAccepted) throw disposeError;
-          // The sealed result outranks cleanup, but cleanup failure must
-          // remain independently visible beside the accepted record.
-          writeReviewArtifact(review, 'lead/dispose-error.json', {
-            error: sanitizeError(disposeError), agentId: lead!.id,
-          });
-        }
+        await disposeLead();
       } finally {
         reviewLease?.release();
       }
