@@ -46,13 +46,16 @@ live PR or edits historical rounds.
    receive neither text nor pixels.
 
 **Fail-closed behavior.** Missing/empty/oversized/wrong-type material,
-traversal, symlinks, foreign paths, non-upload names, mutated frozen bytes, or
-a text-only review model all refuse loudly. A refusal is never replaced by a
-written description, and the round/turn does not pretend the evidence was
-delivered. Check the review model's image capability before arming: a round
-whose review model cannot accept images freezes and then fails closed as
-INCOMPLETE naming the capability, so arm evidence only for image-capable
-models.
+structurally invalid images (a bare signature with no image data),
+traversal, symlinks (including a symlink swapped in between validation and
+the read — the freeze opens the validated identity without following
+symlinks), foreign paths, non-upload names, mutated frozen bytes (re-verified
+at EVERY prompt delivery), or a text-only review model all refuse loudly. A
+refusal is never replaced by a written description, and the round/turn does
+not pretend the evidence was delivered. Check the review model's image
+capability before arming: a round whose review model cannot accept images
+freezes and then fails closed as INCOMPLETE naming the capability, so arm
+evidence only for image-capable models.
 
 **Queued handoffs.** A worker arm while its own lane is busy is queued with
 its request (the durable `job.review-handoff-queued` payload carries the
@@ -87,13 +90,19 @@ distinct from, the local scheduler verification block) and into the manifest.
   the block has control characters/newlines collapsed first, so no check name
   can forge a block boundary.
 - A stale SHA, wrong repository/PR, a PR-less observation standing in for the
-  expected PR, malformed payload, or absent observation renders an explicit
-  `UNAVAILABLE` / `NOT-MATCHED` limitation — never a PASS and never a
-  fabricated failure. When no PR URL is resolvable, the block states that the
-  repository is unverified.
+  expected PR, malformed payload or check list, or absent observation renders
+  an explicit `UNAVAILABLE` / `NOT-MATCHED` limitation — never a PASS and
+  never a fabricated failure. A job with no resolvable PR URL renders
+  UNAVAILABLE: a receipt cannot be repository-bound, and an unverified
+  observation is never rendered as one.
+- The latest recorded observation at the target SHA governs: a newer
+  observation carrying no usable CI result (no check runs yet, malformed
+  payload) degrades to an explicit UNAVAILABLE and never falls back to an
+  older green.
 - A CI block too large for the frozen spec bound renders an explicit
-  `UNAVAILABLE — CI EVIDENCE OMITTED` notice instead of silence; the
-  structured record stays in the manifest.
+  `UNAVAILABLE — CI EVIDENCE OMITTED` notice; if even that notice cannot
+  fit, the freeze is refused rather than shipping a spec with no CI
+  limitation. The structured record stays in the manifest.
 - Frozen rounds stay historically stable; late results do not rewrite them.
 
 ## 3. Approved canonical amendments
@@ -143,7 +152,9 @@ Authorization: Bearer <pairing token>
   rendered effective contract ≤ 192 KiB. `400` for malformed/
   improperly-authorized requests (a blank or missing approval reference is
   refused); terminal jobs and jobs without a recorded briefing take no
-  amendments. Every refusal at the amendment boundary is audited.
+  amendments. Every authenticated refusal at the amendment boundary is
+  audited (unauthenticated attempts answer `401` without ledger writes),
+  including an unreadable request body.
 
 **Authorization honesty.** The service's paired bearer token is the only
 authentication primitive. `approval.by`/`reference` are recorded provenance,

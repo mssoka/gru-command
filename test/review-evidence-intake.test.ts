@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -26,10 +26,12 @@ function temp(prefix: string): string {
   return dir;
 }
 
-const PNG = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from('synthetic-pixels')]);
-const JPEG = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]), Buffer.from('synthetic-jpeg')]);
-const GIF = Buffer.concat([Buffer.from('GIF89a', 'ascii'), Buffer.from('synthetic-gif')]);
-const WEBP = Buffer.concat([Buffer.from('RIFF', 'ascii'), Buffer.alloc(4), Buffer.from('WEBP', 'ascii'), Buffer.from('x')]);
+import { minimalGif, minimalJpeg, minimalPng, minimalWebp } from './helpers/images.js';
+
+const PNG = minimalPng(Buffer.from('synthetic-pixels'));
+const JPEG = minimalJpeg();
+const GIF = minimalGif();
+const WEBP = minimalWebp();
 
 function makeUpload(dir: string, name: string, bytes: Buffer): string {
   const path = join(dir, `${Date.now()}-${randomUUID()}-${name}`);
@@ -56,6 +58,50 @@ describe('private review evidence intake', () => {
     expect(sniffImageMediaType(Buffer.alloc(0))).toBeNull();
     // A .png NAME over text bytes is not an image.
     expect(sniffImageMediaType(Buffer.from('plain text named look.png'))).toBeNull();
+  });
+
+  it('refuses structurally invalid images: signatures without image data are not pixels', () => {
+    const uploads = temp('gru-evidence-uploads-');
+    const round = temp('gru-evidence-round-');
+    const bare = makeUpload(uploads, 'bare.png', Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+    expect(() => freezeEvidenceAttachments({
+      requests: [request(bare)],
+      uploadsDir: uploads,
+      roundDirectory: round,
+      roundId: 'round-invalid-1',
+      jobId: null,
+      targetSha: 'target-sha',
+    })).toThrow(/structurally valid/u);
+    const truncated = makeUpload(uploads, 'truncated.png', PNG.subarray(0, 24));
+    expect(() => freezeEvidenceAttachments({
+      requests: [request(truncated)],
+      uploadsDir: uploads,
+      roundDirectory: round,
+      roundId: 'round-invalid-2',
+      jobId: null,
+      targetSha: 'target-sha',
+    })).toThrow(/structurally valid/u);
+  });
+
+  it('cleans up partial frozen evidence when a later attachment cannot publish', () => {
+    const uploads = temp('gru-evidence-uploads-');
+    const round = temp('gru-evidence-round-');
+    mkdirSync(join(round, 'evidence'), { recursive: true });
+    // A pre-existing ev2.bin blocks the second write-once publish, so the
+    // first attachment's frozen copy must be cleaned up, not left behind.
+    writeFileSync(join(round, 'evidence', 'ev2.bin'), 'occupied', { flag: 'wx' });
+    const first = makeUpload(uploads, 'one.png', PNG);
+    const second = makeUpload(uploads, 'two.png', JPEG);
+    expect(() => freezeEvidenceAttachments({
+      requests: [request(first), request(second)],
+      uploadsDir: uploads,
+      roundDirectory: round,
+      roundId: 'round-partial',
+      jobId: null,
+      targetSha: 'target-sha',
+    })).toThrow();
+    expect(existsSync(join(round, 'evidence', 'ev1.bin'))).toBe(false);
+    expect(existsSync(join(round, 'evidence', 'receipt.json'))).toBe(false);
   });
 
   it('freezes the exact bytes once, with hash, provenance and a private receipt', () => {

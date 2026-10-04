@@ -125,6 +125,14 @@ describe('canonical job amendments', () => {
     expect(rejects.some((entry) => (entry.payload as { reason?: string }).reason?.includes('Acceptance 99'))).toBe(true);
   });
 
+  it('refuses to rewrite a briefing that already carries accepted amendments', () => {
+    const { api } = boot();
+    api.addJob({ id: 'job-1', repo: 'repo', title: 't', briefing: BRIEFING });
+    accepted(amendment(api, sha256(BRIEFING), 'First.'));
+    expect(() => api.setJobBriefing('job-1', 'A rewritten briefing.')).toThrow(/accepted canonical amendments/u);
+    expect(api.getJob('job-1')!.briefing).toBe(BRIEFING);
+  });
+
   it('audits a job-not-found refusal instead of dropping it (events carry no job FK)', () => {
     const { api } = boot();
     const result = amendment(api, sha256(BRIEFING), 'Body.', { jobId: 'missing-job' });

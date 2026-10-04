@@ -13,6 +13,7 @@ import { LedgerDb } from '../src/ledger/db.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 import { GitReviewPort } from './helpers/git-review-port.js';
 import { fakeWholeSpawner } from './helpers/perkins-whole-double.js';
+import { minimalPng } from './helpers/images.js';
 
 const repos: FixtureRepo[] = [];
 const dbs: LedgerDb[] = [];
@@ -52,10 +53,7 @@ function attachOrigin(repo: FixtureRepo, branch: string, root: string): void {
   repo.git(['push', '--quiet', 'origin', `refs/heads/${branch}`]);
 }
 
-const IMAGE = Buffer.concat([
-  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
-  Buffer.from('synthetic-wave-pixels'),
-]);
+const IMAGE = minimalPng(Buffer.from('synthetic-wave-pixels'));
 
 describe('review-input handoff through the real wave freeze', () => {
   it('freezes the amended acceptance, private evidence and exact-target CI, then delivers them', async () => {
@@ -205,6 +203,19 @@ describe('review-input handoff through the real wave freeze', () => {
       reviewEvidence: { ci: { state: string } };
     };
     expect(manifest2.reviewEvidence.ci.state).toBe('not-matched');
+    // A third round at a target with NO recorded observation of any kind
+    // freezes the explicit UNAVAILABLE limitation — never silence.
+    const target3 = repo.commitFile('src/third.ts', 'export const third = 3;\n');
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/feature/review']);
+    const begun3 = await wave.beginRound({ jobId: job.id });
+    const outcome3 = asWave(await begun3.run);
+    const spec3 = readFileSync(join(artifacts, outcome3.round.id, 'spec-context.md'), 'utf8');
+    expect(spec3).toContain('state: UNAVAILABLE — NO BOUND CI RECEIPT');
+    expect(spec3).toContain(target3);
+    const manifest3 = JSON.parse(readFileSync(join(artifacts, outcome3.round.id, 'manifest.json'), 'utf8')) as {
+      reviewEvidence: { ci: { state: string } };
+    };
+    expect(manifest3.reviewEvidence.ci.state).toBe('unavailable');
     await wave.shutdown();
   });
 });

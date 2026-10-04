@@ -824,13 +824,10 @@ export class PerkinsWholeReview {
       });
     };
 
-    // Frozen evidence pixels are read once per review and re-verified at
-    // delivery; every non-blind prompt receives the same exact bytes.
-    let evidenceImagesMemo: PromptOptions['images'] | null = null;
-    const evidenceImages = (): PromptOptions['images'] => {
-      evidenceImagesMemo ??= reviewEvidenceImages(review);
-      return evidenceImagesMemo;
-    };
+    // Frozen evidence pixels are read and hash-verified from the frozen copy
+    // on EVERY prompt (a mutated copy refuses that prompt loudly); no
+    // cross-prompt byte memoization.
+    const evidenceImages = (): PromptOptions['images'] => reviewEvidenceImages(review);
 
     const runSpecialist = async (
       lens: PerkinsLens,

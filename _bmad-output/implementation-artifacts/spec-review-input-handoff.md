@@ -127,6 +127,40 @@ bmad-build interactive checkpoint is not available in this confined worker.
 - [x] `docs/REVIEW-INPUTS.md` — runbook.
 - [x] Tests + focused `/api/verify` scope + full gate.
 
+
+### Review Findings
+
+Second review round (2026-10-04): four independent layers run in Herdr panes
+on `pi --model openai-codex/gpt-6-sol` (blind hunter, edge-case hunter,
+verification gap, acceptance auditor) over the full branch diff at `a416a8d`
+(4,836 lines; layer outputs:
+`~/.gru-command/investigations/review-input-handoff-review-20261004/bcr-196-layers/`).
+Per the owner's standing directive, every actionable finding was patched in
+this round; nothing was deferred.
+
+- [x] [Review][Patch] Late-bind amendments/CI at freeze — an amendment or CI observation accepted during review-worktree setup is no longer absent from the round that freezes afterward (perkins.ts; blind-hunter 1-2).
+- [x] [Review][Patch] Latest unusable at-target CI observation degrades to UNAVAILABLE; malformed check lists are unusable, never a silently-empty green (ci-evidence.ts; blind-hunter 3, edge 6, vgap other, acceptance 3).
+- [x] [Review][Patch] No-PR jobs render UNAVAILABLE — a receipt cannot be repository-bound; the "repository unverified" green note is gone (ci-evidence.ts; blind-hunter 4, edge 10).
+- [x] [Review][Patch] Unreadable amendment bodies are audited; the audit claim is narrowed to authenticated refusals (server.ts, runbook; blind-hunter 6, edge 7).
+- [x] [Review][Patch] Upload read opens the validated identity once with O_NOFOLLOW and reads that descriptor (evidence.ts; blind-hunter 7, edge 2).
+- [x] [Review][Patch] Frozen-evidence directory symlink guard in writeOnce (evidence.ts; blind-hunter 8).
+- [x] [Review][Patch] Frozen pixels re-read and hash-verified at EVERY prompt delivery; the per-review memo is gone (whole.ts; blind-hunter 9, edge 1, acceptance 6).
+- [x] [Review][Patch] Structural decodability: signature-only/truncated images are refused (evidence.ts + minimal-valid fixtures in test/helpers/images.ts; blind-hunter 10).
+- [x] [Review][Patch] When even the CI omission notice cannot fit the frozen bound, the freeze refuses instead of shipping silence (ci-evidence.ts; blind-hunter 11, edge 4, acceptance 4).
+- [x] [Review][Patch] Filesystem error strings in refusals carry errno codes only — no absolute source-path disclosure (evidence.ts; blind-hunter 13, acceptance 8).
+- [x] [Review][Patch] appendRecordedVerification no longer trims the contract prefix: the frozen spec prefix and its acceptance hash describe the same bytes (verify/evidence.ts; blind-hunter 14, edge 8, vgap other, acceptance 1).
+- [x] [Review][Patch] Partial-freeze cleanup: a failed later publish removes everything the call wrote (evidence.ts; edge 3).
+- [x] [Review][Patch] setJobBriefing is refused once a job carries accepted amendments — the briefing is history (ledger/api.ts; edge 9).
+- [x] [Review][Patch] Wave-level tests: no-CI round freezes an explicit UNAVAILABLE limitation; verification-append keeps the untrimmed contract prefix (tests; verification-gap 1).
+- [x] [Review][Patch] Spec wording: explicit no-spec rounds keep their mode and record CI/acceptance state in the manifest only (acceptance 5).
+
+Rejected:
+- approval.by/reference not verified against an owner decision — documented owner-ruled design: the paired bearer token is the only authentication primitive, provenance is recorded and surfaced as a limitation (blind-hunter 5).
+- superseded original clause left verbatim/unmarked — the verbatim original is the contract's design; each amendment header states its supersession explicitly (blind-hunter 12).
+- run-URL-only changes do not re-record branch state — low: dedupe stability outweighs URL freshness in receipts (edge 5).
+- hand-copied file can impersonate an upload — requires write access to the 0700 service-managed uploads dir (operator trust boundary); token-only callers cannot reach it (acceptance 7).
+- newer cross-PR observation leaving an older exact-sha green bound — job-scoped events cannot carry another PR's observation as this lane's; an exact-sha green for this repo/PR stays correctly bound, and newer unusable at-target observations now degrade (acceptance 2).
+
 **Acceptance Criteria:**
 - Given an authenticated approved synthetic reference uploaded outside the
   checkout, when a round freezes and the real lead prompt is assembled, then the
@@ -146,8 +180,10 @@ bmad-build interactive checkpoint is not available in this confined worker.
   retries behave deterministically and are audited.
 - Given restart/old records, all new state is durable and backward compatible
   (zero-amendment jobs render the original briefing bytes as the contract
-  slice; every new frozen round adds the explicit review-input/CI blocks by
-  design); full gate, typecheck and
+  slice; every new spec-carrying frozen round adds the explicit
+  review-input/CI blocks by design — explicit no-spec rounds keep their mode
+  and record the CI/acceptance state in the manifest only); full gate,
+  typecheck and
   focused scopes pass at the final head.
 
 ## I/O & Edge-Case Matrix
@@ -436,6 +472,17 @@ Verdicts are the parent's; reviewer-assigned severities were disregarded.
   re-ran green at the merged head before the final full gate.
 - The final-head full gate after this spec update is recorded in the
   completion report and ledger (not rewritten into the head it proves).
+
+
+### 2026-10-04 second independent review round (Herdr/pi gpt-6-sol)
+
+- The owner directed a `bmad-code-review` run with reviewers on
+  `openai-codex/gpt-6-sol` in Herdr panes. Four context-free reviewer panes
+  (`review-196-*`) ran the workflow's four layers over the full branch diff
+  at `a416a8d`; all 15 actionable grouped findings were patched in this
+  round, five were rejected with refutations recorded in the Review Findings
+  section, and nothing was deferred. Exact-head gates for the patched head
+  are recorded in the completion report.
 
 ## Verification
 

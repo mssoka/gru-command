@@ -434,7 +434,23 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
     }
     if (req.method === 'POST' && path === '/api/dispatch/amendment') {
       if (!authed(req, res)) return true;
-      const body = await readBody(req);
+      let body: Record<string, unknown>;
+      try {
+        body = await readBody(req);
+      } catch (error) {
+        // Authenticated but unreadable bodies are audited like every other
+        // refusal (unauthenticated attempts never reach this audit).
+        options.ledger.appendCustomEvent({
+          kind: 'job.amendment-rejected',
+          jobId: '<unparseable-body>',
+          payload: {
+            code: 'invalid',
+            reason: `amendment body could not be read (${error instanceof Error ? error.message.slice(0, 120) : 'unknown'})`,
+          },
+        });
+        json(res, 400, { error: 'invalid_request', detail: 'amendment request body is malformed' });
+        return true;
+      }
       // Parse BEFORE any mutation: a malformed request is refused, never
       // half-applied. Approval provenance is REQUIRED (missing provenance is
       // an authorization failure, not a default), and every refusal at this

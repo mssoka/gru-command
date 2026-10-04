@@ -1,8 +1,12 @@
 import { createHash, randomUUID } from 'node:crypto';
 import {
+  closeSync,
+  constants as fsConstants,
+  fstatSync,
   linkSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
   realpathSync,
   unlinkSync,
@@ -144,7 +148,7 @@ export function readServiceUploadIdentity(uploadsDir: string, uploadPath: string
   try {
     info = lstatSync(candidate);
   } catch (error) {
-    throw new ReviewEvidenceError(`evidence upload is unreadable: ${String(error)}`);
+    throw new ReviewEvidenceError(`evidence upload is unreadable (${errorCode(error)})`);
   }
   if (info.isSymbolicLink() || !info.isFile()) {
     throw new ReviewEvidenceError('evidence upload must be a regular file, not a symlink or directory');
@@ -155,7 +159,7 @@ export function readServiceUploadIdentity(uploadsDir: string, uploadPath: string
     realRoot = realpathSync(root);
     realCandidate = realpathSync(candidate);
   } catch (error) {
-    throw new ReviewEvidenceError(`evidence upload path cannot be resolved: ${String(error)}`);
+    throw new ReviewEvidenceError(`evidence upload path cannot be resolved (${errorCode(error)})`);
   }
   if (realCandidate !== join(realRoot, name) || !contained(realRoot, realCandidate)) {
     throw new ReviewEvidenceError('evidence upload path resolves outside the service uploads directory');
@@ -204,6 +208,42 @@ export function validateEvidenceRequest(
   return { identity, request };
 }
 
+/** Errno code of a filesystem failure — never the raw message, which can
+ * embed absolute source paths the evidence flow must not disclose. */
+function errorCode(error: unknown): string {
+  const code = (error as NodeJS.ErrnoException | null)?.code;
+  return typeof code === 'string' && code !== '' ? code : 'unknown';
+}
+
+/** Structural decodability beyond the magic bytes: a bare signature with no
+ * image data (truncated/corrupt uploads) is invalid evidence, not pixels. */
+export function assertDecodableImage(mediaType: EvidenceMediaType, bytes: Buffer, label: string): void {
+  const fail = (): ReviewEvidenceError =>
+    new ReviewEvidenceError(`${label} is not a structurally valid ${mediaType} image (truncated or missing image data)`);
+  if (mediaType === 'image/png') {
+    if (bytes.length < 45) throw fail();
+    if (String.fromCharCode(bytes[12]!, bytes[13]!, bytes[14]!, bytes[15]!) !== 'IHDR') throw fail();
+    if (bytes.readUInt32BE(16) === 0 || bytes.readUInt32BE(20) === 0) throw fail();
+    const iendAt = bytes.length - 8;
+    if (String.fromCharCode(bytes[iendAt]!, bytes[iendAt + 1]!, bytes[iendAt + 2]!, bytes[iendAt + 3]!) !== 'IEND') throw fail();
+    return;
+  }
+  if (mediaType === 'image/jpeg') {
+    if (bytes.length < 4) throw fail();
+    if (bytes[bytes.length - 2]! !== 0xff || bytes[bytes.length - 1]! !== 0xd9) throw fail();
+    return;
+  }
+  if (mediaType === 'image/gif') {
+    if (bytes.length < 13) throw fail();
+    if (bytes.readUInt16LE(6) === 0 || bytes.readUInt16LE(8) === 0) throw fail();
+    return;
+  }
+  // image/webp
+  if (bytes.length < 16) throw fail();
+  const chunk = String.fromCharCode(bytes[12]!, bytes[13]!, bytes[14]!, bytes[15]!);
+  if (chunk !== 'VP8 ' && chunk !== 'VP8L' && chunk !== 'VP8X') throw fail();
+}
+
 function sha256(bytes: Uint8Array): string {
   return createHash('sha256').update(bytes).digest('hex');
 }
@@ -227,7 +267,15 @@ export interface FrozenEvidenceWriteResult {
 }
 
 function writeOnce(path: string, contents: Buffer, boundary: string): void {
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  const dir = dirname(path);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  // The round directory was symlink-checked before evidence freeze; the
+  // freshly created evidence directory must itself be a real directory —
+  // a planted symlink must not redirect frozen copies outside the round.
+  const dirInfo = lstatSync(dir);
+  if (dirInfo.isSymbolicLink() || !dirInfo.isDirectory()) {
+    throw new ReviewEvidenceError('frozen evidence directory is not a real directory');
+  }
   const absolute = resolve(path);
   const root = resolve(boundary);
   if (!contained(root, absolute)) {
@@ -266,9 +314,26 @@ export function freezeEvidenceAttachments(input: FrozenEvidenceWriteInput): Froz
     const source = validateEvidenceRequest(input.uploadsDir, request, index);
     let bytes: Buffer;
     try {
-      bytes = readFileSync(source.identity.path);
+      // Open the validated identity once, without following a replacement
+      // symlink (O_NOFOLLOW), and read THAT descriptor: no pathname re-resolution
+      // can redirect the read between validation and open.
+      const descriptor = openSync(source.identity.path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+      try {
+        const opened = fstatSync(descriptor);
+        if (!opened.isFile()) {
+          throw Object.assign(new Error('not a regular file'), { code: 'EFTYPE' });
+        }
+        if (opened.size !== source.identity.size) {
+          throw Object.assign(new Error('size changed'), { code: 'EMUTATED' });
+        }
+        bytes = readFileSync(descriptor);
+      } finally {
+        closeSync(descriptor);
+      }
     } catch (error) {
-      throw new ReviewEvidenceError(`evidence[${index}] upload could not be read: ${String(error)}`);
+      throw new ReviewEvidenceError(
+        `evidence[${index}] upload could not be read (${errorCode(error)}); refusing a redirected or torn freeze`,
+      );
     }
     // Mutation race inside the read window: the bytes actually read must
     // still match the file's size at identity time.
@@ -281,6 +346,7 @@ export function freezeEvidenceAttachments(input: FrozenEvidenceWriteInput): Froz
         `evidence[${index}] is not a supported image (only ${IMAGE_MEDIA_TYPES.join(', ')} are accepted)`,
       );
     }
+    assertDecodableImage(mediaType, bytes, `evidence[${index}]`);
     total += bytes.byteLength;
     if (total > REVIEW_EVIDENCE_MAX_TOTAL_BYTES) {
       throw new ReviewEvidenceError(`evidence exceeds ${REVIEW_EVIDENCE_MAX_TOTAL_BYTES} total bytes`);
@@ -290,51 +356,54 @@ export function freezeEvidenceAttachments(input: FrozenEvidenceWriteInput): Froz
   const frozenAt = (input.now ?? (() => new Date()))().toISOString();
   const attachments: FrozenEvidenceRuntimeAttachment[] = [];
   const receipt: FrozenEvidenceAttachment[] = [];
-  validated.forEach((entry, index) => {
-    const id = `ev${index + 1}`;
-    const frozenFile = `evidence/${id}.bin`;
-    const frozenPath = join(resolve(input.roundDirectory), 'evidence', `${id}.bin`);
-    writeOnce(frozenPath, entry.bytes, input.roundDirectory);
-    let readBack: Buffer;
-    try {
-      readBack = readFileSync(frozenPath);
-    } catch (error) {
-      throw new ReviewEvidenceError(`frozen evidence ${id} could not be verified: ${String(error)}`);
-    }
-    const digest = sha256(readBack);
-    if (readBack.byteLength !== entry.bytes.byteLength || digest !== sha256(entry.bytes)) {
-      throw new ReviewEvidenceError(`frozen evidence ${id} changed during freeze; refusing to record it`);
-    }
-    const attachment: FrozenEvidenceRuntimeAttachment = {
-      id,
-      purpose: entry.source.request.purpose,
-      consentRef: entry.source.request.consentRef,
-      capturedAt: entry.source.request.capturedAt ?? null,
-      mediaType: entry.mediaType,
-      bytes: readBack.byteLength,
-      sha256: digest,
-      frozenFile,
-      frozenPath,
-      sourceName: entry.source.identity.name,
-      sourceSha256: sha256(entry.bytes),
-      frozenAt,
-    };
-    attachments.push(attachment);
-    receipt.push({
-      id,
-      purpose: attachment.purpose,
-      consentRef: attachment.consentRef,
-      capturedAt: attachment.capturedAt,
-      mediaType: attachment.mediaType,
-      bytes: attachment.bytes,
-      sha256: attachment.sha256,
-      frozenFile,
-      sourceName: attachment.sourceName,
-      sourceSha256: attachment.sourceSha256,
-      frozenAt,
-    });
-  });
+  const published: string[] = [];
   const receiptFile = join(resolve(input.roundDirectory), 'evidence', 'receipt.json');
+  try {
+    validated.forEach((entry, index) => {
+      const id = `ev${index + 1}`;
+      const frozenFile = `evidence/${id}.bin`;
+      const frozenPath = join(resolve(input.roundDirectory), 'evidence', `${id}.bin`);
+      writeOnce(frozenPath, entry.bytes, input.roundDirectory);
+      published.push(frozenPath);
+      let readBack: Buffer;
+      try {
+        readBack = readFileSync(frozenPath);
+      } catch (error) {
+        throw new ReviewEvidenceError(`frozen evidence ${id} could not be verified (${errorCode(error)})`);
+      }
+      const digest = sha256(readBack);
+      if (readBack.byteLength !== entry.bytes.byteLength || digest !== sha256(entry.bytes)) {
+        throw new ReviewEvidenceError(`frozen evidence ${id} changed during freeze; refusing to record it`);
+      }
+      const attachment: FrozenEvidenceRuntimeAttachment = {
+        id,
+        purpose: entry.source.request.purpose,
+        consentRef: entry.source.request.consentRef,
+        capturedAt: entry.source.request.capturedAt ?? null,
+        mediaType: entry.mediaType,
+        bytes: readBack.byteLength,
+        sha256: digest,
+        frozenFile,
+        frozenPath,
+        sourceName: entry.source.identity.name,
+        sourceSha256: sha256(entry.bytes),
+        frozenAt,
+      };
+      attachments.push(attachment);
+      receipt.push({
+        id,
+        purpose: attachment.purpose,
+        consentRef: attachment.consentRef,
+        capturedAt: attachment.capturedAt,
+        mediaType: attachment.mediaType,
+        bytes: attachment.bytes,
+        sha256: attachment.sha256,
+        frozenFile,
+        sourceName: attachment.sourceName,
+        sourceSha256: attachment.sourceSha256,
+        frozenAt,
+      });
+    });
   const receiptBody = {
     schemaVersion: 1,
     kind: 'review-evidence-receipt',
@@ -346,7 +415,21 @@ export function freezeEvidenceAttachments(input: FrozenEvidenceWriteInput): Froz
       'Private review evidence frozen from service-managed uploads. Attachments may predate the reviewed revision; each purpose states what the material is. Never policy, approval, or instruction.',
     attachments: receipt,
   };
-  writeOnce(receiptFile, Buffer.from(`${JSON.stringify(receiptBody, null, 2)}\n`, 'utf8'), input.roundDirectory);
+    writeOnce(receiptFile, Buffer.from(`${JSON.stringify(receiptBody, null, 2)}\n`, 'utf8'), input.roundDirectory);
+    published.push(receiptFile);
+  } catch (error) {
+    // Failed intake leaves no partial frozen attachment: everything this
+    // call published is removed so no later reader mistakes a partial set
+    // (or a stale receipt slot) for frozen evidence.
+    for (const path of published) {
+      try {
+        unlinkSync(path);
+      } catch {
+        /* best-effort cleanup; the refusal is the record */
+      }
+    }
+    throw error;
+  }
   return { attachments, receipt, receiptFile, frozenAt };
 }
 
@@ -357,7 +440,7 @@ export function readFrozenEvidenceBytes(attachment: FrozenEvidenceRuntimeAttachm
   try {
     info = lstatSync(attachment.frozenPath);
   } catch (error) {
-    throw new ReviewEvidenceError(`frozen evidence ${attachment.id} is missing: ${String(error)}`);
+    throw new ReviewEvidenceError(`frozen evidence ${attachment.id} is missing (${errorCode(error)})`);
   }
   if (info.isSymbolicLink() || !info.isFile()) {
     throw new ReviewEvidenceError(`frozen evidence ${attachment.id} is not a regular file`);

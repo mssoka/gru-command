@@ -8,6 +8,8 @@ import { loadPerkinsPolicy } from '../src/dispatch/perkins-review/policy.js';
 import { PerkinsWholeReview, type PerkinsWholeResult } from '../src/dispatch/perkins-review/whole.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 import { fakeWholeSpawner } from './helpers/perkins-whole-double.js';
+import { appendRecordedVerification } from '../src/verify/evidence.js';
+import { minimalPng } from './helpers/images.js';
 
 const repos: FixtureRepo[] = [];
 const dirs: string[] = [];
@@ -23,10 +25,7 @@ function temp(prefix: string): string {
 }
 
 /** Synthetic private fixture pixels — never the owner's material. */
-const IMAGE = Buffer.concat([
-  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
-  Buffer.from('synthetic-review-reference-pixels'),
-]);
+const IMAGE = minimalPng(Buffer.from('synthetic-review-reference-pixels'));
 const IMAGE_SHA256 = createHash('sha256').update(IMAGE).digest('hex');
 
 function makeUpload(uploadsDir: string, name: string, bytes: Buffer): string {
@@ -211,6 +210,12 @@ describe('freeze-time acceptance and evidence binding', () => {
         amendmentIds: ['amendment-1'],
       },
     })).toThrow(/does not start with the bound effective contract/u);
+  });
+
+  it('appends recorded verification without trimming the frozen contract prefix', () => {
+    const trailing = 'Acceptance: keep.  ';
+    const combined = appendRecordedVerification({ spec: trailing, evidence: '--- VERIFIED ---\nok\n--- END ---' });
+    expect(combined.startsWith(`${trailing}\n\n`)).toBe(true);
   });
 
   it('binds the acceptance hash to the exact frozen spec prefix, trailing whitespace included', () => {

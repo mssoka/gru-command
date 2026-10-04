@@ -180,16 +180,15 @@ describe('exact-target CI evidence', () => {
     expect(noticed).not.toBeNull();
     expect(noticed).toContain('state: UNAVAILABLE — CI EVIDENCE OMITTED (frozen spec bound)');
     expect(noticed).not.toContain('state: GREEN');
-    // Nothing fits at all: the original spec is preserved and the omission is
-    // still logged (the structured record remains in the manifest).
+    // Nothing fits at all: the freeze is refused rather than returning a
+    // spec with no prompt-visible CI limitation.
     const logs: string[] = [];
-    const skipped = appendCiEvidence({
+    expect(() => appendCiEvidence({
       spec: 'x'.repeat(blockBytes),
       block,
       maxBytes: blockBytes,
       log: (level, msg) => logs.push(`${level}:${msg}`),
-    });
-    expect(skipped).toBe('x'.repeat(blockBytes));
+    })).toThrow(/no room for the recorded CI limitation/u);
     expect(logs[0]).toContain('frozen spec bound');
   });
 
@@ -200,11 +199,24 @@ describe('exact-target CI evidence', () => {
     expect(block).not.toContain('state: GREEN');
   });
 
-  it('states repository verification truthfully when no PR URL was resolvable', () => {
+  it('renders UNAVAILABLE when no PR URL was resolvable: a receipt cannot be repository-bound', () => {
     const { record, block } = bind({ ciGreen: green(3), repo: null, pr: null });
-    expect(record.state).toBe('green');
-    expect(block).toContain('repository unverified (no PR URL was resolvable)');
-    expect(block).not.toContain("repository binding rests on the job's recorded tracked lane");
+    expect(record.state).toBe('unavailable');
+    expect(block).toContain('cannot be repository-bound');
+    expect(block).not.toContain('state: GREEN');
+  });
+
+  it('the latest at-target observation governs: a newer unusable observation degrades to UNAVAILABLE, never an older green', () => {
+    const { record, block } = bind({ ciGreen: green(10), branchState: branchState(12, null) });
+    expect(record.state).toBe('unavailable');
+    expect(block).toContain('no usable CI result');
+    expect(block).not.toContain('state: GREEN');
+  });
+
+  it('a malformed check list on a matching green event is unusable evidence, never a silently-empty green', () => {
+    const { record, block } = bind({ ciGreen: green(13, { checks: 'not-a-list' }) });
+    expect(record.state).toBe('unavailable');
+    expect(block).not.toContain('state: GREEN');
   });
 
   it('collapses control characters in host-supplied check identities so a block boundary cannot be forged', () => {

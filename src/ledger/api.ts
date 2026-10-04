@@ -954,6 +954,12 @@ export class LedgerApi {
     return this.transaction(() => {
       const current = this.getJob(id);
       if (current === null) throw new RecordNotFound(`job "${id}" not found`);
+      // Canonical amendments hang off the ORIGINAL briefing bytes: once any
+      // amendment is accepted, the briefing is history and cannot be
+      // rewritten (append a new amendment instead).
+      if (this.listJobAmendments(id).length > 0) {
+        throw new Error(`job "${id}" has accepted canonical amendments; the briefing cannot be rewritten`);
+      }
       this.db.prepare('UPDATE jobs SET briefing = ?, updated_at = ? WHERE id = ?').run(briefing, nowIso(), id);
       this.appendEvent({ kind: 'job.briefing', jobId: id, payload: { bytes: briefing.length } });
       return this.getJob(id) as JobRecord;

@@ -2503,58 +2503,66 @@ export class WaveRunner {
       explicitTarget: input.targetRef !== undefined && input.targetRef.trim() !== '',
     });
     const baseRef = resolveReviewBaseRef(jobWorktree.path, job.baseBranch);
-    // Effective acceptance (owner ruling j-969): the original briefing
-    // rendered with the job's accepted canonical amendments. Zero amendments
-    // render the original bytes exactly — legacy jobs are unaffected.
-    const amendments = this.opts.ledger.listJobAmendments(job.id);
-    const contract = renderEffectiveContract(job.briefing, amendments);
-    let spec = contract.text ?? undefined;
+    // Effective acceptance + exact-target CI are read AS LATE AS POSSIBLE —
+    // immediately before the freeze — so an amendment or CI observation
+    // accepted while the review worktree is being created is not silently
+    // absent from the round that freezes afterward (owner ruling j-969).
+    let spec: string | undefined;
     let acceptance: FreezeReviewInput['acceptance'];
-    // Exact-target CI evidence (owner ruling j-969): a host-recorded,
-    // repo/PR/sha-bound observation is rendered beside the scheduler block;
-    // absence/staleness/another repo renders an explicit limitation, never a
-    // PASS. The structured record freezes into the manifest even when no
-    // spec is supplied (explicit no-spec reviews keep their mode).
-    const prIdentity = job.prUrl !== null ? parseGitHubPrUrl(job.prUrl) : null;
-    const ci = renderRecordedCiEvidence({
-      events: {
-        branchState: this.opts.ledger.latestJobEvent(job.id, CI_BRANCH_STATE_EVENT),
-        ciGreen: this.opts.ledger.latestJobEvent(job.id, CI_GREEN_EVENT),
-        ciFailed: this.opts.ledger.latestJobEvent(job.id, CI_FAILED_EVENT),
-      },
-      targetSha,
-      expectedRepo: prIdentity !== null ? `${prIdentity.owner}/${prIdentity.repo}` : null,
-      expectedPr: prIdentity?.number ?? null,
-    });
-    // Recorded verification evidence (2026-09-22 fix): a completed
-    // scheduler run on the exact frozen target (clean tree) is handed to
-    // the review as ledger-backed context, so the tests lens weighs the
-    // host's record over any pasted report. No binding run -> no block.
-    if (input.noSpec !== true && spec !== undefined) {
-      acceptance = {
-        contractText: contract.text as string,
-        version: contract.version,
-        baseSha256: contract.baseSha256,
-        amendmentIds: contract.amendmentIds,
-      };
-      const evidence = renderRecordedVerification(
-        this.opts.ledger.latestJobEvent(job.id, VERIFICATION_COMPLETED_EVENT),
+    let ci!: ReturnType<typeof renderRecordedCiEvidence>;
+    const assembleReviewInputs = (): void => {
+      // Zero amendments render the original briefing bytes exactly — legacy
+      // jobs are unaffected.
+      const amendments = this.opts.ledger.listJobAmendments(job.id);
+      const contract = renderEffectiveContract(job.briefing, amendments);
+      spec = contract.text ?? undefined;
+      acceptance = undefined;
+      // A host-recorded, repo/PR/sha-bound observation is rendered beside
+      // the scheduler block; absence/staleness/another repo renders an
+      // explicit limitation, never a PASS. The structured record freezes
+      // into the manifest even when no spec is supplied (no-spec rounds
+      // keep their mode).
+      const prIdentity = job.prUrl !== null ? parseGitHubPrUrl(job.prUrl) : null;
+      ci = renderRecordedCiEvidence({
+        events: {
+          branchState: this.opts.ledger.latestJobEvent(job.id, CI_BRANCH_STATE_EVENT),
+          ciGreen: this.opts.ledger.latestJobEvent(job.id, CI_GREEN_EVENT),
+          ciFailed: this.opts.ledger.latestJobEvent(job.id, CI_FAILED_EVENT),
+        },
         targetSha,
-      );
-      if (evidence !== null) {
-        spec = appendRecordedVerification({
+        expectedRepo: prIdentity !== null ? `${prIdentity.owner}/${prIdentity.repo}` : null,
+        expectedPr: prIdentity?.number ?? null,
+      });
+      // Recorded verification evidence (2026-09-22 fix): a completed
+      // scheduler run on the exact frozen target (clean tree) is handed to
+      // the review as ledger-backed context, so the tests lens weighs the
+      // host's record over any pasted report. No binding run -> no block.
+      if (input.noSpec !== true && spec !== undefined) {
+        acceptance = {
+          contractText: contract.text as string,
+          version: contract.version,
+          baseSha256: contract.baseSha256,
+          amendmentIds: contract.amendmentIds,
+        };
+        const evidence = renderRecordedVerification(
+          this.opts.ledger.latestJobEvent(job.id, VERIFICATION_COMPLETED_EVENT),
+          targetSha,
+        );
+        if (evidence !== null) {
+          spec = appendRecordedVerification({
+            spec,
+            evidence,
+            log: (level, msg, fields) => this.log(level, msg, { job: job.id, ...fields }),
+          });
+        }
+        spec = appendCiEvidence({
           spec,
-          evidence,
+          block: ci.block,
+          maxBytes: FROZEN_SPEC_MAX_BYTES,
           log: (level, msg, fields) => this.log(level, msg, { job: job.id, ...fields }),
         });
       }
-      spec = appendCiEvidence({
-        spec,
-        block: ci.block,
-        maxBytes: FROZEN_SPEC_MAX_BYTES,
-        log: (level, msg, fields) => this.log(level, msg, { job: job.id, ...fields }),
-      });
-    }
+    };
     const flippedFrom = job.status === 'working' || job.status === 'blocked' ? job.status : null;
     let round: RoundRecord;
     try {
@@ -2594,6 +2602,9 @@ export class WaveRunner {
         roundId: round.id,
         ...(flippedFrom !== null ? { reviewedStatus: { jobId: job.id, status: flippedFrom } } : {}),
       });
+      // Late binding: amendments/CI/verification are read NOW, after every
+      // await in setup, so the frozen round carries the newest records.
+      assembleReviewInputs();
       frozenReview = freezeReviewInputs({
         roundId: round.id,
         repoPath: reviewWorktree.path,

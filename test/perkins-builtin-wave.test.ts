@@ -60,6 +60,7 @@ import { LedgerDb } from '../src/ledger/db.js';
 import { FALLBACK_REVIEW_TIMEOUT_MS, lensAgentLabel } from '../src/dispatch/perkins.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 import { fakeWholeSpawner, type WholeLeadOptions } from './helpers/perkins-whole-double.js';
+import { minimalPng } from './helpers/images.js';
 import { GitReviewPort } from './helpers/git-review-port.js';
 import { PersistedReviewPort } from './helpers/persisted-review-port.js';
 
@@ -4380,10 +4381,7 @@ describe('durable handoff admission: perkins route, re-busy re-queue, crash/term
     const uploads = mkdtempSync(join(tmpdir(), 'handoff-evidence-uploads-'));
     dirs.push(uploads);
     const uploadPath = join(uploads, '1791057000000-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee-reference.png');
-    writeFileSync(uploadPath, Buffer.concat([
-      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
-      Buffer.from('handoff-pixels'),
-    ]));
+    writeFileSync(uploadPath, minimalPng(Buffer.from('handoff-pixels')));
     const sessions = mkdtempSync(join(tmpdir(), 'handoff-evidence-sessions-'));
     dirs.push(sessions);
     const fake = fakeWholeSpawner(sessions, { images: true, childAnswer: () => '[]' });
