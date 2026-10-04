@@ -1095,64 +1095,85 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     };
   }
 
-  /** Parse the last page number out of a GitHub Link header, if present.
-   * Three states, never collapsed: ABSENT (no header, or no rel="last" at
-   * all — no pagination evidence either way), LAST (one sane integer >= 1
-   * every rel="last" entry agrees on), and CONTRADICTORY (rel="last"
-   * entries exist but are malformed or disagree with each other). Only
-   * LAST may inform a completeness certificate: a page count an
-   * intermediary could have rewritten — or that disagrees with itself —
-   * must never become the basis of one, and a contradictory header must
-   * poison the walk's evidence even where an earlier bound looked valid.
-   * Picking one of two disagreeing numbers (e.g. their maximum) would
-   * still trust a number the header itself shows to be unreliable. */
-  private parseLastPage(linkHeader: string | null):
-    { readonly kind: 'absent' } | { readonly kind: 'contradictory' } | { readonly kind: 'last'; readonly page: number } {
+  /** Link evidence is untrusted: parse complete entries/parameters before allowing
+   * any page bound to certify absence. Malformed or oversized headers poison
+   * negative proof, but never suppress a matching review on the same page. */
+  private parsePagination(linkHeader: string | null, route: string, responsePage: number):
+    { readonly kind: 'absent' } | { readonly kind: 'contradictory' } |
+    { readonly kind: 'parsed'; readonly last: number | null; readonly next: number | null } {
     if (linkHeader === null) return { kind: 'absent' };
-    // Relation parameters are parsed independent of ORDER: GitHub emits
-    // `; rel="last"` right after the URL, but a provider or intermediary
-    // may emit other parameters first (`; title="tail"; rel="last"`), and
-    // an order-sensitive match would silently drop that page bound and let
-    // an earlier, smaller bound certify absence over pages never read.
-    const pages: number[] = [];
-    for (const entry of linkHeader.matchAll(/<([^>]+)>([^<]*)/gu)) {
-      const paramsText = entry[2]!;
-      let claimsLast = false;
-      for (const rel of paramsText.matchAll(/(?:^|[;\s,])rel\s*=\s*(?:"([^"]*)"|([^;,\s]+))/giu)) {
-        const value = (rel[1] ?? rel[2] ?? '').toLowerCase();
-        if (value === 'last') claimsLast = true;
+    if (linkHeader.length > 16_384) return { kind: 'contradictory' };
+    // Delimiters inside quoted strings, escaped quotes and angle-bracket
+    // URLs are data, not entry/parameter boundaries.
+    const split = (text: string, delimiter: string): string[] | null => {
+      const parts: string[] = [];
+      let start = 0;
+      let quoted = false;
+      let angled = false;
+      let escaped = false;
+      for (let index = 0; index < text.length; index += 1) {
+        const char = text[index]!;
+        if (escaped) { escaped = false; continue; }
+        if (quoted && char === '\\') { escaped = true; continue; }
+        if (char === '"') { quoted = !quoted; continue; }
+        if (!quoted && char === '<') { if (angled) return null; angled = true; continue; }
+        if (!quoted && char === '>') { if (!angled) return null; angled = false; continue; }
+        if (!quoted && !angled && char === delimiter) {
+          parts.push(text.slice(start, index).trim());
+          start = index + 1;
+        }
       }
-      if (!claimsLast) continue;
-      // Strict SEMANTIC page-evidence validation: the entry URL is parsed
-      // as a real URL and its query parameters are read by DECODED name,
-      // so a raw-regex blind spot can never supply a page the provider did
-      // not send. Exactly one `page` parameter must exist with a strictly
-      // sane integer value. A bare duplicate key (`?page=2&page`), a
-      // decoded duplicate (`?page=2&%70age=5`), a `page` only in the
-      // fragment (no query parameter at all), a malformed value next to a
-      // valid one (`page=2junk&page=2` — first-match extraction would
-      // silently skip the malformed prefix and accept the later value),
-      // numeric prefixes (`page=2junk`), and non-URL entries are all
-      // contradictory evidence that must poison completeness, never
-      // combine with an earlier bound into a false certificate. A
-      // genuinely proved positive match stays creditable regardless.
-      let entryUrl: URL;
-      try {
-        entryUrl = new URL(entry[1]!);
-      } catch {
-        return { kind: 'contradictory' };
+      if (quoted || angled || escaped) return null;
+      parts.push(text.slice(start).trim());
+      return parts;
+    };
+    const entries = split(linkHeader, ',');
+    if (entries === null) return { kind: 'contradictory' };
+    let last: number | null = null;
+    let next: number | null = null;
+    for (const entry of entries) {
+      const fields = split(entry, ';');
+      if (fields === null || fields.length < 2) return { kind: 'contradictory' };
+      const urlMatch = /^<([^<>]+)>$/u.exec(fields[0]!);
+      if (urlMatch === null) return { kind: 'contradictory' };
+      let relation: string | null = null;
+      for (const field of fields.slice(1)) {
+        const param = /^([!#$%&'*+.^_`|~0-9A-Za-z-]+)\s*=\s*(?:"((?:[^"\\]|\\.)*)"|([!#$%&'*+.^_`|~0-9A-Za-z-]+))$/u.exec(field);
+        if (param === null) return { kind: 'contradictory' };
+        if (param[1]!.toLowerCase() === 'rel') {
+          if (relation !== null) return { kind: 'contradictory' };
+          relation = (param[2] ?? param[3] ?? '').replace(/\\(.)/gu, '$1').toLowerCase();
+        }
       }
-      const pageValues = entryUrl.searchParams.getAll('page');
-      if (pageValues.length !== 1) return { kind: 'contradictory' };
-      const value = pageValues[0]!;
+      if (relation === null) continue;
+      const relations = relation.split(/\s+/u);
+      if (!relations.includes('last') && !relations.includes('next')) continue;
+      let url: URL;
+      try { url = new URL(urlMatch[1]!); } catch { return { kind: 'contradictory' }; }
+      const params = [...url.searchParams.keys()];
+      if (url.origin !== API_ROOT || url.username !== '' || url.password !== '' ||
+          url.pathname !== route || url.hash !== '' || params.length !== 2 ||
+          params.filter((key) => key === 'page').length !== 1 ||
+          params.filter((key) => key === 'per_page').length !== 1 ||
+          url.searchParams.get('per_page') !== '100') return { kind: 'contradictory' };
+      const value = url.searchParams.get('page')!;
       if (!/^\d+$/u.test(value)) return { kind: 'contradictory' };
-      const parsed = Number(value);
-      if (!Number.isSafeInteger(parsed) || parsed < 1) return { kind: 'contradictory' };
-      pages.push(parsed);
+      const page = Number(value);
+      if (!Number.isSafeInteger(page) || page < 1) return { kind: 'contradictory' };
+      if (relations.includes('last')) {
+        if (last !== null && last !== page) return { kind: 'contradictory' };
+        last = page;
+      }
+      if (relations.includes('next')) {
+        if (page <= responsePage || (next !== null && next !== page)) return { kind: 'contradictory' };
+        next = page;
+      }
     }
-    if (pages.length === 0) return { kind: 'absent' };
-    const first = pages[0]!;
-    return pages.every((candidate) => candidate === first) ? { kind: 'last', page: first } : { kind: 'contradictory' };
+    // A single response claiming both an end before its continuation is
+    // internally contradictory even when an earlier, larger bound means
+    // the walked page set happens to cover the next target.
+    if (last !== null && next !== null && next > last) return { kind: 'contradictory' };
+    return { kind: 'parsed', last, next };
   }
 
   /** Bounded ambiguous-POST reconciliation (the delivery path): a bounded
@@ -1239,7 +1260,8 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     // Set when a response's rel="last" evidence is malformed or
     // self-contradictory: the walk may keep looking, but it can never
     // certify absence — not even from an earlier valid bound.
-    let contradictoryLastPage = false;
+    let contradictoryPagination = false;
+    const observedNextPages = new Set<number>();
     let page = 1;
     let sequentialEnd = false;
     let matchedButUnreceiptable = false;
@@ -1252,15 +1274,16 @@ export class PerkinsAppPrPoster implements VerdictPoster {
       );
       const list = result.body;
       const linkHeader = result.header('link');
-      const seenLast = this.parseLastPage(linkHeader);
-      if (seenLast.kind === 'contradictory') {
+      const seenPagination = this.parsePagination(linkHeader, `/repos/${owner}/${repo}/pulls/${prNumber}/reviews`, page);
+      if (seenPagination.kind === 'contradictory') {
         // The provider's own pagination evidence disagrees with itself or
         // is malformed: no completeness certificate may rest on this walk,
         // even where an earlier bound looked valid. Independently proved
         // exact matches remain creditable; absence never is.
-        contradictoryLastPage = true;
-      } else if (seenLast.kind === 'last') {
-        lastPage = lastPage === null ? seenLast.page : Math.max(lastPage, seenLast.page);
+        contradictoryPagination = true;
+      } else if (seenPagination.kind === 'parsed') {
+        if (seenPagination.last !== null) lastPage = lastPage === null ? seenPagination.last : Math.max(lastPage, seenPagination.last);
+        if (seenPagination.next !== null) observedNextPages.add(seenPagination.next);
       }
       if (!Array.isArray(list)) {
         // Never report "searched and not found" when no usable list was read.
@@ -1314,7 +1337,14 @@ export class PerkinsAppPrPoster implements VerdictPoster {
       if (next < 1 || visited.has(next)) break;
       page = next;
     }
-    const provablyAbsent = !contradictoryLastPage && (lastPage !== null ? visited.size >= lastPage : sequentialEnd);
+    // Coverage is bounded by actual requests, never an allocation sized by
+    // a provider-supplied page count. Even a short final page cannot erase
+    // an earlier next link to a page we did not visit.
+    const covered = lastPage !== null && visited.size >= lastPage &&
+      [...visited].every((visitedPage) => visitedPage <= lastPage);
+    const provablyAbsent = !contradictoryPagination &&
+      [...observedNextPages].every((nextPage) => visited.has(nextPage) && (lastPage === null || nextPage <= lastPage)) &&
+      (lastPage !== null ? covered : sequentialEnd);
     return { matched: null, provablyAbsent, matchedButUnreceiptable };
   }
 }

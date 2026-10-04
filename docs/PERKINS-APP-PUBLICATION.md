@@ -145,16 +145,21 @@ publication whose submission time the provider does not state.
 
 Absence is certified only by full coverage: the walk visits every page up
 to the largest `rel="last"` page number any response reported — a list
-that grows mid-walk stays unresolved only while the grown list is not
-covered within the lookup bound — or, when no Link header is present at
-all, it reaches a short final page (fewer than 100 reviews — GitHub's own
-end-of-list signal). A Link header that carries no usable `rel="last"` is
-not an end-of-list signal: the walk continues bounded and stays unresolved
-rather than certifying absence from a rewritten header. A header whose
-`rel="last"` entries are malformed or contradict each other is worse than
-unusable: it poisons the walk's completeness evidence, so absence is never
-certified from that walk — not even from an earlier valid bound — though
-an independently proved exact match is still credited. A foreign author
+that grows mid-walk stays unresolved while the grown list is not covered
+within the lookup bound — or, without a last bound, it reaches a short
+final page with no Link header (fewer than 100 reviews). An observed
+`rel="next"` to an unvisited page blocks absence even if a later page
+reports a smaller last bound or has no Link header. Next links must advance
+past their response page; contradictory next targets, malformed Link
+parameters, and last/next URLs outside this PR's `api.github.com` reviews
+route with `per_page=100` make absence unprovable. First/prev targets are
+not used as proof of completeness. A Link header without a usable
+`rel="last"` is not an end-of-list signal; malformed or contradictory
+last/next pagination evidence poisons completeness even if an earlier bound
+looked valid. A Link header longer than 16,384 characters also leaves
+absence unresolved; inspect the provider's pagination before retrying.
+Independently proved exact matches are still credited, and an ordinary
+last page linking only to first/prev can complete coverage. A foreign author
 with the same bytes is never credited; a malformed list — one with an
 entry that is not a decidable review record (an array, a primitive, or a
 record without the provider's numeric review id) — a failed request, an

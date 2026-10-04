@@ -1854,7 +1854,7 @@ describe('idempotent recovery reconciliation', () => {
         method: 'GET', test: /\/reviews\?/,
         handler: async (call) => {
           const page = Number(/[?&]page=(\d+)/u.exec(call.url)?.[1] ?? '1');
-          const links = [`<https://api.github.com/repos/acme/widget/pulls/7/reviews?per_page=100&page=${Math.min(page + 1, 3)}>; rel="next"`];
+          const links = page < 3 ? [`<https://api.github.com/repos/acme/widget/pulls/7/reviews?per_page=100&page=${page + 1}>; rel="next"`] : [];
           if (page > 1) links.push(`<https://api.github.com/repos/acme/widget/pulls/7/reviews?per_page=100&page=${page - 1}>; rel="prev"`);
           links.push('<https://api.github.com/repos/acme/widget/pulls/7/reviews?per_page=100&page=3>; rel="last"');
           return { status: 200, body: foreignPage, headers: { link: links.join(', ') } };
@@ -2318,6 +2318,179 @@ describe('bounded lookup growth and link sanity', () => {
     state: 'COMMENTED',
     body: 'review body\n',
   }));
+
+  const link = (page: string, rel: string, base = 'https://api.github.com/repos/acme/widget/pulls/7/reviews') =>
+    `<${base}?per_page=100&page=${page}>; rel="${rel}"`;
+
+  it('refuses contradictory next and last pagination on both lookup routes', async () => {
+    const fixture = bundleFixture();
+    const scenarios: ReadonlyArray<[string, string, string]> = [
+      ['later next beyond an earlier last', link('2', 'last'), link('3', 'next')],
+      ['earlier next beyond a later last', link('3', 'next'), link('2', 'last')],
+      ['multi-token later last', link('2', 'last'), link('3', 'last alternate')],
+      ['backward next after a last', link('2', 'last'), link('1', 'next')],
+      ['self next after a last', link('2', 'last'), link('2', 'next')],
+      ['foreign origin next', link('2', 'last'), link('2', 'next', 'https://evil.example/repos/acme/widget/pulls/7/reviews')],
+      ['foreign PR next', link('2', 'last'), link('2', 'next', 'https://api.github.com/repos/acme/widget/pulls/8/reviews')],
+      ['wrong page size next', link('2', 'last'), link('2', 'next').replace('per_page=100', 'per_page=50')],
+      ['foreign origin last', link('2', 'last'), link('2', 'last', 'https://evil.example/repos/acme/widget/pulls/7/reviews')],
+      ['foreign PR last', link('2', 'last'), link('2', 'last', 'https://api.github.com/repos/acme/widget/pulls/8/reviews')],
+      ['wrong page size last', link('2', 'last'), link('2', 'last').replace('per_page=100', 'per_page=50')],
+      ['duplicate per_page', link('2', 'last'), link('2', 'last').replace('per_page=100', 'per_page=100&per_page=100')],
+      ['extra query parameter', link('2', 'last'), link('2', 'last').replace('per_page=100', 'per_page=100&sort=created')],
+      ['malformed non-rel parameter', link('2', 'last'), `${link('2', 'last')}; title=bad value`],
+      ['duplicate rel parameter', link('2', 'last'), `${link('2', 'last')}; rel="next"`],
+      ['duplicate page next', link('2', 'last'), link('3&%70age=2', 'next')],
+      ['multi-token next', link('2', 'last'), link('3', 'next alternate')],
+      ['quoted less-than and delimiters', link('2', 'last'), `${link('3', 'next')}; title="a < b, c; d"`],
+      ['reordered next', link('2', 'last'), `${link('3', 'next').replace('; rel="next"', '')}; title="tail"; rel="next"`],
+      ['conflicting next targets', link('2', 'last'), `${link('3', 'next')}, ${link('4', 'next')}`],
+      ['overlong Link header', link('2', 'last'), `${link('2', 'last')}; title="${'x'.repeat(16_385)}"`],
+    ];
+    for (const [label, first, second] of scenarios) {
+      const { poster, calls } = posterWith(fixture, [
+        { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+        { method: 'GET', test: /\/reviews\?/, handler: async (call) => ({
+          status: 200, body: fullPage,
+          headers: { link: /[?&]page=1$/u.test(call.url) ? first : second },
+        }) },
+      ], { maxReconciliationPages: 2 });
+      const input = { ...PR_INPUT, repoPath: repoPathOf(fixture) };
+      const error = await poster.post(input).then(() => null, (cause: unknown) => cause as Error);
+      expect(error?.message, label).toMatch(/delivery stays unproven/u);
+      expect(error?.message, label).not.toMatch(/did not land/u);
+      await expect(poster.reconcile(input), label).rejects.toThrow(/delivery stays unresolved/u);
+      expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews')), label).toHaveLength(1);
+    }
+  });
+
+  it('refuses conflicting next targets even when all targets and last pages were visited', async () => {
+    const fixture = bundleFixture();
+    const { poster, calls } = posterWith(fixture, [
+      { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+      { method: 'GET', test: /\/reviews\?/, handler: async (call) => ({
+        status: 200, body: fullPage,
+        headers: { link: /[?&]page=1$/u.test(call.url)
+          ? `${link('3', 'last')}, ${link('2', 'next')}, ${link('3', 'next')}`
+          : link('3', 'last') },
+      }) },
+    ]);
+    const input = { ...PR_INPUT, repoPath: repoPathOf(fixture) };
+    await expect(poster.post(input)).rejects.toThrow(/delivery stays unproven/u);
+    await expect(poster.reconcile(input)).rejects.toThrow(/delivery stays unresolved/u);
+    expect(calls.filter((call) => call.method === 'GET' && call.url.includes('/reviews?'))).toHaveLength(6);
+    expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
+  });
+
+  it('does not certify absence from one header whose next exceeds its own last, even if all four pages were visited', async () => {
+    const fixture = bundleFixture();
+    const { poster, calls } = posterWith(fixture, [
+      { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+      { method: 'GET', test: /\/reviews\?/, handler: async (call) => ({
+        status: 200, body: fullPage,
+        headers: { link: /[?&]page=2$/u.test(call.url)
+          ? `${link('2', 'last')}, ${link('3', 'next')}`
+          : link('4', 'last') },
+      }) },
+    ], { maxReconciliationPages: 4 });
+    const input = { ...PR_INPUT, repoPath: repoPathOf(fixture) };
+    await expect(poster.post(input)).rejects.toThrow(/delivery stays unproven/u);
+    await expect(poster.reconcile(input)).rejects.toThrow(/delivery stays unresolved/u);
+    expect(calls.filter((call) => call.url.includes('/reviews?'))
+      .map((call) => /[?&]page=(\d+)/u.exec(call.url)?.[1]))
+      .toEqual(['1', '4', '3', '2', '1', '4', '3', '2']);
+    expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
+  });
+
+  it('keeps a provider-sized last bound bounded by visited pages', async () => {
+    const fixture = bundleFixture();
+    const { poster, calls } = posterWith(fixture, [
+      { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+      { method: 'GET', test: /\/reviews\?/, handler: async () => ({
+        status: 200, body: fullPage, headers: { link: link(String(Number.MAX_SAFE_INTEGER), 'last') },
+      }) },
+    ], { maxReconciliationPages: 2 });
+    const input = { ...PR_INPUT, repoPath: repoPathOf(fixture) };
+    await expect(poster.post(input)).rejects.toThrow(/delivery stays unproven/u);
+    await expect(poster.reconcile(input)).rejects.toThrow(/delivery stays unresolved/u);
+    expect(calls.filter((call) => call.method === 'GET' && call.url.includes('/reviews?'))).toHaveLength(4);
+    expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
+  });
+
+  it('keeps a short no-Link final page unresolved after an earlier unvisited next', async () => {
+    const fixture = bundleFixture();
+    const { poster } = posterWith(fixture, [
+      { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+      { method: 'GET', test: /\/reviews\?/, handler: async (call) => /[?&]page=1$/u.test(call.url)
+        ? { status: 200, body: fullPage, headers: { link: link('3', 'next') } }
+        : { status: 200, body: [] } },
+    ], { maxReconciliationPages: 2 });
+    const input = { ...PR_INPUT, repoPath: repoPathOf(fixture) };
+    await expect(poster.post(input)).rejects.toThrow(/delivery stays unproven/u);
+    await expect(poster.reconcile(input)).rejects.toThrow(/delivery stays unresolved/u);
+  });
+
+  it('credits an exact match despite an oversized or contradictory Link header', async () => {
+    const fixture = bundleFixture();
+    for (const header of [`${link('2', 'last')}; title="${'x'.repeat(16_385)}"`, link('1', 'next')]) {
+      const { poster, calls } = posterWith(fixture, [
+        { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+        { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [MATCHING_REVIEW], headers: { link: header } }) },
+      ]);
+      const input = { ...PR_INPUT, repoPath: repoPathOf(fixture) };
+      await expect(poster.post(input)).resolves.toEqual(RECEIPT);
+      await expect(poster.reconcile(input)).resolves.toEqual(RECEIPT);
+      expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
+    }
+  });
+
+  it('keeps a valid quoted Link and an exactly-at-limit header usable for normal last-page coverage', async () => {
+    const fixture = bundleFixture();
+    const base = `${link('1', 'prev')}; title="`;
+    const atLimit = `${base}${'x'.repeat(16_384 - base.length - 1)}"`;
+    expect(atLimit.length).toBe(16_384);
+    for (const finalLink of [`${link('1', 'prev')}; title="a < b, c; d"`, atLimit]) {
+      const { poster } = posterWith(fixture, [
+        { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+        { method: 'GET', test: /\/reviews\?/, handler: async (call) => ({
+          status: 200, body: fullPage,
+          headers: { link: /[?&]page=1$/u.test(call.url) ? link('2', 'last') : finalLink },
+        }) },
+      ]);
+      const input = { ...PR_INPUT, repoPath: repoPathOf(fixture) };
+      await expect(poster.post(input)).rejects.toThrow(/POST did not land/u);
+      await expect(poster.reconcile(input)).resolves.toBeNull();
+    }
+  });
+
+  it('allows a visited next before a no-Link short final page on both lookup routes', async () => {
+    const fixture = bundleFixture();
+    const { poster, calls } = posterWith(fixture, [
+      { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+      { method: 'GET', test: /\/reviews\?/, handler: async (call) => /[?&]page=1$/u.test(call.url)
+        ? { status: 200, body: fullPage, headers: { link: link('2', 'next') } }
+        : { status: 200, body: [] } },
+    ], { maxReconciliationPages: 2 });
+    const input = { ...PR_INPUT, repoPath: repoPathOf(fixture) };
+    await expect(poster.post(input)).rejects.toThrow(/POST did not land/u);
+    await expect(poster.reconcile(input)).resolves.toBeNull();
+    expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
+  });
+
+  it('allows ordinary first/prev final-page coverage and ignores escaped quoted rel text', async () => {
+    const fixture = bundleFixture();
+    const { poster } = posterWith(fixture, [
+      { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+      { method: 'GET', test: /\/reviews\?/, handler: async (call) => ({
+        status: 200, body: fullPage, headers: { link: /[?&]page=1$/u.test(call.url)
+          ? link('2', 'last')
+          : `${link('1', 'first')}, ${link('1', 'prev')}; title="escaped ${'\\'}"; rel=next; < data"` },
+      }) },
+    ]);
+    const input = { ...PR_INPUT, repoPath: repoPathOf(fixture) };
+    await expect(poster.post(input)).rejects.toThrow(/POST did not land/u);
+    await expect(poster.reconcile(input)).resolves.toBeNull();
+  });
 
   it('never certifies absence from a page=0 "last" link (a rewriting intermediary cannot mint coverage)', async () => {
     const fixture = bundleFixture();
