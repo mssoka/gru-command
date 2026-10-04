@@ -2182,10 +2182,9 @@ describe('provider pacing: workflow rate-limit retry and cleanup', () => {
       const result = await h.run();
       expect(result.canonicalVerdict).toBe('READY TO MERGE');
       expect(existsSync(join(directory, 'consolidated.json'))).toBe(true);
-      expect(existsSync(join(directory, 'lead/dispose-error.json'))).toBe(false);
-      expect(log).toHaveBeenCalledWith(expect.stringMatching(/Perkins lead disposal failed:.*could not record cleanup evidence:.*EACCES/));
+      expect(readdirSync(join(directory, 'lead/dispose-error.json'))).toEqual([]);
+      expect(log).toHaveBeenCalledWith(expect.stringMatching(/Perkins lead disposal failed:.*could not record cleanup evidence:.*EEXIST/));
     } finally {
-      chmodSync(join(directory, 'lead'), 0o700);
       log.mockRestore();
     }
   });
