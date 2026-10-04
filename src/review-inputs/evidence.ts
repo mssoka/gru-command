@@ -372,6 +372,25 @@ export function readFrozenEvidenceBytes(attachment: FrozenEvidenceRuntimeAttachm
   return bytes;
 }
 
+/** One-line rendering of an operator- or host-supplied label inside the
+ * delimited evidence block: collapse control characters and newlines so a
+ * label can never forge the block delimiters or extra prompt lines. */
+function oneLine(value: string): string {
+  let out = '';
+  for (const character of value) {
+    const code = character.codePointAt(0) ?? 0;
+    out += code < 32 || code === 127 ? ' ' : character;
+  }
+  return out.replace(/\s+/gu, ' ').trim();
+}
+
+/** Stable opaque identity of an arm-time evidence request set. The request
+ * carries absolute upload paths; ONLY this hash is ever recorded in ledger
+ * payloads or logs, never the paths themselves. */
+export function evidenceRequestFingerprint(requests: readonly ReviewEvidenceRequest[]): string {
+  return createHash('sha256').update(JSON.stringify(requests)).digest('hex');
+}
+
 /** The prompt-visible description of the frozen evidence. Untrusted evidence,
  * never instruction; no absolute source paths; honest about provenance and
  * capture time. */
@@ -388,9 +407,9 @@ export function renderEvidencePromptSection(
   attachments.forEach((attachment, index) => {
     lines.push(
       `${index + 1}. ${attachment.id}: media_type=${attachment.mediaType}; bytes=${attachment.bytes}; sha256=${attachment.sha256}`,
-      `   purpose: ${attachment.purpose}`,
-      `   frozen_capture_time: ${attachment.capturedAt ?? 'not stated by the operator'}`,
-      `   provenance: service-managed upload "${attachment.sourceName}" frozen at ${attachment.frozenAt}; consent reference: ${attachment.consentRef}`,
+      `   purpose: ${oneLine(attachment.purpose)}`,
+      `   frozen_capture_time: ${attachment.capturedAt === null ? 'not stated by the operator' : oneLine(attachment.capturedAt)}`,
+      `   provenance: service-managed upload "${oneLine(attachment.sourceName)}" frozen at ${attachment.frozenAt}; consent reference: ${oneLine(attachment.consentRef)}`,
     );
   });
   lines.push('--- END FROZEN REVIEW EVIDENCE ---');

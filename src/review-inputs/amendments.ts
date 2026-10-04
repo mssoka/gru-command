@@ -150,8 +150,6 @@ export function validateAmendmentDraft(input: {
   return null;
 }
 
-const NO_BRIEFING_MARKER = '(no original briefing was recorded for this job)';
-
 /** Render the effective acceptance. Zero amendments return the original
  * briefing bytes EXACTLY (backward compatibility: existing jobs freeze
  * byte-identical specs). */
@@ -180,8 +178,14 @@ export function renderEffectiveContract(
       if (!supersededBy.has(id)) supersededBy.set(id, amendment.version);
     }
   }
+  if (briefing === null) {
+    // Unreachable through addJobAmendment (no-briefing jobs take no
+    // amendments). A caller bypassing that guard must refuse, never invent
+    // contract text.
+    throw new Error('cannot render amendments for a job with no recorded briefing');
+  }
   const lines: string[] = [
-    briefing ?? NO_BRIEFING_MARKER,
+    briefing,
     '',
     '===== CANONICAL AMENDMENTS (append-only; accepted amendments affect later review rounds only) =====',
   ];

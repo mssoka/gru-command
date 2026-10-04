@@ -168,6 +168,43 @@ describe('review-input handoff through the real wave freeze', () => {
     expect(payload.acceptance.version).toBe(1);
     expect(payload.evidence).toHaveLength(1);
     expect(payload.ci.state).toBe('green');
+    // A second round at a new target whose only observation belongs to a
+    // different repository/PR must freeze NOT-MATCHED: this asserts the
+    // call-site wiring of expectedRepo/expectedPr, not just the unit filter.
+    const target2 = repo.commitFile('src/other.ts', 'export const other = 1;\n');
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/feature/review']);
+    ledger.appendCustomEvent({
+      kind: 'github.branch-state',
+      jobId: job.id,
+      payload: {
+        repo: 'someone-else/other',
+        branch: 'gru/job-wave',
+        sha: target2,
+        merged: false,
+        pr_open: true,
+        mergeable_state: 'clean',
+        pr_number: 999,
+        pr_url: 'https://github.com/someone-else/other/pull/999',
+        ci: {
+          sha: target2,
+          status: 'green',
+          signature: '',
+          failures: [],
+          checks: ['CI'],
+          runs: [{ name: 'CI', url: 'https://example.test/runs/1' }],
+        },
+      },
+    });
+    const begun2 = await wave.beginRound({ jobId: job.id });
+    const outcome2 = asWave(await begun2.run);
+    const directory2 = join(artifacts, outcome2.round.id);
+    const spec2 = readFileSync(join(directory2, 'spec-context.md'), 'utf8');
+    expect(spec2).toContain('state: NOT-MATCHED — NO BOUND CI RECEIPT');
+    expect(spec2).not.toContain('state: GREEN (recorded observation)');
+    const manifest2 = JSON.parse(readFileSync(join(directory2, 'manifest.json'), 'utf8')) as {
+      reviewEvidence: { ci: { state: string } };
+    };
+    expect(manifest2.reviewEvidence.ci.state).toBe('not-matched');
     await wave.shutdown();
   });
 });

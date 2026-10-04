@@ -198,7 +198,7 @@ export function summarizeCheckRuns(sha: string, runs: readonly GhCheckRun[]): Ci
   const completed = runs
     .filter((run) => run.status === 'completed')
     .map((run) => ({ name: run.name, url: run.url }))
-    .sort((left, right) => left.name.localeCompare(right.name));
+    .sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
   const checks = completed.map((run) => run.name);
   const signature = failures.map((failure) => failure.name).sort().join('|');
   if (failures.length > 0) return { sha, status: 'failed', signature, failures, checks, runs: completed };

@@ -998,7 +998,9 @@ export class LedgerApi {
     return this.transaction(() => {
       const job = this.getJob(input.jobId);
       if (job === null) {
-        return { status: 'rejected' as const, code: 'job-not-found' as const, reason: `job "${input.jobId}" not found` };
+        // events.job_id carries no foreign key, so the refusal stays visible
+        // even when the named job never existed.
+        return this.rejectAmendment(input.jobId, 'job-not-found', `job "${input.jobId}" not found`, input);
       }
       if (job.status === 'merged' || job.status === 'done') {
         return this.rejectAmendment(input.jobId, 'job-terminal', `job "${input.jobId}" is ${job.status} — terminal lanes take no amendments`, input);
@@ -1006,8 +1008,9 @@ export class LedgerApi {
       if (job.briefing === null || job.briefing.trim() === '') {
         return this.rejectAmendment(input.jobId, 'no-briefing', 'job has no recorded briefing to amend', input);
       }
+      const briefing = job.briefing;
       const existing = this.listJobAmendments(input.jobId);
-      const current = renderEffectiveContract(job.briefing, existing);
+      const current = renderEffectiveContract(briefing, existing);
       const supersedes = input.supersedes ?? [];
       const idempotencyKey = input.idempotencyKey ?? null;
       if (idempotencyKey !== null) {
@@ -1066,6 +1069,19 @@ export class LedgerApi {
       if (draftError !== null) {
         return this.rejectAmendment(input.jobId, 'invalid', draftError, input);
       }
+      // An original:<anchor> supersession is a claim about the briefing: the
+      // anchor must actually occur there, or the recorded provenance is false.
+      const missingAnchor = supersedes.find(
+        (entry) => entry.startsWith('original:') && !briefing.includes(entry.slice('original:'.length)),
+      );
+      if (missingAnchor !== undefined) {
+        return this.rejectAmendment(
+          input.jobId,
+          'invalid',
+          `supersedes anchor "${missingAnchor.slice('original:'.length)}" does not occur in the original briefing`,
+          input,
+        );
+      }
       const createdAt = nowIso();
       const provisional: JobAmendmentRecord = {
         id: randomUUID(),
@@ -1081,7 +1097,7 @@ export class LedgerApi {
         idempotencyKey,
         createdAt,
       };
-      const rendered = renderEffectiveContract(job.briefing, [...existing, provisional]);
+      const rendered = renderEffectiveContract(briefing, [...existing, provisional]);
       const contractSha256 = rendered.contractSha256;
       if (Buffer.byteLength(rendered.text ?? '', 'utf8') > AMENDMENT_CONTRACT_MAX_BYTES) {
         return this.rejectAmendment(

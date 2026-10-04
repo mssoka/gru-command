@@ -213,6 +213,35 @@ describe('freeze-time acceptance and evidence binding', () => {
     })).toThrow(/does not start with the bound effective contract/u);
   });
 
+  it('binds the acceptance hash to the exact frozen spec prefix, trailing whitespace included', () => {
+    const repo = makeFixtureRepo('review-inputs-hash-normalization');
+    repos.push(repo);
+    const base = repo.head();
+    repo.git(['checkout', '-b', 'feature/review']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const contractText = 'Acceptance: original.  \nTrailing spaces preserved.  ';
+    const frozen = freezeReviewInputs({
+      roundId: 'round-hash',
+      repoPath: repo.path,
+      artifactRoot: temp('review-inputs-hash-artifacts-'),
+      baseRef: base,
+      targetRef: target,
+      spec: contractText,
+      acceptance: {
+        contractText,
+        version: 0,
+        baseSha256: createHash('sha256').update(contractText).digest('hex'),
+        amendmentIds: [],
+      },
+    });
+    const spec = readFileSync(join(frozen.directory, 'spec-context.md'), 'utf8');
+    expect(spec.startsWith(contractText)).toBe(true);
+    const manifest = JSON.parse(readFileSync(join(frozen.directory, 'manifest.json'), 'utf8')) as {
+      acceptance: { contractSha256: string };
+    };
+    expect(manifest.acceptance.contractSha256).toBe(createHash('sha256').update(contractText).digest('hex'));
+  });
+
   it('refuses evidence intake when no uploads directory is configured', () => {
     const repo = makeFixtureRepo('review-inputs-no-uploads');
     repos.push(repo);

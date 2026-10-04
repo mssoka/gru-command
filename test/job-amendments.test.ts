@@ -112,6 +112,29 @@ describe('canonical job amendments', () => {
     expect((rejects[0]!.payload as { code: string }).code).toBe('stale');
   });
 
+  it('rejects a supersedes anchor absent from the briefing, and audits the refusal', () => {
+    const { api } = boot();
+    api.addJob({ id: 'job-1', repo: 'repo', title: 't', briefing: BRIEFING });
+    const result = amendment(api, sha256(BRIEFING), 'Rewrite.', { supersedes: ['original:Acceptance 99'] });
+    expect(result.status).toBe('rejected');
+    if (result.status !== 'rejected') throw new Error('unreachable');
+    expect(result.code).toBe('invalid');
+    expect(result.reason).toContain('Acceptance 99');
+    expect(api.listJobAmendments('job-1')).toHaveLength(0);
+    const rejects = api.listEvents().filter((entry) => entry.kind === 'job.amendment-rejected');
+    expect(rejects.some((entry) => (entry.payload as { reason?: string }).reason?.includes('Acceptance 99'))).toBe(true);
+  });
+
+  it('audits a job-not-found refusal instead of dropping it (events carry no job FK)', () => {
+    const { api } = boot();
+    const result = amendment(api, sha256(BRIEFING), 'Body.', { jobId: 'missing-job' });
+    expect(result.status).toBe('rejected');
+    if (result.status !== 'rejected') throw new Error('unreachable');
+    expect(result.code).toBe('job-not-found');
+    const rejects = api.listEvents().filter((entry) => entry.kind === 'job.amendment-rejected');
+    expect(rejects.some((entry) => (entry.payload as { code?: string }).code === 'job-not-found')).toBe(true);
+  });
+
   it('idempotent retries resolve deterministically; a key reused for another request conflicts', () => {
     const { api } = boot();
     api.addJob({ id: 'job-1', repo: 'repo', title: 't', briefing: BRIEFING });

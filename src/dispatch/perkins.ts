@@ -46,7 +46,7 @@ import {
   CI_FAILED_EVENT,
   CI_GREEN_EVENT,
 } from '../review-inputs/ci-evidence.js';
-import type { ReviewEvidenceRequest } from '../review-inputs/evidence.js';
+import { evidenceRequestFingerprint, type ReviewEvidenceRequest } from '../review-inputs/evidence.js';
 import { parseGitHubPrUrl } from './github-poll.js';
 import {
   boundedDiff,
@@ -1550,13 +1550,14 @@ export class WaveRunner {
               ...(input.lenses !== undefined ? { lenses: input.lenses } : {}),
               ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
               ...(input.noSpec !== undefined ? { noSpec: input.noSpec } : {}),
-              ...(input.evidence !== undefined ? { evidence_count: input.evidence.length } : {}),
+              ...(input.evidence !== undefined ? { evidence_count: input.evidence.length, evidence_request_sha256: evidenceRequestFingerprint(input.evidence) } : {}),
             } },
           });
         }
-        // A genuinely NEW validated review request rearms a held intent
-        // (never a sweep/ACK/status flip alone); the fresh request is the
-        // authority, and the queue keeps first-request identity visible.
+        // A genuinely NEW validated review request clears a held intent
+        // (never a sweep/ACK/status flip alone); the queue keeps the
+        // first-request identity (first-wins) and the fresh request is
+        // audited as job.review-handoff-superseded.
         if (existing.held) this.supersedeHeldHandoff(input.jobId, input);
         return { route: 'queued', jobId: input.jobId, requestSeq: existing.seq, run: existing.run };
       }
@@ -1651,6 +1652,11 @@ export class WaveRunner {
       const admission = { lanePath, ...fallbackBaseline };
       this.assertFallbackIterationCurrent(input, admission);
       if (input.force === true) this.enforceBranchIdleForRequest(input);
+      // The fallback gate cannot deliver private evidence: refuse the arm
+      // rather than run the fallback review without the promised material.
+      if (input.evidence !== undefined && input.evidence.length > 0) {
+        throw new Error('private review evidence cannot be delivered through the bmad-review fallback route; re-arm without evidence or repair the Perkins pre-flight');
+      }
       return this.beginFallbackGate(input, result.failures, lanePath, () => this.assertFallbackIterationCurrent(input, admission));
     }
     // Post-await recheck (handoff replays only): permission is re-proven
@@ -1789,10 +1795,25 @@ export class WaveRunner {
 
   /** A genuinely new validated review request clears a prior hold and
    * supersedes the pending intent (queue-path rearm), keyed by identity. */
-  private supersedeHeldHandoff(jobId: string, newInput: { targetRef?: string; lenses?: readonly string[]; noSpec?: boolean }): boolean {
+  private supersedeHeldHandoff(jobId: string, newInput: { targetRef?: string; lenses?: readonly string[]; noSpec?: boolean; evidence?: readonly ReviewEvidenceRequest[] }): boolean {
     const pending = this.handoffs.get(jobId);
     if (pending === undefined || !pending.held) return false;
-    void newInput;
+    // The queue keeps the first-request identity (first-wins); the fresh
+    // validated request only clears the hold. Record the fresh request so the
+    // folded difference is auditable and never silent.
+    this.opts.ledger.appendCustomEvent({
+      kind: 'job.review-handoff-superseded',
+      jobId,
+      payload: {
+        requestSeq: pending.seq,
+        ...(newInput.targetRef !== undefined ? { targetRef: newInput.targetRef } : {}),
+        ...(newInput.lenses !== undefined ? { lenses: newInput.lenses } : {}),
+        ...(newInput.noSpec !== undefined ? { noSpec: newInput.noSpec } : {}),
+        ...(newInput.evidence !== undefined
+          ? { evidence_count: newInput.evidence.length, evidence_request_sha256: evidenceRequestFingerprint(newInput.evidence) }
+          : {}),
+      },
+    });
     pending.held = false; // a NEW request is fresh validated intent
     return true;
   }

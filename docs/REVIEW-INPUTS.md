@@ -17,8 +17,10 @@ live PR or edits historical rounds.
    { "filename": "reference.png", "content_base64": "<base64>" }
    ```
 
-   The response's `path` is the service-managed upload identity. Uploads are
-   never copied into git, a review tree, PR comments, or logs.
+   The response's `path` is the service-managed upload identity. The path
+   must be absolute and name a direct child of that uploads dir;
+   subdirectories, symlinks and foreign paths are refused. Uploads are never
+   copied into git, a review tree, PR comments, or logs.
 
 2. Arm a review naming that identity (at most 4 attachments; PNG/JPEG/GIF/WebP
    only; 8 MiB per file, 16 MiB total):
@@ -47,7 +49,26 @@ live PR or edits historical rounds.
 traversal, symlinks, foreign paths, non-upload names, mutated frozen bytes, or
 a text-only review model all refuse loudly. A refusal is never replaced by a
 written description, and the round/turn does not pretend the evidence was
-delivered.
+delivered. Check the review model's image capability before arming: a round
+whose review model cannot accept images freezes and then fails closed as
+INCOMPLETE naming the capability, so arm evidence only for image-capable
+models.
+
+**Queued handoffs.** A worker arm while its own lane is busy is queued with
+its request (the durable `job.review-handoff-queued` payload carries the
+service upload path so a restart can replay it — private ledger state only,
+never a public artifact or log). The queue keeps the first-request identity: a
+later arm with a different evidence set records `job.review-handoff-conflict`
+with an opaque request fingerprint (no paths) and the queued request's
+evidence is the one delivered; clearing a hold records
+`job.review-handoff-superseded`.
+
+**Retention and quota.** Uploads and frozen copies are private durable state.
+The uploads dir is capped at 1,000 files (posting past the cap answers `507`
+and names the dir to prune), and freeze copies each accepted attachment into
+`<data_dir>/reviews/<round>/evidence/` alongside its receipt. Prune old
+uploads through the existing attach/ops path when the cap is reached; frozen
+copies stay with their round record.
 
 **Honesty rule.** A purpose label must not claim the image was rendered at the
 reviewed SHA when it was not. Reference material may predate the revision; the
@@ -62,10 +83,17 @@ repository/PR/SHA and renders it into the frozen spec context (beside, and
 distinct from, the local scheduler verification block) and into the manifest.
 
 - GREEN/PENDING/FAILED render the recorded state with check names/URLs,
-  observation time and source event (kind + seq).
-- A stale SHA, wrong repository/PR, malformed payload, or absent observation
-  renders an explicit `UNAVAILABLE` / `NOT-MATCHED` limitation — never a PASS
-  and never a fabricated failure.
+  observation time and source event (kind + seq). A host string that lands in
+  the block has control characters/newlines collapsed first, so no check name
+  can forge a block boundary.
+- A stale SHA, wrong repository/PR, a PR-less observation standing in for the
+  expected PR, malformed payload, or absent observation renders an explicit
+  `UNAVAILABLE` / `NOT-MATCHED` limitation — never a PASS and never a
+  fabricated failure. When no PR URL is resolvable, the block states that the
+  repository is unverified.
+- A CI block too large for the frozen spec bound renders an explicit
+  `UNAVAILABLE — CI EVIDENCE OMITTED` notice instead of silence; the
+  structured record stays in the manifest.
 - Frozen rounds stay historically stable; late results do not rewrite them.
 
 ## 3. Approved canonical amendments
@@ -74,12 +102,17 @@ Amendments are append-only and versioned. The original briefing is never
 rewritten; later rounds render the effective acceptance, earlier rounds keep
 their frozen record.
 
-Read the current contract (version, both hashes, full effective text):
+Read the current contract (version, both hashes, full effective text, and the
+accepted amendments):
 
 ```
 GET /api/dispatch/jobs/<job_id>/contract
 Authorization: Bearer <pairing token>
 ```
+
+Returns `version`, `base_sha256`, `contract_sha256`, `effective_contract` and
+an `amendments[]` array (`id`, `version`, `created_at`, `body_sha256`,
+`supersedes`, `approval`, `previous_contract_sha256`, `contract_sha256`).
 
 Append an approved amendment:
 
@@ -98,14 +131,19 @@ Authorization: Bearer <pairing token>
 
 - `expected_contract_sha256` is optimistic concurrency: a stale or concurrent
   writer is refused (`409`) with the current hash/version and the refusal is
-  audited (`job.amendment-rejected`).
+  audited (`job.amendment-rejected`). A `job-not-found` request answers `404`
+  and is audited too.
 - The same `idempotency_key` + same request retries deterministically; a key
-  reused for a different request conflicts.
+  reused for a different request answers `409` (`idempotency-conflict`).
 - Each acceptance is audited (`job.amendment-accepted`) with amendment id,
   version, body hash, approval provenance and contract hashes.
-- 400 for malformed/improperly-authorized requests (a blank or missing
-  approval reference is refused); terminal jobs and jobs without a recorded
-  briefing take no amendments.
+- Bounds: `body` ≤ 32 KiB UTF-8; `supersedes` ≤ 32 entries, each
+  `original:<anchor>` (the anchor must occur in the original briefing — a typo
+  is refused) or `amendment:<id>` (an already-accepted amendment id); the
+  rendered effective contract ≤ 192 KiB. `400` for malformed/
+  improperly-authorized requests (a blank or missing approval reference is
+  refused); terminal jobs and jobs without a recorded briefing take no
+  amendments. Every refusal at the amendment boundary is audited.
 
 **Authorization honesty.** The service's paired bearer token is the only
 authentication primitive. `approval.by`/`reference` are recorded provenance,
@@ -117,10 +155,17 @@ worker/caller-declared role as approval.
 
 Every frozen round records:
 
-- `manifest.acceptance`: contract version, base/effective hashes, amendment ids.
-- `manifest.reviewEvidence`: frozen attachment metadata and the CI record.
+- `manifest.acceptance`: contract version, base/effective hashes, amendment
+  ids — present only when the round froze a spec (`no_spec` rounds have none).
+- `manifest.reviewEvidence`: frozen attachment metadata (possibly empty) and
+  the CI record; always present because the CI record is explicit, including
+  `UNAVAILABLE`/`NOT-MATCHED` when nothing binds.
 - A `round.review-inputs-frozen` ledger event with the same hashes/provenance
   (no pixels, no upload paths).
+
+The frozen `spec-context.md`, `manifest.json` and `evidence/receipt.json` are
+host files under `<data_dir>/reviews/<round>/`; there is no public read
+endpoint for them — operators inspect them on the host.
 
 ## 5. Activating a previously blocked PR (owner-controlled, later)
 

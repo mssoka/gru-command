@@ -332,7 +332,7 @@ export function freezeReviewInputs(input: FreezeReviewInput): FrozenReview {
   const changedFiles = changedFilePaths(input.repoPath, diffBaseSha, targetSha);
   if (changedFiles.length === 0) throw new Error(`frozen review diff is empty for ${diffBaseSha}..${targetSha}`);
 
-  const specContext = input.noSpec === true ? 'EXPLICIT NO-SPEC REVIEW' : input.spec!.trimEnd();
+  const specContext = input.noSpec === true ? 'EXPLICIT NO-SPEC REVIEW' : input.spec!;
   const specBytes = `${specContext}\n`;
   const projectConventions = readConventions(input.repoPath, targetSha, changedFiles);
   assertFrozenPromptBounds({ diff, specContext, projectConventions });

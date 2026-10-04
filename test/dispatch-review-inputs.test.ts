@@ -100,9 +100,45 @@ describe('dispatch review-input surfaces', () => {
       });
       expect(missing.status).toBe(400);
       expect(missing.json['error']).toBe('improper_authorization');
+      // A null approval is the same authorization failure, not a parse crash.
+      const nullApproval = await call(h.port, 'POST', '/api/dispatch/amendment', {
+        job_id: 'j',
+        body: 'amendment',
+        approval: null,
+        expected_contract_sha256: sha256(BRIEFING),
+      });
+      expect(nullApproval.status).toBe(400);
+      expect(nullApproval.json['error']).toBe('improper_authorization');
+      const unknownJob = await call(h.port, 'POST', '/api/dispatch/amendment', {
+        job_id: 'missing-job',
+        body: 'amendment',
+        approval: { by: 'owner', reference: 'j-969' },
+        expected_contract_sha256: sha256(BRIEFING),
+      });
+      expect(unknownJob.status).toBe(404);
+      expect(unknownJob.json['error']).toBe('job-not-found');
       const rejected = h.ledger.listJobAmendments('j');
       expect(rejected).toHaveLength(0);
-      expect(h.ledger.listEvents().filter((event) => event.kind === 'job.amendment-rejected')).toHaveLength(1);
+      const audit = h.ledger.listEvents().filter((event) => event.kind === 'job.amendment-rejected');
+      expect(audit).toHaveLength(3);
+      expect(audit.map((event) => (event.payload as { code?: string }).code)).toEqual([
+        'job-not-found',
+        'improper-authorization',
+        'improper-authorization',
+      ]);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('answers contract reads with 401 for anonymous callers and 404 for unknown jobs', async () => {
+    const h = await boot();
+    try {
+      const anon = await call(h.port, 'GET', '/api/dispatch/jobs/j/contract', undefined, null);
+      expect(anon.status).toBe(401);
+      const missing = await call(h.port, 'GET', '/api/dispatch/jobs/missing/contract');
+      expect(missing.status).toBe(404);
+      expect(missing.json['error']).toBe('job_not_found');
     } finally {
       await h.close();
     }
@@ -156,6 +192,15 @@ describe('dispatch review-input surfaces', () => {
       expect(keyRetried.status).toBe(200);
       expect(keyRetried.json['idempotent']).toBe(true);
       expect((keyRetried.json['amendment'] as { id: string }).id).toBe((keyed.json['amendment'] as { id: string }).id);
+      // The same key with a different request is a conflict, not a bad request.
+      const conflict = await call(h.port, 'POST', '/api/dispatch/amendment', {
+        ...payload,
+        body: 'A different request with the same key.',
+        idempotency_key: 'k2',
+        expected_contract_sha256: after.json['contract_sha256'],
+      });
+      expect(conflict.status).toBe(409);
+      expect(conflict.json['error']).toBe('idempotency-conflict');
     } finally {
       await h.close();
     }
@@ -191,6 +236,11 @@ describe('dispatch review-input surfaces', () => {
         evidence: [{ upload_path: '/x', purpose: 'p' }],
       });
       expect(missingConsent.status).toBe(400);
+      const tooMany = await call(h.port, 'POST', '/api/dispatch/review', {
+        job_id: 'j',
+        evidence: Array.from({ length: 5 }, (_, index) => ({ upload_path: `/x/${index}`, purpose: 'p', consent_ref: 'c' })),
+      });
+      expect(tooMany.status).toBe(400);
       expect(h.reviewCalls).toHaveLength(1);
     } finally {
       await h.close();

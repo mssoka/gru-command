@@ -437,11 +437,17 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       const body = await readBody(req);
       // Parse BEFORE any mutation: a malformed request is refused, never
       // half-applied. Approval provenance is REQUIRED (missing provenance is
-      // an authorization failure, not a default).
-      const rawApproval = body['approval'] as Record<string, unknown> | undefined;
-      const approvalBy = rawApproval === undefined ? undefined : optStrField(rawApproval, 'by');
-      const approvalReference = rawApproval === undefined ? undefined : optStrField(rawApproval, 'reference');
-      const jobId = strField(body, 'job_id');
+      // an authorization failure, not a default), and every refusal at this
+      // boundary is audited — including a null/array approval that would
+      // otherwise throw before the audit.
+      const rawApproval = body['approval'];
+      const approvalRecord = typeof rawApproval === 'object' && rawApproval !== null && !Array.isArray(rawApproval)
+        ? (rawApproval as Record<string, unknown>)
+        : null;
+      const approvalBy = approvalRecord === null ? undefined : optStrField(approvalRecord, 'by');
+      const approvalReference = approvalRecord === null ? undefined : optStrField(approvalRecord, 'reference');
+      const rawJobId = body['job_id'];
+      const jobId = typeof rawJobId === 'string' && rawJobId.trim() !== '' ? rawJobId : '<invalid-or-missing-job>';
       if (approvalBy === undefined || approvalReference === undefined) {
         // An improperly authorized attempt is audited, never silently dropped.
         options.ledger.appendCustomEvent({
@@ -452,13 +458,32 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         json(res, 400, { error: 'improper_authorization', detail: 'approval {by, reference} is required' });
         return true;
       }
+      let amendmentFields: { body: string; supersedes?: readonly string[]; expectedContractSha256: string; idempotencyKey?: string };
+      try {
+        const amendmentBody = strField(body, 'body');
+        const supersedes = optStrArray(body, 'supersedes');
+        const idempotencyKey = optStrField(body, 'idempotency_key');
+        amendmentFields = {
+          body: amendmentBody,
+          ...(supersedes !== undefined ? { supersedes } : {}),
+          expectedContractSha256: strField(body, 'expected_contract_sha256'),
+          ...(idempotencyKey !== undefined ? { idempotencyKey } : {}),
+        };
+      } catch (error) {
+        // Malformed shapes are audited like every other refusal; the reply
+        // stays generic instead of leaking internal error text.
+        options.ledger.appendCustomEvent({
+          kind: 'job.amendment-rejected',
+          jobId,
+          payload: { code: 'invalid', reason: error instanceof Error ? error.message.slice(0, 300) : 'malformed amendment request' },
+        });
+        json(res, 400, { error: 'invalid_request', detail: 'amendment request is malformed' });
+        return true;
+      }
       const result = options.ledger.addJobAmendment({
         jobId,
-        body: strField(body, 'body'),
-        ...(optStrArray(body, 'supersedes') !== undefined ? { supersedes: optStrArray(body, 'supersedes') } : {}),
+        ...amendmentFields,
         approval: { by: approvalBy, reference: approvalReference },
-        expectedContractSha256: strField(body, 'expected_contract_sha256'),
-        ...(optStrField(body, 'idempotency_key') !== undefined ? { idempotencyKey: optStrField(body, 'idempotency_key') } : {}),
       });
       if (result.status === 'accepted') {
         json(res, 200, {

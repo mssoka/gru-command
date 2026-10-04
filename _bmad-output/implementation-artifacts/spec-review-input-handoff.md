@@ -46,7 +46,8 @@ bmad-build interactive checkpoint is not available in this confined worker.
 
 ## Code Map
 
-- `src/ledger/db.ts` — MIGRATIONS list (currently 1–10). Add **migration 11**
+- `src/ledger/db.ts` — MIGRATIONS list (currently 1–13 after the main
+  integration). Add **migration 14**
   `job_amendments` (append-only rows; UNIQUE(job_id,version),
   UNIQUE(job_id,idempotency_key)).
 - `src/ledger/api.ts` — `addRound`/`latestJobEvent`/`appendCustomEvent`
@@ -104,7 +105,9 @@ bmad-build interactive checkpoint is not available in this confined worker.
   `test/review-inputs-handoff.test.ts` (whole-review prompt/delivery),
   `test/dispatch-review-inputs.test.ts` (HTTP + freeze integration);
   `test/helpers/perkins-whole-double.ts` gains capability/images capture;
-  `.gru-command/worktree.toml` gains ONE focused `review-inputs` scope.
+  `.gru-command/worktree.toml` gains the durable `review-inputs` focused
+  scope plus retained lane diagnostics (`review-inputs-regression`,
+  `installer-isolation`), all routed through the workload-aware configs.
 - Do NOT touch: pinned `resources/perkins-code-review/policy.json`, MCP
   bridge/server, verdict arithmetic, auth, review lenses, scheduler limits,
   other lanes' files; no new runtime dependency.
@@ -112,7 +115,7 @@ bmad-build interactive checkpoint is not available in this confined worker.
 ## Tasks & Acceptance
 
 **Execution:**
-- [x] `src/ledger/db.ts` — migration 11 for append-only amendments.
+- [x] `src/ledger/db.ts` — migration 14 for append-only amendments.
 - [x] `src/review-inputs/amendments.ts` + ledger `addJobAmendment`/`listJobAmendments` + audit events — versioned contract.
 - [x] `src/review-inputs/evidence.ts` — upload identity validation, sniffing, freeze-readback, prompt section.
 - [x] `src/review-inputs/ci-evidence.ts` — bound CI receipt/limitation renderer.
@@ -142,7 +145,9 @@ bmad-build interactive checkpoint is not available in this confined worker.
   rounds are unchanged; stale/conflicting/improperly-authorized/idempotent
   retries behave deterministically and are audited.
 - Given restart/old records, all new state is durable and backward compatible
-  (zero-amendment jobs render byte-identical specs); full gate, typecheck and
+  (zero-amendment jobs render the original briefing bytes as the contract
+  slice; every new frozen round adds the explicit review-input/CI blocks by
+  design); full gate, typecheck and
   focused scopes pass at the final head.
 
 ## I/O & Edge-Case Matrix

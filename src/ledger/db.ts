@@ -563,6 +563,10 @@ export const MIGRATIONS: readonly Migration[] = [
     // acceptance amendments with explicit approval provenance, expected-
     // contract-hash concurrency and idempotency. The original job briefing is
     // never rewritten; later review rounds render the effective contract.
+    // LANDING COLLISION (same convention as migrations 10-13): id 14 is a
+    // branch-local next-contiguous number for an UNSHIPPED feature; if
+    // owner-merged main lands first, re-number ONLY this never-applied
+    // migration (never a hole).
     id: 14,
     name: 'job-amendments',
     sql: `
