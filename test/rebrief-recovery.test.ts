@@ -733,6 +733,47 @@ describe('terminal re-brief retirement', () => {
     expect(retired.find((marker) => marker.kind === 'job.delivered')?.guarded_event_landed).toBe(false);
   });
 
+  it('a delivery-only crash window that turns terminal during lane lookup retires instead of fabricating delivery', async () => {
+    const h = makeHarness();
+    const jobId = 'terminal-during-delivery-lookup';
+    await seedPendingRebrief({ h, jobId });
+    h.ledger.appendCustomEvent({ kind: 'silas.rebrief', jobId, payload: { minion_id: 'worker-1' } });
+    const original = h.worktrees.listWorktrees.bind(h.worktrees);
+    const worktrees = Object.create(h.worktrees) as InMemoryWorktreePort;
+    worktrees.listWorktrees = (opts) => {
+      merge(h, jobId);
+      return original(opts);
+    };
+    const report = await reconcilePendingRebriefs({ ...deps(h), worktrees }, { bootAt: new Date(Date.now() + 60_000) });
+    await report.settled;
+    expect(report.completed).toBe(0);
+    expect(report.retired).toBe(1);
+    expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).toBeNull();
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-recovered')).toBeNull();
+    expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(0);
+    expect(retiredAudit(h, jobId)).toHaveLength(2);
+  });
+
+  it('a delivery-only shortcut cannot record a replaced request after lane lookup', async () => {
+    const h = makeHarness();
+    const jobId = 'superseded-during-delivery-lookup';
+    await seedPendingRebrief({ h, jobId });
+    h.ledger.appendCustomEvent({ kind: 'silas.rebrief', jobId, payload: { minion_id: 'worker-1' } });
+    const original = h.worktrees.listWorktrees.bind(h.worktrees);
+    const worktrees = Object.create(h.worktrees) as InMemoryWorktreePort;
+    worktrees.listWorktrees = (opts) => {
+      h.ledger.beginPendingRebrief({ jobId, note: 'new request', briefing: 'new contract' });
+      return original(opts);
+    };
+    const report = await reconcilePendingRebriefs({ ...deps(h), worktrees }, { bootAt: new Date(Date.now() + 60_000) });
+    await report.settled;
+    expect(report.completed).toBe(0);
+    expect(report.retired).toBe(0);
+    expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).toBeNull();
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-recovered')).toBeNull();
+    expect(h.ledger.listPendingRebriefs({ jobId }).map((row) => row.note)).toEqual(['new request', 'new request']);
+  });
+
   it('repeated and overlapping boot passes retire exactly once (idempotent by request identity)', async () => {
     const h = makeHarness();
     const jobId = 'terminal-replay-job';
@@ -780,6 +821,26 @@ describe('terminal re-brief retirement', () => {
     expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-retired')).not.toBeNull();
     expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(0);
     expect(h.ledger.getJob(jobId)?.status).toBe('merged');
+    expect(h.ledger.listNotifications().filter((row) => row.kind === `silas.rebrief-unreconciled.${jobId}`)).toHaveLength(0);
+  });
+
+  it('a recovered turn that errors after terminality retires instead of escalating an obsolete request', async () => {
+    const h = makeHarness();
+    const jobId = 'terminal-midturn-error';
+    await seedPendingRebrief({ h, jobId });
+    let release!: () => void;
+    h.registry.gate = new Promise<void>((resolve) => { release = resolve; });
+    const report = await reconcilePendingRebriefs(deps(h), { bootAt: new Date(Date.now() + 60_000) });
+    expect(report.redispatched).toBe(1);
+    merge(h, jobId);
+    h.registry.healthState = 'error';
+    h.registry.healthError = 'turn rejected';
+    release();
+    await report.settled;
+    expect(h.registry.workers).toHaveLength(1);
+    expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(0);
+    expect(retiredAudit(h, jobId)).toHaveLength(2);
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-recovered')).toBeNull();
     expect(h.ledger.listNotifications().filter((row) => row.kind === `silas.rebrief-unreconciled.${jobId}`)).toHaveLength(0);
   });
 
@@ -836,6 +897,38 @@ describe('terminal re-brief retirement', () => {
     expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(0);
     expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-retired')).toBeNull();
     expect(h.ledger.listNotifications()).toHaveLength(0);
+  });
+
+  it('spent marked events beyond the newest thousand stay completed at terminal boot and finalization', async () => {
+    const h = makeHarness();
+    for (const jobId of ['phase-spent-boot', 'phase-spent-finalize']) {
+      await seedPendingRebrief({ h, jobId });
+      const markers = h.ledger.beginPendingRebrief({
+        jobId, note: 'marked', briefing: 'contract',
+        handoff: { kind: 'gru-decision', decision: 'decide' },
+      });
+      const phaseId = markers[0]!.phaseId;
+      h.ledger.appendCustomEvent({ kind: 'silas.rebrief', jobId, payload: { phase_id: phaseId } });
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { phase_id: phaseId } });
+      for (let i = 0; i < 1001; i += 1) h.ledger.appendCustomEvent({ kind: 'job.note', jobId, payload: { i } });
+      merge(h, jobId);
+      if (jobId === 'phase-spent-boot') {
+        const report = await reconcilePendingRebriefs(deps(h), { bootAt: new Date(Date.now() + 60_000) });
+        await report.settled;
+        expect(report.completed).toBe(1);
+        expect(report.retired).toBe(0);
+      } else {
+        const result = finalizeRebriefRequest({
+          ledger: h.ledger, worktrees: h.worktrees, jobId,
+          minionId: 'worker', lanePath: h.lanePath, note: 'marked', expectedMarkers: markers,
+        });
+        expect(result.retired).toBe(false);
+        expect(result.rebriefRecorded).toBe(false);
+        expect(result.deliveryRecorded).toBe(false);
+      }
+      expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(0);
+      expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-retired')).toBeNull();
+    }
   });
 
   it('a parked job keeps the existing recovery path — not terminal cleanup', async () => {

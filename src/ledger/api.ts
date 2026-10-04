@@ -212,6 +212,14 @@ export class RecordNotFound extends Error {
   }
 }
 
+/** A guarded re-brief write lost its admitted request or the job closed. */
+export class PendingRebriefNoLongerCurrent extends Error {
+  constructor(readonly reason: 'terminal' | 'superseded') {
+    super(`pending re-brief is no longer current: ${reason}`);
+    this.name = 'PendingRebriefNoLongerCurrent';
+  }
+}
+
 /** A continuation was fenced out: the obligation moved to a different
  * generation (a newer distinct incident superseded the caller's view) or
  * the request does not own the current claim. Never retried blind —
@@ -721,6 +729,16 @@ export class LedgerApi {
     const row = this.db
       .prepare('SELECT * FROM events WHERE job_id = ? AND kind = ? ORDER BY seq DESC LIMIT 1')
       .get(jobId, kind) as Row | undefined;
+    return row === undefined ? null : this.eventFromRow(row);
+  }
+
+  /** A marked request's guarded event, however many newer unrelated job
+   * events exist. The request's watermark and phase must both match. */
+  latestJobPhaseEvent(jobId: string, kind: string, phaseId: string, baselineSeq: number): EventRecord | null {
+    const row = this.db.prepare(
+      `SELECT * FROM events WHERE job_id = ? AND kind = ? AND seq > ?
+       AND json_extract(payload, '$.phase_id') = ? ORDER BY seq DESC LIMIT 1`,
+    ).get(jobId, kind, baselineSeq, phaseId) as Row | undefined;
     return row === undefined ? null : this.eventFromRow(row);
   }
 
@@ -1435,6 +1453,29 @@ export class LedgerApi {
         payload: fields.payload,
       }),
     );
+  }
+
+  /** Delivery-only crash recovery: check the exact admitted markers and
+   * job status under the SAME write transaction as the event. A concurrent
+   * terminal commit cannot slip between the guard and a fabricated delivery. */
+  appendCustomEventIfCurrentRebrief(
+    fields: Parameters<LedgerApi['appendCustomEvent']>[0],
+    expected: readonly PendingRebriefRecord[],
+  ): BusEvent {
+    const jobId = fields.jobId;
+    if (jobId === undefined || jobId === null) throw new Error('guarded re-brief event requires a job id');
+    return this.transaction(() => {
+      const current = this.listPendingRebriefs({ jobId });
+      if (current.length !== expected.length || !expected.every((marker) => current.some((row) =>
+        row.id === marker.id && row.kind === marker.kind && row.payloadHash === marker.payloadHash &&
+        row.baselineSeq === marker.baselineSeq && row.phaseId === marker.phaseId))) {
+        throw new PendingRebriefNoLongerCurrent('superseded');
+      }
+      const job = this.getJob(jobId);
+      if (job === null) throw new RecordNotFound(`job "${jobId}" no longer exists — guarded re-brief delivery refused`);
+      if (isJobTerminal(job.status)) throw new PendingRebriefNoLongerCurrent('terminal');
+      return this.appendEvent(fields);
+    });
   }
 
   // ------------------------------------------------------------------

@@ -1,6 +1,7 @@
 import { existsSync } from 'node:fs';
 import { LIVE_DIRECTIVE_STATES } from '../ledger/directives.js';
 import { isJobTerminal } from '../ledger/states.js';
+import { PendingRebriefNoLongerCurrent } from '../ledger/api.js';
 import type {
   DirectiveRequestRecord,
   EventRecord,
@@ -154,7 +155,7 @@ export interface ReconcileReport {
  * marker (an older/other receipt cannot complete or cancel it).
  */
 export function pendingRebriefEventLanded(
-  ledger: Pick<LedgerApi, 'latestJobEvent' | 'listJobEvents'>,
+  ledger: Pick<LedgerApi, 'latestJobEvent' | 'latestJobPhaseEvent'>,
   marker: PendingRebriefRecord,
 ): boolean {
   return pendingRebriefGuardedEvent(ledger, marker, marker.phaseId) !== null;
@@ -163,7 +164,7 @@ export function pendingRebriefEventLanded(
 /** The marker's own guarded event, correlated to the phase when marked.
  * Unmarked markers keep the legacy newest-event predicate. */
 function pendingRebriefGuardedEvent(
-  ledger: Pick<LedgerApi, 'latestJobEvent' | 'listJobEvents'>,
+  ledger: Pick<LedgerApi, 'latestJobEvent' | 'latestJobPhaseEvent'>,
   marker: PendingRebriefRecord,
   phaseId: string | null,
 ): EventRecord | null {
@@ -171,13 +172,7 @@ function pendingRebriefGuardedEvent(
     const event = ledger.latestJobEvent(marker.jobId, marker.kind);
     return event !== null && event.seq > marker.baselineSeq ? event : null;
   }
-  for (const event of ledger.listJobEvents(marker.jobId, { limit: 1000 })) {
-    if (event.kind !== marker.kind) continue;
-    if (event.seq <= marker.baselineSeq) continue;
-    const payload = (typeof event.payload === 'object' && event.payload !== null ? event.payload : {}) as Record<string, unknown>;
-    if (payload['phase_id'] === phaseId) return event;
-  }
-  return null;
+  return ledger.latestJobPhaseEvent(marker.jobId, marker.kind, phaseId, marker.baselineSeq);
 }
 
 /**
@@ -430,14 +425,34 @@ export async function reconcilePendingRebriefs(
     if (job !== null && missing.every((marker) => marker.kind === 'job.delivered')) {
       const anchor = group.find((marker) => marker.kind === 'job.delivered') ?? group[0];
       const phaseId = group.find((marker) => marker.phaseId !== null)?.phaseId ?? null;
-      const followUp = recordFollowUpDelivery({
-        ledger: deps.ledger,
-        worktrees: deps.worktrees,
-        jobId,
-        agentId: anchor?.agentId ?? null,
-        source: 'silas-rebrief',
-        ...(phaseId !== null ? { phaseId } : {}),
-      });
+      let followUp: ReturnType<typeof recordFollowUpDelivery>;
+      try {
+        followUp = recordFollowUpDelivery({
+          // Lane lookup can invoke an injected port (or take time). The
+          // status/generation guard and event write share one ledger txn.
+          ledger: {
+            appendCustomEvent: (fields) => deps.ledger.appendCustomEventIfCurrentRebrief(fields, group),
+          },
+          worktrees: deps.worktrees,
+          jobId,
+          agentId: anchor?.agentId ?? null,
+          source: 'silas-rebrief',
+          ...(phaseId !== null ? { phaseId } : {}),
+        });
+      } catch (error) {
+        if (!(error instanceof PendingRebriefNoLongerCurrent)) throw error;
+        const finalized = finalizeRebriefRequest({
+          ledger: deps.ledger, worktrees: deps.worktrees, jobId,
+          minionId: null, lanePath: null, note: null, expectedMarkers: group,
+        });
+        if (finalized.retired) retired += 1;
+        deps.log?.('info', 're-brief delivery-only shortcut cancelled before recording', {
+          job: jobId, reason: error.reason, retired: finalized.retired,
+          superseded: finalized.superseded,
+          ...(finalized.retirement !== null ? { refused: finalized.retirement.refused, skipped: finalized.retirement.skippedIds } : {}),
+        });
+        continue;
+      }
       deps.ledger.clearPendingRebriefs(group.map((marker) => marker.id));
       deps.ledger.appendCustomEvent({
         kind: 'silas.rebrief-recovered',
@@ -588,13 +603,17 @@ async function redispatchGroup(
       minion_id: result.minionId,
     });
   } catch (error) {
-    if (error instanceof RebriefTurnCancelled) {
+    const currentJob = deps.ledger.getJob(jobId);
+    if (error instanceof RebriefTurnCancelled || (currentJob !== null && isJobTerminal(currentJob.status))) {
+      // A failed turn after a terminal flip is no longer actionable. Close
+      // only the admitted generation; the failure must not resurrect its
+      // markers or raise an obsolete action-required incident.
       const finalized = finalizeRebriefRequest({
         ledger: deps.ledger, worktrees: deps.worktrees, jobId,
         minionId: null, lanePath: null, note: null, expectedMarkers: group,
       });
-      deps.log?.('info', 're-brief recovery cancelled before admission', {
-        job: jobId, reason: error.reason, retired: finalized.retired,
+      deps.log?.('info', 're-brief recovery closed after cancellation or terminal turn failure', {
+        job: jobId, error: String(error), retired: finalized.retired,
         superseded: finalized.superseded,
         ...(finalized.retirement !== null ? { refused: finalized.retirement.refused, skipped: finalized.retirement.skippedIds } : {}),
       });
