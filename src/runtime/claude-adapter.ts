@@ -367,7 +367,19 @@ export class ClaudeCodeRuntime implements AgentRuntime {
     if (reviewMode !== undefined && options.resumeFile !== undefined) {
       throw new Error('isolated review sessions must be fresh and cannot resume ambient context');
     }
-    const fileTools = mapRoleTools(role, reviewMode?.tools ?? roleDef.tools);
+    // Issue #161: a declared role-tool override narrows (never widens) the
+    // role's own set — enforced here exactly as the pi adapter does.
+    if (options.roleTools !== undefined) {
+      const allowed = new Set(roleDef.tools);
+      for (const tool of options.roleTools) {
+        if (!allowed.has(tool)) {
+          throw new Error(
+            `role tool override names "${tool}", which role "${role}" does not declare — an override can only narrow authority`,
+          );
+        }
+      }
+    }
+    const fileTools = mapRoleTools(role, reviewMode?.tools ?? options.roleTools ?? roleDef.tools);
     await this.ensureBinary();
 
     const resumeFile =

@@ -2232,6 +2232,39 @@ body {
   flex: none;
 }
 
+/* Issue #161: parentage marks (top-level minion vs child worker), the
+ * parent-navigation link, and a parent's family counters. */
+.board-agent__parentage {
+  flex: none;
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0 5px;
+  color: var(--muted);
+}
+
+.board-agent__parentage--child {
+  color: var(--band-working-ink, var(--muted));
+  border-color: currentcolor;
+}
+
+.board-agent__parent-link {
+  flex: none;
+  cursor: pointer;
+  text-decoration: underline dotted;
+  color: var(--muted);
+}
+
+.board-agent__parent-link:hover {
+  color: var(--ink);
+}
+
+.board-agent__child-counts {
+  flex: none;
+  color: var(--muted);
+}
+
 .board-agent__supervision--alert {
   color: var(--band-needs-you-ink);
   font-weight: 800;

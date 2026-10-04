@@ -663,8 +663,22 @@ export class PiRuntime implements AgentRuntime {
       // children: the ADAPTER translates the declaration to in-process
       // tools, so callers never branch on harness (SPEC ruling 4).
       const nativeTools = reviewMode === undefined ? [] : nativeReviewTools(reviewMode.nativeTools ?? []);
+      // Issue #161: a declared role-tool override narrows (never widens)
+      // the role's own set — an unknown name fails loud here instead of
+      // silently spawning with the wrong authority.
+      const declaredRoleTools = options.roleTools ?? roleDef.tools;
+      if (options.roleTools !== undefined) {
+        const allowed = new Set(roleDef.tools);
+        for (const tool of options.roleTools) {
+          if (!allowed.has(tool)) {
+            throw new Error(
+              `role tool override names "${tool}", which role "${role}" does not declare — an override can only narrow authority`,
+            );
+          }
+        }
+      }
       const tools = isolatedTools === null
-        ? roleDef.tools
+        ? declaredRoleTools
         : [...isolatedTools.names, ...nativeTools.map((tool) => tool.name)];
       const { session } = await createAgentSession({
         cwd,

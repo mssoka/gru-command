@@ -141,6 +141,15 @@ export interface SpawnOptions {
    */
   readonly thinkingLevel?: string;
   /**
+   * Product-controlled tool subset for this spawn (issue #161): a child
+   * worker's bounded task authority is enforced by the runtime itself —
+   * a `read-only` child is spawned with the read-only role tools, a
+   * `writer` child with the role's full set. Omitted = the role's
+   * declared tool set (a declared override can ONLY narrow it; an
+   * unknown tool name refuses loud).
+   */
+  readonly roleTools?: readonly string[];
+  /**
    * Fresh ambient-free lens child. The adapter replaces the role prompt and
    * tools, disables project/global resources, and forbids resume.
    */

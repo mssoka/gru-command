@@ -117,8 +117,11 @@ export function createWorktreeServer(options: WorktreeServerOptions): WorktreeSe
       }
     } else {
       const jobId = strField(body, 'job_id');
+      // The JOB's own lane — never a linked review or child lane that
+      // happens to share the job id (issue #161: child lanes are registered
+      // under the same job scope).
       const lanes = manager.listWorktrees({ jobId });
-      const active = lanes.find((lane) => lane.status !== 'swept');
+      const active = lanes.find((lane) => lane.kind === 'job' && lane.status !== 'swept');
       if (active === undefined) {
         json(res, 404, { error: 'not_found', detail: 'no active worktree for this job' });
         return;

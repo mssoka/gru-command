@@ -282,9 +282,11 @@ export function digestActionCount(digest: SilasOpsDigest): number {
   );
 }
 
-/** Job lane record as the digest needs it (registry worktree shape). */
+/** Job lane record as the digest needs it (registry worktree shape).
+ * Issue #161: 'child' lanes share the job scope but are never selected as
+ * the job's own lane. */
 interface DigestLane {
-  readonly kind: 'job' | 'review';
+  readonly kind: 'job' | 'review' | 'child';
   readonly status: 'active' | 'paused' | 'swept';
   readonly path: string;
   readonly branch: string | null;

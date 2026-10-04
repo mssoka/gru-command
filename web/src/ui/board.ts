@@ -896,6 +896,7 @@ export class BoardView {
     // service must surface, never silently discard: mark every row of a
     // duplicated singleton role so the operator can investigate (#171).
     const duplicateRoles = duplicatedSingletonRoles(live);
+    const labelById = new Map(agents.map((entry) => [entry.id, agentLabel(entry)]));
     for (const agent of live) {
       rail.append(
         this.agentRow(
@@ -903,6 +904,7 @@ export class BoardView {
           'live',
           duplicateRoles.has(agent.id),
           classificationPresent && agentRuntimeOf(agent) === 'unverified',
+          labelById,
         ),
       );
     }
@@ -928,7 +930,9 @@ export class BoardView {
       });
       rail.append(toggle);
       if (this.historyExpanded) {
-        for (const agent of historical) rail.append(this.agentRow(agent, 'historical', false, false));
+        for (const agent of historical) {
+          rail.append(this.agentRow(agent, 'historical', false, false, labelById));
+        }
       }
     }
     if (disposed.length > 0) {
@@ -951,7 +955,7 @@ export class BoardView {
       });
       rail.append(toggle);
       if (this.disposedExpanded) {
-        for (const agent of disposed) rail.append(this.agentRow(agent, 'disposed', false, false));
+        for (const agent of disposed) rail.append(this.agentRow(agent, 'disposed', false, false, labelById));
       }
     }
   }
@@ -967,6 +971,7 @@ export class BoardView {
     section: 'live' | 'historical' | 'disposed',
     duplicateSingleton: boolean,
     ambiguousOwnership: boolean,
+    labelById: ReadonlyMap<string, string>,
   ): HTMLElement {
     const row = el(
       'button',
@@ -976,6 +981,11 @@ export class BoardView {
     const status = agentStatusOf(agent);
     row.dataset.state = status;
     row.dataset.role = agent.role;
+    // Issue #161: parent navigation target + honest parentage marker
+    // (`unknown` when the server gave no information — legacy rows are
+    // never inferred as top-level).
+    row.dataset.agentId = agent.id;
+    row.dataset.parentage = agent.parentage ?? 'unknown';
     if (status === 'error') row.classList.add('board-agent--error');
     row.title =
       agent.sessionFile !== null
@@ -991,15 +1001,60 @@ export class BoardView {
     });
     const body = el('span', 'board-agent__body');
     const top = el('span', 'board-agent__top');
+    const label = agentLabel(agent);
     top.append(
-      el('span', 'board-agent__name', agentLabel(agent)),
+      el('span', 'board-agent__name', label),
       el('span', 'board-agent__hash lbl', agent.id.slice(0, 8)),
     );
     const subline = el('span', 'board-agent__sub lbl');
+    // Issue #161: top-level minions vs minion-created child workers. The
+    // marker renders from the durable parentage field only; an omitted
+    // field (pre-upgrade server) or a null field (server says unknown)
+    // renders no marker — legacy rows are never claimed either way.
+    const parentage = agent.parentage;
+    const isChild = parentage === 'child';
     subline.append(
       el('span', 'board-agent__emoji', ROLE_EMOJI[agent.role] ?? '🤖'),
-      el('span', 'board-agent__role', `${agent.role} · ${status}`),
+      el('span', 'board-agent__role', isChild ? `child · ${status}` : `${agent.role} · ${status}`),
     );
+    if (parentage === 'top-level' || parentage === 'child') {
+      subline.append(
+        el(
+          'span',
+          `board-agent__parentage board-agent__parentage--${parentage}`,
+          isChild ? '🧬 child' : 'top-level',
+        ),
+      );
+    }
+    if (isChild && agent.parentAgentId !== null && agent.parentAgentId !== undefined) {
+      const parentId = agent.parentAgentId;
+      const parentLink = el(
+        'span',
+        'board-agent__parent-link',
+        `↳ ${labelById.get(parentId) ?? parentId.slice(0, 8)}`,
+      );
+      parentLink.title = `parent minion ${parentId} — jump to the parent row`;
+      parentLink.addEventListener('click', (event) => {
+        event.stopPropagation();
+        mustGet('board-agents')
+          .querySelector<HTMLElement>(`[data-agent-id="${parentId}"]`)
+          ?.scrollIntoView({ block: 'nearest' });
+      });
+      subline.append(parentLink);
+      row.title += ` · child worker of ${parentId}`;
+    }
+    const childCounts = agent.childCounts;
+    if (childCounts !== null && childCounts !== undefined && childCounts.lifetimeCreations > 0) {
+      const family = el(
+        'span',
+        'board-agent__child-counts',
+        `↳ ${childCounts.lifetimeCreations} ${childCounts.lifetimeCreations === 1 ? 'child' : 'children'}` +
+          ` (${childCounts.active} active, ${childCounts.queued} queued, ${childCounts.finished} finished)`,
+      );
+      family.title =
+        'family counters: active / queued / finished children, with lifetime logical creations';
+      subline.append(family);
+    }
     // Turn-age counter: a working agent shows how long its current turn
     // has been quiet — the operator's "is it stuck?" glance. The clock
     // prefers the supervision event stream (#171): deltas never touch the

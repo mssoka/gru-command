@@ -75,6 +75,41 @@ export function runWorktreePortContract(name: string, make: () => Promise<PortCo
       expect(foreign.map((lane) => lane.id)).toEqual(['contract-job-foreign']);
     });
 
+    it('CHILD LANES: own id, job scope, detached read-only / branched writer, sweep', async () => {
+      const jobLane = h.port.listWorktrees({ jobId: 'contract-job' }).find((lane) => lane.kind === 'job');
+      expect(jobLane).toBeDefined();
+      const readOnly = await h.port.createChildWorktree({
+        repoPath: h.repoPath,
+        jobId: 'contract-job',
+        childId: 'contract-child-ro',
+        parentPath: jobLane!.path,
+        authority: 'read-only',
+      });
+      expect(readOnly.id).toBe('contract-child-ro'); // ids ARE owner ids
+      expect(readOnly.kind).toBe('child');
+      expect(readOnly.branch).toBeNull(); // read-only is detached
+      expect(readOnly.jobId).toBe('contract-job');
+      expect(readOnly.roundId).toBeNull();
+      expect(existsSync(readOnly.path)).toBe(true);
+      const writer = await h.port.createChildWorktree({
+        repoPath: h.repoPath,
+        jobId: 'contract-job',
+        childId: 'contract-child-w',
+        parentPath: jobLane!.path,
+        authority: 'writer',
+      });
+      expect(writer.kind).toBe('child');
+      expect(writer.branch).toBe('gru/contract-job-child-contract-child-w');
+      // Child lanes stay inside their job's scope (never a foreign leak).
+      const scoped = h.port.listWorktrees({ jobId: 'contract-job' });
+      expect(scoped.some((lane) => lane.kind === 'child' && lane.id === 'contract-child-ro')).toBe(true);
+      expect(scoped.some((lane) => lane.kind === 'child' && lane.id === 'contract-child-w')).toBe(true);
+      // Release sweeps the tree under the child id (the same path as any lane).
+      const swept = await h.port.release({ worktreeId: 'contract-child-ro' });
+      expect(swept.status).toBe('swept');
+      expect(existsSync(readOnly.path)).toBe(false);
+    });
+
     it('RELEASE: sweeps the lane (tree gone, status swept), idempotent on repeat', async () => {
       const jobLane = h.port.listWorktrees({ jobId: 'contract-job' }).find((lane) => lane.kind === 'job');
       expect(jobLane).toBeDefined();

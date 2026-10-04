@@ -38,6 +38,7 @@ import { routeFixDirectiveToMinion } from './dispatch/fix-directive.js';
 import { reconcilePendingRebriefs, reconcilePendingDirectives } from './dispatch/rebrief-recovery.js';
 import { adoptBlockedLanes, observeFollowUpDelivery, observePhaseCompletion, reconcilePhaseHandoffs, reconcileUnmarkedHandbacks } from './dispatch/obligations.js';
 import { createDispatchServer } from './dispatch/server.js';
+import { ChildWorkerService } from './dispatch/child-workers.js';
 import { createVerificationServer } from './verify/server.js';
 import type { VerificationQueueView } from './verify/scheduler.js';
 import { createService, type ServiceHandle } from './server.js';
@@ -331,6 +332,7 @@ async function main(): Promise<number> {
     silas?: SilasDriver;
     providerRecovery?: ProviderRecoverySensor;
     wave?: WaveRunner;
+    childWorkers?: ChildWorkerService;
     verify?: ReturnType<typeof createVerificationServer>;
     deployDrift?: DeployDriftTracker;
   } = {};
@@ -432,6 +434,13 @@ async function main(): Promise<number> {
             await state.wave.shutdown();
           } catch (error) {
             logger.error('Perkins review shutdown failed', { error: String(error) });
+          }
+        }
+        if (state.childWorkers !== undefined) {
+          try {
+            await state.childWorkers.dispose();
+          } catch (error) {
+            logger.error('child worker shutdown failed', { error: String(error) });
           }
         }
         if (state.verify !== undefined) {
@@ -1036,6 +1045,18 @@ async function main(): Promise<number> {
     ...(config.lessons.enabled ? { lessons: lessonReferences, lessonsCapture } : {}),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
+  // Tracked child workers (issue #161): GC-owned nested workers. Kids
+  // ride the SAME spawner, resident budget and pacing gate as any other
+  // minion turn; GC owns admission, parentage, lifecycle and results.
+  const childWorkers = new ChildWorkerService({
+    ledger,
+    worktrees: worktreeManager,
+    spawner: (role: Role, spawnOptions?: SpawnOptions) => registry.spawn(role, spawnOptions ?? {}),
+    workerGate: pacing.gate,
+    stopSignal: serviceStop.signal,
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  state.childWorkers = childWorkers;
   const wave = new WaveRunner({
     ledger,
     worktrees: worktreeManager,
@@ -1099,6 +1120,14 @@ async function main(): Promise<number> {
       redispatched: rebriefRecovery.redispatched,
       retired: rebriefRecovery.retired,
     });
+  }
+  // Child-worker restart safety (issue #161): a child that never bound a
+  // session re-runs under the same identity; one that had a live session
+  // is terminally failed with the honest reason (its transcript stays
+  // readable) — never a fabricated `done`.
+  const childRecovery = childWorkers.reconcileOnBoot();
+  if (childRecovery.resumed > 0 || childRecovery.failed > 0) {
+    logger.info('child worker reconciliation', childRecovery);
   }
   // Directive-request restart safety (phase 3): a request accepted before
   // the crash reconciles from correlated evidence when it exists; when
@@ -1208,6 +1237,7 @@ async function main(): Promise<number> {
     dispatch: dispatcher,
     wave,
     ledger,
+    childWorkers,
     workerGate: pacing.gate,
     retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
     ...(config.silas.enabled && silasSlot !== null

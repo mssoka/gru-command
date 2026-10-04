@@ -74,6 +74,10 @@ export function renderMinionBriefing(input: {
   worktreePath: string;
   sha: string;
   briefing: string;
+  /** Your own agent id — the durable identity a child-worker request must
+   * carry as `parent_agent_id` (issue #161). Optional for callers that
+   * render the briefing before a session is bound. */
+  agentId?: string;
   /** Progressive-disclosure reference lines (no chapter bodies). */
   lessons?: readonly LessonPointer[];
 }): string {
@@ -83,6 +87,7 @@ export function renderMinionBriefing(input: {
     `Repo: ${input.repoName}`,
     `Branch: ${input.branch} (worktree: ${input.worktreePath})`,
     `Base head at dispatch: ${input.sha}`,
+    ...(input.agentId === undefined ? [] : [`Your agent id: ${input.agentId}`]),
     '',
     'BRIEFING:',
     input.briefing,
@@ -90,6 +95,16 @@ export function renderMinionBriefing(input: {
     '',
     PR_CREATION_RULE,
     '',
+    ...(input.agentId === undefined
+      ? []
+      : [
+          'Independent capacity: if the briefing calls for one independent worker',
+          '(e.g. read-only verification), request a GC-tracked child worker through',
+          'the service\'s authenticated surface (`POST /api/dispatch/child`) with',
+          '`parent_agent_id` set to YOUR agent id above — never launch external or',
+          'headless agents yourself.',
+          '',
+        ]),
     'Execute the briefing inside this worktree. Standing orders: work only',
     'inside this tree; commit your work to the branch; verify it (build,',
     'tests, lint — whatever this project calls green) before finishing;',
@@ -386,6 +401,7 @@ export class DispatchService {
         worktreePath: worktree.path,
         sha: worktree.sha,
         briefing: input.briefing,
+        agentId: handle.id,
         ...(lessons.length > 0 ? { lessons } : {}),
       });
       const promptRun: Promise<unknown> =

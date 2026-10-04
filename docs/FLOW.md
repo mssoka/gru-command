@@ -384,6 +384,59 @@ freezing until that minion's delivery event; a queued round then appears in
 the ledger as `round.residency-queued` until its lead/child pair is admitted.
 Queued waits consume no reviewer turn or spawn timeout.
 
+## 4e. Tracked child workers (sub-minions, issue #161)
+
+A parent minion can commission one independent child worker through GC's
+own authenticated control plane: `POST /api/dispatch/child`
+`{parent_agent_id, job_id, purpose, authority, task, idempotency_key,
+label?}`. GC — not a provider-native delegation extension — owns
+admission, identity, lifecycle, cancellation and the result record.
+
+- **Parentage is a relationship, not a sixth role.** A child is a
+  minion-role session whose agent row carries `parentage = 'child'` and
+  `parent_agent_id`. Only top-level minions may commission workers
+  (nested delegation is refused), and one parent admits at most four
+  logical children (`MAX_CHILDREN_PER_PARENT`).
+- **Idempotent admission.** The child's admission row is written before
+  any spawn; a duplicate or lost-response retry with the same
+  `(parent_agent_id, idempotency_key)` returns the existing child and
+  creates no second worker. The same key with a different payload is a
+  409 conflict. Refusals name the failed precondition: unknown parent,
+  parent not permitted, nested delegation, job mismatch, expired/terminal
+  job, disposed parent, missing parent lane, fanout cap, invalid task or
+  authority (`{error, detail}`).
+- **Bounded authority and isolation.** `authority: "read-only"` spawns
+  the child with the read-only tool set (`read`, `grep`, `find`, `ls`) in
+  a detached lane based at the parent lane's HEAD; `authority: "writer"`
+  gets the minion tool set and its own branch
+  `gru/<jobId>-child-<childId>`. A child never mutates the parent's
+  working tree implicitly and never inherits more than its own declared
+  authority.
+- **Lifecycle and result.** The child record moves
+  `queued → admitted → active → done | error | cancelled`. Child
+  admission waits in the SAME FIFO resident-worker admission as any other
+  worker session, and the child turn consumes the same provider pacing
+  pool. `done` is a successful terminal outcome recorded from the
+  transport's own terminal evidence; the child's final report is captured
+  from its session transcript into `result_summary` (with the session
+  file as `result_ref`) — never fabricated. `GET
+  /api/dispatch/children/:id`, `GET /api/dispatch/jobs/:jobId/children`
+  and `GET /api/dispatch/agents/:agentId/children` are the parent's
+  discovery paths; `POST /api/dispatch/children/:id/cancel` stops a live
+  child (terminal records are immutable).
+- **Counters.** The board snapshot carries `children {queued, active,
+  finished, lifetimeCreations}`; `lifetimeCreations` counts ROWS in
+  `child_workers` (one per logical creation), so retries, session resumes
+  and service restarts never double-count. See [LEDGER.md](./LEDGER.md)
+  for the full semantics.
+- **Ownership and recovery.** Child lanes are registered worktree lanes
+  (kind `child`) and sweep through the same release path; read-only lanes
+  are swept automatically once their run is terminal, writer lanes keep
+  their branch for inspection. At boot, a child that never bound a
+  session is re-run under the same identity; one that had a live session
+  is terminally failed with the honest reason (its transcript stays
+  readable) — never a fabricated `done`.
+
 ## 5. Release (the sweep)
 
 `POST /api/dispatch/release` `{job_id, confirm_kill?, base_branch?}` —

@@ -74,6 +74,16 @@ class HookedWorktreePort implements WorktreePort {
     return lane;
   }
 
+  createChildWorktree(input: {
+    repoPath: string;
+    jobId: string;
+    childId: string;
+    parentPath: string;
+    authority: 'read-only' | 'writer';
+  }): Promise<WorktreeLane> {
+    return this.delegate.createChildWorktree(input);
+  }
+
   getWorktree(id: string): WorktreeLane | null {
     return this.delegate.getWorktree(id);
   }

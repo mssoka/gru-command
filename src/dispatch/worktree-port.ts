@@ -29,9 +29,10 @@
 
 /** One managed worktree lane (registry shape, ruling 18b). */
 export interface WorktreeLane {
-  /** The owning job id (kind 'job') or round id (kind 'review'). */
+  /** The owning job id (kind 'job'), round id (kind 'review'), or child
+   * agent id (kind 'child'). */
   readonly id: string;
-  readonly kind: 'job' | 'review';
+  readonly kind: 'job' | 'review' | 'child';
   readonly repoPath: string;
   readonly repoName: string;
   readonly path: string;
@@ -88,6 +89,19 @@ export interface WorktreePort {
     ref: string;
     jobId?: string;
   }): Promise<WorktreeLane>;
+  /** Issue #161: a child worker's own lane. `read-only` children get a
+   * detached lane at the parent lane's current HEAD (frozen committed
+   * bytes, no branch); `writer` children get their own branch
+   * `gru/<jobId>-child-<childId>` based at the same HEAD, so a child
+   * never mutates the parent's working tree implicitly. */
+  createChildWorktree(input: {
+    repoPath: string;
+    jobId: string;
+    childId: string;
+    /** The parent's live lane path — the child's base HEAD. */
+    parentPath: string;
+    authority: 'read-only' | 'writer';
+  }): Promise<WorktreeLane>;
   getWorktree(id: string): WorktreeLane | null;
   listWorktrees(opts?: { jobId?: string }): readonly WorktreeLane[];
   release(input: { worktreeId: string; confirmKill?: boolean; baseBranch?: string }): Promise<WorktreeSweepResult>;
@@ -112,6 +126,9 @@ export class UnavailableWorktreePort implements WorktreePort {
     throw new Error(WORKTREE_PORT_UNAVAILABLE);
   }
   async createReviewWorktree(): Promise<WorktreeLane> {
+    throw new Error(WORKTREE_PORT_UNAVAILABLE);
+  }
+  async createChildWorktree(): Promise<WorktreeLane> {
     throw new Error(WORKTREE_PORT_UNAVAILABLE);
   }
   getWorktree(_id: string): WorktreeLane | null {

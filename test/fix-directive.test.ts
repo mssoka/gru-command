@@ -80,6 +80,8 @@ function minionRecord(id: string, jobId: string | null, sessionFile: string | nu
     state: 'idle',
     lastActivity: null,
     sessionFile,
+    parentAgentId: null,
+    parentage: null,
     createdAt: '2026-09-21T00:00:00.000Z',
     updatedAt: '2026-09-21T00:00:00.000Z',
   };
