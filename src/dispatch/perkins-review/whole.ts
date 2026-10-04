@@ -744,6 +744,7 @@ export class PerkinsWholeReview {
     let preflightAttempts = 0;
     let terminalAttempts = 0;
     let accepted: PerkinsWholeResult | null = null;
+    let returningAccepted = false;
 
     const registerIsolatedHandle = (handle: AgentHandle, phase: 'lead' | 'specialist'): void => {
       if (handle.reviewIsolation !== true) throw new Error(`${phase} handle is not review-isolated`);
@@ -1663,11 +1664,21 @@ export class PerkinsWholeReview {
         specialistRuns: specialistsStarted,
         nativeTools: leadTools.map((tool) => tool.name),
       });
+      returningAccepted = true;
       return accepted;
     } finally {
       try {
         unsubscribe();
-        await lead?.dispose();
+        try {
+          await lead?.dispose();
+        } catch (disposeError) {
+          if (!returningAccepted) throw disposeError;
+          // The sealed result outranks cleanup, but cleanup failure must
+          // remain independently visible beside the accepted record.
+          writeReviewArtifact(review, 'lead/dispose-error.json', {
+            error: sanitizeError(disposeError), agentId: lead!.id,
+          });
+        }
       } finally {
         reviewLease?.release();
       }

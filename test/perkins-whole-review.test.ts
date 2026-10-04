@@ -2012,11 +2012,21 @@ describe('provider pacing: workflow rate-limit retry and cleanup', () => {
     expect(sleep).not.toHaveBeenCalled();
   });
 
-  it('rejecting lead disposal still returns every pacing lease', async () => {
+  it('#86 preserves an accepted review despite lead disposal failure and records the failure', async () => {
     const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 0, maxConcurrentReviewTurns: 1 });
     const h = wholeHarness({ childAnswer: () => '[]', specialists: [], disposeRejects: (call) => call.options.reviewLead !== undefined }, { reviewGate: gate });
-    await expect(h.run()).rejects.toThrow('simulated session dispose failure');
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    expect(existsSync(join(result.artifactDirectory, 'consolidated.json'))).toBe(true);
+    const cleanup = JSON.parse(readFileSync(join(result.artifactDirectory, 'lead/dispose-error.json'), 'utf8')) as { error: string; agentId: string };
+    expect(cleanup).toEqual({ error: 'simulated session dispose failure', agentId: h.leadCalls[0]!.agentId });
     expect(gate.view().review).toMatchObject({ running: 0, queued: [] });
+  });
+
+  it('#86 propagates lead disposal failure when no terminal submission was accepted', async () => {
+    const h = wholeHarness({ ...ALL_CLEAN, neverSubmit: true, disposeRejects: (call) => call.options.reviewLead !== undefined });
+    await expect(h.run()).rejects.toThrow('simulated session dispose failure');
+    expect(existsSync(join(h.frozen.directory, 'consolidated.json'))).toBe(false);
   });
 
   it('disabled pacing keeps the normal lens fan-out even with configured caps', async () => {
