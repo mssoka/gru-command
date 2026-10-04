@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { createServer } from 'node:http';
@@ -41,6 +41,29 @@ afterEach(() => {
   while (cleanupRepos.length > 0) cleanupRepos.pop()!.cleanup();
   while (cleanupDirs.length > 0) rmSync(cleanupDirs.pop()!, { recursive: true, force: true });
 });
+
+/** Append one assistant message to a parseable session transcript. */
+function appendAssistant(path: string, text: string): void {
+  appendFileSync(
+    path,
+    `${JSON.stringify({
+      type: 'message',
+      id: `a-${Date.now()}-${Math.random()}`,
+      parentId: null,
+      timestamp: '2026-01-01T00:00:01.000Z',
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text }],
+        api: 'demo',
+        provider: 'demo',
+        model: 'demo',
+        stopReason: 'stop',
+        timestamp: Date.now(),
+      },
+    })}\n`,
+    'utf-8',
+  );
+}
 
 /** Write a parseable session transcript with one final assistant report. */
 function writeSession(path: string, assistantTexts: readonly string[]): void {
@@ -97,13 +120,21 @@ interface Harness {
   releaseSettle: (() => void) | null;
   /** Forces the next child's terminal verdict. */
   nextVerdict: { ok: boolean; error: string | null } | null;
+  /** The report text the next child writes (null = a turn with no report). */
+  reportText: string | null;
   setTurnGate(): () => void;
   setSpawnGate(): () => void;
   request(input?: Partial<{ authority: string; task: string; purpose: string; idempotencyKey: string; label: string }>): ReturnType<ChildWorkerService['request']>;
   close(): void;
 }
 
-function makeHarness(opts: { workerGate?: PacingGate } = {}): Harness {
+function makeHarness(
+  opts: {
+    workerGate?: PacingGate;
+    residentProbe?: () => { readonly available: number; readonly idleMinionIds: readonly string[] };
+    retrySettlement?: (agentId: string) => Promise<'none' | 'recovered' | 'exhausted' | 'superseded'>;
+  } = {},
+): Harness {
   const repo = makeFixtureRepo('fixture-child');
   cleanupRepos.push(repo);
   const dir = mkdtempSync(join(tmpdir(), 'gru-command-child-'));
@@ -111,7 +142,15 @@ function makeHarness(opts: { workerGate?: PacingGate } = {}): Harness {
   const ledgerDb = new LedgerDb(dir);
   const bus = new EventBus({});
   const ledger = new LedgerApi(ledgerDb.handle, { bus });
-  const engine = new BoardEngine({ ledger, bus });
+  const engine = new BoardEngine({
+    ledger,
+    bus,
+    // A wired ownership probe makes absence-of-ownership authoritative: a
+    // queued child must classify unverified (pending), never historical.
+    runtimeOwnership: () => ({
+      ownedAgentIds: new Set(handles.filter((handle) => !handle.disposed).map((handle) => handle.id)),
+    }),
+  });
   const worktrees = new InMemoryWorktreePort(join(dir, 'wtroot'));
   const sessionDir = join(dir, 'sessions');
   mkdirSync(sessionDir, { recursive: true });
@@ -136,6 +175,7 @@ function makeHarness(opts: { workerGate?: PacingGate } = {}): Harness {
     sessionDir,
     releaseSettle: null,
     nextVerdict: null,
+    reportText: 'child report from the fake session',
     setTurnGate(): () => void {
       releaseGate = null;
       turnGate = new Promise<void>((resolve) => {
@@ -168,15 +208,24 @@ function makeHarness(opts: { workerGate?: PacingGate } = {}): Harness {
   harness.service = new ChildWorkerService({
     ledger,
     worktrees,
+    credentialsDir: join(dir, 'child-credentials'),
     ...(opts.workerGate !== undefined ? { workerGate: opts.workerGate } : {}),
-    spawner: async (role, options) => {
-      spawns.push({ role, options: options ?? {} });
+    ...(opts.residentProbe !== undefined ? { residentProbe: opts.residentProbe } : {}),
+    ...(opts.retrySettlement !== undefined ? { retrySettlement: opts.retrySettlement } : {}),
+    spawner: async (role, spawnOptions) => {
+      const options = spawnOptions ?? {};
+      spawns.push({ role, options });
       if (spawnGate !== null) await spawnGate;
-      const id = `agent-${++n}`;
+      if (options.signal?.aborted) throw new Error('resident admission cancelled before spawn');
+      // Issue #161: the product-owned identity is bound BEFORE the session.
+      const id = options.agentId ?? `agent-${++n}`;
       const sessionFile = join(sessionDir, `${id}.jsonl`);
-      writeSession(sessionFile, [`child report from ${id}`]);
+      writeSession(sessionFile, []);
       const prompts: string[] = [];
       let state: AgentState = 'idle';
+      const writeReport = (): void => {
+        if (harness.reportText !== null) appendAssistant(sessionFile, harness.reportText);
+      };
       const handle: FakeHandle = {
         role,
         id,
@@ -187,10 +236,12 @@ function makeHarness(opts: { workerGate?: PacingGate } = {}): Harness {
         async prompt(text: string, _options?: PromptOptions) {
           prompts.push(text);
           if (turnGate !== null) await turnGate;
+          writeReport();
         },
         async promptWithVerdict(text: string) {
           prompts.push(text);
           if (turnGate !== null) await turnGate;
+          writeReport();
           if (harness.nextVerdict !== null) {
             const verdict = harness.nextVerdict;
             harness.nextVerdict = null;
@@ -209,6 +260,9 @@ function makeHarness(opts: { workerGate?: PacingGate } = {}): Harness {
         async dispose() {
           state = 'disposed';
           handle.disposed = true;
+          // A real adapter settles the open turn on disposal; the fake
+          // releases its gate so the run can observe the cancellation.
+          releaseGate?.();
         },
       };
       handles.push(handle);
@@ -430,6 +484,61 @@ describe('tracked child workers: admission (issue #161)', () => {
     h.close();
   });
 
+  it('sweeps the lane of a writer child cancelled before it spawned (no orphan lane)', async () => {
+    const h = makeHarness();
+    const release = h.setSpawnGate();
+    const admission = h.request({ authority: 'writer' });
+    await waitForChild(h, admission.record.id, (state) => state === 'admitted');
+    const cancelling = h.service.cancel(admission.record.id, 'cancelled before spawn');
+    release();
+    await cancelling;
+    await waitFor(
+      () => h.worktrees.getWorktree(admission.record.id)?.status === 'swept',
+      'the unspawned writer lane to be swept',
+    );
+    expect(h.ledger.getChildWorker(admission.record.id)!.state).toBe('cancelled');
+    expect(h.spawns).toHaveLength(1);
+    h.close();
+  });
+
+  it('refuses admission with a named budget precondition when resident capacity is exhausted and unreclaimable', () => {
+    const h = makeHarness({ residentProbe: () => ({ available: 0, idleMinionIds: [] }) });
+    const refusalOf = (): ChildWorkerRefusal => {
+      try {
+        h.request();
+      } catch (error) {
+        if (error instanceof ChildWorkerRefusal) return error;
+        throw error;
+      }
+      throw new Error('expected a refusal');
+    };
+    const refusal = refusalOf();
+    expect(refusal.code).toBe('budget');
+    expect(refusal.status).toBe(429);
+    expect(refusal.message).toContain('max_workers');
+    expect(h.ledger.listChildWorkers()).toHaveLength(0);
+    h.close();
+  });
+
+  it('fences a queued child when its job expires while it waits for spawn', async () => {
+    const h = makeHarness();
+    const release = h.setSpawnGate();
+    const admission = h.request({ authority: 'writer' });
+    await waitForChild(h, admission.record.id, (state) => state === 'admitted');
+    h.ledger.setJobStatus('job-1', 'done');
+    release();
+    await waitForChild(h, admission.record.id, (state) => state === 'error');
+    const record = h.ledger.getChildWorker(admission.record.id)!;
+    expect(record.resultSummary).toContain('done');
+    expect(record.resultSummary).toContain('expired');
+    // The never-delivered lane is swept — no orphan writer.
+    await waitFor(
+      () => h.worktrees.getWorktree(admission.record.id)?.status === 'swept',
+      'the fenced writer lane to be swept',
+    );
+    h.close();
+  });
+
   it('consumes the shared worker gate and releases it on settle', async () => {
     const release = vi.fn();
     const acquireWorkerTurn = vi.fn(async (_input: { id: string; jobId?: string | null }) => ({
@@ -482,6 +591,54 @@ describe('tracked child workers: lifecycle, results and recovery', () => {
     h.close();
   });
 
+  it('waits for the automatic retry settlement before recording the child result', async () => {
+    let settleCalls = 0;
+    const h = makeHarness({
+      retrySettlement: async () => {
+        settleCalls += 1;
+        return 'exhausted';
+      },
+    });
+    const admission = h.request();
+    await waitForChild(h, admission.record.id, (state) => state === 'error');
+    expect(settleCalls).toBe(1);
+    const record = h.ledger.getChildWorker(admission.record.id)!;
+    expect(record.resultSummary).toContain('automatic rate-limit retry exhausted');
+    h.close();
+  });
+
+  it('records a named error when a successful turn carries no collectable final report', async () => {
+    const h = makeHarness();
+    h.reportText = null;
+    const admission = h.request();
+    await waitForChild(h, admission.record.id, (state) => state === 'error');
+    const record = h.ledger.getChildWorker(admission.record.id)!;
+    expect(record.resultState).toBe('error');
+    expect(record.resultSummary).toContain('no final report');
+    expect(record.resultRef).not.toBeNull();
+    h.close();
+  });
+
+  it('supervision restarts a child in its own lane with bounded tools, or refuses once terminal', async () => {
+    const h = makeHarness();
+    h.setTurnGate();
+    const admission = h.request();
+    await waitForChild(h, admission.record.id, (state) => state === 'active');
+    const policy = h.service.restartPolicy(admission.record.id, 'minion');
+    expect(policy).toBeDefined();
+    expect(policy !== undefined && 'options' in policy).toBe(true);
+    const options = (policy as { options: import('../src/runtime/types.js').SpawnOptions }).options;
+    expect(options.cwd).toBe(h.worktrees.getWorktree(admission.record.id)!.path);
+    expect(options.roleTools).toEqual(READ_ONLY_CHILD_TOOLS);
+    expect(options.agentId).toBe(admission.record.id);
+    // A non-child agent is not specialized (undefined = default restart).
+    expect(h.service.restartPolicy('parent-1', 'minion')).toBeUndefined();
+    await h.service.cancel(admission.record.id, 'restart-policy test done');
+    const after = h.service.restartPolicy(admission.record.id, 'minion');
+    expect(after !== undefined && 'refuse' in after).toBe(true);
+    h.close();
+  });
+
   it('records an error result when the turn has no positive completion evidence', async () => {
     const h = makeHarness();
     h.nextVerdict = { ok: false, error: 'model refused the task' };
@@ -494,16 +651,16 @@ describe('tracked child workers: lifecycle, results and recovery', () => {
     h.close();
   });
 
-  it('cancel fences a live child: the record lands cancelled and the handle is disposed', async () => {
+  it('cancel fences a live child: the record lands cancelled only after the handle proves cessation', async () => {
     const h = makeHarness();
-    const release = h.setTurnGate();
+    h.setTurnGate();
     const admission = h.request();
     await waitForChild(h, admission.record.id, (state) => state === 'active');
-    const cancelled = h.service.cancel(admission.record.id, 'owner stopped the child');
+    const cancelled = await h.service.cancel(admission.record.id, 'owner stopped the child');
     expect(cancelled.state).toBe('cancelled');
     expect(cancelled.resultSummary).toContain('owner stopped the child');
-    await waitFor(() => h.handles[0]!.disposed, 'the cancelled handle to be disposed');
-    release();
+    expect(cancelled.resultRef).not.toBeNull(); // the transcript reference survives
+    expect(h.handles[0]!.disposed).toBe(true);
     // The run's own settle is idempotent over the terminal record.
     await new Promise((resolve) => setTimeout(resolve, 30));
     expect(h.ledger.getChildWorker(admission.record.id)!.state).toBe('cancelled');
@@ -523,7 +680,6 @@ describe('tracked child workers: lifecycle, results and recovery', () => {
       idempotencyKey: 'k-unbound',
     });
     // A child with a bound session when the service died: honest error.
-    h.ledger.registerAgent({ id: 'bound-agent', role: 'minion', jobId: 'job-1', parentAgentId: 'parent-1' });
     const bound = h.ledger.admitChildWorker({
       id: 'child_bound',
       parentAgentId: 'parent-1',
@@ -533,12 +689,26 @@ describe('tracked child workers: lifecycle, results and recovery', () => {
       task: 'verify the bound lane',
       idempotencyKey: 'k-bound',
     });
-    h.ledger.bindChildAgent(bound.record.id, 'bound-agent');
+    const parentLane = h.worktrees.listWorktrees({ jobId: 'job-1' }).find((lane) => lane.kind === 'job')!;
+    const boundLane = await h.worktrees.createChildWorktree({
+      repoPath: h.repo.path,
+      jobId: 'job-1',
+      childId: bound.record.id,
+      parentPath: parentLane.path,
+      authority: 'read-only',
+    });
+    h.ledger.markChildAdmitted(bound.record.id, { worktreeId: boundLane.id, branch: null });
+    h.ledger.markChildStarted(bound.record.id, { sessionFile: join(h.sessionDir, 'bound.jsonl') });
     const outcome = h.service.reconcileOnBoot();
     expect(outcome).toEqual({ resumed: 1, failed: 1 });
     const failed = h.ledger.getChildWorker('child_bound')!;
     expect(failed.resultState).toBe('error');
     expect(failed.resultSummary).toContain('service restarted');
+    // The interrupted read-only lane is swept on boot — no leaked checkout.
+    await waitFor(
+      () => h.worktrees.getWorktree(bound.record.id)?.status === 'swept',
+      'the interrupted read-only lane to be swept',
+    );
     await waitForChild(h, unbound.record.id, (state) => state === 'done');
     h.close();
   });
@@ -610,6 +780,29 @@ describe('tracked child workers: migration and storage', () => {
 });
 
 describe('tracked child workers: board and API surfaces', () => {
+  it('shows an admitted-but-unspawned child as unverified-pending (never historical)', async () => {
+    const h = makeHarness();
+    const release = h.setSpawnGate();
+    const admission = h.request({ idempotencyKey: 'k-pending' });
+    await waitForChild(h, admission.record.id, (state) => state === 'admitted');
+    const snapshot = h.engine.snapshot();
+    const pending = snapshot.agents.find((agent) => agent.id === admission.record.id)!;
+    expect(pending.state).toBe('spawning');
+    expect(pending.parentage).toBe('child');
+    expect(pending.parentAgentId).toBe('parent-1');
+    expect(pending.runtime).toBe('unverified');
+    expect(pending.child?.state).toBe('admitted');
+    expect(snapshot.children).toEqual({
+      queued: 1,
+      active: 0,
+      finished: 0,
+      lifetimeCreations: 1,
+    });
+    release();
+    await waitForChild(h, admission.record.id, (state) => state === 'done');
+    h.close();
+  });
+
   it('the board distinguishes parentage, exposes parent navigation and family counters', async () => {
     const h = makeHarness();
     const admission = h.request();
@@ -698,6 +891,9 @@ describe('tracked child workers: board and API surfaces', () => {
     const byId = await call(`/api/dispatch/children/${childId}`);
     expect(byId.status).toBe(200);
     expect((byId.json!['child'] as Record<string, unknown>)['result_state']).toBe('done');
+    // The parent can obtain the durable report from the SAME API surface.
+    expect((byId.json!['child'] as Record<string, unknown>)['result_summary']).toContain('child report');
+    expect((byId.json!['child'] as Record<string, unknown>)['result_ref']).not.toBeNull();
     const byJob = await call('/api/dispatch/jobs/job-1/children');
     expect((byJob.json!['children'] as unknown[]).length).toBe(1);
     const byParent = await call('/api/dispatch/agents/parent-1/children');
@@ -708,6 +904,31 @@ describe('tracked child workers: board and API surfaces', () => {
     const malformed = await call('/api/dispatch/child', {});
     expect(malformed.status).toBe(400);
     expect(malformed.json!['error']).toBe('invalid_request');
+
+    // Issue #161 scoped capability: a parent-bound token alone (no operator
+    // token) drives exactly that parent's request/read/cancel surface, and
+    // never another parent's.
+    h.ledger.registerAgent({ id: 'parent-2', role: 'minion', jobId: 'job-1', parentage: 'top-level' });
+    const capability = h.service.issueParentCredential('parent-1');
+    const otherCapability = h.service.issueParentCredential('parent-2');
+    const token1 = readFileSync(capability.tokenFile, 'utf-8').trim();
+    const token2 = readFileSync(otherCapability.tokenFile, 'utf-8').trim();
+    expect(token1).not.toBe(token2);
+    const scopedBody = { ...body, idempotency_key: 'k-http-scoped' };
+    const scoped = await call('/api/dispatch/child', scopedBody, token1);
+    expect(scoped.status).toBe(202);
+    const scopedId = (scoped.json!['child'] as Record<string, unknown>)['id'] as string;
+    // Cross-parent denial: parent-2's capability cannot act as parent-1.
+    const crossPost = await call('/api/dispatch/child', { ...body, idempotency_key: 'k-http-cross' }, token2);
+    expect(crossPost.status).toBe(401);
+    expect((await call(`/api/dispatch/children/${scopedId}`, undefined, token2)).status).toBe(401);
+    expect((await call(`/api/dispatch/children/${scopedId}`, undefined, token1)).status).toBe(200);
+    expect((await call('/api/dispatch/agents/parent-2/children', undefined, token1)).status).toBe(401);
+    expect((await call('/api/dispatch/jobs/job-1/children', undefined, token1)).status).toBe(401);
+    const scopedCancel = await call(`/api/dispatch/children/${scopedId}/cancel`, { reason: 'parent stop' }, token1);
+    expect(scopedCancel.status).toBe(200);
+    expect((scopedCancel.json!['child'] as Record<string, unknown>)['result_state']).not.toBeNull();
+
     const cancel = await call(`/api/dispatch/children/${childId}/cancel`, { reason: 'operator stop' });
     expect(cancel.status).toBe(200);
     expect((cancel.json!['child'] as Record<string, unknown>)['result_state']).toBe('done'); // terminal is immutable

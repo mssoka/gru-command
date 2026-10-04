@@ -1,4 +1,5 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
+import { hashToken } from '../auth.js';
 import type { DatabaseSync } from 'node:sqlite';
 import type { BusEvent, EventBus } from '../events/bus.js';
 import type { Role } from '../config.js';
@@ -2015,19 +2016,34 @@ export class LedgerApi {
         );
       }
       const ts = nowIso();
-      // The admission row IS the child's durable identity while no
-      // session exists; the spawned agent row is bound later by
-      // bindChildAgent (its id is minted by the runtime, never invented
-      // here).
+      // The child's agent row is written AT admission with its product-
+      // owned id, so the durable identity (agent row, child record and
+      // lane) exists before any session — a queued child is visible on
+      // the board and can be navigated to immediately. The spawn binds
+      // the session FILE, never a new identity (SpawnOptions.agentId).
+      this.db
+        .prepare(
+          `INSERT INTO agents (id, role, label, job_id, round_id, state, last_activity, session_file, parent_agent_id, parentage, created_at, updated_at)
+           VALUES (?, 'minion', ?, ?, NULL, 'spawning', NULL, NULL, ?, 'child', ?, ?)`,
+        )
+        .run(
+          input.id,
+          input.label ?? `child of ${input.parentAgentId}`,
+          input.jobId,
+          input.parentAgentId,
+          ts,
+          ts,
+        );
       this.db
         .prepare(
           `INSERT INTO child_workers
              (id, agent_id, parent_agent_id, job_id, purpose, authority, task, label, idempotency_key,
               payload_hash, state, worktree_id, branch, session_file, result_state, result_summary,
               result_ref, created_at, admitted_at, started_at, finished_at, updated_at)
-           VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', NULL, NULL, NULL, NULL, NULL, NULL, ?, NULL, NULL, NULL, ?)`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', NULL, NULL, NULL, NULL, NULL, NULL, ?, NULL, NULL, NULL, ?)`,
         )
         .run(
+          input.id,
           input.id,
           input.parentAgentId,
           input.jobId,
@@ -2041,7 +2057,14 @@ export class LedgerApi {
           ts,
         );
       this.appendEvent({
+        kind: 'agent.spawned',
+        agentId: input.id,
+        jobId: input.jobId,
+        payload: { role: 'minion', label: input.label ?? null, parentAgentId: input.parentAgentId },
+      });
+      this.appendEvent({
         kind: 'child.queued',
+        agentId: input.id,
         jobId: input.jobId,
         payload: {
           childId: input.id,
@@ -2060,25 +2083,53 @@ export class LedgerApi {
     return row === undefined ? null : this.childWorkerFromRow(row);
   }
 
-  /** Bind the runtime-minted child agent row to its admission record
-   * (after spawn, before the child's prompt is delivered). */
-  bindChildAgent(id: string, agentId: string): ChildWorkerRecord {
-    if (agentId === '') throw new Error('child agent id must be non-empty');
-    return this.transaction(() => {
-      const record = this.getChildWorker(id);
-      if (record === null) throw new RecordNotFound(`child worker "${id}" not found`);
-      const agent = this.getAgent(agentId);
-      if (agent === null) throw new RecordNotFound(`agent "${agentId}" not found — bind a real child session`);
-      if (record.agentId !== null && record.agentId !== agentId) {
-        throw new ChildWorkerConflictError(
-          `child worker "${id}" is already bound to agent "${record.agentId}" — one run per logical child`,
-        );
-      }
+  /** The child record owned by an agent id (the supervision restart policy
+   * resolver keys on this; null = not a tracked child). */
+  childWorkerByAgent(agentId: string): ChildWorkerRecord | null {
+    const row = this.db
+      .prepare('SELECT * FROM child_workers WHERE agent_id = ? ORDER BY created_at DESC LIMIT 1')
+      .get(agentId) as Row | undefined;
+    return row === undefined ? null : this.childWorkerFromRow(row);
+  }
+
+  /**
+   * Mint (or re-mint, replacing the prior hash) the scoped parent
+   * capability for a top-level minion. Returns the plaintext exactly once;
+   * only its SHA-256 is stored. The capability authorizes child requests,
+   * reads and cancels for THIS parent only.
+   */
+  issueChildRequestToken(agentId: string): string {
+    const agent = this.getAgent(agentId);
+    if (agent === null) throw new RecordNotFound(`agent "${agentId}" not found — a capability needs a real session`);
+    if (agent.parentage === 'child') {
+      throw new ChildWorkerConflictError(`agent "${agentId}" is a child worker — children never commission children`);
+    }
+    const token = randomBytes(32).toString('base64url');
+    this.transaction(() => {
       this.db
-        .prepare('UPDATE child_workers SET agent_id = ?, updated_at = ? WHERE id = ?')
-        .run(agentId, nowIso(), id);
-      return this.getChildWorker(id) as ChildWorkerRecord;
+        .prepare('UPDATE agents SET child_request_token_hash = ?, updated_at = ? WHERE id = ?')
+        .run(hashToken(token).toString('hex'), nowIso(), agentId);
+      this.appendEvent({
+        kind: 'agent.capability-issued',
+        agentId,
+        jobId: agent.jobId,
+        payload: { capability: 'child-request' },
+      });
     });
+    return token;
+  }
+
+  /** Constant-time scoped-capability check. Unknown/legacy agents (no
+   * stored hash) never authorize. */
+  verifyChildRequestToken(agentId: string, token: string): boolean {
+    const row = this.db
+      .prepare('SELECT child_request_token_hash FROM agents WHERE id = ?')
+      .get(agentId) as Row | undefined;
+    const stored = row === undefined ? null : nstr(row.child_request_token_hash);
+    if (stored === null) return false;
+    const storedBuf = Buffer.from(stored, 'hex');
+    const candidateBuf = hashToken(token);
+    return storedBuf.length === candidateBuf.length && timingSafeEqual(storedBuf, candidateBuf);
   }
 
   listChildWorkers(
@@ -2200,7 +2251,12 @@ export class LedgerApi {
       const record = this.getChildWorker(id);
       if (record === null) throw new RecordNotFound(`child worker "${id}" not found`);
       if (record.resultState !== null) return record;
-      return this.recordChildResult(id, { state: 'cancelled', summary: input.reason, ref: null });
+      return this.recordChildResult(id, {
+        state: 'cancelled',
+        summary: input.reason,
+        // The transcript stays discoverable even for a cancelled child.
+        ref: record.resultRef ?? record.sessionFile,
+      });
     });
   }
 

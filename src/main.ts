@@ -1033,8 +1033,38 @@ async function main(): Promise<number> {
   const worktreeServer = createWorktreeServer({
     config,
     manager: worktreeManager,
+    ledger,
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
+  // Tracked child workers (issue #161): GC-owned nested workers. Kids
+  // ride the SAME spawner, resident budget and pacing gate as any other
+  // minion turn; GC owns admission, parentage, lifecycle and results.
+  // Constructed BEFORE the dispatcher: a dispatched parent's scoped
+  // capability is minted here and named in its briefing.
+  const childWorkers = new ChildWorkerService({
+    ledger,
+    worktrees: worktreeManager,
+    spawner: (role: Role, spawnOptions?: SpawnOptions) => registry.spawn(role, spawnOptions ?? {}),
+    workerGate: pacing.gate,
+    retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
+    stopSignal: serviceStop.signal,
+    credentialsDir: join(config.dataDir, 'child-credentials'),
+    residentProbe: () => {
+      const snapshot = registry.residencySnapshot();
+      return {
+        available: snapshot.capacity - snapshot.occupied,
+        idleMinionIds: snapshot.handles
+          .filter((handle) => handle.role === 'minion' && handle.state === 'idle')
+          .map((handle) => handle.agentId),
+      };
+    },
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  state.childWorkers = childWorkers;
+  // A child's supervision restart returns it to ITS lane with ITS bounded
+  // tools — never the default role spawn (which would widen a read-only
+  // child and move it out of its worktree).
+  supervisorLive.setRestartPolicy((agentId, role) => childWorkers.restartPolicy(agentId, role));
   const dispatcher = new DispatchService({
     ledger,
     worktrees: worktreeManager,
@@ -1042,21 +1072,10 @@ async function main(): Promise<number> {
     workerGate: pacing.gate,
     retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
     stopSignal: serviceStop.signal,
+    parentCredentials: childWorkers,
     ...(config.lessons.enabled ? { lessons: lessonReferences, lessonsCapture } : {}),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
-  // Tracked child workers (issue #161): GC-owned nested workers. Kids
-  // ride the SAME spawner, resident budget and pacing gate as any other
-  // minion turn; GC owns admission, parentage, lifecycle and results.
-  const childWorkers = new ChildWorkerService({
-    ledger,
-    worktrees: worktreeManager,
-    spawner: (role: Role, spawnOptions?: SpawnOptions) => registry.spawn(role, spawnOptions ?? {}),
-    workerGate: pacing.gate,
-    stopSignal: serviceStop.signal,
-    log: (level, msg, fields) => logger.log(level, msg, fields),
-  });
-  state.childWorkers = childWorkers;
   const wave = new WaveRunner({
     ledger,
     worktrees: worktreeManager,

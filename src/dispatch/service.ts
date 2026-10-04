@@ -63,6 +63,12 @@ export interface DispatchServiceOptions {
   readonly lessons?: LessonsReferencePort;
   /** Extracts a minion's opt-in lessons block at delivery settle. */
   readonly lessonsCapture?: LessonCapturePort;
+  /** Issue #161: scoped child-request capability issuance for a dispatched
+   * parent (the returned file path is named in the briefing). Absent = no
+   * child-request instructions are rendered. */
+  readonly parentCredentials?: {
+    issueParentCredential(agentId: string): { readonly tokenFile: string };
+  };
   readonly log?: Log;
 }
 
@@ -80,6 +86,8 @@ export function renderMinionBriefing(input: {
   agentId?: string;
   /** Progressive-disclosure reference lines (no chapter bodies). */
   lessons?: readonly LessonPointer[];
+  /** Issue #161: the parent-scoped capability file for child requests. */
+  credentialFile?: string;
 }): string {
   const lessonsSection = renderLessonsSection(input.lessons ?? []);
   return [
@@ -95,14 +103,16 @@ export function renderMinionBriefing(input: {
     '',
     PR_CREATION_RULE,
     '',
-    ...(input.agentId === undefined
+    ...(input.agentId === undefined || input.credentialFile === undefined
       ? []
       : [
           'Independent capacity: if the briefing calls for one independent worker',
           '(e.g. read-only verification), request a GC-tracked child worker through',
-          'the service\'s authenticated surface (`POST /api/dispatch/child`) with',
-          '`parent_agent_id` set to YOUR agent id above — never launch external or',
-          'headless agents yourself.',
+          'the service\'s authenticated child surface:',
+          `  POST /api/dispatch/child with \`Authorization: Bearer <contents of ${input.credentialFile}>\``,
+          '  and `parent_agent_id` set to YOUR agent id above.',
+          'That credential is scoped to this session — never use or quote the operator',
+          'pairing token. Never launch external or headless agents yourself.',
           '',
         ]),
     'Execute the briefing inside this worktree. Standing orders: work only',
@@ -233,11 +243,14 @@ export class DispatchService {
       // Register the minion lane binding OURSELVES (idempotent): the
       // board engine's spawn-envelope registration is an observer, never
       // a precondition — dispatch must not depend on listener ordering.
+      // Issue #161: a dispatched minion is explicitly TOP-LEVEL (legacy
+      // rows stay unknown; the marker is never retro-fitted).
       this.opts.ledger.registerAgent({
         id: handle.id,
         role: 'minion',
         sessionFile: handle.sessionFile,
         jobId: job.id,
+        parentage: 'top-level',
       });
       // Bind the admitted worker to the marked phase BEFORE its prompt runs:
       // a delivery from any other worker can never complete this phase.
@@ -394,6 +407,13 @@ export class DispatchService {
       // the legacy void. The verdict is derived INSIDE this first `.then`
       // (never an extra helper hop): the worker-admission release below is
       // settle-leaf ordered and must not gain a microtask.
+      // Issue #161: mint the parent's scoped child-request capability BEFORE
+      // the briefing that names it (the session can then commission children
+      // without ever touching the operator token).
+      const credentialFile =
+        this.opts.parentCredentials === undefined
+          ? undefined
+          : this.opts.parentCredentials.issueParentCredential(handle.id).tokenFile;
       const briefing = renderMinionBriefing({
         jobId: job.id,
         repoName,
@@ -402,6 +422,7 @@ export class DispatchService {
         sha: worktree.sha,
         briefing: input.briefing,
         agentId: handle.id,
+        ...(credentialFile !== undefined ? { credentialFile } : {}),
         ...(lessons.length > 0 ? { lessons } : {}),
       });
       const promptRun: Promise<unknown> =
@@ -513,8 +534,10 @@ export class DispatchService {
     jobId: string,
     opts: { confirmKill?: boolean; baseBranch?: string } = {},
   ): Promise<WorktreeSweepResult | null> {
+    // Issue #161: only the JOB's own lane — a linked child (or review) lane
+    // that shares the job scope must never be swept in its place.
     const lanes = this.opts.worktrees.listWorktrees({ jobId });
-    const active = lanes.find((lane) => lane.status !== 'swept');
+    const active = lanes.find((lane) => lane.kind === 'job' && lane.status !== 'swept');
     if (active === undefined) return null;
     return this.opts.worktrees.release({
       worktreeId: active.id,

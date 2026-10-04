@@ -135,7 +135,16 @@ function makeDispatchHarness(opts: {
     engine.onRuntimeEvent({ agentId: handle.id, role, sessionFile: null, phase: 'spawned' });
     return handle;
   };
-  const dispatch = new DispatchService({ ledger, worktrees, spawner });
+  const dispatch = new DispatchService({
+    ledger,
+    worktrees,
+    spawner,
+    // Issue #161: every dispatched parent gets a scoped child-request
+    // capability file named in its briefing.
+    parentCredentials: {
+      issueParentCredential: (agentId) => ({ tokenFile: join(reviewSessions, `${agentId}.token`) }),
+    },
+  });
   const poster = { post: vi.fn(async (input: { readonly targetSha: string; readonly body: string }) => ({ reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: input.targetSha, headSha: input.targetSha, baseSha: 'e2e-delivered-base', bodySha256: createHash('sha256').update(input.body, 'utf8').digest('hex') })) };
   const wave = new WaveRunner({
     ledger,
@@ -197,6 +206,15 @@ describe('end-to-end dispatch (E8 story 4)', () => {
     expect(minion?.prompts[0]?.text).toContain('Dispatch briefing — job widget-polish');
     expect(minion?.prompts[0]?.text).toContain('Acceptance: tests pass.');
     expect(minion?.prompts[0]?.text).toContain(outcome.worktree.branch!);
+    // Issue #161: the parent learns its own identity and the scoped
+    // capability file — never the operator token.
+    expect(minion?.prompts[0]?.text).toContain(`Your agent id: ${minion!.id}`);
+    expect(minion?.prompts[0]?.text).toContain('POST /api/dispatch/child');
+    expect(minion?.prompts[0]?.text).toContain(`${minion!.id}.token`);
+    expect(minion?.prompts[0]?.text).not.toContain('pairing token value');
+    // The production registration path declares the parent TOP-LEVEL (a
+    // legacy/unknown row would render the wrong parentage).
+    expect(h.ledger.getAgent(minion!.id)?.parentage).toBe('top-level');
     // The dispatched contract carries the current non-draft PR rule.
     expect(minion?.prompts[0]?.text).toContain('ordinary, non-draft PR');
     expect(minion?.prompts[0]?.text).toContain('gh pr create without --draft/-d');

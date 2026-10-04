@@ -562,6 +562,14 @@ export class BoardEngine {
     const childRows = this.ledger.listChildWorkers();
     const childByAgent = new Map<string, ChildWorkerView>();
     const childCountsByParent = new Map<string, MutableChildCounts>();
+    // A child admitted but not yet session-bound (no session file) is NOT
+    // historical: its runtime ownership is simply not established yet, so
+    // it classifies `unverified` and stays in the live rail until spawn.
+    const pendingChildAgentIds = new Set(
+      childRows
+        .filter((child) => child.resultState === null && child.sessionFile === null && child.agentId !== null)
+        .map((child) => child.agentId as string),
+    );
     let childrenQueued = 0;
     let childrenActive = 0;
     let childrenFinished = 0;
@@ -596,7 +604,12 @@ export class BoardEngine {
       agentRows.map((agent) => [agent.id, this.supervisionFor(agent.id)]),
     );
     const runtimeClassOf = (agent: AgentRecord): AgentRuntimeClass =>
-      this.classifyRuntime(agent.id, supervisionById.get(agent.id) ?? null, ownership);
+      this.classifyRuntime(
+        agent.id,
+        supervisionById.get(agent.id) ?? null,
+        ownership,
+        pendingChildAgentIds.has(agent.id),
+      );
     // Per-job newest agent activity and per-round lens attempt counts are
     // derived once per snapshot from the same agent rows (ISO stamps
     // compare lexicographically; lens children mint `lens:chunk` labels).
@@ -644,6 +657,7 @@ export class BoardEngine {
           ownership,
           childByAgent.get(agent.id) ?? null,
           (childCountsByParent.get(agent.id) as ChildWorkerCounts | undefined) ?? null,
+          pendingChildAgentIds.has(agent.id),
         ),
       )
       .sort(
@@ -784,6 +798,7 @@ export class BoardEngine {
     ownership: RuntimeOwnership | null,
     child: ChildWorkerView | null,
     childCounts: ChildWorkerCounts | null,
+    pendingChild: boolean,
   ): AgentView {
     return {
       id: agent.id,
@@ -795,7 +810,7 @@ export class BoardEngine {
       child,
       childCounts,
       status: derivedStatus(agent.state, supervision),
-      runtime: this.classifyRuntime(agent.id, supervision, ownership),
+      runtime: this.classifyRuntime(agent.id, supervision, ownership, pendingChild),
       lastActivity: agent.lastActivity,
       // The row's registration stamp: the board's stall clock floor for a
       // fresh worker that has not sent its first frame (twelve-followthrough A1/E1).
@@ -819,8 +834,12 @@ export class BoardEngine {
     agentId: string,
     supervision: AgentSupervisionView | null,
     ownership: RuntimeOwnership | null,
+    pendingChild = false,
   ): AgentRuntimeClass {
     if (supervision !== null) return 'current';
+    // An admitted-but-unspawned child has no runtime owner YET — that is
+    // missing evidence, never a verified historical record.
+    if (pendingChild) return 'unverified';
     if (this.ownershipProbe !== null) {
       // The registry probe is the wired witness: an ANSWER classifies
       // (member → current, verified absence → historical); a null answer

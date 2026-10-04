@@ -757,7 +757,13 @@ function resolveResumeFile(
   const markerSession = group.find((marker) => marker.sessionFile !== null)?.sessionFile ?? null;
   const latestMinion = deps.ledger
     .listAgents()
-    .find((agent) => agent.jobId === jobId && agent.role === 'minion' && agent.sessionFile !== null);
+    .find(
+      (agent) =>
+        agent.jobId === jobId &&
+        agent.role === 'minion' &&
+        agent.parentage !== 'child' &&
+        agent.sessionFile !== null,
+    );
   const candidates = [markerSession, latestMinion?.sessionFile ?? null];
   for (const candidate of candidates) {
     if (candidate !== null && candidate !== '' && existsSync(candidate)) return candidate;

@@ -462,8 +462,15 @@ but whose resident admission is still waiting is not active);
 logical child creation). Restart changes nothing — the aggregates are
 computed from the durable table, and event replay never touches them.
 
+`result_summary` carries the child's own final report on `done`, and the
+named failure/cancellation reason on `error`/`cancelled`; `result_ref`
+is the session transcript referenced by that result (never a bare null
+when a session existed).
+
 Migration 15 also rebuilds the `worktrees` table in place to admit
-`kind = 'child'` (a child lane's owner id is the child worker id; SQLite
-cannot alter a CHECK constraint, so the table is rebuilt with
-`PRAGMA defer_foreign_keys`). It carries the same landing-collision
-convention as migrations 10-14.
+`kind = 'child'` (a child lane's owner id is the child agent id; SQLite
+cannot alter a CHECK constraint). The migration declares
+`foreignKeysOff: true`, so the runner disables foreign keys around the
+rebuild transaction and verifies `PRAGMA foreign_key_check` BEFORE
+COMMIT — a violation rolls the whole migration back loudly. It carries
+the same landing-collision convention as migrations 10-14.

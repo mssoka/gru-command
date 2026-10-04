@@ -727,6 +727,7 @@ export class PiRuntime implements AgentRuntime {
           this.activeFiles.delete(sessionFile);
         },
         this.heartbeatMs(),
+        ...(options.agentId !== undefined ? [options.agentId] : []),
       );
       this.handles.add(handle);
       this.down = undefined;
@@ -865,9 +866,13 @@ export class PiAgentHandle implements AgentHandle {
     private readonly log: Log,
     private readonly onDispose: () => void = () => {},
     toolHeartbeatMs = 60_000,
+    /** Product-owned identity (issue #161): the handle id is the ledger
+     * identity, which must exist before the session for a tracked child.
+     * The session file and its lock stay SDK-minted. */
+    agentId?: string,
   ) {
     this.role = role;
-    this.id = session.sessionId;
+    this.id = agentId ?? session.sessionId;
     this.sessionFile = sessionFile;
     this.capabilities = capabilities;
     if (isolatedReview) this.reviewIsolation = true;

@@ -522,6 +522,7 @@ export class ClaudeCodeRuntime implements AgentRuntime {
         },
         (error) => this.onInfraError(error),
         this.heartbeatMs(),
+        ...(options.agentId !== undefined ? [options.agentId] : []),
       );
       this.handles.add(handle);
       this.down = undefined;
@@ -710,11 +711,14 @@ export class ClaudeCodeHandle implements AgentHandle {
     onDispose: () => void = () => {},
     onInfraError: (error: unknown) => void = () => {},
     toolHeartbeatMs = 60_000,
+    /** Product-owned identity (issue #161): the ledger identity, bound
+     * before the session for a tracked child. */
+    agentId?: string,
   ) {
     this.role = role;
     this.params = params;
     this.capabilities = capabilities;
-    this.id = params.sessionId;
+    this.id = agentId ?? params.sessionId;
     this.sessionFile = params.sessionFile;
     if (params.isolatedReview) this.reviewIsolation = true;
     if (params.reviewTools !== undefined && params.reviewTools.length > 0) {

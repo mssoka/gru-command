@@ -3,6 +3,7 @@ import { hashToken, tokenConfigured, tokenMatches } from '../auth.js';
 import type { GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { WorktreeManager } from './manager.js';
+import type { LedgerApi } from '../ledger/api.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -22,6 +23,9 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
 export interface WorktreeServerOptions {
   readonly config: GruCommandConfig;
   readonly manager: WorktreeManager;
+  /** Issue #161: child-worker records (the job release refuses while a
+   * non-terminal child still owns a lane). */
+  readonly ledger?: LedgerApi;
   readonly log?: Log;
 }
 
@@ -117,6 +121,24 @@ export function createWorktreeServer(options: WorktreeServerOptions): WorktreeSe
       }
     } else {
       const jobId = strField(body, 'job_id');
+      // Issue #161: a job release never abandons a live child worker. A
+      // non-terminal tracked child keeps the release refused with a named
+      // reason; the owner either cancels the child or releases its lane
+      // explicitly (both answerable operations).
+      const outstanding =
+        options.ledger === undefined
+          ? []
+          : options.ledger.listChildWorkers({ jobId }).filter((child) => child.resultState === null);
+      if (outstanding.length > 0) {
+        json(res, 409, {
+          error: 'active_child_workers',
+          detail:
+            `job "${jobId}" has ${outstanding.length} non-terminal child worker(s) — ` +
+            'cancel them (POST /api/dispatch/children/:id/cancel) or release their lanes explicitly first',
+          child_ids: outstanding.map((child) => child.id),
+        });
+        return;
+      }
       // The JOB's own lane — never a linked review or child lane that
       // happens to share the job id (issue #161: child lanes are registered
       // under the same job scope).

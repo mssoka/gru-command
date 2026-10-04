@@ -200,19 +200,56 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
   const inFlight = new Set<Promise<unknown>>();
   const directiveControllers = new Set<AbortController>();
 
+  function bearerToken(req: IncomingMessage): string | null {
+    const header = req.headers.authorization;
+    const match = typeof header === 'string' ? /^Bearer (.+)$/.exec(header.trim()) : null;
+    return match === null ? null : match[1] ?? null;
+  }
+
+  /** The operator pairing token (the superset service authority). */
+  function hasOperatorToken(req: IncomingMessage): boolean {
+    if (!configured) return false;
+    const token = bearerToken(req);
+    return token !== null && tokenMatches(token, tokenHash);
+  }
+
   function authed(req: IncomingMessage, res: ServerResponse): boolean {
     if (!configured) {
       json(res, 503, { error: 'not_configured', detail: 'no pairing token configured' });
       return false;
     }
-    const header = req.headers.authorization;
-    const match = typeof header === 'string' ? /^Bearer (.+)$/.exec(header.trim()) : null;
-    const token = match === null ? null : match[1] ?? null;
-    if (token === null || !tokenMatches(token, tokenHash)) {
+    if (!hasOperatorToken(req)) {
       json(res, 401, { error: 'unauthorized' });
       return false;
     }
     return true;
+  }
+
+  /** Issue #161: operator token OR the scoped parent capability bound to
+   * `parentAgentId`. The capability authorizes exactly one parent's
+   * children — never another parent's. */
+  function authedForParent(
+    req: IncomingMessage,
+    res: ServerResponse,
+    parentAgentId: string | null,
+  ): boolean {
+    if (!configured) {
+      json(res, 503, { error: 'not_configured', detail: 'no pairing token configured' });
+      return false;
+    }
+    if (hasOperatorToken(req)) return true;
+    const service = options.childWorkers;
+    const token = bearerToken(req);
+    if (
+      service !== undefined &&
+      parentAgentId !== null &&
+      token !== null &&
+      service.authorizeParent(parentAgentId, token)
+    ) {
+      return true;
+    }
+    json(res, 401, { error: 'unauthorized' });
+    return false;
   }
 
   function readBody(req: IncomingMessage): Promise<Record<string, unknown>> {
@@ -321,7 +358,10 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
     // admission and answers named refusal preconditions. A replay with the
     // same key returns the existing child (never a second worker).
     if (req.method === 'POST' && path === '/api/dispatch/child') {
-      if (!authed(req, res)) return true;
+      if (!configured) {
+        json(res, 503, { error: 'not_configured', detail: 'no pairing token configured' });
+        return true;
+      }
       const service = options.childWorkers;
       if (service === undefined) {
         json(res, 503, {
@@ -336,6 +376,9 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       // `invalid_request` with the field name, never a generic parse fault.
       const rawField = (field: string): string =>
         typeof body[field] === 'string' ? (body[field] as string) : '';
+      // Authorization is parent-scoped: the operator token, or the scoped
+      // capability issued to exactly this parent (never another's).
+      if (!authedForParent(req, res, rawField('parent_agent_id'))) return true;
       try {
         const admission = service.request({
           parentAgentId: rawField('parent_agent_id'),
@@ -514,18 +557,22 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
     // or by one child id.
     const childMatch = /^\/api\/dispatch\/children\/([^/]+)$/.exec(path);
     if (req.method === 'GET' && childMatch !== null) {
-      if (!authed(req, res)) return true;
       const record = options.ledger.getChildWorker(decodeURIComponent(childMatch[1] ?? ''));
       if (record === null) {
         json(res, 404, { error: 'child_not_found', detail: 'no such tracked child worker' });
         return true;
       }
+      // A parent capability reads only ITS OWN children.
+      if (!authedForParent(req, res, record.parentAgentId)) return true;
       json(res, 200, { child: childView(record) });
       return true;
     }
     const childCancelMatch = /^\/api\/dispatch\/children\/([^/]+)\/cancel$/.exec(path);
     if (req.method === 'POST' && childCancelMatch !== null) {
-      if (!authed(req, res)) return true;
+      if (!configured) {
+        json(res, 503, { error: 'not_configured', detail: 'no pairing token configured' });
+        return true;
+      }
       const service = options.childWorkers;
       if (service === undefined) {
         json(res, 503, {
@@ -534,10 +581,18 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         });
         return true;
       }
+      const childId = decodeURIComponent(childCancelMatch[1] ?? '');
+      const existing = options.ledger.getChildWorker(childId);
+      if (existing === null) {
+        json(res, 404, { error: 'child_not_found', detail: 'no such tracked child worker' });
+        return true;
+      }
+      // A parent capability cancels only ITS OWN children.
+      if (!authedForParent(req, res, existing.parentAgentId)) return true;
       const body = await readBody(req);
       const reason = optStrField(body, 'reason') ?? 'cancelled by the owner';
       try {
-        const record = service.cancel(decodeURIComponent(childCancelMatch[1] ?? ''), reason);
+        const record = await service.cancel(childId, reason);
         json(res, 200, { child: childView(record) });
       } catch (error) {
         const refusal = childRefusalStatus(error);
@@ -548,6 +603,8 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
     }
     const jobChildrenMatch = /^\/api\/dispatch\/jobs\/([^/]+)\/children$/.exec(path);
     if (req.method === 'GET' && jobChildrenMatch !== null) {
+      // The job-wide list is the OPERATOR view (a parent uses its own
+      // /agents/:id/children scope).
       if (!authed(req, res)) return true;
       const jobId = decodeURIComponent(jobChildrenMatch[1] ?? '');
       if (options.ledger.getJob(jobId) === null) {
@@ -559,12 +616,14 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
     }
     const agentChildrenMatch = /^\/api\/dispatch\/agents\/([^/]+)\/children$/.exec(path);
     if (req.method === 'GET' && agentChildrenMatch !== null) {
-      if (!authed(req, res)) return true;
       const parentAgentId = decodeURIComponent(agentChildrenMatch[1] ?? '');
       if (options.ledger.getAgent(parentAgentId) === null) {
         json(res, 404, { error: 'agent_not_found', detail: `agent "${parentAgentId}" not found` });
         return true;
       }
+      // The parent's own discovery path: operator token OR the scoped
+      // capability for exactly this parent.
+      if (!authedForParent(req, res, parentAgentId)) return true;
       json(res, 200, {
         children: options.ledger.listChildWorkers({ parentAgentId }).map(childView),
       });
@@ -1223,7 +1282,12 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       // Selection is listAgents order, as resolveEscalationAgent documents.
       const boundMinion =
         jobId !== undefined
-          ? options.ledger.listAgents().find((agent) => agent.jobId === jobId && agent.role === 'minion')
+          ? options.ledger
+              .listAgents()
+              .find(
+                (agent) =>
+                  agent.jobId === jobId && agent.role === 'minion' && agent.parentage !== 'child',
+              )
           : undefined;
       const notification = ops.notifications.post({
         kind: 'silas.escalation',

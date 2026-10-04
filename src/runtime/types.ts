@@ -141,6 +141,16 @@ export interface SpawnOptions {
    */
   readonly thinkingLevel?: string;
   /**
+   * Product-owned identity for this session (issue #161). The adapter
+   * binds the handle id to this value instead of its own minted session
+   * id, so a tracked child's durable identity exists BEFORE the session
+   * (the admission row, the lane and the agent row share one id) and a
+   * resumed child keeps it across supervision restarts. Omitted = the
+   * adapter's own id. The underlying session file and its lock are
+   * unchanged — only the ledger identity is product-owned.
+   */
+  readonly agentId?: string;
+  /**
    * Product-controlled tool subset for this spawn (issue #161): a child
    * worker's bounded task authority is enforced by the runtime itself —
    * a `read-only` child is spawned with the read-only role tools, a

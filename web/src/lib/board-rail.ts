@@ -72,6 +72,25 @@ export function railChips(snapshot: BoardSnapshot, now = Date.now()): readonly R
 
 function trackersChip(snapshot: BoardSnapshot, kpis: ReturnType<typeof boardKpis>): RailChip {
   const decisions = snapshot.decisions;
+  // Issue #161: the CHILDREN group renders only when the server actually
+  // reported counters — an absent field is unknown, never a verified zero.
+  const childrenGroup: RailKpiGroup[] =
+    kpis.children === null
+      ? []
+      : [
+          {
+            // Issue #161: children at a glance — present state plus the
+            // LIFETIME count of logical child creations (restart-safe).
+            label: 'CHILDREN',
+            values: [
+              kpi('children.active', kpis.children.active, 'active', `${kpis.children.active} child worker${kpis.children.active === 1 ? '' : 's'} active`),
+              kpi('children.queued', kpis.children.queued, 'queued', `${kpis.children.queued} child worker${kpis.children.queued === 1 ? '' : 's'} queued`),
+              kpi('children.finished', kpis.children.finished, 'finished', `${kpis.children.finished} child worker${kpis.children.finished === 1 ? '' : 's'} finished`),
+              kpi('children.lifetimeCreations', kpis.children.lifetimeCreations, 'created', `${kpis.children.lifetimeCreations} logical child creation${kpis.children.lifetimeCreations === 1 ? '' : 's'} (lifetime)`),
+            ],
+            title: 'child workers active / queued / finished / created (lifetime logical creations)',
+          },
+        ];
   const tone: HealthTone =
     snapshot.unackedActionRequired > 0
       ? 'alert'
@@ -119,18 +138,7 @@ function trackersChip(snapshot: BoardSnapshot, kpis: ReturnType<typeof boardKpis
         ],
         title: 'live minions / crew mid-turn / crew disposed',
       },
-      {
-        // Issue #161: children at a glance — present state plus the
-        // LIFETIME count of logical child creations (restart-safe).
-        label: 'CHILDREN',
-        values: [
-          kpi('children.active', kpis.children.active, 'active', `${kpis.children.active} child worker${kpis.children.active === 1 ? '' : 's'} active`),
-          kpi('children.queued', kpis.children.queued, 'queued', `${kpis.children.queued} child worker${kpis.children.queued === 1 ? '' : 's'} queued`),
-          kpi('children.finished', kpis.children.finished, 'finished', `${kpis.children.finished} child worker${kpis.children.finished === 1 ? '' : 's'} finished`),
-          kpi('children.lifetimeCreations', kpis.children.lifetimeCreations, 'created', `${kpis.children.lifetimeCreations} logical child creation${kpis.children.lifetimeCreations === 1 ? '' : 's'} (lifetime)`),
-        ],
-        title: 'child workers active / queued / finished / created (lifetime logical creations)',
-      },
+      ...childrenGroup,
     ],
   };
 }

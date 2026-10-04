@@ -132,6 +132,9 @@ export class BoardView {
   /** Disposed rows are collapsed by default; the toggle state survives
    * snapshot pushes so a live board does not re-open the graveyard. */
   private disposedExpanded = false;
+  /** The last rendered agent list (parent navigation resolves against it
+   * and can expand a collapsed section before scrolling). */
+  private lastAgents: readonly AgentView[] = [];
   /** Issue #171: verified-historical rows are collapsed behind their own
    * disclosure (past sessions), separate from the disposed graveyard;
    * the toggle state survives snapshot pushes. */
@@ -858,6 +861,7 @@ export class BoardView {
   // ------------------------------------------------------------------
 
   private renderAgents(agents: readonly AgentView[]): void {
+    this.lastAgents = agents;
     const rail = mustGet('board-agents');
     rail.replaceChildren();
     this.ensureAgeTicker();
@@ -973,11 +977,15 @@ export class BoardView {
     ambiguousOwnership: boolean,
     labelById: ReadonlyMap<string, string>,
   ): HTMLElement {
+    // A div with button semantics (NOT <button>): the row contains its own
+    // parent-navigation button for child rows, and interactive elements
+    // must not nest. Keyboard activation matches a button (Enter/Space).
     const row = el(
-      'button',
+      'div',
       `board-agent${section === 'disposed' ? ' board-agent--disposed' : ''}${section === 'historical' ? ' board-agent--historical' : ''}`,
     );
-    row.type = 'button';
+    row.setAttribute('role', 'button');
+    row.tabIndex = 0;
     const status = agentStatusOf(agent);
     row.dataset.state = status;
     row.dataset.role = agent.role;
@@ -994,9 +1002,16 @@ export class BoardView {
     if (section === 'historical') {
       row.title += ' · historical: no current runtime owner — record retained';
     }
-    row.addEventListener('click', () => {
+    const openTranscript = (): void => {
       if (agent.sessionFile !== null) {
         this.onOpenTranscript({ file: agent.sessionFile ?? '', label: agentLabel(agent) });
+      }
+    };
+    row.addEventListener('click', openTranscript);
+    row.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        openTranscript();
       }
     });
     const body = el('span', 'board-agent__body');
@@ -1029,16 +1044,15 @@ export class BoardView {
     if (isChild && agent.parentAgentId !== null && agent.parentAgentId !== undefined) {
       const parentId = agent.parentAgentId;
       const parentLink = el(
-        'span',
+        'button',
         'board-agent__parent-link',
         `↳ ${labelById.get(parentId) ?? parentId.slice(0, 8)}`,
       );
+      parentLink.type = 'button';
       parentLink.title = `parent minion ${parentId} — jump to the parent row`;
       parentLink.addEventListener('click', (event) => {
         event.stopPropagation();
-        mustGet('board-agents')
-          .querySelector<HTMLElement>(`[data-agent-id="${parentId}"]`)
-          ?.scrollIntoView({ block: 'nearest' });
+        this.revealAgent(parentId);
       });
       subline.append(parentLink);
       row.title += ` · child worker of ${parentId}`;
@@ -1098,6 +1112,26 @@ export class BoardView {
     row.append(el('span', 'board-agent__dot'), body);
     row.append(el('span', `pp-chip board-agent__state ${agentStateTone(status)}`, status));
     return row;
+  }
+
+  /** Issue #161 parent navigation: reveal the parent row even when its
+   * historical/disposed section is collapsed, then scroll to it. The row
+   * is located by dataset comparison — a manually registered agent id can
+   * contain selector metacharacters, so ids never enter a CSS selector. */
+  private revealAgent(agentId: string): void {
+    const target = this.lastAgents.find((agent) => agent.id === agentId);
+    if (target === undefined) return;
+    const band = agentRailBand(target);
+    if (band === 'historical') this.historyExpanded = true;
+    if (band === 'disposed') this.disposedExpanded = true;
+    this.renderAgents(this.lastAgents);
+    const rows = mustGet('board-agents').querySelectorAll<HTMLElement>('.board-agent');
+    for (const row of rows) {
+      if (row.dataset.agentId === agentId) {
+        row.scrollIntoView?.({ block: 'nearest' });
+        return;
+      }
+    }
   }
 
   // ------------------------------------------------------------------

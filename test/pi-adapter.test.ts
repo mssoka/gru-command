@@ -3002,6 +3002,25 @@ describe('spawn cwd (SPEC ruling 17 — dispatch roots in the project)', () => {
     } finally {
       await handle.dispose();
     }
+    // Issue #161: a child worker's bounded authority is enforced by the
+    // ADAPTER's own tool allowlist, and its product-owned identity is
+    // honored (the ledger identity exists before the session).
+    const child = await fx.runtime.spawn('minion', {
+      cwd: project,
+      agentId: 'child-owned-id',
+      roleTools: ['read', 'grep', 'find', 'ls'],
+    });
+    try {
+      const options = twinGate.lastOptions as { tools?: string[] };
+      expect(options.tools).toEqual(['read', 'grep', 'find', 'ls']);
+      expect(child.id).toBe('child-owned-id');
+    } finally {
+      await child.dispose();
+    }
+    // An override can only NARROW: an undeclared tool refuses loud.
+    await expect(
+      fx.runtime.spawn('minion', { cwd: project, roleTools: ['read', 'undeclared-tool'] }),
+    ).rejects.toThrowError(/role tool override names "undeclared-tool"/);
   });
 
   it('fails loud on a relative or nonexistent cwd (never a silent fallback)', async () => {

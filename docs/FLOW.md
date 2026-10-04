@@ -392,19 +392,31 @@ own authenticated control plane: `POST /api/dispatch/child`
 label?}`. GC — not a provider-native delegation extension — owns
 admission, identity, lifecycle, cancellation and the result record.
 
+**Parent capability.** A dispatched top-level minion receives a
+parent-scoped capability file (0600, under the instance data dir) named
+in its briefing; the child endpoints accept either the operator pairing
+token or that scoped capability, which authorizes exactly one parent's
+requests, reads and cancels. The operator token is never placed in a
+minion's context.
+
 - **Parentage is a relationship, not a sixth role.** A child is a
   minion-role session whose agent row carries `parentage = 'child'` and
   `parent_agent_id`. Only top-level minions may commission workers
   (nested delegation is refused), and one parent admits at most four
   logical children (`MAX_CHILDREN_PER_PARENT`).
-- **Idempotent admission.** The child's admission row is written before
-  any spawn; a duplicate or lost-response retry with the same
-  `(parent_agent_id, idempotency_key)` returns the existing child and
-  creates no second worker. The same key with a different payload is a
-  409 conflict. Refusals name the failed precondition: unknown parent,
-  parent not permitted, nested delegation, job mismatch, expired/terminal
-  job, disposed parent, missing parent lane, fanout cap, invalid task or
-  authority (`{error, detail}`).
+- **Idempotent admission.** The child's admission row AND its agent row
+  are written before any spawn (one product-owned id for the admission
+  record, the agent row and the lane), so a queued child is visible on
+  the board with parent navigation immediately. A duplicate or
+  lost-response retry with the same `(parent_agent_id,
+  idempotency_key)` returns the existing child and creates no second
+  worker; the same key with a different payload is a 409 conflict.
+  Refusals name the failed precondition: unknown parent, parent not
+  permitted, nested delegation, job mismatch, expired/terminal job,
+  disposed parent, missing parent lane, fanout cap, budget/capacity
+  (the shared resident pool is full and no idle minion is reclaimable —
+  a refusal, never an unsatisfiable wait that would deadlock parents),
+  invalid task or authority (`{error, detail}`).
 - **Bounded authority and isolation.** `authority: "read-only"` spawns
   the child with the read-only tool set (`read`, `grep`, `find`, `ls`) in
   a detached lane based at the parent lane's HEAD; `authority: "writer"`
@@ -415,15 +427,21 @@ admission, identity, lifecycle, cancellation and the result record.
 - **Lifecycle and result.** The child record moves
   `queued → admitted → active → done | error | cancelled`. Child
   admission waits in the SAME FIFO resident-worker admission as any other
-  worker session, and the child turn consumes the same provider pacing
-  pool. `done` is a successful terminal outcome recorded from the
-  transport's own terminal evidence; the child's final report is captured
-  from its session transcript into `result_summary` (with the session
-  file as `result_ref`) — never fabricated. `GET
+  worker session; the provider pacing pool is taken only AFTER the
+  resident permit (so a capacity-blocked child never holds a turn slot),
+  and the child turn consumes that shared pool. `done` is a successful
+  terminal outcome recorded from the transport's own terminal evidence
+  AND requires the child's own final report text (anchored to the
+  entries this turn produced) in `result_summary`, with the session file
+  as `result_ref`; a clean turn with no collectable report is a named
+  `error`, never a fully reported `done`. Cancellation awaits handle
+  disposal and records `cancelled` only when cessation is proven (else a
+  named unproven-cessation error). `GET
   /api/dispatch/children/:id`, `GET /api/dispatch/jobs/:jobId/children`
-  and `GET /api/dispatch/agents/:agentId/children` are the parent's
-  discovery paths; `POST /api/dispatch/children/:id/cancel` stops a live
-  child (terminal records are immutable).
+  (operator) and `GET /api/dispatch/agents/:agentId/children` (the
+  parent's own scope) are the discovery paths; `POST
+  /api/dispatch/children/:id/cancel` stops a live child (terminal records
+  are immutable).
 - **Counters.** The board snapshot carries `children {queued, active,
   finished, lifetimeCreations}`; `lifetimeCreations` counts ROWS in
   `child_workers` (one per logical creation), so retries, session resumes
@@ -431,11 +449,18 @@ admission, identity, lifecycle, cancellation and the result record.
   for the full semantics.
 - **Ownership and recovery.** Child lanes are registered worktree lanes
   (kind `child`) and sweep through the same release path; read-only lanes
-  are swept automatically once their run is terminal, writer lanes keep
-  their branch for inspection. At boot, a child that never bound a
-  session is re-run under the same identity; one that had a live session
-  is terminally failed with the honest reason (its transcript stays
-  readable) — never a fabricated `done`.
+  are swept automatically once their run is terminal (including on boot
+  reconciliation after a crash), writer lanes keep their branch for
+  inspection, and a job release refuses (409 `active_child_workers`)
+  while a non-terminal child still owns one. Parent/job eligibility is
+  revalidated immediately before every spawn and restart; a parent that
+  stops while its child waits fences the child instead of starting a
+  writer late. At boot, a child that never bound a session is re-run
+  under the same identity (only when still eligible); one that had a live
+  session is terminally failed with the honest reason (its transcript
+  stays readable) — never a fabricated `done`. A supervision restart
+  returns a child to ITS lane with ITS bounded tools, or is refused when
+  the lane is gone.
 
 ## 5. Release (the sweep)
 

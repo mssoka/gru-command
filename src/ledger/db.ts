@@ -638,8 +638,11 @@ export const MIGRATIONS: readonly Migration[] = [
     //   survive restart by construction.
     // - `worktrees.kind` gains 'child' (a child lane's owner id is the
     //   child agent id). SQLite cannot alter a CHECK constraint, so the
-    //   table is rebuilt in place; `defer_foreign_keys` keeps
-    //   worktree_processes' foreign key satisfied at commit time.
+    //   table is rebuilt in place; the runner's `foreignKeysOff` flag
+    //   disables foreign keys around this migration's transaction and
+    //   fails loud via `PRAGMA foreign_key_check` before COMMIT (see the
+    //   Migration interface), so the rebuild can never commit a broken
+    //   graph over worktree_processes' references.
     //
     // LANDING COLLISION (same convention as migrations 10-14): id 15 is a
     // branch-local next-contiguous number for an UNSHIPPED feature; if
@@ -681,6 +684,11 @@ export const MIGRATIONS: readonly Migration[] = [
       ALTER TABLE agents ADD COLUMN parent_agent_id TEXT REFERENCES agents(id);
       ALTER TABLE agents ADD COLUMN parentage TEXT CHECK (parentage IN ('top-level','child'));
       CREATE INDEX idx_agents_parent ON agents(parent_agent_id);
+      -- Scoped parent capability (issue #161): the hash of the token a
+      -- top-level minion presents to commission/read/cancel ITS OWN
+      -- children. The operator pairing token remains a superset authority;
+      -- this one is bound to exactly one parent agent.
+      ALTER TABLE agents ADD COLUMN child_request_token_hash TEXT;
 
       CREATE TABLE child_workers (
         id              TEXT PRIMARY KEY,
@@ -710,6 +718,7 @@ export const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX idx_child_workers_parent ON child_workers(parent_agent_id);
       CREATE INDEX idx_child_workers_job ON child_workers(job_id);
       CREATE INDEX idx_child_workers_state ON child_workers(state);
+      CREATE INDEX idx_child_workers_agent ON child_workers(agent_id);
     `,
   },
 ];

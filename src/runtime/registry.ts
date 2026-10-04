@@ -509,6 +509,7 @@ export class RuntimeRegistry {
     const handle = await adapter.spawn(role, {
       ...(options.resumeFile !== undefined ? { resumeFile: options.resumeFile } : {}),
       ...(options.cwd !== undefined ? { cwd: options.cwd } : {}),
+      ...(options.agentId !== undefined ? { agentId: options.agentId } : {}),
       ...(options.roleTools !== undefined ? { roleTools: options.roleTools } : {}),
       ...(options.isolatedReview !== undefined ? { isolatedReview: options.isolatedReview } : {}),
       ...(options.reviewLead !== undefined ? { reviewLead: options.reviewLead } : {}),

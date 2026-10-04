@@ -30,7 +30,7 @@ export interface DirectiveRegistry {
 
 export interface DirectiveRoutingDeps {
   readonly registry: DirectiveRegistry;
-  readonly ledger: Pick<LedgerApi, 'listAgents' | 'registerAgent' | 'getJob'>;
+  readonly ledger: Pick<LedgerApi, 'listAgents' | 'registerAgent' | 'getJob' | 'getAgent'>;
   readonly worktrees: WorktreePort;
   /** Book of Lessons injection: pointer lines only, never chapter bodies. */
   readonly lessons?: LessonsReferencePort;
@@ -87,7 +87,9 @@ export async function routeFixDirectiveToMinion(
   );
   const minions = input.ledger
     .listAgents()
-    .filter((agent) => agent.jobId === input.jobId && agent.role === 'minion');
+    // Issue #161: directives belong to the job's WRITER minion — a tracked
+    // child is never selected as the primary lane worker.
+    .filter((agent) => agent.jobId === input.jobId && agent.role === 'minion' && agent.parentage !== 'child');
   let evictedSessionFile: string | null = null;
   for (const minion of [...minions].reverse()) {
     const handle = input.registry.getHandle(minion.id);
@@ -210,7 +212,15 @@ export async function routeFixDirectiveToMinion(
     let promptError: unknown = null;
     let verdict: PromptTurnVerdict | null = null;
     try {
-      input.ledger.registerAgent({ id: handle.id, role: 'minion', jobId: input.jobId, sessionFile: handle.sessionFile });
+      // A fresh fallback minion (the resume attempt failed) is top-level;
+      // a resumed row keeps its recorded parentage (never retro-fitted).
+      input.ledger.registerAgent({
+        id: handle.id,
+        role: 'minion',
+        jobId: input.jobId,
+        sessionFile: handle.sessionFile,
+        ...(input.ledger.getAgent(handle.id) === null ? { parentage: 'top-level' as const } : {}),
+      });
       verdict = await racedPrompt(handle, prompt, input.signal, owner);
     } catch (error) {
       promptError = error;
@@ -374,7 +384,7 @@ export function flipJobToWorking(
  * pending prompt) instead of minting a fresh one. */
 export async function rebriefFreshMinion(
   input: DirectiveRoutingDeps & {
-    readonly ledger: Pick<LedgerApi, 'setAgentState'>;
+    readonly ledger: Pick<LedgerApi, 'setAgentState' | 'getAgent'>;
     jobId: string;
     note: string;
     briefing: string | null;
@@ -423,7 +433,9 @@ export async function rebriefFreshMinion(
     input.beforeTurnSideEffect?.();
     const jobMinions = input.ledger
       .listAgents()
-      .filter((agent) => agent.jobId === input.jobId && agent.role === 'minion');
+      // Retirement/re-brief retires the WRITER sessions only — an active
+      // child worker is not the job's minion lane (issue #161).
+      .filter((agent) => agent.jobId === input.jobId && agent.role === 'minion' && agent.parentage !== 'child');
     for (const minion of jobMinions) {
       const prior = input.registry.getHandle(minion.id);
       if (prior === null) continue;
@@ -442,11 +454,14 @@ export async function rebriefFreshMinion(
     let prompt: string;
     try {
       input.beforeTurnSideEffect?.();
+      // A FRESH re-brief session (no prior row) is explicitly top-level;
+      // a resumed row keeps its recorded parentage (never retro-fitted).
       input.ledger.registerAgent({
         id: handle.id,
         role: 'minion',
         sessionFile: handle.sessionFile,
         jobId: input.jobId,
+        ...(input.ledger.getAgent(handle.id) === null ? { parentage: 'top-level' as const } : {}),
       });
       input.onSpawned?.({ id: handle.id, sessionFile: handle.sessionFile });
       prompt = renderRebriefPrompt({
