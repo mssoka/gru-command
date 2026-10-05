@@ -19,7 +19,11 @@ The engine maps adapter events to ledger rows/events (spawn → agent
 registered; state → agent state; turn lifecycle → activity + lens-chip
 derivation; fatal error → lens error + notification). Every snapshot is
 read straight from the ledger — a restart can never diverge from the
-record.
+record. Agent rows additionally carry the #171 runtime classification
+(`current` / `historical` / `unverified`) derived per snapshot from live
+ownership evidence (registry handles ∪ supervision views) and a
+supervision-corrected `status` — pure reads, so startup, reconnect and
+restart produce the same truth without data edits.
 
 ## HTTP API (token-authed: `Authorization: Bearer <pairing-token>`)
 
@@ -30,7 +34,7 @@ record.
 | `GET /api/transcripts/file?file=<rel>[&q=&before=&limit=]` | one transcript: paged entries (`before` = exclusive upper index, newest-first, `nextCursor`) or case-insensitive search — newest-first scan under a bounded cap, `scanned`/`total` disclose truncation |
 | `POST /api/jobs` | `{id, repo, title, baseBranch?}` → job (`dispatched`) |
 | `POST /api/jobs/:id/status` | `{status}` — validated against the [job machine](./LEDGER.md) |
-| `POST /api/rounds` | `{jobId, lenses? (default 7), targetRef?}` → round (`pending`) |
+| `POST /api/rounds` | `{jobId, lenses? (default 9), targetRef?}` → round (`pending`) |
 | `POST /api/rounds/:id/status` / `:id/verdict` | `{status}` / `{verdict}` |
 | `POST /api/agents` | `{id, role, label?, jobId?, roundId?, sessionFile?}` (upsert) |
 | `POST /api/agents/state` | `{id, state}` |
@@ -134,28 +138,56 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   Round rows carry per-lens chips (`○ pending` gray · `◉ live` yellow ·
   `✓ done` green · `✕ error` red · `— not used` neutral gray, no pass mark)
   behind a click.
-- **Crew rail:** CREW (n) / TRANSCRIPTS tabs above dense rows — a
-  status dot + name + short hash (minion rows lead with the heist's
-  short name: the authored `display_name` when present, otherwise a
-  display-only shortening of the title, plus a normally four-character
-  id suffix extended only on same-heist collisions; full title and id
-  stay in the row's tooltip), a `role · state` subline (with turn
-  age and supervision marks), and a right-aligned state chip; error rows
-  carry the alert accent; disposed rows collapse behind a dashed `+N
-  disposed` footer. Clicking an agent with a session file opens its
-  transcript. The silas chip is LIVE when
-  `[silas] enabled` (default): the hosted ops session (`silas-ops` slot)
-  appears there whenever its wake turns run, and its follow-through lands
-  on the ledger as `silas.*` events (`silas.pr-registered`,
-  `silas.review-triggered`, `silas.directive-sent`, `silas.rebrief`,
-  `silas.escalated`, `silas.wake`) — visible in the event stream like
-  every other transition.
-- **Notification center (E7; routing split 2026-09-23):** the bell panel
-  renders the durable notification log in three bands — FOR YOU
-  (all pending needs-owner rows, even older than the bounded latest feed:
-  owner-only decisions and stops whose ack re-arms supervision), NEEDS GRU
-  (all pending machine rows, including those older than the recent feed;
-  it wakes Gru once and refuses human Ack), and FEED (FYI rows). The bell
+- **Crew rail (#171 truthful agent status):** CREW (n) / TRANSCRIPTS
+  tabs above dense rows — a status dot + name + short hash (minion rows
+  lead with the heist's short name: the authored `display_name` when
+  present, otherwise a display-only shortening of the title, plus a
+  normally four-character id suffix extended only on same-heist
+  collisions; full title and id stay in the row's tooltip and accessible
+  name), a `role · state` subline (with turn age, supervision marks and
+  runtime marks), and a right-aligned state chip; error rows carry the alert
+  accent; disposed rows collapse behind a dashed `+N disposed` footer.
+  Liveness is runtime ownership, not the raw stored state: each row
+  carries a `runtime` classification — `current` (the live runtime owns
+  it: registry handle, supervision adoption or a hydrated durable stop —
+  a stopped/restarting lane stays current, and an owner-held stop keeps
+  its live-crew row even after the released handle left the record
+  `disposed`), `historical` (ownership probes are wired and no live
+  runtime owns the record — a previous run or import left it; collapsed
+  behind a `+N history` disclosure with transcripts intact, never
+  counted or sorted as crew) or `unverified` (no ownership evidence —
+  visible and explicitly marked, never guessed dead; on a classifying
+  server an ambiguous row stays visible but is NOT claimed in the CREW
+  count). A pre-upgrade server (no classification on any row) keeps the
+  legacy attribution and counting. The chip reads the DERIVED `status`:
+  a raw `idle` with an open supervision turn/control/tool call presents
+  the work it is doing (`streaming`), and the quiet clock reads the newer
+  of the ledger stamp and the supervision event stream. A duplicated
+  CURRENT singleton-role owner (`gru`/`silas`/`bob`) is marked `⚠
+  duplicate` — an anomaly surfaced, never silently discarded; a review
+  pool (`perkins`) runs lead + specialists concurrently and never
+  triggers the mark. The TRACKERS crew counts follow the same
+  classification and derived status, so the strip and the rail cannot
+  disagree. Clicking an agent with a session file opens its transcript.
+  Supervision activity (open turn/control/tool calls) changes without a
+  ledger event, so the board also refreshes every heartbeat interval —
+  a connected rail can never stay stale. The silas chip is
+  LIVE when `[silas] enabled` (default): the hosted ops session
+  (`silas-ops` slot) appears there whenever its wake turns run, and its
+  follow-through lands on the ledger as `silas.*` events
+  (`silas.pr-registered`, `silas.review-triggered`,
+  `silas.directive-sent`, `silas.rebrief`, `silas.escalated`,
+  `silas.wake`) — visible in the event stream like every other
+  transition.
+- **Notification center (E7; routing split 2026-09-23; section truth
+  2026-09-29):** the bell panel renders the durable notification log in
+  three bands — FOR YOU (all pending needs-owner rows, even older than the
+  bounded latest feed: owner-only decisions and stops whose ack re-arms
+  supervision), NEEDS GRU (all pending machine rows, including those older
+  than the recent feed; it wakes Gru once and refuses human Ack. Rows bound
+  to a terminal merged/done lane are CLOSED RECEIPTS: they render under
+  FEED, never as live queue entries, and the live unacked chip does not
+  count them), and FEED (FYI rows plus closed receipts). The bell
   is the alert/history surface: it shares the SAME authoritative owner
   projection as the board's permanent FOR YOU band — pending acks AND
   ready PRs, so the two surfaces never disagree about what the owner
@@ -191,7 +223,7 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
 
 `npm run dev:web` proxies `/api` + `/board/ws` to the dev-only mock
 (`web/mock/server.ts`), which serves a GENERIC sample snapshot
-(`demo-api`, `sample-site`, one live 7-lens round in mixed states) —
+(`demo-api`, `sample-site`, one live 9-lens round in mixed states) —
 `POST /__pulse` on the mock port pushes a fresh copy. No real project
 names anywhere, ever.
 

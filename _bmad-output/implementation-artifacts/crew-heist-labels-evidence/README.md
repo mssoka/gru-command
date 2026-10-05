@@ -87,3 +87,16 @@ described above.
   mock changes landed) plus two chat-reflow assertions that failed after
   a websocket ECONNRESET under host load. It is not this display-naming
   lane's acceptance surface and no green claim is made for it.
+
+## State chips vs supervision marks (blind review 2026-10-05)
+
+The captures show minion rows carrying BOTH an `idle` state chip (right
+edge) and a `⛔ stopped` supervision mark (subline) — e.g. the
+`mock-minion` row. That is intentional two-surface truth, not a
+contradiction: the chip reads the agent row's LAST RECORDED state
+(`idle` — what the ledger last heard), while the supervision mark reads
+the live supervisor's verdict for the same row (`stopped` — breaker
+tripped after 3 restarts, holding the lane for an owner ack). The two
+disagree exactly while a stop is owner-held; the row's tooltip names
+the supervision state and restart count, and the alert accent is driven
+by the supervision stop, so a fault never hides behind a calm chip.

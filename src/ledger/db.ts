@@ -13,6 +13,17 @@ export interface Migration {
   readonly id: number;
   readonly name: string;
   readonly sql: string;
+  /**
+   * SQLite's standard table-rebuild procedure (create-new, copy, drop,
+   * rename) cannot satisfy an immediate FK while a dependent table still
+   * references the old table's rows. `foreign_keys` cannot be toggled
+   * inside a transaction, so the runner turns it off around this
+   * migration's transaction and runs `PRAGMA foreign_key_check` BEFORE
+   * COMMIT — a violation rolls the whole migration back loudly, so the
+   * window can never commit a broken graph. Set only for migrations that
+   * rebuild a table other tables reference.
+   */
+  readonly foreignKeysOff?: true;
 }
 
 /**
@@ -107,19 +118,37 @@ export class LedgerDb {
     for (const migration of [...migrations].sort((a, b) => a.id - b.id)) {
       if (applied.has(migration.id)) continue;
       this.log('info', 'ledger migration applying', { id: migration.id, name: migration.name });
-      this.db.exec('BEGIN');
+      // foreign_keys is a no-op mid-transaction: the rebuild flag must be
+      // applied BEFORE BEGIN and restored after COMMIT/ROLLBACK.
+      const foreignKeysOff = migration.foreignKeysOff === true;
+      if (foreignKeysOff) this.db.exec('PRAGMA foreign_keys = OFF');
       try {
-        this.db.exec(migration.sql);
-        this.db
-          .prepare('INSERT INTO schema_migrations (id, name, applied_at) VALUES (?, ?, ?)')
-          .run(migration.id, migration.name, new Date().toISOString());
-        this.db.exec('COMMIT');
-        ran += 1;
+        this.db.exec('BEGIN');
+        try {
+          this.db.exec(migration.sql);
+          if (foreignKeysOff) {
+            const violations = this.db.prepare('PRAGMA foreign_key_check').all();
+            if (violations.length > 0) {
+              throw new Error(
+                `migration left ${violations.length} foreign-key violation(s) — refusing to commit a broken graph`,
+              );
+            }
+          }
+          this.db
+            .prepare('INSERT INTO schema_migrations (id, name, applied_at) VALUES (?, ?, ?)')
+            .run(migration.id, migration.name, new Date().toISOString());
+          this.db.exec('COMMIT');
+          ran += 1;
+        } catch (error) {
+          this.db.exec('ROLLBACK');
+          throw error;
+        }
       } catch (error) {
-        this.db.exec('ROLLBACK');
         throw new Error(
           `ledger migration ${migration.id} (${migration.name}) failed: ${String(error)} — rolled back, nothing applied`,
         );
+      } finally {
+        if (foreignKeysOff) this.db.exec('PRAGMA foreign_keys = ON');
       }
     }
     if (ran === 0) {
@@ -412,12 +441,346 @@ export const MIGRATIONS: readonly Migration[] = [
     `,
   },
   {
-    // Short heist names (owner-approved display, 2026-09-24): optional
-    // authored job label. Renumbered 9 -> 10 -> 11 across the two main integrations
-    // (worktree-base-source id 9; provider-recovery-waits id 10); never
-    // applied anywhere before this integration, so the renumber is safe
-    // and history-free.
+    // Durable follow-through obligations (blocked-heist follow-through,
+    // phase 2 — ledger foundation only; no scheduling/execution).
+    //
+    // LANDING COLLISION RESOLVED (chief ruling 2026-09-28 protocol): main
+    // landed migration 9 (worktree-base-source, PR #69) while these
+    // never-applied migrations sat unshipped on this branch. They were
+    // renumbered 9->10 and 10->11 there, then 10->11, 11->12, 12->13
+    // when owner-merged main landed provider-recovery-waits as id 10 —
+    // renumbering ONLY never-applied migrations, no hole, no imported
+    // schema — and the final head must be reverified/reviewed after
+    // integration. Once applied on any
+    // database, this build refuses unknown/gapped versions — roll-forward
+    // is the only compatible direction (no old-binary compatibility
+    // claim, no live schema action).
+    //
+    // Identity: (job_id, logical_step, incident_key) — stable across
+    // duplicate observations; distinct incidents coexist. The partial
+    // unique index enforces ONE ACTIVE incarnation per tuple (settled/
+    // closed rows are history; a recurrence mints `id#n`); the table-level
+    // UNIQUE of the first draft would have rejected every recurrence.
+    // `generation` is the job's blocked-generation at creation: only a
+    // NEW distinct incident advances it; duplicates never invalidate live
+    // work. `plan_revision` bumps ONLY when a duplicate observation
+    // changes the plan (next action / authority / wake condition) — the
+    // fence that retires claims derived from the older plan.
+    // Discriminated unions persist as JSON in TEXT columns, validated in
+    // src/ledger/obligations.ts (types are the authority, never prose).
+    // `claim_log` keeps the full identity of every prior claim (never a
+    // bare counter): expiry alone transfers nothing — the reconciliation
+    // path records positive disposition proof there. `receipt_correlation`
+    // binds an armed receipt expectation to the delegated phase's actual
+    // identity, so a later unrelated event of the same kind cannot
+    // satisfy an older expectation.
     id: 11,
+    name: 'job-obligations-and-directive-requests',
+    sql: `
+      CREATE TABLE job_obligations (
+        id               TEXT PRIMARY KEY,
+        job_id           TEXT NOT NULL REFERENCES jobs(id),
+        logical_step     TEXT NOT NULL,
+        incident_key     TEXT NOT NULL,
+        generation       INTEGER NOT NULL,
+        description      TEXT,
+        category         TEXT NOT NULL,
+        next_action      TEXT NOT NULL,
+        wake_condition   TEXT NOT NULL,
+        authority        TEXT,
+        firing_rule      TEXT NOT NULL,
+        state            TEXT NOT NULL,
+        settlement       TEXT,
+        due_at           TEXT,
+        receipt_kind     TEXT,
+        deadline_at      TEXT,
+        receipt_correlation TEXT,
+        recorded_receipts TEXT NOT NULL DEFAULT '[]',
+        observations     INTEGER NOT NULL DEFAULT 1,
+        plan_revision    INTEGER NOT NULL DEFAULT 0,
+        first_origin_seq INTEGER NOT NULL,
+        last_origin_seq  INTEGER NOT NULL,
+        superseded_by    TEXT,
+        claim            TEXT,
+        claim_log        TEXT NOT NULL DEFAULT '[]',
+        created_at       TEXT NOT NULL,
+        updated_at       TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX idx_job_obligations_active_tuple
+        ON job_obligations(job_id, logical_step, incident_key)
+        WHERE state IN ('open', 'waiting', 'suspended');
+      CREATE INDEX idx_job_obligations_job ON job_obligations(job_id);
+      CREATE INDEX idx_job_obligations_state ON job_obligations(state);
+
+      CREATE TABLE pending_directives (
+        request_id    TEXT PRIMARY KEY,
+        job_id        TEXT NOT NULL REFERENCES jobs(id),
+        payload       TEXT NOT NULL,
+        payload_hash  TEXT NOT NULL,
+        state         TEXT NOT NULL,
+        baseline_seq  INTEGER NOT NULL,
+        claim         TEXT,
+        admission_seq INTEGER,
+        admission_minion TEXT,
+        delivery_seq  INTEGER,
+        attempts      INTEGER NOT NULL DEFAULT 0,
+        fail_reason   TEXT,
+        created_at    TEXT NOT NULL,
+        updated_at    TEXT NOT NULL
+      );
+      CREATE INDEX idx_pending_directives_job ON pending_directives(job_id);
+      CREATE INDEX idx_pending_directives_state ON pending_directives(state);
+    `,
+  },
+  {
+    // Explicit phase-completion handoffs (pr136-chief-handoff): the durable
+    // intent an authorized bounded phase persists BEFORE admission/side
+    // effects, its validated correlated completion, and the publication
+    // record for the owed Gru decision. The debt itself lives in
+    // job_obligations; the wake rides NotificationCenter's existing
+    // action-required path. `pending_rebriefs.phase_id` binds a re-brief
+    // marker pair to its phase row (host-owned identity, never the event
+    // sequence). Identity = `phase-handoff:<job>:<source>:<generation>` —
+    // generation is per-job monotonic; a replay of the same request returns
+    // the same row, a genuinely new phase advances it. `intent_seq` is the
+    // events watermark at acceptance: a completion at/before it can never
+    // answer this phase (an older receipt cannot complete a newer phase).
+    //
+    // LANDING COLLISION (same convention as migration 10): id 12 is a
+    // branch-local next-contiguous number for an UNSHIPPED feature; if
+    // another lane's migration lands first, integrate owner-merged main and
+    // re-number ONLY this never-applied migration (never a hole).
+    id: 12,
+    name: 'phase-handoffs',
+    sql: `
+      CREATE TABLE phase_handoffs (
+        phase_id        TEXT PRIMARY KEY,
+        job_id          TEXT NOT NULL REFERENCES jobs(id),
+        source          TEXT NOT NULL CHECK (source IN ('dispatch','silas-directive','silas-rebrief')),
+        request_id      TEXT,
+        generation      INTEGER NOT NULL,
+        decision        TEXT NOT NULL,
+        state           TEXT NOT NULL CHECK (state IN ('awaiting','completed','closed')),
+        intent_seq      INTEGER NOT NULL,
+        minion_id       TEXT,
+        completion_seq  INTEGER,
+        obligation_id   TEXT,
+        notification_id TEXT,
+        close_reason    TEXT,
+        created_at      TEXT NOT NULL,
+        updated_at      TEXT NOT NULL
+      );
+      CREATE INDEX idx_phase_handoffs_job ON phase_handoffs(job_id);
+      CREATE INDEX idx_phase_handoffs_state ON phase_handoffs(state);
+      CREATE INDEX idx_phase_handoffs_request ON phase_handoffs(job_id, request_id);
+
+      ALTER TABLE pending_rebriefs ADD COLUMN phase_id TEXT;
+    `,
+  },
+  {
+    // Bounded reconcile cursors (PR136 r4 repair, blocker 3): one tiny
+    // durable round-robin pointer per reconcile scope. The phase-handoff
+    // sweep reads only actionable rows and must still make fair progress
+    // across bounded passes — without a persisted cursor a fresh pass
+    // re-examines the same prefix and a later owed row never lands.
+    // LANDING COLLISION (same convention as migrations 10/11): id 13 is a
+    // branch-local next-contiguous number for an UNSHIPPED feature; if
+    // owner-merged main lands first, re-number ONLY this never-applied
+    // migration (never a hole).
+    id: 13,
+    name: 'reconcile-cursors',
+    sql: `
+      CREATE TABLE reconcile_cursors (
+        scope      TEXT PRIMARY KEY,
+        cursor     INTEGER NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `,
+  },
+  {
+    // Canonical job amendments (owner ruling j-969): append-only versioned
+    // acceptance amendments with explicit approval provenance, expected-
+    // contract-hash concurrency and idempotency. The original job briefing is
+    // never rewritten; later review rounds render the effective contract.
+    // LANDING COLLISION (same convention as migrations 10-13): id 14 is a
+    // branch-local next-contiguous number for an UNSHIPPED feature; if
+    // owner-merged main lands first, re-number ONLY this never-applied
+    // migration (never a hole).
+    id: 14,
+    name: 'job-amendments',
+    sql: `
+      CREATE TABLE job_amendments (
+        id                        TEXT PRIMARY KEY,
+        job_id                    TEXT NOT NULL REFERENCES jobs(id),
+        version                   INTEGER NOT NULL,
+        body                      TEXT NOT NULL,
+        body_sha256               TEXT NOT NULL,
+        supersedes                TEXT NOT NULL,
+        approval_by               TEXT NOT NULL,
+        approval_reference        TEXT NOT NULL,
+        previous_contract_sha256  TEXT NOT NULL,
+        contract_sha256           TEXT NOT NULL,
+        request_sha256            TEXT NOT NULL,
+        idempotency_key           TEXT,
+        created_at                TEXT NOT NULL,
+        UNIQUE (job_id, version)
+      );
+      CREATE INDEX idx_job_amendments_job ON job_amendments(job_id);
+      CREATE UNIQUE INDEX idx_job_amendments_idempotency
+        ON job_amendments(job_id, idempotency_key)
+        WHERE idempotency_key IS NOT NULL;
+    `,
+  },
+  {
+    // Sub-minions (issue #161): GC-owned child workers with tracked
+    // parentage, idempotent admission and durable results.
+    //
+    // - `agents.parent_agent_id` is the durable parent link on the child's
+    //   own agent row; `agents.parentage` is the honest category marker:
+    //   'child' (has a parent), 'top-level' (explicitly parentless),
+    //   NULL = legacy/unknown — never reparented from names or job patterns.
+    // - `child_workers` is the admission record AND the lifetime creation
+    //   counter: one row per LOGICAL child creation. The unique
+    //   (parent_agent_id, idempotency_key) index makes a duplicate or
+    //   lost-response retry replay the same row (payload-hash conflicts
+    //   fail loud), and session resumes/replacement sessions never insert
+    //   a second row. Counters are SQL aggregates over this table, so they
+    //   survive restart by construction.
+    // - `worktrees.kind` gains 'child' (a child lane's owner id is the
+    //   child agent id). SQLite cannot alter a CHECK constraint, so the
+    //   table is rebuilt in place; the runner's `foreignKeysOff` flag
+    //   disables foreign keys around this migration's transaction and
+    //   fails loud via `PRAGMA foreign_key_check` before COMMIT (see the
+    //   Migration interface), so the rebuild can never commit a broken
+    //   graph over worktree_processes' references.
+    //
+    // LANDING COLLISION (same convention as migrations 10-14): id 15 is a
+    // branch-local next-contiguous number for an UNSHIPPED feature; if
+    // owner-merged main lands first, re-number ONLY this never-applied
+    // migration (never a hole).
+    //
+    // UPGRADE NOTE (review rounds 2-3): this id was edited while the
+    // feature was still unmerged/unshipped. A ledger made by an
+    // intermediate commit of this branch (old id-15 shape) is upgraded by
+    // the additive migration 16, which backfills the child/agent binding
+    // and guarantees the lookup index; the retired capability column is
+    // retained here so fresh and upgraded schemas converge. No release
+    // build carried either intermediate shape.
+    id: 15,
+    name: 'child-workers',
+    // The worktrees table is rebuilt to widen its kind CHECK; the runner
+    // disables foreign keys around this migration and verifies with
+    // PRAGMA foreign_key_check before COMMIT (see Migration.foreignKeysOff).
+    foreignKeysOff: true,
+    sql: `
+      CREATE TABLE worktrees_new (
+        id         TEXT PRIMARY KEY,
+        kind       TEXT NOT NULL CHECK (kind IN ('job','review','child')),
+        repo_path  TEXT NOT NULL,
+        repo_name  TEXT NOT NULL,
+        path       TEXT NOT NULL UNIQUE,
+        branch     TEXT,
+        sha        TEXT NOT NULL,
+        job_id     TEXT REFERENCES jobs(id),
+        round_id   TEXT REFERENCES rounds(id),
+        status     TEXT NOT NULL CHECK (status IN ('active','paused','swept')),
+        note       TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        base_source TEXT CHECK (base_source IN ('origin','local-head-fallback'))
+      );
+      INSERT INTO worktrees_new
+        (id, kind, repo_path, repo_name, path, branch, sha, job_id, round_id, status, note, created_at, updated_at, base_source)
+        SELECT id, kind, repo_path, repo_name, path, branch, sha, job_id, round_id, status, note, created_at, updated_at, base_source
+          FROM worktrees;
+      DROP TABLE worktrees;
+      ALTER TABLE worktrees_new RENAME TO worktrees;
+      CREATE INDEX idx_worktrees_job ON worktrees(job_id);
+      CREATE INDEX idx_worktrees_round ON worktrees(round_id);
+      CREATE INDEX idx_worktrees_status ON worktrees(status);
+
+      ALTER TABLE agents ADD COLUMN parent_agent_id TEXT REFERENCES agents(id);
+      ALTER TABLE agents ADD COLUMN parentage TEXT CHECK (parentage IN ('top-level','child'));
+      CREATE INDEX idx_agents_parent ON agents(parent_agent_id);
+      -- RETIRED (issue #161 round 3): the parent capability is GC-mediated
+      -- (in-process native tools), so no bearer column is used by the
+      -- code. The column is retained in the schema so a ledger created by
+      -- an earlier, unshipped commit of this branch CONVERGES with a fresh
+      -- one (a later additive migration must never have to guess which
+      -- shape it is upgrading).
+      ALTER TABLE agents ADD COLUMN child_request_token_hash TEXT;
+
+      CREATE TABLE child_workers (
+        id              TEXT PRIMARY KEY,
+        agent_id        TEXT REFERENCES agents(id),
+        parent_agent_id TEXT NOT NULL REFERENCES agents(id),
+        job_id          TEXT NOT NULL REFERENCES jobs(id),
+        purpose         TEXT NOT NULL,
+        authority       TEXT NOT NULL CHECK (authority IN ('read-only','writer')),
+        task            TEXT NOT NULL,
+        label           TEXT,
+        idempotency_key TEXT NOT NULL,
+        payload_hash    TEXT NOT NULL,
+        state           TEXT NOT NULL CHECK (state IN ('queued','admitted','active','done','error','cancelled')),
+        worktree_id     TEXT,
+        branch          TEXT,
+        session_file    TEXT,
+        result_state    TEXT CHECK (result_state IN ('done','error','cancelled')),
+        result_summary  TEXT,
+        result_ref      TEXT,
+        created_at      TEXT NOT NULL,
+        admitted_at     TEXT,
+        started_at      TEXT,
+        finished_at     TEXT,
+        updated_at      TEXT NOT NULL,
+        UNIQUE (parent_agent_id, idempotency_key)
+      );
+      CREATE INDEX idx_child_workers_parent ON child_workers(parent_agent_id);
+      CREATE INDEX idx_child_workers_job ON child_workers(job_id);
+      CREATE INDEX idx_child_workers_state ON child_workers(state);
+      CREATE INDEX idx_child_workers_agent ON child_workers(agent_id);
+    `,
+  },
+  {
+    // Issue #161 round-3 convergence: an intermediate, unshipped commit of
+    // this branch created child_workers rows whose `agent_id` was bound
+    // later at spawn (a runtime-minted id) or left NULL. The final model
+    // makes `agent_id` equal the admission id from the start, so this
+    // additive migration backfills the unbound rows and guarantees the
+    // lookup index — a database made by EITHER pre-merge shape upgrades to
+    // the same final schema. (Migration 15 keeps the retired capability
+    // column for the same convergence reason; nothing reads it.)
+    id: 16,
+    name: 'child-workers-agent-binding',
+    sql: `
+      CREATE INDEX IF NOT EXISTS idx_child_workers_agent ON child_workers(agent_id);
+      -- The intermediate shape left unspawned rows with NO agent row at
+      -- all. Reconstruct the admission agent row BEFORE rebinding, or the
+      -- foreign key on child_workers.agent_id would reject the update.
+      INSERT INTO agents
+        (id, role, label, job_id, round_id, state, last_activity, session_file, parent_agent_id, parentage, created_at, updated_at)
+      SELECT cw.id, 'minion', cw.label, cw.job_id, NULL,
+             CASE cw.state
+               WHEN 'done' THEN 'idle'
+               WHEN 'error' THEN 'error'
+               WHEN 'cancelled' THEN 'disposed'
+               ELSE 'spawning'
+             END,
+             NULL, cw.session_file, cw.parent_agent_id, 'child', cw.created_at, cw.updated_at
+        FROM child_workers cw
+       WHERE cw.agent_id IS NULL
+         AND NOT EXISTS (SELECT 1 FROM agents a WHERE a.id = cw.id);
+      UPDATE child_workers SET agent_id = id WHERE agent_id IS NULL;
+    `,
+  },
+  {
+    // Short heist names (owner-approved display, 2026-09-24): optional
+    // authored job label. Renumbered 9 -> 10 -> 11 -> 17 across the main
+    // integrations (worktree-base-source id 9; provider-recovery-waits
+    // id 10; obligations/child-workers ids 11-16 on main); never applied
+    // anywhere before this integration, so the renumber is safe and
+    // history-free.
+    id: 17,
     name: 'job-display-name',
     sql: 'ALTER TABLE jobs ADD COLUMN display_name TEXT;',
   },

@@ -218,10 +218,10 @@ describe('board server — HTTP API', () => {
     for (const body of [{}, { title: '  ', detail: 'x' }, { title: 'x', detail: '\n' }, { title: 'x'.repeat(501), detail: 'y' }]) {
       expect((await postJson(port, path, 'board-test-token', body)).status).toBe(400);
     }
-    const before = api.countPendingActionRequired();
+    const before = api.countPendingActionRequiredIncludingReceipts();
     const created = await postJson(port, path, 'board-test-token', { title: 'Owner call', detail: 'Approve external merge' });
     expect(created).toMatchObject({ status: 201, body: { kind: 'gru.owner-escalation', routing: 'needs-owner', title: 'Owner call', ackedAt: null } });
-    expect(api.countPendingActionRequired()).toBe(before); // never loops into Gru's machine queue
+    expect(api.countPendingActionRequiredIncludingReceipts()).toBe(before); // never loops into Gru's machine queue
     const row = created.body as { id: string };
     expect(api.getNotification(row.id)).toMatchObject({ detail: 'Approve external merge', shownAt: null });
     expect((await getJson(port, '/api/board', 'board-test-token')).body).toMatchObject({ unackedNeedsOwner: expect.any(Number) });
@@ -254,7 +254,7 @@ describe('board server — HTTP API', () => {
       jobId: 'api-job',
     });
     expect(round.status).toBe(201);
-    expect((round.body as { lenses: { lens: string }[] }).lenses.length).toBe(7);
+    expect((round.body as { lenses: { lens: string }[] }).lenses.length).toBe(9);
     const illegal = await postJson(harness.port, '/api/jobs/api-job/status', 'board-test-token', {
       status: 'merged',
     });
@@ -414,6 +414,11 @@ describe('board server — WS push', () => {
       // The server pings every 40 ms; the JSON ping frame is how the
       // browser client refreshes its stale clock.
       await client.waitFor((f) => f.type === 'ping', 'app ping');
+      // Issue #171: the same cadence refreshes the snapshot — supervision
+      // activity and ownership classification can change without a ledger
+      // event, so a connected board must not stay stale.
+      client.frames.length = 0;
+      await client.waitFor((f) => f.type === 'board', 'heartbeat snapshot refresh');
       await client.close();
     } finally {
       await env.close();
@@ -506,7 +511,7 @@ describe('board server — empty token config locks every door', () => {
       const illegal = await postJson(port, `/api/notifications/${machine.id}/ack`, 'ack-token', { by: 'web' });
       expect(illegal.status).toBe(400);
       expect(api.getNotification(machine.id)).toMatchObject({ ackedAt: null, resolvedAt: null });
-      expect(api.countPendingActionRequired()).toBeGreaterThan(0);
+      expect(api.countPendingActionRequiredIncludingReceipts()).toBeGreaterThan(0);
       // Owner Ack fires the hook exactly once, idempotently.
       const ack1 = await postJson(port, `/api/notifications/${row.id}/ack`, 'ack-token', { by: 'web' });
       expect(ack1.status).toBe(200);
@@ -537,5 +542,43 @@ describe('board server — empty token config locks every door', () => {
     await client.closed;
     expect(client.frames.some((f) => f.type === 'error' && (f.message ?? '').includes('not configured'))).toBe(true);
     await harness.close();
+  });
+
+  it('pages closed receipts on demand, newest-first, with the raw offset cursor (D3)', async () => {
+    const harness = await boot('board-test-token');
+    try {
+      harness.api.addJob({ id: 'job-receipts', repo: 'r', title: 'Receipts', briefing: 'b' });
+      harness.api.setJobStatus('job-receipts', 'working');
+      harness.api.registerAgent({ id: 'minion-receipts', role: 'minion', jobId: 'job-receipts' });
+      const center = new NotificationCenter({ ledger: harness.api, bus: harness.bus });
+      for (let i = 0; i < 3; i += 1) {
+        center.post({
+          kind: `receipt-page-${i}`,
+          routing: 'action-required',
+          severity: 'error',
+          title: `receipt ${i}`,
+          agentId: 'minion-receipts',
+        });
+      }
+      harness.api.setJobStatus('job-receipts', 'delivered');
+      harness.api.setJobStatus('job-receipts', 'in-review');
+      harness.api.setJobStatus('job-receipts', 'merged');
+      expect((await getJson(harness.port, '/api/notifications/receipts', null)).status).toBe(401);
+      const first = await getJson(harness.port, '/api/notifications/receipts?limit=2', 'board-test-token');
+      expect(first.status).toBe(200);
+      const firstBody = first.body as { receipts: { id: string }[]; nextOffset: number; hasMore: boolean };
+      expect(firstBody.receipts).toHaveLength(2);
+      expect(firstBody.hasMore).toBe(true);
+      const second = await getJson(
+        harness.port,
+        `/api/notifications/receipts?offset=${firstBody.nextOffset}&limit=2`,
+        'board-test-token',
+      );
+      const secondBody = second.body as { receipts: { id: string }[]; hasMore: boolean };
+      expect(secondBody.receipts).toHaveLength(1);
+      expect(secondBody.hasMore).toBe(false);
+    } finally {
+      await harness.close();
+    }
   });
 });

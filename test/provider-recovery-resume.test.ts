@@ -62,6 +62,9 @@ class FakeHandle implements AgentHandle {
   readonly capabilities = FAKE_CAPABILITIES;
   promptCount = 0;
   disposed = false;
+  /** Settle-time terminal health the fallback verdict reads (#160 tests). */
+  healthState: 'idle' | 'error' = 'idle';
+  healthError: string | null = null;
   private readonly listeners = new Set<RuntimeEventListener>();
 
   constructor(role: Role, id: string, sessionFile: string | null) {
@@ -87,7 +90,12 @@ class FakeHandle implements AgentHandle {
     };
   }
   health(): AgentHealth {
-    return { state: 'idle', lastActivity: new Date().toISOString(), sessionFile: this.sessionFile };
+    return {
+      state: this.healthState,
+      lastActivity: new Date().toISOString(),
+      sessionFile: this.sessionFile,
+      ...(this.healthError === null ? {} : { error: this.healthError }),
+    };
   }
   async dispose(): Promise<void> {
     this.disposed = true;
@@ -229,6 +237,54 @@ describe('guarded claim — happy path', () => {
     expect(spawned?.promptCount).toBe(1);
   });
 
+  it('a continuation turn that settles with an in-band error is recorded, never reported as continued (#160)', async () => {
+    const h = new ClaimHarness();
+    const sessionDir = mkdtempSync(join(tmpdir(), 'pr-session-inband-'));
+    cleanupDirs.push(sessionDir);
+    const sessionFile = join(sessionDir, 'minion.jsonl');
+    writeFileSync(sessionFile, '{}\n');
+    const jobId = 'j-inband';
+    const waitId = await h.recoveredMinionWait({ sessionFile, jobId });
+    h.registry.spawnImpl = (resumeFile) => {
+      const handle = new FakeHandle('minion', `agent-inband-${h.registry.handles.size + 1}`, resumeFile);
+      handle.healthState = 'error';
+      handle.healthError = 'assistant stopReason error';
+      h.registry.handles.set(handle.id, handle);
+      return handle;
+    };
+    const result = await claimProviderRecoveryContinuation(h.deps(), waitId, 'silas');
+    // The prompt settled but the turn failed in-band: NOT a continuation.
+    expect(result.outcome).toBe('skipped');
+    expect(result.outcome === 'skipped' ? result.why : '').toContain('in-band');
+    // Durable non-success evidence, no delivery, claim kept (no replay).
+    const events = h.ledger.listJobEvents(jobId, { limit: 50 });
+    expect(events.some((event) => event.kind === 'provider.continuation-failed')).toBe(true);
+    expect(events.some((event) => event.kind === 'job.minion-error')).toBe(true);
+    expect(events.some((event) => event.kind === 'job.delivered')).toBe(false);
+    expect(h.ledger.getProviderWait(waitId)?.status).toBe('claimed');
+    // The lane does not stay 'working' with nobody driving it (#160).
+    expect(h.ledger.getJob(jobId)?.status).toBe('blocked');
+  });
+
+  it('a deterministic spawn failure after the claim records the error durably and blocks the lane (#160)', async () => {
+    const h = new ClaimHarness();
+    const jobId = 'j-spawnfail';
+    const waitId = await h.recoveredMinionWait({ sessionFile: null, jobId });
+    h.registry.spawnImpl = () => {
+      throw new Error('spawn exploded');
+    };
+    const result = await claimProviderRecoveryContinuation(h.deps(), waitId, 'silas');
+    expect(result.outcome).toBe('skipped');
+    expect(result.outcome === 'skipped' ? result.why : '').toContain('no automatic replay');
+    // Both failure paths leave the same durable non-success evidence.
+    const events = h.ledger.listJobEvents(jobId, { limit: 50 });
+    expect(events.some((event) => event.kind === 'provider.continuation-failed')).toBe(true);
+    expect(events.some((event) => event.kind === 'job.minion-error')).toBe(true);
+    expect(events.some((event) => event.kind === 'job.delivered')).toBe(false);
+    expect(h.ledger.getProviderWait(waitId)?.status).toBe('claimed');
+    expect(h.ledger.getJob(jobId)?.status).toBe('blocked');
+  });
+
   it('a missing session file falls back to a fresh worker on the same lane', async () => {
     const h = new ClaimHarness();
     // A nonexistent path exercises the fallback without creating it.
@@ -312,6 +368,20 @@ describe('guarded claim — every recheck fails visible', () => {
     const result = await claimProviderRecoveryContinuation(h.deps(), waitId, 'silas');
     expect(result).toMatchObject({ outcome: 'skipped', why: expect.stringContaining('replacement') });
     expect(h.ledger.getProviderWait(waitId)?.status).toBe('superseded');
+  });
+
+  it('a live REVIEW-ONLY session does not supersede the implementer\'s wait (2026-10-05 review)', async () => {
+    const h = new ClaimHarness();
+    const jobId = 'j-reviewer-live';
+    const waitId = await h.recoveredMinionWait({ jobId });
+    // A newer round-bound review session WITH a live handle: it is not the
+    // lane's writer, so the interrupted implementer's claim proceeds.
+    const round = h.ledger.addRound({ jobId, lenses: ['blind'] });
+    h.ledger.registerAgent({ id: 'agent-review-live', role: 'minion', jobId, roundId: round.id });
+    h.registry.handles.set('agent-review-live', new FakeHandle('minion', 'agent-review-live', null));
+    const result = await claimProviderRecoveryContinuation(h.deps(), waitId, 'silas');
+    expect(result).not.toMatchObject({ why: expect.stringContaining('replacement') });
+    expect(h.ledger.getProviderWait(waitId)?.status).not.toBe('superseded');
   });
 
   it('the original actor being live again supersedes the wait', async () => {

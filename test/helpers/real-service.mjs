@@ -26,6 +26,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import process from 'node:process';
 import { setTimeout as delay } from 'node:timers/promises';
+import { markFixtureStep, trackChildProcess } from './harness-diagnostics.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, '..', '..');
@@ -207,6 +208,16 @@ export async function startRealService({
     stdio: ['ignore', 'pipe', 'pipe'],
     env: childEnv,
   });
+  // Fixture-owned child: the diagnostics scope (when a test is active)
+  // records pid/exit state and a bounded stderr tail for timeouts.
+  trackChildProcess(child, { label: 'gru-command service (dist/main.js)' });
+  // Keep the spawn failure observable to the boot loops below; tracking
+  // attaches its own error listener, so without this a failed spawn would
+  // surface only as a 20s "never answered /health" deadline.
+  let spawnError = null;
+  child.once('error', (error) => {
+    spawnError = error instanceof Error ? error : new Error(String(error));
+  });
   let stderrTail = '';
   child.stdout.on('data', () => {}); // drain: the service log must never wedge the pipe
   child.stderr.on('data', (chunk) => {
@@ -223,18 +234,23 @@ export async function startRealService({
   // co-tenant load a spawned service can take well over the old 20 s
   // from spawn to first /health answer — witnessed on the shared host
   // with the ledger-ready log landing inside the old window while the
-  // health poll was still unpaid. Discovery and health each get their
-  // OWN deadline so a slow discovery cannot starve the health wait, and
-  // a genuinely wedged boot still fails loud at the same budget. Suites
-  // that boot inside a test/hook keep generous ceilings (90 s) so this
-  // helper's loud deadline is the failure surface, never a vitest cut.
-  const BOOT_DEADLINE_MS = 60_000;
-  const discoveryDeadline = Date.now() + BOOT_DEADLINE_MS;
+  // health poll was still unpaid. The two waits have SEPARATE deadlines
+  // (a slow discovery can never starve the health poll), and their sum
+  // (20 s + 60 s = 80 s) fits inside the booting suites' 90 s ceilings,
+  // so a genuinely wedged boot always fails loud HERE — never as a
+  // vitest timeout cut.
+  const DISCOVERY_DEADLINE_MS = 20_000;
+  const HEALTH_DEADLINE_MS = 60_000;
+  const discoveryDeadline = Date.now() + DISCOVERY_DEADLINE_MS;
   if (port === 0) {
     let discovered = null;
     while (discovered === null) {
       discovered = parseListeningPort(stderrTail);
       if (discovered !== null) break;
+      if (spawnError !== null) {
+        cleanup();
+        failLoud(`service failed to spawn: ${spawnError.message}`);
+      }
       if (child.exitCode !== null) {
         cleanup();
         failLoud(`service exited before listening (code ${child.exitCode})\n${stderrTail}`);
@@ -250,8 +266,12 @@ export async function startRealService({
   }
 
   const baseUrl = `http://127.0.0.1:${port}`;
-  const healthDeadline = Date.now() + BOOT_DEADLINE_MS;
+  const healthDeadline = Date.now() + HEALTH_DEADLINE_MS;
   for (;;) {
+    if (spawnError !== null) {
+      cleanup();
+      failLoud(`service failed to spawn: ${spawnError.message}`);
+    }
     if (child.exitCode !== null) {
       cleanup();
       failLoud(`service exited during boot (code ${child.exitCode})\n${stderrTail}`);
@@ -264,6 +284,7 @@ export async function startRealService({
     }
     await delay(100);
   }
+  markFixtureStep(`real service answered /health on port ${port}`);
 
   function cleanup() {
     // keepHome = "this boot's dirs survive stop()" (the e2e restart flow

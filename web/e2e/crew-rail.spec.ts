@@ -32,6 +32,11 @@ const UNICODE_ID = 'mock-minion-unicode';
 test('crew rail names: short authored, long/Unicode, full identity, no overflow', async ({ page }, testInfo) => {
   await pair(page);
   const rail = page.locator('#board-agents');
+  // The long FALLBACK row (title-derived name, no authored display_name):
+  // its name is the longest rendered string in the rail, so the fit
+  // assertions below must cover it at every viewport, not only the
+  // authored/Unicode rows (blind review 2026-10-05).
+  const fallback = rail.locator('.board-agent[data-role="minion"]', { hasText: 'fix the payment retry' });
 
   // 1. Short authored name: lowercase heist name + one four-character
   //    suffix; the redundant primary `minion` prefix is gone and the
@@ -78,11 +83,14 @@ test('crew rail names: short authored, long/Unicode, full identity, no overflow'
     }
     for (const [viewport, width, height] of VIEWPORTS) {
       await page.setViewportSize({ width, height });
+      await fallback.scrollIntoViewIfNeeded();
+      await expect(fallback).toBeVisible();
       await unicode.scrollIntoViewIfNeeded();
       await expect(unicode).toBeVisible();
       // The name and the suffix stay inside the card; nothing spills or
-      // forces a horizontal scroll on the rail.
-      const fit = await unicode.evaluate((node) => {
+      // forces a horizontal scroll on the rail — checked for the Unicode
+      // row AND the long fallback row at every viewport.
+      const fitOf = (node: HTMLElement) => {
         const name = node.querySelector('.board-agent__name')!;
         const hash = node.querySelector('.board-agent__hash')!;
         const row = node.getBoundingClientRect();
@@ -93,8 +101,16 @@ test('crew rail names: short authored, long/Unicode, full identity, no overflow'
           hashInsideCard: hash.getBoundingClientRect().right <= row.right,
           railNoHorizontalOverflow: node.parentElement!.scrollWidth <= node.parentElement!.clientWidth,
         };
+      };
+      const unicodeFit = await unicode.evaluate(fitOf);
+      const fallbackFit = await fallback.evaluate(fitOf);
+      expect(unicodeFit).toEqual({
+        nameScrollFits: true,
+        nameInsideCard: true,
+        hashInsideCard: true,
+        railNoHorizontalOverflow: true,
       });
-      expect(fit).toEqual({
+      expect(fallbackFit).toEqual({
         nameScrollFits: true,
         nameInsideCard: true,
         hashInsideCard: true,

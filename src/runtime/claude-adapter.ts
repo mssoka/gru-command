@@ -54,21 +54,14 @@ import type {
   SpawnOptions,
 } from './types.js';
 import { ToolHeartbeat, toolHeartbeatIntervalMs } from './tool-heartbeat.js';
+import { CLAUDE_CODE_CAPABILITIES } from './capabilities.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
-/** claude-code adapter capabilities, hoisted for the runtime probe (E3 story 3). */
-export const CLAUDE_CODE_CAPABILITIES: AgentCapabilities = {
-  streaming: true,
-  // The -p surface has no mid-turn channel (that lives in the SDK control
-  // protocol, out of scope per SPEC ruling 4) — the interface layer queues.
-  steer: 'queued',
-  resume: 'file',
-  images: true,
-  thinking: true,
-  thinkingLevelControl: true, // via --effort
-  followUp: false,
-};
+// The declaration now lives in the dependency-light `capabilities.js` so the
+// runtime probe can report it without loading this adapter's SDK graph; the
+// re-export keeps every existing import surface (and object identity) intact.
+export { CLAUDE_CODE_CAPABILITIES };
 
 /** Thinking levels the claude CLI accepts via --effort (fail-loud on others). */
 const CLAUDE_EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultracode'] as const;
@@ -374,7 +367,19 @@ export class ClaudeCodeRuntime implements AgentRuntime {
     if (reviewMode !== undefined && options.resumeFile !== undefined) {
       throw new Error('isolated review sessions must be fresh and cannot resume ambient context');
     }
-    const fileTools = mapRoleTools(role, reviewMode?.tools ?? roleDef.tools);
+    // Issue #161: a declared role-tool override narrows (never widens) the
+    // role's own set — enforced here exactly as the pi adapter does.
+    if (options.roleTools !== undefined) {
+      const allowed = new Set(roleDef.tools);
+      for (const tool of options.roleTools) {
+        if (!allowed.has(tool)) {
+          throw new Error(
+            `role tool override names "${tool}", which role "${role}" does not declare — an override can only narrow authority`,
+          );
+        }
+      }
+    }
+    const fileTools = mapRoleTools(role, reviewMode?.tools ?? options.roleTools ?? roleDef.tools);
     await this.ensureBinary();
 
     const resumeFile =
@@ -419,11 +424,24 @@ export class ClaudeCodeRuntime implements AgentRuntime {
       if (reviewConfiguration !== undefined) {
         reviewSettings = privateClaudeReviewSettings(reviewConfiguration.settings);
       }
-      // ANY isolated-review session that declares native tools gets its own
-      // scoped bridge exposing exactly the declared set — leads and lens
-      // children ride the same seam (SPEC ruling 4: no harness split).
-      if (reviewMode !== undefined && reviewMode.nativeTools !== undefined) {
-        reviewBridge = await ReviewMcpBridge.start(reviewMode.nativeTools);
+      // Review sessions (leads/lens children) get their scoped bridge
+      // exactly as before. Issue #161 DECLARED CAPABILITY GAP: a
+      // non-review parent session must NOT be given product-native tools
+      // on this runtime — the MCP bridge is a same-UID-discoverable
+      // loopback socket, and another worker process under the service uid
+      // could invoke the parent's tools (impersonation) and bypass nested-
+      // delegation bounds. Parent child-worker tools are hosted in-process
+      // on runtimes that can execute them in the service process (pi), and
+      // this refusal is loud rather than silently unhosted.
+      if (reviewMode === undefined && options.nativeTools !== undefined && options.nativeTools.length > 0) {
+        throw new Error(
+          'claude-code cannot host product-native non-review tools: its session bridge is a discoverable same-uid socket ' +
+            '(use the pi runtime for parent child-worker tools — declared capability gap, issue #161)',
+        );
+      }
+      const declaredNativeTools = reviewMode !== undefined ? reviewMode.nativeTools : undefined;
+      if (declaredNativeTools !== undefined && declaredNativeTools.length > 0) {
+        reviewBridge = await ReviewMcpBridge.start(declaredNativeTools);
       }
       const nativeTools = reviewBridge?.toolNames.map((name) => `mcp__gru_perkins__${name}`) ?? [];
       const tools = [...fileTools, ...nativeTools];
@@ -517,6 +535,7 @@ export class ClaudeCodeRuntime implements AgentRuntime {
         },
         (error) => this.onInfraError(error),
         this.heartbeatMs(),
+        ...(options.agentId !== undefined ? [options.agentId] : []),
       );
       this.handles.add(handle);
       this.down = undefined;
@@ -705,11 +724,14 @@ export class ClaudeCodeHandle implements AgentHandle {
     onDispose: () => void = () => {},
     onInfraError: (error: unknown) => void = () => {},
     toolHeartbeatMs = 60_000,
+    /** Product-owned identity (issue #161): the ledger identity, bound
+     * before the session for a tracked child. */
+    agentId?: string,
   ) {
     this.role = role;
     this.params = params;
     this.capabilities = capabilities;
-    this.id = params.sessionId;
+    this.id = agentId ?? params.sessionId;
     this.sessionFile = params.sessionFile;
     if (params.isolatedReview) this.reviewIsolation = true;
     if (params.reviewTools !== undefined && params.reviewTools.length > 0) {

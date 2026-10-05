@@ -94,6 +94,17 @@ describe('recorded verification evidence', () => {
     expect(renderRecordedVerification({ ts: 'x', payload: 'not-an-object' }, TARGET)).toBeNull();
   });
 
+  it('requires the complete receipt bindings — run id + output length/hash (issue #159)', () => {
+    expect(renderRecordedVerification(event(passingPayload({ run_id: undefined })), TARGET)).toBeNull();
+    expect(renderRecordedVerification(event(passingPayload({ output_bytes: undefined })), TARGET)).toBeNull();
+    expect(renderRecordedVerification(event(passingPayload({ output_sha256: undefined })), TARGET)).toBeNull();
+    expect(renderRecordedVerification(event(passingPayload({ output_sha256: '' })), TARGET)).toBeNull();
+    // The complete receipt still renders with all bindings present.
+    const complete = renderRecordedVerification(event(passingPayload()), TARGET);
+    expect(complete).toContain('run_id: run-1');
+    expect(complete).toContain('output_bytes: 4096');
+  });
+
   it('appends the block to the spec and skips it when the frozen bound would be exceeded', () => {
     const evidence = renderRecordedVerification(event(passingPayload()), TARGET);
     expect(evidence).not.toBeNull();

@@ -56,7 +56,7 @@ async function bootLane(): Promise<LaneHarness> {
     setupTimeoutMs: 30_000,
     killGraceMs: 25,
   });
-  const server = createWorktreeServer({ config: cfg, manager });
+  const server = createWorktreeServer({ config: cfg, manager, ledger });
   const http: HttpServer = createServer((req, res) => {
     if (server.requestHook(req, res, new URL(req.url ?? '/', 'http://localhost').pathname)) return;
     res.writeHead(404);
@@ -126,6 +126,49 @@ describe('worktree lane release endpoint (r4)', () => {
       expect(field<string>(done.json, 'status')).toBe('swept');
       const again = await call(h.port, '/api/dispatch/release', { job_id: 'job-404' }, TOKEN);
       expect(again.status).toBe(404);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('job release refuses while a child is live and never sweeps a child lane in the job’s place', async () => {
+    const h = await bootLane();
+    const repo = makeFixtureRepo('fixture-child-release');
+    cleanupRepos.push(repo);
+    try {
+      h.ledger.addJob({ id: 'job-c', repo: 'fixture-child-release', title: 'x' });
+      h.ledger.setJobStatus('job-c', 'working');
+      h.ledger.registerAgent({ id: 'parent-c', role: 'minion', jobId: 'job-c', parentage: 'top-level' });
+      const jobLane = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-c' });
+      h.ledger.admitChildWorker({
+        id: 'child-c1',
+        parentAgentId: 'parent-c',
+        jobId: 'job-c',
+        purpose: 'release guard',
+        authority: 'read-only',
+        task: 't',
+        idempotencyKey: 'k-release',
+      });
+      const childLane = await h.manager.createChildWorktree({
+        repoPath: repo.path,
+        jobId: 'job-c',
+        childId: 'child-c1',
+        parentPath: jobLane.path,
+        authority: 'read-only',
+      });
+      expect(childLane.kind).toBe('child');
+      // A live child keeps the job release refused with a named reason.
+      const refused = await call(h.port, '/api/dispatch/release', { job_id: 'job-c' }, TOKEN);
+      expect(refused.status).toBe(409);
+      expect(field<string>(refused.json, 'error')).toBe('active_child_workers');
+      expect(field<readonly string[]>(refused.json, 'child_ids')).toEqual(['child-c1']);
+      // Once terminal, the job release sweeps the JOB lane only.
+      h.ledger.recordChildResult('child-c1', { state: 'done', summary: 'ok', ref: null });
+      const released = await call(h.port, '/api/dispatch/release', { job_id: 'job-c' }, TOKEN);
+      expect(released.status).toBe(200);
+      expect(field<string>(released.json, 'status')).toBe('swept');
+      expect(h.manager.getWorktree('job-c')?.status).toBe('swept');
+      expect(h.manager.getWorktree('child-c1')?.status).toBe('active'); // untouched
     } finally {
       await h.close();
     }

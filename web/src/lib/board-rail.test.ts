@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { boardKpis } from './board-kpi.js';
 import { railChips } from './board-rail.js';
-import type { AgentView, BoardSnapshot, JobView } from './board-protocol.js';
+import type { AgentView, BoardSnapshot, ChildWorkerCounts, JobView } from './board-protocol.js';
 
 /**
  * The v6 status chip rail: seven chips in fixed order, the v4 health
@@ -33,7 +33,11 @@ function agent(id: string, state: string, role = 'minion'): AgentView {
   return { id, role, label: id, state, lastActivity: null, sessionFile: null, jobId: null, roundId: null, supervision: null };
 }
 
-function snapshot(jobs: readonly JobView[], agents: readonly AgentView[] = []): BoardSnapshot {
+function snapshot(
+  jobs: readonly JobView[],
+  agents: readonly AgentView[] = [],
+  children: ChildWorkerCounts | null = { queued: 2, active: 3, finished: 5, lifetimeCreations: 10 },
+): BoardSnapshot {
   return {
     repos: [{ name: 'demo', jobs }],
     agents,
@@ -57,6 +61,7 @@ function snapshot(jobs: readonly JobView[], agents: readonly AgentView[] = []): 
     silas: null,
     verify: null,
     selfHeal: null,
+    children,
   };
 }
 
@@ -94,14 +99,15 @@ describe('board rail — chips (v6)', () => {
     ]);
   });
 
-  it('folds three KPI groups (heists/PRs/crew) into the trackers chip', () => {
+  it('folds the KPI groups (heists/PRs/crew/children) into the trackers chip', () => {
     const chips = railChips(snapshot([job('w1', 'working')]), NOW);
     const trackers = chips.find((chip) => chip.id === 'trackers');
-    expect(trackers?.kpis?.map((group) => group.label)).toEqual(['HEISTS', 'PRS', 'CREW']);
+    expect(trackers?.kpis?.map((group) => group.label)).toEqual(['HEISTS', 'PRS', 'CREW', 'CHILDREN']);
     expect(trackers?.kpis?.map((group) => group.title)).toEqual([
       'working / in-review / merged / done / parked',
       'open / conflicting / merged today',
       'live minions / crew mid-turn / crew disposed',
+      'child workers active / queued / finished / created (lifetime logical creations)',
     ]);
     // CREW, not MINIONS: midTurn/disposed count every agent (gru, silas,
     // lens children too) — the label must not promise minions only.
@@ -111,9 +117,25 @@ describe('board rail — chips (v6)', () => {
       'lanes.midTurn',
       'lanes.disposed',
     ]);
+    // Issue #161: the children group carries present-state counts plus
+    // the lifetime logical-creation counter.
+    expect(trackers?.kpis?.[3]?.values.map((value) => value.kpi)).toEqual([
+      'children.active',
+      'children.queued',
+      'children.finished',
+      'children.lifetimeCreations',
+    ]);
     // The health chips carry no folded counts (their flags are the health
     // card's own sub-badge — e.g. REVIEWS carries "12 FAILED").
     expect(chips.filter((chip) => chip.id !== 'trackers').every((chip) => chip.kpis === undefined)).toBe(true);
+  });
+
+  it('omits the CHILDREN group when the server reports no child counters (unknown ≠ zero)', () => {
+    const chips = railChips(snapshot([job('w1', 'working')], [], null), NOW);
+    const trackers = chips.find((chip) => chip.id === 'trackers');
+    expect(trackers?.kpis?.map((group) => group.label)).toEqual(['HEISTS', 'PRS', 'CREW']);
+    const keys = [...(trackers?.kpis ?? [])].flatMap((group) => group.values.map((value) => value.kpi));
+    expect(keys.some((key) => key.startsWith('children.'))).toBe(false);
   });
 
   it('labels every folded count beside its number (v6.1 ruling 5)', () => {
@@ -137,6 +159,10 @@ describe('board rail — chips (v6)', () => {
       'minions',
       'mid-turn',
       'disposed',
+      'active',
+      'queued',
+      'finished',
+      'created',
     ]);
     // No bare slash counters survive — the operator reads the label order.
     expect(trackers?.kpis?.every((group) => group.values.every((value) => value.label !== undefined))).toBe(true);
@@ -176,6 +202,16 @@ describe('board rail — chips (v6)', () => {
     expect(values.get('lanes.liveMinions')).toBe(kpis.lanes.liveMinions);
     expect(values.get('lanes.midTurn')).toBe(kpis.lanes.midTurn);
     expect(values.get('lanes.disposed')).toBe(kpis.lanes.disposed);
+    expect(kpis.children).not.toBeNull();
+    expect(values.get('children.active')).toBe(kpis.children!.active);
+    expect(values.get('children.queued')).toBe(kpis.children!.queued);
+    expect(values.get('children.finished')).toBe(kpis.children!.finished);
+    expect(values.get('children.lifetimeCreations')).toBe(kpis.children!.lifetimeCreations);
+    // Nonzero on purpose: hard-coded zeros must not pass this check.
+    expect(values.get('children.active')).toBe(3);
+    expect(values.get('children.queued')).toBe(2);
+    expect(values.get('children.finished')).toBe(5);
+    expect(values.get('children.lifetimeCreations')).toBe(10);
 
     // Spot-check the derivation itself so the comparison is not vacuous.
     expect(values.get('jobs.total')).toBe(8);

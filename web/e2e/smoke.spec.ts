@@ -1,4 +1,6 @@
-import { expect, test, type Page } from '@playwright/test';
+import fs from 'node:fs';
+import path from 'node:path';
+import { expect, test, type Locator, type Page } from '@playwright/test';
 import { WebSocket, type RawData } from 'ws';
 
 /** The mock's token — same env knob the mock itself reads (GRU_MOCK_TOKEN, default 'dev-token'). */
@@ -25,6 +27,47 @@ async function pairMobile(page: Page): Promise<void> {
   await page.locator('#pair-token').fill(MOCK_TOKEN);
   await page.locator('#pair-submit').click();
   await expect(page.locator('#board-view')).toBeVisible();
+}
+
+/** Private browser-evidence for the PR-number label (j-982): the actual
+ * row in light/dark, desktop/phone. The capture root is gitignored; the
+ * files stay in the lane worktree for the human/vision review. */
+const PR_NUMBER_CAPTURE_DIR = path.join(
+  import.meta.dirname,
+  '..',
+  '..',
+  '_bmad-output',
+  'board-pr-number-links',
+  'captures',
+);
+
+async function capturePrNumberRow(row: Locator, name: string): Promise<void> {
+  fs.mkdirSync(PR_NUMBER_CAPTURE_DIR, { recursive: true });
+  await row.scrollIntoViewIfNeeded();
+  await row.screenshot({ path: path.join(PR_NUMBER_CAPTURE_DIR, `${name}.png`) });
+}
+
+/** A capture run must start from an empty directory: images left by an
+ * earlier head must never survive a failed run as apparent current-head
+ * evidence for the human/vision review. `force` covers the normal
+ * first-run absence; real removal failures still throw. */
+function clearPrNumberCaptures(): void {
+  fs.rmSync(PR_NUMBER_CAPTURE_DIR, { recursive: true, force: true });
+}
+
+/** The numbered label must be visible as text, inside the row meta line
+ * and never clipped (j-982 acceptance D). */
+async function expectPrLabelFits(row: Locator): Promise<void> {
+  const link = row.locator('.board-job__pr');
+  await expect(link).toBeVisible();
+  const meta = row.locator('.board-job__meta');
+  const [labelBox, metaBox] = await Promise.all([link.boundingBox(), meta.boundingBox()]);
+  expect(labelBox, 'numbered PR link has a box').not.toBeNull();
+  expect(metaBox, 'row meta line has a box').not.toBeNull();
+  expect(labelBox!.x).toBeGreaterThanOrEqual(metaBox!.x - 1);
+  expect(labelBox!.x + labelBox!.width).toBeLessThanOrEqual(metaBox!.x + metaBox!.width + 1);
+  const clipped = await link.evaluate((node) => node.scrollWidth > node.clientWidth + 1);
+  expect(clipped, 'label not clipped inside the link').toBe(false);
 }
 
 async function sendAndWaitReply(page: Page, text: string): Promise<void> {
@@ -89,6 +132,29 @@ test('multi-line composer (desktop, fine pointer): Shift+Enter newlines, grows w
     .poll(async () => (await input.boundingBox())!.height)
     .toBeLessThanOrEqual(restHeight + 1);
   await expect(input).toHaveValue('');
+});
+
+test('held Enter auto-repeat never refills the cleared composer (#26, real browser)', async ({ page }) => {
+  await pair(page);
+  const input = page.locator('#chat-input');
+  await input.fill('hold it boss');
+
+  // A physical hold: one keydown sends, then the browser's auto-repeats
+  // arrive before the keyup. Playwright marks every down after the first
+  // on a held key as a repeat, so Chromium's default would insert newlines
+  // if the handler let the repeats keep their native action.
+  await page.keyboard.down('Enter');
+  await page.keyboard.down('Enter');
+  await page.keyboard.down('Enter');
+  await page.keyboard.up('Enter');
+
+  // The first press sent exactly one message; the repeats typed nothing
+  // into the composer the send cleared.
+  await expect(input).toHaveValue('');
+  await expect(page.locator('.msg--user', { hasText: 'hold it boss' })).toHaveCount(1);
+  const reply = page.locator('.msg--gru', { hasText: `You said: "hold it boss"` });
+  await expect(reply).toBeVisible();
+  await expect(reply).not.toHaveClass(/msg--streaming/);
 });
 
 test('composer caps at ~10rem and scrolls internally past the cap', async ({ page }) => {
@@ -378,7 +444,7 @@ test('mock controls reject missing/wrong tokens without state changes and valid 
   await pair(page);
   await sendAndWaitReply(page, 'control-state-survives');
 
-  for (const route of ['__pulse', '__drop', '__reset', '__stress', '__compact-fail', '__new-chat-fail']) {
+  for (const route of ['__pulse', '__drop', '__reset', '__stress', '__compact-fail', '__new-chat-fail', '__board-mode']) {
     const missing = await page.request.post(`http://localhost:8788/${route}`);
     expect(missing.status(), `${route} missing token`).toBe(401);
     const wrong = await page.request.post(`http://localhost:8788/${route}`, {
@@ -386,6 +452,21 @@ test('mock controls reject missing/wrong tokens without state changes and valid 
     });
     expect(wrong.status(), `${route} wrong token`).toBe(401);
   }
+
+  // The board-mode control validates its body: only the two known modes
+  // pass, and a valid mode returns 200 without touching frame state.
+  for (const body of [{}, { mode: 'nope' }, { mode: 7 }]) {
+    const bad = await page.request.post('http://localhost:8788/__board-mode', {
+      headers: { authorization: `Bearer ${MOCK_TOKEN}` },
+      data: body,
+    });
+    expect(bad.status(), `__board-mode invalid body ${JSON.stringify(body)}`).toBe(400);
+  }
+  const modeOk = await page.request.post('http://localhost:8788/__board-mode', {
+    headers: { authorization: `Bearer ${MOCK_TOKEN}` },
+    data: { mode: 'default' },
+  });
+  expect(modeOk.ok()).toBe(true);
 
   // A denied drop did not touch the live socket, and a denied reset did not
   // clear durable mock history.
@@ -463,9 +544,12 @@ test.describe('board (E6, mock feed)', () => {
     const band = page.locator('#board-owner');
     await expect(band).toBeVisible();
     await expect(band.locator('.board-band__label')).toHaveText('FOR YOU');
-    // The mock owes two owner actions: one unacked needs-owner stop and
-    // one evidence-bound ready PR — the count is owed actions, not rows.
-    await expect(band.locator('.board-band__count')).toHaveText('2 pending');
+    // The combined fixtures owe three owner actions: crash-loop and
+    // provider-wall stops plus one evidence-bound ready PR.
+    await expect(band.locator('.board-band__count')).toHaveText('3 pending');
+    const providerStop = band.locator('.board-owner__row', { hasText: 'Agent mock-minion-quota stopped: quota wall' });
+    await expect(providerStop).toBeVisible();
+    await expect(providerStop.locator('.board-owner__ack')).toHaveText('Ack');
     // The owner stop carries its Ack control and the honest scope copy.
     const stop = band.locator('.board-owner__row', { hasText: 'Crash-loop breaker tripped' });
     await expect(stop).toBeVisible();
@@ -517,21 +601,106 @@ test.describe('board (E6, mock feed)', () => {
     await expect(signal).toContainText('1 blocker');
     await expect(page.locator('#board-unacked')).toContainText('needs Gru');
 
-    // Expand the row, then the round row: all 7 lens chips appear.
+    // Expand the row, then the round row: all 9 lens chips appear.
     await job.locator('.board-job__toggle').click();
     await expect(job).toHaveAttribute('data-expanded', 'true');
     await expect(job.locator('.board-lane')).toBeVisible();
     const round = job.locator('.board-round__toggle');
-    await expect(round).toContainText('3/7 lenses');
+    await expect(round).toContainText('3/9 lenses');
     await expect(round).toContainText('1 blocker');
     await round.click();
-    await expect(page.locator('.board-lens')).toHaveCount(7);
+    await expect(page.locator('.board-lens')).toHaveCount(9);
     // The standing crew is on the rail.
     await expect(page.locator('#board-agents .board-agent', { hasText: 'silas' })).toBeVisible();
     // The notification center opens with the sample feed.
     await page.locator('#notification-bell').click();
     await expect(page.locator('.board-notification').first()).toBeVisible();
     await page.locator('#notification-bell').click();
+  });
+
+  test('PR numbers: each heist link shows its canonical request number', async ({
+    page,
+  }) => {
+    await pair(page);
+    await expect(page.locator('#board-view')).toBeVisible();
+    // GitHub /pull/ route: the number rides the visible label; href,
+    // new-tab target and noreferrer semantics are untouched.
+    const gh = page.locator('.board-job', { hasText: 'Merge main into the retry branch' });
+    await expect(gh.locator('.board-job__pr')).toHaveText('PR #43 ↗');
+    await expect(gh.locator('.board-job__pr')).toHaveAttribute(
+      'href',
+      'https://github.com/acme/demo-api/pull/43',
+    );
+    await expect(gh.locator('.board-job__pr')).toHaveAttribute('target', '_blank');
+    await expect(gh.locator('.board-job__pr')).toHaveAttribute('rel', 'noreferrer');
+    // GitLab /-/merge_requests/ route: same contract, its own number —
+    // no shared/stale constant across heists.
+    const gl = page.locator('.board-job', { hasText: 'Landing copy refresh' });
+    await expect(gl.locator('.board-job__pr')).toHaveText('PR #42 ↗');
+    await expect(gl.locator('.board-job__pr')).toHaveAttribute(
+      'href',
+      'https://gitlab.demo.invalid/sample/sample-site/-/merge_requests/42',
+    );
+  });
+
+  test('a numbered PR link keeps external navigation and never toggles the heist disclosure', async ({
+    page,
+  }) => {
+    // Fixture links must never hit the network from a test run.
+    await page.context().route('https://github.com/**', (route) => route.abort());
+    await pair(page);
+    await expect(page.locator('#board-view')).toBeVisible();
+    const row = page.locator('.board-job', { hasText: 'Merge main into the retry branch' });
+    const link = row.locator('.board-job__pr');
+    await expect(row).toHaveAttribute('data-expanded', 'false');
+    await expect(link).toHaveText('PR #43 ↗');
+    // Keyboard activation opens the external destination in a new tab and
+    // leaves the disclosure closed (the click must not bubble to the row).
+    await link.focus();
+    const popupPromise = page.waitForEvent('popup');
+    await page.keyboard.press('Enter');
+    const popup = await popupPromise;
+    await popup.close();
+    await expect(row).toHaveAttribute('data-expanded', 'false');
+    // Pointer activation behaves the same.
+    const pointerPopupPromise = page.waitForEvent('popup');
+    await link.click();
+    const pointerPopup = await pointerPopupPromise;
+    await pointerPopup.close();
+    await expect(row).toHaveAttribute('data-expanded', 'false');
+    // The heist name/status face is untouched by the label change.
+    await expect(row.locator('.board-job__name')).toHaveText('Merge main into the retry branch');
+    await expect(row.locator('.board-job__status')).toHaveText('in-review');
+  });
+
+  test('PR number label: row captures in light/dark, desktop/phone (private evidence)', async ({ page }) => {
+    // Stale-evidence guard: clear before anything can fail mid-run.
+    clearPrNumberCaptures();
+    await pair(page);
+    await expect(page.locator('#board-view')).toBeVisible();
+    const row = page.locator('.board-job', { hasText: 'Merge main into the retry branch' });
+    await expect(row.locator('.board-job__pr')).toHaveText('PR #43 ↗');
+    // Desktop, light first.
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await expect(page.locator('html')).not.toHaveClass(/dark/);
+    await expectPrLabelFits(row);
+    await capturePrNumberRow(row, 'pr-number-desktop-light');
+    await page.locator('#theme-toggle').click();
+    await expect(page.locator('html')).toHaveClass(/dark/);
+    await expectPrLabelFits(row);
+    await capturePrNumberRow(row, 'pr-number-desktop-dark');
+    // Back to light before the phone pair so each capture sits in one theme.
+    await page.locator('#theme-toggle').click();
+    await expect(page.locator('html')).not.toHaveClass(/dark/);
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expect(page.locator('#board-view')).toBeVisible();
+    await expect(row.locator('.board-job__pr')).toHaveText('PR #43 ↗');
+    await expectPrLabelFits(row);
+    await capturePrNumberRow(row, 'pr-number-phone-light');
+    await page.locator('#theme-toggle').click();
+    await expect(page.locator('html')).toHaveClass(/dark/);
+    await expectPrLabelFits(row);
+    await capturePrNumberRow(row, 'pr-number-phone-dark');
   });
 
   test('v6: the chip rail carries the v4 health row + folded KPI counts, bands stay ordered', async ({ page }) => {
@@ -584,11 +753,130 @@ test.describe('board (E6, mock feed)', () => {
       .locator('.board-band--in-flight .board-band__head')
       .evaluate((node) => getComputedStyle(node).position);
     expect(bandSticky).toBe('sticky');
-    await expect(page.locator('.board-band--settled .board-band__count')).toHaveText('12 heists');
+    await expect(page.locator('.board-band--settled .board-band__count')).toHaveText('13 heists');
     // The stalled working lane sank to COLD carrying the stale flag.
     const stalled = page.locator('.board-band--cold .board-job', { hasText: 'Backfill the audit log' });
     await expect(stalled).toBeVisible();
     await expect(stalled.locator('.board-job__stale')).toHaveText('stalled');
+  });
+
+  test('section truth: a merged leftover leaves NEEDS GRU; a quota-walled lane waits with its reason', async ({ page }, testInfo) => {
+    await page.setViewportSize({ width: 1440, height: 1200 });
+    await pair(page);
+    await expect(page.locator('#board-view')).toBeVisible();
+
+    // Exercise the same acceptance assertions in BOTH themes and retain
+    // the captures. The scheduled board-browser scope gives this test a
+    // unique output directory under the lane's artifact root.
+    for (const theme of ['light', 'dark']) {
+      if (theme === 'dark') await page.locator('#theme-toggle').click();
+      if (theme === 'light') await expect(page.locator('html')).not.toHaveClass(/dark/);
+      else await expect(page.locator('html')).toHaveClass(/dark/);
+
+      // The settled band is a rolling window: the receipt can sit behind
+      // the "+K older settled" expander depending on its recency rank.
+      // Expand once so the assertion never depends on fixture ordering.
+      const more = page.locator('.board-band--settled .board-band__more');
+      if ((await more.count()) > 0) await more.click();
+
+      // The merged lane with a leftover unacked escalation row is a closed
+      // receipt: SETTLED, no signal chip, never a NEEDS GRU queue entry.
+      const receipt = page.locator('.board-band--settled .board-job', { hasText: 'Rotate the staging tokens' });
+      await expect(receipt).toBeVisible();
+      await expect(receipt).toHaveAttribute('data-status', 'merged');
+      await expect(receipt.locator('.board-job__signal')).toHaveCount(0);
+      await expect(
+        page.locator('.board-band--needs-you .board-job', { hasText: 'Rotate the staging tokens' }),
+      ).toHaveCount(0);
+
+      // The quota-walled lane shows its true state: waiting on the provider,
+      // never a bare "working" and never stalled/COLD.
+      const walled = page.locator('.board-band--in-flight .board-job', { hasText: 'Migrate the search index' });
+      await expect(walled).toBeVisible();
+      await expect(walled).toHaveAttribute('data-worker-state', 'waiting');
+      await expect(walled.locator('.board-job__status')).toHaveText('waiting · quota wall');
+      await expect(walled.locator('.board-job__stale')).toHaveCount(0);
+
+      // COLD is still for genuinely silent working lanes.
+      const silent = page.locator('.board-band--cold .board-job', { hasText: 'Backfill the audit log' });
+      await expect(silent.locator('.board-job__stale')).toHaveText('stalled');
+      await expect(silent.locator('.board-job__status')).toHaveText('working');
+
+      // Chip and bands agree: only the live machine row (mock-n5) counts.
+      await expect(page.locator('#board-unacked')).toContainText('1 needs Gru');
+      // Scoped acceptance clips (tracked-review A10): the full-page capture
+      // is taken under sticky chrome that can occlude the IN FLIGHT band,
+      // so the NEEDS GRU band and the waiting row get their own clips — the
+      // band shows the closed-receipt exclusion, the row shows the
+      // stopped-lane waiting state directly. The band sits directly under
+      // the sticky chip rail, so center each element before its clip — a
+      // minimal scroll would leave the rail overlaying the capture.
+      const needsGruBand = page.locator('.board-band--needs-you');
+      await needsGruBand.evaluate((node) => node.scrollIntoView({ block: 'center' }));
+      await needsGruBand.screenshot({ path: testInfo.outputPath(`board-truth-needs-gru-${theme}.png`) });
+      await walled.evaluate((node) => node.scrollIntoView({ block: 'center' }));
+      await walled.screenshot({ path: testInfo.outputPath(`board-truth-waiting-${theme}.png`) });
+      await page.screenshot({ path: testInfo.outputPath(`board-truth-${theme}.png`), fullPage: true });
+
+      // The bell keeps the durable record: the merged lane's leftover row
+      // renders as a closed receipt under FEED, not as live NEEDS GRU work.
+      await page.locator('#notification-bell').click();
+      const closedRow = page.locator('.board-notification[data-receipt="closed"]', {
+        hasText: 'Leftover machine escalation on the merged lane',
+      });
+      await expect(closedRow).toBeVisible();
+      await expect(closedRow).toContainText('closed receipt');
+      const needsGruSection = page.locator('.board-notification-section').filter({
+        has: page.locator('.board-notification-section__head', { hasText: 'NEEDS GRU' }),
+      });
+      await expect(
+        needsGruSection.locator('.board-notification', { hasText: 'Leftover machine escalation on the merged lane' }),
+      ).toHaveCount(0);
+      // The FEED receipt sits below the panel's scroll fold; bring it into
+      // the panel's own view with a natural scroll (no forced clicks) so the
+      // retained capture actually witnesses the closed-receipt claim (A6).
+      await closedRow.evaluate((node) => node.scrollIntoView({ block: 'center' }));
+      await page.screenshot({ path: testInfo.outputPath(`board-truth-${theme}-bell.png`), fullPage: true });
+      await page.locator('#notification-bell').click();
+    }
+  });
+
+  test('section truth: the empty NEEDS GRU clear state holds in light and dark', async ({ page }, testInfo) => {
+    await page.setViewportSize({ width: 1440, height: 1200 });
+    await pair(page);
+    await expect(page.locator('#board-view')).toBeVisible();
+
+    // The clear variant removes every live machine row and needs-you cause,
+    // so the calm green empty state (not absence) is what renders.
+    try {
+      const mode = await page.request.post('http://localhost:8788/__board-mode', {
+        headers: { authorization: `Bearer ${MOCK_TOKEN}` },
+        data: { mode: 'clear-needs-you' },
+      });
+      expect(mode.ok()).toBe(true);
+      await page.reload();
+      await expect(page.locator('#board-view')).toBeVisible();
+
+      for (const theme of ['light', 'dark']) {
+        if (theme === 'dark') await page.locator('#theme-toggle').click();
+        if (theme === 'light') await expect(page.locator('html')).not.toHaveClass(/dark/);
+        else await expect(page.locator('html')).toHaveClass(/dark/);
+
+        const clear = page.locator('.board-band--needs-you .board-band__clear');
+        await expect(clear).toBeVisible();
+        await expect(clear.locator('.board-band__clear-text')).toHaveText('nothing needs Gru');
+        await expect(clear.locator('.board-band__clear-hint')).toHaveText('the crew is on it');
+        await expect(page.locator('#board-unacked')).toBeHidden();
+        await page.screenshot({ path: testInfo.outputPath(`board-truth-empty-${theme}.png`), fullPage: true });
+      }
+    } finally {
+      // The mock server is shared across specs: restore the default board
+      // so later tests never inherit the clear variant.
+      await page.request.post('http://localhost:8788/__board-mode', {
+        headers: { authorization: `Bearer ${MOCK_TOKEN}` },
+        data: { mode: 'default' },
+      });
+    }
   });
 
   test('row disclosure persists per job across a reload (v3)', async ({ page }) => {
@@ -636,7 +924,7 @@ test.describe('board (E6, mock feed)', () => {
 
     // Round header: lens count, blockers, elapsed; chips behind the row.
     const round = card.locator('.board-round__toggle');
-    await expect(round).toContainText('/7 lenses');
+    await expect(round).toContainText('/9 lenses');
     await expect(round.locator('.board-round__blockers')).toContainText('1 blocker');
     await expect(round.locator('.board-round__elapsed')).toContainText('elapsed');
     await round.click();
@@ -657,7 +945,7 @@ test.describe('board (E6, mock feed)', () => {
       .toMatch(/^CREW \(\d+\)$/);
     await expect(page.locator('.agents-rail__tabs')).toHaveAttribute('aria-label', 'Crew and transcripts');
     await expect(rail.locator('.board-agent--disposed')).toHaveCount(0);
-    const toggle = rail.locator('.board-agent-toggle');
+    const toggle = rail.locator(".board-agent-toggle[data-section='disposed']");
     await expect(toggle).toContainText('1 disposed');
     await toggle.click();
     await expect(rail.locator('.board-agent--disposed')).toHaveCount(1);
@@ -704,6 +992,61 @@ test.describe('board (E6, mock feed)', () => {
       }
       await page.setViewportSize({ width: 1280, height: 900 });
     }
+  });
+  test('crew rail truth (#171): historical sessions collapse behind history; raw-idle open work reads streaming', async ({ page }) => {
+    await pair(page);
+    await expect(page.locator('#board-view')).toBeVisible();
+    const rail = page.locator('#board-agents');
+
+    // One live Silas (mock-silas) — the September Silas epoch and the
+    // September minion are VERIFIED-HISTORICAL: not counted as crew, not
+    // sorted into it, disclosed behind their own history toggle. The two
+    // crew-heist-labels demo minions join the live crew (10).
+    await expect
+      .poll(async () => (await page.locator('#rail-tab-agents').textContent())?.trim() ?? '')
+      .toBe('CREW (10)');
+    await expect(rail.locator('.board-agent--historical')).toHaveCount(0);
+    const historyToggle = rail.locator(".board-agent-toggle[data-section='history']");
+    await expect(historyToggle).toContainText('2 history');
+    await historyToggle.click();
+    const historical = rail.locator('.board-agent--historical');
+    await expect(historical).toHaveCount(2);
+    await expect(historical.filter({ hasText: 'Sept 29' }).first()).toBeVisible();
+    // The history rows disclose their classification explicitly.
+    await expect(historical.first().locator('.board-agent__runtime--historical')).toContainText('history');
+
+    // The misleading-idle defect: mock-gru's raw adapter state is `idle`
+    // while supervision sees an open turn + fresh events — the rail must
+    // present the work it is doing (streaming + a fresh quiet clock),
+    // never a settled idle chip.
+    const gru = rail.locator('.board-agent', { hasText: 'gru · chat' });
+    await expect(gru.locator('.board-agent__state')).toHaveText('streaming');
+    await expect(gru.locator('.board-agent__age')).toContainText(/quiet/);
+
+    // Owner-held stop: the released handle left the record disposed, but
+    // the live crew keeps the lane with its stopped mark (never the
+    // graveyard behind the disposed toggle).
+    const held = rail.locator('.board-agent', { hasText: 'held-after-breaker' });
+    await expect(held.locator('.board-agent__supervision--alert')).toHaveText('⛔ stopped');
+    await expect(rail.locator(".board-agent-toggle[data-section='disposed']")).toContainText('1 disposed');
+
+    // Acceptance evidence: the same truth under the dark theme.
+    await page.locator('#theme-toggle').click();
+    await expect(page.locator('html')).toHaveClass(/dark/);
+    await expect(gru.locator('.board-agent__state')).toHaveText('streaming');
+    await expect(historyToggle).toContainText('2 history');
+    await expect(historical).toHaveCount(2);
+    await page.locator('#theme-toggle').click();
+
+    // Acceptance evidence: the same truth in a narrow phone viewport.
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expect(gru.locator('.board-agent__state')).toHaveText('streaming');
+    await expect(historical).toHaveCount(2);
+    await expect(historical.first().locator('.board-agent__runtime--historical')).toContainText('history');
+    const fits = await page.evaluate(
+      () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
+    );
+    expect(fits).toBe(true);
   });
 
   test('trackers render in dark theme and on a narrow phone viewport', async ({ page }) => {
@@ -795,12 +1138,12 @@ test.describe('cockpit layout (v6)', () => {
       .poll(async () => Math.abs((await page.locator('#chat-main-mount').boundingBox())!.width - chatBox.width))
       .toBeLessThanOrEqual(2);
 
-    // The settled window rolls: 12 settled → 10 rows + a +2 footer.
+    // The settled window rolls: 13 settled → 10 rows + a +3 footer.
     await expect(page.locator('.board-band--settled .board-job')).toHaveCount(10);
     const more = page.locator('.board-band--settled .board-band__more');
-    await expect(more).toHaveText('+2 older settled');
+    await expect(more).toHaveText('+3 older settled');
     await more.click();
-    await expect(page.locator('.board-band--settled .board-job')).toHaveCount(12);
+    await expect(page.locator('.board-band--settled .board-job')).toHaveCount(13);
     await expect(page.locator('.board-band--settled .board-band__more')).toHaveCount(0);
 
     // The FAB collapses the pane to the slim rail (and back); the choice persists.

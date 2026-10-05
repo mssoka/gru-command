@@ -130,10 +130,27 @@ function doubleInvocations(fx: Fixture): {
   stdin: string;
 }[] {
   if (!existsSync(fx.doubleLog)) return [];
-  return readFileSync(fx.doubleLog, 'utf-8')
-    .trim()
-    .split('\n')
-    .map((line) => JSON.parse(line) as never);
+  const records: {
+    argv: string[];
+    cwd: string;
+    prompt: string;
+    images: number;
+    sessionId: string;
+    stdin: string;
+  }[] = [];
+  for (const raw of readFileSync(fx.doubleLog, 'utf-8').split('\n')) {
+    const line = raw.trim();
+    if (line === '') continue;
+    try {
+      records.push(JSON.parse(line) as never);
+    } catch {
+      // A concurrent appendFileSync can expose a partially written trailing
+      // record; the callers' waitFor loops retry until the write completes
+      // (code review: the CI Full suite crashed on a mid-append read).
+      break;
+    }
+  }
+  return records;
 }
 
 /** Direct bridge-socket probe: the same newline-delimited wire the bundled
@@ -920,37 +937,54 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       config: loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester'), store: fx.store,
       binary: DOUBLE, reviewSettingsFile: settingsFile,
     });
-    const reviewDirs = () => readdirSync(tmpdir()).filter((name) => name.startsWith('gru-claude-review-')).sort();
-    const before = new Set(reviewDirs());
-    const newlyRetained = () => reviewDirs().filter((name) => !before.has(name));
-    process.env['CLAUDE_DOUBLE_EXPECT_REVIEW_AUTH'] = 'env';
-    writeFileSync(settingsFile, JSON.stringify({ env: { ANTHROPIC_API_KEY: 'bad-key' } }));
-    await expect(runtime.prepareReviewModel('perkins')).rejects.toThrow(/not configured\/authed/);
-    expect(newlyRetained()).toEqual([]);
-    writeFileSync(settingsFile, JSON.stringify({ env: { ANTHROPIC_API_KEY: 'test-key' } }));
-    const snapshot = await runtime.prepareReviewModel('perkins');
-    expect(newlyRetained()).toEqual([]);
-    const goodProbe = doubleInvocations(fx)[0]!;
-    const settingsPath = goodProbe.argv[goodProbe.argv.indexOf('--settings') + 1]!;
-    expect(existsSync(settingsPath)).toBe(false);
-    await expect(runtime.spawn('perkins', {
-      reviewModel: { ...snapshot, role: 'gru' },
-      isolatedReview: { systemPrompt: 'lens', tools: [] },
-    })).rejects.toThrow(/snapshot belongs to gru/);
-    await expect(runtime.spawn('perkins', {
-      reviewModel: snapshot,
-      reviewLead: { systemPrompt: 'lead', tools: [], nativeTools: [
-        { name: 'invalid', description: 'rejected', inputSchema: {}, execute: async () => ({ text: '' }) },
-      ] },
-    })).rejects.toThrow(/invalid or duplicate native review tool name/);
-    expect(newlyRetained()).toEqual([]);
-    expect(doubleInvocations(fx)).toHaveLength(1);
-    const recovered = await runtime.spawn('perkins', {
-      reviewModel: snapshot, isolatedReview: { systemPrompt: 'lens', tools: [] },
-    });
-    try { await recovered.prompt('review'); } finally { await recovered.dispose(); }
-    expect(newlyRetained()).toEqual([]);
-    expect(doubleInvocations(fx)).toHaveLength(2);
+    // Confine credential settings dirs to this test's own TMPDIR: the
+    // machine tmpdir is shared with other suites, other lanes, and the
+    // live service, so a concurrent producer's live dir must never read
+    // as this runtime's leak (same ownership rule as the bridge tests).
+    const ownedTmp = mkdtempSync(join(tmpdir(), 'claude-settings-tmp-'));
+    cleanupDirs.push(ownedTmp);
+    const previousTmpdir = process.env['TMPDIR'];
+    process.env['TMPDIR'] = ownedTmp;
+    try {
+      const newlyRetained = () =>
+        readdirSync(ownedTmp).filter((name) => name.startsWith('gru-claude-review-')).sort();
+      process.env['CLAUDE_DOUBLE_EXPECT_REVIEW_AUTH'] = 'env';
+      writeFileSync(settingsFile, JSON.stringify({ env: { ANTHROPIC_API_KEY: 'bad-key' } }));
+      await expect(runtime.prepareReviewModel('perkins')).rejects.toThrow(/not configured\/authed/);
+      expect(newlyRetained()).toEqual([]);
+      writeFileSync(settingsFile, JSON.stringify({ env: { ANTHROPIC_API_KEY: 'test-key' } }));
+      const snapshot = await runtime.prepareReviewModel('perkins');
+      expect(newlyRetained()).toEqual([]);
+      const goodProbe = doubleInvocations(fx)[0]!;
+      const settingsPath = goodProbe.argv[goodProbe.argv.indexOf('--settings') + 1]!;
+      // The probe must have used the owned root, or the scoped scan above
+      // could go blind instead of catching a genuine retained dir.
+      expect(settingsPath.startsWith(ownedTmp)).toBe(true);
+      expect(existsSync(settingsPath)).toBe(false);
+      await expect(runtime.spawn('perkins', {
+        reviewModel: { ...snapshot, role: 'gru' },
+        isolatedReview: { systemPrompt: 'lens', tools: [] },
+      })).rejects.toThrow(/snapshot belongs to gru/);
+      await expect(runtime.spawn('perkins', {
+        reviewModel: snapshot,
+        reviewLead: { systemPrompt: 'lead', tools: [], nativeTools: [
+          // A general native name is allowed since #161; a malformed one
+          // (space/case) is still rejected at bridge start.
+          { name: 'bad name!', description: 'rejected', inputSchema: {}, execute: async () => ({ text: '' }) },
+        ] },
+      })).rejects.toThrow(/invalid or duplicate native tool name/);
+      expect(newlyRetained()).toEqual([]);
+      expect(doubleInvocations(fx)).toHaveLength(1);
+      const recovered = await runtime.spawn('perkins', {
+        reviewModel: snapshot, isolatedReview: { systemPrompt: 'lens', tools: [] },
+      });
+      try { await recovered.prompt('review'); } finally { await recovered.dispose(); }
+      expect(newlyRetained()).toEqual([]);
+      expect(doubleInvocations(fx)).toHaveLength(2);
+    } finally {
+      if (previousTmpdir === undefined) delete process.env['TMPDIR'];
+      else process.env['TMPDIR'] = previousTmpdir;
+    }
   });
 
   it('keeps concurrent and successive review proofs independent on the same Claude adapter', async () => {
@@ -1138,6 +1172,36 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     }
     expect(review!.argv[review!.argv.indexOf('--tools') + 1]).toBe('Read,Grep,Glob,LS');
     expect(build!.argv[build!.argv.indexOf('--tools') + 1]).toBe('Read,Bash,Edit,Write,Grep,Glob,LS');
+    // Issue #161: a child worker's bounded authority reaches the CLI's
+    // own --tools allowlist, and its product-owned identity is honored.
+    const child = await fx.runtime.spawn('minion', {
+      agentId: 'child-owned-id',
+      roleTools: ['read', 'grep', 'find', 'ls'],
+    });
+    expect(child.id).toBe('child-owned-id');
+    await child.prompt('audit this');
+    await child.dispose();
+    const childInvocation = doubleInvocations(fx).at(-1)!;
+    expect(childInvocation.argv[childInvocation.argv.indexOf('--tools') + 1]).toBe('Read,Grep,Glob,LS');
+    // An override can only NARROW: an undeclared tool refuses loud.
+    await expect(
+      fx.runtime.spawn('perkins', { roleTools: ['undeclared-tool'] }),
+    ).rejects.toThrowError(/role tool override names "undeclared-tool"/);
+    // Issue #161 declared capability gap: non-review product-native tools
+    // cannot be hosted on claude-code (the MCP bridge is a discoverable
+    // same-uid socket); the refusal is loud, never a silent unhosted tool.
+    await expect(
+      fx.runtime.spawn('minion', {
+        nativeTools: [
+          {
+            name: 'request_child_worker',
+            description: 'x',
+            inputSchema: { type: 'object' },
+            execute: async () => ({ text: '' }),
+          },
+        ],
+      }),
+    ).rejects.toThrowError(/cannot host product-native non-review tools/);
     // The role prompt is the perkins/minion definition's own:
     expect(review!.argv[review!.argv.indexOf('--append-system-prompt') + 1]).toContain(
       'Whole-PR Review Lead',
@@ -1254,9 +1318,10 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     const handles: AgentHandle[] = [];
     const configFiles: string[] = [];
     try {
-      // Concurrency note: a hybrid round runs up to seven lens children at
-      // once; each gets its OWN bridge, and none may outlive its session.
-      for (let index = 0; index < 7; index += 1) {
+      // Concurrency note: a hybrid round runs as many concurrent lens
+      // children as its admitted wave allows (the catalog has nine lenses);
+      // each gets its OWN bridge, and none may outlive its session.
+      for (let index = 0; index < 9; index += 1) {
         const handle = await fx.runtime.spawn('perkins', {
           cwd: fx.workspace,
           isolatedReview: {
@@ -1279,8 +1344,8 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         expect(existsSync(dirname(configFile))).toBe(true);
       }
       // Distinct bridges, one per child — never a shared cross-child bridge.
-      expect(new Set(configFiles).size).toBe(7);
-      for (let index = 0; index < 7; index += 1) {
+      expect(new Set(configFiles).size).toBe(9);
+      for (let index = 0; index < 9; index += 1) {
         const listed = await bridgeProbe(configFiles[index]!, '__list__', {}) as Array<{ name: string }>;
         expect(listed.map((tool) => tool.name)).toEqual([`perkins_child_${index}`]);
       }
@@ -1347,9 +1412,9 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         movementRef: 'feature/review', noSpec: false,
       });
       expect(result.canonicalVerdict).toBe('READY TO MERGE');
-      expect(result.specialistRuns.filter((run) => run.status === 'valid')).toHaveLength(7);
+      expect(result.specialistRuns.filter((run) => run.status === 'valid')).toHaveLength(9);
       const invocations = doubleInvocations(fx);
-      expect(invocations).toHaveLength(8);
+      expect(invocations).toHaveLength(10);
       const lead = invocations.find((record) => record.prompt.includes('COMPLETE FROZEN DIFF (the whole change under review)'));
       expect(lead).toBeDefined();
       const configFile = lead!.argv[lead!.argv.indexOf('--mcp-config') + 1];
@@ -2223,12 +2288,12 @@ describe('ReviewMcpBridge fail-closed guards', () => {
   it('rejects invalid or duplicate native tool names at start', async () => {
     await expect(ReviewMcpBridge.start([{
       name: 'not-perkins-prefixed', description: 'x', inputSchema: { type: 'object' }, execute: async () => ({ text: '' }),
-    }])).rejects.toThrow(/invalid or duplicate native review tool name/u);
+    }])).rejects.toThrow(/invalid or duplicate native tool name/u);
     const tool = {
       name: 'perkins_ok', description: 'x', inputSchema: { type: 'object' }, execute: async () => ({ text: '' }),
     };
     await expect(ReviewMcpBridge.start([tool, { ...tool, name: 'perkins_ok' }]))
-      .rejects.toThrow(/invalid or duplicate native review tool name/u);
+      .rejects.toThrow(/invalid or duplicate native tool name/u);
   });
 
   it('rejects a tampered bundled MCP server before launching it', async () => {

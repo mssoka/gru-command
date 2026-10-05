@@ -1,9 +1,9 @@
 import { existsSync, chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { execFileSync, spawnSync } from 'node:child_process';
 import { createServer } from 'node:net';
 import { afterAll, describe, expect, it } from 'vitest';
+import { OwnedCommandTimeoutError, markFixtureStep, runOwnedCommand } from './helpers/harness-diagnostics.mjs';
 import { loadConfig, configPathFor } from '../src/config.js';
 import { probeRuntimes } from '../src/runtime/probe.js';
 import { formatHostForUrl, runFirstBootSmoke } from '../src/wizard/main.js';
@@ -345,23 +345,24 @@ describe('wizard pairing QR + repo discovery + runtime probe', () => {
 });
 
 describe('wizard CLI surface', () => {
-  it('interactive mode without a TTY exits 2 printing the terminal recovery command (Perkins r1 B1)', () => {
+  it('interactive mode without a TTY exits 2 printing the terminal recovery command (Perkins r1 B1)', async () => {
     const repoRoot = join(import.meta.dirname, '..');
-    // stdin: 'ignore' = not a TTY — exactly the piped one-liner's world.
+    // stdin is an already-ended pipe (runOwnedCommand) = not a TTY — the
+    // piped one-liner's world; GRU_COMMAND_TEST_NO_TTY pins the guard too.
     // GRU_COMMAND_HOME is isolated so the no-TTY guard never depends on
     // whether an ambient instance config exists (or whether the loader
     // accepts it): the guard must be reached on a fresh instance.
-    const res = spawnSync(process.execPath, [join(repoRoot, 'dist', 'wizard', 'main.js')], {
+    const res = await runOwnedCommand(process.execPath, [join(repoRoot, 'dist', 'wizard', 'main.js')], {
+      label: 'wizard (no TTY)',
+      deadlineMs: 30_000,
       env: {
         ...process.env,
         GRU_COMMAND_TEST_NO_TTY: '1',
         GRU_COMMAND_HOME: tempDir('gru-command-wizard-notty-'),
       },
-      stdio: ['ignore', 'pipe', 'pipe'],
-      timeout: 30_000,
     });
     expect(res.status).toBe(2);
-    const err = res.stderr?.toString('utf-8') ?? '';
+    const err = res.stderr;
     expect(err).toContain('no controlling terminal for interactive setup');
     // The recovery command names THIS checkout's install.sh — the user
     // copies it straight into a terminal.
@@ -444,49 +445,73 @@ describe('wizard CLI surface', () => {
     expect(seedAnswersFromConfig(fresh, null)).toBe(fresh);
   });
 
-  it('--answers without a JSON argument exits 2 with usage', () => {
+  it('--answers without a JSON argument exits 2 with usage', async () => {
     const repoRoot = join(import.meta.dirname, '..');
-    let status = 0;
-    try {
-      execFileSync('bash', ['-c', `node ${JSON.stringify(join(repoRoot, 'dist/wizard/main.js'))} --answers`], {
-        encoding: 'utf-8',
-        stdio: 'pipe',
-        env: process.env,
-      });
-    } catch (error) {
-      status = (error as { status?: number }).status ?? 1;
-    }
-    expect(status).toBe(2);
+    const res = await runOwnedCommand(process.execPath, [join(repoRoot, 'dist/wizard/main.js'), '--answers'], {
+      label: 'wizard --answers (missing argument)',
+      // Below the file's 120s heavy ceiling, so a stall reports its own deadline.
+      deadlineMs: 100_000,
+    });
+    expect(res.status).toBe(2);
   });
 
-  it('--answers rejects secrets (token) and non-object JSON with the documented errors', () => {
+  it('--answers rejects secrets (token) and non-object JSON with the documented errors', async () => {
     const repoRoot = join(import.meta.dirname, '..');
     const wizard = join(repoRoot, 'dist/wizard/main.js');
-    const runWizard = (answers: string): { status: number; stderr: string } => {
+    const runWizard = async (answers: string): Promise<{ status: number; stdout: string; stderr: string }> => {
       try {
-        const out = execFileSync('bash', ['-c', `node ${JSON.stringify(wizard)} --answers ${JSON.stringify(answers)}`], {
-          encoding: 'utf-8',
-          stdio: ['ignore', 'pipe', 'pipe'],
+        const res = await runOwnedCommand(process.execPath, [wizard, '--answers', answers], {
+          label: 'wizard --answers <json>',
+          // Four sequential runs: 4 × 25s stays below the 120s heavy ceiling.
+          deadlineMs: 25_000,
           env: { ...process.env, GRU_COMMAND_HOME: tempDir('gru-command-wizard-answers-') },
         });
-        return { status: 0, stderr: out };
+        const status = res.status ?? 1;
+        markFixtureStep(`wizard --answers <json> → exit ${status}`);
+        // Preserve the historical shape: the success branch surfaced stdout
+        // through `stderr` (assertions only read the failure branch).
+        return { status, stdout: res.stdout, stderr: status === 0 ? res.stdout : res.stderr };
       } catch (error) {
-        const err = error as { status?: number; stderr?: string | Buffer };
-        return { status: err.status ?? 1, stderr: String(err.stderr ?? '') };
+        // A deadline overrun fails loud rather than posing as exit 1.
+        if (error instanceof OwnedCommandTimeoutError) markFixtureStep('wizard --answers <json> → timeout');
+        throw error;
       }
     };
     // Secrets are forbidden on the command line (documented contract).
-    const secret = runWizard('{"token":"leaky"}');
+    const secret = await runWizard('{"token":"leaky"}');
     expect(secret.status).toBe(1);
     expect(secret.stderr).toContain('secrets are forbidden in --answers: token');
+    expect(secret.stdout).not.toContain('Runtime probe:');
     // Non-object JSON must produce the documented parse error — never a
     // raw TypeError from the round-trip key pre-parse (Perkins R1 warning).
     for (const bad of ['null', '[1,2]', '"str"']) {
-      const res = runWizard(bad);
+      const res = await runWizard(bad);
       expect(res.status, bad).toBe(1);
       expect(res.stderr, bad).toMatch(/must be a JSON object|not valid JSON/);
       expect(res.stderr, bad).not.toContain('TypeError');
+      // Fail-fast ordering: an invalid payload never reaches the runtime
+      // probe (which spawns runtime CLIs and loads the adapter SDKs).
+      expect(res.stdout, bad).not.toContain('Runtime probe:');
     }
+  });
+
+  it('a valid --answers run still prints the runtime probe (fail-fast only skips invalid input)', async () => {
+    // Final independent review T0: the fail-fast refactor is asserted
+    // negatively above; this pins the other half — valid runs still probe
+    // (and therefore still print the probe block).
+    const repoRoot = join(import.meta.dirname, '..');
+    const wizard = join(repoRoot, 'dist', 'wizard', 'main.js');
+    const result = await runOwnedCommand(
+      process.execPath,
+      [wizard, '--answers', JSON.stringify({ smoke: false, port: 0 })],
+      {
+        label: 'wizard valid --answers probe',
+        deadlineMs: 30_000,
+        env: { ...process.env, GRU_COMMAND_HOME: tempDir('gru-command-wizard-valid-') },
+      },
+    );
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(result.stdout).toContain('Runtime probe:');
   });
 
   it('pre-flight port check: an occupied fixed port fails LOUD with stop-first guidance, nothing written (Perkins r2 H2)', async () => {
@@ -498,7 +523,7 @@ describe('wizard CLI surface', () => {
     await new Promise<void>((ready) => holder.once('listening', ready));
     const heldPort = (holder.address() as { port: number }).port;
     try {
-      const res = spawnSync(
+      const res = await runOwnedCommand(
         process.execPath,
         [
           join(repoRoot2, 'dist', 'wizard', 'main.js'),
@@ -506,15 +531,15 @@ describe('wizard CLI surface', () => {
           JSON.stringify({ port: heldPort, smoke: false }),
         ],
         {
+          label: 'wizard port pre-flight',
+          deadlineMs: 30_000,
           env: {
             ...process.env,
             GRU_COMMAND_HOME: instance,
           },
-          stdio: ['ignore', 'pipe', 'pipe'],
-          timeout: 30_000,
         },
       );
-      const text = `${res.stdout?.toString('utf-8') ?? ''}\n${res.stderr?.toString('utf-8') ?? ''}`;
+      const text = `${res.stdout}\n${res.stderr}`;
       expect(res.status, text).toBe(1);
       expect(text).toContain(`port ${heldPort} on 127.0.0.1 is already in use`);
       expect(text).toContain('--uninstall');

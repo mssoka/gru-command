@@ -33,6 +33,7 @@ import {
 } from '../src/dispatch/github-poll.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
+import { renderRecordedCiEvidence } from '../src/review-inputs/ci-evidence.js';
 
 /**
  * GitHub signal ingestion, POLL-ONLY (owner ruling 2026-09-23):
@@ -510,6 +511,7 @@ interface FakePost {
   readonly title: string;
   readonly detail?: string | null;
   readonly dedupe: string;
+  readonly agentId?: string | null;
 }
 
 class FakeNotifications implements GitHubPollNotifications {
@@ -569,6 +571,13 @@ describe('github signal poll tick', () => {
     try {
       addTrackedJob(h.ledger, 'job-merge', 'https://github.com/acme/app/pull/10');
       addTrackedJob(h.ledger, 'job-conflict', 'https://github.com/acme/app/pull/11');
+      // The lane's worker is the existing agentId binding the escalation
+      // row carries (tracked-review A4): the job is already validated by
+      // the poll, so the row is bound without guessing. A second lane's
+      // worker is registered after it (and sorts ahead on tie), so the
+      // binding must pick by JOB, not by first-minion (followup V1).
+      h.ledger.registerAgent({ id: 'minion-conflict', role: 'minion', jobId: 'job-conflict' });
+      h.ledger.registerAgent({ id: 'a-minion-merge', role: 'minion', jobId: 'job-merge' });
       const api = new FakeGhApi();
       api.pulls.set('acme/app', [
         pull({ number: 10, headRef: 'gru/job-merge', headSha: 'sha-10', merged: true, mergeCommitSha: 'mc-10', url: 'https://github.com/acme/app/pull/10' }),
@@ -604,6 +613,7 @@ describe('github signal poll tick', () => {
         routing: 'action-required',
         severity: 'error',
         dedupe: 'unacked',
+        agentId: 'minion-conflict',
       });
       expect(notifications.posts[0]?.detail).toContain('rebase');
 
@@ -658,6 +668,48 @@ describe('github signal poll tick', () => {
     }
   });
 
+  it('carries polled check-run URLs into the recorded event and the frozen CI receipt', async () => {
+    const h = makeLedger();
+    try {
+      addTrackedJob(h.ledger, 'job-runs', 'https://github.com/acme/app/pull/50');
+      const api = new FakeGhApi();
+      api.pulls.set('acme/app', [pull({ number: 50, headRef: 'gru/job-runs', headSha: 'sha-50' })]);
+      api.details.set('acme/app#50', pull({ number: 50, headRef: 'gru/job-runs', headSha: 'sha-50', mergeableState: 'clean' }));
+      api.checks.set('acme/app@sha-50', [{
+        name: 'Full suite (Node 22)',
+        status: 'completed',
+        conclusion: 'success',
+        url: 'https://github.com/acme/app/actions/runs/37084763772',
+      }]);
+      const poll = makePoll({ ledger: h.ledger, api });
+      await poll.pollOnce();
+      const green = h.ledger.latestJobEvent('job-runs', 'github.ci-green');
+      expect(green).not.toBeNull();
+      expect((green!.payload as { runs?: Array<{ name: string; url: string }> }).runs).toEqual([
+        { name: 'Full suite (Node 22)', url: 'https://github.com/acme/app/actions/runs/37084763772' },
+      ]);
+      // The cursor round-trip keeps the run identity too, so later ticks and
+      // carried-forward states do not silently drop the URL.
+      expect(readBranchState(h.ledger, 'job-runs')?.ci?.runs).toEqual([
+        { name: 'Full suite (Node 22)', url: 'https://github.com/acme/app/actions/runs/37084763772' },
+      ]);
+      const receipt = renderRecordedCiEvidence({
+        events: {
+          branchState: h.ledger.latestJobEvent('job-runs', BRANCH_STATE_EVENT),
+          ciGreen: green,
+          ciFailed: null,
+        },
+        targetSha: 'sha-50',
+        expectedRepo: 'acme/app',
+        expectedPr: 50,
+      });
+      expect(receipt.record.state).toBe('green');
+      expect(receipt.block).toContain('https://github.com/acme/app/actions/runs/37084763772');
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it('a merged PR closes a blocked or delivered lane through the legal in-review hop', async () => {
     const h = makeLedger();
     try {
@@ -678,11 +730,45 @@ describe('github signal poll tick', () => {
     }
   });
 
+  it('a conflict row with no bound worker stays unbound and live', async () => {
+    const h = makeLedger();
+    try {
+      addTrackedJob(h.ledger, 'job-nominion', 'https://github.com/acme/app/pull/13');
+      // Another lane's worker ranks first: the unbound lane must NOT
+      // borrow it (followup V1). The other lane must exist as a real job
+      // (the agent→job FK); it is not a tracked poll lane (no PR URL).
+      h.ledger.addJob({ id: 'job-elsewhere', repo: 'fixture', title: 'other', briefing: 'b' });
+      h.ledger.setJobStatus('job-elsewhere', 'working');
+      h.ledger.registerAgent({ id: 'a-minion-other', role: 'minion', jobId: 'job-elsewhere' });
+      const api = new FakeGhApi();
+      api.pulls.set('acme/app', [
+        pull({ number: 13, headRef: 'gru/job-nominion', headSha: 'sha-13', url: 'https://github.com/acme/app/pull/13' }),
+      ]);
+      api.details.set('acme/app#13', pull({ number: 13, headRef: 'gru/job-nominion', headSha: 'sha-13', mergeableState: 'dirty', url: 'https://github.com/acme/app/pull/13' }));
+      const notifications = new FakeNotifications();
+      const poll = makePoll({ ledger: h.ledger, api, notifications });
+
+      await poll.pollOnce();
+      expect(notifications.posts).toHaveLength(1);
+      expect(notifications.posts[0]).toMatchObject({
+        kind: 'github.pr-conflict:job-nominion',
+        routing: 'action-required',
+        agentId: null,
+      });
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it('routes CI failure by check kind: judgment is action-required, mechanical is fyi', async () => {
     const h = makeLedger();
     try {
       addTrackedJob(h.ledger, 'job-mech', 'https://github.com/acme/app/pull/30');
       addTrackedJob(h.ledger, 'job-judge', 'https://github.com/acme/app/pull/31');
+      // The judgment lane's worker is the binding target; a second lane's
+      // worker sorts first, so the binding must pick by job (followup V1).
+      h.ledger.registerAgent({ id: 'a-minion-mech', role: 'minion', jobId: 'job-mech' });
+      h.ledger.registerAgent({ id: 'minion-judge', role: 'minion', jobId: 'job-judge' });
       const api = new FakeGhApi();
       api.pulls.set('acme/app', [
         pull({ number: 30, headRef: 'gru/job-mech', headSha: 'sha-30' }),
@@ -702,7 +788,9 @@ describe('github signal poll tick', () => {
       expect(mechanical).toMatchObject({ routing: 'fyi', severity: 'error', dedupe: 'unacked' });
       expect(mechanical?.detail).toContain('https://runs/30');
       expect(mechanical?.detail).toContain('tier 1 (mechanical)');
-      expect(judgment).toMatchObject({ routing: 'action-required', severity: 'error' });
+      // Mechanical rows stay unbound; judgment rows bind the lane's worker.
+      expect(mechanical?.agentId).toBeUndefined();
+      expect(judgment).toMatchObject({ routing: 'action-required', severity: 'error', agentId: 'minion-judge' });
       expect(judgment?.detail).toContain('tier 2 (judgment)');
       expect(h.ledger.latestJobEvent('job-mech', 'github.ci-failed')?.payload).toMatchObject({ tier: 'mechanical' });
       expect(h.ledger.latestJobEvent('job-judge', 'github.ci-failed')?.payload).toMatchObject({ tier: 'judgment' });

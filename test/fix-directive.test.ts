@@ -7,8 +7,9 @@ import { rebriefFreshMinion, recordFollowUpDelivery, renderRebriefPrompt, routeF
 import { LedgerDb } from '../src/ledger/db.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { EventBus } from '../src/events/bus.js';
-import { PR_CREATION_RULE } from '../src/dispatch/pr-creation.js';
-import type { AgentHandle } from '../src/runtime/types.js';
+import { withFallbacks } from '../src/runtime/fallbacks.js';
+import type { AgentHandle, AgentRuntime } from '../src/runtime/types.js';
+import { appendWorkerRules } from '../src/dispatch/worker-rules.js';
 import type { WorktreeLane, WorktreePort } from '../src/dispatch/worktree-port.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
@@ -170,6 +171,8 @@ function minionRecord(id: string, jobId: string | null, sessionFile: string | nu
     state: 'idle',
     lastActivity: null,
     sessionFile,
+    parentAgentId: null,
+    parentage: null,
     createdAt: '2026-09-21T00:00:00.000Z',
     updatedAt: '2026-09-21T00:00:00.000Z',
   };
@@ -357,6 +360,8 @@ describe('eviction-safe fix directives (phase 3)', () => {
     await worktrees.createJobWorktree({ repoPath: repo.path, jobId: 'job-evict' });
     const ledgerEvents: Array<{ kind: string; payload: unknown }> = [];
     const ledger = {
+      getAgent: () => null,
+      listAgents: () => [],
       listImplementerMinions: () => [{ id: 'minion-live', role: 'minion', jobId: 'job-evict', sessionFile: '/sessions/failing.jsonl' }],
       registerAgent: (fields: { id: string }) => { ledgerEvents.push({ kind: 'agent', payload: fields }); },
       getJob: () => ({ briefing: 'original contract' }),
@@ -379,6 +384,8 @@ describe('eviction-safe fix directives (phase 3)', () => {
     cleanupRepos.push(repo);
     await worktrees.createJobWorktree({ repoPath: repo.path, jobId: 'job-resume' });
     const ledger = {
+      getAgent: () => null,
+      listAgents: () => [{ id: 'minion-live', role: 'minion', jobId: 'job-resume', sessionFile: '/sessions/failing.jsonl' }],
       listImplementerMinions: () => [{ id: 'minion-live', role: 'minion', jobId: 'job-resume', sessionFile: '/sessions/failing.jsonl' }],
       registerAgent: () => {},
       getJob: () => ({ briefing: 'original contract' }),
@@ -387,7 +394,11 @@ describe('eviction-safe fix directives (phase 3)', () => {
       registry: registry as never, ledger: ledger as never, worktrees,
       jobId: 'job-resume', directive: 'fix the blocker', signal: controller.signal,
     });
-    expect(prompted[0]).toBe(`fix the blocker\n\n${PR_CREATION_RULE}`); // resumed session gets the directive (never the re-brief wrapper), now carrying the current non-draft PR rule
+    expect(prompted[0]).toBe(appendWorkerRules('fix the blocker')); // resumed session gets the directive (never the re-brief wrapper), now carrying the current non-draft PR and no-call-budget rules
+    // Literal clause pin (not helper-derived): a routed directive must itself
+    // carry the no-call-budget rule, whatever the helper composes.
+    expect(prompted[0]).toContain('no total or per-phase tool-call budget binds');
+    expect(prompted[0]).toContain('it does not bind');
     rmSync(root, { recursive: true, force: true });
   });
 });
@@ -410,7 +421,9 @@ describe('the non-draft PR rule on follow-up directives', () => {
         disposeHandle: async () => {},
       },
       ledger: {
-        listImplementerMinions: () => [{ id: 'minion-live', role: 'minion', jobId: 'job-live', sessionFile: null }],
+        getAgent: () => null,
+        listAgents: () => [{ id: 'minion-live', role: 'minion', jobId: 'job-live', sessionFile: null }],
+      listImplementerMinions: () => [{ id: 'minion-live', role: 'minion', jobId: 'job-live', sessionFile: null }],
         registerAgent: () => {},
         getJob: () => ({ briefing: 'original contract' }),
       } as never,
@@ -419,7 +432,7 @@ describe('the non-draft PR rule on follow-up directives', () => {
       directive: 'open the PR for the finished fix',
       signal: new AbortController().signal,
     });
-    expect(outcome).toEqual({ delivered: true, minionId: 'minion-live' });
+    expect(outcome).toEqual({ delivered: true, minionId: 'minion-live', outcome: 'completed' });
     expect(prompted).toHaveLength(1);
     expect(prompted[0]).toContain('open the PR for the finished fix');
     expect(prompted[0]).toContain('ordinary, non-draft PR');
@@ -447,8 +460,10 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
       registry: { getHandle: () => handle as never, spawn: async () => handle as never, disposeHandle: async () => {} },
       ledger: {
         listImplementerMinions: () => [minionRecord('minion-live', 'job-cancel', '/sessions/live.jsonl')],
+        listAgents: () => [],
         registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
         getJob: () => null,
+        getAgent: () => null,
       },
       worktrees: { listWorktrees: () => [lane] } as never,
       jobId: 'job-cancel',
@@ -464,7 +479,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
     });
     await vi.waitFor(() => expect(prompted).toHaveLength(1));
     controller.abort();
-    await expect(routing).resolves.toEqual({ delivered: false, note: 'review operation aborted' });
+    await expect(routing).resolves.toEqual({ delivered: false, note: 'review operation aborted', admission: 'unknown' });
     expect(settleCalls).toBe(2);
   });
 
@@ -484,8 +499,10 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
       },
       ledger: {
         listImplementerMinions: () => [],
+        listAgents: () => [],
         registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
         getJob: () => null,
+        getAgent: () => null,
       },
       worktrees: { listWorktrees: () => [lane] } as never,
       jobId: 'job-cancel',
@@ -495,7 +512,40 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
     });
     await vi.waitFor(() => expect(prompted).toHaveLength(1));
     controller.abort();
-    await expect(routing).resolves.toEqual({ delivered: false, note: 'review operation aborted' });
+    await expect(routing).resolves.toEqual({ delivered: false, note: 'review operation aborted', admission: 'unknown' });
+  });
+
+  it('a failed registration disposes the spawned directive worker and rethrows the registration error (2026-10-05 review)', async () => {
+    const disposed: string[] = [];
+    const registrationError = new Error('ledger registration rejected the row');
+    const handle = {
+      id: 'minion-unregistered', sessionFile: '/sessions/unregistered.jsonl',
+      prompt: async () => { throw new Error('the prompt must never run when registration failed'); },
+      dispose: async () => {},
+    };
+    await expect(
+      routeFixDirectiveToMinion({
+        registry: {
+          getHandle: () => null,
+          spawn: async () => handle as never,
+          disposeHandle: async (disposedHandle: { id: string }) => { disposed.push(disposedHandle.id); },
+        },
+        ledger: {
+          listImplementerMinions: () => [],
+          listAgents: () => [],
+          registerAgent: () => { throw registrationError; },
+          getJob: () => null,
+          getAgent: () => null,
+        },
+        worktrees: { listWorktrees: () => [lane] } as never,
+        jobId: 'job-regfail',
+        directive: 'fix the blocker',
+        signal: new AbortController().signal,
+      }),
+    ).rejects.toThrow('ledger registration rejected the row');
+    // The spawned handle never survives a failed registration: an
+    // unbound live worker is disposed exactly once, loudly.
+    expect(disposed).toEqual(['minion-unregistered']);
   });
 
   it('a queued re-brief admission aborts on the service-stopping signal (r4 adversarial#5)', async () => {
@@ -510,8 +560,11 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
       },
       ledger: {
         listImplementerMinions: () => [],
+        listAgents: () => [],
         registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
         getJob: () => null,
+        getAgent: () => null,
+        setAgentState: (id) => minionRecord(id, 'job-cancel', null),
       },
       worktrees: { listWorktrees: () => [lane] } as never,
       jobId: 'job-cancel',
@@ -527,6 +580,62 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
     expect(gate.view().worker).toMatchObject({ running: 0, queued: [] });
   });
 
+  async function assertUnpromptedWorkerDisposed(failure: 'registration' | 'registration-publication' | 'binding' | 'rendering' | 'ownership'): Promise<void> {
+    const disposed: string[] = [];
+    const states: string[] = [];
+    const prompted: string[] = [];
+    let registered = false;
+    const original = new Error(`${failure} failed`);
+    const handle = {
+      id: 'setup-worker', sessionFile: null,
+      prompt: async (text: string) => { prompted.push(text); },
+      dispose: async () => { disposed.push('setup-worker'); },
+    };
+    await expect(rebriefFreshMinion({
+      registry: { getHandle: () => null, spawn: async () => handle as never, disposeHandle: async () => {} },
+      ledger: {
+        listImplementerMinions: () => [],
+        listAgents: () => registered ? [minionRecord('setup-worker', 'job-cancel', null)] : [],
+        registerAgent: (input) => {
+          if (failure === 'registration') throw original;
+          registered = true;
+          if (failure === 'registration-publication') throw original;
+          return minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null);
+        },
+        getJob: () => null,
+        getAgent: () => null,
+        setAgentState: (id, state) => { states.push(`${id}:${state}`); return minionRecord(id, 'job-cancel', null); },
+      },
+      worktrees: { listWorktrees: () => [lane] } as never,
+      jobId: 'job-cancel', note: 'resume', briefing: 'contract',
+      ...(failure === 'binding' ? { onSpawned: () => { throw original; } } : {}),
+      ...(failure === 'rendering' ? { lessons: { referencesFor: () => { throw original; } } as never } : {}),
+      ...(failure === 'ownership' ? { beforeTurnSideEffect: (() => {
+        let checks = 0;
+        return () => { if (++checks === 3) throw original; };
+      })() } : {}),
+    })).rejects.toBe(original);
+    expect(disposed).toEqual(['setup-worker']);
+    expect(states).toEqual(registered ? ['setup-worker:disposed'] : []);
+    expect(prompted).toEqual([]);
+  }
+
+  it('disposes an unprompted worker when registration fails', async () => {
+    await assertUnpromptedWorkerDisposed('registration');
+  });
+  it('marks a committed row disposed when registration publication fails', async () => {
+    await assertUnpromptedWorkerDisposed('registration-publication');
+  });
+  it('disposes an unprompted worker when marker binding fails', async () => {
+    await assertUnpromptedWorkerDisposed('binding');
+  });
+  it('disposes an unprompted worker when prompt rendering fails', async () => {
+    await assertUnpromptedWorkerDisposed('rendering');
+  });
+  it('disposes an unprompted worker when final ownership fails', async () => {
+    await assertUnpromptedWorkerDisposed('ownership');
+  });
+
   it('a post-prompt abort on the re-brief path rejects before any delivery is recorded', async () => {
     const controller = new AbortController();
     const prompted: string[] = [];
@@ -539,8 +648,11 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
       registry: { getHandle: () => null, spawn: async () => handle as never, disposeHandle: async () => {} },
       ledger: {
         listImplementerMinions: () => [],
+        listAgents: () => [],
         registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
         getJob: () => null,
+        getAgent: () => null,
+        setAgentState: (id) => minionRecord(id, 'job-cancel', null),
       },
       worktrees: { listWorktrees: () => [lane] } as never,
       jobId: 'job-cancel',
@@ -552,5 +664,93 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
     await vi.waitFor(() => expect(prompted).toHaveLength(1));
     controller.abort();
     await expect(routing).rejects.toThrow(/cancelled before its automatic retries settled/);
+  });
+});
+
+describe('per-prompt terminal verdict capture (r5 blocker 1)', () => {
+  const QUEUED_CAPS = {
+    streaming: true,
+    steer: 'queued' as const,
+    resume: 'file' as const,
+    images: false,
+    thinking: false,
+    thinkingLevelControl: false,
+    followUp: false,
+  };
+
+  it('a resolved-but-errored directive turn with a queued successor still reports outcome error', async () => {
+    // The REAL fallback wrapper (steer:'queued') pumps its queue in the
+    // settle path, before its caller resumes; the successor therefore owns
+    // the live session health by the time the router would read it. The
+    // verdict must have been captured before that pump.
+    let healthState: 'idle' | 'error' = 'idle';
+    let healthError: string | null = null;
+    const resolvers: Array<() => void> = [];
+    const inner = {
+      role: 'minion' as const,
+      id: 'inner-queued',
+      sessionFile: null,
+      capabilities: QUEUED_CAPS,
+      prompt: () => new Promise<void>((resolve) => resolvers.push(resolve)),
+      async steer() {},
+      async followUp() {},
+      subscribe() {
+        return () => {};
+      },
+      health() {
+        return {
+          state: healthState,
+          lastActivity: null,
+          sessionFile: null,
+          ...(healthError === null ? {} : { error: healthError }),
+        };
+      },
+      async dispose() {},
+    };
+    const runtime = withFallbacks({
+      id: 'queued-fake',
+      capabilities: QUEUED_CAPS,
+      spawn: async () => inner,
+      health: () => ({ state: 'ok' as const }),
+      dispose: async () => {},
+    } as unknown as AgentRuntime);
+    const handle = await runtime.spawn('minion');
+    try {
+      const routing = routeFixDirectiveToMinion({
+        registry: { getHandle: () => handle, spawn: async () => handle, disposeHandle: async () => {} },
+        ledger: {
+          getAgent: () => null,
+          listAgents: () => [{ id: 'inner-queued', jobId: 'job-queued', role: 'minion', sessionFile: null }],
+          listImplementerMinions: () => [{ id: 'inner-queued', jobId: 'job-queued', role: 'minion', sessionFile: null }],
+          registerAgent: () => {},
+          getJob: () => null,
+        } as never,
+        worktrees: {} as never,
+        jobId: 'job-queued',
+        directive: 'fix the race',
+        signal: new AbortController().signal,
+      });
+      await vi.waitFor(() => expect(resolvers).toHaveLength(1));
+      // A successor is queued while the directive turn is live.
+      const successor = handle.prompt('queued successor', { owner: 'other' });
+      // The directive turn ends in an in-band error; the successor starts
+      // inside the settle path and clears the session health.
+      healthState = 'error';
+      healthError = 'assistant stopReason error';
+      resolvers[0]!();
+      await vi.waitFor(() => expect(resolvers).toHaveLength(2));
+      healthState = 'idle';
+      healthError = null;
+      resolvers[1]!();
+      await successor;
+      await expect(routing).resolves.toEqual({
+        delivered: true,
+        minionId: 'inner-queued',
+        outcome: 'error',
+        error: 'assistant stopReason error',
+      });
+    } finally {
+      await handle.dispose();
+    }
   });
 });

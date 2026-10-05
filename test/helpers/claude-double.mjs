@@ -439,9 +439,10 @@ async function run() {
           arguments: { runs: lenses.map((lens) => ({ lens })) },
         });
       const first = await run(['blind', 'edge', 'acceptance', 'security']);
-      const second = await run(['architecture', 'codebase', 'tests']);
+      const second = await run(['architecture', 'codebase', 'tests', 'performance']);
+      const third = await run(['operations']);
       const findings = [];
-      for (const response of [first, second]) {
+      for (const response of [first, second, third]) {
         const payload = JSON.parse(mcpToolText(response));
         for (const result of payload.results) {
           if (result.status !== 'valid') continue;
@@ -460,7 +461,7 @@ async function run() {
             '**Verdict: READY TO MERGE**',
             `Target: ${/^Frozen target SHA: (.+)$/m.exec(prompt)?.[1] ?? ''}`,
             `Base: ${/^Frozen diff base SHA: (.+)$/m.exec(prompt)?.[1] ?? ''}`,
-            'Specialists: blind edge acceptance security architecture codebase tests',
+            'Specialists: blind edge acceptance security architecture codebase tests performance operations',
             'warning Verified adapter finding src/main.ts:2',
             'warning Changed behavior lacks test tracing src/main.ts:2 — add an assertion for the changed return value.',
             'Retain verification coverage for this path.',
@@ -490,7 +491,7 @@ async function run() {
 
   if (process.env['CLAUDE_DOUBLE_WORKFLOW_CANDIDATE'] === '1') {
     const configFile = flagValue('--mcp-config');
-    const lens = /Your lens id is "(blind|edge|acceptance|security|architecture|codebase|tests)"/.exec(prompt)?.[1];
+    const lens = /Your lens id is "(blind|edge|acceptance|security|architecture|codebase|tests|performance|operations)"/.exec(prompt)?.[1];
     if (lens !== undefined && configFile !== undefined) {
       // Native-tool child (the host wired perkins_submit_findings through a
       // scoped bridge): submit findings through the product tool exactly as

@@ -1,6 +1,7 @@
 import { PacingGate, type RetrySettlement } from '../src/runtime/pacing.js';
 import { execFileSync, spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, generateKeyPairSync } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -13,15 +14,25 @@ import {
   WaveRunner,
   hostDisclosureAppendix,
   redactReviewForPublication,
+  type EscalationContext,
   type FallbackGateOutcome,
   type VerdictPoster,
   type WaveOutcome,
 } from '../src/dispatch/perkins.js';
+import { PerkinsAppPrPoster, type AppFetch, type AppFetchInit } from '../src/dispatch/perkins-github-app.js';
 import { preflightFailure, runRuntimeReviewPreflight, type FallbackFinding } from '../src/dispatch/review-path.js';
 import { configPathFor, loadConfig } from '../src/config.js';
 import { RuntimeRegistry } from '../src/runtime/registry.js';
 import { SessionStore } from '../src/sessions/store.js';
 import type { PrHeadProbe } from '../src/dispatch/perkins-review/fresh-head.js';
+import { BoardEngine } from '../src/board/engine.js';
+import { createReviewEscalationNotifier } from '../src/dispatch/escalation-identity.js';
+import { NotificationCenter } from '../src/notifications/center.js';
+import {
+  isValidSnapshot,
+  type BoardSnapshot as WireBoardSnapshot,
+} from '../web/src/lib/board-protocol.js';
+import { terminalBoundNotificationIds } from '../web/src/lib/board-signals.js';
 
 /** These suites exercise the Perkins route (no pre-flight configured), so
  * every runRound result must be a wave outcome; the helper pins that. */
@@ -45,10 +56,12 @@ import type { AgentSpawner } from '../src/dispatch/service.js';
 import type { AgentHandle } from '../src/runtime/types.js';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
+import { PERKINS_LENSES } from '../src/dispatch/perkins-review/policy.js';
 import { LedgerDb } from '../src/ledger/db.js';
-import { lensAgentLabel } from '../src/dispatch/perkins.js';
+import { FALLBACK_REVIEW_TIMEOUT_MS, lensAgentLabel } from '../src/dispatch/perkins.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 import { fakeWholeSpawner, type WholeLeadOptions } from './helpers/perkins-whole-double.js';
+import { minimalPng } from './helpers/images.js';
 import { GitReviewPort } from './helpers/git-review-port.js';
 import { PersistedReviewPort } from './helpers/persisted-review-port.js';
 
@@ -77,6 +90,16 @@ class DeferredReviewPort implements WorktreePort {
     return lane;
   }
 
+  createChildWorktree(input: {
+    repoPath: string;
+    jobId: string;
+    childId: string;
+    parentPath: string;
+    authority: 'read-only' | 'writer';
+  }): Promise<WorktreeLane> {
+    return this.delegate.createChildWorktree(input);
+  }
+
   getWorktree(id: string): WorktreeLane | null { return this.delegate.getWorktree(id); }
   listWorktrees(options: { jobId?: string } = {}): readonly WorktreeLane[] { return this.delegate.listWorktrees(options); }
   release(input: { worktreeId: string }): Promise<WorktreeSweepResult> { return this.delegate.release(input); }
@@ -84,12 +107,53 @@ class DeferredReviewPort implements WorktreePort {
 
 /** Attach a fetchable bare origin inside the test's port root and push the
  * reviewed branch: the fresh-head freeze reads THIS tip, never the local
- * ref left behind by the fixture. */
-function attachOrigin(repo: FixtureRepo, branch: string, root: string): void {
+ * ref left behind by the fixture. `opts.batched` (T4 only) replaces
+ * `init --bare` + `push` with ONE `clone --bare` of the repo at the same
+ * commit: the bare carries refs/heads/<branch> at the identical sha (plus
+ * inert extra state nothing in the flow reads — the bare's HEAD, its own
+ * config, and a stale refs/heads/main copy; the head probe reads the LOCAL
+ * ref, review worktrees are created from the job repo, and the reconcile
+ * git-ops are local), and the job repo's `origin` remote is added exactly
+ * as before. Callers that omit the flag keep the historical three-process
+ * shape byte-for-byte (phase pr144-t4-second-cost-diagnosis-20261002). */
+function attachOrigin(repo: FixtureRepo, branch: string, root: string, opts?: { readonly batched?: boolean }): string {
   const origin = join(root, 'origin.git');
-  execFileSync('git', ['init', '--bare', '--quiet', origin], { stdio: 'ignore' });
-  repo.git(['remote', 'add', 'origin', origin]);
-  repo.git(['push', '--quiet', 'origin', `refs/heads/${branch}`]);
+  if (opts?.batched === true) {
+    execFileSync('git', ['clone', '--bare', '--quiet', repo.path, origin], { stdio: 'ignore' });
+    repo.git(['remote', 'add', 'origin', origin]);
+    // Actual equivalence pin (phase pr144-followup14-feedback): the batched
+    // bare must carry refs/heads/<branch> at the intended fixture target —
+    // the same tip the historical init+push shape produces. The extra inert
+    // state a clone carries (source HEAD, bare config, stale refs/heads/main)
+    // is never read by the flow and is deliberately not asserted.
+    const intended = repo.git(['rev-parse', `refs/heads/${branch}`]);
+    const batched = repo.git(['rev-parse', `refs/heads/${branch}`], origin);
+    if (batched.toLowerCase() !== intended.toLowerCase()) {
+      throw new Error(
+        `batched origin refs/heads/${branch} (${batched}) does not match the fixture target (${intended})`,
+      );
+    }
+  } else {
+    execFileSync('git', ['init', '--bare', '--quiet', origin], { stdio: 'ignore' });
+    repo.git(['remote', 'add', 'origin', origin]);
+    repo.git(['push', '--quiet', 'origin', `refs/heads/${branch}`]);
+  }
+  return origin;
+}
+
+/** Loose-ref fast path (phase pr144-completion-cycle-20261002): the git
+ * command that just ran wrote `.git/refs/heads/<branch>` as a loose ref,
+ * so reading it is value-identical to `git rev-parse refs/heads/<branch>`
+ * and saves one git spawn per call in the load-amplified T4 window. Any
+ * read failure (worktree gitdir files, packed refs, missing file) falls
+ * back to the real rev-parse, so non-loose layouts keep exact behavior.
+ * Dispatch only — the resolved value is never altered. */
+function looseRefOrRevParse(repoPath: string, ref: string): string {
+  try {
+    return readFileSync(join(repoPath, '.git', ref), 'utf-8').trim();
+  } catch {
+    return execFileSync('git', ['-C', repoPath, 'rev-parse', ref], { encoding: 'utf-8' }).trim();
+  }
 }
 
 /** Probe double for PR rounds: report the reviewed branch's local tip (the
@@ -97,13 +161,13 @@ function attachOrigin(repo: FixtureRepo, branch: string, root: string): void {
 function localHeadProbe(branch: string): PrHeadProbe {
   return async ({ repoPath }) => ({
     headRefName: branch,
-    headSha: execFileSync('git', ['-C', repoPath, 'rev-parse', `refs/heads/${branch}`], { encoding: 'utf-8' }).trim(),
+    headSha: looseRefOrRevParse(repoPath, `refs/heads/${branch}`),
   });
 }
 
 function sourceFor(prompt: string): string {
   if (prompt.includes('source=blind')) return 'blind';
-  return /"source": "(blind|edge|acceptance|security|architecture|codebase|tests)"/.exec(prompt)?.[1] ?? 'unknown';
+  return /"source": "(blind|edge|acceptance|security|architecture|codebase|tests|performance|operations)"/.exec(prompt)?.[1] ?? 'unknown';
 }
 
 /**
@@ -116,6 +180,16 @@ function makeSpawner(
   order: string[],
   onLeadStart?: () => void,
   answerOverride?: (prompt: string) => string | undefined,
+  /** Canonical security-blocker evidence the scripted lead cites on its
+   * second attempt. Defaults to the historical `return 43;` snippet the
+   * pre-existing fixtures commit; T4's fixture commits `return 44;`, so it
+   * passes the snippet its frozen diff actually contains — the locatable-
+   * evidence contract (whole.ts evidenceAtCitedLocation) then accepts the
+   * canonical attempt instead of burning it. The malformed first attempt
+   * and the two-run attempt coverage are unchanged, and every caller that
+   * omits this behaves byte-for-byte as before
+   * (phase pr144-t4-cost-repair-20261001). */
+  securityEvidence?: string,
 ): AgentSpawner {
   let securityAttempts = 0;
   const brain: WholeLeadOptions = {
@@ -131,7 +205,7 @@ function makeSpawner(
         : source === 'security'
           ? JSON.stringify([{
               source: 'security', severity: 'blocker', category: 'auth', title: 'Verified security defect',
-              location: 'src/main.ts:2', evidence: '  return 43;', detail: 'The changed line demonstrates the security defect.',
+              location: 'src/main.ts:2', evidence: securityEvidence ?? '  return 43;', detail: 'The changed line demonstrates the security defect.',
               recommended_fix: 'Correct the implementation and add a regression test.',
             }])
           : '[]');
@@ -143,10 +217,40 @@ function makeSpawner(
 const repos: FixtureRepo[] = [];
 const dbs: LedgerDb[] = [];
 const dirs: string[] = [];
+// T4 attribution state (phase pr144-t4-deep-attribution-20261001; test-local,
+// observation only): the afterEach close/cleanup loop runs OUTSIDE the test
+// body and its inherited 30000 ms bound. When the T4 case arms the observer,
+// that loop's cost is measured and labelled here — never inferred, never
+// summed into in-test phases. Non-T4 tests arm nothing and behave identically.
+let t4Observe = false;
+let t4StartAt: number | null = null;
+// True only when the test body reached its end. False proves only that the
+// body did NOT complete — a timeout abandonment or an already-thrown
+// assertion — never that the body is still settling.
+let t4BodyCompleted = false;
 afterEach(() => {
-  while (dbs.length > 0) dbs.pop()!.close();
-  while (repos.length > 0) repos.pop()!.cleanup();
-  while (dirs.length > 0) rmSync(dirs.pop()!, { recursive: true, force: true });
+  const observing = t4Observe;
+  t4Observe = false;
+  const cleanupStarted = performance.now();
+  try {
+    while (dbs.length > 0) dbs.pop()!.close();
+    while (repos.length > 0) repos.pop()!.cleanup();
+    while (dirs.length > 0) rmSync(dirs.pop()!, { recursive: true, force: true });
+  } finally {
+    // Observational finalization is exception-safe: it runs even when a
+    // cleanup call throws, WITHOUT catching, swallowing, or replacing the
+    // original cleanup error, which still propagates to the runner unchanged.
+    if (observing && t4StartAt !== null) {
+      console.log(`T4-ATTR ${JSON.stringify({
+        leg: 'suite', phase: 'outside-test-cleanup', boundary: 'end',
+        absMs: Math.round(performance.now() - t4StartAt),
+        elapsedMs: Math.round(performance.now() - cleanupStarted),
+        outcome: t4BodyCompleted ? 'completed' : 'test-body-incomplete',
+        note: 'db.close + repo.cleanup(prune+rm) + rmSync run in afterEach, OUTSIDE the test body and its inherited 30000 ms bound; observed even when cleanup throws; test-body-incomplete means only that the body did not complete',
+      })}`);
+      t4StartAt = null;
+    }
+  }
 });
 
 describe('GitHub SHA-bound Perkins delivery', () => {
@@ -159,15 +263,17 @@ describe('GitHub SHA-bound Perkins delivery', () => {
     execFileSync('git', ['-C', repoPath, 'remote', 'add', 'origin', 'https://git.example.test/acme/widget.git']);
     const head = '1'.repeat(40);
     const base = '2'.repeat(40);
+    const advancedBase = '5'.repeat(40);
+    const baseState = join(root, 'base.sha');
+    writeFileSync(baseState, base);
     const review = { id: 9001, user: { login: 'gru-bot' }, state: 'COMMENTED', commit_id: head, body: 'review body\n' };
-    writeFileSync(binary, `#!/usr/bin/env node\nimport { appendFileSync, readFileSync } from 'node:fs';\nconst input = readFileSync(0, 'utf8');\nappendFileSync(${JSON.stringify(log)}, JSON.stringify({ argv: process.argv.slice(2), input }) + '\\n');\nconst argv = process.argv.slice(2);\nif (argv.includes('--method') && argv.includes('POST')) {\n  const body = JSON.parse(input);\n  process.stdout.write(JSON.stringify({ id: 9001, user: { login: 'gru-bot' }, state: 'COMMENTED', commit_id: body.commit_id, body: body.body }));\n} else if (argv.some((entry) => entry.includes('/reviews?'))) {\n  process.stdout.write(JSON.stringify([{ id: 8000, user: { login: 'someone' }, state: 'COMMENTED', commit_id: 'f'.repeat(40), body: 'other' }, ${JSON.stringify(review)}]));\n} else if (argv.includes('user') && !argv.some((entry) => entry.includes('/'))) {\n  process.stdout.write('gru-bot');\n} else {\n  process.stdout.write(${JSON.stringify(`${head}\t${base}\n`)});\n}\n`, 'utf8');
+    writeFileSync(binary, `#!/usr/bin/env node\nimport { appendFileSync, readFileSync, writeFileSync } from 'node:fs';\nconst input = readFileSync(0, 'utf8');\nappendFileSync(${JSON.stringify(log)}, JSON.stringify({ argv: process.argv.slice(2), input }) + '\\n');\nconst argv = process.argv.slice(2);\nif (argv.includes('--method') && argv.includes('POST')) {\n  const body = JSON.parse(input);\n  writeFileSync(${JSON.stringify(baseState)}, ${JSON.stringify(advancedBase)});\n  process.stdout.write(JSON.stringify({ id: 9001, user: { login: 'gru-bot' }, state: 'COMMENTED', commit_id: body.commit_id, body: body.body }));\n} else if (argv.some((entry) => entry.includes('/reviews?'))) {\n  process.stdout.write(JSON.stringify([{ id: 8000, user: { login: 'someone' }, state: 'COMMENTED', commit_id: 'f'.repeat(40), body: 'other' }, ${JSON.stringify(review)}]));\n} else if (argv.includes('user') && !argv.some((entry) => entry.includes('/'))) {\n  process.stdout.write('gru-bot');\n} else {\n  process.stdout.write(${JSON.stringify(`${head}\t`)} + readFileSync(${JSON.stringify(baseState)}, 'utf8') + '\\n');\n}\n`, 'utf8');
     chmodSync(binary, 0o755);
     const poster = new GhPrPoster(binary);
-    // (a) The PR's recorded base (GitHub pins it at open/link time) trails
-    // the frozen base as main moves during a long round; head equality is
-    // the delivery invariant, so a stale recorded base must NOT refuse.
-    // The receipt binds the provider review id/actor/event, the commit and
-    // the echoed body digest.
+    // (a) The base may advance inside POST, after the GitHub identity probe.
+    // The receipt carries the base observed by that probe, not a later tip;
+    // head equality remains the delivery invariant and the recorded base
+    // must NOT refuse a commit-bound review.
     await expect(poster.post({
       prUrl: 'https://git.example.test/acme/widget/pull/42', host: 'git.example.test', repoPath,
       body: 'review body\n', targetSha: head, baseSha: '3'.repeat(40),
@@ -176,13 +282,15 @@ describe('GitHub SHA-bound Perkins delivery', () => {
       headSha: head, baseSha: base,
       bodySha256: createHash('sha256').update('review body\n', 'utf8').digest('hex'),
     });
+    expect(readFileSync(baseState, 'utf8')).toBe(advancedBase);
     const calls = readFileSync(log, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as { argv: string[]; input: string });
-    // identity probe, commit-bound POST, authenticated-account probe (R5).
+    // identity probe, authenticated-account probe (R32: BEFORE the
+    // irreversible POST), commit-bound POST (R5).
     expect(calls).toHaveLength(3);
     expect(calls[0]?.argv).toEqual(['api', '--hostname', 'git.example.test', 'repos/acme/widget/pulls/42', '--jq', '[.head.sha,.base.sha] | @tsv']);
-    expect(calls[1]?.argv).toEqual(['api', '--hostname', 'git.example.test', '--method', 'POST', 'repos/acme/widget/pulls/42/reviews', '--input', '-']);
-    expect(calls[2]?.argv).toEqual(['api', '--hostname', 'git.example.test', 'user', '--jq', '.login']);
-    expect(JSON.parse(calls[1]!.input)).toEqual({ body: 'review body\n', event: 'COMMENT', commit_id: head });
+    expect(calls[1]?.argv).toEqual(['api', '--hostname', 'git.example.test', 'user', '--jq', '.login']);
+    expect(calls[2]?.argv).toEqual(['api', '--hostname', 'git.example.test', '--method', 'POST', 'repos/acme/widget/pulls/42/reviews', '--input', '-']);
+    expect(JSON.parse(calls[2]!.input)).toEqual({ body: 'review body\n', event: 'COMMENT', commit_id: head });
     // (b) A moved head is real movement and still fails closed — before any
     // review is posted.
     await expect(poster.post({
@@ -631,12 +739,16 @@ describe('WaveRunner built-in Perkins production path', () => {
     ledger.setRoundStatus(round.id, 'live');
     ledger.markLensLive(round.id, 'blind');
     const escalations: string[] = [];
+    const escalationContexts: (EscalationContext | undefined)[] = [];
     const wave = new WaveRunner({
       ledger,
       worktrees: port,
       spawner: vi.fn() as unknown as AgentSpawner,
       reviewArtifactRoot: artifacts,
-      escalate: (title) => escalations.push(title),
+      escalate: (title, _detail, context) => {
+        escalations.push(title);
+        escalationContexts.push(context);
+      },
     });
     expect(await wave.recoverInterruptedRounds()).toBe(1);
     expect(ledger.getRound(round.id)?.status).toBe('aborted');
@@ -645,6 +757,38 @@ describe('WaveRunner built-in Perkins production path', () => {
     expect(existsSync(join(artifacts, round.id, 'restart-recovery.json'))).toBe(true);
     expect(existsSync(join(artifacts, round.id, 'perkins-report.md'))).toBe(true);
     expect(escalations[0]).toContain('INCOMPLETE');
+    // Producer context: the recovery escalation carries its validated
+    // round/job identity for the notification binding (followup A4).
+    expect(escalationContexts[0]).toEqual({ jobId: 'job-restart', roundId: round.id });
+    // V1 chain: the REAL producer context above — not a handcrafted one —
+    // flows through the notifier into a live row, and the lane
+    // terminalizing reclassifies that emitted row as a closed receipt on
+    // BOTH surfaces (the ledger's live chip count and the board's
+    // terminal-bound set the bell renders from).
+    ledger.registerAgent({ id: 'minion-restart-receipt', role: 'minion', jobId: job.id });
+    const chainCenter = new NotificationCenter({ ledger, bus: new EventBus() });
+    const liveBefore = ledger.countLivePendingActionRequired();
+    const receiptsBefore = ledger.countPendingActionRequiredIncludingReceipts();
+    createReviewEscalationNotifier(ledger, chainCenter)(
+      'chain: Review round INCOMPLETE',
+      'chain detail',
+      escalationContexts[0],
+    );
+    const chainRow = ledger
+      .listNotifications({ limit: 100 })
+      .find((row) => row.kind === 'review-escalation' && row.title === 'chain: Review round INCOMPLETE');
+    expect(chainRow?.agentId).toBe('minion-restart-receipt');
+    expect(ledger.countLivePendingActionRequired()).toBe(liveBefore + 1);
+    ledger.setJobStatus(job.id, 'merged');
+    expect(ledger.countLivePendingActionRequired()).toBe(liveBefore);
+    expect(ledger.countPendingActionRequiredIncludingReceipts()).toBe(receiptsBefore + 1);
+    // The engine's server-side snapshot and the web's wire type are
+    // separate namespaces: cross them the way the wire does — serialize,
+    // validate with the web parser, then classify. A shape drift fails the
+    // validator here instead of silently changing the board's truth.
+    const wireValue: unknown = JSON.parse(JSON.stringify(new BoardEngine({ ledger, bus: new EventBus() }).snapshot()));
+    expect(isValidSnapshot(wireValue)).toBe(true);
+    expect(terminalBoundNotificationIds(wireValue as WireBoardSnapshot)).toContain(chainRow?.id);
     rmSync(root, { recursive: true, force: true });
     rmSync(artifacts, { recursive: true, force: true });
   });
@@ -787,7 +931,7 @@ describe('WaveRunner built-in Perkins production path', () => {
         receipt: { reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: target2, headSha: target2, baseSha: 'b'.repeat(40), bodySha256: publicationSha256 },
       },
     });
-    const poster2 = { post: vi.fn() };
+    const poster2 = { post: vi.fn(), authenticatedActor: async () => 'gru-bot' };
     const wave2 = new WaveRunner({
       ledger: ledger2, worktrees: port2, spawner: vi.fn() as unknown as AgentSpawner,
       reviewArtifactRoot: artifacts2, poster: poster2,
@@ -919,7 +1063,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const securityChip = outcome.round.lenses.find((chip) => chip.lens === 'security');
     expect(securityChip?.state).toBe('done');
     expect(securityChip?.note).toContain('blocker');
-    for (const lens of ['blind', 'edge', 'acceptance', 'architecture', 'codebase']) {
+    for (const lens of ['blind', 'edge', 'acceptance', 'architecture', 'codebase', 'performance', 'operations']) {
       const unusedChip = outcome.round.lenses.find((chip) => chip.lens === lens);
       expect(unusedChip?.state, lens).toBe('done');
       expect(unusedChip?.note, lens).toContain('not used');
@@ -1113,7 +1257,8 @@ describe('WaveRunner built-in Perkins production path', () => {
     expect(outcome.verdict).toBe('changes-requested');
     expect(outcome.round.lenses.every((chip) => chip.state === 'done' && chip.agentId === null)).toBe(true);
     expect(outcome.headMoved).toBe(false);
-    expect(order.filter((entry) => entry.startsWith('model:'))).toHaveLength(9);
+    // One lead + nine catalog children + the retried security lens.
+    expect(order.filter((entry) => entry.startsWith('model:'))).toHaveLength(11);
     // The retried security lens registers TWO distinct agent rows: the
     // second attempt is attempt-suffixed, never a duplicate label.
     const roundLabels = ledger
@@ -1222,13 +1367,21 @@ describe('WaveRunner built-in Perkins production path', () => {
     attachOrigin(repo, 'feature/review', root);
     let moved = false;
     const poster = { post: vi.fn(async () => ({ headSha: 'unused-head', baseSha: 'unused-base' })) } as unknown as VerdictPoster;
-    const spawner = makeSpawner(sessions, [], () => {
-      if (moved) return;
-      moved = true;
-      repo.commitFile('src/later.ts', 'export const later = true;\n', 'move during review');
-      // The PR head MOVES: origin advances past the frozen tip.
-      repo.git(['push', '--quiet', 'origin', 'feature/review']);
-    });
+    const spawner = fakeWholeSpawner(sessions, {
+      onLeadStart: () => {
+        if (moved) return;
+        moved = true;
+        repo.commitFile('src/later.ts', 'export const later = true;\n', 'move during review');
+        // The PR head MOVES: origin advances past the frozen tip.
+        repo.git(['push', '--quiet', 'origin', 'feature/review']);
+      },
+      childAnswer: () => '[]',
+      submitRetries: 1,
+      submitPayload: (attempt, submission) => attempt === 1 ? submission : {
+        ...submission, verdict: 'INCOMPLETE',
+        report_markdown: submission.report_markdown.replace(/\*\*Verdict: [^*]+\*\*/, '**Verdict: INCOMPLETE**'),
+      },
+    }).spawner;
     const wave = new WaveRunner({
       ledger, worktrees: port, spawner, poster, reviewArtifactRoot: artifacts,
       prHeadProbe: localHeadProbe('feature/review'),
@@ -1243,6 +1396,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     expect(poster.post).not.toHaveBeenCalled();
     expect(readFileSync(outcome.reportFile, 'utf8')).toContain('INCOMPLETE');
     expect(ledger.latestRoundEvent(outcome.round.id, 'round.posted')).toBeNull();
+    expect(ledger.latestRoundEvent(outcome.round.id, 'round.head-moved')?.payload).toMatchObject({ cause: 'target-moved' });
     expect(port.getWorktree(outcome.round.id)?.status).toBe('swept');
     rmSync(root, { recursive: true, force: true });
     rmSync(artifacts, { recursive: true, force: true });
@@ -1382,6 +1536,326 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     expect(outcome.verdict).toBeNull();
     expect(outcome.canonicalVerdict).toBe('INCOMPLETE');
     expect(escalations.some((line) => line.includes('NOT posted safely'))).toBe(true);
+    // Even an exhausted lookup with NO match keeps the do-not-retry
+    // caution: a just-created review can lag a provider listing, so null
+    // absence is not permission to retry blindly (R31).
+    expect(escalations.some((line) => line.includes('verify manually before any retry'))).toBe(true);
+  });
+
+  it('refuses a provider receipt without a base binding and stays honestly unposted (R34)', async () => {
+    const repo = makeFixtureRepo('perkins-missing-base-receipt');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/missing-base-receipt']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-mbase-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-mbase-artifacts-'));
+    const sessions = mkdtempSync(join(tmpdir(), 'perkins-mbase-sessions-'));
+    dirs.push(root, artifacts, sessions);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-mbase-db-')));
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/missing-base-receipt', target);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-mbase' });
+    const job = ledger.addJob({ id: 'job-mbase', repo: 'fixture', title: 'missing base receipt', baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/41');
+    attachOrigin(repo, 'feature/missing-base-receipt', root);
+    // An otherwise valid receipt whose base is the shape the shared restart
+    // reader rejects: the writer must refuse it, never persist an event
+    // recovery cannot parse.
+    const post = vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
+      reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+      headSha: call.targetSha, baseSha: '',
+      bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
+    }));
+    const escalations: string[] = [];
+    const wave = new WaveRunner({
+      ledger, worktrees: port, spawner: makeSpawner(sessions, []), poster: { post }, reviewArtifactRoot: artifacts,
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      prHeadProbe: localHeadProbe('feature/missing-base-receipt'),
+    });
+    const outcome = asWave(await wave.runRound({ jobId: job.id }));
+    expect(outcome.posted).toBe(false);
+    expect(outcome.verdict).toBeNull();
+    expect(outcome.canonicalVerdict).toBe('INCOMPLETE');
+    expect(ledger.latestRoundEvent(outcome.round.id, 'round.posted')).toBeNull();
+    const incomplete = ledger.latestRoundEvent(outcome.round.id, 'round.perkins-incomplete')?.payload as { reason?: string; error?: string };
+    expect(incomplete?.reason).toBe('report_not_posted');
+    expect(incomplete?.error).toContain('missing the base binding');
+    expect(escalations.some((line) => line.includes('missing the base binding'))).toBe(true);
+  });
+
+  it('carries the reconciliation failure and its manual-verification warning into the durable record (R31)', async () => {
+    const repo = makeFixtureRepo('perkins-reconcile-failure');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/reconcile-failure']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-rcfail-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-rcfail-artifacts-'));
+    const sessions = mkdtempSync(join(tmpdir(), 'perkins-rcfail-sessions-'));
+    dirs.push(root, artifacts, sessions);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-rcfail-db-')));
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/reconcile-failure', target);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-rcfail' });
+    const job = ledger.addJob({ id: 'job-rcfail', repo: 'fixture', title: 'reconcile failure', baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/34');
+    attachOrigin(repo, 'feature/reconcile-failure', root);
+    const post = vi.fn(async () => { throw new Error('network died after commit'); });
+    const reconcile = vi.fn(async () => {
+      throw new Error('GitHub review reconciliation exceeded the 10-page lookup bound without exhausting the review list; delivery stays unresolved');
+    });
+    const escalations: string[] = [];
+    const wave = new WaveRunner({
+      ledger, worktrees: port, spawner: makeSpawner(sessions, []), poster: { post, reconcile }, reviewArtifactRoot: artifacts,
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      prHeadProbe: localHeadProbe('feature/reconcile-failure'),
+    });
+    const outcome = asWave(await wave.runRound({ jobId: job.id }));
+    expect(outcome.posted).toBe(false);
+    expect(outcome.verdict).toBeNull();
+    expect(reconcile).toHaveBeenCalledTimes(1);
+    // The escalation names BOTH failures, not just the original POST error.
+    const escalation = escalations.find((line) => line.includes('NOT posted safely')) ?? '';
+    expect(escalation).toContain('reconciliation after the ambiguous post ALSO failed');
+    expect(escalation).toContain('exceeded the 10-page lookup bound');
+    expect(escalation).toContain('verify manually before any retry');
+    // ...and so does the persisted round.perkins-incomplete record.
+    const incomplete = ledger.latestRoundEvent(outcome.round.id, 'round.perkins-incomplete')?.payload as { reason?: string; error?: string };
+    expect(incomplete?.reason).toBe('report_not_posted');
+    expect(incomplete?.error).toContain('reconciliation after the ambiguous post ALSO failed');
+    expect(incomplete?.error).toContain('exceeded the 10-page lookup bound');
+    expect(incomplete?.error).toContain('verify manually before any retry');
+  });
+
+  /** Advance local `main` by one commit without touching the reviewed
+   * branch or any checkout: a merge landing on the base mid-round. */
+  function advanceMain(repo: FixtureRepo): string {
+    const next = repo.git([
+      '-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid',
+      'commit-tree', 'main^{tree}', '-p', 'main', '-m', 'main advances during review',
+    ]);
+    repo.git(['update-ref', 'refs/heads/main', next]);
+    return next;
+  }
+
+  async function baseAdvanceFixture(name: string, branch: string, pr: number) {
+    const repo = makeFixtureRepo(name);
+    repos.push(repo);
+    const base = repo.head();
+    repo.git(['checkout', '-b', branch]);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), `${name}-port-`));
+    const artifacts = mkdtempSync(join(tmpdir(), `${name}-artifacts-`));
+    const sessions = mkdtempSync(join(tmpdir(), `${name}-sessions-`));
+    dirs.push(root, artifacts, sessions);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), `${name}-db-`)));
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, branch, target);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: `job-${name}` });
+    const job = ledger.addJob({ id: `job-${name}`, repo: 'fixture', title: name, baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, `https://git.example.invalid/acme/fixture/pull/${pr}`);
+    attachOrigin(repo, branch, root);
+    return { repo, base, target, ledger, port, artifacts, sessions, job };
+  }
+
+  /** A provider receipt for the reviewed head carrying the live base at
+   * its identity probe, not a subsequent advance during delivery. */
+  function liveBaseReceipt(reviewId: string, call: { readonly body: string; readonly targetSha: string }, liveBase: string) {
+    return {
+      reviewId, actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+      headSha: call.targetSha, baseSha: liveBase,
+      bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
+    };
+  }
+
+  function expectRecordedWithFrozenBase(
+    fixture: Awaited<ReturnType<typeof baseAdvanceFixture>>,
+    outcome: WaveOutcome,
+    expected: { readonly reviewId: string; readonly reconciled: boolean; readonly observedBase: string },
+  ): void {
+    const liveBase = fixture.repo.git(['rev-parse', 'main']);
+    expect(liveBase).not.toBe(fixture.base);
+    expect(outcome.headMoved).toBe(false);
+    expect(outcome.posted).toBe(true);
+    expect(outcome.verdict).toBe('changes-requested');
+    expect(outcome.canonicalVerdict).toBe('NEEDS CHANGES');
+    expect(outcome.round.status).toBe('verdict-posted');
+    const posted = fixture.ledger.latestRoundEvent(outcome.round.id, 'round.posted')?.payload as {
+      targetSha?: string; baseSha?: string; reconciled?: boolean; receipt?: { reviewId?: string; baseSha?: string };
+    } | undefined;
+    expect(posted?.receipt?.reviewId).toBe(expected.reviewId);
+    expect(posted?.reconciled).toBe(expected.reconciled);
+    // Delivery stays bound to the reviewed target; the receipt carries the
+    // base observed before POST/reconciliation, while the frozen base stays
+    // provenance and main may advance again before the record is written.
+    expect(posted?.targetSha).toBe(fixture.target);
+    expect(posted?.baseSha).toBe(expected.observedBase);
+    expect(posted?.receipt?.baseSha).toBe(expected.observedBase);
+    expect(posted?.baseSha).not.toBe(liveBase);
+    const recorded = fixture.ledger.latestRoundEvent(outcome.round.id, 'round.perkins-review')?.payload as Record<string, unknown> | undefined;
+    expect(recorded).toMatchObject({
+      targetSha: fixture.target, baseRefSha: fixture.base, diffBaseSha: fixture.base, headMoved: false, complete: true,
+    });
+    const manifest = JSON.parse(readFileSync(join(outcome.artifactDirectory, 'manifest.json'), 'utf8')) as Record<string, unknown>;
+    expect(manifest).toMatchObject({ baseRef: 'main', baseRefSha: fixture.base, diffBaseSha: fixture.base, targetSha: fixture.target });
+    expect(existsSync(join(outcome.artifactDirectory, 'perkins-report.reconciled-unrecorded.json'))).toBe(false);
+  }
+
+  it('reports base-rewritten when main is replaced by an orphan during lead work', async () => {
+    const fixture = await baseAdvanceFixture('perkins-base-rewrite-lead', 'feature/base-rewrite-lead', 40);
+    const post = vi.fn(async () => { throw new Error('a rewritten base must not post'); });
+    let rewritten = false;
+    const spawner = fakeWholeSpawner(fixture.sessions, {
+      onLeadStart: () => {
+        const orphan = fixture.repo.git([
+          '-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid',
+          'commit-tree', 'main^{tree}', '-m', 'base rewritten during review',
+        ]);
+        fixture.repo.git(['update-ref', 'refs/heads/main', orphan]);
+        rewritten = true;
+      },
+      childAnswer: () => '[]',
+      submitRetries: 1,
+      submitPayload: (attempt, submission) => attempt === 1 ? submission : {
+        ...submission, verdict: 'INCOMPLETE',
+        report_markdown: submission.report_markdown.replace(/\*\*Verdict: [^*]+\*\*/, '**Verdict: INCOMPLETE**'),
+      },
+    }).spawner;
+    const wave = new WaveRunner({
+      ledger: fixture.ledger, worktrees: fixture.port, spawner,
+      poster: { post }, reviewArtifactRoot: fixture.artifacts,
+      prHeadProbe: localHeadProbe('feature/base-rewrite-lead'),
+    });
+    const outcome = asWave(await wave.runRound({ jobId: fixture.job.id }));
+    expect(rewritten).toBe(true);
+    expect(outcome.canonicalVerdict).toBe('INCOMPLETE');
+    expect(outcome.headMoved).toBe(true);
+    expect(outcome.posted).toBe(false);
+    expect(post).not.toHaveBeenCalled();
+    expect(fixture.ledger.latestRoundEvent(outcome.round.id, 'round.head-moved')?.payload).toMatchObject({
+      cause: 'base-rewritten',
+      detail: expect.stringContaining('no longer descends'),
+    });
+  });
+
+  it('records a conclusive review when only the base advances during lead work and inside POST', async () => {
+    const fixture = await baseAdvanceFixture('perkins-base-advance-post', 'feature/base-advance-post', 36);
+    let advancedDuringLead = false;
+    let observedBase = '';
+    const post = vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => {
+      observedBase = fixture.repo.git(['rev-parse', 'main']);
+      advanceMain(fixture.repo);
+      return liveBaseReceipt('9300', call, observedBase);
+    });
+    const escalations: string[] = [];
+    const wave = new WaveRunner({
+      ledger: fixture.ledger, worktrees: fixture.port,
+      spawner: makeSpawner(fixture.sessions, [], () => {
+        advanceMain(fixture.repo);
+        advancedDuringLead = true;
+      }),
+      poster: { post }, reviewArtifactRoot: fixture.artifacts,
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      prHeadProbe: localHeadProbe('feature/base-advance-post'),
+    });
+    const outcome = asWave(await wave.runRound({ jobId: fixture.job.id }));
+    expect(advancedDuringLead).toBe(true);
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(observedBase).not.toBe(fixture.base); // lead advance was visible at the identity probe
+    expectRecordedWithFrozenBase(fixture, outcome, { reviewId: '9300', reconciled: false, observedBase });
+    expect(escalations).toEqual([]);
+  });
+
+  it('records a reconciled delivery when POST throws and the base advances inside the reconcile lookup', async () => {
+    const fixture = await baseAdvanceFixture('perkins-base-advance-reconcile', 'feature/base-advance-reconcile', 37);
+    const post = vi.fn(async () => { throw new Error('gh api review delivery exited 1: simulated timeout after commit'); });
+    let observedBase = '';
+    const reconcile = vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => {
+      observedBase = fixture.repo.git(['rev-parse', 'main']);
+      advanceMain(fixture.repo);
+      return liveBaseReceipt('9301', call, observedBase);
+    });
+    const escalations: string[] = [];
+    const wave = new WaveRunner({
+      ledger: fixture.ledger, worktrees: fixture.port, spawner: makeSpawner(fixture.sessions, []),
+      poster: { post, reconcile }, reviewArtifactRoot: fixture.artifacts,
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      prHeadProbe: localHeadProbe('feature/base-advance-reconcile'),
+    });
+    const outcome = asWave(await wave.runRound({ jobId: fixture.job.id }));
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(reconcile).toHaveBeenCalledTimes(1);
+    expect(observedBase).toBe(fixture.base); // the base advanced only after reconciliation began
+    expectRecordedWithFrozenBase(fixture, outcome, { reviewId: '9301', reconciled: true, observedBase });
+    expect(escalations).toEqual([]);
+  });
+
+  /** Push a new commit (same tree, parent = frozen target) to origin's PR
+   * branch: the reviewed target moves on the host mid-delivery. */
+  function pushMovedTarget(fixture: Awaited<ReturnType<typeof baseAdvanceFixture>>, branch: string): void {
+    const next = fixture.repo.git([
+      '-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid',
+      'commit-tree', `${fixture.target}^{tree}`, '-p', fixture.target, '-m', 'target moves during delivery',
+    ]);
+    fixture.repo.git(['push', '--quiet', 'origin', `${next}:refs/heads/${branch}`]);
+  }
+
+  it('refuses to record a delivery when the target is pushed inside POST or inside the reconcile lookup', async () => {
+    // (a) POST returns a valid receipt, but the target moved while it was
+    // outstanding: the post-delivery guard refuses the recording.
+    const inPost = await baseAdvanceFixture('perkins-target-push-post', 'feature/target-push-post', 38);
+    const post = vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => {
+      pushMovedTarget(inPost, 'feature/target-push-post');
+      return liveBaseReceipt('9302', call, inPost.base);
+    });
+    const postEscalations: string[] = [];
+    const postWave = new WaveRunner({
+      ledger: inPost.ledger, worktrees: inPost.port, spawner: makeSpawner(inPost.sessions, []),
+      poster: { post }, reviewArtifactRoot: inPost.artifacts,
+      escalate: (title, detail) => postEscalations.push(`${title}: ${detail}`),
+      prHeadProbe: localHeadProbe('feature/target-push-post'),
+    });
+    const postOutcome = asWave(await postWave.runRound({ jobId: inPost.job.id }));
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(postOutcome.posted).toBe(false);
+    expect(postOutcome.verdict).toBeNull();
+    expect(postOutcome.canonicalVerdict).toBe('INCOMPLETE');
+    expect(postOutcome.headMoved).toBe(true);
+    expect(inPost.ledger.latestRoundEvent(postOutcome.round.id, 'round.posted')).toBeNull();
+    expect(postEscalations.some((line) => line.includes('source changed while the report was being delivered (target-moved:'))).toBe(true);
+    // (b) POST throws; the target moves while the reconcile lookup is
+    // outstanding: the found receipt is kept unrecorded with the exact reason.
+    const inReconcile = await baseAdvanceFixture('perkins-target-push-reconcile', 'feature/target-push-reconcile', 39);
+    const failingPost = vi.fn(async () => { throw new Error('gh api review delivery exited 1: simulated timeout after commit'); });
+    const reconcile = vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => {
+      pushMovedTarget(inReconcile, 'feature/target-push-reconcile');
+      return liveBaseReceipt('9303', call, inReconcile.base);
+    });
+    const reconcileWave = new WaveRunner({
+      ledger: inReconcile.ledger, worktrees: inReconcile.port, spawner: makeSpawner(inReconcile.sessions, []),
+      poster: { post: failingPost, reconcile }, reviewArtifactRoot: inReconcile.artifacts,
+      prHeadProbe: localHeadProbe('feature/target-push-reconcile'),
+    });
+    const reconcileOutcome = asWave(await reconcileWave.runRound({ jobId: inReconcile.job.id }));
+    expect(reconcile).toHaveBeenCalledTimes(1);
+    expect(reconcileOutcome.posted).toBe(false);
+    expect(reconcileOutcome.canonicalVerdict).toBe('INCOMPLETE');
+    expect(reconcileOutcome.headMoved).toBe(true);
+    expect(inReconcile.ledger.latestRoundEvent(reconcileOutcome.round.id, 'round.posted')).toBeNull();
+    const unrecorded = JSON.parse(readFileSync(join(reconcileOutcome.artifactDirectory, 'perkins-report.reconciled-unrecorded.json'), 'utf8')) as {
+      recorded?: boolean; reason?: string; receipt?: { reviewId?: string };
+    };
+    expect(unrecorded.recorded).toBe(false);
+    expect(unrecorded.reason).toMatch(/^source changed while the reconciliation lookup was outstanding \(target-moved: .+\)$/);
+    expect(unrecorded.receipt?.reviewId).toBe('9303');
   });
 
   it('fails loudly when the newest completed predecessor record is missing (B9)', async () => {
@@ -1494,6 +1968,182 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     const securityChip = ledger.getRound(outcome.round.id)?.lenses.find((chip) => chip.lens === 'security');
     expect(securityChip?.state).toBe('done');
     expect(securityChip?.note).toContain('earlier failed attempts: a1 output');
+  });
+
+  it('publishes truthful no-spec coverage at the caller boundary: eight available lenses, no phantom acceptance (gh-164)', async () => {
+    const repo = makeFixtureRepo('perkins-nospec-appendix');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/nospec-appendix']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-nospec-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-nospec-artifacts-'));
+    const sessions = mkdtempSync(join(tmpdir(), 'perkins-nospec-sessions-'));
+    dirs.push(root, artifacts, sessions);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-nospec-db-')));
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/nospec-appendix', target);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-nospec' });
+    const job = ledger.addJob({ id: 'job-nospec', repo: 'fixture', title: 'nospec appendix', baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/35');
+    attachOrigin(repo, 'feature/nospec-appendix', root);
+    const poster = receiptPoster();
+    const wave = new WaveRunner({
+      ledger, worktrees: port,
+      spawner: fakeWholeSpawner(sessions, { childAnswer: () => '[]', specialists: ['blind'] }).spawner,
+      poster,
+      reviewArtifactRoot: artifacts,
+      prHeadProbe: localHeadProbe('feature/nospec-appendix'),
+    });
+    const outcome = asWave(await wave.runRound({ jobId: job.id, noSpec: true }));
+    // The round's OWN chips are the no-spec catalog: acceptance was never
+    // available, so it can neither be run nor reported as unused.
+    expect(outcome.round.lenses.map((chip) => chip.lens)).toEqual([
+      'blind', 'edge', 'security', 'architecture', 'codebase', 'tests', 'performance', 'operations',
+    ]);
+    const postedBody = poster.post.mock.calls[0]?.[0]?.body as string;
+    expect(postedBody).toContain('- Available specialist lenses this round: 8');
+    expect(postedBody).toContain('- Lenses not used this round: edge, security, architecture, codebase, tests, performance, operations');
+    expect(postedBody).not.toContain('acceptance');
+  });
+
+  it('a REAL App publisher reconciling a failed POST never credits a stale identical review — no round.posted, no verdict (App seam)', async () => {
+    // r1 finding 2 end-to-end: WaveRunner calls poster.reconcile after the
+    // failed post; the App publisher's attempt-constrained second lookup
+    // must leave the provider's stale identical review uncredited, so the
+    // round stays honestly unposted (no round.posted event, no recorded
+    // verdict, no approval completion).
+    const { privateKey } = generateKeyPairSync('rsa', {
+      modulusLength: 2048,
+      privateKeyEncoding: { type: 'pkcs1', format: 'pem' },
+      publicKeyEncoding: { type: 'spki', format: 'pem' },
+    });
+    const home = mkdtempSync(join(tmpdir(), 'perkins-app-seam-home-'));
+    dirs.push(home);
+    mkdirSync(join(home, 'perkins'), { recursive: true });
+    chmodSync(join(home, 'perkins'), 0o700);
+    writeFileSync(join(home, 'perkins', 'app-key.pem'), privateKey, 'utf8');
+    chmodSync(join(home, 'perkins', 'app-key.pem'), 0o600);
+    const configPath = join(home, 'perkins', 'config');
+    writeFileSync(configPath, 'app_id=424242\nkey_path="app-key.pem"\ninstallation_id_acme=164552969\n', 'utf8');
+    chmodSync(configPath, 0o600);
+
+    const repo = makeFixtureRepo('perkins-app-seam');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/app-seam']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    // The App publisher binds credentials to the PR URL's origin: an
+    // ssh-form github.com origin satisfies the identity check. The freeze
+    // and drift checks still FETCH that origin and cross-check the local
+    // head probe, so the fixture binds the ssh transport to a local bare
+    // repo via core.sshCommand — every production freshness check runs,
+    // with no network. The delivery itself rides the mocked fetch.
+    const originRoot = mkdtempSync(join(tmpdir(), 'perkins-app-seam-origin-'));
+    dirs.push(originRoot);
+    const origin = join(originRoot, 'origin.git');
+    execFileSync('git', ['init', '--bare', '--quiet', origin], { stdio: 'ignore' });
+    repo.git(['remote', 'add', 'origin', 'git@github.com:acme/widget.git']);
+    repo.git(['push', '--quiet', origin, 'refs/heads/feature/app-seam']);
+    const sshDouble = join(originRoot, 'ssh-double.sh');
+    writeFileSync(sshDouble, `#!/bin/sh\nexec git-upload-pack ${JSON.stringify(origin)}\n`, 'utf8');
+    chmodSync(sshDouble, 0o755);
+    repo.git(['config', 'core.sshCommand', sshDouble]);
+
+    const NOW = 1_800_000_000_000;
+    let postCount = 0;
+    let lookupCount = 0;
+    let allRequests = 0;
+    let deliveredBody = '';
+    const fetchImpl: AppFetch = async (url, init: AppFetchInit = {}) => {
+      const method = init.method ?? 'GET';
+      allRequests += 1;
+      const json = (status: number, body: unknown) => ({
+        ok: status >= 200 && status < 300,
+        status,
+        text: async () => JSON.stringify(body),
+      });
+      if (method === 'GET' && /\/app$/.test(url)) {
+        return json(200, { id: 424242, slug: 'perkins-review', owner: { login: 'solarity-services' } });
+      }
+      if (method === 'POST' && /\/app\/installations\/164552969\/access_tokens$/.test(url)) {
+        return json(201, {
+          token: `ghs_${'S'.repeat(36)}`,
+          expires_at: new Date(NOW + 3_600_000).toISOString(),
+          permissions: { 'pull_requests': 'write', 'metadata': 'read' },
+          repositories: [{ full_name: 'acme/widget', id: 1 }],
+        });
+      }
+      if (method === 'GET' && /\/repos\/acme\/widget\/pulls\/7$/.test(url)) {
+        return json(200, { number: 7, head: { sha: target }, base: { sha: 'b'.repeat(40) } });
+      }
+      if (method === 'POST' && /\/repos\/acme\/widget\/pulls\/7\/reviews$/.test(url)) {
+        postCount += 1;
+        deliveredBody = typeof init.body === 'string' ? (JSON.parse(init.body) as { body?: string }).body ?? '' : '';
+        throw new Error('socket hang up after send');
+      }
+      if (method === 'GET' && /\/repos\/acme\/widget\/pulls\/7\/reviews\?/.test(url)) {
+        lookupCount += 1;
+        // ONLY a stale identical App review: submitted an hour before this
+        // round's POST. An unconstrained second lookup would credit it.
+        return json(200, [{
+          id: 555666,
+          user: { login: 'perkins-review[bot]', type: 'Bot', id: 308038895 },
+          commit_id: target,
+          state: 'COMMENTED',
+          body: deliveredBody,
+          submitted_at: new Date(NOW - 3_600_000).toISOString(),
+        }]);
+      }
+      return json(404, { message: `no test route for ${method} ${url}` });
+    };
+    // The REAL production path: AutoVerdictPoster selecting the real App
+    // publisher — so the post-failure caller context must travel through
+    // AutoVerdictPoster.reconcile to the same selected backend, not just
+    // to a directly injected double.
+    const poster = new AutoVerdictPoster(new PerkinsAppPrPoster({ instanceDir: home, fetchImpl, now: () => NOW }));
+
+    const root = mkdtempSync(join(tmpdir(), 'perkins-app-seam-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-app-seam-artifacts-'));
+    const sessions = mkdtempSync(join(tmpdir(), 'perkins-app-seam-sessions-'));
+    dirs.push(root, artifacts, sessions);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-app-seam-db-')));
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/app-seam', target);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-app-seam' });
+    const job = ledger.addJob({ id: 'job-app-seam', repo: 'fixture', title: 'app seam', baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://github.com/acme/widget/pull/7');
+    const escalations: string[] = [];
+    const wave = new WaveRunner({
+      ledger, worktrees: port, spawner: makeSpawner(sessions, []), poster, reviewArtifactRoot: artifacts,
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      prHeadProbe: localHeadProbe('feature/app-seam') as ReturnType<typeof localHeadProbe>,
+    });
+    const outcome = asWave(await wave.runRound({ jobId: job.id }));
+    // Exactly one POST (never a duplicate) and exactly ONE reviews lookup:
+    // post()'s own bounded strict-window reconciliation. A second lookup
+    // would prove the post-failure context never reached the selected App
+    // (ordinary recovery would then also CREDIT the stale review and
+    // record round.posted).
+    expect(postCount).toBe(1);
+    expect(lookupCount).toBe(1);
+    // The WHOLE provider interaction is exactly the five requests of one
+    // post attempt (App identity, token mint, PR identity, the failed
+    // POST, and post()'s single strict-window lookup): any additional
+    // request — including anything the live second lookup might have sent
+    // — fails this pin.
+    expect(allRequests).toBe(5);
+    // The stale identical review is NOT credited: honestly unposted.
+    expect(outcome.posted).toBe(false);
+    expect(outcome.round.status).not.toBe('verdict-posted');
+    expect(ledger.latestRoundEvent(outcome.round.id, 'round.posted')).toBeNull();
+    expect(ledger.latestRoundEvent(outcome.round.id, 'round.perkins-incomplete')).not.toBeNull();
+    expect(outcome.verdict ?? null).toBeNull();
+    expect(escalations.length).toBeGreaterThanOrEqual(1);
   });
 
   it('reconciles an ambiguous post through the PRODUCTION adapter: same provider selection, single POST (T1)', async () => {
@@ -1619,7 +2269,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     expect(postedEvent.receipt?.headSha).toBe(target);
     expect(postedEvent.receipt?.bodySha256).toBe(postedEvent.publicationSha256);
     // Recovery consumes the ACTUAL persisted event and completes the round.
-    const secondPoster = { post: vi.fn() } as unknown as VerdictPoster;
+    const secondPoster = { post: vi.fn(), authenticatedActor: async () => 'gru-bot' } as unknown as VerdictPoster;
     // A REAL crash dies before runOwnedReview's finally sweeps the review
     // worktree; the sweep above only ran because the simulated crash let
     // the flow continue. Present the crash-time lane state (unswept) to
@@ -1628,6 +2278,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
       createJobWorktree: (input) => port.createJobWorktree(input),
       resolveReviewTarget: (input) => port.resolveReviewTarget(input),
       createReviewWorktree: (input) => port.createReviewWorktree(input),
+      createChildWorktree: (input) => port.createChildWorktree(input),
       getWorktree: (id) => port.getWorktree(id),
       listWorktrees: (listOpts) => port.listWorktrees(listOpts).map((lane) =>
         lane.roundId === outcome.round.id && lane.status === 'swept' ? { ...lane, status: 'active' } : lane),
@@ -1702,89 +2353,335 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     }
   });
 
-  it('does not record a reconciled delivery when the ref moved or the run aborted during the lookup (T4)', async () => {
-    const prepare = async (name: string, branch: string) => {
-      const repo = makeFixtureRepo(name);
+  it('does not record a reconciled delivery when the ref moved during the lookup (T4a)', async () => {
+    // Split from the former composite T4 (moved + aborted in one body): each
+    // scenario runs under its own unchanged body ceiling with its assertions
+    // intact; main's observation-only T4-PHASE/T4-ATTR instrumentation is
+    // retained per leg.
+    // T4 phase evidence (phase pr144-t4-phase-evidence-20261001; test-local,
+    // observation only): monotonic elapsed per named boundary, emitted as
+    // bounded JSON lines so partial evidence survives an exceptional exit or
+    // the unchanged 30000 ms bound. Emits stdout lines only; never alters
+    // refs, ordering, mocks, or assertions.
+    const t4Mark = (kase: 'moved' | 'aborted', phase: string, boundary: 'start' | 'end', outcome: string, elapsedMs?: number): void => {
+      console.log(`T4-PHASE ${JSON.stringify({ case: kase, phase, boundary, outcome, ...(elapsedMs !== undefined ? { elapsedMs: Math.round(elapsedMs) } : {}) })}`);
+    };
+    const t4Timed = async <T>(kase: 'moved' | 'aborted', phase: string, run: () => Promise<T>): Promise<T> => {
+      const started = performance.now();
+      t4Mark(kase, phase, 'start', 'begin');
+      try {
+        const result = await run();
+        t4Mark(kase, phase, 'end', 'completed', performance.now() - started);
+        return result;
+      } catch (error) {
+        t4Mark(kase, phase, 'end', error instanceof Error ? `rejected:${error.name}` : 'rejected', performance.now() - started);
+        throw error;
+      }
+    };
+    // Finer attribution (phase pr144-t4-deep-attribution-20261001; test-local,
+    // observation only): T4-ATTR carries the absolute elapsed relative to this
+    // test's monotonic start on EVERY boundary plus per-phase elapsed, and
+    // subdivides fixture prep, the review-lifecycle boundaries this test
+    // drives (head probe, native lead start, reconciliation lookup), and the
+    // outside-body cleanup (emitted from the gated afterEach). Every real
+    // call is forwarded exactly once; ordering, mocks, refs, and assertions
+    // are untouched. The T4-PHASE marks above are emitted unchanged.
+    // Nested intervals (reconcile-lookup inside wave-round) are reported
+    // separately and are never summed into totals.
+    const t4Start = performance.now();
+    t4StartAt = t4Start;
+    t4Observe = true;
+    t4BodyCompleted = false;
+    const t4Attr = (leg: 'moved' | 'aborted' | 'suite', phase: string, boundary: 'start' | 'end', extra?: { elapsedMs?: number; outcome?: string; note?: string }): void => {
+      console.log(`T4-ATTR ${JSON.stringify({
+        leg, phase, boundary, absMs: Math.round(performance.now() - t4Start),
+        ...(extra?.elapsedMs !== undefined ? { elapsedMs: Math.round(extra.elapsedMs) } : {}),
+        ...(extra?.outcome !== undefined ? { outcome: extra.outcome } : {}),
+        ...(extra?.note !== undefined ? { note: extra.note } : {}),
+      })}`);
+    };
+    // run() may settle synchronously (plain value) or asynchronously
+    // (thenable); the awaited result is forwarded with its exact value and
+    // type, exactly one invocation, unchanged error propagation and ordering.
+    const t4Step = async <T>(leg: 'moved' | 'aborted', phase: string, run: () => T | Promise<T>): Promise<Awaited<T>> => {
+      t4Attr(leg, phase, 'start');
+      const started = performance.now();
+      try {
+        const result = await run();
+        t4Attr(leg, phase, 'end', { elapsedMs: performance.now() - started, outcome: 'completed' });
+        return result;
+      } catch (error) {
+        t4Attr(leg, phase, 'end', { elapsedMs: performance.now() - started, outcome: error instanceof Error ? `rejected:${error.name}` : 'rejected' });
+        throw error;
+      }
+    };
+    const t4Probe = (leg: 'moved' | 'aborted', branch: string): PrHeadProbe => {
+      const inner = localHeadProbe(branch);
+      return (input) => t4Step(leg, 'wave/head-probe', () => inner(input));
+    };
+    t4Attr('suite', 'test-start', 'start', { note: 'split T4a: moved discriminator, inherited 30000 ms bound unchanged; nested intervals are never summed' });
+    const prepare = async (name: string, branch: string, leg: 'moved' | 'aborted') => {
+      const repo = await t4Step(leg, 'fixture/repo-init', async () => makeFixtureRepo(name, (step) => t4Attr(leg, `fixture/repo-init.${step}`, 'end', { outcome: 'completed' })));
       repos.push(repo);
-      repo.git(['checkout', '-b', branch]);
-      const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 44;\n}\n');
-      const root = mkdtempSync(join(tmpdir(), `${name}-port-`));
-      const artifacts = mkdtempSync(join(tmpdir(), `${name}-artifacts-`));
-      const sessions = mkdtempSync(join(tmpdir(), `${name}-sessions-`));
-      dirs.push(root, artifacts, sessions);
-      const db = new LedgerDb(mkdtempSync(join(tmpdir(), `${name}-db-`)));
-      dbs.push(db);
-      const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+      await t4Step(leg, 'fixture/branch-create', async () => { repo.git(['checkout', '-b', branch]); });
+      const target = await t4Step(leg, 'fixture/target-commit', () => {
+        // Batched equivalent of commitFile's add+commit (phase
+        // pr144-t4-cost-repair-20261001): one git process stages the file
+        // and commits (`commit --include`), removing a Node-to-git spawn
+        // per leg while keeping the identical Fixture Tests identity, the
+        // identical default message, parent, and resulting tree/HEAD, and
+        // the same loud non-zero failure propagation on any git error.
+        const file = join(repo.path, 'src/main.ts');
+        mkdirSync(dirname(file), { recursive: true });
+        writeFileSync(file, 'export function answer(): number {\n  return 44;\n}\n');
+        repo.git([
+          '-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid',
+          'commit', '--include', 'src/main.ts', '-m', 'fixture: update src/main.ts',
+        ]);
+        // The branch ref was just written loose by the commit above; the
+        // loose read is value-identical to `git rev-parse HEAD` (HEAD is
+        // the branch here) with an exact rev-parse fallback.
+        return looseRefOrRevParse(repo.path, `refs/heads/${branch}`);
+      });
+      const temps = await t4Step(leg, 'fixture/tempdirs', () => {
+        const root = mkdtempSync(join(tmpdir(), `${name}-port-`));
+        const artifacts = mkdtempSync(join(tmpdir(), `${name}-artifacts-`));
+        const sessions = mkdtempSync(join(tmpdir(), `${name}-sessions-`));
+        dirs.push(root, artifacts, sessions);
+        return { root, artifacts, sessions };
+      });
+      const root = temps.root;
+      const artifacts = temps.artifacts;
+      const sessions = temps.sessions;
+      const ledger = await t4Step(leg, 'fixture/ledger-open', () => {
+        const db = new LedgerDb(mkdtempSync(join(tmpdir(), `${name}-db-`)));
+        dbs.push(db);
+        return new LedgerApi(db.handle, { bus: new EventBus() });
+      });
       const port = new GitReviewPort(root, branch, target);
-      await port.createJobWorktree({ repoPath: repo.path, jobId: `job-${name}` });
-      const job = ledger.addJob({ id: `job-${name}`, repo: 'fixture', title: name, baseBranch: 'main', briefing: 'review' });
-      ledger.setJobStatus(job.id, 'working');
-      settleLane(ledger, job.id);
-      ledger.setJobPr(job.id, `https://git.example.invalid/acme/fixture/pull/${name.length}`);
-      attachOrigin(repo, branch, root);
+      await t4Step(leg, 'fixture/worktree-create', () => port.createJobWorktree({ repoPath: repo.path, jobId: `job-${name}` }));
+      const job = await t4Step(leg, 'fixture/lane-register', () => {
+        const job = ledger.addJob({ id: `job-${name}`, repo: 'fixture', title: name, baseBranch: 'main', briefing: 'review' });
+        ledger.setJobStatus(job.id, 'working');
+        settleLane(ledger, job.id);
+        ledger.setJobPr(job.id, `https://git.example.invalid/acme/fixture/pull/${name.length}`);
+        return job;
+      });
+      await t4Step(leg, 'fixture/origin-push', async () => { attachOrigin(repo, branch, root, { batched: true }); });
       return { repo, ledger, port, artifacts, sessions, target, job, root };
     };
-    // (a) The movement ref advances while the reconciliation lookup is
+    // T4a: the base is rewritten (orphan) while the reconciliation lookup is
     // outstanding: the receipt is preserved, never recorded as delivery.
-    const moved = await prepare('perkins-t4-moved', 'feature/t4-moved');
+    const moved = await t4Timed('moved', 'fixture-prep', () => prepare('perkins-t4-moved', 'feature/t4-moved', 'moved'));
     const post = vi.fn(async () => { throw new Error('gh api review delivery exited 1: timeout'); });
     const reconcile = vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => {
-      // The frozen BASE drifts while the lookup is outstanding — the
-      // stale-source guard refMovedSinceFreeze must refuse the recording.
-      // commit-tree needs an explicit identity: CI runners have no global
-      // git user (commitFile passes one the same way).
-      const newMain = moved.repo.git([
-        '-c', 'user.name=T4 Fixture', '-c', 'user.email=t4@example.invalid',
-        'commit-tree', 'main^{tree}', '-m', 'base moves during lookup',
-      ]).trim();
-      moved.repo.git(['branch', '-f', 'main', newMain]);
-      return {
-        reviewId: '9200', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
-        headSha: call.targetSha, baseSha: 'b'.repeat(40),
-        bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
-      };
+      return t4Timed('moved', 'reconcile-lookup', async () => {
+        // The base is rewritten (orphan) while the lookup is outstanding:
+        // commit-tree without -p, so the new `main` no longer descends from
+        // the frozen merge-base — the stale-source guard refMovedSinceFreeze
+        // must refuse the recording.
+        // commit-tree needs an explicit identity: CI runners have no global
+        // git user (commitFile passes one the same way).
+        const gitStarted = performance.now();
+        t4Mark('moved', 'git-ops', 'start', 'begin');
+        const newMain = moved.repo.git([
+          '-c', 'user.name=T4 Fixture', '-c', 'user.email=t4@example.invalid',
+          'commit-tree', 'main^{tree}', '-m', 'base moves during lookup',
+        ]).trim();
+        moved.repo.git(['branch', '-f', 'main', newMain]);
+        t4Mark('moved', 'git-ops', 'end', 'completed', performance.now() - gitStarted);
+        return {
+          reviewId: '9200', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+          headSha: call.targetSha, baseSha: 'b'.repeat(40),
+          bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
+        };
+      });
     });
     const escalations: string[] = [];
+    const escalationContexts: (EscalationContext | undefined)[] = [];
     const movedWave = new WaveRunner({
-      ledger: moved.ledger, worktrees: moved.port, spawner: makeSpawner(moved.sessions, []),
+      ledger: moved.ledger, worktrees: moved.port, spawner: makeSpawner(moved.sessions, [], () => t4Attr('moved', 'wave/lead-start', 'end', { outcome: 'completed', note: 'native lead child start on the original production path' }), undefined, '  return 44;'),
       poster: { post, reconcile }, reviewArtifactRoot: moved.artifacts,
-      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
-      prHeadProbe: localHeadProbe('feature/t4-moved'),
+      escalate: (title, detail, context) => {
+        escalations.push(`${title}: ${detail}`);
+        escalationContexts.push(context);
+      },
+      prHeadProbe: t4Probe('moved', 'feature/t4-moved'),
     });
-    const movedOutcome = asWave(await movedWave.runRound({ jobId: moved.job.id }));
+    const movedOutcome = asWave(await t4Timed('moved', 'wave-round', () => movedWave.runRound({ jobId: moved.job.id })));
     expect(movedOutcome.posted).toBe(false);
     expect(movedOutcome.verdict).toBeNull();
     expect(movedOutcome.canonicalVerdict).toBe('INCOMPLETE');
     expect(escalations.some((line) => line.includes('reconciled a provider review but did NOT record it'))).toBe(true);
+    // Producer context: the reconciled-unrecorded escalation carries its
+    // validated round/job identity for the notification binding (A4).
+    expect(
+      escalationContexts.some(
+        (context) => context?.jobId === moved.job.id && context.roundId === movedOutcome.round.id,
+      ),
+    ).toBe(true);
     const unrecorded = JSON.parse(readFileSync(join(moved.artifacts, movedOutcome.round.id, 'perkins-report.reconciled-unrecorded.json'), 'utf8')) as { recorded?: boolean; reason?: string; receipt?: { reviewId?: string } };
     expect(unrecorded.recorded).toBe(false);
-    expect(unrecorded.reason).toContain('moved while the reconciliation lookup was outstanding');
+    expect(unrecorded.reason).toMatch(/^source changed while the reconciliation lookup was outstanding \(base-rewritten: .+\)$/);
     expect(unrecorded.receipt?.reviewId).toBe('9200');
     expect(moved.ledger.latestRoundEvent(movedOutcome.round.id, 'round.posted')).toBeNull();
+    t4Attr('moved', 'leg', 'end', { outcome: 'completed', note: 'fixture-prep + wave-round + assertions; reconcile-lookup/git-ops are NESTED in wave-round — never summed' });
+    t4BodyCompleted = true;
+    t4Attr('suite', 'test-end', 'end', { outcome: 'completed' });
+  });
+
+  it('does not record a reconciled delivery when the run aborted during the lookup (T4b)', async () => {
+    // Split from the former composite T4 (moved + aborted in one body): each
+    // scenario runs under its own unchanged body ceiling with its assertions
+    // intact; main's observation-only T4-PHASE/T4-ATTR instrumentation is
+    // retained per leg.
+    // T4 phase evidence (phase pr144-t4-phase-evidence-20261001; test-local,
+    // observation only): monotonic elapsed per named boundary, emitted as
+    // bounded JSON lines so partial evidence survives an exceptional exit or
+    // the unchanged 30000 ms bound. Emits stdout lines only; never alters
+    // refs, ordering, mocks, or assertions.
+    const t4Mark = (kase: 'moved' | 'aborted', phase: string, boundary: 'start' | 'end', outcome: string, elapsedMs?: number): void => {
+      console.log(`T4-PHASE ${JSON.stringify({ case: kase, phase, boundary, outcome, ...(elapsedMs !== undefined ? { elapsedMs: Math.round(elapsedMs) } : {}) })}`);
+    };
+    const t4Timed = async <T>(kase: 'moved' | 'aborted', phase: string, run: () => Promise<T>): Promise<T> => {
+      const started = performance.now();
+      t4Mark(kase, phase, 'start', 'begin');
+      try {
+        const result = await run();
+        t4Mark(kase, phase, 'end', 'completed', performance.now() - started);
+        return result;
+      } catch (error) {
+        t4Mark(kase, phase, 'end', error instanceof Error ? `rejected:${error.name}` : 'rejected', performance.now() - started);
+        throw error;
+      }
+    };
+    // Finer attribution (phase pr144-t4-deep-attribution-20261001; test-local,
+    // observation only): T4-ATTR carries the absolute elapsed relative to this
+    // test's monotonic start on EVERY boundary plus per-phase elapsed, and
+    // subdivides fixture prep, the review-lifecycle boundaries this test
+    // drives (head probe, native lead start, reconciliation lookup), and the
+    // outside-body cleanup (emitted from the gated afterEach). Every real
+    // call is forwarded exactly once; ordering, mocks, refs, and assertions
+    // are untouched. The T4-PHASE marks above are emitted unchanged.
+    // Nested intervals (reconcile-lookup inside wave-round) are reported
+    // separately and are never summed into totals.
+    const t4Start = performance.now();
+    t4StartAt = t4Start;
+    t4Observe = true;
+    t4BodyCompleted = false;
+    const t4Attr = (leg: 'moved' | 'aborted' | 'suite', phase: string, boundary: 'start' | 'end', extra?: { elapsedMs?: number; outcome?: string; note?: string }): void => {
+      console.log(`T4-ATTR ${JSON.stringify({
+        leg, phase, boundary, absMs: Math.round(performance.now() - t4Start),
+        ...(extra?.elapsedMs !== undefined ? { elapsedMs: Math.round(extra.elapsedMs) } : {}),
+        ...(extra?.outcome !== undefined ? { outcome: extra.outcome } : {}),
+        ...(extra?.note !== undefined ? { note: extra.note } : {}),
+      })}`);
+    };
+    // run() may settle synchronously (plain value) or asynchronously
+    // (thenable); the awaited result is forwarded with its exact value and
+    // type, exactly one invocation, unchanged error propagation and ordering.
+    const t4Step = async <T>(leg: 'moved' | 'aborted', phase: string, run: () => T | Promise<T>): Promise<Awaited<T>> => {
+      t4Attr(leg, phase, 'start');
+      const started = performance.now();
+      try {
+        const result = await run();
+        t4Attr(leg, phase, 'end', { elapsedMs: performance.now() - started, outcome: 'completed' });
+        return result;
+      } catch (error) {
+        t4Attr(leg, phase, 'end', { elapsedMs: performance.now() - started, outcome: error instanceof Error ? `rejected:${error.name}` : 'rejected' });
+        throw error;
+      }
+    };
+    const t4Probe = (leg: 'moved' | 'aborted', branch: string): PrHeadProbe => {
+      const inner = localHeadProbe(branch);
+      return (input) => t4Step(leg, 'wave/head-probe', () => inner(input));
+    };
+    t4Attr('suite', 'test-start', 'start', { note: 'split T4b: aborted discriminator, inherited 30000 ms bound unchanged; nested intervals are never summed' });
+    const prepare = async (name: string, branch: string, leg: 'moved' | 'aborted') => {
+      const repo = await t4Step(leg, 'fixture/repo-init', async () => makeFixtureRepo(name, (step) => t4Attr(leg, `fixture/repo-init.${step}`, 'end', { outcome: 'completed' })));
+      repos.push(repo);
+      await t4Step(leg, 'fixture/branch-create', async () => { repo.git(['checkout', '-b', branch]); });
+      const target = await t4Step(leg, 'fixture/target-commit', () => {
+        // Batched equivalent of commitFile's add+commit (phase
+        // pr144-t4-cost-repair-20261001): one git process stages the file
+        // and commits (`commit --include`), removing a Node-to-git spawn
+        // per leg while keeping the identical Fixture Tests identity, the
+        // identical default message, parent, and resulting tree/HEAD, and
+        // the same loud non-zero failure propagation on any git error.
+        const file = join(repo.path, 'src/main.ts');
+        mkdirSync(dirname(file), { recursive: true });
+        writeFileSync(file, 'export function answer(): number {\n  return 44;\n}\n');
+        repo.git([
+          '-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid',
+          'commit', '--include', 'src/main.ts', '-m', 'fixture: update src/main.ts',
+        ]);
+        // The branch ref was just written loose by the commit above; the
+        // loose read is value-identical to `git rev-parse HEAD` (HEAD is
+        // the branch here) with an exact rev-parse fallback.
+        return looseRefOrRevParse(repo.path, `refs/heads/${branch}`);
+      });
+      const temps = await t4Step(leg, 'fixture/tempdirs', () => {
+        const root = mkdtempSync(join(tmpdir(), `${name}-port-`));
+        const artifacts = mkdtempSync(join(tmpdir(), `${name}-artifacts-`));
+        const sessions = mkdtempSync(join(tmpdir(), `${name}-sessions-`));
+        dirs.push(root, artifacts, sessions);
+        return { root, artifacts, sessions };
+      });
+      const root = temps.root;
+      const artifacts = temps.artifacts;
+      const sessions = temps.sessions;
+      const ledger = await t4Step(leg, 'fixture/ledger-open', () => {
+        const db = new LedgerDb(mkdtempSync(join(tmpdir(), `${name}-db-`)));
+        dbs.push(db);
+        return new LedgerApi(db.handle, { bus: new EventBus() });
+      });
+      const port = new GitReviewPort(root, branch, target);
+      await t4Step(leg, 'fixture/worktree-create', () => port.createJobWorktree({ repoPath: repo.path, jobId: `job-${name}` }));
+      const job = await t4Step(leg, 'fixture/lane-register', () => {
+        const job = ledger.addJob({ id: `job-${name}`, repo: 'fixture', title: name, baseBranch: 'main', briefing: 'review' });
+        ledger.setJobStatus(job.id, 'working');
+        settleLane(ledger, job.id);
+        ledger.setJobPr(job.id, `https://git.example.invalid/acme/fixture/pull/${name.length}`);
+        return job;
+      });
+      await t4Step(leg, 'fixture/origin-push', async () => { attachOrigin(repo, branch, root, { batched: true }); });
+      return { repo, ledger, port, artifacts, sessions, target, job, root };
+    };
     // (b) The run's abort signal fires while the lookup is outstanding.
-    const aborted = await prepare('perkins-t4-aborted', 'feature/t4-aborted');
+    const aborted = await t4Timed('aborted', 'fixture-prep', () => prepare('perkins-t4-aborted', 'feature/t4-aborted', 'aborted'));
     const abortPost = vi.fn(async () => { throw new Error('gh api review delivery exited 1: timeout'); });
     const abortReconcile = vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => {
-      for (const controller of (abortedWave as unknown as { activeControllers: Set<AbortController> }).activeControllers) controller.abort();
-      return {
-        reviewId: '9201', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
-        headSha: call.targetSha, baseSha: 'b'.repeat(40),
-        bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
-      };
+      return t4Timed('aborted', 'reconcile-lookup', async () => {
+        for (const controller of (abortedWave as unknown as { activeControllers: Set<AbortController> }).activeControllers) controller.abort();
+        return {
+          reviewId: '9201', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+          headSha: call.targetSha, baseSha: 'b'.repeat(40),
+          bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
+        };
+      });
     });
     const abortEscalations: string[] = [];
     const abortedWave = new WaveRunner({
-      ledger: aborted.ledger, worktrees: aborted.port, spawner: makeSpawner(aborted.sessions, []),
+      ledger: aborted.ledger, worktrees: aborted.port, spawner: makeSpawner(aborted.sessions, [], () => t4Attr('aborted', 'wave/lead-start', 'end', { outcome: 'completed', note: 'native lead child start on the original production path' }), undefined, '  return 44;'),
       poster: { post: abortPost, reconcile: abortReconcile }, reviewArtifactRoot: aborted.artifacts,
       escalate: (title, detail) => abortEscalations.push(`${title}: ${detail}`),
-      prHeadProbe: localHeadProbe('feature/t4-aborted'),
+      prHeadProbe: t4Probe('aborted', 'feature/t4-aborted'),
     });
-    const abortedOutcome = asWave(await abortedWave.runRound({ jobId: aborted.job.id }));
+    const abortedOutcome = asWave(await t4Timed('aborted', 'wave-round', () => abortedWave.runRound({ jobId: aborted.job.id })));
     expect(abortedOutcome.posted).toBe(false);
     expect(abortedOutcome.verdict).toBeNull();
-    const unrecordedAbort = JSON.parse(readFileSync(join(aborted.artifacts, abortedOutcome.round.id, 'perkins-report.reconciled-unrecorded.json'), 'utf8')) as { reason?: string };
+    const unrecordedAbort = JSON.parse(readFileSync(join(aborted.artifacts, abortedOutcome.round.id, 'perkins-report.reconciled-unrecorded.json'), 'utf8')) as { recorded?: boolean; reason?: string; receipt?: { reviewId?: string } };
+    expect(unrecordedAbort.recorded).toBe(false);
     expect(unrecordedAbort.reason).toContain('aborted while the reconciliation lookup was outstanding');
+    expect(unrecordedAbort.receipt?.reviewId).toBe('9201');
     expect(aborted.ledger.latestRoundEvent(abortedOutcome.round.id, 'round.posted')).toBeNull();
+    // T4a parity: the production abort branch escalates the unrecorded
+    // reconciled review; recording without asserting it would hide a lost
+    // operator notification.
+    expect(abortEscalations.some((line) => line.includes('reconciled a provider review but did NOT record it'))).toBe(true);
+    t4Attr('aborted', 'leg', 'end', { outcome: 'completed', note: 'fixture-prep + wave-round + assertions; reconcile-lookup is NESTED in wave-round — never summed' });
+    t4BodyCompleted = true;
+    t4Attr('suite', 'test-end', 'end', { outcome: 'completed' });
   });
 });
 
@@ -2125,6 +3022,45 @@ describe('GitLab SHA-bound merge-request delivery', () => {
     }
   });
 
+  it('re-resolves the authenticated user after a token rotation on the same host (R29)', async () => {
+    const { repoPath, cleanup } = fixture();
+    try {
+      let token = 'glpat-a';
+      const userTokens: string[] = [];
+      const fetchImpl = async (url: string, init?: { headers?: Record<string, string> }): Promise<{ ok: boolean; status: number; text(): Promise<string> }> => {
+        const current = init?.headers?.['PRIVATE-TOKEN'] ?? '';
+        if (url.endsWith('/user')) {
+          userTokens.push(current);
+          return { ok: true, status: 200, text: async () => JSON.stringify({ username: current === 'glpat-a' ? 'user-a' : 'user-b' }) };
+        }
+        if (url.includes('/notes') && !url.includes('?')) {
+          return { ok: true, status: 201, text: async () => JSON.stringify({ id: 70, body: 'rotated body\n', author: { username: current === 'glpat-a' ? 'user-a' : 'user-b' } }) };
+        }
+        return { ok: true, status: 200, text: async () => JSON.stringify({ sha: head, diff_refs: { base_sha: base } }) };
+      };
+      const poster = new GitLabMrPoster({ tokenResolver: () => token, fetchImpl });
+      await expect(poster.post({ prUrl: mrUrl, host: 'gitlab.example.test', repoPath, body: 'rotated body\n', targetSha: head, baseSha: base }))
+        .resolves.toMatchObject({ actor: 'user-a' });
+      // The token rotates under the long-lived poster: the next post must
+      // compare against the NEW account, never a host-keyed stale cache.
+      token = 'glpat-b';
+      await expect(poster.post({ prUrl: mrUrl, host: 'gitlab.example.test', repoPath, body: 'rotated body\n', targetSha: head, baseSha: base }))
+        .resolves.toMatchObject({ actor: 'user-b' });
+      expect(userTokens).toEqual(['glpat-a', 'glpat-b']);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('evidences the authenticated GitLab account for restart recovery (R30)', async () => {
+    const calls: Array<{ url: string; init?: unknown }> = [];
+    const poster = new GitLabMrPoster({ token: 'glpat-token', fetchImpl: fetchDouble({ status: 200 }, calls) });
+    await expect(poster.authenticatedActor!('gitlab.example.test')).resolves.toBe('gru-bot');
+    expect(calls.map((call) => call.url)).toEqual(['https://gitlab.example.test/api/v4/user']);
+    const noToken = new GitLabMrPoster({ fetchImpl: fetchDouble({ status: 200 }, []) });
+    await expect(noToken.authenticatedActor!('gitlab.example.test')).rejects.toThrow(/GITLAB_TOKEN/);
+  });
+
   it('fails closed on a moved head — before and under the note — plus missing token, origin mismatch, and HTTP failure', async () => {
     const { repoPath, cleanup } = fixture();
     try {
@@ -2395,6 +3331,9 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
     /** Make the fallback turn reject after writing its report (a transport
      * rejection whose automatic retry may still recover the delivery). */
     failPrompt?: boolean;
+    /** Hold every fallback minion turn open until the test releases it, so a
+     * transport wait slice can expire while the review is genuinely live. */
+    promptHold?: { readonly release: Promise<void> };
   }): Promise<{
     wave: WaveRunner;
     job: { readonly id: string };
@@ -2408,6 +3347,7 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
     prompts: string[];
     spawnCwds: string[];
     escalations: string[];
+    disposed: string[];
   }> {
     const repo = makeFixtureRepo('perkins-prod-gate');
     repos.push(repo);
@@ -2430,6 +3370,7 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
     const prompts: string[] = [];
     const spawnCwds: string[] = [];
     const escalations: string[] = [];
+    const disposed: string[] = [];
     const spawner: AgentSpawner = async (role, spawnOptions = {}) => {
       spawnCwds.push(spawnOptions.cwd ?? '');
       const file = join(sessions, `prod-${spawnCwds.length}.jsonl`);
@@ -2447,13 +3388,14 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
           if (reportMatch !== null) {
             writeFileSync(reportMatch[1]!, JSON.stringify(options.findingToWrite), 'utf8');
           }
+          if (options.promptHold !== undefined) await options.promptHold.release;
           if (options.failPrompt === true) throw new Error('429 too many requests');
         },
         async steer() {},
         async followUp() {},
         subscribe() { return () => {}; },
         health() { return { state: 'idle', lastActivity: null, sessionFile: file }; },
-        async dispose() {},
+        async dispose() { disposed.push(`prod-minion-${spawnCwds.length}`); },
       };
     };
     const wave = new WaveRunner({
@@ -2474,7 +3416,7 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
       },
       escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
     });
-    return { wave, job, ledger, port, root, artifacts, sessions, repo, skillPath, prompts, spawnCwds, escalations };
+    return { wave, job, ledger, port, root, artifacts, sessions, repo, skillPath, prompts, spawnCwds, escalations, disposed };
   }
 
   it('spawns a minion with the skill prompt, parses findings, and reports clear-to-merge on clean', async () => {
@@ -2496,6 +3438,38 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
         .reverse();
       expect(phases).toEqual(['started', 'triaged', 'pass']);
     } finally {
+      rmSync(h.root, { recursive: true, force: true });
+      rmSync(h.artifacts, { recursive: true, force: true });
+      rmSync(h.sessions, { recursive: true, force: true });
+    }
+  });
+
+  it('a fallback review turn open at the transport wait is reported still-running, kept alive and reattached (j-1065 acceptance 2)', async () => {
+    let release!: () => void;
+    const hold = { release: new Promise<void>((resolve) => { release = resolve; }) };
+    const h = await makeProductionGateHarness({ findingToWrite: [], promptHold: hold });
+    vi.useFakeTimers();
+    try {
+      const running = h.wave.runRound({ jobId: h.job.id });
+      await vi.advanceTimersByTimeAsync(FALLBACK_REVIEW_TIMEOUT_MS + 1);
+      // The wait slice expired while the review turn was genuinely live: a
+      // durable still-running report exists and the minion was NOT disposed.
+      const phases = h.ledger.listEvents({ limit: 100 })
+        .filter((event) => event.kind === 'job.fallback-review')
+        .map((event) => (event.payload as { phase?: string }).phase)
+        .reverse();
+      expect(phases).toContain('still-running');
+      expect(h.disposed).toEqual([]);
+      expect(h.prompts).toHaveLength(1);
+      release();
+      const outcome = await running;
+      if (!('route' in outcome)) throw new Error('expected fallback route');
+      expect(outcome.clearToMerge).toBe(true);
+      // The SAME session delivered the review; it was disposed only after.
+      expect(h.prompts).toHaveLength(1);
+      expect(h.disposed).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
       rmSync(h.root, { recursive: true, force: true });
       rmSync(h.artifacts, { recursive: true, force: true });
       rmSync(h.sessions, { recursive: true, force: true });
@@ -2680,8 +3654,8 @@ describe('fallback diff includes untracked files (V3 revert-mutation pin)', () =
   });
 });
 
-describe('fallback review timeout constant is exported and positive (V4 pin)', () => {
-  it('pins the 15-minute wall-clock bound', async () => {
+describe('fallback review wait constant is the still-running report slice (V4 pin)', () => {
+  it('pins the 15-minute transport wait slice', async () => {
     const { FALLBACK_REVIEW_TIMEOUT_MS } = await import('../src/dispatch/perkins.js');
     expect(FALLBACK_REVIEW_TIMEOUT_MS).toBe(15 * 60 * 1_000);
     expect(FALLBACK_REVIEW_TIMEOUT_MS).toBeGreaterThan(0);
@@ -2707,8 +3681,10 @@ describe('repair pass 3: GitHub receipt identity, state, and pagination (R4/R5/R
    * configurable POST response and per-page review lists. */
   function makeDouble(options: {
     readonly login?: string;
+    readonly loginProbeFails?: boolean;
     readonly created?: unknown;
     readonly reviewPages?: readonly unknown[];
+    readonly identityBase?: string;
   }): { poster: GhPrPoster; log: string; repoPath: string } {
     const root = mkdtempSync(join(tmpdir(), 'perkins-gh-p3-'));
     dirs.push(root);
@@ -2717,7 +3693,11 @@ describe('repair pass 3: GitHub receipt identity, state, and pagination (R4/R5/R
     const repoPath = join(root, 'repo');
     execFileSync('git', ['init', repoPath], { stdio: 'ignore' });
     execFileSync('git', ['-C', repoPath, 'remote', 'add', 'origin', 'https://git.example.test/acme/widget.git']);
-    writeFileSync(binary, `#!/usr/bin/env node\nimport { appendFileSync, readFileSync } from 'node:fs';\nconst input = readFileSync(0, 'utf8');\nappendFileSync(${JSON.stringify(log)}, JSON.stringify({ argv: process.argv.slice(2), input }) + '\\n');\nconst argv = process.argv.slice(2);\nif (argv.includes('--method') && argv.includes('POST')) {\n  const parsed = JSON.parse(input);\n  const created = ${JSON.stringify(options.created === undefined ? 'null' : JSON.stringify(options.created))};\n  const receipt = created === 'null' ? null : JSON.parse(created);\n  const out = receipt ?? { id: 9001, user: { login: 'gru-bot' }, state: 'COMMENTED', commit_id: parsed.commit_id, body: parsed.body };\n  process.stdout.write(JSON.stringify(out));\n} else if (argv.some((entry) => entry.includes('/reviews?'))) {\n  const page = Number(/[?&]page=(\\d+)/u.exec(argv.find((entry) => entry.includes('/reviews?')) ?? '')?.[1] ?? '1');\n  const pages = ${JSON.stringify(JSON.stringify(options.reviewPages ?? []))};\n  process.stdout.write(JSON.stringify(JSON.parse(pages)[page - 1] ?? []));\n} else if (argv.includes('user') && !argv.some((entry) => entry.includes('/'))) {\n  process.stdout.write(${JSON.stringify(options.login ?? 'gru-bot')});\n} else {\n  process.stdout.write(${JSON.stringify(`${head}\t${base}\n`)});\n}\n`, 'utf8');
+    const identityOutput = `${head}\t${options.identityBase ?? base}\n`;
+    const userResponse = options.loginProbeFails === true
+      ? 'process.exit(1);'
+      : `process.stdout.write(${JSON.stringify(options.login ?? 'gru-bot')});`;
+    writeFileSync(binary, `#!/usr/bin/env node\nimport { appendFileSync, readFileSync } from 'node:fs';\nconst input = readFileSync(0, 'utf8');\nappendFileSync(${JSON.stringify(log)}, JSON.stringify({ argv: process.argv.slice(2), input }) + '\\n');\nconst argv = process.argv.slice(2);\nif (argv.includes('--method') && argv.includes('POST')) {\n  const parsed = JSON.parse(input);\n  const created = ${JSON.stringify(options.created === undefined ? 'null' : JSON.stringify(options.created))};\n  const receipt = created === 'null' ? null : JSON.parse(created);\n  const out = receipt ?? { id: 9001, user: { login: 'gru-bot' }, state: 'COMMENTED', commit_id: parsed.commit_id, body: parsed.body };\n  process.stdout.write(JSON.stringify(out));\n} else if (argv.some((entry) => entry.includes('/reviews?'))) {\n  const page = Number(/[?&]page=(\\d+)/u.exec(argv.find((entry) => entry.includes('/reviews?')) ?? '')?.[1] ?? '1');\n  const pages = ${JSON.stringify(JSON.stringify(options.reviewPages ?? []))};\n  process.stdout.write(JSON.stringify(JSON.parse(pages)[page - 1] ?? []));\n} else if (argv.includes('user') && !argv.some((entry) => entry.includes('/'))) {\n  ${userResponse}\n} else {\n  process.stdout.write(${JSON.stringify(identityOutput)});\n}\n`, 'utf8');
     chmodSync(binary, 0o755);
     return { poster: new GhPrPoster(binary), log, repoPath };
   }
@@ -2770,6 +3750,73 @@ describe('repair pass 3: GitHub receipt identity, state, and pagination (R4/R5/R
     }));
     const { poster, repoPath } = makeDouble({ reviewPages: [filler, filler, filler, filler, filler, filler, filler, filler, filler, filler, filler] });
     await expect(poster.reconcile!(input(repoPath))).rejects.toThrow(/exceeded.*pages.*unresolved|unresolved/);
+  });
+
+  it('searches reviews collected before the page bound before throwing it (R28)', async () => {
+    const filler = Array.from({ length: 100 }, (_unused, index) => ({
+      id: 7000 + index, user: { login: 'someone-else' }, state: 'COMMENTED', commit_id: 'f'.repeat(40), body: `filler ${index}`,
+    }));
+    // A fully bound authored match sits on page one; ten FULL pages hit
+    // the lookup bound. The collected match is delivery evidence and must
+    // be returned instead of discarded by the bound error.
+    const { poster, repoPath } = makeDouble({
+      reviewPages: [
+        [{ id: 9200, user: { login: 'gru-bot' }, state: 'COMMENTED', commit_id: head, body }, ...filler.slice(1)],
+        ...Array.from({ length: 9 }, () => filler),
+      ],
+    });
+    await expect(poster.reconcile!(input(repoPath))).resolves.toMatchObject({ reviewId: '9200', actor: 'gru-bot', event: 'COMMENTED', commitId: head });
+  });
+
+  it('returns an earlier usable bound match when a later match carries an unusable id (R13/R28)', async () => {
+    const unusable = { id: null, user: { login: 'gru-bot' }, state: 'COMMENTED', commit_id: head, body };
+    const usable = { id: 9101, user: { login: 'gru-bot' }, state: 'COMMENTED', commit_id: head, body };
+    const mixed = makeDouble({ reviewPages: [[usable, unusable]] });
+    await expect(mixed.poster.reconcile!(input(mixed.repoPath))).resolves.toMatchObject({ reviewId: '9101', commitId: head });
+    // If EVERY collected match is unusable the outcome is a loud refusal,
+    // never reported as absence (which could invite a duplicate POST).
+    const allUnusable = makeDouble({ reviewPages: [[unusable]] });
+    await expect(allUnusable.poster.reconcile!(input(allUnusable.repoPath))).rejects.toThrow(/missing a review id/);
+  });
+
+  it('probes the authenticated account BEFORE the irreversible POST (R32)', async () => {
+    const { poster, log, repoPath } = makeDouble({ loginProbeFails: true });
+    await expect(poster.post(input(repoPath))).rejects.toThrow(/cannot resolve the authenticated gh account/);
+    const calls = readFileSync(log, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as { argv: string[] });
+    // The failed identity probe means NO review POST was ever issued: a
+    // credential hiccup cannot strand a genuinely published review.
+    expect(calls.some((call) => call.argv.includes('--method'))).toBe(false);
+  });
+
+  it('refuses an unrecordable receipt when the identity probe omits the base (R34)', async () => {
+    const { poster, log, repoPath } = makeDouble({ identityBase: '' });
+    await expect(poster.post(input(repoPath))).rejects.toThrow(/missing the base sha/);
+    const calls = readFileSync(log, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as { argv: string[] });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.argv).toEqual(['api', '--hostname', 'git.example.test', 'repos/acme/widget/pulls/42', '--jq', '[.head.sha,.base.sha] | @tsv']);
+  });
+
+  it('re-resolves the authenticated login after a credential rotation on the same host (R29)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'perkins-gh-rotate-'));
+    dirs.push(root);
+    const log = join(root, 'calls.jsonl');
+    const binary = join(root, 'gh-double.mjs');
+    const loginFile = join(root, 'login.txt');
+    const repoPath = join(root, 'repo');
+    writeFileSync(loginFile, 'gru-bot', 'utf8');
+    execFileSync('git', ['init', repoPath], { stdio: 'ignore' });
+    execFileSync('git', ['-C', repoPath, 'remote', 'add', 'origin', 'https://git.example.test/acme/widget.git']);
+    writeFileSync(binary, `#!/usr/bin/env node\nimport { appendFileSync, readFileSync } from 'node:fs';\nconst input = readFileSync(0, 'utf8');\nappendFileSync(${JSON.stringify(log)}, JSON.stringify({ argv: process.argv.slice(2) }) + '\\n');\nconst argv = process.argv.slice(2);\nconst login = readFileSync(${JSON.stringify(loginFile)}, 'utf8').trim();\nif (argv.includes('--method') && argv.includes('POST')) {\n  const parsed = JSON.parse(input);\n  process.stdout.write(JSON.stringify({ id: 9300, user: { login }, state: 'COMMENTED', commit_id: parsed.commit_id, body: parsed.body }));\n} else if (argv.includes('user') && !argv.some((entry) => entry.includes('/'))) {\n  process.stdout.write(login);\n} else {\n  process.stdout.write(${JSON.stringify(`${head}\t${base}\n`)});\n}\n`, 'utf8');
+    chmodSync(binary, 0o755);
+    const poster = new GhPrPoster(binary);
+    await expect(poster.post(input(repoPath))).resolves.toMatchObject({ actor: 'gru-bot' });
+    // The credential rotates under the long-lived poster: the next post
+    // must compare against the NEW account, never a host-keyed stale
+    // cache (R29).
+    writeFileSync(loginFile, 'new-bot', 'utf8');
+    await expect(poster.post(input(repoPath))).resolves.toMatchObject({ actor: 'new-bot' });
+    const calls = readFileSync(log, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as { argv: string[] });
+    expect(calls.filter((call) => call.argv.includes('user'))).toHaveLength(2);
   });
 
 
@@ -2849,14 +3896,26 @@ describe('repair pass 3: GitLab note reconciliation fails closed (R3/T7)', () =>
     readonly user?: string;
     readonly notePages?: readonly unknown[];
     readonly mrStatus?: number;
-  }): { poster: GitLabMrPoster; repoPath: string } {
+    readonly mrBaseSha?: string | null;
+    readonly mrBaseShaAfterPost?: string | null;
+    readonly noteCreated?: unknown;
+  }): { poster: GitLabMrPoster; repoPath: string; calls: Array<{ url: string; init?: unknown }> } {
     const root = mkdtempSync(join(tmpdir(), 'perkins-gl-p3-'));
     dirs.push(root);
     const repoPath = join(root, 'repo');
     execFileSync('git', ['init', repoPath], { stdio: 'ignore' });
     execFileSync('git', ['-C', repoPath, 'remote', 'add', 'origin', 'https://gitlab.example.test/acme/widget.git']);
-    const mr = () => ({ status: options.mrStatus ?? 200, body: JSON.stringify({ sha: head, diff_refs: { base_sha: base } }) });
-    const fetchImpl = async (url: string): Promise<{ ok: boolean; status: number; text(): Promise<string> }> => {
+    const calls: Array<{ url: string; init?: unknown }> = [];
+    const primaryBase = options.mrBaseSha === undefined ? base : options.mrBaseSha;
+    const laterBase = options.mrBaseShaAfterPost === undefined ? primaryBase : options.mrBaseShaAfterPost;
+    let mrCallCount = 0;
+    const mr = () => {
+      const chosen = mrCallCount === 0 ? primaryBase : laterBase;
+      mrCallCount += 1;
+      return { status: options.mrStatus ?? 200, body: JSON.stringify(chosen === null ? { sha: head } : { sha: head, diff_refs: { base_sha: chosen } }) };
+    };
+    const fetchImpl = async (url: string, init?: unknown): Promise<{ ok: boolean; status: number; text(): Promise<string> }> => {
+      calls.push({ url, init });
       if (url.endsWith('/user')) {
         return { ok: true, status: 200, text: async () => JSON.stringify({ username: options.user ?? 'gru-bot' }) };
       }
@@ -2865,10 +3924,14 @@ describe('repair pass 3: GitLab note reconciliation fails closed (R3/T7)', () =>
         const pages = options.notePages ?? [];
         return { ok: true, status: 200, text: async () => JSON.stringify(pages[page - 1] ?? []) };
       }
+      if (url.includes('/notes')) {
+        const created = options.noteCreated ?? { id: 55, body, author: { username: options.user ?? 'gru-bot' } };
+        return { ok: true, status: 201, text: async () => JSON.stringify(created) };
+      }
       const response = mr();
       return { ok: response.status < 300, status: response.status, text: async () => response.body };
     };
-    return { poster: new GitLabMrPoster({ token: 'glpat-token', fetchImpl: fetchImpl as never }), repoPath };
+    return { poster: new GitLabMrPoster({ token: 'glpat-token', fetchImpl: fetchImpl as never }), repoPath, calls };
   }
   const input = (repoPath: string) => ({
     prUrl: mrUrl, host: 'gitlab.example.test', repoPath, body, targetSha: head, baseSha: base,
@@ -2905,6 +3968,69 @@ describe('repair pass 3: GitLab note reconciliation fails closed (R3/T7)', () =>
     }));
     const { poster, repoPath } = gitlabDouble({ notePages: [filler, filler, filler, filler, filler, filler, filler, filler, filler, filler, filler] });
     await expect(poster.reconcile!(input(repoPath))).rejects.toThrow(/exceeded.*pages|unresolved/);
+  });
+
+  it('refuses a null or unusable note id instead of stringifying it (R27)', async () => {
+    for (const [label, id] of [['null', null], ['boolean', true], ['fractional', 1.5]] as const) {
+      const { poster, repoPath } = gitlabDouble({ noteCreated: { id, body, author: { username: 'gru-bot' } } });
+      await expect(poster.post(input(repoPath)), label).rejects.toThrow(/missing a review id/);
+    }
+    // A well-formed id still records normally, including a provider string.
+    const good = gitlabDouble({ noteCreated: { id: 55, body, author: { username: 'gru-bot' } } });
+    await expect(good.poster.post(input(good.repoPath))).resolves.toMatchObject({ reviewId: '55' });
+    const quoted = gitlabDouble({ noteCreated: { id: '56', body, author: { username: 'gru-bot' } } });
+    await expect(quoted.poster.post(input(quoted.repoPath))).resolves.toMatchObject({ reviewId: '56' });
+  });
+
+  it('refuses a GitLab delivery whose identity probe omits the MR base, before the note exists (R34)', async () => {
+    const missing = gitlabDouble({ mrBaseSha: null });
+    await expect(missing.poster.post(input(missing.repoPath))).rejects.toThrow(/missing the base sha/);
+    // Only the pre-POST identity probe ran; no note was created.
+    expect(missing.calls).toHaveLength(1);
+    expect(missing.calls.some((call) => call.url.includes('/notes'))).toBe(false);
+
+    // A base that vanishes between the pre-POST probe and the post-delivery
+    // confirmation falls back to the base PROVEN for this same head by the
+    // pre-POST probe instead of stranding a note that already exists.
+    const vanished = gitlabDouble({ mrBaseShaAfterPost: null, noteCreated: { id: 57, body, author: { username: 'gru-bot' } } });
+    await expect(vanished.poster.post(input(vanished.repoPath))).resolves.toMatchObject({ reviewId: '57', baseSha: base });
+    expect(vanished.calls.some((call) => call.url.includes('/notes') && !call.url.includes('?'))).toBe(true);
+
+    // A whitespace-only base is as unusable as a missing one (the shared
+    // reader trims): it is refused BEFORE the note exists.
+    const whitespace = gitlabDouble({ mrBaseSha: '   ' });
+    await expect(whitespace.poster.post(input(whitespace.repoPath))).rejects.toThrow(/missing the base sha/);
+    expect(whitespace.calls).toHaveLength(1);
+    expect(whitespace.calls.some((call) => call.url.includes('/notes'))).toBe(false);
+  });
+
+  it('treats a body-identical note by another author as ambiguity, never as absence (R35)', async () => {
+    const foreign = gitlabDouble({ notePages: [[{ id: 77, body, author: { username: 'someone-else' } }]] });
+    await expect(foreign.poster.reconcile!(input(foreign.repoPath)))
+      .rejects.toThrow(/body-identical note\(s\) by @someone-else but none authored by gru-bot.*AMBIGUOUS/);
+
+    // The other-author match also decides a bounded lookup: pages that
+    // would otherwise hit the page cap stay ambiguous, never absent.
+    const filler = Array.from({ length: 100 }, (_unused, index) => ({
+      id: 6000 + index, body: `unrelated note ${index}`, author: { username: 'someone-else' },
+    }));
+    const late = gitlabDouble({ notePages: [filler, [{ id: 78, body, author: { username: 'someone-else' } }]] });
+    await expect(late.poster.reconcile!(input(late.repoPath))).rejects.toThrow(/AMBIGUOUS/);
+
+    // ...and at the page cap itself: ten FULL pages where the only body
+    // match is foreign must still report ambiguity, not the generic bound.
+    const capped = gitlabDouble({
+      notePages: [
+        ...Array.from({ length: 9 }, () => filler),
+        [...filler.slice(1), { id: 80, body, author: { username: 'someone-else' } }],
+      ],
+    });
+    await expect(capped.poster.reconcile!(input(capped.repoPath))).rejects.toThrow(/AMBIGUOUS/);
+
+    // A body match with no usable author is unattributed: ambiguity too,
+    // never assumed to be this service's note.
+    const unattributed = gitlabDouble({ notePages: [[{ id: 79, body, author: {} }]] });
+    await expect(unattributed.poster.reconcile!(input(unattributed.repoPath))).rejects.toThrow(/unattributed/);
   });
 });
 
@@ -2964,7 +4090,7 @@ describe('repair pass 3: restart recovery binding contract (R1/R2/R21)', () => {
       publicationFile,
       sha,
       payload: {
-        verdict: 'changes-requested', canonicalVerdict: 'NEEDS CHANGES', url: prUrl, host: 'git.example.invalid',
+        verdict: 'changes-requested', canonicalVerdict: 'NEEDS CHANGES', url: prUrl, host: new URL(prUrl).host,
         targetSha, baseSha: '2'.repeat(40),
         publicationFile, publicationSha256: sha,
         receipt: { reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: targetSha, headSha: targetSha, baseSha: '2'.repeat(40), bodySha256: sha },
@@ -2992,6 +4118,7 @@ describe('repair pass 3: restart recovery binding contract (R1/R2/R21)', () => {
     const escalations: string[] = [];
     const wave = new WaveRunner({
       ledger: first.ledger, worktrees: first.port, spawner: vi.fn() as unknown as AgentSpawner,
+      poster: { post: vi.fn(), authenticatedActor: async () => 'gru-bot' },
       reviewArtifactRoot: first.artifacts, escalate: (title) => escalations.push(title),
     });
     await expect(wave.recoverInterruptedRounds()).resolves.toBe(2);
@@ -3081,7 +4208,7 @@ describe('repair pass 3: restart recovery binding contract (R1/R2/R21)', () => {
     const { ledger, port, artifacts, job, roundId, targetSha } = await recoveryFixture('p3-r2-happy');
     const good = healthyEvent(roundId, artifacts, job!.prUrl!, targetSha);
     ledger.appendCustomEvent({ kind: 'round.posted', jobId: job!.id, roundId, payload: good.payload });
-    const poster = { post: vi.fn() } as unknown as VerdictPoster;
+    const poster = { post: vi.fn(), authenticatedActor: async () => 'gru-bot' } as unknown as VerdictPoster;
     const escalations: string[] = [];
     const wave = new WaveRunner({
       ledger, worktrees: port, spawner: vi.fn() as unknown as AgentSpawner,
@@ -3092,6 +4219,188 @@ describe('repair pass 3: restart recovery binding contract (R1/R2/R21)', () => {
     expect(ledger.getRound(roundId)?.status).toBe('verdict-posted');
     expect(ledger.getRound(roundId)?.verdict).toBe('changes-requested');
     expect(poster.post).not.toHaveBeenCalled();
+  });
+
+  it('promotes a posted event only when the actor matches the evidenced account (R30)', async () => {
+    const { ledger, port, artifacts, job, roundId, targetSha } = await recoveryFixture('p3-r30-match');
+    const good = healthyEvent(roundId, artifacts, job!.prUrl!, targetSha);
+    ledger.appendCustomEvent({ kind: 'round.posted', jobId: job!.id, roundId, payload: good.payload });
+    const poster = { post: vi.fn(), authenticatedActor: vi.fn(async () => 'GRU-BOT') };
+    const wave = new WaveRunner({
+      ledger, worktrees: port, spawner: vi.fn() as unknown as AgentSpawner,
+      poster, reviewArtifactRoot: artifacts,
+    });
+    expect(await wave.recoverInterruptedRounds()).toBe(1);
+    expect(ledger.getRound(roundId)).toMatchObject({ status: 'verdict-posted', verdict: 'changes-requested' });
+    // Case-insensitive exactly like the live writer paths, and the account
+    // is probed for the posted event's host — never taken from the event.
+    expect(poster.authenticatedActor).toHaveBeenCalledWith('git.example.invalid');
+    expect(poster.post).not.toHaveBeenCalled();
+  });
+
+  it('refuses to credit a posted event naming a different well-formed actor than the evidenced account (R30)', async () => {
+    const { ledger, port, artifacts, job, roundId, targetSha } = await recoveryFixture('p3-r30-mismatch');
+    const good = healthyEvent(roundId, artifacts, job!.prUrl!, targetSha);
+    ledger.appendCustomEvent({ kind: 'round.posted', jobId: job!.id, roundId, payload: good.payload });
+    const escalations: string[] = [];
+    const poster = { post: vi.fn(), authenticatedActor: vi.fn(async () => 'someone-else') };
+    const wave = new WaveRunner({
+      ledger, worktrees: port, spawner: vi.fn() as unknown as AgentSpawner,
+      poster, reviewArtifactRoot: artifacts,
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+    });
+    expect(await wave.recoverInterruptedRounds()).toBe(1);
+    expect(ledger.getRound(roundId)).toMatchObject({ status: 'aborted', verdict: null });
+    expect(escalations.some((line) => line.includes('receipt actor') && line.includes('someone-else') && line.includes('gru-bot'))).toBe(true);
+  });
+
+  it('refuses to promote an actor no poster can evidence (R30)', async () => {
+    const { ledger, port, artifacts, job, roundId, targetSha } = await recoveryFixture('p3-r30-unprovable');
+    const good = healthyEvent(roundId, artifacts, job!.prUrl!, targetSha);
+    ledger.appendCustomEvent({ kind: 'round.posted', jobId: job!.id, roundId, payload: good.payload });
+    const escalations: string[] = [];
+    const poster = { post: vi.fn() };
+    const wave = new WaveRunner({
+      ledger, worktrees: port, spawner: vi.fn() as unknown as AgentSpawner,
+      poster, reviewArtifactRoot: artifacts,
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+    });
+    expect(await wave.recoverInterruptedRounds()).toBe(1);
+    expect(ledger.getRound(roundId)).toMatchObject({ status: 'aborted', verdict: null });
+    expect(escalations.some((line) => line.includes('cannot evidence the posting account'))).toBe(true);
+  });
+
+  it('refuses to promote when the recovery identity probe fails (R30)', async () => {
+    const { ledger, port, artifacts, job, roundId, targetSha } = await recoveryFixture('p3-r30-probe-fail');
+    const good = healthyEvent(roundId, artifacts, job!.prUrl!, targetSha);
+    ledger.appendCustomEvent({ kind: 'round.posted', jobId: job!.id, roundId, payload: good.payload });
+    const escalations: string[] = [];
+    const poster = { post: vi.fn(), authenticatedActor: vi.fn(async () => { throw new Error('gh credential unavailable'); }) };
+    const wave = new WaveRunner({
+      ledger, worktrees: port, spawner: vi.fn() as unknown as AgentSpawner,
+      poster, reviewArtifactRoot: artifacts,
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+    });
+    expect(await wave.recoverInterruptedRounds()).toBe(1);
+    expect(ledger.getRound(roundId)).toMatchObject({ status: 'aborted', verdict: null });
+    expect(escalations.some((line) => line.includes('could not be evidenced') && line.includes('gh credential unavailable'))).toBe(true);
+  });
+
+  it('refuses promotion of a fully bound event whose canonical bytes fail only the digest check (R36)', async () => {
+    for (const [label, tamper] of [
+      ['tampered bytes', (directory: string) => { writeFileSync(join(directory, 'perkins-report.publication.md'), '# tampered\n', 'utf8'); }],
+      ['deleted file', (directory: string) => { rmSync(join(directory, 'perkins-report.publication.md'), { force: true }); }],
+      ['symlink swap', (directory: string) => {
+        const canonical = join(directory, 'perkins-report.publication.md');
+        const real = join(directory, 'real.md');
+        writeFileSync(real, readFileSync(canonical, 'utf8'), 'utf8');
+        rmSync(canonical);
+        symlinkSync(real, canonical);
+      }],
+    ] as const) {
+      const slug = label.replace(/\W+/gu, '-');
+      const { ledger, port, artifacts, job, roundId, targetSha } = await recoveryFixture(`p3-r36-${slug}`);
+      const good = healthyEvent(roundId, artifacts, job!.prUrl!, targetSha);
+      tamper(join(artifacts, roundId));
+      ledger.appendCustomEvent({ kind: 'round.posted', jobId: job!.id, roundId, payload: good.payload });
+      const escalations: string[] = [];
+      const poster = { post: vi.fn(), authenticatedActor: vi.fn(async () => 'gru-bot') };
+      const wave = new WaveRunner({
+        ledger, worktrees: port, spawner: vi.fn() as unknown as AgentSpawner,
+        poster, reviewArtifactRoot: artifacts,
+        escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      });
+      // Every earlier binding check passes (actor evidenced, host/reconciled
+      // fields valid, job PR bound): the ONLY failing gate is the digest /
+      // canonical-file evidence this fixture targets.
+      expect(await wave.recoverInterruptedRounds(), label).toBe(1);
+      expect(ledger.getRound(roundId)?.status, label).toBe('aborted');
+      expect(ledger.getRound(roundId)?.verdict, label).toBeNull();
+      expect(escalations.some((line) => line.includes('did not match the posted digest')), label).toBe(true);
+    }
+  });
+
+  it('refuses a posted event whose host is not its pull request URL host, without probing it (R30)', async () => {
+    const { ledger, port, artifacts, job, roundId, targetSha } = await recoveryFixture('p3-r30-host-binding');
+    const good = healthyEvent(roundId, artifacts, job!.prUrl!, targetSha);
+    ledger.appendCustomEvent({
+      kind: 'round.posted', jobId: job!.id, roundId,
+      payload: { ...good.payload, host: 'gitlab.attacker.test' },
+    });
+    const escalations: string[] = [];
+    const poster = { post: vi.fn(), authenticatedActor: vi.fn(async () => 'gru-bot') };
+    const wave = new WaveRunner({
+      ledger, worktrees: port, spawner: vi.fn() as unknown as AgentSpawner,
+      poster, reviewArtifactRoot: artifacts,
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+    });
+    expect(await wave.recoverInterruptedRounds()).toBe(1);
+    expect(ledger.getRound(roundId)).toMatchObject({ status: 'aborted', verdict: null });
+    // The forged host never reaches the identity probe with a credential.
+    expect(poster.authenticatedActor).not.toHaveBeenCalled();
+    expect(escalations.some((line) => line.includes('host does not match its pull request URL'))).toBe(true);
+  });
+
+  it('recovers a fully bound posted event even when the review lane registration was lost (R30/R1)', async () => {
+    const { ledger, port, artifacts, job, roundId, targetSha } = await recoveryFixture('p3-r30-missing-lane');
+    const good = healthyEvent(roundId, artifacts, job!.prUrl!, targetSha);
+    ledger.appendCustomEvent({ kind: 'round.posted', jobId: job!.id, roundId, payload: good.payload });
+    // Present the lost-registration state through the same port interface:
+    // the round exists in the ledger but has no lane row at all.
+    const laneLessPort: WorktreePort = {
+      createJobWorktree: (input) => port.createJobWorktree(input),
+      resolveReviewTarget: (input) => port.resolveReviewTarget(input),
+      createReviewWorktree: (input) => port.createReviewWorktree(input),
+      createChildWorktree: (input) => port.createChildWorktree(input),
+      getWorktree: (id) => port.getWorktree(id),
+      listWorktrees: (opts) => port.listWorktrees(opts).filter((lane) => lane.roundId !== roundId),
+      release: (input) => port.release(input),
+    };
+    const poster = { post: vi.fn(), authenticatedActor: async () => 'gru-bot' };
+    const wave = new WaveRunner({
+      ledger, worktrees: laneLessPort, spawner: vi.fn() as unknown as AgentSpawner,
+      poster, reviewArtifactRoot: artifacts,
+    });
+    expect(await wave.recoverInterruptedRounds()).toBe(1);
+    expect(ledger.getRound(roundId)).toMatchObject({ status: 'verdict-posted', verdict: 'changes-requested' });
+    expect(ledger.latestRoundEvent(roundId, 'round.post-recovered')?.payload).toMatchObject({ verdict: 'changes-requested' });
+    expect(poster.post).not.toHaveBeenCalled();
+  });
+
+  it('routes restart-recovery identity evidence through the host-selected composite (R30)', async () => {
+    const gitlabUrl = 'https://gitlab.example.test/acme/fixture/-/merge_requests/7';
+    const makeGitlabPost = async (name: string, evidencedAccount: string) => {
+      const fixture = await recoveryFixture(name);
+      fixture.ledger.setJobPr(fixture.job!.id, gitlabUrl);
+      const good = healthyEvent(fixture.roundId, fixture.artifacts, gitlabUrl, fixture.targetSha);
+      const payload = {
+        ...good.payload,
+        receipt: { ...(good.payload.receipt as Record<string, unknown>), event: 'note', commitId: null },
+      };
+      fixture.ledger.appendCustomEvent({ kind: 'round.posted', jobId: fixture.job!.id, roundId: fixture.roundId, payload });
+      const github = { post: vi.fn(), authenticatedActor: vi.fn(async () => 'github-bot') };
+      const gitlab = { post: vi.fn(), authenticatedActor: vi.fn(async () => evidencedAccount) };
+      const poster = new AutoVerdictPoster(github as unknown as VerdictPoster, gitlab as unknown as VerdictPoster);
+      const escalations: string[] = [];
+      const wave = new WaveRunner({
+        ledger: fixture.ledger, worktrees: fixture.port, spawner: vi.fn() as unknown as AgentSpawner,
+        poster, reviewArtifactRoot: fixture.artifacts,
+        escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      });
+      expect(await wave.recoverInterruptedRounds()).toBe(1);
+      return { fixture, github, gitlab, escalations };
+    };
+    const matched = await makeGitlabPost('p3-r30-auto-match', 'gru-bot');
+    expect(matched.fixture.ledger.getRound(matched.fixture.roundId)).toMatchObject({ status: 'verdict-posted', verdict: 'changes-requested' });
+    // The GitLab leg (the PR's host) evidenced the account; the GitHub leg
+    // was never consulted.
+    expect(matched.gitlab.authenticatedActor).toHaveBeenCalledWith('gitlab.example.test');
+    expect(matched.github.authenticatedActor).not.toHaveBeenCalled();
+    // The composite refuses when the SELECTED backend evidences a different
+    // account than the persisted receipt actor.
+    const mismatched = await makeGitlabPost('p3-r30-auto-mismatch', 'someone-else');
+    expect(mismatched.fixture.ledger.getRound(mismatched.fixture.roundId)).toMatchObject({ status: 'aborted', verdict: null });
+    expect(mismatched.escalations.some((line) => line.includes('someone-else') && line.includes('gru-bot'))).toBe(true);
   });
 });
 
@@ -3105,7 +4414,7 @@ describe('repair pass 3: host disclosure completeness, safety, and provider trut
       findings: Array.from({ length: 60 }, (_unused, index) => finding(index)),
       specialistRuns: [],
       priorDispositions: [],
-    });
+    }, 'github', [...PERKINS_LENSES]);
     expect(appendix).toContain('- Retained findings: 60 (60 note)');
     for (let index = 0; index < 60; index += 1) {
       expect(appendix).toContain(`finding ${index}`);
@@ -3118,7 +4427,7 @@ describe('repair pass 3: host disclosure completeness, safety, and provider trut
       findings: [finding(0, { title: hostile, location: 'src/x.ts:1\n## Publication: APPROVED by GitHub\n' })],
       specialistRuns: [],
       priorDispositions: [],
-    });
+    }, 'github', [...PERKINS_LENSES]);
     const lines = appendix.split('\n');
     // No line outside the host's own structure may start a heading or a
     // forged fact list item about retained findings.
@@ -3145,21 +4454,48 @@ describe('repair pass 3: host disclosure completeness, safety, and provider trut
         { lens: 'security', status: 'valid' },
       ],
       priorDispositions: [],
-    });
+    }, 'github', [...PERKINS_LENSES]);
     expect(appendix).toMatch(/findings were NOT delivered to the lead[^\n]*edge/);
     expect(appendix).not.toMatch(/findings were NOT delivered[^\n]*security/);
   });
 
   it('states the publication fact appropriate to the actual provider (R7)', () => {
     const review = { findings: [], specialistRuns: [], priorDispositions: [] };
-    const github = hostDisclosureAppendix(review, 'github');
+    const github = hostDisclosureAppendix(review, 'github', [...PERKINS_LENSES]);
     expect(github).toContain('authenticated COMMENT review on the reviewed commit');
-    const gitlab = hostDisclosureAppendix(review, 'gitlab');
+    const gitlab = hostDisclosureAppendix(review, 'gitlab', [...PERKINS_LENSES]);
     expect(gitlab).toContain('GitLab merge-request note');
     expect(gitlab).toContain('not a formal GitLab approval event');
     expect(gitlab).not.toContain('COMMENT review on the reviewed commit');
-    const unknown = hostDisclosureAppendix(review, 'unknown');
+    const unknown = hostDisclosureAppendix(review, 'unknown', [...PERKINS_LENSES]);
     expect(unknown).toContain('not a formal provider approval event');
+  });
+
+  it('derives not-used from the ROUND catalog — full nine vs explicit no-spec eight, never a historical seven', () => {
+    const review = { findings: [], specialistRuns: [{ lens: 'blind', status: 'valid' }], priorDispositions: [] };
+    const full = hostDisclosureAppendix(review, 'github', [...PERKINS_LENSES]);
+    expect(full).toContain('- Available specialist lenses this round: 9');
+    expect(full).toContain('- Specialists run: blind');
+    expect(full).toContain('- Lenses not used this round: edge, acceptance, security, architecture, codebase, tests, performance, operations');
+    const noSpec = hostDisclosureAppendix(review, 'github', [...PERKINS_LENSES].filter((lens) => lens !== 'acceptance'));
+    expect(noSpec).toContain('- Available specialist lenses this round: 8');
+    expect(noSpec).toContain('- Lenses not used this round: edge, security, architecture, codebase, tests, performance, operations');
+    expect(noSpec).not.toContain('acceptance');
+  });
+
+  it('discloses round-budget refusals in the published appendix, distinct from lens-level failures', () => {
+    const review = {
+      findings: [],
+      specialistRuns: [{ lens: 'acceptance', status: 'invalid' }, { lens: 'acceptance', status: 'invalid' }],
+      priorDispositions: [],
+      budgetRefusals: [{ lenses: ['performance', 'operations'], cap: 16, accountedRuns: 16 }],
+    };
+    const appendix = hostDisclosureAppendix(review, 'github', [...PERKINS_LENSES]);
+    expect(appendix).toContain('- Failed specialist attempts: acceptance ×2');
+    expect(appendix).toContain('- Round specialist budget: 1 run call(s) refused by the 16-run cap before any child started (performance, operations)');
+    // The two accounting causes never collapse into one another: the lens
+    // failure is not restated as a budget refusal and vice versa.
+    expect(appendix).not.toContain('acceptance ×2 — the lead judged the change on its own whole-change verification: refused by');
   });
 });
 
@@ -3532,7 +4868,7 @@ describe('repair pass 3: real child-process crash recovery (R19/R16)', () => {
     expect(postedEvent.receipt?.commitId).toBe(target);
     // Recovery completes the round from the persisted event WITHOUT
     // republishing and sweeps the crashed lane.
-    const poster = { post: vi.fn() };
+    const poster = { post: vi.fn(), authenticatedActor: async () => 'gru-bot' };
     const wave = new WaveRunner({
       ledger, worktrees: port, spawner: vi.fn() as unknown as AgentSpawner,
       poster, reviewArtifactRoot: artifacts,
@@ -3557,7 +4893,7 @@ describe('durable handoff admission: perkins route, re-busy re-queue, crash/term
   const HANDOFF_CAPS = { streaming: false, steer: 'queued' as const, resume: 'file' as const, images: false, thinking: false, thinkingLevelControl: false, followUp: false };
   const failingPreflight = async () => ({ ok: false as const, failures: [preflightFailure('review-policy', 'disabled')] });
 
-  async function handoffFixture(name: string, jobId: string) {
+  async function handoffFixture(name: string, jobId: string, opts: { isolateLedgerBus?: boolean } = {}) {
     const repo = makeFixtureRepo(name);
     repos.push(repo);
     repo.git(['checkout', '-b', 'feature/review']);
@@ -3569,7 +4905,10 @@ describe('durable handoff admission: perkins route, re-busy re-queue, crash/term
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), `handoff-${name}-db-`)));
     dbs.push(db);
     const bus = new EventBus();
-    const ledger = new LedgerApi(db.handle, { bus });
+    // With an isolated ledger bus a test can record a REAL delivery without
+    // waking the wave's own listener, then drive the deterministic pass
+    // itself — the realistic settled-lane fixture.
+    const ledger = new LedgerApi(db.handle, { bus: opts.isolateLedgerBus === true ? new EventBus() : bus });
     const port = new GitReviewPort(root, 'feature/review', target);
     await port.createJobWorktree({ repoPath: repo.path, jobId });
     const job = ledger.addJob({ id: jobId, repo: 'fixture', title: name, baseBranch: 'main', briefing: 'review this' });
@@ -3605,6 +4944,55 @@ describe('durable handoff admission: perkins route, re-busy re-queue, crash/term
     expect(started?.payload).toMatchObject({ route: 'perkins' });
     const roundId = (started?.payload as { roundId?: string }).roundId;
     expect(f.ledger.listRounds('job-handoff-pr').some((round) => round.id === roundId)).toBe(true);
+    await wave.shutdown();
+  }, 120_000);
+
+  it('carries private evidence through the queued handoff into the frozen round', async () => {
+    const f = await handoffFixture('handoff-evidence', 'job-handoff-evidence');
+    const uploads = mkdtempSync(join(tmpdir(), 'handoff-evidence-uploads-'));
+    dirs.push(uploads);
+    const uploadPath = join(uploads, '1791057000000-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee-reference.png');
+    writeFileSync(uploadPath, minimalPng(Buffer.from('handoff-pixels')));
+    const sessions = mkdtempSync(join(tmpdir(), 'handoff-evidence-sessions-'));
+    dirs.push(sessions);
+    const fake = fakeWholeSpawner(sessions, { images: true, childAnswer: () => '[]' });
+    const wave = new WaveRunner({ ledger: f.ledger, worktrees: f.port, spawner: fake.spawner, reviewArtifactRoot: f.artifacts, evidenceUploadsDir: uploads, bus: f.bus });
+    const accepted = await wave.requestReview({
+      jobId: 'job-handoff-evidence',
+      handoff: true,
+      evidence: [{ uploadPath, purpose: 'owner reference; NOT rendered at the frozen revision', consentRef: 'owner approval j-969' }],
+    });
+    expect(accepted.route).toBe('queued');
+    expect(f.ledger.listRounds('job-handoff-evidence')).toHaveLength(0);
+    const queued = f.ledger.latestJobEvent('job-handoff-evidence', 'job.review-handoff-queued');
+    expect((queued?.payload as { input?: { evidence?: unknown[] } }).input?.evidence).toHaveLength(1);
+    f.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-handoff-evidence', payload: { sha: f.target } });
+    await tickUntil(() => f.ledger.latestJobEvent('job-handoff-evidence', 'job.review-handoff-started') !== null);
+    const started = f.ledger.latestJobEvent('job-handoff-evidence', 'job.review-handoff-started');
+    expect(started?.payload).toMatchObject({ route: 'perkins' });
+    const roundId = (started?.payload as { roundId?: string }).roundId;
+    expect(typeof roundId).toBe('string');
+    const manifest = JSON.parse(readFileSync(join(f.artifacts, roundId!, 'manifest.json'), 'utf8')) as {
+      reviewEvidence: { attachments: Array<{ purpose: string }> };
+    };
+    expect(manifest.reviewEvidence.attachments).toHaveLength(1);
+    expect(manifest.reviewEvidence.attachments[0]!.purpose).toContain('owner reference');
+    const audit = f.ledger.latestRoundEvent(roundId!, 'round.review-inputs-frozen');
+    expect((audit?.payload as { evidence?: unknown[] }).evidence).toHaveLength(1);
+    await tickUntil(() => fake.leadCalls.length > 0, 5000);
+    expect(fake.leadCalls[0]!.images).toHaveLength(1);
+    await wave.shutdown();
+  }, 120_000);
+
+  it('refuses a private-evidence arm on the bmad-review fallback route instead of dropping the pixels', async () => {
+    const f = await handoffFixture('fallback-evidence-refusal', 'job-fallback-evidence');
+    f.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-fallback-evidence', payload: { sha: f.target } });
+    const wave = new WaveRunner({ ledger: f.ledger, worktrees: f.port, spawner: vi.fn() as unknown as AgentSpawner, bus: f.bus, reviewPreflight: failingPreflight });
+    await expect(wave.requestReview({
+      jobId: 'job-fallback-evidence',
+      evidence: [{ uploadPath: '/data/uploads/1-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee-ref.png', purpose: 'p', consentRef: 'c' }],
+    })).rejects.toThrow(/bmad-review fallback route/u);
+    expect(f.ledger.listRounds('job-fallback-evidence')).toHaveLength(0);
     await wave.shutdown();
   }, 120_000);
 
@@ -3654,16 +5042,15 @@ describe('durable handoff admission: perkins route, re-busy re-queue, crash/term
   }, 120_000);
 
   it('reconsiders pending handoffs on the deterministic pass alone — no second API call, no follow-through feature', async () => {
-    const f = await handoffFixture('handoff-sweep-reconcile', 'job-handoff-sweep');
+    const f = await handoffFixture('handoff-sweep-reconcile', 'job-handoff-sweep', { isolateLedgerBus: true });
     const wave = new WaveRunner({ ledger: f.ledger, worktrees: f.port, spawner: vi.fn() as unknown as AgentSpawner, bus: f.bus, reviewPreflight: failingPreflight });
     const accepted = await wave.requestReview({ jobId: 'job-handoff-sweep', handoff: true });
     expect(accepted.route).toBe('queued');
     expect(f.ledger.latestJobEvent('job-handoff-sweep', 'job.review-handoff-requeued')).toBeNull();
-    // The lane goes idle WITHOUT a delivery and WITHOUT any second request:
-    // the authorized status leaves the busy set, so only the deterministic-
-    // pass reconciler (exactly what main wires into the Silas seam) may
-    // reconsider it.
-    f.ledger.setJobStatus('job-handoff-sweep', 'in-review');
+    // The lane settles with a REAL delivery that never reaches the wave's
+    // listener (isolated ledger bus): only the deterministic-pass reconciler
+    // (exactly what main wires into the Silas seam) may reconsider it.
+    f.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-handoff-sweep', payload: { sha: f.target } });
     wave.reconcilePendingHandoffs(); // the wired callback target — no API call, no timer, no follow-through lane
     await tickUntil(() => f.ledger.latestJobEvent('job-handoff-sweep', 'job.review-handoff-failed') !== null
       || f.ledger.latestJobEvent('job-handoff-sweep', 'job.review-handoff-started') !== null);
@@ -3675,7 +5062,7 @@ describe('durable handoff admission: perkins route, re-busy re-queue, crash/term
   }, 120_000);
 
   it('HOLDS a handoff on a post-intake status flip and rearms only via a genuinely new validated request', async () => {
-    const f = await handoffFixture('handoff-held-rearm', 'job-handoff-held');
+    const f = await handoffFixture('handoff-held-rearm', 'job-handoff-held', { isolateLedgerBus: true });
     const wave = new WaveRunner({ ledger: f.ledger, worktrees: f.port, spawner: vi.fn() as unknown as AgentSpawner, bus: f.bus, reviewPreflight: failingPreflight });
     const first = await wave.requestReview({ jobId: 'job-handoff-held', handoff: true });
     expect(first.route).toBe('queued');
@@ -3692,9 +5079,9 @@ describe('durable handoff admission: perkins route, re-busy re-queue, crash/term
     // A NEW validated review request rearms the held intent.
     const again = await wave.requestReview({ jobId: 'job-handoff-held', handoff: true });
     expect(again.route).toBe('queued');
-    // The lane settles into an authorized-but-idle status: the rearmed
-    // intent may now reach its terminal outcome on the next pass.
-    f.ledger.setJobStatus('job-handoff-held', 'in-review');
+    // The lane settles with a real delivery the control bus never sees: the
+    // rearmed intent may now reach its terminal outcome on the next pass.
+    f.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-handoff-held', payload: { sha: f.target } });
     wave.reconcilePendingHandoffs();
     await tickUntil(() => f.ledger.latestJobEvent('job-handoff-held', 'job.review-handoff-failed') !== null
       || f.ledger.latestJobEvent('job-handoff-held', 'job.review-handoff-started') !== null);
@@ -3739,13 +5126,14 @@ describe('durable handoff admission: perkins route, re-busy re-queue, crash/term
   }, 120_000);
 
   it('reconciles an un-armed handoff on the next genuine observation when the lane went idle without delivery', async () => {
-    const f = await handoffFixture('handoff-idle-reconcile', 'job-handoff-idle');
+    const f = await handoffFixture('handoff-idle-reconcile', 'job-handoff-idle', { isolateLedgerBus: true });
     const wave = new WaveRunner({ ledger: f.ledger, worktrees: f.port, spawner: vi.fn() as unknown as AgentSpawner, bus: f.bus, reviewPreflight: failingPreflight });
     const accepted = await wave.requestReview({ jobId: 'job-handoff-idle', handoff: true });
     expect(accepted.route).toBe('queued'); // busy lane, durable 202 receipt
-    // The turn ends WITHOUT a delivery event (abort/failure): the lane goes
-    // idle and a later genuine observation must ARM the review — no skip.
-    f.ledger.setJobStatus('job-handoff-idle', 'in-review');
+    // The turn ends with a real, recorded delivery the control bus never
+    // sees: the lane goes idle and a later genuine observation must ARM the
+    // review — no skip.
+    f.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-handoff-idle', payload: { sha: f.target } });
     const second = await wave.requestReview({ jobId: 'job-handoff-idle' });
     expect(second.route).toBe('queued'); // the receipt stays truthful while admission reconciles
     await tickUntil(() => f.ledger.latestJobEvent('job-handoff-idle', 'job.review-handoff-failed') !== null

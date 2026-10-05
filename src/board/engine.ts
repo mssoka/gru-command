@@ -12,11 +12,20 @@ import { ownerReadyPr, readBranchEvidence, type OwnerPrView } from './owner-acti
 import {
   DEFAULT_LENSES,
   LedgerApi,
+  type AgentParentage,
   type AgentRecord,
+  type ChildWorkerCounts,
+  type ChildWorkerRecord,
   type JobRecord,
   type RoundRecord,
 } from '../ledger/api.js';
+import { LIVE_DIRECTIVE_STATES } from '../ledger/directives.js';
 import type { JobStatus } from '../ledger/states.js';
+import type { EventRecord } from '../ledger/api.js';
+
+/** Newest closed receipts kept in every snapshot (D3): older ones are
+ * served by the paged `GET /api/notifications/receipts` route. */
+const RECEIPT_WINDOW = 30;
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -93,12 +102,76 @@ export interface JobView {
   readonly lastAgentActivity: string | null;
 }
 
+/** Issue #171 runtime ownership: the agent ids the LIVE process owns
+ * (registry handles ∪ supervision records ∪ durable stops — the caller
+ * unions them). `null` from the probe means "cannot answer" (unwired),
+ * which the board reports as `unverified` — never a guessed class. */
+export interface RuntimeOwnership {
+  readonly ownedAgentIds: ReadonlySet<string>;
+}
+
+/** Issue #171 membership classification for one agent record:
+ * - `current` — the live runtime owns the record (live handle,
+ *   supervision adoption, or a hydrated durable stop — a stopped or
+ *   restoring lane stays current, never retired);
+ * - `historical` — ownership probes are wired and the record is NOT in
+ *   the live ownership set: a previous run/import left it. Transcripts
+ *   stay accessible; it is never counted or sorted as an active worker;
+ * - `unverified` — no ownership evidence either way (probes unwired or
+ *   unavailable): an explicit conservative state, never fabricated
+ *   certainty in either direction. */
+export type AgentRuntimeClass = 'current' | 'historical' | 'unverified';
+
+/** Issue #161: one tracked child worker as the board renders it. The
+ * child's own record is the durable result surface; `resultSummary` is
+ * the child's own final report text (never fabricated). */
+export interface ChildWorkerView {
+  readonly id: string;
+  readonly agentId: string | null;
+  readonly parentAgentId: string;
+  readonly jobId: string;
+  readonly purpose: string;
+  readonly authority: 'read-only' | 'writer';
+  readonly state: ChildWorkerRecord['state'];
+  readonly worktreeId: string | null;
+  readonly branch: string | null;
+  readonly resultState: ChildWorkerRecord['resultState'];
+  readonly resultSummary: string | null;
+  readonly resultRef: string | null;
+  readonly createdAt: string;
+  readonly admittedAt: string | null;
+  readonly startedAt: string | null;
+  readonly finishedAt: string | null;
+}
+
 export interface AgentView {
   readonly id: string;
   readonly role: Role;
   readonly label: string | null;
   readonly state: AgentState;
+  /** Issue #161 parentage category. `null` = genuinely unknown (a legacy
+   * row written before tracked parentage existed) — never guessed from
+   * names or job patterns. */
+  readonly parentage: AgentParentage | null;
+  /** Issue #161 durable parent link (parent navigation for a child). */
+  readonly parentAgentId: string | null;
+  /** The child record when this agent IS a tracked child (null otherwise). */
+  readonly child: ChildWorkerView | null;
+  /** Family counters for a parent row with admitted children (null when
+   * none): present-state plus lifetime logical creations. */
+  readonly childCounts: ChildWorkerCounts | null;
+  /** Issue #171 truthful display status: the raw adapter state corrected
+   * by supervision activity evidence — a raw `idle` with an open turn,
+   * open control or open tool call is WORKING and reads `streaming`, so a
+   * live agent never presents a settled idle turn. `state` keeps the raw
+   * record for the transcript/archaeology surface. */
+  readonly status: AgentState;
+  /** Issue #171 runtime ownership classification (AgentRuntimeClass). */
+  readonly runtime: AgentRuntimeClass;
   readonly lastActivity: string | null;
+  /** Row registration stamp: the board's stall clock floor for a fresh
+   * worker that has not sent its first frame (twelve-followthrough A1/E1). */
+  readonly createdAt: string;
   readonly sessionFile: string | null;
   readonly jobId: string | null;
   readonly roundId: string | null;
@@ -121,11 +194,34 @@ export interface NotificationView {
   readonly resolvedBy: string | null;
 }
 
-/** Silas ops health (board UX v4): the newest wake (sweep or event) and
- * how many reconciliation events landed today. Derived from the durable
- * event stream — the ledger is the record. */
+/** Silas ops health (board UX v4, issue #163): the newest wake (sweep or
+ * event), the newest accepted tick/reconciliation observations, the
+ * current open model-turn start, and today's state-correction actions —
+ * all derived from the durable event stream. `lastWakeAt` is deliberately
+ * the wake START marker, never a completed scan; `lastReconcileAt` only
+ * advances on a successfully completed deterministic pass. */
 export interface SilasView {
   readonly lastWakeAt: string | null;
+  /** Newest accepted trigger (timer tick or bus event). */
+  readonly lastTickAt: string | null;
+  /** Newest SUCCESSFUL deterministic reconciliation pass. */
+  readonly lastReconcileAt: string | null;
+  /** Newest FAILED deterministic reconciliation pass (never counted as
+   * completion). */
+  readonly lastReconcileFailedAt: string | null;
+  /** True when the newest pass failure is NEWER than the newest pass
+   * success (compared by durable event sequence, so same-millisecond
+   * passes cannot tie-break wrongly). */
+  readonly reconcileFailedNewer: boolean;
+  /** Newest state-correction action (register PR, trigger review,
+   * directive, settlement, rebrief, escalation). */
+  readonly lastUsefulActionAt: string | null;
+  /** The oldest live obligation's durable next action, pre-rendered: the
+   * truthful "what is owed next" projection (null when none is live). */
+  readonly nextAction: string | null;
+  /** The current open model turn's start (latest wake marker while
+   * supervision reports an open turn); null when no turn is open. */
+  readonly openTurnSince: string | null;
   readonly reconciliationsToday: number;
   readonly checkedAt: string;
 }
@@ -146,6 +242,8 @@ export interface BoardSnapshot {
   readonly decisions: DecisionRuntimeStatus;
   /** NEEDS GRU: machine-attention rows still awaiting a disposition
    * (self-clearing machine queue; never rings the owner bell). Counted
+   * LIVE: rows bound to a terminal (merged/done) job are closed receipts —
+   * the record keeps them, this count (and the banding) does not. Read
    * from the table, not the 30-row feed window, so the tracker is true. */
   readonly unackedActionRequired: number;
   /** FOR YOU: needs-owner rows still awaiting a human ack — the only
@@ -162,6 +260,12 @@ export interface BoardSnapshot {
   /** Provider pacing gate (limits, running, queued with reasons). Null when
    * the pacing feature is off — the pre-pacing snapshot shape. */
   readonly pacing: PacingGateView | null;
+  /** Issue #161: tracker-wide child counters. Present-state counts
+   * (queued/active/finished) are derived from the durable child_workers
+   * rows; `lifetimeCreations` is the row count (one per LOGICAL child
+   * creation), so restarts, retries and session resumes cannot
+   * double-count. */
+  readonly children: ChildWorkerCounts;
   /** Self-healing session stats (null until its producer exists). */
   readonly selfHeal: SelfHealView | null;
   /** FOR YOU (owner approval 2026-09-28): PRs with exact-head evidence
@@ -174,10 +278,21 @@ export interface BoardSnapshot {
 /** Agent-rail ordering: the standing crew first, workers after. */
 const ROLE_ORDER: Readonly<Record<Role, number>> = { gru: 0, silas: 1, perkins: 2, minion: 3, bob: 4 };
 
-/** Liveness-first rail order: agents actively working float to the top,
- * the graveyard sinks. Liveness IS the primary key — an old disposed chat
- * epoch must never outrank a streaming lens (role order and recency are
- * only tiebreakers inside one liveness band). */
+/** Issue #171 membership bands come FIRST — a historical record must
+ * never outrank any current or unverified row, whatever stale state it
+ * froze in. `unverified` sits between: not claimed active, not retired. */
+const RUNTIME_ORDER: Readonly<Record<AgentRuntimeClass, number>> = {
+  current: 0,
+  unverified: 1,
+  historical: 2,
+};
+
+/** Liveness-first rail order INSIDE a membership band: agents actively
+ * working float to the top, the graveyard sinks. Liveness IS the primary
+ * key inside the band — an old disposed chat epoch must never outrank a
+ * streaming lens (role order and recency are only tiebreakers inside one
+ * liveness band). Keyed on the DERIVED status (#171): a raw-idle agent
+ * with an open supervision turn sorts as the live work it is. */
 const STATE_ORDER: Readonly<Record<AgentState, number>> = {
   streaming: 0,
   spawning: 1,
@@ -196,17 +311,58 @@ const LENS_VERDICTS = ['blocker', 'warning', 'note', 'clean'] as const;
  * board (registering a PR, triggering review, directives, rebriefs,
  * escalations). */
 const SILAS_WAKE_KINDS = ['silas.wake'] as const;
-const SILAS_RECONCILE_KINDS = [
+/** Tick observations and deterministic-pass outcomes (issue #163). */
+const SILAS_TICK_KINDS = ['silas.tick'] as const;
+const SILAS_RECONCILE_KINDS = ['silas.reconcile'] as const;
+const SILAS_RECONCILE_FAILED_KINDS = ['silas.reconcile-failed'] as const;
+/** State-correction and machine-action events that moved the board
+ * (registering a PR, triggering review, directives, settlements,
+ * rebriefs, escalations). */
+const SILAS_ACTION_KINDS = [
   'silas.pr-registered',
   'silas.review-triggered',
   'silas.directive-sent',
+  'silas.directive-settled',
   'silas.rebrief',
   'silas.escalated',
+  // Pass-ATTRIBUTED progress: emitted only by the deterministic pass when
+  // it actually advanced durable work (a generic phase-completion or
+  // obligation event from an unrelated lane is deliberately NOT counted).
+  'silas.reconcile-advanced',
 ] as const;
 
 /** PR state from the record: a terminal `merged` job is merged; a
  * registered URL is open. `conflicting` has no writer yet — the PR-state
  * sweep will land it, and the board already buckets on it. */
+/** The board projection of one tracked child worker. */
+function childView(child: ChildWorkerRecord): ChildWorkerView {
+  return {
+    id: child.id,
+    agentId: child.agentId,
+    parentAgentId: child.parentAgentId,
+    jobId: child.jobId,
+    purpose: child.purpose,
+    authority: child.authority,
+    state: child.state,
+    worktreeId: child.worktreeId,
+    branch: child.branch,
+    resultState: child.resultState,
+    resultSummary: child.resultSummary,
+    resultRef: child.resultRef,
+    createdAt: child.createdAt,
+    admittedAt: child.admittedAt,
+    startedAt: child.startedAt,
+    finishedAt: child.finishedAt,
+  };
+}
+
+interface MutableChildCounts {
+  queued: number;
+  active: number;
+  finished: number;
+  lifetimeCreations: number;
+}
+
 function prStateOf(job: Pick<JobRecord, 'status' | 'prUrl'>): JobView['prState'] {
   if (job.status === 'merged') return 'merged';
   if (job.prUrl !== null) return 'open';
@@ -219,6 +375,19 @@ function lensVerdictFromNote(note: string | null): string | null {
     if (note.startsWith(`${verdict} — `)) return verdict;
   }
   return null;
+}
+
+/** Issue #171 truthful status: supervision activity evidence wins over a
+ * raw `idle` — an open turn, an open control phase or an open tool call
+ * IS live work (fresh events/growing session file), never a settled idle
+ * turn. Only positive evidence upgrades; absence of supervision never
+ * downgrades a raw `streaming` (no hang diagnosis from silence — the
+ * watchdog owns that call). */
+function derivedStatus(state: AgentState, supervision: AgentSupervisionView | null): AgentState {
+  if (supervision === null || state !== 'idle') return state;
+  const openWork =
+    supervision.openTurn || supervision.openControl === true || supervision.openToolCalls > 0;
+  return openWork ? 'streaming' : state;
 }
 
 /** Whole-PR review specialists mint bare `lens` labels; a retry appends
@@ -240,6 +409,10 @@ export interface BoardEngineOptions {
   /** E7: live supervision views per agent id (late-bound — main wires it
    * to the supervisor after both exist). */
   readonly supervisionFor?: (agentId: string) => AgentSupervisionView | null;
+  /** Issue #171: current-runtime ownership probe (live registry handles).
+   * Wiring EITHER probe makes absence-of-evidence authoritative for
+   * `historical` classification; wiring NEITHER yields `unverified`. */
+  readonly runtimeOwnership?: () => RuntimeOwnership | null;
   readonly decisionsStatus?: () => DecisionRuntimeStatus;
   /** Board UX v4: deploy drift view (late-bound tracker). */
   readonly buildDrift?: () => DeployDriftView | null;
@@ -265,6 +438,8 @@ export class BoardEngine {
     this.bus = opts.bus;
     this.log = opts.log ?? (() => {});
     this.supervisionFor = opts.supervisionFor ?? (() => null);
+    this.ownershipProbe = opts.runtimeOwnership ?? null;
+    this.membershipWired = opts.supervisionFor !== undefined || opts.runtimeOwnership !== undefined;
     this.decisionsStatus = opts.decisionsStatus ?? (() => ({
       enabled: false,
       status: 'disabled',
@@ -286,6 +461,11 @@ export class BoardEngine {
   }
 
   private readonly supervisionFor: (agentId: string) => AgentSupervisionView | null;
+  /** Issue #171: the registry-handle ownership probe (null when unwired). */
+  private readonly ownershipProbe: (() => RuntimeOwnership | null) | null;
+  /** Issue #171: whether ANY ownership probe is wired (supervision feed or
+   * the registry probe) — without one, membership is `unverified`. */
+  private readonly membershipWired: boolean;
   private readonly decisionsStatus: () => DecisionRuntimeStatus;
   private readonly buildDrift: () => DeployDriftView | null;
   private readonly verifyQueue: () => VerificationQueueView | null;
@@ -415,13 +595,72 @@ export class BoardEngine {
   snapshot(): BoardSnapshot {
     const jobs = this.ledger.listJobs();
     const agentRows = this.ledger.listAgents();
+    // Issue #161: ONE child read per snapshot serves the child views, the
+    // parent-family counters and the tracker-wide counters.
+    const childRows = this.ledger.listChildWorkers();
+    const childByAgent = new Map<string, ChildWorkerView>();
+    const childCountsByParent = new Map<string, MutableChildCounts>();
+    // A child admitted but not yet session-bound (no session file) is NOT
+    // historical: its runtime ownership is simply not established yet, so
+    // it classifies `unverified` and stays in the live rail until spawn.
+    const pendingChildAgentIds = new Set(
+      childRows
+        .filter((child) => child.resultState === null && child.sessionFile === null && child.agentId !== null)
+        .map((child) => child.agentId as string),
+    );
+    let childrenQueued = 0;
+    let childrenActive = 0;
+    let childrenFinished = 0;
+    for (const child of childRows) {
+      // `admitted` still means waiting on the resident budget — the
+      // session is not live until `active` (queued truthfulness).
+      const bucket =
+        child.state === 'queued' || child.state === 'admitted'
+          ? 'queued'
+          : child.state === 'active'
+            ? 'active'
+            : 'finished';
+      if (bucket === 'queued') childrenQueued += 1;
+      else if (bucket === 'active') childrenActive += 1;
+      else childrenFinished += 1;
+      const counts = childCountsByParent.get(child.parentAgentId) ?? {
+        queued: 0,
+        active: 0,
+        finished: 0,
+        lifetimeCreations: 0,
+      };
+      counts[bucket] += 1;
+      counts.lifetimeCreations += 1;
+      childCountsByParent.set(child.parentAgentId, counts);
+      if (child.agentId !== null) childByAgent.set(child.agentId, childView(child));
+    }
+    // Issue #171: ONE ownership read per snapshot (the probe rebuilds a
+    // set of every live handle) and ONE supervision lookup per row — the
+    // same evidence serves the activity projection and the agent views.
+    const ownership = this.ownershipProbe?.() ?? null;
+    const supervisionById = new Map<string, AgentSupervisionView | null>(
+      agentRows.map((agent) => [agent.id, this.supervisionFor(agent.id)]),
+    );
+    const runtimeClassOf = (agent: AgentRecord): AgentRuntimeClass =>
+      this.classifyRuntime(
+        agent.id,
+        supervisionById.get(agent.id) ?? null,
+        ownership,
+        pendingChildAgentIds.has(agent.id),
+      );
     // Per-job newest agent activity and per-round lens attempt counts are
     // derived once per snapshot from the same agent rows (ISO stamps
     // compare lexicographically; lens children mint `lens:chunk` labels).
     const activityByJob = new Map<string, string>();
     const attemptsByRound = new Map<string, Map<string, number>>();
     for (const agent of agentRows) {
-      if (agent.jobId !== null && agent.lastActivity !== null) {
+      // Issue #171: a verified-historical record's frozen stamp is not
+      // current activity — it must never warm the lane's stall clock.
+      if (
+        agent.jobId !== null &&
+        agent.lastActivity !== null &&
+        runtimeClassOf(agent) !== 'historical'
+      ) {
         const newest = activityByJob.get(agent.jobId);
         if (newest === undefined || agent.lastActivity > newest) activityByJob.set(agent.jobId, agent.lastActivity);
       }
@@ -432,30 +671,65 @@ export class BoardEngine {
         attemptsByRound.set(agent.roundId, perLens);
       }
     }
+    // Closed-receipt rule (owner decisions D1/D3): a machine row bound
+    // through an agent to a merged/done job is a receipt, not live work.
+    const concludedJobs = new Set(
+      jobs.filter((job) => job.status === 'merged' || job.status === 'done').map((job) => job.id),
+    );
+    const agentJob = new Map(
+      agentRows.filter((agent) => agent.jobId !== null).map((agent) => [agent.id, agent.jobId as string]),
+    );
+    const isReceipt = (agentId: string | null): boolean => {
+      if (agentId === null || concludedJobs.size === 0) return false;
+      const jobId = agentJob.get(agentId);
+      return jobId !== undefined && concludedJobs.has(jobId);
+    };
     const repos = [...this.jobViews(jobs, activityByJob, attemptsByRound).entries()]
       .map(([name, group]) => ({ name, jobs: group }))
       .sort((a, b) => a.name.localeCompare(b.name));
     const agents = agentRows
-      .map((agent) => this.agentView(agent))
+      .map((agent) =>
+        this.agentView(
+          agent,
+          supervisionById.get(agent.id) ?? null,
+          ownership,
+          childByAgent.get(agent.id) ?? null,
+          (childCountsByParent.get(agent.id) as ChildWorkerCounts | undefined) ?? null,
+          pendingChildAgentIds.has(agent.id),
+        ),
+      )
       .sort(
         (a, b) =>
-          STATE_ORDER[a.state] - STATE_ORDER[b.state] ||
+          RUNTIME_ORDER[a.runtime] - RUNTIME_ORDER[b.runtime] ||
+          STATE_ORDER[a.status] - STATE_ORDER[b.status] ||
           (ROLE_ORDER[a.role] ?? 99) - (ROLE_ORDER[b.role] ?? 99) ||
           (b.lastActivity ?? '').localeCompare(a.lastActivity ?? ''),
       );
+    // Issue #163: the open-turn start is a led+supervision fact, never a
+    // wake-marker age. A silas record whose live supervision says an open
+    // turn exists is the only source of "a turn is open right now".
+    const silasTurnOpen = agentRows.some(
+      (agent) => agent.role === 'silas' && supervisionById.get(agent.id)?.openTurn === true,
+    );
     return {
       repos,
       agents,
-      notifications: this.notifications(),
+      notifications: this.notifications(isReceipt),
       decisions: this.decisionsStatus(),
-      unackedActionRequired: this.ledger.countPendingActionRequired(),
+      unackedActionRequired: this.ledger.countLivePendingActionRequired(),
       unackedNeedsOwner: this.ledger.countPendingNeedsOwner(),
       wakes: {
         count: this.ledger.countEvents('gru.wake'),
         lastAt: this.ledger.latestEventOfKind('gru.wake')?.ts ?? null,
       },
       build: this.buildDrift(),
-      silas: this.silasView(),
+      children: {
+        queued: childrenQueued,
+        active: childrenActive,
+        finished: childrenFinished,
+        lifetimeCreations: childRows.length,
+      },
+      silas: this.silasView(silasTurnOpen),
       verify: this.verifyQueue(),
       pacing: this.pacing(),
       selfHeal: this.selfHeal(),
@@ -478,17 +752,105 @@ export class BoardEngine {
       .sort((left, right) => left.jobId.localeCompare(right.jobId));
   }
 
-  /** Silas ops health from the durable event stream: newest wake + today's
-   * reconciliations (state-correction events, not the wake itself). */
-  private silasView(): SilasView {
+  /** Silas ops health from the durable event stream: newest wake (start
+   * marker), newest accepted tick, newest successful/failed deterministic
+   * pass, newest corrective action and — when supervision says a turn is
+   * open — that turn's start (issue #163). `reconciliationsToday` stays the
+   * state-correction count; a tick or a failed pass never claims it. */
+  private silasView(openTurn: boolean): SilasView {
     const now = this.now();
     const dayStart = new Date(now);
     dayStart.setHours(0, 0, 0, 0);
+    const wake = this.ledger.latestEventOfKinds(SILAS_WAKE_KINDS);
+    const reconcileOk = this.ledger.latestEventOfKinds(SILAS_RECONCILE_KINDS);
+    const reconcileFailed = this.ledger.latestEventOfKinds(SILAS_RECONCILE_FAILED_KINDS);
     return {
-      lastWakeAt: this.ledger.latestEventOfKinds(SILAS_WAKE_KINDS)?.ts ?? null,
-      reconciliationsToday: this.ledger.countEventsSince(SILAS_RECONCILE_KINDS, dayStart.toISOString()),
+      lastWakeAt: wake?.ts ?? null,
+      lastTickAt: this.ledger.latestEventOfKinds(SILAS_TICK_KINDS)?.ts ?? null,
+      // The success timestamp only ever advances on a completed pass; a
+      // later failure does not erase it, and a failure never sets it.
+      lastReconcileAt: reconcileOk?.ts ?? null,
+      lastReconcileFailedAt: reconcileFailed?.ts ?? null,
+      reconcileFailedNewer:
+        reconcileFailed !== null && (reconcileOk === null || reconcileFailed.seq > reconcileOk.seq),
+      lastUsefulActionAt: this.ledger.latestEventOfKinds(SILAS_ACTION_KINDS)?.ts ?? null,
+      nextAction: this.nextActionProjection(),
+      openTurnSince: openTurn ? (wake?.ts ?? null) : null,
+      reconciliationsToday: this.ledger.countEventsSince(SILAS_ACTION_KINDS, dayStart.toISOString()),
       checkedAt: new Date(now).toISOString(),
     };
+  }
+
+  /** The oldest live debt as the durable next action (issue #163): a live
+   * obligation, else a live directive request, else the newest recorded
+   * verification wait its own scope has not answered. Every read is
+   * state-filtered before any bound and per-row isolated, so settled
+   * history or one damaged row can never blank the board's projection. */
+  private nextActionProjection(): string | null {
+    for (const state of ['open', 'waiting'] as const) {
+      const row = this.ledger.listObligationsDetailed({ state, limit: 5 }).readable[0];
+      if (row !== undefined) {
+        const next = row.nextAction;
+        const detail =
+          next.kind === 'silas-mechanical'
+            ? next.action
+            : next.kind === 'external-wait'
+              ? next.condition
+              : next.decision;
+        const bounded = detail.length > 120 ? `${detail.slice(0, 117)}...` : detail;
+        return `${next.kind}: ${bounded} (${row.jobId})`;
+      }
+    }
+    try {
+      const directive = this.ledger.listPendingDirectives({ states: LIVE_DIRECTIVE_STATES, limit: 1 })[0];
+      if (directive !== undefined) {
+        return `directive ${directive.requestId}: ${directive.state} (${directive.jobId})`;
+      }
+    } catch (error) {
+      // One malformed directive row must never take the board down; the
+      // malformed debt stays visible to the boot reconciler instead.
+      this.log?.('error', 'silas health: live directive read failed', { error: String(error) });
+    }
+    return this.verificationWaitProjection();
+  }
+
+  /** The newest recorded verification wait that its own scope has not
+   * answered (a newer same-scope completion/request retires it). */
+  private verificationWaitProjection(): string | null {
+    const timeout = this.ledger.latestEventOfKinds(['verification.lock-timeout']);
+    if (timeout === null || timeout.jobId === null) return null;
+    const scope =
+      typeof timeout.payload === 'object' && timeout.payload !== null
+        ? ((timeout.payload as { scope?: unknown }).scope ?? null)
+        : null;
+    const scopeLabel = typeof scope === 'string' && scope !== '' ? scope : null;
+    const scoped = this.ledger.latestJobEventsByPayloadScope(timeout.jobId, [
+      'verification.completed',
+      'verification.lock-timeout',
+      'verification.requested',
+    ]);
+    let latestTimeout: EventRecord | null = null;
+    let latestAnswer: EventRecord | null = null;
+    for (const event of scoped) {
+      const eventScope =
+        typeof event.payload === 'object' && event.payload !== null
+          ? (event.payload as { scope?: unknown }).scope
+          : undefined;
+      if (scopeLabel !== null && eventScope !== scopeLabel) continue;
+      if (event.kind === 'verification.lock-timeout') {
+        if (latestTimeout === null || event.seq > latestTimeout.seq) latestTimeout = event;
+      } else if (latestAnswer === null || event.seq > latestAnswer.seq) {
+        latestAnswer = event;
+      }
+    }
+    if (latestTimeout === null) return null;
+    if (latestAnswer !== null && latestAnswer.seq > latestTimeout.seq) return null;
+    const head =
+      typeof latestTimeout.payload === 'object' && latestTimeout.payload !== null
+        ? (latestTimeout.payload as { head?: unknown }).head
+        : null;
+    const headLabel = typeof head === 'string' && head !== '' ? head : 'head unrecorded';
+    return `verification wait: ${scopeLabel ?? 'scope unrecorded'}@${headLabel} (${timeout.jobId})`;
   }
 
   /** Repo-grouped job views (the group map preserves ledger job order). */
@@ -563,18 +925,79 @@ export class BoardEngine {
     };
   }
 
-  private agentView(agent: AgentRecord): AgentView {
+  private agentView(
+    agent: AgentRecord,
+    supervision: AgentSupervisionView | null,
+    ownership: RuntimeOwnership | null,
+    child: ChildWorkerView | null,
+    childCounts: ChildWorkerCounts | null,
+    pendingChild: boolean,
+  ): AgentView {
     return {
       id: agent.id,
       role: agent.role,
       label: agent.label,
       state: agent.state,
+      parentage: agent.parentage,
+      parentAgentId: agent.parentAgentId,
+      child,
+      childCounts,
+      status: derivedStatus(agent.state, supervision),
+      runtime: this.classifyRuntime(agent.id, supervision, ownership, pendingChild),
       lastActivity: agent.lastActivity,
+      // The row's registration stamp: the board's stall clock floor for a
+      // fresh worker that has not sent its first frame (twelve-followthrough A1/E1).
+      createdAt: agent.createdAt,
       sessionFile: agent.sessionFile,
       jobId: agent.jobId,
       roundId: agent.roundId,
-      supervision: this.supervisionFor(agent.id),
+      supervision,
     };
+  }
+
+  /** Issue #171 membership for one record. A supervision view (live
+   * adoption or a hydrated durable stop — a stopped/restoring lane is
+   * OWNED, never retired) or a live registry handle proves `current`.
+   * With a probe wired and ANSWERING, absence from the ownership set is
+   * VERIFIED non-membership → `historical` (the record predates this
+   * runtime: unclean stop, restart, or import). A wired probe answering
+   * `null` (temporarily unavailable) is missing evidence → `unverified`,
+   * as is a board with no witness wired at all. */
+  private classifyRuntime(
+    agentId: string,
+    supervision: AgentSupervisionView | null,
+    ownership: RuntimeOwnership | null,
+    pendingChild = false,
+  ): AgentRuntimeClass {
+    if (supervision !== null) return 'current';
+    // An admitted-but-unspawned child has no runtime owner YET — that is
+    // missing evidence, never a verified historical record.
+    if (pendingChild) return 'unverified';
+    if (this.ownershipProbe !== null) {
+      // The registry probe is the wired witness: an ANSWER classifies
+      // (member → current, verified absence → historical); a null answer
+      // is missing evidence → unverified, never a guessed class.
+      if (ownership === null) return 'unverified';
+      return ownership.ownedAgentIds.has(agentId) ? 'current' : 'historical';
+    }
+    // No registry probe: the supervision feed (which sees every spawn via
+    // the registry tap) is the sole wired witness — its verified absence
+    // is authoritative. With no witness at all, unverified.
+    return this.membershipWired ? 'historical' : 'unverified';
+  }
+
+  /**
+   * The closed-receipt rule (owner decisions D1/D3) for out-of-band
+   * callers (the paged receipt route): a row bound through an agent to a
+   * merged/done job. The snapshot scan uses a map-built predicate instead
+   * so the unbounded walk stays one query per page.
+   */
+  isClosedReceipt(agentId: string | null): boolean {
+    if (agentId === null) return false;
+    const agent = this.ledger.getAgent(agentId);
+    if (agent === null || agent.jobId === null) return false;
+    const job = this.ledger.getJob(agent.jobId);
+    return job !== null && (job.status === 'merged' || job.status === 'done');
   }
 
   /**
@@ -582,16 +1005,34 @@ export class BoardEngine {
    * first. Since E7 the feed is the LEDGER's notifications table —
    * FYI rows derive once at event time (the notification center posts
    * them), action-required rows carry acks; nothing is computed here.
+   *
+   * Boundedness (owner decision D3, code review 2026-10-04): closed
+   * receipts stay unacked forever by design, so the unbounded pending scan
+   * now carries LIVE rows only; the newest RECEIPT_WINDOW receipts stay in
+   * the snapshot and older ones are served by the paged receipt route.
    */
-  notifications(limit = 30): readonly NotificationView[] {
-    // The recent feed is bounded, but neither pending attention queue is.
-    // Old machine incidents remain visible until Gru dispositions them;
-    // owner stops remain in FOR YOU until the owner's Ack.
+  notifications(isReceipt?: (agentId: string | null) => boolean, limit = 30): readonly NotificationView[] {
+    // The snapshot passes its map-built predicate (one query per page);
+    // direct callers keep the single-row lookup fallback.
+    const receiptOf =
+      isReceipt ?? ((agentId: string | null): boolean => this.isClosedReceipt(agentId));
     const byId = new Map(this.ledger.listNotifications({ limit }).map((row) => [row.id, row]));
     for (const routing of ['needs-owner', 'action-required'] as const) {
+      let retainedReceipts = 0;
       for (let offset = 0;; offset += 50) {
         const page = this.ledger.listNotifications({ unackedOnly: true, routing, limit: 50, offset });
-        for (const row of page) byId.set(row.id, row);
+        for (const row of page) {
+          // needs-owner rows stay on the owner path by contract; only
+          // action-required rows participate in the receipt rule.
+          if (routing === 'action-required' && receiptOf(row.agentId)) {
+            if (retainedReceipts < RECEIPT_WINDOW) {
+              byId.set(row.id, row);
+              retainedReceipts += 1;
+            }
+            continue;
+          }
+          byId.set(row.id, row);
+        }
         if (page.length < 50) break;
       }
     }
