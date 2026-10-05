@@ -528,6 +528,13 @@ function defaultSampleSnapshot(): unknown {
     },
     silas: {
       lastWakeAt: new Date(Date.now() - 240_000).toISOString(),
+      lastTickAt: new Date(Date.now() - 60_000).toISOString(),
+      lastReconcileAt: new Date(Date.now() - 60_000).toISOString(),
+      lastReconcileFailedAt: null,
+      reconcileFailedNewer: false,
+      lastUsefulActionAt: new Date(Date.now() - 120_000).toISOString(),
+      nextAction: 'gru-decision: rule on the completed audit (demo-job)',
+      openTurnSince: new Date(Date.now() - 240_000).toISOString(),
       reconciliationsToday: 2,
       checkedAt: new Date().toISOString(),
     },

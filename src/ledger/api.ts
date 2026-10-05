@@ -801,6 +801,24 @@ export class LedgerApi {
     return row === undefined ? null : this.eventFromRow(row);
   }
 
+  /** Job events restricted to an explicit kind set (newest first). Digest
+   * and reconcile read paths use it so unrelated job traffic cannot push
+   * the observed kind out of a fixed newest-N window. */
+  listJobEventsByKinds(
+    jobId: string,
+    kinds: readonly string[],
+    opts: { limit?: number } = {},
+  ): readonly EventRecord[] {
+    if (kinds.length === 0) throw new Error('listJobEventsByKinds requires at least one kind');
+    const limit = opts.limit ?? 200;
+    const placeholders = kinds.map(() => '?').join(', ');
+    return (
+      this.db
+        .prepare(`SELECT * FROM events WHERE job_id = ? AND kind IN (${placeholders}) ORDER BY seq DESC LIMIT ?`)
+        .all(jobId, ...(kinds as string[]), limit) as Row[]
+    ).map((row) => this.eventFromRow(row));
+  }
+
   /** A marked request's guarded event, however many newer unrelated job
    * events exist. The request's watermark and phase must both match. */
   latestJobPhaseEvent(jobId: string, kind: string, phaseId: string, baselineSeq: number): EventRecord | null {
@@ -809,6 +827,78 @@ export class LedgerApi {
        AND json_extract(payload, '$.phase_id') = ? ORDER BY seq DESC LIMIT 1`,
     ).get(jobId, kind, baselineSeq, phaseId) as Row | undefined;
     return row === undefined ? null : this.eventFromRow(row);
+  }
+
+  /** A request-correlated event by identity, not recency: the correlated
+   * receipt is found however many newer same-kind events carry other
+   * request ids (restart-safe admission/delivery reconciliation). */
+  latestJobEventByRequestId(
+    jobId: string,
+    kind: string,
+    requestId: string,
+    opts: { sinceSeq?: number } = {},
+  ): EventRecord | null {
+    if (requestId.trim() === '') throw new Error('latestJobEventByRequestId requires a non-empty requestId');
+    const row = this.db
+      .prepare(
+        `SELECT * FROM events WHERE job_id = ? AND kind = ? AND seq > ?
+         AND json_extract(payload, '$.request_id') = ? ORDER BY seq DESC LIMIT 1`,
+      )
+      .get(jobId, kind, opts.sinceSeq ?? -1, requestId) as Row | undefined;
+    return row === undefined ? null : this.eventFromRow(row);
+  }
+
+  /** The newest event per (kind, scope) for a job. The verification
+   * follow-through reduction rides this so an unresolved scope can never
+   * age out behind newer traffic from other scopes (no newest-N window). */
+  latestJobEventsByPayloadScope(
+    jobId: string,
+    kinds: readonly string[],
+  ): readonly EventRecord[] {
+    if (kinds.length === 0) throw new Error('latestJobEventsByPayloadScope requires at least one kind');
+    // One grouped pass over the job's events (no per-row correlated MAX)
+    // and NO cap: the result set is one row per (kind, scope), bounded by
+    // the configured scope set, so an older unresolved scope can never be
+    // dropped by a newest-N cutoff.
+    const placeholders = kinds.map(() => '?').join(', ');
+    const rows = this.db
+      .prepare(
+        `SELECT e.* FROM events e
+          WHERE e.seq IN (
+            SELECT MAX(s.seq) FROM events s
+             WHERE s.job_id = ? AND s.kind IN (${placeholders})
+             GROUP BY s.kind, json_extract(s.payload, '$.scope')
+          )
+          ORDER BY e.seq DESC`,
+      )
+      .all(jobId, ...(kinds as string[])) as Row[];
+    return rows.map((row) => this.eventFromRow(row));
+  }
+
+  /** Does a job event of one of these kinds exist after `sinceSeq` with
+   * EXACT payload key/value matches for every pair? The identity check for
+   * retirement fences: a matching fingerprint/head/scope/request is found
+   * no matter how much newer same-kind traffic carries other identities. */
+  hasJobEventWithPayloadValues(
+    jobId: string,
+    kinds: readonly string[],
+    values: readonly { readonly key: string; readonly value: string }[],
+    sinceSeq: number,
+  ): boolean {
+    if (kinds.length === 0) throw new Error('hasJobEventWithPayloadValues requires at least one kind');
+    if (values.length === 0) throw new Error('hasJobEventWithPayloadValues requires at least one payload match');
+    const placeholders = kinds.map(() => '?').join(', ');
+    const matches = values.map(() => `json_extract(payload, '$.' || ?) = ?`).join(' AND ');
+    const params: unknown[] = [jobId, ...(kinds as string[]), sinceSeq];
+    for (const { key, value } of values) params.push(key, value);
+    const row = this.db
+      .prepare(
+        `SELECT 1 AS found FROM events
+          WHERE job_id = ? AND kind IN (${placeholders}) AND seq > ? AND ${matches}
+          LIMIT 1`,
+      )
+      .get(...(params as never[])) as Row | undefined;
+    return row !== undefined;
   }
 
   /** Newest event among an explicit kind set (board health cards: the
@@ -2907,9 +2997,12 @@ export class LedgerApi {
    * with no provable blocked episode is excluded. Already-tracked
    * deliveries (and deliveries owned by an existing marked phase row) are
    * excluded BY the query, so bounded passes always reach the tail. */
-  listUnmarkedHandbackDeliveries(limit: number): readonly EventRecord[] {
+  listUnmarkedHandbackDeliveries(limit: number, opts: { cursor?: number } = {}): readonly EventRecord[] {
     if (!Number.isSafeInteger(limit) || limit < 1) {
       throw new Error(`listUnmarkedHandbackDeliveries requires a positive integer limit, got ${String(limit)}`);
+    }
+    if (opts.cursor !== undefined && (!Number.isSafeInteger(opts.cursor) || opts.cursor < 0)) {
+      throw new Error('listUnmarkedHandbackDeliveries cursor must be a safe non-negative event seq');
     }
     const rows = this.db
       .prepare(
@@ -2918,6 +3011,7 @@ export class LedgerApi {
           WHERE e.kind = 'job.delivered'
             AND j.status = 'blocked'
             AND json_valid(e.payload)
+            AND e.seq > ?
             AND json_extract(e.payload, '$.source') IN ('silas-directive', 'silas-rebrief')
             AND COALESCE((
               SELECT json_extract(s.payload, '$.to')
@@ -2943,7 +3037,7 @@ export class LedgerApi {
           ORDER BY e.seq ASC
           LIMIT ?`,
       )
-      .all(limit) as Row[];
+      .all(opts.cursor ?? 0, limit) as Row[];
     return rows.map((row) => this.eventFromRow(row));
   }
 
@@ -2952,16 +3046,36 @@ export class LedgerApi {
    * action-required card was never published (crash between the obligation
    * write and the notification). A published card — even a resolved/acked
    * one — removes the row from the candidate set. */
-  listHandbacksMissingCards(limit: number): readonly ObligationRecord[] {
+  listHandbacksMissingCards(limit: number, opts: { cursor?: number } = {}): readonly ObligationRecord[] {
+    return this.listHandbacksMissingCardsDetailed(limit, opts).readable;
+  }
+
+  /** Window-B candidates with per-row decode isolation: one malformed
+   * obligation row is reported (never re-thrown into a bounded pass) while
+   * the readable rows stay available and the cursor can advance past the
+   * malformed prefix. */
+  listHandbacksMissingCardsDetailed(
+    limit: number,
+    opts: { cursor?: number } = {},
+  ): {
+    readonly readable: readonly ObligationRecord[];
+    readonly malformed: number;
+    readonly lastRowid: number | null;
+    readonly exhausted: boolean;
+  } {
     if (!Number.isSafeInteger(limit) || limit < 1) {
       throw new Error(`listHandbacksMissingCards requires a positive integer limit, got ${String(limit)}`);
     }
+    if (opts.cursor !== undefined && (!Number.isSafeInteger(opts.cursor) || opts.cursor < 0)) {
+      throw new Error('listHandbacksMissingCards cursor must be a safe non-negative rowid');
+    }
     const rows = this.db
       .prepare(
-        `SELECT o.* FROM job_obligations o
+        `SELECT o.rowid AS _rowid, o.* FROM job_obligations o
           WHERE o.logical_step = 'operation'
             AND o.incident_key LIKE 'phase-handback@%'
             AND o.state IN ('open', 'waiting')
+            AND o.rowid > ?
             AND NOT EXISTS (
               SELECT 1 FROM notifications n
                WHERE n.kind = 'silas.phase-handback.' || o.job_id || '@' || substr(o.incident_key, 16)
@@ -2969,8 +3083,23 @@ export class LedgerApi {
           ORDER BY o.rowid ASC
           LIMIT ?`,
       )
-      .all(limit) as Row[];
-    return rows.map((row) => this.obligationFromRow(row));
+      .all(opts.cursor ?? 0, limit) as Row[];
+    const readable: ObligationRecord[] = [];
+    let malformed = 0;
+    for (const row of rows) {
+      try {
+        readable.push(this.obligationFromRow(row));
+      } catch {
+        malformed += 1;
+      }
+    }
+    const last = rows[rows.length - 1];
+    return {
+      readable,
+      malformed,
+      lastRowid: last === undefined ? null : Number(last._rowid),
+      exhausted: rows.length < limit,
+    };
   }
 
   getObligation(id: string): ObligationRecord | null {
@@ -4519,6 +4648,10 @@ export class LedgerApi {
       states?: readonly DirectiveState[];
       limit?: number;
       cursor?: string;
+      /** Integer rowid cursor (reconcile pagination): continues AFTER the
+       * given rowid in insertion order. Mutually exclusive with the string
+       * request-id cursor. */
+      rowidCursor?: number;
     } = {},
   ): readonly DirectiveRequestRecord[] {
     if (opts.state !== undefined && opts.states !== undefined) {
@@ -4544,12 +4677,33 @@ export class LedgerApi {
       where.push(`state IN (${opts.states.map(() => '?').join(', ')})`);
       params.push(...opts.states);
     }
+    if (opts.cursor !== undefined && opts.rowidCursor !== undefined) {
+      throw new Error('listPendingDirectives takes either the request-id cursor or the rowid cursor, never both');
+    }
     if (opts.cursor !== undefined) {
       where.push('request_id > ?');
       params.push(opts.cursor);
     }
-    const sql = `SELECT * FROM pending_directives${where.length > 0 ? ` WHERE ${where.join(' AND ')}` : ''} ORDER BY request_id LIMIT ?`;
+    if (opts.rowidCursor !== undefined) {
+      if (!Number.isSafeInteger(opts.rowidCursor) || opts.rowidCursor < 0) {
+        throw new Error('listPendingDirectives rowidCursor must be a safe non-negative rowid');
+      }
+      where.push('rowid > ?');
+      params.push(opts.rowidCursor);
+    }
+    const order = opts.rowidCursor !== undefined ? 'rowid' : 'request_id';
+    const sql = `SELECT * FROM pending_directives${where.length > 0 ? ` WHERE ${where.join(' AND ')}` : ''} ORDER BY ${order} LIMIT ?`;
     return (this.db.prepare(sql).all(...(params as never[]), limit) as Row[]).map((row) => this.directiveFromRow(row));
+  }
+
+  /** The rowid cursor for one directive request (reconcile pagination
+   * anchor). */
+  directiveRowid(requestId: string): number | null {
+    if (requestId.trim() === '') throw new Error('directiveRowid requires a non-empty requestId');
+    const row = this.db.prepare('SELECT rowid AS _rowid FROM pending_directives WHERE request_id = ?').get(requestId) as
+      | Row
+      | undefined;
+    return row === undefined ? null : Number(row._rowid);
   }
 
   /** Bind a request to its ACTUAL native admission: the correlated
@@ -4617,6 +4771,13 @@ export class LedgerApi {
       this.db
         .prepare("UPDATE pending_directives SET state = 'settled', delivery_seq = ?, updated_at = ? WHERE request_id = ?")
         .run(input.eventSeq, nowIso(), input.requestId);
+      // Durable action marker: a settlement is machine follow-through and
+      // must be visible to health/action projections (issue #163 review).
+      this.appendEvent({
+        kind: 'silas.directive-settled',
+        jobId: row.jobId,
+        payload: { request_id: input.requestId, delivery_seq: input.eventSeq },
+      });
       return this.getDirective(input.requestId) as DirectiveRequestRecord;
     });
   }

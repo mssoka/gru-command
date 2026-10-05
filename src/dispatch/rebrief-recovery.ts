@@ -927,6 +927,101 @@ export function reconcilePendingDirectives(deps: ReconcileDirectivesDeps): Direc
   return { examined: live.length, completed, escalated };
 }
 
+/** Durable round-robin cursor scope for the bounded per-pass evidence
+ * sweep (issue #163): successive passes continue past the examined prefix,
+ * so a fixed prefix of live-but-unsettled requests cannot starve the rows
+ * behind it. */
+const DIRECTIVE_EVIDENCE_SCOPE = 'directive-evidence';
+
+export interface DirectiveEvidenceReport {
+  /** Live requests examined this pass. */
+  readonly examined: number;
+  /** Requests completed from their own correlated evidence this pass. */
+  readonly completed: number;
+  /** Rows whose evidence lookup/reconciliation threw — a partial pass must
+   * never be reported as fully reconciled. */
+  readonly failed: number;
+}
+
+/**
+ * Bounded per-pass directive reconciliation (issue #163): complete the
+ * live requests whose correlated evidence already landed, WITHOUT the boot
+ * pass's escalation notes/cards. The boot pass judges and escalates; this
+ * pass only advances a request on positive durable evidence (a matching
+ * `silas.directive-sent` admission, then a matching `job.delivered`
+ * terminal receipt), so it is safe to run from the Silas deterministic
+ * pass on every tick — including while a model turn is open. An
+ * admission-unknown request is left exactly where it is (visible, live,
+ * never replayed); escalation stays a boot/restart judgment.
+ */
+export function settleDirectivesFromEvidence(
+  deps: Pick<ReconcileDirectivesDeps, 'ledger' | 'log'>,
+  opts: { pageSize?: number; maxPages?: number } = {},
+): DirectiveEvidenceReport {
+  const pageSize = Math.min(Math.max(1, opts.pageSize ?? 200), 1000);
+  const maxPages = Math.min(Math.max(1, opts.maxPages ?? 5), 1000);
+  let cursor = deps.ledger.readReconcileCursor(DIRECTIVE_EVIDENCE_SCOPE) ?? 0;
+  if (!Number.isSafeInteger(cursor) || cursor < 0) cursor = 0;
+  let examined = 0;
+  let completed = 0;
+  let failed = 0;
+  let lastRowid: number | null = null;
+  let reachedEnd = false;
+  for (let page = 0; page < maxPages; page += 1) {
+    const rows = deps.ledger.listPendingDirectives({
+      states: LIVE_DIRECTIVE_STATES,
+      limit: pageSize,
+      rowidCursor: cursor,
+    });
+    if (rows.length === 0) {
+      reachedEnd = true;
+      break;
+    }
+    for (const row of rows) {
+      examined += 1;
+      try {
+        const recovered = completeDirectiveFromEvidence(deps.ledger, row);
+        if (recovered !== null) {
+          completed += 1;
+          deps.log?.('info', 'directive request settled from correlated evidence', {
+            request: recovered.requestId,
+            job: recovered.jobId,
+            admission_seq: recovered.admissionSeq,
+            delivery_seq: recovered.deliverySeq,
+          });
+        }
+      } catch (error) {
+        // One malformed/conflicting row stays VISIBLE and never takes the
+        // pass down: the next pass retries it from durable state.
+        failed += 1;
+        deps.log?.('error', 'directive evidence reconciliation row failed', {
+          request: row.requestId,
+          error: String(error),
+        });
+      }
+    }
+    const last = rows[rows.length - 1];
+    lastRowid = last === undefined ? null : (deps.ledger.directiveRowid(last.requestId) ?? null);
+    if (rows.length < pageSize) {
+      reachedEnd = true; // the factual tail — the next pass starts over
+      break;
+    }
+    if (lastRowid === null) {
+      deps.log?.('error', 'directive evidence cursor could not advance — pass stopped', {
+        request: last?.requestId ?? null,
+      });
+      break;
+    }
+    cursor = lastRowid;
+  }
+  if (reachedEnd) {
+    if (cursor !== 0) deps.ledger.writeReconcileCursor({ scope: DIRECTIVE_EVIDENCE_SCOPE, cursor: 0 });
+  } else if (lastRowid !== null) {
+    deps.ledger.writeReconcileCursor({ scope: DIRECTIVE_EVIDENCE_SCOPE, cursor: lastRowid });
+  }
+  return { examined, completed, failed };
+}
+
 /** Page size for the boot pass: small enough to bound one query, large
  * enough that the common case is one page. */
 const DIRECTIVE_RECONCILE_PAGE = 200;
@@ -984,7 +1079,11 @@ function completeDirectiveFromEvidence(ledger: LedgerApi, row: DirectiveRequestR
 }
 
 /** Newest event of one kind whose payload is correlated to the request
- * id and passes the caller's watermark predicate. */
+ * id, by IDENTITY (SQL on `request_id`) rather than a newest-N window:
+ * however many newer same-kind events carry other request ids, the
+ * correlated receipt is still found. The newest correlated event failing
+ * the watermark predicate means every older one fails too, so no walk is
+ * needed. */
 function findCorrelatedEvent(
   ledger: LedgerApi,
   jobId: string,
@@ -992,13 +1091,7 @@ function findCorrelatedEvent(
   kind: string,
   accept: (event: EventRecord) => boolean,
 ): EventRecord | null {
-  const events = ledger.listJobEvents(jobId, { limit: 500 });
-  for (const event of events) {
-    if (event.kind !== kind) continue;
-    const payload = (typeof event.payload === 'object' && event.payload !== null ? event.payload : {}) as Record<string, unknown>;
-    if (payload['request_id'] !== requestId) continue;
-    if (!accept(event)) continue;
-    return event;
-  }
-  return null;
+  const event = ledger.latestJobEventByRequestId(jobId, kind, requestId);
+  if (event === null || !accept(event)) return null;
+  return event;
 }

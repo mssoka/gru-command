@@ -143,6 +143,24 @@ export interface DigestLedger {
   getJob(id: string): JobRecord | null;
   listRounds(jobId: string): readonly RoundRecord[];
   listJobEvents(jobId: string, opts?: { limit?: number }): readonly EventRecord[];
+  /** Job events restricted to an explicit kind set (newest first) — the
+   * verification follow-through read rides this so unrelated job traffic
+   * cannot age the observed kind out of a fixed window. */
+  listJobEventsByKinds(jobId: string, kinds: readonly string[], opts?: { limit?: number }): readonly EventRecord[];
+  /** The newest event per (kind, scope): the per-scope verification
+   * reduction without a newest-N window. */
+  latestJobEventsByPayloadScope(
+    jobId: string,
+    kinds: readonly string[],
+  ): readonly EventRecord[];
+  /** Exact multi-payload identity query (retirement fences): found however
+   * much newer same-kind traffic carries other identities. */
+  hasJobEventWithPayloadValues(
+    jobId: string,
+    kinds: readonly string[],
+    values: readonly { readonly key: string; readonly value: string }[],
+    sinceSeq: number,
+  ): boolean;
   latestJobEvent(jobId: string, kind: string): EventRecord | null;
   latestRoundEvent(roundId: string, kind: string): EventRecord | null;
   listAgents(): readonly AgentRecord[];
@@ -260,6 +278,38 @@ export interface MinionErrorRow {
   readonly at: string | null;
 }
 
+/** A lane whose newest completed verification FAILED and no repair rung
+ * has landed since (issue #163): the next step is a repair decision routed
+ * through the existing directive machinery, never an unchanged-head green
+ * rerun. Retires on a repair rung, a newer verification activity for the
+ * same scope, or a later PASS. */
+export interface VerificationFailureRow {
+  readonly jobId: string;
+  readonly repo: string;
+  readonly scope: string | null;
+  readonly runId: string | null;
+  readonly head: string | null;
+  readonly at: string | null;
+  readonly detail: string;
+}
+
+/** A verification submission whose queue wait timed out (issue #163):
+ * capacity, not the lane, answered. The row asks for reconsideration at
+ * the same head — never an automatic rerun, never a detached watcher.
+ * Retires when a newer verification activity lands for the same scope or
+ * the lane is terminal. */
+export interface VerificationWaitingRow {
+  readonly jobId: string;
+  readonly repo: string;
+  readonly scope: string | null;
+  readonly requestId: string | null;
+  /** The head pinned at submission (null when the timeout predates the
+   * head-recording form); re-submission must target exactly this head. */
+  readonly head: string | null;
+  readonly waitMs: number | null;
+  readonly at: string | null;
+}
+
 /** A provider-recovered lane awaiting its guarded continuation claim
  * (provider-recovery sensor): Silas drives these through the recovery
  * claim endpoint — one continuation per claim, fan-out after actual model
@@ -280,6 +330,8 @@ export interface SilasOpsDigest {
   readonly verdictsAwaitingDirective: readonly VerdictAwaitingDirectiveRow[];
   readonly stalledWorking: readonly StalledWorkingRow[];
   readonly minionErrors: readonly MinionErrorRow[];
+  readonly verificationFailures: readonly VerificationFailureRow[];
+  readonly verificationWaits: readonly VerificationWaitingRow[];
   readonly providerRecoveryPending: readonly ProviderRecoveryPendingRow[];
 }
 
@@ -291,6 +343,8 @@ export function digestActionCount(digest: SilasOpsDigest): number {
     digest.verdictsAwaitingDirective.length +
     digest.stalledWorking.length +
     digest.minionErrors.length +
+    digest.verificationFailures.length +
+    digest.verificationWaits.length +
     digest.providerRecoveryPending.length
   );
 }
@@ -433,6 +487,66 @@ function latestAnsweringReviewRequest(ledger: DigestLedger, jobId: string): Even
   return winner;
 }
 
+/** Verification event kinds whose latest event per scope the reduction
+ * needs (retirement is a separate identity query). */
+const VERIFICATION_SCOPE_KINDS: readonly string[] = ['verification.completed', 'verification.lock-timeout'];
+
+/** A fresh PRODUCER submission at an exact (scope, head), by identity
+ * query. Only `verification.requested` counts: `verification.attached`
+ * and `verification.started` join a pre-existing attempt and are not a
+ * new submission that answers a debt. A missing scope/head falls back to
+ * any new producer request. */
+function verificationResubmitted(
+  ledger: DigestLedger,
+  jobId: string,
+  scope: string | null,
+  head: string | null,
+  sinceSeq: number,
+): boolean {
+  // No recorded scope means no correlated identity: an unrelated scoped
+  // request must NEVER retire this debt (it stays until a completion in
+  // its own recorded scope, if any).
+  if (scope === null) return false;
+  const values: { readonly key: string; readonly value: string }[] = [{ key: 'scope', value: scope }];
+  if (head !== null) values.push({ key: 'head', value: head });
+  return ledger.hasJobEventWithPayloadValues(jobId, ['verification.requested'], values, sinceSeq);
+}
+
+function payloadRecord(event: EventRecord): Record<string, unknown> {
+  return typeof event.payload === 'object' && event.payload !== null
+    ? (event.payload as Record<string, unknown>)
+    : {};
+}
+
+function payloadString(event: EventRecord, key: string): string | null {
+  const value = payloadRecord(event)[key];
+  return typeof value === 'string' && value !== '' ? value : null;
+}
+
+function payloadNumber(event: EventRecord, key: string): number | null {
+  const value = payloadRecord(event)[key];
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function payloadFlag(event: EventRecord, key: string, expected: boolean): boolean {
+  return payloadRecord(event)[key] === expected;
+}
+
+/** A one-line honest reason a verification failed (never a fabricated
+ * exit status): a timeout or signal outranks an exit code, and a recorded
+ * spawn/runner error outranks a misleading zero exit. */
+function verificationFailureDetail(event: EventRecord): string {
+  const payload = payloadRecord(event);
+  if (payload['timed_out'] === true) return 'timed out';
+  const signal = payload['signal'];
+  if (typeof signal === 'string' && signal !== '') return `signal ${signal}`;
+  const error = payload['error'];
+  if (typeof error === 'string' && error !== '') return error.slice(0, 200);
+  const exitCode = payload['exit_code'];
+  if (typeof exitCode === 'number' && Number.isFinite(exitCode)) return `exit ${exitCode}`;
+  return 'failed with no exit status';
+}
+
 /** The job's current phase-opening evidence. */
 interface CurrentPhaseStart {
   /** Newest phase-opening event (the `working` hop or an explicit repair
@@ -558,6 +672,7 @@ function stallStillEligible(
     return false;
   }
   return true;
+
 }
 
 /**
@@ -591,7 +706,11 @@ function stallStillEligible(
  *    verification, an answering review — fence the row.
  *
  * plus minionErrors — a minion turn that failed more recently than any
- * delivery — so an error wake always carries its context.
+ * delivery — so an error wake always carries its context; and the
+ * verification follow-through rows (issue #163) — a failed completed run
+ * awaiting a repair decision and a queue wait that timed out awaiting
+ * reconsideration — so completion/dependency transitions reach the sweep
+ * without a fresh owner message.
  */
 export async function computeSilasDigest(input: ComputeDigestInput): Promise<SilasOpsDigest> {
   const now = input.now ?? Date.now;
@@ -603,6 +722,8 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     verdictsAwaitingDirective: VerdictAwaitingDirectiveRow[];
     stalledWorking: StalledWorkingRow[];
     minionErrors: MinionErrorRow[];
+    verificationFailures: VerificationFailureRow[];
+    verificationWaits: VerificationWaitingRow[];
     providerRecoveryPending: ProviderRecoveryPendingRow[];
   } = {
     computedAt: new Date(now()).toISOString(),
@@ -612,6 +733,8 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     verdictsAwaitingDirective: [],
     stalledWorking: [],
     minionErrors: [],
+    verificationFailures: [],
+    verificationWaits: [],
     providerRecoveryPending: [],
   };
   // One unresolved re-brief request fences the target: a marker exists while
@@ -940,6 +1063,99 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
         at: minionError.ts,
       });
     }
+
+    // (5)+(6) Verification follow-through (issue #163): reduce the job's
+    // verification traffic PER SCOPE (latest event per kind+scope, no
+    // newest-N window) so an unrelated scope's PASS can never hide a failed
+    // scope, every timed-out scope stays visible, and a same-scope retry
+    // retires only its own row. Repair rungs are read kind-scoped and a
+    // rung retires only the exact failure it names. Terminal lanes are
+    // skipped by the loop's terminal guard above.
+    const verificationCompleted = input.ledger.latestJobEvent(job.id, 'verification.completed');
+    const verificationTimeout = input.ledger.latestJobEvent(job.id, 'verification.lock-timeout');
+    if (verificationCompleted !== null || verificationTimeout !== null) {
+      const scopedEvents = input.ledger.latestJobEventsByPayloadScope(job.id, VERIFICATION_SCOPE_KINDS);
+      const scopeOf = (event: EventRecord): string => payloadString(event, 'scope') ?? '(unknown-scope)';
+      const latestCompleted = new Map<string, EventRecord>();
+      const latestTimeout = new Map<string, EventRecord>();
+      for (const event of scopedEvents) {
+        const scope = scopeOf(event);
+        if (event.kind === 'verification.completed') {
+          if (!latestCompleted.has(scope)) latestCompleted.set(scope, event);
+        } else if (!latestTimeout.has(scope)) {
+          latestTimeout.set(scope, event);
+        }
+      }
+      // Exact identity retirement: a repair rung retires only the failure
+      // whose canonical fingerprint it carries, found by an identity query
+      // (no newest-N window can age a landed disposition out of view).
+      for (const completed of latestCompleted.values()) {
+        if (payloadFlag(completed, 'ok', true)) continue;
+        const runId = payloadString(completed, 'run_id');
+        const scopeLabel = payloadString(completed, 'scope');
+        const head = payloadString(completed, 'sha');
+        const fingerprints: string[] = [];
+        if (scopeLabel !== null) {
+          fingerprints.push(
+            runId === null ? `verification-failure:${scopeLabel}` : `verification-failure:${scopeLabel}@${runId}`,
+          );
+        }
+        const repaired = fingerprints.some((fingerprint) =>
+          input.ledger.hasJobEventWithPayloadValues(
+            job.id,
+            ['silas.directive-sent'],
+            [{ key: 'blocker_fingerprint', value: fingerprint }],
+            completed.seq,
+          ),
+        );
+        // A NEW submission at the FAILED (scope, head) retires the row (a
+        // still-failing retry re-arms it with the newer result); another
+        // scope or head does not answer this failure.
+        const retryInFlight = verificationResubmitted(input.ledger, job.id, scopeLabel, head, completed.seq);
+        if (repaired || retryInFlight) continue;
+        digest.verificationFailures.push({
+          jobId: job.id,
+          repo: job.repo,
+          scope: scopeLabel,
+          runId,
+          head,
+          at: completed.ts,
+          detail: verificationFailureDetail(completed),
+        });
+      }
+      for (const [scopeKey, timeout] of latestTimeout) {
+        const head = payloadString(timeout, 'head');
+        const scopeLabel = payloadString(timeout, 'scope');
+        // A fresh PRODUCER submission at the PINNED (scope, head)
+        // supersedes the wait; a completion answers it only for the pinned
+        // attempt. Another scope or head is a different operation and does
+        // not retire this reconsideration. An attachment or a pre-existing
+        // attempt starting is NOT a resubmission.
+        const resubmitted = verificationResubmitted(input.ledger, job.id, scopeLabel, head, timeout.seq);
+        const completedSameHead =
+          head === null || scopeLabel === null
+            ? (latestCompleted.get(scopeKey)?.seq ?? -1) > timeout.seq
+            : input.ledger.hasJobEventWithPayloadValues(
+                job.id,
+                ['verification.completed'],
+                [
+                  { key: 'scope', value: scopeLabel },
+                  { key: 'sha', value: head },
+                ],
+                timeout.seq,
+              );
+        if (resubmitted || completedSameHead) continue;
+        digest.verificationWaits.push({
+          jobId: job.id,
+          repo: job.repo,
+          scope: payloadString(timeout, 'scope'),
+          requestId: payloadString(timeout, 'request_id'),
+          head,
+          waitMs: payloadNumber(timeout, 'wait_ms'),
+          at: timeout.ts,
+        });
+      }
+    }
   }
   // Provider-recovery lanes awaiting a guarded continuation claim: the
   // durable pending-delivery rows ARE the restart-safe handoff — every
@@ -1056,7 +1272,15 @@ export interface SilasSlot {
   ensure(options?: SpawnOptions): Promise<AgentHandle>;
 }
 
-export type SilasTriggerKind = 'job.delivered' | 'job.minion-error' | 'round.verdict' | 'round.perkins-incomplete' | 'provider.restored' | 'sweep';
+export type SilasTriggerKind =
+  | 'job.delivered'
+  | 'job.minion-error'
+  | 'round.verdict'
+  | 'round.perkins-incomplete'
+  | 'provider.restored'
+  | 'verification.completed'
+  | 'verification.lock-timeout'
+  | 'sweep';
 
 export interface SilasTrigger {
   readonly kind: SilasTriggerKind;
@@ -1098,18 +1322,68 @@ export interface SilasDriverOptions {
   readonly skills?: readonly SkillModule[];
   readonly blockersForRound?: BlockersForRound;
   readonly log?: Log;
-  /** Deterministic no-LLM pass hook (chief phase-3 seam): invoked at the top
-   * of every trigger — bus wake events and sweep ticks alike — BEFORE any
-   * slot wake/LLM work. Must be bounded and no-overlap by construction; a
-   * thrown error is logged and never breaks the driver. */
-  readonly onDeterministicPass?: () => void;
+  /** Deterministic no-LLM pass hook (chief phase-3 seam, issue #163):
+   * invoked at the top of every trigger — bus wake events and sweep ticks
+   * alike — BEFORE any slot wake/LLM work. The pass must be bounded; the
+   * driver serializes overlapping passes (one pass per observed state) and
+   * records the outcome as a durable `silas.reconcile` health event (a
+   * failure lands as `silas.reconcile-failed`, never as a completed pass).
+   * A thrown error is logged and never breaks the driver. */
+  readonly onDeterministicPass?: DeterministicPassHook;
   /** Clock + timer seams for tests. */
   readonly setInterval?: typeof setInterval;
   readonly clearInterval?: typeof clearInterval;
   readonly now?: () => number;
 }
 
+/** One deterministic pass observation: which trigger woke the driver and
+ * whether a model turn was already open at that instant. */
+export interface DeterministicPassContext {
+  readonly trigger: SilasTriggerKind;
+  readonly wakeInFlight: boolean;
+}
+
+/** A bounded no-LLM pass result. `ok: false` marks an incomplete/failed
+ * pass (e.g. partial row failures) without a throw; the driver records it
+ * as a failed pass and never as a completed reconciliation. Any other
+ * entries become the recorded pass counts. */
+export interface DeterministicPassResult extends Record<string, unknown> {
+  readonly ok?: boolean;
+}
+
+/** A bounded no-LLM pass. A plain-object return value is recorded as the
+ * pass counts on the `silas.reconcile` health event; void records none. */
+export type DeterministicPassHook = (
+  context: DeterministicPassContext,
+) => void | DeterministicPassResult | Promise<void | DeterministicPassResult>;
+
+interface DeterministicPassOutcome {
+  readonly ok: boolean;
+  readonly counts: Record<string, unknown> | null;
+  readonly error: string | null;
+  readonly durationMs: number;
+}
+
 const SILAS_WAKE_EVENTS: readonly string[] = ['job.delivered', 'job.minion-error', 'round.verdict', 'round.perkins-incomplete', 'provider.restored'];
+
+/** A bus event worth waking Silas for: the standing kinds unconditionally;
+ * verification traffic only when it is a failure or a capacity timeout. A
+ * routine PASS must not mint an event wake (it would prompt on every green
+ * run), but a failed completed run or a dropped queue waiter is exactly
+ * the dependency transition the digest must reconsider.
+ */
+export function silasWakeEvent(event: { readonly kind: string; readonly payload?: unknown }): boolean {
+  if (SILAS_WAKE_EVENTS.includes(event.kind)) return true;
+  if (event.kind === 'verification.lock-timeout') return true;
+  if (event.kind === 'verification.completed') {
+    const payload =
+      typeof event.payload === 'object' && event.payload !== null
+        ? (event.payload as Record<string, unknown>)
+        : {};
+    return payload['ok'] !== true;
+  }
+  return false;
+}
 
 export class SilasDriver {
   private readonly opts: SilasDriverOptions;
@@ -1124,6 +1398,10 @@ export class SilasDriver {
   private pollInFlight = false;
   private wakeInFlight: Promise<void> | null = null;
   private queuedTrigger: SilasTrigger | null = null;
+  private passInFlight: Promise<DeterministicPassOutcome> | null = null;
+  /** One follow-up pass owed for observations that arrived mid-pass. */
+  private passRequeued = false;
+  private lastPassOutcome: DeterministicPassOutcome | null = null;
   private disposed = false;
 
   constructor(opts: SilasDriverOptions) {
@@ -1135,7 +1413,7 @@ export class SilasDriver {
     this.clearIntervalImpl = opts.clearInterval ?? clearInterval;
     if (opts.bus !== undefined) {
       this.unsubscribe = opts.bus.subscribe((event) => {
-        if (!SILAS_WAKE_EVENTS.includes(event.kind)) return;
+        if (!silasWakeEvent(event)) return;
         void this.trigger({ kind: event.kind as SilasTriggerKind, jobId: event.jobId ?? undefined });
       });
     }
@@ -1227,19 +1505,28 @@ export class SilasDriver {
    * is open queues ONE slot (latest wins — the next digest supersedes the
    * stale one) and runs after the open turn settles. A failed wake is
    * logged loud; the next sweep or event retries it.
+   *
+   * Every trigger records a durable `silas.tick` observation and then runs
+   * the deterministic pass (coalescing onto an already-running pass, never
+   * stacking a second) before the serialized wake path — so routine
+   * follow-through keeps advancing while a long model turn is open, and
+   * the health projection can tell a busy turn from a stopped scheduler.
    */
   async trigger(trigger: SilasTrigger): Promise<void> {
     if (this.disposed) return;
     if (!this.opts.config.enabled) return;
+    const wakeInFlight = this.wakeInFlight !== null;
+    // The tick is the durable proof a timer/event observation happened —
+    // independent of whether it led, queued or coalesced into a wake.
+    this.recordHealthEvent('silas.tick', {
+      trigger: trigger.kind,
+      wake_in_flight: wakeInFlight,
+      pass_in_flight: this.passInFlight !== null,
+    });
     // Deterministic, bounded reconsideration happens before any LLM wake:
     // pending-duty reconciliation never waits for a model turn.
-    if (this.opts.onDeterministicPass !== undefined) {
-      try {
-        this.opts.onDeterministicPass();
-      } catch (error) {
-        this.log('error', 'deterministic pass hook failed', { error: String(error) });
-      }
-    }
+    await this.runDeterministicPass(trigger.kind, wakeInFlight);
+    if (this.disposed) return;
     if (this.wakeInFlight !== null) {
       this.queuedTrigger = trigger;
       return;
@@ -1255,6 +1542,113 @@ export class SilasDriver {
       if (queued !== null && !this.disposed) {
         void this.trigger(queued).catch(() => {});
       }
+    }
+  }
+
+  /** Persist one health observation; the ledger failing must never break
+   * the driver (the next tick re-observes). */
+  private recordHealthEvent(kind: string, payload: Record<string, unknown>): void {
+    try {
+      this.opts.ledger.appendCustomEvent({ kind, payload });
+    } catch (error) {
+      this.log('error', 'silas health event could not be persisted', { kind, error: String(error).slice(0, 300) });
+    }
+  }
+
+  /**
+   * Run the injected deterministic pass with one-pass-in-flight semantics:
+   * a trigger arriving while a pass runs COALESCES onto that pass instead
+   * of starting a second one. Only the pass's starter records the outcome:
+   * `silas.reconcile` on success, `silas.reconcile-failed` on failure —
+   * never a completed-reconciliation timestamp for a failed pass. When no
+   * hook is wired the pass is a no-op and no reconcile event is emitted
+   * (there is no reconciliation to claim).
+   */
+  private async runDeterministicPass(
+    trigger: SilasTriggerKind,
+    wakeInFlight: boolean,
+  ): Promise<DeterministicPassOutcome> {
+    const hook = this.opts.onDeterministicPass;
+    if (hook === undefined) return { ok: true, counts: null, error: null, durationMs: 0 };
+    if (this.passInFlight !== null) {
+      // A fresh observation arrived while the pass ran: the in-flight pass
+      // may already have read the ledger before this trigger's event was
+      // committed, so ONE follow-up pass is owed. All coalesced triggers
+      // await it: the first resumer starts it, the rest join the running
+      // follow-up so nobody proceeds to the wake path ahead of it.
+      this.passRequeued = true;
+      await this.passInFlight;
+      if (this.disposed) return { ok: true, counts: null, error: null, durationMs: 0 };
+      if (!this.passRequeued) {
+        if (this.passInFlight !== null) return this.passInFlight;
+        return this.lastPassOutcome ?? { ok: true, counts: null, error: null, durationMs: 0 };
+      }
+      this.passRequeued = false;
+      return this.runDeterministicPass(trigger, wakeInFlight);
+    }
+    const startedAt = this.now();
+    const duration = (): number => Math.max(0, this.now() - startedAt);
+    // The sentinel is installed BEFORE the hook runs: a hook whose
+    // synchronous portion re-enters trigger() (e.g. publishes a wake-kind
+    // event) must coalesce onto this pass, never start a second one.
+    let releaseGate!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseGate = resolve;
+    });
+    const run = (async (): Promise<DeterministicPassOutcome> => {
+      await gate;
+      try {
+        const outcome = await hook({ trigger, wakeInFlight });
+        const counts =
+          typeof outcome === 'object' && outcome !== null && !Array.isArray(outcome)
+            ? (outcome as Record<string, unknown>)
+            : null;
+        // A hook that returns `ok:false` had partial row failures: record
+        // the honest failed pass, never a completed reconciliation.
+        return { ok: counts === null || counts['ok'] !== false, counts, error: null, durationMs: duration() };
+      } catch (error) {
+        return { ok: false, counts: null, error: String(error).slice(0, 300), durationMs: duration() };
+      }
+    })();
+    this.passInFlight = run;
+    releaseGate();
+    try {
+      const outcome = await run;
+      this.lastPassOutcome = outcome;
+      if (outcome.ok) {
+        this.recordHealthEvent('silas.reconcile', {
+          trigger,
+          ok: true,
+          duration_ms: outcome.durationMs,
+          wake_in_flight: wakeInFlight,
+          ...(outcome.counts === null ? {} : { counts: outcome.counts }),
+        });
+        // Pass-ATTRIBUTED progress: only the deterministic pass emits this
+        // marker, so health never credits unrelated lanes' transitions.
+        const advanced = outcome.counts === null ? 0 : outcome.counts['advanced'];
+        if (typeof advanced === 'number' && advanced > 0) {
+          this.recordHealthEvent('silas.reconcile-advanced', { trigger, advanced });
+        }
+      } else {
+        // A failed pass is recorded under its own kind so the board's
+        // completed-reconciliation timestamp can never be advanced by a
+        // failure while the last failure stays queryable on its own.
+        this.recordHealthEvent('silas.reconcile-failed', {
+          trigger,
+          ok: false,
+          duration_ms: outcome.durationMs,
+          wake_in_flight: wakeInFlight,
+          ...(outcome.counts === null ? {} : { counts: outcome.counts }),
+          error: outcome.error,
+        });
+        this.log('error', 'deterministic pass incomplete', {
+          error: outcome.error,
+          ...(outcome.counts === null ? {} : { failures: outcome.counts['failures'] }),
+        });
+      }
+      return outcome;
+    } finally {
+      this.passInFlight = null;
     }
   }
 

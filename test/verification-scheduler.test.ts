@@ -734,6 +734,9 @@ describe('verification scheduler — global budget', () => {
     expect(scheduler.attemptStatus({ requestId: 'req-admit' }).state).toBe('completed');
     const timeouts = records.filter((record) => record.kind === 'verification.lock-timeout');
     expect(timeouts[0]?.payload['request_id']).toBe('req-admit');
+    // The pinned head travels with the timeout so Silas can resubmit at
+    // exactly that revision (issue #163 review).
+    expect(timeouts[0]?.payload['head']).toBe(repo.head());
   });
 
   it('never reruns an evicted terminal identity: status reports it and resubmission is refused', async () => {
