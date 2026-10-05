@@ -198,12 +198,14 @@ describe('end-to-end dispatch (E8 story 4)', () => {
       jobId: 'widget-polish',
       repoPath: h.repo.path,
       title: 'polish the widget',
+      displayName: 'widget fix',
       briefing: 'Make the widget polish generic and verify it. Acceptance: tests pass.',
     });
     expect(outcome.job.status).toBe('working');
     expect(await outcome.settled).toEqual({ ok: true });
     // Settle truth (2026-09-22): the settling turn lands `delivered`.
-    expect(h.ledger.getJob('widget-polish')?.status).toBe('delivered');
+    expect(h.ledger.getJob('widget-polish')).toMatchObject({ status: 'delivered', displayName: 'widget fix', title: 'polish the widget' });
+    expect(h.engine.snapshot().repos.flatMap((repo) => repo.jobs).find((job) => job.id === 'widget-polish')).toMatchObject({ displayName: 'widget fix', title: 'polish the widget' });
 
     // Ruling 17: the minion session is ROOTED IN THE PROJECT WORKTREE.
     const minionSpawn = h.spawns.find((spawn) => spawn.role === 'minion');

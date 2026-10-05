@@ -336,6 +336,7 @@ describe('dispatch server (E8)', () => {
           job_id: 'http-job',
           repo_path: repo.path,
           title: 'http dispatched',
+          display_name: 'Wake Alerts',
           briefing: 'do the thing via http',
         },
         TOKEN,
@@ -344,9 +345,14 @@ describe('dispatch server (E8)', () => {
       expect(field<string>(res.json, 'job_id')).toBe('http-job');
       expect(field<string>(res.json, 'branch')).toBe('gru/http-job');
       expect(field<string>(res.json, 'status')).toBe('working');
+      // The authored name persists, and the job.created event carries it
+      // (G10) so the event stream stays a complete record of authorship.
+      expect(h.ledger.getJob('http-job')?.displayName).toBe('Wake Alerts');
+      const created = h.ledger.latestJobEvent('http-job', 'job.created');
+      expect(created?.payload).toMatchObject({ repo: expect.any(String), display_name: 'Wake Alerts' });
       // Ruling 17: the minion spawn carried the worktree as cwd.
       expect(h.spawns[0]?.options.cwd).toBe(field<string>(res.json, 'worktree'));
-      expect(h.ledger.getJob('http-job')?.briefing).toBe('do the thing via http');
+      expect(h.ledger.getJob('http-job')).toMatchObject({ briefing: 'do the thing via http', title: 'http dispatched', displayName: 'Wake Alerts' });
       // Worktree rows are queryable through the flow API.
       const wt = await call(h.port, 'GET', '/api/dispatch/jobs/http-job/worktrees', undefined, TOKEN);
       expect(wt.status).toBe(200);
@@ -578,6 +584,47 @@ describe('dispatch server (E8)', () => {
       const bad = await call(h.port, 'POST', '/api/dispatch', { job_id: 'x' }, TOKEN);
       expect(bad.status).toBe(400);
       expect(field<string>(bad.json, 'error')).toBe('bad_request');
+      // Optional-field idiom (G2 ruling 2026-09-29): absent, null, blank,
+      // or mistyped display_name means "no authored name" — accepted, and
+      // the job carries no display name. A too-long name is a hard 400.
+      let seq = 0;
+      for (const display_name of [undefined, null, '', '  ', 42]) {
+        const accepted = await call(h.port, 'POST', '/api/dispatch', {
+          job_id: `unnamed-${(seq += 1)}`, repo_path: '/fixture', title: 'T', briefing: 'B',
+          ...(display_name !== undefined ? { display_name } : {}),
+        }, TOKEN);
+        expect(accepted.status).toBe(202);
+        expect(h.ledger.getJob(`unnamed-${seq}`)?.displayName).toBeNull();
+      }
+      const oversized = await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'name-too-long', repo_path: '/fixture', title: 'T', briefing: 'B', display_name: 'x'.repeat(101),
+      }, TOKEN);
+      expect(oversized.status).toBe(400);
+      expect(h.ledger.getJob('name-too-long')).toBeNull();
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('caps the trimmed authored-name value consistently at the HTTP and ledger boundaries', async () => {
+    const h = await boot();
+    try {
+      for (const [jobId, displayName] of [
+        ['name-at-cap', 'x'.repeat(100)],
+        ['name-padded-cap', `  ${'x'.repeat(100)}  `],
+      ]) {
+        const accepted = await call(h.port, 'POST', '/api/dispatch', {
+          job_id: jobId, repo_path: '/fixture', title: 'Full title', briefing: 'B', display_name: displayName,
+        }, TOKEN);
+        expect(accepted.status).toBe(202);
+        expect(h.ledger.getJob(jobId!)?.displayName).toBe('x'.repeat(100));
+      }
+      const oversized = await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'name-padded-over-cap', repo_path: '/fixture', title: 'T', briefing: 'B',
+        display_name: ` ${'x'.repeat(101)} `,
+      }, TOKEN);
+      expect(oversized.status).toBe(400);
+      expect(h.ledger.getJob('name-padded-over-cap')).toBeNull();
     } finally {
       await h.close();
     }
@@ -1302,6 +1349,28 @@ describe('dispatch server (E8)', () => {
         async dispose() {},
       });
       const freshBefore = h.spawns.filter((spawn) => spawn.role === 'minion').length;
+      // A round-bound review-only minion is not an implementer: the
+      // retirement pass must never touch its live handle (G1 exclusion).
+      const reviewRound = h.ledger.addRound({ jobId: 'rebrief-job', lenses: ['blind'] });
+      h.ledger.registerAgent({
+        id: 'review-only-minion',
+        role: 'minion',
+        jobId: 'rebrief-job',
+        roundId: reviewRound.id,
+        sessionFile: '/review-only.jsonl',
+      });
+      h.liveHandles.set('review-only-minion', {
+        role: 'minion',
+        id: 'review-only-minion',
+        sessionFile: '/review-only.jsonl',
+        capabilities: FAKE_CAPABILITIES,
+        prompt: async () => {},
+        async steer() {},
+        async followUp() {},
+        subscribe: () => () => {},
+        health: () => ({ state: 'idle' as const, lastActivity: null, sessionFile: '/review-only.jsonl' }),
+        async dispose() {},
+      });
       const res = await call(h.port, 'POST', '/api/silas/rebrief', {
         job_id: 'rebrief-job',
         note: 'same blocker three rounds; try a different approach',
@@ -1310,13 +1379,16 @@ describe('dispatch server (E8)', () => {
       const freshMinion = h.spawns.filter((spawn) => spawn.role === 'minion')[freshBefore];
       expect(freshMinion).toBeDefined();
       expect(field<string>(res.json, 'minion_id')).toBe(`agent-${h.spawns.length}`);
+      expect(h.ledger.getAgent(`agent-${h.spawns.length}`)?.jobId).toBe('rebrief-job');
       const job = h.ledger.getJob('rebrief-job');
       expect(job?.status).toBe('working');
       const event = h.ledger.listJobEvents('rebrief-job').find((candidate) => candidate.kind === 'silas.rebrief');
       expect(event).not.toBeNull();
       expect((event?.payload as { note?: string }).note).toContain('same blocker');
-      // The prior live session was retired, not leaked.
+      // The prior live session was retired, not leaked — and the live
+      // review-only session was left alone.
       expect(h.disposedHandles).toContain(priorMinion);
+      expect(h.disposedHandles).not.toContain('review-only-minion');
       // The re-brief prompt carries the original briefing (still the
       // contract) AND the note — a cwd-only check proved neither.
       const rebriefText = h.minionTurnTexts.find((text) => text.startsWith('Re-brief — job rebrief-job'));
@@ -2034,6 +2106,7 @@ describe('dispatch server (E8)', () => {
       expect(fresh?.options.cwd).toBe(lane?.path);
       expect(h.ledger.getDirective(requestId)?.admissionMinion).toBe(`agent-${h.spawns.length}`);
       expect(h.disposedHandles).toContain(`agent-${h.spawns.length}`);
+      expect(h.ledger.getAgent(`agent-${h.spawns.length}`)?.jobId).toBe('dir-fresh');
     } finally {
       await h.close();
     }

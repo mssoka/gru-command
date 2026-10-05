@@ -213,6 +213,7 @@ describe('progressive-disclosure injection', () => {
         lessons: port([POINTER]),
       });
       expect(result.delivered).toBe(true);
+      expect(ledger.getAgent('agent-1')).toMatchObject({ jobId: 'job-3', role: 'minion' });
       expect(prompts).toHaveLength(1);
       expect(prompts[0]).toContain('read /tmp/gru-bible/chapters/ops-restarts.md#shell-hang');
       expect(prompts[0]).not.toContain(BODY_SENTINEL);

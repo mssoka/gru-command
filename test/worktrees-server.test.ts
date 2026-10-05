@@ -245,5 +245,9 @@ describe('worktree lane release endpoint (r4)', () => {
     } finally {
       await h.close();
     }
-  });
+    // Co-tenant load headroom: this case boots a lane harness, a fixture
+    // repo, a job worktree AND a detached review worktree — real git work
+    // that can exceed the 30 s default on the shared host (same class as
+    // the real-service boot budget in helpers/real-service.mjs).
+  }, 90_000);
 });

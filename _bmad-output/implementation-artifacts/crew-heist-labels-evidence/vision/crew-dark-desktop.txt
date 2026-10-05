@@ -1,0 +1,25 @@
+1. **Theme/viewport:** Dark theme. Rendered as a narrow vertical rail (sidebar-style column with right-edge pills, no wrapping) — consistent with a desktop-width fixture cropped to the rail; the full viewport is not visible in the pixels.
+
+2. **Rows (name | badge | subtext | pill):**
+   - `gru · chat` | `MOCK-GRU` | `GRU · IDLE` | `idle` (green)
+   - `silas · ops` | `MOCK-SIL` | `SILAS · STREA… 13S QUIET` | `streaming` (orange)
+   - `blind:001` | `MOCK-LEN` | `PERKINS · IDLE` | `idle` (green)
+   - `fix the payment retry` | `NION` | `MINION · IDLE` followed by a red ⛔ icon and red `STOPPED` text | `idle` (green)
+   - `api docs pass` | `DOCS` | `MINION · IDLE` | `idle` (green)
+   - `preplś <script> & "café"` | `CODE` | `MINION · IDLE` | `idle` (green)
+   - `bob · memory` | `MOCK-BOB` | `BOB · IDLE` | `idle` (green)
+   - Footer text: `+1 disposed`
+
+3. **Primary name starting with literal "minion":** no.
+
+4. **Clipping/overflow/overlap:**
+   - Row `silas · ops`: the subtext reads `SILAS · STREA… 13S QUIET` — the word (apparently "STREAMING") is cut mid-word with an ellipsis while `13S QUIET` still renders after it; partially unreadable.
+   - Row `fix the payment retry`: the badge shows only `NION` — its left portion appears cut/hidden by the long name (fragment, likely of "MINION"), not a clean ~4-character ID.
+
+5. **Long/Unicode row:** `preplś <script> & "café"` (rendered fully, no visible truncation; badge reads `CODE`).
+
+6. **Contradictions:**
+   - Row `fix the payment retry` shows a red inline `STOPPED` marker while its right-edge state pill reads `idle` — two conflicting state indications in one row.
+   - Its badge reads the fragment `NION` instead of a complete short ID like the other rows.
+   - The `silas · ops` subtext is mid-word truncated as described in item 4.
+   - Several badges are longer than "about four characters" (`MOCK-GRU`, `MOCK-SIL`, `MOCK-LEN`, `MOCK-BOB`); only `DOCS` and `CODE` are ~4 characters.

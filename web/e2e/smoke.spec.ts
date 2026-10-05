@@ -953,6 +953,46 @@ test.describe('board (E6, mock feed)', () => {
     await expect(rail.locator('.board-agent__age').first()).toContainText('quiet');
   });
 
+  test('minion heist names fit the crew rail on desktop and phone in light and dark', async ({ page }, testInfo) => {
+    await pair(page);
+    // v6.1 ruling 1: no Chat/Board toggle exists to click — the board is
+    // docked beside chat on desktop and is the default view on phones.
+    await expect(page.locator('#board-view')).toBeVisible();
+    // G5: the authored short name renders as-is (lowercased) with its own
+    // four-character suffix; the title-fallback row below stays the legacy
+    // path. Two minion rows now exist, so scope each by its displayed name.
+    const authored = page.locator('#board-agents .board-agent[data-role="minion"]', { hasText: 'api docs pass' });
+    await expect(authored.locator('.board-agent__name')).toHaveText('api docs pass');
+    await expect(authored.locator('.board-agent__hash')).toHaveText('docs');
+    await expect(authored).toHaveAttribute('title', /Docs pass on the public endpoints.*mock-minion-docs/u);
+    const row = page.locator('#board-agents .board-agent[data-role="minion"]', { hasText: 'fix the payment retry' });
+    await expect(row.locator('.board-agent__name')).toHaveText('fix the payment retry');
+    await expect(row.locator('.board-agent__hash')).toHaveText('nion');
+    await expect(row).toHaveAttribute('title', /Fix the payment retry loop.*mock-minion/u);
+    for (const theme of ['light', 'dark'] as const) {
+      if (theme === 'dark') await page.locator('#theme-toggle').click();
+      // Label integrity (P13): each pass positively asserts its ACTUAL html
+      // theme before any capture named for it — the same pattern the
+      // trackers theme test uses. Light is checked, never assumed.
+      if (theme === 'dark') {
+        await expect(page.locator('html')).toHaveClass(/dark/);
+      } else {
+        await expect(page.locator('html')).not.toHaveClass(/dark/);
+      }
+      for (const [viewport, width, height] of [['desktop', 1280, 900], ['phone', 390, 844]] as const) {
+        await page.setViewportSize({ width, height });
+        if (viewport === 'phone') await row.scrollIntoViewIfNeeded();
+        await expect(row).toBeVisible();
+        const fits = await row.evaluate((node) => {
+          const hash = node.querySelector('.board-agent__hash')!;
+          return hash.getBoundingClientRect().right <= node.getBoundingClientRect().right;
+        });
+        expect(fits).toBe(true);
+        await page.screenshot({ path: testInfo.outputPath(`crew-${theme}-${viewport}.png`) });
+      }
+      await page.setViewportSize({ width: 1280, height: 900 });
+    }
+  });
   test('crew rail truth (#171): historical sessions collapse behind history; raw-idle open work reads streaming', async ({ page }) => {
     await pair(page);
     await expect(page.locator('#board-view')).toBeVisible();
@@ -960,10 +1000,11 @@ test.describe('board (E6, mock feed)', () => {
 
     // One live Silas (mock-silas) — the September Silas epoch and the
     // September minion are VERIFIED-HISTORICAL: not counted as crew, not
-    // sorted into it, disclosed behind their own history toggle.
+    // sorted into it, disclosed behind their own history toggle. The two
+    // crew-heist-labels demo minions join the live crew (10).
     await expect
       .poll(async () => (await page.locator('#rail-tab-agents').textContent())?.trim() ?? '')
-      .toBe('CREW (8)');
+      .toBe('CREW (10)');
     await expect(rail.locator('.board-agent--historical')).toHaveCount(0);
     const historyToggle = rail.locator(".board-agent-toggle[data-section='history']");
     await expect(historyToggle).toContainText('2 history');

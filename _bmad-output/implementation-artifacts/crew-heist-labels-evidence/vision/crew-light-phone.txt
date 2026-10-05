@@ -1,0 +1,19 @@
+1. **Theme/viewport:** Light theme, phone width (narrow single-column layout).
+
+2. **Rows (name | badge | subtext | pill):**
+   - `gru · chat` | `MOCK-GRU` | `GRU · IDLE` | `idle`
+   - `silas · ops` | `MOCK-SIL` | `SILAS · STREAMING 12S QUIET` | `streaming`
+   - `blind:001` | `MOCK-LEN` | `PERKINS · IDLE` | `idle`
+   - `fix the payment retry` | `NION` | `MINION · IDLE 🚫 STOPPED` (red) | `idle`
+   - `api docs pass` | `DOCS` | `MINION · IDLE` | `idle`
+   - `prépis <script> & "café"` | `CODE` | `MINION · IDLE` | `idle`
+   - `bob · memory` | `MOCK-BOB` | `BOB · IDLE` | `idle`
+   - Below the cards: a dashed-border box reading `+1 disposed`.
+
+3. **Any primary name starting with "minion":** no.
+
+4. **Clipping/overflow/overlap:** none observed. The long row `fix the payment retry` fits with its `NION` badge adjacent; all pills sit inside their card edges.
+
+5. **Long/Unicode row, exact rendered name:** `prépis <script> & "café"`
+
+6. **Contradictions:** The prompt describes the ID badge as "about four characters"; four badges are 8 characters (`MOCK-GRU`, `MOCK-SIL`, `MOCK-LEN`, `MOCK-BOB`). Also, row `blind:001`'s subtext reads `PERKINS · IDLE` and row `fix the payment retry`'s subtext ends in red `STOPPED` while its pill reads `idle` — reported as pixels only. Otherwise none.

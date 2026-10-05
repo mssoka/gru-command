@@ -419,16 +419,13 @@ export class ProviderRecoverySensor {
       if (job === null || job.status === 'merged' || job.status === 'done') return 'cancel';
       if (job.status === 'parked') return 'cancel'; // explicit manual hold
       if (wait.jobId !== null) {
+        // Supersession requires a newer IMPLEMENTER (Gru ruling
+        // 2026-09-29 + #161 union): a newer review-only session (round-
+        // or lens-bound) or a tracked child never replaces the job's
+        // writer — listImplementerMinions applies all three exclusions.
         const newer = this.ledger
-          .listAgents()
-          .find(
-            (agent) =>
-              agent.jobId === wait.jobId &&
-              agent.role === 'minion' &&
-              agent.parentage !== 'child' &&
-              agent.id !== wait.agentId &&
-              agent.createdAt >= wait.createdAt,
-          );
+          .listImplementerMinions(wait.jobId)
+          .find((agent) => agent.id !== wait.agentId && agent.createdAt >= wait.createdAt);
         if (newer !== undefined) return 'supersede';
       }
       // Incident currency (rotation/staleness fencing).

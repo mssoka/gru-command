@@ -370,6 +370,20 @@ describe('guarded claim — every recheck fails visible', () => {
     expect(h.ledger.getProviderWait(waitId)?.status).toBe('superseded');
   });
 
+  it('a live REVIEW-ONLY session does not supersede the implementer\'s wait (2026-10-05 review)', async () => {
+    const h = new ClaimHarness();
+    const jobId = 'j-reviewer-live';
+    const waitId = await h.recoveredMinionWait({ jobId });
+    // A newer round-bound review session WITH a live handle: it is not the
+    // lane's writer, so the interrupted implementer's claim proceeds.
+    const round = h.ledger.addRound({ jobId, lenses: ['blind'] });
+    h.ledger.registerAgent({ id: 'agent-review-live', role: 'minion', jobId, roundId: round.id });
+    h.registry.handles.set('agent-review-live', new FakeHandle('minion', 'agent-review-live', null));
+    const result = await claimProviderRecoveryContinuation(h.deps(), waitId, 'silas');
+    expect(result).not.toMatchObject({ why: expect.stringContaining('replacement') });
+    expect(h.ledger.getProviderWait(waitId)?.status).not.toBe('superseded');
+  });
+
   it('the original actor being live again supersedes the wait', async () => {
     const h = new ClaimHarness();
     const jobId = 'j-originlive';

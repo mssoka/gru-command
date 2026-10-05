@@ -14,7 +14,7 @@ import type {
 } from '../lib/board-protocol.js';
 import { memoryStorage } from '../lib/chat-storage.js';
 import { boardKpis } from '../lib/board-kpi.js';
-import { BoardView, jobFailing } from './board.js';
+import { BoardView, RailIdentityError, jobFailing, makeGraphemeSplitter, minionSuffixes, railSuffix, visibleWord } from './board.js';
 
 type DecisionsOverrides = Partial<BoardSnapshot['decisions']>;
 
@@ -156,6 +156,210 @@ function mountBoardDom(): void {
     <div id="notification-panel"><div id="notification-list"></div></div>
   `;
 }
+
+describe('minion heist identity in the crew rail', () => {
+  beforeEach(mountBoardDom);
+
+  it('shows stable names and distinct suffixes for all states, without changing full-ID transcript selection', () => {
+    const view = new BoardView(() => {});
+    const jobs = [baseJob({ id: 'wake', title: 'Full wake alert contract', displayName: 'Wake Alerts' }), baseJob({ id: 'model', title: 'Model repair with full details' })];
+    const agents = [
+      agent('worker-1234dec9', { role: 'minion', label: null, jobId: 'wake', state: 'idle' }),
+      agent('worker-5678dec9', { role: 'minion', label: null, jobId: 'wake', state: 'error' }),
+      agent('worker-9999dec9', { role: 'minion', label: null, jobId: 'wake', state: 'disposed' }),
+      agent('worker-00009b2b', { role: 'minion', label: null, jobId: 'model', state: 'streaming' }),
+      agent('worker-7777cafe', { role: 'minion', label: null, jobId: 'wake', state: 'idle' }),
+      agent('unlinked-1111', { role: 'minion', label: null, jobId: null }),
+      agent('orphaned-1111', { role: 'minion', label: null, jobId: 'missing-job' }),
+      agent('lead-1234', { role: 'perkins', label: 'blind:001', jobId: 'wake' }),
+    ];
+    const board = snapshot({ jobs, agents });
+    view.render(board);
+    document.querySelector<HTMLButtonElement>('.board-agent-toggle')?.click();
+    const rows = [...document.querySelectorAll<HTMLButtonElement>('#board-agents .board-agent')];
+    const byId = (id: string) => rows.find((row) => row.title.includes(id))!;
+    for (const id of ['worker-1234dec9', 'worker-5678dec9', 'worker-9999dec9']) {
+      const row = byId(id);
+      expect(row.querySelector('.board-agent__name')?.textContent).toBe('wake alerts');
+      expect(row.querySelector('.board-agent__sub')?.textContent).toContain('minion ·');
+      expect(row.title).toContain('Full wake alert contract');
+      expect(row.getAttribute('aria-label')).toContain(id);
+    }
+    const collisions = ['worker-1234dec9', 'worker-5678dec9', 'worker-9999dec9'];
+    const originalSuffixes = collisions.map((id) => byId(id).querySelector('.board-agent__hash')?.textContent);
+    expect(new Set(originalSuffixes).size).toBe(3);
+    expect(originalSuffixes.every((suffix) => suffix?.length === 5)).toBe(true);
+    expect(byId('worker-00009b2b').querySelector('.board-agent__name')?.textContent).toBe('model repair with full');
+    // A non-colliding peer on the same heist keeps its normal four
+    // characters; only the colliding trio extends.
+    expect(byId('worker-7777cafe').querySelector('.board-agent__hash')?.textContent).toBe('cafe');
+    expect(byId('unlinked-1111').querySelector('.board-agent__name')?.textContent).toBe('unassigned');
+    expect(byId('orphaned-1111').querySelector('.board-agent__name')?.textContent).toBe('unassigned');
+    expect(byId('unlinked-1111').querySelector('.board-agent__hash')?.textContent).not.toBe(byId('orphaned-1111').querySelector('.board-agent__hash')?.textContent);
+    expect(byId('lead-1234').querySelector('.board-agent__name')?.textContent).toBe('blind:001');
+    // G7: every row has an accessible name; minions keep the full-identity
+    // shape, non-minions announce label · id — role · state.
+    expect(byId('worker-1234dec9').getAttribute('aria-label')).toBe('wake alerts · worker-1234dec9 — Full wake alert contract — minion · idle');
+    expect(byId('lead-1234').getAttribute('aria-label')).toBe('blind:001 · lead-1234 — perkins · idle');
+    view.render({ ...board, agents: [...agents].reverse() });
+    const reordered = [...document.querySelectorAll<HTMLButtonElement>('#board-agents .board-agent')];
+    expect(collisions.map((id) => reordered.find((row) => row.title.includes(id))?.querySelector('.board-agent__hash')?.textContent)).toEqual(originalSuffixes);
+    expect(document.querySelectorAll('.board-agent__hash')).toHaveLength(8);
+  });
+
+  it('ignores invisible-only graphemes before shortening, keeping readable letters and ZWJ emoji', () => {
+    const view = new BoardView(() => {});
+    const jobs = [
+      baseJob({ id: 'wake', title: 'Full wake alert contract', displayName: '\u200b'.repeat(24) + 'wake alerts' }),
+      baseJob({ id: 'emoji', title: 'Emoji heist', displayName: '🧑\u200d🚀 launch' }),
+      baseJob({ id: 'blank', title: 'Legacy title survives', displayName: '\u200b\u200b' }),
+    ];
+    const agents = [
+      agent('worker-1234dec9', { role: 'minion', label: null, jobId: 'wake' }),
+      agent('worker-5678cafe', { role: 'minion', label: null, jobId: 'emoji' }),
+      agent('worker-9999fade', { role: 'minion', label: null, jobId: 'blank' }),
+    ];
+    view.render(snapshot({ jobs, agents }));
+    const rows = [...document.querySelectorAll<HTMLButtonElement>('#board-agents .board-agent')];
+    const byId = (id: string) => rows.find((row) => row.title.includes(id))!;
+    // The 24 leading zero-width spaces no longer consume the rail bound:
+    // the readable letters survive with the suffix and the full identity.
+    expect(byId('worker-1234dec9').querySelector('.board-agent__name')?.textContent).toBe('wake alerts');
+    expect(byId('worker-1234dec9').querySelector('.board-agent__hash')?.textContent).toBe('dec9');
+    expect(byId('worker-1234dec9').getAttribute('aria-label')).toContain('wake alerts · worker-1234dec9');
+    expect(byId('worker-1234dec9').title).toContain('Full wake alert contract');
+    // A ZWJ emoji cluster is one grapheme and survives the filter intact.
+    expect(byId('worker-5678cafe').querySelector('.board-agent__name')?.textContent).toBe('🧑\u200d🚀 launch');
+    // A name with nothing visible after filtering degrades to the neutral
+    // label instead of an empty-looking card.
+    expect(byId('worker-9999fade').querySelector('.board-agent__name')?.textContent).toBe('unassigned');
+  });
+
+  it('bounds a single over-long word at 24 graphemes (no word boundary exists to cut on)', () => {
+    const view = new BoardView(() => {});
+    const jobs = [baseJob({ id: 'long', title: 'Long single word', displayName: 'x'.repeat(32) })];
+    const agents = [agent('worker-1234beef', { role: 'minion', label: null, jobId: 'long' })];
+    view.render(snapshot({ jobs, agents }));
+    const row = document.querySelector<HTMLElement>('#board-agents .board-agent');
+    expect(row?.querySelector('.board-agent__name')?.textContent).toBe('x'.repeat(24));
+    // Full title stays reachable in the tooltip.
+    expect(row?.title).toContain('Long single word');
+  });
+
+  it('opens transcripts under the rail name while the full-ID file drives the selection', () => {
+    const opened = vi.fn();
+    const view = new BoardView(opened);
+    const jobs = [baseJob({ id: 'wake', title: 'Full wake alert contract', displayName: 'Wake Alerts' })];
+    const agents = [
+      agent('worker-5678dec9', { role: 'minion', label: null, jobId: 'wake', state: 'error' }),
+      agent('lead-1234', { role: 'perkins', label: 'blind:001', jobId: 'wake' }),
+    ];
+    view.render(snapshot({ jobs, agents }));
+    const byId = (id: string) => [...document.querySelectorAll<HTMLButtonElement>('#board-agents .board-agent')].find((row) => row.title.includes(id))!;
+    byId('worker-5678dec9').click();
+    expect(opened).toHaveBeenCalledWith({ file: '/sessions/worker-5678dec9.jsonl', label: 'wake alerts · dec9' });
+    byId('lead-1234').click();
+    expect(opened).toHaveBeenLastCalledWith({ file: '/sessions/lead-1234.jsonl', label: 'blind:001' });
+  });
+
+  it('cuts suffixes on grapheme boundaries, never halving an astral character', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({ jobs: [], agents: [agent('a😀bcd', { role: 'minion', label: null, jobId: null })] }));
+    expect(document.querySelector('.board-agent__hash')?.textContent).toBe('😀bcd');
+    view.render(snapshot({ jobs: [], agents: [
+      agent('x😀bcde', { role: 'minion', label: null, jobId: null }),
+      agent('y😀bcde', { role: 'minion', label: null, jobId: null }),
+    ] }));
+    expect([...document.querySelectorAll('.board-agent__hash')].map((node) => node.textContent)).toEqual(['x😀bcde', 'y😀bcde']);
+  });
+
+  it('resolves large groups with tail buckets: lone tails keep four, collisions extend deterministically', () => {
+    const jobs = new Map([['swarm', baseJob({ id: 'swarm', title: 'Swarm review' })]]);
+    const bulk = Array.from({ length: 1500 }, (_, index) =>
+      agent(`bulk-${String(index).padStart(8, '0')}`, { role: 'minion', label: null, jobId: 'swarm' }));
+    const collisions = [
+      agent('worker-1234dec9', { role: 'minion', label: null, jobId: 'swarm' }),
+      agent('worker-5678dec9', { role: 'minion', label: null, jobId: 'swarm' }),
+      agent('worker-9999dec9', { role: 'minion', label: null, jobId: 'swarm' }),
+      agent('worker-12dec9', { role: 'minion', label: null, jobId: 'swarm' }),
+      agent('worker-22dec9', { role: 'minion', label: null, jobId: 'swarm' }),
+      agent('ab', { role: 'minion', label: null, jobId: 'swarm' }),
+    ];
+    const agents = [...bulk, ...collisions];
+    const suffixes = minionSuffixes(agents, jobs);
+    // Lone tails never scan peers and keep the normal four characters.
+    expect(suffixes.get('bulk-00000000')).toBe('0000');
+    expect(suffixes.get('bulk-00001499')).toBe('1499');
+    // A shared four-tail extends only as far as the collision requires.
+    expect(suffixes.get('worker-1234dec9')).toBe('4dec9');
+    expect(suffixes.get('worker-5678dec9')).toBe('8dec9');
+    expect(suffixes.get('worker-9999dec9')).toBe('9dec9');
+    expect(suffixes.get('worker-12dec9')).toBe('12dec9');
+    expect(suffixes.get('worker-22dec9')).toBe('22dec9');
+    // Shorter than four graphemes: the whole id, never a padded tail.
+    expect(suffixes.get('ab')).toBe('ab');
+    // Row order never changes an answer.
+    const reversed = minionSuffixes([...agents].reverse(), jobs);
+    for (const item of agents) expect(reversed.get(item.id)).toBe(suffixes.get(item.id));
+  });
+
+  it('renders exactly the suffixes the rail authority computes and fails loud on a miss', () => {
+    const view = new BoardView(() => {});
+    const jobs = [baseJob({ id: 'wake', title: 'Full wake alert contract', displayName: 'Wake Alerts' })];
+    const agents = [
+      agent('worker-1234dec9', { role: 'minion', label: null, jobId: 'wake' }),
+      agent('worker-5678dec9', { role: 'minion', label: null, jobId: 'wake' }),
+      agent('worker-9999dec9', { role: 'minion', label: null, jobId: 'wake' }),
+      agent('unlinked-1111', { role: 'minion', label: null, jobId: null }),
+    ];
+    view.render(snapshot({ jobs, agents }));
+    const expected = minionSuffixes(agents, new Map(jobs.map((job) => [job.id, job])));
+    for (const item of agents) {
+      const row = [...document.querySelectorAll<HTMLButtonElement>('#board-agents .board-agent')].find((entry) => entry.title.includes(item.id))!;
+      expect(row.querySelector('.board-agent__hash')?.textContent).toBe(expected.get(item.id));
+    }
+    expect(railSuffix(expected, 'unlinked-1111')).toBe('1111');
+    expect(() => railSuffix(new Map(), 'ghost')).toThrow(RailIdentityError);
+    expect(() => railSuffix(new Map(), 'ghost')).toThrow('crew rail suffix missing for agent ghost');
+  });
+
+  it('keeps rendering with a code-point fallback when Intl.Segmenter is absent', () => {
+    const real = Intl.Segmenter;
+    const define = (value: typeof Intl.Segmenter | undefined) =>
+      Object.defineProperty(Intl, 'Segmenter', { value, writable: true, configurable: true });
+    try {
+      define(undefined);
+      const split = makeGraphemeSplitter();
+      expect(split('a😀b')).toEqual(['a', '😀', 'b']);
+    } finally {
+      define(real);
+    }
+    expect(makeGraphemeSplitter()('a😀b')).toEqual(['a', '😀', 'b']);
+  });
+
+  it('visibleWord: drops invisible graphemes under a real segmenter but keeps a ZWJ cluster intact on the code-point fallback (2026-10-05 edge review)', () => {
+    // Real segmenter: a zero-width space inside a word is dropped.
+    expect(visibleWord(`x\u200by`, true)).toBe('xy');
+    expect(visibleWord('\u200b\u200b', true)).toBe('');
+    // Code-point fallback (no Intl.Segmenter): the word is returned
+    // VERBATIM — code points cannot tell the ZWJ joiner of a family emoji
+    // from a stray invisible, and stripping it would change the label.
+    const family = '👩\u200d👩\u200d👧';
+    expect(visibleWord(family, false)).toBe(family);
+  });
+
+  it('escapes and bounds special and grapheme-rich names, retaining full title and id for keyboard users', () => {
+    const view = new BoardView(() => {});
+    const title = '<img src=x onerror=alert(1)> 🧑‍🚀'.repeat(5);
+    view.render(snapshot({ jobs: [baseJob({ id: 'unicode', title, displayName: '🧑‍🚀 Café <script> Hello extra words beyond the limit' })], agents: [agent('full-worker-id-fff1', { role: 'minion', jobId: 'unicode', label: null })] }));
+    const row = document.querySelector<HTMLButtonElement>('#board-agents .board-agent')!;
+    expect(row.querySelector('script')).toBeNull();
+    expect(row.querySelector('.board-agent__name')?.textContent).toContain('🧑‍🚀 café <script>');
+    expect(row.title).toContain(title);
+    expect(row.getAttribute('aria-label')).toContain('full-worker-id-fff1');
+    expect(row.querySelector('.board-agent__hash')?.textContent).toBe('fff1');
+  });
+});
 
 describe('board view resolved-notification rendering', () => {
   beforeEach(mountBoardDom);
@@ -1197,8 +1401,8 @@ describe('board agent rail — dense rows, tabs count, disposed collapse', () =>
     const row = document.querySelector<HTMLElement>('#board-agents .board-agent');
     expect(row?.dataset.state).toBe('streaming');
     expect(row?.querySelector('.board-agent__dot')).not.toBeNull();
-    expect(row?.querySelector('.board-agent__name')?.textContent).toBe('Payment lane');
-    expect(row?.querySelector('.board-agent__hash')?.textContent).toBe('minion-live'.slice(0, 8));
+    expect(row?.querySelector('.board-agent__name')?.textContent).toBe('unassigned');
+    expect(row?.querySelector('.board-agent__hash')?.textContent).toBe('live');
     expect(row?.querySelector('.board-agent__sub')?.textContent).toContain('minion · streaming');
     expect(row?.querySelector('.board-agent__state')?.textContent).toBe('streaming');
   });
@@ -1243,19 +1447,21 @@ describe('board agent rail — dense rows, tabs count, disposed collapse', () =>
       }),
     );
     const rows = [...document.querySelectorAll<HTMLElement>('#board-agents .board-agent')];
-    const byName = new Map(rows.map((row) => [row.querySelector('.board-agent__name')?.textContent, row]));
+    // Crew-heist-labels: a minion's primary name is its heist, not its
+    // label — locate rows by the #171-stable dataset.agentId identity.
+    const byAgentId = new Map(rows.map((row) => [row.dataset.agentId, row]));
     // The parent renders its family counters and the top-level marker.
-    const parent = byName.get('Payment lane')!;
+    const parent = byAgentId.get('parent-minion')!;
     expect(parent.dataset.parentage).toBe('top-level');
     expect(parent.querySelector('.board-agent__parentage')?.textContent).toBe('top-level');
     expect(parent.querySelector('.board-agent__child-counts')?.textContent).toContain('4 children');
     // A child row is labeled as a child and links back to its parent.
-    const child = byName.get('child of Payment lane')!;
+    const child = byAgentId.get('child-agent')!;
     expect(child.dataset.parentage).toBe('child');
     expect(child.querySelector('.board-agent__role')?.textContent).toContain('child ·');
     expect(child.querySelector('.board-agent__parent-link')?.textContent).toContain('Payment lane');
     // A legacy row (no parentage field) is never claimed either way.
-    const legacy = byName.get('legacy lane')!;
+    const legacy = byAgentId.get('legacy-minion')!;
     expect(legacy.dataset.parentage).toBe('unknown');
     expect(legacy.querySelector('.board-agent__parentage')).toBeNull();
   });
@@ -1485,7 +1691,9 @@ describe('board agent rail — truthful runtime status (#171)', () => {
     );
     const rail = document.getElementById('board-agents')!;
     const liveRow = rail.querySelector<HTMLElement>('.board-agent:not(.board-agent--disposed):not(.board-agent--historical)');
-    expect(liveRow?.textContent).toContain('minion-stopped');
+    // Crew-heist-labels: a minion's primary name is its heist (unassigned
+    // here — no job binding); the full id rides the accessible name.
+    expect(liveRow?.getAttribute('aria-label')).toContain('minion-stopped');
     expect(liveRow?.querySelector('.board-agent__supervision--alert')?.textContent).toBe('⛔ stopped');
     // The active count includes the held lane; the graveyard toggle does
     // not.

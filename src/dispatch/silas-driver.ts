@@ -164,6 +164,9 @@ export interface DigestLedger {
   latestJobEvent(jobId: string, kind: string): EventRecord | null;
   latestRoundEvent(roundId: string, kind: string): EventRecord | null;
   listAgents(): readonly AgentRecord[];
+  /** Implementer minions only (Gru ruling 2026-09-29): review-only
+   * sessions never win a digest pick. */
+  listImplementerMinions(jobId: string): readonly AgentRecord[];
   /** Durable re-brief markers; any row for a job is an unresolved request
    * that fences the job's review-eligibility rows (see the digest below). */
   listPendingRebriefs(opts?: { readonly jobId?: string }): readonly PendingRebriefRecord[];
@@ -810,11 +813,13 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     if (delivered !== null && currentPhaseDelivered && reviewPending && !rebriefPending && !liveDirectiveOwns &&
         job.prUrl === null && rounds.length === 0) {
       const lane = (input.worktrees?.listWorktrees({ jobId: job.id }) ?? []).find((candidate) => candidate.kind === 'job');
-      const minion = input.ledger
-        .listAgents()
-        // Issue #161: child workers are not the job's writer lane.
-        .filter((agent) => agent.jobId === job.id && agent.role === 'minion' && agent.parentage !== 'child')
-        .sort((a, b) => (b.lastActivity ?? b.createdAt).localeCompare(a.lastActivity ?? a.createdAt))[0];
+      // ATTRIBUTION, not routing: this pick names the implementer whose
+      // session a human should open for the delivery — most recently
+      // ACTIVE wins (deliberate, distinct from the newest-SPAWN rule that
+      // governs directive/re-brief routing). The pool itself is still
+      // implementer-only (review-only sessions and children never appear).
+      const minion = [...input.ledger.listImplementerMinions(job.id)]
+        .sort((a: AgentRecord, b: AgentRecord) => (b.lastActivity ?? b.createdAt).localeCompare(a.lastActivity ?? a.createdAt))[0];
       digest.deliveredWithoutPr.push({
         jobId: job.id,
         repo: job.repo,
@@ -926,9 +931,9 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       verificationInFlight(input.ledger, job.id) ||
       (answeringRequest !== null && answeringRequest.seq > phaseStartSeq);
     if (stallEligible && !currentPhaseDelivered && !stallOperationOwns) {
-      const boundMinions = input.ledger
-        .listAgents()
-        .filter((agent) => agent.jobId === job.id && agent.role === 'minion' && agent.parentage !== 'child');
+      // Implementer-only pool (Gru ruling 2026-09-29 + #161 union): the
+      // ledger pick excludes review-only sessions AND tracked children.
+      const boundMinions = input.ledger.listImplementerMinions(job.id);
       // The SAME attribution the board renders (stoppedWorkersByJob): a
       // bound minion is live unless its supervision view says stopped or
       // breaker-open, and a disposed unsupervised record is not a worker.

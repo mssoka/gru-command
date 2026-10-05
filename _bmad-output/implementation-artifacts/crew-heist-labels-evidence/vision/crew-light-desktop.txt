@@ -1,0 +1,26 @@
+1. **Theme/viewport:** Light theme (white cards, dark text, green/orange pills). The capture shows only the rail itself (~250 px narrow column, rounded card with dashed bottom divider); the full viewport is not visible, but the layout reads as a desktop sidebar, not a phone screen.
+
+2. **Rows (top → bottom):**
+   - `gru · chat` | `MOCK-GRU` | `GRU · IDLE` (small pink icon) | pill `idle`
+   - `silas · ops` | `MOCK-SIL` | `SILAS · STREA… 12S QUIET` (small brown icon) | pill `streaming` (orange)
+   - `blind:001` | `MOCK-LEN` | `PERKINS · IDLE` | pill `idle`
+   - `fix the payment retry` | `NION` | `MINION · IDLE` + red ⛔ `STOPPED` | pill `idle`
+   - `api docs pass` | `DOCS` | `MINION · IDLE` | pill `idle`
+   - `prepís <script> & “café”` | `CODE` | `MINION · IDLE` | pill `idle`
+   - `bob · memory` | `MOCK-BOB` | `BOB · IDLE` (yellow icon) | pill `idle`
+   - Below a dashed divider: centered text `+1 disposed` (not a minion row).
+
+3. **Any primary name starting with "minion"?** No.
+
+4. **Clipping/overflow/overlap:**
+   - Row 2 subtext is ellipsized mid-word: `SILAS · STREA…` (truncated "STREAMING"), with `12S QUIET` following it.
+   - Row 4: the red `⛔ STOPPED` runs to the right edge of the card, ending right against the `idle` pill's left side — letters are readable, no visible cut-off, but it is crowded to the edge.
+   - Otherwise none observed.
+
+5. **Long/Unicode row:** rendered as `prepís <script> & “café”` (accented í; `<script>` shown as literal escaped text; double quotes around café).
+
+6. **Contradictions:**
+   - ID badges are longer than the expected ~4 characters on most rows: `MOCK-GRU`, `MOCK-SIL`, `MOCK-LEN`, `MOCK-BOB` (8 chars each). Row 4's badge reads exactly `NION`, which is the tail of "MINION" — I cannot tell from pixels whether it is intentionally "NION" or has its leading characters cut off at the left.
+   - Row 2's subtext is ellipsized (`STREA…`), which conflicts with "no ellipsized text".
+   - Row 4 shows conflicting states in one row: subtext says `MINION · IDLE` then red `STOPPED`, while the pill says `idle`.
+   - No primary name shows visible shortening (no name is ellipsized); the Unicode row renders in full, so I cannot confirm any name was actually shortened.

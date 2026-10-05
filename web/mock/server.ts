@@ -330,6 +330,7 @@ function defaultSampleSnapshot(): unknown {
             id: 'demo-api-docs-pass',
             repo: 'demo-api',
             title: 'Docs pass on the public endpoints',
+            displayName: 'api docs pass',
             status: 'parked',
             updatedAt: new Date(Date.now() - 3_600_000).toISOString(),
             prUrl: null,
@@ -395,6 +396,24 @@ function defaultSampleSnapshot(): unknown {
             rounds: [],
             lane: null,
             lastAgentActivity: new Date(Date.now() - 300_000).toISOString(),
+          },
+          {
+            // Long/Unicode/special-character authored name: the rail must
+            // escape it, shorten it to the 24-grapheme bound and keep the
+            // full title + id in the tooltip/accessible name.
+            id: 'demo-api-unicode-names',
+            repo: 'demo-api',
+            title: 'Přepiš šablony a ověř 名前の長い表示 — <script> & "café" v názvu',
+            displayName: 'Přepiš <script> & "café" — 名前がとても長い表示確認',
+            status: 'working',
+            updatedAt: new Date(Date.now() - 240_000).toISOString(),
+            prUrl: null,
+            prState: null,
+            baseBranch: 'main',
+            note: 'long authored name — the rail shortens it for the card',
+            rounds: [],
+            lane: null,
+            lastAgentActivity: new Date(Date.now() - 60_000).toISOString(),
           },
           {
             id: 'demo-api-stalled-lane',
@@ -487,6 +506,11 @@ function defaultSampleSnapshot(): unknown {
       // graveyard.
       { id: 'mock-minion-held', role: 'minion', label: 'held-after-breaker', state: 'disposed', status: 'disposed', runtime: 'current', lastActivity: new Date(Date.now() - 600_000).toISOString(), createdAt: new Date(Date.now() - 2_400_000).toISOString(), sessionFile: null, jobId: null, roundId: null, supervision: { state: 'stopped', restarts: 3, breakerOpen: true, stopReason: 'crash loop' } },
       { id: 'mock-minion-sept', role: 'minion', label: 'sample-site-copy-pass (Sept 29)', state: 'streaming', status: 'streaming', runtime: 'historical', lastActivity: '2026-09-29T21:12:00.000Z', createdAt: '2026-09-29T20:00:00.000Z', sessionFile: null, jobId: 'sample-site-copy-pass', roundId: null, supervision: null },
+      // Crew-heist-labels demo rows: authored display_name + long/Unicode
+      // title-fallback jobs (jobs declared above; the authored row exercises
+      // the short-name path, the Unicode row the 24-grapheme bound).
+      { id: 'mock-minion-docs', role: 'minion', label: null, state: 'idle', status: 'idle', runtime: 'current', lastActivity: null, createdAt: new Date(Date.now() - 1_200_000).toISOString(), sessionFile: null, jobId: 'demo-api-docs-pass', roundId: null, supervision: null },
+      { id: 'mock-minion-unicode', role: 'minion', label: null, state: 'idle', status: 'idle', runtime: 'current', lastActivity: null, createdAt: new Date(Date.now() - 1_500_000).toISOString(), sessionFile: null, jobId: 'demo-api-unicode-names', roundId: null, supervision: null },
       { id: 'mock-bob', role: 'bob', label: 'bob · memory', state: 'idle', status: 'idle', runtime: 'current', lastActivity: null, createdAt: new Date(Date.now() - 5_400_000).toISOString(), sessionFile: null, jobId: null, roundId: null, supervision: null },
       { id: 'mock-gru-old', role: 'gru', label: 'gru · chat (retired)', state: 'disposed', status: 'disposed', runtime: 'historical', lastActivity: new Date(Date.now() - 7_200_000).toISOString(), createdAt: new Date(Date.now() - 10_800_000).toISOString(), sessionFile: null, jobId: null, roundId: null, supervision: null },
     ],

@@ -44,6 +44,27 @@ review-inputs-regression = "node tools/patch-vitest-rpc-timeout.mjs && npx vites
 working-flavor = "node tools/patch-vitest-rpc-timeout.mjs && cd web && npx vitest run src/lib/working-flavor.test.ts src/ui/chat-working-flavor.test.ts src/ui/chat-attachments.test.ts src/ui/chat-composer.test.ts src/ui/chat-console.test.ts src/ui/chat-gfm-invariant.test.ts src/ui/chat-scroll.test.ts src/ui/chat-service-band.test.ts src/ui/chat-tool-turn.test.ts"
 compaction-rollback = "npx vitest run test/pi-adapter.test.ts test/supervisor.test.ts test/config.test.ts test/health.test.ts test/board-engine.test.ts test/suite-shape.test.ts"
 
+# Crew-heist-labels scopes (r7 evidence round; invoked only via the
+# authenticated /api/verify scheduler at unchanged budgets/thresholds —
+# explicit installed CLIs, no worker/timeout flags, never the npm chain).
+# `crew-heist-labels` composes the focused backend suite, the focused web
+# board suite, the web typecheck/build and the crew-rail Playwright project
+# (the complete mock project belongs to `crew-rail-captures`, not this scope).
+# `crew-rail-captures` is the web-first half (focused web suite, typecheck,
+# build, crew-rail captures, then the complete mock project) so a load-
+# affected smoke run can never withhold the capture files.
+# `crew-captures-fast` is the minimal capture producer (build + the
+# one-test crew-rail project + the smoke project) sized for a short
+# admission window on the saturated shared host; the full combined roster
+# stays available for a quiet window.
+crew-heist-labels = "node tools/patch-vitest-rpc-timeout.mjs && cd web && node ../node_modules/vitest/vitest.mjs run src/ui/board.test.ts src/lib/board-protocol.test.ts && node ../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json && node node_modules/vite/bin/vite.js build && node ../node_modules/@playwright/test/cli.js test --project=crew-rail && cd .. && npx vitest run --config vitest.heavy.config.ts test/dispatch-server.test.ts test/dispatch-e2e.test.ts test/fix-directive.test.ts test/perkins-builtin-wave.test.ts && npx vitest run test/ledger-db.test.ts test/ledger-api.test.ts test/board-engine.test.ts test/rebrief-recovery.test.ts test/silas-driver.test.ts test/supervisor.test.ts test/lessons-injection.test.ts test/suite-shape.test.ts"
+# Browser acceptance on the isolated mock fixture: rebuilds web, then runs
+# the complete mock project plus the dedicated crew-rail capture project.
+# Captures land under web/test-results/<project>-<title>/crew-captures/.
+crew-rail-captures = "node tools/patch-vitest-rpc-timeout.mjs && cd web && node ../node_modules/vitest/vitest.mjs run src/ui/board.test.ts src/lib/board-protocol.test.ts && node ../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json && node node_modules/vite/bin/vite.js build && node ../node_modules/@playwright/test/cli.js test --project=crew-rail && node ../node_modules/@playwright/test/cli.js test --project=mock"
+crew-captures-fast = "node tools/patch-vitest-rpc-timeout.mjs && cd web && node node_modules/vite/bin/vite.js build && node ../node_modules/@playwright/test/cli.js test --project=crew-rail"
+
+
 # Retained PR142 worktree-specific verification scopes.
 terminal-rebrief = "node tools/patch-vitest-rpc-timeout.mjs && npx tsc && node -e \"const fs=require('node:fs'); fs.mkdirSync('dist/runtime',{recursive:true}); fs.copyFileSync('src/runtime/review-mcp-server.mjs','dist/runtime/review-mcp-server.mjs')\" && node tools/verify-perkins-resource.mjs . && node tools/write-build-rev.mjs && npx vitest run --config vitest.heavy.config.ts test/dispatch-server.test.ts test/shutdown.test.ts && npx vitest run test/rebrief-recovery.test.ts test/ledger-api.test.ts test/suite-shape.test.ts"
 pr142-static-preflight = "npx eslint . && npx tsc --noEmit -p tsconfig.test.json"
