@@ -152,7 +152,10 @@ describe('W5 — LAN-phone send path over the real socket', () => {
     const port = await pickFreePort();
     service = await startRealService({ port, token: W5_TOKEN, requireWebDist: false });
     url = `ws://127.0.0.1:${port}/ws`;
-  });
+    // Co-tenant boot headroom (see helpers/real-service.mjs): the real
+    // service must finish booting inside the hook so the helper's own
+    // loud deadline — not a vitest hook cut — is the failure surface.
+  }, 90_000);
 
   afterAll(async () => {
     await service?.stop();
