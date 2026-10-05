@@ -136,8 +136,8 @@ setup_timeout_ms = 120000
 # carry pointer lines only (chapter bodies are read on demand, never inlined).
 enabled = true                    # false disables the dream cadence and pointer injection
                                   # (the journal API stays available — capture is never lost)
-dream_interval_ms = 43200000      # 12h; on boot plus every interval, 0 = no periodic pass
-dream_on_boot = true              # one catch-up pass when the service boots
+dream_interval_ms = 43200000      # due lastDreamAt + interval (restarts inherit the cadence); 0 = no periodic pass
+dream_on_boot = true              # boot pass fires only when the dream is already due
 chapter_cap_bytes = 4096          # hard cap per chapter; the dream trims to fit
 index_cap_bytes = 1024           # hard cap for INDEX.md — the only part ever embedded
 max_references = 3                # pointer lines injected into one briefing/directive max

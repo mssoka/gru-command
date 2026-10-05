@@ -715,6 +715,20 @@ describe('dispatch config (E8)', () => {
     expect(loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester').dispatch.bobIntervalMs).toBe(900_000);
   });
 
+  it('intervals above Node\'s timer ceiling fail loud at the config boundary', () => {
+    for (const text of [
+      '[dispatch]\nbob_interval_ms = 2147483648\n',
+      '[lessons]\ndream_interval_ms = 3000000000\n',
+    ]) {
+      const home = tmpHome();
+      writeConfig(home, text);
+      expect(() => loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester'), text).toThrow(/timer ceiling/);
+    }
+    const home = tmpHome();
+    writeConfig(home, '[lessons]\ndream_interval_ms = 2147483647\n');
+    expect(loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester').lessons.dreamIntervalMs).toBe(2_147_483_647);
+  });
+
   it('a disabled Bob trigger is legal; garbage is not', () => {
     const home = tmpHome();
     writeConfig(home, '[dispatch]\nbob_interval_ms = 0\n');

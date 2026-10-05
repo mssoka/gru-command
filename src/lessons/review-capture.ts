@@ -26,8 +26,6 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
 
 /** Body bound for one journaled review finding (a note, not a document). */
 export const REVIEW_FINDING_BODY_MAX_CHARS = 2_000;
-/** Sidecar bound: only the most recent captured round ids are kept. */
-export const REVIEW_CAPTURE_MAX_ROUND_IDS = 500;
 /** Matches the consolidated records Perkins writes (whole-PR review). */
 const CONSOLIDATED_MAX_BYTES = 8 * 1024 * 1024;
 /** The same ingress shape `reviewArtifactDirectory` enforces for round ids
@@ -60,10 +58,11 @@ export interface ConsolidatedRecordSurface {
   readonly repoPath: string;
 }
 
-/** Compose one journal tag, truncated to the journal's per-tag bound — a
- * tag is a filter handle, not a record; the body carries the full text. */
+/** Compose one journal tag: redacted (model-supplied text can carry
+ * secrets) and bounded to the journal's per-tag limit — a tag is a filter
+ * handle, not a record; the body carries the full text. */
 function boundedTag(tag: string): string {
-  return tag.length > JOURNAL_MAX_TAG_CHARS ? tag.slice(0, JOURNAL_MAX_TAG_CHARS) : tag;
+  return redactedText(tag, JOURNAL_MAX_TAG_CHARS);
 }
 
 function assertObject(value: unknown, name: string): Record<string, unknown> {
@@ -147,10 +146,11 @@ function loadCapturedRounds(file: string): readonly string[] {
 }
 
 function saveCapturedRounds(file: string, rounds: readonly string[]): void {
-  const bounded = rounds.slice(-REVIEW_CAPTURE_MAX_ROUND_IDS);
+  // Full history: the sidecar is tiny (a short id per reviewed round) and
+  // eviction would let an old duplicate verdict journal its blockers twice.
   const staging = `${file}.tmp-${process.pid}`;
   try {
-    writeFileSync(staging, `${JSON.stringify({ version: 1, capturedRoundIds: bounded }, null, 2)}\n`, 'utf-8');
+    writeFileSync(staging, `${JSON.stringify({ version: 1, capturedRoundIds: rounds }, null, 2)}\n`, 'utf-8');
     renameSync(staging, file);
   } catch (error) {
     try {
@@ -162,12 +162,33 @@ function saveCapturedRounds(file: string, rounds: readonly string[]): void {
   }
 }
 
+/** Bodies already journaled for `perkins:<roundId>` — the idempotency
+ * check that makes a partial-failure retry (or a lost sidecar) append
+ * only the missing findings instead of duplicating the recorded ones.
+ * Pages the whole journal so correctness never depends on its size. */
+function journaledFindingBodies(journal: JournalStore, source: string): Set<string> {
+  const bodies = new Set<string>();
+  let after = 0;
+  for (;;) {
+    const page = journal.list({ after, limit: 10_000 });
+    if (page.length === 0) break;
+    for (const entry of page) {
+      if (entry.source === source && entry.kind === 'finding') bodies.add(entry.body);
+    }
+    after = page[page.length - 1]!.seq;
+    if (page.length < 10_000) break;
+  }
+  return bodies;
+}
+
 /**
  * Subscribe to the event bus and journal one finding per consolidated
  * blocker on every `round.verdict`. Returns the unsubscribe handle. A
  * capture failure is logged loud and leaves the round uncaptured (a
- * duplicate verdict event retries); a captured round is recorded in the
- * sidecar BEFORE the log line and never processed twice.
+ * duplicate verdict event retries); idempotency is enforced twice — the
+ * sidecar short-circuits known rounds, and the journal itself dedupes
+ * per-finding so a partial capture never duplicates on retry. The round
+ * is remembered only after the sidecar write succeeds.
  */
 export function createReviewOutcomeCapture(opts: ReviewOutcomeCaptureOptions): () => void {
   const log = opts.log ?? (() => {});
@@ -180,21 +201,25 @@ export function createReviewOutcomeCapture(opts: ReviewOutcomeCaptureOptions): (
     try {
       const record = readConsolidatedSurface(opts.artifactRoot, roundId);
       const repoTag = boundedTag(`repo:${basename(record.repoPath)}`);
+      const source = `perkins:${roundId}`;
+      const alreadyJournaled = journaledFindingBodies(opts.journal, source);
       const blockers = record.findings.filter((finding) => finding.severity === 'blocker');
       for (const finding of blockers) {
+        const body = redactedText(
+          `${finding.title} — ${finding.location}: ${finding.detail}`,
+          REVIEW_FINDING_BODY_MAX_CHARS,
+        );
+        if (alreadyJournaled.has(body)) continue;
         opts.journal.append({
           kind: 'finding',
-          source: `perkins:${roundId}`,
+          source,
           tags: [repoTag, 'review:blocker', boundedTag(`category:${finding.category}`)],
-          body: redactedText(
-            `${finding.title} — ${finding.location}: ${finding.detail}`,
-            REVIEW_FINDING_BODY_MAX_CHARS,
-          ),
+          body,
         });
         journaled += 1;
       }
+      saveCapturedRounds(stateFile, [...capturedRounds, roundId]);
       capturedRounds.add(roundId);
-      saveCapturedRounds(stateFile, [...capturedRounds]);
       log('info', 'perkins review outcome captured into the journal', {
         round_id: roundId,
         blockers: blockers.length,

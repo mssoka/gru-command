@@ -725,6 +725,22 @@ function requireNonNegativeInt(value: unknown, file: string, field: string): num
   return value;
 }
 
+/** Node clamps timer delays above 2^31 − 1 ms down to 1 ms, which would
+ * turn a long periodic trigger into a 1 ms tick storm. Refuse such
+ * intervals at the config boundary instead of failing at runtime. */
+function requireTimerInterval(value: unknown, file: string, field: string): number {
+  const ms = requireNonNegativeInt(value, file, field);
+  const TIMER_CEILING_MS = 2_147_483_647;
+  if (ms > TIMER_CEILING_MS) {
+    throw new ConfigError(
+      `${field} exceeds Node's timer ceiling (${TIMER_CEILING_MS} ms ≈ 24.8 days), got: ${ms} — longer delays clamp to 1 ms and would storm; use a smaller interval`,
+      file,
+      field,
+    );
+  }
+  return ms;
+}
+
 function requireUnitNumber(value: unknown, file: string, field: string): number {
   if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 1) {
     throw new ConfigError(`${field} must be a finite number between 0 and 1`, file, field);
@@ -1137,7 +1153,7 @@ export function loadConfig(
       dispatch = {
         bobIntervalMs:
           table['bob_interval_ms'] !== undefined
-            ? requireNonNegativeInt(table['bob_interval_ms'], file, 'dispatch.bob_interval_ms')
+            ? requireTimerInterval(table['bob_interval_ms'], file, 'dispatch.bob_interval_ms')
             : dispatch.bobIntervalMs,
       };
     }
@@ -1167,7 +1183,7 @@ export function loadConfig(
             : lessons.enabled,
         dreamIntervalMs:
           table['dream_interval_ms'] !== undefined
-            ? requireNonNegativeInt(table['dream_interval_ms'], file, 'lessons.dream_interval_ms')
+            ? requireTimerInterval(table['dream_interval_ms'], file, 'lessons.dream_interval_ms')
             : lessons.dreamIntervalMs,
         dreamOnBoot:
           table['dream_on_boot'] !== undefined

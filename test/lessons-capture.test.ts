@@ -309,6 +309,58 @@ describe('perkins review outcome capture', () => {
     expect(entry.body.length).toBeLessThanOrEqual(REVIEW_FINDING_BODY_MAX_CHARS);
   });
 
+  it('redacts model-supplied category text inside tags too', () => {
+    const h = captureHarness();
+    writeConsolidated(h.artifactRoot, 'round-tag-secret', [
+      blockerFixture({ category: 'leak sk-ABCDEFGHIJKLMNOPQRSTUVWX in category' }),
+    ]);
+    h.bus.publish(verdictEvent('round-tag-secret'));
+    const entry = h.journal.list()[0]!;
+    expect(entry.tags.join(' ')).not.toContain('sk-ABCDEFGHIJKLMNOPQRSTUVWX');
+  });
+
+  it('a partial capture retries without duplicating the already-journaled findings', () => {
+    const h = captureHarness();
+    writeConsolidated(h.artifactRoot, 'round-partial', [
+      blockerFixture(),
+      blockerFixture({ title: 'Second blocker', detail: 'The other half.' }),
+    ]);
+    // Simulate a failed capture that already journaled the first blocker.
+    h.journal.append({
+      kind: 'finding',
+      source: 'perkins:round-partial',
+      tags: ['repo:gru-command-demo', 'review:blocker', 'category:correctness'],
+      body: 'Off-by-one in the rollup — src/rollup.ts:42: The rollup drops the last row of every batch.',
+    });
+    h.bus.publish(verdictEvent('round-partial'));
+    const entries = h.journal.list();
+    expect(entries).toHaveLength(2); // the pre-existing one + exactly the missing one
+    expect(entries.filter((entry) => entry.body.startsWith('Second blocker'))).toHaveLength(1);
+    expect(entries.filter((entry) => entry.body.startsWith('Off-by-one'))).toHaveLength(1);
+  });
+
+  it('captures through the production ledger verdict event, not just a raw bus publish', () => {
+    const dir = tmpDir('gru-command-review-capture-ledger-');
+    const artifactRoot = join(dir, 'reviews');
+    const journal = new JournalStore(join(dir, 'journal'));
+    const bus = new EventBus({});
+    createReviewOutcomeCapture({ bus, journal, artifactRoot, stateFile: join(artifactRoot, '.review-capture-state.json') });
+    const ledgerDb = new LedgerDb(join(dir, 'data'));
+    const ledger = new LedgerApi(ledgerDb.handle, { bus });
+    try {
+      const job = ledger.addJob({ id: 'job-cap', repo: 'demo', title: 'review me', briefing: 'b' });
+      const round = ledger.addRound({ jobId: job.id });
+      ledger.setRoundStatus(round.id, 'live');
+      writeConsolidated(artifactRoot, round.id, [blockerFixture({ location: `src/x.ts:1 (${round.id})` })]);
+      ledger.setRoundVerdict(round.id, 'changes-requested');
+      const entries = journal.list();
+      expect(entries).toHaveLength(1);
+      expect(entries[0]).toMatchObject({ kind: 'finding', source: `perkins:${round.id}` });
+    } finally {
+      ledgerDb.close();
+    }
+  });
+
   it('ignores events that are not round verdicts or carry no round id', () => {
     const h = captureHarness();
     writeConsolidated(h.artifactRoot, 'round-abc123', [blockerFixture()]);
