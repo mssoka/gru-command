@@ -43,6 +43,29 @@ describe('install.sh --print rendering', () => {
     ]));
   });
 
+  it('the packed tarball actually ships the worker instruction assets the no-call-budget contract lives in (issue #158)', () => {
+    // The prompt-contract regression reads the repo tree; this pins the
+    // PACKAGED set too, so a packaging change cannot ship an install whose
+    // coordinators lack the no-cap contract (issue #158 §3). --ignore-scripts
+    // skips prepack: the file list is all this needs, and it stays fast.
+    const stdout = execFileSync('npm', ['pack', '--dry-run', '--json', '--ignore-scripts'], {
+      cwd: repoRoot,
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    const reported = JSON.parse(stdout) as readonly { files: readonly { path: string }[] }[];
+    const packed = new Set((reported[0]?.files ?? []).map((file) => file.path));
+    for (const asset of [
+      'roles/minion.md',
+      'roles/silas.md',
+      'roles/gru.md',
+      'resources/silas-skills/ops-dispatch/SKILL.md',
+      'resources/silas-skills/ledger-closeout/SKILL.md',
+    ]) {
+      expect(packed.has(asset), `${asset} missing from the packed tarball`).toBe(true);
+    }
+  });
+
   it('renders the platform unit with every placeholder substituted absolutely', () => {
     const { stdout, status } = print();
     expect(status).toBe(0);

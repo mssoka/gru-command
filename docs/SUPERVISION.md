@@ -147,8 +147,20 @@ computed per-snapshot.
   posted directly by the supervisor (hang detected, restart engaged).
 - **Action-required** — machine attention for Gru. Eligible rows open a
   rate-limited Gru wake turn; Gru diagnoses and dispositions them. They appear
-  in NEEDS GRU, not the owner bell. Breakers requiring owner re-arm and other
-  owner-only decisions use **needs-owner**, not action-required.
+  in NEEDS GRU (live rows only) and not the owner bell; rows bound to a
+  terminal merged/done lane are closed receipts rendered under FEED. Breakers
+  requiring owner re-arm and other owner-only decisions use **needs-owner**,
+  not action-required.
+- **Stopped-worker truth (2026-09-29)** — a supervision-stopped or
+  breaker-open worker leaves the job status working, but the lane renders an
+  explicit waiting state with its recorded reason (`waiting · quota wall`);
+  the Silas stall channel never wakes such a lane — only genuinely silent
+  live workers stall. The lane's current worker decides whether a stop
+  shows: a newer live worker clears an older stop, a fresh worker
+  registered before its first frame counts as live (its registration
+  stamps the stall clock), and among stops the newest recorded one speaks
+  (activity stamp first, registration order when unknown). A re-dispatched
+  lane is never COLD on the superseded stop's stamp.
 
 **Ack ids — nothing shown is unproven.** Every notification carries a
 stable id (the ack contract). When a client displays one — a toast, the

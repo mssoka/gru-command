@@ -50,6 +50,15 @@ describe('UnavailableWorktreePort: fail-loud on EVERY surface (r5 B2/B3)', () =>
     await expect(
       port.createReviewWorktree({ repoPath: '/x', roundId: 'r', ref: 'HEAD' }),
     ).rejects.toThrowError(WORKTREE_PORT_UNAVAILABLE);
+    await expect(
+      port.createChildWorktree({
+        repoPath: '/x',
+        jobId: 'j',
+        childId: 'c',
+        parentPath: '/x',
+        authority: 'read-only',
+      }),
+    ).rejects.toThrowError(WORKTREE_PORT_UNAVAILABLE);
     await expect(port.release({ worktreeId: 'j' })).rejects.toThrowError(WORKTREE_PORT_UNAVAILABLE);
   });
 

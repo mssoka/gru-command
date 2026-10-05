@@ -70,6 +70,26 @@ function toolEntry(id: string, parentId: string, name: string, out: string): Rec
   };
 }
 
+/** A real assistant frame that made a tool call, so the following result is
+ * linked to the call that produced it (issue #158 telemetry shape). */
+function assistantToolCallEntry(id: string, parentId: string | null, callId: string, name: string): Record<string, unknown> {
+  return {
+    type: 'message',
+    id,
+    parentId,
+    timestamp: T0,
+    message: {
+      role: 'assistant',
+      content: [{ type: 'toolCall', id: callId, name, arguments: {} }],
+      api: 'demo',
+      provider: 'demo',
+      model: 'demo',
+      stopReason: 'toolUse',
+      timestamp: 2000,
+    },
+  };
+}
+
 describe('transcript service', () => {
   it('lists session files newest-first with role from the directory layout', () => {
     const { dir, svc } = tmpStore();
@@ -110,6 +130,29 @@ describe('transcript service', () => {
     expect(assistant?.thinking).toBe('considering options');
     const tool = page.entries.find((e) => e.kind === 'tool_result');
     expect(tool?.toolName).toBe('bash');
+  });
+
+  it('records tool-call counts truthfully and never gates on them (issue #158)', () => {
+    const { dir, svc } = tmpStore();
+    const file = join(dir, 'sessions', 'minion', 'd', 's.jsonl');
+    mkdirSync(join(dir, 'sessions', 'minion', 'd'), { recursive: true });
+    // A linked call→result chain, not loose result rows: 40 assistant tool
+    // calls each answered by its own toolResult. The count is telemetry, not
+    // a limit on what the record shows or how much of it a reader may see.
+    const entries: Record<string, unknown>[] = [header(), userEntry('m1', null, 'do the work')];
+    let parent = 'm1';
+    for (let i = 0; i < 40; i += 1) {
+      const call = `a${i}`;
+      entries.push(assistantToolCallEntry(call, parent, `call-t${i}`, 'bash'));
+      entries.push(toolEntry(`t${i}`, call, 'bash', `result ${i}`));
+      parent = call;
+    }
+    writeFileSync(file, sessionFile(entries));
+    const page = svc.page('minion/d/s.jsonl', { limit: 200 });
+    expect(page.entries.filter((e) => e.kind === 'tool_result')).toHaveLength(40);
+    expect(page.entries.filter((e) => e.kind === 'assistant')).toHaveLength(40);
+    expect(page.entries.filter((e) => e.kind === 'user')).toHaveLength(1);
+    expect(page.entries.find((e) => e.kind === 'tool_result')?.toolName).toBe('bash');
   });
 
   it('paginates newest-first with a nextCursor and bounded limits', () => {

@@ -272,6 +272,28 @@ export class RuntimeRegistry {
     }
   }
 
+  /** Issue #161: reserve one resident worker permit up front (the same
+   * FIFO pool `spawn` charges), then spawn against THAT permit — a child
+   * admission can no longer race a probe's free-seat observation. */
+  async reserveResident(signal?: AbortSignal): Promise<() => void> {
+    return this.residents.acquire(1, signal);
+  }
+
+  /** Spawn a session on an already-held resident permit (never charges a
+   * second one). On failure the permit is released. */
+  async spawnWithResident(
+    role: Role,
+    options: SpawnOptions,
+    release: () => void,
+  ): Promise<AgentHandle> {
+    try {
+      return await this.spawnReserved(role, options, release);
+    } catch (error) {
+      release();
+      throw error;
+    }
+  }
+
   async reserveReviewRound(signal?: AbortSignal): Promise<ResidentReviewRound> {
     // Finite positive validation BEFORE acquiring any capacity.
     if (this.opts.closeSettleMs !== undefined &&
@@ -509,6 +531,8 @@ export class RuntimeRegistry {
     const handle = await adapter.spawn(role, {
       ...(options.resumeFile !== undefined ? { resumeFile: options.resumeFile } : {}),
       ...(options.cwd !== undefined ? { cwd: options.cwd } : {}),
+      ...(options.agentId !== undefined ? { agentId: options.agentId } : {}),
+      ...(options.roleTools !== undefined ? { roleTools: options.roleTools } : {}),
       ...(options.isolatedReview !== undefined ? { isolatedReview: options.isolatedReview } : {}),
       ...(options.reviewLead !== undefined ? { reviewLead: options.reviewLead } : {}),
       ...(options.reviewModel !== undefined ? { reviewModel: options.reviewModel } : {}),
@@ -561,10 +585,15 @@ export class RuntimeRegistry {
           );
           return disposing;
         };
-        if (['prompt', 'steer', 'followUp', 'compact'].includes(String(property))) {
+        if (['prompt', 'steer', 'followUp', 'promptWithVerdict', 'compact'].includes(String(property))) {
           if (wrappers.has(String(property))) return wrappers.get(String(property));
+          const tracked = String(property);
           const method = Reflect.get(target, property) as ((...args: unknown[]) => Promise<unknown>) | undefined;
           if (method === undefined) {
+            // Per-turn evidence is an OPTIONAL capability (r6 architecture):
+            // absence means "no attestation", not an adapter defect — callers
+            // check for it. Required methods still fail loud.
+            if (tracked === 'promptWithVerdict') return undefined;
             throw new Error(
               `resident handle was asked for "${String(property)}" but its runtime adapter does not implement it`,
             );
@@ -580,11 +609,11 @@ export class RuntimeRegistry {
               const operation = method.apply(target, args);
               return Promise.resolve(operation).finally(() => {
                 pending -= 1;
-                // Only a real prompt delivers the briefing: steer/followUp
-                // alone must never mark an un-briefed session reclaim-
-                // eligible (docs/FLOW.md §4d "as-yet-undelivered first
-                // prompt").
-                if (property === 'prompt') completedPrompt = true;
+                // Only a real prompt delivers the briefing — plain or
+                // verdict-carrying: steer/followUp alone must never mark an
+                // un-briefed session reclaim-eligible (docs/FLOW.md §4d
+                // "as-yet-undelivered first prompt").
+                if (tracked === 'prompt' || tracked === 'promptWithVerdict') completedPrompt = true;
                 budget.changed();
               });
             } catch (error) {
@@ -593,7 +622,7 @@ export class RuntimeRegistry {
               return Promise.reject(error);
             }
           };
-          wrappers.set(String(property), wrapper);
+          wrappers.set(tracked, wrapper);
           return wrapper;
         }
         const value: unknown = Reflect.get(target, property);

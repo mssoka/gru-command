@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { EventBus } from '../src/events/bus.js';
-import { LedgerApi, DEFAULT_LENSES } from '../src/ledger/api.js';
+import { LedgerApi, DEFAULT_LENSES, type PendingRebriefRecord } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 
 const cleanupDirs: string[] = [];
@@ -129,11 +129,15 @@ describe('ledger api — the record of state', () => {
     expect(api.listEvents().some((e) => e.kind === 'job.pr' && e.jobId === 'docs-pass')).toBe(true);
   });
 
-  it('addRound defaults to exactly the 7 standard lenses, all pending', () => {
+  it('addRound defaults to exactly the nine-lens standard catalog, all pending', () => {
     const round = api.addRound({ jobId: 'fix-login-flow', targetRef: 'abc123' });
     expect(round.seq).toBe(1);
     expect(round.id).toBe('fix-login-flow-r1');
-    expect(round.lenses.map((chip) => chip.lens)).toEqual([...DEFAULT_LENSES]);
+    // The exact names and order are asserted independently of DEFAULT_LENSES:
+    // a swap inside the constant must not silently pass this test.
+    expect(round.lenses.map((chip) => chip.lens)).toEqual([
+      'blind', 'edge', 'acceptance', 'security', 'architecture', 'codebase', 'tests', 'performance', 'operations',
+    ]);
     expect(round.lenses.every((chip) => chip.state === 'pending')).toBe(true);
     expect(round.targetRef).toBe('abc123');
   });
@@ -144,6 +148,25 @@ describe('ledger api — the record of state', () => {
     expect(() => api.addRound({ jobId: 'fix-login-flow', lenses: ['alpha', 'alpha'] })).toThrow(/unique/u);
     expect(() => api.addRound({ jobId: 'fix-login-flow', lenses: [''] })).toThrow(/non-empty/u);
     expect(() => api.addRound({ jobId: 'nope', lenses: ['a'] })).toThrow(/not found/u);
+  });
+
+  it('a historical seven-chip round keeps its own recorded lenses when a later round gets the expanded catalog', () => {
+    api.addJob({ id: 'catalog-expansion', repo: 'billing-api', title: 'catalog expansion' });
+    const historical = api.addRound({
+      jobId: 'catalog-expansion',
+      lenses: ['blind', 'edge', 'acceptance', 'security', 'architecture', 'codebase', 'tests'],
+      targetRef: 'before-expansion',
+    });
+    const current = api.addRound({ jobId: 'catalog-expansion', targetRef: 'after-expansion' });
+    expect(historical.lenses.map((chip) => chip.lens)).toEqual(
+      ['blind', 'edge', 'acceptance', 'security', 'architecture', 'codebase', 'tests'],
+    );
+    expect(current.lenses.map((chip) => chip.lens)).toEqual([...DEFAULT_LENSES]);
+    // The persisted historical round stays exactly as recorded: the
+    // expansion is never backfilled onto a record created before it.
+    expect(api.getRound(historical.id)?.lenses.map((chip) => chip.lens)).toEqual(
+      ['blind', 'edge', 'acceptance', 'security', 'architecture', 'codebase', 'tests'],
+    );
   });
 
   it('round seq numbers continue within a job; verdicts are validated', () => {
@@ -346,4 +369,295 @@ describe('ledger api — the record of state', () => {
     db2.close();
   });
 
+});
+
+describe('pending re-brief terminal retirement (ledger boundary)', () => {
+  let db: LedgerDb;
+  let api: LedgerApi;
+
+  beforeAll(() => {
+    db = new LedgerDb(tmpDir());
+    api = new LedgerApi(db.handle);
+  });
+  afterAll(() => db.close());
+
+  function mergedJob(id: string): void {
+    api.addJob({ id, repo: 'terminal-retirement', title: 'terminal retirement fixture' });
+    api.setJobStatus(id, 'working');
+    api.setJobStatus(id, 'in-review');
+    api.setJobStatus(id, 'merged');
+  }
+
+  function candidatesOf(markers: readonly PendingRebriefRecord[]): readonly {
+    id: string;
+    kind: PendingRebriefRecord['kind'];
+    payloadHash: string;
+    baselineSeq: number;
+  }[] {
+    return markers.map((marker) => ({
+      id: marker.id,
+      kind: marker.kind,
+      payloadHash: marker.payloadHash,
+      baselineSeq: marker.baselineSeq,
+    }));
+  }
+
+  it('beginPendingRebrief refuses a terminal job inside its own transaction (the HTTP guard is not the only boundary)', () => {
+    mergedJob('intake-terminal');
+    expect(() => api.beginPendingRebrief({ jobId: 'intake-terminal', note: 'n', briefing: 'b' }))
+      .toThrow(/terminal lanes are never re-briefed/u);
+    expect(api.listPendingRebriefs({ jobId: 'intake-terminal' })).toHaveLength(0);
+  });
+
+  it('retirePendingRebriefs commits audit + identity-checked deletion together; a replay is a no-op', () => {
+    const jobId = 'retire-atomic';
+    api.addJob({ id: jobId, repo: 'terminal-retirement', title: 'audit atomicity' });
+    api.setJobStatus(jobId, 'working');
+    const markers = api.beginPendingRebrief({ jobId, note: 'n', briefing: 'b' });
+    const candidates = candidatesOf(markers);
+    api.setJobStatus(jobId, 'in-review');
+    api.setJobStatus(jobId, 'merged');
+
+    const first = api.retirePendingRebriefs({ jobId, reason: 'job terminal', candidates });
+    expect(first.refused).toBeNull();
+    expect(first.retired.map((marker) => marker.id).sort()).toEqual(markers.map((marker) => marker.id).sort());
+    expect(api.listPendingRebriefs({ jobId })).toHaveLength(0);
+    const audit = api.latestJobEvent(jobId, 'silas.rebrief-retired');
+    expect(audit).not.toBeNull();
+    expect((audit?.payload as { job_status?: string }).job_status).toBe('merged');
+
+    const replay = api.retirePendingRebriefs({ jobId, reason: 'job terminal', candidates });
+    expect(replay.retired).toHaveLength(0);
+    expect(api.listJobEvents(jobId).filter((event) => event.kind === 'silas.rebrief-retired')).toHaveLength(1);
+  });
+
+  it('refuses direct retirement of a fully landed terminal request without an audit', () => {
+    const jobId = 'retire-spent-refusal';
+    api.addJob({ id: jobId, repo: 'terminal-retirement', title: 'completed request' });
+    api.setJobStatus(jobId, 'working');
+    const markers = api.beginPendingRebrief({ jobId, note: 'n', briefing: 'b' });
+    api.appendCustomEvent({ kind: 'silas.rebrief', jobId });
+    api.appendCustomEvent({ kind: 'job.delivered', jobId });
+    api.setJobStatus(jobId, 'in-review');
+    api.setJobStatus(jobId, 'merged');
+    const result = api.retirePendingRebriefs({ jobId, reason: 'terminal', candidates: candidatesOf(markers) });
+    expect(result).toMatchObject({ retired: [], skippedIds: [], refused: 'events-already-landed' });
+    expect(api.listPendingRebriefs({ jobId })).toEqual(markers);
+    expect(api.latestJobEvent(jobId, 'silas.rebrief-retired')).toBeNull();
+    expect(api.clearPendingRebriefsIfCurrent(markers)).toBe(true);
+    expect(api.listPendingRebriefs({ jobId })).toHaveLength(0);
+  });
+
+  it('retirement audit insertion failure rolls back marker deletion, then a retry commits once', () => {
+    const jobId = 'retire-audit-rollback';
+    api.addJob({ id: jobId, repo: 'terminal-retirement', title: 'rollback' });
+    api.setJobStatus(jobId, 'working');
+    const markers = api.beginPendingRebrief({ jobId, note: 'n', briefing: 'b' });
+    api.setJobStatus(jobId, 'in-review');
+    api.setJobStatus(jobId, 'merged');
+    db.handle.exec(`CREATE TRIGGER fail_retirement_audit BEFORE INSERT ON events
+      WHEN NEW.kind = 'silas.rebrief-retired' BEGIN SELECT RAISE(ABORT, 'audit blocked'); END`);
+    try {
+      expect(() => api.retirePendingRebriefs({ jobId, reason: 'terminal', candidates: candidatesOf(markers) }))
+        .toThrow(/audit blocked/u);
+      expect(api.listPendingRebriefs({ jobId }).map((row) => row.id)).toEqual(markers.map((row) => row.id));
+      expect(api.latestJobEvent(jobId, 'silas.rebrief-retired')).toBeNull();
+    } finally {
+      db.handle.exec('DROP TRIGGER fail_retirement_audit');
+    }
+    expect(api.retirePendingRebriefs({ jobId, reason: 'terminal', candidates: candidatesOf(markers) }).retired).toHaveLength(2);
+    expect(api.listPendingRebriefs({ jobId })).toHaveLength(0);
+    expect(api.listJobEvents(jobId).filter((event) => event.kind === 'silas.rebrief-retired')).toHaveLength(1);
+  });
+
+  it('a stale snapshot never erases a newer request generation; nonterminal and missing jobs are refused', () => {
+    const jobId = 'retire-generation';
+    api.addJob({ id: jobId, repo: 'terminal-retirement', title: 'generation guard' });
+    api.setJobStatus(jobId, 'working');
+    const old = api.beginPendingRebrief({ jobId, note: 'old', briefing: 'b' });
+    const staleCandidates = candidatesOf(old);
+    const fresh = api.beginPendingRebrief({ jobId, note: 'fresh', briefing: 'b' });
+    expect(fresh.map((marker) => marker.id)).not.toEqual(old.map((marker) => marker.id));
+
+    // Nonterminal: refused, nothing deleted or recorded — and nothing is
+    // reported as "skipped" because no row was read or compared.
+    const refused = api.retirePendingRebriefs({ jobId, reason: 'x', candidates: staleCandidates });
+    expect(refused.refused).toBe('job-not-terminal');
+    expect(refused.skippedIds).toHaveLength(0);
+    expect(refused.retired).toHaveLength(0);
+    expect(api.listPendingRebriefs({ jobId })).toHaveLength(2);
+
+    api.setJobStatus(jobId, 'in-review');
+    api.setJobStatus(jobId, 'merged');
+    const stale = api.retirePendingRebriefs({ jobId, reason: 'x', candidates: staleCandidates });
+    expect(stale.retired).toHaveLength(0);
+    expect(stale.skippedIds.slice().sort()).toEqual(staleCandidates.map((candidate) => candidate.id).sort());
+    expect(api.listPendingRebriefs({ jobId })).toHaveLength(2); // the newer generation survives
+
+    const current = api.retirePendingRebriefs({ jobId, reason: 'x', candidates: candidatesOf(fresh) });
+    expect(current.retired).toHaveLength(2);
+    expect(api.listPendingRebriefs({ jobId })).toHaveLength(0);
+
+    const missing = api.retirePendingRebriefs({ jobId: 'no-such-job', reason: 'x', candidates: [] });
+    expect(missing.refused).toBe('job-missing');
+  });
+
+  it('a mixed candidate list retires only the matching identity and traces the drifted id', () => {
+    const jobId = 'retire-mixed';
+    api.addJob({ id: jobId, repo: 'terminal-retirement', title: 'mixed candidates' });
+    api.setJobStatus(jobId, 'working');
+    const superseded = api.beginPendingRebrief({ jobId, note: 'old', briefing: 'b' });
+    const fresh = api.beginPendingRebrief({ jobId, note: 'fresh', briefing: 'b' });
+    api.setJobStatus(jobId, 'in-review');
+    api.setJobStatus(jobId, 'merged');
+    // One candidate still matches the live row; its stale-generation twin
+    // (same kind, superseded id/hash/watermark) must be skipped, never
+    // deleted — and the drift must be traceable in the single audit.
+    const matching = candidatesOf(fresh)[0]!;
+    const drifted = candidatesOf(superseded).find((candidate) => candidate.kind === matching.kind)!;
+    const result = api.retirePendingRebriefs({ jobId, reason: 'job terminal', candidates: [matching, drifted] });
+    expect(result.refused).toBeNull();
+    expect(result.retired.map((marker) => marker.id)).toEqual([matching.id]);
+    expect(result.skippedIds).toEqual([drifted.id]);
+    // Exactly one row deleted; the newer generation of the other kind survives.
+    expect(api.listPendingRebriefs({ jobId }).map((marker) => marker.id))
+      .toEqual([fresh.find((marker) => marker.kind !== matching.kind)!.id]);
+    const audits = api.listJobEvents(jobId).filter((event) => event.kind === 'silas.rebrief-retired');
+    expect(audits).toHaveLength(1);
+    const payload = audits[0]!.payload as { retired: readonly { id: string }[]; skipped_ids: readonly string[] };
+    expect(payload.retired.map((marker) => marker.id)).toEqual([matching.id]);
+    expect(payload.skipped_ids).toEqual([drifted.id]);
+  });
+
+  it('duplicate candidate ids retire and audit ONCE — a caller-side duplicate cannot overstate the deletion', () => {
+    const jobId = 'retire-duplicate-ids';
+    api.addJob({ id: jobId, repo: 'terminal-retirement', title: 'duplicate guard' });
+    api.setJobStatus(jobId, 'working');
+    const markers = api.beginPendingRebrief({ jobId, note: 'n', briefing: 'b' });
+    const candidates = candidatesOf(markers);
+    api.setJobStatus(jobId, 'in-review');
+    api.setJobStatus(jobId, 'merged');
+    // The same candidate twice (a caller-side duplicate): the id retires
+    // once, the audit names it once, and nothing is reported as skipped.
+    const result = api.retirePendingRebriefs({
+      jobId, reason: 'job terminal', candidates: [...candidates, ...candidates],
+    });
+    expect(result.retired.map((marker) => marker.id).sort()).toEqual(markers.map((marker) => marker.id).sort());
+    expect(result.skippedIds).toEqual([]);
+    expect(api.listPendingRebriefs({ jobId })).toHaveLength(0);
+    const audit = api.latestJobEvent(jobId, 'silas.rebrief-retired');
+    const audited = (audit?.payload as { retired?: readonly { id: string }[] }).retired ?? [];
+    expect(audited.map((row) => row.id).sort()).toEqual(markers.map((marker) => marker.id).sort());
+    expect(audited).toHaveLength(2); // one audit row per real marker, not per candidate
+  });
+
+  it('a marked retirement audits its own landed phase despite a newer foreign-phase event', () => {
+    const jobId = 'retire-phase-audit';
+    api.addJob({ id: jobId, repo: 'terminal-retirement', title: 'phase evidence' });
+    api.setJobStatus(jobId, 'working');
+    const markers = api.beginPendingRebrief({
+      jobId, note: 'n', briefing: 'b', handoff: { kind: 'gru-decision', decision: 'review' },
+    });
+    const phaseId = markers[0]!.phaseId;
+    expect(phaseId).not.toBeNull();
+    api.appendCustomEvent({ kind: 'silas.rebrief', jobId, payload: { phase_id: phaseId } });
+    api.appendCustomEvent({ kind: 'silas.rebrief', jobId, payload: { phase_id: 'foreign' } });
+    api.setJobStatus(jobId, 'in-review');
+    api.setJobStatus(jobId, 'merged');
+    api.retirePendingRebriefs({ jobId, reason: 'terminal', candidates: candidatesOf(markers) });
+    const retired = (api.latestJobEvent(jobId, 'silas.rebrief-retired')?.payload as {
+      retired: readonly { kind: string; guarded_event_landed: boolean }[];
+    }).retired;
+    expect(retired.find((row) => row.kind === 'silas.rebrief')?.guarded_event_landed).toBe(true);
+    expect(retired.find((row) => row.kind === 'job.delivered')?.guarded_event_landed).toBe(false);
+  });
+
+  it('a marked retirement audits its own event beyond the newest thousand unrelated job events', () => {
+    const jobId = 'retire-phase-window';
+    api.addJob({ id: jobId, repo: 'terminal-retirement', title: 'old phase evidence' });
+    api.setJobStatus(jobId, 'working');
+    const markers = api.beginPendingRebrief({
+      jobId, note: 'n', briefing: 'b', handoff: { kind: 'gru-decision', decision: 'review' },
+    });
+    api.appendCustomEvent({ kind: 'silas.rebrief', jobId, payload: { phase_id: markers[0]!.phaseId } });
+    api.appendCustomEvent({ kind: 'silas.rebrief', jobId, payload: { phase_id: 'foreign' } });
+    for (let i = 0; i < 1001; i++) api.appendCustomEvent({ kind: 'job.note', jobId, payload: { index: i } });
+    api.setJobStatus(jobId, 'in-review');
+    api.setJobStatus(jobId, 'merged');
+    api.retirePendingRebriefs({ jobId, reason: 'terminal', candidates: candidatesOf(markers) });
+    const retired = (api.latestJobEvent(jobId, 'silas.rebrief-retired')?.payload as {
+      retired: readonly { kind: string; guarded_event_landed: boolean }[];
+    }).retired;
+    expect(retired.find((row) => row.kind === 'silas.rebrief')?.guarded_event_landed).toBe(true);
+    expect(retired.find((row) => row.kind === 'job.delivered')?.guarded_event_landed).toBe(false);
+  });
+
+  it('the retirement audit recomputes guarded_event_landed from the ledger, not the caller', () => {
+    const jobId = 'retire-landed-flag';
+    api.addJob({ id: jobId, repo: 'terminal-retirement', title: 'landed-flag truth' });
+    api.setJobStatus(jobId, 'working');
+    const markers = api.beginPendingRebrief({ jobId, note: 'n', briefing: 'b' });
+    // The guarded `silas.rebrief` event lands; the delivery never does.
+    api.appendCustomEvent({ kind: 'silas.rebrief', jobId, payload: { minion_id: 'w', note: 'n' } });
+    api.setJobStatus(jobId, 'in-review');
+    api.setJobStatus(jobId, 'merged');
+    const result = api.retirePendingRebriefs({ jobId, reason: 'job terminal', candidates: candidatesOf(markers) });
+    expect(result.retired).toHaveLength(2);
+    const audit = api.latestJobEvent(jobId, 'silas.rebrief-retired');
+    const retired =
+      (audit?.payload as { retired?: readonly { kind: string; guarded_event_landed?: boolean }[] }).retired ?? [];
+    const flagFor = (kind: string): boolean | undefined =>
+      retired.find((marker) => marker.kind === kind)?.guarded_event_landed;
+    // Recomputed in the transaction from the ledger's own events: the caller
+    // supplied no flag at all.
+    expect(flagFor('silas.rebrief')).toBe(true);
+    expect(flagFor('job.delivered')).toBe(false);
+  });
+});
+
+describe('ledger api — identity-corrected follow-through reads (issue #163)', () => {
+  function freshApi(): LedgerApi {
+    const db = new LedgerDb(tmpDir());
+    return new LedgerApi(db.handle, { bus: new EventBus() });
+  }
+
+  it('finds a request-correlated event behind a full window of same-kind events', () => {
+    const api = freshApi();
+    api.addJob({ id: 'job-buried', repo: 'demo', title: 't' });
+    const old = api.appendCustomEvent({
+      kind: 'job.delivered',
+      jobId: 'job-buried',
+      payload: { request_id: 'req-old' },
+    });
+    for (let i = 0; i < 1200; i += 1) {
+      api.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-buried', payload: { request_id: `req-${i}` } });
+    }
+    const found = api.latestJobEventByRequestId('job-buried', 'job.delivered', 'req-old');
+    expect(found?.seq).toBe(old.seq);
+    expect(api.latestJobEventByRequestId('job-buried', 'job.delivered', 'req-missing')).toBeNull();
+  });
+
+  it('reduces verification events per scope behind a flood of other scopes', () => {
+    const api = freshApi();
+    api.addJob({ id: 'job-scope-flood', repo: 'demo', title: 't' });
+    const full = api.appendCustomEvent({
+      kind: 'verification.completed',
+      jobId: 'job-scope-flood',
+      payload: { ok: false, scope: 'full', run_id: 'run-old' },
+    });
+    let latestFocused = full;
+    for (let i = 0; i < 600; i += 1) {
+      latestFocused = api.appendCustomEvent({
+        kind: 'verification.completed',
+        jobId: 'job-scope-flood',
+        payload: { ok: true, scope: 'focused', run_id: `run-${i}` },
+      });
+    }
+    const scoped = api.latestJobEventsByPayloadScope('job-scope-flood', ['verification.completed']);
+    const rows = scoped.map((event) => [event.payload, event.seq] as const);
+    const fullRow = rows.find(([payload]) => (payload as { scope?: string }).scope === 'full');
+    const focusedRow = rows.find(([payload]) => (payload as { scope?: string }).scope === 'focused');
+    expect(fullRow?.[1]).toBe(full.seq); // the older failure scope never ages out
+    expect(focusedRow?.[1]).toBe(latestFocused.seq);
+  });
 });

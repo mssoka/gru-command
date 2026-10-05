@@ -6,9 +6,10 @@
  * and grants no publication permission of its own, so read-only,
  * artifact-only and evidence-only contracts keep publishing nothing.
  *
- * The block lives here (one string, one append helper) so the initial
- * briefing, follow-up directives and re-brief prompts cannot drift apart.
- * It is an instruction contract for generated `gh` commands — it is NOT a
+ * The block lives here (one string, composed with the other worker rule
+ * blocks by `worker-rules.ts`) so the initial briefing, follow-up
+ * directives and re-brief prompts cannot drift apart. It is an
+ * instruction contract for generated `gh` commands — it is NOT a
  * sandbox over arbitrary shell commands a model might still construct.
  */
 
@@ -22,9 +23,3 @@ export const PR_CREATION_RULE = [
   'Contracts that do not authorize publication (read-only, artifact-only,',
   'evidence-only work) still publish nothing.',
 ].join('\n');
-
-/** Append the new-PR rule to an assembled worker prompt or directive
- * (its own paragraph; the separator is always exactly one blank line). */
-export function appendPrCreationRule(text: string): string {
-  return `${text}\n\n${PR_CREATION_RULE}`;
-}

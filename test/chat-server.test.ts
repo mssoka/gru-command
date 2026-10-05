@@ -2614,10 +2614,83 @@ describe('chat context controls and durable new-chat boundaries', () => {
         ),
       ).toMatchObject({ ok: true, epoch: 2 });
       expect(new GruSessionPointer(h.chatDir).current()).toMatchObject({ epoch: 2 });
+      // Post-commit retirement is deliberately released after this control's
+      // result (the reset barrier never waits on best-effort cleanup), so
+      // observe the retirement through the same bounded poll the first reset
+      // uses; the oracle still requires disposed to become true.
+      await pollUntil(() => firstFresh.disposed, 'fresh handle disposal after second reset');
       expect(firstFresh.disposed).toBe(true);
       await reconnect.close();
       await client.close();
     } finally {
+      await h.close();
+    }
+  });
+
+  it('holds the reset barrier independent of the retired handle disposal on a committed reset', async () => {
+    let release!: () => void;
+    const retirementHold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const h = await makeHarness();
+    // Hold the retired handle's disposal: the committed reset must still
+    // release its control result and idle view instead of pinning the barrier
+    // behind the cleanup (finalizeCommittedNewChat is post-commit).
+    h.handle.disposeHold = retirementHold;
+    try {
+      const client = await authedClient(h.port, TOKEN, undefined, true);
+      // The committed-retirement path needs an ACTIVE handle to retire.
+      client.send('establish before retirement', 'retirement-establish');
+      await client.waitFor(isTurnEndFrame, 'retirement setup');
+      client.control('new_chat', 'retirement-held');
+      expect(
+        await client.waitFor(
+          (frame) => frame.type === 'control_result' && frame.request_id === 'retirement-held',
+          'committed result while retirement is held',
+        ),
+      ).toMatchObject({ ok: true, epoch: 1 });
+      expect(
+        await client.waitFor(
+          (frame) => frame.type === 'context' && frame.epoch === 1 && frame.state === 'idle',
+          'idle reset state while retirement is held',
+        ),
+      ).toBeDefined();
+      // The post-commit finalizer started retiring the old handle and is stuck
+      // on the test's hold. The delivery barrier is released independently:
+      // new-epoch work reaches the fresh handle while the retired disposal is
+      // still held, and the retired handle receives nothing.
+      await pollUntil(() => h.handle.disposalStarted, 'retired handle disposal started');
+      expect(h.handle.disposed).toBe(false);
+      const retiredCallsBefore = h.handle.calls.length;
+      const deliveredTurn = nextTurnEnd(client);
+      client.send('delivered while retirement is held', 'retirement-held-delivery');
+      // The client sees the delivery end-to-end while retirement is still
+      // held: its ack and completed turn, not only the fresh handle's call.
+      await deliveredTurn;
+      expect(client.frames).toContainEqual(
+        expect.objectContaining({ type: 'ack', client_msg_id: 'retirement-held-delivery' }),
+      );
+      await pollUntil(
+        () =>
+          h.freshHandles[0]?.calls.some(
+            (call) => call.text === 'delivered while retirement is held',
+          ) === true,
+        'fresh-epoch delivery while retirement is held',
+      );
+      // Exactly-once on the real surface: the fresh handle got the message
+      // once, not merely at least once.
+      const freshDeliveries = (): number =>
+        h.freshHandles[0]!.calls.filter((call) => call.text === 'delivered while retirement is held').length;
+      expect(freshDeliveries()).toBe(1);
+      expect(h.handle.calls.length).toBe(retiredCallsBefore);
+      expect(h.handle.disposed).toBe(false);
+      release();
+      await pollUntil(() => h.handle.disposed, 'retired handle disposal settled');
+      // Settlement of the retired handle must not replay the message.
+      expect(freshDeliveries()).toBe(1);
+      await client.close();
+    } finally {
+      release();
       await h.close();
     }
   });
@@ -2770,6 +2843,11 @@ describe('chat context controls and durable new-chat boundaries', () => {
         (frame) => frame.type === 'control_result' && frame.request_id === 'adopt-fresh',
         'fresh adoption result',
       );
+      // Post-commit adoption is intentionally started on the next event-loop
+      // turn AFTER the control result is released (chat/server.ts postCommit
+      // timer), so waiting for the result alone still races the server's
+      // timer under load. Wait for the adoption itself before asserting.
+      await pollUntil(() => adopted !== null, 'fresh handle adoption');
       expect(adopted).toBe(h.freshHandles[0]);
       expect(new GruSessionPointer(h.chatDir).current()?.sessionFile).toBe(
         h.freshHandles[0]?.sessionFile,

@@ -23,6 +23,7 @@ import { normalizeSessionPath, SessionAlreadyActiveError } from './session-paths
 // consumers of the pi adapter's surface keep working.
 export { normalizeSessionPath, SessionAlreadyActiveError };
 import { capabilitiesForModelInput } from './types.js';
+import { PI_CAPABILITIES } from './capabilities.js';
 import { extractProviderRejectionEvidence } from '../provider-recovery/classify.js';
 import type {
   AgentCapabilities,
@@ -33,6 +34,7 @@ import type {
   NativeAgentTool,
   PendingTurn,
   PromptOptions,
+  PromptTurnVerdict,
   RuntimeEvent,
   RuntimeEventListener,
   RuntimeHealth,
@@ -82,8 +84,10 @@ function confinedReviewTools(cwd: string, requested: readonly IsolatedToolName[]
 function nativeReviewTools(definitions: readonly NativeAgentTool[]): ToolDefinition[] {
   const names = new Set<string>();
   return definitions.map((definition) => {
-    if (!/^perkins_[a-z0-9_]{1,48}$/.test(definition.name) || names.has(definition.name)) {
-      throw new Error(`invalid or duplicate native review tool name: ${definition.name}`);
+    // Product-native tool names (review leads and, since issue #161,
+    // non-review parent sessions): a lowercase snake-ish identifier.
+    if (!/^[a-z][a-z0-9_]{1,63}$/.test(definition.name) || names.has(definition.name)) {
+      throw new Error(`invalid or duplicate native tool name: ${definition.name}`);
     }
     names.add(definition.name);
     return {
@@ -160,19 +164,10 @@ export function typedFromProviderMessageLine(
     ...(parsed.bodyCode !== undefined ? { bodyCode: parsed.bodyCode } : {}),
   };
 }
-/** pi adapter capabilities, hoisted so the runtime probe can report them
- * without constructing the adapter (E3 story 3). */
-export const PI_CAPABILITIES: AgentCapabilities = {
-  streaming: true,
-  steer: 'native',
-  resume: 'file',
-  // Adapter transport support. A spawned handle overrides this from the
-  // resolved model's declared input modalities (B1).
-  images: true,
-  thinking: true,
-  thinkingLevelControl: true,
-  followUp: true,
-};
+// The declaration now lives in the dependency-light `capabilities.js` so the
+// runtime probe can report it without loading this adapter's SDK graph; the
+// re-export keeps every existing import surface (and object identity) intact.
+export { PI_CAPABILITIES };
 
 export interface PiRuntimeOptions {
   readonly config: GruCommandConfig;
@@ -273,7 +268,7 @@ interface QueuedMessage {
   readonly text: string;
   readonly owner: string;
   readonly images?: PromptOptions['images'];
-  readonly resolve: () => void;
+  readonly resolve: (verdict: PromptTurnVerdict) => void;
   readonly reject: (error: Error) => void;
   /** Opt-in queued-wait cap (E7): rejects THIS caller when it fires. */
   timer: ReturnType<typeof setTimeout> | null;
@@ -669,9 +664,29 @@ export class PiRuntime implements AgentRuntime {
       // Declared native tools ride the SAME helper for leads and lens
       // children: the ADAPTER translates the declaration to in-process
       // tools, so callers never branch on harness (SPEC ruling 4).
-      const nativeTools = reviewMode === undefined ? [] : nativeReviewTools(reviewMode.nativeTools ?? []);
+      // Product-native tools ride the SAME helper for review leads and
+      // (issue #161) ordinary parent sessions: the adapter translates the
+      // declaration to in-process tools, so callers never branch on
+      // harness and no secret ever leaves the host process.
+      const declaredNativeTools =
+        reviewMode !== undefined ? (reviewMode.nativeTools ?? []) : (options.nativeTools ?? []);
+      const nativeTools = nativeReviewTools(declaredNativeTools);
+      // Issue #161: a declared role-tool override narrows (never widens)
+      // the role's own set — an unknown name fails loud here instead of
+      // silently spawning with the wrong authority.
+      const declaredRoleTools = options.roleTools ?? roleDef.tools;
+      if (options.roleTools !== undefined) {
+        const allowed = new Set(roleDef.tools);
+        for (const tool of options.roleTools) {
+          if (!allowed.has(tool)) {
+            throw new Error(
+              `role tool override names "${tool}", which role "${role}" does not declare — an override can only narrow authority`,
+            );
+          }
+        }
+      }
       const tools = isolatedTools === null
-        ? roleDef.tools
+        ? [...declaredRoleTools, ...nativeTools.map((tool) => tool.name)]
         : [...isolatedTools.names, ...nativeTools.map((tool) => tool.name)];
       const { session } = await createAgentSession({
         cwd,
@@ -680,7 +695,11 @@ export class PiRuntime implements AgentRuntime {
         ...(thinkingLevel !== undefined ? { thinkingLevel } : {}),
         ...(reviewMode !== undefined ? { noTools: 'all' as const } : {}),
         tools: [...tools],
-        ...(isolatedTools !== null ? { customTools: [...isolatedTools.tools, ...nativeTools] } : {}),
+        ...(isolatedTools !== null
+          ? { customTools: [...isolatedTools.tools, ...nativeTools] }
+          : nativeTools.length > 0
+            ? { customTools: [...nativeTools] }
+            : {}),
         resourceLoader: loader,
         ...(isolatedSettings !== undefined ? { settingsManager: isolatedSettings } : {}),
         sessionManager,
@@ -720,6 +739,7 @@ export class PiRuntime implements AgentRuntime {
           this.activeFiles.delete(sessionFile);
         },
         this.heartbeatMs(),
+        ...(options.agentId !== undefined ? [options.agentId] : []),
       );
       this.handles.add(handle);
       this.down = undefined;
@@ -783,6 +803,8 @@ function mapImages(images: PromptOptions['images']): unknown[] | undefined {
 export class PiAgentHandle implements AgentHandle {
   readonly role: Role;
   readonly id: string;
+  /** The SDK session id at construction (== `id` for ordinary handles). */
+  private readonly nativeSessionId: string;
   readonly sessionFile: string;
   readonly reviewIsolation?: true;
   readonly reviewTools?: readonly string[];
@@ -798,6 +820,10 @@ export class PiAgentHandle implements AgentHandle {
   /** The text/images behind the live turn — supervision's resume snapshot. */
   private livePromptText: string | null = null;
   private livePromptImages: PromptOptions['images'] | undefined;
+  /** Terminal evidence of the live turn's LAST assistant message: the only
+   * positive completion proof (`stopReason: 'stop'`). Reset per turn; the
+   * settle capture reads it before `drain()` starts a successor. */
+  private liveTurnStop: { stopReason: string | null; error: string | null } | null = null;
   /** Long-tool heartbeats: an open tool call keeps the event surface alive. */
   private readonly toolHeartbeat: ToolHeartbeat;
   private readonly queue: QueuedMessage[] = [];
@@ -854,9 +880,17 @@ export class PiAgentHandle implements AgentHandle {
     private readonly log: Log,
     private readonly onDispose: () => void = () => {},
     toolHeartbeatMs = 60_000,
+    /** Product-owned identity (issue #161): the handle id is the ledger
+     * identity, which must exist before the session for a tracked child.
+     * The session file and its lock stay SDK-minted. */
+    agentId?: string,
   ) {
     this.role = role;
-    this.id = session.sessionId;
+    // The SDK-minted session identity, retained separately from the
+    // product-owned handle id (issue #161): identity drift checks compare
+    // NATIVE ids, never the product id.
+    this.nativeSessionId = session.sessionId;
+    this.id = agentId ?? session.sessionId;
     this.sessionFile = sessionFile;
     this.capabilities = capabilities;
     if (isolatedReview) this.reviewIsolation = true;
@@ -905,6 +939,10 @@ export class PiAgentHandle implements AgentHandle {
   }
 
   async prompt(text: string, options: PromptOptions = {}): Promise<void> {
+    await this.promptWithVerdict(text, options);
+  }
+
+  async promptWithVerdict(text: string, options: PromptOptions = {}): Promise<PromptTurnVerdict> {
     this.assertLive();
     if (this.compacting || this.nativeCompactionOpen || this.session.isCompacting) {
       throw new Error('agent session is compacting; prompt requires an idle session');
@@ -913,7 +951,9 @@ export class PiAgentHandle implements AgentHandle {
     if (this.liveTurn !== null) {
       return this.enqueue(text, owner, 'single-writer', options.images, options.timeoutMs);
     }
-    return this.runTurn(text, owner, options.images);
+    const turn = this.runTurn(text, owner, options.images);
+    await turn.done;
+    return turn.verdict();
   }
 
   async steer(text: string, options: PromptOptions = {}): Promise<void> {
@@ -927,9 +967,10 @@ export class PiAgentHandle implements AgentHandle {
       return;
     }
     if (this.liveTurn !== null) {
-      return this.enqueue(text, owner, 'single-writer', options.images, options.timeoutMs);
+      await this.enqueue(text, owner, 'single-writer', options.images, options.timeoutMs);
+      return;
     }
-    return this.runTurn(text, owner, options.images);
+    await this.runTurn(text, owner, options.images).done;
   }
 
   async followUp(text: string, options: PromptOptions = {}): Promise<void> {
@@ -943,9 +984,10 @@ export class PiAgentHandle implements AgentHandle {
       return;
     }
     if (this.liveTurn !== null) {
-      return this.enqueue(text, owner, 'single-writer', options.images, options.timeoutMs);
+      await this.enqueue(text, owner, 'single-writer', options.images, options.timeoutMs);
+      return;
     }
-    return this.runTurn(text, owner, options.images);
+    await this.runTurn(text, owner, options.images).done;
   }
 
   getContextUsage = (): ContextUsage | null => {
@@ -1002,7 +1044,10 @@ export class PiAgentHandle implements AgentHandle {
     ) {
       throw new Error('agent session is busy; compaction requires an idle session');
     }
-    const id = this.id;
+    // The NATIVE session identity captured at construction, never the
+    // product-owned handle id (issue #161) and never a fresh read that a
+    // swapped/foreign session could satisfy.
+    const id = this.nativeSessionId;
     const file = this.sessionFile;
     let resolveTerminal!: (
       event: Extract<RuntimeEvent, { type: 'compaction_end' }>,
@@ -1149,14 +1194,14 @@ export class PiAgentHandle implements AgentHandle {
     reason: 'single-writer' | 'steer-unable',
     images?: PromptOptions['images'],
     timeoutMs?: number,
-  ): Promise<void> {
+  ): Promise<PromptTurnVerdict> {
     this.emit({ type: 'queued', reason, owner });
     this.log('info', 'message queued (single-writer)', {
       role: this.role,
       session: this.id,
       owner,
     });
-    return new Promise<void>((resolve, reject) => {
+    return new Promise<PromptTurnVerdict>((resolve, reject) => {
       const item: QueuedMessage = {
         text,
         owner,
@@ -1182,13 +1227,19 @@ export class PiAgentHandle implements AgentHandle {
     });
   }
 
-  private runTurn(text: string, owner: string, images?: PromptOptions['images']): Promise<void> {
+  private runTurn(
+    text: string,
+    owner: string,
+    images?: PromptOptions['images'],
+  ): { readonly done: Promise<void>; readonly verdict: () => PromptTurnVerdict } {
     this.liveOwner = owner;
     this.livePromptText = text;
     this.livePromptImages = images;
+    this.liveTurnStop = { stopReason: null, error: null };
     const promptOptions: Record<string, unknown> = {};
     const mapped = mapImages(images);
     if (mapped !== undefined) promptOptions['images'] = mapped;
+    let captured: PromptTurnVerdict = { ok: true, error: null };
     const turn = this.session
       .prompt(text, promptOptions)
       .catch((error: unknown) => {
@@ -1215,6 +1266,31 @@ export class PiAgentHandle implements AgentHandle {
       })
       .finally(() => {
         if (this.liveTurn === turn) {
+          // Capture THIS turn's terminal evidence BEFORE `drain()` can start
+          // a queued successor: the successor's state must never be read as
+          // this turn's outcome (r5 blocker 1). A resolved prompt is not a
+          // successful turn: only the turn's own LAST assistant message with
+          // `stopReason: 'stop'` is positive completion proof. An in-band
+          // error, an abort/disposal, or any other stop reason (#160) is a
+          // failed/unknown terminal outcome and must never mint delivery.
+          const terminal = this.liveTurnStop;
+          this.liveTurnStop = null;
+          captured =
+            this.state === 'error'
+              ? { ok: false, error: this.stateError ?? terminal?.error ?? 'runtime settled the turn with an in-band error' }
+              : terminal?.stopReason === 'stop'
+                ? { ok: true, error: null }
+                : {
+                    ok: false,
+                    error:
+                      `turn settled without a successful completion (` +
+                      (terminal?.stopReason == null
+                        ? this.disposed
+                          ? 'session disposed before a terminal assistant message'
+                          : 'no terminal assistant message'
+                        : `stopReason: ${terminal.stopReason}`) +
+                      (terminal?.error == null ? ')' : `: ${terminal.error})`),
+                  };
           this.liveTurn = null;
           this.liveOwner = null;
           this.livePromptText = null;
@@ -1224,7 +1300,7 @@ export class PiAgentHandle implements AgentHandle {
         }
       });
     this.liveTurn = turn;
-    return turn;
+    return { done: turn, verdict: () => captured };
   }
 
   private async drain(): Promise<void> {
@@ -1232,8 +1308,9 @@ export class PiAgentHandle implements AgentHandle {
       const next = this.queue.shift()!;
       if (next.timer !== null) clearTimeout(next.timer);
       try {
-        await this.runTurn(next.text, next.owner, next.images);
-        next.resolve();
+        const turn = this.runTurn(next.text, next.owner, next.images);
+        await turn.done;
+        next.resolve(turn.verdict());
       } catch (error) {
         next.reject(error instanceof Error ? error : new Error(String(error)));
       }
@@ -1322,36 +1399,46 @@ export class PiAgentHandle implements AgentHandle {
         }
         return;
       case 'message_end': {
-        // pi reports in-band model errors as an assistant message with
-        // stopReason 'error' — surface it as a runtime error event.
         const msg = e['message'] as Record<string, unknown> | undefined;
-        if (msg !== undefined && msg['role'] === 'assistant' && msg['stopReason'] === 'error') {
-          const detail = String(msg['errorMessage'] ?? 'model error');
-          // The provider terminal message IS the typed origin: its
-          // machine-composed line was built by the transport from the real
-          // response (pi-ai formatProviderError). Strict parse only.
-          const typed = typedFromProviderMessageLine(
-            detail,
-            typeof msg['provider'] === 'string' ? msg['provider'] : this.session.model?.provider ?? '',
-            typeof msg['model'] === 'string' ? msg['model'] : this.session.model?.id ?? '',
-          );
-          this.emit({
-            type: 'error',
-            error: detail,
-            fatal: false,
-            ...(typeof msg['provider'] === 'string'
-              ? { provider: msg['provider'] }
-              : this.session.model !== undefined
-                ? { provider: this.session.model.provider }
-                : {}),
-            ...(typeof msg['model'] === 'string'
-              ? { model: msg['model'] }
-              : this.session.model !== undefined
-                ? { model: this.session.model.id }
-                : {}),
-            ...(typed !== null ? { typed } : {}),
-          });
-          this.setState('error', detail);
+        if (msg !== undefined && msg['role'] === 'assistant') {
+          // Per-turn terminal evidence for the live prompt: every assistant
+          // message updates it; the LAST one decides success vs failure.
+          if (this.liveTurnStop !== null) {
+            this.liveTurnStop = {
+              stopReason: typeof msg['stopReason'] === 'string' ? msg['stopReason'] : null,
+              error: typeof msg['errorMessage'] === 'string' ? msg['errorMessage'] : null,
+            };
+          }
+          // pi reports in-band model errors as an assistant message with
+          // stopReason 'error' — surface it as a runtime error event.
+          if (msg['stopReason'] === 'error') {
+            const detail = String(msg['errorMessage'] ?? 'model error');
+            // The provider terminal message IS the typed origin: its
+            // machine-composed line was built by the transport from the real
+            // response (pi-ai formatProviderError). Strict parse only.
+            const typed = typedFromProviderMessageLine(
+              detail,
+              typeof msg['provider'] === 'string' ? msg['provider'] : this.session.model?.provider ?? '',
+              typeof msg['model'] === 'string' ? msg['model'] : this.session.model?.id ?? '',
+            );
+            this.emit({
+              type: 'error',
+              error: detail,
+              fatal: false,
+              ...(typeof msg['provider'] === 'string'
+                ? { provider: msg['provider'] }
+                : this.session.model !== undefined
+                  ? { provider: this.session.model.provider }
+                  : {}),
+              ...(typeof msg['model'] === 'string'
+                ? { model: msg['model'] }
+                : this.session.model !== undefined
+                  ? { model: this.session.model.id }
+                  : {}),
+              ...(typed !== null ? { typed } : {}),
+            });
+            this.setState('error', detail);
+          }
         }
         return;
       }
