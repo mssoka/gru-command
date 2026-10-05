@@ -142,8 +142,11 @@ provider-recovery-r4-baseline = 'root="$PWD"; dA=$(mktemp -d "${TMPDIR:-/tmp}/gr
 native-compaction-wait-baseline = 'set -e; base=2aa836abe262759c651683deb40d05f02c9ede86; headrev=ab11bb327c4ba1ab3e3e3a9cc9e6b3bcaf4a22b3; root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-native-compaction-wait.XXXXXX"); git archive "$base" | tar -x -C "$d"; git show "$headrev":test/supervisor.test.ts > "$d/test/supervisor.test.ts"; git show "$headrev":test/suite-shape.test.ts > "$d/test/suite-shape.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "%s base=%s head=%s\n" "$d" "$base" "$headrev" > "$prep/native-compaction-wait-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/supervisor.test.ts test/suite-shape.test.ts'
 # wizard-bmad-retry builds first so its CLI/pty legs execute the reviewed
 # source's dist, then applies the repo-approved vitest RPC pretest patch
-# (tools/patch-vitest-rpc-timeout.mjs) that `npm test` also runs.
-wizard-bmad-retry = "npm run build && node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/bmad-onboarding.test.ts test/wizard-interactive.test.ts test/wizard.test.ts test/suite-shape.test.ts"
+# (tools/patch-vitest-rpc-timeout.mjs) that `npm test` also runs. The three
+# wizard suites are heavy-classified (test/helpers/test-budgets.ts) and run
+# through the heavy config exactly as `npm test` phases them; suite-shape is
+# fast-phase and runs under the default config.
+wizard-bmad-retry = "npm run build && node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/bmad-onboarding.test.ts test/wizard-interactive.test.ts test/wizard.test.ts && npx vitest run test/suite-shape.test.ts"
 
 # Feature-specific BASELINE for the gh-32 lane (scheduler-only; never part
 # of `npm test`): the FINAL test generation — the whole-900 review repair
