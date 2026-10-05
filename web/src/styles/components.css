@@ -2284,6 +2284,16 @@ body {
   text-align: left;
   font-size: 12px;
   min-width: 0;
+  /* div with role=button: inherit the page font/color and fill the rail. */
+  width: 100%;
+  box-sizing: border-box;
+  font-family: inherit;
+  color: inherit;
+}
+
+.board-agent:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 1px;
 }
 
 .board-agent:hover {
@@ -2373,6 +2383,44 @@ body {
   flex: none;
 }
 
+/* Issue #161: parentage marks (top-level minion vs child worker), the
+ * parent-navigation link, and a parent's family counters. */
+.board-agent__parentage {
+  flex: none;
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0 5px;
+  color: var(--muted);
+}
+
+.board-agent__parentage--child {
+  color: var(--band-working-ink, var(--muted));
+  border-color: currentcolor;
+}
+
+.board-agent__parent-link {
+  flex: none;
+  cursor: pointer;
+  text-decoration: underline dotted;
+  color: var(--muted);
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  letter-spacing: inherit;
+}
+
+.board-agent__parent-link:hover {
+  color: var(--ink);
+}
+
+.board-agent__child-counts {
+  flex: none;
+  color: var(--muted);
+}
+
 .board-agent__supervision--alert {
   color: var(--band-needs-you-ink);
   font-weight: 800;
@@ -2380,6 +2428,32 @@ body {
 
 .board-agent__supervision--warn {
   color: var(--muted);
+}
+
+/* Issue #171 runtime-ownership marks: ambiguous (unverified) ownership,
+ * verified historical sessions, and duplicate singleton owners. */
+.board-agent__runtime {
+  flex: none;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.board-agent__runtime--unknown {
+  color: var(--muted);
+  font-weight: 800;
+}
+
+.board-agent__runtime--historical {
+  color: var(--muted);
+}
+
+.board-agent__runtime--alert {
+  color: var(--band-needs-you-ink);
+  font-weight: 800;
+}
+
+.board-agent--historical {
+  opacity: 0.72;
 }
 
 .board-agent__state {
@@ -2539,6 +2613,23 @@ body {
 .board-notification--error {
   background: var(--alert);
   color: var(--on-state);
+}
+
+/* A closed receipt is record-only history, never live work: keep it
+ * readable but de-emphasized beside live machine rows. The dashed border
+ * alone marks it — row-level opacity was removed because dimming
+ * composited the title/meta below WCAG AA (the palette-contrast suite
+ * now pins the receipt composite; tracked-review A2). */
+.board-notification--receipt {
+  border-style: dashed;
+}
+
+/* A receipt keeps the error row's readable ink for its meta line: the
+ * rail's faint default on the alert surface composes below the AA floor
+ * the palette suite enforces. */
+.board-notification--error.board-notification--receipt .board-notification__meta {
+  color: var(--on-state);
+  opacity: 1;
 }
 
 .board-notification__title {

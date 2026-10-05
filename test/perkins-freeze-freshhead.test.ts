@@ -52,6 +52,16 @@ class LaneWorktreePort implements WorktreePort {
     return this.delegate.createReviewWorktree(input);
   }
 
+  async createChildWorktree(input: {
+    repoPath: string;
+    jobId: string;
+    childId: string;
+    parentPath: string;
+    authority: 'read-only' | 'writer';
+  }): Promise<WorktreeLane> {
+    return this.delegate.createChildWorktree(input);
+  }
+
   getWorktree(id: string): WorktreeLane | null {
     const lane = this.delegate.getWorktree(id);
     return lane === null ? null : this.withLanePath(lane);

@@ -109,6 +109,13 @@ export function isJobTerminal(status: JobStatus): boolean {
   return JOB_TERMINAL.has(status);
 }
 
+/** The terminal statuses as a list — the one source every SQL IN-list (and
+ * any future consumer) derives from, so the terminal set cannot drift
+ * between the predicate and a hand-written literal. */
+export const TERMINAL_JOB_STATUSES: readonly JobStatus[] = JOB_STATUSES.filter((status) =>
+  JOB_TERMINAL.has(status),
+);
+
 export function isRoundTerminal(status: RoundStatus): boolean {
   return ROUND_TERMINAL.has(status);
 }

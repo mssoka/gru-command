@@ -58,7 +58,9 @@ integrated. Other users can install it on their laptops from GitHub.
     minions (workers), Perkins (hybrid review lead + tracked lens children),
     Bob (memory consolidation) — defined by prompt + skill set + permissions,
     runtime-agnostic. A Perkins round freezes exact inputs, then one lead owns
-    complete seven-lens coverage (six only for explicit no-spec), independent
+    the complete whole-change review — a nine-lens specialist catalog is
+    AVAILABLE (eight only for explicit no-spec) and every lens is optional,
+    lead-selected work — plus independent
     verification, reconciliation, prior-finding audit, canonical blocker
     arithmetic, and report authorship through narrow host tools. The host
     freezes identity, disables ambient resources, tracks/disposes children,

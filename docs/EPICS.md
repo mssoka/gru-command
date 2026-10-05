@@ -92,7 +92,10 @@ gate fails-before-fix where applicable.
    (directive → re-brief fresh minion → escalate; no round cap while
    blockers evolve) through the authenticated `/api/silas/*` surface.
    Ops skills ship in-repo (`resources/silas-skills/`) and reach the
-   session via wake-prompt injection.
+   session via wake-prompt injection. Worker tasks ship with no tool-call
+   budget (issue #158): no numeric total or per-phase call ceiling binds
+   a lane, a call count is telemetry only, and the shipped minion/Silas
+   instructions plus every assembled worker prompt carry that contract.
 
 ## E9 — Installer, wizard & docs
 1. GitHub one-line installer + setup wizard (runtimes detect, repos

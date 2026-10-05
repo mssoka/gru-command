@@ -188,10 +188,18 @@ describe('wake-on-alert real service (offline)', () => {
     // notification content — read from the CLI double's invocation log.
     await service.stop();
     service = null;
-    const invocations = readFileSync(logFile, 'utf-8')
-      .trim()
-      .split('\n')
-      .map((line) => JSON.parse(line) as { prompt?: string });
+    const invocations: { prompt?: string }[] = [];
+    for (const raw of readFileSync(logFile, 'utf-8').split('\n')) {
+      const line = raw.trim();
+      if (line === '') continue;
+      try {
+        invocations.push(JSON.parse(line) as { prompt?: string });
+      } catch {
+        // Tolerate a partially appended trailing record (same flake class
+        // as the claude-adapter double reader).
+        break;
+      }
+    }
     const wakePrompt = invocations.find((entry) =>
       (entry.prompt ?? '').includes('[gru awareness · service context'),
     );

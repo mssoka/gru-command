@@ -14,7 +14,8 @@ whole arc live.
                       │                           briefing turn …
                       │                           deliverable + PR link ◄─┤
                       │                                                   one lead
-                      │                                                   7/6 lens types × chunks
+                      │                                                   9/8 whole-change lenses
+                      │                                                   (lead-selected batches)
                       │                                                   verify + audit
                       │                                                   report → PR comment
  release ◄─────────── sweep (preserve-first)                            (chips live on the board)
@@ -58,15 +59,75 @@ groups by repo; the phone is board-first.
 
 ## 4. Review waves (Perkins)
 
-`POST /api/dispatch/review` `{job_id, target_ref?, no_spec?}` freezes one
-exact target/base/diff/spec set in a detached review worktree. The arm
+`POST /api/dispatch/review` `{job_id, target_ref?, no_spec?, evidence?}`
+freezes one exact target/base/diff/spec set in a detached review worktree. An
+arm may carry private evidence uploads; the frozen round binds the effective
+amended acceptance and the exact-target CI receipt, and the amendment/contract
+endpoints (`POST /api/dispatch/amendment`,
+`GET /api/dispatch/jobs/<id>/contract`) manage that acceptance. See
+[REVIEW-INPUTS.md](./REVIEW-INPUTS.md); a private-evidence arm is refused on
+the bmad-review fallback route rather than silently reviewed without it. The arm
 first passes the **branch-idle guard**: while any lane is actively
-working/pushing the target branch (`dispatched`/`working` with no settled
-delivery for its current attempt), the API answers `409 branch_busy` with
+working/pushing the target branch (`dispatched`/`working`/`in-review`
+with no settled delivery for its current attempt — a PR link flips a lane
+to `in-review` mid-attempt, so that status alone is not proof of
+settlement; a `delivered → in-review` flip starts no attempt), the API
+answers `409 branch_busy` with
 `blockers: [{job_id, status, branch}]` and the same check re-runs
 immediately before the freeze, so a lane re-opened mid-setup is refused
-the same way. The arm passes once the lane delivers. `force: true` is the
-human override; a forced round is tagged in its frozen manifest
+the same way. The guard compares a lane's RECORDED branch (or the
+`gru/<jobId>` branch a `dispatched` job is about to create). A lane that
+checks out its own branch but pushes a FOREIGN PR branch (a rebase/
+salvage lane) is invisible to that comparison — no lane declares a push
+target yet (issue #121 records the evidence and the declared-push-target
+extension). Silas's standing freeze-r1 rule — never arm while a known
+rebase/force-push lane is active on the target — is the control for that
+class. The same recheck runs after a failed pre-flight and before
+the bmad-review fallback gate admits — a re-brief or lane re-open landing
+during the awaited pre-flight refuses the fallback arm (409, or a queued
+replay re-queue) instead of starting a fallback reviewer; the fallback
+recheck enters through the same `arm`-phase guard, so a forced fallback
+admission carries two `arm`-phase `branch-idle.forced` records where the
+native route carries `arm` + `freeze`. A running fallback gate also
+re-proves its lane, marker and replay-authorization facts at each round
+intake, after the default reviewer's worker admission and asynchronous
+spawn, and after the reviewer returns. It compares the current attempt,
+delivery and branch owners to the audited admission snapshot: a new working
+attempt, newly busy foreign lane, or replaced checkout cannot approve the
+old diff. `force` in the fallback covers only blockers present at the
+original arm, not a new request during preflight or an active reviewer.
+It also compares the durable re-brief settlement watermark from admission
+and each round's diff intake: a request that begins and settles while the
+reviewer runs cannot approve the old diff. Those boundary re-proofs
+emit no branch-idle audit rows: at admission a replay whose job is
+blocked/parked is HELD (`job.review-handoff-held` plus escalation,
+requiring a new validated request), while after admission the gate stops
+as `job.fallback-review` phase `aborted` with a free-text reason and no
+held identity. Terminal (`merged`/`done`) jobs take the canonical
+terminal refusal before any busy check — a stale marker never answers
+`branch_busy` and never resurrects the job. The reviewed job's OWN
+unresolved request fences the review regardless of an explicit
+`target_ref` naming another lane; unrelated foreign lanes keep their own
+branch-matched busy semantics. A `blocked` gate terminal reports the
+failing round in `iterations`; an `aborted` terminal reports only
+completed rounds (the aborted event's `iteration` names the round not
+taken). The arm passes
+only when the target work is genuinely
+settled AND no re-brief request is unresolved — a delivery alone does not
+release a fenced lane. A lane with an unresolved re-brief request counts
+busy the same way: the durable pending markers written before a re-brief
+worker spawns (cleared only when the request genuinely settles, via
+finalization or boot recovery) fence the target regardless of an older
+delivery or a status flip — the fence can coexist with a delivered or
+in-review status — and the Silas digest rechecks every proposed review
+at final publication, after any async blocker-history work. A live re-brief
+finalizer matches the exact admitted marker IDs as well as any phase ID:
+ordinary requests have no phase ID, so an older turn cannot consume a
+newer request's markers. Settlement publishes `silas.rebrief-settled`
+after marker retirement, so a queued handoff that re-queued on the
+earlier delivery can retry without waiting for another sweep. `force: true` is the owner's explicit override —
+never an automatic operations action; a forced round is tagged in its
+frozen manifest
 (`branchIdle`) and the event log (`branch-idle.forced`), refusals land as
 `branch-idle.refused`, and a Silas auto-arm deferral lands as
 `silas.review-deferred` (retry on the next sweep). For a job
@@ -78,17 +139,26 @@ pull/merge-request head. A resolved ref that fetches nothing, a moved
 head, or an unverifiable host answer aborts the request before a round or
 lens exists (an action-required escalation names the resolved mismatch).
 A round has
-one real Perkins lead and exactly seven required lens types per frozen diff
-chunk (blind, edge, acceptance, security, architecture, codebase, tests), or
-six types per chunk only when `no_spec: true` explicitly removes acceptance.
-Each lens/chunk attempt is a distinct tracked child; malformed attempts are
-retryable up to the policy limit, so the total child-session count may exceed
-the required coverage cardinality.
+one real Perkins lead reviewing the complete frozen change. The pinned
+policy's catalog makes nine whole-change specialist lenses available (blind,
+edge, acceptance, security, architecture, codebase, tests, performance,
+operations) — eight when `no_spec: true` explicitly removes the
+spec-dependent acceptance lens. The lead SELECTS which specialists help the
+change: availability is never a mandatory coverage gate, and a subset (or
+none) is a valid review. Specialists run in explicit tool-call batches
+bounded by the round's admitted resident wave and provider pacing; the lead
+splits oversized work across calls, and any number of batches completes
+inside the SAME round, frozen target and lead. A round is bounded to 16 real
+specialist runs (retries included), two attempts per lens, and two real
+terminal submissions (free preflight is distinct); failed attempts count and
+stay recorded, and a completed lens cannot be rerun for a second opinion.
+Lenses the lead did not use are reported as `not used`, never as coverage.
 
-- The lead receives only six product-native tools: read a frozen chunk,
-  run tracked lens children, store bounded notes, record a candidate
-  decision, preflight a candidate terminal submission, and submit terminal
-  proof. It owns delegation,
+- The lead receives only its declared product-native tools: four
+  whole-change orchestration tools (run tracked specialist children, store
+  bounded notes, preflight a candidate terminal submission, submit terminal
+  proof) plus the bounded prior-revision reader on a re-review. It reads the
+  complete frozen change with its confined read tools and owns delegation,
   investigation, verification, deduplication, prior audit, verdict
   calculation, and report authorship. Recording runs the exact terminal
   decision validator at store time; preflight uses the exact terminal
@@ -104,9 +174,9 @@ the required coverage cardinality.
   may declare product-native tools, and the ADAPTER exposes exactly those
   declared tools on every harness: pi injects them in-process, claude-code
   attaches a session-scoped, product-owned MCP bridge. The lead declares
-  its six orchestration tools; a lens child that declares native tools
-  gets only its own (the `perkins_submit_findings` channel) and never sees
-  the lead's six. That seam is harness-independent by design — review
+  its whole-change orchestration tools; a lens child that declares native
+  tools gets only its own (the `perkins_submit_findings` channel) and never
+  sees the lead's. That seam is harness-independent by design — review
   isolation and tool exposure live in the adapter implementation, never in
   caller branches on harness.
 - Child findings are evidence-paired at envelope construction: a finding that
@@ -124,17 +194,24 @@ the required coverage cardinality.
   and child review behavior; interpolated repository/spec/convention text is
   untrusted evidence, never instruction. The host bounds attempts,
   concurrency, candidate/report bytes, and wall time; records every child;
-  verifies exact coverage, candidate ownership,
+  verifies exact run accounting (selected lenses, attempts, round budget),
+  candidate ownership,
   frozen-commit evidence, prior audit, source stability, report contents,
   delivery, and canonical blocker arithmetic. Zero blockers is READY TO
   MERGE, 1–3 is NEEDS CHANGES, and 4+ is MAJOR REWORK NEEDED. Warnings and
   notes never block.
 - A malformed child output consumes one attempt and may be retried within the
-  pinned bound. Any exhausted attempt, cancellation, restart, changed
-  source/checkout, unsupported evidence, invalid audit, missing coverage,
-  or delivery failure durably terminalizes the round as INCOMPLETE. It can
+  pinned bound; a failed or exhausted specialist attempt is recorded
+  lens-failure truth and never terminalizes the round by itself.
+  Cancellation, restart, changed
+  source/checkout, unsupported evidence, invalid audit, or delivery failure
+  durably terminalizes the round as INCOMPLETE. It can
   neither post nor record approval. Startup reconciliation marks interrupted
   rounds INCOMPLETE and releases their owned detached lanes.
+- The base is changed source only when the locally resolved base ref no
+  longer contains the frozen merge-base (rewritten past it) or no longer
+  resolves; nothing is fetched, so a host-side rewrite counts once it is
+  visible locally, and the frozen base stays recorded as provenance.
 - Installed builds load the integrity-pinned policy and Claude MCP server
   relative to the compiled package. Missing, tampered, symlinked, or
   source-fallback resources fail closed.
@@ -156,9 +233,12 @@ route:
    claude-code runtime this is a CLI-availability probe; on pi it checks
    model resolution plus provider auth.
 3. **Code-host integration** — a GitHub (`gh`) or GitLab (`GITLAB_TOKEN`)
-   token valid for the exact repository remote, used for SHA-bound verdict
-   delivery. Only GitHub and GitLab hosts are supported; other origins fail
-   the leg closed (credentials are never sent to unknown hosts).
+   token valid for the exact repository remote: the preflight leg. Verdict
+   delivery rides the `gh` token only when no Perkins App bundle is
+   installed; with a bundle, github.com publication is App-authored (see
+   [PERKINS-APP-PUBLICATION.md](./PERKINS-APP-PUBLICATION.md)). Only GitHub
+   and GitLab hosts are supported; other origins fail the leg closed
+   (credentials are never sent to unknown hosts).
 4. **Review policy enabled** — `[review] enabled = true` in config.
 
 All legs pass → Perkins review (the gate). Any leg fails → the request
@@ -184,8 +264,11 @@ delivery discipline as GitHub (the frozen HEAD is verified before a note is
 posted; a PR's recorded base is refreshed into the delivery record rather
 than gating, since a pinned base is expected to trail a moving main), and
 the GitLab probe and poster resolve their token
-identically (`GITLAB_TOKEN`, falling back to `GL_TOKEN`); GitHub
-authenticates through the `gh` CLI.
+identically (`GITLAB_TOKEN`, falling back to `GL_TOKEN`). GitHub
+**publication** authenticates through the `gh` CLI when no Perkins App
+bundle is installed; with a bundle, github.com publication is App-authored
+while the review preflight still probes remotes through `gh` (see
+[PERKINS-APP-PUBLICATION.md](./PERKINS-APP-PUBLICATION.md)).
 
 Report artifacts persist before delivery, but the local round verdict is
 recorded only after SHA-bound delivery proof succeeds; delivery failure
@@ -212,10 +295,52 @@ verification budget.
   that waits past `lock_wait_timeout_ms` (default 15 min) fails LOUD: the
   lane receives a typed `error` frame and the ledger a
   `verification.lock-timeout` record — nothing hangs silently.
+- **Identical submissions are single-flight, never duplicate producers**
+  (issue #159). Same job + lane + scope + head + command shares ONE run:
+  the duplicate stream gets an `attached` frame naming the run and then
+  receives the same terminal outcome; a restart orphan that already
+  represents the submission answers with a typed `duplicate_in_flight`
+  error instead of a second producer. A completed run, a failed-run
+  repair, or a changed head is never permanently suppressed — a fresh
+  submission runs.
+- **A submission can carry durable identity.** `POST /api/verify` accepts
+  an optional client `request_id` (and `expected_head`; a lane that moved
+  answers 409 `head_changed` before any producer exists). Replaying the
+  same `request_id` attaches to the in-flight run or replays the recorded
+  terminal outcome — a lost response is reconciled, never replayed blind.
+  The run's exact head is re-read at spawn: a lane that moved while the
+  request waited fails as `head_changed` instead of verifying the new
+  revision. `GET /api/verify/status?request_id=…` answers
+  `unknown | accepted | running | completed | admission-failed |
+  interrupted`; only a task confirmed never-started (typed
+  `lock_wait_timeout`, no `started` frame) may be retried under its old
+  identity. Terminal identities append to `<data_dir>/verify/requests.ndjson`,
+  so history eviction and crash/restart never turn a completed or
+  interrupted identity into `unknown`: it reports its terminal state and
+  refuses a rerun — a re-verification mints a NEW request id.
+- **Capture is exclusive and receipted.** The shipped capture helper
+  (`dist/verify/capture-cli.js`, named in Silas's wake prompt) opens a
+  unique `wx` sink BEFORE the POST, streams every NDJSON frame to EOF,
+  and writes `<sink>.receipt.json` binding run id, true head/dirty state,
+  exit/outcome and output length/hash. A stream without a valid terminal
+  completion, with torn/foreign records, or whose single run identity does
+  not hold across the whole stream is `unknown` and is never promoted to
+  success; a replayed terminal receipt is marked `reconciled` and is an
+  honest failure (the outcome is known, the original full capture is not
+  reconstructable, and a rerun to recover logs is refused). Owned helpers are withdrawn only with identity validation
+  (pid + start time + command/cwd); malformed pid records, crashes and
+  stale owners are cleared without touching unrelated processes, and
+  sinks/receipts are preserved.
 - **One worker budget across runs.** Total test workers stay within
   `[verify] worker_budget` (default: CPU cores − 2), enforced by the run
   wrapper through the vitest pool knobs and `GRU_VERIFY_*` variables for
   other runners.
+- **Project harness budgets compose with the run budget.** A repo may
+  classify process-heavy integration files with their own finite ceilings
+  and a smaller worker cap (gru-command: 120s and two workers, see
+  `test/helpers/test-budgets.ts`). The classified phase runs sequentially
+  after the fast phase inside the declared `full` command, so the two
+  phases never overlap and a smaller scheduler pin still wins.
 - **Holders are durable and self-healing.** Active holders persist at
   `<data_dir>/verify/scheduler.json` with the runner pid; a persisted
   holder whose pid is dead — or was never recorded — is released
@@ -258,6 +383,103 @@ handoff receipt (202) immediately. The branch-idle guard still prevents
 freezing until that minion's delivery event; a queued round then appears in
 the ledger as `round.residency-queued` until its lead/child pair is admitted.
 Queued waits consume no reviewer turn or spawn timeout.
+
+## 4e. Tracked child workers (sub-minions, issue #161)
+
+A parent minion can commission one independent child worker through GC's
+own authenticated control plane: `POST /api/dispatch/child`
+`{parent_agent_id, job_id, purpose, authority, task, idempotency_key,
+label?}`. GC — not a provider-native delegation extension — owns
+admission, identity, lifecycle, cancellation and the result record.
+
+**GC-mediated parent tools.** A dispatched top-level minion receives
+three product-native tools bound to its own agent id by closure —
+`request_child_worker`, `list_child_workers` and `cancel_child_worker`.
+They execute INSIDE the GC service process, so no bearer secret is
+written into session space and a sibling worker cannot impersonate the
+parent by reading a file. The HTTP child endpoints remain the operator
+surface (pairing token) and are not the minion-facing path.
+
+Declared capability gap (review round 3): the tools are hosted only on
+runtimes that execute them in the service process (**pi**). A
+claude-code session's tools ride a discoverable same-uid loopback bridge,
+which another worker process could call to impersonate the parent — so
+the claude-code adapter REFUSES non-review product tools loudly, and a
+claude-code minion receives no parent-tool surface (the board, HTTP and
+ledger surfaces remain runtime-agnostic).
+
+- **Parentage is a relationship, not a sixth role.** A child is a
+  minion-role session whose agent row carries `parentage = 'child'` and
+  `parent_agent_id`. Only top-level minions may commission workers
+  (nested delegation is refused), and one parent admits at most four
+  logical children (`MAX_CHILDREN_PER_PARENT`).
+- **Idempotent admission.** The child's admission row AND its agent row
+  are written before any spawn (one product-owned id for the admission
+  record, the agent row and the lane), so a queued child is visible on
+  the board with parent navigation immediately. A duplicate or
+  lost-response retry with the same `(parent_agent_id,
+  idempotency_key)` returns the existing child and creates no second
+  worker; the same key with a different payload is a 409 conflict.
+  Refusals name the failed precondition: unknown parent, parent not
+  permitted, nested delegation, job mismatch, expired/terminal job,
+  disposed parent, missing parent lane, fanout cap, budget/capacity
+  (the shared resident pool is full and no ELIGIBLE idle minion is
+  reclaimable by the budget's own predicate — a refusal, never an
+  unsatisfiable wait that would deadlock parents),
+  invalid task or authority (`{error, detail}`).
+- **Bounded authority and isolation.** `authority: "read-only"` spawns
+  the child with the read-only tool set (`read`, `grep`, `find`, `ls`) in
+  a detached lane based at the parent lane's HEAD; `authority: "writer"`
+  gets the minion tool set and its own branch
+  `gru/<jobId>-child-<childId>`. A child never mutates the parent's
+  working tree implicitly and never inherits more than its own declared
+  authority.
+- **Lifecycle and result.** The child record moves
+  `queued → admitted → active → done | error | cancelled`. Child
+  admission waits in the SAME FIFO resident-worker admission as any other
+  worker session (an atomic budget RESERVATION is taken when the run
+  starts, so a free-seat probe race cannot admit an unsatisfiable
+  queue); the provider pacing pool is taken only AFTER the resident
+  permit (so a capacity-blocked child never holds a turn slot), and the
+  child turn consumes that shared pool. `active` means the briefing is
+  about to be delivered — a pacing wait still reads queued/admitted.
+  `done` is a successful terminal outcome recorded from the transport's
+  own terminal evidence INCLUDING any automatic rate-limit retry
+  settlement, AND requires the child's own FINAL report (the turn's last
+  transcript message) in `result_summary`, with the session file as
+  `result_ref`; a clean turn with no collectable final report is a named
+  `error`, never a fully reported `done`. Cancellation awaits handle
+  disposal and records `cancelled` only when cessation is proven; an
+  unproven stop stays NON-TERMINAL with durable `child.stop-unproven`
+  debt (and never releases the lane). `GET
+  /api/dispatch/children/:id`, `GET /api/dispatch/jobs/:jobId/children`
+  (operator) and `GET /api/dispatch/agents/:agentId/children` (the
+  parent's own scope) are the discovery paths; `POST
+  /api/dispatch/children/:id/cancel` stops a live child (terminal records
+  are immutable).
+- **Counters.** The board snapshot carries `children {queued, active,
+  finished, lifetimeCreations}`; `lifetimeCreations` counts ROWS in
+  `child_workers` (one per logical creation), so retries, session resumes
+  and service restarts never double-count. See [LEDGER.md](./LEDGER.md)
+  for the full semantics.
+- **Ownership and recovery.** Child lanes are registered worktree lanes
+  (kind `child`) and sweep through the same release path; read-only lanes
+  are swept automatically once their run is terminal (including on boot
+  reconciliation after a crash), writer lanes keep their branch for
+  inspection, and a release refuses (409 `active_child_workers`)
+  while a non-terminal child still owns one — whichever selector the
+  caller used (job id, job lane, or the child lane itself). Parent/job
+  eligibility is revalidated immediately before the lane, after the
+  lane, after resident admission, after the pacing wait, and on boot;
+  supervision-stopped/errored parents fence the child instead of
+  starting a writer late. At boot, a child that never bound a session is
+  re-run under the same identity (only when still eligible); one that
+  had a live session is terminally failed with the honest reason (its
+  transcript stays readable) — never a fabricated `done`. A supervision
+  restart is REFUSED for a tracked child: a child is a single-run
+  logical worker, and a replacement session would duplicate its result
+  and put two writers in one lane; the parent requests a new child
+  instead (the breaker/stop machinery still applies in full).
 
 ## 5. Release (the sweep)
 
@@ -351,9 +573,25 @@ the judgment; the dispatch surface is the mechanical hand.
   round's reviewed target (first review AND re-review after a fix round);
   or a proven `service_restart` abort on the unchanged delivered head,
   once per source round under `clean-abort-service-restart`. Other aborts
-  and unchanged heads warrant no round. A review already REQUESTED for
-  the current state retires the row — including the bmad-review fallback
-  route, which creates no round and owns its own fix loop. NEEDS CHANGES
+  and unchanged heads warrant no round. The re-arm is bound to the proved
+  delivered head: an explicit `target_ref` must name that sha and an
+  omitted one freezes it — a moved live PR head is never substituted — and
+  the freeze boundary re-proves the delivered head is still the recorded
+  one: a newer delivery during the awaited pre-flight refuses the stale
+  re-arm (the next sweep offers the changed-head re-review instead). A
+  review already REQUESTED for the current state retires the row —
+  including the bmad-review fallback route, which creates no round and
+  owns its own fix loop; a fallback that never engaged (`unavailable`)
+  retires nothing, so a missing/again-repaired gate leaves the row due. A
+  queued handoff that ends `failed`/`held`/`skipped` without arming a
+  round answers nothing either. The clean-abort row retires only on a
+  state that answered it: an armed Perkins round records the consuming
+  `silas.review-triggered` rule/round receipt (a fallback, queued or
+  unavailable route does not), while any other ACCEPTED review request
+  still withdraws the offer. Failed attempts stay eligible: a 409
+  deferral and a fallback that never engaged (`unavailable`) or ended
+  `blocked`/`aborted` answer nothing, so the same abort reappears for the
+  next sweep. NEEDS CHANGES
   verdicts awaiting follow-through, with per-blocker recurrence analysis;
   working lanes whose minion has been silent past `stall_threshold_ms`;
   plus recent minion errors for context.
@@ -385,7 +623,19 @@ the judgment; the dispatch surface is the mechanical hand.
   re-dispatches a fresh worker on the same lane) and records the missing
   events when that turn settles; a failed recovery escalates
   action-required and keeps the markers for the next boot, so the lane
-  can never stall silently on a lost turn.
+  can never stall silently on a lost turn. A leftover marker whose job
+  has since reached terminal (`merged`/`done`) before the request was
+  honored cannot be served: the boot scan — or a settling turn or
+  re-dispatch boundary that meets the terminal job — retires it
+  administratively (the identity-checked deletion and one
+  `silas.rebrief-retired` audit commit together, with no spawn and no
+  escalation); spent markers (both guarded events already landed) still
+  clear as a completion, with no retirement audit. A malformed pair
+  (missing kind or mismatched phase id, payload hash, or watermark) is
+  instead retained and escalated for repair, even on a terminal job; it
+  cannot be treated as one request or retired. The boot summary
+  counts `examined` in markers but `completed`/`redispatched`/`retired`
+  in jobs, so one retired pair reads `examined: 2 … retired: 1` by design.
 - **Authority boundaries are unchanged** (`roles/silas.md`): dispatch,
   track, close; never product code; never merge; preserve before remove;
   escalate with pointers. Silas acts only through the authenticated ops
@@ -473,7 +723,7 @@ next user-directed context block:
 
 | routing | meaning | surface |
 |---|---|---|
-| `action-required` | machine attention: Gru resolves/acts in-turn | NEEDS GRU queue; wakes Gru; never rings the owner bell |
+| `action-required` | machine attention: Gru resolves/acts in-turn | NEEDS GRU queue (live rows only; terminal-job rows are closed receipts under FEED); wakes Gru; never rings the owner bell |
 | `needs-owner` | owner-only decisions (merges outside this repo, budget, destructive ops) and anything Gru escalates | FOR YOU band + owner bell + morning digest |
 | `fyi` | standing feed | board feed only |
 
@@ -512,8 +762,10 @@ known failure classes, sweep acks under recorded rules. Gru keeps the
 judgments: rulings, merges, and novel failures. One standing rule from the
 2026-09-23 freeze: never auto-arm a review round on a branch while a
 rebase/force-push lane is active on the same target (the round races the
-push and dies obsolete); arm after the lane delivery settles. Service
-restarts remain manual until self-roll-34 lands.
+push and dies obsolete); arm only after the lane genuinely settles — the
+attempt delivered AND no unresolved re-brief request standing (marker/
+control settlement, not delivery alone; see the branch-idle guard
+section). Service restarts remain manual until self-roll-34 lands.
 
 ## Bob (periodic memory)
 

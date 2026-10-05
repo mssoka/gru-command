@@ -222,7 +222,7 @@ describe('board rendered regression — concluded jobs and stale review history'
     expect(bandIds('cold')).toEqual(['lane-archive']);
   });
 
-  it('keeps a concluded job in NEEDS YOU when a separate unacked action-required notification exists', () => {
+  it('renders a concluded job’s leftover machine row as a closed receipt — never live NEEDS GRU attention', () => {
     const view = new BoardView(() => {});
     view.render(
       snapshot({
@@ -231,8 +231,14 @@ describe('board rendered regression — concluded jobs and stale review history'
         notifications: [notification('n1', { agentId: 'perkins-1', title: 'Owner decision required' })],
       }),
     );
-    expandForGru();
-    expect(bandIds('needs-you')).toEqual(['lane-merged-owed']);
+    // Section-truth ruling (2026-09-29) supersedes the 2026-09-26
+    // current-state clause for terminal jobs: the bound machine row is a
+    // closed receipt — the lane stays settled and the record moves to FEED.
+    expect(bandIds('needs-you')).toEqual([]);
+    expect(bandIds('settled')).toEqual(['lane-merged-owed']);
+    const receipt = document.querySelector<HTMLElement>('.board-notification[data-receipt="closed"]');
+    expect(receipt?.textContent).toContain('Owner decision required');
+    expect(receipt?.textContent).toContain('closed receipt');
   });
 
   it('preserves legitimate NEEDS YOU attention for active work and retained delivered/parked cases', () => {

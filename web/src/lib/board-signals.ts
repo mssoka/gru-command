@@ -5,7 +5,7 @@
  * a DOM: actionable state must survive the collapse.
  */
 
-import { lensChipState, type BoardSnapshot, type JobView, type RoundView } from './board-protocol.js';
+import { isJobConcluded, lensChipState, type BoardSnapshot, type JobView, type RoundView } from './board-protocol.js';
 
 export interface RoundSummary {
   readonly done: number;
@@ -32,7 +32,7 @@ export interface JobSignal {
 export function roundSummary(round: RoundView): RoundSummary {
   // Whole-PR rounds: a lens the lead never used is done as "not used", not
   // as coverage. `used` counts lenses that actually ran; `unused` is shown
-  // separately so a lead-only round never reads as 7/7 specialist coverage.
+  // separately so a lead-only round never reads as full-catalog specialist coverage.
   // `ran` additionally counts lenses that RAN AND FAILED (R9): a specialist
   // that executed and errored is real work and must not vanish from the
   // "lenses ran" count — only error lenses WITHOUT any recorded attempt
@@ -56,17 +56,38 @@ export function roundSummary(round: RoundView): RoundSummary {
   };
 }
 
-/**
- * Unacked action-required notifications attributed to jobs through the
- * rail's agent bindings (notifications carry an agent; agents carry the
- * job). A notification with no agent binding stays global — the tracker
- * chip above the board still counts it.
- */
-export function unackedByJob(snapshot: BoardSnapshot): Map<string, number> {
+/** The attribution index the live/receipt split rides on: notification
+ * agent → job, plus the set of terminal (merged/done) job ids. Unknown
+ * bindings are simply absent — never guessed. */
+function jobAttribution(snapshot: BoardSnapshot): {
+  readonly jobByAgent: ReadonlyMap<string, string>;
+  readonly terminalJobs: ReadonlySet<string>;
+} {
   const jobByAgent = new Map<string, string>();
   for (const agent of snapshot.agents) {
     if (agent.jobId !== null) jobByAgent.set(agent.id, agent.jobId);
   }
+  const terminalJobs = new Set<string>();
+  for (const repo of snapshot.repos) {
+    for (const job of repo.jobs) {
+      if (isJobConcluded(job.status)) terminalJobs.add(job.id);
+    }
+  }
+  return { jobByAgent, terminalJobs };
+}
+
+/**
+ * Unacked action-required notifications attributed to jobs through the
+ * rail's agent bindings (notifications carry an agent; agents carry the
+ * job). A notification with no agent binding stays global — the tracker
+ * chip above the board still counts it. Rows bound to a TERMINAL job
+ * (merged/done) are closed receipts: they never attribute to the banded
+ * view (the bell keeps them as receipts; machine-row lifecycle stays
+ * with dispositions) so a merged lane can never re-enter NEEDS YOU
+ * through a leftover escalation.
+ */
+export function unackedByJob(snapshot: BoardSnapshot): Map<string, number> {
+  const { jobByAgent, terminalJobs } = jobAttribution(snapshot);
   const byJob = new Map<string, number>();
   for (const notification of snapshot.notifications) {
     if (notification.routing !== 'action-required') continue;
@@ -74,10 +95,31 @@ export function unackedByJob(snapshot: BoardSnapshot): Map<string, number> {
     const agentId = notification.agentId;
     if (agentId === null) continue;
     const jobId = jobByAgent.get(agentId);
-    if (jobId === undefined) continue;
+    if (jobId === undefined || terminalJobs.has(jobId)) continue;
     byJob.set(jobId, (byJob.get(jobId) ?? 0) + 1);
   }
   return byJob;
+}
+
+/**
+ * Ids of unresolved action-required rows bound (agent → job) to a
+ * terminal (merged/done) job: closed receipts. The record keeps them;
+ * the bell renders them under FEED as receipts, never as entries in the
+ * live NEEDS GRU queue. Unbound rows and bindings to unknown jobs stay
+ * live — the board never guesses a receipt.
+ */
+export function terminalBoundNotificationIds(snapshot: BoardSnapshot): Set<string> {
+  const { jobByAgent, terminalJobs } = jobAttribution(snapshot);
+  const ids = new Set<string>();
+  for (const notification of snapshot.notifications) {
+    if (notification.routing !== 'action-required') continue;
+    if (notification.ackedAt !== null || notification.resolvedAt !== null) continue;
+    const agentId = notification.agentId;
+    if (agentId === null) continue;
+    const jobId = jobByAgent.get(agentId);
+    if (jobId !== undefined && terminalJobs.has(jobId)) ids.add(notification.id);
+  }
+  return ids;
 }
 
 export function pluralCount(count: number, noun: string): string {
@@ -93,29 +135,33 @@ export function pluralCount(count: number, noun: string): string {
  *
  * Attention is scoped to the round the operator can still act on: a live
  * or pending round's blockers/errored lenses, or an aborted round. A
- * verdict-posted round's verdict already carried its outcome; a merged or
- * finished job must not keep alarming from review history.
+ * verdict-posted round's verdict already carried its outcome.
  *
  * v5: a merged/done card also suppresses REVIEW LIVENESS pills ("round N
  * live/pending") — a concluded job cannot have a review in flight; the
  * pill is stale data, not a live state.
+ *
+ * Section-truth ruling (2026-09-29): a CONCLUDED card is a closed
+ * receipt — it renders NO pills at all. Attention pills explained why a
+ * concluded card landed in NEEDS YOU; terminal jobs can no longer land
+ * there (the banding enforces it), so the pills would be false alarms,
+ * never live queue entries.
  */
 export function jobSignal(job: JobView, unackedActionRequired: number): JobSignal | null {
+  if (isJobConcluded(job.status)) return null;
   const parts: string[] = [];
   const details: string[] = [];
   let attention = false;
 
   if (unackedActionRequired > 0) {
     parts.push(`🛠 ${unackedActionRequired} needs Gru`);
-    details.push(`${pluralCount(unackedActionRequired, 'machine-attention notification')} awaiting Gru disposition`);
+    details.push(`${pluralCount(unackedActionRequired, 'live machine-attention notification')} awaiting Gru disposition`);
     attention = true;
   }
 
   const round = job.rounds.at(-1) ?? null;
-  // A concluded job's review liveness pill is stale (merged/done cards
-  // never claim an in-flight review). Attention pills still explain why a
-  // concluded card landed in NEEDS YOU.
-  const concluded = job.status === 'merged' || job.status === 'done';
+  // A concluded job never reaches here (closed receipts render no pill);
+  // in-flight cards keep their review liveness pills.
   if (round !== null) {
     const summary = roundSummary(round);
     if (round.status === 'aborted') {
@@ -134,17 +180,15 @@ export function jobSignal(job: JobView, unackedActionRequired: number): JobSigna
         attention = true;
       }
     }
-    if (!concluded) {
-      if (round.status === 'live') {
-        // Settled progress: an errored lens will not run again, so it
-        // counts toward the terminal progress, never as outstanding work.
-        const settled = summary.done + summary.failures;
-        parts.push(`◉ round ${round.seq} · live · ${settled}/${summary.total}`);
-        details.push(`round ${round.seq} live — ${settled}/${summary.total} lenses settled`);
-      } else if (round.status === 'pending') {
-        parts.push(`○ round ${round.seq} pending`);
-        details.push(`round ${round.seq} pending`);
-      }
+    if (round.status === 'live') {
+      // Settled progress: an errored lens will not run again, so it
+      // counts toward the terminal progress, never as outstanding work.
+      const settled = summary.done + summary.failures;
+      parts.push(`◉ round ${round.seq} · live · ${settled}/${summary.total}`);
+      details.push(`round ${round.seq} live — ${settled}/${summary.total} lenses settled`);
+    } else if (round.status === 'pending') {
+      parts.push(`○ round ${round.seq} pending`);
+      details.push(`round ${round.seq} pending`);
     }
   }
 

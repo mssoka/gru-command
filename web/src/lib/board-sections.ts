@@ -13,7 +13,7 @@
  * adds the pipeline block's server-evaluated rows.
  */
 
-import { bucketSnapshot, jobRecency, type BandedJob } from './board-bands.js';
+import { bucketSnapshot, jobRecency, type BandedJob, type WorkerStopView } from './board-bands.js';
 import type { BoardSnapshot, PipelineEntryView, PipelineView } from './board-protocol.js';
 import { unackedByJob } from './board-signals.js';
 import { ownerPendingCount } from './owner-band.js';
@@ -76,8 +76,24 @@ export interface BoardSections {
   readonly pipelineAvailable: boolean;
 }
 
-export function boardSections(snapshot: BoardSnapshot, now = Date.now()): BoardSections {
-  const groups = bucketSnapshot(snapshot, { now, unackedByJob: unackedByJob(snapshot) });
+export function boardSections(
+  snapshot: BoardSnapshot,
+  now = Date.now(),
+  opts: {
+    /** Supervision-stopped worker views per job id — a stopped lane is
+     * waiting, never silent-stalled (main's twelve-followthrough A1/E1
+     * truth, preserved through the section presentation). */
+    readonly stoppedWorkers?: ReadonlyMap<string, WorkerStopView>;
+    /** The stall clock's floor per job from LIVE minion workers. */
+    readonly liveWorkerStamps?: ReadonlyMap<string, number>;
+  } = {},
+): BoardSections {
+  const groups = bucketSnapshot(snapshot, {
+    now,
+    unackedByJob: unackedByJob(snapshot),
+    ...(opts.stoppedWorkers !== undefined ? { stoppedWorkers: opts.stoppedWorkers } : {}),
+    ...(opts.liveWorkerStamps !== undefined ? { liveWorkerStamps: opts.liveWorkerStamps } : {}),
+  });
   const byBand = new Map<string, readonly BandedJob[]>();
   for (const group of groups) byBand.set(group.band, group.jobs);
   const pipeline: PipelineView | null = snapshot.pipeline ?? null;

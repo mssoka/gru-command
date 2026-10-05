@@ -386,7 +386,7 @@ describe('pipeline ledger — evaluation, order and projection', () => {
     db.close();
   });
 
-  it('applies migration 14 over an existing v13 ledger without touching old rows', () => {
+  it('applies the pipeline migration over an existing v13 ledger without touching old rows', () => {
     const dir = mkdtempSync(join(tmpdir(), 'gru-pipeline-upgrade-'));
     cleanupDirs.push(dir);
     // A ledger frozen at the pre-pipeline schema (the shape an existing
@@ -396,15 +396,17 @@ describe('pipeline ledger — evaluation, order and projection', () => {
     ledger13.addJob({ id: 'legacy-job', repo: 'demo', title: 'Legacy', briefing: 'old brief' });
     db13.close();
 
-    // Reboot with the full migration set: 14 applies, old rows survive,
-    // and the queue is immediately usable.
-    const db14 = new LedgerDb(dir);
-    const ledger14 = new LedgerApi(db14.handle, { bus: new EventBus({}) });
-    expect(ledger14.getJob('legacy-job')?.briefing).toBe('old brief');
-    enqueue(ledger14, 'pipe-new');
-    expect(ledger14.listPipelineEntries().map((entry) => entry.id)).toEqual(['pipe-new']);
-    const applied = db14.handle.prepare('SELECT id FROM schema_migrations ORDER BY id').all() as { id: number }[];
-    expect(applied.map((row) => row.id)).toEqual(Array.from({ length: 14 }, (_, index) => index + 1));
-    db14.close();
+    // Reboot with the full migration set: 14–16 (main's landed
+    // job-amendments/child-workers migrations) and the renumbered 17
+    // pipeline migration apply, old rows survive, and the queue is
+    // immediately usable.
+    const dbFull = new LedgerDb(dir);
+    const ledgerFull = new LedgerApi(dbFull.handle, { bus: new EventBus({}) });
+    expect(ledgerFull.getJob('legacy-job')?.briefing).toBe('old brief');
+    enqueue(ledgerFull, 'pipe-new');
+    expect(ledgerFull.listPipelineEntries().map((entry) => entry.id)).toEqual(['pipe-new']);
+    const applied = dbFull.handle.prepare('SELECT id FROM schema_migrations ORDER BY id').all() as { id: number }[];
+    expect(applied.map((row) => row.id)).toEqual(Array.from({ length: MIGRATIONS.length }, (_, index) => index + 1));
+    dbFull.close();
   });
 });

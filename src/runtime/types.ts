@@ -141,6 +141,35 @@ export interface SpawnOptions {
    */
   readonly thinkingLevel?: string;
   /**
+   * Product-owned identity for this session (issue #161). The adapter
+   * binds the handle id to this value instead of its own minted session
+   * id, so a tracked child's durable identity exists BEFORE the session
+   * (the admission row, the lane and the agent row share one id) and a
+   * resumed child keeps it across supervision restarts. Omitted = the
+   * adapter's own id. The underlying session file and its lock are
+   * unchanged — only the ledger identity is product-owned.
+   */
+  readonly agentId?: string;
+  /**
+   * Product-owned narrow tools for a NON-review session (issue #161): the
+   * GC-mediated parent-worker control plane. The adapter exposes exactly
+   * these (pi: in-process custom tools; claude-code: the same scoped MCP
+   * bridge review sessions use) and records the wired names on the handle
+   * (`reviewTools`). Identity is bound by the CLOSURE the caller builds —
+   * no bearer secret ever reaches the session's filesystem or context.
+   * Omitted = none.
+   */
+  readonly nativeTools?: readonly NativeAgentTool[];
+  /**
+   * Product-controlled tool subset for this spawn (issue #161): a child
+   * worker's bounded task authority is enforced by the runtime itself —
+   * a `read-only` child is spawned with the read-only role tools, a
+   * `writer` child with the role's full set. Omitted = the role's
+   * declared tool set (a declared override can ONLY narrow it; an
+   * unknown tool name refuses loud).
+   */
+  readonly roleTools?: readonly string[];
+  /**
    * Fresh ambient-free lens child. The adapter replaces the role prompt and
    * tools, disables project/global resources, and forbids resume.
    */
@@ -243,9 +272,12 @@ export interface PendingTurn {
  * transport IN its settle path, before any queued successor turn can start
  * (single-writer queues pump inside the settle path, ahead of the caller's
  * continuation) — so the caller can never mistake a successor's health for
- * this turn's outcome. `ok:false` = the turn ended in an in-band runtime
- * error (Claude `result.isError`, Pi assistant `stopReason: 'error'`),
- * which is NOT a successful delivery merely because the Promise resolved. */
+ * this turn's outcome. `ok:true` requires the turn's own LAST assistant
+ * message to prove a successful completion (`stopReason: 'stop'`);
+ * `ok:false` covers an in-band runtime error (Claude `result.isError`, Pi
+ * assistant `stopReason: 'error'`), an abort/disposal, and any other
+ * failed/unknown terminal outcome — none of which is a successful delivery
+ * merely because the Promise resolved. */
 export interface PromptTurnVerdict {
   readonly ok: boolean;
   readonly error: string | null;

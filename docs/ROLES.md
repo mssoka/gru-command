@@ -38,12 +38,23 @@ specialist delegation, a bounded prior-revision reader, bounded note
 storage, submission preflight, terminal submit, and confined tree reads;
 the complete frozen diff and the exact reviewed snapshot are its review
 unit. Non-blind specialists get confined read/grep/find/list; blind gets no
-tools. Specialists are optional and each reviews the WHOLE change (six
+tools. Specialists are optional and each reviews the WHOLE change (eight
 available only for explicit no-spec); each failed specialist attempt may
 be retried within the policy limit as a new tracked child. No reviewer
 gets bash, edit, write, general tasks, or nested delegation. Minions get
 the full editing set; Gru/Silas/Bob carry operational tool sets. Runtime
 adapters enforce the same policy natively.
+
+Tracked child workers (issue #161) are a RELATIONSHIP over minion-role
+sessions, not a sixth role: a top-level minion can commission a child
+through the GC-mediated `request_child_worker` / `list_child_workers` /
+`cancel_child_worker` tools (bound to its own agent id by closure; the
+HTTP surface stays the operator's), and the child's row carries
+`parentage = 'child'`. The declared `authority` narrows the runtime's own
+tool set (`read-only` children get read/grep/find/ls; `writer` children
+get the minion set and their own branch), children cannot commission
+further children, and a child never exceeds its parent's authority. See
+[FLOW.md §4e](./FLOW.md) for the admission and result surfaces.
 
 ## Skills
 

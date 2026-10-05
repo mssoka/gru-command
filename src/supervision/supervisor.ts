@@ -18,6 +18,7 @@ import {
   type RateLimitBackoffPolicy, type RetrySettlement,
 } from '../runtime/pacing.js';
 import { WorkerDisposalInProgressError } from '../runtime/worker-errors.js';
+import { promptWithTerminalVerdict } from '../runtime/prompt-verdict.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -88,6 +89,14 @@ export interface AgentSupervisionView {
   /** Restarts inside the current window (the breaker ring size). */
   readonly restarts: number;
   readonly breakerOpen: boolean;
+  /** Why the agent is stopped (failure class, crash loop, …) — null when
+   * running. The board renders this on the job lane instead of a bare
+   * "working" so a stopped lane never reads as live work. */
+  readonly stopReason: string | null;
+  /** When the stop opened (ISO; null/absent while running or on
+   * pre-upgrade servers). Stop-recency ordering prefers this over the
+   * last frame. */
+  readonly stoppedAt?: string | null;
   readonly openTurn: boolean;
   /** Control operations are always emitted by the real supervisor. */
   readonly openControl?: boolean;
@@ -134,6 +143,12 @@ interface SupervisedAgent {
   restartRing: number[];
   consecutiveFailures: number;
   breakerOpen: boolean;
+  /** Why the agent is stopped (null while running) — cleared on re-arm. */
+  stopReason: string | null;
+  /** When the current stop opened (epoch ms; null while running) — the
+   * board/digest stop-recency key: a stop AFTER a later frame still wins
+   * the lane's displayed cause (code review 2026-10-04). */
+  stoppedAt: number | null;
   breakerNotificationId: string | null;
   /** A restart rung is executing: disposed envelopes must not evict us. */
   inRestart: boolean;
@@ -318,7 +333,21 @@ export interface SupervisorOptions {
   /** Test seam: jitter over [0, capMs) added to each backoff delay (default
    * uniform random). Tests pin it for deterministic ladder-shape asserts. */
   readonly jitter?: (capMs: number) => number;
+  /**
+   * Late-bound per-agent restart specialization (issue #161): the child-
+   * worker subsystem is constructed after the supervisor, so this resolver
+   * is installed by a setter. Returning `undefined` = default restart;
+   * `{ options }` = restart with these spawn options (lane cwd, bounded
+   * tools, product-owned agent id); `{ refuse }` = do not restart (the
+   * owner has already terminalized the record honestly).
+   */
+  readonly restartPolicyFor?: (agentId: string, role: Role) => SupervisorRestartPolicy | undefined;
 }
+
+/** One restart specialization decision (see SupervisorOptions). */
+export type SupervisorRestartPolicy =
+  | { readonly options: SpawnOptions }
+  | { readonly refuse: string };
 
 export class Supervisor {
   private readonly cfg: SupervisionConfig;
@@ -334,7 +363,12 @@ export class Supervisor {
   private readonly workerGate: PacingGate | undefined;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly jitter: (capMs: number) => number;
+  /** Late-bound restart specialization (issue #161; see the option doc). */
+  private restartPolicyFor: (agentId: string, role: Role) => SupervisorRestartPolicy | undefined;
   private readonly agents = new Map<string, SupervisedAgent>();
+  /** Durable stop truth for agents whose live record is gone (restart
+   * hydration; code review 2026-10-04). viewFor falls back to this map. */
+  private restoredStops = new Map<string, AgentSupervisionView>();
   private readonly slots = new Map<string, SupervisedSlotInternal>();
   private readonly unsubscribeTap: () => void;
   private readonly tickMs: number;
@@ -357,15 +391,27 @@ export class Supervisor {
     this.workerGate = opts.workerGate;
     this.sleep = opts.sleep ?? defaultSleep;
     this.jitter = opts.jitter ?? ((capMs: number) => Math.random() * capMs);
+    this.restartPolicyFor = opts.restartPolicyFor ?? (() => undefined);
     // Cadence: a quarter of the silence window, capped at 5 s so a tight
     // window still ticks promptly.
     this.tickMs = opts.tickMs ?? Math.min(this.cfg.turnSilenceMs / 4, 5_000);
     this.unsubscribeTap = this.registry.onAgentEvent((envelope) => this.onEnvelope(envelope));
   }
 
+  /** Late-bound restart specialization (issue #161): the child-worker
+   * subsystem is built after the supervisor, so the policy is installed
+   * here. Returning undefined = default restart. */
+  setRestartPolicy(policy: (agentId: string, role: Role) => SupervisorRestartPolicy | undefined): void {
+    this.restartPolicyFor = policy;
+  }
+
   /** Start the watchdog ticker. */
   start(): void {
     if (this.disposed || this.ticker !== null) return;
+    // Restart hydration: the supervisor is in-process only, so a stopped
+    // worker would otherwise lose its waiting truth (and a stalled lane
+    // could wake) until the next live event (code review 2026-10-04).
+    this.restoredStops = this.hydrateRestoredStops();
     this.ticker = setInterval(() => {
       try {
         this.tick();
@@ -447,6 +493,8 @@ export class Supervisor {
         // Supervision off: no re-arm semantics — clear the stale breaker
         // state so the slot serves again (pure registry behavior).
         existing.breakerOpen = false;
+        existing.stopReason = null;
+        existing.stoppedAt = null;
         existing.breakerNotificationId = null;
         existing.restartRing = [];
       } else {
@@ -454,11 +502,14 @@ export class Supervisor {
         // the stopped agent rather than serving it unsupervised — and the
         // escalation row resolves with it (acked by the re-arm itself).
         existing.breakerOpen = false;
+        existing.stopReason = null;
+        existing.stoppedAt = null;
         const rearming = existing.breakerNotificationId;
         existing.breakerNotificationId = null;
         existing.restartRing = [];
         existing.consecutiveFailures = 0;
         existing.state = 'watching';
+        this.restoredStops.delete(existing.agentId);
         this.log('info', 'breaker re-armed by slot use — resuming supervision', {
           agent_id: existing.agentId,
           slot: slot.id,
@@ -537,6 +588,8 @@ export class Supervisor {
         .sort((left, right) => left - right);
       live.consecutiveFailures = Math.max(live.consecutiveFailures, inheritedFailures);
       live.breakerOpen = inheritedBreaker !== undefined;
+      live.stopReason = inheritedBreaker?.stopReason ?? null;
+      live.stoppedAt = inheritedBreaker?.stoppedAt ?? null;
       live.breakerNotificationId =
         inheritedBreaker?.breakerNotificationId ?? live.breakerNotificationId;
     }
@@ -598,6 +651,8 @@ export class Supervisor {
         live.restartRing = [...live.restartRing, ...agent.restartRing].sort((a, b) => a - b);
         if (agent.breakerOpen && !live.breakerOpen) {
           live.breakerOpen = true;
+          live.stopReason = agent.stopReason;
+          live.stoppedAt = agent.stoppedAt;
           live.breakerNotificationId = agent.breakerNotificationId;
           live.state = 'stopped';
         }
@@ -808,6 +863,8 @@ export class Supervisor {
       restartRing: [],
       consecutiveFailures: 0,
       breakerOpen: false,
+      stopReason: null,
+      stoppedAt: null,
       breakerNotificationId: null,
       inRestart: false,
       backoffTimer: null,
@@ -1216,10 +1273,17 @@ export class Supervisor {
       });
       let rejection: unknown = null;
       try {
-        await handle.prompt(incident.pending.text, {
+        // Delivery truth (#160): a retry that RESOLVES is not a recovery
+        // unless the re-delivered turn itself attests success. The verdict
+        // is captured per turn; an aborted/unknown/in-band-error settle is
+        // a failed attempt and falls to the existing failure ladder below.
+        const verdict = await promptWithTerminalVerdict(handle, incident.pending.text, {
           ...(incident.pending.owner !== null ? { owner: incident.pending.owner } : {}),
           ...(incident.pending.images !== undefined ? { images: incident.pending.images } : {}),
         });
+        if (!verdict.ok) {
+          rejection = new Error(verdict.error ?? 'runtime settled the retry turn with an in-band error');
+        }
       } catch (error) {
         rejection = error;
       }
@@ -1300,6 +1364,9 @@ export class Supervisor {
     agent.handle = null;
     agent.openTurn = false;
     agent.state = 'stopped';
+    agent.stopReason = 'review aborted';
+    agent.stoppedAt = this.now();
+    this.rememberStop(agent);
     this.log('warn', 'isolated review attempt aborted for workflow-owned recovery', {
       agent_id: agent.agentId,
       reason,
@@ -1527,6 +1594,9 @@ export class Supervisor {
     if (agent.breakerOpen) return;
     agent.breakerOpen = true;
     agent.state = 'stopped';
+    agent.stopReason = failureClass;
+    agent.stoppedAt = this.now();
+    this.rememberStop(agent);
     const handle = agent.handle;
     const captured = this.captureInterruptedTurn(handle, agent);
     if (captured !== null) agent.pendingRecovery = captured;
@@ -1724,13 +1794,32 @@ export class Supervisor {
 
       if (restartSlot !== null && restartSlot.generation !== restartGeneration) return;
 
+      // Issue #161: the owning subsystem may specialize or refuse a restart
+      // (a child worker must come back in ITS lane with ITS bounded tools —
+      // the default role spawn would widen a read-only child to writing and
+      // move it out of its worktree).
+      const policy = this.restartPolicyFor(agent.agentId, agent.role);
+      if (policy !== undefined && 'refuse' in policy) {
+        agent.state = 'stopped';
+        agent.stoppedAt = this.now();
+        this.log('warn', 'agent restart refused by its owning subsystem', {
+          agent_id: agent.agentId,
+          reason: policy.refuse,
+        });
+        return;
+      }
+
       // Respawn with resume (crash = resume, SPEC ruling 3).
       const resumeFile = agent.sessionFile;
       try {
+        const spawnOptions: SpawnOptions = {
+          ...(resumeFile !== null ? { resumeFile } : {}),
+          ...(policy !== undefined && 'options' in policy ? policy.options : {}),
+        };
         const spawned =
           restartSlot !== null
-            ? await restartSlot.spawn(resumeFile !== null ? { resumeFile } : {})
-            : await this.registry.spawn(agent.role, resumeFile !== null ? { resumeFile } : {});
+            ? await restartSlot.spawn(spawnOptions)
+            : await this.registry.spawn(agent.role, spawnOptions);
         if (
           this.disposed ||
           (restartSlot !== null &&
@@ -1806,6 +1895,13 @@ export class Supervisor {
     adopted.slotGeneration = old.slotGeneration;
     adopted.restartRing = old.restartRing;
     adopted.breakerOpen = old.breakerOpen;
+    // Enforce the copy-site invariant breakerOpen => stopReason: a carried
+    // open breaker keeps its recorded cause, a closed breaker carries none.
+    // (Restart rungs never reach this path with an open breaker, but a
+    // future adopter cannot silently violate the invariant; followup
+    // review, carryOverSupervision.)
+    adopted.stopReason = old.breakerOpen ? old.stopReason : null;
+    adopted.stoppedAt = old.breakerOpen ? old.stoppedAt : null;
     adopted.breakerNotificationId = old.breakerNotificationId;
     // A turn interrupted by an earlier failed rung (or by the breaker
     // stop) still awaits resume on the next live handle.
@@ -1913,10 +2009,18 @@ export class Supervisor {
         });
         if (!stillCurrent()) return;
       }
-      await handle.prompt(pending.text, {
+      // Delivery truth (#160): the recovered turn must attest its own
+      // success. A resolved re-delivery that settled aborted or in-band
+      // error is thrown to the catch below, which consults the retry
+      // settlement and — when nothing carried the turn — posts the honest
+      // recoverable-lane note instead of recording a fabricated 'resumed'.
+      const verdict = await promptWithTerminalVerdict(handle, pending.text, {
         ...(pending.owner !== null ? { owner: pending.owner } : {}),
         ...(pending.images !== undefined ? { images: pending.images } : {}),
       });
+      if (!verdict.ok) {
+        throw new Error(verdict.error ?? 'runtime settled the recovered turn with an in-band error');
+      }
       if (!stillCurrent()) return;
       // Release the slot before waiting on a bounded rate-limit retry so
       // the retry can reacquire admission for its next attempt.
@@ -2039,6 +2143,9 @@ export class Supervisor {
     if (agent.breakerOpen) return; // idempotent — one escalation per trip
     agent.breakerOpen = true;
     agent.state = 'stopped';
+    agent.stopReason = 'crash loop';
+    agent.stoppedAt = this.now();
+    this.rememberStop(agent);
     const handle = agent.handle;
     // The turn this trip kills must survive as a recovery candidate: the
     // ack re-arm resumes it on the next live handle.
@@ -2097,10 +2204,13 @@ export class Supervisor {
     for (const agent of this.agents.values()) {
       if (agent.breakerNotificationId !== notificationId || !agent.breakerOpen) continue;
       agent.breakerOpen = false;
+      agent.stopReason = null;
+      agent.stoppedAt = null;
       agent.breakerNotificationId = null;
       agent.restartRing = [];
       agent.consecutiveFailures = 0;
       agent.state = 'watching';
+      this.restoredStops.delete(agent.agentId);
       this.log('info', 'breaker re-armed by ack — resuming supervision', {
         agent_id: agent.agentId,
         notification_id: notificationId,
@@ -2142,10 +2252,16 @@ export class Supervisor {
     }
     if (!open) return false;
     agent.breakerOpen = false;
+    // The re-arm clears the stop cause with the breaker: a watching agent
+    // must never carry a stale stopReason (the invariant viewFor/health
+    // and the board rely on). Every other re-arm path clears it too.
+    agent.stopReason = null;
+    agent.stoppedAt = null;
     agent.breakerNotificationId = null;
     agent.restartRing = [];
     agent.consecutiveFailures = 0;
     agent.state = 'watching';
+    this.restoredStops.delete(agent.agentId);
     this.log('info', 'breaker re-armed by owned provider recovery', {
       agent_id: agentId,
       wait_id: waitId,
@@ -2176,6 +2292,11 @@ export class Supervisor {
         state: agent.state,
         restarts: agent.restartRing.length,
         breakerOpen: agent.breakerOpen,
+        stopReason: agent.stopReason,
+        stoppedAt:
+          agent.stoppedAt === null || agent.stoppedAt === undefined
+            ? null
+            : new Date(agent.stoppedAt).toISOString(),
         openTurn: agent.openTurn,
         openControl: agent.openControl,
         openToolCalls: agent.openToolCalls.size,
@@ -2186,10 +2307,62 @@ export class Supervisor {
     };
   }
 
+  /** Hydrate the durable stop map from the ledger's supervision events
+   * (restart-only; a malformed query must not take the service down). */
+  private hydrateRestoredStops(): Map<string, AgentSupervisionView> {
+    const stops = new Map<string, AgentSupervisionView>();
+    if (!this.cfg.enabled) return stops;
+    try {
+      for (const [agentId, stop] of this.ledger.durableSupervisionStops()) {
+        stops.set(agentId, {
+          agentId,
+          role: stop.role,
+          slotId: null,
+          state: 'stopped',
+          restarts: stop.restarts,
+          breakerOpen: true,
+          stopReason: stop.reason,
+          stoppedAt: null,
+          openTurn: false,
+          openToolCalls: 0,
+          lastEventAt: null,
+          lastFileBytes: null,
+        });
+      }
+    } catch (error) {
+      this.log('error', 'durable supervision stop hydration failed', { error: String(error) });
+    }
+    return stops;
+  }
+
+  /** Mirror an in-process stop into the restored map so the truth survives
+   * even if the live record is later removed. */
+  private rememberStop(agent: SupervisedAgent): void {
+    this.restoredStops.set(agent.agentId, {
+      agentId: agent.agentId,
+      role: agent.role,
+      slotId: agent.slot?.id ?? null,
+      state: 'stopped',
+      restarts: agent.restartRing.length,
+      breakerOpen: agent.breakerOpen,
+      stopReason: agent.stopReason,
+      stoppedAt:
+        agent.stoppedAt === null || agent.stoppedAt === undefined
+          ? null
+          : new Date(agent.stoppedAt).toISOString(),
+      openTurn: false,
+      openToolCalls: 0,
+      lastEventAt: null,
+      lastFileBytes: null,
+    });
+  }
+
   /** Board feed: supervision view for one agent id (or null). */
   viewFor(agentId: string): AgentSupervisionView | null {
     const agent = this.agents.get(agentId);
-    if (agent === undefined) return null;
+    // No live record (post-restart, or a record removed after its stop):
+    // fall back to the hydrated durable stop truth.
+    if (agent === undefined) return this.restoredStops.get(agentId) ?? null;
     return {
       agentId: agent.agentId,
       role: agent.role,
@@ -2197,6 +2370,11 @@ export class Supervisor {
       state: agent.state,
       restarts: agent.restartRing.length,
       breakerOpen: agent.breakerOpen,
+      stopReason: agent.stopReason,
+      stoppedAt:
+        agent.stoppedAt === null || agent.stoppedAt === undefined
+          ? null
+          : new Date(agent.stoppedAt).toISOString(),
       openTurn: agent.openTurn,
       openControl: agent.openControl,
       openToolCalls: agent.openToolCalls.size,

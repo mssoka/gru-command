@@ -6,6 +6,7 @@ import { EventBus } from '../src/events/bus.js';
 import { LedgerApi, type NotificationRecord } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { NotificationCenter } from '../src/notifications/center.js';
+import { BoardEngine } from '../src/board/engine.js';
 import {
   Supervisor,
   type AgentSupervisionView,
@@ -27,9 +28,11 @@ import type {
 } from '../src/runtime/types.js';
 import type { AgentEventEnvelope } from '../src/runtime/registry.js';
 import { PacingGate, type RateLimitBackoffPolicy } from '../src/runtime/pacing.js';
+import { promptVerdictFromHealth } from '../src/runtime/prompt-verdict.js';
+import type { PromptTurnVerdict } from '../src/runtime/types.js';
 import { DispatchService } from '../src/dispatch/service.js';
 import { routeFixDirectiveToMinion } from '../src/dispatch/fix-directive.js';
-import { PR_CREATION_RULE } from '../src/dispatch/pr-creation.js';
+import { appendWorkerRules } from '../src/dispatch/worker-rules.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { makeFixtureRepo } from './helpers/fixture-repo.js';
 import type { WorktreePort } from '../src/dispatch/worktree-port.js';
@@ -99,6 +102,18 @@ class FakeHandle implements AgentHandle {
   }
   /** Scripted per-delivery transport outcome (tests drive failures). */
   promptHook: ((text: string, options?: PromptOptions) => Promise<void> | void) | null = null;
+  /** Per-turn terminal evidence, exactly like the attesting adapters. OPT-IN
+   * (the #160 tests): absent by default so fixtures without scripted
+   * verdicts keep the legacy prompt + settle-time-health delivery path and
+   * its settle-leaf ordering. */
+  verdictHook: (() => PromptTurnVerdict) | null = null;
+  promptWithVerdict: ((text: string, options?: PromptOptions) => Promise<PromptTurnVerdict>) | undefined = undefined;
+  enableVerdictAttestation(): void {
+    this.promptWithVerdict = async (text = '', options?: PromptOptions) => {
+      await this.prompt(text, options);
+      return this.verdictHook !== null ? this.verdictHook() : promptVerdictFromHealth(this);
+    };
+  }
   async steer(): Promise<void> {}
   async followUp(): Promise<void> {}
   /** E7 live-work probe: a fake scheduler can declare a live child process. */
@@ -222,6 +237,10 @@ function boot(
     workerGate?: PacingGate;
     sleep?: (ms: number) => Promise<void>;
     jitter?: (capMs: number) => number;
+    /** Watchdog silence window override (default 50 ms; long-run tests
+     * simulate hours with a realistic window instead of flake-prone
+     * microsecond beats). */
+    turnSilenceMs?: number;
   } = {},
 ): Harness {
   const dir = tmpDir();
@@ -254,7 +273,7 @@ function boot(
   const supervisor = new Supervisor({
     config: {
       enabled: true,
-      turnSilenceMs: 50,
+      turnSilenceMs: opts.turnSilenceMs ?? 50,
       restartWindowMs: 600_000,
       maxRestarts: 3,
       restartBackoffMs: 1,
@@ -725,6 +744,7 @@ describe('supervisor — watchdog + restart ladder', () => {
     const view = supervisor.viewFor('minion-crashloop') as AgentSupervisionView;
     expect(view.state).toBe('stopped');
     expect(view.breakerOpen).toBe(true);
+    expect(view.stopReason).toBe('crash loop');
 
     // ---- ack re-arms: fresh window, the resume attempt succeeds -------
     registry.spawnImpl = async (role) => new FakeHandle(role, 'minion-crashloop-resumed', null);
@@ -733,6 +753,8 @@ describe('supervisor — watchdog + restart ladder', () => {
     const rearmView = supervisor.viewFor('minion-crashloop-resumed') as AgentSupervisionView;
     expect(rearmView.state).toBe('watching');
     expect(rearmView.breakerOpen).toBe(false);
+    // A re-armed agent is running again — no stop reason lingers.
+    expect(rearmView.stopReason).toBeNull();
     expect(rearmView.restarts).toBe(1); // ring cleared, one fresh rung
     expect(registry.spawnCalls.length).toBe(4);
     // The stopped record for the OLD agent id is gone (new session id) —
@@ -784,6 +806,13 @@ describe('supervisor — workflow-owned review attempts', () => {
     await vi.waitFor(() => expect(handle.disposed).toBe(true));
     expect(h.registry.spawnCalls).toHaveLength(spawns);
     expect(h.api.listEvents({ limit: 20 }).some((event) => event.kind === 'supervision.review-attempt-aborted')).toBe(true);
+    // The abort records its cause on the stopped record the board reads:
+    // the lane renders this exact reason until a re-arm clears it.
+    expect(h.supervisor.viewFor(handle.id)).toMatchObject({
+      state: 'stopped',
+      breakerOpen: false,
+      stopReason: 'review aborted',
+    });
     h.dispose();
   });
 
@@ -802,6 +831,7 @@ describe('supervisor — workflow-owned review attempts', () => {
     expect(h.registry.spawnCalls).toHaveLength(spawns);
     expect(h.api.listEvents({ limit: 20 }).some((event) => event.kind === 'supervision.review-attempt-aborted')).toBe(true);
     expect(h.notificationsOfKind('supervision.native-compaction-wait')).toHaveLength(0);
+    expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', stopReason: 'review aborted' });
     h.dispose();
   });
 });
@@ -953,6 +983,8 @@ describe('supervisor — decision-backed failure guidance', () => {
     handle.emit({ type: 'error', error: 'quota exceeded (HTTP 429)', fatal: false });
     await vi.waitFor(() => expect(handle.disposed).toBe(true));
     expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true, restarts: 0 });
+    // The stop carries its reason so the board can render the truth.
+    expect(h.supervisor.viewFor(handle.id)).toMatchObject({ stopReason: 'quota_wall' });
     expect(h.api.listNotifications({ limit: 20 }).some((row) => row.kind.includes('quota_wall'))).toBe(true);
     h.dispose();
   });
@@ -1603,6 +1635,67 @@ describe('supervisor — Perkins r1 fixes', () => {
     h.dispose();
   });
 
+  it('retiring a dead OPEN-breaker stale slot record carries the stop cause onto the live record (V2)', async () => {
+    const h = boot();
+    const slot = h.supervisor.declareSlot({
+      id: 'gru-open-retire',
+      role: 'gru',
+      spawn: (options) => h.registry.spawn('gru', options),
+    });
+    const first = (await slot.ensure({})) as FakeHandle;
+    // The reachable ensure flows clear a picked open breaker before any
+    // spawn (the slot-use re-arm, pinned by r1-17), so no black-box
+    // sequence hands retirement a STILL-OPEN record. This constructs that
+    // stale shape directly — a dead slot-bound record with an open
+    // breaker whose slot generation has moved on — to pin the defensive
+    // merge: without the stop-cause carry the replacement would render a
+    // bare waiting chip (stopReason null) instead of `waiting · quota wall`.
+    const internals = h.supervisor as unknown as {
+      slots: Map<string, { generation: number }>;
+      agents: Map<string, Record<string, unknown>>;
+    };
+    const internalSlot = internals.slots.get('gru-open-retire')!;
+    internals.agents.set('stale-open-stop', {
+      agentId: 'stale-open-stop',
+      role: 'gru',
+      slot: internalSlot,
+      slotGeneration: internalSlot.generation - 1,
+      handle: null,
+      sessionFile: null,
+      state: 'stopped',
+      openTurn: false,
+      openControl: false,
+      compactionWarned: false,
+      openToolCalls: new Map(),
+      pendingRecovery: null,
+      lastEventAt: 0,
+      lastFileBytes: null,
+      restartRing: [],
+      consecutiveFailures: 0,
+      breakerOpen: true,
+      stopReason: 'quota_wall',
+      breakerNotificationId: null,
+      inRestart: false,
+      backoffTimer: null,
+      activityGeneration: 0,
+      decisionPending: false,
+      failureTerminalPending: false,
+      queuedRecovery: null,
+      rateLimitRetry: null,
+      recoveryAdmission: null,
+    });
+    // The current record dies outside a restart rung; ensure() spawns the
+    // replacement and retires BOTH dead records, merging the open one.
+    await h.registry.disposeHandle(first);
+    const replacement = (await slot.ensure({})) as FakeHandle;
+    expect(h.supervisor.viewFor(replacement.id)).toMatchObject({
+      state: 'stopped',
+      breakerOpen: true,
+      stopReason: 'quota_wall',
+    });
+    h.dispose();
+  });
+
   it('r1-2: supervision.enabled=false gates EVERY side-effect — pure registry behavior', async () => {
     const dir = tmpDir();
     const db = new LedgerDb(dir);
@@ -1711,6 +1804,9 @@ describe('supervisor — Perkins r1 fixes', () => {
     const view = h.supervisor.viewFor('slot-recovered');
     expect(view?.state).toBe('watching');
     expect(view?.breakerOpen).toBe(false);
+    // A re-armed agent is running again — the stop cause clears with the
+    // breaker (final independent review T1).
+    expect(view?.stopReason).toBeNull();
     h.dispose();
   });
 });
@@ -1760,6 +1856,92 @@ describe('supervisor — live tools, sleep/wake, and interrupted-turn recovery',
     h.dispose();
   });
 
+  it('progress past the historical 28/36 call counts never trips a cap, quarantine, or hand-back (issue #158)', async () => {
+    const h = boot();
+    const handle = new FakeHandle('minion', 'minion-no-call-cap', null);
+    h.registry.adopt(handle);
+    const spawns = h.registry.spawnCalls.length;
+    const notificationsBefore = h.api.listNotifications({ limit: 200 }).length;
+    hang(handle);
+    // Forty calls — past the historical 28-call phase ceiling and the
+    // 36-call session count. Every call is open with a live process
+    // (activity), heartbeats while it runs, and returns; one in thirteen
+    // errors. The count is telemetry: never a stall, stop, or compliance
+    // signal by itself.
+    for (let call = 0; call < 40; call += 1) {
+      const callId = `call-${call}`;
+      handle.emit({ type: 'tool_start', callId, tool: 'bash' });
+      handle.liveProcess = true;
+      h.advance(30); // under the 50 ms silence window
+      handle.emit({ type: 'tool_update', callId });
+      h.advance(10);
+      handle.liveProcess = false;
+      handle.emit({ type: 'tool_end', callId, isError: call % 13 === 0 });
+    }
+    await sleep(60);
+    const view = h.supervisor.viewFor('minion-no-call-cap');
+    expect(handle.disposed).toBe(false);
+    expect(h.registry.spawnCalls).toHaveLength(spawns);
+    expect(view?.state).toBe('watching');
+    expect(view?.stopReason ?? null).toBeNull();
+    expect(view?.breakerOpen).toBe(false);
+    expect(view?.restarts).toBe(0);
+    expect(view?.openToolCalls).toBe(0);
+    // No cap-only noncompliance flag, no quarantine escalation, no forced
+    // source hand-back: the round produced no supervision event at all.
+    expect(h.notificationsOfKind('supervision.hang')).toHaveLength(0);
+    expect(h.notificationsOfKind('supervision.breaker')).toHaveLength(0);
+    expect(h.notificationsOfKind('supervision.fatal')).toHaveLength(0);
+    expect(h.api.listNotifications({ limit: 200 }).length).toBe(notificationsBefore);
+    // The turn then settles normally; a settled turn is not a stall.
+    handle.setState('idle');
+    handle.emit({ type: 'turn_end' });
+    h.advance(120);
+    await sleep(60);
+    expect(handle.disposed).toBe(false);
+    expect(h.registry.spawnCalls).toHaveLength(spawns);
+    expect(h.api.listNotifications({ limit: 200 }).length).toBe(notificationsBefore);
+    h.dispose();
+  });
+
+  it('six simulated hours of continuous progress and a compaction boundary never trip a count or time quota', async () => {
+    // A one-minute watchdog window so simulated time can cover hours in
+    // bounded (sub-sleep-gap) beats — no wall-clock waiting in CI.
+    const h = boot(undefined, { turnSilenceMs: 60_000 });
+    const handle = new FakeHandle('minion', 'minion-long-run', null);
+    h.registry.adopt(handle);
+    const spawns = h.registry.spawnCalls.length;
+    handle.setState('streaming');
+    handle.emit({ type: 'turn_start' });
+    let openCall = 'run-0';
+    handle.emit({ type: 'tool_start', callId: openCall, tool: 'bash' });
+    let completedCalls = 0;
+    // 6 h: each 20 s beat carries activity; every other beat closes the
+    // open call and opens the next (~540 calls total, no transcript growth).
+    for (let beat = 0; beat < 1080; beat += 1) {
+      h.advance(20_000);
+      handle.emit({ type: 'tool_update', callId: openCall });
+      if (beat % 2 === 1) {
+        handle.emit({ type: 'tool_end', callId: openCall, isError: false });
+        completedCalls += 1;
+        openCall = `run-${completedCalls}`;
+        handle.emit({ type: 'tool_start', callId: openCall, tool: 'bash' });
+      }
+      // A resumable context boundary mid-run (native compaction) opens,
+      // stays open across beats, and completes — never a quota trigger.
+      if (beat === 400) handle.emit({ type: 'compaction_start' });
+      if (beat === 460) handle.emit({ type: 'compaction_end', success: true });
+    }
+    await sleep(60);
+    expect(completedCalls).toBe(540);
+    expect(handle.disposed).toBe(false);
+    expect(h.registry.spawnCalls).toHaveLength(spawns);
+    expect(h.supervisor.viewFor('minion-long-run')?.state).toBe('watching');
+    expect(h.notificationsOfKind('supervision.hang')).toHaveLength(0);
+    expect(h.notificationsOfKind('supervision.breaker')).toHaveLength(0);
+    h.dispose();
+  });
+
   it('a killed open turn is re-delivered on the resumed session under its owner', async () => {
     const h = boot();
     const handle = new FakeHandle('minion', 'minion-resume', null);
@@ -1783,6 +1965,41 @@ describe('supervisor — live tools, sleep/wake, and interrupted-turn recovery',
     expect(recovery.some((event) => (event.payload as Record<string, unknown>)['disposition'] === 'resumed')).toBe(true);
     // A resumable turn never orphans the lane.
     expect(h.notificationsOfKind('supervision.turn-orphaned.minion-resume')).toHaveLength(0);
+    h.dispose();
+  });
+
+  it('a resumed turn that does not attest success orphans honestly instead of recording resumed (#160)', async () => {
+    const h = boot();
+    h.api.addJob({ id: 'job-resume-abort', repo: 'gru-command', title: 'resume abort' });
+    h.api.setJobStatus('job-resume-abort', 'working');
+    h.api.registerAgent({ id: 'minion-resume-abort', role: 'minion', jobId: 'job-resume-abort' });
+    const handle = new FakeHandle('minion', 'minion-resume-abort', null);
+    handle.pendingTurnSnapshot = { text: 'finish the briefing', owner: 'dispatch:job-resume-abort' };
+    h.registry.adopt(handle);
+    // The restarted session re-delivers the prompt, but its turn settles
+    // without attesting success (transport abort): no fabricated 'resumed'.
+    h.registry.spawnImpl = async (role, options) => {
+      const resumed = new FakeHandle(role, 'minion-resume-abort-2', options?.resumeFile ?? null);
+      resumed.verdictHook = () => ({
+        ok: false,
+        error: 'turn settled without a successful completion (stopReason: aborted): This operation was aborted',
+      });
+      resumed.enableVerdictAttestation();
+      return resumed;
+    };
+    hang(handle);
+    h.advance(60);
+    await vi.waitFor(() => {
+      expect(h.notificationsOfKind('supervision.turn-orphaned.minion-resume-abort')).toHaveLength(1);
+    }, { timeout: 5_000 });
+    const recovery = h.api
+      .listEvents({ limit: 100 })
+      .filter((event) => event.kind === 'supervision.turn-recovery');
+    expect(recovery.some((event) => (event.payload as Record<string, unknown>)['disposition'] === 'resumed')).toBe(false);
+    expect(recovery.some((event) => (event.payload as Record<string, unknown>)['disposition'] === 'orphaned')).toBe(true);
+    const note = h.notificationsOfKind('supervision.turn-orphaned.minion-resume-abort')[0]!;
+    expect(note.routing).toBe('action-required');
+    expect(note.detail).toContain('This operation was aborted');
     h.dispose();
   });
 
@@ -2476,6 +2693,52 @@ describe('worker delivery settlement under automatic rate-limit retry', () => {
     } finally { h.dispose(); }
   });
 
+  it('a retry that resolves without attesting success is a failed attempt, never a recovery (#160)', async () => {
+    const sleeper = new ManualSleeper();
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const h = boot(undefined, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep, jitter: () => 0, workerGate: gate });
+    const repo = makeFixtureRepo('pacing-dispatch-retry-abort');
+    cleanupDirs.push(repo.path);
+    const root = tmpDir();
+    try {
+      const handle = new FakeHandle('minion', 'minion-retry-abort', null);
+      handle.pendingTurnSnapshot = { text: 'retry me', owner: 'dispatch:job-retry-abort' };
+      let failed = false;
+      handle.promptHook = () => {
+        if (failed) return;
+        failed = true;
+        handle.emit({ type: 'error', error: '429 too many requests', fatal: false });
+      };
+      // The re-delivered turn resolves but attests NO positive completion
+      // (the transport aborted it): resolution alone must not be recovery.
+      handle.verdictHook = () => handle.promptCalls.length <= 1
+        ? { ok: true, error: null }
+        : { ok: false, error: 'turn settled without a successful completion (stopReason: aborted): This operation was aborted' };
+      handle.enableVerdictAttestation();
+      h.registry.adopt(handle);
+      const service = new DispatchService({
+        ledger: h.api,
+        worktrees: new InMemoryWorktreePort(root),
+        spawner: async () => handle,
+        workerGate: gate,
+        retrySettlement: (agentId) => h.supervisor.awaitRetrySettlement(agentId),
+      });
+      const outcome = await service.dispatch({
+        jobId: 'job-retry-abort', repoPath: repo.path, title: 'retry', briefing: 'brief',
+      });
+      await vi.waitFor(() => expect(sleeper.delays).toEqual([100]));
+      await sleeper.release();
+      const settled = await outcome.settled;
+      // No fabricated recovery: the retry attempt failed, the lane blocks
+      // with its error on the record, and no delivery is minted.
+      expect(settled).toMatchObject({ ok: false });
+      expect(h.api.listEvents({ limit: 100 }).some((event) => event.kind === 'pacing.auto-retry-recovered')).toBe(false);
+      expect(h.api.listEvents({ limit: 100 }).some((event) => event.kind === 'job.delivered')).toBe(false);
+      expect(h.api.listEvents({ limit: 100 }).some((event) => event.kind === 'job.minion-error')).toBe(true);
+      expect(h.api.getJob('job-retry-abort')?.status).toBe('blocked');
+    } finally { h.dispose(); }
+  });
+
   it('a fresh-minion directive waits out an in-band 429 before it is disposed or reported delivered', async () => {
     const sleeper = new ManualSleeper();
     const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
@@ -2514,8 +2777,8 @@ describe('worker delivery settlement under automatic rate-limit retry', () => {
       await sleeper.release();
       await expect(routing).resolves.toMatchObject({ delivered: true, minionId: 'minion-fresh-directive' });
       expect(handle!.promptCalls).toEqual([
-        { text: `fix the thing\n\n${PR_CREATION_RULE}`, owner: 'fix-directive' },
-        { text: `fix the thing\n\n${PR_CREATION_RULE}`, owner: 'fix-directive' },
+        { text: appendWorkerRules('fix the thing'), owner: 'fix-directive' },
+        { text: appendWorkerRules('fix the thing'), owner: 'fix-directive' },
       ]);
       expect(handle!.disposed).toBe(true);
     } finally { h.dispose(); }
@@ -2752,6 +3015,63 @@ describe('pacing settlement across rejection, recovery, and slot retirement', ()
       await expect(settled).resolves.toBe('superseded');
     } finally {
       h.dispose();
+    }
+  });
+
+  it('restart hydration restores a durable stop into viewFor and the board snapshot (P6)', () => {
+    // Code review 2026-10-04: the supervisor is in-process only. A stop
+    // that survived the previous process must still read waiting after a
+    // restart (and must not wake as stalled).
+    const dir = mkdtempSync(join(tmpdir(), 'gru-hydrate-'));
+    const db = new LedgerDb(dir);
+    const bus = new EventBus();
+    const api = new LedgerApi(db.handle, { bus });
+    try {
+      api.addJob({ id: 'job-hydrate', repo: 'r', title: 'Hydrate', briefing: 'b' });
+      api.setJobStatus('job-hydrate', 'working');
+      api.registerAgent({ id: 'minion-hydrate', role: 'minion', jobId: 'job-hydrate' });
+      api.appendCustomEvent({
+        kind: 'supervision.escalated',
+        agentId: 'minion-hydrate',
+        payload: { class: 'quota_wall', restarts: 2 },
+      });
+      const registry = { onAgentEvent: () => () => {} } as unknown as SupervisorRegistry;
+      const center = new NotificationCenter({ ledger: api, bus });
+      const supervisor = new Supervisor({
+        config: {
+          enabled: true,
+          turnSilenceMs: 50,
+          restartWindowMs: 600_000,
+          maxRestarts: 3,
+          restartBackoffMs: 1,
+        },
+        registry,
+        ledger: api,
+        notifications: center,
+        tickMs: 5,
+      });
+      supervisor.start();
+      try {
+        expect(supervisor.viewFor('minion-hydrate')).toMatchObject({
+          state: 'stopped',
+          stopReason: 'quota_wall',
+          restarts: 2,
+        });
+        // The production board closure reads the same view: the snapshot's
+        // agent row carries the stop truth after the restart.
+        const engine = new BoardEngine({
+          ledger: api,
+          bus,
+          supervisionFor: (agentId) => supervisor.viewFor(agentId),
+        });
+        const agentView = engine.snapshot().agents.find((agent) => agent.id === 'minion-hydrate');
+        expect(agentView?.supervision).toMatchObject({ state: 'stopped', stopReason: 'quota_wall' });
+      } finally {
+        supervisor.dispose();
+      }
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });

@@ -8,16 +8,52 @@ import type { NativeAgentTool } from './types.js';
 
 const MAX_BRIDGE_MESSAGE_BYTES = 1024 * 1024;
 const PARTIAL_FRAME_TIMEOUT_MS = 5_000;
-const TOOL_EXECUTION_TIMEOUT_MS = 15 * 60 * 1_000;
+/** Soft byte bound on successfully settled results retained for re-attach.
+ * Only the newest execution matters for a re-attach, so the oldest settled
+ * entries are evicted first; a single oversized result is still retained. */
+const MAX_RETAINED_EXECUTION_BYTES = 16 * 1024 * 1024;
 const MAX_BUNDLED_SERVER_BYTES = 2 * 1024 * 1024;
 const MAX_BRIDGE_CONNECTIONS = 16;
 const BRIDGE_CLOSE_TIMEOUT_MS = 5_000;
-export const PERKINS_MCP_SERVER_SHA256 = 'badd96c16800cffb9e18734f777d40d423b72423b89debed5684ad42c62f2032';
+export const PERKINS_MCP_SERVER_SHA256 = '06e42a2dfd7330c6b2a7377c0423371907956d52ba56baeb5227caf3e21e1618';
 
 interface BridgeRequest {
   readonly id: string;
   readonly name: string;
   readonly input?: unknown;
+}
+
+interface BridgeToolResult {
+  readonly text: string;
+  readonly details?: Record<string, unknown>;
+  readonly terminate?: boolean;
+}
+
+/** The settled outcome of one host-side tool execution. Failures are never
+ * retained: a later identical request must execute for real. */
+type BridgeOutcome =
+  | { readonly ok: true; readonly result: BridgeToolResult }
+  | { readonly ok: false; readonly error: string };
+
+interface ExecutionRecord {
+  readonly promise: Promise<BridgeOutcome>;
+  settled: boolean;
+  /** Retained text bytes; nonzero only for a settled success. */
+  retainedBytes: number;
+}
+
+/** Canonical request identity: object key order must not split one logical
+ * call into two duplicate executions when a client re-issues it. */
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (object(value)) {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
+function executionKey(name: string, input: Record<string, unknown>): string {
+  return `${name}\u0000${canonicalJson(input)}`;
 }
 
 function object(value: unknown): value is Record<string, unknown> {
@@ -50,7 +86,13 @@ export class ReviewMcpBridge {
   private closePromise: Promise<void> | null = null;
   private readonly abort = new AbortController();
   private readonly sockets = new Set<Socket>();
-  private readonly executions = new Set<Promise<void>>();
+  /** In-flight and retained-success executions, keyed by canonical request
+   * identity, so a transport wait that ended without the result re-attaches
+   * to the SAME work instead of cancelling or duplicating it. */
+  private readonly executions = new Map<string, ExecutionRecord>();
+  private retainedExecutionBytes = 0;
+  /** Per-connection request handlers in flight (teardown awaits them). */
+  private readonly handlers = new Set<Promise<void>>();
 
   private constructor(
     readonly socketPath: string,
@@ -99,8 +141,10 @@ export class ReviewMcpBridge {
   ): Promise<ReviewMcpBridge> {
     const tools = new Map<string, NativeAgentTool>();
     for (const definition of definitions) {
-      if (!/^perkins_[a-z0-9_]{1,48}$/.test(definition.name) || tools.has(definition.name)) {
-        throw new Error(`invalid or duplicate native review tool name: ${definition.name}`);
+      // Product-native tool names (review leads and, since issue #161,
+      // non-review parent sessions): a lowercase snake-ish identifier.
+      if (!/^[a-z][a-z0-9_]{1,63}$/.test(definition.name) || tools.has(definition.name)) {
+        throw new Error(`invalid or duplicate native tool name: ${definition.name}`);
       }
       tools.set(definition.name, definition);
     }
@@ -153,8 +197,8 @@ export class ReviewMcpBridge {
           socket.setTimeout(0);
           socket.pause();
           const execution = current.handle(socket, body.slice(0, newline));
-          current.executions.add(execution);
-          void execution.finally(() => current.executions.delete(execution));
+          current.handlers.add(execution);
+          void execution.finally(() => current.handlers.delete(execution));
         });
       });
       bridge = new ReviewMcpBridge(socketPath, directory, server, tools);
@@ -181,9 +225,7 @@ export class ReviewMcpBridge {
   }
 
   private async handle(socket: Socket, raw: string): Promise<void> {
-    let request: BridgeRequest | null = null;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    let removeAbort = (): void => {};
+    let requestId = 'invalid';
     try {
       const parsed = JSON.parse(raw) as unknown;
       if (!object(parsed) || typeof parsed.id !== 'string' || typeof parsed.name !== 'string') {
@@ -192,7 +234,8 @@ export class ReviewMcpBridge {
       if (parsed.input !== undefined && !object(parsed.input)) {
         throw new Error('review bridge request input must be an object');
       }
-      request = parsed as unknown as BridgeRequest;
+      const request = parsed as unknown as BridgeRequest;
+      requestId = request.id;
       if (request.name === '__list__') {
         writeLine(socket, {
           id: request.id,
@@ -207,39 +250,89 @@ export class ReviewMcpBridge {
       }
       const tool = this.tools.get(request.name);
       if (tool === undefined) throw new Error(`unknown native review tool: ${request.name}`);
-      const controller = new AbortController();
-      const abort = () => controller.abort();
-      this.abort.signal.addEventListener('abort', abort, { once: true });
-      removeAbort = () => this.abort.signal.removeEventListener('abort', abort);
-      const result = await Promise.race([
-        tool.execute(request.input ?? {}, controller.signal),
-        new Promise<never>((_resolve, reject) => {
-          timer = setTimeout(() => {
-            controller.abort();
-            reject(new Error('native review tool execution timed out'));
-          }, TOOL_EXECUTION_TIMEOUT_MS);
-          timer.unref?.();
-        }),
-      ]);
-      if (!object(result) || typeof result.text !== 'string') {
-        throw new Error('native review tool returned an invalid result');
-      }
-      if (result.details !== undefined && !object(result.details)) {
-        throw new Error('native review tool returned non-object structured details');
-      }
-      if (result.terminate !== undefined && typeof result.terminate !== 'boolean') {
-        throw new Error('native review tool returned an invalid termination state');
-      }
-      writeLine(socket, { id: request.id, ok: true, result });
+      const input = (request.input ?? {}) as Record<string, unknown>;
+      const key = executionKey(request.name, input);
+      let record = this.executions.get(key);
+      if (record === undefined) record = this.startExecution(tool, input, key);
+      // A repeated identical request joins the same execution: the tool
+      // runs once, and every waiter receives its settled outcome.
+      const outcome = await record.promise;
+      if (outcome.ok) writeLine(socket, { id: request.id, ok: true, result: outcome.result });
+      else writeLine(socket, { id: request.id, ok: false, error: outcome.error });
     } catch (error) {
       writeLine(socket, {
-        id: request?.id ?? 'invalid',
+        id: requestId,
         ok: false,
         error: error instanceof Error ? error.message : String(error),
       });
-    } finally {
-      if (timer !== null) clearTimeout(timer);
-      removeAbort();
+    }
+  }
+
+  /** Start one host-side tool execution. There is deliberately no execution
+   * deadline: the transport wait that ends without this result reports
+   * still-running and re-attaches (by canonical identity), so the work is
+   * only ended by the tool settling, an explicit bridge abort, or teardown. */
+  private startExecution(
+    tool: NativeAgentTool,
+    input: Record<string, unknown>,
+    key: string,
+  ): ExecutionRecord {
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    this.abort.signal.addEventListener('abort', abort, { once: true });
+    const promise = (async (): Promise<BridgeOutcome> => {
+      try {
+        const result = await tool.execute(input, controller.signal);
+        if (!object(result) || typeof result.text !== 'string') {
+          throw new Error('native review tool returned an invalid result');
+        }
+        if (result.details !== undefined && !object(result.details)) {
+          throw new Error('native review tool returned non-object structured details');
+        }
+        if (result.terminate !== undefined && typeof result.terminate !== 'boolean') {
+          throw new Error('native review tool returned an invalid termination state');
+        }
+        return {
+          ok: true,
+          result: {
+            text: result.text,
+            ...(result.details !== undefined ? { details: result.details } : {}),
+            ...(result.terminate !== undefined ? { terminate: result.terminate } : {}),
+          },
+        };
+      } catch (error) {
+        return { ok: false, error: error instanceof Error ? error.message : String(error) };
+      } finally {
+        this.abort.signal.removeEventListener('abort', abort);
+      }
+    })();
+    const record: ExecutionRecord = { promise, settled: false, retainedBytes: 0 };
+    this.executions.set(key, record);
+    void promise.then((outcome) => {
+      record.settled = true;
+      if (!outcome.ok) {
+        // A failure is never retained: a later identical request must
+        // execute for real (retry semantics), not replay the error.
+        if (this.executions.get(key) === record) this.executions.delete(key);
+        return;
+      }
+      record.retainedBytes = Buffer.byteLength(outcome.result.text, 'utf8');
+      this.retainedExecutionBytes += record.retainedBytes;
+      this.evictRetainedExecutions();
+    });
+    return record;
+  }
+
+  /** Keep retained bytes bounded by evicting the OLDEST settled successes
+   * first; pending executions are never evicted. Eviction only degrades a
+   * stale re-attach into a fresh execution, never into a duplicate. */
+  private evictRetainedExecutions(): void {
+    if (this.retainedExecutionBytes <= MAX_RETAINED_EXECUTION_BYTES) return;
+    for (const [key, record] of this.executions) {
+      if (this.retainedExecutionBytes <= MAX_RETAINED_EXECUTION_BYTES) break;
+      if (!record.settled || record.retainedBytes === 0) continue;
+      this.executions.delete(key);
+      this.retainedExecutionBytes -= record.retainedBytes;
     }
   }
 
@@ -261,7 +354,11 @@ export class ReviewMcpBridge {
     let timer: ReturnType<typeof setTimeout> | null = null;
     try {
       await Promise.race([
-        Promise.allSettled([serverClosed, ...this.executions]),
+        Promise.allSettled([
+          serverClosed,
+          ...[...this.handlers],
+          ...[...this.executions.values()].map((record) => record.promise),
+        ]),
         new Promise<void>((resolve) => {
           timer = setTimeout(resolve, BRIDGE_CLOSE_TIMEOUT_MS);
         }),

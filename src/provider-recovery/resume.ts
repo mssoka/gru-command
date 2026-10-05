@@ -36,6 +36,23 @@ export interface RecoveryClaimDeps {
   readonly log?: Log;
 }
 
+/** A continuation failure leaves the lane honestly non-working: when this
+ * claim re-opened (or kept) the lane `working`, block it with a note so the
+ * board and the digest never show an active lane nobody is driving (#160).
+ * Owner holds, review windows, and terminal states stay exactly as they
+ * are — the error events already carry the failure either way. */
+function blockReopenedLane(
+  ledger: Pick<LedgerApi, 'getJob' | 'setJobStatus' | 'noteJob'>,
+  jobId: string | null,
+  note: string,
+): void {
+  if (jobId === null) return;
+  const job = ledger.getJob(jobId);
+  if (job === null || job.status !== 'working') return;
+  ledger.setJobStatus(jobId, 'blocked');
+  ledger.noteJob(jobId, note.slice(0, 300));
+}
+
 export type RecoveryClaimResult =
   | { readonly outcome: 'continued'; readonly waitId: string; readonly minionId: string; readonly path: 'resumed' | 'redispatched' }
   | { readonly outcome: 'rearmed'; readonly waitId: string; readonly agentId: string }
@@ -153,6 +170,7 @@ async function claimJobMinion(
       (agent) =>
         agent.jobId === wait.jobId &&
         agent.role === 'minion' &&
+        agent.parentage !== 'child' &&
         agent.id !== wait.agentId &&
         agent.createdAt >= wait.createdAt &&
         deps.registry.getHandle(agent.id) !== null,
@@ -238,18 +256,59 @@ async function claimJobMinion(
     // The claim won but the spawn/continuation failed DETERMINISTICALLY.
     // Never blind-retry (crash/ambiguous delivery must be reconciled, not
     // replayed): keep the claim as the durable record and surface it.
+    const detail = String(error).slice(0, 300);
     deps.ledger.appendCustomEvent({
       kind: 'provider.continuation-failed',
       jobId: wait.jobId,
       agentId: wait.agentId,
-      payload: { wait_id: wait.id, by, error: String(error).slice(0, 300) },
+      payload: { wait_id: wait.id, by, stage: 'spawn', error: detail },
     });
+    // The same durable non-success visibility as every other failed minion
+    // turn (#160): a lane whose continuation failed is not working — it
+    // blocks with the error on the record for Silas follow-through.
+    deps.ledger.appendCustomEvent({
+      kind: 'job.minion-error',
+      jobId: wait.jobId,
+      payload: { agentId: wait.agentId, error: detail },
+    });
+    blockReopenedLane(deps.ledger, wait.jobId, `provider recovery continuation failed: ${detail}`);
     deps.log?.('error', 'provider recovery continuation failed after atomic claim — stranded claim recorded, no replay', {
       wait_id: wait.id,
       job: wait.jobId,
       error: String(error),
     });
     return { outcome: 'skipped', waitId: wait.id, why: 'continuation spawn failed after atomic claim (recorded; no automatic replay)' };
+  }
+  // Guarded continuation turn truth (#160): a prompt that settles with an
+  // in-band runtime error was admitted but is NOT a continuation. The atomic
+  // claim stays the durable record (never replayed automatically); the
+  // failure is surfaced where the digest and settle attribution see it.
+  // A delivery must never be minted from a settled-but-failed turn.
+  if (result.outcome === 'error') {
+    const detail = result.error ?? 'runtime settled the continuation turn with an in-band error';
+    deps.ledger.appendCustomEvent({
+      kind: 'provider.continuation-failed',
+      jobId: wait.jobId,
+      agentId: result.minionId,
+      payload: { wait_id: wait.id, by, stage: 'turn', error: detail.slice(0, 300) },
+    });
+    deps.ledger.appendCustomEvent({
+      kind: 'job.minion-error',
+      jobId: wait.jobId,
+      payload: { agentId: result.minionId, error: detail },
+    });
+    blockReopenedLane(deps.ledger, wait.jobId, `provider recovery continuation failed in-band: ${detail.slice(0, 200)}`);
+    deps.log?.('error', 'provider recovery continuation settled with an in-band error — claim kept, no delivery', {
+      wait_id: wait.id,
+      job: wait.jobId,
+      minion: result.minionId,
+      error: detail,
+    });
+    return {
+      outcome: 'skipped',
+      waitId: wait.id,
+      why: 'continuation turn settled with an in-band error (recorded; no automatic replay)',
+    };
   }
   deps.log?.('info', 'provider recovery continuation started', {
     wait_id: wait.id,
