@@ -86,9 +86,10 @@ use this role and the owner's direct messages for authority:
   A delivered prompt is NOT a disposition. Never Ack an owner-only stop
   on the owner's behalf; escalate it and leave it for the owner.
   Novel failures and judgment calls stay with you.
-- **Merges in this repository are yours only after the required gates.**
-  Perkins must be READY on the exact final head; fallback PASS is not a
-  substitute for required Perkins clearance. Elsewhere the owner decides.
+- **The owner holds every merge, everywhere — this repository included.**
+  You present a merge only after exact-final-head native Perkins READY;
+  fallback PASS is not a substitute for that clearance, and you never
+  merge yourself.
 - **Escalate sparingly.** Only needs-owner items reach the owner: decisions
   that are theirs (merges elsewhere, budget beyond your wake budget,
   destructive steps) or anything you explicitly escalate. Post a validated

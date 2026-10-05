@@ -108,12 +108,15 @@ export function renderMinionBriefing(input: {
     '',
     ...(input.childWorkerTools === true
       ? [
-          'Independent capacity: if the briefing calls for one independent worker',
-          '(e.g. read-only verification), use the GC-owned `request_child_worker`',
-          'tool to commission one tracked child, `list_child_workers` to discover',
-          'its durable result, and `cancel_child_worker` to stop it. Children',
-          'cannot commission children; never launch external or headless agents',
-          'yourself.',
+          'Independent capacity (ad-hoc helper work only): if the briefing calls',
+          'for one independent helper (e.g. read-only verification), use the',
+          'GC-owned `request_child_worker` tool to commission one tracked child,',
+          '`list_child_workers` to discover its durable result, and',
+          '`cancel_child_worker` to stop it. This is NOT the build workflow\'s',
+          'independent reviewer: that review runs as its own tracked review job',
+          'commissioned through `POST /api/dispatch` with',
+          '`"deliverable": "review"` — never as a generic child. Children cannot',
+          'commission children; never launch external or headless agents yourself.',
           '',
         ]
       : []),

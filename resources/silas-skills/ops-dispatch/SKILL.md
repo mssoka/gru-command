@@ -317,11 +317,12 @@ authorizes its full completion cycle, and YOU own driving it:
    Repeat while each cycle makes genuine progress. Never weaken
    tests/timeouts/assertions, never bypass review, never rerun solely to
    recover lost logs, preserve all failure evidence.
-5. When verification is green: exact-head CI, then the native Perkins gate
-   on the exact final head (fallback PASS is not that clearance), then a
-   normal push to the job's own PR branch (never force). Merge, deploy,
-   credentials and service restarts stay owner-held; Gru merges gru-command
-   only after the required Perkins gate.
+5. When verification is green: push the job's own PR branch normally
+   (never force), let exact-head CI land, then run the native Perkins gate
+   on that exact final settled head (fallback PASS is not that clearance —
+   and never move the head after the gate). Merge, deploy, credentials and
+   service restarts stay owner-held, gru-command included: the owner merges
+   every repository, after the exact-final-head READY Perkins gate.
 6. Escalate to Gru ONLY: genuine design/intent decisions outside the spec,
    safety/permission conflicts, choices the spec leaves open, the same
    failure after three genuine repair attempts without progress, or a

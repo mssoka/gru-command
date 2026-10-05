@@ -29,7 +29,7 @@ import { createDurableReconcileHook, reconcileDurableWork } from '../src/dispatc
 import type { FollowThroughNotifications } from '../src/dispatch/obligations.js';
 import { FIRING_RULES } from '../src/ledger/obligations.js';
 import { LedgerApi } from '../src/ledger/api.js';
-import { LedgerDb } from '../src/ledger/db.js';
+import { LedgerDb, MIGRATIONS } from '../src/ledger/db.js';
 import { DEFAULT_SILAS_CONFIG } from '../src/config.js';
 import type { AgentCapabilities, AgentHandle } from '../src/runtime/types.js';
 import type { AgentSupervisionView } from '../src/supervision/supervisor.js';
@@ -217,6 +217,44 @@ describe('silas digest (the four actionable states)', () => {
       expect(after.prWithoutReview.map((row) => row.jobId)).toEqual(['job-a']);
     } finally {
       h.cleanup();
+    }
+  });
+
+  it('an upgraded pre-E18 delivered implementation keeps null deliverable and stays PR-overdue', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-e18-upgrade-'));
+    try {
+      // A database shaped before migration 18: null deliverable is the only
+      // pre-existing value, and it must remain PR-owing through the upgrade.
+      const legacy = new LedgerDb(dir, { migrations: MIGRATIONS.filter((migration) => migration.id <= 17) });
+      const legacyApi = new LedgerApi(legacy.handle);
+      // The pre-18 schema has no deliverable column, so the legacy row is
+      // inserted at its own shape (the product's current addJob correctly
+      // writes the column the old schema cannot carry).
+      const ts = new Date().toISOString();
+      legacy.handle
+        .prepare(`INSERT INTO jobs (id, repo, title, status, base_branch, pr_url, note, briefing, created_at, updated_at)
+                  VALUES (?, ?, ?, 'working', NULL, NULL, NULL, ?, ?, ?)`)
+        .run('legacy-impl', 'fixture-app', 't', 'b', ts, ts);
+      legacyApi.appendCustomEvent({ kind: 'job.status', jobId: 'legacy-impl', payload: { from: 'dispatched', to: 'working' } });
+      legacyApi.appendCustomEvent({ kind: 'job.handoff', jobId: 'legacy-impl', payload: {} });
+      legacyApi.appendCustomEvent({ kind: 'job.delivered', jobId: 'legacy-impl', payload: { agentId: 'a1' } });
+      legacy.close();
+      const upgraded = new LedgerDb(dir);
+      const api = new LedgerApi(upgraded.handle);
+      try {
+        expect(api.getJob('legacy-impl')?.deliverable).toBeNull();
+        const digest = await computeSilasDigest({
+          ledger: api,
+          blockersForRound: async () => ({ blockers: [], note: null }),
+          config: DEFAULT_SILAS_CONFIG,
+          trigger: 'sweep',
+        });
+        expect(digest.deliveredWithoutPr.map((row) => row.jobId)).toEqual(['legacy-impl']);
+      } finally {
+        upgraded.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 

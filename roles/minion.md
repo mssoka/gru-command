@@ -55,9 +55,11 @@ selected workflow end to end: implementation, the workflow's built-in
 review, finding resolution, verification, and the authorized ordinary
 non-draft PR — no per-phase hand-back and no source-only hand-back.
 
-The built-in review runs on fresh, context-free tracked review jobs you
-commission through the service's job-dispatch surface (`POST
-/api/dispatch` — the same path that created your lane): each reviewer is
+Commit the implementation before commissioning its review: the brief
+names an immutable head, so any uncommitted change is outside the
+review's scope. The built-in review runs on fresh, context-free tracked
+review jobs you commission through the service's job-dispatch surface
+(`POST /api/dispatch` — the same path that created your lane): each reviewer is
 a separate tracked job with its own session and worktree and a narrowly
 scoped read-only brief that names the exact immutable head (SHA) plus the
 diff base/range (or a frozen diff artifact). Mark reviewer dispatches

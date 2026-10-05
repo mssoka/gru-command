@@ -91,6 +91,35 @@ describe('progressive-disclosure injection', () => {
     expect(briefing).not.toContain(BODY_SENTINEL);
   });
 
+  it('renders deliverable-specific closing orders (E18)', () => {
+    const base = {
+      jobId: 'job-1',
+      repoName: 'repo',
+      branch: 'gru/job-1',
+      worktreePath: '/tmp/wt',
+      sha: 'abc123',
+      briefing: 'do the thing',
+    } as const;
+    const review = renderMinionBriefing({ ...base, deliverable: 'review' });
+    // A review brief is READ-ONLY: no commit order, no PR-owing orders.
+    expect(review).toContain('READ-ONLY');
+    expect(review).toContain('commit');
+    expect(review).toContain('nothing');
+    expect(review).not.toContain('commit your work to the branch');
+    expect(review).toContain('git show');
+    for (const kind of ['artifact', 'investigation'] as const) {
+      const handback = renderMinionBriefing({ ...base, deliverable: kind });
+      expect(handback).toContain('do not open a');
+      expect(handback).toContain('pull request');
+      expect(handback).not.toContain('READ-ONLY');
+    }
+    const pr = renderMinionBriefing({ ...base, deliverable: 'pr' });
+    expect(pr).toContain('commit your work to the branch');
+    expect(pr).toContain('never merge your own pull request');
+    const omitted = renderMinionBriefing(base);
+    expect(omitted).toContain('commit your work to the branch');
+  });
+
   it('omits the section entirely when there are no pointers', () => {
     const briefing = renderMinionBriefing({
       jobId: 'job-1',
