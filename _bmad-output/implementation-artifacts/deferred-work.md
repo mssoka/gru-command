@@ -23,11 +23,8 @@
   summary: `reconcilePendingRebriefs` delivery-only branch may append a `silas.rebrief-recovered` event for a marker group replaced by a newer request mid-boot
   evidence: Markers are read as a boot snapshot; a newer re-brief request can replace them while recovery runs. The `expectedPhaseId` fence added by this delta prevents any phase completion from the stale group (and nothing is cleared), but the recovered-history event is still appended as noise.
 - source_spec: none
-  summary: Investigate and resolve five unrelated UI screenshot/reflow failures in `npm run e2e`.
-  evidence: The Stage 2 run at cd8965c34b88e87fd32037025f86b3b698941afc had 46 e2e passes and five UI failures; this is independently shippable from the Stage 1 verify-scope routing fix and must not silently enter the Stage 2 behavior change.
-- source_spec: none
   summary: Obtain scheduled full `/api/verify` receipts, exact-head CI, and native Perkins READY for the final Stage 2 head.
-  evidence: These operational gates require a final clean head and authenticated job/receipt context and are independent of repairing the Stage 1 verify-scope command; run them after the code and test fixes are finalized.
+  evidence: Operational gates for the owner's authenticated scheduler. The e2e-repair deferral below is resolved: the five UI failures were fixed by this branch (held mock turns, busy-phrase rotation, reserved busy-status slot, expanded service events, sheet preservation) and re-verified on the integrated head 81295ed over the current base 39a19ea — `npm test` green (fast 1766/heavy 750/web 466) and `npm run e2e` 55/55 including visually inspected theme snapshots; the four refreshed snapshots were accepted after explicit image inspection (intact header, bubbles, composer, panels; no blank/garbled regions).
 - source_spec: `_bmad-output/implementation-artifacts/spec-pr142-review-verdict-closure.md`
   summary: App review reconciliation can certify absence from a review-list record missing delivery-predicate fields.
   evidence: Inherited from main e75ca3d; `isDecidableReviewEntry` permits absent state/commit_id/body/submitted_at, while a short `lookupMatchingReview` page can certify non-delivery. Blind 1, Edge 2 and Verification Other 1 share this defect.
