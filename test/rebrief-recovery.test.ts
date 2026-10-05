@@ -618,11 +618,12 @@ describe('re-brief restart safety (durable markers)', () => {
     let busSettlements = 0;
     h.bus.subscribe((event) => { if (event.jobId === jobId && event.kind === 'silas.rebrief-settled') busSettlements += 1; });
     const fault = new Error('settlement publication failed');
+    const markers = h.ledger.listPendingRebriefs({ jobId });
     const restore = failSettlementPublication(h.ledger, fault);
     try {
       expect(() => finalizeRebriefRequest({
         ledger: h.ledger, worktrees: h.worktrees, jobId,
-        minionId: 'worker', lanePath: h.lanePath, note: 'n',
+        minionId: 'worker', lanePath: h.lanePath, note: 'n', expectedMarkers: markers,
       })).toThrow(/settlement publication failed/u);
     } finally { restore(); }
     // Atomicity: the failure rolled the clear back, so the markers and
@@ -633,16 +634,45 @@ describe('re-brief restart safety (durable markers)', () => {
     expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-settled')).toBeNull();
     expect(busSettlements).toBe(0);
 
-    // The next pass repairs the exact window: the markers clear and the
-    // queued review handoff's release signal publishes exactly once.
+    // The next pass repairs the exact window: the admitted generation
+    // clears and the queued review handoff's release signal publishes
+    // exactly once.
     const result = finalizeRebriefRequest({
       ledger: h.ledger, worktrees: h.worktrees, jobId,
-      minionId: 'worker', lanePath: h.lanePath, note: 'n',
+      minionId: 'worker', lanePath: h.lanePath, note: 'n', expectedMarkers: markers,
     });
     expect(result.superseded).toBe(false);
     expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(0);
     expect(h.ledger.listJobEvents(jobId).filter((event) => event.kind === 'silas.rebrief-settled')).toHaveLength(1);
     expect(busSettlements).toBe(1);
+  });
+
+  it('a newer request admitted after a settlement failure is never settled by the old turn (issue #189)', async () => {
+    const h = makeHarness();
+    const jobId = 'settlement-fault-supersede-job';
+    await seedPendingRebrief({ h, jobId });
+    h.ledger.appendCustomEvent({ kind: 'silas.rebrief', jobId });
+    h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId });
+    const oldMarkers = h.ledger.listPendingRebriefs({ jobId });
+    const restore = failSettlementPublication(h.ledger, new Error('settlement publication failed'));
+    try {
+      expect(() => finalizeRebriefRequest({
+        ledger: h.ledger, worktrees: h.worktrees, jobId,
+        minionId: 'worker', lanePath: h.lanePath, note: 'n', expectedMarkers: oldMarkers,
+      })).toThrow(/settlement publication failed/u);
+    } finally { restore(); }
+    expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(2);
+
+    // A newer request owns the lane now: the old turn's replay must not
+    // settle or erase it — the older receipt stays evidence only.
+    const newer = h.ledger.beginPendingRebrief({ jobId, note: 'new request', briefing: 'new contract' });
+    const replay = finalizeRebriefRequest({
+      ledger: h.ledger, worktrees: h.worktrees, jobId,
+      minionId: 'worker', lanePath: h.lanePath, note: 'old', expectedMarkers: oldMarkers,
+    });
+    expect(replay.superseded).toBe(true);
+    expect(h.ledger.listPendingRebriefs({ jobId }).map((marker) => marker.id)).toEqual(newer.map((marker) => marker.id));
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-settled')).toBeNull();
   });
 
   it('boot completion of spent markers survives a settlement failure and settles on the next pass (issue #189)', async () => {
