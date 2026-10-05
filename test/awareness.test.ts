@@ -1150,4 +1150,66 @@ describe('gru awareness — passive queue rotation (GH-109)', () => {
     );
     expect(() => boot({ dir, wakeMode: 'never' })).toThrow(/invalid attention section/);
   });
+
+  it('covers both queues when both are deeper than their block slots', () => {
+    const rig = boot({ wakeMode: 'never', limits: { maxActionNotes: 4 } });
+    const ownerOrder = seedQueue(rig, 10, 'mix-own', 'needs-owner');
+    const machineOrder = seedQueue(rig, 10, 'mix-mach', 'action-required');
+    const all = [...ownerOrder, ...machineOrder];
+    const seen = new Set<string>();
+    for (let block = 0; block < 6 && seen.size < all.length; block += 1) {
+      const prepared = rig.awareness.prepare();
+      expect(prepared).not.toBeNull();
+      expect(prepared?.notificationIds?.length).toBeLessThanOrEqual(4);
+      for (const id of prepared?.notificationIds ?? []) seen.add(id);
+      rig.awareness.commit(prepared!);
+    }
+    expect([...seen].sort()).toEqual([...all].sort());
+  });
+
+  it('rotation still covers every open row when the byte cap fits fewer notes than the page', () => {
+    const rig = boot({ wakeMode: 'never', limits: { maxActionNotes: 4, maxBytes: 240, maxLineChars: 120 } });
+    const order = seedQueue(rig, 8, 'cap');
+    const seen = new Set<string>();
+    for (let block = 0; block < 20 && seen.size < order.length; block += 1) {
+      const prepared = rig.awareness.prepare();
+      expect(prepared).not.toBeNull();
+      for (const id of prepared?.notificationIds ?? []) seen.add(id);
+      rig.awareness.commit(prepared!);
+    }
+    expect([...seen].sort()).toEqual([...order].sort());
+  });
+
+  it('an undelivered passive block re-prepares unchanged and consumes no rotation', () => {
+    const rig = boot({ wakeMode: 'never', limits: { maxActionNotes: 4 } });
+    seedQueue(rig, 10, 'retry');
+    const first = rig.awareness.prepare();
+    expect(first).not.toBeNull();
+    const again = rig.awareness.prepare();
+    expect(again?.notificationIds).toEqual(first?.notificationIds);
+    expect(again?.text).toBe(first?.text);
+    // Nothing was delivered: no rotation was consumed or persisted.
+    expect(existsSync(join(rig.dir, AWARENESS_STATE_NAME))).toBe(false);
+    rig.awareness.commit(first!);
+    const persisted = JSON.parse(readFileSync(join(rig.dir, AWARENESS_STATE_NAME), 'utf-8')) as {
+      attention?: { machineOffset: number; ownerOffset: number };
+    };
+    expect(persisted.attention).toEqual({ machineOffset: 4, ownerOffset: 0 });
+  });
+
+  it('an exact-tail alignment restarts the cycle in the same turn instead of spending a null block', () => {
+    const rig = boot({ wakeMode: 'never', limits: { maxActionNotes: 4 } });
+    const order = seedQueue(rig, 8, 'exact');
+    const blocks: string[][] = [];
+    for (let block = 0; block < 3; block += 1) {
+      const prepared = rig.awareness.prepare();
+      // Never a null user turn while open rows exist.
+      expect(prepared).not.toBeNull();
+      blocks.push([...(prepared?.notificationIds ?? [])]);
+      rig.awareness.commit(prepared!);
+    }
+    expect(blocks[0]).toEqual(order.slice(0, 4));
+    expect(blocks[1]).toEqual(order.slice(4, 8));
+    expect(blocks[2]).toEqual(order.slice(0, 4));
+  });
 });
