@@ -51,6 +51,13 @@ export function isLoopbackHostname(hostname: string): boolean {
   return LOOPBACK_HOSTS.has(hostname.replace(/^\[|\]$/gu, '').toLowerCase());
 }
 
+/** The one request path each named slot may ever POST to. */
+function slotRequestPath(slot: string): string | null {
+  if (slot === 'openrouter') return '/api/alpha/decisions';
+  if (slot === 'typesafe') return SYSTEMONE_PATH;
+  return null;
+}
+
 /** One provider profile as the runtime, CLI and provider consume it. */
 export interface DecisionProviderProfile {
   readonly protocol: DecisionProtocol;
@@ -107,6 +114,12 @@ function requireSystemOnePath(parsed: URL): void {
   }
 }
 
+function requireHttpScheme(parsed: URL): void {
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new ProfileEndpointError('endpoint scheme must be http: or https:');
+  }
+}
+
 /**
  * Validate a profile's endpoint against its protocol and credential slot.
  * `mode === 'resolved'` (env/file keys) enforces the slot's pinned origin;
@@ -122,6 +135,9 @@ export function assertProfileEndpoint(
     if (!isLoopbackHostname(parsed.hostname)) {
       throw new ProfileEndpointError('credential = "none" is allowed only for loopback hosts (127.0.0.1, ::1, localhost)');
     }
+    // A keyless request still travels over a supported web scheme; exotic
+    // schemes would fail only later, at fetch time.
+    requireHttpScheme(parsed);
     if (profile.protocol === 'systemone') requireSystemOnePath(parsed);
     return parsed;
   }
@@ -133,7 +149,13 @@ export function assertProfileEndpoint(
       );
     }
     requireHttpsOrigin(parsed, origin, profile.credential);
-    if (profile.protocol === 'systemone') requireSystemOnePath(parsed);
+    // The slot binds the PATH as well as the origin: a resolved key is
+    // never sent to any other same-origin route (the single-provider
+    // validator pinned /api/alpha/decisions exactly this way).
+    const pinnedPath = slotRequestPath(profile.credential);
+    if (pinnedPath !== null && parsed.pathname !== pinnedPath && parsed.pathname !== `${pinnedPath}/`) {
+      throw new ProfileEndpointError(`${profile.credential} credential binds to the ${pinnedPath} path`);
+    }
     return parsed;
   }
   // Explicit in-process key: the protocol shape still applies.

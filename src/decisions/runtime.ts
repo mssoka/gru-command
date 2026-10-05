@@ -315,7 +315,21 @@ export class DecisionRuntime implements DecisionService {
    * omitted or unrouted surface rides the default profile. */
   private routeFor(surface: string | undefined): string {
     if (surface === undefined) return DEFAULT_DECISION_PROFILE;
-    return this.currentConfig.surfaces[surface] ?? DEFAULT_DECISION_PROFILE;
+    const routed = this.currentConfig.surfaces[surface];
+    return routed ?? DEFAULT_DECISION_PROFILE;
+  }
+
+  /** True when the profile this surface routes to is LIVE (constructed and
+   * probed), so callers can gate work on the routed profile's health
+   * instead of the default profile's. The runtime-level disabled state
+   * gates everything; a degraded default only gates default-routed
+   * surfaces. */
+  readyFor(surface?: string): boolean {
+    if (this.disposed || !this.currentConfig.jev.enabled) return false;
+    if (this.currentStatus.status === 'checking') return false;
+    const name = this.routeFor(surface);
+    if (name === DEFAULT_DECISION_PROFILE) return this.primary !== null;
+    return this.profileServices.get(name) instanceof ProfileDecisionService;
   }
 
   async decide<Q extends QuestionSet>(
@@ -332,12 +346,22 @@ export class DecisionRuntime implements DecisionService {
     }
     // A live default-profile call failing degrades the runtime (existing
     // semantics — one health, one incident stream). Failures of any other
-    // profile fall back deterministically per call and never invent an
-    // owner incident for a surface nobody may be watching.
-    if (outcome.provenance.source === 'deterministic' && profileName === DEFAULT_DECISION_PROFILE && this.primary !== null) {
-      const reason = outcome.provenance.fallbackReason ?? 'provider_degraded';
-      if (reason !== 'capacity_limited') this.degrade(reason);
-      return deterministicOutcome(request, thresholdsOf(this.currentConfig), reason);
+    // profile fall back deterministically per call, are logged for the
+    // operator, and never invent an owner incident for a surface nobody
+    // may be watching. Durable per-profile counters arrive with the yield
+    // telemetry (#214).
+    if (outcome.provenance.source === 'deterministic') {
+      if (profileName === DEFAULT_DECISION_PROFILE && this.primary !== null) {
+        const reason = outcome.provenance.fallbackReason ?? 'provider_degraded';
+        if (reason !== 'capacity_limited') this.degrade(reason);
+        return deterministicOutcome(request, thresholdsOf(this.currentConfig), reason);
+      }
+      if (profileName !== DEFAULT_DECISION_PROFILE) {
+        this.log('warn', 'decision profile fell back; deterministic answer served', {
+          profile: profileName,
+          reason: outcome.provenance.fallbackReason ?? 'provider_degraded',
+        });
+      }
     }
     return outcome;
   }
@@ -449,10 +473,19 @@ export class DecisionRuntime implements DecisionService {
     }
     const primaryProfile = effective[DEFAULT_DECISION_PROFILE];
     if (primaryProfile === undefined) return this.degrade('config_invalid');
-    const credential = resolveCredential(this.options.instanceDir, this.env, primaryProfile.credential);
-    if (credential.state !== 'present' || credential.key === undefined) {
-      const reason = resolvedCredentialReason(credential);
-      return this.degrade(reason, credential.source);
+    // A keyless default-profile override (loopback systemone) never
+    // resolves a credential: the provider runs with no key, exactly like
+    // the non-default builder.
+    let key: string | null = null;
+    let credentialSource: CredentialSource = 'none';
+    if (primaryProfile.credential !== KEYLESS_CREDENTIAL) {
+      const credential = resolveCredential(this.options.instanceDir, this.env, primaryProfile.credential);
+      if (credential.state !== 'present' || credential.key === undefined) {
+        const reason = resolvedCredentialReason(credential);
+        return this.degrade(reason, credential.source);
+      }
+      key = credential.key;
+      credentialSource = credential.source;
     }
 
     let candidate: ProfileDecisionService;
@@ -460,7 +493,7 @@ export class DecisionRuntime implements DecisionService {
       candidate = new ProfileDecisionService(
         new ProfileProvider({
           profile: primaryProfile,
-          key: credential.key,
+          key,
           credentialMode: 'resolved',
           fetchImpl: this.options.fetchImpl,
         }),
@@ -468,7 +501,7 @@ export class DecisionRuntime implements DecisionService {
         DEFAULT_DECISION_PROFILE,
       );
     } catch (error) {
-      return this.degrade(providerConstructionReason(error), credential.source);
+      return this.degrade(providerConstructionReason(error), credentialSource);
     }
     this.pendingPrimary = candidate;
     const probe = await candidate.decide(PROBE_REQUEST);
@@ -479,7 +512,7 @@ export class DecisionRuntime implements DecisionService {
     }
     if (probe.provenance.source !== 'jev') {
       candidate.dispose();
-      return this.degrade(probe.provenance.fallbackReason ?? 'provider_degraded', credential.source);
+      return this.degrade(probe.provenance.fallbackReason ?? 'provider_degraded', credentialSource);
     }
     // This is a semantic liveness check, not an operator action. User
     // routing/confirmation thresholds must not make a healthy provider
@@ -489,7 +522,7 @@ export class DecisionRuntime implements DecisionService {
       probe.answers.probe_class.choice !== 'healthy_probe'
     ) {
       candidate.dispose();
-      return this.degrade('probe_failed', credential.source);
+      return this.degrade('probe_failed', credentialSource);
     }
     this.profileServices.set(DEFAULT_DECISION_PROFILE, candidate);
     this.primary = candidate;
@@ -500,8 +533,8 @@ export class DecisionRuntime implements DecisionService {
       reason: null,
       model: probe.provenance.model ?? primaryProfile.model,
       endpoint: primaryProfile.endpoint,
-      credentialPresent: true,
-      credentialSource: credential.source,
+      credentialPresent: credentialSource !== 'none',
+      credentialSource,
       checkedAt: new Date().toISOString(),
       incarnation: this.incarnation,
       generation: this.generation,
@@ -510,7 +543,7 @@ export class DecisionRuntime implements DecisionService {
       model: this.currentStatus.model,
       profile: DEFAULT_DECISION_PROFILE,
       profiles: [...this.profileServices.keys()].sort(),
-      credential_source: credential.source,
+      credential_source: credentialSource,
       latency_ms: probe.provenance.latencyMs,
       usage: probe.provenance.usage,
     });
@@ -529,14 +562,27 @@ export class DecisionRuntime implements DecisionService {
     return this.status();
   }
 
+  /** Retire ONLY the default profile's provider: a degrade is the default
+   * profile's health event, not a configuration change, so healthy
+   * non-default profiles keep serving their routed surfaces. (A config
+   * change goes through configure(), which disposes everything and bumps
+   * the generation — that path keeps the discard-in-flight semantics.) */
+  private degradeDefaultService(reason: DecisionFailureReason): void {
+    this.pendingPrimary?.dispose();
+    this.pendingPrimary = null;
+    this.primary?.dispose();
+    this.primary = null;
+    const standIn = new DeterministicDecisionService(thresholdsOf(this.currentConfig), reason);
+    this.profileServices.set(DEFAULT_DECISION_PROFILE, standIn);
+  }
+
   private degrade(
     reason: DecisionFailureReason,
     credentialSource: CredentialSource = this.currentStatus.credentialSource,
   ): DecisionRuntimeStatus {
     this.generation += 1;
-    this.disposeServices();
-    this.service = new DeterministicDecisionService(thresholdsOf(this.currentConfig), reason);
-    this.profileServices.set(DEFAULT_DECISION_PROFILE, this.service);
+    this.degradeDefaultService(reason);
+    this.service = this.profileServices.get(DEFAULT_DECISION_PROFILE)!;
     const fields = primaryProfileFields(this.currentConfig);
     this.currentStatus = {
       enabled: true,
@@ -696,13 +742,19 @@ export async function checkDecisionProfile(
   options: Pick<DecisionRuntimeOptions, 'instanceDir' | 'env' | 'fetchImpl'>,
 ): Promise<DecisionProfileCheckResult> {
   if (!config.jev.enabled) {
+    // Even with the master switch off, an unknown profile is an operator
+    // typo and must fail loudly — never report a successful check.
+    const effective = effectiveDecisionProviders(config);
+    if (!Object.prototype.hasOwnProperty.call(effective, profileName)) {
+      throw new Error(`unknown decision profile "${profileName}" (available: ${Object.keys(effective).join(', ')})`);
+    }
     return { profile: profileName, ok: true, status: 'disabled', reason: null, model: null };
   }
   let profile: DecisionProviderProfile;
   try {
     const effective = effectiveDecisionProviders(config);
     const found = effective[profileName];
-    if (found === undefined) {
+    if (found === undefined || !Object.prototype.hasOwnProperty.call(effective, profileName)) {
       throw new Error(`unknown decision profile "${profileName}" (available: ${Object.keys(effective).join(', ')})`);
     }
     validateProviderProfile(found, `decisions.providers.${profileName}`);

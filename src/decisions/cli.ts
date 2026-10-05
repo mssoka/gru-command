@@ -39,11 +39,19 @@ async function readStdin(maxBytes = 16_384): Promise<string> {
 }
 
 /** Offline, sanitised status: legacy top-level fields plus one entry per
- * effective profile (built-ins included). No key material ever leaves. */
+ * effective profile (built-ins included). The top-level credential fields
+ * describe the DEFAULT profile's slot (today's single-slot semantics), so
+ * an overridden default reports its own slot — never hardcoded OpenRouter.
+ * No key material ever leaves. */
 function offlineStatus(): number {
   const config = loadConfig();
-  const credential = resolveCredential(config.instanceDir);
-  const profiles = Object.entries(effectiveDecisionProviders(config.decisions)).map(([name, profile]) => {
+  const effective = effectiveDecisionProviders(config.decisions);
+  const defaultSlot = effective[DEFAULT_DECISION_PROFILE]?.credential ?? 'openrouter';
+  const credential =
+    defaultSlot === KEYLESS_CREDENTIAL
+      ? { state: 'present' as const, source: 'none' as const }
+      : resolveCredential(config.instanceDir, process.env, defaultSlot);
+  const profiles = Object.entries(effective).map(([name, profile]) => {
     if (profile.credential === KEYLESS_CREDENTIAL) {
       return {
         name,
@@ -79,13 +87,13 @@ function offlineStatus(): number {
 async function check(profileName: string | null, asJson: boolean): Promise<number> {
   const config = loadConfig();
   const name = profileName ?? DEFAULT_DECISION_PROFILE;
-  if (!config.decisions.jev.enabled) {
-    if (asJson) json({ ok: true, status: 'disabled', reason: null });
-    else process.stdout.write(`${name}: disabled (the [decisions] master switch is off)\n`);
-    return 0;
-  }
   if (profileName === null) {
     // Default profile: the full runtime startup probe (existing behavior).
+    if (!config.decisions.jev.enabled) {
+      if (asJson) json({ ok: true, status: 'disabled', reason: null });
+      else process.stdout.write(`${name}: disabled (the [decisions] master switch is off)\n`);
+      return 0;
+    }
     const runtime = new DecisionRuntime(config.decisions, {
       instanceDir: config.instanceDir,
       watchConfig: false,
@@ -100,6 +108,8 @@ async function check(profileName: string | null, asJson: boolean): Promise<numbe
       runtime.dispose();
     }
   }
+  // A named profile validates its existence FIRST — a master-switch-off
+  // check of a misspelled profile is a failed check, not a clean disabled.
   const result = await checkDecisionProfile(config.decisions, name, {
     instanceDir: config.instanceDir,
     env: process.env,

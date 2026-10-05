@@ -509,12 +509,15 @@ export function builtinDecisionProviders(jev: JevConfig): Record<string, Decisio
 /** The effective profile set: built-ins (with the legacy `[decisions.jev]`
  * block feeding `openrouter-jev`), overlaid by `[decisions.providers]`.
  * Pure and total: every consumer (runtime, CLI, docs) reads routing from
- * this one map. Throws ConfigError-shaped profile errors on an invalid
- * merge — callers degrade loudly, never silently. */
+ * this one map, which is prototype-free so reserved names (`__proto__`,
+ * `toString`) behave as ordinary profile names. Throws
+ * ConfigError-shaped profile errors on an invalid merge — callers degrade
+ * loudly, never silently. */
 export function effectiveDecisionProviders(
   config: DecisionsConfig,
 ): Record<string, DecisionProviderTable> {
-  const merged = builtinDecisionProviders(config.jev);
+  const merged: Record<string, DecisionProviderTable> = Object.create(null);
+  Object.assign(merged, builtinDecisionProviders(config.jev));
   for (const [name, table] of Object.entries(config.providers)) {
     merged[name] = table;
   }
@@ -1767,10 +1770,13 @@ function readDecisionsConfig(
   // Provider profiles (issue #222). Each table is FULL (protocol, endpoint,
   // model, credential, timeout_ms; optional input_price_per_mtok) and is
   // validated against its protocol's endpoint/credential binding rules.
-  const providers: Record<string, DecisionProviderTable> = {};
+  // Prototype-free: a reserved name like `__proto__` stays an ordinary
+  // profile name instead of silently mutating or vanishing.
+  const providers: Record<string, DecisionProviderTable> = Object.create(null);
   if (table['providers'] !== undefined) {
     const providersTable = requireTable(table['providers'], file, 'decisions.providers');
     for (const name of Object.keys(providersTable)) {
+      if (!Object.prototype.hasOwnProperty.call(providersTable, name)) continue;
       if (!/^[A-Za-z0-9_-]+$/u.test(name)) {
         throw new ConfigError(
           `provider profile name \`${name}\` must match [A-Za-z0-9_-]+`,
@@ -1830,12 +1836,15 @@ function readDecisionsConfig(
     }
   }
   // Per-surface routing: every surface must name a profile that exists in
-  // the effective set (built-ins + this table).
-  const surfaces: Record<string, string> = {};
+  // the effective set (built-ins + this table). Both documented spellings
+  // are accepted — the shorthand `surface = "profile"` and the explicit
+  // `[decisions.surfaces.<surface>] provider = "profile"` table.
+  const surfaces: Record<string, string> = Object.create(null);
   if (table['surfaces'] !== undefined) {
     const surfacesTable = requireTable(table['surfaces'], file, 'decisions.surfaces');
     const effective = effectiveDecisionProviders({ ...defaults, jev, providers, surfaces: {} });
     for (const surface of Object.keys(surfacesTable)) {
+      if (!Object.prototype.hasOwnProperty.call(surfacesTable, surface)) continue;
       if (!/^[a-z0-9_]+$/u.test(surface)) {
         throw new ConfigError(
           `decision surface name \`${surface}\` must match [a-z0-9_]+`,
@@ -1843,8 +1852,31 @@ function readDecisionsConfig(
           `decisions.surfaces.${surface}`,
         );
       }
-      const profile = requireString(surfacesTable[surface], file, `decisions.surfaces.${surface}`);
-      if (effective[profile] === undefined) {
+      let profile: string;
+      const entry = surfacesTable[surface];
+      if (typeof entry === 'object' && entry !== null && !Array.isArray(entry)) {
+        const surfaceTable = entry as Record<string, unknown>;
+        for (const key of Object.keys(surfaceTable)) {
+          if (key !== 'provider') {
+            throw new ConfigError(
+              `unknown key \`${key}\` in [decisions.surfaces.${surface}] (valid keys: provider)`,
+              file,
+              `decisions.surfaces.${surface}.${key}`,
+            );
+          }
+        }
+        if (surfaceTable['provider'] === undefined) {
+          throw new ConfigError(
+            `[decisions.surfaces.${surface}] is missing required key \`provider\``,
+            file,
+            `decisions.surfaces.${surface}`,
+          );
+        }
+        profile = requireString(surfaceTable['provider'], file, `decisions.surfaces.${surface}.provider`);
+      } else {
+        profile = requireString(entry, file, `decisions.surfaces.${surface}`);
+      }
+      if (!Object.prototype.hasOwnProperty.call(effective, profile)) {
         throw new ConfigError(
           `decisions.surfaces.${surface} names unknown provider profile \`${profile}\` (available: ${Object.keys(effective).join(', ')})`,
           file,

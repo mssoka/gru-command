@@ -6,7 +6,11 @@ import type { AgentEventEnvelope } from '../runtime/registry.js';
 import type { LedgerApi } from '../ledger/api.js';
 import type { NotificationCenter } from '../notifications/center.js';
 import type { DecisionService } from '../decisions/types.js';
-import { deterministicFailureClass, supervisionDecisionRequest } from '../decisions/questions.js';
+import {
+  DECISION_SURFACE_SUPERVISION,
+  deterministicFailureClass,
+  supervisionDecisionRequest,
+} from '../decisions/questions.js';
 import {
   backoffDelayMs,
   isRateLimitErrorText,
@@ -1476,7 +1480,7 @@ export class Supervisor {
       breakerLimit: this.cfg.maxRestarts,
     });
     try {
-      const outcome = await this.decisions.decide(request);
+      const outcome = await this.decisions.decide(request, { surface: DECISION_SURFACE_SUPERVISION });
       // The entity may have been stopped/disposed/replaced while Jev was
       // answering. A stale answer never starts a restart. A SILENCE
       // decision is additionally voided once native compaction opened:

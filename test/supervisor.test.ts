@@ -3193,3 +3193,23 @@ describe('pacing settlement across rejection, recovery, and slot retirement', ()
     }
   });
 });
+
+describe('supervision decision surface identity (issue #222)', () => {
+  it('passes its stable surface name to the decision service', async () => {
+    const decide = vi.fn((request: Parameters<DecisionService['decide']>[0], _opts?: { readonly surface?: string }) =>
+      Promise.resolve(deterministicOutcome(request, DEFAULT_DECISIONS_CONFIG.thresholds, 'disabled')));
+    const lane = boot({ decide } as unknown as DecisionService);
+    try {
+      const handle = new FakeHandle('gru', 'gru-surface-canary', null);
+      lane.registry.adopt(handle);
+      hang(handle); // open silent turn → silence fires the turn-hang decision
+      lane.advance(60);
+      await vi.waitFor(() => expect(decide).toHaveBeenCalledTimes(1));
+      // The supervisor's guidance decision is routable: it always names its
+      // surface, so [decisions.surfaces] can route it independently.
+      expect(decide.mock.calls[0]![1]).toEqual({ surface: 'supervision_guidance' });
+    } finally {
+      lane.supervisor.dispose();
+    }
+  });
+});

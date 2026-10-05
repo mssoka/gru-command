@@ -49,11 +49,14 @@ function usageOf(raw: unknown, profile: DecisionProviderProfile): DecisionUsage 
   const usage = raw as Record<string, unknown>;
   const inputTokens = safeNumber(usage.input_tokens);
   const reportedCost = safeNumber(usage.cost);
-  const computedCost =
+  let computedCost: number | null =
     reportedCost ??
     (profile.protocol === 'systemone' && inputTokens !== null
       ? (inputTokens * inputPricePerMtokOf(profile)) / 1_000_000
       : null);
+  // A huge-but-finite token count can overflow the price product; a
+  // non-finite cost is no cost — record null, never an invented number.
+  if (computedCost !== null && !Number.isFinite(computedCost)) computedCost = null;
   return {
     inputTokens,
     outputTokens: safeNumber(usage.output_tokens),
@@ -127,7 +130,8 @@ export interface ProfileProviderOptions {
    * loopback profile. */
   readonly key: string | null;
   /** Resolved env/file keys are restricted to the slot's pinned origin;
-   * explicitly injected in-process keys only need the protocol shape. */
+   * explicitly injected in-process keys only need the protocol shape. The
+   * SAFE default is 'resolved': an injected-key test opts in explicitly. */
   readonly credentialMode?: 'resolved' | 'explicit';
   /** Test seam. Production uses global fetch with redirect disabled. */
   readonly fetchImpl?: typeof globalThis.fetch;
@@ -149,7 +153,7 @@ export class ProfileProvider {
   private disposed = false;
 
   constructor(options: ProfileProviderOptions) {
-    this.credentialMode = options.credentialMode ?? 'explicit';
+    this.credentialMode = options.credentialMode ?? 'resolved';
     this.profile = options.profile;
     // Validate once at construction so a misbound profile fails loud
     // before any request exists.

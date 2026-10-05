@@ -83,6 +83,10 @@ re-declaring it (every key is required) or defines a new profile:
 | `typesafe-direct` | `systemone` | `https://api.typesafe.ai/v1/systemone` | `jev-latest` | `typesafe` |
 | `local` | `systemone` | `http://127.0.0.1:8088/v1/systemone` | `laya-421m` | `none` |
 
+The built-in `local` profile pins `input_price_per_mtok = 0` (a local model
+has no cash cost); override the profile to price token-bearing local
+servers otherwise.
+
 Both protocols send the same request (`{ model, state, questions }` with
 `Authorization: Bearer <key>`) and accept the same typed answer envelope;
 response validation is identical. A `systemone` response that reports only
@@ -109,27 +113,40 @@ event_triage = "typesafe-direct"
 
 Routing rules:
 
-- `[decisions.surfaces.<surface>]` maps a surface name to a profile name.
-  Unlisted surfaces (and omitted surface arguments) ride the default
-  `openrouter-jev` profile — pre-profile behavior, unchanged. The
-  deterministic fallback never changes and stays the floor.
+- `[decisions.surfaces.<surface>]` maps a surface name to a profile name —
+  as the shorthand `event_triage = "typesafe-direct"` or as the explicit
+  table `[decisions.surfaces.event_triage]` with `provider =
+  "typesafe-direct"`. Unlisted surfaces (and omitted surface arguments)
+  ride the default `openrouter-jev` profile — pre-profile behavior,
+  unchanged. The deterministic fallback never changes and stays the floor.
+- Production callers pass stable surface names: event/notification triage
+  uses `event_triage`; supervisor runtime-health guidance uses
+  `supervision_guidance`.
 - The legacy `[decisions.jev]` block keeps working: it is the master
   switch and feeds the default profile's model/endpoint/timeout.
 - **Credential binding is the security property.** A slot's resolved key is
-  only ever sent to its pinned origin — `openrouter` → `https://openrouter.ai`,
-  `typesafe` → `https://api.typesafe.ai` — enforced at config validation,
+  only ever sent to its pinned origin AND its pinned request path —
+  `openrouter` → `https://openrouter.ai/api/alpha/decisions`, `typesafe` →
+  `https://api.typesafe.ai/v1/systemone` — enforced at config validation,
   at provider construction, and again immediately before every request;
-  redirects are refused. `credential = "none"` (keyless) and `http:`
-  endpoints are allowed only for loopback hosts (`127.0.0.1`, `::1`,
-  `localhost`).
+  redirects are refused. `credential = "none"` (keyless) is allowed only
+  for loopback hosts (`127.0.0.1`, `::1`, `localhost`) over `http:` or
+  `https:`.
 - Hot reload applies to profiles and surface routing like every other
   `[decisions]` key: a switch swaps the surface's profile without a
   restart; in-flight answers from the old generation are discarded
-  (existing semantics).
+  (existing semantics). A degrade of the default profile retires only the
+  default profile's provider — other profiles keep serving their routed
+  surfaces.
 - Non-default profiles are constructed offline and probed only when used:
   a profile whose credential is missing falls back deterministically for
-  its own calls and never invents an owner incident. Probe any profile
+  its own calls (logged, never an owner incident). Probe any profile
   explicitly with `check --profile <name>`.
+- **Credential changes need a recheck.** A running service resolves slot
+  credentials when it (re)configures; after
+  `credentials set --slot <name> --stdin`, use the Recheck surface (or
+  restart) to adopt the new key — CLI `status`/`check --profile` always
+  see the fresh key.
 
 Provenance gains `profile` (the profile name that produced a `jev` outcome;
 null on deterministic fallbacks).

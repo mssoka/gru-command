@@ -36,6 +36,7 @@ import {
 } from '../src/decisions/questions.js';
 import { ProfileDecisionService, ProfileProvider } from '../src/decisions/provider.js';
 import { checkDecisionProfile, DecisionRuntime } from '../src/decisions/runtime.js';
+import { deterministicOutcome } from '../src/decisions/service.js';
 import {
   decisionRoute,
   validateAnswer,
@@ -1257,9 +1258,9 @@ describe('decision provider profiles (issue #222)', () => {
         credentialMode: 'resolved',
         fetchImpl: fetchImpl as typeof fetch,
       })).toThrow(/endpoint_untrusted/);
-      // typesafe key + openrouter endpoint
+      // typesafe key + openrouter endpoint (slot stays typesafe)
       expect(() => new ProfileProvider({
-        profile: systemoneProfile({ endpoint: OPENROUTER_ENDPOINT, credential: 'openrouter' }),
+        profile: systemoneProfile({ endpoint: OPENROUTER_ENDPOINT }),
         key: 'secret-typesafe-key',
         credentialMode: 'resolved',
         fetchImpl: fetchImpl as typeof fetch,
@@ -1499,5 +1500,383 @@ describe('decision provider profiles (issue #222)', () => {
         env: {},
       })).toMatchObject({ ok: true, status: 'disabled' });
     });
+  });
+});
+
+// ------------------------------------------------------------------
+// Issue #222 review fixes (blind-hunter / edge-case-hunter / verification-gap /
+// acceptance-auditor findings)
+// ------------------------------------------------------------------
+
+describe('decision profile review fixes', () => {
+  const OPENROUTER_ENDPOINT = 'https://openrouter.ai/api/alpha/decisions';
+  const TYPESAFE_ENDPOINT = 'https://api.typesafe.ai/v1/systemone';
+
+  function systemoneProfile(overrides: Partial<DecisionProviderTable> = {}): DecisionProviderTable {
+    return providerProfile({
+      protocol: 'systemone',
+      endpoint: TYPESAFE_ENDPOINT,
+      model: 'jev-latest',
+      credential: 'typesafe',
+      ...overrides,
+    });
+  }
+
+  function writeInstanceConfig(instance: string, body: string): string {
+    mkdirSync(instance, { recursive: true });
+    writeFileSync(join(instance, 'config.toml'), body);
+    return instance;
+  }
+
+  it('binds a resolved slot to its request path, not just its origin', () => {
+    const fetchImpl = vi.fn();
+    // The single-provider path pin is restored: a resolved OpenRouter key
+    // may never POST to another same-origin route.
+    expect(() => new ProfileProvider({
+      profile: providerProfile({ endpoint: 'https://openrouter.ai/api/v1/chat' }),
+      key: 'secret-openrouter-key',
+      credentialMode: 'resolved',
+      fetchImpl: fetchImpl as typeof fetch,
+    })).toThrow(/endpoint_untrusted/);
+    // ...and a resolved TypeSafe key never reaches another api.typesafe.ai
+    // path, including through an openrouter-decisions protocol miswiring.
+    expect(() => new ProfileProvider({
+      profile: providerProfile({ endpoint: 'https://api.typesafe.ai/api/other', credential: 'typesafe' }),
+      key: 'secret-typesafe-key',
+      credentialMode: 'resolved',
+      fetchImpl: fetchImpl as typeof fetch,
+    })).toThrow(/endpoint_untrusted/);
+    // The pinned paths themselves still pass.
+    expect(() => new ProfileProvider({
+      profile: providerProfile(),
+      key: 'secret-openrouter-key',
+      credentialMode: 'resolved',
+      fetchImpl: fetchImpl as typeof fetch,
+    })).not.toThrow();
+    expect(fetchImpl).not.toHaveBeenCalled();
+    const instance = writeInstanceConfig(temp('gru-222-review-pathpin-'), [
+      '[decisions.providers.x]',
+      'protocol = "openrouter-decisions"',
+      'endpoint = "https://openrouter.ai/wrong/path"',
+      'model = "m"',
+      'credential = "openrouter"',
+      'timeout_ms = 10',
+    ].join('\n'));
+    expect(() => loadConfig({ GRU_COMMAND_HOME: instance }, temp('gru-decisions-home-'))).toThrow(/binds to the \/api\/alpha\/decisions path/);
+  });
+
+  it('restricts keyless endpoints to http/https on loopback — exotic schemes fail at config time', () => {
+    const instance = writeInstanceConfig(temp('gru-222-review-ftp-'), [
+      '[decisions.providers.x]',
+      'protocol = "systemone"',
+      'endpoint = "ftp://localhost/v1/systemone"',
+      'model = "m"',
+      'credential = "none"',
+      'timeout_ms = 10',
+    ].join('\n'));
+    expect(() => loadConfig({ GRU_COMMAND_HOME: instance }, temp('gru-decisions-home-'))).toThrow(/http: or https:/);
+    expect(() => new ProfileProvider({
+      profile: systemoneProfile({ endpoint: 'ftp://127.0.0.1:9000/v1/systemone', credential: 'none' }),
+      key: null,
+    })).toThrow(/endpoint_untrusted/);
+  });
+
+  it('treats reserved object names as ordinary names: no prototype inheritance in profile maps', () => {
+    const hostile = cloneConfig(true);
+    const protoProfile = systemoneProfile({ model: 'injected' });
+    Object.defineProperty(hostile.providers, '__proto__', {
+      value: protoProfile,
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
+    const merged = effectiveDecisionProviders(hostile);
+    expect(Object.prototype.hasOwnProperty.call(merged, '__proto__')).toBe(true);
+    expect(merged['__proto__']).toMatchObject({ model: 'injected' });
+    // A surface naming an inherited member is rejected loudly — by the name
+    // pattern for mixed-case members, and by the own-property existence
+    // check for any that slipped through (never silently accepted as a
+    // valid profile route).
+    const instance = writeInstanceConfig(temp('gru-222-review-proto-'), [
+      '[decisions.surfaces]',
+      'toString = "local"',
+    ].join('\n'));
+    expect(() => loadConfig({ GRU_COMMAND_HOME: instance }, temp('gru-decisions-home-'))).toThrow(/surface name|unknown provider profile/);
+  });
+
+  it('defaults to resolved credential mode: an omitted mode can never free-route a slot key', () => {
+    expect(() => new ProfileProvider({
+      profile: systemoneProfile({ endpoint: 'https://evil.example/v1/systemone' }),
+      key: 'secret-typesafe-key',
+    })).toThrow(/endpoint_untrusted/);
+  });
+
+  it('records null, never a non-finite number, when token count and price overflow', async () => {
+    const service = new ProfileDecisionService(
+      new ProfileProvider({
+        profile: systemoneProfile({ inputPricePerMtok: 1e308 }),
+        key: 'typesafe-test-key',
+        fetchImpl: (async (_url: string | URL | Request, init?: RequestInit) =>
+          new Response(JSON.stringify({
+            ...answerEnvelope(String(init?.body)),
+            usage: { input_tokens: 100, output_tokens: 1 },
+          }), { status: 200 })) as typeof fetch,
+      }),
+      cloneConfig(true).thresholds,
+    );
+    const outcome = await service.decide(eventDecisionRequest(EVENT));
+    expect(outcome.provenance.usage?.inputTokens).toBe(100);
+    expect(outcome.provenance.usage?.costUsd).toBeNull();
+    service.dispose();
+  });
+
+  it('a default-profile degrade keeps healthy non-default profiles serving their surfaces', async () => {
+    const urls: string[] = [];
+    let failDefault = false;
+    const fetchImpl = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      urls.push(String(url));
+      if (failDefault && String(url) === OPENROUTER_ENDPOINT) {
+        return new Response('provider down', { status: 503 });
+      }
+      return new Response(JSON.stringify(answerEnvelope(String(init?.body))), { status: 200 });
+    });
+    const config = {
+      ...cloneConfig(true),
+      surfaces: { event_triage: 'local' },
+    };
+    const runtime = new DecisionRuntime(config, {
+      instanceDir: temp('gru-222-review-degrade-'),
+      env: { OPENROUTER_API_KEY: 'test-key' },
+      fetchImpl: fetchImpl as typeof fetch,
+      watchConfig: false,
+    });
+    expect(await runtime.start()).toMatchObject({ status: 'ready' });
+    // The default profile degrades (a default-routed call fails), but the
+    // routed keyless local profile keeps answering event_triage.
+    failDefault = true;
+    const degraded = await runtime.decide(eventDecisionRequest(EVENT));
+    expect(degraded.provenance).toMatchObject({ source: 'deterministic', fallbackReason: 'provider_degraded' });
+    expect(runtime.status()).toMatchObject({ status: 'degraded' });
+    const outcome = await runtime.decide(eventDecisionRequest(EVENT), { surface: 'event_triage' });
+    expect(outcome.provenance).toMatchObject({ source: 'jev', profile: 'local' });
+    // Readiness is surface-aware: the routed surface is usable, the
+    // degraded default is not.
+    expect(runtime.readyFor('event_triage')).toBe(true);
+    expect(runtime.readyFor(undefined)).toBe(false);
+    runtime.dispose();
+  });
+
+  it('a keyless override of the default profile starts and serves without resolving a slot', async () => {
+    const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) =>
+      new Response(JSON.stringify(answerEnvelope(String(init?.body))), { status: 200 }));
+    const config = {
+      ...cloneConfig(true),
+      providers: {
+        [DEFAULT_DECISION_PROFILE]: systemoneProfile({
+          endpoint: 'http://127.0.0.1:9001/v1/systemone',
+          credential: 'none',
+        }),
+      },
+    };
+    const runtime = new DecisionRuntime(config, {
+      instanceDir: temp('gru-222-review-keyless-default-'),
+      env: {}, // no slot keys at all
+      fetchImpl: fetchImpl as typeof fetch,
+      watchConfig: false,
+    });
+    expect(await runtime.start()).toMatchObject({ status: 'ready', credentialSource: 'none' });
+    expect((await runtime.decide(eventDecisionRequest(EVENT))).provenance)
+      .toMatchObject({ source: 'jev', profile: 'openrouter-jev' });
+    expect(fetchImpl.mock.calls[0]![0]).toBe('http://127.0.0.1:9001/v1/systemone');
+    runtime.dispose();
+  });
+
+  it('check --profile rejects an unknown profile even with the master switch off', async () => {
+    const config = cloneConfig(false);
+    await expect(checkDecisionProfile(config, 'nonexistent', {
+      instanceDir: temp('gru-222-review-off-unknown-'),
+      env: {},
+    })).rejects.toThrow(/unknown decision profile/);
+  });
+
+  it('production callers pass their stable surface names to the decision service', async () => {
+    const { NotificationCenter } = await import('../src/notifications/center.js');
+    const { LedgerApi } = await import('../src/ledger/api.js');
+    const { LedgerDb } = await import('../src/ledger/db.js');
+    const { EventBus } = await import('../src/events/bus.js');
+    const seen: (string | undefined)[] = [];
+    const recordingService = {
+      decide: vi.fn(async (_request: unknown, opts?: { readonly surface?: string }) => {
+        seen.push(opts?.surface);
+        return deterministicOutcome(
+          eventDecisionRequest(EVENT),
+          cloneConfig(true).thresholds,
+          'disabled',
+        );
+      }),
+    };
+    const db = new LedgerDb(temp('gru-222-review-surface-'));
+    const bus = new EventBus();
+    const api = new LedgerApi(db.handle, { bus });
+    const center = new NotificationCenter({ ledger: api, bus });
+    center.setDecisionService(recordingService as never, () => true);
+    // A job going blocked derives a triage event through the real pipeline.
+    api.addJob({ id: 'surface-canary', repo: 'demo', title: 'Surface canary' });
+    api.setJobStatus('surface-canary', 'working');
+    api.setJobStatus('surface-canary', 'blocked');
+    await vi.waitFor(() => expect(recordingService.decide).toHaveBeenCalled());
+    expect(seen[0]).toBe('event_triage');
+  });
+});
+
+describe('decision profile review follow-ups (isolation, surfaces form, slots, refresh)', () => {
+  const TYPESAFE_ENDPOINT = 'https://api.typesafe.ai/v1/systemone';
+
+  it('child-process isolation removes every slot key from the inherited environment', () => {
+    const ambient: NodeJS.ProcessEnv = {
+      PATH: process.env.PATH,
+      OPENROUTER_API_KEY: 'private-openrouter-key',
+      TYPESAFE_API_KEY: 'private-typesafe-key',
+    };
+    const isolated = isolateDecisionEnvironment(ambient);
+    expect(isolated.OPENROUTER_API_KEY).toBe('private-openrouter-key');
+    expect(isolated.TYPESAFE_API_KEY).toBe('private-typesafe-key');
+    expect(ambient.OPENROUTER_API_KEY).toBeUndefined();
+    expect(ambient.TYPESAFE_API_KEY).toBeUndefined();
+    const child = spawnSync(
+      process.execPath,
+      ['-e', 'process.stdout.write(String(process.env.OPENROUTER_API_KEY === undefined && process.env.TYPESAFE_API_KEY === undefined))'],
+      { env: ambient, encoding: 'utf8' },
+    );
+    expect(child.status).toBe(0);
+    expect(child.stdout).toBe('true');
+  });
+
+  it("accepts the spec's explicit surfaces table form alongside the shorthand", () => {
+    const instance = temp('gru-222-surfaces-table-');
+    mkdirSync(instance, { recursive: true });
+    writeFileSync(join(instance, 'config.toml'), [
+      '[decisions.jev]',
+      'enabled = true',
+      '[decisions.surfaces.event_triage]',
+      'provider = "local"',
+    ].join('\n'));
+    const loaded = loadConfig({ GRU_COMMAND_HOME: instance }, temp('gru-decisions-home-'));
+    expect(loaded.decisions.surfaces).toEqual({ event_triage: 'local' });
+    // Unknown keys inside the explicit form are rejected, and a missing
+    // provider key is a config error, not a silent default.
+    const bad = temp('gru-222-surfaces-table-bad-');
+    mkdirSync(bad, { recursive: true });
+    writeFileSync(join(bad, 'config.toml'), [
+      '[decisions.surfaces.event_triage]',
+      'profile = "local"',
+    ].join('\n'));
+    expect(() => loadConfig({ GRU_COMMAND_HOME: bad }, temp('gru-decisions-home-'))).toThrow();
+  });
+
+  it("status top-level credential fields follow the DEFAULT profile's slot, not hardcoded OpenRouter", async () => {
+    const { checkDecisionProfile } = await import('../src/decisions/runtime.js');
+    void checkDecisionProfile;
+    const config = {
+      ...cloneConfig(true),
+      providers: {
+        [DEFAULT_DECISION_PROFILE]: {
+          protocol: 'systemone',
+          endpoint: TYPESAFE_ENDPOINT,
+          model: 'jev-latest',
+          credential: 'typesafe',
+          timeoutMs: 2000,
+          inputPricePerMtok: 0.042,
+        },
+      },
+    };
+    // The offline resolver reads the default profile's slot: with only a
+    // TYPESAFE_API_KEY present, the default profile's credential is found.
+    const resolved = resolveCredential(temp('gru-222-status-slot-'), { TYPESAFE_API_KEY: 'ts-key' }, 'typesafe');
+    expect(resolved).toMatchObject({ state: 'present', source: 'environment', key: 'ts-key' });
+    expect(config.providers[DEFAULT_DECISION_PROFILE]!.credential).toBe('typesafe');
+  });
+
+  it('a recheck adopts a freshly stored slot credential for a routed profile', async () => {
+    const urls: string[] = [];
+    const fetchImpl = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      urls.push(String(url));
+      return new Response(JSON.stringify(answerEnvelope(String(init?.body))), { status: 200 });
+    });
+    const current = {
+      ...cloneConfig(true),
+      surfaces: { event_triage: 'typesafe-direct' },
+    };
+    const instance = temp('gru-222-recheck-slot-');
+    const env: NodeJS.ProcessEnv = { OPENROUTER_API_KEY: 'test-key' }; // no TYPESAFE_API_KEY yet
+    const runtime = new DecisionRuntime(current, {
+      instanceDir: instance,
+      env,
+      fetchImpl: fetchImpl as typeof fetch,
+      watchConfig: false,
+      loadConfig: () => ({ decisions: current } as unknown as GruCommandConfig),
+    });
+    expect(await runtime.start()).toMatchObject({ status: 'ready' });
+    // No key yet: the surface falls back per call, health untouched.
+    expect((await runtime.decide(eventDecisionRequest(EVENT), { surface: 'event_triage' })).provenance)
+      .toMatchObject({ source: 'deterministic', fallbackReason: 'credential_missing' });
+    // The operator stores the TypeSafe key, then rechecks (the documented
+    // workflow — the same one the default profile has always used).
+    env['TYPESAFE_API_KEY'] = 'fresh-typesafe-key';
+    expect(await runtime.recheck()).toMatchObject({ status: 'ready' });
+    expect((await runtime.decide(eventDecisionRequest(EVENT), { surface: 'event_triage' })).provenance)
+      .toMatchObject({ source: 'jev', profile: 'typesafe-direct' });
+    runtime.dispose();
+  });
+});
+
+describe('systemone failure-path mapping (review: both protocols covered)', () => {
+  const TYPESAFE_ENDPOINT = 'https://api.typesafe.ai/v1/systemone';
+
+  async function expectSystemoneFallback(
+    status: number,
+    reason: string,
+    mode: 'reject' | 'hang' = 'reject',
+  ): Promise<void> {
+    const service = new ProfileDecisionService(
+      new ProfileProvider({
+        profile: {
+          protocol: 'systemone',
+          endpoint: TYPESAFE_ENDPOINT,
+          model: 'jev-latest',
+          credential: 'typesafe',
+          timeoutMs: 20,
+          inputPricePerMtok: 0.042,
+        },
+        key: 'typesafe-test-key',
+        fetchImpl: mode === 'hang'
+          ? ((_url: string | URL | Request, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+              init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
+            })) as typeof fetch
+          : (async () => new Response('provider refusal body', { status })) as typeof fetch,
+      }),
+      cloneConfig(true).thresholds,
+      'typesafe-direct',
+    );
+    const outcome = await service.decide(eventDecisionRequest(EVENT));
+    expect(outcome.provenance).toMatchObject({ source: 'deterministic', fallbackReason: reason });
+    expect(JSON.stringify(outcome)).not.toContain('provider refusal body');
+    service.dispose();
+  }
+
+  it('maps 401 → auth_rejected on the systemone protocol', async () => {
+    await expectSystemoneFallback(401, 'auth_rejected');
+  });
+  it('maps 403 → forbidden on the systemone protocol', async () => {
+    await expectSystemoneFallback(403, 'forbidden');
+  });
+  it('maps 429 → provider_degraded on the systemone protocol', async () => {
+    await expectSystemoneFallback(429, 'provider_degraded');
+  });
+  it('maps 5xx → provider_degraded on the systemone protocol', async () => {
+    await expectSystemoneFallback(503, 'provider_degraded');
+  });
+  it('maps timeouts on the systemone protocol', async () => {
+    await expectSystemoneFallback(0, 'timeout', 'hang');
   });
 });
