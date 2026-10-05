@@ -409,6 +409,39 @@ describe('board engine — liveness-first rail and job trackers', () => {
     expect(roundView?.lenses.find((chip) => chip.lens === 'edge')?.verdict).toBe('clean');
   });
 
+  it('counts a charged ledger start with NO registered child as a started attempt (gh-169 P11)', () => {
+    const { api, engine } = fresh();
+    const job = api.addJob({ id: 'charged-job', repo: 'demo-repo', title: 'Charged' });
+    api.setJobStatus(job.id, 'working');
+    api.registerWorktree({
+      id: job.id,
+      kind: 'job',
+      repoPath: '/repos/demo-repo',
+      repoName: 'demo-repo',
+      path: '/worktrees/demo-repo/job-charged-job',
+      branch: 'gru/charged-job',
+      sha: 'ab12cdbase',
+      jobId: job.id,
+    });
+    const round = api.addRound({ jobId: job.id, targetRef: 'ab12cdbase' });
+    // The specialist start was journaled (the budget authority) but the
+    // spawn crashed before any agent row existed: the attempt still
+    // counts, and the MAX merge never lets it fall back to zero.
+    api.appendCustomEvent({
+      kind: 'round.specialist-started',
+      jobId: job.id,
+      roundId: round.id,
+      payload: { lens: 'blind', attempt: 1, originRoundId: round.id },
+    });
+    const view = engine.snapshot().repos.flatMap((repo) => repo.jobs).find((entry) => entry.id === job.id);
+    expect(view?.rounds[0]?.lensAttempts).toEqual([{ lens: 'blind', attempts: 1 }]);
+    // A later registered child for the SAME lens never doubles the count
+    // (MAX, not sum).
+    api.registerAgent({ id: 'sp-blind-late', role: 'perkins', label: 'blind', roundId: round.id, jobId: job.id });
+    const after = engine.snapshot().repos.flatMap((repo) => repo.jobs).find((entry) => entry.id === job.id);
+    expect(after?.rounds[0]?.lensAttempts).toEqual([{ lens: 'blind', attempts: 1 }]);
+  });
+
   it('counts whole-PR bare-lens specialist attempts (blind, blind#2) alongside legacy lens:chunk labels', () => {
     const { api, engine } = fresh();
     const job = api.addJob({ id: 'whole-job', repo: 'demo-repo', title: 'Whole' });

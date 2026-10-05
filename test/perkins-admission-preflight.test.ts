@@ -278,6 +278,64 @@ describe('Perkins admission preflight (gh-169)', () => {
     expect(verificationCheck?.ok).toBe(true);
   });
 
+  it('refuses invalid UTF-8 spec bytes with a named exhaustive refusal instead of an uncaught decode (P1)', () => {
+    const { review } = preflightHarness();
+    // Digest-consistent but non-UTF-8 spec bytes: the manifest hashes raw
+    // bytes, so a matching digest does NOT prove decodable text. The fatal
+    // decode is part of the guarded check, so admission still returns the
+    // exhaustive named refusal (and the ledger event) rather than throwing
+    // past them.
+    const binarySpec = Buffer.concat([Buffer.from('binary: '), Buffer.from([0xff, 0xfe, 0x00])]);
+    writeFileSync(join(review.directory, 'spec-context.md'), binarySpec);
+    const manifest = JSON.parse(readFileSync(join(review.directory, 'manifest.json'), 'utf8')) as FrozenReview['manifest'];
+    const tampered = {
+      ...manifest,
+      specSha256: createHash('sha256').update(binarySpec).digest('hex'),
+    };
+    writeFileSync(join(review.directory, 'manifest.json'), `${JSON.stringify(tampered, null, 2)}\n`);
+    const result = admissionPreflight({ ...review, manifest: tampered }, 'feature/admission');
+    const inputs = result.missing.map((entry) => entry.input);
+    expect(inputs).toContain('spec-context');
+    expect(inputs).toContain('verification-evidence');
+    // Independent checks still ran and passed.
+    expect(result.checks.find((check) => check.name === 'head-binding')?.ok).toBe(true);
+    expect(result.checks.find((check) => check.name === 'ci-evidence')?.ok).toBe(true);
+    expect(result.missing.find((entry) => entry.input === 'spec-context')!.detail).toContain('not valid UTF-8');
+  });
+
+  it('refuses a hash-consistent CI record whose consumed fields are malformed (P2)', () => {
+    const { review } = preflightHarness();
+    const tampered = JSON.parse(readFileSync(join(review.directory, 'manifest.json'), 'utf8')) as FrozenReview['manifest'];
+    const malformedManifest = {
+      ...tampered,
+      reviewEvidence: {
+        attachments: [],
+        // Known state, bound to the right head — but the failures field the
+        // report layer dereferences is not an array.
+        ci: { ...tampered.reviewEvidence!.ci!, state: 'failed', sha: tampered.targetSha, repo: 'acme/fixture', failures: 'unit-tests' },
+      },
+    };
+    writeFileSync(join(review.directory, 'manifest.json'), `${JSON.stringify(malformedManifest, null, 2)}\n`);
+    const result = admissionPreflight(withDiskManifest(review), 'feature/admission');
+    expect(result.missing.map((entry) => entry.input)).toEqual(['ci-evidence']);
+    expect(result.missing[0]!.detail).toContain('failures');
+    expect(result.missing[0]!.detail).toContain('malformed');
+  });
+
+  it('keeps EVERY missing-input name in the refusal message when details overflow the bound (P4)', () => {
+    const missing = Array.from({ length: 40 }, (_unused, index) => ({
+      input: `evidence:ev${index + 1}`,
+      detail: 'x'.repeat(300),
+    }));
+    const error = new ReviewAdmissionError(missing);
+    for (let index = 1; index <= 40; index += 1) {
+      expect(error.message).toContain(`[evidence:ev${index}]`);
+    }
+    expect(error.message).toContain('40 missing input(s)');
+    expect(error.message.length).toBeLessThan(2_200);
+    expect(error.missing).toHaveLength(40);
+  });
+
   it('is read-only: a pass and a refusal leave every frozen packet byte identical', () => {
     const { review, packetHashes } = preflightHarness({ withEvidence: true });
     admissionPreflight(review, 'feature/admission'); // pass

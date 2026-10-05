@@ -11,6 +11,7 @@ import {
   type PrHeadProbe,
 } from '../src/dispatch/perkins-review/fresh-head.js';
 import { WaveRunner, type FallbackGateOutcome, type WaveOutcome } from '../src/dispatch/perkins.js';
+import { freezeReviewInputs, sourceMovementSinceFreeze } from '../src/dispatch/perkins-review/artifacts.js';
 import type { AgentSpawner } from '../src/dispatch/service.js';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
@@ -768,6 +769,69 @@ describe('freeze-time integration on PR rounds', () => {
     ) as { readonly targetSha: string; readonly targetRef: string };
     expect(manifest.targetSha).toBe(laneSha);
     expect(manifest.targetRef).toBe('origin/feature/lane');
+  });
+
+  it('a FULLY-QUALIFIED revision pin (refs/remotes/origin/feature/lane~1) skips the advertised probe — a genuine qualified tracking ref keeps it (gh-169 P9)', async () => {
+    const repo = makeFixtureRepo('freeze-pin-qualified');
+    repos.push(repo);
+    repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    repo.git(['checkout', '-b', 'feature/lane']);
+    const laneFirst = repo.commitFile('src/lane.ts', 'export const lane = true;\n');
+    const laneTip = repo.commitFile('src/lane2.ts', 'export const lane2 = true;\n');
+    attachBareOrigin(repo);
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/main']);
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/feature/lane']);
+    const ancestor = repo.git(['rev-parse', 'refs/remotes/origin/feature/lane~1']);
+    expect(ancestor).toBe(laneFirst);
+    const root = tempDir('gru-freeze-qualified-port-');
+    const artifacts = tempDir('gru-freeze-qualified-artifacts-');
+    const sessions = tempDir('gru-freeze-qualified-sessions-');
+    const ledger = makeLedger();
+    const port = new GitReviewPort(root, 'feature/lane', laneTip);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-pin-qualified' });
+    const job = ledger.addJob({
+      id: 'job-pin-qualified', repo: 'fixture', title: 'qualified revision pin', baseBranch: 'main',
+      briefing: 'Acceptance: lane returns true.',
+    });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://github.com/acme/fixture/pull/24');
+    const wave = new WaveRunner({
+      ledger,
+      worktrees: port,
+      spawner: fakeWholeSpawner(sessions, { childAnswer: () => '[]' }).spawner,
+      reviewArtifactRoot: artifacts,
+      prHeadProbe: fixedProbe('feature/lane', laneTip),
+    });
+    const outcome = asWave(await wave.runRound({ jobId: job.id, targetRef: 'refs/remotes/origin/feature/lane~1' }));
+    // The named ancestor froze — and the advertised-tip probe (whose
+    // ls-remote of refs/heads/feature/lane~1 would exit 2 and poison the
+    // round as check-failed) correctly SKIPPED the expression spelling.
+    expect(outcome.round.targetRef).toBe(ancestor);
+    expect(outcome.headMoved).toBe(false);
+    const events = ledger.listEvents({ limit: 200 });
+    expect(events.some((event) => event.kind === 'round.head-moved')).toBe(false);
+    expect(events.find((event) => event.kind === 'round.admission-preflight')?.payload).toMatchObject({ ok: true });
+    // The GENUINE qualified tracking ref keeps its advertised-tip check:
+    // after the remote tip advances, the same probe reports movement.
+    const frozenTracking = freezeReviewInputs({
+      roundId: 'qualified-tracking-round',
+      repoPath: repo.path,
+      artifactRoot: artifacts,
+      baseRef: 'main',
+      targetRef: laneTip,
+      movementRef: 'refs/remotes/origin/feature/lane',
+      spec: 'Acceptance: lane returns true.',
+    });
+    expect(sourceMovementSinceFreeze(frozenTracking)).toBeNull();
+    repo.commitFile('src/lane3.ts', 'export const lane3 = true;\n');
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/feature/lane']);
+    const moved = sourceMovementSinceFreeze(frozenTracking);
+    // Movement is DETECTED for the genuine tracking spelling (the push
+    // moves both the tracking ref and the advertised tip; either proof is
+    // the target-moved cause) — the exact opposite of the expression
+    // pin's clean pass above.
+    expect(moved?.cause).toBe('target-moved');
   });
 
   it('an origin-prefixed REVISION PIN (origin/feature/lane~1) on a linked PR freezes the named ancestor, never the live PR tip (Perkins R4)', async () => {

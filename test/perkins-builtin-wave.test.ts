@@ -787,10 +787,10 @@ describe('WaveRunner built-in Perkins production path', () => {
     expect(outcome.results.every((result) => result.state === 'error' && result.note.startsWith('not started — parent incident'))).toBe(true);
     const report = readFileSync(join(artifacts, outcome.round.id, 'perkins-report.md'), 'utf8');
     expect(report).toContain('**Parent incident**');
-    expect(report).toContain('0 attempt(s) started');
+    expect(report).toContain('0 journaled attempt(s) started');
     expect(report).toContain('9 lens(es) never started');
     expect(report).toContain('Connection error');
-    expect(escalations.some((entry) => entry.includes('INCOMPLETE') && entry.includes('0 attempt(s) started'))).toBe(true);
+    expect(escalations.some((entry) => entry.includes('INCOMPLETE') && entry.includes('0 journaled attempt(s) started'))).toBe(true);
     expect(port.getWorktree(outcome.round.id)?.status).toBe('swept');
     rmSync(root, { recursive: true, force: true });
     rmSync(artifacts, { recursive: true, force: true });
@@ -848,7 +848,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     expect(securityResult?.state === 'error' && securityResult.note).toContain('attempt started; interrupted by parent failure');
     expect(outcome.results.filter((result) => result.state === 'error' && result.note.startsWith('not started — parent incident'))).toHaveLength(8);
     const report = readFileSync(join(artifacts, outcome.round.id, 'perkins-report.md'), 'utf8');
-    expect(report).toContain('1 attempt(s) started (1 of 9 lenses: security)');
+    expect(report).toContain('1 journaled attempt(s) started (1 of 9 lenses: security)');
     expect(report).toContain('8 lens(es) never started');
   });
 
@@ -896,9 +896,18 @@ describe('WaveRunner built-in Perkins production path', () => {
     expect(chips.find((chip) => chip.lens === 'blind')?.note).toContain('interrupted by parent abort');
     expect(chips.find((chip) => chip.lens === 'security')?.state).toBe('pending');
     const incident = ledger.listEvents({ limit: 200 }).find((event) => event.kind === 'round.parent-incident' && event.roundId === round.id);
-    expect(incident?.payload).toMatchObject({ startedAttempts: 0 });
+    // P5: the event's classification matches the chips — the LIVE lens is
+    // started (its child registered; the journal write was lost to the
+    // crash), the untouched lens is not started. startedAttempts counts
+    // only durable journal entries (zero here).
+    expect(incident?.payload).toMatchObject({ startedAttempts: 0, startedLenses: ['blind'] });
     expect((incident?.payload as { readonly notStartedLenses?: readonly string[] }).notStartedLenses)
-      .toEqual(expect.arrayContaining(['blind', 'security']));
+      .toEqual(['security']);
+    // P6: the durable restart report carries the same execution facts.
+    const restartReport = readFileSync(join(artifacts, round.id, 'perkins-report.md'), 'utf8');
+    expect(restartReport).toContain('**Parent incident**');
+    expect(restartReport).toContain('0 journaled attempt(s) started (1 of 2 lenses: blind)');
+    expect(restartReport).toContain('1 lens(es) never started (security)');
     expect(port.getWorktree(round.id)?.status).toBe('swept');
     expect(existsSync(join(artifacts, round.id, 'restart-recovery.json'))).toBe(true);
     expect(existsSync(join(artifacts, round.id, 'perkins-report.md'))).toBe(true);
@@ -959,7 +968,56 @@ describe('WaveRunner built-in Perkins production path', () => {
     expect(abortedChips.every((chip) => chip.state === 'pending')).toBe(true);
     const pendingIncident = ledger.listEvents({ limit: 200 }).find((event) => event.kind === 'round.parent-incident' && event.roundId === round.id);
     expect(pendingIncident?.payload).toMatchObject({ startedAttempts: 0, startedLenses: [] });
+    // P6: the missing-lane restart report also states the execution facts
+    // (zero started, every lens never started).
+    const missingLaneReport = readFileSync(join(artifacts, round.id, 'perkins-report.md'), 'utf8');
+    expect(missingLaneReport).toContain('**Parent incident**');
+    expect(missingLaneReport).toContain('0 journaled attempt(s) started (0 of 2 lenses: none)');
+    expect(missingLaneReport).toContain('2 lens(es) never started (blind, security)');
     expect(existsSync(join(artifacts, round.id, 'restart-recovery.json'))).toBe(true);
+  });
+
+  it('restart recovery with a charged specialist start keeps ONE parent incident and honest counts (gh-169 P6/P8)', async () => {
+    const repo = makeFixtureRepo('perkins-restart-charged');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/restart-charged']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-charged-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-charged-artifacts-'));
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-charged-db-')));
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/restart-charged', target);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-charged' });
+    const job = ledger.addJob({ id: 'job-charged', repo: 'fixture', title: 'charged restart', baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    const round = ledger.addRound({ jobId: job.id, lenses: ['blind', 'security'], targetRef: target });
+    await port.createReviewWorktree({ repoPath: repo.path, roundId: round.id, ref: target, jobId: job.id });
+    ledger.setRoundStatus(round.id, 'live');
+    // ONE durable specialist start existed when the service died (the
+    // spawn crashed before any agent row or settlement existed).
+    ledger.appendCustomEvent({
+      kind: 'round.specialist-started',
+      jobId: job.id,
+      roundId: round.id,
+      payload: { lens: 'blind', attempt: 1, originRoundId: round.id },
+    });
+    const wave = new WaveRunner({ ledger, worktrees: port, spawner: vi.fn() as unknown as AgentSpawner, reviewArtifactRoot: artifacts });
+    expect(await wave.recoverInterruptedRounds()).toBe(1);
+    // A second recovery pass over the now-terminal round mints nothing.
+    expect(await wave.recoverInterruptedRounds()).toBe(0);
+    const incidents = ledger.listEvents({ limit: 200 }).filter((event) => event.kind === 'round.parent-incident' && event.roundId === round.id);
+    expect(incidents).toHaveLength(1);
+    expect(incidents[0]?.payload).toMatchObject({ startedAttempts: 1, startedLenses: ['blind'], notStartedLenses: ['security'] });
+    const chips = ledger.getRound(round.id)?.lenses ?? [];
+    expect(chips.find((chip) => chip.lens === 'blind')?.state).toBe('error');
+    expect(chips.find((chip) => chip.lens === 'security')?.state).toBe('pending');
+    // P6: the durable restart report carries the charged-start counts.
+    const report = readFileSync(join(artifacts, round.id, 'perkins-report.md'), 'utf8');
+    expect(report).toContain('1 journaled attempt(s) started (1 of 2 lenses: blind)');
+    expect(report).toContain('1 lens(es) never started (security)');
+    rmSync(root, { recursive: true, force: true });
+    rmSync(artifacts, { recursive: true, force: true });
   });
 
   it('does not let a swept lane hide an interrupted pending round during recovery', async () => {
@@ -2844,8 +2902,23 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     const job = ledger.addJob({ id: 'job-appendix', repo: 'fixture', title: 'appendix', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
     settleLane(ledger, job.id);
-    ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/34');
+    // A github.com-shaped PR: the CI receipt is repo/PR-bound, so a real
+    // recorded failure can freeze as the round's measured CI state.
+    ledger.setJobPr(job.id, 'https://github.com/acme/fixture/pull/34');
     attachOrigin(repo, 'feature/appendix', root);
+    // P10 (gh-169): freeze a MEASURED CI FAILURE at the exact target so the
+    // posted body's CI state line is asserted against the real posting
+    // path, not only the appendix helper.
+    ledger.appendCustomEvent({
+      kind: 'github.ci-failed',
+      jobId: job.id,
+      payload: {
+        repo: 'acme/fixture',
+        pr: 34,
+        sha: target,
+        failures: [{ name: 'unit-tests', conclusion: 'failure', url: null }],
+      },
+    });
     // Security reports the canonical blocker; the tests specialist fails
     // both attempts; several lenses stay unused.
     const poster = receiptPoster();
@@ -2882,6 +2955,13 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     expect(postedBody).toContain('- Retained findings: 1 (1 blocker)');
     expect(postedBody).toContain('Verified security defect');
     expect(postedBody).toContain('- Failed specialist attempts: security ×1, tests ×2');
+    // P10: the posted body states the FROZEN CI evidence distinctly — a
+    // measured failure is published as FAILED, never softened and never
+    // rendered as the NOT RECORDED placeholder.
+    expect(postedBody).toContain('- CI evidence at freeze: FAILED — NOT PASS (1 failing check(s): unit-tests)');
+    expect(postedBody).not.toContain('NOT RECORDED');
+    expect(postedBody).not.toContain('UNAVAILABLE');
+    expect(postedBody).toContain('- Specialist attempts started: 5 (2 valid, 3 failed) across 3 of 9 available lenses');
     expect(postedBody).toContain('- Lenses not used this round:');
     expect(postedBody).toContain('authenticated COMMENT review on the reviewed commit');
     // R16: the persisted round.posted receipt pins the actual actor/event —

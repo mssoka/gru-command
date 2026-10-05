@@ -520,6 +520,16 @@ function baseMovementSinceFreeze(review: FrozenReview): SourceMovement | null {
 function advertisedRemoteBranch(repoPath: string, ref: string): { remote: string; branch: string } | null {
   let remoteRef: string;
   if (ref.startsWith('refs/remotes/')) {
+    // gh-169 P9: a fully-qualified spelling is not automatically a tracking
+    // REF — `refs/remotes/origin/topic~1` is a resolvable revision
+    // EXPRESSION whose ls-remote probe would false-alarm exactly like the
+    // short spelling. Validate the ref format before treating the prefix
+    // as proof; a genuine tracking ref keeps its advertised-tip check.
+    try {
+      gitRaw(repoPath, ['check-ref-format', ref]);
+    } catch {
+      return null;
+    }
     remoteRef = ref.slice('refs/remotes/'.length);
   } else {
     // Fully-qualified non-tracking refs (tags, heads) are exact and never
