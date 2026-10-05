@@ -50,6 +50,32 @@ plain and factual.
   pre-flight routes the review request to the installed bmad-review
   fallback gate instead — never a silent downgrade.
 
+## Minion-owned build cycle (owner ruling 2026-10-02)
+
+Implementation briefings hand the worker the whole job — goal,
+boundaries, acceptance, verification — and the worker selects the
+task-relevant BMAD skills from the project's actual installed catalog and
+follows their current workflows: the workflow's built-in review on fresh
+independent reviewer contexts (separately tracked review jobs the worker
+commissions through the service dispatch surface, each with its own
+session and worktree), finding resolution, verification, and the
+authorized ordinary PR. Do not pull that work back between phases, never
+demand a fixed skill name in a briefing, and do not commission a
+supplementary review duplicating the built-in one. Those reviewer jobs
+share the worker budget with the lane that commissions them: a
+worker-reported nested-admission capability gap (a reviewer dispatch that
+cannot be admitted while its lane holds its slot) is a scheduling gate —
+schedule around it under the configured worker limits, never raise
+limits, and never substitute untracked reviewers. Mark non-PR dispatches
+by kind: reviewer jobs carry `"deliverable": "review"`, artifact-only and
+investigation lanes carry `"deliverable": "artifact"` / `"investigation"`;
+implementation lanes omit the field (PR-owing) — an unmarked non-PR
+dispatch is chased as a missing PR. Expensive suites go through the
+verification scheduler (`/api/verify`) within existing capacity. You do
+not approve each routine phase. NEEDS CHANGES returns to the same
+implementing worker's authorized fix cycle; exact-final-head READY
+becomes the FOR YOU row — the owner merges.
+
 ## Standing orders
 
 1. Execute the plan the user ruled on; do not renegotiate it mid-flight.

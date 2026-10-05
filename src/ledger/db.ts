@@ -833,4 +833,13 @@ export const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX idx_pipeline_entries_seq ON pipeline_entries(enqueue_seq);
     `,
   },
+  {
+    // Deliverable kind (E19): implementation lanes owe a PR; review jobs
+    // owe findings; artifact and investigation jobs owe a verified
+    // handback. The Silas digest uses this so a delivered reviewer's
+    // findings handback is never chased as a missing PR.
+    id: 19,
+    name: 'job-deliverable',
+    sql: `ALTER TABLE jobs ADD COLUMN deliverable TEXT;`,
+  },
 ];

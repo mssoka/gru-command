@@ -270,7 +270,9 @@ const DIGEST_RULES: Readonly<Record<string, (event: EventRecord) => string | nul
         return `job ${event.jobId ?? '?'}: fix directive${payload.delivered === false ? ' NOT delivered' : ' delivered'} (${blockers} blocker(s))`;
       }
       case 'pass':
-        return `job ${event.jobId ?? '?'}: bmad-review PASS — clear to merge (merge stays user-held)`;
+        // The fallback PASS is the review-of-record for routing and fixes,
+        // never a Perkins READY: it must not read as merge clearance.
+        return `job ${event.jobId ?? '?'}: bmad-review PASS — review/fix routing cleared (not a Perkins READY; merge stays user-held)`;
       case 'blocked':
         return `job ${event.jobId ?? '?'}: bmad-review BLOCKED${textOf(payload.reason) !== null ? ` — ${textOf(payload.reason)!}` : ''}`;
       case 'unavailable':

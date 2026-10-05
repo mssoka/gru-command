@@ -446,18 +446,18 @@ describe('pipeline ledger — evaluation, order and projection', () => {
     cleanupDirs.push(dir);
     // A ledger frozen at the pre-pipeline schema (the shape an existing
     // installation boots with).
-    // The frozen ledger carries every pre-pipeline migration (main's
-    // display-name 17 included): only the pipeline migration is absent.
-    const pre = MIGRATIONS.filter((migration) => migration.name !== 'pipeline-entries');
+    // The frozen ledger carries every migration before the pipeline one
+    // (display-name 17 included); the pipeline migration AND any later
+    // migration (the deliverable kind) are absent.
+    const pre = MIGRATIONS.filter((migration) => migration.id <= 17);
     const db13 = new LedgerDb(dir, { migrations: pre });
     const ledger13 = new LedgerApi(db13.handle, { bus: new EventBus({}) });
     ledger13.addJob({ id: 'legacy-job', repo: 'demo', title: 'Legacy', briefing: 'old brief' });
     db13.close();
 
-    // Reboot with the full migration set: 14–16 (main's landed
-    // job-amendments/child-workers migrations) and the renumbered 17
-    // pipeline migration apply, old rows survive, and the queue is
-    // immediately usable.
+    // Reboot with the full migration set: the pipeline and deliverable
+    // migrations apply, old rows survive, and the queue is immediately
+    // usable.
     const dbFull = new LedgerDb(dir);
     const ledgerFull = new LedgerApi(dbFull.handle, { bus: new EventBus({}) });
     expect(ledgerFull.getJob('legacy-job')?.briefing).toBe('old brief');

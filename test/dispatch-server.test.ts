@@ -323,6 +323,64 @@ describe('dispatch server (E8)', () => {
     }
   });
 
+  it('validates the optional deliverable kind and persists it (E19)', async () => {
+    const h = await boot();
+    const repo = makeFixtureRepo('fixture-http-deliverable');
+    cleanupRepos.push(repo);
+    try {
+      const ok = await call(
+        h.port,
+        'POST',
+        '/api/dispatch',
+        {
+          job_id: 'http-review-job',
+          repo_path: repo.path,
+          title: 'read-only review',
+          briefing: 'read-only review brief',
+          deliverable: 'review',
+        },
+        TOKEN,
+      );
+      expect(ok.status).toBe(202);
+      expect(h.ledger.getJob('http-review-job')?.deliverable).toBe('review');
+      // The DISPATCHED prompt must carry the review closing orders — a
+      // dropped renderer forwarding would keep response/ledger green.
+      expect(h.minionTurnTexts.at(-1)).toContain('READ-ONLY');
+      expect(h.minionTurnTexts.at(-1)).not.toContain('commit your work to the branch');
+      // The other non-PR kinds admit through HTTP too.
+      for (const kind of ['artifact', 'investigation'] as const) {
+        const nonPr = await call(
+          h.port,
+          'POST',
+          '/api/dispatch',
+          { job_id: `http-${kind}-job`, repo_path: repo.path, title: kind, briefing: 'handback job', deliverable: kind },
+          TOKEN,
+        );
+        expect(nonPr.status).toBe(202);
+        expect(h.ledger.getJob(`http-${kind}-job`)?.deliverable).toBe(kind);
+        // Non-PR handbacks: no PR order, and only review is READ-ONLY.
+        expect(h.minionTurnTexts.at(-1)).toContain('do not open a');
+        expect(h.minionTurnTexts.at(-1)).not.toContain('READ-ONLY');
+        expect(h.minionTurnTexts.at(-1)).not.toContain('never merge your own pull request');
+      }
+      // Present-but-invalid values fail loud before any job exists; an
+      // unknown string, a null, a number, and a blank are all rejected.
+      for (const [id, value] of [['http-bogus', 'merge'], ['http-null', null], ['http-number', 3], ['http-blank', ' ']] as const) {
+        const bad = await call(
+          h.port,
+          'POST',
+          '/api/dispatch',
+          { job_id: id, repo_path: repo.path, title: 'x', briefing: 'b', deliverable: value },
+          TOKEN,
+        );
+        expect(bad.status).toBe(400);
+        expect(h.ledger.getJob(id)).toBeNull();
+      }
+    } finally {
+      await h.close();
+    }
+  });
+
   it('dispatches a job: 202 with the lane, minion spawned in the worktree, board record lives', async () => {
     const h = await boot();
     const repo = makeFixtureRepo('fixture-http');

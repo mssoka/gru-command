@@ -251,14 +251,15 @@ security, data loss, broken builds, and related crash/regression/
 vulnerability/injection/secret-leak tags — are BLOCKERS; the rest are
 notes); BLOCKERS > 0 routes a fix directive to the implementing MINION
 session, the lane's working diff is re-read, and the gate re-reviews after
-fixes (bounded rounds); 0 blockers = PASS reported as clear-to-merge. The
+fixes (bounded rounds); 0 blockers = PASS that clears review/fix routing
+only — the fallback PASS is the review gate of record for routing and
+fixes, never a Perkins READY and never merge clearance. The
 fallback session is a full-capability minion by design — it must load the
 ambient BMAD skill — and is instructed never to gate, approve, merge, or
 modify implementation code; every gate decision is the host's. The fallback
 never records a Perkins verdict and never moves merge authority: only an
-exact-head Perkins READY can authorize a merge; Gru merges this repository
-only after that gate, while the owner holds merges elsewhere
-everywhere. A failed pre-flight is never a silent downgrade — the failed
+exact-head Perkins READY can authorize a merge, and the owner holds every
+merge, everywhere — this repository included. A failed pre-flight is never a silent downgrade — the failed
 legs, their remediations, and both recovery options (install BMAD via
 onboarding / restore Perkins) are escalated and recorded on the job as
 `job.fallback-review` events. GitLab merge requests get the same SHA-bound
@@ -482,6 +483,33 @@ ledger surfaces remain runtime-agnostic).
   logical worker, and a replacement session would duplicate its result
   and put two writers in one lane; the parent requests a new child
   instead (the breaker/stop machinery still applies in full).
+
+## 4f. Minion-owned build cycle (owner ruling 2026-10-02)
+
+Implementation briefings hand the worker the whole job. The minion selects
+the task-relevant BMAD skills by capability from the PROJECT's actual
+installed skill catalog/metadata and follows their current workflows —
+names and workflow structure change between BMAD versions, so brief by
+the task, never by a fixed skill name. The selected workflow's built-in
+review runs on fresh, context-free reviewer contexts the minion
+commissions as separately tracked review jobs — each with its own session
+and worktree, a read-only brief, and the immutable diff head; never an
+untracked launcher, an extension subagent, or a model-native child
+session. The worker owns the cycle end to end (implementation, finding
+resolution, verification, the authorized ordinary non-draft PR); Silas
+gives goal/boundaries/acceptance, coordinates capacity and expensive
+verification through the existing scheduler, and arms native Perkins on
+the exact final settled PR head. NEEDS CHANGES returns to the same
+implementing worker; the owner holds every merge.
+
+**Policy vs implemented.** These obligations ship in the installed
+playbook, and the deliverable kind is implemented: reviewer, artifact and
+investigation dispatches carry `deliverable` (E19, `jobs.deliverable`)
+and their handbacks are no longer classified as PR-overdue by the Silas
+digest. Everything else here — reviewer tool confinement, automated
+commission re-arm, escalation-notification repair — remains shipped
+policy that the runtime does not fully enforce; do not read the playbook
+as a runtime guarantee.
 
 ## 5. Release (the sweep)
 

@@ -203,7 +203,7 @@ describe('gru awareness — passive injection', () => {
     });
     const block = rig.awareness.prepare();
     expect(block?.text).toContain('job j1: bmad-review round 2 — 3 blocker(s), 1 note(s)');
-    expect(block?.text).toContain('job j1: bmad-review PASS — clear to merge (merge stays user-held)');
+    expect(block?.text).toContain('job j1: bmad-review PASS — review/fix routing cleared (not a Perkins READY; merge stays user-held)');
     expect(block?.text).toContain('round j1-r1: Perkins NEEDS CHANGES — 2 blocker(s) (proof complete)');
   });
 

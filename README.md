@@ -168,10 +168,10 @@ external pins `cis=v0.3.2`, `tea=v1.27.2`, `gds=v0.7.2`. Runtime bindings
 follow the selected `pi`/Claude tools. Existing/customized installs
 default to **reuse unchanged**; per-repo skip is always available.
 The pinned set carries `bmad-review` out of the box, and it is a gate:
-0 blockers means clear to merge, while blockers route back to the
-implementing minion as fix directives—never inform-only. Perkins
-(GitHub/GitLab) remains the stronger gate with exact-head verdicts and
-autonomous-merge authority.
+0 blockers clear review/fix routing only — the PASS is not a Perkins
+READY — while blockers route back to the implementing minion as fix
+directives, never inform-only. Perkins (GitHub/GitLab) remains the
+stronger gate with exact-head verdicts; the owner holds every merge.
 
 Successful setup records exact versions in
 `.gru-command/bmad-install.json`, adds an idempotent owned bootstrap
@@ -179,8 +179,9 @@ block to `.gru-command/worktree.toml`, and uses narrow Git-local excludes
 for generated paths. It does not blanket-ignore `.agents/`, `.claude/`,
 or `_bmad-output/`, and never untracks files. Commit the three
 `.gru-command/` bootstrap files so newly-created worktrees can copy an
-isolated project-local BMAD install and discover `bmad-build`; generated
-skills/output remain local. Network and prerequisite failures name the
+isolated project-local BMAD install and discover the build-workflow
+skill this pinned release provides; generated skills/output remain
+local. Network and prerequisite failures name the
 repo and keep retry or explicit skip; deterministic state failures—a
 broken or partial install, a missing/unsafe module directory, a missing
 runtime binding—offer skip-only with deliberate repair guidance

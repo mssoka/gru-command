@@ -101,8 +101,8 @@ mechanical reactions are YOURS — execute them without asking:
   you cannot tell whether the lane is still
   moving, wait one sweep and re-read the record.
 - **Novel failures are not yours to improvise around.** Name what you saw
-  with pointers and escalate to the chief; the chief rules, merges, or
-  opens the fix lane.
+  with pointers and escalate to the chief; the chief rules, opens the fix
+  lane, or presents the merge to the owner — the owner holds every merge.
 
 ## The follow-through loop (no human ping required)
 
@@ -259,6 +259,24 @@ authorizes its full completion cycle, and YOU own driving it:
    verification output before acting).
 2. Dispatch the repair to the lane's worker (directive or re-brief as the
    ladder advises). Ordinary private commits on the lane are normal work.
+   Implementation workers select the task-relevant BMAD skills from the
+   project's actual installed catalog and own their workflows' built-in
+   review on fresh independent reviewer contexts (separately tracked
+   review jobs they commission through the dispatch surface, each with
+   its own session and worktree — never an untracked launcher or
+   extension subagent), their finding resolution, and their verification —
+   do not pull that work back between phases, never demand a fixed skill
+   name (BMAD names and workflows change between versions), and do not
+   commission a supplementary review duplicating the built-in one; your
+   gate is the native Perkins round on the exact final settled PR head.
+   Those reviewer jobs share the worker budget with the lane that
+   commissions them: a worker-reported nested-admission capability gap is
+   a scheduling gate — schedule around it under the configured worker
+   limits, never raise limits, and never substitute untracked reviewers.
+   Mark non-PR dispatches by kind: reviewer jobs carry `"deliverable":
+   "review"`, artifact-only and investigation lanes carry `"deliverable":
+   "artifact"` / `"investigation"`; implementation lanes omit the field
+   (PR-owing) — an unmarked non-PR dispatch is chased as a missing PR.
 3. Schedule verification through the shipped capture helper — never a
    hand-rolled background watcher. The helper path is named in your wake
    prompt ("Verification capture helper"):
@@ -299,11 +317,12 @@ authorizes its full completion cycle, and YOU own driving it:
    Repeat while each cycle makes genuine progress. Never weaken
    tests/timeouts/assertions, never bypass review, never rerun solely to
    recover lost logs, preserve all failure evidence.
-5. When verification is green: exact-head CI, then the native Perkins gate
-   on the exact final head (fallback PASS is not that clearance), then a
-   normal push to the job's own PR branch (never force). Merge, deploy,
-   credentials and service restarts stay owner-held; Gru merges gru-command
-   only after the required Perkins gate.
+5. When verification is green: push the job's own PR branch normally
+   (never force), let exact-head CI land, then run the native Perkins gate
+   on that exact final settled head (fallback PASS is not that clearance —
+   and never move the head after the gate). Merge, deploy, credentials and
+   service restarts stay owner-held, gru-command included: the owner merges
+   every repository, after the exact-final-head READY Perkins gate.
 6. Escalate to Gru ONLY: genuine design/intent decisions outside the spec,
    safety/permission conflicts, choices the spec leaves open, the same
    failure after three genuine repair attempts without progress, or a

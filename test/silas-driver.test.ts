@@ -29,11 +29,11 @@ import { createDurableReconcileHook, reconcileDurableWork } from '../src/dispatc
 import type { FollowThroughNotifications } from '../src/dispatch/obligations.js';
 import { FIRING_RULES } from '../src/ledger/obligations.js';
 import { LedgerApi } from '../src/ledger/api.js';
-import { LedgerDb } from '../src/ledger/db.js';
+import { LedgerDb, MIGRATIONS } from '../src/ledger/db.js';
 import { DEFAULT_SILAS_CONFIG } from '../src/config.js';
 import type { AgentCapabilities, AgentHandle } from '../src/runtime/types.js';
 import type { AgentSupervisionView } from '../src/supervision/supervisor.js';
-import type { EventRecord, JobRecord, RoundRecord } from '../src/ledger/api.js';
+import type { EventRecord, JobDeliverable, JobRecord, RoundRecord } from '../src/ledger/api.js';
 import type { Role } from '../src/config.js';
 
 const FAKE_CAPABILITIES: AgentCapabilities = {
@@ -179,8 +179,11 @@ function makeLedger(): Harness {
   };
 }
 
-function addJobWithDelivery(ledger: LedgerApi, jobId: string, opts: { prUrl?: string } = {}): JobRecord {
-  const job = ledger.addJob({ id: jobId, repo: 'fixture-app', title: `t-${jobId}`, briefing: 'b' });
+function addJobWithDelivery(ledger: LedgerApi, jobId: string, opts: { prUrl?: string; deliverable?: JobDeliverable } = {}): JobRecord {
+  const job = ledger.addJob({
+    id: jobId, repo: 'fixture-app', title: `t-${jobId}`, briefing: 'b',
+    ...(opts.deliverable !== undefined ? { deliverable: opts.deliverable } : {}),
+  });
   ledger.setJobStatus(jobId, 'working');
   ledger.appendCustomEvent({ kind: 'job.handoff', jobId, payload: {} });
   ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { agentId: 'a1' } });
@@ -212,6 +215,66 @@ describe('silas digest (the four actionable states)', () => {
       expect(after.deliveredWithoutPr).toEqual([]);
       // registration alone flips the state to review-due
       expect(after.prWithoutReview.map((row) => row.jobId)).toEqual(['job-a']);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('an upgraded pre-deliverable delivered implementation keeps null deliverable and stays PR-overdue', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-e18-upgrade-'));
+    try {
+      // A database shaped before migration 19: null deliverable is the only
+      // pre-existing value, and it must remain PR-owing through the upgrade.
+      const legacy = new LedgerDb(dir, { migrations: MIGRATIONS.filter((migration) => migration.id <= 18) });
+      const legacyApi = new LedgerApi(legacy.handle);
+      // The pre-18 schema has no deliverable column, so the legacy row is
+      // inserted at its own shape (the product's current addJob correctly
+      // writes the column the old schema cannot carry).
+      const ts = new Date().toISOString();
+      legacy.handle
+        .prepare(`INSERT INTO jobs (id, repo, title, status, base_branch, pr_url, note, briefing, created_at, updated_at)
+                  VALUES (?, ?, ?, 'working', NULL, NULL, NULL, ?, ?, ?)`)
+        .run('legacy-impl', 'fixture-app', 't', 'b', ts, ts);
+      legacyApi.appendCustomEvent({ kind: 'job.status', jobId: 'legacy-impl', payload: { from: 'dispatched', to: 'working' } });
+      legacyApi.appendCustomEvent({ kind: 'job.handoff', jobId: 'legacy-impl', payload: {} });
+      legacyApi.appendCustomEvent({ kind: 'job.delivered', jobId: 'legacy-impl', payload: { agentId: 'a1' } });
+      legacy.close();
+      const upgraded = new LedgerDb(dir);
+      const api = new LedgerApi(upgraded.handle);
+      try {
+        expect(api.getJob('legacy-impl')?.deliverable).toBeNull();
+        const digest = await computeSilasDigest({
+          ledger: api,
+          blockersForRound: async () => ({ blockers: [], note: null }),
+          config: DEFAULT_SILAS_CONFIG,
+          trigger: 'sweep',
+        });
+        expect(digest.deliveredWithoutPr.map((row) => row.jobId)).toEqual(['legacy-impl']);
+      } finally {
+        upgraded.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('excludes a delivered review/artifact job from PR-overdue follow-through (E19 carve-out)', async () => {
+    const h = makeLedger();
+    try {
+      addJobWithDelivery(h.ledger, 'review-job', { deliverable: 'review' });
+      addJobWithDelivery(h.ledger, 'artifact-job', { deliverable: 'artifact' });
+      addJobWithDelivery(h.ledger, 'investigation-job', { deliverable: 'investigation' });
+      addJobWithDelivery(h.ledger, 'impl-job');
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      // Only the PR-owing lane is follow-through due; a reviewer's findings
+      // handback and an artifact handback are their own deliverables and
+      // must never be chased as a missing PR.
+      expect(digest.deliveredWithoutPr.map((row) => row.jobId)).toEqual(['impl-job']);
     } finally {
       h.cleanup();
     }
@@ -2150,9 +2213,10 @@ describe('silas skills and wake prompt', () => {
       verificationFailures: [], verificationWaits: [], providerRecoveryPending: [] },
       trigger: { kind: 'sweep' }, skills: loadSilasSkills(), ops: { baseUrl: 'http://127.0.0.1:1', configPath: '/tmp/test-config' } });
     expect(prompt).toContain('You NEVER merge a pull request');
-    expect(prompt).toContain('Gru may merge gru-command only');
+    expect(prompt).toContain('The owner holds every merge');
+    expect(prompt).not.toContain('Gru may merge gru-command only');
     expect(prompt).toContain('fallback PASS is not that clearance');
-    expect(prompt).toContain('owner holds merges elsewhere');
+    expect(prompt).not.toContain('owner holds merges elsewhere');
     expect(prompt).toContain('clean-abort-service-restart');
     expect(prompt).toContain('source_round_id');
     // Issue #125: the assembled prompt never instructs the phantom action
