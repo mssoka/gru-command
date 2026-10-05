@@ -4,7 +4,8 @@ Running Gru Command on your machine: service management, the emergency
 console, supervision, forensics, and backups & restore. Operator-facing
 companion to [SUPERVISION.md](./SUPERVISION.md) (the supervision +
 service-install internals), [CONFIG.md](./CONFIG.md) (the config
-schema), and [CHAT.md](./CHAT.md) (the chat contract).
+schema), [CHAT.md](./CHAT.md) (the chat contract), and
+[YIELD-REPORT.md](./YIELD-REPORT.md) (the GH-214 cost/yield telemetry).
 
 ## Where everything lives
 
