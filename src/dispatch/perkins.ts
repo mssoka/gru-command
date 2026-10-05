@@ -176,11 +176,11 @@ function ciEvidenceLine(ci: CiEvidenceRecord | null | undefined): string | null 
   };
   switch (ci.state) {
     case 'green':
-      return `- CI evidence at freeze: GREEN (recorded observation, ${ci.checks.length} check(s)) — ${bound}`;
+      return `- CI evidence at freeze: GREEN (recorded observation, ${ci.checks.length} retained check(s)) — ${bound}`;
     case 'pending':
-      return `- CI evidence at freeze: PENDING — NOT PASS (${ci.checks.length} check(s)) — ${bound}`;
+      return `- CI evidence at freeze: PENDING — NOT PASS (${ci.checks.length} retained check(s)) — ${bound}`;
     case 'failed':
-      return `- CI evidence at freeze: FAILED — NOT PASS (${ci.failures.length} failing check(s): ${boundedNames(ci.failures.map((failure) => failure.name))}) — ${bound}`;
+      return `- CI evidence at freeze: FAILED — NOT PASS (${ci.failures.length} retained failing check(s): ${boundedNames(ci.failures.map((failure) => failure.name))}) — ${bound}`;
     case 'unavailable':
       return `- CI evidence at freeze: UNAVAILABLE — NO BOUND CI RECEIPT (missing evidence, not a measured failure): ${renderUntrustedInline(ci.reason ?? 'no reason recorded', 200)}`;
     case 'not-matched':
@@ -3867,6 +3867,9 @@ export class WaveRunner {
       const incidentHeading = spawnInitiated()
         ? '**Parent incident** — the round ended before completion; this is one parent incident, not a per-lens specialist failure.'
         : '**Setup refusal** — the round ended before any review owner spawned; zero lead turns and zero specialist children existed.';
+      const refusalResults: ReviewLensResult[] = spawnInitiated()
+        ? this.interruptedLensResults(this.opts.ledger.getRound(round.id) ?? round, lenses, detail)
+        : lenses.map((_lens) => ({ state: 'error' as const, note: `not started — setup refusal (no review owner spawned): ${detail}`.slice(0, 500) }));
       const incompleteContents = [
         '# Perkins Code Review',
         '',
@@ -3901,7 +3904,9 @@ export class WaveRunner {
       this.opts.escalate?.(`Review round ${round.id} is INCOMPLETE`, `${detail}\n${executionFacts}`, { jobId: job.id, roundId: round.id });
       return {
         round: this.opts.ledger.getRound(round.id) as RoundRecord,
-        results: this.interruptedLensResults(round, lenses, detail),
+        // P5 (round 5): a PRE-SPAWN failure returns setup-refusal notes —
+        // its ledger truth is the no-spawn receipt, not a parent incident.
+        results: refusalResults,
         verdict: null,
         posted: false,
         canonicalVerdict: 'INCOMPLETE',
@@ -3915,7 +3920,7 @@ export class WaveRunner {
     const provisional: LensAccounting = accounting;
     try {
       if (signal.aborted) throw new Error('review operation aborted before finalization');
-      this.recordLensResults(round, lenses, review, accounting, new Set(specialistStartFacts(this.opts.ledger.listRoundSpecialistStarts(round.id)).map((start) => start.lens)));
+      this.recordLensResults(round, lenses, review, accounting, specialistStartFacts(this.opts.ledger.listRoundSpecialistStarts(round.id)));
       const results = accounting.results;
       const sourceMovement = review.sourceMovement ?? sourceMovementSinceFreeze(frozenReview);
       const headMoved = review.headMoved || sourceMovement !== null;
@@ -4241,14 +4246,16 @@ export class WaveRunner {
           complete: canonical !== 'INCOMPLETE' && !headMoved,
         },
       });
-      // gh-169 R4-1: the deferred not-used chips commit BEFORE the verdict
-      // transition — a failure here aborts a still-live round (legal,
-      // consistent), and a posted verdict can never coexist with pending
-      // unused chips. A crash between the two leaves chips terminal and
-      // the round live for an honest restart reconciliation, never a
-      // parent abort after a posted verdict.
-      this.commitUnusedLensChips(round, accounting.unusedLenses);
-      this.opts.ledger.setRoundVerdict(round.id, recordedVerdict);
+      // gh-169 round-5 P1: the deferred not-used chips and the verdict
+      // transition commit in ONE atomic ledger transaction — a failure
+      // anywhere leaves NOTHING committed (round live, deferred chips
+      // pending, the abort path legal), and a posted verdict can never
+      // coexist with pending or mixed deferred chips.
+      this.opts.ledger.finalizeRoundVerdictWithLensOutcomes(
+        round.id,
+        recordedVerdict,
+        accounting.unusedLenses.map((lens) => ({ lens, state: 'done' as const, note: 'not used — lead-owned whole-PR review' })),
+      );
     } else {
       this.opts.ledger.setRoundStatus(round.id, 'aborted');
       // P7/Q5/Q6 (gh-169): an ordinary lead-authored INCOMPLETE (or an
@@ -4458,11 +4465,18 @@ export class WaveRunner {
     lenses: readonly PerkinsLens[],
     review: PerkinsWholeResult,
     accounting: LensAccounting,
-    journaledStartLenses: ReadonlySet<string>,
+    journaledStarts: readonly SpecialistStartFact[],
   ): void {
     const { results, settledLenses, unusedLenses } = accounting;
     for (const lens of lenses) {
       const runs = review.specialistRuns.filter((run) => run.lens === lens);
+      // Attempt-level truth (round-5 P2): a settled a1 never hides a
+      // journaled-but-unsettled retry on the SAME lens.
+      const settledAttempts = new Set(runs.map((run) => run.attempt));
+      const unsettledRetries = journaledStarts
+        .filter((start) => start.lens === lens && !settledAttempts.has(start.attempt as 1 | 2))
+        .map((start) => `a${start.attempt}`);
+      const journaledStartLenses = new Set(journaledStarts.map((start) => start.lens));
       if (runs.length === 0 && journaledStartLenses.has(lens)) {
         // gh-169 R4-2: a lens whose attempt was JOURNALED but never
         // settled is real started work — never 'not used'. Its chip
@@ -4487,7 +4501,8 @@ export class WaveRunner {
       if (failed.length === runs.length) {
         // Every attempt on this lens failed: honest execution error, named
         // per attempt. The lead's own review still stands apart from it.
-        const note = `specialist attempts failed: ${failed.map((run) => `a${run.attempt} ${run.failureKind ?? 'error'}: ${(run.error ?? 'no host-recorded reason').slice(0, 200)}`).join('; ')}`;
+        const note = `specialist attempts failed: ${failed.map((run) => `a${run.attempt} ${run.failureKind ?? 'error'}: ${(run.error ?? 'no host-recorded reason').slice(0, 200)}`).join('; ')}` +
+          `${unsettledRetries.length > 0 ? `; started but unsettled: ${unsettledRetries.join(', ')} (the wave ended before these results committed)` : ''}`;
         this.opts.ledger.setLensOutcome(round.id, lens, 'error', note);
         results.push({ state: 'error', note });
         settledLenses.add(lens);
@@ -4514,6 +4529,9 @@ export class WaveRunner {
       if (runs.some((run) => run.status === 'valid' && run.findingsDelivered === false && run.recoveredForLead !== true)) {
         history.push('specialist findings for this lens were NOT delivered to the lead (transport overflow); the lead judged without them');
       }
+      if (unsettledRetries.length > 0) {
+        history.push(`started but unsettled: ${unsettledRetries.join(', ')} (the wave ended before these results committed)`);
+      }
       const note = `${verdict} — ${evidence}${history.length > 0 ? ` · ${history.join(' · ')}` : ''}`;
       this.opts.ledger.setLensOutcome(round.id, lens, 'done', note);
       results.push({ state: 'done', verdict, evidence: note });
@@ -4522,15 +4540,6 @@ export class WaveRunner {
       // (caller-held) accounting object, never an interrupted error for an
       // already-done chip.
       settledLenses.add(lens);
-    }
-  }
-
-  /** Commit the deferred not-used chips once the round has durably
-   * recorded its verdict (gh-169 P3): only a terminalized round may show
-   * 'not used' coverage chips. */
-  private commitUnusedLensChips(round: RoundRecord, unusedLenses: readonly PerkinsLens[]): void {
-    for (const lens of unusedLenses) {
-      this.opts.ledger.setLensOutcome(round.id, lens, 'done', 'not used — lead-owned whole-PR review');
     }
   }
 

@@ -358,9 +358,11 @@ function joinJobEvent(h: Harness, jobId: string, kind: string, where?: (event: E
     });
     let sweeps = 0;
     const drain = (): void => {
-      setImmediate(() => {
+      // Real-time tick: review setup awaits real async subprocess work
+      // (the admission remote probe), which bare setImmediate drains past.
+      setTimeout(() => {
         if (settled) return;
-        if (sweeps >= 100) {
+        if (sweeps >= 400) {
           settled = true;
           unsubscribe();
           reject(

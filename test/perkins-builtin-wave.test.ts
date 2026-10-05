@@ -526,10 +526,16 @@ describe('WaveRunner built-in Perkins production path', () => {
     });
 
     // Admitted path: the round freezes pending, waits for two resident
-    // slots, then flips live on admission — never before.
+    // slots, then flips live on admission — never before. (Setup includes
+    // an await — the admission remote probe — so wait for the EVENT, not
+    // a fixed tick count.)
     const admitted = wave.beginRound({ jobId: job.id });
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    const [queued] = ledger.listRounds(job.id);
+    let queued = ledger.listRounds(job.id)[0];
+    for (let waited = 0; waited < 200 && (queued === undefined ||
+      ledger.latestRoundEvent(queued.id, 'round.residency-queued') === null); waited += 1) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+      queued = ledger.listRounds(job.id)[0];
+    }
     expect(queued?.status).toBe('pending'); // NOT live while admission waits
     expect(ledger.latestRoundEvent(queued!.id, 'round.residency-queued')?.roundId).toBe(queued!.id);
     deferred[0]!.resolve(probeRound);
@@ -851,7 +857,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     expect(port.getWorktree(aborted!.id)?.status).toBe('swept');
   });
 
-  it('a finalization failure after the chip commits keeps terminal chips, no posted verdict, and consistent results (gh-169 P3/R4-1)', async () => {
+  it('an atomic-finalization failure commits nothing deferred: settled truth kept, unused lenses pending, no posted verdict (gh-169 P1)', async () => {
     const repo = makeFixtureRepo('perkins-finalization-explode');
     repos.push(repo);
     repo.git(['checkout', '-b', 'feature/finalization-explode']);
@@ -893,24 +899,23 @@ describe('WaveRunner built-in Perkins production path', () => {
     expect(outcome.canonicalVerdict).toBe('INCOMPLETE');
     expect(outcome.round.status).toBe('aborted');
     const chips = ledger.getRound(outcome.round.id)?.lenses ?? [];
-    // R4-1 ordering: the deferred not-used chips committed BEFORE the
-    // verdict transition, so the explosion leaves every chip terminal and
-    // truthful — the settled lens done, the never-started lenses done as
-    // the review's completed 'not used' accounting — while the round
-    // itself aborts with NO posted verdict (the verdict write failed) and
-    // no parent abort is invented after a posted verdict.
+    // Round-5 P1 ATOMIC finalization: the explosion inside the verdict
+    // transaction leaves NOTHING committed — the settled lens keeps the
+    // chip it durably committed EARLIER (done), every deferred not-used
+    // chip stays PENDING (no coverage claim on an aborted round), no
+    // verdict is posted, and the abort is legal and honest.
     const security = chips.find((chip) => chip.lens === 'security');
     expect(security?.state).toBe('done');
     for (const chip of chips.filter((entry) => entry.lens !== 'security')) {
-      expect(chip.state, chip.lens).toBe('done');
-      expect(chip.note, chip.lens).toContain('not used');
+      expect(chip.state, chip.lens).toBe('pending');
     }
     expect(ledger.getRound(outcome.round.id)?.verdict).toBeNull();
-    // Returned results agree with the chips: the provisional (truthful)
-    // accounting passes through; no child failure is invented.
+    // Returned results agree with the chips: the settled lens keeps its
+    // provisional (truthful) result; every other lens is an honest
+    // not-started parent-incident outcome; no child failure is invented.
     const securityIndex = chips.findIndex((chip) => chip.lens === 'security');
     expect(outcome.results[securityIndex]?.state).toBe('done');
-    expect(outcome.results.filter((result) => result.state === 'done')).toHaveLength(9);
+    expect(outcome.results.filter((result) => result.state === 'error' && result.note.startsWith('not started — parent incident'))).toHaveLength(8);
     const incident = ledger.listEvents({ limit: 200 }).find((event) => event.kind === 'round.parent-incident');
     expect(incident?.payload).toMatchObject({ startedAttempts: 1, startedLenses: ['security'] });
   });
@@ -1015,10 +1020,11 @@ describe('WaveRunner built-in Perkins production path', () => {
     expect(postedBody).toContain('2 journaled (1 valid, 0 failed; 1 started-but-unsettled: edge a1)');
     expect(postedBody).toContain('Specialist attempts that started but never committed a result: edge a1');
     expect(postedBody).not.toMatch(/Lenses not used this round:[^\n]*edge/u);
-    // A lead-submitted INCOMPLETE over the same shape reports the unsettled
-    // attempt in the host facts (round-3 P1's wave-level pin).
-    const hostReport = readFileSync(join(artifacts, outcome.round.id, 'perkins-report.md'), 'utf8');
-    expect(hostReport).toBeTruthy();
+    // P6 (round 5): the exact frozen no-bound-run UNAVAILABLE disclosure
+    // reaches the LEAD prompt — not only the frozen bytes.
+    expect(fake.leadCalls[0]!.prompt).toContain('--- HOST-RECORDED VERIFICATION');
+    expect(fake.leadCalls[0]!.prompt).toContain('state: UNAVAILABLE — NO BOUND VERIFICATION RUN');
+    expect(fake.leadCalls[0]!.prompt).toContain('--- HOST-RECORDED CI EVIDENCE');
   });
 
   it('refuses the freeze pre-round when the spec bound leaves no room for any verification section (gh-169 P9)', async () => {
@@ -1118,6 +1124,163 @@ describe('WaveRunner built-in Perkins production path', () => {
     expect(frozenSpec).not.toContain('NO BOUND VERIFICATION RUN');
     expect(frozenSpec).toContain('--- HOST-RECORDED CI EVIDENCE');
     expect(outcome.round.status).toBe('verdict-posted');
+  });
+
+  it('keeps the service loop responsive through a stalled advertised-tip probe at admission, refusing fail-closed without spawn (gh-169 P7)', async () => {
+    const repo = makeFixtureRepo('perkins-stalled-admission');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/stalled-admission']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-sa-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-sa-artifacts-'));
+    const sessions = mkdtempSync(join(tmpdir(), 'perkins-sa-sessions-'));
+    dirs.push(sessions);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-sa-db-')));
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/stalled-admission', target);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-sa' });
+    const job = ledger.addJob({ id: 'job-sa', repo: 'fixture', title: 'stalled admission', baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://github.com/acme/fixture/pull/50');
+    attachOrigin(repo, 'feature/stalled-admission', root);
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    const shimDir = mkdtempSync(join(tmpdir(), 'perkins-sa-shim-'));
+    dirs.push(shimDir);
+    const shim = join(shimDir, 'git');
+    writeFileSync(shim, `#!/bin/sh\ncase " $* " in *"ls-remote"*) sleep 30;; esac\nexec "${realGit}" "$@"\n`);
+    chmodSync(shim, 0o755);
+    const underlying = makeSpawner(sessions, []);
+    const wave = new WaveRunner({
+      ledger, worktrees: port, spawner: (role, options) => underlying(role, options),
+      reviewArtifactRoot: artifacts, prHeadProbe: localHeadProbe('feature/stalled-admission'),
+    });
+    const oldPath = process.env.PATH;
+    process.env.PATH = `${shimDir}:${oldPath ?? ''}`;
+    let ticks = 0;
+    const ticker = setInterval(() => { ticks += 1; }, 25);
+    try {
+      await expect(wave.runRound({ jobId: job.id })).rejects.toThrow(/head-binding/u);
+    } finally {
+      clearInterval(ticker);
+      if (oldPath === undefined) delete process.env.PATH;
+      else process.env.PATH = oldPath;
+    }
+    // Unrelated event-loop work ran THROUGHOUT the stalled probe (the
+    // admission probe is off-loop), and the refusal is fail-closed without
+    // any spawn.
+    expect(ticks).toBeGreaterThan(20);
+    const round = ledger.listRounds(job.id)[0]!;
+    expect(round.status).toBe('aborted');
+    expect(ledger.listEvents({ limit: 100 }).some((event) => event.kind === 'round.review-no-spawn')).toBe(true);
+    expect(ledger.listAgents().filter((agent) => agent.roundId === round.id)).toEqual([]);
+  });
+
+  it('a mid-loop settled-chip failure preserves the committed chip and invents no child failure (gh-169 P8)', async () => {
+    const repo = makeFixtureRepo('perkins-partial-chip-failure');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/partial-chip-failure']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-pcf-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-pcf-artifacts-'));
+    const sessions = mkdtempSync(join(tmpdir(), 'perkins-pcf-sessions-'));
+    dirs.push(root, artifacts, sessions);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-pcf-db-')));
+    dbs.push(db);
+    // Explode on the SECOND settled chip write (tests): security's write
+    // succeeds first, preserving its committed truth.
+    class SecondChipExplodingLedger extends LedgerApi {
+      private writes = 0;
+      override setLensOutcome(roundId: string, lens: string, state: string, note?: string): ReturnType<LedgerApi['setLensOutcome']> {
+        this.writes += 1;
+        if (lens === 'tests' && state === 'error') throw new Error('simulated chip-write failure');
+        return super.setLensOutcome(roundId, lens, state, note);
+      }
+    }
+    const ledger = new SecondChipExplodingLedger(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/partial-chip-failure', target);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-pcf' });
+    const job = ledger.addJob({ id: 'job-pcf', repo: 'fixture', title: 'partial chip failure', baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/51');
+    attachOrigin(repo, 'feature/partial-chip-failure', root);
+    const fake = fakeWholeSpawner(sessions, {
+      specialists: ['security', 'tests'],
+      childAnswer: (prompt) => (/"source": "tests"/u.test(prompt) ? 'malformed output' : '[]'),
+    });
+    const wave = new WaveRunner({
+      ledger, worktrees: port, spawner: fake.spawner, reviewArtifactRoot: artifacts,
+      prHeadProbe: localHeadProbe('feature/partial-chip-failure'),
+    });
+    const outcome = asWave(await wave.runRound({ jobId: job.id }));
+    expect(outcome.canonicalVerdict).toBe('INCOMPLETE');
+    const chips = ledger.getRound(outcome.round.id)?.lenses ?? [];
+    // The FIRST settled lens keeps its committed done chip and matching
+    // returned result; the failed-write lens keeps pending (started via
+    // journal) and returns an interrupted-execution error — never an
+    // invented settled failure, never not-used.
+    const security = chips.find((chip) => chip.lens === 'security');
+    expect(security?.state).toBe('done');
+    const securityResult = outcome.results[chips.findIndex((chip) => chip.lens === 'security')];
+    expect(securityResult?.state).toBe('done');
+    const testsChip = chips.find((chip) => chip.lens === 'tests');
+    // The chip write FAILED, so the durable chip keeps its pre-write state
+    // (live — the child had registered); the truth rides in the returned
+    // result and the parent incident, never an invented settled failure.
+    expect(testsChip?.state).toBe('live');
+    const testsResult = outcome.results[chips.findIndex((chip) => chip.lens === 'tests')];
+    expect(testsResult?.state).toBe('error');
+    expect(testsResult?.state === 'error' && testsResult.note).toContain('attempt started; interrupted by parent failure');
+    const incident = ledger.listEvents({ limit: 200 }).find((event) => event.kind === 'round.parent-incident');
+    expect(incident?.payload).toMatchObject({ startedLenses: expect.arrayContaining(['security', 'tests']) });
+  });
+
+  it('names the actual fallback when delivery fails AND the host report cannot be written (gh-169 P9)', async () => {
+    const repo = makeFixtureRepo('perkins-dual-failure');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/dual-failure']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-df-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-df-artifacts-'));
+    const sessions = mkdtempSync(join(tmpdir(), 'perkins-df-sessions-'));
+    dirs.push(root, artifacts, sessions);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-df-db-')));
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/dual-failure', target);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-df' });
+    const job = ledger.addJob({ id: 'job-df', repo: 'fixture', title: 'dual failure', baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://github.com/acme/fixture/pull/52');
+    attachOrigin(repo, 'feature/dual-failure', root);
+    const escalations: string[] = [];
+    const fake = fakeWholeSpawner(sessions, { childAnswer: () => '[]' });
+    const wave = new WaveRunner({
+      ledger, worktrees: port, spawner: fake.spawner, reviewArtifactRoot: artifacts,
+      // Delivery FAILS first (poster throws)...
+      poster: { post: vi.fn(async () => { throw new Error('simulated delivery failure'); }) },
+      prHeadProbe: localHeadProbe('feature/dual-failure'),
+      // ...and then the host INCOMPLETE report cannot be written (planted
+      // different-bytes write-once collision).
+      reviewFreezeObserver: (frozen) => {
+        writeFileSync(join(frozen.directory, 'perkins-report.host-incomplete.md'), 'planted different bytes\n');
+      },
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+    });
+    const outcome = asWave(await wave.runRound({ jobId: job.id }));
+    expect(outcome.canonicalVerdict).toBe('INCOMPLETE');
+    // The RETURNED report is the delivery-incomplete record; the event and
+    // the escalation name the SAME fallback path (they agree with the
+    // returned outcome), and the lead report stays preserved.
+    expect(basename(outcome.reportFile)).toBe('perkins-report.delivery-incomplete.md');
+    const event = ledger.listEvents({ limit: 200 }).find((entry) => entry.kind === 'round.perkins-incomplete');
+    expect((event?.payload as { readonly reportFile?: string }).reportFile).toBe(outcome.reportFile);
+    expect((event?.payload as { readonly hostReportWriteFailed?: string }).hostReportWriteFailed).toBeTruthy();
+    expect(escalations.some((entry) => entry.includes('could NOT be written') && entry.includes('perkins-report.delivery-incomplete.md'))).toBe(true);
+    expect(existsSync(join(artifacts, outcome.round.id, 'perkins-report.md'))).toBe(true);
   });
 
   it('records ONE parent incident and zero executed specialist failures when the lead transport dies before any child (gh-169)', async () => {
@@ -3375,7 +3538,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     // P10: the posted body states the FROZEN CI evidence distinctly — a
     // measured failure is published as FAILED, never softened and never
     // rendered as the NOT RECORDED placeholder.
-    expect(postedBody).toContain('- CI evidence at freeze: FAILED — NOT PASS (1 failing check(s): unit-tests)');
+    expect(postedBody).toContain('- CI evidence at freeze: FAILED — NOT PASS (1 retained failing check(s): unit-tests)');
     expect(postedBody).not.toContain('NOT RECORDED');
     expect(postedBody).not.toContain('UNAVAILABLE');
     expect(postedBody).toContain('- Specialist attempts started: 5 journaled (2 valid, 3 failed) across 3 of 9 available lenses');
@@ -5996,7 +6159,7 @@ describe('repair pass 3: host disclosure completeness, safety, and provider trut
       sourceKind: 'github.ci-failed', sourceSeq: 10, checks: [],
       failures: [{ name: 'unit-tests', conclusion: 'failure', url: null }], reason: null,
     });
-    expect(failed).toContain('- CI evidence at freeze: FAILED — NOT PASS (1 failing check(s): unit-tests)');
+    expect(failed).toContain('- CI evidence at freeze: FAILED — NOT PASS (1 retained failing check(s): unit-tests)');
     // Q7: untrusted failure names are individually bounded and visibly
     // elided past a small cap — a hostile long name can never push the
     // published body past the provider bound.
@@ -6030,7 +6193,7 @@ describe('repair pass 3: host disclosure completeness, safety, and provider trut
       sourceKind: 'github.ci-green', sourceSeq: 12,
       checks: [{ name: 'unit-tests', url: null }, { name: 'lint', url: null }], failures: [], reason: null,
     });
-    expect(green).toContain('- CI evidence at freeze: GREEN (recorded observation, 2 check(s))');
+    expect(green).toContain('- CI evidence at freeze: GREEN (recorded observation, 2 retained check(s))');
     // A round with no frozen CI record says so explicitly — it never
     // guesses and never fabricates a state.
     const unrecorded = hostDisclosureAppendix(review, 'github', [...PERKINS_LENSES]);
@@ -6548,9 +6711,12 @@ describe('durable handoff admission: perkins route, re-busy re-queue, crash/term
     return { repo, target, root, artifacts, db, bus, ledger, port, job };
   }
 
-  async function tickUntil(predicate: () => boolean, limit = 100): Promise<void> {
+  async function tickUntil(predicate: () => boolean, limit = 400): Promise<void> {
+    // Real-time ticks (not bare setImmediate): review setup includes real
+    // async subprocess work (the admission remote probe), so wait on wall
+    // time while staying bounded.
     for (let index = 0; index < limit && !predicate(); index += 1) {
-      await new Promise<void>((resolve) => setImmediate(resolve));
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
     }
   }
 

@@ -637,9 +637,55 @@ export async function probeAdvertisedTipMovementAsync(
   timeoutMs: number,
 ): Promise<SourceMovement | null> {
   const { targetRef, targetSha } = review.manifest;
+  const run = async (args: readonly string[]): Promise<string> => {
+    const { stdout } = await execFileAsPromised('git', ['-C', review.manifest.repoPath, ...args], {
+      encoding: 'utf8', timeout: timeoutMs, maxBuffer: 1024 * 1024,
+    });
+    return stdout;
+  };
+  // Round-5 P3: EVERY preparation step is async and bounded — the sync
+  // advertisedRemoteBranch helper (30 s execFileSync defaults) is never
+  // touched at admission, so no slow config/filesystem/helper step can
+  // block the service event loop. Semantics mirror the sync helper: a
+  // spelling that is not a valid branch/ref name SKIPS the probe (no
+  // movement); only genuine probe errors are fail-closed check-failed.
+  const identify = async (): Promise<{ remote: string; branch: string } | null> => {
+    if (targetRef.startsWith('refs/') && !targetRef.startsWith('refs/remotes/')) return null;
+    if (!targetRef.startsWith('refs/remotes/')) {
+      try {
+        await run(['check-ref-format', '--branch', targetRef]);
+      } catch {
+        return null; // not a branch spelling (e.g. origin/topic~1)
+      }
+      let fullName: string;
+      try {
+        fullName = (await run(['rev-parse', '--symbolic-full-name', '--verify', targetRef])).trimEnd();
+      } catch {
+        return null;
+      }
+      if (!fullName.startsWith('refs/remotes/')) return null;
+      const remoteRef = fullName.slice('refs/remotes/'.length);
+      const slash = remoteRef.indexOf('/');
+      if (slash <= 0 || slash === remoteRef.length - 1) return null;
+      const remote = remoteRef.slice(0, slash);
+      const remotes = (await run(['remote'])).split('\n');
+      return remotes.includes(remote) ? { remote, branch: remoteRef.slice(slash + 1) } : null;
+    }
+    try {
+      await run(['check-ref-format', targetRef]);
+    } catch {
+      return null; // a qualified revision expression, not a tracking ref
+    }
+    const remoteRef = targetRef.slice('refs/remotes/'.length);
+    const slash = remoteRef.indexOf('/');
+    if (slash <= 0 || slash === remoteRef.length - 1) return null;
+    const remote = remoteRef.slice(0, slash);
+    const remotes = (await run(['remote'])).split('\n');
+    return remotes.includes(remote) ? { remote, branch: remoteRef.slice(slash + 1) } : null;
+  };
   let remoteTarget: { remote: string; branch: string } | null = null;
   try {
-    remoteTarget = advertisedRemoteBranch(review.manifest.repoPath, targetRef);
+    remoteTarget = await identify();
   } catch (error) {
     return movement('check-failed', gitErrorDetail(error));
   }

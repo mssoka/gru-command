@@ -2004,6 +2004,42 @@ export class LedgerApi {
     });
   }
 
+  /** ATOMIC verdict + deferred-lens-chip finalization (gh-169 round-5
+   * P1): the verdict transition and the deferred not-used chip writes
+   * commit in ONE transaction — a failure partway leaves NOTHING
+   * committed (the round stays live, the chips stay pending, the abort
+   * path stays legal), and a posted verdict can never coexist with a
+   * mixed or pending deferred-chip set. */
+  finalizeRoundVerdictWithLensOutcomes(
+    id: string,
+    verdict: string,
+    outcomes: ReadonlyArray<{ readonly lens: string; readonly state: 'done'; readonly note: string }>,
+  ): RoundRecord {
+    if (!isRoundVerdict(verdict)) throw new Error(`unknown round verdict "${verdict}"`);
+    return this.transaction(() => {
+      const round = this.getRound(id);
+      if (round === null) throw new RecordNotFound(`round "${id}" not found`);
+      for (const outcome of outcomes) {
+        const chip = round.lenses.find((entry) => entry.lens === outcome.lens);
+        if (chip === undefined) throw new RecordNotFound(`round "${id}" has no lens "${outcome.lens}"`);
+        if (chip.state === 'pending' || chip.state === 'live') {
+          assertLensTransition(chip.state, outcome.state);
+          this.db
+            .prepare('UPDATE lens_states SET state = ?, note = ?, updated_at = ? WHERE round_id = ? AND lens = ?')
+            .run(outcome.state, outcome.note, nowIso(), id, outcome.lens);
+          this.appendEvent({
+            kind: 'lens.status',
+            jobId: round.jobId,
+            roundId: id,
+            lens: outcome.lens,
+            payload: { from: chip.state, to: outcome.state, note: outcome.note },
+          });
+        }
+      }
+      return this.setRoundVerdict(id, verdict);
+    });
+  }
+
   /** Bind a lens chip to its live agent session (chip state derives from it). */
   bindLens(roundId: string, lens: string, agentId: string): RoundRecord {
     return this.transaction(() => {
