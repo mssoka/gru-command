@@ -192,9 +192,13 @@ describe('workload-aware test budgets', () => {
       // This diagnostic intentionally runs inside a pinned pre-policy git
       // archive without a heavy config. It is an expected-RED baseline,
       // not a current-tree verification segment; live scopes stay guarded.
+      // The exemption stays tied to the actual archived baseline: pinned
+      // base SHA, archive command, isolated directory, and the
+      // unconditional exit 1 (restores the PR #179 isolation tie).
       if (scope === 'perkins-stage1-baseline') {
         expect(command).toContain('git archive "$base"');
         expect(command).toContain('base=9bb51b05af5d8f0a0cd389788d1d3f19607d5361');
+        expect(command).toContain('cd "$d"');
         expect(command).toContain('exit 1');
         continue;
       }
