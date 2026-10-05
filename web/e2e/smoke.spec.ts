@@ -1355,7 +1355,7 @@ test.describe('themes', () => {
     // reply wait above covers the chat only (observed RED under load: the
     // capture missed the band while the DOM already had it). Synchronize
     // on the band's authoritative rows before the screenshot.
-    await expect(page.locator('#board-owner .board-owner__row')).toHaveCount(2);
+    await expect(page.locator('#board-owner .board-owner__row')).toHaveCount(3);
     await expect(
       page.locator('#board-owner .board-owner__row', { hasText: 'Fix the payment retry loop' }),
     ).toBeVisible();
