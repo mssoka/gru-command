@@ -97,6 +97,7 @@ import {
   type PipelineState,
 } from './pipeline.js';
 
+const VERIFICATION_KIND = 'verification.completed';
 export type { JobStatus, RoundStatus, RoundVerdict, LensState } from './states.js';
 export type { DirectiveRequestRecord, DirectiveState } from './directives.js';
 export type {
@@ -980,6 +981,24 @@ export class LedgerApi {
         .prepare('SELECT * FROM events WHERE job_id = ? ORDER BY seq DESC LIMIT ?')
         .all(jobId, limit) as Row[]
     ).map((row) => this.eventFromRow(row));
+  }
+
+  /** R8-2 (gh-169): a job's completed verification runs, KIND-SCOPED and
+   * newest-first — the binding-target search must not be truncated by a
+   * generic all-kind event window. The bound is a loud ceiling: a job with
+   * more completed verification runs than this window throws instead of
+   * letting absence masquerade as "no binding run". */
+  listJobVerificationCompleted(jobId: string, limit = 200): readonly EventRecord[] {
+    const rows = this.db
+      .prepare('SELECT COUNT(*) AS total FROM events WHERE job_id = ? AND kind = ?')
+      .all(jobId, VERIFICATION_KIND) as Row[];
+    const total = typeof rows[0]?.total === 'number' ? (rows[0] as { total: number }).total : 0;
+    if (total > limit) {
+      throw new Error(`verification history window exceeded for job ${jobId} (${total} completed runs > ${limit}) — cannot prove the newest target-bound run from a truncated search`);
+    }
+    return (this.db
+      .prepare('SELECT * FROM events WHERE job_id = ? AND kind = ? ORDER BY seq DESC LIMIT ?')
+      .all(jobId, VERIFICATION_KIND, limit) as Row[]).map((row) => this.eventFromRow(row));
   }
 
   /** True while any verification RUN for the job is unsettled: its latest

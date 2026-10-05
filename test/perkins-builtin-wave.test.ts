@@ -1232,7 +1232,9 @@ describe('WaveRunner built-in Perkins production path', () => {
     expect(testsChip?.state).toBe('live');
     const testsResult = outcome.results[chips.findIndex((chip) => chip.lens === 'tests')];
     expect(testsResult?.state).toBe('error');
-    expect(testsResult?.state === 'error' && testsResult.note).toContain('attempt started; interrupted by parent failure');
+    // The tests attempt SETTLED (its checkpoint is durable) — the truthful
+    // wording discloses the settlement rather than claiming no settlement.
+    expect(testsResult?.state === 'error' && testsResult.note).toContain('attempt settled (checkpoint recorded)');
     const incident = ledger.listEvents({ limit: 200 }).find((event) => event.kind === 'round.parent-incident');
     expect(incident?.payload).toMatchObject({ startedLenses: expect.arrayContaining(['security', 'tests']) });
   });
@@ -1467,7 +1469,8 @@ describe('WaveRunner built-in Perkins production path', () => {
     const chips = ledger.getRound(outcome.round.id)?.lenses ?? [];
     expect(chips.find((chip) => chip.lens === 'security')?.state).toBe('done');
     expect(chips.find((chip) => chip.lens === 'tests')?.state).toBe('error');
-    expect(chips.find((chip) => chip.lens === 'tests')?.note).toContain('interrupted by parent abort');
+    // The tests attempt settled (durable checkpoint) — truthful wording.
+    expect(chips.find((chip) => chip.lens === 'tests')?.note).toContain('attempt settled (checkpoint recorded)');
     const incidents = ledger.listEvents({ limit: 200 }).filter((event) => event.kind === 'round.parent-incident');
     expect(incidents).toHaveLength(1);
   });
@@ -1483,9 +1486,15 @@ describe('WaveRunner built-in Perkins production path', () => {
     dirs.push(root, artifacts, sessions);
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-ewf-db-')));
     dbs.push(db);
+    let reviewEventFailures = 0;
     class ReviewEventExplodingLedger extends LedgerApi {
       override appendCustomEvent(fields: Parameters<LedgerApi['appendCustomEvent']>[0]): ReturnType<LedgerApi['appendCustomEvent']> {
-        if (fields.kind === 'round.perkins-review') throw new Error('simulated review-event write failure');
+        // R8-1: the failure is TRANSIENT — the committed-verdict path's
+        // idempotent retry heals the missing complete-review event.
+        if (fields.kind === 'round.perkins-review') {
+          reviewEventFailures += 1;
+          if (reviewEventFailures === 1) throw new Error('simulated review-event write failure');
+        }
         return super.appendCustomEvent(fields);
       }
     }
@@ -1524,6 +1533,10 @@ describe('WaveRunner built-in Perkins production path', () => {
     }
     expect(ledger.listEvents({ limit: 200 }).some((event) => event.kind === 'round.parent-incident')).toBe(false);
     expect(escalations.some((entry) => entry.includes('after its verdict committed'))).toBe(true);
+    // R8-1: the reconciled complete-review event WAS persisted by the
+    // retry — the posted predecessor's history survives for the next lead.
+    const reconciled = ledger.listEvents({ limit: 200 }).find((event) => event.kind === 'round.perkins-review');
+    expect(reconciled?.payload).toMatchObject({ complete: true, reconciledAfterFinalizationFailure: expect.stringContaining('review-event write failure') });
   });
 
   it('a failed round.perkins-incomplete event write never reclassifies the lead INCOMPLETE as a parent failure (gh-169 R7-2)', async () => {
@@ -1606,7 +1619,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     });
     // No independent receipt: the byte proof is REQUIRED, so admission
     // refuses under the manifest's own name instead of silently skipping.
-    await expect(wave.runRound({ jobId: job.id })).rejects.toThrow(/freeze receipt \(round\.freeze-manifest\) is missing or malformed/u);
+    await expect(wave.runRound({ jobId: job.id })).rejects.toThrow(/freeze receipt \(round\.freeze-manifest\) is missing, malformed or conflicting/u);
   });
 
   it('selects the newest verification run THAT BINDS the target — a newer other-sha run never erases it (gh-169 R7-5)', async () => {
@@ -1706,6 +1719,137 @@ describe('WaveRunner built-in Perkins production path', () => {
     const edgeChip = ledger.getRound(outcome.round.id)?.lenses.find((chip) => chip.lens === 'edge');
     expect(edgeChip?.state).toBe('error');
     expect(edgeChip?.note).toContain('attempt(s) started but unsettled: a1, a2');
+  });
+
+  it('finds the binding verification run past 200 unrelated job events (gh-169 R8-2)', async () => {
+    const repo = makeFixtureRepo('perkins-busy-verification-window');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/busy-verification-window']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-bvw-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-bvw-artifacts-'));
+    dirs.push(root, artifacts);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-bvw-db-')));
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/busy-verification-window', target);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-bvw' });
+    const job = ledger.addJob({ id: 'job-bvw', repo: 'fixture', title: 'busy verification window', baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/62');
+    attachOrigin(repo, 'feature/busy-verification-window', root);
+    // A binding completed run, then MORE THAN 200 unrelated job events —
+    // a generic all-kind window would truncate the binding run away.
+    ledger.appendCustomEvent({
+      kind: 'verification.completed',
+      jobId: job.id,
+      payload: {
+        sha: target, scope: 'full', command: 'npm test', ok: true, exit_code: 0,
+        duration_ms: 1000, workers: 2, run_id: 'run-bvw-1', output_bytes: 4096,
+        output_sha256: createHash('sha256').update('bvw').digest('hex'),
+      },
+    });
+    for (let index = 0; index < 205; index += 1) {
+      ledger.appendCustomEvent({ kind: 'job.note', jobId: job.id, payload: { note: `noise ${index}` } });
+    }
+    const underlying = makeSpawner(mkdtempSync(join(tmpdir(), 'perkins-bvw-sessions-')), []);
+    const wave = new WaveRunner({
+      ledger, worktrees: port, spawner: (role, options) => underlying(role, options),
+      reviewArtifactRoot: artifacts, prHeadProbe: localHeadProbe('feature/busy-verification-window'),
+    });
+    await expect(wave.runRound({ jobId: job.id })).resolves.toBeTruthy();
+    const round = ledger.listRounds(job.id)[0]!;
+    const frozenSpec = readFileSync(join(artifacts, round.id, 'spec-context.md'), 'utf8');
+    expect(frozenSpec).toContain('result: PASS (exit 0)');
+    expect(frozenSpec).toContain('run_id: run-bvw-1');
+    expect(frozenSpec).not.toContain('NO BOUND VERIFICATION RUN');
+  });
+
+  it('refuses admission on a conflicting duplicate freeze receipt (gh-169 R8-3)', async () => {
+    const repo = makeFixtureRepo('perkins-duplicate-receipt');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/duplicate-receipt']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-dr-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-dr-artifacts-'));
+    const sessions = mkdtempSync(join(tmpdir(), 'perkins-dr-sessions-'));
+    dirs.push(sessions);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-dr-db-')));
+    dbs.push(db);
+    class ReceiptDuplicatingLedger extends LedgerApi {
+      override appendCustomEvent(fields: Parameters<LedgerApi['appendCustomEvent']>[0]): ReturnType<LedgerApi['appendCustomEvent']> {
+        // The receipt write DUPLICATES with a conflicting hash — the
+        // unique-receipt check must refuse rather than trust either.
+        if (fields.kind === 'round.freeze-manifest') {
+          const first = super.appendCustomEvent(fields);
+          super.appendCustomEvent({ ...fields, payload: { sha256: 'c'.repeat(64) } });
+          return first;
+        }
+        return super.appendCustomEvent(fields);
+      }
+    }
+    const ledger = new ReceiptDuplicatingLedger(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/duplicate-receipt', target);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-dr' });
+    const job = ledger.addJob({ id: 'job-dr', repo: 'fixture', title: 'duplicate receipt', baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/63');
+    attachOrigin(repo, 'feature/duplicate-receipt', root);
+    const underlying = makeSpawner(sessions, []);
+    const wave = new WaveRunner({
+      ledger, worktrees: port, spawner: (role, options) => underlying(role, options),
+      reviewArtifactRoot: artifacts, prHeadProbe: localHeadProbe('feature/duplicate-receipt'),
+    });
+    await expect(wave.runRound({ jobId: job.id })).rejects.toThrow(/missing, malformed or conflicting \(duplicate receipts\)/u);
+  });
+
+  it('a started child with a durable settlement event is never called unsettled (gh-169 R8-4)', async () => {
+    const repo = makeFixtureRepo('perkins-settled-checkpoint-abort');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/settled-checkpoint-abort']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-sca-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-sca-artifacts-'));
+    const sessions = mkdtempSync(join(tmpdir(), 'perkins-sca-sessions-'));
+    dirs.push(root, artifacts, sessions);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-sca-db-')));
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/settled-checkpoint-abort', target);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-sca' });
+    const job = ledger.addJob({ id: 'job-sca', repo: 'fixture', title: 'settled checkpoint abort', baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/64');
+    attachOrigin(repo, 'feature/settled-checkpoint-abort', root);
+    const fake = fakeWholeSpawner(sessions, { specialists: ['security'], childAnswer: () => '[]', neverSubmit: true });
+    const wave = new WaveRunner({
+      ledger, worktrees: port, spawner: fake.spawner, reviewArtifactRoot: artifacts,
+      prHeadProbe: localHeadProbe('feature/settled-checkpoint-abort'),
+      reviewFreezeObserver: (frozen) => {
+        // A charged start AND a durable settlement checkpoint for a lens
+        // whose collected result never reached the aborted round.
+        const roundId = roundIdOf(frozen.directory);
+        ledger.appendCustomEvent({
+          kind: 'round.specialist-started', jobId: job.id, roundId,
+          payload: { lens: 'edge', attempt: 1, originRoundId: roundId },
+        });
+        ledger.appendCustomEvent({
+          kind: 'round.specialist-settled', jobId: job.id, roundId,
+          payload: { lens: 'edge', attempt: 1, sha256: 'a'.repeat(64) },
+        });
+      },
+    });
+    const outcome = asWave(await wave.runRound({ jobId: job.id }));
+    expect(outcome.canonicalVerdict).toBe('INCOMPLETE');
+    const edgeChip = ledger.getRound(outcome.round.id)?.lenses.find((chip) => chip.lens === 'edge');
+    expect(edgeChip?.state).toBe('error');
+    expect(edgeChip?.note).toContain('attempt settled (checkpoint recorded)');
+    expect(edgeChip?.note).not.toContain('before settlement');
+    const edgeResult = outcome.results[(ledger.getRound(outcome.round.id)?.lenses ?? []).findIndex((chip) => chip.lens === 'edge')];
+    expect(edgeResult?.state === 'error' && edgeResult.note).toContain('attempt settled (checkpoint recorded)');
   });
 
   it('records ONE parent incident and zero executed specialist failures when the lead transport dies before any child (gh-169)', async () => {
@@ -1832,7 +1976,9 @@ describe('WaveRunner built-in Perkins production path', () => {
     const chips = ledger.getRound(outcome.round.id)?.lenses ?? [];
     const security = chips.find((chip) => chip.lens === 'security');
     expect(security?.state).toBe('error');
-    expect(security?.note).toContain('interrupted by parent abort');
+    // The security attempt SETTLED (its checkpoint is durable) — truthful
+    // settlement-aware wording rather than a claim of no settlement.
+    expect(security?.note).toContain('attempt settled (checkpoint recorded)');
     // Every other lens never started: pending, not error.
     for (const chip of chips.filter((entry) => entry.lens !== 'security')) {
       expect(chip.state, chip.lens).toBe('pending');
@@ -1843,7 +1989,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     // not-started parent-incident outcomes.
     const securityResult = outcome.results[chips.findIndex((chip) => chip.lens === 'security')];
     expect(securityResult?.state).toBe('error');
-    expect(securityResult?.state === 'error' && securityResult.note).toContain('attempt started; interrupted by parent failure');
+    expect(securityResult?.state === 'error' && securityResult.note).toContain('attempt settled (checkpoint recorded)');
     expect(outcome.results.filter((result) => result.state === 'error' && result.note.startsWith('not started — parent incident'))).toHaveLength(8);
     const report = readFileSync(join(artifacts, outcome.round.id, 'perkins-report.md'), 'utf8');
     expect(report).toContain('1 journaled attempt(s) started (1 of 9 lenses: security)');
@@ -7425,7 +7571,10 @@ describe('provider pacing through WaveRunner', () => {
     const jitter = vi.spyOn(Math, 'random').mockReturnValue(0);
     try {
       const running = wave.runRound({ jobId: 'pacing-wave' });
-      await vi.waitFor(() => expect(gate.view().review.queued).toHaveLength(1));
+      // Setup now includes the real async admission remote probe (gh-169
+      // R4-6): give the wait room under co-tenant load instead of the 1 s
+      // vi.waitFor default.
+      await vi.waitFor(() => expect(gate.view().review.queued).toHaveLength(1), { timeout: 15_000 });
       expect(fake.leadCalls).toHaveLength(0);
       holder.release();
       const result = asWave(await running);

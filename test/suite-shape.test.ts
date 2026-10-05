@@ -62,7 +62,7 @@ const PINS: Record<string, number> = {  'rate-limit-retry.test.ts': 6,
   'pacing.test.ts': 28,
   'patch-vitest-rpc-timeout.test.ts': 11,
   'perkins-admission-preflight.test.ts': 18,
-  'perkins-builtin-wave.test.ts': 180,
+  'perkins-builtin-wave.test.ts': 183,
   'perkins-checkpoint-enumeration.test.ts': 1,
   'perkins-crash-child.test.ts': 1, // skipped unless PERKINS_CRASH_CHILD is set; the parent crash test spawns it
   'perkins-findings-dedupe.test.ts': 11,

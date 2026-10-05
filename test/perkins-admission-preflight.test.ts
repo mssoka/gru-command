@@ -541,7 +541,10 @@ describe('Perkins admission preflight (gh-169)', () => {
       const movement = await probeAdvertisedTipMovementAsync(review, 1_500);
       const elapsed = Date.now() - startedAt;
       expect(movement?.cause).toBe('check-failed');
-      expect(elapsed).toBeLessThan(8_000);
+      // R8-5: DISCRIMINATING bound — under the cumulative budget the probe
+      // refuses at ~1.5 s; a reverted per-call timeout (0.6+0.6+1.5 s)
+      // would take ~2.7 s and fail this threshold.
+      expect(elapsed).toBeLessThan(2_200);
     } finally {
       if (oldPath === undefined) delete process.env.PATH;
       else process.env.PATH = oldPath;

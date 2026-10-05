@@ -224,7 +224,7 @@ export function admissionPreflight(review: FrozenReview, movementRef: string, op
     (options.frozenManifestSha256 === undefined || !/^[a-f0-9]{64}$/u.test(options.frozenManifestSha256))) {
     // R7-4: no independent receipt, no trusted bytes — the gate refuses
     // instead of silently dropping the byte proof.
-    fail('frozen-packet:manifest.json', 'the ledger freeze receipt (round.freeze-manifest) is missing or malformed — the frozen manifest bytes cannot be independently proven');
+    fail('frozen-packet:manifest.json', 'the ledger freeze receipt (round.freeze-manifest) is missing, malformed or conflicting (duplicate receipts) — the frozen manifest bytes cannot be independently proven');
   } else if (options?.frozenManifestSha256 !== undefined && sha256(manifestBytes) !== options.frozenManifestSha256) {
     // R6-6: byte identity against the independently pinned receipt — a
     // rewritten-but-equivalent manifest is a mutated frozen packet.

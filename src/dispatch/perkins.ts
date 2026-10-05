@@ -74,7 +74,6 @@ import {
 import {
   appendRecordedVerification,
   renderRecordedVerification,
-  VERIFICATION_COMPLETED_EVENT,
 } from '../verify/evidence.js';
 import {
   PrHeadVerificationError,
@@ -1984,10 +1983,12 @@ export class WaveRunner {
         },
       });
     }
+    const settled = this.settledSpecialistLenses(round.id);
     for (const chip of round.lenses) {
       if (chip.state === 'live' || (chip.state === 'pending' && started.has(chip.lens))) {
-        this.opts.ledger.setLensOutcome(round.id, chip.lens, 'error',
-          `attempt started; interrupted by parent abort before settlement: ${note}`.slice(0, 500));
+        this.opts.ledger.setLensOutcome(round.id, chip.lens, 'error', (settled.has(chip.lens)
+          ? `attempt settled (checkpoint recorded); the round ended before its result was collected — recoverable by the next round: ${note}`
+          : `attempt started; interrupted by parent abort before settlement: ${note}`).slice(0, 500));
       }
       // A never-started lens keeps `pending`: the aborted round itself is
       // the parent incident; no specialist execution failed.
@@ -3084,9 +3085,12 @@ export class WaveRunner {
         // R7-5: the newest run BINDING THIS TARGET governs — a newer
         // completed run for a DIFFERENT sha must not erase an older clean
         // run for the reviewed head (and never fabricates one).
+        // R8-2: KIND-SCOPED history with a loud window bound — the search
+        // for the newest binding run cannot be truncated by unrelated job
+        // events, and an over-window history fails loud instead of
+        // masquerading as absence.
         const bindingVerification = this.opts.ledger
-          .listJobEvents(job.id, { limit: 200 })
-          .filter((event) => event.kind === VERIFICATION_COMPLETED_EVENT)
+          .listJobVerificationCompleted(job.id)
           .find((event) => renderRecordedVerification(event, targetSha) !== null) ?? null;
         const evidence = renderRecordedVerification(bindingVerification, targetSha);
         // Verification evidence is ALWAYS explicit (gh-169): a binding run
@@ -3299,12 +3303,18 @@ export class WaveRunner {
       const precomputedRemoteMovement = await probeAdvertisedTipMovementAsync(
         frozenReview, ADMISSION_REMOTE_PROBE_TIMEOUT_MS,
       );
-      const freezeReceipt = this.opts.ledger.latestRoundEvent(round.id, 'round.freeze-manifest')?.payload as
-        { readonly sha256?: unknown } | null;
+      // R8-3: the UNIQUE freeze receipt with full identity validation — a
+      // duplicate or conflicting receipt refuses under the manifest's name
+      // instead of trusting whichever the latest-event lookup returned.
+      const uniqueReceipt = this.opts.ledger.uniqueRoundFreezeManifestReceipt(round.id);
+      const receiptPayload = uniqueReceipt?.payload as { readonly sha256?: unknown } | null;
+      const receiptValid = uniqueReceipt !== null && uniqueReceipt.jobId === job.id &&
+        uniqueReceipt.roundId === round.id && typeof receiptPayload?.sha256 === 'string' &&
+        /^[a-f0-9]{64}$/u.test(receiptPayload.sha256);
       const admission = admissionPreflight(frozenReview, movementRef, {
         precomputedRemoteMovement,
         frozenManifestReceiptRequired: true,
-        ...(typeof freezeReceipt?.sha256 === 'string' ? { frozenManifestSha256: freezeReceipt.sha256 } : {}),
+        ...(receiptValid ? { frozenManifestSha256: (uniqueReceipt!.payload as { sha256: string }).sha256 } : {}),
       });
       this.opts.ledger.appendCustomEvent({
         kind: 'round.admission-preflight',
@@ -4390,17 +4400,36 @@ export class WaveRunner {
    * (workflow exception, shutdown, finalization crash — gh-169): a lens
    * with a started attempt is an execution error naming the parent
    * cause; a never-started lens is `not started — parent incident`,
-   * never a failed specialist execution. The note carries the truth the
-   * two-state `ReviewLensResult` union cannot. */
+   * never a failed specialist execution. R8-4: a started lens with an
+   * independently recorded round.specialist-settled event is NOT called
+   * "before settlement" — its checkpointed settlement is durable truth
+   * the next round recovers. */
   private interruptedLensResults(
     round: RoundRecord,
     lenses: readonly PerkinsLens[],
     detail: string,
   ): ReviewLensResult[] {
     const started = this.startedSpecialistLenses(round);
-    return lenses.map((lens) => started.has(lens)
-      ? { state: 'error' as const, note: `attempt started; interrupted by parent failure: ${detail}`.slice(0, 500) }
-      : { state: 'error' as const, note: `not started — parent incident: ${detail}`.slice(0, 500) });
+    const settled = this.settledSpecialistLenses(round.id);
+    return lenses.map((lens) => {
+      if (!started.has(lens)) {
+        return { state: 'error' as const, note: `not started — parent incident: ${detail}`.slice(0, 500) };
+      }
+      return settled.has(lens)
+        ? { state: 'error' as const, note: `attempt settled (checkpoint recorded); the round ended before its result was collected — recoverable by the next round: ${detail}`.slice(0, 500) }
+        : { state: 'error' as const, note: `attempt started; interrupted by parent failure before settlement: ${detail}`.slice(0, 500) };
+    });
+  }
+
+  /** Lenses with a durable round.specialist-settled event (R8-4). */
+  private settledSpecialistLenses(roundId: string): ReadonlySet<string> {
+    const settled = new Set<string>();
+    for (const event of this.opts.ledger.listRoundSpecialistSettlements(roundId)) {
+      const lens = typeof event.payload === 'object' && event.payload !== null
+        ? (event.payload as { readonly lens?: unknown }).lens : null;
+      if (typeof lens === 'string' && lens !== '') settled.add(lens);
+    }
+    return settled;
   }
 
   /** One bounded, report-visible execution-facts line for interrupted
@@ -4436,6 +4465,32 @@ export class WaveRunner {
       this.log('error', 'finalization failed after the verdict committed — returning the settled truth', {
         round: round.id, error: detail,
       });
+      // R8-1: durable idempotent reconciliation — RETRY the complete-review
+      // event here (a transient append failure heals; a permanent one is
+      // disclosed by the escalation below, and the settled truth stands).
+      try {
+        this.opts.ledger.appendCustomEvent({
+          kind: 'round.perkins-review',
+          jobId: job.id,
+          roundId: round.id,
+          payload: {
+            canonicalVerdict: committed.verdict === 'approved' ? 'READY TO MERGE' : 'NEEDS CHANGES',
+            blockers: 0,
+            targetSha: round.targetRef,
+            baseRefSha: frozenReview.manifest.baseRefSha,
+            diffBaseSha: frozenReview.manifest.diffBaseSha,
+            artifactDirectory: frozenReview.directory,
+            reportFile: join(frozenReview.directory, 'perkins-report.md'),
+            headMoved: false,
+            complete: true,
+            reconciledAfterFinalizationFailure: detail.slice(0, 300),
+          },
+        });
+      } catch (retryError) {
+        this.log('error', 'the reconciled complete-review event could not be persisted either', {
+          round: round.id, error: String(retryError),
+        });
+      }
       this.opts.escalate?.(
         `Review round ${round.id} finalization artifact failed after its verdict committed`,
         `The round's ${committed.verdict} verdict and lens chips stand as committed; a later finalization write failed and was not reclassified: ${detail}`,
