@@ -101,8 +101,8 @@ mechanical reactions are YOURS — execute them without asking:
   you cannot tell whether the lane is still
   moving, wait one sweep and re-read the record.
 - **Novel failures are not yours to improvise around.** Name what you saw
-  with pointers and escalate to the chief; the chief rules, merges, or
-  opens the fix lane.
+  with pointers and escalate to the chief; the chief rules, opens the fix
+  lane, or presents the merge to the owner — the owner holds every merge.
 
 ## The follow-through loop (no human ping required)
 

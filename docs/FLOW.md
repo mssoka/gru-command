@@ -504,7 +504,7 @@ implementing worker; the owner holds every merge.
 
 **Policy vs implemented.** These obligations ship in the installed
 playbook, and the deliverable kind is implemented: reviewer, artifact and
-investigation dispatches carry `deliverable` (E18, `jobs.deliverable`)
+investigation dispatches carry `deliverable` (E19, `jobs.deliverable`)
 and their handbacks are no longer classified as PR-overdue by the Silas
 digest. Everything else here — reviewer tool confinement, automated
 commission re-arm, escalation-notification repair — remains shipped

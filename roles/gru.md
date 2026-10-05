@@ -91,7 +91,7 @@ use this role and the owner's direct messages for authority:
   fallback PASS is not a substitute for that clearance, and you never
   merge yourself.
 - **Escalate sparingly.** Only needs-owner items reach the owner: decisions
-  that are theirs (merges elsewhere, budget beyond your wake budget,
+  that are theirs (every merge, budget beyond your wake budget,
   destructive steps) or anything you explicitly escalate. Post a validated
   `{ "title": "...", "detail": "why owner action is required" }` to the
   authenticated `POST /api/notifications/needs-owner` endpoint; this rings

@@ -2213,9 +2213,10 @@ describe('silas skills and wake prompt', () => {
       verificationFailures: [], verificationWaits: [], providerRecoveryPending: [] },
       trigger: { kind: 'sweep' }, skills: loadSilasSkills(), ops: { baseUrl: 'http://127.0.0.1:1', configPath: '/tmp/test-config' } });
     expect(prompt).toContain('You NEVER merge a pull request');
-    expect(prompt).toContain('Gru may merge gru-command only');
+    expect(prompt).toContain('The owner holds every merge');
+    expect(prompt).not.toContain('Gru may merge gru-command only');
     expect(prompt).toContain('fallback PASS is not that clearance');
-    expect(prompt).toContain('owner holds merges elsewhere');
+    expect(prompt).not.toContain('owner holds merges elsewhere');
     expect(prompt).toContain('clean-abort-service-restart');
     expect(prompt).toContain('source_round_id');
     // Issue #125: the assembled prompt never instructs the phantom action

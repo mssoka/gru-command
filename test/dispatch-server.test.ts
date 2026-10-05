@@ -343,6 +343,10 @@ describe('dispatch server (E8)', () => {
       );
       expect(ok.status).toBe(202);
       expect(h.ledger.getJob('http-review-job')?.deliverable).toBe('review');
+      // The DISPATCHED prompt must carry the review closing orders — a
+      // dropped renderer forwarding would keep response/ledger green.
+      expect(h.minionTurnTexts.at(-1)).toContain('READ-ONLY');
+      expect(h.minionTurnTexts.at(-1)).not.toContain('commit your work to the branch');
       // The other non-PR kinds admit through HTTP too.
       for (const kind of ['artifact', 'investigation'] as const) {
         const nonPr = await call(
@@ -354,6 +358,10 @@ describe('dispatch server (E8)', () => {
         );
         expect(nonPr.status).toBe(202);
         expect(h.ledger.getJob(`http-${kind}-job`)?.deliverable).toBe(kind);
+        // Non-PR handbacks: no PR order, and only review is READ-ONLY.
+        expect(h.minionTurnTexts.at(-1)).toContain('do not open a');
+        expect(h.minionTurnTexts.at(-1)).not.toContain('READ-ONLY');
+        expect(h.minionTurnTexts.at(-1)).not.toContain('never merge your own pull request');
       }
       // Present-but-invalid values fail loud before any job exists; an
       // unknown string, a null, a number, and a blank are all rejected.
