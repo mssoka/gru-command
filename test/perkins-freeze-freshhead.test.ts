@@ -778,7 +778,7 @@ describe('freeze-time integration on PR rounds', () => {
     repo.git(['checkout', '-b', 'feature/lane']);
     const laneFirst = repo.commitFile('src/lane.ts', 'export const lane = true;\n');
     const laneTip = repo.commitFile('src/lane2.ts', 'export const lane2 = true;\n');
-    attachBareOrigin(repo);
+    const qualifiedOrigin = attachBareOrigin(repo);
     repo.git(['push', '--quiet', 'origin', 'refs/heads/main']);
     repo.git(['push', '--quiet', 'origin', 'refs/heads/feature/lane']);
     const ancestor = repo.git(['rev-parse', 'refs/remotes/origin/feature/lane~1']);
@@ -824,14 +824,18 @@ describe('freeze-time integration on PR rounds', () => {
       spec: 'Acceptance: lane returns true.',
     });
     expect(sourceMovementSinceFreeze(frozenTracking)).toBeNull();
-    repo.commitFile('src/lane3.ts', 'export const lane3 = true;\n');
-    repo.git(['push', '--quiet', 'origin', 'refs/heads/feature/lane']);
+    // R4-9: advance the BARE advertised branch from a SECOND clone so the
+    // fixture's LOCAL tracking ref stays exactly where it froze — the
+    // movement proof must come from the advertised-tip probe alone.
+    const secondClone = tempDir('gru-freeze-qualified-clone-');
+    execFileSync('git', ['clone', '--quiet', qualifiedOrigin, secondClone], { stdio: 'ignore' });
+    execFileSync('git', ['-C', secondClone, 'checkout', '--quiet', 'feature/lane'], { stdio: 'ignore' });
+    execFileSync('git', ['-C', secondClone, ...['-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid'], 'commit', '--allow-empty', '-m', 'advance the advertised tip'], { stdio: 'ignore' });
+    execFileSync('git', ['-C', secondClone, 'push', '--quiet', 'origin', `refs/heads/feature/lane:refs/heads/feature/lane`], { stdio: 'ignore' });
+    expect(repo.git(['rev-parse', 'refs/remotes/origin/feature/lane'])).toBe(laneTip); // local ref unmoved
     const moved = sourceMovementSinceFreeze(frozenTracking);
-    // Movement is DETECTED for the genuine tracking spelling (the push
-    // moves both the tracking ref and the advertised tip; either proof is
-    // the target-moved cause) — the exact opposite of the expression
-    // pin's clean pass above.
     expect(moved?.cause).toBe('target-moved');
+    expect(moved?.detail).toContain('advertised origin/feature/lane');
   });
 
   it('an origin-prefixed REVISION PIN (origin/feature/lane~1) on a linked PR freezes the named ancestor, never the live PR tip (Perkins R4)', async () => {

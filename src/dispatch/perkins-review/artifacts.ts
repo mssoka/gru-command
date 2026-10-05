@@ -1,4 +1,7 @@
-import { execFileSync } from 'node:child_process';
+import { execFile as execFileCallback, execFileSync } from 'node:child_process';
+import { promisify } from 'node:util';
+
+const execFileAsPromised = promisify(execFileCallback);
 import { createHash } from 'node:crypto';
 import { closeSync, existsSync, fstatSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, unlinkSync, writeFileSync, constants } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
@@ -573,6 +576,10 @@ function advertisedRemoteBranch(repoPath: string, ref: string): { remote: string
  * budget by omitting the option. */
 export interface SourceMovementOptions {
   readonly remoteProbeTimeoutMs?: number;
+  /** Skip the advertised-tip probe (the caller supplies a precomputed
+   * async result — gh-169 R4-6: request-time admission probes the remote
+   * OFF the event loop and injects the outcome). */
+  readonly skipRemoteProbe?: boolean;
 }
 
 export function sourceMovementSinceFreeze(review: FrozenReview, options?: SourceMovementOptions): SourceMovement | null {
@@ -588,15 +595,19 @@ export function sourceMovementSinceFreeze(review: FrozenReview, options?: Source
     }
     if (localTarget !== targetSha) return movement('target-moved', `target ${targetRef} is ${localTarget}, frozen at ${targetSha}`);
     // A push may move the host tip without moving the local tracking ref.
-    const remoteTarget = advertisedRemoteBranch(repoPath, targetRef);
-    if (remoteTarget !== null) {
+    if (options?.skipRemoteProbe === true) {
+      // The caller owns the advertised-tip proof (async path).
+    } else {
+      const remoteTarget = advertisedRemoteBranch(repoPath, targetRef);
+      if (remoteTarget !== null) {
       const advertised = gitRaw(
         repoPath,
         ['ls-remote', '--exit-code', remoteTarget.remote, `refs/heads/${remoteTarget.branch}`],
-        options?.remoteProbeTimeoutMs,
-      ).trim();
-      const tip = advertised.split(/\s+/u)[0] ?? '';
-      if (tip !== targetSha) return movement('target-moved', `advertised ${remoteTarget.remote}/${remoteTarget.branch} is ${tip}, frozen at ${targetSha}`);
+          options?.remoteProbeTimeoutMs,
+        ).trim();
+        const tip = advertised.split(/\s+/u)[0] ?? '';
+        if (tip !== targetSha) return movement('target-moved', `advertised ${remoteTarget.remote}/${remoteTarget.branch} is ${tip}, frozen at ${targetSha}`);
+      }
     }
     if (resolveGitCommit(repoPath, 'HEAD') !== targetSha) {
       return movement('checkout-changed', `review checkout HEAD no longer matches ${targetSha}`);
@@ -608,6 +619,40 @@ export function sourceMovementSinceFreeze(review: FrozenReview, options?: Source
         return movement('checkout-changed', error.message);
       }
       throw error;
+    }
+    return null;
+  } catch (error) {
+    return movement('check-failed', gitErrorDetail(error));
+  }
+}
+
+/** Async advertised-tip probe (gh-169 R4-6): the SAME fail-closed
+ * comparison `sourceMovementSinceFreeze` performs, executed with the
+ * non-blocking execFile so a stalled remote never blocks the service
+ * event loop at request-time admission. Null = no movement; errors and
+ * timeouts return an explicit check-failed movement (fail-closed,
+ * retryable), never silence and never a stall. */
+export async function probeAdvertisedTipMovementAsync(
+  review: FrozenReview,
+  timeoutMs: number,
+): Promise<SourceMovement | null> {
+  const { targetRef, targetSha } = review.manifest;
+  let remoteTarget: { remote: string; branch: string } | null = null;
+  try {
+    remoteTarget = advertisedRemoteBranch(review.manifest.repoPath, targetRef);
+  } catch (error) {
+    return movement('check-failed', gitErrorDetail(error));
+  }
+  if (remoteTarget === null) return null;
+  try {
+    const { stdout } = await execFileAsPromised(
+      'git',
+      ['-C', review.manifest.repoPath, 'ls-remote', '--exit-code', remoteTarget.remote, `refs/heads/${remoteTarget.branch}`],
+      { encoding: 'utf8', timeout: timeoutMs, maxBuffer: 1024 * 1024 },
+    );
+    const tip = stdout.trim().split(/\s+/u)[0] ?? '';
+    if (tip !== targetSha) {
+      return movement('target-moved', `advertised ${remoteTarget.remote}/${remoteTarget.branch} is ${tip}, frozen at ${targetSha}`);
     }
     return null;
   } catch (error) {

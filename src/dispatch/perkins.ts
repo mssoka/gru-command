@@ -2,7 +2,7 @@ import type { AgentHandle } from '../runtime/types.js';
 import { spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { basename, join, resolve } from 'node:path';
 import type { LogLevel } from '../logger.js';
 import { DEFAULT_REVIEW_CHILDREN } from '../config.js';
 import type { JobStatus, LedgerApi, RoundRecord, RoundVerdict } from '../ledger/api.js';
@@ -34,6 +34,7 @@ import {
   compatibleReviewIdentity,
   proveRecoveredBaseMergeability,
   refMovedSinceFreeze,
+  probeAdvertisedTipMovementAsync,
   sourceMovementSinceFreeze,
   resolveGitCommit,
   resolveReviewBaseRef,
@@ -54,7 +55,7 @@ import {
   CI_GREEN_EVENT,
   type CiEvidenceRecord,
 } from '../review-inputs/ci-evidence.js';
-import { admissionPreflight, ReviewAdmissionError } from './perkins-review/admission.js';
+import { admissionPreflight, ADMISSION_REMOTE_PROBE_TIMEOUT_MS, ReviewAdmissionError } from './perkins-review/admission.js';
 import { evidenceRequestFingerprint, type ReviewEvidenceRequest } from '../review-inputs/evidence.js';
 import { parseGitHubPrUrl } from './github-poll.js';
 import {
@@ -331,7 +332,11 @@ export function hostDisclosureAppendix(
       ? [`- Specialist attempts that started but never committed a result: ${startTotals.unsettled.join(', ')} — the round ended (or the wave failed) before their settlement; they are real started work, never "not used"`]
       : []),
     ...(ciLine !== null ? [ciLine] : []),
-    `- Specialists run: ${ran.length === 0 ? 'none (lead-owned whole-change review)' : ran.map(([lens, entry]) => `${lens}${entry.failed > 0 ? ` (attempts: ${entry.valid} valid, ${entry.failed} failed)` : ''}`).join(', ')}`,
+    `- Specialists run${startTotals !== undefined ? ' (settled)' : ''}: ${ran.length === 0
+      ? startTotals !== undefined && startTotals.startedLenses.length > 0
+        ? `none settled (${startTotals.startedLenses.length} lens(es) started — see the started-but-unsettled line)`
+        : 'none (lead-owned whole-change review)'
+      : ran.map(([lens, entry]) => `${lens}${entry.failed > 0 ? ` (attempts: ${entry.valid} valid, ${entry.failed} failed)` : ''}`).join(', ')}`,
     ...(failed.length > 0 ? [`- Failed specialist attempts: ${failed.map(([lens, entry]) => `${lens} ×${entry.failed}`).join(', ')} — the lead judged the change on its own whole-change verification`] : []),
     ...(review.budgetRefusals !== undefined && review.budgetRefusals.length > 0
       ? [`- Round specialist budget: ${review.budgetRefusals.length} run call(s) refused by the ${review.budgetRefusals[0]!.cap}-run cap before any child started (${[...new Set(review.budgetRefusals.flatMap((refusal) => refusal.lenses))].join(', ')})`]
@@ -377,6 +382,16 @@ export function publicationBodyFor(
 type ReviewLensResult =
   | { readonly state: 'done'; readonly verdict: 'blocker' | 'warning' | 'note' | 'clean'; readonly evidence: string }
   | { readonly state: 'error'; readonly note: string };
+
+/** Mutable lens-accounting holder (gh-169 R4-3): `recordLensResults`
+ * fills it INCREMENTALLY so a mid-loop ledger failure still exposes every
+ * chip that durably committed — the abort path reconciles from actual
+ * committed state, never from a lost snapshot. */
+interface LensAccounting {
+  readonly results: ReviewLensResult[];
+  readonly settledLenses: Set<string>;
+  readonly unusedLenses: PerkinsLens[];
+}
 
 /** The PR identity a verdict delivery was proven against. HEAD equality is
  * the delivery invariant: `headSha` is the round's frozen target on any
@@ -3259,7 +3274,13 @@ export class WaveRunner {
       // its full check list so the admission evidence is durable. The
       // freeze observer (test instrumentation) sees the packet first.
       this.opts.reviewFreezeObserver?.(frozenReview);
-      const admission = admissionPreflight(frozenReview, movementRef);
+      // R4-6: the advertised-tip remote probe runs OFF the event loop —
+      // a stalled remote awaits here without blocking unrelated service
+      // work, then its fail-closed outcome is injected into the preflight.
+      const precomputedRemoteMovement = await probeAdvertisedTipMovementAsync(
+        frozenReview, ADMISSION_REMOTE_PROBE_TIMEOUT_MS,
+      );
+      const admission = admissionPreflight(frozenReview, movementRef, { precomputedRemoteMovement });
       this.opts.ledger.appendCustomEvent({
         kind: 'round.admission-preflight',
         jobId: job.id,
@@ -3890,11 +3911,11 @@ export class WaveRunner {
       };
     }
 
-    let provisional: { readonly results: readonly ReviewLensResult[]; readonly settledLenses: ReadonlySet<string> } | null = null;
+    const accounting: LensAccounting = { results: [], settledLenses: new Set<string>(), unusedLenses: [] };
+    const provisional: LensAccounting = accounting;
     try {
       if (signal.aborted) throw new Error('review operation aborted before finalization');
-      const accounting = this.recordLensResults(round, lenses, review);
-      provisional = accounting;
+      this.recordLensResults(round, lenses, review, accounting, new Set(specialistStartFacts(this.opts.ledger.listRoundSpecialistStarts(round.id)).map((start) => start.lens)));
       const results = accounting.results;
       const sourceMovement = review.sourceMovement ?? sourceMovementSinceFreeze(frozenReview);
       const headMoved = review.headMoved || sourceMovement !== null;
@@ -4220,11 +4241,14 @@ export class WaveRunner {
           complete: canonical !== 'INCOMPLETE' && !headMoved,
         },
       });
-      this.opts.ledger.setRoundVerdict(round.id, recordedVerdict);
-      // gh-169 P3: only now — the verdict durably recorded — do the
-      // not-used lenses claim their 'done' chips. A finalization failure
-      // before this point aborts with never-started lenses still pending.
+      // gh-169 R4-1: the deferred not-used chips commit BEFORE the verdict
+      // transition — a failure here aborts a still-live round (legal,
+      // consistent), and a posted verdict can never coexist with pending
+      // unused chips. A crash between the two leaves chips terminal and
+      // the round live for an honest restart reconciliation, never a
+      // parent abort after a posted verdict.
       this.commitUnusedLensChips(round, accounting.unusedLenses);
+      this.opts.ledger.setRoundVerdict(round.id, recordedVerdict);
     } else {
       this.opts.ledger.setRoundStatus(round.id, 'aborted');
       // P7/Q5/Q6 (gh-169): an ordinary lead-authored INCOMPLETE (or an
@@ -4279,7 +4303,7 @@ export class WaveRunner {
         `Review round ${round.id} is INCOMPLETE`,
         `coverage of the round's selected lenses, verification, source stability, or delivery proof did not complete. ` +
         (hostReportWriteFailed !== null
-          ? `NOTE: the host-owned INCOMPLETE report could NOT be written (${hostReportWriteFailed}); the durable event carries the execution facts and the lead-authored report at perkins-report.md is the fallback record.`
+          ? `NOTE: the host-owned INCOMPLETE report could NOT be written (${hostReportWriteFailed}); the durable event carries the execution facts and the report at ${basename(reportFile)} is the fallback record (the lead-authored report stays preserved at perkins-report.md).`
           : `Host report (with execution facts): ${reportFile}`),
         { jobId: job.id, roundId: round.id },
       );
@@ -4337,7 +4361,7 @@ export class WaveRunner {
     lenses: readonly PerkinsLens[],
     frozenReview: FrozenReview,
     error: unknown,
-    provisional?: { readonly results: readonly ReviewLensResult[]; readonly settledLenses: ReadonlySet<string> } | null,
+    provisional?: LensAccounting,
   ): WaveOutcome {
     const detail = `Perkins finalization failed: ${String(error)}`.replace(/[\r\n]+/gu, ' ').slice(0, 500);
     try {
@@ -4392,19 +4416,23 @@ export class WaveRunner {
     } catch {
       // Unknown source state is fail-closed movement.
     }
-    // gh-169 P3: reconcile the RETURNED results with the chips that
-    // already committed. Lenses whose settled chips were recorded keep
-    // their provisional (truthful) results — no invented child failures;
-    // the rest classify by the ONE started set, exactly like abortRound.
+    // gh-169 P3/R4-3: reconcile the RETURNED results with the chips that
+    // DURABLY committed — the live ledger state, not a lost snapshot.
+    // A lens whose chip is terminal (done/error) keeps its provisional
+    // (truthful) result; the rest classify by the ONE started set,
+    // exactly like abortRound. No child failure is ever invented.
+    const currentRound = this.opts.ledger.getRound(round.id) ?? round;
     const started = this.startedSpecialistLenses(round);
     const interrupted = this.interruptedLensResults(round, lenses, detail);
     const reconciled = lenses.map((lens, index) => {
-      const settledResult = provisional?.results[index];
-      return provisional !== null && provisional !== undefined && provisional.settledLenses.has(lens) && settledResult !== undefined
-        ? settledResult
-        : started.has(lens)
-          ? interrupted[index]!
-          : { state: 'error' as const, note: `not started — parent incident: ${detail}`.slice(0, 500) };
+      const chip = currentRound.lenses.find((entry) => entry.lens === lens);
+      const provisionalResult = provisional?.results[index];
+      if ((chip?.state === 'done' || chip?.state === 'error') && provisionalResult !== undefined) {
+        return provisionalResult;
+      }
+      return started.has(lens)
+        ? interrupted[index]!
+        : { state: 'error' as const, note: `not started — parent incident: ${detail}`.slice(0, 500) };
     });
     return {
       round: this.opts.ledger.getRound(round.id) ?? { ...round, status: 'aborted' },
@@ -4429,12 +4457,23 @@ export class WaveRunner {
     round: RoundRecord,
     lenses: readonly PerkinsLens[],
     review: PerkinsWholeResult,
-  ): { readonly results: readonly ReviewLensResult[]; readonly settledLenses: ReadonlySet<string>; readonly unusedLenses: readonly PerkinsLens[] } {
-    const results: ReviewLensResult[] = [];
-    const settledLenses = new Set<string>();
-    const unusedLenses: PerkinsLens[] = [];
+    accounting: LensAccounting,
+    journaledStartLenses: ReadonlySet<string>,
+  ): void {
+    const { results, settledLenses, unusedLenses } = accounting;
     for (const lens of lenses) {
       const runs = review.specialistRuns.filter((run) => run.lens === lens);
+      if (runs.length === 0 && journaledStartLenses.has(lens)) {
+        // gh-169 R4-2: a lens whose attempt was JOURNALED but never
+        // settled is real started work — never 'not used'. Its chip
+        // records the honest execution gap; the lead's whole-change
+        // judgment stands apart from it.
+        const note = 'attempt started but unsettled: the wave ended before this specialist result committed; the lead judged the change on its own whole-change verification';
+        this.opts.ledger.setLensOutcome(round.id, lens, 'error', note);
+        results.push({ state: 'error', note });
+        settledLenses.add(lens);
+        continue;
+      }
       if (runs.length === 0) {
         // Whole-PR review: the lead owns the review; a lens it never used is
         // a truthful 'not used', never missing required coverage. The chip
@@ -4444,7 +4483,6 @@ export class WaveRunner {
         results.push({ state: 'done', verdict: 'clean', evidence: note });
         continue;
       }
-      settledLenses.add(lens);
       const failed = runs.filter((run) => run.status !== 'valid');
       if (failed.length === runs.length) {
         // Every attempt on this lens failed: honest execution error, named
@@ -4452,6 +4490,7 @@ export class WaveRunner {
         const note = `specialist attempts failed: ${failed.map((run) => `a${run.attempt} ${run.failureKind ?? 'error'}: ${(run.error ?? 'no host-recorded reason').slice(0, 200)}`).join('; ')}`;
         this.opts.ledger.setLensOutcome(round.id, lens, 'error', note);
         results.push({ state: 'error', note });
+        settledLenses.add(lens);
         continue;
       }
       const findings = review.findings.filter((finding) => finding.sources.includes(lens));
@@ -4478,8 +4517,12 @@ export class WaveRunner {
       const note = `${verdict} — ${evidence}${history.length > 0 ? ` · ${history.join(' · ')}` : ''}`;
       this.opts.ledger.setLensOutcome(round.id, lens, 'done', note);
       results.push({ state: 'done', verdict, evidence: note });
+      // R4-3: a lens counts as settled only AFTER its chip write committed —
+      // a throw mid-loop leaves the earlier writes visible in this same
+      // (caller-held) accounting object, never an interrupted error for an
+      // already-done chip.
+      settledLenses.add(lens);
     }
-    return { results, settledLenses, unusedLenses };
   }
 
   /** Commit the deferred not-used chips once the round has durably

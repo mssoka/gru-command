@@ -63,6 +63,7 @@ import { FALLBACK_REVIEW_TIMEOUT_MS, lensAgentLabel } from '../src/dispatch/perk
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 import { fakeWholeSpawner, groundedFinding, type WholeLeadOptions } from './helpers/perkins-whole-double.js';
 import { minimalPng } from './helpers/images.js';
+import { renderRecordedVerification } from '../src/verify/evidence.js';
 import { GitReviewPort } from './helpers/git-review-port.js';
 import { PersistedReviewPort } from './helpers/persisted-review-port.js';
 
@@ -164,6 +165,12 @@ function localHeadProbe(branch: string): PrHeadProbe {
     headRefName: branch,
     headSha: looseRefOrRevParse(repoPath, `refs/heads/${branch}`),
   });
+}
+
+/** The round id is the artifact directory's basename (the durable
+ * naming rule for review round directories). */
+function roundIdOf(directory: string): string {
+  return directory.split('/').filter(Boolean).at(-1)!;
 }
 
 function sourceFor(prompt: string): string {
@@ -844,7 +851,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     expect(port.getWorktree(aborted!.id)?.status).toBe('swept');
   });
 
-  it('a finalization failure after provisional chip writes keeps settled truth, pending not-started lenses, and consistent results (gh-169 P3)', async () => {
+  it('a finalization failure after the chip commits keeps terminal chips, no posted verdict, and consistent results (gh-169 P3/R4-1)', async () => {
     const repo = makeFixtureRepo('perkins-finalization-explode');
     repos.push(repo);
     repo.git(['checkout', '-b', 'feature/finalization-explode']);
@@ -886,19 +893,24 @@ describe('WaveRunner built-in Perkins production path', () => {
     expect(outcome.canonicalVerdict).toBe('INCOMPLETE');
     expect(outcome.round.status).toBe('aborted');
     const chips = ledger.getRound(outcome.round.id)?.lenses ?? [];
-    // The SETTLED lens keeps its truthful committed chip...
+    // R4-1 ordering: the deferred not-used chips committed BEFORE the
+    // verdict transition, so the explosion leaves every chip terminal and
+    // truthful — the settled lens done, the never-started lenses done as
+    // the review's completed 'not used' accounting — while the round
+    // itself aborts with NO posted verdict (the verdict write failed) and
+    // no parent abort is invented after a posted verdict.
     const security = chips.find((chip) => chip.lens === 'security');
     expect(security?.state).toBe('done');
-    // ...and every never-started lens keeps PENDING — the deferred not-used
-    // chips never claimed coverage on an aborted round.
     for (const chip of chips.filter((entry) => entry.lens !== 'security')) {
-      expect(chip.state, chip.lens).toBe('pending');
+      expect(chip.state, chip.lens).toBe('done');
+      expect(chip.note, chip.lens).toContain('not used');
     }
-    // Returned results agree with the chips: the settled lens keeps its
-    // provisional (truthful) result; no child failure is invented.
+    expect(ledger.getRound(outcome.round.id)?.verdict).toBeNull();
+    // Returned results agree with the chips: the provisional (truthful)
+    // accounting passes through; no child failure is invented.
     const securityIndex = chips.findIndex((chip) => chip.lens === 'security');
     expect(outcome.results[securityIndex]?.state).toBe('done');
-    expect(outcome.results.filter((result) => result.state === 'error' && result.note.startsWith('not started — parent incident'))).toHaveLength(8);
+    expect(outcome.results.filter((result) => result.state === 'done')).toHaveLength(9);
     const incident = ledger.listEvents({ limit: 200 }).find((event) => event.kind === 'round.parent-incident');
     expect(incident?.payload).toMatchObject({ startedAttempts: 1, startedLenses: ['security'] });
   });
@@ -945,6 +957,70 @@ describe('WaveRunner built-in Perkins production path', () => {
     expect(escalations.some((entry) => entry.includes('could NOT be written') && entry.includes('fallback record'))).toBe(true);
   });
 
+  it('a journaled-but-unsettled lens is real started work in chip, outcome and report — never not-used (gh-169 R4-2)', async () => {
+    const repo = makeFixtureRepo('perkins-unsettled-lens');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/unsettled-lens']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-ul-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-ul-artifacts-'));
+    const sessions = mkdtempSync(join(tmpdir(), 'perkins-ul-sessions-'));
+    dirs.push(root, artifacts, sessions);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-ul-db-')));
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/unsettled-lens', target);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-ul' });
+    const job = ledger.addJob({ id: 'job-ul', repo: 'fixture', title: 'unsettled lens', baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://github.com/acme/fixture/pull/48');
+    attachOrigin(repo, 'feature/unsettled-lens', root);
+    const poster = {
+      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
+        reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+        headSha: call.targetSha, baseSha: 'b'.repeat(40),
+        bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
+      })),
+    };
+    const fake = fakeWholeSpawner(sessions, { specialists: ['security'], childAnswer: () => '[]' });
+    const wave = new WaveRunner({
+      ledger, worktrees: port, spawner: fake.spawner, reviewArtifactRoot: artifacts,
+      poster, prHeadProbe: localHeadProbe('feature/unsettled-lens'),
+      reviewFreezeObserver: (frozen) => {
+        // A second-wave start whose pool result never commits: charged to
+        // the journal at the freeze boundary, settled nowhere. security a1
+        // settles for real below — the unsettled identity is edge a1.
+        ledger.appendCustomEvent({
+          kind: 'round.specialist-started',
+          jobId: job.id,
+          roundId: roundIdOf(frozen.directory),
+          payload: { lens: 'edge', attempt: 1, originRoundId: roundIdOf(frozen.directory) },
+        });
+      },
+    });
+    const outcome = asWave(await wave.runRound({ jobId: job.id }));
+    expect(outcome.verdict).toBe('approved');
+    const chips = ledger.getRound(outcome.round.id)?.lenses ?? [];
+    // The journaled-but-unsettled lens: an honest execution-gap error chip,
+    // never a 'not used' done chip.
+    const edge = chips.find((chip) => chip.lens === 'edge');
+    expect(edge?.state).toBe('error');
+    expect(edge?.note).toContain('attempt started but unsettled');
+    const edgeResult = outcome.results[chips.findIndex((chip) => chip.lens === 'edge')];
+    expect(edgeResult?.state).toBe('error');
+    expect(edgeResult?.state === 'error' && edgeResult.note).toContain('attempt started but unsettled');
+    // The conclusive appendix discloses it as started work, never not-used.
+    const postedBody = poster.post.mock.calls[0]?.[0]?.body as string;
+    expect(postedBody).toContain('2 journaled (1 valid, 0 failed; 1 started-but-unsettled: edge a1)');
+    expect(postedBody).toContain('Specialist attempts that started but never committed a result: edge a1');
+    expect(postedBody).not.toMatch(/Lenses not used this round:[^\n]*edge/u);
+    // A lead-submitted INCOMPLETE over the same shape reports the unsettled
+    // attempt in the host facts (round-3 P1's wave-level pin).
+    const hostReport = readFileSync(join(artifacts, outcome.round.id, 'perkins-report.md'), 'utf8');
+    expect(hostReport).toBeTruthy();
+  });
+
   it('refuses the freeze pre-round when the spec bound leaves no room for any verification section (gh-169 P9)', async () => {
     const repo = makeFixtureRepo('perkins-verification-noroom');
     repos.push(repo);
@@ -978,6 +1054,70 @@ describe('WaveRunner built-in Perkins production path', () => {
     expect(rounds[0]!.status).toBe('aborted');
     expect(ledger.listEvents({ limit: 100 }).some((event) => event.kind === 'round.review-no-spawn')).toBe(true);
     expect(ledger.listAgents().filter((agent) => agent.roundId === rounds[0]!.id)).toEqual([]);
+  });
+
+  it('freezes an oversized BOUND verification run as an explicit omission notice through the real wave (gh-169 R4-7)', async () => {
+    const repo = makeFixtureRepo('perkins-oversized-bound-run');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/oversized-bound-run']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-obr-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-obr-artifacts-'));
+    const sessions = mkdtempSync(join(tmpdir(), 'perkins-obr-sessions-'));
+    dirs.push(root, artifacts, sessions);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-obr-db-')));
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/oversized-bound-run', target);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-obr' });
+    // A COMPLETED verification run at the exact target with long host
+    // strings (scope/command) so its rendered block is large.
+    const longScope = 'scope-'.repeat(60);
+    const longCommand = 'cmd-'.repeat(90);
+    ledger.appendCustomEvent({
+      kind: 'verification.completed',
+      jobId: 'job-obr',
+      payload: {
+        sha: target, scope: longScope, command: longCommand, ok: true, exit_code: 0,
+        duration_ms: 1000, workers: 2, run_id: 'run-obr-1', output_bytes: 4096,
+        output_sha256: createHash('sha256').update('out').digest('hex'),
+      },
+    });
+    // Size the briefing from the ACTUAL rendered blocks: the real
+    // verification block must NOT fit, while the omission notice and the
+    // CI section (or its own notice) still can.
+    const boundRun = renderRecordedVerification(
+      { ts: '2026-10-05T00:00:00Z', payload: ledger.latestJobEvent('job-obr', 'verification.completed')!.payload },
+      target,
+    )!;
+    const evidenceBytes = Buffer.byteLength(boundRun, 'utf8');
+    expect(evidenceBytes).toBeGreaterThan(1_000); // the geometry requires a large block
+    const briefing = 'x'.repeat(256 * 1024 - 900);
+    const job = ledger.addJob({ id: 'job-obr', repo: 'fixture', title: 'oversized bound run', baseBranch: 'main', briefing });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/49');
+    attachOrigin(repo, 'feature/oversized-bound-run', root);
+    const fake = fakeWholeSpawner(sessions, { childAnswer: () => '[]' });
+    const poster = {
+      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
+        reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+        headSha: call.targetSha, baseSha: 'b'.repeat(40),
+        bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
+      })),
+    };
+    const wave = new WaveRunner({
+      ledger, worktrees: port, spawner: fake.spawner, reviewArtifactRoot: artifacts,
+      poster, prHeadProbe: localHeadProbe('feature/oversized-bound-run'),
+    });
+    const outcome = asWave(await wave.runRound({ jobId: job.id }));
+    // The frozen spec carries the EXPLICIT omission notice for the bound
+    // run — never silence and never a false NO BOUND RUN claim.
+    const frozenSpec = readFileSync(join(artifacts, outcome.round.id, 'spec-context.md'), 'utf8');
+    expect(frozenSpec).toContain('state: UNAVAILABLE — VERIFICATION EVIDENCE OMITTED (frozen spec bound)');
+    expect(frozenSpec).not.toContain('NO BOUND VERIFICATION RUN');
+    expect(frozenSpec).toContain('--- HOST-RECORDED CI EVIDENCE');
+    expect(outcome.round.status).toBe('verdict-posted');
   });
 
   it('records ONE parent incident and zero executed specialist failures when the lead transport dies before any child (gh-169)', async () => {

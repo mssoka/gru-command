@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { admissionPreflight, ReviewAdmissionError } from '../src/dispatch/perkins-review/admission.js';
+import { probeAdvertisedTipMovementAsync } from '../src/dispatch/perkins-review/artifacts.js';
 import {
   freezeReviewInputs,
   type FrozenReview,
@@ -440,6 +441,59 @@ describe('Perkins admission preflight (gh-169)', () => {
       expect(elapsed).toBeLessThan(10_000);
       expect(result.missing.map((entry) => entry.input)).toEqual(['head-binding']);
       expect(result.missing[0]!.detail).toContain('check-failed');
+    } finally {
+      if (oldPath === undefined) delete process.env.PATH;
+      else process.env.PATH = oldPath;
+    }
+  });
+
+  it('probes the advertised tip OFF the event loop: unrelated work completes while a stalled remote waits (R4-6)', async () => {
+    const repo = makeFixtureRepo('admission-async-probe');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/asyncprobe']);
+    const target = repo.commitFile('src/main.ts', 'export const a = 1;\n');
+    attachBareOrigin(repo);
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/main']);
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/feature/asyncprobe']);
+    const artifactRoot = temp('admission-artifacts-');
+    const ci = renderRecordedCiEvidence({
+      events: { branchState: null, ciGreen: null, ciFailed: null },
+      targetSha: target,
+      expectedRepo: 'acme/fixture',
+      expectedPr: 12,
+    });
+    let spec = appendRecordedVerification({ spec: 'Acceptance: a is 1.', evidence: null });
+    spec = appendCiEvidence({ spec, block: ci.block, maxBytes: 256 * 1024 });
+    const review = freezeReviewInputs({
+      roundId: 'round-asyncprobe',
+      repoPath: repo.path,
+      artifactRoot,
+      baseRef: 'main',
+      targetRef: target,
+      movementRef: 'origin/feature/asyncprobe',
+      spec,
+      ciEvidence: ci.record,
+    });
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    const shimDir = temp('admission-shim-');
+    const shim = join(shimDir, 'git');
+    writeFileSync(shim, `#!/bin/sh\ncase " $* " in *"ls-remote"*) sleep 8;; esac\nexec "${realGit}" "$@"\n`);
+    chmodSync(shim, 0o755);
+    const oldPath = process.env.PATH;
+    process.env.PATH = `${shimDir}:${oldPath ?? ''}`;
+    try {
+      const stalled = probeAdvertisedTipMovementAsync(review, 3_000);
+      // Unrelated event-loop work completes WHILE the stalled probe waits —
+      // the probe is genuinely off the loop, not a bounded stall.
+      const timers: number[] = [];
+      const responsive = await Promise.race([
+        new Promise<'responsive'>((resolve) => { setTimeout(() => resolve('responsive'), 50).unref?.(); }),
+        stalled.then(() => 'probe-finished-first'),
+      ]);
+      expect(responsive).toBe('responsive');
+      const movement = await stalled;
+      expect(movement?.cause).toBe('check-failed');
+      expect(timers).toEqual([]);
     } finally {
       if (oldPath === undefined) delete process.env.PATH;
       else process.env.PATH = oldPath;

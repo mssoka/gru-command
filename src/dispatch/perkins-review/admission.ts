@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import type { SourceMovement } from './artifacts.js';
 import {
   FROZEN_CHANGED_FILES_MAX_BYTES,
   FROZEN_CONVENTIONS_MAX_BYTES,
@@ -21,6 +22,10 @@ export const ADMISSION_REMOTE_PROBE_TIMEOUT_MS = 5_000;
 
 export interface AdmissionPreflightOptions {
   readonly remoteProbeTimeoutMs?: number;
+  /** Precomputed ASYNC advertised-tip result (gh-169 R4-6): when supplied,
+   * the sync probe is skipped and this outcome is merged into
+   * head-binding — the remote lookup never blocks the event loop. */
+  readonly precomputedRemoteMovement?: SourceMovement | null;
 }
 
 /**
@@ -187,9 +192,17 @@ export function admissionPreflight(review: FrozenReview, movementRef: string, op
   //    (local ref, advertised remote tip, HEAD and pristine checkout). The
   //    advertised probe is BOUNDED at admission (P5): a stalled remote
   //    refuses fail-closed within seconds instead of blocking the request.
-  const movement = headMovedSinceFreeze(review, movementRef, {
-    ...(options?.remoteProbeTimeoutMs !== undefined ? { remoteProbeTimeoutMs: options.remoteProbeTimeoutMs } : { remoteProbeTimeoutMs: ADMISSION_REMOTE_PROBE_TIMEOUT_MS }),
-  });
+  // R4-6: with a precomputed ASYNC probe result the sync path skips its
+  // own remote lookup entirely; the merged outcome keeps the identical
+  // fail-closed semantics.
+  const movement = options?.precomputedRemoteMovement !== undefined
+    ? ((): SourceMovement | null => {
+        const local = headMovedSinceFreeze(review, movementRef, { skipRemoteProbe: true });
+        return local ?? options.precomputedRemoteMovement ?? null;
+      })()
+    : headMovedSinceFreeze(review, movementRef, {
+        ...(options?.remoteProbeTimeoutMs !== undefined ? { remoteProbeTimeoutMs: options.remoteProbeTimeoutMs } : { remoteProbeTimeoutMs: ADMISSION_REMOTE_PROBE_TIMEOUT_MS }),
+      });
   if (movement === null) pass('head-binding');
   else fail('head-binding', `${movement.cause}: ${movement.detail}`);
 

@@ -442,6 +442,36 @@ describe('board engine — liveness-first rail and job trackers', () => {
     expect(after?.rounds[0]?.lensAttempts).toEqual([{ lens: 'blind', attempts: 1 }]);
   });
 
+  it('counts a ledger-only RETRY as ×2 with a single registered child (gh-169 R4-8)', () => {
+    const { api, engine } = fresh();
+    const job = api.addJob({ id: 'retry-job', repo: 'demo-repo', title: 'Retry' });
+    api.setJobStatus(job.id, 'working');
+    api.registerWorktree({
+      id: job.id,
+      kind: 'job',
+      repoPath: '/repos/demo-repo',
+      repoName: 'demo-repo',
+      path: '/worktrees/demo-repo/job-retry-job',
+      branch: 'gru/retry-job',
+      sha: 'cd34efbase',
+      jobId: job.id,
+    });
+    const round = api.addRound({ jobId: job.id, targetRef: 'cd34efbase' });
+    // Two charged starts (a retry) in the journal, ONE registered child:
+    // the board multiplier must show ×2 from the journal alone.
+    for (const attempt of [1, 2] as const) {
+      api.appendCustomEvent({
+        kind: 'round.specialist-started',
+        jobId: job.id,
+        roundId: round.id,
+        payload: { lens: 'blind', attempt, originRoundId: round.id },
+      });
+    }
+    api.registerAgent({ id: 'sp-blind-only', role: 'perkins', label: 'blind', roundId: round.id, jobId: job.id });
+    const view = engine.snapshot().repos.flatMap((repo) => repo.jobs).find((entry) => entry.id === job.id);
+    expect(view?.rounds[0]?.lensAttempts).toEqual([{ lens: 'blind', attempts: 2 }]);
+  });
+
   it('counts whole-PR bare-lens specialist attempts (blind, blind#2) alongside legacy lens:chunk labels', () => {
     const { api, engine } = fresh();
     const job = api.addJob({ id: 'whole-job', repo: 'demo-repo', title: 'Whole' });
