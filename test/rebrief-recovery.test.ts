@@ -185,6 +185,21 @@ async function seedPendingRebrief(input: {
   return { path: lane.path, markers };
 }
 
+/** Deterministic fault injection for the committed-clear/missing-settlement
+ * window (issue #189): fail exactly the `silas.rebrief-settled` append at
+ * the ledger's event seam — the publication point INSIDE the completion
+ * transaction, so a failure here must roll the marker clear back with it.
+ * Returns the restore function. */
+function failSettlementPublication(ledger: LedgerApi, fault: Error): () => void {
+  const seam = ledger as unknown as { appendEvent: (fields: { kind: string }) => unknown };
+  const original = seam.appendEvent;
+  const spy = vi.spyOn(seam, 'appendEvent').mockImplementation(function (this: unknown, fields: { kind: string }) {
+    if (fields.kind === 'silas.rebrief-settled') throw fault;
+    return original.apply(this, [fields]);
+  });
+  return () => { spy.mockRestore(); };
+}
+
 describe('re-brief restart safety (durable markers)', () => {
   it('a pending re-brief marker survives a simulated restart', () => {
     const h = makeHarness();
@@ -594,6 +609,100 @@ describe('re-brief restart safety (durable markers)', () => {
     expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-settled')?.seq).toBe(settlement?.seq);
   });
 
+  it('a settlement publication failure commits no clear; a replay settles exactly once (issue #189)', async () => {
+    const h = makeHarness();
+    const jobId = 'settlement-fault-job';
+    await seedPendingRebrief({ h, jobId });
+    h.ledger.appendCustomEvent({ kind: 'silas.rebrief', jobId });
+    h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { sha: 'settled-head' } });
+    let busSettlements = 0;
+    h.bus.subscribe((event) => { if (event.jobId === jobId && event.kind === 'silas.rebrief-settled') busSettlements += 1; });
+    const fault = new Error('settlement publication failed');
+    const restore = failSettlementPublication(h.ledger, fault);
+    try {
+      expect(() => finalizeRebriefRequest({
+        ledger: h.ledger, worktrees: h.worktrees, jobId,
+        minionId: 'worker', lanePath: h.lanePath, note: 'n',
+      })).toThrow(/settlement publication failed/u);
+    } finally { restore(); }
+    // Atomicity: the failure rolled the clear back, so the markers and
+    // both guarded events survive and no stranded settlement exists.
+    expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(2);
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief')).not.toBeNull();
+    expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).not.toBeNull();
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-settled')).toBeNull();
+    expect(busSettlements).toBe(0);
+
+    // The next pass repairs the exact window: the markers clear and the
+    // queued review handoff's release signal publishes exactly once.
+    const result = finalizeRebriefRequest({
+      ledger: h.ledger, worktrees: h.worktrees, jobId,
+      minionId: 'worker', lanePath: h.lanePath, note: 'n',
+    });
+    expect(result.superseded).toBe(false);
+    expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(0);
+    expect(h.ledger.listJobEvents(jobId).filter((event) => event.kind === 'silas.rebrief-settled')).toHaveLength(1);
+    expect(busSettlements).toBe(1);
+  });
+
+  it('boot completion of spent markers survives a settlement failure and settles on the next pass (issue #189)', async () => {
+    const h = makeHarness();
+    const jobId = 'boot-settlement-fault-job';
+    await seedPendingRebrief({ h, jobId });
+    h.ledger.appendCustomEvent({ kind: 'silas.rebrief', jobId });
+    h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId });
+    let busSettlements = 0;
+    h.bus.subscribe((event) => { if (event.jobId === jobId && event.kind === 'silas.rebrief-settled') busSettlements += 1; });
+    const restore = failSettlementPublication(h.ledger, new Error('boot settlement publication failed'));
+    try {
+      await expect(reconcilePendingRebriefs({ registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications }, { bootAt: new Date(Date.now() + 60_000) }))
+        .rejects.toThrow(/boot settlement publication failed/u);
+    } finally { restore(); }
+    // No clear committed: the spent markers stay for the next pass.
+    expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(2);
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-settled')).toBeNull();
+    expect(busSettlements).toBe(0);
+
+    const report = await reconcilePendingRebriefs({ registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications }, { bootAt: new Date(Date.now() + 120_000) });
+    await report.settled;
+    expect(report.completed).toBe(1);
+    expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(0);
+    expect(h.ledger.listJobEvents(jobId).filter((event) => event.kind === 'silas.rebrief-settled')).toHaveLength(1);
+    expect(busSettlements).toBe(1);
+  });
+
+  it('the delivery-only shortcut survives a settlement failure and releases the signal on the next pass (issue #189)', async () => {
+    const h = makeHarness();
+    const jobId = 'delivery-only-settlement-fault-job';
+    await seedPendingRebrief({ h, jobId });
+    h.ledger.appendCustomEvent({ kind: 'silas.rebrief', jobId, payload: { minion_id: 'worker-1', note: 'n' } });
+    let busSettlements = 0;
+    h.bus.subscribe((event) => { if (event.jobId === jobId && event.kind === 'silas.rebrief-settled') busSettlements += 1; });
+    const restore = failSettlementPublication(h.ledger, new Error('shortcut settlement publication failed'));
+    try {
+      await expect(reconcilePendingRebriefs({ registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications }, { bootAt: new Date(Date.now() + 60_000) }))
+        .rejects.toThrow(/shortcut settlement publication failed/u);
+    } finally { restore(); }
+    // The recorded delivery committed in its own transaction and stays;
+    // the clear rolled back with the settlement, so nothing is stranded.
+    expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).not.toBeNull();
+    expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(2);
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-settled')).toBeNull();
+    expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-recovered')).toBeNull();
+    expect(busSettlements).toBe(0);
+
+    const report = await reconcilePendingRebriefs({ registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications }, { bootAt: new Date(Date.now() + 120_000) });
+    await report.settled;
+    expect(report.completed).toBe(1);
+    expect(h.registry.workers).toHaveLength(0);
+    // The shortcut's recorded delivery was never duplicated by the repair:
+    // the second pass only settles what the fault rolled back.
+    expect(h.ledger.listJobEvents(jobId).filter((event) => event.kind === 'job.delivered')).toHaveLength(1);
+    expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(0);
+    expect(h.ledger.listJobEvents(jobId).filter((event) => event.kind === 'silas.rebrief-settled')).toHaveLength(1);
+    expect(busSettlements).toBe(1);
+  });
+
   it('records only the lost delivery when silas.rebrief already landed', async () => {
     const h = makeHarness();
     const jobId = 'delivery-only-job';
@@ -799,7 +908,7 @@ describe('terminal re-brief retirement', () => {
     const jobId = 'terminal-on-agent-spawned';
     await seedPendingRebrief({ h, jobId });
     h.bus.subscribe((event) => { if (event.kind === 'agent.spawned' && event.jobId === jobId) merge(h, jobId); });
-    const report = await reconcilePendingRebriefs(deps(h), { bootAt: new Date(Date.now() + 60_000) });
+    const report = await reconcilePendingRebriefs({ registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications }, { bootAt: new Date(Date.now() + 60_000) });
     await report.settled;
     expect(h.registry.workers[0]?.prompts).toHaveLength(0);
     expect(h.registry.disposedSpawned).toEqual(['worker-1']);
@@ -817,7 +926,7 @@ describe('terminal re-brief retirement', () => {
         h.ledger.beginPendingRebrief({ jobId, note: 'new request', briefing: 'new contract' });
       }
     });
-    const report = await reconcilePendingRebriefs(deps(h), { bootAt: new Date(Date.now() + 60_000) });
+    const report = await reconcilePendingRebriefs({ registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications }, { bootAt: new Date(Date.now() + 60_000) });
     await report.settled;
     expect(h.registry.workers[0]?.prompts).toHaveLength(0);
     expect(h.registry.disposedSpawned).toEqual(['worker-1']);
@@ -831,7 +940,7 @@ describe('terminal re-brief retirement', () => {
     const jobId = 'spawn-terminal-job';
     await seedPendingRebrief({ h, jobId });
     h.registry.afterSpawn = () => merge(h, jobId);
-    const report = await reconcilePendingRebriefs(deps(h), { bootAt: new Date(Date.now() + 60_000) });
+    const report = await reconcilePendingRebriefs({ registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications }, { bootAt: new Date(Date.now() + 60_000) });
     await report.settled;
     expect(h.registry.workers).toHaveLength(1);
     expect(h.registry.workers[0]?.prompts).toHaveLength(0);
@@ -850,7 +959,7 @@ describe('terminal re-brief retirement', () => {
     await seedPendingRebrief({ h, jobId });
     const pair = h.ledger.listPendingRebriefs({ jobId });
     h.ledger.clearPendingRebriefs(pair.filter((row) => row.kind === 'job.delivered').map((row) => row.id));
-    const report = await reconcilePendingRebriefs(deps(h), { bootAt: new Date(Date.now() + 60_000) });
+    const report = await reconcilePendingRebriefs({ registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications }, { bootAt: new Date(Date.now() + 60_000) });
     await report.settled;
     expect(report.completed).toBe(0);
     expect(h.registry.workers).toHaveLength(0);
@@ -871,7 +980,7 @@ describe('terminal re-brief retirement', () => {
     h.db.handle.prepare(`UPDATE pending_rebriefs SET ${column} = ? WHERE id = ?`)
       .run(column === 'phase_id' ? 'foreign-phase' : column === 'payload_hash' ? 'foreign-hash' : pair[0]!.baselineSeq + 1, pair[0]!.id);
     merge(h, jobId);
-    const report = await reconcilePendingRebriefs(deps(h), { bootAt: new Date(Date.now() + 60_000) });
+    const report = await reconcilePendingRebriefs({ registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications }, { bootAt: new Date(Date.now() + 60_000) });
     await report.settled;
     expect(report).toMatchObject({ completed: 0, redispatched: 0, retired: 0 });
     expect(h.registry.workers).toHaveLength(0);
@@ -901,13 +1010,13 @@ describe('terminal re-brief retirement', () => {
     h.ledger.appendCustomEvent({ kind: 'silas.rebrief', jobId });
     const delivered = h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId });
     merge(h, jobId);
-    const report = await reconcilePendingRebriefs(deps(h), { bootAt: new Date(Date.now() + 60_000) });
+    const report = await reconcilePendingRebriefs({ registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications }, { bootAt: new Date(Date.now() + 60_000) });
     await report.settled;
     expect(report).toMatchObject({ completed: 1, retired: 0 });
     const settled = h.ledger.latestJobEvent(jobId, 'silas.rebrief-settled');
     expect(settled?.seq).toBeGreaterThan(delivered.seq);
     expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-retired')).toBeNull();
-    await (await reconcilePendingRebriefs(deps(h), { bootAt: new Date(Date.now() + 120_000) })).settled;
+    await (await reconcilePendingRebriefs({ registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications }, { bootAt: new Date(Date.now() + 120_000) })).settled;
     expect(h.ledger.listJobEvents(jobId).filter((event) => event.kind === 'silas.rebrief-settled')).toHaveLength(1);
   });
 
@@ -921,7 +1030,7 @@ describe('terminal re-brief retirement', () => {
     h.db.handle.prepare('UPDATE pending_rebriefs SET phase_id = ? WHERE id = ?').run('foreign', mixed[0]!.id);
     merge(h, retiredJob);
     merge(h, malformedJob);
-    const report = await reconcilePendingRebriefs(deps(h), { bootAt: new Date(Date.now() + 60_000) });
+    const report = await reconcilePendingRebriefs({ registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications }, { bootAt: new Date(Date.now() + 60_000) });
     await report.settled;
     expect(report.retired).toBe(1);
     expect(h.ledger.latestJobEvent(retiredJob, 'silas.rebrief-settled')).toBeNull();
@@ -1144,7 +1253,7 @@ describe('terminal re-brief retirement', () => {
     // delivery record — and the job merged before the next boot.
     h.ledger.appendCustomEvent({ kind: 'silas.rebrief', jobId, payload: { minion_id: 'worker-1', note: 'n' } });
     merge(h, jobId);
-    const report = await reconcilePendingRebriefs(deps(h), { bootAt: new Date(Date.now() + 60_000) });
+    const report = await reconcilePendingRebriefs({ registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications }, { bootAt: new Date(Date.now() + 60_000) });
     expect(report.retired).toBe(1);
     expect(report.completed).toBe(0); // NOT the delivery-only crash shortcut
     await report.settled;
@@ -1205,8 +1314,8 @@ describe('terminal re-brief retirement', () => {
     merge(h, jobId);
     // Both passes start in the same tick: the first scan retires
     // synchronously, so the second must find nothing left to retire.
-    const first = reconcilePendingRebriefs(deps(h), { bootAt: new Date(Date.now() + 60_000) });
-    const second = reconcilePendingRebriefs(deps(h), { bootAt: new Date(Date.now() + 60_000) });
+    const first = reconcilePendingRebriefs({ registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications }, { bootAt: new Date(Date.now() + 60_000) });
+    const second = reconcilePendingRebriefs({ registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications }, { bootAt: new Date(Date.now() + 60_000) });
     const firstReport = await first;
     const secondReport = await second;
     expect(firstReport.retired).toBe(1);
@@ -1254,7 +1363,7 @@ describe('terminal re-brief retirement', () => {
     await seedPendingRebrief({ h, jobId });
     let release!: () => void;
     h.registry.gate = new Promise<void>((resolve) => { release = resolve; });
-    const report = await reconcilePendingRebriefs(deps(h), { bootAt: new Date(Date.now() + 60_000) });
+    const report = await reconcilePendingRebriefs({ registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications }, { bootAt: new Date(Date.now() + 60_000) });
     expect(report.redispatched).toBe(1);
     merge(h, jobId);
     h.registry.healthState = 'error';
@@ -1275,7 +1384,7 @@ describe('terminal re-brief retirement', () => {
     await seedPendingRebrief({ h, jobId: terminalJob });
     await seedPendingRebrief({ h, jobId: workingJob });
     merge(h, terminalJob);
-    const report = await reconcilePendingRebriefs(deps(h), { bootAt: new Date(Date.now() + 60_000) });
+    const report = await reconcilePendingRebriefs({ registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications }, { bootAt: new Date(Date.now() + 60_000) });
     expect(report.retired).toBe(1);
     expect(report.redispatched).toBe(1);
     await report.settled;
@@ -1294,7 +1403,7 @@ describe('terminal re-brief retirement', () => {
     const jobId = 'terminal-done-job';
     await seedPendingRebrief({ h, jobId });
     h.ledger.setJobStatus(jobId, 'done');
-    const report = await reconcilePendingRebriefs(deps(h), { bootAt: new Date(Date.now() + 60_000) });
+    const report = await reconcilePendingRebriefs({ registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications }, { bootAt: new Date(Date.now() + 60_000) });
     expect(report.retired).toBe(1);
     expect(report.redispatched).toBe(0);
     await report.settled;
@@ -1314,7 +1423,7 @@ describe('terminal re-brief retirement', () => {
     h.ledger.appendCustomEvent({ kind: 'silas.rebrief', jobId, payload: { minion_id: 'worker-1', note: 'n' } });
     h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { agentId: 'worker-1', source: 'silas-rebrief', sha: null } });
     merge(h, jobId);
-    const report = await reconcilePendingRebriefs(deps(h), { bootAt: new Date(Date.now() + 60_000) });
+    const report = await reconcilePendingRebriefs({ registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications }, { bootAt: new Date(Date.now() + 60_000) });
     expect(report.completed).toBe(1);
     expect(report.retired).toBe(0);
     await report.settled;
@@ -1332,7 +1441,7 @@ describe('terminal re-brief retirement', () => {
     h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId });
     h.ledger.clearPendingRebriefs(pair.filter((row) => row.kind === 'job.delivered').map((row) => row.id));
     merge(h, jobId);
-    const report = await reconcilePendingRebriefs(deps(h), { bootAt: new Date(Date.now() + 60_000) });
+    const report = await reconcilePendingRebriefs({ registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications }, { bootAt: new Date(Date.now() + 60_000) });
     await report.settled;
     expect(report.completed).toBe(0);
     expect(report.retired).toBe(0);
@@ -1359,7 +1468,7 @@ describe('terminal re-brief retirement', () => {
       for (let i = 0; i < 1001; i += 1) h.ledger.appendCustomEvent({ kind: 'job.note', jobId, payload: { i } });
       merge(h, jobId);
       if (jobId === 'phase-spent-boot') {
-        const report = await reconcilePendingRebriefs(deps(h), { bootAt: new Date(Date.now() + 60_000) });
+        const report = await reconcilePendingRebriefs({ registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications }, { bootAt: new Date(Date.now() + 60_000) });
         await report.settled;
         expect(report.completed).toBe(1);
         expect(report.retired).toBe(0);
@@ -1384,10 +1493,10 @@ describe('terminal re-brief retirement', () => {
     h.ledger.appendCustomEvent({ kind: 'silas.rebrief', jobId });
     h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId });
     const view = Object.create(h.ledger) as LedgerApi;
-    Object.defineProperty(view, 'clearPendingRebriefsIfCurrent', {
-      value: (expected: Parameters<LedgerApi['clearPendingRebriefsIfCurrent']>[0]) => {
+    Object.defineProperty(view, 'clearPendingRebriefsIfCurrentAndSettle', {
+      value: (expected: Parameters<LedgerApi['clearPendingRebriefsIfCurrentAndSettle']>[0]) => {
         h.ledger.beginPendingRebrief({ jobId, note: 'new request', briefing: 'new contract' });
-        return h.ledger.clearPendingRebriefsIfCurrent(expected);
+        return h.ledger.clearPendingRebriefsIfCurrentAndSettle(expected);
       },
     });
     const report = await reconcilePendingRebriefs({ ...deps(h), ledger: view }, { bootAt: new Date(Date.now() + 60_000) });
@@ -1402,7 +1511,7 @@ describe('terminal re-brief retirement', () => {
     const jobId = 'parked-rebrief-job';
     await seedPendingRebrief({ h, jobId });
     h.ledger.setJobStatus(jobId, 'parked');
-    const report = await reconcilePendingRebriefs(deps(h), { bootAt: new Date(Date.now() + 60_000) });
+    const report = await reconcilePendingRebriefs({ registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications }, { bootAt: new Date(Date.now() + 60_000) });
     expect(report.retired).toBe(0);
     expect(report.redispatched).toBe(1);
     await report.settled;
@@ -1618,7 +1727,7 @@ describe('terminal re-brief retirement', () => {
     await seedPendingRebrief({ h, jobId: workingJobId });
     merge(h, mergedJobId);
     h.ledger.setJobStatus(doneJobId, 'done');
-    const report = await reconcilePendingRebriefs(deps(h), { bootAt: new Date(Date.now() + 60_000) });
+    const report = await reconcilePendingRebriefs({ registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications }, { bootAt: new Date(Date.now() + 60_000) });
     expect(report.examined).toBe(6);
     expect(report.retired).toBe(2);
     expect(report.completed).toBe(0);

@@ -2805,6 +2805,28 @@ export class LedgerApi {
     });
   }
 
+  /** Complete the still-admitted generation AND publish its durable
+   * settlement signal in ONE transaction (issue #189): the identity-checked
+   * marker deletion and the `silas.rebrief-settled` append commit together
+   * or not at all. The previous clear-then-append ordering stranded queued
+   * review handoffs: a failure after the clear committed left neither the
+   * markers a pending-marker scan needs to repair the gap nor the event a
+   * queued handoff waits on. Here a settlement failure rolls the deletion
+   * back, so the markers stay for the next pass and the next attempt can
+   * still release the handoff; a success publishes the settlement on the
+   * bus exactly once, only after COMMIT, and never for a superseded
+   * generation, a retirement, or a malformed pair. */
+  clearPendingRebriefsIfCurrentAndSettle(expected: readonly PendingRebriefRecord[]): boolean {
+    const jobId = expected[0]?.jobId;
+    if (jobId === undefined) throw new Error('settling a re-brief generation requires markers');
+    return this.transaction(() => {
+      if (!this.matchesPendingRebriefGeneration(jobId, expected)) return false;
+      this.clearPendingRebriefs(expected.map((marker) => marker.id));
+      this.appendEvent({ kind: 'silas.rebrief-settled', jobId });
+      return true;
+    });
+  }
+
   private matchesPendingRebriefGeneration(jobId: string, expected: readonly PendingRebriefRecord[]): boolean {
     if (expected.length === 0 || expected.some((marker) => marker.jobId !== jobId)) return false;
     const current = this.listPendingRebriefs({ jobId });

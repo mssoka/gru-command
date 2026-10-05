@@ -125,9 +125,11 @@ in-review status — and the Silas digest rechecks every proposed review
 at final publication, after any async blocker-history work. A live re-brief
 finalizer matches the exact admitted marker IDs as well as any phase ID:
 ordinary requests have no phase ID, so an older turn cannot consume a
-newer request's markers. Settlement publishes `silas.rebrief-settled`
-after marker retirement, so a queued handoff that re-queued on the
-earlier delivery can retry without waiting for another sweep. `force: true` is the owner's explicit override —
+newer request's markers. Settlement publishes `silas.rebrief-settled` in
+the SAME transaction that clears the markers, so a queued handoff that
+re-queued on the earlier delivery can retry without waiting for another
+sweep — and a settlement publication failure rolls the clear back instead
+of stranding the handoff behind already-cleared markers. `force: true` is the owner's explicit override —
 never an automatic operations action; a forced round is tagged in its
 frozen manifest
 (`branchIdle`) and the event log (`branch-idle.forced`), refusals land as
