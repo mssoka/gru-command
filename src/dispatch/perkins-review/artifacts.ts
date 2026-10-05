@@ -129,17 +129,17 @@ export interface FrozenReview {
   };
 }
 
-function gitRaw(repoPath: string, args: readonly string[]): string {
+function gitRaw(repoPath: string, args: readonly string[], timeoutMs = 30_000): string {
   return execFileSync('git', ['-C', repoPath, ...args], {
     encoding: 'utf8',
     maxBuffer: GIT_MAX_BUFFER,
-    timeout: 30_000,
+    timeout: timeoutMs,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 }
 
-function git(repoPath: string, args: readonly string[]): string {
-  return gitRaw(repoPath, args).trimEnd();
+function git(repoPath: string, args: readonly string[], timeoutMs = 30_000): string {
+  return gitRaw(repoPath, args, timeoutMs).trimEnd();
 }
 
 export function resolveGitCommit(repoPath: string, ref: string): string {
@@ -565,7 +565,17 @@ function advertisedRemoteBranch(repoPath: string, ref: string): { remote: string
  * advertised target tip), HEAD and pristine checkout with the frozen target.
  * A base advance is not movement; frozen SHAs stay provenance. Any failed
  * check returns a cause, so the boolean wrapper fails closed on every error. */
-export function sourceMovementSinceFreeze(review: FrozenReview): SourceMovement | null {
+/** Movement probe options (gh-169 P5): `remoteProbeTimeoutMs` bounds the
+ * advertised-tip ls-remote at REQUEST-TIME admission so a stalled remote
+ * cannot block the service event loop for the full 30 s proof budget — a
+ * probe that exceeds the bound reports check-failed (fail-closed,
+ * retryable) instead of stalling. The submission gate keeps the full
+ * budget by omitting the option. */
+export interface SourceMovementOptions {
+  readonly remoteProbeTimeoutMs?: number;
+}
+
+export function sourceMovementSinceFreeze(review: FrozenReview, options?: SourceMovementOptions): SourceMovement | null {
   const { repoPath, targetRef, targetSha } = review.manifest;
   try {
     const base = baseMovementSinceFreeze(review);
@@ -580,7 +590,11 @@ export function sourceMovementSinceFreeze(review: FrozenReview): SourceMovement 
     // A push may move the host tip without moving the local tracking ref.
     const remoteTarget = advertisedRemoteBranch(repoPath, targetRef);
     if (remoteTarget !== null) {
-      const advertised = gitRaw(repoPath, ['ls-remote', '--exit-code', remoteTarget.remote, `refs/heads/${remoteTarget.branch}`]).trim();
+      const advertised = gitRaw(
+        repoPath,
+        ['ls-remote', '--exit-code', remoteTarget.remote, `refs/heads/${remoteTarget.branch}`],
+        options?.remoteProbeTimeoutMs,
+      ).trim();
       const tip = advertised.split(/\s+/u)[0] ?? '';
       if (tip !== targetSha) return movement('target-moved', `advertised ${remoteTarget.remote}/${remoteTarget.branch} is ${tip}, frozen at ${targetSha}`);
     }

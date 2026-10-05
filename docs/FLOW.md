@@ -163,11 +163,15 @@ verification sections (a no-binding verification run freezes an explicit
 UNAVAILABLE disclosure, never silence) — and refuses with one exhaustive,
 named missing-input list (`round.admission-preflight`); a refused round
 aborts without spawn. Parent-failure truth (gh-169): a round whose PARENT
-fails (lead transport death, shutdown, restart, finalization crash) records
-exactly one `round.parent-incident` event; lenses with a started attempt
-carry an honest interrupted-execution error, and never-started lenses keep
-their `pending` chips — one lead disconnect is one parent incident, never a
-slate of failed specialists. A revision-expression or tag pin
+fails after a review owner spawned (lead transport death, restart,
+finalization crash) records exactly one `round.parent-incident` event;
+lenses with a started attempt carry an honest interrupted-execution error,
+and never-started lenses keep their `pending` chips — one lead disconnect
+is one parent incident, never a slate of failed specialists. A PRE-SPAWN
+interruption (setup shutdown or a pre-spawn workflow failure) is not a
+parent incident: it leaves the durable negative owner receipt
+(`round.review-no-spawn`) and an INCOMPLETE report whose heading says
+setup refusal/interruption — no incident event exists to find. A revision-expression or tag pin
 (`origin/topic~1`, `origin/v1`) is not a branch spelling: the
 advertised-tip movement probe skips it (the pin still binds through local
 resolution and the pristine-checkout proof), so pinned rounds no longer

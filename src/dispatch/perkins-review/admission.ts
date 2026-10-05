@@ -12,6 +12,17 @@ import { CI_EVIDENCE_STATES, type CiEvidenceRecord } from '../../review-inputs/c
 import { REVIEW_EVIDENCE_MAX_FILE_BYTES } from '../../review-inputs/evidence.js';
 import { headMovedSinceFreeze } from './whole.js';
 
+/** Admission options (gh-169 P5): `remoteProbeTimeoutMs` bounds the
+ * advertised-tip ls-remote so a stalled remote cannot block the service
+ * event loop at request time. A probe that exceeds the bound yields a
+ * fail-closed, retryable `head-binding` refusal — never a silent pass and
+ * never an unbounded stall. Default: 5 seconds. */
+export const ADMISSION_REMOTE_PROBE_TIMEOUT_MS = 5_000;
+
+export interface AdmissionPreflightOptions {
+  readonly remoteProbeTimeoutMs?: number;
+}
+
 /**
  * Admission preflight (gh-169 Stage 4).
  *
@@ -99,11 +110,20 @@ function ciRecordShapeProblem(value: unknown): string | null {
   for (const [field, kind] of [
     ['repo', 'string'], ['sha', 'string'], ['observedAt', 'string'], ['sourceKind', 'string'], ['reason', 'string'],
   ] as const) {
+    // Q2/P7 (round 3): the persisted contract declares these fields on
+    // every record — a hash-consistent manifest that OMITS one is
+    // malformed. Null stays permitted (the declared nullable contract);
+    // absence does not.
+    if (!(field in record)) {
+      return `the ${field} field is absent (the frozen CI record contract requires the key, null permitted)`;
+    }
     const raw = record[field];
     if (raw !== null && raw !== undefined && typeof raw !== kind) {
       return `the ${field} field is not ${kind === 'string' ? 'a string or null' : kind}`;
     }
   }
+  if (!('pr' in record)) return 'the pr field is absent (the frozen CI record contract requires the key, null permitted)';
+  if (!('sourceSeq' in record)) return 'the sourceSeq field is absent (the frozen CI record contract requires the key, null permitted)';
   if (record['pr'] !== null && record['pr'] !== undefined &&
     (typeof record['pr'] !== 'number' || !Number.isSafeInteger(record['pr']))) {
     return 'the pr field is not an integer or null';
@@ -119,6 +139,7 @@ function ciRecordShapeProblem(value: unknown): string | null {
       (check as Record<string, unknown>)['name'] === '') {
       return `checks[${index}] is malformed (a non-empty name is required)`;
     }
+    if (!('url' in (check as Record<string, unknown>))) return `checks[${index}].url is absent (null permitted, omission is not)`;
     const url = (check as Record<string, unknown>)['url'];
     if (url !== undefined && url !== null && typeof url !== 'string') return `checks[${index}].url is malformed`;
   }
@@ -127,6 +148,7 @@ function ciRecordShapeProblem(value: unknown): string | null {
     if (typeof failure !== 'object' || failure === null || typeof entry['name'] !== 'string' || entry['name'] === '') {
       return `failures[${index}] is malformed (a non-empty name is required)`;
     }
+    if (!('url' in entry)) return `failures[${index}].url is absent (null permitted, omission is not)`;
     const url = entry['url'];
     if (url !== undefined && url !== null && typeof url !== 'string') return `failures[${index}].url is malformed`;
     // The frozen CiEvidenceFailure contract REQUIRES a conclusion — a
@@ -143,7 +165,7 @@ function ciRecordShapeProblem(value: unknown): string | null {
  * read is bounded and read-only, and the returned `missing` list names each
  * inaccessible input precisely. An empty `missing` list is the pass.
  */
-export function admissionPreflight(review: FrozenReview, movementRef: string): AdmissionPreflightResult {
+export function admissionPreflight(review: FrozenReview, movementRef: string, options?: AdmissionPreflightOptions): AdmissionPreflightResult {
   const checks: AdmissionCheck[] = [];
   const missing: AdmissionMissingInput[] = [];
   const fail = (input: string, detail: string): void => {
@@ -162,8 +184,12 @@ export function admissionPreflight(review: FrozenReview, movementRef: string): A
   };
 
   // 1. Head binding: the frozen target is still exactly what was frozen
-  //    (local ref, advertised remote tip, HEAD and pristine checkout).
-  const movement = headMovedSinceFreeze(review, movementRef);
+  //    (local ref, advertised remote tip, HEAD and pristine checkout). The
+  //    advertised probe is BOUNDED at admission (P5): a stalled remote
+  //    refuses fail-closed within seconds instead of blocking the request.
+  const movement = headMovedSinceFreeze(review, movementRef, {
+    ...(options?.remoteProbeTimeoutMs !== undefined ? { remoteProbeTimeoutMs: options.remoteProbeTimeoutMs } : { remoteProbeTimeoutMs: ADMISSION_REMOTE_PROBE_TIMEOUT_MS }),
+  });
   if (movement === null) pass('head-binding');
   else fail('head-binding', `${movement.cause}: ${movement.detail}`);
 

@@ -1,5 +1,6 @@
+import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -11,7 +12,7 @@ import {
 import { appendCiEvidence, renderRecordedCiEvidence } from '../src/review-inputs/ci-evidence.js';
 import { appendRecordedVerification } from '../src/verify/evidence.js';
 import { minimalPng } from './helpers/images.js';
-import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
+import { attachBareOrigin, makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 
 /**
  * Admission preflight (gh-169 Stage 4): the read-only gate between the
@@ -339,7 +340,7 @@ describe('Perkins admission preflight (gh-169)', () => {
           state: 'failed',
           sha: onDisk.targetSha,
           repo: 'acme/fixture',
-          failures: [{ name: 'unit-tests' }],
+          failures: [{ name: 'unit-tests', url: null }],
         },
       },
     };
@@ -380,6 +381,69 @@ describe('Perkins admission preflight (gh-169)', () => {
     expect(error.message).toContain('40 missing input(s)');
     expect(error.message.length).toBeLessThan(2_200);
     expect(error.missing).toHaveLength(40);
+  });
+
+  it('refuses a CI record that omits a contract-required nullable key (Q2/P7)', () => {
+    const { review } = preflightHarness();
+    const onDisk = JSON.parse(readFileSync(join(review.directory, 'manifest.json'), 'utf8')) as FrozenReview['manifest'];
+    const { reason: _omitted, ...withoutReason } = onDisk.reviewEvidence!.ci!;
+    const absentManifest = {
+      ...onDisk,
+      reviewEvidence: { attachments: [], ci: withoutReason },
+    };
+    writeFileSync(join(review.directory, 'manifest.json'), `${JSON.stringify(absentManifest, null, 2)}\n`);
+    const result = admissionPreflight(withDiskManifest(review), 'feature/admission');
+    expect(result.missing.map((entry) => entry.input)).toEqual(['ci-evidence']);
+    expect(result.missing[0]!.detail).toContain('reason field is absent');
+  });
+
+  it('bounds the advertised-remote probe at admission: a stalled remote refuses fail-closed in seconds, never stalls (P5)', () => {
+    const repo = makeFixtureRepo('admission-stalled-remote');
+    repos.push(repo);
+    const base = repo.head();
+    repo.git(['checkout', '-b', 'feature/stalled']);
+    const target = repo.commitFile('src/main.ts', 'export const s = 1;\n');
+    attachBareOrigin(repo);
+    const artifactRoot = temp('admission-artifacts-');
+    const ci = renderRecordedCiEvidence({
+      events: { branchState: null, ciGreen: null, ciFailed: null },
+      targetSha: target,
+      expectedRepo: 'acme/fixture',
+      expectedPr: 11,
+    });
+    let spec = appendRecordedVerification({ spec: 'Acceptance: s is 1.', evidence: null });
+    spec = appendCiEvidence({ spec, block: ci.block, maxBytes: 256 * 1024 });
+    const review = freezeReviewInputs({
+      roundId: 'round-stalled',
+      repoPath: repo.path,
+      artifactRoot,
+      baseRef: base,
+      targetRef: target,
+      movementRef: 'origin/feature/stalled',
+      spec,
+      ciEvidence: ci.record,
+    });
+    // A tracking-ref spelling whose remote probe hangs: the shim sleeps
+    // far past the admission bound (but under the 30 s full budget).
+    repo.git(['update-ref', 'refs/remotes/origin/feature/stalled', target]);
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    const shimDir = temp('admission-shim-');
+    const shim = join(shimDir, 'git');
+    writeFileSync(shim, `#!/bin/sh\ncase " $* " in *"ls-remote"*) sleep 20;; esac\nexec "${realGit}" "$@"\n`);
+    chmodSync(shim, 0o755);
+    const oldPath = process.env.PATH;
+    process.env.PATH = `${shimDir}:${oldPath ?? ''}`;
+    try {
+      const startedAt = Date.now();
+      const result = admissionPreflight(review, 'origin/feature/stalled', { remoteProbeTimeoutMs: 1_000 });
+      const elapsed = Date.now() - startedAt;
+      expect(elapsed).toBeLessThan(10_000);
+      expect(result.missing.map((entry) => entry.input)).toEqual(['head-binding']);
+      expect(result.missing[0]!.detail).toContain('check-failed');
+    } finally {
+      if (oldPath === undefined) delete process.env.PATH;
+      else process.env.PATH = oldPath;
+    }
   });
 
   it('is read-only: a pass and a refusal leave every frozen packet byte identical', () => {

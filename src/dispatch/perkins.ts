@@ -187,6 +187,63 @@ function ciEvidenceLine(ci: CiEvidenceRecord | null | undefined): string | null 
   }
 }
 
+/** One journaled specialist start (the budget authority) as the
+ * execution accounting consumes it. */
+export interface SpecialistStartFact {
+  readonly lens: string;
+  readonly attempt: number;
+}
+
+/** Journal-sourced start totals for the published appendix (gh-169 P2):
+ * conclusive disclosure counts STARTS from the authoritative journal —
+ * not settled results — and names attempts that started but never
+ * committed a result, so an unsettled retry can never be published as
+ * "not used" or vanish from the started count. */
+export interface AppendixStartTotals {
+  readonly journaled: number;
+  readonly startedLenses: readonly string[];
+  readonly settledValid: number;
+  readonly settledFailed: number;
+  /** Formatted `lens aN` identities of journaled starts with no settled result. */
+  readonly unsettled: readonly string[];
+}
+
+/** Parse the round's specialist-start journal into attempt facts. */
+export function specialistStartFacts(events: ReadonlyArray<{ readonly payload: unknown }>): readonly SpecialistStartFact[] {
+  const facts: SpecialistStartFact[] = [];
+  for (const event of events) {
+    const payload = typeof event.payload === 'object' && event.payload !== null
+      ? (event.payload as { readonly lens?: unknown; readonly attempt?: unknown }) : null;
+    if (payload !== null && typeof payload.lens === 'string' && payload.lens !== '' &&
+      (payload.attempt === 1 || payload.attempt === 2)) {
+      facts.push({ lens: payload.lens, attempt: payload.attempt });
+    }
+  }
+  return facts;
+}
+
+/** The one-line host execution summary for a settled INCOMPLETE round
+ * (gh-169 P1): starts are counted from the journal AT ATTEMPT GRANULARITY
+ * — a settled first attempt can never hide a charged-but-unsettled retry
+ * — and settled results keep their own valid/failed counts. */
+export function settledExecutionFactsLine(
+  journaledStarts: readonly SpecialistStartFact[],
+  specialistRuns: ReadonlyArray<{ readonly lens: string; readonly attempt: number; readonly status: string }>,
+  lenses: readonly string[],
+): string {
+  const settledPairs = new Set(specialistRuns.map((run) => `${run.lens}#${run.attempt}`));
+  const unsettled = journaledStarts
+    .filter((start) => !settledPairs.has(`${start.lens}#${start.attempt}`))
+    .map((start) => `${start.lens} a${start.attempt}`);
+  const startedLensSet = new Set(journaledStarts.map((start) => start.lens));
+  const validSettled = specialistRuns.filter((run) => run.status === 'valid').length;
+  const failedSettled = specialistRuns.filter((run) => run.status !== 'valid').length;
+  const neverStarted = lenses.filter((lens) => !startedLensSet.has(lens));
+  return `Specialist execution: ${journaledStarts.length} journaled start(s); settled results: ${specialistRuns.length} (${validSettled} valid, ${failedSettled} failed)` +
+    `${unsettled.length > 0 ? `; ${unsettled.length} started-but-unsettled (${unsettled.join(', ')}) — the round ended before their result committed` : ''}` +
+    `; ${neverStarted.length} of ${lenses.length} lens(es) never started (${neverStarted.join(', ') || 'none'}).`;
+}
+
 /** Compact host-owned factual appendix for the published body: retained
  * findings and execution facts (specialists ran/failed/not-used, prior
  * dispositions) assembled deterministically from the structured result, so
@@ -213,6 +270,11 @@ export function hostDisclosureAppendix(
    * failure is never softened. Absent parameter = the round predates the
    * disclosure or carried no record; that absence is stated, not guessed. */
   ciEvidence?: CiEvidenceRecord | null,
+  /** Journal-sourced start totals (gh-169 P2): when supplied, the started
+   * totals and not-used classification derive from the authoritative
+   * start journal — a journaled-but-unsettled attempt is disclosed, never
+   * counted as "not used". */
+  startTotals?: AppendixStartTotals,
 ): string {
   const counts = new Map<string, number>();
   for (const finding of review.findings) counts.set(finding.severity, (counts.get(finding.severity) ?? 0) + 1);
@@ -243,10 +305,10 @@ export function hostDisclosureAppendix(
   const cleanupGaps = ran.filter(([, entry]) => entry.cleanupGap);
   const evidenceGaps = ran.filter(([, entry]) => entry.evidenceGap);
   const progressGaps = ran.filter(([, entry]) => entry.progressGap);
-  const notUsed = lenses.filter((lens) => !byLens.has(lens));
-  const startedAttempts = ran.reduce((total, [, entry]) => total + entry.valid + entry.failed, 0);
-  const validAttempts = ran.reduce((total, [, entry]) => total + entry.valid, 0);
-  const failedAttempts = ran.reduce((total, [, entry]) => total + entry.failed, 0);
+  const notUsed = lenses.filter((lens) => !byLens.has(lens) && !(startTotals?.startedLenses.includes(lens) ?? false));
+  const startedAttempts = startTotals?.journaled ?? ran.reduce((total, [, entry]) => total + entry.valid + entry.failed, 0);
+  const validAttempts = startTotals?.settledValid ?? ran.reduce((total, [, entry]) => total + entry.valid, 0);
+  const failedAttempts = startTotals?.settledFailed ?? ran.reduce((total, [, entry]) => total + entry.failed, 0);
   const ciLine = ciEvidenceLine(ciEvidence);
   const prior = review.priorDispositions;
   const priorFixed = prior.filter((disposition) => disposition.status === 'fixed').length;
@@ -264,7 +326,10 @@ export function hostDisclosureAppendix(
     `- Retained findings: ${review.findings.length}${severityLine === '' ? '' : ` (${severityLine})`}`,
     ...findingsLines,
     `- Available specialist lenses this round: ${lenses.length}`,
-    `- Specialist attempts started: ${startedAttempts} (${validAttempts} valid, ${failedAttempts} failed) across ${ran.length} of ${lenses.length} available lenses`,
+    `- Specialist attempts started: ${startedAttempts}${startTotals !== undefined ? ' journaled' : ''} (${validAttempts} valid, ${failedAttempts} failed${startTotals !== undefined && startTotals.unsettled.length > 0 ? `; ${startTotals.unsettled.length} started-but-unsettled: ${startTotals.unsettled.join(', ')}` : ''}) across ${startTotals !== undefined ? startTotals.startedLenses.length : ran.length} of ${lenses.length} available lenses`,
+    ...(startTotals !== undefined && startTotals.unsettled.length > 0
+      ? [`- Specialist attempts that started but never committed a result: ${startTotals.unsettled.join(', ')} — the round ended (or the wave failed) before their settlement; they are real started work, never "not used"`]
+      : []),
     ...(ciLine !== null ? [ciLine] : []),
     `- Specialists run: ${ran.length === 0 ? 'none (lead-owned whole-change review)' : ran.map(([lens, entry]) => `${lens}${entry.failed > 0 ? ` (attempts: ${entry.valid} valid, ${entry.failed} failed)` : ''}`).join(', ')}`,
     ...(failed.length > 0 ? [`- Failed specialist attempts: ${failed.map(([lens, entry]) => `${lens} ×${entry.failed}`).join(', ')} — the lead judged the change on its own whole-change verification`] : []),
@@ -297,8 +362,9 @@ export function publicationBodyFor(
   provider: PublicationProviderKind,
   lenses: readonly string[],
   ciEvidence?: CiEvidenceRecord | null,
+  startTotals?: AppendixStartTotals,
 ): string {
-  const body = `${reportText.trimEnd()}\n\n${hostDisclosureAppendix(review, provider, lenses, ciEvidence)}\n`;
+  const body = `${reportText.trimEnd()}\n\n${hostDisclosureAppendix(review, provider, lenses, ciEvidence, startTotals)}\n`;
   if (Buffer.byteLength(body, 'utf8') > PUBLICATION_BODY_MAX_BYTES) {
     throw new Error(
       `publication body (${Buffer.byteLength(body, 'utf8')} bytes) exceeds the provider review-body limit (${PUBLICATION_BODY_MAX_BYTES} bytes); ` +
@@ -3824,9 +3890,12 @@ export class WaveRunner {
       };
     }
 
+    let provisional: { readonly results: readonly ReviewLensResult[]; readonly settledLenses: ReadonlySet<string> } | null = null;
     try {
       if (signal.aborted) throw new Error('review operation aborted before finalization');
-      const results = this.recordLensResults(round, lenses, review);
+      const accounting = this.recordLensResults(round, lenses, review);
+      provisional = accounting;
+      const results = accounting.results;
       const sourceMovement = review.sourceMovement ?? sourceMovementSinceFreeze(frozenReview);
       const headMoved = review.headMoved || sourceMovement !== null;
     const canonical: CanonicalReviewVerdict = headMoved ? 'INCOMPLETE' : review.canonicalVerdict;
@@ -3873,7 +3942,15 @@ export class WaveRunner {
         // the full evidence is preserved locally instead (R8).
         let publicationBody: string;
         try {
-          publicationBody = publicationBodyFor(readFileSync(reportFile, 'utf8'), review, providerKind, lenses, frozenReview.evidence.ci);
+          const startFacts = specialistStartFacts(this.opts.ledger.listRoundSpecialistStarts(round.id));
+          const settledPairs = new Set(review.specialistRuns.map((run) => `${run.lens}#${run.attempt}`));
+          publicationBody = publicationBodyFor(readFileSync(reportFile, 'utf8'), review, providerKind, lenses, frozenReview.evidence.ci, {
+            journaled: startFacts.length,
+            startedLenses: [...new Set(startFacts.map((start) => start.lens))],
+            settledValid: review.specialistRuns.filter((run) => run.status === 'valid').length,
+            settledFailed: review.specialistRuns.filter((run) => run.status !== 'valid').length,
+            unsettled: startFacts.filter((start) => !settledPairs.has(`${start.lens}#${start.attempt}`)).map((start) => `${start.lens} a${start.attempt}`),
+          });
         } catch (overflow) {
           if (!(overflow instanceof Error) || !overflow.message.includes('exceeds the provider review-body limit')) throw overflow;
           writeReviewArtifact(frozenReview, 'perkins-report.publication-overflow.json', {
@@ -4144,6 +4221,10 @@ export class WaveRunner {
         },
       });
       this.opts.ledger.setRoundVerdict(round.id, recordedVerdict);
+      // gh-169 P3: only now — the verdict durably recorded — do the
+      // not-used lenses claim their 'done' chips. A finalization failure
+      // before this point aborts with never-started lenses still pending.
+      this.commitUnusedLensChips(round, accounting.unusedLenses);
     } else {
       this.opts.ledger.setRoundStatus(round.id, 'aborted');
       // P7/Q5/Q6 (gh-169): an ordinary lead-authored INCOMPLETE (or an
@@ -4154,21 +4235,9 @@ export class WaveRunner {
       // results — a charged-but-unsettled attempt (started, then the
       // round ended before a result committed) is never labeled "not
       // used" and never vanishes.
-      const journaledStarts = this.opts.ledger.listRoundSpecialistStarts(round.id);
-      const startedLensSet = new Set(journaledStarts.flatMap((event) => {
-        const lens = typeof event.payload === 'object' && event.payload !== null
-          ? (event.payload as { readonly lens?: unknown }).lens : null;
-        return typeof lens === 'string' && lens !== '' ? [lens] : [];
-      }));
-      const settledLensSet = new Set<string>(review.specialistRuns.map((run) => run.lens));
-      const validSettled = review.specialistRuns.filter((run) => run.status === 'valid').length;
-      const failedSettled = review.specialistRuns.filter((run) => run.status !== 'valid').length;
-      const unsettled = [...startedLensSet].filter((lens) => !settledLensSet.has(lens));
-      const neverStarted = lenses.filter((lens) => !startedLensSet.has(lens));
-      const executionFactsLine =
-        `Specialist execution: ${journaledStarts.length} journaled start(s); settled results: ${review.specialistRuns.length} (${validSettled} valid, ${failedSettled} failed)` +
-        `${unsettled.length > 0 ? `; ${unsettled.length} lens(es) started but unsettled (${unsettled.join(', ')}) — the round ended before their result committed` : ''}` +
-        `; ${neverStarted.length} of ${lenses.length} lens(es) never started (${neverStarted.join(', ') || 'none'}).`;
+      const journaledStartFacts = specialistStartFacts(this.opts.ledger.listRoundSpecialistStarts(round.id));
+      const executionFactsLine = settledExecutionFactsLine(journaledStartFacts, review.specialistRuns, lenses);
+      let hostReportWriteFailed: string | null = null;
       try {
         reportFile = writeReviewArtifact(frozenReview, 'perkins-report.host-incomplete.md', [
           '# Perkins Code Review',
@@ -4185,8 +4254,13 @@ export class WaveRunner {
           '',
         ].join('\n'));
       } catch (factsError) {
+        // P4 (gh-169): a failed host-report write is LOUD — the returned
+        // report regresses to the preserved lead report, and the event
+        // payload plus the operator escalation disclose exactly that,
+        // with the factual counts still durable in the event.
+        hostReportWriteFailed = String(factsError).slice(0, 300);
         this.log('error', 'could not preserve the host-owned INCOMPLETE report with execution facts', {
-          round: round.id, error: String(factsError),
+          round: round.id, error: hostReportWriteFailed,
         });
       }
       this.opts.ledger.appendCustomEvent({
@@ -4197,12 +4271,16 @@ export class WaveRunner {
           reason: verdict === null ? 'review_incomplete' : deliveryFailureKind,
           reportFile,
           executionFacts: executionFactsLine,
+          ...(hostReportWriteFailed !== null ? { hostReportWriteFailed } : {}),
           ...(deliveryError !== undefined ? { error: String(deliveryError).slice(0, 500) } : {}),
         },
       });
       this.opts.escalate?.(
         `Review round ${round.id} is INCOMPLETE`,
-        `coverage of the round's selected lenses, verification, source stability, or delivery proof did not complete. Host report (with execution facts): ${reportFile}`,
+        `coverage of the round's selected lenses, verification, source stability, or delivery proof did not complete. ` +
+        (hostReportWriteFailed !== null
+          ? `NOTE: the host-owned INCOMPLETE report could NOT be written (${hostReportWriteFailed}); the durable event carries the execution facts and the lead-authored report at perkins-report.md is the fallback record.`
+          : `Host report (with execution facts): ${reportFile}`),
         { jobId: job.id, roundId: round.id },
       );
     }
@@ -4217,7 +4295,7 @@ export class WaveRunner {
       headMoved: headMoved || (deliveryError !== undefined && refMovedSinceFreeze(frozenReview)),
     };
     } catch (error) {
-      return this.finalizationIncomplete(job, round, lenses, frozenReview, error);
+      return this.finalizationIncomplete(job, round, lenses, frozenReview, error, provisional);
     }
   }
 
@@ -4259,6 +4337,7 @@ export class WaveRunner {
     lenses: readonly PerkinsLens[],
     frozenReview: FrozenReview,
     error: unknown,
+    provisional?: { readonly results: readonly ReviewLensResult[]; readonly settledLenses: ReadonlySet<string> } | null,
   ): WaveOutcome {
     const detail = `Perkins finalization failed: ${String(error)}`.replace(/[\r\n]+/gu, ' ').slice(0, 500);
     try {
@@ -4313,9 +4392,23 @@ export class WaveRunner {
     } catch {
       // Unknown source state is fail-closed movement.
     }
+    // gh-169 P3: reconcile the RETURNED results with the chips that
+    // already committed. Lenses whose settled chips were recorded keep
+    // their provisional (truthful) results — no invented child failures;
+    // the rest classify by the ONE started set, exactly like abortRound.
+    const started = this.startedSpecialistLenses(round);
+    const interrupted = this.interruptedLensResults(round, lenses, detail);
+    const reconciled = lenses.map((lens, index) => {
+      const settledResult = provisional?.results[index];
+      return provisional !== null && provisional !== undefined && provisional.settledLenses.has(lens) && settledResult !== undefined
+        ? settledResult
+        : started.has(lens)
+          ? interrupted[index]!
+          : { state: 'error' as const, note: `not started — parent incident: ${detail}`.slice(0, 500) };
+    });
     return {
       round: this.opts.ledger.getRound(round.id) ?? { ...round, status: 'aborted' },
-      results: this.interruptedLensResults(round, lenses, detail),
+      results: reconciled,
       verdict: null,
       posted: false,
       canonicalVerdict: 'INCOMPLETE',
@@ -4325,22 +4418,33 @@ export class WaveRunner {
     };
   }
 
+  /** Lens accounting for a SETTLED review (gh-169 P3): settled lenses
+   * (real runs) commit their truthful chips immediately — their truth is
+   * independent of finalization. The not-used 'done' chips are COMMITTED
+   * SEPARATELY (only once the round records its verdict) so a later
+   * finalization failure aborts with never-started lenses still `pending`,
+   * exactly like every other parent abort — never a `done` chip on an
+   * aborted round claiming coverage that never executed. */
   private recordLensResults(
     round: RoundRecord,
     lenses: readonly PerkinsLens[],
     review: PerkinsWholeResult,
-  ): ReviewLensResult[] {
+  ): { readonly results: readonly ReviewLensResult[]; readonly settledLenses: ReadonlySet<string>; readonly unusedLenses: readonly PerkinsLens[] } {
     const results: ReviewLensResult[] = [];
+    const settledLenses = new Set<string>();
+    const unusedLenses: PerkinsLens[] = [];
     for (const lens of lenses) {
       const runs = review.specialistRuns.filter((run) => run.lens === lens);
       if (runs.length === 0) {
         // Whole-PR review: the lead owns the review; a lens it never used is
-        // a truthful 'not used', never missing required coverage.
+        // a truthful 'not used', never missing required coverage. The chip
+        // commit is deferred (see the doc comment).
         const note = 'not used — lead-owned whole-PR review';
-        this.opts.ledger.setLensOutcome(round.id, lens, 'done', note);
+        unusedLenses.push(lens);
         results.push({ state: 'done', verdict: 'clean', evidence: note });
         continue;
       }
+      settledLenses.add(lens);
       const failed = runs.filter((run) => run.status !== 'valid');
       if (failed.length === runs.length) {
         // Every attempt on this lens failed: honest execution error, named
@@ -4375,7 +4479,16 @@ export class WaveRunner {
       this.opts.ledger.setLensOutcome(round.id, lens, 'done', note);
       results.push({ state: 'done', verdict, evidence: note });
     }
-    return results;
+    return { results, settledLenses, unusedLenses };
+  }
+
+  /** Commit the deferred not-used chips once the round has durably
+   * recorded its verdict (gh-169 P3): only a terminalized round may show
+   * 'not used' coverage chips. */
+  private commitUnusedLensChips(round: RoundRecord, unusedLenses: readonly PerkinsLens[]): void {
+    for (const lens of unusedLenses) {
+      this.opts.ledger.setLensOutcome(round.id, lens, 'done', 'not used — lead-owned whole-PR review');
+    }
   }
 
   private lensVerdict(findings: readonly VerifiedFinding[]): 'blocker' | 'warning' | 'note' | 'clean' {
