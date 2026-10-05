@@ -146,15 +146,50 @@ export function reviewCard(jobs: readonly JobView[], now = Date.now()): HealthCa
 
 export function silasCard(silas: SilasView | null | undefined, now = Date.now()): HealthCardView {
   if (silas === null || silas === undefined) return notAvailable('silas', 'silas');
-  const value = silas.lastWakeAt === null ? 'no wakes yet' : `wake ${formatAge(silas.lastWakeAt, now)} ago`;
+  // Issue #163: the headline answers "is the loop alive?" with the
+  // reconciliation heartbeat, never the wake-start age alone — a healthy
+  // long model turn must not read as a stalled scheduler. A pass that
+  // FAILED after the last success is louder than every healthy state; the
+  // engine compares durable event ORDER, so same-millisecond passes cannot
+  // tie-break wrongly.
+  const failedNewer = silas.reconcileFailedNewer;
+  const value = failedNewer
+    ? `pass failed ${formatAge(silas.lastReconcileFailedAt, now)} ago`
+    : silas.openTurnSince !== null
+      ? `turn open ${formatAge(silas.openTurnSince, now)}`
+      : silas.lastReconcileAt !== null
+        ? `reconciled ${formatAge(silas.lastReconcileAt, now)} ago`
+        : silas.lastWakeAt === null
+          ? 'no wakes yet'
+          : `wake ${formatAge(silas.lastWakeAt, now)} ago`;
+  // An open turn must not hide whether the deterministic loop is still
+  // moving: the detail carries the reconcile freshness beside the count.
+  const detail =
+    silas.openTurnSince !== null && silas.lastReconcileAt !== null
+      ? `reconciled ${formatAge(silas.lastReconcileAt, now)} ago · ${silas.reconciliationsToday} machine actions today`
+      : `${silas.reconciliationsToday} machine actions today`;
+  const full = [
+    `last wake ${formatAge(silas.lastWakeAt, now)} ago (start marker)`,
+    `last reconcile ${silas.lastReconcileAt === null ? 'never' : `${formatAge(silas.lastReconcileAt, now)} ago`}`,
+    silas.lastReconcileFailedAt === null
+      ? 'no failed pass'
+      : `last failed pass ${formatAge(silas.lastReconcileFailedAt, now)} ago`,
+    silas.lastTickAt === null ? 'no ticks recorded' : `last tick ${formatAge(silas.lastTickAt, now)} ago`,
+    silas.openTurnSince === null ? 'no turn open' : `turn open ${formatAge(silas.openTurnSince, now)}`,
+    silas.lastUsefulActionAt === null
+      ? 'no corrective action yet'
+      : `last action ${formatAge(silas.lastUsefulActionAt, now)} ago`,
+    silas.nextAction === null ? 'no tracked obligation' : `next owed: ${silas.nextAction}`,
+    `${silas.reconciliationsToday} machine actions today`,
+  ].join(' · ');
   return card(
     'silas',
     'silas',
     value,
-    `${silas.reconciliationsToday} reconciliations today`,
-    'muted',
-    null,
-    `last Silas wake ${formatAge(silas.lastWakeAt, now)} ago (sweeps wake only on actionable work) · ${silas.reconciliationsToday} reconciliations today`,
+    detail,
+    failedNewer ? 'alert' : 'muted',
+    failedNewer ? 'FAILED' : null,
+    full,
   );
 }
 

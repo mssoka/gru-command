@@ -614,3 +614,50 @@ describe('pending re-brief terminal retirement (ledger boundary)', () => {
     expect(flagFor('job.delivered')).toBe(false);
   });
 });
+
+describe('ledger api — identity-corrected follow-through reads (issue #163)', () => {
+  function freshApi(): LedgerApi {
+    const db = new LedgerDb(tmpDir());
+    return new LedgerApi(db.handle, { bus: new EventBus() });
+  }
+
+  it('finds a request-correlated event behind a full window of same-kind events', () => {
+    const api = freshApi();
+    api.addJob({ id: 'job-buried', repo: 'demo', title: 't' });
+    const old = api.appendCustomEvent({
+      kind: 'job.delivered',
+      jobId: 'job-buried',
+      payload: { request_id: 'req-old' },
+    });
+    for (let i = 0; i < 1200; i += 1) {
+      api.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-buried', payload: { request_id: `req-${i}` } });
+    }
+    const found = api.latestJobEventByRequestId('job-buried', 'job.delivered', 'req-old');
+    expect(found?.seq).toBe(old.seq);
+    expect(api.latestJobEventByRequestId('job-buried', 'job.delivered', 'req-missing')).toBeNull();
+  });
+
+  it('reduces verification events per scope behind a flood of other scopes', () => {
+    const api = freshApi();
+    api.addJob({ id: 'job-scope-flood', repo: 'demo', title: 't' });
+    const full = api.appendCustomEvent({
+      kind: 'verification.completed',
+      jobId: 'job-scope-flood',
+      payload: { ok: false, scope: 'full', run_id: 'run-old' },
+    });
+    let latestFocused = full;
+    for (let i = 0; i < 600; i += 1) {
+      latestFocused = api.appendCustomEvent({
+        kind: 'verification.completed',
+        jobId: 'job-scope-flood',
+        payload: { ok: true, scope: 'focused', run_id: `run-${i}` },
+      });
+    }
+    const scoped = api.latestJobEventsByPayloadScope('job-scope-flood', ['verification.completed']);
+    const rows = scoped.map((event) => [event.payload, event.seq] as const);
+    const fullRow = rows.find(([payload]) => (payload as { scope?: string }).scope === 'full');
+    const focusedRow = rows.find(([payload]) => (payload as { scope?: string }).scope === 'focused');
+    expect(fullRow?.[1]).toBe(full.seq); // the older failure scope never ages out
+    expect(focusedRow?.[1]).toBe(latestFocused.seq);
+  });
+});

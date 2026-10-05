@@ -13,6 +13,17 @@ export interface Migration {
   readonly id: number;
   readonly name: string;
   readonly sql: string;
+  /**
+   * SQLite's standard table-rebuild procedure (create-new, copy, drop,
+   * rename) cannot satisfy an immediate FK while a dependent table still
+   * references the old table's rows. `foreign_keys` cannot be toggled
+   * inside a transaction, so the runner turns it off around this
+   * migration's transaction and runs `PRAGMA foreign_key_check` BEFORE
+   * COMMIT — a violation rolls the whole migration back loudly, so the
+   * window can never commit a broken graph. Set only for migrations that
+   * rebuild a table other tables reference.
+   */
+  readonly foreignKeysOff?: true;
 }
 
 /**
@@ -97,19 +108,37 @@ export class LedgerDb {
     for (const migration of [...migrations].sort((a, b) => a.id - b.id)) {
       if (applied.has(migration.id)) continue;
       this.log('info', 'ledger migration applying', { id: migration.id, name: migration.name });
-      this.db.exec('BEGIN');
+      // foreign_keys is a no-op mid-transaction: the rebuild flag must be
+      // applied BEFORE BEGIN and restored after COMMIT/ROLLBACK.
+      const foreignKeysOff = migration.foreignKeysOff === true;
+      if (foreignKeysOff) this.db.exec('PRAGMA foreign_keys = OFF');
       try {
-        this.db.exec(migration.sql);
-        this.db
-          .prepare('INSERT INTO schema_migrations (id, name, applied_at) VALUES (?, ?, ?)')
-          .run(migration.id, migration.name, new Date().toISOString());
-        this.db.exec('COMMIT');
-        ran += 1;
+        this.db.exec('BEGIN');
+        try {
+          this.db.exec(migration.sql);
+          if (foreignKeysOff) {
+            const violations = this.db.prepare('PRAGMA foreign_key_check').all();
+            if (violations.length > 0) {
+              throw new Error(
+                `migration left ${violations.length} foreign-key violation(s) — refusing to commit a broken graph`,
+              );
+            }
+          }
+          this.db
+            .prepare('INSERT INTO schema_migrations (id, name, applied_at) VALUES (?, ?, ?)')
+            .run(migration.id, migration.name, new Date().toISOString());
+          this.db.exec('COMMIT');
+          ran += 1;
+        } catch (error) {
+          this.db.exec('ROLLBACK');
+          throw error;
+        }
       } catch (error) {
-        this.db.exec('ROLLBACK');
         throw new Error(
           `ledger migration ${migration.id} (${migration.name}) failed: ${String(error)} — rolled back, nothing applied`,
         );
+      } finally {
+        if (foreignKeysOff) this.db.exec('PRAGMA foreign_keys = ON');
       }
     }
     if (ran === 0) {
@@ -593,21 +622,163 @@ export const MIGRATIONS: readonly Migration[] = [
     `,
   },
   {
+    // Sub-minions (issue #161): GC-owned child workers with tracked
+    // parentage, idempotent admission and durable results.
+    //
+    // - `agents.parent_agent_id` is the durable parent link on the child's
+    //   own agent row; `agents.parentage` is the honest category marker:
+    //   'child' (has a parent), 'top-level' (explicitly parentless),
+    //   NULL = legacy/unknown — never reparented from names or job patterns.
+    // - `child_workers` is the admission record AND the lifetime creation
+    //   counter: one row per LOGICAL child creation. The unique
+    //   (parent_agent_id, idempotency_key) index makes a duplicate or
+    //   lost-response retry replay the same row (payload-hash conflicts
+    //   fail loud), and session resumes/replacement sessions never insert
+    //   a second row. Counters are SQL aggregates over this table, so they
+    //   survive restart by construction.
+    // - `worktrees.kind` gains 'child' (a child lane's owner id is the
+    //   child agent id). SQLite cannot alter a CHECK constraint, so the
+    //   table is rebuilt in place; the runner's `foreignKeysOff` flag
+    //   disables foreign keys around this migration's transaction and
+    //   fails loud via `PRAGMA foreign_key_check` before COMMIT (see the
+    //   Migration interface), so the rebuild can never commit a broken
+    //   graph over worktree_processes' references.
+    //
+    // LANDING COLLISION (same convention as migrations 10-14): id 15 is a
+    // branch-local next-contiguous number for an UNSHIPPED feature; if
+    // owner-merged main lands first, re-number ONLY this never-applied
+    // migration (never a hole).
+    //
+    // UPGRADE NOTE (review rounds 2-3): this id was edited while the
+    // feature was still unmerged/unshipped. A ledger made by an
+    // intermediate commit of this branch (old id-15 shape) is upgraded by
+    // the additive migration 16, which backfills the child/agent binding
+    // and guarantees the lookup index; the retired capability column is
+    // retained here so fresh and upgraded schemas converge. No release
+    // build carried either intermediate shape.
+    id: 15,
+    name: 'child-workers',
+    // The worktrees table is rebuilt to widen its kind CHECK; the runner
+    // disables foreign keys around this migration and verifies with
+    // PRAGMA foreign_key_check before COMMIT (see Migration.foreignKeysOff).
+    foreignKeysOff: true,
+    sql: `
+      CREATE TABLE worktrees_new (
+        id         TEXT PRIMARY KEY,
+        kind       TEXT NOT NULL CHECK (kind IN ('job','review','child')),
+        repo_path  TEXT NOT NULL,
+        repo_name  TEXT NOT NULL,
+        path       TEXT NOT NULL UNIQUE,
+        branch     TEXT,
+        sha        TEXT NOT NULL,
+        job_id     TEXT REFERENCES jobs(id),
+        round_id   TEXT REFERENCES rounds(id),
+        status     TEXT NOT NULL CHECK (status IN ('active','paused','swept')),
+        note       TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        base_source TEXT CHECK (base_source IN ('origin','local-head-fallback'))
+      );
+      INSERT INTO worktrees_new
+        (id, kind, repo_path, repo_name, path, branch, sha, job_id, round_id, status, note, created_at, updated_at, base_source)
+        SELECT id, kind, repo_path, repo_name, path, branch, sha, job_id, round_id, status, note, created_at, updated_at, base_source
+          FROM worktrees;
+      DROP TABLE worktrees;
+      ALTER TABLE worktrees_new RENAME TO worktrees;
+      CREATE INDEX idx_worktrees_job ON worktrees(job_id);
+      CREATE INDEX idx_worktrees_round ON worktrees(round_id);
+      CREATE INDEX idx_worktrees_status ON worktrees(status);
+
+      ALTER TABLE agents ADD COLUMN parent_agent_id TEXT REFERENCES agents(id);
+      ALTER TABLE agents ADD COLUMN parentage TEXT CHECK (parentage IN ('top-level','child'));
+      CREATE INDEX idx_agents_parent ON agents(parent_agent_id);
+      -- RETIRED (issue #161 round 3): the parent capability is GC-mediated
+      -- (in-process native tools), so no bearer column is used by the
+      -- code. The column is retained in the schema so a ledger created by
+      -- an earlier, unshipped commit of this branch CONVERGES with a fresh
+      -- one (a later additive migration must never have to guess which
+      -- shape it is upgrading).
+      ALTER TABLE agents ADD COLUMN child_request_token_hash TEXT;
+
+      CREATE TABLE child_workers (
+        id              TEXT PRIMARY KEY,
+        agent_id        TEXT REFERENCES agents(id),
+        parent_agent_id TEXT NOT NULL REFERENCES agents(id),
+        job_id          TEXT NOT NULL REFERENCES jobs(id),
+        purpose         TEXT NOT NULL,
+        authority       TEXT NOT NULL CHECK (authority IN ('read-only','writer')),
+        task            TEXT NOT NULL,
+        label           TEXT,
+        idempotency_key TEXT NOT NULL,
+        payload_hash    TEXT NOT NULL,
+        state           TEXT NOT NULL CHECK (state IN ('queued','admitted','active','done','error','cancelled')),
+        worktree_id     TEXT,
+        branch          TEXT,
+        session_file    TEXT,
+        result_state    TEXT CHECK (result_state IN ('done','error','cancelled')),
+        result_summary  TEXT,
+        result_ref      TEXT,
+        created_at      TEXT NOT NULL,
+        admitted_at     TEXT,
+        started_at      TEXT,
+        finished_at     TEXT,
+        updated_at      TEXT NOT NULL,
+        UNIQUE (parent_agent_id, idempotency_key)
+      );
+      CREATE INDEX idx_child_workers_parent ON child_workers(parent_agent_id);
+      CREATE INDEX idx_child_workers_job ON child_workers(job_id);
+      CREATE INDEX idx_child_workers_state ON child_workers(state);
+      CREATE INDEX idx_child_workers_agent ON child_workers(agent_id);
+    `,
+  },
+  {
+    // Issue #161 round-3 convergence: an intermediate, unshipped commit of
+    // this branch created child_workers rows whose `agent_id` was bound
+    // later at spawn (a runtime-minted id) or left NULL. The final model
+    // makes `agent_id` equal the admission id from the start, so this
+    // additive migration backfills the unbound rows and guarantees the
+    // lookup index — a database made by EITHER pre-merge shape upgrades to
+    // the same final schema. (Migration 15 keeps the retired capability
+    // column for the same convergence reason; nothing reads it.)
+    id: 16,
+    name: 'child-workers-agent-binding',
+    sql: `
+      CREATE INDEX IF NOT EXISTS idx_child_workers_agent ON child_workers(agent_id);
+      -- The intermediate shape left unspawned rows with NO agent row at
+      -- all. Reconstruct the admission agent row BEFORE rebinding, or the
+      -- foreign key on child_workers.agent_id would reject the update.
+      INSERT INTO agents
+        (id, role, label, job_id, round_id, state, last_activity, session_file, parent_agent_id, parentage, created_at, updated_at)
+      SELECT cw.id, 'minion', cw.label, cw.job_id, NULL,
+             CASE cw.state
+               WHEN 'done' THEN 'idle'
+               WHEN 'error' THEN 'error'
+               WHEN 'cancelled' THEN 'disposed'
+               ELSE 'spawning'
+             END,
+             NULL, cw.session_file, cw.parent_agent_id, 'child', cw.created_at, cw.updated_at
+        FROM child_workers cw
+       WHERE cw.agent_id IS NULL
+         AND NOT EXISTS (SELECT 1 FROM agents a WHERE a.id = cw.id);
+      UPDATE child_workers SET agent_id = id WHERE agent_id IS NULL;
+    `,
+  },
+  {
     // Deliverable kind (owner directive 2026-10-04: no deferred jobs):
     // implementation lanes owe a PR; review jobs owe findings; artifact
     // and investigation jobs owe a verified handback. The Silas digest
     // uses this to stop classifying non-PR deliverables as PR-overdue.
-    id: 15,
-    name: 'e15-job-deliverable',
+    id: 17,
+    name: 'e17-job-deliverable',
     sql: `ALTER TABLE jobs ADD COLUMN deliverable TEXT;`,
   },
   {
-    // Parent relation (E16, round-3 finding 4): a reviewer job records
-    // the lane that commissioned it, so its delivery can re-arm the
-    // parent (collect findings, continue the cycle) instead of leaving
-    // the parent parked with no machine-visible follow-up.
-    id: 16,
-    name: 'e16-job-parent',
+    // Parent relation (round-3 finding 4): a reviewer job records the
+    // lane that commissioned it, so its delivery can re-arm the parent
+    // (collect findings, continue the cycle) instead of leaving the
+    // parent parked with no machine-visible follow-up.
+    id: 18,
+    name: 'e18-job-parent',
     sql: `ALTER TABLE jobs ADD COLUMN parent_job_id TEXT;`,
   },
 ];

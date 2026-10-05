@@ -430,3 +430,47 @@ See [REVIEW-INPUTS.md](./REVIEW-INPUTS.md) for the HTTP surface and
 [`src/review-inputs/amendments.ts`](../src/review-inputs/amendments.ts) for the
 renderer. Migration 14 is additive and carries the same landing-collision
 convention as migrations 10-13.
+
+### Tracked child workers (migration 15, issue #161)
+
+Two additive shapes make nested GC-managed workers first-class records:
+
+- **`agents.parent_agent_id` + `agents.parentage`** — the durable parent
+  link and the honest parentage category (`'top-level'` = explicitly
+  parentless, `'child'` = parented, `NULL` = legacy/unknown, never
+  reconstructed from names or job patterns). Indexed by
+  `idx_agents_parent`.
+- **`child_workers`** — the admission record AND the lifetime-creation
+  counter. Columns: `id` (the admission identity), `agent_id` (the
+  spawned session, bound after spawn), `parent_agent_id`, `job_id`,
+  `purpose`, `authority` (`read-only` | `writer`), `task`, `label`,
+  `idempotency_key` + `payload_hash` (UNIQUE `(parent_agent_id,
+  idempotency_key)`), `state` (`queued` → `admitted` → `active` →
+  `done` | `error` | `cancelled`), `worktree_id` + `branch`,
+  `session_file`, `result_state` + `result_summary` + `result_ref`, and
+  the lifecycle timestamps. A retry with the same key replays the same
+  row; a changed payload under the same key fails loud
+  (`ChildWorkerConflictError`). Session resumes and replacement sessions
+  never insert a second row.
+
+**Counter semantics (present + lifetime).** `LedgerApi.countChildWorkers`
+and `childCountsByParent` are SQL aggregates over these rows:
+`queued` = `state` is `queued` or `admitted` (a child whose lane exists
+but whose resident admission is still waiting is not active);
+`active` = a live session is running the task (`active`); `finished` =
+`done`/`error`/`cancelled`; `lifetimeCreations` = the ROW COUNT (one per
+logical child creation). Restart changes nothing — the aggregates are
+computed from the durable table, and event replay never touches them.
+
+`result_summary` carries the child's own final report on `done`, and the
+named failure/cancellation reason on `error`/`cancelled`; `result_ref`
+is the session transcript referenced by that result (never a bare null
+when a session existed).
+
+Migration 15 also rebuilds the `worktrees` table in place to admit
+`kind = 'child'` (a child lane's owner id is the child agent id; SQLite
+cannot alter a CHECK constraint). The migration declares
+`foreignKeysOff: true`, so the runner disables foreign keys around the
+rebuild transaction and verifies `PRAGMA foreign_key_check` BEFORE
+COMMIT — a violation rolls the whole migration back loudly. It carries
+the same landing-collision convention as migrations 10-14.

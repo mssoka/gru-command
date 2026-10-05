@@ -2,7 +2,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { hashToken, tokenConfigured, tokenMatches } from '../auth.js';
 import type { GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
-import type { LedgerApi, JobDeliverable } from '../ledger/api.js';
+import type { ChildWorkerRecord, JobDeliverable, LedgerApi } from '../ledger/api.js';
 import { AmbiguousDirectiveError, DirectiveConflictError, PhaseHandoffConflictError } from '../ledger/api.js';
 import { isJobTerminal } from '../ledger/states.js';
 import { parseCompletionHandoffIntent, type CompletionHandoffIntent } from '../ledger/obligations.js';
@@ -16,6 +16,7 @@ import { BranchBusyError } from './branch-idle.js';
 import { deliveredTargetSha } from './silas-driver.js';
 import type { WorktreePort } from './worktree-port.js';
 import type { PacingGate, RetrySettlement } from '../runtime/pacing.js';
+import { childRefusalStatus, type ChildWorkerService } from './child-workers.js';
 import { REVIEW_EVIDENCE_MAX_FILES, type ReviewEvidenceRequest } from '../review-inputs/evidence.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
@@ -58,6 +59,9 @@ export interface DispatchServerOptions {
    * covering a just-delivered directive/re-brief turn (supervisor-backed
    * in production). The route records delivered only for 'none'/'recovered'. */
   readonly retrySettlement?: (agentId: string) => Promise<RetrySettlement>;
+  /** Issue #161: tracked child workers. Absent = /api/dispatch/child*
+   * answers 503 (the child-worker subsystem is not hosted). */
+  readonly childWorkers?: ChildWorkerService;
   /** Absent = /api/silas/* answers 503 (silas ops not hosted). */
   readonly silasOps?: SilasOpsSurface;
   /** Book of Lessons injection for directives/re-briefs (pointers only). */
@@ -87,6 +91,34 @@ function strField(body: Record<string, unknown>, field: string): string {
 function optStrField(body: Record<string, unknown>, field: string): string | undefined {
   const value = body[field];
   return typeof value === 'string' && value.trim() !== '' ? value : undefined;
+}
+
+/** Issue #161: the wire shape of one tracked child worker (snake_case,
+ * like the rest of the dispatch API). */
+function childView(record: ChildWorkerRecord): Record<string, unknown> {
+  return {
+    id: record.id,
+    agent_id: record.agentId,
+    parent_agent_id: record.parentAgentId,
+    job_id: record.jobId,
+    purpose: record.purpose,
+    authority: record.authority,
+    task: record.task,
+    label: record.label,
+    idempotency_key: record.idempotencyKey,
+    state: record.state,
+    worktree_id: record.worktreeId,
+    branch: record.branch,
+    session_file: record.sessionFile,
+    result_state: record.resultState,
+    result_summary: record.resultSummary,
+    result_ref: record.resultRef,
+    created_at: record.createdAt,
+    admitted_at: record.admittedAt,
+    started_at: record.startedAt,
+    finished_at: record.finishedAt,
+    updated_at: record.updatedAt,
+  };
 }
 
 function optBoolField(body: Record<string, unknown>, field: string): boolean | undefined {
@@ -168,14 +200,25 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
   const inFlight = new Set<Promise<unknown>>();
   const directiveControllers = new Set<AbortController>();
 
+  function bearerToken(req: IncomingMessage): string | null {
+    const header = req.headers.authorization;
+    const match = typeof header === 'string' ? /^Bearer (.+)$/.exec(header.trim()) : null;
+    return match === null ? null : match[1] ?? null;
+  }
+
+  /**
+   * The pairing token is the ONLY HTTP authority for the child-worker
+   * routes. Issue #161's parent-facing surface is GC-mediated instead: a
+   * parent session gets the `request_child_worker` / `list_child_workers`
+   * / `cancel_child_worker` tools bound to its identity by closure, so no
+   * bearer secret is ever written into (or readable from) session space.
+   */
   function authed(req: IncomingMessage, res: ServerResponse): boolean {
     if (!configured) {
       json(res, 503, { error: 'not_configured', detail: 'no pairing token configured' });
       return false;
     }
-    const header = req.headers.authorization;
-    const match = typeof header === 'string' ? /^Bearer (.+)$/.exec(header.trim()) : null;
-    const token = match === null ? null : match[1] ?? null;
+    const token = bearerToken(req);
     if (token === null || !tokenMatches(token, tokenHash)) {
       json(res, 401, { error: 'unauthorized' });
       return false;
@@ -319,6 +362,48 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         });
       }
       json(res, 200, job);
+      return true;
+    }
+    // Issue #161: tracked child workers. The admission surface carries the
+    // parent agent id, job id, purpose, bounded task authority and a
+    // caller-supplied idempotency key; GC validates parent linkage before
+    // admission and answers named refusal preconditions. A replay with the
+    // same key returns the existing child (never a second worker).
+    if (req.method === 'POST' && path === '/api/dispatch/child') {
+      if (!authed(req, res)) return true;
+      const service = options.childWorkers;
+      if (service === undefined) {
+        json(res, 503, {
+          error: 'child_workers_not_hosted',
+          detail: 'the tracked child-worker subsystem is not wired on this service',
+        });
+        return true;
+      }
+      const body = await readBody(req);
+      // Raw (non-coerced) values reach the service's validator so EVERY
+      // refusal names the failed field/precondition — a missing field is
+      // `invalid_request` with the field name, never a generic parse fault.
+      const rawField = (field: string): string =>
+        typeof body[field] === 'string' ? (body[field] as string) : '';
+      try {
+        const admission = service.request({
+          parentAgentId: rawField('parent_agent_id'),
+          jobId: rawField('job_id'),
+          purpose: rawField('purpose'),
+          authority: rawField('authority'),
+          task: rawField('task'),
+          idempotencyKey: rawField('idempotency_key'),
+          ...(optStrField(body, 'label') !== undefined ? { label: optStrField(body, 'label') } : {}),
+        });
+        json(res, admission.idempotent ? 200 : 202, {
+          child: childView(admission.record),
+          idempotent: admission.idempotent,
+        });
+      } catch (error) {
+        const refusal = childRefusalStatus(error);
+        if (refusal === null) throw error;
+        json(res, refusal.status, { error: refusal.code, detail: refusal.detail });
+      }
       return true;
     }
     if (req.method === 'POST' && path === '/api/dispatch/review') {
@@ -473,6 +558,79 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         ...(ruleId !== undefined ? { rule_id: ruleId, source_round_id: sourceRoundId } : {}),
         status: outcome.round.status,
         lenses: outcome.round.lenses.map((chip) => chip.lens),
+      });
+      return true;
+    }
+    // Issue #161: the parent discovers its children (and their durable
+    // results) without correlating external ids: by job, by parent agent,
+    // or by one child id.
+    const childMatch = /^\/api\/dispatch\/children\/([^/]+)$/.exec(path);
+    if (req.method === 'GET' && childMatch !== null) {
+      const record = options.ledger.getChildWorker(decodeURIComponent(childMatch[1] ?? ''));
+      if (record === null) {
+        json(res, 404, { error: 'child_not_found', detail: 'no such tracked child worker' });
+        return true;
+      }
+      if (!authed(req, res)) return true;
+      json(res, 200, { child: childView(record) });
+      return true;
+    }
+    const childCancelMatch = /^\/api\/dispatch\/children\/([^/]+)\/cancel$/.exec(path);
+    if (req.method === 'POST' && childCancelMatch !== null) {
+      if (!configured) {
+        json(res, 503, { error: 'not_configured', detail: 'no pairing token configured' });
+        return true;
+      }
+      const service = options.childWorkers;
+      if (service === undefined) {
+        json(res, 503, {
+          error: 'child_workers_not_hosted',
+          detail: 'the tracked child-worker subsystem is not wired on this service',
+        });
+        return true;
+      }
+      if (!authed(req, res)) return true;
+      const childId = decodeURIComponent(childCancelMatch[1] ?? '');
+      const existing = options.ledger.getChildWorker(childId);
+      if (existing === null) {
+        json(res, 404, { error: 'child_not_found', detail: 'no such tracked child worker' });
+        return true;
+      }
+      const body = await readBody(req);
+      const reason = optStrField(body, 'reason') ?? 'cancelled by the owner';
+      try {
+        const record = await service.cancel(childId, reason);
+        json(res, 200, { child: childView(record) });
+      } catch (error) {
+        const refusal = childRefusalStatus(error);
+        if (refusal === null) throw error;
+        json(res, refusal.status, { error: refusal.code, detail: refusal.detail });
+      }
+      return true;
+    }
+    const jobChildrenMatch = /^\/api\/dispatch\/jobs\/([^/]+)\/children$/.exec(path);
+    if (req.method === 'GET' && jobChildrenMatch !== null) {
+      // The job-wide list is the OPERATOR view (a parent uses its own
+      // /agents/:id/children scope).
+      if (!authed(req, res)) return true;
+      const jobId = decodeURIComponent(jobChildrenMatch[1] ?? '');
+      if (options.ledger.getJob(jobId) === null) {
+        json(res, 404, { error: 'job_not_found', detail: `job "${jobId}" not found` });
+        return true;
+      }
+      json(res, 200, { children: options.ledger.listChildWorkers({ jobId }).map(childView) });
+      return true;
+    }
+    const agentChildrenMatch = /^\/api\/dispatch\/agents\/([^/]+)\/children$/.exec(path);
+    if (req.method === 'GET' && agentChildrenMatch !== null) {
+      const parentAgentId = decodeURIComponent(agentChildrenMatch[1] ?? '');
+      if (options.ledger.getAgent(parentAgentId) === null) {
+        json(res, 404, { error: 'agent_not_found', detail: `agent "${parentAgentId}" not found` });
+        return true;
+      }
+      if (!authed(req, res)) return true;
+      json(res, 200, {
+        children: options.ledger.listChildWorkers({ parentAgentId }).map(childView),
       });
       return true;
     }
@@ -711,6 +869,9 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
             ...(options.workerGate !== undefined ? { workerGate: options.workerGate } : {}),
             ...(options.retrySettlement !== undefined ? { retrySettlement: options.retrySettlement } : {}),
             ...(options.lessons !== undefined ? { lessons: options.lessons } : {}),
+            ...(options.childWorkers !== undefined
+              ? { parentTools: (agentId: string) => options.childWorkers!.parentTools(agentId) }
+              : {}),
           });
         } catch (error) {
           // The turn errored with no positive outcome. A prompt may or may
@@ -957,6 +1118,9 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           signal: controller.signal,
           ...(options.workerGate !== undefined ? { workerGate: options.workerGate } : {}),
           ...(options.retrySettlement !== undefined ? { retrySettlement: options.retrySettlement } : {}),
+          ...(options.childWorkers !== undefined
+            ? { parentTools: (agentId: string) => options.childWorkers!.parentTools(agentId) }
+            : {}),
           jobId,
           note,
           briefing: job.briefing,
@@ -1129,7 +1293,12 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       // Selection is listAgents order, as resolveEscalationAgent documents.
       const boundMinion =
         jobId !== undefined
-          ? options.ledger.listAgents().find((agent) => agent.jobId === jobId && agent.role === 'minion')
+          ? options.ledger
+              .listAgents()
+              .find(
+                (agent) =>
+                  agent.jobId === jobId && agent.role === 'minion' && agent.parentage !== 'child',
+              )
           : undefined;
       const notification = ops.notifications.post({
         kind: 'silas.escalation',

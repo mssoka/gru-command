@@ -7,7 +7,7 @@ import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { DispatchService } from '../src/dispatch/service.js';
 import { routeFixDirectiveToMinion, rebriefFreshMinion } from '../src/dispatch/fix-directive.js';
-import { PR_CREATION_RULE } from '../src/dispatch/pr-creation.js';
+import { appendWorkerRules } from '../src/dispatch/worker-rules.js';
 import { WorkerDisposalInProgressError } from '../src/runtime/worker-errors.js';
 import { PacingGate } from '../src/runtime/pacing.js';
 import { RuntimeRegistry } from '../src/runtime/registry.js';
@@ -200,6 +200,7 @@ describe('worker admission through directive deliveries', () => {
         ],
         registerAgent: (() => undefined) as unknown as LedgerApi['registerAgent'],
         getJob: (() => null) as unknown as LedgerApi['getJob'],
+        getAgent: () => null,
       },
       worktrees: { listWorktrees: () => [lane] } as unknown as WorktreePort,
       jobId: 'job-1',
@@ -212,7 +213,7 @@ describe('worker admission through directive deliveries', () => {
     expect(gate.view().worker.queued.map((entry) => entry.id)).toEqual(['job-1']);
     holder.release();
     await expect(routing).resolves.toMatchObject({ delivered: true, minionId: 'minion-1' });
-    expect(delivered).toEqual([`fix the lane\n\n${PR_CREATION_RULE}`]);
+    expect(delivered).toEqual([appendWorkerRules('fix the lane')]);
     expect(events).toEqual(['pacing.admitted', 'pacing.queued', 'pacing.admitted']);
     expect(gate.view().worker.running).toBe(0);
     expect(gate.view().worker.queued).toHaveLength(0);
@@ -239,6 +240,7 @@ describe('worker admission through directive deliveries', () => {
         ],
         registerAgent: (() => undefined) as unknown as LedgerApi['registerAgent'],
         getJob: (() => null) as unknown as LedgerApi['getJob'],
+        getAgent: () => null,
       },
       worktrees: { listWorktrees: () => [lane] } as unknown as WorktreePort,
       jobId: 'job-1',
@@ -259,7 +261,7 @@ describe('worker admission through directive deliveries', () => {
     expect(gate.view().worker.running).toBe(0);
     settleNow('recovered');
     await expect(routing).resolves.toMatchObject({ delivered: true, minionId: 'minion-1' });
-    expect(delivered).toEqual([`fix the lane\n\n${PR_CREATION_RULE}`]);
+    expect(delivered).toEqual([appendWorkerRules('fix the lane')]);
     expect(settleCalls).toBe(2); // pre-prompt interlock + post-prompt settlement
     expect(gate.view().worker.running).toBe(0);
   });
@@ -284,6 +286,7 @@ describe('worker admission through directive deliveries', () => {
         ],
         registerAgent: (() => undefined) as unknown as LedgerApi['registerAgent'],
         getJob: (() => null) as unknown as LedgerApi['getJob'],
+        getAgent: () => null,
       },
       worktrees: { listWorktrees: () => [lane] } as unknown as WorktreePort,
       jobId: 'job-1',
@@ -329,6 +332,7 @@ describe('worker admission through directive deliveries', () => {
         ],
         registerAgent: (() => undefined) as unknown as LedgerApi['registerAgent'],
         getJob: (() => null) as unknown as LedgerApi['getJob'],
+        getAgent: () => null,
       },
       worktrees: { listWorktrees: () => [lane] } as unknown as WorktreePort,
       jobId: 'job-1',
@@ -343,7 +347,7 @@ describe('worker admission through directive deliveries', () => {
     await expect(routing).resolves.toMatchObject({ delivered: true, minionId: 'minion-2' });
     // The evicted logical session is resumed — never a second writer on it.
     expect(spawned).toEqual([{ id: 'minion-2', resumeFile: '/tmp/minion-1.jsonl' }]);
-    expect(delivered).toEqual([`fix the lane\n\n${PR_CREATION_RULE}`]);
+    expect(delivered).toEqual([appendWorkerRules('fix the lane')]);
   });
 
   it('gates the fresh-minion fallback too: the spawn itself waits for a slot', async () => {
@@ -371,6 +375,7 @@ describe('worker admission through directive deliveries', () => {
         listAgents: () => [],
         registerAgent: (() => undefined) as unknown as LedgerApi['registerAgent'],
         getJob: (() => null) as unknown as LedgerApi['getJob'],
+        getAgent: () => null,
       },
       worktrees: { listWorktrees: () => [lane] } as unknown as WorktreePort,
       jobId: 'job-1',

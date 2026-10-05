@@ -48,7 +48,11 @@ export function resolveEscalationAgent(
   // a superseded-but-later-touched row stays job-correct. This seam
   // deliberately does not read supervision and must not grow an
   // unsupervised "current worker" guess (twelve-followthrough A2).
-  return ledger.listAgents().find((agent) => agent.jobId === jobId && agent.role === 'minion')?.id ?? null;
+  // Issue #161: a tracked child is NOT the lane's writer — primary-minion
+  // selection excludes children (legacy null parentage stays eligible).
+  return ledger
+    .listAgents()
+    .find((agent) => agent.jobId === jobId && agent.role === 'minion' && agent.parentage !== 'child')?.id ?? null;
 }
 
 /** The notification surface this seam writes through. */

@@ -61,8 +61,36 @@ export class InMemoryWorktreePort implements WorktreePort {
     );
   }
 
+  /** Issue #161: child lanes. Read-only children are detached at the
+   * parent lane's HEAD; writer children get their own branch. */
+  async createChildWorktree(input: {
+    repoPath: string;
+    jobId: string;
+    childId: string;
+    parentPath: string;
+    authority: 'read-only' | 'writer';
+  }): Promise<WorktreeLane> {
+    let baseRef = 'HEAD';
+    try {
+      baseRef = execFileSync('git', ['-C', input.parentPath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+    } catch {
+      // Non-git contract fixtures: the parent HEAD is not resolvable and
+      // the fabricated identity is retained.
+    }
+    return this.create(
+      'child',
+      input.repoPath,
+      input.childId,
+      input.jobId,
+      null,
+      input.authority === 'writer' ? `gru/${input.jobId}-child-${input.childId}` : null,
+      `sha-child-${baseRef}`,
+      baseRef,
+    );
+  }
+
   private create(
-    kind: 'job' | 'review',
+    kind: 'job' | 'review' | 'child',
     repoPath: string,
     id: string,
     jobId: string | null,
@@ -73,7 +101,7 @@ export class InMemoryWorktreePort implements WorktreePort {
   ): WorktreeLane {
     if (this.lanes.has(id)) throw new Error(`worktree "${id}" already exists`);
     const repoName = repoPath.split('/').filter(Boolean).pop() ?? repoPath;
-    const path = join(this.root, repoName, `${kind === 'job' ? 'job' : 'review'}-${id}`);
+    const path = join(this.root, repoName, `${kind}-${id}`);
     if (existsSync(path)) throw new Error(`worktree path already exists: ${path}`);
     let actualSha = sha;
     let isGitRepo = false;
@@ -85,8 +113,8 @@ export class InMemoryWorktreePort implements WorktreePort {
     }
     if (isGitRepo) {
       mkdirSync(dirname(path), { recursive: true });
-      const args = kind === 'job'
-        ? ['-C', repoPath, 'worktree', 'add', '-b', branch as string, path, gitRef]
+      const args = branch !== null
+        ? ['-C', repoPath, 'worktree', 'add', '-b', branch, path, gitRef]
         : ['-C', repoPath, 'worktree', 'add', '--detach', path, gitRef];
       execFileSync('git', args, { stdio: 'ignore' });
       actualSha = execFileSync('git', ['-C', path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();

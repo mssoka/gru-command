@@ -646,7 +646,7 @@ Full finding-by-finding triage and evidence: `/Users/moses/.gru-command/reviews/
 | 47 | blind | low | Reviewer briefs must bind the immutable head through the brief itself (dispatch branches from the origin default) → patch (the brief names the exact head SHA) |
 | 48 | blind, edge | low | Frozen spec block still prescribes the headless launcher with no inline supersession marker → patch (amendment marker placed outside the frozen block; frozen text untouched) |
 | 49 | blind, edge | medium | Baseline expected-RED was exit-code-only: a GREEN baseline would be recorded as scope success; the overlay claim was broader than the four overlaid files → patch (GREEN exits 4; overlay claim narrowed to the four files; the staged-tarball oracle is covered by the artifact scope + pre-change phrase-absence). The stricter JSON `numFailedTests>0` identity check was rejected (runner change; identity is read from the complete capture) |
-| 50 | blind | low | "Tracked as separate code work" had no pointers → patch (docs/FLOW §4f cites issues #160/#162/#163) |
+| 50 | blind | low | "Tracked as separate code work" had no pointers → patch (docs/FLOW §4g cites issues #160/#162/#163) |
 | 51 | blind | false, carried | renamed-catalog selector "not tied to a shipped path" — same class as row 34; no shipped selector exists, selection is prompt-level by design, and the intent forbids a new runtime → false (carried) |
 | 52 | blind | low | cross-surface wording drift (`substantive` vs `real repair`) → patch (aligned wording); no cross-surface meta-pin (redundant machinery) |
 | 53 | blind | low | "internal wait … its owner" overloaded owner with the human sense → patch ("its owning job or agent") |
@@ -835,7 +835,7 @@ bad_spec).
   #194); history-preserving merge `3fbfbf1` resolved conflicts
   keep-both (worktree.toml scopes — phase-split aligned for the j-829
   heavy classification; deferred-work entries; FLOW routing table;
-  ops-dispatch step 2+3). FLOW §4f updated: #159 shipped via PR #192;
+  ops-dispatch step 2+3). FLOW §4g (renumbered from §4f when main added §4e child workers) updated: #159 shipped via PR #192;
   #160/#162/#163 remain named. Semantic integration repair `2fa4d13`:
   PR #138's A7/V1 escalation table pinned the pre-correction fallback
   title (`clear to merge`); the table now pins this lane's r4-accepted

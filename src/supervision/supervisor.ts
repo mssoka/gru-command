@@ -333,7 +333,21 @@ export interface SupervisorOptions {
   /** Test seam: jitter over [0, capMs) added to each backoff delay (default
    * uniform random). Tests pin it for deterministic ladder-shape asserts. */
   readonly jitter?: (capMs: number) => number;
+  /**
+   * Late-bound per-agent restart specialization (issue #161): the child-
+   * worker subsystem is constructed after the supervisor, so this resolver
+   * is installed by a setter. Returning `undefined` = default restart;
+   * `{ options }` = restart with these spawn options (lane cwd, bounded
+   * tools, product-owned agent id); `{ refuse }` = do not restart (the
+   * owner has already terminalized the record honestly).
+   */
+  readonly restartPolicyFor?: (agentId: string, role: Role) => SupervisorRestartPolicy | undefined;
 }
+
+/** One restart specialization decision (see SupervisorOptions). */
+export type SupervisorRestartPolicy =
+  | { readonly options: SpawnOptions }
+  | { readonly refuse: string };
 
 export class Supervisor {
   private readonly cfg: SupervisionConfig;
@@ -349,6 +363,8 @@ export class Supervisor {
   private readonly workerGate: PacingGate | undefined;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly jitter: (capMs: number) => number;
+  /** Late-bound restart specialization (issue #161; see the option doc). */
+  private restartPolicyFor: (agentId: string, role: Role) => SupervisorRestartPolicy | undefined;
   private readonly agents = new Map<string, SupervisedAgent>();
   /** Durable stop truth for agents whose live record is gone (restart
    * hydration; code review 2026-10-04). viewFor falls back to this map. */
@@ -375,10 +391,18 @@ export class Supervisor {
     this.workerGate = opts.workerGate;
     this.sleep = opts.sleep ?? defaultSleep;
     this.jitter = opts.jitter ?? ((capMs: number) => Math.random() * capMs);
+    this.restartPolicyFor = opts.restartPolicyFor ?? (() => undefined);
     // Cadence: a quarter of the silence window, capped at 5 s so a tight
     // window still ticks promptly.
     this.tickMs = opts.tickMs ?? Math.min(this.cfg.turnSilenceMs / 4, 5_000);
     this.unsubscribeTap = this.registry.onAgentEvent((envelope) => this.onEnvelope(envelope));
+  }
+
+  /** Late-bound restart specialization (issue #161): the child-worker
+   * subsystem is built after the supervisor, so the policy is installed
+   * here. Returning undefined = default restart. */
+  setRestartPolicy(policy: (agentId: string, role: Role) => SupervisorRestartPolicy | undefined): void {
+    this.restartPolicyFor = policy;
   }
 
   /** Start the watchdog ticker. */
@@ -1770,13 +1794,32 @@ export class Supervisor {
 
       if (restartSlot !== null && restartSlot.generation !== restartGeneration) return;
 
+      // Issue #161: the owning subsystem may specialize or refuse a restart
+      // (a child worker must come back in ITS lane with ITS bounded tools —
+      // the default role spawn would widen a read-only child to writing and
+      // move it out of its worktree).
+      const policy = this.restartPolicyFor(agent.agentId, agent.role);
+      if (policy !== undefined && 'refuse' in policy) {
+        agent.state = 'stopped';
+        agent.stoppedAt = this.now();
+        this.log('warn', 'agent restart refused by its owning subsystem', {
+          agent_id: agent.agentId,
+          reason: policy.refuse,
+        });
+        return;
+      }
+
       // Respawn with resume (crash = resume, SPEC ruling 3).
       const resumeFile = agent.sessionFile;
       try {
+        const spawnOptions: SpawnOptions = {
+          ...(resumeFile !== null ? { resumeFile } : {}),
+          ...(policy !== undefined && 'options' in policy ? policy.options : {}),
+        };
         const spawned =
           restartSlot !== null
-            ? await restartSlot.spawn(resumeFile !== null ? { resumeFile } : {})
-            : await this.registry.spawn(agent.role, resumeFile !== null ? { resumeFile } : {});
+            ? await restartSlot.spawn(spawnOptions)
+            : await this.registry.spawn(agent.role, spawnOptions);
         if (
           this.disposed ||
           (restartSlot !== null &&

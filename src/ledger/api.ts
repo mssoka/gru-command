@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import type { DatabaseSync } from 'node:sqlite';
+import type { DatabaseSync, SQLInputValue } from 'node:sqlite';
 import type { BusEvent, EventBus } from '../events/bus.js';
 import type { Role } from '../config.js';
 import type { AgentState } from '../runtime/types.js';
@@ -183,6 +183,87 @@ export interface RoundRecord {
   readonly lenses: readonly LensChipRecord[];
 }
 
+/** Issue #161: the honest parentage category of an agent row. `child`
+ * means a durable parent link exists; `top-level` means the registering
+ * owner explicitly declared the session parentless; NULL means genuinely
+ * unknown (legacy rows written before child workers existed) — never
+ * reconstructed from names, jobs, or labels. */
+export type AgentParentage = 'top-level' | 'child';
+
+/** Issue #161: bounded task authority of a child worker. A `read-only`
+ * child is spawned with the read-only tool set and a detached lane; a
+ * `writer` child gets the minion write tools and its own named branch.
+ * A child never inherits or exceeds its parent's authority. */
+export const CHILD_WORKER_AUTHORITIES = ['read-only', 'writer'] as const;
+export type ChildWorkerAuthority = (typeof CHILD_WORKER_AUTHORITIES)[number];
+
+/** Issue #161 child lifecycle. `queued` = admitted and waiting for its
+ * lane; `admitted` = a lane exists and the spawn is waiting for resident
+ * budget admission; `active` = a live session is running the task;
+ * `done`/`error` are the terminal transport outcomes; `cancelled` is an
+ * explicit stop. */
+export const CHILD_WORKER_STATES = ['queued', 'admitted', 'active', 'done', 'error', 'cancelled'] as const;
+export type ChildWorkerState = (typeof CHILD_WORKER_STATES)[number];
+
+export function isChildWorkerState(value: string): value is ChildWorkerState {
+  return (CHILD_WORKER_STATES as readonly string[]).includes(value);
+}
+
+export function isChildWorkerAuthority(value: string): value is ChildWorkerAuthority {
+  return (CHILD_WORKER_AUTHORITIES as readonly string[]).includes(value);
+}
+
+/** Terminal child result outcomes. `done` is a successful terminal
+ * outcome (the run's own turn settled cleanly); it is NEVER inferred from
+ * a resolved prompt alone, a reconnect, or a session resume. */
+export const CHILD_RESULT_STATES = ['done', 'error', 'cancelled'] as const;
+export type ChildResultState = (typeof CHILD_RESULT_STATES)[number];
+
+/** One tracked child worker (issue #161). The row is 1:1 with the child's
+ * agent row and is also the durable admission + lifetime-creation record. */
+export interface ChildWorkerRecord {
+  /** The durable child-worker identity minted at admission. */
+  readonly id: string;
+  /** The spawned agent row (null while queued — no session exists yet). */
+  readonly agentId: string | null;
+  readonly parentAgentId: string;
+  readonly jobId: string;
+  readonly purpose: string;
+  readonly authority: ChildWorkerAuthority;
+  readonly task: string;
+  readonly label: string | null;
+  readonly idempotencyKey: string;
+  readonly payloadHash: string;
+  readonly state: ChildWorkerState;
+  readonly worktreeId: string | null;
+  readonly branch: string | null;
+  readonly sessionFile: string | null;
+  readonly resultState: ChildResultState | null;
+  /** The child's own final report text, captured from its session at
+   * terminal settle (never fabricated). Null when extraction failed. */
+  readonly resultSummary: string | null;
+  /** Durable reference for the result: the child's session file. */
+  readonly resultRef: string | null;
+  readonly createdAt: string;
+  readonly admittedAt: string | null;
+  readonly startedAt: string | null;
+  readonly finishedAt: string | null;
+  readonly updatedAt: string;
+}
+
+/** Counters over child_workers rows. `queued` includes `admitted` (lane
+ * exists, resident admission still waiting); `active` means a live
+ * session is running. `lifetimeCreations` counts ROWS — one per logical
+ * child creation — so idempotent retries, session resumes and
+ * replacement sessions can never double-count, and no total is ever
+ * inferred from labels or events. */
+export interface ChildWorkerCounts {
+  readonly queued: number;
+  readonly active: number;
+  readonly finished: number;
+  readonly lifetimeCreations: number;
+}
+
 export interface AgentRecord {
   readonly id: string;
   readonly role: Role;
@@ -192,6 +273,10 @@ export interface AgentRecord {
   readonly state: AgentState;
   readonly lastActivity: string | null;
   readonly sessionFile: string | null;
+  /** Issue #161 durable parent link (null for top-level and legacy rows). */
+  readonly parentAgentId: string | null;
+  /** Issue #161 parentage category; null = unknown (legacy row). */
+  readonly parentage: AgentParentage | null;
   readonly createdAt: string;
   readonly updatedAt: string;
 }
@@ -326,6 +411,16 @@ export class PhaseHandoffConflictError extends Error {
   }
 }
 
+/** A child-worker idempotency key was reused with a DIFFERENT canonical
+ * payload. The admitted request is immutable; a changed request needs a
+ * new key — never a silent replacement of the tracked child. */
+export class ChildWorkerConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ChildWorkerConflictError';
+  }
+}
+
 /** One durable follow-through obligation (current state; full history is
  * the events table). See src/ledger/obligations.ts for the vocabulary. */
 export interface ObligationRecord {
@@ -373,7 +468,7 @@ export interface ObligationRecord {
 // paths only, never id-proximity or labels).
 // ------------------------------------------------------------------
 
-export const WORKTREE_KINDS = ['job', 'review'] as const;
+export const WORKTREE_KINDS = ['job', 'review', 'child'] as const;
 export type WorktreeKind = (typeof WORKTREE_KINDS)[number];
 
 export const WORKTREE_STATUSES = ['active', 'paused', 'swept'] as const;
@@ -778,12 +873,55 @@ export class LedgerApi {
     ).map((row) => this.eventFromRow(row));
   }
 
+  /** True while any verification RUN for the job is unsettled: its latest
+   * open lifecycle event (`requested`/`started`) is newer than the latest
+   * settlement for that SAME run id. Identity-scoped and window-free — one
+   * run's completion never resolves another run, and a long activity tail
+   * can never hide an open run. `verification.attached` settles nothing
+   * (issue #159). */
+  hasUnsettledVerificationRun(jobId: string): boolean {
+    const row = this.db
+      .prepare(
+        `SELECT 1 AS unsettled FROM (
+           SELECT json_extract(payload, '$.run_id') AS run_id,
+                  MAX(CASE WHEN kind IN ('verification.requested', 'verification.started') THEN seq ELSE 0 END) AS open_seq,
+                  MAX(CASE WHEN kind IN ('verification.completed', 'verification.stale-released', 'verification.reconciled', 'verification.lock-timeout') THEN seq ELSE 0 END) AS settled_seq
+           FROM events
+           WHERE job_id = ? AND kind IN (
+             'verification.requested', 'verification.started', 'verification.completed',
+             'verification.stale-released', 'verification.reconciled', 'verification.lock-timeout'
+           )
+           GROUP BY run_id
+         ) WHERE open_seq > settled_seq LIMIT 1`,
+      )
+      .get(jobId) as Row | undefined;
+    return row !== undefined;
+  }
+
   /** Latest durable event for one job/kind (ops follow-through checks). */
   latestJobEvent(jobId: string, kind: string): EventRecord | null {
     const row = this.db
       .prepare('SELECT * FROM events WHERE job_id = ? AND kind = ? ORDER BY seq DESC LIMIT 1')
       .get(jobId, kind) as Row | undefined;
     return row === undefined ? null : this.eventFromRow(row);
+  }
+
+  /** Job events restricted to an explicit kind set (newest first). Digest
+   * and reconcile read paths use it so unrelated job traffic cannot push
+   * the observed kind out of a fixed newest-N window. */
+  listJobEventsByKinds(
+    jobId: string,
+    kinds: readonly string[],
+    opts: { limit?: number } = {},
+  ): readonly EventRecord[] {
+    if (kinds.length === 0) throw new Error('listJobEventsByKinds requires at least one kind');
+    const limit = opts.limit ?? 200;
+    const placeholders = kinds.map(() => '?').join(', ');
+    return (
+      this.db
+        .prepare(`SELECT * FROM events WHERE job_id = ? AND kind IN (${placeholders}) ORDER BY seq DESC LIMIT ?`)
+        .all(jobId, ...(kinds as string[]), limit) as Row[]
+    ).map((row) => this.eventFromRow(row));
   }
 
   /** A marked request's guarded event, however many newer unrelated job
@@ -794,6 +932,78 @@ export class LedgerApi {
        AND json_extract(payload, '$.phase_id') = ? ORDER BY seq DESC LIMIT 1`,
     ).get(jobId, kind, baselineSeq, phaseId) as Row | undefined;
     return row === undefined ? null : this.eventFromRow(row);
+  }
+
+  /** A request-correlated event by identity, not recency: the correlated
+   * receipt is found however many newer same-kind events carry other
+   * request ids (restart-safe admission/delivery reconciliation). */
+  latestJobEventByRequestId(
+    jobId: string,
+    kind: string,
+    requestId: string,
+    opts: { sinceSeq?: number } = {},
+  ): EventRecord | null {
+    if (requestId.trim() === '') throw new Error('latestJobEventByRequestId requires a non-empty requestId');
+    const row = this.db
+      .prepare(
+        `SELECT * FROM events WHERE job_id = ? AND kind = ? AND seq > ?
+         AND json_extract(payload, '$.request_id') = ? ORDER BY seq DESC LIMIT 1`,
+      )
+      .get(jobId, kind, opts.sinceSeq ?? -1, requestId) as Row | undefined;
+    return row === undefined ? null : this.eventFromRow(row);
+  }
+
+  /** The newest event per (kind, scope) for a job. The verification
+   * follow-through reduction rides this so an unresolved scope can never
+   * age out behind newer traffic from other scopes (no newest-N window). */
+  latestJobEventsByPayloadScope(
+    jobId: string,
+    kinds: readonly string[],
+  ): readonly EventRecord[] {
+    if (kinds.length === 0) throw new Error('latestJobEventsByPayloadScope requires at least one kind');
+    // One grouped pass over the job's events (no per-row correlated MAX)
+    // and NO cap: the result set is one row per (kind, scope), bounded by
+    // the configured scope set, so an older unresolved scope can never be
+    // dropped by a newest-N cutoff.
+    const placeholders = kinds.map(() => '?').join(', ');
+    const rows = this.db
+      .prepare(
+        `SELECT e.* FROM events e
+          WHERE e.seq IN (
+            SELECT MAX(s.seq) FROM events s
+             WHERE s.job_id = ? AND s.kind IN (${placeholders})
+             GROUP BY s.kind, json_extract(s.payload, '$.scope')
+          )
+          ORDER BY e.seq DESC`,
+      )
+      .all(jobId, ...(kinds as string[])) as Row[];
+    return rows.map((row) => this.eventFromRow(row));
+  }
+
+  /** Does a job event of one of these kinds exist after `sinceSeq` with
+   * EXACT payload key/value matches for every pair? The identity check for
+   * retirement fences: a matching fingerprint/head/scope/request is found
+   * no matter how much newer same-kind traffic carries other identities. */
+  hasJobEventWithPayloadValues(
+    jobId: string,
+    kinds: readonly string[],
+    values: readonly { readonly key: string; readonly value: string }[],
+    sinceSeq: number,
+  ): boolean {
+    if (kinds.length === 0) throw new Error('hasJobEventWithPayloadValues requires at least one kind');
+    if (values.length === 0) throw new Error('hasJobEventWithPayloadValues requires at least one payload match');
+    const placeholders = kinds.map(() => '?').join(', ');
+    const matches = values.map(() => `json_extract(payload, '$.' || ?) = ?`).join(' AND ');
+    const params: unknown[] = [jobId, ...(kinds as string[]), sinceSeq];
+    for (const { key, value } of values) params.push(key, value);
+    const row = this.db
+      .prepare(
+        `SELECT 1 AS found FROM events
+          WHERE job_id = ? AND kind IN (${placeholders}) AND seq > ? AND ${matches}
+          LIMIT 1`,
+      )
+      .get(...(params as never[])) as Row | undefined;
+    return row !== undefined;
   }
 
   /** Newest event among an explicit kind set (board health cards: the
@@ -837,6 +1047,18 @@ export class LedgerApi {
   // Jobs
   // ------------------------------------------------------------------
 
+  /** Cached jobs-table column set (upgrade tests open handles on older
+   *  migration prefixes; the API must keep working there). */
+  private jobsColumnCache: Set<string> | null = null;
+
+  private jobsColumns(): Set<string> {
+    if (this.jobsColumnCache === null) {
+      const rows = this.db.prepare('PRAGMA table_info(jobs)').all() as Array<{ name?: unknown }>;
+      this.jobsColumnCache = new Set(rows.map((row) => String(row.name)));
+    }
+    return this.jobsColumnCache;
+  }
+
   addJob(input: {
     id: string;
     repo: string;
@@ -855,15 +1077,35 @@ export class LedgerApi {
         throw new Error(`job "${input.id}" already exists`);
       }
       const ts = nowIso();
-      this.db
-        .prepare(
-          `INSERT INTO jobs (id, repo, title, status, base_branch, pr_url, note, briefing, deliverable, parent_job_id, created_at, updated_at)
-           VALUES (?, ?, ?, 'dispatched', ?, NULL, NULL, ?, ?, ?, ?, ?)`,
-        )
-        .run(
-          input.id, input.repo, input.title, input.baseBranch ?? null, input.briefing ?? null,
-          input.deliverable ?? null, input.parentJobId ?? null, ts, ts,
-        );
+      // Schema-tolerant insert: upgrade tests open LedgerApi handles on
+      // deliberately older migration prefixes (a database that predates
+      // E17/E18 has neither column). Writing through such a handle keeps
+      // working — the new fields simply cannot be persisted there.
+      const columns = this.jobsColumns();
+      const columnList = [
+        'id', 'repo', 'title', 'status', 'base_branch', 'pr_url', 'note', 'briefing',
+        ...(columns.has('deliverable') ? ['deliverable'] : []),
+        ...(columns.has('parent_job_id') ? ['parent_job_id'] : []),
+        'created_at', 'updated_at',
+      ];
+      const valueFor = (column: string): unknown => {
+        switch (column) {
+          case 'id': return input.id;
+          case 'repo': return input.repo;
+          case 'title': return input.title;
+          case 'base_branch': return input.baseBranch ?? null;
+          case 'pr_url': return null;
+          case 'note': return null;
+          case 'briefing': return input.briefing ?? null;
+          case 'deliverable': return input.deliverable ?? null;
+          case 'parent_job_id': return input.parentJobId ?? null;
+          default: return ts;
+        }
+      };
+      const sql =
+        `INSERT INTO jobs (${columnList.join(', ')}) VALUES (` +
+        columnList.map((column) => (column === 'status' ? "'dispatched'" : '?')).join(', ') + ')';
+      this.db.prepare(sql).run(...columnList.filter((column) => column !== 'status').map((column) => valueFor(column) as SQLInputValue));
       this.appendEvent({ kind: 'job.created', jobId: input.id, payload: { repo: input.repo, title: input.title } });
       return this.getJob(input.id) as JobRecord;
     });
@@ -1281,6 +1523,9 @@ export class LedgerApi {
     if (input.kind === 'review' && (input.roundId === null || input.roundId === undefined)) {
       throw new Error(`worktree "${input.id}" of kind 'review' requires its owning round id`);
     }
+    if (input.kind === 'child' && (input.jobId === null || input.jobId === undefined)) {
+      throw new Error(`worktree "${input.id}" of kind 'child' requires its owning job id`);
+    }
     if (input.jobId !== null && input.jobId !== undefined && this.getJob(input.jobId) === null) {
       throw new RecordNotFound(`job "${input.jobId}" not found — a worktree lane belongs to a real job`);
     }
@@ -1655,30 +1900,62 @@ export class LedgerApi {
     jobId?: string | null;
     roundId?: string | null;
     sessionFile?: string | null;
+    /** Issue #161: the durable parent link for a child worker. When set,
+     * the row's parentage is `child` and the parent must already exist. */
+    parentAgentId?: string | null;
+    /** Issue #161: explicit parentage for a known-parentless session.
+     * Omitted (with no parent link) leaves parentage NULL — genuinely
+     * unknown, never a fabricated top-level declaration. */
+    parentage?: AgentParentage | null;
   }): AgentRecord {
     if (input.id === '') throw new Error('agent id must be non-empty');
+    if (input.parentAgentId !== undefined && input.parentAgentId !== null && input.parentAgentId === '') {
+      throw new Error('parent agent id must be non-empty when declared');
+    }
+    if (input.parentage !== undefined && input.parentage !== null &&
+        input.parentage !== 'top-level' && input.parentage !== 'child') {
+      throw new Error(`unknown agent parentage "${String(input.parentage)}" (valid: top-level, child)`);
+    }
+    if (input.parentAgentId !== undefined && input.parentAgentId !== null &&
+        input.parentage !== undefined && input.parentage !== null && input.parentage !== 'child') {
+      throw new Error('a parent link declares parentage "child" — parentage and parent link disagree');
+    }
     return this.transaction(() => {
       const existing = this.getAgent(input.id);
       const ts = nowIso();
+      if (input.parentAgentId !== undefined && input.parentAgentId !== null && existing === null && this.getAgent(input.parentAgentId) === null) {
+        throw new RecordNotFound(`parent agent "${input.parentAgentId}" not found — a child row needs a real parent`);
+      }
+      const parentAgentId = input.parentAgentId !== undefined && input.parentAgentId !== null
+        ? input.parentAgentId
+        : (existing?.parentAgentId ?? null);
+      const declaredParentage: AgentParentage | null = parentAgentId !== null
+        ? 'child'
+        : (input.parentage !== undefined ? input.parentage : (existing?.parentage ?? null));
       if (existing === null) {
         this.db
           .prepare(
-            `INSERT INTO agents (id, role, label, job_id, round_id, state, last_activity, session_file, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, 'spawning', NULL, ?, ?, ?)`,
+            `INSERT INTO agents (id, role, label, job_id, round_id, state, last_activity, session_file, parent_agent_id, parentage, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, 'spawning', NULL, ?, ?, ?, ?, ?)`,
           )
-          .run(input.id, input.role, input.label ?? null, input.jobId ?? null, input.roundId ?? null, input.sessionFile ?? null, ts, ts);
+          .run(input.id, input.role, input.label ?? null, input.jobId ?? null, input.roundId ?? null, input.sessionFile ?? null, parentAgentId, declaredParentage, ts, ts);
         this.appendEvent({
           kind: 'agent.spawned',
           agentId: input.id,
           jobId: input.jobId ?? null,
           roundId: input.roundId ?? null,
-          payload: { role: input.role, label: input.label ?? null },
+          payload: {
+            role: input.role,
+            label: input.label ?? null,
+            ...(parentAgentId !== null ? { parentAgentId } : {}),
+          },
         });
       } else {
         this.db
           .prepare(
             `UPDATE agents SET role = ?, label = COALESCE(?, label), job_id = COALESCE(?, job_id),
-             round_id = COALESCE(?, round_id), session_file = COALESCE(?, session_file), updated_at = ? WHERE id = ?`,
+             round_id = COALESCE(?, round_id), session_file = COALESCE(?, session_file),
+             parent_agent_id = COALESCE(?, parent_agent_id), parentage = COALESCE(?, parentage), updated_at = ? WHERE id = ?`,
           )
           .run(
             input.role,
@@ -1686,6 +1963,8 @@ export class LedgerApi {
             input.jobId ?? null,
             input.roundId ?? null,
             input.sessionFile ?? null,
+            parentAgentId,
+            declaredParentage,
             ts,
             input.id,
           );
@@ -1805,6 +2084,343 @@ export class LedgerApi {
       this.appendEvent({ kind: 'agent.attached', agentId, jobId: round.jobId, roundId, payload: { roundId } });
       return this.getAgent(agentId) as AgentRecord;
     });
+  }
+
+  // ------------------------------------------------------------------
+  // Tracked child workers (issue #161)
+  // ------------------------------------------------------------------
+
+  /**
+   * Idempotent admission of one LOGICAL child worker. The child's agent
+   * row and its child_workers admission row land in ONE transaction, so
+   * a crash can never strand a child identity without its admission
+   * record (or vice versa). A retry with the same (parent, idempotency
+   * key) replays the existing child; the same key with a different
+   * canonical payload fails loud (`ChildWorkerConflictError`) and never
+   * replaces the admitted request. The payload hash is computed HERE
+   * from the canonical fields — callers cannot desynchronize it.
+   *
+   * Structural invariants enforced at this boundary (not just at the
+   * HTTP edge): the parent exists and is not itself a child (recursive
+   * fanout is bounded — children never spawn children), the parent's
+   * job binding matches the declared job, and the job is not terminal
+   * (an expired lane admits no fresh worker).
+   */
+  admitChildWorker(input: {
+    id: string;
+    parentAgentId: string;
+    jobId: string;
+    purpose: string;
+    authority: ChildWorkerAuthority;
+    task: string;
+    label?: string | null;
+    idempotencyKey: string;
+  }): { readonly record: ChildWorkerRecord; readonly idempotent: boolean } {
+    for (const [field, value] of [
+      ['child agent id', input.id],
+      ['parent agent id', input.parentAgentId],
+      ['job id', input.jobId],
+      ['purpose', input.purpose],
+      ['task', input.task],
+      ['idempotency key', input.idempotencyKey],
+    ] as const) {
+      if (value.trim() === '') throw new Error(`child worker ${field} must be non-empty`);
+    }
+    if (!isChildWorkerAuthority(input.authority)) {
+      throw new Error(
+        `unknown child worker authority "${String(input.authority)}" (valid: ${CHILD_WORKER_AUTHORITIES.join(', ')})`,
+      );
+    }
+    const payload = JSON.stringify({
+      parent_agent_id: input.parentAgentId,
+      job_id: input.jobId,
+      purpose: input.purpose,
+      authority: input.authority,
+      task: input.task,
+      label: input.label ?? null,
+    });
+    const payloadHash = createHash('sha256').update(payload).digest('hex');
+    return this.transaction(() => {
+      const existing = this.db
+        .prepare('SELECT * FROM child_workers WHERE parent_agent_id = ? AND idempotency_key = ?')
+        .get(input.parentAgentId, input.idempotencyKey) as Row | undefined;
+      if (existing !== undefined) {
+        if (str(existing.payload_hash) !== payloadHash) {
+          throw new ChildWorkerConflictError(
+            `idempotency key "${input.idempotencyKey}" was already admitted for parent ` +
+              `"${input.parentAgentId}" with a different payload — the admitted request is immutable`,
+          );
+        }
+        return { record: this.childWorkerFromRow(existing), idempotent: true };
+      }
+      const parent = this.getAgent(input.parentAgentId);
+      if (parent === null) {
+        throw new RecordNotFound(`parent agent "${input.parentAgentId}" not found — a child needs a real parent`);
+      }
+      if (parent.parentage === 'child' || parent.parentAgentId !== null) {
+        throw new ChildWorkerConflictError(
+          `parent agent "${parent.id}" is itself a child worker — children never spawn children`,
+        );
+      }
+      if (parent.jobId !== null && parent.jobId !== input.jobId) {
+        throw new ChildWorkerConflictError(
+          `parent agent "${parent.id}" is bound to job "${parent.jobId}", not "${input.jobId}"`,
+        );
+      }
+      const job = this.getJob(input.jobId);
+      if (job === null) {
+        throw new RecordNotFound(`job "${input.jobId}" not found — a child worker belongs to a real job`);
+      }
+      if (isJobTerminal(job.status)) {
+        throw new ChildWorkerConflictError(
+          `job "${input.jobId}" is ${job.status} — an expired lane admits no fresh child worker`,
+        );
+      }
+      const ts = nowIso();
+      // The child's agent row is written AT admission with its product-
+      // owned id, so the durable identity (agent row, child record and
+      // lane) exists before any session — a queued child is visible on
+      // the board and can be navigated to immediately. The spawn binds
+      // the session FILE, never a new identity (SpawnOptions.agentId).
+      this.db
+        .prepare(
+          `INSERT INTO agents (id, role, label, job_id, round_id, state, last_activity, session_file, parent_agent_id, parentage, created_at, updated_at)
+           VALUES (?, 'minion', ?, ?, NULL, 'spawning', NULL, NULL, ?, 'child', ?, ?)`,
+        )
+        .run(
+          input.id,
+          input.label ?? `child of ${input.parentAgentId}`,
+          input.jobId,
+          input.parentAgentId,
+          ts,
+          ts,
+        );
+      this.db
+        .prepare(
+          `INSERT INTO child_workers
+             (id, agent_id, parent_agent_id, job_id, purpose, authority, task, label, idempotency_key,
+              payload_hash, state, worktree_id, branch, session_file, result_state, result_summary,
+              result_ref, created_at, admitted_at, started_at, finished_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', NULL, NULL, NULL, NULL, NULL, NULL, ?, NULL, NULL, NULL, ?)`,
+        )
+        .run(
+          input.id,
+          input.id,
+          input.parentAgentId,
+          input.jobId,
+          input.purpose,
+          input.authority,
+          input.task,
+          input.label ?? null,
+          input.idempotencyKey,
+          payloadHash,
+          ts,
+          ts,
+        );
+      this.appendEvent({
+        kind: 'agent.spawned',
+        agentId: input.id,
+        jobId: input.jobId,
+        payload: { role: 'minion', label: input.label ?? null, parentAgentId: input.parentAgentId },
+      });
+      this.appendEvent({
+        kind: 'child.queued',
+        agentId: input.id,
+        jobId: input.jobId,
+        payload: {
+          childId: input.id,
+          parentAgentId: input.parentAgentId,
+          purpose: input.purpose,
+          authority: input.authority,
+          idempotencyKey: input.idempotencyKey,
+        },
+      });
+      return { record: this.getChildWorker(input.id) as ChildWorkerRecord, idempotent: false };
+    });
+  }
+
+  getChildWorker(id: string): ChildWorkerRecord | null {
+    const row = this.db.prepare('SELECT * FROM child_workers WHERE id = ?').get(id) as Row | undefined;
+    return row === undefined ? null : this.childWorkerFromRow(row);
+  }
+
+  /** The child record owned by an agent id (the supervision restart policy
+   * resolver keys on this; null = not a tracked child). */
+  childWorkerByAgent(agentId: string): ChildWorkerRecord | null {
+    const row = this.db
+      .prepare('SELECT * FROM child_workers WHERE agent_id = ? ORDER BY created_at DESC LIMIT 1')
+      .get(agentId) as Row | undefined;
+    return row === undefined ? null : this.childWorkerFromRow(row);
+  }
+
+  listChildWorkers(
+    opts: { jobId?: string; parentAgentId?: string; state?: ChildWorkerState } = {},
+  ): readonly ChildWorkerRecord[] {
+    if (opts.state !== undefined && !isChildWorkerState(opts.state)) {
+      throw new Error(`unknown child worker state "${opts.state}"`);
+    }
+    const clauses: string[] = [];
+    const values: string[] = [];
+    if (opts.jobId !== undefined) {
+      clauses.push('job_id = ?');
+      values.push(opts.jobId);
+    }
+    if (opts.parentAgentId !== undefined) {
+      clauses.push('parent_agent_id = ?');
+      values.push(opts.parentAgentId);
+    }
+    if (opts.state !== undefined) {
+      clauses.push('state = ?');
+      values.push(opts.state);
+    }
+    const where = clauses.length === 0 ? '' : ` WHERE ${clauses.join(' AND ')}`;
+    const rows = this.db
+      .prepare(`SELECT * FROM child_workers${where} ORDER BY created_at, id`)
+      .all(...values) as Row[];
+    return rows.map((row) => this.childWorkerFromRow(row));
+  }
+
+  /** The child's lane exists and its spawn is starting. */
+  markChildAdmitted(id: string, input: { worktreeId: string; branch: string | null }): ChildWorkerRecord {
+    return this.transaction(() => {
+      const record = this.getChildWorker(id);
+      if (record === null) throw new RecordNotFound(`child worker "${id}" not found`);
+      if (record.state !== 'queued') {
+        throw new ChildWorkerConflictError(
+          `child worker "${id}" is ${record.state} — only a queued child can be admitted`,
+        );
+      }
+      const ts = nowIso();
+      this.db
+        .prepare(
+          `UPDATE child_workers SET state = 'admitted', worktree_id = ?, branch = ?, admitted_at = ?, updated_at = ? WHERE id = ?`,
+        )
+        .run(input.worktreeId, input.branch, ts, ts, id);
+      this.appendEvent({
+        kind: 'child.admitted',
+        agentId: record.agentId,
+        jobId: record.jobId,
+        payload: { childId: id, worktreeId: input.worktreeId, branch: input.branch },
+      });
+      return this.getChildWorker(id) as ChildWorkerRecord;
+    });
+  }
+
+  /** A live child session is running the task. */
+  markChildStarted(id: string, input: { sessionFile: string | null }): ChildWorkerRecord {
+    return this.transaction(() => {
+      const record = this.getChildWorker(id);
+      if (record === null) throw new RecordNotFound(`child worker "${id}" not found`);
+      if (record.state !== 'admitted') {
+        throw new ChildWorkerConflictError(
+          `child worker "${id}" is ${record.state} — only an admitted child can start`,
+        );
+      }
+      const ts = nowIso();
+      this.db
+        .prepare(
+          `UPDATE child_workers SET state = 'active', session_file = ?, started_at = ?, updated_at = ? WHERE id = ?`,
+        )
+        .run(input.sessionFile, ts, ts, id);
+      this.appendEvent({
+        kind: 'child.started',
+        agentId: record.agentId,
+        jobId: record.jobId,
+        payload: { childId: id, sessionFile: input.sessionFile },
+      });
+      return this.getChildWorker(id) as ChildWorkerRecord;
+    });
+  }
+
+  /**
+   * Record the child's terminal result. First write wins: a repeated
+   * settle (a resume or a late duplicate observation) replays the
+   * existing terminal record instead of overwriting it — the result
+   * belongs to the run that finished, once.
+   */
+  recordChildResult(
+    id: string,
+    input: { state: ChildResultState; summary: string | null; ref: string | null },
+  ): ChildWorkerRecord {
+    if (!(CHILD_RESULT_STATES as readonly string[]).includes(input.state)) {
+      throw new Error(`unknown child result state "${String(input.state)}"`);
+    }
+    return this.transaction(() => {
+      const record = this.getChildWorker(id);
+      if (record === null) throw new RecordNotFound(`child worker "${id}" not found`);
+      if (record.resultState !== null) return record;
+      const ts = nowIso();
+      this.db
+        .prepare(
+          `UPDATE child_workers SET state = ?, result_state = ?, result_summary = ?, result_ref = ?, finished_at = ?, updated_at = ? WHERE id = ?`,
+        )
+        .run(input.state, input.state, input.summary, input.ref, ts, ts, id);
+      this.appendEvent({
+        kind: 'child.result',
+        agentId: record.agentId,
+        jobId: record.jobId,
+        payload: { childId: id, state: input.state, summary: input.summary, ref: input.ref },
+      });
+      return this.getChildWorker(id) as ChildWorkerRecord;
+    });
+  }
+
+  /** Cancel a non-terminal child (owner stop or parent cancellation).
+   * Terminal records are immutable: a second cancel replays the result. */
+  cancelChildWorker(id: string, input: { reason: string }): ChildWorkerRecord {
+    return this.transaction(() => {
+      const record = this.getChildWorker(id);
+      if (record === null) throw new RecordNotFound(`child worker "${id}" not found`);
+      if (record.resultState !== null) return record;
+      return this.recordChildResult(id, {
+        state: 'cancelled',
+        summary: input.reason,
+        // The transcript stays discoverable even for a cancelled child.
+        ref: record.resultRef ?? record.sessionFile,
+      });
+    });
+  }
+
+  /** Present-state + lifetime counters. Every number is a SQL aggregate
+   * over child_workers rows; `lifetimeCreations` is the row count, so
+   * retries/resumes cannot double-count and restart changes nothing.
+   * `queued` includes `admitted` — a child whose lane exists but whose
+   * resident admission is still waiting is NOT active; `active` means a
+   * live session is running the task. */
+  countChildWorkers(): ChildWorkerCounts {
+    const rows = this.db
+      .prepare('SELECT state, COUNT(*) AS n FROM child_workers GROUP BY state')
+      .all() as Array<{ state: string; n: number }>;
+    let queued = 0;
+    let active = 0;
+    let finished = 0;
+    for (const row of rows) {
+      if (row.state === 'queued' || row.state === 'admitted') queued += row.n;
+      else if (row.state === 'active') active += row.n;
+      else finished += row.n;
+    }
+    return { queued, active, finished, lifetimeCreations: queued + active + finished };
+  }
+
+  /** Per-parent family counters (the board's parent rows). */
+  childCountsByParent(): ReadonlyMap<string, ChildWorkerCounts> {
+    const rows = this.db
+      .prepare('SELECT parent_agent_id, state, COUNT(*) AS n FROM child_workers GROUP BY parent_agent_id, state')
+      .all() as Array<{ parent_agent_id: string; state: string; n: number }>;
+    const counts = new Map<string, { queued: number; active: number; finished: number }>();
+    for (const row of rows) {
+      const entry = counts.get(row.parent_agent_id) ?? { queued: 0, active: 0, finished: 0 };
+      if (row.state === 'queued' || row.state === 'admitted') entry.queued += row.n;
+      else if (row.state === 'active') entry.active += row.n;
+      else entry.finished += row.n;
+      counts.set(row.parent_agent_id, entry);
+    }
+    return new Map(
+      [...counts.entries()].map(([parent, entry]) => [
+        parent,
+        { ...entry, lifetimeCreations: entry.queued + entry.active + entry.finished },
+      ]),
+    );
   }
 
   appendCustomEvent(fields: {
@@ -2843,6 +3459,45 @@ export class LedgerApi {
     };
   }
 
+  private childWorkerFromRow(row: Row): ChildWorkerRecord {
+    const authority = str(row.authority);
+    if (!isChildWorkerAuthority(authority)) {
+      throw new Error(`child_workers row ${str(row.id)} has unknown authority "${authority}"`);
+    }
+    const state = str(row.state);
+    if (!isChildWorkerState(state)) {
+      throw new Error(`child_workers row ${str(row.id)} has unknown state "${state}"`);
+    }
+    const resultState = nstr(row.result_state);
+    if (resultState !== null && !(CHILD_RESULT_STATES as readonly string[]).includes(resultState)) {
+      throw new Error(`child_workers row ${str(row.id)} has unknown result state "${resultState}"`);
+    }
+    return {
+      id: str(row.id),
+      agentId: nstr(row.agent_id),
+      parentAgentId: str(row.parent_agent_id),
+      jobId: str(row.job_id),
+      purpose: str(row.purpose),
+      authority,
+      task: str(row.task),
+      label: nstr(row.label),
+      idempotencyKey: str(row.idempotency_key),
+      payloadHash: str(row.payload_hash),
+      state,
+      worktreeId: nstr(row.worktree_id),
+      branch: nstr(row.branch),
+      sessionFile: nstr(row.session_file),
+      resultState: resultState as ChildResultState | null,
+      resultSummary: nstr(row.result_summary),
+      resultRef: nstr(row.result_ref),
+      createdAt: str(row.created_at),
+      admittedAt: nstr(row.admitted_at),
+      startedAt: nstr(row.started_at),
+      finishedAt: nstr(row.finished_at),
+      updatedAt: str(row.updated_at),
+    };
+  }
+
   /** A stored base source must be one of the known labels — an unknown
    * value means a migration/code mismatch and is never coerced. */
   private worktreeBaseSourceFromRow(row: Row): WorktreeBaseSource | null {
@@ -2855,6 +3510,10 @@ export class LedgerApi {
   }
 
   private agentFromRow(row: Row): AgentRecord {
+    const parentage = nstr(row.parentage);
+    if (parentage !== null && parentage !== 'top-level' && parentage !== 'child') {
+      throw new Error(`agents row ${str(row.id)} has unknown parentage "${parentage}"`);
+    }
     return {
       id: str(row.id),
       role: str(row.role) as Role,
@@ -2864,6 +3523,8 @@ export class LedgerApi {
       state: str(row.state) as AgentState,
       lastActivity: nstr(row.last_activity),
       sessionFile: nstr(row.session_file),
+      parentAgentId: nstr(row.parent_agent_id),
+      parentage,
       createdAt: str(row.created_at),
       updatedAt: str(row.updated_at),
     };
@@ -2899,9 +3560,12 @@ export class LedgerApi {
    * with no provable blocked episode is excluded. Already-tracked
    * deliveries (and deliveries owned by an existing marked phase row) are
    * excluded BY the query, so bounded passes always reach the tail. */
-  listUnmarkedHandbackDeliveries(limit: number): readonly EventRecord[] {
+  listUnmarkedHandbackDeliveries(limit: number, opts: { cursor?: number } = {}): readonly EventRecord[] {
     if (!Number.isSafeInteger(limit) || limit < 1) {
       throw new Error(`listUnmarkedHandbackDeliveries requires a positive integer limit, got ${String(limit)}`);
+    }
+    if (opts.cursor !== undefined && (!Number.isSafeInteger(opts.cursor) || opts.cursor < 0)) {
+      throw new Error('listUnmarkedHandbackDeliveries cursor must be a safe non-negative event seq');
     }
     const rows = this.db
       .prepare(
@@ -2910,6 +3574,7 @@ export class LedgerApi {
           WHERE e.kind = 'job.delivered'
             AND j.status = 'blocked'
             AND json_valid(e.payload)
+            AND e.seq > ?
             AND json_extract(e.payload, '$.source') IN ('silas-directive', 'silas-rebrief')
             AND COALESCE((
               SELECT json_extract(s.payload, '$.to')
@@ -2935,7 +3600,7 @@ export class LedgerApi {
           ORDER BY e.seq ASC
           LIMIT ?`,
       )
-      .all(limit) as Row[];
+      .all(opts.cursor ?? 0, limit) as Row[];
     return rows.map((row) => this.eventFromRow(row));
   }
 
@@ -2944,16 +3609,36 @@ export class LedgerApi {
    * action-required card was never published (crash between the obligation
    * write and the notification). A published card — even a resolved/acked
    * one — removes the row from the candidate set. */
-  listHandbacksMissingCards(limit: number): readonly ObligationRecord[] {
+  listHandbacksMissingCards(limit: number, opts: { cursor?: number } = {}): readonly ObligationRecord[] {
+    return this.listHandbacksMissingCardsDetailed(limit, opts).readable;
+  }
+
+  /** Window-B candidates with per-row decode isolation: one malformed
+   * obligation row is reported (never re-thrown into a bounded pass) while
+   * the readable rows stay available and the cursor can advance past the
+   * malformed prefix. */
+  listHandbacksMissingCardsDetailed(
+    limit: number,
+    opts: { cursor?: number } = {},
+  ): {
+    readonly readable: readonly ObligationRecord[];
+    readonly malformed: number;
+    readonly lastRowid: number | null;
+    readonly exhausted: boolean;
+  } {
     if (!Number.isSafeInteger(limit) || limit < 1) {
       throw new Error(`listHandbacksMissingCards requires a positive integer limit, got ${String(limit)}`);
     }
+    if (opts.cursor !== undefined && (!Number.isSafeInteger(opts.cursor) || opts.cursor < 0)) {
+      throw new Error('listHandbacksMissingCards cursor must be a safe non-negative rowid');
+    }
     const rows = this.db
       .prepare(
-        `SELECT o.* FROM job_obligations o
+        `SELECT o.rowid AS _rowid, o.* FROM job_obligations o
           WHERE o.logical_step = 'operation'
             AND o.incident_key LIKE 'phase-handback@%'
             AND o.state IN ('open', 'waiting')
+            AND o.rowid > ?
             AND NOT EXISTS (
               SELECT 1 FROM notifications n
                WHERE n.kind = 'silas.phase-handback.' || o.job_id || '@' || substr(o.incident_key, 16)
@@ -2961,8 +3646,23 @@ export class LedgerApi {
           ORDER BY o.rowid ASC
           LIMIT ?`,
       )
-      .all(limit) as Row[];
-    return rows.map((row) => this.obligationFromRow(row));
+      .all(opts.cursor ?? 0, limit) as Row[];
+    const readable: ObligationRecord[] = [];
+    let malformed = 0;
+    for (const row of rows) {
+      try {
+        readable.push(this.obligationFromRow(row));
+      } catch {
+        malformed += 1;
+      }
+    }
+    const last = rows[rows.length - 1];
+    return {
+      readable,
+      malformed,
+      lastRowid: last === undefined ? null : Number(last._rowid),
+      exhausted: rows.length < limit,
+    };
   }
 
   getObligation(id: string): ObligationRecord | null {
@@ -4511,6 +5211,10 @@ export class LedgerApi {
       states?: readonly DirectiveState[];
       limit?: number;
       cursor?: string;
+      /** Integer rowid cursor (reconcile pagination): continues AFTER the
+       * given rowid in insertion order. Mutually exclusive with the string
+       * request-id cursor. */
+      rowidCursor?: number;
     } = {},
   ): readonly DirectiveRequestRecord[] {
     if (opts.state !== undefined && opts.states !== undefined) {
@@ -4536,12 +5240,33 @@ export class LedgerApi {
       where.push(`state IN (${opts.states.map(() => '?').join(', ')})`);
       params.push(...opts.states);
     }
+    if (opts.cursor !== undefined && opts.rowidCursor !== undefined) {
+      throw new Error('listPendingDirectives takes either the request-id cursor or the rowid cursor, never both');
+    }
     if (opts.cursor !== undefined) {
       where.push('request_id > ?');
       params.push(opts.cursor);
     }
-    const sql = `SELECT * FROM pending_directives${where.length > 0 ? ` WHERE ${where.join(' AND ')}` : ''} ORDER BY request_id LIMIT ?`;
+    if (opts.rowidCursor !== undefined) {
+      if (!Number.isSafeInteger(opts.rowidCursor) || opts.rowidCursor < 0) {
+        throw new Error('listPendingDirectives rowidCursor must be a safe non-negative rowid');
+      }
+      where.push('rowid > ?');
+      params.push(opts.rowidCursor);
+    }
+    const order = opts.rowidCursor !== undefined ? 'rowid' : 'request_id';
+    const sql = `SELECT * FROM pending_directives${where.length > 0 ? ` WHERE ${where.join(' AND ')}` : ''} ORDER BY ${order} LIMIT ?`;
     return (this.db.prepare(sql).all(...(params as never[]), limit) as Row[]).map((row) => this.directiveFromRow(row));
+  }
+
+  /** The rowid cursor for one directive request (reconcile pagination
+   * anchor). */
+  directiveRowid(requestId: string): number | null {
+    if (requestId.trim() === '') throw new Error('directiveRowid requires a non-empty requestId');
+    const row = this.db.prepare('SELECT rowid AS _rowid FROM pending_directives WHERE request_id = ?').get(requestId) as
+      | Row
+      | undefined;
+    return row === undefined ? null : Number(row._rowid);
   }
 
   /** Bind a request to its ACTUAL native admission: the correlated
@@ -4609,6 +5334,13 @@ export class LedgerApi {
       this.db
         .prepare("UPDATE pending_directives SET state = 'settled', delivery_seq = ?, updated_at = ? WHERE request_id = ?")
         .run(input.eventSeq, nowIso(), input.requestId);
+      // Durable action marker: a settlement is machine follow-through and
+      // must be visible to health/action projections (issue #163 review).
+      this.appendEvent({
+        kind: 'silas.directive-settled',
+        jobId: row.jobId,
+        payload: { request_id: input.requestId, delivery_seq: input.eventSeq },
+      });
       return this.getDirective(input.requestId) as DirectiveRequestRecord;
     });
   }

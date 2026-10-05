@@ -770,6 +770,28 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     }
   });
 
+  it('an ordinary task spawn asks the SDK for no step, turn, or tool-call cap (issue #158)', async () => {
+    const fx = await fixture();
+    const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace });
+    try {
+      const options = twinGate.lastOptions as Record<string, unknown> | null;
+      expect(options).not.toBeNull();
+      // Capture sanity: the adapter really passed its session setup through.
+      expect(Array.isArray(options?.tools)).toBe(true);
+      // Pin that a provider/SDK step, turn, iteration, or tool-call ceiling is
+      // never invented for a task turn: a cap-only stop was the #158 incident.
+      for (const key of Object.keys(options ?? {})) {
+        expect(key).not.toMatch(/(?:max|limit|budget).*(?:step|turn|tool|call|iteration)/iu);
+        expect(key).not.toMatch(/(?:step|turn|tool|call|iteration).*(?:max|limit|budget)/iu);
+      }
+      for (const banned of ['maxSteps', 'maxTurns', 'maxToolCalls', 'maxIterations', 'stepLimit', 'turnLimit', 'toolCallLimit', 'maxBudgetUsd']) {
+        expect(options).not.toHaveProperty(banned);
+      }
+    } finally {
+      await handle.dispose();
+    }
+  });
+
   it('enforces isolated-review tools and strips ambient Pi resources', async () => {
     const fx = await fixture();
     writeFileSync(join(fx.workspace, 'AGENTS.md'), 'PROJECT-CONTEXT-CANARY', 'utf8');
@@ -1243,6 +1265,28 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       internal.session = nativeSession;
     } finally {
       await handle.dispose();
+    }
+
+    // Issue #161: a product-owned child id is NOT session-identity drift.
+    // The native session id is compared, so an unchanged compaction on a
+    // child handle settles instead of disposing the session.
+    const childFx = await fixture([{ deltas: ['child answer'] }, { deltas: ['## Goal\nchild summary'] }]);
+    writeFileSync(
+      join(childFx.agentDir, 'settings.json'),
+      `${JSON.stringify({ compaction: { keepRecentTokens: 1, reserveTokens: 100 } })}\n`,
+      'utf-8',
+    );
+    const child = await childFx.runtime.spawn('minion', { agentId: 'child-compact-id' });
+    try {
+      expect(child.id).toBe('child-compact-id');
+      await child.prompt('child turn');
+      const childFile = child.sessionFile;
+      await child.compact?.();
+      expect(child.id).toBe('child-compact-id');
+      expect(child.sessionFile).toBe(childFile);
+      expect(child.health().state).not.toBe('disposed');
+    } finally {
+      await child.dispose();
     }
   });
 
@@ -3002,6 +3046,25 @@ describe('spawn cwd (SPEC ruling 17 — dispatch roots in the project)', () => {
     } finally {
       await handle.dispose();
     }
+    // Issue #161: a child worker's bounded authority is enforced by the
+    // ADAPTER's own tool allowlist, and its product-owned identity is
+    // honored (the ledger identity exists before the session).
+    const child = await fx.runtime.spawn('minion', {
+      cwd: project,
+      agentId: 'child-owned-id',
+      roleTools: ['read', 'grep', 'find', 'ls'],
+    });
+    try {
+      const options = twinGate.lastOptions as { tools?: string[] };
+      expect(options.tools).toEqual(['read', 'grep', 'find', 'ls']);
+      expect(child.id).toBe('child-owned-id');
+    } finally {
+      await child.dispose();
+    }
+    // An override can only NARROW: an undeclared tool refuses loud.
+    await expect(
+      fx.runtime.spawn('minion', { cwd: project, roleTools: ['read', 'undeclared-tool'] }),
+    ).rejects.toThrowError(/role tool override names "undeclared-tool"/);
   });
 
   it('fails loud on a relative or nonexistent cwd (never a silent fallback)', async () => {

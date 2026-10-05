@@ -657,7 +657,13 @@ export interface GitHubPollLedger {
   latestJobEvent(jobId: string, kind: string): EventRecord | null;
   /** The lane's bound agent rows — used to bind escalation rows to their
    * lane's worker through the existing notification agentId field. */
-  listAgents(): readonly { readonly id: string; readonly jobId: string | null; readonly role: string }[];
+  listAgents(): readonly {
+    readonly id: string;
+    readonly jobId: string | null;
+    readonly role: string;
+    /** Issue #161: primary-minion selection excludes child workers. */
+    readonly parentage?: 'top-level' | 'child' | null;
+  }[];
   appendCustomEvent(fields: {
     kind: string;
     jobId?: string | null;
@@ -1117,7 +1123,10 @@ export class GitHubSignalPoll {
    * live). Selection follows ledger.listAgents() order like the A4
    * resolver; any same-job minion classifies against the same job. */
   private laneMinionId(jobId: string): string | null {
-    return this.ledger.listAgents().find((agent) => agent.jobId === jobId && agent.role === 'minion')?.id ?? null;
+    // Issue #161: a child worker is never the lane's writer.
+    return this.ledger
+      .listAgents()
+      .find((agent) => agent.jobId === jobId && agent.role === 'minion' && agent.parentage !== 'child')?.id ?? null;
   }
 
   /** CI green: the review-gate signal event (no notification — green is a

@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { rebriefFreshMinion, recordFollowUpDelivery, renderRebriefPrompt, routeFixDirectiveToMinion } from '../src/dispatch/fix-directive.js';
 import { withFallbacks } from '../src/runtime/fallbacks.js';
 import type { AgentRuntime } from '../src/runtime/types.js';
-import { PR_CREATION_RULE } from '../src/dispatch/pr-creation.js';
+import { appendWorkerRules } from '../src/dispatch/worker-rules.js';
 import type { WorktreeLane } from '../src/dispatch/worktree-port.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
@@ -80,6 +80,8 @@ function minionRecord(id: string, jobId: string | null, sessionFile: string | nu
     state: 'idle',
     lastActivity: null,
     sessionFile,
+    parentAgentId: null,
+    parentage: null,
     createdAt: '2026-09-21T00:00:00.000Z',
     updatedAt: '2026-09-21T00:00:00.000Z',
   };
@@ -231,6 +233,7 @@ describe('eviction-safe fix directives (phase 3)', () => {
     await worktrees.createJobWorktree({ repoPath: repo.path, jobId: 'job-evict' });
     const ledgerEvents: Array<{ kind: string; payload: unknown }> = [];
     const ledger = {
+      getAgent: () => null,
       listAgents: () => [{ id: 'minion-live', role: 'minion', jobId: 'job-evict', sessionFile: '/sessions/failing.jsonl' }],
       registerAgent: (fields: { id: string }) => { ledgerEvents.push({ kind: 'agent', payload: fields }); },
       getJob: () => ({ briefing: 'original contract' }),
@@ -253,6 +256,7 @@ describe('eviction-safe fix directives (phase 3)', () => {
     cleanupRepos.push(repo);
     await worktrees.createJobWorktree({ repoPath: repo.path, jobId: 'job-resume' });
     const ledger = {
+      getAgent: () => null,
       listAgents: () => [{ id: 'minion-live', role: 'minion', jobId: 'job-resume', sessionFile: '/sessions/failing.jsonl' }],
       registerAgent: () => {},
       getJob: () => ({ briefing: 'original contract' }),
@@ -261,7 +265,11 @@ describe('eviction-safe fix directives (phase 3)', () => {
       registry: registry as never, ledger: ledger as never, worktrees,
       jobId: 'job-resume', directive: 'fix the blocker', signal: controller.signal,
     });
-    expect(prompted[0]).toBe(`fix the blocker\n\n${PR_CREATION_RULE}`); // resumed session gets the directive (never the re-brief wrapper), now carrying the current non-draft PR rule
+    expect(prompted[0]).toBe(appendWorkerRules('fix the blocker')); // resumed session gets the directive (never the re-brief wrapper), now carrying the current non-draft PR and no-call-budget rules
+    // Literal clause pin (not helper-derived): a routed directive must itself
+    // carry the no-call-budget rule, whatever the helper composes.
+    expect(prompted[0]).toContain('no total or per-phase tool-call budget binds');
+    expect(prompted[0]).toContain('it does not bind');
     rmSync(root, { recursive: true, force: true });
   });
 });
@@ -284,6 +292,7 @@ describe('the non-draft PR rule on follow-up directives', () => {
         disposeHandle: async () => {},
       },
       ledger: {
+        getAgent: () => null,
         listAgents: () => [{ id: 'minion-live', role: 'minion', jobId: 'job-live', sessionFile: null }],
         registerAgent: () => {},
         getJob: () => ({ briefing: 'original contract' }),
@@ -323,6 +332,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
         listAgents: () => [minionRecord('minion-live', 'job-cancel', '/sessions/live.jsonl')],
         registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
         getJob: () => null,
+        getAgent: () => null,
       },
       worktrees: { listWorktrees: () => [lane] } as never,
       jobId: 'job-cancel',
@@ -360,6 +370,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
         listAgents: () => [],
         registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
         getJob: () => null,
+        getAgent: () => null,
       },
       worktrees: { listWorktrees: () => [lane] } as never,
       jobId: 'job-cancel',
@@ -386,6 +397,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
         listAgents: () => [],
         registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
         getJob: () => null,
+        getAgent: () => null,
         setAgentState: (id) => minionRecord(id, 'job-cancel', null),
       },
       worktrees: { listWorktrees: () => [lane] } as never,
@@ -424,6 +436,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
           return minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null);
         },
         getJob: () => null,
+        getAgent: () => null,
         setAgentState: (id, state) => { states.push(`${id}:${state}`); return minionRecord(id, 'job-cancel', null); },
       },
       worktrees: { listWorktrees: () => [lane] } as never,
@@ -470,6 +483,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
         listAgents: () => [],
         registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
         getJob: () => null,
+        getAgent: () => null,
         setAgentState: (id) => minionRecord(id, 'job-cancel', null),
       },
       worktrees: { listWorktrees: () => [lane] } as never,
@@ -537,6 +551,7 @@ describe('per-prompt terminal verdict capture (r5 blocker 1)', () => {
       const routing = routeFixDirectiveToMinion({
         registry: { getHandle: () => handle, spawn: async () => handle, disposeHandle: async () => {} },
         ledger: {
+          getAgent: () => null,
           listAgents: () => [{ id: 'inner-queued', jobId: 'job-queued', role: 'minion', sessionFile: null }],
           registerAgent: () => {},
           getJob: () => null,

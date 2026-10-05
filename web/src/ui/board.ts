@@ -132,6 +132,9 @@ export class BoardView {
   /** Disposed rows are collapsed by default; the toggle state survives
    * snapshot pushes so a live board does not re-open the graveyard. */
   private disposedExpanded = false;
+  /** The last rendered agent list (parent navigation resolves against it
+   * and can expand a collapsed section before scrolling). */
+  private lastAgents: readonly AgentView[] = [];
   /** Issue #171: verified-historical rows are collapsed behind their own
    * disclosure (past sessions), separate from the disposed graveyard;
    * the toggle state survives snapshot pushes. */
@@ -210,10 +213,16 @@ export class BoardView {
     this.onToast = handler;
   }
 
-  /** E7: bind the board client (receipts + acks) — rebound on re-pair. */
+  /** E7: bind the board client (receipts + acks) — rebound on re-pair.
+   * Receipt paging is per-connection state: a re-pair must not surface the
+   * previous server's fetched receipts or resume its pagination cursor. */
   bindClient(client: BoardClient): void {
     this.boardClient = client;
     this.sentShown.clear();
+    this.extraReceipts = [];
+    this.receiptsNextOffset = 0;
+    this.receiptsExhausted = false;
+    this.receiptsLoading = false;
   }
 
   render(snapshot: BoardSnapshot): void {
@@ -858,6 +867,7 @@ export class BoardView {
   // ------------------------------------------------------------------
 
   private renderAgents(agents: readonly AgentView[]): void {
+    this.lastAgents = agents;
     const rail = mustGet('board-agents');
     rail.replaceChildren();
     this.ensureAgeTicker();
@@ -896,6 +906,7 @@ export class BoardView {
     // service must surface, never silently discard: mark every row of a
     // duplicated singleton role so the operator can investigate (#171).
     const duplicateRoles = duplicatedSingletonRoles(live);
+    const labelById = new Map(agents.map((entry) => [entry.id, agentLabel(entry)]));
     for (const agent of live) {
       rail.append(
         this.agentRow(
@@ -903,6 +914,7 @@ export class BoardView {
           'live',
           duplicateRoles.has(agent.id),
           classificationPresent && agentRuntimeOf(agent) === 'unverified',
+          labelById,
         ),
       );
     }
@@ -928,7 +940,9 @@ export class BoardView {
       });
       rail.append(toggle);
       if (this.historyExpanded) {
-        for (const agent of historical) rail.append(this.agentRow(agent, 'historical', false, false));
+        for (const agent of historical) {
+          rail.append(this.agentRow(agent, 'historical', false, false, labelById));
+        }
       }
     }
     if (disposed.length > 0) {
@@ -951,7 +965,7 @@ export class BoardView {
       });
       rail.append(toggle);
       if (this.disposedExpanded) {
-        for (const agent of disposed) rail.append(this.agentRow(agent, 'disposed', false, false));
+        for (const agent of disposed) rail.append(this.agentRow(agent, 'disposed', false, false, labelById));
       }
     }
   }
@@ -967,15 +981,25 @@ export class BoardView {
     section: 'live' | 'historical' | 'disposed',
     duplicateSingleton: boolean,
     ambiguousOwnership: boolean,
+    labelById: ReadonlyMap<string, string>,
   ): HTMLElement {
+    // A div with button semantics (NOT <button>): the row contains its own
+    // parent-navigation button for child rows, and interactive elements
+    // must not nest. Keyboard activation matches a button (Enter/Space).
     const row = el(
-      'button',
+      'div',
       `board-agent${section === 'disposed' ? ' board-agent--disposed' : ''}${section === 'historical' ? ' board-agent--historical' : ''}`,
     );
-    row.type = 'button';
+    row.setAttribute('role', 'button');
+    row.tabIndex = 0;
     const status = agentStatusOf(agent);
     row.dataset.state = status;
     row.dataset.role = agent.role;
+    // Issue #161: parent navigation target + honest parentage marker
+    // (`unknown` when the server gave no information — legacy rows are
+    // never inferred as top-level).
+    row.dataset.agentId = agent.id;
+    row.dataset.parentage = agent.parentage ?? 'unknown';
     if (status === 'error') row.classList.add('board-agent--error');
     row.title =
       agent.sessionFile !== null
@@ -984,22 +1008,76 @@ export class BoardView {
     if (section === 'historical') {
       row.title += ' · historical: no current runtime owner — record retained';
     }
-    row.addEventListener('click', () => {
+    const openTranscript = (): void => {
       if (agent.sessionFile !== null) {
         this.onOpenTranscript({ file: agent.sessionFile ?? '', label: agentLabel(agent) });
+      }
+    };
+    row.addEventListener('click', openTranscript);
+    row.addEventListener('keydown', (event) => {
+      // Keys on the nested parent-navigation button belong to THAT button:
+      // the row must not hijack Enter/Space bubbling from a descendant.
+      if (event.target !== row) return;
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        openTranscript();
       }
     });
     const body = el('span', 'board-agent__body');
     const top = el('span', 'board-agent__top');
+    const label = agentLabel(agent);
     top.append(
-      el('span', 'board-agent__name', agentLabel(agent)),
+      el('span', 'board-agent__name', label),
       el('span', 'board-agent__hash lbl', agent.id.slice(0, 8)),
     );
     const subline = el('span', 'board-agent__sub lbl');
+    // Issue #161: top-level minions vs minion-created child workers. The
+    // marker renders from the durable parentage field only; an omitted
+    // field (pre-upgrade server) or a null field (server says unknown)
+    // renders no marker — legacy rows are never claimed either way.
+    const parentage = agent.parentage;
+    const isChild = parentage === 'child';
     subline.append(
       el('span', 'board-agent__emoji', ROLE_EMOJI[agent.role] ?? '🤖'),
-      el('span', 'board-agent__role', `${agent.role} · ${status}`),
+      el('span', 'board-agent__role', isChild ? `child · ${status}` : `${agent.role} · ${status}`),
     );
+    if (parentage === 'top-level' || parentage === 'child') {
+      subline.append(
+        el(
+          'span',
+          `board-agent__parentage board-agent__parentage--${parentage}`,
+          isChild ? '🧬 child' : 'top-level',
+        ),
+      );
+    }
+    if (isChild && agent.parentAgentId !== null && agent.parentAgentId !== undefined) {
+      const parentId = agent.parentAgentId;
+      const parentLink = el(
+        'button',
+        'board-agent__parent-link',
+        `↳ ${labelById.get(parentId) ?? parentId.slice(0, 8)}`,
+      );
+      parentLink.type = 'button';
+      parentLink.title = `parent minion ${parentId} — jump to the parent row`;
+      parentLink.addEventListener('click', (event) => {
+        event.stopPropagation();
+        this.revealAgent(parentId);
+      });
+      subline.append(parentLink);
+      row.title += ` · child worker of ${parentId}`;
+    }
+    const childCounts = agent.childCounts;
+    if (childCounts !== null && childCounts !== undefined && childCounts.lifetimeCreations > 0) {
+      const family = el(
+        'span',
+        'board-agent__child-counts',
+        `↳ ${childCounts.lifetimeCreations} ${childCounts.lifetimeCreations === 1 ? 'child' : 'children'}` +
+          ` (${childCounts.active} active, ${childCounts.queued} queued, ${childCounts.finished} finished)`,
+      );
+      family.title =
+        'family counters: active / queued / finished children, with lifetime logical creations';
+      subline.append(family);
+    }
     // Turn-age counter: a working agent shows how long its current turn
     // has been quiet — the operator's "is it stuck?" glance. The clock
     // prefers the supervision event stream (#171): deltas never touch the
@@ -1045,6 +1123,26 @@ export class BoardView {
     return row;
   }
 
+  /** Issue #161 parent navigation: reveal the parent row even when its
+   * historical/disposed section is collapsed, then scroll to it. The row
+   * is located by dataset comparison — a manually registered agent id can
+   * contain selector metacharacters, so ids never enter a CSS selector. */
+  private revealAgent(agentId: string): void {
+    const target = this.lastAgents.find((agent) => agent.id === agentId);
+    if (target === undefined) return;
+    const band = agentRailBand(target);
+    if (band === 'historical') this.historyExpanded = true;
+    if (band === 'disposed') this.disposedExpanded = true;
+    this.renderAgents(this.lastAgents);
+    const rows = mustGet('board-agents').querySelectorAll<HTMLElement>('.board-agent');
+    for (const row of rows) {
+      if (row.dataset.agentId === agentId) {
+        row.scrollIntoView?.({ block: 'nearest' });
+        return;
+      }
+    }
+  }
+
   // ------------------------------------------------------------------
   // Notification center
   // ------------------------------------------------------------------
@@ -1075,10 +1173,9 @@ export class BoardView {
       ),
       ...this.extraReceipts.filter((extra) => !notifications.some((item) => item.id === extra.id)),
     ];
-    if (notifications.length === 0 && (snapshot.ownerPrs ?? []).length === 0) {
-      list.append(el('div', 'lbl', 'nothing needs attention'));
-      return;
-    }
+    // Every snapshot renders the full band structure — an empty feed is
+    // good news, not absence. No early return may skip FOR YOU / NEEDS GRU
+    // and their clear states (g9).
     // FOR YOU parity (FOR YOU r1): the bell renders the SAME authoritative
     // owner projection the board band renders — pending acks AND ready PRs
     // — so the two surfaces can never disagree about what the owner owes.
@@ -1128,6 +1225,8 @@ export class BoardView {
     if (this.snapshot !== null) this.renderNotifications(this.snapshot);
     try {
       const page = await client.fetchReceipts(this.receiptsNextOffset);
+      // Re-paired mid-fetch: the page belongs to the previous server's record.
+      if (this.boardClient !== client) return;
       for (const row of page.receipts) {
         if (!this.extraReceipts.some((existing) => existing.id === row.id)) this.extraReceipts.push(row);
       }
@@ -1136,8 +1235,10 @@ export class BoardView {
     } catch {
       // The button remains; a later click retries the same cursor.
     } finally {
-      this.receiptsLoading = false;
-      if (this.snapshot !== null) this.renderNotifications(this.snapshot);
+      if (this.boardClient === client) {
+        this.receiptsLoading = false;
+        if (this.snapshot !== null) this.renderNotifications(this.snapshot);
+      }
     }
   }
 
@@ -1220,7 +1321,8 @@ export class BoardView {
       // Only needs-owner rings the shoulder; machine/fyi rows live in the
       // panel bands and reach Gru through the wake path instead.
       if (notification.routing !== 'needs-owner') continue;
-      if (firstRender || notification.resolvedAt !== null) continue; // history/resolved — no toast spam
+      // History and already-handled rows (acked on ANY device) never toast.
+      if (firstRender || notification.ackedAt !== null || notification.resolvedAt !== null) continue;
       this.onToast?.(notification);
       this.sendShown(notification, 'web-toast');
     }

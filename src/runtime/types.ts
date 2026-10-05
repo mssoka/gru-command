@@ -141,6 +141,35 @@ export interface SpawnOptions {
    */
   readonly thinkingLevel?: string;
   /**
+   * Product-owned identity for this session (issue #161). The adapter
+   * binds the handle id to this value instead of its own minted session
+   * id, so a tracked child's durable identity exists BEFORE the session
+   * (the admission row, the lane and the agent row share one id) and a
+   * resumed child keeps it across supervision restarts. Omitted = the
+   * adapter's own id. The underlying session file and its lock are
+   * unchanged — only the ledger identity is product-owned.
+   */
+  readonly agentId?: string;
+  /**
+   * Product-owned narrow tools for a NON-review session (issue #161): the
+   * GC-mediated parent-worker control plane. The adapter exposes exactly
+   * these (pi: in-process custom tools; claude-code: the same scoped MCP
+   * bridge review sessions use) and records the wired names on the handle
+   * (`reviewTools`). Identity is bound by the CLOSURE the caller builds —
+   * no bearer secret ever reaches the session's filesystem or context.
+   * Omitted = none.
+   */
+  readonly nativeTools?: readonly NativeAgentTool[];
+  /**
+   * Product-controlled tool subset for this spawn (issue #161): a child
+   * worker's bounded task authority is enforced by the runtime itself —
+   * a `read-only` child is spawned with the read-only role tools, a
+   * `writer` child with the role's full set. Omitted = the role's
+   * declared tool set (a declared override can ONLY narrow it; an
+   * unknown tool name refuses loud).
+   */
+  readonly roleTools?: readonly string[];
+  /**
    * Fresh ambient-free lens child. The adapter replaces the role prompt and
    * tools, disables project/global resources, and forbids resume.
    */

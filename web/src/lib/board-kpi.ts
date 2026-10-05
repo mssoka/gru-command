@@ -5,7 +5,7 @@
  * without a DOM.
  */
 
-import type { AgentView, BoardSnapshot, JobPrState, JobView } from './board-protocol.js';
+import type { AgentView, BoardSnapshot, ChildWorkerCounts, JobPrState, JobView } from './board-protocol.js';
 import {
   agentActivityOf,
   agentRailBand,
@@ -44,6 +44,17 @@ export interface BoardKpis {
   readonly jobs: JobStatusCounts;
   readonly prs: PrCounts;
   readonly lanes: LaneCounts;
+  /** Issue #161: present-state and lifetime child-worker counters. NULL
+   * when the server does not report them (a pre-upgrade board): unknown is
+   * never rendered as a verified zero. */
+  readonly children: ChildWorkerCounts | null;
+}
+
+/** Issue #161: the snapshot's child counters; null when absent (unknown
+ * ≠ zero — the strip omits the group rather than claiming no children). */
+export function childCounts(snapshot: BoardSnapshot): ChildWorkerCounts | null {
+  const children = snapshot.children ?? null;
+  return children === null ? null : children;
 }
 
 /** Every job on the board, repo grouping flattened. */
@@ -131,5 +142,6 @@ export function boardKpis(snapshot: BoardSnapshot, now = new Date()): BoardKpis 
     jobs: jobStatusCounts(collectJobs(snapshot)),
     prs: prCounts(collectJobs(snapshot), now),
     lanes: laneCounts(snapshot.agents),
+    children: childCounts(snapshot),
   };
 }
