@@ -1026,7 +1026,10 @@ test.describe('board (E6, mock feed)', () => {
     // Owner-held stop: the released handle left the record disposed, but
     // the live crew keeps the lane with its stopped mark (never the
     // graveyard behind the disposed toggle).
-    const held = rail.locator('.board-agent', { hasText: 'held-after-breaker' });
+    // Crew-heist-labels (#141): minion rows display their heist name, not
+    // the raw fixture label, so identify the held row by its stable agent
+    // id (the same identity the transcript selection keys on).
+    const held = rail.locator('[data-agent-id="mock-minion-held"]');
     await expect(held.locator('.board-agent__supervision--alert')).toHaveText('⛔ stopped');
     await expect(rail.locator(".board-agent-toggle[data-section='disposed']")).toContainText('1 disposed');
 
