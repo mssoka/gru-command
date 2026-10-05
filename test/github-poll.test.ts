@@ -33,6 +33,8 @@ import {
 } from '../src/dispatch/github-poll.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
+import { EventBus } from '../src/events/bus.js';
+import { NotificationCenter } from '../src/notifications/center.js';
 import { renderRecordedCiEvidence } from '../src/review-inputs/ci-evidence.js';
 
 /**
@@ -788,6 +790,47 @@ describe('github signal poll tick', () => {
         routing: 'fyi',
         agentId: null,
       });
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a pre-#215 unacked action-required conflict row is re-triaged fyi so it stops waking Gru (issue #215)', async () => {
+    const h = makeLedger();
+    try {
+      addTrackedJob(h.ledger, 'job-legacy', 'https://github.com/acme/app/pull/41');
+      // A legacy row from before the routing change: postIncident dedupe
+      // would reuse it forever with its old wake-eligible routing.
+      const center = new NotificationCenter({ ledger: h.ledger, bus: new EventBus() });
+      const legacy = center.postIncident({
+        kind: 'github.pr-conflict:job-legacy',
+        routing: 'action-required',
+        severity: 'error',
+        title: 'PR #41 conflicts with its base (acme/app)',
+        dedupe: 'unacked',
+        agentId: null,
+      });
+      expect(legacy.routing).toBe('action-required');
+      const api = new FakeGhApi();
+      api.pulls.set('acme/app', [pull({ number: 41, headRef: 'gru/job-legacy', headSha: 'sha-41' })]);
+      api.details.set('acme/app#41', pull({ number: 41, headRef: 'gru/job-legacy', headSha: 'sha-41', mergeableState: 'dirty' }));
+      const poll = new GitHubSignalPoll({
+        ledger: h.ledger,
+        notifications: {
+          postIncident: (input: Parameters<NotificationCenter['postIncident']>[0]) => center.postIncident(input),
+          retriageUnacked: (kind: string, routing: 'action-required' | 'fyi' | 'needs-owner', by: string) =>
+            center.retriageUnacked(kind, routing, by),
+        },
+        api,
+        resolveRemote: () => null,
+      });
+
+      await poll.pollOnce();
+      const rows = h.ledger.listNotifications().filter((row) => row.kind === 'github.pr-conflict:job-legacy');
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.routing).toBe('fyi');
+      expect(rows[0]?.id).toBe(legacy.id);
+      expect(rows[0]?.ackedAt).toBeNull();
     } finally {
       h.cleanup();
     }

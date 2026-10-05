@@ -684,6 +684,11 @@ export interface GitHubPollNotifications {
     dedupe: 'unacked' | 'active' | 'all';
     agentId?: string | null;
   }): unknown;
+  /** Producer-side routing migration (issue #215): re-triage an UNACKED
+   * row of this kind left by an older producer tier to the routing the
+   * producer now uses, so a mechanical downgrade cannot keep waking Gru
+   * through its own historical row. Optional — test fakes may omit it. */
+  retriageUnacked?(kind: string, routing: NotificationRouting, by: string): unknown;
 }
 
 export interface GitHubPollOptions {
@@ -1072,6 +1077,12 @@ export class GitHubSignalPoll {
       // guessed; tracked-review A4).
       agentId: this.laneMinionId(signal.jobId),
     });
+    // A pre-#215 unacked row of this kind still carries the old
+    // action-required cascade, and postIncident dedupe reuses it forever.
+    // Re-triage it to this producer's tier so the historical row cannot
+    // keep waking Gru for work that is now Silas's digest row (issue
+    // #215); the row stays visible as passive context.
+    this.notifications.retriageUnacked?.(`github.pr-conflict:${signal.jobId}`, 'fyi', 'github-poll');
     this.log('info', 'github poll: PR conflict observed', {
       job: signal.jobId,
       repo: repoFullName(signal.repo),

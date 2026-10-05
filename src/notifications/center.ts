@@ -190,6 +190,19 @@ export class NotificationCenter {
     return this.ledger.resolveNotificationsByKindPrefix(kindPrefix, by);
   }
 
+  /** Producer-declared routing migration (issue #215): an UNACKED row of
+   * this kind left by an older producer tier is re-triaged to the
+   * producer's current routing, so a mechanical downgrade (a conflict
+   * alert that used to cascade action-required, now fyi) cannot keep
+   * waking Gru through its own historical row. Acked and resolved rows
+   * are never touched; the re-triaged row stays visible as passive
+   * context with a note naming who moved it. */
+  retriageUnacked(kind: string, routing: NotificationRouting, by: string): NotificationRecord | null {
+    const existing = this.ledger.findNotificationByKind(kind, 'unacked');
+    if (existing === null || existing.routing === routing) return existing;
+    return this.ledger.updateNotificationTriage(existing.id, routing, by);
+  }
+
   /** Display receipt (shown:true doctrine) — idempotent per surface. */
   markShown(id: string, surface: string): NotificationRecord | null {
     return this.ledger.markNotificationShown(id, surface);
