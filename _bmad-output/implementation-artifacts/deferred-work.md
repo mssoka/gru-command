@@ -88,3 +88,12 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-crew-heist-labels.md`
   summary: The crew-rail Playwright project (rail layout/overflow geometry) is not part of any required recurring gate — CI runs `npm test` (Vitest) only; a future CSS regression could pass every required check while breaking the rail layout.
   evidence: Fresh bmad-build verification-gap finding 2026-10-05 (disposition: defer). The dedicated `crew-rail` project is runnable on demand through the declared scheduler scopes (`crew-rail-captures`, `crew-captures-fast`) and ran green at the reviewed heads, but adding Playwright to required CI is a repo-wide runner-cost/policy decision (browsers install, ~1-2 min/job) that the owner and the e2e-gate-repair lane (job-e2e-gate-repair-20261004) own, not this display-naming lane.
+
+## Deferred from: code review of issue 189 (2026-10-05)
+
+- source_spec: GitHub issue #189 (PR #228, settlement-gap lane)
+  summary: A synchronous settlement-publication failure in the boot spent-marker or delivery-only completion paths rejects the whole `reconcilePendingRebriefs` pass, and `src/main.ts` awaits that pass during startup — one faulty job can stall recovery of every other job and startup itself.
+  evidence: bmad code review (blind-hunter, gpt-6-sol) 2026-10-05; pre-existing shape — the old two-step clear→publish could throw out of the scan identically, and GH-228 strictly improves recovery (the clear now rolls back, markers survive for the next boot). Per-job containment changes reconcile error semantics (report shape, escalation routing) and belongs to a dedicated reliability lane, not the settlement-gap fix.
+- source_spec: GitHub issue #189 (PR #228, settlement-gap lane)
+  summary: The delivery-only shortcut appends `silas.rebrief-recovered` after the atomic clear+settle commits; a failure of that audit append loses the recovery audit with no markers left to re-derive it from.
+  evidence: bmad code review (blind-hunter, gpt-6-sol) 2026-10-05; pre-existing window (the audit trailed the settlement before this change too) and observability-only — the settlement itself is committed, so no handoff strands. Atomic audit+settlement needs another API variant; not worth the surface for an informational event.
