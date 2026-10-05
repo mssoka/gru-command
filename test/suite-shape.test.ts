@@ -11,7 +11,10 @@ import { describe, expect, it } from 'vitest';
 const PINS: Record<string, number> = {  'rate-limit-retry.test.ts': 6,
   'owner-actions.test.ts': 28,
   'attachments.test.ts': 28,
-  'awareness.test.ts': 46,
+
+  'awareness.test.ts': 56,
+
+
   'bmad-onboarding.test.ts': 35,
   'board-engine-v4.test.ts': 7,
   'board-engine.test.ts': 38,
