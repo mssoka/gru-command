@@ -2845,7 +2845,10 @@ describe('bmad-review fallback gate (user amendment 2026-09-20, fork-3)', () => 
       expect(outcome.reportFiles).toHaveLength(2);
       const phases = gateEvents(harness).map((payload) => payload['phase']).reverse();
       expect(phases).toEqual(['started', 'triaged', 'fix-directive', 'triaged', 'pass']);
-      expect(harness.escalations.some((line) => line.includes('clear to merge'))).toBe(true);
+      expect(harness.escalations.some((line) => line.includes('review/fix routing cleared'))).toBe(true);
+      // The fallback PASS is not a Perkins READY: the escalation message
+      // must never read as merge clearance.
+      expect(harness.escalations.some((line) => line.includes('clear to merge'))).toBe(false);
       // The fallback gate never creates a Perkins round or verdict.
       expect(harness.ledger.listRounds(harness.job.id)).toHaveLength(0);
     } finally {

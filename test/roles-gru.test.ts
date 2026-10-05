@@ -32,6 +32,13 @@ describe('gru role definition', () => {
     expect(prompt).toContain('Elsewhere the owner decides');
   });
 
+  it('the chief hands workers the whole build and presents merges only on exact-final-head Perkins READY', () => {
+    const gru = ROLE_DEFINITIONS.gru.systemPrompt.replace(/\s+/gu, ' ');
+    expect(gru).toContain('Hand workers the whole build');
+    expect(gru).toContain('the owner holds');
+    expect(gru).toContain('every merge');
+  });
+
   it('the role config maps the permission set (tools + workspace cwd)', () => {
     expect(ROLE_DEFINITIONS.gru.tools).toEqual(['read', 'bash', 'grep', 'find', 'ls']);
     expect(ROLE_DEFINITIONS.gru.cwd).toBe('workspace_root');

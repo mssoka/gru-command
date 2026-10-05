@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { LogLevel } from '../logger.js';
-import type { LedgerApi, JobRecord } from '../ledger/api.js';
+import type { JobDeliverable, LedgerApi, JobRecord } from '../ledger/api.js';
 import type { CompletionHandoffIntent } from '../ledger/obligations.js';
 import { isJobTerminal } from '../ledger/states.js';
 import type { Role } from '../config.js';
@@ -140,6 +140,10 @@ export class DispatchService {
     repoPath: string;
     title: string;
     displayName?: string;
+    /** The deliverable kind (E18): reviewers dispatch with `review`,
+     * artifact-only lanes with `artifact`/`investigation`; omitted = a
+     * PR-owing implementation lane. */
+    deliverable?: JobDeliverable;
     briefing: string;
     /** Explicit completion intent: when present, the phase-handoff guard
      * row is persisted BEFORE any side effect and this exact phase's
@@ -159,6 +163,7 @@ export class DispatchService {
       title: input.title,
       displayName: input.displayName,
       briefing: input.briefing,
+      ...(input.deliverable !== undefined ? { deliverable: input.deliverable } : {}),
     });
 
     // (2) Ops handoff: dispatched → working, on the record.

@@ -33,7 +33,7 @@ import { LedgerDb } from '../src/ledger/db.js';
 import { DEFAULT_SILAS_CONFIG } from '../src/config.js';
 import type { AgentCapabilities, AgentHandle } from '../src/runtime/types.js';
 import type { AgentSupervisionView } from '../src/supervision/supervisor.js';
-import type { EventRecord, JobRecord, RoundRecord } from '../src/ledger/api.js';
+import type { EventRecord, JobDeliverable, JobRecord, RoundRecord } from '../src/ledger/api.js';
 import type { Role } from '../src/config.js';
 
 const FAKE_CAPABILITIES: AgentCapabilities = {
@@ -179,8 +179,11 @@ function makeLedger(): Harness {
   };
 }
 
-function addJobWithDelivery(ledger: LedgerApi, jobId: string, opts: { prUrl?: string } = {}): JobRecord {
-  const job = ledger.addJob({ id: jobId, repo: 'fixture-app', title: `t-${jobId}`, briefing: 'b' });
+function addJobWithDelivery(ledger: LedgerApi, jobId: string, opts: { prUrl?: string; deliverable?: JobDeliverable } = {}): JobRecord {
+  const job = ledger.addJob({
+    id: jobId, repo: 'fixture-app', title: `t-${jobId}`, briefing: 'b',
+    ...(opts.deliverable !== undefined ? { deliverable: opts.deliverable } : {}),
+  });
   ledger.setJobStatus(jobId, 'working');
   ledger.appendCustomEvent({ kind: 'job.handoff', jobId, payload: {} });
   ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { agentId: 'a1' } });
@@ -212,6 +215,27 @@ describe('silas digest (the four actionable states)', () => {
       expect(after.deliveredWithoutPr).toEqual([]);
       // registration alone flips the state to review-due
       expect(after.prWithoutReview.map((row) => row.jobId)).toEqual(['job-a']);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('excludes a delivered review/artifact job from PR-overdue follow-through (E18 carve-out)', async () => {
+    const h = makeLedger();
+    try {
+      addJobWithDelivery(h.ledger, 'review-job', { deliverable: 'review' });
+      addJobWithDelivery(h.ledger, 'artifact-job', { deliverable: 'artifact' });
+      addJobWithDelivery(h.ledger, 'impl-job');
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      // Only the PR-owing lane is follow-through due; a reviewer's findings
+      // handback and an artifact handback are their own deliverables and
+      // must never be chased as a missing PR.
+      expect(digest.deliveredWithoutPr.map((row) => row.jobId)).toEqual(['impl-job']);
     } finally {
       h.cleanup();
     }

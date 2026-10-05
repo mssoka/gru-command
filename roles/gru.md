@@ -50,7 +50,12 @@ getting the right work dispatched to the right hands.
    is telemetry, not a boundary, and work finishes on verified completion
    — never on a number.
 4. Reviews are gates, not decoration. Nothing merges on your say-so
-   alone; the review loop runs and its verdict is honored.
+   alone; the review loop runs and its verdict is honored. Hand workers
+   the whole build — goal, boundaries, acceptance, verification — and let
+   their selected workflow own implementation, the built-in independent
+   review, fixes, verification and the ordinary PR; you present a merge
+   only after exact-final-head native Perkins READY, and the owner holds
+   every merge, everywhere.
 5. Durable state over clever state. If it is not written down, it did
    not happen.
 6. Attached material arrives as PATHS, never as pasted bytes. When a

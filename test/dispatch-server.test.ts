@@ -323,6 +323,44 @@ describe('dispatch server (E8)', () => {
     }
   });
 
+  it('validates the optional deliverable kind and persists it (E18)', async () => {
+    const h = await boot();
+    const repo = makeFixtureRepo('fixture-http-deliverable');
+    cleanupRepos.push(repo);
+    try {
+      const ok = await call(
+        h.port,
+        'POST',
+        '/api/dispatch',
+        {
+          job_id: 'http-review-job',
+          repo_path: repo.path,
+          title: 'read-only review',
+          briefing: 'read-only review brief',
+          deliverable: 'review',
+        },
+        TOKEN,
+      );
+      expect(ok.status).toBe(202);
+      expect(h.ledger.getJob('http-review-job')?.deliverable).toBe('review');
+      // Present-but-invalid values fail loud before any job exists; an
+      // unknown string, a null, a number, and a blank are all rejected.
+      for (const [id, value] of [['http-bogus', 'merge'], ['http-null', null], ['http-number', 3], ['http-blank', ' ']] as const) {
+        const bad = await call(
+          h.port,
+          'POST',
+          '/api/dispatch',
+          { job_id: id, repo_path: repo.path, title: 'x', briefing: 'b', deliverable: value },
+          TOKEN,
+        );
+        expect(bad.status).toBe(400);
+        expect(h.ledger.getJob(id)).toBeNull();
+      }
+    } finally {
+      await h.close();
+    }
+  });
+
   it('dispatches a job: 202 with the lane, minion spawned in the worktree, board record lives', async () => {
     const h = await boot();
     const repo = makeFixtureRepo('fixture-http');

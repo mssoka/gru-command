@@ -122,12 +122,16 @@ export function hasVisibleCharacters(value: string): boolean {
   return value.replace(/[\p{Cf}\p{Cc}\p{M}\s]/gu, '') !== '';
 }
 
+export type JobDeliverable = 'pr' | 'review' | 'artifact' | 'investigation';
+
 export interface JobRecord {
   readonly id: string;
   readonly repo: string;
   readonly title: string;
   /** Optional short heist name; the full title remains authoritative. */
   readonly displayName: string | null;
+  /** The deliverable kind (E18). `null` = legacy row, treated as `'pr'`. */
+  readonly deliverable: JobDeliverable | null;
   readonly status: JobStatus;
   readonly baseBranch: string | null;
   readonly prUrl: string | null;
@@ -1059,6 +1063,7 @@ export class LedgerApi {
     displayName?: string | null;
     baseBranch?: string | null;
     briefing?: string | null;
+    deliverable?: JobDeliverable | null;
   }): JobRecord {
     if (input.id === '' || input.repo === '' || input.title === '') {
       throw new Error('job id, repo, and title must be non-empty');
@@ -1085,10 +1090,10 @@ export class LedgerApi {
       const ts = nowIso();
       this.db
         .prepare(
-          `INSERT INTO jobs (id, repo, title, status, base_branch, pr_url, note, briefing, display_name, created_at, updated_at)
-           VALUES (?, ?, ?, 'dispatched', ?, NULL, NULL, ?, ?, ?, ?)`,
+          `INSERT INTO jobs (id, repo, title, status, base_branch, pr_url, note, briefing, display_name, deliverable, created_at, updated_at)
+           VALUES (?, ?, ?, 'dispatched', ?, NULL, NULL, ?, ?, ?, ?, ?)`,
         )
-        .run(input.id, input.repo, input.title, input.baseBranch ?? null, input.briefing ?? null, displayName, ts, ts);
+        .run(input.id, input.repo, input.title, input.baseBranch ?? null, input.briefing ?? null, displayName, input.deliverable ?? null, ts, ts);
       this.appendEvent({ kind: 'job.created', jobId: input.id, payload: { repo: input.repo, title: input.title, display_name: displayName } });
       return this.getJob(input.id) as JobRecord;
     });
@@ -3446,6 +3451,7 @@ export class LedgerApi {
       repo: str(row.repo),
       title: str(row.title),
       displayName: nstr(row.display_name),
+      deliverable: nstr(row.deliverable) as JobDeliverable | null,
       status: str(row.status) as JobStatus,
       baseBranch: nstr(row.base_branch),
       prUrl: nstr(row.pr_url),

@@ -809,9 +809,13 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       .listPendingDirectives({ jobId: job.id, states: LIVE_DIRECTIVE_STATES }).length > 0;
     const reviewPending = job.status === 'working' || job.status === 'delivered' || job.status === 'in-review';
 
-    // (1) Delivered, no PR yet.
+    // (1) Delivered, no PR yet. Only PR-owing lanes (deliverable
+    // null/'pr', E18) belong here: a delivered review/artifact/
+    // investigation job completes at its handback, so flagging it as
+    // PR-overdue would manufacture ops work and false missing-PR alarms.
     if (delivered !== null && currentPhaseDelivered && reviewPending && !rebriefPending && !liveDirectiveOwns &&
-        job.prUrl === null && rounds.length === 0) {
+        job.prUrl === null && rounds.length === 0 &&
+        (job.deliverable === null || job.deliverable === 'pr')) {
       const lane = (input.worktrees?.listWorktrees({ jobId: job.id }) ?? []).find((candidate) => candidate.kind === 'job');
       // ATTRIBUTION, not routing: this pick names the implementer whose
       // session a human should open for the delivery — most recently

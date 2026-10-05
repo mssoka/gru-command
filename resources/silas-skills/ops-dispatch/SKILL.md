@@ -259,6 +259,24 @@ authorizes its full completion cycle, and YOU own driving it:
    verification output before acting).
 2. Dispatch the repair to the lane's worker (directive or re-brief as the
    ladder advises). Ordinary private commits on the lane are normal work.
+   Implementation workers select the task-relevant BMAD skills from the
+   project's actual installed catalog and own their workflows' built-in
+   review on fresh independent reviewer contexts (separately tracked
+   review jobs they commission through the dispatch surface, each with
+   its own session and worktree — never an untracked launcher or
+   extension subagent), their finding resolution, and their verification —
+   do not pull that work back between phases, never demand a fixed skill
+   name (BMAD names and workflows change between versions), and do not
+   commission a supplementary review duplicating the built-in one; your
+   gate is the native Perkins round on the exact final settled PR head.
+   Those reviewer jobs share the worker budget with the lane that
+   commissions them: a worker-reported nested-admission capability gap is
+   a scheduling gate — schedule around it under the configured worker
+   limits, never raise limits, and never substitute untracked reviewers.
+   Mark non-PR dispatches by kind: reviewer jobs carry `"deliverable":
+   "review"`, artifact-only and investigation lanes carry `"deliverable":
+   "artifact"` / `"investigation"`; implementation lanes omit the field
+   (PR-owing) — an unmarked non-PR dispatch is chased as a missing PR.
 3. Schedule verification through the shipped capture helper — never a
    hand-rolled background watcher. The helper path is named in your wake
    prompt ("Verification capture helper"):

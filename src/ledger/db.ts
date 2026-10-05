@@ -784,4 +784,13 @@ export const MIGRATIONS: readonly Migration[] = [
     name: 'job-display-name',
     sql: 'ALTER TABLE jobs ADD COLUMN display_name TEXT;',
   },
+  {
+    // Deliverable kind (E18): implementation lanes owe a PR; review jobs
+    // owe findings; artifact and investigation jobs owe a verified
+    // handback. The Silas digest uses this so a delivered reviewer's
+    // findings handback is never chased as a missing PR.
+    id: 18,
+    name: 'job-deliverable',
+    sql: `ALTER TABLE jobs ADD COLUMN deliverable TEXT;`,
+  },
 ];
