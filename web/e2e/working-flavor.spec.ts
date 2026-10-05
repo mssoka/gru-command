@@ -202,6 +202,11 @@ test('busy phrases rotate with stable status/control geometry on every surface',
   // The open tablet drawer becomes the phone sheet on resize; it stays
   // open, so no second FAB tap (which the open sheet would cover).
   await page.setViewportSize({ width: 390, height: 844 });
+  // The tablet drawer stays open across the width change and now covers
+  // the FAB — only tap it when the sheet is actually closed.
+  if ((await page.locator('#chat-sheet').getAttribute('data-open')) !== 'true') {
+    await page.locator('#gru-fab').click();
+  }
   await expect(page.locator('#chat-sheet')).toHaveAttribute('data-open', 'true');
   await expect(flavor).toBeVisible();
   await sweepApprovedLabels(page);

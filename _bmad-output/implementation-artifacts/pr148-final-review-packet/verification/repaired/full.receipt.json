@@ -1,0 +1,146 @@
+{
+  "at": "2026-10-03T08:13:32.511842+00:00",
+  "by": "minion",
+  "job": "wizard-bmad-deterministic-retry-32",
+  "scope": "full",
+  "head_expected": "9ba863746da8a0af3b6f20c00d3cb08acc95f28c",
+  "preflight": {
+    "at": "2026-10-03T08:13:29.846712+00:00",
+    "scope": "full",
+    "head": "9ba863746da8a0af3b6f20c00d3cb08acc95f28c",
+    "expected_head": "9ba863746da8a0af3b6f20c00d3cb08acc95f28c",
+    "tracked_dirty": "",
+    "remote_head": "1bac32d4ad2f006e863afa5cf3f480d47e83c9d9",
+    "job_status": "working",
+    "live_rounds": [],
+    "live_minions": [
+      "01a0fdf5-dde4-7194-a9fd-496e9cb2f932"
+    ],
+    "pending_rebriefs": 0,
+    "blocking_rebriefs": [],
+    "recent_verifications": [
+      {
+        "seq": 41833,
+        "ts": "2026-10-03T08:12:59.563Z",
+        "kind": "verification.completed"
+      },
+      {
+        "seq": 41831,
+        "ts": "2026-10-03T08:12:37.933Z",
+        "kind": "verification.started"
+      },
+      {
+        "seq": 41823,
+        "ts": "2026-10-03T08:11:06.613Z",
+        "kind": "verification.completed"
+      },
+      {
+        "seq": 41807,
+        "ts": "2026-10-03T08:09:25.058Z",
+        "kind": "verification.started"
+      }
+    ],
+    "verify_view": {
+      "lockInUse": true,
+      "activeRuns": 1,
+      "queuedRuns": 0,
+      "workerBudget": 14,
+      "workersPerRun": 14
+    },
+    "free_bytes": 56562495488
+  },
+  "starts": [
+    {
+      "type": "started",
+      "runId": "443c4247-c724-47fe-b80a-de0ab5b8f1bd",
+      "workers": 14,
+      "sha": "9ba863746da8a0af3b6f20c00d3cb08acc95f28c",
+      "queuedMs": 76474
+    }
+  ],
+  "completed": {
+    "type": "completed",
+    "runId": "443c4247-c724-47fe-b80a-de0ab5b8f1bd",
+    "outcome": {
+      "runId": "443c4247-c724-47fe-b80a-de0ab5b8f1bd",
+      "jobId": "wizard-bmad-deterministic-retry-32",
+      "scope": "full",
+      "command": "npm test",
+      "cwd": "<LANE_WORKTREE>",
+      "ok": true,
+      "exitCode": 0,
+      "signal": null,
+      "timedOut": false,
+      "queuedMs": 76474,
+      "durationMs": 821772,
+      "sha": "9ba863746da8a0af3b6f20c00d3cb08acc95f28c",
+      "trackedDirty": false,
+      "workers": 14,
+      "outputBytes": 110741,
+      "outputSha256": "14d2c78799f9d37b9a0d6576313274eafd26536cca3f20fce2a7680e8f318313",
+      "outputTail": "u-command/worktrees/gru-command/job-wizard-bmad-deterministic-retry-32/web\n\n \u2713 src/lib/working-flavor.test.ts (9 tests) 179ms\n \u2713 src/lib/uuid.test.ts (5 tests) 66ms\n \u2713 src/lib/board-bands.test.ts (20 tests) 54ms\n \u2713 src/lib/owner-band.test.ts (11 tests) 43ms\n \u2713 src/lib/board-client.test.ts (9 tests) 2526ms\n   \u2713 board client > detects a silently-dead socket via the liveness clock and recovers without a manual reload  956ms\n   \u2713 board client > keepalive ping frames refresh the liveness clock \u2014 a quiet-but-live socket is never reopened  330ms\n   \u2713 board client > wake() refetches the snapshot unconditionally and reopens a socket silent past the window  1014ms\n \u2713 src/lib/board-protocol.test.ts (13 tests) 25ms\n \u2713 src/lib/mock-safety.test.ts (11 tests) 46ms\n \u2713 src/lib/protocol.test.ts (18 tests) 23ms\n \u2713 src/lib/board-rail.test.ts (7 tests) 36ms\n \u2713 src/lib/board-health.test.ts (13 tests) 24ms\n \u2713 src/lib/chat-client-insecure-uuid.test.ts (2 tests) 19ms\n \u2713 src/lib/command-ticker.test.ts (6 tests) 13ms\n \u2713 src/lib/console-layout.test.ts (8 tests) 22ms\n \u2713 src/lib/mock-server-http.test.ts (2 tests) 6964ms\n   \u2713 dev mock upload endpoint hardening > materializes safely and pins raw/decoded caps, quota, UTF-8 names, and collisions  1109ms\n   \u2713 dev mock turn-hold fixture contract > parks the scripted turn until release, and reset settles a parked turn without ghost frames  5845ms\n \u2713 src/lib/board-kpi.test.ts (6 tests) 25ms\n \u2713 src/lib/board-signals.test.ts (16 tests) 31ms\n \u2713 src/styles/theme-surfaces.test.ts (4 tests) 45ms\n \u2713 src/lib/board-vocabulary.test.ts (3 tests) 12ms\n \u2713 src/lib/chat-storage.test.ts (4 tests) 17ms\n \u2713 src/lib/board-collapse.test.ts (4 tests) 24ms\n \u2713 src/lib/palette-contrast.test.ts (3 tests) 12ms\n \u2713 src/lib/board-time.test.ts (4 tests) 10ms\n \u2713 src/theme.test.ts (3 tests) 12ms\n \u2713 src/ui/pairing.test.ts (2 tests) 7ms\nstderr | src/lib/chat-client.test.ts > ChatClient > malformed frames are ignored without killing the session\ngru-chat: ignoring malformed frame {\"type\":\n\n \u2713 src/lib/chat-client.test.ts (30 tests) 11990ms\n   \u2713 ChatClient > reports an honest unknown compact outcome after its terminal result is lost  910ms\n   \u2713 ChatClient > recovers a pending new chat when reconnect first observes resetting  925ms\n   \u2713 ChatClient > treats an advanced resetting epoch as committed success when the result was lost  925ms\n   \u2713 ChatClient > surfaces an inferred failed New chat when its result is lost on reconnect  934ms\n   \u2713 ChatClient > socket drop mid-session reconnects with last_seen_seq (no full replay)  1089ms\n   \u2713 ChatClient > closes and retries when auth_ok is not followed by required context  870ms\n   \u2713 ChatClient > bad token \u2192 fatal error, no reconnect loop  328ms\n   \u2713 ChatClient > server log reset is detected and resynced with a full replay  2522ms\n   \u2713 ChatClient > LIVENESS: a socket silent past the window force-reconnects and replays missed history exactly once  1069ms\n   \u2713 ChatClient > LIVENESS: wake() re-opens a socket silent past the window without waiting out the backoff  1022ms\n \u2713 src/ui/owner-chime.test.ts (26 tests) 617ms\n \u2713 src/ui/chat-gfm-invariant.test.ts (7 tests) 500ms\n \u2713 src/ui/board.test.ts (51 tests) 1995ms\n \u2713 src/ui/chat-attachments.test.ts (11 tests) 468ms\n \u2713 src/lib/markdown.test.ts (21 tests) 313ms\n \u2713 src/ui/board-merged-attention.test.ts (5 tests) 346ms\n \u2713 src/ui/chat-scroll.test.ts (8 tests) 176ms\n \u2713 src/ui/decisions-status.test.ts (4 tests) 270ms\n \u2713 src/ui/chat-working-flavor.test.ts (9 tests) 179ms\n \u2713 src/ui/chat-tool-turn.test.ts (8 tests) 312ms\n \u2713 src/ui/chat-service-band.test.ts (8 tests) 180ms\n \u2713 src/ui/chat-composer.test.ts (6 tests) 147ms\n \u2713 src/ui/splitters.test.ts (10 tests) 95ms\n \u2713 src/ui/chat-console.test.ts (4 tests) 96ms\n \u2713 src/ui/console.test.ts (7 tests) 103ms\n \u2713 src/ui/rail-tabs.test.ts (3 tests) 66ms\n \u2713 src/lib/attach-client.test.ts (4 tests) 30ms\n \u2713 src/ui/chat-reflow.test.ts (5 tests) 29ms\n\n Test Files  43 passed (43)\n      Tests  410 passed (410)\n   Start at  09:28:02\n   Duration  27.88s (transform 3.58s, setup 0ms, collect 7.69s, tests 28.15s, environment 26.64s, prepare 16.20s)\n\n",
+      "error": null
+    }
+  },
+  "errors": [],
+  "frames": 279,
+  "transport_error": null,
+  "http_status": 200,
+  "queued": {
+    "type": "queued",
+    "runId": "443c4247-c724-47fe-b80a-de0ab5b8f1bd",
+    "position": 1,
+    "active": 1,
+    "limit": 1
+  },
+  "captured_output_bytes": 110741,
+  "captured_output_sha256": "14d2c78799f9d37b9a0d6576313274eafd26536cca3f20fce2a7680e8f318313",
+  "raw_ndjson_bytes": 142841,
+  "raw_ndjson_sha256": "83e5bc61c1e968e57c27d279b3b2d9db45afd0bfa643b12510b04b17a322328c",
+  "terminal_outcome": {
+    "runId": "443c4247-c724-47fe-b80a-de0ab5b8f1bd",
+    "jobId": "wizard-bmad-deterministic-retry-32",
+    "scope": "full",
+    "command": "npm test",
+    "cwd": "<LANE_WORKTREE>",
+    "ok": true,
+    "exitCode": 0,
+    "signal": null,
+    "timedOut": false,
+    "queuedMs": 76474,
+    "durationMs": 821772,
+    "sha": "9ba863746da8a0af3b6f20c00d3cb08acc95f28c",
+    "trackedDirty": false,
+    "workers": 14,
+    "outputBytes": 110741,
+    "outputSha256": "14d2c78799f9d37b9a0d6576313274eafd26536cca3f20fce2a7680e8f318313",
+    "error": null
+  },
+  "capture_matches": true,
+  "post_head": "9ba863746da8a0af3b6f20c00d3cb08acc95f28c",
+  "post_tracked_dirty": "",
+  "ledger_terminal": {
+    "seq": 41880,
+    "ts": "2026-10-03T08:28:30.817Z",
+    "payload": {
+      "run_id": "443c4247-c724-47fe-b80a-de0ab5b8f1bd",
+      "scope": "full",
+      "command": "npm test",
+      "cwd": "<LANE_WORKTREE>",
+      "sha": "9ba863746da8a0af3b6f20c00d3cb08acc95f28c",
+      "tracked_dirty": false,
+      "ok": true,
+      "exit_code": 0,
+      "signal": null,
+      "timed_out": false,
+      "queued_ms": 76474,
+      "duration_ms": 821772,
+      "workers": 14,
+      "output_bytes": 110741,
+      "output_sha256": "14d2c78799f9d37b9a0d6576313274eafd26536cca3f20fce2a7680e8f318313",
+      "output_tail": "u-command/worktrees/gru-command/job-wizard-bmad-deterministic-retry-32/web\n\n \u2713 src/lib/working-flavor.test.ts (9 tests) 179ms\n \u2713 src/lib/uuid.test.ts (5 tests) 66ms\n \u2713 src/lib/board-bands.test.ts (20 tests) 54ms\n \u2713 src/lib/owner-band.test.ts (11 tests) 43ms\n \u2713 src/lib/board-client.test.ts (9 tests) 2526ms\n   \u2713 board client > detects a silently-dead socket via the liveness clock and recovers without a manual reload  956ms\n   \u2713 board client > keepalive ping frames refresh the liveness clock \u2014 a quiet-but-live socket is never reopened  330ms\n   \u2713 board client > wake() refetches the snapshot unconditionally and reopens a socket silent past the window  1014ms\n \u2713 src/lib/board-protocol.test.ts (13 tests) 25ms\n \u2713 src/lib/mock-safety.test.ts (11 tests) 46ms\n \u2713 src/lib/protocol.test.ts (18 tests) 23ms\n \u2713 src/lib/board-rail.test.ts (7 tests) 36ms\n \u2713 src/lib/board-health.test.ts (13 tests) 24ms\n \u2713 src/lib/chat-client-insecure-uuid.test.ts (2 tests) 19ms\n \u2713 src/lib/command-ticker.test.ts (6 tests) 13ms\n \u2713 src/lib/console-layout.test.ts (8 tests) 22ms\n \u2713 src/lib/mock-server-http.test.ts (2 tests) 6964ms\n   \u2713 dev mock upload endpoint hardening > materializes safely and pins raw/decoded caps, quota, UTF-8 names, and collisions  1109ms\n   \u2713 dev mock turn-hold fixture contract > parks the scripted turn until release, and reset settles a parked turn without ghost frames  5845ms\n \u2713 src/lib/board-kpi.test.ts (6 tests) 25ms\n \u2713 src/lib/board-signals.test.ts (16 tests) 31ms\n \u2713 src/styles/theme-surfaces.test.ts (4 tests) 45ms\n \u2713 src/lib/board-vocabulary.test.ts (3 tests) 12ms\n \u2713 src/lib/chat-storage.test.ts (4 tests) 17ms\n \u2713 src/lib/board-collapse.test.ts (4 tests) 24ms\n \u2713 src/lib/palette-contrast.test.ts (3 tests) 12ms\n \u2713 src/lib/board-time.test.ts (4 tests) 10ms\n \u2713 src/theme.test.ts (3 tests) 12ms\n \u2713 src/ui/pairing.test.ts (2 tests) 7ms\nstderr | src/lib/chat-client.test.ts > ChatClient > malformed frames are ignored without killing the session\ngru-chat: ignoring malformed frame {\"type\":\n\n \u2713 src/lib/chat-client.test.ts (30 tests) 11990ms\n   \u2713 ChatClient > reports an honest unknown compact outcome after its terminal result is lost  910ms\n   \u2713 ChatClient > recovers a pending new chat when reconnect first observes resetting  925ms\n   \u2713 ChatClient > treats an advanced resetting epoch as committed success when the result was lost  925ms\n   \u2713 ChatClient > surfaces an inferred failed New chat when its result is lost on reconnect  934ms\n   \u2713 ChatClient > socket drop mid-session reconnects with last_seen_seq (no full replay)  1089ms\n   \u2713 ChatClient > closes and retries when auth_ok is not followed by required context  870ms\n   \u2713 ChatClient > bad token \u2192 fatal error, no reconnect loop  328ms\n   \u2713 ChatClient > server log reset is detected and resynced with a full replay  2522ms\n   \u2713 ChatClient > LIVENESS: a socket silent past the window force-reconnects and replays missed history exactly once  1069ms\n   \u2713 ChatClient > LIVENESS: wake() re-opens a socket silent past the window without waiting out the backoff  1022ms\n \u2713 src/ui/owner-chime.test.ts (26 tests) 617ms\n \u2713 src/ui/chat-gfm-invariant.test.ts (7 tests) 500ms\n \u2713 src/ui/board.test.ts (51 tests) 1995ms\n \u2713 src/ui/chat-attachments.test.ts (11 tests) 468ms\n \u2713 src/lib/markdown.test.ts (21 tests) 313ms\n \u2713 src/ui/board-merged-attention.test.ts (5 tests) 346ms\n \u2713 src/ui/chat-scroll.test.ts (8 tests) 176ms\n \u2713 src/ui/decisions-status.test.ts (4 tests) 270ms\n \u2713 src/ui/chat-working-flavor.test.ts (9 tests) 179ms\n \u2713 src/ui/chat-tool-turn.test.ts (8 tests) 312ms\n \u2713 src/ui/chat-service-band.test.ts (8 tests) 180ms\n \u2713 src/ui/chat-composer.test.ts (6 tests) 147ms\n \u2713 src/ui/splitters.test.ts (10 tests) 95ms\n \u2713 src/ui/chat-console.test.ts (4 tests) 96ms\n \u2713 src/ui/console.test.ts (7 tests) 103ms\n \u2713 src/ui/rail-tabs.test.ts (3 tests) 66ms\n \u2713 src/lib/attach-client.test.ts (4 tests) 30ms\n \u2713 src/ui/chat-reflow.test.ts (5 tests) 29ms\n\n Test Files  43 passed (43)\n      Tests  410 passed (410)\n   Start at  09:28:02\n   Duration  27.88s (transform 3.58s, setup 0ms, collect 7.69s, tests 28.15s, environment 26.64s, prepare 16.20s)\n\n",
+      "error": null
+    }
+  },
+  "ledger_match": true
+}

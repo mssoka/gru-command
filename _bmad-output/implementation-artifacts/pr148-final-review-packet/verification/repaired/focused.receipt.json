@@ -1,0 +1,146 @@
+{
+  "at": "2026-10-03T08:02:37.915326+00:00",
+  "by": "minion",
+  "job": "wizard-bmad-deterministic-retry-32",
+  "scope": "wizard-bmad-retry",
+  "head_expected": "9ba863746da8a0af3b6f20c00d3cb08acc95f28c",
+  "preflight": {
+    "at": "2026-10-03T08:02:36.198793+00:00",
+    "scope": "wizard-bmad-retry",
+    "head": "9ba863746da8a0af3b6f20c00d3cb08acc95f28c",
+    "expected_head": "9ba863746da8a0af3b6f20c00d3cb08acc95f28c",
+    "tracked_dirty": "",
+    "remote_head": "1bac32d4ad2f006e863afa5cf3f480d47e83c9d9",
+    "job_status": "working",
+    "live_rounds": [],
+    "live_minions": [
+      "01a0fdf5-dde4-7194-a9fd-496e9cb2f932"
+    ],
+    "pending_rebriefs": 0,
+    "blocking_rebriefs": [],
+    "recent_verifications": [
+      {
+        "seq": 41788,
+        "ts": "2026-10-03T08:02:03.011Z",
+        "kind": "verification.lock-timeout"
+      },
+      {
+        "seq": 41721,
+        "ts": "2026-10-03T07:46:23.857Z",
+        "kind": "verification.completed"
+      },
+      {
+        "seq": 41716,
+        "ts": "2026-10-03T07:44:43.855Z",
+        "kind": "verification.started"
+      },
+      {
+        "seq": 41674,
+        "ts": "2026-10-03T07:32:48.249Z",
+        "kind": "verification.lock-timeout"
+      }
+    ],
+    "verify_view": {
+      "lockInUse": true,
+      "activeRuns": 1,
+      "queuedRuns": 1,
+      "workerBudget": 14,
+      "workersPerRun": 14
+    },
+    "free_bytes": 56596873216
+  },
+  "starts": [
+    {
+      "type": "started",
+      "runId": "02a41d78-5b47-426c-9c29-3130c6b8f397",
+      "workers": 14,
+      "sha": "9ba863746da8a0af3b6f20c00d3cb08acc95f28c",
+      "queuedMs": 407121
+    }
+  ],
+  "completed": {
+    "type": "completed",
+    "runId": "02a41d78-5b47-426c-9c29-3130c6b8f397",
+    "outcome": {
+      "runId": "02a41d78-5b47-426c-9c29-3130c6b8f397",
+      "jobId": "wizard-bmad-deterministic-retry-32",
+      "scope": "wizard-bmad-retry",
+      "command": "npm run build && node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/bmad-onboarding.test.ts test/wizard-interactive.test.ts test/wizard.test.ts test/suite-shape.test.ts",
+      "cwd": "<LANE_WORKTREE>",
+      "ok": true,
+      "exitCode": 0,
+      "signal": null,
+      "timedOut": false,
+      "queuedMs": 407121,
+      "durationMs": 101555,
+      "sha": "9ba863746da8a0af3b6f20c00d3cb08acc95f28c",
+      "trackedDirty": false,
+      "workers": 14,
+      "outputBytes": 9047,
+      "outputSha256": "3ba27534cddefde92b8186fc037115761769a6047eba9cf33b620a4743e5614f",
+      "outputTail": "ding > gh-32 final-review repairs (independent tracked review) > fresh-installer output failing post-install validation stays transient (never skip-only)  1260ms\n   \u2713 per-selected-repo BMAD onboarding > gh-32 final-review repairs (independent tracked review) > missing skills root and ENOTDIR root report the root; EACCES stays transient  3669ms\n   \u2713 per-selected-repo BMAD onboarding > gh-32 final-review repairs (independent tracked review) > control-file refusals are deterministic skip-only without mutation  1817ms\n   \u2713 per-selected-repo BMAD onboarding > gh-32 final-review repairs (independent tracked review) > validateRepo refusals outside the covered pair are deterministic, and EACCES stays transient  1364ms\n   \u2713 per-selected-repo BMAD onboarding > gh-32 final-review repairs (independent tracked review) > reuse-path content validator classifications are pinned (final review)  4105ms\n   \u2713 per-selected-repo BMAD onboarding > gh-32 final-review repairs (independent tracked review) > a denied manifest read stays transient and recovers on the SAME collected answers  1428ms\n   \u2713 per-selected-repo BMAD onboarding > gh-32 final-review repairs (independent tracked review) > ancestor symlink refusals carry the official-installer repair hint for existing installs  952ms\n \u2713 test/wizard-interactive.test.ts (11 tests) 74671ms\n   \u2713 interactive wizard under a pty (Perkins r2 T1) > all-defaults happy path: prompts answered, config written, smoke green  11778ms\n   \u2713 interactive wizard under a pty (Perkins r2 T1) > Enter accepts the default-on fresh BMAD action and reaches ready state  7409ms\n   \u2713 interactive wizard under a pty (Perkins r2 T1) > deterministic BMAD failure offers skip-only with the deliberate-fix path; Enter skips and setup completes (gh-32)  7367ms\n   \u2713 interactive wizard under a pty (Perkins r2 T1) > transient BMAD failure still offers retry; a successful retried attempt completes (gh-32)  9522ms\n   \u2713 interactive wizard under a pty (Perkins r2 T1) > already-onboarded deleted runtime binding is skip-only deterministic; a typed retry is refused and only skip completes (gh-32 r1)  14716ms\n   \u2713 interactive wizard under a pty (Perkins r2 T1) > every prompt loop retries on invalid input, then accepts the valid answer  4912ms\n   \u2713 interactive wizard under a pty (Perkins r2 T1) > managed-repo multi-pick by INDEX selects exactly that repo  4960ms\n   \u2713 interactive wizard under a pty (Perkins r2 T1) > managed-repo multi-pick by NAME (comma-separated) selects exactly those repos  4535ms\n   \u2713 interactive wizard under a pty (Perkins r2 T1) > bind host rejects y/n tokens and re-prompts; 0.0.0.0 lands in the config (user-found boot bug)  4822ms\n   \u2713 interactive wizard under a pty (Perkins r2 T1) > bind host accepts a resolvable hostname (localhost) end-to-end  4463ms\n \u2713 test/wizard.test.ts (27 tests) 76566ms\n   \u2713 wizard CLI surface > interactive mode without a TTY exits 2 printing the terminal recovery command (Perkins r1 B1)  4833ms\n   \u2713 wizard CLI surface > noninteractive deterministic BMAD failure fails loud without offering retry; explicit skip completes (gh-32)  23434ms\n   \u2713 wizard CLI surface > noninteractive hint-less deterministic failures name the neutral deliberate repair (gh-32 final review)  6992ms\n   \u2713 wizard CLI surface > noninteractive deleted recorded binding after successful onboard fails loud skip-only with the installer hint (gh-32 r1)  14238ms\n   \u2713 wizard CLI surface > --answers without a JSON argument exits 2 with usage  3581ms\n   \u2713 wizard CLI surface > --answers rejects secrets (token) and non-object JSON with the documented errors  17425ms\n   \u2713 wizard CLI surface > pre-flight port check: an occupied fixed port fails LOUD with stop-first guidance, nothing written (Perkins r2 H2)  3233ms\n   \u2713 wizard first-boot smoke \u2014 failure modes (I/O matrix) > a service that never answers /health fails loud NAMING the missing signal  2229ms\n\n Test Files  4 passed (4)\n      Tests  67 passed (67)\n   Start at  09:09:43\n   Duration  82.74s (transform 1.75s, setup 208ms, collect 6.49s, tests 223.00s, environment 1ms, prepare 2.24s)\n\n",
+      "error": null
+    }
+  },
+  "errors": [],
+  "frames": 28,
+  "transport_error": null,
+  "http_status": 200,
+  "queued": {
+    "type": "queued",
+    "runId": "02a41d78-5b47-426c-9c29-3130c6b8f397",
+    "position": 2,
+    "active": 1,
+    "limit": 1
+  },
+  "captured_output_bytes": 9047,
+  "captured_output_sha256": "3ba27534cddefde92b8186fc037115761769a6047eba9cf33b620a4743e5614f",
+  "raw_ndjson_bytes": 16698,
+  "raw_ndjson_sha256": "d2c6cccc27c70f1d5c1830df66aa007d6d2b44cdd51c3bb221dd41c7ae8f4700",
+  "terminal_outcome": {
+    "runId": "02a41d78-5b47-426c-9c29-3130c6b8f397",
+    "jobId": "wizard-bmad-deterministic-retry-32",
+    "scope": "wizard-bmad-retry",
+    "command": "npm run build && node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/bmad-onboarding.test.ts test/wizard-interactive.test.ts test/wizard.test.ts test/suite-shape.test.ts",
+    "cwd": "<LANE_WORKTREE>",
+    "ok": true,
+    "exitCode": 0,
+    "signal": null,
+    "timedOut": false,
+    "queuedMs": 407121,
+    "durationMs": 101555,
+    "sha": "9ba863746da8a0af3b6f20c00d3cb08acc95f28c",
+    "trackedDirty": false,
+    "workers": 14,
+    "outputBytes": 9047,
+    "outputSha256": "3ba27534cddefde92b8186fc037115761769a6047eba9cf33b620a4743e5614f",
+    "error": null
+  },
+  "capture_matches": true,
+  "post_head": "9ba863746da8a0af3b6f20c00d3cb08acc95f28c",
+  "post_tracked_dirty": "",
+  "ledger_terminal": {
+    "seq": 41823,
+    "ts": "2026-10-03T08:11:06.613Z",
+    "payload": {
+      "run_id": "02a41d78-5b47-426c-9c29-3130c6b8f397",
+      "scope": "wizard-bmad-retry",
+      "command": "npm run build && node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/bmad-onboarding.test.ts test/wizard-interactive.test.ts test/wizard.test.ts test/suite-shape.test.ts",
+      "cwd": "<LANE_WORKTREE>",
+      "sha": "9ba863746da8a0af3b6f20c00d3cb08acc95f28c",
+      "tracked_dirty": false,
+      "ok": true,
+      "exit_code": 0,
+      "signal": null,
+      "timed_out": false,
+      "queued_ms": 407121,
+      "duration_ms": 101555,
+      "workers": 14,
+      "output_bytes": 9047,
+      "output_sha256": "3ba27534cddefde92b8186fc037115761769a6047eba9cf33b620a4743e5614f",
+      "output_tail": "ding > gh-32 final-review repairs (independent tracked review) > fresh-installer output failing post-install validation stays transient (never skip-only)  1260ms\n   \u2713 per-selected-repo BMAD onboarding > gh-32 final-review repairs (independent tracked review) > missing skills root and ENOTDIR root report the root; EACCES stays transient  3669ms\n   \u2713 per-selected-repo BMAD onboarding > gh-32 final-review repairs (independent tracked review) > control-file refusals are deterministic skip-only without mutation  1817ms\n   \u2713 per-selected-repo BMAD onboarding > gh-32 final-review repairs (independent tracked review) > validateRepo refusals outside the covered pair are deterministic, and EACCES stays transient  1364ms\n   \u2713 per-selected-repo BMAD onboarding > gh-32 final-review repairs (independent tracked review) > reuse-path content validator classifications are pinned (final review)  4105ms\n   \u2713 per-selected-repo BMAD onboarding > gh-32 final-review repairs (independent tracked review) > a denied manifest read stays transient and recovers on the SAME collected answers  1428ms\n   \u2713 per-selected-repo BMAD onboarding > gh-32 final-review repairs (independent tracked review) > ancestor symlink refusals carry the official-installer repair hint for existing installs  952ms\n \u2713 test/wizard-interactive.test.ts (11 tests) 74671ms\n   \u2713 interactive wizard under a pty (Perkins r2 T1) > all-defaults happy path: prompts answered, config written, smoke green  11778ms\n   \u2713 interactive wizard under a pty (Perkins r2 T1) > Enter accepts the default-on fresh BMAD action and reaches ready state  7409ms\n   \u2713 interactive wizard under a pty (Perkins r2 T1) > deterministic BMAD failure offers skip-only with the deliberate-fix path; Enter skips and setup completes (gh-32)  7367ms\n   \u2713 interactive wizard under a pty (Perkins r2 T1) > transient BMAD failure still offers retry; a successful retried attempt completes (gh-32)  9522ms\n   \u2713 interactive wizard under a pty (Perkins r2 T1) > already-onboarded deleted runtime binding is skip-only deterministic; a typed retry is refused and only skip completes (gh-32 r1)  14716ms\n   \u2713 interactive wizard under a pty (Perkins r2 T1) > every prompt loop retries on invalid input, then accepts the valid answer  4912ms\n   \u2713 interactive wizard under a pty (Perkins r2 T1) > managed-repo multi-pick by INDEX selects exactly that repo  4960ms\n   \u2713 interactive wizard under a pty (Perkins r2 T1) > managed-repo multi-pick by NAME (comma-separated) selects exactly those repos  4535ms\n   \u2713 interactive wizard under a pty (Perkins r2 T1) > bind host rejects y/n tokens and re-prompts; 0.0.0.0 lands in the config (user-found boot bug)  4822ms\n   \u2713 interactive wizard under a pty (Perkins r2 T1) > bind host accepts a resolvable hostname (localhost) end-to-end  4463ms\n \u2713 test/wizard.test.ts (27 tests) 76566ms\n   \u2713 wizard CLI surface > interactive mode without a TTY exits 2 printing the terminal recovery command (Perkins r1 B1)  4833ms\n   \u2713 wizard CLI surface > noninteractive deterministic BMAD failure fails loud without offering retry; explicit skip completes (gh-32)  23434ms\n   \u2713 wizard CLI surface > noninteractive hint-less deterministic failures name the neutral deliberate repair (gh-32 final review)  6992ms\n   \u2713 wizard CLI surface > noninteractive deleted recorded binding after successful onboard fails loud skip-only with the installer hint (gh-32 r1)  14238ms\n   \u2713 wizard CLI surface > --answers without a JSON argument exits 2 with usage  3581ms\n   \u2713 wizard CLI surface > --answers rejects secrets (token) and non-object JSON with the documented errors  17425ms\n   \u2713 wizard CLI surface > pre-flight port check: an occupied fixed port fails LOUD with stop-first guidance, nothing written (Perkins r2 H2)  3233ms\n   \u2713 wizard first-boot smoke \u2014 failure modes (I/O matrix) > a service that never answers /health fails loud NAMING the missing signal  2229ms\n\n Test Files  4 passed (4)\n      Tests  67 passed (67)\n   Start at  09:09:43\n   Duration  82.74s (transform 1.75s, setup 208ms, collect 6.49s, tests 223.00s, environment 1ms, prepare 2.24s)\n\n",
+      "error": null
+    }
+  },
+  "ledger_match": true
+}

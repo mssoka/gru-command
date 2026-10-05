@@ -1,0 +1,219 @@
+vitest-rpc-timeout: already patched node_modules/vitest/dist/chunks/rpc.-pEldfrD.js
+vitest-rpc-timeout: 0 file(s) patched this run, 1 checked
+
+> gru-command@1.0.0 test:web
+> npm run test -w web
+
+
+> @gru-command/web@1.0.0 test
+> tsc --noEmit -p tsconfig.json && vitest run
+
+
+ RUN  v3.2.7 <LANE_WORKTREE>/web
+
+ ✓ src/lib/uuid.test.ts (5 tests) 176ms
+ ✓ src/lib/mock-server-http.test.ts (1 test) 1679ms
+   ✓ dev mock upload endpoint hardening > materializes safely and pins raw/decoded caps, quota, UTF-8 names, and collisions  1673ms
+ ✓ src/lib/owner-band.test.ts (11 tests) 86ms
+ ✓ src/lib/working-flavor.test.ts (9 tests) 86ms
+ ✓ src/lib/board-rail.test.ts (7 tests) 20ms
+ ✓ src/lib/board-client.test.ts (9 tests) 2749ms
+   ✓ board client > detects a silently-dead socket via the liveness clock and recovers without a manual reload  998ms
+   ✓ board client > keepalive ping frames refresh the liveness clock — a quiet-but-live socket is never reopened  322ms
+   ✓ board client > wake() refetches the snapshot unconditionally and reopens a socket silent past the window  1057ms
+ ✓ src/lib/board-bands.test.ts (20 tests) 165ms
+ ✓ src/lib/mock-safety.test.ts (11 tests) 90ms
+ ✓ src/styles/theme-surfaces.test.ts (4 tests) 29ms
+ ✓ src/lib/board-signals.test.ts (16 tests) 17ms
+ ✓ src/lib/protocol.test.ts (18 tests) 51ms
+ ✓ src/lib/board-health.test.ts (13 tests) 32ms
+ ✓ src/lib/chat-client-insecure-uuid.test.ts (2 tests) 24ms
+ ✓ src/lib/console-layout.test.ts (8 tests) 30ms
+ ✓ src/lib/board-protocol.test.ts (13 tests) 50ms
+ ✓ src/lib/board-time.test.ts (4 tests) 27ms
+ ✓ src/lib/board-kpi.test.ts (6 tests) 29ms
+ ✓ src/lib/board-collapse.test.ts (4 tests) 15ms
+ ✓ src/lib/command-ticker.test.ts (6 tests) 24ms
+ ✓ src/lib/board-vocabulary.test.ts (3 tests) 13ms
+ ✓ src/lib/chat-storage.test.ts (4 tests) 22ms
+ ✓ src/lib/palette-contrast.test.ts (3 tests) 20ms
+ ✓ src/theme.test.ts (3 tests) 15ms
+ ✓ src/ui/pairing.test.ts (2 tests) 9ms
+ ✓ src/lib/chat-client.test.ts (30 tests) 12336ms
+   ✓ ChatClient > reports an honest unknown compact outcome after its terminal result is lost  945ms
+   ✓ ChatClient > recovers a pending new chat when reconnect first observes resetting  902ms
+   ✓ ChatClient > treats an advanced resetting epoch as committed success when the result was lost  940ms
+   ✓ ChatClient > surfaces an inferred failed New chat when its result is lost on reconnect  930ms
+   ✓ ChatClient > socket drop mid-session reconnects with last_seen_seq (no full replay)  1101ms
+   ✓ ChatClient > closes and retries when auth_ok is not followed by required context  899ms
+   ✓ ChatClient > bad token → fatal error, no reconnect loop  327ms
+   ✓ ChatClient > server log reset is detected and resynced with a full replay  2540ms
+   ✓ ChatClient > LIVENESS: a socket silent past the window force-reconnects and replays missed history exactly once  1028ms
+   ✓ ChatClient > LIVENESS: wake() re-opens a socket silent past the window without waiting out the backoff  1052ms
+stderr | src/lib/chat-client.test.ts > ChatClient > malformed frames are ignored without killing the session
+gru-chat: ignoring malformed frame {"type":
+
+ ✓ src/ui/chat-gfm-invariant.test.ts (7 tests) 585ms
+ ✓ src/ui/chat-attachments.test.ts (11 tests) 642ms
+ ✓ src/ui/owner-chime.test.ts (26 tests) 908ms
+ ✓ src/ui/board.test.ts (51 tests) 2743ms
+   ✓ board view resolved-notification rendering > removes ack/badge/toast behavior for resolved rows while retaining active controls  384ms
+ ✓ src/ui/board-merged-attention.test.ts (5 tests) 788ms
+   ✓ board rendered regression — concluded jobs and stale review history > merged jobs with aborted latest rounds render in SETTLED/COLD, and NEEDS GRU reports calm  337ms
+ ✓ src/ui/decisions-status.test.ts (4 tests) 381ms
+ ✓ src/ui/chat-service-band.test.ts (8 tests) 411ms
+ ✓ src/lib/markdown.test.ts (21 tests) 559ms
+ ✓ src/ui/chat-composer.test.ts (6 tests) 370ms
+ ✓ src/ui/chat-working-flavor.test.ts (9 tests) 503ms
+ ✓ src/ui/splitters.test.ts (10 tests) 185ms
+ ✓ src/ui/chat-tool-turn.test.ts (8 tests) 402ms
+ ✓ src/ui/chat-console.test.ts (4 tests) 167ms
+ ✓ src/ui/chat-scroll.test.ts (8 tests) 339ms
+ ✓ src/ui/rail-tabs.test.ts (3 tests) 112ms
+ ✓ src/ui/console.test.ts (7 tests) 148ms
+ ✓ src/lib/attach-client.test.ts (4 tests) 116ms
+ ✓ src/ui/chat-reflow.test.ts (5 tests) 57ms
+
+ Test Files  43 passed (43)
+      Tests  409 passed (409)
+   Start at  01:03:38
+   Duration  40.97s (transform 5.61s, setup 0ms, collect 12.86s, tests 27.21s, environment 47.71s, prepare 22.48s)
+
+
+> gru-command@1.0.0 e2e
+> npm run build && npm run e2e -w web
+
+
+> gru-command@1.0.0 build
+> tsc && node -e "const fs=require('node:fs'); fs.mkdirSync('dist/runtime',{recursive:true}); fs.copyFileSync('src/runtime/review-mcp-server.mjs', 'dist/runtime/review-mcp-server.mjs')" && node tools/verify-perkins-resource.mjs . && node tools/write-build-rev.mjs
+
+{"loadedFile":"<LANE_WORKTREE>/resources/perkins-code-review/policy.json","bridgeFile":"<LANE_WORKTREE>/dist/runtime/review-mcp-server.mjs","policySha256":"5622da6b100dff79cda29147cb7a3ecd8dd5e0e4905b8bcfb4dcd22f58dfb6a9","bridgeSha256":"badd96c16800cffb9e18734f777d40d423b72423b89debed5684ad42c62f2032","canonicalSourceSha256":"f38c28ffb10b4e44fa1f87f260a08507bb0a5c8872de2cf47e05a985c5eb92e7","residueScan":{"scannedBytes":629159,"scannedFiles":33}}
+build rev c275cfbcf847ac53f6257eb3a4a609ae804815bf → <LANE_WORKTREE>/dist/build-rev.json
+
+> @gru-command/web@1.0.0 e2e
+> npm run build && playwright test
+
+
+> @gru-command/web@1.0.0 build
+> tsc --noEmit -p tsconfig.json && vite build
+
+vite v6.4.3 building for production...
+transforming...
+✓ 90 modules transformed.
+rendering chunks...
+computing gzip size...
+dist/index.html                  13.30 kB │ gzip:  3.87 kB
+dist/assets/index-DAjC8zY_.css   41.27 kB │ gzip:  8.63 kB
+dist/assets/index-X4mnPKRS.js   152.68 kB │ gzip: 48.16 kB
+✓ built in 1.35s
+[WebServer] WARNING: using the development-only default token; mock server is restricted to loopback.
+
+Running 51 tests using 1 worker
+
+  ✓   1 [mock] › e2e/smoke.spec.ts:40:1 › pair, send, streamed reply with tool line (3.8s)
+  ✓   2 [mock] › e2e/smoke.spec.ts:53:1 › multi-line composer (desktop, fine pointer): Shift+Enter newlines, grows without horizontal overflow, Enter sends intact (4.3s)
+  ✓   3 [mock] › e2e/smoke.spec.ts:94:1 › composer caps at ~10rem and scrolls internally past the cap (2.2s)
+  ✓   4 [mock] › e2e/smoke.spec.ts:113:1 › touch composer on a 390px phone (coarse pointer): return inserts a newline, send button visible, click-to-send works (3.7s)
+[WebServer] [2m1:05:18 AM[22m [31m[1m[vite][22m[39m [31mws proxy socket error:[39m
+[WebServer] Error: read ECONNRESET
+[WebServer]     at TCP.onStreamRead (node:internal/stream_base_commons:216:20)
+  ✓   5 [mock] › e2e/smoke.spec.ts:179:1 › context controls compact in place and New chat advances a reload-safe empty view (9.5s)
+  ✓   6 [mock] › e2e/smoke.spec.ts:222:1 › failed New chat restores history and delivers a word typed in the pending view once (9.3s)
+  ✓   7 [mock] › e2e/smoke.spec.ts:259:1 › reconnect keeps history after reload (no duplicates) (3.4s)
+  ✓   8 [mock] › e2e/smoke.spec.ts:271:1 › mobile viewport: board-first; chat is a corner bubble that opens a sheet (4.1s)
+  ✓   9 [mock] › e2e/smoke.spec.ts:300:1 › wrong token: inline error, stays on pairing across reload (1.3s)
+  ✓  10 [mock] › e2e/smoke.spec.ts:314:1 › legacy outbox migration is atomic and browser tabs keep independent queues (1.1s)
+  ✓  11 [mock] › e2e/smoke.spec.ts:373:1 › mock controls reject missing/wrong tokens without state changes and valid controls act (6.8s)
+  ✓  12 [mock] › e2e/smoke.spec.ts:446:1 › socket drop shows a degraded banner that clears on recovery (3.9s)
+  ✓  13 [mock] › e2e/smoke.spec.ts:460:3 › board (E6, mock feed) › FOR YOU owner band renders the pending owner obligations above the job bands (1.6s)
+  ✓  14 [mock] › e2e/smoke.spec.ts:488:3 › board (E6, mock feed) › dense rows collapse by default; expanding reveals the round lens chips (2.2s)
+  ✓  15 [mock] › e2e/smoke.spec.ts:537:3 › board (E6, mock feed) › v6: the chip rail carries the v4 health row + folded KPI counts, bands stay ordered (1.6s)
+  ✓  16 [mock] › e2e/smoke.spec.ts:594:3 › board (E6, mock feed) › row disclosure persists per job across a reload (v3) (1.9s)
+  ✓  17 [mock] › e2e/smoke.spec.ts:623:3 › board (E6, mock feed) › trackers: lane strip, round progress, decisions + unacked, disposed collapse (2.2s)
+  ✓  18 [mock] › e2e/smoke.spec.ts:668:3 › board (E6, mock feed) › trackers render in dark theme and on a narrow phone viewport (2.0s)
+  ✓  19 [mock] › e2e/smoke.spec.ts:689:3 › board (E6, mock feed) › transcript drawer: mock transcript lists, opens, searches (2.6s)
+  ✓  20 [mock] › e2e/smoke.spec.ts:706:3 › cockpit layout (v6) › 1440px: three panes + drag splitters; the drag persists, double-click resets, settled window rolls (5.6s)
+  ✓  21 [mock] › e2e/smoke.spec.ts:780:3 › cockpit layout (v6) › 1100px cockpit edge: three panes, floor widths hold, no horizontal overflow (1.5s)
+  ✓  22 [mock] › e2e/smoke.spec.ts:797:3 › cockpit layout (v6) › 1000px two-pane: board + rail, FAB opens the dimmed overlay chat (2.0s)
+  ✓  23 [mock] › e2e/smoke.spec.ts:818:3 › cockpit layout (v6) › single column at 800px: rail stacks below, FAB overlay sheet over the board (2.3s)
+  ✓  24 [mock] › e2e/smoke.spec.ts:927:3 › chat pane reflow (owner heist) › stress content reflows at floor/default/ceiling through a live drag, light and dark (7.7s)
+  ✓  25 [mock] › e2e/smoke.spec.ts:967:3 › chat pane reflow (owner heist) › stress content reflows inside the tablet drawer and the phone sheet (6.2s)
+  ✓  26 [mock] › e2e/smoke.spec.ts:995:3 › themes › light default, dark toggle persists, both snapshotted (5.0s)
+  ✓  27 [mock] › e2e/smoke.spec.ts:1061:3 › phone chrome › nav fits the phone: zero horizontal overflow on chat and board, every control reachable (2.8s)
+  ✓  28 [mock] › e2e/smoke.spec.ts:1101:3 › phone chrome › 561px band: the single-row nav still fits without overflow or clipped controls (1.9s)
+  ✘  29 [mock] › e2e/working-flavor.spec.ts:109:1 › busy phrases rotate with stable status/control geometry on every surface (6.3s)
+  ✓  30 [lens-pills] › e2e/lens-pills.spec.ts:251:3 › lens pills — unused is neutral, never a pass (synthetic fixture) › seven pills: four unused gray without a tick, three clean green; light/dark, phone/desktop (4.6s)
+  ✓  31 [lens-pills] › e2e/lens-pills.spec.ts:300:3 › lens pills — unused is neutral, never a pass (synthetic fixture) › four unused + three genuine timeout errors: neutral stays neutral, failures stay alert with attempts (4.3s)
+  ✓  32 [lens-pills] › e2e/lens-pills.spec.ts:355:3 › lens pills — unused is neutral, never a pass (synthetic fixture) › mixed round: unused, clean, legacy null-note, live, pending, blocker, error all distinct (3.0s)
+  ✓  33 [real] › e2e/real-server.spec.ts:122:1 › pair with the real token, send, streamed echo reply (2.2s)
+  ✓  34 [real] › e2e/real-server.spec.ts:127:1 › multi-line prompt rides the real socket intact (agent receives the newline) (2.1s)
+  ✓  35 [real] › e2e/real-server.spec.ts:151:1 › real native compact preserves history and New chat starts unresumed behind a durable epoch (3.9s)
+  ✓  36 [real] › e2e/real-server.spec.ts:185:1 › reload keeps history from the real frame log (no duplicates) (2.3s)
+  ✓  37 [real] › e2e/real-server.spec.ts:198:1 › service restart drops the socket; reconnect keeps history and flushes the typed word (8.6s)
+  ✓  38 [real] › e2e/real-server.spec.ts:232:1 › mobile viewport: board-first, corner bubble, sheet, unread badge over the real socket (2.7s)
+  ✓  39 [real] › e2e/real-server.spec.ts:265:1 › wrong token: fatal inline error, stays on pairing across reload (1.4s)
+  ✓  40 [real] › e2e/real-server.spec.ts:281:3 › board (E6) › seeded jobs render repo-grouped with lens chips; live push updates (2.3s)
+  ✓  41 [real] › e2e/real-server.spec.ts:311:3 › board (E6) › agent rail lists the gru session; transcripts open, search, page (3.6s)
+  ✓  42 [real] › e2e/real-server.spec.ts:373:3 › board (E6) › notification round-trip (E7 + routing split): a blocked job lands in the feed, never the bell; ack clears it (2.9s)
+  ✓  43 [real] › e2e/real-server.spec.ts:418:3 › board (E6) › Gru can escalate a machine stop to FOR YOU through the authenticated route (2.6s)
+  ✓  44 [real] › e2e/real-server.spec.ts:448:3 › board (E6) › unauthenticated board API is a locked door (191ms)
+  ✓  45 [real] › e2e/real-server.spec.ts:480:3 › themes › light default, dark toggle persists, both snapshotted (3.3s)
+  ✓  46 [real] › e2e/real-server.spec.ts:496:1 › Settings recheck shows real degraded → recovered Jev state and resolved incident semantics (2.9s)
+  ✓  47 [real] › e2e/real-server.spec.ts:531:1 › missing-key enabled startup is durable degraded: a browser connected AFTER startup sees the actionable notice (5.0s)
+  ✓  48 [real] › e2e/real-server.spec.ts:577:3 › attach flow (SPEC ruling 19) — full gesture › on-disk pick: attach → browse → pick a real file → chip → send → agent receives the PATH; uploads dir stays EMPTY (no byte copy) (2.7s)
+  ✓  49 [real] › e2e/real-server.spec.ts:622:3 › attach flow (SPEC ruling 19) — full gesture › B2 fails-pre-fix discriminator — PHONE full gesture: attach → device button → chooser → chip → send → agent receives THAT path (3.4s)
+  ✓  50 [real] › e2e/real-server.spec.ts:689:3 › attach flow (SPEC ruling 19) — full gesture › clipboard paste (Mac-screenshot class): paste bytes into the composer → materialized → chip → send (2.6s)
+  ✓  51 [real] › e2e/real-server.spec.ts:719:3 › attach flow (SPEC ruling 19) — full gesture › chips replay with history after reload (the durable log carries them) (3.3s)
+
+
+  1) [mock] › e2e/working-flavor.spec.ts:109:1 › busy phrases rotate with stable status/control geometry on every surface 
+
+    Error: [2mexpect([22m[31mreceived[39m[2m).[22mtoEqual[2m([22m[32mexpected[39m[2m) // deep equality[22m
+
+    [32m- Expected  - 8[39m
+    [31m+ Received  + 8[39m
+
+    [2m  Array [[22m
+    [2m    Object {[22m
+    [32m-     "height": 28,[39m
+    [32m-     "width": 113.25,[39m
+    [32m-     "x": 232.453125,[39m
+    [32m-     "y": 792.8125,[39m
+    [31m+     "height": 40,[39m
+    [31m+     "width": 108.484375,[39m
+    [31m+     "x": 239.796875,[39m
+    [31m+     "y": 780.8125,[39m
+    [2m    },[22m
+    [2m    Object {[22m
+    [32m-     "height": 28,[39m
+    [32m-     "width": 72.296875,[39m
+    [32m-     "x": 352.703125,[39m
+    [32m-     "y": 792.8125,[39m
+    [31m+     "height": 40,[39m
+    [31m+     "width": 69.71875,[39m
+    [31m+     "x": 355.28125,[39m
+    [31m+     "y": 780.8125,[39m
+    [2m    },[22m
+    [2m  ][22m
+
+      150 |     }),
+      151 |   );
+    > 152 |   expect(controlsAfter).toEqual(controlsBefore);
+          |                         ^
+      153 |
+      154 |   await sweepApprovedLabels(page);
+      155 |
+        at <LANE_WORKTREE>/web/e2e/working-flavor.spec.ts:152:25
+
+    Error Context: test-results/working-flavor-busy-phrase-4ecaa-l-geometry-on-every-surface-mock/error-context.md
+
+  1 failed
+    [mock] › e2e/working-flavor.spec.ts:109:1 › busy phrases rotate with stable status/control geometry on every surface 
+  50 passed (3.4m)
+npm error Lifecycle script `e2e` failed with error:
+npm error code 1
+npm error path <LANE_WORKTREE>/web
+npm error workspace @gru-command/web@1.0.0
+npm error location <LANE_WORKTREE>/web
+npm error command failed
+npm error command sh -c npm run build && playwright test

@@ -1,0 +1,4 @@
+
+> gru-command@1.0.0 typecheck
+> tsc --noEmit -p tsconfig.test.json
+

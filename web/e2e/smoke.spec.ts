@@ -1026,7 +1026,10 @@ test.describe('board (E6, mock feed)', () => {
     // Owner-held stop: the released handle left the record disposed, but
     // the live crew keeps the lane with its stopped mark (never the
     // graveyard behind the disposed toggle).
-    const held = rail.locator('.board-agent', { hasText: 'held-after-breaker' });
+    // Crew-heist-labels (#141): minion rows display their heist name, not
+    // the raw fixture label, so identify the held row by its stable agent
+    // id (the same identity the transcript selection keys on).
+    const held = rail.locator('[data-agent-id="mock-minion-held"]');
     await expect(held.locator('.board-agent__supervision--alert')).toHaveText('⛔ stopped');
     await expect(rail.locator(".board-agent-toggle[data-section='disposed']")).toContainText('1 disposed');
 
@@ -1295,14 +1298,20 @@ test.describe('chat pane reflow (owner heist)', () => {
       `reflow-all ${LONG_TOKEN}\n\n\`\`\`\n${LONG_CODE}\n\`\`\`\n\n${LONG_TABLE}\n\ntail after table`,
       'reflow-all',
     );
-    // Service machinery is intentionally collapsed after the reply; open
-    // its band so the long tool name participates in the reflow checks.
+    // Clean-chat clause (owner 2026-09-23): tool lines sit in a collapsed
+    // service band — one tap reveals the machinery, exactly as the first
+    // smoke test does. Expand before the assertions AND the reflow sweep so
+    // the long unbroken tokens are measured in their real, expanded layout.
     const toolBand = page.locator('.service-band', {
       has: page.locator('.tool-line', { hasText: 'mcp__' }),
     });
     await expect(toolBand).toHaveCount(1);
-    await toolBand.locator('.service-band__head').click();
-    await expect(toolBand.locator('.service-band__head')).toHaveAttribute('aria-expanded', 'true');
+    const bandHead = toolBand.locator('.service-band__head');
+    // Guard the toggle state so a future already-expanded default cannot
+    // silently collapse the band (and measure the wrong layout).
+    await expect(bandHead).toHaveAttribute('aria-expanded', 'false');
+    await bandHead.click();
+    await expect(bandHead).toHaveAttribute('aria-expanded', 'true');
     await expect(page.locator('.tool-line', { hasText: 'mcp__' })).toBeVisible();
     await expect(page.locator('.tool-line', { hasText: 'failed:' })).toBeVisible();
   }
@@ -1323,16 +1332,23 @@ test.describe('chat pane reflow (owner heist)', () => {
     // ONE live drag: floor first, ceiling second, asserting mid-gesture.
     // The floor move stays INSIDE the viewport — a pointer moved off-screen
     // delivers no further pointermove events to the page.
+    // Resolve the drag target AT ACTION TIME (whole-900 browser red): the
+    // raw cached-box sequence could miss the 4px handle when the page
+    // settled between measuring and pressing. hover() scrolls the handle
+    // into view, waits for stability and verifies the point actually hits
+    // the element; the engagement gate then fails AT the gesture with a
+    // named cause instead of a muted 5s width-poll timeout.
     const handle = page.locator('#splitter-chat');
+    await handle.hover();
     const box = (await handle.boundingBox())!;
-    await page.mouse.move(box.x + 2, box.y + 120);
     await page.mouse.down();
-    await page.mouse.move(box.x + 2 - 400, box.y + 120, { steps: 8 });
+    await expect(page.locator('[data-pane-dragging]')).toHaveCount(1);
+    await page.mouse.move(box.x + box.width / 2 - 400, box.y + 120, { steps: 8 });
     await expect
       .poll(async () => (await page.locator('#chat-main-mount').boundingBox())!.width)
       .toBeLessThan(defaultWidth - 100);
     await assertChatReflows(page, 'live drag at the floor');
-    await page.mouse.move(box.x + 2 + 600, box.y + 120, { steps: 8 });
+    await page.mouse.move(box.x + box.width / 2 + 600, box.y + 120, { steps: 8 });
     await expect
       .poll(async () => (await page.locator('#chat-main-mount').boundingBox())!.width)
       .toBeGreaterThan(defaultWidth + 60);
@@ -1379,10 +1395,25 @@ test.describe('themes', () => {
     await pair(page);
     await sendAndWaitReply(page, 'theme check');
 
+    // The whole-page capture must not race the board's owner band: the
+    // reply wait above covers the chat only (observed RED under load: the
+    // capture missed the band while the DOM already had it). Synchronize
+    // on the band's authoritative rows before the screenshot.
+    await expect(page.locator('#board-owner .board-owner__row')).toHaveCount(3);
+    await expect(
+      page.locator('#board-owner .board-owner__row', { hasText: 'Fix the payment retry loop' }),
+    ).toBeVisible();
+
+    // Whole-page captures must be scroll-invariant: interacting with the
+    // composer can scroll the scrollable shell, and a non-zero page scroll
+    // moves the content (and the sticky band head) under the capture —
+    // observed as RED with the owner band scrolled away. Pin the origin.
+    await page.evaluate(() => window.scrollTo(0, 0));
     await expect(page.locator('html')).not.toHaveClass(/dark/);
     await expect(page).toHaveScreenshot('chat-light.png', { maxDiffPixelRatio: 0.02 });
 
     await page.locator('#theme-toggle').click();
+    await page.evaluate(() => window.scrollTo(0, 0));
     await expect(page.locator('html')).toHaveClass(/dark/);
     await expect(page).toHaveScreenshot('chat-dark.png', { maxDiffPixelRatio: 0.02 });
 

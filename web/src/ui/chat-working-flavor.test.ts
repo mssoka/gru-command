@@ -385,6 +385,18 @@ describe('working flavor stylesheet contract', () => {
     expect(busyLabel).toMatch(/clip:\s*rect\(0, 0, 0, 0\)/);
   });
 
+  it('never wraps the status strip on console/tablet widths', () => {
+    // The rotating phrase must stay on ONE line: with the base wrap, the
+    // longest approved phrases pushed the controls to a second line and
+    // grew the strip (the geometry e2e sweep found 21 phrases doing it).
+    // Console/tablet widths pin the single line AND keep the controls
+    // non-shrinkable, so only the status chip absorbs a long phrase. The
+    // phone sheet keeps the wrap so the status takes its own row.
+    expect(COMPONENTS_CSS).toMatch(
+      /@media \(min-width: 900px\)\s*\{\s*\.chat-context\s*\{[^}]*flex-wrap:\s*nowrap[\s\S]*?\.chat-context__button\s*\{[^}]*flex:\s*none/,
+    );
+  });
+
   it('reserves one flexible chip slot for every rotating phrase', () => {
     // The busy chip must own the strip's flexible slot: with an intrinsic
     // flex-basis a long phrase makes the line overflow and the shrink

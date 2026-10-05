@@ -1,0 +1,65 @@
+{
+  "name": "gru-command",
+  "version": "1.0.0",
+  "description": "A standalone, installable multi-agent orchestrator: one service hosting every agent as a headless session behind a pluggable runtime adapter.",
+  "type": "module",
+  "license": "MIT",
+  "private": true,
+  "files": [
+    "dist/",
+    "resources/perkins-code-review/policy.json",
+    "resources/silas-skills/",
+    "roles/",
+    "tools/verify-perkins-resource.mjs",
+    "tools/patch-vitest-rpc-timeout.mjs",
+    "install/",
+    "install.sh",
+    "web/dist/",
+    "README.md",
+    "LICENSE"
+  ],
+  "workspaces": [
+    "web"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "main": "dist/main.js",
+  "bin": {
+    "gru-service": "dist/cli/service.js"
+  },
+  "scripts": {
+    "build": "tsc && node -e \"const fs=require('node:fs'); fs.mkdirSync('dist/runtime',{recursive:true}); fs.copyFileSync('src/runtime/review-mcp-server.mjs', 'dist/runtime/review-mcp-server.mjs')\" && node tools/verify-perkins-resource.mjs . && node tools/write-build-rev.mjs",
+    "prepack": "node -e \"const fs=require('node:fs'); for (const path of ['dist','web/dist']) fs.rmSync(path,{recursive:true,force:true})\" && npm run build:web && npm run build",
+    "typecheck": "tsc --noEmit -p tsconfig.test.json",
+    "lint": "eslint .",
+    "pretest": "node tools/patch-vitest-rpc-timeout.mjs",
+    "test": "npm run lint && npm run typecheck && npm run build && vitest run && npm run test:web",
+    "build:web": "npm run build -w web",
+    "test:web": "npm run test -w web",
+    "e2e": "npm run build && npm run e2e -w web",
+    "dev:web": "npm run dev -w web",
+    "mock": "npm run mock -w web",
+    "wizard": "node dist/wizard/main.js",
+    "config:generate": "node dist/cli/config-generate.js",
+    "config:docs": "node scripts/render-config-doc.mjs",
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "^0.85.1",
+    "@earendil-works/pi-coding-agent": "^0.85.1",
+    "qrcode": "^1.5.4",
+    "smol-toml": "^1.3.1",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.17.0",
+    "@types/node": "^22.20.3",
+    "@types/qrcode": "^1.5.5",
+    "@types/ws": "^8.5.10",
+    "eslint": "^9.17.0",
+    "typescript": "^5.7.2",
+    "typescript-eslint": "^8.18.0",
+    "vitest": "^3.2.7"
+  }
+}

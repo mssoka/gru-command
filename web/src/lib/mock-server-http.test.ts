@@ -228,4 +228,36 @@ describe('dev mock reset settles the previous turn before rewinding the log', ()
     first.socket.terminate();
     replay.socket.terminate();
   }, 30_000);
+
+  it('drops a queued (deferred) user frame with a parked turn at /__reset — no ghost reply', async () => {
+    const { baseUrl } = await startMock();
+    const first = await openAuthedSocket(baseUrl);
+    await postControl(baseUrl, '/__turn-hold');
+    first.socket.send(
+      JSON.stringify({ type: 'user', text: 'parked probe', client_msg_id: 'd1', epoch: 0 }),
+    );
+    // Run the stream to exhaustion so the turn is genuinely parked, then
+    // queue a SECOND user frame: it defers (one scripted turn at a time).
+    await waitFor(() =>
+      first.frames.some((frame) => frame.type === 'delta' && String(frame.text).includes('🪐')),
+    );
+    await sleep(150);
+    expect(first.frames.some((frame) => frame.type === 'turn' && frame.state === 'end')).toBe(false);
+    first.socket.send(
+      JSON.stringify({ type: 'user', text: 'queued while parked', client_msg_id: 'd2', epoch: 0 }),
+    );
+    await sleep(200);
+
+    const reset = await postControl(baseUrl, '/__reset');
+    expect(reset.ok).toBe(true);
+    // Any drained queued reply would have streamed + settled by now; the
+    // rewind must not leave its frames behind (ghost frames for replay).
+    await sleep(800);
+
+    const replay = await openAuthedSocket(baseUrl);
+    await sleep(300);
+    expect(replay.frames.filter(isTurnFrame)).toEqual([]);
+    first.socket.terminate();
+    replay.socket.terminate();
+  }, 30_000);
 });

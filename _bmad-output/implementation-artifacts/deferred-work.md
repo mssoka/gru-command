@@ -78,6 +78,13 @@
 - source_spec: none — BMAD code review of PR #170 (head 3540500)
   summary: AGENTS.md and other docs don't mention the phase split; `npx vitest run test/<heavy>.test.ts` now exits "No test files found" (low)
   evidence: README documents test:backend:heavy, but agent guidance does not, so minions running a heavy file directly hit an exit-1 trap (it fails loud, not silently). Deferred: the fix edits agent-context files.
+
+## Deferred from: code review of spec-gh-32-deterministic-bmad-failure-skip-only (2026-10-05)
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-gh-32-deterministic-bmad-failure-skip-only.md`
+  summary: `wizard-bmad-browser-consumer` runs `npm run e2e` whose Playwright screenshot baselines are darwin-only, so the scope has no Linux baseline support.
+  evidence: bmad code review (blind-hunter, gpt-6-sol) 2026-10-05; pre-existing main convention — origin/main's `web/e2e/*-snapshots/` carry only `-darwin` PNGs and CI does not run e2e — so repair is a cross-lane Linux-baseline effort, not this lane's change.
+
 - source_spec: `_bmad-output/implementation-artifacts/spec-crew-heist-labels.md`
   summary: The crew-rail Playwright project (rail layout/overflow geometry) is not part of any required recurring gate — CI runs `npm test` (Vitest) only; a future CSS regression could pass every required check while breaking the rail layout.
   evidence: Fresh bmad-build verification-gap finding 2026-10-05 (disposition: defer). The dedicated `crew-rail` project is runnable on demand through the declared scheduler scopes (`crew-rail-captures`, `crew-captures-fast`) and ran green at the reviewed heads, but adding Playwright to required CI is a repo-wide runner-cost/policy decision (browsers install, ~1-2 min/job) that the owner and the e2e-gate-repair lane (job-e2e-gate-repair-20261004) own, not this display-naming lane.

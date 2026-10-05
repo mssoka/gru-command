@@ -1,6 +1,7 @@
 import { existsSync, chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { createServer } from 'node:net';
 import { afterAll, describe, expect, it } from 'vitest';
 import { OwnedCommandTimeoutError, markFixtureStep, runOwnedCommand } from './helpers/harness-diagnostics.mjs';
@@ -369,6 +370,224 @@ describe('wizard CLI surface', () => {
     expect(err).toContain(`bash ${repoRoot}/install.sh`);
     expect(err).toContain('--no-interact');
   });
+
+  it('noninteractive deterministic BMAD failure fails loud without offering retry; explicit skip completes (gh-32)', () => {
+    const repoRoot = join(import.meta.dirname, '..');
+    const workspace = tempDir('gru-command-wizard-det-ws-');
+    const repoA = join(workspace, 'repo-a');
+    mkdirSync(join(repoA, '.git'), { recursive: true });
+    execFileSync('git', ['init', '-q'], { cwd: repoA });
+    // Broken existing install in a temporary fixture: the manifest declares
+    // core, whose directory is missing (the gh-32 class).
+    mkdirSync(join(repoA, '_bmad', '_config'), { recursive: true });
+    writeFileSync(
+      join(repoA, '_bmad', '_config', 'manifest.yaml'),
+      'installation:\n  version: 6.12.0\nmodules:\n  - name: core\n    version: 6.12.0\nides:\n  - pi\n',
+    );
+    const bin = tempDir('gru-command-wizard-det-bin-');
+    writeFileSync(join(bin, 'uv'), '#!/usr/bin/env bash\nexit 0\n', { mode: 0o755 });
+    // The binding-mismatch leg below selects claude-code, whose prerequisite
+    // probe needs a `claude` CLI; provide an owned harmless stub so the leg
+    // reaches the deterministic missing-binding branch instead of depending
+    // on an installed user CLI. Missing-tool retry ownership keeps its
+    // dedicated inverse coverage in the onboarding prerequisite cases.
+    writeFileSync(join(bin, 'claude'), '#!/usr/bin/env bash\nexit 0\n', { mode: 0o755 });
+    const baseEnv = {
+      ...process.env,
+      PATH: `${bin}:${process.env.PATH ?? ''}`,
+    };
+    // Explicit objects (no string surgery): each leg names its repo, action
+    // and runtime directly. Port 0 keeps the fixed-port pre-check out of
+    // the fixture; smoke is off because this leg is about the BMAD contract.
+    const answersFor = (repo: string, action: 'install' | 'reuse' | 'skip', runtime: string) =>
+      JSON.stringify({
+        workspace_root: workspace,
+        repos: [repo],
+        bmad: { [repo]: action },
+        runtime,
+        port: 0,
+        smoke: false,
+      });
+    const answersJson = answersFor('repo-a', 'reuse', 'pi');
+    const instance = tempDir('gru-command-wizard-det-home-');
+    const failed = spawnSync(
+      process.execPath,
+      [join(repoRoot, 'dist', 'wizard', 'main.js'), '--answers', answersJson],
+      { env: { ...baseEnv, GRU_COMMAND_HOME: instance }, encoding: 'utf-8', timeout: 60_000 },
+    );
+    expect(failed.status, failed.stderr).toBe(1);
+    expect(failed.stderr).toContain('deterministic failure — retrying cannot fix it');
+    expect(failed.stderr).toContain('BMAD manifest declares missing or unsafe module directory');
+    // The truthful contract names the deliberate fix and the explicit skip
+    // escape hatch — and never suggests the futile retry.
+    expect(failed.stderr).toContain('npx bmad-method install');
+    expect(failed.stderr).toContain('answers.bmad.repo-a="skip"');
+    expect(failed.stderr).not.toContain('Retry after fixing it');
+    expect(existsSync(join(instance, 'config.toml'))).toBe(false);
+
+    // Explicit skip keeps the existing opt-out contract: headless completion.
+    const skipHome = tempDir('gru-command-wizard-det-skip-home-');
+    const skipped = spawnSync(
+      process.execPath,
+      [join(repoRoot, 'dist', 'wizard', 'main.js'), '--answers', answersFor('repo-a', 'skip', 'pi')],
+      { env: { ...baseEnv, GRU_COMMAND_HOME: skipHome }, encoding: 'utf-8', timeout: 60_000 },
+    );
+    expect(skipped.status, skipped.stderr).toBe(0);
+    expect(skipped.stdout).toContain('BMAD not ready in repo-a: skipped by explicit per-repo choice');
+    expect(readFileSync(join(skipHome, 'config.toml'), 'utf-8')).toContain('port = 0');
+
+    // The issue's second named class — a selected-runtime binding mismatch —
+    // reaches the same skip-only branch with the installer repair text.
+    const repoB = join(workspace, 'repo-b');
+    mkdirSync(join(repoB, '.git'), { recursive: true });
+    execFileSync('git', ['init', '-q'], { cwd: repoB });
+    for (const module of ['core', 'bmm', 'cis', 'tea', 'gds']) {
+      mkdirSync(join(repoB, '_bmad', module), { recursive: true });
+    }
+    mkdirSync(join(repoB, '_bmad', '_config'), { recursive: true });
+    writeFileSync(
+      join(repoB, '_bmad', '_config', 'manifest.yaml'),
+      'installation:\n  version: 6.12.0\nmodules:\n' +
+        '  - name: core\n    version: 6.12.0\n' +
+        '  - name: bmm\n    version: 6.12.0\n' +
+        '  - name: cis\n    version: v0.3.2\n' +
+        '  - name: tea\n    version: v1.27.2\n' +
+        '  - name: gds\n    version: v0.7.2\n' +
+        'ides:\n  - pi\n',
+    );
+    mkdirSync(join(repoB, '.agents', 'skills', 'bmad-build'), { recursive: true });
+    writeFileSync(join(repoB, '.agents', 'skills', 'bmad-build', 'SKILL.md'), '# build\n');
+    const bindingHome = tempDir('gru-command-wizard-binding-home-');
+    const binding = spawnSync(
+      process.execPath,
+      [
+        join(repoRoot, 'dist', 'wizard', 'main.js'),
+        '--answers',
+        answersFor('repo-b', 'reuse', 'claude-code'),
+      ],
+      { env: { ...baseEnv, GRU_COMMAND_HOME: bindingHome }, encoding: 'utf-8', timeout: 60_000 },
+    );
+    expect(binding.status, binding.stderr).toBe(1);
+    expect(binding.stderr).toContain(
+      'existing BMAD install lacks selected runtime binding(s): claude-code',
+    );
+    expect(binding.stderr).toContain('npx bmad-method install');
+    expect(binding.stderr).not.toContain('Retry after fixing it');
+
+    // "BMAD already exists" carries reuse guidance, not the installer hint:
+    // installer overwrite is exactly what the guard refuses.
+    const existsHome = tempDir('gru-command-wizard-exists-home-');
+    const exists = spawnSync(
+      process.execPath,
+      [
+        join(repoRoot, 'dist', 'wizard', 'main.js'),
+        '--answers',
+        answersFor('repo-a', 'install', 'pi'),
+      ],
+      { env: { ...baseEnv, GRU_COMMAND_HOME: existsHome }, encoding: 'utf-8', timeout: 60_000 },
+    );
+    expect(exists.status, exists.stderr).toBe(1);
+    expect(exists.stderr).toContain('BMAD already exists; choose reuse to preserve it');
+    expect(exists.stderr).toContain('Re-run the wizard and choose reuse');
+    // Headless mode names the JSON value it actually offers (whole-900
+    // review A9); the interactive wording above stays truthful too.
+    expect(exists.stderr).toContain('answers.bmad.repo-a="reuse"');
+    expect(exists.stderr).not.toContain('npx bmad-method install');
+  }, 120_000);
+
+  it('noninteractive hint-less deterministic failures name the neutral deliberate repair (gh-32 final review)', () => {
+    const repoRoot = join(import.meta.dirname, '..');
+    const workspace = tempDir('gru-command-wizard-fallback-ws-');
+    const repoA = join(workspace, 'repo-a');
+    mkdirSync(join(repoA, '.git'), { recursive: true });
+    execFileSync('git', ['init', '-q'], { cwd: repoA });
+    // A partial install (_bmad without a manifest) is deterministic with
+    // NO installer hint, so the neutral deliberate-repair fallback renders.
+    mkdirSync(join(repoA, '_bmad', 'bmm'), { recursive: true });
+    const bin = tempDir('gru-command-wizard-fallback-bin-');
+    writeFileSync(join(bin, 'uv'), '#!/usr/bin/env bash\nexit 0\n', { mode: 0o755 });
+    const answersJson = JSON.stringify({
+      workspace_root: workspace,
+      repos: ['repo-a'],
+      bmad: { 'repo-a': 'reuse' },
+      runtime: 'pi',
+      port: 0,
+      smoke: false,
+    });
+    const instance = tempDir('gru-command-wizard-fallback-home-');
+    const failed = spawnSync(
+      process.execPath,
+      [join(repoRoot, 'dist', 'wizard', 'main.js'), '--answers', answersJson],
+      { env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}`, GRU_COMMAND_HOME: instance }, encoding: 'utf-8', timeout: 60_000 },
+    );
+    expect(failed.status, failed.stderr).toBe(1);
+    expect(failed.stderr).toContain('partial BMAD installation detected');
+    expect(failed.stderr).toContain('Repair the reported condition deliberately, then re-run the wizard');
+    expect(failed.stderr).not.toContain('Retry after fixing it');
+    expect(existsSync(join(instance, 'config.toml'))).toBe(false);
+  }, 120_000);
+
+  it('noninteractive deleted recorded binding after successful onboard fails loud skip-only with the installer hint (gh-32 r1)', () => {
+    const repoRoot = join(import.meta.dirname, '..');
+    const workspace = tempDir('gru-command-wizard-unbind-ws-');
+    const repoA = join(workspace, 'repo-a');
+    mkdirSync(join(repoA, '.git'), { recursive: true });
+    execFileSync('git', ['init', '-q'], { cwd: repoA });
+    const bin = tempDir('gru-command-wizard-unbind-bin-');
+    writeFileSync(join(bin, 'uv'), '#!/usr/bin/env bash\nexit 0\n', { mode: 0o755 });
+    // Synthetic pinned installer (no real installer execution): the fake
+    // npx materializes the exact pinned fresh install into its --directory
+    // target (== its cwd, as the wizard invokes it).
+    writeFileSync(
+      join(bin, 'npx'),
+      [
+        '#!/usr/bin/env node',
+        "const { mkdirSync, writeFileSync } = require('node:fs');",
+        "const { join } = require('node:path');",
+        "if (process.argv.includes('--version')) { console.log('10.0.0'); process.exit(0); }",
+        "const root = process.cwd();",
+        "const manifest = ['installation:', '  version: 6.12.0', 'modules:', '  - name: core', '    version: 6.12.0', '  - name: bmm', '    version: 6.12.0', '  - name: cis', '    version: v0.3.2', '  - name: tea', '    version: v1.27.2', '  - name: gds', '    version: v0.7.2', 'ides:', '  - pi', ''].join('\\n');",
+        "for (const module of ['core','bmm','cis','tea','gds']) { mkdirSync(join(root, '_bmad', module), { recursive: true }); writeFileSync(join(root, '_bmad', module, 'marker.txt'), module + '\\n'); }",
+        "mkdirSync(join(root, '_bmad', '_config'), { recursive: true }); writeFileSync(join(root, '_bmad', '_config', 'manifest.yaml'), manifest);",
+        "for (const skill of ['bmad-build','bmad-help','gds-quick-dev']) { const dir=join(root,'.agents','skills',skill); mkdirSync(dir,{recursive:true}); writeFileSync(join(dir,'SKILL.md'),'# skill\\n'); writeFileSync(join(dir,'workflow.md'),'{{.implementation_artifacts}}\\n'); }",
+        '',
+      ].join('\n'),
+      { mode: 0o755 },
+    );
+    const baseEnv = { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}` };
+    const answersFor = (action: 'install' | 'reuse' | 'skip') =>
+      JSON.stringify({
+        workspace_root: workspace,
+        repos: ['repo-a'],
+        bmad: { 'repo-a': action },
+        runtime: 'pi',
+        port: 0,
+        smoke: false,
+      });
+    const runWizard = (answersJson: string, home: string) =>
+      spawnSync(
+        process.execPath,
+        [join(repoRoot, 'dist', 'wizard', 'main.js'), '--answers', answersJson],
+        { env: { ...baseEnv, GRU_COMMAND_HOME: home }, encoding: 'utf-8', timeout: 60_000 },
+      );
+    // First run: a successful install records the runtime bindings.
+    const installed = runWizard(answersFor('install'), tempDir('gru-command-wizard-unbind-install-home-'));
+    expect(installed.status, installed.stderr + installed.stdout).toBe(0);
+    expect(installed.stdout).toContain('BMAD ready in repo-a');
+    expect(existsSync(join(repoA, '.gru-command', 'bmad-install.json'))).toBe(true);
+    // The recorded binding then disappears from disk — unchanged state for
+    // every later retry, so the reuse run must be skip-only deterministic.
+    rmSync(join(repoA, '.agents', 'skills', 'bmad-help'), { recursive: true, force: true });
+    const reuseHome = tempDir('gru-command-wizard-unbind-reuse-home-');
+    const failed = runWizard(answersFor('reuse'), reuseHome);
+    expect(failed.status, failed.stderr).toBe(1);
+    expect(failed.stderr).toContain('deterministic failure — retrying cannot fix it');
+    expect(failed.stderr).toContain('BMAD recorded skill binding is missing');
+    expect(failed.stderr).toContain('npx bmad-method install');
+    expect(failed.stderr).toContain('answers.bmad.repo-a="skip"');
+    expect(failed.stderr).not.toContain('Retry after fixing it');
+    expect(existsSync(join(reuseHome, 'config.toml'))).toBe(false);
+  }, 120_000);
 
   it('host validation accepts every VALID IPv6 form (Perkins r2 note)', () => {
     for (const good of ['::', '::1', 'fe80::1', 'fe80::1%en0', '1:2:3:4:5:6:7:8', '::ffff:127.0.0.1']) {

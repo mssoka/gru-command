@@ -180,8 +180,13 @@ for generated paths. It does not blanket-ignore `.agents/`, `.claude/`,
 or `_bmad-output/`, and never untracks files. Commit the three
 `.gru-command/` bootstrap files so newly-created worktrees can copy an
 isolated project-local BMAD install and discover `bmad-build`; generated
-skills/output remain local. Network/prerequisite/partial failures name
-the repo and require retry or explicit skip—no false-ready state.
+skills/output remain local. Network and prerequisite failures name the
+repo and keep retry or explicit skip; deterministic state failures—a
+broken or partial install, a missing/unsafe module directory, a missing
+runtime binding—offer skip-only with deliberate repair guidance
+(install-repair classes additionally name the official repair path
+`npx bmad-method install` in that repository), never an automatic
+overwrite. No false-ready state.
 
 You need the selected runtime CLI (`pi` or `claude`) for agents and `uv`
 for BMAD workflows. Missing prerequisites are reported before a repo is
