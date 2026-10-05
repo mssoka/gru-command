@@ -64,20 +64,82 @@ export interface JobView {
   readonly lastAgentActivity: string | null;
 }
 
+/** Issue #161: one tracked child worker (sub-minion). */
+export interface ChildWorkerView {
+  readonly id: string;
+  readonly agentId: string | null;
+  readonly parentAgentId: string;
+  readonly jobId: string;
+  readonly purpose: string;
+  readonly authority: 'read-only' | 'writer';
+  readonly state: 'queued' | 'admitted' | 'active' | 'done' | 'error' | 'cancelled';
+  readonly worktreeId: string | null;
+  readonly branch: string | null;
+  readonly resultState: 'done' | 'error' | 'cancelled' | null;
+  readonly resultSummary: string | null;
+  readonly resultRef: string | null;
+  readonly createdAt: string;
+  readonly admittedAt: string | null;
+  readonly startedAt: string | null;
+  readonly finishedAt: string | null;
+}
+
+/** Issue #161: child counters. Present-state counts are derived from the
+ * durable records; `lifetimeCreations` counts LOGICAL creations (one per
+ * admitted child request), so retries and resumes never double-count. */
+export interface ChildWorkerCounts {
+  readonly queued: number;
+  readonly active: number;
+  readonly finished: number;
+  readonly lifetimeCreations: number;
+}
+
 export interface AgentView {
   readonly id: string;
   readonly role: string;
   readonly label: string | null;
   readonly state: string;
+  /** Issue #161 parentage category. Optional: pre-upgrade servers omit it
+   * and the board renders no top-level/child distinction (`undefined` =
+   * no information; `null` = the server says genuinely unknown). */
+  readonly parentage?: 'top-level' | 'child' | null;
+  /** Issue #161 parent link for child rows (parent navigation). */
+  readonly parentAgentId?: string | null;
+  /** The child record when this row IS a tracked child. */
+  readonly child?: ChildWorkerView | null;
+  /** Family counters on a parent row with admitted children. */
+  readonly childCounts?: ChildWorkerCounts | null;
+  /** Issue #171 truthful display status: the raw adapter state corrected
+   * by supervision activity evidence (raw `idle` + open turn →
+   * `streaming`). Optional: pre-upgrade servers omit it and the board
+   * falls back to the raw `state`. */
+  readonly status?: string;
+  /** Issue #171 runtime ownership classification. Optional: pre-upgrade
+   * servers omit it and the board treats membership as `unverified`
+   * (visible, explicitly ambiguous — never guessed historical). */
+  readonly runtime?: 'current' | 'historical' | 'unverified';
   readonly lastActivity: string | null;
+  /** Row registration stamp. Optional: pre-upgrade servers did not send
+   * it, and the board then falls back to lastActivity-only stall truth. */
+  readonly createdAt?: string;
   readonly sessionFile: string | null;
   readonly jobId: string | null;
   readonly roundId: string | null;
-  /** E7 supervision view (null when unsupervised). */
+  /** E7 supervision view (null when unsupervised). `stopReason` is absent
+   * on pre-reason servers — the board renders the stop without a cause;
+   * `stoppedAt` is absent on pre-stop-time servers and null/ignored while
+   * running. Issue #171 activity fields (`openTurn`, `openControl`,
+   * `openToolCalls`, `lastEventAt`) are optional on pre-#171 servers. */
   readonly supervision: {
     readonly state: 'watching' | 'restarting' | 'stopped';
     readonly restarts: number;
     readonly breakerOpen: boolean;
+    readonly stopReason?: string | null;
+    readonly stoppedAt?: string | null;
+    readonly openTurn?: boolean;
+    readonly openControl?: boolean;
+    readonly openToolCalls?: number;
+    readonly lastEventAt?: string | null;
   } | null;
 }
 
@@ -125,9 +187,18 @@ export interface BuildView {
   readonly checkError: string | null;
 }
 
-/** Silas ops health (board UX v4), derived from the durable event stream. */
+/** Silas ops health (board UX v4, issue #163), derived from the durable
+ * event stream. `lastWakeAt` is the wake START marker; `lastReconcileAt`
+ * only advances on a successfully completed deterministic pass. */
 export interface SilasView {
   readonly lastWakeAt: string | null;
+  readonly lastTickAt: string | null;
+  readonly lastReconcileAt: string | null;
+  readonly lastReconcileFailedAt: string | null;
+  readonly reconcileFailedNewer: boolean;
+  readonly lastUsefulActionAt: string | null;
+  readonly nextAction: string | null;
+  readonly openTurnSince: string | null;
   readonly reconciliationsToday: number;
   readonly checkedAt: string;
 }
@@ -195,7 +266,8 @@ export interface BoardSnapshot {
   readonly agents: readonly AgentView[];
   readonly notifications: readonly NotificationView[];
   readonly decisions: DecisionStatusView;
-  /** NEEDS GRU: machine-attention rows awaiting a disposition. */
+  /** NEEDS GRU: LIVE machine-attention rows awaiting a disposition
+   * (terminal-bound rows are closed receipts and are not counted here). */
   readonly unackedActionRequired: number;
   /** FOR YOU: needs-owner rows awaiting a human ack (the bell class). */
   readonly unackedNeedsOwner: number;
@@ -211,6 +283,9 @@ export interface BoardSnapshot {
   /** FOR YOU PR rows (owner approval 2026-09-28); absent on pre-upgrade
   * servers (validator tolerates; the band renders ack rows only). */
   readonly ownerPrs?: readonly OwnerPrView[] | null;
+  /** Issue #161: tracker-wide child counters; absent on pre-upgrade
+  * servers (the strip then renders no child numbers). */
+  readonly children?: ChildWorkerCounts | null;
 }
 
 export interface TranscriptInfo {
@@ -300,6 +375,69 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
 }
 
+const SUPERVISION_STATES = ['watching', 'restarting', 'stopped'] as const;
+
+/** Issue #171 runtime membership classes: an unknown value is a server
+ * bug, never a silently tolerated value. */
+const RUNTIME_CLASSES = ['current', 'historical', 'unverified'] as const;
+
+/** Issue #161: honest parentage categories (null = genuinely unknown). */
+const PARENTAGES = ['top-level', 'child'] as const;
+
+function isParentage(value: unknown): value is (typeof PARENTAGES)[number] {
+  return typeof value === 'string' && (PARENTAGES as readonly string[]).includes(value);
+}
+
+/** Issue #161: a present child counter block is typed strictly — a
+ * malformed count must never render as a number the server did not
+ * prove. */
+function isChildCounts(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  return (['queued', 'active', 'finished', 'lifetimeCreations'] as const).every(
+    (key) => typeof value[key] === 'number' && Number.isSafeInteger(value[key]) && (value[key] as number) >= 0,
+  );
+}
+
+/** Issue #161: a present child view must at least carry a real identity
+ * and lifecycle state; the rest of the projection is renderable. */
+function isChildView(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  return (
+    typeof value.id === 'string' &&
+    typeof value.parentAgentId === 'string' &&
+    typeof value.jobId === 'string' &&
+    typeof value.purpose === 'string' &&
+    (value.authority === 'read-only' || value.authority === 'writer') &&
+    (['queued', 'admitted', 'active', 'done', 'error', 'cancelled'] as readonly unknown[]).includes(value.state)
+  );
+}
+
+function isRuntimeClass(value: unknown): value is (typeof RUNTIME_CLASSES)[number] {
+  return typeof value === 'string' && (RUNTIME_CLASSES as readonly string[]).includes(value);
+}
+
+/** Issue #171: the known agent display states. An unknown `status` is a
+ * server bug, never a silently tolerated value (mirrors the supervision
+ * state validation rule). */
+const AGENT_STATE_NAMES = ['spawning', 'idle', 'streaming', 'error', 'disposed'] as const;
+
+function isAgentStateName(value: unknown): value is (typeof AGENT_STATE_NAMES)[number] {
+  return typeof value === 'string' && (AGENT_STATE_NAMES as readonly string[]).includes(value);
+}
+
+/** The E7 supervision block's known states: an unknown state is a server
+ * bug, never a silently tolerated value. */
+function isSupervisionState(value: unknown): value is (typeof SUPERVISION_STATES)[number] {
+  return typeof value === 'string' && (SUPERVISION_STATES as readonly string[]).includes(value);
+}
+
+/** A restart count must be a finite non-negative number. A malformed value
+ * must not reach the chip/stop predicate as a false-live read (tracked-
+ * review A9). */
+function isRestartCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+}
+
 /** Parse one OUTBOUND client frame (the auth frame clients send); null on
  * anything malformed. Lives here so server and web share the same rules
  * (parity-tested in test/board-frames.test.ts). */
@@ -381,6 +519,13 @@ function isSilasView(value: unknown): value is SilasView {
   return (
     isRecord(value) &&
     (value.lastWakeAt === null || typeof value.lastWakeAt === 'string') &&
+    (value.lastTickAt === null || typeof value.lastTickAt === 'string') &&
+    (value.lastReconcileAt === null || typeof value.lastReconcileAt === 'string') &&
+    (value.lastReconcileFailedAt === null || typeof value.lastReconcileFailedAt === 'string') &&
+    typeof value.reconcileFailedNewer === 'boolean' &&
+    (value.lastUsefulActionAt === null || typeof value.lastUsefulActionAt === 'string') &&
+    (value.nextAction === null || typeof value.nextAction === 'string') &&
+    (value.openTurnSince === null || typeof value.openTurnSince === 'string') &&
     typeof value.reconciliationsToday === 'number' &&
     Number.isSafeInteger(value.reconciliationsToday) &&
     value.reconciliationsToday >= 0 &&
@@ -499,16 +644,62 @@ export function isValidSnapshot(value: unknown): value is BoardSnapshot {
   // present block must match its shape — readiness is server authority.
   if (value.ownerPrs !== undefined && value.ownerPrs !== null && !Array.isArray(value.ownerPrs)) return false;
   if (Array.isArray(value.ownerPrs) && !value.ownerPrs.every(isOwnerPrView)) return false;
+  // Issue #161: the tracker-wide child counters are optional (pre-upgrade
+  // servers) but strictly typed when present.
+  if (value.children !== undefined && value.children !== null && !isChildCounts(value.children)) return false;
   const agentsOk = value.agents.every(
     (agent) =>
       isRecord(agent) &&
       typeof agent.id === 'string' &&
       typeof agent.role === 'string' &&
       typeof agent.state === 'string' &&
-      // supervision is optional (null when the agent is unsupervised)
+      // Issue #171 fields are optional (pre-upgrade servers); present,
+      // they are typed strictly — a junk runtime class or an unknown
+      // status string must never reach the rail split as a false read.
+      (agent.status === undefined || isAgentStateName(agent.status)) &&
+      (agent.runtime === undefined || agent.runtime === null || isRuntimeClass(agent.runtime)) &&
+      // Issue #161 child fields are optional (pre-upgrade servers); when a
+      // server does send them, the parentage marker and counters are typed.
+      (agent.parentage === undefined || agent.parentage === null || isParentage(agent.parentage)) &&
+      (agent.parentAgentId === undefined ||
+        agent.parentAgentId === null ||
+        typeof agent.parentAgentId === 'string') &&
+      (agent.child === undefined || agent.child === null || isChildView(agent.child)) &&
+      (agent.childCounts === undefined ||
+        agent.childCounts === null ||
+        isChildCounts(agent.childCounts)) &&
+      // createdAt is optional (pre-upgrade servers); present, it must be
+      // a parseable date — the stall floor reads it directly and a junk
+      // string would silently remove the floor (code review 2026-10-04).
+      (agent.createdAt === undefined ||
+        agent.createdAt === null ||
+        (typeof agent.createdAt === 'string' && Number.isFinite(Date.parse(agent.createdAt)))) &&
+      // supervision is optional (null when the agent is unsupervised);
+      // stopReason is optional too (pre-reason servers) — present, it is
+      // a nullable string. The whole PRESENT block is typed strictly (A9):
+      // known state, boolean breakerOpen, finite non-negative restarts —
+      // a truthy non-boolean breaker must never read as a false-live lane.
       (agent.supervision === null ||
         agent.supervision === undefined ||
-        (isRecord(agent.supervision) && typeof agent.supervision.state === 'string')),
+        (isRecord(agent.supervision) &&
+          isSupervisionState(agent.supervision.state) &&
+          typeof agent.supervision.breakerOpen === 'boolean' &&
+          isRestartCount(agent.supervision.restarts) &&
+          (agent.supervision.stopReason === undefined ||
+            agent.supervision.stopReason === null ||
+            typeof agent.supervision.stopReason === 'string') &&
+          (agent.supervision.stoppedAt === undefined ||
+            agent.supervision.stoppedAt === null ||
+            typeof agent.supervision.stoppedAt === 'string') &&
+          (agent.supervision.openTurn === undefined ||
+            typeof agent.supervision.openTurn === 'boolean') &&
+          (agent.supervision.openControl === undefined ||
+            typeof agent.supervision.openControl === 'boolean') &&
+          (agent.supervision.openToolCalls === undefined || isRestartCount(agent.supervision.openToolCalls)) &&
+          (agent.supervision.lastEventAt === undefined ||
+            agent.supervision.lastEventAt === null ||
+            (typeof agent.supervision.lastEventAt === 'string' &&
+              Number.isFinite(Date.parse(agent.supervision.lastEventAt)))))),
   );
   const notificationsOk = value.notifications.every(
     (notification) =>
@@ -571,6 +762,70 @@ export function isValidSnapshot(value: unknown): value is BoardSnapshot {
 /** Shape helpers shared by the views (defensive against schema drift). */
 export function agentViewOf(agent: AgentView): { id: string; role: string; state: string } {
   return { id: agent.id, role: agent.role, state: agent.state };
+}
+
+/** Issue #171 runtime membership, with the pre-upgrade fallback: a
+ * server that cannot classify reports nothing and the board keeps the
+ * row visible and explicitly ambiguous (`unverified`) — it never guesses
+ * the record historical (visible-only evidence is not death evidence). */
+export function agentRuntimeOf(agent: AgentView): 'current' | 'historical' | 'unverified' {
+  return agent.runtime ?? 'unverified';
+}
+
+/** Issue #171 truthful display status, with the pre-upgrade fallback to
+ * the raw adapter state. */
+export function agentStatusOf(agent: AgentView): string {
+  return agent.status ?? agent.state;
+}
+
+/** Issue #171: whether this snapshot carries runtime classification AT ALL
+ * (a pre-upgrade server sends none on any row). The board then keeps the
+ * legacy attribution rules — every non-disposed row is live crew — so an
+ * unclassified board never silently drops rows from its counts. */
+export function hasRuntimeClassification(agents: readonly AgentView[]): boolean {
+  return agents.some((agent) => agent.runtime !== undefined);
+}
+
+/** Issue #171: the rail band one agent renders in. An owner-held stop or
+ * restart (supervision view present) stays in the LIVE crew even when the
+ * released handle left the ledger state `disposed`: the current runtime
+ * still owns the lane and waits on the owner's re-arm. */
+export function agentRailBand(agent: AgentView): 'live' | 'historical' | 'disposed' {
+  const supervision = agent.supervision;
+  const ownerHeld =
+    supervision !== null &&
+    supervision !== undefined &&
+    (supervision.state === 'stopped' || supervision.state === 'restarting');
+  if (agent.state === 'disposed' && !ownerHeld) return 'disposed';
+  if (agentRuntimeOf(agent) === 'historical') return 'historical';
+  return 'live';
+}
+
+/** Issue #171: whether a live-band row counts as CONFIRMED crew. On a
+ * classifying server only `current` owners count — an unverified row is
+ * visible with its explicit mark but is never claimed active, so the
+ * active count cannot overstate what the runtime proves. A pre-upgrade
+ * server (no classification at all) keeps today's attribution. */
+export function isCountedCrewAgent(agent: AgentView, classificationPresent: boolean): boolean {
+  if (!classificationPresent) return true;
+  return agentRuntimeOf(agent) === 'current';
+}
+
+/** Issue #171: the freshest known activity stamp for a working row — the
+ * newer of the ledger's last_activity and the supervision event clock
+ * (deltas never touch the ledger, and a ledger write can lag the event
+ * stream; the newer parseable stamp wins). */
+export function agentActivityOf(agent: AgentView): string | null {
+  const supervision = agent.supervision;
+  const eventAt =
+    supervision !== null && supervision !== undefined ? (supervision.lastEventAt ?? null) : null;
+  if (eventAt === null) return agent.lastActivity;
+  if (agent.lastActivity === null) return eventAt;
+  const ledgerMs = Date.parse(agent.lastActivity);
+  const eventMs = Date.parse(eventAt);
+  if (!Number.isFinite(eventMs)) return agent.lastActivity;
+  if (!Number.isFinite(ledgerMs)) return eventAt;
+  return eventMs >= ledgerMs ? eventAt : agent.lastActivity;
 }
 
 /** One presentation classification for every lens chip. A lens recorded
@@ -645,6 +900,15 @@ export function agentStateTone(state: string): string {
     default:
       return 'pp-chip--park';
   }
+}
+
+/** A terminal job (merged/done) is a closed receipt: it can never be live
+ * Gru work, so no leftover unacked escalation row, aborted historical
+ * round, or stale lens noise may promote it back into NEEDS YOU. Shared
+ * by the banding and signal derivations — the web twin of the ledger's
+ * `isJobTerminal` (separate builds; keep the two in step). */
+export function isJobConcluded(status: string): boolean {
+  return status === 'merged' || status === 'done';
 }
 
 export { str as boardStr, nstr as boardNstr };

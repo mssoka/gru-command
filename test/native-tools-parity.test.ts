@@ -114,8 +114,18 @@ async function claudeExposure(rt: ClaudeCodeRuntime, workspace: string, seam: Re
   try {
     await handle.prompt('parity probe');
     const log = process.env['CLAUDE_DOUBLE_LOG']!;
-    const records = readFileSync(log, 'utf8').trim().split('\n')
-      .map((line) => JSON.parse(line) as { argv: string[] });
+    const records: { argv: string[] }[] = [];
+    for (const raw of readFileSync(log, 'utf8').split('\n')) {
+      const line = raw.trim();
+      if (line === '') continue;
+      try {
+        records.push(JSON.parse(line) as { argv: string[] });
+      } catch {
+        // Tolerate a partially appended trailing record (same flake class
+        // as the claude-adapter double reader).
+        break;
+      }
+    }
     const record = records[records.length - 1]!;
     const argv = record.argv;
     // `--tools` carries the enabled list including the bridged MCP names;
@@ -182,7 +192,7 @@ async function capturedWholePolicies(): Promise<CapturedPolicy[]> {
   });
   expect(result.canonicalVerdict).toBe('READY TO MERGE');
   expect(fake.leadCalls).toHaveLength(1);
-  expect(fake.childCalls).toHaveLength(7);
+  expect(fake.childCalls).toHaveLength(9);
 
   const policies = new Map<string, CapturedPolicy>();
   const lead = fake.leadCalls[0]!.options.reviewLead!;
@@ -197,7 +207,7 @@ async function capturedWholePolicies(): Promise<CapturedPolicy[]> {
     const nativeNames = (policy.nativeTools ?? []).map((tool) => tool.name);
     const key = `${policy.systemPrompt}\0${policy.tools.join(',')}\0${nativeNames.join(',')}`;
     if (policies.has(key)) continue;
-    const lens = /"source": "(blind|edge|acceptance|security|architecture|codebase|tests)"/.exec(call.prompt ?? '')?.[1];
+    const lens = /"source": "(blind|edge|acceptance|security|architecture|codebase|tests|performance|operations)"/.exec(call.prompt ?? '')?.[1];
     policies.set(key, {
       label: lens ?? `child-${policies.size}`,
       seam: { isolatedReview: policy },

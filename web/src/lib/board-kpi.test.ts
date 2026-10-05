@@ -113,6 +113,45 @@ describe('board KPIs — counts over the live snapshot', () => {
     expect(lanes.disposed).toBe(2);
   });
 
+  it('#171: the KPI strip agrees with the crew rail — historical rows never read live and derived status drives mid-turn', () => {
+    const agents: AgentView[] = [
+      // A September session frozen in streaming: not live, not mid-turn.
+      agent('minion-sept', { state: 'streaming', runtime: 'historical', lastActivity: ISO(-72 * 3_600_000) }),
+      // A current worker whose raw adapter state says idle but whose
+      // derived status proves an open turn: counts as mid-turn.
+      agent('minion-working', {
+        state: 'idle',
+        status: 'streaming',
+        runtime: 'current',
+        lastActivity: ISO(-120_000),
+        supervision: {
+          state: 'watching',
+          restarts: 0,
+          breakerOpen: false,
+          openTurn: true,
+          lastEventAt: ISO(-10_000),
+        },
+      }),
+      // Ambiguous ownership is not claimed active on a classifying board.
+      agent('minion-ambiguous', { state: 'streaming', runtime: 'unverified', lastActivity: ISO(-5_000) }),
+      // A breaker-held lane stays crew even though the released handle
+      // left the record disposed — and is not a graveyard row.
+      agent('minion-held', {
+        role: 'minion',
+        state: 'disposed',
+        runtime: 'current',
+        supervision: { state: 'stopped', restarts: 2, breakerOpen: true, stopReason: 'crash loop' },
+      }),
+      // A disposed past record stays the graveyard count.
+      agent('minion-disposed', { state: 'disposed', runtime: 'historical' }),
+    ];
+    const lanes = laneCounts(agents);
+    expect(lanes.liveMinions).toBe(2); // working + held (Sept/ambiguous/disposed never)
+    expect(lanes.midTurn).toBe(1); // the derived-streaming worker only
+    expect(lanes.midTurnOldestAt).toBe(ISO(-10_000)); // supervision clock wins over the staler ledger stamp
+    expect(lanes.disposed).toBe(1); // the held lane is not a graveyard row
+  });
+
   it('counts nothing rather than NaN on an empty board', () => {
     const empty = { ...fixture(), repos: [], agents: [] };
     const kpis = boardKpis(empty, NOW);

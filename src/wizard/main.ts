@@ -25,7 +25,11 @@ import { ReadStream, WriteStream } from 'node:tty';
 import { fileURLToPath } from 'node:url';
 import * as QRCode from 'qrcode';
 import { configPathFor, expandTilde, instanceDirFromEnv, DEFAULT_INSTANCE_PORT, RUNTIME_IDS } from '../config.js';
-import { probeRuntimes, type RuntimeProbeResult } from '../runtime/probe.js';
+// TYPE-ONLY import on purpose: the runtime probe drags in both adapter SDK
+// graphs for two static capability literals. The value import is dynamic at
+// its use sites (see main) so wizard invocations that never probe — most
+// importantly an invalid `--answers` payload — do not pay for it.
+import type { RuntimeProbeResult } from '../runtime/probe.js';
 import {
   AnswersError,
   generateToken,
@@ -540,8 +544,6 @@ async function main(argv: readonly string[]): Promise<number> {
 
   const repoRoot = repoRootFrom(import.meta.url);
   stdout.write('Gru Command setup wizard\n=========================');
-  const probe = probeRuntimes();
-  printProbe(probe);
 
   // Round-trip: load + schema-validate any existing config FIRST. A
   // malformed config fails loud here — a re-run never silently drops or
@@ -555,6 +557,11 @@ async function main(argv: readonly string[]): Promise<number> {
     );
   }
 
+  // An invalid `--answers` payload fails fast BEFORE any probe work: the
+  // probe spawns runtime CLIs and its module graph carries the adapter
+  // SDKs, and a run that can never proceed must not pay for either. The
+  // non-interactive validation below therefore runs first, and every probe
+  // is loaded dynamically at its use site.
   let answers: WizardAnswers;
   let terminal: WizardTerminal | null = null;
   if (noInteract) {
@@ -585,8 +592,13 @@ async function main(argv: readonly string[]): Promise<number> {
     } catch (error) {
       fail(String((error as Error).message));
     }
+    const { probeRuntimes } = await import('../runtime/probe.js');
+    printProbe(probeRuntimes());
     stdout.write('\nNon-interactive mode (unspecified answers = documented defaults).\n');
   } else {
+    const { probeRuntimes } = await import('../runtime/probe.js');
+    const probe = probeRuntimes();
+    printProbe(probe);
     terminal = openWizardTerminal(repoRoot);
     answers = await interactiveAnswers(probe, terminal, prior);
   }

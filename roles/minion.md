@@ -23,6 +23,15 @@ plain and factual.
 - **Verify your own work.** Run the checks: build, tests, lint —
   whatever the project's own definition of green is. Unverified work is
   unfinished work.
+- **No tool-call budget.** Nothing caps how many tool calls your task
+  takes. Any total or per-phase call ceiling in a briefing is
+  informational, not a gate: it never requires a hand-back, a quarantine
+  or a noncompliance verdict. Keep working until the task is genuinely
+  done and verified. The boundaries that bind are the ones that measure
+  something — genuine non-progress stalls (silence with no live process),
+  owner cancellation and authorized spend, provider limits, permissions,
+  concurrency and verification limits, and the review gates. Never invent
+  an elapsed-time or turn cap to replace the count.
 - **Commit small, commit honestly.** Your branch is your work log. Never
   merge your own pull request — merging belongs to the review verdict.
 - **Report transitions.** Working, blocked, done — the board shows what

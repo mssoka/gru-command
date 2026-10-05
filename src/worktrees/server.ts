@@ -3,6 +3,7 @@ import { hashToken, tokenConfigured, tokenMatches } from '../auth.js';
 import type { GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { WorktreeManager } from './manager.js';
+import type { LedgerApi } from '../ledger/api.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -22,6 +23,9 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
 export interface WorktreeServerOptions {
   readonly config: GruCommandConfig;
   readonly manager: WorktreeManager;
+  /** Issue #161: child-worker records (the job release refuses while a
+   * non-terminal child still owns a lane). */
+  readonly ledger?: LedgerApi;
   readonly log?: Log;
 }
 
@@ -117,13 +121,45 @@ export function createWorktreeServer(options: WorktreeServerOptions): WorktreeSe
       }
     } else {
       const jobId = strField(body, 'job_id');
+      // The JOB's own lane — never a linked review or child lane that
+      // happens to share the job id (issue #161: child lanes are registered
+      // under the same job scope).
       const lanes = manager.listWorktrees({ jobId });
-      const active = lanes.find((lane) => lane.status !== 'swept');
+      const active = lanes.find((lane) => lane.kind === 'job' && lane.status !== 'swept');
       if (active === undefined) {
         json(res, 404, { error: 'not_found', detail: 'no active worktree for this job' });
         return;
       }
       worktreeId = active.id;
+    }
+    // Issue #161: a release never abandons a live child worker — whatever
+    // selector the caller used (job_id, an explicit job lane, or an
+    // explicit child lane). The manager's OS-process enumeration cannot
+    // prove an in-process child ceased, so the durable record decides.
+    const lane = manager.getWorktree(worktreeId);
+    if (lane !== null && options.ledger !== undefined) {
+      const outstanding =
+        lane.kind === 'child'
+          ? [options.ledger.getChildWorker(lane.id)].filter(
+              (child): child is NonNullable<typeof child> =>
+                child !== null && child.resultState === null,
+            )
+          : lane.kind === 'job' && lane.jobId !== null
+            ? options.ledger
+                .listChildWorkers({ jobId: lane.jobId })
+                .filter((child) => child.resultState === null)
+            : [];
+      if (outstanding.length > 0) {
+        json(res, 409, {
+          error: 'active_child_workers',
+          detail:
+            (lane.kind === 'child'
+              ? `child worker "${lane.id}" is still non-terminal — cancel it (POST /api/dispatch/children/${lane.id}/cancel) first`
+              : `job "${lane.jobId ?? ''}" has ${outstanding.length} non-terminal child worker(s) — cancel them first (POST /api/dispatch/children/:id/cancel)`),
+          child_ids: outstanding.map((child) => child.id),
+        });
+        return;
+      }
     }
     const result = await manager.release({
       worktreeId,

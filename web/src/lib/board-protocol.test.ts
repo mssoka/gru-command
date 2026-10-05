@@ -157,7 +157,18 @@ describe('board server-frame validator', () => {
         checkedAt: '2026-01-01T00:00:00.000Z',
         checkError: null,
       },
-      silas: { lastWakeAt: null, reconciliationsToday: 2, checkedAt: '2026-01-01T00:00:00.000Z' },
+      silas: {
+        lastWakeAt: null,
+        lastTickAt: null,
+        lastReconcileAt: null,
+        lastReconcileFailedAt: null,
+        reconcileFailedNewer: false,
+        lastUsefulActionAt: null,
+        nextAction: null,
+        openTurnSince: null,
+        reconciliationsToday: 2,
+        checkedAt: '2026-01-01T00:00:00.000Z',
+      },
       verify: { lockInUse: true, activeRuns: 1, queuedRuns: 0, workerBudget: 8, workersPerRun: 4 },
       selfHeal: { sessionsResumed: 1, sessionsOrphaned: 0, since: null },
     } as unknown;
@@ -167,6 +178,9 @@ describe('board server-frame validator', () => {
     for (const [field, broken] of [
       ['build', { ...(wired as { build: object }).build, commitsBehind: '43' }],
       ['silas', { ...(wired as { silas: object }).silas, reconciliationsToday: -1 }],
+      ['silas', { ...(wired as { silas: object }).silas, reconcileFailedNewer: 'no' }],
+      ['silas', { ...(wired as { silas: object }).silas, reconcileFailedNewer: undefined }],
+      ['silas', { ...(wired as { silas: object }).silas, nextAction: 7 }],
       ['verify', { ...(wired as { verify: object }).verify, lockInUse: 'yes' }],
       ['selfHeal', { ...(wired as { selfHeal: object }).selfHeal, sessionsResumed: 1.5 }],
     ] as const) {
@@ -174,6 +188,76 @@ describe('board server-frame validator', () => {
     }
   });
 
+  it('validates a present supervision block at the parse boundary (known state, boolean breaker, finite restarts; junk rejects)', () => {
+    const withSupervision = (supervision: unknown): unknown => {
+      const candidate = snapshot();
+      (candidate.agents[0] as unknown as { supervision: unknown }).supervision = supervision;
+      return candidate;
+    };
+    // Accept: a stopped lane with a recorded reason, a stop without one
+    // (pre-reason server), the watching baseline with stopReason absent,
+    // and supervision absent/null (unsupervised).
+    expect(
+      isValidSnapshot(withSupervision({ state: 'stopped', restarts: 2, breakerOpen: true, stopReason: 'quota_wall' })),
+    ).toBe(true);
+    expect(
+      isValidSnapshot(withSupervision({ state: 'stopped', restarts: 0, breakerOpen: true, stopReason: null })),
+    ).toBe(true);
+    expect(isValidSnapshot(withSupervision({ state: 'watching', restarts: 0, breakerOpen: false }))).toBe(true);
+    expect(isValidSnapshot(withSupervision(null))).toBe(true);
+    expect(isValidSnapshot(withSupervision(undefined))).toBe(true);
+    // Reject: a present-but-junk block is a server bug, never "no reason".
+    expect(
+      isValidSnapshot(withSupervision({ state: 'stopped', restarts: 0, breakerOpen: true, stopReason: 7 })),
+    ).toBe(false);
+    expect(
+      isValidSnapshot(withSupervision({ state: 'stopped', restarts: 0, breakerOpen: true, stopReason: {} })),
+    ).toBe(false);
+    expect(isValidSnapshot(withSupervision('stopped'))).toBe(false);
+    // Reject malformed PRESENT fields (tracked-review A9): a truthy
+    // non-boolean breaker must never read as a false-live lane, an unknown
+    // state is not a state, and a non-finite/negative restart count is not
+    // a count.
+    expect(isValidSnapshot(withSupervision({ state: 'watching', restarts: 0, breakerOpen: 1 }))).toBe(false);
+    expect(isValidSnapshot(withSupervision({ state: 'stopped', restarts: 'x', breakerOpen: true }))).toBe(false);
+    expect(isValidSnapshot(withSupervision({ state: 'flying', restarts: 0, breakerOpen: false }))).toBe(false);
+    expect(isValidSnapshot(withSupervision({ state: 'watching', restarts: -1, breakerOpen: false }))).toBe(false);
+    expect(isValidSnapshot(withSupervision({ state: 'watching', restarts: Number.NaN, breakerOpen: false }))).toBe(false);
+  });
+
+  it('#171 agent classification fields validate strictly at the parse boundary (unknown class/status/lastEventAt reject)', () => {
+    const withAgent = (patch: Record<string, unknown>): unknown => {
+      const candidate = snapshot();
+      Object.assign(candidate.agents[0] as unknown as Record<string, unknown>, patch);
+      return candidate;
+    };
+    // Accept: absent (pre-upgrade), the three known classes, a known
+    // derived status, and a parseable supervision event clock.
+    expect(isValidSnapshot(snapshot())).toBe(true);
+    expect(isValidSnapshot(withAgent({ runtime: 'current' }))).toBe(true);
+    expect(isValidSnapshot(withAgent({ runtime: 'historical' }))).toBe(true);
+    expect(isValidSnapshot(withAgent({ runtime: 'unverified' }))).toBe(true);
+    expect(isValidSnapshot(withAgent({ status: 'streaming' }))).toBe(true);
+    expect(
+      isValidSnapshot(
+        withAgent({ supervision: { state: 'watching', restarts: 0, breakerOpen: false, lastEventAt: '2026-01-01T00:00:00.000Z' } }),
+      ),
+    ).toBe(true);
+    // Reject: an unknown ownership class or display status must never be
+    // silently tolerated (a junk class would render as live crew; a junk
+    // status would reach the chip).
+    expect(isValidSnapshot(withAgent({ runtime: 'archived' }))).toBe(false);
+    expect(isValidSnapshot(withAgent({ runtime: 'CURRENT' }))).toBe(false);
+    expect(isValidSnapshot(withAgent({ status: 'vibing' }))).toBe(false);
+    expect(isValidSnapshot(withAgent({ status: 7 }))).toBe(false);
+    // Reject: an unparseable supervision event clock would silently
+    // displace the valid ledger age in the quiet counter.
+    expect(
+      isValidSnapshot(
+        withAgent({ supervision: { state: 'watching', restarts: 0, breakerOpen: false, lastEventAt: 'not-a-date' } }),
+      ),
+    ).toBe(false);
+  });
 
   it('FOR YOU ownerPrs: absent/null tolerated (pre-upgrade servers), well-formed accepted, malformed rejected', () => {
     expect(isValidSnapshot(snapshot())).toBe(true);

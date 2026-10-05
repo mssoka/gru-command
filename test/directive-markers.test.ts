@@ -310,7 +310,11 @@ describe('directive requests — boot reconciliation (crash windows, bounded, no
     expect(ledger.getDirective('req-r3')?.state).toBe('admitted'); // still in flight/unknown
     // No fabricated delivery event exists.
     expect(ledger.latestJobEvent('job-r3', 'job.delivered')).toBeNull();
-    expect(ledger.findNotificationByKind('silas.directive-unreconciled.req-r3', 'unacked')).not.toBeNull();
+    const card = ledger.findNotificationByKind('silas.directive-unreconciled.req-r3', 'unacked');
+    expect(card).not.toBeNull();
+    // Owner decision D2: the recorded admission worker binds the row so a
+    // terminal lane classifies it as a closed receipt.
+    expect(card?.agentId).toBe('minion-r3');
   });
 
   it('reconciles a live request sorting past a long settled history (B1)', () => {

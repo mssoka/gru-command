@@ -204,10 +204,22 @@ describe('board view resolved-notification rendering', () => {
     const view = new BoardView(() => {});
     view.render(snapshot({ notifications: [notification('legacy-machine', { ackedAt: '2026-01-01T00:01:00.000Z' })] }));
     const sections = [...document.querySelectorAll<HTMLElement>('.board-notification-section')];
-    expect(sections[1]?.textContent).toContain('machine queue is clear');
+    expect(sections[1]?.textContent).toContain('live machine queue is clear');
     expect(sections[1]?.textContent).not.toContain('Notice legacy-machine');
     expect(sections[2]?.textContent).toContain('Notice legacy-machine');
     expect(sections[2]?.querySelector('.board-notification__ack')).toBeNull();
+  });
+
+  it('g9: an empty notification feed renders the healthy FOR YOU / NEEDS GRU clear bands, never a bare skip', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({ notifications: [] }));
+    const panel = document.getElementById('notification-list')!;
+    expect(panel.textContent).not.toContain('nothing needs attention');
+    const heads = [...panel.querySelectorAll('.board-notification-section__head')].map((head) => head.textContent);
+    expect(heads).toEqual(['FOR YOU', 'NEEDS GRU']);
+    const sections = [...panel.querySelectorAll('.board-notification-section')];
+    expect(sections[0]?.textContent).toContain('nothing needs you');
+    expect(sections[1]?.textContent).toContain('live machine queue is clear');
   });
 
   it('routing split: machine rows never ring the bell or toast; needs-owner rows do', () => {
@@ -393,6 +405,9 @@ describe('board v6 — status chip rail (v4 health row relocated)', () => {
     const unacked = trackers?.querySelector<HTMLElement>('#board-unacked');
     expect(unacked?.hidden).toBe(false);
     expect(unacked?.textContent).toContain('2 needs Gru');
+    // The count is the LIVE machine queue: the copy says so (A4).
+    expect(unacked?.title).toContain('2 live machine-attention notifications awaiting a Gru disposition');
+    expect(unacked?.title).toContain('closed receipts stay in the record');
   });
 
   it('shows the NEEDS GRU machine-queue chip only when the table has pending rows', () => {
@@ -474,6 +489,32 @@ describe('board v6 — dense job rows', () => {
     // A verdict-posted round closes the alarm.
     expect(jobFailing(baseJob({ rounds: [baseRound({ status: 'verdict-posted' })] }))).toBe(false);
     expect(jobFailing(baseJob({ status: 'done', rounds: [] }))).toBe(false);
+  });
+
+  it('keeps concluded rows calm even when their stale history is failing', () => {
+    const view = new BoardView(() => {});
+    const erroredLenses = [{ lens: 'blind', state: 'error' as const, agentId: null, note: null, verdict: null }];
+    view.render(
+      snapshot({
+        jobs: [
+          baseJob({ id: 'merged-aborted', status: 'merged', rounds: [baseRound({ status: 'aborted', verdict: null })] }),
+          baseJob({ id: 'done-lens-error', status: 'done', rounds: [baseRound({ status: 'live', lenses: erroredLenses })] }),
+        ],
+      }),
+    );
+    const alert = new Map(
+      [...document.querySelectorAll<HTMLElement>('.board-job')].map((row) => [
+        row.dataset.jobId,
+        row.classList.contains('board-job--alert'),
+      ]),
+    );
+    // The concluded guard is load-bearing: without it an aborted newest
+    // round / errored lens would tint each merged/done row with the alert
+    // accent (a closed receipt is history, not a live alarm).
+    expect(jobFailing(baseJob({ status: 'merged', rounds: [baseRound({ status: 'aborted', verdict: null })] }))).toBe(false);
+    expect(jobFailing(baseJob({ status: 'done', rounds: [baseRound({ status: 'live', lenses: erroredLenses })] }))).toBe(false);
+    expect(alert.get('merged-aborted')).toBe(false);
+    expect(alert.get('done-lens-error')).toBe(false);
   });
 
   it('expands inline from a click anywhere on the summary and collapses again; the PR link does not toggle', () => {
@@ -1126,6 +1167,119 @@ describe('board agent rail — dense rows, tabs count, disposed collapse', () =>
     expect(row?.querySelector('.board-agent__state')?.textContent).toBe('streaming');
   });
 
+  it('distinguishes child workers from top-level minions with a parent link and family counters', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        agents: [
+          agent('parent-minion', {
+            role: 'minion',
+            label: 'Payment lane',
+            parentage: 'top-level',
+            childCounts: { queued: 1, active: 1, finished: 2, lifetimeCreations: 4 },
+          }),
+          agent('child-agent', {
+            role: 'minion',
+            label: 'child of Payment lane',
+            parentage: 'child',
+            parentAgentId: 'parent-minion',
+            child: {
+              id: 'child_1',
+              agentId: 'child-agent',
+              parentAgentId: 'parent-minion',
+              jobId: 'job-1',
+              purpose: 'audit',
+              authority: 'read-only',
+              state: 'done',
+              worktreeId: 'child_1',
+              branch: null,
+              resultState: 'done',
+              resultSummary: 'all clear',
+              resultRef: '/sessions/child.jsonl',
+              createdAt: '2026-01-01T00:00:00.000Z',
+              admittedAt: '2026-01-01T00:00:01.000Z',
+              startedAt: '2026-01-01T00:00:02.000Z',
+              finishedAt: '2026-01-01T00:01:00.000Z',
+            },
+          }),
+          agent('legacy-minion', { role: 'minion', label: 'legacy lane' }),
+        ],
+      }),
+    );
+    const rows = [...document.querySelectorAll<HTMLElement>('#board-agents .board-agent')];
+    const byName = new Map(rows.map((row) => [row.querySelector('.board-agent__name')?.textContent, row]));
+    // The parent renders its family counters and the top-level marker.
+    const parent = byName.get('Payment lane')!;
+    expect(parent.dataset.parentage).toBe('top-level');
+    expect(parent.querySelector('.board-agent__parentage')?.textContent).toBe('top-level');
+    expect(parent.querySelector('.board-agent__child-counts')?.textContent).toContain('4 children');
+    // A child row is labeled as a child and links back to its parent.
+    const child = byName.get('child of Payment lane')!;
+    expect(child.dataset.parentage).toBe('child');
+    expect(child.querySelector('.board-agent__role')?.textContent).toContain('child ·');
+    expect(child.querySelector('.board-agent__parent-link')?.textContent).toContain('Payment lane');
+    // A legacy row (no parentage field) is never claimed either way.
+    const legacy = byName.get('legacy lane')!;
+    expect(legacy.dataset.parentage).toBe('unknown');
+    expect(legacy.querySelector('.board-agent__parentage')).toBeNull();
+  });
+
+  it('navigates to a collapsed parent and activates rows from the keyboard', () => {
+    const opened: string[] = [];
+    const view = new BoardView(({ file }) => opened.push(file));
+    const childView = {
+      id: 'child_1',
+      agentId: 'child-agent',
+      parentAgentId: 'old-parent',
+      jobId: 'job-1',
+      purpose: 'audit',
+      authority: 'read-only' as const,
+      state: 'done' as const,
+      worktreeId: 'child_1',
+      branch: null,
+      resultState: 'done' as const,
+      resultSummary: 'all clear',
+      resultRef: '/sessions/child.jsonl',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      admittedAt: '2026-01-01T00:00:01.000Z',
+      startedAt: '2026-01-01T00:00:02.000Z',
+      finishedAt: '2026-01-01T00:01:00.000Z',
+    };
+    view.render(
+      snapshot({
+        agents: [
+          agent('child-agent', {
+            role: 'minion',
+            label: 'child of archived lane',
+            parentage: 'child',
+            parentAgentId: 'old-parent',
+            sessionFile: '/sessions/child-agent.jsonl',
+            child: childView,
+          }),
+          agent('old-parent', { role: 'minion', label: 'archived parent', parentage: 'top-level', state: 'disposed' }),
+        ],
+      }),
+    );
+    // The disposed parent row is collapsed: only the child is visible.
+    expect(document.querySelectorAll('#board-agents .board-agent')).toHaveLength(1);
+    const link = document.querySelector<HTMLButtonElement>('.board-agent__parent-link');
+    expect(link?.tagName).toBe('BUTTON');
+    // Keys pressed ON the nested link must not be hijacked by the row's
+    // transcript action (Enter bubbles; target !== row → ignored).
+    link?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    expect(opened).toEqual([]);
+    link?.click();
+    const rows = [...document.querySelectorAll<HTMLElement>('#board-agents .board-agent')];
+    expect(rows).toHaveLength(2);
+    expect(rows.some((row) => row.dataset.agentId === 'old-parent')).toBe(true);
+    // Rows carry button semantics and activate on Enter (div + keydown).
+    const childRow = rows.find((row) => row.dataset.agentId === 'child-agent')!;
+    expect(childRow.getAttribute('role')).toBe('button');
+    expect(childRow.tabIndex).toBe(0);
+    childRow.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    expect(opened).toEqual(['/sessions/child-agent.jsonl']);
+  });
+
   it('tints error rows with the alert accent', () => {
     const view = new BoardView(() => {});
     view.render(
@@ -1160,6 +1314,182 @@ describe('board agent rail — dense rows, tabs count, disposed collapse', () =>
   });
 });
 
+describe('board agent rail — truthful runtime status (#171)', () => {
+  beforeEach(mountBoardDom);
+
+  it('verified-historical sessions never count or sort as live crew; their transcripts stay reachable', () => {
+    const opened: { file: string }[] = [];
+    const view = new BoardView((_request) => {
+      opened.push(_request);
+    });
+    view.render(
+      snapshot({
+        agents: [
+          // The observed defect: a September Silas frozen in `streaming`
+          // next to the one live Silas, plus a stale lens worker.
+          agent('silas-sept', { role: 'silas', state: 'streaming', runtime: 'historical', lastActivity: '2026-09-29T00:00:00.000Z' }),
+          agent('lens-sept', { state: 'streaming', runtime: 'historical', lastActivity: '2026-09-29T00:00:00.000Z' }),
+          agent('silas-now', { role: 'silas', state: 'idle', runtime: 'current' }),
+          agent('gru-old', { role: 'gru', state: 'disposed' }),
+        ],
+      }),
+    );
+    // Live rail = current rows only; history and graveyard sit behind
+    // their own disclosures; the CREW count agrees with the rail.
+    const rail = document.getElementById('board-agents')!;
+    expect(rail.querySelectorAll('.board-agent:not(.board-agent--disposed):not(.board-agent--historical)')).toHaveLength(1);
+    expect(document.getElementById('rail-agents-count')?.textContent).toBe('1');
+    const historyToggle = [
+      ...rail.querySelectorAll<HTMLButtonElement>('.board-agent-toggle'),
+    ].find((toggle) => toggle.textContent?.includes('history'))!;
+    expect(historyToggle.textContent).toContain('2 history');
+    expect(historyToggle.getAttribute('aria-expanded')).toBe('false');
+    expect(rail.querySelectorAll('.board-agent--historical')).toHaveLength(0);
+
+    historyToggle.click();
+    const historicalRows = [...rail.querySelectorAll<HTMLElement>('.board-agent--historical')];
+    expect(historicalRows).toHaveLength(2);
+    // The history marker is explicit, and the transcript click survives.
+    for (const row of historicalRows) {
+      expect(row.querySelector('.board-agent__runtime--historical')?.textContent).toBe('🕘 history');
+      expect(row.title).toContain('historical');
+    }
+    historicalRows[0]?.click();
+    expect(opened).toHaveLength(1); // the transcript history stays accessible
+  });
+
+  it('a raw-idle agent with open supervision work shows the work it is doing', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        agents: [
+          agent('silas-working', {
+            role: 'silas',
+            state: 'idle',
+            status: 'streaming',
+            runtime: 'current',
+            lastActivity: '2026-09-29T00:00:00.000Z',
+            supervision: {
+              state: 'watching',
+              restarts: 0,
+              breakerOpen: false,
+              openTurn: true,
+              lastEventAt: new Date(Date.now() - 30_000).toISOString(),
+            },
+          }),
+        ],
+      }),
+    );
+    const row = document.querySelector<HTMLElement>('#board-agents .board-agent');
+    // Chip + subline + dataset read the DERIVED status; the stale ledger
+    // stamp never shows days-quiet while supervision sees fresh events.
+    expect(row?.dataset.state).toBe('streaming');
+    expect(row?.querySelector('.board-agent__state')?.textContent).toBe('streaming');
+    expect(row?.querySelector('.board-agent__role')?.textContent).toContain('silas · streaming');
+    const age = row?.querySelector('.board-agent__age')?.textContent ?? '';
+    expect(age).toMatch(/^\d+s quiet$/);
+  });
+
+  it('ambiguous ownership stays visible and marked, but only confirmed current owners count as crew', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        agents: [
+          // A classifying snapshot (some row carries runtime) with one
+          // row missing the field and one explicitly unverified, plus a
+          // confirmed current owner.
+          agent('legacy-row', { state: 'idle' }),
+          agent('probed-row', { state: 'idle', runtime: 'unverified' }),
+          agent('current-row', { state: 'idle', runtime: 'current' }),
+        ],
+      }),
+    );
+    const rows = [...document.querySelectorAll<HTMLElement>('#board-agents .board-agent')];
+    expect(rows).toHaveLength(3); // conservative: ambiguous rows stay visible
+    // The active count claims only what the runtime proves (AC5).
+    expect(document.getElementById('rail-agents-count')?.textContent).toBe('1');
+    const marked = rows.filter((row) => row.querySelector('.board-agent__runtime--unknown') !== null);
+    expect(marked).toHaveLength(2);
+    for (const row of marked) {
+      expect(row.querySelector('.board-agent__runtime--unknown')?.textContent).toBe('❓ unverified');
+    }
+    // No history/disposed disclosures were fabricated from ambiguity.
+    expect(document.querySelector('.board-agent-toggle')).toBeNull();
+  });
+
+  it('a pre-upgrade snapshot (no runtime classification at all) keeps the legacy board: every live row counts and none is marked', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        agents: [agent('old-a', { state: 'idle' }), agent('old-b', { role: 'minion', state: 'streaming' })],
+      }),
+    );
+    expect(document.getElementById('rail-agents-count')?.textContent).toBe('2');
+    expect(document.querySelector('.board-agent__runtime--unknown')).toBeNull();
+    expect(document.querySelector('.board-agent-toggle')).toBeNull();
+  });
+
+  it('an owner-held stop stays in the live crew and counts even when the released handle left the record disposed', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        agents: [
+          // Breaker trip: handle disposed → ledger state disposed, while
+          // the current supervisor still owns the lane awaiting re-arm.
+          agent('minion-stopped', {
+            role: 'minion',
+            state: 'disposed',
+            runtime: 'current',
+            supervision: { state: 'stopped', restarts: 3, breakerOpen: true, stopReason: 'crash loop' },
+          }),
+          // A genuinely disposed past record keeps the graveyard.
+          agent('minion-old', { role: 'minion', state: 'disposed', runtime: 'historical' }),
+        ],
+      }),
+    );
+    const rail = document.getElementById('board-agents')!;
+    const liveRow = rail.querySelector<HTMLElement>('.board-agent:not(.board-agent--disposed):not(.board-agent--historical)');
+    expect(liveRow?.textContent).toContain('minion-stopped');
+    expect(liveRow?.querySelector('.board-agent__supervision--alert')?.textContent).toBe('⛔ stopped');
+    // The active count includes the held lane; the graveyard toggle does
+    // not.
+    expect(document.getElementById('rail-agents-count')?.textContent).toBe('1');
+    const disposedToggle = [...rail.querySelectorAll<HTMLButtonElement>('.board-agent-toggle')].find(
+      (toggle) => toggle.textContent?.includes('disposed'),
+    );
+    expect(disposedToggle?.textContent).toContain('1 disposed');
+  });
+
+  it('a genuine duplicate current singleton owner is surfaced as an anomaly; a historical epoch or review pool is not', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        agents: [
+          agent('silas-a', { role: 'silas', state: 'idle', runtime: 'current' }),
+          agent('silas-b', { role: 'silas', state: 'idle', runtime: 'current' }),
+          agent('silas-sept', { role: 'silas', state: 'streaming', runtime: 'historical' }),
+          agent('minion-1', { role: 'minion', state: 'idle', runtime: 'current' }),
+          agent('minion-2', { role: 'minion', state: 'idle', runtime: 'current' }),
+          // A review round legitimately runs lead + specialists under the
+          // same role concurrently — never a duplicate-owner anomaly.
+          agent('perkins-lead', { role: 'perkins', state: 'idle', runtime: 'current' }),
+          agent('perkins-blind', { role: 'perkins', state: 'idle', runtime: 'current' }),
+        ],
+      }),
+    );
+    const flagged = [...document.querySelectorAll<HTMLElement>('#board-agents .board-agent')].filter(
+      (row) => row.querySelector('.board-agent__runtime--alert') !== null,
+    );
+    // Both CURRENT Silas owners carry the anomaly; the historical epoch,
+    // the minions and the concurrent Perkins review pool never do.
+    expect(flagged.map((row) => row.querySelector('.board-agent__name')?.textContent)).toEqual([
+      'silas-a',
+      'silas-b',
+    ]);
+    expect(flagged[0]?.title).toContain('more than one current silas');
+  });
+});
+
 describe('board v6 — job status tones', () => {
   beforeEach(mountBoardDom);
 
@@ -1172,6 +1502,390 @@ describe('board v6 — job status tones', () => {
     expect(chip?.className).toContain('pp-chip--work');
     expect(chip?.className).not.toContain('pp-chip--rev');
     expect(row?.querySelector('.board-job__dot')?.className).toContain('board-job__dot--work');
+  });
+});
+
+describe('board v6 — section truth: closed receipts never queue, stopped lanes never lie', () => {
+  beforeEach(mountBoardDom);
+
+  it('a merged lane with a leftover unacked escalation leaves NEEDS GRU and renders as a closed receipt', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        jobs: [baseJob({ id: 'merged-leftover', status: 'merged', rounds: [] })],
+        agents: [agent('minion-merged', { role: 'minion', jobId: 'merged-leftover' })],
+        notifications: [notification('n-leftover', { agentId: 'minion-merged' })],
+        unackedActionRequired: 0, // the service counts LIVE rows only
+      }),
+    );
+    const needsYou = document.querySelector('.board-band--needs-you');
+    // The calm green clear state is the truth: nothing needs Gru.
+    expect(needsYou?.querySelector('.board-job')).toBeNull();
+    expect(needsYou?.querySelector('.board-band__clear-text')?.textContent).toBe('nothing needs Gru');
+    // The merged lane renders as a closed receipt in its settle band —
+    // present for the record, never as an active queue entry.
+    const receipt = document.querySelector<HTMLElement>('.board-band--cold .board-job, .board-band--settled .board-job');
+    expect(receipt?.getAttribute('data-job-id')).toBe('merged-leftover');
+    expect(receipt?.getAttribute('data-status')).toBe('merged');
+    expect(receipt?.querySelector('.board-job__signal')).toBeNull(); // no 🔔 alert chip
+  });
+
+  it('the unacked chip counts only live rows while the record keeps every durable row', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        jobs: [
+          baseJob({ id: 'live-walled', status: 'working', rounds: [] }),
+          baseJob({ id: 'merged-leftover', status: 'merged', rounds: [] }),
+        ],
+        agents: [
+          agent('minion-live', { role: 'minion', jobId: 'live-walled' }),
+          agent('minion-merged', { role: 'minion', jobId: 'merged-leftover' }),
+        ],
+        notifications: [
+          notification('n-live', { agentId: 'minion-live' }),
+          notification('n-closed', { agentId: 'minion-merged' }),
+        ],
+        unackedActionRequired: 1, // the live row only — the closed one is a receipt
+      }),
+    );
+    const unacked = document.querySelector<HTMLElement>('#board-unacked');
+    expect(unacked?.hidden).toBe(false);
+    expect(unacked?.textContent).toContain('1 needs Gru');
+    // The record keeps BOTH durable rows. Machine rows clear through a Gru
+    // disposition, not a human Ack, so neither carries an ack control.
+    const rows = [...document.querySelectorAll('.board-notification')];
+    expect(rows).toHaveLength(2);
+    expect(rows.filter((row) => row.querySelector('.board-notification__ack') !== null)).toHaveLength(0);
+    // The closed receipt renders under FEED with its marker — never in the
+    // live NEEDS GRU queue the operator acts on; the live row stays queued.
+    const sectionOf = (needle: string): string | undefined =>
+      rows
+        .find((row) => row.textContent?.includes(needle))
+        ?.closest('.board-notification-section')
+        ?.querySelector('.board-notification-section__head')?.textContent ?? undefined;
+    const closedRow = rows.find((row) => row.textContent?.includes('Notice n-closed'));
+    expect(closedRow?.textContent).toContain('closed receipt');
+    expect(closedRow?.getAttribute('data-receipt')).toBe('closed');
+    expect(sectionOf('Notice n-closed')).toBe('FEED');
+    expect(sectionOf('Notice n-live')).toBe('NEEDS GRU');
+    // The live lane still carries its machine signal; the receipt carries none.
+    const live = document.querySelector<HTMLElement>('.board-band--needs-you .board-job');
+    expect(live?.getAttribute('data-job-id')).toBe('live-walled');
+    expect(live?.querySelector('.board-job__signal')?.textContent).toContain('1 needs Gru');
+    expect(document.querySelector('.board-band--cold .board-job__signal, .board-band--settled .board-job__signal')).toBeNull();
+  });
+
+  it('a quota-walled lane shows its true waiting state instead of plain working', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        jobs: [
+          baseJob({
+            id: 'walled',
+            status: 'working',
+            rounds: [],
+            lastAgentActivity: new Date(Date.now() - 45 * 60_000).toISOString(),
+          }),
+        ],
+        agents: [
+          agent('minion-walled', {
+            role: 'minion',
+            jobId: 'walled',
+            supervision: { state: 'stopped', restarts: 2, breakerOpen: true, stopReason: 'quota_wall' },
+          }),
+        ],
+      }),
+    );
+    const row = document.querySelector<HTMLElement>('.board-job');
+    expect(row?.getAttribute('data-job-id')).toBe('walled');
+    expect(row?.getAttribute('data-worker-state')).toBe('waiting');
+    // Not COLD, not flagged stalled: the silence has a recorded cause.
+    expect(row?.getAttribute('data-band')).toBe('in-flight');
+    expect(row?.querySelector('.board-job__stale')).toBeNull();
+    const chip = row?.querySelector('.board-job__status');
+    expect(chip?.textContent).toBe('waiting · quota wall');
+    expect(chip?.className).toContain('pp-chip--park');
+    expect(chip?.getAttribute('title')).toContain('worker stopped by supervision (quota wall)');
+  });
+
+  it('an aborted isolated review never marks a working lane as waiting', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        jobs: [baseJob({ id: 'reworking', status: 'working', rounds: [] })],
+        agents: [
+          agent('minion-working', { role: 'minion', jobId: 'reworking', state: 'streaming', lastActivity: new Date().toISOString() }),
+          agent('perkins-aborted', {
+            role: 'perkins',
+            roundId: 'r1',
+            jobId: 'reworking',
+            supervision: { state: 'stopped', restarts: 0, breakerOpen: false, stopReason: 'review aborted' },
+          }),
+        ],
+      }),
+    );
+    const row = document.querySelector<HTMLElement>('.board-job');
+    expect(row?.getAttribute('data-job-id')).toBe('reworking');
+    // The workflow-owned stop belongs to the round lifecycle: the lane
+    // keeps its true working state (and its own minion's stop would still
+    // swap it to waiting).
+    expect(row?.getAttribute('data-worker-state')).toBeNull();
+    expect(row?.querySelector('.board-job__status')?.textContent).toBe('working');
+    expect(row?.getAttribute('data-band')).toBe('in-flight');
+  });
+
+  it('a recent non-minion frame never keeps a silent minion out of COLD (code review V1)', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        jobs: [baseJob({ id: 'mixed-role', status: 'working', rounds: [] })],
+        agents: [
+          // The minion has been silent past the window...
+          agent('minion-silent', {
+            role: 'minion',
+            jobId: 'mixed-role',
+            state: 'streaming',
+            lastActivity: new Date(Date.now() - 45 * 60_000).toISOString(),
+          }),
+          // ...while a bound review agent spoke seconds ago. The digest
+          // watches minions only, so the board must agree: COLD + stalled.
+          agent('perkins-recent', {
+            role: 'perkins',
+            roundId: 'r1',
+            jobId: 'mixed-role',
+            lastActivity: new Date().toISOString(),
+          }),
+        ],
+      }),
+    );
+    const row = document.querySelector<HTMLElement>('.board-job');
+    expect(row?.getAttribute('data-band')).toBe('cold');
+    expect(row?.querySelector('.board-job__stale')?.textContent).toBe('stalled');
+  });
+
+  it('a verified-historical minion stamp never keeps a dead lane warm (#171)', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        jobs: [
+          baseJob({
+            id: 'stale-lane',
+            status: 'working',
+            rounds: [],
+            lastAgentActivity: new Date(Date.now() - 45 * 60_000).toISOString(),
+          }),
+        ],
+        agents: [
+          // The only minion record is a VERIFIED-historical session whose
+          // frozen September stamp is recent-looking. It is not live work:
+          // the lane reads on its own recency — COLD + stalled.
+          agent('minion-sept', {
+            role: 'minion',
+            jobId: 'stale-lane',
+            state: 'streaming',
+            runtime: 'historical',
+            lastActivity: new Date(Date.now() - 60_000).toISOString(),
+          }),
+        ],
+      }),
+    );
+    const row = document.querySelector<HTMLElement>('.board-job');
+    expect(row?.getAttribute('data-band')).toBe('cold');
+    expect(row?.querySelector('.board-job__stale')?.textContent).toBe('stalled');
+  });
+
+  it('a verified-historical minion never masks a current stop as live work (#171)', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        jobs: [
+          baseJob({
+            id: 'stopped-lane',
+            status: 'working',
+            rounds: [],
+            lastAgentActivity: new Date(Date.now() - 45 * 60_000).toISOString(),
+          }),
+        ],
+        agents: [
+          agent('minion-stopped', {
+            role: 'minion',
+            jobId: 'stopped-lane',
+            supervision: { state: 'stopped', restarts: 2, breakerOpen: true, stopReason: 'quota_wall' },
+          }),
+          // A stale historical epoch of the same lane, frozen mid-stream,
+          // must not clear the stop with its frozen stamp.
+          agent('minion-epoch', {
+            role: 'minion',
+            jobId: 'stopped-lane',
+            state: 'streaming',
+            runtime: 'historical',
+            lastActivity: new Date(Date.now() - 30_000).toISOString(),
+          }),
+        ],
+      }),
+    );
+    const row = document.querySelector<HTMLElement>('.board-job');
+    expect(row?.getAttribute('data-worker-state')).toBe('waiting');
+    expect(row?.querySelector('.board-job__status')?.textContent).toBe('waiting · quota wall');
+  });
+
+  it('loads older receipts on demand and merges them into FEED (D3)', async () => {
+    const older = notification('older-receipt');
+    const client = {
+      ackNotification: vi.fn(() => Promise.resolve()),
+      markNotificationShown: vi.fn(() => Promise.resolve(true)),
+      fetchReceipts: vi.fn(() => Promise.resolve({ receipts: [older], nextOffset: 1, hasMore: false })),
+    } as unknown as import('../lib/board-client.js').BoardClient;
+    const view = new BoardView(() => {});
+    view.bindClient(client);
+    view.render(
+      snapshot({
+        jobs: [baseJob({ id: 'receipt-lane', status: 'merged', rounds: [] })],
+        agents: [agent('minion-receipt-lane', { role: 'minion', jobId: 'receipt-lane' })],
+        notifications: [notification('snapshot-receipt', { agentId: 'minion-receipt-lane' })],
+      }),
+    );
+    const more = document.querySelector<HTMLButtonElement>('.board-notification__more');
+    expect(more).not.toBeNull();
+    expect(document.getElementById('notification-list')?.textContent).not.toContain('Notice older-receipt');
+    more!.click();
+    await vi.waitFor(() =>
+      expect(document.getElementById('notification-list')?.textContent).toContain('Notice older-receipt'),
+    );
+    expect(client.fetchReceipts).toHaveBeenCalledWith(0);
+  });
+
+  it('a re-pair clears fetched older receipts instead of leaking them into the new server FEED', async () => {
+    const older = notification('older-receipt');
+    const clientA = {
+      ackNotification: vi.fn(() => Promise.resolve()),
+      markNotificationShown: vi.fn(() => Promise.resolve(true)),
+      fetchReceipts: vi.fn(() => Promise.resolve({ receipts: [older], nextOffset: 1, hasMore: false })),
+    } as unknown as import('../lib/board-client.js').BoardClient;
+    const view = new BoardView(() => {});
+    view.bindClient(clientA);
+    view.render(
+      snapshot({
+        jobs: [baseJob({ id: 'receipt-lane', status: 'merged', rounds: [] })],
+        agents: [agent('minion-receipt-lane', { role: 'minion', jobId: 'receipt-lane' })],
+        notifications: [notification('snapshot-receipt', { agentId: 'minion-receipt-lane' })],
+      }),
+    );
+    document.querySelector<HTMLButtonElement>('.board-notification__more')!.click();
+    await vi.waitFor(() =>
+      expect(document.getElementById('notification-list')?.textContent).toContain('Notice older-receipt'),
+    );
+
+    // A re-pair mints a fresh server: the old page is not this server's record.
+    const clientB = {
+      ackNotification: vi.fn(() => Promise.resolve()),
+      markNotificationShown: vi.fn(() => Promise.resolve(true)),
+      fetchReceipts: vi.fn(() => Promise.resolve({ receipts: [], nextOffset: 0, hasMore: true })),
+    } as unknown as import('../lib/board-client.js').BoardClient;
+    view.bindClient(clientB);
+    view.render(snapshot({ notifications: [] }));
+    expect(document.getElementById('notification-list')?.textContent).not.toContain('Notice older-receipt');
+  });
+
+  it('a re-pair during an in-flight receipt fetch drops the stale page instead of merging it', async () => {
+    const older = notification('older-receipt');
+    let resolvePage: (page: { receipts: NotificationView[]; nextOffset: number; hasMore: boolean }) => void = () => {};
+    const pending = new Promise<{ receipts: NotificationView[]; nextOffset: number; hasMore: boolean }>((resolve) => {
+      resolvePage = resolve;
+    });
+    const clientA = {
+      ackNotification: vi.fn(() => Promise.resolve()),
+      markNotificationShown: vi.fn(() => Promise.resolve(true)),
+      fetchReceipts: vi.fn(() => pending),
+    } as unknown as import('../lib/board-client.js').BoardClient;
+    const view = new BoardView(() => {});
+    view.bindClient(clientA);
+    view.render(
+      snapshot({
+        jobs: [baseJob({ id: 'receipt-lane', status: 'merged', rounds: [] })],
+        agents: [agent('minion-receipt-lane', { role: 'minion', jobId: 'receipt-lane' })],
+        notifications: [notification('snapshot-receipt', { agentId: 'minion-receipt-lane' })],
+      }),
+    );
+    document.querySelector<HTMLButtonElement>('.board-notification__more')!.click();
+    expect(clientA.fetchReceipts).toHaveBeenCalledTimes(1);
+
+    const clientB = {
+      ackNotification: vi.fn(() => Promise.resolve()),
+      markNotificationShown: vi.fn(() => Promise.resolve(true)),
+      fetchReceipts: vi.fn(() => Promise.resolve({ receipts: [], nextOffset: 0, hasMore: true })),
+    } as unknown as import('../lib/board-client.js').BoardClient;
+    view.bindClient(clientB);
+    view.render(snapshot({ notifications: [] }));
+    resolvePage({ receipts: [older], nextOffset: 1, hasMore: false });
+    await pending;
+    expect(document.getElementById('notification-list')?.textContent).not.toContain('Notice older-receipt');
+  });
+
+  it('a stopped lane with an unacked escalation sits in NEEDS GRU — waiting chip, honest section', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        jobs: [baseJob({ id: 'walled', status: 'working', rounds: [] })],
+        agents: [
+          agent('minion-walled', {
+            role: 'minion',
+            jobId: 'walled',
+            supervision: { state: 'stopped', restarts: 0, breakerOpen: true, stopReason: 'quota_wall' },
+          }),
+        ],
+        notifications: [notification('n-escalation', { agentId: 'minion-walled' })],
+        unackedActionRequired: 1,
+      }),
+    );
+    const row = document.querySelector<HTMLElement>('.board-band--needs-you .board-job');
+    expect(row?.getAttribute('data-job-id')).toBe('walled');
+    expect(row?.getAttribute('data-worker-state')).toBe('waiting');
+    expect(row?.querySelector('.board-job__status')?.textContent).toBe('waiting · quota wall');
+    expect(row?.querySelector('.board-job__signal')?.textContent).toContain('1 needs Gru');
+    const unacked = document.querySelector<HTMLElement>('#board-unacked');
+    expect(unacked?.textContent).toContain('1 needs Gru');
+  });
+
+  it('the waiting truth is scoped to working lanes: an in-review lane with a live round keeps its true chip', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        jobs: [baseJob({ id: 'reviewing', status: 'in-review' })],
+        agents: [
+          agent('minion-reviewing', {
+            role: 'minion',
+            jobId: 'reviewing',
+            supervision: { state: 'stopped', restarts: 3, breakerOpen: true, stopReason: 'crash loop' },
+          }),
+        ],
+      }),
+    );
+    const row = document.querySelector<HTMLElement>('.board-job');
+    expect(row?.getAttribute('data-worker-state')).toBeNull();
+    expect(row?.querySelector('.board-job__status')?.textContent).toBe('in-review');
+  });
+
+  it('without a stop the same silent lane still demotes to COLD with the stalled flag (COLD stays honest)', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        jobs: [
+          baseJob({
+            id: 'silent',
+            status: 'working',
+            rounds: [],
+            lastAgentActivity: new Date(Date.now() - 45 * 60_000).toISOString(),
+          }),
+        ],
+      }),
+    );
+    const row = document.querySelector<HTMLElement>('.board-band--cold .board-job');
+    expect(row?.getAttribute('data-job-id')).toBe('silent');
+    expect(row?.querySelector('.board-job__stale')?.textContent).toBe('stalled');
+    expect(row?.getAttribute('data-worker-state')).toBeNull();
+    expect(row?.querySelector('.board-job__status')?.textContent).toBe('working');
   });
 });
 
@@ -1331,6 +2045,22 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect((document.activeElement as HTMLElement)?.dataset.actionId).toBe('owner-ack:focus-me');
   });
 
+  it('g10: an owner row already acked on another device arrives with no toast and no web-toast receipt', () => {
+    const toast = vi.fn();
+    const client = stubClient();
+    const view = new BoardView(() => {}, client);
+    view.setToastHandler(toast);
+    view.render(snapshot({ notifications: [] })); // first snapshot primes history: nothing toasts yet
+    const acked = notification('acked-elsewhere', { routing: 'needs-owner', ackedAt: '2026-01-01T00:05:00.000Z' });
+    view.render(snapshot({ notifications: [acked] }));
+    expect(toast).not.toHaveBeenCalled();
+    expect(client.markNotificationShown).not.toHaveBeenCalledWith('acked-elsewhere', 'web-toast');
+    // Scoped to handled rows: a fresh owner arrival in the same push still toasts.
+    view.render(snapshot({ notifications: [acked, notification('fresh-owner', { routing: 'needs-owner' })] }));
+    expect(toast).toHaveBeenCalledTimes(1);
+    expect(toast).toHaveBeenCalledWith(expect.objectContaining({ id: 'fresh-owner' }));
+  });
+
   it('FOR YOU r1 parity: a PR-only obligation shows on BOTH the board band and the bell — never a contradiction', () => {
     const view = new BoardView(() => {});
     view.render(snapshot({ notifications: [], ownerPrs: [ownerPr('job-only-pr')] }));
@@ -1351,6 +2081,45 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     // Alert semantics preserved: the badge counts unseen needs-owner
     // NOTIFICATIONS only — a ready PR never rings the bell.
     expect(document.getElementById('notification-badge')?.textContent).toBe('0');
+  });
+
+  it('terminal machine receipts stay in FEED while terminal-bound owner stops and ready PRs keep FOR YOU parity', () => {
+    for (const status of ['merged', 'done']) {
+      const client = stubClient();
+      const view = new BoardView(() => {}, client);
+      const machine = notification('closed-machine', { agentId: 'minion-closed' });
+      const owner = notification('owner-stop', { routing: 'needs-owner', agentId: 'minion-closed' });
+      view.render(snapshot({
+        jobs: [baseJob({ id: 'closed', status, rounds: [] })],
+        agents: [agent('minion-closed', { role: 'minion', jobId: 'closed' })],
+        notifications: [machine, owner, notification('live-global')],
+        unackedActionRequired: 1,
+        unackedNeedsOwner: 1,
+        ownerPrs: [ownerPr('ready')],
+      }));
+
+      const band = document.getElementById('board-owner')!;
+      expect(band.querySelector('.board-band__count')?.textContent, status).toBe('2 pending');
+      expect(band.querySelector('[data-action-id="owner-ack:owner-stop"]')).not.toBeNull();
+      expect(band.querySelector('[data-action-id="owner-pr:ready"]')).not.toBeNull();
+      const sections = [...document.querySelectorAll('.board-notification-section')];
+      const section = (label: string) => sections.find((node) =>
+        node.querySelector('.board-notification-section__head')?.textContent === label,
+      )!;
+      expect(section('FOR YOU').textContent).toContain('Notice owner-stop');
+      expect(section('FOR YOU').querySelector('.board-owner__open')).not.toBeNull();
+      expect(section('NEEDS GRU').textContent).toContain('Notice live-global');
+      expect(section('NEEDS GRU').textContent).not.toContain('Notice closed-machine');
+      expect(section('FEED').querySelector('[data-receipt="closed"]')?.textContent).toContain('Notice closed-machine');
+      expect(section('FEED').querySelector('.board-notification__ack')).toBeNull();
+      expect(document.getElementById('board-unacked')?.textContent).toContain('1 needs Gru');
+      expect(document.querySelector('.board-band--needs-you .board-job')).toBeNull();
+      expect(client.ackNotification).not.toHaveBeenCalled();
+      expect(machine.ackedAt).toBeNull();
+      expect(machine.resolvedAt).toBeNull();
+      expect(owner.ackedAt).toBeNull();
+      expect(owner.resolvedAt).toBeNull();
+    }
   });
 
   it('FOR YOU r1 parity: an empty projection shows the honest empty state on BOTH surfaces', () => {

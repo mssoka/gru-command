@@ -137,18 +137,87 @@ describe('review throughput — active / failed today / verdicts today', () => {
 });
 
 describe('the remaining health cards render truthfully or n/a', () => {
+  const silasBase = {
+    lastWakeAt: null as string | null,
+    lastTickAt: null as string | null,
+    lastReconcileAt: null as string | null,
+    lastReconcileFailedAt: null as string | null,
+    reconcileFailedNewer: false,
+    lastUsefulActionAt: null as string | null,
+    nextAction: null as string | null,
+    openTurnSince: null as string | null,
+    reconciliationsToday: 0,
+    checkedAt: ISO(0),
+  };
+
   it('Silas: last wake age + reconciliations today; n/a when unwired', () => {
-    const wired = silasCard({ lastWakeAt: ISO(-240_000), reconciliationsToday: 3, checkedAt: ISO(0) }, NOW.getTime());
+    const wired = silasCard(
+      { ...silasBase, lastWakeAt: ISO(-240_000), reconciliationsToday: 3 },
+      NOW.getTime(),
+    );
     expect(wired.value).toBe('wake 4m ago');
-    expect(wired.detail).toBe('3 reconciliations today');
-    const never = silasCard({ lastWakeAt: null, reconciliationsToday: 0, checkedAt: ISO(0) }, NOW.getTime());
+    expect(wired.detail).toBe('3 machine actions today');
+    const never = silasCard({ ...silasBase }, NOW.getTime());
     expect(never.value).toBe('no wakes yet');
     expect(silasCard(null, NOW.getTime()).value).toBe('n/a');
+  });
+
+  it('Silas: a completed reconciliation moves the headline while a turn is open (#163)', () => {
+    const reconciled = silasCard(
+      { ...silasBase, lastWakeAt: ISO(-3_600_000), lastReconcileAt: ISO(-60_000), reconciliationsToday: 1 },
+      NOW.getTime(),
+    );
+    expect(reconciled.value).toBe('reconciled 1m ago');
+    const open = silasCard(
+      {
+        ...silasBase,
+        lastWakeAt: ISO(-3_600_000),
+        lastReconcileAt: ISO(-60_000),
+        openTurnSince: ISO(-3_600_000),
+      },
+      NOW.getTime(),
+    );
+    expect(open.value).toBe('turn open 1h');
+    // An open turn must not hide whether the loop is still moving.
+    expect(open.detail).toBe('reconciled 1m ago · 0 machine actions today');
+  });
+
+  it('Silas: a non-null next action renders in the card tooltip (#163 review)', () => {
+    const card = silasCard(
+      { ...silasBase, lastReconcileAt: ISO(-60_000), nextAction: 'gru-decision: rule on the audit (job-x)' },
+      NOW.getTime(),
+    );
+    expect(card.titleAttr).toContain('next owed: gru-decision: rule on the audit (job-x)');
+    const none = silasCard({ ...silasBase, nextAction: null }, NOW.getTime());
+    expect(none.titleAttr).toContain('no tracked obligation');
+  });
+
+  it('Silas: a pass that failed after the last success is louder than every healthy state (#163)', () => {
+    const failed = silasCard(
+      {
+        ...silasBase,
+        lastWakeAt: ISO(-3_600_000),
+        lastReconcileAt: ISO(-600_000),
+        lastReconcileFailedAt: ISO(-60_000),
+        reconcileFailedNewer: true,
+      },
+      NOW.getTime(),
+    );
+    expect(failed.value).toBe('pass failed 1m ago');
+    expect(failed.tone).toBe('alert');
+    expect(failed.flag).toBe('FAILED');
+    expect(failed.titleAttr).toContain('last failed pass 1m ago');
   });
 
   it('Alerts: unacked count with the ack flag', () => {
     expect(alertsCard(0)).toMatchObject({ value: '0', tone: 'ok', flag: null });
     expect(alertsCard(2)).toMatchObject({ value: '2', tone: 'alert', flag: 'NEEDS GRU' });
+    // The count is LIVE-only: the card copy says so (A4).
+    expect(alertsCard(0).detail).toBe('live machine queue clear');
+    expect(alertsCard(2).detail).toBe('live machine attention awaiting Gru');
+    expect(alertsCard(0).titleAttr).toContain('0 live machine-attention notification(s) awaiting Gru');
+    expect(alertsCard(2).titleAttr).toContain('2 live machine-attention notification(s) awaiting Gru');
+    expect(alertsCard(2).titleAttr).toContain('closed receipts and the owner bell stay quiet');
   });
 
   it('Verify queue: lock/queue/worker headroom, n/a when the api is absent', () => {
@@ -218,7 +287,18 @@ describe('the health row — fixed order over the snapshot', () => {
       unackedNeedsOwner: 0,
       wakes: { count: 0, lastAt: null },
       build: drift(),
-      silas: { lastWakeAt: ISO(-60_000), reconciliationsToday: 1, checkedAt: ISO(0) },
+      silas: {
+        lastWakeAt: ISO(-60_000),
+        lastTickAt: ISO(-30_000),
+        lastReconcileAt: null,
+        lastReconcileFailedAt: null,
+        reconcileFailedNewer: false,
+        lastUsefulActionAt: null,
+        nextAction: null,
+        openTurnSince: null,
+        reconciliationsToday: 1,
+        checkedAt: ISO(0),
+      },
       verify: { lockInUse: false, activeRuns: 0, queuedRuns: 0, workerBudget: 8, workersPerRun: 4 },
       selfHeal: { sessionsResumed: 2, sessionsOrphaned: 0, since: ISO(-3_600_000) },
     } as BoardSnapshot;

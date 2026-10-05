@@ -1,0 +1,453 @@
+{
+  "note": "ONE fixture, TWO surfaces: web stoppedWorkersByJob/isStalledWorking and backend computeSilasDigest must agree on these exact agents (ids/createdAt/stamps/views/reason) AND on the board stall outcome. Consumed by web/src/lib/board-bands.test.ts and test/silas-driver.test.ts \u2014 do not fork the values; a change here must hold for both predicates.",
+  "digestNow": "2026-09-23T10:00:00.000Z",
+  "freshRegistrationAt": "2026-09-23T09:50:00.000Z",
+  "cases": [
+    {
+      "name": "newer stop wins over an older live worker",
+      "agents": [
+        {
+          "id": "stale-live",
+          "jobId": "job-1",
+          "state": "streaming",
+          "lastActivity": "2026-09-23T08:00:00.000Z",
+          "createdAt": "2026-09-23T07:00:00.000Z",
+          "supervision": {
+            "state": "watching",
+            "restarts": 0,
+            "breakerOpen": false,
+            "stopReason": null
+          }
+        },
+        {
+          "id": "current-stop",
+          "jobId": "job-1",
+          "state": "idle",
+          "lastActivity": "2026-09-23T09:00:00.000Z",
+          "createdAt": "2026-09-23T08:30:00.000Z",
+          "supervision": {
+            "state": "stopped",
+            "restarts": 1,
+            "breakerOpen": true,
+            "stopReason": "quota_wall"
+          }
+        }
+      ],
+      "board": {
+        "waiting": true,
+        "reason": "quota_wall",
+        "restarts": 1,
+        "stalled": false
+      },
+      "digest": {
+        "stalled": false
+      }
+    },
+    {
+      "name": "fresh worker with unknown activity never inherits the stop",
+      "agents": [
+        {
+          "id": "old-stop",
+          "jobId": "job-1",
+          "state": "idle",
+          "lastActivity": "2026-09-23T09:00:00.000Z",
+          "createdAt": "2026-09-23T08:30:00.000Z",
+          "supervision": {
+            "state": "stopped",
+            "restarts": 1,
+            "breakerOpen": true,
+            "stopReason": "quota_wall"
+          }
+        },
+        {
+          "id": "fresh-null",
+          "jobId": "job-1",
+          "state": "spawning",
+          "lastActivity": null,
+          "createdAt": "2026-09-23T09:50:00.000Z",
+          "supervision": {
+            "state": "watching",
+            "restarts": 0,
+            "breakerOpen": false,
+            "stopReason": null
+          }
+        }
+      ],
+      "board": {
+        "waiting": false,
+        "stalled": false
+      },
+      "digest": {
+        "stalled": false
+      }
+    },
+    {
+      "name": "all stopped waits on the newest stop",
+      "agents": [
+        {
+          "id": "old-stop",
+          "jobId": "job-1",
+          "state": "idle",
+          "lastActivity": "2026-09-23T08:00:00.000Z",
+          "createdAt": "2026-09-23T07:30:00.000Z",
+          "supervision": {
+            "state": "stopped",
+            "restarts": 1,
+            "breakerOpen": true,
+            "stopReason": "quota_wall"
+          }
+        },
+        {
+          "id": "newer-stop",
+          "jobId": "job-1",
+          "state": "idle",
+          "lastActivity": "2026-09-23T09:00:00.000Z",
+          "createdAt": "2026-09-23T08:30:00.000Z",
+          "supervision": {
+            "state": "stopped",
+            "restarts": 4,
+            "breakerOpen": true,
+            "stopReason": "crash loop"
+          }
+        }
+      ],
+      "board": {
+        "waiting": true,
+        "reason": "crash loop",
+        "restarts": 4,
+        "stalled": false
+      },
+      "digest": {
+        "stalled": false
+      }
+    },
+    {
+      "name": "silent live worker with no stop still stalls",
+      "agents": [
+        {
+          "id": "quiet-live",
+          "jobId": "job-1",
+          "state": "streaming",
+          "lastActivity": "2026-09-23T08:00:00.000Z",
+          "createdAt": "2026-09-23T07:00:00.000Z",
+          "supervision": {
+            "state": "watching",
+            "restarts": 0,
+            "breakerOpen": false,
+            "stopReason": null
+          }
+        }
+      ],
+      "board": {
+        "waiting": false,
+        "stalled": true
+      },
+      "digest": {
+        "stalled": true
+      }
+    },
+    {
+      "name": "tied stop/live stamps favor the live worker",
+      "agents": [
+        {
+          "id": "tied-stop",
+          "jobId": "job-1",
+          "state": "idle",
+          "lastActivity": "2026-09-23T09:00:00.000Z",
+          "createdAt": "2026-09-23T08:30:00.000Z",
+          "supervision": {
+            "state": "stopped",
+            "restarts": 2,
+            "breakerOpen": true,
+            "stopReason": "quota_wall"
+          }
+        },
+        {
+          "id": "tied-live",
+          "jobId": "job-1",
+          "state": "streaming",
+          "lastActivity": "2026-09-23T09:00:00.000Z",
+          "createdAt": "2026-09-23T08:45:00.000Z",
+          "supervision": {
+            "state": "watching",
+            "restarts": 0,
+            "breakerOpen": false,
+            "stopReason": null
+          }
+        }
+      ],
+      "board": {
+        "waiting": false,
+        "stalled": true
+      },
+      "digest": {
+        "stalled": true
+      }
+    },
+    {
+      "name": "tied stop stamps keep snapshot order for the reason",
+      "agents": [
+        {
+          "id": "tied-stop-a",
+          "jobId": "job-1",
+          "state": "idle",
+          "lastActivity": "2026-09-23T09:00:00.000Z",
+          "createdAt": "2026-09-23T08:30:00.000Z",
+          "supervision": {
+            "state": "stopped",
+            "restarts": 1,
+            "breakerOpen": true,
+            "stopReason": "quota_wall"
+          }
+        },
+        {
+          "id": "tied-stop-b",
+          "jobId": "job-1",
+          "state": "idle",
+          "lastActivity": "2026-09-23T09:00:00.000Z",
+          "createdAt": "2026-09-23T08:45:00.000Z",
+          "supervision": {
+            "state": "stopped",
+            "restarts": 4,
+            "breakerOpen": true,
+            "stopReason": "crash loop"
+          }
+        }
+      ],
+      "board": {
+        "waiting": true,
+        "reason": "quota_wall",
+        "restarts": 1,
+        "stalled": false
+      },
+      "digest": {
+        "stalled": false
+      }
+    },
+    {
+      "name": "multi-stop mixed ordering picks the newest stop stamp",
+      "agents": [
+        {
+          "id": "mixed-stop-old",
+          "jobId": "job-1",
+          "state": "idle",
+          "lastActivity": "2026-09-23T09:30:00.000Z",
+          "createdAt": "2026-09-23T08:30:00.000Z",
+          "supervision": {
+            "state": "stopped",
+            "restarts": 1,
+            "breakerOpen": true,
+            "stopReason": "quota_wall"
+          }
+        },
+        {
+          "id": "mixed-live",
+          "jobId": "job-1",
+          "state": "streaming",
+          "lastActivity": "2026-09-23T09:00:00.000Z",
+          "createdAt": "2026-09-23T08:45:00.000Z",
+          "supervision": {
+            "state": "watching",
+            "restarts": 0,
+            "breakerOpen": false,
+            "stopReason": null
+          }
+        },
+        {
+          "id": "mixed-stop-new",
+          "jobId": "job-1",
+          "state": "idle",
+          "lastActivity": "2026-09-23T10:00:00.000Z",
+          "createdAt": "2026-09-23T09:30:00.000Z",
+          "supervision": {
+            "state": "stopped",
+            "restarts": 4,
+            "breakerOpen": true,
+            "stopReason": "crash loop"
+          }
+        }
+      ],
+      "board": {
+        "waiting": true,
+        "reason": "crash loop",
+        "restarts": 4,
+        "stalled": false
+      },
+      "digest": {
+        "stalled": false
+      }
+    },
+    {
+      "name": "an unknown-stamp stop newer than a known stop speaks for the lane",
+      "agents": [
+        {
+          "id": "known-stop",
+          "jobId": "job-1",
+          "state": "idle",
+          "lastActivity": "2026-09-23T09:00:00.000Z",
+          "createdAt": "2026-09-23T08:00:00.000Z",
+          "supervision": {
+            "state": "stopped",
+            "restarts": 1,
+            "breakerOpen": true,
+            "stopReason": "quota_wall"
+          }
+        },
+        {
+          "id": "unknown-stop",
+          "jobId": "job-1",
+          "state": "idle",
+          "lastActivity": null,
+          "createdAt": "2026-09-23T09:30:00.000Z",
+          "supervision": {
+            "state": "stopped",
+            "restarts": 4,
+            "breakerOpen": true,
+            "stopReason": "crash loop"
+          }
+        }
+      ],
+      "board": {
+        "waiting": true,
+        "reason": "crash loop",
+        "restarts": 4,
+        "stalled": false
+      },
+      "digest": {
+        "stalled": false
+      }
+    },
+    {
+      "name": "a fresh unstamped live worker beside an older stamped live worker favors live",
+      "agents": [
+        {
+          "id": "older-live",
+          "jobId": "job-1",
+          "state": "streaming",
+          "lastActivity": "2026-09-23T09:00:00.000Z",
+          "createdAt": "2026-09-23T08:00:00.000Z",
+          "supervision": {
+            "state": "watching",
+            "restarts": 0,
+            "breakerOpen": false,
+            "stopReason": null
+          }
+        },
+        {
+          "id": "current-stop",
+          "jobId": "job-1",
+          "state": "idle",
+          "lastActivity": "2026-09-23T09:10:00.000Z",
+          "createdAt": "2026-09-23T08:30:00.000Z",
+          "supervision": {
+            "state": "stopped",
+            "restarts": 1,
+            "breakerOpen": true,
+            "stopReason": "quota_wall"
+          }
+        },
+        {
+          "id": "fresh-live",
+          "jobId": "job-1",
+          "state": "spawning",
+          "lastActivity": null,
+          "createdAt": "2026-09-23T09:50:00.000Z",
+          "supervision": {
+            "state": "watching",
+            "restarts": 0,
+            "breakerOpen": false,
+            "stopReason": null
+          }
+        }
+      ],
+      "board": {
+        "waiting": false,
+        "stalled": false
+      },
+      "digest": {
+        "stalled": false
+      }
+    },
+    {
+      "name": "a disposed supervised worker never clears a stop",
+      "agents": [
+        {
+          "id": "current-stop",
+          "jobId": "job-1",
+          "state": "idle",
+          "lastActivity": "2026-09-23T09:00:00.000Z",
+          "createdAt": "2026-09-23T08:00:00.000Z",
+          "supervision": {
+            "state": "stopped",
+            "restarts": 2,
+            "breakerOpen": true,
+            "stopReason": "crash loop"
+          }
+        },
+        {
+          "id": "disposed-live",
+          "jobId": "job-1",
+          "state": "disposed",
+          "lastActivity": "2026-09-23T09:30:00.000Z",
+          "createdAt": "2026-09-23T08:30:00.000Z",
+          "supervision": {
+            "state": "watching",
+            "restarts": 0,
+            "breakerOpen": false,
+            "stopReason": null
+          }
+        }
+      ],
+      "board": {
+        "waiting": true,
+        "reason": "crash loop",
+        "restarts": 2,
+        "stalled": false
+      },
+      "digest": {
+        "stalled": false
+      }
+    },
+    {
+      "name": "a recorded stop time after a later frame still marks the lane waiting",
+      "agents": [
+        {
+          "id": "live-worker",
+          "jobId": "job-1",
+          "state": "streaming",
+          "lastActivity": "2026-09-23T09:40:00.000Z",
+          "createdAt": "2026-09-23T08:00:00.000Z",
+          "supervision": {
+            "state": "watching",
+            "restarts": 0,
+            "breakerOpen": false,
+            "stopReason": null
+          }
+        },
+        {
+          "id": "late-stop",
+          "jobId": "job-1",
+          "state": "idle",
+          "lastActivity": "2026-09-23T09:30:00.000Z",
+          "createdAt": "2026-09-23T08:30:00.000Z",
+          "supervision": {
+            "state": "stopped",
+            "restarts": 3,
+            "breakerOpen": true,
+            "stopReason": "quota_wall",
+            "stoppedAt": "2026-09-23T09:45:00.000Z"
+          }
+        }
+      ],
+      "board": {
+        "waiting": true,
+        "reason": "quota_wall",
+        "restarts": 3,
+        "stalled": false
+      },
+      "digest": {
+        "stalled": false
+      }
+    }
+  ]
+}

@@ -425,6 +425,7 @@ export class ProviderRecoverySensor {
             (agent) =>
               agent.jobId === wait.jobId &&
               agent.role === 'minion' &&
+              agent.parentage !== 'child' &&
               agent.id !== wait.agentId &&
               agent.createdAt >= wait.createdAt,
           );

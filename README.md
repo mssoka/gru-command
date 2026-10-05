@@ -25,13 +25,16 @@ waves), and OS service install — see [docs/EPICS.md](docs/EPICS.md).
   review rounds with per-lens live chips, notification center
   ([BOARD.md](docs/BOARD.md)).
 - **Dispatch flow** — briefing → per-job git worktrees → minions →
-  adversarial hybrid review waves → SHA-bound PR verdicts. Perkins runs seven
-  required lens types per frozen chunk (six only for explicit no-spec), with
-  malformed attempts retryable within a pinned bound. Its install-relative,
-  integrity-pinned policy is the sole prompt authority; repository text is
-  untrusted evidence. Claude leads alone receive a fresh scoped MCP bridge for
-  the same narrow native tools ([FLOW.md](docs/FLOW.md),
-  [WORKTREES.md](docs/WORKTREES.md)).
+  adversarial hybrid review waves → SHA-bound PR verdicts. One Perkins lead
+  reviews the complete frozen change and selects optional specialist lenses
+  from the nine-lens whole-change catalog (eight for explicit no-spec).
+  Specialists run in lead-submitted batches inside ONE round, bounded to 16
+  real runs, two attempts per lens, and two terminal submissions, with
+  failed and unused lenses reported as real coverage facts rather than a
+  mandatory gate. Its install-relative, integrity-pinned policy is the sole
+  prompt authority; repository text is untrusted evidence. Claude leads alone
+  receive a fresh scoped MCP bridge for the same narrow native tools
+  ([FLOW.md](docs/FLOW.md), [WORKTREES.md](docs/WORKTREES.md)).
 - **Hosted ops (Silas)** — the operations role runs as a supervised session
   that closes the follow-through loop without a human ping (delivered job →
   PR registered → review wave) and breaks recurring blocker loops: same
@@ -60,9 +63,13 @@ here before the v1.0.0 tag)*
 - **Node.js ≥ 22.19** — the service runtime and build toolchain.
 - **git** — per-job worktree lanes and branch inspection.
 - **GitHub CLI (`gh`), authenticated for every managed repo** — the
-  GitHub signal poll and SHA-bound Perkins verdict delivery both ride
-  `gh`. Run `gh auth login` with a token that can read the repositories
-  (`repo` scope for private repos) and confirm with `gh auth status`.
+  GitHub signal poll and the round's code-host preflight always ride
+  `gh`. SHA-bound Perkins verdict delivery also rides `gh` unless a
+  Perkins App bundle is installed, in which case github.com publication
+  is App-authored while the preflight still uses `gh`
+  ([PERKINS-APP-PUBLICATION.md](docs/PERKINS-APP-PUBLICATION.md)). Run
+  `gh auth login` with a token that can read the repositories (`repo`
+  scope for private repos) and confirm with `gh auth status`.
 
 GitHub signal ingestion is poll-only — no webhooks, no inbound tunnel.
 
@@ -222,9 +229,24 @@ console, forensics and backups:
 
 ```bash
 npm install
-npm test        # lint + typecheck + build + full offline suite
+npm test        # full gate: lint + typecheck + build + fast + heavy + web
+npm run build   # prerequisite for the standalone phase commands below (dist-dependent suites)
+npm run test:backend        # fast suites (30s test/hook budget, up to 4 workers)
+npm run test:backend:heavy  # process-heavy integration suites (120s budget, up to 2 workers)
+npm run test:backend:heavy -- test/perkins-whole-review.test.ts  # debug one heavy file
 npm run wizard  # fresh wizard; use -- --force to replace config with backup
 ```
+
+The backend suite is routed by real workload. Fast unit/in-process suites keep
+the 30s ceiling; the process-heavy integration files (real install/build
+pipelines, spawned services and CLIs, PTY, git worktree/review flows) are
+listed with per-file reasons in `test/helpers/test-budgets.ts`, run at a 120s
+ceiling, and are capped at two workers. Both phases run sequentially inside
+`npm test`, so the aggregate worker count never exceeds the verification
+scheduler's single global budget. `npx vitest run` alone runs the fast phase;
+use `npm run test:backend:heavy` for the classified files. Both standalone
+phases assume `npm run build` has run first — several suites boot `dist/`
+artifacts — while `npm test` builds before either phase.
 
 CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) is the authoritative full gate — it runs `npm test` on every pull request and push to `main`; dispatch lanes verify only their narrow suites locally.
 

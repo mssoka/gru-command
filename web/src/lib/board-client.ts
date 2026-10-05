@@ -13,10 +13,17 @@ import {
   parseBoardServerFrame,
   type BoardSnapshot,
   type DecisionStatusView,
+  type NotificationView,
   type TranscriptInfo,
   type TranscriptPage,
   type TranscriptSearchResult,
 } from './board-protocol.js';
+
+export interface ReceiptPage {
+  readonly receipts: readonly NotificationView[];
+  readonly nextOffset: number;
+  readonly hasMore: boolean;
+}
 
 export type BoardConnectionState =
   | 'idle'
@@ -284,6 +291,14 @@ export class BoardClient {
 
   listTranscripts(): Promise<{ transcripts: readonly TranscriptInfo[] }> {
     return this.api<{ transcripts: readonly TranscriptInfo[] }>('/api/transcripts');
+  }
+
+  /** D3: paged closed-receipt history for the bell's FEED section. The
+   * snapshot carries only the newest receipt window; this fetches older
+   * pages on demand with the raw-row offset cursor. */
+  fetchReceipts(offset = 0, limit = 30): Promise<ReceiptPage> {
+    const params = new URLSearchParams({ offset: String(offset), limit: String(limit) });
+    return this.api<ReceiptPage>(`/api/notifications/receipts?${params.toString()}`);
   }
 
   pageTranscript(file: string, opts: { before?: number; limit?: number } = {}): Promise<TranscriptPage> {
