@@ -61,6 +61,10 @@ async function sweepApprovedLabels(page: Page): Promise<void> {
       near(left.y, right.y) &&
       near(left.width, right.width) &&
       near(left.height, right.height);
+    // Failure messages carry the measured boxes so a geometry drift is
+    // actionable without a second instrumented run.
+    const boxText = (box: { x: number; y: number; width: number; height: number }): string =>
+      `x=${box.x.toFixed(1)} y=${box.y.toFixed(1)} w=${box.width.toFixed(1)} h=${box.height.toFixed(1)}`;
 
     const baseline = {
       chip: boxOf(chip),
@@ -72,24 +76,38 @@ async function sweepApprovedLabels(page: Page): Promise<void> {
       flavor.textContent = `${phrase}…`;
       const now = boxOf(chip);
       if (!near(now.x, baseline.chip.x) || !near(now.y, baseline.chip.y)) {
-        found.push(`${phrase}: status slot moved`);
+        found.push(`${phrase}: status slot moved ${boxText(baseline.chip)} -> ${boxText(now)}`);
       }
       if (!near(now.height, baseline.chip.height)) {
-        found.push(`${phrase}: status slot height jumped`);
+        found.push(
+          `${phrase}: status slot height jumped h=${baseline.chip.height.toFixed(1)} -> ${now.height.toFixed(1)}`,
+        );
       }
       if (!sameBox(boxOf(strip), baseline.strip)) {
-        found.push(`${phrase}: context strip reflowed`);
+        found.push(
+          `${phrase}: context strip reflowed ${boxText(baseline.strip)} -> ${boxText(boxOf(strip))}`,
+        );
       }
       if (!controls.every((control, index) => sameBox(boxOf(control), baseline.controls[index]!))) {
-        found.push(`${phrase}: control moved`);
+        found.push(
+          `${phrase}: control moved ` +
+            controls
+              .map(
+                (control, index) =>
+                  `#${control.id} ${boxText(baseline.controls[index]!)} -> ${boxText(boxOf(control))}`,
+              )
+              .join('; '),
+        );
       }
       if (strip.scrollWidth > strip.clientWidth) {
-        found.push(`${phrase}: context strip overflows`);
+        found.push(
+          `${phrase}: context strip overflows sw=${strip.scrollWidth} cw=${strip.clientWidth}`,
+        );
       }
       const chipBox = chip.getBoundingClientRect();
       const stripBox = strip.getBoundingClientRect();
       if (chipBox.right > stripBox.right + 0.5 || chipBox.left < stripBox.left - 0.5) {
-        found.push(`${phrase}: status slot escapes the strip`);
+        found.push(`${phrase}: status slot escapes the strip ${boxText(chipBox)} vs ${boxText(stripBox)}`);
       }
     }
     return found;
@@ -132,6 +150,12 @@ test('busy phrases rotate with stable status/control geometry on every surface',
   await expect(page.locator('#chat-compact')).toBeDisabled();
   await expect(page.locator('#chat-new')).toBeDisabled();
 
+  // The reply must be fully streamed before layout is measured: message
+  // growth (not the rotation) is what moves the controls while it lands.
+  // The final 🪐 token arrives after 'echo with pride.', so the wait names
+  // the complete tail — a prefix match would still race the last delta.
+  await expect(page.locator('.msg--gru').last()).toContainText('echo with pride. 🪐');
+
   // One real rotation under the hold, with the controls pinned as it lands.
   const controlsBefore = await page.locator('.chat-context__button').evaluateAll((nodes) =>
     nodes.map((node) => {
@@ -139,10 +163,24 @@ test('busy phrases rotate with stable status/control geometry on every surface',
       return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
     }),
   );
-  await expect(flavor).not.toHaveText(first, { timeout: 8000 });
+  // Disappearing at turn end is not a rotation: require a NEW approved,
+  // non-empty phrase while the authoritative busy state still holds.
+  await expect
+    .poll(
+      async () => {
+        const text = (await flavor.textContent()) ?? '';
+        return (
+          text !== first &&
+          text.endsWith('…') &&
+          WORKING_FLAVOR_PHRASES.includes(text.slice(0, -1))
+        );
+      },
+      { timeout: 8000 },
+    )
+    .toBe(true);
   const second = (await flavor.textContent())!;
-  expect(second).not.toBe(first);
   expect(WORKING_FLAVOR_PHRASES).toContain(second.slice(0, -1));
+  await expect(status).toHaveAttribute('aria-label', 'Gru is working; context controls are busy');
   const controlsAfter = await page.locator('.chat-context__button').evaluateAll((nodes) =>
     nodes.map((node) => {
       const rect = node.getBoundingClientRect();
@@ -161,8 +199,9 @@ test('busy phrases rotate with stable status/control geometry on every surface',
   await sweepApprovedLabels(page);
 
   // Phone bottom sheet (< 900px: status takes its own row, controls below).
+  // The open tablet drawer becomes the phone sheet on resize; it stays
+  // open, so no second FAB tap (which the open sheet would cover).
   await page.setViewportSize({ width: 390, height: 844 });
-  await page.locator('#gru-fab').click();
   await expect(page.locator('#chat-sheet')).toHaveAttribute('data-open', 'true');
   await expect(flavor).toBeVisible();
   await sweepApprovedLabels(page);

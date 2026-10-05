@@ -3,6 +3,7 @@ import { readFileSync, readdirSync, rmSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { basename, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { WebSocket } from 'ws';
 import { afterEach, describe, expect, it } from 'vitest';
 
 const TOKEN = 'configured-mock-test-token';
@@ -75,6 +76,47 @@ async function upload(baseUrl: string, filename: string, bytes: Uint8Array): Pro
   });
 }
 
+async function waitFor(condition: () => boolean, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error('waitFor timed out');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+function postControl(baseUrl: string, path: string): Promise<Response> {
+  return fetch(`${baseUrl}${path}`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TOKEN}` },
+  });
+}
+
+interface MockSocket {
+  readonly socket: WebSocket;
+  readonly frames: Array<Record<string, unknown>>;
+}
+
+async function openAuthedSocket(baseUrl: string): Promise<MockSocket> {
+  const socket = new WebSocket(`${baseUrl.replace(/^http/, 'ws')}/ws`);
+  const frames: Array<Record<string, unknown>> = [];
+  socket.on('message', (data) => {
+    frames.push(JSON.parse(String(data)) as Record<string, unknown>);
+  });
+  await new Promise<void>((resolve, reject) => {
+    socket.once('open', resolve);
+    socket.once('error', reject);
+  });
+  socket.send(JSON.stringify({ type: 'auth', token: TOKEN }));
+  await waitFor(() => frames.some((frame) => frame.type === 'auth_ok'));
+  return { socket, frames };
+}
+
+function isTurnFrame(frame: Record<string, unknown>): boolean {
+  return frame.type === 'turn' || frame.type === 'tool' || frame.type === 'delta';
+}
+
 afterEach(async () => {
   for (const child of children.splice(0)) {
     // A signal death leaves exitCode null (r2 W6): treat signalCode as a
@@ -134,5 +176,56 @@ describe('dev mock upload endpoint hardening', () => {
 
     // Both rejected size requests and the rejected quota request leave no file.
     expect(readdirSync(dirname(first.path))).toHaveLength(2);
+  }, 30_000);
+});
+
+describe('dev mock reset settles the previous turn before rewinding the log', () => {
+  it('never replays orphan turn frames from a parked held turn after /__reset', async () => {
+    const { baseUrl } = await startMock();
+    const first = await openAuthedSocket(baseUrl);
+    await postControl(baseUrl, '/__turn-hold');
+    first.socket.send(
+      JSON.stringify({ type: 'user', text: 'reset probe', client_msg_id: 'm1', epoch: 0 }),
+    );
+    // The full scripted reply streams first (final 🪐 token), then the hold
+    // parks the turn on the next tick without a terminal turn frame.
+    await waitFor(() =>
+      first.frames.some((frame) => frame.type === 'delta' && String(frame.text).includes('🪐')),
+    );
+    await sleep(150);
+    expect(first.frames.some((frame) => frame.type === 'turn' && frame.state === 'end')).toBe(false);
+
+    const reset = await postControl(baseUrl, '/__reset');
+    expect(reset.ok).toBe(true);
+    // The terminated socket's close handler settles the parked turn after
+    // the reset returns; the rewind must not leave its frames behind.
+    await sleep(250);
+
+    const replay = await openAuthedSocket(baseUrl);
+    await sleep(150);
+    expect(replay.frames.filter(isTurnFrame)).toEqual([]);
+    first.socket.terminate();
+    replay.socket.terminate();
+  }, 30_000);
+
+  it('drops an in-flight streaming turn at /__reset with no replayed frames', async () => {
+    const { baseUrl } = await startMock();
+    const first = await openAuthedSocket(baseUrl);
+    first.socket.send(
+      JSON.stringify({ type: 'user', text: 'mid-stream probe', client_msg_id: 'm1', epoch: 0 }),
+    );
+    await waitFor(() => first.frames.some((frame) => frame.type === 'delta'));
+    expect(first.frames.some((frame) => frame.type === 'turn' && frame.state === 'end')).toBe(false);
+
+    const reset = await postControl(baseUrl, '/__reset');
+    expect(reset.ok).toBe(true);
+    // The interval/close settle fires after the reset returns.
+    await sleep(250);
+
+    const replay = await openAuthedSocket(baseUrl);
+    await sleep(150);
+    expect(replay.frames.filter(isTurnFrame)).toEqual([]);
+    first.socket.terminate();
+    replay.socket.terminate();
   }, 30_000);
 });

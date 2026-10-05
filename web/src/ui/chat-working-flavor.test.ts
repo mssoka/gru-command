@@ -384,4 +384,13 @@ describe('working flavor stylesheet contract', () => {
     expect(busyLabel).toMatch(/position:\s*absolute/);
     expect(busyLabel).toMatch(/clip:\s*rect\(0, 0, 0, 0\)/);
   });
+
+  it('reserves one flexible chip slot for every rotating phrase', () => {
+    // The busy chip must own the strip's flexible slot: with an intrinsic
+    // flex-basis a long phrase makes the line overflow and the shrink
+    // cascades into the buttons (they narrow and wrap their labels), so
+    // their boxes would depend on the phrase. Basis 0 + grow 1 keeps the
+    // controls phrase-independent and ellipsizes the phrase in the chip.
+    expect(COMPONENTS_CSS).toMatch(/\.chat-context__status--busy\s*\{[^}]*flex:\s*1 1 0/);
+  });
 });

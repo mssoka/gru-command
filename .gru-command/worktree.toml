@@ -35,7 +35,13 @@ review-inputs = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/
 # together at one head to establish whether those failures are contention
 # or reproducible. Heavy-classified files route through the heavy config.
 review-inputs-regression = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/dispatch-server.test.ts test/attachments.test.ts test/claude-adapter.test.ts test/perkins-whole-review.test.ts test/perkins-builtin-wave.test.ts test/lan-phone-raw-client.test.ts && npx vitest run test/chat-server.test.ts test/decisions.test.ts test/suite-shape.test.ts"
-working-flavor = "cd web && npx vitest run src/lib/working-flavor.test.ts src/ui/chat-working-flavor.test.ts src/ui/chat-attachments.test.ts src/ui/chat-composer.test.ts src/ui/chat-console.test.ts src/ui/chat-gfm-invariant.test.ts src/ui/chat-scroll.test.ts src/ui/chat-service-band.test.ts src/ui/chat-tool-turn.test.ts"
+# The web shard needs the approved j-463 RPC-patch prerequisite first (the
+# scheduler runs plain vitest, never the npm chain whose pretest applies it):
+# without it vitest 3.2.7's hardcoded 60s birpc timer can fail suite
+# collection under co-tenant load — run ebfb85f9 on 8f5662b collected only
+# 5/9 suites with `[vitest-worker]: Timeout calling "fetch"`. Same upstream
+# fix every other vitest scope here carries; no test/timeout/budget changes.
+working-flavor = "node tools/patch-vitest-rpc-timeout.mjs && cd web && npx vitest run src/lib/working-flavor.test.ts src/ui/chat-working-flavor.test.ts src/ui/chat-attachments.test.ts src/ui/chat-composer.test.ts src/ui/chat-console.test.ts src/ui/chat-gfm-invariant.test.ts src/ui/chat-scroll.test.ts src/ui/chat-service-band.test.ts src/ui/chat-tool-turn.test.ts"
 compaction-rollback = "npx vitest run test/pi-adapter.test.ts test/supervisor.test.ts test/config.test.ts test/health.test.ts test/board-engine.test.ts test/suite-shape.test.ts"
 
 # Retained PR142 worktree-specific verification scopes.
@@ -380,7 +386,6 @@ perkins-stage1-baseline = 'root="$PWD"; prep=_bmad-output/gate-prep/perkins-reli
 # unchanged budgets, exit codes never masked.
 verification-single-flight = "npx vitest run test/verification-scheduler.test.ts test/verification-capture.test.ts test/verification-evidence.test.ts test/silas-driver.test.ts && npx vitest run --config vitest.heavy.config.ts test/verification-server.test.ts && npx vitest run test/suite-shape.test.ts"
 
-
 # Board PR-number link labels (owner approval j-982): the new pure URL
 # helper plus the board-row label/disclosure DOM contract, via the existing
 # installed Vitest CLI under the existing web config/budgets (no
@@ -410,3 +415,29 @@ board-pr-number-links-baseline = 'set -e; base=5d56194a905262231bb0d183292b6d08c
 # _bmad-output/board-pr-number-links/captures/ (gitignored, retained in the
 # lane).
 board-pr-number-links-browser = "node tools/patch-vitest-rpc-timeout.mjs && cd web && node ../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json && node node_modules/vite/bin/vite.js build && node ../node_modules/@playwright/test/cli.js test --project=mock --grep 'board \\(E6, mock feed\\)'"
+
+# Working-flavor browser proof (job gru-working-flavor-200, 2026-10-03):
+# typecheck + production web build + the existing mock Playwright spec ONLY
+# (the changed surface; it sweeps the imported full pool at desktop, tablet
+# and phone widths). The unfiltered mock project carries unrelated
+# pre-existing failures on this machine, so this scope stays filtered like
+# the other browser scopes and keeps the runner discipline
+# (root-installed TypeScript/Playwright, web-local Vite build, no npm chain).
+working-flavor-browser = "cd web && node ../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json && node node_modules/vite/bin/vite.js build && node ../node_modules/@playwright/test/cli.js test --project=mock working-flavor.spec.ts"
+
+# Fail-before evidence for the catalog expansion (job gru-working-flavor-200):
+# the FINAL catalog test bytes are overlaid onto an isolated git-archive
+# snapshot of the pre-change base 9bb51b05 (old production module, root+web
+# node_modules symlinked, no install, no worktree/branch mutation). The run
+# is EXPECTED RED from the NEW assertions (40-per-category / 200-unique
+# counts, the updated whole-pool hash, the three-bag 200-boundary draws)
+# while the legacy-subset pin passes there by design. The vitest exit code is
+# echoed and the scope exits nonzero so the scheduler captures it as
+# evidence, never masked into a PASS. The approved j-463 RPC-patch
+# prerequisite runs first inside the snapshot (same as the sibling
+# baselines), so the EXPECTED RED is assertion-based, never a collection
+# timeout. Snapshots are preserved; the ignored
+# pointer file
+# _bmad-output/gate-prep/working-flavor-catalog-baseline.last-snapshot.txt
+# records the latest snapshot location.
+working-flavor-catalog-baseline = 'set -e; base=9bb51b05af5d8f0a0cd389788d1d3f19607d5361; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-working-flavor-catalog.XXXXXX"); git archive "$base" | tar -x -C "$d"; git show "$headrev":web/src/lib/working-flavor.test.ts > "$d/web/src/lib/working-flavor.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; ln -s "$root/web/node_modules" "$d/web/node_modules"; printf "%s base=%s head=%s\n" "$d" "$base" "$headrev" > "$prep/working-flavor-catalog-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; cd web; set +e; npx vitest run src/lib/working-flavor.test.ts; code=$?; set -e; echo "working-flavor-catalog-baseline vitest exit=$code (EXPECTED-NONZERO: new catalog assertions vs pre-change base)"; if [ "$code" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: baseline passed unexpectedly"; fi; exit 1'
