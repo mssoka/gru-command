@@ -487,16 +487,22 @@ test.describe('themes', () => {
     await expect(page.locator('#board-owner')).toBeVisible();
     await expect(page.locator('#board-owner .board-owner__clear')).toBeVisible();
 
+    // The deploy chip reads live build-vs-origin/main drift from the real
+    // service: its value ("current"/"N behind"/"unknown") and tone change
+    // with the head under test. Mask it so the theme baselines stay
+    // deterministic across heads; every other chip keeps theme coverage.
+    const deployChip = page.locator('[data-chip="deploy"]');
+
     // Whole-page captures must be scroll-invariant (see the mock themes
     // test): pin the page origin before each capture.
     await page.evaluate(() => window.scrollTo(0, 0));
     await expect(page.locator('html')).not.toHaveClass(/dark/);
-    await expect(page).toHaveScreenshot('real-chat-light.png', { maxDiffPixelRatio: 0.02 });
+    await expect(page).toHaveScreenshot('real-chat-light.png', { maxDiffPixelRatio: 0.02, mask: [deployChip] });
 
     await page.locator('#theme-toggle').click();
     await page.evaluate(() => window.scrollTo(0, 0));
     await expect(page.locator('html')).toHaveClass(/dark/);
-    await expect(page).toHaveScreenshot('real-chat-dark.png', { maxDiffPixelRatio: 0.02 });
+    await expect(page).toHaveScreenshot('real-chat-dark.png', { maxDiffPixelRatio: 0.02, mask: [deployChip] });
 
     await page.reload();
     await expect(page.locator('html')).toHaveClass(/dark/);

@@ -8,6 +8,7 @@ coverage/
 # Playwright / e2e output
 web/playwright-report/
 web/test-results/
+web/test-results-crew/
 # Logs
 *.log
 # Local env — never commit secrets

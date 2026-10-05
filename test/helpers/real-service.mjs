@@ -227,7 +227,21 @@ export async function startRealService({
 
   // Port 0 = ephemeral: discover the OS-assigned port from the service's
   // own `listening` log line before polling /health.
-  const deadline = Date.now() + 20_000;
+  //
+  // Boot budget (shared-host headroom): the full suite runs beside
+  // dispatched job lanes and service housekeeping that sit OUTSIDE the
+  // verify scheduler's pool pin (see vitest.config.ts), and under that
+  // co-tenant load a spawned service can take well over the old 20 s
+  // from spawn to first /health answer — witnessed on the shared host
+  // with the ledger-ready log landing inside the old window while the
+  // health poll was still unpaid. The two waits have SEPARATE deadlines
+  // (a slow discovery can never starve the health poll), and their sum
+  // (20 s + 60 s = 80 s) fits inside the booting suites' 90 s ceilings,
+  // so a genuinely wedged boot always fails loud HERE — never as a
+  // vitest timeout cut.
+  const DISCOVERY_DEADLINE_MS = 20_000;
+  const HEALTH_DEADLINE_MS = 60_000;
+  const discoveryDeadline = Date.now() + DISCOVERY_DEADLINE_MS;
   if (port === 0) {
     let discovered = null;
     while (discovered === null) {
@@ -241,7 +255,7 @@ export async function startRealService({
         cleanup();
         failLoud(`service exited before listening (code ${child.exitCode})\n${stderrTail}`);
       }
-      if (Date.now() > deadline) {
+      if (Date.now() > discoveryDeadline) {
         child.kill('SIGKILL');
         cleanup();
         failLoud(`service never reported a listening port (ephemeral config)\n${stderrTail}`);
@@ -252,6 +266,7 @@ export async function startRealService({
   }
 
   const baseUrl = `http://127.0.0.1:${port}`;
+  const healthDeadline = Date.now() + HEALTH_DEADLINE_MS;
   for (;;) {
     if (spawnError !== null) {
       cleanup();
@@ -262,7 +277,7 @@ export async function startRealService({
       failLoud(`service exited during boot (code ${child.exitCode})\n${stderrTail}`);
     }
     if (await healthOk(baseUrl)) break;
-    if (Date.now() > deadline) {
+    if (Date.now() > healthDeadline) {
       child.kill('SIGKILL');
       cleanup();
       failLoud(`service never answered /health on ${baseUrl}\n${stderrTail}`);

@@ -44,22 +44,35 @@ function draw(deck: WorkingFlavorDeck, count: number): string[] {
 }
 
 describe('working flavor catalog', () => {
-  it('is the approved pool: five categories of twenty, 100 unique phrases', () => {
+  it('is the approved pool: five categories of forty, 200 unique phrases', () => {
     expect(WORKING_FLAVOR_CATEGORIES.map((category) => category.id)).toEqual([...CATEGORY_IDS]);
     for (const category of WORKING_FLAVOR_CATEGORIES) {
-      expect(category.phrases, category.id).toHaveLength(20);
+      expect(category.phrases, category.id).toHaveLength(40);
     }
-    expect(WORKING_FLAVOR_PHRASES).toHaveLength(100);
-    expect(new Set(WORKING_FLAVOR_PHRASES).size).toBe(100);
+    expect(WORKING_FLAVOR_PHRASES).toHaveLength(200);
+    expect(new Set(WORKING_FLAVOR_PHRASES).size).toBe(200);
   });
 
-  it('pins the approved copy verbatim (sha256 of the joined phrases)', () => {
+  it('preserves the original approved 100 as each category’s first twenty (legacy sha256)', () => {
+    // The 2026-10-01 approved copy survives byte-for-byte at the head of
+    // every category. This pin is deliberately separate from the expanded
+    // whole-pool pin so a copy edit cannot silently drop or reorder the
+    // original strings.
+    const legacy = WORKING_FLAVOR_CATEGORIES.flatMap((category) =>
+      category.phrases.slice(0, 20),
+    );
+    expect(legacy).toHaveLength(100);
+    const digest = createHash('sha256').update(legacy.join('\n'), 'utf8').digest('hex');
+    expect(digest).toBe('f0271dd8db53ddfa1c79bc48d29b515284b30b2ea2c8120733bb880269e9207f');
+  });
+
+  it('pins the expanded 200-phrase copy verbatim (sha256 of the joined phrases)', () => {
     // Copy is owner-approved display data: any edit must be an approved
     // copy change and must update this pin deliberately.
     const digest = createHash('sha256')
       .update(WORKING_FLAVOR_PHRASES.join('\n'), 'utf8')
       .digest('hex');
-    expect(digest).toBe('f0271dd8db53ddfa1c79bc48d29b515284b30b2ea2c8120733bb880269e9207f');
+    expect(digest).toBe('277c0d8363f95e1a2c3b43a4d057c9e65a59888160de1bba757f7d5357792aff');
   });
 
   it('is display-safe: no visible "Gru is" prefix, no ellipsis, no stray whitespace', () => {
@@ -78,19 +91,19 @@ describe('working flavor catalog', () => {
 });
 
 describe('working flavor deck', () => {
-  it('deals a full no-repeat bag before repeating any phrase', () => {
+  it('deals a full no-repeat 200-entry bag before repeating any phrase', () => {
     const deck = new WorkingFlavorDeck(seededRandom(20261001));
-    const firstBag = draw(deck, 100);
-    expect(new Set(firstBag).size).toBe(100);
+    const firstBag = draw(deck, 200);
+    expect(new Set(firstBag).size).toBe(200);
     expect([...firstBag].sort()).toEqual([...WORKING_FLAVOR_PHRASES].sort());
-    const secondBag = draw(deck, 100);
-    expect(new Set(secondBag).size).toBe(100);
+    const secondBag = draw(deck, 200);
+    expect(new Set(secondBag).size).toBe(200);
     expect([...secondBag].sort()).toEqual([...WORKING_FLAVOR_PHRASES].sort());
   });
 
-  it('interleaves categories: consecutive phrases never share one', () => {
+  it('interleaves categories across three bags: consecutive phrases never share one', () => {
     const deck = new WorkingFlavorDeck(seededRandom(7));
-    const phrases = draw(deck, 300);
+    const phrases = draw(deck, 600);
     for (let index = 1; index < phrases.length; index += 1) {
       const previous = CATEGORY_BY_PHRASE.get(phrases[index - 1]!);
       const current = CATEGORY_BY_PHRASE.get(phrases[index]!);
@@ -99,9 +112,16 @@ describe('working flavor deck', () => {
     }
   });
 
-  it('never repeats a phrase across a bag boundary', () => {
+  it('deals three complete 200-entry bags: every phrase once, no repeat across any boundary', () => {
     const deck = new WorkingFlavorDeck(seededRandom(99));
-    const phrases = draw(deck, 250);
+    const phrases = draw(deck, 600);
+    for (let bag = 0; bag < 3; bag += 1) {
+      const slice = phrases.slice(bag * 200, (bag + 1) * 200);
+      expect(new Set(slice).size, `bag ${bag + 1} unique`).toBe(200);
+      expect([...slice].sort(), `bag ${bag + 1} covers the pool`).toEqual(
+        [...WORKING_FLAVOR_PHRASES].sort(),
+      );
+    }
     for (let index = 1; index < phrases.length; index += 1) {
       expect(phrases[index], `immediate repeat at draw ${index}`).not.toBe(phrases[index - 1]);
     }

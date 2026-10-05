@@ -139,6 +139,7 @@ export class DispatchService {
     jobId: string;
     repoPath: string;
     title: string;
+    displayName?: string;
     briefing: string;
     /** Explicit completion intent: when present, the phase-handoff guard
      * row is persisted BEFORE any side effect and this exact phase's
@@ -156,6 +157,7 @@ export class DispatchService {
       id: input.jobId,
       repo: repoName,
       title: input.title,
+      displayName: input.displayName,
       briefing: input.briefing,
     });
 

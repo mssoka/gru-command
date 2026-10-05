@@ -56,7 +56,10 @@ export interface DirectiveRegistry {
 
 export interface DirectiveRoutingDeps {
   readonly registry: DirectiveRegistry;
-  readonly ledger: Pick<LedgerApi, 'listAgents' | 'registerAgent' | 'getJob' | 'getAgent'>;
+  readonly ledger: Pick<
+    LedgerApi,
+    'listImplementerMinions' | 'listAgents' | 'registerAgent' | 'getJob' | 'getAgent'
+  >;
   readonly worktrees: WorktreePort;
   /** Book of Lessons injection: pointer lines only, never chapter bodies. */
   readonly lessons?: LessonsReferencePort;
@@ -116,12 +119,13 @@ export async function routeFixDirectiveToMinion(
     ),
   );
   const minions = input.ledger
-    .listAgents()
-    // Issue #161: directives belong to the job's WRITER minion — a tracked
-    // child is never selected as the primary lane worker.
-    .filter((agent) => agent.jobId === input.jobId && agent.role === 'minion' && agent.parentage !== 'child');
+    .listImplementerMinions(input.jobId)
+    // Defense-in-depth for issue #161's writer rule (the ledger pick
+    // already excludes children): a tracked child is never the primary
+    // lane worker even if a future writer lets one into the table shape.
+    .filter((agent) => agent.parentage !== 'child');
   let evictedSessionFile: string | null = null;
-  for (const minion of [...minions].reverse()) {
+  for (const minion of minions) {
     const handle = input.registry.getHandle(minion.id);
     if (handle !== null) {
       // Active-incident attribution (B1): if an automatic retry is already
@@ -221,7 +225,7 @@ export async function routeFixDirectiveToMinion(
     // handle exposed none fall back to the newest session-bearing record —
     // never an arbitrary older disposed minion's session.
     const fallback = evictedSessionFile === null
-      ? ([...minions].reverse().find((minion) => minion.sessionFile !== null)?.sessionFile ?? null)
+      ? (minions.find((minion) => minion.sessionFile !== null)?.sessionFile ?? null)
       : null;
     const resumeFile = evictedSessionFile ?? fallback;
     // Issue #161: the (re)dispatched parent keeps one product-owned id
@@ -246,16 +250,31 @@ export async function routeFixDirectiveToMinion(
     }
     let promptError: unknown = null;
     let verdict: PromptTurnVerdict | null = null;
+    const spawnedHandle = handle;
     try {
       // A fresh fallback minion (the resume attempt failed) is top-level;
       // a resumed row keeps its recorded parentage (never retro-fitted).
       input.ledger.registerAgent({
-        id: handle.id,
+        id: spawnedHandle.id,
         role: 'minion',
         jobId: input.jobId,
         sessionFile: handle.sessionFile,
-        ...(input.ledger.getAgent(handle.id) === null ? { parentage: 'top-level' as const } : {}),
+        ...(input.ledger.getAgent(spawnedHandle.id) === null ? { parentage: 'top-level' as const } : {}),
       });
+    } catch (error) {
+      // A registration failure leaves the spawned handle ownerless — an
+      // unbound live worker must never survive the failed directive
+      // setup. Dispose it loudly, preserving the actionable registration
+      // error (mirrors the re-brief setup path's failure ladder).
+      await input.registry.disposeHandle(spawnedHandle).catch((disposeError: unknown) => {
+        throw new Error(
+          `could not dispose the unregistered minion ${spawnedHandle.id} after a failed directive registration: ${String(disposeError)}`,
+          { cause: error },
+        );
+      });
+      throw error;
+    }
+    try {
       verdict = await racedPrompt(handle, prompt, input.signal, owner);
     } catch (error) {
       promptError = error;
@@ -465,11 +484,11 @@ export async function rebriefFreshMinion(
   }
   try {
     input.beforeTurnSideEffect?.();
-    const jobMinions = input.ledger
-      .listAgents()
-      // Retirement/re-brief retires the WRITER sessions only — an active
-      // child worker is not the job's minion lane (issue #161).
-      .filter((agent) => agent.jobId === input.jobId && agent.role === 'minion' && agent.parentage !== 'child');
+    // Retirement/re-brief retires the WRITER sessions only — an active
+    // child worker is not the job's minion lane (#161), and review-only
+    // sessions (round/lens-bound, Gru ruling 2026-09-29) are never
+    // displaced either: the implementer-only pick applies both exclusions.
+    const jobMinions = input.ledger.listImplementerMinions(input.jobId);
     for (const minion of jobMinions) {
       const prior = input.registry.getHandle(minion.id);
       if (prior === null) continue;

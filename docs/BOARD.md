@@ -139,9 +139,13 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   `✓ done` green · `✕ error` red · `— not used` neutral gray, no pass mark)
   behind a click.
 - **Crew rail (#171 truthful agent status):** CREW (n) / TRANSCRIPTS
-  tabs above dense rows — a status dot + name + short hash, a
-  `role · state` subline (with turn age, supervision marks and runtime
-  marks), and a right-aligned state chip; error rows carry the alert
+  tabs above dense rows — a status dot + name + short hash (minion rows
+  lead with the heist's short name: the authored `display_name` when
+  present, otherwise a display-only shortening of the title, plus a
+  normally four-character id suffix extended only on same-heist
+  collisions; full title and id stay in the row's tooltip and accessible
+  name), a `role · state` subline (with turn age, supervision marks and
+  runtime marks), and a right-aligned state chip; error rows carry the alert
   accent; disposed rows collapse behind a dashed `+N disposed` footer.
   Liveness is runtime ownership, not the raw stored state: each row
   carries a `runtime` classification — `current` (the live runtime owns

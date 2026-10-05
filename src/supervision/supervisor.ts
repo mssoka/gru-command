@@ -1809,6 +1809,9 @@ export class Supervisor {
         return;
       }
 
+      // Snapshot the explicit durable association BEFORE spawning: the tap
+      // carries no job context and a resumed spawn may reuse this row's id.
+      const predecessor = this.ledger.getAgent(agent.agentId);
       // Respawn with resume (crash = resume, SPEC ruling 3).
       const resumeFile = agent.sessionFile;
       try {
@@ -1831,6 +1834,30 @@ export class Supervisor {
           // adopt it or notify swap listeners.
           await this.registry.disposeHandle(spawned).catch(() => {});
           return;
+        }
+        if (predecessor !== null) {
+          try {
+            this.ledger.registerAgent({
+              id: spawned.id,
+              role: predecessor.role,
+              label: predecessor.label,
+              jobId: predecessor.jobId,
+              roundId: predecessor.roundId,
+              sessionFile: spawned.sessionFile,
+            });
+          } catch (error) {
+            // Never recover a prompt on a replacement whose known ownership
+            // could not be recorded; the existing ladder reports/retries it.
+            // A dispose hiccup is reported but must not mask the actionable
+            // binding error (mirrors the stale-result path above).
+            await this.registry.disposeHandle(spawned).catch((disposeError: unknown) => {
+              this.log('warn', 'dispose of the unbound replacement failed — the binding error is preserved', {
+                agent_id: spawned.id,
+                error: String(disposeError),
+              });
+            });
+            throw error;
+          }
         }
         this.adopt(spawned, restartSlot, resumeFile);
         // A resumed session keeps its id; a fresh mint does NOT — the

@@ -1099,6 +1099,17 @@ body {
   text-overflow: ellipsis;
 }
 
+/* Working-flavor geometry: the busy chip must own the strip's flexible
+   slot. With an intrinsic flex-basis a long rotating phrase makes the
+   line overflow, so the shrink cascades into the buttons — they narrow
+   below their one-line width and wrap their labels — and their boxes
+   depend on the phrase. Basis 0 + grow 1 gives the chip the same slot for
+   every phrase and ellipsizes the phrase inside it. The phone sheet
+   overrides the basis to 100% so the status takes its own row. */
+.chat-context__status--busy {
+  flex: 1 1 0;
+}
+
 /* Working flavor (owner-approved 2026-10-01): the chip shows either the
    factual label or the rotating decorative phrase. Both stay on one line
    and ellipsize inside the shrinkable chip, so short/long phrases never
@@ -1111,6 +1122,13 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* Reserve the same flexible slot for every phrase. With an intrinsic flex
+   basis, a long phrase can move the buttons onto another row despite the
+   ellipsis inside the chip. Phone layout overrides the basis to 100%. */
+.chat-context__status--busy {
+  flex: 1 1 0;
 }
 
 .chat-context__status--busy .chat-context__status-label {
@@ -2221,6 +2239,7 @@ body {
 }
 
 .board-agent__name {
+  min-width: 0;
   font-weight: 700;
   overflow: hidden;
   text-overflow: ellipsis;

@@ -752,23 +752,33 @@ function throwIfTurnInBandError(result: Awaited<ReturnType<typeof rebriefFreshMi
 }
 
 /** The interrupted worker's session, when one exists on disk: the marker's
- * bound session first, then the job's latest minion (a crash between spawn
- * and marker binding). No resumable session means a fresh worker. */
+ * bound session first, then the job's latest IMPLEMENTER minion (a crash
+ * between spawn and marker binding). Review-only sessions (Gru ruling
+ * 2026-09-29) are never resume candidates, no matter how new their rows
+ * are. No resumable session means a fresh worker. */
 function resolveResumeFile(
   deps: ReconcileRebriefDeps,
   jobId: string,
   group: readonly PendingRebriefRecord[],
 ): string | null {
-  const markerSession = group.find((marker) => marker.sessionFile !== null)?.sessionFile ?? null;
-  const latestMinion = deps.ledger
-    .listAgents()
-    .find(
-      (agent) =>
-        agent.jobId === jobId &&
-        agent.role === 'minion' &&
-        agent.parentage !== 'child' &&
-        agent.sessionFile !== null,
-    );
+  const implementers = deps.ledger.listImplementerMinions(jobId);
+  const implementerSessions = new Set(
+    implementers.flatMap((agent) => (agent.sessionFile !== null && agent.sessionFile !== '' ? [agent.sessionFile] : [])),
+  );
+  let markerSession = group.find((marker) => marker.sessionFile !== null)?.sessionFile ?? null;
+  if (markerSession !== null && !implementerSessions.has(markerSession)) {
+    // A marker bound to a REVIEW-ONLY worker's session must never resume a
+    // reviewer (edge review 2026-10-05): legacy markers written before the
+    // implementer-only ruling can carry one. The session's OWNER decides
+    // — a row that is not an implementer rejects the marker session; a
+    // MISSING row (crash between binding and registration, or a swept
+    // record) keeps the legacy resume: the marker is the durable binding
+    // of the spawn that wrote it, and no evidence contradicts it.
+    const owner = deps.ledger.listAgents().find((agent) => agent.sessionFile === markerSession) ?? null;
+    const ownerIsReviewOnly = owner !== null && !implementers.some((agent) => agent.id === owner.id);
+    if (ownerIsReviewOnly) markerSession = null;
+  }
+  const latestMinion = implementers.find((agent) => agent.sessionFile !== null) ?? null;
   const candidates = [markerSession, latestMinion?.sessionFile ?? null];
   for (const candidate of candidates) {
     if (candidate !== null && candidate !== '' && existsSync(candidate)) return candidate;

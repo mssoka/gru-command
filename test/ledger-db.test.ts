@@ -35,6 +35,18 @@ describe('ledger db + migration runner', () => {
     db.close();
   });
 
+  it('upgrades a v8 ledger without losing full titles or existing bindings', () => {
+    const dir = tmpDir();
+    const old = new LedgerDb(dir, { migrations: MIGRATIONS.slice(0, 8) });
+    old.handle.prepare("INSERT INTO jobs (id, repo, title, status, created_at, updated_at) VALUES ('j', 'r', 'Full legacy title', 'working', 't', 't')").run();
+    old.handle.prepare("INSERT INTO agents (id, role, job_id, state, created_at, updated_at) VALUES ('a', 'minion', 'j', 'idle', 't', 't')").run();
+    old.close();
+    const upgraded = new LedgerDb(dir);
+    expect(upgraded.handle.prepare("SELECT title, display_name FROM jobs WHERE id = 'j'").get()).toMatchObject({ title: 'Full legacy title', display_name: null });
+    expect(upgraded.handle.prepare("SELECT job_id FROM agents WHERE id = 'a'").get()).toMatchObject({ job_id: 'j' });
+    upgraded.close();
+  });
+
   it('re-opening an up-to-date DB is a no-op (no re-applied migrations)', () => {
     const dir = tmpDir();
     const first = new LedgerDb(dir);
@@ -55,6 +67,21 @@ describe('ledger db + migration runner', () => {
       .run(999, 'from-the-future', new Date().toISOString());
     db.close();
     expect(() => new LedgerDb(dir)).toThrow(/unknown to this build/u);
+  });
+
+  it('an applied migration whose recorded name differs from code fails loud (rename/reuse)', () => {
+    const dir = tmpDir();
+    // A database that applied the pre-integration ordering: id 9 is the
+    // never-deployed old name of the display-name migration (the 2026-10-02
+    // renumbers moved it to id 11 under main's accepted worktree-base-source
+    // id 9 and provider-recovery-waits id 10).
+    const preRename = [
+      ...MIGRATIONS.slice(0, 8),
+      { id: 9, name: 'job-display-name', sql: 'ALTER TABLE jobs ADD COLUMN display_name TEXT;' },
+    ];
+    const old = new LedgerDb(dir, { migrations: preRename });
+    old.close();
+    expect(() => new LedgerDb(dir)).toThrow(/renamed migration/u);
   });
 
   it('a numbering gap in the migration list fails loud before applying anything', () => {

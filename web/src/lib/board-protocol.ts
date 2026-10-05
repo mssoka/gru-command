@@ -53,6 +53,8 @@ export interface JobView {
   readonly id: string;
   readonly repo: string;
   readonly title: string;
+  /** Absent on older servers; null for jobs without an authored name. */
+  readonly displayName?: string | null;
   readonly status: string;
   readonly updatedAt: string;
   readonly prUrl: string | null;
@@ -369,6 +371,16 @@ export function parseBoardServerFrame(raw: unknown): BoardServerFrame | null {
     return { type: 'board', snapshot: frame.snapshot as BoardSnapshot };
   }
   return null;
+}
+
+/** True when the value carries at least one visible character: zero-width
+ * and format controls (Unicode Cf), controls (Cc), and combining marks
+ * (M) do not count — mirror of the ledger's visibility rule, so a
+ * server that somehow persisted an invisible-only name is rejected here
+ * instead of rendering an empty card. (The ledger's 100-code-unit length
+ * ceiling is not mirrored; the rail shortens for display anyway.) */
+function hasVisibleCharacters(value: string): boolean {
+  return value.replace(/[\p{Cf}\p{Cc}\p{M}\s]/gu, '') !== '';
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -730,6 +742,8 @@ export function isValidSnapshot(value: unknown): value is BoardSnapshot {
           isRecord(job) &&
           typeof job.id === 'string' &&
           typeof job.title === 'string' &&
+          (job.displayName === undefined || job.displayName === null ||
+            (typeof job.displayName === 'string' && job.displayName.trim() !== '' && hasVisibleCharacters(job.displayName))) &&
           typeof job.status === 'string' &&
           (job.prState === null || job.prState === undefined || isPrState(job.prState)) &&
           (job.lane === null || isLane(job.lane)) &&

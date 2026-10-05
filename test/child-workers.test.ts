@@ -902,7 +902,17 @@ describe('tracked child workers: migration and storage', () => {
     // worktrees rebuild must keep satisfying at commit).
     const legacy = new LedgerDb(dir, { migrations: MIGRATIONS.filter((migration) => migration.id <= 14) });
     const before = new LedgerApi(legacy.handle, {});
-    before.addJob({ id: 'job-1', repo: 'r', title: 'legacy', briefing: 'b' });
+    // Seed through the FIXTURE's own schema: the merged build's addJob also
+    // writes jobs.display_name (migration 17), which a pre-#161 fixture
+    // (migrations <= 14 / <= 15) does not carry. The raw insert matches the
+    // legacy columns exactly, preserving the upgrade-shape under test.
+    const seededAt = new Date().toISOString();
+legacy.handle
+      .prepare(
+        `INSERT INTO jobs (id, repo, title, status, base_branch, pr_url, note, briefing, created_at, updated_at)
+         VALUES ('job-1', 'r', 'legacy', 'dispatched', NULL, NULL, NULL, 'b', ?, ?)`,
+      )
+      .run(seededAt, seededAt);
     before.registerWorktree({
       id: 'job-1',
       kind: 'job',
@@ -947,7 +957,17 @@ describe('tracked child workers: migration and storage', () => {
     // carrying an unspawned child whose agent binding was still NULL.
     const v15 = new LedgerDb(dir, { migrations: MIGRATIONS.filter((migration) => migration.id <= 15) });
     const before = new LedgerApi(v15.handle, {});
-    before.addJob({ id: 'job-1', repo: 'r', title: 'legacy', briefing: 'b' });
+    // Seed through the FIXTURE's own schema: the merged build's addJob also
+    // writes jobs.display_name (migration 17), which a pre-#161 fixture
+    // (migrations <= 14 / <= 15) does not carry. The raw insert matches the
+    // legacy columns exactly, preserving the upgrade-shape under test.
+    const seededAt = new Date().toISOString();
+v15.handle
+      .prepare(
+        `INSERT INTO jobs (id, repo, title, status, base_branch, pr_url, note, briefing, created_at, updated_at)
+         VALUES ('job-1', 'r', 'legacy', 'dispatched', NULL, NULL, NULL, 'b', ?, ?)`,
+      )
+      .run(seededAt, seededAt);
     before.registerAgent({ id: 'parent-1', role: 'minion', jobId: 'job-1', parentage: 'top-level' });
     const admission = before.admitChildWorker({
       id: 'child_old',

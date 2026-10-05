@@ -3,8 +3,8 @@ import { readFileSync, readdirSync, rmSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { basename, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { afterEach, describe, expect, it, vi } from 'vitest';
 import { WebSocket } from 'ws';
+import { afterEach, describe, expect, it } from 'vitest';
 
 const TOKEN = 'configured-mock-test-token';
 const cleanupDirs: string[] = [];
@@ -76,6 +76,47 @@ async function upload(baseUrl: string, filename: string, bytes: Uint8Array): Pro
   });
 }
 
+async function waitFor(condition: () => boolean, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error('waitFor timed out');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+function postControl(baseUrl: string, path: string): Promise<Response> {
+  return fetch(`${baseUrl}${path}`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TOKEN}` },
+  });
+}
+
+interface MockSocket {
+  readonly socket: WebSocket;
+  readonly frames: Array<Record<string, unknown>>;
+}
+
+async function openAuthedSocket(baseUrl: string): Promise<MockSocket> {
+  const socket = new WebSocket(`${baseUrl.replace(/^http/, 'ws')}/ws`);
+  const frames: Array<Record<string, unknown>> = [];
+  socket.on('message', (data) => {
+    frames.push(JSON.parse(String(data)) as Record<string, unknown>);
+  });
+  await new Promise<void>((resolve, reject) => {
+    socket.once('open', resolve);
+    socket.once('error', reject);
+  });
+  socket.send(JSON.stringify({ type: 'auth', token: TOKEN }));
+  await waitFor(() => frames.some((frame) => frame.type === 'auth_ok'));
+  return { socket, frames };
+}
+
+function isTurnFrame(frame: Record<string, unknown>): boolean {
+  return frame.type === 'turn' || frame.type === 'tool' || frame.type === 'delta';
+}
+
 afterEach(async () => {
   for (const child of children.splice(0)) {
     // A signal death leaves exitCode null (r2 W6): treat signalCode as a
@@ -138,91 +179,85 @@ describe('dev mock upload endpoint hardening', () => {
   }, 30_000);
 });
 
-describe('dev mock turn-hold fixture contract', () => {
-  /** Frame log helper: the mock's chat channel streams JSON frames. */
-  type Frame = Record<string, unknown>;
-
-  async function chatSocket(baseUrl: string): Promise<{ ws: WebSocket; frames: Frame[] }> {
-    const ws = new WebSocket(`${baseUrl.replace('http', 'ws')}/ws`);
-    const frames: Frame[] = [];
-    ws.on('message', (data: Buffer) => frames.push(JSON.parse(String(data)) as Frame));
-    await new Promise<void>((resolve, reject) => {
-      ws.once('open', () => resolve());
-      ws.once('error', reject);
-    });
-    ws.send(JSON.stringify({ type: 'auth', token: TOKEN }));
-    await vi.waitFor(() => expect(frames.some((f) => f['type'] === 'auth_ok')).toBe(true));
-    return { ws, frames };
-  }
-
-  const control = async (baseUrl: string, path: string): Promise<void> => {
-    const res = await fetch(`${baseUrl}${path}`, {
-      method: 'POST',
-      headers: { authorization: `Bearer ${TOKEN}` },
-    });
-    expect(res.ok, path).toBe(true);
-  };
-
-  it('parks the scripted turn until release, and reset settles a parked turn without ghost frames', async () => {
+describe('dev mock reset settles the previous turn before rewinding the log', () => {
+  it('never replays orphan turn frames from a parked held turn after /__reset', async () => {
     const { baseUrl } = await startMock();
-    await control(baseUrl, '/__reset');
-    await control(baseUrl, '/__turn-hold');
-    const first = await chatSocket(baseUrl);
-    first.ws.send(JSON.stringify({ type: 'user', text: 'hold check', client_msg_id: 'hold-1', epoch: 0 }));
-    await vi.waitFor(() => expect(first.frames.some((f) => f['type'] === 'delta')).toBe(true));
-    // Well past the scripted stream duration: a parked turn must NOT end.
-    await new Promise((resolve) => setTimeout(resolve, 2_500));
-    expect(first.frames.some((f) => f['type'] === 'turn' && f['state'] === 'end')).toBe(false);
-    await control(baseUrl, '/__turn-release');
-    await vi.waitFor(() => expect(first.frames.some((f) => f['type'] === 'turn' && f['state'] === 'end')).toBe(true));
-    first.ws.close();
-    await new Promise((resolve) => setTimeout(resolve, 150));
+    const first = await openAuthedSocket(baseUrl);
+    await postControl(baseUrl, '/__turn-hold');
+    first.socket.send(
+      JSON.stringify({ type: 'user', text: 'reset probe', client_msg_id: 'm1', epoch: 0 }),
+    );
+    // The full scripted reply streams first (final 🪐 token), then the hold
+    // parks the turn on the next tick without a terminal turn frame.
+    await waitFor(() =>
+      first.frames.some((frame) => frame.type === 'delta' && String(frame.text).includes('🪐')),
+    );
+    await sleep(150);
+    expect(first.frames.some((frame) => frame.type === 'turn' && frame.state === 'end')).toBe(false);
 
-    // Reset WHILE a turn is parked: the parked turn must settle before the
-    // log clears, so a fresh client replays no ghost turn/tool frames.
-    await control(baseUrl, '/__reset');
-    await control(baseUrl, '/__turn-hold');
-    const parked = await chatSocket(baseUrl);
-    parked.ws.send(JSON.stringify({ type: 'user', text: 'reset while parked', client_msg_id: 'hold-2', epoch: 0 }));
-    await vi.waitFor(() => expect(parked.frames.some((f) => f['type'] === 'delta')).toBe(true));
-    await new Promise((resolve) => setTimeout(resolve, 1_500));
-    await control(baseUrl, '/__reset');
-    await new Promise((resolve) => setTimeout(resolve, 200));
-    const fresh = await chatSocket(baseUrl);
-    await new Promise((resolve) => setTimeout(resolve, 250));
-    expect(fresh.frames.some((f) => f['type'] === 'turn' && f['state'] === 'end')).toBe(false);
-    expect(fresh.frames.some((f) => f['type'] === 'tool')).toBe(false);
-    expect(fresh.frames.some((f) => f['type'] === 'delta')).toBe(false);
-    fresh.ws.close();
+    const reset = await postControl(baseUrl, '/__reset');
+    expect(reset.ok).toBe(true);
+    // The terminated socket's close handler settles the parked turn after
+    // the reset returns; the rewind must not leave its frames behind.
+    await sleep(250);
+
+    const replay = await openAuthedSocket(baseUrl);
+    await sleep(150);
+    expect(replay.frames.filter(isTurnFrame)).toEqual([]);
+    first.socket.terminate();
+    replay.socket.terminate();
   }, 30_000);
 
-  it('reset drops a queued (deferred) user frame instead of letting its reply ghost into the cleared log', async () => {
+  it('drops an in-flight streaming turn at /__reset with no replayed frames', async () => {
     const { baseUrl } = await startMock();
-    await control(baseUrl, '/__reset');
-    await control(baseUrl, '/__turn-hold');
-    const client = await chatSocket(baseUrl);
-    client.ws.send(JSON.stringify({ type: 'user', text: 'parked turn', client_msg_id: 'q-1', epoch: 0 }));
-    await vi.waitFor(() => expect(client.frames.some((f) => f['type'] === 'delta')).toBe(true));
-    // A SECOND user frame arrives while the turn is parked: it defers
-    // (one scripted turn at a time). Reset must drop it BEFORE settling
-    // the parked turn — otherwise its reply starts and the closing frames
-    // land in the freshly cleared log (ghost frames for the next client).
-    client.ws.send(JSON.stringify({ type: 'user', text: 'queued while parked', client_msg_id: 'q-2', epoch: 0 }));
-    // Let the scripted stream run to exhaustion so the turn is genuinely
-    // PARKED (release registered) before the reset arrives — the parked
-    // state is the fixture contract this case pins.
-    await new Promise((resolve) => setTimeout(resolve, 2_000));
-    expect(client.frames.some((f) => f['type'] === 'turn' && f['state'] === 'end')).toBe(false);
-    await control(baseUrl, '/__reset');
-    // Any ghost reply would finish within the scripted window.
-    await new Promise((resolve) => setTimeout(resolve, 800));
-    const fresh = await chatSocket(baseUrl);
-    await new Promise((resolve) => setTimeout(resolve, 400));
-    expect(fresh.frames.some((f) => f['type'] === 'turn' && f['state'] === 'end')).toBe(false);
-    expect(fresh.frames.some((f) => f['type'] === 'tool')).toBe(false);
-    expect(fresh.frames.some((f) => f['type'] === 'delta')).toBe(false);
-    fresh.ws.close();
-    client.ws.close();
-    await new Promise((resolve) => setTimeout(resolve, 150));
+    const first = await openAuthedSocket(baseUrl);
+    first.socket.send(
+      JSON.stringify({ type: 'user', text: 'mid-stream probe', client_msg_id: 'm1', epoch: 0 }),
+    );
+    await waitFor(() => first.frames.some((frame) => frame.type === 'delta'));
+    expect(first.frames.some((frame) => frame.type === 'turn' && frame.state === 'end')).toBe(false);
+
+    const reset = await postControl(baseUrl, '/__reset');
+    expect(reset.ok).toBe(true);
+    // The interval/close settle fires after the reset returns.
+    await sleep(250);
+
+    const replay = await openAuthedSocket(baseUrl);
+    await sleep(150);
+    expect(replay.frames.filter(isTurnFrame)).toEqual([]);
+    first.socket.terminate();
+    replay.socket.terminate();
+  }, 30_000);
+
+  it('drops a queued (deferred) user frame with a parked turn at /__reset — no ghost reply', async () => {
+    const { baseUrl } = await startMock();
+    const first = await openAuthedSocket(baseUrl);
+    await postControl(baseUrl, '/__turn-hold');
+    first.socket.send(
+      JSON.stringify({ type: 'user', text: 'parked probe', client_msg_id: 'd1', epoch: 0 }),
+    );
+    // Run the stream to exhaustion so the turn is genuinely parked, then
+    // queue a SECOND user frame: it defers (one scripted turn at a time).
+    await waitFor(() =>
+      first.frames.some((frame) => frame.type === 'delta' && String(frame.text).includes('🪐')),
+    );
+    await sleep(150);
+    expect(first.frames.some((frame) => frame.type === 'turn' && frame.state === 'end')).toBe(false);
+    first.socket.send(
+      JSON.stringify({ type: 'user', text: 'queued while parked', client_msg_id: 'd2', epoch: 0 }),
+    );
+    await sleep(200);
+
+    const reset = await postControl(baseUrl, '/__reset');
+    expect(reset.ok).toBe(true);
+    // Any drained queued reply would have streamed + settled by now; the
+    // rewind must not leave its frames behind (ghost frames for replay).
+    await sleep(800);
+
+    const replay = await openAuthedSocket(baseUrl);
+    await sleep(300);
+    expect(replay.frames.filter(isTurnFrame)).toEqual([]);
+    first.socket.terminate();
+    replay.socket.terminate();
   }, 30_000);
 });
