@@ -106,19 +106,25 @@ deferred. Dispositions (owner directive 2026-10-04, "do not defer"):
   a pending owner item.
 Full record: the spec's "Review Findings — PR #165 at 4af6aab" section.
 
-## Deferred from: code review of spec-gc-packaged-build-playbook.md (2026-10-04, round 2)
+## Resolved: code review of spec-gc-packaged-build-playbook.md (2026-10-04, round 2)
 
-These are *known runtime gaps*, not new playbook promises or unresolved in-lane fix decisions. The prior scope ruling excludes new runtime/outcome machinery; each is preserved here for its runtime owner rather than silently treating documentation as an implemented fix.
+Owner directive 2026-10-04 ("no job should be deferred"): all four runtime
+gaps from the round-2 review were implemented in the lane instead of carried.
 
-- source_spec: `_bmad-output/implementation-artifacts/spec-gc-packaged-build-playbook.md`
-  summary: Reviewer and artifact-only deliveries without PRs are classified as `deliveredWithoutPr` by the unchanged Silas digest.
-  evidence: `src/dispatch/silas-driver.ts:509-522` does not check deliverable kind; `resources/silas-skills/ops-dispatch/SKILL.md:97-119` looks for a PR or escalates. Already named as the missing deliverable-kind carve-out in `docs/FLOW.md` §4f, with #160/#162/#163 as runtime work; read-only review jobs make the pre-existing gap more visible.
-- source_spec: `_bmad-output/implementation-artifacts/spec-gc-packaged-build-playbook.md`
-  summary: No machine-visible structured re-arm of the worker's recorded review commission after a yield.
-  evidence: Round-one scope decision requires ops not to advance past the commission (`roles/silas.md:138-146` and ops skill) but `src/dispatch/silas-driver.ts:425-548` has no review-commission digest row. Board next-action/runtime truth remains explicitly unenforced in `docs/FLOW.md` §4f.
-- source_spec: `_bmad-output/implementation-artifacts/spec-gc-packaged-build-playbook.md`
-  summary: A failed fallback PASS notifier has no automatic owned deduplicated retry.
-  evidence: `src/dispatch/perkins.ts:2515-2540` records `escalation: failed` and returns. The owner-approved round-one disposition documents this exact policy-only gap in `docs/FLOW.md:482-490`; a new retry mechanism is outside this PR.
-- source_spec: `_bmad-output/implementation-artifacts/spec-gc-packaged-build-playbook.md`
-  summary: The synchronous fallback PASS notification can be observed before its durable PASS event.
-  evidence: `src/dispatch/perkins.ts:2520-2538` posts the notification then appends the event. The round-one disposition explicitly documents the ordering gap at `docs/FLOW.md:482-490`; record-before-notify would falsely predeclare posted success.
+- Deliverable kind (E15): `jobs.deliverable` (migration e15-job-deliverable) +
+  `POST /api/dispatch` `deliverable` field (validated: pr|review|artifact|
+  investigation) + the Silas digest no longer classifies delivered review/
+  artifact/investigation jobs as PR-overdue. Reviewer dispatches carry
+  `deliverable: "review"`; the worker prompt and ops surfaces pin it.
+- Reviewer commission identity: the worker prompt now forbids yielding with an
+  unsubmitted review commission — the dispatch's durable job row (written
+  before admission) is the commission's machine-visible identity, admitted by
+  the demand-driven reclaim; ops dispatches the reviewer when a worker reports
+  it cannot submit. No handback-note-only commission.
+- Failed fallback PASS escalation: the PASS row is appended before the
+  notifier attempt; the outcome lands as a separate durable `escalation` event
+  (posted/failed/not-configured); a failed outcome renders a deduplicated
+  re-post obligation in the awareness digest and the ops skill.
+- PASS notification ordering: the durable PASS row now precedes the notifier
+  call and its outcome event, so a notification-triggered observer can never
+  see an alert without the routing fact on the ledger.

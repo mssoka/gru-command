@@ -2,7 +2,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { hashToken, tokenConfigured, tokenMatches } from '../auth.js';
 import type { GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
-import type { LedgerApi } from '../ledger/api.js';
+import type { LedgerApi, JobDeliverable } from '../ledger/api.js';
 import { AmbiguousDirectiveError, DirectiveConflictError, PhaseHandoffConflictError } from '../ledger/api.js';
 import { isJobTerminal } from '../ledger/states.js';
 import { parseCompletionHandoffIntent, type CompletionHandoffIntent } from '../ledger/obligations.js';
@@ -233,6 +233,17 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
     return optStrField(body, 'by');
   }
 
+  /** Validate the optional deliverable kind (E15): a typo must fail loud,
+   * never silently default an implementation lane into a carve-out. */
+  function deliverableField(body: Record<string, unknown>): JobDeliverable | undefined {
+    const value = optStrField(body, 'deliverable');
+    if (value === undefined) return undefined;
+    if (value !== 'pr' && value !== 'review' && value !== 'artifact' && value !== 'investigation') {
+      throw new Error(`deliverable must be one of pr|review|artifact|investigation (got "${value}")`);
+    }
+    return value;
+  }
+
   /** The silas ops surface, or null with a 503 already written — the
    * endpoints are hosted only when silas is enabled in config. */
   function silasOpsOr503(res: ServerResponse): SilasOpsSurface | null {
@@ -248,11 +259,13 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       if (!authed(req, res)) return true;
       const body = await readBody(req);
       const completionHandoff = completionHandoffField(body);
+      const deliverable = deliverableField(body);
       const outcome = await options.dispatch.dispatch({
         jobId: strField(body, 'job_id'),
         repoPath: strField(body, 'repo_path'),
         title: strField(body, 'title'),
         briefing: strField(body, 'briefing'),
+        ...(deliverable !== undefined ? { deliverable } : {}),
         ...(completionHandoff !== undefined ? { completionHandoff } : {}),
       });
       // The minion's turn runs in the background; the board carries the

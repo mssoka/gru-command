@@ -2747,10 +2747,13 @@ describe('bmad-review fallback gate (user amendment 2026-09-20, fork-3)', () => 
     return { wave, job, ledger, port, root, artifacts, sessions, db, escalations, reviews, directives, repo };
   }
 
+  function harnessEvents(harness: GateHarness): ReturnType<LedgerApi['listEvents']> {
+    return harness.ledger.listEvents({ limit: 200 }).filter((event) => event.jobId === harness.job.id);
+  }
+
   function gateEvents(harness: GateHarness): Array<Record<string, unknown>> {
-    return harness.ledger
-      .listEvents({ limit: 200 })
-      .filter((event) => event.kind === 'job.fallback-review' && event.jobId === harness.job.id)
+    return harnessEvents(harness)
+      .filter((event) => event.kind === 'job.fallback-review')
       .map((event) => event.payload as Record<string, unknown>);
   }
 
@@ -2833,15 +2836,28 @@ describe('bmad-review fallback gate (user amendment 2026-09-20, fork-3)', () => 
       }
       const passOf = (harness: GateHarness): Record<string, unknown> | undefined =>
         gateEvents(harness).find((payload) => payload['phase'] === 'pass');
-      // Escalation truth (native r7): the durable pass event records what
-      // actually happened — absent config, a completed notifier call, or a
-      // throwing notifier (the pass itself still stands).
-      expect(passOf(absent)?.['escalation']).toBe('not-configured');
-      expect(passOf(posted)?.['escalation']).toBe('posted');
+      const escalationOf = (harness: GateHarness): Record<string, unknown> | undefined =>
+        gateEvents(harness).find((payload) => payload['phase'] === 'escalation');
+      // Ordering + truth (bmad-review rounds 1-2): the PASS row exists for
+      // every mode; the notifier outcome is a separate durable event
+      // recorded after the attempt; and it is appended only after the PASS
+      // row (never an alert before its durable fact).
+      for (const harness of [absent, posted, throwing]) {
+        expect(passOf(harness)).toBeTruthy();
+        expect(escalationOf(harness)).toBeTruthy();
+      }
+      expect(escalationOf(absent)?.['status']).toBe('not-configured');
+      expect(escalationOf(posted)?.['status']).toBe('posted');
       expect(posted.escalations.filter((line) => line.includes('review/fix routing cleared'))).toHaveLength(1);
-      expect(passOf(throwing)?.['escalation']).toBe('failed');
+      expect(escalationOf(throwing)?.['status']).toBe('failed');
       expect(throwing.escalations.some((line) => line.includes('review/fix routing cleared'))).toBe(false);
       expect(passOf(throwing)?.['clearToMerge']).toBe(true);
+      const events = harnessEvents(absent);
+      const passSeq = events.find((event) => event.kind === 'job.fallback-review' && (event.payload as Record<string, unknown>)['phase'] === 'pass')?.seq;
+      const escalationSeq = events.find((event) => event.kind === 'job.fallback-review' && (event.payload as Record<string, unknown>)['phase'] === 'escalation')?.seq;
+      expect(passSeq).toBeDefined();
+      expect(escalationSeq).toBeDefined();
+      expect(passSeq!).toBeLessThan(escalationSeq!);
     } finally {
       for (const harness of [absent, posted, throwing]) cleanupGate(harness);
     }

@@ -232,11 +232,12 @@ authorizes its full completion cycle, and YOU own driving it:
    commissions them: a worker-reported nested-admission capability gap (a
    reviewer dispatch that cannot be admitted while its lane holds its
    slot) is a scheduling gate — schedule around it under the configured
-   worker limits, dispatch the lane's recorded next-action review
-   commission once the lane's turn has settled (the reviewer's own
-   submission is what triggers the demand-driven reclamation of a safe
-   idle resident — never wait for a pre-freed permit), reconcile any
-   uncertain submitted dispatch by its job identity before dispatching a
+   worker limits, ensure the lane's reviewer dispatches are submitted
+   once the lane's turn has settled (the reviewer's own submission is
+   what triggers the demand-driven reclamation of a safe idle resident —
+   never wait for a pre-freed permit; when a worker reports it cannot
+   submit, dispatch the reviewer yourself), reconcile any uncertain
+   submitted dispatch by its job identity before dispatching a
    replacement (a queued or working row is left to admit; a blocked row
    is a failed attempt to repair or escalate, never one to wait on), do
    not advance the lane past its recorded review
@@ -246,7 +247,10 @@ authorizes its full completion cycle, and YOU own driving it:
    Perkins pre-flight failure routes the review to the installed
    bmad-review fallback gate, that host-routed gate is the review gate of
    record for routing and fixes — it is the gate, never a duplicate review;
-   its PASS is never a Perkins READY.
+   its PASS is never a Perkins READY. A fallback PASS escalation recorded
+   as failed has no posted notice: re-post it during reconciliation
+   (deduplicated — only when no later posted outcome exists for that job)
+   and never treat the failure record as the notice.
 3. Schedule verification through the shipped capture helper — never a
    hand-rolled background watcher. The helper path is named in your wake
    prompt ("Verification capture helper"):

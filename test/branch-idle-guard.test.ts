@@ -389,6 +389,7 @@ function jobRecord(id: string, status: JobStatus): JobRecord {
     prUrl: null,
     note: null,
     briefing: 'b',
+    deliverable: null,
     createdAt: '2026-09-23T00:00:00.000Z',
     updatedAt: '2026-09-23T00:00:00.000Z',
   };

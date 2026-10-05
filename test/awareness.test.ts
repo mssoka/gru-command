@@ -203,12 +203,30 @@ describe('gru awareness — passive injection', () => {
     });
     const block = rig.awareness.prepare();
     expect(block?.text).toContain('job j1: bmad-review round 2 — 3 blocker(s), 1 note(s)');
-    // Escalation truth (native r7): a LEGACY pass event without the field is
-    // unrecorded — it must never be rendered as "no notifier configured".
-    expect(block?.text).toContain('job j1: bmad-review PASS — review/fix routing cleared (missing Perkins gate escalation unrecorded (legacy event); merge stays user-held)');
+    // Escalation truth (rounds 1-2): a PASS event without an inline
+    // outcome renders the neutral routing fact — never "no notifier
+    // configured"; the split escalation event carries the outcome.
+    expect(block?.text).toContain('job j1: bmad-review PASS — review/fix routing cleared (missing Perkins gate; merge stays user-held)');
     // The fallback PASS never reports merge clearance (native r3 alignment).
     expect(block?.text).not.toContain('clear to merge');
     expect(block?.text).toContain('round j1-r1: Perkins NEEDS CHANGES — 2 blocker(s) (proof complete)');
+  });
+
+  it('renders the split escalation event and its re-post obligation on failure', () => {
+    const rig = boot();
+    rig.api.appendCustomEvent({
+      kind: 'job.fallback-review',
+      jobId: 'j1',
+      payload: { gate: true, phase: 'pass', iteration: 1, notes: 0, clearToMerge: true },
+    });
+    rig.api.appendCustomEvent({
+      kind: 'job.fallback-review',
+      jobId: 'j1',
+      payload: { gate: true, phase: 'escalation', iteration: 1, status: 'failed' },
+    });
+    const block = rig.awareness.prepare();
+    expect(block?.text).toContain('job j1: bmad-review PASS — review/fix routing cleared (missing Perkins gate; merge stays user-held)');
+    expect(block?.text).toContain('job j1: missing Perkins gate escalation FAILED — re-post it (deduplicated; no later posted outcome)');
   });
 
   it('renders the recorded escalation outcome (posted / failed / not-configured)', () => {

@@ -2513,10 +2513,13 @@ export class WaveRunner {
       fallbackEvent({ phase: 'triaged', iteration, blockers, notes, reportFile });
       if (blockers === 0) {
         state.clearToMerge = true;
-        // Escalation truth (native r7): record what actually happened AFTER
-        // the notifier attempt — a configured notifier that throws is a
-        // failed escalation, not a posted one; absent configuration is its
-        // own state; a legacy event without this field stays unrecorded.
+        // Ordering + escalation truth (bmad-review rounds 1-2): the PASS
+        // fact is appended FIRST — it is true regardless of notification —
+        // and the escalation attempt follows with its own durable outcome
+        // event. A notification-triggered observer can therefore never see
+        // an alert without the PASS row, and a throwing notifier leaves a
+        // recorded re-post obligation instead of a false success claim.
+        fallbackEvent({ phase: 'pass', iteration, notes, reportFile, clearToMerge: true, merge: 'user-held' });
         let escalation: 'posted' | 'failed' | 'not-configured' = 'not-configured';
         if (this.opts.escalate !== undefined) {
           try {
@@ -2534,7 +2537,7 @@ export class WaveRunner {
             });
           }
         }
-        fallbackEvent({ phase: 'pass', iteration, notes, reportFile, clearToMerge: true, merge: 'user-held', escalation });
+        fallbackEvent({ phase: 'escalation', iteration, status: escalation });
         return;
       }
       if (iteration === maxRounds) break;

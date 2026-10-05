@@ -109,6 +109,11 @@ export const DEFAULT_LENSES = [
   'operations',
 ] as const;
 
+/** What a job owes on completion (owner ruling 2026-10-04): a PR, review
+ * findings, an artifact, or an investigation handback. `null` = legacy
+ * rows, treated as `'pr'` for the PR-overdue digest. */
+export type JobDeliverable = 'pr' | 'review' | 'artifact' | 'investigation';
+
 export interface JobRecord {
   readonly id: string;
   readonly repo: string;
@@ -121,6 +126,8 @@ export interface JobRecord {
    * IMMUTABLE history: canonical amendments are appended separately and
    * rendered into the effective acceptance at review freeze. */
   readonly briefing: string | null;
+  /** The deliverable kind (E15). `null` = legacy row, treated as `'pr'`. */
+  readonly deliverable: JobDeliverable | null;
   readonly createdAt: string;
   readonly updatedAt: string;
 }
@@ -833,6 +840,7 @@ export class LedgerApi {
     title: string;
     baseBranch?: string | null;
     briefing?: string | null;
+    deliverable?: JobDeliverable | null;
   }): JobRecord {
     if (input.id === '' || input.repo === '' || input.title === '') {
       throw new Error('job id, repo, and title must be non-empty');
@@ -845,10 +853,13 @@ export class LedgerApi {
       const ts = nowIso();
       this.db
         .prepare(
-          `INSERT INTO jobs (id, repo, title, status, base_branch, pr_url, note, briefing, created_at, updated_at)
-           VALUES (?, ?, ?, 'dispatched', ?, NULL, NULL, ?, ?, ?)`,
+          `INSERT INTO jobs (id, repo, title, status, base_branch, pr_url, note, briefing, deliverable, created_at, updated_at)
+           VALUES (?, ?, ?, 'dispatched', ?, NULL, NULL, ?, ?, ?, ?)`,
         )
-        .run(input.id, input.repo, input.title, input.baseBranch ?? null, input.briefing ?? null, ts, ts);
+        .run(
+          input.id, input.repo, input.title, input.baseBranch ?? null, input.briefing ?? null,
+          input.deliverable ?? null, ts, ts,
+        );
       this.appendEvent({ kind: 'job.created', jobId: input.id, payload: { repo: input.repo, title: input.title } });
       return this.getJob(input.id) as JobRecord;
     });
@@ -2802,6 +2813,7 @@ export class LedgerApi {
       prUrl: nstr(row.pr_url),
       note: nstr(row.note),
       briefing: nstr(row.briefing),
+      deliverable: nstr(row.deliverable) as JobDeliverable | null,
       createdAt: str(row.created_at),
       updatedAt: str(row.updated_at),
     };

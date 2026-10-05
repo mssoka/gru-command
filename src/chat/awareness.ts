@@ -270,10 +270,11 @@ const DIGEST_RULES: Readonly<Record<string, (event: EventRecord) => string | nul
         return `job ${event.jobId ?? '?'}: fix directive${payload.delivered === false ? ' NOT delivered' : ' delivered'} (${blockers} blocker(s))`;
       }
       case 'pass': {
-        // Escalation truth (native r7): the recorded escalation outcome is a
-        // fact — posted, failed (the notifier threw), not-configured, or
-        // unrecorded for legacy events that predate the field. Never infer
-        // "no notifier configured" from a legacy absence.
+        // Escalation truth: the outcome lives on its own `escalation` event
+        // (recorded after the attempt), so the PASS line only reports the
+        // routing fact. Legacy events that predate the split carry the
+        // outcome inline — never infer "no notifier configured" from a
+        // legacy absence.
         const escalation = payload.escalation;
         const suffix =
           escalation === 'posted'
@@ -282,8 +283,18 @@ const DIGEST_RULES: Readonly<Record<string, (event: EventRecord) => string | nul
               ? 'missing Perkins gate escalation FAILED; merge stays user-held'
               : escalation === 'not-configured'
                 ? 'missing Perkins gate NOT escalated — no escalation notifier configured; merge stays user-held'
-                : 'missing Perkins gate escalation unrecorded (legacy event); merge stays user-held';
+                : escalation === undefined
+                  ? 'missing Perkins gate; merge stays user-held'
+                  : 'missing Perkins gate escalation unrecorded (legacy event); merge stays user-held';
         return `job ${event.jobId ?? '?'}: bmad-review PASS — review/fix routing cleared (${suffix})`;
+      }
+      case 'escalation': {
+        const status = textOf(payload.status);
+        return status === 'posted'
+          ? `job ${event.jobId ?? '?'}: missing Perkins gate escalation posted`
+          : status === 'failed'
+            ? `job ${event.jobId ?? '?'}: missing Perkins gate escalation FAILED — re-post it (deduplicated; no later posted outcome)`
+            : `job ${event.jobId ?? '?'}: missing Perkins gate escalation not configured`;
       }
       case 'blocked':
         return `job ${event.jobId ?? '?'}: bmad-review BLOCKED${textOf(payload.reason) !== null ? ` — ${textOf(payload.reason)!}` : ''}`;

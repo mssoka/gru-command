@@ -90,7 +90,10 @@ enforced tool restriction: the tracked reviewer runs the ordinary worker
 session, so treat any write by a reviewer as a contract violation and
 confirm the reviewed head is unchanged when you collect its findings. Commission them with the service's authenticated local
 API: read the `[auth]` token from the service's instance config and send
-it as an `Authorization: Bearer` header — never echo or copy the token. A
+it as an `Authorization: Bearer` header — never echo or copy the token.
+Mark each reviewer dispatch with `"deliverable": "review"` in the request
+body so the ops digest treats the reviewer's findings handback as the
+deliverable it is, never as a missing PR. A
 dispatch you submitted is an accepted action: before re-commissioning
 after a lost turn or a restart, reconcile it by job identity so a slow
 admission cannot create a duplicate reviewer. A commissioned review is
@@ -124,14 +127,17 @@ a queued or working attempt is left to admit; a row the service marked
 blocked (a worktree, turn, or spawn failure after the row was written)
 is a failed attempt to repair or escalate, never a lane to wait on; and
 an absent row is an unresolved submission for the operations layer, not
-proof of absence. When a
-resident slot cannot free while your turn stays open, state the review
-commission as this lane's explicit next action in your handback so it is
-dispatched once your turn has settled; the operations layer schedules the
-review under the configured limits — the submission itself is what
-triggers the demand-driven reclamation of a safe idle resident, so never
-wait for a pre-freed permit, and ending your turn does not by itself
-re-arm the commission. If the service
+proof of absence. Never yield with an unsubmitted review
+commission: submit the dispatch with the bounded wait — the service
+writes the reviewer's durable job row before admission, so an accepted
+row is the commission's machine-visible identity and the demand-driven
+reclaim admits it once a slot frees; a handback note alone is never the
+commission. The operations layer reconciles that accepted row (and
+dispatches the reviewer itself when the worker reports it cannot submit);
+never wait for a pre-freed permit. If the dispatch cannot be made at all
+(the service refuses or is unreachable), stop loudly with the exact
+capability gap; the operations layer schedules the review under the
+configured limits. If the service
 dispatch cannot create a fresh tracked reviewer at all, stop and report
 that exact capability gap loudly; an inline self-review is not a
 substitute. If the project has no

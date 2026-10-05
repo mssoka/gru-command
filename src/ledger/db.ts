@@ -592,4 +592,13 @@ export const MIGRATIONS: readonly Migration[] = [
         WHERE idempotency_key IS NOT NULL;
     `,
   },
+  {
+    // Deliverable kind (owner directive 2026-10-04: no deferred jobs):
+    // implementation lanes owe a PR; review jobs owe findings; artifact
+    // and investigation jobs owe a verified handback. The Silas digest
+    // uses this to stop classifying non-PR deliverables as PR-overdue.
+    id: 15,
+    name: 'e15-job-deliverable',
+    sql: `ALTER TABLE jobs ADD COLUMN deliverable TEXT;`,
+  },
 ];

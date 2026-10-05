@@ -358,6 +358,47 @@ describe('dispatch server (E8)', () => {
     }
   });
 
+  it('validates the optional deliverable kind and persists it (E15 carve-out input)', async () => {
+    const h = await boot();
+    const repo = makeFixtureRepo('fixture-http-deliverable');
+    cleanupRepos.push(repo);
+    try {
+      const res = await call(
+        h.port,
+        'POST',
+        '/api/dispatch',
+        {
+          job_id: 'http-review-job',
+          repo_path: repo.path,
+          title: 'read-only review',
+          briefing: 'read-only review brief',
+          deliverable: 'review',
+        },
+        TOKEN,
+      );
+      expect(res.status).toBe(202);
+      expect(h.ledger.getJob('http-review-job')?.deliverable).toBe('review');
+      const bogus = await call(
+        h.port,
+        'POST',
+        '/api/dispatch',
+        {
+          job_id: 'http-bogus-deliverable',
+          repo_path: repo.path,
+          title: 'bogus',
+          briefing: 'b',
+          deliverable: 'merge',
+        },
+        TOKEN,
+      );
+      expect(bogus.status).toBe(400);
+      // A rejected dispatch creates nothing — no silent default.
+      expect(h.ledger.getJob('http-bogus-deliverable')).toBeNull();
+    } finally {
+      await h.close();
+    }
+  });
+
   it('dispatches a marked completion phase: the intent is durable before the turn, the response still 202s', async () => {
     const h = await boot();
     const repo = makeFixtureRepo('fixture-http-handoff');

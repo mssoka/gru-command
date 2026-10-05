@@ -275,10 +275,10 @@ Full branch diff from `origin/main` 28c3dd2b; four fresh `openai-codex/gpt-6-sol
 
 - [x] [Review][Patch] Reconcile a blocked review-job row rather than leaving it to admit [roles/minion.md:114-123; src/dispatch/service.ts:127-159,409-416] — **medium** (edge-case-hunter) — fixed: the worker prompt now requires reading the row's status and failure evidence (queued/working = left to admit; blocked = a failed attempt to repair or escalate, never a lane to wait on; absent = ops reconciliation, never a blind re-POST), with the same distinction added to the silas and ops-dispatch surfaces and pinned at the source, installed, and staged seams.
 - [x] [Review][Patch] Attribute baseline RED to each intended prompt assertion [`.gru-command/worktree.toml:351`] — **low** (blind-hunter) — fixed: each overlaid oracle is now bound to its expected failing test title (roles-installed-playbook: “installed worker prompt carries the BMAD workflow playbook”; roles-definitions: “pins the task-relevant BMAD workflow playbook on the worker prompt”; roles-gru: “plan-before-heist standing orders”; silas-driver: “loads both shipped skills from repo resources”), so an unrelated suite failure cannot satisfy the four-oracle claim; setup/build/green exits keep their distinct codes.
-- [x] [Review][Defer] Reviewer/artifact jobs appear as PR-overdue deliveries [src/dispatch/silas-driver.ts:509-522; resources/silas-skills/ops-dispatch/SKILL.md:97-119] — **medium** (blind-hunter). Pre-existing missing deliverable-kind carve-out, already named in `docs/FLOW.md` §4f and #160/#162/#163: a delivered read-only reviewer job with no PR is listed under `deliveredWithoutPr`, where ops searches for a PR and may escalate unnecessarily. New reviewer use increases exposure, but the predicate is unchanged by this PR; a durable kind/relationship is future runtime work, not part of this playbook-only lane.
-- [x] [Review][Defer] Review-commission re-arm lacks a structured digest row [roles/minion.md:123-135; src/dispatch/silas-driver.ts:425-548] — **medium** (blind-hunter). Known round-one decision: ops now must not advance past the recorded commission, but automated discovery/re-arm from the handback remains unenforced until board next-action truth is implemented. Pre-existing policy-vs-runtime gap, not a fresh promise of machine enforcement at this head.
-- [x] [Review][Defer] Failed fallback PASS notification has no owned retry [src/dispatch/perkins.ts:2515-2540; docs/FLOW.md:482-490] — **medium** (blind-hunter). Previously adjudicated round-one gap, now explicitly documented as policy-only; notifier failure remains truthful in the event and digest but no automatic deduplicated retry exists. No new runtime/outcome subsystem authorized in this PR.
-- [x] [Review][Defer] PASS notification precedes durable PASS event [src/dispatch/perkins.ts:2520-2538; src/notifications/center.ts:116-140] — **medium** (blind-hunter). Previously adjudicated round-one visibility gap, documented in `docs/FLOW.md` §4f: synchronous notification observers may see the earlier `triaged` phase. Recording posted success before the callback would reintroduce r7's false claim; an attempt/outcome sequence is future runtime work.
+- [x] [Review][Resolved, implemented] Reviewer/artifact jobs appear as PR-overdue deliveries [src/dispatch/silas-driver.ts:509-522; resources/silas-skills/ops-dispatch/SKILL.md:97-119] — **medium** (blind-hunter) — fixed (owner directive: no deferral): E15 adds `jobs.deliverable` (migration `e15-job-deliverable`), the dispatch API validates `deliverable: pr|review|artifact|investigation`, reviewer dispatches carry `deliverable: "review"` (prompt + pins), and the digest no longer lists delivered review/artifact/investigation jobs as PR-overdue. `docs/FLOW.md` §4f updated truthfully.
+- [x] [Review][Resolved, implemented] Review-commission re-arm lacks a structured digest row [roles/minion.md:123-135; src/dispatch/silas-driver.ts:425-548] — **medium** (blind-hunter) — fixed: the worker prompt now forbids yielding with an unsubmitted review commission — the dispatch's durable job row (written before admission) is the commission's machine-visible identity, admitted by the demand-driven reclaim — and ops dispatches the reviewer itself when a worker reports it cannot submit; no handback-note-only commission, with source/installed/staged pins.
+- [x] [Review][Resolved, implemented] Failed fallback PASS notification has no owned retry [src/dispatch/perkins.ts:2515-2540; docs/FLOW.md:482-490] — **medium** (blind-hunter) — fixed: the notifier's outcome is its own durable `escalation` event (posted/failed/not-configured); a failed outcome renders a deduplicated re-post obligation in the awareness digest and the ops skill (`re-post it during reconciliation — only when no later posted outcome exists for that job`).
+- [x] [Review][Resolved, implemented] PASS notification precedes durable PASS event [src/dispatch/perkins.ts:2520-2538; src/notifications/center.ts:116-140] — **medium** (blind-hunter) — fixed: the durable PASS row is appended before the notifier attempt and the outcome is appended after it, so a notification-triggered observer can never see an alert without the routing fact; ordering is asserted by ledger sequence in the fallback-path test.
 
 #### Rejected (individual verdicts)
 
@@ -930,6 +930,19 @@ bad_spec).
   on the head remains the authoritative full gate and the native
   clearance formality is unavailable by the owner's choice; the merge
   stays owner-held.
+
+- Deferral closure (owner directive 2026-10-04, "no job should be
+  deferred"): all four round-2 runtime gaps implemented instead of
+  carried. E15 `jobs.deliverable` (migration + validated dispatch field +
+  digest carve-out + reviewer dispatches marked `deliverable: "review"`);
+  never yield with an unsubmitted review commission (the dispatch's
+  durable job row — written before admission — is the commission's
+  machine-visible identity; ops submits when the worker reports it
+  cannot); fallback escalation outcome as its own durable `escalation`
+  event with a deduplicated re-post obligation on failure; the PASS row
+  ordered before the notifier attempt. `docs/FLOW.md` §4f and the
+  deferred-work record updated truthfully; no deferred item remains for
+  this lane.
 
 - Independent `bmad-code-review` round 2 on the `e89cac7` head (same
   multiplexer router, four fresh `openai-codex/gpt-6-sol` layers; report

@@ -502,8 +502,16 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       deliveredTargetSha(delivered) !== null && deliveredTargetSha(delivered) === newestRound.targetRef &&
       !(answeringRequest !== null && answeringRequest.seq > (abortProof?.seq ?? 0));
 
-    // (1) Delivered, no PR yet.
-    if (delivered !== null && job.prUrl === null && rounds.length === 0) {
+    // (1) Delivered, no PR yet. Only PR-owing lanes (E15 deliverable
+    // null/'pr') belong here: a delivered review/artifact/investigation
+    // job completes at its handback, so flagging it as PR-overdue would
+    // manufacture ops work and false missing-PR alarms.
+    if (
+      delivered !== null &&
+      job.prUrl === null &&
+      rounds.length === 0 &&
+      (job.deliverable === null || job.deliverable === 'pr')
+    ) {
       const lane = (input.worktrees?.listWorktrees({ jobId: job.id }) ?? []).find((candidate) => candidate.kind === 'job');
       const minion = input.ledger
         .listAgents()

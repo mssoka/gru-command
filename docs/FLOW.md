@@ -464,16 +464,16 @@ rewritten). A failed attempt during an owned repair does not destroy the
 undertaking.
 
 **Policy vs implemented.** These obligations ship in the installed
-playbook, but the runtime does not yet enforce all of them. Still
-missing in code: the stalled/PR-overdue predicates do not carry
-deliverable-kind carve-outs for artifact-only jobs; and current-phase
-delivery is not distinct from historical `job.delivered` events
-(`stalledWorking` still keys on the absence of any historical delivery).
-Those gaps, plus board cadence/next-action truth, are tracked in
-mssoka/gru-command issues #160 (delivery truth), #162 (current-phase
-stalled detection), and #163 (bounded reconciliation while a model turn
-is open); artifact-job classification and board timing are named there as
-further separate concerns. The outcome/phase machinery itself is
+playbook, and the deliverable kind is now recorded (E15): reviewer,
+artifact and investigation dispatches carry `deliverable` and their
+handbacks are no longer classified as PR-overdue by the Silas digest.
+Still missing in code: current-phase delivery is not distinct from
+historical `job.delivered` events (`stalledWorking` still keys on the
+absence of any historical delivery), and board cadence/next-action truth
+is unenforced. Those gaps are tracked in mssoka/gru-command issues #160
+(delivery truth), #162 (current-phase stalled detection), and #163
+(bounded reconciliation while a model turn is open); board timing is
+named there as a further separate concern. The outcome/phase machinery itself is
 `durable-blocked-followthrough` (PR #136, **merged into main**): durable
 directive intent, request-id idempotency with single-writer refusal,
 marked phase handoffs with correlated completion, per-turn terminal
@@ -481,11 +481,11 @@ outcome validation (`src/runtime/prompt-verdict.ts`), and boot
 reconciliation. That is the mechanism to extend — do not build a parallel
 outcome system. `/api/verify` single-flight admission/re-arm with the
 exclusive-capture helper (#159) has since shipped (PR #192).
-Fallback-PASS escalation follow-through is likewise policy-only: the pass
-event records a failed notifier truthfully, but no owned retry is
-scheduled for it, and the notifier posts before the pass event is
-appended, so a notification-triggered wake can observe the alert ahead of
-its durable event row. Nothing in this section claims the remaining
+Fallback-PASS escalation follow-through is recorded durably: the PASS row
+is appended before the notifier attempt, the attempt's outcome lands as a
+separate `escalation` event (posted / failed / not-configured), and a
+failed outcome surfaces a deduplicated re-post obligation in the digest
+(never an automatic retry). Nothing in this section claims the remaining
 runtime guarantees exist today.
 
 ## 5. Release (the sweep)
