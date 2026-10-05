@@ -703,10 +703,30 @@ describe('worktrees config (E8, manager lane)', () => {
 });
 
 describe('dispatch config (E8)', () => {
-  it('Bob runs hourly by default', () => {
+  it("Bob's consolidation knock ships disabled by default (the dream is the learning loop)", () => {
     const home = tmpHome();
     const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
-    expect(config.dispatch).toEqual({ bobIntervalMs: 3_600_000 });
+    expect(config.dispatch).toEqual({ bobIntervalMs: 0 });
+  });
+
+  it('an explicit bob_interval_ms is preserved verbatim', () => {
+    const home = tmpHome();
+    writeConfig(home, '[dispatch]\nbob_interval_ms = 900000\n');
+    expect(loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester').dispatch.bobIntervalMs).toBe(900_000);
+  });
+
+  it('intervals above Node\'s timer ceiling fail loud at the config boundary', () => {
+    for (const text of [
+      '[dispatch]\nbob_interval_ms = 2147483648\n',
+      '[lessons]\ndream_interval_ms = 3000000000\n',
+    ]) {
+      const home = tmpHome();
+      writeConfig(home, text);
+      expect(() => loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester'), text).toThrow(/timer ceiling/);
+    }
+    const home = tmpHome();
+    writeConfig(home, '[lessons]\ndream_interval_ms = 2147483647\n');
+    expect(loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester').lessons.dreamIntervalMs).toBe(2_147_483_647);
   });
 
   it('a disabled Bob trigger is legal; garbage is not', () => {

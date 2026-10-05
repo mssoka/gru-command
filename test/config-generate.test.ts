@@ -110,6 +110,10 @@ describe('config-generate CLI', () => {
     expect(loaded.dataDir).toBe(instance);
     expect(loaded.models.default).toBe('default');
     expect(loaded.thinking.default).toBe('default');
+    // Issue #221 headline default, pinned at the generator: a fresh install
+    // ships with Bob's knock disabled (restoring 3_600_000 must fail here).
+    expect((raw.dispatch as Record<string, number>).bob_interval_ms).toBe(0);
+    expect(loaded.dispatch.bobIntervalMs).toBe(0);
     expect(raw.concurrency).toMatchObject({ max_workers: 4 });
     expect(raw.review).toMatchObject({ max_concurrent_children: 2 });
     expect(loaded.concurrency.maxWorkers).toBe(4);
