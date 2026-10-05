@@ -281,3 +281,39 @@ the run's image-capable read tool):
   code head's receipt and states the exact relationship; the host scheduler
   `full` receipt at the frozen head is appended to this specification by the
   host because it is bound to that SHA.
+
+### r8 final-head verification — 2026-10-05
+
+- **First full at `c7d2f34` (load-class witness):** scheduler run
+  `b48b27c8-3b46-4898-98dd-a472532ffd73`, exit 1 — three failed files, all
+  real-service boot waits under co-tenant load (1785 backend tests passed):
+  lan-phone W5 and wake-e2e both died in `startRealService`'s fixed 20 s boot
+  deadline with the ledger-ready log inside the window and no `/health`
+  answer yet; worktrees-server ROUND ARM hit the 30 s per-test default while
+  creating a job worktree plus a detached review worktree. Complete capture
+  host-side: `verify-crew-heist-labels-final-c7d2f34-full-20261005T005317Z.ndjson`.
+- **Investigation:** all three are the co-tenant class `vitest.config.ts`
+  already documents (boot deadlines expiring with zero assertion failures).
+  The helper's single 20 s window was shared by the port-discovery and
+  `/health` polls, so a slow discovery starved the health wait outright.
+- **Repair at `cf4bb06` (test harness only):**
+  `test/helpers/real-service.mjs` gets `BOOT_DEADLINE_MS = 60 s` with
+  SEPARATE discovery and health deadlines — a wedged boot still fails loud
+  at the same budget; the booting tests/hooks (lan-phone `beforeAll`,
+  wake-e2e's three cases, worktrees-server ROUND ARM) get explicit 90 s
+  ceilings matching the repo's existing real-service precedent
+  (attachments 60–120 s, dispatch-server 90 s, perkins-builtin-wave
+  60–120 s) so the helper's loud deadline, never a vitest cut, is the
+  failure surface. No assertion, pool, or suite default changed;
+  suite-shape pins hold; focused rerun of the three files: 12/12 pass.
+- **Scheduler-backed full at exact clean head `cf4bb06` (GREEN):** run
+  `3a4178cd-1bdb-479d-9690-4d00cdce00c0`, exit 0, not timed out, duration
+  552 895 ms, `tracked_dirty: false`, output SHA-256
+  `4f37ca7a3df27871c9bee00355c6293552bed10c9b7a2c9523133da35f238fbb`.
+  Backend 106 files / 1792 tests passed (12 skipped, 4 files skipped);
+  web 43 files / 418 tests passed. Complete capture host-side:
+  `verify-crew-heist-labels-final-cf4bb06-full-20261005T0109Z.ndjson`.
+- **Exact-head CI:** `c7d2f34` is green in run `37084763772` (all steps);
+  the repair head's CI rides this documentation commit's push (structural
+  note stands: a commit cannot contain its own CI receipt — the PR's
+  merge-result run is the final-head receipt).
