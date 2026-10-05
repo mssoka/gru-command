@@ -21,7 +21,11 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  *      notifications plus a one-line-per-event digest of what happened on
  *      the ledger since the previous delivered block. The chat server
  *      prepends it to the prompt and calls `commit()` only after the prompt
- *      was accepted, so a failed delivery never eats context.
+ *      was accepted, so a failed delivery never eats context. The open
+ *      queues are sampled through a durable rotation offset (GH-109): each
+ *      passive block consumes one bounded page per queue, so a sustained
+ *      backlog deeper than the block still reaches the brain in bounded
+ *      cycles and a fresh cycle leads with the newest rows.
  *
  *   2. WAKE POLICY — `onBusEvent` watches notification events; with
  *      notify_wake = 'action-required' (the default since the owner ruling
@@ -63,7 +67,9 @@ export interface AwarenessLimits {
   readonly maxBytes: number;
   /** Hard character cap for every rendered line. */
   readonly maxLineChars: number;
-  /** Action-required notes per block (newest first, then oldest-first order). */
+  /** Action-required notes per block. A fresh rotation cycle leads with
+   * the newest rows; subsequent passive blocks rotate through the open
+   * queue (bounded fair coverage, GH-109). */
   readonly maxActionNotes: number;
 }
 
@@ -157,6 +163,12 @@ interface AwarenessState {
     readonly lastDeliveredAt: number | null;
     readonly lastOwnerAt?: number | null;
     readonly lastOwnerSeq?: number;
+  };
+  /** Passive queue rotation offsets (GH-109); absent in legacy state
+   * files, which start a fresh cycle at the newest rows. */
+  readonly attention?: {
+    readonly machineOffset: number;
+    readonly ownerOffset: number;
   };
 }
 
@@ -318,6 +330,13 @@ export class GruAwareness {
   private readonly onFollowUpPosted: (row: NotificationRecord) => void;
   private readonly now: () => number;
   private cursor: number;
+  /** Per-queue rotation offsets for passive blocks (GH-109): durable so a
+   * restart resumes the coverage cycle instead of replaying the newest
+   * page forever. */
+  private attentionRotation: { machine: number; owner: number };
+  /** Rotation advance computed by the last prepare() — applied only by
+   * commit(), so an undelivered block re-prepares unchanged. */
+  private pendingRotationAdvance: { readonly machine: number; readonly owner: number } | null = null;
   /** Epoch ms of the last delivered block (legacy state compatibility). */
   private lastDeliveredAt: number | null;
   /** Only an owner-directed user turn advances the morning boundary. */
@@ -347,6 +366,10 @@ export class GruAwareness {
     this.now = opts.now ?? (() => Date.now());
     const state = GruAwareness.loadState(this.file);
     this.cursor = state.coveredThroughSeq;
+    this.attentionRotation = {
+      machine: state.attention?.machineOffset ?? 0,
+      owner: state.attention?.ownerOffset ?? 0,
+    };
     this.lastDeliveredAt = state.digest?.lastDeliveredAt ?? null;
     this.lastOwnerAt = state.digest?.lastOwnerAt !== undefined ? state.digest.lastOwnerAt : this.lastDeliveredAt;
     this.lastOwnerSeq = state.digest?.lastOwnerSeq ?? state.coveredThroughSeq;
@@ -453,6 +476,26 @@ export class GruAwareness {
         ...(ownerSeq !== undefined ? { lastOwnerSeq: ownerSeq as number } : {}),
       };
     }
+    const attentionRecord = record['attention'];
+    let attention: AwarenessState['attention'];
+    if (attentionRecord !== undefined) {
+      if (typeof attentionRecord !== 'object' || attentionRecord === null || Array.isArray(attentionRecord)) {
+        throw new Error(
+          `gru awareness state ${file} has an invalid attention section; ` +
+            'refusing to guess — inspect or remove the file (a fresh cursor starts at the beginning)',
+        );
+      }
+      const offsets = attentionRecord as Record<string, unknown>;
+      const validOffset = (value: unknown): value is number =>
+        typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+      if (!validOffset(offsets['machineOffset']) || !validOffset(offsets['ownerOffset'])) {
+        throw new Error(
+          `gru awareness state ${file} has an invalid attention section; ` +
+            'refusing to guess — inspect or remove the file (a fresh cursor starts at the beginning)',
+        );
+      }
+      attention = { machineOffset: offsets['machineOffset'] as number, ownerOffset: offsets['ownerOffset'] as number };
+    }
     // v1 claimed IDs before the model turn. Its woken set cannot prove
     // receipt (a failed spawn may have stranded a live alert). Prefer one
     // extra wake to losing an unresolved machine incident on upgrade.
@@ -463,7 +506,8 @@ export class GruAwareness {
       lastAttemptAt: version === 2 && typeof lastAttemptAt === 'number' ? lastAttemptAt : null,
       ...(pending !== undefined ? { pending: pending as string[] } : {}),
       ...(followUp !== undefined ? { followUp: followUp as { id: string; dueAtMs: number }[] } : {}),
-    }, ...(digest !== undefined ? { digest } : {}) };
+    }, ...(digest !== undefined ? { digest } : {}),
+    ...(attention !== undefined ? { attention } : {}) };
   }
 
   /** Attach the wake action once the chat server exists (late-bound).
@@ -497,33 +541,41 @@ export class GruAwareness {
     // rows bound through an agent to a merged/done job are the board's
     // receipts. They are LABELED here and rendered under their own
     // section, never counted as machine attention and never wake seeds.
+    let rotationAdvance: { machine: number; owner: number } | null = null;
     const attention = (() => {
       if (exclusiveWake) return { live: [] as NotificationRecord[], receipts: [] as NotificationRecord[] };
-      const owners = this.ledger.listNotifications({ routing: 'needs-owner', unackedOnly: true, limit: this.limits.maxActionNotes });
-      const machineRows = this.ledger.listNotifications({
-        routing: 'action-required',
-        unackedOnly: true,
-        // Overfetch so receipts cannot crowd live rows out of the page;
-        // each side is then sliced to the block's bounded slots.
-        limit: Math.max(this.limits.maxActionNotes * 4, 16),
-      });
-      const { receipts, live } = this.classifyNotifications(machineRows);
-      const receiptRows = machineRows
-        .filter((row) => receipts.has(row.id))
-        .slice(0, this.limits.maxActionNotes);
+      const owners = this.rotatedOwnerQueue();
+      const machine = this.rotatedMachineQueue();
       // Keep both queues represented in a bounded user block. One busy
       // category must not silently crowd out the other indefinitely.
-      const ownerSlots = live.length > 0 && this.limits.maxActionNotes > 1
+      const ownerSlots = machine.live.length > 0 && this.limits.maxActionNotes > 1
         ? Math.ceil(this.limits.maxActionNotes / 2) : this.limits.maxActionNotes;
-      const selectedOwners = owners.slice(0, ownerSlots);
+      const selectedOwners = owners.rows.slice(0, ownerSlots);
+      rotationAdvance = { machine: machine.nextOffset, owner: owners.nextOffset };
       return {
-        live: [...selectedOwners, ...live.slice(0, this.limits.maxActionNotes - selectedOwners.length),
-          ...owners.slice(ownerSlots, this.limits.maxActionNotes)],
-        receipts: receiptRows,
+        live: [...selectedOwners, ...machine.live.slice(0, this.limits.maxActionNotes - selectedOwners.length),
+          ...owners.rows.slice(ownerSlots, this.limits.maxActionNotes)],
+        receipts: machine.receiptRows,
       };
     })();
+    // prepare stays read-only (the same block returns until delivery): the
+    // offsets advance at commit, so an undelivered block re-prepares
+    // unchanged, and a wake's exclusive block discards any stale advance
+    // with the passive block it displaced.
+    this.pendingRotationAdvance = exclusiveWake ? null : rotationAdvance;
     const openAttention = attention.live;
-    if (latest <= this.cursor && this.pendingWakeIds.size === 0 && morning === null && openAttention.length === 0) return null;
+    if (latest <= this.cursor && this.pendingWakeIds.size === 0 && morning === null && openAttention.length === 0) {
+      // A page holding only closed receipts renders nothing (null block,
+      // never delivered), but the rotation must still move past it (GH-109):
+      // advancing only at commit would wedge the offset behind the receipt
+      // tail forever. Advance in memory so the next prepare() reaches the
+      // live rows; the next delivered block persists it.
+      if (!exclusiveWake && rotationAdvance !== null) {
+        this.attentionRotation = { ...rotationAdvance };
+        this.pendingRotationAdvance = null;
+      }
+      return null;
+    }
 
     const reverse = <T>(items: readonly T[]): T[] => [...items].reverse();
     // Overfetch, then keep the newest maxEvents DIGESTIBLE lines: derived
@@ -622,9 +674,14 @@ export class GruAwareness {
     return { text: rendered.text, coveredThroughSeq: latest, notificationIds: rendered.ids };
   }
 
-  /** Commit a delivered block: advance the event cursor. Only a user chat
-   * turn advances the independent owner watermark used by the morning digest. */
+  /** Commit a delivered block: advance the event cursor and the passive
+   * queue rotation (GH-109). Only a user chat turn advances the independent
+   * owner watermark used by the morning digest. */
   commit(injection: AwarenessInjection, source: 'chat' | 'wake' = 'chat'): void {
+    if (this.pendingRotationAdvance !== null) {
+      this.attentionRotation = { ...this.pendingRotationAdvance };
+      this.pendingRotationAdvance = null;
+    }
     this.cursor = Math.max(this.cursor, injection.coveredThroughSeq);
     this.lastDeliveredAt = this.now();
     if (source === 'chat') {
@@ -794,6 +851,59 @@ export class GruAwareness {
     return { text: parts.join('\n'), ids };
   }
 
+  /** Rotated open needs-owner page for a passive block (GH-109): sampling
+   * only the newest rows starved every older open row once the sustained
+   * queue outgrew the block. Each block consumes one bounded page starting
+   * at the queue's rotation offset; a short page is the queue tail, so the
+   * next cycle restarts at the newest rows. */
+  private rotatedOwnerQueue(): { readonly rows: readonly NotificationRecord[]; readonly nextOffset: number } {
+    const pageSize = this.limits.maxActionNotes;
+    const page = this.ledger.listNotifications({
+      routing: 'needs-owner', unackedOnly: true, limit: pageSize, offset: this.attentionRotation.owner,
+    });
+    return {
+      rows: page,
+      nextOffset: page.length < pageSize ? 0 : this.attentionRotation.owner + page.length,
+    };
+  }
+
+  /** Rotated open action-required page for a passive block (GH-109), split
+   * into live machine attention and this page's closed receipts (D1).
+   * Live slots advance past the receipts they skipped (last selected page
+   * position + 1), a full page holding only receipts is skipped in one
+   * step, and a short page wraps the cycle back to the newest rows — every
+   * open row reaches a passive block within a bounded number of blocks
+   * while the block itself stays bounded. */
+  private rotatedMachineQueue(): {
+    readonly live: readonly NotificationRecord[];
+    readonly receiptRows: readonly NotificationRecord[];
+    readonly nextOffset: number;
+  } {
+    const pageSize = this.limits.maxActionNotes;
+    // Overfetch so receipts cannot crowd live rows out of the page; each
+    // side is then sliced to the block's bounded slots.
+    const fetchLimit = Math.max(pageSize * 4, 16);
+    const page = this.ledger.listNotifications({
+      routing: 'action-required', unackedOnly: true, limit: fetchLimit, offset: this.attentionRotation.machine,
+    });
+    const { receipts, live } = this.classifyNotifications(page);
+    const liveSlots = live.slice(0, pageSize);
+    let nextOffset: number;
+    if (page.length < pageSize) {
+      nextOffset = 0; // tail consumed — the next cycle restarts at the newest rows
+    } else if (liveSlots.length === 0) {
+      nextOffset = this.attentionRotation.machine + page.length; // page of receipts: skip the wall
+    } else {
+      const lastTaken = liveSlots[liveSlots.length - 1]!;
+      nextOffset = this.attentionRotation.machine + page.indexOf(lastTaken) + 1;
+    }
+    return {
+      live: liveSlots,
+      receiptRows: page.filter((row) => receipts.has(row.id)).slice(0, pageSize),
+      nextOffset,
+    };
+  }
+
   /** "While you were away" digest (owner ruling 2026-09-23): the first
    * delivered block after a quiet gap summarises delivered wakes (fires), actions,
    * merges, and staged PRs from the ledger — the morning catch-up. Derived
@@ -837,6 +947,7 @@ export class GruAwareness {
       coveredThroughSeq: this.cursor,
       wake: { version: 2, ...this.wakePolicy.snapshot(), pending: [...this.pendingWakeIds] },
       digest: { lastDeliveredAt: this.lastDeliveredAt, lastOwnerAt: this.lastOwnerAt, lastOwnerSeq: this.lastOwnerSeq },
+      attention: { machineOffset: this.attentionRotation.machine, ownerOffset: this.attentionRotation.owner },
     };
     const staging = `${this.file}.tmp-${process.pid}-${randomUUID()}`;
     try {
