@@ -323,8 +323,15 @@ describe('pipeline ledger — evaluation, order and projection', () => {
     });
     ledger.setWorktreeStatus('lane-pipe-a', 'swept', 'spawn failed');
     expect(blocked()).toContain('waiting for pipe-a to be admitted');
-    // A registered worker agent (dispatch registers it only after a
-    // successful spawn) is real evidence and releases the dependent.
+    // A job-bound Perkins reviewer row is NOT a started worker (r2 B1).
+    ledger.registerAgent({ id: 'perkins_pipe_a', role: 'perkins', sessionFile: null, jobId: 'pipe-a' });
+    expect(blocked()).toContain('waiting for pipe-a to be admitted');
+    // A child identity (parented, pre-spawn) is NOT a started worker.
+    ledger.registerAgent({ id: 'parent-1', role: 'minion', sessionFile: null, parentage: 'top-level' });
+    ledger.registerAgent({ id: 'child_pipe_a', role: 'minion', sessionFile: null, jobId: 'pipe-a', parentAgentId: 'parent-1' });
+    expect(blocked()).toContain('waiting for pipe-a to be admitted');
+    // A TOP-LEVEL dispatch minion (registered only after a successful
+    // spawn) is real evidence and releases the dependent.
     ledger.registerAgent({ id: 'minion_pipe_a', role: 'minion', sessionFile: null, jobId: 'pipe-a', parentage: 'top-level' });
     expect(blocked()).toBeNull();
     db.close();

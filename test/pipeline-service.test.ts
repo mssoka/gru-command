@@ -487,17 +487,19 @@ describe('pipeline service — live recovery (Perkins r1 blockers 3-5)', () => {
       h.service.enqueue({ id: 'pipe-a', repoPath: '/tmp/demo', title: 'A', briefing: 'A' });
       await h.service.whenIdle();
       // The dispatch side effect committed the job; finalization failed.
-      // The port's own minion-spawned event is a genuine NATURAL trigger,
-      // so the retry runs immediately (superseding the timer): the entry
-      // is admitted exactly once, never left admitting, never duplicated.
+      // The claim is KEPT (its live worker holds the scopes) and recovery
+      // owns the retry — the port's own minion-spawned event is a natural
+      // trigger, so the binding retry runs immediately: admitted exactly
+      // once, never re-dispatched, never duplicated.
       expect(h.service.entry('pipe-a')?.state).toBe('admitted');
       expect(markCalls).toBe(2);
       const jobs = h.ledger.listJobs().filter((job) => job.id === 'pipe-a');
       expect(jobs).toHaveLength(1);
+      expect(h.calls).toHaveLength(1); // adopted, never re-dispatched
       // No further work is owed: advancing time changes nothing.
       await vi.advanceTimersByTimeAsync(30_000);
       expect(markCalls).toBe(2);
-      expect(h.calls).toHaveLength(2);
+      expect(h.calls).toHaveLength(1);
       h.db.close();
       real.db.close();
     } finally {
@@ -530,10 +532,11 @@ describe('pipeline service — live recovery (Perkins r1 blockers 3-5)', () => {
       const h = boot(undefined, { retryBackoffMs: 5_000, ledger: broken, bus: real.bus });
       h.service.enqueue({ id: 'pipe-a', repoPath: '/tmp/demo', title: 'A', briefing: 'A' });
       await h.service.whenIdle();
-      // One immediate retry via the port's natural job event; the entry is
-      // reconciled back to waiting, never left admitting.
+      // One immediate binding retry via the port's natural job event. The
+      // claim STAYS admitting (the live worker owns its exclusive scopes —
+      // Perkins r2 blocker 2), so nothing re-enters the executable queue.
       expect(markCalls).toBe(2);
-      expect(h.service.entry('pipe-a')?.state).toBe('waiting');
+      expect(h.service.entry('pipe-a')?.state).toBe('admitting');
       // Timed retries continue only while the bounded counter allows:
       // attempts stop after the fourth failed finalization (stand-down),
       // and NEVER spin.
@@ -541,7 +544,8 @@ describe('pipeline service — live recovery (Perkins r1 blockers 3-5)', () => {
       expect(markCalls).toBe(4);
       await vi.advanceTimersByTimeAsync(60_000);
       expect(markCalls).toBe(4);
-      expect(h.service.entry('pipe-a')?.state).toBe('waiting');
+      expect(h.service.entry('pipe-a')?.state).toBe('admitting');
+      expect(h.calls).toHaveLength(1); // never re-dispatched
       h.db.close();
       real.db.close();
     } finally {
@@ -583,5 +587,237 @@ describe('pipeline service — live recovery (Perkins r1 blockers 3-5)', () => {
     expect(h.calls.map((call) => call.jobId)).toEqual(['pipe-a']);
     expect(h.service.entry('pipe-a')?.state).toBe('admitted');
     h.db.close();
+  });
+});
+
+describe('pipeline service — r2 blocker repairs', () => {
+  it('keeps exclusive scope ownership while a dispatched worker is live (mark failure never requeues it)', async () => {
+    vi.useFakeTimers();
+    try {
+      const real = (() => {
+        const dir = mkdtempSync(join(tmpdir(), 'gru-pipeline-service-b2-'));
+        cleanupDirs.push(dir);
+        const db = new LedgerDb(dir);
+        const bus = new EventBus({});
+        return { db, bus, ledger: new LedgerApi(db.handle, { bus }) };
+      })();
+      let broken = true;
+      const flaky: LedgerApi = new Proxy(real.ledger, {
+        get(target, property, receiver) {
+          if (property === 'markPipelineAdmitted') {
+            return (input: Parameters<LedgerApi['markPipelineAdmitted']>[0]) => {
+              if (broken) throw new Error('transient bookkeeping failure');
+              return target.markPipelineAdmitted(input);
+            };
+          }
+          return Reflect.get(target, property, receiver);
+        },
+      });
+      const h = boot(undefined, { retryBackoffMs: 5_000, ledger: flaky, bus: real.bus });
+      h.service.enqueue({ id: 'pipe-a', repoPath: '/tmp/demo', title: 'A', briefing: 'A', exclusiveScopes: ['repo:demo'] });
+      h.service.enqueue({ id: 'pipe-b', repoPath: '/tmp/demo', title: 'B', briefing: 'B', priority: 1, exclusiveScopes: ['repo:demo'] });
+      await h.service.whenIdle();
+      // A's worker is live but its binding failed: A stays ADMITTING and
+      // keeps the scope — the higher-priority follower B must wait.
+      expect(h.service.entry('pipe-a')?.state).toBe('admitting');
+      const blocked = (): string | null =>
+        h.service.view().entries.find((entry) => entry.id === 'pipe-b')?.reason ?? null;
+      expect(blocked()).toContain('exclusive scope "repo:demo" held by pipe-a');
+      expect(h.calls.map((call) => call.jobId)).toEqual(['pipe-a']);
+      // Storage heals; the bounded retry binds A without an external event.
+      broken = false;
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(h.service.entry('pipe-a')?.state).toBe('admitted');
+      // The live admitted job still owns the scope until it terminates.
+      expect(blocked()).toContain('exclusive scope "repo:demo" held by pipe-a');
+      h.ledger.setJobStatus('pipe-a', 'working');
+      h.ledger.setJobStatus('pipe-a', 'delivered');
+      h.ledger.setJobStatus('pipe-a', 'in-review');
+      h.ledger.setJobStatus('pipe-a', 'merged');
+      h.service.schedule();
+      await h.service.whenIdle();
+      expect(h.service.entry('pipe-b')?.state).toBe('admitted');
+      expect(h.calls.map((call) => call.jobId)).toEqual(['pipe-a', 'pipe-b']);
+      h.db.close();
+      real.db.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('observes a background settlement rejection even when finalization fails (never exits the service)', async () => {
+    vi.useFakeTimers();
+    try {
+      const real = (() => {
+        const dir = mkdtempSync(join(tmpdir(), 'gru-pipeline-service-b3-'));
+        cleanupDirs.push(dir);
+        const db = new LedgerDb(dir);
+        const bus = new EventBus({});
+        return { db, bus, ledger: new LedgerApi(db.handle, { bus }) };
+      })();
+      let broken = true;
+      const flaky: LedgerApi = new Proxy(real.ledger, {
+        get(target, property, receiver) {
+          if (property === 'markPipelineAdmitted') {
+            return (input: Parameters<LedgerApi['markPipelineAdmitted']>[0]) => {
+              if (broken) throw new Error('transient bookkeeping failure');
+              return target.markPipelineAdmitted(input);
+            };
+          }
+          return Reflect.get(target, property, receiver);
+        },
+      });
+      const dir = mkdtempSync(join(tmpdir(), 'gru-pipeline-service-b3-port-'));
+      cleanupDirs.push(dir);
+      const port: PipelineDispatchPort = {
+        async dispatch(input) {
+          real.ledger.addJob({ id: input.jobId, repo: 'demo', title: input.title, briefing: input.briefing });
+          real.ledger.appendCustomEvent({ kind: 'job.minion-spawned', jobId: input.jobId, payload: {} });
+          return {
+            settled: new Promise((_, reject) => {
+              setTimeout(() => reject(new Error('background settlement failed')), 1_000);
+            }),
+          };
+        },
+      };
+      const service = new PipelineService({
+        ledger: flaky,
+        dispatch: port,
+        capacity: () => ({ capacity: 4, occupied: 0, queued: 0, available: 4 }),
+        retryBackoffMs: 5_000,
+        bus: real.bus,
+      });
+      liveServices.push(service);
+      service.enqueue({ id: 'pipe-a', repoPath: '/tmp/demo', title: 'A', briefing: 'A' });
+      await service.whenIdle();
+      expect(service.entry('pipe-a')?.state).toBe('admitting');
+      broken = false;
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(service.entry('pipe-a')?.state).toBe('admitted');
+      // The deferred settlement rejection fires AFTER finalization — an
+      // unobserved rejection would surface as an unhandled rejection and
+      // (in production) exit the service. The test passes only if watched.
+      await vi.advanceTimersByTimeAsync(5_000);
+      real.db.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('re-arms recovery while a claim stays unadvanced, and heals without any external event', async () => {
+    vi.useFakeTimers();
+    try {
+      const real = (() => {
+        const dir = mkdtempSync(join(tmpdir(), 'gru-pipeline-service-b4-'));
+        cleanupDirs.push(dir);
+        const db = new LedgerDb(dir);
+        const bus = new EventBus({});
+        return { db, bus, ledger: new LedgerApi(db.handle, { bus }) };
+      })();
+      let broken = true;
+      let markCalls = 0;
+      const flaky: LedgerApi = new Proxy(real.ledger, {
+        get(target, property, receiver) {
+          if (property === 'markPipelineAdmitted') {
+            return (input: Parameters<LedgerApi['markPipelineAdmitted']>[0]) => {
+              markCalls += 1;
+              if (broken) throw new Error('persistent bookkeeping failure');
+              return target.markPipelineAdmitted(input);
+            };
+          }
+          return Reflect.get(target, property, receiver);
+        },
+      });
+      const h = boot(undefined, { retryBackoffMs: 5_000, ledger: flaky, bus: real.bus });
+      h.service.enqueue({ id: 'pipe-a', repoPath: '/tmp/demo', title: 'A', briefing: 'A' });
+      await h.service.whenIdle();
+      expect(h.service.entry('pipe-a')?.state).toBe('admitting');
+      expect(markCalls).toBeGreaterThanOrEqual(1);
+      // Bounded retries run while the storage is broken (never a tight
+      // loop), and the ladder still permits attempts...
+      await vi.advanceTimersByTimeAsync(5_000);
+      const during = markCalls;
+      expect(during).toBeGreaterThanOrEqual(2);
+      // ...storage heals with NO external event, and a bounded retry binds.
+      broken = false;
+      for (let i = 0; i < 4 && h.service.entry('pipe-a')?.state !== 'admitted'; i += 1) {
+        await vi.advanceTimersByTimeAsync(5_000);
+      }
+      expect(h.service.entry('pipe-a')?.state).toBe('admitted');
+      h.db.close();
+      real.db.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('surfaces an interrupted startup (job committed, no worker) through the blocked-obligation path before adopting', async () => {
+    const h = boot();
+    h.capacity = { capacity: 4, occupied: 4, queued: 0, available: 0 };
+    // Crash shape: the job row committed and moved to working, no worker
+    // ever registered — then the process restarted with the claim intact.
+    h.ledger.enqueuePipelineEntry({ id: 'pipe-crash', repoPath: '/tmp/demo', title: 'Crash', briefing: 'Crash brief' });
+    h.ledger.claimPipelineEntry({ id: 'pipe-crash', holder: 'silas-pipeline' });
+    h.ledger.addJob({ id: 'pipe-crash', repo: 'demo', title: 'Crash', briefing: 'Crash brief' });
+    h.ledger.setJobStatus('pipe-crash', 'working');
+    const report = h.service.reconcileAtBoot();
+    expect(report).toEqual({ examined: 1, adopted: 1, requeued: 0 });
+    expect(h.service.entry('pipe-crash')?.state).toBe('admitted');
+    // The job is blocked with a durable note and ONE machine card.
+    expect(h.ledger.getJob('pipe-crash')?.status).toBe('blocked');
+    expect(h.ledger.getJob('pipe-crash')?.note).toContain('no worker ever started');
+    const cards = h.ledger
+      .listNotifications()
+      .filter((row) => row.kind === 'pipeline.adopted-without-worker');
+    expect(cards).toHaveLength(1);
+    expect(cards[0]?.routing).toBe('action-required');
+    // Never re-dispatched.
+    expect(h.calls).toHaveLength(0);
+    h.db.close();
+  });
+
+  it('stands down the pass-failure ladder only after a FULLY successful pass (no invariant reset mid-pass)', async () => {
+    vi.useFakeTimers();
+    try {
+      const real = (() => {
+        const dir = mkdtempSync(join(tmpdir(), 'gru-pipeline-service-w2-'));
+        cleanupDirs.push(dir);
+        const db = new LedgerDb(dir);
+        const bus = new EventBus({});
+        return { db, bus, ledger: new LedgerApi(db.handle, { bus }) };
+      })();
+      let broken = true;
+      let claimCalls = 0;
+      const flaky: LedgerApi = new Proxy(real.ledger, {
+        get(target, property, receiver) {
+          if (property === 'claimPipelineEntry') {
+            return (input: Parameters<LedgerApi['claimPipelineEntry']>[0]) => {
+              claimCalls += 1;
+              if (broken) throw new Error('persistent claim-write failure');
+              return target.claimPipelineEntry(input);
+            };
+          }
+          return Reflect.get(target, property, receiver);
+        },
+      });
+      const h = boot(undefined, { retryBackoffMs: 5_000, ledger: flaky, bus: real.bus });
+      h.service.enqueue({ id: 'pipe-a', repoPath: '/tmp/demo', title: 'A', briefing: 'A' });
+      await h.service.whenIdle();
+      const afterFirst = claimCalls;
+      expect(afterFirst).toBe(1);
+      // Eight windows: the ladder stands down after four failed passes —
+      // a mid-pass reset would keep retrying forever.
+      for (let i = 0; i < 8; i += 1) await vi.advanceTimersByTimeAsync(5_000);
+      expect(claimCalls).toBe(4);
+      // Healing plus a natural trigger recovers.
+      broken = false;
+      h.service.schedule();
+      await h.service.whenIdle();
+      expect(h.service.entry('pipe-a')?.state).toBe('admitted');
+      h.db.close();
+      real.db.close();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

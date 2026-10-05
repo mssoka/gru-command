@@ -314,6 +314,34 @@ export class BoardView {
     return active.dataset.focusKey ?? null;
   }
 
+  /** The section a job currently lives in, resolved from the SAME
+   * per-render derivation the sections were rendered from (works even
+   * when the job's row is inside a collapsed/count-only section and no
+   * DOM node exists to walk). */
+  private sectionOfJob(jobId: string): string | null {
+    const sections = this.currentSections;
+    if (sections === null) return null;
+    for (const [band, entries] of sections.bands) {
+      if (entries.some((entry) => entry.job.id === jobId)) {
+        // needs-you renders as the FOR GRU section; every other band name
+        // is the section id.
+        return band === 'needs-you' ? 'for-gru' : band;
+      }
+    }
+    return null;
+  }
+
+  /** The job owning a round (round focus keys must resolve a section even
+   * when the round control itself is gone). */
+  private jobIdOfRound(roundId: string): string | null {
+    for (const repo of this.snapshot?.repos ?? []) {
+      for (const job of repo.jobs) {
+        if (job.rounds.some((round) => round.id === roundId)) return job.id;
+      }
+    }
+    return null;
+  }
+
   private restoreFocusKey(key: string | null): void {
     if (key === null) return;
     for (const node of [
@@ -326,39 +354,43 @@ export class BoardView {
       }
     }
     // The exact control is gone. Focus must land somewhere intentional,
-    // never on <body> (Perkins r1 blocker 7): a section disclosure that
-    // disappeared (a count fell under its preview limit) falls back to
-    // its ALWAYS-PRESENT shortcut in the sticky strip; a job row that
-    // moved into a COLLAPSED section (For Gru or count-only Cold) falls
-    // back to that section's disclosure toggle — one gesture away.
+    // never on <body> (Perkins r1 blocker 7 / r2 warning): a section
+    // disclosure that disappeared falls back to its ALWAYS-PRESENT
+    // shortcut in the sticky strip; a job or round control that vanished
+    // resolves its OWNING SECTION from the same snapshot-derived
+    // classification the render used (correct even for a job inside a
+    // collapsed section with no DOM row), then falls back to that
+    // section's disclosure toggle (if it has one) and finally its
+    // shortcut — one gesture away, never an unrelated section.
     const sectionKey = /^section:([a-z-]+)$/u.exec(key);
     if (sectionKey !== null) {
       this.boardNav.querySelector<HTMLElement>(`.board-nav__link[data-nav="${sectionKey[1]}"]`)?.focus();
       return;
     }
+    let jobId: string | null = null;
     const jobKey = /^job:(.+)$/u.exec(key);
-    if (jobKey !== null) {
-      const jobId = jobKey[1];
-      const row = this.mount.querySelector<HTMLElement>(`[data-job-id="${jobId}"]`);
-      const band = row?.closest<HTMLElement>('.board-band');
-      const toggle = band?.querySelector<HTMLElement>('.board-band__more') ?? null;
+    const roundKey = /^round:(.+)$/u.exec(key);
+    if (jobKey !== null && jobKey[1] !== undefined) jobId = jobKey[1];
+    else if (roundKey !== null && roundKey[1] !== undefined) jobId = this.jobIdOfRound(roundKey[1]);
+    if (jobId === null) return;
+    const section = this.sectionOfJob(jobId);
+    if (section !== null) {
+      const toggle = this.mount.querySelector<HTMLElement>(
+        `.board-band[data-section="${section}"] .board-band__more`,
+      );
       if (toggle !== null && toggle.getAttribute('aria-expanded') === 'false') {
         toggle.focus();
         return;
       }
-      const section = band?.dataset.section ?? null;
-      if (section !== null) {
-        const navLink = this.boardNav.querySelector<HTMLElement>(`.board-nav__link[data-nav="${section}"]`);
-        if (navLink !== null) {
-          navLink.focus();
-          return;
-        }
+      const navLink = this.boardNav.querySelector<HTMLElement>(`.board-nav__link[data-nav="${section}"]`);
+      if (navLink !== null) {
+        navLink.focus();
+        return;
       }
-      const collapsed = this.mount.querySelector<HTMLElement>(
-        '.board-band[data-section="for-gru"] .board-band__more, .board-band[data-section="cold"] .board-band__more',
-      );
-      collapsed?.focus();
     }
+    // Last resort: the row exists but its section could not be resolved
+    // (defensive) — the collapsed disclosures, then anything stable.
+    this.mount.querySelector<HTMLElement>('.board-band__more')?.focus();
   }
 
   private measureNav(): void {

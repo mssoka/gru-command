@@ -220,7 +220,18 @@ async function pairAndOpenBoard(page: Page): Promise<void> {
   await expect(page.locator('#board-view')).toBeVisible();
 }
 
+/** Approved compact board (j-1064): a fixture lane with live machine
+ * attention sits in FOR GRU, which starts collapsed — reveal it first,
+ * exactly as an operator would. */
+async function revealForGru(page: Page): Promise<void> {
+  const toggle = page.locator('.board-band[data-section="for-gru"] .board-band__more');
+  if ((await toggle.count()) > 0 && (await toggle.getAttribute('aria-expanded')) === 'false') {
+    await toggle.click();
+  }
+}
+
 async function expandProofRound(page: Page, title: string): Promise<void> {
+  await revealForGru(page);
   const job = page.locator('.board-job', { hasText: title });
   await expect(job).toBeVisible();
   await job.locator('.board-job__toggle').click();

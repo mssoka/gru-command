@@ -2604,3 +2604,109 @@ describe('board v6 — one worker-aware derivation for strip and sections (Perki
     expect((active as HTMLElement).getAttribute('data-nav')).toBe('pipeline');
   });
 });
+
+describe('board v6 — snapshot-resolved focus fallback (Perkins r2 warning)', () => {
+  beforeEach(mountBoardDom);
+
+  it('a job moving into collapsed Cold focuses Cold — never the populated FOR GRU disclosure', () => {
+    const view = new BoardView(() => {});
+    const coldJob = {
+      id: 'gone-cold',
+      status: 'working' as const,
+      rounds: [],
+      lastAgentActivity: new Date(Date.now() - 90 * 60_000).toISOString(),
+    };
+    view.render(
+      snapshot({
+        jobs: [baseJob(coldJob)],
+        agents: [
+          agent('minion-moved', {
+            role: 'minion',
+            jobId: 'gone-cold',
+            state: 'streaming',
+            lastActivity: new Date().toISOString(),
+          }),
+        ],
+      }),
+    );
+    const toggle = document.querySelector<HTMLElement>('.board-band--in-flight .board-job__toggle');
+    expect(toggle).not.toBeNull();
+    toggle?.focus();
+    // Next push: gone-cold went silent-cold while an unrelated machine row
+    // populates FOR GRU. Cold is count-only, so the focused row vanishes.
+    view.render(
+      snapshot({
+        jobs: [
+          baseJob({ ...coldJob }),
+          baseJob({ id: 'machine-row', status: 'working', rounds: [] }),
+        ],
+        agents: [
+          agent('minion-moved', {
+            role: 'minion',
+            jobId: 'gone-cold',
+            state: 'streaming',
+            lastActivity: new Date(Date.now() - 90 * 60_000).toISOString(),
+          }),
+          agent('minion-machine', {
+            role: 'minion',
+            jobId: 'machine-row',
+            supervision: { state: 'stopped', restarts: 0, breakerOpen: true, stopReason: 'quota_wall' },
+          }),
+        ],
+        notifications: [notification('n-machine', { agentId: 'minion-machine' })],
+        unackedActionRequired: 1,
+      }),
+    );
+    const active = document.activeElement;
+    expect(active).toBeInstanceOf(HTMLElement);
+    // The fallback must be COLD's own disclosure (or its shortcut) — the
+    // old first-match fallback would land on the unrelated FOR GRU toggle.
+    const coldToggle = document.querySelector<HTMLElement>('.board-band[data-section="cold"] .board-band__more');
+    const forGruToggle = document.querySelector<HTMLElement>('.board-band[data-section="for-gru"] .board-band__more');
+    expect(active).not.toBe(forGruToggle);
+    const isColdToggle = active === coldToggle;
+    const isColdNav = (active as HTMLElement).classList.contains('board-nav__link') &&
+      (active as HTMLElement).getAttribute('data-nav') === 'cold';
+    expect(isColdToggle || isColdNav).toBe(true);
+  });
+
+  it('a round control whose row is gone resolves its owning job section from the snapshot', () => {
+    const view = new BoardView(() => {});
+    const job = baseJob({
+      id: 'round-owner',
+      status: 'in-review',
+      rounds: [baseRound({ id: 'r-owner', status: 'live' })],
+    });
+    view.render(snapshot({ jobs: [job] }));
+    document.querySelector<HTMLElement>('.board-job__meta')?.click(); // expand rounds
+    const roundToggle = document.querySelector<HTMLElement>('.board-round__toggle');
+    expect(roundToggle?.dataset.focusKey).toBe('round:r-owner');
+    roundToggle?.focus();
+    // The job moves to collapsed Cold: the round control is gone.
+    view.render(
+      snapshot({
+        jobs: [
+          baseJob({
+            id: 'round-owner',
+            status: 'working',
+            rounds: [baseRound({ id: 'r-owner', status: 'live' })],
+            lastAgentActivity: new Date(Date.now() - 90 * 60_000).toISOString(),
+          }),
+        ],
+        agents: [
+          agent('minion-round', {
+            role: 'minion',
+            jobId: 'round-owner',
+            state: 'streaming',
+            lastActivity: new Date(Date.now() - 90 * 60_000).toISOString(),
+          }),
+        ],
+      }),
+    );
+    const active = document.activeElement;
+    expect(active).toBeInstanceOf(HTMLElement);
+    expect(active?.tagName).toBe('BUTTON');
+    expect((active as HTMLElement).className).toContain('board-band__more');
+    expect((active as HTMLElement).closest('.board-band')?.getAttribute('data-section')).toBe('cold');
+  });
+});

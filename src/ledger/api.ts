@@ -5797,16 +5797,18 @@ export class LedgerApi {
     };
   }
 
-  /** Durable minion-start evidence for a job: a job-bound worker agent
-   * row (dispatch registers it ONLY after a successful spawn) or a
-   * recorded `job.minion-spawned` event. A worktree row is NOT evidence
-   * — real dispatch creates the worktree BEFORE spawning and a failed
-   * spawn retains it as swept, so an adopted blocked job must not release
-   * `admitted` dependents on worktree presence alone (Perkins r1
-   * blocker 1). Public: the mechanical pipeline consumer builds the same
-   * evidence context as the board projection. */
+  /** Durable minion-start evidence for a job: a job-bound TOP-LEVEL
+   * minion agent row (real dispatch registers exactly that identity after
+   * a successful spawn — `role='minion'`, `parentage='top-level'`) or a
+   * recorded `job.minion-spawned` event. Neither a worktree row (created
+   * BEFORE spawning, retained swept on failure), nor a job-bound Perkins
+   * reviewer row, nor an unstarted child identity counts as a started
+   * worker (Perkins r1/r2 blocker 1). Public: the mechanical pipeline
+   * consumer builds the same evidence context as the board projection. */
   jobHasWorkerStart(jobId: string): boolean {
-    const agent = this.db.prepare('SELECT id FROM agents WHERE job_id = ? LIMIT 1').get(jobId) as Row | undefined;
+    const agent = this.db
+      .prepare("SELECT id FROM agents WHERE job_id = ? AND role = 'minion' AND parentage = 'top-level' LIMIT 1")
+      .get(jobId) as Row | undefined;
     if (agent !== undefined) return true;
     return this.latestJobEvent(jobId, 'job.minion-spawned') !== null;
   }
