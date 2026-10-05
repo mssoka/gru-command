@@ -1,6 +1,7 @@
 import { spawnSync } from 'node:child_process';
-import type { EventRecord, JobRecord } from '../ledger/api.js';
-import type { JobStatus } from '../ledger/states.js';
+import type { DirectiveRequestRecord, EventRecord, JobRecord, PendingRebriefRecord } from '../ledger/api.js';
+import { isJobTerminal, type JobStatus } from '../ledger/states.js';
+import { LIVE_DIRECTIVE_STATES, type DirectiveState } from '../ledger/directives.js';
 import type { WorktreeLane } from './worktree-port.js';
 
 /**
@@ -15,19 +16,34 @@ import type { WorktreeLane } from './worktree-port.js';
  * `force: true` flag is the human escape hatch, and forced rounds are tagged
  * in the round manifest and the event log.
  *
- * "Busy" means the lane's CURRENT attempt has not delivered: status
- * dispatched/working and no `job.delivered` event newer than the attempt
- * start (the latest `job.status → working` hop). A settled delivery clears
- * busy even while the status still reads working — `delivered` is the
- * review-ready point, and the refusal's own hint says "wait for lane
- * delivery".
+ * "Busy" means either:
+ *
+ * 1. the lane's CURRENT attempt has not delivered: status
+ *    dispatched/working/in-review and no `job.delivered` event newer than
+ *    the attempt start. The attempt starts at the newest `working` hop —
+ *    or, when a PR link flips an OPEN attempt to `in-review` before it
+ *    settles, at that flip itself. A settled delivery clears busy even
+ *    while the status still reads working or in-review (`delivered` is
+ *    the review-ready point, and the refusal's own hint says "wait for lane
+ *    delivery"); a `delivered → in-review` flip starts nothing; or
+ * 2. the job has an UNRESOLVED re-brief request: any durable pending marker
+ *    (`pending_rebriefs`) means target-owned work is in flight — the
+ *    re-brief worker's open turn, or a restart-recovered request not yet
+ *    reconciled. A status flip to delivered/in-review and a late
+ *    `job.delivered` from the pre-re-brief worker cannot clear a newer
+ *    request; the marker clears only when the request genuinely settles
+ *    (`finalizeRebriefRequest` / boot reconciliation).
+ *
+ * Terminal (`merged`/`done`) jobs are never busy: a stale marker left on a
+ * terminal job must not block an unrelated review or resurrect the job.
  */
 
-export const BRANCH_BUSY_HINT = 'wait for lane delivery or dispatch with force';
+export const BRANCH_BUSY_HINT = 'wait for lane delivery or re-brief request settlement, or dispatch with force';
 
 /** Statuses whose lane may be mid-flight (dispatched = the lane is about to
- * be created and pushed; working = the attempt is open). */
-export const BRANCH_BUSY_STATUSES: readonly JobStatus[] = ['dispatched', 'working'];
+ * be created and pushed; working = the attempt is open; in-review = a PR
+ * link can land mid-attempt before delivery). */
+export const BRANCH_BUSY_STATUSES: readonly JobStatus[] = ['dispatched', 'working', 'in-review'];
 
 /** One lane that owns (or is about to own) the reviewed branch. */
 export interface BranchIdleBlocker {
@@ -95,6 +111,21 @@ export class BranchBusyError extends Error {
 export interface BranchIdleLedger {
   listJobs(): readonly JobRecord[];
   latestJobEvent(jobId: string, kind: string): EventRecord | null;
+  /** Newest-first bounded history; the guard pages back to the `working`
+   * hop behind an `in-review` flip. */
+  listJobEvents(jobId: string, opts?: { readonly limit?: number }): readonly EventRecord[];
+  /** Durable re-brief markers; any row for a job is an unresolved
+   * target-owned request (presence is the fact — see laneIsBusy). */
+  listPendingRebriefs(opts?: { readonly jobId?: string }): readonly PendingRebriefRecord[];
+  /** Accepted directive requests still owing completion (`dispatching` or
+   * `admitted`): they may already own the lane before admission lands. */
+  listPendingDirectives(opts?: {
+    readonly jobId?: string;
+    readonly states?: readonly DirectiveState[];
+  }): readonly DirectiveRequestRecord[];
+  /** True while any verification run for the job is unsettled: it owns the
+   * checkout and no review may freeze the same head. */
+  hasUnsettledVerificationRun(jobId: string): boolean;
 }
 
 /** The branch a job lane is created on (worktree manager convention; also
@@ -154,44 +185,116 @@ export function resolveReviewTargetBranch(input: {
   return laneBranch(input.jobId);
 }
 
-/** Seq of the job's latest `job.status → working` hop (0 when the attempt
- * start predates any status event — a `dispatched` job). */
-function attemptStartedSeq(ledger: BranchIdleLedger, jobId: string): number {
-  const latest = ledger.latestJobEvent(jobId, 'job.status');
-  if (latest === null) return 0;
-  const payload = latest.payload;
-  const to = typeof payload === 'object' && payload !== null ? (payload as { to?: unknown }).to : undefined;
-  return to === 'working' ? latest.seq : 0;
+/** The status event immediately before `flipSeq`. A `working → in-review`
+ * flip can only follow the `working` hop that started the attempt, so the
+ * newest older status event IS that hop. Paged because the ledger exposes
+ * only a limit-bounded newest-first window. */
+function previousStatusSeq(ledger: BranchIdleLedger, jobId: string, flipSeq: number): number | null {
+  let limit = 200;
+  for (;;) {
+    const events = ledger.listJobEvents(jobId, { limit });
+    const previous = events.find((event) => event.seq < flipSeq && event.kind === 'job.status');
+    if (previous !== undefined) return previous.seq;
+    // Fewer rows than requested means the history is exhausted.
+    if (events.length < limit || limit >= 12_800) return null;
+    limit *= 4;
+  }
 }
 
-/** The busy predicate: the attempt is open and has not delivered yet. */
+/** Seq of the job's current attempt start (0 when none is open). The
+ * start is the newest `job.status → working` hop, or — when a PR link
+ * moves the job to `in-review` BEFORE its turn settles — the `working` hop
+ * immediately behind that flip: the flip belongs to the still-open
+ * attempt, not the absence of one. A `delivered → in-review` flip starts
+ * nothing. Every other latest-status shape starts nothing. */
+export function openAttemptStartSeq(ledger: BranchIdleLedger, jobId: string): number {
+  const latest = ledger.latestJobEvent(jobId, 'job.status');
+  if (latest === null) return 0;
+  const payload = typeof latest.payload === 'object' && latest.payload !== null
+    ? (latest.payload as { from?: unknown; to?: unknown })
+    : {};
+  if (payload.to === 'working') return latest.seq;
+  if (payload.to === 'in-review' && payload.from === 'working') {
+    const hop = previousStatusSeq(ledger, jobId, latest.seq);
+    if (hop !== null) return hop;
+    // The status history is unreachable past the page cap. A delivery newer
+    // than the flip settles the attempt the flip belongs to, so the lane
+    // clears; otherwise fail closed and treat the attempt as open (a later
+    // delivery clears it — never a permanent busy).
+    const delivered = ledger.latestJobEvent(jobId, 'job.delivered');
+    return delivered !== null && delivered.seq > latest.seq ? 0 : Number.MAX_SAFE_INTEGER;
+  }
+  return 0;
+}
+
+/** Newest explicit repair start that need not flip status: an admitted
+ * directive turn (`silas.directive-sent`) or a claimed provider
+ * continuation (`provider.recovery-claimed`). The digest's stalled-phase
+ * detector reads the same events; review admission must not arm on a head
+ * whose repair is still open (issue #162). */
+function latestRepairStartSeq(ledger: Pick<BranchIdleLedger, 'latestJobEvent'>, jobId: string): number {
+  let newest = 0;
+  for (const kind of ['silas.directive-sent', 'provider.recovery-claimed']) {
+    const event = ledger.latestJobEvent(jobId, kind);
+    if (event !== null && event.seq > newest) newest = event.seq;
+  }
+  return newest;
+}
+
+/** The busy predicate: the attempt is open and has not delivered yet, or a
+ * newer re-brief request is still unresolved. */
 export function laneIsBusy(ledger: BranchIdleLedger, job: JobRecord): boolean {
-  if (!BRANCH_BUSY_STATUSES.includes(job.status)) return false;
+  // Terminal lanes are never busy: the marker retirement lane owns stale
+  // terminal markers, and they must not block anything in the meantime.
+  if (isJobTerminal(job.status)) return false;
+  // An unresolved re-brief fences the lane regardless of delivery or status:
+  // the worker's turn may push a new head after this check. Deliberately
+  // presence-based — a late delivery event from the previous worker cannot
+  // answer a newer request, so it must not release this fence.
+  if (ledger.listPendingRebriefs({ jobId: job.id }).length > 0) return true;
+  // An accepted directive request may already be prompting a writer before
+  // its admission event lands: review must not arm on that head (issue #162).
+  if (ledger.listPendingDirectives({ jobId: job.id, states: LIVE_DIRECTIVE_STATES }).length > 0) return true;
+  // A verification run owns the checkout for its whole life; a review must
+  // not freeze the head it is verifying.
+  if (ledger.hasUnsettledVerificationRun(job.id)) return true;
   const delivered = ledger.latestJobEvent(job.id, 'job.delivered');
+  // A repair admitted after the delivery keeps the lane busy even when no
+  // status hop recorded it, and even while the stale status still reads
+  // `delivered` (a claimed provider continuation) — fallback and recovery
+  // flows do not always flip the row.
+  if (delivered !== null && delivered.seq <= latestRepairStartSeq(ledger, job.id)) return true;
+  if (!BRANCH_BUSY_STATUSES.includes(job.status)) return false;
   if (delivered === null) return true;
-  return delivered.seq <= attemptStartedSeq(ledger, job.id);
+  return delivered.seq <= openAttemptStartSeq(ledger, job.id);
 }
 
 /** Every busy lane whose branch is the reviewed target. The reviewed job is
  * NOT exempt: its own lane is the primary race — a fix loop re-opened the
  * branch and the arm must wait for that attempt to deliver. A linked PR's
- * head ref is the lane branch by construction (the manager opens every lane
- * on `gru/<jobId>` and the minion pushes that branch), so comparing the
- * recorded lane branch covers both clauses without a code-host call at arm
- * time. A `dispatched` job without a registry row yet compares as the
- * branch it is about to create. */
+ * head ref is the lane branch ONLY when the lane follows the manager's
+ * push discipline (open on `gru/<jobId>`, push that branch). A rebase or
+ * salvage lane that checks out its own branch and pushes a FOREIGN PR
+ * branch is not detectable from the registry today (g25/#121): the guard
+ * compares recorded lane branches, and no declared push target exists. A
+ * `dispatched` job without a registry row yet compares as the branch it is
+ * about to create. Terminal jobs are never busy. */
 export function findBusyLanes(input: {
   readonly ledger: BranchIdleLedger;
   readonly lanes: readonly WorktreeLane[];
   readonly targetBranch: string;
   /** Status to evaluate the reviewed job with instead of its live row: the
    * round's own working→in-review flip is bookkeeping and must not mask the
-   * lane it moved. */
+   * lane it moved. The attempt start resolves from the ledger's status
+   * history, so the flip itself never counts as an open attempt. */
   readonly reviewedStatus?: { readonly jobId: string; readonly status: JobStatus } | undefined;
 }): readonly BranchIdleBlocker[] {
   const target = normalizeBranch(input.targetBranch);
   const blockers: BranchIdleBlocker[] = [];
   for (const job of input.ledger.listJobs()) {
+    // A historical pre-review status is only valid while the job is still
+    // nonterminal. A concurrent done/merged transition is authoritative.
+    if (isJobTerminal(job.status)) continue;
     const status =
       input.reviewedStatus !== undefined && input.reviewedStatus.jobId === job.id
         ? input.reviewedStatus.status

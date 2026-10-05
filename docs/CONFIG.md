@@ -47,7 +47,11 @@ The instance dir also carries state that is NOT config and has no keys
 here: `sessions/`, `chat/`, `logs/`, `ledger/`, `worktrees/` and
 `worktree-preserves/` (job lanes and swept-out deliverables —
 [WORKTREES.md](./WORKTREES.md)), and `uploads/` (the attach-flow home,
-created at boot — SPEC ruling 19).
+created at boot — SPEC ruling 19). The Perkins App credential bundle is
+also instance state: it is read from `perkins/` under the instance dir
+(the directory holding this file), with `<data_dir>/perkins/` honored as
+a fallback for relocated deployments — see
+[PERKINS-APP-PUBLICATION.md](./PERKINS-APP-PUBLICATION.md).
 
 ## Load & validation behavior
 
@@ -363,7 +367,9 @@ max_workers = 4
 enabled = true
 # Simultaneous lens children inside the global resident pool (not extra slots).
 # Positive integer <= 32 (review-gated bound); effective concurrency also
-# depends on spare global slots.
+# depends on spare global slots. Specialists are lead-selected whole-change
+# lenses run in explicit batches inside ONE round; the round stays bounded
+# to 16 real runs and two attempts per lens regardless of this ceiling.
 max_concurrent_children = 2
 
 [verify]

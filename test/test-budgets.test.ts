@@ -23,11 +23,16 @@ import {
  * rename surfaces here instead of silently dropping out of the policy.
  */
 
-/** The ten Test-timed-out cases from the failed host run on 78724dc. */
+/** The ten timed-out cases from 78724dc, including every explicit
+ * descendant of the two formerly grouped cases split on this branch. */
 const OBSERVED_TIMEOUTS: readonly { readonly file: string; readonly name: string }[] = [
   {
     file: 'dispatch-server.test.ts',
-    name: 'by=silas on the pr/review endpoints records silas attribution events; without by it does not',
+    name: 'by=silas on the pr/review endpoints records silas attribution events',
+  },
+  {
+    file: 'dispatch-server.test.ts',
+    name: 'without by, the pr/review endpoints record no silas attribution events',
   },
   {
     file: 'install-one-line.test.ts',
@@ -39,7 +44,11 @@ const OBSERVED_TIMEOUTS: readonly { readonly file: string; readonly name: string
   },
   {
     file: 'install-one-line.test.ts',
-    name: 'restarts only an owned service and refuses a foreign unit with the same public name',
+    name: 'refuses a foreign unit with the same public name',
+  },
+  {
+    file: 'install-one-line.test.ts',
+    name: 'restarts only an owned service unit',
   },
   {
     file: 'perkins-builtin-wave.test.ts',
@@ -51,7 +60,11 @@ const OBSERVED_TIMEOUTS: readonly { readonly file: string; readonly name: string
   },
   {
     file: 'perkins-builtin-wave.test.ts',
-    name: 'does not record a reconciled delivery when the ref moved or the run aborted during the lookup (T4)',
+    name: 'does not record a reconciled delivery when the ref moved during the lookup (T4a)',
+  },
+  {
+    file: 'perkins-builtin-wave.test.ts',
+    name: 'does not record a reconciled delivery when the run aborted during the lookup (T4b)',
   },
   {
     file: 'perkins-freeze-freshhead.test.ts',
@@ -59,7 +72,19 @@ const OBSERVED_TIMEOUTS: readonly { readonly file: string; readonly name: string
   },
   {
     file: 'perkins-whole-review.test.ts',
-    name: 'rejects an empty/missing verdict, an empty report, and a report omitting the verdict line or frozen identity',
+    name: 'report rejection: a missing verdict is refused',
+  },
+  {
+    file: 'perkins-whole-review.test.ts',
+    name: 'report rejection: an empty report is refused',
+  },
+  {
+    file: 'perkins-whole-review.test.ts',
+    name: 'report rejection: a report omitting the verdict line is refused',
+  },
+  {
+    file: 'perkins-whole-review.test.ts',
+    name: 'report rejection: a report omitting the frozen identity is refused',
   },
   {
     file: 'wizard.test.ts',
@@ -155,22 +180,22 @@ describe('workload-aware test budgets', () => {
     expect(heavy).toContain('include: heavyTestPaths()');
   });
 
-  it('routes every declared scope segment that names a heavy file through the heavy config, and only heavy files', () => {
+  it('routes live scope segments that name heavy files through the heavy config, and only heavy files', () => {
     const manifest = parseToml(
       readFileSync(join(import.meta.dirname, '..', '.gru-command', 'worktree.toml'), 'utf-8'),
     ) as { verify?: Record<string, string> };
     const scopes = manifest.verify ?? {};
     expect(Object.keys(scopes).length).toBeGreaterThan(0);
+    expect(scopes['perkins-stage1-baseline']).toBeDefined();
     const heavyPaths = heavyTestPaths();
     for (const [scope, command] of Object.entries(scopes)) {
+      // This diagnostic intentionally runs inside a pinned pre-policy git
+      // archive without a heavy config. It is an expected-RED baseline,
+      // not a current-tree verification segment; live scopes stay guarded.
       if (scope === 'perkins-stage1-baseline') {
-        // This fails-before check runs in an archived pre-budget tree, not
-        // the current checkout. Its pinned base predates the heavy config;
-        // requiring that absent config would turn a valid RED into a setup
-        // failure. Keep the exception tied to the actual archived baseline.
-        expect(command).toContain('base=9bb51b05af5d8f0a0cd389788d1d3f19607d5361');
         expect(command).toContain('git archive "$base"');
-        expect(command).toContain('cd "$d"');
+        expect(command).toContain('base=9bb51b05af5d8f0a0cd389788d1d3f19607d5361');
+        expect(command).toContain('exit 1');
         continue;
       }
       for (const segment of command.split('&&').map((part) => part.trim())) {

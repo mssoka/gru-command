@@ -3,8 +3,7 @@ import { accessSync, constants } from 'node:fs';
 import { delimiter, join } from 'node:path';
 import type { RuntimeId } from '../config.js';
 import { RUNTIME_IDS } from '../config.js';
-import { CLAUDE_CODE_CAPABILITIES } from './claude-adapter.js';
-import { PI_CAPABILITIES } from './pi-adapter.js';
+import { CLAUDE_CODE_CAPABILITIES, PI_CAPABILITIES } from './capabilities.js';
 import type { AgentCapabilities } from './types.js';
 
 /**

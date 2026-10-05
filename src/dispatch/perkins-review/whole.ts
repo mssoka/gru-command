@@ -3,12 +3,13 @@ import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, statSync } from 'node:fs';
 import { isAbsolute, resolve } from 'node:path';
 import type { AgentSpawner } from '../service.js';
-import type { AgentHandle, NativeAgentTool } from '../../runtime/types.js';
+import type { AgentHandle, NativeAgentTool, PromptOptions } from '../../runtime/types.js';
 import type { PacingGate, PacingLease, PacingEventRecorder, RateLimitBackoffPolicy } from '../../runtime/pacing.js';
 import { withRateLimitRetries, type RateLimitRetryOptions } from '../../runtime/rate-limit-retry.js';
-import { assertFrozenPromptBounds, publishedReportMatches, refMovedSinceFreeze, writeReviewArtifact, type FrozenReview } from './artifacts.js';
+import { assertFrozenPromptBounds, publishedReportMatches, sourceMovementSinceFreeze, writeReviewArtifact, type FrozenReview, type SourceMovement } from './artifacts.js';
+import { readFrozenEvidenceBytes, renderEvidencePromptSection } from '../../review-inputs/evidence.js';
 import { finalAssistantText } from './session-output.js';
-import { PERKINS_FINDING_SOURCES, type PerkinsFindingSource, type PerkinsLens, type PerkinsPolicy } from './policy.js';
+import { PERKINS_FINDING_SOURCES, PERKINS_LENSES, type PerkinsFindingSource, type PerkinsLens, type PerkinsPolicy } from './policy.js';
 import {
   dedupeVerifiedFindings,
   parseFindingsSubmission,
@@ -182,6 +183,15 @@ export interface SpecialistRun {
   readonly progressError?: string;
 }
 
+/** One pre-start refusal caused solely by the round's specialist-run cap:
+ * the requested run call could not fit the remaining round budget and no
+ * child started for it, so no attempt or budget was charged. */
+export interface RoundBudgetRefusal {
+  readonly lenses: readonly string[];
+  readonly cap: number;
+  readonly accountedRuns: number;
+}
+
 export interface PerkinsWholeResult {
   readonly canonicalVerdict: CanonicalReviewVerdict;
   readonly findings: readonly VerifiedFinding[];
@@ -192,7 +202,9 @@ export interface PerkinsWholeResult {
   readonly targetSha: string;
   readonly diffBaseSha: string;
   readonly headMoved: boolean;
+  readonly sourceMovement?: SourceMovement;
   readonly lensEnvelopes: readonly LensEnvelope[];
+  readonly budgetRefusals?: readonly RoundBudgetRefusal[];
 }
 
 interface SpecialistResult extends SpecialistRun {
@@ -234,11 +246,13 @@ interface SubmissionValidationContext {
   /** Lenses with a committed VALID specialist result; a lead finding may
    * never be attributed to a lens that did not actually run. */
   readonly validLenses: ReadonlySet<PerkinsLens>;
-  /** Per lens, the exact titles of the findings its valid runs actually
-   * DELIVERED to the lead (R12): crediting a lens requires the specialist
-   * to have reported that finding — a valid-but-empty (or undelivered)
-   * result cannot originate a lead-invented finding. */
-  readonly deliveredLensFindingTitles: ReadonlyMap<PerkinsLens, ReadonlySet<string>>;
+  /** Per lens, title -> delivered locations of the findings its valid runs
+   * actually DELIVERED to the lead (R12/R38): crediting a lens requires the
+   * specialist to have reported that finding AT that location — a
+   * valid-but-empty (or undelivered) result cannot originate a
+   * lead-invented finding, and a same-title finding the lead relocated is
+   * the lead's own judgment, not the specialist's. */
+  readonly deliveredLensFindings: ReadonlyMap<PerkinsLens, ReadonlyMap<string, ReadonlySet<string>>>;
 }
 
 interface SubmissionValidationSuccess {
@@ -263,19 +277,21 @@ function sanitizeError(error: unknown): string {
   return (error instanceof Error ? error.message : String(error)).replace(/[\r\n]+/g, ' ').slice(0, 500);
 }
 
-function headMovedSinceFreeze(review: FrozenReview, movementRef: string): boolean {
-  // The frozen inputs — target ref, base drift, HEAD, and the pristine
-  // detached checkout — must ALL still be exactly what was frozen; unknown
-  // movement can never authorize the now-different head.
-  if (refMovedSinceFreeze(review)) return true;
-  if (movementRef === review.manifest.targetSha || movementRef === review.manifest.targetRef) return false;
+function headMovedSinceFreeze(review: FrozenReview, movementRef: string): SourceMovement | null {
+  // The target ref, HEAD, and the pristine detached checkout must ALL still
+  // be exactly what was frozen, and the base must not have been rewritten
+  // past the frozen merge-base; unknown movement can never authorize the
+  // now-different head.
+  const observed = sourceMovementSinceFreeze(review);
+  if (observed !== null) return observed;
+  if (movementRef === review.manifest.targetSha || movementRef === review.manifest.targetRef) return null;
   try {
     return execFileSync(
       'git', ['-C', review.manifest.repoPath, 'rev-parse', '--verify', `${movementRef}^{commit}`],
       { encoding: 'utf8', timeout: GIT_PROOF_TIMEOUT_MS },
-    ).trim() !== review.manifest.targetSha;
+    ).trim() === review.manifest.targetSha ? null : { cause: 'target-moved', detail: `movement ref ${movementRef} no longer matches ${review.manifest.targetSha}` };
   } catch {
-    return true;
+    return { cause: 'target-moved', detail: `movement ref ${movementRef} cannot resolve` };
   }
 }
 
@@ -422,6 +438,121 @@ function evidenceAtCitedLocation(review: FrozenReview, finding: ReviewFinding, e
   return frozenBlobContains(review, path, evidence) || frozenPathDiff(review, path).includes(evidence);
 }
 
+/** Whitespace-normalized location key used for specialist provenance (R38).
+ * Case is preserved: a file path is case-sensitive evidence. */
+function provenanceLocation(location: string): string {
+  // Internal spaces can distinguish two real Git paths. Normalize only the
+  // presentation padding around a location, not the path it identifies.
+  return location.trim();
+}
+
+/** Sentence frames that assert the WHOLE change has no issues left (R37).
+ * Novelty-scoped phrases ("no new issues") are deliberately absent: they do
+ * not claim residual issue-freeness. Scope handling below keeps per-lens,
+ * per-area and prior-only statements legitimate. */
+const TERMINAL_CLEAN_CLAIM_PATTERNS: readonly RegExp[] = [
+  /\bno (?:remaining |outstanding |unresolved )*(?:issues?|problems?|findings?|defects?|bugs?|concerns?|regressions?|blockers?|failures?)\b(?:[^.;!?]{0,80}?\b(?:remain|remains|remained|left|found|detected|identified|exists?|existed|present|outstanding|stands?|observed|reported|known|noted|applicable|arise|arose)\b|\s+to (?:fix|address|resolve|change|report)\b|\s*$)/iu,
+  /\bthere (?:are|were|is|was) no (?:remaining |outstanding |unresolved )*(?:issues?|problems?|findings?|defects?|bugs?|concerns?|regressions?|blockers?|failures?)\b/iu,
+  /\bno (?:remaining |outstanding |unresolved )*(?:issues?|problems?|findings?|defects?|bugs?|concerns?|blockers?) (?:in|for|on|with) (?:(?:this|the) )?(?:change|pr|pull request|diff|patch|branch|review|submission|work|implementation|code)\b/iu,
+  /\bnothing (?:further |else |more )?(?:remains?|remained|(?:is|was) left|left|(?:is|was) found|found|to (?:fix|address|resolve|change|do|report|raise)|(?:requires?|needs?) (?:fixing|changes?|attention)|(?:is|are|was|were) (?:needed|required|necessary))/iu,
+  /\bno (?:changes?|modifications?|edits?) (?:are |is |were |was )?(?:needed|required|necessary)\b/iu,
+  /\b(?:the |this |that )?(?:change|pr|pull request|diff|patch|branch|review|submission|work|implementation|code) (?:requires?|needs?) no (?:further |additional |more )?(?:changes?|fixes|work|attention)\b/iu,
+  /\b(?:the |this |that |our )?(?:change|pr|pull request|diff|patch|branch|review|submission|work|implementation|codebase|code) (?:is|was|looks|looked|appears|appeared|reads|read|remains|remained) (?:clean|issue[- ]free|problem[- ]free|defect[- ]free|bug[- ]free|free of (?:issues?|problems?|findings?|defects?|bugs?|concerns?)|ready as is)\b/iu,
+  /\b(?:has|have|had) no (?:remaining |outstanding |unresolved )*(?:issues?|problems?|findings?|defects?|bugs?|concerns?|regressions?|blockers?)\b/iu,
+  /\b(?:find|found|identified|detected|observed|reported|reports) no (?:remaining |outstanding |unresolved )*(?:issues?|problems?|findings?|defects?|bugs?|concerns?|regressions?|blockers?)\b/iu,
+  /\b(?:everything|all) (?:is|was|looks|looked|appears|appeared) (?:good|fine|clean|clear|issue[- ]free|problem[- ]free)\b/iu,
+  /\b(?:lgtm|looks good to me)\b/iu,
+];
+
+/** A direct whole-change assertion cannot be scoped by a file or lens merely
+ * mentioned elsewhere in the same clause. Exceptions and blocker-qualified
+ * claims are handled separately below. */
+const GLOBAL_CHANGE_CLAIM = /\b(?:no (?:remaining |outstanding |unresolved )*(?:issues?|problems?|findings?|defects?|bugs?|concerns?|blockers?)(?:\s+\w+){0,3}?\s+(?:in|for|on|with)\s+(?:(?:this|the|whole|overall)\s+)?(?:change|pr|pull request|diff|patch|branch|review|submission|work|implementation|code)\b|(?:the|this|that|our)\s+(?:change|pr|pull request|diff|patch|branch|review|submission|work|implementation|codebase|code)\s+(?:is|was|looks|looked|appears|appeared|reads|read|remains|remained|requires?|needs?)\s+(?:clean|issue[- ]free|problem[- ]free|defect[- ]free|bug[- ]free|no\b))/iu;
+
+const LENS_SCOPE = new RegExp(`\\b(?:${PERKINS_LENSES.join('|')})\\s+(?:lens|lenses|review|reviewer|specialist|run|process|report)\\s+(?:found|reported|saw|identified|has|had|detected)\\s+no\\b|\\bno\\s+(?:issues?|findings?|problems?)\\b[^.;!?]{0,80}\\b(?:in|for|from)\\s+(?:the\\s+)?(?:${PERKINS_LENSES.join('|')})\\s+(?:lens|lenses|review|reviewer|specialist|run|process|report)\\b`, 'iu');
+
+/** The bounded scope cues that make a clean claim legitimate beside retained
+ * findings: a named lens/process, a file/area, or a possessive "own" claim.
+ * An unscoped claim concludes the whole change and remains a contradiction. */
+function scopedCleanClaim(
+  segment: string, retainedLocations: readonly string[], retainedBlocker: boolean, retainedPrior: boolean,
+): boolean {
+  // Explicit exceptions leave retained findings in view, even if a whole
+  // change is mentioned. A bare all-files claim is not a limited scope.
+  if (/\b(?:except|aside from|apart from|other than|besides)\b/iu.test(segment)) return true;
+  if (/\b(?:that|which) (?:block|blocks|prevent|prevents|hinder|hinders|require|requires)\b/iu.test(segment)) return !retainedBlocker;
+  if (GLOBAL_CHANGE_CLAIM.test(segment) || /\b(?:any|all|every|each)\s+(?:files?|areas?|parts?|sections?)\b/iu.test(segment)) return false;
+  // The prior round's own outcome is not the present change's conclusion.
+  if (!retainedPrior && /\b(?:prior|previous|earlier|last|preceding)\s+(?:review|round|report|submission|pass|revision)\b/iu.test(segment)) return true;
+  // A named path scopes a claim only if no retained finding cites that file.
+  // Accept both extensionless and space-containing Git paths, not "any files".
+  const paths = [...segment.matchAll(/\b(?:in|within|for|on|file:)\s+((?:[.\w@-]+\/)+[.\w@-]+(?:\s+(?!with\b|and\b|but\b|though\b|including\b|except\b|that\b|which\b|is\b)[.\w@-]+)*|[.\w@-]*\.[\w-]+)/giu)].map((match) => match[1]!);
+  if (paths.length > 0) return paths.every((path) => !retainedLocations.includes(path));
+  if (LENS_SCOPE.test(segment)) return true;
+  if (/\b(?:in|within|for|regarding|concerning|about|on)\s+(?:this|that|the|another|its|their|our|my)?\s*(?:\w+\s+){0,3}?(?:files?|functions?|methods?|modules?|sections?|areas?|paths?|helpers?|components?|classes?|hunks?|categories?|scopes?|parts?|regions?|tests?)\b/iu.test(segment)) return true;
+  return false;
+}
+
+/** The first unscoped terminal clean-slate claim in the report's visible
+ * prose (R37), or null. Markdown noise never turns a claim on or off. */
+function findTerminalCleanClaim(
+  report: string, retainedLocations: readonly string[], retainedBlocker: boolean, retainedPrior: boolean,
+): string | null {
+  // Rendered line wraps are prose, whereas headings, quotes and fenced code
+  // have distinct Markdown roles. Check heading TEXT as well as paragraphs.
+  const paragraphs: Array<{ text: string; priorOnly: boolean }> = [];
+  let pending: string[] = [];
+  let priorOnly = false;
+  let fence: { marker: string; length: number } | null = null;
+  const flush = (): void => {
+    if (pending.length > 0) paragraphs.push({ text: pending.join(' '), priorOnly });
+    pending = [];
+  };
+  for (const line of report.replace(/<!--[\s\S]*?-->/gu, '').split('\n')) {
+    const marker = /^\s*(`{3,}|~{3,})(.*)$/u.exec(line);
+    if (fence !== null) {
+      if (marker !== null && marker[1]![0] === fence.marker && marker[1]!.length >= fence.length && marker[2]!.trim() === '') fence = null;
+      continue;
+    }
+    if (marker !== null) { flush(); fence = { marker: marker[1]![0]!, length: marker[1]!.length }; continue; }
+    if (line.trim() === '' || /^\s*>|^ {4,}\S/u.test(line)) { flush(); continue; }
+    const heading = /^\s*#{1,6}\s+(.+)$/u.exec(line);
+    if (heading !== null) {
+      flush();
+      priorOnly = /\b(?:prior|previous|earlier|last)\b/iu.test(heading[1]!);
+      paragraphs.push({ text: heading[1]!, priorOnly });
+      continue;
+    }
+    pending.push(line);
+  }
+  flush();
+  for (const paragraph of paragraphs) {
+    // A resolved prior-only section may describe its own history, not
+    // silently certify the current PR. Global subjects are always checked.
+    if (paragraph.priorOnly && !retainedPrior &&
+      !/\b(?:the|this|whole|overall)\s+(?:change|pr|pull request|diff|branch|work|implementation)\b|\b(?:in|for|on|with)\s+(?:(?:this|the|whole)\s+)?(?:pr|pull request|change|diff|branch)\b/iu.test(paragraph.text)) continue;
+    // Attributed past judgments and explicitly disallowed quotations are
+    // evidence, not this report's own conclusion. Bare quotes still count.
+    const prose = paragraph.text.replace(/\b(?:(?:the )?(?:prior|previous|earlier) (?:reviewer|report) (?:incorrectly |wrongly )?(?:wrote|said|claimed|asserted)\s+(?:["'“‘][^"'“”‘’]{0,200}["'”’]|[^,;.!?]{0,200})|(?:do not say|don't say)\s*["'“‘][^"'“”‘’]{0,200}["'”’])/giu, '');
+    for (const raw of prose.split(/[;!?]+|\.(?=\s|$)/u)) {
+      // A cue about one lens/file cannot scope another independent claim.
+      for (const clause of raw.split(/,\s*(?=(?:and|but|though|although|however|the|this|no|nothing|everything|security|blind|edge)\b)|\s+(?:but|though|although|however)\s+|\s+and\s+(?=(?:the|this|no|nothing|everything)\b)/iu)) {
+        const segment = clause.replace(/[*_`~#]+/gu, '').replace(/\s+/gu, ' ').trim();
+        if (segment === '') continue;
+        if (/\b(?:it is|that's|this is) (?:not true|false|wrong|incorrect) (?:that|to say)\b/iu.test(segment)) continue;
+        if (!TERMINAL_CLEAN_CLAIM_PATTERNS.some((pattern) => pattern.test(segment))) continue;
+        // "No blockers" and LGTM speak to merge readiness; a warning or
+        // note can remain without contradicting either claim.
+        if (!retainedBlocker && (/\bno (?:remaining |outstanding |unresolved )*blockers?\b/iu.test(segment) || /\b(?:lgtm|looks good to me)\b/iu.test(segment)) &&
+          !/\b(?:issues?|findings?|defects?|problems?|bugs?|clean|no changes?)\b/iu.test(segment)) continue;
+        if (scopedCleanClaim(segment, retainedLocations, retainedBlocker, retainedPrior)) continue;
+        return segment.length > 200 ? `${segment.slice(0, 200)}…` : segment;
+      }
+    }
+  }
+  return null;
+}
+
 interface PriorReview {
   readonly findings: readonly VerifiedFinding[];
   readonly targetSha: string | null;
@@ -492,7 +623,10 @@ function renderSpecialistPrompt(
   const template = lens === 'blind' ? policy.portableContract.blindPrompt : policy.portableContract.sharedPrompt;
   if (!template.includes('{{OUTPUT_CONTRACT}}')) throw new Error('policy prompt is missing the output contract placeholder');
   const rendered = template.replace('{{OUTPUT_CONTRACT}}', () => contract);
-  const prompt = lens === 'blind'
+  // Non-blind paths receive the promised frozen evidence as untrusted text
+  // beside the attachment images the host attaches to the same prompt.
+  const evidenceSection = lens === 'blind' ? '' : renderEvidencePromptSection(review.evidence.attachments, review.manifest.targetSha);
+  const prompt = (lens === 'blind'
     ? renderTemplateOnce(rendered, {
       // The blind child's only grounding: the exact paths its location
       // fields may cite, alongside the whole diff those citations are
@@ -506,7 +640,7 @@ function renderSpecialistPrompt(
       '{{SPEC_CONTEXT}}': review.specContext,
       '{{LENS_BRIEF}}': policy.portableContract.lenses[lens],
       '{{LENS}}': lens,
-    });
+    })) + (evidenceSection === '' ? '' : `\n\n${evidenceSection}`);
   // A retry is corrective, not a blind repeat: the host delivers the previous
   // attempt's exact failure class and reason in the child's own contract.
   if (retry === undefined || retry.attempt <= 1) return prompt;
@@ -515,6 +649,29 @@ function renderSpecialistPrompt(
   // Blind children cannot re-read anything, so their retry restates the
   // locatable-evidence contract on top of the exact rejection.
   return `${prompt}\n\n--- RETRY CORRECTION (attempt ${retry.attempt}) ---\n${correction}\n${blindEvidenceCorrection(retry.previous)}`;
+}
+
+/** Exact frozen evidence pixels for one prompt, re-verified against the
+ * frozen hash/size on every read (a mutated frozen copy refuses loudly). */
+function reviewEvidenceImages(review: FrozenReview): PromptOptions['images'] {
+  return review.evidence.attachments.map((attachment) => ({
+    mediaType: attachment.mediaType,
+    data: readFrozenEvidenceBytes(attachment).toString('base64'),
+  }));
+}
+
+/** The promise is delivery of the frozen content or a named refusal — never a
+ * text-only substitute for material the model cannot see. */
+function assertEvidenceCapability(
+  handle: AgentHandle,
+  images: PromptOptions['images'] | undefined,
+  what: string,
+): void {
+  if (images === undefined || images.length === 0) return;
+  if (handle.capabilities.images === true) return;
+  throw new Error(
+    `${what} does not declare image input; refusing to deliver the ${images.length} frozen evidence attachment(s) as an unverified text-only substitute`,
+  );
 }
 
 /** The reason carried by an abort signal, or the generic cancellation error
@@ -558,6 +715,7 @@ async function boundedPrompt(
   prompt: string,
   timeoutMs: number | null,
   signals: readonly (AbortSignal | undefined)[] = [],
+  images?: PromptOptions['images'],
 ): Promise<void> {
   let failure: string | null = null;
   const unsubscribe = handle.subscribe((event) => {
@@ -583,7 +741,10 @@ async function boundedPrompt(
   });
   try {
     await Promise.race([
-      handle.prompt(prompt, { owner: REVIEW_OWNER }),
+      handle.prompt(prompt, {
+        owner: REVIEW_OWNER,
+        ...(images !== undefined && images.length > 0 ? { images } : {}),
+      }),
       ...(timeoutMs === null
         ? []
         : [new Promise<never>((_resolve, reject) => {
@@ -743,6 +904,7 @@ export class PerkinsWholeReview {
       }
     };
     let specialistsStarted = 0;
+    const budgetRefusals: RoundBudgetRefusal[] = [];
     let preflightAttempts = 0;
     let terminalAttempts = 0;
     let publishedSubmission: string | null = null;
@@ -761,7 +923,7 @@ export class PerkinsWholeReview {
     const retryPrompt = async (
       handle: AgentHandle, prompt: string, budgetMs: number | null, label: string,
       signals: readonly (AbortSignal | undefined)[], acquire: () => Promise<void>, release: () => void,
-      hasSubmission: () => boolean,
+      hasSubmission: () => boolean, images?: PromptOptions['images'],
     ): Promise<void> => {
       const now = this.pacingOptions.pacingNow ?? Date.now;
       let remaining = budgetMs ?? 0;
@@ -770,7 +932,7 @@ export class PerkinsWholeReview {
         const start = now();
         try {
           if (budgetMs !== null && remaining <= 0) throw new ReviewTurnTimeoutError(budgetMs);
-          await boundedPrompt(handle, prompt, budgetMs === null ? null : remaining, signals);
+          await boundedPrompt(handle, prompt, budgetMs === null ? null : remaining, signals, images);
         } catch (error) {
           // A terminal native submission outranks later transport noise.
           if (hasSubmission()) return;
@@ -794,6 +956,11 @@ export class PerkinsWholeReview {
         },
       });
     };
+
+    // Frozen evidence pixels are read and hash-verified from the frozen copy
+    // on EVERY prompt (a mutated copy refuses that prompt loudly); no
+    // cross-prompt byte memoization.
+    const evidenceImages = (): PromptOptions['images'] => reviewEvidenceImages(review);
 
     const runSpecialist = async (
       lens: PerkinsLens,
@@ -878,6 +1045,10 @@ export class PerkinsWholeReview {
         // supervisor owns stall diagnosis (silence + live-tool/compaction
         // evidence) and the workflow waits for the child's settled turn or
         // an explicit cancellation. Visible prose silence is not idleness.
+        // Blind children never receive the evidence (isolation); every other
+        // child receives the same frozen bytes as the lead or refuses loudly.
+        const childImages = lens === 'blind' ? undefined : evidenceImages();
+        assertEvidenceCapability(handle, childImages, `specialist lens ${lens}`);
         await retryPrompt(
           handle,
           renderSpecialistPrompt(
@@ -889,6 +1060,7 @@ export class PerkinsWholeReview {
           async () => { reviewLease ??= await this.acquireReviewTurnSlot(`lens:${lens}#${attempt}`, signal ?? input.signal); },
           () => { const lease = reviewLease; reviewLease = null; lease?.release(); },
           () => capturedSubmission() !== null,
+          childImages,
         );
         promptResolved = true;
       } catch (error) {
@@ -1152,6 +1324,7 @@ export class PerkinsWholeReview {
         // Capacity is checked BEFORE any child starts: a bound the host
         // could have known up front must never strand started children.
         if (specialistsStarted + scheduled.length > MAX_SPECIALISTS_PER_ROUND) {
+          budgetRefusals.push({ lenses: [...lensesRun], cap: MAX_SPECIALISTS_PER_ROUND, accountedRuns: specialistsStarted });
           throw new Error(`review exceeds ${MAX_SPECIALISTS_PER_ROUND} specialist runs; finish with what has run`);
         }
         for (const run of scheduled) attempts.set(run.lens, run.attempt);
@@ -1368,18 +1541,21 @@ export class PerkinsWholeReview {
             '-C', review.manifest.repoPath, 'diff', '--no-ext-diff', '--no-color', '--find-renames',
             '--name-status', '-z', priorTargetSha, review.manifest.targetSha, '--',
           ], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: GIT_PROOF_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] });
-          // Truthful per-status parsing: an added file has NO old path and a
-          // deleted file has NO new path — a re-reviewer must not be shown a
-          // prior version of a file that did not exist.
+          // Truthful per-status parsing covers every name-status letter
+          // git emits for two committed trees (R33): A/D/M/T are
+          // single-path entries (T is a type change at the SAME path,
+          // present at both revisions), R###/C### are two-path entries,
+          // and anything else fails loudly rather than silently dropping
+          // a changed path from the re-reviewer's delta.
           const fields = listing.split('\0').filter(Boolean);
           const changes: { status: string; oldPath: string | null; newPath: string | null }[] = [];
           for (let i = 0; i < fields.length;) {
             const status = fields[i++]!;
-            if (/^R[0-9]{1,3}$/u.test(status)) {
+            if (/^[RC][0-9]{1,3}$/u.test(status)) {
               const oldPath = fields[i++];
               const newPath = fields[i++];
-              if (oldPath !== undefined && newPath !== undefined) changes.push({ status: 'R', oldPath, newPath });
-            } else if (status === 'A' || status === 'D' || status === 'M') {
+              if (oldPath !== undefined && newPath !== undefined) changes.push({ status: status[0]!, oldPath, newPath });
+            } else if (status === 'A' || status === 'D' || status === 'M' || status === 'T') {
               const path = fields[i++];
               if (path !== undefined) {
                 changes.push({
@@ -1389,7 +1565,7 @@ export class PerkinsWholeReview {
                 });
               }
             } else {
-              i += 1; // unknown types are skipped without mislabeling others
+              throw new Error(`git diff reported an unhandled name-status "${status}" — refusing an incomplete prior-revision listing`);
             }
           }
           payload = JSON.stringify({ priorTargetSha, targetSha: review.manifest.targetSha, changes });
@@ -1473,13 +1649,18 @@ export class PerkinsWholeReview {
         }
         return valid;
       },
-      get deliveredLensFindingTitles() {
-        const byLens = new Map<PerkinsLens, ReadonlySet<string>>();
+      get deliveredLensFindings() {
+        const byLens = new Map<PerkinsLens, Map<string, Set<string>>>();
         for (const result of results.values()) {
           if (result.status !== 'valid' || result.findingsDelivered === false) continue;
-          const titles = byLens.get(result.lens) ?? new Set<string>();
-          for (const finding of result.findings) (titles as Set<string>).add(finding.title.trim());
-          byLens.set(result.lens, titles);
+          const byTitle = byLens.get(result.lens) ?? new Map<string, Set<string>>();
+          for (const finding of result.findings) {
+            const title = finding.title.trim();
+            const locations = byTitle.get(title) ?? new Set<string>();
+            locations.add(provenanceLocation(finding.location));
+            byTitle.set(title, locations);
+          }
+          byLens.set(result.lens, byTitle);
         }
         return byLens;
       },
@@ -1575,7 +1756,7 @@ export class PerkinsWholeReview {
             if (!publishedReportMatches(review, reportBytes)) throw writeError;
             reportFile = resolve(review.directory, 'perkins-report.md');
           }
-          const headMoved = headMovedAtSubmit;
+          const headMoved = headMovedAtSubmit !== null;
           // The reviewer owns the verdict; the host owns assembly of the
           // durable record from the accepted submission.
           const leadFindings: VerifiedFinding[] = submission.findings.map((finding) => ({
@@ -1640,7 +1821,8 @@ export class PerkinsWholeReview {
             canonicalVerdict: submission.verdict, findings, priorDispositions: submission.prior_dispositions,
             specialistRuns, artifactDirectory: review.directory, reportFile,
             targetSha: review.manifest.targetSha, diffBaseSha: review.manifest.diffBaseSha,
-            headMoved, lensEnvelopes: [...envelopes],
+            headMoved, ...(headMovedAtSubmit !== null ? { sourceMovement: headMovedAtSubmit } : {}), lensEnvelopes: [...envelopes],
+            ...(budgetRefusals.length > 0 ? { budgetRefusals: [...budgetRefusals] } : {}),
           };
           return {
             text: JSON.stringify({ accepted: true, canonicalVerdict: submission.verdict, findingCount: findings.length }),
@@ -1719,10 +1901,15 @@ export class PerkinsWholeReview {
           if (turns > MAX_LEAD_TURNS) void lead?.dispose().catch(() => {});
         }
       });
+      // The lead owns the verdict: if the frozen evidence cannot be delivered
+      // as pixels, the round refuses to run text-only instead of pretending.
+      const leadImages = evidenceImages();
+      assertEvidenceCapability(lead, leadImages, 'review lead');
       await retryPrompt(lead, initialPrompt, LEAD_TOTAL_TIMEOUT_MS, 'lead', [input.signal],
         async () => { reviewLease ??= await this.acquireReviewTurnSlot('lead', input.signal); },
         () => { const lease = reviewLease; reviewLease = null; lease?.release(); },
         () => accepted !== null,
+        leadImages,
       );
       if (input.signal?.aborted === true) throw new Error('review operation aborted');
       if (turns > MAX_LEAD_TURNS) throw new Error(`Perkins lead exceeded ${MAX_LEAD_TURNS} turns`);
@@ -1759,7 +1946,7 @@ export class PerkinsWholeReview {
   private validateSubmission(
     context: SubmissionValidationContext,
     raw: unknown,
-    headMovedObserved: boolean,
+    headMovedObserved: SourceMovement | null,
   ): SubmissionValidation {
     const issues: SubmissionValidationIssue[] = [];
     const push = (subject: string, rule: string, message: string): void => {
@@ -1811,17 +1998,23 @@ export class PerkinsWholeReview {
         const evidence = collectBoundedString(candidate.evidence, `${subject} evidence`, 4_000, subject, 'finding-evidence', issues);
         const detail = collectBoundedString(candidate.detail, `${subject} detail`, 320, subject, 'finding-detail', issues);
         const fix = collectBoundedString(candidate.recommended_fix, `${subject} recommended_fix`, 320, subject, 'finding-fix', issues);
-        // Provenance (R12): crediting a lens requires that specialist to
-        // have actually DELIVERED a finding with this exact title — a
-        // valid-but-empty or undelivered run cannot originate a
-        // lead-invented finding; the lead's own judgments source "lead".
+        // Provenance (R12/R38): crediting a lens requires that specialist to
+        // have actually DELIVERED a finding with this exact title AT the
+        // cited location — a valid-but-empty or undelivered run cannot
+        // originate a lead-invented finding, and a same-title finding the
+        // lead relocated is the lead's own judgment; the lead's own
+        // judgments source "lead".
         if (
           title !== null && typeof candidate.source === 'string' && candidate.source !== 'lead' &&
           sources.has(candidate.source) && context.validLenses.has(candidate.source as PerkinsLens)
         ) {
-          const deliveredTitles = context.deliveredLensFindingTitles.get(candidate.source as PerkinsLens);
-          if (deliveredTitles === undefined || !deliveredTitles.has(title.trim())) {
+          const deliveredLocations = context.deliveredLensFindings
+            .get(candidate.source as PerkinsLens)?.get(title.trim());
+          if (deliveredLocations === undefined) {
             push(subject, 'finding-source', `${subject} source "${candidate.source}" did not report a finding titled "${title.trim().slice(0, 120)}"; keep the specialist's exact title to credit it, or attribute your own judgment to "lead"`);
+          } else if (location !== null && !deliveredLocations.has(provenanceLocation(location))) {
+            const delivered = [...deliveredLocations].slice(0, 3).map((item) => `"${item.slice(0, 160)}"`).join(', ');
+            push(subject, 'finding-source', `${subject} source "${candidate.source}" delivered "${title.trim().slice(0, 120)}" at ${delivered === '' ? 'a different location' : delivered}, not "${location.slice(0, 160)}"; cite the delivered location and evidence, or attribute your own judgment to "lead"`);
           }
         }
         if (
@@ -1948,7 +2141,8 @@ export class PerkinsWholeReview {
       if (retainedTitles.length > 0) {
         // Hidden HTML comments are not visible prose: titles buried there
         // do not account for a finding the reader can see (E6).
-        const normalizedReport = report.replace(/<!--[\s\S]*?-->/gu, '').replace(/\s+/gu, ' ');
+        const visibleReport = report.replace(/<!--[\s\S]*?-->/gu, '');
+        const normalizedReport = visibleReport.replace(/\s+/gu, ' ');
         const uniqueRetained = [...new Set(retainedTitles)];
         const missing = uniqueRetained.filter((title) => !normalizedReport.includes(title.replace(/\s+/gu, ' ')));
         if (missing.length > 0) {
@@ -1960,6 +2154,28 @@ export class PerkinsWholeReview {
               'a coherent report references every retained finding (quote or restate its title, including still-present priors), or honestly resolves it in the dispositions',
           );
         }
+        // R37: naming every title is still compatible with prose that
+        // explicitly concludes the change is issue-free. A terminal
+        // clean-slate claim beside retained findings contradicts the report's
+        // own record; per-lens/per-area scoping stays legitimate prose.
+        const retainedPriors = (dispositions ?? []).filter((disposition) => disposition.status === 'still-present');
+        const retainedLocations = [
+          ...(findings ?? []).map((finding) => findingPath(finding)),
+          ...retainedPriors.map((disposition) => findingPath({
+            location: disposition.refresh?.location ?? context.prior[disposition.prior_index]?.location ?? '',
+          })),
+        ].filter((path): path is string => path !== null);
+        const retainedBlocker = (findings ?? []).some((finding) => finding.severity === 'blocker') ||
+          retainedPriors.some((disposition) =>
+            (disposition.refresh?.severity ?? context.prior[disposition.prior_index]?.severity) === 'blocker');
+        const cleanClaim = findTerminalCleanClaim(visibleReport, retainedLocations, retainedBlocker, retainedPriors.length > 0);
+        if (cleanClaim !== null) {
+          push(
+            'report',
+            'report-coherence',
+            `the report concludes the change is issue-free ("${cleanClaim}") while ${uniqueRetained.length} finding(s) remain retained — a terminal clean-slate conclusion contradicts the retained findings; remove it or scope the claim to the lens/file it actually describes`,
+          );
+        }
       }
     }
     // A moved source ref never retargets this frozen review, and it can never
@@ -1967,9 +2183,8 @@ export class PerkinsWholeReview {
     // submission can be accepted against a moved ref. The observation is
     // supplied by the caller (one per submission) so validation and the
     // sealed artifact can never disagree.
-    const headMoved = headMovedObserved;
-    if (headMoved && verdict !== null && verdict !== 'INCOMPLETE') {
-      push('submission', 'head-moved', `the source ref moved after target ${context.review.manifest.targetSha} was frozen; only an INCOMPLETE submission can be accepted`);
+    if (headMovedObserved !== null && verdict !== null && verdict !== 'INCOMPLETE') {
+      push('submission', 'head-moved', `source changed after target ${context.review.manifest.targetSha} was frozen (${headMovedObserved.cause}: ${headMovedObserved.detail}); only an INCOMPLETE submission can be accepted`);
     }
     if (issues.length > 0) return { ok: false, issues };
     if (verdict === null || findings === null || dispositions === null) {
@@ -1979,6 +2194,7 @@ export class PerkinsWholeReview {
   }
 
   private leadPrompt(review: FrozenReview, prior: readonly VerifiedFinding[], priorTargetSha: string | null): string {
+    const evidenceSection = renderEvidencePromptSection(review.evidence.attachments, review.manifest.targetSha);
     return [
       'Conduct the complete Perkins review of this whole change as the lead. You own investigation, verification, prior-finding revisiting, the final report, and the verdict. The host owns safety and terminal validation.',
       '',
@@ -1987,6 +2203,7 @@ export class PerkinsWholeReview {
       ...(priorTargetSha === null ? [] : [`Frozen prior target SHA: ${priorTargetSha}`]),
       `Spec mode: ${review.manifest.specMode}`,
       `Changed files (${review.changedFiles.length}): ${review.changedFiles.join(', ')}`,
+      ...(evidenceSection === '' ? [] : ['', evidenceSection]),
       '',
       '--- FROZEN SPECIFICATION / CONTEXT ---',
       review.specContext,

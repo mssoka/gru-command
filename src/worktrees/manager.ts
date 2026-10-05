@@ -789,6 +789,87 @@ export class WorktreeManager {
     });
   }
 
+  /**
+   * Issue #161: a child worker's own lane, based at the parent lane's
+   * current HEAD. Authority decides isolation:
+   * - `read-only` children get a DETACHED lane at the parent's committed
+   *   HEAD (no branch, no write authority);
+   * - `writer` children get their own branch
+   *   `gru/<jobId>-child-<childId>`, so a child can never mutate the
+   *   parent's working tree implicitly and its authority is explicit.
+   * Read-only lanes skip the bootstrap manifest (only committed bytes,
+   * like review lanes); writer lanes apply it (they are workers).
+   */
+  async createChildWorktree(input: {
+    repoPath: string;
+    jobId: string;
+    childId: string;
+    parentPath: string;
+    authority: 'read-only' | 'writer';
+  }): Promise<WorktreeRecord> {
+    if (input.jobId === '' || input.childId === '') {
+      throw new Error('child worktree requires a non-empty job id and child id');
+    }
+    if (input.authority !== 'read-only' && input.authority !== 'writer') {
+      throw new Error(`unknown child worker authority "${String(input.authority)}"`);
+    }
+    return this.withRepoLock(input.repoPath, async () => {
+      const repo = this.assertRepo(input.repoPath);
+      if (!existsSync(input.parentPath)) {
+        throw new Error(
+          `parent lane path ${input.parentPath} does not exist — a child lane must base on a live parent lane`,
+        );
+      }
+      const parentHead = runGit(input.parentPath, ['rev-parse', 'HEAD']);
+      const path = join(this.opts.root, repo.repoName, `child-${input.childId}`);
+      if (existsSync(path)) {
+        throw new Error(`worktree path already exists: ${path}`);
+      }
+      const branch = input.authority === 'writer' ? `gru/${input.jobId}-child-${input.childId}` : null;
+      if (branch !== null) {
+        const existing = spawnGit(repo.repoPath, ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`]);
+        if (existing.status === 0) {
+          throw new Error(`branch ${branch} already exists — one lane per child, never a reused held branch`);
+        }
+        runGit(repo.repoPath, ['worktree', 'add', '-b', branch, path, parentHead]);
+      } else {
+        runGit(repo.repoPath, ['worktree', 'add', '--detach', path, parentHead]);
+      }
+      // Same guard as job/review lanes: registration failures roll the
+      // tree AND the branch back — no unregistered debris, no wedge.
+      let record;
+      try {
+        if (input.authority === 'writer') await this.bootstrap(repo.repoPath, path);
+        const sha = runGit(path, ['rev-parse', 'HEAD']);
+        record = this.opts.ledger.registerWorktree({
+          id: input.childId,
+          kind: 'child',
+          repoPath: repo.repoPath,
+          repoName: repo.repoName,
+          path,
+          branch,
+          sha,
+          // The child's base is the parent lane's HEAD, not a remote
+          // default — provenance is the parent lane itself (declared).
+          baseSource: null,
+          jobId: input.jobId,
+        });
+      } catch (error) {
+        this.rollbackPartialLane(repo.repoPath, path, branch, error);
+        throw error;
+      }
+      this.log('info', 'child worktree created', {
+        child: input.childId,
+        job: input.jobId,
+        authority: input.authority,
+        path,
+        branch,
+        base: parentHead,
+      });
+      return record;
+    });
+  }
+
   /** Bootstrap manifest (18a): auto-apply at creation; missing = no-op.
    * Async: setup commands run off the event loop, so a slow bootstrap
    * (npm ci) never freezes chat/supervision while dispatch awaits the lane. */
@@ -850,7 +931,7 @@ export class WorktreeManager {
       }
       return this.withRepoLock(row.repoPath, async () => {
         let branchOutcome: 'deleted' | 'retained' | 'none' = 'none';
-        if (row.kind === 'job' && row.branch !== null) {
+        if ((row.kind === 'job' || row.kind === 'child') && row.branch !== null) {
           const present = spawnGit(row.repoPath, [
             'rev-parse',
             '--verify',
@@ -1248,11 +1329,11 @@ export class WorktreeManager {
       // branch is retained.)
       const base = this.resolveBase(row.repoPath);
       freshHead = base.sha;
-      // Containment-verified branch delete — job lanes only; a branch
-      // is deleted only when its tip is provably contained in a durable
-      // local ref or the freshly verified remote default; otherwise it
-      // is RETAINED, noted, and the reason reported.
-      if (row.kind === 'job' && row.branch !== null) {
+      // Containment-verified branch delete — job and writer-child lanes;
+      // a branch is deleted only when its tip is provably contained in a
+      // durable local ref or the freshly verified remote default;
+      // otherwise it is RETAINED, noted, and the reason reported.
+      if ((row.kind === 'job' || row.kind === 'child') && row.branch !== null) {
         branchOutcome = this.deleteBranchContained(
           row,
           baseBranch,
@@ -1334,7 +1415,7 @@ export class WorktreeManager {
     baseBranch: string | undefined,
     freshRemoteBranch: string | null,
   ): 'deleted' | 'retained' | 'none' {
-    if (row.kind !== 'job' || row.branch === null) return 'none';
+    if ((row.kind !== 'job' && row.kind !== 'child') || row.branch === null) return 'none';
     try {
       return this.deleteBranchContained(row, baseBranch, freshRemoteBranch);
     } catch (error) {

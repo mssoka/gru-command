@@ -138,6 +138,12 @@ export interface CiFailure {
   readonly url: string | null;
 }
 
+/** One completed check run's identity (name + optional run/details URL). */
+export interface CiCheckRun {
+  readonly name: string;
+  readonly url: string | null;
+}
+
 export interface CiState {
   readonly sha: string;
   readonly status: CiStatus;
@@ -146,6 +152,9 @@ export interface CiState {
   readonly signature: string;
   readonly failures: readonly CiFailure[];
   readonly checks: readonly string[];
+  /** Completed check-run identities with their URLs when the host exposed
+   * them. Present on freshly summarized states; absent on legacy payloads. */
+  readonly runs?: readonly CiCheckRun[];
 }
 
 export interface NormalizedBranchState {
@@ -186,11 +195,15 @@ export function summarizeCheckRuns(sha: string, runs: readonly GhCheckRun[]): Ci
     .filter((run) => run.conclusion !== null && FAILURE_CONCLUSIONS.has(run.conclusion))
     .map((run) => ({ name: run.name, conclusion: run.conclusion as string, url: run.url }));
   const pending = runs.some((run) => run.status !== 'completed');
-  const checks = runs.filter((run) => run.status === 'completed').map((run) => run.name).sort();
+  const completed = runs
+    .filter((run) => run.status === 'completed')
+    .map((run) => ({ name: run.name, url: run.url }))
+    .sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
+  const checks = completed.map((run) => run.name);
   const signature = failures.map((failure) => failure.name).sort().join('|');
-  if (failures.length > 0) return { sha, status: 'failed', signature, failures, checks };
-  if (pending) return { sha, status: 'pending', signature: '', failures: [], checks };
-  return { sha, status: 'green', signature: '', failures: [], checks };
+  if (failures.length > 0) return { sha, status: 'failed', signature, failures, checks, runs: completed };
+  if (pending) return { sha, status: 'pending', signature: '', failures: [], checks, runs: completed };
+  return { sha, status: 'green', signature: '', failures: [], checks, runs: completed };
 }
 
 /** Mechanical checks are build/test/lint-style kinds a lane can fix; every
@@ -320,6 +333,8 @@ export interface CiGreenSignal extends GitHubSignalBase {
   readonly kind: 'ci-green';
   readonly sha: string;
   readonly checks: readonly string[];
+  /** Completed check-run identities/URLs when observed. */
+  readonly runs?: readonly CiCheckRun[];
 }
 
 export type GitHubSignal = PrMergedSignal | PrConflictSignal | CiFailedSignal | CiGreenSignal;
@@ -368,7 +383,7 @@ export function diffBranchState(
   if (ci !== null && ci.status === 'green') {
     const alreadyApplied = prev?.ci != null && prev.ci.sha === ci.sha && prev.ci.status === 'green';
     if (!alreadyApplied) {
-      signals.push({ kind: 'ci-green', ...base, sha: ci.sha, checks: ci.checks });
+      signals.push({ kind: 'ci-green', ...base, sha: ci.sha, checks: ci.checks, ...(ci.runs !== undefined ? { runs: ci.runs } : {}) });
     }
   }
   return signals;
@@ -640,6 +655,15 @@ export interface GitHubPollLedger {
   getJob(id: string): JobRecord | null;
   listWorktrees(opts?: { jobId?: string }): readonly WorktreeRecord[];
   latestJobEvent(jobId: string, kind: string): EventRecord | null;
+  /** The lane's bound agent rows — used to bind escalation rows to their
+   * lane's worker through the existing notification agentId field. */
+  listAgents(): readonly {
+    readonly id: string;
+    readonly jobId: string | null;
+    readonly role: string;
+    /** Issue #161: primary-minion selection excludes child workers. */
+    readonly parentage?: 'top-level' | 'child' | null;
+  }[];
   appendCustomEvent(fields: {
     kind: string;
     jobId?: string | null;
@@ -656,6 +680,7 @@ export interface GitHubPollNotifications {
     title: string;
     detail?: string | null;
     dedupe: 'unacked' | 'active' | 'all';
+    agentId?: string | null;
   }): unknown;
 }
 
@@ -694,6 +719,7 @@ export function branchStatePayload(lane: TrackedLane, state: NormalizedBranchSta
             signature: state.ci.signature,
             failures: state.ci.failures,
             checks: state.ci.checks,
+            ...(state.ci.runs !== undefined ? { runs: state.ci.runs } : {}),
           },
   };
 }
@@ -735,6 +761,15 @@ export function readBranchState(ledger: Pick<GitHubPollLedger, 'latestJobEvent'>
           checks: Array.isArray(ciRaw['checks'])
             ? (ciRaw['checks'] as unknown[]).filter((entry): entry is string => typeof entry === 'string')
             : [],
+          ...(Array.isArray(ciRaw['runs'])
+            ? {
+                runs: (ciRaw['runs'] as unknown[]).flatMap((entry): CiCheckRun[] => {
+                  const run = record(entry);
+                  const name = run !== null ? strOrNull(run['name']) : null;
+                  return run === null || name === null ? [] : [{ name, url: strOrNull(run['url']) }];
+                }),
+              }
+            : {}),
         };
   return {
     sha: strOrNull(payload['sha']),
@@ -1027,6 +1062,13 @@ export class GitHubSignalPoll {
       title: `PR ${prLabel} conflicts with its base (${repoFullName(signal.repo)})`,
       detail,
       dedupe: 'unacked',
+      // Bind the row to the lane's current worker (existing agentId
+      // semantics) so a merged/done lane's leftover row is classified as
+      // a closed receipt instead of live NEEDS GRU work. The job is
+      // already validated by the poll; no bound worker → unbound and
+      // live (unknown historical rows are never guessed; tracked-review
+      // A4).
+      agentId: this.laneMinionId(signal.jobId),
     });
     this.log('info', 'github poll: PR conflict observed', {
       job: signal.jobId,
@@ -1063,12 +1105,28 @@ export class GitHubSignalPoll {
       title: `CI failed on ${signal.branch} (${repoFullName(signal.repo)})`,
       detail,
       dedupe: 'unacked',
+      // Judgment-tier rows are machine attention for the lane: bind the
+      // lane's current worker through the existing agentId (the same
+      // pattern as pr-conflict) so a terminal lane's leftover row is a
+      // closed receipt. Mechanical (fyi) rows stay unbound.
+      ...(signal.tier === 'judgment' ? { agentId: this.laneMinionId(signal.jobId) } : {}),
     });
     this.log('info', 'github poll: CI failure observed', {
       job: signal.jobId,
       sha: signal.sha,
       tier: signal.tier,
     });
+  }
+
+  /** The lane's current worker id for the existing notification.agentId
+   * binding; null when no worker is bound (the row stays unbound and
+   * live). Selection follows ledger.listAgents() order like the A4
+   * resolver; any same-job minion classifies against the same job. */
+  private laneMinionId(jobId: string): string | null {
+    // Issue #161: a child worker is never the lane's writer.
+    return this.ledger
+      .listAgents()
+      .find((agent) => agent.jobId === jobId && agent.role === 'minion' && agent.parentage !== 'child')?.id ?? null;
   }
 
   /** CI green: the review-gate signal event (no notification — green is a
@@ -1083,6 +1141,7 @@ export class GitHubSignalPoll {
         pr: signal.prNumber,
         sha: signal.sha,
         checks: signal.checks,
+        ...(signal.runs !== undefined ? { runs: signal.runs } : {}),
       },
     });
     this.log('info', 'github poll: CI green signal recorded', {

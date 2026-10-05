@@ -169,6 +169,7 @@ describe('GET /health', () => {
               state: 'watching',
               restarts: 1,
               breakerOpen: false,
+              stopReason: null,
               openTurn: false,
               openToolCalls: 0,
               lastEventAt: '2026-09-18T00:00:00.000Z',
@@ -186,7 +187,7 @@ describe('GET /health', () => {
       expect(supervision['enabled']).toBe(true);
       expect(supervision['turnSilenceMs']).toBe(900_000);
       const agents = supervision['agents'] as Array<Record<string, unknown>>;
-      expect(agents[0]).toMatchObject({ agentId: 'gru-main', state: 'watching', restarts: 1 });
+      expect(agents[0]).toMatchObject({ agentId: 'gru-main', state: 'watching', restarts: 1, stopReason: null });
     } finally {
       await handle.stop();
     }

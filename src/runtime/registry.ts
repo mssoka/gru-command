@@ -272,6 +272,28 @@ export class RuntimeRegistry {
     }
   }
 
+  /** Issue #161: reserve one resident worker permit up front (the same
+   * FIFO pool `spawn` charges), then spawn against THAT permit — a child
+   * admission can no longer race a probe's free-seat observation. */
+  async reserveResident(signal?: AbortSignal): Promise<() => void> {
+    return this.residents.acquire(1, signal);
+  }
+
+  /** Spawn a session on an already-held resident permit (never charges a
+   * second one). On failure the permit is released. */
+  async spawnWithResident(
+    role: Role,
+    options: SpawnOptions,
+    release: () => void,
+  ): Promise<AgentHandle> {
+    try {
+      return await this.spawnReserved(role, options, release);
+    } catch (error) {
+      release();
+      throw error;
+    }
+  }
+
   async reserveReviewRound(signal?: AbortSignal): Promise<ResidentReviewRound> {
     // Finite positive validation BEFORE acquiring any capacity.
     if (this.opts.closeSettleMs !== undefined &&
@@ -509,6 +531,8 @@ export class RuntimeRegistry {
     const handle = await adapter.spawn(role, {
       ...(options.resumeFile !== undefined ? { resumeFile: options.resumeFile } : {}),
       ...(options.cwd !== undefined ? { cwd: options.cwd } : {}),
+      ...(options.agentId !== undefined ? { agentId: options.agentId } : {}),
+      ...(options.roleTools !== undefined ? { roleTools: options.roleTools } : {}),
       ...(options.isolatedReview !== undefined ? { isolatedReview: options.isolatedReview } : {}),
       ...(options.reviewLead !== undefined ? { reviewLead: options.reviewLead } : {}),
       ...(options.reviewModel !== undefined ? { reviewModel: options.reviewModel } : {}),

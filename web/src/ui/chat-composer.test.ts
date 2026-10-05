@@ -161,29 +161,29 @@ describe('multi-line composer', () => {
     expect(input().getAttribute('enterkeyhint')).toBe('send');
 
     input().value = 'one line only';
-    input().dispatchEvent(
-      new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }),
-    );
+    const sent = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
+    input().dispatchEvent(sent);
+    expect(sent.defaultPrevented).toBe(true);
     expect(submits()).toBe(1);
 
-    input().dispatchEvent(
-      new KeyboardEvent('keydown', {
-        key: 'Enter',
-        shiftKey: true,
-        bubbles: true,
-        cancelable: true,
-      }),
-    );
+    const shifted = new KeyboardEvent('keydown', {
+      key: 'Enter',
+      shiftKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    input().dispatchEvent(shifted);
+    expect(shifted.defaultPrevented).toBe(false); // the native newline stands
     expect(submits()).toBe(1);
 
-    input().dispatchEvent(
-      new KeyboardEvent('keydown', {
-        key: 'Enter',
-        isComposing: true,
-        bubbles: true,
-        cancelable: true,
-      }),
-    );
+    const composing = new KeyboardEvent('keydown', {
+      key: 'Enter',
+      isComposing: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    input().dispatchEvent(composing);
+    expect(composing.defaultPrevented).toBe(false); // IME confirmation stays native
     expect(submits()).toBe(1);
   });
 
@@ -196,18 +196,22 @@ describe('multi-line composer', () => {
     const submits = countedSubmit(form);
     input().value = 'touch draft';
 
-    input().dispatchEvent(
-      new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }),
-    );
-    input().dispatchEvent(
-      new KeyboardEvent('keydown', {
-        key: 'Enter',
-        repeat: true,
-        bubbles: true,
-        cancelable: true,
-      }),
-    );
+    const touchPress = new KeyboardEvent('keydown', {
+      key: 'Enter',
+      bubbles: true,
+      cancelable: true,
+    });
+    input().dispatchEvent(touchPress);
+    const touchRepeat = new KeyboardEvent('keydown', {
+      key: 'Enter',
+      repeat: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    input().dispatchEvent(touchRepeat);
     expect(submits()).toBe(0); // the return key's job on touch is a NEWLINE
+    expect(touchPress.defaultPrevented).toBe(false); // the native newline stands
+    expect(touchRepeat.defaultPrevented).toBe(false);
 
     // A live flip (keyboard attach/detach) re-labels the key and restores
     // desktop semantics with the pointer.
@@ -235,22 +239,20 @@ describe('multi-line composer', () => {
     const submits = countedSubmit(form);
     input().value = 'guarded gestures';
 
-    input().dispatchEvent(
-      new KeyboardEvent('keydown', {
-        key: 'Enter',
-        ctrlKey: true,
-        bubbles: true,
-        cancelable: true,
-      }),
-    );
-    input().dispatchEvent(
-      new KeyboardEvent('keydown', {
-        key: 'Enter',
-        metaKey: true,
-        bubbles: true,
-        cancelable: true,
-      }),
-    );
+    const control = new KeyboardEvent('keydown', {
+      key: 'Enter',
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    input().dispatchEvent(control);
+    const command = new KeyboardEvent('keydown', {
+      key: 'Enter',
+      metaKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    input().dispatchEvent(command);
     input().dispatchEvent(
       new KeyboardEvent('keydown', {
         key: 'Enter',
@@ -260,6 +262,8 @@ describe('multi-line composer', () => {
       }),
     );
     expect(submits()).toBe(0);
+    expect(control.defaultPrevented).toBe(false); // modifier combos stay native
+    expect(command.defaultPrevented).toBe(false);
 
     // A held Enter: the first press sends, every auto-repeat is ignored.
     input().dispatchEvent(
@@ -273,6 +277,87 @@ describe('multi-line composer', () => {
         cancelable: true,
       }),
     );
+    expect(submits()).toBe(1);
+  });
+
+  it('a held Enter auto-repeat is default-prevented so it cannot insert newlines', () => {
+    const view = new ChatView(() => true);
+    view.bindAttach(null);
+    const form = document.getElementById('chat-form') as HTMLFormElement;
+    const submits = countedSubmit(form);
+
+    input().value = 'hold to send';
+    const first = new KeyboardEvent('keydown', {
+      key: 'Enter',
+      bubbles: true,
+      cancelable: true,
+    });
+    input().dispatchEvent(first);
+    expect(first.defaultPrevented).toBe(true);
+    expect(submits()).toBe(1);
+    expect(input().value).toBe('');
+
+    // Enter is still held: the browser fires auto-repeats after the first
+    // press already sent and cleared the composer. A repeat must not
+    // re-submit AND must not keep the native default — that default is
+    // what types a stray newline into the fresh draft (#26).
+    const repeat = new KeyboardEvent('keydown', {
+      key: 'Enter',
+      repeat: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    input().dispatchEvent(repeat);
+    expect(repeat.defaultPrevented).toBe(true);
+    expect(submits()).toBe(1);
+    expect(input().value).toBe('');
+  });
+
+  it('a held Enter keeps its repeats suppressed when Shift joins mid-hold; a Shift+Enter hold stays native', () => {
+    const view = new ChatView(() => true);
+    view.bindAttach(null);
+    const form = document.getElementById('chat-form') as HTMLFormElement;
+    const submits = countedSubmit(form);
+
+    // Plain Enter sends, then stays held while Shift is pressed: the
+    // repeats still belong to the sending press, so they must keep the
+    // native newline suppressed.
+    input().value = 'hold to send';
+    input().dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }),
+    );
+    expect(submits()).toBe(1);
+    const shiftedRepeat = new KeyboardEvent('keydown', {
+      key: 'Enter',
+      shiftKey: true,
+      repeat: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    input().dispatchEvent(shiftedRepeat);
+    expect(shiftedRepeat.defaultPrevented).toBe(true);
+    expect(submits()).toBe(1);
+    input().dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', bubbles: true }));
+
+    // A hold that STARTS as Shift+Enter is a deliberate newline gesture:
+    // its press and repeats keep the native default and never send.
+    const shiftStart = new KeyboardEvent('keydown', {
+      key: 'Enter',
+      shiftKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    input().dispatchEvent(shiftStart);
+    expect(shiftStart.defaultPrevented).toBe(false);
+    const shiftRepeat = new KeyboardEvent('keydown', {
+      key: 'Enter',
+      shiftKey: true,
+      repeat: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    input().dispatchEvent(shiftRepeat);
+    expect(shiftRepeat.defaultPrevented).toBe(false);
     expect(submits()).toBe(1);
   });
 

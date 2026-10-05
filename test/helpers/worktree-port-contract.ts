@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { existsSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import type { WorktreePort } from '../../src/dispatch/worktree-port.js';
 
 /**
@@ -73,6 +75,78 @@ export function runWorktreePortContract(name: string, make: () => Promise<PortCo
       expect(scoped.every((lane) => lane.jobId === 'contract-job')).toBe(true);
       const foreign = h.port.listWorktrees({ jobId: 'contract-job-foreign' });
       expect(foreign.map((lane) => lane.id)).toEqual(['contract-job-foreign']);
+    });
+
+    it('CHILD LANES: own id, job scope, parent-HEAD base, detached read-only / branched writer, sweep', async () => {
+      const jobLane = h.port.listWorktrees({ jobId: 'contract-job' }).find((lane) => lane.kind === 'job');
+      expect(jobLane).toBeDefined();
+      // Advance the PARENT lane's HEAD: a child lane must base on the
+      // parent's CURRENT committed head, never a stale starting sha. When
+      // the harness's fixture repo is no longer on disk (the lightweight
+      // in-memory double's file cleanup runs between tests), the base is
+      // still pinned by the REAL-manager run of this same contract.
+      let advancedHead: string | null = null;
+      try {
+        writeFileSync(join(jobLane!.path, 'parent-advance.txt'), 'advanced\n', 'utf-8');
+        execFileSync('git', ['-C', jobLane!.path, 'add', 'parent-advance.txt'], { stdio: 'ignore' });
+        execFileSync(
+          'git',
+          ['-C', jobLane!.path, '-c', 'user.name=Contract', '-c', 'user.email=contract@example.invalid', 'commit', '-m', 'advance parent head'],
+          { stdio: 'ignore' },
+        );
+        advancedHead = execFileSync('git', ['-C', jobLane!.path, 'rev-parse', 'HEAD'], {
+          encoding: 'utf-8',
+        }).trim();
+      } catch (error) {
+        // Only the lightweight in-memory harness (whose fixture repo is
+        // cleaned up between contract tests) may skip the advance. A real
+        // git fixture that cannot commit is a broken guarantee — fail loud
+        // rather than silently dropping the base assertion.
+        const isGitWorktree = spawnSync('git', ['-C', jobLane!.path, 'rev-parse', '--is-inside-work-tree'], {
+          stdio: 'ignore',
+        }).status === 0;
+        if (isGitWorktree) throw error;
+        advancedHead = null;
+      }
+      const readOnly = await h.port.createChildWorktree({
+        repoPath: h.repoPath,
+        jobId: 'contract-job',
+        childId: 'contract-child-ro',
+        parentPath: jobLane!.path,
+        authority: 'read-only',
+      });
+      expect(readOnly.id).toBe('contract-child-ro'); // ids ARE owner ids
+      expect(readOnly.kind).toBe('child');
+      expect(readOnly.branch).toBeNull(); // read-only is detached
+      expect(readOnly.jobId).toBe('contract-job');
+      expect(readOnly.roundId).toBeNull();
+      expect(existsSync(readOnly.path)).toBe(true);
+      // The child lane actually contains the parent's latest commit.
+      if (advancedHead !== null) {
+        expect(readOnly.sha).toBe(advancedHead);
+        expect(readFileSync(join(readOnly.path, 'parent-advance.txt'), 'utf-8')).toBe('advanced\n');
+      }
+      const writer = await h.port.createChildWorktree({
+        repoPath: h.repoPath,
+        jobId: 'contract-job',
+        childId: 'contract-child-w',
+        parentPath: jobLane!.path,
+        authority: 'writer',
+      });
+      expect(writer.kind).toBe('child');
+      expect(writer.branch).toBe('gru/contract-job-child-contract-child-w');
+      if (advancedHead !== null) {
+        expect(writer.sha).toBe(advancedHead);
+        expect(readFileSync(join(writer.path, 'parent-advance.txt'), 'utf-8')).toBe('advanced\n');
+      }
+      // Child lanes stay inside their job's scope (never a foreign leak).
+      const scoped = h.port.listWorktrees({ jobId: 'contract-job' });
+      expect(scoped.some((lane) => lane.kind === 'child' && lane.id === 'contract-child-ro')).toBe(true);
+      expect(scoped.some((lane) => lane.kind === 'child' && lane.id === 'contract-child-w')).toBe(true);
+      // Release sweeps the tree under the child id (the same path as any lane).
+      const swept = await h.port.release({ worktreeId: 'contract-child-ro' });
+      expect(swept.status).toBe('swept');
+      expect(existsSync(readOnly.path)).toBe(false);
     });
 
     it('RELEASE: sweeps the lane (tree gone, status swept), idempotent on repeat', async () => {

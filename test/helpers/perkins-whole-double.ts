@@ -32,6 +32,8 @@ export interface WholeSpawnCall {
   readonly agentId: string;
   readonly sessionFile: string;
   prompt?: string;
+  /** Images attached to the prompt, when the review path supplied them. */
+  images?: ReadonlyArray<{ readonly mediaType: string; readonly data: string }>;
   disposed?: boolean;
   disposeRejected?: boolean;
 }
@@ -116,6 +118,10 @@ export interface WholeLeadOptions {
   /** After the worklist completes, try one more run of this (exhausted)
    * lens; the host refusal is recorded and the lead proceeds. */
   readonly probeExhausted?: string;
+  /** Raw run batches issued AFTER the worklist settles: each entry is one
+   * tool call's lenses. Success and refusal are both recorded, so a test
+   * can hold the lead to a batch the round budget can no longer fit. */
+  readonly probes?: ReadonlyArray<readonly string[]>;
   readonly beforeSubmit?: () => void;
   readonly onLeadStart?: () => void;
   readonly onPriorRevision?: (list: unknown, selected: unknown, prompt: string) => void | Promise<void>;
@@ -130,6 +136,9 @@ export interface WholeLeadOptions {
   readonly submitRetries?: number;
   /** Build the exact real-submission payload per attempt (1-based). */
   readonly submitPayload?: (attempt: number, submission: WholeSubmission, findings: readonly WholeFindingView[]) => unknown;
+  /** Declare image input capability on spawned handles (default false: the
+   * offline double is text-only unless a test exercises vision delivery). */
+  readonly images?: boolean;
 }
 
 const SEVERITY_RANK: Record<string, number> = { blocker: 3, warning: 2, note: 1 };
@@ -155,11 +164,20 @@ export function fakeWholeSpawner(
   readonly childCalls: WholeSpawnCall[];
   readonly toolErrors: ReadonlyArray<{ tool: string; error: string }>;
   readonly preflightResults: ReadonlyArray<{ text: string; details?: Readonly<Record<string, unknown>>; terminate?: boolean }>;
+  /** Every run tool call's lens list in order — refusals included. */
+  readonly attemptedBatches: ReadonlyArray<ReadonlyArray<string>>;
+  /** Accepted run tool calls' lens lists in order (children actually started). */
+  readonly runBatches: ReadonlyArray<ReadonlyArray<string>>;
+  /** Post-worklist probes, success or refusal. */
+  readonly probeOutcomes: ReadonlyArray<{ readonly lenses: readonly string[]; readonly ok: boolean; readonly error?: string }>;
 } {
   const calls: WholeSpawnCall[] = [];
   const leadCalls: WholeSpawnCall[] = [];
   const childCalls: WholeSpawnCall[] = [];
   const toolErrors: { tool: string; error: string }[] = [];
+  const attemptedBatches: string[][] = [];
+  const runBatches: string[][] = [];
+  const probeOutcomes: { lenses: readonly string[]; ok: boolean; error?: string }[] = [];
   const preflightResults: { text: string; details?: Readonly<Record<string, unknown>>; terminate?: boolean }[] = [];
   let next = 0;
 
@@ -249,10 +267,12 @@ export function fakeWholeSpawner(
         runs = batch;
       }
       first = false;
+      attemptedBatches.push([...runs]);
       try {
         const response = JSON.parse((await runTool.execute({ runs: runs.map((lens) => ({ lens })) })).text) as {
           results: Array<{ lens: string; status: string; failureKind?: string; error?: string; findings?: WholeFindingView[] }>;
         };
+        runBatches.push([...runs]);
         for (const result of response.results) {
           if (result.status === 'valid') findings.push(...(result.findings ?? []));
           else if (!retried.has(result.lens)) {
@@ -295,6 +315,20 @@ export function fakeWholeSpawner(
       try {
         await runTool.execute({ runs: [{ lens: probe }] });
       } catch (error) {
+        toolErrors.push({ tool: 'perkins_run_specialists', error: String(error) });
+      }
+    }
+    for (const batch of options.probes ?? []) {
+      try {
+        const response = JSON.parse((await runTool.execute({ runs: batch.map((lens) => ({ lens })) })).text) as {
+          results: Array<{ lens: string; status: string; findings?: WholeFindingView[] }>;
+        };
+        probeOutcomes.push({ lenses: [...batch], ok: true });
+        for (const result of response.results) {
+          if (result.status === 'valid') findings.push(...(result.findings ?? []));
+        }
+      } catch (error) {
+        probeOutcomes.push({ lenses: [...batch], ok: false, error: String(error) });
         toolErrors.push({ tool: 'perkins_run_specialists', error: String(error) });
       }
     }
@@ -430,11 +464,12 @@ export function fakeWholeSpawner(
       role: 'perkins',
       id: agentId,
       sessionFile: file,
-      capabilities: CAPS,
+      capabilities: { ...CAPS, images: options.images === true },
       reviewIsolation: true,
       ...(declaresNativeTools ? { reviewTools: requestedNativeTools.map((tool) => tool.name) } : {}),
-      async prompt(prompt) {
+      async prompt(prompt, promptOptions) {
         call.prompt = prompt;
+        if (promptOptions?.images !== undefined) call.images = promptOptions.images;
         const error = options.promptError?.(call) ?? null;
         if (error !== null) {
           for (const listener of listeners) listener({ type: 'error', error, fatal: false });
@@ -486,7 +521,7 @@ export function fakeWholeSpawner(
     return handle;
   };
 
-  return { spawner, calls, leadCalls, childCalls, toolErrors, preflightResults };
+  return { spawner, calls, leadCalls, childCalls, toolErrors, preflightResults, attemptedBatches, runBatches, probeOutcomes };
 }
 
 /** A grounded finding the scripted child can return for a fixture diff. */
