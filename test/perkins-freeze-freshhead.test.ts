@@ -11,6 +11,7 @@ import {
   type PrHeadProbe,
 } from '../src/dispatch/perkins-review/fresh-head.js';
 import { WaveRunner, type FallbackGateOutcome, type WaveOutcome } from '../src/dispatch/perkins.js';
+import { freezeReviewInputs, sourceMovementSinceFreeze } from '../src/dispatch/perkins-review/artifacts.js';
 import type { AgentSpawner } from '../src/dispatch/service.js';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
@@ -770,6 +771,73 @@ describe('freeze-time integration on PR rounds', () => {
     expect(manifest.targetRef).toBe('origin/feature/lane');
   });
 
+  it('a FULLY-QUALIFIED revision pin (refs/remotes/origin/feature/lane~1) skips the advertised probe — a genuine qualified tracking ref keeps it (gh-169 P9)', async () => {
+    const repo = makeFixtureRepo('freeze-pin-qualified');
+    repos.push(repo);
+    repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    repo.git(['checkout', '-b', 'feature/lane']);
+    const laneFirst = repo.commitFile('src/lane.ts', 'export const lane = true;\n');
+    const laneTip = repo.commitFile('src/lane2.ts', 'export const lane2 = true;\n');
+    const qualifiedOrigin = attachBareOrigin(repo);
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/main']);
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/feature/lane']);
+    const ancestor = repo.git(['rev-parse', 'refs/remotes/origin/feature/lane~1']);
+    expect(ancestor).toBe(laneFirst);
+    const root = tempDir('gru-freeze-qualified-port-');
+    const artifacts = tempDir('gru-freeze-qualified-artifacts-');
+    const sessions = tempDir('gru-freeze-qualified-sessions-');
+    const ledger = makeLedger();
+    const port = new GitReviewPort(root, 'feature/lane', laneTip);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-pin-qualified' });
+    const job = ledger.addJob({
+      id: 'job-pin-qualified', repo: 'fixture', title: 'qualified revision pin', baseBranch: 'main',
+      briefing: 'Acceptance: lane returns true.',
+    });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://github.com/acme/fixture/pull/24');
+    const wave = new WaveRunner({
+      ledger,
+      worktrees: port,
+      spawner: fakeWholeSpawner(sessions, { childAnswer: () => '[]' }).spawner,
+      reviewArtifactRoot: artifacts,
+      prHeadProbe: fixedProbe('feature/lane', laneTip),
+    });
+    const outcome = asWave(await wave.runRound({ jobId: job.id, targetRef: 'refs/remotes/origin/feature/lane~1' }));
+    // The named ancestor froze — and the advertised-tip probe (whose
+    // ls-remote of refs/heads/feature/lane~1 would exit 2 and poison the
+    // round as check-failed) correctly SKIPPED the expression spelling.
+    expect(outcome.round.targetRef).toBe(ancestor);
+    expect(outcome.headMoved).toBe(false);
+    const events = ledger.listEvents({ limit: 200 });
+    expect(events.some((event) => event.kind === 'round.head-moved')).toBe(false);
+    expect(events.find((event) => event.kind === 'round.admission-preflight')?.payload).toMatchObject({ ok: true });
+    // The GENUINE qualified tracking ref keeps its advertised-tip check:
+    // after the remote tip advances, the same probe reports movement.
+    const frozenTracking = freezeReviewInputs({
+      roundId: 'qualified-tracking-round',
+      repoPath: repo.path,
+      artifactRoot: artifacts,
+      baseRef: 'main',
+      targetRef: laneTip,
+      movementRef: 'refs/remotes/origin/feature/lane',
+      spec: 'Acceptance: lane returns true.',
+    });
+    expect(sourceMovementSinceFreeze(frozenTracking)).toBeNull();
+    // R4-9: advance the BARE advertised branch from a SECOND clone so the
+    // fixture's LOCAL tracking ref stays exactly where it froze — the
+    // movement proof must come from the advertised-tip probe alone.
+    const secondClone = tempDir('gru-freeze-qualified-clone-');
+    execFileSync('git', ['clone', '--quiet', qualifiedOrigin, secondClone], { stdio: 'ignore' });
+    execFileSync('git', ['-C', secondClone, 'checkout', '--quiet', 'feature/lane'], { stdio: 'ignore' });
+    execFileSync('git', ['-C', secondClone, ...['-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid'], 'commit', '--allow-empty', '-m', 'advance the advertised tip'], { stdio: 'ignore' });
+    execFileSync('git', ['-C', secondClone, 'push', '--quiet', 'origin', `refs/heads/feature/lane:refs/heads/feature/lane`], { stdio: 'ignore' });
+    expect(repo.git(['rev-parse', 'refs/remotes/origin/feature/lane'])).toBe(laneTip); // local ref unmoved
+    const moved = sourceMovementSinceFreeze(frozenTracking);
+    expect(moved?.cause).toBe('target-moved');
+    expect(moved?.detail).toContain('advertised origin/feature/lane');
+  });
+
   it('an origin-prefixed REVISION PIN (origin/feature/lane~1) on a linked PR freezes the named ancestor, never the live PR tip (Perkins R4)', async () => {
     const repo = makeFixtureRepo('freeze-pin-expr-pr');
     repos.push(repo);
@@ -818,6 +886,17 @@ describe('freeze-time integration on PR rounds', () => {
     ) as { readonly targetSha: string; readonly targetRef: string };
     expect(manifest.targetSha).toBe(ancestor);
     expect(manifest.targetRef).toBe('origin/feature/lane~1');
+    // gh-169: a revision-expression pin is not a branch spelling — the
+    // advertised-branch probe must not false-alarm it into check-failed
+    // movement. The round passes admission preflight and finalizes without
+    // ANY head-movement record (previously the poisoned probe forced
+    // headMoved with cause check-failed; the verdict stays withheld only
+    // because this fixture arms a PR link with no poster).
+    expect(outcome.headMoved).toBe(false);
+    const events = ledger.listEvents({ limit: 200 });
+    expect(events.some((event) => event.kind === 'round.head-moved')).toBe(false);
+    const preflight = events.find((event) => event.kind === 'round.admission-preflight');
+    expect(preflight?.payload).toMatchObject({ ok: true });
   });
 
   it('an origin-prefixed REVISION PIN (origin/feature/lane~1) on a non-PR round resolves the named ancestor — no literal branch fetch (Perkins R4)', async () => {

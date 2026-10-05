@@ -155,6 +155,27 @@ specialist runs (retries included), two attempts per lens, and two real
 terminal submissions (free preflight is distinct); failed attempts count and
 stay recorded, and a completed lens cannot be rerun for a second opinion.
 Lenses the lead did not use are reported as `not used`, never as coverage.
+Immediately after the freeze (and before the run promise or any lead/child
+spawn), an **admission preflight** re-validates the complete frozen packet
+read-only — head binding, every declared artifact digest, evidence
+attachment bytes, the CI record's shape, and the spec's explicit CI and
+verification sections (a no-binding verification run freezes an explicit
+UNAVAILABLE disclosure, never silence) — and refuses with one exhaustive,
+named missing-input list (`round.admission-preflight`); a refused round
+aborts without spawn. Parent-failure truth (gh-169): a round whose PARENT
+fails after a review owner spawned (lead transport death, restart,
+finalization crash) records exactly one `round.parent-incident` event;
+lenses with a started attempt carry an honest interrupted-execution error,
+and never-started lenses keep their `pending` chips — one lead disconnect
+is one parent incident, never a slate of failed specialists. A PRE-SPAWN
+interruption (setup shutdown or a pre-spawn workflow failure) is not a
+parent incident: it leaves the durable negative owner receipt
+(`round.review-no-spawn`) and an INCOMPLETE report whose heading says
+setup refusal/interruption — no incident event exists to find. A revision-expression or tag pin
+(`origin/topic~1`, `origin/v1`) is not a branch spelling: the
+advertised-tip movement probe skips it (the pin still binds through local
+resolution and the pristine-checkout proof), so pinned rounds no longer
+degenerate into check-failed movement.
 
 - The lead receives only its declared product-native tools: four
   whole-change orchestration tools (run tracked specialist children, store
