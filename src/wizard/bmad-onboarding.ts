@@ -256,6 +256,10 @@ function manifestFor(repoPath: string): { text: string; summary: BmadManifestSum
  */
 function existingManifestFor(repoPath: string): { text: string; summary: BmadManifestSummary } | null {
   const path = join(repoPath, '_bmad', '_config', 'manifest.yaml');
+  // Guard EVERY manifest path component (not just _bmad) before any
+  // byte is read: a symlinked _config or manifest.yaml would otherwise
+  // read outside the selected repo before later validation refuses it.
+  assertNoSymlinkComponents(repoPath, join('_bmad', '_config', 'manifest.yaml'), INSTALLER_REPAIR_HINT);
   if (!existsSync(path)) return null;
   const text = readFileSync(path, 'utf-8');
   try {
@@ -301,8 +305,19 @@ function assertNoSymlinkComponents(base: string, relativePath: string, repairHin
   let current = base;
   for (const part of relativePath.split('/').filter(Boolean)) {
     current = join(current, part);
-    if (!existsSync(current)) return;
-    const info = lstatSync(current);
+    // lstat, not existsSync: existsSync follows links, so a DANGLING
+    // symlink reads as absent and the unsafe-path refusal would be
+    // silently skipped for exactly the link class it exists to catch.
+    // ENOENT/ENOTDIR end the walk (the path is simply not there); other
+    // I/O errors (EACCES, EIO) stay transient — permissions can recover.
+    let info: ReturnType<typeof lstatSync>;
+    try {
+      info = lstatSync(current);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT' || code === 'ENOTDIR') return;
+      throw error;
+    }
     if (info.isSymbolicLink()) {
       throw new BmadDeterministicSetupError(`refusing BMAD path through symlink: ${current}`, repairHint);
     }
@@ -583,7 +598,20 @@ function installFresh(
   const stage = mkdtempSync(join(tmpdir(), 'gru-command-bmad-preflight-'));
   try {
     runOfficialInstaller(stage, tools, env, run);
-    const staged = manifestFor(stage);
+    let staged: { text: string; summary: BmadManifestSummary } | null;
+    try {
+      staged = manifestFor(stage);
+    } catch (error) {
+      // The staging path is deleted in finally and must never leak into
+      // user-facing text — including parse/read failures from the staged
+      // manifest itself, not only the skill-scan branch (gh-32 review).
+      throw new Error(
+        `official BMAD preflight failed: ${withoutStagingPath(
+          error instanceof Error ? error.message : String(error),
+          stage,
+        )}; retry this repo or skip`,
+      );
+    }
     if (staged === null) throw new Error('official BMAD preflight wrote no manifest');
     expectedFreshModules(staged.summary);
     for (const tool of tools) {
@@ -768,12 +796,9 @@ function hashOwnedPayload(repoPath: string, runtimeSkills: RuntimeSkillMap, incl
   return hash.digest('hex');
 }
 
-function updateLocalExclude(
-  repoPath: string,
-  tools: readonly string[],
-  runtimeSkills: RuntimeSkillMap,
-  env: NodeJS.ProcessEnv,
-): void {
+/** Resolve the repo's .git/info/exclude via Git itself (worktrees keep it
+ * in the common dir). Failure is tool availability, not repo state. */
+function localExcludePath(repoPath: string, env: NodeJS.ProcessEnv): string {
   const gitPath = spawnSync('git', ['-C', repoPath, 'rev-parse', '--git-path', 'info/exclude'], {
     encoding: 'utf-8',
     env,
@@ -783,7 +808,16 @@ function updateLocalExclude(
     throw new Error(`cannot resolve Git local exclude for ${repoPath}`);
   }
   const rawPath = gitPath.stdout.trim();
-  const excludePath = isAbsolute(rawPath) ? rawPath : resolve(repoPath, rawPath);
+  return isAbsolute(rawPath) ? rawPath : resolve(repoPath, rawPath);
+}
+
+function updateLocalExclude(
+  repoPath: string,
+  tools: readonly string[],
+  runtimeSkills: RuntimeSkillMap,
+  env: NodeJS.ProcessEnv,
+): void {
+  const excludePath = localExcludePath(repoPath, env);
   const original = existsSync(excludePath) ? readFileSync(excludePath, 'utf-8') : '';
   const lines = [
     '/_bmad/_config/',
@@ -1077,6 +1111,22 @@ function assertControlFilesSafe(repoPath: string): void {
   }
 }
 
+/** Managed-block markers are unchanged on-disk state: unpaired or
+ * reversed Gru markers in the local exclude or the worktree manifest are
+ * a deterministic refusal, and that refusal must fire BEFORE the official
+ * installer writes anything into the repo — a deterministic refusal
+ * never strands a partial install behind it (gh-32 review). */
+function assertManagedBlocksSafe(repoPath: string, env: NodeJS.ProcessEnv): void {
+  const excludePath = localExcludePath(repoPath, env);
+  if (existsSync(excludePath)) {
+    managedBlock(readFileSync(excludePath, 'utf-8'), EXCLUDE_START, EXCLUDE_END, []);
+  }
+  const manifestPath = join(repoPath, WORKTREE_MANIFEST_PATH);
+  if (existsSync(manifestPath)) {
+    managedBlock(readFileSync(manifestPath, 'utf-8'), BLOCK_START, BLOCK_END, []);
+  }
+}
+
 function validateRepo(
   workspaceRoot: string,
   repoName: string,
@@ -1172,6 +1222,7 @@ export function onboardBmadRepo(
   try {
     const repoPath = validateRepo(options.workspaceRoot, repoName, env);
     assertControlFilesSafe(repoPath);
+    assertManagedBlocksSafe(repoPath, env);
     assertNoSymlinkComponents(repoPath, '_bmad', INSTALLER_REPAIR_HINT);
     for (const tool of tools) runtimeSkillNames(repoPath, tool, INSTALLER_REPAIR_HINT);
     assertPrerequisites(tools, env, repoPath, options.prerequisiteCheck ?? commandAvailable);

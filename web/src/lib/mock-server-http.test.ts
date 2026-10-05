@@ -195,4 +195,34 @@ describe('dev mock turn-hold fixture contract', () => {
     expect(fresh.frames.some((f) => f['type'] === 'delta')).toBe(false);
     fresh.ws.close();
   }, 30_000);
+
+  it('reset drops a queued (deferred) user frame instead of letting its reply ghost into the cleared log', async () => {
+    const { baseUrl } = await startMock();
+    await control(baseUrl, '/__reset');
+    await control(baseUrl, '/__turn-hold');
+    const client = await chatSocket(baseUrl);
+    client.ws.send(JSON.stringify({ type: 'user', text: 'parked turn', client_msg_id: 'q-1', epoch: 0 }));
+    await vi.waitFor(() => expect(client.frames.some((f) => f['type'] === 'delta')).toBe(true));
+    // A SECOND user frame arrives while the turn is parked: it defers
+    // (one scripted turn at a time). Reset must drop it BEFORE settling
+    // the parked turn — otherwise its reply starts and the closing frames
+    // land in the freshly cleared log (ghost frames for the next client).
+    client.ws.send(JSON.stringify({ type: 'user', text: 'queued while parked', client_msg_id: 'q-2', epoch: 0 }));
+    // Let the scripted stream run to exhaustion so the turn is genuinely
+    // PARKED (release registered) before the reset arrives — the parked
+    // state is the fixture contract this case pins.
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
+    expect(client.frames.some((f) => f['type'] === 'turn' && f['state'] === 'end')).toBe(false);
+    await control(baseUrl, '/__reset');
+    // Any ghost reply would finish within the scripted window.
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    const fresh = await chatSocket(baseUrl);
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    expect(fresh.frames.some((f) => f['type'] === 'turn' && f['state'] === 'end')).toBe(false);
+    expect(fresh.frames.some((f) => f['type'] === 'tool')).toBe(false);
+    expect(fresh.frames.some((f) => f['type'] === 'delta')).toBe(false);
+    fresh.ws.close();
+    client.ws.close();
+    await new Promise((resolve) => setTimeout(resolve, 150));
+  }, 30_000);
 });

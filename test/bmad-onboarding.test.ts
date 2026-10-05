@@ -1814,4 +1814,149 @@ describe('per-selected-repo BMAD onboarding', () => {
       expect(result.repairHint).toContain('npx bmad-method install');
     });
   });
+
+  describe('gh-32 r4 review repairs (bmad code review, gpt-6-sol)', () => {
+    it('a dangling _bmad symlink is refused as an unsafe path before the installer runs, never a futile transient retry', () => {
+      // existsSync follows links, so a DANGLING _bmad link used to read as
+      // absent: the pre-install symlink guard silently passed and a fresh
+      // install could write through the link. lstat must see the link.
+      const fixture = fixtureRepo('dangling-bmad-link');
+      const neverCreated = join(fixture.workspace, 'never-created-target');
+      symlinkSync(neverCreated, join(fixture.repo, '_bmad'));
+      let installerCalls = 0;
+      const counting = ((_command: string, _args: string[]) => {
+        installerCalls += 1;
+        return { status: 0, signal: null, stdout: '', stderr: '', pid: 1, output: [] };
+      }) as unknown as typeof spawnSync;
+      const before = bmadSnapshot(fixture.repo);
+      const result = onboardBmadRepo(fixture.name, 'install', {
+        workspaceRoot: fixture.workspace,
+        answers: answers(fixture.workspace, fixture.name, 'install'),
+        run: counting,
+      });
+      expect(result.ready).toBe(false);
+      expect(result.deterministic).toBe(true);
+      expect(result.message).toContain('refusing BMAD path through symlink');
+      expect(result.repairHint).toContain('npx bmad-method install');
+      // Non-mutating: the installer never ran and the link still dangles.
+      expect(installerCalls).toBe(0);
+      expect(bmadSnapshot(fixture.repo)).toBe(before);
+      expect(lstatSync(join(fixture.repo, '_bmad')).isSymbolicLink()).toBe(true);
+    });
+
+    it('a symlinked _bmad/_config is refused before the manifest is read — no read-through outside the repo', () => {
+      // Only _bmad itself was guarded; a symlinked _config (or manifest)
+      // component let the reuse path READ manifest bytes from outside the
+      // selected repo before any later validation refused. The sentinel
+      // proves no byte of the linked manifest ever reached the parser.
+      const fixture = fixtureRepo('symlinked-config-dir');
+      const installed = onboardBmadRepo(fixture.name, 'install', {
+        workspaceRoot: fixture.workspace,
+        answers: answers(fixture.workspace, fixture.name, 'install'),
+        run: successfulInstaller(fixture.repo, []),
+      });
+      expect(installed.ready, installed.message).toBe(true);
+      const outside = tempDir('gru-command-bmad-outside-config-');
+      mkdirSync(join(outside), { recursive: true });
+      writeFileSync(join(outside, 'manifest.yaml'), 'SENTINEL-NOT-A-MANIFEST {{{{');
+      renameSync(join(fixture.repo, '_bmad', '_config'), join(fixture.repo, '_bmad', '_config-real'));
+      symlinkSync(outside, join(fixture.repo, '_bmad', '_config'));
+      const result = onboardBmadRepo(fixture.name, 'reuse', {
+        workspaceRoot: fixture.workspace,
+        answers: answers(fixture.workspace, fixture.name, 'reuse'),
+      });
+      expect(result.ready).toBe(false);
+      expect(result.deterministic).toBe(true);
+      expect(result.message).toContain('refusing BMAD path through symlink');
+      expect(result.repairHint).toContain('npx bmad-method install');
+      expect(result.message).not.toContain('SENTINEL-NOT-A-MANIFEST');
+    });
+
+    it('a malformed staged manifest fails transient without leaking the deleted staging path', () => {
+      // The staging-path hygiene covered the skill scan but not the staged
+      // manifest parse: a malformed installer manifest named a /tmp stage
+      // directory that is deleted before the user ever sees the message.
+      const fixture = fixtureRepo('stage-manifest-garbage');
+      let calls = 0;
+      const garbageManifest = ((_command: string, args: string[]) => {
+        calls += 1;
+        const directoryAt = args.indexOf('--directory');
+        const directory = args[directoryAt + 1] ?? fixture.repo;
+        materializeOfficialInstall(directory, '', ['pi']);
+        writeFileSync(join(directory, '_bmad', '_config', 'manifest.yaml'), 'installation: {{{{ not yaml');
+        return { status: 0, signal: null, stdout: '', stderr: '', pid: 1, output: [] };
+      }) as unknown as typeof spawnSync;
+      const first = onboardBmadRepo(fixture.name, 'install', {
+        workspaceRoot: fixture.workspace,
+        answers: answers(fixture.workspace, fixture.name, 'install'),
+        run: garbageManifest,
+      });
+      expect(first.ready).toBe(false);
+      expect(first.deterministic).toBeUndefined();
+      expect(first.message).toContain('official BMAD preflight failed');
+      expect(first.message).not.toContain('gru-command-bmad-preflight-');
+      expect(first.message).toContain('retry this repo or skip');
+      // The repo was never touched: a healthy installer completes next.
+      expect(calls).toBe(1);
+      expect(existsSync(join(fixture.repo, '_bmad'))).toBe(false);
+      const second = onboardBmadRepo(fixture.name, 'install', {
+        workspaceRoot: fixture.workspace,
+        answers: answers(fixture.workspace, fixture.name, 'install'),
+        run: successfulInstaller(fixture.repo, []),
+      });
+      expect(second.ready, second.message).toBe(true);
+    });
+
+    it('unpaired exclude markers are a deterministic refusal BEFORE the installer writes anything (fresh install)', () => {
+      // Managed-block pairing used to be validated only at write time —
+      // after the official installer had already written _bmad into the
+      // repo. A deterministic refusal must never strand a partial install.
+      const fixture = fixtureRepo('malformed-exclude-fresh');
+      const infoDir = join(fixture.repo, '.git', 'info');
+      mkdirSync(infoDir, { recursive: true });
+      writeFileSync(
+        join(infoDir, 'exclude'),
+        '# BEGIN GRU COMMAND BMAD GENERATED\n/_bmad/\n',
+      );
+      let installerCalls = 0;
+      const counting = ((_command: string, _args: string[]) => {
+        installerCalls += 1;
+        return { status: 0, signal: null, stdout: '', stderr: '', pid: 1, output: [] };
+      }) as unknown as typeof spawnSync;
+      const result = onboardBmadRepo(fixture.name, 'install', {
+        workspaceRoot: fixture.workspace,
+        answers: answers(fixture.workspace, fixture.name, 'install'),
+        run: counting,
+      });
+      expect(result.ready).toBe(false);
+      expect(result.deterministic).toBe(true);
+      expect(result.message).toContain('malformed managed block: expected paired');
+      expect(installerCalls).toBe(0);
+      expect(existsSync(join(fixture.repo, '_bmad'))).toBe(false);
+    });
+
+    it('unpaired worktree-manifest block markers are a deterministic refusal BEFORE the installer writes anything (fresh install)', () => {
+      const fixture = fixtureRepo('malformed-manifest-fresh');
+      mkdirSync(join(fixture.repo, '.gru-command'), { recursive: true });
+      writeFileSync(
+        join(fixture.repo, '.gru-command', 'worktree.toml'),
+        '# BEGIN GRU COMMAND BMAD BOOTSTRAP\n',
+      );
+      let installerCalls = 0;
+      const counting = ((_command: string, _args: string[]) => {
+        installerCalls += 1;
+        return { status: 0, signal: null, stdout: '', stderr: '', pid: 1, output: [] };
+      }) as unknown as typeof spawnSync;
+      const result = onboardBmadRepo(fixture.name, 'install', {
+        workspaceRoot: fixture.workspace,
+        answers: answers(fixture.workspace, fixture.name, 'install'),
+        run: counting,
+      });
+      expect(result.ready).toBe(false);
+      expect(result.deterministic).toBe(true);
+      expect(result.message).toContain('malformed managed block: expected paired');
+      expect(installerCalls).toBe(0);
+      expect(existsSync(join(fixture.repo, '_bmad'))).toBe(false);
+    });
+  });
 });

@@ -906,7 +906,11 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
     }
     // A parked turn must not leak into the cleared log: settle it before
     // the counters reset (the afterEach release is idempotent; this guards
-    // the crash path so no later spec replays a ghost turn).
+    // the crash path so no later spec replays a ghost turn). Deferred user
+    // frames are dropped FIRST: releasing the held turn would otherwise
+    // drain them and start a queued reply whose async frames can land in
+    // the freshly cleared log (ghost frames for the next client).
+    deferredUsers.length = 0;
     releaseHeldTurn?.();
     // Counters may rewind only after every client is detached; otherwise a
     // live browser observes impossible seq/epoch regression.
@@ -926,7 +930,6 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
     boardMode = 'default';
     compactGeneration += 1;
     newChatGeneration += 1;
-    deferredUsers.length = 0;
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end('{"ok":true}\n');
     return;
