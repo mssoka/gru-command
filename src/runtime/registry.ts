@@ -141,6 +141,11 @@ export class RuntimeRegistry {
   /** Rounds with unresolved cleanup debt register a reconcile observer;
    * EXISTING handle 'disposed' events drive it (no watcher/timer). */
   private readonly cleanupObservers = new Set<() => void>();
+  /** Actual shared-permit release notifications (not the pre-release
+   * disposed envelope): a capacity consumer must learn that the permit
+   * was PROVEN released so it can re-register demand even after a wake
+   * refusal (Perkins r3 blocker 4). */
+  private readonly residentReleaseListeners = new Set<() => void>();
 
   constructor(opts: RuntimeRegistryOptions) {
     this.opts = opts;
@@ -198,6 +203,15 @@ export class RuntimeRegistry {
     this.agentListeners.add(listener);
     return () => {
       this.agentListeners.delete(listener);
+    };
+  }
+
+  /** Subscribe to ACTUAL resident-permit releases (after the release has
+   * been applied and proven). Additive; listener failures are contained. */
+  onResidentReleased(listener: () => void): () => void {
+    this.residentReleaseListeners.add(listener);
+    return () => {
+      this.residentReleaseListeners.delete(listener);
     };
   }
 
@@ -550,6 +564,15 @@ export class RuntimeRegistry {
       this.handles.delete(resident);
       this.residents.unwatch(resident);
       release?.();
+      // AFTER the permit is actually released: notify capacity consumers
+      // (the pipeline consumer re-registers demand / admits directly).
+      for (const listener of [...this.residentReleaseListeners]) {
+        try {
+          listener();
+        } catch (error) {
+          this.log('error', 'resident release listener failed', { error: String(error) });
+        }
+      }
     };
     const budget = this.residents;
     // One wrapper per tracked method, memoized: handle.prompt ===

@@ -204,6 +204,14 @@ export class BoardView {
     this.mount = mustGet('board-jobs');
     this.ownerMount = mustGet('board-owner');
     this.boardNav = mustGet('board-nav');
+    // Splitter drags and chat collapse change the strip's width WITHOUT a
+    // window resize; a wrapping strip changes height while the sticky
+    // offsets would keep the prior measurement. Re-measure on actual size
+    // changes (Perkins r3 warning). Absent in non-DOM test shims.
+    if (typeof ResizeObserver !== 'undefined') {
+      const observer = new ResizeObserver(() => this.measureNav());
+      observer.observe(this.boardNav);
+    }
     this.chipRail = mustGet('chip-rail');
     this.agentsCount = mustGet('rail-agents-count');
     this.notificationBell = mustGet<HTMLButtonElement>('notification-bell');

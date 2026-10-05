@@ -12,7 +12,7 @@ import {
   type PipelinePrerequisite,
 } from '../ledger/pipeline.js';
 import type { AgentEventEnvelope } from '../runtime/registry.js';
-import { isJobTerminal } from '../ledger/states.js';
+import { isJobTerminal, type JobStatus } from '../ledger/states.js';
 import type { NotificationCenter } from '../notifications/center.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
@@ -255,12 +255,69 @@ export class PipelineService {
     let adopted = 0;
     let requeued = 0;
     for (const entry of this.opts.ledger.listPipelineEntries({ states: ['admitting'] })) {
+      // Re-read the LIVE row: recovering an earlier claim can synchronously
+      // start a live pass (bus) that claims and begins dispatching a later
+      // one — a stale snapshot must never acquire false recovery debt
+      // (Perkins r3 blocker 2).
+      const current = this.opts.ledger.getPipelineEntry(entry.id);
+      if (current === null || current.state !== 'admitting' || this.inFlightAdmissions.has(current.id)) continue;
       examined += 1;
-      if (this.reconcileClaim(entry) === 'adopted') adopted += 1;
+      if (this.reconcileClaim(current) === 'adopted') adopted += 1;
       else requeued += 1;
     }
     this.schedule();
     return { examined, adopted, requeued };
+  }
+
+  /** Whether a committed job carries THIS entry's accepted identity. */
+  private adoptionMatches(entry: PipelineEntryRecord, job: { readonly briefing: string | null; readonly repo: string }): boolean {
+    return job.briefing === entry.briefing && job.repo === entry.repo;
+  }
+
+  /** Make the interrupted-startup recovery obligation DURABLE before an
+   * adopted job may leave claim recovery (Perkins r3 blocker 3): block it
+   * with a durable note and post ONE machine-attention card. Returns false
+   * when the obligation could not be recorded — the claim must then be
+   * kept and retried, never silently adopted. Returns true when no
+   * obligation is needed (worker started, terminal, or already blocked). */
+  private surfaceInterruptedStartup(
+    entry: PipelineEntryRecord,
+    job: { readonly status: JobStatus; readonly briefing: string | null; readonly repo: string },
+  ): boolean {
+    if (this.opts.ledger.jobHasWorkerStart(entry.id)) return true;
+    if (isJobTerminal(job.status) || job.status === 'blocked') return true;
+    try {
+      this.opts.ledger.setJobStatus(entry.id, 'blocked');
+      this.opts.ledger.noteJob(
+        entry.id,
+        'pipeline recovery: the job was committed but no worker ever started — resolve the interrupted startup and re-arm',
+      );
+    } catch (error) {
+      this.log('error', 'pipeline interrupted-startup surfacing failed — claim kept for retry', {
+        entry: entry.id,
+        error: String(error),
+      });
+      return false;
+    }
+    try {
+      this.opts.notifications?.post({
+        kind: 'pipeline.adopted-without-worker',
+        routing: 'action-required',
+        severity: 'error',
+        title: `Interrupted admission: ${entry.title}`.slice(0, 200),
+        detail:
+          `${entry.id} — the job was committed before any minion started; it is blocked for recovery (never re-dispatched)`.slice(
+            0,
+            1000,
+          ),
+      });
+    } catch (error) {
+      this.log('error', 'pipeline interrupted-startup card failed to post', {
+        entry: entry.id,
+        error: String(error),
+      });
+    }
+    return true;
   }
 
   /** Shared claim reconciliation (boot AND live recovery — Perkins r1
@@ -273,36 +330,11 @@ export class PipelineService {
    * bounded retry (Perkins r2 blocker 4). */
   private reconcileClaim(entry: PipelineEntryRecord): 'adopted' | 'requeued' | 'failed' {
     const job = this.opts.ledger.getJob(entry.id);
-    if (job !== null && job.briefing === entry.briefing) {
-      if (!this.opts.ledger.jobHasWorkerStart(entry.id) && !isJobTerminal(job.status) && job.status !== 'blocked') {
-        // Interrupted startup (crash between job commit and worker
-        // registration): no minion ever ran, so this is recovery debt,
-        // not a live handoff. Block it with a durable note and post ONE
-        // machine-attention card; still adopt (never re-dispatch).
-        try {
-          this.opts.ledger.setJobStatus(entry.id, 'blocked');
-          this.opts.ledger.noteJob(
-            entry.id,
-            'pipeline recovery: the job was committed but no worker ever started — resolve the interrupted startup and re-arm',
-          );
-          this.opts.notifications?.post({
-            kind: 'pipeline.adopted-without-worker',
-            routing: 'action-required',
-            severity: 'error',
-            title: `Interrupted admission: ${entry.title}`.slice(0, 200),
-            detail:
-              `${entry.id} — the job was committed before any minion started; it is blocked for recovery (never re-dispatched)`.slice(
-                0,
-                1000,
-              ),
-          });
-        } catch (error) {
-          this.log('error', 'pipeline interrupted-startup surfacing failed', {
-            entry: entry.id,
-            error: String(error),
-          });
-        }
-      }
+    if (job !== null && this.adoptionMatches(entry, job)) {
+      // The interrupted-startup obligation must be DURABLE before the
+      // entry leaves recovery; a failed write keeps the claim for a retry
+      // (Perkins r3 blocker 3).
+      if (!this.surfaceInterruptedStartup(entry, job)) return 'failed';
       return this.finalizeAdmission(entry) ? 'adopted' : 'failed';
     }
     try {
@@ -314,9 +346,14 @@ export class PipelineService {
       });
       return 'requeued';
     } catch (error) {
+      // Counted on the SAME bounded ladder as finalization failures: a
+      // persistently failing release must stand down, not retry forever
+      // (Perkins r3 warning).
+      this.consecutiveFinalizeFailures += 1;
       this.log('error', 'pipeline claim reconciliation failed — bounded retry owns it', {
         entry: entry.id,
         error: String(error),
+        consecutive_failures: this.consecutiveFinalizeFailures,
       });
       return 'failed';
     }
@@ -480,11 +517,13 @@ export class PipelineService {
       } catch (error) {
         const detail = `admission failed: ${String(error).slice(0, 300)}`;
         const job = this.opts.ledger.getJob(entry.id);
-        if (job !== null && job.briefing === entry.briefing) {
+        if (job !== null && this.adoptionMatches(entry, job)) {
           // Dispatch committed the job row before failing; its lifecycle
           // owns the failure (blocked + note). Adopt — never re-dispatch.
-          // A failed finalization is bounded recovery debt, never a
-          // silent success (Perkins r1 blocker 4 / r2 blockers 2-4).
+          // The interrupted-startup obligation must be durable first
+          // (Perkins r3 blocker 3) and a failed finalization is bounded
+          // recovery debt, never a silent success.
+          if (!this.surfaceInterruptedStartup(entry, job)) return 'requeued';
           if (!this.finalizeAdmission(entry)) return 'requeued';
           this.log('warn', 'pipeline entry adopted its pre-existing job after a dispatch failure', {
             entry: entry.id,

@@ -279,5 +279,8 @@ describe('pipeline production wiring contract', () => {
     // Demand registration with the SHARED budget (D1): the consumer's
     // capacity-blocked acquire drives the budget's own idle-minion reclaim.
     expect(main).toContain('registry.residents.acquire(1, signal)');
+    // The ACTUAL permit release (post-disposed-envelope) re-arms the
+    // consumer even after a wake refusal (Perkins r3 blocker 4).
+    expect(main).toContain('registry.onResidentReleased(() => pipeline?.schedule())');
   });
 });

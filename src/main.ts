@@ -1129,6 +1129,10 @@ async function main(): Promise<number> {
   });
   pipelineView = () => pipeline?.view() ?? null;
   state.pipeline = pipeline ?? undefined;
+  // A PROVEN resident-permit release (after the disposed envelope) is the
+  // signal a capacity-blocked queue may re-register demand / admit — the
+  // pre-release envelope cannot prove it (Perkins r3 blocker 4).
+  registry.onResidentReleased(() => pipeline?.schedule());
   const pipelineRecovery = pipeline.reconcileAtBoot();
   if (pipelineRecovery.examined > 0) {
     logger.info('pipeline admission reconciliation', {

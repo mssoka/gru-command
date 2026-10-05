@@ -130,6 +130,20 @@ export function validatePipelinePriority(value: number): number {
   return value;
 }
 
+/** The shared record-identity contract for entry ids AND prerequisite ids
+ * (Perkins r3 warning): an id that cannot be enqueued must never be
+ * accepted as a prerequisite, or the dependent waits forever. The ledger
+ * boundary uses this same predicate for `requireSafeRecordId`. */
+export function isSafePipelineRecordId(value: string, maxLength = 128): boolean {
+  return (
+    value.length > 0 &&
+    value.length <= maxLength &&
+    /^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(value) &&
+    value !== '.' &&
+    value !== '..'
+  );
+}
+
 function asRecord(value: unknown, what: string): Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     throw new Error(`${what} is not a JSON object`);
@@ -153,14 +167,15 @@ export function parsePipelinePrerequisites(raw: string): readonly PipelinePrereq
     const record = asRecord(entry, 'pipeline prerequisite');
     const id = reqStr(record, 'id', 'pipeline prerequisite');
     // A prerequisite id is an entry id: it must satisfy the same identity
-    // contract as enqueue (exact, unpadded, ≤128 chars) or the dependent
-    // would wait forever on an unenqueuable id (review: prerequisite
-    // identity validation).
+    // contract as enqueue (exact, unpadded, safe charset, ≤128 chars) or
+    // the dependent would wait forever on an unenqueuable id (Perkins r3
+    // warning). Legitimate forward references (not yet enqueued) stay
+    // allowed — they are valid ids, just absent rows.
     if (id !== id.trim()) {
       throw new Error('pipeline prerequisite id must not be whitespace-padded');
     }
-    if (id.length > 128) {
-      throw new Error('pipeline prerequisite id exceeds 128 characters');
+    if (!isSafePipelineRecordId(id)) {
+      throw new Error(`pipeline prerequisite id "${id}" must be a safe 128-character record identifier`);
     }
     const milestone = reqStr(record, 'milestone', 'pipeline prerequisite');
     if (!isPipelineMilestone(milestone)) {

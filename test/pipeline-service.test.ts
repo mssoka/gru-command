@@ -24,7 +24,7 @@ afterEach(() => {
   while (cleanupDirs.length > 0) rmSync(cleanupDirs.pop()!, { recursive: true, force: true });
 });
 
-type DispatchMode = 'ok' | 'throw-after-job' | 'throw-before-job';
+type DispatchMode = 'ok' | 'throw-after-job' | 'throw-before-job' | 'throw-after-handoff';
 
 interface Harness {
   readonly dir: string;
@@ -34,6 +34,8 @@ interface Harness {
   readonly calls: { readonly jobId: string; readonly title: string; readonly briefing: string }[];
   capacity: PipelineCapacityView;
   mode: DispatchMode;
+  /** When set, dispatch yields here (a delayed worktree-creation shape). */
+  holdDispatch: Promise<void> | null;
 }
 
 function boot(
@@ -53,21 +55,29 @@ function boot(
   const ledger = overrides.ledger ?? new LedgerApi(db.handle, { bus });
   const notifications = new NotificationCenter({ ledger, bus });
   const calls: Harness['calls'] = [];
-  const harness = { capacity, mode: 'ok' as DispatchMode, calls } as {
+  const harness = { capacity, mode: 'ok' as DispatchMode, calls, holdDispatch: null } as {
     capacity: PipelineCapacityView;
     mode: DispatchMode;
     calls: Harness['calls'];
+    holdDispatch: Promise<void> | null;
   };
   const port: PipelineDispatchPort = {
     async dispatch(input) {
       calls.push({ jobId: input.jobId, title: input.title, briefing: input.briefing });
       if (harness.mode === 'throw-before-job') throw new Error('spawn failed before any job');
+      if (harness.holdDispatch !== null) await harness.holdDispatch;
       ledger.addJob({ id: input.jobId, repo: 'demo', title: input.title, briefing: input.briefing });
       if (harness.mode === 'throw-after-job') {
         ledger.setJobStatus(input.jobId, 'working');
         ledger.setJobStatus(input.jobId, 'blocked');
         ledger.noteJob(input.jobId, 'dispatch failed: spawn failed');
         throw new Error('spawn failed after the job row');
+      }
+      if (harness.mode === 'throw-after-handoff') {
+        // Job committed and moved to working, then the handoff write threw
+        // BEFORE any worker registration — the live adopt path's shape.
+        ledger.setJobStatus(input.jobId, 'working');
+        throw new Error('handoff write failed after the job commit');
       }
       // Realistic evidence, as the real DispatchService records it: the
       // worker started (milestone proof) and the briefing turn delivered.
@@ -814,6 +824,171 @@ describe('pipeline service — r2 blocker repairs', () => {
       h.service.schedule();
       await h.service.whenIdle();
       expect(h.service.entry('pipe-a')?.state).toBe('admitted');
+      h.db.close();
+      real.db.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('pipeline service — r3 blocker repairs', () => {
+  it('boot reconciliation re-reads live rows and never blocks a dispatch its own recovery started (B2)', async () => {
+    const h = boot();
+    // Fixture writes go through a BUSLESS ledger handle on the same
+    // database: the service must observe exactly the crash snapshot at
+    // reconcileAtBoot, not react to the setup itself.
+    const setup = new LedgerApi(h.db.handle);
+    // A: committed but never started (crash shape). B: no job yet.
+    h.capacity = { capacity: 4, occupied: 4, queued: 0, available: 0 };
+    setup.enqueuePipelineEntry({ id: 'pipe-a', repoPath: '/tmp/demo', title: 'A', briefing: 'A' });
+    setup.claimPipelineEntry({ id: 'pipe-a', holder: 'silas-pipeline' });
+    setup.addJob({ id: 'pipe-a', repo: 'demo', title: 'A', briefing: 'A' });
+    setup.setJobStatus('pipe-a', 'working');
+    setup.enqueuePipelineEntry({ id: 'pipe-b', repoPath: '/tmp/demo', title: 'B', briefing: 'B' });
+    setup.claimPipelineEntry({ id: 'pipe-b', holder: 'silas-pipeline' });
+    // The nested pass that A's recovery starts will claim and dispatch B
+    // and YIELD there (delayed startup); the boot loop must then skip its
+    // stale B record instead of blocking a live dispatch.
+    let releaseHold!: () => void;
+    h.holdDispatch = new Promise<void>((resolve) => {
+      releaseHold = resolve;
+    });
+    h.capacity = { capacity: 4, occupied: 0, queued: 0, available: 4 };
+    const report = h.service.reconcileAtBoot();
+    expect(h.ledger.getPipelineEntry('pipe-b')?.state).toBe('admitting');
+    expect(h.ledger.getJob('pipe-b')).toBeNull(); // dispatch still in flight
+    releaseHold();
+    await h.service.whenIdle();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await h.service.whenIdle();
+    expect(report.examined).toBe(1); // only A was still un-owned at its turn
+    expect(h.service.entry('pipe-a')?.state).toBe('admitted');
+    expect(h.service.entry('pipe-b')?.state).toBe('admitted');
+    expect(h.ledger.getJob('pipe-b')?.status).not.toBe('blocked');
+    const cards = h.ledger
+      .listNotifications()
+      .filter((row) => row.kind === 'pipeline.adopted-without-worker');
+    expect(cards.map((card) => card.title)).toEqual(['Interrupted admission: A']);
+    h.db.close();
+  });
+
+  it('keeps the claim when the interrupted-startup obligation cannot be recorded, then adopts after healing (B3)', async () => {
+    const real = (() => {
+      const dir = mkdtempSync(join(tmpdir(), 'gru-pipeline-service-b3-'));
+      cleanupDirs.push(dir);
+      const db = new LedgerDb(dir);
+      const bus = new EventBus({});
+      return { db, bus, ledger: new LedgerApi(db.handle, { bus }) };
+    })();
+    let broken = true;
+    const flaky: LedgerApi = new Proxy(real.ledger, {
+      get(target, property, receiver) {
+        if (property === 'setJobStatus') {
+          return (id: string, status: string) => {
+            if (broken && status === 'blocked') throw new Error('transient status write failure');
+            return target.setJobStatus(id, status);
+          };
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const h = boot(undefined, { ledger: flaky, bus: real.bus });
+    const setup = new LedgerApi(real.db.handle);
+    h.capacity = { capacity: 4, occupied: 4, queued: 0, available: 0 };
+    setup.enqueuePipelineEntry({ id: 'pipe-crash', repoPath: '/tmp/demo', title: 'Crash', briefing: 'Crash' });
+    setup.claimPipelineEntry({ id: 'pipe-crash', holder: 'silas-pipeline' });
+    setup.addJob({ id: 'pipe-crash', repo: 'demo', title: 'Crash', briefing: 'Crash' });
+    setup.setJobStatus('pipe-crash', 'working');
+    h.capacity = { capacity: 4, occupied: 0, queued: 0, available: 4 };
+    const report = h.service.reconcileAtBoot();
+    // The obligation was not durable: the claim is KEPT (never adopted
+    // without follow-through) and the entry stays in recovery.
+    expect(report).toEqual({ examined: 1, adopted: 0, requeued: 1 });
+    expect(h.service.entry('pipe-crash')?.state).toBe('admitting');
+    expect(
+      h.ledger.listNotifications().filter((row) => row.kind === 'pipeline.adopted-without-worker'),
+    ).toHaveLength(0);
+    // Healing plus a retry records the obligation and adopts.
+    broken = false;
+    h.service.schedule();
+    await h.service.whenIdle();
+    expect(h.service.entry('pipe-crash')?.state).toBe('admitted');
+    expect(h.ledger.getJob('pipe-crash')?.status).toBe('blocked');
+    expect(
+      h.ledger.listNotifications().filter((row) => row.kind === 'pipeline.adopted-without-worker'),
+    ).toHaveLength(1);
+    h.db.close();
+    real.db.close();
+  });
+
+  it('applies the interrupted-startup check to a live dispatch failure too (B3)', async () => {
+    const h = boot();
+    // A dispatch that committed the job and moved it to working, then
+    // threw outside its own blocking handler (e.g. the handoff write).
+    h.mode = 'throw-after-handoff';
+    h.service.enqueue({ id: 'pipe-live', repoPath: '/tmp/demo', title: 'L', briefing: 'L' });
+    await h.service.whenIdle();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await h.service.whenIdle();
+    expect(h.service.entry('pipe-live')?.state).toBe('admitted');
+    // No worker ever started: the live adoption path surfaced the durable
+    // obligation (blocked + note + one card) instead of silently adopting.
+    expect(h.ledger.getJob('pipe-live')?.status).toBe('blocked');
+    expect(h.ledger.getJob('pipe-live')?.note).toContain('no worker ever started');
+    const cards = h.ledger
+      .listNotifications()
+      .filter((row) => row.kind === 'pipeline.adopted-without-worker');
+    expect(cards).toHaveLength(1);
+    expect(h.calls).toHaveLength(1); // never re-dispatched
+    h.db.close();
+  });
+
+  it('bounds a persistently failing claim release on the recovery ladder (W1)', async () => {
+    vi.useFakeTimers();
+    try {
+      const real = (() => {
+        const dir = mkdtempSync(join(tmpdir(), 'gru-pipeline-service-w1b-'));
+        cleanupDirs.push(dir);
+        const db = new LedgerDb(dir);
+        const bus = new EventBus({});
+        return { db, bus, ledger: new LedgerApi(db.handle, { bus }) };
+      })();
+      let broken = true;
+      let releaseCalls = 0;
+      const flaky: LedgerApi = new Proxy(real.ledger, {
+        get(target, property, receiver) {
+          if (property === 'releasePipelineClaim') {
+            return (input: Parameters<LedgerApi['releasePipelineClaim']>[0]) => {
+              releaseCalls += 1;
+              if (broken) throw new Error('persistent release failure');
+              return target.releasePipelineClaim(input);
+            };
+          }
+          return Reflect.get(target, property, receiver);
+        },
+      });
+      const h = boot(undefined, { retryBackoffMs: 5_000, ledger: flaky, bus: real.bus });
+      // Hand-crafted stale claim with no job: the only recovery is release.
+      // The fixture is written through a busless handle so no setup pass
+      // races the claim.
+      const setup = new LedgerApi(real.db.handle);
+      h.capacity = { capacity: 4, occupied: 4, queued: 0, available: 0 };
+      setup.enqueuePipelineEntry({ id: 'pipe-stuck', repoPath: '/tmp/demo', title: 'S', briefing: 'S' });
+      setup.claimPipelineEntry({ id: 'pipe-stuck', holder: 'silas-pipeline' });
+      h.capacity = { capacity: 4, occupied: 0, queued: 0, available: 4 };
+      h.service.schedule();
+      await h.service.whenIdle();
+      expect(h.service.entry('pipe-stuck')?.state).toBe('admitting');
+      // Bounded: attempts stand down after four failures, never spin.
+      for (let i = 0; i < 8; i += 1) await vi.advanceTimersByTimeAsync(5_000);
+      expect(releaseCalls).toBe(4);
+      // Healing plus a natural trigger recovers the accepted brief.
+      broken = false;
+      h.service.schedule();
+      await h.service.whenIdle();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(h.service.entry('pipe-stuck')?.state).toBe('admitted');
       h.db.close();
       real.db.close();
     } finally {

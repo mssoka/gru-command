@@ -79,6 +79,7 @@ import {
 import {
   evaluatePipelineEntry,
   isPipelineState,
+  isSafePipelineRecordId,
   parseExclusiveScopes,
   parsePipelineClaim,
   parsePipelinePrerequisites,
@@ -728,12 +729,7 @@ function nstr(value: unknown): string | null {
 }
 
 export function requireSafeRecordId(value: string, name: string, maxLength = 128): void {
-  if (
-    value.length > maxLength ||
-    !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value) ||
-    value === '.' ||
-    value === '..'
-  ) {
+  if (!isSafePipelineRecordId(value, maxLength)) {
     throw new Error(`${name} must be a safe ${maxLength}-character record identifier`);
   }
 }
@@ -1088,6 +1084,17 @@ export class LedgerApi {
     return this.transaction(() => {
       if (this.getJob(input.id) !== null) {
         throw new Error(`job "${input.id}" already exists`);
+      }
+      // Reservation fence (Perkins r3 blocker 1): an accepted pipeline
+      // entry owns its id across BOTH creation surfaces. The only seam
+      // allowed through is the entry's own admission claim (`admitting`),
+      // which the consumer persists before it may dispatch. A ledger
+      // older than the pipeline migration has no reservations to honour.
+      const reserved = this.hasPipelineTable() ? this.getPipelineEntry(input.id) : null;
+      if (reserved !== null && reserved.state !== 'admitting') {
+        throw new PipelineConflictError(
+          `job id "${input.id}" is reserved by an accepted pipeline entry (${reserved.state}) — a direct job cannot take it`,
+        );
       }
       const ts = nowIso();
       this.db
@@ -5506,6 +5513,21 @@ export class LedgerApi {
     return row === undefined ? null : this.pipelineEntryFromRow(row);
   }
 
+  /** Whether this ledger's schema contains the pipeline table (a ledger
+   * frozen before the pipeline migration must keep normal job creation
+   * working). Cached: a table never appears after construction. */
+  private pipelineTableReady: boolean | null = null;
+
+  private hasPipelineTable(): boolean {
+    if (this.pipelineTableReady === null) {
+      this.pipelineTableReady =
+        this.db
+          .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'pipeline_entries'")
+          .get() !== undefined;
+    }
+    return this.pipelineTableReady;
+  }
+
   private getPipelineEntryByRequestId(requestId: string): PipelineEntryRecord | null {
     const row = this.db.prepare('SELECT * FROM pipeline_entries WHERE request_id = ?').get(requestId) as Row | undefined;
     return row === undefined ? null : this.pipelineEntryFromRow(row);
@@ -5552,8 +5574,9 @@ export class LedgerApi {
   }
 
   /** Bind the claim to the actual job that owns the lifecycle from now
-   * on. The job must exist AND carry this entry's exact briefing —
-   * adoption of unrelated work is refused. */
+   * on. The job must exist AND carry this entry's exact briefing AND
+   * repository — adoption of unrelated work is refused (Perkins r3
+   * blocker 1: briefing equality alone is not identity). */
   markPipelineAdmitted(input: { id: string; jobId: string }): PipelineEntryRecord {
     return this.transaction(() => {
       const row = this.getPipelineEntry(input.id);
@@ -5564,9 +5587,9 @@ export class LedgerApi {
       }
       const job = this.getJob(input.jobId);
       if (job === null) throw new Error(`pipeline admission for "${input.id}" requires job "${input.jobId}" to exist`);
-      if (job.briefing !== row.briefing) {
+      if (job.briefing !== row.briefing || job.repo !== row.repo) {
         throw new Error(
-          `job "${input.jobId}" carries a different briefing than the accepted pipeline entry — refusing adoption`,
+          `job "${input.jobId}" does not carry the accepted pipeline entry's briefing/repository — refusing adoption`,
         );
       }
       const ts = nowIso();

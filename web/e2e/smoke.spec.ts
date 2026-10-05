@@ -1010,6 +1010,20 @@ test.describe('cockpit layout (v6)', () => {
       .poll(async () => Math.abs((await page.locator('#chat-main-mount').boundingBox())!.width - chatBox.width))
       .toBeLessThanOrEqual(2);
 
+    // The sticky strip re-measures on an actual pane resize (Perkins r3
+    // warning): dragging splitters changes board width WITHOUT a window
+    // resize, and the sticky offsets must track the live strip height.
+    await expect
+      .poll(() =>
+        page.evaluate(() => {
+          const nav = document.querySelector<HTMLElement>('#board-nav');
+          if (nav === null) return false;
+          const value = getComputedStyle(document.documentElement).getPropertyValue('--board-nav-h').trim();
+          return value === `${nav.offsetHeight}px`;
+        }),
+      )
+      .toBe(true);
+
     // The settled window rolls (approved j-1064 preview 3): 13 settled → 3
     // rows + a reversible Show older settled expander; expanding reveals
     // all 13 and keeps Show fewer (nothing is deleted).

@@ -154,7 +154,7 @@ describe('pipeline ledger — claims and admission', () => {
     ledger.claimPipelineEntry({ id: 'pipe-a', holder: 'silas' });
     expect(() => ledger.markPipelineAdmitted({ id: 'pipe-a', jobId: 'pipe-a' })).toThrow(/requires job/);
     ledger.addJob({ id: 'pipe-a', repo: 'demo', title: 'Entry pipe-a', briefing: 'different' });
-    expect(() => ledger.markPipelineAdmitted({ id: 'pipe-a', jobId: 'pipe-a' })).toThrow(/different briefing/);
+    expect(() => ledger.markPipelineAdmitted({ id: 'pipe-a', jobId: 'pipe-a' })).toThrow(/briefing\/repository/);
     ledger.setJobBriefing('pipe-a', entry.briefing);
     const admitted = ledger.markPipelineAdmitted({ id: 'pipe-a', jobId: 'pipe-a' });
     expect(admitted.state).toBe('admitted');
@@ -463,5 +463,69 @@ describe('pipeline ledger — evaluation, order and projection', () => {
     const applied = dbFull.handle.prepare('SELECT id FROM schema_migrations ORDER BY id').all() as { id: number }[];
     expect(applied.map((row) => row.id)).toEqual(Array.from({ length: MIGRATIONS.length }, (_, index) => index + 1));
     dbFull.close();
+  });
+});
+
+describe('pipeline id reservation and adoption identity (Perkins r3)', () => {
+  it('reserves accepted ids across the direct job-creation surface, opening only to the admission claim', () => {
+    const { db, ledger } = boot();
+    ledger.enqueuePipelineEntry({ id: 'reserved', repoPath: '/tmp/demo', title: 'R', briefing: 'R' });
+    // A direct job creation cannot take an accepted entry's id.
+    expect(() =>
+      ledger.addJob({ id: 'reserved', repo: 'demo', title: 'R', briefing: 'R' }),
+    ).toThrow(/reserved by an accepted pipeline entry/);
+    // The claim's own admission seam is allowed through (the claim is
+    // persisted BEFORE the dispatch side effect).
+    expect(ledger.claimPipelineEntry({ id: 'reserved', holder: 'silas-pipeline' })?.state).toBe('admitting');
+    const job = ledger.addJob({ id: 'reserved', repo: 'demo', title: 'R', briefing: 'R' });
+    expect(job.id).toBe('reserved');
+    // Terminal queue states stay reserved: an id never becomes available
+    // for a competing direct creation.
+    ledger.setJobStatus('reserved', 'working');
+    ledger.markPipelineAdmitted({ id: 'reserved', jobId: 'reserved' });
+    expect(() =>
+      ledger.addJob({ id: 'reserved', repo: 'demo', title: 'R', briefing: 'R' }),
+    ).toThrow(/already exists/);
+    ledger.enqueuePipelineEntry({ id: 'cancelled-id', repoPath: '/tmp/demo', title: 'C', briefing: 'C' });
+    ledger.cancelPipelineEntry({ id: 'cancelled-id', reason: 'withdrawn' });
+    expect(() =>
+      ledger.addJob({ id: 'cancelled-id', repo: 'demo', title: 'C', briefing: 'C' }),
+    ).toThrow(/reserved by an accepted pipeline entry/);
+    db.close();
+  });
+
+  it('refuses adoption of a same-briefing job from a DIFFERENT repository', () => {
+    const { db, ledger } = boot();
+    ledger.enqueuePipelineEntry({ id: 'repo-bound', repoPath: '/tmp/alpha', title: 'A', briefing: 'same brief' });
+    ledger.claimPipelineEntry({ id: 'repo-bound', holder: 'silas-pipeline' });
+    ledger.addJob({ id: 'repo-bound', repo: 'beta', title: 'A', briefing: 'same brief' });
+    expect(() => ledger.markPipelineAdmitted({ id: 'repo-bound', jobId: 'repo-bound' })).toThrow(
+      /briefing\/repository/,
+    );
+    expect(ledger.getPipelineEntry('repo-bound')?.state).toBe('admitting');
+    db.close();
+  });
+
+  it('rejects prerequisite ids that the enqueue identity contract could never accept', () => {
+    const { db, ledger } = boot();
+    expect(() =>
+      ledger.enqueuePipelineEntry({
+        id: 'bad-prereq',
+        repoPath: '/tmp/demo',
+        title: 'B',
+        briefing: 'B',
+        prerequisites: [{ id: 'a/b', milestone: 'done' }],
+      }),
+    ).toThrow(/safe 128-character record identifier/);
+    // Legitimate forward references (valid ids, not yet enqueued) stay accepted.
+    const entry = ledger.enqueuePipelineEntry({
+      id: 'good-prereq',
+      repoPath: '/tmp/demo',
+      title: 'G',
+      briefing: 'G',
+      prerequisites: [{ id: 'future.entry-1', milestone: 'done' }],
+    });
+    expect(entry.record.prerequisites).toEqual([{ id: 'future.entry-1', milestone: 'done' }]);
+    db.close();
   });
 });
