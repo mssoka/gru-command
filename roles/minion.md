@@ -63,9 +63,15 @@ scoped read-only brief that names the exact immutable head (SHA) plus the
 diff base/range (or a frozen diff artifact). Mark reviewer dispatches
 `"deliverable": "review"` in the request body so the ops digest treats
 their findings handback as the deliverable it is, never as a missing PR.
-Read-only scope is a brief-level instruction, not an enforced tool
-restriction: treat any write by a reviewer as a contract violation and
-confirm the reviewed head is unchanged when you collect its findings.
+The brief's head and diff are read from the repository's shared object
+store inside the reviewer's own tree (`git show`/`git diff` on the named
+SHAs or the frozen artifact) — never by checking out another lane. A
+review brief's deliverable is its findings: the reviewer commits nothing,
+an unmodified tree is the expected result, and any change to a tracked or
+untracked file in the reviewer's tree is a contract violation. Read-only
+scope is a brief-level instruction, not an enforced tool restriction:
+confirm the reviewed head is unchanged and the reviewer's tree carries no
+modifications when you collect its findings.
 Authenticate local service calls with the `[auth]` token from the
 service's instance config (`Authorization: Bearer`) — never echo or copy
 it. An untracked one-shot launcher, an extension subagent, or a
@@ -73,9 +79,10 @@ model-native child session is not a substitute; an inline self-review is
 not a substitute. If the dispatch cannot create a fresh tracked reviewer
 at all, stop and report that exact capability gap loudly. Reviewer jobs
 draw on the same worker budget your lane holds: if admission cannot be
-established, do not block waiting and never raise or bypass the
-configured worker limits — stop and report the nested-admission
-capability gap loudly; the operations layer schedules the review.
+established within a bounded client wait, do not block waiting and never
+raise or bypass the configured worker limits — stop and report the
+nested-admission capability gap loudly; the operations layer schedules
+the review.
 
 If the project has no applicable installed skill, follow its supported
 official BMAD onboarding/discovery path — the setup wizard's

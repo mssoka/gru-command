@@ -225,6 +225,7 @@ describe('silas digest (the four actionable states)', () => {
     try {
       addJobWithDelivery(h.ledger, 'review-job', { deliverable: 'review' });
       addJobWithDelivery(h.ledger, 'artifact-job', { deliverable: 'artifact' });
+      addJobWithDelivery(h.ledger, 'investigation-job', { deliverable: 'investigation' });
       addJobWithDelivery(h.ledger, 'impl-job');
       const digest = await computeSilasDigest({
         ledger: h.ledger,

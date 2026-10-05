@@ -1069,6 +1069,14 @@ export class LedgerApi {
       throw new Error('job id, repo, and title must be non-empty');
     }
     requireSafeRecordId(input.id, 'job id');
+    // Runtime callers (direct dispatch, imported JS) do not share the HTTP
+    // validator: refuse an unknown deliverable at the durable write so a
+    // bad value can never silently change digest routing.
+    if (input.deliverable !== undefined && input.deliverable !== null &&
+        input.deliverable !== 'pr' && input.deliverable !== 'review' &&
+        input.deliverable !== 'artifact' && input.deliverable !== 'investigation') {
+      throw new Error(`unknown job deliverable "${String(input.deliverable)}"`);
+    }
     if (input.displayName !== undefined && input.displayName !== null && input.displayName.trim() === '') {
       throw new Error('job display name must be a non-empty string');
     }
