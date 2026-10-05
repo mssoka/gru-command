@@ -263,6 +263,28 @@ export interface OwnerPrView {
   readonly checkedAt: string;
 }
 
+/** Durable pipeline queue (owner approvals j-239/j-1064): one active
+ * entry as the SERVER evaluated it — waiting/ready/admitting/failed
+ * with the exact wait reason. Admitted/cancelled entries are excluded
+ * server-side (admitted work lives in the normal job lifecycle). The
+ * browser never re-derives eligibility. */
+export interface PipelineEntryView {
+  readonly id: string;
+  readonly repo: string;
+  readonly title: string;
+  readonly priority: number;
+  readonly enqueueSeq: number;
+  readonly state: 'waiting' | 'ready' | 'admitting' | 'failed';
+  readonly reason: string | null;
+  readonly queuedAt: string;
+}
+
+export interface PipelineView {
+  readonly entries: readonly PipelineEntryView[];
+  /** All active entries — full count, never the preview window. */
+  readonly pending: number;
+}
+
 export interface BoardSnapshot {
   readonly repos: readonly { readonly name: string; readonly jobs: readonly JobView[] }[];
   readonly agents: readonly AgentView[];
@@ -281,6 +303,8 @@ export interface BoardSnapshot {
   readonly verify?: VerifyQueueView | null;
   /** Provider pacing gate (server mirror; absent on pre-pacing servers). */
   readonly pacing?: PacingGateView | null;
+  /** Durable pipeline queue; absent on pre-upgrade servers (tolerated). */
+  readonly pipeline?: PipelineView | null;
   readonly selfHeal?: SelfHealView | null;
   /** FOR YOU PR rows (owner approval 2026-09-28); absent on pre-upgrade
   * servers (validator tolerates; the band renders ack rows only). */
@@ -595,6 +619,29 @@ function isSelfHealView(value: unknown): value is SelfHealView {
   );
 }
 
+function isPipelineEntryView(value: unknown): value is PipelineEntryView {
+  return (
+    isRecord(value) &&
+    typeof value.id === 'string' && value.id !== '' &&
+    typeof value.repo === 'string' &&
+    typeof value.title === 'string' &&
+    typeof value.priority === 'number' && Number.isSafeInteger(value.priority) && value.priority >= 0 &&
+    typeof value.enqueueSeq === 'number' && Number.isSafeInteger(value.enqueueSeq) && value.enqueueSeq >= 1 &&
+    (value.state === 'waiting' || value.state === 'ready' || value.state === 'admitting' || value.state === 'failed') &&
+    (value.reason === null || typeof value.reason === 'string') &&
+    typeof value.queuedAt === 'string'
+  );
+}
+
+function isPipelineView(value: unknown): value is PipelineView {
+  return (
+    isRecord(value) &&
+    Array.isArray(value.entries) &&
+    value.entries.every(isPipelineEntryView) &&
+    typeof value.pending === 'number' && Number.isSafeInteger(value.pending) && value.pending >= 0
+  );
+}
+
 function isOwnerPrView(value: unknown): value is OwnerPrView {
   if (
     !isRecord(value) ||
@@ -651,6 +698,7 @@ export function isValidSnapshot(value: unknown): value is BoardSnapshot {
   if (value.silas !== undefined && value.silas !== null && !isSilasView(value.silas)) return false;
   if (value.verify !== undefined && value.verify !== null && !isVerifyQueueView(value.verify)) return false;
   if (value.pacing !== undefined && value.pacing !== null && !isPacingGateView(value.pacing)) return false;
+  if (value.pipeline !== undefined && value.pipeline !== null && !isPipelineView(value.pipeline)) return false;
   if (value.selfHeal !== undefined && value.selfHeal !== null && !isSelfHealView(value.selfHeal)) return false;
   // FOR YOU PR rows: absent on pre-upgrade servers (tolerated), but a
   // present block must match its shape — readiness is server authority.

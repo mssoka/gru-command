@@ -784,4 +784,53 @@ export const MIGRATIONS: readonly Migration[] = [
     name: 'job-display-name',
     sql: 'ALTER TABLE jobs ADD COLUMN display_name TEXT;',
   },
+  {
+    // Durable approved pipeline queue (owner approvals j-239/j-1064):
+    // complete approved executable briefings persist before any worker
+    // exists, with a stable id, explicit priority, durable enqueue order,
+    // prerequisite ids with explicit milestones, and exclusive scopes.
+    // Only the authenticated enqueue boundary writes rows; the state
+    // machine (waiting/ready/admitting/admitted/failed/cancelled) keeps
+    // every claim atomic and crash-reconcilable. `enqueue_seq` is the
+    // durable ordering key (UNIQUE); `request_id` is the idempotency
+    // identity and `payload_hash` the changed-replay fence.
+    // LANDING COLLISION (same convention as migrations 10–17): this
+    // migration was born at branch-local id 14 on this unshipped lane;
+    // owner-merged main landed job-amendments 14, child-workers 15,
+    // child-workers-agent-binding 16 and job-display-name 17 (crew
+    // labels) first, so the never-applied pipeline migration is
+    // re-numbered to 18 (never a hole). No ledger outside this unshipped
+    // branch ever applied it at an earlier id.
+    id: 18,
+    name: 'pipeline-entries',
+    sql: `
+      CREATE TABLE pipeline_entries (
+        id               TEXT PRIMARY KEY,
+        repo_path        TEXT NOT NULL,
+        repo             TEXT NOT NULL,
+        title            TEXT NOT NULL,
+        briefing         TEXT NOT NULL,
+        briefing_hash    TEXT NOT NULL,
+        priority         INTEGER NOT NULL CHECK (priority BETWEEN 0 AND 9),
+        enqueue_seq      INTEGER NOT NULL UNIQUE,
+        state            TEXT NOT NULL CHECK (state IN ('waiting','ready','admitting','admitted','failed','cancelled')),
+        hold_reason      TEXT,
+        prerequisites    TEXT NOT NULL DEFAULT '[]',
+        exclusive_scopes TEXT NOT NULL DEFAULT '[]',
+        request_id       TEXT NOT NULL UNIQUE,
+        payload_hash     TEXT NOT NULL,
+        job_id           TEXT,
+        claim            TEXT,
+        failure_reason   TEXT,
+        failure_count    INTEGER NOT NULL DEFAULT 0,
+        reconcile_note   TEXT,
+        queued_at        TEXT NOT NULL,
+        claimed_at       TEXT,
+        admitted_at      TEXT,
+        updated_at       TEXT NOT NULL
+      );
+      CREATE INDEX idx_pipeline_entries_state ON pipeline_entries(state);
+      CREATE INDEX idx_pipeline_entries_seq ON pipeline_entries(enqueue_seq);
+    `,
+  },
 ];
