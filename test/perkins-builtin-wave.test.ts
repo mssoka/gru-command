@@ -2876,8 +2876,11 @@ describe('bmad-review fallback gate (user amendment 2026-09-20, fork-3)', () => 
       expect(escalationOf(posted)?.['receipt']).toBe('notif-fallback-pass-1');
       expect(posted.escalations.filter((line) => line.includes('review/fix routing cleared'))).toHaveLength(1);
       // Attempt identity: the PASS row and its outcome share escalationId.
-      expect(passOf(posted)?.['escalationId']).toBe('job-fallback-gate:1');
-      expect(escalationOf(posted)?.['escalationId']).toBe('job-fallback-gate:1');
+      // Run-unique attempt id (round-4 finding 2): job id + per-run
+      // discriminator + iteration — the two events share it exactly.
+      const expectedIdPrefix = 'job-fallback-gate:';
+      expect(String(passOf(posted)?.['escalationId'])).toMatch(new RegExp(`^${expectedIdPrefix}[0-9a-f-]{36}:1$`));
+      expect(escalationOf(posted)?.['escalationId']).toBe(passOf(posted)?.['escalationId']);
       // A throwing notifier is UNKNOWN, never a clean failure: the notice
       // may have been recorded before the throw.
       expect(escalationOf(throwing)?.['status']).toBe('unknown');

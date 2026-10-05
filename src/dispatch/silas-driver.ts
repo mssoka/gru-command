@@ -849,7 +849,17 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     // re-arm, not the reviewer's completion (E18 parent relation).
     if (job.deliverable === 'review' && job.parentJobId !== null && currentPhaseDelivered) {
       const parent = input.ledger.getJob(job.parentJobId);
-      if (parent !== null && parent.status !== 'merged' && parent.status !== 'done') {
+      // (round-4 finding 6) The row retires when the parent delivered
+      // AFTER the reviewer: the parent resumed, collected the findings,
+      // and continued its cycle — re-listing it every sweep would re-arm a
+      // lane that already acted. A genuinely newer reviewer delivery (a
+      // second commission) re-arms the parent again by out-dating it.
+      const parentDelivered = parent !== null ? input.ledger.latestJobEvent(parent.id, 'job.delivered') : null;
+      const parentActed = parentDelivered !== null && parentDelivered.seq > delivered.seq;
+      if (
+        parent !== null && parent.status !== 'merged' && parent.status !== 'done' &&
+        !parentActed
+      ) {
         digest.reviewerDelivered.push({
           jobId: job.id,
           parentJobId: parent.id,
@@ -1243,6 +1253,20 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       // in-review), which the phase-identity recheck above already catches;
       // the row-specific precondition here is only the PR link it names.
       return job !== null && job.prUrl !== null;
+    }),
+    // (round-4 finding 7) A parent can reach terminal (or resume) while
+    // blocker histories awaited: revalidate every re-arm row at the same
+    // publish boundary as the PR/review offers.
+    reviewerDelivered: digest.reviewerDelivered.filter((row) => {
+      const reviewer = input.ledger.getJob(row.jobId);
+      const parent = input.ledger.getJob(row.parentJobId);
+      if (reviewer === null || parent === null) return false;
+      if (reviewer.status === 'merged' || reviewer.status === 'done') return false;
+      if (parent.status === 'merged' || parent.status === 'done') return false;
+      const reviewerDelivered = input.ledger.latestJobEvent(reviewer.id, 'job.delivered');
+      const parentDelivered = input.ledger.latestJobEvent(parent.id, 'job.delivered');
+      return reviewerDelivered !== null &&
+        (parentDelivered === null || reviewerDelivered.seq > parentDelivered.seq);
     }),
     stalledWorking: digest.stalledWorking.filter((row) => {
       const phaseSeq = phaseSeqByJob.get(row.jobId);

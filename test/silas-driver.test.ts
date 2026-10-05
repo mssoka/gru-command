@@ -266,6 +266,17 @@ describe('silas digest (the four actionable states)', () => {
       }]);
       expect(digest.deliveredWithoutPr.map((row) => row.jobId)).toEqual(['parent-live']);
       expect(digestActionCount(digest)).toBeGreaterThanOrEqual(1);
+      // Round-4 finding 6: once the parent delivers AFTER the reviewer
+      // (it resumed, collected the findings, continued), the re-arm row
+      // retires — every later sweep stays quiet for that delivery.
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'parent-live', payload: { agentId: 'p1' } });
+      const retired = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(retired.reviewerDelivered).toEqual([]);
     } finally {
       h.cleanup();
     }

@@ -1082,6 +1082,15 @@ export class LedgerApi {
       // E17/E18 has neither column). Writing through such a handle keeps
       // working — the new fields simply cannot be persisted there.
       const columns = this.jobsColumns();
+      // (round-4 finding 9) A caller that EXPLICITLY supplies the new
+      // fields on a database that predates their columns must fail loud —
+      // silently dropping them would turn a review lane into PR debt.
+      if (input.deliverable !== undefined && !columns.has('deliverable')) {
+        throw new Error('job deliverable requires migration e17-job-deliverable (the column is missing on this database)');
+      }
+      if (input.parentJobId !== undefined && !columns.has('parent_job_id')) {
+        throw new Error('job parentJobId requires migration e18-job-parent (the column is missing on this database)');
+      }
       const columnList = [
         'id', 'repo', 'title', 'status', 'base_branch', 'pr_url', 'note', 'briefing',
         ...(columns.has('deliverable') ? ['deliverable'] : []),

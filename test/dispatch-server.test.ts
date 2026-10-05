@@ -431,6 +431,16 @@ describe('dispatch server (E8)', () => {
       }, TOKEN);
       expect(badParent.status).toBe(400);
       expect(h.ledger.getJob('http-child-orphan')).toBeNull();
+      // Malformed PRESENT parent values must fail loud (round-4 finding
+      // 12): null/number/blank/object can never be treated as absent.
+      for (const [suffix, value] of [['null', null], ['number', 7], ['blank', '  '], ['object', { id: 'http-parent-impl' }]] as const) {
+        const malformed = await call(h.port, 'POST', '/api/dispatch', {
+          job_id: `http-parent-malformed-${suffix}`, repo_path: repo.path, title: 'review', briefing: 'b',
+          deliverable: 'review', parent_job_id: value,
+        }, TOKEN);
+        expect(malformed.status).toBe(400);
+        expect(h.ledger.getJob(`http-parent-malformed-${suffix}`)).toBeNull();
+      }
     } finally {
       await h.close();
     }

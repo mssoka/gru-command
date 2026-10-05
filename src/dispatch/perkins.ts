@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type { AgentHandle } from '../runtime/types.js';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -1120,6 +1121,10 @@ export interface FallbackGateState {
   notes: number;
   reportFiles: string[];
   note: string;
+  /** Per-run discriminator for escalation attempt ids (round-4 finding 2):
+   * iteration restarts at 1 on every gate run, so attempts are keyed by
+   * run as well — a later run never inherits or erases an earlier one. */
+  escalationRunId: string;
 }
 
 export interface FallbackGateOptions {
@@ -2375,9 +2380,11 @@ export class WaveRunner {
     }
     const controller = new AbortController();
     const state: FallbackGateState = {
+      escalationRunId: '',
       clearToMerge: false, iterations: 0, blockers: 0, notes: 0, reportFiles: [],
       note: 'bmad-review fallback gate engaged',
     };
+    state.escalationRunId = randomUUID();
     this.activeFallbackGates.add(job.id);
     const run = this.track(
       this.runFallbackGate(job, repoPath, baseRef, failedLegs, gate, controller.signal, state, recheck)
@@ -2522,10 +2529,15 @@ export class WaveRunner {
         // the notice landed; a throw is UNKNOWN — the notice may or may
         // not have been recorded (post-before-wake ordering), so it is
         // never misclassified as a clean failure.
-        const escalationId = `${job.id}:${iteration}`;
+        // Run-unique attempt id (round-4 finding 2): iteration restarts
+        // at 1 on every gate run for a job, so the attempt id carries a
+        // per-run discriminator minted at gate start — a later run can
+        // never inherit or erase an earlier run's outcome.
+        const escalationId = `${job.id}:${state.escalationRunId}:${iteration}`;
         fallbackEvent({ phase: 'pass', iteration, notes, reportFile, clearToMerge: true, merge: 'user-held', escalationId });
         let status: 'posted' | 'unknown' | 'not-configured' = 'not-configured';
         let receipt: string | null = null;
+        let errorDetail: string | null = null;
         if (this.opts.escalate !== undefined) {
           try {
             const returned = this.opts.escalate(
@@ -2541,9 +2553,14 @@ export class WaveRunner {
               job: job.id,
               error: String(error),
             });
+            errorDetail = String(error).slice(0, 300);
           }
         }
-        fallbackEvent({ phase: 'escalation', iteration, status, escalationId, ...(receipt !== null ? { receipt } : {}) });
+        fallbackEvent({
+          phase: 'escalation', iteration, status, escalationId,
+          ...(receipt !== null ? { receipt } : {}),
+          ...(errorDetail !== null ? { error: errorDetail } : {}),
+        });
         return;
       }
       if (iteration === maxRounds) break;

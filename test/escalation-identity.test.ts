@@ -94,6 +94,21 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
     });
   });
 
+  it('returns the posted notice id — the durable receipt callers reconcile against (round-4 finding 11)', () => {
+    const ledger = fresh();
+    seedLane(ledger, 'job-a', 'agent-a');
+    const center = new NotificationCenter({ ledger, bus: new EventBus() });
+    const notify = createReviewEscalationNotifier(ledger, center);
+
+    const receipt = notify('bmad-review gate PASS for job job-a', 'notes', { jobId: 'job-a' });
+    // The receipt IS the recorded notification's id: removing the return
+    // in the adapter breaks this, and the fallback outcome event loses its
+    // durable evidence binding.
+    const row = ledger.listNotifications()[0]!;
+    expect(typeof receipt).toBe('string');
+    expect(receipt).toBe(row.id);
+  });
+
   it('absent or contradictory identity posts the unchanged alert unbound — never vanishing', () => {
     const ledger = fresh();
     seedLane(ledger, 'job-a', 'agent-a');

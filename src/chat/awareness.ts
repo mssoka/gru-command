@@ -524,8 +524,10 @@ export class GruAwareness {
     const attempts = new Map<string, EscalationAttempt>();
     const attemptKey = (event: { jobId?: string | null }, payload: Record<string, unknown>): string =>
       `${event.jobId ?? '?'}|${textOf(payload.escalationId) ?? `i${numberOf(payload.iteration) ?? '?'}`}`;
-    for (const event of this.ledger.listEventsAfter(0, { limit: 600, order: 'desc' })) {
-      if (event.kind !== 'job.fallback-review') continue;
+    // Complete per-kind truth (round-4 finding 1): attempt reconciliation
+    // reads the job.fallback-review stream itself, not a window of mixed
+    // events — unrelated traffic can never age an obligation out of view.
+    for (const event of this.ledger.listEventsAfter(0, { kinds: ['job.fallback-review'], limit: 5000, order: 'desc' })) {
       const payload = payloadOf(event);
       const phase = textOf(payload.phase);
       if (phase !== 'pass' && phase !== 'escalation') continue;
@@ -539,6 +541,14 @@ export class GruAwareness {
             status: current?.status ?? '',
             passSeq: event.seq,
           });
+        }
+        // Legacy inline outcomes (round-4 finding 3): a PASS that carries
+        // escalation: 'posted' inline IS its own resolved outcome — never
+        // render it as a missing-outcome obligation.
+        const inline = textOf(payload.escalation);
+        const merged = attempts.get(key)!;
+        if (inline === 'posted' && merged.newestOutcomeSeq < event.seq) {
+          attempts.set(key, { ...merged, newestOutcomeSeq: event.seq, status: 'posted' });
         }
       } else if (current === undefined || event.seq > current.newestOutcomeSeq) {
         attempts.set(key, {
@@ -565,7 +575,7 @@ export class GruAwareness {
       const label = outcomeRecorded
         ? attempt.status === 'unknown'
           ? 'outcome UNKNOWN — verify before re-posting (never a blind duplicate)'
-          : 'FAILED — re-post it (deduplicated; only when no later posted outcome)'
+          : 'FAILED — re-post it (deduplicated; no later posted outcome)'
         : 'outcome MISSING (pass recorded without outcome) — verify before re-posting';
       lines.push(`job ${attempt.jobId ?? '?'}: missing Perkins gate escalation ${label}`);
     }
@@ -629,6 +639,15 @@ export class GruAwareness {
     const attempts = this.escalationAttempts();
     const supersededOutcomeSeqs = new Set<number>();
     const standingEscalationLines = standingEscalationEarly;
+    // Attempt keys whose outcome is unresolved (the same rule the standing
+    // lines use) — their in-window outcome lines are duplicates.
+    const standingKeys = new Set<string>();
+    for (const [key, attempt] of attempts) {
+      const unresolved = attempt.newestOutcomeSeq < 0
+        ? attempt.passSeq !== null
+        : attempt.status === 'unknown' || attempt.status === 'failed';
+      if (unresolved) standingKeys.add(key);
+    }
     // Overfetch, then keep the newest maxEvents DIGESTIBLE lines: derived
     // notification.* rows mirror board events and must not crowd out the
     // status lines inside a fixed window.
@@ -652,6 +671,11 @@ export class GruAwareness {
           if (attempt !== undefined && attempt.newestOutcomeSeq >= 0 && event.seq !== attempt.newestOutcomeSeq) {
             supersededOutcomeSeqs.add(event.seq);
           }
+          // Round-4 finding 10: when an attempt renders a standing
+          // obligation line, its in-window outcome line is a duplicate.
+          if (attempt !== undefined && standingKeys.has(key) && event.seq === attempt.newestOutcomeSeq) {
+            supersededOutcomeSeqs.add(event.seq);
+          }
         }
       }
       if (supersededOutcomeSeqs.has(event.seq)) continue;
@@ -665,8 +689,10 @@ export class GruAwareness {
       }
       digestLinesNewestFirst.push(line);
     }
-    const digestLines = reverse(digestLinesNewestFirst);
-    digestLines.push(...standingEscalationLines);
+    // Round-4 finding 4: standing obligations render FIRST — the bounded
+    // block must spend its bytes on open repair obligations before
+    // historical status lines, and never advance past an unrendered one.
+    const digestLines = [...standingEscalationLines, ...reverse(digestLinesNewestFirst)];
 
     // Pending IDs are independent of the cursor: a passive delivery may
     // have covered an event before the wake policy was enabled. The active

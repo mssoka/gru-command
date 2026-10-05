@@ -212,6 +212,19 @@ describe('gru awareness — passive injection', () => {
     expect(block?.text).toContain('round j1-r1: Perkins NEEDS CHANGES — 2 blocker(s) (proof complete)');
   });
 
+  it('treats a legacy inline posted PASS as resolved — never a missing-outcome obligation', () => {
+    const rig = boot();
+    rig.api.appendCustomEvent({
+      kind: 'job.fallback-review',
+      jobId: 'j4',
+      payload: { gate: true, phase: 'pass', iteration: 1, notes: 0, clearToMerge: true, escalation: 'posted' },
+    });
+    const block = rig.awareness.prepare();
+    expect(block?.text).toContain('missing Perkins gate escalated; merge stays user-held');
+    expect(block?.text).not.toContain('outcome MISSING');
+    expect(block?.text).not.toContain('re-post it');
+  });
+
   it('renders an UNKNOWN escalation outcome as verify-before-repost, never a blind duplicate', () => {
     const rig = boot();
     rig.api.appendCustomEvent({
@@ -246,7 +259,7 @@ describe('gru awareness — passive injection', () => {
     // The cursor advanced past the failure — the open obligation must
     // STILL surface (it is standing, not event-windowed).
     const second = rig.awareness.prepare();
-    expect(second?.text).toContain('job j2: missing Perkins gate escalation FAILED — re-post it (deduplicated; only when no later posted outcome)');
+    expect(second?.text).toContain('job j2: missing Perkins gate escalation FAILED — re-post it (deduplicated; no later posted outcome)');
     // A later posted outcome for the SAME attempt retires it, and the
     // stale failure line no longer renders.
     rig.api.appendCustomEvent({

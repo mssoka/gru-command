@@ -281,15 +281,26 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
   /** Validate the optional parent relation (E16): a present value must be
    * a non-empty string naming an existing job — a typo'd parent would
    * strand the reviewer's delivery with no lane to re-arm. */
-  function parentJobIdField(body: Record<string, unknown>): string | undefined {
+  function parentJobIdField(body: Record<string, unknown>, repoPath: string): string | undefined {
     if (!Object.hasOwn(body, 'parent_job_id')) return undefined;
     const raw = body['parent_job_id'];
     if (typeof raw !== 'string' || raw.trim() === '') {
       throw new Error(`parent_job_id must be a non-empty string (got ${JSON.stringify(raw)})`);
     }
     const value = raw.trim();
-    if (options.ledger.getJob(value) === null) {
+    const parent = options.ledger.getJob(value);
+    if (parent === null) {
       throw new Error(`parent_job_id "${value}" does not name an existing job`);
+    }
+    // Eligibility (round-4 finding 8): a typo that matches another
+    // repository's job would redirect the review handback to that lane,
+    // and a terminal parent can never re-arm — refuse both loudly.
+    const repoName = repoPath.split('/').filter(Boolean).pop() ?? repoPath;
+    if (parent.repo !== repoName) {
+      throw new Error(`parent_job_id "${value}" belongs to repo "${parent.repo}", not "${repoName}"`);
+    }
+    if (isJobTerminal(parent.status)) {
+      throw new Error(`parent_job_id "${value}" is terminal (${parent.status}) — a terminal lane cannot be re-armed`);
     }
     return value;
   }
@@ -326,7 +337,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       const body = await readBody(req);
       const completionHandoff = completionHandoffField(body);
       const deliverable = deliverableField(body);
-      const parentJobId = parentJobIdField(body);
+      const parentJobId = parentJobIdField(body, strField(body, 'repo_path'));
       const outcome = await options.dispatch.dispatch({
         jobId: strField(body, 'job_id'),
         repoPath: strField(body, 'repo_path'),

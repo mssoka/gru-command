@@ -304,8 +304,7 @@ authorizes its full completion cycle, and YOU own driving it:
    its PASS is never a Perkins READY. A fallback PASS escalation recorded
    as failed or unknown (or a PASS whose outcome never landed) has no
    confirmed posted notice: verify, then re-post it during reconciliation
-   (deduplicated — only when no later posted outcome exists for that
-   attempt) and never treat the failure/unknown record as the notice.
+   (deduplicated — no later posted outcome exists for that attempt) and never treat the failure/unknown record as the notice.
 3. Schedule verification through the shipped capture helper — never a
    hand-rolled background watcher. The helper path is named in your wake
    prompt ("Verification capture helper"):

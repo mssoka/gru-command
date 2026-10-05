@@ -2,7 +2,7 @@
 title: 'Ship the minion-owned BMAD build-workflow playbook in installed role prompts'
 type: 'feature'
 created: '2026-10-02'
-status: 'in-review'
+status: 'in-progress'
 route: 'dispatch'
 baseline_commit: 6a00f4e50e7ae970915a9a534c142c1f8a45b57d
 review_loop_iteration: 2
@@ -307,7 +307,34 @@ Full `git diff origin/main...HEAD` at `77bbf7d3` against `508edaae`; four fresh 
 - Blind — **low, rejected**: an absent fallback notifier records `not-configured` and renders that fact; production composes a notifier in `src/main.ts:1071`. An additional persistent action path for an absent optional hook is more than a direct correction to this low-likelihood case.
 - Blind — **low, rejected**: the verification examples at spec lines 986-998 omit heavy Vitest config/30-second flags, while the operative `.gru-command/worktree.toml` scopes supply them. This review workflow excludes fixes that edit the spec under review.
 
-Full finding-by-finding triage and evidence: `/Users/moses/.gru-command/reviews/gc-packaged-build-playbook-20261002-bmad-code-review-77bbf7d/report.md`.
+Full finding-by-finding triage and evidence: the instance reviews directory: `reviews/gc-packaged-build-playbook-20261002-bmad-code-review-77bbf7d/report.md`.
+
+### Review Findings — PR #165 at 635f415 (2026-10-05, integrated head)
+
+Full `git diff origin/main...HEAD` at `635f415c3acd5afa7019b5118e286ce1ddee92db` against `240084ee3d9093b30efd7acdd5b3131053087ebc`. Four independent `openai-codex/gpt-6-sol` layers completed. The following are action items, not fixed by this review; detailed finding-by-finding triage is in the instance reviews directory: `reviews/gc-packaged-build-playbook-20261002-bmad-code-review-635f415/report.md`.
+
+- [ ] [Review][Patch] Preserve escalation obligations beyond the newest 600 ledger events [src/chat/awareness.ts:527] — unresolved attempts must not disappear after unrelated traffic.
+- [ ] [Review][Patch] Give each fallback PASS a unique per-run escalation attempt identity [src/dispatch/perkins.ts:2525] — the current job/iteration key collides across gate runs and can mistake an old posted outcome for the new attempt's outcome.
+- [ ] [Review][Patch] Reconcile legacy inline PASS outcomes rather than marking them missing [src/chat/awareness.ts:538] — an older posted notice can be falsely requested again.
+- [ ] [Review][Patch] Reserve awareness render space for standing obligations [src/chat/awareness.ts:669] — notes, morning lines and historical digest lines can consume the byte cap before any standing repair line appears.
+- [ ] [Review][Patch] Persist bounded notifier-throw error evidence on unknown escalation outcomes [src/dispatch/perkins.ts:2539] — the logged exception is lost on restart.
+- [ ] [Review][Patch] Retire a delivered-reviewer re-arm after the parent accepts follow-up [src/dispatch/silas-driver.ts:850] — every subsequent sweep currently reissues the same instruction while the parent is live.
+- [ ] [Review][Patch] Recheck reviewer and parent status at the digest publish boundary [src/dispatch/silas-driver.ts:1231] — an awaited blocker lookup can leave a stale row pointing at a newly terminal parent.
+- [ ] [Review][Patch] Reject terminal or unrelated-repository parent IDs at reviewer dispatch [src/dispatch/server.ts:284] — mere existence of the parent row does not prove it can receive the handback.
+- [ ] [Review][Patch] Fail loud when a supplied deliverable or parent ID has no column on an older schema [src/ledger/api.ts:1085] — the schema-tolerant insert currently discards explicitly supplied fields.
+- [ ] [Review][Patch] Avoid duplicate re-post instructions for the same failed attempt in one awareness block [src/chat/awareness.ts:667] — the event digest and standing obligation both render it.
+- [ ] [Review][Patch] Assert the production notifier's durable returned ID reaches the fallback event [test/escalation-identity.test.ts:79] — current fallback receipt coverage uses only a stub notifier.
+- [ ] [Review][Patch] Test malformed present `parent_job_id` values at the HTTP boundary [test/dispatch-server.test.ts:417] — only valid and unknown string cases are covered.
+
+#### Rejected (individual verdicts)
+
+- Blind / edge: **low, rejected** — `not-configured` does not remain standing, but production wires a notifier (`src/main.ts:1121`); the previous round explicitly disposed of this optional-hook case as unlikely and a nontrivial new path.
+- Blind / edge: **false, rejected** — a notifier's returned receipt is intentionally optional (`src/dispatch/perkins.ts:1210`); a successful return from the configured posting adapter is not a failed post just because the receipt is absent. Coverage of the production ID return remains an action item above.
+- Blind: **false, rejected** — an out-of-phase reviewer cannot advance the parent under the installed commission rule (`roles/minion.md`, `roles/silas.md`); no reachable compliant stale-phase case was shown. Durable consumption and publish-race issues remain actionable separately.
+- Blind: **false, rejected** — the dispatch API deliberately permits an omitted optional `parent_job_id`; an independent review job without a parent has no promised parent re-arm. Explicit but invalid parent IDs are a separate actionable issue.
+- Blind: **false, rejected** — the reviewer brief specifies the exact SHA, diff range and how to read lane objects read-only (`roles/minion.md:87-97`); the review need not start from that SHA as its worktree HEAD.
+- Edge: **low, rejected** — the optional `not-configured` path repeats the already-disposed optional-hook case above; the production notifier is configured.
+- Edge: **false, rejected** — a successful notifier returning no receipt is permitted by the explicit optional-receipt contract, not evidence of failed delivery.
 
 ## Implementation Notes
 
@@ -962,6 +989,21 @@ bad_spec).
   ordered before the notifier attempt. `docs/FLOW.md` §4f and the
   deferred-work record updated truthfully; no deferred item remains for
   this lane.
+
+- Round-4 closure (same directive — fix them, then review): all twelve
+  `635f415` review groups fixed. High: standing obligations read the
+  complete `job.fallback-review` stream (kind-scoped query, no mixed-event
+  window) and render FIRST inside the bounded block; escalation attempt
+  ids are run-unique (`job:runId:iteration`, minted per gate run). Medium:
+  legacy inline `escalation: posted` PASS rows reconcile as resolved;
+  a throwing notifier records sanitized error detail on the outcome event;
+  the reviewerDelivered row retires when the parent delivers after the
+  reviewer and is revalidated at the digest publish boundary; parent
+  eligibility (same repo, non-terminal) is enforced at dispatch; the
+  production notifier's returned notice id is asserted (receipt wiring).
+  Low: addJob fails loud when deliverable/parent are supplied without
+  their columns; standing and in-window obligation lines are coalesced;
+  malformed present parent values are 400-tested.
 
 - Round-3 closure (owner directive 2026-10-05: "fix them"): the three
   design decisions implemented as runtime — E16 `jobs.parent_job_id`

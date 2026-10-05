@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi, DEFAULT_LENSES, type PendingRebriefRecord } from '../src/ledger/api.js';
-import { LedgerDb } from '../src/ledger/db.js';
+import { LedgerDb, MIGRATIONS } from '../src/ledger/db.js';
 
 const cleanupDirs: string[] = [];
 afterAll(() => {
@@ -16,6 +16,25 @@ function tmpDir(): string {
   cleanupDirs.push(dir);
   return dir;
 }
+
+describe('job deliverable/parent columns (E17/E18)', () => {
+  it('fail loud when the fields are supplied on a database that predates their columns', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-ledger-e17-missing-'));
+    try {
+      const legacy = new LedgerDb(dir, { migrations: MIGRATIONS.filter((migration) => migration.id <= 16) });
+      const api = new LedgerApi(legacy.handle);
+      expect(() => api.addJob({ id: 'j', repo: 'r', title: 't', briefing: 'b', deliverable: 'review' }))
+        .toThrow(/e17-job-deliverable/);
+      expect(() => api.addJob({ id: 'j', repo: 'r', title: 't', briefing: 'b', parentJobId: 'p' }))
+        .toThrow(/e18-job-parent/);
+      // Absent fields keep working on the older prefix (upgrade fixtures).
+      expect(api.addJob({ id: 'j-ok', repo: 'r', title: 't', briefing: 'b' }).id).toBe('j-ok');
+      legacy.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
 
 describe('ledger api — the record of state', () => {
   let api: LedgerApi;
