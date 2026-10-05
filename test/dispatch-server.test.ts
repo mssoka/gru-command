@@ -394,6 +394,43 @@ describe('dispatch server (E8)', () => {
       expect(bogus.status).toBe(400);
       // A rejected dispatch creates nothing — no silent default.
       expect(h.ledger.getJob('http-bogus-deliverable')).toBeNull();
+      // Present-but-malformed values must fail loud, never default a lane
+      // into a PR-owing (or carved-out) kind.
+      for (const [suffix, value] of [['null', null], ['number', 42], ['blank', '   '], ['object', {}]] as const) {
+        const malformed = await call(
+          h.port,
+          'POST',
+          '/api/dispatch',
+          {
+            job_id: `http-malformed-${suffix}`,
+            repo_path: repo.path,
+            title: 'malformed',
+            briefing: 'b',
+            deliverable: value,
+          },
+          TOKEN,
+        );
+        expect(malformed.status).toBe(400);
+        expect(h.ledger.getJob(`http-malformed-${suffix}`)).toBeNull();
+      }
+      // E16 parent relation: reviewers name their commissioning lane; an
+      // unknown parent is refused before any job exists.
+      const parent = await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'http-parent-impl', repo_path: repo.path, title: 'impl', briefing: 'b',
+      }, TOKEN);
+      expect(parent.status).toBe(202);
+      const child = await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'http-child-review', repo_path: repo.path, title: 'review', briefing: 'read-only review brief',
+        deliverable: 'review', parent_job_id: 'http-parent-impl',
+      }, TOKEN);
+      expect(child.status).toBe(202);
+      expect(h.ledger.getJob('http-child-review')).toMatchObject({ deliverable: 'review', parentJobId: 'http-parent-impl' });
+      const badParent = await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'http-child-orphan', repo_path: repo.path, title: 'review', briefing: 'b',
+        deliverable: 'review', parent_job_id: 'http-no-such-parent',
+      }, TOKEN);
+      expect(badParent.status).toBe(400);
+      expect(h.ledger.getJob('http-child-orphan')).toBeNull();
     } finally {
       await h.close();
     }
@@ -513,11 +550,15 @@ describe('dispatch server (E8)', () => {
       expect(h.ledger.latestJobEvent('http-handoff', 'job.review-handoff-started')?.payload).toMatchObject({
         route: 'bmad-review-fallback',
       });
-      for (let tick = 0; tick < 40 &&
-        (h.ledger.latestJobEvent('http-handoff', 'job.fallback-review')?.payload as { phase?: string } | undefined)?.phase !== 'pass'; tick += 1) {
+      const hasPass = (): boolean => h.ledger.listEvents({ limit: 200 }).some((event) =>
+        event.kind === 'job.fallback-review' && event.jobId === 'http-handoff' &&
+        (event.payload as { phase?: string }).phase === 'pass');
+      for (let tick = 0; tick < 40 && !hasPass(); tick += 1) {
         await new Promise<void>((resolve) => setTimeout(resolve, 25));
       }
-      expect(h.ledger.latestJobEvent('http-handoff', 'job.fallback-review')?.payload).toMatchObject({ phase: 'pass' });
+      // The PASS row must exist; a later outcome event (`escalation`) may
+      // legitimately be the latest row, so scan rather than read latest.
+      expect(hasPass()).toBe(true);
     } finally {
       release();
       await h.close();
@@ -994,13 +1035,14 @@ describe('dispatch server (E8)', () => {
       // The live gate answers the state while it runs...
       expect((await digest()).prWithoutReview).toEqual([]);
       const deadline = Date.now() + 5_000;
-      const phase = (): unknown => {
-        const event = h.ledger.latestJobEvent('clean-abort-fallback-pass', 'job.fallback-review');
-        return typeof event?.payload === 'object' && event.payload !== null
-          ? (event.payload as { phase?: unknown }).phase : undefined;
-      };
-      while (phase() !== 'pass' && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
-      expect(phase()).toBe('pass');
+      const sawPass = (): boolean => h.ledger.listEvents({ limit: 200 }).some((event) =>
+        event.kind === 'job.fallback-review' && event.jobId === 'clean-abort-fallback-pass' &&
+        typeof event.payload === 'object' && event.payload !== null &&
+        (event.payload as { phase?: unknown }).phase === 'pass');
+      while (!sawPass() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
+      // A later `escalation` outcome row is expected; the PASS fact is an
+      // event in the job's history, not necessarily the latest row.
+      expect(sawPass()).toBe(true);
       expect((await digest()).prWithoutReview).toEqual([]);
     } finally { await h.close(); }
   }, 90_000);

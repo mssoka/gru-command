@@ -1672,6 +1672,7 @@ describe('packaged product and terminal-frame coverage (N6)', () => {
     expect(stagedOps).toContain('never one to wait on');
     expect(stagedOps).toContain('dispatch the reviewer yourself');
     expect(stagedOps).toContain('re-post it during reconciliation');
+    expect(stagedOps).toContain('Mark non-PR dispatches by kind');
     expect(stagedOps).toContain('The owner holds ALL merges');
     expect(stagedOps).not.toContain('The chief holds merge authority');
     expect(stagedOps).toContain('never demand a fixed skill name');

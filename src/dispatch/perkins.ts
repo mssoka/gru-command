@@ -1207,7 +1207,7 @@ export interface WaveRunnerOptions {
    * released before the wait so the retry can reacquire admission. */
   readonly retrySettlement?: (agentId: string) => Promise<RetrySettlement>;
   readonly poster?: VerdictPoster;
-  readonly escalate?: (title: string, detail: string, context?: EscalationContext) => void;
+  readonly escalate?: (title: string, detail: string, context?: EscalationContext) => string | void;
   /** Stable service-owned root. Required for every production review. */
   readonly reviewArtifactRoot?: string;
   /** The service uploads dir (`<data_dir>/uploads`): the ONLY namespace an
@@ -2513,31 +2513,37 @@ export class WaveRunner {
       fallbackEvent({ phase: 'triaged', iteration, blockers, notes, reportFile });
       if (blockers === 0) {
         state.clearToMerge = true;
-        // Ordering + escalation truth (bmad-review rounds 1-2): the PASS
-        // fact is appended FIRST — it is true regardless of notification —
-        // and the escalation attempt follows with its own durable outcome
-        // event. A notification-triggered observer can therefore never see
-        // an alert without the PASS row, and a throwing notifier leaves a
-        // recorded re-post obligation instead of a false success claim.
-        fallbackEvent({ phase: 'pass', iteration, notes, reportFile, clearToMerge: true, merge: 'user-held' });
-        let escalation: 'posted' | 'failed' | 'not-configured' = 'not-configured';
+        // Ordering + attempt identity (bmad-review rounds 1-3): the PASS
+        // fact is appended FIRST (true regardless of notification) and
+        // carries a stable escalationId; the attempt follows with its own
+        // durable outcome event under the SAME id. A crash between the two
+        // leaves a discoverable pass-without-outcome pair (reconciled by
+        // the digest as UNKNOWN, never silent); a returned receipt proves
+        // the notice landed; a throw is UNKNOWN — the notice may or may
+        // not have been recorded (post-before-wake ordering), so it is
+        // never misclassified as a clean failure.
+        const escalationId = `${job.id}:${iteration}`;
+        fallbackEvent({ phase: 'pass', iteration, notes, reportFile, clearToMerge: true, merge: 'user-held', escalationId });
+        let status: 'posted' | 'unknown' | 'not-configured' = 'not-configured';
+        let receipt: string | null = null;
         if (this.opts.escalate !== undefined) {
           try {
-            this.opts.escalate(
+            const returned = this.opts.escalate(
               `bmad-review gate PASS for job ${job.id} — review/fix routing cleared (missing Perkins gate escalated; merge stays user-held)`,
               `${notes} note(s) across ${iteration} review round(s). Reports: ${state.reportFiles.join(', ')}`,
               { jobId: job.id },
             );
-            escalation = 'posted';
+            status = 'posted';
+            if (typeof returned === 'string' && returned !== '') receipt = returned;
           } catch (error) {
-            escalation = 'failed';
-            this.log('error', 'fallback PASS escalation notifier threw', {
+            status = 'unknown';
+            this.log('error', 'fallback PASS escalation notifier threw — outcome unknown (the notice may have landed)', {
               job: job.id,
               error: String(error),
             });
           }
         }
-        fallbackEvent({ phase: 'escalation', iteration, status: escalation });
+        fallbackEvent({ phase: 'escalation', iteration, status, escalationId, ...(receipt !== null ? { receipt } : {}) });
         return;
       }
       if (iteration === maxRounds) break;

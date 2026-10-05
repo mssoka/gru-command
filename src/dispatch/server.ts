@@ -235,9 +235,32 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
 
   /** Validate the optional deliverable kind (E15): a typo must fail loud,
    * never silently default an implementation lane into a carve-out. */
+  /** Validate the optional parent relation (E16): a present value must be
+   * a non-empty string naming an existing job — a typo'd parent would
+   * strand the reviewer's delivery with no lane to re-arm. */
+  function parentJobIdField(body: Record<string, unknown>): string | undefined {
+    if (!Object.hasOwn(body, 'parent_job_id')) return undefined;
+    const raw = body['parent_job_id'];
+    if (typeof raw !== 'string' || raw.trim() === '') {
+      throw new Error(`parent_job_id must be a non-empty string (got ${JSON.stringify(raw)})`);
+    }
+    const value = raw.trim();
+    if (options.ledger.getJob(value) === null) {
+      throw new Error(`parent_job_id "${value}" does not name an existing job`);
+    }
+    return value;
+  }
+
   function deliverableField(body: Record<string, unknown>): JobDeliverable | undefined {
-    const value = optStrField(body, 'deliverable');
-    if (value === undefined) return undefined;
+    // Presence is checked FIRST: a present null/number/boolean/blank must
+    // fail loud, never silently default an implementation lane into a
+    // carve-out (or a review lane into PR debt).
+    if (!Object.hasOwn(body, 'deliverable')) return undefined;
+    const raw = body['deliverable'];
+    if (typeof raw !== 'string' || raw.trim() === '') {
+      throw new Error(`deliverable must be a non-empty string of pr|review|artifact|investigation (got ${JSON.stringify(raw)})`);
+    }
+    const value = raw.trim();
     if (value !== 'pr' && value !== 'review' && value !== 'artifact' && value !== 'investigation') {
       throw new Error(`deliverable must be one of pr|review|artifact|investigation (got "${value}")`);
     }
@@ -260,12 +283,14 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       const body = await readBody(req);
       const completionHandoff = completionHandoffField(body);
       const deliverable = deliverableField(body);
+      const parentJobId = parentJobIdField(body);
       const outcome = await options.dispatch.dispatch({
         jobId: strField(body, 'job_id'),
         repoPath: strField(body, 'repo_path'),
         title: strField(body, 'title'),
         briefing: strField(body, 'briefing'),
         ...(deliverable !== undefined ? { deliverable } : {}),
+        ...(parentJobId !== undefined ? { parentJobId } : {}),
         ...(completionHandoff !== undefined ? { completionHandoff } : {}),
       });
       // The minion's turn runs in the background; the board carries the

@@ -212,6 +212,65 @@ describe('gru awareness — passive injection', () => {
     expect(block?.text).toContain('round j1-r1: Perkins NEEDS CHANGES — 2 blocker(s) (proof complete)');
   });
 
+  it('renders an UNKNOWN escalation outcome as verify-before-repost, never a blind duplicate', () => {
+    const rig = boot();
+    rig.api.appendCustomEvent({
+      kind: 'job.fallback-review',
+      jobId: 'j1',
+      payload: { gate: true, phase: 'pass', iteration: 1, notes: 0, clearToMerge: true, escalationId: 'j1:1' },
+    });
+    rig.api.appendCustomEvent({
+      kind: 'job.fallback-review',
+      jobId: 'j1',
+      payload: { gate: true, phase: 'escalation', iteration: 1, status: 'unknown', escalationId: 'j1:1' },
+    });
+    const block = rig.awareness.prepare();
+    expect(block?.text).toContain('job j1: missing Perkins gate escalation outcome UNKNOWN — verify before re-posting (never a blind duplicate)');
+  });
+
+  it('keeps an unresolved escalation obligation visible across cursor advance, and retires it on a later posted outcome', () => {
+    const rig = boot();
+    rig.api.appendCustomEvent({
+      kind: 'job.fallback-review',
+      jobId: 'j2',
+      payload: { gate: true, phase: 'pass', iteration: 2, notes: 0, clearToMerge: true, escalationId: 'j2:2' },
+    });
+    rig.api.appendCustomEvent({
+      kind: 'job.fallback-review',
+      jobId: 'j2',
+      payload: { gate: true, phase: 'escalation', iteration: 2, status: 'failed', escalationId: 'j2:2' },
+    });
+    const first = rig.awareness.prepare();
+    expect(first).not.toBeNull();
+    rig.awareness.commit(first!);
+    // The cursor advanced past the failure — the open obligation must
+    // STILL surface (it is standing, not event-windowed).
+    const second = rig.awareness.prepare();
+    expect(second?.text).toContain('job j2: missing Perkins gate escalation FAILED — re-post it (deduplicated; only when no later posted outcome)');
+    // A later posted outcome for the SAME attempt retires it, and the
+    // stale failure line no longer renders.
+    rig.api.appendCustomEvent({
+      kind: 'job.fallback-review',
+      jobId: 'j2',
+      payload: { gate: true, phase: 'escalation', iteration: 2, status: 'posted', escalationId: 'j2:2', receipt: 'n1' },
+    });
+    const third = rig.awareness.prepare();
+    expect(third?.text).toContain('job j2: missing Perkins gate escalation posted');
+    expect(third?.text).not.toContain('escalation FAILED');
+    expect(third?.text).not.toContain('outcome UNKNOWN');
+  });
+
+  it('surfaces a PASS whose escalation outcome never landed as MISSING (crash reconciliation)', () => {
+    const rig = boot();
+    rig.api.appendCustomEvent({
+      kind: 'job.fallback-review',
+      jobId: 'j3',
+      payload: { gate: true, phase: 'pass', iteration: 1, notes: 0, clearToMerge: true, escalationId: 'j3:1' },
+    });
+    const block = rig.awareness.prepare();
+    expect(block?.text).toContain('job j3: missing Perkins gate escalation outcome MISSING (pass recorded without outcome) — verify before re-posting');
+  });
+
   it('renders the split escalation event and its re-post obligation on failure', () => {
     const rig = boot();
     rig.api.appendCustomEvent({

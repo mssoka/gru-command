@@ -122,6 +122,9 @@ export class DispatchService {
      * dispatch with `review`, artifact-only lanes with `artifact`/
      * `investigation`; omitted = a PR-owing implementation lane. */
     deliverable?: JobDeliverable;
+    /** The commissioning parent lane (E16) for tracked child work such
+     * as reviewers; the digest re-arms the parent on delivery. */
+    parentJobId?: string;
     /** Explicit completion intent: when present, the phase-handoff guard
      * row is persisted BEFORE any side effect and this exact phase's
      * validated completion owes the named decision durably. Omitted =
@@ -140,6 +143,7 @@ export class DispatchService {
       title: input.title,
       briefing: input.briefing,
       ...(input.deliverable !== undefined ? { deliverable: input.deliverable } : {}),
+      ...(input.parentJobId !== undefined ? { parentJobId: input.parentJobId } : {}),
     });
 
     // (2) Ops handoff: dispatched → working, on the record.

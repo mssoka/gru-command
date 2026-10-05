@@ -211,6 +211,16 @@ export interface DeliveredWithoutPrRow {
   readonly deliveredAt: string | null;
 }
 
+/** A commissioned reviewer delivered its findings; the PARENT lane must
+ * resume to collect them and continue its cycle (E16 re-arm). */
+export interface ReviewerDeliveredRow {
+  readonly jobId: string;
+  readonly parentJobId: string;
+  readonly parentStatus: string;
+  readonly repo: string;
+  readonly deliveredAt: string;
+}
+
 export interface PrWithoutReviewRow {
   readonly jobId: string;
   readonly repo: string;
@@ -263,6 +273,7 @@ export interface SilasOpsDigest {
   readonly computedAt: string;
   readonly trigger: string;
   readonly deliveredWithoutPr: readonly DeliveredWithoutPrRow[];
+  readonly reviewerDelivered: readonly ReviewerDeliveredRow[];
   readonly prWithoutReview: readonly PrWithoutReviewRow[];
   readonly verdictsAwaitingDirective: readonly VerdictAwaitingDirectiveRow[];
   readonly stalledWorking: readonly StalledWorkingRow[];
@@ -274,6 +285,7 @@ export interface SilasOpsDigest {
 export function digestActionCount(digest: SilasOpsDigest): number {
   return (
     digest.deliveredWithoutPr.length +
+    digest.reviewerDelivered.length +
     digest.prWithoutReview.length +
     digest.verdictsAwaitingDirective.length +
     digest.stalledWorking.length +
@@ -455,6 +467,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     computedAt: string;
     trigger: string;
     deliveredWithoutPr: DeliveredWithoutPrRow[];
+    reviewerDelivered: ReviewerDeliveredRow[];
     prWithoutReview: PrWithoutReviewRow[];
     verdictsAwaitingDirective: VerdictAwaitingDirectiveRow[];
     stalledWorking: StalledWorkingRow[];
@@ -464,6 +477,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     computedAt: new Date(now()).toISOString(),
     trigger: input.trigger,
     deliveredWithoutPr: [],
+    reviewerDelivered: [],
     prWithoutReview: [],
     verdictsAwaitingDirective: [],
     stalledWorking: [],
@@ -525,6 +539,28 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
         minionSessionFile: minion?.sessionFile ?? null,
         deliveredAt: delivered.ts,
       });
+    }
+
+    // (1b) A commissioned reviewer delivered: the PARENT lane owes the
+    // follow-up (collect findings, continue the cycle). Only non-terminal
+    // reviewers with a live parent surface here — the row is the parent's
+    // re-arm, not the reviewer's completion (E16).
+    if (job.deliverable === 'review' && job.parentJobId !== null) {
+      const parent = input.ledger.getJob(job.parentJobId);
+      const reviewerDelivered = input.ledger.latestJobEvent(job.id, 'job.delivered');
+      if (
+        parent !== null &&
+        parent.status !== 'merged' && parent.status !== 'done' &&
+        reviewerDelivered !== null
+      ) {
+        digest.reviewerDelivered.push({
+          jobId: job.id,
+          parentJobId: parent.id,
+          parentStatus: parent.status,
+          repo: job.repo,
+          deliveredAt: reviewerDelivered.ts,
+        });
+      }
     }
 
     // (2) PR registered, review overdue (first or re-review). Any status

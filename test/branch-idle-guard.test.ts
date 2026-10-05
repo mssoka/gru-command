@@ -155,7 +155,7 @@ async function boot(opts: {
     spawner,
     reviewArtifactRoot: artifactRoot,
     bus,
-    escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+    escalate: (title, detail): void => { escalations.push(`${title}: ${detail}`); },
     // PR-linked rounds verify the live head through the fixture's own bare
     // origin (the same double the dispatch-server suite uses); rounds
     // without a registered PR never consult it.
@@ -390,6 +390,7 @@ function jobRecord(id: string, status: JobStatus): JobRecord {
     note: null,
     briefing: 'b',
     deliverable: null,
+    parentJobId: null,
     createdAt: '2026-09-23T00:00:00.000Z',
     updatedAt: '2026-09-23T00:00:00.000Z',
   };

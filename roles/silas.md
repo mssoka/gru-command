@@ -147,7 +147,15 @@ past its recorded review commission (PR discovery and the native gate
 come after its findings are delivered), and never substitute untracked
 reviewers. Skill
 names and workflow structure change between BMAD versions — never demand
-a fixed skill name in a briefing. Expensive suites go through the
+a fixed skill name in a briefing. Mark non-PR dispatches by kind:
+reviewer jobs carry `"deliverable": "review"` plus
+`"parent_job_id": "<the commissioning lane>"`, artifact-only and
+investigation lanes carry `"deliverable": "artifact"` /
+`"investigation"`; implementation lanes omit the field (PR-owing). An
+unmarked non-PR dispatch will be chased as a missing PR. Digest rows
+under `reviewerDelivered` name parent lanes whose commissioned reviewer
+delivered — resume the parent to collect the findings and continue its
+cycle; the reviewer owes no PR. Expensive suites go through the
 verification scheduler (`/api/verify`) within existing capacity. You do
 not approve each routine phase, do not pull source-only work back between
 phases, and do not commission a supplementary review duplicating the

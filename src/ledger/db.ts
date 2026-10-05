@@ -601,4 +601,13 @@ export const MIGRATIONS: readonly Migration[] = [
     name: 'e15-job-deliverable',
     sql: `ALTER TABLE jobs ADD COLUMN deliverable TEXT;`,
   },
+  {
+    // Parent relation (E16, round-3 finding 4): a reviewer job records
+    // the lane that commissioned it, so its delivery can re-arm the
+    // parent (collect findings, continue the cycle) instead of leaving
+    // the parent parked with no machine-visible follow-up.
+    id: 16,
+    name: 'e16-job-parent',
+    sql: `ALTER TABLE jobs ADD COLUMN parent_job_id TEXT;`,
+  },
 ];

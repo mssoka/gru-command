@@ -290,6 +290,25 @@ Full branch diff from `origin/main` 28c3dd2b; four fresh `openai-codex/gpt-6-sol
 - Acceptance 12 — **false, rejected**: the same exact-head CI run passed lint, typecheck, build and `npm test`; its fast suite includes `test/rehearsal.test.ts` running the hygiene gate.
 - Acceptance 13 — **low, rejected**: the heavy-config documentation mismatch is real but duplicates blind 1/2 and requires editing the spec under review, excluded by this review workflow.
 
+### Review Findings — PR #165 at 77bbf7d (2026-10-05, round 3)
+
+Full `git diff origin/main...HEAD` at `77bbf7d3` against `508edaae`; four fresh `openai-codex/gpt-6-sol` layers completed. No exact-head CI run was available (the previous commit `ce0cc98` passed CI). All seven action groups were resolved in the same continuation (owner directive: fix them); this independent BMAD review is not a native Perkins verdict.
+
+- [x] [Review][Decision→implemented] Persist the parent-to-review commission and delivery re-arm [roles/minion.md:94-141; src/dispatch/service.ts:118-149; src/dispatch/silas-driver.ts:505-522] — **medium**, blind-hunter — fixed: E16 adds `jobs.parent_job_id` (migration `e16-job-parent`), reviewer dispatches carry `parent_job_id` (worker prompt + ops surfaces + validated API field refusing unknown parents), and the digest's `reviewerDelivered` row re-arms the live parent when its commissioned reviewer delivers (ops guidance: resume the parent to collect findings; the reviewer owes no PR). Covered by digest + API tests.
+- [x] [Review][Decision→implemented] Make failed escalation a durable, latest-outcome-aware obligation [src/chat/awareness.ts:291-299,562-574,650-651] — **medium** — fixed: the digest reconciles every attempt to its LATEST outcome (superseded outcome events never render), and unresolved failed/unknown outcomes — plus PASS rows whose outcome never landed — surface as STANDING obligation lines independent of the delivered-event cursor, retired only by a later posted outcome for the same attempt id. Covered by cursor-advance and retire-on-posted tests.
+- [x] [Review][Decision→implemented] Correlate notifier attempts with durable notification evidence [src/dispatch/perkins.ts:2522-2541; src/notifications/center.ts:116-140] — **medium** — fixed: the PASS row and its outcome event share a stable `escalationId`, so a crash between them is a discoverable pass-without-outcome pair (the standing digest renders it as MISSING — verify); the notifier may return its durable notice id (recorded as `receipt`), and a throw records `unknown` — never a clean `failed` — because the notice may have landed before the throw. Covered by fallback-path tests.
+- [x] [Review][Patch] Update fallback phase expectations for the new escalation event — fixed: the three phase lists end at `escalation`, and both server polls scan the job's event history for the PASS fact instead of racing on `latestJobEvent`; full heavy suites re-run green (perkins-builtin-wave + dispatch-server, 171 tests).
+- [x] [Review][Patch] Reject present malformed deliverable fields instead of defaulting them [src/dispatch/server.ts:238-246; test/dispatch-server.test.ts:361-400] — fixed: presence is checked first (`Object.hasOwn`), null/number/boolean/blank/object values are rejected with 400 before any job exists (tested for four malformed shapes).
+- [x] [Review][Patch] Specify non-PR deliverables at artifact/investigation dispatch sites — fixed: both ops surfaces now name all four kinds (`review` with `parent_job_id`, `artifact`, `investigation`, omitted = PR-owing) and warn that an unmarked non-PR dispatch is chased as a missing PR; pinned at the source, loaded-ops, and staged-tarball seams.
+- [x] [Review][Patch] Test PASS existence inside the posted notifier callback — fixed: the harness notifier inspects the ledger at call time (`escalationSawPass`), asserted true in both the posted and the throwing modes — moving the PASS append after the notifier call now fails the test.
+
+#### Rejected (individual verdicts)
+
+- Blind — **low, rejected**: an absent fallback notifier records `not-configured` and renders that fact; production composes a notifier in `src/main.ts:1071`. An additional persistent action path for an absent optional hook is more than a direct correction to this low-likelihood case.
+- Blind — **low, rejected**: the verification examples at spec lines 986-998 omit heavy Vitest config/30-second flags, while the operative `.gru-command/worktree.toml` scopes supply them. This review workflow excludes fixes that edit the spec under review.
+
+Full finding-by-finding triage and evidence: `/Users/moses/.gru-command/reviews/gc-packaged-build-playbook-20261002-bmad-code-review-77bbf7d/report.md`.
+
 ## Implementation Notes
 
 - Runtime capability verified on this lane: `pi` CLI v0.99.1 on PATH,
@@ -943,6 +962,21 @@ bad_spec).
   ordered before the notifier attempt. `docs/FLOW.md` §4f and the
   deferred-work record updated truthfully; no deferred item remains for
   this lane.
+
+- Round-3 closure (owner directive 2026-10-05: "fix them"): the three
+  design decisions implemented as runtime — E16 `jobs.parent_job_id`
+  (migration, validated `parent_job_id` dispatch field, worker prompt +
+  ops guidance) with the digest `reviewerDelivered` parent re-arm row;
+  awareness standing escalation obligations reconciled to the latest
+  outcome per attempt id (superseded outcomes never render; unresolved
+  failed/unknown/missing outcomes persist past the cursor and retire only
+  on a posted outcome); escalation attempt identity (`escalationId` on the
+  PASS row and its outcome event, optional notice `receipt`, throws record
+  `unknown` — never a false clean failure). The four round-3 patches
+  fixed: phase-list/poll expectations for the `escalation` event,
+  presence-first malformed-`deliverable` rejection, artifact/
+  investigation kind guidance, and the in-callback PASS-durability
+  regression. Full fast phase + heavy fallback/dispatch suites green.
 
 - Independent `bmad-code-review` round 2 on the `e89cac7` head (same
   multiplexer router, four fresh `openai-codex/gpt-6-sol` layers; report

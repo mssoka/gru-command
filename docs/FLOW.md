@@ -482,10 +482,16 @@ reconciliation. That is the mechanism to extend — do not build a parallel
 outcome system. `/api/verify` single-flight admission/re-arm with the
 exclusive-capture helper (#159) has since shipped (PR #192).
 Fallback-PASS escalation follow-through is recorded durably: the PASS row
-is appended before the notifier attempt, the attempt's outcome lands as a
-separate `escalation` event (posted / failed / not-configured), and a
-failed outcome surfaces a deduplicated re-post obligation in the digest
-(never an automatic retry). Nothing in this section claims the remaining
+is appended before the notifier attempt under a stable `escalationId`, the
+attempt's outcome lands as a separate `escalation` event (posted with an
+optional notice receipt / unknown on a throw / not-configured), and an
+unresolved failed or unknown outcome — or a PASS whose outcome never
+landed — surfaces a standing verify/re-post obligation in the digest that
+retires only on a later posted outcome for the same attempt (never an
+automatic retry). Commissioned reviewers carry their parent lane
+(`parent_job_id`), and a delivered reviewer re-arms that parent through
+the digest's `reviewerDelivered` row. Nothing in this section claims the
+remaining
 runtime guarantees exist today.
 
 ## 5. Release (the sweep)

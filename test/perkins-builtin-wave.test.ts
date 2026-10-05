@@ -877,7 +877,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const wave = new WaveRunner({
       ledger, worktrees: port, spawner: vi.fn() as unknown as AgentSpawner,
       reviewArtifactRoot: artifacts, poster,
-      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      escalate: (title, detail): void => { escalations.push(`${title}: ${detail}`); },
     });
     expect(await wave.recoverInterruptedRounds()).toBe(1);
     expect(ledger.getRound(round.id)).toMatchObject({ status: 'aborted', verdict: null });
@@ -1040,7 +1040,7 @@ describe('WaveRunner built-in Perkins production path', () => {
         })),
       },
       prHeadProbe: localHeadProbe('feature/specialist-failed'),
-      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      escalate: (title, detail): void => { escalations.push(`${title}: ${detail}`); },
     });
     const outcome = asWave(await wave.runRound({ jobId: job.id }));
     // The failed specialist is an execution fact, never a missing reviewer:
@@ -1181,7 +1181,7 @@ describe('WaveRunner built-in Perkins production path', () => {
       reviewArtifactRoot: artifacts,
       prHeadProbe: localHeadProbe(`feature/post-${mode}`),
       ...(poster === undefined ? {} : { poster }),
-      escalate: (title) => escalations.push(title),
+      escalate: (title): void => { escalations.push(title); },
     });
     const outcome = asWave(await wave.runRound({ jobId: job.id }));
     expect(outcome.canonicalVerdict).toBe('INCOMPLETE');
@@ -1438,7 +1438,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
       const poster = receiptPoster({ ...forge });
       const wave = new WaveRunner({
         ledger, worktrees: port, spawner: makeSpawner(sessions, []), poster, reviewArtifactRoot: artifacts,
-        escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+        escalate: (title, detail): void => { escalations.push(`${title}: ${detail}`); },
         prHeadProbe: localHeadProbe('feature/forged'),
       });
       const outcome = asWave(await wave.runRound({ jobId: job.id }));
@@ -1479,7 +1479,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     const escalations: string[] = [];
     const wave = new WaveRunner({
       ledger, worktrees: port, spawner: makeSpawner(sessions, []), poster: { post, reconcile }, reviewArtifactRoot: artifacts,
-      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      escalate: (title, detail): void => { escalations.push(`${title}: ${detail}`); },
       prHeadProbe: localHeadProbe('feature/reconcile') as ReturnType<typeof localHeadProbe>,
     });
     const outcome = asWave(await wave.runRound({ jobId: job.id }));
@@ -1518,7 +1518,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     const escalations: string[] = [];
     const wave = new WaveRunner({
       ledger, worktrees: port, spawner: makeSpawner(sessions, []), poster: { post, reconcile }, reviewArtifactRoot: artifacts,
-      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      escalate: (title, detail): void => { escalations.push(`${title}: ${detail}`); },
       prHeadProbe: localHeadProbe('feature/reconcile-absent'),
     });
     const outcome = asWave(await wave.runRound({ jobId: job.id }));
@@ -1562,7 +1562,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     const escalations: string[] = [];
     const wave = new WaveRunner({
       ledger, worktrees: port, spawner: makeSpawner(sessions, []), poster: { post }, reviewArtifactRoot: artifacts,
-      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      escalate: (title, detail): void => { escalations.push(`${title}: ${detail}`); },
       prHeadProbe: localHeadProbe('feature/missing-base-receipt'),
     });
     const outcome = asWave(await wave.runRound({ jobId: job.id }));
@@ -1602,7 +1602,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     const escalations: string[] = [];
     const wave = new WaveRunner({
       ledger, worktrees: port, spawner: makeSpawner(sessions, []), poster: { post, reconcile }, reviewArtifactRoot: artifacts,
-      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      escalate: (title, detail): void => { escalations.push(`${title}: ${detail}`); },
       prHeadProbe: localHeadProbe('feature/reconcile-failure'),
     });
     const outcome = asWave(await wave.runRound({ jobId: job.id }));
@@ -1753,7 +1753,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
         advancedDuringLead = true;
       }),
       poster: { post }, reviewArtifactRoot: fixture.artifacts,
-      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      escalate: (title, detail): void => { escalations.push(`${title}: ${detail}`); },
       prHeadProbe: localHeadProbe('feature/base-advance-post'),
     });
     const outcome = asWave(await wave.runRound({ jobId: fixture.job.id }));
@@ -1777,7 +1777,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     const wave = new WaveRunner({
       ledger: fixture.ledger, worktrees: fixture.port, spawner: makeSpawner(fixture.sessions, []),
       poster: { post, reconcile }, reviewArtifactRoot: fixture.artifacts,
-      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      escalate: (title, detail): void => { escalations.push(`${title}: ${detail}`); },
       prHeadProbe: localHeadProbe('feature/base-advance-reconcile'),
     });
     const outcome = asWave(await wave.runRound({ jobId: fixture.job.id }));
@@ -1810,7 +1810,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     const postWave = new WaveRunner({
       ledger: inPost.ledger, worktrees: inPost.port, spawner: makeSpawner(inPost.sessions, []),
       poster: { post }, reviewArtifactRoot: inPost.artifacts,
-      escalate: (title, detail) => postEscalations.push(`${title}: ${detail}`),
+      escalate: (title, detail): void => { postEscalations.push(`${title}: ${detail}`); },
       prHeadProbe: localHeadProbe('feature/target-push-post'),
     });
     const postOutcome = asWave(await postWave.runRound({ jobId: inPost.job.id }));
@@ -1880,7 +1880,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     const second = asWave(await new WaveRunner({
       ledger, worktrees: port, spawner: makeSpawner(mkdtempSync(join(tmpdir(), 'perkins-pmiss-s2-')), []),
       poster: receiptPoster(), reviewArtifactRoot: artifacts,
-      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      escalate: (title, detail): void => { escalations.push(`${title}: ${detail}`); },
       prHeadProbe: localHeadProbe('feature/prior-missing'),
     }).runRound({ jobId: job.id }));
     expect(second.canonicalVerdict).toBe('INCOMPLETE');
@@ -2110,7 +2110,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     const escalations: string[] = [];
     const wave = new WaveRunner({
       ledger, worktrees: port, spawner: makeSpawner(sessions, []), poster, reviewArtifactRoot: artifacts,
-      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      escalate: (title, detail): void => { escalations.push(`${title}: ${detail}`); },
       prHeadProbe: localHeadProbe('feature/app-seam') as ReturnType<typeof localHeadProbe>,
     });
     const outcome = asWave(await wave.runRound({ jobId: job.id }));
@@ -2182,7 +2182,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     const wave = new WaveRunner({
       ledger, worktrees: port, spawner: makeSpawner(sessions, []), poster: adapter,
       reviewArtifactRoot: artifacts,
-      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      escalate: (title, detail): void => { escalations.push(`${title}: ${detail}`); },
       prHeadProbe: localHeadProbe('feature/adapter-reconcile'),
     });
     // Explicit commit pin: the freeze needs no origin fetch (the github-form
@@ -2333,7 +2333,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
       const wave = new WaveRunner({
         ledger, worktrees: port, spawner: vi.fn() as unknown as never, poster: { post: vi.fn() },
         reviewArtifactRoot: artifacts,
-        escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+        escalate: (title, detail): void => { escalations.push(`${title}: ${detail}`); },
       });
       expect(await wave.recoverInterruptedRounds(), label).toBe(1);
       expect(ledger.getRound(round.id), label).toMatchObject({ status: 'aborted', verdict: null });
@@ -2653,7 +2653,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     const abortedWave = new WaveRunner({
       ledger: aborted.ledger, worktrees: aborted.port, spawner: makeSpawner(aborted.sessions, [], () => t4Attr('aborted', 'wave/lead-start', 'end', { outcome: 'completed', note: 'native lead child start on the original production path' }), undefined, '  return 44;'),
       poster: { post: abortPost, reconcile: abortReconcile }, reviewArtifactRoot: aborted.artifacts,
-      escalate: (title, detail) => abortEscalations.push(`${title}: ${detail}`),
+      escalate: (title, detail): void => { abortEscalations.push(`${title}: ${detail}`); },
       prHeadProbe: t4Probe('aborted', 'feature/t4-aborted'),
     });
     const abortedOutcome = asWave(await t4Timed('aborted', 'wave-round', () => abortedWave.runRound({ jobId: aborted.job.id })));
@@ -2685,6 +2685,9 @@ describe('bmad-review fallback gate (user amendment 2026-09-20, fork-3)', () => 
     sessions: string;
     db: LedgerDb;
     escalations: string[];
+    /** True when the PASS row was already readable inside the notifier
+     * callback (the observer-visibility guarantee). */
+    escalationSawPass: boolean;
     reviews: number[];
     directives: string[];
     repo: FixtureRepo;
@@ -2703,6 +2706,7 @@ describe('bmad-review fallback gate (user amendment 2026-09-20, fork-3)', () => 
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
     const port = new GitReviewPort(root, 'feature/fallback', target);
     const escalations: string[] = [];
+    let escalationSawPass = false;
     const reviews: number[] = [];
     const directives: string[] = [];
     const skillFile = join(artifacts, 'skills', 'bmad-review', 'SKILL.md');
@@ -2732,19 +2736,29 @@ describe('bmad-review fallback gate (user amendment 2026-09-20, fork-3)', () => 
       escalate:
         escalateMode === 'absent'
           ? undefined
-          : escalateMode === 'throwing'
-            ? (title) => {
-                // Throw only on the PASS escalation: the entry/route
-                // escalations must not mask the PASS-path behavior under
-                // test (native r7 warning).
-                if (title.includes('gate PASS')) throw new Error('notifier exploded');
-                escalations.push(title);
+          : (title, detail) => {
+              // The observer-visibility guarantee (round 3): the durable
+              // PASS row must already exist when the notifier runs.
+              escalationSawPass = ledger.listEvents({ limit: 200 }).some((event) =>
+                event.kind === 'job.fallback-review' && event.jobId === job.id &&
+                (event.payload as { phase?: string }).phase === 'pass');
+              // Throw only on the PASS escalation: the entry/route
+              // escalations must not mask the PASS-path behavior under
+              // test (native r7 warning). A throw is an UNKNOWN outcome:
+              // the notice may or may not have been recorded.
+              if (escalateMode === 'throwing' && title.includes('gate PASS')) {
+                throw new Error('notifier exploded');
               }
-            : (title, detail) => escalations.push(`${title}: ${detail}`),
+              escalations.push(escalateMode === 'posted' ? `${title}: ${detail}` : title);
+              return escalateMode === 'posted' ? 'notif-fallback-pass-1' : undefined;
+            },
     });
     const job = ledger.addJob({ id: 'job-fallback-gate', repo: 'fixture', title: 'fallback', baseBranch: 'main' });
     settleLane(ledger, job.id);
-    return { wave, job, ledger, port, root, artifacts, sessions, db, escalations, reviews, directives, repo };
+    return {
+      wave, job, ledger, port, root, artifacts, sessions, db, escalations, reviews, directives, repo,
+      get escalationSawPass() { return escalationSawPass; },
+    };
   }
 
   function harnessEvents(harness: GateHarness): ReturnType<LedgerApi['listEvents']> {
@@ -2848,10 +2862,20 @@ describe('bmad-review fallback gate (user amendment 2026-09-20, fork-3)', () => 
       }
       expect(escalationOf(absent)?.['status']).toBe('not-configured');
       expect(escalationOf(posted)?.['status']).toBe('posted');
+      expect(escalationOf(posted)?.['receipt']).toBe('notif-fallback-pass-1');
       expect(posted.escalations.filter((line) => line.includes('review/fix routing cleared'))).toHaveLength(1);
-      expect(escalationOf(throwing)?.['status']).toBe('failed');
+      // Attempt identity: the PASS row and its outcome share escalationId.
+      expect(passOf(posted)?.['escalationId']).toBe('job-fallback-gate:1');
+      expect(escalationOf(posted)?.['escalationId']).toBe('job-fallback-gate:1');
+      // A throwing notifier is UNKNOWN, never a clean failure: the notice
+      // may have been recorded before the throw.
+      expect(escalationOf(throwing)?.['status']).toBe('unknown');
       expect(throwing.escalations.some((line) => line.includes('review/fix routing cleared'))).toBe(false);
       expect(passOf(throwing)?.['clearToMerge']).toBe(true);
+      // Observer visibility (round 3): the notifier ran with the PASS row
+      // already durable in every configured mode, including the throwing one.
+      expect(posted.escalationSawPass).toBe(true);
+      expect(throwing.escalationSawPass).toBe(true);
       const events = harnessEvents(absent);
       const passSeq = events.find((event) => event.kind === 'job.fallback-review' && (event.payload as Record<string, unknown>)['phase'] === 'pass')?.seq;
       const escalationSeq = events.find((event) => event.kind === 'job.fallback-review' && (event.payload as Record<string, unknown>)['phase'] === 'escalation')?.seq;
@@ -2887,7 +2911,7 @@ describe('bmad-review fallback gate (user amendment 2026-09-20, fork-3)', () => 
       expect(outcome.iterations).toBe(2);
       expect(outcome.reportFiles).toHaveLength(2);
       const phases = gateEvents(harness).map((payload) => payload['phase']).reverse();
-      expect(phases).toEqual(['started', 'triaged', 'fix-directive', 'triaged', 'pass']);
+      expect(phases).toEqual(['started', 'triaged', 'fix-directive', 'triaged', 'pass', 'escalation']);
       const passEscalation = harness.escalations.find((line) => line.includes('bmad-review gate PASS'));
       expect(passEscalation).toContain('review/fix routing cleared');
       expect(passEscalation).not.toContain('clear to merge');
@@ -3262,7 +3286,7 @@ describe('WaveRunner request guards', () => {
     const poster = { post: vi.fn(async () => ({ headSha: 'unused-head', baseSha: 'unused-base' })) } as unknown as VerdictPoster;
     const wave = new WaveRunner({
       ledger, worktrees: port, spawner: makeSpawner(sessions, []), poster, reviewArtifactRoot: artifacts,
-      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      escalate: (title, detail): void => { escalations.push(`${title}: ${detail}`); },
     });
     const outcome = asWave(await wave.runRound({ jobId: job.id }));
     // The lead reached NEEDS CHANGES, but with no PR the round cannot be a
@@ -3459,7 +3483,7 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
         skillPath,
         fixDirectiveSink: async () => ({ delivered: true, minionId: 'prod-1' }),
       },
-      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      escalate: (title, detail): void => { escalations.push(`${title}: ${detail}`); },
     });
     return { wave, job, ledger, port, root, artifacts, sessions, repo, skillPath, prompts, spawnCwds, escalations, disposed };
   }
@@ -3480,7 +3504,7 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
         .filter((event) => event.kind === 'job.fallback-review')
         .map((event) => (event.payload as { phase?: string }).phase)
         .reverse();
-      expect(phases).toEqual(['started', 'triaged', 'pass']);
+      expect(phases).toEqual(['started', 'triaged', 'pass', 'escalation']);
     } finally {
       rmSync(h.root, { recursive: true, force: true });
       rmSync(h.artifacts, { recursive: true, force: true });
@@ -3557,7 +3581,7 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
         .filter((event) => event.kind === 'job.fallback-review')
         .map((event) => (event.payload as { phase?: string }).phase)
         .reverse();
-      expect(phases).toEqual(['started', 'triaged', 'pass']);
+      expect(phases).toEqual(['started', 'triaged', 'pass', 'escalation']);
     } finally {
       rmSync(h.root, { recursive: true, force: true });
       rmSync(h.artifacts, { recursive: true, force: true });
@@ -3687,7 +3711,7 @@ describe('fallback diff includes untracked files (V3 revert-mutation pin)', () =
           return { delivered: true, minionId: 'm1' };
         },
       },
-      escalate: (title) => escalations.push(title),
+      escalate: (title): void => { escalations.push(title); },
     });
     const outcome = await wave.runRound({ jobId: job.id });
     if (!('route' in outcome)) throw new Error('expected fallback route');
@@ -4157,7 +4181,7 @@ describe('repair pass 3: restart recovery binding contract (R1/R2/R21)', () => {
     const wave = new WaveRunner({
       ledger: first.ledger, worktrees: first.port, spawner: vi.fn() as unknown as AgentSpawner,
       poster: { post: vi.fn(), authenticatedActor: async () => 'gru-bot' },
-      reviewArtifactRoot: first.artifacts, escalate: (title) => escalations.push(title),
+      reviewArtifactRoot: first.artifacts, escalate: (title): void => { escalations.push(title); },
     });
     await expect(wave.recoverInterruptedRounds()).resolves.toBe(2);
     expect(first.ledger.getRound(first.roundId)?.status).toBe('aborted');
@@ -4183,7 +4207,7 @@ describe('repair pass 3: restart recovery binding contract (R1/R2/R21)', () => {
     const escalations: string[] = [];
     const wave = new WaveRunner({
       ledger, worktrees: port, spawner: vi.fn() as unknown as AgentSpawner,
-      reviewArtifactRoot: artifacts, escalate: (title) => escalations.push(title),
+      reviewArtifactRoot: artifacts, escalate: (title): void => { escalations.push(title); },
     });
     expect(await wave.recoverInterruptedRounds()).toBe(1);
     expect(ledger.getRound(roundId)?.status).toBe('aborted');
@@ -4238,7 +4262,7 @@ describe('repair pass 3: restart recovery binding contract (R1/R2/R21)', () => {
     const wave = new WaveRunner({
       ledger, worktrees: port, spawner: vi.fn() as unknown as AgentSpawner,
       poster, reviewArtifactRoot: artifacts,
-      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      escalate: (title, detail): void => { escalations.push(`${title}: ${detail}`); },
     });
     expect(await wave.recoverInterruptedRounds()).toBe(1);
     expect(ledger.getRound(roundId)?.status).toBe('verdict-posted');
@@ -4272,7 +4296,7 @@ describe('repair pass 3: restart recovery binding contract (R1/R2/R21)', () => {
     const wave = new WaveRunner({
       ledger, worktrees: port, spawner: vi.fn() as unknown as AgentSpawner,
       poster, reviewArtifactRoot: artifacts,
-      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      escalate: (title, detail): void => { escalations.push(`${title}: ${detail}`); },
     });
     expect(await wave.recoverInterruptedRounds()).toBe(1);
     expect(ledger.getRound(roundId)).toMatchObject({ status: 'aborted', verdict: null });
@@ -4288,7 +4312,7 @@ describe('repair pass 3: restart recovery binding contract (R1/R2/R21)', () => {
     const wave = new WaveRunner({
       ledger, worktrees: port, spawner: vi.fn() as unknown as AgentSpawner,
       poster, reviewArtifactRoot: artifacts,
-      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      escalate: (title, detail): void => { escalations.push(`${title}: ${detail}`); },
     });
     expect(await wave.recoverInterruptedRounds()).toBe(1);
     expect(ledger.getRound(roundId)).toMatchObject({ status: 'aborted', verdict: null });
@@ -4304,7 +4328,7 @@ describe('repair pass 3: restart recovery binding contract (R1/R2/R21)', () => {
     const wave = new WaveRunner({
       ledger, worktrees: port, spawner: vi.fn() as unknown as AgentSpawner,
       poster, reviewArtifactRoot: artifacts,
-      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      escalate: (title, detail): void => { escalations.push(`${title}: ${detail}`); },
     });
     expect(await wave.recoverInterruptedRounds()).toBe(1);
     expect(ledger.getRound(roundId)).toMatchObject({ status: 'aborted', verdict: null });
@@ -4333,7 +4357,7 @@ describe('repair pass 3: restart recovery binding contract (R1/R2/R21)', () => {
       const wave = new WaveRunner({
         ledger, worktrees: port, spawner: vi.fn() as unknown as AgentSpawner,
         poster, reviewArtifactRoot: artifacts,
-        escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+        escalate: (title, detail): void => { escalations.push(`${title}: ${detail}`); },
       });
       // Every earlier binding check passes (actor evidenced, host/reconciled
       // fields valid, job PR bound): the ONLY failing gate is the digest /
@@ -4357,7 +4381,7 @@ describe('repair pass 3: restart recovery binding contract (R1/R2/R21)', () => {
     const wave = new WaveRunner({
       ledger, worktrees: port, spawner: vi.fn() as unknown as AgentSpawner,
       poster, reviewArtifactRoot: artifacts,
-      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      escalate: (title, detail): void => { escalations.push(`${title}: ${detail}`); },
     });
     expect(await wave.recoverInterruptedRounds()).toBe(1);
     expect(ledger.getRound(roundId)).toMatchObject({ status: 'aborted', verdict: null });
@@ -4409,7 +4433,7 @@ describe('repair pass 3: restart recovery binding contract (R1/R2/R21)', () => {
       const wave = new WaveRunner({
         ledger: fixture.ledger, worktrees: fixture.port, spawner: vi.fn() as unknown as AgentSpawner,
         poster, reviewArtifactRoot: fixture.artifacts,
-        escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+        escalate: (title, detail): void => { escalations.push(`${title}: ${detail}`); },
       });
       expect(await wave.recoverInterruptedRounds()).toBe(1);
       return { fixture, github, gitlab, escalations };
@@ -4566,7 +4590,7 @@ describe('repair pass 3: publication completeness, GitLab wording, and v2 integr
         transformReport: (report) => `${report}\n${'#'.repeat(61_000)}\n`,
       }).spawner,
       poster, reviewArtifactRoot: artifacts,
-      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      escalate: (title, detail): void => { escalations.push(`${title}: ${detail}`); },
       prHeadProbe: localHeadProbe('feature/p3-overflow'),
     });
     const outcome = asWave(await wave.runRound({ jobId: job.id }));
@@ -4793,7 +4817,7 @@ describe('repair pass 3: publication completeness, GitLab wording, and v2 integr
         })),
       },
       reviewArtifactRoot: artifacts,
-      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      escalate: (title, detail): void => { escalations.push(`${title}: ${detail}`); },
       prHeadProbe: localHeadProbe('feature/p3-v2-prior'),
     });
     const outcome = asWave(await wave.runRound({ jobId: job.id }));

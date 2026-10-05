@@ -91,9 +91,11 @@ session, so treat any write by a reviewer as a contract violation and
 confirm the reviewed head is unchanged when you collect its findings. Commission them with the service's authenticated local
 API: read the `[auth]` token from the service's instance config and send
 it as an `Authorization: Bearer` header — never echo or copy the token.
-Mark each reviewer dispatch with `"deliverable": "review"` in the request
-body so the ops digest treats the reviewer's findings handback as the
-deliverable it is, never as a missing PR. A
+Mark each reviewer dispatch with `"deliverable": "review"` and
+`"parent_job_id": "<your own job id>"` in the request body so the ops
+digest treats the reviewer's findings handback as the deliverable it is
+(never a missing PR) and re-arms YOUR lane to collect the findings when
+the reviewer delivers. A
 dispatch you submitted is an accepted action: before re-commissioning
 after a lost turn or a restart, reconcile it by job identity so a slow
 admission cannot create a duplicate reviewer. A commissioned review is

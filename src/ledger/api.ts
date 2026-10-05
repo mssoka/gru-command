@@ -128,6 +128,9 @@ export interface JobRecord {
   readonly briefing: string | null;
   /** The deliverable kind (E15). `null` = legacy row, treated as `'pr'`. */
   readonly deliverable: JobDeliverable | null;
+  /** The commissioning parent lane for tracked child work such as
+   * reviewers (E16). `null` = a root job. */
+  readonly parentJobId: string | null;
   readonly createdAt: string;
   readonly updatedAt: string;
 }
@@ -841,6 +844,7 @@ export class LedgerApi {
     baseBranch?: string | null;
     briefing?: string | null;
     deliverable?: JobDeliverable | null;
+    parentJobId?: string | null;
   }): JobRecord {
     if (input.id === '' || input.repo === '' || input.title === '') {
       throw new Error('job id, repo, and title must be non-empty');
@@ -853,12 +857,12 @@ export class LedgerApi {
       const ts = nowIso();
       this.db
         .prepare(
-          `INSERT INTO jobs (id, repo, title, status, base_branch, pr_url, note, briefing, deliverable, created_at, updated_at)
-           VALUES (?, ?, ?, 'dispatched', ?, NULL, NULL, ?, ?, ?, ?)`,
+          `INSERT INTO jobs (id, repo, title, status, base_branch, pr_url, note, briefing, deliverable, parent_job_id, created_at, updated_at)
+           VALUES (?, ?, ?, 'dispatched', ?, NULL, NULL, ?, ?, ?, ?, ?)`,
         )
         .run(
           input.id, input.repo, input.title, input.baseBranch ?? null, input.briefing ?? null,
-          input.deliverable ?? null, ts, ts,
+          input.deliverable ?? null, input.parentJobId ?? null, ts, ts,
         );
       this.appendEvent({ kind: 'job.created', jobId: input.id, payload: { repo: input.repo, title: input.title } });
       return this.getJob(input.id) as JobRecord;
@@ -2814,6 +2818,7 @@ export class LedgerApi {
       note: nstr(row.note),
       briefing: nstr(row.briefing),
       deliverable: nstr(row.deliverable) as JobDeliverable | null,
+      parentJobId: nstr(row.parent_job_id),
       createdAt: str(row.created_at),
       updatedAt: str(row.updated_at),
     };

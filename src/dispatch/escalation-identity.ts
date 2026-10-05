@@ -69,10 +69,10 @@ export interface ReviewEscalationPort {
 export function createReviewEscalationNotifier(
   ledger: EscalationIdentityLedger,
   notifications: ReviewEscalationPort,
-): (title: string, detail: string, context?: EscalationContext) => void {
+): (title: string, detail: string, context?: EscalationContext) => string | void {
   return (title, detail, context) => {
     const agentId = resolveEscalationAgent(ledger, context);
-    notifications.post({
+    const posted = notifications.post({
       kind: 'review-escalation',
       routing: 'action-required',
       severity: 'error',
@@ -80,5 +80,11 @@ export function createReviewEscalationNotifier(
       detail,
       ...(agentId !== null ? { agentId } : {}),
     });
+    // Attempt identity (round-3 finding 6): the durable notice id is the
+    // receipt callers can reconcile against — a returned id proves the
+    // post landed; a throw leaves the outcome genuinely unknown.
+    return typeof posted === 'object' && posted !== null && 'id' in posted
+      ? String((posted as { id: unknown }).id)
+      : undefined;
   };
 }

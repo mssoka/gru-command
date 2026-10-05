@@ -243,14 +243,24 @@ authorizes its full completion cycle, and YOU own driving it:
    not advance the lane past its recorded review
    commission (PR discovery and the native gate come after its findings
    are delivered), never raise limits, and never substitute untracked
-   reviewers. When a
+   reviewers. Mark non-PR dispatches by kind: reviewer jobs carry
+   `"deliverable": "review"` plus `"parent_job_id": "<the commissioning
+   lane>"`, artifact-only and investigation lanes carry `"deliverable":
+   "artifact"` / `"investigation"`; implementation lanes omit the field
+   (PR-owing) — an unmarked non-PR dispatch is chased as a missing PR.
+   Digest rows under `reviewerDelivered` name parent lanes whose
+   commissioned reviewer delivered: resume the parent (re-brief or fix
+   directive) to collect the reviewer's findings and continue its cycle —
+   the reviewer job itself owes no PR and must not be chased for one.
+   When a
    Perkins pre-flight failure routes the review to the installed
    bmad-review fallback gate, that host-routed gate is the review gate of
    record for routing and fixes — it is the gate, never a duplicate review;
    its PASS is never a Perkins READY. A fallback PASS escalation recorded
-   as failed has no posted notice: re-post it during reconciliation
-   (deduplicated — only when no later posted outcome exists for that job)
-   and never treat the failure record as the notice.
+   as failed or unknown (or a PASS whose outcome never landed) has no
+   confirmed posted notice: verify, then re-post it during reconciliation
+   (deduplicated — only when no later posted outcome exists for that
+   attempt) and never treat the failure/unknown record as the notice.
 3. Schedule verification through the shipped capture helper — never a
    hand-rolled background watcher. The helper path is named in your wake
    prompt ("Verification capture helper"):

@@ -354,7 +354,7 @@ describe('freeze-time integration on PR rounds', () => {
       // The host reports the STALE recorded head: fetched tip and PR head
       // disagree, so no lens may run on either identity.
       prHeadProbe: fixedProbe('feature/lane', stale),
-      escalate: (title, detail) => escalations.push({ title, detail }),
+      escalate: (title, detail): void => { escalations.push({ title, detail }); },
     });
 
     await expect(wave.runRound({ jobId: job.id })).rejects.toBeInstanceOf(PrHeadVerificationError);
@@ -1078,7 +1078,7 @@ describe('freeze-time integration on PR rounds', () => {
       // The PR reports a head branch origin does not carry: the resolved ref
       // fetches nothing, so the round must not start.
       prHeadProbe: fixedProbe('gru/pr-head', laneSha),
-      escalate: (title, detail) => escalations.push({ title, detail }),
+      escalate: (title, detail): void => { escalations.push({ title, detail }); },
     });
 
     const failure = await captureFailure(() => wave.runRound({ jobId: job.id }));

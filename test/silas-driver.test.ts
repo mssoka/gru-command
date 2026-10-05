@@ -172,10 +172,11 @@ function makeLedger(): Harness {
   };
 }
 
-function addJobWithDelivery(ledger: LedgerApi, jobId: string, opts: { prUrl?: string; deliverable?: JobDeliverable } = {}): JobRecord {
+function addJobWithDelivery(ledger: LedgerApi, jobId: string, opts: { prUrl?: string; deliverable?: JobDeliverable; parentJobId?: string } = {}): JobRecord {
   const job = ledger.addJob({
     id: jobId, repo: 'fixture-app', title: `t-${jobId}`, briefing: 'b',
     ...(opts.deliverable !== undefined ? { deliverable: opts.deliverable } : {}),
+    ...(opts.parentJobId !== undefined ? { parentJobId: opts.parentJobId } : {}),
   });
   ledger.setJobStatus(jobId, 'working');
   ledger.appendCustomEvent({ kind: 'job.handoff', jobId, payload: {} });
@@ -229,6 +230,38 @@ describe('silas digest (the four actionable states)', () => {
       // handbacks are the deliverables and must not manufacture a
       // missing-PR escalation.
       expect(digest.deliveredWithoutPr.map((row) => row.jobId)).toEqual(['impl-job']);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('re-arms a parent lane when its commissioned reviewer delivers (E16)', async () => {
+    const h = makeLedger();
+    try {
+      addJobWithDelivery(h.ledger, 'parent-live');
+      addJobWithDelivery(h.ledger, 'parent-done', { prUrl: 'https://git.example.invalid/o/r/pull/9' });
+      h.ledger.setJobStatus('parent-done', 'done');
+      addJobWithDelivery(h.ledger, 'rev-live', { deliverable: 'review', parentJobId: 'parent-live' });
+      addJobWithDelivery(h.ledger, 'rev-terminal-parent', { deliverable: 'review', parentJobId: 'parent-done' });
+      addJobWithDelivery(h.ledger, 'rev-orphan', { deliverable: 'review' });
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      // Only the live parent's reviewer re-arms it: the merged parent and
+      // the unparented reviewer produce no row, and the reviewer itself
+      // is never PR-overdue.
+      expect(digest.reviewerDelivered).toEqual([{
+        jobId: 'rev-live',
+        parentJobId: 'parent-live',
+        parentStatus: 'working',
+        repo: 'fixture-app',
+        deliveredAt: expect.any(String),
+      }]);
+      expect(digest.deliveredWithoutPr.map((row) => row.jobId)).toEqual(['parent-live']);
+      expect(digestActionCount(digest)).toBeGreaterThanOrEqual(1);
     } finally {
       h.cleanup();
     }
@@ -1193,6 +1226,7 @@ describe('silas skills and wake prompt', () => {
     expect(ops).toContain('never one to wait on');
     expect(ops).toContain('dispatch the reviewer yourself');
     expect(ops).toContain('re-post it during reconciliation');
+    expect(ops).toContain('Mark non-PR dispatches by kind');
     // j-810/j-811: the retired untracked headless-launcher wording must never return.
     expect(ops).not.toContain('pi -p');
     expect(ops).not.toContain('headless print mode');
@@ -1252,7 +1286,7 @@ describe('silas skills and wake prompt', () => {
 
   it('assembles shipped skills with one scoped merge authority and exact clean-abort rule', () => {
     const prompt = buildWakePrompt({ digest: { computedAt: '2026-09-24T00:00:00Z', trigger: 'sweep',
-      deliveredWithoutPr: [], prWithoutReview: [{ jobId: 'clean', repo: 'gru-command', prUrl: 'https://example.invalid/1',
+      deliveredWithoutPr: [], reviewerDelivered: [], prWithoutReview: [{ jobId: 'clean', repo: 'gru-command', prUrl: 'https://example.invalid/1',
         priorRounds: 1, cleanAbort: { roundId: 'clean-r1', ruleId: 'clean-abort-service-restart' } }],
       verdictsAwaitingDirective: [], stalledWorking: [], minionErrors: [], providerRecoveryPending: [] },
       trigger: { kind: 'sweep' }, skills: loadSilasSkills(), ops: { baseUrl: 'http://127.0.0.1:1', configPath: '/tmp/test-config' } });
@@ -1285,6 +1319,7 @@ describe('silas skills and wake prompt', () => {
         computedAt: '2026-09-21T00:00:00.000Z',
         trigger: 'job.delivered',
         deliveredWithoutPr: [],
+        reviewerDelivered: [],
         prWithoutReview: [],
         verdictsAwaitingDirective: [],
         stalledWorking: [],
