@@ -887,6 +887,7 @@ export class VerificationScheduler {
             request_id: spec.requestId ?? null,
             scope: spec.scope,
             command: spec.command,
+            head: spec.head ?? null,
             wait_ms: waitMs,
             active: this.slots.size,
             queued: this.waiters.length,

@@ -27,7 +27,11 @@ close-out: a ledger-visible end state a stranger can audit.
 2. **Fix loops.** A directive or re-brief is closed when the minion's
    follow-up delivery lands and the re-review fires. If the same canonical
    blocker then recurs, the ladder continues (directive → re-brief →
-   escalate); if blockers evolve, keep looping — no cap. A re-brief whose
+   escalate); if blockers evolve, keep looping — no cap. A raw tool-call
+   count is telemetry, never a close-out condition: no numeric total or
+   per-phase call ceiling can hold a delivery open as noncompliant,
+   quarantine a lane, or block acceptance — the gate is the work being
+   verified and reviewed. A re-brief whose
    job reached terminal (`merged`/`done`) before the request was honored
    is closed administratively instead — whether the stale markers surface
    at boot with no live turn at all, or a settling turn or re-dispatch

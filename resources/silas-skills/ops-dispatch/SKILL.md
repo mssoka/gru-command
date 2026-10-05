@@ -25,6 +25,22 @@ draft first, never a later draft-to-ready conversion. This corrects HOW
 an already-authorized PR is created; it grants no publication permission
 to a lane that has none, and existing drafts are left untouched.
 
+## No tool-call ceilings in briefings or directives (issue #158)
+
+A worker's tool-call count is telemetry, never a boundary. You never
+author, repeat, or enforce a numeric total or per-phase tool-call ceiling
+in a directive or re-brief, and you never treat a count — reads, errors,
+retries, or the final handoff write included — as noncompliance, a reason
+to quarantine a lane, or a reason to escalate an authority decision. A
+briefing you review gets the same standard: if it names a numeric call
+ceiling, say plainly that the ceiling does not bind and the worker
+continues to verified completion. Never replace the count with an
+invented turn or elapsed-time cap. The real stop conditions are the ones
+in the authority boundaries above: owner-requested cancellation,
+provider rate limits, permission boundaries, resident and verification
+limits, genuine non-progress stalls (silence with no live process), and
+the review gates.
+
 ## Marking a phase that owes the chief a decision (pr136-chief-handoff)
 
 A bounded phase can complete with the lane unblocked and HEAD unmoved (an
@@ -192,11 +208,40 @@ retrying. When the answer is `409` with
 
 ## Stalled lanes and minion errors
 
-A working job whose minion has been silent past the stall threshold, or a
-minion turn that errored, is yours to assess: read the minion transcript,
-check the lane (`git -C <lane> status`), and decide: wait (say why in your
-completion note), re-brief a fresh minion, or escalate. Never kill a live
-session yourself.
+A working job whose CURRENT phase has not delivered and whose minion has
+been silent past the stall threshold, or a minion turn that errored, is
+yours to assess: read the minion transcript, check the lane
+(`git -C <lane> status`), and decide: wait (say why in your completion
+note), re-brief a fresh minion, or escalate. A truthful older delivery is
+history, not proof the current repair phase delivered; a phase whose
+latest delivery is current, or whose lane is owned by a pending
+directive/re-brief request, an in-flight verification or an answering
+review, is not offered as stalled. A row with `minionId: null` has no
+worker record at all: inspect the lane and the last status hop, then use
+the normal guarded repair surfaces (directive, re-brief, escalate). Never
+kill a live session yourself.
+
+## Verification follow-through (the dependency rows)
+
+Two digest rows report the verification dependency; neither is a rerun
+license:
+
+- `verificationFailures` — the newest completed verification FAILED (the
+  row carries `scope`, `head`, `run_id` and the honest `detail`: timeout,
+  signal, spawn/runner error, or exit status). Read the complete recorded
+  output, repair the real cause through the normal directive path, then
+  re-verify with a NEW request id at the repaired head. Pass the exact
+  fingerprint `verification-failure:<scope>@<run_id>` as the directive's
+  `blocker_fingerprint` so the digest retires this exact debt when your
+  rung lands (an unrelated or unscoped rung never retires it); never rerun
+  an unchanged head merely to recover logs, and never weaken the gate.
+- `verificationWaits` — a submission's queue wait timed out
+  (`verification.lock-timeout`, with `scope`, `request_id`, `head`,
+  `wait_ms`). That is capacity, not a test result: when the budget is
+  free, re-submit the same scope at the row's pinned `head` (pass it as
+  `--expected-head`) with a new request id through the shipped capture
+  helper; otherwise leave it and say why. Capacity release needs no
+  watcher — this digest row is the reconsideration.
 
 ## Closing out
 

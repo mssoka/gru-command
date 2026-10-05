@@ -19,7 +19,9 @@ import {
   type JobRecord,
   type RoundRecord,
 } from '../ledger/api.js';
+import { LIVE_DIRECTIVE_STATES } from '../ledger/directives.js';
 import type { JobStatus } from '../ledger/states.js';
+import type { EventRecord } from '../ledger/api.js';
 
 /** Newest closed receipts kept in every snapshot (D3): older ones are
  * served by the paged `GET /api/notifications/receipts` route. */
@@ -191,11 +193,34 @@ export interface NotificationView {
   readonly resolvedBy: string | null;
 }
 
-/** Silas ops health (board UX v4): the newest wake (sweep or event) and
- * how many reconciliation events landed today. Derived from the durable
- * event stream — the ledger is the record. */
+/** Silas ops health (board UX v4, issue #163): the newest wake (sweep or
+ * event), the newest accepted tick/reconciliation observations, the
+ * current open model-turn start, and today's state-correction actions —
+ * all derived from the durable event stream. `lastWakeAt` is deliberately
+ * the wake START marker, never a completed scan; `lastReconcileAt` only
+ * advances on a successfully completed deterministic pass. */
 export interface SilasView {
   readonly lastWakeAt: string | null;
+  /** Newest accepted trigger (timer tick or bus event). */
+  readonly lastTickAt: string | null;
+  /** Newest SUCCESSFUL deterministic reconciliation pass. */
+  readonly lastReconcileAt: string | null;
+  /** Newest FAILED deterministic reconciliation pass (never counted as
+   * completion). */
+  readonly lastReconcileFailedAt: string | null;
+  /** True when the newest pass failure is NEWER than the newest pass
+   * success (compared by durable event sequence, so same-millisecond
+   * passes cannot tie-break wrongly). */
+  readonly reconcileFailedNewer: boolean;
+  /** Newest state-correction action (register PR, trigger review,
+   * directive, settlement, rebrief, escalation). */
+  readonly lastUsefulActionAt: string | null;
+  /** The oldest live obligation's durable next action, pre-rendered: the
+   * truthful "what is owed next" projection (null when none is live). */
+  readonly nextAction: string | null;
+  /** The current open model turn's start (latest wake marker while
+   * supervision reports an open turn); null when no turn is open. */
+  readonly openTurnSince: string | null;
   readonly reconciliationsToday: number;
   readonly checkedAt: string;
 }
@@ -285,12 +310,24 @@ const LENS_VERDICTS = ['blocker', 'warning', 'note', 'clean'] as const;
  * board (registering a PR, triggering review, directives, rebriefs,
  * escalations). */
 const SILAS_WAKE_KINDS = ['silas.wake'] as const;
-const SILAS_RECONCILE_KINDS = [
+/** Tick observations and deterministic-pass outcomes (issue #163). */
+const SILAS_TICK_KINDS = ['silas.tick'] as const;
+const SILAS_RECONCILE_KINDS = ['silas.reconcile'] as const;
+const SILAS_RECONCILE_FAILED_KINDS = ['silas.reconcile-failed'] as const;
+/** State-correction and machine-action events that moved the board
+ * (registering a PR, triggering review, directives, settlements,
+ * rebriefs, escalations). */
+const SILAS_ACTION_KINDS = [
   'silas.pr-registered',
   'silas.review-triggered',
   'silas.directive-sent',
+  'silas.directive-settled',
   'silas.rebrief',
   'silas.escalated',
+  // Pass-ATTRIBUTED progress: emitted only by the deterministic pass when
+  // it actually advanced durable work (a generic phase-completion or
+  // obligation event from an unrelated lane is deliberately NOT counted).
+  'silas.reconcile-advanced',
 ] as const;
 
 /** PR state from the record: a terminal `merged` job is merged; a
@@ -667,6 +704,12 @@ export class BoardEngine {
           (ROLE_ORDER[a.role] ?? 99) - (ROLE_ORDER[b.role] ?? 99) ||
           (b.lastActivity ?? '').localeCompare(a.lastActivity ?? ''),
       );
+    // Issue #163: the open-turn start is a led+supervision fact, never a
+    // wake-marker age. A silas record whose live supervision says an open
+    // turn exists is the only source of "a turn is open right now".
+    const silasTurnOpen = agentRows.some(
+      (agent) => agent.role === 'silas' && supervisionById.get(agent.id)?.openTurn === true,
+    );
     return {
       repos,
       agents,
@@ -685,7 +728,7 @@ export class BoardEngine {
         finished: childrenFinished,
         lifetimeCreations: childRows.length,
       },
-      silas: this.silasView(),
+      silas: this.silasView(silasTurnOpen),
       verify: this.verifyQueue(),
       pacing: this.pacing(),
       selfHeal: this.selfHeal(),
@@ -708,17 +751,105 @@ export class BoardEngine {
       .sort((left, right) => left.jobId.localeCompare(right.jobId));
   }
 
-  /** Silas ops health from the durable event stream: newest wake + today's
-   * reconciliations (state-correction events, not the wake itself). */
-  private silasView(): SilasView {
+  /** Silas ops health from the durable event stream: newest wake (start
+   * marker), newest accepted tick, newest successful/failed deterministic
+   * pass, newest corrective action and — when supervision says a turn is
+   * open — that turn's start (issue #163). `reconciliationsToday` stays the
+   * state-correction count; a tick or a failed pass never claims it. */
+  private silasView(openTurn: boolean): SilasView {
     const now = this.now();
     const dayStart = new Date(now);
     dayStart.setHours(0, 0, 0, 0);
+    const wake = this.ledger.latestEventOfKinds(SILAS_WAKE_KINDS);
+    const reconcileOk = this.ledger.latestEventOfKinds(SILAS_RECONCILE_KINDS);
+    const reconcileFailed = this.ledger.latestEventOfKinds(SILAS_RECONCILE_FAILED_KINDS);
     return {
-      lastWakeAt: this.ledger.latestEventOfKinds(SILAS_WAKE_KINDS)?.ts ?? null,
-      reconciliationsToday: this.ledger.countEventsSince(SILAS_RECONCILE_KINDS, dayStart.toISOString()),
+      lastWakeAt: wake?.ts ?? null,
+      lastTickAt: this.ledger.latestEventOfKinds(SILAS_TICK_KINDS)?.ts ?? null,
+      // The success timestamp only ever advances on a completed pass; a
+      // later failure does not erase it, and a failure never sets it.
+      lastReconcileAt: reconcileOk?.ts ?? null,
+      lastReconcileFailedAt: reconcileFailed?.ts ?? null,
+      reconcileFailedNewer:
+        reconcileFailed !== null && (reconcileOk === null || reconcileFailed.seq > reconcileOk.seq),
+      lastUsefulActionAt: this.ledger.latestEventOfKinds(SILAS_ACTION_KINDS)?.ts ?? null,
+      nextAction: this.nextActionProjection(),
+      openTurnSince: openTurn ? (wake?.ts ?? null) : null,
+      reconciliationsToday: this.ledger.countEventsSince(SILAS_ACTION_KINDS, dayStart.toISOString()),
       checkedAt: new Date(now).toISOString(),
     };
+  }
+
+  /** The oldest live debt as the durable next action (issue #163): a live
+   * obligation, else a live directive request, else the newest recorded
+   * verification wait its own scope has not answered. Every read is
+   * state-filtered before any bound and per-row isolated, so settled
+   * history or one damaged row can never blank the board's projection. */
+  private nextActionProjection(): string | null {
+    for (const state of ['open', 'waiting'] as const) {
+      const row = this.ledger.listObligationsDetailed({ state, limit: 5 }).readable[0];
+      if (row !== undefined) {
+        const next = row.nextAction;
+        const detail =
+          next.kind === 'silas-mechanical'
+            ? next.action
+            : next.kind === 'external-wait'
+              ? next.condition
+              : next.decision;
+        const bounded = detail.length > 120 ? `${detail.slice(0, 117)}...` : detail;
+        return `${next.kind}: ${bounded} (${row.jobId})`;
+      }
+    }
+    try {
+      const directive = this.ledger.listPendingDirectives({ states: LIVE_DIRECTIVE_STATES, limit: 1 })[0];
+      if (directive !== undefined) {
+        return `directive ${directive.requestId}: ${directive.state} (${directive.jobId})`;
+      }
+    } catch (error) {
+      // One malformed directive row must never take the board down; the
+      // malformed debt stays visible to the boot reconciler instead.
+      this.log?.('error', 'silas health: live directive read failed', { error: String(error) });
+    }
+    return this.verificationWaitProjection();
+  }
+
+  /** The newest recorded verification wait that its own scope has not
+   * answered (a newer same-scope completion/request retires it). */
+  private verificationWaitProjection(): string | null {
+    const timeout = this.ledger.latestEventOfKinds(['verification.lock-timeout']);
+    if (timeout === null || timeout.jobId === null) return null;
+    const scope =
+      typeof timeout.payload === 'object' && timeout.payload !== null
+        ? ((timeout.payload as { scope?: unknown }).scope ?? null)
+        : null;
+    const scopeLabel = typeof scope === 'string' && scope !== '' ? scope : null;
+    const scoped = this.ledger.latestJobEventsByPayloadScope(timeout.jobId, [
+      'verification.completed',
+      'verification.lock-timeout',
+      'verification.requested',
+    ]);
+    let latestTimeout: EventRecord | null = null;
+    let latestAnswer: EventRecord | null = null;
+    for (const event of scoped) {
+      const eventScope =
+        typeof event.payload === 'object' && event.payload !== null
+          ? (event.payload as { scope?: unknown }).scope
+          : undefined;
+      if (scopeLabel !== null && eventScope !== scopeLabel) continue;
+      if (event.kind === 'verification.lock-timeout') {
+        if (latestTimeout === null || event.seq > latestTimeout.seq) latestTimeout = event;
+      } else if (latestAnswer === null || event.seq > latestAnswer.seq) {
+        latestAnswer = event;
+      }
+    }
+    if (latestTimeout === null) return null;
+    if (latestAnswer !== null && latestAnswer.seq > latestTimeout.seq) return null;
+    const head =
+      typeof latestTimeout.payload === 'object' && latestTimeout.payload !== null
+        ? (latestTimeout.payload as { head?: unknown }).head
+        : null;
+    const headLabel = typeof head === 'string' && head !== '' ? head : 'head unrecorded';
+    return `verification wait: ${scopeLabel ?? 'scope unrecorded'}@${headLabel} (${timeout.jobId})`;
   }
 
   /** Repo-grouped job views (the group map preserves ledger job order). */

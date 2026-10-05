@@ -17,6 +17,7 @@ import {
   loadSilasSkills,
   SilasDriver,
   supervisionLookup,
+  type DeterministicPassHook,
   type DigestLedger,
   type GitHubPollPort,
   type RoundBlocker,
@@ -24,6 +25,9 @@ import {
   type SkillModule,
 } from '../src/dispatch/silas-driver.js';
 import { EventBus } from '../src/events/bus.js';
+import { createDurableReconcileHook, reconcileDurableWork } from '../src/dispatch/durable-reconcile.js';
+import type { FollowThroughNotifications } from '../src/dispatch/obligations.js';
+import { FIRING_RULES } from '../src/ledger/obligations.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { DEFAULT_SILAS_CONFIG } from '../src/config.js';
@@ -1081,6 +1085,914 @@ describe('silas digest (the four actionable states)', () => {
       h.cleanup();
     }
   });
+
+  it('surfaces a failed verification as repair-due and retires it on a repair rung or a later pass', async () => {
+    const h = makeLedger();
+    try {
+      h.ledger.addJob({ id: 'job-verify', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('job-verify', 'working');
+      h.ledger.appendCustomEvent({
+        kind: 'verification.completed',
+        jobId: 'job-verify',
+        payload: { ok: false, exit_code: 1, scope: 'full', run_id: 'run-1', sha: 'head-1' },
+      });
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(digest.verificationFailures).toHaveLength(1);
+      expect(digest.verificationFailures[0]).toMatchObject({
+        jobId: 'job-verify',
+        scope: 'full',
+        runId: 'run-1',
+        head: 'head-1',
+        detail: 'exit 1',
+      });
+      expect(digestActionCount(digest)).toBe(1);
+
+      // A repair rung after the failure retires the row — only with the
+      // EXACT failure identity (an unscoped rung retires nothing).
+      h.ledger.appendCustomEvent({
+        kind: 'silas.directive-sent',
+        jobId: 'job-verify',
+        payload: { request_id: 'req-1', minion_id: 'm1', blocker_fingerprint: 'verification-failure:full@run-1' },
+      });
+      const handled = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(handled.verificationFailures).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a later same-scope verification activity retires the failed row; a PASS never re-arms it', async () => {
+    const h = makeLedger();
+    try {
+      h.ledger.addJob({ id: 'job-verify-2', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('job-verify-2', 'working');
+      h.ledger.appendCustomEvent({
+        kind: 'verification.completed',
+        jobId: 'job-verify-2',
+        payload: { ok: false, scope: 'focused', run_id: 'run-1' },
+      });
+      h.ledger.appendCustomEvent({
+        kind: 'verification.requested',
+        jobId: 'job-verify-2',
+        payload: { scope: 'focused', run_id: 'run-2' },
+      });
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(digest.verificationFailures).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('names a verification queue timeout as reconsideration-due, distinct from a failure', async () => {
+    const h = makeLedger();
+    try {
+      h.ledger.addJob({ id: 'job-wait', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('job-wait', 'working');
+      h.ledger.appendCustomEvent({
+        kind: 'verification.lock-timeout',
+        jobId: 'job-wait',
+        payload: { scope: 'full', request_id: 'req-9', wait_ms: 900_000 },
+      });
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(digest.verificationWaits).toEqual([
+        expect.objectContaining({ jobId: 'job-wait', scope: 'full', requestId: 'req-9', waitMs: 900_000 }),
+      ]);
+      expect(digest.verificationFailures).toEqual([]);
+
+      // A newer submission for the same scope is the reconsideration: the
+      // wait row retires (never an automatic rerun).
+      h.ledger.appendCustomEvent({
+        kind: 'verification.requested',
+        jobId: 'job-wait',
+        payload: { scope: 'full', request_id: 'req-10' },
+      });
+      const resubmitted = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(resubmitted.verificationWaits).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('tracks failures and waits per scope: an unrelated PASS or resubmission cannot hide another scope', async () => {
+    const h = makeLedger();
+    try {
+      h.ledger.addJob({ id: 'job-scopes', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('job-scopes', 'working');
+      h.ledger.appendCustomEvent({
+        kind: 'verification.completed',
+        jobId: 'job-scopes',
+        payload: { ok: false, scope: 'full', run_id: 'run-full', exit_code: 1 },
+      });
+      h.ledger.appendCustomEvent({
+        kind: 'verification.completed',
+        jobId: 'job-scopes',
+        payload: { ok: true, scope: 'focused', run_id: 'run-focused', exit_code: 0 },
+      });
+      h.ledger.appendCustomEvent({
+        kind: 'verification.lock-timeout',
+        jobId: 'job-scopes',
+        payload: { scope: 'full', request_id: 'req-a', head: 'head-a', wait_ms: 1_000 },
+      });
+      h.ledger.appendCustomEvent({
+        kind: 'verification.lock-timeout',
+        jobId: 'job-scopes',
+        payload: { scope: 'focused', request_id: 'req-b', head: 'head-b', wait_ms: 2_000 },
+      });
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      // The focused PASS does not hide the failed full scope, and both
+      // timed-out scopes stay visible.
+      expect(digest.verificationFailures.map((row) => row.scope)).toEqual(['full']);
+      expect(digest.verificationWaits.map((row) => row.scope).sort()).toEqual(['focused', 'full']);
+      expect(digest.verificationWaits.map((row) => row.head).sort()).toEqual(['head-a', 'head-b']);
+
+      // Resubmitting only the newer (focused) scope AT ITS PINNED HEAD
+      // retires only its row.
+      h.ledger.appendCustomEvent({
+        kind: 'verification.requested',
+        jobId: 'job-scopes',
+        payload: { scope: 'focused', request_id: 'req-c', head: 'head-b' },
+      });
+      const after = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(after.verificationWaits.map((row) => row.scope)).toEqual(['full']);
+      expect(after.verificationFailures.map((row) => row.scope)).toEqual(['full']);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a fingerprinted repair rung retires only its own failed scope; an unrelated rung cannot', async () => {
+    const h = makeLedger();
+    try {
+      h.ledger.addJob({ id: 'job-rung', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('job-rung', 'working');
+      h.ledger.appendCustomEvent({
+        kind: 'verification.completed',
+        jobId: 'job-rung',
+        payload: { ok: false, scope: 'full', run_id: 'run-77', exit_code: 1 },
+      });
+      h.ledger.appendCustomEvent({
+        kind: 'silas.directive-sent',
+        jobId: 'job-rung',
+        payload: { request_id: 'req-other', blocker_fingerprint: 'lint:src/other.ts' },
+      });
+      const unrelated = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(unrelated.verificationFailures.map((row) => row.scope)).toEqual(['full']);
+
+      h.ledger.appendCustomEvent({
+        kind: 'silas.directive-sent',
+        jobId: 'job-rung',
+        payload: { request_id: 'req-verify', blocker_fingerprint: 'verification-failure:full@run-77' },
+      });
+      const handled = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(handled.verificationFailures).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('reports the real failure detail: timeout/signal/error outrank a zero exit code', async () => {
+    const h = makeLedger();
+    try {
+      for (const [id, payload] of [
+        ['job-detail-1', { ok: false, scope: 'full', exit_code: 0, error: 'spawn ENOENT' }],
+        ['job-detail-2', { ok: false, scope: 'full', exit_code: 0, signal: 'SIGKILL' }],
+        ['job-detail-3', { ok: false, scope: 'full', exit_code: 0, timed_out: true }],
+      ] as const) {
+        h.ledger.addJob({ id, repo: 'fixture-app', title: 't', briefing: 'b' });
+        h.ledger.setJobStatus(id, 'working');
+        h.ledger.appendCustomEvent({ kind: 'verification.completed', jobId: id, payload });
+      }
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      const detail = new Map(digest.verificationFailures.map((row) => [row.jobId, row.detail]));
+      expect(detail.get('job-detail-1')).toBe('spawn ENOENT');
+      expect(detail.get('job-detail-2')).toBe('signal SIGKILL');
+      expect(detail.get('job-detail-3')).toBe('timed out');
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+// ------------------------------------------------------------------
+// Stalled CURRENT phase (issue #162): phase-aware, fence-preserving
+// ------------------------------------------------------------------
+
+describe('silas digest: stalled current phases (issue #162)', () => {
+  /** Open a repair phase on top of a truthful older delivery: the job
+   * delivered once (the historical event), then an explicit repair
+   * transition put it back to `working`. The old `delivered === null`
+   * predicate could never see this lane. */
+  const reopenRepairPhase = (h: Harness, jobId: string): void => {
+    addJobWithDelivery(h.ledger, jobId);
+    h.ledger.setJobStatus(jobId, 'delivered');
+    h.ledger.setJobStatus(jobId, 'working');
+  };
+
+  const digestAt = (h: Harness, at: number) =>
+    computeSilasDigest({
+      ledger: h.ledger,
+      blockersForRound: async () => ({ blockers: [], note: null }),
+      config: DEFAULT_SILAS_CONFIG,
+      trigger: 'sweep',
+      now: () => at,
+    });
+
+  const idleAt = (h: Harness, minionId: string): number =>
+    Date.parse(h.ledger.getAgent(minionId)!.lastActivity!);
+
+  /** A clock far past every stamp the fixture just wrote (fence tests do
+   * not care about the exact boundary; the boundary tests above do). */
+  const farFuture = (): number => Date.now() + DEFAULT_SILAS_CONFIG.stallThresholdMs * 2;
+
+  it('the original blind spot: a legitimately reopened phase with an older delivery becomes visible past the stall threshold', async () => {
+    const h = makeLedger();
+    try {
+      reopenRepairPhase(h, 'job-repair');
+      expect(h.ledger.getJob('job-repair')?.status).toBe('working');
+      expect(h.ledger.latestJobEvent('job-repair', 'job.delivered')).not.toBeNull();
+      h.ledger.registerAgent({ id: 'min-repair', role: 'minion', jobId: 'job-repair' });
+      h.ledger.setAgentState('min-repair', 'idle');
+      const idle = idleAt(h, 'min-repair');
+      // Inside the grace window: nothing is offered.
+      expect((await digestAt(h, idle + DEFAULT_SILAS_CONFIG.stallThresholdMs)).stalledWorking).toEqual([]);
+      // Past it: the CURRENT repair phase is surfaced despite the older delivery.
+      const past = await digestAt(h, idle + DEFAULT_SILAS_CONFIG.stallThresholdMs + 1);
+      expect(past.stalledWorking.map((row) => row.jobId)).toEqual(['job-repair']);
+      expect(past.stalledWorking[0]?.minionId).toBe('min-repair');
+      // Historical delivery evidence is preserved, never deleted or rewritten.
+      expect(h.ledger.listJobEvents('job-repair').filter((event) => event.kind === 'job.delivered')).toHaveLength(1);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a genuinely current delivery stays excluded — a worker exiting after delivery is normal', async () => {
+    const h = makeLedger();
+    try {
+      addJobWithDelivery(h.ledger, 'job-current');
+      h.ledger.registerAgent({ id: 'min-current', role: 'minion', jobId: 'job-current' });
+      h.ledger.setAgentState('min-current', 'idle');
+      const digest = await digestAt(h, idleAt(h, 'min-current') + DEFAULT_SILAS_CONFIG.stallThresholdMs + 1);
+      expect(digest.stalledWorking).toEqual([]);
+      // The state still reaches its real owner: the delivery-without-PR row.
+      expect(digest.deliveredWithoutPr.map((row) => row.jobId)).toEqual(['job-current']);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('terminal, parked, blocked and delivered lanes are never offered for stalled recovery', async () => {
+    const h = makeLedger();
+    try {
+      const jobs: readonly { id: string; status: string[] }[] = [
+        { id: 'job-terminal-done', status: ['done'] },
+        { id: 'job-terminal-merged', status: ['in-review', 'merged'] },
+        { id: 'job-parked', status: ['parked'] },
+        { id: 'job-blocked', status: ['blocked'] },
+        { id: 'job-delivered', status: ['delivered'] },
+      ];
+      for (const { id, status } of jobs) {
+        addJobWithDelivery(h.ledger, id, { prUrl: 'https://git.example.invalid/o/r/pull/1' });
+        for (const step of status) h.ledger.setJobStatus(id, step);
+        h.ledger.registerAgent({ id: `min-${id}`, role: 'minion', jobId: id });
+        h.ledger.setAgentState(`min-${id}`, 'idle');
+      }
+      const far = Math.max(...jobs.map(({ id }) => idleAt(h, `min-${id}`))) + DEFAULT_SILAS_CONFIG.stallThresholdMs + 1;
+      const digest = await digestAt(h, far);
+      expect(digest.stalledWorking).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('the no-minion-record variant is visible past the grace window, never silently invisible', async () => {
+    const h = makeLedger();
+    try {
+      reopenRepairPhase(h, 'job-no-worker');
+      const startedAt = Date.parse(h.ledger.latestJobEvent('job-no-worker', 'job.status')!.ts);
+      // Exactly at the grace boundary is not stalled; past it the absent
+      // worker record no longer hides the phase.
+      expect((await digestAt(h, startedAt + DEFAULT_SILAS_CONFIG.stallThresholdMs)).stalledWorking).toEqual([]);
+      const past = await digestAt(h, startedAt + DEFAULT_SILAS_CONFIG.stallThresholdMs + 1);
+      expect(past.stalledWorking).toEqual([
+        {
+          jobId: 'job-no-worker',
+          repo: 'fixture-app',
+          minionId: null,
+          minionState: null,
+          lastActivity: null,
+          idleMs: DEFAULT_SILAS_CONFIG.stallThresholdMs + 1,
+        },
+      ]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a pending re-brief request owns the lane: accepted work awaiting startup is never called lost', async () => {
+    const h = makeLedger();
+    try {
+      reopenRepairPhase(h, 'job-rebrief');
+      h.ledger.beginPendingRebrief({ jobId: 'job-rebrief', note: 'retry the repair', briefing: 'b' });
+      const startedAt = Date.parse(h.ledger.latestJobEvent('job-rebrief', 'job.status')!.ts);
+      expect((await digestAt(h, startedAt + DEFAULT_SILAS_CONFIG.stallThresholdMs + 1)).stalledWorking).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a live directive request fences the lane while ownership is uncertain, in BOTH live states', async () => {
+    const h = makeLedger();
+    try {
+      reopenRepairPhase(h, 'job-directive');
+      const intent = h.ledger.beginDirectiveIntent({ jobId: 'job-directive', directive: 'fix it', holder: 'silas-ops' });
+      const at = farFuture();
+      // `dispatching` = side effects possible, admission unknown: reconcile, never duplicate.
+      expect((await digestAt(h, at)).stalledWorking).toEqual([]);
+      const sent = h.ledger.appendCustomEvent({
+        kind: 'silas.directive-sent',
+        jobId: 'job-directive',
+        payload: { request_id: intent.record.requestId, minion_id: 'min-live' },
+      });
+      h.ledger.recordDirectiveAdmission({ requestId: intent.record.requestId, minionId: 'min-live', eventSeq: sent.seq });
+      // `admitted` = a bound turn is still in flight: same fence.
+      expect((await digestAt(h, at)).stalledWorking).toEqual([]);
+      // A durable failure with positive no-effect proof releases the fence.
+      h.ledger.failDirective({ requestId: intent.record.requestId, reason: 'no lane and no minion' });
+      expect((await digestAt(h, at)).stalledWorking.map((row) => row.jobId)).toEqual(['job-directive']);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('an in-flight verification owns the checkout; only its own run settlement releases it', async () => {
+    const h = makeLedger();
+    try {
+      reopenRepairPhase(h, 'job-verify');
+      // A started run owns the checkout regardless of how old it is.
+      h.ledger.appendCustomEvent({ kind: 'verification.started', jobId: 'job-verify', payload: { run_id: 'run-1', scope: 'full' } });
+      const at = farFuture();
+      expect((await digestAt(h, at)).stalledWorking).toEqual([]);
+      // A duplicate caller attaching to the same attempt is NOT a settlement.
+      h.ledger.appendCustomEvent({ kind: 'verification.attached', jobId: 'job-verify', payload: { run_id: 'run-1', scope: 'full', state: 'running' } });
+      expect((await digestAt(h, at)).stalledWorking).toEqual([]);
+      // Run 2 starts while run 1 is open; run 1's later settlement must not
+      // release run 2's checkout (per-run identity, not job-level order).
+      h.ledger.appendCustomEvent({ kind: 'verification.requested', jobId: 'job-verify', payload: { run_id: 'run-2', scope: 'web' } });
+      h.ledger.appendCustomEvent({ kind: 'verification.started', jobId: 'job-verify', payload: { run_id: 'run-2', scope: 'web' } });
+      h.ledger.appendCustomEvent({ kind: 'verification.completed', jobId: 'job-verify', payload: { run_id: 'run-1', scope: 'full' } });
+      expect((await digestAt(h, at)).stalledWorking).toEqual([]);
+      // Run 2's own settlement releases the lane.
+      h.ledger.appendCustomEvent({ kind: 'verification.completed', jobId: 'job-verify', payload: { run_id: 'run-2', scope: 'web' } });
+      expect((await digestAt(h, at)).stalledWorking.map((row) => row.jobId)).toEqual(['job-verify']);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('an unsettled queued verification keeps its ownership fence (uncertain ownership fails closed)', async () => {
+    const h = makeLedger();
+    try {
+      reopenRepairPhase(h, 'job-queue');
+      const requested = h.ledger.appendCustomEvent({
+        kind: 'verification.requested', jobId: 'job-queue', payload: { run_id: 'run-queued', scope: 'full' },
+      });
+      const at = Date.parse(requested.ts) + 3 * DEFAULT_SILAS_CONFIG.stallThresholdMs;
+      // Long past the stall threshold the accepted queue still owns the
+      // checkout: the scheduler's lock-timeout/stale record is the terminal
+      // evidence, and guessing cessation would risk competing writers.
+      expect((await digestAt(h, at)).stalledWorking).toEqual([]);
+      // The scheduler's own terminal record for THIS run releases it.
+      h.ledger.appendCustomEvent({ kind: 'verification.lock-timeout', jobId: 'job-queue', payload: { run_id: 'run-queued', scope: 'full' } });
+      expect((await digestAt(h, at)).stalledWorking.map((row) => row.jobId)).toEqual(['job-queue']);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a busy verification history cannot hide an unsettled run from the ownership query', async () => {
+    const h = makeLedger();
+    try {
+      reopenRepairPhase(h, 'job-tail');
+      h.ledger.appendCustomEvent({ kind: 'verification.started', jobId: 'job-tail', payload: { run_id: 'run-active', scope: 'full' } });
+      // 650 newer lifecycle events (325 settled runs) plus a busy activity
+      // tail: the durable per-run query still sees the open run.
+      for (let index = 0; index < 325; index += 1) {
+        h.ledger.appendCustomEvent({ kind: 'verification.requested', jobId: 'job-tail', payload: { run_id: `run-${index}`, scope: 'web' } });
+        h.ledger.appendCustomEvent({ kind: 'verification.completed', jobId: 'job-tail', payload: { run_id: `run-${index}`, scope: 'web' } });
+      }
+      for (let index = 0; index < 450; index += 1) {
+        h.ledger.appendCustomEvent({ kind: 'agent.state', jobId: 'job-tail', payload: { index } });
+      }
+      const at = farFuture();
+      expect((await digestAt(h, at)).stalledWorking).toEqual([]);
+      h.ledger.appendCustomEvent({ kind: 'verification.completed', jobId: 'job-tail', payload: { run_id: 'run-active', scope: 'full' } });
+      expect((await digestAt(h, at)).stalledWorking.map((row) => row.jobId)).toEqual(['job-tail']);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a claimed provider continuation opens a repair phase without a status hop', async () => {
+    const h = makeLedger();
+    try {
+      // Delivered lane that never left `working` (fallback-review shape).
+      addJobWithDelivery(h.ledger, 'job-recovered');
+      const claim = h.ledger.appendCustomEvent({
+        kind: 'provider.recovery-claimed', jobId: 'job-recovered', payload: { wait_id: 'w-1', path: 'resumed' },
+      });
+      const claimedAt = Date.parse(claim.ts);
+      expect((await digestAt(h, claimedAt + DEFAULT_SILAS_CONFIG.stallThresholdMs)).stalledWorking).toEqual([]);
+      expect(
+        (await digestAt(h, claimedAt + DEFAULT_SILAS_CONFIG.stallThresholdMs + 1)).stalledWorking.map((row) => row.jobId),
+      ).toEqual(['job-recovered']);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a directive intent that never admitted work cannot reopen a genuinely delivered phase', async () => {
+    const h = makeLedger();
+    try {
+      addJobWithDelivery(h.ledger, 'job-noop');
+      const intent = h.ledger.beginDirectiveIntent({ jobId: 'job-noop', directive: 'no-op', holder: 'silas-ops' });
+      h.ledger.failDirective({ requestId: intent.record.requestId, reason: 'no lane and no minion' });
+      // Delivery is newer than the working hop and no admission ever landed:
+      // the phase is still delivered, not stalled.
+      expect((await digestAt(h, farFuture())).stalledWorking).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a fresh dispatch with no worker record is accepted startup, not lost work', async () => {
+    const h = makeLedger();
+    try {
+      h.ledger.addJob({ id: 'job-dispatch', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('job-dispatch', 'working');
+      const startedAt = Date.parse(h.ledger.latestJobEvent('job-dispatch', 'job.status')!.ts);
+      // The dispatch turn owns its accepted startup (a queued worker-gate
+      // admission is not lost work); a deterministic failure blocks the
+      // lane with error evidence instead. Repair phases are the case where
+      // a missing record means lost work — covered above.
+      expect((await digestAt(h, startedAt + DEFAULT_SILAS_CONFIG.stallThresholdMs + 1)).stalledWorking).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('an in-review attempt that never delivered is still assessed when its worker dies', async () => {
+    const h = makeLedger();
+    try {
+      // A PR link flips a still-working attempt to in-review before its
+      // delivery: laneIsBusy still treats it as a writer, so the stall
+      // channel must not strand it behind the in-review status.
+      h.ledger.addJob({ id: 'job-linked', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('job-linked', 'working');
+      h.ledger.setJobPr('job-linked', 'https://git.example.invalid/o/r/pull/3');
+      h.ledger.setJobStatus('job-linked', 'in-review');
+      h.ledger.registerAgent({ id: 'min-linked', role: 'minion', jobId: 'job-linked' });
+      h.ledger.setAgentState('min-linked', 'idle');
+      const at = idleAt(h, 'min-linked') + DEFAULT_SILAS_CONFIG.stallThresholdMs + 1;
+      expect((await digestAt(h, at)).stalledWorking.map((row) => row.jobId)).toEqual(['job-linked']);
+      // Once the attempt delivers, the review owns it: no stall offer.
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-linked', payload: { sha: 'sha-linked' } });
+      expect((await digestAt(h, at)).stalledWorking).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a reopened phase binds its grace to the phase start, not the old idle worker stamp', async () => {
+    const h = makeLedger();
+    try {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date('2026-10-04T00:00:00.000Z'));
+        addJobWithDelivery(h.ledger, 'job-grace');
+        h.ledger.registerAgent({ id: 'min-old', role: 'minion', jobId: 'job-grace' });
+        h.ledger.setAgentState('min-old', 'idle');
+        const workerIdleAt = idleAt(h, 'min-old');
+        // Reopen five minutes later: the old idle stamp is older than the
+        // phase opening, so the fresh grace starts at the reopen.
+        vi.setSystemTime(new Date(workerIdleAt + 5 * 60_000));
+        h.ledger.setJobStatus('job-grace', 'delivered');
+        h.ledger.setJobStatus('job-grace', 'working');
+        const reopenedAt = Date.parse(h.ledger.latestJobEvent('job-grace', 'job.status')!.ts);
+        expect((await digestAt(h, reopenedAt + DEFAULT_SILAS_CONFIG.stallThresholdMs)).stalledWorking).toEqual([]);
+        // One millisecond past the reopen's own grace: visible.
+        expect(
+          (await digestAt(h, reopenedAt + DEFAULT_SILAS_CONFIG.stallThresholdMs + 1)).stalledWorking.map((row) => row.jobId),
+        ).toEqual(['job-grace']);
+      } finally {
+        vi.useRealTimers();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a supervised open turn owns the lane even when the ledger stamp is old; closing it lets the stall surface', async () => {
+    const h = makeLedger();
+    try {
+      reopenRepairPhase(h, 'job-open-turn');
+      h.ledger.registerAgent({ id: 'min-open', role: 'minion', jobId: 'job-open-turn' });
+      h.ledger.setAgentState('min-open', 'idle');
+      const at = farFuture();
+      const base: AgentSupervisionView = {
+        agentId: 'min-open', role: 'minion', slotId: null, state: 'watching', restarts: 0,
+        breakerOpen: false, stopReason: null, openTurn: true, openToolCalls: 0,
+        lastEventAt: null, lastFileBytes: null,
+      };
+      const digestOf = (view: AgentSupervisionView | null) =>
+        computeSilasDigest({
+          ledger: h.ledger,
+          blockersForRound: async () => ({ blockers: [], note: null }),
+          config: DEFAULT_SILAS_CONFIG,
+          trigger: 'sweep',
+          now: () => at,
+          supervisionFor: (agentId) => (agentId === 'min-open' ? view : null),
+        });
+      // A live open turn is active work, never a lost worker.
+      expect((await digestOf(base)).stalledWorking).toEqual([]);
+      // Each independent ownership field fences on its own.
+      expect((await digestOf({ ...base, openTurn: false, openControl: true })).stalledWorking).toEqual([]);
+      expect((await digestOf({ ...base, openTurn: false, openControl: false, openToolCalls: 1 })).stalledWorking).toEqual([]);
+      // The same worker with the turn closed and only a stale stamp is silent.
+      expect((await digestOf({ ...base, openTurn: false })).stalledWorking.map((row) => row.jobId)).toEqual(['job-open-turn']);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('fresh supervisor activity keeps a closed-turn worker out of its silent window', async () => {
+    const h = makeLedger();
+    try {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date('2026-10-04T00:00:00.000Z'));
+        addJobWithDelivery(h.ledger, 'job-sup');
+        h.ledger.registerAgent({ id: 'min-sup', role: 'minion', jobId: 'job-sup' });
+        h.ledger.setAgentState('min-sup', 'idle');
+        const idle = idleAt(h, 'min-sup');
+        vi.setSystemTime(new Date(idle + 10 * 60_000));
+        h.ledger.setJobStatus('job-sup', 'delivered');
+        h.ledger.setJobStatus('job-sup', 'working');
+        const reopenedAt = Date.parse(h.ledger.latestJobEvent('job-sup', 'job.status')!.ts);
+        const base: AgentSupervisionView = {
+          agentId: 'min-sup', role: 'minion', slotId: null, state: 'watching', restarts: 0,
+          breakerOpen: false, stopReason: null, openTurn: false, openToolCalls: 0,
+          lastEventAt: null, lastFileBytes: null,
+        };
+        const digestOf = (view: AgentSupervisionView | null, at: number) =>
+          computeSilasDigest({
+            ledger: h.ledger,
+            blockersForRound: async () => ({ blockers: [], note: null }),
+            config: DEFAULT_SILAS_CONFIG,
+            trigger: 'sweep',
+            now: () => at,
+            supervisionFor: (agentId) => (agentId === 'min-sup' ? view : null),
+          });
+        // The ledger stamp is past the threshold, but the supervisor's own
+        // event clock is inside the silence window.
+        const fresh = { ...base, lastEventAt: new Date(idle + 20 * 60_000).toISOString() };
+        expect((await digestOf(fresh, reopenedAt + 35 * 60_000)).stalledWorking).toEqual([]);
+        // The supervisor clock itself ages past the window: silent again.
+        expect((await digestOf(fresh, reopenedAt + 55 * 60_000)).stalledWorking.map((row) => row.jobId)).toEqual(['job-sup']);
+      } finally {
+        vi.useRealTimers();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a later working hop is a genuine repair even when a clean abort is on the record', async () => {
+    const h = makeLedger();
+    try {
+      addJobWithDelivery(h.ledger, 'job-abort', { prUrl: 'https://git.example.invalid/o/r/pull/9' });
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-abort', payload: { sha: 'sha-same' } });
+      const round = h.ledger.addRound({ jobId: 'job-abort', targetRef: 'sha-same' });
+      h.ledger.setRoundStatus(round.id, 'live');
+      h.ledger.setJobStatus('job-abort', 'in-review');
+      h.ledger.setRoundStatus(round.id, 'aborted');
+      h.ledger.appendCustomEvent({
+        kind: 'round.perkins-incomplete', jobId: 'job-abort', roundId: round.id, payload: { reason: 'service_restart' },
+      });
+      // The in-review → working restore leaves the lane on an old head the
+      // branch guard refuses to re-arm (the restore hop keeps the attempt
+      // open): the lane is surfaced for assessment, never offered an
+      // unarmable clean-abort review row.
+      h.ledger.setJobStatus('job-abort', 'working');
+      const rearmed = await digestAt(h, farFuture());
+      expect(rearmed.prWithoutReview).toEqual([]);
+      expect(rearmed.stalledWorking.map((row) => row.jobId)).toEqual(['job-abort']);
+      // A LATER delivered → working hop is a genuine reopen: the old abort
+      // must not hide it, and the old head must not be offered for review.
+      h.ledger.setJobStatus('job-abort', 'delivered');
+      h.ledger.setJobStatus('job-abort', 'working');
+      h.ledger.registerAgent({ id: 'min-abort', role: 'minion', jobId: 'job-abort' });
+      h.ledger.setAgentState('min-abort', 'idle');
+      const reopened = await digestAt(h, idleAt(h, 'min-abort') + DEFAULT_SILAS_CONFIG.stallThresholdMs + 1);
+      expect(reopened.stalledWorking.map((row) => row.jobId)).toEqual(['job-abort']);
+      expect(reopened.prWithoutReview).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a live directive or pending re-brief fences the PR/review offers on a delivered lane', async () => {
+    const h = makeLedger();
+    try {
+      // Row (1): delivered, no PR yet.
+      addJobWithDelivery(h.ledger, 'job-offer1');
+      expect((await digestAt(h, farFuture())).deliveredWithoutPr.map((row) => row.jobId)).toEqual(['job-offer1']);
+      const intent = h.ledger.beginDirectiveIntent({ jobId: 'job-offer1', directive: 'no-op', holder: 'silas-ops' });
+      expect((await digestAt(h, farFuture())).deliveredWithoutPr).toEqual([]);
+      h.ledger.failDirective({ requestId: intent.record.requestId, reason: 'no lane and no minion' });
+      expect((await digestAt(h, farFuture())).deliveredWithoutPr.map((row) => row.jobId)).toEqual(['job-offer1']);
+      h.ledger.beginPendingRebrief({ jobId: 'job-offer1', note: 'retry', briefing: 'b' });
+      expect((await digestAt(h, farFuture())).deliveredWithoutPr).toEqual([]);
+      // Row (2): PR-linked, review due.
+      addJobWithDelivery(h.ledger, 'job-offer2', { prUrl: 'https://git.example.invalid/o/r/pull/2' });
+      expect((await digestAt(h, farFuture())).prWithoutReview.map((row) => row.jobId)).toEqual(['job-offer2']);
+      h.ledger.beginDirectiveIntent({ jobId: 'job-offer2', directive: 'no-op', holder: 'silas-ops' });
+      expect((await digestAt(h, farFuture())).prWithoutReview).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a stalled offer is retracted when a new repair phase opens during the await', async () => {
+    const h = makeLedger();
+    try {
+      // The await job is created first and the stalled candidate a second
+      // later, so the candidate is deterministically visited first.
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-10-04T10:00:00.000Z'));
+      h.ledger.addJob({ id: 'job-other3', repo: 'fixture-app', title: 'other', briefing: 'b' });
+      h.ledger.setJobStatus('job-other3', 'working');
+      const round = h.ledger.addRound({ jobId: 'job-other3', lenses: ['blind'] });
+      h.ledger.setRoundStatus(round.id, 'live');
+      h.ledger.setRoundVerdict(round.id, 'changes-requested');
+      h.ledger.setJobStatus('job-other3', 'in-review');
+      vi.setSystemTime(new Date('2026-10-04T10:00:01.000Z'));
+      reopenRepairPhase(h, 'job-race-claim');
+      h.ledger.registerAgent({ id: 'min-race-claim', role: 'minion', jobId: 'job-race-claim' });
+      h.ledger.setAgentState('min-race-claim', 'idle');
+      vi.useRealTimers();
+      let raced = false;
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => {
+          if (!raced) {
+            raced = true;
+            h.ledger.appendCustomEvent({ kind: 'provider.recovery-claimed', jobId: 'job-race-claim', payload: { wait_id: 'w' } });
+          }
+          return { blockers: [], note: null };
+        },
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+        now: () => farFuture(),
+      });
+      expect(raced).toBe(true);
+      expect(digest.stalledWorking).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a stalled offer is retracted when its worker resumes activity during the await', async () => {
+    const h = makeLedger();
+    try {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-10-04T10:00:00.000Z'));
+      h.ledger.addJob({ id: 'job-other4', repo: 'fixture-app', title: 'other', briefing: 'b' });
+      h.ledger.setJobStatus('job-other4', 'working');
+      const round = h.ledger.addRound({ jobId: 'job-other4', lenses: ['blind'] });
+      h.ledger.setRoundStatus(round.id, 'live');
+      h.ledger.setRoundVerdict(round.id, 'changes-requested');
+      h.ledger.setJobStatus('job-other4', 'in-review');
+      vi.setSystemTime(new Date('2026-10-04T10:00:01.000Z'));
+      reopenRepairPhase(h, 'job-race-worker');
+      h.ledger.registerAgent({ id: 'min-race-worker', role: 'minion', jobId: 'job-race-worker' });
+      h.ledger.setAgentState('min-race-worker', 'idle');
+      vi.useRealTimers();
+      let raced = false;
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => {
+          if (!raced) {
+            raced = true;
+            // The worker resumed while the digest awaited the other job.
+            h.ledger.setAgentState('min-race-worker', 'idle');
+          }
+          return { blockers: [], note: null };
+        },
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+        now: () => farFuture(),
+      });
+      expect(raced).toBe(true);
+      expect(digest.stalledWorking).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a stalled offer is retracted when an owner lands while another job\'s blocker history is awaited', async () => {
+    const h = makeLedger();
+    try {
+      // The other job is created FIRST so its blocker report is awaited
+      // AFTER job-race (the more recently updated row) is visited.
+      h.ledger.addJob({ id: 'job-other', repo: 'fixture-app', title: 'other', briefing: 'b' });
+      h.ledger.setJobStatus('job-other', 'working');
+      const round = h.ledger.addRound({ jobId: 'job-other', lenses: ['blind'] });
+      h.ledger.setRoundStatus(round.id, 'live');
+      h.ledger.setRoundVerdict(round.id, 'changes-requested');
+      h.ledger.setJobStatus('job-other', 'in-review');
+      reopenRepairPhase(h, 'job-race');
+      const at = farFuture();
+      let raced = false;
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => {
+          if (!raced) {
+            raced = true;
+            // An accepted directive owns job-race while the await is open.
+            h.ledger.beginDirectiveIntent({ jobId: 'job-race', directive: 'repair', holder: 'silas-ops' });
+          }
+          return { blockers: [], note: null };
+        },
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+        now: () => at,
+      });
+      expect(raced).toBe(true);
+      expect(digest.stalledWorking).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('an answering review request fences the phase; a failed fallback request does not', async () => {
+    const h = makeLedger();
+    try {
+      reopenRepairPhase(h, 'job-review');
+      const at = farFuture();
+      h.ledger.appendCustomEvent({ kind: 'silas.review-triggered', jobId: 'job-review', payload: { route: 'perkins' } });
+      expect((await digestAt(h, at)).stalledWorking).toEqual([]);
+      // A terminal fallback failure newer than the trigger answers nothing.
+      h.ledger.appendCustomEvent({ kind: 'job.fallback-review', jobId: 'job-review', payload: { phase: 'blocked' } });
+      expect((await digestAt(h, at)).stalledWorking.map((row) => row.jobId)).toEqual(['job-review']);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a stalled offer is retracted when its phase delivers during the await', async () => {
+    const h = makeLedger();
+    try {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-10-04T10:00:00.000Z'));
+      h.ledger.addJob({ id: 'job-other5', repo: 'fixture-app', title: 'other', briefing: 'b' });
+      h.ledger.setJobStatus('job-other5', 'working');
+      const round = h.ledger.addRound({ jobId: 'job-other5', lenses: ['blind'] });
+      h.ledger.setRoundStatus(round.id, 'live');
+      h.ledger.setRoundVerdict(round.id, 'changes-requested');
+      h.ledger.setJobStatus('job-other5', 'in-review');
+      vi.setSystemTime(new Date('2026-10-04T10:00:01.000Z'));
+      reopenRepairPhase(h, 'job-race-delivery');
+      h.ledger.registerAgent({ id: 'min-race-delivery', role: 'minion', jobId: 'job-race-delivery' });
+      h.ledger.setAgentState('min-race-delivery', 'idle');
+      vi.useRealTimers();
+      let raced = false;
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => {
+          if (!raced) {
+            raced = true;
+            h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-race-delivery', payload: { sha: 'sha-delivered' } });
+          }
+          return { blockers: [], note: null };
+        },
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+        now: () => farFuture(),
+      });
+      expect(raced).toBe(true);
+      expect(digest.stalledWorking).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a stalled offer is retracted when verification takes ownership during the await', async () => {
+    const h = makeLedger();
+    try {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-10-04T10:00:00.000Z'));
+      h.ledger.addJob({ id: 'job-other6', repo: 'fixture-app', title: 'other', briefing: 'b' });
+      h.ledger.setJobStatus('job-other6', 'working');
+      const round = h.ledger.addRound({ jobId: 'job-other6', lenses: ['blind'] });
+      h.ledger.setRoundStatus(round.id, 'live');
+      h.ledger.setRoundVerdict(round.id, 'changes-requested');
+      h.ledger.setJobStatus('job-other6', 'in-review');
+      vi.setSystemTime(new Date('2026-10-04T10:00:01.000Z'));
+      reopenRepairPhase(h, 'job-race-verify');
+      h.ledger.registerAgent({ id: 'min-race-verify', role: 'minion', jobId: 'job-race-verify' });
+      h.ledger.setAgentState('min-race-verify', 'idle');
+      vi.useRealTimers();
+      let raced = false;
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => {
+          if (!raced) {
+            raced = true;
+            h.ledger.appendCustomEvent({ kind: 'verification.requested', jobId: 'job-race-verify', payload: { run_id: 'run-race', scope: 'full' } });
+          }
+          return { blockers: [], note: null };
+        },
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+        now: () => farFuture(),
+      });
+      expect(raced).toBe(true);
+      expect(digest.stalledWorking).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('repeated sweeps report one row for the phase and add no writers of their own; an accepted continuation retires it', async () => {
+    const h = makeLedger();
+    try {
+      reopenRepairPhase(h, 'job-repeat');
+      const at = farFuture();
+      const first = await digestAt(h, at);
+      const eventsBefore = h.ledger.listJobEvents('job-repeat', { limit: 200 }).length;
+      const second = await digestAt(h, at);
+      expect(first.stalledWorking.map((row) => row.jobId)).toEqual(['job-repeat']);
+      expect(second.stalledWorking.map((row) => row.jobId)).toEqual(['job-repeat']);
+      // The detector is read-only: no delivery, directive or rebrief event is minted.
+      expect(h.ledger.listJobEvents('job-repeat', { limit: 200 }).length).toBe(eventsBefore);
+      // The existing guarded continuation path (Silas' accepted directive) owns the phase from here.
+      h.ledger.beginDirectiveIntent({ jobId: 'job-repeat', directive: 'repair', holder: 'silas-ops' });
+      expect((await digestAt(h, at)).stalledWorking).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
 });
 
 // ------------------------------------------------------------------
@@ -1166,6 +2078,11 @@ describe('silas skills and wake prompt', () => {
     expect(ops).toContain('recorded rule (a documented retry, a re-brief on a known protocol break)');
     expect(ops).toContain('In-round lens retries are Perkins-owned machinery');
     expect(ops).toContain('wave-level request (`POST /api/dispatch/review`)');
+    // Issue #162: the stalled guidance is phase-aware — an older delivery is
+    // history, accepted operations fence the lane, and a null-minion row
+    // (no worker record at all) is named for the lane inspection path.
+    expect(ops).toContain('A truthful older delivery is history, not proof the current repair phase delivered');
+    expect(ops).toContain('A row with `minionId: null` has no worker record at all');
     expect(() => loadSilasSkills(['nope'])).toThrow(/unreadable/);
   });
 
@@ -1173,7 +2090,8 @@ describe('silas skills and wake prompt', () => {
     const prompt = buildWakePrompt({ digest: { computedAt: '2026-09-24T00:00:00Z', trigger: 'sweep',
       deliveredWithoutPr: [], prWithoutReview: [{ jobId: 'clean', repo: 'gru-command', prUrl: 'https://example.invalid/1',
         priorRounds: 1, cleanAbort: { roundId: 'clean-r1', ruleId: 'clean-abort-service-restart' } }],
-      verdictsAwaitingDirective: [], stalledWorking: [], minionErrors: [], providerRecoveryPending: [] },
+      verdictsAwaitingDirective: [], stalledWorking: [], minionErrors: [],
+      verificationFailures: [], verificationWaits: [], providerRecoveryPending: [] },
       trigger: { kind: 'sweep' }, skills: loadSilasSkills(), ops: { baseUrl: 'http://127.0.0.1:1', configPath: '/tmp/test-config' } });
     expect(prompt).toContain('You NEVER merge a pull request');
     expect(prompt).toContain('Gru may merge gru-command only');
@@ -1206,6 +2124,8 @@ describe('silas skills and wake prompt', () => {
         verdictsAwaitingDirective: [],
         stalledWorking: [],
         minionErrors: [],
+        verificationFailures: [],
+        verificationWaits: [],
         providerRecoveryPending: [],
       },
       trigger: { kind: 'job.delivered', jobId: 'job-a' },
@@ -1253,6 +2173,7 @@ function makeDriver(opts: {
    * main.ts wires it (final independent review T0). */
   supervisionFor?: (agentId: string) => AgentSupervisionView | null;
   now?: () => number;
+  onDeterministicPass?: DeterministicPassHook;
 } = {}): DriverHarness {
   const h = makeLedger();
   const prompts: { text: string; owner?: string }[] = [];
@@ -1300,6 +2221,7 @@ function makeDriver(opts: {
     ...(opts.timers !== undefined ? { setInterval: opts.timers.setInterval, clearInterval: opts.timers.clearInterval } : {}),
     ...(opts.supervisionFor !== undefined ? { supervisionFor: opts.supervisionFor } : {}),
     ...(opts.now !== undefined ? { now: opts.now } : {}),
+    ...(opts.onDeterministicPass !== undefined ? { onDeterministicPass: opts.onDeterministicPass } : {}),
     log: () => {},
   });
   return {
@@ -1694,6 +2616,667 @@ describe('silas driver github signal poll', () => {
       ticks[0]?.();
       await vi.waitFor(() => expect(polls).toBe(2));
       expect(h.driver.pollRunning).toBe(true);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+// ------------------------------------------------------------------
+
+// Deterministic pass health + open-turn independence (issue #163)
+// ------------------------------------------------------------------
+
+describe('silas deterministic pass observation (issue #163)', () => {
+  const kinds = (h: DriverHarness, kind: string): EventRecord[] =>
+    h.ledger.listEvents({ limit: 200 }).filter((event) => event.kind === kind);
+
+  it('keeps reconciling while a model prompt is held open; one queued wake follows settlement', async () => {
+    const passes: { trigger: string; wakeInFlight: boolean }[] = [];
+    const h = makeDriver({
+      onDeterministicPass: (context) => {
+        passes.push({ trigger: context.trigger, wakeInFlight: context.wakeInFlight });
+        return { examined: 1, advanced: 1 };
+      },
+    });
+    try {
+      // An actionable row so the coalesced wake after settlement actually prompts.
+      addJobWithDelivery(h.ledger, 'job-open');
+      h.hold();
+      const first = h.driver.trigger({ kind: 'job.delivered', jobId: 'job-open' });
+      await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
+
+      // Two sweep ticks land while the prompt is unresolved. The pass runs
+      // for each (there is no in-flight pass to coalesce onto), the wake is
+      // not stacked, and no second prompt exists.
+      await h.driver.trigger({ kind: 'sweep' });
+      await h.driver.trigger({ kind: 'sweep' });
+      expect(h.prompts).toHaveLength(1);
+      expect(passes.map((p) => p.trigger)).toEqual(['job.delivered', 'sweep', 'sweep']);
+      expect(passes[1]?.wakeInFlight).toBe(true);
+      // Every tick left a durable observation and every pass a completed
+      // reconciliation; the open turn cannot hide either.
+      const ticks = kinds(h, 'silas.tick');
+      expect(ticks).toHaveLength(3);
+      expect(ticks[1]?.payload).toMatchObject({ trigger: 'sweep', wake_in_flight: true });
+      const reconciles = kinds(h, 'silas.reconcile');
+      expect(reconciles).toHaveLength(3);
+      expect(reconciles.every((event) => (event.payload as { ok?: unknown }).ok === true)).toBe(true);
+      expect((reconciles[1]?.payload as { counts?: unknown }).counts).toEqual({ examined: 1, advanced: 1 });
+      // The wake marker still means "wake start": only the first wake exists.
+      expect(kinds(h, 'silas.wake')).toHaveLength(1);
+
+      h.settle();
+      await first;
+      // Exactly ONE coalesced wake runs at settlement — no stacked wakes.
+      await vi.waitFor(() => expect(h.prompts).toHaveLength(2));
+      expect(kinds(h, 'silas.wake')).toHaveLength(2);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(h.prompts).toHaveLength(2);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('coalesces overlapping passes onto ONE execution and never spawns a second turn', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let invocations = 0;
+    const h = makeDriver({
+      onDeterministicPass: async () => {
+        invocations += 1;
+        await gate;
+        return { examined: 0, advanced: 0 };
+      },
+    });
+    try {
+      addJobWithDelivery(h.ledger, 'job-overlap');
+      const first = h.driver.trigger({ kind: 'job.delivered', jobId: 'job-overlap' });
+      await vi.waitFor(() => expect(kinds(h, 'silas.tick')).toHaveLength(1));
+      const second = h.driver.trigger({ kind: 'sweep' });
+      await vi.waitFor(() => expect(kinds(h, 'silas.tick')).toHaveLength(2));
+      // Both triggers are blocked on the SAME pass: one execution, zero
+      // wake markers, zero completed reconciliations yet.
+      expect(invocations).toBe(1);
+      expect(kinds(h, 'silas.wake')).toHaveLength(0);
+      expect(kinds(h, 'silas.reconcile')).toHaveLength(0);
+      release();
+      await first;
+      await second;
+      // One wake plus exactly one coalesced wake at settlement; no third.
+      await vi.waitFor(() => expect(h.prompts).toHaveLength(2));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(h.prompts).toHaveLength(2);
+      expect(kinds(h, 'silas.reconcile')).toHaveLength(2); // one per accepted trigger, never a stacked pass
+    } finally {
+      release();
+      h.cleanup();
+    }
+  });
+
+  it('records a failed pass as ok:false and never as a completed reconciliation', async () => {
+    const h = makeDriver({
+      onDeterministicPass: () => {
+        throw new Error('ledger exploded');
+      },
+    });
+    try {
+      addJobWithDelivery(h.ledger, 'job-fail-pass');
+      await h.driver.trigger({ kind: 'sweep' });
+      const reconciles = kinds(h, 'silas.reconcile-failed');
+      expect(reconciles).toHaveLength(1);
+      expect(reconciles[0]?.payload).toMatchObject({ ok: false, error: 'Error: ledger exploded' });
+      // A failure is never recorded as a completed reconciliation.
+      expect(kinds(h, 'silas.reconcile')).toHaveLength(0);
+      // The failed pass never blocks the wake path.
+      await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
+    } finally {
+      h.cleanup();
+    }
+  });
+  it('a partial pass (ok:false with failures) is recorded as failed, never as a completed reconciliation', async () => {
+    const h = makeDriver({
+      onDeterministicPass: () => ({ ok: false, failures: 2, advanced: 1 }),
+    });
+    try {
+      addJobWithDelivery(h.ledger, 'job-partial-pass');
+      await h.driver.trigger({ kind: 'sweep' });
+      expect(kinds(h, 'silas.reconcile')).toHaveLength(0);
+      const failed = kinds(h, 'silas.reconcile-failed');
+      expect(failed).toHaveLength(1);
+      expect(failed[0]?.payload).toMatchObject({ ok: false, counts: { ok: false, failures: 2, advanced: 1 } });
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('the REAL durable pass advances an approved lane while the model prompt is held open', async () => {
+    // Production composition: the hook is exactly the reconcileDurableWork
+    // call main.ts wires. A completion that lands DURING the open turn is
+    // settled by the independent pass; one coalesced wake follows.
+    const posts: { kind: string }[] = [];
+    const notifications: FollowThroughNotifications = {
+      postIncident: (input) => {
+        posts.push({ kind: input.kind });
+        return { id: `notice-${posts.length}` };
+      },
+    };
+    const h = makeDriver({
+      // The production factory, invoked lazily because it needs the
+      // harness's ledger instance (made inside makeDriver).
+      onDeterministicPass: (context) =>
+        createDurableReconcileHook({ ledger: h.ledger, notifications })(context),
+    });
+    try {
+      const job = h.ledger.addJob({ id: 'job-midturn', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus(job.id, 'working');
+      const phase = h.ledger.beginPhaseHandoff({
+        jobId: job.id,
+        source: 'silas-rebrief',
+        intent: { kind: 'gru-decision', decision: 'rule on the mid-turn completion' },
+      }).record;
+      h.ledger.appendCustomEvent({ kind: 'silas.rebrief', jobId: job.id, payload: { phase_id: phase.phaseId } });
+      // An actionable lane so the one queued wake after settlement prompts.
+      addJobWithDelivery(h.ledger, 'job-open-wake');
+      h.hold();
+      const first = h.driver.trigger({ kind: 'job.delivered', jobId: 'job-open-wake' });
+      await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
+
+      // The correlated completion lands while the prompt is unresolved.
+      h.ledger.appendCustomEvent({
+        kind: 'job.delivered',
+        jobId: job.id,
+        payload: { phase_id: phase.phaseId, source: 'silas-rebrief' },
+      });
+      await h.driver.trigger({ kind: 'sweep' });
+      expect(h.ledger.getPhaseHandoff(phase.phaseId)?.state).toBe('completed');
+      expect(h.ledger.listObligations({ jobId: job.id })).toHaveLength(1);
+      expect(posts).toHaveLength(1);
+      expect(h.prompts).toHaveLength(1); // still the one held turn
+
+      h.settle();
+      await first;
+      await vi.waitFor(() => expect(h.prompts).toHaveLength(2));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(h.prompts).toHaveLength(2); // exactly one coalesced wake, no second session
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('wakes on a failed verification or capacity timeout, never on a routine PASS', async () => {
+    const h = makeDriver();
+    try {
+      h.driver.start();
+      const publish = (kind: string, payload: unknown): void => {
+        h.bus.publish({
+          seq: 1,
+          ts: new Date().toISOString(),
+          kind,
+          agentId: null,
+          jobId: 'job-verify-wake',
+          roundId: null,
+          lens: null,
+          payload,
+        });
+      };
+      publish('verification.completed', { ok: true, scope: 'full' });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(h.prompts).toHaveLength(0);
+      publish('verification.completed', { ok: false, scope: 'full' });
+      await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
+      publish('verification.lock-timeout', { scope: 'full', request_id: 'req-wake' });
+      await vi.waitFor(() => expect(h.prompts).toHaveLength(2));
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a lone verification timeout is actionable on a sweep (no unrelated event needed)', async () => {
+    const h = makeDriver();
+    try {
+      h.ledger.addJob({ id: 'job-wait-wake', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('job-wait-wake', 'working');
+      h.ledger.appendCustomEvent({
+        kind: 'verification.lock-timeout',
+        jobId: 'job-wait-wake',
+        payload: { scope: 'full', request_id: 'req-lone', head: 'head-lone', wait_ms: 900_000 },
+      });
+      await h.driver.trigger({ kind: 'sweep' });
+      await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
+      expect(h.prompts[0]?.text).toContain('req-lone');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('the main assembly wires the durable reconciliation pass into the driver (assembly alarm)', () => {
+    const mainSource = readFileSync(join(import.meta.dirname, '..', 'src', 'main.ts'), 'utf8');
+    expect(mainSource).toMatch(
+      /import\s*\{[^}]*\bcreateProductionDeterministicPass\b[^}]*\}\s*from\s*'\.\/dispatch\/durable-reconcile\.js'/,
+    );
+    expect(mainSource).toMatch(/onDeterministicPass:\s*createProductionDeterministicPass\(\{/);
+    expect(mainSource).toMatch(/getWave:\s*\(\)\s*=>\s*state\.wave/);
+  });
+  it('a wait row is bound to its pinned head: another head cannot retire it, the same head can', async () => {
+    const h = makeLedger();
+    try {
+      h.ledger.addJob({ id: 'job-head', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('job-head', 'working');
+      h.ledger.appendCustomEvent({
+        kind: 'verification.lock-timeout',
+        jobId: 'job-head',
+        payload: { scope: 'full', request_id: 'req-head', head: 'head-a', wait_ms: 1_000 },
+      });
+      h.ledger.appendCustomEvent({
+        kind: 'verification.completed',
+        jobId: 'job-head',
+        payload: { ok: true, scope: 'full', run_id: 'other-run', sha: 'head-b' },
+      });
+      const otherHead = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      // A result for a different revision is not the timed-out submission.
+      expect(otherHead.verificationWaits.map((row) => row.requestId)).toEqual(['req-head']);
+
+      h.ledger.appendCustomEvent({
+        kind: 'verification.completed',
+        jobId: 'job-head',
+        payload: { ok: true, scope: 'full', run_id: 'pinned-run', sha: 'head-a' },
+      });
+      const sameHead = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(sameHead.verificationWaits).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a reconciled replay never retires a failed run, and an earlier matching rung survives a later unrelated one', async () => {
+    const h = makeLedger();
+    try {
+      h.ledger.addJob({ id: 'job-rung2', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('job-rung2', 'working');
+      h.ledger.appendCustomEvent({
+        kind: 'verification.completed',
+        jobId: 'job-rung2',
+        payload: { ok: false, scope: 'full', run_id: 'run-9', exit_code: 1 },
+      });
+      // A replay of an older run is not a new attempt.
+      h.ledger.appendCustomEvent({
+        kind: 'verification.reconciled',
+        jobId: 'job-rung2',
+        payload: { scope: 'full', request_id: 'old-req' },
+      });
+      const replayed = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(replayed.verificationFailures.map((row) => row.scope)).toEqual(['full']);
+
+      // The matching rung lands, then an unrelated fingerprint-less rung:
+      // the matching disposition is not forgotten.
+      h.ledger.appendCustomEvent({
+        kind: 'silas.directive-sent',
+        jobId: 'job-rung2',
+        payload: { request_id: 'req-fix', blocker_fingerprint: 'verification-failure:full@run-9' },
+      });
+      h.ledger.appendCustomEvent({
+        kind: 'silas.rebrief',
+        jobId: 'job-rung2',
+        payload: { request_id: 'req-other' },
+      });
+      const handled = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(handled.verificationFailures).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('bounds the follow-up pass: many triggers during one slow pass run at most one extra pass each interval', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let invocations = 0;
+    let active = 0;
+    let maxActive = 0;
+    const h = makeDriver({
+      onDeterministicPass: async () => {
+        invocations += 1;
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        await gate;
+        active -= 1;
+        return { examined: 0, advanced: 0 };
+      },
+    });
+    try {
+      addJobWithDelivery(h.ledger, 'job-bound');
+      // Hold the model turn so the queued triggers cannot chain passes
+      // through wake drains; the count then isolates pass coalescing.
+      h.hold();
+      const first = h.driver.trigger({ kind: 'job.delivered', jobId: 'job-bound' });
+      await vi.waitFor(() => expect(invocations).toBe(1));
+      const rest = [
+        h.driver.trigger({ kind: 'sweep' }),
+        h.driver.trigger({ kind: 'sweep' }),
+        h.driver.trigger({ kind: 'sweep' }),
+        h.driver.trigger({ kind: 'sweep' }),
+      ];
+      await vi.waitFor(() => expect(maxActive).toBe(1));
+      release();
+      // Four mid-pass observations produced exactly ONE follow-up pass.
+      await vi.waitFor(() => expect(invocations).toBe(2));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(invocations).toBe(2);
+      expect(maxActive).toBe(1); // passes never overlap
+      h.settle();
+      await Promise.all([first, ...rest]);
+      expect(invocations).toBeLessThanOrEqual(3); // at most one queued-wake pass
+    } finally {
+      h.settle();
+      release();
+      h.cleanup();
+    }
+  });
+
+  it('fences synchronous re-entry: a hook that publishes a wake event starts no second pass', async () => {
+    let invocations = 0;
+    let active = 0;
+    let maxActive = 0;
+    const h = makeDriver({
+      onDeterministicPass: () => {
+        invocations += 1;
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        if (invocations === 1) {
+          // A wake-kind event published from the hook's SYNC portion.
+          h.bus.publish({
+            seq: 1,
+            ts: new Date().toISOString(),
+            kind: 'job.delivered',
+            agentId: null,
+            jobId: 'job-reentry',
+            roundId: null,
+            lens: null,
+            payload: {},
+          });
+        }
+        active -= 1;
+        return { examined: 0, advanced: 0 };
+      },
+    });
+    try {
+      await h.driver.trigger({ kind: 'sweep' });
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(maxActive).toBe(1);
+      expect(invocations).toBeLessThanOrEqual(3);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('never claims or executes silas-mechanical debt: the closed registry mints none today', async () => {
+    // The issue's plan allows routing an ALREADY-AUTHORIZED next step; the
+    // closed firing-rule registry contains no rule that grants a
+    // silas-mechanical action, so the pass cannot enumerate one. This pin
+    // fails the moment a mechanical rule is added without an executor.
+    expect(FIRING_RULES.some((rule) => rule.nextAction.kind === 'silas-mechanical')).toBe(false);
+    const h = makeLedger();
+    try {
+      h.ledger.addJob({ id: 'job-mech', repo: 'fixture-app', title: 't', briefing: 'b' });
+      // A VALID chief ruling makes the authority verifiable/executable in
+      // the ledger — the pass still does not claim it, because no executor
+      // port exists for any closed mechanical action (the missing piece is
+      // an execution port, not the reconciliation).
+      h.ledger.appendCustomEvent({
+        kind: 'ruling.recorded',
+        jobId: 'job-mech',
+        payload: { ref: 'r-mech', version: '1' },
+      });
+      const obligation = h.ledger.recordBlockedObservation('job-mech', {
+        logicalStep: 'implementation',
+        category: { kind: 'known', category: 'quality-gate' },
+        incidentKey: 'mechanical-pin',
+        observedAtSeq: h.ledger.latestEventSeq(),
+        nextAction: { kind: 'silas-mechanical', action: 'register-pr' },
+        authority: { source: 'chief-ruling', rulingRef: 'r-mech', version: '1' },
+      });
+      expect(h.ledger.verifyObligationAuthority(obligation.id).executable).toBe(true);
+      const report = reconcileDurableWork({
+        ledger: h.ledger,
+        notifications: { postIncident: () => ({ id: 'notice-pin' }) },
+      });
+      expect(
+        h.ledger.listEvents({ limit: 100 }).filter((event) => event.kind === 'job.obligation-claimed'),
+      ).toHaveLength(0);
+      expect(h.ledger.listObligations({ jobId: 'job-mech' }).every((row) => row.claim === null)).toBe(true);
+      expect(report.ok).toBe(true); // the pass completed without touching mechanical debt
+    } finally {
+      h.cleanup();
+    }
+  });
+  it('only the EXACT canonical fingerprint retires a failed run; embedded or suffixed markers do not', async () => {
+    const h = makeLedger();
+    try {
+      h.ledger.addJob({ id: 'job-exact', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('job-exact', 'working');
+      h.ledger.appendCustomEvent({
+        kind: 'verification.completed',
+        jobId: 'job-exact',
+        payload: { ok: false, scope: 'full', run_id: 'run-9', exit_code: 1 },
+      });
+      for (const fingerprint of [
+        'lint:verification-failure:full@run-9',
+        'verification-failure:full@run-9@extra',
+        'verification-failure:full@run-90',
+      ]) {
+        h.ledger.appendCustomEvent({
+          kind: 'silas.directive-sent',
+          jobId: 'job-exact',
+          payload: { request_id: `req-${fingerprint}`, blocker_fingerprint: fingerprint },
+        });
+      }
+      const embedded = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(embedded.verificationFailures.map((row) => row.scope)).toEqual(['full']);
+
+      h.ledger.appendCustomEvent({
+        kind: 'silas.directive-sent',
+        jobId: 'job-exact',
+        payload: { request_id: 'req-exact', blocker_fingerprint: 'verification-failure:full@run-9' },
+      });
+      const exact = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(exact.verificationFailures).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+  it('a same-head but different-scope submission does not retire a failure or wait', async () => {
+    const h = makeLedger();
+    try {
+      h.ledger.addJob({ id: 'job-samehead', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('job-samehead', 'working');
+      h.ledger.appendCustomEvent({
+        kind: 'verification.completed',
+        jobId: 'job-samehead',
+        payload: { ok: false, scope: 'full', run_id: 'run-full', sha: 'head-h', exit_code: 1 },
+      });
+      h.ledger.appendCustomEvent({
+        kind: 'verification.lock-timeout',
+        jobId: 'job-samehead',
+        payload: { scope: 'focused', request_id: 'req-focused', head: 'head-h', wait_ms: 1_000 },
+      });
+      // A focused request at the SAME head is another operation, not a
+      // full retry or an answer to the focused wait.
+      h.ledger.appendCustomEvent({
+        kind: 'verification.requested',
+        jobId: 'job-samehead',
+        payload: { scope: 'focused', request_id: 'req-focused-2', head: 'head-h' },
+      });
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(digest.verificationFailures.map((row) => row.scope)).toEqual(['full']);
+      // The focused wait IS retired by the focused request (same scope+head).
+      expect(digest.verificationWaits).toEqual([]);
+
+      // A full-scope request at the same head retires the full failure.
+      h.ledger.appendCustomEvent({
+        kind: 'verification.requested',
+        jobId: 'job-samehead',
+        payload: { scope: 'full', request_id: 'req-full-2', head: 'head-h' },
+      });
+      const retried = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(retried.verificationFailures).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+  it('records pass-attributed progress only when the pass actually advanced work', async () => {
+    const h = makeDriver({
+      onDeterministicPass: (context) => ({ ok: true, advanced: context.trigger === 'sweep' ? 1 : 0 }),
+    });
+    try {
+      addJobWithDelivery(h.ledger, 'job-advanced');
+      await h.driver.trigger({ kind: 'sweep' });
+      const marks = h.ledger.listEvents({ limit: 100 }).filter((event) => event.kind === 'silas.reconcile-advanced');
+      expect(marks).toHaveLength(1);
+      expect(marks[0]?.payload).toMatchObject({ trigger: 'sweep', advanced: 1 });
+      await h.driver.trigger({ kind: 'job.delivered', jobId: 'job-advanced' });
+      expect(h.ledger.listEvents({ limit: 100 }).filter((event) => event.kind === 'silas.reconcile-advanced')).toHaveLength(1);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('attachments and pre-existing attempts starting do NOT answer a headless verification debt', async () => {
+    const h = makeLedger();
+    try {
+      h.ledger.addJob({ id: 'job-started', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('job-started', 'working');
+      h.ledger.appendCustomEvent({
+        kind: 'verification.completed',
+        jobId: 'job-started',
+        payload: { ok: false, scope: 'full', run_id: 'run-s', exit_code: 1 },
+      });
+      h.ledger.appendCustomEvent({
+        kind: 'verification.lock-timeout',
+        jobId: 'job-started',
+        payload: { scope: 'full', request_id: 'req-s', wait_ms: 1_000 },
+      });
+      for (const kind of ['verification.started', 'verification.attached']) {
+        h.ledger.appendCustomEvent({ kind, jobId: 'job-started', payload: { scope: 'full', run_id: 'run-old' } });
+      }
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(digest.verificationFailures.map((row) => row.scope)).toEqual(['full']);
+      expect(digest.verificationWaits.map((row) => row.requestId)).toEqual(['req-s']);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a same-head completion in another scope does not answer a wait; the matching completion does', async () => {
+    const h = makeLedger();
+    try {
+      h.ledger.addJob({ id: 'job-wait-scope', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('job-wait-scope', 'working');
+      h.ledger.appendCustomEvent({
+        kind: 'verification.lock-timeout',
+        jobId: 'job-wait-scope',
+        payload: { scope: 'full', request_id: 'req-full-wait', head: 'head-w', wait_ms: 1_000 },
+      });
+      h.ledger.appendCustomEvent({
+        kind: 'verification.completed',
+        jobId: 'job-wait-scope',
+        payload: { ok: true, scope: 'focused', run_id: 'run-f', sha: 'head-w' },
+      });
+      const otherScope = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(otherScope.verificationWaits.map((row) => row.requestId)).toEqual(['req-full-wait']);
+
+      h.ledger.appendCustomEvent({
+        kind: 'verification.completed',
+        jobId: 'job-wait-scope',
+        payload: { ok: true, scope: 'full', run_id: 'run-ok', sha: 'head-w' },
+      });
+      const answered = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(answered.verificationWaits).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a scoped request never retires a scope-less (legacy) verification debt', async () => {
+    const h = makeLedger();
+    try {
+      h.ledger.addJob({ id: 'job-scopeless', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('job-scopeless', 'working');
+      h.ledger.appendCustomEvent({
+        kind: 'verification.completed',
+        jobId: 'job-scopeless',
+        payload: { ok: false, run_id: 'run-noscope', exit_code: 1 },
+      });
+      h.ledger.appendCustomEvent({
+        kind: 'verification.requested',
+        jobId: 'job-scopeless',
+        payload: { scope: 'full', request_id: 'req-other-scope' },
+      });
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(digest.verificationFailures).toHaveLength(1);
     } finally {
       h.cleanup();
     }

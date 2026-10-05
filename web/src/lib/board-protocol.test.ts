@@ -157,7 +157,18 @@ describe('board server-frame validator', () => {
         checkedAt: '2026-01-01T00:00:00.000Z',
         checkError: null,
       },
-      silas: { lastWakeAt: null, reconciliationsToday: 2, checkedAt: '2026-01-01T00:00:00.000Z' },
+      silas: {
+        lastWakeAt: null,
+        lastTickAt: null,
+        lastReconcileAt: null,
+        lastReconcileFailedAt: null,
+        reconcileFailedNewer: false,
+        lastUsefulActionAt: null,
+        nextAction: null,
+        openTurnSince: null,
+        reconciliationsToday: 2,
+        checkedAt: '2026-01-01T00:00:00.000Z',
+      },
       verify: { lockInUse: true, activeRuns: 1, queuedRuns: 0, workerBudget: 8, workersPerRun: 4 },
       selfHeal: { sessionsResumed: 1, sessionsOrphaned: 0, since: null },
     } as unknown;
@@ -167,6 +178,9 @@ describe('board server-frame validator', () => {
     for (const [field, broken] of [
       ['build', { ...(wired as { build: object }).build, commitsBehind: '43' }],
       ['silas', { ...(wired as { silas: object }).silas, reconciliationsToday: -1 }],
+      ['silas', { ...(wired as { silas: object }).silas, reconcileFailedNewer: 'no' }],
+      ['silas', { ...(wired as { silas: object }).silas, reconcileFailedNewer: undefined }],
+      ['silas', { ...(wired as { silas: object }).silas, nextAction: 7 }],
       ['verify', { ...(wired as { verify: object }).verify, lockInUse: 'yes' }],
       ['selfHeal', { ...(wired as { selfHeal: object }).selfHeal, sessionsResumed: 1.5 }],
     ] as const) {

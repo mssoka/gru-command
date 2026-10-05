@@ -1,6 +1,7 @@
 import { spawnSync } from 'node:child_process';
-import type { EventRecord, JobRecord, PendingRebriefRecord } from '../ledger/api.js';
+import type { DirectiveRequestRecord, EventRecord, JobRecord, PendingRebriefRecord } from '../ledger/api.js';
 import { isJobTerminal, type JobStatus } from '../ledger/states.js';
+import { LIVE_DIRECTIVE_STATES, type DirectiveState } from '../ledger/directives.js';
 import type { WorktreeLane } from './worktree-port.js';
 
 /**
@@ -116,6 +117,15 @@ export interface BranchIdleLedger {
   /** Durable re-brief markers; any row for a job is an unresolved
    * target-owned request (presence is the fact — see laneIsBusy). */
   listPendingRebriefs(opts?: { readonly jobId?: string }): readonly PendingRebriefRecord[];
+  /** Accepted directive requests still owing completion (`dispatching` or
+   * `admitted`): they may already own the lane before admission lands. */
+  listPendingDirectives(opts?: {
+    readonly jobId?: string;
+    readonly states?: readonly DirectiveState[];
+  }): readonly DirectiveRequestRecord[];
+  /** True while any verification run for the job is unsettled: it owns the
+   * checkout and no review may freeze the same head. */
+  hasUnsettledVerificationRun(jobId: string): boolean;
 }
 
 /** The branch a job lane is created on (worktree manager convention; also
@@ -217,6 +227,20 @@ export function openAttemptStartSeq(ledger: BranchIdleLedger, jobId: string): nu
   return 0;
 }
 
+/** Newest explicit repair start that need not flip status: an admitted
+ * directive turn (`silas.directive-sent`) or a claimed provider
+ * continuation (`provider.recovery-claimed`). The digest's stalled-phase
+ * detector reads the same events; review admission must not arm on a head
+ * whose repair is still open (issue #162). */
+function latestRepairStartSeq(ledger: Pick<BranchIdleLedger, 'latestJobEvent'>, jobId: string): number {
+  let newest = 0;
+  for (const kind of ['silas.directive-sent', 'provider.recovery-claimed']) {
+    const event = ledger.latestJobEvent(jobId, kind);
+    if (event !== null && event.seq > newest) newest = event.seq;
+  }
+  return newest;
+}
+
 /** The busy predicate: the attempt is open and has not delivered yet, or a
  * newer re-brief request is still unresolved. */
 export function laneIsBusy(ledger: BranchIdleLedger, job: JobRecord): boolean {
@@ -228,8 +252,19 @@ export function laneIsBusy(ledger: BranchIdleLedger, job: JobRecord): boolean {
   // presence-based — a late delivery event from the previous worker cannot
   // answer a newer request, so it must not release this fence.
   if (ledger.listPendingRebriefs({ jobId: job.id }).length > 0) return true;
-  if (!BRANCH_BUSY_STATUSES.includes(job.status)) return false;
+  // An accepted directive request may already be prompting a writer before
+  // its admission event lands: review must not arm on that head (issue #162).
+  if (ledger.listPendingDirectives({ jobId: job.id, states: LIVE_DIRECTIVE_STATES }).length > 0) return true;
+  // A verification run owns the checkout for its whole life; a review must
+  // not freeze the head it is verifying.
+  if (ledger.hasUnsettledVerificationRun(job.id)) return true;
   const delivered = ledger.latestJobEvent(job.id, 'job.delivered');
+  // A repair admitted after the delivery keeps the lane busy even when no
+  // status hop recorded it, and even while the stale status still reads
+  // `delivered` (a claimed provider continuation) — fallback and recovery
+  // flows do not always flip the row.
+  if (delivered !== null && delivered.seq <= latestRepairStartSeq(ledger, job.id)) return true;
+  if (!BRANCH_BUSY_STATUSES.includes(job.status)) return false;
   if (delivered === null) return true;
   return delivered.seq <= openAttemptStartSeq(ledger, job.id);
 }

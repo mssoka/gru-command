@@ -187,9 +187,18 @@ export interface BuildView {
   readonly checkError: string | null;
 }
 
-/** Silas ops health (board UX v4), derived from the durable event stream. */
+/** Silas ops health (board UX v4, issue #163), derived from the durable
+ * event stream. `lastWakeAt` is the wake START marker; `lastReconcileAt`
+ * only advances on a successfully completed deterministic pass. */
 export interface SilasView {
   readonly lastWakeAt: string | null;
+  readonly lastTickAt: string | null;
+  readonly lastReconcileAt: string | null;
+  readonly lastReconcileFailedAt: string | null;
+  readonly reconcileFailedNewer: boolean;
+  readonly lastUsefulActionAt: string | null;
+  readonly nextAction: string | null;
+  readonly openTurnSince: string | null;
   readonly reconciliationsToday: number;
   readonly checkedAt: string;
 }
@@ -510,6 +519,13 @@ function isSilasView(value: unknown): value is SilasView {
   return (
     isRecord(value) &&
     (value.lastWakeAt === null || typeof value.lastWakeAt === 'string') &&
+    (value.lastTickAt === null || typeof value.lastTickAt === 'string') &&
+    (value.lastReconcileAt === null || typeof value.lastReconcileAt === 'string') &&
+    (value.lastReconcileFailedAt === null || typeof value.lastReconcileFailedAt === 'string') &&
+    typeof value.reconcileFailedNewer === 'boolean' &&
+    (value.lastUsefulActionAt === null || typeof value.lastUsefulActionAt === 'string') &&
+    (value.nextAction === null || typeof value.nextAction === 'string') &&
+    (value.openTurnSince === null || typeof value.openTurnSince === 'string') &&
     typeof value.reconciliationsToday === 'number' &&
     Number.isSafeInteger(value.reconciliationsToday) &&
     value.reconciliationsToday >= 0 &&

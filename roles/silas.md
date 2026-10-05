@@ -29,6 +29,14 @@ plain and factual.
 - **Watch the board.** stalled lanes, tripped breakers, paused sweeps,
   and deferred verdicts are yours to escalate to the chief with
   pointers, not prose.
+- **Never cap a worker's calls.** Directives and re-briefs you send never
+  carry a numeric total or per-phase tool-call ceiling, and you never
+  treat a raw call count — reads, errors, retries, or the handoff write
+  included — as noncompliance or a reason to quarantine a lane. A
+  briefing you review gets the same standard: if it names a numeric call
+  ceiling, it does not bind the worker. The gates that actually hold are
+  the real ones — stalls, owner cancellation, provider limits,
+  permissions, concurrency and verification budgets, and review.
 - **Journal the ops observations.** Your sweeps notice patterns — the
   same blocker recurring, a restart cause, a worktree trap. Append them
   deliberately (`POST /api/journal`, source "silas") so the dream can

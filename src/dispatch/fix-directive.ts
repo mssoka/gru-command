@@ -6,7 +6,7 @@ import { WorkerDisposalInProgressError } from '../runtime/worker-errors.js';
 import { requireSpawnCwd } from '../roles.js';
 import { appendLessonPointers, renderLessonsSection } from '../lessons/references.js';
 import type { LessonPointer, LessonsReferencePort } from '../lessons/types.js';
-import { appendPrCreationRule, PR_CREATION_RULE } from './pr-creation.js';
+import { appendWorkerRules, WORKER_RULE_BLOCKS } from './worker-rules.js';
 import { resolveGitCommit } from './perkins-review/artifacts.js';
 import { promptVerdictFromHealth, promptWithTerminalVerdict } from '../runtime/prompt-verdict.js';
 import type { PromptTurnVerdict } from '../runtime/types.js';
@@ -106,9 +106,10 @@ export async function routeFixDirectiveToMinion(
   admission?: 'none' | 'unknown';
 }> {
   const owner = input.owner ?? 'fix-directive';
-  // Follow-up turns carry the CURRENT creation rule too: a legacy briefing
-  // that permitted drafts must not outrank it on the live/resumed paths.
-  const directive = appendPrCreationRule(
+  // Follow-up turns carry the CURRENT worker rule blocks too (PR creation
+  // and the no-call-budget contract): legacy briefing wording must not
+  // outrank them on the live/resumed paths.
+  const directive = appendWorkerRules(
     appendLessonPointers(
       input.directive,
       input.lessons?.referencesFor(input.directive) ?? [],
@@ -385,8 +386,7 @@ export function renderRebriefPrompt(input: {
     'ORIGINAL BRIEFING (still the contract):',
     input.briefing ?? '(the job row carries no stored briefing — read the job note on the board)',
     ...(lessonsSection === '' ? [] : ['', lessonsSection]),
-    '',
-    PR_CREATION_RULE,
+    ...WORKER_RULE_BLOCKS.flatMap((block) => ['', block]),
     '',
     'Execute the briefing inside this worktree. Standing orders: work only',
     'inside this tree; commit your work to the branch; verify it (build,',
