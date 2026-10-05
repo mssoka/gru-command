@@ -87,6 +87,11 @@ export function renderMinionBriefing(input: {
   lessons?: readonly LessonPointer[];
   /** Issue #161: this parent has GC-mediated child-worker tools wired. */
   childWorkerTools?: boolean;
+  /** The job's deliverable kind (E18). Non-PR kinds get their own closing
+   *  orders: a review job's deliverable is its findings — it commits
+   *  nothing, and an unmodified tree is the expected result; artifact and
+   *  investigation jobs hand back their artifacts without opening a PR. */
+  deliverable?: JobDeliverable;
 }): string {
   const lessonsSection = renderLessonsSection(input.lessons ?? []);
   return [
@@ -112,10 +117,27 @@ export function renderMinionBriefing(input: {
           '',
         ]
       : []),
-    'Execute the briefing inside this worktree. Standing orders: work only',
-    'inside this tree; commit your work to the branch; verify it (build,',
-    'tests, lint — whatever this project calls green) before finishing;',
-    'never merge your own pull request. End with a completion report.',
+    ...(input.deliverable === 'review'
+      ? [
+          'Execute the briefing inside this worktree. Standing orders: work only',
+          'inside this tree; this brief is READ-ONLY — change nothing, commit',
+          'nothing (an unmodified tree is the expected result); read the named',
+          'immutable head and diff via git show/git diff inside your tree; never',
+          'merge; end with your findings and a completion report.',
+        ]
+      : input.deliverable === 'artifact' || input.deliverable === 'investigation'
+        ? [
+            'Execute the briefing inside this worktree. Standing orders: work only',
+            'inside this tree; commit your work to the branch; verify it; hand back',
+            'the named artifact and end with a completion report; do not open a',
+            'pull request — this job owes an artifact handback, not a PR.',
+          ]
+        : [
+            'Execute the briefing inside this worktree. Standing orders: work only',
+            'inside this tree; commit your work to the branch; verify it (build,',
+            'tests, lint — whatever this project calls green) before finishing;',
+            'never merge your own pull request. End with a completion report.',
+          ]),
   ].join('\n');
 }
 
@@ -430,6 +452,7 @@ export class DispatchService {
         worktreePath: worktree.path,
         sha: worktree.sha,
         briefing: input.briefing,
+        ...(input.deliverable !== undefined ? { deliverable: input.deliverable } : {}),
         agentId: handle.id,
         ...(this.opts.parentTools !== undefined && this.opts.parentTools(handle.id).length > 0
           ? { childWorkerTools: true }

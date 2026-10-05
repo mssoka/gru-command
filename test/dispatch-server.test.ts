@@ -343,6 +343,18 @@ describe('dispatch server (E8)', () => {
       );
       expect(ok.status).toBe(202);
       expect(h.ledger.getJob('http-review-job')?.deliverable).toBe('review');
+      // The other non-PR kinds admit through HTTP too.
+      for (const kind of ['artifact', 'investigation'] as const) {
+        const nonPr = await call(
+          h.port,
+          'POST',
+          '/api/dispatch',
+          { job_id: `http-${kind}-job`, repo_path: repo.path, title: kind, briefing: 'handback job', deliverable: kind },
+          TOKEN,
+        );
+        expect(nonPr.status).toBe(202);
+        expect(h.ledger.getJob(`http-${kind}-job`)?.deliverable).toBe(kind);
+      }
       // Present-but-invalid values fail loud before any job exists; an
       // unknown string, a null, a number, and a blank are all rejected.
       for (const [id, value] of [['http-bogus', 'merge'], ['http-null', null], ['http-number', 3], ['http-blank', ' ']] as const) {

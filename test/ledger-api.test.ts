@@ -17,6 +17,28 @@ function tmpDir(): string {
   return dir;
 }
 
+describe('job deliverable kind (E18 durable-write guard)', () => {
+  it('refuses an unknown deliverable at addJob — direct callers share the boundary', () => {
+    // Self-cleaning (never cleanupDirs: the shared registry's index 0 is
+    // the main describe's beforeAll dir).
+    const dir = mkdtempSync(join(tmpdir(), 'gru-ledger-deliverable-'));
+    const db = new LedgerDb(dir);
+    const api = new LedgerApi(db.handle);
+    try {
+      expect(() => api.addJob({
+        id: 'bad-kind', repo: 'r', title: 't', briefing: 'b',
+        deliverable: 'merge' as never,
+      })).toThrow(/unknown job deliverable/);
+      expect(db.handle.prepare('SELECT COUNT(*) AS n FROM jobs WHERE id = ?').get('bad-kind')).toEqual({ n: 0 });
+      expect(api.addJob({ id: 'ok-kind', repo: 'r', title: 't', briefing: 'b', deliverable: 'review' }).deliverable).toBe('review');
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+
 describe('ledger api — the record of state', () => {
   let api: LedgerApi;
   let bus: EventBus;
