@@ -386,6 +386,36 @@ perkins-stage1-baseline = 'root="$PWD"; prep=_bmad-output/gate-prep/perkins-reli
 # unchanged budgets, exit codes never masked.
 verification-single-flight = "npx vitest run test/verification-scheduler.test.ts test/verification-capture.test.ts test/verification-evidence.test.ts test/silas-driver.test.ts && npx vitest run --config vitest.heavy.config.ts test/verification-server.test.ts && npx vitest run test/suite-shape.test.ts"
 
+# Board PR-number link labels (owner approval j-982): the new pure URL
+# helper plus the board-row label/disclosure DOM contract, via the existing
+# installed Vitest CLI under the existing web config/budgets (no
+# worker/timeout flags, never the npm chain), approved RPC patch first.
+board-pr-number-links = "node tools/patch-vitest-rpc-timeout.mjs && cd web && ../node_modules/.bin/vitest run src/lib/pr-link.test.ts src/ui/board.test.ts"
+
+# Fails-before evidence (j-982 acceptance E): the IDENTICAL final board DOM
+# tests overlaid on the pinned lane base (old generic-label board.ts) with
+# dependencies linked by symlink — no download/install, no branch mutation.
+# The baseline lacks the label change, so assertion RED is EXPECTED
+# (compilation/import/setup failure would not be RED evidence). The archive
+# step writes an explicit file so a bad base sha aborts loudly instead of
+# masking behind a tar pipe; the Vitest exit is left intact, never masked;
+# the ignored pointer file records the snapshot, preserved for inspection.
+board-pr-number-links-baseline = 'set -e; base=5d56194a905262231bb0d183292b6d08cbd70810; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-board-pr-number-links.XXXXXX"); git archive "$base" -o "$d/base.tar"; tar -xf "$d/base.tar" -C "$d"; rm -f "$d/base.tar"; git show "$headrev":web/src/ui/board.test.ts > "$d/web/src/ui/board.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; ln -s "$root/web/node_modules" "$d/web/node_modules"; printf "board-pr-number-links-baseline base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/board-pr-number-links-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs && cd web && ../node_modules/.bin/vitest run src/ui/board.test.ts'
+
+# Browser evidence (j-982 acceptance C/D): typecheck + production web build
+# + the board surface of the existing mock Playwright project (the board
+# describe only). The UNFILTERED mock project carries four PRE-EXISTING
+# failures on this machine in untouched chat/theme/working-flavor tests
+# (ledger: crew-captures-fast 2026-10-02T22:32, working-flavor-browser
+# 2026-10-02T11:53, and board-pr-number-links-browser 2026-10-03T13:20 ran
+# at head 8a44e7d8 — all outside this diff and not repaired here). Keeping
+# the gate on the changed board surface follows the established
+# board-section-truth board-browser pattern. The scope writes the private
+# light/dark desktop/phone row captures under
+# _bmad-output/board-pr-number-links/captures/ (gitignored, retained in the
+# lane).
+board-pr-number-links-browser = "node tools/patch-vitest-rpc-timeout.mjs && cd web && node ../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json && node node_modules/vite/bin/vite.js build && node ../node_modules/@playwright/test/cli.js test --project=mock --grep 'board \\(E6, mock feed\\)'"
+
 # Working-flavor browser proof (job gru-working-flavor-200, 2026-10-03):
 # typecheck + production web build + the existing mock Playwright spec ONLY
 # (the changed surface; it sweeps the imported full pool at desktop, tablet

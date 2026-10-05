@@ -53,6 +53,7 @@ import {
 import { railChips, type RailChip } from '../lib/board-rail.js';
 import { BOARD_WORDS, heistCount } from '../lib/board-vocabulary.js';
 import { formatAge } from '../lib/board-time.js';
+import { prLinkLabel } from '../lib/pr-link.js';
 import {
   jobSignal,
   pluralCount,
@@ -706,7 +707,9 @@ export class BoardView {
       meta.append(el('span', 'board-job__branch', `⌂ ${job.baseBranch}`));
     }
     if (job.prUrl !== null) {
-      const link = el('a', 'board-job__pr', 'PR ↗');
+      // Owner approval j-982: show the canonical request number when the
+      // URL carries one; an unprovable URL keeps the generic label.
+      const link = el('a', 'board-job__pr', prLinkLabel(job.prUrl));
       link.href = job.prUrl;
       link.target = '_blank';
       link.rel = 'noreferrer';
