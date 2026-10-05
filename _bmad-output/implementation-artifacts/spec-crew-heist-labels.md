@@ -326,7 +326,7 @@ the run's image-capable read tool):
   CI run can exist at any head until the conflict clears (the missing
   CI at `d194a08` was this, not a dropped event; close/reopen did not
   and cannot fix it).
-- **Fresh independent review (4 layers, herdr panes, `pi
+- **Fresh independent review (4 isolated terminal panes, `pi
   openai-codex/gpt-6-sol`, cwd = lane, diff `b900837...d194a08`):**
   blind-hunter 10 findings, edge-case-hunter 7, verification-gap 2,
   acceptance-auditor 1. Raw findings + session transcripts preserved
