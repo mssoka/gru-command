@@ -483,6 +483,34 @@ describe('dispatch server (E8)', () => {
         job_id: 'http-parent-impl', title: 'x', escalation_id: 'no-such-attempt', by: 'silas',
       }, TOKEN);
       expect(bogusAttempt.status).toBe(400);
+      // (round-6 finding 4) Idempotent by attempt identity: a repeated
+      // correlated re-post REPLAYS the recorded outcome — no second
+      // notice is created.
+      const noticesBefore = h.ledger.listNotifications().length;
+      const replay = await call(h.port, 'POST', '/api/silas/escalate', {
+        job_id: 'http-parent-impl', title: 'anything', escalation_id: 'http-parent-impl:run1:1', by: 'silas',
+      }, TOKEN);
+      expect(replay.status).toBe(200);
+      expect(field<boolean>(replay.json, 'replay')).toBe(true);
+      expect(h.ledger.listNotifications().length).toBe(noticesBefore);
+      // (round-6 finding 10) Malformed PRESENT escalation_id values are
+      // refused before any notice exists.
+      for (const [suffix, value] of [['null', null], ['number', 3], ['blank', ' ']] as const) {
+        const malformed = await call(h.port, 'POST', '/api/silas/escalate', {
+          job_id: 'http-parent-impl', title: 'x', escalation_id: value, by: 'silas',
+        }, TOKEN);
+        expect(malformed.status).toBe(400);
+      }
+      // (round-6 finding 11) A parent without recorded handoff PATH
+      // evidence is refused — repository identity cannot be verified.
+      h.ledger.addJob({ id: 'http-parent-nohandoff', repo: repoBasename, title: 'legacy', briefing: 'b' });
+      h.ledger.setJobStatus('http-parent-nohandoff', 'working');
+      const noHandoff = await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'http-child-nohandoff', repo_path: repo.path, title: 'review', briefing: 'b',
+        deliverable: 'review', parent_job_id: 'http-parent-nohandoff',
+      }, TOKEN);
+      expect(noHandoff.status).toBe(400);
+      expect(h.ledger.getJob('http-child-nohandoff')).toBeNull();
       // Malformed PRESENT parent values must fail loud (round-4 finding
       // 12): null/number/blank/object can never be treated as absent.
       for (const [suffix, value] of [['null', null], ['number', 7], ['blank', '  '], ['object', { id: 'http-parent-impl' }]] as const) {

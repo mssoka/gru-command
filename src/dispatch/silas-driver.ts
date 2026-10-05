@@ -140,6 +140,7 @@ export function adviseFollowThrough(
 /** Ledger surface the digest reads (the real LedgerApi satisfies it). */
 export interface DigestLedger {
   listJobs(): readonly JobRecord[];
+  listEventsAfter(seq: number, opts?: { limit?: number; order?: 'asc' | 'desc'; kinds?: readonly string[] }): readonly EventRecord[];
   getJob(id: string): JobRecord | null;
   listRounds(jobId: string): readonly RoundRecord[];
   listJobEvents(jobId: string, opts?: { limit?: number }): readonly EventRecord[];
@@ -179,6 +180,44 @@ export interface DigestLedger {
   hasUnsettledVerificationRun(jobId: string): boolean;
   listProviderWaits?(opts?: { status?: string }): readonly unknown[];
   listPendingProviderRecoveries?(): readonly unknown[];
+}
+
+/** (round-6 findings 7+12) The parent follow-up that retires a reviewer
+ *  re-arm: an accepted directive/re-brief/recovery that started AFTER the
+ *  reviewer delivered and completed before the parent's later delivery,
+ *  BOUND to that reviewer by its recorded correlation (identity, not mere
+ *  temporal order — an unrelated repair never retires an uncollected
+ *  review, and one follow-up never retires two reviewers). The scan pages
+ *  the full stream between the two seqs: no newest-event window can lose
+ *  the evidence. */
+function correlatedFollowUpBetween(
+  ledger: DigestLedger,
+  parentId: string,
+  afterSeq: number,
+  beforeSeq: number,
+  reviewerJobId: string,
+  reviewerIsNewestForParent: boolean,
+): boolean {
+  const kinds = ['silas.directive-sent', 'silas.rebrief', 'provider.recovery-claimed'];
+  let cursor = afterSeq;
+  for (;;) {
+    const page = ledger.listEventsAfter(cursor, { kinds, limit: 500, order: 'asc' });
+    for (const event of page) {
+      if (event.seq >= beforeSeq) return false;
+      if (event.jobId !== parentId) continue;
+      const payload = event.payload as { correlates_reviewer?: unknown };
+      if (payload.correlates_reviewer === reviewerJobId) return true;
+      // A fresh-worker re-brief (or a claimed recovery) accepted after the
+      // reviewer delivered is accepted as collection for the parent's
+      // NEWEST delivered reviewer only — it cannot silently retire an
+      // older, still-uncollected commission.
+      if ((event.kind === 'silas.rebrief' || event.kind === 'provider.recovery-claimed') && reviewerIsNewestForParent) {
+        return true;
+      }
+    }
+    if (page.length < 500) return false;
+    cursor = page[page.length - 1]!.seq;
+  }
 }
 
 /** Blockers of one round, with an explicit loud note instead of a silent
@@ -435,8 +474,18 @@ function latestReviewRequest(ledger: DigestLedger, jobId: string): EventRecord |
   const candidates: EventRecord[] = [];
   const trigger = ledger.latestJobEvent(jobId, 'silas.review-triggered');
   if (trigger !== null) candidates.push(trigger);
-  const fallback = ledger.latestJobEvent(jobId, 'job.fallback-review');
-  if (fallback !== null && fallbackPhaseOf(fallback) !== 'unavailable') candidates.push(fallback);
+  // (round-6 finding 8) An escalation OUTCOME (e.g. an ops re-post of an
+  // old attempt) is follow-through evidence, never a new review request:
+  // counting it would suppress prWithoutReview for an unreviewed head.
+  // Walk newest-first past outcome rows to the newest request-shaped row.
+  for (const event of [...ledger.listJobEvents(jobId, { limit: 100 })].reverse()) {
+    if (event.kind !== 'job.fallback-review') continue;
+    const phase = fallbackPhaseOf(event);
+    if (phase === 'escalation') continue;
+    if (phase === 'unavailable') break;
+    candidates.push(event);
+    break;
+  }
   return candidates.sort((a, b) => b.seq - a.seq)[0] ?? null;
 }
 
@@ -759,6 +808,16 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
   // The review-eligibility rows below never offer such a target on an OLDER
   // delivery — the worker may push a new head at any moment.
   const pendingRebriefJobIds = new Set(input.ledger.listPendingRebriefs().map((marker) => marker.jobId));
+  // (round-6 finding 7) The parent's NEWEST delivered reviewer: unbound
+  // follow-ups (re-brief/recovery) may retire only that one.
+  const newestReviewerSeqByParent = new Map<string, number>();
+  for (const job of input.ledger.listJobs()) {
+    if (job.deliverable !== 'review' || job.parentJobId === null) continue;
+    const delivery = input.ledger.latestJobEvent(job.id, 'job.delivered');
+    if (delivery === null) continue;
+    const current = newestReviewerSeqByParent.get(job.parentJobId) ?? -1;
+    if (delivery.seq > current) newestReviewerSeqByParent.set(job.parentJobId, delivery.seq);
+  }
   // Phase identity per job, for the publish-boundary rechecks: a phase that
   // opened during a later job's blocker-history await invalidates any row
   // computed against the previous phase.
@@ -868,12 +927,24 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       // would let an unrelated repair retire an uncollected review.
       const parentDelivered = parent !== null ? input.ledger.latestJobEvent(parent.id, 'job.delivered') : null;
       const parentActedOnThis = parent !== null && parentDelivered !== null && parentDelivered.seq > delivered.seq &&
-        input.ledger.listJobEvents(parent.id, { limit: 200 }).some((event) =>
-          (event.kind === 'silas.directive-sent' || event.kind === 'silas.rebrief' || event.kind === 'provider.recovery-claimed') &&
-          event.seq > delivered.seq && event.seq < parentDelivered.seq);
+        correlatedFollowUpBetween(
+          input.ledger, parent.id, delivered.seq, parentDelivered.seq, job.id,
+          delivered.seq === (newestReviewerSeqByParent.get(parent.id) ?? -1),
+        );
+      // (round-6 finding 9) A parent turn that is ACTIVE right now owns
+      // its own follow-through: while the parent's worker has activity
+      // newer than the reviewer's delivery, the row stays suppressed
+      // instead of commissioning a competing follow-up.
+      const parentActiveTurn = parent !== null && (() => {
+        const agent = input.ledger
+          .listAgents()
+          .filter((candidate) => candidate.jobId === parent.id && candidate.role === 'minion' && candidate.parentage !== 'child')
+          .sort((a, b) => (b.lastActivity ?? b.createdAt).localeCompare(a.lastActivity ?? a.createdAt))[0];
+        return agent !== undefined && agent.lastActivity !== null && agent.lastActivity > delivered.ts;
+      })();
       if (
         parent !== null && parent.status !== 'merged' && parent.status !== 'done' &&
-        !parentActedOnThis && !parentFollowUpInFlight
+        !parentActedOnThis && !parentFollowUpInFlight && !parentActiveTurn
       ) {
         digest.reviewerDelivered.push({
           jobId: job.id,
@@ -1284,10 +1355,14 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       const reviewerDelivered = input.ledger.latestJobEvent(reviewer.id, 'job.delivered');
       const parentDelivered = input.ledger.latestJobEvent(parent.id, 'job.delivered');
       if (reviewerDelivered === null) return false;
+      const agent = input.ledger
+        .listAgents()
+        .filter((candidate) => candidate.jobId === parent.id && candidate.role === 'minion' && candidate.parentage !== 'child')
+        .sort((a, b) => (b.lastActivity ?? b.createdAt).localeCompare(a.lastActivity ?? a.createdAt))[0];
+      if (agent !== undefined && agent.lastActivity !== null && agent.lastActivity > reviewerDelivered.ts) return false;
       if (parentDelivered === null || parentDelivered.seq < reviewerDelivered.seq) return true;
-      return !input.ledger.listJobEvents(parent.id, { limit: 200 }).some((event) =>
-        (event.kind === 'silas.directive-sent' || event.kind === 'silas.rebrief' || event.kind === 'provider.recovery-claimed') &&
-        event.seq > reviewerDelivered.seq && event.seq < parentDelivered.seq);
+      const isNewest = reviewerDelivered.seq >= (newestReviewerSeqByParent.get(parent.id) ?? -1);
+      return !correlatedFollowUpBetween(input.ledger, parent.id, reviewerDelivered.seq, parentDelivered.seq, reviewer.id, isNewest);
     }),
     stalledWorking: digest.stalledWorking.filter((row) => {
       const phaseSeq = phaseSeqByJob.get(row.jobId);

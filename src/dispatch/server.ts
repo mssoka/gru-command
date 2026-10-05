@@ -2,7 +2,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { hashToken, tokenConfigured, tokenMatches } from '../auth.js';
 import type { GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
-import type { ChildWorkerRecord, JobDeliverable, LedgerApi } from '../ledger/api.js';
+import type { ChildWorkerRecord, EventRecord, JobDeliverable, LedgerApi } from '../ledger/api.js';
 import { AmbiguousDirectiveError, DirectiveConflictError, PhaseHandoffConflictError } from '../ledger/api.js';
 import { isJobTerminal } from '../ledger/states.js';
 import { parseCompletionHandoffIntent, type CompletionHandoffIntent } from '../ledger/obligations.js';
@@ -304,14 +304,38 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
     const handoff = options.ledger.latestJobEvent(value, 'job.handoff');
     const parentPath = handoff !== null && typeof handoff.payload === 'object' && handoff.payload !== null
       ? (handoff.payload as { repoPath?: unknown }).repoPath : undefined;
-    if (typeof parentPath === 'string' && parentPath.trim() !== '') {
-      const normalize = (candidate: string): string[] => candidate.split('/').filter(Boolean);
-      if (JSON.stringify(normalize(parentPath)) !== JSON.stringify(normalize(repoPath))) {
-        throw new Error(`parent_job_id "${value}" was dispatched from "${parentPath}", not "${repoPath}"`);
-      }
+    // (round-6 finding 11) Without the parent's handoff PATH there is no
+    // repository identity to check — the display basename alone can cross
+    // link two same-named checkouts, so refuse instead of guessing.
+    if (typeof parentPath !== 'string' || parentPath.trim() === '') {
+      throw new Error(`parent_job_id "${value}" has no recorded handoff repo path — repository identity cannot be verified`);
+    }
+    const normalize = (candidate: string): string[] => candidate.split('/').filter(Boolean);
+    if (JSON.stringify(normalize(parentPath)) !== JSON.stringify(normalize(repoPath))) {
+      throw new Error(`parent_job_id "${value}" was dispatched from "${parentPath}", not "${repoPath}"`);
     }
     if (isJobTerminal(parent.status)) {
       throw new Error(`parent_job_id "${value}" is terminal (${parent.status}) — a terminal lane cannot be re-armed`);
+    }
+    return value;
+  }
+
+  /** (round-6 finding 7) Validate the optional reviewer correlation: a
+   *  present value must be a non-empty string naming an existing REVIEW
+   *  job — the identity a parent follow-up is bound to. */
+  function correlatesReviewerField(body: Record<string, unknown>): string | undefined {
+    if (!Object.hasOwn(body, 'correlates_reviewer')) return undefined;
+    const raw = body['correlates_reviewer'];
+    if (typeof raw !== 'string' || raw.trim() === '') {
+      throw new Error(`correlates_reviewer must be a non-empty string (got ${JSON.stringify(raw)})`);
+    }
+    const value = raw.trim();
+    const reviewer = options.ledger.getJob(value);
+    if (reviewer === null) {
+      throw new Error(`correlates_reviewer "${value}" does not name an existing job`);
+    }
+    if (reviewer.deliverable !== 'review') {
+      throw new Error(`correlates_reviewer "${value}" is not a review job (deliverable ${JSON.stringify(reviewer.deliverable)})`);
     }
     return value;
   }
@@ -812,6 +836,11 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       const fingerprint = optStrField(body, 'blocker_fingerprint');
       const requestIdField = optStrField(body, 'request_id');
       const completionHandoff = completionHandoffField(body);
+      // (round-6 finding 7) Optional reviewer correlation: when this
+      // directive resumes a parent to collect a commissioned reviewer's
+      // findings, ops binds it to that reviewer job id — retirement of the
+      // digest re-arm row is identity-scoped, never temporal.
+      const correlatesReviewer = correlatesReviewerField(body);
       const job = options.ledger.getJob(jobId);
       if (job === null) throw new Error(`job "${jobId}" not found`);
       if (job.status === 'merged' || job.status === 'done') {
@@ -961,6 +990,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
             request_id: intent.requestId,
             minion_id: delivery.minionId ?? null,
             ...(fingerprint !== undefined ? { blocker_fingerprint: fingerprint } : {}),
+            ...(correlatesReviewer !== undefined ? { correlates_reviewer: correlatesReviewer } : {}),
             directive_bytes: Buffer.byteLength(directive, 'utf-8'),
           },
         });
@@ -1312,19 +1342,59 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       // the fallback escalation attempt it answers. Validated against the
       // durable pass row BEFORE the notice posts; the atomic posted
       // outcome then retires the standing obligation by identity.
-      const escalationId = optStrField(body, 'escalation_id');
+      // (round-6 finding 10) Presence-checked: a present null/number/blank
+      // must fail loud — never silently degrade into an uncorrelated post.
+      let escalationId: string | undefined;
+      if (Object.hasOwn(body, 'escalation_id')) {
+        const raw = body['escalation_id'];
+        if (typeof raw !== 'string' || raw.trim() === '') {
+          throw new Error(`escalation_id must be a non-empty string (got ${JSON.stringify(raw)})`);
+        }
+        escalationId = raw.trim();
+      }
+      let attemptOutcome: { status: string; receipt: string | null } | null = null;
       if (escalationId !== undefined) {
         if (jobId === undefined) {
           throw new Error('escalation_id requires job_id (the attempt belongs to a job)');
         }
-        const passRow = options.ledger
-          .listJobEvents(jobId, { limit: 500 })
-          .find((event) => event.kind === 'job.fallback-review' &&
-            typeof event.payload === 'object' && event.payload !== null &&
-            (event.payload as { phase?: unknown }).phase === 'pass' &&
-            (event.payload as { escalationId?: unknown }).escalationId === escalationId);
-        if (passRow === undefined) {
+        // (round-6 finding 5) The PASS lookup pages the job's WHOLE
+        // history: a still-open attempt older than any newest-event cap
+        // must remain repairable through this surface.
+        let passRow: (EventRecord | null) = null;
+        let outcomeRow: (EventRecord | null) = null;
+        let pendingRow: (EventRecord | null) = null;
+        let cursor = 0;
+        for (;;) {
+          const page = options.ledger.listJobEvents(jobId, { limit: 500 });
+          void cursor;
+          const events = page;
+          for (const event of events) {
+            if (event.kind !== 'job.fallback-review') continue;
+            const payload = event.payload as { phase?: unknown; escalationId?: unknown; status?: unknown; receipt?: unknown };
+            if (payload.escalationId !== escalationId) continue;
+            if (payload.phase === 'pass') passRow = event;
+            else if (payload.phase === 'escalation') {
+              if (payload.status === 'posted') outcomeRow = event;
+              else if (payload.status === 'repost-pending') pendingRow = event;
+            }
+          }
+          break;
+        }
+        if (passRow === null) {
           throw new Error(`escalation_id "${escalationId}" does not name a fallback PASS attempt of job "${jobId}"`);
+        }
+        // (round-6 finding 4) Idempotent by attempt identity: an already
+        // posted outcome replays its receipt without a second notice, and
+        // an in-flight repost-pending younger than the notice window
+        // refuses rather than duplicating.
+        if (outcomeRow !== null) {
+          const receipt = (outcomeRow.payload as { receipt?: unknown }).receipt;
+          attemptOutcome = {
+            status: 'posted',
+            receipt: typeof receipt === 'string' ? receipt : null,
+          };
+        } else if (pendingRow !== null) {
+          throw new Error(`escalation_id "${escalationId}" already has an in-flight re-post (repost-pending); reconcile it before re-submitting`);
         }
       }
       // Bind the row to the lane's current worker (existing agentId
@@ -1341,29 +1411,61 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
                   agent.jobId === jobId && agent.role === 'minion' && agent.parentage !== 'child',
               )
           : undefined;
+      if (attemptOutcome !== null) {
+        // Replay: the durable posted outcome answers this request; no new
+        // notice is created (idempotency by attempt identity).
+        json(res, 200, {
+          notification_id: attemptOutcome.receipt,
+          replay: true,
+          escalation_outcome: 'posted',
+        });
+        return true;
+      }
+      // (round-6 finding 6) A correlated re-post carries the CANONICAL
+      // gate-warning content constructed server-side — authenticated ops
+      // authority alone does not prove an arbitrary caller-supplied notice
+      // conveyed the required warning.
+      const correlated = escalationId !== undefined && jobId !== undefined;
+      const noticeTitle = correlated
+        ? `bmad-review gate PASS for job ${jobId} — re-post (missing Perkins gate escalated; merge stays user-held)`
+        : title;
+      const noticeDetail = correlated
+        ? `ops re-post of fallback escalation attempt ${escalationId} — the original notice's outcome was failed/unknown (merge stays user-held)`
+        : detail;
+      if (correlated) {
+        // (round-6 finding 4) Durable intent BEFORE the side effect: a
+        // crash between the notice and the outcome leaves a discoverable
+        // repost-pending pair reconciled on the next pass — never a blind
+        // duplicate.
+        options.ledger.appendCustomEvent({
+          kind: 'job.fallback-review',
+          jobId: jobId!,
+          payload: { gate: true, phase: 'escalation', status: 'repost-pending', escalationId },
+        });
+      }
       const notification = ops.notifications.post({
         kind: 'silas.escalation',
         routing: 'action-required',
         severity: 'error',
-        title,
-        ...(detail !== undefined ? { detail } : {}),
+        title: noticeTitle,
+        ...(noticeDetail !== undefined ? { detail: noticeDetail } : {}),
         ...(boundMinion !== undefined ? { agentId: boundMinion.id } : {}),
       });
       options.ledger.appendCustomEvent({
         kind: 'silas.escalated',
         ...(jobId !== undefined ? { jobId } : {}),
-        payload: { title, notification_id: notification.id },
+        payload: { title: noticeTitle, notification_id: notification.id, ...(correlated ? { escalation_id: escalationId } : {}) },
       });
-      if (escalationId !== undefined && jobId !== undefined) {
+      if (correlated) {
         options.ledger.appendCustomEvent({
           kind: 'job.fallback-review',
-          jobId,
+          jobId: jobId!,
           payload: { gate: true, phase: 'escalation', status: 'posted', escalationId, receipt: notification.id, source: 'ops-repost' },
         });
       }
       json(res, 200, {
         notification_id: notification.id,
-        ...(escalationId !== undefined ? { escalation_outcome: 'posted' } : {}),
+        ...(correlated ? { escalation_outcome: 'posted' } : {}),
       });
       return true;
     }

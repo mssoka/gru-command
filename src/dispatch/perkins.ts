@@ -2568,11 +2568,14 @@ export class WaveRunner {
             if (typeof returned === 'string' && returned !== '') receipt = returned;
           } catch (error) {
             status = 'unknown';
+            // (round-6 finding 3) Sanitize ONCE, then use only the
+            // sanitized value at BOTH durable boundaries — the logger and
+            // the ledger event. The raw exception never leaves this frame.
+            errorDetail = sanitizeEscalationError(String(error));
             this.log('error', 'fallback PASS escalation notifier threw — outcome unknown (the notice may have landed)', {
               job: job.id,
-              error: String(error),
+              error: errorDetail,
             });
-            errorDetail = sanitizeEscalationError(String(error));
           }
         }
         fallbackEvent({

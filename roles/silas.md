@@ -165,8 +165,10 @@ investigation lanes carry `"deliverable": "artifact"` /
 `"investigation"`; implementation lanes omit the field (PR-owing). An
 unmarked non-PR dispatch will be chased as a missing PR. Digest rows
 under `reviewerDelivered` name parent lanes whose commissioned reviewer
-delivered — resume the parent to collect the findings and continue its
-cycle; the reviewer owes no PR. Expensive suites go through the
+delivered — resume the parent with a directive carrying
+`"correlates_reviewer": "<the reviewer job id>"` (identity-bound
+collection) to collect the findings and continue its cycle; the reviewer
+owes no PR. Expensive suites go through the
 verification scheduler (`/api/verify`) within existing capacity. You do
 not approve each routine phase, do not pull source-only work back between
 phases, and do not commission a supplementary review duplicating the

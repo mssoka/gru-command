@@ -362,6 +362,30 @@ Full `git diff origin/main...HEAD` at `6bdde5492db7678f7d866ca456e715270125bb8b`
 - Blind — **false**: the authenticated local job-dispatch token is the explicitly accepted worker commissioning route in the installed playbook; no new privilege boundary or concrete exploit is shown beyond the product's existing trusted-worker authority.
 - Blind — **low, rejected**: the spec's runnable heavy-test examples may be stale, but this review workflow rejects fixes that edit the spec under review; `.gru-command/worktree.toml` holds the operative gate commands.
 
+### Review Findings — PR #165 at cdcd303 (2026-10-05, round 6)
+
+Full `git diff $(git merge-base origin/main HEAD)...HEAD` at `cdcd30306887e9396f4c478f1947d7f193523a1d` against `240084ee3d9093b30efd7acdd5b3131053087ebc`. Four independent `openai-codex/gpt-6-sol` layers completed. Detailed individual verdicts and evidence: `reviews/gc-packaged-build-playbook-20261002-bmad-code-review-cdcd303/report.md`. Review-only: these items are not yet fixed.
+
+- [ ] [Review][Patch] Reconcile paged escalation events without retaining the entire history twice per prompt [src/chat/awareness.ts:527-551] — streaming into the attempt map and reusing it keeps large ledgers from exhausting awareness.
+- [ ] [Review][Patch] Rotate/paginate standing obligations when they exceed the awareness byte cap, preserving wake-batch notification IDs [src/chat/awareness.ts:925-940] — oldest-first standing lines can hide later obligations forever and starve autonomous wake admission.
+- [ ] [Review][Patch] Sanitize notifier exception text before logging, not only before the ledger append [src/dispatch/perkins.ts:2571-2577] — raw tokens/private paths currently reach service logs.
+- [ ] [Review][Patch] Make correlated ops escalation re-posts restart-safe and idempotent by attempt identity [src/dispatch/server.ts:1316-1364] — repeat/concurrent requests or a crash between notification and outcome create duplicate or uncorrelated notices; include escalation_id on the durable notice and reconcile the post-before-outcome window.
+- [ ] [Review][Patch] Validate old escalation attempts beyond the newest 500 job events [src/dispatch/server.ts:1320-1330] — an old standing obligation currently cannot use the prescribed re-post endpoint.
+- [ ] [Review][Patch] Construct or validate the missing-Perkins notice when escalation_id is supplied [src/dispatch/server.ts:1302-1364] — arbitrary unrelated title/detail must not retire the gate obligation as posted.
+- [ ] [Review][Patch] Correlate parent follow-up with the specific reviewer delivery [src/dispatch/silas-driver.ts:851-893] — a later unrelated parent directive/turn, including one following two reviews, can erase uncollected findings.
+- [ ] [Review][Patch] Exclude escalation outcome events from review-request evidence [src/dispatch/silas-driver.ts:431-442] — re-posting an older attempt after a new head delivers can wrongly suppress `prWithoutReview` for that head.
+- [ ] [Review][Patch] Fence reviewerDelivered while the parent has an active worker turn [src/dispatch/silas-driver.ts:851-885] — a fast reviewer delivery can otherwise prompt a competing follow-up in the running parent lane.
+- [ ] [Review][Patch] Reject a present malformed escalation_id before posting [src/dispatch/server.ts:1317] — null/number/blank currently silently turn the correlated request into an uncorrelated 200.
+- [ ] [Review][Patch] Refuse a parent whose recorded handoff repository path is missing [src/dispatch/server.ts:299-312] — basename-only fallback can bind an unrelated same-name repository.
+- [ ] [Review][Patch] Query parent follow-up evidence beyond its newest 200 job events [src/dispatch/silas-driver.ts:860,1291] — a legitimately retired re-arm returns after enough later history.
+
+#### Rejected (individual verdicts)
+
+- Blind: **low, rejected** — an absent optional fallback notifier records `not-configured`; production wires a notifier (`src/main.ts`), and the optional-hook persistent path was explicitly rejected as unlikely in earlier rounds.
+- Edge: **low, rejected** — the same optional-hook case adds no routinely reachable production repair path; previous disposition still applies.
+- Blind: **false** — the fallback notifier's return receipt is intentionally optional; a nonthrowing `void` return alone is not evidence of a failed post.
+- Blind: **false** — a blocked reviewer remains a tracked job and a blocked-row repair/escalation obligation in the ops skill and durable blocked-job adoption; lack of `reviewerDelivered` (which is delivery-specific) does not prove a permanently parked parent.
+
 ## Implementation Notes
 
 - Runtime capability verified on this lane: `pi` CLI v0.99.1 on PATH,
@@ -1015,6 +1039,24 @@ bad_spec).
   ordered before the notifier attempt. `docs/FLOW.md` §4f and the
   deferred-work record updated truthfully; no deferred item remains for
   this lane.
+
+- Round-6 closure (same directive): all twelve `6bdde54`-round review
+  groups fixed at the next head. Attempt reconciliation folds each page
+  directly into the map (bounded memory, one scan per preparation);
+  standing obligations render newest-first within a byte/row budget that
+  reserves capacity for an exclusive wake's required notification IDs;
+  the notifier error is sanitized once and only the sanitized value
+  reaches logger and ledger; the correlated ops re-post is idempotent by
+  attempt identity (a posted outcome replays without a second notice), is
+  preceded by a durable repost-pending marker, carries server-constructed
+  canonical gate-warning content, and validates the attempt against the
+  job's WHOLE history; a missing parent handoff path fails loud; malformed
+  present escalation_id values are refused; escalation outcomes are never
+  counted as review requests; reviewer re-arm retirement is
+  identity-bound (directives carry correlates_reviewer; an unbound
+  re-brief retires only the parent's NEWEST delivered reviewer) with the
+  follow-up scan paged over the full stream; an active parent turn
+  fences the row.
 
 - Round-4 closure (same directive — fix them, then review): all twelve
   `635f415` review groups fixed. High: standing obligations read the

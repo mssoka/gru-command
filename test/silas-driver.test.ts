@@ -280,7 +280,7 @@ describe('silas digest (the four actionable states)', () => {
       expect(uncorrelated.reviewerDelivered.map((row) => row.jobId)).toEqual(['rev-live']);
       // The bound follow-up: a directive accepted AFTER the reviewer
       // delivered, then a delivery that completes it.
-      h.ledger.appendCustomEvent({ kind: 'silas.directive-sent', jobId: 'parent-live', payload: { directive: 'collect the review' } });
+      h.ledger.appendCustomEvent({ kind: 'silas.directive-sent', jobId: 'parent-live', payload: { directive: 'collect the review', correlates_reviewer: 'rev-live' } });
       h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'parent-live', payload: { agentId: 'p1' } });
       const retired = await computeSilasDigest({
         ledger: h.ledger,
@@ -289,6 +289,22 @@ describe('silas digest (the four actionable states)', () => {
         trigger: 'sweep',
       });
       expect(retired.reviewerDelivered).toEqual([]);
+      // (round-6 finding 8) An ops re-post OUTCOME for an old attempt is
+      // follow-through, never a new review request: it must not satisfy
+      // reviewAlreadyRequested for a newer, unreviewed delivery.
+      const reviewed = addJobWithDelivery(h.ledger, 'job-repost', { prUrl: 'https://git.example.invalid/o/r/pull/12' });
+      void reviewed;
+      h.ledger.appendCustomEvent({
+        kind: 'job.fallback-review', jobId: 'job-repost',
+        payload: { gate: true, phase: 'escalation', status: 'posted', escalationId: 'job-repost:old:1', source: 'ops-repost' },
+      });
+      const afterRepost = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(afterRepost.prWithoutReview.map((row) => row.jobId)).toContain('job-repost');
     } finally {
       h.cleanup();
     }

@@ -529,16 +529,18 @@ export class GruAwareness {
     // age an unresolved obligation out of view (a cap of 5000 was itself
     // expirable). Ascending pages keep memory bounded and order stable.
     const pageSize = 500;
-    const stream: EventRecord[] = [];
     let pageCursor = 0;
+    let pagesScanned = 0;
     for (;;) {
+      // (round-6 finding 1) Each page folds DIRECTLY into the map — no
+      // whole-stream array is materialized; memory stays bounded by the
+      // page size plus the (small) attempt map regardless of history.
       const page = this.ledger.listEventsAfter(pageCursor, { kinds: ['job.fallback-review'], limit: pageSize, order: 'asc' });
-      stream.push(...page);
-      if (page.length < pageSize) break;
-      pageCursor = page[page.length - 1]!.seq;
-    }
-    // Visit oldest-first so the newest pass/outcome wins the map update.
-    for (const event of stream) {
+      pagesScanned += 1;
+      if (pagesScanned > 10_000) break; // pathological-ledger circuit breaker
+      let lastSeq = pageCursor;
+      for (const event of page) {
+        lastSeq = event.seq;
       const payload = payloadOf(event);
       const phase = textOf(payload.phase);
       if (phase !== 'pass' && phase !== 'escalation') continue;
@@ -569,6 +571,9 @@ export class GruAwareness {
           passSeq: current?.passSeq ?? null,
         });
       }
+      }
+      if (page.length < pageSize) break;
+      pageCursor = lastSeq;
     }
     return attempts;
   }
@@ -577,9 +582,9 @@ export class GruAwareness {
    *  unresolved (failed/unknown, or a PASS whose outcome never landed).
    *  Independent of the delivered-event cursor; retired only by a later
    *  posted outcome for the same attempt. */
-  private standingEscalationObligations(): string[] {
+  private standingEscalationObligations(attempts: Map<string, { jobId: string | null; newestOutcomeSeq: number; status: string; passSeq: number | null }>): string[] {
     const lines: string[] = [];
-    for (const attempt of this.escalationAttempts().values()) {
+    for (const attempt of attempts.values()) {
       const outcomeRecorded = attempt.newestOutcomeSeq >= 0;
       if (outcomeRecorded && attempt.status === 'posted') continue;
       if (outcomeRecorded && attempt.status !== 'unknown' && attempt.status !== 'failed') continue;
@@ -633,7 +638,8 @@ export class GruAwareness {
     // Standing escalation obligations (see below) must keep the block
     // alive even when the event cursor is fully advanced — compute them
     // before the nothing-new early return.
-    const standingEscalationEarly = this.standingEscalationObligations();
+    const escalationAttemptMap = this.escalationAttempts();
+    const standingEscalationEarly = this.standingEscalationObligations(escalationAttemptMap);
     if (
       latest <= this.cursor && this.pendingWakeIds.size === 0 && morning === null &&
       openAttention.length === 0 && standingEscalationEarly.length === 0
@@ -647,7 +653,7 @@ export class GruAwareness {
     // outcome resolves the same attempt id — the cursor must not retire an
     // open repair obligation, and a later posted outcome must retire a
     // stale failure line.
-    const attempts = this.escalationAttempts();
+    const attempts = escalationAttemptMap;
     const supersededOutcomeSeqs = new Set<number>();
     const standingEscalationLines = standingEscalationEarly;
     // Attempt keys whose outcome is unresolved (the same rule the standing
@@ -763,7 +769,25 @@ export class GruAwareness {
         addNote(id);
       }
     }
-    const rendered = this.render(standingEscalationLines, notes, receiptNotes, digestLines, overflow, morning);
+    // (round-6 finding 2) Standing obligations render NEWEST-first and are
+    // byte/row-bounded so saturation can neither starve later obligations
+    // forever nor crowd an exclusive wake's required notification IDs out
+    // of the block.
+    const standingRender = (() => {
+      const newestFirst = [...standingEscalationLines].reverse();
+      const budgetRows = exclusiveWake ? 2 : Math.max(2, Math.floor(this.limits.maxEvents / 2));
+      const budgetBytes = Math.floor(this.limits.maxBytes / 2);
+      const chosen: string[] = [];
+      let used = 0;
+      for (const line of newestFirst) {
+        const size = Buffer.byteLength(line, 'utf8') + 1;
+        if (chosen.length >= budgetRows || used + size > budgetBytes) break;
+        chosen.push(line);
+        used += size;
+      }
+      return chosen;
+    })();
+    const rendered = this.render(standingRender, notes, receiptNotes, digestLines, overflow, morning);
     if (rendered === null) return null;
     if (exclusiveWake && rendered.ids.length === 0) {
       this.log('error', 'wake context has no visible notification IDs; increase awareness line/byte limits', {

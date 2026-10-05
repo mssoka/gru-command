@@ -294,9 +294,13 @@ authorizes its full completion cycle, and YOU own driving it:
    "artifact"` / `"investigation"`; implementation lanes omit the field
    (PR-owing) — an unmarked non-PR dispatch is chased as a missing PR.
    Digest rows under `reviewerDelivered` name parent lanes whose
-   commissioned reviewer delivered: resume the parent (re-brief or fix
-   directive) to collect the reviewer's findings and continue its cycle —
-   the reviewer job itself owes no PR and must not be chased for one.
+   commissioned reviewer delivered: resume the parent with a fix
+   directive that carries `"correlates_reviewer": "<the reviewer job id>"`
+   (identity-bound collection; the row retires against exactly that
+   follow-up — an unbound or unrelated repair never retires it; a
+   re-brief may retire only the parent's NEWEST delivered reviewer) and
+   continue its cycle — the reviewer job itself owes no PR and must not
+   be chased for one.
    When a
    Perkins pre-flight failure routes the review to the installed
    bmad-review fallback gate, that host-routed gate is the review gate of
