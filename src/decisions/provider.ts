@@ -1,5 +1,11 @@
 import { performance } from 'node:perf_hooks';
-import type { JevConfig } from '../config.js';
+import { DEFAULT_DECISION_PROFILE, type DecisionProviderTable } from '../config.js';
+import {
+  assertProfileEndpoint,
+  type DecisionProviderProfile,
+  inputPricePerMtokOf,
+  KEYLESS_CREDENTIAL,
+} from './profile.js';
 import {
   decisionRoute,
   deterministicOutcome,
@@ -19,58 +25,39 @@ import type {
 export const OPENROUTER_DECISIONS_ENDPOINT = 'https://openrouter.ai/api/alpha/decisions';
 
 export class DecisionProviderError extends Error {
-  constructor(readonly reason: DecisionFailureReason) {
-    super(`decision provider unavailable (${reason})`);
+  constructor(
+    readonly reason: DecisionFailureReason,
+    detail?: string,
+  ) {
+    super(`decision provider unavailable (${reason})${detail !== undefined ? `: ${detail}` : ''}`);
     this.name = 'DecisionProviderError';
   }
-}
-
-function secureEndpoint(endpoint: string): URL {
-  let parsed: URL;
-  try {
-    parsed = new URL(endpoint);
-  } catch {
-    throw new DecisionProviderError('endpoint_untrusted');
-  }
-  if (
-    parsed.protocol !== 'https:' ||
-    parsed.username !== '' ||
-    parsed.password !== '' ||
-    parsed.search !== '' ||
-    parsed.hash !== ''
-  ) {
-    throw new DecisionProviderError('endpoint_untrusted');
-  }
-  return parsed;
-}
-
-export function assertTrustedOpenRouterEndpoint(endpoint: string): URL {
-  const parsed = secureEndpoint(endpoint);
-  if (
-    parsed.hostname !== 'openrouter.ai' ||
-    (parsed.port !== '' && parsed.port !== '443') ||
-    parsed.pathname !== '/api/alpha/decisions'
-  ) {
-    throw new DecisionProviderError('endpoint_untrusted');
-  }
-  return parsed;
-}
-
-function endpointForCredential(endpoint: string, mode: 'resolved' | 'explicit'): URL {
-  return mode === 'resolved' ? assertTrustedOpenRouterEndpoint(endpoint) : secureEndpoint(endpoint);
 }
 
 function safeNumber(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
 }
 
-function usageOf(raw: unknown): DecisionUsage | null {
+/**
+ * Honest cost provenance: `usage.cost` wins when the provider reports it
+ * (OpenRouter); otherwise the systemone protocol computes the input cost
+ * from the profile's `input_price_per_mtok`; when neither is possible the
+ * cost is null, never invented.
+ */
+function usageOf(raw: unknown, profile: DecisionProviderProfile): DecisionUsage | null {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null;
   const usage = raw as Record<string, unknown>;
+  const inputTokens = safeNumber(usage.input_tokens);
+  const reportedCost = safeNumber(usage.cost);
+  const computedCost =
+    reportedCost ??
+    (profile.protocol === 'systemone' && inputTokens !== null
+      ? (inputTokens * inputPricePerMtokOf(profile)) / 1_000_000
+      : null);
   return {
-    inputTokens: safeNumber(usage.input_tokens),
+    inputTokens,
     outputTokens: safeNumber(usage.output_tokens),
-    costUsd: safeNumber(usage.cost),
+    costUsd: computedCost,
   };
 }
 
@@ -119,31 +106,63 @@ async function boundedResponseText(response: Response): Promise<string> {
   }
 }
 
-export interface JevProviderOptions {
-  readonly config: JevConfig;
-  readonly key: string;
-  /** Resolved env/file keys are restricted to the exact trusted endpoint. */
+/** Endpoint/credential binding failures are endpoint_untrusted — the same
+ * failure class the single-provider runtime surfaced — with the validator's
+ * stranger-actionable detail preserved in the message. */
+function assertEndpointTrusted(
+  profile: DecisionProviderProfile,
+  mode: 'resolved' | 'explicit',
+): URL {
+  try {
+    return assertProfileEndpoint(profile, mode);
+  } catch (error) {
+    throw new DecisionProviderError('endpoint_untrusted', error instanceof Error ? error.message : String(error));
+  }
+}
+
+export interface ProfileProviderOptions {
+  /** The effective profile (see `effectiveDecisionProviders`). */
+  readonly profile: DecisionProviderTable | DecisionProviderProfile;
+  /** Resolved slot key; null ONLY for a keyless (`credential = "none"`)
+   * loopback profile. */
+  readonly key: string | null;
+  /** Resolved env/file keys are restricted to the slot's pinned origin;
+   * explicitly injected in-process keys only need the protocol shape. */
   readonly credentialMode?: 'resolved' | 'explicit';
   /** Test seam. Production uses global fetch with redirect disabled. */
   readonly fetchImpl?: typeof globalThis.fetch;
 }
 
-/** Owns every in-flight request so disable/reload can abort the old generation. */
-export class JevProvider {
-  private readonly config: JevConfig;
-  private readonly key: string;
+/**
+ * One decision-provider profile (issue #222): speaks `openrouter-decisions`
+ * or `systemone`, sends `{ model, state, questions }`, validates the typed
+ * `{ model, answers, usage }` envelope exactly as before, and re-checks the
+ * endpoint/credential binding immediately before every request so a slot's
+ * key can never travel to another host (redirects included).
+ */
+export class ProfileProvider {
+  private readonly profile: DecisionProviderProfile;
+  private readonly key: string | null;
   private readonly fetchImpl: typeof globalThis.fetch;
   private readonly credentialMode: 'resolved' | 'explicit';
   private readonly active = new Set<AbortController>();
   private disposed = false;
 
-  constructor(options: JevProviderOptions) {
+  constructor(options: ProfileProviderOptions) {
     this.credentialMode = options.credentialMode ?? 'explicit';
-    endpointForCredential(options.config.endpoint, this.credentialMode);
-    if (options.key.trim() === '' || /[\r\n\0]/.test(options.key)) {
+    this.profile = options.profile;
+    // Validate once at construction so a misbound profile fails loud
+    // before any request exists.
+    assertEndpointTrusted(this.profile, this.credentialMode);
+    if (this.profile.credential === KEYLESS_CREDENTIAL) {
+      if (options.key !== null) throw new DecisionProviderError('credential_invalid');
+    } else if (
+      options.key === null ||
+      options.key.trim() === '' ||
+      /[\r\n\0]/.test(options.key)
+    ) {
       throw new DecisionProviderError('credential_invalid');
     }
-    this.config = options.config;
     this.key = options.key;
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch;
   }
@@ -161,25 +180,29 @@ export class JevProvider {
       throw new DecisionProviderError('capacity_limited');
     }
     validateRequest(request);
-    // Validate immediately before constructing credential-bearing headers.
-    const endpoint = endpointForCredential(this.config.endpoint, this.credentialMode).href;
+    // Validate immediately before constructing credential-bearing headers:
+    // the binding check is the last gate in front of the wire.
+    const endpoint = assertEndpointTrusted(this.profile, this.credentialMode).href;
     const controller = new AbortController();
     this.active.add(controller);
-    const timer = setTimeout(() => controller.abort(), this.config.timeoutMs);
+    const timer = setTimeout(() => controller.abort(), this.profile.timeoutMs);
     timer.unref?.();
     const started = performance.now();
     try {
+      const headers: Record<string, string> = {
+        'content-type': 'application/json',
+      };
+      if (this.key !== null) headers['authorization'] = `Bearer ${this.key}`;
+      if (this.profile.protocol === 'openrouter-decisions') {
+        headers['http-referer'] = 'https://github.com/mssoka/gru-command';
+        headers['x-title'] = 'gru-command';
+      }
       const response = await this.fetchImpl(endpoint, {
         method: 'POST',
         redirect: 'manual',
-        headers: {
-          authorization: `Bearer ${this.key}`,
-          'content-type': 'application/json',
-          'http-referer': 'https://github.com/mssoka/gru-command',
-          'x-title': 'gru-command',
-        },
+        headers,
         body: JSON.stringify({
-          model: this.config.model,
+          model: this.profile.model,
           state: request.state,
           questions: request.questions,
         }),
@@ -197,6 +220,10 @@ export class JevProvider {
         }
         if (response.status === 401) throw new DecisionProviderError('auth_rejected');
         if (response.status === 403) throw new DecisionProviderError('forbidden');
+        // A structurally rejected request (TypeSafe documents 422) is the
+        // caller's shape, not the provider's health: a distinct reason so
+        // wiring bugs surface as wiring bugs.
+        if (response.status === 422) throw new DecisionProviderError('malformed_request');
         throw new DecisionProviderError('provider_degraded');
       }
       const responseText = await boundedResponseText(response);
@@ -220,7 +247,7 @@ export class JevProvider {
         answers,
         model: typeof record.model === 'string' && record.model.trim() !== '' ? record.model : null,
         latencyMs: Math.max(0, Math.round(performance.now() - started)),
-        usage: usageOf(record.usage),
+        usage: usageOf(record.usage, this.profile),
       };
     } catch (error) {
       throw new DecisionProviderError(providerReason(error));
@@ -241,13 +268,19 @@ export class JevProvider {
   }
 }
 
-export class JevDecisionService implements DecisionService {
+/** One profile's decision service: provider failures always fall back to
+ * the deterministic outcome; nothing here ever throws to the caller. */
+export class ProfileDecisionService implements DecisionService {
   constructor(
-    private readonly provider: JevProvider,
+    private readonly provider: ProfileProvider,
     private readonly thresholds: ThresholdsConfig,
+    private readonly profileName: string = DEFAULT_DECISION_PROFILE,
   ) {}
 
-  async decide<Q extends QuestionSet>(request: DecisionRequest<Q>): Promise<DecisionOutcome<Q>> {
+  async decide<Q extends QuestionSet>(
+    request: DecisionRequest<Q>,
+    _opts?: { readonly surface?: string },
+  ): Promise<DecisionOutcome<Q>> {
     try {
       const result = await this.provider.request(request);
       const routes: Record<string, ReturnType<typeof decisionRoute>> = {};
@@ -267,6 +300,7 @@ export class JevDecisionService implements DecisionService {
           model: result.model,
           latencyMs: result.latencyMs,
           usage: result.usage,
+          profile: this.profileName,
         },
       };
     } catch (error) {

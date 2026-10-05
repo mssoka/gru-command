@@ -89,6 +89,8 @@ describe('decision config', () => {
         endpoint: 'https://openrouter.ai/api/alpha/decisions',
         timeoutMs: 2_000,
       },
+      providers: {},
+      surfaces: {},
       thresholds: {
         read_only: { act: 0.6, confirm: 0.4, requireConfirmOnAct: false },
         operational: { act: 0.75, confirm: 0.55, requireConfirmOnAct: false },

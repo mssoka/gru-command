@@ -4,19 +4,24 @@ import { homedir } from 'node:os';
 import {
   configPathFor,
   loadConfig,
+  DEFAULT_DECISION_PROFILE,
+  effectiveDecisionProviders,
   type DecisionsConfig,
   type GruCommandConfig,
 } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { NotificationCenter } from '../notifications/center.js';
 import { resolveCredential, type CredentialSource } from './credentials.js';
-import { JevDecisionService, JevProvider } from './provider.js';
+import { ProfileDecisionService, ProfileProvider } from './provider.js';
+import type { DecisionProviderProfile } from './profile.js';
+import { KEYLESS_CREDENTIAL, validateProviderProfile } from './profile.js';
 import { deterministicOutcome, DeterministicDecisionService } from './service.js';
 import type {
   DecisionFailureReason,
   DecisionOutcome,
   DecisionRequest,
   DecisionService,
+  DecisionSurface,
   QuestionSet,
   ThresholdsConfig,
 } from './types.js';
@@ -91,9 +96,49 @@ function thresholdsOf(config: DecisionsConfig): ThresholdsConfig {
   return config.thresholds;
 }
 
+/** The default profile's identity fields, for status surfaces that predate
+ * per-profile routing. An invalid merged table falls back to the legacy
+ * `[decisions.jev]` fields rather than throwing out of a status path. */
+function primaryProfileFields(config: DecisionsConfig): { model: string; endpoint: string } {
+  try {
+    const profile = effectiveDecisionProviders(config)[DEFAULT_DECISION_PROFILE];
+    if (profile !== undefined) return { model: profile.model, endpoint: profile.endpoint };
+  } catch {
+    // fall through to the legacy fields
+  }
+  return { model: config.jev.model, endpoint: config.jev.endpoint };
+}
+
+function credentialFailureReason(state: 'absent' | 'invalid' | 'unsafe' | 'unreadable'): DecisionFailureReason {
+  return state === 'absent'
+    ? 'credential_missing'
+    : state === 'invalid'
+      ? 'credential_invalid'
+      : 'credential_unsafe';
+}
+
+/** A resolution that reports `present` always carries a key; reaching the
+ * failure mapper with one is a broken caller, not a fallback case. */
+function resolvedCredentialReason(credential: { readonly state: string; readonly key?: string }): DecisionFailureReason {
+  if (credential.state === 'present' && credential.key !== undefined) {
+    throw new Error('credential resolution reported present with a key; this is a caller bug');
+  }
+  return credentialFailureReason(credential.state as 'absent' | 'invalid' | 'unsafe' | 'unreadable');
+}
+
 /**
- * Hot-reloadable decision-service owner. A generation changes before the
- * old provider is disposed, so a late answer can never alter caller state.
+ * Hot-reloadable decision-service owner over provider profiles (issue #222).
+ *
+ * One generation owns one provider service per profile; the DEFAULT profile
+ * (`openrouter-jev`) is probed at startup and owns the runtime health
+ * status/degrade/incident semantics exactly as the single-provider runtime
+ * did. Every other profile is constructed offline: a profile whose
+ * credential cannot resolve stands in deterministically per call and never
+ * invents an owner incident — nobody may be routed to it. `decide` routes
+ * surface → profile via `[decisions.surfaces]`; an omitted surface routes
+ * to the default profile, which is today's behavior unchanged. A
+ * generation changes before old providers are disposed, so a late answer
+ * can never alter caller state.
  */
 export class DecisionRuntime implements DecisionService {
   private readonly options: DecisionRuntimeOptions;
@@ -103,8 +148,11 @@ export class DecisionRuntime implements DecisionService {
   private readonly configFile: string;
   private currentConfig: DecisionsConfig;
   private service: DecisionService;
-  private jev: JevDecisionService | null = null;
-  private pendingJev: JevDecisionService | null = null;
+  /** The live default-profile service; null while the default profile is
+   * degraded/disabled (its map entry is then a deterministic stand-in). */
+  private primary: ProfileDecisionService | null = null;
+  private pendingPrimary: ProfileDecisionService | null = null;
+  private readonly profileServices = new Map<string, DecisionService>();
   private readonly incarnation = randomUUID();
   private generation = 0;
   private disposed = false;
@@ -127,12 +175,13 @@ export class DecisionRuntime implements DecisionService {
     this.configFile = configPathFor(options.instanceDir);
     this.currentConfig = initial;
     this.service = new DeterministicDecisionService(thresholdsOf(initial), 'disabled');
+    const fields = primaryProfileFields(initial);
     this.currentStatus = {
       enabled: initial.jev.enabled,
       status: initial.jev.enabled ? 'checking' : 'disabled',
       reason: initial.jev.enabled ? null : 'disabled',
-      model: initial.jev.model,
-      endpoint: initial.jev.endpoint,
+      model: fields.model,
+      endpoint: fields.endpoint,
       credentialPresent: false,
       credentialSource: 'none',
       checkedAt: null,
@@ -240,18 +289,16 @@ export class DecisionRuntime implements DecisionService {
         return;
       }
       this.generation += 1;
-      this.pendingJev?.dispose();
-      this.pendingJev = null;
-      this.jev?.dispose();
-      this.jev = null;
+      this.disposeServices();
       this.currentConfig = next;
+      const fields = primaryProfileFields(next);
       this.service = new DeterministicDecisionService(thresholdsOf(next), 'provider_degraded');
       this.currentStatus = {
         enabled: true,
         status: 'checking',
         reason: null,
-        model: next.jev.model,
-        endpoint: next.jev.endpoint,
+        model: fields.model,
+        endpoint: fields.endpoint,
         credentialPresent: false,
         credentialSource: 'none',
         checkedAt: null,
@@ -264,15 +311,30 @@ export class DecisionRuntime implements DecisionService {
     }
   }
 
-  async decide<Q extends QuestionSet>(request: DecisionRequest<Q>): Promise<DecisionOutcome<Q>> {
+  /** Which configured profile answers this surface (issue #222): an
+   * omitted or unrouted surface rides the default profile. */
+  private routeFor(surface: string | undefined): string {
+    if (surface === undefined) return DEFAULT_DECISION_PROFILE;
+    return this.currentConfig.surfaces[surface] ?? DEFAULT_DECISION_PROFILE;
+  }
+
+  async decide<Q extends QuestionSet>(
+    request: DecisionRequest<Q>,
+    opts?: DecisionSurface,
+  ): Promise<DecisionOutcome<Q>> {
     if (this.disposed) return deterministicOutcome(request, thresholdsOf(this.currentConfig), 'disposed');
+    const profileName = this.routeFor(opts?.surface);
     const generation = this.generation;
-    const selected = this.service;
-    const outcome = await selected.decide(request);
-    if (this.disposed || generation !== this.generation || selected !== this.service) {
+    const selected = this.profileServices.get(profileName) ?? this.service;
+    const outcome = await selected.decide(request, opts);
+    if (this.disposed || generation !== this.generation || selected !== (this.profileServices.get(profileName) ?? this.service)) {
       return deterministicOutcome(request, thresholdsOf(this.currentConfig), 'stale_generation');
     }
-    if (outcome.provenance.source === 'deterministic' && this.jev !== null) {
+    // A live default-profile call failing degrades the runtime (existing
+    // semantics — one health, one incident stream). Failures of any other
+    // profile fall back deterministically per call and never invent an
+    // owner incident for a surface nobody may be watching.
+    if (outcome.provenance.source === 'deterministic' && profileName === DEFAULT_DECISION_PROFILE && this.primary !== null) {
       const reason = outcome.provenance.fallbackReason ?? 'provider_degraded';
       if (reason !== 'capacity_limited') this.degrade(reason);
       return deterministicOutcome(request, thresholdsOf(this.currentConfig), reason);
@@ -280,15 +342,69 @@ export class DecisionRuntime implements DecisionService {
     return outcome;
   }
 
+  /** Dispose every generation-owned service (idempotent per service;
+   * deterministic stand-ins carry nothing to dispose). */
+  private disposeServices(): void {
+    this.pendingPrimary?.dispose();
+    this.pendingPrimary = null;
+    this.primary?.dispose();
+    this.primary = null;
+    for (const service of this.profileServices.values()) {
+      if (service instanceof ProfileDecisionService) service.dispose();
+    }
+    this.profileServices.clear();
+  }
+
+  /** Build one non-default profile's service OFFLINE: no probe, no owner
+   * incident. A profile that cannot be constructed stands in
+   * deterministically with the honest reason. */
+  private buildProfileService(name: string, profile: DecisionProviderProfile): DecisionService {
+    const thresholds = thresholdsOf(this.currentConfig);
+    const standIn = (reason: DecisionFailureReason): DecisionService =>
+      new DeterministicDecisionService(thresholds, reason);
+    try {
+      validateProviderProfile(profile, `decisions.providers.${name}`);
+    } catch {
+      return standIn('config_invalid');
+    }
+    if (profile.credential !== KEYLESS_CREDENTIAL) {
+      const credential = resolveCredential(this.options.instanceDir, this.env, profile.credential);
+      if (credential.state !== 'present' || credential.key === undefined) {
+        return standIn(resolvedCredentialReason(credential));
+      }
+      try {
+        return new ProfileDecisionService(
+          new ProfileProvider({
+            profile,
+            key: credential.key,
+            credentialMode: 'resolved',
+            fetchImpl: this.options.fetchImpl,
+          }),
+          thresholds,
+          name,
+        );
+      } catch (error) {
+        return standIn(providerConstructionReason(error));
+      }
+    }
+    try {
+      return new ProfileDecisionService(
+        new ProfileProvider({ profile, key: null, credentialMode: 'resolved', fetchImpl: this.options.fetchImpl }),
+        thresholds,
+        name,
+      );
+    } catch (error) {
+      return standIn(providerConstructionReason(error));
+    }
+  }
+
   private async configure(config: DecisionsConfig, initial: boolean): Promise<DecisionRuntimeStatus> {
     if (this.disposed) return this.status();
     const previous = this.currentStatus.status;
     this.generation += 1;
-    this.pendingJev?.dispose();
-    this.pendingJev = null;
-    this.jev?.dispose();
-    this.jev = null;
+    this.disposeServices();
     this.currentConfig = config;
+    const fields = primaryProfileFields(config);
     this.service = new DeterministicDecisionService(
       thresholdsOf(config),
       config.jev.enabled ? 'provider_degraded' : 'disabled',
@@ -302,12 +418,21 @@ export class DecisionRuntime implements DecisionService {
       return this.status();
     }
 
+    let effective: Record<string, DecisionProviderProfile>;
+    try {
+      effective = effectiveDecisionProviders(config);
+      for (const [name, profile] of Object.entries(effective)) {
+        validateProviderProfile(profile, `decisions.providers.${name}`);
+      }
+    } catch {
+      return this.degrade('config_invalid');
+    }
     this.currentStatus = {
       enabled: true,
       status: 'checking',
       reason: null,
-      model: config.jev.model,
-      endpoint: config.jev.endpoint,
+      model: fields.model,
+      endpoint: fields.endpoint,
       credentialPresent: false,
       credentialSource: 'none',
       checkedAt: null,
@@ -316,38 +441,38 @@ export class DecisionRuntime implements DecisionService {
     };
     this.signalStatus();
     const generation = this.generation;
-    const credential = resolveCredential(this.options.instanceDir, this.env);
+    // Non-default profiles: offline construction only (see
+    // buildProfileService). Their health is per-call honest fallback plus
+    // `check --profile`, never a startup owner incident.
+    for (const [name, profile] of Object.entries(effective)) {
+      if (name !== DEFAULT_DECISION_PROFILE) this.profileServices.set(name, this.buildProfileService(name, profile));
+    }
+    const primaryProfile = effective[DEFAULT_DECISION_PROFILE];
+    if (primaryProfile === undefined) return this.degrade('config_invalid');
+    const credential = resolveCredential(this.options.instanceDir, this.env, primaryProfile.credential);
     if (credential.state !== 'present' || credential.key === undefined) {
-      const reason: DecisionFailureReason =
-        credential.state === 'absent'
-          ? 'credential_missing'
-          : credential.state === 'invalid'
-            ? 'credential_invalid'
-            : 'credential_unsafe';
+      const reason = resolvedCredentialReason(credential);
       return this.degrade(reason, credential.source);
     }
 
-    let candidate: JevDecisionService;
+    let candidate: ProfileDecisionService;
     try {
-      candidate = new JevDecisionService(
-        new JevProvider({
-          config: config.jev,
+      candidate = new ProfileDecisionService(
+        new ProfileProvider({
+          profile: primaryProfile,
           key: credential.key,
           credentialMode: 'resolved',
           fetchImpl: this.options.fetchImpl,
         }),
         thresholdsOf(config),
+        DEFAULT_DECISION_PROFILE,
       );
     } catch (error) {
-      const reason =
-        typeof error === 'object' && error !== null && 'reason' in error
-          ? (error as { reason: DecisionFailureReason }).reason
-          : 'provider_degraded';
-      return this.degrade(reason, credential.source);
+      return this.degrade(providerConstructionReason(error), credential.source);
     }
-    this.pendingJev = candidate;
+    this.pendingPrimary = candidate;
     const probe = await candidate.decide(PROBE_REQUEST);
-    if (this.pendingJev === candidate) this.pendingJev = null;
+    if (this.pendingPrimary === candidate) this.pendingPrimary = null;
     if (this.disposed || generation !== this.generation) {
       candidate.dispose();
       return this.status();
@@ -366,14 +491,15 @@ export class DecisionRuntime implements DecisionService {
       candidate.dispose();
       return this.degrade('probe_failed', credential.source);
     }
-    this.jev = candidate;
+    this.profileServices.set(DEFAULT_DECISION_PROFILE, candidate);
+    this.primary = candidate;
     this.service = candidate;
     this.currentStatus = {
       enabled: true,
       status: 'ready',
       reason: null,
-      model: probe.provenance.model ?? config.jev.model,
-      endpoint: config.jev.endpoint,
+      model: probe.provenance.model ?? primaryProfile.model,
+      endpoint: primaryProfile.endpoint,
       credentialPresent: true,
       credentialSource: credential.source,
       checkedAt: new Date().toISOString(),
@@ -382,6 +508,8 @@ export class DecisionRuntime implements DecisionService {
     };
     this.log('info', 'Jev decision service ready', {
       model: this.currentStatus.model,
+      profile: DEFAULT_DECISION_PROFILE,
+      profiles: [...this.profileServices.keys()].sort(),
       credential_source: credential.source,
       latency_ms: probe.provenance.latencyMs,
       usage: probe.provenance.usage,
@@ -406,17 +534,16 @@ export class DecisionRuntime implements DecisionService {
     credentialSource: CredentialSource = this.currentStatus.credentialSource,
   ): DecisionRuntimeStatus {
     this.generation += 1;
-    this.pendingJev?.dispose();
-    this.pendingJev = null;
-    this.jev?.dispose();
-    this.jev = null;
+    this.disposeServices();
     this.service = new DeterministicDecisionService(thresholdsOf(this.currentConfig), reason);
+    this.profileServices.set(DEFAULT_DECISION_PROFILE, this.service);
+    const fields = primaryProfileFields(this.currentConfig);
     this.currentStatus = {
       enabled: true,
       status: 'degraded',
       reason,
-      model: this.currentConfig.jev.model,
-      endpoint: this.currentConfig.jev.endpoint,
+      model: fields.model,
+      endpoint: fields.endpoint,
       credentialPresent: credentialSource !== 'none' && !reason.startsWith('credential_'),
       credentialSource,
       checkedAt: new Date().toISOString(),
@@ -462,12 +589,13 @@ export class DecisionRuntime implements DecisionService {
 
   /** The single shape for "Jev off": zero credential claims, one reason. */
   private disabledStatusOf(reason: DecisionFailureReason, checkedAt: string | null): DecisionRuntimeStatus {
+    const fields = primaryProfileFields(this.currentConfig);
     return {
       enabled: false,
       status: 'disabled',
       reason,
-      model: this.currentConfig.jev.model,
-      endpoint: this.currentConfig.jev.endpoint,
+      model: fields.model,
+      endpoint: fields.endpoint,
       credentialPresent: false,
       credentialSource: 'none',
       checkedAt,
@@ -531,10 +659,7 @@ export class DecisionRuntime implements DecisionService {
       clearTimeout(this.transientRecoveryTimer);
       this.transientRecoveryTimer = null;
     }
-    this.pendingJev?.dispose();
-    this.pendingJev = null;
-    this.jev?.dispose();
-    this.jev = null;
+    this.disposeServices();
     this.service = new DeterministicDecisionService(thresholdsOf(this.currentConfig), 'disposed');
     if (this.watching) {
       unwatchFile(this.configFile);
@@ -542,5 +667,84 @@ export class DecisionRuntime implements DecisionService {
       this.eventWatcher = null;
       this.watching = false;
     }
+  }
+}
+
+function providerConstructionReason(error: unknown): DecisionFailureReason {
+  return typeof error === 'object' && error !== null && 'reason' in error
+    ? (error as { reason: DecisionFailureReason }).reason
+    : 'provider_degraded';
+}
+
+export interface DecisionProfileCheckResult {
+  readonly profile: string;
+  readonly ok: boolean;
+  readonly status: 'ready' | 'degraded' | 'disabled';
+  readonly reason: DecisionFailureReason | null;
+  readonly model: string | null;
+}
+
+/**
+ * Probe any single configured profile (CLI `check --profile <name>`): the
+ * same synthetic probe and semantic liveness check as the runtime's
+ * startup, scoped to one profile, with no runtime, no watcher and no
+ * owner incidents.
+ */
+export async function checkDecisionProfile(
+  config: DecisionsConfig,
+  profileName: string,
+  options: Pick<DecisionRuntimeOptions, 'instanceDir' | 'env' | 'fetchImpl'>,
+): Promise<DecisionProfileCheckResult> {
+  if (!config.jev.enabled) {
+    return { profile: profileName, ok: true, status: 'disabled', reason: null, model: null };
+  }
+  let profile: DecisionProviderProfile;
+  try {
+    const effective = effectiveDecisionProviders(config);
+    const found = effective[profileName];
+    if (found === undefined) {
+      throw new Error(`unknown decision profile "${profileName}" (available: ${Object.keys(effective).join(', ')})`);
+    }
+    validateProviderProfile(found, `decisions.providers.${profileName}`);
+    profile = found;
+  } catch (error) {
+    if (error instanceof Error && /unknown decision profile/.test(error.message)) throw error;
+    return { profile: profileName, ok: false, status: 'degraded', reason: 'config_invalid', model: null };
+  }
+  let key: string | null = null;
+  if (profile.credential !== KEYLESS_CREDENTIAL) {
+    const credential = resolveCredential(options.instanceDir, options.env ?? process.env, profile.credential);
+    if (credential.state !== 'present' || credential.key === undefined) {
+      return {
+        profile: profileName,
+        ok: false,
+        status: 'degraded',
+        reason: resolvedCredentialReason(credential),
+        model: null,
+      };
+    }
+    key = credential.key;
+  }
+  let service: ProfileDecisionService;
+  try {
+    service = new ProfileDecisionService(
+      new ProfileProvider({ profile, key, credentialMode: 'resolved', fetchImpl: options.fetchImpl }),
+      config.thresholds,
+      profileName,
+    );
+  } catch (error) {
+    return { profile: profileName, ok: false, status: 'degraded', reason: providerConstructionReason(error), model: null };
+  }
+  try {
+    const probe = await service.decide(PROBE_REQUEST);
+    if (probe.provenance.source !== 'jev') {
+      return { profile: profileName, ok: false, status: 'degraded', reason: probe.provenance.fallbackReason ?? 'provider_degraded', model: null };
+    }
+    if (probe.answers.provider_alive.noul < 0.5 || probe.answers.probe_class.choice !== 'healthy_probe') {
+      return { profile: profileName, ok: false, status: 'degraded', reason: 'probe_failed', model: null };
+    }
+    return { profile: profileName, ok: true, status: 'ready', reason: null, model: probe.provenance.model ?? profile.model };
+  } finally {
+    service.dispose();
   }
 }

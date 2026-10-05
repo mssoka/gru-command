@@ -215,6 +215,7 @@ export function deterministicOutcome<Q extends QuestionSet>(
       model: null,
       latencyMs: 0,
       usage: null,
+      profile: null,
     },
   };
 }
@@ -227,7 +228,10 @@ export class DeterministicDecisionService implements DecisionService {
     validateThresholdConfig(thresholds);
   }
 
-  async decide<Q extends QuestionSet>(request: DecisionRequest<Q>): Promise<DecisionOutcome<Q>> {
+  async decide<Q extends QuestionSet>(
+    request: DecisionRequest<Q>,
+    _opts?: { readonly surface?: string },
+  ): Promise<DecisionOutcome<Q>> {
     return deterministicOutcome(request, this.thresholds, this.reason);
   }
 }
