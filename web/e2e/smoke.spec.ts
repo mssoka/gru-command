@@ -91,6 +91,29 @@ test('multi-line composer (desktop, fine pointer): Shift+Enter newlines, grows w
   await expect(input).toHaveValue('');
 });
 
+test('held Enter auto-repeat never refills the cleared composer (#26, real browser)', async ({ page }) => {
+  await pair(page);
+  const input = page.locator('#chat-input');
+  await input.fill('hold it boss');
+
+  // A physical hold: one keydown sends, then the browser's auto-repeats
+  // arrive before the keyup. Playwright marks every down after the first
+  // on a held key as a repeat, so Chromium's default would insert newlines
+  // if the handler let the repeats keep their native action.
+  await page.keyboard.down('Enter');
+  await page.keyboard.down('Enter');
+  await page.keyboard.down('Enter');
+  await page.keyboard.up('Enter');
+
+  // The first press sent exactly one message; the repeats typed nothing
+  // into the composer the send cleared.
+  await expect(input).toHaveValue('');
+  await expect(page.locator('.msg--user', { hasText: 'hold it boss' })).toHaveCount(1);
+  const reply = page.locator('.msg--gru', { hasText: `You said: "hold it boss"` });
+  await expect(reply).toBeVisible();
+  await expect(reply).not.toHaveClass(/msg--streaming/);
+});
+
 test('composer caps at ~10rem and scrolls internally past the cap', async ({ page }) => {
   await pair(page);
   const input = page.locator('#chat-input');

@@ -158,6 +158,11 @@ export class ChatView {
   private pendingResetView: PendingResetView | null = null;
   private controlsConnected = false;
   private requestControl: ((action: ControlAction) => boolean) | null = null;
+  /** True while an Enter press that was intercepted (sent) is still held
+   * down: its auto-repeats must keep suppressing the native default even
+   * when modifiers change mid-hold (an Enter hold followed by Shift). A
+   * hold that started as Shift+Enter keeps its native newline repeats. */
+  private enterPressSent = false;
 
   constructor(
     private readonly onSend: (
@@ -178,13 +183,28 @@ export class ChatView {
     // composing (isComposing; keyCode 229 is the legacy composition code
     // some browsers still emit).
     this.input.addEventListener('keydown', (event) => {
-      if (event.key !== 'Enter' || event.shiftKey) return;
+      if (event.key !== 'Enter') return;
+      if (event.repeat) {
+        // The repeat belongs to the held Enter that just sent: keep its
+        // native default suppressed even if Shift was pressed during the
+        // hold, or the repeats type newlines into the cleared composer.
+        if (this.enterPressSent) event.preventDefault();
+        return;
+      }
+      this.enterPressSent = false;
+      if (event.shiftKey) return;
       if (this.coarse.matches) return;
       if (event.altKey || event.ctrlKey || event.metaKey) return;
-      if (event.repeat) return;
       if (event.isComposing || event.keyCode === 229) return;
+      // The intercepted press blocks the native default and submits: the
+      // composer clears, and every later repeat of this held key is caught
+      // above so nothing refills the fresh draft.
       event.preventDefault();
+      this.enterPressSent = true;
       this.form.requestSubmit();
+    });
+    this.input.addEventListener('keyup', (event) => {
+      if (event.key === 'Enter') this.enterPressSent = false;
     });
     // Auto-grow with content; the CSS max-height is the hard cap (the
     // textarea scrolls internally past it) and this keeps height honest.
@@ -804,11 +824,14 @@ export class ChatView {
   /** User message status changes: queued → sent → acked. `live` is false
    * for replayed frames: the viewport settle coalesces those. */
   upsertMessage(message: ChatMessage, live = true): void {
-    // A user message is conversation: it ends any open service run.
-    this.closeServiceBand();
     let bubble = this.bubbles.get(message.client_msg_id);
     const fresh = bubble === undefined;
     if (bubble === undefined) {
+      // A genuinely NEW user message is conversation: it ends any open
+      // service run. A status update to an already-rendered bubble is not
+      // a boundary — closing there split one consecutive service run into
+      // two bands (g22/#118).
+      this.closeServiceBand();
       bubble = el('div', 'msg msg--user');
       this.bubbles.set(message.client_msg_id, bubble);
       this.log.append(bubble);
@@ -838,6 +861,11 @@ export class ChatView {
   addFrame(frame: LoggedFrame, live: boolean): void {
     switch (frame.type) {
       case 'user': {
+        // A user frame is conversation: it ends any open service run, even
+        // on replay where the bubble may already be pre-rendered (main.ts
+        // renders pending messages before a full replay). upsertMessage's
+        // own close covers the optimistic-send path only.
+        this.closeServiceBand();
         this.upsertMessage(
           {
             client_msg_id: frame.client_msg_id,
