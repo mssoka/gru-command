@@ -317,3 +317,49 @@ the run's image-capable read tool):
   the repair head's CI rides this documentation commit's push (structural
   note stands: a commit cannot contain its own CI receipt — the PR's
   merge-result run is the final-head receipt).
+
+### r9 main-drift integration + fresh bmad review — 2026-10-05
+
+- **Main drift forced a third integration:** main advanced to `639998e`
+  (PRs #204–#209 + board-pr-number-links), leaving the PR CONFLICTING —
+  GitHub builds no merge ref for a conflicting PR, so no `pull_request`
+  CI run can exist at any head until the conflict clears (the missing
+  CI at `d194a08` was this, not a dropped event; close/reopen did not
+  and cannot fix it).
+- **Fresh independent review (4 layers, herdr panes, `pi
+  openai-codex/gpt-6-sol`, cwd = lane, diff `b900837...d194a08`):**
+  blind-hunter 10 findings, edge-case-hunter 7, verification-gap 2,
+  acceptance-auditor 1. Raw findings + session transcripts preserved
+  under `reviewers-d194a08/` (host-side). Triage: the same-millisecond
+  tie-break in `listImplementerMinions` was confirmed by all four
+  layers and fixed (rowid insertion order); the directive
+  registration-failure dispose gap, the stale-marker review-only
+  resume, the provider-recovery non-adoption (vgap patch), the ZWJ
+  code-point fallback, the boot-budget arithmetic, the fallback-row
+  e2e fit, the scope-comment over-claim, the UTF-16 doc unit and the
+  evidence README state-surface explanation are all repaired in the
+  integration commit; the digest attribution sort is documented as
+  deliberate (attribution ≠ routing); crew-rail in required CI is
+  deferred to the owner/e2e-gate lane (deferred-work.md).
+- **Integration `1aeeb7f`:** 19 files resolved semantically (migration
+  17 renumber, implementer-only × #161 child-exclusion union across
+  routing/supervision/provider-recovery, #171 rail carrying the heist
+  names, mock fixtures merged, pins re-derived).
+- **First full at `1aeeb7f` failed 3 merge artifacts** (run
+  `8522bf1f`, exit 1, 1783 passed): child-workers migration fixtures
+  seeded via the merged `addJob` against pre-#161 schemas lacking
+  `display_name`, and the lane's verify scope named heavy files
+  without the heavy config (test-budgets guard). Fixed at `992d51f`:
+  fixtures seed raw SQL through their own schema; the scope's backend
+  roster splits heavy/light per the repo rule.
+- **Scheduler-backed full at exact clean head `992d51f` (GREEN):** run
+  `f8b5ad83-e70e-45be-98fe-ce13a6b913e3`, exit 0, not timed out,
+  duration 702 867 ms, `tracked_dirty: false`, output SHA-256
+  `dfffdb1abb737e806c98ccfda482a3216a8433b6e3357cdcce8fe7dba819d196`.
+  Backend 100 files / 1786 tests passed (6 skipped, 4 files skipped);
+  decisions 29/741; web 44 files / 484 tests passed. Captures host-side:
+  `verify-crew-heist-labels-final-{c7d2f34,cf4bb06,1aeeb7f,992d51f}-full-*.ndjson`
+  (the c7d2f34 and 1aeeb7f failures preserved as load-class and
+  merge-artifact witnesses).
+- **Exact-head CI:** rides this documentation commit's push — the PR is
+  mergeable again, so the merge-ref run is the final-head receipt.
