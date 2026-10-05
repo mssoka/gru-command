@@ -170,6 +170,7 @@ async function claimJobMinion(
       (agent) =>
         agent.jobId === wait.jobId &&
         agent.role === 'minion' &&
+        agent.parentage !== 'child' &&
         agent.id !== wait.agentId &&
         agent.createdAt >= wait.createdAt &&
         deps.registry.getHandle(agent.id) !== null,

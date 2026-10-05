@@ -1,6 +1,7 @@
+import { randomUUID } from 'node:crypto';
 import type { Role } from '../config.js';
 import type { LedgerApi } from '../ledger/api.js';
-import type { AgentHandle, SpawnOptions } from '../runtime/types.js';
+import type { AgentHandle, NativeAgentTool, SpawnOptions } from '../runtime/types.js';
 import { WorkerDisposalInProgressError } from '../runtime/worker-errors.js';
 import { requireSpawnCwd } from '../roles.js';
 import { appendLessonPointers, renderLessonsSection } from '../lessons/references.js';
@@ -20,6 +21,31 @@ import { settleRetries, type PacingGate, type PacingLease, type RetrySettlement 
  * between them.
  */
 
+/** The product-owned identity + GC-mediated child tools for a
+ * (re)dispatched parent session (issue #161). A resumed row keeps its id
+ * (one logical worker, one identity); a fresh replacement mints one. */
+function parentIdentitySpawnOptions(
+  input: {
+    readonly parentTools?: (agentId: string) => readonly NativeAgentTool[];
+    readonly ledger: Pick<LedgerApi, 'listAgents'>;
+  },
+  resumeFile: string | null,
+): Pick<SpawnOptions, 'agentId' | 'nativeTools'> {
+  const resumed =
+    resumeFile === null
+      ? undefined
+      : input.ledger.listAgents().find((agent) => agent.sessionFile === resumeFile);
+  const agentId = resumed?.id ?? `minion_${randomUUID()}`;
+  const nativeTools = input.parentTools?.(agentId) ?? [];
+  return {
+    agentId,
+    // A runtime that cannot host parent tools returns none: no empty array
+    // is forwarded (the adapter would treat a declared-but-empty set the
+    // same, but an omission is the honest declaration).
+    ...(nativeTools.length > 0 ? { nativeTools } : {}),
+  };
+}
+
 /** The registry surface directive routing needs (structural — the real
  * RuntimeRegistry satisfies it; tests drive a controllable fake). */
 export interface DirectiveRegistry {
@@ -30,10 +56,13 @@ export interface DirectiveRegistry {
 
 export interface DirectiveRoutingDeps {
   readonly registry: DirectiveRegistry;
-  readonly ledger: Pick<LedgerApi, 'listAgents' | 'registerAgent' | 'getJob'>;
+  readonly ledger: Pick<LedgerApi, 'listAgents' | 'registerAgent' | 'getJob' | 'getAgent'>;
   readonly worktrees: WorktreePort;
   /** Book of Lessons injection: pointer lines only, never chapter bodies. */
   readonly lessons?: LessonsReferencePort;
+  /** Issue #161: GC-mediated child-worker tools for a (re)dispatched parent
+   * session, bound to its product-owned agent id by closure. */
+  readonly parentTools?: (agentId: string) => readonly NativeAgentTool[];
   /** Provider pacing: worker (minion turn) admission gate. Absent = off. */
   readonly workerGate?: PacingGate;
   /** Provider pacing: the bounded settlement of an automatic rate-limit
@@ -88,7 +117,9 @@ export async function routeFixDirectiveToMinion(
   );
   const minions = input.ledger
     .listAgents()
-    .filter((agent) => agent.jobId === input.jobId && agent.role === 'minion');
+    // Issue #161: directives belong to the job's WRITER minion — a tracked
+    // child is never selected as the primary lane worker.
+    .filter((agent) => agent.jobId === input.jobId && agent.role === 'minion' && agent.parentage !== 'child');
   let evictedSessionFile: string | null = null;
   for (const minion of [...minions].reverse()) {
     const handle = input.registry.getHandle(minion.id);
@@ -193,11 +224,16 @@ export async function routeFixDirectiveToMinion(
       ? ([...minions].reverse().find((minion) => minion.sessionFile !== null)?.sessionFile ?? null)
       : null;
     const resumeFile = evictedSessionFile ?? fallback;
+    // Issue #161: the (re)dispatched parent keeps one product-owned id
+    // (the resumed row's id, else a fresh one) and receives the GC-mediated
+    // child tools bound to it — re-briefed parents stay able to commission.
+    const identity = parentIdentitySpawnOptions(input, resumeFile);
     let prompt = directive;
     try {
       handle = await input.registry.spawn('minion', {
         cwd: lane.path, signal: input.signal,
         ...(resumeFile !== null ? { resumeFile } : {}),
+        ...identity,
       });
     } catch (error) {
       if (resumeFile === null || input.signal.aborted) throw error;
@@ -205,13 +241,21 @@ export async function routeFixDirectiveToMinion(
       if (job == null || job.briefing == null) {
         throw new Error(`cannot resume prior minion session for job ${input.jobId} and no original briefing is available to re-brief: ${String(error)}`);
       }
-      handle = await input.registry.spawn('minion', { cwd: lane.path, signal: input.signal });
+      handle = await input.registry.spawn('minion', { cwd: lane.path, signal: input.signal, ...identity });
       prompt = `Fresh minion re-brief for job ${input.jobId}. Original contract:\n${job.briefing}\n\nCurrent fix directive:\n${directive}`;
     }
     let promptError: unknown = null;
     let verdict: PromptTurnVerdict | null = null;
     try {
-      input.ledger.registerAgent({ id: handle.id, role: 'minion', jobId: input.jobId, sessionFile: handle.sessionFile });
+      // A fresh fallback minion (the resume attempt failed) is top-level;
+      // a resumed row keeps its recorded parentage (never retro-fitted).
+      input.ledger.registerAgent({
+        id: handle.id,
+        role: 'minion',
+        jobId: input.jobId,
+        sessionFile: handle.sessionFile,
+        ...(input.ledger.getAgent(handle.id) === null ? { parentage: 'top-level' as const } : {}),
+      });
       verdict = await racedPrompt(handle, prompt, input.signal, owner);
     } catch (error) {
       promptError = error;
@@ -374,7 +418,7 @@ export function flipJobToWorking(
  * pending prompt) instead of minting a fresh one. */
 export async function rebriefFreshMinion(
   input: DirectiveRoutingDeps & {
-    readonly ledger: Pick<LedgerApi, 'setAgentState'>;
+    readonly ledger: Pick<LedgerApi, 'setAgentState' | 'getAgent'>;
     jobId: string;
     note: string;
     briefing: string | null;
@@ -423,7 +467,9 @@ export async function rebriefFreshMinion(
     input.beforeTurnSideEffect?.();
     const jobMinions = input.ledger
       .listAgents()
-      .filter((agent) => agent.jobId === input.jobId && agent.role === 'minion');
+      // Retirement/re-brief retires the WRITER sessions only — an active
+      // child worker is not the job's minion lane (issue #161).
+      .filter((agent) => agent.jobId === input.jobId && agent.role === 'minion' && agent.parentage !== 'child');
     for (const minion of jobMinions) {
       const prior = input.registry.getHandle(minion.id);
       if (prior === null) continue;
@@ -435,18 +481,28 @@ export async function rebriefFreshMinion(
       input.beforeTurnSideEffect?.();
     }
     input.beforeTurnSideEffect?.();
+    // Issue #161: a fresh/resumed re-brief parent keeps a product-owned id
+    // (the resumed row's id, else a fresh one) plus the child tools.
+    const identity = parentIdentitySpawnOptions(
+      input,
+      input.resumeFile !== undefined && input.resumeFile !== null ? input.resumeFile : null,
+    );
     const handle = await input.registry.spawn('minion', {
       cwd,
       ...(input.resumeFile !== undefined && input.resumeFile !== null ? { resumeFile: input.resumeFile } : {}),
+      ...identity,
     });
     let prompt: string;
     try {
       input.beforeTurnSideEffect?.();
+      // A FRESH re-brief session (no prior row) is explicitly top-level;
+      // a resumed row keeps its recorded parentage (never retro-fitted).
       input.ledger.registerAgent({
         id: handle.id,
         role: 'minion',
         sessionFile: handle.sessionFile,
         jobId: input.jobId,
+        ...(input.ledger.getAgent(handle.id) === null ? { parentage: 'top-level' as const } : {}),
       });
       input.onSpawned?.({ id: handle.id, sessionFile: handle.sessionFile });
       prompt = renderRebriefPrompt({

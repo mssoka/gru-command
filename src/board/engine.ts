@@ -12,7 +12,10 @@ import { ownerReadyPr, readBranchEvidence, type OwnerPrView } from './owner-acti
 import {
   DEFAULT_LENSES,
   LedgerApi,
+  type AgentParentage,
   type AgentRecord,
+  type ChildWorkerCounts,
+  type ChildWorkerRecord,
   type JobRecord,
   type RoundRecord,
 } from '../ledger/api.js';
@@ -118,11 +121,44 @@ export interface RuntimeOwnership {
  *   certainty in either direction. */
 export type AgentRuntimeClass = 'current' | 'historical' | 'unverified';
 
+/** Issue #161: one tracked child worker as the board renders it. The
+ * child's own record is the durable result surface; `resultSummary` is
+ * the child's own final report text (never fabricated). */
+export interface ChildWorkerView {
+  readonly id: string;
+  readonly agentId: string | null;
+  readonly parentAgentId: string;
+  readonly jobId: string;
+  readonly purpose: string;
+  readonly authority: 'read-only' | 'writer';
+  readonly state: ChildWorkerRecord['state'];
+  readonly worktreeId: string | null;
+  readonly branch: string | null;
+  readonly resultState: ChildWorkerRecord['resultState'];
+  readonly resultSummary: string | null;
+  readonly resultRef: string | null;
+  readonly createdAt: string;
+  readonly admittedAt: string | null;
+  readonly startedAt: string | null;
+  readonly finishedAt: string | null;
+}
+
 export interface AgentView {
   readonly id: string;
   readonly role: Role;
   readonly label: string | null;
   readonly state: AgentState;
+  /** Issue #161 parentage category. `null` = genuinely unknown (a legacy
+   * row written before tracked parentage existed) — never guessed from
+   * names or job patterns. */
+  readonly parentage: AgentParentage | null;
+  /** Issue #161 durable parent link (parent navigation for a child). */
+  readonly parentAgentId: string | null;
+  /** The child record when this agent IS a tracked child (null otherwise). */
+  readonly child: ChildWorkerView | null;
+  /** Family counters for a parent row with admitted children (null when
+   * none): present-state plus lifetime logical creations. */
+  readonly childCounts: ChildWorkerCounts | null;
   /** Issue #171 truthful display status: the raw adapter state corrected
    * by supervision activity evidence — a raw `idle` with an open turn,
    * open control or open tool call is WORKING and reads `streaming`, so a
@@ -223,6 +259,12 @@ export interface BoardSnapshot {
   /** Provider pacing gate (limits, running, queued with reasons). Null when
    * the pacing feature is off — the pre-pacing snapshot shape. */
   readonly pacing: PacingGateView | null;
+  /** Issue #161: tracker-wide child counters. Present-state counts
+   * (queued/active/finished) are derived from the durable child_workers
+   * rows; `lifetimeCreations` is the row count (one per LOGICAL child
+   * creation), so restarts, retries and session resumes cannot
+   * double-count. */
+  readonly children: ChildWorkerCounts;
   /** Self-healing session stats (null until its producer exists). */
   readonly selfHeal: SelfHealView | null;
   /** FOR YOU (owner approval 2026-09-28): PRs with exact-head evidence
@@ -291,6 +333,35 @@ const SILAS_ACTION_KINDS = [
 /** PR state from the record: a terminal `merged` job is merged; a
  * registered URL is open. `conflicting` has no writer yet — the PR-state
  * sweep will land it, and the board already buckets on it. */
+/** The board projection of one tracked child worker. */
+function childView(child: ChildWorkerRecord): ChildWorkerView {
+  return {
+    id: child.id,
+    agentId: child.agentId,
+    parentAgentId: child.parentAgentId,
+    jobId: child.jobId,
+    purpose: child.purpose,
+    authority: child.authority,
+    state: child.state,
+    worktreeId: child.worktreeId,
+    branch: child.branch,
+    resultState: child.resultState,
+    resultSummary: child.resultSummary,
+    resultRef: child.resultRef,
+    createdAt: child.createdAt,
+    admittedAt: child.admittedAt,
+    startedAt: child.startedAt,
+    finishedAt: child.finishedAt,
+  };
+}
+
+interface MutableChildCounts {
+  queued: number;
+  active: number;
+  finished: number;
+  lifetimeCreations: number;
+}
+
 function prStateOf(job: Pick<JobRecord, 'status' | 'prUrl'>): JobView['prState'] {
   if (job.status === 'merged') return 'merged';
   if (job.prUrl !== null) return 'open';
@@ -523,6 +594,45 @@ export class BoardEngine {
   snapshot(): BoardSnapshot {
     const jobs = this.ledger.listJobs();
     const agentRows = this.ledger.listAgents();
+    // Issue #161: ONE child read per snapshot serves the child views, the
+    // parent-family counters and the tracker-wide counters.
+    const childRows = this.ledger.listChildWorkers();
+    const childByAgent = new Map<string, ChildWorkerView>();
+    const childCountsByParent = new Map<string, MutableChildCounts>();
+    // A child admitted but not yet session-bound (no session file) is NOT
+    // historical: its runtime ownership is simply not established yet, so
+    // it classifies `unverified` and stays in the live rail until spawn.
+    const pendingChildAgentIds = new Set(
+      childRows
+        .filter((child) => child.resultState === null && child.sessionFile === null && child.agentId !== null)
+        .map((child) => child.agentId as string),
+    );
+    let childrenQueued = 0;
+    let childrenActive = 0;
+    let childrenFinished = 0;
+    for (const child of childRows) {
+      // `admitted` still means waiting on the resident budget — the
+      // session is not live until `active` (queued truthfulness).
+      const bucket =
+        child.state === 'queued' || child.state === 'admitted'
+          ? 'queued'
+          : child.state === 'active'
+            ? 'active'
+            : 'finished';
+      if (bucket === 'queued') childrenQueued += 1;
+      else if (bucket === 'active') childrenActive += 1;
+      else childrenFinished += 1;
+      const counts = childCountsByParent.get(child.parentAgentId) ?? {
+        queued: 0,
+        active: 0,
+        finished: 0,
+        lifetimeCreations: 0,
+      };
+      counts[bucket] += 1;
+      counts.lifetimeCreations += 1;
+      childCountsByParent.set(child.parentAgentId, counts);
+      if (child.agentId !== null) childByAgent.set(child.agentId, childView(child));
+    }
     // Issue #171: ONE ownership read per snapshot (the probe rebuilds a
     // set of every live handle) and ONE supervision lookup per row — the
     // same evidence serves the activity projection and the agent views.
@@ -531,7 +641,12 @@ export class BoardEngine {
       agentRows.map((agent) => [agent.id, this.supervisionFor(agent.id)]),
     );
     const runtimeClassOf = (agent: AgentRecord): AgentRuntimeClass =>
-      this.classifyRuntime(agent.id, supervisionById.get(agent.id) ?? null, ownership);
+      this.classifyRuntime(
+        agent.id,
+        supervisionById.get(agent.id) ?? null,
+        ownership,
+        pendingChildAgentIds.has(agent.id),
+      );
     // Per-job newest agent activity and per-round lens attempt counts are
     // derived once per snapshot from the same agent rows (ISO stamps
     // compare lexicographically; lens children mint `lens:chunk` labels).
@@ -572,7 +687,16 @@ export class BoardEngine {
       .map(([name, group]) => ({ name, jobs: group }))
       .sort((a, b) => a.name.localeCompare(b.name));
     const agents = agentRows
-      .map((agent) => this.agentView(agent, supervisionById.get(agent.id) ?? null, ownership))
+      .map((agent) =>
+        this.agentView(
+          agent,
+          supervisionById.get(agent.id) ?? null,
+          ownership,
+          childByAgent.get(agent.id) ?? null,
+          (childCountsByParent.get(agent.id) as ChildWorkerCounts | undefined) ?? null,
+          pendingChildAgentIds.has(agent.id),
+        ),
+      )
       .sort(
         (a, b) =>
           RUNTIME_ORDER[a.runtime] - RUNTIME_ORDER[b.runtime] ||
@@ -598,6 +722,12 @@ export class BoardEngine {
         lastAt: this.ledger.latestEventOfKind('gru.wake')?.ts ?? null,
       },
       build: this.buildDrift(),
+      children: {
+        queued: childrenQueued,
+        active: childrenActive,
+        finished: childrenFinished,
+        lifetimeCreations: childRows.length,
+      },
       silas: this.silasView(silasTurnOpen),
       verify: this.verifyQueue(),
       pacing: this.pacing(),
@@ -797,14 +927,21 @@ export class BoardEngine {
     agent: AgentRecord,
     supervision: AgentSupervisionView | null,
     ownership: RuntimeOwnership | null,
+    child: ChildWorkerView | null,
+    childCounts: ChildWorkerCounts | null,
+    pendingChild: boolean,
   ): AgentView {
     return {
       id: agent.id,
       role: agent.role,
       label: agent.label,
       state: agent.state,
+      parentage: agent.parentage,
+      parentAgentId: agent.parentAgentId,
+      child,
+      childCounts,
       status: derivedStatus(agent.state, supervision),
-      runtime: this.classifyRuntime(agent.id, supervision, ownership),
+      runtime: this.classifyRuntime(agent.id, supervision, ownership, pendingChild),
       lastActivity: agent.lastActivity,
       // The row's registration stamp: the board's stall clock floor for a
       // fresh worker that has not sent its first frame (twelve-followthrough A1/E1).
@@ -828,8 +965,12 @@ export class BoardEngine {
     agentId: string,
     supervision: AgentSupervisionView | null,
     ownership: RuntimeOwnership | null,
+    pendingChild = false,
   ): AgentRuntimeClass {
     if (supervision !== null) return 'current';
+    // An admitted-but-unspawned child has no runtime owner YET — that is
+    // missing evidence, never a verified historical record.
+    if (pendingChild) return 'unverified';
     if (this.ownershipProbe !== null) {
       // The registry probe is the wired witness: an ANSWER classifies
       // (member → current, verified absence → historical); a null answer

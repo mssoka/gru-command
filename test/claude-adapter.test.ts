@@ -968,9 +968,11 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       await expect(runtime.spawn('perkins', {
         reviewModel: snapshot,
         reviewLead: { systemPrompt: 'lead', tools: [], nativeTools: [
-          { name: 'invalid', description: 'rejected', inputSchema: {}, execute: async () => ({ text: '' }) },
+          // A general native name is allowed since #161; a malformed one
+          // (space/case) is still rejected at bridge start.
+          { name: 'bad name!', description: 'rejected', inputSchema: {}, execute: async () => ({ text: '' }) },
         ] },
-      })).rejects.toThrow(/invalid or duplicate native review tool name/);
+      })).rejects.toThrow(/invalid or duplicate native tool name/);
       expect(newlyRetained()).toEqual([]);
       expect(doubleInvocations(fx)).toHaveLength(1);
       const recovered = await runtime.spawn('perkins', {
@@ -1170,6 +1172,36 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     }
     expect(review!.argv[review!.argv.indexOf('--tools') + 1]).toBe('Read,Grep,Glob,LS');
     expect(build!.argv[build!.argv.indexOf('--tools') + 1]).toBe('Read,Bash,Edit,Write,Grep,Glob,LS');
+    // Issue #161: a child worker's bounded authority reaches the CLI's
+    // own --tools allowlist, and its product-owned identity is honored.
+    const child = await fx.runtime.spawn('minion', {
+      agentId: 'child-owned-id',
+      roleTools: ['read', 'grep', 'find', 'ls'],
+    });
+    expect(child.id).toBe('child-owned-id');
+    await child.prompt('audit this');
+    await child.dispose();
+    const childInvocation = doubleInvocations(fx).at(-1)!;
+    expect(childInvocation.argv[childInvocation.argv.indexOf('--tools') + 1]).toBe('Read,Grep,Glob,LS');
+    // An override can only NARROW: an undeclared tool refuses loud.
+    await expect(
+      fx.runtime.spawn('perkins', { roleTools: ['undeclared-tool'] }),
+    ).rejects.toThrowError(/role tool override names "undeclared-tool"/);
+    // Issue #161 declared capability gap: non-review product-native tools
+    // cannot be hosted on claude-code (the MCP bridge is a discoverable
+    // same-uid socket); the refusal is loud, never a silent unhosted tool.
+    await expect(
+      fx.runtime.spawn('minion', {
+        nativeTools: [
+          {
+            name: 'request_child_worker',
+            description: 'x',
+            inputSchema: { type: 'object' },
+            execute: async () => ({ text: '' }),
+          },
+        ],
+      }),
+    ).rejects.toThrowError(/cannot host product-native non-review tools/);
     // The role prompt is the perkins/minion definition's own:
     expect(review!.argv[review!.argv.indexOf('--append-system-prompt') + 1]).toContain(
       'Whole-PR Review Lead',
@@ -2256,12 +2288,12 @@ describe('ReviewMcpBridge fail-closed guards', () => {
   it('rejects invalid or duplicate native tool names at start', async () => {
     await expect(ReviewMcpBridge.start([{
       name: 'not-perkins-prefixed', description: 'x', inputSchema: { type: 'object' }, execute: async () => ({ text: '' }),
-    }])).rejects.toThrow(/invalid or duplicate native review tool name/u);
+    }])).rejects.toThrow(/invalid or duplicate native tool name/u);
     const tool = {
       name: 'perkins_ok', description: 'x', inputSchema: { type: 'object' }, execute: async () => ({ text: '' }),
     };
     await expect(ReviewMcpBridge.start([tool, { ...tool, name: 'perkins_ok' }]))
-      .rejects.toThrow(/invalid or duplicate native review tool name/u);
+      .rejects.toThrow(/invalid or duplicate native tool name/u);
   });
 
   it('rejects a tampered bundled MCP server before launching it', async () => {

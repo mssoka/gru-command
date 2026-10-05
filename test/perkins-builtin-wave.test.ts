@@ -90,6 +90,16 @@ class DeferredReviewPort implements WorktreePort {
     return lane;
   }
 
+  createChildWorktree(input: {
+    repoPath: string;
+    jobId: string;
+    childId: string;
+    parentPath: string;
+    authority: 'read-only' | 'writer';
+  }): Promise<WorktreeLane> {
+    return this.delegate.createChildWorktree(input);
+  }
+
   getWorktree(id: string): WorktreeLane | null { return this.delegate.getWorktree(id); }
   listWorktrees(options: { jobId?: string } = {}): readonly WorktreeLane[] { return this.delegate.listWorktrees(options); }
   release(input: { worktreeId: string }): Promise<WorktreeSweepResult> { return this.delegate.release(input); }
@@ -2268,6 +2278,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
       createJobWorktree: (input) => port.createJobWorktree(input),
       resolveReviewTarget: (input) => port.resolveReviewTarget(input),
       createReviewWorktree: (input) => port.createReviewWorktree(input),
+      createChildWorktree: (input) => port.createChildWorktree(input),
       getWorktree: (id) => port.getWorktree(id),
       listWorktrees: (listOpts) => port.listWorktrees(listOpts).map((lane) =>
         lane.roundId === outcome.round.id && lane.status === 'swept' ? { ...lane, status: 'active' } : lane),
@@ -4320,6 +4331,7 @@ describe('repair pass 3: restart recovery binding contract (R1/R2/R21)', () => {
       createJobWorktree: (input) => port.createJobWorktree(input),
       resolveReviewTarget: (input) => port.resolveReviewTarget(input),
       createReviewWorktree: (input) => port.createReviewWorktree(input),
+      createChildWorktree: (input) => port.createChildWorktree(input),
       getWorktree: (id) => port.getWorktree(id),
       listWorktrees: (opts) => port.listWorktrees(opts).filter((lane) => lane.roundId !== roundId),
       release: (input) => port.release(input),

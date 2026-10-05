@@ -47,6 +47,22 @@ export class ResidentBudget {
   get queued(): number { return this.waiting.length; }
   get available(): number { return this.capacity - this.used; }
 
+  /** Idle minions THIS budget would attempt to reclaim right now — the
+   * same role + health + eligibility predicate the reclaim path uses
+   * (read-only observation; no reservation, no side effects). */
+  eligibleIdleCount(): number {
+    let count = 0;
+    for (const [handle, record] of this.idle) {
+      if (handle.role !== 'minion') continue;
+      try {
+        if (handle.health().state === 'idle' && record.eligible()) count += 1;
+      } catch {
+        // A throwing probe is not eligibility.
+      }
+    }
+    return count;
+  }
+
   /** Keep an idle resident warm until the oldest safe one is needed. */
   watch(handle: AgentHandle, eligible: () => boolean, at: number = Date.now()): void {
     this.idle.set(handle, { eligible, at: handle.health().state === 'idle' && eligible() ? at : null,

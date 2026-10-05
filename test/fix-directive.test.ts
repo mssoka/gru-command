@@ -80,6 +80,8 @@ function minionRecord(id: string, jobId: string | null, sessionFile: string | nu
     state: 'idle',
     lastActivity: null,
     sessionFile,
+    parentAgentId: null,
+    parentage: null,
     createdAt: '2026-09-21T00:00:00.000Z',
     updatedAt: '2026-09-21T00:00:00.000Z',
   };
@@ -231,6 +233,7 @@ describe('eviction-safe fix directives (phase 3)', () => {
     await worktrees.createJobWorktree({ repoPath: repo.path, jobId: 'job-evict' });
     const ledgerEvents: Array<{ kind: string; payload: unknown }> = [];
     const ledger = {
+      getAgent: () => null,
       listAgents: () => [{ id: 'minion-live', role: 'minion', jobId: 'job-evict', sessionFile: '/sessions/failing.jsonl' }],
       registerAgent: (fields: { id: string }) => { ledgerEvents.push({ kind: 'agent', payload: fields }); },
       getJob: () => ({ briefing: 'original contract' }),
@@ -253,6 +256,7 @@ describe('eviction-safe fix directives (phase 3)', () => {
     cleanupRepos.push(repo);
     await worktrees.createJobWorktree({ repoPath: repo.path, jobId: 'job-resume' });
     const ledger = {
+      getAgent: () => null,
       listAgents: () => [{ id: 'minion-live', role: 'minion', jobId: 'job-resume', sessionFile: '/sessions/failing.jsonl' }],
       registerAgent: () => {},
       getJob: () => ({ briefing: 'original contract' }),
@@ -288,6 +292,7 @@ describe('the non-draft PR rule on follow-up directives', () => {
         disposeHandle: async () => {},
       },
       ledger: {
+        getAgent: () => null,
         listAgents: () => [{ id: 'minion-live', role: 'minion', jobId: 'job-live', sessionFile: null }],
         registerAgent: () => {},
         getJob: () => ({ briefing: 'original contract' }),
@@ -327,6 +332,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
         listAgents: () => [minionRecord('minion-live', 'job-cancel', '/sessions/live.jsonl')],
         registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
         getJob: () => null,
+        getAgent: () => null,
       },
       worktrees: { listWorktrees: () => [lane] } as never,
       jobId: 'job-cancel',
@@ -364,6 +370,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
         listAgents: () => [],
         registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
         getJob: () => null,
+        getAgent: () => null,
       },
       worktrees: { listWorktrees: () => [lane] } as never,
       jobId: 'job-cancel',
@@ -390,6 +397,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
         listAgents: () => [],
         registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
         getJob: () => null,
+        getAgent: () => null,
         setAgentState: (id) => minionRecord(id, 'job-cancel', null),
       },
       worktrees: { listWorktrees: () => [lane] } as never,
@@ -428,6 +436,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
           return minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null);
         },
         getJob: () => null,
+        getAgent: () => null,
         setAgentState: (id, state) => { states.push(`${id}:${state}`); return minionRecord(id, 'job-cancel', null); },
       },
       worktrees: { listWorktrees: () => [lane] } as never,
@@ -474,6 +483,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
         listAgents: () => [],
         registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
         getJob: () => null,
+        getAgent: () => null,
         setAgentState: (id) => minionRecord(id, 'job-cancel', null),
       },
       worktrees: { listWorktrees: () => [lane] } as never,
@@ -541,6 +551,7 @@ describe('per-prompt terminal verdict capture (r5 blocker 1)', () => {
       const routing = routeFixDirectiveToMinion({
         registry: { getHandle: () => handle, spawn: async () => handle, disposeHandle: async () => {} },
         ledger: {
+          getAgent: () => null,
           listAgents: () => [{ id: 'inner-queued', jobId: 'job-queued', role: 'minion', sessionFile: null }],
           registerAgent: () => {},
           getJob: () => null,

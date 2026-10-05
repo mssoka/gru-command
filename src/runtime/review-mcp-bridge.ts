@@ -141,8 +141,10 @@ export class ReviewMcpBridge {
   ): Promise<ReviewMcpBridge> {
     const tools = new Map<string, NativeAgentTool>();
     for (const definition of definitions) {
-      if (!/^perkins_[a-z0-9_]{1,48}$/.test(definition.name) || tools.has(definition.name)) {
-        throw new Error(`invalid or duplicate native review tool name: ${definition.name}`);
+      // Product-native tool names (review leads and, since issue #161,
+      // non-review parent sessions): a lowercase snake-ish identifier.
+      if (!/^[a-z][a-z0-9_]{1,63}$/.test(definition.name) || tools.has(definition.name)) {
+        throw new Error(`invalid or duplicate native tool name: ${definition.name}`);
       }
       tools.set(definition.name, definition);
     }

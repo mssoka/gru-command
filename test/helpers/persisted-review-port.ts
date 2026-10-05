@@ -68,6 +68,33 @@ export class PersistedReviewPort implements WorktreePort {
     return lane;
   }
 
+  /** Issue #161: real child lanes (detached read-only / branched writer),
+   * persisted like every other lane this port owns. */
+  async createChildWorktree(input: {
+    repoPath: string;
+    jobId: string;
+    childId: string;
+    parentPath: string;
+    authority: 'read-only' | 'writer';
+  }): Promise<WorktreeLane> {
+    const path = join(this.root, `child-${input.childId}`);
+    const base = execFileSync('git', ['-C', input.parentPath, 'rev-parse', 'HEAD'], { encoding: 'utf-8' }).trim();
+    const branch = input.authority === 'writer' ? `gru/${input.jobId}-child-${input.childId}` : null;
+    if (branch === null) {
+      execFileSync('git', ['-C', input.repoPath, 'worktree', 'add', '--detach', path, base], { stdio: 'ignore' });
+    } else {
+      execFileSync('git', ['-C', input.repoPath, 'worktree', 'add', '-b', branch, path, base], { stdio: 'ignore' });
+    }
+    const lanes = this.read();
+    const lane: WorktreeLane = {
+      id: input.childId, kind: 'child', repoPath: input.repoPath, repoName: 'fixture', path,
+      branch, sha: base, jobId: input.jobId, roundId: null, status: 'active',
+    };
+    lanes.set(lane.id, lane);
+    this.write(lanes);
+    return lane;
+  }
+
   getWorktree(id: string): WorktreeLane | null {
     return this.read().get(id) ?? null;
   }
@@ -80,8 +107,11 @@ export class PersistedReviewPort implements WorktreePort {
     const lanes = this.read();
     const lane = lanes.get(input.worktreeId);
     if (lane === undefined) throw new Error('missing lane');
-    if (lane.kind === 'review' && existsSync(lane.path)) {
+    if ((lane.kind === 'review' || lane.kind === 'child') && existsSync(lane.path)) {
       execFileSync('git', ['-C', lane.repoPath, 'worktree', 'remove', '--force', lane.path], { stdio: 'ignore' });
+      if (lane.branch !== null) {
+        execFileSync('git', ['-C', lane.repoPath, 'branch', '-D', lane.branch], { stdio: 'ignore' });
+      }
     }
     lanes.set(lane.id, { ...lane, status: 'swept' });
     this.write(lanes);

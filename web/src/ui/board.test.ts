@@ -1167,6 +1167,119 @@ describe('board agent rail — dense rows, tabs count, disposed collapse', () =>
     expect(row?.querySelector('.board-agent__state')?.textContent).toBe('streaming');
   });
 
+  it('distinguishes child workers from top-level minions with a parent link and family counters', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        agents: [
+          agent('parent-minion', {
+            role: 'minion',
+            label: 'Payment lane',
+            parentage: 'top-level',
+            childCounts: { queued: 1, active: 1, finished: 2, lifetimeCreations: 4 },
+          }),
+          agent('child-agent', {
+            role: 'minion',
+            label: 'child of Payment lane',
+            parentage: 'child',
+            parentAgentId: 'parent-minion',
+            child: {
+              id: 'child_1',
+              agentId: 'child-agent',
+              parentAgentId: 'parent-minion',
+              jobId: 'job-1',
+              purpose: 'audit',
+              authority: 'read-only',
+              state: 'done',
+              worktreeId: 'child_1',
+              branch: null,
+              resultState: 'done',
+              resultSummary: 'all clear',
+              resultRef: '/sessions/child.jsonl',
+              createdAt: '2026-01-01T00:00:00.000Z',
+              admittedAt: '2026-01-01T00:00:01.000Z',
+              startedAt: '2026-01-01T00:00:02.000Z',
+              finishedAt: '2026-01-01T00:01:00.000Z',
+            },
+          }),
+          agent('legacy-minion', { role: 'minion', label: 'legacy lane' }),
+        ],
+      }),
+    );
+    const rows = [...document.querySelectorAll<HTMLElement>('#board-agents .board-agent')];
+    const byName = new Map(rows.map((row) => [row.querySelector('.board-agent__name')?.textContent, row]));
+    // The parent renders its family counters and the top-level marker.
+    const parent = byName.get('Payment lane')!;
+    expect(parent.dataset.parentage).toBe('top-level');
+    expect(parent.querySelector('.board-agent__parentage')?.textContent).toBe('top-level');
+    expect(parent.querySelector('.board-agent__child-counts')?.textContent).toContain('4 children');
+    // A child row is labeled as a child and links back to its parent.
+    const child = byName.get('child of Payment lane')!;
+    expect(child.dataset.parentage).toBe('child');
+    expect(child.querySelector('.board-agent__role')?.textContent).toContain('child ·');
+    expect(child.querySelector('.board-agent__parent-link')?.textContent).toContain('Payment lane');
+    // A legacy row (no parentage field) is never claimed either way.
+    const legacy = byName.get('legacy lane')!;
+    expect(legacy.dataset.parentage).toBe('unknown');
+    expect(legacy.querySelector('.board-agent__parentage')).toBeNull();
+  });
+
+  it('navigates to a collapsed parent and activates rows from the keyboard', () => {
+    const opened: string[] = [];
+    const view = new BoardView(({ file }) => opened.push(file));
+    const childView = {
+      id: 'child_1',
+      agentId: 'child-agent',
+      parentAgentId: 'old-parent',
+      jobId: 'job-1',
+      purpose: 'audit',
+      authority: 'read-only' as const,
+      state: 'done' as const,
+      worktreeId: 'child_1',
+      branch: null,
+      resultState: 'done' as const,
+      resultSummary: 'all clear',
+      resultRef: '/sessions/child.jsonl',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      admittedAt: '2026-01-01T00:00:01.000Z',
+      startedAt: '2026-01-01T00:00:02.000Z',
+      finishedAt: '2026-01-01T00:01:00.000Z',
+    };
+    view.render(
+      snapshot({
+        agents: [
+          agent('child-agent', {
+            role: 'minion',
+            label: 'child of archived lane',
+            parentage: 'child',
+            parentAgentId: 'old-parent',
+            sessionFile: '/sessions/child-agent.jsonl',
+            child: childView,
+          }),
+          agent('old-parent', { role: 'minion', label: 'archived parent', parentage: 'top-level', state: 'disposed' }),
+        ],
+      }),
+    );
+    // The disposed parent row is collapsed: only the child is visible.
+    expect(document.querySelectorAll('#board-agents .board-agent')).toHaveLength(1);
+    const link = document.querySelector<HTMLButtonElement>('.board-agent__parent-link');
+    expect(link?.tagName).toBe('BUTTON');
+    // Keys pressed ON the nested link must not be hijacked by the row's
+    // transcript action (Enter bubbles; target !== row → ignored).
+    link?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    expect(opened).toEqual([]);
+    link?.click();
+    const rows = [...document.querySelectorAll<HTMLElement>('#board-agents .board-agent')];
+    expect(rows).toHaveLength(2);
+    expect(rows.some((row) => row.dataset.agentId === 'old-parent')).toBe(true);
+    // Rows carry button semantics and activate on Enter (div + keydown).
+    const childRow = rows.find((row) => row.dataset.agentId === 'child-agent')!;
+    expect(childRow.getAttribute('role')).toBe('button');
+    expect(childRow.tabIndex).toBe(0);
+    childRow.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    expect(opened).toEqual(['/sessions/child-agent.jsonl']);
+  });
+
   it('tints error rows with the alert accent', () => {
     const view = new BoardView(() => {});
     view.render(

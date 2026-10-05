@@ -39,6 +39,7 @@ import { routeFixDirectiveToMinion } from './dispatch/fix-directive.js';
 import { reconcilePendingRebriefs, reconcilePendingDirectives } from './dispatch/rebrief-recovery.js';
 import { adoptBlockedLanes, observeFollowUpDelivery, observePhaseCompletion, reconcilePhaseHandoffs, reconcileUnmarkedHandbacks } from './dispatch/obligations.js';
 import { createDispatchServer } from './dispatch/server.js';
+import { ChildWorkerService } from './dispatch/child-workers.js';
 import { createVerificationServer } from './verify/server.js';
 import type { VerificationQueueView } from './verify/scheduler.js';
 import { createService, type ServiceHandle } from './server.js';
@@ -77,7 +78,7 @@ import {
 } from './dispatch/review-path.js';
 import { loadPerkinsPolicy } from './dispatch/perkins-review/policy.js';
 import { getAgentDir } from '@earendil-works/pi-coding-agent';
-import type { SpawnOptions } from './runtime/types.js';
+import type { NativeAgentTool, SpawnOptions } from './runtime/types.js';
 
 /** Locate the installed bmad-review skill: check both the pi agent dir
  * and ~/.agents (the BMAD default install root) for maximum compatibility. */
@@ -332,6 +333,7 @@ async function main(): Promise<number> {
     silas?: SilasDriver;
     providerRecovery?: ProviderRecoverySensor;
     wave?: WaveRunner;
+    childWorkers?: ChildWorkerService;
     verify?: ReturnType<typeof createVerificationServer>;
     deployDrift?: DeployDriftTracker;
   } = {};
@@ -433,6 +435,13 @@ async function main(): Promise<number> {
             await state.wave.shutdown();
           } catch (error) {
             logger.error('Perkins review shutdown failed', { error: String(error) });
+          }
+        }
+        if (state.childWorkers !== undefined) {
+          try {
+            await state.childWorkers.dispose();
+          } catch (error) {
+            logger.error('child worker shutdown failed', { error: String(error) });
           }
         }
         if (state.verify !== undefined) {
@@ -1025,8 +1034,46 @@ async function main(): Promise<number> {
   const worktreeServer = createWorktreeServer({
     config,
     manager: worktreeManager,
+    ledger,
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
+  // Tracked child workers (issue #161): GC-owned nested workers. Kids
+  // ride the SAME spawner, resident budget and pacing gate as any other
+  // minion turn; GC owns admission, parentage, lifecycle and results.
+  // Constructed BEFORE the dispatcher: a dispatched parent's scoped
+  // capability is minted here and named in its briefing.
+  const childWorkers = new ChildWorkerService({
+    ledger,
+    worktrees: worktreeManager,
+    hostParentTools: registry.runtimeIdFor('minion') === 'pi',
+    spawner: (role: Role, spawnOptions?: SpawnOptions, residentRelease?: () => void) =>
+      residentRelease !== undefined
+        ? registry.spawnWithResident(role, spawnOptions ?? {}, residentRelease)
+        : registry.spawn(role, spawnOptions ?? {}),
+    workerGate: pacing.gate,
+    retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
+    stopSignal: serviceStop.signal,
+    reserveResident: (signal) => registry.reserveResident(signal),
+    residentProbe: () => ({
+      // The REAL budget eligibility (idle + its own reclaim predicate),
+      // never a bare health-state guess.
+      available: registry.residents.available,
+      reclaimable: registry.residents.eligibleIdleCount(),
+    }),
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  state.childWorkers = childWorkers;
+  // A child's supervision restart returns it to ITS lane with ITS bounded
+  // tools — never the default role spawn (which would widen a read-only
+  // child and move it out of its worktree).
+  supervisorLive.setRestartPolicy((agentId, role) => childWorkers.restartPolicy(agentId, role));
+  // Issue #161 declared capability gap: parent child-worker tools are
+  // in-process and therefore only hosted on runtimes that execute tools in
+  // the service process (pi). A claude-code minion receives no parent
+  // tools rather than a same-uid-discoverable bridge (see the adapter's
+  // refusal).
+  const parentToolsFor = (agentId: string): readonly NativeAgentTool[] =>
+    childWorkers.parentTools(agentId);
   const dispatcher = new DispatchService({
     ledger,
     worktrees: worktreeManager,
@@ -1034,6 +1081,7 @@ async function main(): Promise<number> {
     workerGate: pacing.gate,
     retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
     stopSignal: serviceStop.signal,
+    parentTools: parentToolsFor,
     ...(config.lessons.enabled ? { lessons: lessonReferences, lessonsCapture } : {}),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
@@ -1064,6 +1112,7 @@ async function main(): Promise<number> {
         directive: directiveInput.directive,
         signal: directiveInput.signal,
         owner: 'bmad-review-gate',
+        parentTools: parentToolsFor,
       }),
     },
     // Wave escalations carry bounded per-call identity context; the
@@ -1089,6 +1138,7 @@ async function main(): Promise<number> {
     notifications,
     workerGate: pacing.gate,
     retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
+    parentTools: parentToolsFor,
     stopSignal: serviceStop.signal,
     log: (level, msg, fields) => logger.log(level, msg, fields),
     stopping: () => shuttingDown,
@@ -1100,6 +1150,14 @@ async function main(): Promise<number> {
       redispatched: rebriefRecovery.redispatched,
       retired: rebriefRecovery.retired,
     });
+  }
+  // Child-worker restart safety (issue #161): a child that never bound a
+  // session re-runs under the same identity; one that had a live session
+  // is terminally failed with the honest reason (its transcript stays
+  // readable) — never a fabricated `done`.
+  const childRecovery = childWorkers.reconcileOnBoot();
+  if (childRecovery.resumed > 0 || childRecovery.failed > 0) {
+    logger.info('child worker reconciliation', childRecovery);
   }
   // Directive-request restart safety (phase 3): a request accepted before
   // the crash reconciles from correlated evidence when it exists; when
@@ -1209,6 +1267,7 @@ async function main(): Promise<number> {
     dispatch: dispatcher,
     wave,
     ledger,
+    childWorkers,
     workerGate: pacing.gate,
     retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
     ...(config.silas.enabled && silasSlot !== null

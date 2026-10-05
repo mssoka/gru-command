@@ -349,9 +349,11 @@ export function digestActionCount(digest: SilasOpsDigest): number {
   );
 }
 
-/** Job lane record as the digest needs it (registry worktree shape). */
+/** Job lane record as the digest needs it (registry worktree shape).
+ * Issue #161: 'child' lanes share the job scope but are never selected as
+ * the job's own lane. */
 interface DigestLane {
-  readonly kind: 'job' | 'review';
+  readonly kind: 'job' | 'review' | 'child';
   readonly status: 'active' | 'paused' | 'swept';
   readonly path: string;
   readonly branch: string | null;
@@ -810,7 +812,8 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       const lane = (input.worktrees?.listWorktrees({ jobId: job.id }) ?? []).find((candidate) => candidate.kind === 'job');
       const minion = input.ledger
         .listAgents()
-        .filter((agent) => agent.jobId === job.id && agent.role === 'minion')
+        // Issue #161: child workers are not the job's writer lane.
+        .filter((agent) => agent.jobId === job.id && agent.role === 'minion' && agent.parentage !== 'child')
         .sort((a, b) => (b.lastActivity ?? b.createdAt).localeCompare(a.lastActivity ?? a.createdAt))[0];
       digest.deliveredWithoutPr.push({
         jobId: job.id,
@@ -925,7 +928,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     if (stallEligible && !currentPhaseDelivered && !stallOperationOwns) {
       const boundMinions = input.ledger
         .listAgents()
-        .filter((agent) => agent.jobId === job.id && agent.role === 'minion');
+        .filter((agent) => agent.jobId === job.id && agent.role === 'minion' && agent.parentage !== 'child');
       // The SAME attribution the board renders (stoppedWorkersByJob): a
       // bound minion is live unless its supervision view says stopped or
       // breaker-open, and a disposed unsupervised record is not a worker.

@@ -64,11 +64,51 @@ export interface JobView {
   readonly lastAgentActivity: string | null;
 }
 
+/** Issue #161: one tracked child worker (sub-minion). */
+export interface ChildWorkerView {
+  readonly id: string;
+  readonly agentId: string | null;
+  readonly parentAgentId: string;
+  readonly jobId: string;
+  readonly purpose: string;
+  readonly authority: 'read-only' | 'writer';
+  readonly state: 'queued' | 'admitted' | 'active' | 'done' | 'error' | 'cancelled';
+  readonly worktreeId: string | null;
+  readonly branch: string | null;
+  readonly resultState: 'done' | 'error' | 'cancelled' | null;
+  readonly resultSummary: string | null;
+  readonly resultRef: string | null;
+  readonly createdAt: string;
+  readonly admittedAt: string | null;
+  readonly startedAt: string | null;
+  readonly finishedAt: string | null;
+}
+
+/** Issue #161: child counters. Present-state counts are derived from the
+ * durable records; `lifetimeCreations` counts LOGICAL creations (one per
+ * admitted child request), so retries and resumes never double-count. */
+export interface ChildWorkerCounts {
+  readonly queued: number;
+  readonly active: number;
+  readonly finished: number;
+  readonly lifetimeCreations: number;
+}
+
 export interface AgentView {
   readonly id: string;
   readonly role: string;
   readonly label: string | null;
   readonly state: string;
+  /** Issue #161 parentage category. Optional: pre-upgrade servers omit it
+   * and the board renders no top-level/child distinction (`undefined` =
+   * no information; `null` = the server says genuinely unknown). */
+  readonly parentage?: 'top-level' | 'child' | null;
+  /** Issue #161 parent link for child rows (parent navigation). */
+  readonly parentAgentId?: string | null;
+  /** The child record when this row IS a tracked child. */
+  readonly child?: ChildWorkerView | null;
+  /** Family counters on a parent row with admitted children. */
+  readonly childCounts?: ChildWorkerCounts | null;
   /** Issue #171 truthful display status: the raw adapter state corrected
    * by supervision activity evidence (raw `idle` + open turn →
    * `streaming`). Optional: pre-upgrade servers omit it and the board
@@ -243,6 +283,9 @@ export interface BoardSnapshot {
   /** FOR YOU PR rows (owner approval 2026-09-28); absent on pre-upgrade
   * servers (validator tolerates; the band renders ack rows only). */
   readonly ownerPrs?: readonly OwnerPrView[] | null;
+  /** Issue #161: tracker-wide child counters; absent on pre-upgrade
+  * servers (the strip then renders no child numbers). */
+  readonly children?: ChildWorkerCounts | null;
 }
 
 export interface TranscriptInfo {
@@ -337,6 +380,37 @@ const SUPERVISION_STATES = ['watching', 'restarting', 'stopped'] as const;
 /** Issue #171 runtime membership classes: an unknown value is a server
  * bug, never a silently tolerated value. */
 const RUNTIME_CLASSES = ['current', 'historical', 'unverified'] as const;
+
+/** Issue #161: honest parentage categories (null = genuinely unknown). */
+const PARENTAGES = ['top-level', 'child'] as const;
+
+function isParentage(value: unknown): value is (typeof PARENTAGES)[number] {
+  return typeof value === 'string' && (PARENTAGES as readonly string[]).includes(value);
+}
+
+/** Issue #161: a present child counter block is typed strictly — a
+ * malformed count must never render as a number the server did not
+ * prove. */
+function isChildCounts(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  return (['queued', 'active', 'finished', 'lifetimeCreations'] as const).every(
+    (key) => typeof value[key] === 'number' && Number.isSafeInteger(value[key]) && (value[key] as number) >= 0,
+  );
+}
+
+/** Issue #161: a present child view must at least carry a real identity
+ * and lifecycle state; the rest of the projection is renderable. */
+function isChildView(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  return (
+    typeof value.id === 'string' &&
+    typeof value.parentAgentId === 'string' &&
+    typeof value.jobId === 'string' &&
+    typeof value.purpose === 'string' &&
+    (value.authority === 'read-only' || value.authority === 'writer') &&
+    (['queued', 'admitted', 'active', 'done', 'error', 'cancelled'] as readonly unknown[]).includes(value.state)
+  );
+}
 
 function isRuntimeClass(value: unknown): value is (typeof RUNTIME_CLASSES)[number] {
   return typeof value === 'string' && (RUNTIME_CLASSES as readonly string[]).includes(value);
@@ -570,6 +644,9 @@ export function isValidSnapshot(value: unknown): value is BoardSnapshot {
   // present block must match its shape — readiness is server authority.
   if (value.ownerPrs !== undefined && value.ownerPrs !== null && !Array.isArray(value.ownerPrs)) return false;
   if (Array.isArray(value.ownerPrs) && !value.ownerPrs.every(isOwnerPrView)) return false;
+  // Issue #161: the tracker-wide child counters are optional (pre-upgrade
+  // servers) but strictly typed when present.
+  if (value.children !== undefined && value.children !== null && !isChildCounts(value.children)) return false;
   const agentsOk = value.agents.every(
     (agent) =>
       isRecord(agent) &&
@@ -581,6 +658,16 @@ export function isValidSnapshot(value: unknown): value is BoardSnapshot {
       // status string must never reach the rail split as a false read.
       (agent.status === undefined || isAgentStateName(agent.status)) &&
       (agent.runtime === undefined || agent.runtime === null || isRuntimeClass(agent.runtime)) &&
+      // Issue #161 child fields are optional (pre-upgrade servers); when a
+      // server does send them, the parentage marker and counters are typed.
+      (agent.parentage === undefined || agent.parentage === null || isParentage(agent.parentage)) &&
+      (agent.parentAgentId === undefined ||
+        agent.parentAgentId === null ||
+        typeof agent.parentAgentId === 'string') &&
+      (agent.child === undefined || agent.child === null || isChildView(agent.child)) &&
+      (agent.childCounts === undefined ||
+        agent.childCounts === null ||
+        isChildCounts(agent.childCounts)) &&
       // createdAt is optional (pre-upgrade servers); present, it must be
       // a parseable date — the stall floor reads it directly and a junk
       // string would silently remove the floor (code review 2026-10-04).

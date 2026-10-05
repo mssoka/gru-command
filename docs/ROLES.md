@@ -45,6 +45,17 @@ gets bash, edit, write, general tasks, or nested delegation. Minions get
 the full editing set; Gru/Silas/Bob carry operational tool sets. Runtime
 adapters enforce the same policy natively.
 
+Tracked child workers (issue #161) are a RELATIONSHIP over minion-role
+sessions, not a sixth role: a top-level minion can commission a child
+through the GC-mediated `request_child_worker` / `list_child_workers` /
+`cancel_child_worker` tools (bound to its own agent id by closure; the
+HTTP surface stays the operator's), and the child's row carries
+`parentage = 'child'`. The declared `authority` narrows the runtime's own
+tool set (`read-only` children get read/grep/find/ls; `writer` children
+get the minion set and their own branch), children cannot commission
+further children, and a child never exceeds its parent's authority. See
+[FLOW.md §4e](./FLOW.md) for the admission and result surfaces.
+
 ## Skills
 
 Skill ids are declared per role (`src/roles.ts`) for ordinary sessions.
