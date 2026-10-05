@@ -302,14 +302,30 @@ describe('pipeline ledger — evaluation, order and projection', () => {
     const blocked = (): string | null =>
       ledger.pipelineBoardView(FULL_CAPACITY).entries.find((entry) => entry.id === 'pipe-b')?.reason ?? null;
     // A dispatch that committed the job row but never started a worker
-    // (no agent row, no worktree, no minion-spawned event) is adopted per
-    // the approved matrix — but its admitted milestone cannot release a
-    // dependent until worker evidence exists.
+    // (no agent row, no minion-spawned event) is adopted per the approved
+    // matrix — but its admitted milestone cannot release a dependent
+    // until worker evidence exists.
     ledger.claimPipelineEntry({ id: 'pipe-a', holder: 'silas' });
     ledger.addJob({ id: 'pipe-a', repo: 'demo', title: 'Entry pipe-a', briefing: 'Briefing for pipe-a' });
     ledger.markPipelineAdmitted({ id: 'pipe-a', jobId: 'pipe-a' });
     expect(blocked()).toContain('waiting for pipe-a to be admitted');
-    ledger.appendCustomEvent({ kind: 'job.minion-spawned', jobId: 'pipe-a', payload: {} });
+    // The failed-spawn trap (Perkins r1 blocker 1): real dispatch creates
+    // the worktree BEFORE spawning and retains it as swept when the spawn
+    // fails — a worktree row is NOT worker-start evidence.
+    ledger.registerWorktree({
+      id: 'lane-pipe-a',
+      kind: 'job',
+      repoPath: '/tmp/demo',
+      repoName: 'demo',
+      path: '/tmp/demo-lane',
+      sha: '0'.repeat(40),
+      jobId: 'pipe-a',
+    });
+    ledger.setWorktreeStatus('lane-pipe-a', 'swept', 'spawn failed');
+    expect(blocked()).toContain('waiting for pipe-a to be admitted');
+    // A registered worker agent (dispatch registers it only after a
+    // successful spawn) is real evidence and releases the dependent.
+    ledger.registerAgent({ id: 'minion_pipe_a', role: 'minion', sessionFile: null, jobId: 'pipe-a', parentage: 'top-level' });
     expect(blocked()).toBeNull();
     db.close();
   });

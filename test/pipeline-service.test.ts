@@ -43,6 +43,7 @@ function boot(
     budget?: { acquire: (signal?: AbortSignal) => Promise<() => void> };
     ledger?: LedgerApi;
     bus?: EventBus;
+    capacityFn?: () => PipelineCapacityView;
   } = {},
 ): Harness {
   const dir = mkdtempSync(join(tmpdir(), 'gru-pipeline-service-'));
@@ -77,7 +78,7 @@ function boot(
   const service = new PipelineService({
     ledger,
     dispatch: port,
-    capacity: () => ({ ...harness.capacity }),
+    capacity: overrides.capacityFn ?? (() => ({ ...harness.capacity })),
     ...(overrides.budget === undefined ? {} : { budget: overrides.budget }),
     ...(overrides.retryBackoffMs === undefined ? {} : { retryBackoffMs: overrides.retryBackoffMs }),
     bus,
@@ -421,6 +422,166 @@ describe('pipeline service — failure and crash reconciliation', () => {
     await h.service.whenIdle();
     expect(h.calls.map((call) => call.jobId)).toEqual(['pipe-a', 'pipe-b', 'pipe-d']);
     expect(h.service.entry('pipe-d')?.state).toBe('admitted');
+    h.db.close();
+  });
+});
+
+describe('pipeline service — live recovery (Perkins r1 blockers 3-5)', () => {
+  it('reconciles an admitting claim with no in-flight dispatch in a LIVE pass (no restart needed)', async () => {
+    const h = boot();
+    h.service.enqueue({ id: 'pipe-a', repoPath: '/tmp/demo', title: 'A', briefing: 'A' });
+    await h.service.whenIdle();
+    expect(h.calls).toHaveLength(1);
+    // Freeze capacity so the live service cannot race the hand-crafted
+    // stuck claim (as if a claim-release write failed after dispatch).
+    h.capacity = { capacity: 4, occupied: 4, queued: 0, available: 0 };
+    h.ledger.enqueuePipelineEntry({ id: 'pipe-b', repoPath: '/tmp/demo', title: 'B', briefing: 'B' });
+    expect(h.ledger.claimPipelineEntry({ id: 'pipe-b', holder: 'silas-pipeline' })?.state).toBe('admitting');
+    // The next live pass reconciles the stale claim — no restart.
+    h.capacity = { capacity: 4, occupied: 0, queued: 0, available: 4 };
+    h.service.schedule();
+    await h.service.whenIdle();
+    expect(h.service.entry('pipe-b')?.state).toBe('admitted');
+    expect(h.calls.map((call) => call.jobId)).toEqual(['pipe-a', 'pipe-b']);
+    h.db.close();
+  });
+
+  it('live recovery ADOPTS a stale claim whose job already exists — never re-dispatches it', async () => {
+    const h = boot();
+    h.capacity = { capacity: 4, occupied: 4, queued: 0, available: 0 };
+    h.ledger.enqueuePipelineEntry({ id: 'pipe-c', repoPath: '/tmp/demo', title: 'C', briefing: 'C' });
+    h.ledger.claimPipelineEntry({ id: 'pipe-c', holder: 'silas-pipeline' });
+    h.ledger.addJob({ id: 'pipe-c', repo: 'demo', title: 'C', briefing: 'C' });
+    h.capacity = { capacity: 4, occupied: 0, queued: 0, available: 4 };
+    h.service.schedule();
+    await h.service.whenIdle();
+    expect(h.service.entry('pipe-c')?.state).toBe('admitted');
+    expect(h.calls).toHaveLength(0); // adopted, never dispatched
+    h.db.close();
+  });
+
+  it('propagates a transient finalization failure through the bounded backoff, then adopts once bookkeeping heals', async () => {
+    vi.useFakeTimers();
+    try {
+      const real = (() => {
+        const dir = mkdtempSync(join(tmpdir(), 'gru-pipeline-service-b4a-'));
+        cleanupDirs.push(dir);
+        const db = new LedgerDb(dir);
+        const bus = new EventBus({});
+        return { db, bus, ledger: new LedgerApi(db.handle, { bus }) };
+      })();
+      let markCalls = 0;
+      const flaky: LedgerApi = new Proxy(real.ledger, {
+        get(target, property, receiver) {
+          if (property === 'markPipelineAdmitted') {
+            return (input: Parameters<LedgerApi['markPipelineAdmitted']>[0]) => {
+              markCalls += 1;
+              if (markCalls === 1) throw new Error('transient bookkeeping failure');
+              return target.markPipelineAdmitted(input);
+            };
+          }
+          return Reflect.get(target, property, receiver);
+        },
+      });
+      const h = boot(undefined, { retryBackoffMs: 5_000, ledger: flaky, bus: real.bus });
+      h.service.enqueue({ id: 'pipe-a', repoPath: '/tmp/demo', title: 'A', briefing: 'A' });
+      await h.service.whenIdle();
+      // The dispatch side effect committed the job; finalization failed.
+      // The port's own minion-spawned event is a genuine NATURAL trigger,
+      // so the retry runs immediately (superseding the timer): the entry
+      // is admitted exactly once, never left admitting, never duplicated.
+      expect(h.service.entry('pipe-a')?.state).toBe('admitted');
+      expect(markCalls).toBe(2);
+      const jobs = h.ledger.listJobs().filter((job) => job.id === 'pipe-a');
+      expect(jobs).toHaveLength(1);
+      // No further work is owed: advancing time changes nothing.
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(markCalls).toBe(2);
+      expect(h.calls).toHaveLength(2);
+      h.db.close();
+      real.db.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('stands down a persistently failing finalization after the bounded attempts (no tight loop)', async () => {
+    vi.useFakeTimers();
+    try {
+      const real = (() => {
+        const dir = mkdtempSync(join(tmpdir(), 'gru-pipeline-service-b4b-'));
+        cleanupDirs.push(dir);
+        const db = new LedgerDb(dir);
+        const bus = new EventBus({});
+        return { db, bus, ledger: new LedgerApi(db.handle, { bus }) };
+      })();
+      let markCalls = 0;
+      const broken: LedgerApi = new Proxy(real.ledger, {
+        get(target, property, receiver) {
+          if (property === 'markPipelineAdmitted') {
+            return () => {
+              markCalls += 1;
+              throw new Error('persistent bookkeeping failure');
+            };
+          }
+          return Reflect.get(target, property, receiver);
+        },
+      });
+      const h = boot(undefined, { retryBackoffMs: 5_000, ledger: broken, bus: real.bus });
+      h.service.enqueue({ id: 'pipe-a', repoPath: '/tmp/demo', title: 'A', briefing: 'A' });
+      await h.service.whenIdle();
+      // One immediate retry via the port's natural job event; the entry is
+      // reconciled back to waiting, never left admitting.
+      expect(markCalls).toBe(2);
+      expect(h.service.entry('pipe-a')?.state).toBe('waiting');
+      // Timed retries continue only while the bounded counter allows:
+      // attempts stop after the fourth failed finalization (stand-down),
+      // and NEVER spin.
+      for (let i = 0; i < 8; i += 1) await vi.advanceTimersByTimeAsync(5_000);
+      expect(markCalls).toBe(4);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(markCalls).toBe(4);
+      expect(h.service.entry('pipe-a')?.state).toBe('waiting');
+      h.db.close();
+      real.db.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('an intentional wake disarm never opens the refusal window — hold then clear-hold still admits on the real budget', async () => {
+    const { ResidentBudget } = await import('../src/runtime/resident-budget.js');
+    const budget = new ResidentBudget(1);
+    const held = await budget.acquire(1); // the pool is full
+    const h = boot(undefined, {
+      budget: { acquire: (signal) => budget.acquire(1, signal) },
+      capacityFn: () => ({
+        capacity: budget.capacity,
+        occupied: budget.occupied,
+        queued: budget.queued,
+        available: budget.capacity - budget.occupied,
+      }),
+    });
+    h.service.enqueue({ id: 'pipe-a', repoPath: '/tmp/demo', title: 'A', briefing: 'A' });
+    await h.service.whenIdle();
+    expect(h.calls).toHaveLength(0);
+    expect(budget.queued).toBe(1); // demand registered with the real budget
+    // Hold the ONLY eligible entry: the pass disarms its wake acquire —
+    // an intentional cancellation, not capacity feedback.
+    h.service.hold('pipe-a', 'owner deciding');
+    await h.service.whenIdle();
+    expect(budget.queued).toBe(0);
+    // Clear the hold while the pool is STILL full: demand must re-register
+    // (a refusal-window bug would block this for 60 s).
+    h.service.clearHold('pipe-a', 'approved');
+    await h.service.whenIdle();
+    expect(budget.queued).toBe(1);
+    // Freeing the permit grants the queued demand; admission follows.
+    held();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await h.service.whenIdle();
+    expect(h.calls.map((call) => call.jobId)).toEqual(['pipe-a']);
+    expect(h.service.entry('pipe-a')?.state).toBe('admitted');
     h.db.close();
   });
 });

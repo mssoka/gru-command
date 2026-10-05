@@ -280,7 +280,10 @@ export class BoardView {
    * each section. Every section always exists (empty sections carry a
    * compact empty state), so every shortcut has a valid labelled target. */
   private renderNav(snapshot: BoardSnapshot): void {
-    const sections = boardSections(snapshot);
+    // SAME worker-aware derivation as the section bodies (one source per
+    // render): a fresh worker on an old lane moves the band in both the
+    // counts and the rows, never in one alone.
+    const sections = this.sectionsFor(snapshot);
     const nav = this.boardNav;
     nav.hidden = false;
     nav.replaceChildren();
@@ -322,19 +325,34 @@ export class BoardView {
         return;
       }
     }
-    // The exact control is gone (its job moved into a COLLAPSED section —
-    // For Gru or count-only Cold): focus that section's disclosure toggle
-    // instead of dropping focus to <body>. The operator lands one gesture
-    // away from the row they were on, never lost.
+    // The exact control is gone. Focus must land somewhere intentional,
+    // never on <body> (Perkins r1 blocker 7): a section disclosure that
+    // disappeared (a count fell under its preview limit) falls back to
+    // its ALWAYS-PRESENT shortcut in the sticky strip; a job row that
+    // moved into a COLLAPSED section (For Gru or count-only Cold) falls
+    // back to that section's disclosure toggle — one gesture away.
+    const sectionKey = /^section:([a-z-]+)$/u.exec(key);
+    if (sectionKey !== null) {
+      this.boardNav.querySelector<HTMLElement>(`.board-nav__link[data-nav="${sectionKey[1]}"]`)?.focus();
+      return;
+    }
     const jobKey = /^job:(.+)$/u.exec(key);
     if (jobKey !== null) {
       const jobId = jobKey[1];
       const row = this.mount.querySelector<HTMLElement>(`[data-job-id="${jobId}"]`);
-      const band = row?.closest('.board-band');
+      const band = row?.closest<HTMLElement>('.board-band');
       const toggle = band?.querySelector<HTMLElement>('.board-band__more') ?? null;
       if (toggle !== null && toggle.getAttribute('aria-expanded') === 'false') {
         toggle.focus();
         return;
+      }
+      const section = band?.dataset.section ?? null;
+      if (section !== null) {
+        const navLink = this.boardNav.querySelector<HTMLElement>(`.board-nav__link[data-nav="${section}"]`);
+        if (navLink !== null) {
+          navLink.focus();
+          return;
+        }
       }
       const collapsed = this.mount.querySelector<HTMLElement>(
         '.board-band[data-section="for-gru"] .board-band__more, .board-band[data-section="cold"] .board-band__more',

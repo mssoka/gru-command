@@ -98,6 +98,18 @@ function optStrField(body: Record<string, unknown>, field: string): string | und
   return typeof value === 'string' && value.trim() !== '' ? value : undefined;
 }
 
+/** A present-but-malformed optional field is a 400, never a silent drop:
+ * safety-relevant fields (an owner hold) must never degrade into their
+ * absent default (Perkins r1 blocker 2). */
+function optStrFieldStrict(body: Record<string, unknown>, field: string): string | undefined {
+  if (!(field in body)) return undefined;
+  const value = body[field];
+  if (typeof value !== 'string') {
+    throw new Error(`${field} must be a string when present`);
+  }
+  return value.trim() === '' ? undefined : value;
+}
+
 /** Issue #161: the wire shape of one tracked child worker (snake_case,
  * like the rest of the dispatch API). */
 function childView(record: ChildWorkerRecord): Record<string, unknown> {
@@ -568,7 +580,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           ...(priorityField !== undefined ? { priority: priorityField as number } : {}),
           ...(optPrerequisitesField(body) !== undefined ? { prerequisites: optPrerequisitesField(body) } : {}),
           ...(scopes !== undefined ? { exclusiveScopes: scopes } : {}),
-          ...(optStrField(body, 'hold_reason') !== undefined ? { holdReason: optStrField(body, 'hold_reason') } : {}),
+          ...(optStrFieldStrict(body, 'hold_reason') !== undefined ? { holdReason: optStrFieldStrict(body, 'hold_reason') } : {}),
           by: byField(body) ?? null,
         });
       } catch (error) {

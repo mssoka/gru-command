@@ -2522,3 +2522,85 @@ describe('board — compact owner-first presentation (j-1064)', () => {
     }
   });
 });
+
+describe('board v6 — one worker-aware derivation for strip and sections (Perkins r1 blockers 6-7)', () => {
+  beforeEach(mountBoardDom);
+
+  it('a fresh minion on an old lane counts In flight in BOTH the strip and the section', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        jobs: [
+          baseJob({
+            id: 'old-lane-fresh-worker',
+            status: 'working',
+            rounds: [],
+            lastAgentActivity: new Date(Date.now() - 90 * 60_000).toISOString(),
+          }),
+        ],
+        agents: [
+          agent('minion-fresh', {
+            role: 'minion',
+            jobId: 'old-lane-fresh-worker',
+            state: 'streaming',
+            lastActivity: new Date().toISOString(),
+          }),
+        ],
+      }),
+    );
+    // The live-worker stamp keeps the lane on the stall clock's floor:
+    // In flight (no alert) in the section rows AND the strip count.
+    const row = document.querySelector<HTMLElement>('.board-band--in-flight .board-job');
+    expect(row?.getAttribute('data-job-id')).toBe('old-lane-fresh-worker');
+    expect(row?.querySelector('.board-job__stale')).toBeNull();
+    expect(document.querySelector<HTMLElement>('.board-nav__link[data-nav="in-flight"] .board-nav__count')?.textContent).toBe('1');
+    expect(document.querySelector<HTMLElement>('.board-nav__link[data-nav="cold"] .board-nav__count')?.textContent).toBe('0');
+  });
+
+  it('focus falls to the section shortcut when the disclosure it was on disappears (count drop)', () => {
+    const view = new BoardView(() => {});
+    const entry = (index: number): Record<string, unknown> => ({
+      id: `pipe-${index}`,
+      repo: 'demo',
+      title: `Queued ${index}`,
+      priority: 5,
+      enqueueSeq: index,
+      state: 'waiting',
+      reason: null,
+      queuedAt: '2026-01-01T00:00:00.000Z',
+    });
+    const six = Array.from({ length: 6 }, (_, index) => entry(index + 1));
+    view.render(snapshot({ jobs: [], pipeline: { entries: six as never, pending: 6 } }));
+    const toggle = document.querySelector<HTMLElement>('.board-band--pipeline .board-band__more');
+    expect(toggle?.dataset.focusKey).toBe('section:pipeline');
+    toggle?.focus();
+    expect(document.activeElement).toBe(toggle);
+    // The next snapshot has five entries: the Show all toggle is gone.
+    view.render(snapshot({ jobs: [], pipeline: { entries: six.slice(0, 5) as never, pending: 5 } }));
+    const active = document.activeElement;
+    expect(active).toBeInstanceOf(HTMLElement);
+    expect((active as HTMLElement).classList.contains('board-nav__link')).toBe(true);
+    expect((active as HTMLElement).getAttribute('data-nav')).toBe('pipeline');
+  });
+
+  it('focus falls to the section shortcut when the pipeline empties under the focused disclosure', () => {
+    const view = new BoardView(() => {});
+    const entry = (index: number): Record<string, unknown> => ({
+      id: `pipe-${index}`,
+      repo: 'demo',
+      title: `Queued ${index}`,
+      priority: 5,
+      enqueueSeq: index,
+      state: 'waiting',
+      reason: null,
+      queuedAt: '2026-01-01T00:00:00.000Z',
+    });
+    const six = Array.from({ length: 6 }, (_, index) => entry(index + 1));
+    view.render(snapshot({ jobs: [], pipeline: { entries: six as never, pending: 6 } }));
+    document.querySelector<HTMLElement>('.board-band--pipeline .board-band__more')?.focus();
+    view.render(snapshot({ jobs: [], pipeline: { entries: [], pending: 0 } }));
+    const active = document.activeElement;
+    expect((active as HTMLElement).classList.contains('board-nav__link')).toBe(true);
+    expect((active as HTMLElement).getAttribute('data-nav')).toBe('pipeline');
+  });
+});

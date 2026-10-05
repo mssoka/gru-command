@@ -165,6 +165,20 @@ describe('pipeline HTTP surface', () => {
     expect(after.body.pending).toBe(0);
   });
 
+  it('rejects a malformed hold_reason outright — never a silently unheld executable entry', async () => {
+    const h = await boot({ available: 0 });
+    const numeric = await api(h, 'POST', '/api/pipeline/enqueue', { ...ENQUEUE, hold_reason: 123 });
+    expect(numeric.status).toBe(400);
+    expect(String(numeric.body.detail)).toContain('hold_reason must be a string');
+    const boolean = await api(h, 'POST', '/api/pipeline/enqueue', { ...ENQUEUE, hold_reason: true });
+    expect(boolean.status).toBe(400);
+    // No durable side effect at all: nothing was accepted or executed.
+    expect(h.ledger.getPipelineEntry('pipe-http-a')).toBeNull();
+    expect(h.calls).toHaveLength(0);
+    const list = await api(h, 'GET', '/api/pipeline');
+    expect(list.body.pending).toBe(0);
+  });
+
   it('validates priority and prerequisite milestones at the boundary', async () => {
     const h = await boot();
     expect((await api(h, 'POST', '/api/pipeline/enqueue', { ...ENQUEUE, priority: 99 })).status).toBe(400);

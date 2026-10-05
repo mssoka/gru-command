@@ -120,6 +120,9 @@ const MAX_CONSECUTIVE_PASS_FAILURES = 3;
 /** After a budget wake refusal (reclaim exhaustion), do not re-register
  * demand for this window; natural triggers still admit directly. */
 const WAKE_REFUSAL_WINDOW_MS = 60_000;
+/** Consecutive admission-finalization failures before the backoff stands
+ * down for a natural trigger (bounded, never a tight loop). */
+const MAX_CONSECUTIVE_FINALIZE_FAILURES = 3;
 
 /** Reconsideration triggers are EXTERNAL facts — exactly the inputs the
  * evaluator reads. New accepted work (pipeline.enqueued), a deliberate
@@ -155,6 +158,14 @@ export class PipelineService {
   private wakeAbort: AbortController | null = null;
   private wakePending = false;
   private wakeRefusedUntil = 0;
+  /** Entries with a live in-flight dispatch claim (this process). An
+   * `admitting` row NOT in this set is recovery debt a live pass must
+   * reconcile — never invisible until a restart (Perkins r1 blocker 3). */
+  private readonly inFlightAdmissions = new Set<string>();
+  /** Consecutive admission-finalization failures: after three, the
+   * backoff stands down and waits for a natural trigger (bounded, never
+   * a tight loop — Perkins r1 blocker 4). */
+  private consecutiveFinalizeFailures = 0;
 
   constructor(opts: PipelineServiceOptions) {
     this.opts = opts;
@@ -244,25 +255,29 @@ export class PipelineService {
     let requeued = 0;
     for (const entry of this.opts.ledger.listPipelineEntries({ states: ['admitting'] })) {
       examined += 1;
-      const job = this.opts.ledger.getJob(entry.id);
-      if (job !== null && job.briefing === entry.briefing) {
-        if (this.finalizeAdmission(entry)) {
-          adopted += 1;
-        } else {
-          requeued += 1;
-        }
-        continue;
-      }
-      this.opts.ledger.releasePipelineClaim({
-        id: entry.id,
-        reason: 'service restart during admission',
-        outcome: 'reconciled',
-        note: 'reconciled at boot before any admission evidence existed — the accepted brief is intact and will be reconsidered',
-      });
-      requeued += 1;
+      if (this.reconcileClaim(entry) === 'adopted') adopted += 1;
+      else requeued += 1;
     }
     this.schedule();
     return { examined, adopted, requeued };
+  }
+
+  /** Shared claim reconciliation (boot AND live recovery — Perkins r1
+   * blocker 3): a claim whose dispatch is NOT in flight is recovery
+   * debt. Adopt a committed matching job (never re-dispatch); otherwise
+   * return the accepted brief to waiting with the brief intact. */
+  private reconcileClaim(entry: PipelineEntryRecord): 'adopted' | 'requeued' {
+    const job = this.opts.ledger.getJob(entry.id);
+    if (job !== null && job.briefing === entry.briefing) {
+      return this.finalizeAdmission(entry) ? 'adopted' : 'requeued';
+    }
+    this.opts.ledger.releasePipelineClaim({
+      id: entry.id,
+      reason: 'admission recovery: no committed job for the claim',
+      outcome: 'reconciled',
+      note: 'reconciled before any admission evidence existed — the accepted brief is intact and will be reconsidered',
+    });
+    return 'requeued';
   }
 
   /** Coalesced trigger; safe to call from any event. A natural trigger
@@ -306,7 +321,9 @@ export class PipelineService {
       // A pass failure is loud and bounded: the durable queue keeps the
       // truth, a one-shot backoff retry owns recovery when no natural
       // trigger arrives, and after three consecutive failed passes the
-      // consumer stands down for a natural trigger (never spins).
+      // consumer stands down for a natural trigger (never spins). A
+      // claim left admitting by the failure is recovered by the next
+      // pass's stale-claim reconciliation (or boot).
       this.consecutivePassFailures += 1;
       this.log('error', 'pipeline reconsider pass failed', {
         error: String(error),
@@ -347,6 +364,13 @@ export class PipelineService {
         this.opts.ledger.setPipelineEntryState({ id: entry.id, state: target, reason: evaluation.reason });
       }
     }
+    // Live recovery debt (Perkins r1 blocker 3): an admitting claim with
+    // no in-flight dispatch in THIS process is reconciled by every pass —
+    // a transient claim-release write failure must not need a restart.
+    for (const entry of before) {
+      if (entry.state !== 'admitting' || this.inFlightAdmissions.has(entry.id)) continue;
+      this.reconcileClaim(entry);
+    }
     this.consecutivePassFailures = 0;
     for (;;) {
       if (this.disposed) return;
@@ -372,8 +396,9 @@ export class PipelineService {
       const claimed = this.opts.ledger.claimPipelineEntry({ id: next.id, holder: ADMISSION_HOLDER });
       if (claimed === null) continue; // raced; re-read and pick the next entry
       const outcome = await this.admit(claimed);
-      // A requeued attempt never retries inside the same pass (D3): the
-      // bounded backoff (or any natural trigger) spaces the next attempt
+      // A requeued attempt (or a failed finalization — Perkins r1
+      // blocker 4) never retries inside the same pass: the bounded
+      // backoff (or any natural trigger) spaces the next attempt
       // instead of burning every attempt on one outage.
       if (outcome === 'requeued') {
         this.armRetry();
@@ -383,52 +408,59 @@ export class PipelineService {
   }
 
   private async admit(entry: PipelineEntryRecord): Promise<'admitted' | 'adopted' | 'requeued' | 'failed'> {
-    let settled: Promise<unknown>;
+    this.inFlightAdmissions.add(entry.id);
     try {
-      const outcome = await this.opts.dispatch.dispatch({
-        jobId: entry.id,
-        repoPath: entry.repoPath,
-        title: entry.title,
-        briefing: entry.briefing,
-      });
-      settled = outcome.settled;
-    } catch (error) {
-      const detail = `admission failed: ${String(error).slice(0, 300)}`;
-      const job = this.opts.ledger.getJob(entry.id);
-      if (job !== null && job.briefing === entry.briefing) {
-        // Dispatch committed the job row before failing; its lifecycle
-        // owns the failure (blocked + note). Adopt — never re-dispatch.
-        this.finalizeAdmission(entry);
-        this.log('warn', 'pipeline entry adopted its pre-existing job after a dispatch failure', {
-          entry: entry.id,
-          error: detail,
+      let settled: Promise<unknown>;
+      try {
+        const outcome = await this.opts.dispatch.dispatch({
+          jobId: entry.id,
+          repoPath: entry.repoPath,
+          title: entry.title,
+          briefing: entry.briefing,
         });
-        return 'adopted';
+        settled = outcome.settled;
+      } catch (error) {
+        const detail = `admission failed: ${String(error).slice(0, 300)}`;
+        const job = this.opts.ledger.getJob(entry.id);
+        if (job !== null && job.briefing === entry.briefing) {
+          // Dispatch committed the job row before failing; its lifecycle
+          // owns the failure (blocked + note). Adopt — never re-dispatch.
+          // A failed finalization is bounded recovery debt, never a
+          // silent success (Perkins r1 blocker 4).
+          if (!this.finalizeAdmission(entry)) return 'requeued';
+          this.log('warn', 'pipeline entry adopted its pre-existing job after a dispatch failure', {
+            entry: entry.id,
+            error: detail,
+          });
+          return 'adopted';
+        }
+        const failures = entry.failureCount + 1;
+        if (failures >= this.maxAdmissionFailures) {
+          this.opts.ledger.releasePipelineClaim({ id: entry.id, reason: detail, outcome: 'failed' });
+          this.notifyAdmissionFailed(entry, detail);
+          return 'failed';
+        }
+        this.opts.ledger.releasePipelineClaim({
+          id: entry.id,
+          reason: detail,
+          outcome: 'requeue',
+          note: `attempt ${failures}/${this.maxAdmissionFailures} failed before any job existed`,
+        });
+        return 'requeued';
       }
-      const failures = entry.failureCount + 1;
-      if (failures >= this.maxAdmissionFailures) {
-        this.opts.ledger.releasePipelineClaim({ id: entry.id, reason: detail, outcome: 'failed' });
-        this.notifyAdmissionFailed(entry, detail);
-        return 'failed';
-      }
-      this.opts.ledger.releasePipelineClaim({
-        id: entry.id,
-        reason: detail,
-        outcome: 'requeue',
-        note: `attempt ${failures}/${this.maxAdmissionFailures} failed before any job existed`,
-      });
-      return 'requeued';
+      if (!this.finalizeAdmission(entry)) return 'requeued';
+      // The briefing turn runs in the background (dispatch owns it); when it
+      // settles, capacity may have moved for a waiting follower. Rejections
+      // are owned here so the settled promise never leaks unhandled.
+      void settled
+        .catch(() => {
+          /* the job lifecycle recorded the outcome; nothing to duplicate */
+        })
+        .finally(() => this.schedule());
+      return 'admitted';
+    } finally {
+      this.inFlightAdmissions.delete(entry.id);
     }
-    this.finalizeAdmission(entry);
-    // The briefing turn runs in the background (dispatch owns it); when it
-    // settles, capacity may have moved for a waiting follower. Rejections
-    // are owned here so the settled promise never leaks unhandled.
-    void settled
-      .catch(() => {
-        /* the job lifecycle recorded the outcome; nothing to duplicate */
-      })
-      .finally(() => this.schedule());
-    return 'admitted';
   }
 
   /** One-shot bounded backoff arming (D3/D4): fires a single reconsider
@@ -437,6 +469,7 @@ export class PipelineService {
    * periodic: recovery, not polling. */
   private armRetry(): void {
     if (this.disposed || this.retryTimer !== null) return;
+    if (this.consecutiveFinalizeFailures > MAX_CONSECUTIVE_FINALIZE_FAILURES) return;
     this.retryTimer = setTimeout(() => {
       this.retryTimer = null;
       this.schedule();
@@ -477,6 +510,11 @@ export class PipelineService {
           this.wakeAbort = null;
           this.wakePending = false;
         }
+        // An INTENTIONAL disarm (eligibility changed — e.g. the last
+        // eligible entry was held) cancels its own acquire: that is not
+        // capacity feedback and must never open the refusal window
+        // (Perkins r1 blocker 5); nor may a stale wake.
+        if (abort.signal.aborted) return;
         // The budget surfaced a real decision (reclaim exhaustion): loud,
         // never a spin — re-arming waits out the refusal window; the next
         // natural trigger can still admit the entry directly.
@@ -500,15 +538,21 @@ export class PipelineService {
    * effect must never leave a permanently admitting claim. It reconciles
    * the row back to waiting; a retry ADOPTS the existing job (the dispatch
    * throws on the duplicate id and the adopt path wins) instead of
-   * duplicating work. */
+   * duplicating work. The failure is PROPAGATED (Perkins r1 blocker 4):
+   * the caller ends the pass and the bounded backoff owns the retry —
+   * after three consecutive finalization failures the backoff stands
+   * down for a natural trigger (never a tight loop). */
   private finalizeAdmission(entry: PipelineEntryRecord): boolean {
     try {
       this.opts.ledger.markPipelineAdmitted({ id: entry.id, jobId: entry.id });
+      this.consecutiveFinalizeFailures = 0;
       return true;
     } catch (error) {
+      this.consecutiveFinalizeFailures += 1;
       this.log('error', 'pipeline admission bookkeeping failed — reconciled for a safe retry', {
         entry: entry.id,
         error: String(error),
+        consecutive_failures: this.consecutiveFinalizeFailures,
       });
       try {
         this.opts.ledger.releasePipelineClaim({
@@ -517,9 +561,9 @@ export class PipelineService {
           outcome: 'reconciled',
           note: 'reconciled by the live pass; a retry adopts the existing job rather than duplicating it',
         });
-        this.schedule();
       } catch {
-        // The ledger itself is failing; boot reconciliation owns the claim.
+        // The ledger itself is failing; the next pass's stale-claim
+        // reconciliation (and boot reconciliation) own the claim.
       }
       return false;
     }
