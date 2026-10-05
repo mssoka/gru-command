@@ -637,11 +637,25 @@ export async function probeAdvertisedTipMovementAsync(
   timeoutMs: number,
 ): Promise<SourceMovement | null> {
   const { targetRef, targetSha } = review.manifest;
+  // R6-4: ONE cumulative admission budget across every async step — each
+  // call gets only the remaining time and exhaustion fails closed.
+  const deadline = Date.now() + timeoutMs;
   const run = async (args: readonly string[]): Promise<string> => {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      throw new Error(`admission remote-probe budget exhausted before: git ${args.join(' ')}`);
+    }
     const { stdout } = await execFileAsPromised('git', ['-C', review.manifest.repoPath, ...args], {
-      encoding: 'utf8', timeout: timeoutMs, maxBuffer: 1024 * 1024,
+      encoding: 'utf8', timeout: remaining, maxBuffer: 1024 * 1024,
     });
     return stdout;
+  };
+  // R6-3: only an ESTABLISHED non-zero exit (git itself answered
+  // "invalid spelling") may skip the remote proof; timeouts, kills and
+  // spawn failures fail closed.
+  const establishedRejection = (error: unknown): boolean => {
+    const code = (error as { code?: unknown } | null)?.code;
+    return typeof code === 'number';
   };
   // Round-5 P3: EVERY preparation step is async and bounded — the sync
   // advertisedRemoteBranch helper (30 s execFileSync defaults) is never
@@ -654,14 +668,16 @@ export async function probeAdvertisedTipMovementAsync(
     if (!targetRef.startsWith('refs/remotes/')) {
       try {
         await run(['check-ref-format', '--branch', targetRef]);
-      } catch {
-        return null; // not a branch spelling (e.g. origin/topic~1)
+      } catch (error) {
+        if (establishedRejection(error)) return null; // not a branch spelling (e.g. origin/topic~1)
+        throw error; // timeout/kill/spawn failure — fail closed
       }
       let fullName: string;
       try {
         fullName = (await run(['rev-parse', '--symbolic-full-name', '--verify', targetRef])).trimEnd();
-      } catch {
-        return null;
+      } catch (error) {
+        if (establishedRejection(error)) return null; // the ref resolves to nothing — not advertised
+        throw error;
       }
       if (!fullName.startsWith('refs/remotes/')) return null;
       const remoteRef = fullName.slice('refs/remotes/'.length);
@@ -673,8 +689,9 @@ export async function probeAdvertisedTipMovementAsync(
     }
     try {
       await run(['check-ref-format', targetRef]);
-    } catch {
-      return null; // a qualified revision expression, not a tracking ref
+    } catch (error) {
+      if (establishedRejection(error)) return null; // a qualified revision expression, not a tracking ref
+      throw error;
     }
     const remoteRef = targetRef.slice('refs/remotes/'.length);
     const slash = remoteRef.indexOf('/');

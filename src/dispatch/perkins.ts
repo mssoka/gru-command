@@ -1777,7 +1777,22 @@ export class WaveRunner {
       }
     }
     if (bound && event !== null) {
-      this.opts.ledger.setRoundVerdict(round.id, postedVerdict);
+      // R6-1: reconstruct the DEFERRED lens outcomes from durable evidence
+      // before promotion — the crash may have landed between the real post
+      // and finalization, leaving never-started lenses pending. The
+      // reconstruction commits ATOMICALLY with the verdict: a posted,
+      // promoted round can never keep pending unused chips.
+      const started = this.startedSpecialistLenses(round);
+      const deferred = round.lenses
+        .filter((chip) => chip.state === 'pending' || chip.state === 'live')
+        .map((chip) => started.has(chip.lens)
+          ? {
+              lens: chip.lens,
+              state: 'error' as const,
+              note: 'attempt started; interrupted by the crash before settlement — recovered by restart promotion',
+            }
+          : { lens: chip.lens, state: 'done' as const, note: 'not used — lead-owned whole-PR review' });
+      this.opts.ledger.finalizeRoundVerdictWithLensOutcomes(round.id, postedVerdict, deferred);
       this.opts.ledger.appendCustomEvent({
         kind: 'round.post-recovered',
         jobId: round.jobId,
@@ -3280,7 +3295,12 @@ export class WaveRunner {
       const precomputedRemoteMovement = await probeAdvertisedTipMovementAsync(
         frozenReview, ADMISSION_REMOTE_PROBE_TIMEOUT_MS,
       );
-      const admission = admissionPreflight(frozenReview, movementRef, { precomputedRemoteMovement });
+      const freezeReceipt = this.opts.ledger.latestRoundEvent(round.id, 'round.freeze-manifest')?.payload as
+        { readonly sha256?: unknown } | null;
+      const admission = admissionPreflight(frozenReview, movementRef, {
+        precomputedRemoteMovement,
+        ...(typeof freezeReceipt?.sha256 === 'string' ? { frozenManifestSha256: freezeReceipt.sha256 } : {}),
+      });
       this.opts.ledger.appendCustomEvent({
         kind: 'round.admission-preflight',
         jobId: job.id,
@@ -4228,6 +4248,19 @@ export class WaveRunner {
       ].join('\n'));
     }
     if (recordedVerdict !== null) {
+      // gh-169 round-5 P1: the deferred not-used chips and the verdict
+      // transition commit in ONE atomic ledger transaction — a failure
+      // anywhere leaves NOTHING committed (round live, deferred chips
+      // pending, the abort path legal), and a posted verdict can never
+      // coexist with pending or mixed deferred chips.
+      this.opts.ledger.finalizeRoundVerdictWithLensOutcomes(
+        round.id,
+        recordedVerdict,
+        accounting.unusedLenses.map((lens) => ({ lens, state: 'done' as const, note: 'not used — lead-owned whole-PR review' })),
+      );
+      // R6-2: the complete-review event lands ONLY after the atomic commit
+      // succeeded — an aborted round can never carry a complete:true
+      // review event for the Silas digest to consume.
       this.opts.ledger.appendCustomEvent({
         kind: 'round.perkins-review',
         jobId: job.id,
@@ -4246,18 +4279,22 @@ export class WaveRunner {
           complete: canonical !== 'INCOMPLETE' && !headMoved,
         },
       });
-      // gh-169 round-5 P1: the deferred not-used chips and the verdict
-      // transition commit in ONE atomic ledger transaction — a failure
-      // anywhere leaves NOTHING committed (round live, deferred chips
-      // pending, the abort path legal), and a posted verdict can never
-      // coexist with pending or mixed deferred chips.
-      this.opts.ledger.finalizeRoundVerdictWithLensOutcomes(
-        round.id,
-        recordedVerdict,
-        accounting.unusedLenses.map((lens) => ({ lens, state: 'done' as const, note: 'not used — lead-owned whole-PR review' })),
-      );
     } else {
       this.opts.ledger.setRoundStatus(round.id, 'aborted');
+      // R6-8: the round ABORTED, so the deferred not-used chips never
+      // committed — the RETURNED results must not claim done/not-used
+      // coverage their ledger chips do not hold. Settled lenses keep their
+      // truthful results; unused lenses return an honest round-incomplete
+      // note instead.
+      const unusedSet = new Set<string>(accounting.unusedLenses);
+      for (let index = 0; index < lenses.length; index += 1) {
+        if (unusedSet.has(lenses[index]!)) {
+          accounting.results[index] = {
+            state: 'error',
+            note: 'not used — lead-owned review; the round ended INCOMPLETE before the not-used coverage chips committed',
+          };
+        }
+      }
       // P7/Q5/Q6 (gh-169): an ordinary lead-authored INCOMPLETE (or an
       // undelivered conclusive report) surfaces the host-owned execution
       // facts AT the returned report boundary: a write-once host report
@@ -4371,15 +4408,21 @@ export class WaveRunner {
     provisional?: LensAccounting,
   ): WaveOutcome {
     const detail = `Perkins finalization failed: ${String(error)}`.replace(/[\r\n]+/gu, ' ').slice(0, 500);
+    let abortRoundFailed: string | null = null;
     try {
       this.abortRound(this.opts.ledger.getRound(round.id) ?? round, detail);
     } catch (ledgerError) {
+      abortRoundFailed = String(ledgerError).slice(0, 300);
       this.log('error', 'could not terminalize failed Perkins round in ledger', {
         round: round.id, error: String(ledgerError),
       });
     }
     const reportFile = join(frozenReview.directory, 'perkins-report.finalization-incomplete.md');
     const executionFacts = this.interruptedExecutionFacts(this.opts.ledger.getRound(round.id) ?? round, lenses);
+    // R6-7: the report heading follows the DURABLE incident marker — if
+    // abortRound itself failed, the report says so instead of claiming a
+    // parent-incident event that never persisted.
+    const incidentMarker = this.opts.ledger.latestRoundEvent(round.id, 'round.parent-incident');
     try {
       if (!existsSync(reportFile)) {
         writeFileSync(
@@ -4391,7 +4434,9 @@ export class WaveRunner {
             '',
             detail,
             '',
-            '**Parent incident** — finalization ended the round; this is one parent incident, not a per-lens specialist failure.',
+            incidentMarker !== null
+              ? '**Parent incident** — finalization ended the round; this is one parent incident, not a per-lens specialist failure.'
+              : `**Terminalization incomplete** — finalization failed and the parent-incident marker could not be persisted${abortRoundFailed !== null ? ` (${abortRoundFailed})` : ''}; the ledger state above is the durable truth.`,
             '',
             executionFacts,
             '',

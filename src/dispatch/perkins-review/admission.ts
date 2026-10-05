@@ -22,6 +22,11 @@ export const ADMISSION_REMOTE_PROBE_TIMEOUT_MS = 5_000;
 
 export interface AdmissionPreflightOptions {
   readonly remoteProbeTimeoutMs?: number;
+  /** R6-6: the ledger's independent round.freeze-manifest sha256 receipt.
+   * When supplied, the on-disk manifest BYTES must match it exactly — a
+   * whitespace-only rewrite of a semantically identical manifest refuses
+   * admission under frozen-packet:manifest.json. */
+  readonly frozenManifestSha256?: string;
   /** Precomputed ASYNC advertised-tip result (gh-169 R4-6): when supplied,
    * the sync probe is skipped and this outcome is merged into
    * head-binding — the remote lookup never blocks the event loop. */
@@ -211,6 +216,10 @@ export function admissionPreflight(review: FrozenReview, movementRef: string, op
   const manifestBytes = readFrozen('manifest.json', FROZEN_MANIFEST_MAX_BYTES);
   if (manifestBytes instanceof Error) {
     fail('frozen-packet:manifest.json', `the frozen manifest cannot be read: ${sanitizeDetail(manifestBytes)}`);
+  } else if (options?.frozenManifestSha256 !== undefined && sha256(manifestBytes) !== options.frozenManifestSha256) {
+    // R6-6: byte identity against the independently pinned receipt — a
+    // rewritten-but-equivalent manifest is a mutated frozen packet.
+    fail('frozen-packet:manifest.json', 'the frozen manifest bytes do not match the ledger-pinned freeze receipt (round.freeze-manifest)');
   } else {
     try {
       const parsed: unknown = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(manifestBytes));

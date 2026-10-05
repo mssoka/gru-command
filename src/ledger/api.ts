@@ -2013,7 +2013,7 @@ export class LedgerApi {
   finalizeRoundVerdictWithLensOutcomes(
     id: string,
     verdict: string,
-    outcomes: ReadonlyArray<{ readonly lens: string; readonly state: 'done'; readonly note: string }>,
+    outcomes: ReadonlyArray<{ readonly lens: string; readonly state: 'done' | 'error'; readonly note: string }>,
   ): RoundRecord {
     if (!isRoundVerdict(verdict)) throw new Error(`unknown round verdict "${verdict}"`);
     return this.transaction(() => {
