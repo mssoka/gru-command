@@ -6,7 +6,7 @@ import type { AgentSpawner } from '../service.js';
 import type { AgentHandle, NativeAgentTool, PromptOptions } from '../../runtime/types.js';
 import type { PacingGate, PacingLease, PacingEventRecorder, RateLimitBackoffPolicy } from '../../runtime/pacing.js';
 import { withRateLimitRetries, type RateLimitRetryOptions } from '../../runtime/rate-limit-retry.js';
-import { assertFrozenPromptBounds, publishedReportMatches, sourceMovementSinceFreeze, writeReviewArtifact, type FrozenReview, type SourceMovement } from './artifacts.js';
+import { assertFrozenPromptBounds, publishedReportMatches, readReviewArtifact, sourceMovementSinceFreeze, writeReviewArtifact, type FrozenReview, type SourceMovement } from './artifacts.js';
 import { readFrozenEvidenceBytes, renderEvidencePromptSection } from '../../review-inputs/evidence.js';
 import { finalAssistantText } from './session-output.js';
 import { PERKINS_FINDING_SOURCES, PERKINS_LENSES, type PerkinsFindingSource, type PerkinsLens, type PerkinsPolicy } from './policy.js';
@@ -1127,7 +1127,6 @@ export class PerkinsWholeReview {
         for (const [path, value] of [
           [`specialists/${lens}.attempt-${attempt}-${runToken}.raw.json`, `${outputBytes}\n`],
           [`specialists/${lens}.attempt-${attempt}-${runToken}.envelope.json`, envelope],
-          [`children/${resultId}.json`, settled],
         ] as const) {
           try {
             writeReviewArtifact(review, path, value);
@@ -1137,13 +1136,23 @@ export class PerkinsWholeReview {
         }
         if (recordingErrors.length > 0) {
           settled = { ...settled, evidenceRecordingError: recordingErrors.join('; ') };
+        }
+        // The canonical child record is written LAST and carries the
+        // evidence-recording gap when earlier writes failed: a recovery
+        // that rebuilds the round from children/*.json must never see an
+        // apparently clean run whose evidence could not be recorded.
+        try {
+          writeReviewArtifact(review, `children/${resultId}.json`, settled);
+        } catch (writeError) {
+          recordingErrors.push(`children/${resultId}.json: ${sanitizeError(writeError)}`);
+          settled = { ...settled, evidenceRecordingError: recordingErrors.join('; ') };
           // A previously published valid raw/envelope must never be replaced
           // with a failure envelope when only the child-result write failed.
           try {
             writeReviewArtifact(review, `children/${resultId}.recording-error-${runToken}.json`, settled);
-          } catch (writeError) {
+          } catch (fallbackError) {
             settled = { ...settled, evidenceRecordingError:
-              `${settled.evidenceRecordingError}; children fallback: ${sanitizeError(writeError)}` };
+              `${settled.evidenceRecordingError}; children fallback: ${sanitizeError(fallbackError)}` };
           }
         }
         settledProgress = { lens, state: 'done', note: `${reviewFindings.length} finding(s)${recordingErrors.length > 0 ? ` (evidence recording failed: ${recordingErrors.join('; ')})` : ''}` };
@@ -1182,14 +1191,23 @@ export class PerkinsWholeReview {
         };
         const recordingErrors: string[] = [];
         const recordFailureEvidence = (suffix: string, value: unknown): void => {
+          const path = `specialists/${lens}.attempt-${attempt}-${runToken}${suffix}`;
           try {
-            writeReviewArtifact(review, `specialists/${lens}.attempt-${attempt}-${runToken}${suffix}`, value);
+            writeReviewArtifact(review, path, value);
           } catch (writeError) {
-            // A valid output's raw/envelope may already exist when a later
-            // artifact fails; never overwrite those write-once bytes.
-            if (!(writeError instanceof Error && 'code' in writeError && (writeError as { code?: string }).code === 'EEXIST')) {
-              recordingErrors.push(`${suffix}: ${sanitizeError(writeError)}`);
+            // A byte-identical prior write is an idempotent retry: the
+            // evidence stands. A collision with DIFFERENT bytes is a gap
+            // the sealed record must disclose — never silently swallow a
+            // possibly missing or stale failure artifact.
+            if (writeError instanceof Error && 'code' in writeError && (writeError as { code?: string }).code === 'EEXIST') {
+              const expected = typeof value === 'string' ? value : `${JSON.stringify(value, null, 2)}\n`;
+              try {
+                if (readReviewArtifact(review, path) === expected) return;
+              } catch {
+                // An unreadable existing artifact cannot prove identity.
+              }
             }
+            recordingErrors.push(`${suffix}: ${sanitizeError(writeError)}`);
           }
         };
         if (outputBytes !== null) recordFailureEvidence('.raw.json', `${outputBytes}\n`);
@@ -1258,6 +1276,19 @@ export class PerkinsWholeReview {
           // Observability must not reject a settled pool slot and refund a
           // child that actually ran; disclose the observer failure instead.
           settled = { ...settled!, progressError: sanitizeError(error) };
+          // The disclosure must survive an unsealed round: write a durable
+          // best-effort note next to the canonical child record. A failure
+          // to record an observability failure never rethrows after
+          // settlement — the in-memory disclosure on the returned record
+          // still stands.
+          try {
+            writeReviewArtifact(review, `children/${settled.resultId}.progress-error-${runToken}.json`, {
+              lens: settled.lens, attempt: settled.attempt, progressError: settled.progressError,
+            });
+          } catch {
+            // Last resort: the sealed/consolidated path still carries the
+            // flag whenever the round completes.
+          }
         }
       }
       return settled as SpecialistResult;
@@ -1430,6 +1461,19 @@ export class PerkinsWholeReview {
           const neverRan = scheduled.filter((run) => !ran.has(run.lens));
           restoreAttempts(neverRan);
           specialistsStarted -= neverRan.length;
+          if (acquireError !== null) {
+            // The wave rejected AND the lead's review slot could not be
+            // re-acquired. Dropping the acquire failure would let later
+            // lead turns run WITHOUT a review slot — the same violation the
+            // sibling re-acquire path exists to prevent. Surface both
+            // facts: the batch error (why the wave failed) and the slot
+            // loss (why the round must not continue pacing-free).
+            const waveMessage = poolOutcome.error instanceof Error ? poolOutcome.error.message : String(poolOutcome.error);
+            const acquireMessage = acquireError instanceof Error ? acquireError.message : String(acquireError);
+            throw new Error(
+              `${waveMessage}; additionally the lead could not re-acquire its review slot: ${acquireMessage} — the round must not continue without a review slot`,
+            );
+          }
           throw poolOutcome.error;
         }
         const childResults: readonly SpecialistResult[] = committed;
@@ -1872,13 +1916,22 @@ export class PerkinsWholeReview {
         } catch (recordingError) {
           // A collision at the primary path must not erase cleanup evidence
           // while the lead directory can still accept a distinct write-once
-          // artifact. If both paths fail, disclose both recording errors.
+          // artifact. If both fixed paths fail, one unique-name alternate
+          // keeps the durable evidence — the specialist precedent (R10).
           try {
             writeReviewArtifact(review, 'lead/dispose-error-fallback.json', {
               ...cleanup, recordingError: sanitizeError(recordingError),
             });
           } catch (fallbackError) {
-            console.error(`Perkins lead disposal failed: ${cleanup.error}; could not record cleanup evidence: ${sanitizeError(recordingError)}; fallback: ${sanitizeError(fallbackError)}`);
+            try {
+              writeReviewArtifact(review, `lead/dispose-error-${randomUUID().slice(0, 8)}.json`, {
+                ...cleanup,
+                recordingError: sanitizeError(recordingError),
+                fallbackError: sanitizeError(fallbackError),
+              });
+            } catch (alternateError) {
+              console.error(`Perkins lead disposal failed: ${cleanup.error}; could not record cleanup evidence: ${sanitizeError(recordingError)}; fallback: ${sanitizeError(fallbackError)}; alternate: ${sanitizeError(alternateError)}`);
+            }
           }
         }
       }

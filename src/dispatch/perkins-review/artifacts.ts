@@ -524,7 +524,11 @@ export function refMovedSinceFreeze(review: FrozenReview): boolean {
  * round directory without relaxing write-once artifact publication. */
 export function publishedReportMatches(review: FrozenReview, expected: string): boolean {
   const root = ensureDirectoryWithoutSymlinks(review.directory);
-  const descriptor = openSync(join(root, 'perkins-report.md'), constants.O_RDONLY | constants.O_NOFOLLOW);
+  // O_NOFOLLOW rejects symlink swaps; O_NONBLOCK keeps the open bounded —
+  // a FIFO or device planted at the report path returns immediately and
+  // is then rejected by the regular-file check below instead of blocking
+  // the terminal retry indefinitely.
+  const descriptor = openSync(join(root, 'perkins-report.md'), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const info = fstatSync(descriptor);
     const bytes = Buffer.from(expected, 'utf8');
@@ -535,7 +539,7 @@ export function publishedReportMatches(review: FrozenReview, expected: string): 
   }
 }
 
-export function writeReviewArtifact(review: FrozenReview, relativePath: string, value: unknown): string {
+function reviewArtifactPath(review: FrozenReview, relativePath: string): { root: string; path: string } {
   const components = relativePath.split('/');
   if (
     relativePath.startsWith('/') || relativePath.includes('\\') || relativePath.includes('\0') ||
@@ -544,6 +548,20 @@ export function writeReviewArtifact(review: FrozenReview, relativePath: string, 
   const root = ensureDirectoryWithoutSymlinks(review.directory);
   const path = resolve(root, ...components);
   if (!contained(root, path) || path === root) throw new Error('review artifact path escapes round directory');
+  return { root, path };
+}
+
+/** Read a review artifact with the same path-safety rules as writes. A
+ * write-once collision is idempotent ONLY when the existing bytes equal
+ * what the rejected write would have published; callers use this to tell
+ * an idempotent retry apart from a missing-or-stale evidence gap. */
+export function readReviewArtifact(review: FrozenReview, relativePath: string): string {
+  const { path } = reviewArtifactPath(review, relativePath);
+  return readFileSync(path, 'utf8');
+}
+
+export function writeReviewArtifact(review: FrozenReview, relativePath: string, value: unknown): string {
+  const { root, path } = reviewArtifactPath(review, relativePath);
   atomicWrite(path, typeof value === 'string' ? value : `${JSON.stringify(value, null, 2)}\n`, root);
   return path;
 }

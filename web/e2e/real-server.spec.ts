@@ -481,12 +481,17 @@ test.describe('themes', () => {
     await pair(page, `http://127.0.0.1:${themesPort}/`);
     await sendAndWaitReply(page, 'theme real check');
 
+    // The deploy chip reads live build-vs-origin/main drift from the real
+    // service: its value ("current"/"N behind"/"unknown") and tone change
+    // with the head under test. Mask it so the theme baselines stay
+    // deterministic across heads; every other chip keeps theme coverage.
+    const deployChip = page.locator('[data-chip="deploy"]');
     await expect(page.locator('html')).not.toHaveClass(/dark/);
-    await expect(page).toHaveScreenshot('real-chat-light.png', { maxDiffPixelRatio: 0.02 });
+    await expect(page).toHaveScreenshot('real-chat-light.png', { maxDiffPixelRatio: 0.02, mask: [deployChip] });
 
     await page.locator('#theme-toggle').click();
     await expect(page.locator('html')).toHaveClass(/dark/);
-    await expect(page).toHaveScreenshot('real-chat-dark.png', { maxDiffPixelRatio: 0.02 });
+    await expect(page).toHaveScreenshot('real-chat-dark.png', { maxDiffPixelRatio: 0.02, mask: [deployChip] });
 
     await page.reload();
     await expect(page.locator('html')).toHaveClass(/dark/);

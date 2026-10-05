@@ -11,6 +11,8 @@ import {
   freezeReviewInputs,
   FROZEN_DIFF_MAX_BYTES,
   FROZEN_SPEC_MAX_BYTES,
+  publishedReportMatches,
+  readReviewArtifact,
   resolveReviewBaseRef,
   reviewArtifactDirectory,
   writeReviewArtifact,
@@ -771,6 +773,20 @@ describe('Perkins whole-PR lead engine', () => {
       roundId: 'whole-round', roundNumber: 1, frozenReview: h.frozen,
       movementRef: 'feature/review', noSpec: false, signal: controller.signal,
     })).rejects.toThrow(/service shutdown/);
+  });
+
+  it('#87 bounded report comparison: a FIFO planted at the published report path never blocks the retry', async () => {
+    const h = wholeHarness(ALL_CLEAN);
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    const reportPath = join(h.frozen.directory, 'perkins-report.md');
+    const expected = readFileSync(reportPath, 'utf8');
+    rmSync(reportPath);
+    execFileSync('mkfifo', [reportPath]);
+    // Before the O_NONBLOCK bound this read-only open blocked forever (no
+    // writer ever appears), hanging the terminal retry; now the open
+    // returns immediately and the regular-file check rejects it.
+    expect(publishedReportMatches(h.frozen, expected)).toBe(false);
   });
 
   it('a moved source ref rejects a conclusive verdict and accepts only INCOMPLETE', async () => {
@@ -1591,6 +1607,53 @@ describe('Stage 2 specialist accounting', () => {
     expect(result.findings).toEqual([]);
   });
 
+  it('surfaces a failed slot re-acquire together with the batch rejection instead of dropping it', async () => {
+    // The lead's INITIAL admission succeeds; its post-wave re-acquire is
+    // admitted too, but the recorder fails exactly that second admission —
+    // the deterministic stand-in for a slot the lead can never get back.
+    let leadAdmissions = 0;
+    const gate = new PacingGate({
+      enabled: true,
+      maxConcurrentMinions: 0,
+      maxConcurrentReviewTurns: 2,
+      record: (event) => {
+        if (event.kind === 'pacing.admitted' && (event.payload as { id?: string } | undefined)?.id === 'lead') {
+          leadAdmissions += 1;
+          if (leadAdmissions === 2) throw new Error('pacing recorder unavailable');
+        }
+      },
+    });
+    let rejectEdge = true;
+    const h = wholeHarness({
+      specialists: ['security', 'edge'],
+      childAnswer: (prompt) => prompt.includes('"source": "security"')
+        ? JSON.stringify([groundedFinding('security', 'warning')]) : '[]',
+    }, {
+      reviewGate: gate,
+      onProgress: (event) => {
+        if (event.lens === 'edge' && event.state === 'running' && rejectEdge) {
+          rejectEdge = false;
+          throw new Error('edge batch rejected');
+        }
+      },
+    });
+    const directory = h.frozen.directory;
+    const result = await h.run();
+    // Both facts reach the lead in ONE tool error: the wave failure AND
+    // the slot loss (previously the acquire error was silently dropped,
+    // letting later turns continue without a review slot).
+    expect(h.toolErrors.some((entry) => entry.tool === 'perkins_run_specialists' &&
+      /edge batch rejected.*additionally the lead could not re-acquire its review slot: pacing recorder unavailable/.test(entry.error),
+    )).toBe(true);
+    // The committed valid sibling keeps its undelivered stamp — the
+    // compound error never un-runs or re-refunds executed children.
+    const validSibling = result.specialistRuns.find((run) => run.lens === 'security');
+    expect(validSibling).toMatchObject({ status: 'valid', findingsDelivered: false });
+    const consolidated = JSON.parse(readFileSync(join(directory, 'consolidated.json'), 'utf8')) as { specialistRuns: Array<{ lens: string; findingsDelivered?: boolean }> };
+    expect(consolidated.specialistRuns.find((run) => run.lens === 'security')?.findingsDelivered).toBe(false);
+    expect(result.findings).toEqual([]);
+  });
+
   it('#80 consumes a failed started child despite rejected primary evidence writes', async () => {
     let directory = '';
     const h = wholeHarness({
@@ -1642,6 +1705,12 @@ describe('Stage 2 specialist accounting', () => {
     expect(h.childCalls).toHaveLength(1);
     const consolidated = JSON.parse(readFileSync(join(directory, 'consolidated.json'), 'utf8')) as { specialistRuns: Array<{ status: string; evidenceRecordingError?: string }> };
     expect(consolidated.specialistRuns[0]).toMatchObject({ status: 'valid', evidenceRecordingError: expect.stringMatching(/real directory/) });
+    // The CANONICAL child record carries the gap too: a recovery that
+    // rebuilds the round from children/*.json must never see an apparently
+    // clean run whose evidence writes failed.
+    const resultId = `edge-a1-${createHash('sha256').update(h.childCalls[0]!.agentId).digest('hex').slice(0, 16)}`;
+    const canonicalChild = JSON.parse(readFileSync(join(directory, 'children', `${resultId}.json`), 'utf8')) as { status: string; evidenceRecordingError?: string };
+    expect(canonicalChild).toMatchObject({ status: 'valid', evidenceRecordingError: expect.stringMatching(/real directory/) });
   });
 
   it('retains valid raw/envelope and writes a distinct fallback if the child record fails', async () => {
@@ -1677,8 +1746,31 @@ describe('Stage 2 specialist accounting', () => {
     expect(result.specialistRuns).toMatchObject([{ lens: 'edge', attempt: 1, status: 'valid', progressError: 'progress observer unavailable' }]);
     const consolidated = JSON.parse(readFileSync(join(result.artifactDirectory, 'consolidated.json'), 'utf8')) as { specialistRuns: Array<{ progressError?: string }> };
     expect(consolidated.specialistRuns[0]?.progressError).toBe('progress observer unavailable');
+    // The observer failure also leaves a durable note next to the canonical
+    // child record, so an unsealed round cannot lose the disclosure.
+    const progressNote = readdirSync(join(result.artifactDirectory, 'children')).find((name) => name.includes('.progress-error-'));
+    expect(progressNote).toBeDefined();
+    const note = JSON.parse(readFileSync(join(result.artifactDirectory, 'children', progressNote!), 'utf8')) as { lens: string; attempt: number; progressError: string };
+    expect(note).toEqual({ lens: 'edge', attempt: 1, progressError: 'progress observer unavailable' });
     const receipt = JSON.parse(readFileSync(join(result.artifactDirectory, 'lead/receipt.json'), 'utf8')) as { specialistRuns: number };
     expect(receipt.specialistRuns).toBe(1);
+  });
+
+  it('treats a byte-identical write-once collision as idempotent and a different-bytes one as a disclosed gap', () => {
+    const h = wholeHarness(ALL_CLEAN);
+    const value = { error: 'edge turn failed' };
+    const expected = `${JSON.stringify(value, null, 2)}\n`;
+    writeReviewArtifact(h.frozen, 'specialists/edge.attempt-1-test.error.json', value);
+    // Same bytes: the exact serialization recordFailureEvidence compares
+    // against — an idempotent retry, never a gap.
+    expect(readReviewArtifact(h.frozen, 'specialists/edge.attempt-1-test.error.json')).toBe(expected);
+    // Different bytes at the write-once path: the comparison that decides
+    // "identical retry" vs "missing-or-stale evidence" must see the
+    // mismatch, so the sealed record discloses the gap.
+    writeFileSync(join(h.frozen.directory, 'specialists/edge.attempt-1-stale.error.json'), '{"error":"stale"}\n');
+    expect(readReviewArtifact(h.frozen, 'specialists/edge.attempt-1-stale.error.json')).not.toBe(expected);
+    // Unreadable/absent artifacts can never prove identity either.
+    expect(() => readReviewArtifact(h.frozen, 'specialists/never-written.error.json')).toThrow();
   });
 });
 
@@ -2891,7 +2983,7 @@ describe('provider pacing: workflow rate-limit retry and cleanup', () => {
     }
   });
 
-  it('#86 preserves acceptance and logs both recording failures when fallback also collides', async () => {
+  it('#86 preserves acceptance and records a unique-name alternate when both fixed cleanup paths collide', async () => {
     let directory = '';
     const log = vi.spyOn(console, 'error').mockImplementation(() => {});
     const h = wholeHarness({
@@ -2908,7 +3000,44 @@ describe('provider pacing: workflow rate-limit retry and cleanup', () => {
       const result = await h.run();
       expect(result.canonicalVerdict).toBe('READY TO MERGE');
       expect(existsSync(join(directory, 'consolidated.json'))).toBe(true);
-      expect(log).toHaveBeenCalledWith(expect.stringMatching(/Perkins lead disposal failed:.*could not record cleanup evidence:.*fallback:.*EEXIST/));
+      // The specialist precedent (R10): one unique-name write-once alternate
+      // keeps the cleanup evidence durable instead of degrading to console
+      // output when both fixed paths collide.
+      const alternate = readdirSync(join(directory, 'lead')).find((name) => /^dispose-error-[0-9a-f]{8}\.json$/.test(name));
+      expect(alternate).toBeDefined();
+      const record = JSON.parse(readFileSync(join(directory, 'lead', alternate!), 'utf8')) as { error: string; agentId: string; recordingError: string; fallbackError: string };
+      expect(record).toMatchObject({
+        error: 'simulated session dispose failure',
+        recordingError: expect.stringMatching(/EEXIST/),
+        fallbackError: expect.stringMatching(/EEXIST/),
+      });
+      expect(log).not.toHaveBeenCalled();
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('#86 preserves acceptance and logs every recording failure only when the lead directory is unusable', async () => {
+    let directory = '';
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const h = wholeHarness({
+      ...ALL_CLEAN,
+      disposeRejects: (call) => {
+        if (call.options.reviewLead === undefined) return false;
+        // Replacing the lead/ directory with a regular file makes EVERY
+        // cleanup artifact write — primary, fallback and unique-name
+        // alternate — fail: no path under it can resolve to a real file.
+        rmSync(join(directory, 'lead'), { recursive: true });
+        writeFileSync(join(directory, 'lead'), 'blocked');
+        return true;
+      },
+    });
+    directory = h.frozen.directory;
+    try {
+      const result = await h.run();
+      expect(result.canonicalVerdict).toBe('READY TO MERGE');
+      expect(existsSync(join(directory, 'consolidated.json'))).toBe(true);
+      expect(log).toHaveBeenCalledWith(expect.stringMatching(/Perkins lead disposal failed:.*could not record cleanup evidence:.*fallback:.*alternate:/));
     } finally {
       log.mockRestore();
     }

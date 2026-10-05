@@ -157,7 +157,7 @@ function renderUntrustedInline(value: string, maxChars = 240): string {
 export function hostDisclosureAppendix(
   review: {
     readonly findings: ReadonlyArray<{ readonly severity: string; readonly title: string; readonly location: string; readonly source: string }>;
-    readonly specialistRuns: ReadonlyArray<{ readonly lens: string; readonly status: string; readonly findingsDelivered?: boolean; readonly cleanupRecordingError?: string }>;
+    readonly specialistRuns: ReadonlyArray<{ readonly lens: string; readonly status: string; readonly findingsDelivered?: boolean; readonly cleanupRecordingError?: string; readonly evidenceRecordingError?: string; readonly progressError?: string }>;
     readonly priorDispositions: ReadonlyArray<{ readonly status: string }>;
     readonly budgetRefusals?: ReadonlyArray<RoundBudgetRefusal>;
   },
@@ -177,19 +177,23 @@ export function hostDisclosureAppendix(
     ? ['- none retained']
     : review.findings.map((finding) =>
         `- [${finding.severity}] \`${renderUntrustedInline(finding.title)}\` — \`${renderUntrustedInline(finding.location)}\` (source: ${renderUntrustedInline(finding.source, 40)})`);
-  const byLens = new Map<string, { valid: number; failed: number; undelivered: boolean; cleanupGap: boolean }>();
+  const byLens = new Map<string, { valid: number; failed: number; undelivered: boolean; cleanupGap: boolean; evidenceGap: boolean; progressGap: boolean }>();
   for (const run of review.specialistRuns) {
-    const entry = byLens.get(run.lens) ?? { valid: 0, failed: 0, undelivered: false, cleanupGap: false };
+    const entry = byLens.get(run.lens) ?? { valid: 0, failed: 0, undelivered: false, cleanupGap: false, evidenceGap: false, progressGap: false };
     if (run.status === 'valid') entry.valid += 1;
     else entry.failed += 1;
     if (run.findingsDelivered === false) entry.undelivered = true;
     if (run.cleanupRecordingError !== undefined) entry.cleanupGap = true;
+    if (run.evidenceRecordingError !== undefined) entry.evidenceGap = true;
+    if (run.progressError !== undefined) entry.progressGap = true;
     byLens.set(run.lens, entry);
   }
   const ran = [...byLens.entries()].sort(([left], [right]) => left.localeCompare(right));
   const failed = ran.filter(([, entry]) => entry.failed > 0);
   const undelivered = ran.filter(([, entry]) => entry.undelivered);
   const cleanupGaps = ran.filter(([, entry]) => entry.cleanupGap);
+  const evidenceGaps = ran.filter(([, entry]) => entry.evidenceGap);
+  const progressGaps = ran.filter(([, entry]) => entry.progressGap);
   const notUsed = lenses.filter((lens) => !byLens.has(lens));
   const prior = review.priorDispositions;
   const priorFixed = prior.filter((disposition) => disposition.status === 'fixed').length;
@@ -214,6 +218,8 @@ export function hostDisclosureAppendix(
       : []),
     ...(undelivered.length > 0 ? [`- Specialist findings were NOT delivered to the lead: ${undelivered.map(([lens]) => lens).join(', ')} — those runs completed but the transport response failed, so the lead judged without their findings`] : []),
     ...(cleanupGaps.length > 0 ? [`- Specialist cleanup failures that could not be recorded durably: ${cleanupGaps.map(([lens]) => lens).join(', ')}`] : []),
+    ...(evidenceGaps.length > 0 ? [`- Specialist evidence recording gaps: ${evidenceGaps.map(([lens]) => lens).join(', ')} — those runs stand, but at least one of their evidence artifacts could not be written; the sealed run record carries the reason`] : []),
+    ...(progressGaps.length > 0 ? [`- Specialist progress observer failures: ${progressGaps.map(([lens]) => lens).join(', ')} — the runs stand, but their progress report could not be published; the sealed run record carries the reason`] : []),
     ...(notUsed.length > 0 ? [`- Lenses not used this round: ${notUsed.join(', ')}`]: []),
     ...(prior.length > 0 ? [`- Prior findings revisited: ${prior.length} (${priorFixed} fixed, ${priorStill} still present)`] : []),
     publicationLine,

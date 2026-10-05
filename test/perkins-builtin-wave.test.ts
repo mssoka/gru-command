@@ -4439,6 +4439,22 @@ describe('repair pass 3: host disclosure completeness, safety, and provider trut
     expect(appendix).not.toMatch(/findings were NOT delivered[^\n]*security/);
   });
 
+  it('discloses specialist evidence-recording gaps and progress-observer failures', () => {
+    const appendix = hostDisclosureAppendix({
+      findings: [],
+      specialistRuns: [
+        { lens: 'edge', status: 'valid', evidenceRecordingError: 'specialists/edge.attempt-1.raw.json: EEXIST' },
+        { lens: 'security', status: 'failed', progressError: 'progress observer unavailable' },
+        { lens: 'blind', status: 'valid' },
+      ],
+      priorDispositions: [],
+    }, 'github', [...PERKINS_LENSES]);
+    expect(appendix).toMatch(/Specialist evidence recording gaps: edge/);
+    expect(appendix).toMatch(/Specialist progress observer failures: security/);
+    expect(appendix).not.toMatch(/evidence recording gaps[^\n]*(?:security|blind)/);
+    expect(appendix).not.toMatch(/progress observer failures[^\n]*(?:edge|blind)/);
+  });
+
   it('states the publication fact appropriate to the actual provider (R7)', () => {
     const review = { findings: [], specialistRuns: [], priorDispositions: [] };
     const github = hostDisclosureAppendix(review, 'github', [...PERKINS_LENSES]);
