@@ -155,7 +155,10 @@ past its recorded review commission (PR discovery and the native gate
 come after its findings are delivered), and never substitute untracked
 reviewers. Skill
 names and workflow structure change between BMAD versions — never demand
-a fixed skill name in a briefing. Mark non-PR dispatches by kind:
+a fixed skill name in a briefing. A fallback PASS escalation recorded as failed or unknown is re-posted
+through `POST /api/silas/escalate` with the attempt's `escalation_id` —
+the recorded posted outcome retires the standing obligation by identity.
+Mark non-PR dispatches by kind:
 reviewer jobs carry `"deliverable": "review"` plus
 `"parent_job_id": "<the commissioning lane>"`, artifact-only and
 investigation lanes carry `"deliverable": "artifact"` /

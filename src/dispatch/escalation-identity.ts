@@ -81,14 +81,27 @@ export function createReviewEscalationNotifier(
       routing: 'action-required',
       severity: 'error',
       title,
-      detail,
+      // The attempt id travels IN the durable notice (round-5 finding 9):
+      // a post-then-throw attempt is reconcilable by identity from the
+      // notice side, not by guessing among a job's attempts.
+      detail: context?.escalationId !== undefined
+        ? `${detail} [attempt ${context.escalationId}]`
+        : detail,
       ...(agentId !== null ? { agentId } : {}),
     });
     // Attempt identity (round-3 finding 6): the durable notice id is the
     // receipt callers can reconcile against — a returned id proves the
     // post landed; a throw leaves the outcome genuinely unknown.
-    return typeof posted === 'object' && posted !== null && 'id' in posted
-      ? String((posted as { id: unknown }).id)
-      : undefined;
+    if (typeof posted === 'object' && posted !== null && 'id' in posted) {
+      const id = (posted as { id: unknown }).id;
+      // (round-5 finding 10) A malformed port result can never become a
+      // fabricated receipt: empty/non-string ids fail loud instead of
+      // stringifying into proof.
+      if (typeof id !== 'string' || id.trim() === '') {
+        throw new Error(`escalation notice port returned a non-string/empty id (${JSON.stringify(id)})`);
+      }
+      return id;
+    }
+    return undefined;
   };
 }

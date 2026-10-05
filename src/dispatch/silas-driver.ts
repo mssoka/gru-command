@@ -772,7 +772,11 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
   // floor reconstructed from a later clock reading.
   const stallSilenceFloorByJob = new Map<string, number>();
   for (const job of input.ledger.listJobs()) {
-    if (job.status === 'merged' || job.status === 'done') continue;
+    // (round-5 finding 5) A terminal REVIEWER still owes its live parent
+    // the re-arm row: a reviewer can hand back findings and close out
+    // before Silas sweeps. Terminal jobs otherwise contribute no rows;
+    // every other classification below requires a non-terminal status.
+    if ((job.status === 'merged' || job.status === 'done') && job.deliverable !== 'review') continue;
     const rounds = [...input.ledger.listRounds(job.id)].sort((a, b) => b.seq - a.seq);
     const newestRound = rounds[0] ?? null;
     const delivered = input.ledger.latestJobEvent(job.id, 'job.delivered');
@@ -849,16 +853,27 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     // re-arm, not the reviewer's completion (E18 parent relation).
     if (job.deliverable === 'review' && job.parentJobId !== null && currentPhaseDelivered) {
       const parent = input.ledger.getJob(job.parentJobId);
-      // (round-4 finding 6) The row retires when the parent delivered
-      // AFTER the reviewer: the parent resumed, collected the findings,
-      // and continued its cycle — re-listing it every sweep would re-arm a
-      // lane that already acted. A genuinely newer reviewer delivery (a
-      // second commission) re-arms the parent again by out-dating it.
+      // (round-5 finding 6) While the parent has an ACCEPTED follow-up in
+      // flight (a pending re-brief or a live directive), the row is
+      // suppressed — ops already acted; a duplicate follow-up must not be
+      // commissioned against the same delivery.
+      const parentFollowUpInFlight = parent !== null && (
+        pendingRebriefJobIds.has(parent.id) ||
+        input.ledger.listPendingDirectives({ jobId: parent.id, states: LIVE_DIRECTIVE_STATES }).length > 0
+      );
+      // (rounds 4-5, findings 6/7) Retirement requires the parent to have
+      // demonstrably ACTED on THIS delivery: a parent turn that started
+      // (an accepted directive / re-brief / claimed recovery) AFTER the
+      // reviewer delivered and completed after it. Temporal order alone
+      // would let an unrelated repair retire an uncollected review.
       const parentDelivered = parent !== null ? input.ledger.latestJobEvent(parent.id, 'job.delivered') : null;
-      const parentActed = parentDelivered !== null && parentDelivered.seq > delivered.seq;
+      const parentActedOnThis = parent !== null && parentDelivered !== null && parentDelivered.seq > delivered.seq &&
+        input.ledger.listJobEvents(parent.id, { limit: 200 }).some((event) =>
+          (event.kind === 'silas.directive-sent' || event.kind === 'silas.rebrief' || event.kind === 'provider.recovery-claimed') &&
+          event.seq > delivered.seq && event.seq < parentDelivered.seq);
       if (
         parent !== null && parent.status !== 'merged' && parent.status !== 'done' &&
-        !parentActed
+        !parentActedOnThis && !parentFollowUpInFlight
       ) {
         digest.reviewerDelivered.push({
           jobId: job.id,
@@ -1261,12 +1276,18 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       const reviewer = input.ledger.getJob(row.jobId);
       const parent = input.ledger.getJob(row.parentJobId);
       if (reviewer === null || parent === null) return false;
-      if (reviewer.status === 'merged' || reviewer.status === 'done') return false;
+      // The reviewer may be terminal — the row is the PARENT's obligation
+      // (round-5 finding 5); only the parent's state retires it here.
       if (parent.status === 'merged' || parent.status === 'done') return false;
+      if (pendingRebriefJobIds.has(parent.id)) return false;
+      if (input.ledger.listPendingDirectives({ jobId: parent.id, states: LIVE_DIRECTIVE_STATES }).length > 0) return false;
       const reviewerDelivered = input.ledger.latestJobEvent(reviewer.id, 'job.delivered');
       const parentDelivered = input.ledger.latestJobEvent(parent.id, 'job.delivered');
-      return reviewerDelivered !== null &&
-        (parentDelivered === null || reviewerDelivered.seq > parentDelivered.seq);
+      if (reviewerDelivered === null) return false;
+      if (parentDelivered === null || parentDelivered.seq < reviewerDelivered.seq) return true;
+      return !input.ledger.listJobEvents(parent.id, { limit: 200 }).some((event) =>
+        (event.kind === 'silas.directive-sent' || event.kind === 'silas.rebrief' || event.kind === 'provider.recovery-claimed') &&
+        event.seq > reviewerDelivered.seq && event.seq < parentDelivered.seq);
     }),
     stalledWorking: digest.stalledWorking.filter((row) => {
       const phaseSeq = phaseSeqByJob.get(row.jobId);

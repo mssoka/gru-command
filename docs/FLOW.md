@@ -579,16 +579,23 @@ reconciliation. That is the mechanism to extend — do not build a parallel
 outcome system. `/api/verify` single-flight admission/re-arm with the
 exclusive-capture helper (#159) has since shipped (PR #192).
 Fallback-PASS escalation follow-through is recorded durably: the PASS row
-is appended before the notifier attempt under a stable `escalationId`, the
-attempt's outcome lands as a separate `escalation` event (posted with an
-optional notice receipt / unknown on a throw / not-configured), and an
-unresolved failed or unknown outcome — or a PASS whose outcome never
-landed — surfaces a standing verify/re-post obligation in the digest that
-retires only on a later posted outcome for the same attempt (never an
-automatic retry). Commissioned reviewers carry their parent lane
-(`parent_job_id`), and a delivered reviewer re-arms that parent through
-the digest's `reviewerDelivered` row. Nothing in this section claims the
-remaining
+is appended before the notifier attempt under a run-unique `escalationId`,
+the attempt's outcome lands as a separate `escalation` event (posted with
+its notice receipt / unknown with sanitized error evidence on a throw /
+not-configured), and an unresolved failed or unknown outcome — or a PASS
+whose outcome never landed — surfaces a standing verify/re-post obligation
+that renders with first claim on the awareness budget and retires only on
+a posted outcome for the same attempt: ops re-posts through
+`POST /api/silas/escalate` with `escalation_id`, which validates the
+attempt against its durable PASS row and records the posted outcome
+(never an automatic retry, never an inferred outcome). Commissioned
+reviewers carry their parent lane (`parent_job_id`, validated for
+repository identity and non-terminal state), and a delivered reviewer
+re-arms its live parent through the digest's `reviewerDelivered` row —
+suppressed while the parent has an accepted follow-up in flight, and
+retired only by a follow-up that demonstrably started after the reviewer
+delivered and completed (never by an unrelated later delivery). Nothing
+in this section claims the remaining
 runtime guarantees exist today.
 
 ## 5. Release (the sweep)

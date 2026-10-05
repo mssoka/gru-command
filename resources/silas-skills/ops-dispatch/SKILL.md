@@ -303,8 +303,12 @@ authorizes its full completion cycle, and YOU own driving it:
    record for routing and fixes — it is the gate, never a duplicate review;
    its PASS is never a Perkins READY. A fallback PASS escalation recorded
    as failed or unknown (or a PASS whose outcome never landed) has no
-   confirmed posted notice: verify, then re-post it during reconciliation
-   (deduplicated — no later posted outcome exists for that attempt) and never treat the failure/unknown record as the notice.
+   confirmed posted notice: verify, then re-post it through
+   `POST /api/silas/escalate` with `"escalation_id": "<the attempt id>"`
+   — the service validates the attempt against its durable PASS row and
+   records the posted outcome that retires the standing obligation by
+   identity. Never treat the failure/unknown record as the notice, and
+   never infer an outcome from unrelated same-job notifications.
 3. Schedule verification through the shipped capture helper — never a
    hand-rolled background watcher. The helper path is named in your wake
    prompt ("Verification capture helper"):

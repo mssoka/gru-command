@@ -2,7 +2,7 @@
 title: 'Ship the minion-owned BMAD build-workflow playbook in installed role prompts'
 type: 'feature'
 created: '2026-10-02'
-status: 'in-progress'
+status: 'in-review'
 route: 'dispatch'
 baseline_commit: 6a00f4e50e7ae970915a9a534c142c1f8a45b57d
 review_loop_iteration: 2
@@ -335,6 +335,32 @@ Full `git diff origin/main...HEAD` at `635f415c3acd5afa7019b5118e286ce1ddee92db`
 - Blind: **false, rejected** — the reviewer brief specifies the exact SHA, diff range and how to read lane objects read-only (`roles/minion.md:87-97`); the review need not start from that SHA as its worktree HEAD.
 - Edge: **low, rejected** — the optional `not-configured` path repeats the already-disposed optional-hook case above; the production notifier is configured.
 - Edge: **false, rejected** — a successful notifier returning no receipt is permitted by the explicit optional-receipt contract, not evidence of failed delivery.
+
+### Review Findings — PR #165 at 6bdde54 (2026-10-05, round 5)
+
+All eleven groups were resolved in the same continuation (owner directive: fix them; the decision was taken as the bounded extension the reviewer sketched — extend the existing authenticated ops endpoint): (1) `POST /api/silas/escalate` accepts a validated `escalation_id` naming the job's durable fallback PASS attempt and records the atomic posted outcome (receipt = the notice id, `source: ops-repost`), retiring the standing obligation by identity; (2) attempt reconciliation pages the ENTIRE `job.fallback-review` stream (no fixed window); (3) standing obligations render with first claim on the awareness byte budget, ahead of notes/receipts/morning; (4) parent identity is the recorded handoff PATH (same-basename foreign repos refused, tested); (5) terminal reviewers keep the parent's re-arm row (the row is the parent's obligation); (6) the row is suppressed while the parent has an accepted follow-up in flight; (7) retirement requires a follow-up that started after the reviewer delivered and completed (directive-sent/rebrief/recovery-claimed between the two deliveries) — a bare unrelated parent delivery no longer retires it; (8) throw-time error evidence is sanitized (keys, tokens, bearer, JWT, personal paths) before the durable write; (9) the attempt id travels in the notice detail and context (post-then-throw attempts reconcile by identity); (10) a malformed port id fails loud instead of fabricating a receipt; (11) foreign-repository (same basename) and terminal-parent refusals are HTTP-tested, as is the correlated re-post (valid + bogus attempt).
+
+Full `git diff origin/main...HEAD` at `6bdde5492db7678f7d866ca456e715270125bb8b` against the merge base `240084ee3d9093b30efd7acdd5b3131053087ebc`; four independent `openai-codex/gpt-6-sol` layers completed. Report and individual verdicts: the instance reviews directory: `reviews/gc-packaged-build-playbook-20261002-bmad-code-review-6bdde54/report.md`. Review-only: no implementation changes.
+
+- [ ] [Review][Decision] Correlate a successful manual fallback escalation re-post with a durable posted outcome for its attempt [src/chat/awareness.ts:558-580; resources/silas-skills/ops-dispatch/SKILL.md:302-309] — the existing ops escalation endpoint posts a `silas.escalated` event but no `job.fallback-review` posted outcome, so the standing obligation cannot retire. Owner must select a correlation and authority path (e.g. extend the existing ops endpoint with a validated attempt id and atomic outcome event, or add a dedicated typed resolution surface); do not infer resolution from an unrelated notification.
+- [ ] [Review][Patch] Remove the 5,000-event cap from supposedly complete escalation attempt reconciliation [src/chat/awareness.ts:530] — older open attempts still age out after enough fallback events.
+- [ ] [Review][Patch] Give standing escalation lines reserved render capacity ahead of notes and morning lines [src/chat/awareness.ts:920] — prepending them only within the digest does not prevent byte-cap starvation.
+- [ ] [Review][Patch] Validate the parent's actual repository identity, not its directory basename [src/dispatch/server.ts:298] — different repositories named alike can cross-link a reviewer.
+- [ ] [Review][Patch] Preserve the parent re-arm after a reviewer job becomes done [src/dispatch/silas-driver.ts:770,1264] — a terminal successful reviewer can still have findings its live parent has not collected.
+- [ ] [Review][Patch] Fence reviewerDelivered once parent follow-up is accepted and still in flight [src/dispatch/silas-driver.ts:856] — a later parent delivery is too late to prevent duplicate sweeps.
+- [ ] [Review][Patch] Retire reviewerDelivered only against a follow-up linked to that reviewer delivery [src/dispatch/silas-driver.ts:858] — unrelated parent delivery must not erase uncollected findings.
+- [ ] [Review][Patch] Redact secrets and private paths before persisting notifier exception evidence [src/dispatch/perkins.ts:2554] — `String(error).slice(0,300)` is bounded but not sanitized.
+- [ ] [Review][Patch] Carry escalationId into the notification attempt [src/dispatch/perkins.ts:2540-2545] — if posting succeeds then throws, repeated attempts for the job have no notice-side key to reconcile the unknown outcome.
+- [ ] [Review][Patch] Reject an invalid notice ID instead of recording a fabricated receipt [src/dispatch/escalation-identity.ts:90] — an injected port can return `{id: undefined}` and the adapter converts it to `'undefined'`.
+- [ ] [Review][Patch] Test HTTP rejection of foreign-repository and terminal parents [test/dispatch-server.test.ts:413] — the new guards have no boundary assertions; the terminal-parent digest fixture bypasses HTTP validation.
+
+#### Rejected (individual verdicts)
+
+- Blind — **false**: omitted `parent_job_id` is an intentional optional field; independent review jobs have no promised commissioning-parent re-arm.
+- Blind — **false**: `job.delivered` proves a successful terminal turn, not the quality of a review report. The parent is instructed to collect and assess the findings, not to treat the event as verified content.
+- Blind — **false**: the reviewer-specific read-only briefing can be honored without code changes; the generic 'commit your work' order does not require a reviewer with no changes to create a commit, and brief-level read-only scope was accepted in earlier rounds.
+- Blind — **false**: the authenticated local job-dispatch token is the explicitly accepted worker commissioning route in the installed playbook; no new privilege boundary or concrete exploit is shown beyond the product's existing trusted-worker authority.
+- Blind — **low, rejected**: the spec's runnable heavy-test examples may be stale, but this review workflow rejects fixes that edit the spec under review; `.gru-command/worktree.toml` holds the operative gate commands.
 
 ## Implementation Notes
 

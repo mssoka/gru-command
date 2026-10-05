@@ -1190,6 +1190,10 @@ export interface EscalationContext {
   readonly jobId?: string;
   readonly roundId?: string;
   readonly agentId?: string;
+  /** The fallback escalation attempt id (round-5 finding 9): carried into
+   *  durable notice metadata so a post-then-throw attempt is reconcilable
+   *  by identity, never by guessing among a job's attempts. */
+  readonly escalationId?: string;
 }
 
 export interface WaveRunnerOptions {
@@ -1268,6 +1272,21 @@ function fallbackWorkingStartedSince(ledger: LedgerApi, jobId: string, baselineS
   return events.some((event) => event.seq > baselineSeq && event.kind === 'job.status' &&
     typeof event.payload === 'object' && event.payload !== null &&
     (event.payload as { to?: unknown }).to === 'working');
+}
+
+/** Strip credential-shaped bytes and personal paths from an escalation
+ *  error before it lands in a durable event (round-5 finding 8): fixed
+ *  placeholders, never digests (an offline brute-force oracle). */
+function sanitizeEscalationError(text: string): string {
+  return text
+    .replace(/-----BEGIN [^-\r\n]*PRIVATE KEY-----[\s\S]*?(?:-----END [^-\r\n]*PRIVATE KEY-----|$)/gu, '[REDACTED]')
+    .replace(/gh[pousra]_[A-Za-z0-9_]{16,}/gu, '[REDACTED]')
+    .replace(/github_pat_[A-Za-z0-9_]{16,}/gu, '[REDACTED]')
+    .replace(/Bearer\s+[A-Za-z0-9._-]{8,}/giu, '[REDACTED]')
+    .replace(/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/gu, '[REDACTED]')
+    .replace(/(?:\/Users\/|\/home\/)[^\s'"]+/gu, '[PATH]')
+    .replace(/[\r\n]+/gu, ' ')
+    .slice(0, 300);
 }
 
 export class WaveRunner {
@@ -2542,8 +2561,8 @@ export class WaveRunner {
           try {
             const returned = this.opts.escalate(
               `bmad-review gate PASS for job ${job.id} — review/fix routing cleared (missing Perkins gate escalated; merge stays user-held)`,
-              `${notes} note(s) across ${iteration} review round(s). Reports: ${state.reportFiles.join(', ')}`,
-              { jobId: job.id },
+              `${notes} note(s) across ${iteration} review round(s). Reports: ${state.reportFiles.join(', ')} (escalation attempt ${escalationId})`,
+              { jobId: job.id, escalationId },
             );
             status = 'posted';
             if (typeof returned === 'string' && returned !== '') receipt = returned;
@@ -2553,7 +2572,7 @@ export class WaveRunner {
               job: job.id,
               error: String(error),
             });
-            errorDetail = String(error).slice(0, 300);
+            errorDetail = sanitizeEscalationError(String(error));
           }
         }
         fallbackEvent({

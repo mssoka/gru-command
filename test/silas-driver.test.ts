@@ -266,9 +266,21 @@ describe('silas digest (the four actionable states)', () => {
       }]);
       expect(digest.deliveredWithoutPr.map((row) => row.jobId)).toEqual(['parent-live']);
       expect(digestActionCount(digest)).toBeGreaterThanOrEqual(1);
-      // Round-4 finding 6: once the parent delivers AFTER the reviewer
-      // (it resumed, collected the findings, continued), the re-arm row
-      // retires — every later sweep stays quiet for that delivery.
+      // Rounds 4-5: a BARE later parent delivery (an unrelated repair
+      // turn) must NOT retire an uncollected review — only a follow-up
+      // that demonstrably started after the reviewer delivered and
+      // completed (here: an accepted directive then a delivery) retires it.
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'parent-live', payload: { agentId: 'unrelated' } });
+      const uncorrelated = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(uncorrelated.reviewerDelivered.map((row) => row.jobId)).toEqual(['rev-live']);
+      // The bound follow-up: a directive accepted AFTER the reviewer
+      // delivered, then a delivery that completes it.
+      h.ledger.appendCustomEvent({ kind: 'silas.directive-sent', jobId: 'parent-live', payload: { directive: 'collect the review' } });
       h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'parent-live', payload: { agentId: 'p1' } });
       const retired = await computeSilasDigest({
         ledger: h.ledger,
@@ -2148,7 +2160,8 @@ describe('silas skills and wake prompt', () => {
     expect(ops).toContain('a blocked row');
     expect(ops).toContain('never one to wait on');
     expect(ops).toContain('dispatch the reviewer yourself');
-    expect(ops).toContain('re-post it during reconciliation');
+    expect(ops).toContain('escalation_id');
+    expect(ops).toContain('retires the standing obligation by');
     expect(ops).toContain('Mark non-PR dispatches by kind');
     // j-810/j-811: the retired untracked headless-launcher wording must never return.
     expect(ops).not.toContain('pi -p');

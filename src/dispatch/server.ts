@@ -292,12 +292,23 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
     if (parent === null) {
       throw new Error(`parent_job_id "${value}" does not name an existing job`);
     }
-    // Eligibility (round-4 finding 8): a typo that matches another
-    // repository's job would redirect the review handback to that lane,
-    // and a terminal parent can never re-arm — refuse both loudly.
+    // Eligibility (rounds 4-5): a typo that matches another repository's
+    // job would redirect the review handback to that lane, and a terminal
+    // parent can never re-arm — refuse both loudly. Repository identity is
+    // the parent's recorded handoff PATH, not the display basename: two
+    // distinct checkouts can share a basename.
     const repoName = repoPath.split('/').filter(Boolean).pop() ?? repoPath;
     if (parent.repo !== repoName) {
       throw new Error(`parent_job_id "${value}" belongs to repo "${parent.repo}", not "${repoName}"`);
+    }
+    const handoff = options.ledger.latestJobEvent(value, 'job.handoff');
+    const parentPath = handoff !== null && typeof handoff.payload === 'object' && handoff.payload !== null
+      ? (handoff.payload as { repoPath?: unknown }).repoPath : undefined;
+    if (typeof parentPath === 'string' && parentPath.trim() !== '') {
+      const normalize = (candidate: string): string[] => candidate.split('/').filter(Boolean);
+      if (JSON.stringify(normalize(parentPath)) !== JSON.stringify(normalize(repoPath))) {
+        throw new Error(`parent_job_id "${value}" was dispatched from "${parentPath}", not "${repoPath}"`);
+      }
     }
     if (isJobTerminal(parent.status)) {
       throw new Error(`parent_job_id "${value}" is terminal (${parent.status}) — a terminal lane cannot be re-armed`);
@@ -1297,6 +1308,25 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       if (jobId !== undefined && options.ledger.getJob(jobId) === null) {
         throw new Error(`job "${jobId}" not found`);
       }
+      // Attempt correlation (round-5 decision 1): an ops re-post may name
+      // the fallback escalation attempt it answers. Validated against the
+      // durable pass row BEFORE the notice posts; the atomic posted
+      // outcome then retires the standing obligation by identity.
+      const escalationId = optStrField(body, 'escalation_id');
+      if (escalationId !== undefined) {
+        if (jobId === undefined) {
+          throw new Error('escalation_id requires job_id (the attempt belongs to a job)');
+        }
+        const passRow = options.ledger
+          .listJobEvents(jobId, { limit: 500 })
+          .find((event) => event.kind === 'job.fallback-review' &&
+            typeof event.payload === 'object' && event.payload !== null &&
+            (event.payload as { phase?: unknown }).phase === 'pass' &&
+            (event.payload as { escalationId?: unknown }).escalationId === escalationId);
+        if (passRow === undefined) {
+          throw new Error(`escalation_id "${escalationId}" does not name a fallback PASS attempt of job "${jobId}"`);
+        }
+      }
       // Bind the row to the lane's current worker (existing agentId
       // semantics) so a terminal lane's leftover escalation is classified
       // as a closed receipt; no bound worker → unbound and live
@@ -1324,7 +1354,17 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         ...(jobId !== undefined ? { jobId } : {}),
         payload: { title, notification_id: notification.id },
       });
-      json(res, 200, { notification_id: notification.id });
+      if (escalationId !== undefined && jobId !== undefined) {
+        options.ledger.appendCustomEvent({
+          kind: 'job.fallback-review',
+          jobId,
+          payload: { gate: true, phase: 'escalation', status: 'posted', escalationId, receipt: notification.id, source: 'ops-repost' },
+        });
+      }
+      json(res, 200, {
+        notification_id: notification.id,
+        ...(escalationId !== undefined ? { escalation_outcome: 'posted' } : {}),
+      });
       return true;
     }
     if (req.method === 'POST' && path === '/api/silas/provider-recovery/claim') {

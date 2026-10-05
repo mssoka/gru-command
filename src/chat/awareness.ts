@@ -524,10 +524,21 @@ export class GruAwareness {
     const attempts = new Map<string, EscalationAttempt>();
     const attemptKey = (event: { jobId?: string | null }, payload: Record<string, unknown>): string =>
       `${event.jobId ?? '?'}|${textOf(payload.escalationId) ?? `i${numberOf(payload.iteration) ?? '?'}`}`;
-    // Complete per-kind truth (round-4 finding 1): attempt reconciliation
-    // reads the job.fallback-review stream itself, not a window of mixed
-    // events — unrelated traffic can never age an obligation out of view.
-    for (const event of this.ledger.listEventsAfter(0, { kinds: ['job.fallback-review'], limit: 5000, order: 'desc' })) {
+    // Complete per-kind truth (rounds 4-5): attempt reconciliation pages
+    // through the ENTIRE job.fallback-review stream — no fixed window can
+    // age an unresolved obligation out of view (a cap of 5000 was itself
+    // expirable). Ascending pages keep memory bounded and order stable.
+    const pageSize = 500;
+    const stream: EventRecord[] = [];
+    let pageCursor = 0;
+    for (;;) {
+      const page = this.ledger.listEventsAfter(pageCursor, { kinds: ['job.fallback-review'], limit: pageSize, order: 'asc' });
+      stream.push(...page);
+      if (page.length < pageSize) break;
+      pageCursor = page[page.length - 1]!.seq;
+    }
+    // Visit oldest-first so the newest pass/outcome wins the map update.
+    for (const event of stream) {
       const payload = payloadOf(event);
       const phase = textOf(payload.phase);
       if (phase !== 'pass' && phase !== 'escalation') continue;
@@ -689,10 +700,7 @@ export class GruAwareness {
       }
       digestLinesNewestFirst.push(line);
     }
-    // Round-4 finding 4: standing obligations render FIRST — the bounded
-    // block must spend its bytes on open repair obligations before
-    // historical status lines, and never advance past an unrendered one.
-    const digestLines = [...standingEscalationLines, ...reverse(digestLinesNewestFirst)];
+    const digestLines = reverse(digestLinesNewestFirst);
 
     // Pending IDs are independent of the cursor: a passive delivery may
     // have covered an event before the wake policy was enabled. The active
@@ -755,7 +763,7 @@ export class GruAwareness {
         addNote(id);
       }
     }
-    const rendered = this.render(notes, receiptNotes, digestLines, overflow, morning);
+    const rendered = this.render(standingEscalationLines, notes, receiptNotes, digestLines, overflow, morning);
     if (rendered === null) return null;
     if (exclusiveWake && rendered.ids.length === 0) {
       this.log('error', 'wake context has no visible notification IDs; increase awareness line/byte limits', {
@@ -891,6 +899,7 @@ export class GruAwareness {
   }
 
   private render(
+    standingLines: readonly string[],
     actionNotes: readonly { id: string; line: string }[],
     receiptNotes: readonly { id: string; line: string }[],
     digestLines: readonly string[],
@@ -916,6 +925,13 @@ export class GruAwareness {
       return true;
     };
 
+    // Round-5 finding 3: open repair obligations claim the budget BEFORE
+    // notes, receipts, and the morning summary — a bounded block must
+    // never spend its bytes on lower-priority sections while an
+    // unresolved obligation goes unrendered (the cursor still advances).
+    if (standingLines.length > 0 && push('Open repair obligations:')) {
+      for (const line of standingLines) push(line);
+    }
     if (actionNotes.length > 0 && push(this.wakeMode === 'all' ? 'Notifications (unacknowledged):' : 'Action required (unacknowledged):')) {
       for (const note of actionNotes) {
         // Never claim an ID whose identifier was clipped by the line/byte

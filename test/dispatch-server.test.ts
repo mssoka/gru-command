@@ -431,6 +431,58 @@ describe('dispatch server (E8)', () => {
       }, TOKEN);
       expect(badParent.status).toBe(400);
       expect(h.ledger.getJob('http-child-orphan')).toBeNull();
+      // Foreign repository with the SAME basename (round-5 finding 4):
+      // identity is the parent's recorded handoff path, not the basename.
+      const repoBasename = repo.path.split('/').filter(Boolean).pop()!;
+      h.ledger.addJob({ id: 'http-parent-foreign', repo: repoBasename, title: 'foreign', briefing: 'b' });
+      h.ledger.setJobStatus('http-parent-foreign', 'working');
+      h.ledger.appendCustomEvent({
+        kind: 'job.handoff', jobId: 'http-parent-foreign',
+        payload: { repo: repoBasename, repoPath: `/elsewhere/${repoBasename}` },
+      });
+      const foreignParent = await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'http-child-foreign', repo_path: repo.path, title: 'review', briefing: 'b',
+        deliverable: 'review', parent_job_id: 'http-parent-foreign',
+      }, TOKEN);
+      expect(foreignParent.status).toBe(400);
+      expect(h.ledger.getJob('http-child-foreign')).toBeNull();
+      // Terminal parent (round-5 finding 11): a terminal lane can never
+      // be re-armed.
+      h.ledger.addJob({ id: 'http-parent-done', repo: repoBasename, title: 'done', briefing: 'b' });
+      h.ledger.setJobStatus('http-parent-done', 'working');
+      h.ledger.setJobStatus('http-parent-done', 'delivered');
+      h.ledger.setJobStatus('http-parent-done', 'done');
+      h.ledger.appendCustomEvent({
+        kind: 'job.handoff', jobId: 'http-parent-done',
+        payload: { repo: repoBasename, repoPath: repo.path },
+      });
+      const terminalParent = await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'http-child-terminal', repo_path: repo.path, title: 'review', briefing: 'b',
+        deliverable: 'review', parent_job_id: 'http-parent-done',
+      }, TOKEN);
+      expect(terminalParent.status).toBe(400);
+      expect(h.ledger.getJob('http-child-terminal')).toBeNull();
+      // Correlated ops re-post (round-5 decision 1): the attempt must
+      // name a durable PASS row; the posted outcome retires it.
+      h.ledger.appendCustomEvent({
+        kind: 'job.fallback-review', jobId: 'http-parent-impl',
+        payload: { gate: true, phase: 'pass', iteration: 1, notes: 0, clearToMerge: true, merge: 'user-held', escalationId: 'http-parent-impl:run1:1' },
+      });
+      const repost = await call(h.port, 'POST', '/api/silas/escalate', {
+        job_id: 'http-parent-impl', title: 're-post the fallback PASS notice', detail: 'ops reconciliation',
+        escalation_id: 'http-parent-impl:run1:1', by: 'silas',
+      }, TOKEN);
+      expect(repost.status).toBe(200);
+      expect(field<string>(repost.json, 'escalation_outcome')).toBe('posted');
+      const outcome = h.ledger.listJobEvents('http-parent-impl', { limit: 50 })
+        .find((event) => event.kind === 'job.fallback-review' &&
+          typeof event.payload === 'object' && event.payload !== null &&
+          (event.payload as { phase?: unknown }).phase === 'escalation');
+      expect(outcome).toMatchObject({ payload: { status: 'posted', escalationId: 'http-parent-impl:run1:1', source: 'ops-repost' } });
+      const bogusAttempt = await call(h.port, 'POST', '/api/silas/escalate', {
+        job_id: 'http-parent-impl', title: 'x', escalation_id: 'no-such-attempt', by: 'silas',
+      }, TOKEN);
+      expect(bogusAttempt.status).toBe(400);
       // Malformed PRESENT parent values must fail loud (round-4 finding
       // 12): null/number/blank/object can never be treated as absent.
       for (const [suffix, value] of [['null', null], ['number', 7], ['blank', '  '], ['object', { id: 'http-parent-impl' }]] as const) {
