@@ -270,7 +270,9 @@ async function prepareCleanAbort(
   const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: lane.path, encoding: 'utf8' }).trim();
   expect(h.ledger.latestJobEvent(jobId, 'job.delivered')?.payload).toMatchObject({ sha, source: 'dispatch' });
   const round = h.ledger.addRound({ jobId, targetRef: sha, lenses: ['blind'] });
-  h.ledger.setRoundStatus(round.id, 'aborted');
+  // The clean abort is known to precede any spawn; the incomplete reason
+  // alone cannot prove an old writer is gone.
+  h.ledger.abortReviewSetupWithoutSpawn(round.id);
   h.ledger.appendCustomEvent({
     kind: 'round.perkins-incomplete', jobId, roundId: round.id, payload: { reason: 'service_restart' },
   });
@@ -856,7 +858,7 @@ describe('dispatch server (E8)', () => {
     }
   });
 
-  it('re-arms one proven same-head service-restart abort through the guarded Silas review API', async () => {
+  it('holds a Silas same-head service-restart re-arm when the old review owner has no cessation proof', async () => {
     const h = await boot();
     const repo = makeFixtureRepo('fixture-clean-abort');
     cleanupRepos.push(repo);
@@ -888,12 +890,10 @@ describe('dispatch server (E8)', () => {
         config: DEFAULT_SILAS_CONFIG, trigger: 'sweep' });
       expect(digest.prWithoutReview).toMatchObject([{ jobId: 'clean-abort', cleanAbort: { roundId: round.id } }]);
       const review = await call(h.port, 'POST', '/api/dispatch/review', body, TOKEN);
-      expect(review).toMatchObject({ status: 202, json: { route: 'perkins', round_id: 'clean-abort-r2',
-        rule_id: 'clean-abort-service-restart', source_round_id: round.id } });
-      expect(h.ledger.latestJobEvent('clean-abort', 'silas.review-triggered')?.payload).toMatchObject({
-        rule_id: 'clean-abort-service-restart', source_round_id: round.id, round_id: 'clean-abort-r2',
-      });
-      expect((await call(h.port, 'POST', '/api/dispatch/review', body, TOKEN)).status).toBe(400);
+      expect(review).toMatchObject({ status: 400, json: { error: 'bad_request',
+        detail: expect.stringMatching(/no trusted no-spawn proof or owner marker; ownership is unknown/) } });
+      expect(h.ledger.latestJobEvent('clean-abort', 'silas.review-triggered')).toBeNull();
+      expect(h.ledger.listRounds('clean-abort')).toHaveLength(1);
     } finally { await h.close(); }
   }, 90_000);
 
@@ -1129,7 +1129,9 @@ describe('dispatch server (E8)', () => {
       const lane = h.worktrees.listWorktrees({ jobId: 'clean-abort-lane' }).find((row) => row.kind === 'job')!;
       const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: lane.path, encoding: 'utf8' }).trim();
       const round = h.ledger.addRound({ jobId: 'clean-abort-lane', targetRef: sha, lenses: ['blind'] });
-      h.ledger.setRoundStatus(round.id, 'aborted');
+      // This fixture models a missing review lane after a proven pre-spawn
+      // abort, not a service-restart reason standing in for cessation proof.
+      h.ledger.abortReviewSetupWithoutSpawn(round.id);
       const body = { job_id: 'clean-abort-lane', by: 'silas', rule_id: 'clean-abort-service-restart', source_round_id: round.id };
       h.ledger.appendCustomEvent({ kind: 'round.perkins-incomplete', jobId: 'clean-abort-lane', roundId: round.id, payload: { reason: 'service_restart_missing_review_lane' } });
       const review = await call(h.port, 'POST', '/api/dispatch/review', body, TOKEN);

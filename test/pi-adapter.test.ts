@@ -1,4 +1,5 @@
 import { ModelRuntime } from '@earendil-works/pi-coding-agent';
+import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -2127,6 +2128,142 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       });
       await expect(fx.runtime.checkReviewModel('perkins')).rejects.toThrow(detail);
       await expect(fx.runtime.spawn('perkins')).rejects.toThrow(detail);
+    }
+  });
+
+  it('pins the Pi preflight provider/model on isolated lead and child spawns and refuses a changed settings default', async () => {
+    const fx = await fixture([], ['text'], { configExtra: '[models.roles]\nperkins = "default"\n[runtimes.pi.roles.perkins]\nthinking_level = "high"\n' });
+    const settings = join(fx.agentDir, 'settings.json');
+    writeFileSync(settings, JSON.stringify({ defaultProvider: 'gru-stub', defaultModel: 'stub-model' }));
+    const registry = new RuntimeRegistry({ config: fx.config, store: fx.store,
+      pi: { agentDir: fx.agentDir, modelRuntime: fx.modelRuntime } });
+    const proof = await registry.prepareReviewModel('perkins');
+    expect(registry.reviewThinkingLevel('perkins')).toBe('high');
+    expect(proof).toMatchObject({ role: 'perkins', modelRef: 'gru-stub/stub-model', settings: {}, authEnv: {} });
+    expect(proof?.routingSha256).toMatch(/^[a-f0-9]{64}$/u);
+    const generation = randomUUID();
+    const lead = await registry.spawn('perkins', {
+      reviewLead: { systemPrompt: 'lead', tools: [], nativeTools: [] }, reviewModel: proof,
+      reviewOwnerGeneration: generation,
+    });
+    const owner = { roundId: 'test-round', runtimeId: 'pi', pid: process.pid, generation };
+    expect(registry.reviewOwnerCeased(lead.id, owner)).toBe(false);
+    expect((twinGate.lastOptions as { model?: { provider: string; id: string } }).model)
+      .toMatchObject({ provider: 'gru-stub', id: 'stub-model' });
+    expect((twinGate.lastOptions as { thinkingLevel?: string }).thinkingLevel).toBe('high');
+    await lead.dispose();
+    expect(registry.reviewOwnerCeased(lead.id, owner)).toBe(true);
+    expect(registry.reviewOwnerCeased(lead.id, { ...owner, generation: randomUUID() })).toBe(false);
+    const child = await registry.spawn('perkins', {
+      isolatedReview: { systemPrompt: 'lens', tools: [] }, reviewModel: proof,
+    });
+    expect((twinGate.lastOptions as { model?: { provider: string; id: string } }).model)
+      .toMatchObject({ provider: 'gru-stub', id: 'stub-model' });
+    expect((twinGate.lastOptions as { thinkingLevel?: string }).thinkingLevel).toBe('high');
+    await child.dispose();
+    const getModel = fx.modelRuntime.getModel.bind(fx.modelRuntime);
+    vi.spyOn(fx.modelRuntime, 'getModel').mockImplementation((provider, id) =>
+      id === 'alternate-model' ? { ...getModel(provider, 'stub-model')!, id } : getModel(provider, id));
+    writeFileSync(settings, JSON.stringify({ defaultProvider: 'gru-stub', defaultModel: 'alternate-model' }));
+    for (const reviewMode of [
+      { reviewLead: { systemPrompt: 'lead', tools: [] as const, nativeTools: [] } },
+      { isolatedReview: { systemPrompt: 'lens', tools: [] as const } },
+    ]) {
+      await expect(registry.spawn('perkins', { ...reviewMode, reviewModel: proof }))
+        .rejects.toThrow('Pi review model changed since preflight');
+    }
+    writeFileSync(settings, JSON.stringify({ defaultProvider: 'gru-stub', defaultModel: 'stub-model' }));
+    vi.spyOn(fx.modelRuntime, 'getModel').mockImplementation((provider, id) => {
+      const selected = getModel(provider, id);
+      return selected === undefined ? undefined : { ...selected, baseUrl: 'https://alternate.example.invalid/v2' };
+    });
+    await expect(registry.spawn('perkins', {
+      reviewLead: { systemPrompt: 'lead', tools: [], nativeTools: [] }, reviewModel: proof,
+    })).rejects.toThrow('Pi review model changed since preflight');
+    const changedRoute = await registry.prepareReviewModel('perkins');
+    expect(changedRoute?.modelRef).toBe(proof?.modelRef);
+    expect(changedRoute?.routingSha256).toBeUndefined();
+    for (const changes of [
+      { maxTokens: 2_048 }, { contextWindow: 50_000 }, { input: ['text', 'image'] as ('text' | 'image')[] },
+    ]) {
+      vi.spyOn(fx.modelRuntime, 'getModel').mockImplementation((provider, id) => {
+        const selected = getModel(provider, id);
+        return selected === undefined ? undefined : { ...selected, ...changes };
+      });
+      const changedModel = await registry.prepareReviewModel('perkins');
+      expect(changedModel?.modelRef).toBe(proof?.modelRef);
+      expect(changedModel?.routingSha256).not.toBe(proof?.routingSha256);
+      await expect(registry.spawn('perkins', {
+        reviewLead: { systemPrompt: 'lead', tools: [], nativeTools: [] }, reviewModel: proof,
+      })).rejects.toThrow('Pi review model changed since preflight');
+    }
+    for (const baseUrl of ['https://user:secret@example.invalid/v2',
+      'https://api.openai.com/v1/secret-in-path', 'https://secret-in-host.example.invalid/v1']) {
+      vi.spyOn(fx.modelRuntime, 'getModel').mockImplementation((provider, id) => {
+        const selected = getModel(provider, id);
+        return selected === undefined ? undefined : { ...selected, baseUrl };
+      });
+      const unknownRoute = await registry.prepareReviewModel('perkins');
+      expect(unknownRoute?.routingSha256).toBeUndefined();
+      vi.spyOn(fx.modelRuntime, 'getModel').mockImplementation((provider, id) => {
+        const selected = getModel(provider, id);
+        return selected === undefined ? undefined : { ...selected, baseUrl: `${baseUrl}/changed` };
+      });
+      await expect(registry.spawn('perkins', {
+        reviewLead: { systemPrompt: 'lead', tools: [], nativeTools: [] }, reviewModel: unknownRoute,
+      })).rejects.toThrow('Pi review model changed since preflight');
+    }
+    vi.spyOn(fx.modelRuntime, 'getModel').mockImplementation((provider, id) => {
+      const selected = getModel(provider, id);
+      return selected === undefined ? undefined : { ...selected, api: 'anthropic-messages',
+        baseUrl: 'https://api.anthropic.com', compat: { supportsStrictTools: true,
+          allowedFallbackModels: [{ provider: 'anthropic', model: 'claude-opus-5',
+            cost: { input: 5, output: 25, cacheRead: 1, cacheWrite: 2 } }] } };
+    });
+    const compatible = await registry.prepareReviewModel('perkins');
+    expect(compatible?.routingSha256).toMatch(/^[a-f0-9]{64}$/u);
+    vi.spyOn(fx.modelRuntime, 'getModel').mockImplementation((provider, id) => {
+      const selected = getModel(provider, id);
+      return selected === undefined ? undefined : { ...selected, api: 'anthropic-messages',
+        baseUrl: 'https://api.anthropic.com', name: 'credential-looking-display-name',
+        compat: { supportsStrictTools: true, allowedFallbackModels: [{ provider: 'anthropic', model: 'claude-opus-5',
+          cost: { input: 5, output: 25, cacheRead: 1, cacheWrite: 2 } }] } };
+    });
+    expect((await registry.prepareReviewModel('perkins'))?.routingSha256).toBe(compatible?.routingSha256);
+    vi.spyOn(fx.modelRuntime, 'getModel').mockImplementation((provider, id) => {
+      const selected = getModel(provider, id);
+      return selected === undefined ? undefined : { ...selected, api: 'anthropic-messages',
+        baseUrl: 'https://api.anthropic.com', compat: { supportsStrictTools: false,
+          allowedFallbackModels: [{ provider: 'anthropic', model: 'claude-opus-5',
+            cost: { input: 5, output: 25, cacheRead: 1, cacheWrite: 2 } }] } };
+    });
+    expect((await registry.prepareReviewModel('perkins'))?.routingSha256).not.toBe(compatible?.routingSha256);
+    vi.spyOn(fx.modelRuntime, 'getModel').mockImplementation((provider, id) => {
+      const selected = getModel(provider, id);
+      return selected === undefined ? undefined : { ...selected, api: 'anthropic-messages',
+        baseUrl: 'https://api.anthropic.com',
+        compat: { secretOverride: 'sensitive' } as unknown as NonNullable<typeof selected>['compat'] };
+    });
+    expect((await registry.prepareReviewModel('perkins'))?.routingSha256).toBeUndefined();
+    for (const change of [
+      { provider: 'credential-looking-provider' },
+      { id: 'credential-looking-model' },
+      { api: 'credential-looking-api' },
+      { thinkingLevelMap: { high: 'credential-looking-thinking' } },
+      { thinkingLevelMap: { 'credential-looking-key': 'high' } },
+      { compat: { allowedFallbackModels: [{ provider: 'anthropic', model: 'claude-credential-looking-token',
+        cost: { input: 1, output: 1, cacheRead: 1, cacheWrite: 1 } }] } },
+    ]) {
+      vi.spyOn(fx.modelRuntime, 'getModel').mockImplementation((provider, id) => {
+        const selected = getModel(provider, id);
+        return selected === undefined ? undefined : { ...selected, api: 'anthropic-messages',
+          baseUrl: 'https://api.anthropic.com', ...change };
+      });
+      if ('provider' in change) {
+        await expect(registry.prepareReviewModel('perkins')).rejects.toThrow('not authenticated');
+      } else {
+        expect((await registry.prepareReviewModel('perkins'))?.routingSha256).toBeUndefined();
+      }
     }
   });
 

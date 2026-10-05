@@ -36,6 +36,8 @@ export interface ReviewPreflightResult {
   readonly failures: readonly ReviewCapabilityFailure[];
   /** In-memory request-owned proof, never included in fallback findings. */
   readonly reviewModel?: ClaudeReviewSnapshot;
+  /** Effective non-secret thinking policy captured beside the model probe. */
+  readonly reviewThinkingLevel?: string;
 }
 
 const LEG_REMEDIATION: Readonly<Record<ReviewCapabilityLeg, string>> = {

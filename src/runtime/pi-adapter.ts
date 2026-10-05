@@ -10,8 +10,11 @@ import {
 import type { ToolDefinition } from '@earendil-works/pi-coding-agent';
 import type { Api, Model, ThinkingLevel } from '@earendil-works/pi-ai';
 import { realpathSync, readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import type { GruCommandConfig, Role } from '../config.js';
+import type { ClaudeReviewSnapshot } from './claude-review-settings.js';
 import { resolveModelRefreshPolicy, resolveSpawnPolicy } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import { ROLE_DEFINITIONS } from '../roles.js';
@@ -321,6 +324,8 @@ export class PiRuntime implements AgentRuntime {
   /** Only matching provider refreshes (or a full-catalog refresh) can share
    * their result. Different providers queue behind one another for the SDK. */
   private readonly catalogRefreshes = new Map<string, Promise<ModelCatalogRefreshOutcome>>();
+  /** Opaque endpoints are checked only within this request; never hash or persist them. */
+  private readonly reviewModels = new WeakMap<ClaudeReviewSnapshot, Model<Api>>();
   private catalogRefreshTail: Promise<void> = Promise.resolve();
   private down: string | undefined;
 
@@ -537,9 +542,91 @@ export class PiRuntime implements AgentRuntime {
     return model;
   }
 
-  /** Check the very model spawn resolves, without creating a session or
-   * sending a generation request. Do not accept auth for another provider. */
-  async checkReviewModel(role: Role): Promise<void> {
+  // Finite public catalog spellings, never a lexical pattern over user models.
+  private static readonly PUBLIC_ANTHROPIC_MODELS = new Set([
+    'claude-fable-5', 'claude-fable-5-1', 'claude-haiku-4-5', 'claude-haiku-4-5-20251001',
+    'claude-opus-4-5', 'claude-opus-4-5-20251101', 'claude-opus-4-6', 'claude-opus-4-7',
+    'claude-opus-4-8', 'claude-opus-5', 'claude-sonnet-4-5', 'claude-sonnet-4-5-20250929',
+    'claude-sonnet-4-6', 'claude-sonnet-5',
+  ]);
+
+  private safeReviewCompat(compat: unknown, api: string): boolean {
+    if (compat === undefined) return true;
+    if (api !== 'anthropic-messages' || compat === null || typeof compat !== 'object' || Array.isArray(compat)) return false;
+    const flags = new Set(['supportsEagerToolInputStreaming', 'supportsLongCacheRetention',
+      'sendSessionAffinityHeaders', 'supportsCacheControlOnTools', 'supportsTemperature',
+      'forceAdaptiveThinking', 'allowEmptySignature', 'supportsStrictTools', 'supportsMidConvoEffort']);
+    return Object.entries(compat).every(([key, value]) => {
+      if (flags.has(key)) return typeof value === 'boolean';
+      if (key !== 'allowedFallbackModels' || !Array.isArray(value)) return false;
+      return value.every((item: unknown) => {
+        if (item === null || typeof item !== 'object' || Array.isArray(item)) return false;
+        const fallback = item as Record<string, unknown>;
+        const cost = fallback.cost;
+        return Object.keys(fallback).every((field) => ['provider', 'model', 'cost'].includes(field)) &&
+          fallback.provider === 'anthropic' && typeof fallback.model === 'string' &&
+          PiRuntime.PUBLIC_ANTHROPIC_MODELS.has(fallback.model) &&
+          cost !== null && typeof cost === 'object' && !Array.isArray(cost) &&
+          Object.keys(cost).every((field) => ['input', 'output', 'cacheRead', 'cacheWrite'].includes(field)) &&
+          ['input', 'output', 'cacheRead', 'cacheWrite'].every((field) =>
+            typeof (cost as Record<string, unknown>)[field] === 'number' &&
+            Number.isFinite((cost as Record<string, number>)[field]));
+      });
+    });
+  }
+
+  /** Bind endpoint/API selection without recording (or hashing) credentials.
+   * Ambiguous/custom routing is deliberately not eligible for reuse. */
+  private reviewRouting(model: Model<Api>): string | undefined {
+    if (model.headers !== undefined || model.samplingParams !== undefined ||
+      !this.safeReviewCompat(model.compat, model.api) ||
+      Object.keys(model).some((key) => !['id', 'name', 'api', 'provider', 'baseUrl', 'reasoning',
+        'thinkingLevelMap', 'input', 'cost', 'contextWindow', 'maxTokens', 'compat'].includes(key))) return undefined;
+    let url: URL;
+    try { url = new URL(model.baseUrl); } catch { return undefined; }
+    // An arbitrary hostname or path may itself be an API credential. Do not
+    // even hash custom routes: only these literal, credential-free endpoints
+    // can produce a reusable proof. Other models can still undergo a fresh
+    // review, but their results cannot be inherited across rounds.
+    const publicRoutes = new Set([
+      'https://api.anthropic.com', 'https://api.anthropic.com/',
+      'https://api.openai.com/v1', 'https://api.openai.com/v1/',
+      'https://generativelanguage.googleapis.com', 'https://generativelanguage.googleapis.com/',
+      'stub://local',
+    ]);
+    if (!publicRoutes.has(model.baseUrl) || url.username !== '' || url.password !== '' ||
+      url.search !== '' || url.hash !== '') return undefined;
+    const isAnthropic = model.provider === 'anthropic' && model.api === 'anthropic-messages' &&
+      PiRuntime.PUBLIC_ANTHROPIC_MODELS.has(model.id) && url.origin === 'https://api.anthropic.com';
+    const isStub = model.provider === 'gru-stub' && model.id === 'stub-model' &&
+      ((model.api === 'gru-stub' && model.baseUrl === 'stub://local') ||
+        (model.api === 'anthropic-messages' && url.origin === 'https://api.anthropic.com'));
+    if (!isAnthropic && !isStub) return undefined;
+    const levels = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
+    if (model.thinkingLevelMap !== undefined &&
+      (typeof model.thinkingLevelMap !== 'object' || model.thinkingLevelMap === null ||
+        Object.entries(model.thinkingLevelMap).some(([key, value]) =>
+          !levels.has(key) || (value !== null && (typeof value !== 'string' || !levels.has(value)))))) return undefined;
+    if (typeof model.reasoning !== 'boolean' || !Array.isArray(model.input) ||
+      model.input.length === 0 || Array.from(model.input).some((value) => value !== 'text' && value !== 'image') ||
+      !Number.isSafeInteger(model.contextWindow) || !Number.isSafeInteger(model.maxTokens) ||
+      model.cost === null || typeof model.cost !== 'object' ||
+      Object.keys(model.cost).some((key) => !['input', 'output', 'cacheRead', 'cacheWrite'].includes(key)) ||
+      ['input', 'output', 'cacheRead', 'cacheWrite'].some((key) => {
+        const value = (model.cost as unknown as Record<string, unknown>)[key];
+        return typeof value !== 'number' || !Number.isFinite(value);
+      })) return undefined;
+    return createHash('sha256').update(JSON.stringify({
+      api: model.api, baseUrl: url.href, provider: model.provider, id: model.id,
+      reasoning: model.reasoning, thinkingLevelMap: model.thinkingLevelMap ?? null,
+      input: model.input, cost: model.cost, contextWindow: model.contextWindow, maxTokens: model.maxTokens,
+      compat: model.compat ?? null,
+    })).digest('hex');
+  }
+
+  /** Capture the actual Pi provider/model selected by the same resolver as
+   * spawn, not the mutable "default" setting or a credential-bearing value. */
+  async prepareReviewModel(role: Role): Promise<ClaudeReviewSnapshot> {
     const model = await this.resolveModel(role);
     if (model === undefined) {
       // With no settings default the offline SDK snapshot cannot choose a
@@ -549,6 +636,15 @@ export class PiRuntime implements AgentRuntime {
     if (await (await this.runtime()).checkAuth(model.provider) === undefined) {
       throw new Error(`review model provider is not authenticated: ${model.provider} (model ${model.provider}/${model.id})`);
     }
+    const routingSha256 = this.reviewRouting(model);
+    const snapshot: ClaudeReviewSnapshot = { role, modelRef: `${model.provider}/${model.id}`, settings: {}, authEnv: {},
+      ...(routingSha256 !== undefined ? { routingSha256 } : {}) };
+    this.reviewModels.set(snapshot, structuredClone(model));
+    return snapshot;
+  }
+
+  async checkReviewModel(role: Role): Promise<void> {
+    await this.prepareReviewModel(role);
   }
 
   /** Thinking levels pi's session API accepts (fail-loud on typos: pi CAN set it). */
@@ -580,7 +676,25 @@ export class PiRuntime implements AgentRuntime {
     // SPEC ruling 17: an explicit cwd roots the session in the project it
     // serves (the dispatch flow's worktree); absent = workspace root.
     const cwd = resolveSpawnCwd(this.config.workspaceRoot, options.cwd);
+    if (options.reviewModel !== undefined) {
+      if ((options.reviewLead ?? options.isolatedReview) === undefined || options.reviewModel.role !== role ||
+        Object.keys(options.reviewModel.authEnv).length > 0 || Object.keys(options.reviewModel.settings).length > 0) {
+        throw new Error('Pi review model proof requires a matching isolated role and no Claude settings or credentials');
+      }
+      const current = await this.resolveModel(role);
+      if (current === undefined || `${current.provider}/${current.id}` !== options.reviewModel.modelRef ||
+        options.model !== options.reviewModel.modelRef ||
+        !isDeepStrictEqual(current, this.reviewModels.get(options.reviewModel)) ||
+        (options.reviewModel.routingSha256 !== undefined && this.reviewRouting(current) !== options.reviewModel.routingSha256)) {
+        throw new Error('Pi review model changed since preflight (including routing) — do not spawn a lead or lens against a different endpoint');
+      }
+    }
     const model = await this.resolveModel(role, options.model);
+    if (options.reviewModel !== undefined &&
+      (model === undefined || !isDeepStrictEqual(model, this.reviewModels.get(options.reviewModel)) ||
+        (options.reviewModel.routingSha256 !== undefined && this.reviewRouting(model) !== options.reviewModel.routingSha256))) {
+      throw new Error('Pi review endpoint changed before session creation');
+    }
     const thinkingLevel = this.resolveThinkingLevel(role, options.thinkingLevel);
     // Name the RESOLVED model: future "No API key"-style complaints must
     // name the actual model, not the sentinel that requested it.

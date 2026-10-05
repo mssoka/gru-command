@@ -61,6 +61,7 @@ here before the v1.0.0 tag)*
 ## Prerequisites
 
 - **Node.js ≥ 22.19** — the service runtime and build toolchain.
+- **Python 3 ≥ 3.8 on macOS** — required for descriptor-bound installed-code fingerprinting and Perkins review recovery; `install.sh` verifies inherited-directory-FD support before setup, update, or service registration.
 - **git** — per-job worktree lanes and branch inspection.
 - **GitHub CLI (`gh`), authenticated for every managed repo** — the
   GitHub signal poll and the round's code-host preflight always ride
@@ -110,11 +111,22 @@ GitHub signal ingestion is poll-only — no webhooks, no inbound tunnel.
 
 ## Install
 
-One line (macOS + Linux, Node ≥ 22.19, git):
+One line (macOS + Linux, Node ≥ 22.19, git; **macOS also requires Python 3 ≥ 3.8**):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/mssoka/gru-command/main/install.sh | bash
 ```
+
+On macOS, the installer verifies that Python 3 can enumerate an inherited
+checked directory descriptor before setup, update or service registration.
+It pins the resolved absolute interpreter in the launchd unit as
+`GRU_COMMAND_REVIEW_PYTHON`, so startup does not depend on an interactive
+shell or version-manager shim. Set `GRU_COMMAND_REVIEW_PYTHON` to a stable
+absolute Python 3 executable if it is not found on `PATH`. Missing or
+unusable Python stops installation before mutation; at runtime, review
+identity fails closed rather than crediting incompatible checkpoints.
+`--help`, `--print`, and `--uninstall` remain available without Python.
+See [the prerequisite decision](docs/decisions/gh-168-darwin-python-review-enumeration.md).
 
 That single invocation clones to `~/gru-command`, installs dependencies,
 builds the service and web UI, and runs the setup wizard through

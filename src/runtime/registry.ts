@@ -57,6 +57,18 @@ export interface ClaudeKnobs {
   readonly reviewSettingsFile?: string;
 }
 
+export function validReviewOwnerGeneration(value: unknown): value is string {
+  return typeof value === 'string' &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(value);
+}
+
+export interface ReviewOwnerMarker {
+  readonly roundId: string;
+  readonly runtimeId: string;
+  readonly pid: number;
+  readonly generation: string;
+}
+
 export interface RuntimeRegistryOptions {
   readonly config: Parameters<typeof resolveSpawnPolicy>[0];
   readonly store: SessionStore;
@@ -70,6 +82,8 @@ export interface RuntimeRegistryOptions {
   /** Review-reservation close settle window (default 30s, named
    * CLOSE_SETTLE_MS). Expiration fails closed and retains capacity. */
   readonly closeSettleMs?: number;
+  /** OS probe override for deterministic death/live/unknown tests only. */
+  readonly ownerProcessProbe?: (pid: number) => 'dead' | 'alive' | 'unknown';
   /** Durable relay for reclaim-failure observations (one per handle per
    * drain epoch). The registry owns no ledger; the host wires this. */
   readonly reclaimFailureSink?: (observation: {
@@ -132,6 +146,26 @@ export class RuntimeRegistry {
   private readonly adapters = new Map<RuntimeId, AgentRuntime>();
   private readonly nativeAdapters = new Map<RuntimeId, PiRuntime | ClaudeCodeRuntime>();
   private readonly handles = new Set<AgentHandle>();
+  private readonly ceasedReviewOwners = new Map<string, string>();
+
+  /** Pi isolated review tools and host-native callbacks run inside this
+   * hosting process; an OS-proven dead host cannot issue another write.
+   * Claude can leave an independently running child, so PID death is NEVER
+   * cessation proof for Claude. A live/reused/unknown PID blocks unless the
+   * current process observed adapter-owned cessation for this generation. */
+  reviewOwnerCeased(agentId: string, marker: ReviewOwnerMarker | null): boolean {
+    if (marker === null || !Number.isSafeInteger(marker.pid) || marker.pid <= 0 ||
+      !validReviewOwnerGeneration(marker.generation) || marker.roundId.trim() === '') return false;
+    if (marker.pid === process.pid) return this.ceasedReviewOwners.get(agentId) === marker.generation;
+    if (marker.runtimeId !== 'pi') return false;
+    try {
+      if (this.opts.ownerProcessProbe !== undefined) return this.opts.ownerProcessProbe(marker.pid) === 'dead';
+      process.kill(marker.pid, 0);
+      return false;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === 'ESRCH';
+    }
+  }
   private readonly agentListeners = new Set<AgentEventListener>();
   private readonly opts: RuntimeRegistryOptions;
   private readonly log: Log;
@@ -231,12 +265,16 @@ export class RuntimeRegistry {
     this.runtimeFor(id);
     const native = this.nativeAdapters.get(id)!;
     if (native instanceof ClaudeCodeRuntime) return native.prepareReviewModel(role);
-    await native.checkReviewModel(role);
-    return undefined;
+    return native.prepareReviewModel(role);
   }
 
   async checkReviewModel(role: Role): Promise<void> {
     await this.prepareReviewModel(role);
+  }
+
+  reviewThinkingLevel(role: Role): string {
+    const id = this.runtimeIdFor(role);
+    return applyThinkingFallback(this.runtimeFor(id), resolveSpawnPolicy(this.opts.config, id, role).thinkingLevel, this.log);
   }
 
   /** The fallback-wrapped adapter for a runtime id (created on first use). */
@@ -523,8 +561,13 @@ export class RuntimeRegistry {
 
   private async spawnReserved(role: Role, options: SpawnOptions, release: (() => void) | null): Promise<AgentHandle> {
     if (options.signal?.aborted) throw new Error('resident admission cancelled before spawn');
-    if (options.reviewModel !== undefined && this.runtimeIdFor(role) !== 'claude-code') {
-      throw new Error('Claude review model snapshot cannot be used with a different runtime');
+    if (options.reviewOwnerGeneration !== undefined &&
+      ((options.reviewLead ?? options.isolatedReview) === undefined || !validReviewOwnerGeneration(options.reviewOwnerGeneration))) {
+      throw new Error('review ownership generation requires an isolated review with a valid generation');
+    }
+    if (options.reviewModel !== undefined && this.runtimeIdFor(role) === 'pi' &&
+      (options.reviewLead ?? options.isolatedReview) === undefined) {
+      throw new Error('Pi review model snapshot requires an isolated review lead or lens');
     }
     const adapter = this.runtimeFor(this.runtimeIdFor(role));
     // SPEC ruling 16: resolve the model & thinking policy from config
@@ -550,7 +593,8 @@ export class RuntimeRegistry {
       ...(options.isolatedReview !== undefined ? { isolatedReview: options.isolatedReview } : {}),
       ...(options.reviewLead !== undefined ? { reviewLead: options.reviewLead } : {}),
       ...(options.reviewModel !== undefined ? { reviewModel: options.reviewModel } : {}),
-      model: policy.model,
+      model: options.reviewModel !== undefined && this.runtimeIdFor(role) === 'pi'
+        ? options.reviewModel.modelRef : policy.model,
       thinkingLevel,
     });
     let pending = 0;
@@ -561,6 +605,13 @@ export class RuntimeRegistry {
     const releaseHandle = (): void => {
       if (released) return;
       released = true;
+      try {
+        if (options.reviewOwnerGeneration !== undefined && handle.cessationEvidence?.() === 'ceased') {
+          this.ceasedReviewOwners.set(handle.id, options.reviewOwnerGeneration);
+        }
+      } catch {
+        // Missing or failing adapter evidence remains unknown.
+      }
       this.handles.delete(resident);
       this.residents.unwatch(resident);
       release?.();

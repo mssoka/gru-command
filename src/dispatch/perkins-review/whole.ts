@@ -6,7 +6,7 @@ import type { AgentSpawner } from '../service.js';
 import type { AgentHandle, NativeAgentTool, PromptOptions } from '../../runtime/types.js';
 import type { PacingGate, PacingLease, PacingEventRecorder, RateLimitBackoffPolicy } from '../../runtime/pacing.js';
 import { withRateLimitRetries, type RateLimitRetryOptions } from '../../runtime/rate-limit-retry.js';
-import { assertFrozenPromptBounds, publishedReportMatches, readReviewArtifact, sourceMovementSinceFreeze, writeReviewArtifact, type FrozenReview, type SourceMovement } from './artifacts.js';
+import { assertFrozenPromptBounds, compatibleReviewIdentity, proveRecoveredBaseMergeability, publishedReportMatches, readReviewArtifact, readReviewCheckpoint, sourceMovementSinceFreeze, SPECIALIST_CHECKPOINT_MAX_BYTES, writeReviewArtifact, type FrozenReview, type SourceMovement } from './artifacts.js';
 import { readFrozenEvidenceBytes, renderEvidencePromptSection } from '../../review-inputs/evidence.js';
 import { finalAssistantText } from './session-output.js';
 import { PERKINS_FINDING_SOURCES, PERKINS_LENSES, type PerkinsFindingSource, type PerkinsLens, type PerkinsPolicy } from './policy.js';
@@ -141,6 +141,8 @@ export interface PerkinsWholeReviewOptions {
    * remaining/elapsed deterministically; default Date.now). */
   readonly pacingNow?: () => number;
   readonly onProgress?: (progress: ReviewProgress) => void;
+  readonly recordSpecialistStart?: (lens: PerkinsLens, attempt: 1 | 2, originRoundId?: string) => void;
+  readonly recordSpecialistSettlement?: (lens: PerkinsLens, attempt: 1 | 2, sha256: string) => void;
   readonly onAgent?: (input: {
     readonly phase: 'lead' | 'specialist';
     readonly lens?: PerkinsLens;
@@ -159,6 +161,20 @@ export interface RunWholeReviewInput {
   readonly movementRef: string;
   readonly noSpec: boolean;
   readonly priorConsolidatedFile?: string;
+  /** Authenticated predecessor base tips when a compatible base-only fast-forward
+   * occurred. The fresh lead must judge the current base, not inherited work. */
+  readonly recoveredBaseTips?: readonly string[];
+  /** Interrupted same-job predecessor; never a prior verdict or clearance. */
+  readonly recoveryDirectory?: string;
+  /** Ledger start events survive missing or failed artifact writes. */
+  readonly recoveryStarts?: readonly { readonly lens: PerkinsLens; readonly attempt: 1 | 2; readonly originRoundId?: string }[];
+  readonly recoverySettlements?: readonly { readonly lens: PerkinsLens; readonly attempt: 1 | 2; readonly sha256: string }[];
+  /** Each charged start selects its own authenticated source; a partly
+   * copied later round must not suppress an older valid checkpoint. */
+  readonly recoverySources?: readonly {
+    readonly lens: PerkinsLens; readonly attempt: 1 | 2; readonly directory: string;
+    readonly manifestSha256: string; readonly sha256?: string;
+  }[];
   /** Service shutdown or caller cancellation. Cancellation is always INCOMPLETE. */
   readonly signal?: AbortSignal;
 }
@@ -169,10 +185,13 @@ export interface SpecialistRun {
   readonly status: 'valid' | 'invalid' | 'failed';
   readonly failureKind?: ChildFailureKind;
   readonly error?: string;
-  /** False when the run completed validly but its findings never reached
-   * the lead (over-bound tool response): 'ran' must never read as
-   * 'delivered' (R17). Absent = delivered. */
+  /** False when the run's original tool response did not deliver findings
+   * (or a recovered run has no provable prior delivery). A fresh lead may
+   * separately see recoveredForLead evidence in its initial prompt. */
   readonly findingsDelivered?: boolean;
+  /** Prior transport was not delivered through the tool; validated
+   * checkpoint evidence was separately shown in this lead's prompt. */
+  readonly recoveredForLead?: true;
   /** Set when the run settled but its cleanup failure could not be
    * recorded durably — the settled work stands, the recording gap is
    * disclosed (R10). */
@@ -213,6 +232,103 @@ interface SpecialistResult extends SpecialistRun {
   readonly findings: readonly ReviewFinding[];
 }
 
+/** Start markers are the budget authority. A missing or damaged settlement
+ * never refunds a start; valid credit requires every original source byte. */
+function readSpecialistCheckpoints(
+  directory: string, catalog: readonly PerkinsLens[],
+  settlementDigests?: ReadonlyMap<string, string>,
+  sourceDirectories?: ReadonlyMap<string, string>,
+  expectedStarts?: readonly string[],
+): {
+  readonly started: number;
+  readonly attempts: Map<string, number>;
+  readonly results: SpecialistResult[];
+  readonly envelopes: Map<string, LensEnvelope>;
+} {
+  const attempts = new Map<string, number>();
+  const results: SpecialistResult[] = [];
+  const envelopes = new Map<string, LensEnvelope>();
+  // Only independent ledger starts authorize marker names. Never enumerate an
+  // untrusted predecessor attempts pathname, including before marker reads.
+  const names = (expectedStarts ?? [...sourceDirectories?.keys() ?? []]).map((stem) => `${stem}.start.json`);
+  const starts = names.filter((name) => name.endsWith('.start.json')).sort((left, right) =>
+    Number(left.match(/-([12])\.start\.json$/u)?.[1] ?? 0) - Number(right.match(/-([12])\.start\.json$/u)?.[1] ?? 0));
+  if (starts.length > MAX_SPECIALISTS_PER_ROUND) throw new Error('recovered specialist budget exceeds the round limit');
+  for (const name of starts) {
+    const match = /^([a-z]+)-([12])\.start\.json$/u.exec(name);
+    if (match === null || !catalog.includes(match[1] as PerkinsLens)) throw new Error('invalid recovered specialist start marker');
+    const lens = match[1] as PerkinsLens;
+    const attempt = Number(match[2]) as 1 | 2;
+    if (attempt !== (attempts.get(lens) ?? 0) + 1) throw new Error('recovered specialist attempt lineage is incomplete');
+    attempts.set(lens, attempt);
+    const source = sourceDirectories?.get(`${lens}-${attempt}`) ?? directory;
+    try {
+      const markerBytes = readReviewCheckpoint(source, `attempts/${name}`);
+      const marker = JSON.parse(markerBytes) as { schemaVersion?: number; lens?: string; attempt?: number };
+      if (marker.schemaVersion !== 1 || marker.lens !== lens || marker.attempt !== attempt ||
+        markerBytes !== `${JSON.stringify({ schemaVersion: 1, lens, attempt }, null, 2)}\n`) {
+        throw new Error('recovered specialist start marker is invalid');
+      }
+    } catch (error) {
+      if (expectedStarts === undefined) throw error;
+      continue; // An independently supplied start stays charged; other checked lenses survive.
+    }
+    try {
+      // A checked marker does not authorize enumerating its pathname: an
+      // ancestor may have changed. Open only the expected no-follow file.
+      const settlementBytes = readReviewCheckpoint(source, `attempts/${lens}-${attempt}.settled.json`, SPECIALIST_CHECKPOINT_MAX_BYTES);
+      if (settlementDigests !== undefined && hash(settlementBytes) !== settlementDigests.get(`${lens}-${attempt}`)) continue;
+      const entry = JSON.parse(settlementBytes) as {
+        schemaVersion?: number; result?: SpecialistResult; runToken?: string;
+        outputProtocol?: 'native' | 'text';
+        rawSha256?: string; envelopeSha256?: string; childSha256?: string;
+      };
+      const result = entry.result;
+      if (entry.schemaVersion !== 1 || result?.lens !== lens || result.attempt !== attempt ||
+        !['valid', 'invalid', 'failed'].includes(result.status) || typeof result.resultId !== 'string' ||
+        !/^[A-Za-z0-9._-]+$/u.test(result.resultId) || typeof result.agentId !== 'string') continue;
+      if (result.status === 'valid') {
+        if (!/^[a-f0-9]{8}$/u.test(entry.runToken ?? '')) continue;
+        const raw = readReviewCheckpoint(source, `specialists/${lens}.attempt-${attempt}-${entry.runToken}.raw.json`, MAX_TOOL_RESPONSE_BYTES);
+        const envelopeBytes = readReviewCheckpoint(source, `specialists/${lens}.attempt-${attempt}-${entry.runToken}.envelope.json`, SPECIALIST_CHECKPOINT_MAX_BYTES);
+        const childBytes = readReviewCheckpoint(source, `children/${result.resultId}.json`, SPECIALIST_CHECKPOINT_MAX_BYTES);
+        if (hash(raw) !== entry.rawSha256 || hash(envelopeBytes) !== entry.envelopeSha256 || hash(childBytes) !== entry.childSha256 ||
+          JSON.stringify(JSON.parse(childBytes)) !== JSON.stringify(result)) continue;
+        const envelope = JSON.parse(envelopeBytes) as LensEnvelope;
+        const rawContent = raw.endsWith('\n') ? raw.slice(0, -1) : raw;
+        if (envelope.schemaVersion !== 1 || envelope.lens !== lens || envelope.attempt !== attempt ||
+          envelope.status !== 'valid' || envelope.outputSha256 !== hash(rawContent)) continue;
+        if (entry.outputProtocol !== 'native' && entry.outputProtocol !== 'text') continue;
+        const parsed = entry.outputProtocol === 'native'
+          ? parseFindingsSubmission(JSON.parse(rawContent), lens)
+          : parseFindingsWithRecovery(rawContent, lens).findings;
+        if (JSON.stringify(parsed) !== JSON.stringify(envelope.findings) ||
+          JSON.stringify(parsed) !== JSON.stringify(result.findings)) continue;
+        envelopes.set(result.resultId, envelope);
+      }
+      results.push(result);
+    } catch {
+      // Rejected output is candidate-only. Its start still charges budget.
+    }
+  }
+  return { started: starts.length, attempts, results, envelopes };
+}
+
+/** Probe original bytes against immutable settlement receipts before selecting
+ * a source for an individual start. This does not mint a new receipt. */
+export function verifiedSpecialistCheckpointResults(
+  directory: string, catalog: readonly PerkinsLens[],
+  digests: ReadonlyMap<string, string>, expectedStarts: readonly string[],
+): readonly { readonly key: string; readonly status: SpecialistResult['status'] }[] {
+  try {
+    return readSpecialistCheckpoints(directory, catalog, digests, undefined, expectedStarts).results.map((result) => ({
+      key: `${result.lens}-${result.attempt}`, status: result.status,
+    }));
+  } catch {
+    return [];
+  }
+}
+
 /** One host-recorded non-valid specialist attempt. */
 export interface SpecialistAttemptFailure {
   readonly attempt: number;
@@ -246,12 +362,8 @@ interface SubmissionValidationContext {
   /** Lenses with a committed VALID specialist result; a lead finding may
    * never be attributed to a lens that did not actually run. */
   readonly validLenses: ReadonlySet<PerkinsLens>;
-  /** Per lens, title -> delivered locations of the findings its valid runs
-   * actually DELIVERED to the lead (R12/R38): crediting a lens requires the
-   * specialist to have reported that finding AT that location — a
-   * valid-but-empty (or undelivered) result cannot originate a
-   * lead-invented finding, and a same-title finding the lead relocated is
-   * the lead's own judgment, not the specialist's. */
+  /** Per lens, title -> delivered locations from tool responses or checked
+   * recovery prompts. Undelivered and relocated findings belong to the lead. */
   readonly deliveredLensFindings: ReadonlyMap<PerkinsLens, ReadonlyMap<string, ReadonlySet<string>>>;
 }
 
@@ -839,6 +951,8 @@ export class PerkinsWholeReview {
   private readonly reviewGate: PacingGate | null;
   private readonly pacingOptions: PerkinsWholeReviewOptions;
   private readonly onProgress: (progress: ReviewProgress) => void;
+  private readonly recordSpecialistStart: NonNullable<PerkinsWholeReviewOptions['recordSpecialistStart']>;
+  private readonly recordSpecialistSettlement: NonNullable<PerkinsWholeReviewOptions['recordSpecialistSettlement']>;
   private readonly onAgent: NonNullable<PerkinsWholeReviewOptions['onAgent']>;
 
   constructor(options: PerkinsWholeReviewOptions) {
@@ -849,6 +963,8 @@ export class PerkinsWholeReview {
     this.beginChildren = options.beginChildren ?? (() => ({ concurrency: this.maxConcurrentChildren, finish: () => {} }));
     this.reviewGate = options.reviewGate ?? null;
     this.onProgress = options.onProgress ?? (() => {});
+    this.recordSpecialistStart = options.recordSpecialistStart ?? (() => {});
+    this.recordSpecialistSettlement = options.recordSpecialistSettlement ?? (() => {});
     this.onAgent = options.onAgent ?? (() => {});
   }
 
@@ -893,6 +1009,131 @@ export class PerkinsWholeReview {
     const agentIds = new Set<string>();
     const sessionFiles = new Set<string>();
     const failureLog = new Map<string, SpecialistAttemptFailure[]>();
+    let specialistsStarted = 0;
+    if (input.recoveryStarts !== undefined ||
+      (input.recoveryDirectory !== undefined && compatibleReviewIdentity(review, input.recoveryDirectory))) {
+      let restored: ReturnType<typeof readSpecialistCheckpoints>;
+      const settlementDigests = input.recoverySources !== undefined
+        ? new Map(input.recoverySources.filter((entry) => entry.sha256 !== undefined)
+          .map((entry) => [`${entry.lens}-${entry.attempt}`, entry.sha256!]))
+        : input.recoverySettlements === undefined ? undefined
+          : new Map(input.recoverySettlements.map((entry) => [`${entry.lens}-${entry.attempt}`, entry.sha256]));
+      const directories = input.recoverySources === undefined ? undefined
+        : new Map(input.recoverySources.map((entry) => [`${entry.lens}-${entry.attempt}`, entry.directory]));
+      if (input.recoverySources !== undefined && input.recoverySources.some((entry) =>
+        entry.directory !== review.directory &&
+        !compatibleReviewIdentity(review, entry.directory, entry.manifestSha256))) {
+        throw new Error('recovered specialist source no longer matches its pinned freeze receipt');
+      }
+      if (directories !== undefined && (directories.size !== input.recoverySources!.length ||
+        input.recoveryStarts === undefined || directories.size !== input.recoveryStarts.length ||
+        input.recoveryStarts.some((entry) => !directories.has(`${entry.lens}-${entry.attempt}`)))) {
+        throw new Error('recovered specialist source mapping does not match charged starts');
+      }
+      try {
+        restored = input.recoveryDirectory !== undefined && compatibleReviewIdentity(review, input.recoveryDirectory)
+          ? readSpecialistCheckpoints(input.recoveryDirectory, catalog, settlementDigests, directories,
+            input.recoveryStarts?.map((entry) => `${entry.lens}-${entry.attempt}`))
+          : { started: 0, attempts: new Map(), results: [], envelopes: new Map() };
+      } catch {
+        restored = { started: 0, attempts: new Map(), results: [], envelopes: new Map() };
+      }
+      if (input.recoveryStarts !== undefined) {
+        const fromLedger = new Map<string, number>();
+        for (const entry of input.recoveryStarts) {
+          if (!catalog.includes(entry.lens) || entry.attempt !== (fromLedger.get(entry.lens) ?? 0) + 1 ||
+            input.recoveryStarts.length > MAX_SPECIALISTS_PER_ROUND) {
+            throw new Error('ledger recovery attempt budget is invalid');
+          }
+          fromLedger.set(entry.lens, entry.attempt);
+        }
+        if (JSON.stringify([...fromLedger].sort()) !== JSON.stringify([...restored.attempts].sort())) {
+          // Missing/tampered checkpoint: no output is credited, but every
+          // independently logged start remains charged across future rounds.
+          restored = { started: input.recoveryStarts.length, attempts: fromLedger, results: [], envelopes: new Map() };
+        }
+      }
+      specialistsStarted = restored.started;
+      for (const [lens, count] of restored.attempts) attempts.set(lens, count);
+      // Carry the charged lineage into this round before starting a lead:
+      // another interruption cannot reset a predecessor's budget.
+      for (const [lens, count] of restored.attempts) {
+        for (let attempt = 1; attempt <= count; attempt += 1) {
+          const stem = `${lens}-${attempt}`;
+          const originRoundId = input.recoveryStarts?.find((entry) =>
+            entry.lens === lens && entry.attempt === attempt)?.originRoundId;
+          this.recordSpecialistStart(lens as PerkinsLens, attempt as 1 | 2, originRoundId);
+          let startBytes: string;
+          const sourceDirectory = directories?.get(stem) ?? input.recoveryDirectory ?? review.directory;
+          try {
+            const sourceBytes = readReviewCheckpoint(sourceDirectory, `attempts/${stem}.start.json`);
+            const marker = JSON.parse(sourceBytes) as { schemaVersion?: number; lens?: string; attempt?: number };
+            if (marker.schemaVersion !== 1 || marker.lens !== lens || marker.attempt !== attempt ||
+              sourceBytes !== `${JSON.stringify({ schemaVersion: 1, lens, attempt }, null, 2)}\n`) {
+              throw new Error('copied specialist start marker is invalid');
+            }
+            startBytes = sourceBytes;
+          } catch {
+            // The independently recorded start is authoritative; never
+            // propagate a malformed marker that poisons later recovery.
+            startBytes = `${JSON.stringify({ schemaVersion: 1, lens, attempt }, null, 2)}\n`;
+          }
+          writeReviewArtifact(review, `attempts/${stem}.start.json`, startBytes);
+          const validated = restored.results.find((result) =>
+            result.lens === lens && result.attempt === attempt && result.status === 'valid');
+          try {
+            const settled = readReviewCheckpoint(sourceDirectory, `attempts/${stem}.settled.json`, SPECIALIST_CHECKPOINT_MAX_BYTES);
+            const record = JSON.parse(settled) as {
+              result?: SpecialistResult; runToken?: string;
+              rawSha256?: string; envelopeSha256?: string; childSha256?: string;
+            };
+            if (validated !== undefined) {
+              // A second read during copying must remain bound to the
+              // predecessor receipt; never mint a fresh receipt for mutated
+              // bytes that the initial checkpoint validation did not see.
+              if ((settlementDigests !== undefined && settlementDigests.get(stem) !== hash(settled)) ||
+                JSON.stringify(record.result) !== JSON.stringify(validated) ||
+                !restored.envelopes.has(validated.resultId)) {
+                throw new Error('settlement changed after validation');
+              }
+              const prefix = `specialists/${lens}.attempt-${attempt}-${record.runToken}`;
+              for (const [path, digest, limit] of [
+                [`${prefix}.raw.json`, record.rawSha256, MAX_TOOL_RESPONSE_BYTES],
+                [`${prefix}.envelope.json`, record.envelopeSha256, SPECIALIST_CHECKPOINT_MAX_BYTES],
+                [`children/${validated.resultId}.json`, record.childSha256, SPECIALIST_CHECKPOINT_MAX_BYTES],
+              ] as const) {
+                const source = readReviewCheckpoint(sourceDirectory, path, limit);
+                if (hash(source) !== digest) throw new Error(`source bytes changed after validation: ${path}`);
+                writeReviewArtifact(review, path, source);
+              }
+              writeReviewArtifact(review, `attempts/${stem}.settled.json`, settled);
+              this.recordSpecialistSettlement(lens as PerkinsLens, attempt as 1 | 2, hash(settled));
+            } else if (record.result?.status !== 'valid' &&
+              (settlementDigests === undefined || settlementDigests.get(stem) === hash(settled))) {
+              writeReviewArtifact(review, `attempts/${stem}.settled.json`, settled);
+              this.recordSpecialistSettlement(lens as PerkinsLens, attempt as 1 | 2, hash(settled));
+            }
+          } catch (error) {
+            if (validated !== undefined) {
+              throw new Error(`validated checkpoint ${stem} could not be copied with its original receipt: ${String(error)}`);
+            }
+            // The immutable start survives; missing or suspect settlement
+            // never becomes a credited outcome on the next recovery.
+          }
+        }
+      }
+      for (const result of restored.results) {
+        // Prior transport was not delivered to this lead. Valid checkpoint
+        // evidence is explicitly supplied for fresh revalidation below.
+        results.set(result.resultId, { ...result, findingsDelivered: false,
+          ...(result.status === 'valid' ? { recoveredForLead: true as const } : {}) });
+        if (result.status === 'valid') envelopes.push(restored.envelopes.get(result.resultId)!);
+        else failureLog.set(result.lens, [...(failureLog.get(result.lens) ?? []), {
+          attempt: result.attempt, status: result.status,
+          failureKind: result.failureKind ?? 'error', error: result.error ?? 'interrupted attempt',
+        }]);
+      }
+    }
     // Host-side bounds restore attempt counters so specialists stay retryable;
     // every child run therefore writes artifacts under a unique run token so
     // a restored retry cannot collide with the write-once artifact store.
@@ -903,7 +1144,6 @@ export class PerkinsWholeReview {
         else attempts.set(run.lens, (priorAttempt - 1) as 1 | 2);
       }
     };
-    let specialistsStarted = 0;
     const budgetRefusals: RoundBudgetRefusal[] = [];
     let preflightAttempts = 0;
     let terminalAttempts = 0;
@@ -1114,6 +1354,12 @@ export class PerkinsWholeReview {
             );
           }
         }
+        // The write-once raw artifact includes its terminating newline.
+        // Reject oversize output before claiming a recoverable valid result.
+        if (Buffer.byteLength(`${outputBytes}\n`, 'utf8') > MAX_TOOL_RESPONSE_BYTES) {
+          outputRejected = true;
+          throw new Error('specialist raw output exceeds the checkpoint byte limit');
+        }
         const resultId = `${lens}-a${attempt}-${hash(handle.id).slice(0, 16)}`;
         const envelope: LensEnvelope = {
           schemaVersion: 1, lens, attempt, status: 'valid', outputSha256: hash(outputBytes), findings: reviewFindings,
@@ -1269,6 +1515,28 @@ export class PerkinsWholeReview {
           cleanupRecordingError: `could not record the dispose failure durably: ${sanitizeError(disposeArtifactError)}`,
         };
       }
+      // The start marker is charged even when any evidence write fails.
+      // Settlement is published before a tool response could imply delivery.
+      if (settled !== null) {
+        try {
+          const rawPath = `specialists/${lens}.attempt-${attempt}-${runToken}.raw.json`;
+          const envelopePath = `specialists/${lens}.attempt-${attempt}-${runToken}.envelope.json`;
+          const checkpointPath = `attempts/${lens}-${attempt}.settled.json`;
+          writeReviewArtifact(review, checkpointPath, {
+            schemaVersion: 1, result: settled,
+            ...(settled.status === 'valid' ? {
+              outputProtocol: nativeSubmit ? 'native' : 'text',
+              rawSha256: hash(readReviewCheckpoint(review.directory, rawPath, MAX_TOOL_RESPONSE_BYTES)),
+              envelopeSha256: hash(readReviewCheckpoint(review.directory, envelopePath, SPECIALIST_CHECKPOINT_MAX_BYTES)),
+              childSha256: hash(readReviewCheckpoint(review.directory, `children/${settled.resultId}.json`, SPECIALIST_CHECKPOINT_MAX_BYTES)),
+              runToken,
+            } : {}),
+          });
+          this.recordSpecialistSettlement(lens, attempt, hash(readReviewCheckpoint(review.directory, checkpointPath, SPECIALIST_CHECKPOINT_MAX_BYTES)));
+        } catch (error) {
+          settled = { ...settled, evidenceRecordingError: [settled.evidenceRecordingError, `checkpoint unavailable: ${sanitizeError(error)}`].filter(Boolean).join('; ') };
+        }
+      }
       if (settledProgress !== null) {
         try {
           this.onProgress(settledProgress);
@@ -1372,6 +1640,7 @@ export class PerkinsWholeReview {
         // up to the combined cap. The slot is re-acquired before the result
         // returns to the model, so the next lead turn is gated again.
         const yieldedLeadSlot = reviewLease !== null;
+        const initiated = new Set<string>();
         const runWave = async (): Promise<{
           readonly outcome: PoolOutcome<SpecialistResult | undefined>;
           readonly acquireError: unknown | null;
@@ -1402,8 +1671,16 @@ export class PerkinsWholeReview {
               // pacing cap both bound the fan-out: run the narrower of the
               // two. Pacing never refuses a wave, it only throttles width.
               const waveWidth = Math.max(1, Math.min(batch.concurrency, this.specialistWaveWidth()));
-              outcome = await pool(scheduled, waveWidth, (run) =>
-                runSpecialist(run.lens, run.attempt, run.previous, signal));
+              outcome = await pool(scheduled, waveWidth, async (run) => {
+                // Journal only a child actually invoked by the pool. Once a
+                // start is emitted, no later failure can refund it.
+                this.recordSpecialistStart(run.lens, run.attempt);
+                initiated.add(run.lens);
+                writeReviewArtifact(review, `attempts/${run.lens}-${run.attempt}.start.json`, {
+                  schemaVersion: 1, lens: run.lens, attempt: run.attempt,
+                });
+                return runSpecialist(run.lens, run.attempt, run.previous, signal);
+              });
             } finally {
               batch.finish();
             }
@@ -1454,11 +1731,9 @@ export class PerkinsWholeReview {
               results.set(result.resultId, { ...result, findingsDelivered: false });
             }
           }
-          // Only lenses that produced NO result never ran: restore their
-          // attempt budget and started count. Lenses that ran keep their
-          // accounted state — their evidence already stands.
-          const ran = new Set(committed.map((result) => result.lens));
-          const neverRan = scheduled.filter((run) => !ran.has(run.lens));
+          // A pool rejection may have started a child whose callback never
+          // returned a result. Its journaled start is still spent.
+          const neverRan = scheduled.filter((run) => !initiated.has(run.lens));
           restoreAttempts(neverRan);
           specialistsStarted -= neverRan.length;
           if (acquireError !== null) {
@@ -1696,7 +1971,8 @@ export class PerkinsWholeReview {
       get deliveredLensFindings() {
         const byLens = new Map<PerkinsLens, Map<string, Set<string>>>();
         for (const result of results.values()) {
-          if (result.status !== 'valid' || result.findingsDelivered === false) continue;
+          if (result.status !== 'valid' ||
+            (result.findingsDelivered === false && result.recoveredForLead !== true)) continue;
           const byTitle = byLens.get(result.lens) ?? new Map<string, Set<string>>();
           for (const finding of result.findings) {
             const title = finding.title.trim();
@@ -1710,6 +1986,16 @@ export class PerkinsWholeReview {
       },
     };
 
+    const baseProofIssue = (verdict: string): SubmissionValidationIssue | null => {
+      if (verdict === 'INCOMPLETE' || input.recoveredBaseTips === undefined || input.recoveredBaseTips.length === 0) return null;
+      try {
+        proveRecoveredBaseMergeability(review, input.recoveredBaseTips);
+        return null;
+      } catch {
+        return { subject: 'submission', rule: 'recovered-base-mergeability',
+          message: 'Current base mergeability could not be proved after recovered specialist credit; submit INCOMPLETE' };
+      }
+    };
     const preflightTool: NativeAgentTool = {
       name: 'perkins_preflight_submission',
       description: 'Validate a candidate terminal submission with the exact rules perkins_submit_review enforces, without spending a terminal attempt and without sealing the round. Returns the complete exhaustive error list in one response; ok=true means the same payload would be accepted. Preflight accepts nothing and never terminates.',
@@ -1720,11 +2006,15 @@ export class PerkinsWholeReview {
         preflightAttempts += 1;
         const validation = this.validateSubmission(
           validationContext, raw, headMovedSinceFreeze(review, input.movementRef));
-        const issues = validation.ok ? [] : validation.issues;
+        const issues = [...(validation.ok ? [] : validation.issues)];
+        if (validation.ok) {
+          const baseIssue = baseProofIssue(validation.submission.verdict);
+          if (baseIssue !== null) issues.push(baseIssue);
+        }
         const artifact = `lead/preflight-attempt-${preflightAttempts}.json`;
         writeReviewArtifact(review, artifact, {
           schemaVersion: 1,
-          ok: validation.ok,
+          ok: issues.length === 0,
           errorCount: issues.length,
           errors: issues,
         });
@@ -1734,7 +2024,7 @@ export class PerkinsWholeReview {
         const included: SubmissionValidationIssue[] = [];
         for (const issue of issues) {
           const candidate = JSON.stringify({
-            preflight: true, ok: validation.ok, errorCount: issues.length,
+            preflight: true, ok: issues.length === 0, errorCount: issues.length,
             errors: [...included, issue],
             omittedErrorCount: issues.length - included.length - 1,
             fullList: artifact,
@@ -1744,13 +2034,13 @@ export class PerkinsWholeReview {
         }
         return {
           text: JSON.stringify({
-            preflight: true, ok: validation.ok, errorCount: issues.length,
+            preflight: true, ok: issues.length === 0, errorCount: issues.length,
             errors: included,
             ...(included.length < issues.length
               ? { omittedErrorCount: issues.length - included.length, fullList: artifact }
               : {}),
           }),
-          details: { preflight: true, ok: validation.ok, errorCount: issues.length, preflightAttempt: preflightAttempts },
+          details: { preflight: true, ok: issues.length === 0, errorCount: issues.length, preflightAttempt: preflightAttempts },
         };
       },
     };
@@ -1783,6 +2073,13 @@ export class PerkinsWholeReview {
             throw new SubmissionRejection(validation.issues);
           }
           const submission = validation.submission;
+          const baseIssue = baseProofIssue(submission.verdict);
+          if (baseIssue !== null) {
+            writeReviewArtifact(review, `lead/submission-attempt-${attempt}.error.json`, {
+              error: rejectionMessage([baseIssue]), issues: [baseIssue],
+            });
+            throw new SubmissionRejection([baseIssue]);
+          }
           writeReviewArtifact(review, `lead/submission-attempt-${attempt}.json`, submission);
           const reportBytes = submission.report_markdown.endsWith('\n') ? submission.report_markdown : `${submission.report_markdown}\n`;
           let reportFile: string;
@@ -1846,6 +2143,7 @@ export class PerkinsWholeReview {
             ...(result.failureKind !== undefined ? { failureKind: result.failureKind } : {}),
             ...(result.error !== undefined ? { error: result.error } : {}),
             ...(result.findingsDelivered === false ? { findingsDelivered: false } : {}),
+            ...(result.recoveredForLead === true ? { recoveredForLead: true as const } : {}),
             ...(result.cleanupRecordingError !== undefined ? { cleanupRecordingError: result.cleanupRecordingError } : {}),
             ...(result.evidenceRecordingError !== undefined ? { evidenceRecordingError: result.evidenceRecordingError } : {}),
             ...(result.progressError !== undefined ? { progressError: result.progressError } : {}),
@@ -1897,7 +2195,33 @@ export class PerkinsWholeReview {
       ...(priorReview.targetSha === null ? [] : ['On a re-review use perkins_read_prior_revision to list prior-target changes and read bounded path diffs while revisiting prior findings.']),
       'Specialists never inherit these tools. You, the lead, own every retained finding, every prior-finding disposition, and the verdict. Do not write implementation files.',
     ].join('\n');
-    const initialPrompt = this.leadPrompt(review, prior, priorReview.targetSha);
+    const restoredResults = [...results.values()].map((result) => ({
+      lens: result.lens, attempt: result.attempt, status: result.status,
+      findings: result.status === 'valid' ? result.findings : [],
+      findingsDelivered: false,
+      ...(result.error !== undefined ? { error: result.error } : {}),
+    }));
+    const restoredEvidence = JSON.stringify(restoredResults);
+    if (Buffer.byteLength(restoredEvidence, 'utf8') > MAX_TOOL_RESPONSE_BYTES) {
+      throw new Error(`recovered specialist evidence exceeds ${MAX_TOOL_RESPONSE_BYTES} UTF-8 bytes; charged attempts remain spent, and the evidence cannot be silently omitted from a fresh lead prompt`);
+    }
+    const chargedSummary = specialistsStarted === 0 ? '' :
+      `--- CHARGED SPECIALIST BUDGET ---\n${specialistsStarted}/${MAX_SPECIALISTS_PER_ROUND} round runs spent; ` +
+      catalog.map((lens) => `${lens}: ${attempts.get(lens) ?? 0}/2 attempts`).join(', ') +
+      '. These ledger starts remain spent even when their output cannot be authenticated. No previous verdict or clearance is inherited.';
+    const initialPrompt = [this.leadPrompt(review, prior, priorReview.targetSha),
+      ...(input.recoveredBaseTips === undefined || input.recoveredBaseTips.length === 0 ? [] : [
+        '--- BASE ADVANCED SINCE RECOVERED SPECIALIST WORK ---',
+        `Earlier frozen base tip(s): ${input.recoveredBaseTips.join(', ')}; current frozen ${review.manifest.baseRef} tip: ${review.manifest.baseRefSha}.`,
+        `The host verified a clean merge tree for pinned base ${review.manifest.baseRefSha} and frozen target ${review.manifest.targetSha}; it will recheck before any conclusive submission. Revalidate this current-base mergeability proof and any exact-head CI required by the effective acceptance contract before your OWN verdict. An old target-only CI observation does not attest the new merged base. If a required check cannot be proven, submit INCOMPLETE, never READY TO MERGE. Optional CI is not a universal prerequisite. No earlier verdict or clearance was inherited.`,
+      ]),
+      ...(chargedSummary === '' ? [] : [chargedSummary]),
+      ...(restoredResults.length === 0 ? [] : [
+        '--- RECOVERED SPECIALIST EVIDENCE (EARLIER TOOL DELIVERY UNPROVEN) ---',
+        restoredEvidence,
+        'These checkpoint bytes are shown to you now, independently of the earlier tool response. Validate every restored finding yourself against the frozen tree before using it. This is not clearance or a verdict. Spent attempts and the round run limit remain charged.',
+      ]),
+    ].join('\n');
     let lead: AgentHandle | null = null;
     let reviewLease: PacingLease | null = null;
     let unsubscribe = (): void => {};
@@ -2051,12 +2375,9 @@ export class PerkinsWholeReview {
         const evidence = collectBoundedString(candidate.evidence, `${subject} evidence`, 4_000, subject, 'finding-evidence', issues);
         const detail = collectBoundedString(candidate.detail, `${subject} detail`, 320, subject, 'finding-detail', issues);
         const fix = collectBoundedString(candidate.recommended_fix, `${subject} recommended_fix`, 320, subject, 'finding-fix', issues);
-        // Provenance (R12/R38): crediting a lens requires that specialist to
-        // have actually DELIVERED a finding with this exact title AT the
-        // cited location — a valid-but-empty or undelivered run cannot
-        // originate a lead-invented finding, and a same-title finding the
-        // lead relocated is the lead's own judgment; the lead's own
-        // judgments source "lead".
+        // Credit a lens only for an exact title and location shown in a
+        // tool response or checked checkpoint in this lead's prompt. A
+        // valid-but-unshown result or relocated finding belongs to the lead.
         if (
           title !== null && typeof candidate.source === 'string' && candidate.source !== 'lead' &&
           sources.has(candidate.source) && context.validLenses.has(candidate.source as PerkinsLens)

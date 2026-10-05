@@ -1,7 +1,8 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { reviewPythonExecutable } from '../src/runtime/review-directory-entries.js';
 import { afterAll, describe, expect, it } from 'vitest';
 
 /**
@@ -29,6 +30,81 @@ function print(env: NodeJS.ProcessEnv = {}): { stdout: string; status: number } 
     return { stdout: err.stdout ?? '', status: err.status ?? 1 };
   }
 }
+
+describe('install.sh Darwin Python prerequisite', () => {
+  const stage = () => {
+    const root = mkdtempSync(join(tmpdir(), 'gru-install-python-'));
+    cleanupDirs.push(root);
+    const bin = join(root, 'bin');
+    mkdirSync(bin);
+    writeFileSync(join(bin, 'uname'), '#!/bin/sh\necho Darwin\n', { mode: 0o755 });
+    copyFileSync(join(repoRoot, 'install.sh'), join(root, 'install.sh'));
+    mkdirSync(join(root, 'install', 'launchd'), { recursive: true });
+    copyFileSync(join(repoRoot, 'install/launchd/com.gru-command.service.plist.template'),
+      join(root, 'install/launchd/com.gru-command.service.plist.template'));
+    const invoke = (flags: readonly string[], python: string) => spawnSync('bash', [join(root, 'install.sh'), ...flags], {
+      env: { ...process.env, HOME: root, GRU_COMMAND_HOME: join(root, 'instance'),
+        GRU_COMMAND_REVIEW_PYTHON: python, PATH: `${bin}:${process.env.PATH ?? ''}` },
+      cwd: root, encoding: 'utf8', timeout: 10_000,
+    });
+    return { root, invoke };
+  };
+
+  it('refuses a missing or unusable interpreter before setup, update, or service registration', () => {
+    const { root, invoke } = stage();
+    const invalid = join(root, 'missing-python');
+    for (const flags of [['--no-interact'], ['--update'], ['--service']]) {
+      const missing = invoke(flags, invalid);
+      expect(missing.status).not.toBe(0);
+      expect(missing.stderr).toContain('requires a usable pinned Python 3');
+      expect(readFileSync(join(root, 'install.sh'), 'utf8')).toContain('preflight_python');
+    }
+    const unusable = join(root, 'unusable-python');
+    writeFileSync(unusable, '#!/bin/sh\necho credential-looking-output\n', { mode: 0o755 });
+    expect(invoke(['--service'], realpathSync(unusable)).stderr).toContain('inherited directory-FD os.scandir');
+    expect(invoke(['--service'], realpathSync(unusable)).stderr).not.toContain('credential-looking-output');
+    expect(readFileSync(join(root, 'install.sh'), 'utf8')).not.toContain('credential-looking-output');
+  });
+
+  it('probes a private bounded child through both inherited FDs, not the invoking cwd', () => {
+    const script = readFileSync(join(repoRoot, 'install.sh'), 'utf8');
+    expect(script).toContain("fs.mkdtempSync(require('node:path').join(require('node:os').tmpdir(), 'gru-python-fd-probe-'))");
+    expect(script).toContain("os.open(\"child\",os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,dir_fd=root)");
+    expect(script).toContain("stdio: ['ignore','pipe','pipe',fd,rootFd]");
+    expect(script).not.toContain('fs.openSync(process.cwd()');
+  });
+
+  it.skipIf(process.platform !== 'darwin')('rejects a working-directory-sensitive shim even when it can pass the installer FD probe', () => {
+    const { root, invoke } = stage();
+    const python = reviewPythonExecutable();
+    const shim = join(root, 'python-shim');
+    writeFileSync(shim, `#!/bin/sh\nif [ "$PWD" = "${root}" ]; then exec "${python}" "$@"; fi\nexit 42\n`, { mode: 0o755 });
+    const refused = invoke(['--service'], shim);
+    expect(refused.status).not.toBe(0);
+    expect(refused.stderr).toContain('requires a usable pinned Python 3');
+    expect(refused.stderr).not.toContain('dist/main.js not found');
+    expect(existsSync(join(root, 'instance'))).toBe(false);
+  });
+
+  it.skipIf(process.platform !== 'darwin')('probes a real inherited FD and pins its stable interpreter in launchd; passive modes remain available', () => {
+    const { root, invoke } = stage();
+    const python = reviewPythonExecutable();
+    const service = invoke(['--service'], python);
+    expect(service.stderr).toContain('dist/main.js not found'); // Stops before any service mutation.
+    expect(service.stderr).not.toContain('inherited directory-FD os.scandir');
+    const update = invoke(['--update'], python);
+    expect(update.stderr).toContain('--update requires an existing configured instance');
+    const sessionPython = join(root, 'ephemeral-python');
+    symlinkSync(python, sessionPython);
+    const rendered = invoke(['--print'], sessionPython);
+    expect(rendered.status).toBe(0);
+    expect(rendered.stdout).toContain(`<key>GRU_COMMAND_REVIEW_PYTHON</key>\n    <string>${python}</string>`);
+    expect(rendered.stdout).not.toContain('{{REVIEW_PYTHON}}');
+    expect(invoke(['--print'], join(root, 'missing-python')).status).toBe(0);
+    expect(invoke(['--help'], join(root, 'missing-python')).status).toBe(0);
+    expect(invoke(['--uninstall'], join(root, 'missing-python')).status).toBe(0);
+  });
+});
 
 describe('install.sh --print rendering', () => {
   it('declares the standalone Perkins resources in the npm package allowlist', () => {

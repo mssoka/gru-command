@@ -14,13 +14,14 @@ import { BoardEngine } from './board/engine.js';
 import { createBoardServer } from './board/server.js';
 import { DeployDriftTracker } from './board/deploy-drift.js';
 import { defaultPackageRoot, readBuildInfo } from './build-info.js';
+import { createServiceReviewWave } from './dispatch/service-review-wave.js';
 import { NotificationCenter } from './notifications/center.js';
 import { Supervisor } from './supervision/supervisor.js';
 import { TranscriptService } from './transcripts/service.js';
 import { DispatchService } from './dispatch/service.js';
 import { WorktreeManager } from './worktrees/manager.js';
 import { createWorktreeServer } from './worktrees/server.js';
-import { WaveRunner } from './dispatch/perkins.js';
+import type { WaveRunner } from './dispatch/perkins.js';
 import { createReviewEscalationNotifier } from './dispatch/escalation-identity.js';
 import { createStartupVerdictPoster } from './dispatch/perkins-github-app.js';
 import { BobScheduler } from './dispatch/bob-scheduler.js';
@@ -143,7 +144,12 @@ async function reviewPreflightCheck(
   registry: RuntimeRegistry,
   repoPath: string,
 ): Promise<Awaited<ReturnType<typeof runRuntimeReviewPreflight>>> {
-  return runRuntimeReviewPreflight(() => registry.prepareReviewModel('perkins'), {
+  let thinking: string | undefined;
+  const preflight = await runRuntimeReviewPreflight(async () => {
+    const model = await registry.prepareReviewModel('perkins');
+    thinking = registry.reviewThinkingLevel('perkins');
+    return model;
+  }, {
     'resource-integrity': () => {
       loadPerkinsPolicy();
     },
@@ -160,6 +166,7 @@ async function reviewPreflightCheck(
     },
     'review-policy': () => probeReviewPolicy({ reviewEnabled: () => config.review.enabled }),
   });
+  return preflight.ok && thinking !== undefined ? { ...preflight, reviewThinkingLevel: thinking } : preflight;
 }
 import { ChatFrameLog } from './chat/frame-log.js';
 import { createChatServer, type ChatServer } from './chat/server.js';
@@ -1141,7 +1148,7 @@ async function main(): Promise<number> {
       requeued: pipelineRecovery.requeued,
     });
   }
-  const wave = new WaveRunner({
+  const wave = createServiceReviewWave({ registry, options: {
     ledger,
     worktrees: worktreeManager,
     spawner: (role: Role, spawnOptions?: SpawnOptions) => registry.spawn(role, spawnOptions ?? {}),
@@ -1151,6 +1158,7 @@ async function main(): Promise<number> {
     retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
     poster: createStartupVerdictPoster(config),
     reserveReviewRound: (signal) => registry.reserveReviewRound(signal),
+    reconcileReviewAgent: async (agentId, marker) => registry.reviewOwnerCeased(agentId, marker),
     maxConcurrentChildren: config.review.maxConcurrentChildren,
     bus,
     reviewArtifactRoot: join(config.dataDir, 'reviews'),
@@ -1176,7 +1184,7 @@ async function main(): Promise<number> {
     // that identity is consistent (see src/dispatch/escalation-identity.ts).
     escalate: createReviewEscalationNotifier(ledger, notifications),
     log: (level, msg, fields) => logger.log(level, msg, fields),
-  });
+  } });
   state.wave = wave;
   await wave.recoverInterruptedRounds();
   wave.resumeQueuedHandoffs();

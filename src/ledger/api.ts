@@ -905,6 +905,73 @@ export class LedgerApi {
     return row === undefined ? null : this.eventFromRow(row);
   }
 
+  /** Exactly one immutable freeze receipt must bind a reusable manifest.
+   * A second event cannot supersede the original digest. */
+  uniqueRoundFreezeManifestReceipt(roundId: string): EventRecord | null {
+    const rows = this.db.prepare(
+      "SELECT * FROM events WHERE round_id = ? AND kind = 'round.freeze-manifest' ORDER BY seq ASC LIMIT 2",
+    ).all(roundId) as Row[];
+    return rows.length === 1 ? this.eventFromRow(rows[0]!) : null;
+  }
+
+  /** Only one pre-spawn owner marker can attest a round's runtime host.
+   * A later conflicting marker is ambiguity, never a replacement authority. */
+  uniqueRoundReviewOwnerMarker(roundId: string): EventRecord | null {
+    const rows = this.db.prepare(
+      "SELECT * FROM events WHERE round_id = ? AND kind = 'round.review-owner' ORDER BY seq ASC LIMIT 2",
+    ).all(roundId) as Row[];
+    return rows.length === 1 ? this.eventFromRow(rows[0]!) : null;
+  }
+
+  /** A single ledger-bound negative proof for a setup that never initiated
+   * spawning. A duplicate or contradictory marker cannot authorize reuse. */
+  uniqueRoundNoSpawnReceipt(roundId: string): EventRecord | null {
+    const rows = this.db.prepare(
+      "SELECT * FROM events WHERE round_id = ? AND kind = 'round.review-no-spawn' ORDER BY seq ASC LIMIT 2",
+    ).all(roundId) as Row[];
+    return rows.length === 1 ? this.eventFromRow(rows[0]!) : null;
+  }
+
+  /** Atomically record a no-spawn setup failure and abort its round. A
+   * previous live transition is durable spawn-initiation evidence, even if
+   * the spawner threw before it could register an agent. */
+  abortReviewSetupWithoutSpawn(roundId: string): void {
+    this.transaction(() => {
+      const round = this.getRound(roundId);
+      const owner = this.latestRoundEvent(roundId, 'round.review-owner');
+      if (round === null || (round.status !== 'pending' && round.status !== 'aborted') ||
+        (owner !== null && this.uniqueRoundReviewOwnerMarker(roundId) === null) ||
+        this.latestRoundEvent(roundId, 'round.review-no-spawn') !== null ||
+        this.db.prepare("SELECT 1 FROM events WHERE round_id = ? AND kind = 'round.status' AND json_extract(payload, '$.to') = 'live' LIMIT 1")
+          .get(roundId) !== undefined ||
+        this.listRoundSpecialistStarts(roundId).length !== 0 ||
+        this.listAgents().some((agent) => agent.roundId === roundId)) {
+        throw new Error(`round ${roundId} cannot prove no review owner started`);
+      }
+      const generation = randomUUID();
+      this.appendEvent({ kind: 'round.review-no-spawn', jobId: round.jobId, roundId,
+        payload: { roundId, generation,
+          ownerGeneration: (owner?.payload as { generation?: unknown } | null)?.generation ?? null } });
+      if (round.status === 'pending') this.setRoundStatus(roundId, 'aborted');
+    });
+  }
+
+  /** Bounded immutable start journal for one review owner. A missing artifact
+   * cannot erase a charged specialist attempt during selective recovery. */
+  listRoundSpecialistStarts(roundId: string): readonly EventRecord[] {
+    return (this.db.prepare(
+      "SELECT * FROM events WHERE round_id = ? AND kind = 'round.specialist-started' ORDER BY seq ASC LIMIT 17",
+    ).all(roundId) as Row[]).map((row) => this.eventFromRow(row));
+  }
+
+  /** Source-byte receipts for settled attempts; a rewritten artifact cannot
+   * authenticate itself by rewriting its own embedded digest. */
+  listRoundSpecialistSettlements(roundId: string): readonly EventRecord[] {
+    return (this.db.prepare(
+      "SELECT * FROM events WHERE round_id = ? AND kind = 'round.specialist-settled' ORDER BY seq ASC LIMIT 17",
+    ).all(roundId) as Row[]).map((row) => this.eventFromRow(row));
+  }
+
   /** One job's events, newest first (ops digest scans; bounded). */
   listJobEvents(jobId: string, opts: { limit?: number } = {}): readonly EventRecord[] {
     const limit = opts.limit ?? 200;
@@ -1790,6 +1857,55 @@ export class LedgerApi {
       for (const lens of lenses) chip.run(id, lens, 'pending', ts);
       this.appendEvent({ kind: 'round.created', jobId: input.jobId, roundId: id, payload: { seq, lenses } });
       return this.getRound(id) as RoundRecord;
+    });
+  }
+
+  /** Compare-and-set review admission under the ledger transaction: two
+   * service/runner instances cannot each mint a round after independently
+   * reconciling the same predecessor. The status flip and round creation
+   * commit together (or neither does). Runtime cessation is proven by the
+   * caller before this boundary; a changed predecessor requires reproof. */
+  admitReviewRound(input: {
+    readonly jobId: string;
+    readonly expectedLatestRoundId: string | null;
+    readonly expectedJobStatus: JobStatus;
+    readonly lenses: readonly string[];
+    readonly targetRef: string;
+  }): RoundRecord {
+    return this.transaction(() => {
+      const job = this.getJob(input.jobId);
+      if (job === null) throw new RecordNotFound(`job "${input.jobId}" not found`);
+      const latest = this.db.prepare('SELECT id FROM rounds WHERE job_id = ? ORDER BY seq DESC LIMIT 1')
+        .get(input.jobId) as { id: string } | undefined;
+      if ((latest?.id ?? null) !== input.expectedLatestRoundId || job.status !== input.expectedJobStatus) {
+        throw new Error(`review admission for job ${input.jobId} changed during reconciliation; retry ownership proof before replacement`);
+      }
+      const active = this.db.prepare("SELECT id FROM rounds WHERE job_id = ? AND status IN ('pending', 'live') LIMIT 1")
+        .get(input.jobId) as { id: string } | undefined;
+      if (active !== undefined) {
+        throw new Error(`review round ${active.id} still owns job ${input.jobId}; reconcile its live owner before replacement`);
+      }
+      if (job.status === 'working' || job.status === 'blocked') this.setJobStatus(input.jobId, 'in-review');
+      return this.addRound({ jobId: input.jobId, lenses: input.lenses, targetRef: input.targetRef });
+    });
+  }
+
+  /** Undo only this round's provisional status flip. An admitted successor
+   * owns the job status now: an older setup failure must not roll it back. */
+  restoreReviewSetupStatus(input: {
+    readonly jobId: string;
+    readonly roundId: string;
+    readonly priorStatus: 'working' | 'blocked';
+  }): boolean {
+    return this.transaction(() => {
+      const job = this.getJob(input.jobId);
+      const round = this.getRound(input.roundId);
+      const latest = this.db.prepare('SELECT id FROM rounds WHERE job_id = ? ORDER BY seq DESC LIMIT 1')
+        .get(input.jobId) as { id: string } | undefined;
+      if (job?.status !== 'in-review' || round?.jobId !== input.jobId ||
+        round.status !== 'aborted' || latest?.id !== input.roundId) return false;
+      this.setJobStatus(input.jobId, input.priorStatus);
+      return true;
     });
   }
 
