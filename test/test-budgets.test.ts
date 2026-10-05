@@ -192,13 +192,32 @@ describe('workload-aware test budgets', () => {
       // These diagnostics intentionally run inside a pinned pre-policy git
       // archive without a heavy config. They are expected-RED baselines,
       // not current-tree verification segments; live scopes stay guarded.
-      // wizard-bmad-retry-baseline archives base cee0ecb, which predates the
-      // heavy/fast phase split entirely: that base has no heavy config and
-      // its default config excludes nothing, so the named files really run
-      // (no vacuous-pass risk the live guard exists to catch).
+      // Each exemption stays tied to the actual archived baseline: pinned
+      // base SHA, archive command, isolated directory (and, where the
+      // script ends unconditionally RED, exit 1) — restores the PR #179
+      // isolation tie. wizard-bmad-retry-baseline archives base cee0ecb,
+      // which predates the heavy/fast phase split entirely: that base has
+      // no heavy config and its default config excludes nothing, so the
+      // named files really run (no vacuous-pass risk the live guard
+      // exists to catch); its expected RED comes from set -e propagating
+      // the vitest exit, not an unconditional exit 1.
       if (scope === 'perkins-stage1-baseline') {
         expect(command).toContain('git archive "$base"');
         expect(command).toContain('base=9bb51b05af5d8f0a0cd389788d1d3f19607d5361');
+        expect(command).toContain('cd "$d"');
+        expect(command).toContain('exit 1');
+        continue;
+      }
+      if (scope === 'wizard-bmad-retry-baseline') {
+        expect(command).toContain('git archive "$base"');
+        expect(command).toContain('base=cee0ecbe53229d05c13f909dd11d4b31e886db72');
+        expect(command).toContain('cd "$d"');
+        continue;
+      }
+      if (scope === 'perkins-stage1-baseline') {
+        expect(command).toContain('git archive "$base"');
+        expect(command).toContain('base=9bb51b05af5d8f0a0cd389788d1d3f19607d5361');
+        expect(command).toContain('cd "$d"');
         expect(command).toContain('exit 1');
         continue;
       }
