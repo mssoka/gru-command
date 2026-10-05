@@ -166,40 +166,69 @@ export class DreamEngine {
 }
 
 /**
- * Cadence trigger for the dream (default: on boot + every 12h). Never
- * overlaps; a failed pass is logged loud and retried at the next beat.
+ * Cadence trigger for the dream (default: on boot + every 12h), due-based
+ * (issue #221): the next pass is due `lastDreamAt + intervalMs`, read from
+ * the persisted dream state at start, so a service restart inherits the
+ * running cadence instead of resetting it. The on-boot pass fires only
+ * when the dream is already due; a restart before the due time waits out
+ * the remainder as the first periodic beat. Never overlaps; a failed pass
+ * is logged loud and retried at the next beat.
  */
 export interface DreamSchedulerOptions {
-  /** Interval in ms; 0 disables the periodic trigger (on-boot still fires). */
+  /** Interval in ms; 0 disables the periodic trigger (a due on-boot pass still fires). */
   readonly intervalMs: number;
   readonly dreamOnBoot: boolean;
+  /** Persisted last-dream timestamp (ISO string) or null (never dreamed),
+   * read fresh at start. Omitting it keeps the pre-due semantics: the dream
+   * counts as due immediately. */
+  readonly lastDreamAt?: () => string | null;
   readonly run: () => Promise<DreamOutcome>;
   readonly log?: Log;
   readonly setInterval?: typeof setInterval;
   readonly clearInterval?: typeof clearInterval;
   readonly setTimeout?: typeof setTimeout;
   readonly clearTimeout?: typeof clearTimeout;
+  readonly now?: () => Date;
 }
 
 export class DreamScheduler {
   private readonly opts: DreamSchedulerOptions;
   private readonly log: Log;
+  private readonly now: () => Date;
   private timer: ReturnType<typeof setInterval> | null = null;
   private bootTimer: ReturnType<typeof setTimeout> | null = null;
+  private firstBeatTimer: ReturnType<typeof setTimeout> | null = null;
   private busy = false;
 
   constructor(opts: DreamSchedulerOptions) {
     this.opts = opts;
     this.log = opts.log ?? (() => {});
+    this.now = opts.now ?? (() => new Date());
   }
 
   get running(): boolean {
-    return this.timer !== null || this.bootTimer !== null;
+    return this.timer !== null || this.bootTimer !== null || this.firstBeatTimer !== null;
+  }
+
+  /** Milliseconds until the next dream is due, from the persisted schedule:
+   * `max(0, lastDreamAt + intervalMs − now)`; null (never dreamed) is due
+   * now. An unparsable timestamp is a corrupt state file — refuse to guess. */
+  private dueInMs(): number {
+    const lastDreamAt = this.opts.lastDreamAt?.() ?? null;
+    if (lastDreamAt === null) return 0;
+    const last = Date.parse(lastDreamAt);
+    if (Number.isNaN(last)) {
+      throw new DreamError(
+        `persisted dream state has an unparsable lastDreamAt ${JSON.stringify(lastDreamAt)} — inspect or remove the dream state file`,
+      );
+    }
+    return Math.max(0, last + this.opts.intervalMs - this.now().getTime());
   }
 
   start(): void {
-    if (this.timer !== null) return;
-    if (this.opts.dreamOnBoot) {
+    if (this.timer !== null || this.bootTimer !== null || this.firstBeatTimer !== null) return;
+    const dueInMs = this.dueInMs();
+    if (this.opts.dreamOnBoot && dueInMs === 0) {
       const setTimeoutImpl = this.opts.setTimeout ?? setTimeout;
       this.bootTimer = setTimeoutImpl(() => {
         this.bootTimer = null;
@@ -208,15 +237,28 @@ export class DreamScheduler {
       this.bootTimer.unref?.();
     }
     if (this.opts.intervalMs > 0) {
-      const setIntervalImpl = this.opts.setInterval ?? setInterval;
-      this.timer = setIntervalImpl(() => {
+      // Cadence continuity: a restart mid-interval waits out the remainder
+      // (dueInMs) instead of resetting the clock; due-now falls back to a
+      // full interval. The recurring interval arms after the first beat.
+      const firstBeatInMs = dueInMs > 0 ? dueInMs : this.opts.intervalMs;
+      const setTimeoutImpl = this.opts.setTimeout ?? setTimeout;
+      this.firstBeatTimer = setTimeoutImpl(() => {
+        this.firstBeatTimer = null;
         void this.tick();
-      }, this.opts.intervalMs);
-      this.timer.unref?.();
+        const setIntervalImpl = this.opts.setInterval ?? setInterval;
+        this.timer = setIntervalImpl(() => {
+          void this.tick();
+        }, this.opts.intervalMs);
+        this.timer.unref?.();
+      }, firstBeatInMs);
+      this.firstBeatTimer.unref?.();
     }
     this.log('info', 'lesson dream trigger started', {
       interval_ms: this.opts.intervalMs,
       on_boot: this.opts.dreamOnBoot,
+      boot_pass_due: this.opts.dreamOnBoot && dueInMs === 0,
+      due_in_ms: dueInMs,
+      first_beat_in_ms: this.opts.intervalMs > 0 ? (dueInMs > 0 ? dueInMs : this.opts.intervalMs) : null,
     });
   }
 
@@ -224,6 +266,10 @@ export class DreamScheduler {
     if (this.bootTimer !== null) {
       (this.opts.clearTimeout ?? clearTimeout)(this.bootTimer);
       this.bootTimer = null;
+    }
+    if (this.firstBeatTimer !== null) {
+      (this.opts.clearTimeout ?? clearTimeout)(this.firstBeatTimer);
+      this.firstBeatTimer = null;
     }
     if (this.timer !== null) {
       (this.opts.clearInterval ?? clearInterval)(this.timer);

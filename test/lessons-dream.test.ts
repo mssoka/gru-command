@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BibleStore } from '../src/lessons/bible.js';
-import { DreamEngine, DreamScheduler, loadDreamState, type DreamDistiller, type DistillInput, type DistillResult, type DreamOutcome } from '../src/lessons/dream.js';
+import { DreamEngine, DreamScheduler, DREAM_STATE_FILE, loadDreamState, saveDreamState, type DreamDistiller, type DistillInput, type DistillResult, type DreamOutcome } from '../src/lessons/dream.js';
 import { DREAM_PROMPT_BODY_CLAMP, parseDreamOutput, renderDreamPrompt } from '../src/lessons/distiller.js';
 import { JournalStore } from '../src/lessons/journal.js';
 import { DreamError, type JournalEntry, type ProposedChapter } from '../src/lessons/types.js';
@@ -327,6 +327,163 @@ describe('dream scheduler', () => {
       expect(scheduler.running).toBe(false);
       await vi.advanceTimersByTimeAsync(10_000);
       expect(calls).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('due-based dream cadence (issue #221)', () => {
+  const HOUR = 3_600_000;
+  const BOOT_AT = Date.parse('2026-10-05T12:00:00.000Z');
+
+  /**
+   * A persisted schedule (lastDreamAt), one already-covered journal entry,
+   * `newEntries` fresh entries, and a scheduler on fake timers whose clock
+   * advances in lockstep with the injected `now`.
+   */
+  function cadenceHarness(opts: {
+    intervalMs: number;
+    lastDreamAt: string | null;
+    newEntries: number;
+    dreamOnBoot?: boolean;
+  }) {
+    const root = tmpDir('gru-command-dream-cadence-');
+    const journal = new JournalStore(join(root, 'journal'));
+    const bible = new BibleStore(join(root, 'bible'));
+    const stateFile = join(bible.dir, DREAM_STATE_FILE);
+    const distiller = new FakeDistiller();
+    bible.ensureSeeded();
+    journal.append({ kind: 'finding', source: 'gru', body: 'covered entry' });
+    saveDreamState(stateFile, {
+      version: 1,
+      coveredThroughSeq: 1,
+      lastDreamAt: opts.lastDreamAt,
+      cycles: opts.lastDreamAt === null ? 0 : 1,
+    });
+    for (let index = 0; index < opts.newEntries; index += 1) {
+      journal.append({ kind: 'finding', source: 'gru', body: `new entry ${index}` });
+    }
+    let nowMs = BOOT_AT;
+    const engine = new DreamEngine({ journal, bible, distiller });
+    const scheduler = new DreamScheduler({
+      intervalMs: opts.intervalMs,
+      dreamOnBoot: opts.dreamOnBoot ?? true,
+      lastDreamAt: () => loadDreamState(stateFile).lastDreamAt,
+      now: () => new Date(nowMs),
+      run: () => engine.run(),
+    });
+    return {
+      distiller,
+      stateFile,
+      scheduler,
+      advance: async (ms: number) => {
+        nowMs += ms;
+        await vi.advanceTimersByTimeAsync(ms);
+      },
+    };
+  }
+
+  it('a restart before the due time does not dream; the beat due after the interval does', async () => {
+    vi.useFakeTimers();
+    try {
+      const lastDreamAt = new Date(BOOT_AT - 5 * HOUR).toISOString();
+      const h = cadenceHarness({ intervalMs: 12 * HOUR, lastDreamAt, newEntries: 1 });
+      h.scheduler.start();
+      await h.advance(0);
+      expect(h.distiller.calls).toHaveLength(0); // restart ≠ reset: not due yet
+      await h.advance(6 * HOUR);
+      expect(h.distiller.calls).toHaveLength(0); // 6h < the 7h still owed
+      await h.advance(1 * HOUR); // 12h after the last dream
+      expect(h.distiller.calls).toHaveLength(1);
+      expect(loadDreamState(h.stateFile).coveredThroughSeq).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a restart after the due time dreams on boot when new entries exist', async () => {
+    vi.useFakeTimers();
+    try {
+      const lastDreamAt = new Date(BOOT_AT - 13 * HOUR).toISOString();
+      const h = cadenceHarness({ intervalMs: 12 * HOUR, lastDreamAt, newEntries: 1 });
+      h.scheduler.start();
+      await h.advance(0);
+      expect(h.distiller.calls).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('due on boot with no new journal entries runs the beat but never calls the distiller', async () => {
+    vi.useFakeTimers();
+    try {
+      const lastDreamAt = new Date(BOOT_AT - 13 * HOUR).toISOString();
+      const h = cadenceHarness({ intervalMs: 12 * HOUR, lastDreamAt, newEntries: 0 });
+      h.scheduler.start();
+      await h.advance(0);
+      expect(h.distiller.calls).toHaveLength(0);
+      expect(loadDreamState(h.stateFile).coveredThroughSeq).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('the first periodic beat waits out the remainder since the last dream', async () => {
+    vi.useFakeTimers();
+    try {
+      const lastDreamAt = new Date(BOOT_AT - 5 * HOUR).toISOString();
+      const h = cadenceHarness({ intervalMs: 12 * HOUR, lastDreamAt, newEntries: 1, dreamOnBoot: false });
+      h.scheduler.start();
+      await h.advance(0);
+      expect(h.distiller.calls).toHaveLength(0);
+      await h.advance(7 * HOUR - 60_000);
+      expect(h.distiller.calls).toHaveLength(0);
+      await h.advance(60_000);
+      expect(h.distiller.calls).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('an unparsable lastDreamAt fails loud at start instead of guessing', () => {
+    const scheduler = new DreamScheduler({
+      intervalMs: HOUR,
+      dreamOnBoot: true,
+      lastDreamAt: () => 'not-a-timestamp',
+      run: async () => {
+        throw new Error('should never run');
+      },
+    });
+    expect(() => scheduler.start()).toThrowError(DreamError);
+    expect(() => scheduler.start()).toThrowError(/lastDreamAt/);
+  });
+
+  it('stop() cancels a still-pending due beat', async () => {
+    vi.useFakeTimers();
+    try {
+      const lastDreamAt = new Date(BOOT_AT - 5 * HOUR).toISOString();
+      const h = cadenceHarness({ intervalMs: 12 * HOUR, lastDreamAt, newEntries: 1, dreamOnBoot: false });
+      h.scheduler.start();
+      expect(h.scheduler.running).toBe(true);
+      h.scheduler.stop();
+      expect(h.scheduler.running).toBe(false);
+      await h.advance(24 * HOUR);
+      expect(h.distiller.calls).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('interval 0 keeps the on-boot-only semantics: one boot pass, no periodic beat', async () => {
+    vi.useFakeTimers();
+    try {
+      const h = cadenceHarness({ intervalMs: 0, lastDreamAt: null, newEntries: 1 });
+      h.scheduler.start();
+      await h.advance(0);
+      expect(h.distiller.calls).toHaveLength(1);
+      await h.advance(48 * HOUR);
+      expect(h.distiller.calls).toHaveLength(1);
     } finally {
       vi.useRealTimers();
     }

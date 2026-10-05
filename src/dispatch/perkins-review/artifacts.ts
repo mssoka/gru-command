@@ -1,4 +1,7 @@
-import { execFileSync } from 'node:child_process';
+import { execFile as execFileCallback, execFileSync } from 'node:child_process';
+import { promisify } from 'node:util';
+
+const execFileAsPromised = promisify(execFileCallback);
 import { createHash } from 'node:crypto';
 import { closeSync, existsSync, fstatSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, unlinkSync, writeFileSync, constants } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
@@ -129,17 +132,17 @@ export interface FrozenReview {
   };
 }
 
-function gitRaw(repoPath: string, args: readonly string[]): string {
+function gitRaw(repoPath: string, args: readonly string[], timeoutMs = 30_000): string {
   return execFileSync('git', ['-C', repoPath, ...args], {
     encoding: 'utf8',
     maxBuffer: GIT_MAX_BUFFER,
-    timeout: 30_000,
+    timeout: timeoutMs,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 }
 
-function git(repoPath: string, args: readonly string[]): string {
-  return gitRaw(repoPath, args).trimEnd();
+function git(repoPath: string, args: readonly string[], timeoutMs = 30_000): string {
+  return gitRaw(repoPath, args, timeoutMs).trimEnd();
 }
 
 export function resolveGitCommit(repoPath: string, ref: string): string {
@@ -505,11 +508,55 @@ function baseMovementSinceFreeze(review: FrozenReview): SourceMovement | null {
 }
 
 /** The configured-remote branch a movement ref names, or null when the ref
- * is not a remote-tracking ref (a SHA, a tag, or a local branch whose
- * leading segment is not a configured remote — a local `feature/x` is NOT
- * `remote feature`). */
+ * is not a remote-tracking branch spelling (a SHA, a tag, a revision
+ * expression like origin/topic~1, or a local branch whose leading segment
+ * is not a configured remote — a local `feature/x` is NOT
+ * `remote feature`).
+ *
+ * gh-169: the advertised-tip comparison applies ONLY to refs that resolve
+ * to refs/remotes/<remote>/<branch>. A revision expression (origin/topic~1)
+ * is not that branch spelling — probing refs/heads/<branch-with-operators>
+ * exits 2 and poisoned every pin round as `check-failed` movement; a tag
+ * like origin/v1 resolves to refs/tags/… and never names an advertised
+ * branch. Both now correctly skip this check; their pins still bind through
+ * the local resolution and pristine-checkout proofs. */
 function advertisedRemoteBranch(repoPath: string, ref: string): { remote: string; branch: string } | null {
-  const remoteRef = ref.startsWith('refs/remotes/') ? ref.slice('refs/remotes/'.length) : ref;
+  let remoteRef: string;
+  if (ref.startsWith('refs/remotes/')) {
+    // gh-169 P9: a fully-qualified spelling is not automatically a tracking
+    // REF — `refs/remotes/origin/topic~1` is a resolvable revision
+    // EXPRESSION whose ls-remote probe would false-alarm exactly like the
+    // short spelling. Validate the ref format before treating the prefix
+    // as proof; a genuine tracking ref keeps its advertised-tip check.
+    try {
+      gitRaw(repoPath, ['check-ref-format', ref]);
+    } catch {
+      return null;
+    }
+    remoteRef = ref.slice('refs/remotes/'.length);
+  } else {
+    // Fully-qualified non-tracking refs (tags, heads) are exact and never
+    // advertised-branch spellings.
+    if (ref.startsWith('refs/')) return null;
+    // A valid branch spelling only: revision operators (~ ^ : .. @{}) make
+    // the ref an EXPRESSION, not the branch itself.
+    try {
+      gitRaw(repoPath, ['check-ref-format', '--branch', ref]);
+    } catch {
+      return null;
+    }
+    // The ref must actually RESOLVE to a remote-tracking ref — a tag whose
+    // name carries a slash (origin/v1) resolves to refs/tags/origin/v1 and
+    // never names an advertised branch.
+    let fullName: string;
+    try {
+      fullName = git(repoPath, ['rev-parse', '--symbolic-full-name', '--verify', ref]);
+    } catch {
+      return null;
+    }
+    if (!fullName.startsWith('refs/remotes/')) return null;
+    remoteRef = fullName.slice('refs/remotes/'.length);
+  }
   const slash = remoteRef.indexOf('/');
   if (slash <= 0 || slash === remoteRef.length - 1) return null;
   const remote = remoteRef.slice(0, slash);
@@ -521,7 +568,21 @@ function advertisedRemoteBranch(repoPath: string, ref: string): { remote: string
  * advertised target tip), HEAD and pristine checkout with the frozen target.
  * A base advance is not movement; frozen SHAs stay provenance. Any failed
  * check returns a cause, so the boolean wrapper fails closed on every error. */
-export function sourceMovementSinceFreeze(review: FrozenReview): SourceMovement | null {
+/** Movement probe options (gh-169 P5): `remoteProbeTimeoutMs` bounds the
+ * advertised-tip ls-remote at REQUEST-TIME admission so a stalled remote
+ * cannot block the service event loop for the full 30 s proof budget — a
+ * probe that exceeds the bound reports check-failed (fail-closed,
+ * retryable) instead of stalling. The submission gate keeps the full
+ * budget by omitting the option. */
+export interface SourceMovementOptions {
+  readonly remoteProbeTimeoutMs?: number;
+  /** Skip the advertised-tip probe (the caller supplies a precomputed
+   * async result — gh-169 R4-6: request-time admission probes the remote
+   * OFF the event loop and injects the outcome). */
+  readonly skipRemoteProbe?: boolean;
+}
+
+export function sourceMovementSinceFreeze(review: FrozenReview, options?: SourceMovementOptions): SourceMovement | null {
   const { repoPath, targetRef, targetSha } = review.manifest;
   try {
     const base = baseMovementSinceFreeze(review);
@@ -534,11 +595,19 @@ export function sourceMovementSinceFreeze(review: FrozenReview): SourceMovement 
     }
     if (localTarget !== targetSha) return movement('target-moved', `target ${targetRef} is ${localTarget}, frozen at ${targetSha}`);
     // A push may move the host tip without moving the local tracking ref.
-    const remoteTarget = advertisedRemoteBranch(repoPath, targetRef);
-    if (remoteTarget !== null) {
-      const advertised = gitRaw(repoPath, ['ls-remote', '--exit-code', remoteTarget.remote, `refs/heads/${remoteTarget.branch}`]).trim();
-      const tip = advertised.split(/\s+/u)[0] ?? '';
-      if (tip !== targetSha) return movement('target-moved', `advertised ${remoteTarget.remote}/${remoteTarget.branch} is ${tip}, frozen at ${targetSha}`);
+    if (options?.skipRemoteProbe === true) {
+      // The caller owns the advertised-tip proof (async path).
+    } else {
+      const remoteTarget = advertisedRemoteBranch(repoPath, targetRef);
+      if (remoteTarget !== null) {
+      const advertised = gitRaw(
+        repoPath,
+        ['ls-remote', '--exit-code', remoteTarget.remote, `refs/heads/${remoteTarget.branch}`],
+          options?.remoteProbeTimeoutMs,
+        ).trim();
+        const tip = advertised.split(/\s+/u)[0] ?? '';
+        if (tip !== targetSha) return movement('target-moved', `advertised ${remoteTarget.remote}/${remoteTarget.branch} is ${tip}, frozen at ${targetSha}`);
+      }
     }
     if (resolveGitCommit(repoPath, 'HEAD') !== targetSha) {
       return movement('checkout-changed', `review checkout HEAD no longer matches ${targetSha}`);
@@ -550,6 +619,102 @@ export function sourceMovementSinceFreeze(review: FrozenReview): SourceMovement 
         return movement('checkout-changed', error.message);
       }
       throw error;
+    }
+    return null;
+  } catch (error) {
+    return movement('check-failed', gitErrorDetail(error));
+  }
+}
+
+/** Async advertised-tip probe (gh-169 R4-6): the SAME fail-closed
+ * comparison `sourceMovementSinceFreeze` performs, executed with the
+ * non-blocking execFile so a stalled remote never blocks the service
+ * event loop at request-time admission. Null = no movement; errors and
+ * timeouts return an explicit check-failed movement (fail-closed,
+ * retryable), never silence and never a stall. */
+export async function probeAdvertisedTipMovementAsync(
+  review: FrozenReview,
+  timeoutMs: number,
+): Promise<SourceMovement | null> {
+  const { targetRef, targetSha } = review.manifest;
+  // R6-4: ONE cumulative admission budget across every async step — each
+  // call gets only the remaining time and exhaustion fails closed.
+  const deadline = Date.now() + timeoutMs;
+  const run = async (args: readonly string[]): Promise<string> => {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      throw new Error(`admission remote-probe budget exhausted before: git ${args.join(' ')}`);
+    }
+    const { stdout } = await execFileAsPromised('git', ['-C', review.manifest.repoPath, ...args], {
+      encoding: 'utf8', timeout: remaining, maxBuffer: 1024 * 1024,
+    });
+    return stdout;
+  };
+  // R6-3: only an ESTABLISHED non-zero exit (git itself answered
+  // "invalid spelling") may skip the remote proof; timeouts, kills and
+  // spawn failures fail closed.
+  const establishedRejection = (error: unknown): boolean => {
+    const code = (error as { code?: unknown } | null)?.code;
+    return typeof code === 'number';
+  };
+  // Round-5 P3: EVERY preparation step is async and bounded — the sync
+  // advertisedRemoteBranch helper (30 s execFileSync defaults) is never
+  // touched at admission, so no slow config/filesystem/helper step can
+  // block the service event loop. Semantics mirror the sync helper: a
+  // spelling that is not a valid branch/ref name SKIPS the probe (no
+  // movement); only genuine probe errors are fail-closed check-failed.
+  const identify = async (): Promise<{ remote: string; branch: string } | null> => {
+    if (targetRef.startsWith('refs/') && !targetRef.startsWith('refs/remotes/')) return null;
+    if (!targetRef.startsWith('refs/remotes/')) {
+      try {
+        await run(['check-ref-format', '--branch', targetRef]);
+      } catch (error) {
+        if (establishedRejection(error)) return null; // not a branch spelling (e.g. origin/topic~1)
+        throw error; // timeout/kill/spawn failure — fail closed
+      }
+      let fullName: string;
+      try {
+        fullName = (await run(['rev-parse', '--symbolic-full-name', '--verify', targetRef])).trimEnd();
+      } catch (error) {
+        if (establishedRejection(error)) return null; // the ref resolves to nothing — not advertised
+        throw error;
+      }
+      if (!fullName.startsWith('refs/remotes/')) return null;
+      const remoteRef = fullName.slice('refs/remotes/'.length);
+      const slash = remoteRef.indexOf('/');
+      if (slash <= 0 || slash === remoteRef.length - 1) return null;
+      const remote = remoteRef.slice(0, slash);
+      const remotes = (await run(['remote'])).split('\n');
+      return remotes.includes(remote) ? { remote, branch: remoteRef.slice(slash + 1) } : null;
+    }
+    try {
+      await run(['check-ref-format', targetRef]);
+    } catch (error) {
+      if (establishedRejection(error)) return null; // a qualified revision expression, not a tracking ref
+      throw error;
+    }
+    const remoteRef = targetRef.slice('refs/remotes/'.length);
+    const slash = remoteRef.indexOf('/');
+    if (slash <= 0 || slash === remoteRef.length - 1) return null;
+    const remote = remoteRef.slice(0, slash);
+    const remotes = (await run(['remote'])).split('\n');
+    return remotes.includes(remote) ? { remote, branch: remoteRef.slice(slash + 1) } : null;
+  };
+  let remoteTarget: { remote: string; branch: string } | null = null;
+  try {
+    remoteTarget = await identify();
+  } catch (error) {
+    return movement('check-failed', gitErrorDetail(error));
+  }
+  if (remoteTarget === null) return null;
+  try {
+    // R7-3: the FINAL call flows through run() — the remaining budget at
+    // the moment of the probe is what ls-remote gets, and exhaustion
+    // fails closed.
+    const stdout = await run(['ls-remote', '--exit-code', remoteTarget.remote, `refs/heads/${remoteTarget.branch}`]);
+    const tip = stdout.trim().split(/\s+/u)[0] ?? '';
+    if (tip !== targetSha) {
+      return movement('target-moved', `advertised ${remoteTarget.remote}/${remoteTarget.branch} is ${tip}, frozen at ${targetSha}`);
     }
     return null;
   } catch (error) {

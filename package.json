@@ -47,6 +47,7 @@
     "mock": "npm run mock -w web",
     "wizard": "node dist/wizard/main.js",
     "config:generate": "node dist/cli/config-generate.js",
+    "yield": "node dist/cli/yield-report.js",
     "config:docs": "node scripts/render-config-doc.mjs",
     "start": "node dist/main.js"
   },

@@ -6,7 +6,7 @@ import type { AgentSpawner } from '../service.js';
 import type { AgentHandle, NativeAgentTool, PromptOptions } from '../../runtime/types.js';
 import type { PacingGate, PacingLease, PacingEventRecorder, RateLimitBackoffPolicy } from '../../runtime/pacing.js';
 import { withRateLimitRetries, type RateLimitRetryOptions } from '../../runtime/rate-limit-retry.js';
-import { assertFrozenPromptBounds, compatibleReviewIdentity, proveRecoveredBaseMergeability, publishedReportMatches, readReviewArtifact, readReviewCheckpoint, sourceMovementSinceFreeze, SPECIALIST_CHECKPOINT_MAX_BYTES, writeReviewArtifact, type FrozenReview, type SourceMovement } from './artifacts.js';
+import { assertFrozenPromptBounds, compatibleReviewIdentity, proveRecoveredBaseMergeability, publishedReportMatches, readReviewArtifact, readReviewCheckpoint, sourceMovementSinceFreeze, SPECIALIST_CHECKPOINT_MAX_BYTES, writeReviewArtifact, type FrozenReview, type SourceMovement, type SourceMovementOptions } from './artifacts.js';
 import { readFrozenEvidenceBytes, renderEvidencePromptSection } from '../../review-inputs/evidence.js';
 import { finalAssistantText } from './session-output.js';
 import { PERKINS_FINDING_SOURCES, PERKINS_LENSES, type PerkinsFindingSource, type PerkinsLens, type PerkinsPolicy } from './policy.js';
@@ -389,12 +389,12 @@ function sanitizeError(error: unknown): string {
   return (error instanceof Error ? error.message : String(error)).replace(/[\r\n]+/g, ' ').slice(0, 500);
 }
 
-function headMovedSinceFreeze(review: FrozenReview, movementRef: string): SourceMovement | null {
+function headMovedSinceFreeze(review: FrozenReview, movementRef: string, options?: SourceMovementOptions): SourceMovement | null {
   // The target ref, HEAD, and the pristine detached checkout must ALL still
   // be exactly what was frozen, and the base must not have been rewritten
   // past the frozen merge-base; unknown movement can never authorize the
   // now-different head.
-  const observed = sourceMovementSinceFreeze(review);
+  const observed = sourceMovementSinceFreeze(review, options);
   if (observed !== null) return observed;
   if (movementRef === review.manifest.targetSha || movementRef === review.manifest.targetRef) return null;
   try {
@@ -406,6 +406,8 @@ function headMovedSinceFreeze(review: FrozenReview, movementRef: string): Source
     return { cause: 'target-moved', detail: `movement ref ${movementRef} cannot resolve` };
   }
 }
+
+export { headMovedSinceFreeze };
 
 function record(value: unknown, name: string): Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new Error(`${name} must be an object`);

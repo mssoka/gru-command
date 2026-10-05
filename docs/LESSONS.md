@@ -12,7 +12,7 @@ The mechanism ships with gru-command; the content accrues per user.
 
 ```
 deliberate capture          distillation              progressive disclosure
-journal/*.jsonl      →      dream (Bob, 12h)     →    bible/INDEX.md (≤1 KB)
+journal/*.jsonl      →      dream (Bob, due-based) →   bible/INDEX.md (≤1 KB)
   finding | ruling            dedupe + recurred        chapters/*.md (≤4 KB)
   observation                 provenance + caps        pointer lines in briefings
 ```
@@ -26,6 +26,10 @@ Entries are deliberate — nothing writes noise:
 - **Silas** appends ops observations from his sweeps.
 - **Minions** may end a delivery report with an optional fenced
   `lessons` block; the host extracts it at settle.
+- **Perkins** journals each posted review verdict's consolidated
+  blockers as `finding` entries (source `perkins:<round>`, tags
+  `repo:…`, `review:blocker`, `category:…`) — reviews are learning
+  inputs, captured once per round, idempotently.
 - **The owner** can append through the same API.
 
 `POST /api/journal` with `{kind: 'finding'|'ruling'|'observation',
@@ -39,12 +43,18 @@ behind the pairing token, like every other mutating surface.
 
 ### 2. Dream (distillation)
 
-A cadence job — **on boot + every 12 h** by default (`[lessons]`
-`dream_interval_ms`, `dream_on_boot`). Bob reads the journal entries
-newer than the last dream, merges repeats into their existing lesson
-(`recurred: N`, provenance unioned), rewrites **only the affected
-chapters**, and enforces the caps by trimming — never by appending
-journal text verbatim. Every lesson cites its journal ids and dates.
+A cadence job, **due-based** (`[lessons]` `dream_interval_ms`,
+`dream_on_boot`): the next pass is due `lastDreamAt + interval`, read
+from the persisted dream state, so a service restart inherits the
+running cadence instead of resetting it (issue #221 — with a long
+interval and a service that restarts daily, a boot-reset timer would
+never fire). The on-boot pass runs only when the dream is already due,
+and a beat with no new journal entries never calls the distiller. Bob
+reads the journal entries newer than the last dream, merges repeats
+into their existing lesson (`recurred: N`, provenance unioned),
+rewrites **only the affected chapters**, and enforces the caps by
+trimming — never by appending journal text verbatim. Every lesson
+cites its journal ids and dates.
 
 The cursor only advances after a successful apply: a failed pass retries
 the same entries at the next beat. Nothing new = no distiller call = no
@@ -93,8 +103,8 @@ callers that want them explicitly.
 ```toml
 [lessons]
 enabled = true               # false: no dream cadence, no pointer injection
-dream_interval_ms = 43200000 # 12 h; 0 disables the periodic pass
-dream_on_boot = true         # one catch-up pass at service boot
+dream_interval_ms = 43200000 # due lastDreamAt + interval; 0 disables the periodic pass
+dream_on_boot = true         # boot pass only when the dream is already due
 chapter_cap_bytes = 4096     # per chapter; the dream trims to fit
 index_cap_bytes = 1024       # INDEX.md hard cap — the only embedded part
 max_references = 3           # pointer lines per briefing/directive

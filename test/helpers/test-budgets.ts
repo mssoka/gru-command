@@ -73,6 +73,10 @@ export const HEAVY_TESTS: readonly HeavyTestEntry[] = Object.freeze([
   { file: 'lan-phone-raw-client.test.ts', workload: 'real service over sockets with the raw client' },
   { file: 'listener-probe.test.ts', workload: 'real child listeners and service port-guard probes' },
   {
+    file: 'perkins-admission-preflight.test.ts',
+    workload: 'real git fixture freezes plus frozen-packet corruption scenarios',
+  },
+  {
     file: 'perkins-builtin-wave.test.ts',
     workload: 'wave/worktree/review flows over real git repositories',
   },
