@@ -88,3 +88,13 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-crew-heist-labels.md`
   summary: The crew-rail Playwright project (rail layout/overflow geometry) is not part of any required recurring gate — CI runs `npm test` (Vitest) only; a future CSS regression could pass every required check while breaking the rail layout.
   evidence: Fresh bmad-build verification-gap finding 2026-10-05 (disposition: defer). The dedicated `crew-rail` project is runnable on demand through the declared scheduler scopes (`crew-rail-captures`, `crew-captures-fast`) and ran green at the reviewed heads, but adding Playwright to required CI is a repo-wide runner-cost/policy decision (browsers install, ~1-2 min/job) that the owner and the e2e-gate-repair lane (job-e2e-gate-repair-20261004) own, not this display-naming lane.
+
+## Deferred from: code review of GH-215 conflicts-to-silas (2026-10-05)
+
+- source_spec: GitHub issue #215 (Route mechanical PR conflicts to Silas's digest instead of waking Gru)
+  summary: Conflict-row retirement is ADMISSION-based (a `silas.directive-sent` carrying `pr-conflict:<headSha>` retires the row) while the ops-dispatch skill says to escalate only after the rebase directive fails twice — a failed rebase directive leaves no visible second attempt, because the spec itself prescribes admission-based suppression. Any fix that retires only on a successful outcome contradicts issue #215's explicit suppression rule, so it needs an issue-level decision (or #218 typed holds) first.
+  evidence: bmad code review (blind-hunter + edge-case-hunter, gpt-6-sol) 2026-10-05, triaged defer — spec-prescribed behavior, not this lane's change.
+
+- source_spec: GitHub issue #215 (Route mechanical PR conflicts to Silas's digest instead of waking Gu)
+  summary: A live/armed Perkins review round does not fence the `conflictingPrs` row — a base update can dirty the PR mid-round and the digest will offer a rebase that invalidates the frozen review target. The issue's suppression list is deliberately enumerated (directives, re-briefs, verifications, later #218 holds); round coordination belongs to #218's typed decision memory, where an active-hold check can cover `pr-conflict`.
+  evidence: bmad code review (blind-hunter, gpt-6-sol) 2026-10-05, triaged defer — real coordination hazard, owned by the #218 phase; adding round-state fencing here would exceed the issue's prescribed suppression contract.
