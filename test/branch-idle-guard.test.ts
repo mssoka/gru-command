@@ -395,6 +395,7 @@ function jobRecord(id: string, status: JobStatus): JobRecord {
     repo: 'fixture',
     title: id,
     displayName: null,
+    deliverable: null,
     status,
     baseBranch: 'main',
     prUrl: null,

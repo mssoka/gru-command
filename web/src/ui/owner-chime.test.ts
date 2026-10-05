@@ -172,6 +172,7 @@ function mountDom(): void {
       <span id="board-unacked" hidden></span>
       <span id="board-wakes" hidden></span>
     </div>
+    <nav id="board-nav" hidden></nav>
     <div id="board-jobs"></div>
     <section id="board-owner" hidden></section>
     <div id="board-agents"></div>

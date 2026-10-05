@@ -20,6 +20,37 @@ async function pair(page: Page): Promise<void> {
   await expect(page.locator('#chat-view')).toBeVisible();
 }
 
+/** Approved compact board (j-1064): FOR GRU starts collapsed and COLD is
+ * count-only. Classification checks reveal the section first, exactly as
+ * an operator would; the reveal is idempotent and never re-collapses. */
+async function revealForGru(page: Page): Promise<void> {
+  // The reveal must wait for the rendered board: a click before the first
+  // snapshot push would find no toggle and silently skip.
+  await expect(page.locator('#board-view')).toBeVisible();
+  const toggle = page.locator('.board-band[data-section="for-gru"] .board-band__more');
+  if ((await toggle.count()) > 0 && (await toggle.getAttribute('aria-expanded')) === 'false') {
+    await toggle.click();
+  }
+}
+
+async function revealCold(page: Page): Promise<void> {
+  // The reveal must wait for the rendered board: a click before the first
+  // snapshot push would find no toggle and silently skip.
+  await expect(page.locator('#board-view')).toBeVisible();
+  const toggle = page.locator('.board-band[data-section="cold"] .board-band__more');
+  if ((await toggle.count()) > 0 && (await toggle.getAttribute('aria-expanded')) === 'false') {
+    await toggle.click();
+  }
+}
+
+/** The settled preview is bounded at three; the head keeps the FULL count. */
+async function revealAllSettled(page: Page): Promise<void> {
+  const more = page.locator('.board-band[data-section="settled"] .board-band__more');
+  if ((await more.count()) > 0 && (await more.getAttribute('aria-expanded')) === 'false') {
+    await more.click();
+  }
+}
+
 /** Pair on a phone viewport: the board is the DEFAULT view (SPEC ruling 11). */
 async function pairMobile(page: Page): Promise<void> {
   await page.goto('/');
@@ -582,6 +613,7 @@ test.describe('board (E6, mock feed)', () => {
     // owner-action band — then the v4 job bands; rows group under sticky
     // band separators.
     await expect(page.locator('.board-band__label').first()).toHaveText('FOR YOU');
+    await revealForGru(page);
     await expect(
       page.locator('.board-band--needs-you .board-job', { hasText: 'Merge main into the retry branch' }),
     ).toBeVisible();
@@ -622,6 +654,7 @@ test.describe('board (E6, mock feed)', () => {
     page,
   }) => {
     await pair(page);
+    await revealForGru(page);
     await expect(page.locator('#board-view')).toBeVisible();
     // GitHub /pull/ route: the number rides the visible label; href,
     // new-tab target and noreferrer semantics are untouched.
@@ -649,6 +682,7 @@ test.describe('board (E6, mock feed)', () => {
     // Fixture links must never hit the network from a test run.
     await page.context().route('https://github.com/**', (route) => route.abort());
     await pair(page);
+    await revealForGru(page);
     await expect(page.locator('#board-view')).toBeVisible();
     const row = page.locator('.board-job', { hasText: 'Merge main into the retry branch' });
     const link = row.locator('.board-job__pr');
@@ -677,6 +711,7 @@ test.describe('board (E6, mock feed)', () => {
     // Stale-evidence guard: clear before anything can fail mid-run.
     clearPrNumberCaptures();
     await pair(page);
+    await revealForGru(page);
     await expect(page.locator('#board-view')).toBeVisible();
     const row = page.locator('.board-job', { hasText: 'Merge main into the retry branch' });
     await expect(row.locator('.board-job__pr')).toHaveText('PR #43 ↗');
@@ -744,8 +779,9 @@ test.describe('board (E6, mock feed)', () => {
     // the unchanged v4 job-band order.
     await expect(page.locator('.board-band__label')).toHaveText([
       'FOR YOU',
-      'NEEDS GRU',
       'IN FLIGHT',
+      'PIPELINE',
+      'FOR GRU',
       'SETTLED',
       'COLD',
     ]);
@@ -754,7 +790,9 @@ test.describe('board (E6, mock feed)', () => {
       .evaluate((node) => getComputedStyle(node).position);
     expect(bandSticky).toBe('sticky');
     await expect(page.locator('.board-band--settled .board-band__count')).toHaveText('13 heists');
-    // The stalled working lane sank to COLD carrying the stale flag.
+    // The stalled working lane sank to COLD carrying the stale flag
+    // (COLD is count-only until revealed — j-1064).
+    await revealCold(page);
     const stalled = page.locator('.board-band--cold .board-job', { hasText: 'Backfill the audit log' });
     await expect(stalled).toBeVisible();
     await expect(stalled.locator('.board-job__stale')).toHaveText('stalled');
@@ -776,8 +814,10 @@ test.describe('board (E6, mock feed)', () => {
       // The settled band is a rolling window: the receipt can sit behind
       // the "+K older settled" expander depending on its recency rank.
       // Expand once so the assertion never depends on fixture ordering.
-      const more = page.locator('.board-band--settled .board-band__more');
-      if ((await more.count()) > 0) await more.click();
+      await revealAllSettled(page);
+      // Reveal FOR GRU so the "never a NEEDS GRU queue entry" assertion is
+      // not vacuous against the collapsed default.
+      await revealForGru(page);
 
       // The merged lane with a leftover unacked escalation row is a closed
       // receipt: SETTLED, no signal chip, never a NEEDS GRU queue entry.
@@ -797,7 +837,9 @@ test.describe('board (E6, mock feed)', () => {
       await expect(walled.locator('.board-job__status')).toHaveText('waiting · quota wall');
       await expect(walled.locator('.board-job__stale')).toHaveCount(0);
 
-      // COLD is still for genuinely silent working lanes.
+      // COLD is still for genuinely silent working lanes (revealed from
+      // the count-only default).
+      await revealCold(page);
       const silent = page.locator('.board-band--cold .board-job', { hasText: 'Backfill the audit log' });
       await expect(silent.locator('.board-job__stale')).toHaveText('stalled');
       await expect(silent.locator('.board-job__status')).toHaveText('working');
@@ -881,6 +923,7 @@ test.describe('board (E6, mock feed)', () => {
 
   test('row disclosure persists per job across a reload (v3)', async ({ page }) => {
     await pair(page);
+    await revealForGru(page);
     const job = page.locator('.board-job', { hasText: 'Fix the payment retry loop' });
     await expect(job).toHaveAttribute('data-expanded', 'false');
 
@@ -897,13 +940,17 @@ test.describe('board (E6, mock feed)', () => {
     expect(expandedHeight).toBeGreaterThan(collapsedHeight);
 
     // Reload: the expanded job comes back expanded (per-job localStorage).
+    // The FOR GRU disclosure itself is session state (j-1064) and starts
+    // collapsed again after a reload — reveal it before each assertion.
     await page.reload();
+    await revealForGru(page);
     await expect(job).toHaveAttribute('data-expanded', 'true');
 
     // Collapse it again; the next reload comes back collapsed.
     await job.locator('.board-job__toggle').click();
     await expect(job).toHaveAttribute('data-expanded', 'false');
     await page.reload();
+    await revealForGru(page);
     await expect(job).toHaveAttribute('data-expanded', 'false');
     await expect(job.locator('.board-job__body')).toHaveCount(0);
   });
@@ -912,7 +959,9 @@ test.describe('board (E6, mock feed)', () => {
     await pair(page);
     await expect(page.locator('#board-view')).toBeVisible();
 
-    // The lane strip lives in the expanded detail (v2 surface, v3 default).
+    // The lane strip lives in the expanded detail (v2 surface, v3 default);
+    // the lane's machine rows live in FOR GRU, revealed first.
+    await revealForGru(page);
     const card = page.locator('.board-job', { hasText: 'Fix the payment retry loop' });
     await card.locator('.board-job__toggle').click();
     const lane = card.locator('.board-lane');
@@ -1054,6 +1103,7 @@ test.describe('board (E6, mock feed)', () => {
 
   test('trackers render in dark theme and on a narrow phone viewport', async ({ page }) => {
     await pair(page);
+    await revealForGru(page);
     const card = page.locator('.board-job', { hasText: 'Fix the payment retry loop' });
     await card.locator('.board-job__toggle').click();
     await expect(card.locator('.board-lane')).toBeVisible();
@@ -1141,13 +1191,30 @@ test.describe('cockpit layout (v6)', () => {
       .poll(async () => Math.abs((await page.locator('#chat-main-mount').boundingBox())!.width - chatBox.width))
       .toBeLessThanOrEqual(2);
 
-    // The settled window rolls: 13 settled → 10 rows + a +3 footer.
-    await expect(page.locator('.board-band--settled .board-job')).toHaveCount(10);
+    // The sticky strip re-measures on an actual pane resize (Perkins r3
+    // warning): dragging splitters changes board width WITHOUT a window
+    // resize, and the sticky offsets must track the live strip height.
+    await expect
+      .poll(() =>
+        page.evaluate(() => {
+          const nav = document.querySelector<HTMLElement>('#board-nav');
+          if (nav === null) return false;
+          const value = getComputedStyle(document.documentElement).getPropertyValue('--board-nav-h').trim();
+          return value === `${nav.offsetHeight}px`;
+        }),
+      )
+      .toBe(true);
+
+    // The settled window rolls (approved j-1064 preview 3): 13 settled → 3
+    // rows + a reversible Show older settled expander; expanding reveals
+    // all 13 and keeps Show fewer (nothing is deleted).
+    await expect(page.locator('.board-band--settled .board-job')).toHaveCount(3);
     const more = page.locator('.board-band--settled .board-band__more');
-    await expect(more).toHaveText('+3 older settled');
+    await expect(more).toHaveText('Show older settled (+10)');
     await more.click();
     await expect(page.locator('.board-band--settled .board-job')).toHaveCount(13);
-    await expect(page.locator('.board-band--settled .board-band__more')).toHaveCount(0);
+    await expect(page.locator('.board-band--settled .board-band__more')).toHaveText('Show fewer');
+    await expect(page.locator('.board-band--settled .board-band__more')).toHaveAttribute('aria-expanded', 'true');
 
     // The FAB collapses the pane to the slim rail (and back); the choice persists.
     await page.locator('#gru-fab').click();

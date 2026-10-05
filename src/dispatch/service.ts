@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { LogLevel } from '../logger.js';
-import type { LedgerApi, JobRecord } from '../ledger/api.js';
+import type { JobDeliverable, LedgerApi, JobRecord } from '../ledger/api.js';
 import type { CompletionHandoffIntent } from '../ledger/obligations.js';
 import { isJobTerminal } from '../ledger/states.js';
 import type { Role } from '../config.js';
@@ -87,6 +87,11 @@ export function renderMinionBriefing(input: {
   lessons?: readonly LessonPointer[];
   /** Issue #161: this parent has GC-mediated child-worker tools wired. */
   childWorkerTools?: boolean;
+  /** The job's deliverable kind (E19). Non-PR kinds get their own closing
+   *  orders: a review job's deliverable is its findings — it commits
+   *  nothing, and an unmodified tree is the expected result; artifact and
+   *  investigation jobs hand back their artifacts without opening a PR. */
+  deliverable?: JobDeliverable;
 }): string {
   const lessonsSection = renderLessonsSection(input.lessons ?? []);
   return [
@@ -103,19 +108,39 @@ export function renderMinionBriefing(input: {
     '',
     ...(input.childWorkerTools === true
       ? [
-          'Independent capacity: if the briefing calls for one independent worker',
-          '(e.g. read-only verification), use the GC-owned `request_child_worker`',
-          'tool to commission one tracked child, `list_child_workers` to discover',
-          'its durable result, and `cancel_child_worker` to stop it. Children',
-          'cannot commission children; never launch external or headless agents',
-          'yourself.',
+          'Independent capacity (ad-hoc helper work only): if the briefing calls',
+          'for one independent helper (e.g. read-only verification), use the',
+          'GC-owned `request_child_worker` tool to commission one tracked child,',
+          '`list_child_workers` to discover its durable result, and',
+          '`cancel_child_worker` to stop it. This is NOT the build workflow\'s',
+          'independent reviewer: that review runs as its own tracked review job',
+          'commissioned through `POST /api/dispatch` with',
+          '`"deliverable": "review"` — never as a generic child. Children cannot',
+          'commission children; never launch external or headless agents yourself.',
           '',
         ]
       : []),
-    'Execute the briefing inside this worktree. Standing orders: work only',
-    'inside this tree; commit your work to the branch; verify it (build,',
-    'tests, lint — whatever this project calls green) before finishing;',
-    'never merge your own pull request. End with a completion report.',
+    ...(input.deliverable === 'review'
+      ? [
+          'Execute the briefing inside this worktree. Standing orders: work only',
+          'inside this tree; this brief is READ-ONLY — change nothing, commit',
+          'nothing (an unmodified tree is the expected result); read the named',
+          'immutable head and diff via git show/git diff inside your tree; never',
+          'merge; end with your findings and a completion report.',
+        ]
+      : input.deliverable === 'artifact' || input.deliverable === 'investigation'
+        ? [
+            'Execute the briefing inside this worktree. Standing orders: work only',
+            'inside this tree; commit your work to the branch; verify it; hand back',
+            'the named artifact and end with a completion report; do not open a',
+            'pull request — this job owes an artifact handback, not a PR.',
+          ]
+        : [
+            'Execute the briefing inside this worktree. Standing orders: work only',
+            'inside this tree; commit your work to the branch; verify it (build,',
+            'tests, lint — whatever this project calls green) before finishing;',
+            'never merge your own pull request. End with a completion report.',
+          ]),
   ].join('\n');
 }
 
@@ -140,6 +165,10 @@ export class DispatchService {
     repoPath: string;
     title: string;
     displayName?: string;
+    /** The deliverable kind (E19): reviewers dispatch with `review`,
+     * artifact-only lanes with `artifact`/`investigation`; omitted = a
+     * PR-owing implementation lane. */
+    deliverable?: JobDeliverable;
     briefing: string;
     /** Explicit completion intent: when present, the phase-handoff guard
      * row is persisted BEFORE any side effect and this exact phase's
@@ -159,6 +188,7 @@ export class DispatchService {
       title: input.title,
       displayName: input.displayName,
       briefing: input.briefing,
+      ...(input.deliverable !== undefined ? { deliverable: input.deliverable } : {}),
     });
 
     // (2) Ops handoff: dispatched → working, on the record.
@@ -425,6 +455,7 @@ export class DispatchService {
         worktreePath: worktree.path,
         sha: worktree.sha,
         briefing: input.briefing,
+        ...(input.deliverable !== undefined ? { deliverable: input.deliverable } : {}),
         agentId: handle.id,
         ...(this.opts.parentTools !== undefined && this.opts.parentTools(handle.id).length > 0
           ? { childWorkerTools: true }

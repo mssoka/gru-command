@@ -2,10 +2,12 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { hashToken, tokenConfigured, tokenMatches } from '../auth.js';
 import type { GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
-import type { ChildWorkerRecord, LedgerApi } from '../ledger/api.js';
-import { JOB_DISPLAY_NAME_MAX_LENGTH, AmbiguousDirectiveError, DirectiveConflictError, PhaseHandoffConflictError } from '../ledger/api.js';
+import type { ChildWorkerRecord, JobDeliverable, LedgerApi } from '../ledger/api.js';
+import { JOB_DISPLAY_NAME_MAX_LENGTH, AmbiguousDirectiveError, DirectiveConflictError, PhaseHandoffConflictError, PipelineConflictError } from '../ledger/api.js';
 import { isJobTerminal } from '../ledger/states.js';
 import { parseCompletionHandoffIntent, type CompletionHandoffIntent } from '../ledger/obligations.js';
+import { parsePipelinePrerequisites, type PipelinePrerequisite } from '../ledger/pipeline.js';
+import type { PipelineService } from './pipeline.js';
 import type { NotificationCenter } from '../notifications/center.js';
 import type { DispatchService } from './service.js';
 import type { WaveRunner } from './perkins.js';
@@ -64,6 +66,9 @@ export interface DispatchServerOptions {
   readonly childWorkers?: ChildWorkerService;
   /** Absent = /api/silas/* answers 503 (silas ops not hosted). */
   readonly silasOps?: SilasOpsSurface;
+  /** Durable pipeline queue surface (approved j-239/j-1064); absent =
+   * /api/pipeline/* answers 503 (queue not hosted in this build). */
+  readonly pipeline?: PipelineService;
   /** Book of Lessons injection for directives/re-briefs (pointers only). */
   readonly lessons?: LessonsReferencePort;
   readonly log?: Log;
@@ -91,6 +96,18 @@ function strField(body: Record<string, unknown>, field: string): string {
 function optStrField(body: Record<string, unknown>, field: string): string | undefined {
   const value = body[field];
   return typeof value === 'string' && value.trim() !== '' ? value : undefined;
+}
+
+/** A present-but-malformed optional field is a 400, never a silent drop:
+ * safety-relevant fields (an owner hold) must never degrade into their
+ * absent default (Perkins r1 blocker 2). */
+function optStrFieldStrict(body: Record<string, unknown>, field: string): string | undefined {
+  if (!(field in body)) return undefined;
+  const value = body[field];
+  if (typeof value !== 'string') {
+    throw new Error(`${field} must be a string when present`);
+  }
+  return value.trim() === '' ? undefined : value;
 }
 
 /** Issue #161: the wire shape of one tracked child worker (snake_case,
@@ -187,10 +204,40 @@ function optEvidenceField(body: Record<string, unknown>): readonly ReviewEvidenc
 /** The optional explicit completion intent on phase-authorizing requests.
  * Absent = ordinary flow; malformed = fail loud (the handler answers 400
  * BEFORE any job/side effect runs). */
+/** Validate the optional deliverable kind (E19): presence is checked
+ * FIRST so a present null/number/blank fails loud — never silently
+ * defaulting an implementation lane into a carve-out (or a review lane
+ * into PR debt). */
+function deliverableField(body: Record<string, unknown>): JobDeliverable | undefined {
+  if (!Object.hasOwn(body, 'deliverable')) return undefined;
+  const raw = body['deliverable'];
+  if (typeof raw !== 'string' || raw.trim() === '') {
+    throw new Error(`deliverable must be a non-empty string of pr|review|artifact|investigation (got ${JSON.stringify(raw)})`);
+  }
+  const value = raw.trim();
+  if (value !== 'pr' && value !== 'review' && value !== 'artifact' && value !== 'investigation') {
+    throw new Error(`deliverable must be one of pr|review|artifact|investigation (got "${value}")`);
+  }
+  return value;
+}
+
 function completionHandoffField(body: Record<string, unknown>): CompletionHandoffIntent | undefined {
   const value = body['completion_handoff'];
   if (value === undefined) return undefined;
   return parseCompletionHandoffIntent(value);
+}
+
+/** Pipeline prerequisites arrive as a JSON array of `{id, milestone}`;
+ * validated by the SAME codec the ledger persists (fail loud on any
+ * typo'd milestone rather than silently treating it as unmet). */
+function optPrerequisitesField(body: Record<string, unknown>): readonly PipelinePrerequisite[] | undefined {
+  const value = body['prerequisites'];
+  if (value === undefined) return undefined;
+  try {
+    return parsePipelinePrerequisites(JSON.stringify(value));
+  } catch (error) {
+    throw new Error(`prerequisites: ${String(error instanceof Error ? error.message : error)}`);
+  }
 }
 
 export function createDispatchServer(options: DispatchServerOptions): DispatchServer {
@@ -286,6 +333,15 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
     return options.silasOps;
   }
 
+  /** The pipeline surface, or null with a 503 already written. */
+  function pipelineOr503(res: ServerResponse): PipelineService | null {
+    if (options.pipeline === undefined) {
+      json(res, 503, { error: 'pipeline_not_hosted', detail: 'the durable pipeline queue is not hosted on this service' });
+      return null;
+    }
+    return options.pipeline;
+  }
+
   async function handleApi(req: IncomingMessage, res: ServerResponse, path: string): Promise<boolean> {
     if (req.method === 'POST' && path === '/api/dispatch') {
       if (!authed(req, res)) return true;
@@ -297,12 +353,14 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       if (displayName !== undefined && displayName.length > JOB_DISPLAY_NAME_MAX_LENGTH) {
         throw new Error(`display_name exceeds ${JOB_DISPLAY_NAME_MAX_LENGTH} characters`);
       }
+      const deliverable = deliverableField(body);
       const completionHandoff = completionHandoffField(body);
       const outcome = await options.dispatch.dispatch({
         jobId: strField(body, 'job_id'),
         repoPath: strField(body, 'repo_path'),
         title: strField(body, 'title'),
         ...(displayName !== undefined ? { displayName } : {}),
+        ...(deliverable !== undefined ? { deliverable } : {}),
         briefing: strField(body, 'briefing'),
         ...(completionHandoff !== undefined ? { completionHandoff } : {}),
       });
@@ -526,6 +584,86 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         status: outcome.round.status,
         lenses: outcome.round.lenses.map((chip) => chip.lens),
       });
+      return true;
+    }
+    if (req.method === 'POST' && path === '/api/pipeline/enqueue') {
+      if (!authed(req, res)) return true;
+      const pipeline = pipelineOr503(res);
+      if (pipeline === null) return true;
+      const body = await readBody(req);
+      const priorityField = body['priority'];
+      if (priorityField !== undefined && typeof priorityField !== 'number') {
+        throw new Error('priority must be a number');
+      }
+      const scopes = optStrArray(body, 'exclusive_scopes');
+      let receipt: ReturnType<PipelineService['enqueue']>;
+      try {
+        receipt = pipeline.enqueue({
+          id: strField(body, 'id'),
+          ...(optStrField(body, 'request_id') !== undefined ? { requestId: optStrField(body, 'request_id') } : {}),
+          repoPath: strField(body, 'repo_path'),
+          title: strField(body, 'title'),
+          briefing: strField(body, 'briefing'),
+          ...(priorityField !== undefined ? { priority: priorityField as number } : {}),
+          ...(optPrerequisitesField(body) !== undefined ? { prerequisites: optPrerequisitesField(body) } : {}),
+          ...(scopes !== undefined ? { exclusiveScopes: scopes } : {}),
+          ...(optStrFieldStrict(body, 'hold_reason') !== undefined ? { holdReason: optStrFieldStrict(body, 'hold_reason') } : {}),
+          by: byField(body) ?? null,
+        });
+      } catch (error) {
+        if (error instanceof PipelineConflictError) {
+          json(res, 409, { error: 'conflict', detail: error.message });
+          return true;
+        }
+        throw error;
+      }
+      json(res, receipt.duplicate ? 200 : 201, receipt);
+      return true;
+    }
+    if (req.method === 'GET' && path === '/api/pipeline') {
+      if (!authed(req, res)) return true;
+      const pipeline = pipelineOr503(res);
+      if (pipeline === null) return true;
+      json(res, 200, pipeline.view());
+      return true;
+    }
+    const pipelineEntryMatch = /^\/api\/pipeline\/entries\/([^/]+)$/.exec(path);
+    if (req.method === 'GET' && pipelineEntryMatch !== null) {
+      if (!authed(req, res)) return true;
+      const pipeline = pipelineOr503(res);
+      if (pipeline === null) return true;
+      const id = decodeURIComponent(pipelineEntryMatch[1] ?? '');
+      const record = pipeline.entry(id);
+      if (record === null) {
+        json(res, 404, { error: 'not_found', detail: `no pipeline entry "${id}"` });
+        return true;
+      }
+      const live = pipeline.view().entries.find((row) => row.id === id) ?? null;
+      json(res, 200, {
+        entry: record,
+        live_state: live?.state ?? record.state,
+        live_reason: live?.reason ?? (record.state === 'failed' ? record.failureReason : null),
+      });
+      return true;
+    }
+    const pipelineHoldMatch = /^\/api\/pipeline\/entries\/([^/]+)\/(hold|clear-hold|cancel)$/.exec(path);
+    if (req.method === 'POST' && pipelineHoldMatch !== null) {
+      if (!authed(req, res)) return true;
+      const pipeline = pipelineOr503(res);
+      if (pipeline === null) return true;
+      const id = decodeURIComponent(pipelineHoldMatch[1] ?? '');
+      const action = pipelineHoldMatch[2];
+      const body = await readBody(req);
+      const by = byField(body) ?? null;
+      if (action === 'hold') {
+        json(res, 200, pipeline.hold(id, strField(body, 'reason'), { by }));
+        return true;
+      }
+      if (action === 'clear-hold') {
+        json(res, 200, pipeline.clearHold(id, optStrField(body, 'reason') ?? null, { by }));
+        return true;
+      }
+      json(res, 200, pipeline.cancel(id, strField(body, 'reason'), { by }));
       return true;
     }
     // Issue #161: the parent discovers its children (and their durable
@@ -1309,7 +1447,9 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
 
   return {
     requestHook(req, res, path): boolean {
-      if (!path.startsWith('/api/dispatch') && !path.startsWith('/api/silas')) return false;
+      if (!path.startsWith('/api/dispatch') && !path.startsWith('/api/silas') && !path.startsWith('/api/pipeline')) {
+        return false;
+      }
       const startedAt = Date.now();
       handleApi(req, res, path)
         .then((handled) => {

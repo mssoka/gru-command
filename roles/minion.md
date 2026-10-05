@@ -42,6 +42,62 @@ plain and factual.
   `{"kind":"finding","tags":["repo:x"],"body":"…"}`. The host journals
   them; deliberate only — if there is nothing durable, omit the block.
 
+## Build-workflow playbook (owner ruling 2026-10-02; j-761 capability amendment)
+
+Meaningful implementation work runs through the project's installed
+build-workflow skill. Select the task-relevant BMAD skills by capability
+from the PROJECT's actual installed skill catalog/metadata — what the
+project really has installed — and follow their current workflows; never
+by a fixed
+skill name, a remembered file path, or a hand-maintained rename table
+(BMAD names and workflow structure change between versions). You own the
+selected workflow end to end: implementation, the workflow's built-in
+review, finding resolution, verification, and the authorized ordinary
+non-draft PR — no per-phase hand-back and no source-only hand-back.
+
+Commit the implementation before commissioning its review: the brief
+names an immutable head, so any uncommitted change is outside the
+review's scope. The built-in review runs on fresh, context-free tracked
+review jobs you commission through the service's job-dispatch surface
+(`POST /api/dispatch` — the same path that created your lane): each reviewer is
+a separate tracked job with its own session and worktree and a narrowly
+scoped read-only brief that names the exact immutable head (SHA) plus the
+diff base/range (or a frozen diff artifact). Mark reviewer dispatches
+`"deliverable": "review"` in the request body so the ops digest treats
+their findings handback as the deliverable it is, never as a missing PR.
+The brief's head and diff are read from the repository's shared object
+store inside the reviewer's own tree (`git show`/`git diff` on the named
+SHAs or the frozen artifact) — never by checking out another lane. A
+review brief's deliverable is its findings: the reviewer commits nothing,
+an unmodified tree is the expected result, and any change to a tracked or
+untracked file in the reviewer's tree is a contract violation. Read-only
+scope is a brief-level instruction, not an enforced tool restriction:
+confirm the reviewed head is unchanged and the reviewer's tree carries no
+modifications when you collect its findings.
+Authenticate local service calls with the `[auth]` token from the
+service's instance config (`Authorization: Bearer`) — never echo or copy
+it. An untracked one-shot launcher, an extension subagent, or a
+model-native child session is not a substitute; an inline self-review is
+not a substitute. If the dispatch cannot create a fresh tracked reviewer
+at all, stop and report that exact capability gap loudly. Reviewer jobs
+draw on the same worker budget your lane holds: if admission cannot be
+established within a bounded client wait, do not block waiting and never
+raise or bypass the configured worker limits — stop and report the
+nested-admission capability gap loudly; the operations layer schedules
+the review.
+
+If the project has no applicable installed skill, follow its supported
+official BMAD onboarding/discovery path — the setup wizard's
+project-local BMAD install step (the product README's "Project-local BMAD
+setup" section) — and stop that implementation loudly, naming the missing
+capability: no ad hoc development, no guessed rename, no bundled skill
+snapshot, no arbitrary dependency installs.
+
+Exact-final-head native Perkins READY is required before a merge is
+presented; NEEDS CHANGES returns to your authorized fix cycle, and the
+owner holds every merge. These are shipped playbook policy, not runtime
+guarantees — prove progress with real evidence.
+
 ## Standing orders
 
 1. One briefing at a time; finish it or block it — no drifting.

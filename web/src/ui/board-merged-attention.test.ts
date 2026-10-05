@@ -143,6 +143,7 @@ function mountBoardDom(): void {
       <span id="board-unacked" hidden></span>
       <span id="board-wakes" hidden></span>
     </div>
+    <nav id="board-nav" hidden></nav>
     <section id="board-owner" hidden></section>
     <div id="board-jobs"></div>
     <div id="board-agents"></div>
@@ -156,6 +157,20 @@ function bandIds(band: string): string[] {
   return [...document.querySelectorAll<HTMLElement>(`.board-band--${band} .board-job`)].map(
     (row) => row.dataset.jobId ?? '',
   );
+}
+
+/** FOR GRU is collapsed by default (owner approval j-1064); these tests
+ * assert CLASSIFICATION, so the machine queue is deliberately revealed
+ * first — an empty band keeps its calm clear state either way. COLD is
+ * count-only by default for the same reason. */
+function expandForGru(): void {
+  const toggle = document.querySelector<HTMLButtonElement>('.board-band--needs-you .board-band__more');
+  if (toggle !== null && toggle.getAttribute('aria-expanded') === 'false') toggle.click();
+}
+
+function expandCold(): void {
+  const toggle = document.querySelector<HTMLButtonElement>('.board-band--cold .board-band__more');
+  if (toggle !== null && toggle.getAttribute('aria-expanded') === 'false') toggle.click();
 }
 
 describe('board rendered regression — concluded jobs and stale review history', () => {
@@ -193,6 +208,7 @@ describe('board rendered regression — concluded jobs and stale review history'
       'nothing needs Gru',
     );
     expect(bandIds('settled')).toEqual(['lane-parity-fix']);
+    expandCold();
     expect(bandIds('cold')).toEqual(['lane-audit-fix']);
   });
 
@@ -202,6 +218,7 @@ describe('board rendered regression — concluded jobs and stale review history'
       snapshot({ jobs: [job({ id: 'lane-archive', status: 'done', rounds: concludedHistory({ id: 'lane-archive' }) })] }),
     );
     expect(bandIds('needs-you')).toEqual([]);
+    expandCold();
     expect(bandIds('cold')).toEqual(['lane-archive']);
   });
 
@@ -251,6 +268,7 @@ describe('board rendered regression — concluded jobs and stale review history'
         ],
       }),
     );
+    expandForGru();
     const expected = ['lane-blocked', 'lane-error', 'lane-conflict', 'lane-reopened', 'lane-delivered', 'lane-parked'];
     expect([...bandIds('needs-you')].sort()).toEqual([...expected].sort());
   });

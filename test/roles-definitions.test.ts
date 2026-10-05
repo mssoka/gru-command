@@ -106,6 +106,45 @@ describe('role definitions (E8)', () => {
   });
 });
 
+describe('build-workflow playbook (owner ruling 2026-10-02; j-761 capability amendment)', () => {
+  const minion = ROLE_DEFINITIONS.minion.systemPrompt.replace(/\s+/gu, ' ');
+  const silas = ROLE_DEFINITIONS.silas.systemPrompt.replace(/\s+/gu, ' ');
+
+  it('the worker selects the installed build-workflow skill by capability and owns the cycle end to end', () => {
+    expect(minion).toContain("the PROJECT's actual installed skill catalog/metadata");
+    expect(minion).toContain('task-relevant BMAD skills by capability');
+    expect(minion).toContain('never by a fixed skill name, a remembered file path, or a hand-maintained rename table');
+    expect(minion).toContain('You own the');
+    expect(minion).toContain('no per-phase hand-back and no source-only hand-back');
+    // The literal fixed-name requirement is retired (j-761): no bmad-* token
+    // may appear as a required skill name in the worker prompt.
+    expect(minion).not.toMatch(/bmad-build/);
+  });
+
+  it('the built-in review runs on fresh tracked review jobs with read-only briefs', () => {
+    expect(minion).toContain('fresh, context-free tracked review jobs');
+    expect(minion).toContain('`POST');
+    expect(minion).toContain('/api/dispatch');
+    expect(minion).toContain('a separate tracked job with its own session and worktree');
+    expect(minion).toContain('read-only brief');
+    expect(minion).toContain('"deliverable": "review"');
+    expect(minion).toContain('an inline self-review is not a substitute');
+    // The loud missing-capability stop names the official onboarding path.
+    expect(minion).toContain("Project-local BMAD");
+    expect(minion).not.toContain('pi -p');
+    expect(minion).not.toContain('claude -p');
+  });
+
+  it('the ops persona carries the minion-owned build cycle without fixed names', () => {
+    expect(silas).toContain('Minion-owned build cycle');
+    expect(silas).toContain("selects the task-relevant BMAD skills from the project's actual installed catalog");
+    expect(silas).toContain('never demand a fixed skill name');
+    expect(silas).toContain('"deliverable": "review"');
+    expect(silas).toContain('exact-final-head READY');
+    expect(silas).not.toContain('bmad-build');
+  });
+});
+
 describe('role prompt files ship in the package', () => {
   it('all five markdown files exist next to the definitions', () => {
     // Loaded at import time (fail-loud); reaching here already proves it.

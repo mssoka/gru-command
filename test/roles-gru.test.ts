@@ -28,8 +28,16 @@ describe('gru role definition', () => {
     expect(prompt).toContain('single-writer');
     expect(prompt).toContain('UNTRUSTED DATA');
     expect(prompt).toContain('POST /api/notifications/needs-owner');
-    expect(prompt).toContain('Perkins must be READY on the exact final head');
-    expect(prompt).toContain('Elsewhere the owner decides');
+    expect(prompt).toContain('exact-final-head native Perkins READY');
+    expect(prompt).toContain('The owner holds every merge, everywhere');
+    expect(prompt).toContain('merge yourself');
+  });
+
+  it('the chief hands workers the whole build and presents merges only on exact-final-head Perkins READY', () => {
+    const gru = ROLE_DEFINITIONS.gru.systemPrompt.replace(/\s+/gu, ' ');
+    expect(gru).toContain('Hand workers the whole build');
+    expect(gru).toContain('the owner holds');
+    expect(gru).toContain('every merge');
   });
 
   it('the role config maps the permission set (tools + workspace cwd)', () => {

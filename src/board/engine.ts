@@ -8,6 +8,7 @@ import type { DecisionRuntimeStatus } from '../decisions/runtime.js';
 import type { DeployDriftView } from './deploy-drift.js';
 import type { VerificationQueueView } from '../verify/scheduler.js';
 import type { PacingGateView } from '../runtime/pacing.js';
+import type { PipelineBoardView } from '../ledger/pipeline.js';
 import { ownerReadyPr, readBranchEvidence, type OwnerPrView } from './owner-actions.js';
 import {
   DEFAULT_LENSES,
@@ -260,6 +261,10 @@ export interface BoardSnapshot {
   /** Provider pacing gate (limits, running, queued with reasons). Null when
    * the pacing feature is off — the pre-pacing snapshot shape. */
   readonly pacing: PacingGateView | null;
+  /** Durable approved pipeline queue (owner approvals j-239/j-1064):
+   * waiting/ready work with exact reasons, deterministic order. Null when
+   * the queue is not hosted (pre-upgrade/pre-wiring shape). */
+  readonly pipeline: PipelineBoardView | null;
   /** Issue #161: tracker-wide child counters. Present-state counts
    * (queued/active/finished) are derived from the durable child_workers
    * rows; `lifetimeCreations` is the row count (one per LOGICAL child
@@ -420,6 +425,8 @@ export interface BoardEngineOptions {
   readonly verifyQueue?: () => VerificationQueueView | null;
   /** Provider pacing: gate view (late-bound; null when the feature is off). */
   readonly pacing?: () => PacingGateView | null;
+  /** Durable pipeline queue projection (late-bound; null when unwired). */
+  readonly pipeline?: () => PipelineBoardView | null;
   /** Board UX v4: self-heal stats (no producer yet; null renders n/a). */
   readonly selfHeal?: () => SelfHealView | null;
   /** Clock seam for the day-boundary health derivations. */
@@ -455,6 +462,7 @@ export class BoardEngine {
     this.buildDrift = opts.buildDrift ?? (() => null);
     this.verifyQueue = opts.verifyQueue ?? (() => null);
     this.pacing = opts.pacing ?? (() => null);
+    this.pipeline = opts.pipeline ?? (() => null);
     this.selfHeal = opts.selfHeal ?? (() => null);
     this.now = opts.now ?? Date.now;
     this.bus.subscribe(() => this.notifyChanged());
@@ -470,6 +478,7 @@ export class BoardEngine {
   private readonly buildDrift: () => DeployDriftView | null;
   private readonly verifyQueue: () => VerificationQueueView | null;
   private readonly pacing: () => PacingGateView | null;
+  private readonly pipeline: () => PipelineBoardView | null;
   private readonly selfHeal: () => SelfHealView | null;
   private readonly now: () => number;
 
@@ -732,6 +741,7 @@ export class BoardEngine {
       silas: this.silasView(silasTurnOpen),
       verify: this.verifyQueue(),
       pacing: this.pacing(),
+      pipeline: this.pipeline(),
       selfHeal: this.selfHeal(),
       ownerPrs: this.ownerPrs(repos),
     };

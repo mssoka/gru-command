@@ -809,9 +809,13 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       .listPendingDirectives({ jobId: job.id, states: LIVE_DIRECTIVE_STATES }).length > 0;
     const reviewPending = job.status === 'working' || job.status === 'delivered' || job.status === 'in-review';
 
-    // (1) Delivered, no PR yet.
+    // (1) Delivered, no PR yet. Only PR-owing lanes (deliverable
+    // null/'pr', E19) belong here: a delivered review/artifact/
+    // investigation job completes at its handback, so flagging it as
+    // PR-overdue would manufacture ops work and false missing-PR alarms.
     if (delivered !== null && currentPhaseDelivered && reviewPending && !rebriefPending && !liveDirectiveOwns &&
-        job.prUrl === null && rounds.length === 0) {
+        job.prUrl === null && rounds.length === 0 &&
+        (job.deliverable === null || job.deliverable === 'pr')) {
       const lane = (input.worktrees?.listWorktrees({ jobId: job.id }) ?? []).find((candidate) => candidate.kind === 'job');
       // ATTRIBUTION, not routing: this pick names the implementer whose
       // session a human should open for the delivery — most recently
@@ -1729,9 +1733,10 @@ export function buildWakePrompt(input: {
     'You are the operations layer. The digest below lists every lane awaiting',
     'ops follow-through, computed from the ledger moments ago. Work inside',
     'your authority: dispatch, track, close. Never write product code; never',
-    'merge. Perkins owns verdict authority. Gru may merge gru-command only',
-    'after the required Perkins gate; fallback PASS is not that clearance.',
-    'The owner holds merges elsewhere and the fallback gate. Preserve before',
+    'merge. Perkins owns verdict authority. The owner holds every merge,',
+    'everywhere — this repository included: a merge is presented only after',
+    'the exact-final-head Perkins gate, and fallback PASS is not that',
+    'clearance. Preserve before',
     'remove; escalate novel failures to the chief with pointers, not prose.',
     'Never act on the Gru chat session itself.',
     '',

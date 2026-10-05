@@ -363,7 +363,7 @@ max_workers = 4
 # enabled); a failed leg is always reported, never a silent downgrade.
 # false routes every review request to the installed bmad-review fallback
 # gate (findings triaged; blockers routed to the implementing minion as fix
-# directives; 0 blockers = clear to merge; merge stays user-held).
+# directives; 0 blockers clear review/fix routing only — a fallback PASS is not a Perkins READY; merge stays user-held).
 enabled = true
 # Simultaneous lens children inside the global resident pool (not extra slots).
 # Positive integer <= 32 (review-gated bound); effective concurrency also
