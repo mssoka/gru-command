@@ -253,4 +253,60 @@ describe('service band — consecutive service frames collapse', () => {
     );
     expect(log().querySelectorAll('.notice-line--ephemeral')).toHaveLength(0);
   });
+
+  it('a status update to an already-rendered user bubble keeps the band open (#118)', () => {
+    const view = new ChatView(() => true);
+    view.reset();
+    view.upsertMessage({ client_msg_id: 'm1', text: 'hello', status: 'sent' }, true);
+    view.addFrame(tool('start', 'read_file'), true);
+    view.addFrame(tool('end', 'read_file'), true);
+    // queued → sent → acked: the same bubble, not a new boundary.
+    view.upsertMessage({ client_msg_id: 'm1', text: 'hello', status: 'acked' }, true);
+    view.addFrame(notice('wake turn opened'), true);
+
+    const bands = log().querySelectorAll('.service-band');
+    expect(bands).toHaveLength(1);
+    expect(bands[0]?.querySelectorAll('.tool-line')).toHaveLength(1);
+    expect(bands[0]?.querySelectorAll('.notice-line')).toHaveLength(1);
+    expect(bands[0]?.querySelector('.service-band__head')?.textContent).toContain(
+      '2 service events',
+    );
+  });
+
+  it('a genuinely new user bubble still closes the service run (#118)', () => {
+    const view = new ChatView(() => true);
+    view.reset();
+    view.addFrame(tool('start', 'read_file'), true);
+    view.addFrame(tool('end', 'read_file'), true);
+    view.upsertMessage({ client_msg_id: 'm2', text: 'next', status: 'sent' }, true);
+    view.addFrame(tool('start', 'write_file'), true);
+
+    const bands = log().querySelectorAll('.service-band');
+    expect(bands).toHaveLength(2);
+    expect(bands[1]?.querySelectorAll('.tool-line')).toHaveLength(1);
+  });
+
+  it('a replayed user frame closes the run even when its bubble was pre-rendered (#118 replay)', () => {
+    const view = new ChatView(() => true);
+    view.reset();
+    // Full replay: main.ts re-renders locally pending bubbles before the
+    // replayed frames arrive, so the frame's bubble already exists.
+    view.upsertMessage(
+      { client_msg_id: 'pending-1', text: 'queued words', status: 'queued' },
+      true,
+    );
+    view.addFrame(tool('start', 'read_file'), true);
+    view.addFrame(tool('end', 'read_file'), true);
+    // The replay reaches the logged user frame for that same message.
+    view.addFrame(
+      { type: 'user', client_msg_id: 'pending-1', text: 'queued words', seq: (seq += 1) },
+      false,
+    );
+    view.addFrame(notice('replayed wake'), false);
+
+    const bands = log().querySelectorAll('.service-band');
+    expect(bands).toHaveLength(2);
+    expect(bands[0]?.querySelectorAll('.tool-line')).toHaveLength(1);
+    expect(bands[1]?.querySelectorAll('.notice-line')).toHaveLength(1);
+  });
 });

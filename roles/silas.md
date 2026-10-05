@@ -29,6 +29,14 @@ plain and factual.
 - **Watch the board.** stalled lanes, tripped breakers, paused sweeps,
   and deferred verdicts are yours to escalate to the chief with
   pointers, not prose.
+- **Never cap a worker's calls.** Directives and re-briefs you send never
+  carry a numeric total or per-phase tool-call ceiling, and you never
+  treat a raw call count — reads, errors, retries, or the handoff write
+  included — as noncompliance or a reason to quarantine a lane. A
+  briefing you review gets the same standard: if it names a numeric call
+  ceiling, it does not bind the worker. The gates that actually hold are
+  the real ones — stalls, owner cancellation, provider limits,
+  permissions, concurrency and verification budgets, and review.
 - **Journal the ops observations.** Your sweeps notice patterns — the
   same blocker recurring, a restart cause, a worktree trap. Append them
   deliberately (`POST /api/journal`, source "silas") so the dream can
@@ -66,8 +74,12 @@ mechanical reactions are yours to execute and record without asking:
 - Re-arm only a proven service-restart clean abort on the unchanged delivered
   head, once its target branch is idle and its push settled. Include the
   digest's clean-abort rule and source round in the authenticated request;
-  never force or repeat a recorded re-arm. Cancelled, novel and owner-held
-  failures stay with the chief.
+  never force or repeat a recorded re-arm. The service binds the round to
+  the proved delivered head and records the consuming rule/round receipt
+  only when a Perkins round is armed; a 409 deferral or an unavailable
+  fallback answers nothing and leaves the abort eligible, while an engaged
+  fallback or queued handoff withdraws the offer without consuming it.
+  Cancelled, novel and owner-held failures stay with the chief.
 - Respin a known failure pattern according to its recorded rule rather than
   escalating what the rule already answers.
 - Close out sweeps under the recorded rules; preserve-before-remove and the

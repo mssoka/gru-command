@@ -21,9 +21,9 @@ import { DEFAULT_REVIEW_CHILDREN } from '../src/config.js';
 import { PerkinsWholeReview, STANDALONE_SPECIALIST_CONCURRENCY, type PerkinsWholeResult, type PerkinsWholeReviewOptions } from '../src/dispatch/perkins-review/whole.js';
 import { ReviewMcpBridge } from '../src/runtime/review-mcp-bridge.js';
 import { finalAssistantText } from '../src/dispatch/perkins-review/session-output.js';
-import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
+import { attachBareOrigin, makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 import { PacingGate, type PacingAcquireInput, type PacingLease } from '../src/runtime/pacing.js';
-import { fakeWholeSpawner, groundedFinding, type WholeLeadOptions, type WholeSpawnCall, type WholeSubmission } from './helpers/perkins-whole-double.js';
+import { fakeWholeSpawner, groundedFinding, type WholeLeadOptions, type WholeSpawnCall } from './helpers/perkins-whole-double.js';
 import type { NativeAgentTool } from '../src/runtime/types.js';
 
 const repos: FixtureRepo[] = [];
@@ -57,6 +57,9 @@ interface WholeHarness {
   readonly childCalls: ReturnType<typeof fakeWholeSpawner>['childCalls'];
   readonly toolErrors: ReturnType<typeof fakeWholeSpawner>['toolErrors'];
   readonly preflightResults: ReturnType<typeof fakeWholeSpawner>['preflightResults'];
+  readonly attemptedBatches: ReturnType<typeof fakeWholeSpawner>['attemptedBatches'];
+  readonly runBatches: ReturnType<typeof fakeWholeSpawner>['runBatches'];
+  readonly probeOutcomes: ReturnType<typeof fakeWholeSpawner>['probeOutcomes'];
   run(input?: { noSpec?: boolean; priorConsolidatedFile?: string }): Promise<PerkinsWholeResult>;
 }
 
@@ -67,6 +70,9 @@ function wholeHarness(
     spec?: string;
     priorConsolidatedFile?: string;
     beforeFreeze?: (repo: FixtureRepo) => void;
+    /** Named base ref to freeze (`main`, `origin/main`); default pins the
+     * base by SHA, which can never advance. */
+    baseRef?: string;
     reviewGate?: PacingGate;
     pacing?: Pick<PerkinsWholeReviewOptions, 'rateLimitBackoff' | 'recordPacing' | 'pacingSleep' | 'pacingJitter' | 'pacingNow'>;
   },
@@ -74,14 +80,14 @@ function wholeHarness(
   const fixture = makeReviewRepo();
   repos.push(fixture.repo);
   options?.beforeFreeze?.(fixture.repo);
-  const base = fixture.repo.git(['rev-parse', 'main']);
+  const base = fixture.repo.git(['rev-parse', options?.baseRef ?? 'main']);
   const target = fixture.repo.head();
   const root = temp('perkins-whole-test-');
   const frozen = freezeReviewInputs({
     roundId: 'whole-round',
     repoPath: fixture.repo.path,
     artifactRoot: root,
-    baseRef: base,
+    baseRef: options?.baseRef ?? base,
     targetRef: target,
     movementRef: 'feature/review',
     ...(options?.noSpec === true
@@ -106,6 +112,9 @@ function wholeHarness(
     childCalls: fake.childCalls,
     toolErrors: fake.toolErrors,
     preflightResults: fake.preflightResults,
+    attemptedBatches: fake.attemptedBatches,
+    runBatches: fake.runBatches,
+    probeOutcomes: fake.probeOutcomes,
     run: (input = {}) => engine.run({
       roundId: 'whole-round',
       roundNumber: 1,
@@ -120,6 +129,44 @@ function wholeHarness(
 }
 
 const ALL_CLEAN: WholeLeadOptions = { childAnswer: () => '[]', specialists: [] };
+
+/** Advance `branch` by one commit without touching any checkout (a merge
+ * landing on the base mid-review). `cwd` targets another repository, e.g.
+ * the bare origin, so only its advertised tip moves. */
+function advanceBranch(repo: FixtureRepo, branch: string, cwd?: string): string {
+  const next = repo.git([
+    '-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid',
+    'commit-tree', `${branch}^{tree}`, '-p', branch, '-m', `${branch} advances during review`,
+  ], cwd);
+  repo.git(['update-ref', `refs/heads/${branch}`, next], cwd);
+  return next;
+}
+
+/** Attempt 1 submits the conclusive verdict; attempt 2 falls back to INCOMPLETE. */
+function incompleteOnRetry(attempt: number, submission: { verdict: string; report_markdown: string }): unknown {
+  return attempt === 1
+    ? submission
+    : { ...submission, verdict: 'INCOMPLETE', report_markdown: submission.report_markdown.replace(/\*\*Verdict: [^*]+\*\*/, '**Verdict: INCOMPLETE**') };
+}
+
+/** A base-only advance leaves the frozen target valid: preflight ok, the
+ * conclusive verdict accepted first time, and the frozen base kept as
+ * provenance (never rewritten to the live tip). */
+function expectBaseAdvanceAccepted(h: WholeHarness, result: PerkinsWholeResult): void {
+  expect(h.preflightResults).toHaveLength(1);
+  expect(JSON.parse(h.preflightResults[0]!.text)).toMatchObject({ ok: true, errorCount: 0 });
+  expect(h.toolErrors.filter((entry) => entry.tool === 'perkins_submit_review')).toEqual([]);
+  expect(result.canonicalVerdict).toBe('READY TO MERGE');
+  expect(result.headMoved).toBe(false);
+  const consolidated = JSON.parse(readFileSync(join(result.artifactDirectory, 'consolidated.json'), 'utf8')) as {
+    complete: boolean; headMoved: boolean; frozen: Record<string, unknown>;
+  };
+  expect(consolidated.complete).toBe(true);
+  expect(consolidated.headMoved).toBe(false);
+  const frozenProvenance = { baseRefSha: h.base, diffBaseSha: h.base, targetSha: h.target, diffSha256: h.frozen.manifest.diffSha256 };
+  expect(consolidated.frozen).toMatchObject(frozenProvenance);
+  expect(JSON.parse(readFileSync(join(h.frozen.directory, 'manifest.json'), 'utf8'))).toMatchObject(frozenProvenance);
+}
 
 describe('bundled Perkins policy (whole-PR contract)', () => {
   it('loads the integrity-pinned whole-PR policy with the lead workflow and no chunk rule', () => {
@@ -335,7 +382,7 @@ describe('Perkins whole-PR lead engine', () => {
     });
     const result = await h.run();
     expect(result.canonicalVerdict).toBe('READY TO MERGE');
-    expect(h.childCalls).toHaveLength(7);
+    expect(h.childCalls).toHaveLength(9);
     for (const call of h.childCalls) {
       expect(call.options.isolatedReview).toBeDefined();
       expect(call.options.reviewLead).toBeUndefined();
@@ -355,11 +402,33 @@ describe('Perkins whole-PR lead engine', () => {
     }
   });
 
-  it('uses exactly six specialists in explicit no-spec mode', async () => {
+  it('uses exactly eight specialists in explicit no-spec mode, omitting only acceptance', async () => {
     const h = wholeHarness({ childAnswer: () => '[]' }, { noSpec: true });
     await h.run();
-    expect(h.childCalls).toHaveLength(6);
+    expect(h.childCalls).toHaveLength(8);
     expect(h.childCalls.some((call) => call.prompt!.includes('EXPLICIT NO-SPEC REVIEW'))).toBe(true);
+    // The spec-dependent lens is the ONLY omission: the two spec-independent
+    // newcomers (performance, operations) are available and run.
+    expect(h.childCalls.some((call) => call.prompt!.includes('"source": "acceptance"'))).toBe(false);
+    expect(h.childCalls.some((call) => call.prompt!.includes('"source": "performance"'))).toBe(true);
+    expect(h.childCalls.some((call) => call.prompt!.includes('"source": "operations"'))).toBe(true);
+  });
+
+  it('a performance and an operations finding survive child validation, lead submission and attribution', async () => {
+    const h = wholeHarness({
+      childAnswer: (prompt) => {
+        const source = /"source": "(performance|operations)"/u.exec(prompt)?.[1];
+        return source === undefined ? '[]' : JSON.stringify([groundedFinding(source, 'warning')]);
+      },
+    });
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    // Attribution is by the NEW source ids and nothing else: each finding
+    // crossed child validation, lead consolidation and the submission schema.
+    expect(result.findings.map((finding) => finding.source).sort()).toEqual(['operations', 'performance']);
+    expect(result.specialistRuns
+      .filter((run) => run.lens === 'performance' || run.lens === 'operations')
+      .every((run) => run.status === 'valid' && run.attempt === 1)).toBe(true);
   });
 
   it('a REQUEST_CHANGES review is successful completion, not an orchestration failure', async () => {
@@ -497,21 +566,46 @@ describe('Perkins whole-PR lead engine', () => {
     expect(preflight.errors.map((error) => error.rule)).toContain('submission-verdict');
   });
 
-  it('rejects an empty/missing verdict, an empty report, and a report omitting the verdict line or frozen identity', async () => {
-    const cases: ReadonlyArray<{ name: string; mutate: (submission: WholeSubmission) => Record<string, unknown>; pattern: RegExp }> = [
-      { name: 'missing verdict', mutate: (s) => ({ ...s, verdict: undefined }), pattern: /submission-verdict/ },
-      { name: 'empty report', mutate: (s) => ({ ...s, report_markdown: '' }), pattern: /report-shape/ },
-      { name: 'verdict line missing', mutate: (s) => ({ ...s, report_markdown: s.report_markdown.replace(/\*\*Verdict: READY TO MERGE\*\*/, '**Verdict: UNKNOWN**') }), pattern: /report-verdict/ },
-      { name: 'frozen identity missing', mutate: (s) => ({ ...s, report_markdown: s.report_markdown.replace(/^Frozen target: .+$/m, 'Frozen target: redacted') }), pattern: /report-identity/ },
-    ];
-    for (const testCase of cases) {
-      const h = wholeHarness({
-        ...ALL_CLEAN,
-        submitPayload: (_attempt, submission) => testCase.mutate(submission) as never,
-        submitRetries: 0,
-      });
-      await expect(h.run()).rejects.toThrow(testCase.pattern);
-    }
+  it('report rejection: a missing verdict is refused', async () => {
+    const h = wholeHarness({
+      ...ALL_CLEAN,
+      submitPayload: (_attempt, submission) => ({ ...submission, verdict: undefined }) as never,
+      submitRetries: 0,
+    });
+    await expect(h.run()).rejects.toThrow(/submission-verdict/);
+  });
+
+  it('report rejection: an empty report is refused', async () => {
+    const h = wholeHarness({
+      ...ALL_CLEAN,
+      submitPayload: (_attempt, submission) => ({ ...submission, report_markdown: '' }) as never,
+      submitRetries: 0,
+    });
+    await expect(h.run()).rejects.toThrow(/report-shape/);
+  });
+
+  it('report rejection: a report omitting the verdict line is refused', async () => {
+    const h = wholeHarness({
+      ...ALL_CLEAN,
+      submitPayload: (_attempt, submission) => ({
+        ...submission,
+        report_markdown: submission.report_markdown.replace(/\*\*Verdict: READY TO MERGE\*\*/, '**Verdict: UNKNOWN**'),
+      }) as never,
+      submitRetries: 0,
+    });
+    await expect(h.run()).rejects.toThrow(/report-verdict/);
+  });
+
+  it('report rejection: a report omitting the frozen identity is refused', async () => {
+    const h = wholeHarness({
+      ...ALL_CLEAN,
+      submitPayload: (_attempt, submission) => ({
+        ...submission,
+        report_markdown: submission.report_markdown.replace(/^Frozen target: .+$/m, 'Frozen target: redacted'),
+      }) as never,
+      submitRetries: 0,
+    });
+    await expect(h.run()).rejects.toThrow(/report-identity/);
   });
 
   it('preflight is free and exhaustive; a rejected submission is corrected and accepted within the real attempt bound', async () => {
@@ -588,6 +682,181 @@ describe('Perkins whole-PR lead engine', () => {
     expect(first?.error).toMatch(/head-moved/);
   });
 
+  it('a local base advance alone keeps the frozen target valid: preflight ok, READY accepted, base provenance kept', async () => {
+    const h = wholeHarness({
+      ...ALL_CLEAN,
+      preflight: { calls: 1 },
+      // `main` advances (a merge lands) before preflight and submit; the
+      // reviewed branch and the checkout are untouched.
+      beforeSubmit: () => { advanceBranch(h.repo, 'main'); },
+    }, { baseRef: 'main' });
+    const result = await h.run();
+    expect(h.repo.git(['rev-parse', 'main'])).not.toBe(h.base);
+    expect(h.frozen.manifest.baseRef).toBe('main');
+    expectBaseAdvanceAccepted(h, result);
+  });
+
+  it('an advertised remote base advance alone keeps the frozen target valid', async () => {
+    let origin = '';
+    const h = wholeHarness({
+      ...ALL_CLEAN,
+      preflight: { calls: 1 },
+      // origin's main advances on the host only: the local tracking ref
+      // stays at the frozen base, so the advertised tip alone moved.
+      beforeSubmit: () => { advanceBranch(h.repo, 'main', origin); },
+    }, {
+      baseRef: 'origin/main',
+      beforeFreeze: (repo) => {
+        origin = attachBareOrigin(repo);
+        repo.git(['push', '--quiet', 'origin', 'refs/heads/main']);
+      },
+    });
+    const result = await h.run();
+    expect(h.repo.git(['rev-parse', 'refs/remotes/origin/main'])).toBe(h.base);
+    expect(h.repo.git(['ls-remote', 'origin', 'refs/heads/main']).split(/\s+/u)[0]).not.toBe(h.base);
+    expect(h.frozen.manifest.baseRef).toBe('origin/main');
+    expectBaseAdvanceAccepted(h, result);
+  });
+
+  it('a target move alongside a base advance still rejects a conclusive verdict', async () => {
+    const h = wholeHarness({
+      ...ALL_CLEAN,
+      beforeSubmit: () => {
+        advanceBranch(h.repo, 'main');
+        advanceBranch(h.repo, 'feature/review');
+      },
+      submitRetries: 1,
+      submitPayload: incompleteOnRetry,
+    }, { baseRef: 'main' });
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('INCOMPLETE');
+    expect(result.headMoved).toBe(true);
+    const first = h.toolErrors.find((entry) => entry.tool === 'perkins_submit_review');
+    expect(first?.error).toMatch(/head-moved.*target-moved/);
+  });
+
+  it('an untracked file in the review checkout rejects a conclusive verdict as head-moved', async () => {
+    const h = wholeHarness({
+      ...ALL_CLEAN,
+      beforeSubmit: () => { writeFileSync(join(h.repo.path, 'stray.txt'), 'outside the target commit\n'); },
+      submitRetries: 1,
+      submitPayload: incompleteOnRetry,
+    }, { baseRef: 'main' });
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('INCOMPLETE');
+    expect(result.headMoved).toBe(true);
+    const first = h.toolErrors.find((entry) => entry.tool === 'perkins_submit_review');
+    expect(first?.error).toMatch(/head-moved.*checkout-changed/);
+  });
+
+  it('a rewritten base (main replaced by an orphan commit) still rejects a conclusive verdict', async () => {
+    let orphan = '';
+    const h = wholeHarness({
+      ...ALL_CLEAN,
+      // A force-push that drops the frozen merge-base: the new `main` does
+      // not descend from diffBaseSha, so the PR delta can exceed the frozen
+      // diff even though the reviewed branch is untouched.
+      beforeSubmit: () => {
+        orphan = h.repo.git([
+          '-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid',
+          'commit-tree', 'main^{tree}', '-m', 'main rewritten during review',
+        ]);
+        h.repo.git(['update-ref', 'refs/heads/main', orphan]);
+      },
+      submitRetries: 1,
+      submitPayload: incompleteOnRetry,
+    }, { baseRef: 'main' });
+    const result = await h.run();
+    expect(h.repo.git(['rev-parse', 'main'])).toBe(orphan);
+    expect(h.repo.git(['rev-list', '--max-parents=0', 'main'])).toBe(orphan);
+    expect(result.canonicalVerdict).toBe('INCOMPLETE');
+    expect(result.headMoved).toBe(true);
+    const first = h.toolErrors.find((entry) => entry.tool === 'perkins_submit_review');
+    expect(first?.error).toMatch(/head-moved.*base-rewritten/);
+  });
+
+  it('a deleted base ref still rejects a conclusive verdict', async () => {
+    const h = wholeHarness({
+      ...ALL_CLEAN,
+      // The frozen base no longer resolves (deleted or retargeted away):
+      // reviewed-target validity cannot be shown, so it fails closed.
+      beforeSubmit: () => { h.repo.git(['update-ref', '-d', 'refs/heads/main']); },
+      submitRetries: 1,
+      submitPayload: incompleteOnRetry,
+    }, { baseRef: 'main' });
+    const result = await h.run();
+    expect(() => h.repo.git(['rev-parse', '--verify', '--quiet', 'refs/heads/main'])).toThrow();
+    expect(result.canonicalVerdict).toBe('INCOMPLETE');
+    expect(result.headMoved).toBe(true);
+    const first = h.toolErrors.find((entry) => entry.tool === 'perkins_submit_review');
+    expect(first?.error).toMatch(/head-moved.*base-unresolvable/);
+  });
+
+  it('a git remote lookup failure rejects a conclusive verdict with its error', async () => {
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    const shimDir = temp('perkins-git-shim-');
+    const shim = join(shimDir, 'git');
+    const credentialUrl = 'https://user:secret-token@code.example.invalid/acme/fixture?access_token=another-secret';
+    writeFileSync(shim, `#!/bin/sh\ncase " $* " in *" remote "*) printf '%s\\n' "fatal: unable to access '${credentialUrl}': simulated remote listing failure" >&2; exit 2;; esac\nexec "${realGit}" "$@"\n`);
+    chmodSync(shim, 0o755);
+    const h = wholeHarness({ ...ALL_CLEAN, submitRetries: 1, submitPayload: incompleteOnRetry });
+    const oldPath = process.env.PATH;
+    try {
+      process.env.PATH = `${shimDir}:${oldPath ?? ''}`;
+      const result = await h.run();
+      expect(result.canonicalVerdict).toBe('INCOMPLETE');
+      expect(result.headMoved).toBe(true);
+      const first = h.toolErrors.find((entry) => entry.tool === 'perkins_submit_review');
+      expect(first?.error).toMatch(/head-moved.*check-failed.*simulated remote listing failure/);
+      expect(first?.error).not.toContain('secret-token');
+      expect(first?.error).not.toContain('another-secret');
+      expect(result.sourceMovement).toEqual({
+        cause: 'check-failed',
+        detail: "fatal: unable to access '[REDACTED URL]': simulated remote listing failure",
+      });
+    } finally {
+      if (oldPath === undefined) delete process.env.PATH;
+      else process.env.PATH = oldPath;
+    }
+  });
+
+  it('a base rewound to the frozen merge-base still contains it and keeps the frozen target valid', async () => {
+    let mergeBase = '';
+    const h = wholeHarness({
+      ...ALL_CLEAN,
+      preflight: { calls: 1 },
+      // `main` is rewound below the frozen base tip but still contains the
+      // frozen merge-base: the ancestry anchor is diffBaseSha, not baseRefSha.
+      beforeSubmit: () => { h.repo.git(['update-ref', 'refs/heads/main', h.frozen.manifest.diffBaseSha]); },
+    }, {
+      baseRef: 'main',
+      // `main` is already ahead of the branch point at freeze time, so the
+      // frozen base tip and the frozen merge-base differ.
+      beforeFreeze: (repo) => {
+        mergeBase = repo.git(['rev-parse', 'main']);
+        advanceBranch(repo, 'main');
+      },
+    });
+    expect(h.frozen.manifest.baseRefSha).toBe(h.base);
+    expect(h.frozen.manifest.diffBaseSha).toBe(mergeBase);
+    expect(h.frozen.manifest.baseRefSha).not.toBe(h.frozen.manifest.diffBaseSha);
+    const result = await h.run();
+    expect(h.repo.git(['rev-parse', 'main'])).toBe(mergeBase);
+    expect(h.preflightResults).toHaveLength(1);
+    expect(JSON.parse(h.preflightResults[0]!.text)).toMatchObject({ ok: true, errorCount: 0 });
+    expect(h.toolErrors.filter((entry) => entry.tool === 'perkins_submit_review')).toEqual([]);
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    expect(result.headMoved).toBe(false);
+    const consolidated = JSON.parse(readFileSync(join(result.artifactDirectory, 'consolidated.json'), 'utf8')) as {
+      complete: boolean; headMoved: boolean; frozen: Record<string, unknown>;
+    };
+    expect(consolidated.complete).toBe(true);
+    expect(consolidated.headMoved).toBe(false);
+    const frozenProvenance = { baseRefSha: h.base, diffBaseSha: mergeBase, targetSha: h.target, diffSha256: h.frozen.manifest.diffSha256 };
+    expect(consolidated.frozen).toMatchObject(frozenProvenance);
+    expect(JSON.parse(readFileSync(join(h.frozen.directory, 'manifest.json'), 'utf8'))).toMatchObject(frozenProvenance);
+  });
+
   it('a failed specialist run is an honest execution fact — never a missing reviewer and never a block', async () => {
     let testsAnswers = 0;
     const h = wholeHarness({
@@ -661,6 +930,24 @@ describe('Perkins whole-PR lead engine', () => {
     )).toBe(true);
     // The refused rerun spawned nothing new.
     expect(h.childCalls).toHaveLength(1);
+  });
+
+  it('refuses an unknown lens before any spawn or attempt charge, and a later valid call still runs', async () => {
+    const h = wholeHarness({
+      childAnswer: () => '[]',
+      specialists: ['blind', 'mystery'],
+      probes: [['blind']],
+    });
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    expect(h.toolErrors.some((entry) =>
+      entry.tool === 'perkins_run_specialists' && /not in this review's specialist catalog/.test(entry.error),
+    )).toBe(true);
+    // The refused call spawned nothing and charged nothing: the only real
+    // child is the post-refusal valid call, on attempt 1.
+    expect(h.childCalls).toHaveLength(1);
+    expect(result.specialistRuns).toMatchObject([{ lens: 'blind', attempt: 1, status: 'valid' }]);
+    expect(h.probeOutcomes).toEqual([{ lenses: ['blind'], ok: true }]);
   });
 
   it('a child citing evidence from another file fails its attempt and a corrected retry is accepted', async () => {
@@ -1583,6 +1870,243 @@ describe('whole-PR engine: repair pass 3', () => {
     expect(result.findings).toHaveLength(2);
   });
 
+  it('rejects an all-titles report that explicitly concludes the change is issue-free (R37)', async () => {
+    const h = wholeHarness({
+      childAnswer: (prompt) => (prompt.includes('"source": "edge"')
+        ? JSON.stringify([groundedFinding('edge', 'blocker', { title: 'broken guard' })])
+        : '[]'),
+      specialists: ['edge'],
+      submitRetries: 0,
+      transformReport: (report) => report
+        .concat('\n**In summary, no issues remain in this change; no changes needed; the change is clean.**\n'),
+    });
+    const rejection = await h.run().then(
+      () => { throw new Error('expected rejection'); },
+      (error: Error) => error.message,
+    );
+    expect(rejection).toContain('report-coherence');
+    // The rejection names the contradiction, not just the prose.
+    expect(rejection).toMatch(/issue-free|clean-slate/u);
+    expect(rejection).toMatch(/contradict/u);
+  });
+
+  it('accepts a lens-scoped clean statement beside retained findings (R37)', async () => {
+    const h = wholeHarness({
+      childAnswer: (prompt) => (prompt.includes('"source": "edge"')
+        ? JSON.stringify([groundedFinding('edge', 'warning')])
+        : '[]'),
+      specialists: ['edge'],
+      transformReport: (report) => report
+        .concat('\nNote: the security and codebase lenses found no issues of their own.\n'),
+    });
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    expect(result.findings).toHaveLength(1);
+  });
+
+  it('accepts a clean statement scoped by an explicit exception (R37)', async () => {
+    const h = wholeHarness({
+      childAnswer: (prompt) => (prompt.includes('"source": "edge"')
+        ? JSON.stringify([groundedFinding('edge', 'warning')])
+        : '[]'),
+      specialists: ['edge'],
+      transformReport: (report) => report
+        .concat('\nNo issues remain in this change except the retained finding listed above.\n'),
+    });
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    expect(result.findings).toHaveLength(1);
+  });
+
+  it('classifies clean-slate prose against retained findings (R37 table)', async () => {
+    const terminal = [
+      '\nNo issues remain.\n',
+      '\nNo changes needed.\n',
+      '\nThe change is clean.\n',
+      '\nNothing needs fixing.\n',
+      '\nEverything looks good.\n',
+      '\nThe PR requires no further changes.\n',
+      '\nThe blind lens found no issues of its own, and the change is clean.\n',
+      '\nsrc/main.ts contains the retained defect, but no issues remain in the change.\n',
+      '\nNo remaining issues in this change.\n',
+      '\nNo issues in this change.\n',
+      '\nNo issues remain in src/main.ts.\n',
+      '\nThe change is clean, and security review still lists a blocker.\n',
+      '\nIt is not true that the change is clean, and no issues remain.\n',
+      '\n## Prior review\nThe change is clean.\n',
+      '\n## Summary — The change is clean\n',
+      '\nNo\nissues remain.\n',
+      '\nThe change is\nclean.\n',
+      '\nNo issues remain in any files.\n',
+      '\nNo issues remain in this PR for src/other.ts.\n',
+      '\nNo issues remain in this change, including in src/other.ts.\n',
+      '\nSecurity review found a blocker, the change is clean.\n',
+      '\nThe change is clean on its own merits.\n',
+      '\nThe change is clean because the blind lens found no issues of its own.\n',
+      '\n## Prior review\nNo issues remain in PR.\n',
+      '\nNo issues remain in this change, though the security specialist found a warning.\n',
+    ];
+    const scoped = [
+      '\nThe blind lens found no issues of its own.\n',
+      '\nNo issues remain in src/other.ts.\n',
+      '\nNo issues remain except the retained finding above.\n',
+      '\nNo new issues were found; the retained finding stands.\n',
+      '\n> An earlier report said no issues remain. That conclusion was wrong.\n',
+      '\nThe prior reviewer wrote “No issues remain”, but broken guard remains an issue.\n',
+      '\nDo not say “The change is clean”; broken guard remains.\n',
+      '\nIt is not true that the change is clean; broken guard remains.\n',
+      '\nNo issues remain in app.vue.\n',
+      '\nNo issues remain in .gitignore.\n',
+      '\nNo issues remain from the previous round.\n',
+      '\nNo issues remain EXCEPT the retained finding above.\n',
+      '\nNo issues remain in scripts/build.\n',
+      '\nNo issues remain in src/other file.ts.\n',
+      '\nThe security lens found no issues.\n',
+      '\nThe performance review reported no issues.\n',
+      '\nThe operations review reported no issues.\n',
+      '\nThe previous reviewer said the change is clean, but broken guard remains.\n',
+      '\nThe prior reviewer incorrectly said the change is clean, but broken guard remains.\n',
+      '\n````\n```\nNo issues remain.\n````\n',
+      '\nNo blockers remain; the retained finding is only a warning.\n',
+      '\nLGTM.\n',
+      '\nLGTM; the retained finding is only a warning.\n',
+    ];
+    const variants = [...terminal, ...scoped];
+    let call = 0;
+    const h = wholeHarness({
+      childAnswer: (prompt) => (prompt.includes('"source": "edge"')
+        ? JSON.stringify([groundedFinding('edge', 'warning', { title: 'broken guard' })])
+        : '[]'),
+      specialists: ['edge'],
+      submitRetries: 0,
+      preflight: {
+        calls: variants.length,
+        mutate: (submission) => ({ ...submission, report_markdown: submission.report_markdown + variants[call++]! }),
+      },
+    });
+    const result = await h.run();
+    const verdicts = h.preflightResults.map((entry) => (JSON.parse(entry.text) as { ok: boolean }).ok);
+    expect(verdicts.slice(0, terminal.length)).toEqual(terminal.map(() => false));
+    expect(verdicts.slice(terminal.length).map((ok, index) => [scoped[index], ok])).toEqual(scoped.map((text) => [text, true]));
+    // The unmutated submission itself stays accepted.
+    expect(result.findings).toHaveLength(1);
+  });
+
+  it('applies no clean-conclusion rule when nothing is retained (R37)', async () => {
+    const h = wholeHarness({
+      ...ALL_CLEAN,
+      transformReport: (report) => report.concat('\nNo issues remain; nothing needs changing; the change is clean.\n'),
+    });
+    const result = await h.run();
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+    expect(result.findings).toHaveLength(0);
+  });
+
+  it('credits a specialist finding at the location it delivered (R38)', async () => {
+    const h = wholeHarness({
+      childAnswer: (prompt) => (prompt.includes('"source": "edge"')
+        ? JSON.stringify([groundedFinding('edge', 'blocker', { title: 'broken guard' })])
+        : '[]'),
+      specialists: ['edge'],
+    });
+    const result = await h.run();
+    expect(result.findings).toHaveLength(1);
+    expect(result.findings[0]).toMatchObject({ source: 'edge', title: 'broken guard', location: 'src/main.ts:1' });
+  });
+
+  it('refuses to credit a lens for a same-title finding the lead relocated (R38)', async () => {
+    const h = wholeHarness({
+      childAnswer: (prompt) => (prompt.includes('"source": "edge"')
+        ? JSON.stringify([groundedFinding('edge', 'blocker', { title: 'broken guard' })])
+        : '[]'),
+      specialists: ['edge'],
+      submitRetries: 0,
+      findings: (findings) => findings.map((finding) => ({
+        ...finding,
+        location: 'src/other.ts:7',
+        evidence: 'const unrelated = true;',
+      })),
+    });
+    const rejection = await h.run().then(
+      () => { throw new Error('expected rejection'); },
+      (error: Error) => error.message,
+    );
+    expect(rejection).toContain('finding-source');
+    expect(rejection).toMatch(/broken guard/u);
+    expect(rejection).toMatch(/delivered/u);
+  });
+
+  it('ignores harmless padding around an otherwise identical specialist location (R38)', async () => {
+    const h = wholeHarness({
+      childAnswer: (prompt) => (prompt.includes('"source": "edge"')
+        ? JSON.stringify([groundedFinding('edge', 'warning', { location: ' src/main.ts:1 ' })])
+        : '[]'),
+      specialists: ['edge'],
+      findings: (findings) => findings.map((finding) => ({ ...finding, location: 'src/main.ts:1' })),
+    });
+    expect((await h.run()).findings[0]?.source).toBe('edge');
+  });
+
+  it('rejects a prior-only retained finding plus a contradictory clean conclusion (R37)', async () => {
+    const h = priorHarness({ submitPayload: (_attempt, submission) => ({
+      ...submission, findings: [],
+      report_markdown: `${submission.report_markdown}\nNo issues remain.\n`,
+    }) });
+    await expect(h.run()).rejects.toThrow(/report-coherence/u);
+  });
+
+  it('accepts a historical clean claim in a prior section when every prior was fixed', async () => {
+    const h = priorHarness({
+      audit: { prior_index: 0, status: 'fixed', note: 'fixed by current changes' },
+      leadFinding: groundedFinding('lead', 'warning', {
+        title: 'current issue', location: 'src/caller.ts:2', evidence: 'const selected = nativeSetting;',
+      }),
+      submitPayload: (_attempt, submission) => ({
+        ...submission, report_markdown: `${submission.report_markdown}\nNo issues remain from the prior review.\n`,
+      }),
+    });
+    expect((await h.run()).findings).toHaveLength(1);
+  });
+
+  it('refuses no-blockers claims while a blocker remains', async () => {
+    for (const claim of ['No blockers remain.', 'No blockers in this PR.']) {
+      const h = wholeHarness({
+        childAnswer: (prompt) => (prompt.includes('"source": "edge"')
+          ? JSON.stringify([groundedFinding('edge', 'blocker')]) : '[]'),
+        specialists: ['edge'], submitRetries: 0,
+        transformReport: (report) => `${report}\n${claim}\n`,
+      });
+      await expect(h.run()).rejects.toThrow(/report-coherence/u);
+    }
+  });
+
+  it('does not collapse internal whitespace in a specialist-provenance filename (R38)', async () => {
+    const h = wholeHarness({
+      childAnswer: (prompt) => (prompt.includes('"source": "edge"')
+        ? JSON.stringify([groundedFinding('edge', 'warning', { title: 'broken guard', location: 'src/two  spaces.ts:1', evidence: 'export const guard = 43;' })])
+        : '[]'),
+      specialists: ['edge'],
+      submitRetries: 0,
+      findings: (findings) => findings.map((finding) => ({ ...finding, location: 'src/two spaces.ts:1', evidence: 'export const guard = 43;' })),
+    }, { beforeFreeze: (repo) => {
+      repo.commitFile('src/two  spaces.ts', 'export const guard = 43;\n');
+      repo.commitFile('src/two spaces.ts', 'export const guard = 43;\n');
+    } });
+    await expect(h.run()).rejects.toThrow(/finding-source/u);
+  });
+
+  it('keeps specialist path case significant (R38)', async () => {
+    const h = wholeHarness({
+      childAnswer: (prompt) => (prompt.includes('"source": "edge"')
+        ? JSON.stringify([groundedFinding('edge', 'warning', {
+          title: 'case-sensitive path', location: 'src/main.ts:1', evidence: 'export function answer(): number {',
+        })]) : '[]'),
+      specialists: ['edge'], submitRetries: 0,
+      findings: (findings) => findings.map((finding) => ({ ...finding, location: 'src/Main.ts:1' })),
+    });
+    await expect(h.run()).rejects.toThrow(/finding-source/u);
+  });
+
   it('handles Git-quoted prior paths and refuses nonexistent or directory-masquerading selections (R11)', async () => {
     const repo = makeFixtureRepo('whole-reader-quoted');
     repos.push(repo);
@@ -1675,6 +2199,55 @@ describe('whole-PR engine: repair pass 3', () => {
     expect(deleted).toEqual({ status: 'D', oldPath: 'src/gone.ts', newPath: null });
   });
 
+  it('lists a type-change prior entry truthfully as {status:"T"} at the same path (R33)', async () => {
+    const repo = makeFixtureRepo('whole-reader-typechange');
+    repos.push(repo);
+    const base = repo.head();
+    repo.git(['checkout', '-b', 'feature/typechange']);
+    repo.commitFile('src/typed.ts', 'export const typed = 1;\n');
+    // PRIOR revision: a gitlink (mode 160000) at src/typed.ts. A gitlink
+    // is invisible to the freeze symlink guard, and the target revision
+    // restored below is a regular file, so the frozen tree stays clean.
+    repo.git(['rm', '-q', 'src/typed.ts']);
+    repo.git(['update-index', '--add', '--cacheinfo', `160000,${repo.head()},src/typed.ts`]);
+    repo.git(['-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '-m', 'fixture: gitlink state']);
+    const priorTarget = repo.head();
+    // TARGET revision: the same path is a regular file again.
+    repo.git(['rm', '--cached', '-q', 'src/typed.ts']);
+    writeFileSync(join(repo.path, 'src/typed.ts'), 'export const typed = 2;\n', 'utf8');
+    repo.git(['-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'add', 'src/typed.ts']);
+    repo.git(['-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '-m', 'fixture: regular file again']);
+    const root = temp('perkins-typechange-');
+    const priorFile = join(root, 'prior.json');
+    writeFileSync(priorFile, JSON.stringify({
+      schemaVersion: 3,
+      architecture: 'perkins-whole-pr',
+      canonicalVerdict: 'NEEDS CHANGES', complete: true, headMoved: false,
+      findings: [],
+      frozen: { targetSha: priorTarget, diffBaseSha: base },
+    }));
+    const frozen = freezeReviewInputs({
+      roundId: 'typechange-round', repoPath: repo.path, artifactRoot: root,
+      baseRef: base, targetRef: repo.head(), movementRef: 'feature/typechange', spec: 'type change reader',
+    });
+    const fake = fakeWholeSpawner(temp('perkins-typechange-sessions-'), {
+      childAnswer: () => '[]',
+      specialists: [],
+      onPriorRevision: () => {},
+    });
+    const engine = new PerkinsWholeReview({ spawner: fake.spawner, policy: loadPerkinsPolicy() });
+    await engine.run({
+      roundId: 'typechange-round', roundNumber: 2, frozenReview: frozen,
+      movementRef: 'feature/typechange', noSpec: false, priorConsolidatedFile: priorFile,
+    });
+    const tool = fake.leadCalls[0]!.options.reviewLead!.nativeTools
+      .find((entry) => entry.name === 'perkins_read_prior_revision') as NativeAgentTool;
+    const listing = JSON.parse((await tool.execute({})).text) as { changes: Array<{ status: string; oldPath: string | null; newPath: string | null }> };
+    // Before the fix the `T` entry fell into the silent-skip branch and the
+    // re-reviewer saw an incomplete changed-path list.
+    expect(listing.changes).toContainEqual({ status: 'T', oldPath: 'src/typed.ts', newPath: 'src/typed.ts' });
+  });
+
   it('delivers the LAST-file sentinel of a >3000-line multi-file diff to BOTH the lead and specialist prompts (R18)', async () => {
     const sentinel = 'P3-SENTINEL-LAST-FILE-4902';
     const h = wholeHarness({
@@ -1749,9 +2322,9 @@ describe('wave refusals never consume lens or round budget (H1)', () => {
       movementRef: 'feature/review', noSpec: false,
     });
     expect(result.canonicalVerdict).toBe('READY TO MERGE');
-    expect(h.fake.childCalls).toHaveLength(8); // 7 lenses + security's invalid attempt
+    expect(h.fake.childCalls).toHaveLength(10); // 9 lenses + security's invalid attempt
     const valid = result.specialistRuns.filter((run) => run.status === 'valid');
-    expect(valid).toHaveLength(7); // every required lens still ran
+    expect(valid).toHaveLength(9); // every catalog lens still ran
     const securityValid = valid.find((run) => run.lens === 'security');
     expect(securityValid?.attempt).toBe(2); // retry survived the refusal
   }, 120_000);
@@ -1763,10 +2336,90 @@ describe('wave refusals never consume lens or round budget (H1)', () => {
       movementRef: 'feature/review', noSpec: false,
     });
     expect(result.canonicalVerdict).toBe('READY TO MERGE');
-    expect(result.specialistRuns).toHaveLength(7);
-    expect(h.fake.childCalls).toHaveLength(7);
+    expect(result.specialistRuns).toHaveLength(9);
+    expect(h.fake.childCalls).toHaveLength(9);
     const refusals = h.fake.toolErrors.filter((entry) => entry.error.includes('admitted wave'));
     expect(refusals.length).toBeGreaterThanOrEqual(3); // the stubborn re-issues happened
+  }, 120_000);
+
+  it('schedules seven selected lenses as 3+3+1 and nine as 3+3+3 at admitted width 3 inside one lead and frozen target', async () => {
+    const catalog = [...PERKINS_LENSES];
+    const cases: ReadonlyArray<{ selected: readonly string[]; expected: ReadonlyArray<readonly string[]> }> = [
+      { selected: catalog.slice(0, 7), expected: [catalog.slice(0, 3), catalog.slice(3, 6), catalog.slice(6, 7)] },
+      { selected: catalog, expected: [catalog.slice(0, 3), catalog.slice(3, 6), catalog.slice(6, 9)] },
+    ];
+    for (const { selected, expected } of cases) {
+      const h = waveHarness({
+        childAnswer: (prompt) => {
+          const source = /"source": "(blind|tests)"/u.exec(prompt)?.[1];
+          return source === undefined ? '[]' : JSON.stringify([groundedFinding(source, 'warning')]);
+        },
+        specialists: selected,
+      }, 3);
+      const result = await h.engine.run({
+        roundId: 'wave-refusal-round', roundNumber: 1, frozenReview: h.frozen,
+        movementRef: 'feature/review', noSpec: false,
+      });
+      expect(result.canonicalVerdict).toBe('READY TO MERGE');
+      // One lead, one frozen target: batches and retries never mint another.
+      expect(h.fake.leadCalls).toHaveLength(1);
+      expect(result.targetSha).toBe(h.frozen.manifest.targetSha);
+      expect(h.fake.childCalls).toHaveLength(selected.length);
+      expect(result.specialistRuns).toHaveLength(selected.length);
+      expect(result.specialistRuns.every((run) => run.status === 'valid' && run.attempt === 1)).toBe(true);
+      // Findings delivered by the FIRST and LAST batch survive together: a
+      // batch split is a transport detail, never a dropped or duplicated review.
+      expect(result.findings.map((finding) => finding.source).sort()).toEqual(['blind', 'tests']);
+      // Every batch is accounted in the SAME single lead receipt: no later
+      // batch or retry creates a second round or lead.
+      const receipt = JSON.parse(readFileSync(join(result.artifactDirectory, 'lead/receipt.json'), 'utf8')) as { specialistRuns: number };
+      expect(receipt.specialistRuns).toBe(selected.length);
+      expect(result.artifactDirectory).toContain('wave-refusal-round');
+      // The scripted lead opens with the schema-maximum 4-run call at an
+      // admitted wave of 3: refused before any child starts and fully
+      // restored (each lens still lands on attempt 1), then re-batched.
+      expect(h.fake.attemptedBatches[0]).toHaveLength(4);
+      expect(h.fake.toolErrors.filter((entry) => entry.error.includes('admitted wave of 3'))).toHaveLength(1);
+      expect(h.fake.runBatches).toEqual(expected.map((batch) => [...batch]));
+    }
+  }, 120_000);
+
+  it('accounts sixteen real runs and refuses an otherwise eligible seventeenth by the round cap, distinct from per-lens exhaustion', async () => {
+    const h = wholeHarness({
+      childAnswer: () => 'not json',
+      specialists: [...PERKINS_LENSES],
+      probeExhausted: 'acceptance',
+    });
+    const result = await h.run();
+    // Nine initial attempts fail, then retries interleave with the remaining
+    // first attempts; the round stops at exactly 16 accounted runs.
+    expect(h.childCalls).toHaveLength(16);
+    expect(result.specialistRuns).toHaveLength(16);
+    expect(result.specialistRuns.every((run) => run.status !== 'valid')).toBe(true);
+    expect(result.specialistRuns.every((run) => run.attempt === 1 || run.attempt === 2)).toBe(true);
+    const receipt = JSON.parse(readFileSync(join(result.artifactDirectory, 'lead/receipt.json'), 'utf8')) as { specialistRuns: number };
+    expect(receipt.specialistRuns).toBe(16);
+    // The refusal is durable coverage truth, not only a transient tool error:
+    // the result carries the refused call, the cap, and the runs accounted at
+    // refusal time so a report can disclose budget-limited coverage.
+    expect(result.budgetRefusals).toMatchObject([{ lenses: ['performance', 'operations'], cap: 16, accountedRuns: 16 }]);
+    // The refused call was otherwise per-lens eligible — performance and
+    // operations still had one attempt each — and the ROUND budget refuses
+    // it before any spawn: both keep their single recorded attempt.
+    expect(h.attemptedBatches.at(-1)).toEqual(['performance', 'operations']);
+    for (const lens of ['performance', 'operations']) {
+      expect(result.specialistRuns.filter((run) => run.lens === lens)).toHaveLength(1);
+    }
+    const roundRefusals = h.toolErrors.filter((entry) => /exceeds 16 specialist runs/.test(entry.error));
+    expect(roundRefusals).toHaveLength(1);
+    expect(roundRefusals[0]).toMatchObject({ tool: 'perkins_run_specialists' });
+    expect(roundRefusals.every((entry) => !/exhausted its attempts/.test(entry.error))).toBe(true);
+    // The per-lens cause stays distinct: an exhausted lens names itself, not
+    // the round budget, and its completed attempts remain recorded.
+    const lensRefusal = h.toolErrors.find((entry) => /specialist acceptance exhausted its attempts/.test(entry.error));
+    expect(lensRefusal).toBeDefined();
+    expect(lensRefusal?.error).not.toMatch(/exceeds 16 specialist runs/);
+    expect(result.specialistRuns.filter((run) => run.lens === 'acceptance')).toHaveLength(2);
   }, 120_000);
 });
 
@@ -2001,7 +2654,7 @@ describe('provider pacing: workflow rate-limit retry and cleanup', () => {
     expect(gate.view().review).toMatchObject({ running: 0, queued: [] });
   });
 
-  it('shares one turn budget across retries: an elapsed retry never invokes the model (r4 verification#1)', async () => {
+  it('specialist retries are count-bounded, never stopped by elapsed wall clock (j-1065)', async () => {
     let clock = 1_000_000_000;
     let firstChild: string | null = null;
     const promptsByChild = new Map<string, number>();
@@ -2012,11 +2665,10 @@ describe('provider pacing: workflow rate-limit retry and cleanup', () => {
           if (firstChild === null) firstChild = call.agentId;
           promptsByChild.set(call.agentId, (promptsByChild.get(call.agentId) ?? 0) + 1);
           if (call.agentId === firstChild) {
-            // Consume 400000 ms of the 600000 ms (10-minute) child turn
-            // budget on each model call and stay in the rate-limit class so
-            // the bounded retry runs: after call 1 the retry still has room,
-            // after call 2 the elapsed third iteration is stopped BEFORE the
-            // model runs.
+            // Each model call burns 400000 ms of wall clock and stays in the
+            // rate-limit class. The retired 600000 ms turn budget would have
+            // stopped the third call; the retry policy's COUNT bound (1 + 3)
+            // must be what governs now.
             clock += 400_000;
             throw new Error('429 too many requests');
           }
@@ -2036,13 +2688,42 @@ describe('provider pacing: workflow rate-limit retry and cleanup', () => {
     );
     const result = await h.run();
     expect(result.canonicalVerdict).toBe('READY TO MERGE');
-    // First attempt: exactly TWO model invocations — the shared budget guard
-    // stopped the third BEFORE the model ran. The lead's attempt-2 child
-    // then succeeds (one more invocation), so the round still completes.
+    // First attempt: exactly FOUR model invocations (initial + three bounded
+    // retries). Elapsed clock never stops a retry — the attempt fails on the
+    // retry-count bound with the provider error, not a fabricated timeout.
     const firstChildId = [...promptsByChild.keys()][0]!;
-    expect(promptsByChild.get(firstChildId)).toBe(2);
-    expect([...promptsByChild.values()].reduce((sum, count) => sum + count, 0)).toBe(3);
+    expect(promptsByChild.get(firstChildId)).toBe(4);
+    expect([...promptsByChild.values()].reduce((sum, count) => sum + count, 0)).toBe(5);
     const envelope = result.lensEnvelopes.find((entry) => entry.lens === 'blind' && entry.attempt === 1);
-    expect(envelope?.failureKind).toBe('timeout');
+    expect(envelope?.failureKind).toBe('error');
+    expect(envelope?.error).toContain('429');
+  });
+
+  it('a healthy specialist crossing the retired 600000 ms deadline completes valid and exactly once (j-1065 acceptance 1)', async () => {
+    const h = wholeHarness({
+      specialists: ['blind'],
+      // The child turn settles at 700 s of DETERMINISTIC fake time — past the
+      // retired 10-minute lifetime — with a perfectly ordinary empty result.
+      childAnswer: () => new Promise<string>((resolve) => {
+        setTimeout(() => resolve('[]'), 700_000);
+      }),
+    });
+    vi.useFakeTimers();
+    try {
+      const run = h.run();
+      await vi.advanceTimersByTimeAsync(1_500_000);
+      const result = await run;
+      expect(result.canonicalVerdict).toBe('READY TO MERGE');
+      const envelopes = result.lensEnvelopes.filter((entry) => entry.lens === 'blind');
+      // Exactly one attempt, valid, no timeout classification: the run was
+      // neither killed at 600 s nor duplicated into a retry.
+      expect(envelopes).toHaveLength(1);
+      expect(envelopes[0]).toMatchObject({ lens: 'blind', attempt: 1, status: 'valid' });
+      expect(envelopes[0]?.failureKind).toBeUndefined();
+      expect(h.childCalls).toHaveLength(1);
+      expect(h.childCalls[0]?.disposed).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

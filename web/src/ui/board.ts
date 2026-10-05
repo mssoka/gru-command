@@ -20,7 +20,14 @@
  */
 
 import {
+  agentActivityOf,
+  agentRailBand,
+  agentRuntimeOf,
   agentStateTone,
+  agentStatusOf,
+  hasRuntimeClassification,
+  isCountedCrewAgent,
+  isJobConcluded,
   jobChipTone,
   jobStatusTone,
   lensChipState,
@@ -36,14 +43,25 @@ import {
   BAND_LABELS,
   BAND_ORDER,
   bucketSnapshot,
+  liveWorkerStampsByJob,
   settledWindow,
+  stoppedWorkersByJob,
+  workerStopLabel,
   type BandId,
+  type WorkerStopView,
 } from '../lib/board-bands.js';
 import { railChips, type RailChip } from '../lib/board-rail.js';
 import { BOARD_WORDS, heistCount } from '../lib/board-vocabulary.js';
 import { formatAge } from '../lib/board-time.js';
 import { prLinkLabel } from '../lib/pr-link.js';
-import { jobSignal, pluralCount, roundSummary, unackedByJob, type RoundSummary } from '../lib/board-signals.js';
+import {
+  jobSignal,
+  pluralCount,
+  roundSummary,
+  terminalBoundNotificationIds,
+  unackedByJob,
+  type RoundSummary,
+} from '../lib/board-signals.js';
 import {
   ownerRows,
   ownerWindow,
@@ -115,6 +133,13 @@ export class BoardView {
   /** Disposed rows are collapsed by default; the toggle state survives
    * snapshot pushes so a live board does not re-open the graveyard. */
   private disposedExpanded = false;
+  /** The last rendered agent list (parent navigation resolves against it
+   * and can expand a collapsed section before scrolling). */
+  private lastAgents: readonly AgentView[] = [];
+  /** Issue #171: verified-historical rows are collapsed behind their own
+   * disclosure (past sessions), separate from the disposed graveyard;
+   * the toggle state survives snapshot pushes. */
+  private historyExpanded = false;
   /** Age counters (lane age, round elapsed, streaming turn age): registered
    * per render and refreshed by one shared ticker. */
   private readonly ageNodes = new Set<HTMLElement>();
@@ -126,6 +151,11 @@ export class BoardView {
   /** Toast + browser-notification surface (E7). */
   private onToast: ((notification: NotificationView) => void) | null = null;
   private snapshot: BoardSnapshot | null = null;
+  /** D3: older receipt pages fetched on demand (merged into FEED). */
+  private extraReceipts: NotificationView[] = [];
+  private receiptsNextOffset = 0;
+  private receiptsLoading = false;
+  private receiptsExhausted = false;
   /** Owner notification ids seen in the panel; every pending owner stop,
    * including informational destructive-op asks, earns a bell badge. */
   private readonly seenOwnerIds = new Set<string>();
@@ -184,10 +214,16 @@ export class BoardView {
     this.onToast = handler;
   }
 
-  /** E7: bind the board client (receipts + acks) — rebound on re-pair. */
+  /** E7: bind the board client (receipts + acks) — rebound on re-pair.
+   * Receipt paging is per-connection state: a re-pair must not surface the
+   * previous server's fetched receipts or resume its pagination cursor. */
   bindClient(client: BoardClient): void {
     this.boardClient = client;
     this.sentShown.clear();
+    this.extraReceipts = [];
+    this.receiptsNextOffset = 0;
+    this.receiptsExhausted = false;
+    this.receiptsLoading = false;
   }
 
   render(snapshot: BoardSnapshot): void {
@@ -440,13 +476,14 @@ export class BoardView {
         : decisions.reason === null
           ? `Decision routing: ${decisions.status}.`
           : `Decision routing: ${decisions.status} (${decisions.reason}).`;
-    // NEEDS GRU is the machine queue: action-required rows awaiting a
-    // machine disposition. It never rings the owner bell — the FOR YOU
-    // band (bell + toasts) is the only human-facing surface.
+    // NEEDS GRU is the LIVE machine queue: action-required rows awaiting a
+    // machine disposition (terminal-bound rows are closed receipts below).
+    // It never rings the owner bell — the FOR YOU band (bell + toasts) is
+    // the only human-facing surface.
     const needsGru = snapshot.unackedActionRequired;
     this.unackedChip.hidden = needsGru === 0;
     this.unackedChip.textContent = `🛠 ${needsGru} needs Gru`;
-    this.unackedChip.title = `${needsGru} machine-attention notification${needsGru === 1 ? '' : 's'} awaiting a Gru disposition — the machine queue clears itself; the owner bell is not rung.`;
+    this.unackedChip.title = `${needsGru} live machine-attention notification${needsGru === 1 ? '' : 's'} awaiting a Gru disposition — the live queue clears itself; closed receipts stay in the record and the owner bell is not rung.`;
     // Wake tracker: every autonomous wake is a durable `gru.wake` event;
     // the count/last fire stamp makes the wake path visible on the board.
     const wakes = snapshot.wakes;
@@ -520,7 +557,20 @@ export class BoardView {
       return;
     }
     const unacked = unackedByJob(snapshot);
-    const bands = bucketSnapshot(snapshot, { now: Date.now(), unackedByJob: unacked });
+    // Section truth: the live needs-Gru view counts only LIVE rows. The
+    // stopped-worker map carries the supervision stop (waiting-on-rearm)
+    // truth for working lanes; terminal-job notifications stay in the bell.
+    // The live-worker stamps keep a re-dispatched lane's fresh registration
+    // on the stall clock's floor (never falsely COLD — twelve-followthrough
+    // A1/E1).
+    const stoppedWorkers = stoppedWorkersByJob(snapshot.agents);
+    const liveWorkerStamps = liveWorkerStampsByJob(snapshot.agents);
+    const bands = bucketSnapshot(snapshot, {
+      now: Date.now(),
+      unackedByJob: unacked,
+      stoppedWorkers,
+      liveWorkerStamps,
+    });
     const seenIds = new Set<string>();
     for (const band of BAND_ORDER) {
       const jobs = bands.find((group) => group.band === band)?.jobs ?? [];
@@ -538,7 +588,15 @@ export class BoardView {
         const window = band === 'settled' ? settledWindow(jobs, this.settledExpanded) : { jobs, hidden: 0 };
         const rows = el('div', 'board-band__rows');
         for (const entry of window.jobs) {
-          rows.append(this.jobRow(entry.job, unacked.get(entry.job.id) ?? 0, entry.stale, band));
+          rows.append(
+            this.jobRow(
+              entry.job,
+              unacked.get(entry.job.id) ?? 0,
+              entry.stale,
+              band,
+              stoppedWorkers.get(entry.job.id) ?? null,
+            ),
+          );
         }
         section.append(rows);
         if (window.hidden > 0) {
@@ -578,11 +636,23 @@ export class BoardView {
    * the summary expands the v3 detail inline — the row is never a card
    * until it is expanded. Error/failing rows carry the alert accent.
    */
-  private jobRow(job: JobView, unackedActionRequired: number, stale: boolean, band: BandId): HTMLElement {
+  private jobRow(
+    job: JobView,
+    unackedActionRequired: number,
+    stale: boolean,
+    band: BandId,
+    workerStop: WorkerStopView | null,
+  ): HTMLElement {
     const row = el('article', 'board-job');
     row.dataset.jobId = job.id;
     row.dataset.band = band;
     row.dataset.status = job.status;
+    // Defect truth (2026-09-29): a supervision-stopped worker is waiting
+    // on a human re-arm — the row says so instead of a bare "working".
+    // The swap is scoped to working lanes (where the status lies); other
+    // statuses keep their true chip, and the agent rail carries the ⛔.
+    const waiting = workerStop !== null && job.status === 'working';
+    if (waiting) row.dataset.workerState = 'waiting';
     if (jobFailing(job)) row.classList.add('board-job--alert');
     // v5: a job that was not on screen slides in (8px); a snapshot push
     // re-rendering known rows stays still.
@@ -611,7 +681,19 @@ export class BoardView {
       chip.title = signal.title;
       toggle.append(chip);
     }
-    toggle.append(el('span', `pp-chip board-job__status ${jobChipTone(job.status)}`, job.status));
+    const status = el(
+      'span',
+      `pp-chip board-job__status ${waiting ? 'pp-chip--park' : jobChipTone(job.status)}`,
+      waiting ? workerStopLabel(workerStop) : job.status,
+    );
+    if (waiting && workerStop !== null) {
+      status.title =
+        `worker stopped by supervision` +
+        (workerStop.reason === null ? '' : ` (${workerStop.reason.replaceAll('_', ' ')})`) +
+        `${workerStop.restarts > 0 ? ` after ${workerStop.restarts} restart${workerStop.restarts === 1 ? '' : 's'}` : ''} — ` +
+        'the lane is not running: resolve the condition, then ack the escalation to re-arm';
+    }
+    toggle.append(status);
     head.append(toggle);
     row.append(head);
 
@@ -688,7 +770,7 @@ export class BoardView {
       body.append(lane);
     }
     if (job.note !== null && job.note !== '') body.append(el('div', 'board-job__note', job.note));
-    const concluded = job.status === 'merged' || job.status === 'done';
+    const concluded = isJobConcluded(job.status);
     const rounds = concluded ? job.rounds.slice(-1) : job.rounds;
     for (const round of rounds) body.append(this.roundRow(round, concluded));
     if (concluded && rounds.length > 0) {
@@ -788,19 +870,84 @@ export class BoardView {
   // ------------------------------------------------------------------
 
   private renderAgents(agents: readonly AgentView[]): void {
+    this.lastAgents = agents;
     const rail = mustGet('board-agents');
     rail.replaceChildren();
     this.ensureAgeTicker();
-    const live = agents.filter((agent) => agent.state !== 'disposed');
-    const disposed = agents.filter((agent) => agent.state === 'disposed');
-    this.agentsCount.textContent = String(live.length);
+    // Issue #171 truthful agent status: liveness is RUNTIME OWNERSHIP,
+    // not the raw stored state. The live crew = current members plus
+    // explicitly-ambiguous unverified rows (missing evidence is never
+    // death — the row stays visible and marked); on a classifying server
+    // only CONFIRMED current rows count toward CREW (n), so the count
+    // never claims ambiguous ownership as active. Owner-held stops or
+    // restarts stay in the live crew even when the released handle left
+    // the ledger state disposed — the current runtime still owns the
+    // lane. Verified-historical records (a previous run/import left them)
+    // collapse behind a history disclosure with their transcripts intact;
+    // fully disposed rows keep their graveyard. A pre-upgrade snapshot
+    // (no classification at all) keeps today's attribution and counting.
+    const classificationPresent = hasRuntimeClassification(agents);
+    const disposed: AgentView[] = [];
+    const historical: AgentView[] = [];
+    const live: AgentView[] = [];
+    for (const agent of agents) {
+      const band = agentRailBand(agent);
+      if (band === 'disposed') disposed.push(agent);
+      else if (band === 'historical') historical.push(agent);
+      else live.push(agent);
+    }
+    this.agentsCount.textContent = String(
+      live.filter((agent) => isCountedCrewAgent(agent, classificationPresent)).length,
+    );
     if (agents.length === 0) {
       rail.append(el('div', 'lbl', 'no crew yet'));
       return;
     }
-    // Liveness-first order arrives from the server; disposed rows collapse
+    // Membership-first order arrives from the server; disposed rows collapse
     // behind a toggle so the graveyard never crowds live work.
-    for (const agent of live) rail.append(this.agentRow(agent, false));
+    // A genuine duplicate CURRENT singleton-role owner is an anomaly the
+    // service must surface, never silently discard: mark every row of a
+    // duplicated singleton role so the operator can investigate (#171).
+    const duplicateRoles = duplicatedSingletonRoles(live);
+    const labelById = new Map(agents.map((entry) => [entry.id, agentLabel(entry)]));
+    for (const agent of live) {
+      rail.append(
+        this.agentRow(
+          agent,
+          'live',
+          duplicateRoles.has(agent.id),
+          classificationPresent && agentRuntimeOf(agent) === 'unverified',
+          labelById,
+        ),
+      );
+    }
+    if (historical.length > 0) {
+      const toggle = el(
+        'button',
+        'board-agent-toggle',
+        `${this.historyExpanded ? '−' : '+'}${historical.length} history`,
+      );
+      toggle.type = 'button';
+      toggle.setAttribute('aria-expanded', String(this.historyExpanded));
+      toggle.setAttribute('data-section', 'history');
+      toggle.title =
+        'verified historical sessions — no current runtime owner; transcripts stay accessible';
+      toggle.addEventListener('click', () => {
+        this.historyExpanded = !this.historyExpanded;
+        this.renderAgents(agents);
+        if (this.historyExpanded) {
+          rail
+            .querySelector<HTMLElement>('.board-agent--historical')
+            ?.scrollIntoView?.({ block: 'nearest' });
+        }
+      });
+      rail.append(toggle);
+      if (this.historyExpanded) {
+        for (const agent of historical) {
+          rail.append(this.agentRow(agent, 'historical', false, false, labelById));
+        }
+      }
+    }
     if (disposed.length > 0) {
       const toggle = el(
         'button',
@@ -809,6 +956,7 @@ export class BoardView {
       );
       toggle.type = 'button';
       toggle.setAttribute('aria-expanded', String(this.disposedExpanded));
+      toggle.setAttribute('data-section', 'disposed');
       toggle.addEventListener('click', () => {
         this.disposedExpanded = !this.disposedExpanded;
         this.renderAgents(agents);
@@ -820,44 +968,141 @@ export class BoardView {
       });
       rail.append(toggle);
       if (this.disposedExpanded) {
-        for (const agent of disposed) rail.append(this.agentRow(agent, true));
+        for (const agent of disposed) rail.append(this.agentRow(agent, 'disposed', false, false, labelById));
       }
     }
   }
 
   /** One dense agent row: status dot, name + short hash, role·state
    * subline, right-aligned status chip. Error rows carry the alert
-   * accent (tint + left border) so a fault never hides in the list. */
-  private agentRow(agent: AgentView, disposed: boolean): HTMLElement {
-    const row = el('button', `board-agent${disposed ? ' board-agent--disposed' : ''}`);
-    row.type = 'button';
-    row.dataset.state = agent.state;
+   * accent (tint + left border) so a fault never hides in the list.
+   * Issue #171: the chip and subline read the DERIVED status (a raw-idle
+   * agent with open supervision work shows the work it is doing), and
+   * historical rows are marked as past sessions rather than live crew. */
+  private agentRow(
+    agent: AgentView,
+    section: 'live' | 'historical' | 'disposed',
+    duplicateSingleton: boolean,
+    ambiguousOwnership: boolean,
+    labelById: ReadonlyMap<string, string>,
+  ): HTMLElement {
+    // A div with button semantics (NOT <button>): the row contains its own
+    // parent-navigation button for child rows, and interactive elements
+    // must not nest. Keyboard activation matches a button (Enter/Space).
+    const row = el(
+      'div',
+      `board-agent${section === 'disposed' ? ' board-agent--disposed' : ''}${section === 'historical' ? ' board-agent--historical' : ''}`,
+    );
+    row.setAttribute('role', 'button');
+    row.tabIndex = 0;
+    const status = agentStatusOf(agent);
+    row.dataset.state = status;
     row.dataset.role = agent.role;
-    if (agent.state === 'error') row.classList.add('board-agent--error');
+    // Issue #161: parent navigation target + honest parentage marker
+    // (`unknown` when the server gave no information — legacy rows are
+    // never inferred as top-level).
+    row.dataset.agentId = agent.id;
+    row.dataset.parentage = agent.parentage ?? 'unknown';
+    if (status === 'error') row.classList.add('board-agent--error');
     row.title =
       agent.sessionFile !== null
         ? `${agent.id} — open transcript`
         : `${agent.id} — no session file yet`;
-    row.addEventListener('click', () => {
+    if (section === 'historical') {
+      row.title += ' · historical: no current runtime owner — record retained';
+    }
+    const openTranscript = (): void => {
       if (agent.sessionFile !== null) {
         this.onOpenTranscript({ file: agent.sessionFile ?? '', label: agentLabel(agent) });
+      }
+    };
+    row.addEventListener('click', openTranscript);
+    row.addEventListener('keydown', (event) => {
+      // Keys on the nested parent-navigation button belong to THAT button:
+      // the row must not hijack Enter/Space bubbling from a descendant.
+      if (event.target !== row) return;
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        openTranscript();
       }
     });
     const body = el('span', 'board-agent__body');
     const top = el('span', 'board-agent__top');
+    const label = agentLabel(agent);
     top.append(
-      el('span', 'board-agent__name', agentLabel(agent)),
+      el('span', 'board-agent__name', label),
       el('span', 'board-agent__hash lbl', agent.id.slice(0, 8)),
     );
     const subline = el('span', 'board-agent__sub lbl');
+    // Issue #161: top-level minions vs minion-created child workers. The
+    // marker renders from the durable parentage field only; an omitted
+    // field (pre-upgrade server) or a null field (server says unknown)
+    // renders no marker — legacy rows are never claimed either way.
+    const parentage = agent.parentage;
+    const isChild = parentage === 'child';
     subline.append(
       el('span', 'board-agent__emoji', ROLE_EMOJI[agent.role] ?? '🤖'),
-      el('span', 'board-agent__role', `${agent.role} · ${agent.state}`),
+      el('span', 'board-agent__role', isChild ? `child · ${status}` : `${agent.role} · ${status}`),
     );
-    // Turn-age counter: a streaming agent shows how long its current turn
-    // has been quiet — the operator's "is it stuck?" glance.
-    if (agent.state === 'streaming') {
-      subline.append(this.ageNode('board-agent__age lbl', agent.lastActivity, '', ' quiet'));
+    if (parentage === 'top-level' || parentage === 'child') {
+      subline.append(
+        el(
+          'span',
+          `board-agent__parentage board-agent__parentage--${parentage}`,
+          isChild ? '🧬 child' : 'top-level',
+        ),
+      );
+    }
+    if (isChild && agent.parentAgentId !== null && agent.parentAgentId !== undefined) {
+      const parentId = agent.parentAgentId;
+      const parentLink = el(
+        'button',
+        'board-agent__parent-link',
+        `↳ ${labelById.get(parentId) ?? parentId.slice(0, 8)}`,
+      );
+      parentLink.type = 'button';
+      parentLink.title = `parent minion ${parentId} — jump to the parent row`;
+      parentLink.addEventListener('click', (event) => {
+        event.stopPropagation();
+        this.revealAgent(parentId);
+      });
+      subline.append(parentLink);
+      row.title += ` · child worker of ${parentId}`;
+    }
+    const childCounts = agent.childCounts;
+    if (childCounts !== null && childCounts !== undefined && childCounts.lifetimeCreations > 0) {
+      const family = el(
+        'span',
+        'board-agent__child-counts',
+        `↳ ${childCounts.lifetimeCreations} ${childCounts.lifetimeCreations === 1 ? 'child' : 'children'}` +
+          ` (${childCounts.active} active, ${childCounts.queued} queued, ${childCounts.finished} finished)`,
+      );
+      family.title =
+        'family counters: active / queued / finished children, with lifetime logical creations';
+      subline.append(family);
+    }
+    // Turn-age counter: a working agent shows how long its current turn
+    // has been quiet — the operator's "is it stuck?" glance. The clock
+    // prefers the supervision event stream (#171): deltas never touch the
+    // ledger's last_activity, so a busy turn must not read as days-quiet.
+    if (status === 'streaming') {
+      subline.append(this.ageNode('board-agent__age lbl', agentActivityOf(agent), '', ' quiet'));
+    }
+    // Issue #171: ambiguous ownership is explicit — an unverified row is
+    // visible, marked, and never claimed active or dead by the board (on
+    // a pre-upgrade server no row is marked: the whole board is legacy).
+    if (ambiguousOwnership) {
+      subline.append(el('span', 'board-agent__runtime board-agent__runtime--unknown', '❓ unverified'));
+      row.title += ' · runtime ownership unverified (no ownership evidence)';
+    }
+    if (section === 'historical') {
+      subline.append(el('span', 'board-agent__runtime board-agent__runtime--historical', '🕘 history'));
+    }
+    // Issue #171: a duplicated CURRENT singleton-role owner is surfaced as
+    // an anomaly (the service supervises one of each) — never discarded.
+    if (duplicateSingleton) {
+      subline.append(el('span', 'board-agent__runtime board-agent__runtime--alert', '⚠ duplicate'));
+      row.title += ` · anomaly: more than one current ${agent.role} owner — investigate`;
     }
     // E7: supervision mark — a stopped (breaker-tripped) or restarting
     // agent carries its supervision state on the subline (the right chip
@@ -877,8 +1122,28 @@ export class BoardView {
     }
     body.append(top, subline);
     row.append(el('span', 'board-agent__dot'), body);
-    row.append(el('span', `pp-chip board-agent__state ${agentStateTone(agent.state)}`, agent.state));
+    row.append(el('span', `pp-chip board-agent__state ${agentStateTone(status)}`, status));
     return row;
+  }
+
+  /** Issue #161 parent navigation: reveal the parent row even when its
+   * historical/disposed section is collapsed, then scroll to it. The row
+   * is located by dataset comparison — a manually registered agent id can
+   * contain selector metacharacters, so ids never enter a CSS selector. */
+  private revealAgent(agentId: string): void {
+    const target = this.lastAgents.find((agent) => agent.id === agentId);
+    if (target === undefined) return;
+    const band = agentRailBand(target);
+    if (band === 'historical') this.historyExpanded = true;
+    if (band === 'disposed') this.disposedExpanded = true;
+    this.renderAgents(this.lastAgents);
+    const rows = mustGet('board-agents').querySelectorAll<HTMLElement>('.board-agent');
+    for (const row of rows) {
+      if (row.dataset.agentId === agentId) {
+        row.scrollIntoView?.({ block: 'nearest' });
+        return;
+      }
+    }
   }
 
   // ------------------------------------------------------------------
@@ -897,15 +1162,23 @@ export class BoardView {
     // the standing feed.
     // A pre-disposition release could Ack machine rows. Those legacy rows
     // are closed receipts, not active NEEDS GRU work, even if unresolved.
+    // A row bound to a TERMINAL job is the same kind of receipt (section
+    // truth, 2026-09-29): the record keeps it — FEED renders it as a
+    // closed receipt — but the live queue never counts or lists it.
     const unresolved = (item: NotificationView): boolean => item.resolvedAt === null && item.ackedAt === null;
-    const needsGru = notifications.filter((item) => item.routing === 'action-required' && unresolved(item));
-    const feed = notifications.filter(
-      (item) => item.routing === 'fyi' || !unresolved(item),
+    const receipts = terminalBoundNotificationIds(snapshot);
+    const needsGru = notifications.filter(
+      (item) => item.routing === 'action-required' && unresolved(item) && !receipts.has(item.id),
     );
-    if (notifications.length === 0 && (snapshot.ownerPrs ?? []).length === 0) {
-      list.append(el('div', 'lbl', 'nothing needs attention'));
-      return;
-    }
+    const feed = [
+      ...notifications.filter(
+        (item) => item.routing === 'fyi' || !unresolved(item) || receipts.has(item.id),
+      ),
+      ...this.extraReceipts.filter((extra) => !notifications.some((item) => item.id === extra.id)),
+    ];
+    // Every snapshot renders the full band structure — an empty feed is
+    // good news, not absence. No early return may skip FOR YOU / NEEDS GRU
+    // and their clear states (g9).
     // FOR YOU parity (FOR YOU r1): the bell renders the SAME authoritative
     // owner projection the board band renders — pending acks AND ready PRs
     // — so the two surfaces can never disagree about what the owner owes.
@@ -922,8 +1195,54 @@ export class BoardView {
       }
     }
     list.append(forYou);
-    this.renderNotificationSection(list, 'NEEDS GRU', needsGru, 'machine queue is clear');
-    if (feed.length > 0) this.renderNotificationSection(list, 'FEED', feed, null);
+    this.renderNotificationSection(list, 'NEEDS GRU', needsGru, 'live machine queue is clear', receipts);
+    if (feed.length > 0) {
+      this.renderNotificationSection(list, 'FEED', feed, null, receipts);
+      // D3: the snapshot carries the newest receipt window only; older
+      // receipts are fetched on demand. The control appears only when a
+      // receipt is actually on screen.
+      if (
+        this.boardClient !== null &&
+        !this.receiptsExhausted &&
+        feed.some((item) => receipts.has(item.id) || this.extraReceipts.some((extra) => extra.id === item.id))
+      ) {
+        const more = el(
+          'button',
+          'board-notification__more lbl',
+          this.receiptsLoading ? 'loading older receipts…' : 'load older receipts',
+        );
+        more.type = 'button';
+        (more as HTMLButtonElement).disabled = this.receiptsLoading;
+        more.addEventListener('click', () => void this.loadOlderReceipts());
+        list.append(more);
+      }
+    }
+  }
+
+  /** D3: fetch the next page of closed receipts and merge it into FEED.
+   * A failed page is non-fatal: the control stays for retry. */
+  private async loadOlderReceipts(): Promise<void> {
+    const client = this.boardClient;
+    if (client === null || this.receiptsLoading) return;
+    this.receiptsLoading = true;
+    if (this.snapshot !== null) this.renderNotifications(this.snapshot);
+    try {
+      const page = await client.fetchReceipts(this.receiptsNextOffset);
+      // Re-paired mid-fetch: the page belongs to the previous server's record.
+      if (this.boardClient !== client) return;
+      for (const row of page.receipts) {
+        if (!this.extraReceipts.some((existing) => existing.id === row.id)) this.extraReceipts.push(row);
+      }
+      this.receiptsNextOffset = page.nextOffset;
+      if (!page.hasMore) this.receiptsExhausted = true;
+    } catch {
+      // The button remains; a later click retries the same cursor.
+    } finally {
+      if (this.boardClient === client) {
+        this.receiptsLoading = false;
+        if (this.snapshot !== null) this.renderNotifications(this.snapshot);
+      }
+    }
   }
 
   private renderNotificationSection(
@@ -931,26 +1250,33 @@ export class BoardView {
     label: string,
     rows: readonly NotificationView[],
     empty: string | null,
+    receipts: ReadonlySet<string>,
   ): void {
     const section = el('section', 'board-notification-section');
     section.append(el('div', 'board-notification-section__head lbl', label));
     if (rows.length === 0) {
       if (empty !== null) section.append(el('div', 'board-notification-section__empty lbl', empty));
     } else {
-      for (const item of rows) section.append(this.notificationRow(item));
+      for (const item of rows) section.append(this.notificationRow(item, receipts.has(item.id)));
     }
     list.append(section);
   }
 
-  private notificationRow(item: NotificationView): HTMLElement {
-    const row = el('div', `board-notification board-notification--${item.severity}`);
+  private notificationRow(item: NotificationView, closedReceipt = false): HTMLElement {    const row = el(
+      'div',
+      `board-notification board-notification--${item.severity}${closedReceipt ? ' board-notification--receipt' : ''}`,
+    );
+    if (closedReceipt) row.dataset.receipt = 'closed';
     const icon = item.routing === 'needs-owner' ? '🔔' : item.routing === 'action-required' ? '🛠' : item.severity === 'error' ? '🚨' : 'ℹ️';
+    const suffix = closedReceipt
+      ? ' · closed receipt'
+      : item.resolvedAt !== null
+        ? ' · resolved'
+        : item.ackedAt !== null
+          ? ' ✓'
+          : '';
     row.append(
-      el(
-        'div',
-        'board-notification__title',
-        `${icon} ${item.title}${item.resolvedAt !== null ? ' · resolved' : item.ackedAt !== null ? ' ✓' : ''}`,
-      ),
+      el('div', 'board-notification__title', `${icon} ${item.title}${suffix}`),
       el(
         'div',
         'board-notification__meta lbl',
@@ -960,6 +1286,7 @@ export class BoardView {
     // Only an owner stop or FYI row has a human Ack/Mark seen control.
     // Gru records a machine disposition through the authenticated API
     // after acting; a human click must not silently clear NEEDS GRU.
+    // A closed receipt is machine-attention history: same rule, no Ack.
     if (item.routing !== 'action-required' && item.ackedAt === null && item.resolvedAt === null) {
       const ack = document.createElement('button');
       ack.type = 'button';
@@ -997,7 +1324,8 @@ export class BoardView {
       // Only needs-owner rings the shoulder; machine/fyi rows live in the
       // panel bands and reach Gru through the wake path instead.
       if (notification.routing !== 'needs-owner') continue;
-      if (firstRender || notification.resolvedAt !== null) continue; // history/resolved — no toast spam
+      // History and already-handled rows (acked on ANY device) never toast.
+      if (firstRender || notification.ackedAt !== null || notification.resolvedAt !== null) continue;
       this.onToast?.(notification);
       this.sendShown(notification, 'web-toast');
     }
@@ -1041,8 +1369,10 @@ export class BoardView {
 /** A row is "failing" when the record itself says so: blocked/error
  * status, an aborted newest round, or errored lenses in a round that has
  * not posted a verdict. Conflicting-PR-only rows stay calm — the band
- * already shouts. */
+ * already shouts. A CONCLUDED job (merged/done) is a closed receipt: its
+ * history renders quiescent and never carries the alert accent. */
 export function jobFailing(job: JobView): boolean {
+  if (isJobConcluded(job.status)) return false;
   if (job.status === 'blocked' || job.status === 'error') return true;
   const round = job.rounds.at(-1) ?? null;
   if (round === null) return false;
@@ -1054,6 +1384,32 @@ export function jobFailing(job: JobView): boolean {
 function agentLabel(agent: AgentView): string {
   if (agent.label !== null && agent.label !== '') return agent.label;
   return `${agent.role} · ${agent.id.slice(0, 12)}`;
+}
+
+/** Roles the service hosts ONE of (the standing crew + bob). Minions are
+ * a pool and never duplicate — and NEITHER is perkins: a review round
+ * runs its lead alongside specialist children under the same role, so a
+ * concurrent-review fan-out is normal, not a duplicate-owner anomaly. */
+const SINGLETON_ROLES: ReadonlySet<string> = new Set(['gru', 'silas', 'bob']);
+
+/** Issue #171: agent ids of the live rail's rows whose singleton role has
+ * MORE THAN ONE current owner — an unexpected concurrent owner is an
+ * anomaly to surface, never to silently discard. Only explicitly-current
+ * rows count (unverified rows are already marked ambiguous; a historical
+ * epoch of the same role is expected, not an anomaly). */
+function duplicatedSingletonRoles(liveAgents: readonly AgentView[]): Set<string> {
+  const counts = new Map<string, string[]>();
+  for (const agent of liveAgents) {
+    if (agentRuntimeOf(agent) !== 'current' || !SINGLETON_ROLES.has(agent.role)) continue;
+    const ids = counts.get(agent.role) ?? [];
+    ids.push(agent.id);
+    counts.set(agent.role, ids);
+  }
+  const duplicated = new Set<string>();
+  for (const ids of counts.values()) {
+    if (ids.length > 1) for (const id of ids) duplicated.add(id);
+  }
+  return duplicated;
 }
 
 function formatTs(iso: string): string {

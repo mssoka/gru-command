@@ -1,12 +1,15 @@
+import { randomUUID } from 'node:crypto';
 import type { Role } from '../config.js';
 import type { LedgerApi } from '../ledger/api.js';
-import type { AgentHandle, SpawnOptions } from '../runtime/types.js';
+import type { AgentHandle, NativeAgentTool, SpawnOptions } from '../runtime/types.js';
 import { WorkerDisposalInProgressError } from '../runtime/worker-errors.js';
 import { requireSpawnCwd } from '../roles.js';
 import { appendLessonPointers, renderLessonsSection } from '../lessons/references.js';
 import type { LessonPointer, LessonsReferencePort } from '../lessons/types.js';
-import { appendPrCreationRule, PR_CREATION_RULE } from './pr-creation.js';
+import { appendWorkerRules, WORKER_RULE_BLOCKS } from './worker-rules.js';
 import { resolveGitCommit } from './perkins-review/artifacts.js';
+import { promptVerdictFromHealth, promptWithTerminalVerdict } from '../runtime/prompt-verdict.js';
+import type { PromptTurnVerdict } from '../runtime/types.js';
 import type { WorktreePort } from './worktree-port.js';
 import { settleRetries, type PacingGate, type PacingLease, type RetrySettlement } from '../runtime/pacing.js';
 
@@ -18,6 +21,31 @@ import { settleRetries, type PacingGate, type PacingLease, type RetrySettlement 
  * between them.
  */
 
+/** The product-owned identity + GC-mediated child tools for a
+ * (re)dispatched parent session (issue #161). A resumed row keeps its id
+ * (one logical worker, one identity); a fresh replacement mints one. */
+function parentIdentitySpawnOptions(
+  input: {
+    readonly parentTools?: (agentId: string) => readonly NativeAgentTool[];
+    readonly ledger: Pick<LedgerApi, 'listAgents'>;
+  },
+  resumeFile: string | null,
+): Pick<SpawnOptions, 'agentId' | 'nativeTools'> {
+  const resumed =
+    resumeFile === null
+      ? undefined
+      : input.ledger.listAgents().find((agent) => agent.sessionFile === resumeFile);
+  const agentId = resumed?.id ?? `minion_${randomUUID()}`;
+  const nativeTools = input.parentTools?.(agentId) ?? [];
+  return {
+    agentId,
+    // A runtime that cannot host parent tools returns none: no empty array
+    // is forwarded (the adapter would treat a declared-but-empty set the
+    // same, but an omission is the honest declaration).
+    ...(nativeTools.length > 0 ? { nativeTools } : {}),
+  };
+}
+
 /** The registry surface directive routing needs (structural — the real
  * RuntimeRegistry satisfies it; tests drive a controllable fake). */
 export interface DirectiveRegistry {
@@ -28,10 +56,13 @@ export interface DirectiveRegistry {
 
 export interface DirectiveRoutingDeps {
   readonly registry: DirectiveRegistry;
-  readonly ledger: Pick<LedgerApi, 'listAgents' | 'registerAgent' | 'getJob'>;
+  readonly ledger: Pick<LedgerApi, 'listAgents' | 'registerAgent' | 'getJob' | 'getAgent'>;
   readonly worktrees: WorktreePort;
   /** Book of Lessons injection: pointer lines only, never chapter bodies. */
   readonly lessons?: LessonsReferencePort;
+  /** Issue #161: GC-mediated child-worker tools for a (re)dispatched parent
+   * session, bound to its product-owned agent id by closure. */
+  readonly parentTools?: (agentId: string) => readonly NativeAgentTool[];
   /** Provider pacing: worker (minion turn) admission gate. Absent = off. */
   readonly workerGate?: PacingGate;
   /** Provider pacing: the bounded settlement of an automatic rate-limit
@@ -39,6 +70,12 @@ export interface DirectiveRoutingDeps {
    * only for 'none'/'recovered'; the worker lease is released before the
    * wait so the retry can reacquire admission. Absent = no interlock. */
   readonly retrySettlement?: (agentId: string) => Promise<RetrySettlement>;
+}
+
+function verdictFields(verdict: PromptTurnVerdict): { readonly outcome: 'completed' | 'error'; readonly error?: string } {
+  return verdict.ok
+    ? { outcome: 'completed' }
+    : { outcome: 'error', error: verdict.error ?? 'runtime settled the turn with an in-band error' };
 }
 
 /** Route a directive to the implementing minion: the live job minion
@@ -51,11 +88,28 @@ export async function routeFixDirectiveToMinion(
     /** Prompt owner tag (audit); defaults to the shared routing owner. */
     owner?: string;
   },
-): Promise<{ delivered: boolean; minionId?: string; note?: string }> {
+): Promise<{
+  delivered: boolean;
+  minionId?: string;
+  note?: string;
+  /** 'error' = the prompt settled with an in-band runtime error: it WAS
+   * admitted, but it is not a successful completion and must never
+   * complete a marked phase or record a phase-tagged delivery. */
+  outcome?: 'completed' | 'error';
+  error?: string;
+  /** Only on `delivered:false`: `'none'` = positive no-effect proof (the
+   * prompt was never handed to a worker or turn); `'unknown'` = the prompt
+   * may already have run (cancellation or a spent/superseded retry AFTER
+   * the prompt call) — the durable request must stay live for
+   * reconciliation and must never be marked failed or release its
+   * single-writer guard on this evidence alone. */
+  admission?: 'none' | 'unknown';
+}> {
   const owner = input.owner ?? 'fix-directive';
-  // Follow-up turns carry the CURRENT creation rule too: a legacy briefing
-  // that permitted drafts must not outrank it on the live/resumed paths.
-  const directive = appendPrCreationRule(
+  // Follow-up turns carry the CURRENT worker rule blocks too (PR creation
+  // and the no-call-budget contract): legacy briefing wording must not
+  // outrank them on the live/resumed paths.
+  const directive = appendWorkerRules(
     appendLessonPointers(
       input.directive,
       input.lessons?.referencesFor(input.directive) ?? [],
@@ -63,7 +117,9 @@ export async function routeFixDirectiveToMinion(
   );
   const minions = input.ledger
     .listAgents()
-    .filter((agent) => agent.jobId === input.jobId && agent.role === 'minion');
+    // Issue #161: directives belong to the job's WRITER minion — a tracked
+    // child is never selected as the primary lane worker.
+    .filter((agent) => agent.jobId === input.jobId && agent.role === 'minion' && agent.parentage !== 'child');
   let evictedSessionFile: string | null = null;
   for (const minion of [...minions].reverse()) {
     const handle = input.registry.getHandle(minion.id);
@@ -75,7 +131,7 @@ export async function routeFixDirectiveToMinion(
       // the other turn's outcome. Await before taking the worker slot — the
       // retry re-acquires its own slot and must not be blocked by ours.
       const pending = await settleRetries(input.retrySettlement, handle.id, input.signal);
-      if (pending === 'cancelled') return { delivered: false, note: 'review operation aborted' };
+      if (pending === 'cancelled') return { delivered: false, note: 'review operation aborted', admission: 'none' };
       let lease: PacingLease | null = null;
       if (input.workerGate !== undefined) {
         lease = await input.workerGate.acquireWorkerTurn({
@@ -86,8 +142,9 @@ export async function routeFixDirectiveToMinion(
         });
       }
       let promptError: unknown = null;
+      let verdict: PromptTurnVerdict | null = null;
       try {
-        await racedPrompt(handle, directive, input.signal, owner);
+        verdict = await racedPrompt(handle, directive, input.signal, owner);
       } catch (error) {
         promptError = error;
       } finally {
@@ -103,8 +160,10 @@ export async function routeFixDirectiveToMinion(
         // session) — and a 'recovered' disposition is reported as the
         // delivery it is.
         const disposition = await settleRetries(input.retrySettlement, handle.id, input.signal);
-        if (disposition === 'cancelled') return { delivered: false, note: 'review operation aborted' };
-        if (disposition === 'recovered') return { delivered: true, minionId: minion.id };
+        if (disposition === 'cancelled') return { delivered: false, note: 'review operation aborted', admission: 'unknown' };
+        if (disposition === 'recovered') {
+          return { delivered: true, minionId: minion.id, ...verdictFields({ ok: true, error: null }) };
+        }
         evictedSessionFile = handle.sessionFile;
         continue;
       }
@@ -113,19 +172,39 @@ export async function routeFixDirectiveToMinion(
       // the directive, so failure is reported only after the disposition is
       // known (never duplicating a delivery the retry still owns).
       const disposition = await settleRetries(input.retrySettlement, handle.id, input.signal);
-      if (disposition === 'cancelled') return { delivered: false, note: 'review operation aborted' };
+      if (disposition === 'cancelled') {
+        // The prompt call already ran: admission is UNKNOWN, not a no-effect
+        // failure — the request stays live for reconciliation.
+        return { delivered: false, note: 'review operation aborted', admission: 'unknown' };
+      }
       if (disposition === 'exhausted' || disposition === 'superseded') {
-        return { delivered: false, note: `automatic rate-limit retry ${disposition} before delivery` };
+        return {
+          delivered: false,
+          note: `automatic rate-limit retry ${disposition} before delivery`,
+          admission: 'unknown',
+        };
       }
       if (promptError !== null && disposition !== 'recovered') throw promptError;
-      return { delivered: true, minionId: minion.id };
+      // Terminal/error correlation (r4/r5 blocker 1): the verdict was
+      // captured by the transport when THIS prompt settled — before any
+      // queued successor turn could start — and is held across the retry
+      // settlement above. A resolved-but-errored turn reports outcome
+      // 'error' and must never complete a marked phase or record a
+      // phase-tagged delivery. A retry-recovered disposition is the
+      // retry's own clean turn (the supervisor supersedes itself on any
+      // further in-band error), so it is delivery evidence.
+      const evidence =
+        disposition === 'recovered'
+          ? ({ ok: true, error: null } as const)
+          : (verdict ?? promptVerdictFromHealth(handle));
+      return { delivered: true, minionId: minion.id, ...verdictFields(evidence) };
     }
   }
   const lane = input.worktrees
     .listWorktrees({ jobId: input.jobId })
     .find((candidate) => candidate.kind === 'job');
   if (lane === undefined) {
-    return { delivered: false, note: 'no implementing minion session and no job lane' };
+    return { delivered: false, note: 'no implementing minion session and no job lane', admission: 'none' };
   }
   let lease: PacingLease | null = null;
   if (input.workerGate !== undefined) {
@@ -145,11 +224,16 @@ export async function routeFixDirectiveToMinion(
       ? ([...minions].reverse().find((minion) => minion.sessionFile !== null)?.sessionFile ?? null)
       : null;
     const resumeFile = evictedSessionFile ?? fallback;
+    // Issue #161: the (re)dispatched parent keeps one product-owned id
+    // (the resumed row's id, else a fresh one) and receives the GC-mediated
+    // child tools bound to it — re-briefed parents stay able to commission.
+    const identity = parentIdentitySpawnOptions(input, resumeFile);
     let prompt = directive;
     try {
       handle = await input.registry.spawn('minion', {
         cwd: lane.path, signal: input.signal,
         ...(resumeFile !== null ? { resumeFile } : {}),
+        ...identity,
       });
     } catch (error) {
       if (resumeFile === null || input.signal.aborted) throw error;
@@ -157,13 +241,22 @@ export async function routeFixDirectiveToMinion(
       if (job == null || job.briefing == null) {
         throw new Error(`cannot resume prior minion session for job ${input.jobId} and no original briefing is available to re-brief: ${String(error)}`);
       }
-      handle = await input.registry.spawn('minion', { cwd: lane.path, signal: input.signal });
+      handle = await input.registry.spawn('minion', { cwd: lane.path, signal: input.signal, ...identity });
       prompt = `Fresh minion re-brief for job ${input.jobId}. Original contract:\n${job.briefing}\n\nCurrent fix directive:\n${directive}`;
     }
     let promptError: unknown = null;
+    let verdict: PromptTurnVerdict | null = null;
     try {
-      input.ledger.registerAgent({ id: handle.id, role: 'minion', jobId: input.jobId, sessionFile: handle.sessionFile });
-      await racedPrompt(handle, prompt, input.signal, owner);
+      // A fresh fallback minion (the resume attempt failed) is top-level;
+      // a resumed row keeps its recorded parentage (never retro-fitted).
+      input.ledger.registerAgent({
+        id: handle.id,
+        role: 'minion',
+        jobId: input.jobId,
+        sessionFile: handle.sessionFile,
+        ...(input.ledger.getAgent(handle.id) === null ? { parentage: 'top-level' as const } : {}),
+      });
+      verdict = await racedPrompt(handle, prompt, input.signal, owner);
     } catch (error) {
       promptError = error;
     } finally {
@@ -172,12 +265,29 @@ export async function routeFixDirectiveToMinion(
       lease = null;
     }
     const disposition = await settleRetries(input.retrySettlement, handle.id, input.signal);
-    if (disposition === 'cancelled') return { delivered: false, note: 'review operation aborted' };
+    if (disposition === 'cancelled') {
+      // The prompt call already ran on the fresh minion: UNKNOWN admission.
+      return { delivered: false, note: 'review operation aborted', admission: 'unknown' };
+    }
     if (disposition === 'exhausted' || disposition === 'superseded') {
-      return { delivered: false, note: `automatic rate-limit retry ${disposition} before delivery` };
+      return {
+        delivered: false,
+        note: `automatic rate-limit retry ${disposition} before delivery`,
+        admission: 'unknown',
+      };
     }
     if (promptError !== null && disposition !== 'recovered') throw promptError;
-    return { delivered: true, minionId: handle.id };
+    // Terminal/error correlation (r4/r5 blocker 1): the verdict was captured
+    // by the transport when THIS prompt settled (before any queued successor
+    // could start) and is held across the retry settlement. A
+    // resolved-but-errored turn must never complete a marked phase or record
+    // a phase-tagged delivery; a retry-recovered disposition is the retry's
+    // own clean turn.
+    const evidence =
+      disposition === 'recovered'
+        ? ({ ok: true, error: null } as const)
+        : (verdict ?? promptVerdictFromHealth(handle));
+    return { delivered: true, minionId: handle.id, ...verdictFields(evidence) };
   } finally {
     lease?.release();
     if (handle !== null) await handle.dispose();
@@ -185,11 +295,17 @@ export async function routeFixDirectiveToMinion(
 }
 
 /** Race a prompt against cancellation so shutdown cannot stall on an
- * in-flight fix-directive turn. */
-function racedPrompt(handle: { prompt(text: string, options?: { owner?: string }): Promise<void> }, text: string, signal: AbortSignal, owner: string): Promise<void> {
+ * in-flight fix-directive turn, carrying the settled turn's captured
+ * terminal verdict through the race. */
+function racedPrompt(
+  handle: Pick<AgentHandle, 'prompt' | 'health'> & Partial<Pick<AgentHandle, 'promptWithVerdict'>>,
+  text: string,
+  signal: AbortSignal,
+  owner: string,
+): Promise<PromptTurnVerdict> {
   if (signal.aborted) return Promise.reject(new Error('review operation aborted'));
   return Promise.race([
-    handle.prompt(text, { owner }),
+    promptWithTerminalVerdict(handle, text, { owner }),
     new Promise<never>((_resolve, reject) => {
       signal.addEventListener('abort', () => reject(new Error('review operation aborted')), { once: true });
     }),
@@ -210,7 +326,15 @@ export function recordFollowUpDelivery(input: {
   readonly jobId: string;
   readonly agentId: string | null;
   readonly source: 'dispatch' | 'silas-directive' | 'silas-rebrief';
-}): { readonly sha: string | null; readonly lanePath: string | null; readonly note: string | null } {
+  /** Request-scoped correlation: the durable directive request this
+   * delivery answers. When present the event can only settle THAT
+   * request — a later unrelated delivery cannot clear an older marker. */
+  readonly requestId?: string;
+  /** Host-owned phase-handoff identity: present when the phase was
+   * explicitly marked as owing a completion decision. The completion
+   * observer matches on THIS id (never the event sequence). */
+  readonly phaseId?: string;
+}): { readonly sha: string | null; readonly lanePath: string | null; readonly note: string | null; readonly eventSeq: number } {
   const jobLanes = input.worktrees.listWorktrees({ jobId: input.jobId }).filter((lane) => lane.kind === 'job');
   const lane = jobLanes.find((candidate) => candidate.status !== 'swept') ?? jobLanes[0];
   let sha: string | null = null;
@@ -226,12 +350,18 @@ export function recordFollowUpDelivery(input: {
   } else {
     note = 'no job lane in the registry to resolve a head from';
   }
-  input.ledger.appendCustomEvent({
+  const event = input.ledger.appendCustomEvent({
     kind: 'job.delivered',
     jobId: input.jobId,
-    payload: { agentId: input.agentId, source: input.source, sha },
+    payload: {
+      agentId: input.agentId,
+      source: input.source,
+      sha,
+      ...(input.requestId !== undefined ? { request_id: input.requestId } : {}),
+      ...(input.phaseId !== undefined ? { phase_id: input.phaseId } : {}),
+    },
   });
-  return { sha, lanePath: lane?.path ?? null, note };
+  return { sha, lanePath: lane?.path ?? null, note, eventSeq: event.seq };
 }
 
 /** Render the prompt handed to a FRESH minion taking over a stuck lane:
@@ -256,8 +386,7 @@ export function renderRebriefPrompt(input: {
     'ORIGINAL BRIEFING (still the contract):',
     input.briefing ?? '(the job row carries no stored briefing — read the job note on the board)',
     ...(lessonsSection === '' ? [] : ['', lessonsSection]),
-    '',
-    PR_CREATION_RULE,
+    ...WORKER_RULE_BLOCKS.flatMap((block) => ['', block]),
     '',
     'Execute the briefing inside this worktree. Standing orders: work only',
     'inside this tree; commit your work to the branch; verify it (build,',
@@ -289,6 +418,7 @@ export function flipJobToWorking(
  * pending prompt) instead of minting a fresh one. */
 export async function rebriefFreshMinion(
   input: DirectiveRoutingDeps & {
+    readonly ledger: Pick<LedgerApi, 'setAgentState' | 'getAgent'>;
     jobId: string;
     note: string;
     briefing: string | null;
@@ -302,20 +432,21 @@ export async function rebriefFreshMinion(
      * delivered — the durable re-brief marker binds the worker here, so a
      * crash mid-turn leaves a resumable pointer behind. */
     onSpawned?: (worker: { readonly id: string; readonly sessionFile: string | null }) => void;
+    /** Recheck request ownership and terminality at the last asynchronous
+     * admission boundaries; a running prompt is allowed to settle. */
+    beforeTurnSideEffect?: () => void;
   },
-): Promise<{ minionId: string; lanePath: string; prompt: string; sessionFile: string | null }> {
-  const jobMinions = input.ledger
-    .listAgents()
-    .filter((agent) => agent.jobId === input.jobId && agent.role === 'minion');
-  for (const minion of jobMinions) {
-    const handle = input.registry.getHandle(minion.id);
-    if (handle === null) continue;
-    await input.registry.disposeHandle(handle).catch((error: unknown) => {
-      throw new Error(
-        `could not retire the prior minion session ${minion.id} before re-briefing: ${String(error)}`,
-      );
-    });
-  }
+): Promise<{
+  minionId: string;
+  lanePath: string;
+  prompt: string;
+  sessionFile: string | null;
+  /** 'error' = the prompt settled with an in-band runtime error (resolved
+   * but failed): the caller must keep the request markers pending and
+   * record NO delivery and NO phase completion. */
+  outcome: 'completed' | 'error';
+  error?: string;
+}> {
   const lane = input.worktrees
     .listWorktrees({ jobId: input.jobId })
     .find((candidate) => candidate.kind === 'job' && candidate.status !== 'swept');
@@ -333,28 +464,76 @@ export async function rebriefFreshMinion(
     });
   }
   try {
+    input.beforeTurnSideEffect?.();
+    const jobMinions = input.ledger
+      .listAgents()
+      // Retirement/re-brief retires the WRITER sessions only — an active
+      // child worker is not the job's minion lane (issue #161).
+      .filter((agent) => agent.jobId === input.jobId && agent.role === 'minion' && agent.parentage !== 'child');
+    for (const minion of jobMinions) {
+      const prior = input.registry.getHandle(minion.id);
+      if (prior === null) continue;
+      await input.registry.disposeHandle(prior).catch((error: unknown) => {
+        throw new Error(
+          `could not retire the prior minion session ${minion.id} before re-briefing: ${String(error)}`,
+        );
+      });
+      input.beforeTurnSideEffect?.();
+    }
+    input.beforeTurnSideEffect?.();
+    // Issue #161: a fresh/resumed re-brief parent keeps a product-owned id
+    // (the resumed row's id, else a fresh one) plus the child tools.
+    const identity = parentIdentitySpawnOptions(
+      input,
+      input.resumeFile !== undefined && input.resumeFile !== null ? input.resumeFile : null,
+    );
     const handle = await input.registry.spawn('minion', {
       cwd,
       ...(input.resumeFile !== undefined && input.resumeFile !== null ? { resumeFile: input.resumeFile } : {}),
+      ...identity,
     });
-    input.ledger.registerAgent({
-      id: handle.id,
-      role: 'minion',
-      sessionFile: handle.sessionFile,
-      jobId: input.jobId,
-    });
-    input.onSpawned?.({ id: handle.id, sessionFile: handle.sessionFile });
-    const prompt = renderRebriefPrompt({
-      jobId: input.jobId,
-      briefing: input.briefing,
-      note: input.note,
-      ...(input.lessons !== undefined
-        ? { lessons: input.lessons.referencesFor(`${input.note}\n${input.briefing ?? ''}`) }
-        : {}),
-    });
-    let promptError: unknown = null;
+    let prompt: string;
     try {
-      await handle.prompt(prompt, { owner: `silas-rebrief:${input.jobId}` });
+      input.beforeTurnSideEffect?.();
+      // A FRESH re-brief session (no prior row) is explicitly top-level;
+      // a resumed row keeps its recorded parentage (never retro-fitted).
+      input.ledger.registerAgent({
+        id: handle.id,
+        role: 'minion',
+        sessionFile: handle.sessionFile,
+        jobId: input.jobId,
+        ...(input.ledger.getAgent(handle.id) === null ? { parentage: 'top-level' as const } : {}),
+      });
+      input.onSpawned?.({ id: handle.id, sessionFile: handle.sessionFile });
+      prompt = renderRebriefPrompt({
+        jobId: input.jobId,
+        briefing: input.briefing,
+        note: input.note,
+        ...(input.lessons !== undefined
+          ? { lessons: input.lessons.referencesFor(`${input.note}\n${input.briefing ?? ''}`) }
+          : {}),
+      });
+      // registerAgent publishes agent.spawned after COMMIT. A subscriber
+      // can close the job or replace this request before the prompt; no
+      // await may separate this last fence from prompt delivery.
+      input.beforeTurnSideEffect?.();
+    } catch (error) {
+      try {
+        await handle.dispose();
+        // Registration can commit and then throw from its publication
+        // listener. Check the row rather than assuming a returned call.
+        if (input.ledger.listAgents().some((agent) => agent.id === handle.id)) {
+          input.ledger.setAgentState(handle.id, 'disposed');
+        }
+      } catch (cleanupError) {
+        throw new Error(`could not dispose minion ${handle.id} after failed re-brief setup: ${String(cleanupError)}`, { cause: error });
+      }
+      throw error;
+    }
+    let promptError: unknown = null;
+    let verdict: PromptTurnVerdict | null = null;
+    try {
+      verdict = await promptWithTerminalVerdict(handle, prompt, { owner: `silas-rebrief:${input.jobId}` });
     } catch (error) {
       promptError = error;
     } finally {
@@ -376,7 +555,22 @@ export async function rebriefFreshMinion(
     if (promptError !== null && disposition !== 'recovered') {
       throw new Error(`re-brief turn failed on ${handle.id}: ${String(promptError)}`);
     }
-    return { minionId: handle.id, lanePath: lane.path, prompt, sessionFile: handle.sessionFile };
+    // Terminal/error correlation (r4/r5 blocker 1): the transport captured
+    // the verdict when THIS prompt settled, before any queued successor
+    // could start, and it is held across the retry settlement. A
+    // resolved-but-errored turn is not a delivery; a retry-recovered
+    // disposition is the retry's own clean turn.
+    const evidence =
+      disposition === 'recovered'
+        ? ({ ok: true, error: null } as const)
+        : (verdict ?? promptVerdictFromHealth(handle));
+    return {
+      minionId: handle.id,
+      lanePath: lane.path,
+      prompt,
+      sessionFile: handle.sessionFile,
+      ...verdictFields(evidence),
+    };
   } finally {
     lease?.release();
   }
