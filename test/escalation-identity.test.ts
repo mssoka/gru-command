@@ -229,13 +229,15 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       ['`Perkins report for round ${round.id} was recorded but NOT posted safely to the pull request`', '{ jobId: round.jobId, roundId: round.id }'],
       ['`Perkins report for round ${round.id} was recorded but has NO pull request to publish to`', '{ jobId: round.jobId, roundId: round.id }'],
       ['`Perkins report for round ${round.id} was recorded but NOT posted to the pull request`', '{ jobId: round.jobId, roundId: round.id }'],
+      ['`Review round ${round.id} INCOMPLETE record event could not be persisted`', '{ jobId: job.id, roundId: round.id }'],
       ['`Review round ${round.id} is INCOMPLETE`', '{ jobId: job.id, roundId: round.id }'],
+      ['`Review round ${round.id} finalization artifact failed after its verdict committed`', '{ jobId: job.id, roundId: round.id }'],
       ['`Review round ${round.id} is INCOMPLETE`', '{ jobId: job.id, roundId: round.id }'],
       ['`Review worktree for round ${worktreeId} paused on live processes`', null],
       ['`Review worktree for round ${worktreeId} could not be swept`', null],
     ];
     expect(sites.map((site) => [site.title, site.context])).toEqual(expected);
-    expect(sites).toHaveLength(26);
-    expect(sites.filter((site) => site.context !== null)).toHaveLength(23);
+    expect(sites).toHaveLength(28);
+    expect(sites.filter((site) => site.context !== null)).toHaveLength(25);
   });
 });

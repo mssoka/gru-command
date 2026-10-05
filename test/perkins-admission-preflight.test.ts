@@ -500,6 +500,54 @@ describe('Perkins admission preflight (gh-169)', () => {
     }
   });
 
+  it('enforces ONE cumulative budget: slow identification then a stalled remote refuse within the single deadline (R7-3)', async () => {
+    const repo = makeFixtureRepo('admission-cumulative-budget');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/cumulative']);
+    const target = repo.commitFile('src/main.ts', 'export const c = 1;\n');
+    attachBareOrigin(repo);
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/main']);
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/feature/cumulative']);
+    const artifactRoot = temp('admission-artifacts-');
+    const ci = renderRecordedCiEvidence({
+      events: { branchState: null, ciGreen: null, ciFailed: null },
+      targetSha: target,
+      expectedRepo: 'acme/fixture',
+      expectedPr: 13,
+    });
+    let spec = appendRecordedVerification({ spec: 'Acceptance: c is 1.', evidence: null });
+    spec = appendCiEvidence({ spec, block: ci.block, maxBytes: 256 * 1024 });
+    const review = freezeReviewInputs({
+      roundId: 'round-cumulative',
+      repoPath: repo.path,
+      artifactRoot,
+      baseRef: 'main',
+      targetRef: target,
+      movementRef: 'origin/feature/cumulative',
+      spec,
+      ciEvidence: ci.record,
+    });
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    const shimDir = temp('admission-shim-');
+    const shim = join(shimDir, 'git');
+    // Identification is SLOW (600 ms per rev-parse/remote) and the remote
+    // probe STALLS: the single 1.5 s budget must cover both and refuse.
+    writeFileSync(shim, `#!/bin/sh\ncase " $* " in *"rev-parse"*|*" remote "*) sleep 0.6;; *"ls-remote"*) sleep 20;; esac\nexec "${realGit}" "$@"\n`);
+    chmodSync(shim, 0o755);
+    const oldPath = process.env.PATH;
+    process.env.PATH = `${shimDir}:${oldPath ?? ''}`;
+    try {
+      const startedAt = Date.now();
+      const movement = await probeAdvertisedTipMovementAsync(review, 1_500);
+      const elapsed = Date.now() - startedAt;
+      expect(movement?.cause).toBe('check-failed');
+      expect(elapsed).toBeLessThan(8_000);
+    } finally {
+      if (oldPath === undefined) delete process.env.PATH;
+      else process.env.PATH = oldPath;
+    }
+  });
+
   it('is read-only: a pass and a refusal leave every frozen packet byte identical', () => {
     const { review, packetHashes } = preflightHarness({ withEvidence: true });
     admissionPreflight(review, 'feature/admission'); // pass

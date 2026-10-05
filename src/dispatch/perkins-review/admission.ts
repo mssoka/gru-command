@@ -22,11 +22,15 @@ export const ADMISSION_REMOTE_PROBE_TIMEOUT_MS = 5_000;
 
 export interface AdmissionPreflightOptions {
   readonly remoteProbeTimeoutMs?: number;
-  /** R6-6: the ledger's independent round.freeze-manifest sha256 receipt.
-   * When supplied, the on-disk manifest BYTES must match it exactly — a
-   * whitespace-only rewrite of a semantically identical manifest refuses
-   * admission under frozen-packet:manifest.json. */
+  /** R6-6/R7-4: the ledger's independent round.freeze-manifest sha256
+   * receipt. The byte proof is REQUIRED at the built-in admission gate —
+   * a missing or malformed receipt refuses (never a silently skipped
+   * byte proof), and a whitespace-only rewrite of a semantically
+   * identical manifest refuses under frozen-packet:manifest.json. */
   readonly frozenManifestSha256?: string;
+  /** True at the built-in gate: the freeze receipt must exist and be a
+   * valid sha256 for the manifest bytes to be trusted at all. */
+  readonly frozenManifestReceiptRequired?: boolean;
   /** Precomputed ASYNC advertised-tip result (gh-169 R4-6): when supplied,
    * the sync probe is skipped and this outcome is merged into
    * head-binding — the remote lookup never blocks the event loop. */
@@ -216,6 +220,11 @@ export function admissionPreflight(review: FrozenReview, movementRef: string, op
   const manifestBytes = readFrozen('manifest.json', FROZEN_MANIFEST_MAX_BYTES);
   if (manifestBytes instanceof Error) {
     fail('frozen-packet:manifest.json', `the frozen manifest cannot be read: ${sanitizeDetail(manifestBytes)}`);
+  } else if (options?.frozenManifestReceiptRequired === true &&
+    (options.frozenManifestSha256 === undefined || !/^[a-f0-9]{64}$/u.test(options.frozenManifestSha256))) {
+    // R7-4: no independent receipt, no trusted bytes — the gate refuses
+    // instead of silently dropping the byte proof.
+    fail('frozen-packet:manifest.json', 'the ledger freeze receipt (round.freeze-manifest) is missing or malformed — the frozen manifest bytes cannot be independently proven');
   } else if (options?.frozenManifestSha256 !== undefined && sha256(manifestBytes) !== options.frozenManifestSha256) {
     // R6-6: byte identity against the independently pinned receipt — a
     // rewritten-but-equivalent manifest is a mutated frozen packet.

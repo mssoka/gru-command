@@ -1011,10 +1011,10 @@ describe('WaveRunner built-in Perkins production path', () => {
     // never a 'not used' done chip.
     const edge = chips.find((chip) => chip.lens === 'edge');
     expect(edge?.state).toBe('error');
-    expect(edge?.note).toContain('attempt started but unsettled');
+    expect(edge?.note).toContain('attempt(s) started but unsettled: a1');
     const edgeResult = outcome.results[chips.findIndex((chip) => chip.lens === 'edge')];
     expect(edgeResult?.state).toBe('error');
-    expect(edgeResult?.state === 'error' && edgeResult.note).toContain('attempt started but unsettled');
+    expect(edgeResult?.state === 'error' && edgeResult.note).toContain('attempt(s) started but unsettled: a1');
     // The conclusive appendix discloses it as started work, never not-used.
     const postedBody = poster.post.mock.calls[0]?.[0]?.body as string;
     expect(postedBody).toContain('2 journaled (1 valid, 0 failed; 1 started-but-unsettled: edge a1)');
@@ -1470,6 +1470,242 @@ describe('WaveRunner built-in Perkins production path', () => {
     expect(chips.find((chip) => chip.lens === 'tests')?.note).toContain('interrupted by parent abort');
     const incidents = ledger.listEvents({ limit: 200 }).filter((event) => event.kind === 'round.parent-incident');
     expect(incidents).toHaveLength(1);
+  });
+
+  it('a post-verdict event-write failure never reclassifies the committed verdict (gh-169 R7-1)', async () => {
+    const repo = makeFixtureRepo('perkins-event-write-failure');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/event-write-failure']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-ewf-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-ewf-artifacts-'));
+    const sessions = mkdtempSync(join(tmpdir(), 'perkins-ewf-sessions-'));
+    dirs.push(root, artifacts, sessions);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-ewf-db-')));
+    dbs.push(db);
+    class ReviewEventExplodingLedger extends LedgerApi {
+      override appendCustomEvent(fields: Parameters<LedgerApi['appendCustomEvent']>[0]): ReturnType<LedgerApi['appendCustomEvent']> {
+        if (fields.kind === 'round.perkins-review') throw new Error('simulated review-event write failure');
+        return super.appendCustomEvent(fields);
+      }
+    }
+    const ledger = new ReviewEventExplodingLedger(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/event-write-failure', target);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-ewf' });
+    const job = ledger.addJob({ id: 'job-ewf', repo: 'fixture', title: 'event write failure', baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://github.com/acme/fixture/pull/57');
+    attachOrigin(repo, 'feature/event-write-failure', root);
+    const escalations: string[] = [];
+    const fake = fakeWholeSpawner(sessions, { specialists: ['security'], childAnswer: () => '[]' });
+    const poster = {
+      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
+        reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+        headSha: call.targetSha, baseSha: 'b'.repeat(40),
+        bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
+      })),
+    };
+    const wave = new WaveRunner({
+      ledger, worktrees: port, spawner: fake.spawner, reviewArtifactRoot: artifacts,
+      poster, prHeadProbe: localHeadProbe('feature/event-write-failure'),
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+    });
+    const outcome = asWave(await wave.runRound({ jobId: job.id }));
+    // The verdict and chips committed atomically; the later event write
+    // failed and was NOT reclassified — no INCOMPLETE, no parent incident.
+    expect(outcome.verdict).toBe('approved');
+    expect(outcome.round.status).toBe('verdict-posted');
+    expect(outcome.round.verdict).toBe('approved');
+    const chips = ledger.getRound(outcome.round.id)?.lenses ?? [];
+    expect(chips.find((chip) => chip.lens === 'security')?.state).toBe('done');
+    for (const chip of chips.filter((entry) => entry.lens !== 'security')) {
+      expect(chip.state, chip.lens).toBe('done');
+    }
+    expect(ledger.listEvents({ limit: 200 }).some((event) => event.kind === 'round.parent-incident')).toBe(false);
+    expect(escalations.some((entry) => entry.includes('after its verdict committed'))).toBe(true);
+  });
+
+  it('a failed round.perkins-incomplete event write never reclassifies the lead INCOMPLETE as a parent failure (gh-169 R7-2)', async () => {
+    const repo = makeFixtureRepo('perkins-incomplete-event-failure');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/incomplete-event-failure']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-ief-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-ief-artifacts-'));
+    const sessions = mkdtempSync(join(tmpdir(), 'perkins-ief-sessions-'));
+    dirs.push(root, artifacts, sessions);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-ief-db-')));
+    dbs.push(db);
+    class IncompleteEventExplodingLedger extends LedgerApi {
+      override appendCustomEvent(fields: Parameters<LedgerApi['appendCustomEvent']>[0]): ReturnType<LedgerApi['appendCustomEvent']> {
+        if (fields.kind === 'round.perkins-incomplete') throw new Error('simulated incomplete-event write failure');
+        return super.appendCustomEvent(fields);
+      }
+    }
+    const ledger = new IncompleteEventExplodingLedger(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/incomplete-event-failure', target);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-ief' });
+    const job = ledger.addJob({ id: 'job-ief', repo: 'fixture', title: 'incomplete event failure', baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/58');
+    attachOrigin(repo, 'feature/incomplete-event-failure', root);
+    const escalations: string[] = [];
+    const fake = fakeWholeSpawner(sessions, { childAnswer: () => '[]', verdictOverride: 'INCOMPLETE' });
+    const wave = new WaveRunner({
+      ledger, worktrees: port, spawner: fake.spawner, reviewArtifactRoot: artifacts,
+      prHeadProbe: localHeadProbe('feature/incomplete-event-failure'),
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+    });
+    const outcome = asWave(await wave.runRound({ jobId: job.id }));
+    expect(outcome.canonicalVerdict).toBe('INCOMPLETE');
+    expect(outcome.round.status).toBe('aborted');
+    // The lead's classification stands; the failed EVENT write is
+    // disclosed — and no parent incident is minted for it.
+    expect(ledger.listEvents({ limit: 200 }).some((event) => event.kind === 'round.parent-incident')).toBe(false);
+    expect(escalations.some((entry) => entry.includes('could not be persisted'))).toBe(true);
+    expect(existsSync(join(artifacts, outcome.round.id, 'perkins-report.host-incomplete.md'))).toBe(true);
+  });
+
+  it('requires a valid independent freeze receipt before trusting the manifest bytes (gh-169 R7-4)', async () => {
+    const repo = makeFixtureRepo('perkins-missing-receipt');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/missing-receipt']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-mr-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-mr-artifacts-'));
+    const sessions = mkdtempSync(join(tmpdir(), 'perkins-mr-sessions-'));
+    dirs.push(sessions);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-mr-db-')));
+    dbs.push(db);
+    class ReceiptSuppressingLedger extends LedgerApi {
+      private suppressed?: unknown;
+      override appendCustomEvent(fields: Parameters<LedgerApi['appendCustomEvent']>[0]): ReturnType<LedgerApi['appendCustomEvent']> {
+        // The receipt write SILENTLY vanishes (a torn/lost write): the
+        // preflight must refuse by name rather than skip the byte proof.
+        if (fields.kind === 'round.freeze-manifest') {
+          this.suppressed = fields;
+          return super.appendCustomEvent({ ...fields, kind: 'round.freeze-manifest-lost' });
+        }
+        return super.appendCustomEvent(fields);
+      }
+    }
+    const ledger = new ReceiptSuppressingLedger(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/missing-receipt', target);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-mr' });
+    const job = ledger.addJob({ id: 'job-mr', repo: 'fixture', title: 'missing receipt', baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/59');
+    attachOrigin(repo, 'feature/missing-receipt', root);
+    const underlying = makeSpawner(sessions, []);
+    const wave = new WaveRunner({
+      ledger, worktrees: port, spawner: (role, options) => underlying(role, options),
+      reviewArtifactRoot: artifacts, prHeadProbe: localHeadProbe('feature/missing-receipt'),
+    });
+    // No independent receipt: the byte proof is REQUIRED, so admission
+    // refuses under the manifest's own name instead of silently skipping.
+    await expect(wave.runRound({ jobId: job.id })).rejects.toThrow(/freeze receipt \(round\.freeze-manifest\) is missing or malformed/u);
+  });
+
+  it('selects the newest verification run THAT BINDS the target — a newer other-sha run never erases it (gh-169 R7-5)', async () => {
+    const repo = makeFixtureRepo('perkins-binding-verification');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/binding-verification']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-bv-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-bv-artifacts-'));
+    dirs.push(root, artifacts);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-bv-db-')));
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/binding-verification', target);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-bv' });
+    const job = ledger.addJob({ id: 'job-bv', repo: 'fixture', title: 'binding verification', baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/60');
+    attachOrigin(repo, 'feature/binding-verification', root);
+    // An OLDER completed run that BINDS the target (PASS), then a NEWER
+    // completed run for a DIFFERENT sha — the binding run must win.
+    ledger.appendCustomEvent({
+      kind: 'verification.completed',
+      jobId: job.id,
+      payload: {
+        sha: target, scope: 'full', command: 'npm test', ok: true, exit_code: 0,
+        duration_ms: 1000, workers: 2, run_id: 'run-bind-1', output_bytes: 4096,
+        output_sha256: createHash('sha256').update('bind').digest('hex'),
+      },
+    });
+    ledger.appendCustomEvent({
+      kind: 'verification.completed',
+      jobId: job.id,
+      payload: {
+        sha: 'f'.repeat(40), scope: 'full', command: 'npm test', ok: true, exit_code: 0,
+        duration_ms: 900, workers: 2, run_id: 'run-other-1', output_bytes: 2048,
+        output_sha256: createHash('sha256').update('other').digest('hex'),
+      },
+    });
+    const underlying = makeSpawner(mkdtempSync(join(tmpdir(), 'perkins-bv-sessions-')), []);
+    const wave = new WaveRunner({
+      ledger, worktrees: port, spawner: (role, options) => underlying(role, options),
+      reviewArtifactRoot: artifacts, prHeadProbe: localHeadProbe('feature/binding-verification'),
+    });
+    await expect(wave.runRound({ jobId: job.id })).resolves.toBeTruthy();
+    const round = ledger.listRounds(job.id)[0]!;
+    const frozenSpec = readFileSync(join(artifacts, round.id, 'spec-context.md'), 'utf8');
+    expect(frozenSpec).toContain('result: PASS (exit 0)');
+    expect(frozenSpec).toContain('run_id: run-bind-1');
+    expect(frozenSpec).not.toContain('NO BOUND VERIFICATION RUN');
+  });
+
+  it('names every charged unsettled attempt when no result settled (gh-169 R7-6)', async () => {
+    const repo = makeFixtureRepo('perkins-two-charged');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/two-charged']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-tc-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-tc-artifacts-'));
+    const sessions = mkdtempSync(join(tmpdir(), 'perkins-tc-sessions-'));
+    dirs.push(root, artifacts, sessions);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-tc-db-')));
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/two-charged', target);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-tc2' });
+    const job = ledger.addJob({ id: 'job-tc2', repo: 'fixture', title: 'two charged', baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://github.com/acme/fixture/pull/61');
+    attachOrigin(repo, 'feature/two-charged', root);
+    const poster = {
+      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
+        reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+        headSha: call.targetSha, baseSha: 'b'.repeat(40),
+        bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
+      })),
+    };
+    const fake = fakeWholeSpawner(sessions, { specialists: ['security'], childAnswer: () => '[]' });
+    const wave = new WaveRunner({
+      ledger, worktrees: port, spawner: fake.spawner, reviewArtifactRoot: artifacts,
+      poster, prHeadProbe: localHeadProbe('feature/two-charged'),
+      reviewFreezeObserver: (frozen) => {
+        // TWO charged starts on a lens that never settles.
+        for (const attempt of [1, 2] as const) {
+          ledger.appendCustomEvent({
+            kind: 'round.specialist-started',
+            jobId: job.id,
+            roundId: roundIdOf(frozen.directory),
+            payload: { lens: 'edge', attempt, originRoundId: roundIdOf(frozen.directory) },
+          });
+        }
+      },
+    });
+    const outcome = asWave(await wave.runRound({ jobId: job.id }));
+    const edgeChip = ledger.getRound(outcome.round.id)?.lenses.find((chip) => chip.lens === 'edge');
+    expect(edgeChip?.state).toBe('error');
+    expect(edgeChip?.note).toContain('attempt(s) started but unsettled: a1, a2');
   });
 
   it('records ONE parent incident and zero executed specialist failures when the lead transport dies before any child (gh-169)', async () => {

@@ -708,11 +708,10 @@ export async function probeAdvertisedTipMovementAsync(
   }
   if (remoteTarget === null) return null;
   try {
-    const { stdout } = await execFileAsPromised(
-      'git',
-      ['-C', review.manifest.repoPath, 'ls-remote', '--exit-code', remoteTarget.remote, `refs/heads/${remoteTarget.branch}`],
-      { encoding: 'utf8', timeout: timeoutMs, maxBuffer: 1024 * 1024 },
-    );
+    // R7-3: the FINAL call flows through run() — the remaining budget at
+    // the moment of the probe is what ls-remote gets, and exhaustion
+    // fails closed.
+    const stdout = await run(['ls-remote', '--exit-code', remoteTarget.remote, `refs/heads/${remoteTarget.branch}`]);
     const tip = stdout.trim().split(/\s+/u)[0] ?? '';
     if (tip !== targetSha) {
       return movement('target-moved', `advertised ${remoteTarget.remote}/${remoteTarget.branch} is ${tip}, frozen at ${targetSha}`);
