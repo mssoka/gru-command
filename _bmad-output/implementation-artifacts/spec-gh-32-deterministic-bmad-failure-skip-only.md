@@ -2,7 +2,7 @@
 title: 'GH-32: deterministic BMAD setup failures must not offer futile retry'
 type: 'bugfix'
 created: '2026-09-30'
-status: 'in-review'
+status: 'in-progress'
 route: 'oneshot'
 baseline_commit: '2aa836abe262759c651683deb40d05f02c9ede86'
 review_loop_iteration: 0
