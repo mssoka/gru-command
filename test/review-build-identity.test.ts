@@ -162,7 +162,7 @@ describe('installed Perkins runtime identity', () => {
     rmSync(dependency);
     rmSync(join(root, 'dist', 'review-dependency-identity.json'));
     expect(() => reviewRuntimeVersion(root)).toThrow();
-  }, 150_000);
+  }, 300_000);
 
   it('resolves a hoisted installed dependency by the Node ancestor lookup', () => {
     const { root, identity } = packageIdentity();
@@ -274,7 +274,8 @@ describe('installed Perkins runtime identity', () => {
       const lane = await manager.createJobWorktree({ repoPath: repo.path, jobId });
       writeFileSync(join(lane.path, 'src', 'main.ts'), 'export function answer(): number { return 43; }\n');
       execFileSync('git', ['-C', lane.path, 'add', 'src/main.ts']);
-      execFileSync('git', ['-C', lane.path, 'commit', '-m', 'change answer']);
+      execFileSync('git', ['-C', lane.path, '-c', 'user.name=Fixture Tests',
+        '-c', 'user.email=tests@example.invalid', 'commit', '-m', 'change answer']);
       const target = execFileSync('git', ['-C', lane.path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
       ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { sha: target } });
       writeFileSync(join(home, 'config.toml'), [

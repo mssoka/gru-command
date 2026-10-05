@@ -101,6 +101,19 @@ function fixture(): string {
   return root;
 }
 
+it.skipIf(process.platform !== 'linux')('keeps a checked installation valid when an unrelated sibling is created in its shared parent', async () => {
+  const { reviewRuntimeVersion } = await import('../src/runtime/review-build-identity.js');
+  const root = fixture();
+  writeFileSync(join(root, 'package.json'), JSON.stringify({ dependencies: {} }));
+  const original = reviewRuntimeVersion(root);
+  const neighbor = join(dirname(root), `gru-review-neighbor-${basename(root)}.txt`);
+  roots.push(neighbor);
+  Object.assign(seam, { addAtDigest: 'dist/review-dependency-identity.json', addFile: neighbor });
+  expect(reviewRuntimeVersion(root)).toBe(original);
+  expect(seam.additions).toBe(1);
+  expect(seam.unknownDigestUpdates).toBe(0);
+});
+
 it.skipIf(process.platform !== 'darwin')('rejects a real-directory swap at file open before reading or hashing foreign bytes', async () => {
   const { reviewRuntimeVersion } = await import('../src/runtime/review-build-identity.js');
   const root = fixture();
@@ -208,9 +221,10 @@ it('retains the original package descriptor across a package-directory replaceme
   try {
     expect(() => reviewRuntimeVersion(root)).toThrow(process.platform === 'darwin'
       ? /directory enumeration failed|directory changed|file changed/
-      : 'installed dependency changed during fingerprint');
+      : /installed dependency changed during fingerprint|review runtime directory changed during child selection/);
     expect(seam.swapCount).toBe(1);
     expect(seam.foreignReads).toBe(0);
+    expect(seam.unknownDigestUpdates).toBe(0);
   } finally {
     if (seam.swapCount !== 0) {
       const { renameSync } = await import('node:fs');

@@ -223,7 +223,13 @@ export function reviewRuntimeVersion(packageRoot: string): string {
       checkedReviewDirectoryEntries(rootFd, rootListing);
     } else {
       assertDirectoryReceipt(rootFd, rootReceipt);
-      assertDirectoryReceipt(rootParentFd!, rootParentReceipt!);
+      // The parent may be shared (for example /tmp): unrelated siblings can
+      // change its mtime/ctime without changing this installation. Check its
+      // identity, then re-open the installed root below to bind the pathname.
+      const parent = directoryReceipt(rootParentFd!);
+      if (parent.dev !== rootParentReceipt!.dev || parent.ino !== rootParentReceipt!.ino) {
+        throw new Error('review runtime installed root changed parents during fingerprint');
+      }
       const installedFd = openCheckpoint(dirname(root), basename(root));
       try {
         const installed = directoryReceipt(installedFd);
