@@ -162,13 +162,24 @@ function ciEvidenceLine(ci: CiEvidenceRecord | null | undefined): string | null 
     return '- CI evidence at freeze: NOT RECORDED — this round predates the frozen CI-record disclosure; absence here is not a pass and not a failure';
   }
   const bound = `observed ${ci.observedAt ?? 'unknown time'} via ${ci.sourceKind ?? 'unknown'} (ledger seq ${ci.sourceSeq ?? 'unknown'})`;
+  // Q7: untrusted check/failure NAMES are individually bounded and
+  // visibly elided past a small cap — a hostile long name cannot push an
+  // otherwise publishable body past the provider bound, and the elision
+  // is explicit rather than silent truncation.
+  const boundedNames = (names: readonly string[]): string => {
+    if (names.length === 0) return 'none named';
+    const shown = names.slice(0, 5).map((name) => renderUntrustedInline(name, 60));
+    return names.length > shown.length
+      ? `${shown.join(', ')}, … +${names.length - shown.length} more (elided)`
+      : shown.join(', ');
+  };
   switch (ci.state) {
     case 'green':
       return `- CI evidence at freeze: GREEN (recorded observation, ${ci.checks.length} check(s)) — ${bound}`;
     case 'pending':
       return `- CI evidence at freeze: PENDING — NOT PASS (${ci.checks.length} check(s)) — ${bound}`;
     case 'failed':
-      return `- CI evidence at freeze: FAILED — NOT PASS (${ci.failures.length} failing check(s): ${ci.failures.map((failure) => failure.name).join(', ') || 'none named'}) — ${bound}`;
+      return `- CI evidence at freeze: FAILED — NOT PASS (${ci.failures.length} failing check(s): ${boundedNames(ci.failures.map((failure) => failure.name))}) — ${bound}`;
     case 'unavailable':
       return `- CI evidence at freeze: UNAVAILABLE — NO BOUND CI RECEIPT (missing evidence, not a measured failure): ${renderUntrustedInline(ci.reason ?? 'no reason recorded', 200)}`;
     case 'not-matched':
@@ -1276,6 +1287,12 @@ export interface WaveRunnerOptions {
   /** Fail-closed four-leg capability pre-flight, evaluated per review request
    * with the job's repository path. Absent = Perkins route (test seam). */
   readonly reviewPreflight?: (input: { readonly repoPath: string }) => Promise<ReviewPreflightResult>;
+  /** Read-only instrumentation (gh-169 Q9): invoked exactly once per
+   * round, immediately after the freeze receipts and BEFORE the admission
+   * preflight — the single seam where tests observe (or, for refusal
+   * fixtures, corrupt) the just-frozen packet without touching live
+   * sources. Production leaves it unset; it never alters the packet. */
+  readonly reviewFreezeObserver?: (review: FrozenReview) => void;
   /** bmad-review fallback gate configuration. Required for fallback routing
    * to be available; without it a failed pre-flight reports both options. */
   readonly fallbackGate?: FallbackGateOptions;
@@ -1485,16 +1502,22 @@ export class WaveRunner {
           encoding: 'utf8', mode: 0o600, flag: 'wx',
         });
       }
-      // P6 (gh-169): the durable restart report carries the host's
+      // P6/Q4 (gh-169): the durable restart report carries the host's
       // execution facts — started attempts and never-started lenses from
       // the SAME classification abortRound used. The caller passes the
       // PRE-ABORT facts (a live chip is `live` only before abortRound
       // flips it); without them the round's current record degrades to
       // journal-only truth — never invented counts, and a missing round
-      // record degrades to the historical generic note.
+      // record degrades to the historical generic note. Q4: the incident
+      // heading follows the LEDGER truth — a "parent incident" is claimed
+      // only when the round.parent-incident event exists; pre-spawn
+      // interruptions say so explicitly instead.
       const round = this.opts.ledger.getRound(roundId);
       const facts = preAbortFacts ??
         (round === null ? null : this.interruptedExecutionFacts(round, round.lenses.map((chip) => chip.lens as PerkinsLens)));
+      const incidentHeading = this.opts.ledger.latestRoundEvent(roundId, 'round.parent-incident') !== null
+        ? '**Parent incident** — the service died beneath this round; this is one parent incident, not a per-lens specialist failure.'
+        : '**Setup interruption** — the round ended before any review owner spawned; zero lead turns and zero specialist children existed.';
       const contents = [
         '# Perkins Code Review',
         '',
@@ -1502,7 +1525,7 @@ export class WaveRunner {
         '',
         `${note}. Rerun a complete review against a newly frozen target.`,
         '',
-        '**Parent incident** — the service died beneath this round; this is one parent incident, not a per-lens specialist failure.',
+        incidentHeading,
         '',
         ...(facts !== null ? [facts, ''] : []),
       ].join('\n');
@@ -1813,11 +1836,11 @@ export class WaveRunner {
 
   /** Lenses with a started execution this round — ONE classification
    * shared by every parent-incident surface (P5): a durable
-   * `round.specialist-started` journal entry (the budget authority) OR a
-   * live chip (a registered child whose journal write may predate the
-   * crash that lost it). `abortRound`, the parent-incident event and the
-   * interrupted outcomes/reports all derive from this set, so a lens can
-   * never be both a failed/live child and "never started" (gh-169). */
+   * `round.specialist-started` journal entry (the budget authority), a
+   * live chip (a registered child), OR a lens an already-persisted
+   * parent-incident event classified as started (Q8: a partial abort that
+   * flipped chips before a later recovery must not relabel that child
+   * never-started). */
   private startedSpecialistLenses(round: RoundRecord): ReadonlySet<string> {
     const started = new Set<string>();
     for (const event of this.opts.ledger.listRoundSpecialistStarts(round.id)) {
@@ -1827,6 +1850,12 @@ export class WaveRunner {
     }
     for (const chip of round.lenses) {
       if (chip.state === 'live') started.add(chip.lens);
+    }
+    const incident = this.opts.ledger.latestRoundEvent(round.id, 'round.parent-incident');
+    const recorded = typeof incident?.payload === 'object' && incident.payload !== null
+      ? (incident.payload as { readonly startedLenses?: unknown }).startedLenses : null;
+    if (Array.isArray(recorded)) {
+      for (const lens of recorded) if (typeof lens === 'string' && lens !== '') started.add(lens);
     }
     return started;
   }
@@ -1839,15 +1868,13 @@ export class WaveRunner {
    * round-level facts (idempotent across a partial abort failure and
    * later recovery: an existing incident is never re-minted, P8). */
   private abortRound(round: RoundRecord, note: string): void {
+    // Q8: the incident event is persisted FIRST (from the PRE-abort
+    // classification), before any chip flips — a partial failure leaves
+    // either no event plus untouched chips (a clean retry recomputes the
+    // same set) or a persisted event whose startedLenses outlive chip
+    // changes. The append is idempotent, so a retry never mints a second
+    // incident.
     const started = this.startedSpecialistLenses(round);
-    for (const chip of round.lenses) {
-      if (chip.state === 'live' || (chip.state === 'pending' && started.has(chip.lens))) {
-        this.opts.ledger.setLensOutcome(round.id, chip.lens, 'error',
-          `attempt started; interrupted by parent abort before settlement: ${note}`.slice(0, 500));
-      }
-      // A never-started lens keeps `pending`: the aborted round itself is
-      // the parent incident; no specialist execution failed.
-    }
     if (this.opts.ledger.latestRoundEvent(round.id, 'round.parent-incident') === null) {
       this.opts.ledger.appendCustomEvent({
         kind: 'round.parent-incident',
@@ -1860,6 +1887,14 @@ export class WaveRunner {
           notStartedLenses: round.lenses.filter((chip) => !started.has(chip.lens)).map((chip) => chip.lens),
         },
       });
+    }
+    for (const chip of round.lenses) {
+      if (chip.state === 'live' || (chip.state === 'pending' && started.has(chip.lens))) {
+        this.opts.ledger.setLensOutcome(round.id, chip.lens, 'error',
+          `attempt started; interrupted by parent abort before settlement: ${note}`.slice(0, 500));
+      }
+      // A never-started lens keeps `pending`: the aborted round itself is
+      // the parent incident; no specialist execution failed.
     }
     this.opts.ledger.setRoundStatus(round.id, 'aborted');
   }
@@ -3155,7 +3190,9 @@ export class WaveRunner {
       // promise exists and before any lead or child can spawn. A refusal
       // names every missing input precisely and aborts the round without
       // spawn (the setup catch's no-spawn path); a pass is recorded with
-      // its full check list so the admission evidence is durable.
+      // its full check list so the admission evidence is durable. The
+      // freeze observer (test instrumentation) sees the packet first.
+      this.opts.reviewFreezeObserver?.(frozenReview);
       const admission = admissionPreflight(frozenReview, movementRef);
       this.opts.ledger.appendCustomEvent({
         kind: 'round.admission-preflight',
@@ -3737,6 +3774,12 @@ export class WaveRunner {
         });
       }
       const executionFacts = this.interruptedExecutionFacts(this.opts.ledger.getRound(round.id) ?? round, lenses);
+      // Q4/R12: the report heading follows the ledger truth — a pre-spawn
+      // failure has a durable no-spawn receipt but NO parent-incident
+      // event, so it must not claim one.
+      const incidentHeading = spawnInitiated()
+        ? '**Parent incident** — the round ended before completion; this is one parent incident, not a per-lens specialist failure.'
+        : '**Setup refusal** — the round ended before any review owner spawned; zero lead turns and zero specialist children existed.';
       const incompleteContents = [
         '# Perkins Code Review',
         '',
@@ -3744,7 +3787,7 @@ export class WaveRunner {
         '',
         `${detail.slice(0, 500)}`,
         '',
-        '**Parent incident** — the round ended before completion; this is one parent incident, not a per-lens specialist failure.',
+        incidentHeading,
         '',
         executionFacts,
         '',
@@ -4103,22 +4146,46 @@ export class WaveRunner {
       this.opts.ledger.setRoundVerdict(round.id, recordedVerdict);
     } else {
       this.opts.ledger.setRoundStatus(round.id, 'aborted');
-      // P7 (gh-169): an ordinary lead-authored INCOMPLETE gets the same
-      // host-owned execution facts as exception paths — a separate
-      // write-once artifact beside the immutable lead report (never a
-      // mutation of it), plus the facts in the durable event payload and
-      // the escalation, so the settled record can never read as silent
-      // about what actually executed.
-      const settledFacts = [
-        '**Host-recorded execution facts** — one round, one lead, frozen target unchanged.',
-        '',
-        `Specialist attempts settled this round: ${review.specialistRuns.length} (${review.specialistRuns.filter((run) => run.status === 'valid').length} valid, ${review.specialistRuns.filter((run) => run.status !== 'valid').length} failed) across ${new Set(review.specialistRuns.map((run) => run.lens)).size} of ${lenses.length} available lenses; ${lenses.filter((lens) => !review.specialistRuns.some((run) => run.lens === lens)).length} lens(es) not used.`,
-        '',
-      ].join('\n');
+      // P7/Q5/Q6 (gh-169): an ordinary lead-authored INCOMPLETE (or an
+      // undelivered conclusive report) surfaces the host-owned execution
+      // facts AT the returned report boundary: a write-once host report
+      // that links the preserved, immutable lead report and carries the
+      // factual counts. Counts separate JOURNALED STARTS from SETTLED
+      // results — a charged-but-unsettled attempt (started, then the
+      // round ended before a result committed) is never labeled "not
+      // used" and never vanishes.
+      const journaledStarts = this.opts.ledger.listRoundSpecialistStarts(round.id);
+      const startedLensSet = new Set(journaledStarts.flatMap((event) => {
+        const lens = typeof event.payload === 'object' && event.payload !== null
+          ? (event.payload as { readonly lens?: unknown }).lens : null;
+        return typeof lens === 'string' && lens !== '' ? [lens] : [];
+      }));
+      const settledLensSet = new Set<string>(review.specialistRuns.map((run) => run.lens));
+      const validSettled = review.specialistRuns.filter((run) => run.status === 'valid').length;
+      const failedSettled = review.specialistRuns.filter((run) => run.status !== 'valid').length;
+      const unsettled = [...startedLensSet].filter((lens) => !settledLensSet.has(lens));
+      const neverStarted = lenses.filter((lens) => !startedLensSet.has(lens));
+      const executionFactsLine =
+        `Specialist execution: ${journaledStarts.length} journaled start(s); settled results: ${review.specialistRuns.length} (${validSettled} valid, ${failedSettled} failed)` +
+        `${unsettled.length > 0 ? `; ${unsettled.length} lens(es) started but unsettled (${unsettled.join(', ')}) — the round ended before their result committed` : ''}` +
+        `; ${neverStarted.length} of ${lenses.length} lens(es) never started (${neverStarted.join(', ') || 'none'}).`;
       try {
-        writeReviewArtifact(frozenReview, 'perkins-report.host-facts.md', settledFacts);
+        reportFile = writeReviewArtifact(frozenReview, 'perkins-report.host-incomplete.md', [
+          '# Perkins Code Review',
+          '',
+          '**Verdict: INCOMPLETE** — host-recorded execution facts',
+          '',
+          deliveryError !== undefined
+            ? `The lead completed a report for target \`${review.targetSha}\`, but delivery proof failed (${String(deliveryError).slice(0, 300)}).`
+            : `The lead judged the change INCOMPLETE for target \`${review.targetSha}\`.`,
+          '',
+          executionFactsLine,
+          '',
+          'The lead-authored report is preserved verbatim at `perkins-report.md`; this host-owned summary links it and carries the factual execution counts (gh-169).',
+          '',
+        ].join('\n'));
       } catch (factsError) {
-        this.log('error', 'could not preserve host execution facts for the settled INCOMPLETE report', {
+        this.log('error', 'could not preserve the host-owned INCOMPLETE report with execution facts', {
           round: round.id, error: String(factsError),
         });
       }
@@ -4129,13 +4196,13 @@ export class WaveRunner {
         payload: {
           reason: verdict === null ? 'review_incomplete' : deliveryFailureKind,
           reportFile,
-          executionFacts: settledFacts.split('\n').find((line) => line.startsWith('Specialist attempts settled')) ?? null,
+          executionFacts: executionFactsLine,
           ...(deliveryError !== undefined ? { error: String(deliveryError).slice(0, 500) } : {}),
         },
       });
       this.opts.escalate?.(
         `Review round ${round.id} is INCOMPLETE`,
-        `coverage of the round's selected lenses, verification, source stability, or delivery proof did not complete. Report: ${reportFile}`,
+        `coverage of the round's selected lenses, verification, source stability, or delivery proof did not complete. Host report (with execution facts): ${reportFile}`,
         { jobId: job.id, roundId: round.id },
       );
     }

@@ -82,18 +82,35 @@ function sanitizeDetail(value: unknown): string {
   return String(value instanceof Error ? value.message : value).replace(/[\r\n]+/gu, ' ').trim().slice(0, 300);
 }
 
-/** Full CI-record shape validation (P2): the admission boundary must not
- * accept a hash-consistent manifest whose record the report layer would
- * dereference blindly. Validates the state AND every field the host
- * consumes (checks/failures arrays with well-formed items) — an explicit
- * UNAVAILABLE/NOT-MATCHED record with a reason stays a valid MISSING
- * record, never a measured failure. */
+/** Full CI-record shape validation (P2/Q2): the admission boundary must
+ * not accept a hash-consistent manifest whose record the report layer
+ * would dereference blindly. Validates the state AND every persisted
+ * field of the frozen `CiEvidenceRecord` contract (typed nullable
+ * provenance, arrays with well-formed items, the REQUIRED failure
+ * `conclusion`) — an explicit UNAVAILABLE/NOT-MATCHED record with a
+ * reason stays a valid MISSING record, never a measured failure. */
 function ciRecordShapeProblem(value: unknown): string | null {
   if (typeof value !== 'object' || value === null) return 'the CI record is not an object';
   const record = value as Record<string, unknown>;
   const state = record['state'];
   if (typeof state !== 'string' || !(CI_EVIDENCE_STATES as readonly string[]).includes(state)) {
     return 'unknown state (malformed record)';
+  }
+  for (const [field, kind] of [
+    ['repo', 'string'], ['sha', 'string'], ['observedAt', 'string'], ['sourceKind', 'string'], ['reason', 'string'],
+  ] as const) {
+    const raw = record[field];
+    if (raw !== null && raw !== undefined && typeof raw !== kind) {
+      return `the ${field} field is not ${kind === 'string' ? 'a string or null' : kind}`;
+    }
+  }
+  if (record['pr'] !== null && record['pr'] !== undefined &&
+    (typeof record['pr'] !== 'number' || !Number.isSafeInteger(record['pr']))) {
+    return 'the pr field is not an integer or null';
+  }
+  if (record['sourceSeq'] !== null && record['sourceSeq'] !== undefined &&
+    (typeof record['sourceSeq'] !== 'number' || !Number.isSafeInteger(record['sourceSeq']))) {
+    return 'the sourceSeq field is not an integer or null';
   }
   if (!Array.isArray(record['checks'])) return 'the checks field is not an array';
   if (!Array.isArray(record['failures'])) return 'the failures field is not an array';
@@ -112,6 +129,11 @@ function ciRecordShapeProblem(value: unknown): string | null {
     }
     const url = entry['url'];
     if (url !== undefined && url !== null && typeof url !== 'string') return `failures[${index}].url is malformed`;
+    // The frozen CiEvidenceFailure contract REQUIRES a conclusion — a
+    // failure entry without one is malformed, not merely sparse.
+    if (typeof entry['conclusion'] !== 'string' || entry['conclusion'] === '') {
+      return `failures[${index}].conclusion is required (a non-empty string)`;
+    }
   }
   return null;
 }
@@ -170,30 +192,70 @@ export function admissionPreflight(review: FrozenReview, movementRef: string): A
   const fileBytes = new Map<string, Buffer | null>();
   for (const declared of declaredFiles) {
     const bytes = readFrozen(declared.path, declared.bound);
-    if (bytes instanceof Error) {
-      fail(declared.name, `cannot be read from the frozen packet: ${sanitizeDetail(bytes)}`);
-      fileBytes.set(declared.path, null);
+    fileBytes.set(declared.path, bytes instanceof Error ? null : bytes);
+  }
+  // Plain digest-checked artifacts (one check each). The spec context and
+  // the changed-file list get richer single checks below — Q3 guarantees
+  // EXACTLY ONE verdict per named check, so a digest pass is never later
+  // contradicted by a same-name failure.
+  for (const declared of declaredFiles) {
+    if (declared.path === 'spec-context.md' || declared.path === 'changed-files.json') continue;
+    const bytes = fileBytes.get(declared.path) ?? null;
+    if (bytes === null) {
+      const error = readFrozen(declared.path, declared.bound);
+      fail(declared.name, `cannot be read from the frozen packet: ${sanitizeDetail(error instanceof Error ? error : new Error('unreadable'))}`);
     } else if (sha256(bytes) !== declared.digest) {
       fail(declared.name, 'bytes no longer match the digest declared in the frozen manifest');
-      fileBytes.set(declared.path, bytes);
+    } else pass(declared.name);
+  }
+  // Q1: the changed-file list is a SHAPE-checked packet input, not just a
+  // hashed blob — a hash-consistent malformed list refuses admission under
+  // its own single name.
+  {
+    const bytes = fileBytes.get('changed-files.json') ?? null;
+    const digest = bytes === null ? null : sha256(bytes);
+    if (bytes === null) {
+      fail('frozen-packet:changed-files.json', 'cannot be read from the frozen packet');
+    } else if (digest !== review.manifest.changedFilesSha256) {
+      fail('frozen-packet:changed-files.json', 'bytes no longer match the digest declared in the frozen manifest');
     } else {
-      pass(declared.name);
-      fileBytes.set(declared.path, bytes);
+      try {
+        const parsed: unknown = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+        const shapeOk = Array.isArray(parsed) && parsed.every((entry) => typeof entry === 'string' && entry !== '');
+        if (!shapeOk || JSON.stringify(parsed) !== JSON.stringify(review.manifest.changedFiles)) {
+          fail('frozen-packet:changed-files.json', 'the frozen changed-file list is malformed or does not match the manifest list');
+        } else pass('frozen-packet:changed-files.json');
+      } catch (error) {
+        fail('frozen-packet:changed-files.json', `the frozen changed-file list is not valid UTF-8 JSON: ${sanitizeDetail(error)}`);
+      }
     }
   }
 
   const specBytes = fileBytes.get('spec-context.md') ?? null;
-  // P1: the fatal decode itself is part of the guarded check — invalid
-  // UTF-8 freezes a refusal naming the spec file (and its dependent
-  // sections) instead of escaping as an uncaught exception that skips the
-  // exhaustive admission event. A digest match does NOT prove valid UTF-8
-  // (the manifest hashes raw bytes).
-  let specText: string | null;
+  // Q3/P1: digest AND UTF-8 decodability are ONE combined check on the
+  // spec file's single name — a digest pass is never contradicted by a
+  // later same-name decode failure, and invalid bytes still yield the
+  // exhaustive named refusal (never an uncaught exception).
+  if (specBytes === null) {
+    fail('frozen-packet:spec-context.md', 'cannot be read from the frozen packet');
+  } else if (sha256(specBytes) !== review.manifest.specSha256) {
+    fail('frozen-packet:spec-context.md', 'bytes no longer match the digest declared in the frozen manifest');
+  } else {
+    try {
+      new TextDecoder('utf-8', { fatal: true }).decode(specBytes);
+      pass('frozen-packet:spec-context.md');
+    } catch (error) {
+      fail('frozen-packet:spec-context.md', `the frozen spec context is not valid UTF-8 text: ${sanitizeDetail(error)}`);
+    }
+  }
+  // The decode was already judged inside the combined spec-file check
+  // above; here it only derives the dependent section checks (a failure
+  // can no longer throw — the bytes proved decodable or the check failed).
+  let specText: string | null = null;
   try {
     specText = specBytes === null ? null : new TextDecoder('utf-8', { fatal: true }).decode(specBytes);
-  } catch (error) {
+  } catch {
     specText = null;
-    fail('frozen-packet:spec-context.md', `the frozen spec context is not valid UTF-8 text: ${sanitizeDetail(error)}`);
   }
   if (specText !== null) {
     const supplied = review.manifest.specMode === 'supplied';

@@ -4,7 +4,7 @@ import { createHash, generateKeyPairSync } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   AutoVerdictPoster,
@@ -724,6 +724,118 @@ describe('WaveRunner built-in Perkins production path', () => {
     rmSync(sessions, { recursive: true, force: true });
   });
 
+  it('a lead-submitted INCOMPLETE returns a host-owned report with journal-vs-settled execution facts at the report boundary (gh-169 Q5/Q6)', async () => {
+    const repo = makeFixtureRepo('perkins-lead-incomplete');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/lead-incomplete']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-li-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-li-artifacts-'));
+    const sessions = mkdtempSync(join(tmpdir(), 'perkins-li-sessions-'));
+    dirs.push(root, artifacts, sessions);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-li-db-')));
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/lead-incomplete', target);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-lead-incomplete' });
+    const job = ledger.addJob({ id: 'job-lead-incomplete', repo: 'fixture', title: 'lead incomplete', baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/43');
+    attachOrigin(repo, 'feature/lead-incomplete', root);
+    const escalations: string[] = [];
+    const fake = fakeWholeSpawner(sessions, {
+      specialists: ['security', 'tests'],
+      childAnswer: () => '[]',
+      verdictOverride: 'INCOMPLETE',
+    });
+    const settledHashes = new Map<string, string>();
+    const wave = new WaveRunner({
+      ledger, worktrees: port, spawner: fake.spawner, reviewArtifactRoot: artifacts,
+      prHeadProbe: localHeadProbe('feature/lead-incomplete'),
+      reviewFreezeObserver: (frozen) => {
+        for (const name of ['manifest.json', 'diff.patch', 'spec-context.md', 'project-conventions.md', 'changed-files.json']) {
+          settledHashes.set(name, createHash('sha256').update(readFileSync(join(frozen.directory, name))).digest('hex'));
+        }
+      },
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+    });
+    const outcome = asWave(await wave.runRound({ jobId: job.id }));
+    expect(outcome.canonicalVerdict).toBe('INCOMPLETE');
+    expect(outcome.round.status).toBe('aborted');
+    // Q6: the RETURNED report is the host-owned INCOMPLETE report — a
+    // reader at outcome.reportFile sees the factual counts and the link to
+    // the preserved lead report.
+    expect(basename(outcome.reportFile)).toBe('perkins-report.host-incomplete.md');
+    const hostReport = readFileSync(outcome.reportFile, 'utf8');
+    expect(hostReport).toContain('Specialist execution: 2 journaled start(s); settled results: 2 (2 valid, 0 failed)');
+    expect(hostReport).toContain('7 of 9 lens(es) never started');
+    expect(hostReport).toContain('preserved verbatim at `perkins-report.md`');
+    expect(existsSync(join(artifacts, outcome.round.id, 'perkins-report.md'))).toBe(true);
+    // Q5: the durable event payload carries the same facts line.
+    const incompleteEvent = ledger.listEvents({ limit: 200 }).find((event) => event.kind === 'round.perkins-incomplete');
+    expect((incompleteEvent?.payload as { readonly executionFacts?: string }).executionFacts)
+      .toContain('2 journaled start(s); settled results: 2 (2 valid, 0 failed)');
+    expect(escalations.some((entry) => entry.includes('perkins-report.host-incomplete.md'))).toBe(true);
+    // No parent incident: the lead COMPLETED a submission; this is a
+    // settled INCOMPLETE, not a parent failure.
+    expect(ledger.listEvents({ limit: 200 }).some((event) => event.kind === 'round.parent-incident')).toBe(false);
+    // Q10: the frozen packet stays byte-identical through the full settled
+    // round (preflight, specialist runs, terminalization, host report).
+    for (const [name, digest] of settledHashes) {
+      expect(createHash('sha256').update(readFileSync(join(artifacts, outcome.round.id, name))).digest('hex'), name).toBe(digest);
+    }
+  });
+
+  it('refuses admission through the real wave when the frozen packet corrupts at the freeze boundary (gh-169 Q9)', async () => {
+    const repo = makeFixtureRepo('perkins-admission-refused');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/admission-refused']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-refused-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-refused-artifacts-'));
+    const sessions = mkdtempSync(join(tmpdir(), 'perkins-refused-sessions-'));
+    dirs.push(sessions);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-refused-db-')));
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/admission-refused', target);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-refused' });
+    const job = ledger.addJob({ id: 'job-refused', repo: 'fixture', title: 'admission refused', baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/44');
+    attachOrigin(repo, 'feature/admission-refused', root);
+    const escalations: string[] = [];
+    const underlying = makeSpawner(sessions, []);
+    const wave = new WaveRunner({
+      ledger, worktrees: port,
+      spawner: (role, options) => underlying(role, options),
+      reviewArtifactRoot: artifacts,
+      prHeadProbe: localHeadProbe('feature/admission-refused'),
+      reviewFreezeObserver: (frozen) => {
+        // Corrupt the just-frozen diff between the freeze receipts and the
+        // admission preflight — exactly the boundary the gate owns.
+        writeFileSync(join(frozen.directory, 'diff.patch'), 'tampered after freeze');
+      },
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+    });
+    await expect(wave.runRound({ jobId: job.id })).rejects.toThrow(/review admission preflight refused.*\[frozen-packet:diff\.patch\]/u);
+    // One failed admission event with the exhaustive named missing list,
+    // an aborted round with a durable no-spawn receipt, and ZERO spawns.
+    const admission = ledger.listEvents({ limit: 200 }).find((event) => event.kind === 'round.admission-preflight');
+    expect(admission?.payload).toMatchObject({ ok: false });
+    expect((admission?.payload as { readonly missing?: Array<{ readonly input: string }> }).missing?.map((entry) => entry.input))
+      .toContain('frozen-packet:diff.patch');
+    const aborted = ledger.listRounds(job.id).find((entry) => entry.status === 'aborted');
+    expect(aborted).toBeDefined();
+    expect(ledger.listEvents({ limit: 200 }).some((event) => event.kind === 'round.review-no-spawn')).toBe(true);
+    expect(ledger.listAgents().filter((agent) => agent.roundId === aborted!.id)).toEqual([]);
+    expect(ledger.listEvents({ limit: 200 }).some((event) => event.kind === 'round.parent-incident')).toBe(false);
+    expect(escalations.some((entry) => entry.includes('refused admission before any specialist started') && entry.includes('frozen-packet:diff.patch'))).toBe(true);
+    expect(port.getWorktree(aborted!.id)?.status).toBe('swept');
+  });
+
   it('records ONE parent incident and zero executed specialist failures when the lead transport dies before any child (gh-169)', async () => {
     const repo = makeFixtureRepo('perkins-lead-connection-error');
     repos.push(repo);
@@ -763,9 +875,18 @@ describe('WaveRunner built-in Perkins production path', () => {
       };
     };
     const escalations: string[] = [];
+    const packetHashes = new Map<string, string>();
     const wave = new WaveRunner({
       ledger, worktrees: port, spawner, reviewArtifactRoot: artifacts,
       prHeadProbe: localHeadProbe('feature/lead-connection-error'),
+      reviewFreezeObserver: (frozen) => {
+        // Q10: pin every frozen packet byte at the freeze boundary; the
+        // assertions after the abort prove admission/abort/recovery never
+        // mutated the frozen review.
+        for (const name of ['manifest.json', 'diff.patch', 'spec-context.md', 'project-conventions.md', 'changed-files.json']) {
+          packetHashes.set(name, createHash('sha256').update(readFileSync(join(frozen.directory, name))).digest('hex'));
+        }
+      },
       escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
     });
     const outcome = asWave(await wave.runRound({ jobId: job.id }));
@@ -791,6 +912,11 @@ describe('WaveRunner built-in Perkins production path', () => {
     expect(report).toContain('9 lens(es) never started');
     expect(report).toContain('Connection error');
     expect(escalations.some((entry) => entry.includes('INCOMPLETE') && entry.includes('0 journaled attempt(s) started'))).toBe(true);
+    // Q10: the frozen packet is byte-identical after admission, the lead
+    // run, the parent abort and the sweep.
+    for (const [name, digest] of packetHashes) {
+      expect(createHash('sha256').update(readFileSync(join(artifacts, outcome.round.id, name))).digest('hex'), name).toBe(digest);
+    }
     expect(port.getWorktree(outcome.round.id)?.status).toBe('swept');
     rmSync(root, { recursive: true, force: true });
     rmSync(artifacts, { recursive: true, force: true });
@@ -1207,6 +1333,13 @@ describe('WaveRunner built-in Perkins production path', () => {
     const second = asWave(await wave.runRound({ jobId: job.id }));
     expect(second.canonicalVerdict).toBe('INCOMPLETE');
     expect(second.round.status).toBe('aborted');
+    // Q4 (gh-169): the pre-spawn failure has a durable no-spawn receipt and
+    // NO parent-incident event — its report must say setup refusal, not
+    // claim the incident counter exists.
+    const refusalReport = readFileSync(join(artifacts, second.round.id, 'perkins-report.md'), 'utf8');
+    expect(refusalReport).toContain('**Setup refusal** — the round ended before any review owner spawned');
+    expect(refusalReport).not.toContain('**Parent incident**');
+    expect(ledger.listEvents({ limit: 200 }).some((event) => event.kind === 'round.parent-incident' && event.roundId === second.round.id)).toBe(false);
     const directory = join(artifacts, second.round.id);
     expect((await import('node:fs')).readFileSync(join(directory, 'perkins-report.md'), 'utf8')).toContain('INCOMPLETE');
     expect(existsSync(join(directory, 'workflow-error.json'))).toBe(true);
@@ -5549,6 +5682,20 @@ describe('repair pass 3: host disclosure completeness, safety, and provider trut
       failures: [{ name: 'unit-tests', conclusion: 'failure', url: null }], reason: null,
     });
     expect(failed).toContain('- CI evidence at freeze: FAILED — NOT PASS (1 failing check(s): unit-tests)');
+    // Q7: untrusted failure names are individually bounded and visibly
+    // elided past a small cap — a hostile long name can never push the
+    // published body past the provider bound.
+    const hostile = 'x'.repeat(300);
+    const elided = hostDisclosureAppendix(review, 'github', [...PERKINS_LENSES], {
+      state: 'failed', repo: 'acme/fixture', pr: 7, sha: 'a'.repeat(40), observedAt: '2026-10-05T01:02:03Z',
+      sourceKind: 'github.ci-failed', sourceSeq: 10, checks: [],
+      failures: [hostile, ...Array.from({ length: 7 }, (_unused, index) => `check-${index}`)].map((name) => ({ name, conclusion: 'failure', url: null })),
+      reason: null,
+    });
+    const elidedLine = elided.split('\n').find((line) => line.includes('FAILED — NOT PASS'))!;
+    expect(elidedLine.length).toBeLessThan(400);
+    expect(elidedLine).toContain('…[truncated]');
+    expect(elidedLine).toContain('+3 more (elided)');
     expect(failed).not.toContain('UNAVAILABLE');
     const unavailable = hostDisclosureAppendix(review, 'github', [...PERKINS_LENSES], {
       state: 'unavailable', repo: null, pr: null, sha: null, observedAt: null,

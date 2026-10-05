@@ -301,6 +301,52 @@ describe('Perkins admission preflight (gh-169)', () => {
     expect(result.checks.find((check) => check.name === 'head-binding')?.ok).toBe(true);
     expect(result.checks.find((check) => check.name === 'ci-evidence')?.ok).toBe(true);
     expect(result.missing.find((entry) => entry.input === 'spec-context')!.detail).toContain('not valid UTF-8');
+    // Q3: exactly ONE verdict for the spec file's name — the digest pass
+    // is never contradicted by a same-name decode failure.
+    const specChecks = result.checks.filter((check) => check.name === 'frozen-packet:spec-context.md');
+    expect(specChecks).toHaveLength(1);
+    expect(specChecks[0]!.ok).toBe(false);
+    expect(specChecks[0]!.detail).toContain('not valid UTF-8');
+  });
+
+  it('refuses a hash-consistent changed-file list that is malformed or diverges from the manifest (Q1)', () => {
+    const { review } = preflightHarness();
+    const original = JSON.parse(readFileSync(join(review.directory, 'changed-files.json'), 'utf8')) as readonly string[];
+    const malformed = `${JSON.stringify({ files: original })}\n`;
+    writeFileSync(join(review.directory, 'changed-files.json'), malformed);
+    const manifest = JSON.parse(readFileSync(join(review.directory, 'manifest.json'), 'utf8')) as FrozenReview['manifest'];
+    const tampered = {
+      ...manifest,
+      changedFilesSha256: createHash('sha256').update(malformed).digest('hex'),
+    };
+    writeFileSync(join(review.directory, 'manifest.json'), `${JSON.stringify(tampered, null, 2)}\n`);
+    const result = admissionPreflight({ ...review, manifest: tampered }, 'feature/admission');
+    expect(result.missing.map((entry) => entry.input)).toEqual(['frozen-packet:changed-files.json']);
+    expect(result.missing[0]!.detail).toContain('malformed or does not match the manifest list');
+    const checks = result.checks.filter((check) => check.name === 'frozen-packet:changed-files.json');
+    expect(checks).toHaveLength(1);
+  });
+
+  it('refuses a CI failure entry without its required conclusion (Q2)', () => {
+    const { review } = preflightHarness();
+    const onDisk = JSON.parse(readFileSync(join(review.directory, 'manifest.json'), 'utf8')) as FrozenReview['manifest'];
+    const malformedManifest = {
+      ...onDisk,
+      reviewEvidence: {
+        attachments: [],
+        ci: {
+          ...onDisk.reviewEvidence!.ci!,
+          state: 'failed',
+          sha: onDisk.targetSha,
+          repo: 'acme/fixture',
+          failures: [{ name: 'unit-tests' }],
+        },
+      },
+    };
+    writeFileSync(join(review.directory, 'manifest.json'), `${JSON.stringify(malformedManifest, null, 2)}\n`);
+    const result = admissionPreflight(withDiskManifest(review), 'feature/admission');
+    expect(result.missing.map((entry) => entry.input)).toEqual(['ci-evidence']);
+    expect(result.missing[0]!.detail).toContain('conclusion is required');
   });
 
   it('refuses a hash-consistent CI record whose consumed fields are malformed (P2)', () => {
