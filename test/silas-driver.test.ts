@@ -220,12 +220,12 @@ describe('silas digest (the four actionable states)', () => {
     }
   });
 
-  it('an upgraded pre-E18 delivered implementation keeps null deliverable and stays PR-overdue', async () => {
+  it('an upgraded pre-deliverable delivered implementation keeps null deliverable and stays PR-overdue', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'gru-e18-upgrade-'));
     try {
-      // A database shaped before migration 18: null deliverable is the only
+      // A database shaped before migration 19: null deliverable is the only
       // pre-existing value, and it must remain PR-owing through the upgrade.
-      const legacy = new LedgerDb(dir, { migrations: MIGRATIONS.filter((migration) => migration.id <= 17) });
+      const legacy = new LedgerDb(dir, { migrations: MIGRATIONS.filter((migration) => migration.id <= 18) });
       const legacyApi = new LedgerApi(legacy.handle);
       // The pre-18 schema has no deliverable column, so the legacy row is
       // inserted at its own shape (the product's current addJob correctly
@@ -258,7 +258,7 @@ describe('silas digest (the four actionable states)', () => {
     }
   });
 
-  it('excludes a delivered review/artifact job from PR-overdue follow-through (E18 carve-out)', async () => {
+  it('excludes a delivered review/artifact job from PR-overdue follow-through (E19 carve-out)', async () => {
     const h = makeLedger();
     try {
       addJobWithDelivery(h.ledger, 'review-job', { deliverable: 'review' });

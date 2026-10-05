@@ -810,7 +810,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     const reviewPending = job.status === 'working' || job.status === 'delivered' || job.status === 'in-review';
 
     // (1) Delivered, no PR yet. Only PR-owing lanes (deliverable
-    // null/'pr', E18) belong here: a delivered review/artifact/
+    // null/'pr', E19) belong here: a delivered review/artifact/
     // investigation job completes at its handback, so flagging it as
     // PR-overdue would manufacture ops work and false missing-PR alarms.
     if (delivered !== null && currentPhaseDelivered && reviewPending && !rebriefPending && !liveDirectiveOwns &&

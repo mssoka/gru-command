@@ -686,3 +686,47 @@ describe('registry resident boundary across adapters', () => {
     } finally { h.cleanup(); }
   });
 });
+
+describe('registry resident release notifications (Perkins r3 blocker 4)', () => {
+  it('notifies capacity consumers only AFTER the permit is actually released', async () => {
+    const h = harness(2);
+    try {
+      const released: Array<{ occupied: number }> = [];
+      const unsubscribe = h.registry.onResidentReleased(() => {
+        released.push({ occupied: h.registry.residents.occupied });
+      });
+      const minion = await h.registry.spawn('minion');
+      expect(h.registry.residents.occupied).toBe(1);
+      await minion.dispose();
+      await tick();
+      // The disposed envelope fired during the proxy disposal while the
+      // permit was still held; the RELEASE notification arrived after the
+      // permit was actually freed (no queued demand in this fixture, so
+      // the post-release state is observable).
+      expect(h.registry.residents.occupied).toBe(0);
+      expect(released).toHaveLength(1);
+      expect(released[0]?.occupied).toBe(0);
+      unsubscribe();
+      h.cleanup();
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a listener failure never breaks the release path (contained)', async () => {
+    const h = harness(1);
+    try {
+      const unsubscribe = h.registry.onResidentReleased(() => {
+        throw new Error('listener failure');
+      });
+      const minion = await h.registry.spawn('minion');
+      await minion.dispose();
+      await tick();
+      expect(h.registry.residents.occupied).toBe(0);
+      unsubscribe();
+      h.cleanup();
+    } finally {
+      h.cleanup();
+    }
+  });
+});

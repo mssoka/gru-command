@@ -87,7 +87,7 @@ export function renderMinionBriefing(input: {
   lessons?: readonly LessonPointer[];
   /** Issue #161: this parent has GC-mediated child-worker tools wired. */
   childWorkerTools?: boolean;
-  /** The job's deliverable kind (E18). Non-PR kinds get their own closing
+  /** The job's deliverable kind (E19). Non-PR kinds get their own closing
    *  orders: a review job's deliverable is its findings — it commits
    *  nothing, and an unmodified tree is the expected result; artifact and
    *  investigation jobs hand back their artifacts without opening a PR. */
@@ -165,7 +165,7 @@ export class DispatchService {
     repoPath: string;
     title: string;
     displayName?: string;
-    /** The deliverable kind (E18): reviewers dispatch with `review`,
+    /** The deliverable kind (E19): reviewers dispatch with `review`,
      * artifact-only lanes with `artifact`/`investigation`; omitted = a
      * PR-owing implementation lane. */
     deliverable?: JobDeliverable;

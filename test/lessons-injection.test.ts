@@ -91,7 +91,7 @@ describe('progressive-disclosure injection', () => {
     expect(briefing).not.toContain(BODY_SENTINEL);
   });
 
-  it('renders deliverable-specific closing orders (E18)', () => {
+  it('renders deliverable-specific closing orders (E19)', () => {
     const base = {
       jobId: 'job-1',
       repoName: 'repo',

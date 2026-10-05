@@ -1541,14 +1541,84 @@ body {
 
 .board-band--needs-you { --band-accent: var(--band-needs-you); }
 .board-band--in-flight { --band-accent: var(--work); }
+.board-band--pipeline { --band-accent: var(--rev); }
 .board-band--settled { --band-accent: var(--done); }
 .board-band--cold { --band-accent: var(--park); }
 
-/* A sticky band separator: the label + count pin under the global chrome
-   while the rows scroll beneath them. */
-.board-band__head {
+/* ── Sticky section shortcut strip (owner approval j-1064): one compact
+   row of labelled, uncapped counts that jumps to each section. Wraps on
+   narrow viewports instead of causing horizontal body overflow; sticky
+   under the global chrome and above the band separators. ───────────── */
+.board-nav {
   position: sticky;
   top: var(--chrome-h, 100px);
+  z-index: 6;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 4px;
+  background: var(--paper);
+  border-bottom: var(--outline-thin);
+}
+
+.board-nav__link {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 4px 10px;
+  border: 2px solid var(--line);
+  border-radius: 999px;
+  background: var(--card);
+  color: var(--ink);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.board-nav__link:hover {
+  background: var(--soft);
+}
+
+.board-nav__link:focus-visible {
+  outline: 3px solid var(--work);
+  outline-offset: 2px;
+}
+
+.board-nav__count {
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+  letter-spacing: 0;
+}
+
+/* Sections keep their header reachable under the sticky strip + chrome:
+   an anchor jump or focus scroll never hides the target. */
+.board-band {
+  scroll-margin-top: calc(var(--chrome-h, 100px) + var(--board-nav-h, 0px) + 40px);
+}
+
+/* Focusable controls inside the bands scroll into view like the sections
+   themselves: a programmatic/restored focus must clear the measured sticky
+   chrome (command bar + chip rail), the shortcut strip AND the sticky band
+   head that pins under them — otherwise the browser aligns the target flush
+   to the viewport top, underneath the header (tablet 768-wide focus
+   evidence: button rect y0 with html scroll-padding auto). The same
+   clearance as the section jump above keeps a focused control at the
+   position an anchor jump would give its section. */
+.board-band__more,
+.board-job__toggle,
+.board-round__toggle {
+  scroll-margin-top: calc(var(--chrome-h, 100px) + var(--board-nav-h, 0px) + 40px);
+}
+
+/* A sticky band separator: the label + count pin under the global chrome
+   AND the section shortcut strip while the rows scroll beneath them. */
+.board-band__head {
+  position: sticky;
+  top: calc(var(--chrome-h, 100px) + var(--board-nav-h, 0px));
   z-index: 5;
   display: flex;
   align-items: center;
@@ -1576,6 +1646,72 @@ body {
 
 .board-band__count {
   color: var(--muted);
+}
+
+/* Compact empty state for any section (never omission — a shortcut still
+   has a valid labelled target). */
+.board-band__empty {
+  padding: 12px 8px;
+  color: var(--muted);
+}
+
+/* ── Pipeline rows (durable queue): two dense lines per entry — state
+   chip + title + priority, then repo / durable order / age / exact wait
+   reason. No card box; hairline dividers like the job rows. ────────── */
+.board-pipeline {
+  display: grid;
+  gap: 3px;
+  padding: 8px 6px 9px;
+  border-bottom: 1px solid color-mix(in srgb, var(--line) 22%, transparent);
+  min-width: 0;
+}
+
+.board-pipeline:last-child {
+  border-bottom: 0;
+}
+
+.board-pipeline--failed {
+  border-left: 4px solid var(--alert);
+  padding-left: 10px;
+}
+
+.board-pipeline__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.board-pipeline__title {
+  font-weight: 800;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+.board-pipeline__priority {
+  font-variant-numeric: tabular-nums;
+  flex: none;
+}
+
+.board-pipeline__state {
+  flex: none;
+  text-transform: lowercase;
+}
+
+.board-pipeline__meta {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.board-pipeline__reason {
+  color: var(--muted);
+  font-weight: 700;
 }
 
 /* The band's rows: full-width dense rows on hairline dividers — the
@@ -1862,10 +1998,15 @@ body {
 }
 
 .board-job__toggle:focus-visible,
-.board-round__toggle:focus-visible {
+.board-round__toggle:focus-visible,
+.board-band__more:focus-visible {
   outline: 3px solid var(--work);
   outline-offset: 2px;
   border-radius: 6px;
+}
+
+.board-band__more:focus-visible {
+  border-radius: 999px;
 }
 
 .board-job__chevron {

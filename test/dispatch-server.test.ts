@@ -323,7 +323,7 @@ describe('dispatch server (E8)', () => {
     }
   });
 
-  it('validates the optional deliverable kind and persists it (E18)', async () => {
+  it('validates the optional deliverable kind and persists it (E19)', async () => {
     const h = await boot();
     const repo = makeFixtureRepo('fixture-http-deliverable');
     cleanupRepos.push(repo);

@@ -17,7 +17,7 @@ function tmpDir(): string {
   return dir;
 }
 
-describe('job deliverable kind (E18 durable-write guard)', () => {
+describe('job deliverable kind (E19 durable-write guard)', () => {
   it('refuses an unknown deliverable at addJob — direct callers share the boundary', () => {
     // Self-cleaning (never cleanupDirs: the shared registry's index 0 is
     // the main describe's beforeAll dir).

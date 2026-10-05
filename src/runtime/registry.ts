@@ -141,6 +141,11 @@ export class RuntimeRegistry {
   /** Rounds with unresolved cleanup debt register a reconcile observer;
    * EXISTING handle 'disposed' events drive it (no watcher/timer). */
   private readonly cleanupObservers = new Set<() => void>();
+  /** Actual shared-permit release notifications (not the pre-release
+   * disposed envelope): a capacity consumer must learn that the permit
+   * was PROVEN released so it can re-register demand even after a wake
+   * refusal (Perkins r3 blocker 4). */
+  private readonly residentReleaseListeners = new Set<() => void>();
 
   constructor(opts: RuntimeRegistryOptions) {
     this.opts = opts;
@@ -198,6 +203,15 @@ export class RuntimeRegistry {
     this.agentListeners.add(listener);
     return () => {
       this.agentListeners.delete(listener);
+    };
+  }
+
+  /** Subscribe to ACTUAL resident-permit releases (after the release has
+   * been applied and proven). Additive; listener failures are contained. */
+  onResidentReleased(listener: () => void): () => void {
+    this.residentReleaseListeners.add(listener);
+    return () => {
+      this.residentReleaseListeners.delete(listener);
     };
   }
 
@@ -550,6 +564,15 @@ export class RuntimeRegistry {
       this.handles.delete(resident);
       this.residents.unwatch(resident);
       release?.();
+      // AFTER the permit is actually released: notify capacity consumers
+      // (the pipeline consumer re-registers demand / admits directly).
+      for (const listener of [...this.residentReleaseListeners]) {
+        try {
+          listener();
+        } catch (error) {
+          this.log('error', 'resident release listener failed', { error: String(error) });
+        }
+      }
     };
     const budget = this.residents;
     // One wrapper per tracked method, memoized: handle.prompt ===
@@ -648,6 +671,18 @@ export class RuntimeRegistry {
     // E6 event tap: surface spawn/dispose + forward every runtime event to
     // registry-level subscribers (the board engine's feed).
     this.emitAgentEvent({ agentId: handle.id, role, sessionFile: handle.sessionFile, phase: 'spawned' });
+    // Self-healing membership: a handle disposed by ANY caller leaves the
+    // registry set — the status surface must never contradict itself.
+    // Registered FIRST (before the emit tap below) so the disposed event
+    // releases the resident permit BEFORE any disposed-phase listener
+    // runs: a synchronous capacity consumer (the pipeline consumer's
+    // reconsider pass) must read the budget AFTER the release, or it can
+    // see a full pool, exit, and never receive another trigger.
+    handle.subscribe((event) => {
+      if (event.type === 'state' && event.state === 'disposed' && !disposingNow) {
+        releaseHandle();
+      }
+    });
     handle.subscribe((event) => {
       this.emitAgentEvent({
         agentId: handle.id,
@@ -670,13 +705,6 @@ export class RuntimeRegistry {
         event.type === 'tool_start' || event.type === 'tool_end' ||
         event.type === 'compaction_start' || event.type === 'compaction_end') {
         this.residents.changed();
-      }
-    });
-    // Self-healing membership: a handle disposed by ANY caller leaves the
-    // registry set — the status surface must never contradict itself.
-    handle.subscribe((event) => {
-      if (event.type === 'state' && event.state === 'disposed' && !disposingNow) {
-        releaseHandle();
       }
     });
     return resident;
