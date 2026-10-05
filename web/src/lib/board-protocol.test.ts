@@ -82,6 +82,33 @@ describe('board server-frame validator', () => {
     expect(error).toEqual({ type: 'error', message: 'bad token', fatal: true });
   });
 
+  it('accepts legacy absent and nullable heist metadata, rejects malformed authored names', () => {
+    const board = snapshot();
+    const job = board.repos[0]!.jobs[0]! as { displayName?: unknown };
+    expect(isValidSnapshot(board)).toBe(true); // older server
+    job.displayName = null;
+    expect(isValidSnapshot(board)).toBe(true);
+    job.displayName = 'Wake & alerts';
+    expect(isValidSnapshot(board)).toBe(true);
+    // Visible letters behind invisible formatting controls are accepted
+    // raw; ignoring the controls before shortening is the renderer's
+    // contract (r5 display-correctness warning).
+    job.displayName = '\u200b'.repeat(24) + 'wake alerts';
+    expect(isValidSnapshot(board)).toBe(true);
+    job.displayName = '   ';
+    expect(isValidSnapshot(board)).toBe(false);
+    job.displayName = 123;
+    expect(isValidSnapshot(board)).toBe(false);
+    // Invisible-only names would render an empty card (G3): format and
+    // combining characters alone are as bad as blank.
+    job.displayName = '\u200b\u200d';
+    expect(isValidSnapshot(board)).toBe(false);
+    job.displayName = '\u0301\u0301';
+    expect(isValidSnapshot(board)).toBe(false);
+    job.displayName = '🧑\u200d🚀 launch';
+    expect(isValidSnapshot(board)).toBe(true);
+  });
+
   it('rejects malformed frames (wrong shapes, missing fields, non-objects)', () => {
     expect(parseBoardServerFrame(null)).toBeNull();
     expect(parseBoardServerFrame('board')).toBeNull();

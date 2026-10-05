@@ -314,6 +314,17 @@ describe('board engine — liveness-first rail and job trackers', () => {
     return { api, bus, engine: new BoardEngine({ ledger: api, bus }) };
   }
 
+  it('projects heist metadata and retains full worker/job IDs through observer lifecycle', () => {
+    const { api, engine } = fresh();
+    const job = api.addJob({ id: 'wake-crew', repo: 'fixture', title: 'Full wake-up alert contract', displayName: 'wake alerts' });
+    api.registerAgent({ id: 'full-worker-uuid-dec9', role: 'minion', jobId: job.id });
+    engine.onRuntimeEvent({ agentId: 'full-worker-uuid-dec9', role: 'minion', sessionFile: '/session', phase: 'spawned' });
+    api.setAgentState('full-worker-uuid-dec9', 'idle');
+    api.setAgentState('full-worker-uuid-dec9', 'disposed');
+    expect(engine.snapshot().repos.flatMap((repo) => repo.jobs).find((row) => row.id === job.id)).toMatchObject({ title: job.title, displayName: 'wake alerts' });
+    expect(engine.snapshot().agents.find((row) => row.id === 'full-worker-uuid-dec9')).toMatchObject({ jobId: job.id, state: 'disposed', sessionFile: '/session' });
+  });
+
   it('sorts the rail by liveness before role: disposed gru BELOW streaming perkins; streaming above idle', () => {
     const { api, engine } = fresh();
     api.registerAgent({ id: 'chat-gru', role: 'gru' });

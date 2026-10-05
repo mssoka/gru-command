@@ -481,12 +481,28 @@ test.describe('themes', () => {
     await pair(page, `http://127.0.0.1:${themesPort}/`);
     await sendAndWaitReply(page, 'theme real check');
 
+    // The whole-page capture must not race the board's owner band (the
+    // chat wait above does not cover the board snapshot; observed as a RED
+    // capture with the band missing while the DOM already had it).
+    await expect(page.locator('#board-owner')).toBeVisible();
+    await expect(page.locator('#board-owner .board-owner__clear')).toBeVisible();
+
+    // The deploy chip reads live build-vs-origin/main drift from the real
+    // service: its value ("current"/"N behind"/"unknown") and tone change
+    // with the head under test. Mask it so the theme baselines stay
+    // deterministic across heads; every other chip keeps theme coverage.
+    const deployChip = page.locator('[data-chip="deploy"]');
+
+    // Whole-page captures must be scroll-invariant (see the mock themes
+    // test): pin the page origin before each capture.
+    await page.evaluate(() => window.scrollTo(0, 0));
     await expect(page.locator('html')).not.toHaveClass(/dark/);
-    await expect(page).toHaveScreenshot('real-chat-light.png', { maxDiffPixelRatio: 0.02 });
+    await expect(page).toHaveScreenshot('real-chat-light.png', { maxDiffPixelRatio: 0.02, mask: [deployChip] });
 
     await page.locator('#theme-toggle').click();
+    await page.evaluate(() => window.scrollTo(0, 0));
     await expect(page.locator('html')).toHaveClass(/dark/);
-    await expect(page).toHaveScreenshot('real-chat-dark.png', { maxDiffPixelRatio: 0.02 });
+    await expect(page).toHaveScreenshot('real-chat-dark.png', { maxDiffPixelRatio: 0.02, mask: [deployChip] });
 
     await page.reload();
     await expect(page.locator('html')).toHaveClass(/dark/);
@@ -661,6 +677,10 @@ test.describe('attach flow (SPEC ruling 19) — full gesture', () => {
 
     const chip = page.locator('#chat-chips .attach-chip', { hasText: 'camera-roll.png' });
     await expect(chip).toBeVisible();
+    // The ready chip appears with the upload; the busy placeholder clears
+    // in the same settle. The composer refuses a send while an upload is
+    // in flight ("one moment…"), so wait for the hand-off before clicking.
+    await expect(page.locator('#chat-chips .attach-chip--busy')).toHaveCount(0);
 
     await page.locator('#chat-input').fill('what did I just shoot');
     await page.locator('#chat-send').click();
@@ -698,6 +718,9 @@ test.describe('attach flow (SPEC ruling 19) — full gesture', () => {
     });
     const chip = page.locator('#chat-chips .attach-chip', { hasText: 'paste-shot.png' });
     await expect(chip).toBeVisible();
+    // Same hand-off wait as the device-picker leg: send is guarded while
+    // the upload is still in flight.
+    await expect(page.locator('#chat-chips .attach-chip--busy')).toHaveCount(0);
 
     // Attachment-only send: no typed words needed (empty text + chips).
     await page.locator('#chat-send').click();

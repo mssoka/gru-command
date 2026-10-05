@@ -224,6 +224,9 @@ async function pairAndOpenBoard(page: Page): Promise<void> {
  * attention sits in FOR GRU, which starts collapsed — reveal it first,
  * exactly as an operator would. */
 async function revealForGru(page: Page): Promise<void> {
+  // The reveal must wait for the rendered board: a click before the first
+  // snapshot push would find no toggle and silently skip.
+  await expect(page.locator('#board-view')).toBeVisible();
   const toggle = page.locator('.board-band[data-section="for-gru"] .board-band__more');
   if ((await toggle.count()) > 0 && (await toggle.getAttribute('aria-expanded')) === 'false') {
     await toggle.click();

@@ -1,4 +1,6 @@
-import { expect, test, type Page } from '@playwright/test';
+import fs from 'node:fs';
+import path from 'node:path';
+import { expect, test, type Locator, type Page } from '@playwright/test';
 import { WebSocket, type RawData } from 'ws';
 
 /** The mock's token — same env knob the mock itself reads (GRU_MOCK_TOKEN, default 'dev-token'). */
@@ -22,6 +24,9 @@ async function pair(page: Page): Promise<void> {
  * count-only. Classification checks reveal the section first, exactly as
  * an operator would; the reveal is idempotent and never re-collapses. */
 async function revealForGru(page: Page): Promise<void> {
+  // The reveal must wait for the rendered board: a click before the first
+  // snapshot push would find no toggle and silently skip.
+  await expect(page.locator('#board-view')).toBeVisible();
   const toggle = page.locator('.board-band[data-section="for-gru"] .board-band__more');
   if ((await toggle.count()) > 0 && (await toggle.getAttribute('aria-expanded')) === 'false') {
     await toggle.click();
@@ -29,6 +34,9 @@ async function revealForGru(page: Page): Promise<void> {
 }
 
 async function revealCold(page: Page): Promise<void> {
+  // The reveal must wait for the rendered board: a click before the first
+  // snapshot push would find no toggle and silently skip.
+  await expect(page.locator('#board-view')).toBeVisible();
   const toggle = page.locator('.board-band[data-section="cold"] .board-band__more');
   if ((await toggle.count()) > 0 && (await toggle.getAttribute('aria-expanded')) === 'false') {
     await toggle.click();
@@ -50,6 +58,47 @@ async function pairMobile(page: Page): Promise<void> {
   await page.locator('#pair-token').fill(MOCK_TOKEN);
   await page.locator('#pair-submit').click();
   await expect(page.locator('#board-view')).toBeVisible();
+}
+
+/** Private browser-evidence for the PR-number label (j-982): the actual
+ * row in light/dark, desktop/phone. The capture root is gitignored; the
+ * files stay in the lane worktree for the human/vision review. */
+const PR_NUMBER_CAPTURE_DIR = path.join(
+  import.meta.dirname,
+  '..',
+  '..',
+  '_bmad-output',
+  'board-pr-number-links',
+  'captures',
+);
+
+async function capturePrNumberRow(row: Locator, name: string): Promise<void> {
+  fs.mkdirSync(PR_NUMBER_CAPTURE_DIR, { recursive: true });
+  await row.scrollIntoViewIfNeeded();
+  await row.screenshot({ path: path.join(PR_NUMBER_CAPTURE_DIR, `${name}.png`) });
+}
+
+/** A capture run must start from an empty directory: images left by an
+ * earlier head must never survive a failed run as apparent current-head
+ * evidence for the human/vision review. `force` covers the normal
+ * first-run absence; real removal failures still throw. */
+function clearPrNumberCaptures(): void {
+  fs.rmSync(PR_NUMBER_CAPTURE_DIR, { recursive: true, force: true });
+}
+
+/** The numbered label must be visible as text, inside the row meta line
+ * and never clipped (j-982 acceptance D). */
+async function expectPrLabelFits(row: Locator): Promise<void> {
+  const link = row.locator('.board-job__pr');
+  await expect(link).toBeVisible();
+  const meta = row.locator('.board-job__meta');
+  const [labelBox, metaBox] = await Promise.all([link.boundingBox(), meta.boundingBox()]);
+  expect(labelBox, 'numbered PR link has a box').not.toBeNull();
+  expect(metaBox, 'row meta line has a box').not.toBeNull();
+  expect(labelBox!.x).toBeGreaterThanOrEqual(metaBox!.x - 1);
+  expect(labelBox!.x + labelBox!.width).toBeLessThanOrEqual(metaBox!.x + metaBox!.width + 1);
+  const clipped = await link.evaluate((node) => node.scrollWidth > node.clientWidth + 1);
+  expect(clipped, 'label not clipped inside the link').toBe(false);
 }
 
 async function sendAndWaitReply(page: Page, text: string): Promise<void> {
@@ -601,6 +650,94 @@ test.describe('board (E6, mock feed)', () => {
     await page.locator('#notification-bell').click();
   });
 
+  test('PR numbers: each heist link shows its canonical request number', async ({
+    page,
+  }) => {
+    await pair(page);
+    await revealForGru(page);
+    await expect(page.locator('#board-view')).toBeVisible();
+    // GitHub /pull/ route: the number rides the visible label; href,
+    // new-tab target and noreferrer semantics are untouched.
+    const gh = page.locator('.board-job', { hasText: 'Merge main into the retry branch' });
+    await expect(gh.locator('.board-job__pr')).toHaveText('PR #43 ↗');
+    await expect(gh.locator('.board-job__pr')).toHaveAttribute(
+      'href',
+      'https://github.com/acme/demo-api/pull/43',
+    );
+    await expect(gh.locator('.board-job__pr')).toHaveAttribute('target', '_blank');
+    await expect(gh.locator('.board-job__pr')).toHaveAttribute('rel', 'noreferrer');
+    // GitLab /-/merge_requests/ route: same contract, its own number —
+    // no shared/stale constant across heists.
+    const gl = page.locator('.board-job', { hasText: 'Landing copy refresh' });
+    await expect(gl.locator('.board-job__pr')).toHaveText('PR #42 ↗');
+    await expect(gl.locator('.board-job__pr')).toHaveAttribute(
+      'href',
+      'https://gitlab.demo.invalid/sample/sample-site/-/merge_requests/42',
+    );
+  });
+
+  test('a numbered PR link keeps external navigation and never toggles the heist disclosure', async ({
+    page,
+  }) => {
+    // Fixture links must never hit the network from a test run.
+    await page.context().route('https://github.com/**', (route) => route.abort());
+    await pair(page);
+    await revealForGru(page);
+    await expect(page.locator('#board-view')).toBeVisible();
+    const row = page.locator('.board-job', { hasText: 'Merge main into the retry branch' });
+    const link = row.locator('.board-job__pr');
+    await expect(row).toHaveAttribute('data-expanded', 'false');
+    await expect(link).toHaveText('PR #43 ↗');
+    // Keyboard activation opens the external destination in a new tab and
+    // leaves the disclosure closed (the click must not bubble to the row).
+    await link.focus();
+    const popupPromise = page.waitForEvent('popup');
+    await page.keyboard.press('Enter');
+    const popup = await popupPromise;
+    await popup.close();
+    await expect(row).toHaveAttribute('data-expanded', 'false');
+    // Pointer activation behaves the same.
+    const pointerPopupPromise = page.waitForEvent('popup');
+    await link.click();
+    const pointerPopup = await pointerPopupPromise;
+    await pointerPopup.close();
+    await expect(row).toHaveAttribute('data-expanded', 'false');
+    // The heist name/status face is untouched by the label change.
+    await expect(row.locator('.board-job__name')).toHaveText('Merge main into the retry branch');
+    await expect(row.locator('.board-job__status')).toHaveText('in-review');
+  });
+
+  test('PR number label: row captures in light/dark, desktop/phone (private evidence)', async ({ page }) => {
+    // Stale-evidence guard: clear before anything can fail mid-run.
+    clearPrNumberCaptures();
+    await pair(page);
+    await revealForGru(page);
+    await expect(page.locator('#board-view')).toBeVisible();
+    const row = page.locator('.board-job', { hasText: 'Merge main into the retry branch' });
+    await expect(row.locator('.board-job__pr')).toHaveText('PR #43 ↗');
+    // Desktop, light first.
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await expect(page.locator('html')).not.toHaveClass(/dark/);
+    await expectPrLabelFits(row);
+    await capturePrNumberRow(row, 'pr-number-desktop-light');
+    await page.locator('#theme-toggle').click();
+    await expect(page.locator('html')).toHaveClass(/dark/);
+    await expectPrLabelFits(row);
+    await capturePrNumberRow(row, 'pr-number-desktop-dark');
+    // Back to light before the phone pair so each capture sits in one theme.
+    await page.locator('#theme-toggle').click();
+    await expect(page.locator('html')).not.toHaveClass(/dark/);
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expect(page.locator('#board-view')).toBeVisible();
+    await expect(row.locator('.board-job__pr')).toHaveText('PR #43 ↗');
+    await expectPrLabelFits(row);
+    await capturePrNumberRow(row, 'pr-number-phone-light');
+    await page.locator('#theme-toggle').click();
+    await expect(page.locator('html')).toHaveClass(/dark/);
+    await expectPrLabelFits(row);
+    await capturePrNumberRow(row, 'pr-number-phone-dark');
+  });
+
   test('v6: the chip rail carries the v4 health row + folded KPI counts, bands stay ordered', async ({ page }) => {
     await pair(page);
     await expect(page.locator('#board-view')).toBeVisible();
@@ -865,6 +1002,46 @@ test.describe('board (E6, mock feed)', () => {
     await expect(rail.locator('.board-agent__age').first()).toContainText('quiet');
   });
 
+  test('minion heist names fit the crew rail on desktop and phone in light and dark', async ({ page }, testInfo) => {
+    await pair(page);
+    // v6.1 ruling 1: no Chat/Board toggle exists to click — the board is
+    // docked beside chat on desktop and is the default view on phones.
+    await expect(page.locator('#board-view')).toBeVisible();
+    // G5: the authored short name renders as-is (lowercased) with its own
+    // four-character suffix; the title-fallback row below stays the legacy
+    // path. Two minion rows now exist, so scope each by its displayed name.
+    const authored = page.locator('#board-agents .board-agent[data-role="minion"]', { hasText: 'api docs pass' });
+    await expect(authored.locator('.board-agent__name')).toHaveText('api docs pass');
+    await expect(authored.locator('.board-agent__hash')).toHaveText('docs');
+    await expect(authored).toHaveAttribute('title', /Docs pass on the public endpoints.*mock-minion-docs/u);
+    const row = page.locator('#board-agents .board-agent[data-role="minion"]', { hasText: 'fix the payment retry' });
+    await expect(row.locator('.board-agent__name')).toHaveText('fix the payment retry');
+    await expect(row.locator('.board-agent__hash')).toHaveText('nion');
+    await expect(row).toHaveAttribute('title', /Fix the payment retry loop.*mock-minion/u);
+    for (const theme of ['light', 'dark'] as const) {
+      if (theme === 'dark') await page.locator('#theme-toggle').click();
+      // Label integrity (P13): each pass positively asserts its ACTUAL html
+      // theme before any capture named for it — the same pattern the
+      // trackers theme test uses. Light is checked, never assumed.
+      if (theme === 'dark') {
+        await expect(page.locator('html')).toHaveClass(/dark/);
+      } else {
+        await expect(page.locator('html')).not.toHaveClass(/dark/);
+      }
+      for (const [viewport, width, height] of [['desktop', 1280, 900], ['phone', 390, 844]] as const) {
+        await page.setViewportSize({ width, height });
+        if (viewport === 'phone') await row.scrollIntoViewIfNeeded();
+        await expect(row).toBeVisible();
+        const fits = await row.evaluate((node) => {
+          const hash = node.querySelector('.board-agent__hash')!;
+          return hash.getBoundingClientRect().right <= node.getBoundingClientRect().right;
+        });
+        expect(fits).toBe(true);
+        await page.screenshot({ path: testInfo.outputPath(`crew-${theme}-${viewport}.png`) });
+      }
+      await page.setViewportSize({ width: 1280, height: 900 });
+    }
+  });
   test('crew rail truth (#171): historical sessions collapse behind history; raw-idle open work reads streaming', async ({ page }) => {
     await pair(page);
     await expect(page.locator('#board-view')).toBeVisible();
@@ -872,10 +1049,11 @@ test.describe('board (E6, mock feed)', () => {
 
     // One live Silas (mock-silas) — the September Silas epoch and the
     // September minion are VERIFIED-HISTORICAL: not counted as crew, not
-    // sorted into it, disclosed behind their own history toggle.
+    // sorted into it, disclosed behind their own history toggle. The two
+    // crew-heist-labels demo minions join the live crew (10).
     await expect
       .poll(async () => (await page.locator('#rail-tab-agents').textContent())?.trim() ?? '')
-      .toBe('CREW (8)');
+      .toBe('CREW (10)');
     await expect(rail.locator('.board-agent--historical')).toHaveCount(0);
     const historyToggle = rail.locator(".board-agent-toggle[data-section='history']");
     await expect(historyToggle).toContainText('2 history');
@@ -897,7 +1075,10 @@ test.describe('board (E6, mock feed)', () => {
     // Owner-held stop: the released handle left the record disposed, but
     // the live crew keeps the lane with its stopped mark (never the
     // graveyard behind the disposed toggle).
-    const held = rail.locator('.board-agent', { hasText: 'held-after-breaker' });
+    // Crew-heist-labels (#141): minion rows display their heist name, not
+    // the raw fixture label, so identify the held row by its stable agent
+    // id (the same identity the transcript selection keys on).
+    const held = rail.locator('[data-agent-id="mock-minion-held"]');
     await expect(held.locator('.board-agent__supervision--alert')).toHaveText('⛔ stopped');
     await expect(rail.locator(".board-agent-toggle[data-section='disposed']")).toContainText('1 disposed');
 
@@ -1184,6 +1365,20 @@ test.describe('chat pane reflow (owner heist)', () => {
       `reflow-all ${LONG_TOKEN}\n\n\`\`\`\n${LONG_CODE}\n\`\`\`\n\n${LONG_TABLE}\n\ntail after table`,
       'reflow-all',
     );
+    // Clean-chat clause (owner 2026-09-23): tool lines sit in a collapsed
+    // service band — one tap reveals the machinery, exactly as the first
+    // smoke test does. Expand before the assertions AND the reflow sweep so
+    // the long unbroken tokens are measured in their real, expanded layout.
+    const toolBand = page.locator('.service-band', {
+      has: page.locator('.tool-line', { hasText: 'mcp__' }),
+    });
+    await expect(toolBand).toHaveCount(1);
+    const bandHead = toolBand.locator('.service-band__head');
+    // Guard the toggle state so a future already-expanded default cannot
+    // silently collapse the band (and measure the wrong layout).
+    await expect(bandHead).toHaveAttribute('aria-expanded', 'false');
+    await bandHead.click();
+    await expect(bandHead).toHaveAttribute('aria-expanded', 'true');
     await expect(page.locator('.tool-line', { hasText: 'mcp__' })).toBeVisible();
     await expect(page.locator('.tool-line', { hasText: 'failed:' })).toBeVisible();
   }
@@ -1204,16 +1399,23 @@ test.describe('chat pane reflow (owner heist)', () => {
     // ONE live drag: floor first, ceiling second, asserting mid-gesture.
     // The floor move stays INSIDE the viewport — a pointer moved off-screen
     // delivers no further pointermove events to the page.
+    // Resolve the drag target AT ACTION TIME (whole-900 browser red): the
+    // raw cached-box sequence could miss the 4px handle when the page
+    // settled between measuring and pressing. hover() scrolls the handle
+    // into view, waits for stability and verifies the point actually hits
+    // the element; the engagement gate then fails AT the gesture with a
+    // named cause instead of a muted 5s width-poll timeout.
     const handle = page.locator('#splitter-chat');
+    await handle.hover();
     const box = (await handle.boundingBox())!;
-    await page.mouse.move(box.x + 2, box.y + 120);
     await page.mouse.down();
-    await page.mouse.move(box.x + 2 - 400, box.y + 120, { steps: 8 });
+    await expect(page.locator('[data-pane-dragging]')).toHaveCount(1);
+    await page.mouse.move(box.x + box.width / 2 - 400, box.y + 120, { steps: 8 });
     await expect
       .poll(async () => (await page.locator('#chat-main-mount').boundingBox())!.width)
       .toBeLessThan(defaultWidth - 100);
     await assertChatReflows(page, 'live drag at the floor');
-    await page.mouse.move(box.x + 2 + 600, box.y + 120, { steps: 8 });
+    await page.mouse.move(box.x + box.width / 2 + 600, box.y + 120, { steps: 8 });
     await expect
       .poll(async () => (await page.locator('#chat-main-mount').boundingBox())!.width)
       .toBeGreaterThan(defaultWidth + 60);
@@ -1260,10 +1462,25 @@ test.describe('themes', () => {
     await pair(page);
     await sendAndWaitReply(page, 'theme check');
 
+    // The whole-page capture must not race the board's owner band: the
+    // reply wait above covers the chat only (observed RED under load: the
+    // capture missed the band while the DOM already had it). Synchronize
+    // on the band's authoritative rows before the screenshot.
+    await expect(page.locator('#board-owner .board-owner__row')).toHaveCount(3);
+    await expect(
+      page.locator('#board-owner .board-owner__row', { hasText: 'Fix the payment retry loop' }),
+    ).toBeVisible();
+
+    // Whole-page captures must be scroll-invariant: interacting with the
+    // composer can scroll the scrollable shell, and a non-zero page scroll
+    // moves the content (and the sticky band head) under the capture —
+    // observed as RED with the owner band scrolled away. Pin the origin.
+    await page.evaluate(() => window.scrollTo(0, 0));
     await expect(page.locator('html')).not.toHaveClass(/dark/);
     await expect(page).toHaveScreenshot('chat-light.png', { maxDiffPixelRatio: 0.02 });
 
     await page.locator('#theme-toggle').click();
+    await page.evaluate(() => window.scrollTo(0, 0));
     await expect(page.locator('html')).toHaveClass(/dark/);
     await expect(page).toHaveScreenshot('chat-dark.png', { maxDiffPixelRatio: 0.02 });
 

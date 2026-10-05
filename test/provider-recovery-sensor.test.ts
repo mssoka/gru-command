@@ -458,6 +458,25 @@ describe('eligibility invalidation (acceptance 2)', () => {
     expect(h.probe.calls).toHaveLength(0);
   });
 
+  it('a newer REVIEW-ONLY session never supersedes the implementer\'s wait (2026-10-05 review)', async () => {
+    const h = new Harness();
+    h.makeJob('job-1');
+    h.ledger.registerAgent({ id: 'agent-minion-1', role: 'minion', jobId: 'job-1' });
+    await h.establishMinionWait();
+    // Newer review-only rows for the same job — round-bound, perkins-role
+    // and lens-bound — plus a tracked child: none of them is the lane's
+    // writer, so the interrupted implementer keeps its recovery.
+    const round = h.ledger.addRound({ jobId: 'job-1', lenses: ['blind'] });
+    h.ledger.registerAgent({ id: 'agent-review-lead', role: 'perkins', jobId: 'job-1', roundId: round.id });
+    h.ledger.registerAgent({ id: 'agent-review-round', role: 'minion', jobId: 'job-1', roundId: round.id });
+    h.ledger.registerAgent({ id: 'agent-review-lens', role: 'minion', jobId: 'job-1' });
+    h.ledger.bindLens(round.id, 'blind', 'agent-review-lens');
+    h.ledger.registerAgent({ id: 'agent-child', role: 'minion', jobId: 'job-1', parentage: 'child', parentAgentId: 'agent-minion-1' });
+    await h.sensor.tick();
+    expect(h.ledger.listProviderWaits({ status: 'superseded' })).toHaveLength(0);
+    expect(h.ledger.listProviderWaits({ status: 'waiting' })).toHaveLength(1);
+  });
+
   it('a silas-slot wait retires when silas is no longer hosted', async () => {
     const h = new Harness();
     await establishProviderWait(h.sensor, {

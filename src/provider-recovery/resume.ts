@@ -164,17 +164,20 @@ async function claimJobMinion(
     deps.ledger.setProviderWaitStatus(wait.id, 'superseded', { why: 'original actor is live again', by });
     return { outcome: 'skipped', waitId: wait.id, why: 'original actor is live again' };
   }
-  const replacement = deps.ledger
-    .listAgents()
-    .find(
-      (agent) =>
-        agent.jobId === wait.jobId &&
-        agent.role === 'minion' &&
-        agent.parentage !== 'child' &&
-        agent.id !== wait.agentId &&
-        agent.createdAt >= wait.createdAt &&
-        deps.registry.getHandle(agent.id) !== null,
-    );
+  // A replacement must be a live IMPLEMENTER (Gru ruling 2026-09-29 +
+  // #161 union): a newer review-only session or tracked child is not the
+  // lane's writer — listImplementerMinions applies the exclusions. A
+  // waiter without a job id has no replacement semantics at all.
+  const replacement = wait.jobId !== null
+    ? deps.ledger
+        .listImplementerMinions(wait.jobId)
+        .find(
+          (agent) =>
+            agent.id !== wait.agentId &&
+            agent.createdAt >= wait.createdAt &&
+            deps.registry.getHandle(agent.id) !== null,
+        )
+    : undefined;
   if (replacement !== undefined) {
     deps.ledger.setProviderWaitStatus(wait.id, 'superseded', { why: 'a live replacement minion owns the lane', by });
     return { outcome: 'skipped', waitId: wait.id, why: 'a live replacement minion owns the lane' };

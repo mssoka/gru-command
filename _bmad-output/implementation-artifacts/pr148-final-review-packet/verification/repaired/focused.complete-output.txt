@@ -1,0 +1,77 @@
+
+> gru-command@1.0.0 build
+> tsc && node -e "const fs=require('node:fs'); fs.mkdirSync('dist/runtime',{recursive:true}); fs.copyFileSync('src/runtime/review-mcp-server.mjs', 'dist/runtime/review-mcp-server.mjs')" && node tools/verify-perkins-resource.mjs . && node tools/write-build-rev.mjs
+
+{"loadedFile":"<LANE_WORKTREE>/resources/perkins-code-review/policy.json","bridgeFile":"<LANE_WORKTREE>/dist/runtime/review-mcp-server.mjs","policySha256":"5622da6b100dff79cda29147cb7a3ecd8dd5e0e4905b8bcfb4dcd22f58dfb6a9","bridgeSha256":"badd96c16800cffb9e18734f777d40d423b72423b89debed5684ad42c62f2032","canonicalSourceSha256":"f38c28ffb10b4e44fa1f87f260a08507bb0a5c8872de2cf47e05a985c5eb92e7","residueScan":{"scannedBytes":629731,"scannedFiles":33}}
+build rev 9ba863746da8a0af3b6f20c00d3cb08acc95f28c → <LANE_WORKTREE>/dist/build-rev.json
+vitest-rpc-timeout: already patched node_modules/vitest/dist/chunks/rpc.-pEldfrD.js
+vitest-rpc-timeout: 0 file(s) patched this run, 1 checked
+
+ RUN  v3.2.7 <LANE_WORKTREE>
+
+ ✓ test/suite-shape.test.ts (2 tests) 102ms
+Preparing worktree (detached HEAD d86d7a2)
+Preparing worktree (detached HEAD a4371d7)
+Preparing worktree (detached HEAD a4371d7)
+Preparing worktree (detached HEAD a4371d7)
+Preparing worktree (detached HEAD a4371d7)
+Preparing worktree (detached HEAD a4371d7)
+Preparing worktree (detached HEAD a4371d7)
+Preparing worktree (detached HEAD a4371d7)
+Preparing worktree (detached HEAD a4371d7)
+Preparing worktree (detached HEAD a4371d7)
+Preparing worktree (detached HEAD a4371d7)
+ ✓ test/bmad-onboarding.test.ts (27 tests) 71664ms
+   ✓ per-selected-repo BMAD onboarding > runs the pinned official headless installer with all four defaults and writes narrow idempotent bindings  2001ms
+   ✓ per-selected-repo BMAD onboarding > onboarding and reuse keep fresh clones usable without Git-local BMAD source  2371ms
+   ✓ per-selected-repo BMAD onboarding > explicit reuse upgrades only a verified legacy fingerprint, not changed tooling or legacy caches  3502ms
+   ✓ per-selected-repo BMAD onboarding > refuses traversal and symlinked skill paths before hashing a recorded binding  1533ms
+   ✓ per-selected-repo BMAD onboarding > reuses an existing customized install without changing custom bytes, modules, versions, or local excludes  839ms
+   ✓ per-selected-repo BMAD onboarding > installs both project-local runtime bindings for mixed Pi and Claude role policy  964ms
+   ✓ per-selected-repo BMAD onboarding > skip touches nothing; partial/network failure remains visible and never writes a ready record  1037ms
+   ✓ per-selected-repo BMAD onboarding > missing-prerequisite failure names the missing tool and never marks ready (failure matrix)  649ms
+   ✓ per-selected-repo BMAD onboarding > the PRODUCTION prerequisite probe executes and detects a missing binary (mutation-kill)  2251ms
+   ✓ per-selected-repo BMAD onboarding > read-only repo fails visibly without a ready record (failure matrix)  787ms
+   ✓ per-selected-repo BMAD onboarding > interrupted/partial install is refused until repaired, never overwritten (failure matrix)  4799ms
+   ✓ per-selected-repo BMAD onboarding > rejects malformed existing manifests and symlinked selected repos without mutation  3476ms
+   ✓ per-selected-repo BMAD onboarding > classifies deterministic state failures as retry-futile and keeps transient failures retryable (gh-32)  9873ms
+   ✓ per-selected-repo BMAD onboarding > already-onboarded missing declared module directory keeps the installer hint before any fingerprint refusal (gh-32 r1)  1095ms
+   ✓ per-selected-repo BMAD onboarding > already-onboarded symlinked declared module directory keeps the installer hint (gh-32 r1)  965ms
+   ✓ per-selected-repo BMAD onboarding > already-onboarded deleted recorded runtime binding is deterministic with installer guidance, never a futile retry (gh-32 r1)  1077ms
+   ✓ per-selected-repo BMAD onboarding > valid-but-unreadable BMAD control files stay transient and recover on the SAME collected answers (gh-32 r1)  1756ms
+   ✓ per-selected-repo BMAD onboarding > disposable BMAD preflight output failing safety validation stays transient and the next attempt completes (gh-32 r1)  1273ms
+   ✓ per-selected-repo BMAD onboarding > bootstraps isolated copies into a real fresh worktree and fails when a required source module disappears  13304ms
+   ✓ per-selected-repo BMAD onboarding > gh-32 final-review repairs (independent tracked review) > unpaired managed-block markers in worktree.toml are deterministic skip-only, never a futile retry  1222ms
+   ✓ per-selected-repo BMAD onboarding > gh-32 final-review repairs (independent tracked review) > fresh-installer output failing post-install validation stays transient (never skip-only)  1260ms
+   ✓ per-selected-repo BMAD onboarding > gh-32 final-review repairs (independent tracked review) > missing skills root and ENOTDIR root report the root; EACCES stays transient  3669ms
+   ✓ per-selected-repo BMAD onboarding > gh-32 final-review repairs (independent tracked review) > control-file refusals are deterministic skip-only without mutation  1817ms
+   ✓ per-selected-repo BMAD onboarding > gh-32 final-review repairs (independent tracked review) > validateRepo refusals outside the covered pair are deterministic, and EACCES stays transient  1364ms
+   ✓ per-selected-repo BMAD onboarding > gh-32 final-review repairs (independent tracked review) > reuse-path content validator classifications are pinned (final review)  4105ms
+   ✓ per-selected-repo BMAD onboarding > gh-32 final-review repairs (independent tracked review) > a denied manifest read stays transient and recovers on the SAME collected answers  1428ms
+   ✓ per-selected-repo BMAD onboarding > gh-32 final-review repairs (independent tracked review) > ancestor symlink refusals carry the official-installer repair hint for existing installs  952ms
+ ✓ test/wizard-interactive.test.ts (11 tests) 74671ms
+   ✓ interactive wizard under a pty (Perkins r2 T1) > all-defaults happy path: prompts answered, config written, smoke green  11778ms
+   ✓ interactive wizard under a pty (Perkins r2 T1) > Enter accepts the default-on fresh BMAD action and reaches ready state  7409ms
+   ✓ interactive wizard under a pty (Perkins r2 T1) > deterministic BMAD failure offers skip-only with the deliberate-fix path; Enter skips and setup completes (gh-32)  7367ms
+   ✓ interactive wizard under a pty (Perkins r2 T1) > transient BMAD failure still offers retry; a successful retried attempt completes (gh-32)  9522ms
+   ✓ interactive wizard under a pty (Perkins r2 T1) > already-onboarded deleted runtime binding is skip-only deterministic; a typed retry is refused and only skip completes (gh-32 r1)  14716ms
+   ✓ interactive wizard under a pty (Perkins r2 T1) > every prompt loop retries on invalid input, then accepts the valid answer  4912ms
+   ✓ interactive wizard under a pty (Perkins r2 T1) > managed-repo multi-pick by INDEX selects exactly that repo  4960ms
+   ✓ interactive wizard under a pty (Perkins r2 T1) > managed-repo multi-pick by NAME (comma-separated) selects exactly those repos  4535ms
+   ✓ interactive wizard under a pty (Perkins r2 T1) > bind host rejects y/n tokens and re-prompts; 0.0.0.0 lands in the config (user-found boot bug)  4822ms
+   ✓ interactive wizard under a pty (Perkins r2 T1) > bind host accepts a resolvable hostname (localhost) end-to-end  4463ms
+ ✓ test/wizard.test.ts (27 tests) 76566ms
+   ✓ wizard CLI surface > interactive mode without a TTY exits 2 printing the terminal recovery command (Perkins r1 B1)  4833ms
+   ✓ wizard CLI surface > noninteractive deterministic BMAD failure fails loud without offering retry; explicit skip completes (gh-32)  23434ms
+   ✓ wizard CLI surface > noninteractive hint-less deterministic failures name the neutral deliberate repair (gh-32 final review)  6992ms
+   ✓ wizard CLI surface > noninteractive deleted recorded binding after successful onboard fails loud skip-only with the installer hint (gh-32 r1)  14238ms
+   ✓ wizard CLI surface > --answers without a JSON argument exits 2 with usage  3581ms
+   ✓ wizard CLI surface > --answers rejects secrets (token) and non-object JSON with the documented errors  17425ms
+   ✓ wizard CLI surface > pre-flight port check: an occupied fixed port fails LOUD with stop-first guidance, nothing written (Perkins r2 H2)  3233ms
+   ✓ wizard first-boot smoke — failure modes (I/O matrix) > a service that never answers /health fails loud NAMING the missing signal  2229ms
+
+ Test Files  4 passed (4)
+      Tests  67 passed (67)
+   Start at  09:09:43
+   Duration  82.74s (transform 1.75s, setup 208ms, collect 6.49s, tests 223.00s, environment 1ms, prepare 2.24s)
+

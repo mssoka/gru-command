@@ -3,7 +3,7 @@ import { hashToken, tokenConfigured, tokenMatches } from '../auth.js';
 import type { GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { ChildWorkerRecord, LedgerApi } from '../ledger/api.js';
-import { AmbiguousDirectiveError, DirectiveConflictError, PhaseHandoffConflictError, PipelineConflictError } from '../ledger/api.js';
+import { JOB_DISPLAY_NAME_MAX_LENGTH, AmbiguousDirectiveError, DirectiveConflictError, PhaseHandoffConflictError, PipelineConflictError } from '../ledger/api.js';
 import { isJobTerminal } from '../ledger/states.js';
 import { parseCompletionHandoffIntent, type CompletionHandoffIntent } from '../ledger/obligations.js';
 import { parsePipelinePrerequisites, type PipelinePrerequisite } from '../ledger/pipeline.js';
@@ -329,11 +329,19 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
     if (req.method === 'POST' && path === '/api/dispatch') {
       if (!authed(req, res)) return true;
       const body = await readBody(req);
+      // Optional-field idiom (target_ref and friends): an absent, null, or
+      // blank display_name means "no authored name" — the job falls back
+      // to its title. A real name is bounded here AND at the ledger write.
+      const displayName = optStrField(body, 'display_name')?.trim();
+      if (displayName !== undefined && displayName.length > JOB_DISPLAY_NAME_MAX_LENGTH) {
+        throw new Error(`display_name exceeds ${JOB_DISPLAY_NAME_MAX_LENGTH} characters`);
+      }
       const completionHandoff = completionHandoffField(body);
       const outcome = await options.dispatch.dispatch({
         jobId: strField(body, 'job_id'),
         repoPath: strField(body, 'repo_path'),
         title: strField(body, 'title'),
+        ...(displayName !== undefined ? { displayName } : {}),
         briefing: strField(body, 'briefing'),
         ...(completionHandoff !== undefined ? { completionHandoff } : {}),
       });

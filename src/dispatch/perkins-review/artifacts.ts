@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, linkSync, lstatSync, mkdirSync, realpathSync, unlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, fstatSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, unlinkSync, writeFileSync, constants } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { BranchIdleTag } from '../branch-idle.js';
 import type { CiEvidenceRecord } from '../../review-inputs/ci-evidence.js';
@@ -519,7 +519,27 @@ export function refMovedSinceFreeze(review: FrozenReview): boolean {
   return sourceMovementSinceFreeze(review) !== null;
 }
 
-export function writeReviewArtifact(review: FrozenReview, relativePath: string, value: unknown): string {
+/** Only the terminal retry may compare a previously published report. A
+ * no-follow descriptor and byte bound keep this check inside the same safe
+ * round directory without relaxing write-once artifact publication. */
+export function publishedReportMatches(review: FrozenReview, expected: string): boolean {
+  const root = ensureDirectoryWithoutSymlinks(review.directory);
+  // O_NOFOLLOW rejects symlink swaps; O_NONBLOCK keeps the open bounded —
+  // a FIFO or device planted at the report path returns immediately and
+  // is then rejected by the regular-file check below instead of blocking
+  // the terminal retry indefinitely.
+  const descriptor = openSync(join(root, 'perkins-report.md'), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const info = fstatSync(descriptor);
+    const bytes = Buffer.from(expected, 'utf8');
+    if (!info.isFile() || info.size !== bytes.length) return false;
+    return readFileSync(descriptor).equals(bytes);
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function reviewArtifactPath(review: FrozenReview, relativePath: string): { root: string; path: string } {
   const components = relativePath.split('/');
   if (
     relativePath.startsWith('/') || relativePath.includes('\\') || relativePath.includes('\0') ||
@@ -528,6 +548,20 @@ export function writeReviewArtifact(review: FrozenReview, relativePath: string, 
   const root = ensureDirectoryWithoutSymlinks(review.directory);
   const path = resolve(root, ...components);
   if (!contained(root, path) || path === root) throw new Error('review artifact path escapes round directory');
+  return { root, path };
+}
+
+/** Read a review artifact with the same path-safety rules as writes. A
+ * write-once collision is idempotent ONLY when the existing bytes equal
+ * what the rejected write would have published; callers use this to tell
+ * an idempotent retry apart from a missing-or-stale evidence gap. */
+export function readReviewArtifact(review: FrozenReview, relativePath: string): string {
+  const { path } = reviewArtifactPath(review, relativePath);
+  return readFileSync(path, 'utf8');
+}
+
+export function writeReviewArtifact(review: FrozenReview, relativePath: string, value: unknown): string {
+  const { root, path } = reviewArtifactPath(review, relativePath);
   atomicWrite(path, typeof value === 'string' ? value : `${JSON.stringify(value, null, 2)}\n`, root);
   return path;
 }

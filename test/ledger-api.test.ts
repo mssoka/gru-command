@@ -35,6 +35,59 @@ describe('ledger api — the record of state', () => {
     expect(events.some((e) => e.kind === 'job.created' && e.jobId === 'fix-login-flow')).toBe(true);
   });
 
+  it('retains optional heist names and bound worker identity through restart and observer updates', () => {
+    const dir = tmpDir();
+    const firstDb = new LedgerDb(dir);
+    const first = new LedgerApi(firstDb.handle, { bus: new EventBus() });
+    first.addJob({ id: 'named-heist', repo: 'fixture', title: 'Full & Detailed Heist Title', displayName: ' Wake Alerts ' });
+    first.addJob({ id: 'legacy-heist', repo: 'fixture', title: 'Original title' });
+    first.registerAgent({ id: 'worker-full-id', role: 'minion', jobId: 'named-heist', sessionFile: '/session' });
+    first.registerAgent({ id: 'worker-full-id', role: 'minion' }); // runtime observer cannot erase the binding
+    firstDb.close();
+    const reopenedDb = new LedgerDb(dir);
+    const reopened = new LedgerApi(reopenedDb.handle, { bus: new EventBus() });
+    expect(reopened.getJob('named-heist')).toMatchObject({ title: 'Full & Detailed Heist Title', displayName: 'Wake Alerts' });
+    expect(reopened.getJob('legacy-heist')?.displayName).toBeNull();
+    expect(reopened.getAgent('worker-full-id')).toMatchObject({ id: 'worker-full-id', jobId: 'named-heist', sessionFile: '/session' });
+    expect(() => reopened.addJob({ id: 'blank-name', repo: 'fixture', title: 'T', displayName: '  ' })).toThrow(/display name/u);
+    reopenedDb.close();
+  });
+
+  it('authored names are bounded and must be visible: cap, invisible-only, emoji ok (G2/G3)', () => {
+    expect(() => api.addJob({ id: 'name-over-cap', repo: 'fixture', title: 'T', displayName: 'x'.repeat(101) }))
+      .toThrow(/exceeds 100 characters/u);
+    // Zero-width and format-only names would render an empty card.
+    expect(() => api.addJob({ id: 'name-invisible-zwsp', repo: 'fixture', title: 'T', displayName: '\u200b\u200b' }))
+      .toThrow(/visible characters/u);
+    expect(() => api.addJob({ id: 'name-invisible-zwj', repo: 'fixture', title: 'T', displayName: '\u200d\u200d\u200d' }))
+      .toThrow(/visible characters/u);
+    expect(() => api.addJob({ id: 'name-invisible-bidi', repo: 'fixture', title: 'T', displayName: '\u200e\u202e\u2066' }))
+      .toThrow(/visible characters/u);
+    expect(() => api.addJob({ id: 'name-invisible-marks', repo: 'fixture', title: 'T', displayName: '\u0301\u0301' }))
+      .toThrow(/visible characters/u);
+    const named = api.addJob({ id: 'name-emoji-ok', repo: 'fixture', title: 'T', displayName: '🧑\u200d🚀 launch' });
+    expect(named.displayName).toBe('🧑\u200d🚀 launch');
+    // Visible letters behind an invisible prefix are accepted and kept raw:
+    // the rail ignores the controls before shortening (r5 warning), so the
+    // stored authored value is never mutated to fit a display bound.
+    const prefixed = api.addJob({
+      id: 'name-invisible-prefix', repo: 'fixture', title: 'T',
+      displayName: '\u200b'.repeat(24) + 'wake alerts',
+    });
+    expect(prefixed.displayName).toBe('\u200b'.repeat(24) + 'wake alerts');
+    const atCap = api.addJob({ id: 'name-at-cap', repo: 'fixture', title: 'T', displayName: 'y'.repeat(100) });
+    expect(atCap.displayName).toHaveLength(100);
+  });
+
+  it('job.created payload carries the authored name; legacy jobs record null (G10)', () => {
+    api.addJob({ id: 'created-named', repo: 'fixture', title: 'Full title', displayName: 'short name' });
+    api.addJob({ id: 'created-legacy', repo: 'fixture', title: 'Full title' });
+    const named = api.latestJobEvent('created-named', 'job.created');
+    const legacy = api.latestJobEvent('created-legacy', 'job.created');
+    expect(named?.payload).toMatchObject({ repo: 'fixture', title: 'Full title', display_name: 'short name' });
+    expect(legacy?.payload).toMatchObject({ repo: 'fixture', title: 'Full title', display_name: null });
+  });
+
   it('duplicate job ids and empty fields are rejected', () => {
     expect(() => api.addJob({ id: 'fix-login-flow', repo: 'x', title: 'dup' })).toThrow(/already exists/u);
     expect(() => api.addJob({ id: '', repo: 'x', title: 'empty id' })).toThrow(/non-empty/u);
@@ -191,6 +244,72 @@ describe('ledger api — the record of state', () => {
     const hops = api.listEvents().filter((e) => e.kind === 'agent.state' && e.agentId === 'agent-one');
     expect(hops.map((e) => (e.payload as { to: string }).to).reverse()).toEqual(['streaming', 'idle']);
     expect(() => api.setAgentState('ghost', 'idle')).toThrow(/not found/u);
+  });
+
+  it('listImplementerMinions: newest-first role-minion rows, review-only sessions excluded (G1)', () => {
+    // Self-seeding: earlier sections share this db, but a focused run must
+    // not depend on their rows (agents.job_id is FK-enforced).
+    if (api.getJob('fix-login-flow') === null) {
+      api.addJob({ id: 'fix-login-flow', repo: 'billing-api', title: 'Fix the login flow regression' });
+    }
+    api.addJob({ id: 'unrelated', repo: 'fixture', title: 'other heist' });
+    api.registerAgent({ id: 'crew', role: 'gru' });
+    api.registerAgent({ id: 'impl', role: 'minion', jobId: 'fix-login-flow', sessionFile: '/impl.jsonl' });
+    api.registerAgent({ id: 'other-job', role: 'minion', jobId: 'unrelated', sessionFile: '/other.jsonl' });
+    const round = api.addRound({ jobId: 'fix-login-flow', lenses: ['blind'] });
+    api.registerAgent({ id: 'lead', role: 'perkins', jobId: 'fix-login-flow', roundId: round.id, sessionFile: '/lead.jsonl' });
+    api.registerAgent({ id: 'round-bound', role: 'minion', jobId: 'fix-login-flow', roundId: round.id, sessionFile: '/round.jsonl' });
+    api.registerAgent({ id: 'lens-bound', role: 'minion', jobId: 'fix-login-flow', sessionFile: '/lens.jsonl' });
+    api.bindLens(round.id, 'blind', 'lens-bound');
+    api.registerAgent({ id: 'unlinked', role: 'minion', sessionFile: '/unlinked.jsonl' });
+    const bump = db.handle.prepare('UPDATE agents SET updated_at = ? WHERE id = ?');
+    bump.run('2026-09-29T12:00:01.000Z', 'impl');
+    bump.run('2026-09-29T12:00:02.000Z', 'round-bound');
+    bump.run('2026-09-29T12:00:03.000Z', 'lens-bound');
+    // 'agent-one' trails from an earlier suite section sharing this db.
+    const implementers = api.listImplementerMinions('fix-login-flow').map((agent) => agent.id);
+    expect(implementers[0]).toBe('impl');
+    for (const reviewer of ['lead', 'round-bound', 'lens-bound']) {
+      expect(implementers).not.toContain(reviewer);
+    }
+    expect(api.listImplementerMinions('unrelated').map((agent) => agent.id)).toEqual(['other-job']);
+    expect(api.listImplementerMinions('no-such-job')).toEqual([]);
+  });
+
+  it('listImplementerMinions: same-millisecond ties keep insertion (spawn) order, and tracked children are never implementers (2026-10-05 review)', () => {
+    api.addJob({ id: 'tie-heist', repo: 'billing-api', title: 'Tie order heist' });
+    // Two implementers registered within the SAME millisecond: created_at
+    // cannot separate them, and the alphabetical UUID order ('tie-a' <
+    // 'tie-b') is incidental — insertion (spawn) order must win, so the
+    // second registrant is the newest implementer.
+    api.registerAgent({ id: 'tie-a', role: 'minion', jobId: 'tie-heist' });
+    api.registerAgent({ id: 'tie-b', role: 'minion', jobId: 'tie-heist' });
+    const tie = db.handle.prepare('UPDATE agents SET created_at = ? WHERE id = ?');
+    tie.run('2026-10-05T03:00:00.000Z', 'tie-a');
+    tie.run('2026-10-05T03:00:00.000Z', 'tie-b');
+    expect(api.listImplementerMinions('tie-heist').map((agent) => agent.id)).toEqual(['tie-b', 'tie-a']);
+    // Issue #161 union: a tracked child worker on the same job shares the
+    // writer's role but is never the primary lane worker — the pick must
+    // exclude it (routing digests/fix directives never land on a child).
+    const parent = api.getAgent('tie-b')!;
+    api.registerAgent({ id: 'tie-child', role: 'minion', jobId: 'tie-heist', parentage: 'child', parentAgentId: parent.id });
+    const afterChild = api.listImplementerMinions('tie-heist').map((agent) => agent.id);
+    expect(afterChild).not.toContain('tie-child');
+    expect(afterChild).toEqual(['tie-b', 'tie-a']);
+  });
+
+  it('preserves the review-worker role when a fallback reviewer is re-registered by the spawn tap', () => {
+    api.addJob({ id: 'fallback-role-heist', repo: 'fixture', title: 'Review title' });
+    api.registerAgent({ id: 'fallback-reviewer', role: 'minion', sessionFile: '/review.jsonl' });
+    api.registerAgent({ id: 'fallback-reviewer', role: 'perkins', label: 'fallback-review', jobId: 'fallback-role-heist' });
+    // A resumed fallback restart uses the runtime spawn role, not the
+    // durable review-worker role. The observer must not downgrade it.
+    api.registerAgent({ id: 'fallback-reviewer', role: 'minion', sessionFile: '/review-resumed.jsonl' });
+    expect(api.getAgent('fallback-reviewer')).toMatchObject({
+      id: 'fallback-reviewer', role: 'perkins', label: 'fallback-review',
+      jobId: 'fallback-role-heist', sessionFile: '/review-resumed.jsonl', roundId: null,
+    });
+    expect(api.listImplementerMinions('fallback-role-heist').map((agent) => agent.id)).not.toContain('fallback-reviewer');
   });
 
   it('lens binding + outcome transitions; unknown rounds/lenses fail loud', () => {

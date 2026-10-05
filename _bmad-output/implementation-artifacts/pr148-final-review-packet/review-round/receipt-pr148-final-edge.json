@@ -1,0 +1,105 @@
+{
+  "review_id": "pr148-final-edge",
+  "artifact": "final receipt — provenance metadata for the lens-edge-case-hunter whole-change review (initial declaration, method, limits, variances, hash counts, findings count)",
+  "job": "pr148-final-edge",
+  "repo": "gru-command",
+  "branch": "gru/pr148-final-edge",
+  "worktree": "<HOME>/.gru-command/worktrees/gru-command/job-pr148-final-edge",
+  "path_tokens": {
+    "<HOME>": "personal home prefix (sanitized per standing order; briefing supplies machine paths)",
+    "<LANE_WORKTREE>": "<HOME>/.gru-command/worktrees/gru-command/job-wizard-bmad-deterministic-retry-32",
+    "<PACKET>": "<LANE_WORKTREE>/_bmad-output/implementation-artifacts/pr148-final-review-packet"
+  },
+  "lens": {
+    "name": "lens-edge-case-hunter",
+    "file": "<LANE_WORKTREE>/.agents/skills/bmad-review/references/lens-edge-case-hunter.md",
+    "sha256": "5f0c4778d7b393d11156af8c1bd9bf88aafeb9d50fff5f460ca67df50d927e7d",
+    "bytes": 5857,
+    "steps_executed_in_order": [
+      "1 exhaustive path analysis (all diff hunks; also_consider folded in)",
+      "2 completeness validation (edge classes revisited)",
+      "3 deletion check (removed/replaced chunks reviewed)",
+      "4 claims check (claims/spec.md read as a file for the first time after tracing)"
+    ]
+  },
+  "review_target_products": {
+    "product_head": "5c0d1d343639c4c96c0e387030f8c3ef6fddd445",
+    "packet_commit": "821ead3f8fd5989e3e05bf80568888d32c40ea44",
+    "base": "5d56194a905262231bb0d183292b6d08cbd70810",
+    "diff_base": "5d56194a905262231bb0d183292b6d08cbd70810",
+    "product_diff": "final.patch",
+    "product_diff_bytes": 122261,
+    "product_diff_sha256": "97f0c0d890b90da7d9b727f3f8e1f5382c6e2ed64f82a4f5579a5c2c4cd3aeb7",
+    "packet_manifest_sha256": "76c2eb8001487ea6ab539920c45724e4255901e8ec81caebd6e94bd16275340a"
+  },
+  "declared_inputs": {
+    "briefing": "dispatch briefing for job pr148-final-edge",
+    "packet_dir": "<PACKET>",
+    "packet_entrypoints": ["<PACKET>/README.md", "<PACKET>/manifest.json"],
+    "frozen_source_worktree_readonly": "<LANE_WORKTREE> at product head 5c0d1d3 (tracked content only)",
+    "prohibited_inputs_acknowledged": "node_modules/, dist/, web/dist/, web/test-results/, .git/ internals, _bmad-output/gate-prep/, other jobs' worktrees/sessions/ledgers/journals, owner/private/Gru/Silas material, native review material (claims/native-r1-review.md and claims/native-r1-dispositions.md were NOT read), ambient typedefs, nested skill/agents/reviewers/reporting tools"
+  },
+  "hash_verification": {
+    "method": "static in-memory hashing (shasum -a 256); all 58 manifest-listed files checked mechanically in one pass via jq pipe from manifest.json; no scratch files, no redirects, no caches",
+    "baseline": {
+      "at": "before substantive analysis",
+      "manifest_listed_files": 58,
+      "manifest_listed_ok": 58,
+      "manifest_itself_sha256": "76c2eb8001487ea6ab539920c45724e4255901e8ec81caebd6e94bd16275340a",
+      "manifest_sha256_matches_briefing": true,
+      "mismatches": []
+    },
+    "after": {
+      "at": "after analysis, before writing findings",
+      "manifest_listed_files": 58,
+      "manifest_listed_ok": 58,
+      "manifest_itself_sha256": "76c2eb8001487ea6ab539920c45724e4255901e8ec81caebd6e94bd16275340a",
+      "mismatches": []
+    },
+    "packet_files_total_on_disk_including_manifest": 59,
+    "before_and_after_identical": true,
+    "lens_file_sha256_matches_briefing": true
+  },
+  "method": {
+    "reads": [
+      "<PACKET>/README.md, manifest.json; final.patch read in full (2017 lines; all 18 file sections)",
+      "<PACKET>/claims/spec.md and claims/issue-32.json (claims check; spec read first at Step 4)",
+      "<PACKET>/png/PROVENANCE.md; png/before/chat-light-darwin.png and png/after/chat-light-darwin.png inspected as images",
+      "head sources traced in <PACKET>/source/changed: src/wizard/bmad-onboarding.ts (full), src/wizard/main.ts (retry loop + fail/ask/terminal definitions), test/bmad-onboarding.test.ts and test/wizard-interactive.test.ts (helpers + changed tests), test/wizard.test.ts and test/suite-shape.test.ts (diff hunks), web/e2e/real-server.spec.ts, web/e2e/smoke.spec.ts, web/e2e/working-flavor.spec.ts, web/mock/server.ts (hold/reset regions), web/src/styles/components.css (chat-context rules), web/src/ui/chat-working-flavor.test.ts",
+      "context reads: <PACKET>/source/context/web/src/lib/working-flavor.ts (contract), source/context/web/src/ui/chat.ts (attach-chip classes); <LANE_WORKTREE>/src/wizard/answers.ts (parseAnswers keys/repo validation, symbol search)"
+    ],
+    "checks": [
+      "every changed/new call site compared against its callee declaration (argument count/order/types) as far as statically decidable",
+      "suite pins re-derived by the guard's own regex over the three pinned head files: 19 / 11 / 26 = pins in test/suite-shape.test.ts",
+      "media-query boundary and cascade checked at 899/900px for the new .chat-context pins",
+      "worktree.toml new verify-scope keys checked for duplicates and quoting",
+      "PROVENANCE.md's approval-anchors corroborated at screenshot scale for one before/after pair"
+    ]
+  },
+  "limits": [
+    "no execution of any kind: no build/tests/lint/typecheck/npm/npx/node/product scripts/scheduler/network/browser; findings rest on static trace only",
+    "packet run outputs, CI metadata, and referenced commit existence were trusted as provided (read-only); not independently re-run or re-resolved",
+    "image inspection was one before/after pair at screenshot scale; the other three baselines were checked by hash + provenance text only",
+    "native review material and gate-prep/run logs deliberately not read, so prior findings were neither confirmed nor reused"
+  ],
+  "variances": [
+    "claims/spec.md ships as an added file inside final.patch, so its narrative was unavoidably visible while reading the required diff before the Step-4 file read; path tracing (Steps 1-2) was performed against the code, and the Step-4 read of the claims file itself was still executed only after tracing, as instructed",
+    "manifest.json's `product_files_at_head` is an empty array, while README.md's verification step 3 and PROVENANCE geometry describe per-file blob hashes of diff-touched files; this is a packet metadata gap only — no packet hash mismatch was found, and changed product files were verified through the manifest's packet_files entries"
+  ],
+  "findings_count": 3,
+  "findings_kinds": {
+    "claim": 1,
+    "edge": 2,
+    "deletion": 0
+  },
+  "findings_output": "<HOME>/.gru-command/worktrees/gru-command/job-pr148-final-edge/_bmad-output/implementation-artifacts/ops-review/pr148-final-edge/findings.json",
+  "session": null,
+  "model": null,
+  "session_note": "not observable without env/session reads, which the briefing prohibits",
+  "discipline": {
+    "writes": "only this receipt.json and its sibling findings.json in own worktree; both stay gitignored; never git add/-f, commit, or push; no /tmp or external scratch files; no redirects or tee",
+    "reads": "static reads only; refs never moved",
+    "outputs_ignored": true
+  },
+  "status": "final — initial declaration before analysis; final fields appended after analysis"
+}

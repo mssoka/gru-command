@@ -53,6 +53,9 @@ let holdNextTurn = false;
 let releaseHeldTurn: (() => void) | null = null;
 let compactGeneration = 0;
 let newChatGeneration = 0;
+/** Bumped by /__reset: a previous turn's interval/close settle must not
+ * record frames into the rewound log (they replay as orphan turn frames). */
+let turnGeneration = 0;
 /** Reflow stress controls (owner heist 2026-09-29, tests only): the next
  * scripted reply runs under this tool name and/or emits this error line.
  * Long unbroken tokens prove the chat pane never scrolls horizontally;
@@ -116,6 +119,7 @@ function sendError(socket: WebSocket, message: string, fatal: boolean): void {
 
 /** Deterministic scripted Gru reply: turn → tool activity → deltas → end. */
 function scriptedReply(socket: WebSocket, userText: string, attachments?: readonly AttachmentChip[]): void {
+  const generation = turnGeneration;
   controlState = 'busy';
   broadcastContext();
   // Attach chips echo as PATH lines (SPEC ruling 19 parity: the mock is
@@ -138,6 +142,10 @@ function scriptedReply(socket: WebSocket, userText: string, attachments?: readon
   let toolEnded = false;
   let settled = false;
   const timer = setInterval(() => {
+    if (generation !== turnGeneration) {
+      finish();
+      return;
+    }
     if (socket.readyState !== socket.OPEN) {
       finish();
       return;
@@ -151,7 +159,16 @@ function scriptedReply(socket: WebSocket, userText: string, attachments?: readon
     if (chunk === undefined) {
       if (holdNextTurn) {
         holdNextTurn = false;
+        // Stop polling exhausted tokens while held: otherwise the next
+        // interval tick falls through to finish() without a release.
+        clearInterval(timer);
         releaseHeldTurn = finish;
+        // Park genuinely: stop the stream interval, or its next tick sees
+        // holdNextTurn cleared and finishes the turn ~45ms later — the
+        // busy state then ends before the browser spec can observe the
+        // 4s rotation the hold exists to protect. Release and socket
+        // close still settle through the idempotent finish().
+        clearInterval(timer);
         return;
       }
       finish();
@@ -172,6 +189,10 @@ function scriptedReply(socket: WebSocket, userText: string, attachments?: readon
     clearInterval(timer);
     releaseHeldTurn = null;
     socket.off('close', finish);
+    // /__reset bumps turnGeneration and rewinds the log; a settle from a
+    // previous generation (parked, streaming, or socket-close) must not
+    // record orphan frames into it.
+    if (generation !== turnGeneration) return;
     if (!toolEnded) {
       toolEnded = true;
       emit({ type: 'tool', name: toolName, state: 'end', seq: nextSeq() });
@@ -309,6 +330,7 @@ function defaultSampleSnapshot(): unknown {
             id: 'demo-api-docs-pass',
             repo: 'demo-api',
             title: 'Docs pass on the public endpoints',
+            displayName: 'api docs pass',
             status: 'parked',
             updatedAt: new Date(Date.now() - 3_600_000).toISOString(),
             prUrl: null,
@@ -367,13 +389,31 @@ function defaultSampleSnapshot(): unknown {
             title: 'Merge main into the retry branch',
             status: 'in-review',
             updatedAt: new Date(Date.now() - 300_000).toISOString(),
-            prUrl: 'https://example.invalid/pr/43',
+            prUrl: 'https://github.com/acme/demo-api/pull/43',
             prState: 'conflicting',
             baseBranch: 'main',
             note: 'PR conflicts with main — rebase owed',
             rounds: [],
             lane: null,
             lastAgentActivity: new Date(Date.now() - 300_000).toISOString(),
+          },
+          {
+            // Long/Unicode/special-character authored name: the rail must
+            // escape it, shorten it to the 24-grapheme bound and keep the
+            // full title + id in the tooltip/accessible name.
+            id: 'demo-api-unicode-names',
+            repo: 'demo-api',
+            title: 'Přepiš šablony a ověř 名前の長い表示 — <script> & "café" v názvu',
+            displayName: 'Přepiš <script> & "café" — 名前がとても長い表示確認',
+            status: 'working',
+            updatedAt: new Date(Date.now() - 240_000).toISOString(),
+            prUrl: null,
+            prState: null,
+            baseBranch: 'main',
+            note: 'long authored name — the rail shortens it for the card',
+            rounds: [],
+            lane: null,
+            lastAgentActivity: new Date(Date.now() - 60_000).toISOString(),
           },
           {
             id: 'demo-api-stalled-lane',
@@ -405,7 +445,7 @@ function defaultSampleSnapshot(): unknown {
             title: 'Landing copy refresh',
             status: 'working',
             updatedAt: new Date(Date.now() - 600_000).toISOString(),
-            prUrl: 'https://example.invalid/pr/42',
+            prUrl: 'https://gitlab.demo.invalid/sample/sample-site/-/merge_requests/42',
             prState: 'open',
             baseBranch: 'main',
             note: null,
@@ -466,6 +506,11 @@ function defaultSampleSnapshot(): unknown {
       // graveyard.
       { id: 'mock-minion-held', role: 'minion', label: 'held-after-breaker', state: 'disposed', status: 'disposed', runtime: 'current', lastActivity: new Date(Date.now() - 600_000).toISOString(), createdAt: new Date(Date.now() - 2_400_000).toISOString(), sessionFile: null, jobId: null, roundId: null, supervision: { state: 'stopped', restarts: 3, breakerOpen: true, stopReason: 'crash loop' } },
       { id: 'mock-minion-sept', role: 'minion', label: 'sample-site-copy-pass (Sept 29)', state: 'streaming', status: 'streaming', runtime: 'historical', lastActivity: '2026-09-29T21:12:00.000Z', createdAt: '2026-09-29T20:00:00.000Z', sessionFile: null, jobId: 'sample-site-copy-pass', roundId: null, supervision: null },
+      // Crew-heist-labels demo rows: authored display_name + long/Unicode
+      // title-fallback jobs (jobs declared above; the authored row exercises
+      // the short-name path, the Unicode row the 24-grapheme bound).
+      { id: 'mock-minion-docs', role: 'minion', label: null, state: 'idle', status: 'idle', runtime: 'current', lastActivity: null, createdAt: new Date(Date.now() - 1_200_000).toISOString(), sessionFile: null, jobId: 'demo-api-docs-pass', roundId: null, supervision: null },
+      { id: 'mock-minion-unicode', role: 'minion', label: null, state: 'idle', status: 'idle', runtime: 'current', lastActivity: null, createdAt: new Date(Date.now() - 1_500_000).toISOString(), sessionFile: null, jobId: 'demo-api-unicode-names', roundId: null, supervision: null },
       { id: 'mock-bob', role: 'bob', label: 'bob · memory', state: 'idle', status: 'idle', runtime: 'current', lastActivity: null, createdAt: new Date(Date.now() - 5_400_000).toISOString(), sessionFile: null, jobId: null, roundId: null, supervision: null },
       { id: 'mock-gru-old', role: 'gru', label: 'gru · chat (retired)', state: 'disposed', status: 'disposed', runtime: 'historical', lastActivity: new Date(Date.now() - 7_200_000).toISOString(), createdAt: new Date(Date.now() - 10_800_000).toISOString(), sessionFile: null, jobId: null, roundId: null, supervision: null },
     ],
@@ -919,6 +964,7 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
     boardMode = 'default';
     compactGeneration += 1;
     newChatGeneration += 1;
+    turnGeneration += 1;
     deferredUsers.length = 0;
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end('{"ok":true}\n');

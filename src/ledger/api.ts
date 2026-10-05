@@ -137,10 +137,25 @@ export const DEFAULT_LENSES = [
   'operations',
 ] as const;
 
+/** Upper bound for an authored job display name (Gru ruling G2,
+ * 2026-09-29): a short card label, bounded at every write boundary —
+ * 100 UTF-16 code units, comfortably above the 24-grapheme rail bound
+ * the board renders. */
+export const JOB_DISPLAY_NAME_MAX_LENGTH = 100;
+
+/** True when the value carries at least one visible character: zero-width
+ * and format controls (Unicode Cf), controls (Cc), and combining marks
+ * (M) do not count — a name made only of them renders an empty card. */
+export function hasVisibleCharacters(value: string): boolean {
+  return value.replace(/[\p{Cf}\p{Cc}\p{M}\s]/gu, '') !== '';
+}
+
 export interface JobRecord {
   readonly id: string;
   readonly repo: string;
   readonly title: string;
+  /** Optional short heist name; the full title remains authoritative. */
+  readonly displayName: string | null;
   readonly status: JobStatus;
   readonly baseBranch: string | null;
   readonly prUrl: string | null;
@@ -1074,6 +1089,7 @@ export class LedgerApi {
     id: string;
     repo: string;
     title: string;
+    displayName?: string | null;
     baseBranch?: string | null;
     briefing?: string | null;
   }): JobRecord {
@@ -1081,6 +1097,20 @@ export class LedgerApi {
       throw new Error('job id, repo, and title must be non-empty');
     }
     requireSafeRecordId(input.id, 'job id');
+    if (input.displayName !== undefined && input.displayName !== null && input.displayName.trim() === '') {
+      throw new Error('job display name must be a non-empty string');
+    }
+    const displayName = input.displayName?.trim() ?? null;
+    if (displayName !== null) {
+      // A name made only of invisible characters (ZWSP/ZWJ, bidi and
+      // format controls, combining marks) would render an empty card.
+      if (!hasVisibleCharacters(displayName)) {
+        throw new Error('job display name must contain visible characters');
+      }
+      if (displayName.length > JOB_DISPLAY_NAME_MAX_LENGTH) {
+        throw new Error(`job display name exceeds ${JOB_DISPLAY_NAME_MAX_LENGTH} characters`);
+      }
+    }
     return this.transaction(() => {
       if (this.getJob(input.id) !== null) {
         throw new Error(`job "${input.id}" already exists`);
@@ -1099,11 +1129,11 @@ export class LedgerApi {
       const ts = nowIso();
       this.db
         .prepare(
-          `INSERT INTO jobs (id, repo, title, status, base_branch, pr_url, note, briefing, created_at, updated_at)
-           VALUES (?, ?, ?, 'dispatched', ?, NULL, NULL, ?, ?, ?)`,
+          `INSERT INTO jobs (id, repo, title, status, base_branch, pr_url, note, briefing, display_name, created_at, updated_at)
+           VALUES (?, ?, ?, 'dispatched', ?, NULL, NULL, ?, ?, ?, ?)`,
         )
-        .run(input.id, input.repo, input.title, input.baseBranch ?? null, input.briefing ?? null, ts, ts);
-      this.appendEvent({ kind: 'job.created', jobId: input.id, payload: { repo: input.repo, title: input.title } });
+        .run(input.id, input.repo, input.title, input.baseBranch ?? null, input.briefing ?? null, displayName, ts, ts);
+      this.appendEvent({ kind: 'job.created', jobId: input.id, payload: { repo: input.repo, title: input.title, display_name: displayName } });
       return this.getJob(input.id) as JobRecord;
     });
   }
@@ -1948,6 +1978,10 @@ export class LedgerApi {
           },
         });
       } else {
+        // The runtime spawn tap knows the spawn role only. Fallback review
+        // workers spawn as minions, then receive their durable Perkins role;
+        // a resumed spawn must never turn them into implementer candidates.
+        const role = existing.role === 'perkins' && input.role === 'minion' ? existing.role : input.role;
         this.db
           .prepare(
             `UPDATE agents SET role = ?, label = COALESCE(?, label), job_id = COALESCE(?, job_id),
@@ -1955,7 +1989,7 @@ export class LedgerApi {
              parent_agent_id = COALESCE(?, parent_agent_id), parentage = COALESCE(?, parentage), updated_at = ? WHERE id = ?`,
           )
           .run(
-            input.role,
+            role,
             input.label ?? null,
             input.jobId ?? null,
             input.roundId ?? null,
@@ -1977,6 +2011,36 @@ export class LedgerApi {
 
   listAgents(): readonly AgentRecord[] {
     const rows = this.db.prepare('SELECT * FROM agents ORDER BY updated_at DESC, id').all() as Row[];
+    return rows.map((row) => this.agentFromRow(row));
+  }
+
+  /** The implementing minions of one job, newest spawn first: role-minion
+   * rows MINUS review-only sessions (Gru ruling 2026-09-29 on the phase8
+   * finding). A session is review-only when existing data says so — the
+   * review-worker role (Perkins lead, lens specialists, fallback reviewer),
+   * review-round membership (`round_id`), or a bound lens chip — and a
+   * review-only session must never win a latest-minion pick (re-brief
+   * resume, Silas digest, fix-directive routing). Recency is spawn order
+   * (`created_at`): observer state writes refresh `updated_at` on older
+   * rows, so a revisited old implementer must not outrank the newest.
+   * Query-side exclusion only: no schema change, and the lens subquery
+   * rides idx_lens_agent. */
+  listImplementerMinions(jobId: string): readonly AgentRecord[] {
+    // Implementer-only selection (crew-heist-labels): role 'minion' for the
+    // job, never round- or lens-bound review sessions. Issue #161 union:
+    // a tracked child worker is never the primary lane worker either.
+    // Newest spawn first: created_at has millisecond precision, so ties
+    // break by rowid DESC — SQLite's monotonic insertion order — never by
+    // the incidental alphabetical order of the UUID id column.
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM agents
+         WHERE job_id = ? AND role = 'minion' AND round_id IS NULL
+           AND (parentage IS NULL OR parentage <> 'child')
+           AND NOT EXISTS (SELECT 1 FROM lens_states WHERE lens_states.agent_id = agents.id)
+         ORDER BY created_at DESC, rowid DESC`,
+      )
+      .all(jobId) as Row[];
     return rows.map((row) => this.agentFromRow(row));
   }
 
@@ -3425,6 +3489,7 @@ export class LedgerApi {
       id: str(row.id),
       repo: str(row.repo),
       title: str(row.title),
+      displayName: nstr(row.display_name),
       status: str(row.status) as JobStatus,
       baseBranch: nstr(row.base_branch),
       prUrl: nstr(row.pr_url),

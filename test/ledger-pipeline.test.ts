@@ -441,12 +441,15 @@ describe('pipeline ledger — evaluation, order and projection', () => {
     db.close();
   });
 
-  it('applies the pipeline migration over an existing v13 ledger without touching old rows', () => {
+  it('applies the pipeline migration over an existing pre-pipeline ledger without touching old rows', () => {
     const dir = mkdtempSync(join(tmpdir(), 'gru-pipeline-upgrade-'));
     cleanupDirs.push(dir);
     // A ledger frozen at the pre-pipeline schema (the shape an existing
     // installation boots with).
-    const db13 = new LedgerDb(dir, { migrations: MIGRATIONS.slice(0, 13) });
+    // The frozen ledger carries every pre-pipeline migration (main's
+    // display-name 17 included): only the pipeline migration is absent.
+    const pre = MIGRATIONS.filter((migration) => migration.name !== 'pipeline-entries');
+    const db13 = new LedgerDb(dir, { migrations: pre });
     const ledger13 = new LedgerApi(db13.handle, { bus: new EventBus({}) });
     ledger13.addJob({ id: 'legacy-job', repo: 'demo', title: 'Legacy', briefing: 'old brief' });
     db13.close();

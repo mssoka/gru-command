@@ -1073,12 +1073,41 @@ body {
   background: var(--card);
 }
 
+/* Working flavor geometry (owner 2026-10-01): the rotating phrase must
+   never push the controls onto a second line. Console/tablet widths pin
+   the strip to one line — a long phrase ellipsizes inside the shrinkable
+   status chip instead of wrapping the buttons (which also grew the strip
+   and shifted the row above). The phone sheet keeps the wrap so the
+   status takes its own row (max-width: 899px block below). */
+@media (min-width: 900px) {
+  .chat-context {
+    flex-wrap: nowrap;
+  }
+  /* Long phrases shrink/ellipsize the status chip ALONE: the controls keep
+     their intrinsic boxes so a rotating phrase can never narrow them into
+     wrapping their own labels. */
+  .chat-context__button {
+    flex: none;
+  }
+}
+
 .chat-context__status {
   margin-right: auto;
   max-width: 100%;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* Working-flavor geometry: the busy chip must own the strip's flexible
+   slot. With an intrinsic flex-basis a long rotating phrase makes the
+   line overflow, so the shrink cascades into the buttons — they narrow
+   below their one-line width and wrap their labels — and their boxes
+   depend on the phrase. Basis 0 + grow 1 gives the chip the same slot for
+   every phrase and ellipsizes the phrase inside it. The phone sheet
+   overrides the basis to 100% so the status takes its own row. */
+.chat-context__status--busy {
+  flex: 1 1 0;
 }
 
 /* Working flavor (owner-approved 2026-10-01): the chip shows either the
@@ -1093,6 +1122,13 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* Reserve the same flexible slot for every phrase. With an intrinsic flex
+   basis, a long phrase can move the buttons onto another row despite the
+   ellipsis inside the chip. Phone layout overrides the basis to 100%. */
+.chat-context__status--busy {
+  flex: 1 1 0;
 }
 
 .chat-context__status--busy .chat-context__status-label {
@@ -2344,6 +2380,7 @@ body {
 }
 
 .board-agent__name {
+  min-width: 0;
   font-weight: 700;
   overflow: hidden;
   text-overflow: ellipsis;

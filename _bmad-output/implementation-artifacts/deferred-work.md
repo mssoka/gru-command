@@ -16,12 +16,18 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-worker-residency-budget.md`
   summary: 2026-09-28 recheck-round deferrals on pre-existing main code (each verified untouched by this lane via git diff origin/main)
   evidence: (1) whole.ts commitSettled may re-store unstamped originals over findingsDelivered:false in the pool-error branch (pre-dates this lane; this diff renamed only the pool variable); (2) dispatch worker-spawn waits emit no queue/ledger visibility and do not re-validate job status after admission (additive design scope beyond the review-scoped queue-visibility intent); (3) pi checkReviewModel tightening (authenticated provider alone no longer passes; no migration doc); (4) awareness resolveNotificationById legacy follow-up close path has no test; (5) ensureGru 'wake' default classifies user-driven compaction recovery through the wake gate/breaker message; (6) install.sh .service PATH dollar escaping; (7) board lensFromAgentLabel leading-colon lens chip; (8) awareness openAttention 1-slot split starves machine rows.
+- source_spec: `_bmad-output/implementation-artifacts/spec-crew-heist-labels.md`
+  summary: The crew-rail e2e covers short ASCII authored names only; add a long/Unicode authored name plus an ellipsis/overflow assertion (and re-check the authored row at the phone viewport) when an e2e-executing scope is available.
+  evidence: Fresh bmad-build blind-hunter finding 2026-10-02 (triaged low, not fixed): the recorded layout acceptance remains the four human-inspected desktop+phone light/dark captures, and the lane's only declared scheduler scope is `full` (`npm test`), which does not run Playwright.
 - source_spec: `_bmad-output/implementation-artifacts/pr136-chief-handoff/plan.md`
   summary: Dispatch-lane mid-turn crash after a marked phase intent has no recovery beyond leaving the phase `awaiting` (no fabricated completion, no phase-specific escalation)
   evidence: The pr136-chief-handoff delta deliberately adds no runtime attestation interface or provider recovery; a crash between the persisted intent and any admission evidence leaves the guard row awaiting and the job's own state visible. Adding dispatch-lane provider recovery is a wider runtime change that returns to Gru.
 - source_spec: `_bmad-output/implementation-artifacts/pr136-chief-handoff/plan.md`
   summary: `reconcilePendingRebriefs` delivery-only branch may append a `silas.rebrief-recovered` event for a marker group replaced by a newer request mid-boot
   evidence: Markers are read as a boot snapshot; a newer re-brief request can replace them while recovery runs. The `expectedPhaseId` fence added by this delta prevents any phase completion from the stale group (and nothing is cleared), but the recovered-history event is still appended as noise.
+- source_spec: none
+  summary: Obtain scheduled full `/api/verify` receipts, exact-head CI, and native Perkins READY for the final Stage 2 head.
+  evidence: Operational gates for the owner's authenticated scheduler. The e2e-repair deferral below is resolved: the five UI failures were fixed by this branch (held mock turns, busy-phrase rotation, reserved busy-status slot, expanded service events, sheet preservation) and re-verified on the integrated head 81295ed over the current base 39a19ea — `npm test` green (fast 1766/heavy 750/web 466) and `npm run e2e` 55/55 including visually inspected theme snapshots; the four refreshed snapshots were accepted after explicit image inspection (intact header, bubbles, composer, panels; no blank/garbled regions).
 - source_spec: `_bmad-output/implementation-artifacts/spec-pr142-review-verdict-closure.md`
   summary: App review reconciliation can certify absence from a review-list record missing delivery-predicate fields.
   evidence: Inherited from main e75ca3d; `isDecidableReviewEntry` permits absent state/commit_id/body/submitted_at, while a short `lookupMatchingReview` page can certify non-delivery. Blind 1, Edge 2 and Verification Other 1 share this defect.
@@ -72,3 +78,13 @@
 - source_spec: none — BMAD code review of PR #170 (head 3540500)
   summary: AGENTS.md and other docs don't mention the phase split; `npx vitest run test/<heavy>.test.ts` now exits "No test files found" (low)
   evidence: README documents test:backend:heavy, but agent guidance does not, so minions running a heavy file directly hit an exit-1 trap (it fails loud, not silently). Deferred: the fix edits agent-context files.
+
+## Deferred from: code review of spec-gh-32-deterministic-bmad-failure-skip-only (2026-10-05)
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-gh-32-deterministic-bmad-failure-skip-only.md`
+  summary: `wizard-bmad-browser-consumer` runs `npm run e2e` whose Playwright screenshot baselines are darwin-only, so the scope has no Linux baseline support.
+  evidence: bmad code review (blind-hunter, gpt-6-sol) 2026-10-05; pre-existing main convention — origin/main's `web/e2e/*-snapshots/` carry only `-darwin` PNGs and CI does not run e2e — so repair is a cross-lane Linux-baseline effort, not this lane's change.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-crew-heist-labels.md`
+  summary: The crew-rail Playwright project (rail layout/overflow geometry) is not part of any required recurring gate — CI runs `npm test` (Vitest) only; a future CSS regression could pass every required check while breaking the rail layout.
+  evidence: Fresh bmad-build verification-gap finding 2026-10-05 (disposition: defer). The dedicated `crew-rail` project is runnable on demand through the declared scheduler scopes (`crew-rail-captures`, `crew-captures-fast`) and ran green at the reviewed heads, but adding Playwright to required CI is a repo-wide runner-cost/policy decision (browsers install, ~1-2 min/job) that the owner and the e2e-gate-repair lane (job-e2e-gate-repair-20261004) own, not this display-naming lane.

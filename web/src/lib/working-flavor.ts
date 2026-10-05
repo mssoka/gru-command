@@ -1,6 +1,7 @@
 /**
- * Working-state flavor copy (owner-approved 2026-10-01,
- * `GRU-WORKING-FLAVOR-20261001`).
+ * Working-state flavor copy: the original 100 phrases (owner-approved
+ * 2026-10-01, `GRU-WORKING-FLAVOR-20261001`) plus 100 additions
+ * (owner-approved 2026-10-03, twenty per category) — 200 in all.
  *
  * While the authoritative chat context is connected and `busy`, the status
  * chip rotates one of these phrases every `WORKING_FLAVOR_INTERVAL_MS`.
@@ -9,7 +10,7 @@
  * anything but that chip's text.
  *
  * `WorkingFlavorDeck` owns the shuffle contract:
- *   - each bag is a permutation of all 100 approved phrases (nothing
+ *   - each bag is a permutation of all 200 approved phrases (nothing
  *     repeats until the full pool has been shown);
  *   - categories interleave round-robin with an adjacency guard, so no
  *     two consecutive phrases share a category (no banana/minion runs) —
@@ -32,8 +33,10 @@ export interface WorkingFlavorCategory {
 
 /**
  * The approved pool, verbatim: order, curly quotes, and casing are part of
- * the approval. The focused test pins the joined copy's SHA-256, so edits
- * require an owner-approved copy change plus an explicit pin update.
+ * the approval. Each category's first twenty entries are the original
+ * 2026-10-01 copy, pinned on its own; the whole 200-phrase pool is pinned
+ * separately, so edits require an owner-approved copy change plus explicit
+ * pin updates.
  */
 export const WORKING_FLAVOR_CATEGORIES: readonly WorkingFlavorCategory[] = [
   {
@@ -59,6 +62,26 @@ export const WORKING_FLAVOR_CATEGORIES: readonly WorkingFlavorCategory[] = [
       'Adjusting the disguise',
       'Counting down ominously',
       'Overthinking everything',
+      'Alphabetising evil plans',
+      'Rehearsing an innocent whistle',
+      'Scouting the aquarium',
+      'Mapping the air vents',
+      'Sketching secret tunnels',
+      'Synchronizing watches',
+      'Memorising the guard rota',
+      'Picking the codename',
+      'Designing a better trapdoor',
+      'Auditioning accomplices',
+      'Conniving politely',
+      'Rethinking the entire plan',
+      'Casing the museum',
+      'Erasing the footprints',
+      'Renting a stealth blimp',
+      'Buffing the grappling hook',
+      'Buying suspicious rope',
+      'Choosing escape music',
+      'Mastering sneaky footsteps',
+      'Scheduling the moon grab',
     ],
   },
   {
@@ -84,6 +107,26 @@ export const WORKING_FLAVOR_CATEGORIES: readonly WorkingFlavorCategory[] = [
       'Surviving a group hug',
       'Explaining “no”',
       'Supervising nonsense',
+      'Giving Kevin a decoy button',
+      'Moderating the group chat',
+      'Issuing tiny name badges',
+      'Assigning buddy minions',
+      'Holding a safety briefing',
+      'Peeling a minion off the wall',
+      'Teaching Stuart to knock',
+      'Enforcing nap time',
+      'Welcoming the newest minion',
+      'Updating the chore wheel',
+      'Vacuuming up the glitter',
+      'Hosting a talent show',
+      'Arranging tiny vacations',
+      'Leading the team chant',
+      'Rescuing a lost goggle',
+      'Breaking up a tiny mutiny',
+      'Interviewing tiny applicants',
+      'Wiping tiny fingerprints',
+      'Rebuilding the pillow fort',
+      'Handing out juice boxes',
     ],
   },
   {
@@ -109,6 +152,26 @@ export const WORKING_FLAVOR_CATEGORIES: readonly WorkingFlavorCategory[] = [
       'Measuring suspicious goo',
       'Recalibrating reality',
       'Inventing extra buttons',
+      'Untangling the laser spaghetti',
+      'Rebuilding the ray gun',
+      'Unplugging the angry vacuum',
+      'Soothing a grumpy robot',
+      'Chasing a runaway invention',
+      'Installing a lab disco ball',
+      'Rewiring the doorbell',
+      'Bolting on rocket cupholders',
+      'Explaining the small explosion',
+      'Mislabelling the big button',
+      'Calibrating the banana scale',
+      'Magnetising the cutlery',
+      'Freezing a banana for science',
+      'Apologizing to the test dummy',
+      'Christening the new laser',
+      'Brewing a new isotope',
+      'Testing the mood ray',
+      'Teaching the toaster to sing',
+      'Assembling a helper robot',
+      'Arguing with the lab computer',
     ],
   },
   {
@@ -134,6 +197,26 @@ export const WORKING_FLAVOR_CATEGORIES: readonly WorkingFlavorCategory[] = [
       'Sorting suspicious receipts',
       'Authorizing extra fog',
       'Laminating the master plan',
+      'Changing the snack vault code',
+      'Guarding the cookie jar',
+      'Stapling the fine print',
+      'Colour-coding the folders',
+      'Ordering extra paperclips',
+      'Sharpening the evil pencils',
+      'Filing under “later”',
+      'Invoicing the Moon',
+      'Balancing the banana ledger',
+      'Protecting the good stapler',
+      'Postponing the audit',
+      'Recycling last week’s memos',
+      'Watering the office plant',
+      'Bubble-wrapping the snacks',
+      'Reserving the lair’s ballroom',
+      'Pinning up the snack rota',
+      'Taking villain meeting minutes',
+      'Shipping a crate of bananas',
+      'Rewriting the snack policy',
+      'Rationing the jelly beans',
     ],
   },
   {
@@ -159,6 +242,26 @@ export const WORKING_FLAVOR_CATEGORIES: readonly WorkingFlavorCategory[] = [
       'Feigning total control',
       'Pretending this was planned',
       'Reconsidering the cape',
+      'Blaming a suspicious penguin',
+      'Nailing the slow clap',
+      'Summoning a little thunder',
+      'Dry-cleaning the cape',
+      'Sampling entrance songs',
+      'Dusting the skull mug',
+      'Talking to the evil fern',
+      'Petting a fluffy cat',
+      'Checking the evil echo',
+      'Naming the secret lair',
+      'Humming the evil theme',
+      'Booking a dramatic sunset',
+      'Delivering a wicked one-liner',
+      'Tidying up for the heroes',
+      'Rereading the villain handbook',
+      'Reclining dramatically',
+      'Starting the wind machine',
+      'Nodding slowly',
+      'Slurping ominously',
+      'Curating the lair playlist',
     ],
   },
 ];

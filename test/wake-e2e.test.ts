@@ -93,7 +93,9 @@ describe('wake-on-alert real service (offline)', () => {
       rmSync(home, { recursive: true, force: true });
       rmSync(workspace, { recursive: true, force: true });
     }
-  }, 30_000);
+    // Co-tenant boot headroom (see helpers/real-service.mjs): this case
+    // boots its own real service inside the test.
+  }, 90_000);
 
   it('refused foreign-listener startup never consumes a seeded wake', async () => {
     const home = mkdtempSync(join(tmpdir(), 'gru-wake-refused-'));
@@ -133,7 +135,9 @@ describe('wake-on-alert real service (offline)', () => {
       rmSync(home, { recursive: true, force: true });
       rmSync(workspace, { recursive: true, force: true });
     }
-  }, 30_000);
+    // Co-tenant boot headroom (see helpers/real-service.mjs): the awaited
+    // rejection is itself a real-service boot outcome under load.
+  }, 90_000);
 
   it('an injected action-required notification opens a Gru turn with its payload', async () => {
     const port = await pickFreePort();
@@ -206,5 +210,7 @@ describe('wake-on-alert real service (offline)', () => {
     expect(wakePrompt).toBeDefined();
     expect(wakePrompt?.prompt).toContain('Wake e2e: lane interruption needs a machine disposition');
     expect(wakePrompt?.prompt).toContain('This turn was started by the service wake policy');
-  });
+    // Co-tenant boot headroom (see helpers/real-service.mjs): this case
+    // boots its own real service inside the test.
+  }, 90_000);
 });

@@ -84,12 +84,22 @@ export class LedgerDb {
 
     // Guard 1: every applied version must still exist in code — an unknown
     // version means this binary is OLDER than the database; running on
-    // would risk writing rows a missing migration shaped.
-    for (const id of applied.keys()) {
-      if (!migrations.some((m) => m.id === id)) {
+    // would risk writing rows a missing migration shaped. A recorded NAME
+    // that differs from code means the id was renamed or reused AFTER it
+    // was applied: continuing would silently skip the renamed SQL (or die
+    // on a duplicate column), so refuse with the mismatch named.
+    for (const [id, name] of applied) {
+      const coded = migrations.find((m) => m.id === id);
+      if (coded === undefined) {
         throw new Error(
           `ledger schema version ${id} is applied but unknown to this build — ` +
             'refusing to run an older binary against a newer ledger',
+        );
+      }
+      if (coded.name !== name) {
+        throw new Error(
+          `ledger migration ${id} was applied as "${name}" but this build defines ` +
+            `"${coded.name}" — refusing to run with a renamed migration`,
         );
       }
     }
@@ -764,6 +774,17 @@ export const MIGRATIONS: readonly Migration[] = [
     `,
   },
   {
+    // Short heist names (owner-approved display, 2026-09-24): optional
+    // authored job label. Renumbered 9 -> 10 -> 11 -> 17 across the main
+    // integrations (worktree-base-source id 9; provider-recovery-waits
+    // id 10; obligations/child-workers ids 11-16 on main); never applied
+    // anywhere before this integration, so the renumber is safe and
+    // history-free.
+    id: 17,
+    name: 'job-display-name',
+    sql: 'ALTER TABLE jobs ADD COLUMN display_name TEXT;',
+  },
+  {
     // Durable approved pipeline queue (owner approvals j-239/j-1064):
     // complete approved executable briefings persist before any worker
     // exists, with a stable id, explicit priority, durable enqueue order,
@@ -773,14 +794,14 @@ export const MIGRATIONS: readonly Migration[] = [
     // every claim atomic and crash-reconcilable. `enqueue_seq` is the
     // durable ordering key (UNIQUE); `request_id` is the idempotency
     // identity and `payload_hash` the changed-replay fence.
-    // LANDING COLLISION (same convention as migrations 10–13): id 14 is a
-    // LANDING COLLISION (same convention as migrations 10–16): this
+    // LANDING COLLISION (same convention as migrations 10–17): this
     // migration was born at branch-local id 14 on this unshipped lane;
-    // owner-merged main landed job-amendments 14, child-workers 15 and
-    // child-workers-agent-binding 16 first, so the never-applied pipeline
-    // migration is re-numbered to 17 (never a hole). No ledger outside
-    // this unshipped branch ever applied it at id 14.
-    id: 17,
+    // owner-merged main landed job-amendments 14, child-workers 15,
+    // child-workers-agent-binding 16 and job-display-name 17 (crew
+    // labels) first, so the never-applied pipeline migration is
+    // re-numbered to 18 (never a hole). No ledger outside this unshipped
+    // branch ever applied it at an earlier id.
+    id: 18,
     name: 'pipeline-entries',
     sql: `
       CREATE TABLE pipeline_entries (
