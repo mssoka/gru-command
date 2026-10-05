@@ -47,6 +47,14 @@ async function capturePrNumberRow(row: Locator, name: string): Promise<void> {
   await row.screenshot({ path: path.join(PR_NUMBER_CAPTURE_DIR, `${name}.png`) });
 }
 
+/** A capture run must start from an empty directory: images left by an
+ * earlier head must never survive a failed run as apparent current-head
+ * evidence for the human/vision review. `force` covers the normal
+ * first-run absence; real removal failures still throw. */
+function clearPrNumberCaptures(): void {
+  fs.rmSync(PR_NUMBER_CAPTURE_DIR, { recursive: true, force: true });
+}
+
 /** The numbered label must be visible as text, inside the row meta line
  * and never clipped (j-982 acceptance D). */
 async function expectPrLabelFits(row: Locator): Promise<void> {
@@ -666,6 +674,8 @@ test.describe('board (E6, mock feed)', () => {
   });
 
   test('PR number label: row captures in light/dark, desktop/phone (private evidence)', async ({ page }) => {
+    // Stale-evidence guard: clear before anything can fail mid-run.
+    clearPrNumberCaptures();
     await pair(page);
     await expect(page.locator('#board-view')).toBeVisible();
     const row = page.locator('.board-job', { hasText: 'Merge main into the retry branch' });
