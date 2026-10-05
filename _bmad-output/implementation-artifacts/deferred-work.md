@@ -22,6 +22,9 @@
 - source_spec: `_bmad-output/implementation-artifacts/pr136-chief-handoff/plan.md`
   summary: `reconcilePendingRebriefs` delivery-only branch may append a `silas.rebrief-recovered` event for a marker group replaced by a newer request mid-boot
   evidence: Markers are read as a boot snapshot; a newer re-brief request can replace them while recovery runs. The `expectedPhaseId` fence added by this delta prevents any phase completion from the stale group (and nothing is cleared), but the recovered-history event is still appended as noise.
+- source_spec: none
+  summary: Obtain scheduled full `/api/verify` receipts, exact-head CI, and native Perkins READY for the final Stage 2 head.
+  evidence: Operational gates for the owner's authenticated scheduler. The e2e-repair deferral below is resolved: the five UI failures were fixed by this branch (held mock turns, busy-phrase rotation, reserved busy-status slot, expanded service events, sheet preservation) and re-verified on the integrated head 81295ed over the current base 39a19ea — `npm test` green (fast 1766/heavy 750/web 466) and `npm run e2e` 55/55 including visually inspected theme snapshots; the four refreshed snapshots were accepted after explicit image inspection (intact header, bubbles, composer, panels; no blank/garbled regions).
 - source_spec: `_bmad-output/implementation-artifacts/spec-pr142-review-verdict-closure.md`
   summary: App review reconciliation can certify absence from a review-list record missing delivery-predicate fields.
   evidence: Inherited from main e75ca3d; `isDecidableReviewEntry` permits absent state/commit_id/body/submitted_at, while a short `lookupMatchingReview` page can certify non-delivery. Blind 1, Edge 2 and Verification Other 1 share this defect.
