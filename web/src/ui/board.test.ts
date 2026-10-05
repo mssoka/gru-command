@@ -1583,6 +1583,78 @@ describe('board v6 — job status tones', () => {
 describe('board v6 — section truth: closed receipts never queue, stopped lanes never lie', () => {
   beforeEach(mountBoardDom);
 
+  it('the shortcut strip and the section bodies count the SAME truth (one derivation)', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        jobs: [baseJob({ id: 'walled', status: 'working', rounds: [] })],
+        agents: [
+          agent('minion-walled', {
+            role: 'minion',
+            jobId: 'walled',
+            supervision: { state: 'stopped', restarts: 0, breakerOpen: true, stopReason: 'quota_wall' },
+          }),
+        ],
+        notifications: [notification('n-escalation', { agentId: 'minion-walled' })],
+        unackedActionRequired: 1,
+      }),
+    );
+    // The stopped lane sits in NEEDS GRU (main's stop truth) — the strip
+    // count and the section head count must agree because BOTH read the
+    // single per-render sections derivation (stopped/live maps included).
+    const navCount = document.querySelector<HTMLElement>('.board-nav__link[data-nav="for-gru"] .board-nav__count');
+    expect(navCount?.textContent).toBe('1');
+    const sectionCount = document.querySelector<HTMLElement>('.board-band--needs-you .board-band__count');
+    expect(sectionCount?.textContent).toContain('1');
+    expandForGru();
+    const row = document.querySelector<HTMLElement>('.board-band--needs-you .board-job');
+    expect(row?.getAttribute('data-job-id')).toBe('walled');
+  });
+
+  it('focus falls back to the section disclosure when its job moves into a collapsed section', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        jobs: [baseJob({ id: 'walled', status: 'working', rounds: [] })],
+        agents: [
+          agent('minion-walled', {
+            role: 'minion',
+            jobId: 'walled',
+            supervision: { state: 'stopped', restarts: 0, breakerOpen: true, stopReason: 'quota_wall' },
+          }),
+        ],
+        notifications: [notification('n-escalation', { agentId: 'minion-walled' })],
+        unackedActionRequired: 1,
+      }),
+    );
+    expandForGru();
+    const toggle = document.querySelector<HTMLElement>('.board-band--needs-you .board-job__toggle');
+    toggle?.focus();
+    expect(document.activeElement).toBe(toggle);
+    // The next snapshot resolves the stop and the lane goes silent-cold:
+    // the focused row leaves the expanded section entirely and COLD is
+    // count-only — the exact focus target disappears, so focus must fall
+    // back to a section disclosure toggle, never to <body>.
+    view.render(
+      snapshot({
+        jobs: [
+          baseJob({
+            id: 'walled',
+            status: 'working',
+            rounds: [],
+            lastAgentActivity: new Date(Date.now() - 45 * 60_000).toISOString(),
+          }),
+        ],
+        agents: [agent('minion-walled', { role: 'minion', jobId: 'walled', state: 'streaming', lastActivity: new Date(Date.now() - 45 * 60_000).toISOString() })],
+      }),
+    );
+    const active = document.activeElement;
+    expect(active).toBeInstanceOf(HTMLElement);
+    expect((active as HTMLElement).tagName).toBe('BUTTON');
+    expect((active as HTMLElement).className).toContain('board-band__more');
+    expect((active as HTMLElement).getAttribute('aria-expanded')).toBe('false');
+  });
+
   it('a merged lane with a leftover unacked escalation leaves NEEDS GRU and renders as a closed receipt', () => {
     const view = new BoardView(() => {});
     view.render(

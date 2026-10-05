@@ -648,6 +648,18 @@ export class RuntimeRegistry {
     // E6 event tap: surface spawn/dispose + forward every runtime event to
     // registry-level subscribers (the board engine's feed).
     this.emitAgentEvent({ agentId: handle.id, role, sessionFile: handle.sessionFile, phase: 'spawned' });
+    // Self-healing membership: a handle disposed by ANY caller leaves the
+    // registry set — the status surface must never contradict itself.
+    // Registered FIRST (before the emit tap below) so the disposed event
+    // releases the resident permit BEFORE any disposed-phase listener
+    // runs: a synchronous capacity consumer (the pipeline consumer's
+    // reconsider pass) must read the budget AFTER the release, or it can
+    // see a full pool, exit, and never receive another trigger.
+    handle.subscribe((event) => {
+      if (event.type === 'state' && event.state === 'disposed' && !disposingNow) {
+        releaseHandle();
+      }
+    });
     handle.subscribe((event) => {
       this.emitAgentEvent({
         agentId: handle.id,
@@ -670,13 +682,6 @@ export class RuntimeRegistry {
         event.type === 'tool_start' || event.type === 'tool_end' ||
         event.type === 'compaction_start' || event.type === 'compaction_end') {
         this.residents.changed();
-      }
-    });
-    // Self-healing membership: a handle disposed by ANY caller leaves the
-    // registry set — the status surface must never contradict itself.
-    handle.subscribe((event) => {
-      if (event.type === 'state' && event.state === 'disposed' && !disposingNow) {
-        releaseHandle();
       }
     });
     return resident;

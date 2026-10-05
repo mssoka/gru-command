@@ -280,6 +280,11 @@ describe('pipeline ledger — evaluation, order and projection', () => {
     ledger.markPipelineAdmitted({ id: 'pipe-a', jobId: 'pipe-a' });
     ledger.setJobStatus('pipe-a', 'working');
     ledger.setJobStatus('pipe-a', 'delivered');
+    // The delivered milestone needs DURABLE delivery proof, not status
+    // alone: without a recorded job.delivered event the dependent stays
+    // waiting (status-only transitions never release dependents).
+    expect(ready('pipe-b')).toBe(false);
+    ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'pipe-a', payload: {} });
     expect(ready('pipe-b')).toBe(true); // delivered milestone satisfied
     expect(ready('pipe-c')).toBe(false); // done is NOT merged/other
     ledger.setJobStatus('pipe-a', 'in-review');
@@ -287,6 +292,25 @@ describe('pipeline ledger — evaluation, order and projection', () => {
     ledger.setJobStatus('pipe-a', 'merged');
     expect(ready('pipe-b')).toBe(true);
     expect(ready('pipe-c')).toBe(false);
+    db.close();
+  });
+
+  it('never releases an admitted milestone without durable worker-start evidence', () => {
+    const { db, ledger } = boot();
+    enqueue(ledger, 'pipe-a');
+    enqueue(ledger, 'pipe-b', { prerequisites: [{ id: 'pipe-a', milestone: 'admitted' }] });
+    const blocked = (): string | null =>
+      ledger.pipelineBoardView(FULL_CAPACITY).entries.find((entry) => entry.id === 'pipe-b')?.reason ?? null;
+    // A dispatch that committed the job row but never started a worker
+    // (no agent row, no worktree, no minion-spawned event) is adopted per
+    // the approved matrix — but its admitted milestone cannot release a
+    // dependent until worker evidence exists.
+    ledger.claimPipelineEntry({ id: 'pipe-a', holder: 'silas' });
+    ledger.addJob({ id: 'pipe-a', repo: 'demo', title: 'Entry pipe-a', briefing: 'Briefing for pipe-a' });
+    ledger.markPipelineAdmitted({ id: 'pipe-a', jobId: 'pipe-a' });
+    expect(blocked()).toContain('waiting for pipe-a to be admitted');
+    ledger.appendCustomEvent({ kind: 'job.minion-spawned', jobId: 'pipe-a', payload: {} });
+    expect(blocked()).toBeNull();
     db.close();
   });
 
@@ -335,8 +359,12 @@ describe('pipeline ledger — evaluation, order and projection', () => {
     const blocked = ledger.pipelineBoardView({ capacity: 4, occupied: 4, queued: 0, available: 0 });
     expect(blocked.entries[0]?.state).toBe('ready');
     expect(blocked.entries[0]?.reason).toBe('waiting for a resident worker slot (4/4 busy)');
+    // Queued-ahead is NOT capacity exhaustion: slots are free, an older
+    // resident admission simply owns the turn — the reason says so.
     const queuedAhead = ledger.pipelineBoardView({ capacity: 4, occupied: 1, queued: 1, available: 3 });
-    expect(queuedAhead.entries[0]?.reason).toContain('resident worker slot');
+    expect(queuedAhead.entries[0]?.reason).toBe('waiting behind 1 older resident admission in the shared queue');
+    const queuedAheadMany = ledger.pipelineBoardView({ capacity: 4, occupied: 1, queued: 2, available: 3 });
+    expect(queuedAheadMany.entries[0]?.reason).toBe('waiting behind 2 older resident admissions in the shared queue');
     expect(ledger.pipelineBoardView(FULL_CAPACITY).entries[0]?.reason).toBeNull();
     db.close();
   });
@@ -374,12 +402,16 @@ describe('pipeline ledger — evaluation, order and projection', () => {
     const reason = pipelineBlockingReason(entry, {
       entries: [entry],
       jobStatusOf: () => null,
+      jobDeliveredOf: () => false,
+      jobStartedOf: () => false,
       capacity: FULL_CAPACITY,
     });
     expect(reason).toBe('waiting for pipe-b — not enqueued');
     const evaluation = evaluatePipelineEntry(entry, {
       entries: [entry],
       jobStatusOf: () => null,
+      jobDeliveredOf: () => false,
+      jobStartedOf: () => false,
       capacity: { capacity: 1, occupied: 1, queued: 0, available: 0 },
     });
     expect(evaluation.state).toBe('waiting');

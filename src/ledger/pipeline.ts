@@ -111,8 +111,9 @@ export interface PipelineEntryBoardView {
 
 export interface PipelineBoardView {
   readonly entries: readonly PipelineEntryBoardView[];
-  /** All active entries (waiting + ready + admitting + failed) — full
-   * count, never the preview window. */
+  /** Executable entries only (waiting + ready + admitting) — the full
+   * count, never the preview window. Terminal `failed` rows stay visible
+   * in `entries` as machine attention but never count as pending work. */
   readonly pending: number;
 }
 
@@ -151,6 +152,16 @@ export function parsePipelinePrerequisites(raw: string): readonly PipelinePrereq
   return parsed.map((entry) => {
     const record = asRecord(entry, 'pipeline prerequisite');
     const id = reqStr(record, 'id', 'pipeline prerequisite');
+    // A prerequisite id is an entry id: it must satisfy the same identity
+    // contract as enqueue (exact, unpadded, ≤128 chars) or the dependent
+    // would wait forever on an unenqueuable id (review: prerequisite
+    // identity validation).
+    if (id !== id.trim()) {
+      throw new Error('pipeline prerequisite id must not be whitespace-padded');
+    }
+    if (id.length > 128) {
+      throw new Error('pipeline prerequisite id exceeds 128 characters');
+    }
     const milestone = reqStr(record, 'milestone', 'pipeline prerequisite');
     if (!isPipelineMilestone(milestone)) {
       throw new Error(`pipeline prerequisite milestone "${milestone}" is not one of ${PIPELINE_MILESTONES.join(', ')}`);
@@ -172,6 +183,13 @@ export function parseExclusiveScopes(raw: string): readonly string[] {
   return parsed.map((entry) => {
     if (typeof entry !== 'string' || entry.trim() === '') {
       throw new Error('pipeline exclusive scopes must be non-empty strings');
+    }
+    // Scope names are lock keys: a padded name would mint a DIFFERENT key
+    // than its trimmed twin and let apparently-shared work run concur-
+    // rently (review: exclusive-lock key identity). Reject padded keys at
+    // acceptance — normalization would silently rewrite accepted briefs.
+    if (entry !== entry.trim()) {
+      throw new Error('pipeline exclusive scope must not be whitespace-padded');
     }
     if (entry.length > 200) throw new Error('pipeline exclusive scope exceeds 200 characters');
     if (seen.has(entry)) throw new Error(`pipeline exclusive scope "${entry}" is listed twice`);
@@ -223,6 +241,16 @@ export interface PipelineEvaluationContext {
   readonly entries: readonly PipelineEntryRecord[];
   /** Job status by job id (null when the job row does not exist). */
   readonly jobStatusOf: (jobId: string) => JobStatus | null;
+  /** Durable delivery proof by job id: true only when the ledger holds a
+   * recorded successful delivery event for that job. Status alone never
+   * proves a briefing turn was delivered (working → in-review/done are
+   * legal transitions without one). */
+  readonly jobDeliveredOf: (jobId: string) => boolean;
+  /** Durable worker-start proof by job id: true only when the job has a
+   * registered worker (agent row), a lane worktree or a recorded
+   * minion-spawned event — the evidence an `admitted` milestone needs
+   * before it can release dependents. */
+  readonly jobStartedOf: (jobId: string) => boolean;
   readonly capacity: PipelineCapacityView;
 }
 
@@ -292,7 +320,13 @@ export function evaluatePipelineEntry(
   }
   const blocking = pipelineBlockingReason(entry, ctx);
   if (blocking !== null) return { state: 'waiting', reason: blocking };
-  if (ctx.capacity.available < 1 || ctx.capacity.queued > 0) {
+  if (ctx.capacity.queued > 0) {
+    return {
+      state: 'ready',
+      reason: `waiting behind ${ctx.capacity.queued} older resident admission${ctx.capacity.queued === 1 ? '' : 's'} in the shared queue`,
+    };
+  }
+  if (ctx.capacity.available < 1) {
     return {
       state: 'ready',
       reason: `waiting for a resident worker slot (${ctx.capacity.occupied}/${ctx.capacity.capacity} busy)`,
@@ -308,10 +342,14 @@ function milestoneReached(
 ): boolean {
   switch (prerequisite.milestone) {
     case 'admitted':
-      return dependency.state === 'admitted' && dependency.jobId !== null;
+      // The durable milestone release needs worker evidence: an admitted
+      // job whose dispatch never started a worker (a blocked, unspawned
+      // adoption) must not release dependents (review D2).
+      return dependency.state === 'admitted' && dependency.jobId !== null && ctx.jobStartedOf(dependency.jobId);
     case 'delivered': {
       const status = jobStatusOf(dependency, ctx);
-      return status === 'delivered' || status === 'in-review' || status === 'merged' || status === 'done';
+      return (status === 'delivered' || status === 'in-review' || status === 'merged' || status === 'done') &&
+        dependency.jobId !== null && ctx.jobDeliveredOf(dependency.jobId);
     }
     case 'merged':
       return jobStatusOf(dependency, ctx) === 'merged';

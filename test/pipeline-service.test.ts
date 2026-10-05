@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
@@ -36,12 +36,20 @@ interface Harness {
   mode: DispatchMode;
 }
 
-function boot(capacity: PipelineCapacityView = { capacity: 4, occupied: 0, queued: 0, available: 4 }): Harness {
+function boot(
+  capacity: PipelineCapacityView = { capacity: 4, occupied: 0, queued: 0, available: 4 },
+  overrides: {
+    retryBackoffMs?: number;
+    budget?: { acquire: (signal?: AbortSignal) => Promise<() => void> };
+    ledger?: LedgerApi;
+    bus?: EventBus;
+  } = {},
+): Harness {
   const dir = mkdtempSync(join(tmpdir(), 'gru-pipeline-service-'));
   cleanupDirs.push(dir);
   const db = new LedgerDb(dir);
-  const bus = new EventBus({});
-  const ledger = new LedgerApi(db.handle, { bus });
+  const bus = overrides.bus ?? new EventBus({});
+  const ledger = overrides.ledger ?? new LedgerApi(db.handle, { bus });
   const notifications = new NotificationCenter({ ledger, bus });
   const calls: Harness['calls'] = [];
   const harness = { capacity, mode: 'ok' as DispatchMode, calls } as {
@@ -60,6 +68,9 @@ function boot(capacity: PipelineCapacityView = { capacity: 4, occupied: 0, queue
         ledger.noteJob(input.jobId, 'dispatch failed: spawn failed');
         throw new Error('spawn failed after the job row');
       }
+      // Realistic evidence, as the real DispatchService records it: the
+      // worker started (milestone proof) and the briefing turn delivered.
+      ledger.appendCustomEvent({ kind: 'job.minion-spawned', jobId: input.jobId, payload: {} });
       return { settled: Promise.resolve() };
     },
   };
@@ -67,6 +78,8 @@ function boot(capacity: PipelineCapacityView = { capacity: 4, occupied: 0, queue
     ledger,
     dispatch: port,
     capacity: () => ({ ...harness.capacity }),
+    ...(overrides.budget === undefined ? {} : { budget: overrides.budget }),
+    ...(overrides.retryBackoffMs === undefined ? {} : { retryBackoffMs: overrides.retryBackoffMs }),
     bus,
     notifications,
   });
@@ -227,6 +240,9 @@ describe('pipeline service — admission and ordering', () => {
     );
     h.ledger.setJobStatus('pipe-dep', 'working');
     h.ledger.setJobStatus('pipe-dep', 'delivered');
+    // Durable delivery proof (a bare status transition never releases a
+    // dependent — the milestone needs the recorded delivery event).
+    h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'pipe-dep', payload: {} });
     await h.service.whenIdle();
     expect(h.calls.map((call) => call.jobId)).toEqual(['pipe-dep', 'pipe-follower']);
     h.db.close();
@@ -274,18 +290,108 @@ describe('pipeline service — failure and crash reconciliation', () => {
     h.db.close();
   });
 
-  it('requeues a failure with no job, bounded, then lands failed with one machine card', async () => {
-    const h = boot();
-    h.mode = 'throw-before-job';
+  it('requeues a failure with no job, bounded and SPACED by a one-shot backoff, then lands failed with one machine card', async () => {
+    vi.useFakeTimers();
+    try {
+      const h = boot(undefined, { retryBackoffMs: 5_000 });
+      h.mode = 'throw-before-job';
+      h.service.enqueue({ id: 'pipe-a', repoPath: '/tmp/demo', title: 'A', briefing: 'A' });
+      await h.service.whenIdle();
+      // One attempt per pass: the next attempts wait for the bounded
+      // backoff (or a natural trigger), never burned inside one outage.
+      expect(h.calls).toHaveLength(1);
+      expect(h.service.entry('pipe-a')?.state).toBe('waiting');
+      expect(h.service.entry('pipe-a')?.failureCount).toBe(1);
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(h.calls).toHaveLength(2);
+      expect(h.service.entry('pipe-a')?.failureCount).toBe(2);
+      await vi.advanceTimersByTimeAsync(5_000);
+      const entry = h.service.entry('pipe-a');
+      expect(entry?.state).toBe('failed');
+      expect(entry?.failureCount).toBe(3);
+      expect(h.calls).toHaveLength(3);
+      const cards = h.ledger.listNotifications().filter((row) => row.kind === 'pipeline.admission-failed');
+      expect(cards).toHaveLength(1);
+      expect(cards[0]?.routing).toBe('action-required');
+      h.db.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('recovers a failed reconsider pass through the bounded one-shot retry (no stranding)', async () => {
+    vi.useFakeTimers();
+    try {
+      const real = (() => {
+        const dir = mkdtempSync(join(tmpdir(), 'gru-pipeline-service-d4-'));
+        cleanupDirs.push(dir);
+        const db = new LedgerDb(dir);
+        const bus = new EventBus({});
+        return { dir, db, bus, ledger: new LedgerApi(db.handle, { bus }) };
+      })();
+      // The ledger reads fine for the enqueue, then the FIRST reconsider
+      // pass hits a transient failure (call #2), then reads are healthy.
+      let callsToList = 0;
+      const flaky: LedgerApi = new Proxy(real.ledger, {
+        get(target, property, receiver) {
+          if (property === 'listPipelineEntries') {
+            const seen = ++callsToList;
+            if (seen === 2) {
+              return () => {
+                throw new Error('transient ledger failure');
+              };
+            }
+          }
+          return Reflect.get(target, property, receiver);
+        },
+      });
+      const h = boot(undefined, { retryBackoffMs: 5_000, ledger: flaky, bus: real.bus });
+      h.service.enqueue({ id: 'pipe-a', repoPath: '/tmp/demo', title: 'A', briefing: 'A' });
+      await h.service.whenIdle();
+      // The pass failed loudly; the entry is stranded only until the
+      // one-shot backoff (no bus event is coming for it).
+      expect(h.calls).toHaveLength(0);
+      expect(h.service.entry('pipe-a')?.state).toBe('waiting');
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(h.calls.map((call) => call.jobId)).toEqual(['pipe-a']);
+      expect(h.service.entry('pipe-a')?.state).toBe('admitted');
+      h.db.close();
+      real.db.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('registers queue demand with the shared budget while capacity-blocked and admits on the wake grant (D1)', async () => {
+    const waiters: Array<(release: () => void) => void> = [];
+    const refusals: Array<(error: Error) => void> = [];
+    const acquiredSignals: Array<AbortSignal | undefined> = [];
+    const budget = {
+      acquire: (signal?: AbortSignal) =>
+        new Promise<() => void>((resolve, reject) => {
+          acquiredSignals.push(signal);
+          waiters.push(resolve);
+          refusals.push(reject);
+        }),
+    };
+    const h = boot({ capacity: 4, occupied: 4, queued: 0, available: 0 }, { budget });
     h.service.enqueue({ id: 'pipe-a', repoPath: '/tmp/demo', title: 'A', briefing: 'A' });
     await h.service.whenIdle();
-    const entry = h.service.entry('pipe-a');
-    expect(entry?.state).toBe('failed');
-    expect(entry?.failureCount).toBe(3);
-    expect(h.calls).toHaveLength(3);
-    const cards = h.ledger.listNotifications().filter((row) => row.kind === 'pipeline.admission-failed');
-    expect(cards).toHaveLength(1);
-    expect(cards[0]?.routing).toBe('action-required');
+    // Eligible work + full pool: exactly ONE demand registration is open.
+    expect(h.calls).toHaveLength(0);
+    expect(waiters).toHaveLength(1);
+    // The permit frees (a worker finished): the wake resolves, releases
+    // immediately, and the triggered pass admits through the fresh read.
+    h.capacity = { capacity: 4, occupied: 3, queued: 0, available: 1 };
+    waiters[0]!(() => {});
+    // Let the wake's release → schedule → pass microtasks run before the
+    // idle gate is observed.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await h.service.whenIdle();
+    expect(h.calls.map((call) => call.jobId)).toEqual(['pipe-a']);
+    expect(h.service.entry('pipe-a')?.state).toBe('admitted');
+    // The demand registration is gone: no lingering acquire stays queued.
+    expect(acquiredSignals.length).toBe(1);
     h.db.close();
   });
 

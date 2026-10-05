@@ -187,10 +187,83 @@ describe('pipeline HTTP surface', () => {
     expect(String(refused.body.detail)).toContain('live admission claim');
   });
 
+  it('never cancels a terminally failed entry over its durable failure record', async () => {
+    const h = await boot({ available: 0 });
+    await api(h, 'POST', '/api/pipeline/enqueue', ENQUEUE);
+    h.ledger.claimPipelineEntry({ id: 'pipe-http-a', holder: 'silas-pipeline' });
+    h.ledger.releasePipelineClaim({
+      id: 'pipe-http-a',
+      reason: 'admission failed: spawn broken',
+      outcome: 'failed',
+    });
+    const refused = await api(h, 'POST', '/api/pipeline/entries/pipe-http-a/cancel', { reason: 'clean up' });
+    expect(refused.status).toBe(400);
+    expect(String(refused.body.detail)).toContain('already failed terminally');
+    // The failure record survives verbatim for downstream diagnosis.
+    expect(h.ledger.getPipelineEntry('pipe-http-a')?.state).toBe('failed');
+    expect(h.ledger.getPipelineEntry('pipe-http-a')?.failureReason).toBe('admission failed: spawn broken');
+  });
+
+  it('keeps a lone terminal failure visible as attention but NOT as pending queued work', async () => {
+    const h = await boot({ available: 0 });
+    await api(h, 'POST', '/api/pipeline/enqueue', ENQUEUE);
+    h.ledger.claimPipelineEntry({ id: 'pipe-http-a', holder: 'silas-pipeline' });
+    h.ledger.releasePipelineClaim({ id: 'pipe-http-a', reason: 'admission failed: boom', outcome: 'failed' });
+    const list = await api(h, 'GET', '/api/pipeline');
+    const rows = list.body.entries as Record<string, unknown>[];
+    expect(rows[0]).toMatchObject({ id: 'pipe-http-a', state: 'failed' });
+    expect(String(rows[0]?.reason)).toContain('admission failed: boom');
+    expect(list.body.pending).toBe(0);
+  });
+
+  it('returns the ACCEPTANCE receipt on replay — live drift never mutates it', async () => {
+    const h = await boot({ available: 0 });
+    const first = await api(h, 'POST', '/api/pipeline/enqueue', ENQUEUE);
+    expect(first.status).toBe(201);
+    // Live state drifts: an owner hold lands after acceptance.
+    await api(h, 'POST', '/api/pipeline/entries/pipe-http-a/hold', { reason: 'owner deciding' });
+    const live = await api(h, 'GET', '/api/pipeline/entries/pipe-http-a');
+    expect(live.body.live_state).toBe('waiting');
+    // The replay still returns the acceptance-time receipt: state waiting,
+    // not held — the frozen "same receipt except duplicate:true" matrix.
+    const replay = await api(h, 'POST', '/api/pipeline/enqueue', ENQUEUE);
+    expect(replay.status).toBe(200);
+    expect(replay.body).toMatchObject({
+      entryId: 'pipe-http-a',
+      state: 'waiting',
+      held: false,
+      duplicate: true,
+      enqueueSeq: first.body.enqueueSeq,
+      queuedAt: first.body.queuedAt,
+    });
+    // The live row keeps its honest current state.
+    expect(h.ledger.getPipelineEntry('pipe-http-a')?.holdReason).toBe('owner deciding');
+  });
+
   it('answers 503 when the pipeline surface is not hosted', async () => {
     const h = await boot({ hosted: false });
     const response = await api(h, 'POST', '/api/pipeline/enqueue', ENQUEUE);
     expect(response.status).toBe(503);
     expect(response.body.error).toBe('pipeline_not_hosted');
+  });
+});
+
+describe('pipeline production wiring contract', () => {
+  // The focused suites inject fake pipeline services; a dropped production
+  // injection would leave them green while the real queue went dark. This
+  // source-contract pins the exact main-assembly seams (review finding:
+  // production hosting/wiring is untested).
+  it('main.ts constructs the real PipelineService against the shared registry budget', async () => {
+    const { readFileSync } = await import('node:fs');
+    const main = readFileSync(join(import.meta.dirname, '..', 'src', 'main.ts'), 'utf-8');
+    expect(main).toContain('new PipelineService({');
+    // The dispatch server hosts the real service instance.
+    expect(main).toMatch(/pipeline(?:\s*=|\s*,)/u);
+    // The board engine reads the same service's view (server-computed
+    // pipeline block), never a browser-side re-derivation.
+    expect(main).toContain('pipeline: () => pipelineView()');
+    // Demand registration with the SHARED budget (D1): the consumer's
+    // capacity-blocked acquire drives the budget's own idle-minion reclaim.
+    expect(main).toContain('registry.residents.acquire(1, signal)');
   });
 });

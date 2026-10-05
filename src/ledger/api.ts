@@ -5728,6 +5728,14 @@ export class LedgerApi {
       if (row.state === 'admitting') {
         throw new Error(`pipeline entry "${input.id}" has a live admission claim — reconciliation owns it`);
       }
+      if (row.state === 'failed') {
+        // Terminal failure is durable history: overwriting it with a
+        // cancellation would erase the exact failure reason downstream
+        // dependents (and their diagnosis) were recorded against.
+        throw new Error(
+          `pipeline entry "${input.id}" already failed terminally — its failure record is preserved; supersede it with a fresh request`,
+        );
+      }
       if (row.state === 'admitted') {
         throw new Error(`pipeline entry "${input.id}" is admitted — its job lifecycle owns it now`);
       }
@@ -5747,14 +5755,19 @@ export class LedgerApi {
 
   /** Board projection (server-computed, evidence-bound): every active
    * entry (waiting/ready/admitting/failed), evaluated against the live
-   * job statuses + shared capacity, in the approved deterministic order.
-   * Admitted/cancelled entries are excluded — admitted work lives in the
-   * normal job lifecycle, cancelled work is terminal. No briefings. */
+   * job statuses, durable delivery/worker-start proofs and shared
+   * capacity, in the approved deterministic order. Admitted/cancelled
+   * entries are excluded — admitted work lives in the normal job
+   * lifecycle, cancelled work is terminal. No briefings. `pending` counts
+   * executable work only (waiting + ready + admitting); terminal `failed`
+   * rows stay visible as attention, never as pending. */
   pipelineBoardView(capacity: PipelineEvaluationContext['capacity']): PipelineBoardView {
     const entries = this.listPipelineEntries();
     const ctx: PipelineEvaluationContext = {
       entries,
       jobStatusOf: (jobId) => this.getJob(jobId)?.status ?? null,
+      jobDeliveredOf: (jobId) => this.latestJobEvent(jobId, 'job.delivered') !== null,
+      jobStartedOf: (jobId) => this.jobHasWorkerStart(jobId),
       capacity,
     };
     const rows: PipelineEntryBoardView[] = entries
@@ -5778,7 +5791,23 @@ export class LedgerApi {
           { priority: right.priority, enqueueSeq: right.enqueueSeq, id: right.id },
         ),
       );
-    return { entries: rows, pending: rows.length };
+    return {
+      entries: rows,
+      pending: rows.filter((row) => row.state !== 'failed').length,
+    };
+  }
+
+  /** Durable worker-start evidence for a job: a registered worker agent,
+   * a lane worktree or a recorded minion-spawned event. Status alone
+   * never proves a worker began (a dispatch can commit the job row and
+   * fail before any side effect). Public: the mechanical pipeline
+   * consumer builds the same evidence context as the board projection. */
+  jobHasWorkerStart(jobId: string): boolean {
+    const agent = this.db.prepare('SELECT id FROM agents WHERE job_id = ? LIMIT 1').get(jobId) as Row | undefined;
+    if (agent !== undefined) return true;
+    const worktree = this.db.prepare('SELECT id FROM worktrees WHERE job_id = ? LIMIT 1').get(jobId) as Row | undefined;
+    if (worktree !== undefined) return true;
+    return this.latestJobEvent(jobId, 'job.minion-spawned') !== null;
   }
 
   private pipelineEntryFromRow(row: Row): PipelineEntryRecord {

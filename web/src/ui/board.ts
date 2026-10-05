@@ -164,6 +164,10 @@ export class BoardView {
   /** Toast + browser-notification surface (E7). */
   private onToast: ((notification: NotificationView) => void) | null = null;
   private snapshot: BoardSnapshot | null = null;
+  /** ONE sections derivation per render (classification truth is shared
+   * by the shortcut strip and the section bodies — computed from the SAME
+   * stopped/live-worker inputs so they can never disagree). */
+  private currentSections: ReturnType<typeof boardSections> | null = null;
   /** D3: older receipt pages fetched on demand (merged into FEED). */
   private extraReceipts: NotificationView[] = [];
   private receiptsNextOffset = 0;
@@ -257,6 +261,7 @@ export class BoardView {
     // on keeps its place (stable focus keys), so a snapshot update never
     // steals focus or resets a disclosure mid-interaction.
     const focusKey = this.captureFocusKey();
+    this.currentSections = null; // one fresh derivation per render
     this.renderOwnerActions(snapshot);
     this.renderRail(snapshot);
     this.renderNav(snapshot);
@@ -316,6 +321,25 @@ export class BoardView {
         node.focus();
         return;
       }
+    }
+    // The exact control is gone (its job moved into a COLLAPSED section —
+    // For Gru or count-only Cold): focus that section's disclosure toggle
+    // instead of dropping focus to <body>. The operator lands one gesture
+    // away from the row they were on, never lost.
+    const jobKey = /^job:(.+)$/u.exec(key);
+    if (jobKey !== null) {
+      const jobId = jobKey[1];
+      const row = this.mount.querySelector<HTMLElement>(`[data-job-id="${jobId}"]`);
+      const band = row?.closest('.board-band');
+      const toggle = band?.querySelector<HTMLElement>('.board-band__more') ?? null;
+      if (toggle !== null && toggle.getAttribute('aria-expanded') === 'false') {
+        toggle.focus();
+        return;
+      }
+      const collapsed = this.mount.querySelector<HTMLElement>(
+        '.board-band[data-section="for-gru"] .board-band__more, .board-band[data-section="cold"] .board-band__more',
+      );
+      collapsed?.focus();
     }
   }
 
@@ -629,6 +653,19 @@ export class BoardView {
    * rows or a compact empty state. In flight previews 5, Pipeline 5,
    * Settled 3; For Gru and Cold render no rows until deliberately
    * expanded; disclosures are reversible and survive snapshot pushes. */
+  /** The single per-render sections derivation (memoized for this
+   * render pass): the nav strip and the section bodies read the SAME
+   * classification — stopped/live-worker truth included — so their counts
+   * cannot drift apart between renders. */
+  private sectionsFor(snapshot: BoardSnapshot): ReturnType<typeof boardSections> {
+    if (this.currentSections === null) {
+      const stoppedWorkers = stoppedWorkersByJob(snapshot.agents);
+      const liveWorkerStamps = liveWorkerStampsByJob(snapshot.agents);
+      this.currentSections = boardSections(snapshot, Date.now(), { stoppedWorkers, liveWorkerStamps });
+    }
+    return this.currentSections;
+  }
+
   private renderJobs(snapshot: BoardSnapshot): void {
     this.mount.replaceChildren();
     const unacked = unackedByJob(snapshot);
@@ -637,10 +674,10 @@ export class BoardView {
     // truth for working lanes; terminal-job notifications stay in the bell.
     // The live-worker stamps keep a re-dispatched lane's fresh registration
     // on the stall clock's floor (never falsely COLD — twelve-followthrough
-    // A1/E1).
+    // A1/E1). The SAME derivation feeds the shortcut strip (one source:
+    // strip counts and section bodies can never disagree).
+    const sections = this.sectionsFor(snapshot);
     const stoppedWorkers = stoppedWorkersByJob(snapshot.agents);
-    const liveWorkerStamps = liveWorkerStampsByJob(snapshot.agents);
-    const sections = boardSections(snapshot, Date.now(), { stoppedWorkers, liveWorkerStamps });
     this.mount.append(this.jobsSection('in-flight', sections.bands.get('in-flight') ?? [], unacked, stoppedWorkers));
     this.mount.append(this.pipelineSection(sections));
     this.mount.append(this.forGruSection(sections.bands.get('needs-you') ?? [], unacked, stoppedWorkers));

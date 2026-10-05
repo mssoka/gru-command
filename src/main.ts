@@ -1118,6 +1118,11 @@ async function main(): Promise<number> {
         available: snapshot.capacity - snapshot.occupied,
       };
     },
+    // Demand registration with the SAME shared budget every admission
+    // uses: while eligible work is capacity-blocked, one queued acquire
+    // stays open so the budget's demand-driven idle-minion reclaim can
+    // serve approved pipeline work (released the instant it grants).
+    budget: { acquire: (signal) => registry.residents.acquire(1, signal) },
     bus,
     notifications,
     log: (level, msg, fields) => logger.log(level, msg, fields),
