@@ -323,6 +323,13 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
   /** (round-6 finding 7) Validate the optional reviewer correlation: a
    *  present value must be a non-empty string naming an existing REVIEW
    *  job — the identity a parent follow-up is bound to. */
+  function appendCustomEventSafe(
+    optionsRef: { readonly ledger: LedgerApi },
+    event: { kind: string; jobId: string; payload: Record<string, unknown> },
+  ): void {
+    optionsRef.ledger.appendCustomEvent(event);
+  }
+
   function correlatesReviewerField(body: Record<string, unknown>): string | undefined {
     if (!Object.hasOwn(body, 'correlates_reviewer')) return undefined;
     const raw = body['correlates_reviewer'];
@@ -1128,6 +1135,9 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       const jobId = strField(body, 'job_id');
       const note = strField(body, 'note');
       const completionHandoff = completionHandoffField(body);
+      // (round-7 finding 10) Optional reviewer correlation for a parent
+      // resumed to collect a commissioned reviewer's findings.
+      const correlatesReviewer = correlatesReviewerField(body);
       const job = options.ledger.getJob(jobId);
       if (job === null) throw new Error(`job "${jobId}" not found`);
       if (job.status === 'merged' || job.status === 'done') {
@@ -1141,6 +1151,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         note,
         briefing: job.briefing,
         ...(completionHandoff !== undefined ? { handoff: completionHandoff } : {}),
+        ...(correlatesReviewer !== undefined ? { correlatesReviewer } : {}),
       });
       const rebriefPhaseId = markers.find((marker) => marker.phaseId !== null)?.phaseId ?? null;
       const closeFailedTerminalTurn = (error: unknown): ReturnType<typeof finalizeRebriefRequest> | null => {
@@ -1352,6 +1363,23 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         }
         escalationId = raw.trim();
       }
+      // (round-7 deferred item, implemented) Legacy PASS rows predate the
+      // escalationId field; their attempt key is `i<iteration>`. Accept an
+      // explicit numeric attempt_iteration (paired with job_id) so a
+      // still-open legacy obligation remains repairable by identity.
+      if (Object.hasOwn(body, 'attempt_iteration')) {
+        const raw = body['attempt_iteration'];
+        if (typeof raw !== 'number' || !Number.isSafeInteger(raw) || raw < 1) {
+          throw new Error(`attempt_iteration must be a positive integer (got ${JSON.stringify(raw)})`);
+        }
+        if (escalationId !== undefined) {
+          throw new Error('attempt_iteration and escalation_id are mutually exclusive');
+        }
+        if (jobId === undefined) {
+          throw new Error('attempt_iteration requires job_id');
+        }
+        escalationId = `i${raw}`;
+      }
       let attemptOutcome: { status: string; receipt: string | null } | null = null;
       if (escalationId !== undefined) {
         if (jobId === undefined) {
@@ -1360,33 +1388,45 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         // (round-6 finding 5) The PASS lookup pages the job's WHOLE
         // history: a still-open attempt older than any newest-event cap
         // must remain repairable through this surface.
+        // (round-7 finding 1/13/23/26) REAL advancing paging: walk the
+        // whole fallback stream ascending, job-filtered, until the stream
+        // ends — no newest-500 window can strand an open obligation. The
+        // attempt key is the modern escalationId or the legacy `i<iter>`.
+        const attemptKeyOf = (payload: { escalationId?: unknown; iteration?: unknown }): string | null => {
+          if (typeof payload.escalationId === 'string' && payload.escalationId !== '') return payload.escalationId;
+          const iteration = typeof payload.iteration === 'number' ? payload.iteration : null;
+          return iteration === null ? null : `i${iteration}`;
+        };
         let passRow: (EventRecord | null) = null;
         let outcomeRow: (EventRecord | null) = null;
         let pendingRow: (EventRecord | null) = null;
-        let cursor = 0;
+        const pendingAgeBoundMs = 10 * 60 * 1000;
+        let scanCursor = 0;
         for (;;) {
-          const page = options.ledger.listJobEvents(jobId, { limit: 500 });
-          void cursor;
-          const events = page;
-          for (const event of events) {
-            if (event.kind !== 'job.fallback-review') continue;
-            const payload = event.payload as { phase?: unknown; escalationId?: unknown; status?: unknown; receipt?: unknown };
-            if (payload.escalationId !== escalationId) continue;
+          const page = options.ledger.listEventsAfter(scanCursor, { kinds: ['job.fallback-review'], limit: 500, order: 'asc' });
+          for (const event of page) {
+            if (event.jobId !== jobId) continue;
+            const payload = event.payload as { phase?: unknown; escalationId?: unknown; iteration?: unknown; status?: unknown; receipt?: unknown };
+            if (attemptKeyOf(payload) !== escalationId) continue;
             if (payload.phase === 'pass') passRow = event;
             else if (payload.phase === 'escalation') {
               if (payload.status === 'posted') outcomeRow = event;
               else if (payload.status === 'repost-pending') pendingRow = event;
             }
           }
-          break;
+          if (page.length < 500) break;
+          scanCursor = page[page.length - 1]!.seq;
         }
         if (passRow === null) {
           throw new Error(`escalation_id "${escalationId}" does not name a fallback PASS attempt of job "${jobId}"`);
         }
-        // (round-6 finding 4) Idempotent by attempt identity: an already
-        // posted outcome replays its receipt without a second notice, and
-        // an in-flight repost-pending younger than the notice window
-        // refuses rather than duplicating.
+        // (rounds 6-7) Idempotent by attempt identity: an already posted
+        // outcome replays its receipt without a second notice. A
+        // repost-pending marker younger than the recovery bound refuses
+        // (an in-flight post must not be duplicated); once the bound
+        // passes the post is treated as crashed/unknown and a fresh
+        // correlated re-post is allowed — the pending row itself was
+        // already treated as unknown by the awareness digest.
         if (outcomeRow !== null) {
           const receipt = (outcomeRow.payload as { receipt?: unknown }).receipt;
           attemptOutcome = {
@@ -1394,7 +1434,15 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
             receipt: typeof receipt === 'string' ? receipt : null,
           };
         } else if (pendingRow !== null) {
-          throw new Error(`escalation_id "${escalationId}" already has an in-flight re-post (repost-pending); reconcile it before re-submitting`);
+          const ageMs = Date.now() - Date.parse(pendingRow.ts);
+          if (!Number.isFinite(ageMs) || ageMs < pendingAgeBoundMs) {
+            throw new Error(`escalation_id "${escalationId}" already has an in-flight re-post (repost-pending); reconcile it before re-submitting`);
+          }
+          appendCustomEventSafe(options, {
+            kind: 'job.fallback-review',
+            jobId: jobId!,
+            payload: { gate: true, phase: 'escalation', status: 'unknown', escalationId, source: 'ops-repost-recovery', detail: 'repost-pending exceeded the recovery bound before a posted outcome' },
+          });
         }
       }
       // Bind the row to the lane's current worker (existing agentId

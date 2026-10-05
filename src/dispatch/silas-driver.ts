@@ -190,13 +190,37 @@ export interface DigestLedger {
  *  review, and one follow-up never retires two reviewers). The scan pages
  *  the full stream between the two seqs: no newest-event window can lose
  *  the evidence. */
+/** (round-7 findings 6/19/29) A parent turn is OPEN from LIVE evidence:
+ *  the parent's newest worker's latest agent.state transition is
+ *  spawning/streaming. Historical activity recency is not an open turn. */
+function parentTurnOpen(ledger: DigestLedger, parentId: string): boolean {
+  const agent = ledger
+    .listAgents()
+    .filter((candidate) => candidate.jobId === parentId && candidate.role === 'minion' && candidate.parentage !== 'child')
+    .sort((a, b) => (b.lastActivity ?? b.createdAt).localeCompare(a.lastActivity ?? a.createdAt))[0];
+  if (agent === undefined) return false;
+  let latest: EventRecord | null = null;
+  let cursor = 0;
+  for (;;) {
+    const page = ledger.listEventsAfter(cursor, { kinds: ['agent.state'], limit: 500, order: 'asc' });
+    for (const event of page) {
+      if (event.agentId !== agent.id) continue;
+      if (latest === null || event.seq > latest.seq) latest = event;
+    }
+    if (page.length < 500) break;
+    cursor = page[page.length - 1]!.seq;
+  }
+  if (latest === null) return false;
+  const payload = latest.payload as { to?: unknown };
+  return payload.to === 'spawning' || payload.to === 'streaming';
+}
+
 function correlatedFollowUpBetween(
   ledger: DigestLedger,
   parentId: string,
   afterSeq: number,
   beforeSeq: number,
   reviewerJobId: string,
-  reviewerIsNewestForParent: boolean,
 ): boolean {
   const kinds = ['silas.directive-sent', 'silas.rebrief', 'provider.recovery-claimed'];
   let cursor = afterSeq;
@@ -206,14 +230,12 @@ function correlatedFollowUpBetween(
       if (event.seq >= beforeSeq) return false;
       if (event.jobId !== parentId) continue;
       const payload = event.payload as { correlates_reviewer?: unknown };
+      // STRICT identity binding (round-7 finding 10): only a follow-up
+      // that names THIS reviewer retires its row. Temporal order alone can
+      // never collect a commission, one follow-up can never retire two
+      // reviewers, and a later reviewer's delivery cannot resurrect a
+      // collected one (the binding is permanent on the event itself).
       if (payload.correlates_reviewer === reviewerJobId) return true;
-      // A fresh-worker re-brief (or a claimed recovery) accepted after the
-      // reviewer delivered is accepted as collection for the parent's
-      // NEWEST delivered reviewer only — it cannot silently retire an
-      // older, still-uncollected commission.
-      if ((event.kind === 'silas.rebrief' || event.kind === 'provider.recovery-claimed') && reviewerIsNewestForParent) {
-        return true;
-      }
     }
     if (page.length < 500) return false;
     cursor = page[page.length - 1]!.seq;
@@ -474,17 +496,35 @@ function latestReviewRequest(ledger: DigestLedger, jobId: string): EventRecord |
   const candidates: EventRecord[] = [];
   const trigger = ledger.latestJobEvent(jobId, 'silas.review-triggered');
   if (trigger !== null) candidates.push(trigger);
-  // (round-6 finding 8) An escalation OUTCOME (e.g. an ops re-post of an
-  // old attempt) is follow-through evidence, never a new review request:
-  // counting it would suppress prWithoutReview for an unreviewed head.
-  // Walk newest-first past outcome rows to the newest request-shaped row.
-  for (const event of [...ledger.listJobEvents(jobId, { limit: 100 })].reverse()) {
-    if (event.kind !== 'job.fallback-review') continue;
-    const phase = fallbackPhaseOf(event);
-    if (phase === 'escalation') continue;
-    if (phase === 'unavailable') break;
-    candidates.push(event);
-    break;
+  // (rounds 6-7 findings 3/4/8/17) An escalation OUTCOME (e.g. an ops
+  // re-post of an old attempt) is follow-through evidence, never a new
+  // review request. Walk the WHOLE fallback stream newest-first (paged,
+  // job-filtered): unrelated activity cannot age a request out, and the
+  // newest request-shaped row is found in true order.
+  {
+    let newestRequest: EventRecord | null = null;
+    let newestUnavailable: EventRecord | null = null;
+    let cursor = 0;
+    for (;;) {
+      const page = ledger.listEventsAfter(cursor, { kinds: ['job.fallback-review'], limit: 500, order: 'asc' });
+      for (const event of page) {
+        if (event.jobId !== jobId) continue;
+        const phase = fallbackPhaseOf(event);
+        if (phase === 'escalation') continue;
+        if (phase === 'unavailable') {
+          if (newestUnavailable === null || event.seq > newestUnavailable.seq) newestUnavailable = event;
+          continue;
+        }
+        if (newestRequest === null || event.seq > newestRequest.seq) newestRequest = event;
+      }
+      if (page.length < 500) break;
+      cursor = page[page.length - 1]!.seq;
+    }
+    // The newest request-shaped row wins; an UNAVAILABLE row at least as
+    // new as it withdraws the request (the route answered nothing).
+    if (newestRequest !== null && (newestUnavailable === null || newestRequest.seq > newestUnavailable.seq)) {
+      candidates.push(newestRequest);
+    }
   }
   return candidates.sort((a, b) => b.seq - a.seq)[0] ?? null;
 }
@@ -539,7 +579,21 @@ function triggerAnswers(ledger: DigestLedger, jobId: string, trigger: EventRecor
  * and never counts. */
 function latestAnsweringReviewRequest(ledger: DigestLedger, jobId: string): EventRecord | null {
   const trigger = ledger.latestJobEvent(jobId, 'silas.review-triggered');
-  const fallback = ledger.latestJobEvent(jobId, 'job.fallback-review');
+  // (round-7 finding 5/18) Escalation OUTCOMES answer nothing: a late
+  // re-post of an old attempt must never look like the response to a
+  // newer review/clean-abort debt. Walk to the newest request-shaped row.
+  let fallback: EventRecord | null = null;
+  let cursor = 0;
+  for (;;) {
+    const page = ledger.listEventsAfter(cursor, { kinds: ['job.fallback-review'], limit: 500, order: 'asc' });
+    for (const event of page) {
+      if (event.jobId !== jobId) continue;
+      if (fallbackPhaseOf(event) === 'escalation') continue;
+      if (fallback === null || event.seq > fallback.seq) fallback = event;
+    }
+    if (page.length < 500) break;
+    cursor = page[page.length - 1]!.seq;
+  }
   const phase = fallback === null ? undefined : fallbackPhaseOf(fallback);
   const fallbackFailed = fallback !== null && typeof phase === 'string' && FALLBACK_FAILED_PHASES.has(phase);
   const candidates: EventRecord[] = [];
@@ -808,16 +862,6 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
   // The review-eligibility rows below never offer such a target on an OLDER
   // delivery — the worker may push a new head at any moment.
   const pendingRebriefJobIds = new Set(input.ledger.listPendingRebriefs().map((marker) => marker.jobId));
-  // (round-6 finding 7) The parent's NEWEST delivered reviewer: unbound
-  // follow-ups (re-brief/recovery) may retire only that one.
-  const newestReviewerSeqByParent = new Map<string, number>();
-  for (const job of input.ledger.listJobs()) {
-    if (job.deliverable !== 'review' || job.parentJobId === null) continue;
-    const delivery = input.ledger.latestJobEvent(job.id, 'job.delivered');
-    if (delivery === null) continue;
-    const current = newestReviewerSeqByParent.get(job.parentJobId) ?? -1;
-    if (delivery.seq > current) newestReviewerSeqByParent.set(job.parentJobId, delivery.seq);
-  }
   // Phase identity per job, for the publish-boundary rechecks: a phase that
   // opened during a later job's blocker-history await invalidates any row
   // computed against the previous phase.
@@ -927,21 +971,11 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       // would let an unrelated repair retire an uncollected review.
       const parentDelivered = parent !== null ? input.ledger.latestJobEvent(parent.id, 'job.delivered') : null;
       const parentActedOnThis = parent !== null && parentDelivered !== null && parentDelivered.seq > delivered.seq &&
-        correlatedFollowUpBetween(
-          input.ledger, parent.id, delivered.seq, parentDelivered.seq, job.id,
-          delivered.seq === (newestReviewerSeqByParent.get(parent.id) ?? -1),
-        );
-      // (round-6 finding 9) A parent turn that is ACTIVE right now owns
-      // its own follow-through: while the parent's worker has activity
-      // newer than the reviewer's delivery, the row stays suppressed
-      // instead of commissioning a competing follow-up.
-      const parentActiveTurn = parent !== null && (() => {
-        const agent = input.ledger
-          .listAgents()
-          .filter((candidate) => candidate.jobId === parent.id && candidate.role === 'minion' && candidate.parentage !== 'child')
-          .sort((a, b) => (b.lastActivity ?? b.createdAt).localeCompare(a.lastActivity ?? a.createdAt))[0];
-        return agent !== undefined && agent.lastActivity !== null && agent.lastActivity > delivered.ts;
-      })();
+        correlatedFollowUpBetween(input.ledger, parent.id, delivered.seq, parentDelivered.seq, job.id);
+      // (round-7 findings 6/19/29) An OPEN parent turn (live state, not
+      // activity recency) owns its own follow-through: the row stays
+      // suppressed instead of commissioning a competing follow-up.
+      const parentActiveTurn = parent !== null && parentTurnOpen(input.ledger, parent.id);
       if (
         parent !== null && parent.status !== 'merged' && parent.status !== 'done' &&
         !parentActedOnThis && !parentFollowUpInFlight && !parentActiveTurn
@@ -1351,18 +1385,16 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       // (round-5 finding 5); only the parent's state retires it here.
       if (parent.status === 'merged' || parent.status === 'done') return false;
       if (pendingRebriefJobIds.has(parent.id)) return false;
+      // (round-7 finding 7) Awaited blocker reads can admit a new marker
+      // after the snapshot — re-read at the publish boundary.
+      if (input.ledger.listPendingRebriefs({ jobId: parent.id }).length > 0) return false;
       if (input.ledger.listPendingDirectives({ jobId: parent.id, states: LIVE_DIRECTIVE_STATES }).length > 0) return false;
       const reviewerDelivered = input.ledger.latestJobEvent(reviewer.id, 'job.delivered');
       const parentDelivered = input.ledger.latestJobEvent(parent.id, 'job.delivered');
       if (reviewerDelivered === null) return false;
-      const agent = input.ledger
-        .listAgents()
-        .filter((candidate) => candidate.jobId === parent.id && candidate.role === 'minion' && candidate.parentage !== 'child')
-        .sort((a, b) => (b.lastActivity ?? b.createdAt).localeCompare(a.lastActivity ?? a.createdAt))[0];
-      if (agent !== undefined && agent.lastActivity !== null && agent.lastActivity > reviewerDelivered.ts) return false;
+      if (parentTurnOpen(input.ledger, parent.id)) return false;
       if (parentDelivered === null || parentDelivered.seq < reviewerDelivered.seq) return true;
-      const isNewest = reviewerDelivered.seq >= (newestReviewerSeqByParent.get(parent.id) ?? -1);
-      return !correlatedFollowUpBetween(input.ledger, parent.id, reviewerDelivered.seq, parentDelivered.seq, reviewer.id, isNewest);
+      return !correlatedFollowUpBetween(input.ledger, parent.id, reviewerDelivered.seq, parentDelivered.seq, reviewer.id);
     }),
     stalledWorking: digest.stalledWorking.filter((row) => {
       const phaseSeq = phaseSeqByJob.get(row.jobId);

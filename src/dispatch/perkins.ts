@@ -1283,6 +1283,7 @@ function sanitizeEscalationError(text: string): string {
     .replace(/gh[pousra]_[A-Za-z0-9_]{16,}/gu, '[REDACTED]')
     .replace(/github_pat_[A-Za-z0-9_]{16,}/gu, '[REDACTED]')
     .replace(/Bearer\s+[A-Za-z0-9._-]{8,}/giu, '[REDACTED]')
+    .replace(/((?:api[_-]?key|access[_-]?key|token|secret|password|passwd|authorization)\s*[=:]\s*)\S+/giu, '$1[REDACTED]')
     .replace(/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/gu, '[REDACTED]')
     .replace(/(?:\/Users\/|\/home\/)[^\s'"]+/gu, '[PATH]')
     .replace(/[\r\n]+/gu, ' ')

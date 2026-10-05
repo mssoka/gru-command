@@ -331,6 +331,7 @@ function pendingMarker(
     // Ordinary re-brief (no explicit completion intent): PR136's
     // phase-handoff identity is optional and null here.
     phaseId: null,
+    correlatesReviewer: null,
     requestedAt: '2026-09-30T00:00:00.000Z',
   };
 }

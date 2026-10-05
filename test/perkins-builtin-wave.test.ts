@@ -2696,6 +2696,9 @@ describe('bmad-review fallback gate (user amendment 2026-09-20, fork-3)', () => 
     sessions: string;
     db: LedgerDb;
     escalations: string[];
+    /** Captured logger fields — used to prove sanitized evidence at the
+     *  logging boundary (round-7 finding 13). */
+    logLines: string[];
     /** True when the PASS row was already readable inside the notifier
      * callback (the observer-visibility guarantee). */
     escalationSawPass: boolean;
@@ -2717,6 +2720,7 @@ describe('bmad-review fallback gate (user amendment 2026-09-20, fork-3)', () => 
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
     const port = new GitReviewPort(root, 'feature/fallback', target);
     const escalations: string[] = [];
+    const logLines: string[] = [];
     let escalationSawPass = false;
     const reviews: number[] = [];
     const directives: string[] = [];
@@ -2727,6 +2731,7 @@ describe('bmad-review fallback gate (user amendment 2026-09-20, fork-3)', () => 
       ledger,
       worktrees: port,
       spawner: makeSpawner(sessions, []),
+      log: (_level, _msg, fields) => logLines.push(JSON.stringify(fields)),
       reviewArtifactRoot: artifacts,
       reviewPreflight: async () => ({
         ok: false,
@@ -2758,7 +2763,9 @@ describe('bmad-review fallback gate (user amendment 2026-09-20, fork-3)', () => 
               // test (native r7 warning). A throw is an UNKNOWN outcome:
               // the notice may or may not have been recorded.
               if (escalateMode === 'throwing' && title.includes('gate PASS')) {
-                throw new Error('notifier exploded');
+                // Credential-shaped and personal-path bytes: both durable
+                // boundaries must see only redacted evidence.
+                throw new Error('notifier exploded: api_key=super-secret-token-value at /Users/moses/private/key.pem with Bearer abcdefghijklmnop');
               }
               escalations.push(escalateMode === 'posted' ? `${title}: ${detail}` : title);
               return escalateMode === 'posted' ? 'notif-fallback-pass-1' : undefined;
@@ -2767,7 +2774,7 @@ describe('bmad-review fallback gate (user amendment 2026-09-20, fork-3)', () => 
     const job = ledger.addJob({ id: 'job-fallback-gate', repo: 'fixture', title: 'fallback', baseBranch: 'main' });
     settleLane(ledger, job.id);
     return {
-      wave, job, ledger, port, root, artifacts, sessions, db, escalations, reviews, directives, repo,
+      wave, job, ledger, port, root, artifacts, sessions, db, escalations, logLines, reviews, directives, repo,
       get escalationSawPass() { return escalationSawPass; },
     };
   }
@@ -2884,6 +2891,21 @@ describe('bmad-review fallback gate (user amendment 2026-09-20, fork-3)', () => 
       // A throwing notifier is UNKNOWN, never a clean failure: the notice
       // may have been recorded before the throw.
       expect(escalationOf(throwing)?.['status']).toBe('unknown');
+      // (round-7 finding 13) Redaction at BOTH durable boundaries: the
+      // ledger outcome and the captured logger never carry the credential,
+      // the personal path, or the bearer token — only the placeholders.
+      const outcomeError = String(escalationOf(throwing)?.['error'] ?? '');
+      expect(outcomeError).not.toContain('super-secret-token-value');
+      expect(outcomeError).not.toContain('moses');
+      expect(outcomeError).not.toContain('abcdefghijklmnop');
+      expect(outcomeError).toContain('[REDACTED]');
+      expect(outcomeError).toContain('[PATH]');
+      const logged = throwing.logLines.join('\n');
+      // Never a vacuous pass: the logger boundary must have been exercised.
+      expect(throwing.logLines.length).toBeGreaterThan(0);
+      expect(logged).not.toContain('super-secret-token-value');
+      expect(logged).not.toContain('moses');
+      expect(logged).not.toContain('abcdefghijklmnop');
       expect(throwing.escalations.some((line) => line.includes('review/fix routing cleared'))).toBe(false);
       expect(passOf(throwing)?.['clearToMerge']).toBe(true);
       // Observer visibility (round 3): the notifier ran with the PASS row

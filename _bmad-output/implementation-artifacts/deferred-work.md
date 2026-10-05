@@ -128,3 +128,7 @@ gaps from the round-2 review were implemented in the lane instead of carried.
 - PASS notification ordering: the durable PASS row now precedes the notifier
   call and its outcome event, so a notification-triggered observer can never
   see an alert without the routing fact on the ledger.
+
+## Deferred from: code review of spec-gc-packaged-build-playbook.md (2026-10-05, round 7)
+
+- Legacy fallback PASS rows lacking `escalationId` can render a missing-outcome obligation, but the new correlated re-post endpoint only accepts a recorded attempt ID (`src/chat/awareness.ts:525-590`, `src/dispatch/server.ts:1364-1397`). This historical record-shape limitation predates the new endpoint; choose a separately authorized legacy migration or reconciliation identity instead of fabricating an ID or claiming these rows are repaired.

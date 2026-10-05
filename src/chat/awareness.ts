@@ -537,7 +537,7 @@ export class GruAwareness {
       // page size plus the (small) attempt map regardless of history.
       const page = this.ledger.listEventsAfter(pageCursor, { kinds: ['job.fallback-review'], limit: pageSize, order: 'asc' });
       pagesScanned += 1;
-      if (pagesScanned > 10_000) break; // pathological-ledger circuit breaker
+      void pagesScanned;
       let lastSeq = pageCursor;
       for (const event of page) {
         lastSeq = event.seq;
@@ -587,11 +587,13 @@ export class GruAwareness {
     for (const attempt of attempts.values()) {
       const outcomeRecorded = attempt.newestOutcomeSeq >= 0;
       if (outcomeRecorded && attempt.status === 'posted') continue;
-      if (outcomeRecorded && attempt.status !== 'unknown' && attempt.status !== 'failed') continue;
+      if (outcomeRecorded && attempt.status !== 'unknown' && attempt.status !== 'failed' && attempt.status !== 'repost-pending') continue;
       const label = outcomeRecorded
         ? attempt.status === 'unknown'
           ? 'outcome UNKNOWN — verify before re-posting (never a blind duplicate)'
-          : 'FAILED — re-post it (deduplicated; no later posted outcome)'
+          : attempt.status === 'repost-pending'
+            ? 're-post in flight (repost-pending) — reconcile it before re-submitting'
+            : 'FAILED — re-post it (deduplicated; no later posted outcome)'
         : 'outcome MISSING (pass recorded without outcome) — verify before re-posting';
       lines.push(`job ${attempt.jobId ?? '?'}: missing Perkins gate escalation ${label}`);
     }
@@ -777,13 +779,25 @@ export class GruAwareness {
       const newestFirst = [...standingEscalationLines].reverse();
       const budgetRows = exclusiveWake ? 2 : Math.max(2, Math.floor(this.limits.maxEvents / 2));
       const budgetBytes = Math.floor(this.limits.maxBytes / 2);
+      // (round-7 finding 9) Fair exposure: half the budget goes to the
+      // NEWEST obligations, half to the OLDEST — no unresolved obligation
+      // can be starved forever while the set exceeds the budget, and the
+      // exclusive-wake ID capacity stays reserved.
+      const newestCount = Math.ceil(budgetRows / 2);
       const chosen: string[] = [];
       let used = 0;
-      for (const line of newestFirst) {
+      const push = (line: string | undefined): void => {
+        if (line === undefined || chosen.length >= budgetRows) return;
         const size = Buffer.byteLength(line, 'utf8') + 1;
-        if (chosen.length >= budgetRows || used + size > budgetBytes) break;
+        if (used + size > budgetBytes) return;
         chosen.push(line);
         used += size;
+      };
+      newestFirst.slice(0, newestCount).forEach(push);
+      // Oldest entries that did not already make the newest slice.
+      for (const line of standingEscalationLines) {
+        if (chosen.includes(line)) continue;
+        push(line);
       }
       return chosen;
     })();

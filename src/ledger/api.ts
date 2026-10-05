@@ -651,6 +651,9 @@ export interface PendingRebriefRecord {
   readonly baselineSeq: number;
   /** The spawned re-brief worker, once known (resume hint after a crash). */
   readonly agentId: string | null;
+  /** The commissioned reviewer this request collects for (round-7
+   *  finding 10), when the caller supplied it. */
+  readonly correlatesReviewer: string | null;
   readonly sessionFile: string | null;
   /** The phase-handoff row this marker pair belongs to, when the request
    * carried an explicit completion intent (host-owned identity; the
@@ -2492,8 +2495,16 @@ export class LedgerApi {
     briefing: string | null;
     /** Explicit completion intent; omitted = ordinary re-brief (no phase). */
     handoff?: CompletionHandoffIntent;
+    /** (round-7 finding 10) The commissioned reviewer this re-brief
+     *  collects for — recorded on the marker so the settled re-brief event
+     *  can retire exactly that reviewer's digest row, permanently. */
+    correlatesReviewer?: string;
   }): readonly PendingRebriefRecord[] {
-    const payload = JSON.stringify({ note: input.note, briefing: input.briefing });
+    const payload = JSON.stringify({
+      note: input.note,
+      briefing: input.briefing,
+      ...(input.correlatesReviewer !== undefined ? { correlates_reviewer: input.correlatesReviewer } : {}),
+    });
     const payloadHash = createHash('sha256').update(payload).digest('hex');
     return this.transaction(() => {
       // The HTTP caller pre-checks, but admission is the boundary of
@@ -5452,6 +5463,7 @@ export class LedgerApi {
       kind,
       note: nstr(payload.note),
       briefing: nstr(payload.briefing),
+      correlatesReviewer: nstr((payload as { correlates_reviewer?: unknown }).correlates_reviewer),
       payloadHash: str(row.payload_hash),
       baselineSeq: Number(row.baseline_seq),
       agentId: nstr(row.agent_id),

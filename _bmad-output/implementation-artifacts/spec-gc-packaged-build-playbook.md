@@ -386,6 +386,31 @@ Full `git diff $(git merge-base origin/main HEAD)...HEAD` at `cdcd30306887e9396f
 - Blind: **false** — the fallback notifier's return receipt is intentionally optional; a nonthrowing `void` return alone is not evidence of a failed post.
 - Blind: **false** — a blocked reviewer remains a tracked job and a blocked-row repair/escalation obligation in the ops skill and durable blocked-job adoption; lack of `reviewerDelivered` (which is delivery-specific) does not prove a permanently parked parent.
 
+### Review Findings — PR #165 at fb8c0bc (2026-10-05, round 7)
+
+Full merge-base diff against `origin/main`; four fresh independent `openai-codex/gpt-6-sol` layers. Detailed individual verdicts and evidence: `reviews/gc-packaged-build-playbook-20261002-bmad-code-review-fb8c0bc/report.md`. Review-only: unresolved patches remain action items.
+
+- [ ] [Review][Patch] Page correlated PASS lookup through the job's history [src/dispatch/server.ts:1364-1384] — the current loop reads only 500 events, so old valid attempts cannot be repaired.
+- [ ] [Review][Patch] Recover `repost-pending` attempts by identity, without duplicate notices [src/dispatch/server.ts:1396-1465; src/chat/awareness.ts:587-592] — a throw/crash leaves an invisible, unretryable obligation.
+- [ ] [Review][Patch] Correct newest-first fallback request ordering [src/dispatch/silas-driver.ts:481] — reversing the DESC result allows an older unavailable/PASS phase to mask the newer answer.
+- [ ] [Review][Patch] Search fallback request evidence beyond the newest 100 all-kind job events [src/dispatch/silas-driver.ts:481] — unrelated activity ages out live request evidence.
+- [ ] [Review][Patch] Exclude escalation outcomes from every review-request consumer [src/dispatch/silas-driver.ts:540-551] — the second consumer can mistake an old re-post for a new review request.
+- [ ] [Review][Patch] Check actual parent-turn liveness when fencing reviewer handback [src/dispatch/silas-driver.ts:937-947,1360-1362] — historical activity suppresses an idle parent's row, while a quiet live turn receives competing work.
+- [ ] [Review][Patch] Recheck pending parent re-briefs at digest publication [src/dispatch/silas-driver.ts:1353] — a marker accepted during an awaited blocker lookup can leave an obsolete reviewer row.
+- [ ] [Review][Patch] Do not silently truncate fallback escalation history at 10,000 pages [src/chat/awareness.ts:536-540] — an extreme but valid ledger loses unresolved attempts.
+- [ ] [Review][Patch] Rotate/paginate standing obligations inside the awareness budget [src/chat/awareness.ts:769-787] — newest-only fixed selection permanently hides older open attempts.
+- [ ] [Review][Patch] Bind completed uncorrelated reviewer collection permanently [src/dispatch/silas-driver.ts:193-221,930-933] — a later reviewer's delivery resurrects an earlier retired handback.
+- [ ] [Review][Patch] Prevent arbitrary notifier exception secrets from reaching logs or events [src/dispatch/perkins.ts:1280-1294,2574-2584] — a credential assignment outside the known token regexes remains in both outputs.
+- [ ] [Review][Patch] Test escalation ID uniqueness across two fallback runs of one job [test/perkins-builtin-wave.test.ts:2851-2883; test/awareness.test.ts] — old posted outcomes must never conceal a new outcome-less PASS.
+- [ ] [Review][Patch] Test credential-bearing notifier exceptions at both output boundaries [test/perkins-builtin-wave.test.ts:2753-2763] — the current throw-only assertion cannot catch raw text leaks.
+- [x] [Review][Defer] Legacy PASS without an escalation ID has no correlated re-post path [src/chat/awareness.ts:525-590; src/dispatch/server.ts:1364-1397] — deferred: pre-upgrade records need a separately authorized migration/reconciliation contract; the new endpoint cannot invent an old attempt ID.
+
+#### Rejected (individual verdicts)
+
+- Blind: **low, rejected** — `not-configured` is an optional absent-notifier path; production wires a notifier, and this unlikely nontrivial repair path was explicitly rejected in earlier reviews.
+- Blind: **false** — notification-driven autonomous wake does not promise a wake for a naked PASS; the owner-context/ops obligation remains the relevant contract.
+- Blind: **low, rejected** — the stale verification commands require editing the spec under review, expressly excluded here; executable scope configuration remains `.gru-command/worktree.toml`.
+
 ## Implementation Notes
 
 - Runtime capability verified on this lane: `pi` CLI v0.99.1 on PATH,
@@ -1039,6 +1064,24 @@ bad_spec).
   ordered before the notifier attempt. `docs/FLOW.md` §4f and the
   deferred-work record updated truthfully; no deferred item remains for
   this lane.
+
+- Round-7 closure (same directive): all thirteen groups fixed. The
+  correlated PASS lookup truly pages the whole fallback stream (the prior
+  loop read one newest page and broke); repost-pending is a standing
+  obligation in the digest and recovers after a ten-minute bound (a
+  crashed post is unknown, never a permanent dead end); the fallback
+  request scan walks the full stream newest-first (no all-kind 100-event
+  window, correct order); every review-request consumer excludes
+  escalation outcomes; the parent-turn fence reads LIVE agent.state
+  (open spawning/streaming), not activity recency; publish-time re-reads
+  pending re-briefs; the awareness page loop terminates naturally (no
+  silent 10k cap); standing exposure splits newest/oldest fairly; re-brief
+  now carries correlates_reviewer through the marker and its settled
+  event, and retirement is STRICTLY identity-bound (no unbound branch —
+  permanent collection, no resurrection by a later reviewer); sanitizer
+  redacts credential assignments too; legacy PASS rows are repairable by
+  `attempt_iteration`; regression tests cover cross-run attempt
+  uniqueness and redaction at both the logger and ledger boundaries.
 
 - Round-6 closure (same directive): all twelve `6bdde54`-round review
   groups fixed at the next head. Attempt reconciliation folds each page

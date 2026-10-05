@@ -225,6 +225,27 @@ describe('gru awareness — passive injection', () => {
     expect(block?.text).not.toContain('re-post it');
   });
 
+  it('a posted outcome from one gate run never retires another run\'s missing obligation', () => {
+    const rig = boot();
+    // Run A (older): posted. Run B (newer): PASS with no outcome — the
+    // run-unique attempt id keeps B's obligation open.
+    rig.api.appendCustomEvent({
+      kind: 'job.fallback-review', jobId: 'j9',
+      payload: { gate: true, phase: 'pass', iteration: 1, notes: 0, clearToMerge: true, escalationId: 'j9:run-a:1' },
+    });
+    rig.api.appendCustomEvent({
+      kind: 'job.fallback-review', jobId: 'j9',
+      payload: { gate: true, phase: 'escalation', iteration: 1, status: 'posted', escalationId: 'j9:run-a:1', receipt: 'n-a' },
+    });
+    rig.api.appendCustomEvent({
+      kind: 'job.fallback-review', jobId: 'j9',
+      payload: { gate: true, phase: 'pass', iteration: 1, notes: 0, clearToMerge: true, escalationId: 'j9:run-b:1' },
+    });
+    const block = rig.awareness.prepare();
+    expect(block?.text).toContain('job j9: missing Perkins gate escalation outcome MISSING (pass recorded without outcome) — verify before re-posting');
+    expect(block?.text).not.toContain('j9:run-a');
+  });
+
   it('renders an UNKNOWN escalation outcome as verify-before-repost, never a blind duplicate', () => {
     const rig = boot();
     rig.api.appendCustomEvent({

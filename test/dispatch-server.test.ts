@@ -493,9 +493,20 @@ describe('dispatch server (E8)', () => {
       expect(replay.status).toBe(200);
       expect(field<boolean>(replay.json, 'replay')).toBe(true);
       expect(h.ledger.listNotifications().length).toBe(noticesBefore);
+      // (round-7 deferred item) Legacy PASS rows (no escalationId) remain
+      // repairable by their `i<iteration>` identity.
+      h.ledger.appendCustomEvent({
+        kind: 'job.fallback-review', jobId: 'http-parent-impl',
+        payload: { gate: true, phase: 'pass', iteration: 2, notes: 0, clearToMerge: true, merge: 'user-held' },
+      });
+      const legacyRepost = await call(h.port, 'POST', '/api/silas/escalate', {
+        job_id: 'http-parent-impl', title: 'legacy re-post', attempt_iteration: 2, by: 'silas',
+      }, TOKEN);
+      expect(legacyRepost.status).toBe(200);
+      expect(field<string>(legacyRepost.json, 'escalation_outcome')).toBe('posted');
       // (round-6 finding 10) Malformed PRESENT escalation_id values are
       // refused before any notice exists.
-      for (const [suffix, value] of [['null', null], ['number', 3], ['blank', ' ']] as const) {
+      for (const value of [null, 3, ' '] as const) {
         const malformed = await call(h.port, 'POST', '/api/silas/escalate', {
           job_id: 'http-parent-impl', title: 'x', escalation_id: value, by: 'silas',
         }, TOKEN);

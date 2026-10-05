@@ -298,6 +298,10 @@ export function finalizeRebriefRequest(input: {
           minion_id: input.minionId,
           lane: input.lanePath,
           note: input.note,
+          // (round-7 finding 10) Identity-bound collection: the settled
+          // re-brief retires exactly the reviewer it was commissioned for,
+          // permanently — a later reviewer's delivery cannot resurrect it.
+          ...(rebriefMarker.correlatesReviewer !== null ? { correlates_reviewer: rebriefMarker.correlatesReviewer } : {}),
           ...(phaseId !== null ? { phase_id: phaseId } : {}),
         },
       }, markers);
