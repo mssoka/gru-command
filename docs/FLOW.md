@@ -799,11 +799,16 @@ section). Service restarts remain manual until self-roll-34 lands.
 
 ## Bob (periodic memory)
 
-Bob's consolidation trigger runs on the configured interval
-(`[dispatch] bob_interval_ms`, default hourly; `0` disables): it knocks
-on the bob role's supervised slot with consolidation instructions; the
-role's persona (`roles/bob.md`) governs the craft. Never overlapping,
-never blocking a live operation.
+Bob's consolidation trigger ships **disabled** (`[dispatch]
+bob_interval_ms = 0`, issue #221): the due-based dream pass (Book of
+Lessons) is the learning loop that feeds the crew — it reads journal
+entries, including the blockers Perkins journals from every posted
+review verdict — and an hourly knock mostly found nothing, writing
+memory files no role prompt or code path reads. The trigger remains
+available for installs that want it (any positive `bob_interval_ms`
+enables; `0` disables): it knocks on the bob role's supervised slot
+with consolidation instructions; the role's persona (`roles/bob.md`)
+governs the craft. Never overlapping, never blocking a live operation.
 
 ## Self-roll (the service deploys itself)
 
@@ -895,7 +900,7 @@ or an outside shell to avoid waiting out the drain bound.
 # setup_timeout_ms = 120000
 
 [dispatch]
-# bob_interval_ms = 3600000        # 0 disables Bob's trigger
+# bob_interval_ms = 3600000        # ships 0: disabled — the due-based dream is the loop
 
 [silas]
 # hosted ops session (see "Ops follow-through" above); live by default

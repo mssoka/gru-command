@@ -192,7 +192,10 @@ export interface WorktreesConfig {
 
 /** Dispatch flow policy (E8). */
 export interface DispatchConfig {
-  /** Bob's periodic consolidation interval; 0 disables the trigger. */
+  /** Bob's periodic consolidation interval; 0 disables the trigger. Ships
+   * 0 (issue #221): the due-based dream pass is the learning loop that
+   * feeds the crew, and the hourly knock mostly found nothing — its
+   * memory files feed no code path. Re-enable deliberately. */
   readonly bobIntervalMs: number;
 }
 
@@ -838,7 +841,7 @@ export function loadConfig(
     morningDigestGapMs: 28_800_000,
   };
   let worktrees: WorktreesConfig | null = null;
-  let dispatch: DispatchConfig = { bobIntervalMs: 3_600_000 };
+  let dispatch: DispatchConfig = { bobIntervalMs: 0 };
   let lessons: LessonsConfig = DEFAULT_LESSONS_CONFIG;
   let silas: SilasConfig = DEFAULT_SILAS_CONFIG;
   let providerRecovery: ProviderRecoveryConfig = DEFAULT_PROVIDER_RECOVERY_CONFIG;

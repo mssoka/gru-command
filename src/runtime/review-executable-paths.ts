@@ -2595,6 +2595,7 @@ export const PUBLIC_REVIEW_EXECUTABLE_PATHS: ReadonlySet<string> = new Set([
   "dist/lessons/dream.js",
   "dist/lessons/journal.js",
   "dist/lessons/references.js",
+  "dist/lessons/review-capture.js",
   "dist/lessons/server.js",
   "dist/lessons/types.js",
   "dist/listener-probe.js",

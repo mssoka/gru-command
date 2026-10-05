@@ -8,8 +8,10 @@ import { LedgerDb } from '../src/ledger/db.js';
 import { DispatchService } from '../src/dispatch/service.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { extractLessonsBlock, createSessionLessonsCapture } from '../src/lessons/capture.js';
+import { createReviewOutcomeCapture, REVIEW_FINDING_BODY_MAX_CHARS } from '../src/lessons/review-capture.js';
 import { JournalStore } from '../src/lessons/journal.js';
 import { LessonCaptureError } from '../src/lessons/types.js';
+import type { BusEvent } from '../src/events/bus.js';
 import type { AgentCapabilities, AgentHandle } from '../src/runtime/types.js';
 
 /**
@@ -164,5 +166,155 @@ describe('minion lessons capture', () => {
     } finally {
       ledgerDb.close();
     }
+  });
+});
+
+/**
+ * Perkins review outcome capture (issue #221): when a round posts a
+ * verdict, each consolidated blocker becomes ONE deliberate journal
+ * entry (source `perkins:<round>`), redacted and bounded, idempotent
+ * per round across duplicate events and service restarts.
+ */
+
+function blockerFixture(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    severity: 'blocker',
+    category: 'correctness',
+    title: 'Off-by-one in the rollup',
+    location: 'src/rollup.ts:42',
+    evidence: 'the loop exits before the last row',
+    detail: 'The rollup drops the last row of every batch.',
+    recommended_fix: 'Use <= in the loop guard.',
+    verification: { disposition: 'confirmed', evidence: 'reproduced', reason: 'plain from the diff' },
+    sources: ['specialist'],
+    roundOrigin: 1,
+    ...overrides,
+  };
+}
+
+function writeConsolidated(
+  root: string,
+  roundId: string,
+  findings: readonly Record<string, unknown>[],
+  repoPath = '/tmp/gru-command-demo',
+): string {
+  const directory = join(root, roundId);
+  mkdirSync(directory, { recursive: true });
+  const file = join(directory, 'consolidated.json');
+  writeFileSync(
+    file,
+    `${JSON.stringify({ schemaVersion: 3, canonicalVerdict: 'NEEDS CHANGES', findings, frozen: { repoPath } })}\n`,
+    'utf-8',
+  );
+  return file;
+}
+
+function verdictEvent(roundId: string): BusEvent {
+  return {
+    seq: 1,
+    ts: '2026-10-05T12:00:00.000Z',
+    kind: 'round.verdict',
+    agentId: null,
+    jobId: 'job-1',
+    roundId,
+    lens: null,
+    payload: { verdict: 'NEEDS CHANGES' },
+  };
+}
+
+function captureHarness() {
+  const dir = tmpDir('gru-command-review-capture-');
+  const artifactRoot = join(dir, 'reviews');
+  const journal = new JournalStore(join(dir, 'journal'));
+  const bus = new EventBus({});
+  const logs: [string, string, Record<string, unknown>][] = [];
+  const stateFile = join(artifactRoot, '.review-capture-state.json');
+  const stop = createReviewOutcomeCapture({
+    bus,
+    journal,
+    artifactRoot,
+    stateFile,
+    log: (level, message, fields) => logs.push([level, message, fields ?? {}]),
+  });
+  return { dir, artifactRoot, journal, bus, logs, stateFile, stop };
+}
+
+describe('perkins review outcome capture', () => {
+  it('journals one bounded, redacted finding entry per blocker with perkins:<round> source', () => {
+    const h = captureHarness();
+    writeConsolidated(h.artifactRoot, 'round-abc123', [
+      blockerFixture(),
+      blockerFixture({ severity: 'warning', title: 'a warning is not journaled' }),
+      blockerFixture({ category: 'c'.repeat(80), title: 'second blocker' }),
+    ]);
+    h.bus.publish(verdictEvent('round-abc123'));
+    const entries = h.journal.list();
+    expect(entries).toHaveLength(2);
+    expect(entries[0]).toMatchObject({
+      kind: 'finding',
+      source: 'perkins:round-abc123',
+      tags: ['repo:gru-command-demo', 'review:blocker', 'category:correctness'],
+      body: 'Off-by-one in the rollup — src/rollup.ts:42: The rollup drops the last row of every batch.',
+    });
+    // Tags stay inside the journal's 64-char bound even for an 80-char category.
+    expect(entries[1]!.tags[2]!.length).toBe(64);
+    expect(h.logs.every(([level]) => level !== 'error')).toBe(true);
+  });
+
+  it('is idempotent per round across duplicate events and capture restarts', () => {
+    const h = captureHarness();
+    writeConsolidated(h.artifactRoot, 'round-abc123', [blockerFixture()]);
+    h.bus.publish(verdictEvent('round-abc123'));
+    h.bus.publish(verdictEvent('round-abc123'));
+    expect(h.journal.list()).toHaveLength(1);
+    // A fresh capture over the same sidecar (service restart) is idempotent too.
+    const resumed = createReviewOutcomeCapture({ bus: h.bus, journal: h.journal, artifactRoot: h.artifactRoot, stateFile: h.stateFile });
+    h.bus.publish(verdictEvent('round-abc123'));
+    expect(h.journal.list()).toHaveLength(1);
+    resumed();
+  });
+
+  it('a verdict with no blockers marks the round captured and journals nothing', () => {
+    const h = captureHarness();
+    writeConsolidated(h.artifactRoot, 'round-clean', [blockerFixture({ severity: 'note' })]);
+    h.bus.publish(verdictEvent('round-clean'));
+    h.bus.publish(verdictEvent('round-clean'));
+    expect(h.journal.list()).toEqual([]);
+    expect(h.logs.every(([level]) => level !== 'error')).toBe(true);
+  });
+
+  it('a missing consolidated record fails loud, marks nothing, and a later event captures', () => {
+    const h = captureHarness();
+    h.bus.publish(verdictEvent('round-missing'));
+    expect(h.journal.list()).toEqual([]);
+    expect(h.logs.some(([level, , fields]) => level === 'error' && fields['round_id'] === 'round-missing')).toBe(true);
+    // The record appears (e.g. the lead settled just after the verdict) — a
+    // re-posted verdict retries instead of having been burned by the sidecar.
+    writeConsolidated(h.artifactRoot, 'round-missing', [blockerFixture()]);
+    h.bus.publish(verdictEvent('round-missing'));
+    expect(h.journal.list()).toHaveLength(1);
+  });
+
+  it('redacts secrets and bounds the body of journaled findings', () => {
+    const h = captureHarness();
+    writeConsolidated(h.artifactRoot, 'round-secret', [
+      blockerFixture({
+        detail: `leaked key sk-ABCDEFGHIJKLMNOPQRSTUVWX inside ${'x'.repeat(10_000)}`,
+      }),
+    ]);
+    h.bus.publish(verdictEvent('round-secret'));
+    const entry = h.journal.list()[0]!;
+    expect(entry.body).not.toContain('sk-ABCDEFGHIJKLMNOPQRSTUVWX');
+    expect(entry.body).toContain('[redacted]');
+    expect(entry.body.length).toBeLessThanOrEqual(REVIEW_FINDING_BODY_MAX_CHARS);
+  });
+
+  it('ignores events that are not round verdicts or carry no round id', () => {
+    const h = captureHarness();
+    writeConsolidated(h.artifactRoot, 'round-abc123', [blockerFixture()]);
+    h.bus.publish({ ...verdictEvent('round-abc123'), kind: 'round.status' });
+    h.bus.publish({ ...verdictEvent('round-abc123'), roundId: null });
+    expect(h.journal.list()).toEqual([]);
+    expect(h.logs).toEqual([]);
   });
 });

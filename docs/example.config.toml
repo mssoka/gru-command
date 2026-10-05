@@ -125,7 +125,10 @@ morning_digest_gap_ms = 28800000
 setup_timeout_ms = 120000
 
 [dispatch]                        # dispatch flow (E8) — all optional
-bob_interval_ms = 3600000         # Bob's consolidation interval; 0 disables
+# Bob's consolidation knock ships 0 (disabled): the due-based dream pass is
+# the learning loop that feeds the crew; an hourly knock mostly found
+# nothing. Re-enable deliberately.
+# bob_interval_ms = 3600000
 
 [lessons]                         # Book of Lessons — all optional, live by default
 # Deliberate journal entries (Gru/Silas via /api/journal, minion lessons blocks)
