@@ -72,3 +72,9 @@
 - source_spec: none — BMAD code review of PR #170 (head 3540500)
   summary: AGENTS.md and other docs don't mention the phase split; `npx vitest run test/<heavy>.test.ts` now exits "No test files found" (low)
   evidence: README documents test:backend:heavy, but agent guidance does not, so minions running a heavy file directly hit an exit-1 trap (it fails loud, not silently). Deferred: the fix edits agent-context files.
+
+## Deferred from: code review of spec-gh-32-deterministic-bmad-failure-skip-only (2026-10-05)
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-gh-32-deterministic-bmad-failure-skip-only.md`
+  summary: `wizard-bmad-browser-consumer` runs `npm run e2e` whose Playwright screenshot baselines are darwin-only, so the scope has no Linux baseline support.
+  evidence: bmad code review (blind-hunter, gpt-6-sol) 2026-10-05; pre-existing main convention — origin/main's `web/e2e/*-snapshots/` carry only `-darwin` PNGs and CI does not run e2e — so repair is a cross-lane Linux-baseline effort, not this lane's change.

@@ -184,6 +184,23 @@ re-asking — recorded here as the standing Checkpoint-1 approval.
 
 ## Review Triage Log
 
+### Review Findings — r4 bmad code review (2026-10-05, four independent reviewers)
+
+Reviewed head `941268c` (post current-main integration); repairs landed at `d2e40b7`, all five red-proven against pre-fix source.
+
+- [x] [Review][Patch] Dangling `_bmad` symlink bypassed the unsafe-path refusal (`existsSync` follows links) — `src/wizard/bmad-onboarding.ts` — lstat walk; installer never invoked; deterministic with installer hint.
+- [x] [Review][Patch] Symlinked `_bmad/_config` read manifest bytes outside the repo before any guard — `src/wizard/bmad-onboarding.ts:existingManifestFor` — full-component guard before the read; sentinel regression proves no read-through.
+- [x] [Review][Patch] Malformed staged-manifest parse leaked the deleted `/tmp` preflight stage path — `src/wizard/bmad-onboarding.ts:installFresh` — sanitized through `withoutStagingPath`, stays transient.
+- [x] [Review][Patch] Managed-block marker pairing (exclude + worktree manifest) validated only AFTER the installer had written into the repo — `assertManagedBlocksSafe` pre-install; installer-call-count regressions for both files.
+- [x] [Review][Patch] `/__reset` drained a queued (deferred) user frame when settling a parked turn, ghosting its reply into the cleared log — `web/mock/server.ts` — deferred queue dropped before release; queued-frame regression (red pre-fix).
+- [ ] [Review][Decision] Post-install validation failures stay transient (retry offered), but the wizard's own retry cannot complete: the failed attempt's output trips `assertNoPartialInstall`/"BMAD already exists" on the next run — the r2-reviewed oracle ("stays transient, never skip-only") and the gh-32 spec contract (retry must be plausibly completable) pull opposite ways. Options: (a) compensating cleanup of the wizard's own failed output before offering retry (keeps the r2 oracle), (b) skip-only with cleanup guidance (contradicts the r2 oracle, needs owner sign-off), (c) accept the two-step dance (first retry yields the actionable deterministic refusal). Owner call required — two reviewed artifacts conflict.
+- [x] [Review][Defer] `wizard-bmad-browser-consumer` runs `npm run e2e` with darwin-only Playwright baselines — deferred: pre-existing main convention (origin/main's `smoke.spec.ts-snapshots/` carries only `-darwin` PNGs; CI does not run e2e); a Linux-baseline lane crosses other lanes' ownership.
+
+Rejected (appendix):
+- `false` — "existsSync false on EACCES misclassifies unreadable module/skill as deterministic missing" (`verifyModuleDirectories`/`verifySkills`): the pre-fix source passes the strongest constructed case because `runtimeSkillNames`' earlier transient IO guard classifies the permission failure before those checks are reached; unreachable at the cited location, no code change.
+- `low` — baseline scope's overlaid suite-shape pins red on pin drift vs the old archive: expected-RED scheduler-only historical evidence, receipts preserved; per-base pin maintenance is more than a direct correction.
+- `low` — chmod-000 EACCES tests fail when the suite runs as root: pre-existing repo idiom, CI/devs run unprivileged; a permission-denial seam is more than a direct correction.
+
 ## Verification
 
 **Commands:**
