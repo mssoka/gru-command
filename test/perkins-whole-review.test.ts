@@ -84,6 +84,9 @@ function wholeHarness(
     reviewGate?: PacingGate;
     pacing?: Pick<PerkinsWholeReviewOptions, 'rateLimitBackoff' | 'recordPacing' | 'pacingSleep' | 'pacingJitter' | 'pacingNow'>;
     onProgress?: PerkinsWholeReviewOptions['onProgress'];
+    /** Frozen movement ref (default 'feature/review'); tests exercising the
+     * advertised-remote movement probe pass a tracking-ref spelling. */
+    movementRef?: string;
   },
 ): WholeHarness {
   const fixture = makeReviewRepo();
@@ -98,7 +101,7 @@ function wholeHarness(
     artifactRoot: root,
     baseRef: options?.baseRef ?? base,
     targetRef: target,
-    movementRef: 'feature/review',
+    movementRef: options?.movementRef ?? 'feature/review',
     ...(options?.noSpec === true
       ? { noSpec: true }
       : { spec: options?.spec ?? 'return 43' }),
@@ -1410,7 +1413,15 @@ describe('Perkins whole-PR lead engine', () => {
     const credentialUrl = 'https://user:secret-token@code.example.invalid/acme/fixture?access_token=another-secret';
     writeFileSync(shim, `#!/bin/sh\ncase " $* " in *" remote "*) printf '%s\\n' "fatal: unable to access '${credentialUrl}': simulated remote listing failure" >&2; exit 2;; esac\nexec "${realGit}" "$@"\n`);
     chmodSync(shim, 0o755);
-    const h = wholeHarness({ ...ALL_CLEAN, submitRetries: 1, submitPayload: incompleteOnRetry });
+    // gh-169: the advertised-remote probe runs only for TRACKING-REF
+    // spellings (a local branch resolves refs/heads/… and never consults
+    // the remote list), so this test drives a tracking-ref movement ref —
+    // the spelling whose remote lookup is genuinely load-bearing.
+    const h = wholeHarness({ ...ALL_CLEAN, submitRetries: 1, submitPayload: incompleteOnRetry }, { movementRef: 'origin/feature/review' });
+    // The tracking ref the probe will interrogate: locally resolvable at
+    // the frozen target, so the ONLY failing lookup is the shimmed
+    // `git remote` membership call.
+    h.repo.git(['update-ref', 'refs/remotes/origin/feature/review', h.target]);
     const oldPath = process.env.PATH;
     try {
       process.env.PATH = `${shimDir}:${oldPath ?? ''}`;

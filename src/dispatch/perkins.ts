@@ -52,7 +52,9 @@ import {
   CI_BRANCH_STATE_EVENT,
   CI_FAILED_EVENT,
   CI_GREEN_EVENT,
+  type CiEvidenceRecord,
 } from '../review-inputs/ci-evidence.js';
+import { admissionPreflight, ReviewAdmissionError } from './perkins-review/admission.js';
 import { evidenceRequestFingerprint, type ReviewEvidenceRequest } from '../review-inputs/evidence.js';
 import { parseGitHubPrUrl } from './github-poll.js';
 import {
@@ -151,6 +153,29 @@ function renderUntrustedInline(value: string, maxChars = 240): string {
   return single.length > maxChars ? `${single.slice(0, maxChars)}…[truncated]` : single;
 }
 
+/** One deterministic appendix line for the frozen CI record: distinct
+ * wordings keep missing evidence (UNAVAILABLE / NOT-MATCHED — no bound
+ * receipt) apart from a measured host failure (FAILED), and neither is
+ * ever a PASS (gh-169: missing CI evidence is not a CI failure). */
+function ciEvidenceLine(ci: CiEvidenceRecord | null | undefined): string | null {
+  if (ci === null || ci === undefined) {
+    return '- CI evidence at freeze: NOT RECORDED — this round predates the frozen CI-record disclosure; absence here is not a pass and not a failure';
+  }
+  const bound = `observed ${ci.observedAt ?? 'unknown time'} via ${ci.sourceKind ?? 'unknown'} (ledger seq ${ci.sourceSeq ?? 'unknown'})`;
+  switch (ci.state) {
+    case 'green':
+      return `- CI evidence at freeze: GREEN (recorded observation, ${ci.checks.length} check(s)) — ${bound}`;
+    case 'pending':
+      return `- CI evidence at freeze: PENDING — NOT PASS (${ci.checks.length} check(s)) — ${bound}`;
+    case 'failed':
+      return `- CI evidence at freeze: FAILED — NOT PASS (${ci.failures.length} failing check(s): ${ci.failures.map((failure) => failure.name).join(', ') || 'none named'}) — ${bound}`;
+    case 'unavailable':
+      return `- CI evidence at freeze: UNAVAILABLE — NO BOUND CI RECEIPT (missing evidence, not a measured failure): ${renderUntrustedInline(ci.reason ?? 'no reason recorded', 200)}`;
+    case 'not-matched':
+      return `- CI evidence at freeze: NOT-MATCHED — the recorded observation cannot certify this review target (missing evidence, not a measured failure): ${renderUntrustedInline(ci.reason ?? 'no reason recorded', 200)}`;
+  }
+}
+
 /** Compact host-owned factual appendix for the published body: retained
  * findings and execution facts (specialists ran/failed/not-used, prior
  * dispositions) assembled deterministically from the structured result, so
@@ -171,6 +196,12 @@ export function hostDisclosureAppendix(
    * not-used accounting is derived from what this round could run, never
    * from a historical or future catalog. */
   lenses: readonly string[],
+  /** The CI record as FROZEN for this round (gh-169): the published body
+   * states the frozen CI evidence distinctly — missing (UNAVAILABLE /
+   * NOT-MATCHED) is never rendered as a measured failure, and a measured
+   * failure is never softened. Absent parameter = the round predates the
+   * disclosure or carried no record; that absence is stated, not guessed. */
+  ciEvidence?: CiEvidenceRecord | null,
 ): string {
   const counts = new Map<string, number>();
   for (const finding of review.findings) counts.set(finding.severity, (counts.get(finding.severity) ?? 0) + 1);
@@ -202,6 +233,10 @@ export function hostDisclosureAppendix(
   const evidenceGaps = ran.filter(([, entry]) => entry.evidenceGap);
   const progressGaps = ran.filter(([, entry]) => entry.progressGap);
   const notUsed = lenses.filter((lens) => !byLens.has(lens));
+  const startedAttempts = ran.reduce((total, [, entry]) => total + entry.valid + entry.failed, 0);
+  const validAttempts = ran.reduce((total, [, entry]) => total + entry.valid, 0);
+  const failedAttempts = ran.reduce((total, [, entry]) => total + entry.failed, 0);
+  const ciLine = ciEvidenceLine(ciEvidence);
   const prior = review.priorDispositions;
   const priorFixed = prior.filter((disposition) => disposition.status === 'fixed').length;
   const priorStill = prior.length - priorFixed;
@@ -218,6 +253,8 @@ export function hostDisclosureAppendix(
     `- Retained findings: ${review.findings.length}${severityLine === '' ? '' : ` (${severityLine})`}`,
     ...findingsLines,
     `- Available specialist lenses this round: ${lenses.length}`,
+    `- Specialist attempts started: ${startedAttempts} (${validAttempts} valid, ${failedAttempts} failed) across ${ran.length} of ${lenses.length} available lenses`,
+    ...(ciLine !== null ? [ciLine] : []),
     `- Specialists run: ${ran.length === 0 ? 'none (lead-owned whole-change review)' : ran.map(([lens, entry]) => `${lens}${entry.failed > 0 ? ` (attempts: ${entry.valid} valid, ${entry.failed} failed)` : ''}`).join(', ')}`,
     ...(failed.length > 0 ? [`- Failed specialist attempts: ${failed.map(([lens, entry]) => `${lens} ×${entry.failed}`).join(', ')} — the lead judged the change on its own whole-change verification`] : []),
     ...(review.budgetRefusals !== undefined && review.budgetRefusals.length > 0
@@ -248,8 +285,9 @@ export function publicationBodyFor(
   review: Parameters<typeof hostDisclosureAppendix>[0],
   provider: PublicationProviderKind,
   lenses: readonly string[],
+  ciEvidence?: CiEvidenceRecord | null,
 ): string {
-  const body = `${reportText.trimEnd()}\n\n${hostDisclosureAppendix(review, provider, lenses)}\n`;
+  const body = `${reportText.trimEnd()}\n\n${hostDisclosureAppendix(review, provider, lenses, ciEvidence)}\n`;
   if (Buffer.byteLength(body, 'utf8') > PUBLICATION_BODY_MAX_BYTES) {
     throw new Error(
       `publication body (${Buffer.byteLength(body, 'utf8')} bytes) exceeds the provider review-body limit (${PUBLICATION_BODY_MAX_BYTES} bytes); ` +
@@ -1749,12 +1787,50 @@ export class WaveRunner {
     };
   }
 
-  private abortRound(round: RoundRecord, note: string): void {
-    for (const chip of round.lenses) {
-      if (chip.state === 'pending' || chip.state === 'live') {
-        this.opts.ledger.setLensOutcome(round.id, chip.lens, 'error', note);
-      }
+  /** Lenses with ≥1 durably charged specialist start this round — the
+   * budget authority is the honest "a child actually started" set (a
+   * charged start precedes every spawn; a registered live chip implies
+   * one). Used to keep parent incidents from minting specialist
+   * failures (gh-169: one lead disconnect is one parent incident, never
+   * a nine-chip slate of failed specialists). */
+  private startedSpecialistLenses(roundId: string): ReadonlySet<string> {
+    const started = new Set<string>();
+    for (const event of this.opts.ledger.listRoundSpecialistStarts(roundId)) {
+      const lens = typeof event.payload === 'object' && event.payload !== null
+        ? (event.payload as { readonly lens?: unknown }).lens : null;
+      if (typeof lens === 'string' && lens !== '') started.add(lens);
     }
+    return started;
+  }
+
+  /** Terminalize a round whose PARENT (lead/transport/service) failed.
+   * Counter truth (gh-169): lenses with a started attempt record an
+   * honest execution error naming the parent cause; lenses that never
+   * started stay `pending` — a not-started lens is not a failed
+   * execution. Exactly ONE `round.parent-incident` event carries the
+   * round-level facts (started attempts, started/not-started lenses). */
+  private abortRound(round: RoundRecord, note: string): void {
+    const started = this.startedSpecialistLenses(round.id);
+    for (const chip of round.lenses) {
+      const startedHere = started.has(chip.lens);
+      if (chip.state === 'live' || (chip.state === 'pending' && startedHere)) {
+        this.opts.ledger.setLensOutcome(round.id, chip.lens, 'error',
+          `attempt started; interrupted by parent abort before settlement: ${note}`.slice(0, 500));
+      }
+      // A never-started lens keeps `pending`: the aborted round itself is
+      // the parent incident; no specialist execution failed.
+    }
+    this.opts.ledger.appendCustomEvent({
+      kind: 'round.parent-incident',
+      jobId: round.jobId,
+      roundId: round.id,
+      payload: {
+        note: note.slice(0, 500),
+        startedAttempts: this.opts.ledger.listRoundSpecialistStarts(round.id).length,
+        startedLenses: round.lenses.filter((chip) => started.has(chip.lens)).map((chip) => chip.lens),
+        notStartedLenses: round.lenses.filter((chip) => !started.has(chip.lens)).map((chip) => chip.lens),
+      },
+    });
     this.opts.ledger.setRoundStatus(round.id, 'aborted');
   }
 
@@ -2848,13 +2924,15 @@ export class WaveRunner {
           this.opts.ledger.latestJobEvent(job.id, VERIFICATION_COMPLETED_EVENT),
           targetSha,
         );
-        if (evidence !== null) {
-          spec = appendRecordedVerification({
-            spec,
-            evidence,
-            log: (level, msg, fields) => this.log(level, msg, { job: job.id, ...fields }),
-          });
-        }
+        // Verification evidence is ALWAYS explicit (gh-169): a binding run
+        // renders its block; no binding run freezes the UNAVAILABLE
+        // disclosure — never silence. The absence block that cannot fit
+        // refuses the freeze (mirrors the CI omission-notice contract).
+        spec = appendRecordedVerification({
+          spec,
+          evidence,
+          log: (level, msg, fields) => this.log(level, msg, { job: job.id, ...fields }),
+        });
         spec = appendCiEvidence({
           spec,
           block: ci.block,
@@ -3040,6 +3118,33 @@ export class WaveRunner {
           payload: { roundId: round.id, targetSha, runtimeId: runtime.id,
             pid: process.pid, generation: randomUUID() },
         });
+      }
+      // ADMISSION PREFLIGHT (gh-169 Stage 4): validate the complete frozen
+      // packet read-only — head binding, every declared artifact digest,
+      // evidence bytes, CI record, verification section — BEFORE the run
+      // promise exists and before any lead or child can spawn. A refusal
+      // names every missing input precisely and aborts the round without
+      // spawn (the setup catch's no-spawn path); a pass is recorded with
+      // its full check list so the admission evidence is durable.
+      const admission = admissionPreflight(frozenReview, movementRef);
+      this.opts.ledger.appendCustomEvent({
+        kind: 'round.admission-preflight',
+        jobId: job.id,
+        roundId: round.id,
+        payload: {
+          ok: admission.missing.length === 0,
+          checks: admission.checks,
+          ...(admission.missing.length > 0 ? { missing: admission.missing } : {}),
+        },
+      });
+      if (admission.missing.length > 0) {
+        const refusal = new ReviewAdmissionError(admission.missing);
+        this.opts.escalate?.(
+          `Perkins review for job ${job.id} refused admission before any specialist started`,
+          refusal.message,
+          { jobId: job.id, roundId: round.id },
+        );
+        throw refusal;
       }
     } catch (error) {
       const failures: unknown[] = [error];
@@ -3601,7 +3706,19 @@ export class WaveRunner {
           encoding: 'utf8', mode: 0o600, flag: 'wx',
         });
       }
-      const incompleteContents = `# Perkins Code Review\n\n**Verdict: INCOMPLETE**\n\n${detail.slice(0, 500)}\n`;
+      const executionFacts = this.interruptedExecutionFacts(round.id, lenses);
+      const incompleteContents = [
+        '# Perkins Code Review',
+        '',
+        '**Verdict: INCOMPLETE**',
+        '',
+        `${detail.slice(0, 500)}`,
+        '',
+        '**Parent incident** — the round ended before completion; this is one parent incident, not a per-lens specialist failure.',
+        '',
+        executionFacts,
+        '',
+      ].join('\n');
       const reportFile = join(frozenReview.directory, 'perkins-report.incomplete.md');
       if (!existsSync(reportFile)) {
         writeFileSync(reportFile, incompleteContents, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
@@ -3614,12 +3731,17 @@ export class WaveRunner {
         kind: 'round.perkins-incomplete',
         jobId: job.id,
         roundId: round.id,
-        payload: { reason: signal.aborted ? 'cancelled' : 'workflow_error', error: detail.slice(0, 500), reportFile },
+        payload: {
+          reason: signal.aborted ? 'cancelled' : 'workflow_error',
+          error: detail.slice(0, 500),
+          reportFile,
+          executionFacts,
+        },
       });
-      this.opts.escalate?.(`Review round ${round.id} is INCOMPLETE`, detail, { jobId: job.id, roundId: round.id });
+      this.opts.escalate?.(`Review round ${round.id} is INCOMPLETE`, `${detail}\n${executionFacts}`, { jobId: job.id, roundId: round.id });
       return {
         round: this.opts.ledger.getRound(round.id) as RoundRecord,
-        results: lenses.map(() => ({ state: 'error' as const, note: detail })),
+        results: this.interruptedLensResults(round, lenses, detail),
         verdict: null,
         posted: false,
         canonicalVerdict: 'INCOMPLETE',
@@ -3678,7 +3800,7 @@ export class WaveRunner {
         // the full evidence is preserved locally instead (R8).
         let publicationBody: string;
         try {
-          publicationBody = publicationBodyFor(readFileSync(reportFile, 'utf8'), review, providerKind, lenses);
+          publicationBody = publicationBodyFor(readFileSync(reportFile, 'utf8'), review, providerKind, lenses, frozenReview.evidence.ci);
         } catch (overflow) {
           if (!(overflow instanceof Error) || !overflow.message.includes('exceeds the provider review-body limit')) throw overflow;
           writeReviewArtifact(frozenReview, 'perkins-report.publication-overflow.json', {
@@ -3982,6 +4104,35 @@ export class WaveRunner {
     }
   }
 
+  /** Honest per-lens outcomes for a round ended by a PARENT failure
+   * (workflow exception, shutdown, finalization crash — gh-169): a lens
+   * with a started attempt is an execution error naming the parent
+   * cause; a never-started lens is `not started — parent incident`,
+   * never a failed specialist execution. The note carries the truth the
+   * two-state `ReviewLensResult` union cannot. */
+  private interruptedLensResults(
+    round: RoundRecord,
+    lenses: readonly PerkinsLens[],
+    detail: string,
+  ): ReviewLensResult[] {
+    const started = this.startedSpecialistLenses(round.id);
+    return lenses.map((lens) => started.has(lens)
+      ? { state: 'error' as const, note: `attempt started; interrupted by parent failure: ${detail}`.slice(0, 500) }
+      : { state: 'error' as const, note: `not started — parent incident: ${detail}`.slice(0, 500) });
+  }
+
+  /** One bounded, report-visible execution-facts line for interrupted
+   * rounds: how many specialist attempts actually started and which
+   * lenses never executed. The durable INCOMPLETE report carries it so a
+   * reader can never mistake a parent abort for specialist failures. */
+  private interruptedExecutionFacts(roundId: string, lenses: readonly PerkinsLens[]): string {
+    const started = this.startedSpecialistLenses(roundId);
+    const attempts = this.opts.ledger.listRoundSpecialistStarts(roundId).length;
+    const startedLenses = lenses.filter((lens) => started.has(lens));
+    const notStarted = lenses.filter((lens) => !started.has(lens));
+    return `Specialist execution at abort: ${attempts} attempt(s) started (${startedLenses.length} of ${lenses.length} lenses: ${startedLenses.join(', ') || 'none'}); ${notStarted.length} lens(es) never started (${notStarted.join(', ') || 'none'}).`;
+  }
+
   private finalizationIncomplete(
     job: { readonly id: string },
     round: RoundRecord,
@@ -3998,11 +4149,23 @@ export class WaveRunner {
       });
     }
     const reportFile = join(frozenReview.directory, 'perkins-report.finalization-incomplete.md');
+    const executionFacts = this.interruptedExecutionFacts(round.id, lenses);
     try {
       if (!existsSync(reportFile)) {
         writeFileSync(
           reportFile,
-          `# Perkins Code Review\n\n**Verdict: INCOMPLETE**\n\n${detail}\n`,
+          [
+            '# Perkins Code Review',
+            '',
+            '**Verdict: INCOMPLETE**',
+            '',
+            detail,
+            '',
+            '**Parent incident** — finalization ended the round; this is one parent incident, not a per-lens specialist failure.',
+            '',
+            executionFacts,
+            '',
+          ].join('\n'),
           { encoding: 'utf8', mode: 0o600, flag: 'wx' },
         );
       }
@@ -4016,14 +4179,14 @@ export class WaveRunner {
         kind: 'round.perkins-incomplete',
         jobId: job.id,
         roundId: round.id,
-        payload: { reason: 'finalization_error', error: detail, reportFile },
+        payload: { reason: 'finalization_error', error: detail, reportFile, executionFacts },
       });
     } catch (ledgerError) {
       this.log('error', 'could not persist finalization INCOMPLETE event', {
         round: round.id, error: String(ledgerError),
       });
     }
-    this.opts.escalate?.(`Review round ${round.id} is INCOMPLETE`, detail, { jobId: job.id, roundId: round.id });
+    this.opts.escalate?.(`Review round ${round.id} is INCOMPLETE`, `${detail}\n${executionFacts}`, { jobId: job.id, roundId: round.id });
     let moved = true;
     try {
       moved = refMovedSinceFreeze(frozenReview);
@@ -4032,7 +4195,7 @@ export class WaveRunner {
     }
     return {
       round: this.opts.ledger.getRound(round.id) ?? { ...round, status: 'aborted' },
-      results: lenses.map(() => ({ state: 'error' as const, note: detail })),
+      results: this.interruptedLensResults(round, lenses, detail),
       verdict: null,
       posted: false,
       canonicalVerdict: 'INCOMPLETE',

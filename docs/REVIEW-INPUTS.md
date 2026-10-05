@@ -173,10 +173,36 @@ Every frozen round records:
   `UNAVAILABLE`/`NOT-MATCHED` when nothing binds.
 - A `round.review-inputs-frozen` ledger event with the same hashes/provenance
   (no pixels, no upload paths).
+- A `round.admission-preflight` ledger event (gh-169): the read-only gate
+  that ran after the freeze and BEFORE any lead or child spawn. Its payload
+  carries `ok`, the complete check list, and on refusal the exhaustive named
+  missing inputs (`head-binding`, `frozen-packet:<file>`, `spec-context`,
+  `verification-evidence`, `ci-evidence`, `evidence:<id>`). A refused round
+  aborts without spawn and escalates naming every missing input; fully
+  accessible material passes and the packet stays frozen head-bound. Missing
+  evidence never refuses admission by itself: an explicit UNAVAILABLE CI
+  record is a PASS at preflight (its missing-vs-failed distinction is a
+  display/report duty — see §2); only inaccessible, corrupt or unbound
+  material refuses. The preflight is read-only: packet bytes are never
+  mutated by admission, display or recovery code.
 
 The frozen `spec-context.md`, `manifest.json` and `evidence/receipt.json` are
 host files under `<data_dir>/reviews/<round>/`; there is no public read
 endpoint for them — operators inspect them on the host.
+
+**Verification absence is explicit (gh-169).** A supplied-spec round with no
+completed scheduler verification run bound to the frozen target freezes an
+`UNAVAILABLE — NO BOUND VERIFICATION RUN` section beside the spec (the same
+ledger-backed, untrusted-evidence framing as a real run) — never silence. A
+spec with no room for that disclosure refuses the freeze. Explicit no-spec
+rounds keep their mode and are exempt from the section check.
+
+**Published reports carry the frozen CI state.** The host appendix of a
+published review states the frozen CI evidence distinctly — `GREEN`,
+`PENDING — NOT PASS`, `FAILED — NOT PASS`, `UNAVAILABLE — NO BOUND CI
+RECEIPT (missing evidence, not a measured failure)`, or `NOT-MATCHED` —
+derived only from the frozen manifest record, so missing evidence can never
+read as a CI failure (and a measured failure is never softened).
 
 ## 5. Activating a previously blocked PR (owner-controlled, later)
 

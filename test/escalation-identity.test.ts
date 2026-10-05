@@ -221,6 +221,7 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       ['`bmad-review gate PASS for job ${job.id} — review/fix routing cleared (not a Perkins READY; merge stays user-held)`', '{ jobId: job.id }'],
       ['`bmad-review gate BLOCKED for job ${jobId}`', '{ jobId }'],
       ['`bmad-review gate ABORTED for job ${jobId}`', '{ jobId }'],
+      ['`Perkins review for job ${job.id} refused admission before any specialist started`', '{ jobId: job.id, roundId: round.id }'],
       ['`Perkins review for job ${input.job.id} was blocked before any round: the PR head could not be verified`', '{ jobId: input.job.id }'],
       ['`Review round ${round.id} disposal failed after completion`', '{ jobId: job.id, roundId: round.id }'],
       ['`Review round ${round.id} is INCOMPLETE`', '{ jobId: job.id, roundId: round.id }'],
@@ -234,7 +235,7 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       ['`Review worktree for round ${worktreeId} could not be swept`', null],
     ];
     expect(sites.map((site) => [site.title, site.context])).toEqual(expected);
-    expect(sites).toHaveLength(25);
-    expect(sites.filter((site) => site.context !== null)).toHaveLength(22);
+    expect(sites).toHaveLength(26);
+    expect(sites.filter((site) => site.context !== null)).toHaveLength(23);
   });
 });

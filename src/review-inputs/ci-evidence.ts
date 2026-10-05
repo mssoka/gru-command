@@ -21,7 +21,8 @@ import type { EventRecord } from '../ledger/api.js';
  *    never a pass and never a fabricated measured failure.
  */
 
-export type CiEvidenceState = 'green' | 'pending' | 'failed' | 'unavailable' | 'not-matched';
+export const CI_EVIDENCE_STATES = ['green', 'pending', 'failed', 'unavailable', 'not-matched'] as const;
+export type CiEvidenceState = (typeof CI_EVIDENCE_STATES)[number];
 
 export interface CiEvidenceCheck {
   readonly name: string;

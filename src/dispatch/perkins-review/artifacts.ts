@@ -505,11 +505,45 @@ function baseMovementSinceFreeze(review: FrozenReview): SourceMovement | null {
 }
 
 /** The configured-remote branch a movement ref names, or null when the ref
- * is not a remote-tracking ref (a SHA, a tag, or a local branch whose
- * leading segment is not a configured remote — a local `feature/x` is NOT
- * `remote feature`). */
+ * is not a remote-tracking branch spelling (a SHA, a tag, a revision
+ * expression like origin/topic~1, or a local branch whose leading segment
+ * is not a configured remote — a local `feature/x` is NOT
+ * `remote feature`).
+ *
+ * gh-169: the advertised-tip comparison applies ONLY to refs that resolve
+ * to refs/remotes/<remote>/<branch>. A revision expression (origin/topic~1)
+ * is not that branch spelling — probing refs/heads/<branch-with-operators>
+ * exits 2 and poisoned every pin round as `check-failed` movement; a tag
+ * like origin/v1 resolves to refs/tags/… and never names an advertised
+ * branch. Both now correctly skip this check; their pins still bind through
+ * the local resolution and pristine-checkout proofs. */
 function advertisedRemoteBranch(repoPath: string, ref: string): { remote: string; branch: string } | null {
-  const remoteRef = ref.startsWith('refs/remotes/') ? ref.slice('refs/remotes/'.length) : ref;
+  let remoteRef: string;
+  if (ref.startsWith('refs/remotes/')) {
+    remoteRef = ref.slice('refs/remotes/'.length);
+  } else {
+    // Fully-qualified non-tracking refs (tags, heads) are exact and never
+    // advertised-branch spellings.
+    if (ref.startsWith('refs/')) return null;
+    // A valid branch spelling only: revision operators (~ ^ : .. @{}) make
+    // the ref an EXPRESSION, not the branch itself.
+    try {
+      gitRaw(repoPath, ['check-ref-format', '--branch', ref]);
+    } catch {
+      return null;
+    }
+    // The ref must actually RESOLVE to a remote-tracking ref — a tag whose
+    // name carries a slash (origin/v1) resolves to refs/tags/origin/v1 and
+    // never names an advertised branch.
+    let fullName: string;
+    try {
+      fullName = git(repoPath, ['rev-parse', '--symbolic-full-name', '--verify', ref]);
+    } catch {
+      return null;
+    }
+    if (!fullName.startsWith('refs/remotes/')) return null;
+    remoteRef = fullName.slice('refs/remotes/'.length);
+  }
   const slash = remoteRef.indexOf('/');
   if (slash <= 0 || slash === remoteRef.length - 1) return null;
   const remote = remoteRef.slice(0, slash);

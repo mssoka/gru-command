@@ -112,9 +112,17 @@ describe('recorded verification evidence', () => {
     const combined = appendRecordedVerification({ spec, evidence });
     expect(combined).toBe(`${spec}\n\n${evidence}`);
     expect(combined.startsWith(spec)).toBe(true);
-    // Unchanged when no evidence binds.
-    expect(appendRecordedVerification({ spec, evidence: null })).toBe(spec);
-    // A spec at the frozen bound swallows the block (loud log, never a throw).
+    // gh-169: no binding run is EXPLICIT — the UNAVAILABLE disclosure
+    // freezes beside the spec instead of silence, still prefixed by the
+    // original spec bytes (the acceptance hash binds that prefix).
+    const absence = appendRecordedVerification({ spec, evidence: null });
+    expect(absence.startsWith(spec)).toBe(true);
+    expect(absence).toContain('--- HOST-RECORDED VERIFICATION');
+    expect(absence).toContain('state: UNAVAILABLE — NO BOUND VERIFICATION RUN');
+    expect(absence).toContain('not a pass and not a measured failure');
+    // A spec at the frozen bound swallows a REAL block (loud log, never a
+    // throw) — but the absence disclosure itself cannot be swallowed: a
+    // spec with no room for it refuses the freeze (no silent packet).
     const logs: string[] = [];
     const huge = 'x'.repeat(FROZEN_SPEC_MAX_BYTES - 10);
     const skipped = appendRecordedVerification({
@@ -125,5 +133,8 @@ describe('recorded verification evidence', () => {
     expect(skipped).toBe(huge);
     expect(logs).toHaveLength(1);
     expect(logs[0]).toContain('frozen spec bound exceeded');
+    expect(() => appendRecordedVerification({ spec: huge, evidence: null })).toThrow(
+      /no room for the verification-absence disclosure/u,
+    );
   });
 });

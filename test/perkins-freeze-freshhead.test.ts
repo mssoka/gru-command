@@ -818,6 +818,17 @@ describe('freeze-time integration on PR rounds', () => {
     ) as { readonly targetSha: string; readonly targetRef: string };
     expect(manifest.targetSha).toBe(ancestor);
     expect(manifest.targetRef).toBe('origin/feature/lane~1');
+    // gh-169: a revision-expression pin is not a branch spelling — the
+    // advertised-branch probe must not false-alarm it into check-failed
+    // movement. The round passes admission preflight and finalizes without
+    // ANY head-movement record (previously the poisoned probe forced
+    // headMoved with cause check-failed; the verdict stays withheld only
+    // because this fixture arms a PR link with no poster).
+    expect(outcome.headMoved).toBe(false);
+    const events = ledger.listEvents({ limit: 200 });
+    expect(events.some((event) => event.kind === 'round.head-moved')).toBe(false);
+    const preflight = events.find((event) => event.kind === 'round.admission-preflight');
+    expect(preflight?.payload).toMatchObject({ ok: true });
   });
 
   it('an origin-prefixed REVISION PIN (origin/feature/lane~1) on a non-PR round resolves the named ancestor — no literal branch fetch (Perkins R4)', async () => {

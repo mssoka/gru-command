@@ -407,6 +407,8 @@ function headMovedSinceFreeze(review: FrozenReview, movementRef: string): Source
   }
 }
 
+export { headMovedSinceFreeze };
+
 function record(value: unknown, name: string): Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new Error(`${name} must be an object`);
   return value as Record<string, unknown>;

@@ -724,6 +724,134 @@ describe('WaveRunner built-in Perkins production path', () => {
     rmSync(sessions, { recursive: true, force: true });
   });
 
+  it('records ONE parent incident and zero executed specialist failures when the lead transport dies before any child (gh-169)', async () => {
+    const repo = makeFixtureRepo('perkins-lead-connection-error');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/lead-connection-error']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-lead-conn-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-lead-conn-artifacts-'));
+    const sessions = mkdtempSync(join(tmpdir(), 'perkins-lead-conn-sessions-'));
+    dirs.push(sessions);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-lead-conn-db-')));
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/lead-connection-error', target);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-lead-conn' });
+    const job = ledger.addJob({ id: 'job-lead-conn', repo: 'fixture', title: 'lead connection error', baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/41');
+    attachOrigin(repo, 'feature/lead-connection-error', root);
+    let spawned = 0;
+    const spawner: AgentSpawner = async (_role, _options = {}) => {
+      spawned += 1;
+      const sessionFile = join(sessions, `conn-lead-${spawned}.jsonl`);
+      writeFileSync(sessionFile, '', 'utf8');
+      return {
+        role: 'perkins', id: `conn-lead-${spawned}`, sessionFile, reviewIsolation: true,
+        capabilities: {
+          streaming: true, steer: 'native', resume: 'file', images: false,
+          thinking: false, thinkingLevelControl: false, followUp: false,
+        },
+        // The lead transport dies on its FIRST turn — before any specialist
+        // child exists. This is the display evidence that motivated gh-169.
+        async prompt() { throw new Error('Connection error'); },
+        async steer() {}, async followUp() {}, subscribe() { return () => {}; },
+        health() { return { state: 'streaming', lastActivity: null, sessionFile }; },
+        async dispose() {},
+      };
+    };
+    const escalations: string[] = [];
+    const wave = new WaveRunner({
+      ledger, worktrees: port, spawner, reviewArtifactRoot: artifacts,
+      prHeadProbe: localHeadProbe('feature/lead-connection-error'),
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+    });
+    const outcome = asWave(await wave.runRound({ jobId: job.id }));
+    expect(outcome.canonicalVerdict).toBe('INCOMPLETE');
+    expect(outcome.round.status).toBe('aborted');
+    // Only the lead ever spawned: zero specialist children existed.
+    expect(spawned).toBe(1);
+    // Counter truth: every lens stays pending (not started) — the round is
+    // ONE parent incident, not a nine-chip slate of failed specialists.
+    const chips = ledger.getRound(outcome.round.id)?.lenses ?? [];
+    expect(chips).toHaveLength(9);
+    expect(chips.every((chip) => chip.state === 'pending')).toBe(true);
+    const incidents = ledger.listEvents({ limit: 300 }).filter((event) => event.kind === 'round.parent-incident');
+    expect(incidents).toHaveLength(1);
+    expect(incidents[0]?.payload).toMatchObject({ startedAttempts: 0, startedLenses: [] });
+    expect((incidents[0]?.payload as { readonly notStartedLenses?: readonly string[] }).notStartedLenses).toHaveLength(9);
+    // The wave outcome and the durable report carry the same honesty: no
+    // lens is a failed execution; the report states the execution facts.
+    expect(outcome.results.every((result) => result.state === 'error' && result.note.startsWith('not started — parent incident'))).toBe(true);
+    const report = readFileSync(join(artifacts, outcome.round.id, 'perkins-report.md'), 'utf8');
+    expect(report).toContain('**Parent incident**');
+    expect(report).toContain('0 attempt(s) started');
+    expect(report).toContain('9 lens(es) never started');
+    expect(report).toContain('Connection error');
+    expect(escalations.some((entry) => entry.includes('INCOMPLETE') && entry.includes('0 attempt(s) started'))).toBe(true);
+    expect(port.getWorktree(outcome.round.id)?.status).toBe('swept');
+    rmSync(root, { recursive: true, force: true });
+    rmSync(artifacts, { recursive: true, force: true });
+    rmSync(sessions, { recursive: true, force: true });
+  });
+
+  it('keeps a started lens an honest error while never-started lenses stay pending when the parent aborts after one child (gh-169)', async () => {
+    const repo = makeFixtureRepo('perkins-parent-after-child');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/parent-after-child']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-pac-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-pac-artifacts-'));
+    const sessions = mkdtempSync(join(tmpdir(), 'perkins-pac-sessions-'));
+    dirs.push(root, artifacts, sessions);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-pac-db-')));
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/parent-after-child', target);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-pac' });
+    const job = ledger.addJob({ id: 'job-pac', repo: 'fixture', title: 'parent after child', baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/42');
+    attachOrigin(repo, 'feature/parent-after-child', root);
+    // One security specialist completes its run (a charged, journaled
+    // start); the lead then never submits, so the round dies as a parent
+    // failure AFTER real child work existed.
+    const fake = fakeWholeSpawner(sessions, {
+      specialists: ['security'],
+      childAnswer: () => '[]',
+      neverSubmit: true,
+    });
+    const wave = new WaveRunner({
+      ledger, worktrees: port, spawner: fake.spawner, reviewArtifactRoot: artifacts,
+      prHeadProbe: localHeadProbe('feature/parent-after-child'),
+    });
+    const outcome = asWave(await wave.runRound({ jobId: job.id }));
+    expect(outcome.canonicalVerdict).toBe('INCOMPLETE');
+    expect(outcome.round.status).toBe('aborted');
+    const chips = ledger.getRound(outcome.round.id)?.lenses ?? [];
+    const security = chips.find((chip) => chip.lens === 'security');
+    expect(security?.state).toBe('error');
+    expect(security?.note).toContain('interrupted by parent abort');
+    // Every other lens never started: pending, not error.
+    for (const chip of chips.filter((entry) => entry.lens !== 'security')) {
+      expect(chip.state, chip.lens).toBe('pending');
+    }
+    const incident = ledger.listEvents({ limit: 300 }).find((event) => event.kind === 'round.parent-incident');
+    expect(incident?.payload).toMatchObject({ startedAttempts: 1, startedLenses: ['security'] });
+    // The started lens maps to an interrupted-execution error; the rest are
+    // not-started parent-incident outcomes.
+    const securityResult = outcome.results[chips.findIndex((chip) => chip.lens === 'security')];
+    expect(securityResult?.state).toBe('error');
+    expect(securityResult?.state === 'error' && securityResult.note).toContain('attempt started; interrupted by parent failure');
+    expect(outcome.results.filter((result) => result.state === 'error' && result.note.startsWith('not started — parent incident'))).toHaveLength(8);
+    const report = readFileSync(join(artifacts, outcome.round.id, 'perkins-report.md'), 'utf8');
+    expect(report).toContain('1 attempt(s) started (1 of 9 lenses: security)');
+    expect(report).toContain('8 lens(es) never started');
+  });
+
   it('reconciles an interrupted live round as durable INCOMPLETE before startup continues', async () => {
     const repo = makeFixtureRepo('perkins-wave-restart');
     repos.push(repo);
@@ -757,7 +885,20 @@ describe('WaveRunner built-in Perkins production path', () => {
     });
     expect(await wave.recoverInterruptedRounds()).toBe(1);
     expect(ledger.getRound(round.id)?.status).toBe('aborted');
-    expect(ledger.getRound(round.id)?.lenses.every((chip) => chip.state === 'error')).toBe(true);
+    // gh-169 counter truth: the live lens (a started child) records an
+    // honest execution error; the never-started lens stays pending — one
+    // parent incident is not a two-chip slate of failed specialists. The
+    // single round.parent-incident event carries the started/not-started
+    // facts (startedAttempts 0 here: no specialist start was journaled,
+    // only the chip went live).
+    const chips = ledger.getRound(round.id)?.lenses ?? [];
+    expect(chips.find((chip) => chip.lens === 'blind')?.state).toBe('error');
+    expect(chips.find((chip) => chip.lens === 'blind')?.note).toContain('interrupted by parent abort');
+    expect(chips.find((chip) => chip.lens === 'security')?.state).toBe('pending');
+    const incident = ledger.listEvents({ limit: 200 }).find((event) => event.kind === 'round.parent-incident' && event.roundId === round.id);
+    expect(incident?.payload).toMatchObject({ startedAttempts: 0 });
+    expect((incident?.payload as { readonly notStartedLenses?: readonly string[] }).notStartedLenses)
+      .toEqual(expect.arrayContaining(['blind', 'security']));
     expect(port.getWorktree(round.id)?.status).toBe('swept');
     expect(existsSync(join(artifacts, round.id, 'restart-recovery.json'))).toBe(true);
     expect(existsSync(join(artifacts, round.id, 'perkins-report.md'))).toBe(true);
@@ -812,7 +953,12 @@ describe('WaveRunner built-in Perkins production path', () => {
     const wave = new WaveRunner({ ledger, worktrees: port, spawner: vi.fn() as unknown as AgentSpawner, reviewArtifactRoot: artifacts });
     expect(await wave.recoverInterruptedRounds()).toBe(1);
     expect(ledger.getRound(round.id)?.status).toBe('aborted');
-    expect(ledger.getRound(round.id)?.lenses.every((chip) => chip.state === 'error')).toBe(true);
+    // gh-169: a pending round with zero children aborts as ONE parent
+    // incident — every lens stays pending (not-started), none is error.
+    const abortedChips = ledger.getRound(round.id)?.lenses ?? [];
+    expect(abortedChips.every((chip) => chip.state === 'pending')).toBe(true);
+    const pendingIncident = ledger.listEvents({ limit: 200 }).find((event) => event.kind === 'round.parent-incident' && event.roundId === round.id);
+    expect(pendingIncident?.payload).toMatchObject({ startedAttempts: 0, startedLenses: [] });
     expect(existsSync(join(artifacts, round.id, 'restart-recovery.json'))).toBe(true);
   });
 
@@ -2031,6 +2177,25 @@ describe('WaveRunner built-in Perkins production path', () => {
     const events = ledger.listEvents({ limit: 200 });
     expect(events.some((event) => event.kind === 'round.perkins-review')).toBe(true);
     expect(events.some((event) => event.kind === 'round.head-moved')).toBe(false);
+    // Admission preflight (gh-169): the pass is recorded with its complete
+    // check list BEFORE any child starts, after the freeze receipts.
+    const admissionEvent = events.find((event) => event.kind === 'round.admission-preflight');
+    expect(admissionEvent?.roundId).toBe(outcome.round.id);
+    expect(admissionEvent?.payload).toMatchObject({ ok: true });
+    const checkNames = ((admissionEvent?.payload as { readonly checks?: Array<{ readonly name: string }> }).checks ?? []).map((check) => check.name);
+    for (const expected of ['head-binding', 'frozen-packet:manifest.json', 'verification-evidence', 'ci-evidence']) {
+      expect(checkNames, expected).toContain(expected);
+    }
+    const freezeReceipt = events.find((event) => event.kind === 'round.freeze-manifest');
+    const firstStart = events.find((event) => event.kind === 'round.specialist-started');
+    expect(freezeReceipt?.seq).toBeDefined();
+    expect(admissionEvent!.seq).toBeGreaterThan(freezeReceipt!.seq);
+    if (firstStart !== undefined) expect(admissionEvent!.seq).toBeLessThan(firstStart.seq);
+    // The frozen spec carried the explicit verification-absence disclosure
+    // (this job recorded no verification run) — never silence.
+    const frozenSpec = readFileSync(join(artifacts, outcome.round.id, 'spec-context.md'), 'utf8');
+    expect(frozenSpec).toContain('state: UNAVAILABLE — NO BOUND VERIFICATION RUN');
+    expect(frozenSpec).toContain('--- HOST-RECORDED CI EVIDENCE');
     rmSync(root, { recursive: true, force: true });
     rmSync(artifacts, { recursive: true, force: true });
     rmSync(sessions, { recursive: true, force: true });
@@ -5279,6 +5444,55 @@ describe('repair pass 3: host disclosure completeness, safety, and provider trut
     // The two accounting causes never collapse into one another: the lens
     // failure is not restated as a budget refusal and vice versa.
     expect(appendix).not.toContain('acceptance ×2 — the lead judged the change on its own whole-change verification: refused by');
+  });
+
+  it('states started/valid/failed attempt totals as one counter line (gh-169)', () => {
+    const review = {
+      findings: [],
+      specialistRuns: [
+        { lens: 'blind', status: 'valid' },
+        { lens: 'edge', status: 'valid' },
+        { lens: 'edge', status: 'failed' },
+        { lens: 'security', status: 'invalid' },
+      ],
+      priorDispositions: [],
+    };
+    const appendix = hostDisclosureAppendix(review, 'github', [...PERKINS_LENSES]);
+    expect(appendix).toContain('- Specialist attempts started: 4 (2 valid, 2 failed) across 3 of 9 available lenses');
+  });
+
+  it('publishes the frozen CI evidence state distinctly: missing is never a measured failure (gh-169)', () => {
+    const review = { findings: [], specialistRuns: [], priorDispositions: [] };
+    const failed = hostDisclosureAppendix(review, 'github', [...PERKINS_LENSES], {
+      state: 'failed', repo: 'acme/fixture', pr: 7, sha: 'a'.repeat(40), observedAt: '2026-10-05T01:02:03Z',
+      sourceKind: 'github.ci-failed', sourceSeq: 10, checks: [],
+      failures: [{ name: 'unit-tests', conclusion: 'failure', url: null }], reason: null,
+    });
+    expect(failed).toContain('- CI evidence at freeze: FAILED — NOT PASS (1 failing check(s): unit-tests)');
+    expect(failed).not.toContain('UNAVAILABLE');
+    const unavailable = hostDisclosureAppendix(review, 'github', [...PERKINS_LENSES], {
+      state: 'unavailable', repo: null, pr: null, sha: null, observedAt: null,
+      sourceKind: null, sourceSeq: null, checks: [], failures: [],
+      reason: 'no CI observation is recorded for this job (the GitHub poll has never observed a check run here)',
+    });
+    expect(unavailable).toContain('- CI evidence at freeze: UNAVAILABLE — NO BOUND CI RECEIPT (missing evidence, not a measured failure)');
+    expect(unavailable).not.toContain('FAILED');
+    const notMatched = hostDisclosureAppendix(review, 'github', [...PERKINS_LENSES], {
+      state: 'not-matched', repo: 'other/repo', pr: 8, sha: 'a'.repeat(40), observedAt: '2026-10-05T01:02:03Z',
+      sourceKind: 'github.branch-state', sourceSeq: 11, checks: [], failures: [],
+      reason: 'the recorded observation at the target sha belongs to repository other/repo, not acme/fixture',
+    });
+    expect(notMatched).toContain('- CI evidence at freeze: NOT-MATCHED — the recorded observation cannot certify this review target (missing evidence, not a measured failure)');
+    const green = hostDisclosureAppendix(review, 'github', [...PERKINS_LENSES], {
+      state: 'green', repo: 'acme/fixture', pr: 7, sha: 'a'.repeat(40), observedAt: '2026-10-05T01:02:03Z',
+      sourceKind: 'github.ci-green', sourceSeq: 12,
+      checks: [{ name: 'unit-tests', url: null }, { name: 'lint', url: null }], failures: [], reason: null,
+    });
+    expect(green).toContain('- CI evidence at freeze: GREEN (recorded observation, 2 check(s))');
+    // A round with no frozen CI record says so explicitly — it never
+    // guesses and never fabricates a state.
+    const unrecorded = hostDisclosureAppendix(review, 'github', [...PERKINS_LENSES]);
+    expect(unrecorded).toContain('- CI evidence at freeze: NOT RECORDED — this round predates the frozen CI-record disclosure');
   });
 });
 
