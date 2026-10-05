@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, cpSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createConnection } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -8,6 +8,9 @@ import { pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   assertFrozenPromptBounds,
+  compatibleReviewIdentity,
+  proveRecoveredBaseMergeability,
+  readBoundedCheckpointDescriptor,
   freezeReviewInputs,
   FROZEN_DIFF_MAX_BYTES,
   FROZEN_SPEC_MAX_BYTES,
@@ -15,6 +18,8 @@ import {
   readReviewArtifact,
   resolveReviewBaseRef,
   reviewArtifactDirectory,
+  readReviewCheckpoint,
+  readReviewCheckpointBytes,
   writeReviewArtifact,
   type FrozenReview,
 } from '../src/dispatch/perkins-review/artifacts.js';
@@ -27,6 +32,7 @@ import { attachBareOrigin, makeFixtureRepo, type FixtureRepo } from './helpers/f
 import { PacingGate, type PacingAcquireInput, type PacingLease } from '../src/runtime/pacing.js';
 import { fakeWholeSpawner, groundedFinding, type WholeLeadOptions, type WholeSpawnCall } from './helpers/perkins-whole-double.js';
 import type { NativeAgentTool } from '../src/runtime/types.js';
+import { minimalPng } from './helpers/images.js';
 
 const repos: FixtureRepo[] = [];
 const temporaryDirectories: string[] = [];
@@ -171,6 +177,484 @@ function expectBaseAdvanceAccepted(h: WholeHarness, result: PerkinsWholeResult):
   expect(consolidated.frozen).toMatchObject(frozenProvenance);
   expect(JSON.parse(readFileSync(join(h.frozen.directory, 'manifest.json'), 'utf8'))).toMatchObject(frozenProvenance);
 }
+
+const recoveryIdentity = {
+  jobId: 'job-selective', policySha256: PERKINS_POLICY_SHA256,
+  runtimeId: 'pi', runtimeVersion: 'runtime-fixture-v1', modelRef: 'fixture-model-v1',
+  modelRole: 'perkins', modelSettingsSha256: 'model-settings-fixture-v1',
+};
+
+describe('selective recovery identity and write-once checkpoints', () => {
+  it('credits a proven base-only fast-forward but refuses rewrites, changed merge-bases, targets and inputs', () => {
+    const { repo, base, target } = makeReviewRepo('recovery-base-fast-forward');
+    repos.push(repo);
+    const root = temp('recovery-base-fast-forward-');
+    const freeze = (roundId: string, spec = 'review', targetRef = target) => freezeReviewInputs({
+      roundId, repoPath: repo.path, artifactRoot: root, baseRef: 'main', targetRef,
+      spec, recoveryIdentity,
+    });
+    const prior = freeze('prior');
+    const advancedBase = advanceBranch(repo, 'main');
+    const advanced = freeze('advanced');
+    expect(prior.manifest.baseRefSha).toBe(base);
+    expect(advanced.manifest.baseRefSha).toBe(advancedBase);
+    expect(advanced.manifest.diffBaseSha).toBe(base);
+    expect(compatibleReviewIdentity(advanced, prior.directory)).toBe(true);
+    expect(() => proveRecoveredBaseMergeability(advanced, [base])).not.toThrow();
+    expect(compatibleReviewIdentity(freeze('changed-input', 'different spec'), prior.directory)).toBe(false);
+    const nextTarget = repo.commitFile('src/other.ts', 'export const other = true;\n');
+    expect(compatibleReviewIdentity(freeze('changed-target', 'review', nextTarget), prior.directory)).toBe(false);
+    // A fast-forward onto a commit shared with the feature changes the
+    // merge-base even though the symbolic base tip remains an ancestor.
+    const shared = repo.git(['rev-parse', `${target}^`]);
+    repo.git(['update-ref', 'refs/heads/main', target]);
+    expect(shared).toBe(base);
+    const changedMergeBase = freeze('changed-merge-base', 'review', nextTarget);
+    expect(changedMergeBase.manifest.diffBaseSha).toBe(target);
+    expect(compatibleReviewIdentity(changedMergeBase, prior.directory)).toBe(false);
+    // A diverged/replaced tip cannot supply ancestry credit even if its
+    // resulting diff has the same original merge-base.
+    repo.git(['update-ref', 'refs/heads/main', base]);
+    const rewrittenBase = repo.git([
+      '-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid',
+      'commit-tree', `${base}^{tree}`, '-p', base, '-m', 'different base lineage',
+    ]);
+    repo.git(['update-ref', 'refs/heads/main', rewrittenBase]);
+    expect(rewrittenBase).not.toBe(advancedBase);
+    expect(compatibleReviewIdentity(freeze('rewritten'), advanced.directory)).toBe(false);
+    expect(() => proveRecoveredBaseMergeability(freeze('rewritten-proof'), [advancedBase])).toThrow();
+  });
+
+  it('refuses base-advanced credit on a conflict or a moved base during merge proof', () => {
+    const { repo, base, target } = makeReviewRepo('recovery-base-conflict');
+    repos.push(repo);
+    const root = temp('recovery-base-conflict-');
+    repo.git(['checkout', 'main']);
+    repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 99;\n}\n');
+    repo.git(['checkout', 'feature/review']);
+    const conflicted = freezeReviewInputs({
+      roundId: 'conflict', repoPath: repo.path, artifactRoot: root, baseRef: 'main',
+      targetRef: target, spec: 'review', recoveryIdentity,
+    });
+    expect(conflicted.manifest.diffBaseSha).toBe(base);
+    expect(() => proveRecoveredBaseMergeability(conflicted, [base])).toThrow();
+    const previousBase = conflicted.manifest.baseRefSha;
+    advanceBranch(repo, 'main');
+    expect(() => proveRecoveredBaseMergeability(conflicted, [base])).toThrow(/moved/);
+    expect(repo.git(['rev-parse', 'main'])).not.toBe(previousBase);
+  });
+  it('rejects missing, changed and tampered identity/source bytes', () => {
+    const { repo, base, target } = makeReviewRepo('recovery-identity');
+    repos.push(repo);
+    const root = temp('recovery-identity-');
+    const freeze = (roundId: string, identity = recoveryIdentity) => freezeReviewInputs({
+      roundId, repoPath: repo.path, artifactRoot: root, baseRef: base, targetRef: target,
+      spec: 'review', recoveryIdentity: identity,
+    });
+    const prior = freeze('prior');
+    const fresh = freeze('fresh');
+    expect(compatibleReviewIdentity(fresh, prior.directory)).toBe(true);
+    const linkedRoot = join(root, 'redirected-artifacts');
+    symlinkSync(root, linkedRoot);
+    expect(() => readReviewCheckpoint(join(linkedRoot, 'prior'), 'manifest.json'))
+      .toThrow();
+    const nested = join(root, 'nested');
+    mkdirSync(nested);
+    const redirected = join(nested, 'redirect');
+    symlinkSync(prior.directory, redirected, 'dir');
+    expect(() => readReviewCheckpoint(nested, 'redirect/manifest.json')).toThrow();
+    const swappable = join(root, 'swappable');
+    mkdirSync(swappable);
+    cpSync(join(prior.directory, 'manifest.json'), join(swappable, 'manifest.json'));
+    expect(readReviewCheckpoint(swappable, 'manifest.json')).toContain('"roundId": "prior"');
+    renameSync(swappable, `${swappable}-old`);
+    symlinkSync(prior.directory, swappable, 'dir');
+    expect(() => readReviewCheckpoint(swappable, 'manifest.json')).toThrow();
+    expect(() => readReviewCheckpoint(prior.directory, 'manifest.json', 3)).toThrow(/bounded regular file/);
+    for (const [index, mutation] of [
+      { modelRef: 'other-model' }, { modelSettingsSha256: 'other-settings' },
+      { runtimeVersion: 'other-runtime' }, { runtimeId: 'claude-code' },
+      { policySha256: 'other-policy' }, { jobId: 'other-job' },
+    ].entries()) {
+      expect(compatibleReviewIdentity(freeze(`changed-${index}`, { ...recoveryIdentity, ...mutation }), prior.directory)).toBe(false);
+    }
+    expect(compatibleReviewIdentity(freezeReviewInputs({
+      roundId: 'other-spec', repoPath: repo.path, artifactRoot: root, baseRef: base, targetRef: target,
+      spec: 'different spec', recoveryIdentity,
+    }), prior.directory)).toBe(false);
+    expect(compatibleReviewIdentity(freezeReviewInputs({
+      roundId: 'legacy', repoPath: repo.path, artifactRoot: root, baseRef: base, targetRef: target, spec: 'review',
+    }), prior.directory)).toBe(false);
+    const manifestFile = join(prior.directory, 'manifest.json');
+    const originalManifest = readFileSync(manifestFile);
+    const originalReceipt = createHash('sha256').update(originalManifest).digest('hex');
+    writeFileSync(manifestFile, Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), originalManifest]));
+    expect(compatibleReviewIdentity(fresh, prior.directory, originalReceipt)).toBe(false);
+    writeFileSync(manifestFile, originalManifest);
+    const changedFilesFile = join(prior.directory, 'changed-files.json');
+    const originalChanged = readFileSync(changedFilesFile);
+    writeFileSync(changedFilesFile, ` ${originalChanged.toString('utf8')}`);
+    expect(compatibleReviewIdentity(fresh, prior.directory)).toBe(false);
+    writeFileSync(changedFilesFile, originalChanged);
+    writeFileSync(join(prior.directory, 'spec-context.md'), 'tampered\n');
+    expect(compatibleReviewIdentity(fresh, prior.directory)).toBe(false);
+    const changedTarget = repo.commitFile('assets/data.json', '{"new":true}\n');
+    const moved = freezeReviewInputs({
+      roundId: 'asset-change', repoPath: repo.path, artifactRoot: root, baseRef: base,
+      targetRef: changedTarget, spec: 'review', recoveryIdentity,
+    });
+    expect(compatibleReviewIdentity(moved, prior.directory)).toBe(false);
+  });
+
+  it('reuses identical frozen image inputs across freeze times but refuses changed or missing predecessor bytes', () => {
+    const { repo, base, target } = makeReviewRepo('recovery-image-inputs');
+    repos.push(repo);
+    const root = temp('recovery-image-artifacts-');
+    const uploads = temp('recovery-image-uploads-');
+    const uploadPath = join(uploads, '1760000000000-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee-reference.png');
+    const image = minimalPng(Buffer.from('compatible-review-image'));
+    writeFileSync(uploadPath, image);
+    const freeze = (roundId: string, time: string, purpose = 'approved image') => freezeReviewInputs({
+      roundId, repoPath: repo.path, artifactRoot: root, baseRef: base, targetRef: target,
+      spec: 'review', recoveryIdentity, now: () => new Date(time),
+      evidenceUploadsDir: uploads, evidence: [{ uploadPath, purpose, consentRef: 'owner-approval' }],
+    });
+    const prior = freeze('image-prior', '2026-01-01T00:00:00Z');
+    const fresh = freeze('image-fresh', '2026-01-02T00:00:00Z');
+    expect(prior.manifest.reviewEvidence?.attachments[0]?.frozenAt)
+      .not.toBe(fresh.manifest.reviewEvidence?.attachments[0]?.frozenAt);
+    expect(compatibleReviewIdentity(fresh, prior.directory)).toBe(true);
+    expect(compatibleReviewIdentity(freeze('image-changed-purpose', '2026-01-03T00:00:00Z', 'other purpose'), prior.directory)).toBe(false);
+    const predecessorImage = join(prior.directory, 'evidence', 'ev1.bin');
+    writeFileSync(predecessorImage, Buffer.alloc(image.length, 0));
+    expect(compatibleReviewIdentity(fresh, prior.directory)).toBe(false);
+    rmSync(predecessorImage);
+    expect(compatibleReviewIdentity(fresh, prior.directory)).toBe(false);
+  });
+
+  it('rejects a FIFO checkpoint without blocking on its open', () => {
+    if (process.platform === 'win32') return;
+    const root = temp('recovery-fifo-checkpoint-');
+    execFileSync('mkfifo', [join(root, 'checkpoint.json')]);
+    expect(() => readReviewCheckpointBytes(root, 'checkpoint.json')).toThrow(/bounded regular file/);
+  });
+
+  it('bounds the actual descriptor read if a checkpoint grows after its initial stat', () => {
+    const root = temp('recovery-growing-read-');
+    const path = join(root, 'checkpoint.json');
+    writeFileSync(path, 'a');
+    const descriptor = openSync(path, 'r');
+    const requested: number[] = [];
+    try {
+      expect(() => readBoundedCheckpointDescriptor(descriptor, 1, (fd, bytes, offset, length, position) => {
+        requested.push(length);
+        writeFileSync(path, 'bc', { flag: 'a' });
+        return readSync(fd, bytes, offset, length, position);
+      })).toThrow(/changed during bounded read/);
+      expect(requested).toEqual([2]);
+    } finally {
+      closeSync(descriptor);
+    }
+  });
+
+  it('lets a fresh lead attribute a shown, revalidated checkpoint finding without inventing prior tool delivery', async () => {
+    const { repo, base, target } = makeReviewRepo('recovery-finding-source');
+    repos.push(repo);
+    const root = temp('recovery-finding-source-');
+    const freeze = (roundId: string) => freezeReviewInputs({
+      roundId, repoPath: repo.path, artifactRoot: root, baseRef: base, targetRef: target,
+      spec: 'review', recoveryIdentity,
+    });
+    const first = freeze('first');
+    const finding = groundedFinding('blind', 'warning');
+    const prior = fakeWholeSpawner(temp('recovery-finding-prior-'), {
+      childAnswer: () => JSON.stringify([finding]), specialists: ['blind'], neverSubmit: true,
+    });
+    await expect(new PerkinsWholeReview({ spawner: prior.spawner, policy: loadPerkinsPolicy() }).run({
+      roundId: 'first', roundNumber: 1, frozenReview: first, movementRef: 'feature/review', noSpec: false,
+    })).rejects.toThrow(/without an accepted terminal submission/);
+    const fresh = freeze('fresh');
+    const lead = fakeWholeSpawner(temp('recovery-finding-lead-'), {
+      childAnswer: () => '[]', specialists: [],
+      findings: () => [finding],
+    });
+    const result = await new PerkinsWholeReview({ spawner: lead.spawner, policy: loadPerkinsPolicy() }).run({
+      roundId: 'fresh', roundNumber: 2, frozenReview: fresh, movementRef: 'feature/review', noSpec: false,
+      recoveryDirectory: first.directory, recoveryStarts: [{ lens: 'blind', attempt: 1 }],
+    });
+    expect(lead.childCalls).toHaveLength(0);
+    expect(lead.leadCalls[0]?.prompt).toContain(finding.title);
+    expect(result.findings).toEqual([expect.objectContaining({ source: 'blind', title: finding.title })]);
+    expect(result.specialistRuns).toEqual([expect.objectContaining({
+      lens: 'blind', status: 'valid', findingsDelivered: false, recoveredForLead: true,
+    })]);
+    expect(result.canonicalVerdict).toBe('READY TO MERGE');
+  });
+
+  it('replays text starting with a brace using its recorded protocol, not a native guess', async () => {
+    const { repo, base, target } = makeReviewRepo('recovery-text-protocol');
+    repos.push(repo);
+    const root = temp('recovery-text-protocol-');
+    const freeze = (roundId: string) => freezeReviewInputs({
+      roundId, repoPath: repo.path, artifactRoot: root, baseRef: base, targetRef: target,
+      spec: 'review', recoveryIdentity,
+    });
+    const finding = groundedFinding('blind', 'warning');
+    const first = freeze('first');
+    const prior = fakeWholeSpawner(temp('recovery-text-prior-'), {
+      childAnswer: () => `{narrative text only}\n${JSON.stringify([finding])}`,
+      specialists: ['blind'], neverSubmit: true,
+    });
+    await expect(new PerkinsWholeReview({ spawner: prior.spawner, policy: loadPerkinsPolicy() }).run({
+      roundId: 'first', roundNumber: 1, frozenReview: first, movementRef: 'feature/review', noSpec: false,
+    })).rejects.toThrow(/without an accepted terminal submission/);
+    expect(JSON.parse(readFileSync(join(first.directory, 'attempts', 'blind-1.settled.json'), 'utf8')))
+      .toMatchObject({ outputProtocol: 'text', result: { status: 'valid' } });
+    const fresh = freeze('fresh');
+    const lead = fakeWholeSpawner(temp('recovery-text-lead-'), { childAnswer: () => '[]', specialists: [] });
+    const result = await new PerkinsWholeReview({ spawner: lead.spawner, policy: loadPerkinsPolicy() }).run({
+      roundId: 'fresh', roundNumber: 2, frozenReview: fresh, movementRef: 'feature/review', noSpec: false,
+      recoveryDirectory: first.directory, recoveryStarts: [{ lens: 'blind', attempt: 1 }],
+    });
+    expect(result.specialistRuns).toEqual([expect.objectContaining({ lens: 'blind', status: 'valid' })]);
+    expect(lead.leadCalls[0]?.prompt).toContain(finding.title);
+  });
+
+  it('does not credit a changed start marker even when its parsed fields still match, while charging its ledger start', async () => {
+    const { repo, base, target } = makeReviewRepo('recovery-start-original-bytes');
+    repos.push(repo);
+    const root = temp('recovery-start-original-bytes-');
+    const freeze = (roundId: string) => freezeReviewInputs({
+      roundId, repoPath: repo.path, artifactRoot: root, baseRef: base, targetRef: target,
+      spec: 'review', recoveryIdentity,
+    });
+    const first = freeze('first');
+    const original = fakeWholeSpawner(temp('recovery-start-original-sessions-'), {
+      childAnswer: () => '[]', specialists: ['blind'], neverSubmit: true,
+    });
+    await expect(new PerkinsWholeReview({ spawner: original.spawner, policy: loadPerkinsPolicy() }).run({
+      roundId: 'first', roundNumber: 1, frozenReview: first, movementRef: 'feature/review', noSpec: false,
+    })).rejects.toThrow(/without an accepted terminal submission/);
+    const markerPath = join(first.directory, 'attempts', 'blind-1.start.json');
+    const marker = JSON.parse(readFileSync(markerPath, 'utf8')) as object;
+    for (const [suffix, bytes] of [
+      ['whitespace', `${JSON.stringify(marker)}\n`],
+      ['extra-field', `${JSON.stringify({ ...marker, extraneous: true }, null, 2)}\n`],
+    ] as const) {
+      writeFileSync(markerPath, bytes);
+      const fresh = freeze(suffix);
+      const lead = fakeWholeSpawner(temp('recovery-start-fresh-sessions-'), ALL_CLEAN);
+      const result = await new PerkinsWholeReview({ spawner: lead.spawner, policy: loadPerkinsPolicy() }).run({
+        roundId: suffix, roundNumber: 2, frozenReview: fresh, movementRef: 'feature/review', noSpec: false,
+        recoveryDirectory: first.directory, recoveryStarts: [{ lens: 'blind', attempt: 1 }],
+      });
+      expect(result.specialistRuns.some((run) => run.lens === 'blind')).toBe(false);
+      expect(lead.leadCalls[0]?.prompt).toContain('ledger starts remain spent');
+      expect(lead.leadCalls[0]?.prompt).not.toContain('RECOVERED SPECIALIST EVIDENCE');
+      expect(readFileSync(join(fresh.directory, 'attempts', 'blind-1.start.json'), 'utf8'))
+        .toBe(`${JSON.stringify(marker, null, 2)}\n`);
+    }
+  });
+
+  it('receipts the exact raw-byte ceiling including its stored newline and refuses one byte more', async () => {
+    const { repo, base, target } = makeReviewRepo('recovery-raw-newline');
+    repos.push(repo);
+    const root = temp('recovery-raw-newline-');
+    const freeze = (roundId: string) => freezeReviewInputs({
+      roundId, repoPath: repo.path, artifactRoot: root, baseRef: base, targetRef: target,
+      spec: 'review', recoveryIdentity,
+    });
+    for (const extra of [0, 1]) {
+      const first = freeze(`raw-${extra}`);
+      const prior = fakeWholeSpawner(temp('recovery-raw-sessions-'), {
+        childAnswer: () => `${'x'.repeat(900 * 1024 - 3 + extra)}[]`,
+        specialists: ['blind'], neverSubmit: true,
+      });
+      await expect(new PerkinsWholeReview({ spawner: prior.spawner, policy: loadPerkinsPolicy() }).run({
+        roundId: `raw-${extra}`, roundNumber: 1, frozenReview: first, movementRef: 'feature/review', noSpec: false,
+      })).rejects.toThrow(/without an accepted terminal submission/);
+      const settlement = JSON.parse(readFileSync(join(first.directory, 'attempts', 'blind-1.settled.json'), 'utf8')) as {
+        result: { status: string }; outputProtocol?: string;
+      };
+      expect(settlement.result.status).toBe(extra === 0 ? 'valid' : 'invalid');
+      if (extra === 0) {
+        expect(settlement.outputProtocol).toBe('text');
+        const raw = readdirSync(join(first.directory, 'specialists')).find((name) => name.endsWith('.raw.json'))!;
+        expect(readFileSync(join(first.directory, 'specialists', raw)).byteLength).toBe(900 * 1024);
+      }
+    }
+  });
+
+  it('refuses oversized recovered evidence before spawning a lead while retaining every charged start', async () => {
+    const { repo, base, target } = makeReviewRepo('recovery-prompt-bound');
+    repos.push(repo);
+    const root = temp('recovery-prompt-bound-');
+    const freeze = (roundId: string) => freezeReviewInputs({
+      roundId, repoPath: repo.path, artifactRoot: root, baseRef: base, targetRef: target,
+      spec: 'review', recoveryIdentity,
+    });
+    const first = freeze('first');
+    const prior = fakeWholeSpawner(temp('recovery-prompt-prior-'), {
+      childAnswer: (prompt) => {
+        const lens = prompt.includes('source=blind') ? 'blind'
+          : /"source": "(edge|acceptance|security|architecture|codebase|tests)"/u.exec(prompt)?.[1] ?? 'unknown';
+        return JSON.stringify(Array.from({ length: 200 }, (_value, index) => groundedFinding(lens, 'note', {
+          title: `${lens} evidence ${index}`, detail: 'd'.repeat(300), recommended_fix: 'f'.repeat(300),
+        })));
+      },
+      specialists: [...PERKINS_LENSES], neverSubmit: true,
+    });
+    await expect(new PerkinsWholeReview({ spawner: prior.spawner, policy: loadPerkinsPolicy() }).run({
+      roundId: 'first', roundNumber: 1, frozenReview: first, movementRef: 'feature/review', noSpec: false,
+    })).rejects.toThrow(/without an accepted terminal submission/);
+    const starts = readdirSync(join(first.directory, 'attempts')).filter((name) => name.endsWith('.start.json'));
+    expect(starts.length).toBeGreaterThanOrEqual(7);
+    const fresh = freeze('fresh');
+    const lead = fakeWholeSpawner(temp('recovery-prompt-fresh-'), ALL_CLEAN);
+    const charged: string[] = [];
+    await expect(new PerkinsWholeReview({
+      spawner: lead.spawner, policy: loadPerkinsPolicy(),
+      recordSpecialistStart: (lens, attempt) => charged.push(`${lens}-${attempt}`),
+    }).run({
+      roundId: 'fresh', roundNumber: 2, frozenReview: fresh, movementRef: 'feature/review', noSpec: false,
+      recoveryDirectory: first.directory,
+      recoveryStarts: starts.map((name) => ({ lens: name.split('-')[0] as (typeof PERKINS_LENSES)[number],
+        attempt: Number(name.match(/-([12])\.start\.json$/u)?.[1]) as 1 | 2 })),
+    })).rejects.toThrow(/recovered specialist evidence exceeds .*charged attempts remain spent/);
+    expect(charged).toHaveLength(starts.length);
+    expect(readdirSync(join(fresh.directory, 'attempts')).filter((name) => name.endsWith('.start.json'))).toHaveLength(starts.length);
+    expect(lead.leadCalls).toHaveLength(0);
+  });
+
+  it('refuses to re-sign a changed checkpoint during copying after its original receipt was checked', async () => {
+    const { repo, base, target } = makeReviewRepo('recovery-copy-receipt');
+    repos.push(repo);
+    const root = temp('recovery-copy-receipt-');
+    const freeze = (roundId: string) => freezeReviewInputs({
+      roundId, repoPath: repo.path, artifactRoot: root, baseRef: base, targetRef: target,
+      spec: 'review', recoveryIdentity,
+    });
+    const first = freeze('first');
+    const prior = fakeWholeSpawner(temp('recovery-copy-prior-'), {
+      childAnswer: () => '[]', specialists: ['blind'], neverSubmit: true,
+    });
+    await expect(new PerkinsWholeReview({ spawner: prior.spawner, policy: loadPerkinsPolicy() }).run({
+      roundId: 'first', roundNumber: 1, frozenReview: first, movementRef: 'feature/review', noSpec: false,
+    })).rejects.toThrow(/without an accepted terminal submission/);
+    const settlement = join(first.directory, 'attempts', 'blind-1.settled.json');
+    const sha256 = createHash('sha256').update(readFileSync(settlement)).digest('hex');
+    const fresh = freeze('fresh');
+    const lead = fakeWholeSpawner(temp('recovery-copy-lead-'), ALL_CLEAN);
+    await expect(new PerkinsWholeReview({
+      spawner: lead.spawner, policy: loadPerkinsPolicy(),
+      recordSpecialistStart: () => writeFileSync(settlement, `${readFileSync(settlement, 'utf8').trimEnd()} \n`),
+    }).run({
+      roundId: 'fresh', roundNumber: 2, frozenReview: fresh, movementRef: 'feature/review', noSpec: false,
+      recoveryDirectory: first.directory,
+      recoveryStarts: [{ lens: 'blind', attempt: 1 }],
+      recoverySettlements: [{ lens: 'blind', attempt: 1, sha256 }],
+    })).rejects.toThrow(/validated checkpoint blind-1 could not be copied with its original receipt/);
+    expect(lead.leadCalls).toHaveLength(0);
+    expect(existsSync(join(fresh.directory, 'attempts', 'blind-1.start.json'))).toBe(true);
+    expect(existsSync(join(fresh.directory, 'attempts', 'blind-1.settled.json'))).toBe(false);
+  });
+
+  it('rehydrates only validated settled outcomes and preserves started budgets when source is tampered', async () => {
+    const { repo, base, target } = makeReviewRepo('recovery-checkpoints');
+    repos.push(repo);
+    const root = temp('recovery-checkpoints-');
+    const freeze = (roundId: string) => freezeReviewInputs({
+      roundId, repoPath: repo.path, artifactRoot: root, baseRef: base, targetRef: target,
+      spec: 'review', recoveryIdentity,
+    });
+    const first = freeze('first');
+    const fake = fakeWholeSpawner(temp('recovery-first-sessions-'), {
+      childAnswer: () => '[]', specialists: ['blind', 'edge'], neverSubmit: true,
+    });
+    await expect(new PerkinsWholeReview({ spawner: fake.spawner, policy: loadPerkinsPolicy() }).run({
+      roundId: 'first', roundNumber: 1, frozenReview: first, movementRef: 'feature/review', noSpec: false,
+    })).rejects.toThrow(/without an accepted terminal submission/);
+    // An earlier failed transport is still a charged attempt, even with no
+    // usable raw output to hand the new lead.
+    writeReviewArtifact(first, 'attempts/tests-1.start.json', { schemaVersion: 1, lens: 'tests', attempt: 1 });
+    writeReviewArtifact(first, 'attempts/tests-1.settled.json', {
+      schemaVersion: 1,
+      result: { resultId: 'failed-tests-a1-fixture', agentId: 'spawn-failed', lens: 'tests', attempt: 1,
+        status: 'failed', findings: [], failureKind: 'error', error: 'transport lost' },
+    });
+    const second = freeze('second');
+    const resumed = fakeWholeSpawner(temp('recovery-second-sessions-'), { childAnswer: () => '[]', specialists: ['tests'] });
+    const result = await new PerkinsWholeReview({ spawner: resumed.spawner, policy: loadPerkinsPolicy() }).run({
+      roundId: 'second', roundNumber: 2, frozenReview: second, movementRef: 'feature/review', noSpec: false,
+      recoveryDirectory: first.directory,
+      recoveryStarts: [{ lens: 'blind', attempt: 1 }, { lens: 'edge', attempt: 1 }, { lens: 'tests', attempt: 1 }],
+    });
+    expect(resumed.childCalls).toHaveLength(1);
+    expect(result.specialistRuns).toEqual(expect.arrayContaining([
+      expect.objectContaining({ lens: 'blind', status: 'valid', findingsDelivered: false }),
+      expect.objectContaining({ lens: 'edge', status: 'valid', findingsDelivered: false }),
+      expect.objectContaining({ lens: 'tests', status: 'valid' }),
+    ]));
+    expect(readFileSync(join(second.directory, 'attempts', 'blind-1.start.json'), 'utf8')).toContain('blind');
+    expect(readFileSync(join(second.directory, 'attempts', 'tests-2.start.json'), 'utf8')).toContain('tests');
+    expect(result.specialistRuns).toEqual(expect.arrayContaining([
+      expect.objectContaining({ lens: 'tests', attempt: 1, status: 'failed' }),
+      expect.objectContaining({ lens: 'tests', attempt: 2, status: 'valid' }),
+    ]));
+    const onward = freeze('onward');
+    const onwardLead = fakeWholeSpawner(temp('recovery-onward-sessions-'), {
+      childAnswer: () => '[]', specialists: ['tests'], probeExhausted: 'tests',
+    });
+    const onwardResult = await new PerkinsWholeReview({ spawner: onwardLead.spawner, policy: loadPerkinsPolicy() }).run({
+      roundId: 'onward', roundNumber: 3, frozenReview: onward, movementRef: 'feature/review', noSpec: false,
+      recoveryDirectory: second.directory,
+      recoveryStarts: [{ lens: 'blind', attempt: 1 }, { lens: 'edge', attempt: 1 },
+        { lens: 'tests', attempt: 1 }, { lens: 'tests', attempt: 2 }],
+    });
+    expect(onwardLead.childCalls).toHaveLength(0);
+    expect(onwardLead.toolErrors.some((error) => error.error.includes('tests already has a valid result'))).toBe(true);
+    expect(onwardResult.specialistRuns.filter((run) => run.lens === 'tests')).toHaveLength(2);
+    expect(existsSync(join(onward.directory, 'attempts', 'tests-2.start.json'))).toBe(true);
+    const priorSettlements = ['blind-1', 'edge-1', 'tests-1'].map((stem) => {
+      const [lens, attempt] = stem.split('-');
+      return { lens: lens as 'blind' | 'edge' | 'tests', attempt: Number(attempt) as 1,
+        sha256: createHash('sha256').update(readFileSync(join(first.directory, 'attempts', `${stem}.settled.json`))).digest('hex') };
+    });
+    const edgeSettlement = join(first.directory, 'attempts', 'edge-1.settled.json');
+    const originalSettlement = readFileSync(edgeSettlement);
+    writeFileSync(edgeSettlement, Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), originalSettlement]));
+    const receiptBound = freeze('receipt-bound');
+    const receiptLead = fakeWholeSpawner(temp('recovery-receipt-sessions-'), { childAnswer: () => '[]', specialists: [] });
+    const receiptResult = await new PerkinsWholeReview({ spawner: receiptLead.spawner, policy: loadPerkinsPolicy() }).run({
+      roundId: 'receipt-bound', roundNumber: 3, frozenReview: receiptBound, movementRef: 'feature/review', noSpec: false,
+      recoveryDirectory: first.directory,
+      recoveryStarts: [{ lens: 'blind', attempt: 1 }, { lens: 'edge', attempt: 1 }, { lens: 'tests', attempt: 1 }],
+      recoverySettlements: priorSettlements,
+    });
+    expect(receiptResult.specialistRuns.some((run) => run.lens === 'edge')).toBe(false);
+    expect(receiptResult.specialistRuns.some((run) => run.lens === 'blind')).toBe(true);
+    writeFileSync(edgeSettlement, originalSettlement);
+    const raw = readdirSync(join(first.directory, 'specialists')).find((name) => name.startsWith('blind.') && name.endsWith('.raw.json'))!;
+    writeFileSync(join(first.directory, 'specialists', raw), '[{"tampered":true}]\n');
+    rmSync(join(first.directory, 'attempts', 'blind-1.start.json'));
+    const third = freeze('third');
+    const resumedAgain = fakeWholeSpawner(temp('recovery-third-sessions-'), {
+      childAnswer: () => '[]', specialists: ['blind'], probeExhausted: 'blind',
+    });
+    const resultAfterTamper = await new PerkinsWholeReview({ spawner: resumedAgain.spawner, policy: loadPerkinsPolicy() }).run({
+      roundId: 'third', roundNumber: 3, frozenReview: third, movementRef: 'feature/review', noSpec: false,
+      recoveryDirectory: first.directory,
+      recoveryStarts: [{ lens: 'blind', attempt: 1 }, { lens: 'edge', attempt: 1 }, { lens: 'tests', attempt: 1 }],
+    });
+    expect(resultAfterTamper.specialistRuns.some((run) => run.lens === 'blind' && run.attempt === 1)).toBe(false);
+    expect(resultAfterTamper.specialistRuns.some((run) => run.lens === 'edge' && run.status === 'valid')).toBe(true);
+    expect(resumedAgain.leadCalls[0]?.prompt).toContain('3/16 round runs spent');
+    expect(resumedAgain.leadCalls[0]?.prompt).toContain('ledger starts remain spent');
+    expect(resumedAgain.leadCalls[0]?.prompt).toContain('RECOVERED SPECIALIST EVIDENCE');
+    expect(resumedAgain.childCalls).toHaveLength(1);
+    expect(readFileSync(join(third.directory, 'attempts', 'blind-2.start.json'), 'utf8')).toContain('blind');
+  });
+});
 
 describe('bundled Perkins policy (whole-PR contract)', () => {
   it('loads the integrity-pinned whole-PR policy with the lead workflow and no chunk rule', () => {
@@ -2619,6 +3103,57 @@ describe('wave refusals never consume lens or round budget (H1)', () => {
     });
     return { fake, engine, frozen };
   }
+
+  it('reuses an attempt when its start append fails, but keeps successfully journaled starts spent', async () => {
+    const h = waveHarness({ childAnswer: () => '[]', specialists: ['blind', 'edge', 'security', 'architecture'] }, 4);
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 0, maxConcurrentReviewTurns: 1 });
+    const attemptedStarts: string[] = [];
+    const durableStarts: string[] = [];
+    const engine = new PerkinsWholeReview({
+      spawner: h.fake.spawner, policy: loadPerkinsPolicy(), maxConcurrentChildren: 4,
+      beginChildren: () => ({ concurrency: 4, finish: () => {} }), reviewGate: gate,
+      recordSpecialistStart: (lens, attempt) => {
+        attemptedStarts.push(`${lens}-${attempt}`);
+        if (attemptedStarts.length === 1) throw new Error('ledger append failed before commit');
+        durableStarts.push(`${lens}-${attempt}`);
+      },
+    });
+    const result = await engine.run({
+      roundId: 'wave-refusal-round', roundNumber: 1, frozenReview: h.frozen,
+      movementRef: 'feature/review', noSpec: false,
+    });
+    expect(h.fake.toolErrors.some((entry) => entry.error.includes('ledger append failed before commit'))).toBe(true);
+    expect(attemptedStarts.filter((start) => start === 'blind-1')).toHaveLength(2);
+    expect(durableStarts.filter((start) => start === 'blind-1')).toHaveLength(1);
+    expect(durableStarts).not.toContain('blind-2');
+    expect(durableStarts).toContain('edge-1');
+    expect(result.specialistRuns.some((run) => run.lens === 'blind' && run.attempt === 1 && run.status === 'valid')).toBe(true);
+    expect(result.specialistRuns.some((run) => run.lens === 'edge' && run.status === 'valid')).toBe(true);
+  }, 120_000);
+
+  it('does not refund a durable start when its later artifact write fails', async () => {
+    const h = waveHarness({ childAnswer: () => '[]', specialists: ['blind'] }, 1);
+    const durable: string[] = [];
+    const engine = new PerkinsWholeReview({
+      spawner: h.fake.spawner, policy: loadPerkinsPolicy(), maxConcurrentChildren: 1,
+      beginChildren: () => ({ concurrency: 1, finish: () => {} }),
+      recordSpecialistStart: (lens, attempt) => {
+        durable.push(`${lens}-${attempt}`);
+        if (lens === 'blind' && attempt === 1) {
+          mkdirSync(join(h.frozen.directory, 'attempts'), { recursive: true });
+          writeFileSync(join(h.frozen.directory, 'attempts', 'blind-1.start.json'), 'collision');
+        }
+      },
+    });
+    const result = await engine.run({
+      roundId: 'wave-refusal-round', roundNumber: 1, frozenReview: h.frozen,
+      movementRef: 'feature/review', noSpec: false,
+    });
+    expect(h.fake.toolErrors.some((entry) => entry.error.includes('EEXIST'))).toBe(true);
+    expect(durable.filter((entry) => entry === 'blind-1')).toHaveLength(1);
+    expect(durable).toContain('blind-2');
+    expect(result.specialistRuns.some((run) => run.lens === 'blind' && run.attempt === 2)).toBe(true);
+  }, 120_000);
 
   it('a refused batch keeps its full attempt budget: re-batched invalid run still gets its policy retry', async () => {
     // The double's first call is the oversized badRuns batch (4 lenses at

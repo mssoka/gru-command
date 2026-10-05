@@ -1,11 +1,14 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { closeSync, existsSync, fstatSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, unlinkSync, writeFileSync, constants } from 'node:fs';
-import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { closeSync, existsSync, fstatSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, unlinkSync, writeFileSync, constants } from 'node:fs';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { BranchIdleTag } from '../branch-idle.js';
 import type { CiEvidenceRecord } from '../../review-inputs/ci-evidence.js';
 import {
   freezeEvidenceAttachments,
+  REVIEW_EVIDENCE_MAX_FILE_BYTES,
+  REVIEW_EVIDENCE_MAX_FILES,
+  REVIEW_EVIDENCE_MAX_TOTAL_BYTES,
   type FrozenEvidenceAttachment,
   type FrozenEvidenceRuntimeAttachment,
   type ReviewEvidenceRequest,
@@ -15,6 +18,9 @@ const GIT_MAX_BUFFER = 128 * 1024 * 1024;
 export const FROZEN_DIFF_MAX_BYTES = 8 * 1024 * 1024;
 export const FROZEN_SPEC_MAX_BYTES = 256 * 1024;
 export const FROZEN_CONVENTIONS_MAX_BYTES = 256 * 1024;
+export const FROZEN_MANIFEST_MAX_BYTES = 256 * 1024;
+export const FROZEN_CHANGED_FILES_MAX_BYTES = 256 * 1024;
+export const SPECIALIST_CHECKPOINT_MAX_BYTES = 1024 * 1024;
 
 export interface FrozenAcceptance {
   readonly version: number;
@@ -34,8 +40,10 @@ export interface FrozenReviewEvidenceManifest {
 }
 
 export interface FrozenReviewInputs {
-  readonly schemaVersion: 1;
+  readonly schemaVersion: 2;
   readonly roundId: string;
+  /** Absent provenance makes an older manifest ineligible for recovery. */
+  readonly recoveryIdentity: ReviewRecoveryIdentity | null;
   readonly repoPath: string;
   readonly targetRef: string;
   readonly baseRef: string;
@@ -46,6 +54,7 @@ export interface FrozenReviewInputs {
   readonly specMode: 'supplied' | 'explicit-no-spec';
   readonly specSha256: string;
   readonly conventionsSha256: string;
+  readonly changedFilesSha256: string;
   readonly createdAt: string;
   /** Changed file paths of the frozen diff (the whole-PR review unit). */
   readonly changedFiles: readonly string[];
@@ -60,7 +69,20 @@ export interface FrozenReviewInputs {
   readonly branchIdle?: BranchIdleTag;
 }
 
+export interface ReviewRecoveryIdentity {
+  readonly jobId: string;
+  readonly policySha256: string;
+  readonly runtimeId: string;
+  readonly runtimeVersion: string;
+  readonly modelRef: string;
+  readonly modelRole: string;
+  readonly modelSettingsSha256: string;
+  /** Entire tracked target tree, including assets not shown in the diff. */
+  readonly trackedTreeSha: string;
+}
+
 export interface FreezeReviewInput {
+  readonly recoveryIdentity?: Omit<ReviewRecoveryIdentity, 'trackedTreeSha'>;
   readonly roundId: string;
   readonly repoPath: string;
   readonly artifactRoot: string;
@@ -143,7 +165,7 @@ export function resolveReviewBaseRef(repoPath: string, explicit?: string | null)
   throw new Error('complete review requires job.baseBranch or a resolvable origin/HEAD, main, or master base');
 }
 
-function hash(text: string): string {
+function hash(text: string | Buffer): string {
   return createHash('sha256').update(text).digest('hex');
 }
 
@@ -312,6 +334,13 @@ export function freezeReviewInputs(input: FreezeReviewInput): FrozenReview {
     throw new Error('complete review requires frozen spec/context or explicit noSpec=true');
   }
   if (input.baseRef.trim() === '' || input.targetRef.trim() === '') throw new Error('review base and target refs are required');
+  if (input.recoveryIdentity !== undefined &&
+    (Object.keys(input.recoveryIdentity).sort().join(',') !== [
+      'jobId', 'policySha256', 'runtimeId', 'runtimeVersion', 'modelRef', 'modelRole', 'modelSettingsSha256',
+    ].sort().join(',') || Object.values(input.recoveryIdentity).some((value) =>
+      typeof value !== 'string' || value.trim() === ''))) {
+    throw new Error('recovery identity must contain every non-empty provenance field');
+  }
 
   const targetSha = resolveGitCommit(input.repoPath, input.targetRef);
   const baseRefSha = resolveGitCommit(input.repoPath, input.baseRef);
@@ -381,11 +410,19 @@ export function freezeReviewInputs(input: FreezeReviewInput): FrozenReview {
   atomicWrite(join(directory, 'diff.patch'), diff, directory);
   atomicWrite(join(directory, 'spec-context.md'), specBytes, directory);
   atomicWrite(join(directory, 'project-conventions.md'), projectConventions, directory);
-  atomicWrite(join(directory, 'changed-files.json'), `${JSON.stringify(changedFiles, null, 2)}\n`, directory);
+  const changedFilesBytes = `${JSON.stringify(changedFiles, null, 2)}\n`;
+  if (Buffer.byteLength(changedFilesBytes) > FROZEN_CHANGED_FILES_MAX_BYTES) {
+    throw new Error('frozen changed-file list exceeds recovery byte limit');
+  }
+  atomicWrite(join(directory, 'changed-files.json'), changedFilesBytes, directory);
 
   const manifest: FrozenReviewInputs = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     roundId: input.roundId,
+    recoveryIdentity: input.recoveryIdentity === undefined ? null : {
+      ...input.recoveryIdentity,
+      trackedTreeSha: git(input.repoPath, ['rev-parse', `${targetSha}^{tree}`]),
+    },
     repoPath: input.repoPath,
     targetRef: input.movementRef ?? input.targetRef,
     baseRef: input.baseRef,
@@ -396,6 +433,7 @@ export function freezeReviewInputs(input: FreezeReviewInput): FrozenReview {
     specMode: input.noSpec === true ? 'explicit-no-spec' : 'supplied',
     specSha256: hash(specBytes),
     conventionsSha256: hash(projectConventions),
+    changedFilesSha256: hash(changedFilesBytes),
     createdAt: (input.now ?? (() => new Date()))().toISOString(),
     changedFiles,
     ...(acceptance !== undefined ? { acceptance } : {}),
@@ -409,7 +447,11 @@ export function freezeReviewInputs(input: FreezeReviewInput): FrozenReview {
       : {}),
     ...(input.branchIdle !== undefined ? { branchIdle: input.branchIdle } : {}),
   };
-  atomicWrite(join(directory, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, directory);
+  const manifestBytes = `${JSON.stringify(manifest, null, 2)}\n`;
+  if (Buffer.byteLength(manifestBytes) > FROZEN_MANIFEST_MAX_BYTES) {
+    throw new Error('frozen manifest exceeds recovery byte limit');
+  }
+  atomicWrite(join(directory, 'manifest.json'), manifestBytes, directory);
   return {
     directory,
     manifest,
@@ -523,19 +565,198 @@ export function refMovedSinceFreeze(review: FrozenReview): boolean {
  * no-follow descriptor and byte bound keep this check inside the same safe
  * round directory without relaxing write-once artifact publication. */
 export function publishedReportMatches(review: FrozenReview, expected: string): boolean {
-  const root = ensureDirectoryWithoutSymlinks(review.directory);
-  // O_NOFOLLOW rejects symlink swaps; O_NONBLOCK keeps the open bounded —
-  // a FIFO or device planted at the report path returns immediately and
-  // is then rejected by the regular-file check below instead of blocking
-  // the terminal retry indefinitely.
-  const descriptor = openSync(join(root, 'perkins-report.md'), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  const descriptor = openCheckpoint(review.directory, 'perkins-report.md');
   try {
     const info = fstatSync(descriptor);
     const bytes = Buffer.from(expected, 'utf8');
     if (!info.isFile() || info.size !== bytes.length) return false;
-    return readFileSync(descriptor).equals(bytes);
+    const actual = Buffer.allocUnsafe(bytes.length);
+    let count = 0;
+    while (count < actual.length) {
+      const read = readSync(descriptor, actual, count, actual.length - count, null);
+      if (read === 0) return false;
+      count += read;
+    }
+    return fstatSync(descriptor).size === count && actual.equals(bytes);
   } finally {
     closeSync(descriptor);
+  }
+}
+
+/** Each open must be anchored in one kernel path walk. Darwin's
+ * O_NOFOLLOW_ANY rejects symlinks anywhere in that walk; Linux resolves each
+ * component relative to a held no-follow directory descriptor through procfs.
+ * An lstat followed by a pathname open is not an ownership proof. */
+export function openCheckpoint(directory: string, relativePath: string): number {
+  const absolute = resolve(directory, relativePath);
+  if (process.platform === 'darwin') {
+    // Only the OS-owned /var alias may be normalized; never realpath a
+    // caller-controlled ancestor (doing so would conceal a substitution).
+    const path = absolute.startsWith('/var/') ? `/private${absolute}` : absolute;
+    // Darwin sys/fcntl.h O_NOFOLLOW_ANY; unlike O_NOFOLLOW this applies to
+    // the entire kernel pathname walk, including ancestor directories.
+    return openSync(path, constants.O_RDONLY | constants.O_NONBLOCK | 0x20000000);
+  }
+  if (process.platform !== 'linux') throw new Error('no race-safe checkpoint directory traversal on this platform');
+  const descriptors: number[] = [];
+  try {
+    let parent = openSync('/', constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+    descriptors.push(parent);
+    const parts = absolute.slice(1).split('/');
+    for (const part of parts.slice(0, -1)) {
+      parent = openSync(`/proc/self/fd/${parent}/${part}`, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+      descriptors.push(parent);
+    }
+    return openSync(`/proc/self/fd/${parent}/${parts.at(-1)!}`, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW);
+  } finally {
+    for (const fd of descriptors.reverse()) closeSync(fd);
+  }
+}
+
+/** Read exact original bytes with a bound on the read itself, not merely the
+ * pre-read stat: a concurrent append cannot cause an unbounded allocation. */
+export function readReviewCheckpointBytes(directory: string, relativePath: string, maxBytes = 256 * 1024): Buffer {
+  const components = relativePath.split('/');
+  if (components.some((part) => !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(part)) ||
+    !Number.isSafeInteger(maxBytes) || maxBytes < 0 || maxBytes > FROZEN_DIFF_MAX_BYTES) {
+    throw new Error('invalid review checkpoint path or byte limit');
+  }
+  const descriptor = openCheckpoint(directory, relativePath);
+  try {
+    return readBoundedCheckpointDescriptor(descriptor, maxBytes);
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+/** @internal The reader seam makes concurrent growth deterministic in tests;
+ * production always uses readSync on the no-follow descriptor. */
+export function readBoundedCheckpointDescriptor(
+  descriptor: number, maxBytes: number,
+  readChunk: (fd: number, bytes: Buffer, offset: number, length: number, position: null) => number = readSync,
+): Buffer {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 0 || maxBytes > FROZEN_DIFF_MAX_BYTES) {
+    throw new Error('invalid review checkpoint byte limit');
+  }
+  const info = fstatSync(descriptor);
+  if (!info.isFile() || info.nlink !== 1 || info.size > maxBytes) throw new Error('review checkpoint is not a bounded regular file');
+  const bytes = Buffer.allocUnsafe(maxBytes + 1);
+  let count = 0;
+  while (count < bytes.length) {
+    const read = readChunk(descriptor, bytes, count, bytes.length - count, null);
+    if (read === 0) break;
+    count += read;
+  }
+  const after = fstatSync(descriptor);
+  if (count !== info.size || after.size !== info.size || after.ino !== info.ino || count > maxBytes) {
+    throw new Error('review checkpoint changed during bounded read');
+  }
+  return bytes.subarray(0, count);
+}
+
+export function readReviewCheckpoint(directory: string, relativePath: string, maxBytes = 256 * 1024): string {
+  // Preserve a UTF-8 BOM as U+FEFF so callers that re-encode a checkpoint
+  // never confuse BOM-prefixed bytes with the original receipted source.
+  return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true })
+    .decode(readReviewCheckpointBytes(directory, relativePath, maxBytes));
+}
+
+/** A base-only recovered lens is usable only while the same pinned base
+ * still merges cleanly with the frozen target. merge-tree writes Git objects,
+ * never the index or checkout; nonzero/conflict/ambiguous output refuses.
+ * Re-run at submission so movement after lead spawn cannot authorize READY. */
+export function proveRecoveredBaseMergeability(review: FrozenReview, priorBaseTips: readonly string[]): void {
+  const { repoPath, baseRef, baseRefSha, targetSha, diffBaseSha } = review.manifest;
+  if (priorBaseTips.length === 0 || priorBaseTips.length > 16 ||
+    priorBaseTips.some((tip) => !/^[0-9a-f]{40}$/u.test(tip) || tip === baseRefSha)) {
+    throw new Error('recovered base mergeability requires bounded distinct prior base tips');
+  }
+  if (resolveGitCommit(repoPath, baseRef) !== baseRefSha || resolveGitCommit(repoPath, targetSha) !== targetSha) {
+    throw new Error('recovered base moved before mergeability proof');
+  }
+  for (const tip of priorBaseTips) gitRaw(repoPath, ['merge-base', '--is-ancestor', tip, baseRefSha]);
+  if (git(repoPath, ['merge-base', baseRefSha, targetSha]) !== diffBaseSha) {
+    throw new Error('recovered base changed the frozen merge-base');
+  }
+  const mergedTree = execFileSync('git', ['-C', repoPath, 'merge-tree', '--write-tree', baseRefSha, targetSha], {
+    encoding: 'utf8', maxBuffer: 1024 * 1024, timeout: 30_000, stdio: ['ignore', 'pipe', 'pipe'],
+  }).trim();
+  if (!/^[0-9a-f]{40}$/u.test(mergedTree) || git(repoPath, ['cat-file', '-t', mergedTree]) !== 'tree') {
+    throw new Error('recovered base mergeability proof did not produce one verified tree');
+  }
+  if (resolveGitCommit(repoPath, baseRef) !== baseRefSha || resolveGitCommit(repoPath, targetSha) !== targetSha) {
+    throw new Error('recovered base moved during mergeability proof');
+  }
+}
+
+function effectiveEvidenceIdentity(evidence: FrozenReviewEvidenceManifest | undefined): unknown {
+  if (evidence === undefined) return undefined;
+  return {
+    ci: evidence.ci,
+    // Each manifest keeps its own freeze time. It is provenance of the copy,
+    // not a change to the bytes or owner-authorized purpose/consent.
+    attachments: evidence.attachments.map(({ frozenAt: _frozenAt, ...effective }) => effective),
+  };
+}
+
+function authenticateFrozenAttachments(directory: string, evidence: FrozenReviewEvidenceManifest | undefined): boolean {
+  if (evidence === undefined) return true;
+  if (!Array.isArray(evidence.attachments) || evidence.attachments.length > REVIEW_EVIDENCE_MAX_FILES) return false;
+  let total = 0;
+  for (const [index, attachment] of evidence.attachments.entries()) {
+    if (attachment?.id !== `ev${index + 1}` || attachment.frozenFile !== `evidence/ev${index + 1}.bin` ||
+      !Number.isSafeInteger(attachment.bytes) || attachment.bytes < 0 || attachment.bytes > REVIEW_EVIDENCE_MAX_FILE_BYTES ||
+      typeof attachment.sha256 !== 'string' || !/^[a-f0-9]{64}$/u.test(attachment.sha256) ||
+      attachment.sourceSha256 !== attachment.sha256) return false;
+    total += attachment.bytes;
+    if (total > REVIEW_EVIDENCE_MAX_TOTAL_BYTES) return false;
+    const bytes = readReviewCheckpointBytes(directory, attachment.frozenFile, REVIEW_EVIDENCE_MAX_FILE_BYTES);
+    if (bytes.length !== attachment.bytes || hash(bytes) !== attachment.sha256) return false;
+  }
+  return true;
+}
+
+export function compatibleReviewIdentity(
+  current: FrozenReview, predecessorDirectory: string, expectedManifestSha256?: string,
+): boolean {
+  try {
+    const manifestBytes = readReviewCheckpointBytes(predecessorDirectory, 'manifest.json', FROZEN_MANIFEST_MAX_BYTES);
+    if (expectedManifestSha256 !== undefined && hash(manifestBytes) !== expectedManifestSha256) return false;
+    const prior = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(manifestBytes)) as FrozenReviewInputs;
+    const identity = current.manifest.recoveryIdentity;
+    if (prior.schemaVersion !== 2 || prior.roundId !== basename(predecessorDirectory) ||
+      identity === null || prior.recoveryIdentity === null ||
+      JSON.stringify(prior.recoveryIdentity) !== JSON.stringify(identity)) return false;
+    for (const key of ['targetSha', 'baseRef', 'diffBaseSha', 'diffSha256', 'specMode', 'specSha256', 'conventionsSha256', 'changedFiles', 'acceptance'] as const) {
+      if (JSON.stringify(prior[key]) !== JSON.stringify(current.manifest[key])) return false;
+    }
+    if (JSON.stringify(effectiveEvidenceIdentity(prior.reviewEvidence)) !==
+      JSON.stringify(effectiveEvidenceIdentity(current.manifest.reviewEvidence)) ||
+      !authenticateFrozenAttachments(predecessorDirectory, prior.reviewEvidence)) return false;
+    // A moving symbolic base is provenance, not an effective frozen input.
+    // Only a proven fast-forward with the same target merge-base can reuse
+    // specialist work; missing/replaced commits and inconclusive git proofs
+    // fail closed. Both manifests retain their own observed base tips.
+    if (typeof prior.baseRefSha !== 'string' || !/^[0-9a-f]{40}$/u.test(prior.baseRefSha)) return false;
+    if (prior.baseRefSha !== current.manifest.baseRefSha) {
+      gitRaw(current.manifest.repoPath, ['merge-base', '--is-ancestor', prior.baseRefSha, current.manifest.baseRefSha]);
+      if (git(current.manifest.repoPath, ['merge-base', current.manifest.baseRefSha, current.manifest.targetSha]) !== prior.diffBaseSha) return false;
+    }
+    const files = [
+      ['diff.patch', prior.diffSha256, FROZEN_DIFF_MAX_BYTES],
+      ['spec-context.md', prior.specSha256, FROZEN_SPEC_MAX_BYTES],
+      ['project-conventions.md', prior.conventionsSha256, FROZEN_CONVENTIONS_MAX_BYTES],
+    ] as const;
+    for (const [name, digest, limit] of files) {
+      if (hash(readReviewCheckpointBytes(predecessorDirectory, name, limit)) !== digest) return false;
+    }
+    if (typeof prior.changedFilesSha256 !== 'string' || prior.changedFilesSha256 !== current.manifest.changedFilesSha256) return false;
+    const changed = readReviewCheckpointBytes(predecessorDirectory, 'changed-files.json', FROZEN_CHANGED_FILES_MAX_BYTES);
+    if (hash(changed) !== prior.changedFilesSha256 ||
+      JSON.stringify(JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(changed))) !== JSON.stringify(prior.changedFiles)) return false;
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -562,6 +783,13 @@ export function readReviewArtifact(review: FrozenReview, relativePath: string): 
 
 export function writeReviewArtifact(review: FrozenReview, relativePath: string, value: unknown): string {
   const { root, path } = reviewArtifactPath(review, relativePath);
-  atomicWrite(path, typeof value === 'string' ? value : `${JSON.stringify(value, null, 2)}\n`, root);
+  const bytes = typeof value === 'string' ? value : `${JSON.stringify(value, null, 2)}\n`;
+  if ((/^attempts\/[a-z]+-[12]\.settled\.json$/u.test(relativePath) ||
+    /^specialists\/[a-z]+\.attempt-[12]-[a-f0-9]{8}\.envelope\.json$/u.test(relativePath) ||
+    /^children\/[A-Za-z0-9._-]+\.json$/u.test(relativePath)) &&
+    Buffer.byteLength(bytes, 'utf8') > SPECIALIST_CHECKPOINT_MAX_BYTES) {
+    throw new Error('specialist checkpoint exceeds its recovery byte limit');
+  }
+  atomicWrite(path, bytes, root);
   return path;
 }

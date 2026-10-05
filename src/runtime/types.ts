@@ -174,9 +174,12 @@ export interface SpawnOptions {
    * tools, disables project/global resources, and forbids resume.
    */
   readonly isolatedReview?: IsolatedReviewPolicy;
-  /** Request-owned Claude preflight proof, forwarded only to this round's
-   * lead and lenses. Never persisted or cached by role on the adapter. */
+  /** Request-owned resolved review model proof; Pi carries only the
+   * non-secret provider/model, Claude additionally carries private auth. */
   readonly reviewModel?: ClaudeReviewSnapshot;
+  /** Runtime-registry ownership generation for this isolated review round.
+   * Used only to bind adapter cessation to the durable round marker. */
+  readonly reviewOwnerGeneration?: string;
   /** Fresh ambient-free Perkins lead with product-owned orchestration tools. */
   readonly reviewLead?: IsolatedReviewPolicy & {
     readonly nativeTools: readonly NativeAgentTool[];

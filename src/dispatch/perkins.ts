@@ -1,6 +1,6 @@
 import type { AgentHandle } from '../runtime/types.js';
 import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import type { LogLevel } from '../logger.js';
@@ -21,21 +21,26 @@ import {
 } from './branch-idle.js';
 import type { AgentSpawner } from './service.js';
 import type { EventBus } from '../events/bus.js';
-import type { ResidentReviewRound } from '../runtime/registry.js';
+import { validReviewOwnerGeneration, type ResidentReviewRound, type ReviewOwnerMarker } from '../runtime/registry.js';
 import { settleRetries, type PacingGate, type PacingLease, type RateLimitBackoffPolicy, type RetrySettlement } from '../runtime/pacing.js';
 import { isExactOriginBranchSpelling } from '../worktrees/manager.js';
 import { deliveredTargetSha } from './silas-driver.js';
 import type { CanonicalReviewVerdict, VerifiedFinding } from './perkins-review/types.js';
-import { PerkinsWholeReview, type PerkinsWholeResult, type RoundBudgetRefusal } from './perkins-review/whole.js';
+import { PerkinsWholeReview, verifiedSpecialistCheckpointResults, type PerkinsWholeResult, type RoundBudgetRefusal } from './perkins-review/whole.js';
+import { publicRecoveryModelIdentity } from '../runtime/review-model-identity.js';
 import { loadPerkinsPolicy, type PerkinsLens, type PerkinsPolicy } from './perkins-review/policy.js';
 import {
   freezeReviewInputs,
+  compatibleReviewIdentity,
+  proveRecoveredBaseMergeability,
   refMovedSinceFreeze,
   sourceMovementSinceFreeze,
   resolveGitCommit,
   resolveReviewBaseRef,
   reviewArtifactDirectory,
+  readReviewCheckpointBytes,
   writeReviewArtifact,
+  FROZEN_MANIFEST_MAX_BYTES,
   FROZEN_SPEC_MAX_BYTES,
   type FreezeReviewInput,
   type FrozenReview,
@@ -157,7 +162,7 @@ function renderUntrustedInline(value: string, maxChars = 240): string {
 export function hostDisclosureAppendix(
   review: {
     readonly findings: ReadonlyArray<{ readonly severity: string; readonly title: string; readonly location: string; readonly source: string }>;
-    readonly specialistRuns: ReadonlyArray<{ readonly lens: string; readonly status: string; readonly findingsDelivered?: boolean; readonly cleanupRecordingError?: string; readonly evidenceRecordingError?: string; readonly progressError?: string }>;
+    readonly specialistRuns: ReadonlyArray<{ readonly lens: string; readonly status: string; readonly findingsDelivered?: boolean; readonly recoveredForLead?: true; readonly cleanupRecordingError?: string; readonly evidenceRecordingError?: string; readonly progressError?: string }>;
     readonly priorDispositions: ReadonlyArray<{ readonly status: string }>;
     readonly budgetRefusals?: ReadonlyArray<RoundBudgetRefusal>;
   },
@@ -177,12 +182,13 @@ export function hostDisclosureAppendix(
     ? ['- none retained']
     : review.findings.map((finding) =>
         `- [${finding.severity}] \`${renderUntrustedInline(finding.title)}\` — \`${renderUntrustedInline(finding.location)}\` (source: ${renderUntrustedInline(finding.source, 40)})`);
-  const byLens = new Map<string, { valid: number; failed: number; undelivered: boolean; cleanupGap: boolean; evidenceGap: boolean; progressGap: boolean }>();
+  const byLens = new Map<string, { valid: number; failed: number; undelivered: boolean; restored: boolean; cleanupGap: boolean; evidenceGap: boolean; progressGap: boolean }>();
   for (const run of review.specialistRuns) {
-    const entry = byLens.get(run.lens) ?? { valid: 0, failed: 0, undelivered: false, cleanupGap: false, evidenceGap: false, progressGap: false };
+    const entry = byLens.get(run.lens) ?? { valid: 0, failed: 0, undelivered: false, restored: false, cleanupGap: false, evidenceGap: false, progressGap: false };
     if (run.status === 'valid') entry.valid += 1;
     else entry.failed += 1;
-    if (run.findingsDelivered === false) entry.undelivered = true;
+    if (run.recoveredForLead === true) entry.restored = true;
+    else if (run.findingsDelivered === false) entry.undelivered = true;
     if (run.cleanupRecordingError !== undefined) entry.cleanupGap = true;
     if (run.evidenceRecordingError !== undefined) entry.evidenceGap = true;
     if (run.progressError !== undefined) entry.progressGap = true;
@@ -191,6 +197,7 @@ export function hostDisclosureAppendix(
   const ran = [...byLens.entries()].sort(([left], [right]) => left.localeCompare(right));
   const failed = ran.filter(([, entry]) => entry.failed > 0);
   const undelivered = ran.filter(([, entry]) => entry.undelivered);
+  const restored = ran.filter(([, entry]) => entry.restored);
   const cleanupGaps = ran.filter(([, entry]) => entry.cleanupGap);
   const evidenceGaps = ran.filter(([, entry]) => entry.evidenceGap);
   const progressGaps = ran.filter(([, entry]) => entry.progressGap);
@@ -217,6 +224,7 @@ export function hostDisclosureAppendix(
       ? [`- Round specialist budget: ${review.budgetRefusals.length} run call(s) refused by the ${review.budgetRefusals[0]!.cap}-run cap before any child started (${[...new Set(review.budgetRefusals.flatMap((refusal) => refusal.lenses))].join(', ')})`]
       : []),
     ...(undelivered.length > 0 ? [`- Specialist findings were NOT delivered to the lead: ${undelivered.map(([lens]) => lens).join(', ')} — those runs completed but the transport response failed, so the lead judged without their findings`] : []),
+    ...(restored.length > 0 ? [`- Prior-round checkpoint evidence shown to the fresh lead: ${restored.map(([lens]) => lens).join(', ')} — earlier transport delivery was not inherited; the fresh lead was required to revalidate it against the frozen head`] : []),
     ...(cleanupGaps.length > 0 ? [`- Specialist cleanup failures that could not be recorded durably: ${cleanupGaps.map(([lens]) => lens).join(', ')}`] : []),
     ...(evidenceGaps.length > 0 ? [`- Specialist evidence recording gaps: ${evidenceGaps.map(([lens]) => lens).join(', ')} — those runs stand, but at least one of their evidence artifacts could not be written; the sealed run record carries the reason`] : []),
     ...(progressGaps.length > 0 ? [`- Specialist progress observer failures: ${progressGaps.map(([lens]) => lens).join(', ')} — the runs stand, but their progress report could not be published; the sealed run record carries the reason`] : []),
@@ -1199,6 +1207,11 @@ export interface WaveRunnerOptions {
   readonly spawner: AgentSpawner;
   /** Service-wide paired resident admission; omitted by standalone workflow tests. */
   readonly reserveReviewRound?: (signal: AbortSignal) => Promise<ResidentReviewRound>;
+  /** Stable runtime implementation identity, not a credential or model alias. */
+  readonly reviewRuntimeIdentity?: () => { readonly id: string; readonly version: string };
+  readonly reviewThinkingLevel?: () => string;
+  /** Runtime-owned proof that an interrupted owner has actually ceased. */
+  readonly reconcileReviewAgent?: (agentId: string, marker: ReviewOwnerMarker | null) => Promise<boolean>;
   readonly maxConcurrentChildren?: number;
   /** Ledger bus used to admit a worker's durable handoff after its turn delivers. */
   readonly bus?: EventBus;
@@ -1719,6 +1732,23 @@ export class WaveRunner {
     return recovered;
   }
 
+  /** A write-once pre-spawn event, not a ledger lifecycle state, binds
+   * the runtime host whose cessation must be proven before replacement. */
+  private reviewOwnerMarker(round: RoundRecord): ReviewOwnerMarker | null {
+    const event = this.opts.ledger.uniqueRoundReviewOwnerMarker(round.id);
+    if (event?.jobId !== round.jobId || event.roundId !== round.id ||
+      typeof event.payload !== 'object' || event.payload === null || Array.isArray(event.payload)) return null;
+    const payload = event.payload as Record<string, unknown>;
+    if (payload['roundId'] !== round.id || payload['targetSha'] !== round.targetRef ||
+      (payload['runtimeId'] !== 'pi' && payload['runtimeId'] !== 'claude-code') ||
+      !Number.isSafeInteger(payload['pid']) || (payload['pid'] as number) <= 0 ||
+      !validReviewOwnerGeneration(payload['generation'])) return null;
+    return {
+      roundId: round.id, runtimeId: payload['runtimeId'], pid: payload['pid'] as number,
+      generation: payload['generation'],
+    };
+  }
+
   private abortRound(round: RoundRecord, note: string): void {
     for (const chip of round.lenses) {
       if (chip.state === 'pending' || chip.state === 'live') {
@@ -1905,7 +1935,8 @@ export class WaveRunner {
       const pending = this.handoffs.get(input.jobId);
       this.assertHandoffAuthorized(input.jobId, pending?.seq ?? -1);
     }
-    const begun = await this.beginPerkinsRound({ ...input, reviewModel: result.reviewModel });
+    const begun = await this.beginPerkinsRound({ ...input, reviewModel: result.reviewModel,
+      reviewThinkingLevel: result.reviewThinkingLevel });
     return { route: 'perkins', round: begun.round, run: begun.run };
   }
 
@@ -2070,15 +2101,17 @@ export class WaveRunner {
   }): Promise<{ readonly round: RoundRecord; readonly run: Promise<WaveOutcome> }> {
     this.enforceBranchIdleForRequest(input);
     let reviewModel: ReviewPreflightResult['reviewModel'];
+    let reviewThinkingLevel: string | undefined;
     if (this.opts.reviewPreflight !== undefined) {
       const repoPath = this.resolveReviewRequestRepo(input);
       if (repoPath !== null) {
         const result = await this.opts.reviewPreflight({ repoPath });
         if (!result.ok) throw new FallbackGateRequiredError(result.failures);
         reviewModel = result.reviewModel;
+        reviewThinkingLevel = result.reviewThinkingLevel;
       }
     }
-    return this.beginPerkinsRound({ ...input, reviewModel });
+    return this.beginPerkinsRound({ ...input, reviewModel, reviewThinkingLevel });
   }
 
   private resolveReviewRequestRepo(input: { jobId: string }): string | null {
@@ -2177,6 +2210,8 @@ export class WaveRunner {
     return { targetBranch, blockers };
   }
 
+  private readonly roundAdmission = new Set<string>();
+
   private async beginPerkinsRound(input: {
     jobId: string;
     targetRef?: string;
@@ -2188,10 +2223,19 @@ export class WaveRunner {
     force?: boolean;
     evidence?: readonly ReviewEvidenceRequest[];
     reviewModel?: ReviewPreflightResult['reviewModel'];
+    reviewThinkingLevel?: string;
   }): Promise<{ readonly round: RoundRecord; readonly run: Promise<WaveOutcome> }> {
     if (this.shuttingDown) throw new Error('Perkins review service is shutting down');
+    if (this.roundAdmission.has(input.jobId)) {
+      throw new Error(`review round admission for job ${input.jobId} is already in progress; retry after setup settles`);
+    }
+    this.roundAdmission.add(input.jobId);
     const controller = new AbortController();
-    return this.track(this.setupRound(input, controller.signal), controller);
+    try {
+      return await this.track(this.setupRound(input, controller.signal), controller);
+    } finally {
+      this.roundAdmission.delete(input.jobId);
+    }
   }
 
   /** Direct, lane-independent re-proof of the CURRENT fallback-admission
@@ -2726,6 +2770,7 @@ export class WaveRunner {
     force?: boolean;
     evidence?: readonly ReviewEvidenceRequest[];
     reviewModel?: ReviewPreflightResult['reviewModel'];
+    reviewThinkingLevel?: string;
   }, setupSignal: AbortSignal): Promise<{ readonly round: RoundRecord; readonly run: Promise<WaveOutcome> }> {
     if (this.shuttingDown || setupSignal.aborted) throw new Error('Perkins review service is shutting down');
     const policy = (this.opts.reviewPolicyLoader ?? loadPerkinsPolicy)();
@@ -2818,17 +2863,55 @@ export class WaveRunner {
         });
       }
     };
-    const flippedFrom = job.status === 'working' || job.status === 'blocked' ? job.status : null;
-    let round: RoundRecord;
-    try {
-      if (flippedFrom !== null) this.opts.ledger.setJobStatus(job.id, 'in-review');
-      round = this.opts.ledger.addRound({ jobId: job.id, lenses: canonicalLenses, targetRef: targetSha });
-    } catch (error) {
-      if (flippedFrom !== null && !isJobTerminal(this.opts.ledger.getJob(job.id)?.status ?? job.status)) {
-        this.opts.ledger.setJobStatus(job.id, flippedFrom);
+    // Reconcile ownership before creating a replacement round or worktree.
+    // Ledger disposal metadata is not runtime cessation proof. A live/pending
+    // predecessor may be executing even before its first agent is recorded.
+    const predecessor = [...this.opts.ledger.listRounds(job.id)]
+      .sort((left, right) => right.seq - left.seq)[0];
+    for (const oldRound of this.opts.ledger.listRounds(job.id).filter((candidate) => candidate.status !== 'verdict-posted')) {
+      if (oldRound.status === 'pending' || oldRound.status === 'live') {
+        throw new Error(`review round ${oldRound.id} still owns this job; reconcile its live owner before replacement`);
       }
-      throw error;
+      // Head changes invalidate reuse, not writer ownership. The marker
+      // precedes registration and must be reconciled even with zero agents.
+      const marker = this.reviewOwnerMarker(oldRound);
+      const agents = this.opts.ledger.listAgents().filter((entry) => entry.roundId === oldRound.id);
+      const receipt = this.opts.ledger.uniqueRoundNoSpawnReceipt(oldRound.id);
+      const proof = receipt?.payload as { roundId?: unknown; generation?: unknown; ownerGeneration?: unknown } | null;
+      const noSpawn = agents.length === 0 && receipt?.jobId === job.id && receipt.roundId === oldRound.id &&
+        proof?.roundId === oldRound.id && validReviewOwnerGeneration(proof.generation) &&
+        proof.ownerGeneration === (marker?.generation ?? null) &&
+        (marker !== null || this.opts.ledger.latestRoundEvent(oldRound.id, 'round.review-owner') === null) &&
+        this.opts.ledger.listRoundSpecialistStarts(oldRound.id).length === 0;
+      if (this.opts.ledger.latestRoundEvent(oldRound.id, 'round.review-no-spawn') !== null && !noSpawn) {
+        throw new Error(`review round ${oldRound.id} has contradictory or duplicate no-spawn and owner evidence; reconcile ownership manually`);
+      }
+      if (!noSpawn && marker === null && agents.length === 0) {
+        throw new Error(`review round ${oldRound.id} has no trusted no-spawn proof or owner marker; ownership is unknown (including a possible spawn-before-registration crash) — reconcile cessation manually before replacement`);
+      }
+      if (!noSpawn && marker !== null && agents.length === 0 &&
+        await this.opts.reconcileReviewAgent?.('', marker) !== true) {
+        throw new Error(`review owner marker from round ${oldRound.id} may still run before agent registration; reconcile runtime cessation before replacement`);
+      }
+      for (const agent of agents) {
+        if (await this.opts.reconcileReviewAgent?.(agent.id, marker) !== true) {
+          throw new Error(`review owner ${agent.id} from round ${oldRound.id} may still run; reconcile runtime cessation before starting a replacement writer`);
+        }
+      }
     }
+    const latestAfterReconciliation = [...this.opts.ledger.listRounds(job.id)]
+      .sort((left, right) => right.seq - left.seq)[0];
+    if (latestAfterReconciliation?.id !== predecessor?.id) {
+      throw new Error('review ownership changed during reconciliation; retry after the active round settles');
+    }
+    const flippedFrom = job.status === 'working' || job.status === 'blocked' ? job.status : null;
+    // The local admission guard covers this runner's awaited setup. The
+    // ledger CAS covers other runner instances (or processes) sharing its
+    // database: a replaced predecessor or status cannot mint two writers.
+    const round = this.opts.ledger.admitReviewRound({
+      jobId: job.id, expectedLatestRoundId: predecessor?.id ?? null,
+      expectedJobStatus: job.status, lenses: canonicalLenses, targetRef: targetSha,
+    });
 
     let reviewWorktree: Awaited<ReturnType<WorktreePort['createReviewWorktree']>> | undefined;
     let frozenReview: FrozenReview;
@@ -2875,8 +2958,38 @@ export class WaveRunner {
       // Late binding: amendments/CI/verification are read NOW, after every
       // await in setup, so the frozen round carries the newest records.
       assembleReviewInputs();
+      const runtime = this.opts.reviewRuntimeIdentity?.();
+      const model = input.reviewModel;
+      if (input.reviewThinkingLevel !== undefined &&
+        input.reviewThinkingLevel !== this.opts.reviewThinkingLevel?.()) {
+        throw new Error('review thinking level changed since preflight — retry the review request');
+      }
+      const thinkingLevel = input.reviewThinkingLevel ?? this.opts.reviewThinkingLevel?.();
+      // Provider-routing environment is not persistable without risking
+      // credential exposure. If it exists, its value could switch the
+      // effective model behind an unchanged modelRef: refuse reuse instead.
+      const stableProvider = model !== undefined && Object.keys(model.authEnv).every((name) =>
+        ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN'].includes(name)) &&
+        runtime !== undefined && publicRecoveryModelIdentity({ runtimeId: runtime.id,
+          modelRef: model.modelRef, settingsModel: model.settings.model,
+          thinkingLevel, routingSha256: model.routingSha256 });
+      const recoveryIdentity = runtime !== undefined && runtime.id !== '' && runtime.version !== '' &&
+        stableProvider && model !== undefined && model.modelRef !== '' && model.modelRef !== 'default'
+        ? {
+            jobId: job.id,
+            policySha256: createHash('sha256').update(JSON.stringify(policy)).digest('hex'),
+            runtimeId: runtime.id, runtimeVersion: runtime.version,
+            modelRef: model.modelRef, modelRole: model.role,
+            // Never persist or hash credential values or auth environment.
+            modelSettingsSha256: createHash('sha256').update(JSON.stringify({
+              model: model.settings.model ?? null,
+              thinkingLevel: thinkingLevel ?? null,
+              routingSha256: model.routingSha256 ?? null,
+            })).digest('hex'),
+          } : undefined;
       frozenReview = freezeReviewInputs({
         roundId: round.id,
+        ...(recoveryIdentity !== undefined ? { recoveryIdentity } : {}),
         repoPath: reviewWorktree.path,
         artifactRoot,
         baseRef,
@@ -2911,14 +3024,30 @@ export class WaveRunner {
           ci: frozenReview.manifest.reviewEvidence?.ci ?? null,
         },
       });
-      if (this.opts.reserveReviewRound === undefined) this.opts.ledger.setRoundStatus(round.id, 'live');
+      // The manifest's self-declared hashes are not its authority: pin the
+      // exact frozen bytes independently in the append-only ledger before
+      // any specialist can create reusable checkpoint evidence.
+      this.opts.ledger.appendCustomEvent({
+        kind: 'round.freeze-manifest', jobId: job.id, roundId: round.id,
+        payload: { sha256: createHash('sha256').update(readFileSync(join(frozenReview.directory, 'manifest.json'))).digest('hex') },
+      });
+      // Durable runtime provenance BEFORE any lead/child may spawn. The
+      // generation binds same-process adapter cessation; a restarted Pi
+      // service may instead prove its old in-process host PID has exited.
+      if (runtime?.id === 'pi' || runtime?.id === 'claude-code') {
+        this.opts.ledger.appendCustomEvent({
+          kind: 'round.review-owner', jobId: job.id, roundId: round.id,
+          payload: { roundId: round.id, targetSha, runtimeId: runtime.id,
+            pid: process.pid, generation: randomUUID() },
+        });
+      }
     } catch (error) {
       const failures: unknown[] = [error];
       const interrupted = this.shuttingDown || setupSignal.aborted;
       try {
         if (interrupted) {
           const note = 'review setup interrupted by service shutdown; frozen proof is incomplete';
-          this.abortRound(this.opts.ledger.getRound(round.id) ?? round, note);
+          this.opts.ledger.abortReviewSetupWithoutSpawn(round.id);
           const artifacts = this.writeInterruptedArtifacts(round.id, 'service_shutdown_setup', note);
           this.opts.ledger.appendCustomEvent({
             kind: 'round.perkins-incomplete',
@@ -2931,7 +3060,9 @@ export class WaveRunner {
             },
           });
         } else {
-          this.opts.ledger.setRoundStatus(round.id, 'aborted');
+          // The immutable negative receipt and abort commit together. A
+          // failure after the owner marker is never eligible for this proof.
+          this.opts.ledger.abortReviewSetupWithoutSpawn(round.id);
         }
       } catch (proofError) {
         failures.push(proofError);
@@ -2945,7 +3076,9 @@ export class WaveRunner {
       }
       if (flippedFrom !== null && !isJobTerminal(this.opts.ledger.getJob(job.id)?.status ?? job.status)) {
         try {
-          this.opts.ledger.setJobStatus(job.id, flippedFrom);
+          this.opts.ledger.restoreReviewSetupStatus({
+            jobId: job.id, roundId: round.id, priorStatus: flippedFrom,
+          });
         } catch (restoreError) {
           failures.push(restoreError);
         }
@@ -3158,6 +3291,15 @@ export class WaveRunner {
   ): Promise<WaveOutcome> {
     let reservation: ResidentReviewRound | undefined;
     let settledOutcome: WaveOutcome | null = null;
+    let spawnInitiated = false;
+    const beginSpawn = (): void => {
+      if (!spawnInitiated) {
+        // Commit the owner boundary before invoking a spawner: a rejected
+        // spawn may already have created an unregistered writer.
+        this.opts.ledger.setRoundStatus(round.id, 'live');
+        spawnInitiated = true;
+      }
+    };
     try {
       reservation = this.opts.reserveReviewRound === undefined
         ? undefined : await this.opts.reserveReviewRound(signal);
@@ -3166,18 +3308,24 @@ export class WaveRunner {
           await reservation.close();
           throw new Error('review cancelled before admission');
         }
-        this.opts.ledger.setRoundStatus(round.id, 'live');
         this.opts.ledger.appendCustomEvent({
           kind: 'round.residency-admitted', jobId: job.id, roundId: round.id,
           payload: { reason: 'lead and child resident slots admitted' },
         });
       }
-      const outcome = await this.runOwnedReview(job, round, lenses, movementRef, noSpec, frozenReview, policy, signal, reviewModel, reservation);
+      const outcome = await this.runOwnedReview(job, round, lenses, movementRef, noSpec, frozenReview, policy, signal, reviewModel, beginSpawn, () => spawnInitiated, reservation);
       settledOutcome = outcome;
       return outcome;
     } catch (error) {
       if (this.opts.ledger.getRound(round.id)?.status === 'pending') {
-        this.abortRound(this.opts.ledger.getRound(round.id) ?? round, `review admission cancelled: ${String(error)}`);
+        if (spawnInitiated) {
+          // Never invent a negative receipt after the owner may have spawned.
+          this.abortRound(this.opts.ledger.getRound(round.id) ?? round, `review admission cancelled: ${String(error)}`);
+        } else {
+          // The guarded receipt and abort commit together, or leave the
+          // uncertain owner pending for explicit reconciliation.
+          this.opts.ledger.abortReviewSetupWithoutSpawn(round.id);
+        }
         this.opts.ledger.appendCustomEvent({
           kind: 'round.residency-cancelled', jobId: job.id, roundId: round.id,
           payload: { error: String(error) },
@@ -3214,21 +3362,39 @@ export class WaveRunner {
     frozenReview: FrozenReview,
     policy: PerkinsPolicy,
     signal: AbortSignal,
-    reviewModel?: ReviewPreflightResult['reviewModel'],
+    reviewModel: ReviewPreflightResult['reviewModel'] | undefined,
+    beginSpawn: () => void,
+    spawnInitiated: () => boolean,
     reservation?: ResidentReviewRound,
   ): Promise<WaveOutcome> {
     // The model-resolution closure belongs to one round. A concurrent
     // preflight cannot replace the proof used by its lead or specialist
     // children, and a reserved round routes through its own admission.
+    const owner = this.reviewOwnerMarker(round);
+    const frozenThinking = this.opts.reviewThinkingLevel?.();
+    if (frozenReview.manifest.recoveryIdentity !== null && reviewModel !== undefined &&
+      createHash('sha256').update(JSON.stringify({
+        model: reviewModel.settings.model ?? null, thinkingLevel: frozenThinking ?? null,
+        routingSha256: reviewModel.routingSha256 ?? null,
+      })).digest('hex') !== frozenReview.manifest.recoveryIdentity.modelSettingsSha256) {
+      throw new Error('review thinking/model settings changed since freeze — a new review is required');
+    }
     const spawnWithOptions: AgentSpawner = (role, options) => {
+      if (frozenThinking !== undefined && this.opts.reviewThinkingLevel?.() !== frozenThinking) {
+        throw new Error('review thinking level changed since freeze — a new review is required');
+      }
       if (reservation !== undefined && role !== 'perkins') {
         throw new Error(`review reservation spawns perkins sessions only, got role "${role}"`);
       }
       const resolved = {
         ...options,
+        ...(frozenThinking !== undefined ? { thinkingLevel: frozenThinking } : {}),
+        ...(owner !== null && (options?.isolatedReview !== undefined || options?.reviewLead !== undefined)
+          ? { reviewOwnerGeneration: owner.generation } : {}),
         ...(reviewModel !== undefined && (options?.isolatedReview !== undefined || options?.reviewLead !== undefined)
           ? { reviewModel } : {}),
       };
+      beginSpawn();
       return reservation === undefined
         ? this.opts.spawner(role, resolved)
         : reservation.spawn(resolved);
@@ -3243,6 +3409,18 @@ export class WaveRunner {
         kind: event.kind, jobId: job.id, roundId: round.id, agentId: event.agentId ?? null, payload: event.payload,
       }),
       policy,
+      recordSpecialistStart: (lens, attempt, originRoundId = round.id) => {
+        this.opts.ledger.appendCustomEvent({
+          kind: 'round.specialist-started', jobId: job.id, roundId: round.id,
+          payload: { lens, attempt, originRoundId },
+        });
+      },
+      recordSpecialistSettlement: (lens, attempt, sha256) => {
+        this.opts.ledger.appendCustomEvent({
+          kind: 'round.specialist-settled', jobId: job.id, roundId: round.id,
+          payload: { lens, attempt, sha256 },
+        });
+      },
       onAgent: ({ phase, lens, attempt, handle }) => {
         this.opts.ledger.registerAgent({
           id: handle.id,
@@ -3282,18 +3460,141 @@ export class WaveRunner {
         }
         priorConsolidatedFile = file;
       }
+      // Content identity may span several interrupted round ids. Take all
+      // compatible owners since the last posted verdict so a second crash
+      // DURING checkpoint copying cannot erase a previously charged start.
+      const history = this.opts.ledger.listRounds(job.id)
+        .filter((candidate) => candidate.seq < round.seq)
+        .sort((left, right) => right.seq - left.seq);
+      const postedIndex = history.findIndex((candidate) => candidate.status === 'verdict-posted');
+      const interrupted = history.slice(0, postedIndex === -1 ? undefined : postedIndex);
+      const candidates: { round: RoundRecord; directory: string; manifestSha256: string; baseRefSha: string }[] = [];
+      for (const candidate of interrupted) {
+        // A changed, unknown or tampered intermediate round breaks the
+        // lineage. Never jump past it to credit an older compatible round.
+        if (candidate.status !== 'aborted') break;
+        const directory = reviewArtifactDirectory(this.artifactRoot(), candidate.id);
+        const freeze = this.opts.ledger.uniqueRoundFreezeManifestReceipt(candidate.id);
+        const pinned = freeze?.payload as { sha256?: unknown } | null;
+        if (freeze?.jobId !== job.id || freeze.roundId !== candidate.id ||
+          typeof pinned?.sha256 !== 'string' || !/^[0-9a-f]{64}$/u.test(pinned.sha256)) break;
+        if (!compatibleReviewIdentity(frozenReview, directory, pinned.sha256)) break;
+        const manifestBytes = readReviewCheckpointBytes(directory, 'manifest.json', FROZEN_MANIFEST_MAX_BYTES);
+        if (createHash('sha256').update(manifestBytes).digest('hex') !== pinned.sha256) break;
+        const priorBase = (JSON.parse(manifestBytes.toString('utf8')) as { baseRefSha?: unknown }).baseRefSha;
+        if (typeof priorBase !== 'string' || !/^[a-f0-9]{40}$/u.test(priorBase)) break;
+        candidates.push({ round: candidate, directory, manifestSha256: pinned.sha256, baseRefSha: priorBase });
+      }
+      const recoveredBaseTips = [...new Set(candidates
+        .map((candidate) => candidate.baseRefSha)
+        .filter((tip) => tip !== frozenReview.manifest.baseRefSha))];
+      if (recoveredBaseTips.length > 0) {
+        try {
+          proveRecoveredBaseMergeability(frozenReview, recoveredBaseTips);
+        } catch {
+          // Charged starts survive, but conflicting/uncertain bases cannot
+          // supply specialist credit. A fresh lead may still review anew.
+          candidates.length = 0;
+        }
+      }
+      let recoveryDirectory: string | undefined;
+      let recoveryStarts: { lens: PerkinsLens; attempt: 1 | 2; originRoundId: string }[] | undefined;
+      let recoverySources: { lens: PerkinsLens; attempt: 1 | 2; directory: string; manifestSha256: string; sha256?: string }[] | undefined;
+      // Starts are independent ledger charges, even if the output manifest
+      // is gone, forged, or belongs to a different model. Only output reuse
+      // depends on compatible frozen evidence.
+      const chargedRounds = interrupted.filter((candidate) =>
+        candidate.status === 'aborted' && candidate.targetRef === frozenReview.manifest.targetSha);
+      if (chargedRounds.length > 0) {
+        const startsByRound = chargedRounds.map((round) => {
+          const matching = candidates.find((entry) => entry.round.id === round.id);
+          const directory = matching?.directory ?? frozenReview.directory;
+          const manifestSha256 = matching?.manifestSha256 ?? '';
+          const events = this.opts.ledger.listRoundSpecialistStarts(round.id);
+          if (events.length > 16) throw new Error(`review round ${round.id} exceeds the 16-run specialist cap`);
+          const starts = events.map((event) => {
+            const payload = event.payload as { lens?: unknown; attempt?: unknown; originRoundId?: unknown } | null;
+            if (payload === null || typeof payload !== 'object' ||
+              !lenses.includes(payload.lens as PerkinsLens) || (payload.attempt !== 1 && payload.attempt !== 2)) {
+              throw new Error(`review round ${round.id} has an invalid charged specialist start event`);
+            }
+            const originRoundId = payload.originRoundId ?? round.id;
+            if (typeof originRoundId !== 'string' ||
+              !this.opts.ledger.listRounds(job.id).some((entry) => entry.id === originRoundId && entry.seq <= round.seq)) {
+              throw new Error(`review round ${round.id} has an invalid charged specialist origin`);
+            }
+            return { lens: payload.lens as PerkinsLens, attempt: payload.attempt as 1 | 2, originRoundId };
+          });
+          if (new Set(starts.map((start) => `${start.lens}-${start.attempt}`)).size !== starts.length) {
+            throw new Error(`review round ${round.id} has duplicate charged specialist starts`);
+          }
+          return { round, directory, manifestSha256, starts };
+        });
+        const allStarts = new Map<string, { lens: PerkinsLens; attempt: 1 | 2; originRoundId: string }>();
+        for (const candidate of startsByRound) {
+          for (const start of candidate.starts) {
+            const key = `${start.lens}-${start.attempt}`;
+            const previous = allStarts.get(key);
+            if (previous !== undefined && previous.originRoundId !== start.originRoundId) {
+              throw new Error(`specialist ${key} has independently charged starts from multiple rounds; attempt budget is ambiguous — reconcile before replacement`);
+            }
+            allStarts.set(key, start);
+          }
+        }
+        recoveryStarts = [...allStarts.values()].sort((left, right) =>
+          left.attempt - right.attempt || left.lens.localeCompare(right.lens));
+        if (recoveryStarts.length > 16) throw new Error('recovered lineage exceeds the 16-run specialist cap');
+        const sources = startsByRound.map((candidate) => {
+          const settlements = this.opts.ledger.listRoundSpecialistSettlements(candidate.round.id).map((event) => {
+            const payload = event.payload as { lens?: unknown; attempt?: unknown; sha256?: unknown } | null;
+            if (payload === null || typeof payload !== 'object' ||
+              !lenses.includes(payload.lens as PerkinsLens) || (payload.attempt !== 1 && payload.attempt !== 2) ||
+              typeof payload.sha256 !== 'string' || !/^[a-f0-9]{64}$/u.test(payload.sha256)) {
+              throw new Error(`review round ${candidate.round.id} has an invalid settled specialist receipt`);
+            }
+            return { lens: payload.lens as PerkinsLens, attempt: payload.attempt, sha256: payload.sha256 };
+          });
+          const digests = new Map(settlements.map((entry) => [`${entry.lens}-${entry.attempt}`, entry.sha256]));
+          if (digests.size !== settlements.length) {
+            throw new Error(`review round ${candidate.round.id} has duplicate settled specialist receipts`);
+          }
+          return { ...candidate, digests,
+            verified: new Map(verifiedSpecialistCheckpointResults(candidate.directory, lenses, digests,
+              candidate.starts.map((start) => `${start.lens}-${start.attempt}`))
+              .map((result) => [result.key, result.status] as const)) };
+        });
+        recoveryDirectory = frozenReview.directory;
+        const currentManifestSha256 = createHash('sha256').update(readFileSync(join(frozenReview.directory, 'manifest.json'))).digest('hex');
+        recoverySources = recoveryStarts.map((start) => {
+          const stem = `${start.lens}-${start.attempt}`;
+          const chargedHere = (entry: (typeof sources)[number]) => entry.starts.some((item) =>
+            item.lens === start.lens && item.attempt === start.attempt);
+          const source = sources.find((entry) => entry.manifestSha256 !== '' && chargedHere(entry) && entry.verified.get(stem) === 'valid') ??
+            sources.find((entry) => entry.manifestSha256 !== '' && chargedHere(entry) && entry.verified.has(stem));
+          if (source === undefined) return { ...start, directory: frozenReview.directory, manifestSha256: currentManifestSha256 };
+          const sha256 = source.digests.get(stem);
+          return { ...start, directory: source.directory, manifestSha256: source.manifestSha256,
+            ...(sha256 !== undefined ? { sha256 } : {}) };
+        });
+      }
       review = await workflow.run({
         roundId: round.id,
+        ...(recoveryDirectory !== undefined ? { recoveryDirectory, recoveryStarts, recoverySources } : {}),
         roundNumber: round.seq,
         movementRef,
         noSpec,
         frozenReview,
         signal,
+        ...(recoveredBaseTips.length > 0 && candidates.length > 0 ? { recoveredBaseTips } : {}),
         ...(priorConsolidatedFile !== undefined ? { priorConsolidatedFile } : {}),
       });
     } catch (error) {
       const detail = `Perkins whole-PR workflow failed: ${String(error).replace(/[\r\n]+/gu, ' ').slice(0, 500)}`;
-      this.abortRound(this.opts.ledger.getRound(round.id) ?? round, detail.slice(0, 500));
+      if (!spawnInitiated() && this.opts.ledger.getRound(round.id)?.status === 'pending') {
+        this.opts.ledger.abortReviewSetupWithoutSpawn(round.id);
+      } else {
+        this.abortRound(this.opts.ledger.getRound(round.id) ?? round, detail.slice(0, 500));
+      }
       const errorArtifact = join(frozenReview.directory, 'workflow-error.json');
       if (!existsSync(errorArtifact)) {
         writeFileSync(errorArtifact, `${JSON.stringify({ schemaVersion: 1, canonicalVerdict: 'INCOMPLETE', error: detail.slice(0, 500) }, null, 2)}\n`, {
@@ -3781,7 +4082,10 @@ export class WaveRunner {
       if (failed.length > 0) {
         history.push(`earlier failed attempts: ${failed.map((run) => `a${run.attempt} ${run.failureKind ?? 'error'}`).join(', ')}`);
       }
-      if (runs.some((run) => run.status === 'valid' && run.findingsDelivered === false)) {
+      if (runs.some((run) => run.status === 'valid' && run.recoveredForLead === true)) {
+        history.push('validated prior checkpoint was shown to the fresh lead for revalidation; earlier delivery was not inherited');
+      }
+      if (runs.some((run) => run.status === 'valid' && run.findingsDelivered === false && run.recoveredForLead !== true)) {
         history.push('specialist findings for this lens were NOT delivered to the lead (transport overflow); the lead judged without them');
       }
       const note = `${verdict} — ${evidence}${history.length > 0 ? ` · ${history.join(' · ')}` : ''}`;

@@ -37,6 +37,11 @@
 # Test/install seams (also handy for real users):
 #   GRU_COMMAND_ORIGIN   clone URL when piped (default: the GitHub repo)
 #   GRU_COMMAND_TARGET   clone destination    (default: ~/gru-command)
+#   GRU_COMMAND_REVIEW_PYTHON  macOS: pinned absolute Python 3 path used by
+#                                    the launchd service for review identity.
+#                                    Setup/update/service require a working
+#                                    Python 3 inherited-directory-FD probe.
+#                                    --help/--print/--uninstall do not probe.
 
 set -euo pipefail
 
@@ -134,6 +139,64 @@ detect_os() {
 }
 
 OS="$(detect_os)"
+PYTHON_BIN="${GRU_COMMAND_REVIEW_PYTHON-$(command -v python3 || true)}"
+# Resolve the symlink before embedding the interpreter in launchd: a shell
+# version manager's path can disappear after the installing session ends.
+resolve_python_bin() {
+  [[ -n "$PYTHON_BIN" && "$PYTHON_BIN" == /* ]] || return 1
+  PYTHON_BIN="$("$NODE_BIN" -e 'const fs=require("node:fs"); const p=fs.realpathSync(process.argv[1]); if(!fs.statSync(p).isFile()) process.exit(1); process.stdout.write(p)' "$PYTHON_BIN" 2>/dev/null)" || return 1
+  [[ -x "$PYTHON_BIN" && "$PYTHON_BIN" != *$'\n'* && "$PYTHON_BIN" != *'&'* &&
+     "$PYTHON_BIN" != *'<'* && "$PYTHON_BIN" != *'>'* ]]
+}
+
+preflight_python() {
+  [[ "$OS" == "darwin" ]] || return 0
+  if ! resolve_python_bin || ! "$NODE_BIN" - "$PYTHON_BIN" <<'NODE'
+const fs = require('node:fs');
+const { spawnSync } = require('node:child_process');
+let fd, rootFd, probe;
+try {
+  // Version-manager shims can choose a different interpreter in launchd's
+  // working directory. Only the resolved native Mach-O interpreter is pinned.
+  const interpreter = fs.openSync(process.argv[2], fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  try {
+    if (!fs.fstatSync(interpreter).isFile()) throw new Error('non-regular interpreter');
+    const magic = Buffer.alloc(4);
+    if (fs.readSync(interpreter, magic, 0, 4, 0) !== 4 ||
+        !new Set(['feedface', 'cefaedfe', 'feedfacf', 'cffaedfe',
+          'cafebabe', 'bebafeca', 'cafebabf', 'bfbafeca']).has(magic.toString('hex'))) throw new Error('non-native interpreter');
+  } finally { fs.closeSync(interpreter); }
+  // Probe only our private temporary tree, never the installing shell's cwd.
+  // Runtime scans package FD 3 with a held installation-root FD 4: exercise
+  // the same descriptor-relative ancestry walk before mutating the service.
+  probe = fs.mkdtempSync(require('node:path').join(require('node:os').tmpdir(), 'gru-python-fd-probe-'));
+  fs.mkdirSync(require('node:path').join(probe, 'child'));
+  rootFd = fs.openSync(probe, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  fd = fs.openSync(require('node:path').join(probe, 'child'), fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  const info = fs.fstatSync(fd);
+  if (!info.isDirectory()) throw new Error('missing probe directory');
+  const script = 'import json,os,stat,sys\nif sys.version_info < (3,8) or not stat.S_ISDIR(os.fstat(3).st_mode) or not stat.S_ISDIR(os.fstat(4).st_mode): sys.exit(2)\nroot=os.dup(4)\ntry:\n child=os.open("child",os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,dir_fd=root)\nfinally: os.close(root)\ntry:\n if (os.fstat(child).st_dev,os.fstat(child).st_ino)!=(os.fstat(3).st_dev,os.fstat(3).st_ino): sys.exit(2)\nfinally: os.close(child)\nnames=[]\nwith os.scandir(3) as entries:\n for entry in entries:\n  if len(names)>=65536: sys.exit(2)\n  names.append(entry.name)\nprint(json.dumps([str(os.fstat(3).st_dev),str(os.fstat(3).st_ino),len(names)]))';
+  const child = spawnSync(process.argv[2], ['-I','-S','-c',script], {
+    env: { PATH: '/usr/bin:/bin', PYTHONNOUSERSITE: '1' },
+    stdio: ['ignore','pipe','pipe',fd,rootFd], encoding: 'utf8', timeout: 10000,
+    maxBuffer: 1024, shell: false,
+  });
+  if (child.status !== 0 || child.error ||
+      JSON.stringify([String(info.dev),String(info.ino)]) !== JSON.stringify(JSON.parse(child.stdout).slice(0,2))) throw new Error('FD probe failed');
+} catch { process.exitCode = 1; }
+finally {
+  if (fd !== undefined) fs.closeSync(fd);
+  if (rootFd !== undefined) fs.closeSync(rootFd);
+  if (probe !== undefined) fs.rmSync(probe, { recursive: true, force: true });
+}
+NODE
+  then
+    err "macOS review recovery requires a usable pinned Python 3 (>= 3.8) with inherited directory-FD os.scandir; install Python 3 or set GRU_COMMAND_REVIEW_PYTHON to its stable absolute executable path"
+    exit 1
+  fi
+  export GRU_COMMAND_REVIEW_PYTHON="$PYTHON_BIN"
+}
+
 if [[ "$OS" == "unsupported" && "$MODE" != "uninstall" ]]; then
   err "unsupported platform: $(uname -s) — launchd (macOS) and systemd (Linux) units ship in install/"
   exit 1
@@ -154,7 +217,7 @@ render_unit() {
   local template="$1"
   local node="$2" repo="$3" home="$4"
   # Multi-line paths cannot render into single-line unit fields.
-  for value in "$node" "$repo" "$home"; do
+  for value in "$node" "$repo" "$home" "$PYTHON_BIN"; do
     if [[ "$value" == *$'\n'* ]]; then
       err "path contains a newline which the unit renderer cannot escape: $value"
       exit 1
@@ -167,6 +230,8 @@ render_unit() {
   repo_arg="$(esc_for_sed "$repo")"
   local home_arg=""
   home_arg="$(esc_for_sed "$home")"
+  local python_arg=""
+  python_arg="$(esc_for_sed "$PYTHON_BIN")"
   if [[ "$template" == *.service.template ]]; then
     [[ "$node" == *" "* ]] && node_arg="\"$node_arg\""
     [[ "$repo" == *" "* ]] && repo_arg="\"$repo_arg\""
@@ -191,6 +256,7 @@ render_unit() {
   sed -e "s|{{NODE}}|$node_arg|g" \
       -e "s|{{REPO_ROOT}}|$repo_arg|g" \
       -e "s|{{GRU_COMMAND_HOME}}|$home_arg|g" \
+      -e "s|{{REVIEW_PYTHON}}|$python_arg|g" \
       -e "s|{{PATH}}|$path_value|g" "$template"
 }
 
@@ -583,6 +649,16 @@ run_setup() {
     err "node >= 22.19 required, found $("$NODE_BIN" --version) — upgrade Node.js first"
     exit 1
   fi
+  preflight_python
+  if [[ "$OS" == "darwin" && -f "$INSTANCE_DIR/config.toml" && "$(service_ownership)" == "owned" ]] &&
+    inside_managed_service_pgroup; then
+    local pinned
+    pinned="$(plutil -extract EnvironmentVariables.GRU_COMMAND_REVIEW_PYTHON raw -o - "$(service_target)" 2>/dev/null || true)"
+    if [[ "$pinned" != "$PYTHON_BIN" ]]; then
+      err "the running launchd unit does not pin the verified Python 3 executable — run this update from a terminal to refresh its unit before restart"
+      exit 1
+    fi
+  fi
   if [[ "$UPDATE_REQUESTED" -eq 1 && ! -f "$INSTANCE_DIR/config.toml" ]]; then
     err "--update requires an existing configured instance at $INSTANCE_DIR/config.toml"
     err "run setup without --update for a fresh installation"
@@ -678,6 +754,8 @@ run_setup() {
 
 case "$MODE" in
   print)
+    # Rendering remains side-effect-free and does not demand an FD probe.
+    [[ "$OS" != "darwin" ]] || resolve_python_bin || true
     case "$OS" in
       darwin) render_unit "$REPO_ROOT/install/launchd/$LABEL.plist.template" "$NODE_BIN" "$REPO_ROOT" "$INSTANCE_DIR" ;;
       linux) render_unit "$REPO_ROOT/install/systemd/gru-command.service.template" "$NODE_BIN" "$REPO_ROOT" "$INSTANCE_DIR" ;;
@@ -694,6 +772,7 @@ case "$MODE" in
       err "node >= 22.19 required, found $("$NODE_BIN" --version) — upgrade Node.js first"
       exit 1
     fi
+    preflight_python
     # E7 contract: dist/ must exist — the service runs node dist/main.js.
     if [[ ! -f "$REPO_ROOT/dist/main.js" ]]; then
       err "dist/main.js not found — run 'npm install && npm run build' in $REPO_ROOT first"

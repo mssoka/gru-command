@@ -27,6 +27,7 @@ interface CrashChildPayload {
   readonly sessions: string;
   readonly markerPath: string;
   readonly prUrl: string;
+  readonly crashPhase?: 'checkpoint';
 }
 
 const payloadPath = process.env['PERKINS_CRASH_CHILD'];
@@ -57,7 +58,19 @@ describe.skipIf(payloadPath === undefined)('perkins crash child (R19)', () => {
     ledger.setJobPr(job.id, spec.prUrl);
     const wave = new WaveRunner({
       ledger, worktrees: port,
-      spawner: fakeWholeSpawner(spec.sessions, { childAnswer: () => '[]', specialists: [] }).spawner,
+      ...(spec.crashPhase === 'checkpoint' ? {
+        reviewRuntimeIdentity: () => ({ id: 'pi', version: 'test-runtime-v1' }),
+        reviewPreflight: async () => ({ ok: true as const, failures: [],
+          reviewModel: { role: 'perkins' as const, modelRef: 'fixture-model-v1', settings: {}, authEnv: {}, routingSha256: "fixture-safe-route" } }),
+      } : {}),
+      spawner: fakeWholeSpawner(spec.sessions, {
+        childAnswer: () => '[]', specialists: spec.crashPhase === 'checkpoint' ? ['blind', 'edge'] : [],
+        ...(spec.crashPhase === 'checkpoint' ? { beforeSubmit: () => {
+          const round = ledger.listRounds(job.id).at(-1)!;
+          writeFileSync(spec.markerPath, `${JSON.stringify({ roundId: round.id, phase: 'checkpoint' })}\n`, 'utf8');
+          process.kill(process.pid, 'SIGKILL');
+        } } : {}),
+      }).spawner,
       poster: {
         post: async (call: { readonly body: string; readonly targetSha: string }) => ({
           reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,

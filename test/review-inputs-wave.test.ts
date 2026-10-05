@@ -121,6 +121,9 @@ describe('review-input handoff through the real wave freeze', () => {
       reviewArtifactRoot: artifacts,
       evidenceUploadsDir: uploads,
       prHeadProbe: localHeadProbe('feature/review'),
+      // Fake specialist sessions have finished before a later round starts;
+      // production must prove cessation through the runtime adapter.
+      reconcileReviewAgent: async () => true,
     });
     const begun = await wave.beginRound({
       jobId: job.id,

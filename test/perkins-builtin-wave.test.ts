@@ -60,7 +60,7 @@ import { PERKINS_LENSES } from '../src/dispatch/perkins-review/policy.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { FALLBACK_REVIEW_TIMEOUT_MS, lensAgentLabel } from '../src/dispatch/perkins.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
-import { fakeWholeSpawner, type WholeLeadOptions } from './helpers/perkins-whole-double.js';
+import { fakeWholeSpawner, groundedFinding, type WholeLeadOptions } from './helpers/perkins-whole-double.js';
 import { minimalPng } from './helpers/images.js';
 import { GitReviewPort } from './helpers/git-review-port.js';
 import { PersistedReviewPort } from './helpers/persisted-review-port.js';
@@ -529,7 +529,11 @@ describe('WaveRunner built-in Perkins production path', () => {
     expect(outcome.round.id).toBe(queued!.id);
     expect(ledger.latestRoundEvent(queued!.id, 'round.residency-admitted')).not.toBeNull();
     expect(ledger.latestRoundEvent(queued!.id, 'round.residency-cancelled')).toBeNull();
-    expect(ledger.getRound(queued!.id)?.status).not.toBe('pending'); // admitted to live, then terminalized by the probe refusal
+    // Admission itself is not a spawn: the first attempted lead transition
+    // is what changes pending to live, even if its spawner throws.
+    await outcome.run;
+    expect(ledger.getRound(queued!.id)?.status).toBe('aborted');
+    expect(ledger.uniqueRoundNoSpawnReceipt(queued!.id)).toBeNull();
     await wave.shutdown();
     rmSync(root, { recursive: true, force: true });
     rmSync(artifacts, { recursive: true, force: true });
@@ -560,6 +564,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     await pending.catch(() => {});
     expect(ledger2.getRound(waiting!.id)?.status).toBe('aborted');
     expect(ledger2.latestRoundEvent(waiting!.id, 'round.residency-cancelled')).not.toBeNull();
+    expect(ledger2.uniqueRoundNoSpawnReceipt(waiting!.id)).not.toBeNull();
     expect(spawner).not.toHaveBeenCalled();
   });
   it('fails closed on bundled-policy setup errors before a round or reviewer spawn', async () => {
@@ -1110,13 +1115,19 @@ describe('WaveRunner built-in Perkins production path', () => {
     expect(first.canonicalVerdict).toBe('NEEDS CHANGES');
 
     const secondSessions = mkdtempSync(join(tmpdir(), 'perkins-prior-second-'));
+    const recoveryPreflight = async () => ({
+      ok: true as const, failures: [],
+      reviewModel: { role: 'perkins' as const, modelRef: 'fixture-model-v1', settings: {}, authEnv: {}, routingSha256: "fixture-safe-route" },
+    });
+    const recoveryRuntime = () => ({ id: 'pi', version: 'test-runtime-v1' });
     const second = asWave(await new WaveRunner({
+      reviewPreflight: recoveryPreflight, reviewRuntimeIdentity: recoveryRuntime,
       ledger,
       worktrees: port,
       // The middle round's lead stops without submitting: an honest
       // INCOMPLETE that leaves no complete consolidated record behind.
       spawner: fakeWholeSpawner(secondSessions, {
-        childAnswer: () => '[]',
+        childAnswer: () => '[]', specialists: ['blind', 'edge'],
         neverSubmit: true,
       }).spawner,
       poster: receiptPoster,
@@ -1125,27 +1136,41 @@ describe('WaveRunner built-in Perkins production path', () => {
     }).runRound({ jobId: job.id }));
     expect(second.canonicalVerdict).toBe('INCOMPLETE');
     expect(second.round.status).toBe('aborted');
+    expect(ledger.listRoundSpecialistStarts(second.round.id)).toHaveLength(2);
+    const roundCount = ledger.listRounds(job.id).length;
+    await expect(new WaveRunner({
+      ledger, worktrees: port, spawner: makeSpawner(secondSessions, []),
+      reviewArtifactRoot: artifacts, prHeadProbe: localHeadProbe('feature/prior-continuity'),
+    }).runRound({ jobId: job.id })).rejects.toThrow(/may still run; reconcile runtime cessation/);
+    expect(ledger.listRounds(job.id)).toHaveLength(roundCount);
 
     let thirdAuditSeen = false;
     const thirdSessions = mkdtempSync(join(tmpdir(), 'perkins-prior-third-'));
+    const thirdFake = fakeWholeSpawner(thirdSessions, {
+      childAnswer: () => '[]', specialists: ['tests'],
+      priorDisposition: () => {
+        thirdAuditSeen = true;
+        return [{ prior_index: 0, status: 'still-present', note: 'defect remains: src/main.ts:2 still returns 43' }];
+      },
+    });
     const third = asWave(await new WaveRunner({
+      reviewPreflight: recoveryPreflight, reviewRuntimeIdentity: recoveryRuntime,
+      // This fake has no runtime registry; attest that its prior handles
+      // settled before admitting a replacement owner.
+      reconcileReviewAgent: async () => true,
       ledger,
       worktrees: port,
-      spawner: (() => {
-        const fake = fakeWholeSpawner(thirdSessions, {
-          childAnswer: () => '[]',
-          priorDisposition: () => {
-            thirdAuditSeen = true;
-            return [{ prior_index: 0, status: 'still-present', note: 'defect remains: src/main.ts:2 still returns 43' }];
-          },
-        });
-        return fake.spawner;
-      })(),
+      spawner: thirdFake.spawner,
       poster: receiptPoster,
       reviewArtifactRoot: artifacts,
       prHeadProbe: localHeadProbe('feature/prior-continuity'),
     }).runRound({ jobId: job.id }));
     expect(thirdAuditSeen).toBe(true);
+    expect(thirdFake.childCalls).toHaveLength(1);
+    expect(thirdFake.childCalls[0]?.prompt).toContain('"source": "tests"');
+    expect(ledger.listRoundSpecialistStarts(third.round.id)).toHaveLength(3);
+    expect(readFileSync(join(third.artifactDirectory!, 'perkins-report.publication.md'), 'utf8'))
+      .toContain('Prior-round checkpoint evidence shown to the fresh lead: blind, edge');
     expect(third.canonicalVerdict).toBe('NEEDS CHANGES');
     expect(third.round.status).toBe('verdict-posted');
     const consolidated = JSON.parse(readFileSync(join(third.artifactDirectory!, 'consolidated.json'), 'utf8')) as {
@@ -1157,6 +1182,729 @@ describe('WaveRunner built-in Perkins production path', () => {
     for (const directory of [root, artifacts, firstSessions, secondSessions, thirdSessions]) {
       rmSync(directory, { recursive: true, force: true });
     }
+  }, 180_000);
+
+  it('requires old-head writer cessation before admitting a new-head review', async () => {
+    const repo = makeFixtureRepo('perkins-historical-head');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/historical-head']);
+    const oldTarget = repo.commitFile('src/main.ts', 'export const answer = 43;\n');
+    const newTarget = repo.commitFile('src/main.ts', 'export const answer = 44;\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-historical-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-historical-artifacts-'));
+    const sessions = mkdtempSync(join(tmpdir(), 'perkins-historical-sessions-'));
+    const dbDir = mkdtempSync(join(tmpdir(), 'perkins-historical-db-'));
+    dirs.push(root, artifacts, sessions, dbDir);
+    const db = new LedgerDb(dbDir);
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/historical-head', newTarget);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-historical-head' });
+    const job = ledger.addJob({ id: 'job-historical-head', repo: 'fixture', title: 'historical head',
+      baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    const stale = ledger.addRound({ jobId: job.id, lenses: ['blind'], targetRef: oldTarget });
+    ledger.registerAgent({ id: 'historical-agent', role: 'perkins', roundId: stale.id, jobId: job.id });
+    ledger.setRoundStatus(stale.id, 'aborted');
+    const fresh = fakeWholeSpawner(sessions, { childAnswer: () => '[]', specialists: [], verdictOverride: 'INCOMPLETE' });
+    const wave = new WaveRunner({ ledger, worktrees: port, spawner: fresh.spawner, reviewArtifactRoot: artifacts,
+      reconcileReviewAgent: async () => false });
+    await expect(wave.runRound({ jobId: job.id })).rejects.toThrow(/historical-agent.*may still run/);
+    expect(fresh.leadCalls).toHaveLength(0);
+    expect(ledger.listRounds(job.id)).toHaveLength(1);
+  });
+
+  function integrityHarness(name: string) {
+    const repo = makeFixtureRepo(name);
+    repos.push(repo);
+    repo.git(['checkout', '-b', `feature/${name}`]);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), `${name}-port-`));
+    const artifacts = mkdtempSync(join(tmpdir(), `${name}-artifacts-`));
+    const dbDir = mkdtempSync(join(tmpdir(), `${name}-db-`));
+    dirs.push(root, artifacts, dbDir);
+    const db = new LedgerDb(dbDir);
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, `feature/${name}`, target);
+    const jobId = `job-${name}`;
+    const prepare = async () => {
+      await port.createJobWorktree({ repoPath: repo.path, jobId });
+      ledger.addJob({ id: jobId, repo: 'fixture', title: name, baseBranch: 'main', briefing: 'review' });
+      ledger.setJobStatus(jobId, 'working');
+      settleLane(ledger, jobId);
+    };
+    const fake = (brain: WholeLeadOptions) => {
+      const sessions = mkdtempSync(join(tmpdir(), `${name}-sessions-`));
+      dirs.push(sessions);
+      return fakeWholeSpawner(sessions, brain);
+    };
+    const wave = (modelRef: string, spawner: AgentSpawner, thinking = 'high', runtimeVersion = 'fixture-runtime-v1',
+      routingSha256: string | null = 'fixture-safe-route', runtimeId: 'pi' | 'claude-code' = 'pi',
+      settingsModel?: string,
+      reserveReviewRound?: (signal: AbortSignal) => Promise<import('../src/runtime/registry.js').ResidentReviewRound>,
+      effectiveThinking?: () => string) => new WaveRunner({
+      ...(reserveReviewRound === undefined ? {} : { reserveReviewRound }),
+      ledger, worktrees: port, spawner, reviewArtifactRoot: artifacts,
+      reconcileReviewAgent: async (_agentId, marker) => marker !== null, // fake handles; no claim without owner proof
+      reviewRuntimeIdentity: () => ({ id: runtimeId, version: runtimeVersion }),
+      reviewThinkingLevel: effectiveThinking ?? (() => thinking),
+      reviewPreflight: async () => ({ ok: true as const, failures: [],
+        reviewModel: { role: 'perkins' as const, modelRef,
+          settings: settingsModel === undefined ? {} : { model: settingsModel }, authEnv: {},
+          ...(routingSha256 === null ? {} : { routingSha256 }) } }),
+    });
+    return { repo, ledger, port, artifacts, jobId, target, prepare, fake, wave };
+  }
+
+  it('offers checked lenses after a base-only fast-forward to a fresh lead without refunding starts', async () => {
+    const fixture = integrityHarness('perkins-base-fast-forward-credit');
+    await fixture.prepare();
+    const firstFake = fixture.fake({ childAnswer: () => JSON.stringify([groundedFinding('blind', 'warning')]),
+      specialists: ['blind'], neverSubmit: true });
+    const first = asWave(await fixture.wave('fixture-model-v1', firstFake.spawner).runRound({ jobId: fixture.jobId }));
+    expect(first.round.status).toBe('aborted');
+    const priorBase = fixture.repo.git(['rev-parse', 'main']);
+    const newBase = fixture.repo.git([
+      '-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid',
+      'commit-tree', 'main^{tree}', '-p', 'main', '-m', 'base fast-forward',
+    ]);
+    fixture.repo.git(['update-ref', 'refs/heads/main', newBase]);
+    const freshFake = fixture.fake({ childAnswer: () => '[]', specialists: [], neverSubmit: true });
+    const next = asWave(await fixture.wave('fixture-model-v1', freshFake.spawner).runRound({ jobId: fixture.jobId }));
+    expect(next.round.status).toBe('aborted');
+    expect(freshFake.childCalls).toHaveLength(0);
+    expect(freshFake.leadCalls).toHaveLength(1);
+    expect(freshFake.leadCalls[0]?.prompt).toContain('RECOVERED SPECIALIST EVIDENCE');
+    expect(freshFake.leadCalls[0]?.prompt).toContain(`Earlier frozen base tip(s): ${priorBase}; current frozen main tip: ${newBase}`);
+    expect(freshFake.leadCalls[0]?.prompt).toContain('Revalidate this current-base mergeability proof');
+    // The carried ledger start is charged in this round, not a new child.
+    expect(fixture.ledger.listRoundSpecialistStarts(next.round.id)).toHaveLength(1);
+    expect(fixture.ledger.listRoundSpecialistStarts(next.round.id)[0]?.payload)
+      .toMatchObject({ lens: 'blind', attempt: 1, originRoundId: first.round.id });
+    const manifests = [first, next].map((round) => JSON.parse(readFileSync(join(fixture.artifacts, round.round.id, 'manifest.json'), 'utf8')) as { baseRefSha: string });
+    expect(manifests.map((manifest) => manifest.baseRefSha)).toEqual([priorBase, newBase]);
+  }, 180_000);
+
+  it('withholds base-advanced credit on a merge conflict while retaining charged starts', async () => {
+    const fixture = integrityHarness('perkins-base-conflict-refusal');
+    await fixture.prepare();
+    const earlierFake = fixture.fake({ childAnswer: () => JSON.stringify([groundedFinding('blind', 'warning')]),
+      specialists: ['blind'], neverSubmit: true });
+    const earlier = asWave(await fixture.wave('fixture-model-v1', earlierFake.spawner).runRound({ jobId: fixture.jobId }));
+    fixture.repo.git(['checkout', 'main']);
+    fixture.repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 99;\n}\n');
+    fixture.repo.git(['checkout', 'feature/perkins-base-conflict-refusal']);
+    const freshFake = fixture.fake({ childAnswer: () => '[]', specialists: [], neverSubmit: true });
+    const fresh = asWave(await fixture.wave('fixture-model-v1', freshFake.spawner).runRound({ jobId: fixture.jobId }));
+    expect(freshFake.leadCalls[0]?.prompt).not.toContain('RECOVERED SPECIALIST EVIDENCE');
+    expect(fixture.ledger.listRoundSpecialistStarts(fresh.round.id)[0]?.payload)
+      .toMatchObject({ lens: 'blind', attempt: 1, originRoundId: earlier.round.id });
+  }, 180_000);
+
+  it('rejects a conclusive recovered verdict when the base moves after lead spawn', async () => {
+    const fixture = integrityHarness('perkins-base-submit-race');
+    await fixture.prepare();
+    const earlierFake = fixture.fake({ childAnswer: () => JSON.stringify([groundedFinding('blind', 'warning')]),
+      specialists: ['blind'], neverSubmit: true });
+    await fixture.wave('fixture-model-v1', earlierFake.spawner).runRound({ jobId: fixture.jobId });
+    const advanceBase = (message: string) => {
+      const next = fixture.repo.git([
+        '-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid',
+        'commit-tree', 'main^{tree}', '-p', 'main', '-m', message,
+      ]);
+      fixture.repo.git(['update-ref', 'refs/heads/main', next]);
+    };
+    advanceBase('before lead spawn');
+    const leadFake = fixture.fake({ childAnswer: () => '[]', specialists: [],
+      beforeSubmit: () => advanceBase('after lead spawn') });
+    const outcome = asWave(await fixture.wave('fixture-model-v1', leadFake.spawner).runRound({ jobId: fixture.jobId }));
+    expect(outcome.canonicalVerdict).toBe('INCOMPLETE');
+    expect(leadFake.leadCalls[0]?.prompt).toContain('RECOVERED SPECIALIST EVIDENCE');
+    expect(leadFake.toolErrors.some((error) => error.tool === 'perkins_submit_review' &&
+      error.error.includes('recovered-base-mergeability'))).toBe(true);
+  }, 180_000);
+
+  it('recovers a checked Claude specialist with unchanged public model identity and charges the original start', async () => {
+    const fixture = integrityHarness('perkins-claude-compatible-credit');
+    await fixture.prepare();
+    const earlierFake = fixture.fake({ childAnswer: () => JSON.stringify([groundedFinding('blind', 'warning')]),
+      specialists: ['blind'], neverSubmit: true });
+    const earlier = asWave(await fixture.wave('anthropic/claude-sonnet-4-6', earlierFake.spawner, 'high',
+      'fixture-runtime-v1', null, 'claude-code').runRound({ jobId: fixture.jobId }));
+    expect(earlier.round.status).toBe('aborted');
+    const freshFake = fixture.fake({ childAnswer: () => '[]', specialists: ['edge'], neverSubmit: true });
+    const fresh = asWave(await fixture.wave('anthropic/claude-sonnet-4-6', freshFake.spawner, 'high',
+      'fixture-runtime-v1', null, 'claude-code').runRound({ jobId: fixture.jobId }));
+    expect(freshFake.leadCalls[0]?.prompt).toContain('RECOVERED SPECIALIST EVIDENCE');
+    expect(freshFake.leadCalls[0]?.prompt).toContain('blind grounded defect');
+    expect(freshFake.childCalls.map((call) => sourceFor(call.prompt ?? ''))).toEqual(['edge']);
+    expect(fixture.ledger.listRoundSpecialistStarts(fresh.round.id)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ payload: expect.objectContaining({ lens: 'blind', attempt: 1, originRoundId: earlier.round.id }) }),
+    ]));
+  }, 180_000);
+
+  it('allows a public Claude model but never persists a credential prefix, model setting or thinking sentinel', async () => {
+    for (const [name, modelRef, thinking, settingsModel] of [
+      ['prefix', 'credential-looking-provider/claude-sonnet-4-6', 'high', undefined],
+      ['setting', 'anthropic/claude-sonnet-4-6', 'high', 'credential-looking-model'],
+      ['thinking', 'anthropic/claude-sonnet-4-6', 'credential-looking-thinking', undefined],
+    ] as const) {
+      const fixture = integrityHarness(`perkins-claude-identity-${name}`);
+      await fixture.prepare();
+      const earlier = fixture.fake({ childAnswer: () => '[]', specialists: ['blind'], neverSubmit: true });
+      const first = asWave(await fixture.wave('anthropic/claude-sonnet-4-6', earlier.spawner, 'high',
+        'fixture-runtime-v1', null, 'claude-code').runRound({ jobId: fixture.jobId }));
+      const initialManifest = JSON.parse(readFileSync(join(fixture.artifacts, first.round.id, 'manifest.json'), 'utf8')) as {
+        recoveryIdentity: { modelRef: string } | null;
+      };
+      expect(initialManifest.recoveryIdentity?.modelRef).toBe('anthropic/claude-sonnet-4-6');
+      const changed = fixture.fake({ childAnswer: () => '[]', specialists: ['edge'], neverSubmit: true });
+      const next = asWave(await fixture.wave(modelRef, changed.spawner, thinking, 'fixture-runtime-v1',
+        null, 'claude-code', settingsModel).runRound({ jobId: fixture.jobId }));
+      const manifestBytes = readFileSync(join(fixture.artifacts, next.round.id, 'manifest.json'), 'utf8');
+      expect((JSON.parse(manifestBytes) as { recoveryIdentity: unknown }).recoveryIdentity).toBeNull();
+      expect(manifestBytes).not.toContain('credential-looking');
+      expect(changed.leadCalls[0]?.prompt).not.toContain('RECOVERED SPECIALIST EVIDENCE');
+      expect(fixture.ledger.listRoundSpecialistStarts(next.round.id).length).toBeGreaterThan(0);
+    }
+  }, 180_000);
+
+  it('never credits an unchanged Pi model ID routed to a different endpoint', async () => {
+    const fixture = integrityHarness('perkins-pi-route-change');
+    await fixture.prepare();
+    const first = fixture.fake({ childAnswer: () => JSON.stringify([groundedFinding('blind', 'warning')]),
+      specialists: ['blind'], neverSubmit: true });
+    const earlier = asWave(await fixture.wave('fixture-model-v1', first.spawner).runRound({ jobId: fixture.jobId }));
+    expect(fixture.ledger.listRoundSpecialistStarts(earlier.round.id)).toHaveLength(1);
+    const changedRoute = fixture.fake({ childAnswer: () => '[]', specialists: ['edge'], neverSubmit: true });
+    const later = asWave(await fixture.wave('fixture-model-v1', changedRoute.spawner, 'high',
+      'fixture-runtime-v1', 'alternate-safe-route').runRound({ jobId: fixture.jobId }));
+    expect(changedRoute.leadCalls[0]?.prompt).not.toContain('RECOVERED SPECIALIST EVIDENCE');
+    expect(changedRoute.childCalls).toHaveLength(1);
+    expect(fixture.ledger.listRoundSpecialistStarts(later.round.id)).toHaveLength(2);
+  }, 180_000);
+
+  it('never credits prior Pi work when routing proof is absent in either round', async () => {
+    const fixture = integrityHarness('perkins-pi-missing-route');
+    await fixture.prepare();
+    const first = fixture.fake({ childAnswer: () => JSON.stringify([groundedFinding('blind', 'warning')]),
+      specialists: ['blind'], neverSubmit: true });
+    const earlier = asWave(await fixture.wave('fixture-model-v1', first.spawner, 'high', 'fixture-runtime-v1', null)
+      .runRound({ jobId: fixture.jobId }));
+    expect(fixture.ledger.listRoundSpecialistStarts(earlier.round.id)).toHaveLength(1);
+    const laterFake = fixture.fake({ childAnswer: () => '[]', specialists: ['edge'], neverSubmit: true });
+    const later = asWave(await fixture.wave('fixture-model-v1', laterFake.spawner)
+      .runRound({ jobId: fixture.jobId }));
+    expect(laterFake.leadCalls[0]?.prompt).not.toContain('RECOVERED SPECIALIST EVIDENCE');
+    expect(laterFake.childCalls).toHaveLength(1);
+    expect(fixture.ledger.listRoundSpecialistStarts(later.round.id)).toHaveLength(2);
+  }, 180_000);
+
+  it('admits a proven dead Pi host with no registered agents', async () => {
+    const fixture = integrityHarness('perkins-pi-dead-empty-owner');
+    await fixture.prepare();
+    const old = fixture.ledger.addRound({ jobId: fixture.jobId, targetRef: fixture.target, lenses: ['blind'] });
+    fixture.ledger.appendCustomEvent({ kind: 'round.review-owner', jobId: fixture.jobId, roundId: old.id,
+      payload: { roundId: old.id, targetSha: fixture.target, runtimeId: 'pi', pid: 2147483647,
+        generation: '12345678-1234-4234-8234-123456789abc' } });
+    fixture.ledger.setRoundStatus(old.id, 'aborted');
+    expect(fixture.ledger.listAgents().filter((agent) => agent.roundId === old.id)).toHaveLength(0);
+    const replacement = fixture.fake({ childAnswer: () => '[]', specialists: [] });
+    const home = mkdtempSync(join(tmpdir(), 'perkins-dead-host-registry-'));
+    dirs.push(home);
+    const workspace = mkdtempSync(join(tmpdir(), 'perkins-dead-host-workspace-'));
+    dirs.push(workspace);
+    writeFileSync(configPathFor(home), `workspace_root = ${JSON.stringify(workspace)}\n`);
+    const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
+    const registry = new RuntimeRegistry({ config, store: new SessionStore(config.dataDir),
+      ownerProcessProbe: () => 'dead' });
+    const wave = new WaveRunner({ ledger: fixture.ledger, worktrees: fixture.port, spawner: replacement.spawner,
+      reviewArtifactRoot: fixture.artifacts,
+      reconcileReviewAgent: async (agentId, marker) => registry.reviewOwnerCeased(agentId, marker) });
+    await wave.runRound({ jobId: fixture.jobId });
+    expect(replacement.leadCalls).toHaveLength(1);
+    expect(fixture.ledger.listRounds(fixture.jobId)).toHaveLength(2);
+  }, 180_000);
+
+  it('recovers A verified work from a partly copied B while carrying every start into C', async () => {
+    const fixture = integrityHarness('perkins-three-round-copy');
+    await fixture.prepare();
+    const a = fixture.fake({ childAnswer: () => JSON.stringify([groundedFinding('blind', 'warning')]),
+      specialists: ['blind'], neverSubmit: true });
+    const first = asWave(await fixture.wave('fixture-model-v1', a.spawner).runRound({ jobId: fixture.jobId }));
+    expect(fixture.ledger.listRoundSpecialistStarts(first.round.id)).toHaveLength(1);
+    const freezeReceipt = fixture.ledger.uniqueRoundFreezeManifestReceipt(first.round.id);
+    const firstStart = fixture.ledger.listRoundSpecialistStarts(first.round.id)[0]!;
+    expect(freezeReceipt?.seq).toBeLessThan(firstStart.seq);
+    expect(freezeReceipt?.payload).toMatchObject({ sha256: expect.stringMatching(/^[0-9a-f]{64}$/u) });
+    const b = fixture.fake({ childAnswer: () => 'malformed tests output', specialists: ['tests'], neverSubmit: true });
+    const middle = asWave(await fixture.wave('fixture-model-v1', b.spawner).runRound({ jobId: fixture.jobId }));
+    expect(fixture.ledger.listRoundSpecialistStarts(middle.round.id)).toHaveLength(3);
+    // Crash halfway through B's evidence copy: its charged marker survives,
+    // but its copied child proof cannot authenticate a valid outcome.
+    rmSync(join(middle.artifactDirectory!, 'children'), { recursive: true, force: true });
+    const c = fixture.fake({ childAnswer: () => '[]', specialists: ['edge'], probeExhausted: 'tests', neverSubmit: true });
+    const final = asWave(await fixture.wave('fixture-model-v1', c.spawner).runRound({ jobId: fixture.jobId }));
+    expect(c.leadCalls[0]?.prompt).toContain('RECOVERED SPECIALIST EVIDENCE');
+    expect(c.leadCalls[0]?.prompt).toContain('blind grounded defect');
+    expect(c.childCalls).toHaveLength(1);
+    expect(c.toolErrors.some((error) => error.error.includes('tests exhausted its attempts'))).toBe(true);
+    expect(fixture.ledger.listRoundSpecialistStarts(final.round.id)).toHaveLength(4);
+    expect(fixture.ledger.listRoundSpecialistSettlements(final.round.id)).toHaveLength(4);
+    expect(fixture.ledger.listRoundSpecialistStarts(final.round.id).map((event) => event.payload))
+      .toEqual([{ lens: 'blind', attempt: 1, originRoundId: first.round.id },
+        { lens: 'tests', attempt: 1, originRoundId: middle.round.id },
+        { lens: 'tests', attempt: 2, originRoundId: middle.round.id },
+        { lens: 'edge', attempt: 1, originRoundId: final.round.id }]);
+  }, 180_000);
+
+  it('fails closed on two independently charged attempt-one starts instead of deduplicating them', async () => {
+    const fixture = integrityHarness('perkins-duplicate-origin');
+    await fixture.prepare();
+    const first = asWave(await fixture.wave('fixture-model-v1', fixture.fake({
+      childAnswer: () => '[]', specialists: ['blind'], neverSubmit: true,
+    }).spawner).runRound({ jobId: fixture.jobId }));
+    const other = fixture.ledger.addRound({ jobId: fixture.jobId, targetRef: fixture.target, lenses: ['blind'] });
+    fixture.ledger.appendCustomEvent({ kind: 'round.specialist-started', jobId: fixture.jobId,
+      roundId: other.id, payload: { lens: 'blind', attempt: 1, originRoundId: other.id } });
+    fixture.ledger.appendCustomEvent({ kind: 'round.review-owner', jobId: fixture.jobId, roundId: other.id,
+      payload: { roundId: other.id, targetSha: fixture.target, runtimeId: 'pi', pid: process.pid,
+        generation: '12345678-1234-4234-8234-123456789abc' } });
+    fixture.ledger.setRoundStatus(other.id, 'aborted');
+    const replacement = fixture.fake({ childAnswer: () => '[]', specialists: [] });
+    const result = asWave(await fixture.wave('fixture-model-v1', replacement.spawner).runRound({ jobId: fixture.jobId }));
+    expect(result.canonicalVerdict).toBe('INCOMPLETE');
+    expect(replacement.leadCalls).toHaveLength(0);
+    expect(readFileSync(result.reportFile!, 'utf8')).toContain('independently charged starts');
+    expect(fixture.ledger.listRoundSpecialistStarts(first.round.id)).toHaveLength(1);
+  }, 180_000);
+
+  it('rejects a 17th charged ledger start before a recovered lead can spawn', async () => {
+    const fixture = integrityHarness('perkins-recovered-run-cap');
+    await fixture.prepare();
+    const a = fixture.fake({ childAnswer: () => '[]', specialists: ['blind'], neverSubmit: true });
+    const first = asWave(await fixture.wave('fixture-model-v1', a.spawner).runRound({ jobId: fixture.jobId }));
+    for (let i = 0; i < 16; i += 1) {
+      fixture.ledger.appendCustomEvent({ kind: 'round.specialist-started', jobId: fixture.jobId,
+        roundId: first.round.id, payload: { lens: 'blind', attempt: 1 } });
+    }
+    const b = fixture.fake({ childAnswer: () => '[]', specialists: [], neverSubmit: true });
+    const second = asWave(await fixture.wave('fixture-model-v1', b.spawner).runRound({ jobId: fixture.jobId }));
+    expect(second.canonicalVerdict).toBe('INCOMPLETE');
+    expect(b.leadCalls).toHaveLength(0);
+    expect(readFileSync(second.reportFile!, 'utf8')).toContain('exceeds the 16-run specialist cap');
+  }, 180_000);
+
+  it('refuses a duplicate owner marker instead of trusting a newer host PID', async () => {
+    const fixture = integrityHarness('perkins-duplicate-owner');
+    await fixture.prepare();
+    const first = asWave(await fixture.wave('fixture-model-v1', fixture.fake({
+      childAnswer: () => '[]', specialists: ['blind'], neverSubmit: true,
+    }).spawner).runRound({ jobId: fixture.jobId }));
+    const owner = fixture.ledger.uniqueRoundReviewOwnerMarker(first.round.id);
+    expect(owner).not.toBeNull();
+    fixture.ledger.appendCustomEvent({ kind: 'round.review-owner', jobId: fixture.jobId,
+      roundId: first.round.id, payload: owner!.payload });
+    expect(fixture.ledger.uniqueRoundReviewOwnerMarker(first.round.id)).toBeNull();
+    const replacement = fixture.fake({ childAnswer: () => '[]', specialists: [] });
+    await expect(fixture.wave('fixture-model-v1', replacement.spawner).runRound({ jobId: fixture.jobId }))
+      .rejects.toThrow(/may still run; reconcile runtime cessation/);
+    expect(replacement.leadCalls).toHaveLength(0);
+    expect(fixture.ledger.listRounds(fixture.jobId)).toHaveLength(1);
+  }, 180_000);
+
+  it('admits only one job round across concurrent setup calls', async () => {
+    const fixture = integrityHarness('perkins-concurrent-admission');
+    await fixture.prepare();
+    const lead = fixture.fake({ childAnswer: () => '[]', specialists: [], neverSubmit: true });
+    const wave = fixture.wave('fixture-model-v1', lead.spawner);
+    const outcomes = await Promise.allSettled([
+      wave.runRound({ jobId: fixture.jobId }), wave.runRound({ jobId: fixture.jobId }),
+    ]);
+    expect(outcomes.filter((outcome) => outcome.status === 'fulfilled')).toHaveLength(1);
+    expect(outcomes.filter((outcome) => outcome.status === 'rejected')).toEqual([
+      expect.objectContaining({ reason: expect.objectContaining({ message: expect.stringMatching(/admission.*in progress/) }) }),
+    ]);
+    expect(fixture.ledger.listRounds(fixture.jobId)).toHaveLength(1);
+  }, 180_000);
+
+  it('commits the job-status flip and predecessor CAS with exactly one new round', async () => {
+    const fixture = integrityHarness('perkins-ledger-admission-cas');
+    await fixture.prepare();
+    const predecessor = fixture.ledger.addRound({ jobId: fixture.jobId, targetRef: fixture.target, lenses: ['blind'] });
+    fixture.ledger.setRoundStatus(predecessor.id, 'aborted');
+    const input = { jobId: fixture.jobId, expectedLatestRoundId: predecessor.id,
+      expectedJobStatus: 'working' as const, targetRef: fixture.target, lenses: ['blind'] };
+    const admitted = fixture.ledger.admitReviewRound(input);
+    expect(fixture.ledger.getJob(fixture.jobId)?.status).toBe('in-review');
+    expect(() => fixture.ledger.admitReviewRound(input)).toThrow(/changed during reconciliation/);
+    expect(fixture.ledger.listRounds(fixture.jobId).map((round) => round.id))
+      .toEqual([predecessor.id, admitted.id]);
+    expect(fixture.ledger.listJobEvents(fixture.jobId).filter((event) =>
+      event.kind === 'job.status' && (event.payload as { to?: string }).to === 'in-review')).toHaveLength(1);
+  }, 180_000);
+
+  it('does not roll back job status when a later round was admitted during an older setup failure', async () => {
+    const fixture = integrityHarness('perkins-successor-setup-rollback');
+    await fixture.prepare();
+    let entered!: () => void;
+    let failSetup!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    const gate = new Promise<void>((resolve) => { failSetup = resolve; });
+    const port: WorktreePort = {
+      createJobWorktree: (input) => fixture.port.createJobWorktree(input),
+      createChildWorktree: (input) => fixture.port.createChildWorktree(input),
+      resolveReviewTarget: (input) => fixture.port.resolveReviewTarget(input),
+      createReviewWorktree: async () => {
+        entered();
+        await gate;
+        throw new Error('synthetic older setup failure after successor admission');
+      },
+      getWorktree: (id) => fixture.port.getWorktree(id),
+      listWorktrees: (options) => fixture.port.listWorktrees(options),
+      release: (input) => fixture.port.release(input),
+    };
+    const spawner = vi.fn() as unknown as AgentSpawner;
+    const wave = new WaveRunner({ ledger: fixture.ledger, worktrees: port, spawner,
+      reviewArtifactRoot: fixture.artifacts });
+    const starting = wave.beginRound({ jobId: fixture.jobId });
+    // Observe a failure as a settled value until the delayed setup is released.
+    const observed = starting.then(() => null, (error: unknown) => error);
+    await started;
+    const old = fixture.ledger.listRounds(fixture.jobId)[0]!;
+    expect(fixture.ledger.getJob(fixture.jobId)?.status).toBe('in-review');
+    fixture.ledger.setRoundStatus(old.id, 'aborted');
+    const successor = fixture.ledger.admitReviewRound({
+      jobId: fixture.jobId, expectedLatestRoundId: old.id, expectedJobStatus: 'in-review',
+      lenses: ['blind'], targetRef: fixture.target,
+    });
+    failSetup();
+    expect(String(await observed)).toContain('synthetic older setup failure');
+    expect(fixture.ledger.getJob(fixture.jobId)?.status).toBe('in-review');
+    expect(fixture.ledger.getRound(successor.id)?.status).toBe('pending');
+    expect(fixture.ledger.listRounds(fixture.jobId)).toHaveLength(2);
+    expect(spawner).not.toHaveBeenCalled();
+  }, 180_000);
+
+  it('serializes two runner instances despite a stale predecessor snapshot during reconciliation', async () => {
+    const fixture = integrityHarness('perkins-two-runner-race');
+    await fixture.prepare();
+    const predecessor = fixture.ledger.addRound({ jobId: fixture.jobId, targetRef: fixture.target, lenses: ['blind'] });
+    fixture.ledger.registerAgent({ id: 'previous-lead', role: 'perkins', roundId: predecessor.id, jobId: fixture.jobId });
+    fixture.ledger.setRoundStatus(predecessor.id, 'aborted');
+    const snapshot = fixture.ledger.listRounds(fixture.jobId);
+    const originalListRounds = fixture.ledger.listRounds.bind(fixture.ledger);
+    // Two hosts can each have a reconciled predecessor snapshot before
+    // either publishes the replacement. Only the transactional ledger CAS
+    // may grant permission; an in-memory runner guard cannot cover both.
+    const stale = vi.spyOn(fixture.ledger, 'listRounds').mockImplementation(() => snapshot);
+    let arrivals = 0;
+    let release!: () => void;
+    const barrier = new Promise<void>((resolve) => { release = resolve; });
+    const fakeA = fixture.fake({ childAnswer: () => '[]', specialists: [], neverSubmit: true });
+    const fakeB = fixture.fake({ childAnswer: () => '[]', specialists: [], neverSubmit: true });
+    const makeRunner = (spawner: AgentSpawner) => new WaveRunner({
+      ledger: fixture.ledger, worktrees: fixture.port, spawner, reviewArtifactRoot: fixture.artifacts,
+      reconcileReviewAgent: async () => { arrivals += 1; await barrier; return true; },
+      reviewRuntimeIdentity: () => ({ id: 'pi', version: 'fixture-runtime-v1' }),
+      reviewPreflight: async () => ({ ok: true, failures: [],
+        reviewModel: { role: 'perkins', modelRef: 'fixture-model-v1', settings: {}, authEnv: {}, routingSha256: "fixture-safe-route" } }),
+    });
+    try {
+      const runnerA = makeRunner(fakeA.spawner);
+      const runnerB = makeRunner(fakeB.spawner);
+      const attempts = [runnerA.runRound({ jobId: fixture.jobId }), runnerB.runRound({ jobId: fixture.jobId })];
+      await vi.waitFor(() => expect(arrivals).toBe(2));
+      release();
+      const outcomes = await Promise.allSettled(attempts);
+      expect(outcomes.filter((outcome) => outcome.status === 'fulfilled')).toHaveLength(1);
+      expect(outcomes.filter((outcome) => outcome.status === 'rejected')).toEqual([
+        expect.objectContaining({ reason: expect.objectContaining({ message: expect.stringMatching(/changed during reconciliation/) }) }),
+      ]);
+      expect(fakeA.leadCalls.length + fakeB.leadCalls.length).toBe(1);
+      expect(originalListRounds(fixture.jobId)).toHaveLength(2);
+    } finally {
+      release();
+      stale.mockRestore();
+    }
+  }, 180_000);
+
+  it('blocks an unregistered marked owner before creating a second writer', async () => {
+    const fixture = integrityHarness('perkins-unregistered-owner');
+    await fixture.prepare();
+    const first = asWave(await fixture.wave('fixture-model-v1', fixture.fake({
+      childAnswer: () => '[]', specialists: [], neverSubmit: true,
+    }).spawner).runRound({ jobId: fixture.jobId }));
+    expect(fixture.ledger.uniqueRoundReviewOwnerMarker(first.round.id)).not.toBeNull();
+    // Registration can be lost in the marker-before-register crash window.
+    const agents = fixture.ledger.listAgents().filter((agent) => agent.roundId === first.round.id);
+    expect(agents).toHaveLength(1);
+    // A separate ledger round models that window without modifying durable rows.
+    const unregistered = fixture.ledger.addRound({ jobId: fixture.jobId, targetRef: fixture.target, lenses: ['blind'] });
+    fixture.ledger.appendCustomEvent({ kind: 'round.review-owner', jobId: fixture.jobId, roundId: unregistered.id,
+      payload: { roundId: unregistered.id, targetSha: fixture.target, runtimeId: 'pi', pid: process.pid,
+        generation: '12345678-1234-4234-8234-123456789abc' } });
+    fixture.ledger.setRoundStatus(unregistered.id, 'aborted');
+    const replacement = fixture.fake({ childAnswer: () => '[]', specialists: [] });
+    const blocked = new WaveRunner({ ledger: fixture.ledger, worktrees: fixture.port,
+      spawner: replacement.spawner, reviewArtifactRoot: fixture.artifacts,
+      reconcileReviewAgent: async (agentId) => agentId !== '' });
+    await expect(blocked.runRound({ jobId: fixture.jobId })).rejects.toThrow(/marker.*may still run/);
+    expect(fixture.ledger.listRounds(fixture.jobId)).toHaveLength(2);
+    expect(replacement.leadCalls).toHaveLength(0);
+  }, 180_000);
+
+  it('refuses an older-head aborted round with neither marker nor agent before creating a new writer', async () => {
+    const fixture = integrityHarness('perkins-old-head-untracked-owner');
+    await fixture.prepare();
+    const old = fixture.ledger.addRound({ jobId: fixture.jobId, targetRef: 'a'.repeat(40), lenses: ['blind'] });
+    fixture.ledger.setRoundStatus(old.id, 'aborted');
+    const fake = fixture.fake({ childAnswer: () => '[]', specialists: [] });
+    await expect(fixture.wave('fixture-model-v1', fake.spawner).runRound({ jobId: fixture.jobId }))
+      .rejects.toThrow(/ownership is unknown.*reconcile cessation manually/);
+    expect(fixture.ledger.listRounds(fixture.jobId)).toHaveLength(1);
+    expect(fake.leadCalls).toHaveLength(0);
+  }, 180_000);
+
+  it('blocks an unreceipted legacy freeze with unknown ownership and retains same-head charged starts', async () => {
+    const fixture = integrityHarness('perkins-legacy-freeze');
+    await fixture.prepare();
+    const a = fixture.fake({ childAnswer: () => JSON.stringify([groundedFinding('blind', 'warning')]),
+      specialists: ['blind'], neverSubmit: true });
+    const first = asWave(await fixture.wave('fixture-model-v1', a.spawner).runRound({ jobId: fixture.jobId }));
+    const legacy = fixture.ledger.addRound({ jobId: fixture.jobId, targetRef: fixture.target, lenses: ['blind'] });
+    const legacyDir = join(fixture.artifacts, legacy.id);
+    mkdirSync(legacyDir);
+    const manifest = JSON.parse(readFileSync(join(first.artifactDirectory!, 'manifest.json'), 'utf8')) as { roundId: string };
+    writeFileSync(join(legacyDir, 'manifest.json'), `${JSON.stringify({ ...manifest, roundId: legacy.id }, null, 2)}\n`);
+    fixture.ledger.setRoundStatus(legacy.id, 'aborted');
+    expect(fixture.ledger.uniqueRoundFreezeManifestReceipt(legacy.id)).toBeNull();
+    const c = fixture.fake({ childAnswer: () => '[]', specialists: [], neverSubmit: true });
+    await expect(fixture.wave('fixture-model-v1', c.spawner).runRound({ jobId: fixture.jobId }))
+      .rejects.toThrow(/no trusted no-spawn proof or owner marker; ownership is unknown/);
+    expect(c.leadCalls).toHaveLength(0);
+    expect(fixture.ledger.listRounds(fixture.jobId)).toHaveLength(2);
+    expect(fixture.ledger.listRoundSpecialistStarts(first.round.id)).toHaveLength(1);
+  }, 180_000);
+
+  it('receipts a rejected resident admission and retries under the same owner without attesting an in-flight review', async () => {
+    const fixture = integrityHarness('perkins-resident-admission-retry');
+    await fixture.prepare();
+    const fake = fixture.fake({ childAnswer: () => '[]', specialists: [], neverSubmit: true });
+    let rejectAdmission = true;
+    const reserve = async (): Promise<import('../src/runtime/registry.js').ResidentReviewRound> => {
+      if (rejectAdmission) throw new Error('resident slots unavailable');
+      return { spawn: (options) => fake.spawner('perkins', options),
+        beginChildren: (concurrency) => ({ concurrency, finish() {} }),
+        close: async () => {}, reconcileCleanup() {}, cleanupDebt: () => [] };
+    };
+    const wave = fixture.wave('fixture-model-v1', fake.spawner, 'high', 'fixture-runtime-v1',
+      'fixture-safe-route', 'pi', undefined, reserve);
+    await expect(wave.runRound({ jobId: fixture.jobId })).rejects.toThrow('resident slots unavailable');
+    const failed = fixture.ledger.listRounds(fixture.jobId)[0]!;
+    expect(failed.status).toBe('aborted');
+    expect(fixture.ledger.uniqueRoundNoSpawnReceipt(failed.id)?.payload)
+      .toMatchObject({ roundId: failed.id,
+        ownerGeneration: (fixture.ledger.uniqueRoundReviewOwnerMarker(failed.id)?.payload as { generation: string }).generation });
+    expect(fixture.ledger.listAgents().filter((agent) => agent.roundId === failed.id)).toHaveLength(0);
+    expect(fake.leadCalls).toHaveLength(0);
+    rejectAdmission = false;
+    const resumed = asWave(await wave.runRound({ jobId: fixture.jobId, force: true }));
+    expect(resumed.round.id).not.toBe(failed.id);
+    expect(fake.leadCalls).toHaveLength(1);
+    expect(fixture.ledger.listAgents().some((agent) => agent.roundId === resumed.round.id)).toBe(true);
+    expect(fixture.ledger.uniqueRoundNoSpawnReceipt(resumed.round.id)).toBeNull();
+    expect(() => fixture.ledger.abortReviewSetupWithoutSpawn(resumed.round.id)).toThrow('cannot prove no review owner started');
+    expect(fixture.ledger.uniqueRoundNoSpawnReceipt(resumed.round.id)).toBeNull();
+  }, 180_000);
+
+  it('attests a model/thinking change during resident admission before spawn and retries safely', async () => {
+    const fixture = integrityHarness('perkins-admission-thinking-change');
+    await fixture.prepare();
+    const fake = fixture.fake({ childAnswer: () => '[]', specialists: [], neverSubmit: true });
+    let thinking = 'high';
+    let admissions = 0;
+    const reserve = async (): Promise<import('../src/runtime/registry.js').ResidentReviewRound> => {
+      admissions += 1;
+      thinking = admissions === 1 ? 'low' : 'high';
+      return { spawn: (options) => fake.spawner('perkins', options),
+        beginChildren: (concurrency) => ({ concurrency, finish() {} }),
+        close: async () => {}, reconcileCleanup() {}, cleanupDebt: () => [] };
+    };
+    const wave = fixture.wave('fixture-model-v1', fake.spawner, 'high', 'fixture-runtime-v1',
+      'fixture-safe-route', 'pi', undefined, reserve, () => thinking);
+    await expect(wave.runRound({ jobId: fixture.jobId })).rejects.toThrow('settings changed since freeze');
+    const rejected = fixture.ledger.listRounds(fixture.jobId)[0]!;
+    expect(rejected.status).toBe('aborted');
+    expect(fixture.ledger.uniqueRoundNoSpawnReceipt(rejected.id)?.payload)
+      .toMatchObject({ roundId: rejected.id,
+        ownerGeneration: (fixture.ledger.uniqueRoundReviewOwnerMarker(rejected.id)?.payload as { generation: string }).generation });
+    expect(fake.leadCalls).toHaveLength(0);
+    thinking = 'high';
+    const retry = asWave(await wave.runRound({ jobId: fixture.jobId, force: true }));
+    expect(retry.round.id).not.toBe(rejected.id);
+    expect(fake.leadCalls).toHaveLength(1);
+    expect(fixture.ledger.uniqueRoundNoSpawnReceipt(retry.round.id)).toBeNull();
+  }, 180_000);
+
+  it('refuses negative proof after a spawner throws before registering its handle', async () => {
+    const fixture = integrityHarness('perkins-ambiguous-spawn');
+    await fixture.prepare();
+    const spawner = vi.fn((_role: Parameters<AgentSpawner>[0], _options: Parameters<AgentSpawner>[1]) => {
+      throw new Error('spawner may have started a writer');
+    });
+    const outcome = asWave(await fixture.wave('fixture-model-v1', spawner).runRound({ jobId: fixture.jobId }));
+    expect(outcome.round.status).toBe('aborted');
+    expect(spawner).toHaveBeenCalled();
+    expect(fixture.ledger.listAgents().filter((agent) => agent.roundId === outcome.round.id)).toHaveLength(0);
+    expect(fixture.ledger.uniqueRoundNoSpawnReceipt(outcome.round.id)).toBeNull();
+    expect(() => fixture.ledger.abortReviewSetupWithoutSpawn(outcome.round.id)).toThrow('cannot prove no review owner started');
+    await expect(new WaveRunner({ ledger: fixture.ledger, worktrees: fixture.port, spawner,
+      reviewArtifactRoot: fixture.artifacts }).runRound({ jobId: fixture.jobId }))
+      .rejects.toThrow(/marker.*may still run/);
+  }, 180_000);
+
+  it('attests setup failure with a unique no-spawn receipt, while legacy missing proof stays blocked', async () => {
+    const fixture = integrityHarness('perkins-setup-no-spawn');
+    await fixture.prepare();
+    const failLive = vi.spyOn(fixture.ledger, 'setRoundStatus').mockImplementationOnce(() => {
+      throw new Error('setup failed before any spawn');
+    });
+    const fake = fixture.fake({ childAnswer: () => '[]', specialists: [] });
+    const first = fixture.wave('fixture-model-v1', fake.spawner);
+    const failedOutcome = asWave(await first.runRound({ jobId: fixture.jobId }));
+    expect(failedOutcome.canonicalVerdict).toBe('INCOMPLETE');
+    failLive.mockRestore();
+    const failed = fixture.ledger.listRounds(fixture.jobId)[0]!;
+    expect(failed.status).toBe('aborted');
+    expect(fixture.ledger.uniqueRoundReviewOwnerMarker(failed.id)).not.toBeNull();
+    expect(fixture.ledger.uniqueRoundNoSpawnReceipt(failed.id)?.payload)
+      .toMatchObject({ roundId: failed.id,
+        ownerGeneration: (fixture.ledger.uniqueRoundReviewOwnerMarker(failed.id)?.payload as { generation: string }).generation });
+    expect(fake.leadCalls).toHaveLength(0);
+    expect(fixture.ledger.getJob(fixture.jobId)?.status).toBe('in-review');
+    const replacement = fixture.fake({ childAnswer: () => '[]', specialists: [] });
+    await fixture.wave('fixture-model-v1', replacement.spawner).runRound({ jobId: fixture.jobId, force: true });
+    expect(replacement.leadCalls).toHaveLength(1);
+    fixture.ledger.appendCustomEvent({ kind: 'round.review-no-spawn', jobId: fixture.jobId, roundId: failed.id,
+      payload: fixture.ledger.latestRoundEvent(failed.id, 'round.review-no-spawn')?.payload });
+    expect(fixture.ledger.uniqueRoundNoSpawnReceipt(failed.id)).toBeNull();
+    const third = fixture.fake({ childAnswer: () => '[]', specialists: [] });
+    await expect(fixture.wave('fixture-model-v1', third.spawner).runRound({ jobId: fixture.jobId, force: true }))
+      .rejects.toThrow(/contradictory or duplicate no-spawn and owner evidence/);
+    expect(third.leadCalls).toHaveLength(0);
+  }, 180_000);
+
+  it('rejects a thinking change between preflight and freeze before any review spawn', async () => {
+    const fixture = integrityHarness('perkins-preflight-thinking');
+    await fixture.prepare();
+    const fake = fixture.fake({ childAnswer: () => '[]', specialists: [] });
+    const wave = new WaveRunner({ ledger: fixture.ledger, worktrees: fixture.port, spawner: fake.spawner,
+      reviewArtifactRoot: fixture.artifacts,
+      reviewRuntimeIdentity: () => ({ id: 'pi', version: 'fixture-runtime-v1' }),
+      reviewThinkingLevel: () => 'low',
+      reviewPreflight: async () => ({ ok: true, failures: [], reviewThinkingLevel: 'high',
+        reviewModel: { role: 'perkins', modelRef: 'fixture-model-v1', settings: {}, authEnv: {}, routingSha256: "fixture-safe-route" } }),
+    });
+    await expect(wave.runRound({ jobId: fixture.jobId })).rejects.toThrow(/thinking level changed since preflight/);
+    expect(fake.leadCalls).toHaveLength(0);
+  }, 180_000);
+
+  it('charges same-head starts but never credits outputs when thinking or runtime changes', async () => {
+    const fixture = integrityHarness('perkins-thinking-runtime');
+    await fixture.prepare();
+    const first = fixture.fake({ childAnswer: () => JSON.stringify([groundedFinding('blind', 'warning')]),
+      specialists: ['blind'], neverSubmit: true });
+    await fixture.wave('fixture-model-v1', first.spawner, 'high').runRound({ jobId: fixture.jobId });
+    const changedThinking = fixture.fake({ childAnswer: () => '[]', specialists: [], neverSubmit: true });
+    const second = asWave(await fixture.wave('fixture-model-v1', changedThinking.spawner, 'low').runRound({ jobId: fixture.jobId }));
+    expect(changedThinking.leadCalls[0]?.prompt).not.toContain('RECOVERED SPECIALIST EVIDENCE');
+    expect(fixture.ledger.listRoundSpecialistStarts(second.round.id)).toHaveLength(1);
+    const changedRuntime = fixture.fake({ childAnswer: () => '[]', specialists: [], neverSubmit: true });
+    const third = asWave(await fixture.wave('fixture-model-v1', changedRuntime.spawner, 'high', 'fixture-runtime-v2')
+      .runRound({ jobId: fixture.jobId }));
+    expect(changedRuntime.leadCalls[0]?.prompt).not.toContain('RECOVERED SPECIALIST EVIDENCE');
+    expect(fixture.ledger.listRoundSpecialistStarts(third.round.id)).toHaveLength(1);
+  }, 180_000);
+
+  it('refuses a rewritten prior manifest even if its fields and self-hashes impersonate the current model', async () => {
+    const fixture = integrityHarness('perkins-manifest-integrity');
+    await fixture.prepare();
+    const a = fixture.fake({ childAnswer: () => JSON.stringify([groundedFinding('blind', 'warning')]),
+      specialists: ['blind'], neverSubmit: true });
+    const first = asWave(await fixture.wave('fixture-model-v1', a.spawner).runRound({ jobId: fixture.jobId }));
+    const manifestPath = join(first.artifactDirectory!, 'manifest.json');
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as {
+      recoveryIdentity: { modelRef: string }; diffSha256: string; specSha256: string;
+    };
+    manifest.recoveryIdentity.modelRef = 'fixture-model-v2';
+    // Self-consistent frozen-file hashes do not replace the ledger receipt.
+    manifest.diffSha256 = createHash('sha256').update(readFileSync(join(first.artifactDirectory!, 'diff.patch'))).digest('hex');
+    manifest.specSha256 = createHash('sha256').update(readFileSync(join(first.artifactDirectory!, 'spec-context.md'))).digest('hex');
+    writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+    const b = fixture.fake({ childAnswer: () => '[]', specialists: [], neverSubmit: true });
+    const second = asWave(await fixture.wave('fixture-model-v2', b.spawner).runRound({ jobId: fixture.jobId }));
+    expect(b.leadCalls[0]?.prompt).not.toContain('RECOVERED SPECIALIST EVIDENCE');
+    expect(fixture.ledger.listRoundSpecialistStarts(second.round.id)).toHaveLength(1);
+    const receipt = fixture.ledger.uniqueRoundFreezeManifestReceipt(first.round.id);
+    expect(receipt).not.toBeNull();
+    fixture.ledger.appendCustomEvent({ kind: 'round.freeze-manifest', jobId: fixture.jobId, roundId: first.round.id,
+      payload: { sha256: createHash('sha256').update(readFileSync(manifestPath)).digest('hex') } });
+    expect(fixture.ledger.uniqueRoundFreezeManifestReceipt(first.round.id)).toBeNull();
+  }, 180_000);
+
+  it('does not jump past an incompatible interrupted identity to credit an older checkpoint', async () => {
+    const repo = makeFixtureRepo('perkins-intervening-identity');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/intervening-identity']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-intervening-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-intervening-artifacts-'));
+    const dbDir = mkdtempSync(join(tmpdir(), 'perkins-intervening-db-'));
+    dirs.push(root, artifacts, dbDir);
+    const db = new LedgerDb(dbDir);
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/intervening-identity', target);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-intervening-identity' });
+    const job = ledger.addJob({
+      id: 'job-intervening-identity', repo: 'fixture', title: 'intervening identity',
+      baseBranch: 'main', briefing: 'review',
+    });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    const makeFake = (brain: WholeLeadOptions) => {
+      const sessions = mkdtempSync(join(tmpdir(), 'perkins-intervening-sessions-'));
+      dirs.push(sessions);
+      return fakeWholeSpawner(sessions, brain);
+    };
+    const makeWave = (modelRef: string, spawner: AgentSpawner) => new WaveRunner({
+      ledger, worktrees: port, spawner, reviewArtifactRoot: artifacts,
+      reconcileReviewAgent: async () => true,
+      reviewRuntimeIdentity: () => ({ id: 'pi', version: 'fixture-runtime-v1' }),
+      reviewPreflight: async () => ({ ok: true as const, failures: [],
+        reviewModel: { role: 'perkins' as const, modelRef, settings: {}, authEnv: {}, routingSha256: "fixture-safe-route" } }),
+    });
+    const older = makeFake({
+      childAnswer: () => JSON.stringify([groundedFinding('blind', 'warning')]),
+      specialists: ['blind'], neverSubmit: true,
+    });
+    const first = asWave(await makeWave('fixture-model-v1', older.spawner).runRound({ jobId: job.id }));
+    expect(first.round.status).toBe('aborted');
+    expect(ledger.listRoundSpecialistStarts(first.round.id)).toHaveLength(1);
+    const incompatible = makeFake({ childAnswer: () => '[]', specialists: [], neverSubmit: true });
+    const second = asWave(await makeWave('fixture-model-v2', incompatible.spawner).runRound({ jobId: job.id }));
+    expect(second.round.status).toBe('aborted');
+    const newer = makeFake({ childAnswer: () => '[]', specialists: [], neverSubmit: true });
+    const third = asWave(await makeWave('fixture-model-v1', newer.spawner).runRound({ jobId: job.id }));
+    expect(third.round.status).toBe('aborted');
+    const fresh = makeFake({ childAnswer: () => '[]', specialists: [], verdictOverride: 'INCOMPLETE' });
+    const fourth = asWave(await makeWave('fixture-model-v1', fresh.spawner).runRound({ jobId: job.id }));
+    expect(fourth.canonicalVerdict).toBe('INCOMPLETE');
+    expect(fresh.leadCalls[0]?.prompt).not.toContain('RECOVERED SPECIALIST EVIDENCE');
+    expect(ledger.listRoundSpecialistStarts(fourth.round.id)).toHaveLength(1);
   }, 180_000);
 
   it('withholds a built-in verdict when PR delivery rejects or is absent', async () => {
@@ -1884,18 +2632,34 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
       prHeadProbe: localHeadProbe('feature/prior-missing'),
     }).runRound({ jobId: job.id }));
     expect(first.round.status).toBe('verdict-posted');
-    // ...then its consolidated record disappears.
-    rmSync(join(artifacts, first.round.id, 'consolidated.json'));
+    // ...then its consolidated record disappears before any new spawn.
+    const priorFile = join(artifacts, first.round.id, 'consolidated.json');
+    const priorBytes = readFileSync(priorFile);
+    rmSync(priorFile);
     const escalations: string[] = [];
+    const originalSpawner = makeSpawner(mkdtempSync(join(tmpdir(), 'perkins-pmiss-s2-')), []);
+    const secondSpawner = vi.fn((...args: Parameters<AgentSpawner>) => originalSpawner(...args));
     const second = asWave(await new WaveRunner({
-      ledger, worktrees: port, spawner: makeSpawner(mkdtempSync(join(tmpdir(), 'perkins-pmiss-s2-')), []),
+      ledger, worktrees: port, spawner: secondSpawner,
       poster: receiptPoster(), reviewArtifactRoot: artifacts,
       escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
       prHeadProbe: localHeadProbe('feature/prior-missing'),
     }).runRound({ jobId: job.id }));
     expect(second.canonicalVerdict).toBe('INCOMPLETE');
     expect(second.round.status).toBe('aborted');
+    expect(secondSpawner).not.toHaveBeenCalled();
+    expect(ledger.uniqueRoundNoSpawnReceipt(second.round.id)).not.toBeNull();
+    expect(ledger.listRoundSpecialistStarts(second.round.id)).toHaveLength(0);
     expect(escalations.some((line) => line.includes(`required prior review record for round ${first.round.id}`))).toBe(true);
+    writeFileSync(priorFile, priorBytes);
+    const retrySpawner = makeSpawner(mkdtempSync(join(tmpdir(), 'perkins-pmiss-retry-')), []);
+    const resumed = asWave(await new WaveRunner({ ledger, worktrees: port, spawner: retrySpawner,
+      poster: receiptPoster(), reviewArtifactRoot: artifacts,
+      prHeadProbe: localHeadProbe('feature/prior-missing'),
+    }).runRound({ jobId: job.id, force: true }));
+    expect(resumed.round.id).not.toBe(second.round.id);
+    expect(resumed.round.status).toBe('verdict-posted');
+    expect(ledger.uniqueRoundNoSpawnReceipt(resumed.round.id)).toBeNull();
   });
 
   it('publishes the host-owned execution/findings disclosure appendix with the review (B10)', async () => {
@@ -4903,6 +5667,99 @@ describe('repair pass 3: real child-process crash recovery (R19/R16)', () => {
     expect(recoveredEvent?.receipt?.actor).toBe('gru-bot');
     expect(recoveredEvent?.receipt?.event).toBe('COMMENTED');
     expect(port.getWorktree(roundId)?.status).toBe('swept');
+  }, 300_000);
+
+  it('retains pre-verdict checkpoints after SIGKILL, blocks uncertain ownership and reattaches only with cessation proof', async () => {
+    const repo = makeFixtureRepo('selective-crash-parent');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/selective-crash']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), 'selective-crash-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'selective-crash-artifacts-'));
+    const sessions = mkdtempSync(join(tmpdir(), 'selective-crash-sessions-'));
+    const dbDir = mkdtempSync(join(tmpdir(), 'selective-crash-db-'));
+    dirs.push(root, artifacts, sessions, dbDir);
+    attachOrigin(repo, 'feature/selective-crash', root);
+    const dbPath = join(dbDir, 'ledger.db');
+    const markerPath = join(dbDir, 'checkpoint-marker.json');
+    const payloadPath = join(dbDir, 'payload.json');
+    writeFileSync(payloadPath, `${JSON.stringify({
+      repoPath: repo.path, branch: 'feature/selective-crash', target,
+      dbPath, portRoot: root, artifacts, sessions, markerPath,
+      prUrl: 'https://git.example.invalid/acme/fixture/pull/48', crashPhase: 'checkpoint',
+    })}\n`);
+    const child = await new Promise<number | null>((resolve, reject) => {
+      const spawned = spawn(process.execPath, [
+        join('node_modules', 'vitest', 'dist', 'cli.js'),
+        'run', 'test/perkins-crash-child.test.ts', '--config', 'vitest.config.ts',
+      ], { cwd: process.cwd(), env: { ...process.env, PERKINS_CRASH_CHILD: payloadPath }, stdio: 'ignore' });
+      const timer = setTimeout(() => spawned.kill('SIGKILL'), 240_000);
+      timer.unref?.();
+      spawned.on('error', reject);
+      spawned.on('close', (code) => { clearTimeout(timer); resolve(code); });
+    });
+    expect(child).not.toBe(0);
+    expect(existsSync(markerPath)).toBe(true);
+    const { roundId } = JSON.parse(readFileSync(markerPath, 'utf8')) as { roundId: string };
+    const db = new LedgerDb(dbPath);
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new PersistedReviewPort(root, 'feature/selective-crash', target);
+    expect(ledger.listRoundSpecialistStarts(roundId)).toHaveLength(2);
+    const recordedOwner = ledger.latestRoundEvent(roundId, 'round.review-owner')?.payload as {
+      roundId: string; runtimeId: string; pid: number; generation: string;
+    };
+    expect(recordedOwner).toMatchObject({ roundId, runtimeId: 'pi', pid: expect.any(Number) });
+    const ownerEvent = ledger.latestRoundEvent(roundId, 'round.review-owner');
+    const earliestSpawn = ledger.listEvents({ limit: 1000 }).find((event) => event.roundId === roundId && event.kind === 'agent.spawned');
+    expect(ownerEvent).toBeDefined();
+    expect(earliestSpawn).toBeDefined();
+    expect(ownerEvent!.seq).toBeLessThan(earliestSpawn!.seq);
+    const manifest = JSON.parse(readFileSync(join(artifacts, roundId, 'manifest.json'), 'utf8')) as {
+      recoveryIdentity: { runtimeId: string; modelRole: string; modelRef: string } | null;
+    };
+    expect(manifest.recoveryIdentity).toMatchObject({
+      runtimeId: 'pi', modelRole: 'perkins', modelRef: 'fixture-model-v1',
+    });
+    const registryHome = mkdtempSync(join(tmpdir(), 'selective-crash-registry-'));
+    dirs.push(registryHome);
+    writeFileSync(configPathFor(registryHome), `workspace_root = "${root}"\n`);
+    const registryConfig = loadConfig({ GRU_COMMAND_HOME: registryHome }, '/home/tester');
+    const runtimeOwner = new RuntimeRegistry({ config: registryConfig, store: new SessionStore(registryConfig.dataDir) });
+    expect(runtimeOwner.reviewOwnerCeased('old-lead', null)).toBe(false);
+    expect(runtimeOwner.reviewOwnerCeased('old-lead', { ...recordedOwner, pid: process.pid })).toBe(false);
+    expect(runtimeOwner.reviewOwnerCeased('old-lead', { ...recordedOwner, runtimeId: 'claude-code' })).toBe(false);
+    const unknownRuntime = new RuntimeRegistry({ config: registryConfig, store: new SessionStore(registryConfig.dataDir),
+      ownerProcessProbe: () => 'unknown' });
+    expect(unknownRuntime.reviewOwnerCeased('old-lead', recordedOwner)).toBe(false);
+    expect(runtimeOwner.reviewOwnerCeased('old-lead', recordedOwner)).toBe(true);
+    const options = {
+      ledger, worktrees: port, reviewArtifactRoot: artifacts,
+      reviewRuntimeIdentity: () => ({ id: 'pi', version: 'test-runtime-v1' }),
+      reviewPreflight: async () => ({ ok: true as const, failures: [],
+        reviewModel: { role: 'perkins' as const, modelRef: 'fixture-model-v1', settings: {}, authEnv: {}, routingSha256: "fixture-safe-route" } }),
+      prHeadProbe: localHeadProbe('feature/selective-crash'),
+      poster: { post: vi.fn(async (call: { body: string; targetSha: string }) => ({
+        reviewId: 'new', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+        headSha: call.targetSha, baseSha: 'b'.repeat(40),
+        bodySha256: createHash('sha256').update(call.body).digest('hex'),
+      })) },
+    };
+    const restarting = new WaveRunner({ ...options, spawner: vi.fn() as unknown as AgentSpawner });
+    expect(await restarting.recoverInterruptedRounds()).toBe(1);
+    expect(ledger.getRound(roundId)?.status).toBe('aborted');
+    await expect(restarting.runRound({ jobId: 'job-p3-crash' })).rejects.toThrow(/may still run/);
+    expect(ledger.listRounds('job-p3-crash')).toHaveLength(1);
+    const freshSessions = join(dbDir, 'fresh-sessions');
+    mkdirSync(freshSessions);
+    const fake = fakeWholeSpawner(freshSessions, { childAnswer: () => '[]', specialists: ['tests'] });
+    const fresh = asWave(await new WaveRunner({ ...options, spawner: fake.spawner,
+      reconcileReviewAgent: async (agentId, marker) => runtimeOwner.reviewOwnerCeased(agentId, marker),
+    }).runRound({ jobId: 'job-p3-crash' }));
+    expect(fake.childCalls).toHaveLength(1);
+    expect(fake.leadCalls[0]?.prompt).toContain('RECOVERED SPECIALIST EVIDENCE');
+    expect(fresh.canonicalVerdict).toBe('READY TO MERGE');
+    expect(ledger.listRoundSpecialistStarts(fresh.round.id)).toHaveLength(3);
   }, 300_000);
 });
 describe('durable handoff admission: perkins route, re-busy re-queue, crash/terminal reconciliation', () => {

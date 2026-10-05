@@ -24,6 +24,9 @@ export interface ClaudeReviewConfiguration {
 /** Request-owned proof returned by preflight; no shared per-role cache. */
 export interface ClaudeReviewSnapshot extends ClaudeReviewConfiguration {
   readonly role: Role;
+  /** Non-secret Pi model routing proof. Absent means routing cannot be
+   * established safely and no specialist work may be reused. */
+  readonly routingSha256?: string;
 }
 
 const AUTH_ENV = /^(?:ANTHROPIC_(?:API_KEY|AUTH_TOKEN|BASE_URL|CUSTOM_HEADERS|VERTEX_PROJECT_ID|FOUNDRY_RESOURCE|FOUNDRY_BASE_URL|MODEL|DEFAULT_(?:OPUS|SONNET|HAIKU)_MODEL)|CLAUDE_CODE_OAUTH_TOKEN|CLAUDE_CODE_USE_(?:BEDROCK|VERTEX|FOUNDRY)|AWS_[A-Z0-9_]+|GOOGLE_[A-Z0-9_]+|CLOUD_ML_REGION)$/u;
