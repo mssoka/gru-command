@@ -53,6 +53,9 @@ let holdNextTurn = false;
 let releaseHeldTurn: (() => void) | null = null;
 let compactGeneration = 0;
 let newChatGeneration = 0;
+/** Bumped by /__reset: a previous turn's interval/close settle must not
+ * record frames into the rewound log (they replay as orphan turn frames). */
+let turnGeneration = 0;
 /** Reflow stress controls (owner heist 2026-09-29, tests only): the next
  * scripted reply runs under this tool name and/or emits this error line.
  * Long unbroken tokens prove the chat pane never scrolls horizontally;
@@ -116,6 +119,7 @@ function sendError(socket: WebSocket, message: string, fatal: boolean): void {
 
 /** Deterministic scripted Gru reply: turn → tool activity → deltas → end. */
 function scriptedReply(socket: WebSocket, userText: string, attachments?: readonly AttachmentChip[]): void {
+  const generation = turnGeneration;
   controlState = 'busy';
   broadcastContext();
   // Attach chips echo as PATH lines (SPEC ruling 19 parity: the mock is
@@ -138,6 +142,10 @@ function scriptedReply(socket: WebSocket, userText: string, attachments?: readon
   let toolEnded = false;
   let settled = false;
   const timer = setInterval(() => {
+    if (generation !== turnGeneration) {
+      finish();
+      return;
+    }
     if (socket.readyState !== socket.OPEN) {
       finish();
       return;
@@ -178,6 +186,10 @@ function scriptedReply(socket: WebSocket, userText: string, attachments?: readon
     clearInterval(timer);
     releaseHeldTurn = null;
     socket.off('close', finish);
+    // /__reset bumps turnGeneration and rewinds the log; a settle from a
+    // previous generation (parked, streaming, or socket-close) must not
+    // record orphan frames into it.
+    if (generation !== turnGeneration) return;
     if (!toolEnded) {
       toolEnded = true;
       emit({ type: 'tool', name: toolName, state: 'end', seq: nextSeq() });
@@ -925,6 +937,7 @@ const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
     boardMode = 'default';
     compactGeneration += 1;
     newChatGeneration += 1;
+    turnGeneration += 1;
     deferredUsers.length = 0;
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end('{"ok":true}\n');

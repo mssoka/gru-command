@@ -152,7 +152,9 @@ test('busy phrases rotate with stable status/control geometry on every surface',
 
   // The reply must be fully streamed before layout is measured: message
   // growth (not the rotation) is what moves the controls while it lands.
-  await expect(page.locator('.msg--gru').last()).toContainText('echo with pride.');
+  // The final 🪐 token arrives after 'echo with pride.', so the wait names
+  // the complete tail — a prefix match would still race the last delta.
+  await expect(page.locator('.msg--gru').last()).toContainText('echo with pride. 🪐');
 
   // One real rotation under the hold, with the controls pinned as it lands.
   const controlsBefore = await page.locator('.chat-context__button').evaluateAll((nodes) =>
