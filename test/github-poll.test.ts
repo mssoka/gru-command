@@ -610,12 +610,16 @@ describe('github signal poll tick', () => {
       expect(notifications.posts).toHaveLength(1);
       expect(notifications.posts[0]).toMatchObject({
         kind: 'github.pr-conflict:job-conflict',
-        routing: 'action-required',
+        // Issue #215: mechanical tier routes fyi like mechanical CI —
+        // the digest and board visibility carry the conflict, Gru is
+        // never woken for it.
+        routing: 'fyi',
         severity: 'error',
         dedupe: 'unacked',
         agentId: 'minion-conflict',
       });
       expect(notifications.posts[0]?.detail).toContain('rebase');
+      expect(notifications.posts[0]?.detail).toContain('Silas owns the rebase within mandate');
 
       // one dedupe cursor per job, recording the observed state
       for (const jobId of ['job-merge', 'job-conflict']) {
@@ -623,6 +627,35 @@ describe('github signal poll tick', () => {
       }
       expect(readBranchState(h.ledger, 'job-merge')?.merged).toBe(true);
       expect(readBranchState(h.ledger, 'job-conflict')?.mergeableState).toBe('dirty');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a mechanical conflict posts fyi and is never a Gru wake candidate under notify_wake action-required (issue #215)', async () => {
+    const h = makeLedger();
+    try {
+      addTrackedJob(h.ledger, 'job-dirty', 'https://github.com/acme/app/pull/21');
+      const api = new FakeGhApi();
+      api.pulls.set('acme/app', [pull({ number: 21, headRef: 'gru/job-dirty', headSha: 'sha-21' })]);
+      api.details.set('acme/app#21', pull({ number: 21, headRef: 'gru/job-dirty', headSha: 'sha-21', mergeableState: 'dirty' }));
+      const notifications = new FakeNotifications();
+      const poll = makePoll({ ledger: h.ledger, api, notifications });
+
+      const result = await poll.pollOnce();
+      expect(result.signals.map((signal) => signal.kind)).toEqual(['pr-conflict']);
+      // Same tier rule as mechanical CI: routing fyi means the
+      // action-required wake policy never sees a candidate; the ledger
+      // event stays the record.
+      expect(notifications.posts).toHaveLength(1);
+      expect(notifications.posts[0]).toMatchObject({
+        kind: 'github.pr-conflict:job-dirty',
+        routing: 'fyi',
+        severity: 'error',
+        dedupe: 'unacked',
+      });
+      expect(notifications.posts[0]?.title).toContain('conflicts with its base');
+      expect(h.ledger.latestJobEvent('job-dirty', 'github.pr-conflict')).not.toBeNull();
     } finally {
       h.cleanup();
     }
@@ -752,7 +785,7 @@ describe('github signal poll tick', () => {
       expect(notifications.posts).toHaveLength(1);
       expect(notifications.posts[0]).toMatchObject({
         kind: 'github.pr-conflict:job-nominion',
-        routing: 'action-required',
+        routing: 'fyi',
         agentId: null,
       });
     } finally {

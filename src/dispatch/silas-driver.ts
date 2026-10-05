@@ -18,6 +18,7 @@ import { openAttemptStartSeq } from './branch-idle.js';
 import type { AgentHandle, SpawnOptions } from '../runtime/types.js';
 import type { AgentSupervisionView } from '../supervision/supervisor.js';
 import type { GitHubPollTickResult } from './github-poll.js';
+import { BRANCH_STATE_EVENT } from './github-poll.js';
 import { pendingRecoveryRows } from '../provider-recovery/sensor.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
@@ -325,6 +326,25 @@ export interface ProviderRecoveryPendingRow {
   readonly recoveredAt: string;
 }
 
+/** An open PR whose head is dirty against its base (issue #215): the
+ * rebase is Silas's mechanical work, derived from the job's latest
+ * `github.branch-state` cursor. Suppressed while any accepted operation
+ * owns the lane (a live directive, a pending re-brief, an in-flight
+ * verification) or a rebase directive for this exact head has landed
+ * after the conflict — uncertain ownership fails closed to no row. */
+export interface ConflictingPrRow {
+  readonly jobId: string;
+  readonly repo: string;
+  readonly branch: string | null;
+  readonly prNumber: number | null;
+  readonly prUrl: string | null;
+  readonly headSha: string | null;
+  /** When this conflict stretch was first observed: the latest
+   * `github.pr-conflict` transition (it fires once per clean→dirty
+   * change), falling back to the dirty cursor itself. */
+  readonly firstSeenAt: string | null;
+}
+
 export interface SilasOpsDigest {
   readonly computedAt: string;
   readonly trigger: string;
@@ -336,6 +356,7 @@ export interface SilasOpsDigest {
   readonly verificationFailures: readonly VerificationFailureRow[];
   readonly verificationWaits: readonly VerificationWaitingRow[];
   readonly providerRecoveryPending: readonly ProviderRecoveryPendingRow[];
+  readonly conflictingPrs: readonly ConflictingPrRow[];
 }
 
 /** Count of actionable rows (event triggers wake even at zero; sweeps do not). */
@@ -348,7 +369,8 @@ export function digestActionCount(digest: SilasOpsDigest): number {
     digest.minionErrors.length +
     digest.verificationFailures.length +
     digest.verificationWaits.length +
-    digest.providerRecoveryPending.length
+    digest.providerRecoveryPending.length +
+    digest.conflictingPrs.length
   );
 }
 
@@ -711,11 +733,14 @@ function stallStillEligible(
  *    verification, an answering review — fence the row.
  *
  * plus minionErrors — a minion turn that failed more recently than any
- * delivery — so an error wake always carries its context; and the
+ * delivery — so an error wake always carries its context; the
  * verification follow-through rows (issue #163) — a failed completed run
  * awaiting a repair decision and a queue wait that timed out awaiting
  * reconsideration — so completion/dependency transitions reach the sweep
- * without a fresh owner message.
+ * without a fresh owner message; and the conflictingPrs rows (issue
+ * #215) — a live PR-owing lane whose open head is dirty against its
+ * base, Silas's mechanical rebase work, suppressed while an accepted
+ * operation owns the lane and never a Gru wake.
  */
 export async function computeSilasDigest(input: ComputeDigestInput): Promise<SilasOpsDigest> {
   const now = input.now ?? Date.now;
@@ -730,6 +755,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     verificationFailures: VerificationFailureRow[];
     verificationWaits: VerificationWaitingRow[];
     providerRecoveryPending: ProviderRecoveryPendingRow[];
+    conflictingPrs: ConflictingPrRow[];
   } = {
     computedAt: new Date(now()).toISOString(),
     trigger: input.trigger,
@@ -741,6 +767,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     verificationFailures: [],
     verificationWaits: [],
     providerRecoveryPending: [],
+    conflictingPrs: [],
   };
   // One unresolved re-brief request fences the target: a marker exists while
   // a re-brief worker runs (or a restart-recovered request waits for boot
@@ -1168,6 +1195,48 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
         });
       }
     }
+
+    // (7) Conflicting PR head (issue #215): a mechanical dirty state is
+    // Silas's digest work, never a Gru wake. Derived from the job's
+    // latest `github.branch-state` cursor on live PR-owing lanes only;
+    // suppressed while an unresolved re-brief, a live directive request
+    // or an in-flight verification owns the lane (uncertain ownership
+    // fails closed to no row). No new wake event exists for this: the
+    // change-gated sweep (#217) picks the row up without extra turns,
+    // so `github.pr-conflict` deliberately stays out of
+    // SILAS_WAKE_EVENTS.
+    if (reviewPending && (job.deliverable === null || job.deliverable === 'pr') &&
+        !rebriefPending && !liveDirectiveOwns && !verificationInFlight(input.ledger, job.id)) {
+      const branchState = input.ledger.latestJobEvent(job.id, BRANCH_STATE_EVENT);
+      const conflict = input.ledger.latestJobEvent(job.id, 'github.pr-conflict');
+      if (branchState !== null) {
+        const state = payloadRecord(branchState);
+        const headSha = payloadString(branchState, 'sha');
+        if (state['pr_open'] === true && state['merged'] !== true && state['mergeable_state'] === 'dirty') {
+          // Identity retirement, the verification-failure pattern: a
+          // directive carrying `pr-conflict:<headSha>` after the conflict
+          // retires exactly that head; a later dirty cursor at a new head
+          // re-arms the row.
+          const directed = conflict !== null && headSha !== null && input.ledger.hasJobEventWithPayloadValues(
+            job.id,
+            ['silas.directive-sent'],
+            [{ key: 'blocker_fingerprint', value: `pr-conflict:${headSha}` }],
+            conflict.seq,
+          );
+          if (!directed) {
+            digest.conflictingPrs.push({
+              jobId: job.id,
+              repo: job.repo,
+              branch: payloadString(branchState, 'branch'),
+              prNumber: payloadNumber(branchState, 'pr_number'),
+              prUrl: payloadString(branchState, 'pr_url'),
+              headSha,
+              firstSeenAt: conflict !== null ? conflict.ts : branchState.ts,
+            });
+          }
+        }
+      }
+    }
   }
   // Provider-recovery lanes awaiting a guarded continuation claim: the
   // durable pending-delivery rows ARE the restart-safe handoff — every
@@ -1217,6 +1286,16 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       // in-review), which the phase-identity recheck above already catches;
       // the row-specific precondition here is only the PR link it names.
       return job !== null && job.prUrl !== null;
+    }),
+    conflictingPrs: digest.conflictingPrs.filter((row) => {
+      if (!reviewOfferFencesHold(row.jobId)) return false;
+      const job = input.ledger.getJob(row.jobId);
+      // The row-specific precondition restates its scope: a live PR-owing
+      // lane only — a lane gone terminal, blocked or parked during the
+      // compute retracts its conflict offer.
+      return job !== null &&
+        (job.status === 'working' || job.status === 'delivered' || job.status === 'in-review') &&
+        (job.deliverable === null || job.deliverable === 'pr');
     }),
     stalledWorking: digest.stalledWorking.filter((row) => {
       const phaseSeq = phaseSeqByJob.get(row.jobId);

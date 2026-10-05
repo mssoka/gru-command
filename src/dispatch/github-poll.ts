@@ -23,9 +23,11 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  * the state-change mappings:
  *
  *   PR merged            -> job in-review -> merged transition + `github.pr-merged`
- *   PR conflicting       -> `github.pr-conflict` + action-required cascade
- *                           notification (mechanical tier: Silas may arm a
- *                           rebase lane within his existing mandate)
+ *   PR conflicting       -> `github.pr-conflict` + fyi notification
+ *                           (mechanical tier: Silas owns the rebase within
+ *                           his existing mandate — the conflict lands in his
+ *                           digest's conflictingPrs rows, never as a Gru
+ *                           wake; issue #215)
  *   CI failed (tracked)  -> `github.ci-failed` + notification with the run URL,
  *                           routed by check kind (mechanical -> fyi, Silas may
  *                           act; judgment -> action-required, wake-eligible)
@@ -1034,14 +1036,15 @@ export class GitHubSignalPoll {
     }
   }
 
-  /** Conflict cascade: the event is the record; the action-required
-   * notification is the cascade (mechanical tier — Silas may arm a rebase
-   * lane within his existing mandate, no human ack required to act). */
+  /** Conflict cascade: the event is the record; the fyi notification is
+   * the cascade (mechanical tier — Silas owns the rebase within his
+   * existing mandate, so the row routes fyi into his digest and must
+   * never wake Gru; issue #215, the same tier rule as mechanical CI). */
   private applyConflict(signal: PrConflictSignal): void {
     const prLabel = signal.prNumber !== null ? `#${signal.prNumber}` : '(unknown PR)';
     const detail = [
       `Branch ${signal.branch} of ${repoFullName(signal.repo)} is conflicting with its base.`,
-      `Mechanical tier: within mandate Silas may arm a rebase lane for ${prLabel}.`,
+      `Mechanical tier: Silas owns the rebase within mandate for ${prLabel}; tracked in his digest, not a Gru wake.`,
       ...(signal.prUrl !== null ? [signal.prUrl] : []),
     ].join(' ');
     this.ledger.appendCustomEvent({
@@ -1057,17 +1060,16 @@ export class GitHubSignalPoll {
     });
     this.notifications.postIncident({
       kind: `github.pr-conflict:${signal.jobId}`,
-      routing: 'action-required',
+      routing: 'fyi',
       severity: 'error',
       title: `PR ${prLabel} conflicts with its base (${repoFullName(signal.repo)})`,
       detail,
       dedupe: 'unacked',
-      // Bind the row to the lane's current worker (existing agentId
-      // semantics) so a merged/done lane's leftover row is classified as
-      // a closed receipt instead of live NEEDS GRU work. The job is
-      // already validated by the poll; no bound worker → unbound and
-      // live (unknown historical rows are never guessed; tracked-review
-      // A4).
+      // Mechanical (fyi) rows never wake Gru; the binding stays so a
+      // merged/done lane's leftover row is classified as a closed
+      // receipt. The job is already validated by the poll; no bound
+      // worker → unbound and live (unknown historical rows are never
+      // guessed; tracked-review A4).
       agentId: this.laneMinionId(signal.jobId),
     });
     this.log('info', 'github poll: PR conflict observed', {
