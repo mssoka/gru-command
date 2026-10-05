@@ -41,8 +41,9 @@ mode (never written, never migrated) and session JSONL is only streamed.
   (machine / delivery / owner) and per provider+model.
 - **Yield.** For each `silas.wake` (and `gru.wake`) ledger event: whether any
   ops action (directive, re-brief, escalation, PR registration, review
-  trigger, verification request, resolution) lands before the next wake.
-  The no-action share is the waste signal from GH-213.
+  trigger, verification request, provider-recovery continuation, resolution)
+  lands before the next wake in (timestamp, sequence) order. The no-action
+  share is the waste signal from GH-213.
 - **Digest stability.** Each Silas sweep prompt's fenced digest JSON is
   reduced to a signature (per category, sorted job IDs); the share of sweeps
   whose signature matches the previous sweep is the "wake without new
@@ -76,5 +77,14 @@ Output is counts and bounded identifiers only (job IDs, trigger names,
 notification kinds). Prompts, transcripts, token values, and secrets never
 appear in the report; tests pin this (a sentinel planted in a fixture prompt
 must not surface in text or JSON output).
+
+## Coverage
+
+The parser reads pi-session JSONL (the format every GC role writes today).
+Sessions written in other runtimes' formats (for example a Claude Code
+stream-JSON transcript) contribute no turns and no cost; if a runtime switch
+ever happens, the parser must gain that format or the report will silently
+understate. Cost figures cover what pi recorded per assistant message, so a
+report over a past window is stable once its turns have finished streaming.
 
 A board panel can follow later by rendering the same `--json` output.

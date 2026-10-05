@@ -34,7 +34,9 @@ export const PERKINS_LEAD_PROMPT_PREFIX = 'Conduct the complete Perkins review';
 export const MINION_BRIEFING_PREFIX = 'Dispatch briefing — job ';
 export const MINION_REBRIEF_PREFIX = 'Re-brief — job ';
 
-/** Silas ops actions that count as follow-through yield (the issue's list). */
+/** Silas ops actions that count as follow-through yield. The issue's list
+ * plus `provider.recovery-claimed`, which the driver itself treats as Silas
+ * follow-through (silas-driver.ts groups it with directive-sent). */
 export const SILAS_YIELD_ACTION_KINDS = [
   'silas.directive-sent',
   'silas.rebrief',
@@ -45,6 +47,7 @@ export const SILAS_YIELD_ACTION_KINDS = [
   'job.pr-linked',
   'verification.requested',
   'silas.rebrief-recovered',
+  'provider.recovery-claimed',
 ] as const;
 
 /** Ledger kinds the report reads (beyond the wake kinds above). */
@@ -86,8 +89,9 @@ export interface ParsedTurn {
   /** Reduced digest signature (sorted job IDs per category) when the
    * opening prompt is a Silas wake carrying a parseable digest; else null. */
   readonly digestSignature: string | null;
-  /** provider/model per assistant message, for the per-model table. */
-  readonly models: readonly { readonly provider: string; readonly model: string }[];
+  /** provider/model per assistant message with that message's cost, for
+   * the per-model table. */
+  readonly models: readonly { readonly provider: string; readonly model: string; readonly costUsd: number }[];
 }
 
 export interface SessionParseResult {
@@ -129,14 +133,16 @@ export function classifyTurn(role: SessionRole, text: string): TurnClassificatio
 }
 
 /** `buildWakePrompt` opens `Silas ops wake — trigger: <kind>` with an
- * optional ` (job <id>)` clause. Returns the trigger kind, null when the
- * text is not a wake prompt. */
+ * optional ` (job <id>)` clause. Returns the trigger kind when it is a
+ * bounded identifier (trigger kinds and future kinds are dot-separated
+ * identifiers; anything else is refused so prompt text can never leak
+ * into a report label), null when the text is not a wake prompt. */
 export function parseSilasWakeTrigger(text: string): string | null {
   if (!text.startsWith(SILAS_WAKE_PREFIX)) return null;
   const rest = text.slice(SILAS_WAKE_PREFIX.length);
   const end = rest.search(/(?: \(job |\n)/);
   const kind = end === -1 ? rest : rest.slice(0, end);
-  return kind.length > 0 ? kind : null;
+  return /^[A-Za-z0-9._-]{1,40}$/.test(kind) ? kind : null;
 }
 
 /** Digest header exactly as `buildWakePrompt` renders it. */
@@ -172,6 +178,20 @@ export function digestSignatureFromPrompt(prompt: string): string | null {
   }
   if (parsed === null || typeof parsed !== 'object') return null;
   const digest = parsed as Record<string, unknown>;
+  // Shape guard: every PRESENT category must be an array, and at least one
+  // actionable category must exist at all. Keys may be ABSENT — older
+  // digest formats predate newer categories (e.g. verificationFailures
+  // landed with #163) and count as empty for those formats — but a payload
+  // with no actionable categories is not a digest, and a non-array value
+  // is corrupt; either would fake stability.
+  let presentCategories = 0;
+  for (const key of DIGEST_CATEGORY_KEYS) {
+    const value = digest[key];
+    if (value === undefined) continue;
+    if (!Array.isArray(value)) return null;
+    presentCategories += 1;
+  }
+  if (presentCategories === 0) return null;
   const signature: Record<string, readonly string[]> = {};
   for (const key of DIGEST_CATEGORY_KEYS) {
     const rows = digest[key];
@@ -217,9 +237,14 @@ export interface ParseSkips {
 
 /** Statefully fold one pi session's JSONL lines into attributed turns.
  * A turn is one `user` message plus the assistant messages that follow it,
- * up to the next `user` message. Unparsable lines are counted, never
- * thrown; prompt text is never retained. Pure (no I/O). */
-export function parseSessionLines(role: SessionRole, lines: readonly string[]): SessionParseResult {
+ * up to the next `user` message. Accepts a sync or async iterable so the
+ * CLI can feed a readline interface directly — no session is ever held in
+ * memory whole. Unparsable lines are counted, never thrown; prompt text is
+ * never retained. */
+export async function parseSessionLines(
+  role: SessionRole,
+  lines: Iterable<string> | AsyncIterable<string>,
+): Promise<SessionParseResult> {
   const turns: ParsedTurn[] = [];
   let unparsableLines = 0;
   let unattributedCompactions = 0;
@@ -233,7 +258,7 @@ export function parseSessionLines(role: SessionRole, lines: readonly string[]): 
     tokens: TokenClasses;
     costUsd: number;
     compactions: number;
-    models: { provider: string; model: string }[];
+    models: { provider: string; model: string; costUsd: number }[];
   } | null = null;
 
   const close = (): void => {
@@ -253,7 +278,7 @@ export function parseSessionLines(role: SessionRole, lines: readonly string[]): 
     open = null;
   };
 
-  for (const line of lines) {
+  for await (const line of lines) {
     let record: unknown;
     try {
       record = JSON.parse(line);
@@ -309,6 +334,7 @@ export function parseSessionLines(role: SessionRole, lines: readonly string[]): 
 
     if (messageRole === 'assistant' && open !== null) {
       open.llmCalls += 1;
+      let messageCost = 0;
       const usage = shapedMessage['usage'];
       if (usage !== null && typeof usage === 'object') {
         const u = usage as Record<string, unknown>;
@@ -324,13 +350,16 @@ export function parseSessionLines(role: SessionRole, lines: readonly string[]): 
         const cost = u['cost'];
         if (cost !== null && typeof cost === 'object') {
           const total = (cost as Record<string, unknown>)['total'];
-          if (typeof total === 'number' && Number.isFinite(total)) open.costUsd += total;
+          if (typeof total === 'number' && Number.isFinite(total)) {
+            messageCost = total;
+            open.costUsd += total;
+          }
         }
       }
       const provider = shapedMessage['provider'];
       const model = shapedMessage['model'];
       if (typeof provider === 'string' && typeof model === 'string') {
-        open.models.push({ provider, model });
+        open.models.push({ provider, model, costUsd: messageCost });
       }
     }
     // toolResult and anything else: no usage, no attribution.
@@ -420,14 +449,15 @@ export function aggregateUsage(turns: readonly ParsedTurn[]): UsageSummary {
     addUsage(label, turn);
     addUsage(byClass[turn.turnClass], turn);
     addUsage(total, turn);
-    for (const { provider, model } of turn.models) {
-      const modelKey = `${provider}/${model}`;
+    for (const modelCall of turn.models) {
+      const modelKey = `${modelCall.provider}/${modelCall.model}`;
       let entry = byModel.get(modelKey);
       if (entry === undefined) {
-        entry = { provider, model, llmCalls: 0, costUsd: 0 };
+        entry = { provider: modelCall.provider, model: modelCall.model, llmCalls: 0, costUsd: 0 };
         byModel.set(modelKey, entry);
       }
       entry.llmCalls += 1;
+      entry.costUsd += modelCall.costUsd;
     }
   }
 
@@ -507,6 +537,8 @@ export interface M0Measures {
   /** Non-terminal jobs (replayed status as of `until`) by status, with age. */
   readonly wipByStatus: readonly { readonly status: string; readonly jobs: number; readonly medianAgeHours: number }[];
   readonly wipTotal: number;
+  /** Total in-window cost divided by finished heists; null when none finished. */
+  readonly costPerFinishedUsd: number | null;
 }
 
 export interface LedgerMeasures {
@@ -519,6 +551,12 @@ export interface LedgerMeasures {
 
 const inWindow = (ts: string, since: string, until: string): boolean => ts >= since && ts < until;
 
+/** Total order over ledger events: timestamp, then sequence. Two events
+ * sharing a timestamp are ordered by their append sequence, so an action
+ * at the exact instant of the next wake lands in exactly one window. */
+const eventKeyLessEq = (left: { readonly ts: string; readonly seq: number }, right: { readonly ts: string; readonly seq: number }): boolean =>
+  left.ts < right.ts || (left.ts === right.ts && left.seq <= right.seq);
+
 function median(values: readonly number[]): number | null {
   if (values.length === 0) return null;
   const sorted = [...values].sort((a, b) => a - b);
@@ -530,8 +568,9 @@ function median(values: readonly number[]): number | null {
   return lower === undefined ? upper : (lower + upper) / 2;
 }
 
-/** Yield over one wake kind: actions of `actionKinds` landing strictly
- * after a wake and at or before the next wake (or `until` for the last). */
+/** Yield over one wake kind: actions landing strictly after a wake and at
+ * or before the next wake in (ts, seq) order — or strictly before `until`
+ * for the last wake, keeping the window end exclusive. */
 function computeWakeYield(
   events: readonly LedgerEventRecord[],
   wakeKind: string,
@@ -551,15 +590,19 @@ function computeWakeYield(
   let wakesWithAction = 0;
   const perTrigger = new Map<string, { wakes: number; wakesWithAction: number }>();
 
-  for (let i = 0; i < wakes.length; i += 1) {
-    const wake = wakes[i];
-    if (wake === undefined) continue;
-    const next = wakes[i + 1];
-    const nextTs = next === undefined ? until : next.ts;
-    const triggered = actions.some((action) => action.ts > wake.ts && action.ts <= nextTs);
+  for (const wake of wakes) {
+    const next = wakes.find((candidate) => candidate !== wake && eventKeyLessEq(wake, candidate));
+    const nextKey = next ?? null;
+    const inWakeWindow = (action: LedgerEventRecord): boolean => {
+      const afterWake = action.ts > wake.ts || (action.ts === wake.ts && action.seq > wake.seq);
+      if (!afterWake) return false;
+      if (nextKey === null) return action.ts < until;
+      return action.ts < nextKey.ts || (action.ts === nextKey.ts && action.seq <= nextKey.seq);
+    };
+    const triggered = actions.some(inWakeWindow);
     if (triggered) wakesWithAction += 1;
     for (const action of actions) {
-      if (action.ts > wake.ts && action.ts <= nextTs) {
+      if (inWakeWindow(action)) {
         actionsByKind[action.kind] = (actionsByKind[action.kind] ?? 0) + 1;
       }
     }
@@ -582,8 +625,15 @@ function computeWakeYield(
 }
 
 /** Digest stability over silas sweep turns (session side): share of sweeps
- * whose signature matches the previous sweep's, in chronological order. */
-export function computeDigestStability(sweepSignatures: readonly (readonly [string, string])[]): DigestStability {
+ * whose signature matches the previous sweep's in (ts, seq)-free
+ * chronological order. Sweeps are drawn from the WHOLE parse so the first
+ * in-window sweep can be compared with the last sweep before the window;
+ * only in-window sweeps with a predecessor count toward the share. */
+export function computeDigestStability(
+  sweepSignatures: readonly (readonly [string, string])[],
+  since: string,
+  until: string,
+): DigestStability {
   const ordered = [...sweepSignatures].sort((a, b) => a[0].localeCompare(b[0]));
   let comparable = 0;
   let stable = 0;
@@ -591,11 +641,12 @@ export function computeDigestStability(sweepSignatures: readonly (readonly [stri
     const current = ordered[i];
     const previous = ordered[i - 1];
     if (current === undefined || previous === undefined) continue;
+    if (!inWindow(current[0], since, until)) continue;
     comparable += 1;
     if (current[1] === previous[1]) stable += 1;
   }
   return {
-    sweeps: ordered.length,
+    sweeps: ordered.filter((pair) => inWindow(pair[0], since, until)).length,
     stable,
     share: comparable === 0 ? null : stable / comparable,
   };
@@ -619,9 +670,13 @@ export function computeLedgerMeasures(
   });
   const gruYield = computeWakeYield(events, 'gru.wake', new Set(['notification.resolved']), since, until, () => 'wake');
 
-  // Digest stability comes from session turns; only parseable digests count.
+  // Digest stability comes from session turns; only parseable digests
+  // count. Signatures span the window boundary: the first in-window sweep
+  // compares against the last sweep before it.
   const stability = computeDigestStability(
     sweepSignatures.flatMap((pair) => (pair[1] === null ? [] : [[pair[0], pair[1]] as const])),
+    since,
+    until,
   );
 
   // Gru wake causes: join payload.notification_ids to notifications.kind.
@@ -636,10 +691,15 @@ export function computeLedgerMeasures(
   const wakeIds: string[][] = [];
   for (const wake of gruWakes) {
     const payload = wake.payload;
-    const ids =
-      payload !== null && typeof payload === 'object' && Array.isArray((payload as Record<string, unknown>)['notification_ids'])
-        ? ((payload as Record<string, unknown>)['notification_ids'] as unknown[]).filter((id): id is string => typeof id === 'string')
-        : [];
+    // Deduplicate within a wake: a repeated ID in one payload is one
+    // incident delivered once, not a repeat.
+    const ids = [
+      ...new Set(
+        payload !== null && typeof payload === 'object' && Array.isArray((payload as Record<string, unknown>)['notification_ids'])
+          ? ((payload as Record<string, unknown>)['notification_ids'] as unknown[]).filter((id): id is string => typeof id === 'string')
+          : [],
+      ),
+    ];
     wakeIds.push(ids);
     if (ids.length > 0) wakesWithNotificationIds += 1;
     let sawConflict = false;
@@ -725,6 +785,7 @@ export function computeLedgerMeasures(
       }))
       .sort((a, b) => b.jobs - a.jobs || a.status.localeCompare(b.status)),
     wipTotal,
+    costPerFinishedUsd: null, // filled by buildYieldReport from session totals
   };
 
   return { silasYield, gruYield, digestStability: stability, gruWakeCauses, m0 };
@@ -771,6 +832,7 @@ export interface BuildReportInput {
 export function buildYieldReport(input: BuildReportInput): YieldReport {
   const usage = aggregateUsage(input.turns);
   const measures = computeLedgerMeasures(input.ledger, input.sweepSignatures);
+  const costPerFinishedUsd = measures.m0.finishedJobs > 0 ? usage.total.costUsd / measures.m0.finishedJobs : null;
   return {
     since: input.since,
     until: input.until,
@@ -781,7 +843,7 @@ export function buildYieldReport(input: BuildReportInput): YieldReport {
     gruYield: measures.gruYield,
     digestStability: measures.digestStability,
     gruWakeCauses: measures.gruWakeCauses,
-    m0: measures.m0,
+    m0: { ...measures.m0, costPerFinishedUsd },
   };
 }
 
@@ -791,7 +853,9 @@ export function windowTurns<T extends { startedAt: string }>(turns: readonly T[]
 }
 
 /** Digest stability source: silas sweep turns with a parseable digest,
- * as [startedAt, signature] pairs. */
+ * as [startedAt, signature] pairs. Pass the WHOLE parse (not windowed)
+ * so the first in-window sweep compares against the last sweep before
+ * the window. */
 export function sweepSignaturesOf(turns: readonly ParsedTurn[]): (readonly [string, string])[] {
   return turns.flatMap((turn) =>
     turn.role === 'silas' && turn.label === 'sweep' && turn.digestSignature !== null
@@ -821,10 +885,10 @@ export function renderTextReport(report: YieldReport): string {
   push('');
 
   push('Usage by trigger');
-  push('  role       label                  class      turns      calls       cost    compactions');
+  push('  role       label                  class      turns      calls         in        out     cache        cost    compactions');
   for (const label of report.usage.byLabel) {
     push(
-      `  ${label.role.padEnd(10)} ${label.label.padEnd(21)} ${label.turnClass.padEnd(9)} ${fmtNum(label.turns).padStart(6)} ${fmtNum(label.llmCalls).padStart(10)} ${fmtUsd(label.costUsd).padStart(9)} ${fmtNum(label.compactions).padStart(13)}`,
+      `  ${label.role.padEnd(10)} ${label.label.padEnd(21)} ${label.turnClass.padEnd(9)} ${fmtNum(label.turns).padStart(6)} ${fmtNum(label.llmCalls).padStart(10)} ${fmtNum(label.tokens.input).padStart(10)} ${fmtNum(label.tokens.output).padStart(10)} ${fmtNum(label.tokens.cacheRead + label.tokens.cacheWrite).padStart(10)} ${fmtUsd(label.costUsd).padStart(9)} ${fmtNum(label.compactions).padStart(13)}`,
     );
   }
   push('');
@@ -832,11 +896,11 @@ export function renderTextReport(report: YieldReport): string {
   for (const turnClass of TURN_CLASSES) {
     const bucket = report.usage.byClass[turnClass];
     push(
-      `  ${turnClass.padEnd(9)} turns ${fmtNum(bucket.turns).padStart(6)}  calls ${fmtNum(bucket.llmCalls).padStart(7)}  cost ${fmtUsd(bucket.costUsd).padStart(9)}  (${((bucket.costUsd / (report.usage.total.costUsd || 1)) * 100).toFixed(1)}%)`,
+      `  ${turnClass.padEnd(9)} turns ${fmtNum(bucket.turns).padStart(6)}  calls ${fmtNum(bucket.llmCalls).padStart(7)}  tokens ${fmtNum(bucket.tokens.input + bucket.tokens.output + bucket.tokens.cacheRead + bucket.tokens.cacheWrite).padStart(11)}  cost ${fmtUsd(bucket.costUsd).padStart(9)}  (${((bucket.costUsd / (report.usage.total.costUsd || 1)) * 100).toFixed(1)}%)`,
     );
   }
   push(
-    `  ${'total'.padEnd(9)} turns ${fmtNum(report.usage.total.turns).padStart(6)}  calls ${fmtNum(report.usage.total.llmCalls).padStart(7)}  cost ${fmtUsd(report.usage.total.costUsd).padStart(9)}`,
+    `  ${'total'.padEnd(9)} turns ${fmtNum(report.usage.total.turns).padStart(6)}  calls ${fmtNum(report.usage.total.llmCalls).padStart(7)}  tokens ${fmtNum(report.usage.total.tokens.input + report.usage.total.tokens.output + report.usage.total.tokens.cacheRead + report.usage.total.tokens.cacheWrite).padStart(11)}  cost ${fmtUsd(report.usage.total.costUsd).padStart(9)}`,
   );
   push('');
   push('Usage by model');
@@ -873,8 +937,8 @@ export function renderTextReport(report: YieldReport): string {
   for (const wip of report.m0.wipByStatus) {
     push(`  ${wip.status}: ${fmtNum(wip.jobs)} (median age ${fmtHours(wip.medianAgeHours)})`);
   }
-  if (report.m0.finishedJobs > 0) {
-    push(`  cost per finished heist ${fmtUsd(report.usage.total.costUsd / report.m0.finishedJobs)}`);
+  if (report.m0.costPerFinishedUsd !== null) {
+    push(`  cost per finished heist ${fmtUsd(report.m0.costPerFinishedUsd)}`);
   }
   push('');
   if (report.parseSkips.unparsableLines > 0 || report.parseSkips.unattributedCompactions > 0) {

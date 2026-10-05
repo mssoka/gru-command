@@ -75,6 +75,11 @@ function requireValue(argv: readonly string[], index: number, flag: string): str
 }
 
 export function requireIso(value: string, flag: string): string {
+  // Date.parse alone accepts junk like "2026"; the flags contract is an
+  // ISO timestamp with time and zone.
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})$/u.test(value)) {
+    throw new Error(`${flag} must be an ISO timestamp with time and zone, got: ${value}`);
+  }
   const parsed = Date.parse(value);
   if (Number.isNaN(parsed)) throw new Error(`${flag} must be an ISO timestamp, got: ${value}`);
   return new Date(parsed).toISOString();
@@ -97,8 +102,12 @@ export function listSessionFiles(dataDir: string): SessionFile[] {
     let entries: string[];
     try {
       entries = readdirSync(roleDir, { recursive: true, encoding: 'utf8' });
-    } catch {
-      continue; // a role with no sessions yet is not an error
+    } catch (error) {
+      // A role with no sessions yet is not an error; any other failure
+      // (permissions, I/O) must fail loud — a silently missing role would
+      // understate the report without a trace.
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      throw error;
     }
     for (const entry of entries) {
       if (!entry.endsWith('.jsonl')) continue;
@@ -119,11 +128,11 @@ export async function collectTurns(files: readonly SessionFile[]): Promise<Colle
   const turns: ParsedTurn[] = [];
   let skips: ParseSkips = { unparsableLines: 0, unattributedCompactions: 0 };
   for (const file of files) {
-    const lines: string[] = [];
+    // Stream straight into the parser — no session file is ever held in
+    // memory whole (the issue's "stream with readline" constraint).
     const readable = createReadStream(file.path, { encoding: 'utf8' });
     const linesRef = createInterface({ input: readable, crlfDelay: Infinity });
-    for await (const line of linesRef) lines.push(line);
-    const parsed = parseSessionLines(file.role, lines);
+    const parsed = await parseSessionLines(file.role, linesRef);
     turns.push(...parsed.turns);
     skips = {
       unparsableLines: skips.unparsableLines + parsed.unparsableLines,
@@ -209,7 +218,9 @@ export async function runYieldReport(argv: readonly string[], now: () => Date = 
     generatedAt: now().toISOString(),
     parseSkips: collected.skips,
     turns: windowed,
-    sweepSignatures: sweepSignaturesOf(windowed),
+    // Signatures span the window boundary: the first in-window sweep
+    // compares against the last sweep before the window.
+    sweepSignatures: sweepSignaturesOf(collected.turns),
     ledger: { since, until, ...ledger },
   });
 

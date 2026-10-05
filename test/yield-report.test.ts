@@ -140,6 +140,14 @@ function digestJson(jobIdsByCategory: Partial<Record<(typeof DIGEST_CATEGORY_KEY
       prUrl: `https://example.test/${jobId}`,
       priorRounds: 0,
     })),
+    stalledWorking: (jobIdsByCategory.stalledWorking ?? []).map((jobId) => ({
+      jobId,
+      repo: 'r',
+      minionId: null,
+      minionState: null,
+      lastActivity: null,
+      idleMs: 0,
+    })),
     providerRecoveryPending: (jobIdsByCategory.providerRecoveryPending ?? []).map((waitId) => ({
       waitId,
       jobId: null,
@@ -167,6 +175,14 @@ describe('turn attribution follows the real prompt builders', () => {
     expect(classifyTurn('silas', silasWakePrompt('sweep', emptyDigest)).turnClass).toBe('machine');
     expect(classifyTurn('silas', silasWakePrompt('job.delivered', emptyDigest)).label).toBe('job.delivered');
     expect(classifyTurn('silas', silasWakePrompt('round.verdict', emptyDigest)).label).toBe('round.verdict');
+  });
+
+  it('refuses unbounded trigger kinds so prompt text can never become a report label', () => {
+    expect(parseSilasWakeTrigger(`${SILAS_WAKE_PREFIX}sweep\n`)).toBe('sweep');
+    expect(parseSilasWakeTrigger(`${SILAS_WAKE_PREFIX}job.delivered (job j-1)\n`)).toBe('job.delivered');
+    expect(parseSilasWakeTrigger(`${SILAS_WAKE_PREFIX}SECRET secret SECRET\nrest of the prompt\n`)).toBeNull();
+    expect(parseSilasWakeTrigger(`${SILAS_WAKE_PREFIX}${'x'.repeat(41)}\n`)).toBeNull();
+    expect(classifyTurn('silas', `${SILAS_WAKE_PREFIX}not a bounded kind\n`).label).toBe('other');
   });
 
   it('keeps the retyped wake prefix aligned with buildWakePrompt output', () => {
@@ -240,8 +256,8 @@ describe('turn attribution follows the real prompt builders', () => {
 // ------------------------------------------------------------------
 
 describe('parseSessionLines', () => {
-  it('folds one user message plus its assistant messages into one attributed turn', () => {
-    const parsed = parseSessionLines('gru', [
+  it('folds one user message plus its assistant messages into one attributed turn', async () => {
+    const parsed = await parseSessionLines('gru', [
       userLine('2026-10-01T00:00:00.000Z', gruWakeText),
       assistantLine({ input: 10, output: 5, cacheRead: 3, cost: 0.25 }),
       assistantLine({ input: 10, output: 5, cost: 0.25, provider: 'p2', model: 'm2' }),
@@ -260,15 +276,15 @@ describe('parseSessionLines', () => {
     });
     expect(parsed.turns[0]?.tokens).toEqual({ input: 20, output: 10, cacheRead: 3, cacheWrite: 0, reasoning: 0 });
     expect(parsed.turns[0]?.models).toEqual([
-      { provider: 'p', model: 'm' },
-      { provider: 'p2', model: 'm2' },
+      { provider: 'p', model: 'm', costUsd: 0.25 },
+      { provider: 'p2', model: 'm2', costUsd: 0.25 },
     ]);
     expect(parsed.turns[1]).toMatchObject({ label: 'owner-turn', turnClass: 'owner', llmCalls: 1, costUsd: 1 });
     expect(parsed.unparsableLines).toBe(0);
   });
 
-  it('attributes compactions to the open turn and counts pre-turn compactions separately', () => {
-    const parsed = parseSessionLines('silas', [
+  it('attributes compactions to the open turn and counts pre-turn compactions separately', async () => {
+    const parsed = await parseSessionLines('silas', [
       JSON.stringify({ type: 'compaction' }),
       userLine('2026-10-01T00:00:00.000Z', silasWakePrompt('sweep', emptyDigest)),
       JSON.stringify({ type: 'compaction' }),
@@ -279,8 +295,8 @@ describe('parseSessionLines', () => {
     expect(parsed.unattributedCompactions).toBe(1);
   });
 
-  it('counts unparsable lines instead of throwing and ignores assistant chatter before any turn', () => {
-    const parsed = parseSessionLines('bob', [
+  it('counts unparsable lines instead of throwing and ignores assistant chatter before any turn', async () => {
+    const parsed = await parseSessionLines('bob', [
       'not json at all',
       assistantLine({ cost: 9 }),
       userLine('2026-10-01T00:00:00.000Z', BOB_CONSOLIDATION_PROMPT),
@@ -291,17 +307,28 @@ describe('parseSessionLines', () => {
     expect(parsed.unparsableLines).toBe(1);
   });
 
-  it('carries the digest signature on silas turns and null elsewhere', () => {
+  it('carries the digest signature on silas turns and null elsewhere', async () => {
     const prompt = sweepPromptWithDigest({ deliveredWithoutPr: ['job-b', 'job-a'] });
-    const parsed = parseSessionLines('silas', [userLine('2026-10-01T00:00:00.000Z', prompt), assistantLine({})]);
+    const parsed = await parseSessionLines('silas', [userLine('2026-10-01T00:00:00.000Z', prompt), assistantLine({})]);
     expect(parsed.turns[0]?.digestSignature).not.toBeNull();
-    const gru = parseSessionLines('gru', [userLine('2026-10-01T00:00:00.000Z', gruWakeText), assistantLine({})]);
+    const gru = await parseSessionLines('gru', [userLine('2026-10-01T00:00:00.000Z', gruWakeText), assistantLine({})]);
     expect(gru.turns[0]?.digestSignature).toBeNull();
   });
 
-  it('a user message without a timestamp is skipped and counted, not attributed', () => {
+  it('treats a digest with no actionable categories or a corrupt value as malformed', () => {
+    const headerOnly = `## Digest (actionable states, JSON)\n\n\`\`\`json\n${JSON.stringify({ computedAt: 'x', trigger: 'sweep' })}\n\`\`\``;
+    expect(digestSignatureFromPrompt(headerOnly)).toBeNull();
+    const corrupt = `## Digest (actionable states, JSON)\n\n\`\`\`json\n${JSON.stringify({ computedAt: 'x', trigger: 'sweep', deliveredWithoutPr: 'oops' })}\n\`\`\``;
+    expect(digestSignatureFromPrompt(corrupt)).toBeNull();
+    // Older digest formats predate newer categories: a digest with SOME
+    // categories present is a real digest, and missing keys count as empty.
+    const older = `## Digest (actionable states, JSON)\n\n\`\`\`json\n${JSON.stringify({ computedAt: 'x', trigger: 'sweep', deliveredWithoutPr: [] })}\n\`\`\``;
+    expect(digestSignatureFromPrompt(older)).not.toBeNull();
+  });
+
+  it('a user message without a timestamp is skipped and counted, not attributed', async () => {
     const line = JSON.stringify({ type: 'message', timestamp: 123, message: { role: 'user', content: [{ type: 'text', text: 'x' }] } });
-    const parsed = parseSessionLines('gru', [line]);
+    const parsed = await parseSessionLines('gru', [line]);
     expect(parsed.turns).toHaveLength(0);
     expect(parsed.unparsableLines).toBe(1);
   });
@@ -324,6 +351,14 @@ describe('digestSignatureFromPrompt', () => {
     expect(parsedA['minionErrors']).toEqual([]);
   });
 
+  it('a stalled-working row changes the signature — every actionable category participates', () => {
+    const without = digestSignatureFromPrompt(sweepPromptWithDigest({ deliveredWithoutPr: ['job-a'] }));
+    const withStalled = digestSignatureFromPrompt(sweepPromptWithDigest({ deliveredWithoutPr: ['job-a'], stalledWorking: ['job-s'] }));
+    expect(withStalled).not.toBeNull();
+    expect(withStalled).not.toBe(without);
+    expect((JSON.parse(withStalled ?? '') as Record<string, string[]>)['stalledWorking']).toEqual(['job-s']);
+  });
+
   it('falls back to wait IDs for provider-recovery rows and changes when rows change', () => {
     const withWait = digestSignatureFromPrompt(sweepPromptWithDigest({ providerRecoveryPending: ['wait-1'] }));
     const withOtherWait = digestSignatureFromPrompt(sweepPromptWithDigest({ providerRecoveryPending: ['wait-2'] }));
@@ -343,11 +378,11 @@ describe('digestSignatureFromPrompt', () => {
 // ------------------------------------------------------------------
 
 describe('aggregateUsage', () => {
-  it('buckets by label, class and model with totals', () => {
+  it('buckets by label, class and model with totals including per-model cost', () => {
     const turns: ParsedTurn[] = [
-      makeTurn({ role: 'gru', label: 'service-wake', turnClass: 'machine', llmCalls: 2, costUsd: 2, models: [{ provider: 'p', model: 'm' }, { provider: 'p', model: 'm' }] }),
-      makeTurn({ role: 'gru', label: 'owner-turn', turnClass: 'owner', llmCalls: 1, costUsd: 3, models: [{ provider: 'p', model: 'm' }] }),
-      makeTurn({ role: 'silas', label: 'sweep', turnClass: 'machine', llmCalls: 1, costUsd: 1, models: [{ provider: 'q', model: 'z' }] }),
+      makeTurn({ role: 'gru', label: 'service-wake', turnClass: 'machine', llmCalls: 2, costUsd: 2, models: [{ provider: 'p', model: 'm', costUsd: 0.5 }, { provider: 'p', model: 'm', costUsd: 1.5 }] }),
+      makeTurn({ role: 'gru', label: 'owner-turn', turnClass: 'owner', llmCalls: 1, costUsd: 3, models: [{ provider: 'p', model: 'm', costUsd: 3 }] }),
+      makeTurn({ role: 'silas', label: 'sweep', turnClass: 'machine', llmCalls: 1, costUsd: 1, models: [{ provider: 'q', model: 'z', costUsd: 1 }] }),
     ];
     const usage = aggregateUsage(turns);
     expect(usage.total.costUsd).toBe(6);
@@ -358,8 +393,8 @@ describe('aggregateUsage', () => {
     const sweep = usage.byLabel.find((label) => label.label === 'sweep');
     expect(sweep).toMatchObject({ role: 'silas', turns: 1, llmCalls: 1, costUsd: 1 });
     expect(usage.byModel).toEqual([
-      { provider: 'p', model: 'm', llmCalls: 3, costUsd: 0 },
-      { provider: 'q', model: 'z', llmCalls: 1, costUsd: 0 },
+      { provider: 'p', model: 'm', llmCalls: 3, costUsd: 5 },
+      { provider: 'q', model: 'z', llmCalls: 1, costUsd: 1 },
     ]);
   });
 });
@@ -370,7 +405,7 @@ function makeTurn(overrides: {
   turnClass: ParsedTurn['turnClass'];
   llmCalls?: number;
   costUsd?: number;
-  models?: readonly { provider: string; model: string }[];
+  models?: readonly { provider: string; model: string; costUsd: number }[];
   startedAt?: string;
 }): ParsedTurn {
   return {
@@ -391,8 +426,8 @@ function makeTurn(overrides: {
 // Ledger measures
 // ------------------------------------------------------------------
 
-function event(kind: string, ts: string, extra: { jobId?: string | null; payload?: unknown } = {}): LedgerEventRecord {
-  return { seq: 0, ts, kind, jobId: extra.jobId ?? null, payload: extra.payload ?? {} };
+function event(kind: string, ts: string, extra: { jobId?: string | null; payload?: unknown; seq?: number } = {}): LedgerEventRecord {
+  return { seq: extra.seq ?? 0, ts, kind, jobId: extra.jobId ?? null, payload: extra.payload ?? {} };
 }
 
 function measureInput(events: LedgerEventRecord[]) {
@@ -436,20 +471,38 @@ describe('computeLedgerMeasures', () => {
     ]);
   });
 
-  it('an action at the exact next-wake timestamp belongs to the earlier window, once', () => {
+  it('orders same-timestamp events by sequence: each action lands in exactly one window', () => {
+    // wake1 seq 1 and wake2 seq 3 share a timestamp; the action in between
+    // (seq 2) belongs to wake1, the action after (seq 4) to wake2.
+    const shared = '2026-10-01T02:00:00.000Z';
     const measures = computeLedgerMeasures(
       measureInput([
-        event('silas.wake', '2026-10-01T01:00:00.000Z', { payload: { trigger: 'sweep' } }),
-        event('silas.wake', '2026-10-01T02:00:00.000Z', { payload: { trigger: 'sweep' } }),
-        event('job.pr', '2026-10-01T02:00:00.000Z'),
+        event('silas.wake', '2026-10-01T01:00:00.000Z', { payload: { trigger: 'sweep' }, seq: 1 }),
+        event('silas.wake', shared, { payload: { trigger: 'sweep' }, seq: 3 }),
+        event('silas.directive-sent', shared, { seq: 2 }),
+        event('silas.escalated', shared, { seq: 4 }),
       ]),
       [],
     );
-    expect(measures.silasYield.actionsByKind).toEqual({ 'job.pr': 1 });
-    expect(measures.silasYield.wakesWithAction).toBe(1);
+    expect(measures.silasYield.actionsByKind).toEqual({ 'silas.directive-sent': 1, 'silas.escalated': 1 });
+    expect(measures.silasYield.wakes).toBe(2);
+    expect(measures.silasYield.wakesWithAction).toBe(2);
   });
 
-  it('windows gru yield on notification.resolved and leaves out-of-window wakes alone', () => {
+  it('an action at the exclusive window end belongs to no wake', () => {
+    const measures = computeLedgerMeasures(
+      measureInput([
+        event('silas.wake', '2026-10-01T01:00:00.000Z', { payload: { trigger: 'sweep' } }),
+        event('silas.directive-sent', UNTIL),
+      ]),
+      [],
+    );
+    expect(measures.silasYield.actionsByKind).toEqual({});
+    expect(measures.silasYield.wakesWithAction).toBe(0);
+    expect(measures.silasYield.noActionShare).toBe(1);
+  });
+
+  it('windows gru yield actions to the gap before the next wake', () => {
     const measures = computeLedgerMeasures(
       measureInput([
         event('gru.wake', '2026-09-30T23:00:00.000Z', { payload: { notification_ids: ['error-1'] } }),
@@ -464,16 +517,41 @@ describe('computeLedgerMeasures', () => {
     expect(measures.gruYield.noActionShare).toBeCloseTo(0.5);
   });
 
-  it('computes digest stability over chronological sweeps with predecessors only', () => {
+  it('computes digest stability over chronological sweeps with predecessors only, across the window edge', () => {
     const sigA = digestSignatureFromPrompt(sweepPromptWithDigest({ deliveredWithoutPr: ['job-a'] }));
     const sigB = digestSignatureFromPrompt(sweepPromptWithDigest({ deliveredWithoutPr: ['job-b'] }));
-    const stability = computeDigestStability([
-      ['2026-10-01T03:00:00.000Z', sigB ?? ''],
-      ['2026-10-01T01:00:00.000Z', sigA ?? ''],
-      ['2026-10-01T02:00:00.000Z', sigA ?? ''],
-    ]);
+    const stability = computeDigestStability(
+      [
+        ['2026-10-01T03:00:00.000Z', sigB ?? ''],
+        ['2026-10-01T01:00:00.000Z', sigA ?? ''],
+        ['2026-10-01T02:00:00.000Z', sigA ?? ''],
+      ],
+      SINCE,
+      UNTIL,
+    );
     expect(stability).toEqual({ sweeps: 3, stable: 1, share: 0.5 });
-    expect(computeDigestStability([['2026-10-01T01:00:00.000Z', sigA ?? '']])).toEqual({
+    // The first in-window sweep compares against the last sweep BEFORE the
+    // window: it counts, and its signature matches, so share is 1.
+    const edge = computeDigestStability(
+      [
+        ['2026-09-30T23:00:00.000Z', sigA ?? ''],
+        ['2026-10-01T01:00:00.000Z', sigA ?? ''],
+      ],
+      SINCE,
+      UNTIL,
+    );
+    expect(edge).toEqual({ sweeps: 1, stable: 1, share: 1 });
+    // Different pre-window digest: the in-window sweep is comparable and unstable.
+    const edgeDifferent = computeDigestStability(
+      [
+        ['2026-09-30T23:00:00.000Z', sigB ?? ''],
+        ['2026-10-01T01:00:00.000Z', sigA ?? ''],
+      ],
+      SINCE,
+      UNTIL,
+    );
+    expect(edgeDifferent).toEqual({ sweeps: 1, stable: 0, share: 0 });
+    expect(computeDigestStability([['2026-10-01T01:00:00.000Z', sigA ?? '']], SINCE, UNTIL)).toEqual({
       sweeps: 1,
       stable: 0,
       share: null,
@@ -500,6 +578,21 @@ describe('computeLedgerMeasures', () => {
     ]);
   });
 
+  it('a duplicate id inside one wake is one incident, and a kind counts once per wake', () => {
+    const measures = computeLedgerMeasures(
+      measureInput([
+        event('gru.wake', '2026-10-01T01:00:00.000Z', { payload: { notification_ids: ['conflict-1', 'conflict-1', 'conflict-2', 'conflict-2'] } }),
+      ]),
+      [],
+    );
+    expect(measures.gruWakeCauses.repeatIncidentIds).toBe(0);
+    expect(measures.gruWakeCauses.wakesWithRepeatIncident).toBe(0);
+    expect(measures.gruWakeCauses.perKind).toEqual([
+      { kind: 'github.pr-conflict:job-x', wakes: 1 },
+      { kind: 'github.pr-conflict:job-y', wakes: 1 },
+    ]);
+  });
+
   it('counts finished heists in the window, lead times, and replays WIP to until', () => {
     const measures = computeLedgerMeasures(
       measureInput([
@@ -515,6 +608,7 @@ describe('computeLedgerMeasures', () => {
     expect(measures.m0.finishedJobs).toBe(2);
     // finished-1: 09-30T00:00 → 10-01T09:00 = 33h; finished-2: 10-01T06:00 → 18:00 = 12h.
     expect(measures.m0.leadTimeHours).toEqual({ median: 22.5, max: 33 });
+    expect(measures.m0.costPerFinishedUsd).toBeNull(); // filled by buildYieldReport
     expect(measures.m0.wipTotal).toBe(2);
     // wip-1: 09-15T00:00 → window end = 408h; wip-2: 10-01T12:00 → 12h.
     // Equal counts tie-break alphabetically: dispatched before working.
@@ -579,9 +673,9 @@ describe('buildYieldReport and renderTextReport', () => {
     expect(text).toContain('unparsable lines');
   });
 
-  it('never prints prompt or transcript text — counts and bounded identifiers only', () => {
+  it('never prints prompt or transcript text — counts and bounded identifiers only', async () => {
     const secretMarker = 'SECRET-PAIRING-TOKEN-DO-NOT-PRINT';
-    const parsed = parseSessionLines('gru', [userLine(SINCE, `${gruWakeText}\n${secretMarker}`), assistantLine({})]);
+    const parsed = await parseSessionLines('gru', [userLine(SINCE, `${gruWakeText}\n${secretMarker}`), assistantLine({})]);
     const report = buildYieldReport({
       since: SINCE,
       until: UNTIL,
@@ -623,6 +717,9 @@ describe('yield-report CLI', () => {
     expect(() => parseArgs(['--bogus'])).toThrow(/unknown argument/);
     expect(() => parseArgs(['--since'])).toThrow(/requires a value/);
     expect(() => requireIso('not-a-date', '--since')).toThrow(/ISO timestamp/);
+    expect(() => requireIso('2026', '--since')).toThrow(/ISO timestamp/);
+    expect(() => requireIso('2026-09-29', '--since')).toThrow(/ISO timestamp/);
+    expect(requireIso('2026-09-29T02:00:00+02:00', '--since')).toBe('2026-09-29T00:00:00.000Z');
     expect(requireIso('2026-09-29T00:00:00Z', '--since')).toBe('2026-09-29T00:00:00.000Z');
   });
 
@@ -647,9 +744,28 @@ describe('yield-report CLI', () => {
         assistantLine({ cost: 0.5 }),
       ].join('\n') + '\n',
     );
+    // A delivery-role session: discovery must include it in delivery cost.
+    const minionDir = join(dataDir, 'sessions', 'minion');
+    mkdirSync(minionDir, { recursive: true });
+    const briefing = renderMinionBriefing({
+      jobId: 'j-9',
+      repoName: 'repo',
+      branch: 'gru/j-9',
+      worktreePath: '/fixture/wt9',
+      sha: 'feedface',
+      briefing: 'carry the crate',
+    });
+    writeFileSync(
+      join(minionDir, 'm1.jsonl'),
+      `${userLine('2026-10-01T04:00:00.000Z', briefing)}\n${assistantLine({ cost: 3 })}\n`,
+    );
 
     const files = listSessionFiles(dataDir);
-    expect(files.map((file) => `${file.role}:${file.path.split('/').pop()}`)).toEqual(['gru:s1.jsonl', 'silas:s2.jsonl']);
+    expect(files.map((file) => `${file.role}:${file.path.split('/').pop()}`)).toEqual([
+      'gru:s1.jsonl',
+      'minion:m1.jsonl',
+      'silas:s2.jsonl',
+    ]);
 
     // Real ledger schema via LedgerDb, then deterministic-history inserts.
     const db = new LedgerDb(dataDir);
@@ -690,7 +806,10 @@ describe('yield-report CLI', () => {
         process.stdout.write = originalWrite;
       }
       const report = JSON.parse(writes.join('')) as Parameters<typeof renderTextReport>[0];
-      expect(report.usage.total.costUsd).toBeCloseTo(2.5); // backup duplicate (999) never counted
+      expect(report.usage.total.costUsd).toBeCloseTo(5.5); // gru 1.5 + silas 1.0 + minion 3.0; backup dup (999) never counted
+      expect(report.usage.byClass.delivery.costUsd).toBeCloseTo(3); // the minion briefing is delivery work
+      expect(report.usage.byModel.some((model) => model.costUsd > 0)).toBe(true);
+      expect(report.m0.costPerFinishedUsd).toBeCloseTo(5.5);
       expect(report.silasYield.wakes).toBe(1);
       expect(report.silasYield.wakesWithAction).toBe(1);
       expect(report.gruYield.wakes).toBe(1);
@@ -702,11 +821,11 @@ describe('yield-report CLI', () => {
       // Text rendering of the same report stays paste-safe.
       const text = renderTextReport(report);
       expect(text).not.toContain('Silas ops wake');
-      expect(
-        sweepSignaturesOf(
-          parseSessionLines('silas', [userLine('2026-10-01T01:00:00.000Z', sweepPrompt), assistantLine({})]).turns,
-        ),
-      ).toHaveLength(1);
+      const silasParsed = await parseSessionLines('silas', [
+        userLine('2026-10-01T01:00:00.000Z', sweepPrompt),
+        assistantLine({}),
+      ]);
+      expect(sweepSignaturesOf(silasParsed.turns)).toHaveLength(1);
     } finally {
       db.close();
     }
