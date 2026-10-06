@@ -105,6 +105,14 @@ describe('board KPIs — counts over the live snapshot', () => {
     expect(derivedPrState(job('wire', { prUrl: 'https://x/2', prState: 'conflicting' }))).toBe('conflicting');
   });
 
+  it('a terminal done job with a registered PR is a closed receipt — never an open claim', () => {
+    const closed = job('done-url', { status: 'done', prUrl: 'https://x/5' });
+    expect(derivedPrState(closed)).toBeNull();
+    expect(prCounts([closed], NOW)).toEqual({ open: 0, conflicting: 0, mergedToday: 0 });
+    // The failure mode this pins: a live lane's registered PR still counts.
+    expect(derivedPrState(job('live-url', { status: 'in-review', prUrl: 'https://x/6' }))).toBe('open');
+  });
+
   it('counts lanes: live minions, mid-turn with the oldest quiet stamp, disposed', () => {
     const lanes = laneCounts(fixture().agents);
     expect(lanes.liveMinions).toBe(2); // the disposed minion is not live

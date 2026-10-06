@@ -561,3 +561,12 @@ working-flavor-browser = "cd web && node ../node_modules/typescript/bin/tsc --no
 # _bmad-output/gate-prep/working-flavor-catalog-baseline.last-snapshot.txt
 # records the latest snapshot location.
 working-flavor-catalog-baseline = 'set -e; base=9bb51b05af5d8f0a0cd389788d1d3f19607d5361; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-working-flavor-catalog.XXXXXX"); git archive "$base" | tar -x -C "$d"; git show "$headrev":web/src/lib/working-flavor.test.ts > "$d/web/src/lib/working-flavor.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; ln -s "$root/web/node_modules" "$d/web/node_modules"; printf "%s base=%s head=%s\n" "$d" "$base" "$headrev" > "$prep/working-flavor-catalog-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; cd web; set +e; npx vitest run src/lib/working-flavor.test.ts; code=$?; set -e; echo "working-flavor-catalog-baseline vitest exit=$code (EXPECTED-NONZERO: new catalog assertions vs pre-change base)"; if [ "$code" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: baseline passed unexpectedly"; fi; exit 1'
+
+# Parked PR administrative-closeout lane (owner stop exception j-1115/j-1116):
+# the touched ledger machine, the authenticated closeout endpoint, the
+# terminal PR projection and the recomputed suite pins — invoked only via
+# the authenticated /api/verify scheduler at unchanged budgets/thresholds,
+# approved RPC patch first, exits never masked. The static scope carries the
+# lint/typecheck product checks for the same change.
+parked-closeout = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/ledger-api.test.ts test/ledger-obligations.test.ts test/board-server.test.ts test/board-engine-v4.test.ts test/suite-shape.test.ts && cd web && ../node_modules/.bin/vitest run src/lib/board-kpi.test.ts"
+parked-closeout-static = "node tools/patch-vitest-rpc-timeout.mjs && npm run lint && npm run typecheck"

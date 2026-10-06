@@ -163,6 +163,19 @@ describe('board engine — v4 snapshot blocks', () => {
     api.setJobStatus(job.id, 'merged');
     expect(engine.snapshot().repos.flatMap((r) => r.jobs).find((j) => j.id === job.id)?.prState).toBe('merged');
   });
+  it('a done job never presents its registered PR as open (closed-without-merge receipt)', () => {
+    const { api, engine } = fresh();
+    const job = api.addJob({ id: 'closed-pr-job', repo: 'demo-repo', title: 'Closed PR' });
+    api.setJobStatus(job.id, 'working');
+    api.setJobPr(job.id, 'https://example.invalid/pr/9');
+    api.setJobStatus(job.id, 'in-review');
+    expect(engine.snapshot().repos.flatMap((r) => r.jobs).find((j) => j.id === job.id)?.prState).toBe('open');
+    // A terminal lane is a closed receipt: its registered PR is never
+    // presented as open, and closure never infers a merge.
+    api.setJobStatus(job.id, 'done');
+    expect(engine.snapshot().repos.flatMap((r) => r.jobs).find((j) => j.id === job.id)?.prState).toBeNull();
+  });
+
   it('attributes only Silas-issued actions and projects the durable next action (#163 review)', () => {
     const { api, engine } = fresh({ now: () => Date.now() });
     const job = api.addJob({ id: 'job-next', repo: 'demo', title: 't', briefing: 'b' });

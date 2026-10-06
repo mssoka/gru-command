@@ -10,6 +10,7 @@ import {
   StaleContinuationError,
 } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
+import { branchStatePayload } from '../src/dispatch/github-poll.js';
 import {
   obligationRouting,
   selectDueObligations,
@@ -555,6 +556,52 @@ describe('obligations — park/terminal act only on APPLICABLE rows; history sur
       jobStatus: 'done',
     });
     expect(finalRows.find((row) => row.state === 'settled')?.settlement?.kind).toBe('executed-action');
+  });
+
+  it('administrative closeout closes suspended obligations as job-terminal and preserves settled history', () => {
+    api = new LedgerApi(new LedgerDb(tmpDir()).handle, { bus: new EventBus() });
+    api.addJob({ id: 'job-closeout', repo: 'r', title: 'Job closeout' });
+    api.setJobStatus('job-closeout', 'working');
+    api.setJobStatus('job-closeout', 'blocked', ownerHoldContext(api.latestEventSeq()));
+    const settledRow = api.recordBlockedObservation('job-closeout', {
+      logicalStep: 'review',
+      category: { kind: 'known', category: 'review-verdict' },
+      incidentKey: 'r1',
+      observedAtSeq: api.latestEventSeq(),
+    });
+    const evidence = api.appendCustomEvent({ kind: 'silas.directive-sent', jobId: 'job-closeout', payload: { request_id: 'x', minion_id: 'm1' } });
+    api.settleObligation({
+      obligationId: settledRow.id,
+      settlement: { kind: 'executed-action', action: 'request-review', evidenceEventSeq: evidence.seq, evidenceEventKind: 'silas.directive-sent' },
+    });
+    const prUrl = 'https://github.com/mssoka/gru-command/pull/165';
+    const sha = '3c44e87e2e9e64cbc3301d7806540df6273438e6';
+    api.setJobPr('job-closeout', prUrl);
+    api.setJobStatus('job-closeout', 'parked');
+    expect(api.getObligation('job-closeout:operation:quota-exhausted')?.state).toBe('suspended');
+    api.appendCustomEvent({
+      kind: 'github.branch-state',
+      jobId: 'job-closeout',
+      payload: branchStatePayload(
+        { jobId: 'job-closeout', repo: { host: 'github.com', owner: 'mssoka', repo: 'gru-command' }, branch: 'gru/job-closeout', prNumber: 165, prUrl },
+        { sha, merged: false, prOpen: false, mergeableState: 'dirty', ci: null, prNumber: 165, prUrl, mergeCommitSha: null },
+      ),
+    });
+    api.adminCloseParkedJob({
+      jobId: 'job-closeout',
+      expectedStatus: 'parked',
+      expectedPrUrl: prUrl,
+      provider: { provider: 'github', state: 'closed', merged: false, headSha: sha, closedAt: '2026-10-05T05:06:52Z' },
+      reason: 'owner-authorized administrative closeout (j-1115)',
+    });
+
+    const rows = api.listObligations({ jobId: 'job-closeout' });
+    // Abandonment, never a success claim: suspended debt closes job-terminal...
+    expect(rows.find((row) => row.incidentKey === 'quota-exhausted')?.state).toBe('closed');
+    expect(rows.find((row) => row.incidentKey === 'quota-exhausted')?.settlement).toEqual({ kind: 'job-terminal', jobStatus: 'done' });
+    // ...and settled history is untouched.
+    expect(rows.find((row) => row.incidentKey === 'r1')?.state).toBe('settled');
+    expect(rows.find((row) => row.incidentKey === 'r1')?.settlement?.kind).toBe('executed-action');
   });
 });
 
