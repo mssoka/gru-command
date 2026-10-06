@@ -846,3 +846,196 @@ describe('ledger api — identity-corrected follow-through reads (issue #163)', 
     expect(focusedRow?.[1]).toBe(latestFocused.seq);
   });
 });
+
+describe('decision memory (issue #218)', () => {
+  let api: LedgerApi;
+  const closeFns: (() => void)[] = [];
+  afterAll(() => {
+    for (const close of closeFns) close();
+  });
+
+  function fresh(): LedgerApi {
+    const d = new LedgerDb(tmpDir());
+    closeFns.push(() => d.close());
+    api = new LedgerApi(d.handle, { bus: new EventBus() });
+    return api;
+  }
+
+  const base = {
+    subject: 'pr:mssoka/gru-command#148',
+    decision: 'hold' as const,
+    covers: ['pr-conflict'],
+    reason: 'existing ownership/integration hold',
+    by: 'gru' as const,
+  };
+
+  it('coverage matrix: unchanged basis → covered; changed basis → not covered', () => {
+    const a = fresh();
+    a.recordDecision({ ...base, basisFingerprint: 'aaaa', clientKey: 'k-basis' });
+    expect(a.coveringDecision({ subject: base.subject, signal: 'pr-conflict', basis: 'aaaa' })).not.toBeNull();
+    // The basis moved (a new head) — the hold no longer covers; the subject re-opens.
+    expect(a.coveringDecision({ subject: base.subject, signal: 'pr-conflict', basis: 'bbbb' })).toBeNull();
+  });
+
+  it('coverage matrix: a passed recheck_at → not covered; a future one → covered', () => {
+    const a = fresh();
+    a.recordDecision({
+      ...base,
+      recheckAt: '2030-01-01T00:00:00.000Z',
+      clientKey: 'k-recheck',
+    });
+    expect(a.coveringDecision({ subject: base.subject, signal: 'pr-conflict', basis: 'x', now: '2029-06-01T00:00:00.000Z' })).not.toBeNull();
+    expect(a.coveringDecision({ subject: base.subject, signal: 'pr-conflict', basis: 'x', now: '2030-06-01T00:00:00.000Z' })).toBeNull();
+    // Omitted `now` means the real clock: a far-future recheck still covers.
+    expect(a.coveringDecision({ subject: base.subject, signal: 'pr-conflict', basis: 'x' })).not.toBeNull();
+  });
+
+  it('coverage matrix: cleared → not covered; unknown subject → not covered', () => {
+    const a = fresh();
+    const row = a.recordDecision({ ...base, clientKey: 'k-clear' });
+    expect(a.coveringDecision({ subject: base.subject, signal: 'pr-conflict', basis: 'x' })).not.toBeNull();
+    a.clearDecision({ id: row.id, by: 'owner', reason: 'hold lifted' });
+    expect(a.coveringDecision({ subject: base.subject, signal: 'pr-conflict', basis: 'x' })).toBeNull();
+    expect(a.coveringDecision({ subject: 'pr:elsewhere/repo#1', signal: 'pr-conflict', basis: 'x' })).toBeNull();
+  });
+
+  it('coverage matrix: a signal outside covers → not covered; null basis covers ANY basis', () => {
+    const a = fresh();
+    a.recordDecision({ ...base, covers: ['ci-failed'], clientKey: 'k-signal' });
+    expect(a.coveringDecision({ subject: base.subject, signal: 'pr-conflict', basis: 'x' })).toBeNull();
+    expect(a.coveringDecision({ subject: base.subject, signal: 'ci-failed', basis: 'anything' })).not.toBeNull();
+    a.recordDecision({ ...base, covers: ['ci-failed'], basisFingerprint: null, clientKey: 'k-any-basis', subject: 'job:j-1' });
+    expect(a.coveringDecision({ subject: 'job:j-1', signal: 'ci-failed', basis: 'whatever-head' })).not.toBeNull();
+  });
+
+  it('only the newest decision covering the signal is the candidate — an older broader hold never shadows a re-open', () => {
+    const a = fresh();
+    a.recordDecision({ ...base, basisFingerprint: null, clientKey: 'k-old-broad' });
+    const newer = a.recordDecision({ ...base, covers: ['pr-conflict', 'ci-failed'], basisFingerprint: 'aaaa', clientKey: 'k-newer' });
+    // Newer decision covers on its own basis.
+    expect(a.coveringDecision({ subject: base.subject, signal: 'pr-conflict', basis: 'aaaa' })).toMatchObject({ id: newer.id });
+    // Basis moved: the NEWER decision fails — and the older, basisless hold
+    // must NOT keep the subject covered (the promised re-open is real).
+    expect(a.coveringDecision({ subject: base.subject, signal: 'pr-conflict', basis: 'bbbb' })).toBeNull();
+    expect(a.coveringDecision({ subject: base.subject, signal: 'ci-failed', basis: 'bbbb' })).toBeNull();
+    // A passed recheck on the newest coverer re-opens the same way.
+    a.clearDecision({ id: newer.id, by: 'gru', reason: 'replace with recheck shape' });
+    const withRecheck = a.recordDecision({ ...base, basisFingerprint: null, clientKey: 'k-recheck-shape', recheckAt: '2030-01-01T00:00:00.000Z' });
+    expect(a.coveringDecision({ subject: base.subject, signal: 'pr-conflict', basis: 'x', now: '2031-01-01T00:00:00.000Z' })).toBeNull();
+    expect(a.coveringDecision({ subject: base.subject, signal: 'pr-conflict', basis: 'x', now: '2029-01-01T00:00:00.000Z' })).toMatchObject({ id: withRecheck.id });
+  });
+
+  it('coveringDecision pages to exhaustion — a hold beyond any single listing window is still found', () => {
+    const a = fresh();
+    // The OLDEST decision is the only coverer for pr-conflict; 510 newer
+    // active decisions on the same subject cover a different signal, so
+    // the coverer sits past the first (500-row) page.
+    const oldest = a.recordDecision({ ...base, clientKey: 'k-deep' });
+    for (let i = 0; i < 510; i += 1) {
+      a.recordDecision({ ...base, covers: ['ci-failed'] });
+    }
+    const found = a.coveringDecision({ subject: base.subject, signal: 'pr-conflict', basis: 'x' });
+    expect(found).toMatchObject({ id: oldest.id });
+    // …and a subject with only non-covering decisions stays uncovered.
+    expect(a.coveringDecision({ subject: 'job:j-none', signal: 'pr-conflict', basis: 'x' })).toBeNull();
+  }, 20_000);
+
+  it('vocabulary: subject kinds are exactly job/pr/incident; signals are canonical lowercase tokens', () => {
+    const a = fresh();
+    expect(a.recordDecision({ ...base, subject: 'job:j-9', clientKey: 'k-job' }).subject).toBe('job:j-9');
+    expect(a.recordDecision({ ...base, subject: 'incident:pr-conflict:abc', clientKey: 'k-inc' }).subject).toBe('incident:pr-conflict:abc');
+    expect(() => a.recordDecision({ ...base, subject: 'bogus:key', clientKey: 'k-bogus' })).toThrow(/unknown decision subject kind "bogus"/);
+    expect(() => a.recordDecision({ ...base, subject: 'PR:x', clientKey: 'k-upper' })).toThrow(/unknown decision subject kind "PR"/);
+    expect(() => a.recordDecision({ ...base, covers: ['Pr Conflict'] })).toThrow(/lowercase token/);
+    expect(() => a.recordDecision({ ...base, covers: ['PR-CONFLICT'] })).toThrow(/lowercase token/);
+    expect(a.recordDecision({ ...base, covers: ['ci.failed_v2'], clientKey: 'k-token' }).covers).toEqual(['ci.failed_v2']);
+  });
+
+  it('recheck_at must be an ISO 8601 UTC timestamp, not merely Date.parse-able', () => {
+    const a = fresh();
+    expect(() => a.recordDecision({ ...base, recheckAt: 'March 5 2030' })).toThrow(/ISO 8601 UTC timestamp/);
+    expect(() => a.recordDecision({ ...base, recheckAt: '2030-01-01T00:00:00+02:00' })).toThrow(/ISO 8601 UTC timestamp/);
+    expect(() => a.recordDecision({ ...base, recheckAt: '2030-13-45T00:00:00.000Z' })).toThrow(/parseable ISO timestamp/);
+    const ok = a.recordDecision({ ...base, recheckAt: '2030-01-01T00:00:00Z' });
+    expect(ok.recheckAt).toBe('2030-01-01T00:00:00.000Z');
+  });
+
+  it('countDecisions reports the untruncated active total', () => {
+    const a = fresh();
+    const one = a.recordDecision({ ...base, clientKey: 'k-c1' });
+    a.recordDecision({ ...base, clientKey: 'k-c2' });
+    expect(a.countDecisions({ activeOnly: true })).toBe(2);
+    expect(a.countDecisions()).toBe(2);
+    a.clearDecision({ id: one.id, by: 'gru', reason: 'r' });
+    expect(a.countDecisions({ activeOnly: true })).toBe(1);
+    expect(a.countDecisions()).toBe(2);
+  });
+
+  it('create is idempotent on client_key retry: same row, one event; changed content conflicts', () => {
+    const a = fresh();
+    const first = a.recordDecision({ ...base, basisFingerprint: 'aaaa', clientKey: 'k-idem', recheckAt: '2030-01-01T00:00:00.000Z' });
+    const replay = a.recordDecision({ ...base, basisFingerprint: 'aaaa', clientKey: 'k-idem', recheckAt: '2030-01-01T00:00:00.000Z' });
+    expect(replay.id).toBe(first.id);
+    // covers ordering differences canonicalize to the same decision.
+    const replayReordered = a.recordDecision({
+      ...base, covers: ['ci-failed', 'pr-conflict'], basisFingerprint: 'aaaa', clientKey: 'k-idem-covers',
+    });
+    const replayReordered2 = a.recordDecision({
+      ...base, covers: ['pr-conflict', 'ci-failed'], basisFingerprint: 'aaaa', clientKey: 'k-idem-covers',
+    });
+    expect(replayReordered2.id).toBe(replayReordered.id);
+    // k-idem (1 row) + k-idem-covers (1 row): replays never add rows.
+    expect(a.listDecisions({ subject: base.subject })).toHaveLength(2);
+    const recorded = a.listEvents().filter((e) => e.kind === 'decision.recorded');
+    expect(recorded).toHaveLength(2);
+    expect(() =>
+      a.recordDecision({ ...base, reason: 'a DIFFERENT hold under the same key', clientKey: 'k-idem' }),
+    ).toThrow(/different decision/);
+    // No key = no idempotency: every call makes a new decision.
+    const free1 = a.recordDecision({ ...base });
+    const free2 = a.recordDecision({ ...base });
+    expect(free1.id).not.toBe(free2.id);
+  });
+
+  it('events carry the decision payload; clear appends decision.cleared once', () => {
+    const a = fresh();
+    const row = a.recordDecision({
+      subject: 'incident:pr-conflict:abc', decision: 'dismissed', covers: ['pr-conflict'],
+      basisFingerprint: 'hash-1', reason: 'stale incident, already settled', by: 'silas', clientKey: 'k-event',
+    });
+    const event = a.listEvents().find((e) => e.kind === 'decision.recorded' && (e.payload as { id?: string }).id === row.id);
+    expect(event?.payload).toMatchObject({
+      id: row.id, subject: 'incident:pr-conflict:abc', decision: 'dismissed', by: 'silas', basis_fingerprint: 'hash-1',
+    });
+    a.clearDecision({ id: row.id, by: 'gru', reason: 're-opened by owner' });
+    a.clearDecision({ id: row.id, by: 'gru', reason: 'repeat is an idempotent no-op' });
+    const cleared = a.listEvents().filter((e) => e.kind === 'decision.cleared');
+    expect(cleared).toHaveLength(1);
+    expect(cleared[0]?.payload).toMatchObject({ id: row.id, by: 'gru' });
+  });
+
+  it('validation: bad enums, empty reason, bad dates, and malformed subjects fail loudly', () => {
+    const a = fresh();
+    expect(() => a.recordDecision({ ...base, decision: 'maybe' as never })).toThrow(/unknown decision kind/);
+    expect(() => a.recordDecision({ ...base, by: 'minion' as never })).toThrow(/unknown decision actor/);
+    expect(() => a.recordDecision({ ...base, reason: '' })).toThrow(/reason must be 1-/);
+    expect(() => a.recordDecision({ ...base, recheckAt: 'not-a-date' })).toThrow(/ISO 8601 UTC timestamp/);
+    expect(() => a.recordDecision({ ...base, subject: 'no-colon-here' })).toThrow(/"<kind>:<key>"/);
+    expect(() => a.recordDecision({ ...base, covers: [] })).toThrow(/non-empty array/);
+    expect(() => a.recordDecision({ ...base, covers: [''] })).toThrow(/signal must be 1-/);
+    expect(() => a.coveringDecision({ subject: base.subject, signal: '', basis: 'x' })).toThrow(/signal/);
+    expect(() => a.clearDecision({ id: 'missing', by: 'gru', reason: 'r' })).toThrow(/not found/);
+  });
+
+  it('listDecisions filters by subject and activeOnly, newest first, bounded', () => {
+    const a = fresh();
+    const first = a.recordDecision({ ...base, subject: 'job:j-list', clientKey: 'k-l1' });
+    const second = a.recordDecision({ ...base, subject: 'job:j-list', covers: ['ci-failed'], clientKey: 'k-l2' });
+    a.recordDecision({ ...base, subject: 'job:j-other', clientKey: 'k-l3' });
+    a.clearDecision({ id: second.id, by: 'silas', reason: 'done' });
+    const all = a.listDecisions({ subject: 'job:j-list' });
+    expect(all.map((r) => r.id)).toEqual([second.id, first.id]); // newest first
+    expect(a.listDecisions({ subject: 'job:j-list', activeOnly: true }).map((r) => r.id)).toEqual([first.id]);
+    expect(a.listDecisions()).toHaveLength(3);
+  });
+});

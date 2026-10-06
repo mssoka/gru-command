@@ -112,3 +112,8 @@
 - source_spec: GitHub issue #215 (Route mechanical PR conflicts to Silas's digest instead of waking Gru)
   summary: A live/armed Perkins review round does not fence the `conflictingPrs` row — a base update can dirty the PR mid-round and the digest will offer a rebase that invalidates the frozen review target. The issue's suppression list is deliberately enumerated (directives, re-briefs, verifications, later #218 holds); round coordination belongs to #218's typed decision memory, where an active-hold check can cover `pr-conflict`.
   evidence: bmad code review (blind-hunter, gpt-6-sol) 2026-10-05, triaged defer — real coordination hazard, owned by the #218 phase; adding round-state fencing here would exceed the issue's prescribed suppression contract.
+
+## Deferred from: code review of issue #218 (2026-10-06)
+
+- [Review][Defer] Trigger-path suppression wiring — `coveringDecision` is not yet called by any production trigger/wake path, so a recorded hold does not yet prevent re-detection wakes. Deferred: #218 is the foundation by the issue's own sequencing; hold suppression wiring is #215's scope and the #219 lane is already stacking on `gru/decision-memory-218`. Docs now state this truthfully. Settled by: #215 landing its suppression query on this API.
+- [Review][Defer] `recheck_at` re-look scheduler — a passed `recheck_at` re-opens the subject for future queries, but nothing schedules a wake/sweep when it passes. Deferred: the recheck sweep is #217's explicit scope per the issue ("recheck_at in #217"). Settled by: #217's scheduler reading `recheck_at`.

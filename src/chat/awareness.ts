@@ -56,8 +56,11 @@ export const AWARENESS_WAKE_INSTRUCTION =
   'take one substantive step per incident (a fix lane, a re-arm, or a disposition), and ' +
   'stage the rest. After acting on an action-required alert, explicitly resolve its ' +
   'notification ID with POST /api/notifications/{id}/disposition and a nonempty detail; ' +
-  'prompt delivery alone never clears it. In all mode, FYI and needs-owner ' +
-  'rows can also wake you; do not act on or Ack an owner-only stop on the ' +
+  'prompt delivery alone never clears it. When the right outcome is a hold or "needs no ' +
+  'action", record that decision FIRST with POST /api/decisions (subject, covers, ' +
+  'basis_fingerprint, recheck_at, by: "gru") and then disposition the alert — a hold ' +
+  'recorded as state keeps the incident from re-waking you; prose does not. In all mode, ' +
+  'FYI and needs-owner rows can also wake you; do not act on or Ack an owner-only stop on the ' +
   'owner’s behalf. Escalate decisions that are theirs; if nothing is actionable, say so briefly.';
 
 export interface AwarenessLimits {
