@@ -345,6 +345,13 @@ function normalize(value: string): string {
   return value.toLowerCase().replace(/\s+/g, ' ').trim();
 }
 
+/** The exact dedupe key used by dedupeVerifiedFindings, exported for the
+ * host to recognize a restatement of an already-retained prior finding
+ * (Stage-5 convergence: a rediscovery is never a NEW finding). */
+export function findingDedupeKey(title: string, location: string): string {
+  return `${normalize(title)}\0${normalize(location)}`;
+}
+
 export function dedupeVerifiedFindings(findings: readonly VerifiedFinding[]): readonly VerifiedFinding[] {
   const severityRank: Record<FindingSeverity, number> = { blocker: 3, warning: 2, note: 1 };
   // The retained same-key judgment carries the actual round it came from.

@@ -620,4 +620,38 @@ describe('Stage-5 convergence over whole rounds', () => {
     // The lead was shown the carried list it must not disposition.
     expect(harness.leadCalls.at(-1)!.prompt ?? '').toContain('PRIOR FINDINGS CARRIED FORWARD');
   });
+
+  it('never defers a lead restatement of a carried blocker: the prior holds the PR', async () => {
+    const harness = makeEngine({
+      childAnswer: () => '[]',
+      specialists: [],
+      leadFinding: groundedFinding('lead', 'blocker', { location: 'src/main.ts:1', evidence: 'export function answer(): number {' }),
+    });
+    harness.repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const frozen1 = freeze(harness, { roundId: 'rs-round-1', spec: 'return 43' });
+    await runRound(harness, { roundId: 'rs-round-1', roundNumber: 1, frozen: frozen1, reviewScope: 'whole' });
+    const consolidated1 = join(reviewArtifactDirectory(harness.root, 'rs-round-1'), 'consolidated.json');
+
+    // Same head, delta round: the prior is carried; the scripted lead
+    // restates it (the double counts carried blockers in its verdict).
+    const frozen2 = freeze(harness, { roundId: 'rs-round-2', spec: 'return 43' });
+    const brain = harness.brain as { leadFinding?: unknown };
+    delete brain.leadFinding;
+    const round2 = await runRound(harness, {
+      roundId: 'rs-round-2', roundNumber: 3, frozen: frozen2,
+      reviewScope: 'delta', priorConsolidatedFile: consolidated1,
+    });
+    // An empty delta defers nothing EXCEPT genuinely new findings; the
+    // restated carried blocker merges into the original and still holds.
+    expect(round2.canonicalVerdict).toBe('NEEDS CHANGES');
+    expect(round2.convergence?.deferredFollowups).toBeUndefined();
+    expect(round2.convergence?.verdictRecomputed).toBeUndefined();
+    const consolidated2 = JSON.parse(readFileSync(join(round2.artifactDirectory, 'consolidated.json'), 'utf8')) as {
+      findings: Array<{ title: string; roundOrigin: number; deferredFollowup?: true }>;
+    };
+    const merged = consolidated2.findings.filter((finding) => finding.title === 'lead grounded defect');
+    expect(merged).toHaveLength(1);
+    expect(merged[0]!.roundOrigin).toBe(1);
+    expect(merged[0]!.deferredFollowup).toBeUndefined();
+  });
 });

@@ -377,6 +377,21 @@ export function fakeWholeSpawner(
 
     const retained: WholeFindingView[] = [...(options.findings?.(findings) ?? findings)];
     if (options.leadFinding !== undefined) retained.push(options.leadFinding);
+    // Stage-5: host-carried priors are still-present findings of THIS
+    // change — the lead's verdict counts them even though the host, not
+    // the lead, re-verified them.
+    for (const carriedPrior of carriedPriors) {
+      retained.push({
+        source: 'lead',
+        severity: carriedPrior.severity as WholeFindingView['severity'],
+        category: 'carried',
+        title: carriedPrior.title,
+        location: carriedPrior.location,
+        evidence: 'carried from prior round (host-verified)',
+        detail: 'Still present; carried forward by the host this round.',
+        recommended_fix: 'Resolve the carried finding.',
+      });
+    }
     // Policy verdict guidance counts confirmed blockers — a still-present
     // prior blocker is still a blocker of this change (the SAME effective
     // dispositions the submission carries feed the verdict).

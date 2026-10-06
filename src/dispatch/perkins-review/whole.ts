@@ -13,6 +13,7 @@ import { finalAssistantText } from './session-output.js';
 import { PERKINS_FINDING_SOURCES, PERKINS_LENSES, type PerkinsFindingSource, type PerkinsLens, type PerkinsPolicy } from './policy.js';
 import {
   dedupeVerifiedFindings,
+  findingDedupeKey,
   parseFindingsSubmission,
   parseFindingsWithRecovery,
   safeFixPath,
@@ -2193,16 +2194,31 @@ export class PerkinsWholeReview {
           // Stage-5 convergence rule (delta rounds, from the policy round):
           // new findings outside this round's delta hunks are deferred as
           // follow-ups — recorded and disclosed, never dropped — and a
-          // deferred blocker cannot hold the PR. Applied before dedupe so
-          // the flag survives merging into an older finding.
+          // deferred blocker cannot hold the PR. A RESTATEMENT of an
+          // already-retained prior finding (same dedupe key) is a
+          // rediscovery, not a new finding: the prior itself is retained
+          // through its disposition/carry path with full severity, so the
+          // restatement is exempt from deferral (it merges into the
+          // original anyway). Applied before dedupe so the flag survives
+          // merging into an older finding.
+          const retainedPriorKeys = new Set(prior.map((finding) => findingDedupeKey(finding.title, finding.location)));
+          // Restatements merge into the retained original; only genuinely
+          // new findings are subject to the convergence rule.
+          const restatements = reviewScope === 'delta' && submission.verdict !== 'INCOMPLETE'
+            ? leadFindings.filter((finding) => retainedPriorKeys.has(findingDedupeKey(finding.title, finding.location)))
+            : [];
+          const novelFindings = reviewScope === 'delta' && submission.verdict !== 'INCOMPLETE'
+            ? leadFindings.filter((finding) => !retainedPriorKeys.has(findingDedupeKey(finding.title, finding.location)))
+            : [];
           const partition = delta !== null && reviewScope === 'delta' && submission.verdict !== 'INCOMPLETE'
             ? partitionConvergedFindings({
               roundNumber: input.roundNumber,
               fromRound: convergenceRules.convergenceRuleFromRound,
-              findings: leadFindings,
+              findings: novelFindings,
               hunks: delta.hunks,
             })
             : { converged: leadFindings, deferred: [] as readonly { readonly finding: VerifiedFinding; readonly reason: string }[] };
+          const convergedLead = [...restatements, ...partition.converged];
           const deferredLead = partition.deferred.map(({ finding, reason }) => ({
             ...finding,
             deferredFollowup: true as const,
@@ -2253,7 +2269,7 @@ export class PerkinsWholeReview {
             status: 'still-present' as const,
             note: `carried forward by the host (Stage-5 carry-forward): ${reason}`,
           }));
-          const findings = dedupeVerifiedFindings([...hostCarried, ...carried, ...partition.converged, ...deferredLead]);
+          const findings = dedupeVerifiedFindings([...hostCarried, ...carried, ...convergedLead, ...deferredLead]);
           // Convergence verdict: when a deferred blocker exists, the
           // converged blocker set — everything except deferred blockers —
           // determines the canonical verdict by the SAME deterministic

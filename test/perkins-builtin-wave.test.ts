@@ -2503,9 +2503,16 @@ describe('WaveRunner built-in Perkins production path', () => {
     const thirdSessions = mkdtempSync(join(tmpdir(), 'perkins-prior-third-'));
     const thirdFake = fakeWholeSpawner(thirdSessions, {
       childAnswer: () => '[]', specialists: ['tests'],
-      priorDisposition: () => {
+      // Stage-5: the prior finding's cited file is untouched and its
+      // evidence unchanged at the same head, so the host CARRIES it — the
+      // prompt shows an empty revisit list and the lead dispositions only
+      // what it was shown (the carried blocker still holds the verdict).
+      priorDisposition: (shown) => {
         thirdAuditSeen = true;
-        return [{ prior_index: 0, status: 'still-present', note: 'defect remains: src/main.ts:2 still returns 43' }];
+        return shown.map((entry, index) => {
+          const finding = entry as { title: string; location: string };
+          return { prior_index: index, status: 'still-present' as const, note: `defect remains: ${finding.location}` };
+        });
       },
     });
     const third = asWave(await new WaveRunner({
