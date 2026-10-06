@@ -262,6 +262,15 @@ This writes `~/.gru-command/credentials/openrouter.key` (or under `$GRU_COMMAND_
 - **Don't edit the file.** If an editor adds a final newline, that is tolerated; a second line is not.
 - **Environment variable alternative.** An `OPENROUTER_API_KEY` variable in the service environment also works and takes precedence. The file is the recommended store.
 
+**Modes.** Each `[decisions.surfaces.<surface>]` picks one mode. `node dist/decisions/cli.js config-template` prints the full annotated fragment.
+
+| Mode | What Gru Command does |
+|---|---|
+| `off` | Deterministic only; Jev is never asked |
+| `shadow` | Asks Jev and records its answer, but always uses the deterministic answer. **Start here.** |
+| `enforce` | Uses Jev's answer, with deterministic fallback. It refuses to run until a recorded backtest meets its threshold. |
+| *(no mode key)* | Legacy behaviour, for `event_triage` and `supervision_guidance` only: uses Jev's answer with **no** backtest gate. Avoid it by listing those surfaces explicitly. |
+
 **2. Enable Jev in shadow mode.** Add this to `~/.gru-command/config.toml`. The service hot-reloads this section, so no restart is needed. Keep every surface listed explicitly: a surface that isn't listed would act on Jev's answer instead of only recording it.
 
 ```toml
@@ -269,7 +278,7 @@ This writes `~/.gru-command/credentials/openrouter.key` (or under `$GRU_COMMAND_
 enabled = true
 model = "~typesafe/jev-latest"
 endpoint = "https://openrouter.ai/api/alpha/decisions"
-timeout_ms = 2000
+timeout_ms = 5000
 
 [decisions.surfaces.event_triage]
 provider = "openrouter-jev"
@@ -304,6 +313,7 @@ node dist/decisions/cli.js check --json    # one tiny live probe; expect "status
 | `credential_invalid` | The file holds more than one line. Repeat step 1 instead of editing the file. |
 | `credential_unsafe` | Folder or file permissions are too open, or the file is a symlink. Remove `~/.gru-command/credentials` and repeat step 1. |
 | `probe_failed` / `malformed_response` | OpenRouter answered, but not as expected. Check the `model` and `endpoint` values above. |
+| `timeout` | Answers are slower than `timeout_ms`. A single slow shadow ask is only recorded; 3 in a row mark Jev degraded, and it rechecks automatically. If this keeps happening on a healthy network, raise `timeout_ms` (for example to 8000). |
 
 Full reference (provider profiles including TypeSafe direct and a local `/v1/systemone` model, backtests, enforcement): [docs/jev-production-integration.md](docs/jev-production-integration.md).
 
