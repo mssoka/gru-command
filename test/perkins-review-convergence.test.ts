@@ -251,7 +251,8 @@ describe('deltaSince (bounded git delta)', () => {
     repo.git(['checkout', '-b', 'feature/mode']);
     const first = repo.commitFile('src/script.sh', '#!/bin/sh\necho hi\n');
     repo.git(['update-index', '--chmod=+x', 'src/script.sh']);
-    repo.git(['commit', '-m', 'make executable']);
+    // A CI runner has no global git identity: commit with an explicit one.
+    repo.git(['-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '-m', 'make executable']);
     const second = repo.head();
     const delta = deltaSince(repo.path, first, second);
     expect(delta.touchedPaths.has('src/script.sh')).toBe(true);
