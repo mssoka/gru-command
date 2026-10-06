@@ -157,6 +157,27 @@ specialist runs (retries included), two attempts per lens, and two real
 terminal submissions (free preflight is distinct); failed attempts count and
 stay recorded, and a completed lens cannot be rerun for a second opinion.
 Lenses the lead did not use are reported as `not used`, never as coverage.
+Immediately after the freeze (and before the run promise or any lead/child
+spawn), an **admission preflight** re-validates the complete frozen packet
+read-only — head binding, every declared artifact digest, evidence
+attachment bytes, the CI record's shape, and the spec's explicit CI and
+verification sections (a no-binding verification run freezes an explicit
+UNAVAILABLE disclosure, never silence) — and refuses with one exhaustive,
+named missing-input list (`round.admission-preflight`); a refused round
+aborts without spawn. Parent-failure truth (gh-169): a round whose PARENT
+fails after a review owner spawned (lead transport death, restart,
+finalization crash) records exactly one `round.parent-incident` event;
+lenses with a started attempt carry an honest interrupted-execution error,
+and never-started lenses keep their `pending` chips — one lead disconnect
+is one parent incident, never a slate of failed specialists. A PRE-SPAWN
+interruption (setup shutdown or a pre-spawn workflow failure) is not a
+parent incident: it leaves the durable negative owner receipt
+(`round.review-no-spawn`) and an INCOMPLETE report whose heading says
+setup refusal/interruption — no incident event exists to find. A revision-expression or tag pin
+(`origin/topic~1`, `origin/v1`) is not a branch spelling: the
+advertised-tip movement probe skips it (the pin still binds through local
+resolution and the pristine-checkout proof), so pinned rounds no longer
+degenerate into check-failed movement.
 
 - The lead receives only its declared product-native tools: four
   whole-change orchestration tools (run tracked specialist children, store
@@ -588,8 +609,9 @@ the judgment; the dispatch surface is the mechanical hand.
   call per repo per tick where possible. Each observed state CHANGE
   applies exactly once: PR merged → `in-review → merged` transition plus
   a `github.pr-merged` event; PR conflicting (`mergeable_state: dirty`) →
-  `github.pr-conflict` plus an action-required cascade notification
-  (mechanical tier — Silas may arm a rebase lane within mandate); CI
+  `github.pr-conflict` plus an fyi notification (mechanical tier — Silas
+  owns the rebase within mandate; the conflict lands in his digest's
+  `conflictingPrs` rows and never wakes Gru, issue #215); CI
   failed → `github.ci-failed` plus a notification carrying the run URL,
   routed by check kind (mechanical → fyi, judgment → wake-eligible
   action-required); CI green → `github.ci-green` review-gate signal.
@@ -623,7 +645,10 @@ the judgment; the dispatch surface is the mechanical hand.
   still withdraws the offer. Failed attempts stay eligible: a 409
   deferral and a fallback that never engaged (`unavailable`) or ended
   `blocked`/`aborted` answer nothing, so the same abort reappears for the
-  next sweep. NEEDS CHANGES
+  next sweep. Conflicting PR heads (issue #215) are digest rows too: a
+  live PR-owing lane whose open head is dirty against its base is Silas's
+  mechanical rebase work — suppressed while a directive, re-brief or
+  verification owns the lane, and never a Gru wake. NEEDS CHANGES
   verdicts awaiting follow-through, with per-blocker recurrence analysis;
   working lanes whose minion has been silent past `stall_threshold_ms`;
   plus recent minion errors for context.
@@ -801,11 +826,16 @@ section). Service restarts remain manual until self-roll-34 lands.
 
 ## Bob (periodic memory)
 
-Bob's consolidation trigger runs on the configured interval
-(`[dispatch] bob_interval_ms`, default hourly; `0` disables): it knocks
-on the bob role's supervised slot with consolidation instructions; the
-role's persona (`roles/bob.md`) governs the craft. Never overlapping,
-never blocking a live operation.
+Bob's consolidation trigger ships **disabled** (`[dispatch]
+bob_interval_ms = 0`, issue #221): the due-based dream pass (Book of
+Lessons) is the learning loop that feeds the crew — it reads journal
+entries, including the blockers Perkins journals from every posted
+review verdict — and an hourly knock mostly found nothing, writing
+memory files no role prompt or code path reads. The trigger remains
+available for installs that want it (any positive `bob_interval_ms`
+enables; `0` disables): it knocks on the bob role's supervised slot
+with consolidation instructions; the role's persona (`roles/bob.md`)
+governs the craft. Never overlapping, never blocking a live operation.
 
 ## Self-roll (the service deploys itself)
 
@@ -897,7 +927,7 @@ or an outside shell to avoid waiting out the drain bound.
 # setup_timeout_ms = 120000
 
 [dispatch]
-# bob_interval_ms = 3600000        # 0 disables Bob's trigger
+# bob_interval_ms = 3600000        # ships 0: disabled — the due-based dream is the loop
 
 [silas]
 # hosted ops session (see "Ops follow-through" above); live by default

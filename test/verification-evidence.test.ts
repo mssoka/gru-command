@@ -105,25 +105,52 @@ describe('recorded verification evidence', () => {
     expect(complete).toContain('output_bytes: 4096');
   });
 
-  it('appends the block to the spec and skips it when the frozen bound would be exceeded', () => {
+  it('appends the block to the spec; an oversized block renders the bounded omission notice instead of silence', () => {
     const evidence = renderRecordedVerification(event(passingPayload()), TARGET);
     expect(evidence).not.toBeNull();
+    const evidenceText = evidence as string;
     const spec = 'Acceptance: answer returns 43.';
-    const combined = appendRecordedVerification({ spec, evidence });
+    const combined = appendRecordedVerification({ spec, evidence: evidenceText });
+    expect(combined).toBe(`${spec}\n\n${evidenceText}`);
     expect(combined).toBe(`${spec}\n\n${evidence}`);
     expect(combined.startsWith(spec)).toBe(true);
-    // Unchanged when no evidence binds.
-    expect(appendRecordedVerification({ spec, evidence: null })).toBe(spec);
-    // A spec at the frozen bound swallows the block (loud log, never a throw).
+    // gh-169: no binding run is EXPLICIT — the UNAVAILABLE disclosure
+    // freezes beside the spec instead of silence, still prefixed by the
+    // original spec bytes (the acceptance hash binds that prefix).
+    const absence = appendRecordedVerification({ spec, evidence: null });
+    expect(absence.startsWith(spec)).toBe(true);
+    expect(absence).toContain('--- HOST-RECORDED VERIFICATION');
+    expect(absence).toContain('state: UNAVAILABLE — NO BOUND VERIFICATION RUN');
+    expect(absence).toContain('not a pass and not a measured failure');
+    // P3 (gh-169): a REAL block that cannot fit renders the explicit
+    // bounded omission notice when that notice fits (never silence — the
+    // packet keeps its verification section); a spec with no room for
+    // even the notice refuses the freeze.
     const logs: string[] = [];
-    const huge = 'x'.repeat(FROZEN_SPEC_MAX_BYTES - 10);
-    const skipped = appendRecordedVerification({
-      spec: huge,
-      evidence,
+    const evidenceBytes = Buffer.byteLength(evidenceText, 'utf8');
+    // The full block must NOT fit while the short omission notice does:
+    // that requires the real block to be larger than the notice (~330 B).
+    expect(evidenceBytes).toBeGreaterThan(400);
+    const roomy = 'x'.repeat(FROZEN_SPEC_MAX_BYTES - evidenceBytes);
+    const omitted = appendRecordedVerification({
+      spec: roomy,
+      evidence: evidenceText,
       log: (level, msg) => logs.push(`${level}:${msg}`),
     });
-    expect(skipped).toBe(huge);
+    expect(omitted.startsWith(roomy)).toBe(true);
+    expect(omitted).toContain('--- HOST-RECORDED VERIFICATION');
+    expect(omitted).toContain('state: UNAVAILABLE — VERIFICATION EVIDENCE OMITTED (frozen spec bound)');
+    expect(omitted).toContain('Omission is not a pass and not a measured failure');
     expect(logs).toHaveLength(1);
-    expect(logs[0]).toContain('frozen spec bound exceeded');
+    expect(logs[0]).toContain('exceeded the frozen spec bound');
+    // No room for even the omission notice: the freeze refuses (a supplied
+    // spec may never freeze without a verification section).
+    const huge = 'x'.repeat(FROZEN_SPEC_MAX_BYTES - 10);
+    expect(() => appendRecordedVerification({ spec: huge, evidence: evidenceText })).toThrow(
+      /no room for a verification section/u,
+    );
+    expect(() => appendRecordedVerification({ spec: huge, evidence: null })).toThrow(
+      /no room for a verification section/u,
+    );
   });
 });

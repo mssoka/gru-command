@@ -259,8 +259,10 @@ morning_digest_gap_ms = 28800000
 setup_timeout_ms = 120000
 
 [dispatch]
-# Bob consolidation interval; 0 disables the periodic trigger.
-bob_interval_ms = 3600000
+# Bob consolidation knock; 0 (the default) disables it. The due-based dream
+# pass is the learning loop that feeds the crew; an hourly knock mostly
+# found nothing and wrote memory no code path reads. Re-enable deliberately.
+bob_interval_ms = 0
 
 [lessons]
 # Book of Lessons: deliberate journal entries → dream distillation →

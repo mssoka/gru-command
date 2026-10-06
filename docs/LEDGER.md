@@ -109,6 +109,8 @@ publishes it on the in-process event bus (`src/events/bus.ts`).
 | `silas.review-triggered` | route, and `round_id` + `rule_id`/`source_round_id` ONLY when a Perkins round is actually armed — the consuming clean-abort receipt; fallback/queued routes record the route without the provenance |
 | `job.amendment-accepted` / `job.amendment-rejected` | amendment id, version, body sha256+bytes, supersedes, approval by/reference, previous/effective contract hashes, idempotency key / refusal code+reason + current hash/version |
 | `round.review-inputs-frozen` | acceptance version/base+effective hashes/amendment ids, evidence attachment hashes (no pixels, no paths), bound CI record state |
+| `round.admission-preflight` | ok, full check list (`head-binding`, `frozen-packet:<file>`, `spec-context`, `verification-evidence`, `ci-evidence`, `evidence:<id>`), and on refusal the exhaustive named missing-input list — recorded after the freeze receipts and BEFORE any lead/child spawn (gh-169) |
+| `round.parent-incident` | exactly ONE per parent-aborted round: note, startedAttempts, startedLenses, notStartedLenses — a lead disconnect is one parent incident; never-started lenses keep their `pending` chip (not-started ≠ failed execution) (gh-169) |
 | `job.review-handoff-conflict` / `job.review-handoff-superseded` | request seq + folded scope; a differing evidence set is recorded as count + opaque request fingerprint, never paths |
 
 Events are appended for **state changes**; idempotent enrichment writes

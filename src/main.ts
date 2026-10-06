@@ -55,9 +55,10 @@ import { uploadsDirNeedsHardening } from './attachments/resolver.js';
 import { JournalStore } from './lessons/journal.js';
 import { BibleStore } from './lessons/bible.js';
 import { createBibleReferences } from './lessons/references.js';
-import { DreamEngine, DreamScheduler } from './lessons/dream.js';
+import { DreamEngine, DreamScheduler, DREAM_STATE_FILE, loadDreamState } from './lessons/dream.js';
 import { AgentLessonsDistiller } from './lessons/distiller.js';
 import { createSessionLessonsCapture } from './lessons/capture.js';
+import { createReviewOutcomeCapture } from './lessons/review-capture.js';
 import { createLessonsServer } from './lessons/server.js';
 import { DecisionRuntime } from './decisions/runtime.js';
 import { isolateDecisionEnvironment } from './decisions/credentials.js';
@@ -564,6 +565,18 @@ async function main(): Promise<number> {
     journal,
     bible,
     references: lessonReferences,
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  // Perkins verdicts are learning inputs (issue #221): every posted round
+  // verdict journals its consolidated blockers as deliberate finding
+  // entries (source perkins:<round>), so the dream learns from reviews
+  // without Bob's hourly pass. Idempotent per round via a sidecar next to
+  // the review artifacts; runs regardless of [lessons] enabled — capture
+  // is deliberate and must never be lost.
+  createReviewOutcomeCapture({
+    bus,
+    journal,
+    artifactRoot: join(config.dataDir, 'reviews'),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   // E7: late-bound supervision feed — the engine is constructed before
@@ -1301,6 +1314,9 @@ async function main(): Promise<number> {
   const dream = new DreamScheduler({
     intervalMs: config.lessons.dreamIntervalMs,
     dreamOnBoot: config.lessons.dreamOnBoot,
+    // Due-based cadence (issue #221): the schedule persists in the dream
+    // state, so a service restart no longer resets it.
+    lastDreamAt: () => loadDreamState(join(bible.dir, DREAM_STATE_FILE)).lastDreamAt,
     run: () =>
       new DreamEngine({
         journal,

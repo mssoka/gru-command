@@ -30,6 +30,7 @@ import type { FollowThroughNotifications } from '../src/dispatch/obligations.js'
 import { FIRING_RULES } from '../src/ledger/obligations.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb, MIGRATIONS } from '../src/ledger/db.js';
+import { BRANCH_STATE_EVENT } from '../src/dispatch/github-poll.js';
 import { DEFAULT_SILAS_CONFIG } from '../src/config.js';
 import type { AgentCapabilities, AgentHandle } from '../src/runtime/types.js';
 import type { AgentSupervisionView } from '../src/supervision/supervisor.js';
@@ -146,6 +147,272 @@ describe('re-review freshness predicate', () => {
     const stale = delivery({ sha: 'sha-reviewed' });
     expect((stale as { seq: number }).seq > 50).toBe(true);
     expect(followUpChangedTarget(stale, { targetRef: 'sha-reviewed' })).toBe(false);
+  });
+});
+
+// ------------------------------------------------------------------
+// Conflicting PR rows (issue #215)
+// ------------------------------------------------------------------
+
+describe('silas digest conflictingPrs rows (issue #215)', () => {
+  const dirtyCursor = (sha: string, overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+    repo: 'acme/app',
+    branch: 'gru/job-conf',
+    sha,
+    merged: false,
+    pr_open: true,
+    mergeable_state: 'dirty',
+    pr_number: 11,
+    pr_url: 'https://github.com/acme/app/pull/11',
+    ...overrides,
+  });
+  const digestOf = (h: Harness) =>
+    computeSilasDigest({
+      ledger: h.ledger,
+      blockersForRound: async () => ({ blockers: [], note: null }),
+      config: DEFAULT_SILAS_CONFIG,
+      trigger: 'sweep',
+    });
+  const addDirtyJob = (
+    h: Harness,
+    jobId: string,
+    sha = 'sha-11',
+    cursorOverrides: Record<string, unknown> = {},
+    opts: { deliverable?: JobDeliverable } = {},
+  ): void => {
+    h.ledger.addJob({
+      id: jobId, repo: 'acme/app', title: `t-${jobId}`, briefing: 'b',
+      ...(opts.deliverable !== undefined ? { deliverable: opts.deliverable } : {}),
+    });
+    h.ledger.setJobStatus(jobId, 'working');
+    h.ledger.setJobPr(jobId, 'https://github.com/acme/app/pull/11');
+    h.ledger.appendCustomEvent({ kind: BRANCH_STATE_EVENT, jobId, payload: dirtyCursor(sha, cursorOverrides) });
+  };
+
+  it('a dirty branch-state lists exactly one conflicting PR row and counts it actionable', async () => {
+    const h = makeLedger();
+    try {
+      addDirtyJob(h, 'job-conf');
+      const d = await digestOf(h);
+      expect(d.conflictingPrs).toHaveLength(1);
+      expect(d.conflictingPrs[0]).toMatchObject({
+        jobId: 'job-conf',
+        repo: 'acme/app',
+        branch: 'gru/job-conf',
+        prNumber: 11,
+        prUrl: 'https://github.com/acme/app/pull/11',
+        headSha: 'sha-11',
+      });
+      // No pr-conflict transition in the ledger (pre-#215 history): the
+      // dirty cursor itself is the honest first-seen timestamp.
+      expect(d.conflictingPrs[0]?.firstSeenAt).toBe(h.ledger.latestJobEvent('job-conf', BRANCH_STATE_EVENT)?.ts);
+      expect(digestActionCount(d)).toBe(1);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('firstSeenAt is the oldest consecutive dirty cursor for the head, not a possibly-older transition', async () => {
+    const h = makeLedger();
+    try {
+      addDirtyJob(h, 'job-conf');
+      // The pr-conflict transition carries no head identity, so it must
+      // not be attributed to this head's first-seen: the cursor walk owns
+      // that timestamp.
+      h.ledger.appendCustomEvent({
+        kind: 'github.pr-conflict', jobId: 'job-conf', payload: { pr: 11, mergeable_state: 'dirty' },
+      });
+      const cursorTs = h.ledger.latestJobEvent('job-conf', BRANCH_STATE_EVENT)?.ts;
+      const d = await digestOf(h);
+      expect(d.conflictingPrs[0]?.firstSeenAt).toBe(cursorTs);
+      // A dirty→dirty head move re-arms under the NEW head's own
+      // first-observed cursor, never the previous head's history.
+      const moved = h.ledger.appendCustomEvent({
+        kind: BRANCH_STATE_EVENT, jobId: 'job-conf', payload: dirtyCursor('sha-12'),
+      });
+      const d2 = await digestOf(h);
+      expect(d2.conflictingPrs.map((row) => row.headSha)).toEqual(['sha-12']);
+      expect(d2.conflictingPrs[0]?.firstSeenAt).toBe(moved.ts);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a dirty cursor with no head SHA lists no row (no fingerprint, no retirement — fail closed)', async () => {
+    const h = makeLedger();
+    try {
+      addDirtyJob(h, 'job-nosha', '', { sha: '' });
+      const d = await digestOf(h);
+      expect(d.conflictingPrs).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a dirty PR on a DELIVERED repair lane keeps its row through the publish boundary', async () => {
+    const h = makeLedger();
+    try {
+      // Delivered lane whose phase carries a directive-admission repair
+      // start: the recorded phase seq is nonzero, so a publish recheck
+      // that substitutes zero for delivered lanes would drop the row.
+      addJobWithDelivery(h.ledger, 'job-delivered-dirty');
+      h.ledger.setJobStatus('job-delivered-dirty', 'delivered');
+      h.ledger.setJobPr('job-delivered-dirty', 'https://github.com/acme/app/pull/31');
+      h.ledger.appendCustomEvent({
+        kind: BRANCH_STATE_EVENT, jobId: 'job-delivered-dirty', payload: dirtyCursor('sha-31'),
+      });
+      const d = await digestOf(h);
+      expect(d.conflictingPrs.map((row) => row.jobId)).toEqual(['job-delivered-dirty']);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a conflict offer is retracted when a directive is admitted during the compute await', async () => {
+    const h = makeLedger();
+    try {
+      // The await job is created first and the conflict candidate a second
+      // later, so the candidate is deterministically visited first.
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-10-04T10:00:00.000Z'));
+      h.ledger.addJob({ id: 'job-await', repo: 'fixture-app', title: 'other', briefing: 'b' });
+      h.ledger.setJobStatus('job-await', 'working');
+      const round = h.ledger.addRound({ jobId: 'job-await', lenses: ['blind'] });
+      h.ledger.setRoundStatus(round.id, 'live');
+      h.ledger.setRoundVerdict(round.id, 'changes-requested');
+      h.ledger.setJobStatus('job-await', 'in-review');
+      vi.setSystemTime(new Date('2026-10-04T10:00:01.000Z'));
+      addDirtyJob(h, 'job-race-conf');
+      vi.useRealTimers();
+      let raced = false;
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => {
+          if (!raced) {
+            raced = true;
+            const intent = h.ledger.beginDirectiveIntent({ jobId: 'job-race-conf', directive: 'rebase', holder: 'silas-ops' });
+            const sent = h.ledger.appendCustomEvent({
+              kind: 'silas.directive-sent', jobId: 'job-race-conf', payload: { request_id: intent.record.requestId, minion_id: 'min-race' },
+            });
+            h.ledger.recordDirectiveAdmission({ requestId: intent.record.requestId, minionId: 'min-race', eventSeq: sent.seq });
+          }
+          return { blockers: [], note: null };
+        },
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(raced).toBe(true);
+      expect(digest.conflictingPrs).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a pre-#215 dirty stretch (no transition event) still retires on its head directive', async () => {
+    const h = makeLedger();
+    try {
+      addDirtyJob(h, 'job-legacy-dirty');
+      // No github.pr-conflict event exists; the dirty cursor itself is
+      // the retirement watermark.
+      h.ledger.appendCustomEvent({
+        kind: 'silas.directive-sent', jobId: 'job-legacy-dirty', payload: { blocker_fingerprint: 'pr-conflict:sha-11' },
+      });
+      expect((await digestOf(h)).conflictingPrs).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('clean, merged, closed or absent states list no row', async () => {
+    const h = makeLedger();
+    try {
+      addDirtyJob(h, 'job-clean', 'sha-11', { mergeable_state: 'clean' });
+      addDirtyJob(h, 'job-merged', 'sha-11', { merged: true });
+      addDirtyJob(h, 'job-closed', 'sha-11', { pr_open: false });
+      const d = await digestOf(h);
+      expect(d.conflictingPrs).toEqual([]);
+      expect(digestActionCount(d)).toBe(0);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('review deliverables and non-live lanes never list a conflict', async () => {
+    const h = makeLedger();
+    try {
+      addDirtyJob(h, 'job-review', 'sha-11', {}, { deliverable: 'review' });
+      h.ledger.addJob({ id: 'job-blocked', repo: 'acme/app', title: 't-blocked', briefing: 'b' });
+      h.ledger.setJobStatus('job-blocked', 'working');
+      h.ledger.setJobPr('job-blocked', 'https://github.com/acme/app/pull/12');
+      h.ledger.appendCustomEvent({ kind: BRANCH_STATE_EVENT, jobId: 'job-blocked', payload: dirtyCursor('sha-12') });
+      h.ledger.setJobStatus('job-blocked', 'blocked');
+      const d = await digestOf(h);
+      expect(d.conflictingPrs).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a live directive or pending re-brief suppresses the row; a failed directive releases it', async () => {
+    const h = makeLedger();
+    try {
+      addDirtyJob(h, 'job-directive');
+      const intent = h.ledger.beginDirectiveIntent({ jobId: 'job-directive', directive: 'rebase the lane', holder: 'silas-ops' });
+      expect((await digestOf(h)).conflictingPrs).toEqual([]);
+      h.ledger.failDirective({ requestId: intent.record.requestId, reason: 'no lane and no minion' });
+      expect((await digestOf(h)).conflictingPrs.map((row) => row.jobId)).toEqual(['job-directive']);
+    } finally {
+      h.cleanup();
+    }
+    const h2 = makeLedger();
+    try {
+      addDirtyJob(h2, 'job-rebrief');
+      h2.ledger.beginPendingRebrief({ jobId: 'job-rebrief', note: 'retry the repair', briefing: 'b' });
+      expect((await digestOf(h2)).conflictingPrs).toEqual([]);
+    } finally {
+      h2.cleanup();
+    }
+  });
+
+  it('an in-flight verification suppresses the row; its settlement releases it', async () => {
+    const h = makeLedger();
+    try {
+      addDirtyJob(h, 'job-verify');
+      h.ledger.appendCustomEvent({ kind: 'verification.started', jobId: 'job-verify', payload: { run_id: 'run-1', scope: 'full' } });
+      expect((await digestOf(h)).conflictingPrs).toEqual([]);
+      h.ledger.appendCustomEvent({ kind: 'verification.completed', jobId: 'job-verify', payload: { run_id: 'run-1', scope: 'full' } });
+      expect((await digestOf(h)).conflictingPrs.map((row) => row.jobId)).toEqual(['job-verify']);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a pr-conflict directive retires exactly its head after the conflict; a new dirty head re-arms', async () => {
+    const h = makeLedger();
+    try {
+      addDirtyJob(h, 'job-fp');
+      // A rung BEFORE the conflict transition answers nothing.
+      h.ledger.appendCustomEvent({
+        kind: 'silas.directive-sent', jobId: 'job-fp', payload: { blocker_fingerprint: 'pr-conflict:sha-11' },
+      });
+      h.ledger.appendCustomEvent({ kind: 'github.pr-conflict', jobId: 'job-fp', payload: { pr: 11 } });
+      expect((await digestOf(h)).conflictingPrs.map((row) => row.jobId)).toEqual(['job-fp']);
+      // An unrelated fingerprint after the conflict retires nothing either.
+      h.ledger.appendCustomEvent({
+        kind: 'silas.directive-sent', jobId: 'job-fp', payload: { blocker_fingerprint: 'verification-failure:full@run-1' },
+      });
+      expect((await digestOf(h)).conflictingPrs.map((row) => row.jobId)).toEqual(['job-fp']);
+      // The exact head fingerprint after the conflict retires the row.
+      h.ledger.appendCustomEvent({
+        kind: 'silas.directive-sent', jobId: 'job-fp', payload: { blocker_fingerprint: 'pr-conflict:sha-11' },
+      });
+      expect((await digestOf(h)).conflictingPrs).toEqual([]);
+      // A later dirty cursor at a NEW head re-arms the row.
+      h.ledger.appendCustomEvent({ kind: BRANCH_STATE_EVENT, jobId: 'job-fp', payload: dirtyCursor('sha-12') });
+      expect((await digestOf(h)).conflictingPrs.map((row) => row.headSha)).toEqual(['sha-12']);
+    } finally {
+      h.cleanup();
+    }
   });
 });
 
@@ -2210,7 +2477,7 @@ describe('silas skills and wake prompt', () => {
       deliveredWithoutPr: [], prWithoutReview: [{ jobId: 'clean', repo: 'gru-command', prUrl: 'https://example.invalid/1',
         priorRounds: 1, cleanAbort: { roundId: 'clean-r1', ruleId: 'clean-abort-service-restart' } }],
       verdictsAwaitingDirective: [], stalledWorking: [], minionErrors: [],
-      verificationFailures: [], verificationWaits: [], providerRecoveryPending: [] },
+      verificationFailures: [], verificationWaits: [], providerRecoveryPending: [], conflictingPrs: [] },
       trigger: { kind: 'sweep' }, skills: loadSilasSkills(), ops: { baseUrl: 'http://127.0.0.1:1', configPath: '/tmp/test-config' } });
     expect(prompt).toContain('You NEVER merge a pull request');
     expect(prompt).toContain('The owner holds every merge');
@@ -2247,6 +2514,7 @@ describe('silas skills and wake prompt', () => {
         verificationFailures: [],
         verificationWaits: [],
         providerRecoveryPending: [],
+        conflictingPrs: [],
       },
       trigger: { kind: 'job.delivered', jobId: 'job-a' },
       skills,

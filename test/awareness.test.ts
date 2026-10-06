@@ -301,6 +301,29 @@ describe('gru awareness — wake policy', () => {
     expect(rig.woke).toEqual([]);
   });
 
+  it('a mechanical PR conflict routes fyi and never becomes a Gru wake candidate (issue #215)', () => {
+    const rig = boot({ wakeMode: 'action-required' });
+    rig.notifications.post({
+      kind: 'github.pr-conflict:job-1',
+      routing: 'fyi',
+      severity: 'error',
+      title: 'PR #11 conflicts with its base (acme/app)',
+      detail: 'Mechanical tier: Silas owns the rebase within mandate for #11; tracked in his digest, not a Gru wake.',
+    });
+    // The mechanical conflict is Silas's digest work: under the default
+    // action-required wake policy it is a passive ℹ row, never a wake —
+    // the judgment escalation that follows is what wakes, exactly once.
+    expect(rig.woke).toHaveLength(0);
+    rig.notifications.post({
+      kind: 'review-escalation',
+      routing: 'action-required',
+      severity: 'error',
+      title: 'Escalation',
+    });
+    expect(rig.woke).toHaveLength(1);
+    expect(rig.wakeBlocks[0]).not.toContain('conflicts with its base');
+  });
+
   it("wake 'action-required': escalations wake once; FYI stays passive", () => {
     const rig = boot({ wakeMode: 'action-required' });
     rig.notifications.post({ kind: 'round.verdict', routing: 'fyi', severity: 'info', title: 'FYI' });
@@ -996,5 +1019,220 @@ describe('gru awareness — morning digest (owner ruling 2026-09-23)', () => {
     // The boot backlog never seeded it: with a zero interval a seeded row
     // would have fired a wake turn through the sink.
     expect(rig.woke).toHaveLength(0);
+  });
+});
+
+describe('gru awareness — passive queue rotation (GH-109)', () => {
+  /** Record an explicit-id open queue. The ledger's own newest-first order
+   * is read back for assertions, so no test depends on wall-clock ties. */
+  function seedQueue(rig: Rig, count: number, prefix: string, routing: 'action-required' | 'needs-owner' = 'action-required'): readonly string[] {
+    for (let i = 0; i < count; i += 1) {
+      rig.api.recordNotification({
+        id: `${prefix}-${String(i).padStart(2, '0')}`,
+        kind: 'test.rotation',
+        routing,
+        severity: 'error',
+        title: `Rotation row ${prefix}-${i}`,
+      });
+    }
+    return rig.api.listNotifications({ routing, unackedOnly: true, limit: 1000 }).map((row) => row.id);
+  }
+
+  it('covers every open row within a bounded number of passive blocks while the queue stays deeper than the block', () => {
+    const rig = boot({ wakeMode: 'never', limits: { maxActionNotes: 4 } });
+    const ledgerOrder = seedQueue(rig, 10, 'rot');
+    const blocksPerCycle = Math.ceil(ledgerOrder.length / 4);
+    const seen = new Set<string>();
+    for (let block = 0; block < blocksPerCycle; block += 1) {
+      const prepared = rig.awareness.prepare();
+      expect(prepared).not.toBeNull();
+      const ids = prepared?.notificationIds ?? [];
+      // The block itself stays bounded at the configured page size.
+      expect(ids.length).toBeLessThanOrEqual(4);
+      // Newest rows still appear promptly: a fresh cycle leads with them.
+      if (block === 0) expect(ids).toContain(ledgerOrder[0]);
+      for (const id of ids) if (ledgerOrder.includes(id)) seen.add(id);
+      rig.awareness.commit(prepared!);
+    }
+    // Sustained queue, one full cycle: no open row is left unseen.
+    expect([...seen].sort()).toEqual([...ledgerOrder].sort());
+    // The rotation continues: the next cycle covers the queue again.
+    const secondCycle = new Set<string>();
+    for (let block = 0; block < blocksPerCycle; block += 1) {
+      const prepared = rig.awareness.prepare()!;
+      for (const id of prepared.notificationIds ?? []) if (ledgerOrder.includes(id)) secondCycle.add(id);
+      rig.awareness.commit(prepared);
+    }
+    expect([...secondCycle].sort()).toEqual([...ledgerOrder].sort());
+  });
+
+  it('closed receipts never crowd live rows out of the rotation cycle (D1 + GH-109)', () => {
+    const rig = boot({ wakeMode: 'never', limits: { maxActionNotes: 4 } });
+    rig.api.addJob({ id: 'job-rot', repo: 'r', title: 'Concluded job', briefing: 'b' });
+    rig.api.setJobStatus('job-rot', 'working');
+    rig.api.registerAgent({ id: 'minion-rot', role: 'minion', jobId: 'job-rot' });
+    for (let i = 0; i < 12; i += 1) {
+      rig.api.recordNotification({
+        id: `receipt-${String(i).padStart(2, '0')}`,
+        kind: 'test.rotation',
+        routing: 'action-required',
+        severity: 'error',
+        title: `Closed receipt ${i}`,
+        agentId: 'minion-rot',
+      });
+    }
+    rig.api.setJobStatus('job-rot', 'delivered');
+    rig.api.setJobStatus('job-rot', 'in-review');
+    rig.api.setJobStatus('job-rot', 'merged');
+    const liveOrder = seedQueue(rig, 6, 'live');
+    const seen = new Set<string>();
+    // A receipt wall ahead of the live rows must not stall coverage:
+    // the wall is skipped in one step, then the live rows rotate through.
+    let delivered = 0;
+    let previousNull = false;
+    let recoveredFromReceiptPage = false;
+    for (let attempt = 0; attempt < 6 && delivered < 3; attempt += 1) {
+      const prepared = rig.awareness.prepare();
+      if (prepared === null) {
+        // A page holding only closed receipts renders nothing — and must
+        // not wedge the rotation: the next prepare() reaches live rows.
+        previousNull = true;
+        continue;
+      }
+      if (previousNull) recoveredFromReceiptPage = true;
+      const lines = prepared.text.split('\n');
+      const actionSection = lines.indexOf('Action required (unacknowledged):');
+      expect(actionSection).toBeGreaterThanOrEqual(0);
+      for (const id of prepared.notificationIds ?? []) if (id.startsWith('live-')) seen.add(id);
+      // Receipts render only under their labeled section, never as live work.
+      const receiptSectionStart = lines.indexOf('Closed receipts (no action required; kept for reference):');
+      for (const line of lines.slice(actionSection, receiptSectionStart === -1 ? undefined : receiptSectionStart)) {
+        expect(line).not.toMatch(/\[receipt-/);
+      }
+      rig.awareness.commit(prepared);
+      delivered += 1;
+    }
+    expect(recoveredFromReceiptPage).toBe(true);
+    expect([...seen].sort()).toEqual(liveOrder.filter((id) => id.startsWith('live-')).sort());
+  });
+
+  it('rotates owner stops through passive blocks instead of pinning the newest page', () => {
+    const rig = boot({ wakeMode: 'never', limits: { maxActionNotes: 4 } });
+    const ledgerOrder = seedQueue(rig, 10, 'own', 'needs-owner');
+    const seen = new Set<string>();
+    for (let block = 0; block < Math.ceil(ledgerOrder.length / 4); block += 1) {
+      const prepared = rig.awareness.prepare()!;
+      for (const id of prepared.notificationIds ?? []) seen.add(id);
+      rig.awareness.commit(prepared);
+    }
+    expect([...seen].sort()).toEqual([...ledgerOrder].sort());
+  });
+
+  it('the rotation offset survives a restart so the cycle resumes instead of replaying the newest page', () => {
+    const dir = tmpDir();
+    let deliveredPage: readonly string[] = [];
+    {
+      const first = boot({ dir, wakeMode: 'never', limits: { maxActionNotes: 4 } });
+      seedQueue(first, 8, 'restart');
+      const prepared = first.awareness.prepare()!;
+      deliveredPage = prepared.notificationIds ?? [];
+      expect(deliveredPage).toHaveLength(4);
+      first.awareness.commit(prepared);
+    }
+    const persisted = JSON.parse(readFileSync(join(dir, AWARENESS_STATE_NAME), 'utf-8')) as {
+      attention?: { machineOffset: number; ownerOffset: number };
+    };
+    expect(persisted.attention).toEqual({ machineOffset: 4, ownerOffset: 0 });
+    const resumed = boot({ dir, wakeMode: 'never', limits: { maxActionNotes: 4 } });
+    const block = resumed.awareness.prepare()!;
+    expect(block).not.toBeNull();
+    for (const id of deliveredPage) expect(block.notificationIds).not.toContain(id);
+    expect(block.notificationIds?.length).toBeGreaterThan(0);
+  });
+
+  it('a legacy state file without the attention section still boots and starts at the newest rows', () => {
+    const dir = tmpDir();
+    writeFileSync(
+      join(dir, AWARENESS_STATE_NAME),
+      `${JSON.stringify({ coveredThroughSeq: 3, wake: { version: 2, woken: [], lastFiredAt: null } }, null, 2)}\n`,
+      'utf-8',
+    );
+    const rig = boot({ dir, wakeMode: 'never', limits: { maxActionNotes: 4 } });
+    const ledgerOrder = seedQueue(rig, 6, 'legacy');
+    const prepared = rig.awareness.prepare()!;
+    expect(prepared.notificationIds).toHaveLength(4);
+    expect(prepared.notificationIds).toEqual(ledgerOrder.slice(0, 4));
+  });
+
+  it('a corrupt attention section fails loud — never silently resets', () => {
+    const dir = tmpDir();
+    writeFileSync(
+      join(dir, AWARENESS_STATE_NAME),
+      `${JSON.stringify({ coveredThroughSeq: 1, attention: { machineOffset: -1, ownerOffset: 0 } }, null, 2)}\n`,
+      'utf-8',
+    );
+    expect(() => boot({ dir, wakeMode: 'never' })).toThrow(/invalid attention section/);
+  });
+
+  it('covers both queues when both are deeper than their block slots', () => {
+    const rig = boot({ wakeMode: 'never', limits: { maxActionNotes: 4 } });
+    const ownerOrder = seedQueue(rig, 10, 'mix-own', 'needs-owner');
+    const machineOrder = seedQueue(rig, 10, 'mix-mach', 'action-required');
+    const all = [...ownerOrder, ...machineOrder];
+    const seen = new Set<string>();
+    for (let block = 0; block < 6 && seen.size < all.length; block += 1) {
+      const prepared = rig.awareness.prepare();
+      expect(prepared).not.toBeNull();
+      expect(prepared?.notificationIds?.length).toBeLessThanOrEqual(4);
+      for (const id of prepared?.notificationIds ?? []) seen.add(id);
+      rig.awareness.commit(prepared!);
+    }
+    expect([...seen].sort()).toEqual([...all].sort());
+  });
+
+  it('rotation still covers every open row when the byte cap fits fewer notes than the page', () => {
+    const rig = boot({ wakeMode: 'never', limits: { maxActionNotes: 4, maxBytes: 240, maxLineChars: 120 } });
+    const order = seedQueue(rig, 8, 'cap');
+    const seen = new Set<string>();
+    for (let block = 0; block < 20 && seen.size < order.length; block += 1) {
+      const prepared = rig.awareness.prepare();
+      expect(prepared).not.toBeNull();
+      for (const id of prepared?.notificationIds ?? []) seen.add(id);
+      rig.awareness.commit(prepared!);
+    }
+    expect([...seen].sort()).toEqual([...order].sort());
+  });
+
+  it('an undelivered passive block re-prepares unchanged and consumes no rotation', () => {
+    const rig = boot({ wakeMode: 'never', limits: { maxActionNotes: 4 } });
+    seedQueue(rig, 10, 'retry');
+    const first = rig.awareness.prepare();
+    expect(first).not.toBeNull();
+    const again = rig.awareness.prepare();
+    expect(again?.notificationIds).toEqual(first?.notificationIds);
+    expect(again?.text).toBe(first?.text);
+    // Nothing was delivered: no rotation was consumed or persisted.
+    expect(existsSync(join(rig.dir, AWARENESS_STATE_NAME))).toBe(false);
+    rig.awareness.commit(first!);
+    const persisted = JSON.parse(readFileSync(join(rig.dir, AWARENESS_STATE_NAME), 'utf-8')) as {
+      attention?: { machineOffset: number; ownerOffset: number };
+    };
+    expect(persisted.attention).toEqual({ machineOffset: 4, ownerOffset: 0 });
+  });
+
+  it('an exact-tail alignment restarts the cycle in the same turn instead of spending a null block', () => {
+    const rig = boot({ wakeMode: 'never', limits: { maxActionNotes: 4 } });
+    const order = seedQueue(rig, 8, 'exact');
+    const blocks: string[][] = [];
+    for (let block = 0; block < 3; block += 1) {
+      const prepared = rig.awareness.prepare();
+      // Never a null user turn while open rows exist.
+      expect(prepared).not.toBeNull();
+      blocks.push([...(prepared?.notificationIds ?? [])]);
+      rig.awareness.commit(prepared!);
+    }
+    expect(blocks[0]).toEqual(order.slice(0, 4));
+    expect(blocks[1]).toEqual(order.slice(4, 8));
+    expect(blocks[2]).toEqual(order.slice(0, 4));
   });
 });

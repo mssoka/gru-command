@@ -243,6 +243,24 @@ license:
   helper; otherwise leave it and say why. Capacity release needs no
   watcher — this digest row is the reconsideration.
 
+## Conflicting PRs (issue #215)
+
+A `conflictingPrs` digest row names a live PR-owing lane whose open PR
+head is dirty against its base (`mergeable_state: dirty`), with the head
+SHA and when the conflict was first seen. The rebase is mechanical work
+inside your mandate — it routes `fyi` and never wakes the chief:
+
+- Arm ONE rebase directive per conflicting head to the lane's minion via
+  `POST /api/silas/directive`
+  `{"job_id":"<job>","directive":"rebase <branch> onto its base ...","blocker_fingerprint":"pr-conflict:<head_sha>","request_id":"<stable-id>"}`.
+  The exact fingerprint is what retires this row when your rung lands; a
+  new dirty head re-arms it under a new fingerprint.
+- Never arm a rebase on a held lane: blocked or parked, an unresolved
+  re-brief, a live directive request, or an in-flight verification — the
+  digest already withholds those rows, so a missing row means hands off.
+- Escalate only after the rebase directive fails twice. A merged PR, a
+  closed PR, or a clean head retires the row on its own.
+
 ## Closing out
 
 Release a finished, merged, or abandoned lane with

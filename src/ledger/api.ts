@@ -97,6 +97,7 @@ import {
   type PipelineState,
 } from './pipeline.js';
 
+const VERIFICATION_KIND = 'verification.completed';
 export type { JobStatus, RoundStatus, RoundVerdict, LensState } from './states.js';
 export type { DirectiveRequestRecord, DirectiveState } from './directives.js';
 export type {
@@ -980,6 +981,24 @@ export class LedgerApi {
         .prepare('SELECT * FROM events WHERE job_id = ? ORDER BY seq DESC LIMIT ?')
         .all(jobId, limit) as Row[]
     ).map((row) => this.eventFromRow(row));
+  }
+
+  /** R8-2 (gh-169): a job's completed verification runs, KIND-SCOPED and
+   * newest-first — the binding-target search must not be truncated by a
+   * generic all-kind event window. The bound is a loud ceiling: a job with
+   * more completed verification runs than this window throws instead of
+   * letting absence masquerade as "no binding run". */
+  listJobVerificationCompleted(jobId: string, limit = 200): readonly EventRecord[] {
+    const rows = this.db
+      .prepare('SELECT COUNT(*) AS total FROM events WHERE job_id = ? AND kind = ?')
+      .all(jobId, VERIFICATION_KIND) as Row[];
+    const total = typeof rows[0]?.total === 'number' ? (rows[0] as { total: number }).total : 0;
+    if (total > limit) {
+      throw new Error(`verification history window exceeded for job ${jobId} (${total} completed runs > ${limit}) — cannot prove the newest target-bound run from a truncated search`);
+    }
+    return (this.db
+      .prepare('SELECT * FROM events WHERE job_id = ? AND kind = ? ORDER BY seq DESC LIMIT ?')
+      .all(jobId, VERIFICATION_KIND, limit) as Row[]).map((row) => this.eventFromRow(row));
   }
 
   /** True while any verification RUN for the job is unsettled: its latest
@@ -2001,6 +2020,42 @@ export class LedgerApi {
       this.db.prepare('UPDATE rounds SET target_ref = ?, updated_at = ? WHERE id = ?').run(ref, nowIso(), id);
       this.appendEvent({ kind: 'round.target', jobId: round.jobId, roundId: id, payload: { ref } });
       return this.getRound(id) as RoundRecord;
+    });
+  }
+
+  /** ATOMIC verdict + deferred-lens-chip finalization (gh-169 round-5
+   * P1): the verdict transition and the deferred not-used chip writes
+   * commit in ONE transaction — a failure partway leaves NOTHING
+   * committed (the round stays live, the chips stay pending, the abort
+   * path stays legal), and a posted verdict can never coexist with a
+   * mixed or pending deferred-chip set. */
+  finalizeRoundVerdictWithLensOutcomes(
+    id: string,
+    verdict: string,
+    outcomes: ReadonlyArray<{ readonly lens: string; readonly state: 'done' | 'error'; readonly note: string }>,
+  ): RoundRecord {
+    if (!isRoundVerdict(verdict)) throw new Error(`unknown round verdict "${verdict}"`);
+    return this.transaction(() => {
+      const round = this.getRound(id);
+      if (round === null) throw new RecordNotFound(`round "${id}" not found`);
+      for (const outcome of outcomes) {
+        const chip = round.lenses.find((entry) => entry.lens === outcome.lens);
+        if (chip === undefined) throw new RecordNotFound(`round "${id}" has no lens "${outcome.lens}"`);
+        if (chip.state === 'pending' || chip.state === 'live') {
+          assertLensTransition(chip.state, outcome.state);
+          this.db
+            .prepare('UPDATE lens_states SET state = ?, note = ?, updated_at = ? WHERE round_id = ? AND lens = ?')
+            .run(outcome.state, outcome.note, nowIso(), id, outcome.lens);
+          this.appendEvent({
+            kind: 'lens.status',
+            jobId: round.jobId,
+            roundId: id,
+            lens: outcome.lens,
+            payload: { from: chip.state, to: outcome.state, note: outcome.note },
+          });
+        }
+      }
+      return this.setRoundVerdict(id, verdict);
     });
   }
 

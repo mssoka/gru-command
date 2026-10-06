@@ -658,10 +658,23 @@ export class BoardEngine {
         pendingChildAgentIds.has(agent.id),
       );
     // Per-job newest agent activity and per-round lens attempt counts are
-    // derived once per snapshot from the same agent rows (ISO stamps
-    // compare lexicographically; lens children mint `lens:chunk` labels).
+    // derived once per snapshot. Attempt counts come from the ledger's
+    // `round.specialist-started` events — the budget authority — merged
+    // with the legacy agent-label derivation at the MAX (never a sum: one
+    // lens with two charged starts and one registered child shows two):
+    // a charged start whose spawn crashed still counts as a started
+    // attempt even though no agent row exists for it (gh-169 counter
+    // truth), and a pre-event legacy round keeps its label-derived count.
     const activityByJob = new Map<string, string>();
     const attemptsByRound = new Map<string, Map<string, number>>();
+    const agentAttemptsByRound = new Map<string, Map<string, number>>();
+    const countInto = (
+      target: Map<string, Map<string, number>>, roundId: string, lens: string,
+    ): void => {
+      const perLens = target.get(roundId) ?? new Map<string, number>();
+      perLens.set(lens, (perLens.get(lens) ?? 0) + 1);
+      target.set(roundId, perLens);
+    };
     for (const agent of agentRows) {
       // Issue #171: a verified-historical record's frozen stamp is not
       // current activity — it must never warm the lane's stall clock.
@@ -674,11 +687,23 @@ export class BoardEngine {
         if (newest === undefined || agent.lastActivity > newest) activityByJob.set(agent.jobId, agent.lastActivity);
       }
       const lens = lensFromAgentLabel(agent.label);
-      if (agent.roundId !== null && lens !== null) {
-        const perLens = attemptsByRound.get(agent.roundId) ?? new Map<string, number>();
-        perLens.set(lens, (perLens.get(lens) ?? 0) + 1);
-        attemptsByRound.set(agent.roundId, perLens);
+      if (agent.roundId !== null && lens !== null) countInto(agentAttemptsByRound, agent.roundId, lens);
+    }
+    for (const job of jobs) {
+      for (const round of this.ledger.listRounds(job.id)) {
+        for (const start of this.ledger.listRoundSpecialistStarts(round.id)) {
+          const lens = typeof start.payload === 'object' && start.payload !== null
+            ? (start.payload as { readonly lens?: unknown }).lens : null;
+          if (typeof lens === 'string' && lens !== '') countInto(attemptsByRound, round.id, lens);
+        }
       }
+    }
+    for (const [roundId, agentLenses] of agentAttemptsByRound) {
+      const ledgerLenses = attemptsByRound.get(roundId) ?? new Map<string, number>();
+      for (const [lens, agentCount] of agentLenses) {
+        ledgerLenses.set(lens, Math.max(ledgerLenses.get(lens) ?? 0, agentCount));
+      }
+      attemptsByRound.set(roundId, ledgerLenses);
     }
     // Closed-receipt rule (owner decisions D1/D3): a machine row bound
     // through an agent to a merged/done job is a receipt, not live work.
