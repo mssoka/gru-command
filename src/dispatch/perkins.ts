@@ -4446,17 +4446,20 @@ export class WaveRunner {
               })),
           },
         });
-        // The product's GitHub App requests only pull_requests+metadata, so
-        // no issue is created automatically; the guaranteed handoff is the
-        // operator escalation beside the durable artifact, ledger event and
-        // PR appendix — never a silent drop.
+        // Follow-ups are review-scoped records, deliberately not tracker
+        // issues: the review surface holds no tracker scopes, creating
+        // issues would duplicate the record below and grow the backlog,
+        // and triage/ownership of tracker work is not the reviewer's call.
+        // The guaranteed handoff is the operator escalation beside the
+        // durable artifact, ledger event and PR appendix — never a silent
+        // drop.
         const followupTitles = review.findings
           .filter((finding) => finding.deferredFollowup === true)
           .map((finding) => `${finding.severity}: ${finding.title} (${finding.location})`);
         this.opts.escalate?.(
           `Perkins review for job ${job.id} deferred ${followupTitles.length} follow-up finding(s)`,
-          `Filed as follow-ups by the Stage-5 convergence rule (outside this round's delta hunks; they cannot hold the PR): ${followupTitles.join('; ')}. ` +
-          `Full records: ${join(review.artifactDirectory, 'followups-deferred.json')} and the round.followups-deferred ledger event. The review App has no issues permission, so no issue was created automatically.`,
+          `Deferred by the Stage-5 convergence rule (outside this round's delta hunks; they cannot hold the PR): ${followupTitles.join('; ')}. ` +
+          `Filed as review follow-ups with full records in ${join(review.artifactDirectory, 'followups-deferred.json')}, the round.followups-deferred ledger event, the round's consolidated record and the PR review appendix — never dropped, and never another review round.`,
           { jobId: job.id, roundId: round.id },
         );
       }
