@@ -17,7 +17,7 @@ import {
 import { loadPerkinsPolicy } from '../src/dispatch/perkins-review/policy.js';
 import { PerkinsWholeReview, type PerkinsWholeResult } from '../src/dispatch/perkins-review/whole.js';
 import type { VerifiedFinding } from '../src/dispatch/perkins-review/types.js';
-import { fakeWholeSpawner, groundedFinding, type WholeLeadOptions, type WholeSpawnCall } from './helpers/perkins-whole-double.js';
+import { fakeWholeSpawner, groundedFinding, type WholeLeadOptions } from './helpers/perkins-whole-double.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 
 const repos: FixtureRepo[] = [];
@@ -427,7 +427,7 @@ describe('Stage-5 convergence over whole rounds', () => {
     });
     harness.repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
     const frozen1 = freeze(harness, { roundId: 'rv-round-1', spec: 'return 43' });
-    const round1 = await runRound(harness, { roundId: 'rv-round-1', roundNumber: 1, frozen: frozen1, reviewScope: 'whole' });
+    await runRound(harness, { roundId: 'rv-round-1', roundNumber: 1, frozen: frozen1, reviewScope: 'whole' });
     const consolidated1 = join(reviewArtifactDirectory(harness.root, 'rv-round-1'), 'consolidated.json');
 
     // The delta touches the CITED file: the prior must be re-verified.
@@ -468,7 +468,7 @@ describe('Stage-5 convergence over whole rounds', () => {
     });
     harness.repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
     const frozen1 = freeze(harness, { roundId: 'df-round-1', spec: 'return 43' });
-    const round1 = await runRound(harness, { roundId: 'df-round-1', roundNumber: 1, frozen: frozen1, reviewScope: 'whole' });
+    await runRound(harness, { roundId: 'df-round-1', roundNumber: 1, frozen: frozen1, reviewScope: 'whole' });
     const consolidated1 = join(reviewArtifactDirectory(harness.root, 'df-round-1'), 'consolidated.json');
 
     harness.repo.commitFile('src/other.ts', 'export const other = 2;\n');
@@ -520,7 +520,7 @@ describe('Stage-5 convergence over whole rounds', () => {
     });
     harness.repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
     const frozen1 = freeze(harness, { roundId: 'in-round-1', spec: 'return 43' });
-    const round1 = await runRound(harness, { roundId: 'in-round-1', roundNumber: 1, frozen: frozen1, reviewScope: 'whole' });
+    await runRound(harness, { roundId: 'in-round-1', roundNumber: 1, frozen: frozen1, reviewScope: 'whole' });
     const consolidated1 = join(reviewArtifactDirectory(harness.root, 'in-round-1'), 'consolidated.json');
 
     harness.repo.commitFile('src/other.ts', 'export const other = 2;\nexport const more = 3;\n');
@@ -559,7 +559,7 @@ describe('Stage-5 convergence over whole rounds', () => {
     });
     harness.repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
     const frozen1 = freeze(harness, { roundId: 'fp-round-1', spec: 'return 43' });
-    const round1 = await runRound(harness, { roundId: 'fp-round-1', roundNumber: 1, frozen: frozen1, reviewScope: 'whole' });
+    await runRound(harness, { roundId: 'fp-round-1', roundNumber: 1, frozen: frozen1, reviewScope: 'whole' });
     const consolidated1 = join(reviewArtifactDirectory(harness.root, 'fp-round-1'), 'consolidated.json');
 
     harness.repo.commitFile('src/other.ts', 'export const other = 2;\n');
@@ -603,7 +603,7 @@ describe('Stage-5 convergence over whole rounds', () => {
     });
     harness.repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
     const frozen1 = freeze(harness, { roundId: 'cj-round-1', spec: 'return 43' });
-    const round1 = await runRound(harness, { roundId: 'cj-round-1', roundNumber: 1, frozen: frozen1, reviewScope: 'whole' });
+    await runRound(harness, { roundId: 'cj-round-1', roundNumber: 1, frozen: frozen1, reviewScope: 'whole' });
     const consolidated1 = join(reviewArtifactDirectory(harness.root, 'cj-round-1'), 'consolidated.json');
 
     harness.repo.commitFile('src/other.ts', 'export const other = 2;\n');
