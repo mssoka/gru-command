@@ -72,10 +72,18 @@ export interface DecisionRuntimeOptions {
 }
 
 const PROBE_QUESTIONS = {
+  // Liveness itself is proven by a schema-valid typed answer. This noul must
+  // be answerable FROM THE STATE: the original wording ("did the provider
+  // receive and answer this?") asked the model about its own act, which no
+  // state can evidence — live Jev 1.13 answered 0.35–0.37 every time, below
+  // the 0.5 bar, so a healthy provider could never pass the probe.
   provider_alive: {
     type: 'noul',
-    instructions: 'Did the decision provider receive and answer this synthetic health check?',
-    criteria: { true: 'The provider returned this answer.', false: 'The provider did not return a valid answer.' },
+    instructions: 'Does the state identify this request as a synthetic health check confirming that the decision provider is reachable?',
+    criteria: {
+      true: 'The state says this is a synthetic health check confirming the decision provider is reachable.',
+      false: 'The state describes anything else.',
+    },
   },
   probe_class: {
     type: 'choice',
@@ -89,7 +97,7 @@ const PROBE_QUESTIONS = {
 } as const;
 
 const PROBE_REQUEST: DecisionRequest<typeof PROBE_QUESTIONS> = {
-  state: 'Synthetic Gru Command Jev startup health check; no user or project data is included.',
+  state: 'Synthetic Gru Command Jev startup health check confirming the decision provider is reachable; no user or project data is included.',
   questions: PROBE_QUESTIONS,
   risks: { provider_alive: 'read_only', probe_class: 'read_only' },
   fallback: {

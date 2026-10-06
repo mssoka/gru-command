@@ -225,6 +225,88 @@ surface. Service management, supervision behavior, the emergency
 console, forensics and backups:
 [docs/OPERATIONS.md](docs/OPERATIONS.md).
 
+## Optional: Jev decisions (OpenRouter key)
+
+Gru Command runs fully without this. **Jev** is TypeSafe's System One decision model, served through OpenRouter. It is an optional, very cheap decision aid for a few bounded judgments, for example:
+
+- triaging an alert;
+- recognising the same review blocker across rounds;
+- classifying an escalation.
+
+It is **off by default**. While it is off, deterministic code makes every decision.
+
+**What to expect**
+
+- **Shadow mode first.** You start in shadow mode: Jev is asked and its answers are recorded in the ledger (`decisions.shadow`), but Gru Command keeps using the deterministic answer. Behaviour cannot change.
+- **The cost is tiny.** Jev costs about $0.04 per million input tokens, and a decision is a few hundred tokens (about $0.00002). Use a **dedicated OpenRouter key with a low credit limit**.
+- **Enforcement is gated.** Moving a surface from shadow to `enforce` requires a recorded backtest that meets its threshold, and your explicit decision. See the [Jev guide](docs/jev-production-integration.md).
+- **Authority stays with you.** Jev never decides merges, review verdicts, restarts or owner-only rulings. If OpenRouter is unreachable, Gru Command falls back to deterministic behaviour.
+
+**1. Store the key.** Use stdin only: never pass the key on the command line or put it in `config.toml`.
+
+Create a key at openrouter.ai → **Keys**. Copy **only the key**: it starts with `sk-or-v1-` and is 73 characters long, with no `OPENROUTER_API_KEY=` prefix and no quotes. Then, from the install directory:
+
+```bash
+# macOS: from the clipboard
+pbpaste | cut -c1-9           # sanity check: must print sk-or-v1-
+pbpaste | node dist/decisions/cli.js credentials set --stdin
+pbcopy < /dev/null            # clear the clipboard
+
+# Linux: hidden prompt
+read -rs KEY && printf '%s\n' "$KEY" | node dist/decisions/cli.js credentials set --stdin; unset KEY
+```
+
+This writes `~/.gru-command/credentials/openrouter.key` (or under `$GRU_COMMAND_HOME`). The folder is `0700` and the file `0600`.
+
+- **Don't create the folder yourself.** A folder with looser permissions is refused as unsafe.
+- **Don't edit the file.** If an editor adds a final newline, that is tolerated; a second line is not.
+- **Environment variable alternative.** An `OPENROUTER_API_KEY` variable in the service environment also works and takes precedence. The file is the recommended store.
+
+**2. Enable Jev in shadow mode.** Add this to `~/.gru-command/config.toml`. The service hot-reloads this section, so no restart is needed. Keep every surface listed explicitly: a surface that isn't listed would act on Jev's answer instead of only recording it.
+
+```toml
+[decisions.jev]
+enabled = true
+model = "~typesafe/jev-latest"
+endpoint = "https://openrouter.ai/api/alpha/decisions"
+timeout_ms = 2000
+
+[decisions.surfaces.event_triage]
+provider = "openrouter-jev"
+mode = "shadow"
+
+[decisions.surfaces.supervision_guidance]
+provider = "openrouter-jev"
+mode = "shadow"
+
+[decisions.surfaces.escalation_triage]
+provider = "openrouter-jev"
+mode = "shadow"
+
+[decisions.surfaces.same_blocker]
+provider = "openrouter-jev"
+mode = "shadow"
+```
+
+**3. Verify.** No key material is printed.
+
+```bash
+node dist/decisions/cli.js status --json   # credential_present: true, credential_source: "file"
+node dist/decisions/cli.js check --json    # one tiny live probe; expect "status":"ready"
+```
+
+`check` only probes while `enabled = true`; while Jev is off it reports `disabled`. If it isn't `ready`, set `enabled = false` until it is. Otherwise a running service reports the provider as degraded and raises an alert.
+
+| `check` reason | What it means / fix |
+|---|---|
+| `credential_missing` | No key stored. Do step 1. |
+| `auth_rejected` | OpenRouter refused the key. You copied something other than the bare `sk-or-v1-…` key, or the key is revoked. Repeat step 1. |
+| `credential_invalid` | The file holds more than one line. Repeat step 1 instead of editing the file. |
+| `credential_unsafe` | Folder or file permissions are too open, or the file is a symlink. Remove `~/.gru-command/credentials` and repeat step 1. |
+| `probe_failed` / `malformed_response` | OpenRouter answered, but not as expected. Check the `model` and `endpoint` values above. |
+
+Full reference (provider profiles including TypeSafe direct and a local `/v1/systemone` model, backtests, enforcement): [docs/jev-production-integration.md](docs/jev-production-integration.md).
+
 ## Documentation
 
 | Doc | What it covers |
@@ -238,6 +320,7 @@ console, forensics and backups:
 | [FLOW.md](docs/FLOW.md) | the dispatch flow: briefing → lanes → review waves |
 | [WORKTREES.md](docs/WORKTREES.md) | the worktree manager (preserve-first sweeps) |
 | [RUNTIMES.md](docs/RUNTIMES.md) | runtime adapters, capabilities, session store |
+| [jev-production-integration.md](docs/jev-production-integration.md) | optional Jev decision provider: OpenRouter key, shadow mode, backtests, troubleshooting |
 | [SUPERVISION.md](docs/SUPERVISION.md) | supervision, notifications, OS service install |
 | [ROLES.md](docs/ROLES.md) | the five product-native roles |
 | [UI.md](docs/UI.md) | the web front-end + design system |

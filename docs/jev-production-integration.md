@@ -258,7 +258,9 @@ The credential directory is owner-only (`0700`) and the key file is
 owner-only (`0600`). The key file contains protected **plaintext**, not
 encrypted storage; protection relies on filesystem ownership and these
 permissions. Writes are atomic. Symlinks, loose permissions, empty values,
-and multiline values are rejected. The key is removed from the service's
+and multiline values are rejected; a single final newline (as an editor adds
+on save) is tolerated. Let `credentials set` create the directory — a
+pre-created directory with looser permissions is refused as unsafe. The key is removed from the service's
 ambient process environment at boot (children never inherit it), never
 accepted on argv, and never written to TOML, JSON status, logs,
 notifications, or child-process environments.

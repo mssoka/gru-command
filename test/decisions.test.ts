@@ -553,6 +553,20 @@ describe('portable credential resolver', () => {
     expect(resolveCredential(home, { OPENROUTER_API_KEY: 'env-key' })).toMatchObject({ state: 'present', source: 'environment', key: 'env-key' });
   });
 
+  it('accepts a key file saved by an editor with one final newline, still rejecting a second line', () => {
+    const home = temp('gru-decisions-eol-');
+    writeCredential(home, 'file-key');
+    const file = join(home, 'credentials', 'openrouter.key');
+    writeFileSync(file, 'file-key\n', { mode: 0o600 });
+    expect(resolveCredential(home, {})).toMatchObject({ state: 'present', source: 'file', key: 'file-key' });
+    writeFileSync(file, 'file-key\r\n', { mode: 0o600 });
+    expect(resolveCredential(home, {})).toMatchObject({ state: 'present', source: 'file', key: 'file-key' });
+    writeFileSync(file, 'file-key\nsecond\n', { mode: 0o600 });
+    expect(resolveCredential(home, {}).state).toBe('invalid');
+    writeFileSync(file, 'file-key\n\n', { mode: 0o600 });
+    expect(resolveCredential(home, {}).state).toBe('invalid');
+  });
+
   it('rejects symlinks, loose modes, empty values and does not repair unsafe stores', () => {
     const home = temp('gru-decisions-unsafe-');
     const dir = join(home, 'credentials');
@@ -847,6 +861,36 @@ describe('runtime startup, degradation and generation safety', () => {
     });
     expect(await runtime.start()).toMatchObject({ status: 'degraded', reason: 'probe_failed' });
     runtime.dispose();
+  });
+
+  it('asks a startup liveness noul that its own probe state can answer', async () => {
+    // Live Jev 1.13 answered the original self-referential question ("did the
+    // provider receive and answer this?") at 0.35-0.37 every time, never the
+    // 0.5 bar: no state can evidence it. The noul's TRUE criterion must be
+    // stated by the probe state itself, or a healthy provider can never pass.
+    const captured: { body?: string } = {};
+    const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      captured.body ??= String(init?.body);
+      return new Response(JSON.stringify(answerEnvelope(String(init?.body))), { status: 200 });
+    });
+    const runtime = new DecisionRuntime(cloneConfig(true), {
+      instanceDir: temp('gru-decisions-probe-state-'),
+      env: { OPENROUTER_API_KEY: 'test-key' },
+      fetchImpl: fetchImpl as typeof fetch,
+      watchConfig: false,
+    });
+    await runtime.start();
+    runtime.dispose();
+    const probe = JSON.parse(captured.body ?? 'null') as {
+      readonly state: string;
+      readonly questions: Readonly<Record<string, { readonly criteria?: { readonly true?: string } }>>;
+    } | null;
+    expect(probe).not.toBeNull();
+    const state = probe?.state.toLowerCase() ?? '';
+    expect(state).toContain('synthetic');
+    expect(state).toContain('health check');
+    expect(state).toContain('decision provider is reachable');
+    expect(probe?.questions['provider_alive']?.criteria?.true?.toLowerCase()).toContain('decision provider is reachable');
   });
 
   it('health probing ignores operator confirmation preferences while still validating semantic answers', async () => {
