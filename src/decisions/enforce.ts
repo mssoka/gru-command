@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { BACKTEST_SURFACES } from './cases/registry.js';
 import type { SurfaceMode } from './types.js';
 
 /**
@@ -11,7 +12,7 @@ import type { SurfaceMode } from './types.js';
  * downgrade that an operator would read as a healthy enforce.
  */
 
-export const BACKTEST_RECORD_SCHEMA_VERSION = 1;
+export const BACKTEST_RECORD_SCHEMA_VERSION = 2;
 
 /** The threshold statement inside a backtest record: metric + optional
  * per-class label + the minimum acceptable value. */
@@ -29,6 +30,8 @@ export interface BacktestRecord {
   readonly surface: string;
   readonly provider: string;
   readonly model: string | null;
+  /** The model requested by the configured profile when evidence was earned. */
+  readonly configuredModel: string;
   readonly n: number;
   /** Share of cases where the provider's would-be action matched the
    * deterministic baseline's action. */
@@ -92,6 +95,7 @@ function parseRecord(raw: string, path: string, surface: string): BacktestRecord
     r.schemaVersion !== BACKTEST_RECORD_SCHEMA_VERSION ||
     typeof r.surface !== 'string' || r.surface !== surface ||
     typeof r.provider !== 'string' || r.provider.trim() === '' ||
+    typeof r.configuredModel !== 'string' || r.configuredModel.trim() === '' ||
     typeof r.n !== 'number' || !Number.isSafeInteger(r.n) || r.n < 1 ||
     typeof r.agreement !== 'number' || !(r.agreement >= 0 && r.agreement <= 1) ||
     typeof r.precision !== 'object' || r.precision === null ||
@@ -123,7 +127,11 @@ export function assertEnforceGate(input: {
   readonly dataDir: string;
   readonly surface: string;
   readonly provider: string;
+  readonly model: string;
 }): BacktestRecord {
+  if (!BACKTEST_SURFACES.includes(input.surface)) {
+    throw new EnforceGateError(input.surface, `enforce gate: surface "${input.surface}" has no registered backtest; use mode = "off" or "shadow" until labelled cases and a backtest are available`);
+  }
   const path = backtestRecordPath(input.dataDir, input.surface);
   let raw: string;
   try {
@@ -142,6 +150,12 @@ export function assertEnforceGate(input: {
     throw new EnforceGateError(
       input.surface,
       `enforce gate: surface "${input.surface}" is routed to profile "${input.provider}" but the recorded backtest at ${path} was earned on "${record.provider}". Evidence for one profile never licenses another; rerun the backtest on "${input.provider}".`,
+    );
+  }
+  if (record.configuredModel !== input.model) {
+    throw new EnforceGateError(
+      input.surface,
+      `enforce gate: surface "${input.surface}" is configured for model "${input.model}" but evidence at ${path} was earned on "${record.configuredModel}"; rerun the backtest`,
     );
   }
   if (!backtestMeetsThreshold(record)) {

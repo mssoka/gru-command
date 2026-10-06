@@ -123,6 +123,7 @@ export async function startRealService({
   workspace: existingWorkspace,
   model = 'anthropic/claude-sonnet-4-5',
   decisionsEnabled = false,
+  decisionSurfaceMode,
   decisionKey,
   nodeImport,
   notifyWake,
@@ -169,6 +170,9 @@ export async function startRealService({
       // exercise the conservative decline through the real service.
       `default = "${model}"`,
       ...(decisionsEnabled ? ['[decisions.jev]', 'enabled = true'] : []),
+      ...(decisionSurfaceMode !== undefined
+        ? ['[decisions.surfaces.event_triage]', `mode = ${JSON.stringify(decisionSurfaceMode)}`]
+        : []),
       // Wake-on-alert tests need the policy ON (the default in production,
       // explicit here so the hermetic config pins the behavior).
       ...(notifyWake !== undefined

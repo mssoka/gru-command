@@ -37,7 +37,9 @@ export interface SurfaceCaseSpec<Q extends QuestionSet = QuestionSet> {
   /** The label whose correct handling is "take the action" — the class
    * precision/recall are headline-reported on. */
   readonly actionableLabel: string;
-  /** Which band(s) of the provider answer count as acting, per label. */
+  /** Map the answer actually served (provider or per-question fallback) to
+   * the operational action; route bands alone cannot identify that action. */
+  answerAction(answers: AnswersFor<Q>): CaseAction;
   readonly labelAction: (label: string) => CaseAction;
   /** The question whose routed metric feeds calibration buckets. */
   readonly calibrationQuestion: keyof Q & string;

@@ -38,6 +38,7 @@ interface NotificationRow {
 interface EventRow {
   readonly seq: number;
   readonly kind: string;
+  readonly jobId: string | null;
   readonly payload: unknown;
 }
 
@@ -64,13 +65,14 @@ export function parseWakeRow(row: EventRow): WakeRow | null {
 export function extractEscalationTriageCases(db: InstanceType<typeof DatabaseSync>): LabelledCase[] {
   const events = (
     db.prepare(
-      `SELECT seq, kind, payload FROM events
-       WHERE kind IN ('gru.wake', 'notification.resolved', ${SILAS_YIELD_ACTION_KINDS.map((kind) => `'${kind}'`).join(', ')})
+      `SELECT seq, kind, job_id, payload FROM events
+       WHERE kind IN ('gru.wake', 'notification.resolved', 'job.created', ${SILAS_YIELD_ACTION_KINDS.map((kind) => `'${kind}'`).join(', ')})
        ORDER BY seq`,
     ).all() as Record<string, unknown>[]
   ).map((row) => ({
     seq: Number(row['seq']),
     kind: String(row['kind']),
+    jobId: typeof row['job_id'] === 'string' ? row['job_id'] : null,
     payload: safeParse(row['payload']),
   }));
   const notifications = new Map<string, NotificationRow>(
@@ -101,6 +103,12 @@ export function extractEscalationTriageCases(db: InstanceType<typeof DatabaseSyn
     const windowEnd = index + 1 < wakes.length ? wakes[index + 1]!.seq : Number.MAX_SAFE_INTEGER;
     const window = events.filter((event) => event.seq > wake.seq && event.seq < windowEnd);
     const ids = new Set(wake.notificationIds);
+    const escalations = wake.notificationIds
+      .map((id) => notifications.get(id))
+      .filter((row): row is NotificationRow => row !== undefined)
+      .filter((row) => row.kind.startsWith('silas.escalated') || row.kind.includes('escalat'));
+    if (escalations.length === 0) continue;
+    const jobs = new Set(escalations.map((row) => row.kind.match(/^silas\.escalated:(.+)$/u)?.[1]).filter((id): id is string => id !== undefined));
 
     let deferEvidence = false;
     let rulingEvidence = false;
@@ -113,19 +121,18 @@ export function extractEscalationTriageCases(db: InstanceType<typeof DatabaseSyn
         if (escalationLabelFromResolvedDetail(detail) === 'defer_ok') deferEvidence = true;
         continue;
       }
-      // Any other kind in the window is a Silas yield action: the machine
-      // acted on the escalation rather than deferring it.
-      rulingEvidence = true;
+      // Only an action tied to the wake is an outcome; unrelated ops work
+      // in the same interval cannot label this escalation.
+      const payload = payloadRecord(event.payload);
+      const notificationIds = payload['notification_ids'];
+      if (
+        (typeof payload['notification_id'] === 'string' && ids.has(payload['notification_id'])) ||
+        (Array.isArray(notificationIds) && notificationIds.some((id) => typeof id === 'string' && ids.has(id))) ||
+        (event.jobId !== null && jobs.has(event.jobId)) ||
+        (typeof payload['job_id'] === 'string' && jobs.has(payload['job_id']))
+      ) rulingEvidence = true;
     }
     if (deferEvidence === rulingEvidence) continue; // absent or contradictory evidence is never guessed
-
-    const escalations = wake.notificationIds
-      .map((id) => notifications.get(id))
-      .filter((row): row is NotificationRow => row !== undefined)
-      .filter((row) => row.kind.startsWith('silas.escalated') || row.kind.includes('escalat'));
-    // #224 scope: Silas-authored escalations. A wake carrying none is
-    // owner chatter, not triage material.
-    if (escalations.length === 0) continue;
 
     cases.push({
       id: `escalation-wake-${wake.seq}`,

@@ -61,7 +61,8 @@ describe('escalation-triage case extractor (issue #223)', () => {
       insertEvent.run('2026-10-01T02:00:00.000Z', 'gru.wake', JSON.stringify({ notification_ids: ['n1'], count: 1, mode: 'action-required' }));
       insertEvent.run('2026-10-01T02:05:00.000Z', 'notification.resolved', JSON.stringify({ id: 'n1', by: 'gru', detail: 'duplicate of a covered item — nothing actionable' }));
       insertEvent.run('2026-10-01T03:00:00.000Z', 'gru.wake', JSON.stringify({ notification_ids: ['n2'], count: 1, mode: 'action-required' }));
-      insertEvent.run('2026-10-01T03:10:00.000Z', 'silas.directive-sent', JSON.stringify({ request_id: 'r1' }));
+      db.handle.prepare('INSERT INTO events (ts, kind, agent_id, job_id, round_id, lens, payload) VALUES (?, ?, NULL, ?, NULL, NULL, ?)')
+        .run('2026-10-01T03:10:00.000Z', 'silas.directive-sent', 'job-2', JSON.stringify({ request_id: 'r1' }));
       insertEvent.run('2026-10-01T04:00:00.000Z', 'gru.wake', JSON.stringify({ notification_ids: ['n3'], count: 1, mode: 'action-required' }));
       const insertNotification = db.handle.prepare(
         'INSERT INTO notifications (id, ts, kind, routing, severity, title, detail) VALUES (?, ?, ?, ?, ?, ?, ?)',
@@ -80,6 +81,23 @@ describe('escalation-triage case extractor (issue #223)', () => {
     } finally {
       db.close();
     }
+  });
+
+  it('requires a linked dispatch and ignores unrelated Silas actions in the same wake window', () => {
+    const dir = temp('gru-backtest-attribution-');
+    const db = new LedgerDb(dir);
+    try {
+      const add = db.handle.prepare('INSERT INTO events (ts, kind, agent_id, job_id, round_id, lens, payload) VALUES (?, ?, NULL, ?, NULL, NULL, ?)');
+      add.run('2026-10-01T00:00:00Z', 'gru.wake', null, JSON.stringify({ notification_ids: ['n1'] }));
+      add.run('2026-10-01T00:01:00Z', 'silas.directive-sent', 'unrelated', '{}');
+      add.run('2026-10-01T00:02:00Z', 'notification.resolved', null, JSON.stringify({ id: 'n1', detail: 'duplicate' }));
+      add.run('2026-10-01T01:00:00Z', 'gru.wake', null, JSON.stringify({ notification_ids: ['n2'] }));
+      add.run('2026-10-01T01:01:00Z', 'job.created', 'job-2', '{}');
+      const notification = db.handle.prepare('INSERT INTO notifications (id, ts, kind, routing, severity, title, detail) VALUES (?, ?, ?, ?, ?, ?, ?)');
+      notification.run('n1', '2026-10-01T00:00:00Z', 'silas.escalated:job-1', 'action', 'error', 'duplicate', 'already covered');
+      notification.run('n2', '2026-10-01T01:00:00Z', 'silas.escalated:job-2', 'action', 'error', 'dispatch', 'needs work');
+      expect(extractEscalationTriageCases(db.handle as never).map((c) => c.label)).toEqual(['defer_ok', 'needs_ruling']);
+    } finally { db.close(); }
   });
 });
 
@@ -112,7 +130,7 @@ function writeConsolidated(root: string, roundId: string, verdict: string, findi
     headMoved: false,
     findings,
     priorDispositions: [],
-    frozen: { targetSha },
+    frozen: { targetSha, createdAt: roundId === 'round-b' ? '2026-10-02T00:00:00Z' : '2026-10-01T00:00:00Z' },
     specialistRuns: [],
   }, null, 2)}\n`);
 }
@@ -136,6 +154,25 @@ describe('same-blocker case extractor (issue #223)', () => {
     expect((JSON.parse(same.state) as { prior_finding: { title: string } }).prior_finding.title).toBe('Null deref on empty list');
   });
 
+  it('keeps carried-only rounds and same-file negatives at different line locations', () => {
+    const root = temp('gru-backtest-blocker-carried-');
+    writeConsolidated(root, 'round-a', 'NEEDS CHANGES', [finding({ location: 'src/a.ts:10' })], 'sha-a');
+    writeConsolidated(root, 'round-b', 'NEEDS CHANGES', [
+      finding({ location: 'src/a.ts:10' }),
+      finding({ title: 'Another crash', location: 'src/a.ts:20', roundOrigin: 2 }),
+    ], 'sha-a');
+    expect(extractSameBlockerCases(root).map((c) => c.label).sort()).toEqual(['different', 'same']);
+    const carried = extractSameBlockerCases(root).find((c) => c.label === 'same')!;
+    expect(carried.state).not.toContain('round_origin');
+  });
+
+  it('pairs a carried-only later round even though every finding has the old origin', () => {
+    const root = temp('gru-backtest-blocker-carry-only-');
+    writeConsolidated(root, 'round-a', 'NEEDS CHANGES', [finding({ roundOrigin: 1 })], 'sha-a');
+    writeConsolidated(root, 'round-b', 'NEEDS CHANGES', [finding({ roundOrigin: 1 })], 'sha-a');
+    expect(extractSameBlockerCases(root).map((c) => c.label)).toEqual(['same']);
+  });
+
   it('ignores rounds of different targets, invalid files, and single-round groups', () => {
     const root = temp('gru-backtest-blocker-none-');
     writeConsolidated(root, 'round-x', 'NEEDS CHANGES', [finding()], 'sha-x');
@@ -147,19 +184,23 @@ describe('same-blocker case extractor (issue #223)', () => {
 });
 
 describe('report-conclusion case extractor (issue #223)', () => {
-  it('labels from the report verdict line and skips unknown verdicts and old schemas', () => {
+  it('uses delivered report handbacks, excludes the verdict from state, and ignores review rounds', () => {
     const root = temp('gru-backtest-report-');
-    writeConsolidated(root, 'r-pass', 'READY TO MERGE', [], 'sha-p');
-    writeConsolidated(root, 'r-changes', 'NEEDS CHANGES', [finding({ severity: 'blocker' })], 'sha-p');
-    writeConsolidated(root, 'r-incomplete', 'INCOMPLETE', [], 'sha-p');
-    mkdirSync(join(root, 'r-old'), { recursive: true });
-    writeFileSync(join(root, 'r-old', 'consolidated.json'), `${JSON.stringify({ schemaVersion: 2, canonicalVerdict: 'READY TO MERGE', findings: [] })}\n`);
+    for (const [id, verdict] of [['r-pass', 'READY TO MERGE'], ['r-changes', 'NEEDS CHANGES'], ['r-incomplete', 'INCOMPLETE']] as const) {
+      mkdirSync(join(root, id), { recursive: true });
+      writeFileSync(join(root, id, 'handback.json'), JSON.stringify({
+        schemaVersion: 1, jobId: id, deliverable: 'review',
+        report: `Found concrete evidence in the submitted work.\n**Verdict: ${verdict}**`,
+      }));
+    }
+    writeConsolidated(root, 'perkins-round', 'READY TO MERGE', [], 'sha-p');
     const cases = extractReportConclusionCases(root);
     expect(cases.map((c) => [c.id, c.label])).toEqual([
       ['reportconclusion-r-changes', 'findings_need_action'],
       ['reportconclusion-r-incomplete', 'inconclusive'],
       ['reportconclusion-r-pass', 'clean_pass'],
     ]);
+    expect(cases.every((c) => !c.state.includes('Verdict') && !c.state.includes('READY TO MERGE'))).toBe(true);
   });
 });
 
@@ -178,7 +219,7 @@ function escalationFetch(): typeof fetch {
       model: 'laya-421m-test',
       answers: {
         triage: defer
-          ? { type: 'choice', choice: 'status_report', probabilities: { needs_ruling: 0, needs_owner: 0, status_report: 1, covered_by_open_item: 0 }, confidence: 0.3 }
+          ? { type: 'choice', choice: 'status_report', probabilities: { needs_ruling: 0, needs_owner: 0, status_report: 1, covered_by_open_item: 0 }, confidence: 0.94 }
           : { type: 'choice', choice: 'needs_ruling', probabilities: { needs_ruling: 1, needs_owner: 0, status_report: 0, covered_by_open_item: 0 }, confidence: 0.94 },
         needs_decision: defer ? { type: 'noul', noul: 0.1 } : { type: 'noul', noul: 0.97 },
       },
@@ -218,8 +259,7 @@ describe('backtest engine (issue #223)', () => {
     expect(live.precision.defer).toBe(1);
     expect(live.recall.defer).toBe(1);
     expect(live.calibration.reduce((total, bucket) => total + bucket.n, 0)).toBe(3);
-    expect(live.calibration.find((bucket) => bucket.lo === 0.8)!.n).toBe(1);
-    expect(live.calibration.find((bucket) => bucket.lo === 0.2)!.n).toBe(2);
+    expect(live.calibration.find((bucket) => bucket.lo === 0.8)!.n).toBe(3);
     expect(live.costUsd).toBeCloseTo(0.0003);
     expect(live.latencyMs.p50).toBeGreaterThanOrEqual(0);
     expect(live.latencyMs.p95).toBeGreaterThanOrEqual(live.latencyMs.p50);
@@ -240,6 +280,49 @@ describe('backtest engine (issue #223)', () => {
     expect(replay.agreement).toBe(live.agreement);
     expect(replay.actions).toEqual(live.actions);
     expect(replay.costUsd).toBeCloseTo(live.costUsd);
+  });
+
+  it('rejects a live provider fallback before it can become enforce evidence', async () => {
+    await expect(runBacktest({
+      surface: 'escalation_triage', profileName: 'local', cases: ESCALATION_CASES,
+      config: decisionsConfig(), instanceDir: temp('i'), env: {},
+      fetchImpl: (async () => { throw new Error('offline'); }) as typeof fetch,
+    })).rejects.toThrow(/live backtest provider fell back/u);
+  });
+
+  it('scores chosen answers and deterministic fallback actions rather than route bands', async () => {
+    const fetchImpl = (async (_url: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as { questions: Record<string, unknown> };
+      const same = Object.hasOwn(body.questions, 'same_defect');
+      const answers = same
+        ? { same_defect: { type: 'noul', noul: 0.96 } }
+        : { conclusion: { type: 'choice', choice: 'clean_pass', probabilities: { clean_pass: 1, findings_need_action: 0, inconclusive: 0 }, confidence: 0.95 } };
+      return new Response(JSON.stringify({ model: 'laya-421m', answers }), { status: 200 });
+    }) as typeof fetch;
+    const same = await runBacktest({ surface: 'same_blocker', profileName: 'local',
+      cases: [{ id: 'same', state: '{}', label: 'same' }], config: decisionsConfig(),
+      instanceDir: temp('same-i'), env: {}, fetchImpl });
+    const report = await runBacktest({ surface: 'report_conclusion', profileName: 'local',
+      cases: [{ id: 'pass', state: '{}', label: 'clean_pass' }], config: decisionsConfig(),
+      instanceDir: temp('report-i'), env: {}, fetchImpl });
+    expect(same.actions.defer).toEqual({ predicted: 1, correct: 1 });
+    expect(report.actions.defer).toEqual({ predicted: 1, correct: 1 });
+    expect(same.agreement).toBe(0);
+    expect(report.agreement).toBe(0);
+  });
+
+  it('uses the baseline action for a fallback-band provider answer', async () => {
+    const fetchImpl = (async () => new Response(JSON.stringify({
+      model: 'laya-421m', answers: {
+        triage: { type: 'choice', choice: 'status_report', probabilities: { needs_ruling: 0, needs_owner: 0, status_report: 1, covered_by_open_item: 0 }, confidence: 0.1 },
+        needs_decision: { type: 'noul', noul: 0.1 },
+      },
+    }), { status: 200 })) as typeof fetch;
+    const report = await runBacktest({ surface: 'escalation_triage', profileName: 'local',
+      cases: [{ id: 'c', state: '{}', label: 'needs_ruling' }], config: decisionsConfig(),
+      instanceDir: temp('fallback-i'), env: {}, fetchImpl });
+    expect(report.actions.act).toEqual({ predicted: 1, correct: 1 });
+    expect(report.agreement).toBe(1);
   });
 
   it('a replay miss fails loud instead of inventing an answer, and unknown profiles/surfaces/labels are rejected', async () => {
@@ -281,11 +364,11 @@ describe('backtest engine (issue #223)', () => {
     const record = backtestRecordFromReport(report, { metric: 'precision', label: null, min: 0.9 });
     saveBacktestRecord(dataDir, record);
     expect(JSON.parse(readFileSync(backtestRecordPath(dataDir, 'escalation_triage'), 'utf8'))).toMatchObject({ n: 3, met: true });
-    expect(assertEnforceGate({ dataDir, surface: 'escalation_triage', provider: 'local' }).n).toBe(3);
+    expect(assertEnforceGate({ dataDir, surface: 'escalation_triage', provider: 'local', model: 'laya-421m' }).n).toBe(3);
     const stricter = backtestRecordFromReport(report, { metric: 'agreement', label: null, min: 0.9 });
     expect(stricter.met).toBe(false);
     saveBacktestRecord(dataDir, stricter);
-    expect(() => assertEnforceGate({ dataDir, surface: 'escalation_triage', provider: 'local' })).toThrow(EnforceGateError);
+    expect(() => assertEnforceGate({ dataDir, surface: 'escalation_triage', provider: 'local', model: 'laya-421m' })).toThrow(EnforceGateError);
   });
 
   it('rebuilds the surface request from a case state with the canonical questions and baseline', () => {

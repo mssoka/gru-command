@@ -8,13 +8,13 @@ import {
 import { resolveCredential } from './credentials.js';
 import { ProfileDecisionService, ProfileProvider } from './provider.js';
 import { KEYLESS_CREDENTIAL, validateProviderProfile } from './profile.js';
-import { decisionRoute } from './service.js';
-import { routeDisagreement } from './shadow.js';
 import type {
+  Answer,
+  AnswersFor,
+  DecisionOutcome,
   DecisionRequest,
   DecisionRoute,
   QuestionSet,
-  ThresholdsConfig,
 } from './types.js';
 import { requestFromCase, surfaceCaseSpec, type LabelledCase } from './cases/registry.js';
 import { BACKTEST_RECORD_SCHEMA_VERSION, backtestMeetsThreshold, type BacktestRecord, type BacktestThreshold } from './enforce.js';
@@ -39,9 +39,10 @@ export interface BacktestReport {
   readonly surface: string;
   readonly provider: string;
   readonly model: string | null;
+  /** Configured request model, not the provider's optional response alias. */
+  readonly configuredModel: string;
   readonly n: number;
-  /** Share of cases where the provider's would-be routing matched the
-   * deterministic baseline's routing exactly. */
+  /** Share of cases where the action served matches the deterministic baseline. */
   readonly agreement: number;
   /** Action confusion: predictions and correct predictions per action. */
   readonly actions: BacktestActionCounts;
@@ -141,19 +142,11 @@ function ratio(numerator: number, denominator: number): number {
   return denominator === 0 ? 0 : numerator / denominator;
 }
 
-function baselineRoutes<Q extends QuestionSet>(
-  request: DecisionRequest<Q>,
-  thresholds: ThresholdsConfig,
-): Readonly<Record<string, DecisionRoute>> {
-  const routes: Record<string, DecisionRoute> = {};
-  for (const id of Object.keys(request.questions)) {
-    routes[id] = decisionRoute(request.fallback[id]!, request.risks[id]!, thresholds);
-  }
-  return routes;
-}
-
-function predictedActionOf(routes: Readonly<Record<string, DecisionRoute>>): 'act' | 'defer' {
-  return Object.values(routes).some((route) => route.path !== 'fallback') ? 'act' : 'defer';
+function servedAnswers<Q extends QuestionSet>(request: DecisionRequest<Q>, outcome: DecisionOutcome<Q>): AnswersFor<Q> {
+  return Object.fromEntries(Object.keys(request.questions).map((id) => [
+    id,
+    outcome.routes[id]?.path === 'fallback' ? request.fallback[id] : outcome.answers[id],
+  ])) as AnswersFor<Q>;
 }
 
 // ------------------------------------------------------------------
@@ -233,7 +226,7 @@ export async function runBacktest(input: BacktestRunOptions): Promise<BacktestRe
   }
   const { service } = buildBacktestService(input);
   try {
-    const thresholds = input.config.thresholds;
+    const configuredModel = effectiveDecisionProviders(input.config)[input.profileName]!.model;
     let agree = 0;
     const actions = {
       act: { predicted: 0, correct: 0 },
@@ -247,17 +240,15 @@ export async function runBacktest(input: BacktestRunOptions): Promise<BacktestRe
     for (const [caseIndex, testCase] of input.cases.entries()) {
       const request = requestFromCase(spec, testCase.state);
       const outcome = await service.decide(request);
-      // In replay mode a fallback is a HARNESS failure, never a provider
-      // miss: the recordings exist precisely to answer every request, so
-      // a missing one must fail loud instead of producing a bogus report.
-      if (input.replayDir !== undefined && outcome.provenance.source !== 'jev') {
-        throw new Error(
-          `replay run produced a fallback for case ${JSON.stringify(testCase.id)} (index ${caseIndex}); the recording set is incomplete — rerun with --record over the same cases/config`,
-        );
+      // A provider miss is never evidence that the provider earned enforce.
+      // Replay misses additionally indicate an incomplete recording set.
+      if (outcome.provenance.source !== 'jev') {
+        throw new Error(input.replayDir !== undefined
+          ? `replay run produced a fallback for case ${JSON.stringify(testCase.id)} (index ${caseIndex}); the recording set is incomplete — rerun with --record over the same cases/config`
+          : `live backtest provider fell back for case ${JSON.stringify(testCase.id)} (index ${caseIndex}); fix the provider and rerun before saving enforce evidence`);
       }
-      const baseline = baselineRoutes(request, thresholds);
-      if (!routeDisagreement(outcome.routes, baseline)) agree += 1;
-      const predicted = predictedActionOf(outcome.routes as unknown as Readonly<Record<string, DecisionRoute>>);
+      const predicted = spec.answerAction(servedAnswers(request, outcome) as Record<string, Answer>);
+      if (predicted === spec.answerAction(request.fallback as Record<string, Answer>)) agree += 1;
       const actual = spec.labelAction(testCase.label);
       actions[predicted].predicted += 1;
       if (predicted === actual) actions[predicted].correct += 1;
@@ -296,6 +287,7 @@ export async function runBacktest(input: BacktestRunOptions): Promise<BacktestRe
       surface: input.surface,
       provider: input.profileName,
       model,
+      configuredModel,
       n: input.cases.length,
       agreement: ratio(agree, input.cases.length),
       actions,
@@ -329,6 +321,7 @@ export function backtestRecordFromReport(
     surface: report.surface,
     provider: report.provider,
     model: report.model,
+    configuredModel: report.configuredModel,
     n: report.n,
     agreement: report.agreement,
     precision: report.precision,

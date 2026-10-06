@@ -36,6 +36,7 @@ export const SAME_BLOCKER_SPEC: SurfaceCaseSpec<typeof SAME_BLOCKER_QUESTIONS> =
   // A wrongly-merged pair hides a live defect, so "different" (new
   // blocker that must be handled) is the actionable class.
   actionableLabel: 'different',
+  answerAction: (answers) => answers.same_defect.noul >= 0.5 ? 'defer' : 'act',
   labelAction: (label) => (label === 'different' ? 'act' : 'defer'),
   calibrationQuestion: 'same_defect',
 };

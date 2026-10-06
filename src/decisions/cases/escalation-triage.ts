@@ -62,6 +62,7 @@ export const ESCALATION_TRIAGE_SPEC: SurfaceCaseSpec<typeof ESCALATION_TRIAGE_QU
   },
   labels: ESCALATION_TRIAGE_LABELS,
   actionableLabel: 'needs_ruling',
+  answerAction: (answers) => RULING_CHOICES.includes(answers.triage.choice) ? 'act' : 'defer',
   labelAction: (label) => (label === 'needs_ruling' ? 'act' : 'defer'),
   calibrationQuestion: 'triage',
 };

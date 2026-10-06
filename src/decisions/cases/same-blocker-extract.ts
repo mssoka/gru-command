@@ -26,7 +26,7 @@ import type { LabelledCase } from './registry.js';
 interface ConsolidatedFile {
   readonly roundId: string;
   readonly targetSha: string | null;
-  readonly roundNumber: number;
+  readonly createdAt: string;
   readonly findings: readonly FindingBrief[];
 }
 
@@ -76,14 +76,12 @@ export function parseConsolidatedFile(roundId: string, raw: string): Consolidate
   const findings = c['findings'].map(toBrief);
   if (findings.some((finding) => finding === null)) return null;
   const frozen = c['frozen'];
-  const targetSha =
-    typeof frozen === 'object' && frozen !== null && typeof (frozen as Record<string, unknown>)['targetSha'] === 'string'
-      ? (frozen as Record<string, unknown>)['targetSha'] as string
-      : null;
-  const rounds = (findings as FindingBrief[]).map((finding) => finding.roundOrigin);
-  const roundNumber = rounds.length > 0 ? Math.max(...rounds) : 0;
-  if (roundNumber < 1) return null;
-  return { roundId, targetSha, roundNumber, findings: findings as FindingBrief[] };
+  if (typeof frozen !== 'object' || frozen === null) return null;
+  const manifest = frozen as Record<string, unknown>;
+  const targetSha = typeof manifest['targetSha'] === 'string' ? manifest['targetSha'] : null;
+  const createdAt = manifest['createdAt'];
+  if (typeof createdAt !== 'string' || !Number.isFinite(Date.parse(createdAt))) return null;
+  return { roundId, targetSha, createdAt, findings: findings as FindingBrief[] };
 }
 
 export function listConsolidatedFiles(artifactRoot: string): ConsolidatedFile[] {
@@ -107,7 +105,7 @@ export function listConsolidatedFiles(artifactRoot: string): ConsolidatedFile[] 
     const parsed = parseConsolidatedFile(entry, raw);
     if (parsed !== null) files.push(parsed);
   }
-  return files.sort((a, b) => a.roundNumber - b.roundNumber || a.roundId.localeCompare(b.roundId));
+  return files.sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.roundId.localeCompare(b.roundId));
 }
 
 /** Extract same-blocker pair cases from a review artifact tree. Pure over
@@ -127,10 +125,10 @@ export function extractSameBlockerCases(artifactRoot: string): LabelledCase[] {
     for (let index = 1; index < group.length; index++) {
       const prior = group[index - 1]!;
       const current = group[index]!;
-      if (current.roundNumber <= prior.roundNumber) continue;
       const priorKeys = new Map<string, FindingBrief>();
       for (const finding of prior.findings) priorKeys.set(findingCarryKey(finding), finding);
       const priorOverlaps = prior.findings;
+      const latestPriorOrigin = Math.max(0, ...prior.findings.map((finding) => finding.roundOrigin));
 
       for (const finding of current.findings) {
         const key = findingCarryKey(finding);
@@ -145,9 +143,9 @@ export function extractSameBlockerCases(artifactRoot: string): LabelledCase[] {
         }
         // Fresh this round (not carried), overlapping file+category with
         // a prior finding the lead did NOT merge into: kept separate.
-        if (finding.roundOrigin !== current.roundNumber) continue;
+        if (finding.roundOrigin <= latestPriorOrigin) continue;
         const overlap = priorOverlaps.find(
-          (candidate) => candidate.location === finding.location && candidate.category === finding.category,
+          (candidate) => fileOfLocation(candidate.location) === fileOfLocation(finding.location) && candidate.category === finding.category,
         );
         if (overlap === undefined) continue;
         cases.push({
@@ -161,6 +159,10 @@ export function extractSameBlockerCases(artifactRoot: string): LabelledCase[] {
   return cases;
 }
 
+function fileOfLocation(location: string): string {
+  return location.trim().replace(/:\d+(?::\d+)?$/u, '');
+}
+
 function pairState(prior: FindingBrief, current: FindingBrief): string {
   return filteredState({
     prior_finding: {
@@ -169,7 +171,6 @@ function pairState(prior: FindingBrief, current: FindingBrief): string {
       location: prior.location,
       severity: prior.severity,
       detail: prior.detail,
-      round_origin: prior.roundOrigin,
     },
     current_finding: {
       title: current.title,
@@ -177,7 +178,6 @@ function pairState(prior: FindingBrief, current: FindingBrief): string {
       location: current.location,
       severity: current.severity,
       detail: current.detail,
-      round_origin: current.roundOrigin,
     },
   });
 }

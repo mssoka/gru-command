@@ -129,8 +129,12 @@ Routing rules:
   serves the provider answer but requires recorded backtest evidence
   meeting its stated threshold at
   `<data_dir>/decisions/backtests/<surface>.json`; missing or failing
-  evidence fails the request loud (`EnforceGateError`). A surface with no
-  `mode` key keeps the pre-#223 behavior without the gate.
+  evidence fails the request loud (`EnforceGateError`) and posts a deduplicated
+  needs-owner configuration incident. Only surfaces with registered labelled
+  backtests (`escalation_triage`, `same_blocker`, `report_conclusion`) may opt in
+  to `enforce`; today's production `event_triage` and `supervision_guidance`
+  surfaces can use `off` or `shadow` until their backtests exist. A surface
+  with no `mode` key keeps the pre-#223 behavior without the gate.
 - **Earning enforce.** Extract labelled history to JSONL
   (`{ id, state, label }`), run the harness against any profile, and save
   the evidence together with its stated threshold:
@@ -146,9 +150,16 @@ Routing rules:
   The report carries n, agreement with the deterministic baseline,
   precision/recall of the action that would be taken, calibration
   buckets, cost, and p50/p95 latency. `--save` only accepts a `--threshold`;
-  the enforce gate re-evaluates the recorded metric against it and never
-  trusts the stored flag. Yield telemetry (#214) reports shadow
-  disagreement rates per surface and provider.
+  the enforce gate re-evaluates the recorded metric against it, binds it to
+  the configured profile model, and never trusts the stored flag. Live
+  provider fallbacks fail the backtest instead of earning enforce evidence.
+  For `report_conclusion`, `--artifact-root` points to delivered report
+  handback exports: one `<job>/handback.json` per case with
+  `{ "schemaVersion": 1, "jobId": "<job>", "deliverable": "review",
+  "report": "...\\n**Verdict: READY TO MERGE**" }`. Perkins
+  `consolidated.json` review rounds are not report-type handbacks; verdict
+  lines are removed from the request state. Yield telemetry (#214) reports
+  shadow disagreement rates per surface and provider.
 - Production callers pass stable surface names: event/notification triage
   uses `event_triage`; supervisor runtime-health guidance uses
   `supervision_guidance`.

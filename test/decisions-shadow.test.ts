@@ -18,7 +18,10 @@ import {
 import { eventDecisionRequest } from '../src/decisions/questions.js';
 import { DecisionRuntime } from '../src/decisions/runtime.js';
 import { backtestRecordFromReport, saveBacktestRecord, type BacktestReport } from '../src/decisions/backtest.js';
-import type { BusEvent } from '../src/events/bus.js';
+import { EventBus, type BusEvent } from '../src/events/bus.js';
+import { LedgerDb } from '../src/ledger/db.js';
+import { LedgerApi } from '../src/ledger/api.js';
+import { NotificationCenter } from '../src/notifications/center.js';
 import type { ShadowDecisionRecord } from '../src/decisions/types.js';
 
 const cleanups: string[] = [];
@@ -247,11 +250,17 @@ describe('per-surface mode semantics (issue #223)', () => {
 });
 
 describe('the enforce gate (issue #223)', () => {
+  const surface = 'escalation_triage';
+  const profile = 'local';
+  const configuredModel = 'laya-421m';
+  const gate = (dataDir: string): ReturnType<typeof assertEnforceGate> =>
+    assertEnforceGate({ dataDir, surface, provider: profile, model: configuredModel });
   const minimalReport: BacktestReport = {
     schemaVersion: BACKTEST_RECORD_SCHEMA_VERSION,
-    surface: 'event_triage',
-    provider: 'local',
+    surface,
+    provider: profile,
     model: 'laya-421m-test',
+    configuredModel,
     n: 12,
     agreement: 0.92,
     actions: { act: { predicted: 5, correct: 5 }, defer: { predicted: 7, correct: 6 } },
@@ -278,10 +287,10 @@ describe('the enforce gate (issue #223)', () => {
 
   it('mode "enforce" without recorded evidence fails loud with a stranger-actionable message', async () => {
     const dataDir = temp('gru-decisions-gate-empty-');
-    const runtime = await startedRuntime({ event_triage: surfaceEntry('local', 'enforce') }, { dataDir });
-    await expect(runtime.decide(eventRequest(), { surface: 'event_triage' })).rejects.toThrow(EnforceGateError);
-    await expect(runtime.decide(eventRequest(), { surface: 'event_triage' })).rejects.toThrow(
-      /event_triage.*backtests.*backtest --surface event_triage/s,
+    const runtime = await startedRuntime({ [surface]: surfaceEntry(profile, 'enforce') }, { dataDir });
+    await expect(runtime.decide(eventRequest(), { surface })).rejects.toThrow(EnforceGateError);
+    await expect(runtime.decide(eventRequest(), { surface })).rejects.toThrow(
+      /escalation_triage.*backtests.*backtest --surface escalation_triage/s,
     );
     runtime.dispose();
   });
@@ -289,34 +298,63 @@ describe('the enforce gate (issue #223)', () => {
   it('mode "enforce" with meeting evidence for the ROUTED provider serves the provider answer', async () => {
     const dataDir = temp('gru-decisions-gate-ok-');
     const record = backtestRecordFromReport(minimalReport, { metric: 'precision', label: null, min: 0.9 });
-    expect(saveBacktestRecord(dataDir, record)).toBe(backtestRecordPath(dataDir, 'event_triage'));
-    const runtime = await startedRuntime({ event_triage: surfaceEntry('local', 'enforce') }, { dataDir });
-    const outcome = await runtime.decide(eventRequest(), { surface: 'event_triage' });
+    expect(saveBacktestRecord(dataDir, record)).toBe(backtestRecordPath(dataDir, surface));
+    const runtime = await startedRuntime({ [surface]: surfaceEntry(profile, 'enforce') }, { dataDir });
+    const outcome = await runtime.decide(eventRequest(), { surface });
     expect(outcome.provenance).toMatchObject({ source: 'jev', model: 'laya-421m-test' });
     runtime.dispose();
   });
 
-  it('evidence earned on another profile never licenses enforce, and failing evidence is rejected', async () => {
+  it('evidence earned on another profile or model never licenses enforce', () => {
     const dataDir = temp('gru-decisions-gate-bad-');
     saveBacktestRecord(dataDir, backtestRecordFromReport(
-      { ...minimalReport, provider: 'typesafe-direct' },
-      { metric: 'precision', label: null, min: 0.9 },
+      { ...minimalReport, provider: 'typesafe-direct' }, { metric: 'precision', label: null, min: 0.9 },
     ));
-    expect(() => assertEnforceGate({ dataDir, surface: 'event_triage', provider: 'local' })).toThrow(EnforceGateError);
+    expect(() => gate(dataDir)).toThrow(/profile/u);
+    saveBacktestRecord(dataDir, backtestRecordFromReport(
+      { ...minimalReport, configuredModel: 'new-model' }, { metric: 'precision', label: null, min: 0.9 },
+    ));
+    expect(() => gate(dataDir)).toThrow(/configured for model/u);
     saveBacktestRecord(dataDir, backtestRecordFromReport(minimalReport, { metric: 'agreement', label: null, min: 0.99 }));
-    expect(() => assertEnforceGate({ dataDir, surface: 'event_triage', provider: 'local' })).toThrow(/does not meet its stated threshold/u);
+    expect(() => gate(dataDir)).toThrow(/does not meet its stated threshold/u);
   });
 
-  it('a malformed or foreign-surface evidence file fails loud, and enforce without a dataDir is itself a gate failure', async () => {
+  it('posts one durable owner-visible gate incident when production callers catch the rejection', async () => {
+    const db = new LedgerDb(temp('gru-decisions-gate-incident-'));
+    try {
+      const bus = new EventBus();
+      const ledger = new LedgerApi(db.handle, { bus });
+      const notifications = new NotificationCenter({ ledger, bus });
+      const runtime = new DecisionRuntime(configWithSurfaces({ event_triage: surfaceEntry('local', 'enforce') }), {
+        instanceDir: temp('gru-decisions-gate-instance-'), dataDir: temp('gru-decisions-gate-evidence-'),
+        env: { OPENROUTER_API_KEY: 'test-key' }, fetchImpl: stubFetch(), watchConfig: false, notifications,
+      });
+      await runtime.start();
+      await expect(runtime.decide(eventRequest(), { surface: 'event_triage' })).rejects.toThrow(EnforceGateError);
+      await expect(runtime.decide(eventRequest(), { surface: 'event_triage' })).rejects.toThrow(EnforceGateError);
+      expect(ledger.listNotifications({ limit: 20 }).filter((row) => row.kind === 'decisions.enforce-gate.event_triage'))
+        .toMatchObject([{ routing: 'needs-owner', severity: 'error' }]);
+      runtime.dispose();
+    } finally { db.close(); }
+  });
+
+  it('rejects enforce for unbacktestable production surfaces even with fabricated evidence', async () => {
+    const dataDir = temp('gru-decisions-unregistered-');
+    saveBacktestRecord(dataDir, backtestRecordFromReport({ ...minimalReport, surface: 'event_triage' }, { metric: 'precision', label: null, min: 0.9 }));
+    const runtime = await startedRuntime({ event_triage: surfaceEntry(profile, 'enforce') }, { dataDir });
+    await expect(runtime.decide(eventRequest(), { surface: 'event_triage' })).rejects.toThrow(/no registered backtest/u);
+    runtime.dispose();
+  });
+
+  it('rejects malformed or foreign-surface evidence and enforce without a dataDir', async () => {
     const dataDir = temp('gru-decisions-gate-junk-');
     mkdirSync(join(dataDir, 'decisions', 'backtests'), { recursive: true });
-    writeFileSync(backtestRecordPath(dataDir, 'event_triage'), '{ not json');
-    expect(() => assertEnforceGate({ dataDir, surface: 'event_triage', provider: 'local' })).toThrow(/not valid JSON/u);
-    writeFileSync(backtestRecordPath(dataDir, 'event_triage'), JSON.stringify({ ...minimalReport, surface: 'other_surface', met: true }));
-    expect(() => assertEnforceGate({ dataDir, surface: 'event_triage', provider: 'local' })).toThrow(/does not match schema/u);
-
-    const runtime = await startedRuntime({ event_triage: surfaceEntry('local', 'enforce') }, {});
-    await expect(runtime.decide(eventRequest(), { surface: 'event_triage' })).rejects.toThrow(/no data directory is available/u);
+    writeFileSync(backtestRecordPath(dataDir, surface), '{ not json');
+    expect(() => gate(dataDir)).toThrow(/not valid JSON/u);
+    writeFileSync(backtestRecordPath(dataDir, surface), JSON.stringify({ ...minimalReport, surface: 'other_surface', met: true }));
+    expect(() => gate(dataDir)).toThrow(/does not match schema/u);
+    const runtime = await startedRuntime({ [surface]: surfaceEntry(profile, 'enforce') });
+    await expect(runtime.decide(eventRequest(), { surface })).rejects.toThrow(/no data directory is available/u);
     runtime.dispose();
   });
 });

@@ -376,13 +376,32 @@ export class DecisionRuntime implements DecisionService {
       return deterministicOutcome(request, thresholdsOf(this.currentConfig), 'disabled');
     }
     if (mode === 'enforce') {
-      if (this.options.dataDir === undefined || opts?.surface === undefined) {
-        throw new EnforceGateError(
-          opts?.surface ?? '(unnamed)',
-          'enforce gate: no data directory is available to read backtest evidence from; pass dataDir to the decision runtime',
-        );
+      try {
+        if (this.options.dataDir === undefined || opts?.surface === undefined) {
+          throw new EnforceGateError(
+            opts?.surface ?? '(unnamed)',
+            'enforce gate: no data directory is available to read backtest evidence from; pass dataDir to the decision runtime',
+          );
+        }
+        const profile = effectiveDecisionProviders(this.currentConfig)[profileName];
+        if (profile === undefined) throw new EnforceGateError(opts.surface, `enforce gate: unknown routed profile "${profileName}"`);
+        assertEnforceGate({ dataDir: this.options.dataDir, surface: opts.surface, provider: profileName, model: profile.model });
+      } catch (error) {
+        if (error instanceof EnforceGateError) {
+          // Both production callers deliberately catch decision errors and
+          // retain deterministic safety behavior. Keep the rejection AND
+          // make the configuration failure visible to the operator.
+          this.options.notifications?.postIncident({
+            kind: `decisions.enforce-gate.${error.surface}`,
+            routing: 'needs-owner',
+            severity: 'error',
+            title: `Decision enforce gate blocked for ${error.surface}`,
+            detail: error.message,
+            dedupe: 'active',
+          });
+        }
+        throw error;
       }
-      assertEnforceGate({ dataDir: this.options.dataDir, surface: opts.surface, provider: profileName });
     }
     const generation = this.generation;
     const selected = this.profileServices.get(profileName) ?? this.service;

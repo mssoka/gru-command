@@ -50,6 +50,7 @@ export const REPORT_CONCLUSION_SPEC: SurfaceCaseSpec<typeof REPORT_CONCLUSION_QU
   },
   labels: REPORT_CONCLUSION_LABELS,
   actionableLabel: 'findings_need_action',
+  answerAction: (answers) => answers.conclusion.choice === 'findings_need_action' ? 'act' : 'defer',
   labelAction: (label) => (label === 'findings_need_action' ? 'act' : 'defer'),
   calibrationQuestion: 'conclusion',
 };
