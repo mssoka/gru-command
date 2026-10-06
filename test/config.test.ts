@@ -87,7 +87,7 @@ describe('decision config', () => {
         enabled: false,
         model: '~typesafe/jev-latest',
         endpoint: 'https://openrouter.ai/api/alpha/decisions',
-        timeoutMs: 2_000,
+        timeoutMs: 5_000,
       },
       providers: {},
       surfaces: {},

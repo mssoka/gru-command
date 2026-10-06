@@ -16,7 +16,7 @@ import {
   EnforceGateError,
 } from '../src/decisions/enforce.js';
 import { eventDecisionRequest } from '../src/decisions/questions.js';
-import { DecisionRuntime } from '../src/decisions/runtime.js';
+import { DecisionRuntime, SHADOW_MISS_DEGRADE_THRESHOLD } from '../src/decisions/runtime.js';
 import { backtestRecordFromReport, saveBacktestRecord, type BacktestReport } from '../src/decisions/backtest.js';
 import { EventBus, type BusEvent } from '../src/events/bus.js';
 import { LedgerDb } from '../src/ledger/db.js';
@@ -356,5 +356,125 @@ describe('the enforce gate (issue #223)', () => {
     const runtime = await startedRuntime({ [surface]: surfaceEntry(profile, 'enforce') });
     await expect(runtime.decide(eventRequest(), { surface })).rejects.toThrow(/no data directory is available/u);
     runtime.dispose();
+  });
+});
+
+describe('shadow misses are evidence, not incidents (2026-10-06 owner page)', () => {
+  type Step = 'ok' | 'timeout' | 'auth';
+
+  /** Call 1 is the default profile's startup probe; each later call is one
+   * shadow ask. A timeout is the provider's own abort, as in production. */
+  function scriptedFetch(steps: readonly Step[]): typeof fetch {
+    let call = 0;
+    return (async (_url: string | URL | Request, init?: RequestInit) => {
+      const step = steps[call] ?? 'ok';
+      call += 1;
+      if (step === 'timeout') throw Object.assign(new Error('This operation was aborted'), { name: 'AbortError' });
+      if (step === 'auth') return new Response('denied', { status: 401 });
+      return new Response(JSON.stringify(answerEnvelope(String(init?.body))), { status: 200 });
+    }) as unknown as typeof fetch;
+  }
+
+  function notificationStub(): { readonly center: NotificationCenter; readonly postIncident: ReturnType<typeof vi.fn> } {
+    const postIncident = vi.fn();
+    const center = { postIncident, post: vi.fn(), resolveIncidents: vi.fn(() => []) } as unknown as NotificationCenter;
+    return { center, postIncident };
+  }
+
+  async function shadowRuntime(
+    surfaces: DecisionsConfig['surfaces'],
+    steps: readonly Step[],
+    sinks: { readonly notifications: NotificationCenter; readonly records: ShadowDecisionRecord[] },
+  ): Promise<DecisionRuntime> {
+    const runtime = new DecisionRuntime(configWithSurfaces(surfaces), {
+      instanceDir: temp('gru-decisions-shadow-misses-'),
+      env: { OPENROUTER_API_KEY: 'test-key' },
+      fetchImpl: scriptedFetch(steps),
+      watchConfig: false,
+      notifications: sinks.notifications,
+      onShadowRecord: (record) => sinks.records.push(record),
+    });
+    expect(await runtime.start()).toMatchObject({ status: 'ready' });
+    return runtime;
+  }
+
+  const ALL_SHADOW: DecisionsConfig['surfaces'] = {
+    event_triage: surfaceEntry('openrouter-jev', 'shadow'),
+    supervision_guidance: surfaceEntry('openrouter-jev', 'shadow'),
+  };
+
+  it('one transient shadow miss is recorded: the runtime stays ready and nobody is paged', async () => {
+    const { center, postIncident } = notificationStub();
+    const records: ShadowDecisionRecord[] = [];
+    const runtime = await shadowRuntime(ALL_SHADOW, ['ok', 'timeout'], { notifications: center, records });
+    postIncident.mockClear(); // drop the startup "ready" FYI
+    const outcome = await runtime.decide(eventRequest(), { surface: 'event_triage' });
+    expect(outcome.provenance).toMatchObject({ source: 'deterministic', fallbackReason: 'shadow_mode' });
+    expect(records).toHaveLength(1);
+    expect(records[0]).toMatchObject({ provenance_source: 'deterministic', model: null });
+    expect(runtime.status()).toMatchObject({ status: 'ready', reason: null });
+    expect(postIncident).not.toHaveBeenCalled();
+    runtime.dispose();
+  });
+
+  it(`degrades only after ${SHADOW_MISS_DEGRADE_THRESHOLD} consecutive transient misses; a success resets the run`, async () => {
+    const { center } = notificationStub();
+    const records: ShadowDecisionRecord[] = [];
+    const runtime = await shadowRuntime(
+      ALL_SHADOW,
+      ['ok', 'timeout', 'timeout', 'ok', 'timeout', 'timeout', 'timeout'],
+      { notifications: center, records },
+    );
+    await runtime.decide(eventRequest(), { surface: 'event_triage' }); // miss 1
+    await runtime.decide(eventRequest(), { surface: 'event_triage' }); // miss 2
+    expect(runtime.status()).toMatchObject({ status: 'ready' });
+    await runtime.decide(eventRequest(), { surface: 'event_triage' }); // success → reset
+    await runtime.decide(eventRequest(), { surface: 'event_triage' }); // miss 1
+    await runtime.decide(eventRequest(), { surface: 'event_triage' }); // miss 2
+    expect(runtime.status()).toMatchObject({ status: 'ready' });
+    await runtime.decide(eventRequest(), { surface: 'event_triage' }); // miss 3 → degrade
+    expect(runtime.status()).toMatchObject({ status: 'degraded', reason: 'timeout' });
+    expect(records).toHaveLength(6);
+    runtime.dispose();
+  });
+
+  it('a transient degrade with every acting surface in shadow goes to the board feed, not the owner bell', async () => {
+    const { center, postIncident } = notificationStub();
+    const runtime = await shadowRuntime(ALL_SHADOW, ['ok', 'timeout', 'timeout', 'timeout'], { notifications: center, records: [] });
+    postIncident.mockClear();
+    for (let i = 0; i < SHADOW_MISS_DEGRADE_THRESHOLD; i += 1) {
+      await runtime.decide(eventRequest(), { surface: 'event_triage' });
+    }
+    expect(runtime.status()).toMatchObject({ status: 'degraded', reason: 'timeout' });
+    expect(postIncident).toHaveBeenCalledTimes(1);
+    expect(postIncident.mock.calls[0]![0]).toMatchObject({ kind: 'decisions.degraded.timeout', routing: 'fyi' });
+    runtime.dispose();
+  });
+
+  it('still pages the owner when a modeless (pre-#223) host acts on Jev or when the failure needs a human', async () => {
+    // supervision_guidance has no mode: it ACTS on Jev's answer, so even a
+    // transient degrade is owner-visible.
+    const legacy = notificationStub();
+    const actingRuntime = await shadowRuntime(
+      { event_triage: surfaceEntry('openrouter-jev', 'shadow') },
+      ['ok', 'timeout', 'timeout', 'timeout'],
+      { notifications: legacy.center, records: [] },
+    );
+    legacy.postIncident.mockClear();
+    for (let i = 0; i < SHADOW_MISS_DEGRADE_THRESHOLD; i += 1) {
+      await actingRuntime.decide(eventRequest(), { surface: 'event_triage' });
+    }
+    expect(legacy.postIncident.mock.calls[0]![0]).toMatchObject({ routing: 'needs-owner' });
+    actingRuntime.dispose();
+
+    // An auth failure needs a human: it degrades on the FIRST shadow miss
+    // and pages the owner even when every surface is in shadow.
+    const auth = notificationStub();
+    const authRuntime = await shadowRuntime(ALL_SHADOW, ['ok', 'auth'], { notifications: auth.center, records: [] });
+    auth.postIncident.mockClear();
+    await authRuntime.decide(eventRequest(), { surface: 'event_triage' });
+    expect(authRuntime.status()).toMatchObject({ status: 'degraded', reason: 'auth_rejected' });
+    expect(auth.postIncident.mock.calls[0]![0]).toMatchObject({ kind: 'decisions.degraded.auth_rejected', routing: 'needs-owner' });
+    authRuntime.dispose();
   });
 });

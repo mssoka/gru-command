@@ -38,6 +38,14 @@ baseline while still serving the deterministic answer: behavior cannot
 change until the #223 enforce gate is met AND the owner records a
 decision per surface.
 
+**Shadow misses are evidence, not incidents.** A transient failure of a
+default-profile shadow ask (`timeout`, `network_error`,
+`provider_degraded`) is recorded (`decisions.shadow`, provenance
+`deterministic`, model `null`) and logged; the runtime stays `ready`.
+Only **3 consecutive** transient misses degrade it, and a successful ask
+resets the count. Credential, auth, config and schema failures still
+degrade on the first miss.
+
 | Surface | Question | Fires at | Deterministic baseline |
 |---|---|---|---|
 | `escalation_triage` | choice `triage` (`needs_ruling`, `needs_owner`, `status_report`, `covered_by_open_item`) + noul `needs_decision` | the awareness layer's wake-delivery receipt, for Silas-authored escalation rows (`silas.escalation`, `silas.escalated:<jobId>`) inside the delivered batch — the exact point the labelled extractor links on | every escalation reaches Gru (`needs_ruling`, noul 1 — fail toward a wake) |
@@ -90,7 +98,7 @@ The complete default-off fragment is:
 enabled = false
 model = "~typesafe/jev-latest"
 endpoint = "https://openrouter.ai/api/alpha/decisions"
-timeout_ms = 2000
+timeout_ms = 5000
 
 [decisions.thresholds.read_only]
 act = 0.60
@@ -150,7 +158,7 @@ protocol = "systemone"
 endpoint = "https://api.typesafe.ai/v1/systemone"
 model = "jev-latest"
 credential = "typesafe"
-timeout_ms = 2000
+timeout_ms = 5000
 
 [decisions.surfaces]
 event_triage = "typesafe-direct"
@@ -297,8 +305,12 @@ Authenticated service surfaces:
 The Settings page shows only `disabled`, `ready`, or `degraded`, sanitized
 reason text, model/endpoint, credential presence/source, last-check time, and
 the per-process generation. It never shows key material. A degraded
-transition creates one durable action-required notification; a recovery (or
-an explicit disable) resolves it with a durable FYI notification. Repeated
+transition creates one durable notification: FOR YOU (`needs-owner`) when a
+human must act (credential, auth, config, schema) or a surface acts on Jev
+(`enforce`, or a modeless `event_triage`/`supervision_guidance`), and a board
+FYI when the failure is transient and every acting surface is `shadow`/`off`.
+A recovery (or an explicit disable) resolves it with a durable FYI
+notification. Repeated
 restarts deduplicate the same unresolved incident instead of flooding copies.
 
 ## Decision boundaries
@@ -327,8 +339,8 @@ schemes, URL userinfo, opaque key formats, private-key blocks).
 | `credential_invalid` | Remove whitespace/empty environment input or rewrite one non-empty line through the CLI. |
 | `credential_unsafe` | Remove symlinks; set the credentials directory to `0700` and key file to `0600`; re-provision if ownership is uncertain. |
 | `auth_rejected` / `forbidden` | Verify the OpenRouter credential and access, then recheck. |
-| `provider_degraded` | One automatic recheck runs after a transient degradation; if still degraded, wait for provider/rate-limit recovery and use Recheck — deterministic behavior remains active. |
-| `timeout` / `network_error` | One automatic recheck runs after a transient degradation; if still degraded, verify DNS/TLS/connectivity to `openrouter.ai` (the request timeout is intentionally bounded) and use Recheck. |
+| `provider_degraded` | Transient: automatic rechecks run on a bounded backoff (1, 5, 15, 60 min); if still degraded after the last one, wait for provider/rate-limit recovery and use Recheck — deterministic behavior remains active. |
+| `timeout` / `network_error` | Transient: automatic rechecks run on a bounded backoff (1, 5, 15, 60 min); if still degraded, verify DNS/TLS/connectivity to `openrouter.ai` and use Recheck. Repeated timeouts on a healthy network mean `timeout_ms` (default 5000) is too tight for your provider latency — raise it; the section hot-reloads. |
 | `malformed_response` | Leave deterministic fallback active and inspect the configured model/endpoint compatibility. |
 | `malformed_request` | The provider rejected the request shape (HTTP 422). Check the surface wiring/model name; this is a caller bug, not provider health. |
 | `endpoint_untrusted` | Restore the verified HTTPS endpoint. Resolved portable credentials are never sent elsewhere. |

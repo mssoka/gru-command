@@ -46,7 +46,7 @@ import {
 import type { EscalationFacts } from '../src/decisions/questions.js';
 import { surfaceCaseSpec } from '../src/decisions/cases/registry.js';
 import { ProfileDecisionService, ProfileProvider } from '../src/decisions/provider.js';
-import { checkDecisionProfile, DecisionRuntime } from '../src/decisions/runtime.js';
+import { checkDecisionProfile, DecisionRuntime, TRANSIENT_RECHECK_FACTORS } from '../src/decisions/runtime.js';
 import { deterministicOutcome } from '../src/decisions/service.js';
 import {
   decisionRoute,
@@ -677,7 +677,7 @@ describe('runtime startup, degradation and generation safety', () => {
     runtime.dispose();
   });
 
-  it('a still-down provider consumes the single automatic recheck and then stops retrying on its own', async () => {
+  it('a still-down provider gets a bounded backoff of automatic rechecks and then stops retrying on its own', async () => {
     const fetchImpl = vi.fn(async () => {
       throw new TypeError('provider down');
     }) as unknown as typeof fetch;
@@ -686,14 +686,15 @@ describe('runtime startup, degradation and generation safety', () => {
       env: { OPENROUTER_API_KEY: 'test-key' },
       fetchImpl,
       watchConfig: false,
-      transientRecoveryMs: 10,
+      transientRecoveryMs: 10, // base: rechecks at 10, 50, 150 and 600 ms
       loadConfig: () => ({ decisions: cloneConfig(true) } as unknown as GruCommandConfig),
     });
-    await runtime.start(); // probe 1 fails → degrade → arms the auto recheck
+    await runtime.start(); // probe 1 fails → degrade → schedules recheck 1
     expect(await runtime.status()).toMatchObject({ status: 'degraded', reason: 'network_error' });
-    await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(2)); // the automatic recheck probe
-    await sleep(60);
-    expect(fetchImpl).toHaveBeenCalledTimes(2); // consumed: no third attempt, no loop
+    const budget = TRANSIENT_RECHECK_FACTORS.length;
+    await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(1 + budget), { timeout: 5_000 });
+    await sleep(800); // longer than the last backoff step: nothing else may fire
+    expect(fetchImpl).toHaveBeenCalledTimes(1 + budget); // bounded: no further attempt, no loop
     expect(await runtime.status()).toMatchObject({ status: 'degraded', reason: 'network_error' });
     runtime.dispose();
   });
