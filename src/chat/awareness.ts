@@ -2,9 +2,12 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { NotifyWakeMode, QuietHours, WakeMinSeverity } from '../config.js';
+import { DECISION_SURFACE_ESCALATION_TRIAGE, escalationTriageDecisionRequest } from '../decisions/questions.js';
+import type { DecisionMemoryFacts, EscalationFacts } from '../decisions/questions.js';
+import type { DecisionService } from '../decisions/types.js';
 import type { BusEvent, EventBus } from '../events/bus.js';
 import type { LogLevel } from '../logger.js';
-import type { EventRecord, LedgerApi, NotificationRecord } from '../ledger/api.js';
+import type { DecisionRecord, EventRecord, LedgerApi, NotificationRecord } from '../ledger/api.js';
 import { WakePolicy, type WakeCandidate } from './wake-policy.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
@@ -123,7 +126,25 @@ export type GruAwarenessLedger = Pick<
   | 'resolveNotificationById'
   | 'listJobs'
   | 'listAgents'
->;
+  // Decision memory reads (issues #218/#224): present on the real ledger;
+  // optional so narrow test fakes stay honest. Absent = triage asks run
+  // without the open-decisions/dispositions context.
+> & Partial<Pick<LedgerApi, 'listDecisions'>>;
+
+/** The escalation notification kinds the triage surface applies to — the
+ * SAME predicate the labelled extractor labels on (silas-authored
+ * escalations). */
+export function isSilasEscalationKind(kind: string): boolean {
+  return kind.startsWith('silas.escalated') || kind.includes('escalat');
+}
+
+/** The decision-memory subject an escalation kind points at
+ * (`silas.escalated:<jobId>` → `job:<jobId>`); null when the kind names
+ * no job. */
+export function escalationDecisionSubject(kind: string): string | null {
+  const jobId = kind.match(/^silas\.escalated:(.+)$/u)?.[1];
+  return jobId === undefined ? null : `job:${jobId}`;
+}
 
 export interface GruAwarenessOptions {
   /** Chat dir (same home as the frame log); the cursor sidecar lives here. */
@@ -148,6 +169,14 @@ export interface GruAwarenessOptions {
   readonly log?: Log;
   /** Clock seam (tests advance fake timers through this closure). */
   readonly now?: () => number;
+  /** Issue #224 shadow wiring: the decision service asked for escalation
+   * triage at candidate time, and the per-surface readiness gate. SHADOW
+   * ONLY — the runtime records the provider answer next to the
+   * deterministic baseline and this layer ignores the outcome entirely:
+   * the wake policy's decision is untouched. Omitting either leaves
+   * awareness exactly as before. */
+  readonly decisions?: Pick<DecisionService, 'decide'>;
+  readonly readyForSurface?: (surface: string) => boolean;
 }
 
 interface AwarenessState {
@@ -356,6 +385,14 @@ export class GruAwareness {
   private failedRetryAtMs = 0;
   private wakeTimer: ReturnType<typeof setTimeout> | null = null;
   private wakeTimerAt: number | null = null;
+  /** Issue #224 shadow wiring (see GruAwarenessOptions). */
+  private readonly decisions: Pick<DecisionService, 'decide'> | null;
+  private readonly readyForSurface: ((surface: string) => boolean) | null;
+  /** Escalation-triage shadow dedupe (issue #224): notification ids whose
+   * candidate already fired an ask this process. A spend guard against
+   * the created→triaged event double-delivery, not a correctness
+   * contract; FIFO-evicted at 512 ids. */
+  private readonly askedEscalations = new Set<string>();
   private disposed = false;
 
   constructor(opts: GruAwarenessOptions) {
@@ -367,6 +404,8 @@ export class GruAwareness {
     }
     this.wakeMode = opts.wakeMode ?? 'action-required';
     this.morningDigestGapMs = opts.morningDigestGapMs ?? DEFAULT_MORNING_DIGEST_GAP_MS;
+    this.decisions = opts.decisions ?? null;
+    this.readyForSurface = opts.readyForSurface ?? null;
     this.log = opts.log ?? (() => {});
     this.onFollowUpPosted = opts.onFollowUpPosted ?? (() => {});
     this.now = opts.now ?? (() => Date.now());
@@ -1085,7 +1124,66 @@ export class GruAwareness {
       if (this.pendingWakeIds.delete(row.id)) this.persistWakeState();
       return;
     }
+    this.recordEscalationTriageShadow(row);
     this.considerCandidate({ id: row.id, routing: row.routing, severity: row.severity });
+  }
+
+  /** Issue #224 escalation-triage SHADOW ask at candidate time. Applies
+   * to machine wakes only (action-required rows) that are Silas-authored
+   * escalations. Compute-and-record: the runtime (in `shadow` mode)
+   * records what the provider WOULD have triaged next to the
+   * deterministic baseline and still serves the deterministic answer;
+   * this layer ignores the outcome, so wake behavior cannot change. The
+   * ask is fire-and-forget with isolated logging — it must never delay
+   * or break the wake path. */
+  private recordEscalationTriageShadow(row: NotificationRecord): void {
+    const decisions = this.decisions;
+    if (decisions === null || this.readyForSurface?.(DECISION_SURFACE_ESCALATION_TRIAGE) !== true) return;
+    if (row.routing !== 'action-required' || !isSilasEscalationKind(row.kind)) return;
+    if (this.askedEscalations.has(row.id)) return;
+    if (this.askedEscalations.size >= 512) {
+      const oldest = this.askedEscalations.values().next().value;
+      if (oldest !== undefined) this.askedEscalations.delete(oldest);
+    }
+    this.askedEscalations.add(row.id);
+    const escalations: readonly EscalationFacts[] = [{ kind: row.kind, title: row.title, detail: row.detail }];
+    // Decision memory (issue #218) read-only context for the escalated
+    // subject; absent rows (or an optional-less ledger port) simply ask
+    // without the context keys, exactly like the labelled states.
+    const subject = escalationDecisionSubject(row.kind);
+    const memory: { openDecisions?: readonly DecisionMemoryFacts[]; recentDispositions?: readonly DecisionMemoryFacts[] } = {};
+    if (subject !== null && this.ledger.listDecisions !== undefined) {
+      const toFacts = (rows: readonly DecisionRecord[]): readonly DecisionMemoryFacts[] =>
+        rows.map((decision) => ({ decision: decision.decision, reason: decision.reason, by: decision.by, recheck_at: decision.recheckAt }));
+      try {
+        const open = this.ledger.listDecisions({ subject, activeOnly: true, limit: 8 });
+        if (open.length > 0) memory['openDecisions'] = toFacts(open);
+        const recent = this.ledger.listDecisions({ subject, limit: 5 });
+        if (recent.length > 0) memory['recentDispositions'] = toFacts(recent);
+      } catch (error) {
+        // Memory is enrichment: a failed read still asks, just without it.
+        this.log('debug', 'decision memory read for escalation triage failed; asking without it', {
+          notification_id: row.id,
+          error: String(error),
+        });
+      }
+    }
+    void decisions
+      .decide(
+        escalationTriageDecisionRequest({
+          escalations,
+          mode: this.wakeMode,
+          ...(memory['openDecisions'] !== undefined ? { openDecisions: memory['openDecisions'] } : {}),
+          ...(memory['recentDispositions'] !== undefined ? { recentDispositions: memory['recentDispositions'] } : {}),
+        }),
+        { surface: DECISION_SURFACE_ESCALATION_TRIAGE },
+      )
+      .catch((error: unknown) => {
+        this.log('error', 'escalation-triage shadow ask failed; wake behavior unchanged', {
+          notification_id: row.id,
+          error: String(error),
+        });
+      });
   }
 
   /** Route/severity/dedupe gate, then claim or defer — never fire twice for

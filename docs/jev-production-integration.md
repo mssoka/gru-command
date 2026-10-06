@@ -27,6 +27,28 @@ Jev classifies exactly two surfaces:
 Perkins wave/findings triage and worktree sweep/disposal preflight are
 deliberately OUT of scope and are not wired.
 
+## Shadow surfaces (issue #224)
+
+Three further surfaces exist for the labelled-history backtest harness
+(#223) and ship in `shadow` first: the provider is asked and its answer
+RECORDED next to the deterministic baseline, but the deterministic answer
+is still served — behavior cannot change until the #223 enforce gate is met
+AND the owner records a decision per surface.
+
+| Surface | Question | Fires at | Deterministic baseline |
+|---|---|---|---|
+| `escalation_triage` | choice `triage` (`needs_ruling`, `needs_owner`, `status_report`, `covered_by_open_item`) + noul `needs_decision` | wake-candidate time in the awareness layer, for Silas-authored escalation rows on machine wakes (`action-required`) | every escalation reaches Gru (`needs_ruling`, noul 1 — fail toward a wake) |
+| `same_blocker` | noul `same_defect` over two findings | the Silas digest's recurrence block, when two blockers' #216 fingerprints differ but file and category overlap (capped at 8 pairs per digest, deduped per process) | different fingerprints are different blockers (noul 0 — fail toward the new blocker) |
+| `report_conclusion` | choice `conclusion` (`clean_pass`, `findings_need_action`, `inconclusive`) | wired at #220's report-type handback path (the host change; not built yet) | every delivered report still owes the commissioner a review (`findings_need_action` — never a silent clean pass) |
+
+Escalation-triage requests carry the job's open decisions and recent
+dispositions from decision memory (#218) when any exist for the escalated
+subject; the ask is read-only over that memory. Enforcement preconditions:
+`escalation_triage` additionally needs #219's deferral mechanism (defer,
+never drop; hard floors bypass), and `report_conclusion` needs #220's
+handback host. Same-blocker enforcement needs only the backtest evidence
+and the owner decision.
+
 ## Configuration
 
 Add the generated fragment to `$GRU_COMMAND_HOME/config.toml` (default:

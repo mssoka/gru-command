@@ -15,6 +15,8 @@ import type {
 } from '../ledger/api.js';
 import { LIVE_DIRECTIVE_STATES, type DirectiveState } from '../ledger/directives.js';
 import type { LogLevel } from '../logger.js';
+import { DECISION_SURFACE_SAME_BLOCKER, fileOfLocation, sameBlockerDecisionRequest } from '../decisions/questions.js';
+import type { DecisionService } from '../decisions/types.js';
 import { openAttemptStartSeq } from './branch-idle.js';
 import type { AgentHandle, SpawnOptions } from '../runtime/types.js';
 import type { AgentSupervisionView } from '../supervision/supervisor.js';
@@ -75,6 +77,12 @@ export interface RoundBlocker {
    * part of the base fingerprint (it churns every round) — it only breaks
    * same-key ties inside roundBlockerKeys. */
   readonly evidence?: string;
+  /** Severity and detail ride along when the source report carries them —
+   * they are PROJECTED OUT of the digest rows (kept byte-stable below)
+   * but the #224 same-blocker shadow ask uses the fuller facts so its
+   * request state matches the labelled extractor's exactly. */
+  readonly severity?: string;
+  readonly detail?: string;
 }
 
 export type RecurrenceAdvice = 'monitor' | 'directive' | 'rebrief' | 'escalate';
@@ -198,6 +206,54 @@ export function adviseFollowThrough(
   return recurrence === 'monitor' ? 'directive' : recurrence;
 }
 
+// Same-blocker identity candidates (issue #224). -----------------------------
+
+/** Upper bound on same-blocker candidate pairs per digest build. The
+ * ladder logic is untouched; this only bounds how many shadow asks one
+ * sweep can enqueue. */
+export const SAME_BLOCKER_PAIR_CAP = 8;
+
+export interface SameBlockerPair {
+  readonly prior: RoundBlocker;
+  readonly current: RoundBlocker;
+}
+
+/**
+ * Candidate pairs for the same-blocker identity surface (issue #224):
+ * pairs whose #216 base fingerprints DIFFER but whose file and category
+ * overlap — exactly the ambiguity the deterministic ladder cannot
+ * resolve, so the question "same underlying defect?" is meaningful.
+ * Prior rounds are searched newest-first; one prior match per current
+ * blocker (deduped by base fingerprint); capped. Pure.
+ */
+export function sameBlockerPairs(
+  latest: readonly RoundBlocker[],
+  priorRoundsNewestFirst: readonly (readonly RoundBlocker[])[],
+  cap: number = SAME_BLOCKER_PAIR_CAP,
+): SameBlockerPair[] {
+  const pairs: SameBlockerPair[] = [];
+  const seenCurrent = new Set<string>();
+  for (const blocker of latest) {
+    if (pairs.length >= cap) break;
+    const fingerprint = blockerFingerprint(blocker);
+    if (seenCurrent.has(fingerprint)) continue;
+    seenCurrent.add(fingerprint);
+    const file = fileOfLocation(blocker.location);
+    for (const round of priorRoundsNewestFirst) {
+      const prior = round.find((candidate) =>
+        blockerFingerprint(candidate) !== fingerprint &&
+        candidate.category === blocker.category &&
+        fileOfLocation(candidate.location) === file,
+      );
+      if (prior !== undefined) {
+        pairs.push({ prior, current: blocker });
+        break;
+      }
+    }
+  }
+  return pairs;
+}
+
 // ------------------------------------------------------------------
 // Digest (the four actionable states)
 // ------------------------------------------------------------------
@@ -281,7 +337,7 @@ export function consolidatedBlockersFor(ledger: DigestLedger): BlockersForRound 
         return Promise.resolve({ blockers: [], note: `consolidated report ${file} has no findings array` });
       }
       const blockers = (parsed.findings as unknown[])
-        .map((finding) => finding as Partial<RoundBlocker> & { severity?: unknown })
+        .map((finding) => finding as Partial<RoundBlocker> & { severity?: unknown; detail?: unknown })
         .filter((finding) => finding.severity === 'blocker')
         .map((finding) => ({
           category: String(finding.category ?? ''),
@@ -289,6 +345,9 @@ export function consolidatedBlockersFor(ledger: DigestLedger): BlockersForRound 
           location: String(finding.location ?? ''),
           ...(typeof finding.evidence === 'string' && finding.evidence.trim() !== ''
             ? { evidence: finding.evidence }
+            : {}),
+          ...(typeof finding.detail === 'string' && finding.detail.trim() !== ''
+            ? { detail: finding.detail }
             : {}),
         }));
       return Promise.resolve({ blockers, note: null });
@@ -466,6 +525,12 @@ export interface ComputeDigestInput {
    * waiting on a human re-arm with a recorded cause — the board renders it
    * as waiting, so the digest must not call the same lane stalled. */
   readonly supervisionFor?: (agentId: string) => AgentSupervisionView | null;
+  /** Issue #224 same-blocker shadow candidate observer (shadow only —
+   * the digest NEVER waits on or reads the observer's outcome; the ask,
+   * its dedupe and its error isolation belong to the caller). Invoked
+   * once per same-file/same-category pair whose fingerprints differ,
+   * bounded by SAME_BLOCKER_PAIR_CAP per job. */
+  readonly onSameBlockerPair?: (jobId: string, pair: SameBlockerPair) => void;
 }
 
 /** The head sha a delivery event recorded (`job.delivered.payload.sha`) —
@@ -1019,13 +1084,34 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
           const fingerprint = latestKeys[index];
           if (fingerprint === undefined || seen.has(fingerprint)) return;
           const consecutiveRounds = consecutiveRecurrence(fingerprint, blockerHistory);
+          // Explicit digest row shape: severity/detail stay OUT of the
+          // Silas prompt even though the blocker facts carry them for the
+          // #224 same-blocker ask below; evidence keeps its pre-existing
+          // digest presence (tie-break provenance) unchanged.
           seen.set(fingerprint, {
-            ...blocker,
+            category: blocker.category,
+            title: blocker.title,
+            location: blocker.location,
+            ...(blocker.evidence !== undefined ? { evidence: blocker.evidence } : {}),
             fingerprint,
             consecutiveRounds,
             advice: adviseFollowThrough(consecutiveRounds, input.config),
           });
         });
+        // Same-blocker identity shadow candidates (issue #224): the
+        // observer is fire-and-forget — this must never await, throw, or
+        // otherwise reach the digest.
+        if (input.onSameBlockerPair !== undefined) {
+          for (const pair of sameBlockerPairs(latest, blockerHistory.slice(1))) {
+            try {
+              input.onSameBlockerPair(job.id, pair);
+            } catch (error) {
+              // An observer that throws synchronously is a caller bug;
+              // the digest is already computed, so log and move on.
+              console.error('silas same-blocker observer failed', String(error));
+            }
+          }
+        }
         digest.verdictsAwaitingDirective.push({
           jobId: job.id,
           repo: job.repo,
@@ -1538,6 +1624,13 @@ export interface SilasDriverOptions {
   readonly skills?: readonly SkillModule[];
   readonly blockersForRound?: BlockersForRound;
   readonly log?: Log;
+  /** Issue #224 shadow wiring: the decision service asked for same-blocker
+   * identity, and the per-surface readiness gate. The ask is shadow-only
+   * (compute and record; the runtime serves and the driver ignores the
+   * answer — the recurrence ladder stays deterministic). Omitting either
+   * leaves the driver exactly as before. */
+  readonly decisions?: Pick<DecisionService, 'decide'>;
+  readonly readyForSurface?: (surface: string) => boolean;
   /** Deterministic no-LLM pass hook (chief phase-3 seam, issue #163):
    * invoked at the top of every trigger — bus wake events and sweep ticks
    * alike — BEFORE any slot wake/LLM work. The pass must be bounded; the
@@ -1609,6 +1702,11 @@ export class SilasDriver {
   private readonly setIntervalImpl: typeof setInterval;
   private readonly clearIntervalImpl: typeof clearInterval;
   private readonly unsubscribe: (() => void) | null = null;
+  /** Same-blocker shadow dedupe (issue #224): pair keys already asked
+   * this process. A spend guard, not a correctness contract — the ledger
+   * record's request_hash is the analytical truth, and a restart may
+   * re-ask. FIFO-evicted at 512 keys. */
+  private readonly sameBlockerAsked = new Set<string>();
   private timer: ReturnType<typeof setInterval> | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private pollInFlight = false;
@@ -1637,6 +1735,28 @@ export class SilasDriver {
 
   get running(): boolean {
     return this.timer !== null;
+  }
+
+  /** Fire-and-forget shadow ask for one same-blocker candidate pair
+   * (issue #224). Compute-and-record only: the answer is ignored, the
+   * recurrence ladder stays deterministic, and every failure is logged —
+   * never thrown. Deduped per process by job + fingerprint pair; capped
+   * so one digest can never enqueue unbounded asks. */
+  private recordSameBlockerShadow(jobId: string, pair: SameBlockerPair): void {
+    const decisions = this.opts.decisions;
+    if (decisions === undefined || this.opts.readyForSurface?.(DECISION_SURFACE_SAME_BLOCKER) !== true) return;
+    const key = `${jobId}\u0000${blockerFingerprint(pair.prior)}\u0001${blockerFingerprint(pair.current)}`;
+    if (this.sameBlockerAsked.has(key)) return;
+    if (this.sameBlockerAsked.size >= 512) {
+      const oldest = this.sameBlockerAsked.values().next().value;
+      if (oldest !== undefined) this.sameBlockerAsked.delete(oldest);
+    }
+    this.sameBlockerAsked.add(key);
+    void decisions
+      .decide(sameBlockerDecisionRequest(pair.prior, pair.current), { surface: DECISION_SURFACE_SAME_BLOCKER })
+      .catch((error: unknown) => {
+        this.log('error', 'same-blocker shadow ask failed; recurrence ladder unchanged', { job: jobId, error: String(error) });
+      });
   }
 
   /** The fast GitHub signal poll timer (independent of the sweep). */
@@ -1882,6 +2002,9 @@ export class SilasDriver {
         trigger: trigger.kind,
         now: this.now,
         ...(this.opts.supervisionFor !== undefined ? { supervisionFor: this.opts.supervisionFor } : {}),
+        ...(this.opts.decisions !== undefined
+          ? { onSameBlockerPair: (jobId: string, pair: SameBlockerPair) => this.recordSameBlockerShadow(jobId, pair) }
+          : {}),
       });
     } catch (error) {
       this.log('error', 'silas digest computation failed', { trigger: trigger.kind, error: String(error) });

@@ -980,6 +980,11 @@ async function main(): Promise<number> {
     wakeQuietHours: config.chat.wakeQuietHours,
     morningDigestGapMs: config.chat.morningDigestGapMs,
     onFollowUpPosted: (notification) => surfaceInChat(notification),
+    // Issue #224 shadow wiring: escalation-triage asks at candidate time.
+    // Shadow mode records without changing wake behavior; the ask only
+    // fires when the escalation_triage surface is ready.
+    decisions: decisionRuntime,
+    readyForSurface: (surface) => decisionRuntime.readyFor(surface),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   const chat = createChatServer({
@@ -1558,6 +1563,11 @@ async function main(): Promise<number> {
       // getter keeps the lookup late-bound like the engine's closure — a
       // construction-order change can never freeze a null handle (A4).
       supervisionFor: supervisionLookup(() => supervisor),
+      // Issue #224 shadow wiring: same-blocker identity asks from the
+      // recurrence block. Shadow mode records without changing the
+      // ladder; the ask only fires when the same_blocker surface is ready.
+      decisions: decisionRuntime,
+      readyForSurface: (surface) => decisionRuntime.readyFor(surface),
       // Chief phase-3 seam: every deterministic Silas pass runs the
       // production hook — the in-memory review-handoff reconsideration
       // plus the bounded durable reconciliation (issue #163) — BEFORE any

@@ -28,12 +28,22 @@ import {
   writeCredential,
 } from '../src/decisions/credentials.js';
 import {
+  ESCALATION_TRIAGE_QUESTIONS,
+  REPORT_CONCLUSION_QUESTIONS,
+  SAME_BLOCKER_QUESTIONS,
   deterministicFailureClass,
   eventDecisionRequest,
+  escalationTriageDecisionRequest,
+  fileOfLocation,
   filteredState,
   redactedText,
+  reportConclusionDecisionRequest,
+  reportConclusionState,
+  sameBlockerDecisionRequest,
   supervisionDecisionRequest,
 } from '../src/decisions/questions.js';
+import type { EscalationFacts } from '../src/decisions/questions.js';
+import { surfaceCaseSpec } from '../src/decisions/cases/registry.js';
 import { ProfileDecisionService, ProfileProvider } from '../src/decisions/provider.js';
 import { checkDecisionProfile, DecisionRuntime } from '../src/decisions/runtime.js';
 import { deterministicOutcome } from '../src/decisions/service.js';
@@ -1878,5 +1888,109 @@ describe('systemone failure-path mapping (review: both protocols covered)', () =
   });
   it('maps timeouts on the systemone protocol', async () => {
     await expectSystemoneFallback(0, 'timeout', 'hang');
+  });
+});
+
+// ------------------------------------------------------------------
+// Issue #224: the three shadow surfaces — question sets, builders,
+// and exact parity with the labelled-history measurement contract.
+// ------------------------------------------------------------------
+
+describe('issue #224 shadow surfaces — question sets, builders, backtest parity', () => {
+  const esc = (over: Partial<EscalationFacts> = {}): EscalationFacts => ({
+    kind: 'silas.escalated:job-1',
+    title: 'typecheck blocked',
+    detail: 'ONE scheduled typecheck RAN (run 567a1364)',
+    ...over,
+  });
+
+  it('pins the escalation-triage vocabulary: options, risks and the fail-toward-a-wake fallback', () => {
+    expect(ESCALATION_TRIAGE_QUESTIONS.triage.options).toEqual([
+      'needs_ruling',
+      'needs_owner',
+      'status_report',
+      'covered_by_open_item',
+    ]);
+    const request = escalationTriageDecisionRequest({ escalations: [esc()], mode: 'action-required' });
+    expect(request.risks).toEqual({ triage: 'operational', needs_decision: 'read_only' });
+    expect(request.fallback.triage).toMatchObject({ type: 'choice', choice: 'needs_ruling', confidence: 1 });
+    expect(request.fallback.needs_decision).toEqual({ type: 'noul', noul: 1 });
+  });
+
+  it('builds the escalation state in the labelled extractor\'s shape and omits empty memory keys', () => {
+    const request = escalationTriageDecisionRequest({ escalations: [esc()], mode: 'action-required' });
+    expect(request.state).toBe(filteredState({
+      wake: { notification_count: 1, mode: 'action-required' },
+      escalations: [esc()],
+    }));
+    const withMemory = escalationTriageDecisionRequest({
+      escalations: [esc()],
+      mode: 'action-required',
+      openDecisions: [{ decision: 'hold', reason: 'waiting on upstream', by: 'owner', recheck_at: '2026-10-08T00:00:00.000Z' }],
+      recentDispositions: [{ decision: 'acted', reason: 'directive sent', by: 'silas', recheck_at: null }],
+    });
+    expect(withMemory.state).toContain('open_decisions');
+    expect(withMemory.state).toContain('recent_dispositions');
+    expect(withMemory.state).toContain('waiting on upstream');
+  });
+
+  it('redacts secrets inside escalation facts before they reach the state', () => {
+    const request = escalationTriageDecisionRequest({
+      escalations: [esc({ detail: 'leaked OPENROUTER_API_KEY=sk-or-v1-abcdefghijklmnop in logs' })],
+      mode: null,
+    });
+    expect(request.state).not.toContain('sk-or-v1-abcdefghijklmnop');
+    expect(request.state).toContain('[redacted]');
+  });
+
+  it('pins the same-blocker vocabulary and pair-state parity with the extractor', () => {
+    const request = sameBlockerDecisionRequest(
+      { category: 'correctness', location: 'src/a.ts:10', title: 'null deref' },
+      { category: 'correctness', location: 'src/a.ts:42', title: 'null deref on empty path', detail: 'crash in parse' },
+    );
+    expect(request.risks).toEqual({ same_defect: 'operational' });
+    expect(request.fallback.same_defect).toEqual({ type: 'noul', noul: 0 });
+    // Exact shape the labelled extractor measures (severity/detail appear
+    // only when the caller carries them).
+    expect(request.state).toBe(filteredState({
+      prior_finding: { title: 'null deref', category: 'correctness', location: 'src/a.ts:10' },
+      current_finding: { title: 'null deref on empty path', category: 'correctness', location: 'src/a.ts:42', detail: 'crash in parse' },
+    }));
+  });
+
+  it('fileOfLocation strips line/column suffixes', () => {
+    expect(fileOfLocation('src/a.ts')).toBe('src/a.ts');
+    expect(fileOfLocation(' src/a.ts:12 ')).toBe('src/a.ts');
+    expect(fileOfLocation('src/a.ts:12:34')).toBe('src/a.ts');
+  });
+
+  it('pins the report-conclusion vocabulary: never a silent clean pass', () => {
+    const request = reportConclusionDecisionRequest('## Summary\nall good\n\n**Verdict: READY TO MERGE**');
+    expect(request.risks).toEqual({ conclusion: 'operational' });
+    expect(request.fallback.conclusion).toMatchObject({ type: 'choice', choice: 'findings_need_action', confidence: 1 });
+    // The verdict line is the LABEL: it never rides in the request state.
+    expect(request.state).toBe(filteredState({ report: '## Summary\nall good' }));
+  });
+
+  it('strips verdict lines in every canonical spelling but keeps everything else', () => {
+    const state = reportConclusionState('verdict: needs changes\nbody line\nVerdict: MAJOR REWORK NEEDED\nmore body');
+    expect(state).toBe(filteredState({ report: 'body line\nmore body' }));
+  });
+
+  it('the backtest registry measures exactly the production question sets and baselines', () => {
+    expect(surfaceCaseSpec('escalation_triage').questions).toBe(ESCALATION_TRIAGE_QUESTIONS);
+    expect(surfaceCaseSpec('same_blocker').questions).toBe(SAME_BLOCKER_QUESTIONS);
+    expect(surfaceCaseSpec('report_conclusion').questions).toBe(REPORT_CONCLUSION_QUESTIONS);
+    // Baseline parity: the specs' deterministic fallbacks are the same
+    // constants the production builders pin.
+    expect(surfaceCaseSpec('escalation_triage').fallback)
+      .toEqual(escalationTriageDecisionRequest({ escalations: [esc()], mode: null }).fallback);
+    expect(surfaceCaseSpec('same_blocker').fallback)
+      .toEqual(sameBlockerDecisionRequest(
+        { category: 'c', location: 'a.ts', title: 't' },
+        { category: 'c', location: 'a.ts', title: 'u' },
+      ).fallback);
+    expect(surfaceCaseSpec('report_conclusion').fallback)
+      .toEqual(reportConclusionDecisionRequest('body').fallback);
   });
 });

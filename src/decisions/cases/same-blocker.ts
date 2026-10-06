@@ -1,29 +1,17 @@
-import type { QuestionSet } from '../types.js';
+import { SAME_BLOCKER_QUESTIONS } from '../questions.js';
 import type { SurfaceCaseSpec } from './registry.js';
 
 /**
  * Same-blocker case vocabulary (issues #223/#224).
  *
- * #224's same-blocker identity surface: "do these two findings describe
- * the same underlying defect?" — asked when the #216 stable fingerprints
- * differ but file and category overlap. The DETERMINISTIC BASELINE is
- * today's rule: differing fingerprints are DIFFERENT blockers (noul 0) —
+ * The canonical question set lives in `../questions.ts` (issue #224's
+ * wiring asks exactly these questions). This spec owns the DETERMINISTIC
+ * BASELINE: differing fingerprints are DIFFERENT blockers (noul 0) —
  * treating same as different is the conservative default the provider
  * must earn the right to overturn.
  */
 
 export const SAME_BLOCKER_LABELS = ['same', 'different'] as const;
-
-export const SAME_BLOCKER_QUESTIONS = {
-  same_defect: {
-    type: 'noul',
-    instructions: 'Do these two review findings describe the same underlying defect?',
-    criteria: {
-      true: 'The two findings are the same defect and should share one recurrence ladder entry.',
-      false: 'The two findings are distinct defects even if they touch the same file.',
-    },
-  },
-} as const satisfies QuestionSet;
 
 export const SAME_BLOCKER_SPEC: SurfaceCaseSpec<typeof SAME_BLOCKER_QUESTIONS> = {
   surface: 'same_blocker',

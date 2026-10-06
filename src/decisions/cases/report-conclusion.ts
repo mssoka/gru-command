@@ -1,31 +1,18 @@
-import { choiceProbabilities } from '../questions.js';
-import type { QuestionSet } from '../types.js';
+import { REPORT_CONCLUSION_QUESTIONS, choiceProbabilities } from '../questions.js';
 import type { SurfaceCaseSpec } from './registry.js';
 
 /**
  * Report-conclusion case vocabulary (issues #223/#224).
  *
- * #224's report-conclusion surface over report-type handbacks. The
- * DETERMINISTIC BASELINE is today's behavior: every delivered report
- * still owes the commissioner a review (`findings_need_action`) —
- * #220's disposition records do not exist yet, so nothing may be
- * auto-cleared without evidence to the contrary.
+ * The canonical question set lives in `../questions.ts` (issue #224's
+ * builder asks exactly these questions; its production ask wires at
+ * #220's report handback path). This spec owns the DETERMINISTIC
+ * BASELINE: every delivered report still owes the commissioner a review
+ * (`findings_need_action`) — nothing may be auto-cleared without
+ * evidence to the contrary.
  */
 
 export const REPORT_CONCLUSION_LABELS = ['clean_pass', 'findings_need_action', 'inconclusive'] as const;
-
-export const REPORT_CONCLUSION_QUESTIONS = {
-  conclusion: {
-    type: 'choice',
-    instructions: 'Conclude this report-type handback for the commissioner.',
-    options: ['clean_pass', 'findings_need_action', 'inconclusive'] as const,
-    criteria: {
-      clean_pass: 'The report supports closing the obligation with no further work.',
-      findings_need_action: 'The report contains findings someone must act on.',
-      inconclusive: 'The report does not contain enough evidence to conclude either way.',
-    },
-  },
-} as const satisfies QuestionSet;
 
 /** Map a Perkins canonical verdict (the report's verdict line, durable in
  * consolidated.json) to the labelled case's ground truth. */
