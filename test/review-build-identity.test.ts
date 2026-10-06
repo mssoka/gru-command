@@ -26,6 +26,21 @@ const fixture = (prefix: string): string => {
 };
 afterEach(() => { vi.unstubAllEnvs(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
+/** Copy a directory tree; on darwin try APFS clonefile first (the fixture
+ * copies ~150MB of installed dependency per identity, and cloning is
+ * near-instant while still giving each caller a private tree). */
+function copyTree(source: string, destination: string): void {
+  if (process.platform === 'darwin') {
+    try {
+      execFileSync('cp', ['-cR', source, destination], { stdio: 'ignore' });
+      return;
+    } catch {
+      // Clone unsupported (different volume/filesystem) — portable copy.
+    }
+  }
+  cpSync(source, destination, { recursive: true });
+}
+
 /** The build+packed tarball is the same bytes for every identity fixture
  * in this file, so it is built and packed ONCE and reused: the four
  * `packageIdentity()` calls used to rebuild and repack the whole source,
@@ -105,11 +120,10 @@ function packageIdentity(): { root: string; identity: string } {
   for (const directory of packageClosure(source)) {
     const destination = join(installed, directory.slice(source.length + 1));
     mkdirSync(dirname(destination), { recursive: true });
-    // `cpSync` (never a clone shorthand): its default symlink resolution
-    // is part of the installed-tree contract `reviewRuntimeVersion`
-    // walks, and clonefile/`cp -R` would leave relative `.bin` targets
-    // the walk rejects.
-    cpSync(directory, destination, { recursive: true });
+    // APFS clonefile first: a plain cpSync of this closure takes 80-100s
+    // per identity on this host, while cloning is ~13s and yields the
+    // same directory tree. Fall back to cpSync portably.
+    copyTree(directory, destination);
   }
   expect(existsSync(join(installed, 'node_modules', '@earendil-works', 'pi-ai'))).toBe(true);
   return { root: installed, identity: reviewRuntimeVersion(installed) };

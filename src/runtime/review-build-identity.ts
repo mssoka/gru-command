@@ -330,7 +330,7 @@ export function reviewRuntimeVersion(packageRoot: string): string {
           // installed pathname (even a .js or catalog JSON) into a digest.
           const publicPath = installed ? `${packageName}/${treePrefix}${name}` : relativePath;
           if (!PUBLIC_REVIEW_EXECUTABLE_PATHS.has(publicPath)) {
-            throw new Error('review runtime contains an unproven executable path');
+            throw new Error(`review runtime contains an unproven executable path: ${publicPath}`);
           }
           const beforeRead = () => { assertDirectoryReceipt(parentFd, parentReceipt); checkRoot(); };
           const bytes = process.platform === 'darwin'
