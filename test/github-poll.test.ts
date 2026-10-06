@@ -33,6 +33,8 @@ import {
 } from '../src/dispatch/github-poll.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
+import { EventBus } from '../src/events/bus.js';
+import { NotificationCenter } from '../src/notifications/center.js';
 import { renderRecordedCiEvidence } from '../src/review-inputs/ci-evidence.js';
 
 /**
@@ -610,12 +612,16 @@ describe('github signal poll tick', () => {
       expect(notifications.posts).toHaveLength(1);
       expect(notifications.posts[0]).toMatchObject({
         kind: 'github.pr-conflict:job-conflict',
-        routing: 'action-required',
+        // Issue #215: mechanical tier routes fyi like mechanical CI —
+        // the digest and board visibility carry the conflict, Gru is
+        // never woken for it.
+        routing: 'fyi',
         severity: 'error',
         dedupe: 'unacked',
         agentId: 'minion-conflict',
       });
       expect(notifications.posts[0]?.detail).toContain('rebase');
+      expect(notifications.posts[0]?.detail).toContain('Silas owns the rebase within mandate');
 
       // one dedupe cursor per job, recording the observed state
       for (const jobId of ['job-merge', 'job-conflict']) {
@@ -623,6 +629,35 @@ describe('github signal poll tick', () => {
       }
       expect(readBranchState(h.ledger, 'job-merge')?.merged).toBe(true);
       expect(readBranchState(h.ledger, 'job-conflict')?.mergeableState).toBe('dirty');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a mechanical conflict posts fyi and is never a Gru wake candidate under notify_wake action-required (issue #215)', async () => {
+    const h = makeLedger();
+    try {
+      addTrackedJob(h.ledger, 'job-dirty', 'https://github.com/acme/app/pull/21');
+      const api = new FakeGhApi();
+      api.pulls.set('acme/app', [pull({ number: 21, headRef: 'gru/job-dirty', headSha: 'sha-21' })]);
+      api.details.set('acme/app#21', pull({ number: 21, headRef: 'gru/job-dirty', headSha: 'sha-21', mergeableState: 'dirty' }));
+      const notifications = new FakeNotifications();
+      const poll = makePoll({ ledger: h.ledger, api, notifications });
+
+      const result = await poll.pollOnce();
+      expect(result.signals.map((signal) => signal.kind)).toEqual(['pr-conflict']);
+      // Same tier rule as mechanical CI: routing fyi means the
+      // action-required wake policy never sees a candidate; the ledger
+      // event stays the record.
+      expect(notifications.posts).toHaveLength(1);
+      expect(notifications.posts[0]).toMatchObject({
+        kind: 'github.pr-conflict:job-dirty',
+        routing: 'fyi',
+        severity: 'error',
+        dedupe: 'unacked',
+      });
+      expect(notifications.posts[0]?.title).toContain('conflicts with its base');
+      expect(h.ledger.latestJobEvent('job-dirty', 'github.pr-conflict')).not.toBeNull();
     } finally {
       h.cleanup();
     }
@@ -752,9 +787,50 @@ describe('github signal poll tick', () => {
       expect(notifications.posts).toHaveLength(1);
       expect(notifications.posts[0]).toMatchObject({
         kind: 'github.pr-conflict:job-nominion',
-        routing: 'action-required',
+        routing: 'fyi',
         agentId: null,
       });
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a pre-#215 unacked action-required conflict row is re-triaged fyi so it stops waking Gru (issue #215)', async () => {
+    const h = makeLedger();
+    try {
+      addTrackedJob(h.ledger, 'job-legacy', 'https://github.com/acme/app/pull/41');
+      // A legacy row from before the routing change: postIncident dedupe
+      // would reuse it forever with its old wake-eligible routing.
+      const center = new NotificationCenter({ ledger: h.ledger, bus: new EventBus() });
+      const legacy = center.postIncident({
+        kind: 'github.pr-conflict:job-legacy',
+        routing: 'action-required',
+        severity: 'error',
+        title: 'PR #41 conflicts with its base (acme/app)',
+        dedupe: 'unacked',
+        agentId: null,
+      });
+      expect(legacy.routing).toBe('action-required');
+      const api = new FakeGhApi();
+      api.pulls.set('acme/app', [pull({ number: 41, headRef: 'gru/job-legacy', headSha: 'sha-41' })]);
+      api.details.set('acme/app#41', pull({ number: 41, headRef: 'gru/job-legacy', headSha: 'sha-41', mergeableState: 'dirty' }));
+      const poll = new GitHubSignalPoll({
+        ledger: h.ledger,
+        notifications: {
+          postIncident: (input: Parameters<NotificationCenter['postIncident']>[0]) => center.postIncident(input),
+          retriageUnacked: (kind: string, routing: 'action-required' | 'fyi' | 'needs-owner', by: string) =>
+            center.retriageUnacked(kind, routing, by),
+        },
+        api,
+        resolveRemote: () => null,
+      });
+
+      await poll.pollOnce();
+      const rows = h.ledger.listNotifications().filter((row) => row.kind === 'github.pr-conflict:job-legacy');
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.routing).toBe('fyi');
+      expect(rows[0]?.id).toBe(legacy.id);
+      expect(rows[0]?.ackedAt).toBeNull();
     } finally {
       h.cleanup();
     }

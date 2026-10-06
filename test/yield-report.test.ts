@@ -67,6 +67,7 @@ const emptyDigest: SilasOpsDigest = {
   verificationFailures: [],
   verificationWaits: [],
   providerRecoveryPending: [],
+  conflictingPrs: [],
 };
 
 const noSkills: readonly SkillModule[] = [];
@@ -154,6 +155,15 @@ function digestJson(jobIdsByCategory: Partial<Record<(typeof DIGEST_CATEGORY_KEY
       slotId: null,
       route: 'r',
       recoveredAt: '2026-10-01T00:00:00.000Z',
+    })),
+    conflictingPrs: (jobIdsByCategory.conflictingPrs ?? []).map((jobId) => ({
+      jobId,
+      repo: 'r',
+      branch: null,
+      prNumber: null,
+      prUrl: null,
+      headSha: 'sha',
+      firstSeenAt: null,
     })),
   };
   return JSON.stringify(digest, null, 2);
@@ -365,6 +375,14 @@ describe('digestSignatureFromPrompt', () => {
     expect(withWait).not.toBeNull();
     expect(withWait).not.toBe(withOtherWait);
     expect((JSON.parse(withWait ?? '') as Record<string, string[]>)['providerRecoveryPending']).toEqual(['wait-1']);
+  });
+
+  it('a conflicting-PR row participates in the signature (GH-215 category adoption)', () => {
+    const without = digestSignatureFromPrompt(sweepPromptWithDigest({ deliveredWithoutPr: ['job-a'] }));
+    const withConflict = digestSignatureFromPrompt(sweepPromptWithDigest({ deliveredWithoutPr: ['job-a'], conflictingPrs: ['job-conf'] }));
+    expect(withConflict).not.toBeNull();
+    expect(withConflict).not.toBe(without);
+    expect((JSON.parse(withConflict ?? '') as Record<string, string[]>)['conflictingPrs']).toEqual(['job-conf']);
   });
 
   it('returns null for prompts without a parseable digest', () => {

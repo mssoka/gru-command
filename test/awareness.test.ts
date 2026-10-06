@@ -301,6 +301,29 @@ describe('gru awareness — wake policy', () => {
     expect(rig.woke).toEqual([]);
   });
 
+  it('a mechanical PR conflict routes fyi and never becomes a Gru wake candidate (issue #215)', () => {
+    const rig = boot({ wakeMode: 'action-required' });
+    rig.notifications.post({
+      kind: 'github.pr-conflict:job-1',
+      routing: 'fyi',
+      severity: 'error',
+      title: 'PR #11 conflicts with its base (acme/app)',
+      detail: 'Mechanical tier: Silas owns the rebase within mandate for #11; tracked in his digest, not a Gru wake.',
+    });
+    // The mechanical conflict is Silas's digest work: under the default
+    // action-required wake policy it is a passive ℹ row, never a wake —
+    // the judgment escalation that follows is what wakes, exactly once.
+    expect(rig.woke).toHaveLength(0);
+    rig.notifications.post({
+      kind: 'review-escalation',
+      routing: 'action-required',
+      severity: 'error',
+      title: 'Escalation',
+    });
+    expect(rig.woke).toHaveLength(1);
+    expect(rig.wakeBlocks[0]).not.toContain('conflicts with its base');
+  });
+
   it("wake 'action-required': escalations wake once; FYI stays passive", () => {
     const rig = boot({ wakeMode: 'action-required' });
     rig.notifications.post({ kind: 'round.verdict', routing: 'fyi', severity: 'info', title: 'FYI' });

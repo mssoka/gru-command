@@ -161,6 +161,7 @@ export const DIGEST_CATEGORY_KEYS = [
   'verificationFailures',
   'verificationWaits',
   'providerRecoveryPending',
+  'conflictingPrs',
 ] as const;
 
 /** Parse the fenced digest JSON from a Silas wake prompt and reduce it to

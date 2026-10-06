@@ -607,8 +607,9 @@ the judgment; the dispatch surface is the mechanical hand.
   call per repo per tick where possible. Each observed state CHANGE
   applies exactly once: PR merged → `in-review → merged` transition plus
   a `github.pr-merged` event; PR conflicting (`mergeable_state: dirty`) →
-  `github.pr-conflict` plus an action-required cascade notification
-  (mechanical tier — Silas may arm a rebase lane within mandate); CI
+  `github.pr-conflict` plus an fyi notification (mechanical tier — Silas
+  owns the rebase within mandate; the conflict lands in his digest's
+  `conflictingPrs` rows and never wakes Gru, issue #215); CI
   failed → `github.ci-failed` plus a notification carrying the run URL,
   routed by check kind (mechanical → fyi, judgment → wake-eligible
   action-required); CI green → `github.ci-green` review-gate signal.
@@ -642,7 +643,10 @@ the judgment; the dispatch surface is the mechanical hand.
   still withdraws the offer. Failed attempts stay eligible: a 409
   deferral and a fallback that never engaged (`unavailable`) or ended
   `blocked`/`aborted` answer nothing, so the same abort reappears for the
-  next sweep. NEEDS CHANGES
+  next sweep. Conflicting PR heads (issue #215) are digest rows too: a
+  live PR-owing lane whose open head is dirty against its base is Silas's
+  mechanical rebase work — suppressed while a directive, re-brief or
+  verification owns the lane, and never a Gru wake. NEEDS CHANGES
   verdicts awaiting follow-through, with per-blocker recurrence analysis;
   working lanes whose minion has been silent past `stall_threshold_ms`;
   plus recent minion errors for context.
