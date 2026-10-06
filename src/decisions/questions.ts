@@ -2,12 +2,20 @@ import type { BusEvent } from '../events/bus.js';
 import type { DecisionRequest, QuestionSet, ScoreAnswer } from './types.js';
 
 /**
- * The stable decision surface names (issue #222). Each production caller
- * passes its surface to `decide` so `[decisions.surfaces]` can route it to
- * a provider profile; an unrouted surface rides the default profile.
+ * The stable decision surface names (issues #222/#224). Each production
+ * caller passes its surface to `decide` so `[decisions.surfaces]` can
+ * route it to a provider profile; an unrouted surface rides the default
+ * profile. The three #224 surfaces ship in `shadow` first: ask, record,
+ * and still serve the deterministic answer (see README of the backtest
+ * harness — `mode = "enforce"` additionally requires recorded backtest
+ * evidence and an owner decision, and escalation-triage enforcement also
+ * requires #219's deferral mechanism).
  */
 export const DECISION_SURFACE_EVENT_TRIAGE = 'event_triage';
 export const DECISION_SURFACE_SUPERVISION = 'supervision_guidance';
+export const DECISION_SURFACE_ESCALATION_TRIAGE = 'escalation_triage';
+export const DECISION_SURFACE_SAME_BLOCKER = 'same_blocker';
+export const DECISION_SURFACE_REPORT_CONCLUSION = 'report_conclusion';
 
 const SECRET_KEY_CANONICAL = /(?:authorization|proxyauthorization|apikey|token|accesstoken|refreshtoken|idtoken|password|passwd|secret|clientsecret|credential|cookie|sessionid|sessionkey|sessiontoken|awssecretaccesskey|privatekey)/i;
 const SECRET_FIELD = String.raw`(?:authorization|proxy[-_\s]?authorization|api[-_\s]?key|(?:access|refresh|id)[-_\s]?token|token|password|passwd|(?:client[-_\s]?)?secret|credential|cookie|session[-_\s]?(?:id|key|token)|aws[-_\s]?secret[-_\s]?access[-_\s]?key|private[-_\s]?key)`;
@@ -246,6 +254,274 @@ export function supervisionDecisionRequest(input: {
       },
       restart_advised: { type: 'noul', noul: restart ? 1 : 0 },
       severity: scoreFallback(restart ? 1 : 2, 3),
+    },
+  };
+}
+
+// ------------------------------------------------------------------
+// The three shadow surfaces (issue #224)
+//
+// Question sets are the SINGLE production home of the vocabulary the
+// backtest harness (issue #223) measures: the `cases/` specs import them
+// from here so a backtest can never drift from what production asks.
+// Every surface is `operational`-risk with a deterministic fallback that
+// FAILS TOWARD THE WAKE / THE NEW BLOCKER / THE COMMISSIONER REVIEW —
+// the conservative side is the side that keeps a human in the loop.
+// ------------------------------------------------------------------
+
+/**
+ * ESCALATION TRIAGE (machine wakes only). Classifies a Silas-authored
+ * escalation at wake-candidate time: does it ask the chief for a decision
+ * that is not already recorded (decision memory, issue #218), or is it a
+ * status report / already-covered item? The deterministic baseline is
+ * today's behavior — every escalation reaches Gru (`needs_ruling`, noul
+ * 1) — so an unavailable or low-confidence answer always wakes.
+ */
+export const ESCALATION_TRIAGE_QUESTIONS = {
+  triage: {
+    type: 'choice',
+    instructions: 'Classify this machine-authored escalation by the attention it needs.',
+    options: ['needs_ruling', 'needs_owner', 'status_report', 'covered_by_open_item'] as const,
+    criteria: {
+      needs_ruling: 'The escalation asks for a decision a human or the chief must make now.',
+      needs_owner: 'Only the repository owner can decide this (credentials, spend, policy).',
+      status_report: 'The escalation only reports progress or status; no response is needed.',
+      covered_by_open_item: 'The ask is already covered by an open item, hold or disposition.',
+    },
+  },
+  needs_decision: {
+    type: 'noul',
+    instructions: 'Does this escalation ask the chief for a decision not already recorded in the listed holds/dispositions?',
+    criteria: {
+      true: 'A new decision is being asked for.',
+      false: 'No new decision is asked for; the escalation is informational or already covered.',
+    },
+  },
+} as const satisfies QuestionSet;
+
+/** One escalation row as the request state carries it: the ledger
+ * notification's stable identity fields (already durable, already
+ * redacted at write time; `filteredState` re-redacts defensively). */
+export interface EscalationFacts {
+  readonly kind: string;
+  readonly title: string | null;
+  readonly detail: string | null;
+}
+
+/** One decision-memory row (issue #218) reduced to what triage needs.
+ * `covers` and `basis_fingerprint` ride along so a hold scoped to another
+ * signal — or one made against a stale basis — cannot read as an
+ * applicable open item. */
+export interface DecisionMemoryFacts {
+  readonly decision: string;
+  readonly reason: string;
+  readonly by: string;
+  /** The decision's covered signals, canonical order, joined — a string
+   * survives `filteredState`'s bounded-depth rendering without
+   * truncation. */
+  readonly covers: string;
+  readonly basis_fingerprint: string | null;
+  readonly recheck_at: string | null;
+}
+
+export interface EscalationTriageInput {
+  /** The Silas-authored escalation rows in this wake candidate batch. */
+  readonly escalations: readonly EscalationFacts[];
+  /** The wake policy mode the candidate arrived under (e.g.
+   * `action-required`), for provenance of "machine wake". */
+  readonly mode: string | null;
+  /** Open decision-memory rows for the escalated subject (issue #218).
+   * Empty until decision memory records one — the key is omitted so the
+   * state matches the labelled extractor's shape exactly. */
+  readonly openDecisions?: readonly DecisionMemoryFacts[];
+  /** Recent dispositions for the escalated subject (issue #218), newest
+   * first. Omitted for the same parity reason. */
+  readonly recentDispositions?: readonly DecisionMemoryFacts[];
+}
+
+export function escalationTriageDecisionRequest(input: EscalationTriageInput): DecisionRequest<typeof ESCALATION_TRIAGE_QUESTIONS> {
+  const state: Record<string, unknown> = {
+    wake: { notification_count: input.escalations.length, mode: input.mode },
+    escalations: input.escalations,
+  };
+  if (input.openDecisions !== undefined && input.openDecisions.length > 0) state['open_decisions'] = input.openDecisions;
+  if (input.recentDispositions !== undefined && input.recentDispositions.length > 0) state['recent_dispositions'] = input.recentDispositions;
+  return {
+    state: filteredState(state),
+    questions: ESCALATION_TRIAGE_QUESTIONS,
+    risks: { triage: 'operational', needs_decision: 'read_only' },
+    // Fail toward a wake: the baseline IS "reach Gru".
+    fallback: {
+      triage: {
+        type: 'choice',
+        choice: 'needs_ruling',
+        probabilities: choiceProbabilities(ESCALATION_TRIAGE_QUESTIONS.triage.options, 'needs_ruling'),
+        confidence: 1,
+      },
+      needs_decision: { type: 'noul', noul: 1 },
+    },
+  };
+}
+
+/**
+ * SAME-BLOCKER IDENTITY. Asked when two review findings carry DIFFERENT
+ * #216 stable fingerprints but overlap on file and category: do they
+ * describe the same underlying defect? The deterministic baseline is
+ * today's rule — different fingerprints are DIFFERENT blockers (noul 0)
+ * — so a wrongly-merged pair stays impossible without a confident
+ * provider answer (a hidden live defect is worse than a duplicate rung).
+ */
+export const SAME_BLOCKER_QUESTIONS = {
+  same_defect: {
+    type: 'noul',
+    instructions: 'Do these two review findings describe the same underlying defect?',
+    criteria: {
+      true: 'The two findings are the same defect and should share one recurrence ladder entry.',
+      false: 'The two findings are distinct defects even if they touch the same file.',
+    },
+  },
+} as const satisfies QuestionSet;
+
+/** One side of a same-blocker pair. The digest's `RoundBlocker` carries
+ * the first three; severity/detail ride along when the caller has them
+ * (the labelled extractor always does). */
+export interface BlockerFacts {
+  readonly category: string;
+  readonly location: string;
+  readonly title: string;
+  readonly severity?: string | null;
+  readonly detail?: string | null;
+}
+
+/** A finding's file: the SAME normalization #216's blockerLocationKey
+ * applies (separators, `#L`/line/range suffixes, case) plus one trailing
+ * `:column` strip for `path:line:col` locations — a strict superset, so
+ * a candidate pair's file check can never contradict the fingerprint
+ * identity that guards it while still matching plain file-level overlap.
+ * Shared by the production pairing and the labelled extractor. */
+export function fileOfLocation(location: string): string {
+  return location
+    .trim()
+    .replace(/\\+/gu, '/')
+    .replace(/(?:#L\d+(?:-L\d+)?|:\d+(?:-\d+)?)$/u, '')
+    .replace(/:\d+$/u, '')
+    .toLowerCase()
+    .trim();
+}
+
+function blockerFactsState(facts: BlockerFacts): Record<string, unknown> {
+  const state: Record<string, unknown> = { title: facts.title, category: facts.category, location: facts.location };
+  if (facts.severity != null) state['severity'] = facts.severity;
+  if (facts.detail != null) state['detail'] = facts.detail;
+  return state;
+}
+
+export function sameBlockerDecisionRequest(
+  prior: BlockerFacts,
+  current: BlockerFacts,
+): DecisionRequest<typeof SAME_BLOCKER_QUESTIONS> {
+  return {
+    state: filteredState({ prior_finding: blockerFactsState(prior), current_finding: blockerFactsState(current) }),
+    questions: SAME_BLOCKER_QUESTIONS,
+    risks: { same_defect: 'operational' },
+    // Deterministic fingerprint equality — and when fingerprints differ
+    // (the only time this is asked), "different" is the baseline.
+    fallback: { same_defect: { type: 'noul', noul: 0 } },
+  };
+}
+
+/**
+ * REPORT CONCLUSION (report-type handbacks, issue #220's host). One
+ * choice over the handback: did the report pass clean, do its findings
+ * need action, or is it inconclusive? The deterministic baseline is
+ * today's behavior — every delivered report still owes the commissioner
+ * a review (`findings_need_action`) — so a missing answer always wakes
+ * the commissioner. The production ask wires at #220's report handback
+ * path; until that host exists this surface stays shadow-measurable via
+ * the backtest harness only.
+ */
+export const REPORT_CONCLUSION_QUESTIONS = {
+  conclusion: {
+    type: 'choice',
+    instructions: 'Conclude this report-type handback for the commissioner.',
+    options: ['clean_pass', 'findings_need_action', 'inconclusive'] as const,
+    criteria: {
+      clean_pass: 'The report supports closing the obligation with no further work.',
+      findings_need_action: 'The report contains findings someone must act on.',
+      inconclusive: 'The report does not contain enough evidence to conclude either way.',
+    },
+  },
+} as const satisfies QuestionSet;
+
+/** The explicit `Verdict:` line is the LABEL (ground truth from the
+ * canonical Perkins vocabulary), never part of the question — strip every
+ * explicit verdict line the way the labelled extractor does. Long bodies
+ * are then SUMMARISED (issue #224's input limit), not tail-truncated: the
+ * head of the report (its summary sections lead) plus every finding-title
+ * line, up to the bound. Shared by production and the labelled extractor
+ * so a backtest measures exactly what production sends. */
+/** `filteredState` bounds every string field through `redactedText` at
+ * 800 characters, so the summarised body must land under that — a longer
+ * body loses its tail, and the finding titles live at the tail. */
+export const REPORT_BODY_BOUND = 700;
+
+const FINDING_TITLE_LINE = /^\s*(?:#{1,6}\s|[-*]\s|\d+\.\s)/u;
+
+export function reportConclusionState(report: string): string {
+  const body = summariseReportBody(
+    report
+      .split(/\r?\n/u)
+      .filter((line) => !/^\s*(?:\*\*)?Verdict:\s*(?:READY TO MERGE|NEEDS CHANGES|MAJOR REWORK NEEDED|INCOMPLETE)(?:\*\*)?\s*$/iu.test(line))
+      .join('\n')
+      .trim(),
+  );
+  return filteredState({ report: body });
+}
+
+/** Deterministic bounded summary: bodies at or under the bound pass
+ * through untouched (the labelled history's regime); longer bodies keep
+ * their head plus every finding-title line. */
+export function summariseReportBody(body: string, bound: number = REPORT_BODY_BOUND): string {
+  if (body.length <= bound) return body;
+  const lines = body.split(/\r?\n/u);
+  const head: string[] = [];
+  let headLength = 0;
+  const headBudget = Math.floor(bound * 0.6);
+  let index = 0;
+  for (; index < lines.length; index++) {
+    const line = lines[index]!;
+    if (headLength + line.length + 1 > headBudget) break;
+    head.push(line);
+    headLength += line.length + 1;
+  }
+  const titles: string[] = [];
+  let titlesLength = 0;
+  for (; index < lines.length; index++) {
+    const line = lines[index]!;
+    if (!FINDING_TITLE_LINE.test(line)) continue;
+    if (headLength + titlesLength + line.length + 2 > bound) break;
+    titles.push(line.trim());
+    titlesLength += line.length + 2;
+  }
+  return [...head, ...(titles.length > 0 ? ['', '… finding titles:', ...titles] : [])].join('\n').trim();
+}
+
+export function reportConclusionDecisionRequest(report: string): DecisionRequest<typeof REPORT_CONCLUSION_QUESTIONS> {
+  return {
+    state: reportConclusionState(report),
+    questions: REPORT_CONCLUSION_QUESTIONS,
+    risks: { conclusion: 'operational' },
+    // The baseline is today's behavior: every delivered report still owes
+    // the commissioner a review (`findings_need_action`) — never a silent
+    // clean pass. (#223's case spec pins the same constant, so backtests
+    // measure production exactly.)
+    fallback: {
+      conclusion: {
+        type: 'choice',
+        choice: 'findings_need_action',
+        probabilities: choiceProbabilities(REPORT_CONCLUSION_QUESTIONS.conclusion.options, 'findings_need_action'),
+        confidence: 1,
+      },
     },
   };
 }

@@ -1,7 +1,7 @@
 import type { AnswersFor, DecisionRequest, QuestionSet, RiskClass } from '../types.js';
-import { ESCALATION_TRIAGE_LABELS, ESCALATION_TRIAGE_SPEC, ESCALATION_TRIAGE_QUESTIONS } from './escalation-triage.js';
-import { REPORT_CONCLUSION_LABELS, REPORT_CONCLUSION_SPEC, REPORT_CONCLUSION_QUESTIONS } from './report-conclusion.js';
-import { SAME_BLOCKER_LABELS, SAME_BLOCKER_SPEC, SAME_BLOCKER_QUESTIONS } from './same-blocker.js';
+import { ESCALATION_TRIAGE_LABELS, ESCALATION_TRIAGE_SPEC } from './escalation-triage.js';
+import { REPORT_CONCLUSION_LABELS, REPORT_CONCLUSION_SPEC } from './report-conclusion.js';
+import { SAME_BLOCKER_LABELS, SAME_BLOCKER_SPEC } from './same-blocker.js';
 
 /** One labelled history case (issue #223): the filtered request state as
  * production would have built it, plus the outcome label ground truth. */
@@ -76,9 +76,9 @@ export function surfaceCaseSpec(surface: string): SurfaceCaseSpec {
 
 export {
   ESCALATION_TRIAGE_LABELS,
-  ESCALATION_TRIAGE_QUESTIONS,
   REPORT_CONCLUSION_LABELS,
-  REPORT_CONCLUSION_QUESTIONS,
   SAME_BLOCKER_LABELS,
-  SAME_BLOCKER_QUESTIONS,
 };
+// The canonical question sets are re-exported verbatim from their single
+// production home so backtest callers keep one import site.
+export { ESCALATION_TRIAGE_QUESTIONS, REPORT_CONCLUSION_QUESTIONS, SAME_BLOCKER_QUESTIONS } from '../questions.js';

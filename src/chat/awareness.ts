@@ -2,6 +2,9 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { NotifyWakeMode, QuietHours, WakeMinSeverity } from '../config.js';
+import { DECISION_SURFACE_ESCALATION_TRIAGE, escalationTriageDecisionRequest } from '../decisions/questions.js';
+import type { DecisionMemoryFacts, EscalationFacts } from '../decisions/questions.js';
+import type { DecisionService } from '../decisions/types.js';
 import type { BusEvent, EventBus } from '../events/bus.js';
 import type { LogLevel } from '../logger.js';
 import type { DecisionRecord, EventRecord, LedgerApi, NotificationRecord } from '../ledger/api.js';
@@ -157,7 +160,32 @@ export type GruAwarenessLedger = Pick<
   | 'listJobs'
   | 'listAgents'
   | 'coveringDecision'
->;
+  // Decision memory reads (issues #218/#224): present on the real ledger;
+  // optional so narrow test fakes stay honest. Absent = triage asks run
+  // without the open-decisions/dispositions context.
+> & Partial<Pick<LedgerApi, 'listDecisions'>>;
+
+/** The escalation notification kinds the triage surface applies to — the
+ * Silas-authored family: the ops endpoint's `silas.escalation` and the
+ * job-suffixed `silas.escalated:<jobId>` rows. Deliberately narrower than
+ * the labelled extractor's historical net (which also caught unrelated
+ * `*escalat*` kinds): production asks must not spend on notifications
+ * Silas did not author. */
+export function isSilasEscalationKind(kind: string): boolean {
+  return kind === 'silas.escalation' || kind.startsWith('silas.escalated');
+}
+
+/** The decision-memory subject a Silas escalation row points at
+ * (`silas.escalated:<jobId>` → `job:<jobId>`; the production
+ * `silas.escalation` kind binds no job in its kind, so the caller
+ * resolves the bound minion's job). Null when neither names a job. */
+export function escalationDecisionSubject(kind: string, agentJobId?: string | null): string | null {
+  const jobId = kind.match(/^silas\.escalated:(.+)$/u)?.[1];
+  if (jobId !== undefined) return `job:${jobId}`;
+  if (agentJobId !== undefined && agentJobId !== null && agentJobId !== '') return `job:${agentJobId}`;
+  return null;
+}
+
 
 export interface GruAwarenessOptions {
   /** Chat dir (same home as the frame log); the cursor sidecar lives here. */
@@ -186,6 +214,17 @@ export interface GruAwarenessOptions {
   readonly log?: Log;
   /** Clock seam (tests advance fake timers through this closure). */
   readonly now?: () => number;
+  /** Issue #224 shadow wiring: the decision service asked for escalation
+   * triage at the delivery receipt, the per-surface readiness gate, and
+   * the per-surface mode reader. SHADOW ONLY — asks fire exclusively
+   * when the surface's configured mode is `shadow` and the routed
+   * profile is ready; the runtime records the provider answer next to
+   * the deterministic baseline and this layer ignores the outcome
+   * entirely: the wake policy's decision is untouched. Omitting any of
+   * the three leaves awareness exactly as before. */
+  readonly decisions?: Pick<DecisionService, 'decide'>;
+  readonly readyForSurface?: (surface: string) => boolean;
+  readonly modeForSurface?: (surface: string) => 'off' | 'shadow' | 'enforce' | null;
 }
 
 interface AwarenessState {
@@ -442,6 +481,15 @@ export class GruAwareness {
   private failedRetryAtMs = 0;
   private wakeTimer: ReturnType<typeof setTimeout> | null = null;
   private wakeTimerAt: number | null = null;
+  /** Issue #224 shadow wiring (see GruAwarenessOptions). */
+  private readonly decisions: Pick<DecisionService, 'decide'> | null;
+  private readonly readyForSurface: ((surface: string) => boolean) | null;
+  private readonly modeForSurface: ((surface: string) => 'off' | 'shadow' | 'enforce' | null) | null;
+  /** Escalation-triage shadow dedupe (issue #224): notification ids whose
+   * candidate already fired an ask this process. A spend guard against
+   * the created→triaged event double-delivery, not a correctness
+   * contract; FIFO-evicted at 512 ids. */
+  private readonly askedEscalations = new Set<string>();
   private disposed = false;
 
   constructor(opts: GruAwarenessOptions) {
@@ -454,6 +502,9 @@ export class GruAwareness {
     this.wakeMode = opts.wakeMode ?? 'action-required';
     this.coveredDeferralEnabled = opts.wakeDeferCovered ?? true;
     this.morningDigestGapMs = opts.morningDigestGapMs ?? DEFAULT_MORNING_DIGEST_GAP_MS;
+    this.decisions = opts.decisions ?? null;
+    this.readyForSurface = opts.readyForSurface ?? null;
+    this.modeForSurface = opts.modeForSurface ?? null;
     this.log = opts.log ?? (() => {});
     this.onFollowUpPosted = opts.onFollowUpPosted ?? (() => {});
     this.now = opts.now ?? (() => Date.now());
@@ -967,6 +1018,16 @@ export class GruAwareness {
       this.failedRetryAtMs = 0;
       this.log('info', 'gru wake opened', { notification_ids: delivered, count: delivered.length, mode: this.wakeMode });
       this.persistWakeState();
+      // Issue #224 escalation-triage shadow ask at the delivery receipt —
+      // the exact point the labelled extractor links (the gru.wake
+      // notification_ids), so backtest states and production states share
+      // one unit of decision: the delivered wake batch. Fully isolated:
+      // a failure here must never touch the wake path.
+      try {
+        this.recordEscalationTriageShadow(delivered);
+      } catch (error) {
+        this.log('error', 'escalation-triage shadow ask setup failed; wake behavior unchanged', { error: String(error) });
+      }
       this.flushPendingWakes();
       return;
     }
@@ -1528,6 +1589,87 @@ export class GruAwareness {
       routing: row.routing,
       severity: row.severity,
     });
+  }
+
+  /** Issue #224 escalation-triage SHADOW ask, fired at the delivery
+   * receipt for one delivered wake batch whose rows include
+   * Silas-authored escalations. SHADOW ONLY: the callers gate on the
+   * surface's explicit `shadow` mode plus readiness, the runtime records
+   * what the provider WOULD have triaged next to the deterministic
+   * baseline and still serves the deterministic answer, and this layer
+   * ignores the outcome — wake behavior cannot change. Fire-and-forget
+   * with isolated logging; never delays the wake path. The state shape
+   * is the labelled extractor's exactly: one wake (`notification_count`
+   * over the whole delivered batch — the same ids the `gru.wake` event
+   * records, which is what the extractor links on), the Silas-authored
+   * escalation rows inside it, and — when the subjects carry any —
+   * decision memory (#218). */
+  private recordEscalationTriageShadow(deliveredIds: readonly string[]): void {
+    if (this.decisions === null) return;
+    if (this.readyForSurface?.(DECISION_SURFACE_ESCALATION_TRIAGE) !== true) return;
+    if (this.modeForSurface?.(DECISION_SURFACE_ESCALATION_TRIAGE) !== 'shadow') return;
+    const rows = deliveredIds
+      .map((id) => this.ledger.getNotification(id))
+      .filter((row): row is NotificationRecord => row !== null && isSilasEscalationKind(row.kind));
+    if (rows.length === 0) return;
+    const dedupeKey = rows.map((row) => row.id).sort().join('\u0000');
+    if (this.askedEscalations.has(dedupeKey)) return;
+    if (this.askedEscalations.size >= 512) {
+      const oldest = this.askedEscalations.values().next().value;
+      if (oldest !== undefined) this.askedEscalations.delete(oldest);
+    }
+    this.askedEscalations.add(dedupeKey);
+    const escalations: readonly EscalationFacts[] = rows.map((row) => ({ kind: row.kind, title: row.title, detail: row.detail }));
+    // Decision memory (#218) read-only context for the escalated
+    // subjects; absent rows (or an optional-less ledger port) simply ask
+    // without the context keys, exactly like the labelled states.
+    const memory: { openDecisions?: readonly DecisionMemoryFacts[]; recentDispositions?: readonly DecisionMemoryFacts[] } = {};
+    if (this.ledger.listDecisions !== undefined) {
+      const subjects = [
+        ...new Set(
+          rows.map((row) => {
+            const agent = row.agentId !== null ? this.ledger.listAgents().find((candidate) => candidate.id === row.agentId) : undefined;
+            return escalationDecisionSubject(row.kind, agent?.jobId ?? null);
+          }),
+        ),
+      ].filter((subject): subject is string => subject !== null);
+      if (subjects.length > 0) {
+        const toFacts = (decision: DecisionRecord): DecisionMemoryFacts => ({
+          decision: decision.decision,
+          reason: decision.reason,
+          by: decision.by,
+          covers: decision.covers.join(','),
+          basis_fingerprint: decision.basisFingerprint,
+          recheck_at: decision.recheckAt,
+        });
+        try {
+          const open = subjects.flatMap((subject) => this.ledger.listDecisions!({ subject, activeOnly: true, limit: 4 }));
+          if (open.length > 0) memory['openDecisions'] = open.slice(0, 12).map(toFacts);
+          const recent = subjects.flatMap((subject) => this.ledger.listDecisions!({ subject, limit: 3 }));
+          if (recent.length > 0) memory['recentDispositions'] = recent.slice(0, 12).map(toFacts);
+        } catch (error) {
+          // Memory is enrichment: a failed read still asks, just without it.
+          this.log('debug', 'decision memory read for escalation triage failed; asking without it', {
+            error: String(error),
+          });
+        }
+      }
+    }
+    void this.decisions
+      .decide(
+        escalationTriageDecisionRequest({
+          escalations,
+          mode: this.wakeMode,
+          ...(memory['openDecisions'] !== undefined ? { openDecisions: memory['openDecisions'] } : {}),
+          ...(memory['recentDispositions'] !== undefined ? { recentDispositions: memory['recentDispositions'] } : {}),
+        }),
+        { surface: DECISION_SURFACE_ESCALATION_TRIAGE },
+      )
+      .catch((error: unknown) => {
+        this.log('error', 'escalation-triage shadow ask failed; wake behavior unchanged', {
+          error: String(error),
+        });
+      });
   }
 
   /** The shared admission path (issue #219): the policy gates (mode,

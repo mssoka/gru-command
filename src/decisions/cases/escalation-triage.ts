@@ -1,40 +1,17 @@
-import { choiceProbabilities } from '../questions.js';
-import type { QuestionSet } from '../types.js';
+import { ESCALATION_TRIAGE_QUESTIONS, choiceProbabilities } from '../questions.js';
 import type { SurfaceCaseSpec } from './registry.js';
 
 /**
  * Escalation-triage case vocabulary (issues #223/#224).
  *
- * Question set per #224's escalation-triage surface: a choice over the
- * triage class and a noul over "does this ask the chief for a decision
- * not already recorded". The DETERMINISTIC BASELINE is today's behavior:
- * every Silas-authored escalation reaches Gru (`needs_ruling`) — that is
- * the thing Jev must beat, so the baseline never defers.
+ * The canonical question set lives in `../questions.ts` (the production
+ * home — issue #224's wiring asks exactly these questions); this spec
+ * owns the DETERMINISTIC BASELINE (what today's rules do: every
+ * Silas-authored escalation reaches Gru, `needs_ruling`) and the labelled
+ * vocabulary the backtest scores against.
  */
 
 export const ESCALATION_TRIAGE_LABELS = ['defer_ok', 'needs_ruling'] as const;
-
-export const ESCALATION_TRIAGE_QUESTIONS = {
-  triage: {
-    type: 'choice',
-    instructions: 'Classify this machine-authored escalation by the attention it needs.',
-    options: ['needs_ruling', 'needs_owner', 'status_report', 'covered_by_open_item'] as const,
-    criteria: {
-      needs_ruling: 'The escalation asks for a decision a human or the chief must make now.',
-      needs_owner: 'Only the repository owner can decide this (credentials, spend, policy).',
-      status_report: 'The escalation only reports progress or status; no response is needed.',
-      covered_by_open_item: 'The ask is already covered by an open item, hold or disposition.',
-    },
-  },
-  needs_decision: {
-    type: 'noul',
-    instructions: 'Does this escalation ask the chief for a decision not already recorded in the listed holds/dispositions?',
-    criteria: {
-      true: 'A new decision is being asked for.',
-      false: 'No new decision is asked for; the escalation is informational or already covered.',
-    },
-  },
-} as const satisfies QuestionSet;
 
 /** Label evidence for the extractor: a resolution detail naming the wake
  * duplicate, covered, or nothing actionable proves a defer was right. */
@@ -50,6 +27,8 @@ export const DEFER_CHOICES: readonly string[] = ['status_report', 'covered_by_op
 export const ESCALATION_TRIAGE_SPEC: SurfaceCaseSpec<typeof ESCALATION_TRIAGE_QUESTIONS> = {
   surface: 'escalation_triage',
   questions: ESCALATION_TRIAGE_QUESTIONS,
+  // Keep in lockstep with escalationTriageDecisionRequest (questions.ts):
+  // the spec and the production builder must pin identical risks/fallback.
   risks: { triage: 'operational', needs_decision: 'read_only' },
   fallback: {
     triage: {

@@ -19,16 +19,23 @@ import {
   followUpChangedTarget,
   loadSilasSkills,
   roundBlockerKeys,
+  SAME_BLOCKER_PAIR_CAP,
+  sameBlockerPairs,
   SilasDriver,
   silasBriefHash,
   supervisionLookup,
+  type BlockersForRound,
   type DeterministicPassHook,
   type DigestLedger,
   type GitHubPollPort,
   type RoundBlocker,
   type SilasSlot,
   type SkillModule,
+  type SameBlockerPair,
 } from '../src/dispatch/silas-driver.js';
+import { DECISION_SURFACE_SAME_BLOCKER } from '../src/decisions/questions.js';
+import type { DecisionOutcome, QuestionSet } from '../src/decisions/types.js';
+import type { DecisionService } from '../src/decisions/types.js';
 import { EventBus } from '../src/events/bus.js';
 import { createDurableReconcileHook, reconcileDurableWork } from '../src/dispatch/durable-reconcile.js';
 import type { FollowThroughNotifications } from '../src/dispatch/obligations.js';
@@ -2689,10 +2696,12 @@ describe('consolidated blockers port', () => {
       const port = consolidatedBlockersFor(h.ledger);
       const read = await port(round.id);
       expect(read.blockers).toEqual([
-        { category: 'correctness', title: 'boom', location: 'src/a.ts' },
-        { category: 'security', title: '', location: 'src/c.ts' },
+        // severity rides along (constant 'blocker' — the #224 ask state
+        // matches the labelled extractor's, which always carries it)
+        { category: 'correctness', title: 'boom', location: 'src/a.ts', severity: 'blocker' },
+        { category: 'security', title: '', location: 'src/c.ts', severity: 'blocker' },
         // evidence rides along when present — it only ever breaks same-key ties
-        { category: 'security', title: 'injection', location: 'src/d.ts:12', evidence: 'exec(userInput)' },
+        { category: 'security', title: 'injection', location: 'src/d.ts:12', severity: 'blocker', evidence: 'exec(userInput)' },
       ]);
       expect(read.note).toBeNull();
 
@@ -2848,6 +2857,11 @@ function makeDriver(opts: {
   supervisionFor?: (agentId: string) => AgentSupervisionView | null;
   now?: () => number;
   onDeterministicPass?: DeterministicPassHook;
+  /** Issue #224 shadow wiring pass-through. */
+  decisions?: Pick<DecisionService, 'decide'>;
+  readyForSurface?: (surface: string) => boolean;
+  modeForSurface?: (surface: string) => 'off' | 'shadow' | 'enforce' | null;
+  blockersForRound?: BlockersForRound;
   /** Reuse an existing ledger+harness (restart tests construct a second
    * driver over the SAME durable state, issue #217). */
   harness?: Harness;
@@ -2905,6 +2919,10 @@ function makeDriver(opts: {
     ...(opts.supervisionFor !== undefined ? { supervisionFor: opts.supervisionFor } : {}),
     ...(opts.now !== undefined ? { now: opts.now } : {}),
     ...(opts.onDeterministicPass !== undefined ? { onDeterministicPass: opts.onDeterministicPass } : {}),
+    ...(opts.decisions !== undefined ? { decisions: opts.decisions } : {}),
+    ...(opts.readyForSurface !== undefined ? { readyForSurface: opts.readyForSurface } : {}),
+    ...(opts.modeForSurface !== undefined ? { modeForSurface: opts.modeForSurface } : {}),
+    ...(opts.blockersForRound !== undefined ? { blockersForRound: opts.blockersForRound } : {}),
     log: () => {},
   });
   return {
@@ -4518,3 +4536,357 @@ describe('silas deterministic pass observation (issue #163)', () => {
     }
   });
 });
+
+// ------------------------------------------------------------------
+// Issue #224: same-blocker identity surface (shadow)
+// ------------------------------------------------------------------
+
+describe('same-blocker identity candidates (issue #224)', () => {
+  const b = (title: string, location = 'src/a.ts', category = 'correctness', extra: Partial<RoundBlocker> = {}): RoundBlocker => ({
+    title,
+    location,
+    category,
+    severity: 'blocker',
+    ...extra,
+  });
+
+  it('pairs blockers whose fingerprints differ but file and category overlap', () => {
+    const latest = [b('null deref on empty path', 'src/a.ts:42')];
+    const priorRounds = [[b('null deref', 'src/a.ts:10'), b('unrelated other file', 'src/b.ts:1', 'security')]];
+    const pairs = sameBlockerPairs(latest, priorRounds);
+    expect(pairs).toHaveLength(1);
+    expect(pairs[0]?.prior.title).toBe('null deref');
+    expect(pairs[0]?.current.title).toBe('null deref on empty path');
+  });
+
+  it('never pairs identical fingerprints, different files, or different categories', () => {
+    const same = b('same leak', 'src/a.ts');
+    expect(sameBlockerPairs([same], [[b('same leak', 'src/a.ts:999')]])).toEqual([]);
+    expect(sameBlockerPairs([b('x', 'src/a.ts')], [[b('y', 'src/b.ts')]])).toEqual([]);
+    expect(sameBlockerPairs([b('x', 'src/a.ts', 'correctness')], [[b('y', 'src/a.ts', 'security')]])).toEqual([]);
+  });
+
+  it('searches prior rounds newest-first, one prior match per current blocker, capped', () => {
+    const latest = [b('current', 'src/a.ts')];
+    const pairs = sameBlockerPairs(latest, [[b('newer prior', 'src/a.ts:2')], [b('older prior', 'src/a.ts:1')]]);
+    expect(pairs).toHaveLength(1);
+    expect(pairs[0]?.prior.title).toBe('newer prior');
+    // Current blockers dedupe by fingerprint and the cap bounds the list.
+    const manyCurrents = Array.from({ length: 12 }, (_, index) => b(`defect ${index}`, `src/f${index}.ts`, 'security'));
+    const onePrior = [manyCurrents.slice(0, 11).map((blocker, index) => b(`prior ${index}`, `src/f${index}.ts`, 'security'))];
+    const capped = sameBlockerPairs(manyCurrents, onePrior);
+    expect(capped).toHaveLength(8);
+  });
+
+  it('the digest invokes the observer for a real overlap and never for identical fingerprints', async () => {
+    const h = makeLedger();
+    try {
+      addJobWithDelivery(h.ledger, 'job-pair', { prUrl: 'https://git.example.invalid/o/r/pull/12' });
+      const reports = new Map<string, RoundBlocker[]>();
+      const blockersForRound = async (roundId: string) => ({ blockers: reports.get(roundId) ?? [], note: null });
+      const r1 = h.ledger.addRound({ jobId: 'job-pair', lenses: ['blind'] });
+      reports.set(r1.id, [b('null deref', 'src/a.ts:10', 'correctness', { detail: 'crash on empty input' })]);
+      h.ledger.setRoundStatus(r1.id, 'live');
+      h.ledger.setRoundStatus(r1.id, 'verdict-posted');
+      h.ledger.setRoundVerdict(r1.id, 'changes-requested');
+      h.ledger.setJobStatus('job-pair', 'in-review');
+      h.ledger.appendCustomEvent({ kind: 'round.verdict', jobId: 'job-pair', roundId: r1.id, payload: { verdict: 'changes-requested' } });
+
+      // Round 2: an evolved title at the same file+category (different
+      // fingerprint) and an identical re-report (same fingerprint).
+      const r2 = h.ledger.addRound({ jobId: 'job-pair', lenses: ['blind'] });
+      reports.set(r2.id, [
+        b('null deref', 'src/a.ts', 'correctness'),
+        b('null deref on empty path', 'src/a.ts:44', 'correctness', { detail: 'still crashes' }),
+      ]);
+      h.ledger.setRoundStatus(r2.id, 'live');
+      h.ledger.setRoundStatus(r2.id, 'verdict-posted');
+      h.ledger.setRoundVerdict(r2.id, 'changes-requested');
+      h.ledger.appendCustomEvent({ kind: 'round.verdict', jobId: 'job-pair', roundId: r2.id, payload: { verdict: 'changes-requested' } });
+
+      const observed: (string)[] = [];
+      const pairs: SameBlockerPair[] = [];
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound,
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'round.verdict',
+        onSameBlockerPair: (jobId, pair) => {
+          observed.push(jobId);
+          pairs.push(pair);
+        },
+      });
+      // Only the different-fingerprint overlap pairs; the identical
+      // re-report is the ladder's own job (same fingerprint), never a
+      // question.
+      expect(observed).toEqual(['job-pair']);
+      expect(pairs[0]?.current.title).toBe('null deref on empty path');
+      expect(pairs[0]?.prior.title).toBe('null deref');
+      // The digest itself is unchanged: same recurring-blocker rows.
+      expect(digest.verdictsAwaitingDirective).toHaveLength(1);
+      expect(digest.verdictsAwaitingDirective[0]?.recurringBlockers).toHaveLength(2);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a throwing observer never breaks the digest', async () => {
+    const h = makeLedger();
+    try {
+      addJobWithDelivery(h.ledger, 'job-throw', { prUrl: 'https://git.example.invalid/o/r/pull/13' });
+      const reports = new Map<string, RoundBlocker[]>();
+      const blockersForRound = async (roundId: string) => ({ blockers: reports.get(roundId) ?? [], note: null });
+      const r1 = h.ledger.addRound({ jobId: 'job-throw', lenses: ['blind'] });
+      reports.set(r1.id, [b('old defect', 'src/a.ts:1')]);
+      h.ledger.setRoundStatus(r1.id, 'live');
+      h.ledger.setRoundStatus(r1.id, 'verdict-posted');
+      h.ledger.setRoundVerdict(r1.id, 'changes-requested');
+      h.ledger.setJobStatus('job-throw', 'in-review');
+      h.ledger.appendCustomEvent({ kind: 'round.verdict', jobId: 'job-throw', roundId: r1.id, payload: { verdict: 'changes-requested' } });
+      const r2 = h.ledger.addRound({ jobId: 'job-throw', lenses: ['blind'] });
+      reports.set(r2.id, [b('new defect', 'src/a.ts:2')]);
+      h.ledger.setRoundStatus(r2.id, 'live');
+      h.ledger.setRoundStatus(r2.id, 'verdict-posted');
+      h.ledger.setRoundVerdict(r2.id, 'changes-requested');
+      h.ledger.appendCustomEvent({ kind: 'round.verdict', jobId: 'job-throw', roundId: r2.id, payload: { verdict: 'changes-requested' } });
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound,
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'round.verdict',
+        onSameBlockerPair: () => {
+          throw new Error('observer bug');
+        },
+      });
+      expect(digest.verdictsAwaitingDirective).toHaveLength(1);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('the driver asks the same_blocker surface in shadow, dedupes per pair, and isolates provider failures', async () => {
+    const flush = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+    const reports = new Map<string, RoundBlocker[]>();
+    const asks: { readonly surface: string | undefined; readonly state: string }[] = [];
+    let failNext = false;
+    // The driver never reads the outcome; the fixed stand-in keeps the
+    // fake honest without widening the real contract.
+    const fakeDecide: Pick<DecisionService, 'decide'>['decide'] = async (request, opts) => {
+      if (failNext) {
+        failNext = false;
+        throw new Error('provider down');
+      }
+      asks.push({ surface: opts?.surface, state: request.state });
+      return deterministicShadowOutcome() as never;
+    };
+    const h = makeDriver({
+      blockersForRound: async (roundId: string) => ({ blockers: reports.get(roundId) ?? [], note: null }),
+      decisions: { decide: fakeDecide },
+      readyForSurface: (surface) => surface === DECISION_SURFACE_SAME_BLOCKER,
+      modeForSurface: (surface) => (surface === DECISION_SURFACE_SAME_BLOCKER ? 'shadow' : null),
+    });
+    try {
+      const ledger = h.ledger;
+      addJobWithDelivery(ledger, 'job-shadow', { prUrl: 'https://git.example.invalid/o/r/pull/14' });
+      const r1 = ledger.addRound({ jobId: 'job-shadow', lenses: ['blind'] });
+      reports.set(r1.id, [b('prior defect', 'src/a.ts:10', 'correctness', { detail: 'evidence one' })]);
+      ledger.setRoundStatus(r1.id, 'live');
+      ledger.setRoundStatus(r1.id, 'verdict-posted');
+      ledger.setRoundVerdict(r1.id, 'changes-requested');
+      ledger.setJobStatus('job-shadow', 'in-review');
+      ledger.appendCustomEvent({ kind: 'round.verdict', jobId: 'job-shadow', roundId: r1.id, payload: { verdict: 'changes-requested' } });
+      const r2 = ledger.addRound({ jobId: 'job-shadow', lenses: ['blind'] });
+      reports.set(r2.id, [b('evolved defect', 'src/a.ts:20', 'correctness', { detail: 'evidence two' })]);
+      ledger.setRoundStatus(r2.id, 'live');
+      ledger.setRoundStatus(r2.id, 'verdict-posted');
+      ledger.setRoundVerdict(r2.id, 'changes-requested');
+      ledger.appendCustomEvent({ kind: 'round.verdict', jobId: 'job-shadow', roundId: r2.id, payload: { verdict: 'changes-requested' } });
+
+      await h.driver.trigger({ kind: 'round.verdict' });
+      await flush();
+      expect(asks).toHaveLength(1);
+      expect(asks[0]?.surface).toBe(DECISION_SURFACE_SAME_BLOCKER);
+      // The request state carries BOTH sides' facts, including detail —
+      // the exact shape the labelled extractor measures.
+      expect(asks[0]?.state).toContain('prior defect');
+      expect(asks[0]?.state).toContain('evolved defect');
+      expect(asks[0]?.state).toContain('evidence one');
+      expect(asks[0]?.state).toContain('evidence two');
+      // Severity rides along — the labelled extractor always carries it.
+      expect(asks[0]?.state).toContain('"severity":"blocker"');
+
+      // A second identical sweep dedupes: no second ask.
+      await h.driver.trigger({ kind: 'sweep' });
+      await flush();
+      expect(asks).toHaveLength(1);
+
+      // A provider failure is isolated: a new pair's ask fails, is logged,
+      // and the driver keeps running.
+      failNext = true;
+      const r3 = ledger.addRound({ jobId: 'job-shadow', lenses: ['blind'] });
+      reports.set(r3.id, [b('evolved defect again', 'src/a.ts:30', 'correctness', { detail: 'evidence three' })]);
+      ledger.setRoundStatus(r3.id, 'live');
+      ledger.setRoundStatus(r3.id, 'verdict-posted');
+      ledger.setRoundVerdict(r3.id, 'changes-requested');
+      ledger.appendCustomEvent({ kind: 'round.verdict', jobId: 'job-shadow', roundId: r3.id, payload: { verdict: 'changes-requested' } });
+      await h.driver.trigger({ kind: 'round.verdict' });
+      await flush();
+      expect(asks).toHaveLength(1); // the failed ask never landed
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('no decisions dependency or a not-ready surface keeps the driver fully inert', async () => {
+    const flush = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+    const overlap = async (roundId: string): Promise<{ blockers: RoundBlocker[]; note: null }> => {
+      void roundId;
+      return { blockers: [b('prior', 'src/a.ts:1'), b('current', 'src/a.ts:2')], note: null };
+    };
+    let asked = 0;
+    const inertDecide: Pick<DecisionService, 'decide'>['decide'] = async () => {
+      asked += 1;
+      return deterministicShadowOutcome() as never;
+    };
+    const notReady = makeDriver({
+      blockersForRound: overlap,
+      decisions: { decide: inertDecide },
+      readyForSurface: () => false,
+    });
+    const unwired = makeDriver({ blockersForRound: overlap });
+    try {
+      for (const harness of [notReady, unwired]) {
+        addJobWithDelivery(harness.ledger, 'job-inert', { prUrl: 'https://git.example.invalid/o/r/pull/15' });
+        const r1 = harness.ledger.addRound({ jobId: 'job-inert', lenses: ['blind'] });
+        harness.ledger.setRoundStatus(r1.id, 'live');
+        harness.ledger.setRoundStatus(r1.id, 'verdict-posted');
+        harness.ledger.setRoundVerdict(r1.id, 'changes-requested');
+        harness.ledger.setJobStatus('job-inert', 'in-review');
+        harness.ledger.appendCustomEvent({ kind: 'round.verdict', jobId: 'job-inert', roundId: r1.id, payload: { verdict: 'changes-requested' } });
+        const r2 = harness.ledger.addRound({ jobId: 'job-inert', lenses: ['blind'] });
+        harness.ledger.setRoundStatus(r2.id, 'live');
+        harness.ledger.setRoundStatus(r2.id, 'verdict-posted');
+        harness.ledger.setRoundVerdict(r2.id, 'changes-requested');
+        harness.ledger.appendCustomEvent({ kind: 'round.verdict', jobId: 'job-inert', roundId: r2.id, payload: { verdict: 'changes-requested' } });
+        await harness.driver.trigger({ kind: 'round.verdict' });
+      }
+      await flush();
+      expect(asked).toBe(0);
+    } finally {
+      notReady.cleanup();
+      unwired.cleanup();
+    }
+  });
+});
+
+/** Minimal DecisionOutcome stand-in for driver-level ask fakes: the
+ * driver NEVER reads the outcome, so its shape only needs to satisfy the
+ * type. */
+function deterministicShadowOutcome(): DecisionOutcome<QuestionSet> {
+  return {
+    answers: {},
+    routes: {},
+    provenance: {
+      source: 'deterministic',
+      fallbackReason: null,
+      model: null,
+      latencyMs: 0,
+      usage: null,
+      profile: null,
+    },
+  };
+}
+
+describe('same-blocker review fixes (issue #224 review)', () => {
+  const b = (title: string, location = 'src/a.ts', category = 'correctness'): RoundBlocker => ({
+    title,
+    location,
+    category,
+    severity: 'blocker',
+  });
+
+  it('the pair budget is digest-wide across jobs, not per job', async () => {
+    const h = makeLedger();
+    try {
+      const reports = new Map<string, RoundBlocker[]>();
+      for (const jobId of ['job-cap-1', 'job-cap-2', 'job-cap-3']) {
+        addJobWithDelivery(h.ledger, jobId, { prUrl: `https://git.example.invalid/o/r/pull/${jobId}` });
+        for (let index = 0; index < 4; index++) {
+          const round = h.ledger.addRound({ jobId, lenses: ['blind'] });
+          const newest = index === 3;
+          reports.set(round.id, newest
+            ? [
+                b(`defect A r${index} ${jobId}`, `src/a.ts:${index + 1}`),
+                b(`defect B r${index} ${jobId}`, `src/b.ts:${index + 1}`, 'security'),
+                b(`defect C r${index} ${jobId}`, `src/c.ts:${index + 1}`, 'security'),
+                b(`defect D r${index} ${jobId}`, `src/d.ts:${index + 1}`, 'style'),
+              ]
+            : [
+                b(`defect A r${index} ${jobId}`, `src/a.ts:${index + 1}`),
+                b(`defect B r${index} ${jobId}`, `src/b.ts:${index + 1}`, 'security'),
+                b(`defect C r${index} ${jobId}`, `src/c.ts:${index + 1}`, 'security'),
+                b(`defect D r${index} ${jobId}`, `src/d.ts:${index + 1}`, 'style'),
+              ]);
+          h.ledger.setRoundStatus(round.id, 'live');
+          h.ledger.setRoundStatus(round.id, 'verdict-posted');
+          h.ledger.setRoundVerdict(round.id, 'changes-requested');
+          if (index === 0) h.ledger.setJobStatus(jobId, 'in-review');
+          h.ledger.appendCustomEvent({ kind: 'round.verdict', jobId, roundId: round.id, payload: { verdict: 'changes-requested' } });
+        }
+      }
+      const observed: SameBlockerPair[] = [];
+      await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async (roundId: string) => ({ blockers: reports.get(roundId) ?? [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'round.verdict',
+        onSameBlockerPair: (_jobId, pair) => {
+          observed.push(pair);
+        },
+      });
+      // 3 jobs x 4 pairs = 12 candidates; the digest-wide budget stops at
+      // SAME_BLOCKER_PAIR_CAP.
+      expect(observed).toHaveLength(SAME_BLOCKER_PAIR_CAP);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('file-level pairing follows #216 location identity: #L and range suffixes pair, case-insensitively', () => {
+    const latest = [b('null deref on empty path', 'src/a.ts#L44')];
+    const priorRounds = [[b('null deref', 'SRC/A.ts#L10-L20', 'correctness')]];
+    const pairs = sameBlockerPairs(latest, priorRounds);
+    expect(pairs).toHaveLength(1);
+    expect(pairs[0]?.prior.title).toBe('null deref');
+  });
+
+  it('a ready but modeless surface never asks', async () => {
+    const flush = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+    let asked = 0;
+    const fakeInertDecide: Pick<DecisionService, 'decide'>['decide'] = async () => {
+      asked += 1;
+      return deterministicShadowOutcome() as never;
+    };
+    const h = makeDriver({
+      blockersForRound: async () => ({ blockers: [b('prior', 'src/a.ts:1'), b('current', 'src/a.ts:2')], note: null }),
+      decisions: { decide: fakeInertDecide },
+      readyForSurface: () => true,
+      // No modeForSurface: legacy surface — an ask would go unrecorded.
+    });
+    try {
+      addJobWithDelivery(h.ledger, 'job-modeless', { prUrl: 'https://git.example.invalid/o/r/pull/16' });
+      const r1 = h.ledger.addRound({ jobId: 'job-modeless', lenses: ['blind'] });
+      h.ledger.setRoundStatus(r1.id, 'live');
+      h.ledger.setRoundStatus(r1.id, 'verdict-posted');
+      h.ledger.setRoundVerdict(r1.id, 'changes-requested');
+      h.ledger.setJobStatus('job-modeless', 'in-review');
+      h.ledger.appendCustomEvent({ kind: 'round.verdict', jobId: 'job-modeless', roundId: r1.id, payload: { verdict: 'changes-requested' } });
+      await h.driver.trigger({ kind: 'round.verdict' });
+      await flush();
+      expect(asked).toBe(0);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+

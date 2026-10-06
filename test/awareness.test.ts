@@ -10,6 +10,8 @@ import {
   type GruAwarenessLedger,
 } from '../src/chat/awareness.js';
 import type { NotifyWakeMode, QuietHours, WakeMinSeverity } from '../src/config.js';
+import { DECISION_SURFACE_ESCALATION_TRIAGE } from '../src/decisions/questions.js';
+import type { DecisionService } from '../src/decisions/types.js';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
@@ -51,6 +53,10 @@ function boot(options: {
   wakeQuietHours?: QuietHours | null;
   morningDigestGapMs?: number;
   now?: () => number;
+  /** Issue #224 shadow wiring pass-through. */
+  decisions?: Pick<DecisionService, 'decide'>;
+  readyForSurface?: (surface: string) => boolean;
+  modeForSurface?: (surface: string) => 'off' | 'shadow' | 'enforce' | null;
 } = {}): Rig {
   const dir = options.dir ?? tmpDir();
   const db = new LedgerDb(dir);
@@ -69,6 +75,9 @@ function boot(options: {
     ...(options.morningDigestGapMs !== undefined ? { morningDigestGapMs: options.morningDigestGapMs } : {}),
     ...(options.now !== undefined ? { now: options.now } : {}),
     ...(options.limits !== undefined ? { limits: options.limits } : {}),
+    ...(options.decisions !== undefined ? { decisions: options.decisions } : {}),
+    ...(options.readyForSurface !== undefined ? { readyForSurface: options.readyForSurface } : {}),
+    ...(options.modeForSurface !== undefined ? { modeForSurface: options.modeForSurface } : {}),
   });
   const woke: number[] = [];
   const wakeBlocks: string[] = [];
@@ -1236,6 +1245,281 @@ describe('gru awareness — passive queue rotation (GH-109)', () => {
     expect(blocks[0]).toEqual(order.slice(0, 4));
     expect(blocks[1]).toEqual(order.slice(4, 8));
     expect(blocks[2]).toEqual(order.slice(0, 4));
+  });
+});
+
+// ------------------------------------------------------------------
+// Issue #224: escalation-triage surface (shadow, at candidate time)
+// ------------------------------------------------------------------
+
+describe('escalation-triage shadow wiring (issue #224)', () => {
+  const flush = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+
+  function fakeDecisions(): {
+    asks: { surface: string | undefined; state: string }[];
+    state: { fail: boolean };
+    decide: Pick<DecisionService, 'decide'>['decide'];
+  } {
+    const asks: { surface: string | undefined; state: string }[] = [];
+    const state = { fail: false };
+    // Awareness never reads the outcome; the fixed stand-in keeps the
+    // fake honest without widening the real contract.
+    const decide: Pick<DecisionService, 'decide'>['decide'] = async (request, opts) => {
+      if (state.fail) {
+        state.fail = false;
+        throw new Error('provider down');
+      }
+      asks.push({ surface: opts?.surface, state: request.state });
+      return {
+        answers: {},
+        routes: {},
+        provenance: { source: 'deterministic', fallbackReason: null, model: null, latencyMs: 0, usage: null, profile: null },
+      } as never;
+    };
+    return { asks, state, decide };
+  }
+
+  it('a Silas escalation on a machine wake fires exactly one shadow ask and still wakes', async () => {
+    const fake = fakeDecisions();
+    const rig = boot({
+      wakeMode: 'action-required',
+      decisions: { decide: fake.decide },
+      readyForSurface: (surface) => surface === DECISION_SURFACE_ESCALATION_TRIAGE,
+      modeForSurface: (surface) => (surface === DECISION_SURFACE_ESCALATION_TRIAGE ? 'shadow' : null),
+    });
+    rig.notifications.post({
+      kind: 'silas.escalated:job-9',
+      routing: 'action-required',
+      severity: 'error',
+      title: 'typecheck blocked',
+      detail: 'ONE scheduled typecheck RAN (run 567a1364)',
+    });
+    await flush();
+    expect(fake.asks).toHaveLength(1);
+    expect(fake.asks[0]?.surface).toBe(DECISION_SURFACE_ESCALATION_TRIAGE);
+    // The state is the labelled extractor's shape: a one-escalation wake.
+    expect(fake.asks[0]?.state).toContain('silas.escalated:job-9');
+    expect(fake.asks[0]?.state).toContain('"notification_count":1');
+    expect(fake.asks[0]?.state).toContain('action-required');
+    // Shadow = behavior unchanged: the wake fired as always.
+    expect(rig.woke).toHaveLength(1);
+
+    // The created→triaged double delivery asks once, not twice.
+    rig.api.updateNotificationTriage(
+      rig.api.listNotifications({ limit: 10 })[0]!.id,
+      'action-required',
+      null,
+    );
+    await flush();
+    expect(fake.asks).toHaveLength(1);
+  });
+
+  it('decision memory enriches the ask for the escalated subject', async () => {
+    const fake = fakeDecisions();
+    const rig = boot({
+      wakeMode: 'action-required',
+      decisions: { decide: fake.decide },
+      readyForSurface: () => true,
+      modeForSurface: () => 'shadow',
+    });
+    rig.api.recordDecision({
+      subject: 'job:job-mem',
+      decision: 'hold',
+      covers: ['typecheck'],
+      reason: 'waiting on upstream fix',
+      by: 'owner',
+    });
+    rig.notifications.post({
+      kind: 'silas.escalated:job-mem',
+      routing: 'action-required',
+      severity: 'error',
+      title: 'typecheck blocked again',
+      detail: null,
+    });
+    await flush();
+    expect(fake.asks).toHaveLength(1);
+    expect(fake.asks[0]?.state).toContain('open_decisions');
+    expect(fake.asks[0]?.state).toContain('waiting on upstream fix');
+    expect(fake.asks[0]?.state).toContain('recent_dispositions');
+  });
+
+  it('non-escalation kinds, FYI rows, not-ready surfaces and missing wiring never ask', async () => {
+    const fake = fakeDecisions();
+    const wired = boot({
+      wakeMode: 'action-required',
+      decisions: { decide: fake.decide },
+      readyForSurface: (surface) => surface !== DECISION_SURFACE_ESCALATION_TRIAGE, // not ready for triage
+      modeForSurface: () => 'shadow',
+    });
+    const modeless = boot({
+      wakeMode: 'action-required',
+      decisions: { decide: fake.decide },
+      readyForSurface: () => true,
+      modeForSurface: () => null, // legacy surface: an ask would go unrecorded
+    });
+    const unwired = boot({ wakeMode: 'action-required' });
+    // Different kind, machine wake → no ask.
+    wired.notifications.post({ kind: 'supervision.breaker', routing: 'action-required', severity: 'error', title: 'breaker' });
+    // Escalation but FYI → no ask (machine wakes only).
+    wired.notifications.post({ kind: 'silas.escalated:job-x', routing: 'fyi', severity: 'info', title: 'fyi escalation' });
+    // Escalation on a machine wake but the surface is not ready → no ask.
+    wired.notifications.post({ kind: 'silas.escalated:job-y', routing: 'action-required', severity: 'error', title: 'not ready' });
+    // Ready but the surface is NOT in shadow mode → no ask (a legacy or
+    // enforce surface must not receive an unrecorded/ignored call).
+    modeless.notifications.post({ kind: 'silas.escalated:job-m', routing: 'action-required', severity: 'error', title: 'modeless' });
+    // Fully wired and ready, but the awareness under test has no decisions → no ask.
+    unwired.notifications.post({ kind: 'silas.escalated:job-z', routing: 'action-required', severity: 'error', title: 'no wiring' });
+    await flush();
+    expect(fake.asks).toHaveLength(0);
+  });
+
+  it('a rejected provider ask never breaks or delays the wake', async () => {
+    const fake = fakeDecisions();
+    fake.state.fail = true;
+    const rig = boot({
+      wakeMode: 'action-required',
+      decisions: { decide: fake.decide },
+      readyForSurface: () => true,
+      modeForSurface: () => 'shadow',
+    });
+    rig.notifications.post({
+      kind: 'silas.escalated:job-fail',
+      routing: 'action-required',
+      severity: 'error',
+      title: 'will fail',
+      detail: null,
+    });
+    await flush();
+    // The wake proceeded despite the rejected ask.
+    expect(rig.woke).toHaveLength(1);
+    expect(fake.asks).toHaveLength(0);
+  });
+});
+
+describe('escalation-triage review fixes (issue #224 review)', () => {
+  const flush = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+
+  function fakeDecisions() {
+    const asks: { surface: string | undefined; state: string }[] = [];
+    const decide: Pick<DecisionService, 'decide'>['decide'] = async (request, opts) => {
+      asks.push({ surface: opts?.surface, state: request.state });
+      return {
+        answers: {},
+        routes: {},
+        provenance: { source: 'deterministic', fallbackReason: null, model: null, latencyMs: 0, usage: null, profile: null },
+      } as never;
+    };
+    return { asks, decide };
+  }
+
+  const shadowWiring = (decide: Pick<DecisionService, 'decide'>['decide']) => ({
+    decisions: { decide },
+    readyForSurface: (surface: string) => surface === DECISION_SURFACE_ESCALATION_TRIAGE,
+    modeForSurface: (surface: string) => (surface === DECISION_SURFACE_ESCALATION_TRIAGE ? ('shadow' as const) : null),
+  });
+
+  it('a restart-backlog escalation asks when its seeded wake delivers', async () => {
+    const fake = fakeDecisions();
+    const dir = tmpDir();
+    const db = new LedgerDb(dir);
+    const bus = new EventBus();
+    const api = new LedgerApi(db.handle, { bus });
+    // The row predates the awareness layer: a restart seeds it as backlog.
+    api.recordNotification({
+      id: 'backlog-esc',
+      kind: 'silas.escalated:job-backlog',
+      routing: 'action-required',
+      severity: 'error',
+      title: 'predates restart',
+      detail: null,
+    });
+    const notifications = new NotificationCenter({ ledger: api, bus });
+    const awareness = new GruAwareness({
+      dir,
+      ledger: api,
+      bus,
+      wakeMode: 'action-required',
+      wakeMinIntervalMs: 0,
+      ...shadowWiring(fake.decide),
+    });
+    const woke: number[] = [];
+    awareness.setWakeSink(() => {
+      const injection = awareness.prepare('wake');
+      woke.push(woke.length);
+      if (injection !== undefined && injection !== null) awareness.noteWakeOutcome(true, undefined, injection);
+    });
+    try {
+      // A fresh machine-attention row triggers a flush; the seeded backlog
+      // row also wakes (boot seeding arms its own timer). Whichever batch
+      // carries the escalation must produce exactly one ask.
+      notifications.post({ kind: 'test.machine', routing: 'action-required', severity: 'error', title: 'kick' });
+      await flush();
+      await flush();
+      expect(woke.length).toBeGreaterThan(0);
+      expect(fake.asks).toHaveLength(1);
+      // The delivered escalation row is in the ask state (kind carries
+      // the job suffix), in the extractor's wake shape.
+      expect(fake.asks[0]?.state).toContain('job-backlog');
+    } finally {
+      awareness.dispose();
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('the production silas.escalation kind resolves its job through the bound minion', async () => {
+    const fake = fakeDecisions();
+    const rig = boot({
+      wakeMode: 'action-required',
+      ...shadowWiring(fake.decide),
+    });
+    rig.api.addJob({ id: 'job-bound', repo: 'acme/app', title: 'bound lane', briefing: 'b' });
+    rig.api.registerAgent({ id: 'minion-esc', role: 'minion', jobId: 'job-bound' });
+    rig.api.recordDecision({
+      subject: 'job:job-bound',
+      decision: 'hold',
+      covers: ['flaky-lane'],
+      reason: 'owner hold, recheck friday',
+      by: 'owner',
+    });
+    rig.notifications.post({
+      kind: 'silas.escalation',
+      routing: 'action-required',
+      severity: 'error',
+      title: 'lane needs a ruling',
+      detail: null,
+      agentId: 'minion-esc',
+    });
+    await flush();
+    expect(fake.asks).toHaveLength(1);
+    // Memory resolved through the minion binding, with scope fields.
+    expect(fake.asks[0]?.state).toContain('owner hold, recheck friday');
+    expect(fake.asks[0]?.state).toContain('flaky-lane');
+    expect(fake.asks[0]?.state).toContain('basis_fingerprint');
+  });
+
+  it('unrelated escalat-kind notifications never consume asks', async () => {
+    const fake = fakeDecisions();
+    const rig = boot({
+      wakeMode: 'action-required',
+      ...shadowWiring(fake.decide),
+    });
+    rig.notifications.post({
+      kind: 'supervision.escalated',
+      routing: 'action-required',
+      severity: 'error',
+      title: 'not silas',
+      detail: null,
+    });
+    rig.notifications.post({
+      kind: 'review-escalation',
+      routing: 'action-required',
+      severity: 'error',
+      title: 'also not silas-authored',
+      detail: null,
+    });
+    await flush();
+    expect(fake.asks).toHaveLength(0);
   });
 });
 
