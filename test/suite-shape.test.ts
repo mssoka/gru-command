@@ -160,7 +160,7 @@ const PINS: Record<string, number> = {  'rate-limit-retry.test.ts': 6,
   'prompt-verdict.test.ts': 6,
   'test-budgets.test.ts': 9,
   'tool-call-policy.test.ts': 12,
-  'verification-capture.test.ts': 21,
+  'verification-capture.test.ts': 22,
 
 };
 

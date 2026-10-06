@@ -6,7 +6,7 @@ import { request } from 'node:http';
 import { dirname, join, sep } from 'node:path';
 import { transpileModule, ModuleKind, ScriptTarget } from 'typescript';
 import { pathToFileURL } from 'node:url';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { defaultPackageRoot } from '../src/build-info.js';
 import { reviewRuntimeVersion, reviewServiceRuntimeIdentity } from '../src/runtime/review-build-identity.js';
 import { reviewPythonExecutable } from '../src/runtime/review-directory-entries.js';
@@ -26,10 +26,38 @@ const fixture = (prefix: string): string => {
 };
 afterEach(() => { vi.unstubAllEnvs(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
-function packageIdentity(): { root: string; identity: string } {
-  const root = fixture('gru-review-pack-');
+/** The build+packed tarball is the same bytes for every identity fixture
+ * in this file, so it is built and packed ONCE and reused: the four
+ * `packageIdentity()` calls used to rebuild and repack the whole source,
+ * which dominated this file's runtime under load. Lives outside `roots`
+ * (cleared after each test) and is removed after the file. */
+let packageTarballCache: { tarballPath: string } | null = null;
+let packageBuildRoot: string | null = null;
+afterAll(() => {
+  if (packageBuildRoot !== null) rmSync(packageBuildRoot, { recursive: true, force: true });
+});
+
+/** Copy a directory tree; on darwin try APFS clonefile first (the fixture
+ * copies ~150MB of installed dependency per identity, and cloning is
+ * near-instant while still giving each caller a private tree). */
+function copyTree(source: string, destination: string): void {
+  if (process.platform === 'darwin') {
+    try {
+      execFileSync('cp', ['-cR', source, destination], { stdio: 'ignore' });
+      return;
+    } catch {
+      // Clone unsupported (different volume/filesystem) — portable copy.
+    }
+  }
+  cpSync(source, destination, { recursive: true });
+}
+
+function packageTarball(): { tarballPath: string; files: readonly string[] } {
+  if (packageTarballCache !== null) return packageTarballCache;
   // Standalone test: compile in an isolated tree rather than assuming npm
   // test already populated dist or racing another suite's shared build.
+  const root = mkdtempSync(join(tmpdir(), 'gru-review-pack-build-'));
+  packageBuildRoot = root;
   const source = defaultPackageRoot();
   const build = join(root, 'build');
   for (const path of ['src', 'tools', 'resources', 'roles', 'package.json', 'package-lock.json', 'tsconfig.json']) {
@@ -42,12 +70,21 @@ function packageIdentity(): { root: string; identity: string } {
   })) as [{ filename: string; files: Array<{ path: string }> }];
   expect(manifest[0]!.files.some((entry) => entry.path === 'package-lock.json')).toBe(false);
   expect(manifest[0]!.files.some((entry) => entry.path === 'dist/review-dependency-identity.json')).toBe(true);
-  execFileSync('tar', ['-xzf', join(root, manifest[0]!.filename), '-C', root]);
-  const installed = join(root, 'package');
-  // Copy precisely the installed dependency closure from this npm-ci tree.
-  // This is offline and also avoids npm adding a lock to the unpacked tarball.
+  packageTarballCache = {
+    tarballPath: join(root, manifest[0]!.filename),
+  };
+  return packageTarballCache;
+}
+
+/** The installed dependency closure paths (source-relative) resolved from
+ * this npm-ci tree. Deterministic for the whole run; the metadata walk is
+ * cached, while each caller still copies its own tree. */
+let packageClosureCache: readonly string[] | null = null;
+function packageClosure(source: string): readonly string[] {
+  if (packageClosureCache !== null) return packageClosureCache;
   const visited = new Set<string>();
-  const copyDependency = (name: string, parent: string): void => {
+  const ordered: string[] = [];
+  const walk = (name: string, parent: string): void => {
     let base = parent;
     let directory: string | null = null;
     while (base === source || base.startsWith(`${source}${sep}`)) {
@@ -57,19 +94,34 @@ function packageIdentity(): { root: string; identity: string } {
     }
     if (directory === null || visited.has(directory)) return;
     visited.add(directory);
-    const destination = join(installed, directory.slice(source.length + 1));
-    mkdirSync(dirname(destination), { recursive: true });
-    cpSync(directory, destination, { recursive: true });
+    ordered.push(directory);
     const metadata = JSON.parse(readFileSync(join(directory, 'package.json'), 'utf8')) as {
       dependencies?: Record<string, string>; optionalDependencies?: Record<string, string>;
       peerDependencies?: Record<string, string>;
     };
     for (const dependency of Object.keys({ ...metadata.dependencies, ...metadata.optionalDependencies, ...metadata.peerDependencies })) {
-      copyDependency(dependency, directory);
+      walk(dependency, directory);
     }
   };
   const project = JSON.parse(readFileSync(join(source, 'package.json'), 'utf8')) as { dependencies: Record<string, string> };
-  for (const name of Object.keys(project.dependencies)) copyDependency(name, source);
+  for (const name of Object.keys(project.dependencies)) walk(name, source);
+  packageClosureCache = ordered;
+  return ordered;
+}
+
+function packageIdentity(): { root: string; identity: string } {
+  const tarball = packageTarball();
+  const root = fixture('gru-review-pack-');
+  execFileSync('tar', ['-xzf', tarball.tarballPath, '-C', root]);
+  const installed = join(root, 'package');
+  // Copy precisely the installed dependency closure from this npm-ci tree.
+  // This is offline and also avoids npm adding a lock to the unpacked tarball.
+  const source = defaultPackageRoot();
+  for (const directory of packageClosure(source)) {
+    const destination = join(installed, directory.slice(source.length + 1));
+    mkdirSync(dirname(destination), { recursive: true });
+    copyTree(directory, destination);
+  }
   expect(existsSync(join(installed, 'node_modules', '@earendil-works', 'pi-ai'))).toBe(true);
   return { root: installed, identity: reviewRuntimeVersion(installed) };
 }

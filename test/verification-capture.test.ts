@@ -1,4 +1,6 @@
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -386,6 +388,39 @@ describe('capture CLI run: exclusive sink + honest outcome', () => {
     // The raw sink is a complete capture, streamed to EOF.
     expect(readFileSync(sinkPath, 'utf-8')).toBe(completedNdjson());
     expect(out.join('')).toContain('run-capture-1');
+  });
+
+  it('streams the production transport through a quiet stall with no client idle timeout (raw HTTP, never fetch)', async () => {
+    const dir = tempDir();
+    const sinkPath = join(dir, 'stalled.ndjson');
+    const frame = completedNdjson();
+    const cut = frame.indexOf('{"type":"output"');
+    const server = createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+      res.write(frame.slice(0, cut));
+      // A quiet stretch longer than any test would assert on: the raw
+      // transport has no response idle timeout, so the stream survives
+      // until the scheduler actually produces the terminal frame.
+      setTimeout(() => res.end(frame.slice(cut)), 150);
+    });
+    await new Promise<void>((resolveListen) => server.listen(0, '127.0.0.1', resolveListen));
+    try {
+      const port = (server.address() as AddressInfo).port;
+      const code = await runCaptureCli(
+        [...BASE_ARGS, '--sink', sinkPath, '--request-id', 'req-cli-stall', '--url', `http://127.0.0.1:${String(port)}`, '--token', 't'],
+        deps({ stdout: () => {} }),
+      );
+      expect(code).toBe(CAPTURE_EXIT.ok);
+      const receipt = JSON.parse(readFileSync(captureReceiptPath(sinkPath), 'utf-8')) as CaptureReceipt;
+      expect(receipt.outcome).toBe('completed');
+      expect(receipt.reconciled).toBe(false);
+      expect(receipt.error).toBeNull();
+      expect(captureReceiptSucceeded(receipt)).toBe(true);
+      expect(readFileSync(sinkPath, 'utf-8')).toBe(frame);
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+    }
   });
 
   it('records an UNKNOWN outcome on a lost connection and never promotes partial data', async () => {

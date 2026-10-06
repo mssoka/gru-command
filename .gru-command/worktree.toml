@@ -570,3 +570,10 @@ working-flavor-catalog-baseline = 'set -e; base=9bb51b05af5d8f0a0cd389788d1d3f19
 # lint/typecheck product checks for the same change.
 parked-closeout = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/ledger-api.test.ts test/ledger-obligations.test.ts test/board-server.test.ts test/board-engine-v4.test.ts test/suite-shape.test.ts && cd web && ../node_modules/.bin/vitest run src/lib/board-kpi.test.ts"
 parked-closeout-static = "node tools/patch-vitest-rpc-timeout.mjs && npm run lint && npm run typecheck && cd web && node ../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json"
+
+# Owner-correction verification repair (2026-10-06): the long-running
+# files whose fixture cost starved the full gate's fast phase, plus the
+# whole fast phase for wall-time measurement. Committed scheduler scopes;
+# plain vitest invocations at unchanged budgets, RPC patch first.
+parked-closeout-repair = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/review-build-identity.test.ts test/review-inputs-wave.test.ts test/review-inputs-handoff.test.ts"
+repair-fast-phase = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run"

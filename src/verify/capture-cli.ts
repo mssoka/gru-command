@@ -2,6 +2,8 @@
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { readFileSync, readlinkSync, rmSync, writeFileSync } from 'node:fs';
+import { request as httpRequest } from 'node:http';
+import { request as httpsRequest } from 'node:https';
 import { pathToFileURL } from 'node:url';
 import { pidAlive } from './scheduler.js';
 import {
@@ -61,6 +63,89 @@ export const CAPTURE_EXIT = {
 export type CaptureExitCode = (typeof CAPTURE_EXIT)[keyof typeof CAPTURE_EXIT];
 
 type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
+
+/**
+ * The production streaming transport. Deliberately NOT global fetch:
+ * undici's default 5-minute body inactivity timeout can abort a verify
+ * stream while the scheduler run is still alive (a long quiet fixture),
+ * severing the capture before the terminal frame and leaving an UNKNOWN
+ * receipt for a run that later settles. A raw HTTP request has no
+ * response idle timeout — the scheduler's run deadline is the only bound
+ * — and real socket errors reach the receipt with their errno/cause.
+ * The surface matches the FetchLike seam the tests inject: `ok`,
+ * `status`, `body` (a byte stream) and `text()`.
+ */
+function nodeStreamFetch(input: string, init?: RequestInit): Promise<Response> {
+  return new Promise((resolve, reject) => {
+    const url = new URL(input);
+    const requestFn = url.protocol === 'https:' ? httpsRequest : httpRequest;
+    const headers: Record<string, string> = {};
+    const initHeaders: HeadersInit | undefined = init?.headers;
+    if (initHeaders !== undefined) {
+      if (initHeaders instanceof Headers) {
+        for (const [name, value] of initHeaders.entries()) headers[name] = value;
+      } else if (Array.isArray(initHeaders)) {
+        for (const [name, value] of initHeaders) headers[name] = value;
+      } else {
+        for (const [name, value] of Object.entries(initHeaders)) {
+          if (value !== undefined) headers[name] = String(value);
+        }
+      }
+    }
+    const request = requestFn(url, { method: init?.method ?? 'GET', headers }, (response) => {
+      let cachedBody: ReadableStream<Uint8Array> | null = null;
+      const text = (): Promise<string> =>
+        new Promise((resolveText, rejectText) => {
+          const chunks: Buffer[] = [];
+          response.on('data', (chunk: Buffer) => chunks.push(chunk));
+          response.on('end', () => resolveText(Buffer.concat(chunks).toString('utf-8')));
+          response.on('error', rejectText);
+        });
+      const result = {
+        ok: response.statusCode !== undefined && response.statusCode >= 200 && response.statusCode < 300,
+        status: response.statusCode ?? 0,
+        get body(): ReadableStream<Uint8Array> | null {
+          if (cachedBody === null) {
+            cachedBody = new ReadableStream<Uint8Array>({
+              start(controller) {
+                response.on('data', (chunk: Buffer) => controller.enqueue(new Uint8Array(chunk)));
+                response.on('end', () => controller.close());
+                response.on('error', (error: Error) => controller.error(error));
+              },
+              cancel() {
+                request.destroy();
+                response.destroy();
+              },
+            });
+          }
+          return cachedBody;
+        },
+        text,
+        json: async (): Promise<unknown> => JSON.parse(await text()) as unknown,
+      };
+      resolve(result as unknown as Response);
+    });
+    request.on('error', (error: Error) => reject(error));
+    const body = init?.body;
+    if (typeof body === 'string' || Buffer.isBuffer(body)) request.write(body);
+    request.end();
+  });
+}
+
+/** Transport errors keep the primary message and add the underlying cause
+ * (errno/code) when the runtime attached one, so a severed stream is
+ * diagnosable from the receipt instead of a bare "terminated". */
+function describeTransportError(error: unknown): string {
+  if (!(error instanceof Error)) return String(error);
+  const cause = error.cause;
+  if (cause === undefined) return error.message;
+  const code = (cause as NodeJS.ErrnoException | undefined)?.code;
+  const causeText =
+    cause instanceof Error
+      ? `${cause.name}: ${cause.message}${code === undefined || code === '' ? '' : ` (code ${String(code)})`}`
+      : String(cause);
+  return `${error.message} — cause: ${causeText}`;
+}
 
 export interface CaptureCliDeps {
   readonly fetchImpl?: FetchLike;
@@ -244,7 +329,7 @@ async function commandRun(
   const expectedHead = flags.get('expected-head') ?? null;
   const { baseUrl, token } = resolveOps(flags);
   const probe = deps.probe ?? systemProcessProbe;
-  const fetchImpl: FetchLike = deps.fetchImpl ?? fetch;
+  const fetchImpl: FetchLike = deps.fetchImpl ?? nodeStreamFetch;
   const now = deps.now ?? Date.now;
   const ownerPath = captureOwnerPath(sinkPath);
 
@@ -335,7 +420,7 @@ async function commandRun(
       }
     }
   } catch (error) {
-    transportError = String(error instanceof Error ? error.message : error);
+    transportError = describeTransportError(error);
   }
   const digest = sink.close();
   const parsed = captureReader.finish();
@@ -426,7 +511,7 @@ async function commandStatus(
 ): Promise<CaptureExitCode> {
   const requestId = required(flags, 'request-id');
   const { baseUrl, token } = resolveOps(flags);
-  const fetchImpl: FetchLike = deps.fetchImpl ?? fetch;
+  const fetchImpl: FetchLike = deps.fetchImpl ?? nodeStreamFetch;
   let response: Response;
   try {
     response = await fetchImpl(
