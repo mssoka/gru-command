@@ -583,7 +583,7 @@ describe('obligations — park/terminal act only on APPLICABLE rows; history sur
       kind: 'github.branch-state',
       jobId: 'job-closeout',
       payload: branchStatePayload(
-        { jobId: 'job-closeout', repo: { host: 'github.com', owner: 'mssoka', repo: 'gru-command' }, branch: 'gru/job-closeout', prNumber: 165, prUrl },
+        { jobId: 'job-closeout', repo: { host: 'github.com', owner: 'acme', repo: 'gru-command' }, branch: 'gru/job-closeout', prNumber: 165, prUrl },
         { sha, merged: false, prOpen: false, mergeableState: 'dirty', ci: null, prNumber: 165, prUrl, mergeCommitSha: null },
       ),
     });
@@ -642,7 +642,7 @@ describe('obligations — park/terminal act only on APPLICABLE rows; history sur
       kind: 'github.branch-state',
       jobId: 'job-closeout-states',
       payload: branchStatePayload(
-        { jobId: 'job-closeout-states', repo: { host: 'github.com', owner: 'mssoka', repo: 'gru-command' }, branch: 'gru/job-closeout-states', prNumber: 165, prUrl },
+        { jobId: 'job-closeout-states', repo: { host: 'github.com', owner: 'acme', repo: 'gru-command' }, branch: 'gru/job-closeout-states', prNumber: 165, prUrl },
         { sha, merged: false, prOpen: false, mergeableState: 'dirty', ci: null, prNumber: 165, prUrl, mergeCommitSha: null },
       ),
     });

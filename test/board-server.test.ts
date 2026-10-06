@@ -315,7 +315,7 @@ describe('board server — HTTP API', () => {
       kind: 'github.branch-state',
       jobId: 'open-pr-http',
       payload: branchStatePayload(
-        { jobId: 'open-pr-http', repo: { host: 'github.com', owner: 'mssoka', repo: 'gru-command' }, branch: 'gru/open-pr-http', prNumber: 165, prUrl },
+        { jobId: 'open-pr-http', repo: { host: 'github.com', owner: 'acme', repo: 'gru-command' }, branch: 'gru/open-pr-http', prNumber: 165, prUrl },
         { sha: head, merged: false, prOpen: true, mergeableState: 'dirty', ci: null, prNumber: 165, prUrl, mergeCommitSha: null },
       ),
     });
@@ -336,7 +336,7 @@ describe('board server — HTTP API', () => {
       kind: 'github.branch-state',
       jobId: 'target-http',
       payload: branchStatePayload(
-        { jobId: 'target-http', repo: { host: 'github.com', owner: 'mssoka', repo: 'gru-command' }, branch: 'gru/target-http', prNumber: 165, prUrl },
+        { jobId: 'target-http', repo: { host: 'github.com', owner: 'acme', repo: 'gru-command' }, branch: 'gru/target-http', prNumber: 165, prUrl },
         { sha: head, merged: false, prOpen: false, mergeableState: 'dirty', ci: null, prNumber: 165, prUrl, mergeCommitSha: null },
       ),
     });
@@ -367,7 +367,7 @@ describe('board server — HTTP API', () => {
       kind: 'github.branch-state',
       jobId: 'live-http',
       payload: branchStatePayload(
-        { jobId: 'live-http', repo: { host: 'github.com', owner: 'mssoka', repo: 'gru-command' }, branch: 'gru/live-http', prNumber: 165, prUrl },
+        { jobId: 'live-http', repo: { host: 'github.com', owner: 'acme', repo: 'gru-command' }, branch: 'gru/live-http', prNumber: 165, prUrl },
         { sha: head, merged: false, prOpen: false, mergeableState: 'dirty', ci: null, prNumber: 165, prUrl, mergeCommitSha: null },
       ),
     });
@@ -392,7 +392,7 @@ describe('board server — HTTP API', () => {
       kind: 'github.branch-state',
       jobId,
       payload: branchStatePayload(
-        { jobId, repo: { host: 'github.com', owner: 'mssoka', repo: 'gru-command' }, branch: `gru/${jobId}`, prNumber: 178, prUrl },
+        { jobId, repo: { host: 'github.com', owner: 'acme', repo: 'gru-command' }, branch: `gru/${jobId}`, prNumber: 178, prUrl },
         { sha: head, merged: false, prOpen: false, mergeableState: 'dirty', ci: null, prNumber: 178, prUrl, mergeCommitSha: null },
       ),
     });

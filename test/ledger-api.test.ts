@@ -1394,7 +1394,7 @@ describe('administrative closeout of a parked PR-backed job', () => {
       payload: branchStatePayload(
         {
           jobId,
-          repo: { host: 'github.com', owner: 'mssoka', repo: 'gru-command' },
+          repo: { host: 'github.com', owner: 'acme', repo: 'gru-command' },
           branch: `gru/${jobId}`,
           prNumber: opts.prNumber ?? 165,
           prUrl,
