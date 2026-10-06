@@ -71,6 +71,7 @@ export interface DecisionRoute {
 
 export type DecisionFailureReason =
   | 'disabled'
+  | 'shadow_mode'
   | 'credential_missing'
   | 'credential_unsafe'
   | 'credential_invalid'
@@ -111,6 +112,51 @@ export interface DecisionProvenance {
  * (`openrouter-jev`) — today's behavior, unchanged. */
 export interface DecisionSurface {
   readonly surface?: string;
+}
+
+/** Per-surface execution mode (issue #223).
+ *
+ * - `off`: deterministic only; no provider call.
+ * - `shadow`: the provider is asked and its answer RECORDED next to the
+ *   deterministic baseline, but the caller still receives the
+ *   deterministic outcome — behavior cannot change while evidence
+ *   accumulates.
+ * - `enforce`: the provider's answer routes the decision (today's
+ *   behavior) and the surface must present a recorded backtest result
+ *   meeting its stated threshold (`<data_dir>/decisions/backtests/
+ *   <surface>.json`); without one the request fails loud.
+ *
+ * A surface whose config entry omits `mode` keeps its pre-#223 behavior
+ * (the `enforce` semantics) WITHOUT the gate: the gate protects a
+ * deliberate operator switch, not a legacy default. */
+export type SurfaceMode = 'off' | 'shadow' | 'enforce';
+export const SURFACE_MODES: readonly SurfaceMode[] = ['off', 'shadow', 'enforce'];
+
+/** One `decisions.shadow` ledger event payload (issue #223). Records what
+ * the provider WOULD have done next to the deterministic baseline. The
+ * filtered request state is NEVER recorded — `request_hash` (sha256 over
+ * the filtered state plus the question ids) is the only request
+ * identifier. */
+export interface ShadowDecisionRecord {
+  readonly surface: string;
+  readonly request_hash: string;
+  /** The `[decisions.providers]` profile that was asked. */
+  readonly provider: string;
+  /** The model that answered (null when the provider fell back before
+   * naming one). */
+  readonly model: string | null;
+  /** The provider's (or its fallback's) answers and routes — what WOULD
+   * have happened under enforce. */
+  readonly answers: unknown;
+  readonly routes: unknown;
+  /** The deterministic baseline answers — what actually happened. */
+  readonly deterministic_answers: unknown;
+  readonly latency_ms: number;
+  readonly cost: number | null;
+  readonly provenance_source: 'jev' | 'deterministic';
+  /** True when the provider's routes would have differed from the
+   * deterministic baseline's routes on at least one question. */
+  readonly disagrees: boolean;
 }
 
 export interface DecisionRequest<Q extends QuestionSet> {

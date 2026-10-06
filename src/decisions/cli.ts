@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-import { resolve } from 'node:path';
+import { mkdirSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
   DEFAULT_DECISION_PROFILE,
@@ -16,6 +17,18 @@ import {
 } from './credentials.js';
 import { CREDENTIAL_SLOTS, KEYLESS_CREDENTIAL, type CredentialSlot } from './profile.js';
 import { checkDecisionProfile, DecisionRuntime } from './runtime.js';
+import {
+  backtestRecordFromReport,
+  defaultCasesPath,
+  readCasesJsonl,
+  runBacktest,
+  saveBacktestRecord,
+  writeCasesJsonl,
+} from './backtest.js';
+import { BACKTEST_SURFACES, surfaceCaseSpec } from './cases/registry.js';
+import { extractEscalationTriageCases } from './cases/escalation-triage-extract.js';
+import { extractSameBlockerCases } from './cases/same-blocker-extract.js';
+import { extractReportConclusionCases } from './cases/report-conclusion-extract.js';
 
 function json(value: unknown): void {
   process.stdout.write(`${JSON.stringify(value)}\n`);
@@ -144,6 +157,224 @@ function parseCheckArgs(rest: readonly string[]): { profile: string | null; json
   return { profile, json: asJson };
 }
 
+// ------------------------------------------------------------------
+// backtest + extract-cases (issue #223)
+// ------------------------------------------------------------------
+
+const BACKTEST_USAGE =
+  'usage: backtest --surface <name> --profile <name> [--cases <jsonl>] [--record <dir>] [--replay <dir>] [--threshold <min>] [--threshold-metric <agreement|precision|recall>] [--save]';
+const EXTRACT_USAGE =
+  'usage: extract-cases --surface <name> --out <jsonl> [--ledger-db <path>] [--artifact-root <dir>]';
+
+interface BacktestArgs {
+  readonly surface: string;
+  readonly profile: string;
+  readonly cases: string | null;
+  readonly record: string | null;
+  readonly replay: string | null;
+  readonly threshold: number | null;
+  readonly thresholdMetric: 'agreement' | 'precision' | 'recall';
+  readonly save: boolean;
+}
+
+function parseBacktestArgs(rest: readonly string[]): BacktestArgs | string {
+  const parsed: {
+    surface: string | null; profile: string | null; cases: string | null;
+    record: string | null; replay: string | null; threshold: number | null;
+    thresholdMetric: 'agreement' | 'precision' | 'recall'; save: boolean;
+  } = {
+    surface: null, profile: null, cases: null, record: null, replay: null,
+    threshold: null, thresholdMetric: 'precision', save: false,
+  };
+  for (let i = 0; i < rest.length; i++) {
+    switch (rest[i]) {
+      case '--surface': {
+        const value = rest[i + 1];
+        if (value === undefined) return BACKTEST_USAGE;
+        parsed.surface = value;
+        i += 1;
+        break;
+      }
+      case '--profile': {
+        const value = rest[i + 1];
+        if (value === undefined) return BACKTEST_USAGE;
+        parsed.profile = value;
+        i += 1;
+        break;
+      }
+      case '--cases': {
+        const value = rest[i + 1];
+        if (value === undefined) return BACKTEST_USAGE;
+        parsed.cases = value;
+        i += 1;
+        break;
+      }
+      case '--record': {
+        const value = rest[i + 1];
+        if (value === undefined) return BACKTEST_USAGE;
+        parsed.record = value;
+        i += 1;
+        break;
+      }
+      case '--replay': {
+        const value = rest[i + 1];
+        if (value === undefined) return BACKTEST_USAGE;
+        parsed.replay = value;
+        i += 1;
+        break;
+      }
+      case '--threshold': {
+        const raw = rest[i + 1];
+        if (raw === undefined) return BACKTEST_USAGE;
+        const threshold = Number(raw);
+        if (!Number.isFinite(threshold) || threshold < 0 || threshold > 1) {
+          return '--threshold must be a number between 0 and 1';
+        }
+        parsed.threshold = threshold;
+        i += 1;
+        break;
+      }
+      case '--threshold-metric': {
+        const metric = rest[i + 1];
+        if (metric === undefined) return BACKTEST_USAGE;
+        if (metric !== 'agreement' && metric !== 'precision' && metric !== 'recall') {
+          return '--threshold-metric must be one of: agreement, precision, recall';
+        }
+        parsed.thresholdMetric = metric;
+        i += 1;
+        break;
+      }
+      case '--save':
+        parsed.save = true;
+        break;
+      default:
+        return BACKTEST_USAGE;
+    }
+  }
+  if (parsed.surface === null || parsed.profile === null) return BACKTEST_USAGE;
+  if (parsed.record !== null && parsed.replay !== null) return '--record and --replay are mutually exclusive';
+  return { ...parsed, surface: parsed.surface, profile: parsed.profile };
+}
+
+async function backtest(args: BacktestArgs): Promise<number> {
+  if (!BACKTEST_SURFACES.includes(args.surface)) {
+    return fail(`unknown backtest surface "${args.surface}" (registered: ${BACKTEST_SURFACES.join(', ')})`);
+  }
+  const spec = surfaceCaseSpec(args.surface);
+  const config = loadConfig();
+  const casesPath = args.cases ?? defaultCasesPath(config.dataDir, args.surface);
+  const cases = readCasesJsonl(casesPath);
+  const labels = new Set(spec.labels);
+  const unknown = cases.filter((testCase) => !labels.has(testCase.label));
+  if (unknown.length > 0) {
+    return fail(
+      `case file ${casesPath} carries labels outside the ${args.surface} vocabulary (${spec.labels.join(', ')}): ` +
+      [...new Set(unknown.map((testCase) => testCase.label))].join(', '),
+    );
+  }
+  const report = await runBacktest({
+    surface: args.surface,
+    profileName: args.profile,
+    cases,
+    config: config.decisions,
+    instanceDir: config.instanceDir,
+    env: process.env,
+    ...(args.record !== null ? { recordDir: args.record } : {}),
+    ...(args.replay !== null ? { replayDir: args.replay } : {}),
+  });
+  if (args.save) {
+    if (args.threshold === null) {
+      return fail('--save requires a --threshold <min>: evidence is only recorded together with its stated threshold');
+    }
+    const record = backtestRecordFromReport(report, { metric: args.thresholdMetric, label: null, min: args.threshold });
+    const path = saveBacktestRecord(config.dataDir, record);
+    json({ report, saved: path });
+    return record.met ? 0 : 1;
+  }
+  json({ report });
+  return 0;
+}
+
+interface ExtractArgs {
+  readonly surface: string;
+  readonly out: string | null;
+  readonly ledgerDb: string | null;
+  readonly artifactRoot: string | null;
+}
+
+function parseExtractArgs(rest: readonly string[]): ExtractArgs | string {
+  const parsed: { surface: string | null; out: string | null; ledgerDb: string | null; artifactRoot: string | null } = {
+    surface: null, out: null, ledgerDb: null, artifactRoot: null,
+  };
+  for (let i = 0; i < rest.length; i++) {
+    const flag = rest[i];
+    const value = rest[i + 1];
+    switch (flag) {
+      case '--surface':
+      case '--out':
+      case '--ledger-db':
+      case '--artifact-root': {
+        if (value === undefined) return EXTRACT_USAGE;
+        const key = { '--surface': 'surface', '--out': 'out', '--ledger-db': 'ledgerDb', '--artifact-root': 'artifactRoot' }[flag] as
+          | 'surface' | 'out' | 'ledgerDb' | 'artifactRoot';
+        parsed[key] = value;
+        i += 1;
+        break;
+      }
+      default:
+        return EXTRACT_USAGE;
+    }
+  }
+  if (parsed.surface === null) return EXTRACT_USAGE;
+  return parsed as ExtractArgs;
+}
+
+async function extractCases(args: ExtractArgs): Promise<number> {
+  const config = loadConfig();
+  const outPath = args.out ?? defaultCasesPath(config.dataDir, args.surface);
+  let cases: ReturnType<typeof extractEscalationTriageCases>;
+  try {
+    switch (args.surface) {
+      case 'escalation_triage': {
+        const dbPath = args.ledgerDb ?? resolve(config.dataDir, 'ledger', 'ledger.db');
+        // Dynamic import: ordinary decisions subcommands must not load
+        // node:sqlite (its experimental warning would pollute stderr).
+        const { DatabaseSync } = await import('node:sqlite');
+        let db: InstanceType<typeof DatabaseSync>;
+        try {
+          db = new DatabaseSync(dbPath, { readOnly: true });
+        } catch (error) {
+          return fail(`cannot open ledger read-only at ${dbPath}: ${(error as Error).message}`);
+        }
+        try {
+          cases = extractEscalationTriageCases(db);
+        } finally {
+          db.close();
+        }
+        break;
+      }
+      case 'same_blocker': {
+        if (args.artifactRoot === null) return fail('extract-cases --surface same_blocker requires --artifact-root <dir>');
+        cases = extractSameBlockerCases(args.artifactRoot);
+        break;
+      }
+      case 'report_conclusion': {
+        if (args.artifactRoot === null) return fail('extract-cases --surface report_conclusion requires --artifact-root <dir>');
+        cases = extractReportConclusionCases(args.artifactRoot);
+        break;
+      }
+      default:
+        return fail(`unknown extract surface "${args.surface}" (registered: ${BACKTEST_SURFACES.join(', ')})`);
+    }
+  } catch (error) {
+    return fail(`case extraction failed: ${(error as Error).message}`);
+  }
+  mkdirSync(dirname(resolve(outPath)), { recursive: true });
+  writeCasesJsonl(outPath, cases);
+  json({ surface: args.surface, out: outPath, n: cases.length });
+  return 0;
+}
+
 function parseSlot(rest: readonly string[]): { readonly ok: true; readonly slot: CredentialSlot } | { readonly ok: false; readonly message: string } {
   // `credentials set --stdin` (legacy, openrouter slot) or
   // `credentials set --slot <name> --stdin`.
@@ -193,7 +424,17 @@ export async function runDecisionCli(argv: readonly string[]): Promise<number> {
       if (typeof parsed === 'string') return fail(parsed);
       return await check(parsed.profile, parsed.json);
     }
-    return fail('usage: <config-template|credentials|status|check> (secrets are stdin-only)');
+    if (command === 'backtest') {
+      const parsed = parseBacktestArgs(rest);
+      if (typeof parsed === 'string') return fail(parsed);
+      return await backtest(parsed);
+    }
+    if (command === 'extract-cases') {
+      const parsed = parseExtractArgs(rest);
+      if (typeof parsed === 'string') return fail(parsed);
+      return await extractCases(parsed);
+    }
+    return fail('usage: <backtest|check|config-template|credentials|extract-cases|status> (secrets are stdin-only)');
   } catch (error) {
     if (error instanceof ConfigError) return fail('configuration is invalid; fix config.toml and retry', 1);
     const message = error instanceof Error && /credential|profile/i.test(error.message)

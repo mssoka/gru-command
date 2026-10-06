@@ -72,7 +72,7 @@ export function filteredState(value: unknown): string {
   return JSON.stringify(safeValue(value)).slice(0, 4_000);
 }
 
-function choiceProbabilities<Choice extends string>(
+export function choiceProbabilities<Choice extends string>(
   choices: readonly Choice[],
   selected: Choice,
 ): Record<Choice, number> {

@@ -58,6 +58,7 @@ export const REPORT_EVENT_KINDS = [
   'notification.resolved',
   'job.status',
   'job.created',
+  'decisions.shadow',
 ] as const;
 
 /** Notification-kind prefix of the mechanical PR-conflict alerts that
@@ -562,6 +563,76 @@ export interface LedgerMeasures {
   readonly digestStability: DigestStability;
   readonly gruWakeCauses: GruWakeCauses;
   readonly m0: M0Measures;
+  readonly decisionsShadow: DecisionShadowMeasures;
+}
+
+/** Shadow-decision measures (issue #223, reported per #214): disagreement
+ * rates per surface and provider — the share of shadow asks where the
+ * provider's would-be routing differed from the deterministic baseline —
+ * plus provider misses (fallbacks), cost and latency. Counts and rates
+ * only; a shadow record never carries request state. */
+export interface DecisionShadowMeasures {
+  readonly records: number;
+  readonly bySurfaceProvider: readonly {
+    readonly surface: string;
+    readonly provider: string;
+    readonly records: number;
+    readonly disagreements: number;
+    readonly disagreementShare: number;
+    readonly providerMisses: number;
+    readonly costUsd: number;
+    readonly latencyP50Ms: number;
+    readonly latencyP95Ms: number;
+  }[];
+}
+
+/** Aggregate decisions.shadow ledger events (#223). Pure. Malformed
+ * records are skipped, not fatal — a torn row must not blind the whole
+ * report. */
+export function computeDecisionShadowMeasures(events: readonly LedgerEventRecord[]): DecisionShadowMeasures {
+  const groups = new Map<string, { surface: string; provider: string; records: number; disagreements: number; misses: number; cost: number; latencies: number[] }>();
+  let total = 0;
+  for (const event of events) {
+    if (event.kind !== 'decisions.shadow') continue;
+    const payload = event.payload;
+    if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) continue;
+    const row = payload as Record<string, unknown>;
+    if (typeof row['surface'] !== 'string' || typeof row['provider'] !== 'string') continue;
+    total += 1;
+    const key = `${row['surface']}\0${row['provider']}`;
+    const bucket = groups.get(key) ?? {
+      surface: row['surface'], provider: row['provider'],
+      records: 0, disagreements: 0, misses: 0, cost: 0, latencies: [],
+    };
+    bucket.records += 1;
+    if (row['disagrees'] === true) bucket.disagreements += 1;
+    if (row['provenance_source'] === 'deterministic') bucket.misses += 1;
+    if (typeof row['cost'] === 'number' && Number.isFinite(row['cost'])) bucket.cost += row['cost'];
+    if (typeof row['latency_ms'] === 'number' && Number.isFinite(row['latency_ms'])) bucket.latencies.push(row['latency_ms']);
+    groups.set(key, bucket);
+  }
+  const quantile = (values: readonly number[], q: number): number => {
+    if (values.length === 0) return 0;
+    const sorted = [...values].sort((a, b) => a - b);
+    const index = Math.min(sorted.length - 1, Math.max(0, Math.ceil(q * sorted.length) - 1));
+    return sorted[index]!;
+  };
+  return {
+    records: total,
+    bySurfaceProvider: [...groups.values()]
+      .map((bucket) => ({
+        surface: bucket.surface,
+        provider: bucket.provider,
+        records: bucket.records,
+        disagreements: bucket.disagreements,
+        disagreementShare: bucket.records === 0 ? 0 : bucket.disagreements / bucket.records,
+        providerMisses: bucket.misses,
+        costUsd: bucket.cost,
+        latencyP50Ms: quantile(bucket.latencies, 0.5),
+        latencyP95Ms: quantile(bucket.latencies, 0.95),
+      }))
+      .sort((a, b) => b.records - a.records || a.surface.localeCompare(b.surface) || a.provider.localeCompare(b.provider)),
+  };
 }
 
 const inWindow = (ts: string, since: string, until: string): boolean => ts >= since && ts < until;
@@ -828,7 +899,7 @@ export function computeLedgerMeasures(
     costPerFinishedUsd: null, // filled by buildYieldReport from session totals
   };
 
-  return { silasYield, gruYield, digestStability: stability, gruWakeCauses, m0 };
+  return { silasYield, gruYield, digestStability: stability, gruWakeCauses, m0, decisionsShadow: computeDecisionShadowMeasures(events) };
 }
 
 function toStatus(payload: unknown): string {
@@ -854,6 +925,7 @@ export interface YieldReport {
   readonly digestStability: DigestStability;
   readonly gruWakeCauses: GruWakeCauses;
   readonly m0: M0Measures;
+  readonly decisionsShadow: DecisionShadowMeasures;
 }
 
 export interface BuildReportInput {
@@ -884,6 +956,7 @@ export function buildYieldReport(input: BuildReportInput): YieldReport {
     digestStability: measures.digestStability,
     gruWakeCauses: measures.gruWakeCauses,
     m0: { ...measures.m0, costPerFinishedUsd },
+    decisionsShadow: measures.decisionsShadow,
   };
 }
 
@@ -967,6 +1040,16 @@ export function renderTextReport(report: YieldReport): string {
   push(`  wakes/day ${report.gruWakeCauses.wakesPerDay.toFixed(2)}, avoided ${fmtNum(report.gruWakeCauses.avoided.duplicates)} duplicate(s) + ${fmtNum(report.gruWakeCauses.avoided.covered)} covered (${fmtPct(report.gruWakeCauses.avoided.share)})`);
   for (const kind of report.gruWakeCauses.perKind.slice(0, 10)) {
     push(`  kind ${kind.kind}: ${fmtNum(kind.wakes)} wakes`);
+  }
+  push('');
+  push('Decisions (shadow, #223)');
+  if (report.decisionsShadow.bySurfaceProvider.length === 0) {
+    push(`  no shadow records in window (records ${fmtNum(report.decisionsShadow.records)})`);
+  }
+  for (const row of report.decisionsShadow.bySurfaceProvider) {
+    push(
+      `  ${row.surface} / ${row.provider}: records ${fmtNum(row.records)}, disagreements ${fmtNum(row.disagreements)} (${fmtPct(row.disagreementShare)}), provider misses ${fmtNum(row.providerMisses)}, cost ${fmtUsd(row.costUsd)}, latency p50 ${fmtNum(row.latencyP50Ms)}ms / p95 ${fmtNum(row.latencyP95Ms)}ms`,
+    );
   }
   push('');
   push('M0 — heists');

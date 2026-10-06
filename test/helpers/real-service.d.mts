@@ -44,6 +44,8 @@ export declare function startRealService(options?: {
   model?: string;
   /** Write enabled=true into the hermetic decision configuration. */
   decisionsEnabled?: boolean;
+  /** Configure the event-triage mode for a real caller. */
+  decisionSurfaceMode?: 'off' | 'shadow' | 'enforce';
   /** Provision through the compiled stdin-only CLI before service boot. */
   decisionKey?: string;
   /** Offline child preload, e.g. the Jev fetch double. */
