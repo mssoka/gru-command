@@ -198,9 +198,12 @@ describe('legacy report backfill plan and apply (issue #220)', () => {
   });
 
   it('the CLI contract: --apply is opt-in, dry-run is the default', () => {
-    expect(parseArgs([])).toEqual({ apply: false, dataDir: null, json: false });
-    expect(parseArgs(['--apply', '--json'])).toEqual({ apply: true, dataDir: null, json: true });
+    expect(parseArgs([])).toEqual({ apply: false, dryRun: false, dataDir: null, json: false });
+    expect(parseArgs(['--apply', '--json'])).toEqual({ apply: true, dryRun: false, dataDir: null, json: true });
+    // The runbook's explicit default is accepted verbatim.
+    expect(parseArgs(['--dry-run'])).toEqual({ apply: false, dryRun: true, dataDir: null, json: false });
     expect(parseArgs(['--data-dir', '/tmp/x']).dataDir).toBe('/tmp/x');
     expect(() => parseArgs(['--write'])).toThrow(/unknown argument/);
+    expect(() => parseArgs(['--apply', '--dry-run'])).toThrow(/mutually exclusive/);
   });
 });

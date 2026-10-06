@@ -18,18 +18,20 @@ import { LedgerDb } from '../ledger/db.js';
 import { applyLegacyReportBackfill, planLegacyReportBackfill } from '../ledger/report-backfill.js';
 
 const USAGE =
-  'usage: node dist/cli/report-jobs-backfill.js [--apply] [--data-dir <path>] [--json]\n' +
-  '       (no --apply = dry-run; the default lists proposals and writes nothing)';
+  'usage: node dist/cli/report-jobs-backfill.js [--dry-run] [--apply] [--data-dir <path>] [--json]\n' +
+  '       (--dry-run is the default and lists proposals without writing; --apply writes)';
 
 interface ParsedArgs {
   readonly apply: boolean;
+  readonly dryRun: boolean;
   readonly dataDir: string | null;
   readonly json: boolean;
 }
 
 export function parseArgs(argv: readonly string[]): ParsedArgs {
-  const parsed: { apply: boolean; dataDir: string | null; json: boolean } = {
+  const parsed: { apply: boolean; dryRun: boolean; dataDir: string | null; json: boolean } = {
     apply: false,
+    dryRun: false,
     dataDir: null,
     json: false,
   };
@@ -37,6 +39,10 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
     const arg = argv[i];
     if (arg === '--apply') {
       parsed.apply = true;
+    } else if (arg === '--dry-run') {
+      // Explicitly accepted: the runbook names the default, so following it
+      // verbatim must work. Combining the two is refused below.
+      parsed.dryRun = true;
     } else if (arg === '--json') {
       parsed.json = true;
     } else if (arg === '--data-dir') {
@@ -49,6 +55,9 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
     } else {
       throw new Error(`unknown argument: ${arg}\n${USAGE}`);
     }
+  }
+  if (parsed.apply && parsed.dryRun) {
+    throw new Error('--apply and --dry-run are mutually exclusive\n' + USAGE);
   }
   return parsed;
 }
