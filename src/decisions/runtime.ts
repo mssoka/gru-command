@@ -15,7 +15,9 @@ import { resolveCredential, type CredentialSource } from './credentials.js';
 import { ProfileDecisionService, ProfileProvider } from './provider.js';
 import type { DecisionProviderProfile } from './profile.js';
 import { KEYLESS_CREDENTIAL, validateProviderProfile } from './profile.js';
+import { assertEnforceGate, EnforceGateError } from './enforce.js';
 import { deterministicOutcome, DeterministicDecisionService } from './service.js';
+import { buildShadowRecord, type ShadowRecorder } from './shadow.js';
 import type {
   DecisionFailureReason,
   DecisionOutcome,
@@ -23,6 +25,7 @@ import type {
   DecisionService,
   DecisionSurface,
   QuestionSet,
+  SurfaceMode,
   ThresholdsConfig,
 } from './types.js';
 
@@ -58,6 +61,14 @@ export interface DecisionRuntimeOptions {
   readonly transientRecoveryMs?: number;
   /** Durable/status-bus projection; failures are isolated from routing. */
   readonly onStatusChange?: (status: DecisionRuntimeStatus) => void;
+  /** Instance data directory; REQUIRED for `mode = "enforce"` surfaces,
+   * which read their backtest evidence from
+   * `<dataDir>/decisions/backtests/<surface>.json`. Omitting it while a
+   * surface declares enforce is itself a gate failure (fail loud). */
+  readonly dataDir?: string;
+  /** Durable sink for `decisions.shadow` ledger events (issue #223).
+   * Failures inside the recorder are isolated from routing. */
+  readonly onShadowRecord?: ShadowRecorder;
 }
 
 const PROBE_QUESTIONS = {
@@ -127,7 +138,8 @@ function resolvedCredentialReason(credential: { readonly state: string; readonly
 }
 
 /**
- * Hot-reloadable decision-service owner over provider profiles (issue #222).
+ * Hot-reloadable decision-service owner over provider profiles (issue #222)
+ * with per-surface modes (issue #223).
  *
  * One generation owns one provider service per profile; the DEFAULT profile
  * (`openrouter-jev`) is probed at startup and owns the runtime health
@@ -136,9 +148,19 @@ function resolvedCredentialReason(credential: { readonly state: string; readonly
  * credential cannot resolve stands in deterministically per call and never
  * invents an owner incident — nobody may be routed to it. `decide` routes
  * surface → profile via `[decisions.surfaces]`; an omitted surface routes
- * to the default profile, which is today's behavior unchanged. A
- * generation changes before old providers are disposed, so a late answer
- * can never alter caller state.
+ * to the default profile, which is today's behavior unchanged.
+ *
+ * Per-surface mode (`mode = "off" | "shadow" | "enforce"`): `off` serves
+ * the deterministic answer without touching the provider; `shadow` asks
+ * the provider, records the answer next to the deterministic baseline via
+ * `onShadowRecord`, and STILL serves the deterministic answer; `enforce`
+ * serves the provider answer but first demands recorded backtest evidence
+ * (`<data_dir>/decisions/backtests/<surface>.json`) meeting its stated
+ * threshold — missing or failing evidence throws {@link EnforceGateError}
+ * (fail loud, never a silent downgrade). A surface with no `mode` key
+ * keeps its pre-#223 behavior without the gate. A generation changes
+ * before old providers are disposed, so a late answer can never alter
+ * caller state.
  */
 export class DecisionRuntime implements DecisionService {
   private readonly options: DecisionRuntimeOptions;
@@ -315,8 +337,16 @@ export class DecisionRuntime implements DecisionService {
    * omitted or unrouted surface rides the default profile. */
   private routeFor(surface: string | undefined): string {
     if (surface === undefined) return DEFAULT_DECISION_PROFILE;
-    const routed = this.currentConfig.surfaces[surface];
+    const routed = this.currentConfig.surfaces[surface]?.provider;
     return routed ?? DEFAULT_DECISION_PROFILE;
+  }
+
+  /** The mode this surface runs in: the configured `mode` key, or null
+   * (pre-#223 legacy behavior, ungated) when the surface has no config
+   * entry or omits the key. An unnamed surface is always legacy. */
+  private modeFor(surface: string | undefined): SurfaceMode | null {
+    if (surface === undefined) return null;
+    return this.currentConfig.surfaces[surface]?.mode ?? null;
   }
 
   /** True when the profile this surface routes to is LIVE (constructed and
@@ -338,8 +368,51 @@ export class DecisionRuntime implements DecisionService {
   ): Promise<DecisionOutcome<Q>> {
     if (this.disposed) return deterministicOutcome(request, thresholdsOf(this.currentConfig), 'disposed');
     const profileName = this.routeFor(opts?.surface);
+    const mode = this.modeFor(opts?.surface);
+    // Issue #223 mode semantics, evaluated BEFORE any provider spend:
+    // `off` never calls the provider; `enforce` never calls it without
+    // meeting recorded evidence.
+    if (mode === 'off') {
+      return deterministicOutcome(request, thresholdsOf(this.currentConfig), 'disabled');
+    }
+    if (mode === 'enforce') {
+      try {
+        if (this.options.dataDir === undefined || opts?.surface === undefined) {
+          throw new EnforceGateError(
+            opts?.surface ?? '(unnamed)',
+            'enforce gate: no data directory is available to read backtest evidence from; pass dataDir to the decision runtime',
+          );
+        }
+        const profile = effectiveDecisionProviders(this.currentConfig)[profileName];
+        if (profile === undefined) throw new EnforceGateError(opts.surface, `enforce gate: unknown routed profile "${profileName}"`);
+        assertEnforceGate({ dataDir: this.options.dataDir, surface: opts.surface, provider: profileName, model: profile.model });
+      } catch (error) {
+        if (error instanceof EnforceGateError) {
+          // Both production callers deliberately catch decision errors and
+          // retain deterministic safety behavior. Keep the rejection AND
+          // make the configuration failure visible to the operator.
+          this.options.notifications?.postIncident({
+            kind: `decisions.enforce-gate.${error.surface}`,
+            routing: 'needs-owner',
+            severity: 'error',
+            title: `Decision enforce gate blocked for ${error.surface}`,
+            detail: error.message,
+            dedupe: 'active',
+          });
+        }
+        throw error;
+      }
+    }
     const generation = this.generation;
     const selected = this.profileServices.get(profileName) ?? this.service;
+    if (mode === 'shadow') {
+      return await this.decideShadow(request, opts, {
+        profileName,
+        selected,
+        generation,
+        record: this.options.onShadowRecord ?? (() => {}),
+      });
+    }
     const outcome = await selected.decide(request, opts);
     if (this.disposed || generation !== this.generation || selected !== (this.profileServices.get(profileName) ?? this.service)) {
       return deterministicOutcome(request, thresholdsOf(this.currentConfig), 'stale_generation');
@@ -364,6 +437,67 @@ export class DecisionRuntime implements DecisionService {
       }
     }
     return outcome;
+  }
+
+  /** Shadow mode (issue #223): the provider ask runs in full, its answer
+   * is recorded next to the deterministic baseline, and the caller
+   * receives the DETERMINISTIC outcome. Degrade semantics stay identical
+   * to enforce/legacy — the live default profile failing inside a shadow
+   * ask is still a real health event; other profiles fall back per call
+   * with a warn. The record is emitted after the generation check so a
+   * superseded generation's late ask can never poison the ledger, and a
+   * failing recorder is logged, never thrown: telemetry must not hold
+   * behavior hostage. */
+  private async decideShadow<Q extends QuestionSet>(
+    request: DecisionRequest<Q>,
+    opts: DecisionSurface | undefined,
+    context: {
+      readonly profileName: string;
+      readonly selected: DecisionService;
+      readonly generation: number;
+      readonly record: ShadowRecorder;
+    },
+  ): Promise<DecisionOutcome<Q>> {
+    const thresholds = thresholdsOf(this.currentConfig);
+    const deterministic = deterministicOutcome(request, thresholds, 'shadow_mode');
+    let providerOutcome: DecisionOutcome<Q>;
+    try {
+      providerOutcome = await context.selected.decide(request, opts);
+    } catch {
+      // An inner service that throws (not the profile fallback path — a
+      // genuine crash) counts as a provider miss with honest provenance.
+      providerOutcome = deterministicOutcome(request, thresholds, 'provider_degraded');
+    }
+    if (
+      this.disposed ||
+      context.generation !== this.generation ||
+      context.selected !== (this.profileServices.get(context.profileName) ?? this.service)
+    ) {
+      return deterministicOutcome(request, thresholds, 'stale_generation');
+    }
+    if (providerOutcome.provenance.source === 'deterministic') {
+      if (context.profileName === DEFAULT_DECISION_PROFILE && this.primary !== null) {
+        const reason = providerOutcome.provenance.fallbackReason ?? 'provider_degraded';
+        if (reason !== 'capacity_limited') this.degrade(reason);
+      } else if (context.profileName !== DEFAULT_DECISION_PROFILE) {
+        this.log('warn', 'decision profile fell back during a shadow ask; deterministic answer recorded', {
+          profile: context.profileName,
+          reason: providerOutcome.provenance.fallbackReason ?? 'provider_degraded',
+        });
+      }
+    }
+    try {
+      context.record(buildShadowRecord({
+        surface: opts?.surface ?? '',
+        provider: context.profileName,
+        request,
+        providerOutcome,
+        deterministicOutcome: deterministic,
+      }));
+    } catch (error) {
+      this.log('error', 'decisions.shadow record failed; routing state remains usable', { error: String(error) });
+    }
+    return deterministic;
   }
 
   /** Dispose every generation-owned service (idempotent per service;

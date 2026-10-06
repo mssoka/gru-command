@@ -14,7 +14,7 @@ import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { DispatchService } from '../src/dispatch/service.js';
 import { WaveRunner } from '../src/dispatch/perkins.js';
 import { fakeWholeSpawner, type WholeLeadOptions } from './helpers/perkins-whole-double.js';
-import { SilasDriver } from '../src/dispatch/silas-driver.js';
+import { SilasDriver, computeSilasDigest, consolidatedBlockersFor } from '../src/dispatch/silas-driver.js';
 import { createDispatchServer } from '../src/dispatch/server.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 import type { AgentCapabilities, AgentHandle, SpawnOptions } from '../src/runtime/types.js';
@@ -78,24 +78,6 @@ function silasActsViaHttp(input: {
   }) => void;
 }) {
   return async (prompt: string): Promise<void> => {
-    // The digest is the JSON block under the '## Digest' heading. The wake
-    // prompt may carry OTHER ```json fences (e.g. the ops skill's
-    // completion_handoff example), so locate the digest by its heading
-    // first — then take the next fenced block — and require the expected
-    // digest keys; never assume the digest is the prompt's first fence.
-    const heading = prompt.indexOf('## Digest');
-    const jsonStart = heading < 0 ? -1 : prompt.indexOf('```json', heading);
-    const jsonEnd = jsonStart < 0 ? -1 : prompt.indexOf('```', jsonStart + 7);
-    if (jsonStart < 0 || jsonEnd < 0) throw new Error('wake prompt carries no digest block');
-    const parsed = JSON.parse(prompt.slice(jsonStart + 7, jsonEnd)) as unknown;
-    if (
-      typeof parsed !== 'object' ||
-      parsed === null ||
-      !Array.isArray((parsed as { deliveredWithoutPr?: unknown }).deliveredWithoutPr)
-    ) {
-      throw new Error('wake prompt digest block is not the actionable digest');
-    }
-    const digest = parsed as DigestView;
     const base = `http://127.0.0.1:${input.port()}`;
     const auth = { authorization: `Bearer ${input.token}`, 'content-type': 'application/json' };
     const post = async (
@@ -116,6 +98,41 @@ function silasActsViaHttp(input: {
       }
       return (await res.json()) as Record<string, unknown>;
     };
+    let digest: DigestView;
+    const fullHeading = prompt.indexOf('## Digest (actionable states, JSON)');
+    if (fullHeading >= 0) {
+      // The digest is the JSON block under the digest heading. The wake
+      // prompt may carry OTHER ```json fences (e.g. the ops skill's
+      // completion_handoff example), so locate the digest by its heading
+      // first — then take the next fenced block — and require the expected
+      // digest keys; never assume the digest is the prompt's first fence.
+      const jsonStart = fullHeading;
+      const fenceStart = prompt.indexOf('```json', jsonStart);
+      const fenceEnd = fenceStart < 0 ? -1 : prompt.indexOf('```', fenceStart + 7);
+      if (fenceStart < 0 || fenceEnd < 0) throw new Error('wake prompt carries no digest block');
+      const parsed = JSON.parse(prompt.slice(fenceStart + 7, fenceEnd)) as unknown;
+      if (
+        typeof parsed !== 'object' ||
+        parsed === null ||
+        !Array.isArray((parsed as { deliveredWithoutPr?: unknown }).deliveredWithoutPr)
+      ) {
+        throw new Error('wake prompt digest block is not the actionable digest');
+      }
+      digest = parsed as DigestView;
+    } else {
+      // Delta wake (issue #217): the prompt carries changed/new/resolved
+      // rows plus the authenticated pointer — a Silas who needs the whole
+      // picture fetches the full digest through the ops surface, exactly
+      // as the pointer line prescribes.
+      if (!prompt.includes(`GET ${base}/api/silas/digest`)) {
+        throw new Error('delta wake prompt carries no full-digest pointer');
+      }
+      const fetched = await get('/api/silas/digest');
+      if (!Array.isArray(fetched['deliveredWithoutPr'])) {
+        throw new Error('fetched digest is not the actionable digest');
+      }
+      digest = fetched as unknown as DigestView;
+    }
     for (const row of digest.deliveredWithoutPr) {
       // discovery (transcript/gh) simulated by the fixture mapping…
       const url = input.prFor(row.jobId);
@@ -302,6 +319,16 @@ async function bootFollowThrough(input: {
       },
       worktrees,
       notifications: new NotificationCenter({ ledger, bus }),
+      // The delta pointer's target (issue #217), wired exactly like
+      // main.ts: same seams the driver's own digest computation uses.
+      digest: () =>
+        computeSilasDigest({
+          ledger,
+          worktrees,
+          blockersForRound: consolidatedBlockersFor(ledger),
+          config: cfg.silas,
+          trigger: 'api',
+        }),
     },
   });
   const http: HttpServer = createServer((req, res) => {

@@ -247,6 +247,11 @@ wake_min_severity = "info"
 # Local-time quiet window ("HH:MM-HH:MM", may wrap midnight); wakes
 # inside it defer to the window end. Empty string = off.
 wake_quiet_hours = ""
+# Issue #219 kill switch: an incident covered by an active decision
+# (issue #218) defers its wake to that decision's recheck instead of
+# opening a turn; breakers, provider walls and needs-owner rows always
+# wake. false restores waking for covered incidents.
+wake_defer_covered = true
 # First delivered block after this much quiet time carries a "while you
 # were away" digest (wakes, actions, merges, staged PRs). 0 disables it.
 morning_digest_gap_ms = 28800000
@@ -290,6 +295,16 @@ max_references = 3
 # CONSECUTIVE verdict rounds carrying the SAME canonical blocker.
 enabled = true
 sweep_interval_ms = 300000
+# Sweep wake gate (issue #217): a sweep whose digest fingerprint is
+# unchanged does not re-wake Silas until this much time has passed
+# since the last delivered wake (a bounded safety re-look). 0 = never
+# re-wake on an unchanged digest; a changed digest, an event trigger
+# or a passed decision recheck always wakes. The wake prompt carries
+# digest DELTA rows plus a pointer to GET /api/silas/digest, and the
+# static operating brief (orders, ops surface, skills) is injected
+# once per session — re-injected only when the brief hash changes,
+# the session handle changes, or a compaction may have dropped it).
+unchanged_rewake_ms = 21600000
 # GitHub signal poll (POLL-ONLY; webhooks are not built). Once per tick
 # every tracked branch is read through authenticated `gh api` — merged
 # PR state, mergeable_state conflicts, and check-run conclusions — and

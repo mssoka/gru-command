@@ -492,3 +492,65 @@ cannot alter a CHECK constraint). The migration declares
 rebuild transaction and verifies `PRAGMA foreign_key_check` BEFORE
 COMMIT — a violation rolls the whole migration back loudly. It carries
 the same landing-collision convention as migrations 10-14.
+
+### Decision memory (migration 20, issue #218)
+
+Decisions Gru and Silas make — holds, dismissals, acted dispositions —
+are STATE, not prose. Before this table, "resolved under the existing
+ownership hold" lived only in memory notes, so every re-detection of the
+same signal re-woke the chief to rediscover the hold. The `decisions`
+table makes the hold queryable:
+
+| Column | Purpose |
+|---|---|
+| `id` | uuid |
+| `subject` | `'job:<id>'` \| `'pr:<repo>#<n>'` \| `'incident:<kind>:<key>'` — a kind-prefixed stable key |
+| `decision` | `hold` \| `dismissed` \| `acted` \| `superseded` \| `covered` |
+| `covers` | JSON array of signal kinds, e.g. `["pr-conflict","ci-failed"]` (canonical: deduped, sorted) |
+| `basis_fingerprint` | state hash at decision time (head SHA / incident hash); `NULL` = any basis |
+| `reason` | non-empty, bounded (2000) |
+| `by` | `gru` \| `silas` \| `owner` \| `code` — a CLAIM, never identity proof (#99: the bearer token is shared) |
+| `client_key` | UNIQUE idempotency key — a retry with the same key and content returns the original row; changed content fails loud (`DecisionConflictError`) |
+| `created_at`, `recheck_at` | `recheck_at NULL` = no scheduled re-look (a basis change still re-opens) |
+| `cleared_at`, `cleared_by`, `cleared_reason` | stamped by `clearDecision`; rows are never rewritten or deleted |
+
+**The trigger query** is `LedgerApi.coveringDecision({ subject, signal,
+basis, now })`: it returns a decision only when the row is not cleared,
+its `covers` include the signal, its `basis_fingerprint` is null or
+equals the current basis, and its `recheck_at` is null or in the future.
+A changed basis OR a passed recheck re-opens the subject — suppression
+never outlives its evidence. Only the NEWEST active decision listing the
+signal is the candidate: when it fails, the subject re-opens even if an
+older, broader hold on the same subject still matches — a replacement
+hold should mark its predecessor `superseded` or clear it. The scan is
+exhaustive for the subject (pages past any listing window).
+
+**Writes** go through `LedgerApi` (`recordDecision`, `clearDecision`,
+each appending a `decision.recorded` / `decision.cleared` event in the
+same transaction as the row) or the board server's bearer-authed routes
+(`POST /api/decisions`, `POST /api/decisions/{id}/clear`,
+`GET /api/decisions?subject=&active=1`). Both Gru (`roles/gru.md`) and
+Silas (`resources/silas-skills/ops-dispatch`) record holds through this
+API instead of prose: hold a lane → record the decision with covers +
+basis + recheck, then resolve the alert.
+
+**Board visibility:** the snapshot carries `activeDecisions` (subject,
+decision, by, recheck — a bounded newest-first window) plus
+`activeDecisionCount`, the untruncated total, so an overflow past the
+window is visible rather than silent; the full set is paged via
+`GET /api/decisions?active=1`. No owner-facing notification is ever
+hidden by a decision — decisions suppress re-detection noise, never the
+needs-owner bell.
+
+**Sequencing (the issue's own plan):** #218 is the foundation. The
+production wiring lands in the lanes it unblocks — hold suppression in
+#215, the `recheck_at` re-look sweep in #217, and the #219/#220/#117
+lanes stacking on this branch. Until those land, the table is the
+readable state they build on; recording through the API is live now.
+
+**Wake side (issue #219):** every wake the decision layer avoids is on
+the ledger as `gru.wake-deferred` — `reason: 'covered'` names the
+decision id that held the incident, `duplicate` the incident key already
+woken, `failed` the bounded-retry exhaustion that escalated. The board
+wakes tracker and the #214 yield report (wakes/day, avoided share) read
+this stream; nothing avoids a wake silently.

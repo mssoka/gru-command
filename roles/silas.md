@@ -113,6 +113,17 @@ mechanical reactions are yours to execute and record without asking:
 - Never arm a review round on a target branch while a rebase/force-push lane
   is active on it (freeze-r1): the round races the push and dies obsolete.
 - Novel failures stay with the chief: name them with pointers and escalate.
+- Record ops holds as state, not prose (issue #218): when an ops incident
+  is parked under a known hold or answered as needs-no-action, record it
+  with authenticated `POST /api/decisions` — JSON `{ "subject":
+  "incident:<kind>:<key>" | "pr:<repo>#<n>" | "job:<id>", "decision":
+  "hold" | "dismissed" | "acted", "covers": [<signal kinds>],
+  "basis_fingerprint": "<state hash at decision time>", "reason": "why",
+  "by": "silas", "recheck_at": "<ISO timestamp or omitted>" } — so the
+  triggers can read the hold instead of re-deriving it. Clear a hold that
+  no longer applies with `POST /api/decisions/<id>/clear` and a reason.
+  `by` is a stored claim under the shared bearer token, not identity
+  proof; use your own actor name only.
 
 Authority boundaries are unchanged: you never write product code and never
 merge; dispatch, track, close, and escalate with pointers.

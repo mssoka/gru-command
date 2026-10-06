@@ -245,6 +245,18 @@ export interface SelfHealView {
   readonly since: string | null;
 }
 
+/** Decision memory (issue #218): one active hold/disposition — the state
+ * behind a suppressed signal, visible instead of prose-only. A UI panel
+ * can follow later; the payload carries the truth today. */
+export interface ActiveDecisionView {
+  readonly id: string;
+  readonly subject: string;
+  readonly decision: string;
+  readonly by: string;
+  readonly recheckAt: string | null;
+  readonly createdAt: string;
+}
+
 /** FOR YOU (owner approval 2026-09-28): one PR genuinely ready for the
  * owner — the SERVER-computed, evidence-bound projection (approved
  * head-bound review round + clean mergeable state + green CI at the
@@ -296,7 +308,18 @@ export interface BoardSnapshot {
   /** FOR YOU: needs-owner rows awaiting a human ack (the bell class). */
   readonly unackedNeedsOwner: number;
   /** Autonomous Gru wakes fired by the policy (`gru.wake` events). */
-  readonly wakes: { readonly count: number; readonly lastAt: string | null };
+  readonly wakes: {
+    readonly count: number;
+    readonly lastAt: string | null;
+    /** Issue #219: avoidance counts with reasons; absent on pre-upgrade
+     * servers (validator tolerates). `truncated` = the server tally hit
+     * its scan cap (counts are a lower bound). */
+    readonly deferred?: {
+      readonly count: number;
+      readonly reasons: Readonly<Record<string, number>>;
+      readonly truncated?: boolean;
+    } | null;
+  };
   /** Absent on pre-v4 servers (validator tolerates; consumers render n/a). */
   readonly build?: BuildView | null;
   readonly silas?: SilasView | null;
@@ -306,6 +329,12 @@ export interface BoardSnapshot {
   /** Durable pipeline queue; absent on pre-upgrade servers (tolerated). */
   readonly pipeline?: PipelineView | null;
   readonly selfHeal?: SelfHealView | null;
+  /** Decision memory (issue #218): active holds/dispositions; absent on
+  * pre-upgrade servers (validator tolerates). */
+  readonly activeDecisions?: readonly ActiveDecisionView[] | null;
+  /** Truthful total of active decisions — the snapshot's activeDecisions
+  * is a bounded newest-first window, so the count exposes overflow. */
+  readonly activeDecisionCount?: number | null;
   /** FOR YOU PR rows (owner approval 2026-09-28); absent on pre-upgrade
   * servers (validator tolerates; the band renders ack rows only). */
   readonly ownerPrs?: readonly OwnerPrView[] | null;
@@ -619,6 +648,18 @@ function isSelfHealView(value: unknown): value is SelfHealView {
   );
 }
 
+function isActiveDecisionView(value: unknown): value is ActiveDecisionView {
+  return (
+    isRecord(value) &&
+    typeof value.id === 'string' && value.id !== '' &&
+    typeof value.subject === 'string' && value.subject !== '' &&
+    typeof value.decision === 'string' && value.decision !== '' &&
+    typeof value.by === 'string' && value.by !== '' &&
+    (value.recheckAt === null || typeof value.recheckAt === 'string') &&
+    typeof value.createdAt === 'string' && value.createdAt !== ''
+  );
+}
+
 function isPipelineEntryView(value: unknown): value is PipelineEntryView {
   return (
     isRecord(value) &&
@@ -666,13 +707,30 @@ function isOwnerPrView(value: unknown): value is OwnerPrView {
 }
 
 function isWakesView(value: unknown): boolean {
-  return (
-    isRecord(value) &&
-    typeof value.count === 'number' &&
-    Number.isSafeInteger(value.count) &&
-    value.count >= 0 &&
-    (value.lastAt === null || typeof value.lastAt === 'string')
-  );
+  if (
+    !(
+      isRecord(value) &&
+      typeof value.count === 'number' &&
+      Number.isSafeInteger(value.count) &&
+      value.count >= 0 &&
+      (value.lastAt === null || typeof value.lastAt === 'string')
+    )
+  ) {
+    return false;
+  }
+  // Issue #219 deferred block: optional (pre-upgrade servers) but strictly
+  // typed when present.
+  if (value.deferred !== undefined && value.deferred !== null) {
+    const deferred = value.deferred;
+    if (!isRecord(deferred)) return false;
+    if (typeof deferred.count !== 'number' || !Number.isSafeInteger(deferred.count) || deferred.count < 0) return false;
+    if (!isRecord(deferred.reasons)) return false;
+    for (const count of Object.values(deferred.reasons)) {
+      if (typeof count !== 'number' || !Number.isSafeInteger(count) || count < 0) return false;
+    }
+    if (deferred.truncated !== undefined && typeof deferred.truncated !== 'boolean') return false;
+  }
+  return true;
 }
 
 export function isValidSnapshot(value: unknown): value is BoardSnapshot {
@@ -700,6 +758,12 @@ export function isValidSnapshot(value: unknown): value is BoardSnapshot {
   if (value.pacing !== undefined && value.pacing !== null && !isPacingGateView(value.pacing)) return false;
   if (value.pipeline !== undefined && value.pipeline !== null && !isPipelineView(value.pipeline)) return false;
   if (value.selfHeal !== undefined && value.selfHeal !== null && !isSelfHealView(value.selfHeal)) return false;
+  // Decision memory (issue #218): optional (pre-upgrade servers) but
+  // strictly typed when present.
+  if (value.activeDecisions !== undefined && value.activeDecisions !== null && !Array.isArray(value.activeDecisions)) return false;
+  if (Array.isArray(value.activeDecisions) && !value.activeDecisions.every(isActiveDecisionView)) return false;
+  if (value.activeDecisionCount !== undefined && value.activeDecisionCount !== null &&
+    (typeof value.activeDecisionCount !== 'number' || !Number.isInteger(value.activeDecisionCount) || value.activeDecisionCount < 0)) return false;
   // FOR YOU PR rows: absent on pre-upgrade servers (tolerated), but a
   // present block must match its shape — readiness is server authority.
   if (value.ownerPrs !== undefined && value.ownerPrs !== null && !Array.isArray(value.ownerPrs)) return false;

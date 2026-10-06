@@ -1,6 +1,7 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { pickFreePort, startRealService } from './helpers/real-service.mjs';
 
@@ -26,6 +27,35 @@ async function json(baseUrl: string, token: string, path: string, init: RequestI
 }
 
 describe('compiled service Jev credential lifecycle', () => {
+  it('records a real shadow decision through the production ledger callback', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'gru-shadow-service-home-'));
+    const workspace = mkdtempSync(join(tmpdir(), 'gru-shadow-service-workspace-'));
+    cleanup.push(home, workspace);
+    const service = await startRealService({
+      port: await pickFreePort(), token: 'shadow-ledger-token', home, workspace,
+      decisionsEnabled: true, decisionSurfaceMode: 'shadow', decisionKey: 'FILE-CREDENTIAL-CANARY',
+      nodeImport: join(import.meta.dirname, 'helpers', 'jev-fetch-double.mjs'), requireWebDist: false,
+    });
+    try {
+      expect((await json(service.baseUrl, service.token, '/api/jobs', {
+        method: 'POST', body: JSON.stringify({ id: 'shadow-job', repo: 'demo', title: 'Shadow caller' }),
+      })).status).toBe(201);
+      expect((await json(service.baseUrl, service.token, '/api/jobs/shadow-job/status', {
+        method: 'POST', body: JSON.stringify({ status: 'working' }),
+      })).status).toBe(200);
+      expect((await json(service.baseUrl, service.token, '/api/jobs/shadow-job/status', {
+        method: 'POST', body: JSON.stringify({ status: 'blocked' }),
+      })).status).toBe(200);
+      await vi.waitFor(() => {
+        const db = new DatabaseSync(join(home, 'ledger', 'ledger.db'), { readOnly: true });
+        try {
+          const rows = db.prepare("SELECT payload FROM events WHERE kind = 'decisions.shadow'").all() as { payload: string }[];
+          expect(rows.some((row) => JSON.parse(row.payload).surface === 'event_triage')).toBe(true);
+        } finally { db.close(); }
+      });
+    } finally { await service.stop(); }
+  }, 30_000);
+
   it('boots and restarts from a CLI-stored key, drives a real caller, then disables with zero further requests', async () => {
     const home = mkdtempSync(join(tmpdir(), 'gru-jev-service-home-'));
     const workspace = mkdtempSync(join(tmpdir(), 'gru-jev-service-workspace-'));

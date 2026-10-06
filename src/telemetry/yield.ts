@@ -58,6 +58,7 @@ export const REPORT_EVENT_KINDS = [
   'notification.resolved',
   'job.status',
   'job.created',
+  'decisions.shadow',
 ] as const;
 
 /** Notification-kind prefix of the mechanical PR-conflict alerts that
@@ -150,6 +151,11 @@ export const SILAS_DIGEST_HEADER = '## Digest (actionable states, JSON)';
 
 const DIGEST_FENCE = /## Digest \(actionable states, JSON\)\s*\n+```json\n([\s\S]*?)\n```/;
 
+/** The wake prompt's digest-identity line (issue #217): every wake — full
+ * or delta — names the fingerprint of the digest it was built from, so
+ * stability attribution survives the delta prompt shape. */
+const DIGEST_FINGERPRINT_LINE = /^Digest fingerprint: ([0-9a-f]{64})$/m;
+
 /** Digest categories that carry actionable rows (skip the scalar header
  * fields `computedAt`/`trigger`). Order is the SilasOpsDigest field order. */
 export const DIGEST_CATEGORY_KEYS = [
@@ -164,10 +170,18 @@ export const DIGEST_CATEGORY_KEYS = [
   'conflictingPrs',
 ] as const;
 
-/** Parse the fenced digest JSON from a Silas wake prompt and reduce it to
- * a stability signature: per category, the sorted job IDs (wait ID when a
- * row has no job). Null when the prompt carries no parseable digest. */
+/** Parse the digest identity from a Silas wake prompt and reduce it to a
+ * stability signature: the `Digest fingerprint:` line when the prompt
+ * carries one (issue #217 — full and delta wakes alike), otherwise the
+ * fenced full-digest JSON reduced per category to the sorted job IDs
+ * (wait ID when a row has no job; older prompt shapes). Null when the
+ * prompt carries neither. */
 export function digestSignatureFromPrompt(prompt: string): string | null {
+  // Fingerprint-bearing prompts (issue #217) attribute directly: the
+  // fingerprint IS the stable digest identity, and it is the only
+  // digest signal a delta wake carries.
+  const fingerprint = DIGEST_FINGERPRINT_LINE.exec(prompt);
+  if (fingerprint !== null) return `fp:${fingerprint[1]}`;
   const match = DIGEST_FENCE.exec(prompt);
   const body = match === null ? undefined : match[1];
   if (body === undefined) return null;
@@ -529,6 +543,20 @@ export interface GruWakeCauses {
   readonly repeatIncidentIds: number;
   /** Wakes containing at least one repeat incident ID. */
   readonly wakesWithRepeatIncident: number;
+  /** Issue #219 / #214: autonomous Gru wakes per day over the window —
+   * the headline cost number the decision-cost program tracks. */
+  readonly wakesPerDay: number;
+  /** Issue #219 / #214: wakes avoided inside the window because the
+   * incident was a duplicate (already-woken incident re-detected under a
+   * new row id) or hold-covered (an active decision, issue #218), with
+   * their share of (opened + avoided) wake demands. */
+  readonly avoided: {
+    readonly duplicates: number;
+    readonly covered: number;
+    /** (duplicates + covered) / (gru.wake count + duplicates + covered);
+     * null when nothing was demanded in the window. */
+    readonly share: number | null;
+  };
 }
 
 export interface M0Measures {
@@ -548,6 +576,76 @@ export interface LedgerMeasures {
   readonly digestStability: DigestStability;
   readonly gruWakeCauses: GruWakeCauses;
   readonly m0: M0Measures;
+  readonly decisionsShadow: DecisionShadowMeasures;
+}
+
+/** Shadow-decision measures (issue #223, reported per #214): disagreement
+ * rates per surface and provider — the share of shadow asks where the
+ * provider's would-be routing differed from the deterministic baseline —
+ * plus provider misses (fallbacks), cost and latency. Counts and rates
+ * only; a shadow record never carries request state. */
+export interface DecisionShadowMeasures {
+  readonly records: number;
+  readonly bySurfaceProvider: readonly {
+    readonly surface: string;
+    readonly provider: string;
+    readonly records: number;
+    readonly disagreements: number;
+    readonly disagreementShare: number;
+    readonly providerMisses: number;
+    readonly costUsd: number;
+    readonly latencyP50Ms: number;
+    readonly latencyP95Ms: number;
+  }[];
+}
+
+/** Aggregate decisions.shadow ledger events (#223). Pure. Malformed
+ * records are skipped, not fatal — a torn row must not blind the whole
+ * report. */
+export function computeDecisionShadowMeasures(events: readonly LedgerEventRecord[]): DecisionShadowMeasures {
+  const groups = new Map<string, { surface: string; provider: string; records: number; disagreements: number; misses: number; cost: number; latencies: number[] }>();
+  let total = 0;
+  for (const event of events) {
+    if (event.kind !== 'decisions.shadow') continue;
+    const payload = event.payload;
+    if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) continue;
+    const row = payload as Record<string, unknown>;
+    if (typeof row['surface'] !== 'string' || typeof row['provider'] !== 'string') continue;
+    total += 1;
+    const key = `${row['surface']}\0${row['provider']}`;
+    const bucket = groups.get(key) ?? {
+      surface: row['surface'], provider: row['provider'],
+      records: 0, disagreements: 0, misses: 0, cost: 0, latencies: [],
+    };
+    bucket.records += 1;
+    if (row['disagrees'] === true) bucket.disagreements += 1;
+    if (row['provenance_source'] === 'deterministic') bucket.misses += 1;
+    if (typeof row['cost'] === 'number' && Number.isFinite(row['cost'])) bucket.cost += row['cost'];
+    if (typeof row['latency_ms'] === 'number' && Number.isFinite(row['latency_ms'])) bucket.latencies.push(row['latency_ms']);
+    groups.set(key, bucket);
+  }
+  const quantile = (values: readonly number[], q: number): number => {
+    if (values.length === 0) return 0;
+    const sorted = [...values].sort((a, b) => a - b);
+    const index = Math.min(sorted.length - 1, Math.max(0, Math.ceil(q * sorted.length) - 1));
+    return sorted[index]!;
+  };
+  return {
+    records: total,
+    bySurfaceProvider: [...groups.values()]
+      .map((bucket) => ({
+        surface: bucket.surface,
+        provider: bucket.provider,
+        records: bucket.records,
+        disagreements: bucket.disagreements,
+        disagreementShare: bucket.records === 0 ? 0 : bucket.disagreements / bucket.records,
+        providerMisses: bucket.misses,
+        costUsd: bucket.cost,
+        latencyP50Ms: quantile(bucket.latencies, 0.5),
+        latencyP95Ms: quantile(bucket.latencies, 0.95),
+      }))
+      .sort((a, b) => b.records - a.records || a.surface.localeCompare(b.surface) || a.provider.localeCompare(b.provider)),
+  };
 }
 
 const inWindow = (ts: string, since: string, until: string): boolean => ts >= since && ts < until;
@@ -718,6 +816,25 @@ export function computeLedgerMeasures(
   const repeatSet = new Set(repeatIds);
   const wakesWithRepeatIncident = wakeIds.filter((ids) => ids.some((id) => repeatSet.has(id))).length;
 
+  // Issue #219 / #214: the avoidance stream — `gru.wake-deferred` events
+  // with reason 'duplicate' (incident-key dedupe) or 'covered' (hold-
+  // covered deferral) are wakes that never opened. Failed escalations
+  // ('failed') are NOT avoidance — the demand stays unserved.
+  let duplicates = 0;
+  let covered = 0;
+  for (const event of events) {
+    if (event.kind !== 'gru.wake-deferred' || !inWindow(event.ts, since, until)) continue;
+    const reason =
+      event.payload !== null && typeof event.payload === 'object'
+        ? (event.payload as Record<string, unknown>)['reason']
+        : undefined;
+    if (reason === 'duplicate') duplicates += 1;
+    else if (reason === 'covered') covered += 1;
+  }
+  const windowMs = Math.max(1, Date.parse(until) - Date.parse(since));
+  const wakesPerDay = (gruWakes.length / windowMs) * 86_400_000;
+  const demanded = gruWakes.length + duplicates + covered;
+
   const gruWakeCauses: GruWakeCauses = {
     wakesWithNotificationIds,
     perKind: [...perKind.entries()]
@@ -726,6 +843,12 @@ export function computeLedgerMeasures(
     conflictOnlyWakes,
     repeatIncidentIds: repeatIds.length,
     wakesWithRepeatIncident,
+    wakesPerDay,
+    avoided: {
+      duplicates,
+      covered,
+      share: demanded === 0 ? null : (duplicates + covered) / demanded,
+    },
   };
 
   // M0 — heists finished in the window and WIP replayed to `until`.
@@ -789,7 +912,7 @@ export function computeLedgerMeasures(
     costPerFinishedUsd: null, // filled by buildYieldReport from session totals
   };
 
-  return { silasYield, gruYield, digestStability: stability, gruWakeCauses, m0 };
+  return { silasYield, gruYield, digestStability: stability, gruWakeCauses, m0, decisionsShadow: computeDecisionShadowMeasures(events) };
 }
 
 function toStatus(payload: unknown): string {
@@ -815,6 +938,7 @@ export interface YieldReport {
   readonly digestStability: DigestStability;
   readonly gruWakeCauses: GruWakeCauses;
   readonly m0: M0Measures;
+  readonly decisionsShadow: DecisionShadowMeasures;
 }
 
 export interface BuildReportInput {
@@ -845,6 +969,7 @@ export function buildYieldReport(input: BuildReportInput): YieldReport {
     digestStability: measures.digestStability,
     gruWakeCauses: measures.gruWakeCauses,
     m0: { ...measures.m0, costPerFinishedUsd },
+    decisionsShadow: measures.decisionsShadow,
   };
 }
 
@@ -925,8 +1050,19 @@ export function renderTextReport(report: YieldReport): string {
   push('Gru wake causes');
   push(`  wakes with notification ids ${fmtNum(report.gruWakeCauses.wakesWithNotificationIds)}, conflict-only ${fmtNum(report.gruWakeCauses.conflictOnlyWakes)}`);
   push(`  repeat-incident ids ${fmtNum(report.gruWakeCauses.repeatIncidentIds)} across ${fmtNum(report.gruWakeCauses.wakesWithRepeatIncident)} wakes`);
+  push(`  wakes/day ${report.gruWakeCauses.wakesPerDay.toFixed(2)}, avoided ${fmtNum(report.gruWakeCauses.avoided.duplicates)} duplicate(s) + ${fmtNum(report.gruWakeCauses.avoided.covered)} covered (${fmtPct(report.gruWakeCauses.avoided.share)})`);
   for (const kind of report.gruWakeCauses.perKind.slice(0, 10)) {
     push(`  kind ${kind.kind}: ${fmtNum(kind.wakes)} wakes`);
+  }
+  push('');
+  push('Decisions (shadow, #223)');
+  if (report.decisionsShadow.bySurfaceProvider.length === 0) {
+    push(`  no shadow records in window (records ${fmtNum(report.decisionsShadow.records)})`);
+  }
+  for (const row of report.decisionsShadow.bySurfaceProvider) {
+    push(
+      `  ${row.surface} / ${row.provider}: records ${fmtNum(row.records)}, disagreements ${fmtNum(row.disagreements)} (${fmtPct(row.disagreementShare)}), provider misses ${fmtNum(row.providerMisses)}, cost ${fmtUsd(row.costUsd)}, latency p50 ${fmtNum(row.latencyP50Ms)}ms / p95 ${fmtNum(row.latencyP95Ms)}ms`,
+    );
   }
   push('');
   push('M0 — heists');

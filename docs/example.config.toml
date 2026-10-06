@@ -116,6 +116,9 @@ wake_min_interval_ms = 300000
 wake_min_severity = "info"
 # Local-time quiet window ("HH:MM-HH:MM", may wrap midnight); "" = off.
 wake_quiet_hours = ""
+# Issue #219 kill switch: an incident covered by an active decision (#218)
+# defers its wake to the decision's recheck; hard floors always wake.
+wake_defer_covered = true
 # First block after this quiet gap carries the "while you were away" digest.
 morning_digest_gap_ms = 28800000
 

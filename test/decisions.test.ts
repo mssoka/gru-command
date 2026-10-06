@@ -1140,7 +1140,7 @@ describe('decision provider profiles (issue #222)', () => {
         timeoutMs: 2500,
         inputPricePerMtok: 0.05,
       });
-      expect(loaded.decisions.surfaces).toEqual({ event_triage: 'typesafe-direct' });
+      expect(loaded.decisions.surfaces).toEqual({ event_triage: { provider: 'typesafe-direct' } });
     });
 
     it('always exposes the three built-in profiles and feeds openrouter-jev from the legacy [decisions.jev] block', () => {
@@ -1358,7 +1358,7 @@ describe('decision provider profiles (issue #222)', () => {
       const { fetch, urls } = fetchRecordingDouble();
       const config = {
         ...cloneConfig(true),
-        surfaces: { event_triage: 'typesafe-direct' },
+        surfaces: { event_triage: { provider: 'typesafe-direct' } },
       };
       const runtime = new DecisionRuntime(config, {
         instanceDir: temp('gru-decisions-222-route-'),
@@ -1384,7 +1384,7 @@ describe('decision provider profiles (issue #222)', () => {
       const { fetch } = fetchRecordingDouble();
       const config = {
         ...cloneConfig(true),
-        surfaces: { event_triage: 'typesafe-direct' },
+        surfaces: { event_triage: { provider: 'typesafe-direct' } },
       };
       const runtime = new DecisionRuntime(config, {
         instanceDir: temp('gru-decisions-222-missing-key-'),
@@ -1422,7 +1422,7 @@ describe('decision provider profiles (issue #222)', () => {
       });
       let current = {
         ...cloneConfig(true),
-        surfaces: { event_triage: 'typesafe-direct' },
+        surfaces: { event_triage: { provider: 'typesafe-direct' } },
       };
       const runtime = new DecisionRuntime(current, {
         instanceDir: temp('gru-decisions-222-hot-'),
@@ -1439,7 +1439,7 @@ describe('decision provider profiles (issue #222)', () => {
       await vi.waitFor(() => expect(releaseLate).not.toBeNull());
       current = {
         ...cloneConfig(true),
-        surfaces: { event_triage: 'local' },
+        surfaces: { event_triage: { provider: 'local' } },
       };
       expect(await runtime.recheck()).toMatchObject({ status: 'ready' }); // probe 4 (openrouter)
       releaseLate!();
@@ -1642,7 +1642,7 @@ describe('decision profile review fixes', () => {
     });
     const config = {
       ...cloneConfig(true),
-      surfaces: { event_triage: 'local' },
+      surfaces: { event_triage: { provider: 'local' } },
     };
     const runtime = new DecisionRuntime(config, {
       instanceDir: temp('gru-222-review-degrade-'),
@@ -1762,7 +1762,7 @@ describe('decision profile review follow-ups (isolation, surfaces form, slots, r
       'provider = "local"',
     ].join('\n'));
     const loaded = loadConfig({ GRU_COMMAND_HOME: instance }, temp('gru-decisions-home-'));
-    expect(loaded.decisions.surfaces).toEqual({ event_triage: 'local' });
+    expect(loaded.decisions.surfaces).toEqual({ event_triage: { provider: 'local' } });
     // Unknown keys inside the explicit form are rejected, and a missing
     // provider key is a config error, not a silent default.
     const bad = temp('gru-222-surfaces-table-bad-');
@@ -1805,7 +1805,7 @@ describe('decision profile review follow-ups (isolation, surfaces form, slots, r
     });
     const current = {
       ...cloneConfig(true),
-      surfaces: { event_triage: 'typesafe-direct' },
+      surfaces: { event_triage: { provider: 'typesafe-direct' } },
     };
     const instance = temp('gru-222-recheck-slot-');
     const env: NodeJS.ProcessEnv = { OPENROUTER_API_KEY: 'test-key' }; // no TYPESAFE_API_KEY yet

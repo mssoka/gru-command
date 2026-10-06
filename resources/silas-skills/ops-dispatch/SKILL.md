@@ -261,6 +261,38 @@ inside your mandate — it routes `fyi` and never wakes the chief:
 - Escalate only after the rebase directive fails twice. A merged PR, a
   closed PR, or a clean head retires the row on its own.
 
+## Ops holds are decisions, not prose (decision memory, issue #218)
+
+When you hold a lane or rule that a recurring signal needs no action,
+record the hold through the decisions API — the same bearer gate as every
+other ops write:
+
+```
+POST /api/decisions
+{ "subject": "pr:<repo>#<n>", "decision": "hold",
+  "covers": ["pr-conflict"], "basis_fingerprint": "<head sha or incident hash>",
+  "reason": "why this is parked", "by": "silas", "client_key": "<stable id>",
+  "recheck_at": "<ISO timestamp or omitted>" }
+```
+
+- `covers` names the signal kinds the hold suppresses (e.g. `pr-conflict`,
+  `ci-failed`); anything not listed stays loud.
+- `basis_fingerprint` pins the hold to the state you judged (head SHA,
+  incident hash); omit it only for holds that stand on ANY basis.
+- `recheck_at` schedules your own re-look; once it passes the subject
+  re-opens on its own — a hold never outlives its evidence silently.
+- `client_key` makes the create idempotent: a retry returns the original
+  decision; changed content under the same key fails loud.
+- `by` records WHO claims the decision (`gru` | `silas` | `owner` |
+  `code`). It is a claim, not identity proof — the bearer token is
+  shared (#99). Do not claim `owner` for your own judgment calls.
+
+After recording a hold, resolve the related alert through the ordinary
+surface. Clearing a hold (`POST /api/decisions/<id>/clear` with `by` and
+`reason`) re-opens the subject; active decisions are visible on the board
+(`activeDecisions`), so a suppressed signal is quiet BY RECORD, never by
+forgetting. Prose notes are not state.
+
 ## Closing out
 
 Release a finished, merged, or abandoned lane with
