@@ -1315,6 +1315,41 @@ describe('silas digest (the four actionable states)', () => {
     } finally { release(); h.cleanup(); }
   });
 
+  it('retracts a candidate that slid to blocked or parked while a later history wait ran (gh-187)', async () => {
+    const h = makeLedger();
+    let release!: () => void;
+    let entered!: () => void;
+    const wait = new Promise<void>((resolve) => { release = resolve; });
+    const waiting = new Promise<void>((resolve) => { entered = resolve; });
+    try {
+      // The candidates are OLDER than the verdict job, so the compute visits
+      // them only after the history wait resolves — by then the listJobs
+      // snapshot each intake row is computed from is already stale.
+      addJobWithDelivery(h.ledger, 'eligible-offer', { prUrl: 'https://git.example.invalid/pull/7' });
+      addJobWithDelivery(h.ledger, 'parked-offer', { prUrl: 'https://git.example.invalid/pull/8' });
+      addJobWithDelivery(h.ledger, 'blocked-offer', { prUrl: 'https://git.example.invalid/pull/9' });
+      addJobWithDelivery(h.ledger, 'history-wait', { prUrl: 'https://git.example.invalid/pull/6' });
+      const round = h.ledger.addRound({ jobId: 'history-wait' });
+      h.ledger.setRoundStatus(round.id, 'live');
+      h.ledger.setRoundStatus(round.id, 'verdict-posted');
+      h.ledger.setRoundVerdict(round.id, 'changes-requested');
+      h.ledger.setJobStatus('history-wait', 'in-review');
+      h.ledger.appendCustomEvent({ kind: 'round.verdict', jobId: 'history-wait', roundId: round.id, payload: {} });
+      const digestPromise = computeSilasDigest({ ledger: h.ledger,
+        blockersForRound: async () => { entered(); await wait; return { blockers: [], note: null }; },
+        config: DEFAULT_SILAS_CONFIG, trigger: 'sweep' });
+      await waiting;
+      // The recoverable side-states land DURING the deferred await: intake
+      // still sees `delivered` in the stale snapshot, so only the publish
+      // boundary can retract these two offers.
+      h.ledger.setJobStatus('blocked-offer', 'blocked');
+      h.ledger.setJobStatus('parked-offer', 'parked');
+      release();
+      const digest = await digestPromise;
+      expect(digest.prWithoutReview.map((row) => row.jobId)).toEqual(['eligible-offer']);
+    } finally { release(); h.cleanup(); }
+  });
+
   it('retracts an earlier review offer when its own blocker-history wait admits a re-brief', async () => {
     const h = makeLedger();
     let release!: () => void;
