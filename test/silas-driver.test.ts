@@ -20,7 +20,7 @@ import {
   loadSilasSkills,
   roundBlockerKeys,
   SilasDriver,
-  silasSkillsHash,
+  silasBriefHash,
   supervisionLookup,
   type DeterministicPassHook,
   type DigestLedger,
@@ -3239,6 +3239,30 @@ describe('silas digest fingerprint (issue #217)', () => {
     expect(digestFingerprint(stalled({ idleMs: 1 }))).toBe(digestFingerprint(stalled({ idleMs: 2 })));  
   });
 
+  it('a changed blockersNote wakes: loud evidence is decision-relevant (review r1)', () => {
+    const row = (blockersNote: string | null) =>
+      baseDigest({
+        verdictsAwaitingDirective: [
+          {
+            jobId: 'job-v',
+            repo: 'r',
+            roundId: 'job-v-r1',
+            roundSeq: 1,
+            verdict: 'NEEDS CHANGES',
+            blockerCount: 1,
+            blockersNote,
+            recurringBlockers: [
+              { category: 'correctness', title: 't', location: 'src/a.ts', fingerprint: 'correctness::src/a.ts::t', consecutiveRounds: 2, advice: 'directive' as const },
+            ],
+          },
+        ],
+      });
+    expect(digestFingerprint(row(null))).not.toBe(digestFingerprint(row('consolidated report unreadable')));
+    expect(digestFingerprint(row('consolidated report unreadable'))).not.toBe(
+      digestFingerprint(row('report recovered: zero blockers parsed')),
+    );
+  });
+
   it('every conflictingPrs field participates; a new conflict stretch is a new fingerprint', () => {
     const row = (firstSeenAt: string, headSha: string) =>
       baseDigest({
@@ -3311,14 +3335,21 @@ describe('silas sweep wake gate (issue #217)', () => {
       // and the new baseline also sticks
       await h.driver.trigger({ kind: 'sweep' });
       expect(h.prompts).toHaveLength(2);
-      // exactly two durable wake records, each with its fingerprint
-      const wakes = h.ledger.listEvents({ limit: 50 }).filter((event) => event.kind === 'silas.wake');
-      expect(wakes).toHaveLength(2);
-      for (const wake of wakes) {
+      // exactly two DELIVERED wake records, each with its fingerprint; the
+      // attempt markers (silas.wake) exist for telemetry, the delivered
+      // markers (silas.wake-delivered) seed the gate (review r1)
+      const delivered = h.ledger
+        .listEvents({ limit: 100 })
+        .filter((event) => event.kind === 'silas.wake-delivered');
+      expect(delivered).toHaveLength(2);
+      for (const wake of delivered) {
         const payload = wake.payload as Record<string, unknown>;
         expect(typeof payload['digest_fingerprint']).toBe('string');
         expect(payload['digest_fingerprint']).toMatch(/^[0-9a-f]{64}$/u);
       }
+      // every wake carries the prompt's fingerprint line (telemetry, r1)
+      expect(h.prompts[0]?.text).toMatch(/^Digest fingerprint: [0-9a-f]{64}$/m);
+      expect(h.prompts[1]?.text).toMatch(/^Digest fingerprint: [0-9a-f]{64}$/m);
     } finally {
       h.cleanup();
     }
@@ -3412,7 +3443,66 @@ describe('silas sweep wake gate (issue #217)', () => {
       h.failNext(new Error('model unreachable'));
       await h.driver.trigger({ kind: 'sweep' });
       expect(h.prompts).toHaveLength(0);
+      // the attempt marker exists (telemetry), the delivered marker does
+      // not (gate seed), and nothing advanced
+      const kinds = (kind: string): number =>
+        h.ledger.listEvents({ limit: 50 }).filter((event) => event.kind === kind).length;
+      expect(kinds('silas.wake')).toBe(1);
+      expect(kinds('silas.wake-delivered')).toBe(0);
       // the digest is unchanged, but nothing was delivered — retry
+      await h.driver.trigger({ kind: 'sweep' });
+      expect(h.prompts).toHaveLength(1);
+      expect(kinds('silas.wake-delivered')).toBe(1);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a sweep never displaces a queued event trigger (review r1)', async () => {
+    const h = makeDriver();
+    try {
+      addJobWithDelivery(h.ledger, 'job-q1');
+      h.hold();
+      const first = h.driver.trigger({ kind: 'job.delivered', jobId: 'job-q1' });
+      await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
+      // the event queues mid-turn; a sweep ticks after it — the sweep must
+      // NOT replace the queued event (it could find an unchanged digest and
+      // swallow the event's context)
+      await h.driver.trigger({ kind: 'round.verdict', jobId: 'job-q1' });
+      await h.driver.trigger({ kind: 'sweep' });
+      h.settle();
+      await first;
+      await vi.waitFor(() => expect(h.prompts).toHaveLength(2));
+      expect(h.prompts[1]?.text).toContain('trigger: round.verdict');
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(h.prompts).toHaveLength(2);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a due decision recheck wakes even when the digest is empty (review r1)', async () => {
+    let clock = 1_750_000_000_000;
+    const h = makeDriver({ now: () => clock });
+    try {
+      // nothing actionable at all; a hold's recheck comes due
+      h.ledger.addJob({ id: 'job-empty', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('job-empty', 'working');
+      h.ledger.recordDecision({
+        subject: 'job:job-empty',
+        decision: 'hold',
+        covers: ['pr-conflict'],
+        reason: 'waiting on the owner',
+        by: 'silas',
+        recheckAt: new Date(clock + 1_000).toISOString(),
+      });
+      await h.driver.trigger({ kind: 'sweep' });
+      expect(h.prompts).toHaveLength(0);
+      clock += 2_000;
+      await h.driver.trigger({ kind: 'sweep' });
+      expect(h.prompts).toHaveLength(1);
+      // and exactly once
+      clock += 60_000;
       await h.driver.trigger({ kind: 'sweep' });
       expect(h.prompts).toHaveLength(1);
     } finally {
@@ -3472,25 +3562,32 @@ describe('silas wake gate restart seeding (issue #217)', () => {
   });
 });
 
-describe('silas skills once per session (issue #217)', () => {
-  it('injected on the first wake, a marker line afterwards, re-injected after compaction and on a skills change', async () => {
+describe('silas operating brief once per session (issue #217)', () => {
+  it('injected on the first wake, a marker line afterwards, re-injected after compaction and on a brief change', async () => {
     const skills: SkillModule[] = [{ name: 'test-skill', body: 'SKILL MARKER ONE' }];
     const h = makeDriver({ skills });
     try {
       addJobWithDelivery(h.ledger, 'job-sk1');
       await h.driver.trigger({ kind: 'job.delivered', jobId: 'job-sk1' });
       expect(h.prompts[0]?.text).toContain('SKILL MARKER ONE');
+      // the whole static brief — orders included — is in the first wake
+      expect(h.prompts[0]?.text).toContain('## Ops surface');
+      expect(h.prompts[0]?.text).toContain('## Recurrence policy');
       // second wake, changed digest, same handle and hash: marker only
       addJobWithDelivery(h.ledger, 'job-sk2');
       await h.driver.trigger({ kind: 'job.delivered', jobId: 'job-sk2' });
       expect(h.prompts[1]?.text).not.toContain('SKILL MARKER ONE');
-      expect(h.prompts[1]?.text).toContain('Operating skills unchanged (hash');
-      expect(h.prompts[1]?.text).toContain(silasSkillsHash(skills).slice(0, 16));
-      // a compaction may have dropped the pack: the next wake re-injects
+      expect(h.prompts[1]?.text).not.toContain('## Ops surface');
+      expect(h.prompts[1]?.text).toContain('Operating brief unchanged (hash');
+      expect(h.prompts[1]?.text).toContain(
+        silasBriefHash({ skills, ops: { baseUrl: 'http://127.0.0.1:7665', configPath: '/instance/config.toml' } }).slice(0, 16),
+      );
+      // a compaction may have dropped the brief: the next wake re-injects
       h.emitRuntime({ type: 'compaction_end', success: true });
       addJobWithDelivery(h.ledger, 'job-sk3');
       await h.driver.trigger({ kind: 'job.delivered', jobId: 'job-sk3' });
       expect(h.prompts[2]?.text).toContain('SKILL MARKER ONE');
+      expect(h.prompts[2]?.text).toContain('## Ops surface');
       // and exactly once: the wake after that is a marker again
       addJobWithDelivery(h.ledger, 'job-sk4');
       await h.driver.trigger({ kind: 'job.delivered', jobId: 'job-sk4' });
@@ -3503,7 +3600,29 @@ describe('silas skills once per session (issue #217)', () => {
       addJobWithDelivery(h.ledger, 'job-sk6');
       await h.driver.trigger({ kind: 'job.delivered', jobId: 'job-sk6' });
       expect(h.prompts[5]?.text).not.toContain('SKILL MARKER TWO');
-      expect(h.prompts[5]?.text).toContain('Operating skills unchanged (hash');
+      expect(h.prompts[5]?.text).toContain('Operating brief unchanged (hash');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a compaction DURING an injecting wake does not record the marker (epoch guard, review r1)', async () => {
+    const skills: SkillModule[] = [{ name: 'test-skill', body: 'EPOCH SKILL MARKER' }];
+    const h = makeDriver({ skills });
+    try {
+      addJobWithDelivery(h.ledger, 'job-ep1');
+      // hold the first (brief-injecting) turn open, compact mid-turn, settle
+      h.hold();
+      const first = h.driver.trigger({ kind: 'job.delivered', jobId: 'job-ep1' });
+      await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
+      h.emitRuntime({ type: 'compaction_end', success: true });
+      h.settle();
+      await first;
+      // the completion must NOT overwrite the compaction invalidation
+      addJobWithDelivery(h.ledger, 'job-ep2');
+      await h.driver.trigger({ kind: 'job.delivered', jobId: 'job-ep2' });
+      expect(h.prompts[1]?.text).toContain('EPOCH SKILL MARKER');
+      expect(h.prompts[1]?.text).toContain('## Ops surface');
     } finally {
       h.cleanup();
     }
@@ -3773,9 +3892,9 @@ describe('silas deterministic pass observation (issue #163)', () => {
       expect(reconciles).toHaveLength(3);
       expect(reconciles.every((event) => (event.payload as { ok?: unknown }).ok === true)).toBe(true);
       expect((reconciles[1]?.payload as { counts?: unknown }).counts).toEqual({ examined: 1, advanced: 1 });
-      // The wake marker means DELIVERED (issue #217): the open turn has
-      // not settled, so no wake event exists yet — only ticks and passes.
-      expect(kinds(h, 'silas.wake')).toHaveLength(0);
+      // The wake marker means wake START (issue #217 keeps the attempt
+      // marker pre-prompt for telemetry; the delivered marker lands after).
+      expect(kinds(h, 'silas.wake')).toHaveLength(1);
 
       h.settle();
       await first;

@@ -151,6 +151,11 @@ export const SILAS_DIGEST_HEADER = '## Digest (actionable states, JSON)';
 
 const DIGEST_FENCE = /## Digest \(actionable states, JSON\)\s*\n+```json\n([\s\S]*?)\n```/;
 
+/** The wake prompt's digest-identity line (issue #217): every wake — full
+ * or delta — names the fingerprint of the digest it was built from, so
+ * stability attribution survives the delta prompt shape. */
+const DIGEST_FINGERPRINT_LINE = /^Digest fingerprint: ([0-9a-f]{64})$/m;
+
 /** Digest categories that carry actionable rows (skip the scalar header
  * fields `computedAt`/`trigger`). Order is the SilasOpsDigest field order. */
 export const DIGEST_CATEGORY_KEYS = [
@@ -165,10 +170,18 @@ export const DIGEST_CATEGORY_KEYS = [
   'conflictingPrs',
 ] as const;
 
-/** Parse the fenced digest JSON from a Silas wake prompt and reduce it to
- * a stability signature: per category, the sorted job IDs (wait ID when a
- * row has no job). Null when the prompt carries no parseable digest. */
+/** Parse the digest identity from a Silas wake prompt and reduce it to a
+ * stability signature: the `Digest fingerprint:` line when the prompt
+ * carries one (issue #217 — full and delta wakes alike), otherwise the
+ * fenced full-digest JSON reduced per category to the sorted job IDs
+ * (wait ID when a row has no job; older prompt shapes). Null when the
+ * prompt carries neither. */
 export function digestSignatureFromPrompt(prompt: string): string | null {
+  // Fingerprint-bearing prompts (issue #217) attribute directly: the
+  // fingerprint IS the stable digest identity, and it is the only
+  // digest signal a delta wake carries.
+  const fingerprint = DIGEST_FINGERPRINT_LINE.exec(prompt);
+  if (fingerprint !== null) return `fp:${fingerprint[1]}`;
   const match = DIGEST_FENCE.exec(prompt);
   const body = match === null ? undefined : match[1];
   if (body === undefined) return null;
