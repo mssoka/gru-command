@@ -80,7 +80,7 @@ function nodeStreamFetch(input: string, init?: RequestInit): Promise<Response> {
     const url = new URL(input);
     const requestFn = url.protocol === 'https:' ? httpsRequest : httpRequest;
     const headers: Record<string, string> = {};
-    const initHeaders: HeadersInit | undefined = init?.headers;
+    const initHeaders = init?.headers;
     if (initHeaders !== undefined) {
       if (initHeaders instanceof Headers) {
         for (const [name, value] of initHeaders.entries()) headers[name] = value;
