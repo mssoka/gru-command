@@ -1,6 +1,6 @@
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { request } from 'node:http';
 import { dirname, join, sep } from 'node:path';
@@ -26,19 +26,24 @@ const fixture = (prefix: string): string => {
 };
 afterEach(() => { vi.unstubAllEnvs(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
-/** Copy a directory tree; on darwin try APFS clonefile first (the fixture
- * copies ~150MB of installed dependency per identity, and cloning is
- * near-instant while still giving each caller a private tree). */
+/** Copy a directory TREE into `destination` (contents, unambiguously —
+ * never `cp`'s copy-into-existing-dir nesting). On darwin APFS clonefile
+ * makes this ~13s instead of cpSync's 80-100s per ~150MB identity tree;
+ * the portable path copies entry by entry. */
 function copyTree(source: string, destination: string): void {
+  mkdirSync(destination, { recursive: true });
   if (process.platform === 'darwin') {
     try {
-      execFileSync('cp', ['-cR', source, destination], { stdio: 'ignore' });
+      // `source/.` copies the directory CONTENTS into the existing dest.
+      execFileSync('cp', ['-cR', join(source, '.'), destination], { stdio: 'ignore' });
       return;
     } catch {
       // Clone unsupported (different volume/filesystem) — portable copy.
     }
   }
-  cpSync(source, destination, { recursive: true });
+  for (const entry of readdirSync(source)) {
+    cpSync(join(source, entry), join(destination, entry), { recursive: true });
+  }
 }
 
 /** The build+packed tarball is the same bytes for every identity fixture
@@ -119,10 +124,6 @@ function packageIdentity(): { root: string; identity: string } {
   const source = defaultPackageRoot();
   for (const directory of packageClosure(source)) {
     const destination = join(installed, directory.slice(source.length + 1));
-    mkdirSync(dirname(destination), { recursive: true });
-    // APFS clonefile first: a plain cpSync of this closure takes 80-100s
-    // per identity on this host, while cloning is ~13s and yields the
-    // same directory tree. Fall back to cpSync portably.
     copyTree(directory, destination);
   }
   expect(existsSync(join(installed, 'node_modules', '@earendil-works', 'pi-ai'))).toBe(true);
