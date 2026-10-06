@@ -145,7 +145,7 @@ function inferredReportKind(job: JobRecord): ReportDeliverable | null {
  * every eligible row reaches the dry run.
  */
 export function planLegacyReportBackfill(
-  ledger: Pick<LedgerApi, 'listLegacyDeliveredJobs' | 'listJobs'>,
+  ledger: Pick<LedgerApi, 'listLegacyDeliveredJobs' | 'listJobs' | 'latestJobEvent'>,
   opts: { pageSize?: number } = {},
 ): BackfillPlan {
   // PR identity → jobs carrying that PR, so merge/re-supersede evidence is
@@ -172,8 +172,12 @@ export function planLegacyReportBackfill(
   for (const job of allJobs) {
     indexUrl(job.prUrl, job);
     indexUrl(job.targetRef, job);
+    // The job id's embedded PR number is evidence ONLY when the row carries
+    // no URL target of its own: a job whose id says pr55 but whose prUrl is
+    // PR 56 belongs to #56, never #55. Unmarked legacy rows have no URL at
+    // all, so their id is the only anchor that exists.
     const number = legacyJobPrNumber(job.id);
-    if (number !== null && job.repo.trim() !== '') {
+    if (number !== null && job.repo.trim() !== '' && job.prUrl === null && job.targetRef === null) {
       const key = `${job.repo.toLowerCase()}#${number}`;
       const bucket = byLegacyId.get(key) ?? [];
       bucket.push(job);
@@ -263,6 +267,9 @@ export function planLegacyReportBackfill(
         (candidate) =>
           candidate.createdAt > job.createdAt &&
           (candidate.status === 'delivered' || candidate.status === 'done' || candidate.status === 'merged') &&
+          // A closed status alone is not a handback: the replacement must
+          // have actually DELIVERED findings (its own job.delivered receipt).
+          ledger.latestJobEvent(candidate.id, 'job.delivered') !== null &&
           inferredReportKind(candidate) === classified.deliverable &&
           (candidate.deliverable !== null || candidate.prUrl === null),
       )
@@ -299,7 +306,10 @@ export function planLegacyReportBackfill(
  * it for obligations through `obligationRowid` and for jobs here. The
  * optional method keeps test doubles that pre-date the cursor contract
  * usable (a page shorter than the limit always terminates the scan). */
-function legacyJobRowid(ledger: Pick<LedgerApi, 'listLegacyDeliveredJobs' | 'listJobs'> & { jobRowid?(id: string): number | null }, id: string): number | null {
+function legacyJobRowid(
+  ledger: Pick<LedgerApi, 'listLegacyDeliveredJobs' | 'listJobs' | 'latestJobEvent'> & { jobRowid?(id: string): number | null },
+  id: string,
+): number | null {
   return ledger.jobRowid === undefined ? null : ledger.jobRowid(id);
 }
 

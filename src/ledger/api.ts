@@ -4545,6 +4545,13 @@ export class LedgerApi {
         jobId: row.jobId,
         payload: { id: row.id, from: row.state, to: target, settlement: input.settlement },
       });
+      // A settled report debt answers its handback card HERE, at the one
+      // boundary every closure path rides (disposition, auto-supersede,
+      // terminal status transitions, stale-continuation invalidation) — no
+      // path can close the debt and leave a false outstanding action.
+      if (row.incidentKey === reportIncidentKey(row.jobId)) {
+        this.resolveReportHandbackCard(row.jobId, 'code');
+      }
       return this.getObligation(row.id) as ObligationRecord;
     });
   }
@@ -5193,10 +5200,6 @@ export class LedgerApi {
             ? { kind: 'cancelled', reason: note }
             : { kind: 'superseded', byObligationId: null, reason: note };
       const settled = this.settleObligation({ obligationId: obligation.id, settlement });
-      // The handback card (posted by the deterministic pass) is answered by
-      // this settlement: a resolved debt must never leave a false
-      // outstanding action behind.
-      this.resolveReportHandbackCard(job.id, actor);
       const done = this.setJobStatus(job.id, 'done');
       return { job: done, obligation: settled };
     });
@@ -5229,7 +5232,6 @@ export class LedgerApi {
         obligationId: obligation.id,
         settlement: { kind: 'superseded', byObligationId: null, reason: input.reason },
       });
-      this.resolveReportHandbackCard(job.id, 'code');
       this.appendEvent({
         kind: REPORT_SUPERSEDED_EVENT,
         jobId: job.id,
@@ -5249,8 +5251,10 @@ export class LedgerApi {
    * still open — called from every settlement path so a closed debt never
    * leaves a false outstanding action. */
   private resolveReportHandbackCard(jobId: string, by: string): void {
-    const card = this.findNotificationByKind(`silas.report-handback.${jobId}`, 'any');
-    if (card !== null && card.resolvedAt === null) this.resolveNotificationById(card.id, by);
+    // ACTIVE (unresolved) only: a resolved prior card must never win the
+    // tie-break against its own repost and leave that repost outstanding.
+    const card = this.findNotificationByKind(`silas.report-handback.${jobId}`, 'active');
+    if (card !== null) this.resolveNotificationById(card.id, by);
   }
 
   /** One job's rowid (keyset pagination anchor). */

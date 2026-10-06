@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -338,6 +338,48 @@ describe('legacy report backfill plan and apply (issue #220)', () => {
     expect(parseArgs(['--data-dir', '/tmp/x']).dataDir).toBe('/tmp/x');
     expect(() => parseArgs(['--write'])).toThrow(/unknown argument/);
     expect(() => parseArgs(['--apply', '--dry-run'])).toThrow(/mutually exclusive/);
+  });
+
+  it('a done/merged newer report WITHOUT a delivery receipt is not supersession evidence', async () => {
+    const h = freshLedger();
+    try {
+      seedLegacyJob(h.api, 'job-pr60-review-lens');
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      h.api.addJob({
+        id: 'review-pr60-abandoned', repo: 'fixture-app', title: 't', briefing: 're-review',
+        deliverable: 'review', commissioner: 'gru', targetRef: 'https://github.com/o/fixture-app/pull/60', targetSha: 'h',
+      });
+      // Administratively closed without ever delivering findings.
+      h.api.setJobStatus('review-pr60-abandoned', 'working');
+      h.api.setJobStatus('review-pr60-abandoned', 'done');
+      const plan = planLegacyReportBackfill(h.api);
+      expect(plan.proposals.find((p) => p.job.id === 'job-pr60-review-lens')?.outcome).toBe('obligation-opened');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('the compiled CLI refuses --data-dir when the instance config redirects data_dir', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-backfill-override-'));
+    const elsewhere = mkdtempSync(join(tmpdir(), 'gru-backfill-elsewhere-'));
+    try {
+      // The instance config points data_dir at a different tree.
+      writeFileSync(
+        join(dir, 'config.toml'),
+        `data_dir = "${elsewhere}"\n[auth]\ntoken = "test"\n[server]\nport = 0\n`,
+        'utf-8',
+      );
+      const cli = join(process.cwd(), 'dist', 'cli', 'report-jobs-backfill.js');
+      const run = spawnSync(process.execPath, [cli, '--data-dir', dir, '--apply'], { encoding: 'utf8', timeout: 15_000 });
+      expect(run.status).toBe(1);
+      expect(run.stderr).toContain('refusing to operate on a different ledger');
+      // Neither tree gained a ledger.
+      expect(existsSync(join(dir, 'ledger', 'ledger.db'))).toBe(false);
+      expect(existsSync(join(elsewhere, 'ledger', 'ledger.db'))).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(elsewhere, { recursive: true, force: true });
+    }
   });
 
   it('the compiled CLI dry-run is READ-ONLY (no migration, no job writes) and prints the resolved ledger', () => {

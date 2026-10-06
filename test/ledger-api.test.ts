@@ -1243,6 +1243,32 @@ describe('report-job closure (issue #220)', () => {
     }
   });
 
+  it('only the recorded commissioner (or gru) may settle, and every closure path resolves the card', () => {
+    const { api, db, dir } = freshDb();
+    try {
+      deliveredReportJob(api, 'rep-owner', { commissioner: 'silas', targetRef: 'https://x/pull/10', targetSha: 's1' });
+      // A foreign actor is refused; gru (the chief) may close on behalf.
+      expect(() =>
+        api.settleReportDisposition({ jobId: 'rep-owner', outcome: 'dismissed', note: 'x', by: 'someone-else' }),
+      ).toThrow(/commissioned by "silas"/);
+      expect(api.getJob('rep-owner')?.status).toBe('delivered');
+
+      // A card posted by the deterministic pass is RESOLVED by a direct
+      // terminal status transition too — not only by the disposition API.
+      const card = api.recordNotification({
+        id: 'card-rep-owner', kind: 'silas.report-handback.rep-owner',
+        routing: 'action-required', severity: 'info', title: 'card',
+      });
+      expect(api.getNotification(card.id)?.resolvedAt).toBeNull();
+      api.setJobStatus('rep-owner', 'done');
+      expect(api.getNotification(card.id)?.resolvedAt).not.toBeNull();
+      expect(api.findReportObligation('rep-owner')?.state).toBe('closed');
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('findReportObligation survives a long obligation history (no 200-row page dependency)', () => {
     const { api, db, dir } = freshDb();
     try {
