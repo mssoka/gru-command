@@ -274,7 +274,7 @@ describe('board server — HTTP API', () => {
   it('closeout endpoint: auth, malformed bodies, missing jobs and guard refusals fail loud without changes', async () => {
     const { api, port } = harness;
     const head = '3c44e87e2e9e64cbc3301d7806540df6273438e6';
-    const prUrl = 'https://github.com/mssoka/gru-command/pull/165';
+    const prUrl = 'https://github.com/acme/gru-command/pull/165';
     const validBody = {
       expected_status: 'parked',
       expected_pr_url: prUrl,
@@ -342,7 +342,7 @@ describe('board server — HTTP API', () => {
     });
     const mismatch = await postJson(port, '/api/jobs/target-http/closeout', 'board-test-token', {
       ...validBody,
-      expected_pr_url: 'https://github.com/mssoka/gru-command/pull/999',
+      expected_pr_url: 'https://github.com/acme/gru-command/pull/999',
     });
     expect(mismatch.status).toBe(409);
     expect(mismatch.body).toMatchObject({ error: 'closeout_refused', code: 'target-mismatch' });
@@ -352,7 +352,7 @@ describe('board server — HTTP API', () => {
     // still maps to the typed 409, never the transcript 404.
     const sentinel = await postJson(port, '/api/jobs/target-http/closeout', 'board-test-token', {
       ...validBody,
-      expected_pr_url: 'https://github.com/mssoka/gru-command/transcript unreadable/pull/165',
+      expected_pr_url: 'https://github.com/acme/gru-command/transcript unreadable/pull/165',
     });
     expect(sentinel.status).toBe(409);
     expect(sentinel.body).toMatchObject({ error: 'closeout_refused', code: 'target-mismatch' });
@@ -382,7 +382,7 @@ describe('board server — HTTP API', () => {
     const { api, port } = harness;
     const jobId = 'closeout-http';
     const head = '3c44e87e2e9e64cbc3301d7806540df6273438e6';
-    const prUrl = 'https://github.com/mssoka/gru-command/pull/178';
+    const prUrl = 'https://github.com/acme/gru-command/pull/178';
     api.addJob({ id: jobId, repo: 'demo-repo', title: 'Closeout HTTP' });
     api.setJobStatus(jobId, 'working');
     api.setJobPr(jobId, prUrl);
@@ -430,6 +430,28 @@ describe('board server — HTTP API', () => {
     };
     const job = snapshot.repos.flatMap((repo) => repo.jobs).find((candidate) => candidate.id === jobId);
     expect(job).toMatchObject({ status: 'done', prUrl, prState: null });
+
+    // An omitted closed_at is a valid closeout: the audit records null.
+    const noClosedAt = 'closeout-http-no-closed-at';
+    api.addJob({ id: noClosedAt, repo: 'demo-repo', title: 'Closeout without closed_at' });
+    api.setJobStatus(noClosedAt, 'working');
+    api.setJobPr(noClosedAt, prUrl);
+    api.setJobStatus(noClosedAt, 'in-review');
+    api.setJobStatus(noClosedAt, 'parked');
+    api.appendCustomEvent({
+      kind: 'github.branch-state',
+      jobId: noClosedAt,
+      payload: branchStatePayload(
+        { jobId: noClosedAt, repo: { host: 'github.com', owner: 'acme', repo: 'gru-command' }, branch: `gru/${noClosedAt}`, prNumber: 178, prUrl },
+        { sha: head, merged: false, prOpen: false, mergeableState: 'dirty', ci: null, prNumber: 178, prUrl, mergeCommitSha: null },
+      ),
+    });
+    const { closed_at: _omitted, ...providerWithoutClosedAt } = body.provider;
+    const noClosed = await postJson(port, `/api/jobs/${noClosedAt}/closeout`, 'board-test-token', { ...body, provider: providerWithoutClosedAt });
+    expect(noClosed.status).toBe(200);
+    expect(
+      (noClosed.body as { event: { payload: { provider: { closed_at: unknown } } } }).event.payload.provider.closed_at,
+    ).toBeNull();
   });
 
   it('write endpoints reject bad bodies and missing entities', async () => {

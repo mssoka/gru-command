@@ -574,7 +574,7 @@ describe('obligations — park/terminal act only on APPLICABLE rows; history sur
       obligationId: settledRow.id,
       settlement: { kind: 'executed-action', action: 'request-review', evidenceEventSeq: evidence.seq, evidenceEventKind: 'silas.directive-sent' },
     });
-    const prUrl = 'https://github.com/mssoka/gru-command/pull/165';
+    const prUrl = 'https://github.com/acme/gru-command/pull/165';
     const sha = '3c44e87e2e9e64cbc3301d7806540df6273438e6';
     api.setJobPr('job-closeout', prUrl);
     api.setJobStatus('job-closeout', 'parked');
@@ -635,7 +635,7 @@ describe('obligations — park/terminal act only on APPLICABLE rows; history sur
     });
     expect(secondOpen.state).toBe('open');
 
-    const prUrl = 'https://github.com/mssoka/gru-command/pull/165';
+    const prUrl = 'https://github.com/acme/gru-command/pull/165';
     const sha = '3c44e87e2e9e64cbc3301d7806540df6273438e6';
     api.setJobPr('job-closeout-states', prUrl);
     api.appendCustomEvent({

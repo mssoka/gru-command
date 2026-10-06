@@ -569,4 +569,4 @@ working-flavor-catalog-baseline = 'set -e; base=9bb51b05af5d8f0a0cd389788d1d3f19
 # approved RPC patch first, exits never masked. The static scope carries the
 # lint/typecheck product checks for the same change.
 parked-closeout = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/ledger-api.test.ts test/ledger-obligations.test.ts test/board-server.test.ts test/board-engine-v4.test.ts test/suite-shape.test.ts && cd web && ../node_modules/.bin/vitest run src/lib/board-kpi.test.ts"
-parked-closeout-static = "node tools/patch-vitest-rpc-timeout.mjs && npm run lint && npm run typecheck"
+parked-closeout-static = "node tools/patch-vitest-rpc-timeout.mjs && npm run lint && npm run typecheck && cd web && node ../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json"

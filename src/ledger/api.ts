@@ -869,6 +869,7 @@ export function requireSafeRecordId(value: string, name: string, maxLength = 128
  * wire; anything absent or the wrong type reads as `null` and fails the
  * closeout closed (unconfirmed) — never as a guessed default. */
 interface CloseoutObservation {
+  readonly repo: string | null;
   readonly prUrl: string | null;
   readonly prNumber: number | null;
   readonly sha: string | null;
@@ -884,6 +885,7 @@ function parseCloseoutObservation(payload: unknown): CloseoutObservation | null 
     typeof value === 'number' && Number.isFinite(value) ? value : null;
   const booleanOrNull = (value: unknown): boolean | null => (typeof value === 'boolean' ? value : null);
   return {
+    repo: stringOrNull(record['repo']),
     prUrl: stringOrNull(record['pr_url']),
     prNumber: numberOrNull(record['pr_number']),
     sha: stringOrNull(record['sha']),
@@ -1651,11 +1653,21 @@ export class LedgerApi {
         if (recorded !== null && recordedSha === requestSha256) {
           return { job, event: recorded, idempotent: true };
         }
+        if (recorded === null) {
+          throw new AdminCloseoutRefusal(
+            'already-closed',
+            `job "${job.id}" is done — not by this administrative operation; re-read the record`,
+          );
+        }
+        if (typeof recordedSha !== 'string') {
+          throw new AdminCloseoutRefusal(
+            'already-closed',
+            `job "${job.id}" is already done and its recorded closeout (event ${recorded.seq}) carries no readable request identity — inspect the recorded event before retrying`,
+          );
+        }
         throw new AdminCloseoutRefusal(
           'already-closed',
-          recorded === null
-            ? `job "${job.id}" is done — not by this administrative operation; re-read the record`
-            : `job "${job.id}" is already done under a DIFFERENT administrative closeout request (event ${recorded.seq}); a changed request never overwrites the recorded one`,
+          `job "${job.id}" is already done under a DIFFERENT administrative closeout request (event ${recorded.seq}); a changed request never overwrites the recorded one`,
         );
       }
       // Target identity next: a request about another PR/lane never
@@ -1702,13 +1714,21 @@ export class LedgerApi {
           `the recorded provider observation names "${observation.prUrl ?? 'no url'}", not "${expectedPrUrl}" — stale target identity`,
         );
       }
-      // Defense in depth: when the observation carries a PR number it must
-      // agree with the number the recorded URL names.
+      // Defense in depth: when the observation carries a PR number or repo
+      // it must agree with the number/repo the recorded URL names.
       const urlPrNumber = /\/pull\/(\d+)\/?$/u.exec(parsedPrUrl.pathname)?.[1] ?? null;
       if (observation.prNumber !== null && urlPrNumber !== null && String(observation.prNumber) !== urlPrNumber) {
         throw new AdminCloseoutRefusal(
           'target-mismatch',
           `the recorded provider observation cites PR #${String(observation.prNumber)} for "${expectedPrUrl}" — inconsistent target identity`,
+        );
+      }
+      const urlPathSegments = parsedPrUrl.pathname.split('/').filter((segment) => segment !== '');
+      const urlRepo = urlPathSegments.length >= 2 ? `${urlPathSegments[0]}/${urlPathSegments[1]}` : null;
+      if (observation.repo !== null && urlRepo !== null && observation.repo !== urlRepo) {
+        throw new AdminCloseoutRefusal(
+          'target-mismatch',
+          `the recorded provider observation names repo "${observation.repo}" for "${expectedPrUrl}" — inconsistent target identity`,
         );
       }
       if (observation.prOpen === true) {
@@ -1735,10 +1755,16 @@ export class LedgerApi {
           `job "${job.id}" has no recorded not-merged observation — unconfirmed merge state`,
         );
       }
-      if (observation.sha === null || observation.sha.toLowerCase() !== headSha) {
+      if (observation.sha === null) {
+        throw new AdminCloseoutRefusal(
+          'unconfirmed-pr',
+          `job "${job.id}" has no recorded provider head for ${expectedPrUrl} — unconfirmed target identity`,
+        );
+      }
+      if (observation.sha.toLowerCase() !== headSha) {
         throw new AdminCloseoutRefusal(
           'stale-head',
-          `recorded provider head ${observation.sha ?? 'unknown'} does not match the requested ${headSha} — stale head`,
+          `recorded provider head ${observation.sha} does not match the requested ${headSha} — stale head`,
         );
       }
 
@@ -1765,6 +1791,7 @@ export class LedgerApi {
           observation: {
             event_seq: observationEvent.seq,
             observed_at: observationEvent.ts,
+            repo: observation.repo,
             pr_url: observation.prUrl,
             pr_number: observation.prNumber,
             sha: observation.sha,

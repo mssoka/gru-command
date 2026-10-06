@@ -1368,7 +1368,7 @@ describe('report-job closure (issue #220)', () => {
 });
 
 describe('administrative closeout of a parked PR-backed job', () => {
-  const PR_URL = 'https://github.com/mssoka/gru-command/pull/165';
+  const PR_URL = 'https://github.com/acme/gru-command/pull/165';
   const HEAD = '3c44e87e2e9e64cbc3301d7806540df6273438e6';
   const CLOSED_AT = '2026-10-05T05:06:52Z';
 
@@ -1385,7 +1385,14 @@ describe('administrative closeout of a parked PR-backed job', () => {
   function appendObservation(
     api: LedgerApi,
     jobId: string,
-    opts: { prUrl?: string; headSha?: string; prOpen?: boolean | null; merged?: boolean; prNumber?: number } = {},
+    opts: {
+      prUrl?: string;
+      headSha?: string;
+      prOpen?: boolean | null;
+      merged?: boolean;
+      prNumber?: number;
+      repo?: { host: string; owner: string; repo: string };
+    } = {},
   ): void {
     const prUrl = opts.prUrl ?? PR_URL;
     api.appendCustomEvent({
@@ -1394,7 +1401,7 @@ describe('administrative closeout of a parked PR-backed job', () => {
       payload: branchStatePayload(
         {
           jobId,
-          repo: { host: 'github.com', owner: 'acme', repo: 'gru-command' },
+          repo: opts.repo ?? { host: 'github.com', owner: 'acme', repo: 'gru-command' },
           branch: `gru/${jobId}`,
           prNumber: opts.prNumber ?? 165,
           prUrl,
@@ -1538,7 +1545,7 @@ describe('administrative closeout of a parked PR-backed job', () => {
       parkedPrJob(api, 'target-mismatch');
       expect(
         refusalOf(() =>
-          api.adminCloseParkedJob(closeoutRequest('target-mismatch', { expectedPrUrl: 'https://github.com/mssoka/gru-command/pull/999' })),
+          api.adminCloseParkedJob(closeoutRequest('target-mismatch', { expectedPrUrl: 'https://github.com/acme/gru-command/pull/999' })),
         ).code,
       ).toBe('target-mismatch');
 
@@ -1572,7 +1579,7 @@ describe('administrative closeout of a parked PR-backed job', () => {
       // The observation must name the SAME target as the request, even when
       // the job's registered PR matches: stale evidence never closes.
       parkedPrJob(api, 'observation-mismatch');
-      appendObservation(api, 'observation-mismatch', { prUrl: 'https://github.com/mssoka/gru-command/pull/999', prNumber: 999 });
+      appendObservation(api, 'observation-mismatch', { prUrl: 'https://github.com/acme/gru-command/pull/999', prNumber: 999 });
       expect(refusalOf(() => api.adminCloseParkedJob(closeoutRequest('observation-mismatch'))).code).toBe('target-mismatch');
 
       // Fail-closed observation fields: an unobserved open/closed state, a
@@ -1594,7 +1601,11 @@ describe('administrative closeout of a parked PR-backed job', () => {
         jobId: 'observation-null-sha',
         payload: { pr_url: PR_URL, pr_number: 165, sha: null, pr_open: false, merged: false },
       });
-      expect(refusalOf(() => api.adminCloseParkedJob(closeoutRequest('observation-null-sha'))).code).toBe('stale-head');
+      expect(refusalOf(() => api.adminCloseParkedJob(closeoutRequest('observation-null-sha'))).code).toBe('unconfirmed-pr');
+      // The observation's repo field must agree with the URL's repo too.
+      parkedPrJob(api, 'observation-repo-mismatch');
+      appendObservation(api, 'observation-repo-mismatch', { repo: { host: 'github.com', owner: 'other', repo: 'gru-command' } });
+      expect(refusalOf(() => api.adminCloseParkedJob(closeoutRequest('observation-repo-mismatch'))).code).toBe('target-mismatch');
       parkedPrJob(api, 'number-mismatch');
       appendObservation(api, 'number-mismatch', { prNumber: 999 });
       expect(refusalOf(() => api.adminCloseParkedJob(closeoutRequest('number-mismatch'))).code).toBe('target-mismatch');
@@ -1623,6 +1634,7 @@ describe('administrative closeout of a parked PR-backed job', () => {
         ['observation-null-open', 'parked'],
         ['observation-no-merged', 'parked'],
         ['observation-null-sha', 'parked'],
+        ['observation-repo-mismatch', 'parked'],
         ['number-mismatch', 'parked'],
         ['no-pr', 'parked'],
         ['report-only', 'parked'],
@@ -1651,6 +1663,13 @@ describe('administrative closeout of a parked PR-backed job', () => {
       expect(
         api.listJobEventsByKinds('replay', ['job.status']).filter((event) => (event.payload as { to: string }).to === 'done'),
       ).toHaveLength(1);
+
+      // A later PR re-link on the closed lane never changes the idempotent
+      // replay of the SAME request — the recorded event is returned.
+      api.setJobPr('replay', 'https://github.com/acme/gru-command/pull/777');
+      const afterRelink = api.adminCloseParkedJob(closeoutRequest('replay'));
+      expect(afterRelink.idempotent).toBe(true);
+      expect(afterRelink.event.seq).toBe(first.event.seq);
 
       // A changed request cannot overwrite the recorded closeout.
       const conflict = refusalOf(() => api.adminCloseParkedJob(closeoutRequest('replay', { reason: 'a different request' })));
@@ -1727,6 +1746,35 @@ describe('administrative closeout of a parked PR-backed job', () => {
       expect(refusalOf(() => api.adminCloseParkedJob(closeoutRequest('live-turn'))).message).toContain('worker-live');
       expect(refusalOf(() => api.adminCloseParkedJob(closeoutRequest('live-round'))).message).toContain('live-round-r1');
       expect(refusalOf(() => api.adminCloseParkedJob(closeoutRequest('live-verify'))).message).toContain('verification');
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('administrative closeout accepts full-identity variants: 64-char uppercase head, explicit null closed_at', () => {
+    const { api, db, dir } = freshDb();
+    try {
+      const sha64 = 'a1'.repeat(32);
+      parkedPrJob(api, 'variants', { headSha: sha64 });
+      const result = api.adminCloseParkedJob({
+        jobId: 'variants',
+        expectedStatus: 'parked',
+        expectedPrUrl: PR_URL,
+        provider: {
+          provider: 'github',
+          state: 'closed',
+          merged: false,
+          headSha: sha64.toUpperCase(),
+          closedAt: null,
+        },
+        reason: 'variant closeout',
+      });
+      expect(result.idempotent).toBe(false);
+      expect(result.job.status).toBe('done');
+      const payload = result.event.payload as { provider: { head_sha: string; closed_at: unknown } };
+      expect(payload.provider.head_sha).toBe(sha64);
+      expect(payload.provider.closed_at).toBeNull();
     } finally {
       db.close();
       rmSync(dir, { recursive: true, force: true });
@@ -1827,7 +1875,7 @@ describe('administrative closeout of a parked PR-backed job', () => {
       ).toThrow(/real ISO-8601 UTC/u);
       // The target must be an absolute https url.
       expect(attempt({ expectedPrUrl: 'not-a-url' })).toThrow(/absolute https url/u);
-      expect(attempt({ expectedPrUrl: 'http://github.com/mssoka/gru-command/pull/165' })).toThrow(/absolute https url/u);
+      expect(attempt({ expectedPrUrl: 'http://github.com/acme/gru-command/pull/165' })).toThrow(/absolute https url/u);
       // Bounded reason / hex head (full 40- or 64-character identity).
       expect(attempt({ reason: 'x'.repeat(2_001) })).toThrow(/bounded printable text/u);
       expect(attempt({ provider: { provider: 'github', state: 'closed', merged: false, headSha: 'abc123' } })).toThrow(/full 40- or 64-character hex commit sha/u);

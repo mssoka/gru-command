@@ -51,6 +51,11 @@ transitions and unknown entities are 400/404 with the reason in
 `detail`; a guarded closeout refusal is a typed `409 closeout_refused`
 whose `code` names the refusing guard. Bodies are capped (200 KB).
 
+PR state derives from the record: a `merged` job reports `merged`; a
+terminal `done` job is a closed receipt — its registered PR is never
+presented or counted as open (and closure never infers a merge); any
+other lane with a registered URL reports `open`.
+
 ## Board WebSocket — `/board/ws`
 
 JSON frames; **first frame must be `auth`** (same pairing token, 5 s
