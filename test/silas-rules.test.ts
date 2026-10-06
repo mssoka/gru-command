@@ -28,15 +28,19 @@ const EXPECTED_RULE_IDS = [
   'freeze-r1',
 ] as const;
 
-/** Every src TypeScript file, concatenated — the receipt-existence probe. */
+/** Every src TypeScript file EXCEPT the registry itself, concatenated —
+ * the receipt-existence probe. The registry's own entries name the receipt
+ * kinds too, so searching it would prove nothing: a writer must exist
+ * OUTSIDE the registry for every named receipt (issue #117 review). */
 function allSrcSource(): string {
   const root = join(import.meta.dirname, '..', 'src');
+  const registryPath = join(root, 'dispatch', 'silas-rules.ts');
   const files: string[] = [];
   const walk = (dir: string): void => {
     for (const entry of readdirSync(dir)) {
       const full = join(dir, entry);
       if (statSync(full).isDirectory()) walk(full);
-      else if (entry.endsWith('.ts')) files.push(full);
+      else if (entry.endsWith('.ts') && full !== registryPath) files.push(full);
     }
   };
   walk(root);

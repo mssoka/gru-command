@@ -43,6 +43,9 @@ export const SILAS_YIELD_ACTION_KINDS = [
   'silas.escalated',
   'silas.pr-registered',
   'silas.review-triggered',
+  // The sweep-ack release receipt (issue #117): a rule-based close-out is
+  // Silas follow-through and must attribute like every other action.
+  'silas.lane-released',
   'job.pr',
   'job.pr-linked',
   'verification.requested',

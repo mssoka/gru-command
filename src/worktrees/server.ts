@@ -4,6 +4,7 @@ import type { GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { WorktreeManager } from './manager.js';
 import type { LedgerApi } from '../ledger/api.js';
+import { isJobTerminal } from '../ledger/states.js';
 import { parseSilasActionRuleId } from '../dispatch/silas-rules.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
@@ -183,16 +184,41 @@ export function createWorktreeServer(options: WorktreeServerOptions): WorktreeSe
         return;
       }
     }
-    // A silas release must resolve to a JOB lane before anything is
-    // released: the sweep-ack receipt lands on the job, and a raw or
-    // round lane carries no job to receipt. Fail loud BEFORE acting —
-    // never release a lane whose rule-hit cannot be recorded.
+    // A silas release enforces the sweep-ack rule's OWN firing condition —
+    // a terminal job still holding its own lane — instead of trusting the
+    // caller's digest read (issue #117 review): a live job is never swept
+    // mechanically, an already-swept lane cannot mint a duplicate receipt,
+    // and confirm_kill stays a human-only acknowledgment (pause-and-ask).
+    // Fail loud BEFORE acting — never release a lane whose rule-hit cannot
+    // be recorded or whose precondition failed.
     if (silasRelease) {
+      if (confirmKill) {
+        json(res, 400, {
+          error: 'bad_request',
+          detail: 'a silas release cannot carry confirm_kill — acknowledging a paused sweep is a human decision',
+        });
+        return;
+      }
+      if (lane?.status === 'swept') {
+        json(res, 409, {
+          error: 'already_swept',
+          detail: `lane "${worktreeId}" is already swept — a re-release mints no second sweep-ack receipt`,
+        });
+        return;
+      }
       const releasedJobId = lane?.kind === 'job' ? lane.jobId : null;
       if (releasedJobId === null) {
         json(res, 400, {
           error: 'bad_request',
           detail: 'a silas release must resolve to a job lane — raw or round lanes carry no job receipt',
+        });
+        return;
+      }
+      const releaseJob = options.ledger?.getJob(releasedJobId) ?? null;
+      if (releaseJob === null || !isJobTerminal(releaseJob.status)) {
+        json(res, 409, {
+          error: 'job_not_terminal',
+          detail: `job "${releasedJobId}" is ${releaseJob?.status ?? 'unknown'} — sweep-ack releases only terminal lanes`,
         });
         return;
       }

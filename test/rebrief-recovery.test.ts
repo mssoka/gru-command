@@ -280,11 +280,21 @@ describe('re-brief restart safety (durable markers)', () => {
   it('rule provenance survives the restart: the replayed silas.rebrief receipt carries the firing rule (issue #117)', async () => {
     const h = makeHarness();
     const jobId = 'rule-replay-job';
-    const { markers } = await seedPendingRebrief({ h, jobId, ruleId: 'verdict-rung-rebrief', sourceRoundId: 'rule-replay-job-r3' });
+    const { markers } = await seedPendingRebrief({ h, jobId });
+    const replayRound = h.ledger.addRound({ jobId, lenses: ['blind'] });
+    // Re-seed with rule provenance pointing at the real round: the marker
+    // upsert replaces the pair, carrying ruleId + sourceRoundId durably.
+    h.ledger.beginPendingRebrief({
+      jobId,
+      note: 'same blocker three rounds; try differently',
+      briefing: 'the original contract',
+      ruleId: 'verdict-rung-rebrief',
+      sourceRoundId: replayRound.id,
+    });
     // The durable request itself carries the rule BEFORE any worker exists.
     const stored = h.ledger.listPendingRebriefs({ jobId }).find((marker) => marker.kind === 'silas.rebrief');
     expect(stored?.ruleId).toBe('verdict-rung-rebrief');
-    expect(stored?.sourceRoundId).toBe('rule-replay-job-r3');
+    expect(stored?.sourceRoundId).toBe(replayRound.id);
     const report = await reconcilePendingRebriefs(
       {
         registry: h.registry,
@@ -302,7 +312,7 @@ describe('re-brief restart safety (durable markers)', () => {
     // cannot strip the provenance (rule hit, restart-safe).
     expect(rebrief?.payload).toMatchObject({
       rule_id: 'verdict-rung-rebrief',
-      source_round_id: 'rule-replay-job-r3',
+      source_round_id: replayRound.id,
       note: 'same blocker three rounds; try differently',
     });
     expect(h.ledger.listPendingRebriefs()).toHaveLength(0);

@@ -141,3 +141,49 @@ export function parseSilasActionRuleId(raw: string | undefined): SilasActionRule
   }
   return raw as SilasActionRuleId;
 }
+
+/** The receipt contract is per-route: each silas endpoint records exactly
+ * one event kind, so only the rules whose registry receipt IS that event
+ * may fire there. A rule id on the wrong route would mint a receipt the
+ * registry never assigned (issue #117 review: cross-route rule claims). */
+export const SILAS_RULE_ROUTES: Readonly<{
+  directive: ReadonlySet<string>;
+  rebrief: ReadonlySet<string>;
+  escalate: ReadonlySet<string>;
+}> = {
+  directive: new Set(['verdict-rung-directive', 'verification-repair', 'pr-conflict-rebase']),
+  rebrief: new Set(['verdict-rung-rebrief']),
+  escalate: new Set(['verdict-rung-escalate']),
+};
+
+/** Validate a rule id for a specific route: known action rule AND allowed
+ * on that route. Absent input → null; anything else refuses loud. */
+export function parseSilasRouteRuleId(
+  route: 'directive' | 'rebrief' | 'escalate',
+  raw: string | undefined,
+): SilasActionRuleId | null {
+  const parsed = parseSilasActionRuleId(raw);
+  if (parsed === null) return null;
+  if (!SILAS_RULE_ROUTES[route].has(parsed)) {
+    throw new Error(`rule_id "${parsed}" does not fire on the ${route} route (allowed: ${[...SILAS_RULE_ROUTES[route]].sort().join(', ')})`);
+  }
+  return parsed;
+}
+
+/** Verdict-rung rules consume a specific verdict round: their provenance
+ * is incomplete without the round id they answered. */
+export function isVerdictRungRule(ruleId: string): boolean {
+  return ruleId === 'verdict-rung-directive' || ruleId === 'verdict-rung-rebrief' || ruleId === 'verdict-rung-escalate';
+}
+
+/** Strict optional string field: present-but-empty or non-string values
+ * refuse loud instead of silently reading as absent (a malformed rule_id
+ * must never downgrade to an action without provenance). */
+export function strictOptStrField(body: Record<string, unknown>, field: string): string | undefined {
+  if (!(field in body)) return undefined;
+  const value = body[field];
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw new Error(`${field} must be a non-empty string when present`);
+  }
+  return value;
+}

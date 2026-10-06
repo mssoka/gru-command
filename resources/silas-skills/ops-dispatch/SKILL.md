@@ -209,7 +209,7 @@ retrying. When the answer is `409` with
    round's blockers with `consecutive_rounds` and the advised rung:
    - `directive`: send a fix directive naming each blocker with its
      evidence, via `POST /api/silas/directive`
-     `{"job_id":"<job>","directive":"...","blocker_fingerprint":"...","request_id":"<stable-id>"}`.
+     `{"job_id":"<job>","directive":"...","blocker_fingerprint":"...","rule_id":"verdict-rung-directive","source_round_id":"<round>","request_id":"<stable-id>"}`.
      The call answers **202** with the stable `request_id` once the durable
      intent is accepted — accepted is not admitted; read the durable state
      back with `GET /api/silas/directives/{request_id}`. Retry only with the
@@ -224,9 +224,10 @@ retrying. When the answer is `409` with
      settles; that delivery, against the lane head it produced, is what
      re-arms the re-review.
    - `rebrief`: same endpoint philosophy, but the lane needs a fresh
-     worker: `POST /api/silas/rebrief {"job_id":"<job>","note":"..."}`.
+     worker: `POST /api/silas/rebrief {"job_id":"<job>","note":"...","rule_id":"verdict-rung-rebrief","source_round_id":"<round>"}`.
      The note must carry what stalled and what to do differently.
-   - `escalate`: `POST /api/silas/escalate` with title, detail, job_id.
+   - `escalate`: `POST /api/silas/escalate` with title, detail, job_id,
+     `rule_id:"verdict-rung-escalate"` and `source_round_id:"<round>"`.
      Escalation always beats an endless loop. There is no round cap for
      EVOLVING blockers — but the same blocker recurring past the ladder is
      a stop condition, not a treadmill.
@@ -255,8 +256,9 @@ license:
   row carries `scope`, `head`, `run_id` and the honest `detail`: timeout,
   signal, spawn/runner error, or exit status). Read the complete recorded
   output, repair the real cause through the normal directive path, then
-  re-verify with a NEW request id at the repaired head. Pass the exact
-  fingerprint `verification-failure:<scope>@<run_id>` as the directive's
+  re-verify with a NEW request id at the repaired head. The repair
+  directive carries `rule_id:"verification-repair"` plus the exact
+  fingerprint `verification-failure:<scope>@<run_id>` as its
   `blocker_fingerprint` so the digest retires this exact debt when your
   rung lands (an unrelated or unscoped rung never retires it); never rerun
   an unchanged head merely to recover logs, and never weaken the gate.
@@ -277,7 +279,7 @@ inside your mandate — it routes `fyi` and never wakes the chief:
 
 - Arm ONE rebase directive per conflicting head to the lane's minion via
   `POST /api/silas/directive`
-  `{"job_id":"<job>","directive":"rebase <branch> onto its base ...","blocker_fingerprint":"pr-conflict:<head_sha>","request_id":"<stable-id>"}`.
+  `{"job_id":"<job>","directive":"rebase <branch> onto its base ...","blocker_fingerprint":"pr-conflict:<head_sha>","rule_id":"pr-conflict-rebase","request_id":"<stable-id>"}`.
   The exact fingerprint is what retires this row when your rung lands; a
   new dirty head re-arms it under a new fingerprint.
 - Never arm a rebase on a held lane: blocked or parked, an unresolved
@@ -321,8 +323,11 @@ forgetting. Prose notes are not state.
 ## Closing out
 
 Release a finished, merged, or abandoned lane with
-`POST /api/dispatch/release {"job_id":"<job>"}` (worktree surface). Confirm
-the arc on the board first; follow your ledger-closeout skill.
+`POST /api/dispatch/release {"job_id":"<job>","by":"silas","rule_id":"sweep-ack"}`
+(worktree surface) — the plain release form records no sweep-ack receipt.
+The release refuses unless the job is terminal, so never release a lane the
+digest has not named. Confirm the arc on the board first; follow your
+ledger-closeout skill.
 
 
 ## Completion mandate (owner ruling 2026-09-29 — supersedes per-phase handbacks)

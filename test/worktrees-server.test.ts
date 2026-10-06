@@ -238,6 +238,49 @@ describe('worktree lane release endpoint (r4)', () => {
     }
   });
 
+  it('a silas release enforces the sweep-ack firing condition: terminal job, un-swept lane, no confirm_kill', async () => {
+    const h = await bootLane();
+    const repo = makeFixtureRepo('fixture-sweep-ack-guard');
+    cleanupRepos.push(repo);
+    try {
+      // A non-terminal job holding a lane: refused, lane untouched.
+      h.ledger.addJob({ id: 'job-live', repo: 'fixture-sweep-ack-guard', title: 'x' });
+      h.ledger.setJobStatus('job-live', 'working');
+      await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-live' });
+      const notTerminal = await call(h.port, '/api/dispatch/release', {
+        job_id: 'job-live', by: 'silas', rule_id: 'sweep-ack',
+      }, TOKEN);
+      expect(notTerminal.status).toBe(409);
+      expect(field<string>(notTerminal.json, 'error')).toBe('job_not_terminal');
+      expect(h.manager.getWorktree('job-live')?.status).toBe('active');
+      expect(h.ledger.listJobEvents('job-live').filter((event) => event.kind === 'silas.lane-released')).toHaveLength(0);
+      // confirm_kill is a human-only acknowledgment: a silas release
+      // carrying it refuses before anything is paused or killed.
+      const killed = await call(h.port, '/api/dispatch/release', {
+        job_id: 'job-live', by: 'silas', rule_id: 'sweep-ack', confirm_kill: true,
+      }, TOKEN);
+      expect(killed.status).toBe(400);
+      expect(JSON.stringify(killed.json)).toContain('human decision');
+      expect(h.manager.getWorktree('job-live')?.status).toBe('active');
+      // Terminal, released once: a re-release refuses — no duplicate receipt.
+      h.ledger.setJobStatus('job-live', 'in-review');
+      h.ledger.setJobStatus('job-live', 'merged');
+      const released = await call(h.port, '/api/dispatch/release', {
+        job_id: 'job-live', by: 'silas', rule_id: 'sweep-ack',
+      }, TOKEN);
+      expect(released.status).toBe(200);
+      const again = await call(h.port, '/api/dispatch/release', {
+        worktree_id: 'job-live', by: 'silas', rule_id: 'sweep-ack',
+      }, TOKEN);
+      expect(again.status).toBe(409);
+      expect(field<string>(again.json, 'error')).toBe('already_swept');
+      const receipts = h.ledger.listJobEvents('job-live').filter((event) => event.kind === 'silas.lane-released');
+      expect(receipts).toHaveLength(1);
+    } finally {
+      await h.close();
+    }
+  });
+
   it('a silas release of a non-job lane refuses before releasing — no job, no receipt, no sweep', async () => {
     const h = await bootLane();
     const repo = makeFixtureRepo('fixture-sweep-ack-raw');

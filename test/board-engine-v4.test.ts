@@ -79,6 +79,15 @@ describe('board engine — v4 snapshot blocks', () => {
     expect(view.reconciliationsToday).toBe(2); // pr-registered + rebrief; the wake itself is not a reconciliation
     expect(view.checkedAt).toBe(new Date(realNow).toISOString());
 
+    // The sweep-ack release receipt (issue #117) counts as a recorded
+    // silas action: it advances both the last-useful-action timestamp and
+    // the daily count, exactly like the other machine-action kinds.
+    const { api: api2, engine: engine2 } = fresh({ now: () => realNow });
+    api2.appendCustomEvent({ kind: 'silas.lane-released', payload: { rule_id: 'sweep-ack', by: 'silas' } });
+    const releaseView = engine2.snapshot().silas;
+    expect(releaseView.lastUsefulActionAt).not.toBeNull();
+    expect(releaseView.reconciliationsToday).toBe(1);
+
     // An engine whose clock is two days ahead sees zero "today" events —
     // the day boundary is real, not a rolling total.
     const { engine: later } = fresh({ now: () => realNow + 48 * 60 * 60 * 1_000 });
