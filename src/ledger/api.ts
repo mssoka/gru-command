@@ -5138,6 +5138,15 @@ export class LedgerApi {
         );
       }
       const note = input.note?.trim() ?? '';
+      // The recorded commissioner owes the decision; the chief (gru) may
+      // always close on their behalf. Any other caller is refused: a debt
+      // assigned to silas must not be settled by an unrelated actor.
+      const actor = input.by ?? job.commissioner ?? 'gru';
+      if (job.commissioner !== null && actor !== job.commissioner && actor !== 'gru') {
+        throw new Error(
+          `job "${job.id}" is commissioned by "${job.commissioner}" — only that commissioner (or gru, the chief) may settle it (got "${actor}")`,
+        );
+      }
       if (input.outcome === 'acted') {
         if (input.directiveJobId === undefined || input.directiveJobId.trim() === '') {
           throw new Error('disposition acted requires directive_job_id — findings route as a directive to the target lane');
@@ -5184,6 +5193,10 @@ export class LedgerApi {
             ? { kind: 'cancelled', reason: note }
             : { kind: 'superseded', byObligationId: null, reason: note };
       const settled = this.settleObligation({ obligationId: obligation.id, settlement });
+      // The handback card (posted by the deterministic pass) is answered by
+      // this settlement: a resolved debt must never leave a false
+      // outstanding action behind.
+      this.resolveReportHandbackCard(job.id, actor);
       const done = this.setJobStatus(job.id, 'done');
       return { job: done, obligation: settled };
     });
@@ -5216,6 +5229,7 @@ export class LedgerApi {
         obligationId: obligation.id,
         settlement: { kind: 'superseded', byObligationId: null, reason: input.reason },
       });
+      this.resolveReportHandbackCard(job.id, 'code');
       this.appendEvent({
         kind: REPORT_SUPERSEDED_EVENT,
         jobId: job.id,
@@ -5229,6 +5243,14 @@ export class LedgerApi {
       const done = this.setJobStatus(job.id, 'done');
       return { job: done, obligation: settled };
     });
+  }
+
+  /** Resolve the job's stable-kind handback card, if one was posted and is
+   * still open — called from every settlement path so a closed debt never
+   * leaves a false outstanding action. */
+  private resolveReportHandbackCard(jobId: string, by: string): void {
+    const card = this.findNotificationByKind(`silas.report-handback.${jobId}`, 'any');
+    if (card !== null && card.resolvedAt === null) this.resolveNotificationById(card.id, by);
   }
 
   /** One job's rowid (keyset pagination anchor). */

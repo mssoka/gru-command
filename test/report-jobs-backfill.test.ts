@@ -1,4 +1,7 @@
+import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
@@ -62,8 +65,8 @@ describe('legacy report backfill plan and apply (issue #220)', () => {
   }
 
   /** A legacy delivered lane: PR-less, NULL deliverable (pre-E19 shape). */
-  function seedLegacyJob(api: LedgerApi, jobId: string, briefing = 'look into it'): void {
-    api.addJob({ id: jobId, repo: 'fixture-app', title: `t-${jobId}`, briefing });
+  function seedLegacyJob(api: LedgerApi, jobId: string, briefing = 'look into it', repo = 'fixture-app'): void {
+    api.addJob({ id: jobId, repo, title: `t-${jobId}`, briefing });
     api.setJobStatus(jobId, 'working');
     api.setJobStatus(jobId, 'delivered');
     api.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { sha: 'head-1' } });
@@ -112,6 +115,9 @@ describe('legacy report backfill plan and apply (issue #220)', () => {
       await new Promise((resolve) => setTimeout(resolve, 5));
       h.api.addJob({ id: 'job-pr32-review-edge-retry', repo: 'fixture-app', title: 't', briefing: 'b', deliverable: 'review' });
       h.api.setJobPr('job-pr32-review-edge-retry', 'https://github.com/o/fixture-app/pull/32');
+      h.api.setJobStatus('job-pr32-review-edge-retry', 'working');
+      h.api.setJobStatus('job-pr32-review-edge-retry', 'delivered');
+      h.api.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-pr32-review-edge-retry', payload: { sha: 'h' } });
 
       const plan = planLegacyReportBackfill(h.api);
       const merged = plan.proposals.find((proposal) => proposal.job.id === 'job-pr31-review-blind');
@@ -119,7 +125,7 @@ describe('legacy report backfill plan and apply (issue #220)', () => {
       expect(merged?.reason).toContain('#31');
       const retried = plan.proposals.find((proposal) => proposal.job.id === 'job-pr32-review-edge');
       expect(retried?.outcome).toBe('superseded');
-      expect(retried?.reason).toContain('newer report job');
+      expect(retried?.reason).toContain('newer delivered review report');
     } finally {
       h.cleanup();
     }
@@ -235,16 +241,72 @@ describe('legacy report backfill plan and apply (issue #220)', () => {
       let plan = planLegacyReportBackfill(h.api);
       expect(plan.proposals[0]?.outcome).toBe('obligation-opened');
 
-      // ...but a newer REPORT job (kind recorded; target carried in
-      // targetRef, never its own prUrl) does supersede.
+      // ...and a newer REPORT job (kind recorded; target carried in
+      // targetRef, never its own prUrl) must have DELIVERED before it can
+      // supersede.
       await new Promise((resolve) => setTimeout(resolve, 5));
       h.api.addJob({
         id: 'review-pr56-second-pass', repo: 'fixture-app', title: 't', briefing: 're-review',
         deliverable: 'review', commissioner: 'gru', targetRef: 'https://github.com/o/fixture-app/pull/56', targetSha: 'head-2',
       });
       plan = planLegacyReportBackfill(h.api);
+      expect(plan.proposals[0]?.outcome).toBe('obligation-opened'); // dispatched, no findings yet
+      h.api.setJobStatus('review-pr56-second-pass', 'working');
+      h.api.setJobStatus('review-pr56-second-pass', 'delivered');
+      h.api.appendCustomEvent({ kind: 'job.delivered', jobId: 'review-pr56-second-pass', payload: { sha: 'head-2' } });
+      plan = planLegacyReportBackfill(h.api);
       expect(plan.proposals[0]?.outcome).toBe('superseded');
-      expect(plan.proposals[0]?.reason).toContain('newer report job');
+      expect(plan.proposals[0]?.reason).toContain('newer delivered review report');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a delivered report of a DIFFERENT kind does not supersede, and legacy siblings count by id', async () => {
+    const h = freshLedger();
+    try {
+      seedLegacyJob(h.api, 'job-pr58-review-lens');
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      // A newer delivered ARTIFACT targeting the same PR is not a re-review.
+      h.api.addJob({
+        id: 'artifact-pr58-run', repo: 'fixture-app', title: 't', briefing: 'verify',
+        deliverable: 'artifact', commissioner: 'gru', targetRef: 'https://github.com/o/fixture-app/pull/58', targetSha: 'h',
+      });
+      h.api.setJobStatus('artifact-pr58-run', 'working');
+      h.api.setJobStatus('artifact-pr58-run', 'delivered');
+      h.api.appendCustomEvent({ kind: 'job.delivered', jobId: 'artifact-pr58-run', payload: {} });
+      let plan = planLegacyReportBackfill(h.api);
+      expect(plan.proposals.find((p) => p.job.id === 'job-pr58-review-lens')?.outcome).toBe('obligation-opened');
+
+      // A newer LEGACY review sibling whose PR number lives only in the job
+      // id counts once it has delivered.
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      seedLegacyJob(h.api, 'job-pr58-review-second');
+      plan = planLegacyReportBackfill(h.api);
+      const first = plan.proposals.find((p) => p.job.id === 'job-pr58-review-lens');
+      expect(first?.outcome).toBe('superseded');
+      expect(first?.reason).toContain('job-pr58-review-second');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('ambiguous repository identities (same basename, different owner) leave the decision to the owner', async () => {
+    const h = freshLedger();
+    try {
+      seedLegacyJob(h.api, 'job-pr59-review-lens', 'review the widget change', 'widget');
+      // Two repositories named widget under different owners, one merged.
+      h.api.addJob({ id: 'alice-impl', repo: 'widget', title: 't', briefing: 'b' });
+      h.api.setJobStatus('alice-impl', 'working');
+      h.api.setJobPr('alice-impl', 'https://github.com/alice/widget/pull/59');
+      h.api.setJobStatus('alice-impl', 'in-review');
+      h.api.setJobStatus('alice-impl', 'merged');
+      h.api.addJob({ id: 'bob-impl', repo: 'widget', title: 't', briefing: 'b' });
+      h.api.setJobPr('bob-impl', 'https://github.com/bob/widget/pull/59');
+      const plan = planLegacyReportBackfill(h.api);
+      const proposal = plan.proposals.find((p) => p.job.id === 'job-pr59-review-lens');
+      expect(proposal?.outcome).toBe('obligation-opened');
+      expect(proposal?.reason).toContain('identities');
     } finally {
       h.cleanup();
     }
@@ -277,4 +339,77 @@ describe('legacy report backfill plan and apply (issue #220)', () => {
     expect(() => parseArgs(['--write'])).toThrow(/unknown argument/);
     expect(() => parseArgs(['--apply', '--dry-run'])).toThrow(/mutually exclusive/);
   });
+
+  it('the compiled CLI dry-run is READ-ONLY (no migration, no job writes) and prints the resolved ledger', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-backfill-cli-'));
+    try {
+      // Seed a ledger through the service's own open path, then snapshot it.
+      const db = new LedgerDb(dir);
+      const api = new LedgerApi(db.handle, { bus: new EventBus() });
+      seedLegacyJob(api, 'cli-legacy-review');
+      const before = snapshot(db);
+      db.close();
+
+      const cli = join(process.cwd(), 'dist', 'cli', 'report-jobs-backfill.js');
+      const run = spawnSync(process.execPath, [cli, '--data-dir', dir, '--dry-run'], { encoding: 'utf8', timeout: 15_000 });
+      expect(run.status).toBe(0);
+      expect(run.stdout).toContain(`ledger: ${join(dir, 'ledger', 'ledger.db')}`);
+      expect(run.stdout).toContain('cli-legacy-review');
+
+      // The database is byte-for-byte at the job/schema level: no write, no
+      // migration row (a read-only handle makes writes impossible).
+      const after = (() => {
+        const reopen = new LedgerDb(dir);
+        const snap = snapshot(reopen);
+        reopen.close();
+        return snap;
+      })();
+      expect(after).toEqual(before);
+      expect(after.deliverable).toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('the compiled CLI --apply exits nonzero when a row fails and applies the rest', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-backfill-cli-fail-'));
+    try {
+      const db = new LedgerDb(dir);
+      const api = new LedgerApi(db.handle, { bus: new EventBus() });
+      // A good row and a delivered row with NO delivery event (unprovable).
+      seedLegacyJob(api, 'cli-good-review');
+      api.addJob({ id: 'cli-no-evidence', repo: 'fixture-app', title: 't', briefing: 'review this' });
+      api.setJobStatus('cli-no-evidence', 'working');
+      api.setJobStatus('cli-no-evidence', 'delivered');
+      db.close();
+
+      const cli = join(process.cwd(), 'dist', 'cli', 'report-jobs-backfill.js');
+      const run = spawnSync(process.execPath, [cli, '--data-dir', dir, '--apply'], { encoding: 'utf8', timeout: 15_000 });
+      expect(run.status).toBe(1);
+      expect(run.stdout).toContain('failed 1');
+      // The provable row landed; the unprovable row stayed legacy.
+      const reopen = new LedgerDb(dir);
+      const api2 = new LedgerApi(reopen.handle, { bus: new EventBus() });
+      expect(api2.getJob('cli-good-review')?.deliverable).toBe('review');
+      expect(api2.getJob('cli-no-evidence')?.deliverable).toBeNull();
+      reopen.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
+
+/** A tiny comparable snapshot of job/obligation/migration state. */
+function snapshot(db: LedgerDb): { deliverable: string | null; status: string; migrations: number; jobs: number } {
+  const migrations = db.handle.prepare('SELECT COUNT(*) AS n FROM schema_migrations').get() as { n: number };
+  const jobs = db.handle.prepare('SELECT COUNT(*) AS n FROM jobs').get() as { n: number };
+  const row = db.handle.prepare("SELECT deliverable, status FROM jobs WHERE id = 'cli-legacy-review'").get() as
+    | { deliverable: string | null; status: string }
+    | undefined;
+  return {
+    deliverable: row?.deliverable ?? null,
+    status: row?.status ?? 'missing',
+    migrations: migrations.n,
+    jobs: jobs.n,
+  };
+}

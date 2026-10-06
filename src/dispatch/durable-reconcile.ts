@@ -238,7 +238,10 @@ export function reconcileReportClosures(
         if ((active.state === 'open' || active.state === 'waiting') &&
             deps.ledger.latestJobEvent(job.id, REPORT_BACKFILL_EVENT) === null) {
           const notificationKind = `silas.report-handback.${job.id}`;
-          if (deps.ledger.findNotificationByKind(notificationKind, 'any') === null) {
+          // 'active' (unresolved) dedupe, not 'any': a card someone resolved
+          // WITHOUT settling the report must not silence the debt forever —
+          // the next pass posts a fresh action for the still-open obligation.
+          if (deps.ledger.findNotificationByKind(notificationKind, 'active') === null) {
             deps.notifications.postIncident({
               kind: notificationKind,
               routing: 'action-required',

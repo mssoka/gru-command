@@ -13,7 +13,7 @@
  * owner reviews the dry-run list BEFORE any apply.
  */
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { loadConfig } from '../config.js';
 import { LedgerApi } from '../ledger/api.js';
@@ -65,8 +65,13 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
   return parsed;
 }
 
-function renderText(plan: ReturnType<typeof planLegacyReportBackfill>, applied: ReturnType<typeof applyLegacyReportBackfill> | null): string {
+function renderText(
+  ledgerPath: string,
+  plan: ReturnType<typeof planLegacyReportBackfill>,
+  applied: ReturnType<typeof applyLegacyReportBackfill> | null,
+): string {
   const lines: string[] = [];
+  lines.push(`ledger: ${ledgerPath}`);
   lines.push(`legacy delivered report jobs: ${plan.proposals.length}`);
   lines.push(`  superseded (provable):  ${plan.superseded}`);
   lines.push(`  obligation to open:     ${plan.obligationOpened}`);
@@ -94,6 +99,16 @@ function main(): void {
   // environment/config; tilde expansion resolves against the RUNNING
   // user's home, never a baked-in path.
   const config = args.dataDir === null ? loadConfig() : loadConfig({ GRU_COMMAND_HOME: args.dataDir }, homedir());
+  // An explicit --data-dir must BE the ledger's data dir: if the instance
+  // config overrides data_dir elsewhere, operating would inspect or modify
+  // a different ledger than the caller named. Refuse loudly.
+  if (args.dataDir !== null && resolve(config.dataDir) !== resolve(args.dataDir)) {
+    throw new Error(
+      `--data-dir ${args.dataDir} resolved to data_dir ${config.dataDir} ` +
+        `(the instance config at ${join(args.dataDir, 'config.toml')} overrides it) — refusing to operate on a different ledger`,
+    );
+  }
+  const ledgerPath = join(config.dataDir, 'ledger', 'ledger.db');
   // Dry-run is read-only by construction; --apply migrates on open
   // (forward-only), like the service.
   let db: LedgerDb | null = null;
@@ -104,12 +119,11 @@ function main(): void {
       db = new LedgerDb(config.dataDir);
       ledger = new LedgerApi(db.handle, {});
     } else {
-      const dbPath = join(config.dataDir, 'ledger', 'ledger.db');
       try {
-        readOnly = new DatabaseSync(dbPath, { readOnly: true });
+        readOnly = new DatabaseSync(ledgerPath, { readOnly: true });
       } catch (error) {
         throw new Error(
-          `cannot open the ledger read-only at ${dbPath} (is the service deployed? use --apply to migrate): ${String(error)}`,
+          `cannot open the ledger read-only at ${ledgerPath} (is the service deployed? use --apply to migrate): ${String(error)}`,
         );
       }
       ledger = new LedgerApi(readOnly, {});
@@ -126,6 +140,7 @@ function main(): void {
         `${JSON.stringify(
           {
             mode: args.apply ? 'apply' : 'dry-run',
+            ledger_path: ledgerPath,
             proposals: plan.proposals.map((proposal) => ({
               job_id: proposal.job.id,
               outcome: proposal.outcome,
@@ -146,7 +161,7 @@ function main(): void {
         )}\n`,
       );
     } else {
-      process.stdout.write(`${renderText(plan, applied)}\n`);
+      process.stdout.write(`${renderText(ledgerPath, plan, applied)}\n`);
     }
   } finally {
     db?.close();

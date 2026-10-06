@@ -103,13 +103,24 @@ export function prUrlNumber(url: string): number | null {
 }
 
 /** The repository name a PR url points at (`.../mssoka/gru-command/pull/1`
- * → `gru-command`), or null. Repository identity joins the PR number in
- * the sibling key: PR #31 in another repository must never supersede this
- * repo's report. */
+ * → `gru-command`), or null. */
 export function prUrlRepo(url: string): string | null {
   const match = url.match(/\/([^/]+)\/pull\/\d{1,9}(?:$|[/?#])/);
   const repo = match?.[1];
   return repo === undefined ? null : repo.toLowerCase();
+}
+
+/** The full identity a PR url points at (`host/owner/repo`), or null. The
+ * sibling key keeps the WHOLE identity, so a merged `alice/widget#55` can
+ * never retire a report about `bob/widget#55`; when the same basename
+ * appears under more than one identity the planner refuses to supersede
+ * (an unowned legacy row has no owner/host evidence to disambiguate). */
+export function prUrlIdentity(url: string): string | null {
+  const match = url.match(/^https?:\/\/([^/]+)\/([^/]+)\/([^/]+)\/pull\/\d{1,9}(?:$|[/?#])/i);
+  if (match === null) return null;
+  const [, host, owner, repo] = match;
+  if (host === undefined || owner === undefined || repo === undefined) return null;
+  return `${host}/${owner}/${repo}`.toLowerCase();
 }
 
 /** The keyset page size the planner reads legacy rows with — it pages
@@ -117,20 +128,15 @@ export function prUrlRepo(url: string): string | null {
  * classifiable rows from the dry run. */
 const LEGACY_SCAN_PAGE = 1000;
 
-/** One sibling-index key: repository + PR number. */
-function prKey(repo: string, number: number): string {
-  return `${repo.toLowerCase()}##${number}`;
-}
-
-/** True when a job looks like a report lane: an explicit non-PR
- * deliverable, or a legacy id/briefing the classifier recognizes. Only
- * report-shaped siblings can supersede an older report — a later
- * implementation or administrative job sharing the PR is not a
- * re-review. */
-function isReportShaped(job: JobRecord): boolean {
-  if (job.deliverable !== null && job.deliverable !== 'pr') return true;
-  if (job.deliverable !== null) return false;
-  return classifyLegacyReportJob(job.id, job.briefing) !== null;
+/** The report kind a job represents: an explicit non-PR deliverable
+ * wins; a legacy NULL-deliverable row only qualifies by id/briefing
+ * classification while it carries NO PR of its own (a PR-carrying lane is
+ * an implementation lane, whatever its prose says). Null = not a report
+ * lane. */
+function inferredReportKind(job: JobRecord): ReportDeliverable | null {
+  if (job.deliverable !== null) return job.deliverable === 'pr' ? null : job.deliverable;
+  if (job.prUrl !== null) return null;
+  return classifyLegacyReportJob(job.id, job.briefing)?.deliverable ?? null;
 }
 
 /**
@@ -142,23 +148,38 @@ export function planLegacyReportBackfill(
   ledger: Pick<LedgerApi, 'listLegacyDeliveredJobs' | 'listJobs'>,
   opts: { pageSize?: number } = {},
 ): BackfillPlan {
-  // repo+pr number → jobs carrying that PR, so merge/re-supersede evidence
-  // is one map lookup per proposal. Both the job's own PR (`prUrl`) and a
+  // PR identity → jobs carrying that PR, so merge/re-supersede evidence is
+  // one map lookup per proposal. Both the job's own PR (`prUrl`) and a
   // report's reviewed target (`targetRef`) index: a newer REVIEW job
-  // carries its target in targetRef, never as its own PR.
-  const jobsByPr = new Map<string, JobRecord[]>();
-  const index = (url: string | null, job: JobRecord): void => {
+  // carries its target in targetRef, never as its own PR. Legacy rows
+  // whose PR number lives only in the job id index separately under the
+  // repository basename (no host/owner evidence exists for them).
+  const allJobs = ledger.listJobs();
+  // `identity#number` → jobs; the number is part of the key so one
+  // repository's PR #31 can never answer a lookup for its PR #32.
+  const byIdentity = new Map<string, JobRecord[]>();
+  const byLegacyId = new Map<string, JobRecord[]>();
+  const indexUrl = (url: string | null, job: JobRecord): void => {
     if (url === null) return;
+    const identity = prUrlIdentity(url);
     const number = prUrlNumber(url);
-    const repo = prUrlRepo(url);
-    if (number === null || repo === null) return;
-    const key = prKey(repo, number);
-    const bucket = jobsByPr.get(key) ?? [];
+    if (identity === null || number === null) return;
+    const key = `${identity}#${number}`;
+    const bucket = byIdentity.get(key) ?? [];
     bucket.push(job);
-    jobsByPr.set(key, bucket);
+    byIdentity.set(key, bucket);
   };
-  for (const job of ledger.listJobs()) index(job.prUrl, job);
-  for (const job of ledger.listJobs()) index(job.targetRef, job);
+  for (const job of allJobs) {
+    indexUrl(job.prUrl, job);
+    indexUrl(job.targetRef, job);
+    const number = legacyJobPrNumber(job.id);
+    if (number !== null && job.repo.trim() !== '') {
+      const key = `${job.repo.toLowerCase()}#${number}`;
+      const bucket = byLegacyId.get(key) ?? [];
+      bucket.push(job);
+      byLegacyId.set(key, bucket);
+    }
+  }
 
   const legacy: JobRecord[] = [];
   const pageSize = opts.pageSize ?? LEGACY_SCAN_PAGE;
@@ -188,11 +209,38 @@ export function planLegacyReportBackfill(
       continue;
     }
     const prNumber = legacyJobPrNumber(job.id);
+    const basenameKey = `${job.repo.toLowerCase()}#${String(prNumber)}`;
+    // Every URL identity sharing the legacy row's basename+number. More
+    // than one DISTINCT identity means the row cannot be attributed to a
+    // repository — refuse to supersede and leave it to the owner.
+    const matchingIdentities = new Set<string>();
+    const urlSiblings: JobRecord[] = [];
+    for (const [key, jobs] of byIdentity) {
+      const hash = key.lastIndexOf('#');
+      if (Number(key.slice(hash + 1)) !== prNumber) continue;
+      const identity = key.slice(0, hash);
+      if (identity.slice(identity.lastIndexOf('/') + 1) !== job.repo.toLowerCase()) continue;
+      matchingIdentities.add(identity);
+      urlSiblings.push(...jobs);
+    }
+    const idSiblings = byLegacyId.get(basenameKey) ?? [];
+    const ambiguousIdentity = matchingIdentities.size > 1;
     const siblings =
-      prNumber === null ? [] : (jobsByPr.get(prKey(job.repo, prNumber)) ?? []).filter((candidate) => candidate.id !== job.id);
+      prNumber === null ? [] : [...urlSiblings, ...idSiblings].filter((candidate) => candidate.id !== job.id);
+    if (ambiguousIdentity) {
+      proposals.push({
+        job,
+        outcome: 'obligation-opened',
+        deliverable: classified.deliverable,
+        reason: `${classified.reason} — PR #${String(prNumber)} matches ${matchingIdentities.size} repository identities; the ledger cannot attribute the target, so the owner decides`,
+        targetRef: null,
+        targetSha: null,
+      });
+      continue;
+    }
     // Provable supersede (a): the target PR merged. The PR number comes
     // from the job id; the merge fact from the job that carried the PR in
-    // the SAME repository.
+    // the SAME repository identity.
     const merged = siblings.find((candidate) => candidate.status === 'merged');
     if (prNumber !== null && merged !== undefined) {
       proposals.push({
@@ -205,18 +253,26 @@ export function planLegacyReportBackfill(
       });
       continue;
     }
-    // Provable supersede (b): a NEWER REPORT-SHAPED job already covers the
-    // same repo+PR (later creation) — the older findings were superseded
-    // by re-review. A later implementation lane is NOT evidence.
+    // Provable supersede (b): a NEWER, DELIVERED report of the SAME KIND
+    // already covers the same repo+PR — the older findings were superseded
+    // by re-review. A later implementation lane, an undelivered dispatch,
+    // and a different report kind (an artifact does not replace a review's
+    // findings) are all NOT evidence.
     const newer = siblings
-      .filter((candidate) => candidate.createdAt > job.createdAt && isReportShaped(candidate))
+      .filter(
+        (candidate) =>
+          candidate.createdAt > job.createdAt &&
+          (candidate.status === 'delivered' || candidate.status === 'done' || candidate.status === 'merged') &&
+          inferredReportKind(candidate) === classified.deliverable &&
+          (candidate.deliverable !== null || candidate.prUrl === null),
+      )
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt))[0];
     if (prNumber !== null && newer !== undefined) {
       proposals.push({
         job,
         outcome: 'superseded',
         deliverable: classified.deliverable,
-        reason: `a newer report job for PR #${prNumber} exists (${newer.id}, created ${newer.createdAt}) — this report was superseded by re-review`,
+        reason: `a newer delivered ${classified.deliverable} report for PR #${prNumber} exists (${newer.id}, created ${newer.createdAt}) — this report was superseded by re-review`,
         targetRef: newer.targetRef ?? newer.prUrl,
         targetSha: null,
       });
