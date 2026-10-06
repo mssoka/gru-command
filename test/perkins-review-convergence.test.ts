@@ -196,23 +196,25 @@ describe('delta hunk parsing and intersection', () => {
   });
 
   it('lets rename metadata override an ambiguous bare header (no bogus touched path)', () => {
-    // Real Git output for renaming `x b/y` (a path containing a space AND
-    // ` b/`) to `y`: the bare header has TWO well-formed splits, and the
-    // equal-pair preference cannot disambiguate it. Rename metadata is
-    // authoritative; the OLD path must not gain a line span (an unrelated
-    // blocker there could otherwise hold the PR).
+    // The reviewer's exact real-Git repro: rename `x b/y b/x` -> `y` while
+    // an UNRELATED `x b/y` exists. The bare header `a/x b/y b/x b/y` has a
+    // WRONG equal-pair split at `x b/y`; without rename metadata that split
+    // wins and records the untouched file as changed, so an unrelated
+    // blocker there could hold the PR.
     const renamed = [
-      'diff --git a/x b/y b/y',
+      'diff --git a/x b/y b/x b/y',
       'similarity index 100%',
-      'rename from x b/y',
+      'rename from x b/y b/x',
       'rename to y',
     ].join('\n');
     const parsed = parseDeltaStructure(renamed);
     expect(parsed.paths.has('y')).toBe(true);
-    // The source is touched (the file was removed there) but carries no
-    // intersection span.
-    expect(parsed.paths.has('x b/y')).toBe(true);
+    // The true source is touched (the file was removed there) but carries
+    // no intersection span.
+    expect(parsed.paths.has('x b/y b/x')).toBe(true);
     expect(findingIntersectsDelta('y:1', parsed.hunks)).toBe(true);
+    // The unrelated file whose name matches the wrong equal split stays
+    // untouched.
     expect(findingIntersectsDelta('x b/y:1', parsed.hunks)).toBe(false);
   });
 
