@@ -160,6 +160,41 @@ describe('delta hunk parsing and intersection', () => {
     expect(findingIntersectsDelta('src/weird name.ts:1', parsedBare.hunks)).toBe(true);
   });
 
+  it('parses paths containing " b/" and non-BMP quoted names', () => {
+    // A mode-only change prints the BARE header even when the path itself
+    // contains a ` b/` segment: the same-path candidate wins the split.
+    const bare = [
+      'diff --git a/src/a b/thing.ts b/src/a b/thing.ts',
+      'old mode 100644',
+      'new mode 100755',
+    ].join('\n');
+    const parsedBare = parseDeltaStructure(bare);
+    expect(parsedBare.paths).toEqual(new Set(['src/a b/thing.ts']));
+    expect(findingIntersectsDelta('src/a b/thing.ts:1', parsedBare.hunks)).toBe(true);
+
+    // A quoted path with an emoji (non-BMP) and a tab escape decodes
+    // byte-accurately: surrogate halves are never encoded separately.
+    const quoted = [
+      'diff --git "a/src/\u{1F600}\\tfile.ts" "b/src/\u{1F600}\\tfile.ts"',
+      'old mode 100644',
+      'new mode 100755',
+    ].join('\n');
+    const parsedQuoted = parseDeltaStructure(quoted);
+    expect(parsedQuoted.paths).toEqual(new Set(['src/\u{1F600}\tfile.ts']));
+    expect(findingIntersectsDelta('src/\u{1F600}\tfile.ts:1', parsedQuoted.hunks)).toBe(true);
+
+    // A pure rename carries its destination in metadata (no ---/+++ pair).
+    const renamed = [
+      'diff --git a/old.ts b/new name.ts',
+      'similarity index 100%',
+      'rename from old.ts',
+      'rename to new name.ts',
+    ].join('\n');
+    const parsedRenamed = parseDeltaStructure(renamed);
+    expect(parsedRenamed.paths.has('new name.ts')).toBe(true);
+    expect(findingIntersectsDelta('new name.ts:1', parsedRenamed.hunks)).toBe(true);
+  });
+
   it('fails closed toward blocking for unanchored findings and unusable line numbers', () => {
     const hunks = parseDeltaHunks(diff);
     expect(findingIntersectsDelta('N/A', hunks)).toBe(true);
@@ -666,6 +701,33 @@ describe('Stage-5 convergence over whole rounds', () => {
     )) as { verdict: string; report_markdown: string };
     expect(submitted.verdict).toBe('NEEDS CHANGES');
     expect(submitted.report_markdown).toContain('**Verdict: NEEDS CHANGES**');
+  });
+
+  it('never carries a valid-but-undelivered lens result into the next round', async () => {
+    const harness = makeEngine({ childAnswer: () => '[]', specialists: ['blind', 'edge'] });
+    harness.repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const frozen1 = freeze(harness, { roundId: 'ud-round-1', spec: 'return 43' });
+    const round1 = await runRound(harness, { roundId: 'ud-round-1', roundNumber: 1, frozen: frozen1, reviewScope: 'whole' });
+    // Mark the blind run undelivered in a copied prior record: its result
+    // never reached a lead, so it cannot be credited as coverage.
+    const consolidated1 = join(reviewArtifactDirectory(harness.root, 'ud-round-1'), 'consolidated.json');
+    const record = JSON.parse(readFileSync(consolidated1, 'utf8')) as Record<string, unknown>;
+    const runs = (record['specialistRuns'] as Array<Record<string, unknown>>).map((run) =>
+      run['lens'] === 'blind' ? { ...run, findingsDelivered: false } : run);
+    const rewritten = join(harness.root, 'ud-prior-undelivered.json');
+    writeFileSync(rewritten, JSON.stringify({ ...record, specialistRuns: runs }));
+
+    harness.repo.commitFile('src/other.ts', 'export const other = 2;\n');
+    const frozen2 = freeze(harness, { roundId: 'ud-round-2', spec: 'return 43' });
+    (harness.brain as { specialists?: readonly string[] }).specialists = [];
+    const round2 = await runRound(harness, {
+      roundId: 'ud-round-2', roundNumber: 2, frozen: frozen2,
+      reviewScope: 'delta', priorConsolidatedFile: rewritten,
+    });
+    expect(round2.convergence?.carriedLenses).toEqual(['edge']);
+    expect(harness.leadCalls.at(-1)!.prompt ?? '').toContain('PRIOR LENS RESULTS CARRIED (edge)');
+    expect(harness.leadCalls.at(-1)!.prompt ?? '').not.toContain('PRIOR LENS RESULTS CARRIED (blind');
+    expect(round1.convergence).toMatchObject({ reviewScope: 'whole' });
   });
 
   it('strips a stale deferral when a later whole-change pass re-retains the blocker', async () => {

@@ -576,6 +576,16 @@ describe('dispatch server (E8)', () => {
       const queued = h.ledger.latestJobEvent('http-claims', 'job.review-handoff-queued')?.payload as
         { input?: { claimedFixedPriors?: unknown } } | undefined;
       expect(queued?.input?.claimedFixedPriors).toEqual([2, 5]);
+      // A second queued request with DIFFERENT claims keeps first-wins but
+      // is never silent: the conflict record names the folded claims.
+      const conflicting = await call(h.port, 'POST', '/api/dispatch/review', {
+        job_id: 'http-claims', by: 'minion', claimed_fixed_priors: [7],
+      }, TOKEN);
+      expect(conflicting.status).toBe(202);
+      const conflict = h.ledger.latestJobEvent('http-claims', 'job.review-handoff-conflict')?.payload as
+        { folded?: { claimedFixedPriors?: unknown } } | undefined;
+      expect(conflict?.folded?.claimedFixedPriors).toEqual([7]);
+      expect(queued?.input?.claimedFixedPriors).toEqual([2, 5]);
       // A malformed list is refused at the boundary, never silently dropped.
       const invalid = await call(h.port, 'POST', '/api/dispatch/review', {
         job_id: 'http-claims', by: 'minion', claimed_fixed_priors: ['nope'],

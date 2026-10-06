@@ -2405,6 +2405,10 @@ describe('consolidated blockers port', () => {
             { severity: 'blocker', category: 'correctness', title: 'boom', location: 'src/a.ts' },
             { severity: 'warning', category: 'style', title: 'meh', location: 'src/b.ts' },
             { severity: 'blocker', category: 'security', location: 'src/c.ts' },
+            // A deferred Stage-5 follow-up is still a blocker finding in the
+            // record, but it cannot hold the PR and must not feed the
+            // recurrence ladder or a release-blocker directive.
+            { severity: 'blocker', category: 'convergence', title: 'deferred', location: 'src/d.ts', deferredFollowup: true },
           ],
         }),
       );

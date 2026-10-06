@@ -764,29 +764,37 @@ describe('board engine — FOR YOU owner-PR projection on the snapshot', () => {
 
   it('keeps a delta READY gated until its final whole-change pass closes', () => {
     const { api, engine } = fresh();
-    stageReadyJob(api, 'job-final-pass');
-    // The delta round approval is recorded, but it still owes the final
-    // whole-change pass: the owner-ready row must not appear.
-    const rounds = api.listRounds('job-final-pass');
-    api.appendCustomEvent({
-      kind: 'round.perkins-review',
-      jobId: 'job-final-pass',
-      roundId: rounds.at(-1)!.id,
-      payload: { canonicalVerdict: 'READY TO MERGE', reviewScope: 'delta', finalPassRequired: true },
-    });
-    expect(engine.snapshot().ownerPrs).toEqual([]);
-    // The pre-commit marker alone (no review-event flag) is enough to gate:
-    // a crash between the verdict commit and the review event cannot expose
-    // owner-ready.
+    // (a) ONLY the pre-commit marker exists: a crash between the verdict
+    // commit and the review event must not expose owner-ready.
+    stageReadyJob(api, 'job-marker-only');
     api.appendCustomEvent({
       kind: 'round.final-pass-required',
-      jobId: 'job-final-pass',
-      roundId: rounds.at(-1)!.id,
+      jobId: 'job-marker-only',
+      roundId: api.listRounds('job-marker-only').at(-1)!.id,
       payload: { targetSha: SHA, reviewScope: 'delta' },
     });
     expect(engine.snapshot().ownerPrs).toEqual([]);
-    // The whole-scope round closes and its review event carries no pending
-    // flag: the newest round is whole and owner-ready.
+
+    // (b) ONLY the review-event flag exists (legacy/post-commit shape).
+    stageReadyJob(api, 'job-event-only');
+    api.appendCustomEvent({
+      kind: 'round.perkins-review',
+      jobId: 'job-event-only',
+      roundId: api.listRounds('job-event-only').at(-1)!.id,
+      payload: { canonicalVerdict: 'READY TO MERGE', reviewScope: 'delta', finalPassRequired: true },
+    });
+    expect(engine.snapshot().ownerPrs).toEqual([]);
+
+    // (c) The whole-scope round closes and its review event carries no
+    // pending flag: the newest round is whole and owner-ready.
+    stageReadyJob(api, 'job-final-pass');
+    api.appendCustomEvent({
+      kind: 'round.final-pass-required',
+      jobId: 'job-final-pass',
+      roundId: api.listRounds('job-final-pass').at(-1)!.id,
+      payload: { targetSha: SHA, reviewScope: 'delta' },
+    });
+    expect(engine.snapshot().ownerPrs).toEqual([]);
     const finalRound = api.addRound({ jobId: 'job-final-pass', targetRef: SHA });
     api.setRoundStatus(finalRound.id, 'live');
     api.setRoundVerdict(finalRound.id, 'approved');

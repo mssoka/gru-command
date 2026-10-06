@@ -2081,6 +2081,8 @@ export class WaveRunner {
           (input.lenses !== undefined && JSON.stringify(input.lenses) !== JSON.stringify((existing.input as { lenses?: readonly string[] }).lenses ?? undefined)) ||
           (input.targetRef !== undefined && input.targetRef !== (existing.input as { targetRef?: string }).targetRef) ||
           (input.noSpec !== undefined && input.noSpec !== (existing.input as { noSpec?: boolean }).noSpec) ||
+          (input.claimedFixedPriors !== undefined && JSON.stringify(input.claimedFixedPriors) !==
+            JSON.stringify((existing.input as { claimedFixedPriors?: readonly number[] }).claimedFixedPriors ?? undefined)) ||
           (input.evidence !== undefined && JSON.stringify(input.evidence) !== JSON.stringify((existing.input as { evidence?: readonly ReviewEvidenceRequest[] }).evidence ?? undefined));
         if (differs) {
           this.opts.ledger.appendCustomEvent({
@@ -2089,6 +2091,7 @@ export class WaveRunner {
               ...(input.lenses !== undefined ? { lenses: input.lenses } : {}),
               ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
               ...(input.noSpec !== undefined ? { noSpec: input.noSpec } : {}),
+              ...(input.claimedFixedPriors !== undefined ? { claimedFixedPriors: input.claimedFixedPriors } : {}),
               ...(input.evidence !== undefined ? { evidence_count: input.evidence.length, evidence_request_sha256: evidenceRequestFingerprint(input.evidence) } : {}),
             } },
           });

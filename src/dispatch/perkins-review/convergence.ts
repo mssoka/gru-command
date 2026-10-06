@@ -84,28 +84,34 @@ export function parseFindingLocation(location: string): ParsedFindingLocation | 
 /** Decode one Git C-quoted path (the `"..."` form git uses for names with
  * spaces, quotes or control bytes). Escapes are BYTES: octal escapes decode
  * as their byte value and plain characters as UTF-8 bytes, then the whole
- * sequence decodes as UTF-8 (so `\303\251` is `é`, not `Ã©`). Unknown
- * escapes keep their literal byte; malformed quoting returns null so the
- * caller fails closed. */
+ * sequence decodes as UTF-8 (so `\303\251` is `é`, not `Ã©`). Iteration is
+ * by CODE POINT so a non-BMP character (an emoji) is never split into
+ * surrogate halves. Unknown escapes keep their literal byte; malformed
+ * quoting returns null so the caller fails closed. */
 function unquoteGitPath(text: string): string | null {
   if (!text.startsWith('"')) return text;
   if (!text.endsWith('"') || text.length < 2) return null;
   const bytes: number[] = [];
-  for (let index = 1; index < text.length - 1; index += 1) {
-    const character = text[index]!;
+  const inner = text.slice(1, -1);
+  for (let index = 0; index < inner.length; index += 1) {
+    const character = inner[index]!;
     if (character !== '\\') {
-      for (const byte of Buffer.from(character, 'utf8')) bytes.push(byte);
+      // Re-encode the full code point, never a lone surrogate.
+      const codePoint = inner.codePointAt(index)!;
+      const full = String.fromCodePoint(codePoint);
+      for (const byte of Buffer.from(full, 'utf8')) bytes.push(byte);
+      index += full.length - 1;
       continue;
     }
     index += 1;
-    if (index >= text.length - 1) return null;
-    const escaped = text[index]!;
+    if (index >= inner.length) return null;
+    const escaped = inner[index]!;
     const simple: Record<string, number> = { a: 7, b: 8, f: 12, n: 10, r: 13, t: 9, v: 11, '\\': 92, '"': 34 };
     if (simple[escaped] !== undefined) {
       bytes.push(simple[escaped]!);
       continue;
     }
-    const octal = /^[0-7]{1,3}/u.exec(text.slice(index))?.[0];
+    const octal = /^[0-7]{1,3}/u.exec(inner.slice(index))?.[0];
     if (octal !== undefined) {
       bytes.push(Number.parseInt(octal, 8) & 0xff);
       index += octal.length - 1;
@@ -140,13 +146,21 @@ function parseDiffHeaderPaths(rest: string): { readonly oldPath: string; readonl
     if (oldPath === null || newPath === null) return null;
     return { oldPath, newPath };
   }
-  // Git leaves spaces UNQUOTED and separates the two path operands with a
-  // single space: `a/<path> b/<path>`. The greedy match takes the LAST
-  // ` b/` that leaves a well-formed `a/...` on the left, so a path that
-  // itself contains ` b/` still parses.
-  const match = /^a\/(.*) b\/(.*)$/u.exec(rest);
-  if (match === null) return null;
-  return { oldPath: `a/${match[1]}`, newPath: `b/${match[2]}` };
+  // Git leaves spaces UNQUOTED and separates the two operands with a single
+  // space: `a/<path> b/<path>`. A path may itself contain ` b/`, so every
+  // well-formed split is a candidate; the SAME-PATH pair (the common
+  // mode-only/unchanged case) wins, and otherwise the last candidate is the
+  // separator (a rename's exact sides come from its `rename from/to` lines).
+  const candidates: { oldPath: string; newPath: string }[] = [];
+  for (let index = 2; index < rest.length; index += 1) {
+    if (rest[index] !== ' ') continue;
+    const left = rest.slice(0, index);
+    const right = rest.slice(index + 1);
+    if (left.startsWith('a/') && right.startsWith('b/')) candidates.push({ oldPath: left, newPath: right });
+  }
+  if (candidates.length === 0) return null;
+  return candidates.find((candidate) =>
+    candidate.oldPath.slice(2) === candidate.newPath.slice(2)) ?? candidates[candidates.length - 1]!;
 }
 
 /** Strip the `a/` / `b/` prefix a diff path carries (quoted or bare). */
@@ -234,6 +248,14 @@ export function parseDeltaStructure(diff: string): {
     if (line.startsWith('--- ')) {
       const previous = stripDiffPrefix(line.slice(4).trimEnd(), 'a');
       if (previous !== null) notePath(previous);
+      continue;
+    }
+    if (line.startsWith('rename to ') || line.startsWith('copy to ')) {
+      // Rename/copy metadata carries the DESTINATION path (quoted when it
+      // needs quoting); no `---`/`+++` headers exist for a pure rename.
+      const destination = line.slice(line.indexOf(' to ') + 4);
+      notePath(destination.startsWith('"') ? unquoteGitPath(destination) : destination);
+      if (path !== null) unhunked.add(path);
       continue;
     }
     const hunkHeader = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/u.exec(line);
