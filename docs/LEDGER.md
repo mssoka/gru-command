@@ -517,8 +517,11 @@ basis, now })`: it returns a decision only when the row is not cleared,
 its `covers` include the signal, its `basis_fingerprint` is null or
 equals the current basis, and its `recheck_at` is null or in the future.
 A changed basis OR a passed recheck re-opens the subject — suppression
-never outlives its evidence. Trigger paths ask this query before waking
-anyone; a covered signal is quiet BY RECORD, not by forgetting.
+never outlives its evidence. Only the NEWEST active decision listing the
+signal is the candidate: when it fails, the subject re-opens even if an
+older, broader hold on the same subject still matches — a replacement
+hold should mark its predecessor `superseded` or clear it. The scan is
+exhaustive for the subject (pages past any listing window).
 
 **Writes** go through `LedgerApi` (`recordDecision`, `clearDecision`,
 each appending a `decision.recorded` / `decision.cleared` event in the
@@ -530,7 +533,15 @@ API instead of prose: hold a lane → record the decision with covers +
 basis + recheck, then resolve the alert.
 
 **Board visibility:** the snapshot carries `activeDecisions` (subject,
-decision, by, recheck) so the state behind a quiet signal is on the
-board, not buried in prose. No owner-facing notification is ever hidden
-by a decision — decisions suppress re-detection noise, never the
+decision, by, recheck — a bounded newest-first window) plus
+`activeDecisionCount`, the untruncated total, so an overflow past the
+window is visible rather than silent; the full set is paged via
+`GET /api/decisions?active=1`. No owner-facing notification is ever
+hidden by a decision — decisions suppress re-detection noise, never the
 needs-owner bell.
+
+**Sequencing (the issue's own plan):** #218 is the foundation. The
+production wiring lands in the lanes it unblocks — hold suppression in
+#215, the `recheck_at` re-look sweep in #217, and the #219/#220/#117
+lanes stacking on this branch. Until those land, the table is the
+readable state they build on; recording through the API is live now.

@@ -6328,11 +6328,16 @@ export class LedgerApi {
   }
 
   /** List decisions, newest first. `activeOnly` keeps the covering
-   * candidates (not cleared); `subject` narrows to one key. Bounded.
+   * candidates (not cleared); `subject` narrows to one key; `offset`
+   * pages (the covering query walks pages to exhaustion). Bounded.
    * Same-millisecond creates tie-break by INSERTION order (rowid DESC) —
    * a random id would make "newest" nondeterministic. */
-  listDecisions(opts: { subject?: string; activeOnly?: boolean; limit?: number } = {}): readonly DecisionRecord[] {
+  listDecisions(opts: { subject?: string; activeOnly?: boolean; limit?: number; offset?: number } = {}): readonly DecisionRecord[] {
     const limit = Math.min(Math.max(1, opts.limit ?? 50), 1000);
+    const offset = Math.max(0, opts.offset ?? 0);
+    if (!Number.isSafeInteger(offset) || offset < 0) {
+      throw new Error('decision page offset must be non-negative');
+    }
     const where: string[] = [];
     const params: unknown[] = [];
     if (opts.subject !== undefined) {
@@ -6340,10 +6345,20 @@ export class LedgerApi {
       params.push(opts.subject);
     }
     if (opts.activeOnly === true) where.push('cleared_at IS NULL');
-    const sql = `SELECT * FROM decisions${where.length > 0 ? ` WHERE ${where.join(' AND ')}` : ''} ORDER BY created_at DESC, rowid DESC LIMIT ?`;
-    return (this.db.prepare(sql).all(...(params as never[]), limit) as Row[]).map((row) =>
+    const sql = `SELECT * FROM decisions${where.length > 0 ? ` WHERE ${where.join(' AND ')}` : ''} ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?`;
+    return (this.db.prepare(sql).all(...(params as never[]), limit, offset) as Row[]).map((row) =>
       this.decisionFromRow(row),
     );
+  }
+
+  /** Count decisions (`activeOnly` = not cleared) — the board pairs its
+   * bounded activeDecisions window with this truthful total so a hidden
+   * overflow is visible, never silent. */
+  countDecisions(opts: { activeOnly?: boolean } = {}): number {
+    const row = this.db
+      .prepare(`SELECT COUNT(*) AS n FROM decisions${opts.activeOnly === true ? ' WHERE cleared_at IS NULL' : ''}`)
+      .get() as Row;
+    return Number(row.n);
   }
 
   getDecision(id: string): DecisionRecord | null {
@@ -6353,34 +6368,44 @@ export class LedgerApi {
 
   /** THE trigger query (issue #218): is signal `signal` on `subject`
    * covered by an active decision whose basis still matches at `now`?
-   * Returns a decision only when ALL of these hold:
+   * Only the NEWEST active decision that lists the signal in `covers` is
+   * the candidate: if it fails (basis moved, recheck passed) the subject
+   * is NOT covered — an older, broader hold on the same subject+signal
+   * must never shadow the re-open a newer decision promised. The scan is
+   * exhaustive for the subject (pages to the end): coverage is the
+   * correctness-critical read, so it is never truncated by a listing
+   * window. Returns a decision only when ALL of these hold:
    * - it is not cleared;
-   * - its `covers` includes `signal`;
+   * - its `covers` include `signal`;
    * - its `basis_fingerprint` is null or equals `basis` (a changed basis
    *   re-opens the subject);
    * - its `recheck_at` is null or later than `now` (a passed recheck
-   *   re-opens the subject).
-   * Newest matching decision wins (deterministic: created_at DESC, then
-   * insertion order). */
+   *   re-opens the subject). */
   coveringDecision(opts: { subject: string; signal: string; basis: string; now?: string }): DecisionRecord | null {
     if (opts.signal.length === 0) throw new Error('coveringDecision "signal" must be non-empty');
     if (opts.basis.length === 0) throw new Error('coveringDecision "basis" must be non-empty');
     const nowMs = Date.parse(opts.now ?? nowIso());
     if (!Number.isFinite(nowMs)) throw new Error(`coveringDecision "now" must be a parseable timestamp, got "${String(opts.now)}"`);
     validateDecisionSignal(opts.signal);
-    for (const row of this.listDecisions({ subject: opts.subject, activeOnly: true, limit: 1000 })) {
-      if (!row.covers.includes(opts.signal)) continue;
-      if (row.basisFingerprint !== null && row.basisFingerprint !== opts.basis) continue;
-      if (row.recheckAt !== null) {
-        const recheckMs = Date.parse(row.recheckAt);
-        if (!Number.isFinite(recheckMs)) {
-          throw new Error(`decision "${row.id}" carries an unparseable recheck_at "${row.recheckAt}"`);
+    // Page to exhaustion: a hold older than any single listing window
+    // must still be found (bounded per subject, newest first).
+    const pageSize = 500;
+    for (let offset = 0; ; offset += pageSize) {
+      const page = this.listDecisions({ subject: opts.subject, activeOnly: true, limit: pageSize, offset });
+      for (const row of page) {
+        if (!row.covers.includes(opts.signal)) continue;
+        if (row.basisFingerprint !== null && row.basisFingerprint !== opts.basis) return null;
+        if (row.recheckAt !== null) {
+          const recheckMs = Date.parse(row.recheckAt);
+          if (!Number.isFinite(recheckMs)) {
+            throw new Error(`decision "${row.id}" carries an unparseable recheck_at "${row.recheckAt}"`);
+          }
+          if (recheckMs <= nowMs) return null;
         }
-        if (recheckMs <= nowMs) continue;
+        return row;
       }
-      return row;
+      if (page.length < pageSize) return null;
     }
-    return null;
   }
 
   private decisionByClientKey(clientKey: string): DecisionRecord | null {

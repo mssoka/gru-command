@@ -321,6 +321,9 @@ export interface BoardSnapshot {
   /** Decision memory (issue #218): active holds/dispositions; absent on
   * pre-upgrade servers (validator tolerates). */
   readonly activeDecisions?: readonly ActiveDecisionView[] | null;
+  /** Truthful total of active decisions — the snapshot's activeDecisions
+  * is a bounded newest-first window, so the count exposes overflow. */
+  readonly activeDecisionCount?: number | null;
   /** FOR YOU PR rows (owner approval 2026-09-28); absent on pre-upgrade
   * servers (validator tolerates; the band renders ack rows only). */
   readonly ownerPrs?: readonly OwnerPrView[] | null;
@@ -731,6 +734,8 @@ export function isValidSnapshot(value: unknown): value is BoardSnapshot {
   // strictly typed when present.
   if (value.activeDecisions !== undefined && value.activeDecisions !== null && !Array.isArray(value.activeDecisions)) return false;
   if (Array.isArray(value.activeDecisions) && !value.activeDecisions.every(isActiveDecisionView)) return false;
+  if (value.activeDecisionCount !== undefined && value.activeDecisionCount !== null &&
+    (typeof value.activeDecisionCount !== 'number' || !Number.isInteger(value.activeDecisionCount) || value.activeDecisionCount < 0)) return false;
   // FOR YOU PR rows: absent on pre-upgrade servers (tolerated), but a
   // present block must match its shape — readiness is server authority.
   if (value.ownerPrs !== undefined && value.ownerPrs !== null && !Array.isArray(value.ownerPrs)) return false;

@@ -625,12 +625,31 @@ describe('board server — decision memory (issue #218)', () => {
       expect(
         (await postJson(harness.port, '/api/decisions', 'board-test-token', { ...decisionBody, subject: 'no-colon', client_key: 'bad-4' })).status,
       ).toBe(400);
+      expect(
+        (await postJson(harness.port, '/api/decisions', 'board-test-token', { ...decisionBody, subject: 'bogus:key', client_key: 'bad-5' })).status,
+      ).toBe(400);
+      // Present-but-empty optional fields are LOUD 400s — never silent
+      // broadening ("" fingerprint → any-basis) or silent recheck removal.
+      expect(
+        (await postJson(harness.port, '/api/decisions', 'board-test-token', { ...decisionBody, basis_fingerprint: '', client_key: 'bad-6' })).status,
+      ).toBe(400);
+      expect(
+        (await postJson(harness.port, '/api/decisions', 'board-test-token', { ...decisionBody, recheck_at: '', client_key: 'bad-7' })).status,
+      ).toBe(400);
+      expect(
+        (await postJson(harness.port, '/api/decisions', 'board-test-token', { ...decisionBody, client_key: '' })).status,
+      ).toBe(400);
+      expect(
+        (await postJson(harness.port, '/api/decisions', 'board-test-token', { ...decisionBody, recheck_at: 'March 5 2030', client_key: 'bad-8' })).status,
+      ).toBe(400);
 
       // The board snapshot carries active decisions (subject, decision, by, recheck).
       const snapshot = (await getJson(harness.port, '/api/board', 'board-test-token')).body as {
         activeDecisions: { id: string; subject: string; decision: string; by: string; recheckAt: string | null }[];
+        activeDecisionCount: number;
       };
       expect(snapshot.activeDecisions).toHaveLength(1);
+      expect(snapshot.activeDecisionCount).toBe(1);
       expect(snapshot.activeDecisions[0]).toMatchObject({
         id: created.id, subject: created.subject, decision: 'hold', by: 'gru', recheckAt: null,
       });
@@ -651,8 +670,9 @@ describe('board server — decision memory (issue #218)', () => {
       expect((cleared.body as { clearedAt: string | null }).clearedAt).not.toBeNull();
       expect(((await getJson(harness.port, '/api/decisions?active=1', 'board-test-token')).body as { decisions: unknown[] }).decisions).toHaveLength(0);
       expect(((await getJson(harness.port, '/api/decisions', 'board-test-token')).body as { decisions: unknown[] }).decisions).toHaveLength(1);
-      const afterClear = (await getJson(harness.port, '/api/board', 'board-test-token')).body as { activeDecisions: unknown[] };
+      const afterClear = (await getJson(harness.port, '/api/board', 'board-test-token')).body as { activeDecisions: unknown[]; activeDecisionCount: number };
       expect(afterClear.activeDecisions).toHaveLength(0);
+      expect(afterClear.activeDecisionCount).toBe(0);
     } finally {
       await harness.close();
     }

@@ -291,8 +291,11 @@ export interface BoardSnapshot {
   readonly selfHeal: SelfHealView | null;
   /** Decision memory (issue #218): active holds and dispositions with
    * subject, decision, by and recheck — the state behind suppressed
-   * signals, visible instead of prose-only. */
+   * signals, visible instead of prose-only. Bounded newest-first window;
+   * `activeDecisionCount` is the truthful total so an overflow past the
+   * window is visible, never silent (the D3 receipts pattern). */
   readonly activeDecisions: readonly ActiveDecisionView[];
+  readonly activeDecisionCount: number;
   /** FOR YOU (owner approval 2026-09-28): PRs with exact-head evidence
    * that they are genuinely ready for the owner — approved head-bound
    * review round + clean mergeable state + green CI at the same sha.
@@ -789,12 +792,14 @@ export class BoardEngine {
       pipeline: this.pipeline(),
       selfHeal: this.selfHeal(),
       activeDecisions: this.activeDecisions(),
+      activeDecisionCount: this.ledger.countDecisions({ activeOnly: true }),
       ownerPrs: this.ownerPrs(repos),
     };
   }
 
   /** Decision memory projection (issue #218): bounded active decisions,
-   * newest first (the ledger listing's own deterministic order). */
+   * newest first (the ledger listing's own deterministic order); the
+   * snapshot's `activeDecisionCount` carries the untruncated total. */
   private activeDecisions(): readonly ActiveDecisionView[] {
     const rows: readonly DecisionRecord[] = this.ledger.listDecisions({ activeOnly: true, limit: 50 });
     return rows.map((row) => ({

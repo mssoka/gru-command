@@ -73,9 +73,15 @@ export const DECISION_FINGERPRINT_MAX_LENGTH = 256;
 export const DECISION_SIGNAL_MAX_LENGTH = 64;
 export const DECISION_SIGNALS_MAX_COUNT = 16;
 
-/** A subject is a kind-prefixed stable key: `job:j-123`,
- * `pr:mssoka/gru-command#148`, `incident:pr-conflict:<hash>`. The prefix
- * makes the subject vocabulary explicit; the key part stays opaque. */
+/** The subject kinds the issue enumerates — 'job:<id>',
+ * 'pr:<repo>#<n>', 'incident:<kind>:<key>'. A new kind is a deliberate
+ * vocabulary extension (db migration comment + this list together),
+ * never a silently-accepted near-miss that can never match a trigger. */
+export const DECISION_SUBJECT_KINDS: readonly string[] = ['job', 'pr', 'incident'];
+
+/** A subject is one of the documented kind-prefixed stable keys.
+ * Anything else would be stored, never match a trigger query, and
+ * silently hold nothing — reject it at the write boundary instead. */
 export function validateDecisionSubject(value: string): string {
   if (value.length === 0 || value.length > DECISION_SUBJECT_MAX_LENGTH) {
     throw new Error(`decision subject must be 1-${DECISION_SUBJECT_MAX_LENGTH} characters`);
@@ -87,16 +93,24 @@ export function validateDecisionSubject(value: string): string {
   if (colon <= 0 || colon === value.length - 1) {
     throw new Error(`decision subject must be "<kind>:<key>" (e.g. "pr:<repo>#<n>"), got "${value}"`);
   }
+  const kind = value.slice(0, colon);
+  if (!(DECISION_SUBJECT_KINDS as readonly string[]).includes(kind)) {
+    throw new Error(
+      `unknown decision subject kind "${kind}" — expected one of ${DECISION_SUBJECT_KINDS.map((k) => `${k}:`).join(', ')}`,
+    );
+  }
   return value;
 }
 
-/** Signal kinds are short bounded tokens (`pr-conflict`, `ci-failed`). */
+/** Signal kinds are canonical lowercase tokens (`pr-conflict`,
+ * `ci-failed`); a whitespace-bearing or mixed-case near-miss would be
+ * stored but never match the trigger's signal — reject it here. */
 export function validateDecisionSignal(value: string): string {
   if (value.length === 0 || value.length > DECISION_SIGNAL_MAX_LENGTH) {
     throw new Error(`decision signal must be 1-${DECISION_SIGNAL_MAX_LENGTH} characters`);
   }
-  if (/[\p{Cc}]/u.test(value)) {
-    throw new Error('decision signal must not contain control characters');
+  if (!/^[a-z0-9][a-z0-9._-]*$/u.test(value)) {
+    throw new Error(`decision signal must be a lowercase token of [a-z0-9._-], got "${value}"`);
   }
   return value;
 }
@@ -148,6 +162,16 @@ export interface CanonicalDecisionInput {
   readonly recheckAt: string | null;
 }
 
+/** Strict ISO-8601 UTC shape for `recheck_at`: the issue asks for an ISO
+ * timestamp, and Date.parse alone would also accept prose like
+ * "March 5 2030" — canonicalize only what is unambiguously ISO. */
+function requireIsoUtcTimestamp(value: string, what: string): string {
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/u.test(value)) {
+    throw new Error(`${what} must be an ISO 8601 UTC timestamp (e.g. 2030-01-01T00:00:00.000Z), got "${value}"`);
+  }
+  return canonicalIsoTimestamp(value, what);
+}
+
 /** Validate + canonicalize a decision write. `recheckAt` is canonicalized
  * to a UTC ISO string so string comparison in queries is sound. */
 export function canonicalizeDecisionInput(input: {
@@ -179,7 +203,7 @@ export function canonicalizeDecisionInput(input: {
     recheckAt:
       input.recheckAt === null || input.recheckAt === undefined
         ? null
-        : canonicalIsoTimestamp(input.recheckAt, 'decision recheckAt'),
+        : requireIsoUtcTimestamp(input.recheckAt, 'decision recheckAt'),
   };
 }
 

@@ -184,6 +184,19 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
     return value === '' ? undefined : value;
   }
 
+  /** Optional-string variant for decision fields, where an empty string
+   * is NOT "omitted": `basis_fingerprint: ""` would silently broaden a
+   * hold to any-basis and `recheck_at: ""` would silently remove the
+   * scheduled re-look. Present-but-empty is a loud 400, never a coercion
+   * (deliberately NOT built on optStrField, which maps '' → undefined). */
+  function decisionOptStrField(body: Record<string, unknown>, field: string): string | undefined {
+    if (!(field in body)) return undefined;
+    const value = body[field];
+    if (typeof value !== 'string') throw new Error(`field "${field}" must be a string`);
+    if (value === '') throw new Error(`field "${field}" must not be empty when present`);
+    return value;
+  }
+
   function handleApi(
     req: IncomingMessage,
     res: import('node:http').ServerResponse,
@@ -345,16 +358,16 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
             subject: strField(body, 'subject'),
             decision: decision as DecisionKind,
             covers: covers as readonly string[],
-            ...(optStrField(body, 'basis_fingerprint') !== undefined
-              ? { basisFingerprint: optStrField(body, 'basis_fingerprint') }
+            ...(decisionOptStrField(body, 'basis_fingerprint') !== undefined
+              ? { basisFingerprint: decisionOptStrField(body, 'basis_fingerprint') }
               : {}),
             reason: strField(body, 'reason'),
             by: by as DecisionActor,
-            ...(optStrField(body, 'client_key') !== undefined
-              ? { clientKey: optStrField(body, 'client_key') }
+            ...(decisionOptStrField(body, 'client_key') !== undefined
+              ? { clientKey: decisionOptStrField(body, 'client_key') }
               : {}),
-            ...(optStrField(body, 'recheck_at') !== undefined
-              ? { recheckAt: optStrField(body, 'recheck_at') }
+            ...(decisionOptStrField(body, 'recheck_at') !== undefined
+              ? { recheckAt: decisionOptStrField(body, 'recheck_at') }
               : {}),
           });
           json(res, 201, record);
