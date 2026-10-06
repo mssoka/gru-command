@@ -116,4 +116,9 @@
 ## Deferred from: code review of issue #218 (2026-10-06)
 
 - [Review][Defer] Trigger-path suppression wiring — `coveringDecision` is not yet called by any production trigger/wake path, so a recorded hold does not yet prevent re-detection wakes. Deferred: #218 is the foundation by the issue's own sequencing; hold suppression wiring is #215's scope and the #219 lane is already stacking on `gru/decision-memory-218`. Docs now state this truthfully. Settled by: #215 landing its suppression query on this API.
-- [Review][Defer] `recheck_at` re-look scheduler — a passed `recheck_at` re-opens the subject for future queries, but nothing schedules a wake/sweep when it passes. Deferred: the recheck sweep is #217's explicit scope per the issue ("recheck_at in #217"). Settled by: #217's scheduler reading `recheck_at`.
+- [x] [Review][Defer] `recheck_at` re-look scheduler — a passed `recheck_at` re-opens the subject for future queries, but nothing schedules a wake/sweep when it passes. Deferred: the recheck sweep is #217's explicit scope per the issue ("recheck_at in #217"). Settled by: #217's scheduler reading `recheck_at` — DONE: PR #238 (merged 2026-10-06) reads `recheck_at` in the Silas sweep gate.
+
+## Deferred from: code review of PR #238 (2026-10-06)
+
+- `prompt()` resolving with an unsuccessful in-band turn verdict is counted as a delivered wake (`src/dispatch/silas-driver.ts` runWake) — pre-existing slot contract, not introduced by #217; adopting `promptWithVerdict` for the silas slot is a separate change.
+- Skill files edited on disk while the driver runs never reload (constructor-loaded `loadSilasSkills`) — pre-existing; a driver restart applies the revised pack.
