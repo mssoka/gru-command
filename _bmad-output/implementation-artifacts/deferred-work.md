@@ -89,6 +89,15 @@
   summary: The crew-rail Playwright project (rail layout/overflow geometry) is not part of any required recurring gate — CI runs `npm test` (Vitest) only; a future CSS regression could pass every required check while breaking the rail layout.
   evidence: Fresh bmad-build verification-gap finding 2026-10-05 (disposition: defer). The dedicated `crew-rail` project is runnable on demand through the declared scheduler scopes (`crew-rail-captures`, `crew-captures-fast`) and ran green at the reviewed heads, but adding Playwright to required CI is a repo-wide runner-cost/policy decision (browsers install, ~1-2 min/job) that the owner and the e2e-gate-repair lane (job-e2e-gate-repair-20261004) own, not this display-naming lane.
 
+## Deferred from: code review of issue 189 (2026-10-05)
+
+- source_spec: GitHub issue #189 (PR #228, settlement-gap lane)
+  summary: A synchronous settlement-publication failure in the boot spent-marker or delivery-only completion paths rejects the whole `reconcilePendingRebriefs` pass, and `src/main.ts` awaits that pass during startup — one faulty job can stall recovery of every other job and startup itself.
+  evidence: bmad code review (blind-hunter, gpt-6-sol) 2026-10-05; pre-existing shape — the old two-step clear→publish could throw out of the scan identically, and GH-228 strictly improves recovery (the clear now rolls back, markers survive for the next boot). Per-job containment changes reconcile error semantics (report shape, escalation routing) and belongs to a dedicated reliability lane, not the settlement-gap fix.
+- source_spec: GitHub issue #189 (PR #228, settlement-gap lane)
+  summary: The delivery-only shortcut appends `silas.rebrief-recovered` after the atomic clear+settle commits; a failure of that audit append loses the recovery audit with no markers left to re-derive it from.
+  evidence: bmad code review (blind-hunter, gpt-6-sol) 2026-10-05; pre-existing window (the audit trailed the settlement before this change too) and observability-only — the settlement itself is committed, so no handoff strands. Atomic audit+settlement needs another API variant; not worth the surface for an informational event.
+
 ## Deferred from: code review of GH-221 / PR #229 (2026-10-05)
 
 - [ ] [Review][Defer] No startup reconciliation of uncaptured review verdicts [src/lessons/review-capture.ts] — deferred: real but not actionable now. Capture is event-driven only: a verdict whose consolidated record is missing/unreadable at event time stays uncaptured unless the same round posts another verdict event, and verdicts committed moments before a crash are never rescanned at boot. Closing it needs a new ledger query (all verdict-posted rounds across jobs — none exists today) plus a bounded startup sweep wired in main.ts, which is new ledger surface beyond this reviewed PR. Exposure in the current production flow is near-nil: verdicts post only while the service is up, and whole-pr rounds write consolidated.json before the verdict event (INCOMPLETE/recovery rounds carry no accepted findings). Settled by: implement `listVerdictRounds()` on LedgerApi + a boot-time sweep that replays uncaptured rounds through the same capture path (finding sources make replays idempotent).
@@ -103,3 +112,8 @@
 - source_spec: GitHub issue #215 (Route mechanical PR conflicts to Silas's digest instead of waking Gru)
   summary: A live/armed Perkins review round does not fence the `conflictingPrs` row — a base update can dirty the PR mid-round and the digest will offer a rebase that invalidates the frozen review target. The issue's suppression list is deliberately enumerated (directives, re-briefs, verifications, later #218 holds); round coordination belongs to #218's typed decision memory, where an active-hold check can cover `pr-conflict`.
   evidence: bmad code review (blind-hunter, gpt-6-sol) 2026-10-05, triaged defer — real coordination hazard, owned by the #218 phase; adding round-state fencing here would exceed the issue's prescribed suppression contract.
+
+## Deferred from: code review of issue #218 (2026-10-06)
+
+- [Review][Defer] Trigger-path suppression wiring — `coveringDecision` is not yet called by any production trigger/wake path, so a recorded hold does not yet prevent re-detection wakes. Deferred: #218 is the foundation by the issue's own sequencing; hold suppression wiring is #215's scope and the #219 lane is already stacking on `gru/decision-memory-218`. Docs now state this truthfully. Settled by: #215 landing its suppression query on this API.
+- [Review][Defer] `recheck_at` re-look scheduler — a passed `recheck_at` re-opens the subject for future queries, but nothing schedules a wake/sweep when it passes. Deferred: the recheck sweep is #217's explicit scope per the issue ("recheck_at in #217"). Settled by: #217's scheduler reading `recheck_at`.

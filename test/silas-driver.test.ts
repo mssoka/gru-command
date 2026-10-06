@@ -6,6 +6,7 @@ import {
   adviseFollowThrough,
   adviseRecurrence,
   blockerFingerprint,
+  blockerLocationKey,
   buildWakePrompt,
   CAPTURE_HELPER_PATH,
   computeSilasDigest,
@@ -15,6 +16,7 @@ import {
   digestActionCount,
   followUpChangedTarget,
   loadSilasSkills,
+  roundBlockerKeys,
   SilasDriver,
   supervisionLookup,
   type DeterministicPassHook,
@@ -71,6 +73,108 @@ describe('blocker recurrence policy', () => {
     expect(left).toBe(right);
     expect(left).not.toBe(blockerFingerprint(b('null deref on empty path', 'src/b.ts')));
     expect(left).not.toBe(blockerFingerprint(b('null deref on empty path', 'src/a.ts', 'security')));
+  });
+
+  it('a shifted line range keeps the fingerprint: edits above a defect do not reset its streak (gh-216)', () => {
+    // The carried blocker moves from 287-294 to 301-308 when a fix above it
+    // lands; the identity that carries the ladder must survive the move.
+    const before = blockerFingerprint(b('null deref on empty path', 'src/dispatch/pipeline.ts:287-294'));
+    expect(blockerFingerprint(b('null deref on empty path', 'src/dispatch/pipeline.ts:301-308'))).toBe(before);
+    // Recurrence count ADVANCES across the shift, and the ladder rung fires:
+    // same defect in two consecutive rounds → advice `directive` (defaults 2/3/4).
+    const history = [
+      [b('null deref on empty path', 'src/dispatch/pipeline.ts:301-308')],
+      [b('null deref on empty path', 'src/dispatch/pipeline.ts:287-294')],
+    ];
+    expect(consecutiveRecurrence(before, history)).toBe(2);
+    expect(adviseRecurrence(2, DEFAULT_SILAS_CONFIG)).toBe('directive');
+  });
+
+  it('blockerLocationKey strips trailing line suffixes, normalizes separators and lowercases', () => {
+    expect(blockerLocationKey('src/a.ts')).toBe('src/a.ts');
+    expect(blockerLocationKey('src/a.ts:42')).toBe('src/a.ts');
+    expect(blockerLocationKey('src/a.ts:42-48')).toBe('src/a.ts');
+    expect(blockerLocationKey('src/a.ts#L42')).toBe('src/a.ts');
+    expect(blockerLocationKey('src/a.ts#L42-L48')).toBe('src/a.ts');
+    expect(blockerLocationKey('SRC\\A.TS:42')).toBe('src/a.ts');
+    // padded input strips its suffix just the same: the findings parsers
+    // accept surrounding whitespace without trimming it (boundedString)
+    expect(blockerLocationKey('  src/a.ts:42-48  ')).toBe('src/a.ts');
+    // only a TRAILING suffix is stripped — digits inside the path survive
+    expect(blockerLocationKey('src/2.ts:7')).toBe('src/2.ts');
+    expect(blockerLocationKey('src/file:42.ts')).toBe('src/file:42.ts');
+  });
+
+  it('two different blockers in one file stay distinct even at one identity path', () => {
+    expect(blockerFingerprint(b('null deref on empty path', 'src/a.ts:10-20'))).not.toBe(
+      blockerFingerprint(b('leaked handle on error path', 'src/a.ts:30-44')),
+    );
+    // same title, different file: still distinct
+    expect(blockerFingerprint(b('null deref on empty path', 'src/a.ts:10-20'))).not.toBe(
+      blockerFingerprint(b('null deref on empty path', 'src/b.ts:10-20')),
+    );
+  });
+
+  it('a reworded title still mints a new fingerprint and breaks the streak (documented limit; semantic matching is gh-224)', () => {
+    const before = blockerFingerprint(b('null deref on empty path', 'src/a.ts:10-20'));
+    const after = blockerFingerprint(b('EMPTY_PATH dereference crashes render', 'src/a.ts:10-20'));
+    expect(after).not.toBe(before);
+    expect(
+      consecutiveRecurrence(after, [
+        [b('EMPTY_PATH dereference crashes render', 'src/a.ts:10-20')],
+        [b('null deref on empty path', 'src/a.ts:10-20')],
+      ]),
+    ).toBe(1);
+  });
+
+  it('roundBlockerKeys: same-file same-title collisions tie-break on evidence; everyone else never sees it', () => {
+    const left = { ...b('null deref on empty path', 'src/a.ts:10-20'), evidence: 'if (path === EMPTY) return path.length;' };
+    const right = { ...b('null deref on empty path', 'src/a.ts:88-96'), evidence: 'const n = cache.get(EMPTY).size;' };
+    const keys = roundBlockerKeys([left, right]);
+    // distinct defects that share file/category/title stay distinct
+    expect(keys[0]).not.toBe(keys[1]);
+    expect(keys[0]?.startsWith(blockerFingerprint(left))).toBe(true);
+    expect(keys[1]?.startsWith(blockerFingerprint(right))).toBe(true);
+    // the tie-break is deterministic across rounds
+    expect(roundBlockerKeys([left, right])).toEqual(keys);
+    // a NON-colliding blocker never carries evidence in its key — evidence
+    // churn between rounds can never reset its streak
+    const solo = { ...b('same leak', 'src/a.ts:10-20'), evidence: 'totally different wording every round' };
+    expect(roundBlockerKeys([solo])).toEqual([blockerFingerprint(b('same leak', 'src/a.ts:10-20'))]);
+    expect(roundBlockerKeys([{ ...solo, evidence: 'other round other words' }])).toEqual(roundBlockerKeys([solo]));
+  });
+
+  it('roundBlockerKeys: indistinguishable collisions (missing or equal evidence) merge — documented limit', () => {
+    const left = b('null deref on empty path', 'src/a.ts:10-20');
+    const right = b('null deref on empty path', 'src/a.ts:88-96');
+    const keys = roundBlockerKeys([left, right]);
+    expect(keys[0]).toBe(keys[1]);
+    const evLeft = { ...left, evidence: 'same quoted snippet' };
+    const evRight = { ...right, evidence: 'SAME  quoted\nsnippet ' };
+    const evKeys = roundBlockerKeys([evLeft, evRight]);
+    // equal normalized evidence hashes to one augmented key — merge
+    expect(evKeys[0]).toBe(evKeys[1]);
+  });
+
+  it('a colliding pair recurs on its augmented keys across rounds; a half-fixed pair breaks the streak', () => {
+    const mk = (evidence: string) => ({ ...b('null deref on empty path', 'src/a.ts'), evidence });
+    const left = mk('first defect snippet');
+    const right = mk('second defect snippet');
+    const keys = roundBlockerKeys([left, right]);
+    if (keys[0] === undefined || keys[1] === undefined) {
+      throw new Error('roundBlockerKeys must return one key per blocker');
+    }
+    const [leftKey, rightKey] = keys;
+    expect(consecutiveRecurrence(leftKey, [[left, right], [left, right]])).toBe(2);
+    expect(consecutiveRecurrence(rightKey, [[left, right], [left, right]])).toBe(2);
+    // one defect fixed: the survivor no longer collides, drops its
+    // augmentation — the augmented pair identity no longer exists in the
+    // newest round, so the pair's streak ends and the survivor restarts
+    // from its base key
+    expect(consecutiveRecurrence(leftKey, [[left], [left, right]])).toBe(0);
+    expect(
+      consecutiveRecurrence(blockerFingerprint(left), [[left], [left, right]]),
+    ).toBe(1);
   });
 
   it('counts consecutive rounds carrying the same blocker; a gap breaks the streak', () => {
@@ -1211,6 +1315,56 @@ describe('silas digest (the four actionable states)', () => {
     } finally { release(); h.cleanup(); }
   });
 
+  it('retracts a candidate that slid to blocked or parked while a later history wait ran (gh-187)', async () => {
+    const h = makeLedger();
+    let release!: () => void;
+    let entered!: () => void;
+    const wait = new Promise<void>((resolve) => { release = resolve; });
+    const waiting = new Promise<void>((resolve) => { entered = resolve; });
+    try {
+      // The candidates are OLDER than the verdict job, so the compute visits
+      // them only after the history wait resolves — by then the listJobs
+      // snapshot each intake row is computed from still reads the pre-
+      // mutation review-eligible status ('working'; addJobWithDelivery
+      // records the delivery as an event and never flips the status). The
+      // 'z-' id prefix keeps every mutated/control candidate AFTER
+      // 'history-wait' even under a same-millisecond updated_at tie
+      // (listJobs breaks ties by id ascending), so the stale-snapshot path
+      // is structural, not clock luck.
+      addJobWithDelivery(h.ledger, 'eligible-offer', { prUrl: 'https://git.example.invalid/pull/7' });
+      addJobWithDelivery(h.ledger, 'z-parked-offer', { prUrl: 'https://git.example.invalid/pull/8' });
+      addJobWithDelivery(h.ledger, 'z-blocked-offer', { prUrl: 'https://git.example.invalid/pull/9' });
+      // PR-less lanes share the same publish fence (deliveredWithoutPr):
+      // one is flipped to blocked during the wait, one stays untouched.
+      addJobWithDelivery(h.ledger, 'z-blocked-no-pr');
+      addJobWithDelivery(h.ledger, 'z-plain-no-pr');
+      addJobWithDelivery(h.ledger, 'history-wait', { prUrl: 'https://git.example.invalid/pull/6' });
+      const round = h.ledger.addRound({ jobId: 'history-wait' });
+      h.ledger.setRoundStatus(round.id, 'live');
+      h.ledger.setRoundStatus(round.id, 'verdict-posted');
+      h.ledger.setRoundVerdict(round.id, 'changes-requested');
+      h.ledger.setJobStatus('history-wait', 'in-review');
+      h.ledger.appendCustomEvent({ kind: 'round.verdict', jobId: 'history-wait', roundId: round.id, payload: {} });
+      const digestPromise = computeSilasDigest({ ledger: h.ledger,
+        blockersForRound: async () => { entered(); await wait; return { blockers: [], note: null }; },
+        config: DEFAULT_SILAS_CONFIG, trigger: 'sweep' });
+      await waiting;
+      // The recoverable side-states land DURING the deferred await: intake
+      // still sees the pre-mutation review-eligible status in the stale
+      // snapshot, so only the publish boundary can retract these offers.
+      h.ledger.setJobStatus('z-blocked-offer', 'blocked');
+      h.ledger.setJobStatus('z-parked-offer', 'parked');
+      h.ledger.setJobStatus('z-blocked-no-pr', 'blocked');
+      release();
+      const digest = await digestPromise;
+      expect(digest.prWithoutReview.map((row) => row.jobId)).toEqual(['eligible-offer']);
+      // The shared fence guards the PR-less projection too: the blocked
+      // lane's PR-registration offer is retracted; the untouched control
+      // remains.
+      expect(digest.deliveredWithoutPr.map((row) => row.jobId)).toEqual(['z-plain-no-pr']);
+    } finally { release(); h.cleanup(); }
+  });
+
   it('retracts an earlier review offer when its own blocker-history wait admits a re-brief', async () => {
     const h = makeLedger();
     let release!: () => void;
@@ -1448,6 +1602,122 @@ describe('silas digest (the four actionable states)', () => {
         trigger: 'sweep',
       });
       expect(handled.verdictsAwaitingDirective).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a carried blocker climbs the ladder through SHIFTED line ranges at the digest level (gh-216, end to end)', async () => {
+    const h = makeLedger();
+    try {
+      addJobWithDelivery(h.ledger, 'job-shift', { prUrl: 'https://git.example.invalid/o/r/pull/11' });
+      // The same defect carried across three verdict rounds while fixes above
+      // it keep shifting its lines. If the digest ever lost the history (e.g.
+      // supplied only the newest round to the recurrence read), rounds 1–2
+      // would both say directive and this test would miss the regression.
+      const locations = ['src/dispatch/pipeline.ts:287-294', 'src/dispatch/pipeline.ts:301-308', 'src/dispatch/pipeline.ts:310-317'];
+      const reports = new Map<string, RoundBlocker[]>();
+      const blockersForRound = async (roundId: string) => ({
+        blockers: reports.get(roundId) ?? [],
+        note: null,
+      });
+      const advices = [];
+      for (const location of locations) {
+        const round = h.ledger.addRound({ jobId: 'job-shift', lenses: ['blind'] });
+        h.ledger.setRoundStatus(round.id, 'live');
+        h.ledger.setRoundStatus(round.id, 'verdict-posted');
+        h.ledger.setRoundVerdict(round.id, 'changes-requested');
+        h.ledger.setJobStatus('job-shift', 'in-review');
+        h.ledger.appendCustomEvent({ kind: 'round.verdict', jobId: 'job-shift', roundId: round.id, payload: { verdict: 'changes-requested' } });
+        reports.set(round.id, [{ title: 'same leak', location, category: 'correctness' }]);
+        const digest = await computeSilasDigest({
+          ledger: h.ledger,
+          blockersForRound,
+          config: DEFAULT_SILAS_CONFIG,
+          trigger: 'round.verdict',
+        });
+        const row = digest.verdictsAwaitingDirective[0]?.recurringBlockers[0];
+        advices.push(row?.advice);
+        if (location === locations[2]) {
+          expect(row?.consecutiveRounds).toBe(3);
+          expect(row?.advice).toBe('rebrief');
+        }
+      }
+      expect(advices).toEqual(['directive', 'directive', 'rebrief']);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('the digest keeps two same-file same-title blockers distinct via the evidence tie-break', async () => {
+    const h = makeLedger();
+    try {
+      addJobWithDelivery(h.ledger, 'job-collide', { prUrl: 'https://git.example.invalid/o/r/pull/12' });
+      const round = h.ledger.addRound({ jobId: 'job-collide', lenses: ['blind'] });
+      h.ledger.setRoundStatus(round.id, 'live');
+      h.ledger.setRoundStatus(round.id, 'verdict-posted');
+      h.ledger.setRoundVerdict(round.id, 'changes-requested');
+      h.ledger.setJobStatus('job-collide', 'in-review');
+      h.ledger.appendCustomEvent({ kind: 'round.verdict', jobId: 'job-collide', roundId: round.id, payload: { verdict: 'changes-requested' } });
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({
+          blockers: [
+            { title: 'null deref on empty path', location: 'src/a.ts:10-20', category: 'correctness', evidence: 'if (p === EMPTY) return p.length;' },
+            { title: 'null deref on empty path', location: 'src/a.ts:88-96', category: 'correctness', evidence: 'const n = cache.get(EMPTY).size;' },
+          ],
+          note: null,
+        }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'round.verdict',
+      });
+      const rows = digest.verdictsAwaitingDirective[0]?.recurringBlockers ?? [];
+      expect(rows).toHaveLength(2);
+      expect(rows[0]?.fingerprint).not.toBe(rows[1]?.fingerprint);
+      // indistinguishable members (no evidence) still merge to one row
+      const merged = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({
+          blockers: [
+            { title: 'null deref on empty path', location: 'src/a.ts:10-20', category: 'correctness' },
+            { title: 'null deref on empty path', location: 'src/a.ts:88-96', category: 'correctness' },
+          ],
+          note: null,
+        }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'round.verdict',
+      });
+      expect(merged.verdictsAwaitingDirective[0]?.recurringBlockers).toHaveLength(1);
+      expect(merged.verdictsAwaitingDirective[0]?.blockerCount).toBe(2);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('unrelated job traffic cannot age a landed rung marker out of the handled check (gh-216 AC4)', async () => {
+    const h = makeLedger();
+    try {
+      addJobWithDelivery(h.ledger, 'job-window', { prUrl: 'https://git.example.invalid/o/r/pull/13' });
+      const round = h.ledger.addRound({ jobId: 'job-window', lenses: ['blind'] });
+      h.ledger.setRoundStatus(round.id, 'live');
+      h.ledger.setRoundStatus(round.id, 'verdict-posted');
+      h.ledger.setRoundVerdict(round.id, 'changes-requested');
+      h.ledger.setJobStatus('job-window', 'in-review');
+      h.ledger.appendCustomEvent({ kind: 'round.verdict', jobId: 'job-window', roundId: round.id, payload: { verdict: 'changes-requested' } });
+      h.ledger.appendCustomEvent({ kind: 'silas.directive-sent', jobId: 'job-window', payload: {} });
+      // More than the old fixed window of 50 UNRELATED job events after the
+      // rung marker: a mixed newest-50 read would lose the marker and offer
+      // the verdict again. The kinds-scoped read must not.
+      for (let i = 0; i < 60; i += 1) {
+        h.ledger.appendCustomEvent({ kind: 'job.transcript', jobId: 'job-window', payload: { n: i } });
+      }
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [{ title: 'same leak', location: 'src/a.ts', category: 'correctness' }], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(digest.verdictsAwaitingDirective).toEqual([]);
     } finally {
       h.cleanup();
     }
@@ -2405,6 +2675,7 @@ describe('consolidated blockers port', () => {
             { severity: 'blocker', category: 'correctness', title: 'boom', location: 'src/a.ts' },
             { severity: 'warning', category: 'style', title: 'meh', location: 'src/b.ts' },
             { severity: 'blocker', category: 'security', location: 'src/c.ts' },
+            { severity: 'blocker', category: 'security', title: 'injection', location: 'src/d.ts:12', evidence: 'exec(userInput)' },
           ],
         }),
       );
@@ -2413,6 +2684,8 @@ describe('consolidated blockers port', () => {
       expect(read.blockers).toEqual([
         { category: 'correctness', title: 'boom', location: 'src/a.ts' },
         { category: 'security', title: '', location: 'src/c.ts' },
+        // evidence rides along when present — it only ever breaks same-key ties
+        { category: 'security', title: 'injection', location: 'src/d.ts:12', evidence: 'exec(userInput)' },
       ]);
       expect(read.note).toBeNull();
 

@@ -2598,6 +2598,7 @@ export const PUBLIC_REVIEW_EXECUTABLE_PATHS: ReadonlySet<string> = new Set([
   "dist/identity.js",
   "dist/ledger/api.js",
   "dist/ledger/db.js",
+  "dist/ledger/decision-memory.js",
   "dist/ledger/directives.js",
   "dist/ledger/obligations.js",
   "dist/ledger/pipeline.js",

@@ -1021,6 +1021,66 @@ describe('branch-idle guard', () => {
     }
   });
 
+  /** Deterministic fault injection at the ledger's settlement publication
+   * point (issue #189): the `silas.rebrief-settled` append inside the
+   * completion transaction throws, so the transaction rolls back as one. */
+  function failSettlementPublication(ledger: LedgerApi, fault: Error): () => void {
+    const seam = ledger as unknown as { appendEvent: (fields: { kind: string }) => unknown };
+    const original = seam.appendEvent;
+    const spy = vi.spyOn(seam, 'appendEvent').mockImplementation(function (this: unknown, fields: { kind: string }) {
+      if (fields.kind === 'silas.rebrief-settled') throw fault;
+      return original.apply(this, [fields]);
+    });
+    return () => { spy.mockRestore(); };
+  }
+
+  it('a failed settlement publication leaves the queued handoff queued; a replay wakes it exactly once (issue #189)', async () => {
+    const repo = makeFixtureRepo('branch-idle-settlement-fault-replay');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    const jobId = 'settlement-fault-replay';
+    try {
+      const lane = await createLaneJob(h, repo, { jobId, status: 'working' });
+      const queued = await postReview(h, { job_id: jobId, by: 'minion' });
+      expect(queued.json).toMatchObject({ route: 'queued' });
+      h.ledger.beginPendingRebrief({ jobId, note: 'n', briefing: 'b' });
+
+      const restore = failSettlementPublication(h.ledger, new Error('settlement publication failed'));
+      try {
+        expect(() => finalizeRebriefRequest({
+          ledger: h.ledger, worktrees: h.worktrees, jobId,
+          minionId: 'minion-fresh', lanePath: lane.path, note: 'n',
+        })).toThrow(/settlement publication failed/u);
+      } finally { restore(); }
+      // The completion rolled back as one: markers stay, the guarded
+      // events stay, and the queued handoff was NOT woken by a stranded
+      // half-completion (no started marker, no settlement).
+      expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(2);
+      expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief')).not.toBeNull();
+      expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).not.toBeNull();
+      expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-settled')).toBeNull();
+      expect(h.ledger.latestJobEvent(jobId, 'job.review-handoff-started')).toBeNull();
+      expect(h.ledger.listRounds(jobId)).toHaveLength(0);
+
+      // The replay (the next pass or finalization) repairs the window:
+      // the exact queued handoff starts exactly once.
+      const startedPromise = joinJobEvent(h, jobId, 'job.review-handoff-started');
+      const finalized = finalizeRebriefRequest({
+        ledger: h.ledger, worktrees: h.worktrees, jobId,
+        minionId: 'minion-fresh', lanePath: lane.path, note: 'n',
+      });
+      expect(finalized.superseded).toBe(false);
+      const started = await startedPromise;
+      expect(started.payload).toMatchObject({ requestSeq: queued.json['request_seq'] });
+      expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(0);
+      expect(h.ledger.listJobEvents(jobId).filter((event) => event.kind === 'silas.rebrief-settled')).toHaveLength(1);
+      expect(h.ledger.listJobEvents(jobId).filter((event) => event.kind === 'job.review-handoff-started')).toHaveLength(1);
+      expect(h.ledger.listRounds(jobId)).toHaveLength(1);
+    } finally {
+      await h.close();
+    }
+  });
+
   it('a replaced checkout during failing preflight is refused instead of reviewing the stale path', async () => {
     const oldRepo = makeFixtureRepo('branch-idle-fallback-old-path');
     const newRepo = makeFixtureRepo('branch-idle-fallback-new-path');

@@ -354,6 +354,44 @@ describe('board server-frame validator', () => {
     expect(isValidSnapshot({ ...snapshot(), ownerPrs: { not: 'an array' } } as unknown)).toBe(false);
   });
 
+  it('activeDecisions (issue #218): absent/null tolerated, well-formed accepted, malformed rejected', () => {
+    expect(isValidSnapshot(snapshot())).toBe(true);
+    const nullDecisions = { ...snapshot(), activeDecisions: null, activeDecisionCount: null } as unknown;
+    expect(isValidSnapshot(nullDecisions)).toBe(true);
+
+    const decision = {
+      id: 'd-1',
+      subject: 'pr:example/repo#148',
+      decision: 'hold',
+      by: 'gru',
+      recheckAt: null,
+      createdAt: '2026-01-01T00:00:00.000Z',
+    };
+    expect(
+      isValidSnapshot({ ...snapshot(), activeDecisions: [decision], activeDecisionCount: 1 } as unknown),
+    ).toBe(true);
+
+    // A malformed decision row must fail the whole snapshot: the board
+    // client discards unparseable frames, so bad rows must never slip in.
+    for (const broken of [
+      { ...decision, id: '' },
+      { ...decision, subject: 7 },
+      { ...decision, decision: '' },
+      { ...decision, by: null },
+      { ...decision, recheckAt: 12 },
+      { ...decision, createdAt: '' },
+    ]) {
+      expect(
+        isValidSnapshot({ ...snapshot(), activeDecisions: [broken], activeDecisionCount: 1 } as unknown),
+        JSON.stringify(broken),
+      ).toBe(false);
+    }
+    expect(isValidSnapshot({ ...snapshot(), activeDecisions: { not: 'an array' } } as unknown)).toBe(false);
+    expect(isValidSnapshot({ ...snapshot(), activeDecisionCount: 1.5 } as unknown)).toBe(false);
+    expect(isValidSnapshot({ ...snapshot(), activeDecisionCount: -1 } as unknown)).toBe(false);
+    expect(isValidSnapshot({ ...snapshot(), activeDecisionCount: 'many' } as unknown)).toBe(false);
+  });
+
   it('accepts prState present, null, or absent; rejects junk states', () => {
     for (const prState of ['open', 'conflicting', 'merged', null, undefined]) {
       const candidate = snapshot();
