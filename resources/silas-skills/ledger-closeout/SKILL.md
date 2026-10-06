@@ -14,7 +14,11 @@ close-out: a ledger-visible end state a stranger can audit.
 - Mechanical reactions are recorded too (mandate split 2026-09-23): a
   re-arm, a pattern respin, or a rule-based sweep ack lands as the event
   it is (the review request, the round, the sweep) with the rule that
-  fired it — the chief's trackers count them.
+  fired it — `rule_id` (and `source_round_id` when a round was consumed)
+  on `silas.review-triggered`, `silas.directive-sent`, `silas.rebrief`,
+  and `silas.escalated`; `gate:"freeze-r1"` on a `silas.review-deferred`
+  refusal; `silas.lane-released` for a sweep-ack release — the chief's
+  trackers count them.
 - Before you act on a lane, re-read its recent events. A stale digest is a
   hypothesis; the ledger is the fact.
 
@@ -52,9 +56,11 @@ close-out: a ledger-visible end state a stranger can audit.
    completion note. Do not re-escalate the same state on every sweep: the
    digest stops listing a verdict once your rung lands.
 5. **Lanes.** A lane releases only when the job is terminal (merged/done)
-   or explicitly abandoned by the chief. Preserve before remove: untracked
-   deliverables are preserved by the sweep, and a live process pauses it —
-   acknowledge, never override.
+   or explicitly abandoned by the chief. The digest's `releaseEligible`
+   rows are the terminal lanes still held: release with `by:silas` +
+   `rule_id:sweep-ack` so the `silas.lane-released` receipt lands (issue
+   #117). Preserve before remove: untracked deliverables are preserved by
+   the sweep, and a live process pauses it — acknowledge, never override.
 
 ## Completion notes
 

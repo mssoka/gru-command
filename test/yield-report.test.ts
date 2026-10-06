@@ -68,6 +68,7 @@ const emptyDigest: SilasOpsDigest = {
   verificationWaits: [],
   providerRecoveryPending: [],
   conflictingPrs: [],
+  releaseEligible: [],
 };
 
 const noSkills: readonly SkillModule[] = [];
@@ -501,6 +502,20 @@ describe('computeLedgerMeasures', () => {
     expect(measures.silasYield.byTrigger).toEqual([
       { trigger: 'sweep', wakes: 3, wakesWithAction: 2 },
     ]);
+  });
+
+  it('a sweep-ack release attributes to its wake like every other silas action (issue #117)', () => {
+    const measures = computeLedgerMeasures(
+      measureInput([
+        event('silas.wake', '2026-10-01T01:00:00.000Z', { payload: { trigger: 'sweep', actionable: 1 } }),
+        event('silas.lane-released', '2026-10-01T01:05:00.000Z'),
+        event('silas.wake', '2026-10-01T02:00:00.000Z', { payload: { trigger: 'sweep', actionable: 0 } }),
+      ]),
+      [],
+    );
+    expect(measures.silasYield.wakes).toBe(2);
+    expect(measures.silasYield.wakesWithAction).toBe(1);
+    expect(measures.silasYield.actionsByKind).toEqual({ 'silas.lane-released': 1 });
   });
 
   it('orders same-timestamp events by sequence: each action lands in exactly one window', () => {

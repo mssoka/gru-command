@@ -16,6 +16,7 @@ import { checkRebriefTurn, finalizeRebriefRequest, RebriefTurnCancelled } from '
 import type { LessonsReferencePort } from '../lessons/types.js';
 import { BranchBusyError } from './branch-idle.js';
 import { deliveredTargetSha, type SilasOpsDigest } from './silas-driver.js';
+import { isVerdictRungRule, parseSilasRouteRuleId, strictOptStrField } from './silas-rules.js';
 import type { WorktreePort } from './worktree-port.js';
 import type { PacingGate, RetrySettlement } from '../runtime/pacing.js';
 import { childRefusalStatus, type ChildWorkerService } from './child-workers.js';
@@ -576,12 +577,17 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           if (by === 'silas') {
             // The deferred-arm note: Silas retries on the next sweep once
             // the busy lane delivers; the ledger keeps the deferral trail.
+            // gate=freeze-r1 is the standing gate's firing receipt (issue
+            // #117, g21): the fence refused this arm, so the deferral
+            // PROVES the gate fired — alongside the deferred arm's own
+            // trigger provenance when it carried one.
             options.ledger.appendCustomEvent({
               kind: 'silas.review-deferred',
               jobId: input.jobId,
               payload: {
                 target_branch: error.targetBranch,
                 phase: error.phase,
+                gate: 'freeze-r1',
                 ...(ruleId !== undefined ? { rule_id: ruleId, source_round_id: sourceRoundId } : {}),
                 blockers: refusal.blockers,
                 hint: refusal.hint,
@@ -965,6 +971,26 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       const jobId = strField(body, 'job_id');
       const directive = strField(body, 'directive');
       const fingerprint = optStrField(body, 'blocker_fingerprint');
+      // Firing-rule provenance (issue #117, g21): the named Silas rule the
+      // digest row answered. Validated against the registry AND this
+      // route's receipt contract; the receipt below carries it so the
+      // chief's trackers can audit rule hits. Verdict-rung rules consume a
+      // specific verdict round, so the round id is required there and must
+      // belong to THIS job — a fabricated or foreign round is refused.
+      const ruleField = strictOptStrField(body, 'rule_id');
+      const ruleId = parseSilasRouteRuleId('directive', ruleField);
+      const sourceRoundId = strictOptStrField(body, 'source_round_id');
+      if (sourceRoundId !== undefined && ruleId === null) {
+        throw new Error('source_round_id must be paired with a rule_id');
+      }
+      if (ruleId !== null && isVerdictRungRule(ruleId)) {
+        if (sourceRoundId === undefined) {
+          throw new Error(`rule_id "${ruleId}" consumes a verdict round — source_round_id is required`);
+        }
+        if (options.ledger.getRound(sourceRoundId)?.jobId !== jobId) {
+          throw new Error(`source_round_id "${sourceRoundId}" is not a round of job "${jobId}"`);
+        }
+      }
       const requestIdField = optStrField(body, 'request_id');
       const completionHandoff = completionHandoffField(body);
       const job = options.ledger.getJob(jobId);
@@ -1116,6 +1142,8 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
             request_id: intent.requestId,
             minion_id: delivery.minionId ?? null,
             ...(fingerprint !== undefined ? { blocker_fingerprint: fingerprint } : {}),
+            ...(ruleId !== null ? { rule_id: ruleId } : {}),
+            ...(sourceRoundId !== undefined ? { source_round_id: sourceRoundId } : {}),
             directive_bytes: Buffer.byteLength(directive, 'utf-8'),
           },
         });
@@ -1252,6 +1280,24 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       const body = await readBody(req);
       const jobId = strField(body, 'job_id');
       const note = strField(body, 'note');
+      // Firing-rule provenance (issue #117, g21): stored on the durable
+      // request marker BEFORE any worker exists, so the silas.rebrief
+      // receipt replays it even across a restart mid-turn. Route- and
+      // round-validated like every silas rule intake.
+      const ruleField = strictOptStrField(body, 'rule_id');
+      const ruleId = parseSilasRouteRuleId('rebrief', ruleField);
+      const sourceRoundId = strictOptStrField(body, 'source_round_id');
+      if (sourceRoundId !== undefined && ruleId === null) {
+        throw new Error('source_round_id must be paired with a rule_id');
+      }
+      if (ruleId !== null && isVerdictRungRule(ruleId)) {
+        if (sourceRoundId === undefined) {
+          throw new Error(`rule_id "${ruleId}" consumes a verdict round — source_round_id is required`);
+        }
+        if (options.ledger.getRound(sourceRoundId)?.jobId !== jobId) {
+          throw new Error(`source_round_id "${sourceRoundId}" is not a round of job "${jobId}"`);
+        }
+      }
       const completionHandoff = completionHandoffField(body);
       const job = options.ledger.getJob(jobId);
       if (job === null) throw new Error(`job "${jobId}" not found`);
@@ -1265,6 +1311,8 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         jobId,
         note,
         briefing: job.briefing,
+        ...(ruleId !== null ? { ruleId } : {}),
+        ...(sourceRoundId !== undefined ? { sourceRoundId } : {}),
         ...(completionHandoff !== undefined ? { handoff: completionHandoff } : {}),
       });
       const rebriefPhaseId = markers.find((marker) => marker.phaseId !== null)?.phaseId ?? null;
@@ -1459,9 +1507,26 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       if (title.length > 500) throw new Error('title exceeds 500 characters');
       const detail = optStrField(body, 'detail');
       if (detail !== undefined && detail.length > 4000) throw new Error('detail exceeds 4000 characters');
+      // Firing-rule provenance (issue #117, g21): the named rule whose
+      // ladder rung this escalation is (verdict-rung-escalate). Route- and
+      // round-validated like every silas rule intake.
+      const ruleField = strictOptStrField(body, 'rule_id');
+      const ruleId = parseSilasRouteRuleId('escalate', ruleField);
+      const sourceRoundId = strictOptStrField(body, 'source_round_id');
+      if (sourceRoundId !== undefined && ruleId === null) {
+        throw new Error('source_round_id must be paired with a rule_id');
+      }
       const jobId = optStrField(body, 'job_id');
       if (jobId !== undefined && options.ledger.getJob(jobId) === null) {
         throw new Error(`job "${jobId}" not found`);
+      }
+      if (ruleId !== null && isVerdictRungRule(ruleId)) {
+        if (sourceRoundId === undefined || jobId === undefined) {
+          throw new Error(`rule_id "${ruleId}" consumes a verdict round — source_round_id and job_id are required`);
+        }
+        if (options.ledger.getRound(sourceRoundId)?.jobId !== jobId) {
+          throw new Error(`source_round_id "${sourceRoundId}" is not a round of job "${jobId}"`);
+        }
       }
       // Bind the row to the lane's current worker (existing agentId
       // semantics) so a terminal lane's leftover escalation is classified
@@ -1488,7 +1553,12 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       options.ledger.appendCustomEvent({
         kind: 'silas.escalated',
         ...(jobId !== undefined ? { jobId } : {}),
-        payload: { title, notification_id: notification.id },
+        payload: {
+          title,
+          notification_id: notification.id,
+          ...(ruleId !== null ? { rule_id: ruleId } : {}),
+          ...(sourceRoundId !== undefined ? { source_round_id: sourceRoundId } : {}),
+        },
       });
       json(res, 200, { notification_id: notification.id });
       return true;

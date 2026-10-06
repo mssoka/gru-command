@@ -363,6 +363,9 @@ const SILAS_ACTION_KINDS = [
   'silas.directive-settled',
   'silas.rebrief',
   'silas.escalated',
+  // The sweep-ack release receipt (issue #117): a rule-based close-out
+  // the trackers count like every other recorded reaction.
+  'silas.lane-released',
   // Pass-ATTRIBUTED progress: emitted only by the deterministic pass when
   // it actually advanced durable work (a generic phase-completion or
   // obligation event from an unrelated lane is deliberately NOT counted).

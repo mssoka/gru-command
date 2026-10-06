@@ -4,6 +4,8 @@ import type { GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { WorktreeManager } from './manager.js';
 import type { LedgerApi } from '../ledger/api.js';
+import { isJobTerminal } from '../ledger/states.js';
+import { parseSilasActionRuleId } from '../dispatch/silas-rules.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -110,6 +112,27 @@ export function createWorktreeServer(options: WorktreeServerOptions): WorktreeSe
     const body = await readBody(req);
     const confirmKill = body['confirm_kill'] === true;
     const baseBranch = optStrField(body, 'base_branch');
+    // Sweep-ack provenance (issue #117, g21): a silas release must name the
+    // rule that fired it (sweep-ack — the releaseEligible digest row), so
+    // the silas.lane-released receipt is attributable end-to-end. Any other
+    // caller releases without silas provenance, exactly as before.
+    const by = optStrField(body, 'by');
+    const silasRelease = by === 'silas';
+    let silasRule: string | null = null;
+    if (silasRelease) {
+      silasRule = parseSilasActionRuleId(optStrField(body, 'rule_id'));
+      if (silasRule !== 'sweep-ack') {
+        json(res, 400, {
+          error: 'bad_request',
+          detail: 'a silas release carries rule_id "sweep-ack" — no other rule releases a lane',
+        });
+        return;
+      }
+      if (options.ledger === undefined) {
+        json(res, 503, { error: 'not_configured', detail: 'no ledger wired — a silas release cannot be receipted' });
+        return;
+      }
+    }
     const rawId = optStrField(body, 'worktree_id') ?? optStrField(body, 'round_id');
     // Resolve the lane: an explicit worktree/round id, or the job's lane.
     let worktreeId: string;
@@ -161,11 +184,70 @@ export function createWorktreeServer(options: WorktreeServerOptions): WorktreeSe
         return;
       }
     }
+    // A silas release enforces the sweep-ack rule's OWN firing condition —
+    // a terminal job still holding its own lane — instead of trusting the
+    // caller's digest read (issue #117 review): a live job is never swept
+    // mechanically, an already-swept lane cannot mint a duplicate receipt,
+    // and confirm_kill stays a human-only acknowledgment (pause-and-ask).
+    // Fail loud BEFORE acting — never release a lane whose rule-hit cannot
+    // be recorded or whose precondition failed.
+    if (silasRelease) {
+      if (confirmKill) {
+        json(res, 400, {
+          error: 'bad_request',
+          detail: 'a silas release cannot carry confirm_kill — acknowledging a paused sweep is a human decision',
+        });
+        return;
+      }
+      if (lane?.status === 'swept') {
+        json(res, 409, {
+          error: 'already_swept',
+          detail: `lane "${worktreeId}" is already swept — a re-release mints no second sweep-ack receipt`,
+        });
+        return;
+      }
+      const releasedJobId = lane?.kind === 'job' ? lane.jobId : null;
+      if (releasedJobId === null) {
+        json(res, 400, {
+          error: 'bad_request',
+          detail: 'a silas release must resolve to a job lane — raw or round lanes carry no job receipt',
+        });
+        return;
+      }
+      const releaseJob = options.ledger?.getJob(releasedJobId) ?? null;
+      if (releaseJob === null || !isJobTerminal(releaseJob.status)) {
+        json(res, 409, {
+          error: 'job_not_terminal',
+          detail: `job "${releasedJobId}" is ${releaseJob?.status ?? 'unknown'} — sweep-ack releases only terminal lanes`,
+        });
+        return;
+      }
+    }
     const result = await manager.release({
       worktreeId,
       ...(confirmKill ? { confirmKill: true } : {}),
       ...(baseBranch !== undefined ? { baseBranch } : {}),
     });
+    if (silasRelease && options.ledger !== undefined) {
+      // The sweep-ack receipt lands on the JOB only after the release
+      // actually succeeded — a refused release (a live child worker, a
+      // paused tree) records nothing, so no false rule-hit is counted.
+      // A paused result is a refusal: the pause-and-ask rule stays
+      // absolute, and the next sweep re-derives the row.
+      const releasedJobId = lane?.kind === 'job' ? lane.jobId : null;
+      if (releasedJobId !== null && result.status === 'swept') {
+        options.ledger.appendCustomEvent({
+          kind: 'silas.lane-released',
+          jobId: releasedJobId,
+          payload: {
+            worktree_id: worktreeId,
+            rule_id: 'sweep-ack',
+            by: 'silas',
+            branch_disposition: result.branch,
+          },
+        });
+      }
+    }
     // The answer payload: status, the FULL process list when paused (the
     // human acknowledges against it), the ask note, the preserve record.
     json(res, 200, result);

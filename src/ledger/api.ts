@@ -749,6 +749,12 @@ export interface PendingRebriefRecord {
    * carried an explicit completion intent (host-owned identity; the
    * delivery event must carry it). Null = ordinary re-brief. */
   readonly phaseId: string | null;
+  /** Firing-rule provenance (issue #117): the named Silas rule this
+   * re-brief answers (e.g. verdict-rung-rebrief) and the round it
+   * consumed. The silas.rebrief receipt replays both — restart-safe,
+   * because the marker is the durable request. */
+  readonly ruleId: string | null;
+  readonly sourceRoundId: string | null;
   readonly requestedAt: string;
 }
 
@@ -2849,8 +2855,18 @@ export class LedgerApi {
     briefing: string | null;
     /** Explicit completion intent; omitted = ordinary re-brief (no phase). */
     handoff?: CompletionHandoffIntent;
+    /** Firing-rule provenance (issue #117): the named Silas rule and the
+     * round it consumes. Persisted in the marker payload so the receipt
+     * carries them even when a restart replays the request. */
+    ruleId?: string;
+    sourceRoundId?: string;
   }): readonly PendingRebriefRecord[] {
-    const payload = JSON.stringify({ note: input.note, briefing: input.briefing });
+    const payload = JSON.stringify({
+      note: input.note,
+      briefing: input.briefing,
+      ...(input.ruleId !== undefined ? { rule_id: input.ruleId } : {}),
+      ...(input.sourceRoundId !== undefined ? { source_round_id: input.sourceRoundId } : {}),
+    });
     const payloadHash = createHash('sha256').update(payload).digest('hex');
     return this.transaction(() => {
       // The HTTP caller pre-checks, but admission is the boundary of
@@ -6730,9 +6746,9 @@ export class LedgerApi {
     if (!isPendingRebriefKind(kind)) {
       throw new Error(`pending_rebriefs row has unknown kind "${kind}"`);
     }
-    let payload: { note?: unknown; briefing?: unknown };
+    let payload: { note?: unknown; briefing?: unknown; rule_id?: unknown; source_round_id?: unknown };
     try {
-      payload = JSON.parse(str(row.payload)) as { note?: unknown; briefing?: unknown };
+      payload = JSON.parse(str(row.payload)) as { note?: unknown; briefing?: unknown; rule_id?: unknown; source_round_id?: unknown };
     } catch (error) {
       throw new Error(`pending_rebriefs row ${str(row.id)} payload is not valid JSON: ${String(error)}`);
     }
@@ -6747,6 +6763,8 @@ export class LedgerApi {
       agentId: nstr(row.agent_id),
       sessionFile: nstr(row.session_file),
       phaseId: nstr(row.phase_id),
+      ruleId: nstr(payload.rule_id),
+      sourceRoundId: nstr(payload.source_round_id),
       requestedAt: str(row.requested_at),
     };
   }
