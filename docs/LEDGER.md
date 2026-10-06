@@ -188,8 +188,10 @@ clear as the completed request they are, with no retirement audit. A
 malformed pair (missing kind or mismatched phase id, payload hash, or
 watermark) stays visible and escalates for repair instead of being
 completed or retired, even when terminal. A completed pair publishes
-`silas.rebrief-settled` after its markers clear; retirement and escalation
-do not publish settlement. The boot summary's units are mixed by design:
+`silas.rebrief-settled` in the same transaction that clears its markers
+(a settlement failure rolls the clear back, so the next pass can still
+release the queued handoff); retirement and escalation do not publish
+settlement. The boot summary's units are mixed by design:
 `examined` counts markers while `completed`/`redispatched`/`retired` count
 jobs, so one retired
 marker pair reads `examined: 2 … retired: 1` — not a partial failure. A
