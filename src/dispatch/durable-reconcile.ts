@@ -9,6 +9,7 @@ import {
   type PhaseReconcileReport,
   type UnmarkedReconcileReport,
 } from './obligations.js';
+import { REPORT_BACKFILL_EVENT } from '../ledger/obligations.js';
 import { settleDirectivesFromEvidence, type DirectiveEvidenceReport } from './rebrief-recovery.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
@@ -20,6 +21,12 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  */
 const UNMARKED_DELIVERIES_SCOPE = 'unmarked-handback-deliveries';
 const UNMARKED_CARDS_SCOPE = 'unmarked-handback-cards';
+
+/** Durable round-robin cursors for the report-closure scans (issue #220):
+ * a persistently unresolved prefix must never hide older reports whose
+ * target merged or whose obligation open was lost. */
+const REPORT_BACKSTOP_SCOPE = 'report-obligation-backstop';
+const REPORT_SUPERSEDE_SCOPE = 'report-closure-supersede';
 
 /**
  * The bounded, non-LLM durable reconciliation pass (issue #163).
@@ -66,8 +73,10 @@ export interface DurableReconcileBudget {
   readonly phaseMaxPages?: number;
   /** Unmarked hand-back candidates per pass and window. Default 100. */
   readonly handbackLimit?: number;
-  /** Report-closure candidates per pass. Default 100. */
+  /** Report-closure page size (rows per scan page). Default 200. */
   readonly reportLimit?: number;
+  /** Report-closure pages per scan per tick. Default 4. */
+  readonly reportMaxPages?: number;
 }
 
 export interface DurableReconcileReport extends Record<string, unknown> {
@@ -88,15 +97,17 @@ export interface DurableReconcileReport extends Record<string, unknown> {
   readonly failures: number;
 }
 
-/** Issue #220 auto-supersede scan result. `examined` counts delivered
- * report-type jobs carrying a target; `superseded` the durable retires;
- * `opened` the handbacks whose obligation open the crash backstop
- * recovered; `failed` rows that threw (retried next pass — a partial pass
- * is never reported as fully reconciled). */
+/** Issue #220 report-closure scan result. `examined` counts delivered
+ * report-type jobs visited; `superseded` the durable retires; `opened`
+ * the handbacks whose obligation open the crash backstop recovered;
+ * `published` the action-required cards newly posted; `failed` rows that
+ * threw (retried next pass — a partial pass is never reported as fully
+ * reconciled). */
 export interface ReportClosureReport extends Record<string, unknown> {
   readonly examined: number;
   readonly superseded: number;
   readonly opened: number;
+  readonly published: number;
   readonly failed: number;
 }
 
@@ -130,7 +141,10 @@ export function reconcileDurableWork(
     scope: UNMARKED_CARDS_SCOPE,
     cursor: handbacks.cardsCursor ?? 0,
   });
-  const reports = reconcileReportClosures(deps, { limit: budget.reportLimit ?? 100 });
+  const reports = reconcileReportClosures(deps, {
+    pageSize: budget.reportLimit ?? 200,
+    ...(budget.reportMaxPages !== undefined ? { maxPages: budget.reportMaxPages } : {}),
+  });
   const failures = directives.failed + phases.failed + handbacks.failed + reports.failed;
   return {
     ok: failures === 0,
@@ -147,76 +161,153 @@ export function reconcileDurableWork(
       handbacks.recovered +
       handbacks.published +
       reports.superseded +
-      reports.opened,
+      reports.opened +
+      reports.published,
     failures,
   };
 }
 
 /**
- * Report-job auto-supersede (issue #220): a delivered report-type job's
- * findings die with their target. When the ledger proves the target PR
- * merged, or its head moved past the reviewed sha, the commissioner's
- * owed disposition is retired mechanically — obligation settled as
- * superseded, `report.superseded` recorded, job delivered → done — before
- * any LLM wake. Ledger-only, no filesystem probing: merge reads the
- * source job's terminal status or its `github.pr-merged` receipt; a moved
- * head reads the source job's `github.branch-state` observations (the
- * reviewed sha must be an OBSERVED predecessor of a different latest sha
- * — an unobserved target retires nothing and stays with the commissioner).
+ * Report-job closure (issue #220): handback debt recovery, the
+ * commissioner's action-required card, and auto-supersede. Ledger-only,
+ * no filesystem probing.
+ *
+ *  1. BACKSTOP — a delivered report-type job whose handback lost its
+ *     obligation open (crash between the delivery event and the insert)
+ *     is re-opened from its own delivery event (idempotent). Legacy NULL
+ *     rows are deliberately excluded: the backfill CLI owns those and the
+ *     owner reviews its dry-run list before anything writes.
+ *  2. CARD — every LIVE report obligation (not one the backfill already
+ *     surfaced to the owner via its dry-run list) gets ONE stable-kind
+ *     action-required card, deduped across passes and restarts.
+ *  3. SUPERSEDE — the findings die with their target: when the ledger
+ *     proves the target PR merged, or its head moved past the reviewed
+ *     sha, the owed disposition retires mechanically (obligation settled
+ *     as superseded, `report.superseded` recorded, job delivered → done)
+ *     before any LLM wake.
+ *
+ *     The moved-head proof is LEDGER-OBSERVABLE ONLY: the reviewed sha
+ *     must have been observed as branch state, and the latest observation
+ *     must differ. That cannot distinguish a forward push from a
+ *     force-push rewind — the ledger holds no ancestry graph — so the
+ *     pass states the rule it can prove rather than probing repositories
+ *     from the deterministic path.
+ *
+ * Both scans keyset-page by rowid under durable round-robin cursors, so
+ * an unchanged prefix never starves older rows; the cursors reset on the
+ * tail so re-observations start over.
  */
 export function reconcileReportClosures(
   deps: DurableReconcileDeps,
-  budget: { limit?: number } = {},
+  budget: { pageSize?: number; maxPages?: number } = {},
 ): ReportClosureReport {
+  const pageSize = budget.pageSize ?? 200;
+  const maxPages = Math.max(1, budget.maxPages ?? 4);
   let superseded = 0;
   let failed = 0;
   let examined = 0;
   let opened = 0;
-  // Crash-window backstop FIRST: a delivered report-type job whose handback
-  // lost its obligation open (crash between the delivery event and the
-  // obligation insert) has NO owner of its settlement. Re-open it from the
-  // delivery event — idempotent, so a live debt coalesces. Legacy rows
-  // (deliverable NULL) are deliberately excluded: the backfill CLI owns
-  // those and the owner reviews its dry-run list before anything writes.
-  for (const job of deps.ledger.listDeliveredReportJobs(budget.limit ?? 100)) {
-    examined += 1;
-    try {
-      const active = deps.ledger.findReportObligation(job.id);
-      if (active !== null && (active.state === 'open' || active.state === 'waiting' || active.state === 'suspended')) continue;
-      const delivered = deps.ledger.latestJobEvent(job.id, 'job.delivered');
-      if (delivered === null) {
+  let published = 0;
+
+  // (1+2) Backstop + card, paged under a durable cursor.
+  let backstopCursor = deps.ledger.readReconcileCursor(REPORT_BACKSTOP_SCOPE) ?? 0;
+  for (let page = 0; page < maxPages; page += 1) {
+    const rows = deps.ledger.listDeliveredReportJobs(pageSize, { cursor: backstopCursor });
+    if (rows.length === 0) {
+      backstopCursor = 0;
+      break;
+    }
+    for (const job of rows) {
+      examined += 1;
+      try {
+        let active = deps.ledger.findReportObligation(job.id);
+        if (active === null || (active.state !== 'open' && active.state !== 'waiting' && active.state !== 'suspended')) {
+          const delivered = deps.ledger.latestJobEvent(job.id, 'job.delivered');
+          if (delivered === null) {
+            failed += 1;
+            deps.log?.('error', 'delivered report job has no delivery event — cannot open its obligation', { job: job.id });
+            continue;
+          }
+          const result = deps.ledger.openReportObligation({ jobId: job.id, observedAtSeq: delivered.seq });
+          active = result.obligation;
+          if (result.created) opened += 1;
+        }
+        // The card: live debts only. A backfilled debt was surfaced to the
+        // owner as a dry-run row before --apply, so carding it here would
+        // page the owner once per legacy row.
+        if ((active.state === 'open' || active.state === 'waiting') &&
+            deps.ledger.latestJobEvent(job.id, REPORT_BACKFILL_EVENT) === null) {
+          const notificationKind = `silas.report-handback.${job.id}`;
+          if (deps.ledger.findNotificationByKind(notificationKind, 'any') === null) {
+            deps.notifications.postIncident({
+              kind: notificationKind,
+              routing: 'action-required',
+              severity: 'info',
+              title: `${job.deliverable} report handback on ${job.id} — disposition owed`,
+              detail:
+                `Commissioner ${job.commissioner ?? 'gru'} owes one disposition for the delivered ` +
+                `${job.deliverable} report (obligation ${active.id}): acted (route the findings as a directive ` +
+                'to the target lane), dismissed (with a reason), or superseded. The target is ' +
+                `${job.targetRef ?? 'unrecorded'}.`,
+              dedupe: 'unacked',
+            });
+            published += 1;
+          }
+        }
+      } catch (error) {
         failed += 1;
-        deps.log?.('error', 'delivered report job has no delivery event — cannot open its obligation', { job: job.id });
-        continue;
+        deps.log?.('error', 'report obligation backstop failed', {
+          job: job.id,
+          error: String(error).slice(0, 300),
+        });
       }
-      const result = deps.ledger.openReportObligation({ jobId: job.id, observedAtSeq: delivered.seq });
-      if (result.created) opened += 1;
-    } catch (error) {
-      failed += 1;
-      deps.log?.('error', 'report obligation backstop failed', {
-        job: job.id,
-        error: String(error).slice(0, 300),
-      });
     }
-  }
-  for (const job of deps.ledger.listReportClosureCandidates(budget.limit ?? 100)) {
-    try {
-      const target = job.targetRef ?? '';
-      const source = deps.ledger.findJobByPrUrl(target);
-      if (source === null || source.id === job.id) continue; // unobservable target — the commissioner keeps the debt
-      const reason = reportSupersedeReason(deps, job.targetSha ?? '', source);
-      if (reason === null) continue;
-      deps.ledger.supersedeReportObligation({ jobId: job.id, reason });
-      superseded += 1;
-    } catch (error) {
-      failed += 1;
-      deps.log?.('error', 'report auto-supersede failed', {
-        job: job.id,
-        error: String(error).slice(0, 300),
-      });
+    const last = rows[rows.length - 1];
+    const rowid = last === undefined ? null : deps.ledger.jobRowid(last.id);
+    if (rowid === null || rows.length < pageSize) {
+      backstopCursor = 0;
+      break;
     }
+    backstopCursor = rowid;
   }
-  return { examined, superseded, opened, failed };
+  deps.ledger.writeReconcileCursor({ scope: REPORT_BACKSTOP_SCOPE, cursor: backstopCursor });
+
+  // (3) Auto-supersede, paged under its own durable cursor.
+  let supersedeCursor = deps.ledger.readReconcileCursor(REPORT_SUPERSEDE_SCOPE) ?? 0;
+  for (let page = 0; page < maxPages; page += 1) {
+    const rows = deps.ledger.listReportClosureCandidates(pageSize, { cursor: supersedeCursor });
+    if (rows.length === 0) {
+      supersedeCursor = 0;
+      break;
+    }
+    for (const job of rows) {
+      try {
+        const target = job.targetRef ?? '';
+        const source = deps.ledger.findJobByPrUrl(target);
+        if (source === null || source.id === job.id) continue; // unobservable target — the commissioner keeps the debt
+        const reason = reportSupersedeReason(deps, job.targetSha ?? '', source);
+        if (reason === null) continue;
+        deps.ledger.supersedeReportObligation({ jobId: job.id, reason });
+        superseded += 1;
+      } catch (error) {
+        failed += 1;
+        deps.log?.('error', 'report auto-supersede failed', {
+          job: job.id,
+          error: String(error).slice(0, 300),
+        });
+      }
+    }
+    const last = rows[rows.length - 1];
+    const rowid = last === undefined ? null : deps.ledger.jobRowid(last.id);
+    if (rowid === null || rows.length < pageSize) {
+      supersedeCursor = 0;
+      break;
+    }
+    supersedeCursor = rowid;
+  }
+  deps.ledger.writeReconcileCursor({ scope: REPORT_SUPERSEDE_SCOPE, cursor: supersedeCursor });
+
+  return { examined, superseded, opened, published, failed };
 }
 
 /** The durable supersede reason for a report's target, or null when the

@@ -1154,7 +1154,7 @@ describe('report-job closure (issue #220)', () => {
     const { api, db, dir } = freshDb();
     try {
       deliveredReportJob(api, 'rep-acted', { targetRef: 'https://x/pull/2', targetSha: 's1' });
-      api.addJob({ id: 'directive-1', repo: 'r', title: 'fix lane', briefing: 'fix' });
+      api.addJob({ id: 'directive-1', repo: 'fixture-app', title: 'fix lane', briefing: 'fix' });
       const result = api.settleReportDisposition({
         jobId: 'rep-acted', outcome: 'acted', directiveJobId: 'directive-1', by: 'gru',
       });
@@ -1237,6 +1237,84 @@ describe('report-job closure (issue #220)', () => {
       expect(api.listReportClosureCandidates().map((job) => job.id)).toEqual([]);
       // A second auto-supersede hits the status guard — the lane is done.
       expect(() => api.supersedeReportObligation({ jobId: 'rep-auto', reason: 'again' })).toThrow(/DELIVERED report/);
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('findReportObligation survives a long obligation history (no 200-row page dependency)', () => {
+    const { api, db, dir } = freshDb();
+    try {
+      deliveredReportJob(api, 'rep-buried', { targetRef: 'https://x/pull/8', targetSha: 's1' });
+      // 250 unrelated live obligations precede the report obligation in row
+      // order; a page-limited scan would never reach it.
+      for (let i = 0; i < 250; i += 1) {
+        api.recordBlockedObservation('rep-buried', {
+          logicalStep: 'operation',
+          category: { kind: 'unknown' },
+          incidentKey: `noise-${i}`,
+          observedAtSeq: i + 1,
+        });
+      }
+      const found = api.findReportObligation('rep-buried');
+      expect(found?.incidentKey).toBe('report:rep-buried');
+      expect(found?.state).toBe('open');
+      // And the disposition still settles it.
+      const settled = api.settleReportDisposition({ jobId: 'rep-buried', outcome: 'dismissed', note: 'covered' });
+      expect(settled.job.status).toBe('done');
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('acted refuses a directive job from another repository', () => {
+    const { api, db, dir } = freshDb();
+    try {
+      deliveredReportJob(api, 'rep-repo-guard', { targetRef: 'https://x/pull/9', targetSha: 's1' });
+      api.addJob({ id: 'elsewhere-job', repo: 'another-repo', title: 't', briefing: 'b' });
+      expect(() =>
+        api.settleReportDisposition({ jobId: 'rep-repo-guard', outcome: 'acted', directiveJobId: 'elsewhere-job' }),
+      ).toThrow(/another repository|belongs to repo/);
+      // The lane is untouched — still delivered, obligation still open.
+      expect(api.getJob('rep-repo-guard')?.status).toBe('delivered');
+      expect(api.findReportObligation('rep-repo-guard')?.state).toBe('open');
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('applyReportBackfill refuses a stale plan on a changed row and requires delivery evidence', () => {
+    const { api, db, dir } = freshDb();
+    try {
+      // A legacy delivered lane...
+      api.addJob({ id: 'legacy-guard', repo: 'r', title: 't', briefing: 'review this' });
+      api.setJobStatus('legacy-guard', 'working');
+      api.setJobStatus('legacy-guard', 'delivered');
+      api.appendCustomEvent({ kind: 'job.delivered', jobId: 'legacy-guard', payload: { sha: 'h1' } });
+      // ...that registered a PR after the plan was computed: the stale
+      // proposal must be a no-op, never stamping over live truth.
+      api.setJobPr('legacy-guard', 'https://github.com/o/r/pull/77');
+      const stale = api.applyReportBackfill({
+        jobId: 'legacy-guard', deliverable: 'review', outcome: 'obligation-opened', reason: 'stale plan',
+      });
+      expect(stale.applied).toBe(false);
+      expect(api.getJob('legacy-guard')?.deliverable).toBeNull();
+      expect(api.latestJobEvent('legacy-guard', 'report.backfilled')).toBeNull();
+
+      // A row whose handback has no delivery event fails loud instead of
+      // vanishing into stamped-invisible debt.
+      api.addJob({ id: 'legacy-no-evidence', repo: 'r', title: 't', briefing: 'review this' });
+      api.setJobStatus('legacy-no-evidence', 'working');
+      api.setJobStatus('legacy-no-evidence', 'delivered');
+      expect(() =>
+        api.applyReportBackfill({
+          jobId: 'legacy-no-evidence', deliverable: 'review', outcome: 'obligation-opened', reason: 'no evidence',
+        }),
+      ).toThrow(/no job.delivered event/);
+      expect(api.getJob('legacy-no-evidence')?.deliverable).toBeNull();
     } finally {
       db.close();
       rmSync(dir, { recursive: true, force: true });

@@ -35,6 +35,7 @@ import type { FollowThroughNotifications } from '../src/dispatch/obligations.js'
 import { FIRING_RULES } from '../src/ledger/obligations.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb, MIGRATIONS } from '../src/ledger/db.js';
+import { NotificationCenter } from '../src/notifications/center.js';
 import { BRANCH_STATE_EVENT } from '../src/dispatch/github-poll.js';
 import { DEFAULT_SILAS_CONFIG } from '../src/config.js';
 import type { AgentCapabilities, AgentHandle, RuntimeEvent } from '../src/runtime/types.js';
@@ -4517,13 +4518,20 @@ describe('silas deterministic pass observation (issue #163)', () => {
 
 describe('report-job auto-supersede in the deterministic pass (issue #220)', () => {
   /** The EXACT production hook: the deterministic pass main.ts wires. */
-  function makeDriverWithProductionPass(h: Harness): ReturnType<typeof makeDriver> {
-    const notifications: FollowThroughNotifications = {
-      postIncident: () => ({ id: 'notice' }),
-    };
+  function makeDriverWithProductionPass(
+    h: Harness,
+    opts: { notifications?: FollowThroughNotifications; budget?: { reportLimit?: number; reportMaxPages?: number } } = {},
+  ): ReturnType<typeof makeDriver> {
+    const notifications: FollowThroughNotifications =
+      opts.notifications ?? { postIncident: () => ({ id: 'notice' }) };
     return makeDriver({
       harness: h,
-      onDeterministicPass: (context) => createDurableReconcileHook({ ledger: h.ledger, notifications })(context),
+      onDeterministicPass: (context) =>
+        createDurableReconcileHook({
+          ledger: h.ledger,
+          notifications,
+          ...(opts.budget !== undefined ? { budget: opts.budget } : {}),
+        })(context),
     });
   }
 
@@ -4669,6 +4677,85 @@ describe('report-job auto-supersede in the deterministic pass (issue #220)', () 
       expect(h.ledger.listObligations({ jobId: 'report-lost-open' })).toHaveLength(1);
       expect(h.ledger.listObligations({ jobId: 'legacy-null-row' })).toHaveLength(0);
       expect(h.ledger.getJob('legacy-null-row')?.deliverable).toBeNull();
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('the supersede scan keyset-pages under a durable cursor: a tail candidate is reached on the next pass', async () => {
+    const h0 = makeLedger();
+    const h = makeDriverWithProductionPass(h0, { budget: { reportLimit: 2, reportMaxPages: 1 } });
+    try {
+      // Three unresolved report candidates; only the THIRD (newest) has a
+      // merged source. With a two-row page per pass, pass 1 cannot see it —
+      // the durable cursor must resume past the examined prefix.
+      const first = seedReportWithTarget(h.ledger, {
+        prUrl: 'https://git.example.invalid/o/r/pull/41',
+        reviewedSha: 'reviewed-41',
+      });
+      const second = seedReportWithTarget(h.ledger, {
+        prUrl: 'https://git.example.invalid/o/r/pull/42',
+        reviewedSha: 'reviewed-42',
+      });
+      h.ledger.appendCustomEvent({ kind: 'github.branch-state', jobId: first.sourceJobId, payload: { sha: 'reviewed-41' } });
+      h.ledger.appendCustomEvent({ kind: 'github.branch-state', jobId: second.sourceJobId, payload: { sha: 'reviewed-42' } });
+      const third = seedReportWithTarget(h.ledger, {
+        prUrl: 'https://git.example.invalid/o/r/pull/43',
+        reviewedSha: 'reviewed-43',
+      });
+      h.ledger.setJobStatus(third.sourceJobId, 'in-review');
+      h.ledger.setJobStatus(third.sourceJobId, 'merged');
+
+      await h.driver.trigger({ kind: 'sweep' });
+      // Pass 1 examined the first page only: the merged tail survives.
+      expect(h.ledger.getJob(third.reportJobId)?.status).toBe('delivered');
+
+      await h.driver.trigger({ kind: 'sweep' });
+      // Pass 2 resumed past the prefix and retired the tail.
+      expect(h.ledger.getJob(third.reportJobId)?.status).toBe('done');
+      expect(h.ledger.latestJobEvent(third.reportJobId, 'report.superseded')).not.toBeNull();
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a live handback posts ONE action-required card; a backfilled debt posts none; repeats dedupe', async () => {
+    const h0 = makeLedger();
+    const posts: { kind: string; routing: string; title: string }[] = [];
+    const center = new NotificationCenter({ ledger: h0.ledger, bus: h0.bus });
+    const h = makeDriverWithProductionPass(h0, {
+      notifications: {
+        postIncident: (input) => {
+          posts.push({ kind: input.kind, routing: input.routing, title: input.title });
+          return center.postIncident(input);
+        },
+      },
+    });
+    try {
+      const live = seedReportWithTarget(h.ledger, {
+        prUrl: 'https://git.example.invalid/o/r/pull/44',
+        reviewedSha: 'reviewed-44',
+      });
+      // A backfilled debt: delivered + obligation, already surfaced to the
+      // owner in the dry-run list — never carded.
+      const backfilled = seedReportWithTarget(h.ledger, {
+        prUrl: 'https://git.example.invalid/o/r/pull/45',
+        reviewedSha: 'reviewed-45',
+      });
+      h.ledger.appendCustomEvent({
+        kind: 'report.backfilled',
+        jobId: backfilled.reportJobId,
+        payload: { outcome: 'obligation-opened' },
+      });
+
+      await h.driver.trigger({ kind: 'sweep' });
+      await h.driver.trigger({ kind: 'sweep' });
+
+      const cards = posts.filter((post) => post.kind.startsWith('silas.report-handback.'));
+      expect(cards).toHaveLength(1);
+      expect(cards[0]?.kind).toBe(`silas.report-handback.${live.reportJobId}`);
+      expect(cards[0]?.routing).toBe('action-required');
+      expect(h.ledger.findNotificationByKind(`silas.report-handback.${backfilled.reportJobId}`, 'any')).toBeNull();
     } finally {
       h.cleanup();
     }

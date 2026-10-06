@@ -102,25 +102,79 @@ export function prUrlNumber(url: string): number | null {
   return match === null ? null : Number(match[1]);
 }
 
+/** The repository name a PR url points at (`.../mssoka/gru-command/pull/1`
+ * → `gru-command`), or null. Repository identity joins the PR number in
+ * the sibling key: PR #31 in another repository must never supersede this
+ * repo's report. */
+export function prUrlRepo(url: string): string | null {
+  const match = url.match(/\/([^/]+)\/pull\/\d{1,9}(?:$|[/?#])/);
+  const repo = match?.[1];
+  return repo === undefined ? null : repo.toLowerCase();
+}
+
+/** The keyset page size the planner reads legacy rows with — it pages
+ * until exhausted, so an owner-list prefix of any size cannot hide older
+ * classifiable rows from the dry run. */
+const LEGACY_SCAN_PAGE = 1000;
+
+/** One sibling-index key: repository + PR number. */
+function prKey(repo: string, number: number): string {
+  return `${repo.toLowerCase()}##${number}`;
+}
+
+/** True when a job looks like a report lane: an explicit non-PR
+ * deliverable, or a legacy id/briefing the classifier recognizes. Only
+ * report-shaped siblings can supersede an older report — a later
+ * implementation or administrative job sharing the PR is not a
+ * re-review. */
+function isReportShaped(job: JobRecord): boolean {
+  if (job.deliverable !== null && job.deliverable !== 'pr') return true;
+  if (job.deliverable !== null) return false;
+  return classifyLegacyReportJob(job.id, job.briefing) !== null;
+}
+
 /**
  * Plan the backfill over the ledger's legacy scan set. Reads only — safe
- * on a live instance, safe to re-run.
+ * on a live instance, safe to re-run. The legacy scan is fully paged:
+ * every eligible row reaches the dry run.
  */
-export function planLegacyReportBackfill(ledger: Pick<LedgerApi, 'listLegacyDeliveredJobs' | 'listJobs'>): BackfillPlan {
-  // pr number → jobs carrying that PR, so merge/re-supersede evidence is
-  // one map lookup per proposal (the scan set is small; the CLI is a
-  // bounded batch, not a hot path).
-  const jobsByPr = new Map<number, JobRecord[]>();
-  for (const job of ledger.listJobs()) {
-    if (job.prUrl === null) continue;
-    const number = prUrlNumber(job.prUrl);
-    if (number === null) continue;
-    const bucket = jobsByPr.get(number) ?? [];
+export function planLegacyReportBackfill(
+  ledger: Pick<LedgerApi, 'listLegacyDeliveredJobs' | 'listJobs'>,
+  opts: { pageSize?: number } = {},
+): BackfillPlan {
+  // repo+pr number → jobs carrying that PR, so merge/re-supersede evidence
+  // is one map lookup per proposal. Both the job's own PR (`prUrl`) and a
+  // report's reviewed target (`targetRef`) index: a newer REVIEW job
+  // carries its target in targetRef, never as its own PR.
+  const jobsByPr = new Map<string, JobRecord[]>();
+  const index = (url: string | null, job: JobRecord): void => {
+    if (url === null) return;
+    const number = prUrlNumber(url);
+    const repo = prUrlRepo(url);
+    if (number === null || repo === null) return;
+    const key = prKey(repo, number);
+    const bucket = jobsByPr.get(key) ?? [];
     bucket.push(job);
-    jobsByPr.set(number, bucket);
+    jobsByPr.set(key, bucket);
+  };
+  for (const job of ledger.listJobs()) index(job.prUrl, job);
+  for (const job of ledger.listJobs()) index(job.targetRef, job);
+
+  const legacy: JobRecord[] = [];
+  const pageSize = opts.pageSize ?? LEGACY_SCAN_PAGE;
+  let cursor: number | undefined;
+  for (;;) {
+    const page = ledger.listLegacyDeliveredJobs(pageSize, cursor === undefined ? {} : { cursor });
+    legacy.push(...page);
+    if (page.length < pageSize) break;
+    const last = page[page.length - 1];
+    const rowid = last === undefined ? null : legacyJobRowid(ledger, last.id);
+    if (rowid === null) break;
+    cursor = rowid;
   }
+
   const proposals: BackfillProposal[] = [];
-  for (const job of ledger.listLegacyDeliveredJobs()) {
+  for (const job of legacy) {
     const classified = classifyLegacyReportJob(job.id, job.briefing);
     if (classified === null) {
       proposals.push({
@@ -134,40 +188,36 @@ export function planLegacyReportBackfill(ledger: Pick<LedgerApi, 'listLegacyDeli
       continue;
     }
     const prNumber = legacyJobPrNumber(job.id);
-    const siblings = prNumber === null ? [] : (jobsByPr.get(prNumber) ?? []);
+    const siblings =
+      prNumber === null ? [] : (jobsByPr.get(prKey(job.repo, prNumber)) ?? []).filter((candidate) => candidate.id !== job.id);
     // Provable supersede (a): the target PR merged. The PR number comes
-    // from the job id; the merge fact from the job that carried the PR.
-    const merged = siblings.find(
-      (candidate) =>
-        candidate.id !== job.id &&
-        (candidate.status === 'merged' ||
-          candidate.status === 'done' ||
-          (candidate.prUrl !== null && prUrlNumber(candidate.prUrl) === prNumber)),
-    );
-    if (prNumber !== null && siblings.some((candidate) => candidate.id !== job.id && candidate.status === 'merged')) {
+    // from the job id; the merge fact from the job that carried the PR in
+    // the SAME repository.
+    const merged = siblings.find((candidate) => candidate.status === 'merged');
+    if (prNumber !== null && merged !== undefined) {
       proposals.push({
         job,
         outcome: 'superseded',
         deliverable: classified.deliverable,
-        reason: `target PR #${prNumber} merged (job ${merged?.id ?? '—'}) — the findings can no longer apply`,
-        targetRef: merged?.prUrl ?? null,
+        reason: `target PR #${prNumber} merged (job ${merged.id}) — the findings can no longer apply`,
+        targetRef: merged.prUrl ?? null,
         targetSha: null,
       });
       continue;
     }
-    // Provable supersede (b): a NEWER report already covers the same
-    // target (same PR number, later creation) — the older findings were
-    // superseded by re-review.
+    // Provable supersede (b): a NEWER REPORT-SHAPED job already covers the
+    // same repo+PR (later creation) — the older findings were superseded
+    // by re-review. A later implementation lane is NOT evidence.
     const newer = siblings
-      .filter((candidate) => candidate.id !== job.id && candidate.createdAt > job.createdAt)
+      .filter((candidate) => candidate.createdAt > job.createdAt && isReportShaped(candidate))
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt))[0];
     if (prNumber !== null && newer !== undefined) {
       proposals.push({
         job,
         outcome: 'superseded',
         deliverable: classified.deliverable,
-        reason: `a newer job for PR #${prNumber} exists (${newer.id}, created ${newer.createdAt}) — this report was superseded by re-review`,
-        targetRef: newer.prUrl,
+        reason: `a newer report job for PR #${prNumber} exists (${newer.id}, created ${newer.createdAt}) — this report was superseded by re-review`,
+        targetRef: newer.targetRef ?? newer.prUrl,
         targetSha: null,
       });
       continue;
@@ -187,6 +237,14 @@ export function planLegacyReportBackfill(ledger: Pick<LedgerApi, 'listLegacyDeli
     obligationOpened: proposals.filter((proposal) => proposal.outcome === 'obligation-opened').length,
     ownerList: proposals.filter((proposal) => proposal.outcome === 'owner-list').length,
   };
+}
+
+/** The planner only needs the rowid anchor for paging; the ledger exposes
+ * it for obligations through `obligationRowid` and for jobs here. The
+ * optional method keeps test doubles that pre-date the cursor contract
+ * usable (a page shorter than the limit always terminates the scan). */
+function legacyJobRowid(ledger: Pick<LedgerApi, 'listLegacyDeliveredJobs' | 'listJobs'> & { jobRowid?(id: string): number | null }, id: string): number | null {
+  return ledger.jobRowid === undefined ? null : ledger.jobRowid(id);
 }
 
 /**

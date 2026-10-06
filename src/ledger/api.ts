@@ -5048,8 +5048,8 @@ export class LedgerApi {
           nextAction: {
             kind: 'gru-decision',
             decision:
-              `settle the ${job.deliverable} report handback: disposition acted (route findings as a directive), ` +
-              'dismissed (with a reason), or superseded',
+              `commissioner ${job.commissioner ?? 'gru'} owes the ${job.deliverable} report disposition: ` +
+              'acted (route findings as a directive), dismissed (with a reason), or superseded',
           },
           description:
             input.note ??
@@ -5088,13 +5088,25 @@ export class LedgerApi {
 
   /** The job's report-closure obligation — the live incarnation when one
    * is open, else the newest row in any state (history for audits), else
-   * null. */
+   * null. Direct indexed queries: a long obligation history (page 200+)
+   * must never hide the live debt from a disposition. */
   findReportObligation(jobId: string): ObligationRecord | null {
-    const rows = this.listObligations({ jobId });
     const incident = reportIncidentKey(jobId);
-    const matching = rows.filter((row) => row.incidentKey === incident);
-    return matching.find((row) => row.state === 'open' || row.state === 'waiting' || row.state === 'suspended') ??
-      matching.at(-1) ?? null;
+    const active = this.db
+      .prepare(
+        `SELECT * FROM job_obligations
+          WHERE job_id = ? AND incident_key = ?
+            AND state IN ('open', 'waiting', 'suspended')
+          ORDER BY rowid DESC LIMIT 1`,
+      )
+      .get(jobId, incident) as Row | undefined;
+    if (active !== undefined) return this.obligationFromRow(active);
+    const newest = this.db
+      .prepare(
+        'SELECT * FROM job_obligations WHERE job_id = ? AND incident_key = ? ORDER BY rowid DESC LIMIT 1',
+      )
+      .get(jobId, incident) as Row | undefined;
+    return newest === undefined ? null : this.obligationFromRow(newest);
   }
 
   /** The commissioner settles a delivered report: ONE transaction records
@@ -5130,8 +5142,15 @@ export class LedgerApi {
         if (input.directiveJobId === undefined || input.directiveJobId.trim() === '') {
           throw new Error('disposition acted requires directive_job_id — findings route as a directive to the target lane');
         }
-        if (this.getJob(input.directiveJobId) === null) {
+        const directive = this.getJob(input.directiveJobId);
+        if (directive === null) {
           throw new RecordNotFound(`directive job "${input.directiveJobId}" not found — route findings to a real job`);
+        }
+        if (directive.repo !== job.repo) {
+          throw new Error(
+            `directive job "${directive.id}" belongs to repo "${directive.repo}", but the report reviewed "${job.repo}" — ` +
+              'route findings to the target lane, not another repository',
+          );
         }
       } else if (note === '') {
         throw new Error(`disposition ${input.outcome} requires a non-empty note (the recorded reason)`);
@@ -5212,40 +5231,52 @@ export class LedgerApi {
     });
   }
 
-  /** The auto-supersede scan set, straight from SQL (bounded): delivered
-   * report-type jobs carrying a target. Legacy NULL-deliverable rows and
-   * PR-owing lanes never appear — the backfill owns the former, and a PR
-   * lane's merge path is the machine's, not this pass's. */
-  listReportClosureCandidates(limit = 200): readonly JobRecord[] {
+  /** One job's rowid (keyset pagination anchor). */
+  jobRowid(id: string): number | null {
+    const row = this.db.prepare('SELECT rowid AS _rowid FROM jobs WHERE id = ?').get(id) as Row | undefined;
+    return row === undefined ? null : Number(row._rowid);
+  }
+
+  /** The auto-supersede scan set, straight from SQL: delivered report-type
+   * jobs carrying a target (the reviewed sha is optional — a merged target
+   * needs only the PR url). Legacy NULL-deliverable rows and PR-owing
+   * lanes never appear — the backfill owns the former, and a PR lane's
+   * merge path is the machine's, not this pass's. Keyset-paged by rowid
+   * (`cursor`) so a persistently unchanged prefix cannot starve the tail:
+   * the caller resumes past the last examined row on its next pass. */
+  listReportClosureCandidates(limit = 200, opts: { cursor?: number } = {}): readonly JobRecord[] {
     if (!Number.isSafeInteger(limit) || limit < 1) {
       throw new Error(`listReportClosureCandidates requires a positive integer limit, got ${String(limit)}`);
     }
     const placeholders = REPORT_DELIVERABLES.map(() => '?').join(', ');
+    const cursorClause = opts.cursor !== undefined ? 'AND rowid > ?' : '';
     const rows = this.db
       .prepare(
         `SELECT * FROM jobs WHERE status = 'delivered' AND deliverable IN (${placeholders})
-           AND target_ref IS NOT NULL AND target_sha IS NOT NULL
-         ORDER BY updated_at DESC, id LIMIT ?`,
+           AND target_ref IS NOT NULL ${cursorClause}
+         ORDER BY rowid LIMIT ?`,
       )
-      .all(...REPORT_DELIVERABLES, limit) as Row[];
+      .all(...REPORT_DELIVERABLES, ...(opts.cursor !== undefined ? [opts.cursor] : []), limit) as Row[];
     return rows.map((row) => this.jobFromRow(row));
   }
 
   /** Every delivered report-type job with its kind RECORDED — the
    * deterministic pass's crash-window backstop set for a lost obligation
    * open. Legacy NULL rows are excluded by construction: the backfill CLI
-   * owns them and the owner reviews its dry-run first. */
-  listDeliveredReportJobs(limit = 200): readonly JobRecord[] {
+   * owns them and the owner reviews its dry-run first. Same keyset paging
+   * contract as the supersede scan. */
+  listDeliveredReportJobs(limit = 200, opts: { cursor?: number } = {}): readonly JobRecord[] {
     if (!Number.isSafeInteger(limit) || limit < 1) {
       throw new Error(`listDeliveredReportJobs requires a positive integer limit, got ${String(limit)}`);
     }
     const placeholders = REPORT_DELIVERABLES.map(() => '?').join(', ');
+    const cursorClause = opts.cursor !== undefined ? 'AND rowid > ?' : '';
     const rows = this.db
       .prepare(
-        `SELECT * FROM jobs WHERE status = 'delivered' AND deliverable IN (${placeholders})
-         ORDER BY updated_at DESC, id LIMIT ?`,
+        `SELECT * FROM jobs WHERE status = 'delivered' AND deliverable IN (${placeholders}) ${cursorClause}
+         ORDER BY rowid LIMIT ?`,
       )
-      .all(...REPORT_DELIVERABLES, limit) as Row[];
+      .all(...REPORT_DELIVERABLES, ...(opts.cursor !== undefined ? [opts.cursor] : []), limit) as Row[];
     return rows.map((row) => this.jobFromRow(row));
   }
 
@@ -5260,16 +5291,17 @@ export class LedgerApi {
   /** Legacy backfill (issue #220): the delivered, PR-less rows whose
    * deliverable was never recorded (pre-E19 lanes). The backfill CLI
    * classifies and proposes; only --apply writes. */
-  listLegacyDeliveredJobs(limit = 1000): readonly JobRecord[] {
+  listLegacyDeliveredJobs(limit = 1000, opts: { cursor?: number } = {}): readonly JobRecord[] {
     if (!Number.isSafeInteger(limit) || limit < 1) {
       throw new Error(`listLegacyDeliveredJobs requires a positive integer limit, got ${String(limit)}`);
     }
+    const cursorClause = opts.cursor !== undefined ? 'AND rowid > ?' : '';
     const rows = this.db
       .prepare(
-        `SELECT * FROM jobs WHERE status = 'delivered' AND pr_url IS NULL AND deliverable IS NULL
-         ORDER BY updated_at DESC, id LIMIT ?`,
+        `SELECT * FROM jobs WHERE status = 'delivered' AND pr_url IS NULL AND deliverable IS NULL ${cursorClause}
+         ORDER BY rowid LIMIT ?`,
       )
-      .all(limit) as Row[];
+      .all(...(opts.cursor !== undefined ? [opts.cursor] : []), limit) as Row[];
     return rows.map((row) => this.jobFromRow(row));
   }
 
@@ -5298,6 +5330,10 @@ export class LedgerApi {
       // together), so a replayed stale plan is a true no-op — no duplicate
       // audit event, no second obligation.
       if (this.latestJobEvent(job.id, REPORT_BACKFILL_EVENT) !== null) return { job, applied: false };
+      // The plan was computed on a changed row: a PR link or an explicit
+      // deliverable stamp (another actor got there first) means this is no
+      // longer a legacy row — never stamp over live truth with a stale plan.
+      if (job.prUrl !== null || job.deliverable !== null) return { job, applied: false };
       const stamp = (column: 'deliverable' | 'commissioner' | 'target_ref' | 'target_sha', value: string | null): void => {
         this.db.prepare(`UPDATE jobs SET ${column} = ?, updated_at = ? WHERE id = ? AND ${column} IS NULL`).run(value, nowIso(), job.id);
       };
@@ -5306,10 +5342,16 @@ export class LedgerApi {
       stamp('target_ref', input.targetRef ?? null);
       stamp('target_sha', input.targetSha ?? null);
       const current = this.getJob(job.id) as JobRecord;
+      // A delivered legacy row whose delivery event is missing has no
+      // handback to open an obligation from: fail loud and leave the row in
+      // the scan for the owner instead of stamping it into invisible debt.
       const latestDelivered = this.latestJobEvent(job.id, 'job.delivered');
-      if (latestDelivered !== null) {
-        this.openReportObligation({ jobId: job.id, observedAtSeq: latestDelivered.seq });
+      if (latestDelivered === null) {
+        throw new Error(
+          `job "${job.id}" is delivered with no job.delivered event — its handback is not proven; refusing to backfill`,
+        );
       }
+      this.openReportObligation({ jobId: job.id, observedAtSeq: latestDelivered.seq });
       this.appendEvent({
         kind: REPORT_BACKFILL_EVENT,
         jobId: job.id,

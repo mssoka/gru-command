@@ -101,7 +101,7 @@ describe('legacy report backfill plan and apply (issue #220)', () => {
       // The job that carried PR #31, now merged.
       h.api.addJob({ id: 'impl-pr31', repo: 'fixture-app', title: 't', briefing: 'b' });
       h.api.setJobStatus('impl-pr31', 'working');
-      h.api.setJobPr('impl-pr31', `https://github.com/o/r/pull/31`);
+      h.api.setJobPr('impl-pr31', `https://github.com/o/fixture-app/pull/31`);
       h.api.setJobStatus('impl-pr31', 'in-review');
       h.api.setJobStatus('impl-pr31', 'merged');
 
@@ -111,7 +111,7 @@ describe('legacy report backfill plan and apply (issue #220)', () => {
       // created_at, so the fixture lets the clock advance.)
       await new Promise((resolve) => setTimeout(resolve, 5));
       h.api.addJob({ id: 'job-pr32-review-edge-retry', repo: 'fixture-app', title: 't', briefing: 'b', deliverable: 'review' });
-      h.api.setJobPr('job-pr32-review-edge-retry', 'https://github.com/o/r/pull/32');
+      h.api.setJobPr('job-pr32-review-edge-retry', 'https://github.com/o/fixture-app/pull/32');
 
       const plan = planLegacyReportBackfill(h.api);
       const merged = plan.proposals.find((proposal) => proposal.job.id === 'job-pr31-review-blind');
@@ -119,7 +119,7 @@ describe('legacy report backfill plan and apply (issue #220)', () => {
       expect(merged?.reason).toContain('#31');
       const retried = plan.proposals.find((proposal) => proposal.job.id === 'job-pr32-review-edge');
       expect(retried?.outcome).toBe('superseded');
-      expect(retried?.reason).toContain('newer job');
+      expect(retried?.reason).toContain('newer report job');
     } finally {
       h.cleanup();
     }
@@ -131,7 +131,7 @@ describe('legacy report backfill plan and apply (issue #220)', () => {
       seedLegacyJob(h.api, 'job-pr33-review-lens');
       h.api.addJob({ id: 'impl-pr33', repo: 'fixture-app', title: 't', briefing: 'b' });
       h.api.setJobStatus('impl-pr33', 'working');
-      h.api.setJobPr('impl-pr33', 'https://github.com/o/r/pull/33');
+      h.api.setJobPr('impl-pr33', 'https://github.com/o/fixture-app/pull/33');
       h.api.setJobStatus('impl-pr33', 'in-review');
       h.api.setJobStatus('impl-pr33', 'merged');
       seedLegacyJob(h.api, 'verification-lane-9');
@@ -144,7 +144,7 @@ describe('legacy report backfill plan and apply (issue #220)', () => {
       // The merged-target lane: superseded end-to-end.
       expect(h.api.getJob('job-pr33-review-lens')?.deliverable).toBe('review');
       expect(h.api.getJob('job-pr33-review-lens')?.status).toBe('done');
-      expect(h.api.getJob('job-pr33-review-lens')?.targetRef).toBe('https://github.com/o/r/pull/33');
+      expect(h.api.getJob('job-pr33-review-lens')?.targetRef).toBe('https://github.com/o/fixture-app/pull/33');
       expect(h.api.listObligations({ jobId: 'job-pr33-review-lens' })).toHaveLength(1);
       expect(h.api.latestJobEvent('job-pr33-review-lens', 'report.backfilled')?.payload).toMatchObject({ outcome: 'superseded' });
       expect(h.api.latestJobEvent('job-pr33-review-lens', 'report.superseded')).not.toBeNull();
@@ -168,7 +168,7 @@ describe('legacy report backfill plan and apply (issue #220)', () => {
       seedLegacyJob(h.api, 'job-pr34-review-lens');
       h.api.addJob({ id: 'impl-pr34', repo: 'fixture-app', title: 't', briefing: 'b' });
       h.api.setJobStatus('impl-pr34', 'working');
-      h.api.setJobPr('impl-pr34', 'https://github.com/o/r/pull/34');
+      h.api.setJobPr('impl-pr34', 'https://github.com/o/fixture-app/pull/34');
       h.api.setJobStatus('impl-pr34', 'in-review');
       h.api.setJobStatus('impl-pr34', 'merged');
       seedLegacyJob(h.api, 'unclassifiable-lane');
@@ -192,6 +192,77 @@ describe('legacy report backfill plan and apply (issue #220)', () => {
       expect(h.api.listObligations({ jobId: 'job-pr34-review-lens' })).toHaveLength(1);
       expect(h.api.getJob('job-pr34-review-lens')?.status).toBe('done');
       expect(h.api.getJob('unclassifiable-lane')?.deliverable).toBeNull();
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('PR identity joins repository and number: another repo\'s merge never supersedes this report', () => {
+    const h = freshLedger();
+    try {
+      seedLegacyJob(h.api, 'job-pr55-review-lens');
+      // The SAME number merged in a DIFFERENT repository: no supersede.
+      h.api.addJob({ id: 'other-impl', repo: 'other-repo', title: 't', briefing: 'b' });
+      h.api.setJobStatus('other-impl', 'working');
+      h.api.setJobPr('other-impl', 'https://github.com/o/other-repo/pull/55');
+      h.api.setJobStatus('other-impl', 'in-review');
+      h.api.setJobStatus('other-impl', 'merged');
+      let plan = planLegacyReportBackfill(h.api);
+      expect(plan.proposals[0]?.outcome).toBe('obligation-opened');
+
+      // The same number merged in THIS repo does supersede.
+      h.api.addJob({ id: 'this-impl', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.api.setJobStatus('this-impl', 'working');
+      h.api.setJobPr('this-impl', 'https://github.com/o/fixture-app/pull/55');
+      h.api.setJobStatus('this-impl', 'in-review');
+      h.api.setJobStatus('this-impl', 'merged');
+      plan = planLegacyReportBackfill(h.api);
+      expect(plan.proposals[0]?.outcome).toBe('superseded');
+      expect(plan.proposals[0]?.reason).toContain('#55');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('only a NEWER REPORT-SHAPED job supersedes; a newer implementation lane and a targetRef review both index', async () => {
+    const h = freshLedger();
+    try {
+      seedLegacyJob(h.api, 'job-pr56-review-blind');
+      // A newer IMPLEMENTATION job for the same PR is not a re-review...
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      h.api.addJob({ id: 'impl-pr56-again', repo: 'fixture-app', title: 't', briefing: 'build the thing' });
+      h.api.setJobPr('impl-pr56-again', 'https://github.com/o/fixture-app/pull/56');
+      let plan = planLegacyReportBackfill(h.api);
+      expect(plan.proposals[0]?.outcome).toBe('obligation-opened');
+
+      // ...but a newer REPORT job (kind recorded; target carried in
+      // targetRef, never its own prUrl) does supersede.
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      h.api.addJob({
+        id: 'review-pr56-second-pass', repo: 'fixture-app', title: 't', briefing: 're-review',
+        deliverable: 'review', commissioner: 'gru', targetRef: 'https://github.com/o/fixture-app/pull/56', targetSha: 'head-2',
+      });
+      plan = planLegacyReportBackfill(h.api);
+      expect(plan.proposals[0]?.outcome).toBe('superseded');
+      expect(plan.proposals[0]?.reason).toContain('newer report job');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('the legacy dry-run scan pages until exhausted — owner-list prefixes cannot hide rows', () => {
+    const h = freshLedger();
+    try {
+      // The classifiable row is created FIRST (oldest rowid); four
+      // unclassifiable rows follow. With a two-row page the planner must
+      // walk every page to reach the tail.
+      seedLegacyJob(h.api, 'job-pr57-review-lens');
+      for (let i = 0; i < 4; i += 1) seedLegacyJob(h.api, `mystery-${i}`, 'nothing recognizable');
+      const plan = planLegacyReportBackfill(h.api, { pageSize: 2 });
+      expect(plan.proposals).toHaveLength(5);
+      const classified = plan.proposals.find((proposal) => proposal.job.id === 'job-pr57-review-lens');
+      expect(classified?.outcome).toBe('obligation-opened');
+      expect(plan.ownerList).toBe(4);
     } finally {
       h.cleanup();
     }

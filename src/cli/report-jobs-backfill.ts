@@ -3,15 +3,18 @@
  * Legacy report-job backfill (issue #220) — close out the pre-E19
  * `delivered` lanes the Silas digest still chases as missing PRs.
  *
- * DRY-RUN IS THE DEFAULT: every legacy row is listed with its proposed
- * outcome and nothing is written. `--apply` writes the plan (idempotent —
- * re-running a settled plan is a no-op) and records `report.backfilled`
- * per row. The owner reviews the dry-run list BEFORE any apply.
- *
- * Runs after the live instance is on the `job-deliverable` migration
- * (deploy main first — the migration set is forward-only and the CLI
- * opens the ledger through the same migrate-on-boot path as the service).
+ * DRY-RUN IS THE DEFAULT and is genuinely read-only: the ledger opens in
+ * SQLite readOnly mode and the schema is NEVER migrated, so a dry run can
+ * not write even a schema_migrations row. Every legacy row is listed with
+ * its proposed outcome. `--apply` opens through the service's
+ * migrate-on-boot path (the migration set is forward-only), writes the
+ * plan (idempotent — re-running a settled plan is a no-op), records
+ * `report.backfilled` per row, and exits nonzero if any row failed. The
+ * owner reviews the dry-run list BEFORE any apply.
  */
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { loadConfig } from '../config.js';
 import { LedgerApi } from '../ledger/api.js';
 import { LedgerDb } from '../ledger/db.js';
@@ -87,14 +90,37 @@ function renderText(plan: ReturnType<typeof planLegacyReportBackfill>, applied: 
 
 function main(): void {
   const args = parseArgs(process.argv.slice(2));
-  const config = loadConfig(args.dataDir === null ? {} : { GRU_COMMAND_HOME: args.dataDir }, '/home/tester');
-  // One explicit decision: the CLI migrates on open (forward-only), like
-  // the service. A dry-run performs zero job writes; only --apply writes.
-  const db = new LedgerDb(config.dataDir);
+  // The instance dir comes from --data-dir (explicit) or the ambient
+  // environment/config; tilde expansion resolves against the RUNNING
+  // user's home, never a baked-in path.
+  const config = args.dataDir === null ? loadConfig() : loadConfig({ GRU_COMMAND_HOME: args.dataDir }, homedir());
+  // Dry-run is read-only by construction; --apply migrates on open
+  // (forward-only), like the service.
+  let db: LedgerDb | null = null;
+  let readOnly: DatabaseSync | null = null;
   try {
-    const ledger = new LedgerApi(db.handle, {});
+    let ledger: LedgerApi;
+    if (args.apply) {
+      db = new LedgerDb(config.dataDir);
+      ledger = new LedgerApi(db.handle, {});
+    } else {
+      const dbPath = join(config.dataDir, 'ledger', 'ledger.db');
+      try {
+        readOnly = new DatabaseSync(dbPath, { readOnly: true });
+      } catch (error) {
+        throw new Error(
+          `cannot open the ledger read-only at ${dbPath} (is the service deployed? use --apply to migrate): ${String(error)}`,
+        );
+      }
+      ledger = new LedgerApi(readOnly, {});
+    }
     const plan = planLegacyReportBackfill(ledger);
     const applied = args.apply ? applyLegacyReportBackfill(ledger, plan) : null;
+    if (applied !== null && applied.failed > 0) {
+      // A partially applied backfill is an incomplete batch: the command
+      // contract fails so scripts and the owner's runbook can see it.
+      process.exitCode = 1;
+    }
     if (args.json) {
       process.stdout.write(
         `${JSON.stringify(
@@ -123,7 +149,8 @@ function main(): void {
       process.stdout.write(`${renderText(plan, applied)}\n`);
     }
   } finally {
-    db.close();
+    db?.close();
+    readOnly?.close();
   }
 }
 
