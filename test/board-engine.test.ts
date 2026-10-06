@@ -762,6 +762,33 @@ describe('board engine — FOR YOU owner-PR projection on the snapshot', () => {
     expect(engine.snapshot().ownerPrs).toEqual([]);
   });
 
+  it('keeps a delta READY gated until its final whole-change pass closes', () => {
+    const { api, engine } = fresh();
+    stageReadyJob(api, 'job-final-pass');
+    // The delta round approval is recorded, but it still owes the final
+    // whole-change pass: the owner-ready row must not appear.
+    const rounds = api.listRounds('job-final-pass');
+    api.appendCustomEvent({
+      kind: 'round.perkins-review',
+      jobId: 'job-final-pass',
+      roundId: rounds.at(-1)!.id,
+      payload: { canonicalVerdict: 'READY TO MERGE', reviewScope: 'delta', finalPassRequired: true },
+    });
+    expect(engine.snapshot().ownerPrs).toEqual([]);
+    // The whole-scope round closes and its review event carries no pending
+    // flag: the newest round is whole and owner-ready.
+    const finalRound = api.addRound({ jobId: 'job-final-pass', targetRef: SHA });
+    api.setRoundStatus(finalRound.id, 'live');
+    api.setRoundVerdict(finalRound.id, 'approved');
+    api.appendCustomEvent({
+      kind: 'round.perkins-review',
+      jobId: 'job-final-pass',
+      roundId: finalRound.id,
+      payload: { canonicalVerdict: 'READY TO MERGE', reviewScope: 'whole' },
+    });
+    expect(engine.snapshot().ownerPrs.map((row) => row.id)).toEqual(['owner-pr:job-final-pass']);
+  });
+
   it('drops the row when the job takes a hold (blocked) or a newer round is changes-requested', () => {
     const { api, engine } = fresh();
     stageReadyJob(api, 'job-hold');

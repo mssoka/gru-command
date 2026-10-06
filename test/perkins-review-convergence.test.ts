@@ -11,7 +11,8 @@ import {
   nextReviewScope,
   parseDeltaHunks,
   parseFindingLocation,
-  partitionConvergedFindings,
+  parseDeltaStructure,
+  applyConvergenceDeferral,
   readPriorConvergenceMeta,
 } from '../src/dispatch/perkins-review/convergence.js';
 import { loadPerkinsPolicy } from '../src/dispatch/perkins-review/policy.js';
@@ -65,33 +66,62 @@ describe('delta hunk parsing and intersection', () => {
     '@@ -1,2 +0,0 @@',
     '-const gone = true;',
     '-const alsoGone = true;',
+    'diff --git a/src/mode-only.ts b/src/mode-only.ts',
+    'old mode 100644',
+    'new mode 100755',
   ].join('\n');
 
-  it('parses new-file hunk ranges including pure deletions', () => {
-    const hunks = parseDeltaHunks(diff);
+  it('parses EXACT added lines (context excluded) and deletion seams', () => {
+    const { hunks, paths } = parseDeltaStructure(diff);
     expect(hunks).toEqual([
-      { path: 'src/kept.ts', startLine: 1, endLine: 4 },
-      { path: 'src/deleted.ts', startLine: 0, endLine: -1 },
+      { path: 'src/kept.ts', kind: 'added', startLine: 2, endLine: 2 },
+      { path: 'src/deleted.ts', kind: 'seam', startLine: 1, endLine: 1 },
+      { path: 'src/deleted.ts', kind: 'seam', startLine: 1, endLine: 1 },
     ]);
+    // Every named path is touched, including a mode-only change with no hunk.
+    expect(paths).toEqual(new Set(['src/kept.ts', 'src/deleted.ts', 'src/mode-only.ts']));
   });
 
-  it('intersects findings inside the delta and skips untouched code', () => {
+  it('intersects changed lines and deletion seams, never untouched context', () => {
     const hunks = parseDeltaHunks(diff);
     expect(findingIntersectsDelta('src/kept.ts:2', hunks)).toBe(true);
     expect(findingIntersectsDelta('src/kept.ts:2-3', hunks)).toBe(true);
-    // Untouched line of a touched file: outside every hunk.
+    // A context line inside the hunk is NOT a changed line.
+    expect(findingIntersectsDelta('src/kept.ts:1', hunks)).toBe(false);
+    // Untouched line of a touched file: outside every changed range.
     expect(findingIntersectsDelta('src/kept.ts:900', hunks)).toBe(false);
     // A file with no hunks at all is untouched code by construction.
     expect(findingIntersectsDelta('src/untouched.ts:1', hunks)).toBe(false);
-    // A pure deletion hunk adds no new lines to intersect.
-    expect(findingIntersectsDelta('src/deleted.ts:1', hunks)).toBe(false);
+    // A grounded finding about DELETED code anchors at the removal seam.
+    expect(findingIntersectsDelta('src/deleted.ts:1', hunks)).toBe(true);
   });
 
-  it('fails closed toward blocking for unanchored findings', () => {
+  it('parses Git-quoted paths (spaces and escapes) instead of losing their hunks', () => {
+    const quoted = [
+      'diff --git "a/src/weird name.ts" "b/src/weird name.ts"',
+      '--- "a/src/weird name.ts"',
+      '+++ "b/src/weird name.ts"',
+      '@@ -1 +1 @@',
+      '-old',
+      '+new',
+    ].join('\n');
+    const { hunks, paths } = parseDeltaStructure(quoted);
+    expect(paths.has('src/weird name.ts')).toBe(true);
+    // The modification carries both the removal seam and the added line.
+    expect(hunks).toEqual([
+      { path: 'src/weird name.ts', kind: 'seam', startLine: 1, endLine: 1 },
+      { path: 'src/weird name.ts', kind: 'added', startLine: 1, endLine: 1 },
+    ]);
+    expect(findingIntersectsDelta('src/weird name.ts:1', hunks)).toBe(true);
+  });
+
+  it('fails closed toward blocking for unanchored findings and unusable line numbers', () => {
     const hunks = parseDeltaHunks(diff);
     expect(findingIntersectsDelta('N/A', hunks)).toBe(true);
     expect(findingIntersectsDelta('no path at all', hunks)).toBe(true);
     expect(findingIntersectsDelta('src/kept.ts:hunk', hunks)).toBe(true);
+    // An oversized line number can never silently defer a blocker.
+    expect(findingIntersectsDelta('src/kept.ts:99999999999999999999', hunks)).toBe(true);
   });
 });
 
@@ -107,9 +137,25 @@ describe('deltaSince (bounded git delta)', () => {
     expect(delta.fromSha).toBe(first);
     expect(delta.toSha).toBe(second);
     expect(delta.touchedPaths).toEqual(new Set(['src/second.ts']));
-    expect(delta.hunks).toEqual([{ path: 'src/second.ts', startLine: 1, endLine: 2 }]);
+    expect(delta.hunks).toEqual([{ path: 'src/second.ts', kind: 'added', startLine: 1, endLine: 2 }]);
     expect(delta.diff).toContain('+++ b/src/second.ts');
     expect(Buffer.byteLength(`x${base}`)).toBeGreaterThan(0);
+  });
+
+  it('touches mode-only changed paths that emit no hunks', () => {
+    const repo = makeFixtureRepo('perkins-convergence-mode-only');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/mode']);
+    const first = repo.commitFile('src/script.sh', '#!/bin/sh\necho hi\n');
+    repo.git(['update-index', '--chmod=+x', 'src/script.sh']);
+    repo.git(['commit', '-m', 'make executable']);
+    const second = repo.head();
+    const delta = deltaSince(repo.path, first, second);
+    expect(delta.touchedPaths.has('src/script.sh')).toBe(true);
+    expect(delta.hunks).toEqual([]);
+    // Mode-only files carry no changed lines: a finding there is not
+    // line-intersecting, but the path is touched (so priors re-verify).
+    expect(findingIntersectsDelta('src/script.sh:1', delta.hunks)).toBe(false);
   });
 
   it('refuses non-SHA endpoints and unreadable revisions', () => {
@@ -190,17 +236,28 @@ describe('convergence partition and verdict mapping', () => {
     ...overrides,
   });
 
-  it('defers new findings outside the delta from the policy round and never before', () => {
-    const hunks = parseDeltaHunks(['diff --git a/src/kept.ts b/src/kept.ts', '--- a/src/kept.ts', '+++ b/src/kept.ts', '@@ -1,3 +1,4 @@', '+const two = 2;', ''].join('\n'));
-    const inside = finding({ location: 'src/kept.ts:2' });
-    const outside = finding({ location: 'src/untouched.ts:1', title: 'outside defect' });
-    const early = partitionConvergedFindings({ roundNumber: 2, fromRound: 3, findings: [inside, outside], hunks });
+  const verified = (entry: ReturnType<typeof finding>) => ({
+    ...entry,
+    verification: { disposition: 'confirmed' as const, evidence: entry.evidence, reason: 'test' },
+    sources: [entry.source],
+    roundOrigin: 3,
+  });
+
+  it('defers findings outside the delta from the policy round and never before', () => {
+    const hunks = parseDeltaHunks(['diff --git a/src/kept.ts b/src/kept.ts', '--- a/src/kept.ts', '+++ b/src/kept.ts', '@@ -1,3 +1,4 @@', ' const one = 1;', '+const two = 2;', ' const three = 3;', ''].join('\n'));
+    const inside = verified(finding({ location: 'src/kept.ts:2' }));
+    const outside = verified(finding({ location: 'src/untouched.ts:1', title: 'outside defect' }));
+    const early = applyConvergenceDeferral({ roundNumber: 2, fromRound: 3, findings: [inside, outside], hunks });
     expect(early.deferred).toEqual([]);
-    const late = partitionConvergedFindings({ roundNumber: 3, fromRound: 3, findings: [inside, outside], hunks });
-    expect(late.converged).toEqual([inside]);
+    expect(early.findings.every((entry) => entry.deferredFollowup !== true)).toBe(true);
+    const late = applyConvergenceDeferral({ roundNumber: 3, fromRound: 3, findings: [inside, outside], hunks });
     expect(late.deferred).toHaveLength(1);
     expect(late.deferred[0]!.finding.title).toBe('outside defect');
     expect(late.deferred[0]!.reason).toContain('cannot hold the PR');
+    // The deferred finding is retained with the explicit flag; the
+    // intersecting one keeps full blocking power.
+    expect(late.findings.find((entry) => entry.title === 'outside defect')?.deferredFollowup).toBe(true);
+    expect(late.findings.find((entry) => entry.title === 'new defect')?.deferredFollowup).toBeUndefined();
   });
 
   it('maps the converged blocker count with the standing policy mapping', () => {
@@ -212,25 +269,57 @@ describe('convergence partition and verdict mapping', () => {
 });
 
 describe('review scope planning (final whole pass at a READY candidate)', () => {
-  const meta = (overrides: Partial<{ seq: number; reviewScope: 'whole' | 'delta' | 'unknown'; canonicalVerdict: string }> = {}) => ({
+  const TARGET = 'a'.repeat(40);
+  const BASE = 'd'.repeat(40);
+  const meta = (overrides: Partial<{ seq: number; reviewScope: 'whole' | 'delta' | 'unknown'; canonicalVerdict: string; targetSha: string; diffBaseSha: string }> = {}) => ({
     seq: 1,
     reviewScope: 'delta' as const,
     canonicalVerdict: 'NEEDS CHANGES',
-    targetSha: 'a'.repeat(40),
+    targetSha: TARGET,
+    diffBaseSha: BASE,
+    ...overrides,
+  });
+  const scope = (prior: ReturnType<typeof meta> | null, overrides: Partial<{ currentTargetSha: string; currentDiffBaseSha: string; finalWholePassAtReady: boolean }> = {}) => nextReviewScope({
+    prior,
+    currentTargetSha: TARGET,
+    currentDiffBaseSha: BASE,
+    deltaRoundsFrom: 2,
+    finalWholePassAtReady: true,
     ...overrides,
   });
 
-  it('plans whole for a job with no prior and delta for every round after a prior', () => {
-    expect(nextReviewScope({ prior: null, deltaRoundsFrom: 2, finalWholePassAtReady: true })).toBe('whole');
-    expect(nextReviewScope({ prior: meta(), deltaRoundsFrom: 2, finalWholePassAtReady: true })).toBe('delta');
-    expect(nextReviewScope({ prior: meta({ reviewScope: 'whole', canonicalVerdict: 'READY TO MERGE' }), deltaRoundsFrom: 2, finalWholePassAtReady: true })).toBe('delta');
+  it('plans whole for a job with no prior and delta for a moved-target round after a prior', () => {
+    expect(scope(null)).toBe('whole');
+    // The normal fix-then-review case: target advanced, base unchanged.
+    expect(scope(meta(), { currentTargetSha: 'c'.repeat(40) })).toBe('delta');
+    expect(scope(meta({ reviewScope: 'whole', canonicalVerdict: 'READY TO MERGE' }), { currentTargetSha: 'c'.repeat(40) })).toBe('delta');
+  });
+
+  it('plans whole when nothing changed (same candidate) or the base moved', () => {
+    // Same head + same base: there is no delta to review; a re-request is
+    // a whole-change re-review.
+    expect(scope(meta())).toBe('whole');
+    // A moved merge base changes the review CONTEXT even at one target.
+    expect(scope(meta(), { currentDiffBaseSha: 'e'.repeat(40) })).toBe('whole');
   });
 
   it('plans the final whole pass exactly when a delta round posted READY', () => {
-    expect(nextReviewScope({ prior: meta({ canonicalVerdict: 'READY TO MERGE' }), deltaRoundsFrom: 2, finalWholePassAtReady: true })).toBe('whole');
-    expect(nextReviewScope({ prior: meta({ canonicalVerdict: 'READY TO MERGE' }), deltaRoundsFrom: 2, finalWholePassAtReady: false })).toBe('delta');
+    expect(scope(meta({ canonicalVerdict: 'READY TO MERGE' }), { currentTargetSha: 'c'.repeat(40) })).toBe('whole');
+    expect(nextReviewScope({
+      prior: meta({ canonicalVerdict: 'READY TO MERGE' }),
+      currentTargetSha: TARGET,
+      currentDiffBaseSha: BASE,
+      deltaRoundsFrom: 2,
+      finalWholePassAtReady: false,
+    })).toBe('whole'); // same candidate still re-reviews whole; the flag only governs the moved-target case
     // A legacy (pre-Stage-5) prior record never triggers the final pass.
-    expect(nextReviewScope({ prior: meta({ reviewScope: 'unknown', canonicalVerdict: 'READY TO MERGE' }), deltaRoundsFrom: 2, finalWholePassAtReady: true })).toBe('delta');
+    expect(nextReviewScope({
+      prior: meta({ reviewScope: 'unknown', canonicalVerdict: 'READY TO MERGE' }),
+      currentTargetSha: 'c'.repeat(40),
+      currentDiffBaseSha: BASE,
+      deltaRoundsFrom: 2,
+      finalWholePassAtReady: true,
+    })).toBe('delta');
   });
 });
 
@@ -244,12 +333,12 @@ describe('prior convergence meta read (tolerant)', () => {
       canonicalVerdict: 'READY TO MERGE',
       complete: true,
       headMoved: false,
-      frozen: { targetSha: 'b'.repeat(40) },
+      frozen: { targetSha: 'b'.repeat(40), diffBaseSha: 'd'.repeat(40) },
       convergence: { reviewScope: 'delta' },
     };
     writeFileSync(file, JSON.stringify(modern));
     expect(readPriorConvergenceMeta(file, 4)).toEqual({
-      seq: 4, reviewScope: 'delta', canonicalVerdict: 'READY TO MERGE', targetSha: 'b'.repeat(40),
+      seq: 4, reviewScope: 'delta', canonicalVerdict: 'READY TO MERGE', targetSha: 'b'.repeat(40), diffBaseSha: 'd'.repeat(40),
     });
     writeFileSync(file, JSON.stringify({ ...modern, convergence: undefined }));
     expect(readPriorConvergenceMeta(file, 4)?.reviewScope).toBe('unknown');
@@ -264,7 +353,7 @@ describe('prior convergence meta read (tolerant)', () => {
       canonicalVerdict: 'INCOMPLETE',
       complete: true,
       headMoved: false,
-      frozen: { targetSha: 'c'.repeat(40) },
+      frozen: { targetSha: 'c'.repeat(40), diffBaseSha: 'd'.repeat(40) },
     };
     writeFileSync(file, JSON.stringify(modern));
     expect(readPriorConvergenceMeta(file, 2)).toBeNull();
@@ -396,6 +485,9 @@ describe('Stage-5 convergence over whole rounds', () => {
     expect(round2.canonicalVerdict).toBe('READY TO MERGE');
     expect(round2.convergence).toMatchObject({ reviewScope: 'delta', carriedPriors: [0], reverifyPriors: [], deltaFromSha: target1 });
     expect(round2.convergence?.deferredFollowups).toBeUndefined();
+    // A delta READY still owes the final whole-change pass: approval can
+    // never be credited before a whole-scope round closes.
+    expect(round2.convergence?.finalPassRequired).toBe(true);
 
     const consolidated2 = JSON.parse(readFileSync(join(round2.artifactDirectory, 'consolidated.json'), 'utf8')) as {
       canonicalVerdict: string;
@@ -497,8 +589,9 @@ describe('Stage-5 convergence over whole rounds', () => {
       reviewScope: 'delta',
       verdictRecomputed: { from: 'NEEDS CHANGES', to: 'READY TO MERGE' },
     });
-    expect(round3.convergence?.deferredFollowups).toHaveLength(1);
-    expect(round3.convergence?.deferredFollowups?.[0]).toMatchObject({ title: 'untouched new defect', severity: 'blocker' });
+    expect(round3.convergence?.deferredFollowups).toHaveLength(2);
+    expect(round3.convergence?.deferredFollowups?.find((entry) => entry.title === 'untouched new defect'))
+      .toMatchObject({ severity: 'blocker' });
 
     const consolidated3 = JSON.parse(readFileSync(join(round3.artifactDirectory, 'consolidated.json'), 'utf8')) as {
       canonicalVerdict: string;
@@ -510,6 +603,96 @@ describe('Stage-5 convergence over whole rounds', () => {
     const deferred = consolidated3.findings.find((finding) => finding.title === 'untouched new defect');
     expect(deferred!.deferredFollowup).toBe(true);
     expect(deferred!.verification.reason).toContain('cannot hold the PR');
+    // The published report headline matches the recorded canonical verdict
+    // and discloses the host recomputation; the lead's submitted bytes stay
+    // preserved in the submission artifact.
+    const published = readFileSync(join(round3.artifactDirectory, 'perkins-report.md'), 'utf8');
+    expect(published).toContain('**Verdict: READY TO MERGE**');
+    expect(published).not.toContain('**Verdict: NEEDS CHANGES**');
+    expect(published).toContain('Host convergence');
+    const submitted = JSON.parse(readFileSync(
+      join(round3.artifactDirectory, 'lead', 'submission-attempt-1.json'), 'utf8',
+    )) as { verdict: string; report_markdown: string };
+    expect(submitted.verdict).toBe('NEEDS CHANGES');
+    expect(submitted.report_markdown).toContain('**Verdict: NEEDS CHANGES**');
+  });
+
+  it('strips a stale deferral when a later whole-change pass re-retains the blocker', async () => {
+    const harness = makeEngine({
+      childAnswer: () => '[]',
+      specialists: [],
+      leadFinding: groundedFinding('lead', 'warning', { location: 'src/main.ts:1', evidence: 'export function answer(): number {' }),
+    });
+    harness.repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const frozen1 = freeze(harness, { roundId: 'sd-round-1', spec: 'return 43' });
+    await runRound(harness, { roundId: 'sd-round-1', roundNumber: 1, frozen: frozen1, reviewScope: 'whole' });
+    const consolidated1 = join(reviewArtifactDirectory(harness.root, 'sd-round-1'), 'consolidated.json');
+
+    harness.repo.commitFile('src/other.ts', 'export const other = 2;\n');
+    const frozen2 = freeze(harness, { roundId: 'sd-round-2', spec: 'return 43' });
+    const brain = harness.brain as { leadFinding?: unknown; verdictOverride?: string };
+    delete brain.leadFinding;
+    await runRound(harness, {
+      roundId: 'sd-round-2', roundNumber: 2, frozen: frozen2,
+      reviewScope: 'delta', priorConsolidatedFile: consolidated1,
+    });
+
+    // Round 3 defers a new blocker on untouched code.
+    harness.repo.commitFile('src/third.ts', 'export const third = 3;\n');
+    const frozen3 = freeze(harness, { roundId: 'sd-round-3', spec: 'return 43' });
+    brain.verdictOverride = 'NEEDS CHANGES';
+    brain.leadFinding = groundedFinding('lead', 'blocker', { location: 'src/main.ts:1', title: 'deferred then re-retained' });
+    const round3 = await runRound(harness, {
+      roundId: 'sd-round-3', roundNumber: 3, frozen: frozen3,
+      reviewScope: 'delta', priorConsolidatedFile: join(reviewArtifactDirectory(harness.root, 'sd-round-2'), 'consolidated.json'),
+    });
+    expect(round3.canonicalVerdict).toBe('READY TO MERGE');
+    expect(round3.convergence?.finalPassRequired).toBe(true);
+    // Both the new blocker and the carried warning sit outside this delta.
+    expect(round3.convergence?.deferredFollowups).toHaveLength(2);
+
+    // The final whole-change pass re-retains the deferred blocker: the old
+    // deferral flag must NOT keep it out of the counts.
+    delete brain.leadFinding;
+    delete brain.verdictOverride;
+    const frozen4 = freeze(harness, { roundId: 'sd-round-4', spec: 'return 43' });
+    const round4 = await runRound(harness, {
+      roundId: 'sd-round-4', roundNumber: 4, frozen: frozen4,
+      reviewScope: 'whole', priorConsolidatedFile: join(round3.artifactDirectory, 'consolidated.json'),
+    });
+    expect(round4.canonicalVerdict).toBe('NEEDS CHANGES');
+    expect(round4.convergence).toMatchObject({ reviewScope: 'whole' });
+    expect(round4.convergence?.deferredFollowups).toBeUndefined();
+    const consolidated4 = JSON.parse(readFileSync(join(round4.artifactDirectory, 'consolidated.json'), 'utf8')) as {
+      findings: Array<{ title: string; deferredFollowup?: true; severity: string; sources: string[] }>;
+    };
+    const retained = consolidated4.findings.find((finding) => finding.title === 'deferred then re-retained');
+    expect(retained).toBeDefined();
+    expect(retained!.deferredFollowup).toBeUndefined();
+    expect(round4.convergence?.finalPassRequired).toBeUndefined();
+  });
+
+  it('carries prior lens results with no open finding and offers them to the lead', async () => {
+    const harness = makeEngine({ childAnswer: () => '[]', specialists: ['blind', 'edge'] });
+    harness.repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const frozen1 = freeze(harness, { roundId: 'cl-round-1', spec: 'return 43' });
+    await runRound(harness, { roundId: 'cl-round-1', roundNumber: 1, frozen: frozen1, reviewScope: 'whole' });
+    const consolidated1 = join(reviewArtifactDirectory(harness.root, 'cl-round-1'), 'consolidated.json');
+
+    harness.repo.commitFile('src/other.ts', 'export const other = 2;\n');
+    const frozen2 = freeze(harness, { roundId: 'cl-round-2', spec: 'return 43' });
+    (harness.brain as { specialists?: readonly string[] }).specialists = [];
+    const round2 = await runRound(harness, {
+      roundId: 'cl-round-2', roundNumber: 2, frozen: frozen2,
+      reviewScope: 'delta', priorConsolidatedFile: consolidated1,
+    });
+    const prompt = harness.leadCalls.at(-1)!.prompt ?? '';
+    expect(prompt).toContain('PRIOR LENS RESULTS CARRIED (blind, edge)');
+    expect(round2.convergence?.carriedLenses).toEqual(['blind', 'edge']);
+    const consolidated2 = JSON.parse(readFileSync(join(round2.artifactDirectory, 'consolidated.json'), 'utf8')) as {
+      convergence: { carriedLenses?: string[] };
+    };
+    expect(consolidated2.convergence.carriedLenses).toEqual(['blind', 'edge']);
   });
 
   it('keeps an intersecting round-3 blocker holding the PR', async () => {
@@ -542,7 +725,10 @@ describe('Stage-5 convergence over whole rounds', () => {
       reviewScope: 'delta', priorConsolidatedFile: join(reviewArtifactDirectory(harness.root, 'in-round-2'), 'consolidated.json'),
     });
     expect(round3.canonicalVerdict).toBe('NEEDS CHANGES');
-    expect(round3.convergence?.deferredFollowups).toBeUndefined();
+    // The carried warning on untouched code is itself deferred, but the
+    // intersecting blocker keeps its hold.
+    expect(round3.convergence?.deferredFollowups).toHaveLength(1);
+    expect(round3.convergence?.deferredFollowups?.[0]).toMatchObject({ severity: 'warning' });
     expect(round3.convergence?.verdictRecomputed).toBeUndefined();
     const consolidated3 = JSON.parse(readFileSync(join(round3.artifactDirectory, 'consolidated.json'), 'utf8')) as {
       findings: Array<{ title: string; deferredFollowup?: true }>;
@@ -621,37 +807,4 @@ describe('Stage-5 convergence over whole rounds', () => {
     expect(harness.leadCalls.at(-1)!.prompt ?? '').toContain('PRIOR FINDINGS CARRIED FORWARD');
   });
 
-  it('never defers a lead restatement of a carried blocker: the prior holds the PR', async () => {
-    const harness = makeEngine({
-      childAnswer: () => '[]',
-      specialists: [],
-      leadFinding: groundedFinding('lead', 'blocker', { location: 'src/main.ts:1', evidence: 'export function answer(): number {' }),
-    });
-    harness.repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
-    const frozen1 = freeze(harness, { roundId: 'rs-round-1', spec: 'return 43' });
-    await runRound(harness, { roundId: 'rs-round-1', roundNumber: 1, frozen: frozen1, reviewScope: 'whole' });
-    const consolidated1 = join(reviewArtifactDirectory(harness.root, 'rs-round-1'), 'consolidated.json');
-
-    // Same head, delta round: the prior is carried; the scripted lead
-    // restates it (the double counts carried blockers in its verdict).
-    const frozen2 = freeze(harness, { roundId: 'rs-round-2', spec: 'return 43' });
-    const brain = harness.brain as { leadFinding?: unknown };
-    delete brain.leadFinding;
-    const round2 = await runRound(harness, {
-      roundId: 'rs-round-2', roundNumber: 3, frozen: frozen2,
-      reviewScope: 'delta', priorConsolidatedFile: consolidated1,
-    });
-    // An empty delta defers nothing EXCEPT genuinely new findings; the
-    // restated carried blocker merges into the original and still holds.
-    expect(round2.canonicalVerdict).toBe('NEEDS CHANGES');
-    expect(round2.convergence?.deferredFollowups).toBeUndefined();
-    expect(round2.convergence?.verdictRecomputed).toBeUndefined();
-    const consolidated2 = JSON.parse(readFileSync(join(round2.artifactDirectory, 'consolidated.json'), 'utf8')) as {
-      findings: Array<{ title: string; roundOrigin: number; deferredFollowup?: true }>;
-    };
-    const merged = consolidated2.findings.filter((finding) => finding.title === 'lead grounded defect');
-    expect(merged).toHaveLength(1);
-    expect(merged[0]!.roundOrigin).toBe(1);
-    expect(merged[0]!.deferredFollowup).toBeUndefined();
-  });
 });

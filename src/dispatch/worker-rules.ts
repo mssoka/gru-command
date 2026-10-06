@@ -17,7 +17,7 @@ export const REVIEW_CONVERGENCE_RULE = [
   'REVIEW CONVERGENCE RULE (review loops in minion lanes):',
   '- From round 3 of one review/fix loop, only a new finding whose location intersects the hunks changed in this round can block; new findings on untouched code are follow-ups — report them as such, never drop them, and do not run another round for them.',
   '- Prior findings whose quoted evidence is unchanged carry forward as still-present without re-verification; findings whose code changed, or that you claimed fixed, are re-verified explicitly.',
-  '- When a round concludes READY/PASS, one final whole-review pass of the complete change confirms it before the loop may report convergence.',
+  '- A loop whose rounds review only the latest changes (delta-scoped) must run one final whole-review pass of the complete change at a READY/PASS candidate before it may report convergence. A loop that already reviews the complete change in every round (such as a working-diff gate) holds that whole-change coverage in the concluding round itself.',
 ].join('\n');
 
 /**

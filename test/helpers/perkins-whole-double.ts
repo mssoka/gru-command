@@ -364,11 +364,19 @@ export function fakeWholeSpawner(
 
     if (options.neverSubmit === true) return 'lead gave up without submitting';
 
+    // Delta rounds list only the priors to REVISIT, with their ORIGINAL
+    // prior_index; a disposition must address the entry's own index, never
+    // its position in the filtered list.
+    const priorByIndex = new Map<number, unknown>();
+    prior.forEach((entry, position) => {
+      const index = (entry as { prior_index?: unknown })?.prior_index;
+      priorByIndex.set(typeof index === 'number' ? index : position, entry);
+    });
     const effectiveDispositions: readonly WholePriorDisposition[] = options.priorDisposition?.(prior) ??
-      prior.map((entry, index) => {
+      [...priorByIndex].map(([priorIndex, entry]) => {
         const finding = entry as { title: string };
         return {
-          prior_index: index,
+          prior_index: priorIndex,
           status: 'still-present' as const,
           note: `prior remains: ${finding.title}`,
         };
@@ -397,7 +405,7 @@ export function fakeWholeSpawner(
     // dispositions the submission carries feed the verdict).
     for (const disposition of effectiveDispositions) {
       if (disposition.status !== 'still-present') continue;
-      const carried = prior[disposition.prior_index] as { severity: string; title: string; location: string } | undefined;
+      const carried = priorByIndex.get(disposition.prior_index) as { severity: string; title: string; location: string } | undefined;
       if (carried === undefined) continue;
       // The scripted lead cites the CURRENT location/severity when the
       // disposition refreshes one, so its finding merges with the carried
@@ -449,7 +457,7 @@ export function fakeWholeSpawner(
       ...(prior.length === 0 ? [] : [
         '## Prior findings revisited',
         ...priorDispositions.map((disposition) => {
-          const finding = prior[disposition.prior_index] as { title: string; location: string } | undefined;
+          const finding = priorByIndex.get(disposition.prior_index) as { title: string; location: string } | undefined;
           const title = finding?.title ?? '(prior not shown to this lead)';
           const location = finding?.location ?? 'N/A';
           return `- #${disposition.prior_index} ${disposition.status}: ${title} @ ${location} — ${disposition.note}`;
