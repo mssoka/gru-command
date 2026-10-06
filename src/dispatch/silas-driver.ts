@@ -343,6 +343,10 @@ export function consolidatedBlockersFor(ledger: DigestLedger): BlockersForRound 
           category: String(finding.category ?? ''),
           title: String(finding.title ?? ''),
           location: String(finding.location ?? ''),
+          // The severity filter above guarantees 'blocker'; carrying it
+          // keeps the #224 ask state identical to the labelled
+          // extractor's, which always includes the field.
+          severity: 'blocker',
           ...(typeof finding.evidence === 'string' && finding.evidence.trim() !== ''
             ? { evidence: finding.evidence }
             : {}),
@@ -902,6 +906,11 @@ function stallStillEligible(
  */
 export async function computeSilasDigest(input: ComputeDigestInput): Promise<SilasOpsDigest> {
   const now = input.now ?? Date.now;
+  // Digest-wide same-blocker budget (issue #224 review): the cap bounds
+  // asks across the WHOLE digest, not per job, so one sweep with many
+  // overlapping lanes can never enqueue more than SAME_BLOCKER_PAIR_CAP
+  // provider asks.
+  let sameBlockerBudget = SAME_BLOCKER_PAIR_CAP;
   const digest: {
     computedAt: string;
     trigger: string;
@@ -1100,9 +1109,12 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
         });
         // Same-blocker identity shadow candidates (issue #224): the
         // observer is fire-and-forget — this must never await, throw, or
-        // otherwise reach the digest.
-        if (input.onSameBlockerPair !== undefined) {
-          for (const pair of sameBlockerPairs(latest, blockerHistory.slice(1))) {
+        // otherwise reach the digest. Pairs consume the digest-wide
+        // budget before the observer is invoked.
+        if (input.onSameBlockerPair !== undefined && sameBlockerBudget > 0) {
+          const pairs = sameBlockerPairs(latest, blockerHistory.slice(1), sameBlockerBudget);
+          sameBlockerBudget -= pairs.length;
+          for (const pair of pairs) {
             try {
               input.onSameBlockerPair(job.id, pair);
             } catch (error) {
@@ -1625,12 +1637,14 @@ export interface SilasDriverOptions {
   readonly blockersForRound?: BlockersForRound;
   readonly log?: Log;
   /** Issue #224 shadow wiring: the decision service asked for same-blocker
-   * identity, and the per-surface readiness gate. The ask is shadow-only
-   * (compute and record; the runtime serves and the driver ignores the
-   * answer — the recurrence ladder stays deterministic). Omitting either
-   * leaves the driver exactly as before. */
+   * identity, the per-surface readiness gate, and the per-surface mode
+   * reader. The ask is shadow-only (compute and record; the runtime
+   * serves and the driver ignores the answer — the recurrence ladder
+   * stays deterministic) and fires exclusively in `shadow` mode.
+   * Omitting any of the three leaves the driver exactly as before. */
   readonly decisions?: Pick<DecisionService, 'decide'>;
   readonly readyForSurface?: (surface: string) => boolean;
+  readonly modeForSurface?: (surface: string) => 'off' | 'shadow' | 'enforce' | null;
   /** Deterministic no-LLM pass hook (chief phase-3 seam, issue #163):
    * invoked at the top of every trigger — bus wake events and sweep ticks
    * alike — BEFORE any slot wake/LLM work. The pass must be bounded; the
@@ -1744,7 +1758,12 @@ export class SilasDriver {
    * so one digest can never enqueue unbounded asks. */
   private recordSameBlockerShadow(jobId: string, pair: SameBlockerPair): void {
     const decisions = this.opts.decisions;
-    if (decisions === undefined || this.opts.readyForSurface?.(DECISION_SURFACE_SAME_BLOCKER) !== true) return;
+    if (decisions === undefined) return;
+    if (this.opts.readyForSurface?.(DECISION_SURFACE_SAME_BLOCKER) !== true) return;
+    // Shadow-only: a legacy (modeless) surface would make an unrecorded
+    // provider call, and enforce is a future host change — neither may
+    // spend here.
+    if (this.opts.modeForSurface?.(DECISION_SURFACE_SAME_BLOCKER) !== 'shadow') return;
     const key = `${jobId}\u0000${blockerFingerprint(pair.prior)}\u0001${blockerFingerprint(pair.current)}`;
     if (this.sameBlockerAsked.has(key)) return;
     if (this.sameBlockerAsked.size >= 512) {

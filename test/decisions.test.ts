@@ -39,6 +39,7 @@ import {
   redactedText,
   reportConclusionDecisionRequest,
   reportConclusionState,
+  summariseReportBody,
   sameBlockerDecisionRequest,
   supervisionDecisionRequest,
 } from '../src/decisions/questions.js';
@@ -1926,8 +1927,8 @@ describe('issue #224 shadow surfaces — question sets, builders, backtest parit
     const withMemory = escalationTriageDecisionRequest({
       escalations: [esc()],
       mode: 'action-required',
-      openDecisions: [{ decision: 'hold', reason: 'waiting on upstream', by: 'owner', recheck_at: '2026-10-08T00:00:00.000Z' }],
-      recentDispositions: [{ decision: 'acted', reason: 'directive sent', by: 'silas', recheck_at: null }],
+      openDecisions: [{ decision: 'hold', reason: 'waiting on upstream', by: 'owner', covers: 'typecheck', basis_fingerprint: 'sha-1', recheck_at: '2026-10-08T00:00:00.000Z' }],
+      recentDispositions: [{ decision: 'acted', reason: 'directive sent', by: 'silas', covers: '', basis_fingerprint: null, recheck_at: null }],
     });
     expect(withMemory.state).toContain('open_decisions');
     expect(withMemory.state).toContain('recent_dispositions');
@@ -1992,5 +1993,40 @@ describe('issue #224 shadow surfaces — question sets, builders, backtest parit
       ).fallback);
     expect(surfaceCaseSpec('report_conclusion').fallback)
       .toEqual(reportConclusionDecisionRequest('body').fallback);
+  });
+});
+
+describe('issue #224 review fixes — normalization, summarisation', () => {
+  it('fileOfLocation mirrors #216 location identity plus one column strip', () => {
+    expect(fileOfLocation('src/a.ts')).toBe('src/a.ts');
+    expect(fileOfLocation(' src/A.ts:12 ')).toBe('src/a.ts');
+    expect(fileOfLocation('src/a.ts:12:34')).toBe('src/a.ts');
+    expect(fileOfLocation('src/a.ts#L42')).toBe('src/a.ts');
+    expect(fileOfLocation('src/a.ts#L42-L48')).toBe('src/a.ts');
+    expect(fileOfLocation('src/a.ts:42-58')).toBe('src/a.ts');
+    expect(fileOfLocation('src\\win\\path.ts:7')).toBe('src/win/path.ts');
+  });
+
+  it('summariseReportBody passes short bodies through and summarises long ones', () => {
+    const short = '## Summary\nall good';
+    expect(summariseReportBody(short)).toBe(short);
+    const filler = Array.from({ length: 200 }, (_, index) => `prose line ${index} with some length to it`).join('\n');
+    const long = `## Summary\nthe head matters\n\n${filler}\n\n- finding one: real\n- finding two: also real`;
+    const summarised = summariseReportBody(long, 1_000);
+    expect(summarised.length).toBeLessThanOrEqual(1_000);
+    expect(summarised).toContain('the head matters');
+    expect(summarised).toContain('- finding one: real');
+    expect(summarised).toContain('- finding two: also real');
+    expect(summarised).not.toContain('prose line 150');
+  });
+
+  it('reportConclusionState summarises instead of tail-truncating', () => {
+    const filler = Array.from({ length: 300 }, (_, index) => `prose ${index}`).join('\n');
+    const report = `## Summary\nhead section\n\n${filler}\n\n- the real finding\n\n**Verdict: NEEDS CHANGES**`;
+    const state = reportConclusionState(report);
+    expect(state).toContain('head section');
+    // The finding title survives — summarised, never tail-truncated.
+    expect(state).toContain('the real finding');
+    expect(state).not.toContain('Verdict');
   });
 });

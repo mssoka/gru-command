@@ -308,11 +308,19 @@ export interface EscalationFacts {
   readonly detail: string | null;
 }
 
-/** One decision-memory row (issue #218) reduced to what triage needs. */
+/** One decision-memory row (issue #218) reduced to what triage needs.
+ * `covers` and `basis_fingerprint` ride along so a hold scoped to another
+ * signal — or one made against a stale basis — cannot read as an
+ * applicable open item. */
 export interface DecisionMemoryFacts {
   readonly decision: string;
   readonly reason: string;
   readonly by: string;
+  /** The decision's covered signals, canonical order, joined — a string
+   * survives `filteredState`'s bounded-depth rendering without
+   * truncation. */
+  readonly covers: string;
+  readonly basis_fingerprint: string | null;
   readonly recheck_at: string | null;
 }
 
@@ -385,9 +393,20 @@ export interface BlockerFacts {
   readonly detail?: string | null;
 }
 
-/** A finding's file: the location minus any trailing `:line[:col]`. */
+/** A finding's file: the SAME normalization #216's blockerLocationKey
+ * applies (separators, `#L`/line/range suffixes, case) plus one trailing
+ * `:column` strip for `path:line:col` locations — a strict superset, so
+ * a candidate pair's file check can never contradict the fingerprint
+ * identity that guards it while still matching plain file-level overlap.
+ * Shared by the production pairing and the labelled extractor. */
 export function fileOfLocation(location: string): string {
-  return location.trim().replace(/:\d+(?::\d+)?$/u, '');
+  return location
+    .trim()
+    .replace(/\\+/gu, '/')
+    .replace(/(?:#L\d+(?:-L\d+)?|:\d+(?:-\d+)?)$/u, '')
+    .replace(/:\d+$/u, '')
+    .toLowerCase()
+    .trim();
 }
 
 function blockerFactsState(facts: BlockerFacts): Record<string, unknown> {
@@ -436,17 +455,55 @@ export const REPORT_CONCLUSION_QUESTIONS = {
 
 /** The explicit `Verdict:` line is the LABEL (ground truth from the
  * canonical Perkins vocabulary), never part of the question — strip every
- * explicit verdict line the way the labelled extractor does, then let
- * `filteredState` bound the size (the 32k-token state cap is far above
- * the 4k-character filtered bound, so no further summarisation is
- * needed; a longer report loses its tail, never its verdict). */
+ * explicit verdict line the way the labelled extractor does. Long bodies
+ * are then SUMMARISED (issue #224's input limit), not tail-truncated: the
+ * head of the report (its summary sections lead) plus every finding-title
+ * line, up to the bound. Shared by production and the labelled extractor
+ * so a backtest measures exactly what production sends. */
+/** `filteredState` bounds every string field through `redactedText` at
+ * 800 characters, so the summarised body must land under that — a longer
+ * body loses its tail, and the finding titles live at the tail. */
+export const REPORT_BODY_BOUND = 700;
+
+const FINDING_TITLE_LINE = /^\s*(?:#{1,6}\s|[-*]\s|\d+\.\s)/u;
+
 export function reportConclusionState(report: string): string {
-  const body = report
-    .split(/\r?\n/u)
-    .filter((line) => !/^\s*(?:\*\*)?Verdict:\s*(?:READY TO MERGE|NEEDS CHANGES|MAJOR REWORK NEEDED|INCOMPLETE)(?:\*\*)?\s*$/iu.test(line))
-    .join('\n')
-    .trim();
+  const body = summariseReportBody(
+    report
+      .split(/\r?\n/u)
+      .filter((line) => !/^\s*(?:\*\*)?Verdict:\s*(?:READY TO MERGE|NEEDS CHANGES|MAJOR REWORK NEEDED|INCOMPLETE)(?:\*\*)?\s*$/iu.test(line))
+      .join('\n')
+      .trim(),
+  );
   return filteredState({ report: body });
+}
+
+/** Deterministic bounded summary: bodies at or under the bound pass
+ * through untouched (the labelled history's regime); longer bodies keep
+ * their head plus every finding-title line. */
+export function summariseReportBody(body: string, bound: number = REPORT_BODY_BOUND): string {
+  if (body.length <= bound) return body;
+  const lines = body.split(/\r?\n/u);
+  const head: string[] = [];
+  let headLength = 0;
+  const headBudget = Math.floor(bound * 0.6);
+  let index = 0;
+  for (; index < lines.length; index++) {
+    const line = lines[index]!;
+    if (headLength + line.length + 1 > headBudget) break;
+    head.push(line);
+    headLength += line.length + 1;
+  }
+  const titles: string[] = [];
+  let titlesLength = 0;
+  for (; index < lines.length; index++) {
+    const line = lines[index]!;
+    if (!FINDING_TITLE_LINE.test(line)) continue;
+    if (headLength + titlesLength + line.length + 2 > bound) break;
+    titles.push(line.trim());
+    titlesLength += line.length + 2;
+  }
+  return [...head, ...(titles.length > 0 ? ['', '… finding titles:', ...titles] : [])].join('\n').trim();
 }
 
 export function reportConclusionDecisionRequest(report: string): DecisionRequest<typeof REPORT_CONCLUSION_QUESTIONS> {

@@ -980,11 +980,13 @@ async function main(): Promise<number> {
     wakeQuietHours: config.chat.wakeQuietHours,
     morningDigestGapMs: config.chat.morningDigestGapMs,
     onFollowUpPosted: (notification) => surfaceInChat(notification),
-    // Issue #224 shadow wiring: escalation-triage asks at candidate time.
-    // Shadow mode records without changing wake behavior; the ask only
-    // fires when the escalation_triage surface is ready.
+    // Issue #224 shadow wiring: escalation-triage asks at the delivery
+    // receipt. Asks fire ONLY when the escalation_triage surface is
+    // explicitly configured `mode = "shadow"` and its routed profile is
+    // ready; the runtime records without changing wake behavior.
     decisions: decisionRuntime,
     readyForSurface: (surface) => decisionRuntime.readyFor(surface),
+    modeForSurface: (surface) => decisionRuntime.surfaceMode(surface),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   const chat = createChatServer({
@@ -1564,10 +1566,12 @@ async function main(): Promise<number> {
       // construction-order change can never freeze a null handle (A4).
       supervisionFor: supervisionLookup(() => supervisor),
       // Issue #224 shadow wiring: same-blocker identity asks from the
-      // recurrence block. Shadow mode records without changing the
-      // ladder; the ask only fires when the same_blocker surface is ready.
+      // recurrence block. Asks fire ONLY when the same_blocker surface is
+      // explicitly configured `mode = "shadow"` and its routed profile is
+      // ready; the runtime records without changing the ladder.
       decisions: decisionRuntime,
       readyForSurface: (surface) => decisionRuntime.readyFor(surface),
+      modeForSurface: (surface) => decisionRuntime.surfaceMode(surface),
       // Chief phase-3 seam: every deterministic Silas pass runs the
       // production hook — the in-memory review-handoff reconsideration
       // plus the bounded durable reconciliation (issue #163) — BEFORE any
