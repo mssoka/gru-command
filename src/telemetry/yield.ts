@@ -11,12 +11,21 @@
  * real prompt builders through `classifyTurn`.
  */
 
-import { AWARENESS_BLOCK_HEADER, AWARENESS_WAKE_INSTRUCTION } from '../chat/awareness.js';
+import { AWARENESS_BLOCK_HEADER } from '../chat/awareness.js';
 import { BOB_CONSOLIDATION_PROMPT } from '../dispatch/bob-scheduler.js';
 
 // ------------------------------------------------------------------
 // Vocabulary
 // ------------------------------------------------------------------
+
+/**
+ * Stable identity of a policy-started Gru turn: the FIRST clause of
+ * AWARENESS_WAKE_INSTRUCTION. The instruction's tail evolves (GH-218/219
+ * appended the decision-memory order), so matching the whole live constant
+ * classified every historical wake as an owner turn — 0 of 202 real wake
+ * prompts matched. A test pins this marker as the constant's prefix.
+ */
+export const SERVICE_WAKE_MARKER = 'This turn was started by the service wake policy';
 
 export const SESSION_ROLES = ['gru', 'silas', 'bob', 'perkins', 'minion'] as const;
 export type SessionRole = (typeof SESSION_ROLES)[number];
@@ -119,7 +128,7 @@ export function classifyTurn(role: SessionRole, text: string): TurnClassificatio
       return kind === null ? { label: 'other', turnClass: 'machine' } : { label: kind, turnClass: 'machine' };
     }
     case 'gru':
-      if (text.includes(AWARENESS_WAKE_INSTRUCTION)) return { label: 'service-wake', turnClass: 'machine' };
+      if (text.includes(SERVICE_WAKE_MARKER)) return { label: 'service-wake', turnClass: 'machine' };
       if (text.startsWith(AWARENESS_BLOCK_HEADER)) return { label: 'owner-turn+awareness', turnClass: 'owner' };
       return { label: 'owner-turn', turnClass: 'owner' };
     case 'bob':

@@ -23,6 +23,7 @@ import {
   parseSilasWakeTrigger,
   PERKINS_LEAD_PROMPT_PREFIX,
   renderTextReport,
+  SERVICE_WAKE_MARKER,
   SILAS_WAKE_PREFIX,
   sweepSignaturesOf,
   windowTurns,
@@ -85,6 +86,21 @@ function silasWakePrompt(kind: SilasTrigger['kind'], digest: SilasOpsDigest): st
 const gruWakeText = `${AWARENESS_BLOCK_HEADER}\nAction required (unacknowledged):\n- [11111111-1111-4111-8111-111111111111] title="x" — "y"\n\n${AWARENESS_WAKE_INSTRUCTION}`;
 
 const gruOwnerAwareText = `${AWARENESS_BLOCK_HEADER}\nSince your last turn:\njob x: working → delivered`;
+
+/** The wake instruction exactly as it shipped before GH-218/219 appended the
+ * decision-memory order — every real 2026-09 wake prompt carries THIS text,
+ * so the classifier must not depend on the live constant's tail. */
+const HISTORICAL_WAKE_INSTRUCTION =
+  'This turn was started by the service wake policy — no user message is waiting. ' +
+  'This is machine attention and it is meant to be acted on in-turn: diagnose the item, ' +
+  'take one substantive step per incident (a fix lane, a re-arm, or a disposition), and ' +
+  'stage the rest. After acting on an action-required alert, explicitly resolve its ' +
+  'notification ID with POST /api/notifications/{id}/disposition and a nonempty detail; ' +
+  'prompt delivery alone never clears it. In all mode, FYI and needs-owner rows can also ' +
+  'wake you; do not act on or Ack an owner-only stop on the owner’s behalf. Escalate ' +
+  'decisions that are theirs; if nothing is actionable, say so briefly.';
+
+const gruHistoricalWakeText = `${AWARENESS_BLOCK_HEADER}\nAction required (unacknowledged):\n- [22222222-2222-4222-8222-222222222222] title="PR #148 conflicts with its base" — "z"\n\n${HISTORICAL_WAKE_INSTRUCTION}`;
 
 function assistantLine(overrides: {
   readonly input?: number;
@@ -199,6 +215,18 @@ describe('turn attribution follows the real prompt builders', () => {
   it('keeps the retyped wake prefix aligned with buildWakePrompt output', () => {
     expect(silasWakePrompt('sweep', emptyDigest).startsWith(SILAS_WAKE_PREFIX)).toBe(true);
     expect(parseSilasWakeTrigger(silasWakePrompt('job.delivered', emptyDigest))).toBe('job.delivered');
+  });
+
+  it('classifies a service wake whose instruction predates later edits (real 2026-09 wording)', () => {
+    // Fail-before: matching the whole live constant attributed all 202 real
+    // historical wakes to owner turns, halving the reported machine share.
+    expect(HISTORICAL_WAKE_INSTRUCTION).not.toBe(AWARENESS_WAKE_INSTRUCTION);
+    expect(classifyTurn('gru', gruHistoricalWakeText)).toEqual({ label: 'service-wake', turnClass: 'machine' });
+  });
+
+  it('keeps the service-wake marker a prefix of the live wake instruction', () => {
+    expect(AWARENESS_WAKE_INSTRUCTION.startsWith(SERVICE_WAKE_MARKER)).toBe(true);
+    expect(HISTORICAL_WAKE_INSTRUCTION.startsWith(SERVICE_WAKE_MARKER)).toBe(true);
   });
 
   it('classifies gru service wakes, awareness-tagged owner turns and plain owner turns', () => {
