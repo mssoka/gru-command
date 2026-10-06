@@ -48,6 +48,19 @@ function copyTree(source: string, destination: string): void {
   }
 }
 
+/** macOS marks every npm-installed file with a provenance xattr whose
+ * per-file verification makes tree walks an order of magnitude slower on
+ * this host; the identity walk only hashes file bytes and metadata, so
+ * clearing them on the private copy changes nothing it verifies. */
+function clearProvenanceXattrs(destination: string): void {
+  if (process.platform !== 'darwin') return;
+  try {
+    execFileSync('xattr', ['-cr', destination], { stdio: 'ignore' });
+  } catch {
+    // best effort: absence of the tool is not a test failure
+  }
+}
+
 /** The build+packed tarball is the same bytes for every identity fixture
  * in this file, so it is built and packed ONCE and reused: the four
  * `packageIdentity()` calls used to rebuild and repack the whole source,
@@ -128,6 +141,7 @@ function packageIdentity(): { root: string; identity: string } {
     const destination = join(installed, directory.slice(source.length + 1));
     copyTree(directory, destination);
   }
+  clearProvenanceXattrs(installed);
   expect(existsSync(join(installed, 'node_modules', '@earendil-works', 'pi-ai'))).toBe(true);
   return { root: installed, identity: reviewRuntimeVersion(installed) };
 }
