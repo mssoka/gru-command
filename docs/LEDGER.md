@@ -56,6 +56,9 @@ job:    dispatched → working → delivered → in-review → merged | done
         (any non-terminal ⇄ blocked / parked as recoverable side-states;
          merged/done are terminal; a PR registered before the turn
          settles keeps working → in-review legal)
+        administrative closeout: parked → done ONLY through
+         `adminCloseParkedJob` (audited, evidence-bound — never the
+         generic status write)
 
 round:  pending → live → verdict-posted | aborted   (terminal: the last two)
 
@@ -71,6 +74,22 @@ lens:   pending → live → done | error               (terminal: the last two)
 - `merged` has **no internal writer**: merge detection belongs to the
   external sweep (Silas) — the remaining external caller of the job
   machine. Nothing in the ledger infers a merge.
+- **Administrative closeout** (`adminCloseParkedJob`, owner ruling
+  j-1115) is the ONE exception path that closes a parked PR-backed lane
+  without faking a hop: the generic machine still refuses parked → done,
+  and only this guarded operation admits `parked → done`. It requires an
+  explicit expected status + PR url + head, the job's LATEST recorded
+  `github.branch-state` observation to say the PR is CLOSED and not
+  merged at exactly that url/head, and no target-owned live work
+  (spawning/streaming worker turns, non-terminal child workers,
+  pending/live rounds, unsettled verification runs). ONE transaction
+  appends the `job.admin-closeout` audit (request evidence + the cited
+  observation seq), records the direct status hop, and closes the
+  applicable obligations `job-terminal` (abandonment, never a success
+  claim). A repeated identical request returns the recorded closeout
+  idempotently; a changed request is refused — the recorded one is never
+  overwritten. Idle/historical bookkeeping rows and the separate
+  directive/re-brief control rows are neither read nor rewritten.
 - `setRoundVerdict` also transitions the round to `verdict-posted` — a
   posted verdict IS that state (and a verdict on a still-`pending` round
   fails loud, machine and all, leaving no trace).
@@ -97,6 +116,7 @@ publishes it on the in-process event bus (`src/events/bus.ts`).
 |---|---|
 | `job.created` | repo, title, display_name |
 | `job.status` / `job.note` / `job.pr` / `job.target` | from→to / note / url / ref |
+| `job.admin-closeout` | disposition (`closed-without-merge`), expected status/url, provider evidence (state/merged/head/closed_at), the cited `github.branch-state` observation (event seq + identity), reason, request sha256 |
 | `round.created` / `round.status` / `round.verdict` / `round.target` | seq, lenses / from→to / verdict / ref |
 | `lens.bound` / `lens.status` | agentId / from→to (+note) |
 | `agent.spawned` / `agent.state` / `agent.error` | role, label / from→to (+error) / error, fatal |
@@ -125,7 +145,9 @@ first); the notification center derives its feed from recent events.
 All writes go through `LedgerApi`; every method validates, updates the
 row, appends the event, and (with a bus attached) publishes it:
 
-- jobs: `addJob` · `setJobStatus` · `noteJob` · `setJobPr` · `setJobTargetRef`
+- jobs: `addJob` · `setJobStatus` · `noteJob` · `setJobPr` · `setJobTargetRef` ·
+  `adminCloseParkedJob` (guarded administrative closeout, owner ruling
+  j-1115: evidence-bound parked → done for a closed-without-merge PR)
 - rounds: `addRound` · `setRoundStatus` · `setRoundVerdict` · `setRoundTarget`
 - lenses: `bindLens` · `setLensOutcome` · `markLensLive`
 - agents: `registerAgent` (upsert) · `setAgentState`

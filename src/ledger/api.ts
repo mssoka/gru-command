@@ -4,6 +4,7 @@ import type { BusEvent, EventBus } from '../events/bus.js';
 import type { Role } from '../config.js';
 import type { AgentState } from '../runtime/types.js';
 import {
+  assertAdminCloseoutTransition,
   assertJobTransition,
   assertLensTransition,
   assertObligationTransition,
@@ -425,6 +426,64 @@ export class RecordNotFound extends Error {
   }
 }
 
+/** Why an administrative closeout was refused. Each refusal is a loud,
+ * no-effect failure: nothing is written when it is thrown (the operation
+ * validates every guard before its single transaction writes). */
+export type AdminCloseoutRefusalCode =
+  | 'not-parked'
+  | 'not-pr-backed'
+  | 'not-pr-owing'
+  | 'target-mismatch'
+  | 'unconfirmed-pr'
+  | 'pr-open'
+  | 'pr-merged'
+  | 'stale-head'
+  | 'live-work'
+  | 'already-closed';
+
+/** A guarded administrative closeout refused by a durable-state fact. The
+ * HTTP surface maps this to 409 (`closeout_refused` + `code`), never to a
+ * malformed-request 400. */
+export class AdminCloseoutRefusal extends Error {
+  constructor(
+    readonly code: AdminCloseoutRefusalCode,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'AdminCloseoutRefusal';
+  }
+}
+
+/** The provider identity an administrative closeout asserts: the PR is
+ * CLOSED and explicitly not merged, at the named head. */
+export interface AdminCloseoutProviderEvidence {
+  readonly provider: 'github';
+  readonly state: 'closed';
+  readonly merged: false;
+  readonly headSha: string;
+  /** The provider's close timestamp when the caller has one (recorded
+   * verbatim; never compared — the observation event is the binding). */
+  readonly closedAt?: string | null;
+}
+
+export interface AdminCloseoutInput {
+  readonly jobId: string;
+  /** Optimistic concurrency: the only admitted source state. */
+  readonly expectedStatus: 'parked';
+  /** The exact registered PR target being closed. */
+  readonly expectedPrUrl: string;
+  readonly provider: AdminCloseoutProviderEvidence;
+  /** Why the closeout is authorized (recorded verbatim; bounded). */
+  readonly reason: string;
+}
+
+export interface AdminCloseoutResult {
+  readonly job: JobRecord;
+  /** The `job.admin-closeout` audit event (the ORIGINAL on a replay). */
+  readonly event: EventRecord;
+  readonly idempotent: boolean;
+}
+
 /** A guarded re-brief write lost its admitted request or the job closed. */
 export class PendingRebriefNoLongerCurrent extends Error {
   constructor(readonly reason: 'terminal' | 'superseded') {
@@ -803,6 +862,34 @@ export function requireSafeRecordId(value: string, name: string, maxLength = 128
   if (!isSafePipelineRecordId(value, maxLength)) {
     throw new Error(`${name} must be a safe ${maxLength}-character record identifier`);
   }
+}
+
+/** The strict read of one recorded `github.branch-state` observation, as
+ * the administrative closeout consumes it. Every field is optional on the
+ * wire; anything absent or the wrong type reads as `null` and fails the
+ * closeout closed (unconfirmed) — never as a guessed default. */
+interface CloseoutObservation {
+  readonly prUrl: string | null;
+  readonly prNumber: number | null;
+  readonly sha: string | null;
+  readonly merged: boolean | null;
+  readonly prOpen: boolean | null;
+}
+
+function parseCloseoutObservation(payload: unknown): CloseoutObservation | null {
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return null;
+  const record = payload as Record<string, unknown>;
+  const stringOrNull = (value: unknown): string | null => (typeof value === 'string' ? value : null);
+  const numberOrNull = (value: unknown): number | null =>
+    typeof value === 'number' && Number.isFinite(value) ? value : null;
+  const booleanOrNull = (value: unknown): boolean | null => (typeof value === 'boolean' ? value : null);
+  return {
+    prUrl: stringOrNull(record['pr_url']),
+    prNumber: numberOrNull(record['pr_number']),
+    sha: stringOrNull(record['sha']),
+    merged: booleanOrNull(record['merged']),
+    prOpen: booleanOrNull(record['pr_open']),
+  };
 }
 
 export class LedgerApi {
@@ -1397,6 +1484,14 @@ export class LedgerApi {
     return rows.map((row) => this.jobFromRow(row));
   }
 
+  /** The one jobs-row status write + `job.status` event. Callers assert
+   * their own transition first (the generic machine vs. the audited
+   * administrative-closeout edge); the write shape lives in one place. */
+  private writeJobStatus(id: string, from: JobStatus, to: JobStatus): EventRecord {
+    this.db.prepare('UPDATE jobs SET status = ?, updated_at = ? WHERE id = ?').run(to, nowIso(), id);
+    return this.appendEvent({ kind: 'job.status', jobId: id, payload: { from, to } });
+  }
+
   setJobStatus(id: string, status: string, context?: BlockerContext): JobRecord {
     if (!isJobStatus(status)) throw new Error(`unknown job status "${status}"`);
     if (context !== undefined && status !== 'blocked') {
@@ -1407,10 +1502,7 @@ export class LedgerApi {
       if (current === null) throw new RecordNotFound(`job "${id}" not found`);
       if (current.status !== status) {
         assertJobTransition(current.status, status);
-        this.db
-          .prepare('UPDATE jobs SET status = ?, updated_at = ? WHERE id = ?')
-          .run(status, nowIso(), id);
-        const event = this.appendEvent({ kind: 'job.status', jobId: id, payload: { from: current.status, to: status } });
+        const event = this.writeJobStatus(id, current.status, status);
         // Status/obligation consistency lives AT this transactional boundary
         // (chief ruling A): every writer — dispatch, HTTP API, future hooks —
         // rides it. A blocked transition synthesizes/refreshes obligations
@@ -1440,6 +1532,240 @@ export class LedgerApi {
       }
       return this.getJob(id) as JobRecord;
     });
+  }
+
+  /** Administrative closeout (owner ruling j-1115): the ONE audited path
+   * that terminalizes a parked PR-backed lane whose provider PR is
+   * independently recorded CLOSED without merge. It never fakes a
+   * working/in-review hop and never infers merge/READY: the lane closes as
+   * `done` (the existing non-merge terminal) in one transaction that
+   * appends the audit, records the direct status hop and closes the
+   * applicable obligations with `job-terminal` abandonment semantics.
+   *
+   * Guards, all evaluated before anything is written:
+   * - explicit expected state/target identity (stale requests fail loud);
+   * - the job's latest recorded `github.branch-state` observation must say
+   *   the PR is closed (`pr_open === false`), not merged (`merged ===
+   *   false`) and name exactly the expected url + head sha;
+   * - no target-owned live work: spawning/streaming worker turns,
+   *   non-terminal tracked children, pending/live review rounds or
+   *   unsettled verification runs refuse the closeout.
+   *
+   * Repeated identical requests return the recorded closeout idempotently;
+   * a changed request against an already-closed lane is refused, never
+   * silently folded into the recorded one. Directive/re-brief rows,
+   * worktrees, rounds, agents and children are never rewritten — historical
+   * uncertain-control rows stay truthful history. */
+  adminCloseParkedJob(input: AdminCloseoutInput): AdminCloseoutResult {
+    if (input.expectedStatus !== 'parked') {
+      throw new Error(
+        `administrative closeout admits expected_status "parked" only (got ${JSON.stringify(input.expectedStatus)})`,
+      );
+    }
+    const expectedPrUrl = typeof input.expectedPrUrl === 'string' ? input.expectedPrUrl.trim() : '';
+    if (expectedPrUrl === '' || expectedPrUrl.length > 2_000 || /[\p{Cc}]/u.test(expectedPrUrl)) {
+      throw new Error('expected_pr_url must be a bounded non-empty PR url');
+    }
+    const evidence = input.provider;
+    if (typeof evidence !== 'object' || evidence === null) {
+      throw new Error('provider evidence must be an object');
+    }
+    if (evidence.provider !== 'github') {
+      throw new Error(`administrative closeout supports provider "github" only (got ${JSON.stringify(evidence.provider)})`);
+    }
+    if (evidence.state !== 'closed') {
+      throw new Error(`provider state must be "closed" for a closed-without-merge closeout (got ${JSON.stringify(evidence.state)})`);
+    }
+    if (evidence.merged !== false) {
+      throw new Error('provider merged must be exactly false — a merged PR is never an administrative closeout');
+    }
+    const headSha = typeof evidence.headSha === 'string' ? evidence.headSha.trim().toLowerCase() : '';
+    if (!/^[0-9a-f]{7,64}$/u.test(headSha)) {
+      throw new Error(`provider head_sha must be a hex commit sha (got ${JSON.stringify(evidence.headSha)})`);
+    }
+    const closedAt = evidence.closedAt ?? null;
+    if (closedAt !== null && (typeof closedAt !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/u.test(closedAt))) {
+      throw new Error(`provider closed_at must be an ISO-8601 UTC timestamp when present (got ${JSON.stringify(closedAt)})`);
+    }
+    const reason = input.reason.trim();
+    if (reason === '' || reason.length > 2_000 || /[\p{Cc}]/u.test(reason.replaceAll('\n', '').replaceAll('\t', ''))) {
+      throw new Error('reason must be bounded printable text (1-2000 characters)');
+    }
+
+    return this.transaction(() => {
+      const job = this.getJob(input.jobId);
+      if (job === null) throw new RecordNotFound(`job "${input.jobId}" not found`);
+      // Target identity first: a request about another PR/lane never
+      // matches, whatever the current status.
+      if (job.prUrl === null) {
+        throw new AdminCloseoutRefusal(
+          'not-pr-backed',
+          `job "${job.id}" has no registered PR — administrative closeout closes PR-backed lanes only`,
+        );
+      }
+      if (job.deliverable !== null && job.deliverable !== 'pr') {
+        throw new AdminCloseoutRefusal(
+          'not-pr-owing',
+          `job "${job.id}" is a ${job.deliverable} lane — report-only lanes are outside the administrative closeout`,
+        );
+      }
+      if (job.prUrl !== expectedPrUrl) {
+        throw new AdminCloseoutRefusal(
+          'target-mismatch',
+          `job "${job.id}" registers PR "${job.prUrl}", not "${expectedPrUrl}" — stale target identity`,
+        );
+      }
+      // Replay identity covers every validated request field in a fixed
+      // order: a changed request is a different identity, never a silent
+      // overwrite of the recorded closeout.
+      const requestSha256 = createHash('sha256')
+        .update(
+          JSON.stringify({
+            job_id: job.id,
+            expected_status: 'parked',
+            expected_pr_url: expectedPrUrl,
+            provider: { provider: 'github', state: 'closed', merged: false, head_sha: headSha, closed_at: closedAt },
+            reason,
+          }),
+        )
+        .digest('hex');
+
+      if (job.status === 'done') {
+        const recorded = this.latestJobEvent(job.id, 'job.admin-closeout');
+        const recordedSha =
+          recorded !== null && typeof recorded.payload === 'object' && recorded.payload !== null
+            ? (recorded.payload as { request_sha256?: unknown }).request_sha256
+            : undefined;
+        if (recorded !== null && recordedSha === requestSha256) {
+          return { job, event: recorded, idempotent: true };
+        }
+        throw new AdminCloseoutRefusal(
+          'already-closed',
+          recorded === null
+            ? `job "${job.id}" is done — not by this administrative operation; re-read the record`
+            : `job "${job.id}" is already done under a DIFFERENT administrative closeout request (event ${recorded.seq}); a changed request never overwrites the recorded one`,
+        );
+      }
+      if (job.status !== 'parked') {
+        throw new AdminCloseoutRefusal(
+          'not-parked',
+          `job "${job.id}" is ${job.status} — administrative closeout admits only a parked lane (expected_status "parked")`,
+        );
+      }
+
+      // Provider identity: the ledger's OWN recorded observation must say
+      // CLOSED without merge at exactly this target/head. No observation,
+      // an open PR, a merge or a moved head all fail closed.
+      const observationEvent = this.latestJobEvent(job.id, 'github.branch-state');
+      const observation = observationEvent === null ? null : parseCloseoutObservation(observationEvent.payload);
+      if (observationEvent === null || observation === null) {
+        throw new AdminCloseoutRefusal(
+          'unconfirmed-pr',
+          `job "${job.id}" has no recorded provider observation — the PR state is unconfirmed; the closeout needs the poll's closed-without-merge record`,
+        );
+      }
+      if (observation.prUrl !== expectedPrUrl) {
+        throw new AdminCloseoutRefusal(
+          'target-mismatch',
+          `the recorded provider observation names "${observation.prUrl ?? 'no url'}", not "${expectedPrUrl}" — stale target identity`,
+        );
+      }
+      if (observation.prOpen === true) {
+        throw new AdminCloseoutRefusal(
+          'pr-open',
+          `job "${job.id}" has a recorded OPEN PR (${expectedPrUrl}) — an open PR is never administratively closed`,
+        );
+      }
+      if (observation.prOpen !== false) {
+        throw new AdminCloseoutRefusal(
+          'unconfirmed-pr',
+          `job "${job.id}" has no recorded closed observation for ${expectedPrUrl} — unconfirmed PR state`,
+        );
+      }
+      if (observation.merged === true) {
+        throw new AdminCloseoutRefusal(
+          'pr-merged',
+          `job "${job.id}" records a MERGED PR — the merge path owns that disposition, never a closeout`,
+        );
+      }
+      if (observation.merged !== false) {
+        throw new AdminCloseoutRefusal(
+          'unconfirmed-pr',
+          `job "${job.id}" has no recorded not-merged observation — unconfirmed merge state`,
+        );
+      }
+      if (observation.sha === null || observation.sha.toLowerCase() !== headSha) {
+        throw new AdminCloseoutRefusal(
+          'stale-head',
+          `recorded provider head ${observation.sha ?? 'unknown'} does not match the requested ${headSha} — stale head`,
+        );
+      }
+
+      // Live-work fence: refusal names every durable execution blocker.
+      const blockers = this.closeoutLiveWorkBlockers(job.id);
+      if (blockers.length > 0) {
+        throw new AdminCloseoutRefusal(
+          'live-work',
+          `job "${job.id}" has target-owned live work — closeout would orphan or conceal it: ${blockers.join('; ')}`,
+        );
+      }
+
+      // ONE transaction: audit first, then the direct parked → done hop,
+      // then obligation closure. A throw anywhere rolls all of it back.
+      assertAdminCloseoutTransition(job.status, 'done');
+      const event = this.appendEvent({
+        kind: 'job.admin-closeout',
+        jobId: job.id,
+        payload: {
+          disposition: 'closed-without-merge',
+          expected_status: 'parked',
+          expected_pr_url: expectedPrUrl,
+          provider: { provider: 'github', state: 'closed', merged: false, head_sha: headSha, closed_at: closedAt },
+          observation: {
+            event_seq: observationEvent.seq,
+            pr_url: observation.prUrl,
+            pr_number: observation.prNumber,
+            sha: observation.sha,
+            pr_open: false,
+            merged: false,
+          },
+          reason,
+          request_sha256: requestSha256,
+        },
+      });
+      this.writeJobStatus(job.id, 'parked', 'done');
+      this.closeApplicableObligations(job.id, 'done');
+      return { job: this.getJob(job.id) as JobRecord, event, idempotent: false };
+    });
+  }
+
+  /** Durable execution blockers for a would-be administrative closeout:
+   * open worker turns, non-terminal tracked children, live review rounds
+   * and unsettled verification runs. Idle/disposed/historical bookkeeping
+   * rows are NOT execution evidence (issue #171 ownership classifies
+   * leftovers at the runtime boundary; a historical gap must not block a
+   * truthful closure) and directive/re-brief control rows are owned by
+   * their own reconcilers — neither is read here. */
+  private closeoutLiveWorkBlockers(jobId: string): readonly string[] {
+    const blockers: string[] = [];
+    const openTurns = this.listAgents().filter(
+      (agent) => agent.jobId === jobId && (agent.state === 'spawning' || agent.state === 'streaming'),
+    );
+    if (openTurns.length > 0) {
+      blockers.push(`open worker turn(s): ${openTurns.map((agent) => `${agent.id} (${agent.state})`).join(', ')}`);
+    }
+    const children = this.listChildWorkers({ jobId }).filter((child) => child.resultState === null);
+    if (children.length > 0) {
+      blockers.push(`non-terminal child worker(s): ${children.map((child) => child.id).join(', ')}`);
+    }
+    const rounds = this.listRounds(jobId).filter((round) => round.status === 'pending' || round.status === 'live');
+    if (rounds.length > 0) {
+      blockers.push(`live review round(s): ${rounds.map((round) => `${round.id} (${round.status})`).join(', ')}`);
+    }
+    if (this.hasUnsettledVerificationRun(jobId)) {
+      blockers.push('unsettled verification run(s) hold the lane');
+    }
+    return blockers;
   }
 
   noteJob(id: string, note: string): JobRecord {

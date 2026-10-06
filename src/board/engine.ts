@@ -406,6 +406,10 @@ interface MutableChildCounts {
 
 function prStateOf(job: Pick<JobRecord, 'status' | 'prUrl'>): JobView['prState'] {
   if (job.status === 'merged') return 'merged';
+  // A terminal `done` lane (including a closed-without-merge administrative
+  // closeout) is a closed receipt: its registered PR is never presented as
+  // open, and closure never infers a merge.
+  if (job.status === 'done') return null;
   if (job.prUrl !== null) return 'open';
   return null;
 }

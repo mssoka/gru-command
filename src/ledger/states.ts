@@ -124,6 +124,17 @@ export function assertJobTransition(from: JobStatus, to: JobStatus): void {
   assertTransition('job', from, to, JOB_TRANSITIONS);
 }
 
+/** The audited administrative-closeout edge (owner ruling j-1115): a parked
+ * PR-backed lane whose provider PR is independently recorded CLOSED without
+ * merge closes truthfully as `done`. Deliberately NOT part of
+ * `JOB_TRANSITIONS`: the generic status write keeps refusing parked → done,
+ * and only the guarded, evidence-bound operation
+ * (`LedgerApi.adminCloseParkedJob`) admits this edge. */
+export function assertAdminCloseoutTransition(from: JobStatus, to: JobStatus): void {
+  if (from === 'parked' && to === 'done') return;
+  throw new Error(`job administrative closeout ${from} → ${to} is not admitted (only parked → done)`);
+}
+
 export function assertRoundTransition(from: RoundStatus, to: RoundStatus): void {
   assertTransition('round', from, to, ROUND_TRANSITIONS);
 }
