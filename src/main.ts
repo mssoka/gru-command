@@ -715,6 +715,14 @@ async function main(): Promise<number> {
   const decisionRuntime = new DecisionRuntime(config.decisions, {
     instanceDir: config.instanceDir,
     env: decisionEnvironment,
+    // The enforce gate (#223) reads recorded backtest evidence from the
+    // instance data directory.
+    dataDir: config.dataDir,
+    // Durable shadow ledger (#223): one decisions.shadow event per shadow
+    // ask; recorder failures are isolated inside the runtime.
+    onShadowRecord: (record) => {
+      ledger.appendCustomEvent({ kind: 'decisions.shadow', payload: record });
+    },
     notifications,
     onStatusChange: (status) => {
       ledger.appendCustomEvent({

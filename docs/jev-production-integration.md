@@ -119,6 +119,36 @@ Routing rules:
   "typesafe-direct"`. Unlisted surfaces (and omitted surface arguments)
   ride the default `openrouter-jev` profile — pre-profile behavior,
   unchanged. The deterministic fallback never changes and stays the floor.
+- **Per-surface mode (issue #223).** The explicit table form also accepts
+  `mode = "off" | "shadow" | "enforce"`. `off` serves the deterministic
+  answer and never calls the provider. `shadow` asks the provider and
+  records the answer next to the deterministic baseline as a
+  `decisions.shadow` ledger event (hash of the filtered state + question
+  ids — never the state text), but still serves the deterministic
+  answer: behavior cannot change while evidence accumulates. `enforce`
+  serves the provider answer but requires recorded backtest evidence
+  meeting its stated threshold at
+  `<data_dir>/decisions/backtests/<surface>.json`; missing or failing
+  evidence fails the request loud (`EnforceGateError`). A surface with no
+  `mode` key keeps the pre-#223 behavior without the gate.
+- **Earning enforce.** Extract labelled history to JSONL
+  (`{ id, state, label }`), run the harness against any profile, and save
+  the evidence together with its stated threshold:
+
+  ```
+  node dist/decisions/cli.js extract-cases --surface <s> --out cases.jsonl
+  node dist/decisions/cli.js backtest --surface <s> --profile <p> \
+    --cases cases.jsonl --record <dir>      # live run; stores raw responses
+  node dist/decisions/cli.js backtest --surface <s> --profile <p> \
+    --cases cases.jsonl --replay <dir> --threshold <min> --save
+  ```
+
+  The report carries n, agreement with the deterministic baseline,
+  precision/recall of the action that would be taken, calibration
+  buckets, cost, and p50/p95 latency. `--save` only accepts a `--threshold`;
+  the enforce gate re-evaluates the recorded metric against it and never
+  trusts the stored flag. Yield telemetry (#214) reports shadow
+  disagreement rates per surface and provider.
 - Production callers pass stable surface names: event/notification triage
   uses `event_triage`; supervisor runtime-health guidance uses
   `supervision_guidance`.

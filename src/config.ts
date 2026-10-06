@@ -4,6 +4,7 @@ import { isAbsolute, join, relative, resolve } from 'node:path';
 import { parse, type TomlPrimitive } from 'smol-toml';
 import { parseQuietHours } from './chat/wake-policy.js';
 import { DEFAULT_INPUT_PRICE_PER_MTOK, validateProviderProfile } from './decisions/profile.js';
+import type { SurfaceMode } from './decisions/types.js';
 
 /** Roles are product-native and runtime-agnostic (SPEC ruling 15). */
 export const ROLES = ['gru', 'silas', 'minion', 'perkins', 'bob'] as const;
@@ -452,13 +453,24 @@ export interface DecisionThresholdConfig {
   readonly requireConfirmOnAct: boolean;
 }
 
+/** One normalized `[decisions.surfaces.<surface>]` entry (issue #223).
+ * `provider` omitted → the default profile (today's routing, unchanged).
+ * `mode` omitted → the surface keeps its pre-#223 behavior (the provider's
+ * answer, deterministic fallback) with NO enforce gate: the gate protects
+ * an operator's explicit switch, never a legacy default. */
+export interface DecisionSurfaceConfig {
+  readonly provider?: string;
+  readonly mode?: SurfaceMode;
+}
+
 export interface DecisionsConfig {
   readonly jev: JevConfig;
   /** User-defined/overriding provider profiles; built-ins are merged in by
    * {@link effectiveDecisionProviders}. */
   readonly providers: Readonly<Record<string, DecisionProviderTable>>;
-  /** Per-surface routing: surface name → provider profile name. */
-  readonly surfaces: Readonly<Record<string, string>>;
+  /** Per-surface routing and mode (issue #223): surface name → the profile
+   * it routes to and the off/shadow/enforce mode it runs in. */
+  readonly surfaces: Readonly<Record<string, DecisionSurfaceConfig>>;
   readonly thresholds: Readonly<{
     read_only: DecisionThresholdConfig;
     operational: DecisionThresholdConfig;
@@ -1835,11 +1847,13 @@ function readDecisionsConfig(
       providers[name] = profile;
     }
   }
-  // Per-surface routing: every surface must name a profile that exists in
-  // the effective set (built-ins + this table). Both documented spellings
-  // are accepted — the shorthand `surface = "profile"` and the explicit
-  // `[decisions.surfaces.<surface>] provider = "profile"` table.
-  const surfaces: Record<string, string> = Object.create(null);
+  // Per-surface routing and mode (issue #223). Both documented spellings
+  // are accepted — the shorthand `surface = "profile"` (routing only,
+  // legacy behavior preserved) and the explicit
+  // `[decisions.surfaces.<surface>]` table with `provider` and/or `mode`.
+  // Every named provider must exist in the effective set (built-ins + this
+  // table); mode must be one of off|shadow|enforce when present.
+  const surfaces: Record<string, DecisionSurfaceConfig> = Object.create(null);
   if (table['surfaces'] !== undefined) {
     const surfacesTable = requireTable(table['surfaces'], file, 'decisions.surfaces');
     const effective = effectiveDecisionProviders({ ...defaults, jev, providers, surfaces: {} });
@@ -1852,38 +1866,56 @@ function readDecisionsConfig(
           `decisions.surfaces.${surface}`,
         );
       }
-      let profile: string;
-      const entry = surfacesTable[surface];
-      if (typeof entry === 'object' && entry !== null && !Array.isArray(entry)) {
-        const surfaceTable = entry as Record<string, unknown>;
+      let entry: DecisionSurfaceConfig;
+      const raw = surfacesTable[surface];
+      if (typeof raw === 'object' && raw !== null && !Array.isArray(raw)) {
+        const surfaceTable = raw as Record<string, unknown>;
         for (const key of Object.keys(surfaceTable)) {
-          if (key !== 'provider') {
+          if (key !== 'provider' && key !== 'mode') {
             throw new ConfigError(
-              `unknown key \`${key}\` in [decisions.surfaces.${surface}] (valid keys: provider)`,
+              `unknown key \`${key}\` in [decisions.surfaces.${surface}] (valid keys: mode, provider)`,
               file,
               `decisions.surfaces.${surface}.${key}`,
             );
           }
         }
-        if (surfaceTable['provider'] === undefined) {
+        if (surfaceTable['provider'] === undefined && surfaceTable['mode'] === undefined) {
           throw new ConfigError(
-            `[decisions.surfaces.${surface}] is missing required key \`provider\``,
+            `[decisions.surfaces.${surface}] is empty; name \`provider\` and/or \`mode\``,
             file,
             `decisions.surfaces.${surface}`,
           );
         }
-        profile = requireString(surfaceTable['provider'], file, `decisions.surfaces.${surface}.provider`);
+        entry = {};
+        if (surfaceTable['provider'] !== undefined) {
+          entry = {
+            ...entry,
+            provider: requireString(surfaceTable['provider'], file, `decisions.surfaces.${surface}.provider`),
+          };
+        }
+        if (surfaceTable['mode'] !== undefined) {
+          const mode = requireString(surfaceTable['mode'], file, `decisions.surfaces.${surface}.mode`);
+          if (mode !== 'off' && mode !== 'shadow' && mode !== 'enforce') {
+            throw new ConfigError(
+              `decisions.surfaces.${surface}.mode must be one of: off, shadow, enforce`,
+              file,
+              `decisions.surfaces.${surface}.mode`,
+            );
+          }
+          entry = { ...entry, mode };
+        }
       } else {
-        profile = requireString(entry, file, `decisions.surfaces.${surface}`);
+        entry = { provider: requireString(raw, file, `decisions.surfaces.${surface}`) };
       }
-      if (!Object.prototype.hasOwnProperty.call(effective, profile)) {
+      const profile = entry.provider;
+      if (profile !== undefined && !Object.prototype.hasOwnProperty.call(effective, profile)) {
         throw new ConfigError(
           `decisions.surfaces.${surface} names unknown provider profile \`${profile}\` (available: ${Object.keys(effective).join(', ')})`,
           file,
           `decisions.surfaces.${surface}`,
         );
       }
-      surfaces[surface] = profile;
+      surfaces[surface] = entry;
     }
   }
   let thresholds = defaults.thresholds;
