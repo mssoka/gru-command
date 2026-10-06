@@ -585,8 +585,52 @@ describe('pending re-brief terminal retirement (ledger boundary)', () => {
     expect(result).toMatchObject({ retired: [], skippedIds: [], refused: 'events-already-landed' });
     expect(api.listPendingRebriefs({ jobId })).toEqual(markers);
     expect(api.latestJobEvent(jobId, 'silas.rebrief-retired')).toBeNull();
-    expect(api.clearPendingRebriefsIfCurrent(markers)).toBe(true);
+    expect(api.clearPendingRebriefsIfCurrentAndSettle(markers)).toBe(true);
     expect(api.listPendingRebriefs({ jobId })).toHaveLength(0);
+    expect(api.listJobEvents(jobId).filter((event) => event.kind === 'silas.rebrief-settled')).toHaveLength(1);
+  });
+
+  it('settlement refuses an unfinished or incoherent pair before any deletion', () => {
+    const unlanded = 'settle-refuse-unlanded';
+    api.addJob({ id: unlanded, repo: 'settlement-refusal', title: 'not yet' });
+    api.setJobStatus(unlanded, 'working');
+    const markers = api.beginPendingRebrief({ jobId: unlanded, note: 'n', briefing: 'b' });
+    expect(() => api.clearPendingRebriefsIfCurrentAndSettle(markers))
+      .toThrow(/guarded event .* has not landed/u);
+    expect(api.listPendingRebriefs({ jobId: unlanded })).toHaveLength(2);
+    expect(api.latestJobEvent(unlanded, 'silas.rebrief-settled')).toBeNull();
+
+    const malformed = 'settle-refuse-malformed';
+    api.addJob({ id: malformed, repo: 'settlement-refusal', title: 'broken pair' });
+    api.setJobStatus(malformed, 'working');
+    const pair = api.beginPendingRebrief({ jobId: malformed, note: 'n', briefing: 'b' });
+    db.handle.prepare('DELETE FROM pending_rebriefs WHERE id = ?').run(pair[0]!.id);
+    const survivor = api.listPendingRebriefs({ jobId: malformed });
+    expect(() => api.clearPendingRebriefsIfCurrentAndSettle(survivor))
+      .toThrow(/incomplete or incoherent/u);
+    expect(api.listPendingRebriefs({ jobId: malformed })).toHaveLength(1);
+    expect(api.latestJobEvent(malformed, 'silas.rebrief-settled')).toBeNull();
+  });
+
+  it('settlement insertion failure rolls back the marker clear, then a retry settles once', () => {
+    const jobId = 'settle-atomic-rollback';
+    api.addJob({ id: jobId, repo: 'settlement-rollback', title: 'atomic' });
+    api.setJobStatus(jobId, 'working');
+    const markers = api.beginPendingRebrief({ jobId, note: 'n', briefing: 'b' });
+    api.appendCustomEvent({ kind: 'silas.rebrief', jobId });
+    api.appendCustomEvent({ kind: 'job.delivered', jobId });
+    db.handle.exec(`CREATE TRIGGER fail_rebrief_settlement BEFORE INSERT ON events
+      WHEN NEW.kind = 'silas.rebrief-settled' BEGIN SELECT RAISE(ABORT, 'settlement blocked'); END`);
+    try {
+      expect(() => api.clearPendingRebriefsIfCurrentAndSettle(markers)).toThrow(/settlement blocked/u);
+      expect(api.listPendingRebriefs({ jobId }).map((row) => row.id)).toEqual(markers.map((row) => row.id));
+      expect(api.latestJobEvent(jobId, 'silas.rebrief-settled')).toBeNull();
+    } finally {
+      db.handle.exec('DROP TRIGGER fail_rebrief_settlement');
+    }
+    expect(api.clearPendingRebriefsIfCurrentAndSettle(markers)).toBe(true);
+    expect(api.listPendingRebriefs({ jobId })).toHaveLength(0);
+    expect(api.listJobEvents(jobId).filter((event) => event.kind === 'silas.rebrief-settled')).toHaveLength(1);
   });
 
   it('retirement audit insertion failure rolls back marker deletion, then a retry commits once', () => {

@@ -70,19 +70,82 @@ export interface RoundBlocker {
   readonly category: string;
   readonly title: string;
   readonly location: string;
+  /** Quoted snippet from the finding, when the report carried one. NOT
+   * part of the base fingerprint (it churns every round) — it only breaks
+   * same-key ties inside roundBlockerKeys. */
+  readonly evidence?: string;
 }
 
 export type RecurrenceAdvice = 'monitor' | 'directive' | 'rebrief' | 'escalate';
 
 /**
+ * Stable location identity for a blocker: the file path with any
+ * line-position suffix stripped. A repair edit above a blocker shifts its
+ * line numbers, and a line-bearing identity would mint a new fingerprint
+ * every round — silently resetting the recurrence ladder (issue #216).
+ * Strips a trailing `:<line>`, `:<start>-<end>` or `#L…` marker (bare or
+ * `#L<start>-L<end>`), normalizes path separators to `/`, and lowercases.
+ * Pads first: the findings parsers accept surrounding whitespace without
+ * trimming it, and `"src/a.ts:42 "` must strip its suffix just the same.
+ */
+export function blockerLocationKey(location: string): string {
+  return location
+    .trim()
+    .replace(/\\+/gu, '/')
+    .replace(/(?:#L\d+(?:-L\d+)?|:\d+(?:-\d+)?)$/u, '')
+    .toLowerCase()
+    .trim();
+}
+
+/** Deterministic 32-bit FNV-1a, hex — collision tie-breaks only; never a
+ * security primitive. Pure so recomputed identities stay stable. */
+function evidenceHash(value: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < value.length; i += 1) {
+    hash ^= value.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash.toString(16).padStart(8, '0');
+}
+
+/**
  * Canonical blocker identity: the same defect resurfaces across review
  * rounds with reworded prose, so the fingerprint normalizes the finding's
- * category, location, and title (case and whitespace collapsed). Evidence
- * is deliberately excluded — it changes every round.
+ * category and title (case and whitespace collapsed) and keys the
+ * location by FILE PATH ONLY (see blockerLocationKey) — line numbers move
+ * with every edit above the defect and must not reset its streak
+ * (issue #216). Evidence is deliberately excluded — it changes every
+ * round. Known limit: a reworded title still mints a new fingerprint;
+ * semantic matching is #224's surface, not this one's.
  */
 export function blockerFingerprint(blocker: RoundBlocker): string {
   const norm = (value: string): string => value.toLowerCase().replace(/\s+/gu, ' ').trim();
-  return [norm(blocker.category), norm(blocker.location), norm(blocker.title)].join('::');
+  return [norm(blocker.category), blockerLocationKey(blocker.location), norm(blocker.title)].join('::');
+}
+
+/**
+ * Per-blocker identity keys for one round's blockers, in input order. The
+ * base key is blockerFingerprint; when one base key is shared (same file,
+ * category and title — distinct defects that would otherwise collide and
+ * merge, one dropped by the digest's dedupe), members carrying
+ * distinguishable evidence get a `::ev-<hash>` tie-break suffix (the
+ * issue's optional step 4). Evidence participates ONLY inside a colliding
+ * group — a non-colliding blocker's key never sees evidence, so evidence
+ * churn between rounds can never reset a streak. Members with no evidence,
+ * or equal normalized evidence, keep the base key and merge downstream —
+ * that merge is the documented limit.
+ */
+export function roundBlockerKeys(blockers: readonly RoundBlocker[]): string[] {
+  const norm = (value: string): string => value.toLowerCase().replace(/\s+/gu, ' ').trim();
+  const baseKeys = blockers.map((blocker) => blockerFingerprint(blocker));
+  const counts = new Map<string, number>();
+  for (const key of baseKeys) counts.set(key, (counts.get(key) ?? 0) + 1);
+  return baseKeys.map((base, index) => {
+    if ((counts.get(base) ?? 0) <= 1) return base;
+    const evidence = blockers[index]?.evidence;
+    const normalized = typeof evidence === 'string' ? norm(evidence) : '';
+    return normalized === '' ? base : `${base}::ev-${evidenceHash(normalized)}`;
+  });
 }
 
 /**
@@ -94,7 +157,7 @@ export function blockerFingerprint(blocker: RoundBlocker): string {
 export function consecutiveRecurrence(fingerprint: string, roundsNewestFirst: readonly (readonly RoundBlocker[])[]): number {
   let count = 0;
   for (const round of roundsNewestFirst) {
-    if (round.some((blocker) => blockerFingerprint(blocker) === fingerprint)) count += 1;
+    if (roundBlockerKeys(round).includes(fingerprint)) count += 1;
     else break;
   }
   return count;
@@ -223,6 +286,9 @@ export function consolidatedBlockersFor(ledger: DigestLedger): BlockersForRound 
           category: String(finding.category ?? ''),
           title: String(finding.title ?? ''),
           location: String(finding.location ?? ''),
+          ...(typeof finding.evidence === 'string' && finding.evidence.trim() !== ''
+            ? { evidence: finding.evidence }
+            : {}),
         }));
       return Promise.resolve({ blockers, note: null });
     } catch (error) {
@@ -915,9 +981,14 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       job.status === 'in-review'
     ) {
       const verdictEvent = input.ledger.latestJobEvent(job.id, 'round.verdict');
-      const handled = input.ledger
-        .listJobEvents(job.id, { limit: 50 })
-        .filter((event) => event.kind === 'silas.directive-sent' || event.kind === 'silas.rebrief' || event.kind === 'silas.escalated');
+      // Kinds-scoped read: unrelated job traffic must not age a landed rung
+      // marker out of a fixed newest-N window, or an already-handled verdict
+      // would be offered again (issue #216, AC4).
+      const handled = input.ledger.listJobEventsByKinds(job.id, [
+        'silas.directive-sent',
+        'silas.rebrief',
+        'silas.escalated',
+      ]);
       // Only hand the verdict over when no silas rung has landed after it —
       // a directive whose turn is still running must not re-fire per sweep.
       const alreadyHandled = handled.some((event) => verdictEvent === null || event.seq > verdictEvent.seq);
@@ -933,10 +1004,11 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
         // verdictRounds preserves the newest-first order of `rounds`, so the
         // first history entry IS the verdict awaiting follow-through.
         const latest = blockerHistory[0] ?? [];
+        const latestKeys = roundBlockerKeys(latest);
         const seen = new Map<string, DigestRecurringBlocker>();
-        for (const blocker of latest) {
-          const fingerprint = blockerFingerprint(blocker);
-          if (seen.has(fingerprint)) continue;
+        latest.forEach((blocker, index) => {
+          const fingerprint = latestKeys[index];
+          if (fingerprint === undefined || seen.has(fingerprint)) return;
           const consecutiveRounds = consecutiveRecurrence(fingerprint, blockerHistory);
           seen.set(fingerprint, {
             ...blocker,
@@ -944,7 +1016,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
             consecutiveRounds,
             advice: adviseFollowThrough(consecutiveRounds, input.config),
           });
-        }
+        });
         digest.verdictsAwaitingDirective.push({
           jobId: job.id,
           repo: job.repo,

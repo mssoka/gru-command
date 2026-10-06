@@ -125,9 +125,11 @@ in-review status — and the Silas digest rechecks every proposed review
 at final publication, after any async blocker-history work. A live re-brief
 finalizer matches the exact admitted marker IDs as well as any phase ID:
 ordinary requests have no phase ID, so an older turn cannot consume a
-newer request's markers. Settlement publishes `silas.rebrief-settled`
-after marker retirement, so a queued handoff that re-queued on the
-earlier delivery can retry without waiting for another sweep. `force: true` is the owner's explicit override —
+newer request's markers. Settlement publishes `silas.rebrief-settled` in
+the SAME transaction that clears the markers, so a queued handoff that
+re-queued on the earlier delivery can retry without waiting for another
+sweep — and a settlement publication failure rolls the clear back instead
+of stranding the handoff behind already-cleared markers. `force: true` is the owner's explicit override —
 never an automatic operations action; a forced round is tagged in its
 frozen manifest
 (`branchIdle`) and the event log (`branch-idle.forced`), refusals land as
@@ -662,12 +664,19 @@ the judgment; the dispatch surface is the mechanical hand.
   re-open). A settled directive/re-brief turn lands as a `job.delivered`
   event carrying the lane head it produced; the digest only fires the
   re-review when that head moved past the round's reviewed target. When
-  the SAME canonical blocker (normalized category/location/title
-  fingerprint) recurs across consecutive verdict rounds, the digest names
+  the SAME canonical blocker (fingerprint of normalized category, file
+  path without line numbers, and normalized title — a line-number suffix
+  never participates, so an edit that shifts the defect's lines keeps its
+  streak; issue #216) recurs across consecutive verdict rounds, the digest names
   the rung and Silas executes it through `/api/silas/*`: `directive_at`
   (default 2) → fix directive to the implementing minion; `rebrief_at`
   (default 3) → re-brief a FRESH minion on the same lane; `escalate_at`
   (default 4) → action-required notification that wakes Gru to rule.
+  Distinct defects sharing one file, category and title tie-break on a
+  normalized hash of the finding's evidence — only inside that colliding
+  group, so evidence churn never resets anyone else's streak. A rung marker
+  is read kinds-scoped, so unrelated job traffic cannot age an
+  already-handled verdict back into the digest.
   Escalation always beats an endless loop. Every rung lands as
   `silas.directive-sent`, `silas.rebrief`, or `silas.escalated`.
 - **Restart safety.** A re-brief REQUEST is durable BEFORE any worker

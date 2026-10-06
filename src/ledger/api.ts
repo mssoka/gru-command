@@ -2876,16 +2876,67 @@ export class LedgerApi {
     });
   }
 
-  /** Complete only the still-admitted generation. Delivery event publication
-   * can re-enter the ledger and replace markers before the caller clears them. */
-  clearPendingRebriefsIfCurrent(expected: readonly PendingRebriefRecord[]): boolean {
+  /** Complete the still-admitted re-brief generation AND publish its durable
+   * settlement signal in ONE transaction (issue #189): the identity-checked
+   * marker deletion and the `silas.rebrief-settled` append commit together
+   * or not at all. The previous clear-then-append ordering stranded queued
+   * review handoffs: a failure after the clear committed left neither the
+   * markers a pending-marker scan needs to repair the gap nor the event a
+   * queued handoff waits on. Here a settlement failure rolls the deletion
+   * back, so the markers stay for the next pass and the next attempt can
+   * still release the handoff; a success publishes the settlement on the
+   * bus exactly once, only after COMMIT, and never for a superseded
+   * generation, a retirement, or a malformed pair.
+   *
+   * The boundary enforces LEDGER TRUTH, never a caller assertion: the rows
+   * must form one complete, coherent marker pair (one marker per guarded
+   * kind, identical phase id, payload hash, and baseline watermark) whose
+   * guarded events have already landed — mirroring how
+   * `retirePendingRebriefs` re-verifies event truth inside its transaction.
+   * A caller that asks to settle an unfinished or incoherent request is a
+   * bug: the transaction aborts with a named refusal and nothing is deleted
+   * or published. The atomicity guarantee is the ledger's durability — the
+   * event row commits with the clear; delivery to a given live bus listener
+   * afterwards is the bus's own contract (a failing listener drops that
+   * event for itself and restart recovery re-arms from `job.delivered`). */
+  clearPendingRebriefsIfCurrentAndSettle(expected: readonly PendingRebriefRecord[]): boolean {
     const jobId = expected[0]?.jobId;
-    if (jobId === undefined) throw new Error('clearing a re-brief generation requires markers');
+    if (jobId === undefined) throw new Error('settling a re-brief generation requires markers');
     return this.transaction(() => {
       if (!this.matchesPendingRebriefGeneration(jobId, expected)) return false;
+      this.assertSettleableRebriefGeneration(jobId, expected);
       this.clearPendingRebriefs(expected.map((marker) => marker.id));
+      this.appendEvent({ kind: 'silas.rebrief-settled', jobId });
       return true;
     });
+  }
+
+  /** Refuse — loudly, before any deletion — a generation that must never
+   * publish settlement: an incomplete or incoherent marker pair, or a
+   * marker whose guarded event has not landed. Ledger truth only: the
+   * events table decides, never the caller's snapshot. */
+  private assertSettleableRebriefGeneration(jobId: string, expected: readonly PendingRebriefRecord[]): void {
+    const coherentPair = expected.length === 2 &&
+      PENDING_REBRIEF_KINDS.every((kind) => expected.some((marker) => marker.kind === kind)) &&
+      expected[0] !== undefined && expected[1] !== undefined &&
+      expected[0].phaseId === expected[1].phaseId &&
+      expected[0].payloadHash === expected[1].payloadHash &&
+      expected[0].baselineSeq === expected[1].baselineSeq;
+    if (!coherentPair) {
+      throw new Error(`job "${jobId}" cannot settle a re-brief: the marker pair is incomplete or incoherent — settlement requires one marker per guarded kind with identical phase id, payload hash, and baseline watermark`);
+    }
+    for (const marker of expected) {
+      const landed = marker.phaseId === null
+        ? (this.latestJobEvent(marker.jobId, marker.kind)?.seq ?? 0) > marker.baselineSeq
+        : this.db.prepare(
+          `SELECT 1 FROM events
+           WHERE job_id = ? AND kind = ? AND seq > ? AND json_extract(payload, '$.phase_id') = ?
+           LIMIT 1`,
+        ).get(marker.jobId, marker.kind, marker.baselineSeq, marker.phaseId) !== undefined;
+      if (!landed) {
+        throw new Error(`job "${jobId}" cannot settle a re-brief: the guarded event ${marker.kind} has not landed past the request watermark — markers must clear only when their events exist`);
+      }
+    }
   }
 
   private matchesPendingRebriefGeneration(jobId: string, expected: readonly PendingRebriefRecord[]): boolean {

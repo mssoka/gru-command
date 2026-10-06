@@ -43,7 +43,11 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  * falls back to a fresh worker on the same lane, and records the missing
  * events when that turn settles. A re-dispatch that fails escalates as
  * action-required — visibly stalled, never silently. The marker outlives
- * every failure, so the next boot retries. A marker whose job has since
+ * every failure, so the next boot retries. Completion itself is atomic
+ * (issue #189): the identity-checked marker clear and the durable
+ * `silas.rebrief-settled` publication (the queued-review release signal)
+ * commit in ONE transaction, so a settlement failure can never leave a
+ * handoff stranded behind already-cleared markers. A marker whose job has since
  * reached terminal (`merged`/`done`) is the exception: the request can
  * never be honored, so boot retires it administratively — one
  * `silas.rebrief-retired` audit committed with the marker deletion —
@@ -177,12 +181,6 @@ function pendingRebriefGuardedEvent(
     return event !== null && event.seq > marker.baselineSeq ? event : null;
   }
   return ledger.latestJobPhaseEvent(marker.jobId, marker.kind, phaseId, marker.baselineSeq);
-}
-
-function publishRebriefSettlement(ledger: LedgerApi, jobId: string): void {
-  // Only after identity-checked completion clears the markers: a queued
-  // review handoff can now retry, never on a superseded or retired turn.
-  ledger.appendCustomEvent({ kind: 'silas.rebrief-settled', jobId });
 }
 
 /**
@@ -343,10 +341,12 @@ export function finalizeRebriefRequest(input: {
 
   // Event publication may have replaced the markers after delivery. The
   // identity-checked clear must not claim that older turn recovered an heir.
-  if (!input.ledger.clearPendingRebriefsIfCurrent(markers)) {
+  // Clear and settlement commit atomically (issue #189): a settlement
+  // failure throws with the markers rolled back, so the queued review
+  // handoff keeps its release signal and the next pass can repair.
+  if (!input.ledger.clearPendingRebriefsIfCurrentAndSettle(markers)) {
     return { minionId: input.minionId, deliveredSha, deliveryNote, rebriefRecorded, deliveryRecorded, retired: false, retirement: null, superseded: true };
   }
-  publishRebriefSettlement(input.ledger, input.jobId);
   return { minionId: input.minionId, deliveredSha, deliveryNote, rebriefRecorded, deliveryRecorded, retired: false, retirement: null, superseded: false };
 }
 
@@ -440,8 +440,7 @@ export async function reconcilePendingRebriefs(
     }
     const missing = group.filter((marker) => !pendingRebriefEventLanded(deps.ledger, marker));
     if (missing.length === 0) {
-      if (deps.ledger.clearPendingRebriefsIfCurrent(group)) {
-        publishRebriefSettlement(deps.ledger, jobId);
+      if (deps.ledger.clearPendingRebriefsIfCurrentAndSettle(group)) {
         completed += 1;
       } else deps.log?.('warn', 're-brief spent markers superseded before clearing', { job: jobId });
       continue;
@@ -511,11 +510,10 @@ export async function reconcilePendingRebriefs(
         });
         continue;
       }
-      if (!deps.ledger.clearPendingRebriefsIfCurrent(group)) {
+      if (!deps.ledger.clearPendingRebriefsIfCurrentAndSettle(group)) {
         deps.log?.('warn', 're-brief delivery recorded but request was superseded before clearing', { job: jobId });
         continue;
       }
-      publishRebriefSettlement(deps.ledger, jobId);
       deps.ledger.appendCustomEvent({
         kind: 'silas.rebrief-recovered',
         jobId,
