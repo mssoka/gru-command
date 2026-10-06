@@ -662,8 +662,10 @@ the judgment; the dispatch surface is the mechanical hand.
   re-open). A settled directive/re-brief turn lands as a `job.delivered`
   event carrying the lane head it produced; the digest only fires the
   re-review when that head moved past the round's reviewed target. When
-  the SAME canonical blocker (normalized category/location/title
-  fingerprint) recurs across consecutive verdict rounds, the digest names
+  the SAME canonical blocker (fingerprint of normalized category, file
+  path without line numbers, and normalized title — a line-number suffix
+  never participates, so an edit that shifts the defect's lines keeps its
+  streak; issue #216) recurs across consecutive verdict rounds, the digest names
   the rung and Silas executes it through `/api/silas/*`: `directive_at`
   (default 2) → fix directive to the implementing minion; `rebrief_at`
   (default 3) → re-brief a FRESH minion on the same lane; `escalate_at`

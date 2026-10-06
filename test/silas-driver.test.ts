@@ -6,6 +6,7 @@ import {
   adviseFollowThrough,
   adviseRecurrence,
   blockerFingerprint,
+  blockerLocationKey,
   buildWakePrompt,
   CAPTURE_HELPER_PATH,
   computeSilasDigest,
@@ -71,6 +72,55 @@ describe('blocker recurrence policy', () => {
     expect(left).toBe(right);
     expect(left).not.toBe(blockerFingerprint(b('null deref on empty path', 'src/b.ts')));
     expect(left).not.toBe(blockerFingerprint(b('null deref on empty path', 'src/a.ts', 'security')));
+  });
+
+  it('a shifted line range keeps the fingerprint: edits above a defect do not reset its streak (gh-216)', () => {
+    // The carried blocker moves from 287-294 to 301-308 when a fix above it
+    // lands; the identity that carries the ladder must survive the move.
+    const before = blockerFingerprint(b('null deref on empty path', 'src/dispatch/pipeline.ts:287-294'));
+    expect(blockerFingerprint(b('null deref on empty path', 'src/dispatch/pipeline.ts:301-308'))).toBe(before);
+    // Recurrence count ADVANCES across the shift, and the ladder rung fires:
+    // same defect in two consecutive rounds → advice `directive` (defaults 2/3/4).
+    const history = [
+      [b('null deref on empty path', 'src/dispatch/pipeline.ts:301-308')],
+      [b('null deref on empty path', 'src/dispatch/pipeline.ts:287-294')],
+    ];
+    expect(consecutiveRecurrence(before, history)).toBe(2);
+    expect(adviseRecurrence(2, DEFAULT_SILAS_CONFIG)).toBe('directive');
+  });
+
+  it('blockerLocationKey strips trailing line suffixes, normalizes separators and lowercases', () => {
+    expect(blockerLocationKey('src/a.ts')).toBe('src/a.ts');
+    expect(blockerLocationKey('src/a.ts:42')).toBe('src/a.ts');
+    expect(blockerLocationKey('src/a.ts:42-48')).toBe('src/a.ts');
+    expect(blockerLocationKey('src/a.ts#L42')).toBe('src/a.ts');
+    expect(blockerLocationKey('src/a.ts#L42-L48')).toBe('src/a.ts');
+    expect(blockerLocationKey('SRC\\A.TS:42')).toBe('src/a.ts');
+    // only a TRAILING suffix is stripped — digits inside the path survive
+    expect(blockerLocationKey('src/2.ts:7')).toBe('src/2.ts');
+    expect(blockerLocationKey('src/file:42.ts')).toBe('src/file:42.ts');
+  });
+
+  it('two different blockers in one file stay distinct even at one identity path', () => {
+    expect(blockerFingerprint(b('null deref on empty path', 'src/a.ts:10-20'))).not.toBe(
+      blockerFingerprint(b('leaked handle on error path', 'src/a.ts:30-44')),
+    );
+    // same title, different file: still distinct
+    expect(blockerFingerprint(b('null deref on empty path', 'src/a.ts:10-20'))).not.toBe(
+      blockerFingerprint(b('null deref on empty path', 'src/b.ts:10-20')),
+    );
+  });
+
+  it('a reworded title still mints a new fingerprint and breaks the streak (documented limit; semantic matching is gh-224)', () => {
+    const before = blockerFingerprint(b('null deref on empty path', 'src/a.ts:10-20'));
+    const after = blockerFingerprint(b('EMPTY_PATH dereference crashes render', 'src/a.ts:10-20'));
+    expect(after).not.toBe(before);
+    expect(
+      consecutiveRecurrence(after, [
+        [b('EMPTY_PATH dereference crashes render', 'src/a.ts:10-20')],
+        [b('null deref on empty path', 'src/a.ts:10-20')],
+      ]),
+    ).toBe(1);
   });
 
   it('counts consecutive rounds carrying the same blocker; a gap breaks the streak', () => {

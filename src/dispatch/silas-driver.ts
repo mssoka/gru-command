@@ -75,14 +75,34 @@ export interface RoundBlocker {
 export type RecurrenceAdvice = 'monitor' | 'directive' | 'rebrief' | 'escalate';
 
 /**
+ * Stable location identity for a blocker: the file path with any
+ * line-position suffix stripped. A repair edit above a blocker shifts its
+ * line numbers, and a line-bearing identity would mint a new fingerprint
+ * every round — silently resetting the recurrence ladder (issue #216).
+ * Strips a trailing `:<line>`, `:<start>-<end>` or `#L…` marker (bare or
+ * `#L<start>-L<end>`), normalizes path separators to `/`, and lowercases.
+ */
+export function blockerLocationKey(location: string): string {
+  return location
+    .replace(/\\+/gu, '/')
+    .replace(/(?:#L\d+(?:-L\d+)?|:\d+(?:-\d+)?)$/u, '')
+    .toLowerCase()
+    .trim();
+}
+
+/**
  * Canonical blocker identity: the same defect resurfaces across review
  * rounds with reworded prose, so the fingerprint normalizes the finding's
- * category, location, and title (case and whitespace collapsed). Evidence
- * is deliberately excluded — it changes every round.
+ * category and title (case and whitespace collapsed) and keys the
+ * location by FILE PATH ONLY (see blockerLocationKey) — line numbers move
+ * with every edit above the defect and must not reset its streak
+ * (issue #216). Evidence is deliberately excluded — it changes every
+ * round. Known limit: a reworded title still mints a new fingerprint;
+ * semantic matching is #224's surface, not this one's.
  */
 export function blockerFingerprint(blocker: RoundBlocker): string {
   const norm = (value: string): string => value.toLowerCase().replace(/\s+/gu, ' ').trim();
-  return [norm(blocker.category), norm(blocker.location), norm(blocker.title)].join('::');
+  return [norm(blocker.category), blockerLocationKey(blocker.location), norm(blocker.title)].join('::');
 }
 
 /**
