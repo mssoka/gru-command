@@ -80,16 +80,20 @@ function nodeStreamFetch(input: string, init?: RequestInit): Promise<Response> {
     const url = new URL(input);
     const requestFn = url.protocol === 'https:' ? httpsRequest : httpRequest;
     const headers: Record<string, string> = {};
-    const initHeaders = init?.headers;
-    if (initHeaders !== undefined) {
-      if (initHeaders instanceof Headers) {
-        for (const [name, value] of initHeaders.entries()) headers[name] = value;
-      } else if (Array.isArray(initHeaders)) {
-        for (const [name, value] of initHeaders) headers[name] = value;
-      } else {
-        for (const [name, value] of Object.entries(initHeaders)) {
-          if (value !== undefined) headers[name] = String(value);
-        }
+    // Structural narrowing, deliberately avoiding DOM-only type names
+    // (the project compiles without the DOM lib).
+    const initHeaders: unknown = init?.headers;
+    if (initHeaders instanceof Headers) {
+      for (const [name, value] of initHeaders.entries()) headers[name] = value;
+    } else if (Array.isArray(initHeaders)) {
+      for (const entry of initHeaders as readonly (readonly [unknown, unknown])[]) {
+        const name = entry[0];
+        const value = entry[1];
+        if (typeof name === 'string' && typeof value === 'string') headers[name] = value;
+      }
+    } else if (typeof initHeaders === 'object' && initHeaders !== null) {
+      for (const [name, value] of Object.entries(initHeaders)) {
+        if (value !== undefined) headers[name] = String(value);
       }
     }
     const request = requestFn(url, { method: init?.method ?? 'GET', headers }, (response) => {
