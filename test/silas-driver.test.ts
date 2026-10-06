@@ -16,6 +16,7 @@ import {
   digestActionCount,
   digestDelta,
   digestFingerprint,
+  digestRowKey,
   followUpChangedTarget,
   loadSilasSkills,
   roundBlockerKeys,
@@ -48,6 +49,7 @@ import { DEFAULT_SILAS_CONFIG } from '../src/config.js';
 import type { AgentCapabilities, AgentHandle, RuntimeEvent } from '../src/runtime/types.js';
 import type { AgentSupervisionView } from '../src/supervision/supervisor.js';
 import type { EventRecord, JobDeliverable, JobRecord, RoundRecord } from '../src/ledger/api.js';
+import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import type { Role } from '../src/config.js';
 
 const FAKE_CAPABILITIES: AgentCapabilities = {
@@ -2751,7 +2753,13 @@ describe('silas skills and wake prompt', () => {
     // wave-level review request. The rule list is pinned verbatim so a
     // retry variant cannot reappear under different wording.
     expect(ops).not.toContain('a lens retry');
-    expect(ops).toContain('recorded rule (a documented retry, a re-brief on a known protocol break)');
+    // Issue #117/g21: the respin promise names ONLY the bounded rule set —
+    // every rule id with its firing surface and receipt, nothing inferred.
+    expect(ops).toContain('only these named rules');
+    for (const ruleId of ['clean-abort-service-restart', 'verdict-rung-directive', 'verdict-rung-rebrief', 'verdict-rung-escalate', 'verification-repair', 'pr-conflict-rebase', 'sweep-ack', 'freeze-r1']) {
+      expect(ops).toContain(ruleId);
+    }
+    expect(ops).toContain('silas.lane-released');
     expect(ops).toContain('In-round lens retries are Perkins-owned machinery');
     expect(ops).toContain('wave-level request (`POST /api/dispatch/review`)');
     // Issue #162: the stalled guidance is phase-aware — an older delivery is
@@ -2767,7 +2775,7 @@ describe('silas skills and wake prompt', () => {
       deliveredWithoutPr: [], prWithoutReview: [{ jobId: 'clean', repo: 'gru-command', prUrl: 'https://example.invalid/1',
         priorRounds: 1, cleanAbort: { roundId: 'clean-r1', ruleId: 'clean-abort-service-restart' } }],
       verdictsAwaitingDirective: [], stalledWorking: [], minionErrors: [],
-      verificationFailures: [], verificationWaits: [], providerRecoveryPending: [], conflictingPrs: [] },
+      verificationFailures: [], verificationWaits: [], providerRecoveryPending: [], conflictingPrs: [], releaseEligible: [] },
       trigger: { kind: 'sweep' }, skills: loadSilasSkills(), ops: { baseUrl: 'http://127.0.0.1:1', configPath: '/tmp/test-config' } });
     expect(prompt).toContain('You NEVER merge a pull request');
     expect(prompt).toContain('The owner holds every merge');
@@ -2805,6 +2813,7 @@ describe('silas skills and wake prompt', () => {
         verificationWaits: [],
         providerRecoveryPending: [],
         conflictingPrs: [],
+        releaseEligible: [],
       },
       trigger: { kind: 'job.delivered', jobId: 'job-a' },
       skills,
@@ -3183,6 +3192,7 @@ describe('silas digest fingerprint (issue #217)', () => {
     verificationWaits: [],
     providerRecoveryPending: [],
     conflictingPrs: [],
+    releaseEligible: [],
     ...over,
   });
 
@@ -3317,6 +3327,7 @@ describe('silas digest delta (issue #217)', () => {
       verificationWaits: [],
       providerRecoveryPending: [],
       conflictingPrs: [],
+      releaseEligible: [],
     };
     const current: import('../src/dispatch/silas-driver.js').SilasOpsDigest = {
       ...previous,
@@ -5166,3 +5177,145 @@ describe('same-blocker review fixes (issue #224 review)', () => {
 });
 
 
+
+// ------------------------------------------------------------------
+// releaseEligible rows: the sweep-ack rule's digest surface (issue #117)
+// ------------------------------------------------------------------
+
+describe('silas digest releaseEligible rows (issue #117/g21)', () => {
+  /** A non-git fixture dir: the in-memory port keeps lightweight lanes. */
+  const makeRepo = (): string => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-silas-release-repo-'));
+    return dir;
+  };
+  const digestOf = (h: Harness, worktrees: InMemoryWorktreePort) =>
+    computeSilasDigest({
+      ledger: h.ledger,
+      worktrees,
+      blockersForRound: async () => ({ blockers: [], note: null }),
+      config: DEFAULT_SILAS_CONFIG,
+      trigger: 'sweep',
+    });
+  const addTerminalJob = (h: Harness, jobId: string, status: 'merged' | 'done'): void => {
+    h.ledger.addJob({ id: jobId, repo: 'fixture-app', title: `t-${jobId}`, briefing: 'b' });
+    h.ledger.setJobStatus(jobId, 'working');
+    h.ledger.setJobStatus(jobId, 'in-review');
+    h.ledger.setJobStatus(jobId, status);
+  };
+  const admitChild = (h: Harness, childId: string, jobId: string): void => {
+    h.ledger.registerAgent({ id: 'agent-parent', role: 'minion', jobId });
+    h.ledger.admitChildWorker({
+      id: childId,
+      parentAgentId: 'agent-parent',
+      jobId,
+      purpose: 'review',
+      authority: 'read-only',
+      task: 'review the lane',
+      idempotencyKey: `idem-${childId}`,
+    });
+  };
+
+  it('a terminal job still holding its lane is release-eligible and actionable (rule hit)', async () => {
+    const h = makeLedger();
+    const worktrees = new InMemoryWorktreePort(mkdtempSync(join(tmpdir(), 'gru-command-silas-release-wt-')));
+    try {
+      addTerminalJob(h, 'job-merged', 'merged');
+      const lane = await worktrees.createJobWorktree({ repoPath: makeRepo(), jobId: 'job-merged' });
+      const d = await digestOf(h, worktrees);
+      expect(d.releaseEligible).toHaveLength(1);
+      expect(d.releaseEligible[0]).toMatchObject({
+        jobId: 'job-merged',
+        repo: 'fixture-app',
+        status: 'merged',
+        branch: lane.branch,
+      });
+      expect(digestActionCount(d)).toBe(1);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a done job counts exactly like a merged one; the row key is the job id', async () => {
+    const h = makeLedger();
+    const worktrees = new InMemoryWorktreePort(mkdtempSync(join(tmpdir(), 'gru-command-silas-release-wt-')));
+    try {
+      addTerminalJob(h, 'job-done', 'done');
+      await worktrees.createJobWorktree({ repoPath: makeRepo(), jobId: 'job-done' });
+      const d = await digestOf(h, worktrees);
+      expect(d.releaseEligible.map((row) => row.status)).toEqual(['done']);
+      expect(digestRowKey('releaseEligible', d.releaseEligible[0]!)).toBe('job-done');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a terminal job with NO held lane (already swept) lists no row (rule miss)', async () => {
+    const h = makeLedger();
+    const worktrees = new InMemoryWorktreePort(mkdtempSync(join(tmpdir(), 'gru-command-silas-release-wt-')));
+    try {
+      addTerminalJob(h, 'job-swept', 'merged');
+      await worktrees.createJobWorktree({ repoPath: makeRepo(), jobId: 'job-swept' });
+      await worktrees.release({ worktreeId: 'job-swept' });
+      const d = await digestOf(h, worktrees);
+      expect(d.releaseEligible).toEqual([]);
+      expect(digestActionCount(d)).toBe(0);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a non-terminal job holding a lane is never release-eligible (rule miss)', async () => {
+    const h = makeLedger();
+    const worktrees = new InMemoryWorktreePort(mkdtempSync(join(tmpdir(), 'gru-command-silas-release-wt-')));
+    try {
+      h.ledger.addJob({ id: 'job-live', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('job-live', 'working');
+      await worktrees.createJobWorktree({ repoPath: makeRepo(), jobId: 'job-live' });
+      const d = await digestOf(h, worktrees);
+      expect(d.releaseEligible).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a non-terminal child worker fences the row (the release would refuse); settling it releases the fence', async () => {
+    const h = makeLedger();
+    const worktrees = new InMemoryWorktreePort(mkdtempSync(join(tmpdir(), 'gru-command-silas-release-wt-')));
+    try {
+      // The child is admitted BEFORE the job goes terminal (a terminal job
+      // admits no fresh child) and is still non-terminal at sweep time.
+      h.ledger.addJob({ id: 'job-child', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('job-child', 'working');
+      h.ledger.setJobStatus('job-child', 'in-review');
+      admitChild(h, 'child-live', 'job-child');
+      h.ledger.setJobStatus('job-child', 'merged');
+      await worktrees.createJobWorktree({ repoPath: makeRepo(), jobId: 'job-child' });
+      const fenced = await digestOf(h, worktrees);
+      expect(fenced.releaseEligible).toEqual([]);
+      // terminal child: the release can proceed — the row appears
+      h.ledger.recordChildResult('child-live', { state: 'done', summary: null, ref: null });
+      const open = await digestOf(h, worktrees);
+      expect(open.releaseEligible.map((row) => row.jobId)).toEqual(['job-child']);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('the row is decision-relevant: it moves the fingerprint and rides the delta as added/resolved', async () => {
+    const h = makeLedger();
+    const worktrees = new InMemoryWorktreePort(mkdtempSync(join(tmpdir(), 'gru-command-silas-release-wt-')));
+    try {
+      addTerminalJob(h, 'job-fp', 'merged');
+      const withoutRow = await digestOf(h, worktrees);
+      await worktrees.createJobWorktree({ repoPath: makeRepo(), jobId: 'job-fp' });
+      const withRow = await digestOf(h, worktrees);
+      expect(digestFingerprint(withRow)).not.toBe(digestFingerprint(withoutRow));
+      const delta = digestDelta(withoutRow, withRow);
+      expect(delta.added.map((entry) => entry.category)).toEqual(['releaseEligible']);
+      const back = digestDelta(withRow, withoutRow);
+      expect(back.resolved.map((entry) => entry.category)).toEqual(['releaseEligible']);
+    } finally {
+      h.cleanup();
+    }
+  });
+});

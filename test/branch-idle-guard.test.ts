@@ -328,6 +328,8 @@ function pendingMarker(
     baselineSeq: 40,
     agentId: null,
     sessionFile: null,
+    ruleId: null,
+    sourceRoundId: null,
     // Ordinary re-brief (no explicit completion intent): PR136's
     // phase-handoff identity is optional and null here.
     phaseId: null,
@@ -596,6 +598,30 @@ describe('branch-idle guard', () => {
       expect(passed.status).toBe(202);
       expect(passed.json['round_id']).toBe('busy-lane-r1');
       expect(h.ledger.listRounds('busy-lane')).toHaveLength(1);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('the silas 409 deferral carries gate=freeze-r1 — the fence fired (issue #117)', async () => {
+    const repo = makeFixtureRepo('freeze-r1-receipt');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    try {
+      await createLaneJob(h, repo, { jobId: 'gate-lane', status: 'working' });
+      const refused = await postReview(h, { job_id: 'gate-lane', by: 'silas' });
+      expect(refused.status).toBe(409);
+      const deferrals = h.ledger.listJobEvents('gate-lane').filter((event) => event.kind === 'silas.review-deferred');
+      expect(deferrals).toHaveLength(1);
+      // The gate's firing provenance, alongside the refusal's own facts.
+      expect(deferrals[0]?.payload).toMatchObject({ gate: 'freeze-r1', phase: 'arm', target_branch: 'gru/gate-lane' });
+      // This arm carried no trigger rule: no clean-abort provenance either.
+      expect(deferrals[0]?.payload).not.toHaveProperty('rule_id');
+      // A NON-silas refusal records no silas deferral at all — the gate
+      // receipt is silas's deferral trail, not every refusal.
+      const gruRefused = await postReview(h, { job_id: 'gate-lane' });
+      expect(gruRefused.status).toBe(409);
+      expect(h.ledger.listJobEvents('gate-lane').filter((event) => event.kind === 'silas.review-deferred')).toHaveLength(1);
     } finally {
       await h.close();
     }

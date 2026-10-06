@@ -299,6 +299,13 @@ export interface DigestLedger {
     readonly jobId?: string;
     readonly states?: readonly DirectiveState[];
   }): readonly DirectiveRequestRecord[];
+  /** Tracked child workers (issue #161/#117): the releaseEligible sweep-ack
+   * row fences on non-terminal children exactly like the release endpoint's
+   * own refusal — the digest never offers a release that would 409. */
+  listChildWorkers(opts?: {
+    readonly jobId?: string;
+    readonly parentAgentId?: string;
+  }): readonly { readonly id: string; readonly jobId: string; readonly resultState: unknown }[];
   /** True while any verification run for the job is unsettled (its newest
    * open event is newer than the same run's newest terminal event). */
   hasUnsettledVerificationRun(jobId: string): boolean;
@@ -488,6 +495,22 @@ export interface ConflictingPrRow {
   readonly firstSeenAt: string | null;
 }
 
+/** A terminal job (merged/done) still holding its own lane worktree
+ * (issue #117, g21): the sweep-ack rule's firing surface. Swept-only work
+ * now APPEARS in the digest — Silas releases the lane through the worktree
+ * surface with `by=silas` + `rule_id=sweep-ack`, and the release records
+ * `silas.lane-released` on the job. Fenced while non-terminal child
+ * workers exist (the release would refuse, issue #161) — the fence mirrors
+ * the endpoint's own durable-record check, and uncertain ledger state
+ * fails closed to no row. */
+export interface ReleaseEligibleRow {
+  readonly jobId: string;
+  readonly repo: string;
+  /** The terminal state the close-out rule releases on. */
+  readonly status: 'merged' | 'done';
+  readonly branch: string | null;
+}
+
 export interface SilasOpsDigest {
   readonly computedAt: string;
   readonly trigger: string;
@@ -500,6 +523,7 @@ export interface SilasOpsDigest {
   readonly verificationWaits: readonly VerificationWaitingRow[];
   readonly providerRecoveryPending: readonly ProviderRecoveryPendingRow[];
   readonly conflictingPrs: readonly ConflictingPrRow[];
+  readonly releaseEligible: readonly ReleaseEligibleRow[];
 }
 
 /** Count of actionable rows (event triggers wake even at zero; sweeps do not). */
@@ -513,7 +537,8 @@ export function digestActionCount(digest: SilasOpsDigest): number {
     digest.verificationFailures.length +
     digest.verificationWaits.length +
     digest.providerRecoveryPending.length +
-    digest.conflictingPrs.length
+    digest.conflictingPrs.length +
+    digest.releaseEligible.length
   );
 }
 
@@ -532,6 +557,7 @@ const DIGEST_ROW_CATEGORIES = [
   'verificationWaits',
   'providerRecoveryPending',
   'conflictingPrs',
+  'releaseEligible',
 ] as const;
 
 export type DigestRowCategory = (typeof DIGEST_ROW_CATEGORIES)[number];
@@ -546,7 +572,8 @@ export type DigestRow =
   | VerificationFailureRow
   | VerificationWaitingRow
   | ProviderRecoveryPendingRow
-  | ConflictingPrRow;
+  | ConflictingPrRow
+  | ReleaseEligibleRow;
 
 /**
  * Decision-relevant projection of a digest row (issue #217): identity and
@@ -624,6 +651,12 @@ export function digestRowProjection(category: DigestRowCategory, row: DigestRow)
         firstSeenAt: r.firstSeenAt,
       };
     }
+    case 'releaseEligible': {
+      // Identity + the terminal state the rule releases on (#117). Lane
+      // paths stay out: volatile, and the release surface re-derives them.
+      const r = row as ReleaseEligibleRow;
+      return { jobId: r.jobId, repo: r.repo, status: r.status, branch: r.branch };
+    }
   }
 }
 
@@ -650,6 +683,8 @@ export function digestRowKey(category: DigestRowCategory, row: DigestRow): strin
       return (row as ProviderRecoveryPendingRow).waitId;
     case 'conflictingPrs':
       return `${(row as ConflictingPrRow).jobId} ${(row as ConflictingPrRow).prUrl ?? ''} ${(row as ConflictingPrRow).branch ?? ''}`;
+    case 'releaseEligible':
+      return (row as ReleaseEligibleRow).jobId;
   }
 }
 
@@ -1198,10 +1233,13 @@ function stallStillEligible(
  * verification follow-through rows (issue #163) — a failed completed run
  * awaiting a repair decision and a queue wait that timed out awaiting
  * reconsideration — so completion/dependency transitions reach the sweep
- * without a fresh owner message; and the conflictingPrs rows (issue
+ * without a fresh owner message; the conflictingPrs rows (issue
  * #215) — a live PR-owing lane whose open head is dirty against its
  * base, Silas's mechanical rebase work, suppressed while an accepted
- * operation owns the lane and never a Gru wake.
+ * operation owns the lane and never a Gru wake; and the releaseEligible
+ * rows (issue #117, g21) — a terminal job still holding its own lane,
+ * the sweep-ack rule's digest surface, fenced while non-terminal child
+ * workers make the release refuse (issue #161).
  */
 export async function computeSilasDigest(input: ComputeDigestInput): Promise<SilasOpsDigest> {
   const now = input.now ?? Date.now;
@@ -1222,6 +1260,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     verificationWaits: VerificationWaitingRow[];
     providerRecoveryPending: ProviderRecoveryPendingRow[];
     conflictingPrs: ConflictingPrRow[];
+    releaseEligible: ReleaseEligibleRow[];
   } = {
     computedAt: new Date(now()).toISOString(),
     trigger: input.trigger,
@@ -1234,6 +1273,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     verificationWaits: [],
     providerRecoveryPending: [],
     conflictingPrs: [],
+    releaseEligible: [],
   };
   // One unresolved re-brief request fences the target: a marker exists while
   // a re-brief worker runs (or a restart-recovered request waits for boot
@@ -1254,7 +1294,24 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
   // floor reconstructed from a later clock reading.
   const stallSilenceFloorByJob = new Map<string, number>();
   for (const job of input.ledger.listJobs()) {
-    if (job.status === 'merged' || job.status === 'done') continue;
+    // (5) releaseEligible (issue #117, g21 — the sweep-ack rule): a
+    // TERMINAL job still holding its own kind=job lane is swept-only work
+    // that must surface in the digest. The child-worker fence mirrors the
+    // release endpoint's own durable-record refusal (issue #161): a lane
+    // with a non-terminal child is never offered, so the row can always be
+    // acted on. Terminal jobs reach no other row — this replaces the skip.
+    if (job.status === 'merged' || job.status === 'done') {
+      const lane = (input.worktrees?.listWorktrees({ jobId: job.id }) ?? []).find(
+        (candidate) => candidate.kind === 'job' && candidate.status !== 'swept',
+      );
+      if (
+        lane !== undefined &&
+        input.ledger.listChildWorkers({ jobId: job.id }).every((child) => child.resultState !== null)
+      ) {
+        digest.releaseEligible.push({ jobId: job.id, repo: job.repo, status: job.status, branch: lane.branch ?? null });
+      }
+      continue;
+    }
     const rounds = [...input.ledger.listRounds(job.id)].sort((a, b) => b.seq - a.seq);
     const newestRound = rounds[0] ?? null;
     const delivered = input.ledger.latestJobEvent(job.id, 'job.delivered');

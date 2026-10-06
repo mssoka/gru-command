@@ -297,6 +297,11 @@ export function finalizeRebriefRequest(input: {
           lane: input.lanePath,
           note: input.note,
           ...(phaseId !== null ? { phase_id: phaseId } : {}),
+          // Firing-rule provenance (issue #117, g21): replayed from the
+          // durable request marker, so a restart mid-turn cannot strip the
+          // receipt of the rule that fired the re-brief.
+          ...(rebriefMarker.ruleId !== null ? { rule_id: rebriefMarker.ruleId } : {}),
+          ...(rebriefMarker.sourceRoundId !== null ? { source_round_id: rebriefMarker.sourceRoundId } : {}),
         },
       }, markers);
       rebriefRecorded = true;

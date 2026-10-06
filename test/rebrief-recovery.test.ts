@@ -163,6 +163,9 @@ async function seedPendingRebrief(input: {
   jobId: string;
   note?: string;
   briefing?: string;
+  /** Firing-rule provenance (issue #117) stored on the durable markers. */
+  ruleId?: string;
+  sourceRoundId?: string;
   bindWorker?: { agentId: string; sessionFile: string | null };
 }): Promise<{ path: string; markers: readonly { id: string; kind: string }[] }> {
   const repo = fixtureRepo();
@@ -174,6 +177,8 @@ async function seedPendingRebrief(input: {
     jobId: input.jobId,
     note: input.note ?? 'same blocker three rounds; try differently',
     briefing: input.briefing ?? 'the original contract',
+    ...(input.ruleId !== undefined ? { ruleId: input.ruleId } : {}),
+    ...(input.sourceRoundId !== undefined ? { sourceRoundId: input.sourceRoundId } : {}),
   });
   if (input.bindWorker !== undefined) {
     input.h.ledger.bindPendingRebriefWorker({
@@ -270,6 +275,38 @@ describe('re-brief restart safety (durable markers)', () => {
     // The recovery itself is on the record.
     const recovered = h.ledger.latestJobEvent(jobId, 'silas.rebrief-recovered');
     expect(recovered?.payload).toMatchObject({ path: 'redispatched', minion_id: 'worker-1' });
+  });
+
+  it('rule provenance survives the restart: the replayed silas.rebrief receipt carries the firing rule (issue #117)', async () => {
+    const h = makeHarness();
+    const jobId = 'rule-replay-job';
+    const { markers } = await seedPendingRebrief({ h, jobId, ruleId: 'verdict-rung-rebrief', sourceRoundId: 'rule-replay-job-r3' });
+    // The durable request itself carries the rule BEFORE any worker exists.
+    const stored = h.ledger.listPendingRebriefs({ jobId }).find((marker) => marker.kind === 'silas.rebrief');
+    expect(stored?.ruleId).toBe('verdict-rung-rebrief');
+    expect(stored?.sourceRoundId).toBe('rule-replay-job-r3');
+    const report = await reconcilePendingRebriefs(
+      {
+        registry: h.registry,
+        ledger: h.ledger,
+        worktrees: h.worktrees,
+        notifications: h.notifications,
+      },
+      { bootAt: new Date(Date.now() + 60_000) },
+    );
+    expect(report.redispatched).toBe(1);
+    await report.settled;
+    const rebrief = h.ledger.latestJobEvent(jobId, 'silas.rebrief');
+    expect(rebrief).not.toBeNull();
+    // The receipt replays the rule the marker carried — a restart mid-turn
+    // cannot strip the provenance (rule hit, restart-safe).
+    expect(rebrief?.payload).toMatchObject({
+      rule_id: 'verdict-rung-rebrief',
+      source_round_id: 'rule-replay-job-r3',
+      note: 'same blocker three rounds; try differently',
+    });
+    expect(h.ledger.listPendingRebriefs()).toHaveLength(0);
+    void markers;
   });
 
   it('the re-dispatched re-brief waits for a worker pacing slot before spawning', async () => {

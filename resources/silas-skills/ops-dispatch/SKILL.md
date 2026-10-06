@@ -64,13 +64,17 @@ or a nonempty artifact is never completion by itself: the hand-back fires
 only for the marked phase's correlated, admitted terminal delivery. Never
 re-mark historical work; a changed decision needs a NEW request id.
 
-## Mechanical reactions vs judgment (owner mandate split 2026-09-23)
+## Mechanical reactions vs judgment (owner mandate split 2026-09-23; rules codified for issue #117/g21)
 
 The chief keeps the judgments: rulings, merges, and novel failures. The
-mechanical reactions are YOURS — execute them without asking:
+mechanical reactions are YOURS — execute them without asking. Each named
+rule has ONE firing surface (a digest row) and ONE receipt that carries its
+`rule_id` (`source_round_id` when the rule consumes a round) — a reaction
+without a named rule is not yours to invent:
 
-- **Re-arm proven clean aborts.** The digest marks only an aborted round with
-  `round.perkins-incomplete.reason = service_restart` or
+- **`clean-abort-service-restart` — re-arm a proven clean abort.** Fires on
+  a `prWithoutReview` row carrying `cleanAbort`: the newest round aborted
+  with `round.perkins-incomplete.reason = service_restart` or
   `service_restart_missing_review_lane` on the unchanged delivered head.
   Once its target branch is idle and the push has settled, request ONE new
   review with `"by":"silas","rule_id":"clean-abort-service-restart",` and
@@ -84,22 +88,43 @@ mechanical reactions are YOURS — execute them without asking:
   withdraws the offer without consuming the abort. Never force it.
   Cancelled rounds, coverage failures, auth/budget walls, owner-held breakers,
   and unexplained aborts are not clean; leave them held for Gru.
-- **Respin known failure patterns.** When a failure class has a recorded
-  rule (a documented retry, a re-brief on a known protocol break), apply
-  the rule and record the action — do not escalate what the rule already
-  answers. In-round lens retries are Perkins-owned machinery, not a Silas
+- **Respin known failure patterns — only these named rules.** When the
+  failure class IS one of these, apply the rule, pass its `rule_id` (and
+  `source_round_id` where the rule consumes a round), and record the action
+  — do not escalate what the rule already answers:
+  - `verdict-rung-directive` / `verdict-rung-rebrief` /
+    `verdict-rung-escalate` — fire on a `verdictsAwaitingDirective` row,
+    at the rung its `recurringBlockers[].advice` names. The directive and
+    re-brief receipts (`silas.directive-sent`, `silas.rebrief`) and the
+    escalation receipt (`silas.escalated`) carry your `rule_id` +
+    `source_round_id`.
+  - `verification-repair` — fires on a `verificationFailures` row; the
+    repair directive carries `rule_id` plus the exact
+    `blocker_fingerprint` `verification-failure:<scope>@<run_id>`.
+  - `pr-conflict-rebase` — fires on a `conflictingPrs` row; the rebase
+    directive carries `rule_id` plus `blocker_fingerprint`
+    `pr-conflict:<head_sha>`.
+  In-round lens retries are Perkins-owned machinery, not a Silas
   action: your review surface is the wave-level request
   (`POST /api/dispatch/review`), never a per-lens retry.
-- **Sweep acks under the recorded rules.** Close out swept lanes that meet
-  the recorded rules; preserve-before-remove and the pause-and-ask rule
-  remain absolute.
-- **One standing gate (freeze-r1).** Never arm a review round on a branch
+- **`sweep-ack` — release swept lanes the digest names.** Fires on a
+  `releaseEligible` row: a terminal (merged/done) job still holding its own
+  lane. Close it out by releasing with
+  `{"job_id":"<job>","by":"silas","rule_id":"sweep-ack"}`; the release
+  records `silas.lane-released` with the rule on the job — that receipt is
+  the sweep ack. A release refused for a live child worker (409) records
+  nothing and stays eligible for the next sweep. Preserve-before-remove
+  and the pause-and-ask rule remain absolute: a paused release is a
+  refusal, never an override.
+- **`freeze-r1` — one standing gate.** Never arm a review round on a branch
   while a rebase/force-push lane is ACTIVE on the same target — the round
   races the push and dies obsolete. Wait for the lane delivery (and its
   push) to settle and for any unresolved re-brief request to finalize or
   be recovered (a delivery alone does not clear that fence), then arm. If
   you cannot tell whether the lane is still
-  moving, wait one sweep and re-read the record.
+  moving, wait one sweep and re-read the record. When the gate refuses an
+  arm (409 `branch_busy`), the `silas.review-deferred` receipt carries
+  `gate:"freeze-r1"` — the proof the fence fired.
 - **Novel failures are not yours to improvise around.** Name what you saw
   with pointers and escalate to the chief; the chief rules, opens the fix
   lane, or presents the merge to the owner — the owner holds every merge.

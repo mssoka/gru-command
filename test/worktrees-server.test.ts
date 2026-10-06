@@ -174,6 +174,91 @@ describe('worktree lane release endpoint (r4)', () => {
     }
   });
 
+  it('a silas sweep-ack release records silas.lane-released with the rule on the job (issue #117)', async () => {
+    const h = await bootLane();
+    const repo = makeFixtureRepo('fixture-sweep-ack');
+    cleanupRepos.push(repo);
+    try {
+      h.ledger.addJob({ id: 'job-ack', repo: 'fixture-sweep-ack', title: 'x' });
+      h.ledger.setJobStatus('job-ack', 'working');
+      h.ledger.setJobStatus('job-ack', 'in-review');
+      h.ledger.setJobStatus('job-ack', 'merged');
+      await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-ack' });
+      const released = await call(h.port, '/api/dispatch/release', {
+        job_id: 'job-ack', by: 'silas', rule_id: 'sweep-ack',
+      }, TOKEN);
+      expect(released.status).toBe(200);
+      expect(field<string>(released.json, 'status')).toBe('swept');
+      const receipts = h.ledger.listJobEvents('job-ack').filter((event) => event.kind === 'silas.lane-released');
+      expect(receipts).toHaveLength(1);
+      expect(receipts[0]?.payload).toMatchObject({
+        worktree_id: 'job-ack',
+        rule_id: 'sweep-ack',
+        by: 'silas',
+        branch_disposition: 'deleted',
+      });
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a plain release records NO silas receipt; a silas release naming any other rule refuses before acting', async () => {
+    const h = await bootLane();
+    const repo = makeFixtureRepo('fixture-sweep-ack-miss');
+    cleanupRepos.push(repo);
+    try {
+      h.ledger.addJob({ id: 'job-plain', repo: 'fixture-sweep-ack-miss', title: 'x' });
+      h.ledger.setJobStatus('job-plain', 'working');
+      h.ledger.setJobStatus('job-plain', 'in-review');
+      h.ledger.setJobStatus('job-plain', 'done');
+      await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-plain' });
+      // No by/rule_id: the release is exactly as before — no receipt.
+      const plain = await call(h.port, '/api/dispatch/release', { job_id: 'job-plain' }, TOKEN);
+      expect(plain.status).toBe(200);
+      expect(h.ledger.listJobEvents('job-plain').filter((event) => event.kind === 'silas.lane-released')).toHaveLength(0);
+
+      // silas provenance with a different action rule: refused pre-release.
+      h.ledger.addJob({ id: 'job-wrong', repo: 'fixture-sweep-ack-miss', title: 'x' });
+      h.ledger.setJobStatus('job-wrong', 'working');
+      h.ledger.setJobStatus('job-wrong', 'in-review');
+      h.ledger.setJobStatus('job-wrong', 'merged');
+      await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-wrong' });
+      const wrongRule = await call(h.port, '/api/dispatch/release', {
+        job_id: 'job-wrong', by: 'silas', rule_id: 'clean-abort-service-restart',
+      }, TOKEN);
+      expect(wrongRule.status).toBe(400);
+      expect(h.manager.getWorktree('job-wrong')?.status).toBe('active');
+      // silas provenance with NO rule: refused too.
+      const noRule = await call(h.port, '/api/dispatch/release', { job_id: 'job-wrong', by: 'silas' }, TOKEN);
+      expect(noRule.status).toBe(400);
+      expect(h.manager.getWorktree('job-wrong')?.status).toBe('active');
+      expect(h.ledger.listJobEvents('job-wrong').filter((event) => event.kind === 'silas.lane-released')).toHaveLength(0);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a silas release of a non-job lane refuses before releasing — no job, no receipt, no sweep', async () => {
+    const h = await bootLane();
+    const repo = makeFixtureRepo('fixture-sweep-ack-raw');
+    cleanupRepos.push(repo);
+    try {
+      const job = h.ledger.addJob({ id: 'job-raw', repo: 'fixture-sweep-ack-raw', title: 'x' });
+      h.ledger.setJobStatus('job-raw', 'working');
+      const round = h.ledger.addRound({ jobId: job.id, lenses: ['blind'] });
+      const roundLane = await h.manager.createReviewWorktree({ repoPath: repo.path, roundId: round.id, ref: 'HEAD', jobId: job.id });
+      const refused = await call(h.port, '/api/dispatch/release', {
+        worktree_id: roundLane.id, by: 'silas', rule_id: 'sweep-ack',
+      }, TOKEN);
+      expect(refused.status).toBe(400);
+      expect(field<string>(refused.json, 'detail')).toContain('job lane');
+      // The lane was NOT released: the rule-hit must be recordable first.
+      expect(h.manager.getWorktree(roundLane.id)?.status).toBe('active');
+    } finally {
+      await h.close();
+    }
+  });
+
   it('ROUND ARM: the paused payload carries the pid list and the ask — pinned', async () => {
     const h = await bootLane();
     const repo = makeFixtureRepo('fixture-round-arm');

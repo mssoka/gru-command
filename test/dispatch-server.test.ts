@@ -866,6 +866,7 @@ describe('dispatch server (E8)', () => {
           verificationWaits: [],
           providerRecoveryPending: [],
           conflictingPrs: [],
+          releaseEligible: [],
         };
       },
     });
@@ -2648,4 +2649,156 @@ describe('report-job closure over HTTP (issue #220)', () => {
       await h.close();
     }
   });
+});
+
+// ------------------------------------------------------------------
+// Firing-rule provenance on silas receipts (issue #117, g21)
+// ------------------------------------------------------------------
+
+describe('silas firing-rule provenance (issue #117)', () => {
+  /** Dispatch a job and register its live minion — the directive/rebrief
+   * routes' shared setup. */
+  async function dispatchWithLiveMinion(h: Awaited<ReturnType<typeof boot>>, jobId: string, repoPath: string): Promise<string> {
+    await call(h.port, 'POST', '/api/dispatch', {
+      job_id: jobId, repo_path: repoPath, title: `lane ${jobId}`, briefing: 'b',
+    }, TOKEN);
+    const minionId = `agent-${h.spawns.length}`;
+    h.ledger.registerAgent({ id: minionId, role: 'minion', jobId });
+    h.liveHandles.set(minionId, {
+      role: 'minion',
+      id: minionId,
+      sessionFile: null,
+      capabilities: FAKE_CAPABILITIES,
+      prompt: async () => {},
+      async steer() {},
+      async followUp() {},
+      subscribe: () => () => {},
+      health: () => ({ state: 'idle' as const, lastActivity: null, sessionFile: null }),
+      async dispose() {},
+    });
+    return minionId;
+  }
+
+  it('a directive carrying a named rule records rule_id + source_round_id on silas.directive-sent (rule hit)', async () => {
+    const h = await boot();
+    const repo = makeFixtureRepo('fixture-rule-directive');
+    cleanupRepos.push(repo);
+    try {
+      await dispatchWithLiveMinion(h, 'rule-dir-job', repo.path);
+      h.ledger.setJobStatus('rule-dir-job', 'in-review');
+      const res = await call(h.port, 'POST', '/api/silas/directive', {
+        job_id: 'rule-dir-job',
+        directive: 'Fix the null deref at src/a.ts.',
+        blocker_fingerprint: 'correctness::src/a.ts::null deref',
+        rule_id: 'verdict-rung-directive',
+        source_round_id: 'rule-dir-job-r1',
+      }, TOKEN);
+      expect(res.status).toBe(202);
+      const requestId = field<string>(res.json, 'request_id');
+      expect((await awaitDirectiveTerminal(h, requestId)).state).toBe('settled');
+      const event = h.ledger.listJobEvents('rule-dir-job').find((candidate) => candidate.kind === 'silas.directive-sent');
+      expect(event?.payload).toMatchObject({
+        rule_id: 'verdict-rung-directive',
+        source_round_id: 'rule-dir-job-r1',
+        blocker_fingerprint: 'correctness::src/a.ts::null deref',
+      });
+    } finally {
+      await h.close();
+    }
+  }, 90_000);
+
+  it('an unknown rule_id refuses loud; source_round_id without a rule_id refuses (rule misses)', async () => {
+    const h = await boot();
+    const repo = makeFixtureRepo('fixture-rule-directive-miss');
+    cleanupRepos.push(repo);
+    try {
+      await dispatchWithLiveMinion(h, 'rule-miss-job', repo.path);
+      const unknown = await call(h.port, 'POST', '/api/silas/directive', {
+        job_id: 'rule-miss-job',
+        directive: 'd',
+        rule_id: 'respin-known-failure',
+      }, TOKEN);
+      expect(unknown.status).toBe(400);
+      expect(JSON.stringify(unknown.json)).toContain('not a named Silas rule');
+      const orphanRound = await call(h.port, 'POST', '/api/silas/directive', {
+        job_id: 'rule-miss-job',
+        directive: 'd',
+        source_round_id: 'some-round',
+      }, TOKEN);
+      expect(orphanRound.status).toBe(400);
+      expect(JSON.stringify(orphanRound.json)).toContain('source_round_id must be paired');
+      // Nothing was admitted: no directive request rows exist.
+      expect(h.ledger.listPendingDirectives({ jobId: 'rule-miss-job' })).toHaveLength(0);
+    } finally {
+      await h.close();
+    }
+  }, 90_000);
+
+  it('an escalation carrying the ladder rule records it on silas.escalated (hit and miss)', async () => {
+    const h = await boot();
+    const repo = makeFixtureRepo('fixture-rule-escalate');
+    cleanupRepos.push(repo);
+    try {
+      await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'rule-esc-job', repo_path: repo.path, title: 'looping lane', briefing: 'b',
+      }, TOKEN);
+      const hit = await call(h.port, 'POST', '/api/silas/escalate', {
+        title: 'same blocker past the ladder',
+        job_id: 'rule-esc-job',
+        rule_id: 'verdict-rung-escalate',
+        source_round_id: 'rule-esc-job-r3',
+      }, TOKEN);
+      expect(hit.status).toBe(200);
+      const event = h.ledger.listJobEvents('rule-esc-job').find((candidate) => candidate.kind === 'silas.escalated');
+      expect(event?.payload).toMatchObject({
+        rule_id: 'verdict-rung-escalate',
+        source_round_id: 'rule-esc-job-r3',
+      });
+      const miss = await call(h.port, 'POST', '/api/silas/escalate', {
+        title: 'x',
+        rule_id: 'not-a-rule',
+      }, TOKEN);
+      expect(miss.status).toBe(400);
+      const gateMiss = await call(h.port, 'POST', '/api/silas/escalate', {
+        title: 'x',
+        rule_id: 'freeze-r1',
+      }, TOKEN);
+      expect(gateMiss.status).toBe(400);
+      expect(JSON.stringify(gateMiss.json)).toContain('gate, not an action rule');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a re-brief request stores the rule on the durable marker and the receipt replays it (hit)', async () => {
+    const h = await boot();
+    const repo = makeFixtureRepo('fixture-rule-rebrief');
+    cleanupRepos.push(repo);
+    try {
+      await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'rule-rebrief-job', repo_path: repo.path, title: 'stuck lane', briefing: 'b',
+      }, TOKEN);
+      const res = await call(h.port, 'POST', '/api/silas/rebrief', {
+        job_id: 'rule-rebrief-job',
+        note: 'same blocker three rounds; try differently',
+        rule_id: 'verdict-rung-rebrief',
+        source_round_id: 'rule-rebrief-job-r3',
+      }, TOKEN);
+      expect(res.status).toBe(200);
+      const event = h.ledger.listJobEvents('rule-rebrief-job').find((candidate) => candidate.kind === 'silas.rebrief');
+      expect(event?.payload).toMatchObject({
+        rule_id: 'verdict-rung-rebrief',
+        source_round_id: 'rule-rebrief-job-r3',
+      });
+      const miss = await call(h.port, 'POST', '/api/silas/rebrief', {
+        job_id: 'rule-rebrief-job',
+        note: 'n',
+        rule_id: 'respin-known-failure',
+      }, TOKEN);
+      expect(miss.status).toBe(400);
+      expect(JSON.stringify(miss.json)).toContain('not a named Silas rule');
+    } finally {
+      await h.close();
+    }
+  }, 90_000);
 });
