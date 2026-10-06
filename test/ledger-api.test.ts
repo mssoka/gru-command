@@ -1039,3 +1039,225 @@ describe('decision memory (issue #218)', () => {
     expect(a.listDecisions()).toHaveLength(3);
   });
 });
+
+describe('report-job closure (issue #220)', () => {
+  function freshDb(): { api: LedgerApi; db: LedgerDb; dir: string } {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-report-closure-'));
+    const db = new LedgerDb(dir);
+    const api = new LedgerApi(db.handle, { bus: new EventBus() });
+    return { api, db, dir };
+  }
+
+  /** A delivered report-type job with its target recorded. */
+  function deliveredReportJob(
+    api: LedgerApi,
+    jobId: string,
+    opts: { deliverable?: 'review' | 'artifact' | 'investigation'; targetRef?: string; targetSha?: string; commissioner?: string } = {},
+  ): void {
+    api.addJob({
+      id: jobId, repo: 'fixture-app', title: `t-${jobId}`, briefing: 'review the PR',
+      deliverable: opts.deliverable ?? 'review',
+      commissioner: opts.commissioner ?? 'gru',
+      ...(opts.targetRef !== undefined ? { targetRef: opts.targetRef } : {}),
+      ...(opts.targetSha !== undefined ? { targetSha: opts.targetSha } : {}),
+    });
+    api.setJobStatus(jobId, 'working');
+    api.setJobStatus(jobId, 'delivered');
+    const delivered = api.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { agentId: 'a1', sha: 'head-1' } });
+    api.openReportObligation({ jobId, observedAtSeq: delivered.seq });
+  }
+
+  it('persists commissioner and target on a report-type job, and the created event carries them', () => {
+    const { api, db, dir } = freshDb();
+    try {
+      const job = api.addJob({
+        id: 'rep-1', repo: 'fixture-app', title: 't', briefing: 'b',
+        deliverable: 'review', commissioner: 'silas',
+        targetRef: 'https://git.example.invalid/o/r/pull/9', targetSha: 'abc123',
+      });
+      expect(job.commissioner).toBe('silas');
+      expect(job.targetRef).toBe('https://git.example.invalid/o/r/pull/9');
+      expect(job.targetSha).toBe('abc123');
+      const created = api.latestJobEvent('rep-1', 'job.created');
+      expect(created?.payload).toMatchObject({ commissioner: 'silas', target_ref: 'https://git.example.invalid/o/r/pull/9', target_sha: 'abc123' });
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses target fields on a PR-owing lane and blank values anywhere', () => {
+    const { api, db, dir } = freshDb();
+    try {
+      expect(() => api.addJob({
+        id: 'pr-lane', repo: 'r', title: 't', briefing: 'b',
+        targetRef: 'https://git.example.invalid/o/r/pull/1',
+      })).toThrow(/report-job fields/);
+      expect(() => api.addJob({
+        id: 'blank-sha', repo: 'r', title: 't', briefing: 'b',
+        deliverable: 'review', targetRef: 'https://git.example.invalid/o/r/pull/1', targetSha: '  ',
+      })).toThrow(/target_sha/);
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a handback opens exactly ONE obligation; a duplicate delivery coalesces (idempotent)', () => {
+    const { api, db, dir } = freshDb();
+    try {
+      api.addJob({ id: 'rep-dup', repo: 'r', title: 't', briefing: 'b', deliverable: 'review', commissioner: 'gru', targetRef: 'https://x/pull/1', targetSha: 's1' });
+      api.setJobStatus('rep-dup', 'working');
+      const first = api.appendCustomEvent({ kind: 'job.delivered', jobId: 'rep-dup', payload: { sha: 's1' } });
+      const opened = api.openReportObligation({ jobId: 'rep-dup', observedAtSeq: first.seq });
+      expect(opened.created).toBe(true);
+      expect(opened.obligation.incidentKey).toBe('report:rep-dup');
+      expect(opened.obligation.logicalStep).toBe('review');
+      expect(opened.obligation.state).toBe('open');
+      // A later delivery (re-brief) replays the same open: still one debt.
+      const second = api.appendCustomEvent({ kind: 'job.delivered', jobId: 'rep-dup', payload: { sha: 's2' } });
+      const replay = api.openReportObligation({ jobId: 'rep-dup', observedAtSeq: second.seq });
+      expect(replay.created).toBe(false);
+      expect(replay.obligation.id).toBe(opened.obligation.id);
+      expect(api.listObligations({ jobId: 'rep-dup' })).toHaveLength(1);
+      // Step follows kind: artifact → verification, investigation → audit.
+      api.addJob({ id: 'rep-art', repo: 'r', title: 't', briefing: 'b', deliverable: 'artifact', commissioner: 'gru' });
+      api.setJobStatus('rep-art', 'working');
+      const art = api.appendCustomEvent({ kind: 'job.delivered', jobId: 'rep-art', payload: {} });
+      expect(api.openReportObligation({ jobId: 'rep-art', observedAtSeq: art.seq }).obligation.logicalStep).toBe('verification');
+      api.addJob({ id: 'rep-inv', repo: 'r', title: 't', briefing: 'b', deliverable: 'investigation', commissioner: 'gru' });
+      api.setJobStatus('rep-inv', 'working');
+      const inv = api.appendCustomEvent({ kind: 'job.delivered', jobId: 'rep-inv', payload: {} });
+      expect(api.openReportObligation({ jobId: 'rep-inv', observedAtSeq: inv.seq }).obligation.logicalStep).toBe('audit');
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('openReportObligation refuses PR-owing lanes and unknown jobs', () => {
+    const { api, db, dir } = freshDb();
+    try {
+      api.addJob({ id: 'pr-job', repo: 'r', title: 't', briefing: 'b' });
+      expect(() => api.openReportObligation({ jobId: 'pr-job', observedAtSeq: 1 })).toThrow(/report obligations open only on/);
+      expect(() => api.openReportObligation({ jobId: 'missing', observedAtSeq: 1 })).toThrow(/not found/);
+      // Legacy NULL deliverable is PR-owing by definition — refused too.
+      api.addJob({ id: 'legacy-job', repo: 'r', title: 't', briefing: 'b' });
+      expect(() => api.openReportObligation({ jobId: 'legacy-job', observedAtSeq: 1 })).toThrow(/report obligations open only on/);
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('an acted disposition settles the obligation and closes the job delivered → done', () => {
+    const { api, db, dir } = freshDb();
+    try {
+      deliveredReportJob(api, 'rep-acted', { targetRef: 'https://x/pull/2', targetSha: 's1' });
+      api.addJob({ id: 'directive-1', repo: 'r', title: 'fix lane', briefing: 'fix' });
+      const result = api.settleReportDisposition({
+        jobId: 'rep-acted', outcome: 'acted', directiveJobId: 'directive-1', by: 'gru',
+      });
+      expect(result.job.status).toBe('done');
+      expect(result.obligation.state).toBe('settled');
+      const disposition = api.latestJobEvent('rep-acted', 'job.report-disposition');
+      expect(disposition?.payload).toMatchObject({ outcome: 'acted', directive_job_id: 'directive-1', obligation_id: result.obligation.id });
+      // Evidence grounding (ruling A): the cited event is real, on the job.
+      const settled = api.getObligation(result.obligation.id);
+      expect(settled?.settlement).toMatchObject({ kind: 'executed-action', evidenceEventKind: 'job.report-disposition' });
+      expect(() => api.setJobStatus('rep-acted', 'working')).toThrow(/illegal transition/); // done is terminal
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('dismissed and superseded dispositions carry a written reason and close the lane', () => {
+    const { api, db, dir } = freshDb();
+    try {
+      deliveredReportJob(api, 'rep-dismiss', { deliverable: 'investigation', targetRef: 'https://x/pull/3', targetSha: 's1' });
+      const dismissed = api.settleReportDisposition({ jobId: 'rep-dismiss', outcome: 'dismissed', note: 'findings already covered by the hold' });
+      expect(dismissed.job.status).toBe('done');
+      expect(dismissed.obligation.settlement).toMatchObject({ kind: 'cancelled', reason: 'findings already covered by the hold' });
+
+      deliveredReportJob(api, 'rep-super', { deliverable: 'artifact', targetRef: 'https://x/pull/4', targetSha: 's1' });
+      const superseded = api.settleReportDisposition({ jobId: 'rep-super', outcome: 'superseded', note: 're-reviewed by the newer round' });
+      expect(superseded.job.status).toBe('done');
+      expect(superseded.obligation.settlement).toMatchObject({ kind: 'superseded', reason: 're-reviewed by the newer round' });
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('dispositions fail loud on every missing precondition', () => {
+    const { api, db, dir } = freshDb();
+    try {
+      deliveredReportJob(api, 'rep-guard', { targetRef: 'https://x/pull/5', targetSha: 's1' });
+      expect(() => api.settleReportDisposition({ jobId: 'rep-guard', outcome: 'acted' })).toThrow(/acted requires directive_job_id/);
+      expect(() => api.settleReportDisposition({ jobId: 'rep-guard', outcome: 'acted', directiveJobId: 'ghost' })).toThrow(/not found/);
+      expect(() => api.settleReportDisposition({ jobId: 'rep-guard', outcome: 'dismissed' })).toThrow(/non-empty note/);
+      expect(() => api.settleReportDisposition({ jobId: 'missing', outcome: 'dismissed', note: 'x' })).toThrow(/not found/);
+      // A working (not yet delivered) report owes nothing to settle.
+      api.addJob({ id: 'rep-working', repo: 'r', title: 't', briefing: 'b', deliverable: 'review', commissioner: 'gru' });
+      api.setJobStatus('rep-working', 'working');
+      expect(() => api.settleReportDisposition({ jobId: 'rep-working', outcome: 'dismissed', note: 'x' })).toThrow(/DELIVERED report/);
+      // A delivered PR job has no report obligation to settle.
+      api.addJob({ id: 'pr-delivered', repo: 'r', title: 't', briefing: 'b' });
+      api.setJobStatus('pr-delivered', 'working');
+      api.setJobStatus('pr-delivered', 'delivered');
+      api.appendCustomEvent({ kind: 'job.delivered', jobId: 'pr-delivered', payload: {} });
+      expect(() => api.settleReportDisposition({ jobId: 'pr-delivered', outcome: 'dismissed', note: 'x' })).toThrow(/dispositions apply to/);
+      // An already-settled obligation refuses a second disposition — the
+      // closed lane (done) is the guard that answers.
+      api.settleReportDisposition({ jobId: 'rep-guard', outcome: 'dismissed', note: 'first' });
+      expect(() => api.settleReportDisposition({ jobId: 'rep-guard', outcome: 'dismissed', note: 'second' })).toThrow(/is done/);
+      // A delivered report whose obligation was never opened (e.g. the
+      // crash window the boot reconciler covers) also refuses loudly.
+      api.addJob({ id: 'rep-noles', repo: 'r', title: 't', briefing: 'b', deliverable: 'review', commissioner: 'gru' });
+      api.setJobStatus('rep-noles', 'working');
+      api.setJobStatus('rep-noles', 'delivered');
+      api.appendCustomEvent({ kind: 'job.delivered', jobId: 'rep-noles', payload: {} });
+      expect(() => api.settleReportDisposition({ jobId: 'rep-noles', outcome: 'dismissed', note: 'x' })).toThrow(/no open report obligation/);
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('auto-supersede retires the debt, records report.superseded, and closes the lane', () => {
+    const { api, db, dir } = freshDb();
+    try {
+      deliveredReportJob(api, 'rep-auto', { targetRef: 'https://x/pull/6', targetSha: 's1' });
+      const result = api.supersedeReportObligation({ jobId: 'rep-auto', reason: 'target merged' });
+      expect(result.job.status).toBe('done');
+      expect(result.obligation.settlement).toMatchObject({ kind: 'superseded', reason: 'target merged' });
+      expect(api.latestJobEvent('rep-auto', 'report.superseded')?.payload).toMatchObject({ reason: 'target merged', target_ref: 'https://x/pull/6' });
+      // The scan set no longer carries the closed lane.
+      expect(api.listReportClosureCandidates().map((job) => job.id)).toEqual([]);
+      // A second auto-supersede hits the status guard — the lane is done.
+      expect(() => api.supersedeReportObligation({ jobId: 'rep-auto', reason: 'again' })).toThrow(/DELIVERED report/);
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('the candidate scan and the PR-url lookup find exactly the delivered targeted reports', () => {
+    const { api, db, dir } = freshDb();
+    try {
+      deliveredReportJob(api, 'rep-scan', { targetRef: 'https://x/pull/7', targetSha: 's1' });
+      deliveredReportJob(api, 'rep-untargeted', { deliverable: 'artifact' }); // no target: commissioner's, not the pass's
+      api.addJob({ id: 'src-pr', repo: 'fixture-app', title: 't', briefing: 'b' });
+      api.setJobPr('src-pr', 'https://x/pull/7');
+      const candidates = api.listReportClosureCandidates();
+      expect(candidates.map((job) => job.id)).toEqual(['rep-scan']);
+      expect(api.findJobByPrUrl('https://x/pull/7')?.id).toBe('src-pr');
+      expect(api.findJobByPrUrl('https://x/pull/999')).toBeNull();
+      expect(api.findJobByPrUrl('')).toBeNull();
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { rebriefFreshMinion, recordFollowUpDelivery, renderRebriefPrompt, routeFixDirectiveToMinion } from '../src/dispatch/fix-directive.js';
 import { LedgerDb } from '../src/ledger/db.js';
-import { LedgerApi } from '../src/ledger/api.js';
+import { LedgerApi, type ObligationRecord } from '../src/ledger/api.js';
 import { EventBus } from '../src/events/bus.js';
 import { withFallbacks } from '../src/runtime/fallbacks.js';
 import type { AgentHandle, AgentRuntime } from '../src/runtime/types.js';
@@ -36,7 +36,7 @@ interface RecordedEvent {
   readonly payload?: unknown;
 }
 
-function fakeLedger() {
+function fakeLedger(job: { deliverable?: 'review' | 'artifact' | 'investigation' | null } = {}) {
   const events: RecordedEvent[] = [];
   return {
     events,
@@ -52,6 +52,34 @@ function fakeLedger() {
         lens: null,
         payload: fields.payload ?? {},
       };
+    },
+    // Issue #220: the delivery path reads the job to decide whether this
+    // is a report handback. The fixture's jobs are PR-owing (deliverable
+    // null), so the obligation path stays untouched unless a test opts in.
+    getJob(id: string) {
+      return id === 'job-1'
+        ? {
+            id,
+            repo: 'fixture',
+            title: id,
+            displayName: null,
+            deliverable: job.deliverable ?? null,
+            commissioner: null,
+            targetRef: null,
+            targetSha: null,
+            status: 'delivered' as const,
+            baseBranch: null,
+            prUrl: null,
+            note: null,
+            briefing: null,
+            createdAt: '2026-09-21T00:00:00.000Z',
+            updatedAt: '2026-09-21T00:00:00.000Z',
+          }
+        : null;
+    },
+    openReportObligation(args: { jobId: string; observedAtSeq: number }) {
+      events.push({ kind: 'job.report-obligation-opened', jobId: args.jobId, payload: args });
+      return { obligation: { id: `obl-${args.jobId}` } as ObligationRecord, created: true };
     },
   };
 }

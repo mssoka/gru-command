@@ -169,6 +169,15 @@ export class DispatchService {
      * artifact-only lanes with `artifact`/`investigation`; omitted = a
      * PR-owing implementation lane. */
     deliverable?: JobDeliverable;
+    /** Issue #220 report-job closure: who commissioned this report (the
+     * disposition debtor) and what it reviewed. The commissioner defaults
+     * to `gru` on report-type jobs; a review job WITHOUT a target fails
+     * loud — findings that cannot name what they reviewed are not a
+     * commissioned report. Rejected on PR-owing lanes (the lane's own PR
+     * is the deliverable, recorded via recordPr). */
+    commissioner?: string;
+    targetRef?: string;
+    targetSha?: string;
     briefing: string;
     /** Explicit completion intent: when present, the phase-handoff guard
      * row is persisted BEFORE any side effect and this exact phase's
@@ -179,6 +188,30 @@ export class DispatchService {
     if (input.jobId.trim() === '' || input.title.trim() === '' || input.briefing.trim() === '') {
       throw new Error('dispatch requires a non-empty job id, title, and briefing');
     }
+    const isReportKind = input.deliverable !== undefined && input.deliverable !== 'pr';
+    if (isReportKind) {
+      if (input.targetRef !== undefined && input.targetRef.trim() === '') {
+        throw new Error(`report job "${input.jobId}" target_ref must be a non-empty string when present`);
+      }
+      if (input.targetSha !== undefined && input.targetSha.trim() === '') {
+        throw new Error(`report job "${input.jobId}" target_sha must be a non-empty string when present`);
+      }
+      if (input.deliverable === 'review' &&
+          (input.targetRef === undefined || input.targetRef.trim() === '' ||
+           input.targetSha === undefined || input.targetSha.trim() === '')) {
+        throw new Error(
+          `report review job "${input.jobId}" requires a review target: target_ref (the PR url) and target_sha ` +
+            '(the reviewed head) — findings that cannot name their target are not a commissioned report',
+        );
+      }
+    } else if (input.targetRef !== undefined || input.targetSha !== undefined) {
+      throw new Error(
+        `job "${input.jobId}" is a PR-owing lane — target_ref/target_sha are report-job fields`,
+      );
+    }
+    const commissioner = isReportKind ? (input.commissioner?.trim() || 'gru') : undefined;
+    const targetRef = isReportKind ? input.targetRef?.trim() : undefined;
+    const targetSha = isReportKind ? input.targetSha?.trim() : undefined;
     const repoName = input.repoPath.split('/').filter(Boolean).pop() ?? input.repoPath;
 
     // (1) The job row: the briefing IS the contract (recorded verbatim).
@@ -189,6 +222,9 @@ export class DispatchService {
       displayName: input.displayName,
       briefing: input.briefing,
       ...(input.deliverable !== undefined ? { deliverable: input.deliverable } : {}),
+      ...(commissioner !== undefined ? { commissioner } : {}),
+      ...(targetRef !== undefined ? { targetRef } : {}),
+      ...(targetSha !== undefined ? { targetSha } : {}),
     });
 
     // (2) Ops handoff: dispatched → working, on the record.

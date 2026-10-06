@@ -24,7 +24,16 @@ close-out: a ledger-visible end state a stranger can audit.
    the job's PR is registered, the newest delivery has a review round, and
    the verdict is recorded. A `silas.review-triggered` event with the round
    id is your receipt.
-2. **Fix loops.** A directive or re-brief is closed when the minion's
+2. **Report handbacks owe a disposition, not a PR chase (issue #220).** A
+   delivered review/artifact/investigation job opens ONE `report:<jobId>`
+   obligation owed by its commissioner the moment the handback lands. The
+   lane is closed when that obligation settles: `acted` (the findings were
+   routed as a directive to the target lane — dispatch it first, then
+   disposition with its job id), `dismissed` (with a written reason), or
+   `superseded`. The deterministic pass settles it for you when the target
+   PR merges or its head moves past the reviewed sha — a superseded report
+   is closed, never re-opened and never re-chased as a missing PR.
+3. **Fix loops.** A directive or re-brief is closed when the minion's
    follow-up delivery lands and the re-review fires. If the same canonical
    blocker then recurs, the ladder continues (directive → re-brief →
    escalate); if blockers evolve, keep looping — no cap. A raw tool-call
@@ -38,11 +47,11 @@ close-out: a ledger-visible end state a stranger can audit.
    boundary meets the terminal job: the pending markers are retired with
    a `silas.rebrief-retired` event and no delivery is expected — do not
    re-treat that lane as unclosed.
-3. **Escalations.** An escalation is closed by a human ack, not by you.
+4. **Escalations.** An escalation is closed by a human ack, not by you.
    After escalating, leave the lane exactly as it is and say so in your
    completion note. Do not re-escalate the same state on every sweep: the
    digest stops listing a verdict once your rung lands.
-4. **Lanes.** A lane releases only when the job is terminal (merged/done)
+5. **Lanes.** A lane releases only when the job is terminal (merged/done)
    or explicitly abandoned by the chief. Preserve before remove: untracked
    deliverables are preserved by the sweep, and a live process pauses it —
    acknowledge, never override.

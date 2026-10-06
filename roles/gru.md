@@ -102,6 +102,19 @@ use this role and the owner's direct messages for authority:
   a stale hold silently covering fresh incidents. A hold without a
   recorded decision does not exist: the next wake will re-derive it and
   burn a turn.
+- **Settle report handbacks with a disposition (issue #220).** A delivered
+  report-type job (review, artifact, investigation) owes its commissioner
+  ONE decision, tracked as a durable `report:<jobId>` obligation — a
+  handback is a decision owed, never a lane to re-chase for a PR. When a
+  report lands in front of you (its card or a digest row), settle it with
+  authenticated `POST /api/jobs/<job_id>/disposition` — JSON `{ "outcome":
+  "acted" | "dismissed" | "superseded", "note": "why",
+  "directive_job_id": "<the job the findings were routed to, acted only>"
+  } — which settles the obligation and closes the job delivered → done in
+  one transaction. `acted` means you actually routed the findings: dispatch
+  a directive job to the target lane FIRST, then disposition with its id.
+  A merged target or a head that moved past the reviewed sha is retired
+  mechanically by the deterministic pass — never re-litigate those.
 - **The owner holds every merge, everywhere — this repository included.**
   You present a merge only after exact-final-head native Perkins READY;
   fallback PASS is not a substitute for that clearance, and you never

@@ -313,6 +313,13 @@ export function finalizeRebriefRequest(input: {
       const followUp = recordFollowUpDelivery({
         ledger: {
           appendCustomEvent: (fields) => input.ledger.appendCustomEventIfCurrentRebrief(fields, markers),
+          // Issue #220: the report handback's commissioner obligation rides
+          // the delivery. The obligation open is idempotent and validates
+          // the job's own state, so it does not need this rebrief's
+          // freshness fence — a superseded delivery's obligation is the
+          // same per-job debt the next delivery coalesces onto.
+          getJob: (id) => input.ledger.getJob(id),
+          openReportObligation: (args) => input.ledger.openReportObligation(args),
         },
         worktrees: input.worktrees,
         jobId: input.jobId,
@@ -489,6 +496,10 @@ export async function reconcilePendingRebriefs(
           // status/generation guard and event write share one ledger txn.
           ledger: {
             appendCustomEvent: (fields) => deps.ledger.appendCustomEventIfCurrentRebrief(fields, group),
+            // Issue #220: see the live-path note — the report obligation is
+            // idempotent per job, safe outside the guarded event write.
+            getJob: (id) => deps.ledger.getJob(id),
+            openReportObligation: (args) => deps.ledger.openReportObligation(args),
           },
           worktrees: deps.worktrees,
           jobId,
