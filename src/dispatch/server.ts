@@ -1529,7 +1529,11 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
 
   return {
     requestHook(req, res, path): boolean {
-      if (!path.startsWith('/api/dispatch') && !path.startsWith('/api/silas') && !path.startsWith('/api/pipeline') && !path.startsWith('/api/jobs/')) {
+      // The /api/jobs namespace belongs to the BOARD api except for the
+      // report disposition endpoint this hook adds — claim only that exact
+      // shape, or /api/jobs/{id}/status and friends would 404 here.
+      const isDisposition = path.startsWith('/api/jobs/') && path.endsWith('/disposition');
+      if (!path.startsWith('/api/dispatch') && !path.startsWith('/api/silas') && !path.startsWith('/api/pipeline') && !isDisposition) {
         return false;
       }
       const startedAt = Date.now();
