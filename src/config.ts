@@ -3,6 +3,7 @@ import { homedir } from 'node:os';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { parse, type TomlPrimitive } from 'smol-toml';
 import { parseQuietHours } from './chat/wake-policy.js';
+import { DEFAULT_INPUT_PRICE_PER_MTOK, validateProviderProfile } from './decisions/profile.js';
 
 /** Roles are product-native and runtime-agnostic (SPEC ruling 15). */
 export const ROLES = ['gru', 'silas', 'minion', 'perkins', 'bob'] as const;
@@ -433,6 +434,18 @@ export interface JevConfig {
   readonly timeoutMs: number;
 }
 
+/** One `[decisions.providers.<name>]` table: the full profile (issue #222).
+ * Protocol, endpoint, model, credential slot and timeout are all required;
+ * `input_price_per_mtok` is optional (systemone cost fallback). */
+export interface DecisionProviderTable {
+  readonly protocol: 'openrouter-decisions' | 'systemone';
+  readonly endpoint: string;
+  readonly model: string;
+  readonly credential: string;
+  readonly timeoutMs: number;
+  readonly inputPricePerMtok: number;
+}
+
 export interface DecisionThresholdConfig {
   readonly act: number;
   readonly confirm: number;
@@ -441,11 +454,74 @@ export interface DecisionThresholdConfig {
 
 export interface DecisionsConfig {
   readonly jev: JevConfig;
+  /** User-defined/overriding provider profiles; built-ins are merged in by
+   * {@link effectiveDecisionProviders}. */
+  readonly providers: Readonly<Record<string, DecisionProviderTable>>;
+  /** Per-surface routing: surface name → provider profile name. */
+  readonly surfaces: Readonly<Record<string, string>>;
   readonly thresholds: Readonly<{
     read_only: DecisionThresholdConfig;
     operational: DecisionThresholdConfig;
     destructive: DecisionThresholdConfig;
   }>;
+}
+
+/** The profile every surface routes to unless `[decisions.surfaces]` says
+ * otherwise; the legacy `[decisions.jev]` block keeps feeding it. */
+export const DEFAULT_DECISION_PROFILE = 'openrouter-jev';
+
+const TYPESAFE_DIRECT_ENDPOINT = 'https://api.typesafe.ai/v1/systemone';
+const LOCAL_SYSTEMONE_ENDPOINT = 'http://127.0.0.1:8088/v1/systemone';
+
+/** The three built-in profiles, before user overrides (issue #222). The
+ * `openrouter-jev` entry shown here is superseded by the legacy
+ * `[decisions.jev]` block's model/endpoint/timeout when that block sets
+ * them — see {@link effectiveDecisionProviders}. */
+export function builtinDecisionProviders(jev: JevConfig): Record<string, DecisionProviderTable> {
+  return {
+    [DEFAULT_DECISION_PROFILE]: {
+      protocol: 'openrouter-decisions',
+      endpoint: jev.endpoint,
+      model: jev.model,
+      credential: 'openrouter',
+      timeoutMs: jev.timeoutMs,
+      inputPricePerMtok: 0.042,
+    },
+    'typesafe-direct': {
+      protocol: 'systemone',
+      endpoint: TYPESAFE_DIRECT_ENDPOINT,
+      model: 'jev-latest',
+      credential: 'typesafe',
+      timeoutMs: jev.timeoutMs,
+      inputPricePerMtok: 0.042,
+    },
+    local: {
+      protocol: 'systemone',
+      endpoint: LOCAL_SYSTEMONE_ENDPOINT,
+      model: 'laya-421m',
+      credential: 'none',
+      timeoutMs: jev.timeoutMs,
+      inputPricePerMtok: 0,
+    },
+  };
+}
+
+/** The effective profile set: built-ins (with the legacy `[decisions.jev]`
+ * block feeding `openrouter-jev`), overlaid by `[decisions.providers]`.
+ * Pure and total: every consumer (runtime, CLI, docs) reads routing from
+ * this one map, which is prototype-free so reserved names (`__proto__`,
+ * `toString`) behave as ordinary profile names. Throws
+ * ConfigError-shaped profile errors on an invalid merge — callers degrade
+ * loudly, never silently. */
+export function effectiveDecisionProviders(
+  config: DecisionsConfig,
+): Record<string, DecisionProviderTable> {
+  const merged: Record<string, DecisionProviderTable> = Object.create(null);
+  Object.assign(merged, builtinDecisionProviders(config.jev));
+  for (const [name, table] of Object.entries(config.providers)) {
+    merged[name] = table;
+  }
+  return merged;
 }
 
 export const DEFAULT_DECISIONS_CONFIG: DecisionsConfig = {
@@ -455,6 +531,8 @@ export const DEFAULT_DECISIONS_CONFIG: DecisionsConfig = {
     endpoint: 'https://openrouter.ai/api/alpha/decisions',
     timeoutMs: 2_000,
   },
+  providers: {},
+  surfaces: {},
   thresholds: {
     read_only: { act: 0.6, confirm: 0.4, requireConfirmOnAct: false },
     operational: { act: 0.75, confirm: 0.55, requireConfirmOnAct: false },
@@ -739,6 +817,13 @@ function requireTimerInterval(value: unknown, file: string, field: string): numb
     );
   }
   return ms;
+}
+
+function requireNonNegativeNumber(value: unknown, file: string, field: string): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+    throw new ConfigError(`${field} must be a non-negative finite number`, file, field);
+  }
+  return value;
 }
 
 function requireUnitNumber(value: unknown, file: string, field: string): number {
@@ -1654,9 +1739,9 @@ function readDecisionsConfig(
 ): DecisionsConfig {
   const table = requireTable(value, file, 'decisions');
   for (const key of Object.keys(table)) {
-    if (!['jev', 'thresholds'].includes(key)) {
+    if (!['jev', 'providers', 'surfaces', 'thresholds'].includes(key)) {
       throw new ConfigError(
-        `unknown key \`${key}\` in [decisions] (valid keys: jev, thresholds)`,
+        `unknown key \`${key}\` in [decisions] (valid keys: jev, providers, surfaces, thresholds)`,
         file,
         `decisions.${key}`,
       );
@@ -1681,6 +1766,125 @@ function readDecisionsConfig(
       endpoint: jevTable['endpoint'] !== undefined ? requireString(jevTable['endpoint'], file, 'decisions.jev.endpoint') : jev.endpoint,
       timeoutMs: jevTable['timeout_ms'] !== undefined ? requirePositiveInt(jevTable['timeout_ms'], file, 'decisions.jev.timeout_ms') : jev.timeoutMs,
     };
+  }
+  // Provider profiles (issue #222). Each table is FULL (protocol, endpoint,
+  // model, credential, timeout_ms; optional input_price_per_mtok) and is
+  // validated against its protocol's endpoint/credential binding rules.
+  // Prototype-free: a reserved name like `__proto__` stays an ordinary
+  // profile name instead of silently mutating or vanishing.
+  const providers: Record<string, DecisionProviderTable> = Object.create(null);
+  if (table['providers'] !== undefined) {
+    const providersTable = requireTable(table['providers'], file, 'decisions.providers');
+    for (const name of Object.keys(providersTable)) {
+      if (!Object.prototype.hasOwnProperty.call(providersTable, name)) continue;
+      if (!/^[A-Za-z0-9_-]+$/u.test(name)) {
+        throw new ConfigError(
+          `provider profile name \`${name}\` must match [A-Za-z0-9_-]+`,
+          file,
+          `decisions.providers.${name}`,
+        );
+      }
+      const profileTable = requireTable(providersTable[name], file, `decisions.providers.${name}`);
+      const valid = ['protocol', 'endpoint', 'model', 'credential', 'timeout_ms', 'input_price_per_mtok'];
+      for (const key of Object.keys(profileTable)) {
+        if (!valid.includes(key)) {
+          throw new ConfigError(
+            `unknown key \`${key}\` in [decisions.providers.${name}] (valid keys: ${valid.join(', ')})`,
+            file,
+            `decisions.providers.${name}.${key}`,
+          );
+        }
+      }
+      const missing = ['protocol', 'endpoint', 'model', 'credential', 'timeout_ms'].filter((key) => profileTable[key] === undefined);
+      if (missing.length > 0) {
+        throw new ConfigError(
+          `[decisions.providers.${name}] is missing required key(s): ${missing.join(', ')}`,
+          file,
+          `decisions.providers.${name}`,
+        );
+      }
+      const protocol = requireString(profileTable['protocol'], file, `decisions.providers.${name}.protocol`);
+      if (protocol !== 'openrouter-decisions' && protocol !== 'systemone') {
+        throw new ConfigError(
+          `decisions.providers.${name}.protocol must be "openrouter-decisions" or "systemone"`,
+          file,
+          `decisions.providers.${name}.protocol`,
+        );
+      }
+      const credential = requireString(profileTable['credential'], file, `decisions.providers.${name}.credential`);
+      const profile: DecisionProviderTable = {
+        protocol,
+        endpoint: requireString(profileTable['endpoint'], file, `decisions.providers.${name}.endpoint`),
+        model: requireString(profileTable['model'], file, `decisions.providers.${name}.model`),
+        credential,
+        timeoutMs: requirePositiveInt(profileTable['timeout_ms'], file, `decisions.providers.${name}.timeout_ms`),
+        inputPricePerMtok:
+          profileTable['input_price_per_mtok'] !== undefined
+            ? requireNonNegativeNumber(profileTable['input_price_per_mtok'], file, `decisions.providers.${name}.input_price_per_mtok`)
+            : DEFAULT_INPUT_PRICE_PER_MTOK,
+      };
+      try {
+        validateProviderProfile(profile, `decisions.providers.${name}`);
+      } catch (error) {
+        throw new ConfigError(
+          error instanceof Error ? error.message : String(error),
+          file,
+          `decisions.providers.${name}`,
+        );
+      }
+      providers[name] = profile;
+    }
+  }
+  // Per-surface routing: every surface must name a profile that exists in
+  // the effective set (built-ins + this table). Both documented spellings
+  // are accepted — the shorthand `surface = "profile"` and the explicit
+  // `[decisions.surfaces.<surface>] provider = "profile"` table.
+  const surfaces: Record<string, string> = Object.create(null);
+  if (table['surfaces'] !== undefined) {
+    const surfacesTable = requireTable(table['surfaces'], file, 'decisions.surfaces');
+    const effective = effectiveDecisionProviders({ ...defaults, jev, providers, surfaces: {} });
+    for (const surface of Object.keys(surfacesTable)) {
+      if (!Object.prototype.hasOwnProperty.call(surfacesTable, surface)) continue;
+      if (!/^[a-z0-9_]+$/u.test(surface)) {
+        throw new ConfigError(
+          `decision surface name \`${surface}\` must match [a-z0-9_]+`,
+          file,
+          `decisions.surfaces.${surface}`,
+        );
+      }
+      let profile: string;
+      const entry = surfacesTable[surface];
+      if (typeof entry === 'object' && entry !== null && !Array.isArray(entry)) {
+        const surfaceTable = entry as Record<string, unknown>;
+        for (const key of Object.keys(surfaceTable)) {
+          if (key !== 'provider') {
+            throw new ConfigError(
+              `unknown key \`${key}\` in [decisions.surfaces.${surface}] (valid keys: provider)`,
+              file,
+              `decisions.surfaces.${surface}.${key}`,
+            );
+          }
+        }
+        if (surfaceTable['provider'] === undefined) {
+          throw new ConfigError(
+            `[decisions.surfaces.${surface}] is missing required key \`provider\``,
+            file,
+            `decisions.surfaces.${surface}`,
+          );
+        }
+        profile = requireString(surfaceTable['provider'], file, `decisions.surfaces.${surface}.provider`);
+      } else {
+        profile = requireString(entry, file, `decisions.surfaces.${surface}`);
+      }
+      if (!Object.prototype.hasOwnProperty.call(effective, profile)) {
+        throw new ConfigError(
+          `decisions.surfaces.${surface} names unknown provider profile \`${profile}\` (available: ${Object.keys(effective).join(', ')})`,
+          file,
+          `decisions.surfaces.${surface}`,
+        );
+      }
+      surfaces[surface] = profile;
+    }
   }
   let thresholds = defaults.thresholds;
   if (table['thresholds'] !== undefined) {
@@ -1717,7 +1921,7 @@ function readDecisionsConfig(
       'decisions.thresholds.destructive.require_confirm_on_act',
     );
   }
-  return { jev, thresholds };
+  return { jev, providers, surfaces, thresholds };
 }
 
 /** Keys accepted per [runtimes.<id>]; the catalog-refresh knobs are pi-only. */

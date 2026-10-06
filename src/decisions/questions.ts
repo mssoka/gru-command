@@ -1,6 +1,14 @@
 import type { BusEvent } from '../events/bus.js';
 import type { DecisionRequest, QuestionSet, ScoreAnswer } from './types.js';
 
+/**
+ * The stable decision surface names (issue #222). Each production caller
+ * passes its surface to `decide` so `[decisions.surfaces]` can route it to
+ * a provider profile; an unrouted surface rides the default profile.
+ */
+export const DECISION_SURFACE_EVENT_TRIAGE = 'event_triage';
+export const DECISION_SURFACE_SUPERVISION = 'supervision_guidance';
+
 const SECRET_KEY_CANONICAL = /(?:authorization|proxyauthorization|apikey|token|accesstoken|refreshtoken|idtoken|password|passwd|secret|clientsecret|credential|cookie|sessionid|sessionkey|sessiontoken|awssecretaccesskey|privatekey)/i;
 const SECRET_FIELD = String.raw`(?:authorization|proxy[-_\s]?authorization|api[-_\s]?key|(?:access|refresh|id)[-_\s]?token|token|password|passwd|(?:client[-_\s]?)?secret|credential|cookie|session[-_\s]?(?:id|key|token)|aws[-_\s]?secret[-_\s]?access[-_\s]?key|private[-_\s]?key)`;
 // Free-text failures often contain `Authorization: Bearer <key>`,

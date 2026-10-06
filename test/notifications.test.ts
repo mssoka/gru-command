@@ -71,7 +71,7 @@ async function expectClosedTriageDoesNotResurface(closed: 'acknowledged' | 'reso
       ...fallback.routes,
       needs_action: { path: 'act', metric: 0.99, metricKind: 'probability', requiresConfirm: false, riskClass: 'operational' },
     },
-    provenance: { source: 'jev', fallbackReason: null, model: 'jev-test', latencyMs: 2, usage: null },
+    provenance: { source: 'jev', fallbackReason: null, model: 'jev-test', latencyMs: 2, usage: null, profile: null },
   });
   await new Promise((resolve) => setTimeout(resolve, 10));
   expect(pending.api.getNotification(provisional.id)).toMatchObject({ routing: 'fyi' });
@@ -217,7 +217,7 @@ describe('notification center — durable log + receipts + acks', () => {
         ...fallback.routes,
         needs_action: { path: 'act', metric: 0.95, metricKind: 'probability', requiresConfirm: false, riskClass: 'operational' },
       },
-      provenance: { source: 'jev', fallbackReason: null, model: 'jev-test', latencyMs: 2, usage: null },
+      provenance: { source: 'jev', fallbackReason: null, model: 'jev-test', latencyMs: 2, usage: null, profile: null },
     });
     await vi.waitFor(() => expect(pending.api.getNotification(provisional!.id)).toMatchObject({ routing: 'action-required' }));
     expect(pending.api.listNotifications({ limit: 50 }).filter((item) => item.title.includes('pending-jev'))).toHaveLength(1);
@@ -253,7 +253,7 @@ describe('notification center — durable log + receipts + acks', () => {
           needs_action: { path: 'confirm', metric: 0.7, metricKind: 'probability', requiresConfirm: true, riskClass: 'operational' },
           event_class: { path: 'act', metric: 0.95, metricKind: 'confidence', requiresConfirm: false, riskClass: 'read_only' },
         },
-        provenance: { source: 'jev', fallbackReason: null, model: 'jev-test', latencyMs: 2, usage: null },
+        provenance: { source: 'jev', fallbackReason: null, model: 'jev-test', latencyMs: 2, usage: null, profile: null },
       };
     });
     rig4.center.setDecisionService({ decide } as unknown as DecisionService);
@@ -619,7 +619,7 @@ describe('notification center — durable log + receipts + acks', () => {
         needs_action: { path: 'fallback', metric: 0.01, metricKind: 'probability', requiresConfirm: false, riskClass: 'operational' },
         event_class: { path: 'act', metric: 0.99, metricKind: 'confidence', requiresConfirm: false, riskClass: 'read_only' },
       },
-      provenance: { source: 'jev', fallbackReason: null, model: 'jev-test', latencyMs: 2, usage: null },
+      provenance: { source: 'jev', fallbackReason: null, model: 'jev-test', latencyMs: 2, usage: null, profile: null },
     });
     await vi.waitFor(() => expect(rig.api.getNotification(provisional.id)?.detail ?? '').toContain('settle_noise'));
     expect(rig.api.getNotification(incident.id)).toMatchObject({ routing: 'action-required', ackedAt: null, resolvedAt: null });

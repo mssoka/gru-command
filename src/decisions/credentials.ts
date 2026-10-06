@@ -12,6 +12,13 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
+import {
+  CREDENTIAL_ENV_VARS,
+  CREDENTIAL_SLOTS,
+  credentialEnvVar,
+  credentialFileFor,
+  type CredentialSlot,
+} from './profile.js';
 
 export type CredentialSource = 'environment' | 'file' | 'none';
 export type CredentialState = 'present' | 'absent' | 'unsafe' | 'invalid' | 'unreadable';
@@ -23,20 +30,28 @@ export interface CredentialResolution {
   readonly key?: string;
 }
 
-export function credentialPath(instanceDir: string): string {
-  return join(instanceDir, 'credentials', 'openrouter.key');
+/** Legacy single-slot path (the openrouter slot); kept for callers that
+ * predate named slots. Unknown slots fail loud — callers validate earlier,
+ * so reaching here with one is a programmer error. */
+export function credentialPath(instanceDir: string, slot: string = 'openrouter'): string {
+  if (!(CREDENTIAL_SLOTS as readonly string[]).includes(slot)) {
+    throw new Error(`unknown credential slot "${slot}" (valid: ${CREDENTIAL_SLOTS.join(', ')})`);
+  }
+  return join(instanceDir, 'credentials', credentialFileFor(slot as CredentialSlot));
 }
 
 /**
- * Move the provider key into a private environment snapshot before any
+ * Move every provider key into a private environment snapshot before any
  * product subprocesses are launched. Child processes inherit process.env,
- * so leaving this value ambient would expose it to agents and repo hooks.
+ * so leaving these values ambient would expose them to agents and repo
+ * hooks. The slot set is explicit (never a blanket `_API_KEY` sweep, which
+ * would delete unrelated tooling credentials).
  */
 export function isolateDecisionEnvironment(
   env: NodeJS.ProcessEnv = process.env,
 ): NodeJS.ProcessEnv {
   const isolated = { ...env };
-  delete env['OPENROUTER_API_KEY'];
+  for (const name of CREDENTIAL_ENV_VARS) delete env[name];
   return isolated;
 }
 
@@ -53,8 +68,8 @@ function unixOwnershipSafe(path: string, expectedMode: number): boolean {
   return (info.mode & 0o777) === expectedMode;
 }
 
-function resolveFile(instanceDir: string): CredentialResolution {
-  const file = credentialPath(instanceDir);
+function resolveFile(instanceDir: string, slot: CredentialSlot): CredentialResolution {
+  const file = credentialPath(instanceDir, slot);
   const directory = dirname(file);
   try {
     // lstat sees dangling symlinks that existsSync deliberately follows and
@@ -77,17 +92,22 @@ function resolveFile(instanceDir: string): CredentialResolution {
   }
 }
 
-/** Environment override wins even when malformed: never silently fall through. */
+/** Environment override wins even when malformed: never silently fall through.
+ * Keyless profiles never reach here (the provider runs with no key). */
 export function resolveCredential(
   instanceDir: string,
   env: NodeJS.ProcessEnv = process.env,
+  slot: string = 'openrouter',
 ): CredentialResolution {
-  const fromEnv = env['OPENROUTER_API_KEY'];
+  if (!(CREDENTIAL_SLOTS as readonly string[]).includes(slot)) {
+    throw new Error(`unknown credential slot "${slot}" (valid: ${CREDENTIAL_SLOTS.join(', ')})`);
+  }
+  const fromEnv = env[credentialEnvVar(slot as CredentialSlot)];
   if (fromEnv !== undefined) {
     if (!validKey(fromEnv)) return { state: 'invalid', source: 'environment' };
     return { state: 'present', source: 'environment', key: fromEnv };
   }
-  return resolveFile(instanceDir);
+  return resolveFile(instanceDir, slot as CredentialSlot);
 }
 
 export function parseCredentialStdin(input: string): string {
@@ -99,9 +119,12 @@ export function parseCredentialStdin(input: string): string {
 }
 
 /** Atomic protected-file persistence; pre-existing unsafe paths are rejected. */
-export function writeCredential(instanceDir: string, key: string): void {
+export function writeCredential(instanceDir: string, key: string, slot: string = 'openrouter'): void {
+  if (!(CREDENTIAL_SLOTS as readonly string[]).includes(slot)) {
+    throw new Error(`unknown credential slot "${slot}" (valid: ${CREDENTIAL_SLOTS.join(', ')})`);
+  }
   if (!validKey(key)) throw new Error('credential must be one non-empty line');
-  const file = credentialPath(instanceDir);
+  const file = credentialPath(instanceDir, slot as CredentialSlot);
   const directory = dirname(file);
   mkdirSync(instanceDir, { recursive: true, mode: 0o700 });
   if (existsSync(directory)) {
@@ -118,7 +141,7 @@ export function writeCredential(instanceDir: string, key: string): void {
       throw new Error('credential file is unsafe; require an owner-only 0600 regular file');
     }
   }
-  const temp = join(directory, `.openrouter.key.${process.pid}.${Date.now()}.tmp`);
+  const temp = join(directory, `.${slot}.key.${process.pid}.${Date.now()}.tmp`);
   let fd: number | null = null;
   try {
     const noFollow = 'O_NOFOLLOW' in constants ? constants.O_NOFOLLOW : 0;

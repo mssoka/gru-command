@@ -61,6 +61,7 @@ import { createSessionLessonsCapture } from './lessons/capture.js';
 import { createReviewOutcomeCapture } from './lessons/review-capture.js';
 import { createLessonsServer } from './lessons/server.js';
 import { DecisionRuntime } from './decisions/runtime.js';
+import { DECISION_SURFACE_EVENT_TRIAGE } from './decisions/questions.js';
 import { isolateDecisionEnvironment } from './decisions/credentials.js';
 import type { Role } from './config.js';
 import type { GruCommandConfig } from './config.js';
@@ -735,7 +736,7 @@ async function main(): Promise<number> {
   state.decisions = decisionRuntime;
   notifications.setDecisionService(
     decisionRuntime,
-    () => decisionRuntime.status().status === 'ready',
+    () => decisionRuntime.readyFor(DECISION_SURFACE_EVENT_TRIAGE),
   );
   // Provider-recovery sensor (owner-approved 2026-09-28): constructed
   // BEFORE the supervisor so its recorder can observe wall stops, with

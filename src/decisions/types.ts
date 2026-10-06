@@ -81,6 +81,7 @@ export type DecisionFailureReason =
   | 'timeout'
   | 'network_error'
   | 'malformed_response'
+  | 'malformed_request'
   | 'provider_degraded'
   | 'capacity_limited'
   | 'probe_failed'
@@ -99,6 +100,17 @@ export interface DecisionProvenance {
   readonly model: string | null;
   readonly latencyMs: number;
   readonly usage: DecisionUsage | null;
+  /** The `[decisions.providers]` profile that produced (or was attempted
+   * for) this outcome; null for deterministic fallbacks that never named
+   * one. */
+  readonly profile: string | null;
+}
+
+/** Optional routing input: which `[decisions.surfaces]` entry decides the
+ * provider profile. Omitted surfaces route to the default profile
+ * (`openrouter-jev`) — today's behavior, unchanged. */
+export interface DecisionSurface {
+  readonly surface?: string;
 }
 
 export interface DecisionRequest<Q extends QuestionSet> {
@@ -118,5 +130,5 @@ export interface DecisionOutcome<Q extends QuestionSet> {
 }
 
 export interface DecisionService {
-  decide<Q extends QuestionSet>(request: DecisionRequest<Q>): Promise<DecisionOutcome<Q>>;
+  decide<Q extends QuestionSet>(request: DecisionRequest<Q>, opts?: DecisionSurface): Promise<DecisionOutcome<Q>>;
 }

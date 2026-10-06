@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { LogLevel } from '../logger.js';
 import type { BusEvent, EventBus } from '../events/bus.js';
 import type { DecisionService } from '../decisions/types.js';
-import { eventDecisionRequest, redactedText } from '../decisions/questions.js';
+import { DECISION_SURFACE_EVENT_TRIAGE, eventDecisionRequest, redactedText } from '../decisions/questions.js';
 import {
   LedgerApi,
   isOwnerHeldNotificationKind,
@@ -253,7 +253,7 @@ export class NotificationCenter {
       ).length,
     });
     void this.decisions
-      .decide(request)
+      .decide(request, { surface: DECISION_SURFACE_EVENT_TRIAGE })
       .then((outcome) => {
         const actionRoute = outcome.routes.needs_action;
         const classRoute = outcome.routes.event_class;
