@@ -2538,6 +2538,7 @@ export const PUBLIC_REVIEW_EXECUTABLE_PATHS: ReadonlySet<string> = new Set([
   "dist/chat/awareness.js",
   "dist/chat/frame-log.js",
   "dist/chat/frames.js",
+  "dist/chat/incident.js",
   "dist/chat/server.js",
   "dist/chat/session-state.js",
   "dist/chat/spawn-backoff.js",

@@ -5,7 +5,9 @@ import { afterAll, describe, expect, it, vi } from 'vitest';
 import {
   AWARENESS_STATE_NAME,
   GruAwareness,
+  type AwarenessInjection,
   type AwarenessLimits,
+  type GruAwarenessLedger,
 } from '../src/chat/awareness.js';
 import type { NotifyWakeMode, QuietHours, WakeMinSeverity } from '../src/config.js';
 import { EventBus } from '../src/events/bus.js';
@@ -1234,5 +1236,598 @@ describe('gru awareness — passive queue rotation (GH-109)', () => {
     expect(blocks[0]).toEqual(order.slice(0, 4));
     expect(blocks[1]).toEqual(order.slice(4, 8));
     expect(blocks[2]).toEqual(order.slice(0, 4));
+  });
+});
+
+describe('gru awareness — wake rework (issue #219)', () => {
+  it('a re-detected incident under a new id opens no second wake; a new head does', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-10-05T12:00:00'));
+      const rig = boot({ wakeMode: 'action-required' });
+      const first = rig.notifications.post({ kind: 'github.ci-failed:j-1:abc123', routing: 'action-required', severity: 'error', title: 'CI failed on main' });
+      expect(rig.woke).toHaveLength(1);
+      // Gru disposes the alert; the poll re-detects the SAME failing head
+      // and mints a fresh row id.
+      rig.api.resolveNotificationById(first.id, 'gru');
+      const repeat = rig.notifications.post({ kind: 'github.ci-failed:j-1:abc123', routing: 'action-required', severity: 'error', title: 'CI failed on main' });
+      expect(rig.woke).toHaveLength(1); // duplicate incident: no second wake
+      // The row stays visible exactly as today (passive context).
+      expect(rig.awareness.prepare()?.notificationIds).toContain(repeat.id);
+      // The avoidance is on the board's stream, once per row.
+      const deferred = rig.api.listEventsAfter(0, { kinds: ['gru.wake-deferred'] });
+      expect(deferred).toHaveLength(1);
+      expect(deferred[0]?.payload).toMatchObject({ reason: 'duplicate', notification_id: repeat.id, incident_key: 'github.ci-failed:j-1:abc123' });
+      // A NEW head is a NEW incident: it wakes.
+      rig.notifications.post({ kind: 'github.ci-failed:j-1:def456', routing: 'action-required', severity: 'error', title: 'CI failed on main' });
+      expect(rig.woke).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a covered incident defers with the decision id, then re-opens at the recheck', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-10-05T12:00:00'));
+      const rig = boot({ wakeMode: 'action-required' });
+      rig.api.recordDecision({
+        subject: 'job:j-1',
+        decision: 'hold',
+        covers: ['ci-failed'],
+        basisFingerprint: 'abc123',
+        reason: 'ownership/integration hold',
+        by: 'gru',
+        clientKey: 'hold-j-1',
+        recheckAt: new Date(Date.now() + 60_000).toISOString(),
+      });
+      rig.notifications.post({ kind: 'github.ci-failed:j-1:abc123', routing: 'action-required', severity: 'error', title: 'CI failed on main' });
+      expect(rig.woke).toHaveLength(0); // covered: deferred, no prompt
+      const deferred = rig.api.listEventsAfter(0, { kinds: ['gru.wake-deferred'] });
+      expect(deferred).toHaveLength(1);
+      const decisionRow = rig.api.listDecisions({ subject: 'job:j-1', activeOnly: true })[0];
+      expect(deferred[0]?.payload).toMatchObject({ reason: 'covered', decision_id: decisionRow?.id });
+      // The row is untouched and visible.
+      expect(rig.api.countLivePendingActionRequired()).toBe(1);
+      // The recheck passes: the incident is wake-eligible again.
+      vi.advanceTimersByTime(61_000);
+      expect(rig.woke).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a hold with no recheck still re-checks coverage at the bounded hour: a cleared hold wakes', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-10-05T12:00:00'));
+      const rig = boot({ wakeMode: 'action-required' });
+      const hold = rig.api.recordDecision({
+        subject: 'job:j-1', decision: 'hold', covers: ['ci-failed'], basisFingerprint: 'abc123',
+        reason: 'hold, no explicit recheck', by: 'gru', clientKey: 'hold-j-1-open',
+      });
+      rig.notifications.post({ kind: 'github.ci-failed:j-1:abc123', routing: 'action-required', severity: 'error', title: 'CI failed on main' });
+      expect(rig.woke).toHaveLength(0);
+      // The bound is a RE-CHECK, not an expiry: with the hold still active
+      // the re-check defers again (a null recheck_at never expires itself).
+      vi.advanceTimersByTime(3_600_000);
+      expect(rig.woke).toHaveLength(0);
+      // The hold is cleared: the next bound cycle finds no coverage and wakes.
+      rig.api.clearDecision({ id: hold.id, by: 'owner', reason: 'integration landed' });
+      vi.advanceTimersByTime(3_600_000);
+      expect(rig.woke).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a changed basis re-opens a held subject immediately', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-10-05T12:00:00'));
+      const rig = boot({ wakeMode: 'action-required' });
+      rig.api.recordDecision({
+        subject: 'job:j-1', decision: 'hold', covers: ['ci-failed'], basisFingerprint: 'abc123',
+        reason: 'hold against the known failure', by: 'gru', clientKey: 'hold-j-1-abc',
+        recheckAt: new Date(Date.now() + 3_600_000).toISOString(),
+      });
+      rig.notifications.post({ kind: 'github.ci-failed:j-1:abc123', routing: 'action-required', severity: 'error', title: 'CI failed on main' });
+      expect(rig.woke).toHaveLength(0);
+      // A NEW failing head under the same lane: the hold's basis no longer
+      // matches — the wake opens without waiting for the recheck.
+      rig.notifications.post({ kind: 'github.ci-failed:j-1:def456', routing: 'action-required', severity: 'error', title: 'CI failed on main' });
+      expect(rig.woke).toHaveLength(1);
+      const receipts = rig.api.listEventsAfter(0, { kinds: ['gru.wake'] });
+      expect(receipts).toHaveLength(1);
+      const receiptIds = (receipts[0]?.payload as { notification_ids: string[] }).notification_ids;
+      expect(receiptIds.map((id) => rig.api.getNotification(id)?.kind)).toEqual(['github.ci-failed:j-1:def456']);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('hard floors wake even when a decision claims the subject', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-10-05T12:00:00'));
+      const rig = boot({ wakeMode: 'all' });
+      // A hold covering the provider-wall incident and the breaker subject.
+      rig.api.recordDecision({
+        subject: 'incident:supervision.provider-wall.a1.quota_wall:agent-a1-stopped-quota-wall',
+        decision: 'hold', covers: ['supervision.provider-wall.a1.quota_wall'], basisFingerprint: null,
+        reason: 'known provider condition', by: 'owner', clientKey: 'hold-wall',
+      });
+      rig.notifications.post({ kind: 'supervision.provider-wall.a1.quota_wall', routing: 'action-required', severity: 'error', title: 'Agent a1 stopped: quota wall' });
+      expect(rig.woke).toHaveLength(1); // provider wall: hard floor, never deferred
+      expect(rig.api.listEventsAfter(0, { kinds: ['gru.wake-deferred'] })).toHaveLength(0);
+      // needs-owner routing is a floor too (all mode wakes for it).
+      rig.api.recordDecision({
+        subject: 'incident:supervision.breaker:crash-loop-breaker-tripped',
+        decision: 'hold', covers: ['supervision.breaker'], basisFingerprint: null,
+        reason: 'meaningless hold on a breaker', by: 'owner', clientKey: 'hold-breaker',
+      });
+      rig.notifications.post({ kind: 'supervision.breaker', routing: 'needs-owner', severity: 'error', title: 'Crash-loop breaker tripped' });
+      expect(rig.woke).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('wake_defer_covered = false restores pre-#219 behavior (kill switch)', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-10-05T12:00:00'));
+      const dir = tmpDir();
+      const db = new LedgerDb(dir);
+      const bus = new EventBus();
+      const api = new LedgerApi(db.handle, { bus });
+      const notifications = new NotificationCenter({ ledger: api, bus });
+      api.recordDecision({
+        subject: 'job:j-1', decision: 'hold', covers: ['ci-failed'], basisFingerprint: 'abc123',
+        reason: 'hold', by: 'gru', clientKey: 'hold-j-1-kill',
+      });
+      const awareness = new GruAwareness({
+        dir, ledger: api, bus, wakeMode: 'action-required', wakeMinIntervalMs: 0,
+        wakeDeferCovered: false, now: () => Date.now(),
+      });
+      awareness.setWakeSink(() => {
+        const injection = awareness.prepare('wake');
+        if (injection !== null) awareness.noteWakeOutcome(true, undefined, injection);
+      });
+      notifications.post({ kind: 'github.ci-failed:j-1:abc123', routing: 'action-required', severity: 'error', title: 'CI failed on main' });
+      expect(awareness.prepare('wake')).not.toBeNull();
+      expect(api.listEventsAfter(0, { kinds: ['gru.wake-deferred'] })).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('#102: a row closed across the awaited spawn is not prompted; survivors are', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-10-05T12:00:00'));
+      const dir = tmpDir();
+      const db = new LedgerDb(dir);
+      const bus = new EventBus();
+      const api = new LedgerApi(db.handle, { bus });
+      const notifications = new NotificationCenter({ ledger: api, bus });
+      // Both rows land BEFORE the awareness layer binds (backlog seeding
+      // is the bounded batch that survives to the spawn boundary).
+      notifications.post({ kind: 'github.ci-failed:j-1:abc', routing: 'action-required', severity: 'error', title: 'First' });
+      const b = notifications.post({ kind: 'github.ci-failed:j-2:def', routing: 'action-required', severity: 'error', title: 'Second' });
+      const awareness = new GruAwareness({ dir, ledger: api, bus, wakeMode: 'action-required', wakeMinIntervalMs: 0, now: () => Date.now() });
+      const prompted: string[][] = [];
+      const closedDuringSpawn = api.listNotifications({ routing: 'action-required', unackedOnly: true })
+        .find((row) => row.id !== b.id)?.id as string;
+      awareness.setWakeSink(() => {
+        // The spawn boundary: the first row closes while the turn waits.
+        api.resolveNotificationById(closedDuringSpawn, 'test-during-spawn');
+        expect(awareness.admitWake()).toBe(true);
+        const injection = awareness.prepare('wake');
+        prompted.push([...(injection?.notificationIds ?? [])]);
+        awareness.noteWakeOutcome(true, undefined, injection as AwarenessInjection);
+      });
+      expect(prompted).toHaveLength(1);
+      expect(prompted[0]).toEqual([b.id]); // only the still-open id
+      // The receipt claims exactly what was delivered — never the closed id.
+      const receipts = api.listEventsAfter(0, { kinds: ['gru.wake'] });
+      expect(receipts).toHaveLength(1);
+      expect(receipts[0]?.payload).toMatchObject({ notification_ids: [b.id] });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('#102: a row a decision covers across the spawn cancels the turn instead of prompting', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-10-05T12:00:00'));
+      const dir = tmpDir();
+      const db = new LedgerDb(dir);
+      const bus = new EventBus();
+      const api = new LedgerApi(db.handle, { bus });
+      const notifications = new NotificationCenter({ ledger: api, bus });
+      const row = notifications.post({ kind: 'github.ci-failed:j-1:abc', routing: 'action-required', severity: 'error', title: 'Covered mid-spawn' });
+      const awareness = new GruAwareness({ dir, ledger: api, bus, wakeMode: 'action-required', wakeMinIntervalMs: 0, now: () => Date.now() });
+      let admitted = false;
+      awareness.setWakeSink(() => {
+        // The hold lands while the turn waits (a sibling lane recorded it).
+        api.recordDecision({
+          subject: 'job:j-1', decision: 'hold', covers: ['ci-failed'], basisFingerprint: 'abc',
+          reason: 'covered mid-spawn', by: 'gru', clientKey: 'hold-mid-spawn',
+        });
+        // Revalidation drops the only batch member: no wake without
+        // eligible IDs (the chat server then opens no turn).
+        admitted = awareness.admitWake();
+      });
+      void row;
+      expect(admitted).toBe(false);
+      expect(api.listEventsAfter(0, { kinds: ['gru.wake'] })).toHaveLength(0);
+      expect(api.listEventsAfter(0, { kinds: ['gru.wake-deferred'] })[0]?.payload).toMatchObject({ reason: 'covered' });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('#112: a failed receipt append parks the batch, never re-prompts, and reconciles once', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-10-05T12:00:00'));
+      const dir = tmpDir();
+      const db = new LedgerDb(dir);
+      const bus = new EventBus();
+      const api = new LedgerApi(db.handle, { bus });
+      let failWakeAppends = true;
+      // Prototype chain delegation: the full ledger API with one
+      // fail-loud override (class methods are not own properties).
+      const guarded = Object.assign(Object.create(api), {
+        appendCustomEvent: (input: { kind: string; payload?: Record<string, unknown> }) => {
+          if (input.kind === 'gru.wake' && failWakeAppends) throw new Error('ledger write failed');
+          return api.appendCustomEvent(input);
+        },
+      }) as GruAwarenessLedger;
+      const awareness = new GruAwareness({ dir, ledger: guarded, bus, wakeMode: 'action-required', wakeMinIntervalMs: 0, now: () => Date.now() });
+      const notifications = new NotificationCenter({ ledger: api, bus });
+      const prompted: string[][] = [];
+      awareness.setWakeSink(() => {
+        const injection = awareness.prepare('wake');
+        prompted.push([...(injection?.notificationIds ?? [])]);
+        awareness.noteWakeOutcome(true, undefined, injection as AwarenessInjection);
+      });
+      const row = notifications.post({ kind: 'github.ci-failed:j-1:abc', routing: 'action-required', severity: 'error', title: 'Unreceipted wake' });
+      expect(prompted).toHaveLength(1); // the turn happened
+      expect(api.listEventsAfter(0, { kinds: ['gru.wake'] })).toHaveLength(0); // receipt missing
+      const sidecar = JSON.parse(readFileSync(awareness.file, 'utf-8')) as { wake: { unreceipted: { id: string; ids: string[] }[]; woken: string[]; wokenIncidents: string[] } };
+      expect(sidecar.wake.unreceipted.map((batch) => batch.ids)).toEqual([[row.id]]);
+      // Park-first: the delivered turn is claimed the moment it parks —
+      // no crash window can re-prompt it; only the receipt is owed.
+      expect(sidecar.wake.woken).toContain(row.id);
+      expect(sidecar.wake.wokenIncidents).toContain('github.ci-failed:j-1:abc');
+      expect(typeof sidecar.wake.unreceipted[0]?.id).toBe('string');
+      // A replayed event for the same row cannot open a duplicate turn
+      // while the receipt is owed.
+      api.appendCustomEvent({ kind: 'notification.created', payload: { id: row.id, routing: 'action-required', severity: 'error' } });
+      expect(prompted).toHaveLength(1);
+      // The append recovers: the parked receipt lands exactly once, and
+      // the delivery timestamp is the ORIGINAL wake.
+      failWakeAppends = false;
+      vi.advanceTimersByTime(5_000);
+      const receipts = api.listEventsAfter(0, { kinds: ['gru.wake'] });
+      expect(receipts).toHaveLength(1);
+      expect(receipts[0]?.payload).toMatchObject({ notification_ids: [row.id], wake_at: new Date(Date.parse('2026-10-05T12:00:00')).toISOString() });
+      const recovered = JSON.parse(readFileSync(awareness.file, 'utf-8')) as { wake: { unreceipted?: unknown[]; woken: string[]; wokenIncidents: string[] } };
+      expect(recovered.wake.unreceipted ?? []).toEqual([]);
+      expect(recovered.wake.woken).toContain(row.id);
+      expect(recovered.wake.wokenIncidents).toContain('github.ci-failed:j-1:abc');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('#112: boot reconciliation re-appends a missing receipt exactly once and never re-prompts', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-10-05T12:00:00'));
+      const dir = tmpDir();
+      const db = new LedgerDb(dir);
+      const bus = new EventBus();
+      const api = new LedgerApi(db.handle, { bus });
+      let failWakeAppends = true;
+      // Prototype chain delegation: the full ledger API with one
+      // fail-loud override (class methods are not own properties).
+      const guarded = Object.assign(Object.create(api), {
+        appendCustomEvent: (input: { kind: string; payload?: Record<string, unknown> }) => {
+          if (input.kind === 'gru.wake' && failWakeAppends) throw new Error('ledger write failed');
+          return api.appendCustomEvent(input);
+        },
+      }) as GruAwarenessLedger;
+      const first = new GruAwareness({ dir, ledger: guarded, bus, wakeMode: 'action-required', wakeMinIntervalMs: 0, now: () => Date.now() });
+      const notifications = new NotificationCenter({ ledger: api, bus });
+      first.setWakeSink(() => {
+        const injection = first.prepare('wake');
+        if (injection !== null) first.noteWakeOutcome(true, undefined, injection);
+      });
+      const row = notifications.post({ kind: 'github.ci-failed:j-1:abc', routing: 'action-required', severity: 'error', title: 'Restart reconcile' });
+      expect(api.listEventsAfter(0, { kinds: ['gru.wake'] })).toHaveLength(0);
+      failWakeAppends = false;
+      // Restart: boot reconciliation repairs the gap before backlog
+      // admission; the id is claimed, never re-prompted.
+      const second = new GruAwareness({ dir, ledger: api, bus, wakeMode: 'action-required', wakeMinIntervalMs: 0, now: () => Date.now() });
+      let prompted = 0;
+      second.setWakeSink(() => {
+        prompted += 1;
+        const injection = second.prepare('wake');
+        if (injection !== null) second.noteWakeOutcome(true, undefined, injection);
+      });
+      expect(prompted).toBe(0);
+      const receipts = api.listEventsAfter(0, { kinds: ['gru.wake'] });
+      expect(receipts).toHaveLength(1);
+      expect(receipts[0]?.payload).toMatchObject({ notification_ids: [row.id], reconciled: true });
+      // The state was persisted post-reconcile: a THIRD boot finds nothing owed.
+      const third = new GruAwareness({ dir, ledger: api, bus, wakeMode: 'action-required', wakeMinIntervalMs: 0, now: () => Date.now() });
+      third.setWakeSink(() => {});
+      expect(api.listEventsAfter(0, { kinds: ['gru.wake'] })).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('#115: a failed accepted turn retries at most twice, then escalates exactly once', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-10-05T12:00:00'));
+      const dir = tmpDir();
+      const db = new LedgerDb(dir);
+      const bus = new EventBus();
+      const api = new LedgerApi(db.handle, { bus });
+      const notifications = new NotificationCenter({ ledger: api, bus });
+      const awareness = new GruAwareness({ dir, ledger: api, bus, wakeMode: 'action-required', wakeMinIntervalMs: 0, now: () => Date.now() });
+      const turns: 'accepted-failed'[] = [];
+      awareness.setWakeSink(() => {
+        const injection = awareness.prepare('wake');
+        if (injection === null) return;
+        awareness.noteWakeOutcome(true, undefined, injection); // accepted at turn_start
+        awareness.noteWakeTurnFailure('model stream died', injection);
+        turns.push('accepted-failed');
+      });
+      const row = notifications.post({ kind: 'github.ci-failed:j-1:abc', routing: 'action-required', severity: 'error', title: 'Failing turn' });
+      expect(turns).toHaveLength(1); // initial attempt
+      vi.advanceTimersByTime(5_000);
+      expect(turns).toHaveLength(2); // bounded retry 1
+      vi.advanceTimersByTime(5_000);
+      expect(turns).toHaveLength(3); // bounded retry 2
+      vi.advanceTimersByTime(60_000);
+      expect(turns).toHaveLength(3); // bound spent: no more autonomous turns
+      // Exactly one truthful owner escalation, idempotent across repeats.
+      const escalations = api.listNotifications({ routing: 'needs-owner', unackedOnly: true });
+      expect(escalations).toHaveLength(1);
+      // One escalation per INCIDENT: the stop is keyed by the incident
+      // key, not the notification id.
+      expect(escalations[0]?.id).toBe('gru-wake-failed:github.ci-failed_j-1_abc');
+      expect(escalations[0]?.title).toContain(row.title);
+      expect(escalations[0]?.detail).toContain(row.id);
+      expect(api.listEventsAfter(0, { kinds: ['gru.wake-deferred'] })[0]?.payload).toMatchObject({ reason: 'failed', notification_id: row.id });
+      // The escalation never re-arms the autonomous path.
+      vi.advanceTimersByTime(300_000);
+      expect(turns).toHaveLength(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('#115: a recovery inside the retry bound clears the failure debt and re-arms dedupe', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-10-05T12:00:00'));
+      const dir = tmpDir();
+      const db = new LedgerDb(dir);
+      const bus = new EventBus();
+      const api = new LedgerApi(db.handle, { bus });
+      const notifications = new NotificationCenter({ ledger: api, bus });
+      const awareness = new GruAwareness({ dir, ledger: api, bus, wakeMode: 'action-required', wakeMinIntervalMs: 0, now: () => Date.now() });
+      let failNext = true;
+      const attempts: ('accepted' | 'accepted-failed')[] = [];
+      awareness.setWakeSink(() => {
+        const injection = awareness.prepare('wake');
+        if (injection === null) return;
+        awareness.noteWakeOutcome(true, undefined, injection);
+        if (failNext) {
+          awareness.noteWakeTurnFailure('transient', injection);
+          attempts.push('accepted-failed');
+          failNext = false;
+        } else {
+          attempts.push('accepted');
+        }
+      });
+      const row = notifications.post({ kind: 'github.ci-failed:j-9:abc', routing: 'action-required', severity: 'error', title: 'Transient' });
+      vi.advanceTimersByTime(5_000);
+      expect(attempts).toEqual(['accepted-failed', 'accepted']);
+      // The recovered retry re-claimed the id AND its incident key: the
+      // dedupe state is whole again. The one failure stays on the books
+      // until the row resolves (the bound counts consecutive failures);
+      // no escalation exists.
+      const state = JSON.parse(readFileSync(awareness.file, 'utf-8')) as {
+        wake: { woken: string[]; wokenIncidents: string[]; wakeFailures?: Record<string, number> };
+      };
+      expect(state.wake.woken).toContain(row.id);
+      expect(state.wake.wokenIncidents).toContain('github.ci-failed:j-9:abc');
+      expect(state.wake.wakeFailures).toEqual({ [row.id]: 1 });
+      expect(api.listNotifications({ routing: 'needs-owner', unackedOnly: true })).toHaveLength(0);
+      // Resolution spends the debt.
+      api.resolveNotificationById(row.id, 'gru');
+      const after = JSON.parse(readFileSync(awareness.file, 'utf-8')) as { wake: { wakeFailures?: Record<string, number> } };
+      expect(after.wake.wakeFailures ?? {}).toEqual({});
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('gru awareness — wake rework review fixes (issue #219)', () => {
+  it('incident keys survive a restart: a re-detected incident stays suppressed', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-10-05T12:00:00'));
+      const dir = tmpDir();
+      const db = new LedgerDb(dir);
+      const bus = new EventBus();
+      const api = new LedgerApi(db.handle, { bus });
+      const notifications = new NotificationCenter({ ledger: api, bus });
+      const first = new GruAwareness({ dir, ledger: api, bus, wakeMode: 'action-required', wakeMinIntervalMs: 0, now: () => Date.now() });
+      first.setWakeSink(() => {
+        const injection = first.prepare('wake');
+        if (injection !== null) first.noteWakeOutcome(true, undefined, injection);
+      });
+      const row = notifications.post({ kind: 'github.ci-failed:j-1:abc', routing: 'action-required', severity: 'error', title: 'CI failed' });
+      api.resolveNotificationById(row.id, 'gru');
+      // Restart: the sidecar's wokenIncidents must restore verbatim.
+      const second = new GruAwareness({ dir, ledger: api, bus, wakeMode: 'action-required', wakeMinIntervalMs: 0, now: () => Date.now() });
+      let prompted = 0;
+      second.setWakeSink(() => {
+        prompted += 1;
+        const injection = second.prepare('wake');
+        if (injection !== null) second.noteWakeOutcome(true, undefined, injection);
+      });
+      expect(prompted).toBe(0);
+      const state = JSON.parse(readFileSync(second.file, 'utf-8')) as { wake: { wokenIncidents: string[] } };
+      expect(state.wake.wokenIncidents).toContain('github.ci-failed:j-1:abc');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a re-armed hard floor under a new id wakes even though its incident key was spent', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-10-05T12:00:00'));
+      const rig = boot({ wakeMode: 'action-required' });
+      const first = rig.notifications.post({
+        kind: 'supervision.provider-wall.a1.quota_wall', routing: 'action-required', severity: 'error',
+        title: 'Agent a1 stopped: quota wall',
+      });
+      expect(rig.woke).toHaveLength(1);
+      rig.api.resolveNotificationById(first.id, 'gru'); // the re-arm resolves the row
+      rig.notifications.post({
+        kind: 'supervision.provider-wall.a1.quota_wall', routing: 'action-required', severity: 'error',
+        title: 'Agent a1 stopped: quota wall',
+      });
+      expect(rig.woke).toHaveLength(2); // hard floor: the incident key never suppresses it
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a receipt append that keeps failing re-arms its retry indefinitely', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-10-05T12:00:00'));
+      const dir = tmpDir();
+      const db = new LedgerDb(dir);
+      const bus = new EventBus();
+      const api = new LedgerApi(db.handle, { bus });
+      let failWakeAppends = true;
+      const guarded = Object.assign(Object.create(api), {
+        appendCustomEvent: (input: { kind: string; payload?: Record<string, unknown> }) => {
+          if (input.kind === 'gru.wake' && failWakeAppends) throw new Error('ledger write failed');
+          return api.appendCustomEvent(input);
+        },
+      }) as GruAwarenessLedger;
+      const awareness = new GruAwareness({ dir, ledger: guarded, bus, wakeMode: 'action-required', wakeMinIntervalMs: 0, now: () => Date.now() });
+      const notifications = new NotificationCenter({ ledger: api, bus });
+      awareness.setWakeSink(() => {
+        const injection = awareness.prepare('wake');
+        if (injection !== null) awareness.noteWakeOutcome(true, undefined, injection);
+      });
+      notifications.post({ kind: 'github.ci-failed:j-1:abc', routing: 'action-required', severity: 'error', title: 'Stuck receipt' });
+      expect(api.listEventsAfter(0, { kinds: ['gru.wake'] })).toHaveLength(0);
+      // Two retry windows, both failing: the timer must keep re-arming.
+      vi.advanceTimersByTime(5_000);
+      expect(api.listEventsAfter(0, { kinds: ['gru.wake'] })).toHaveLength(0);
+      vi.advanceTimersByTime(5_000);
+      expect(api.listEventsAfter(0, { kinds: ['gru.wake'] })).toHaveLength(0);
+      // Recovery: the next window lands the receipt exactly once.
+      failWakeAppends = false;
+      vi.advanceTimersByTime(5_000);
+      expect(api.listEventsAfter(0, { kinds: ['gru.wake'] })).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('two ids of one failed incident escalate as ONE owner stop', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-10-05T12:00:00'));
+      const dir = tmpDir();
+      const db = new LedgerDb(dir);
+      const bus = new EventBus();
+      const api = new LedgerApi(db.handle, { bus });
+      const notifications = new NotificationCenter({ ledger: api, bus });
+      // Two rows, same unscoped kind + title => same incident key; both
+      // seed the backlog BEFORE the sink binds, so ONE coalesced wake
+      // carries both ids.
+      notifications.post({ kind: 'review-escalation', routing: 'action-required', severity: 'error', title: 'Shared incident' });
+      notifications.post({ kind: 'review-escalation', routing: 'action-required', severity: 'error', title: 'Shared incident' });
+      const awareness = new GruAwareness({ dir, ledger: api, bus, wakeMode: 'action-required', wakeMinIntervalMs: 0, now: () => Date.now() });
+      const turns: string[][] = [];
+      awareness.setWakeSink(() => {
+        const injection = awareness.prepare('wake');
+        if (injection === null) return;
+        awareness.noteWakeOutcome(true, undefined, injection);
+        awareness.noteWakeTurnFailure('model stream died', injection);
+        turns.push([...(injection.notificationIds ?? [])]);
+      });
+      expect(turns).toHaveLength(1);
+      expect(turns[0]).toHaveLength(2);
+      for (let i = 0; i < 2; i += 1) vi.advanceTimersByTime(5_000);
+      const escalations = api.listNotifications({ routing: 'needs-owner', unackedOnly: true });
+      expect(escalations).toHaveLength(1); // one stop for the incident
+      expect(escalations[0]?.detail).toContain(turns[0]![0]);
+      expect(escalations[0]?.detail).toContain(turns[0]![1]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a failed escalation posting re-arms the bounded cycle until the stop lands', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-10-05T12:00:00'));
+      const dir = tmpDir();
+      const db = new LedgerDb(dir);
+      const bus = new EventBus();
+      const api = new LedgerApi(db.handle, { bus });
+      let failEscalationPosts = true;
+      const guarded = Object.assign(Object.create(api), {
+        recordNotification: (input: Parameters<LedgerApi['recordNotification']>[0]) => {
+          if (input.id.startsWith('gru-wake-failed:') && failEscalationPosts) throw new Error('ledger write failed');
+          return api.recordNotification(input);
+        },
+      }) as GruAwarenessLedger;
+      const notifications = new NotificationCenter({ ledger: api, bus });
+      const awareness = new GruAwareness({ dir, ledger: guarded, bus, wakeMode: 'action-required', wakeMinIntervalMs: 0, now: () => Date.now() });
+      let failures = 0;
+      awareness.setWakeSink(() => {
+        const injection = awareness.prepare('wake');
+        if (injection === null) return;
+        awareness.noteWakeOutcome(true, undefined, injection);
+        awareness.noteWakeTurnFailure('boom', injection);
+        failures += 1;
+      });
+      notifications.post({ kind: 'github.ci-failed:j-2:abc', routing: 'action-required', severity: 'error', title: 'Escalate me' });
+      // Initial turn + 2 bounded retries, all failing; the escalation
+      // post also fails -> the cycle re-arms.
+      vi.advanceTimersByTime(5_000);
+      vi.advanceTimersByTime(5_000);
+      const afterFirstCycle = failures;
+      expect(afterFirstCycle).toBeGreaterThanOrEqual(3);
+      expect(api.listNotifications({ routing: 'needs-owner', unackedOnly: true })).toHaveLength(0);
+      // The ledger recovers: the next cycle's escalation lands.
+      failEscalationPosts = false;
+      for (let i = 0; i < 6; i += 1) vi.advanceTimersByTime(5_000);
+      expect(api.listNotifications({ routing: 'needs-owner', unackedOnly: true })).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

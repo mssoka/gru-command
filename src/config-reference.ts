@@ -443,6 +443,11 @@ export function renderReferenceConfig(
         `${String(Math.floor(minute / 60)).padStart(2, '0')}:${String(minute % 60).padStart(2, '0')}`;
       return tomlString(`${hhmm(window.startMinute)}-${hhmm(window.endMinute)}`);
     })()}`,
+    '# Issue #219 kill switch: an incident covered by an active decision',
+    '# (issue #218) defers its wake to that decision\'s recheck instead of',
+    '# opening a turn; breakers, provider walls and needs-owner rows always',
+    '# wake. false restores waking for covered incidents.',
+    `wake_defer_covered = ${preserved?.chat.wakeDeferCovered ?? true}`,
     '# First delivered block after this much quiet time carries a "while you',
     '# were away" digest (wakes, actions, merges, staged PRs). 0 disables it.',
     `morning_digest_gap_ms = ${preserved?.chat.morningDigestGapMs ?? 28_800_000}`,

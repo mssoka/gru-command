@@ -970,6 +970,7 @@ async function main(): Promise<number> {
     wakeMinIntervalMs: config.chat.wakeMinIntervalMs,
     wakeMinSeverity: config.chat.wakeMinSeverity,
     wakeQuietHours: config.chat.wakeQuietHours,
+    wakeDeferCovered: config.chat.wakeDeferCovered,
     morningDigestGapMs: config.chat.morningDigestGapMs,
     onFollowUpPosted: (notification) => surfaceInChat(notification),
     log: (level, msg, fields) => logger.log(level, msg, fields),

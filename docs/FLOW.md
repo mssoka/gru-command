@@ -620,7 +620,12 @@ the judgment; the dispatch surface is the mechanical hand.
   budget keeps the poll under 40 % of the authenticated GitHub rate
   limit; a rate-limit response aborts the tick instead of hammering.
   Webhooks are not built (no inbound tunnel). The tier ladder is
-  unchanged: no new autonomy.
+  unchanged: no new autonomy. On the wake side (issue #219) a
+  re-detected failing head under a fresh notification id is ONE incident
+  (`github.ci-failed:<job>:<sha>` is the incident key) — the wake policy
+  opens no second turn for it; a hold recorded through
+  `POST /api/decisions` (issue #218) with a matching basis defers the
+  wake to the hold's recheck instead.
 - **The digest** handed to every wake carries the actionable states,
   computed from the ledger: delivered jobs with no PR registered; PRs
   whose follow-up delivery proves the lane head moved past the newest

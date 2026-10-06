@@ -3432,6 +3432,44 @@ describe('chat server — Gru awareness (dispatch briefing 2026-09-22)', () => {
     }
   });
 
+  it('#219: the wake prompt is re-read after the awaited spawn — never the stale pre-spawn block', async () => {
+    const stale = sampleInjection();
+    const fresh: AwarenessInjection = {
+      text: '[gru awareness · service context — not a user message]\n- only-still-eligible remains',
+      coveredThroughSeq: 42,
+    };
+    const prepares: (string | null)[] = [];
+    const commits: AwarenessInjection[] = [];
+    const outcomes: boolean[] = [];
+    const harness = await makeHarness({ awareness: {
+      admitWake: () => true,
+      prepare: () => {
+        // First call: pre-spawn composition (a row later closed or became
+        // covered). Second call: the admission-boundary re-read (issue
+        // #102) — only the still-eligible ids render.
+        const value = prepares.length === 0 ? stale : fresh;
+        prepares.push(value.text);
+        return value;
+      },
+      commit: (value) => commits.push(value),
+      noteWakeOutcome: (ok) => outcomes.push(ok),
+    } });
+    try {
+      harness.chat.wakeAwareness();
+      await pollUntil(() => harness.handle.calls.length === 1, 'awareness wake turn');
+      // The delivered prompt carries the RE-READ block: the stale row text
+      // is gone, the eligible row text is in.
+      expect(harness.handle.calls).toEqual([
+        { op: 'prompt', text: `${fresh.text}\n\n${AWARENESS_WAKE_INSTRUCTION}`, owner: 'chat' },
+      ]);
+      expect(prepares).toHaveLength(2);
+      expect(commits).toEqual([fresh]);
+      expect(outcomes).toEqual([true]);
+    } finally {
+      await harness.close();
+    }
+  });
+
   it('receipts a wake at turn start while its tool is still running and records a later turn failure separately', async () => {
     let rejectTurn!: (error: Error) => void;
     const hold = new Promise<void>((_resolve, reject) => { rejectTurn = reject; });

@@ -318,6 +318,24 @@ relaying it. Two mechanisms share one boundary:
   inject does not spawn a session or burn a turn, and a wake requested
   mid-turn becomes one trailing turn after the conversation goes idle — it
   is never steered into a live user turn. Each wake is a full model turn.
+- **Wake rework** (issue #219): the wake dedupes on INCIDENT identity
+  (alert kind + subject + head SHA where applicable, `src/chat/incident.ts`),
+  not just row id — a re-detected incident under a fresh notification id
+  opens no second turn; the avoidance lands on the ledger as a
+  `gru.wake-deferred` event (`reason: duplicate | covered | failed`) and
+  the board tracker tallies it. When the decision-memory trigger query
+  (issue #218) reports the incident covered by an active, basis-matched
+  decision, the wake DEFERS (`[chat] wake_defer_covered`, default on): the
+  notification stays visible, the deferral records the decision id and a
+  recheck (bounded at 60 min when the decision names none), and the
+  incident re-opens when the recheck passes, the hold is cleared, or the
+  basis changes. Hard floors — breakers, provider walls,
+  false-recovery escalations, anything `needs-owner` — always wake. The
+  `gru.wake` receipt commits before the dedupe state: a failed append
+  parks the delivered batch as unreceipted (never re-prompted) and boot
+  reconciliation re-appends the missing receipt exactly once. An accepted
+  turn that fails later retries at most twice on the existing backoff,
+  then posts exactly one truthful `needs-owner` escalation per incident.
 - **Morning digest** (`[chat] morning_digest_gap_ms`, default 8 h; 0
   disables): the first delivered block after a quiet gap adds a bounded
   "while you were away" digest — fires (wakes delivered), actions with

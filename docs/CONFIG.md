@@ -247,6 +247,11 @@ wake_min_severity = "info"
 # Local-time quiet window ("HH:MM-HH:MM", may wrap midnight); wakes
 # inside it defer to the window end. Empty string = off.
 wake_quiet_hours = ""
+# Issue #219 kill switch: an incident covered by an active decision
+# (issue #218) defers its wake to that decision's recheck instead of
+# opening a turn; breakers, provider walls and needs-owner rows always
+# wake. false restores waking for covered incidents.
+wake_defer_covered = true
 # First delivered block after this much quiet time carries a "while you
 # were away" digest (wakes, actions, merges, staged PRs). 0 disables it.
 morning_digest_gap_ms = 28800000
