@@ -10,6 +10,7 @@ import { BoardEngine } from '../src/board/engine.js';
 import { createBoardServer } from '../src/board/server.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
+import { branchStatePayload } from '../src/dispatch/github-poll.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 import { TranscriptService } from '../src/transcripts/service.js';
 import { loadConfig } from '../src/config.js';
@@ -268,6 +269,189 @@ describe('board server — HTTP API', () => {
       repos: { name: string; jobs: { id: string }[] }[];
     };
     expect(snapshot.repos.find((r) => r.name === 'demo-repo')?.jobs.some((j) => j.id === 'api-job')).toBe(true);
+  });
+
+  it('closeout endpoint: auth, malformed bodies, missing jobs and guard refusals fail loud without changes', async () => {
+    const { api, port } = harness;
+    const head = '3c44e87e2e9e64cbc3301d7806540df6273438e6';
+    const prUrl = 'https://github.com/acme/gru-command/pull/165';
+    const validBody = {
+      expected_status: 'parked',
+      expected_pr_url: prUrl,
+      provider: { provider: 'github', state: 'closed', merged: false, head_sha: head, closed_at: '2026-10-05T05:06:52Z' },
+      reason: 'owner-authorized administrative closeout (j-1115)',
+    };
+    expect((await postJson(port, '/api/jobs/x/closeout', null, validBody)).status).toBe(401);
+    expect((await postJson(port, '/api/jobs/x/closeout', 'wrong-token', validBody)).status).toBe(401);
+    for (const body of [
+      {},
+      { ...validBody, expected_status: 'working' },
+      { ...validBody, provider: { ...validBody.provider, state: 'open' } },
+      { ...validBody, provider: { ...validBody.provider, merged: true } },
+      { ...validBody, provider: { ...validBody.provider, head_sha: 'nope' } },
+      { ...validBody, provider: { ...validBody.provider, closed_at: 'not-a-time' } },
+      { ...validBody, provider: { ...validBody.provider, closed_at: '' } },
+      { ...validBody, expected_pr_url: '' },
+      { ...validBody, expected_pr_url: 'not-a-url' },
+      { ...validBody, reason: '' },
+    ]) {
+      const bad = await postJson(port, '/api/jobs/x/closeout', 'board-test-token', body);
+      expect(bad.status, JSON.stringify(body)).toBe(400);
+    }
+    // A literal JSON null body is a named 400, never a raw TypeError detail.
+    const nullBody = await postJson(port, '/api/jobs/x/closeout', 'board-test-token', null);
+    expect(nullBody.status).toBe(400);
+    expect((nullBody.body as { detail: string }).detail).toContain('JSON object');
+    expect((await postJson(port, '/api/jobs/ghost/closeout', 'board-test-token', validBody)).status).toBe(404);
+
+    // A parked lane whose recorded provider observation is still OPEN is
+    // refused with the typed code — and nothing changes.
+    api.addJob({ id: 'open-pr-http', repo: 'demo-repo', title: 'Open PR' });
+    api.setJobStatus('open-pr-http', 'working');
+    api.setJobPr('open-pr-http', prUrl);
+    api.setJobStatus('open-pr-http', 'in-review');
+    api.setJobStatus('open-pr-http', 'parked');
+    api.appendCustomEvent({
+      kind: 'github.branch-state',
+      jobId: 'open-pr-http',
+      payload: branchStatePayload(
+        { jobId: 'open-pr-http', repo: { host: 'github.com', owner: 'acme', repo: 'gru-command' }, branch: 'gru/open-pr-http', prNumber: 165, prUrl },
+        { sha: head, merged: false, prOpen: true, mergeableState: 'dirty', ci: null, prNumber: 165, prUrl, mergeCommitSha: null },
+      ),
+    });
+    const refused = await postJson(port, '/api/jobs/open-pr-http/closeout', 'board-test-token', validBody);
+    expect(refused.status).toBe(409);
+    expect(refused.body).toMatchObject({ error: 'closeout_refused', code: 'pr-open' });
+    expect(api.getJob('open-pr-http')?.status).toBe('parked');
+    expect(api.latestJobEvent('open-pr-http', 'job.admin-closeout')).toBeNull();
+
+    // Target-identity refusals ride the same typed 409 mapping: the request
+    // names a different PR than the registered / recorded target.
+    api.addJob({ id: 'target-http', repo: 'demo-repo', title: 'Target' });
+    api.setJobStatus('target-http', 'working');
+    api.setJobPr('target-http', prUrl);
+    api.setJobStatus('target-http', 'in-review');
+    api.setJobStatus('target-http', 'parked');
+    api.appendCustomEvent({
+      kind: 'github.branch-state',
+      jobId: 'target-http',
+      payload: branchStatePayload(
+        { jobId: 'target-http', repo: { host: 'github.com', owner: 'acme', repo: 'gru-command' }, branch: 'gru/target-http', prNumber: 165, prUrl },
+        { sha: head, merged: false, prOpen: false, mergeableState: 'dirty', ci: null, prNumber: 165, prUrl, mergeCommitSha: null },
+      ),
+    });
+    const mismatch = await postJson(port, '/api/jobs/target-http/closeout', 'board-test-token', {
+      ...validBody,
+      expected_pr_url: 'https://github.com/acme/gru-command/pull/999',
+    });
+    expect(mismatch.status).toBe(409);
+    expect(mismatch.body).toMatchObject({ error: 'closeout_refused', code: 'target-mismatch' });
+    expect(api.getJob('target-http')?.status).toBe('parked');
+
+    // A refusal message that happens to contain the transcript sentinel
+    // still maps to the typed 409, never the transcript 404.
+    const sentinel = await postJson(port, '/api/jobs/target-http/closeout', 'board-test-token', {
+      ...validBody,
+      expected_pr_url: 'https://github.com/acme/gru-command/transcript unreadable/pull/165',
+    });
+    expect(sentinel.status).toBe(409);
+    expect(sentinel.body).toMatchObject({ error: 'closeout_refused', code: 'target-mismatch' });
+
+    // Live work rides the same typed 409 mapping.
+    api.addJob({ id: 'live-http', repo: 'demo-repo', title: 'Live' });
+    api.setJobStatus('live-http', 'working');
+    api.setJobPr('live-http', prUrl);
+    api.setJobStatus('live-http', 'in-review');
+    api.setJobStatus('live-http', 'parked');
+    api.appendCustomEvent({
+      kind: 'github.branch-state',
+      jobId: 'live-http',
+      payload: branchStatePayload(
+        { jobId: 'live-http', repo: { host: 'github.com', owner: 'acme', repo: 'gru-command' }, branch: 'gru/live-http', prNumber: 165, prUrl },
+        { sha: head, merged: false, prOpen: false, mergeableState: 'dirty', ci: null, prNumber: 165, prUrl, mergeCommitSha: null },
+      ),
+    });
+    api.registerAgent({ id: 'live-http-worker', role: 'minion', jobId: 'live-http' });
+    api.setAgentState('live-http-worker', 'streaming');
+    const liveRefused = await postJson(port, '/api/jobs/live-http/closeout', 'board-test-token', validBody);
+    expect(liveRefused.status).toBe(409);
+    expect(liveRefused.body).toMatchObject({ error: 'closeout_refused', code: 'live-work' });
+  });
+
+  it('closeout endpoint: the guarded success is audited, idempotent, and the board stops presenting the lane as an open PR', async () => {
+    const { api, port } = harness;
+    const jobId = 'closeout-http';
+    const head = '3c44e87e2e9e64cbc3301d7806540df6273438e6';
+    const prUrl = 'https://github.com/acme/gru-command/pull/178';
+    api.addJob({ id: jobId, repo: 'demo-repo', title: 'Closeout HTTP' });
+    api.setJobStatus(jobId, 'working');
+    api.setJobPr(jobId, prUrl);
+    api.setJobStatus(jobId, 'in-review');
+    api.setJobStatus(jobId, 'parked');
+    api.appendCustomEvent({
+      kind: 'github.branch-state',
+      jobId,
+      payload: branchStatePayload(
+        { jobId, repo: { host: 'github.com', owner: 'acme', repo: 'gru-command' }, branch: `gru/${jobId}`, prNumber: 178, prUrl },
+        { sha: head, merged: false, prOpen: false, mergeableState: 'dirty', ci: null, prNumber: 178, prUrl, mergeCommitSha: null },
+      ),
+    });
+    const body = {
+      expected_status: 'parked',
+      expected_pr_url: prUrl,
+      provider: { provider: 'github', state: 'closed', merged: false, head_sha: head, closed_at: '2026-10-05T05:06:52Z' },
+      reason: 'owner-authorized administrative closeout (j-1115)',
+    };
+    // The previous refusal is preserved at the HTTP boundary.
+    const illegal = await postJson(port, `/api/jobs/${jobId}/status`, 'board-test-token', { status: 'done' });
+    expect(illegal.status).toBe(400);
+    expect((illegal.body as { detail: string }).detail).toContain('illegal transition parked → done');
+
+    const accepted = await postJson(port, `/api/jobs/${jobId}/closeout`, 'board-test-token', body);
+    expect(accepted.status).toBe(200);
+    const acceptedBody = accepted.body as { job: { status: string }; event: { kind: string; seq: number }; idempotent: boolean };
+    expect(acceptedBody.job.status).toBe('done');
+    expect(acceptedBody.event.kind).toBe('job.admin-closeout');
+    expect(acceptedBody.idempotent).toBe(false);
+
+    const replay = await postJson(port, `/api/jobs/${jobId}/closeout`, 'board-test-token', body);
+    expect(replay.status).toBe(200);
+    expect(replay.body).toMatchObject({ idempotent: true, event: { seq: acceptedBody.event.seq }, job: { status: 'done' } });
+    expect(api.listJobEventsByKinds(jobId, ['job.admin-closeout'])).toHaveLength(1);
+
+    // A changed request against the closed lane is the typed 409.
+    const changed = await postJson(port, `/api/jobs/${jobId}/closeout`, 'board-test-token', { ...body, reason: 'a different request' });
+    expect(changed.status).toBe(409);
+    expect(changed.body).toMatchObject({ error: 'closeout_refused', code: 'already-closed' });
+    expect(api.listJobEventsByKinds(jobId, ['job.admin-closeout'])).toHaveLength(1);
+
+    const snapshot = (await getJson(port, '/api/board', 'board-test-token')).body as {
+      repos: { jobs: { id: string; status: string; prUrl: string | null; prState: string | null }[] }[];
+    };
+    const job = snapshot.repos.flatMap((repo) => repo.jobs).find((candidate) => candidate.id === jobId);
+    expect(job).toMatchObject({ status: 'done', prUrl, prState: null });
+
+    // An omitted closed_at is a valid closeout: the audit records null.
+    const noClosedAt = 'closeout-http-no-closed-at';
+    api.addJob({ id: noClosedAt, repo: 'demo-repo', title: 'Closeout without closed_at' });
+    api.setJobStatus(noClosedAt, 'working');
+    api.setJobPr(noClosedAt, prUrl);
+    api.setJobStatus(noClosedAt, 'in-review');
+    api.setJobStatus(noClosedAt, 'parked');
+    api.appendCustomEvent({
+      kind: 'github.branch-state',
+      jobId: noClosedAt,
+      payload: branchStatePayload(
+        { jobId: noClosedAt, repo: { host: 'github.com', owner: 'acme', repo: 'gru-command' }, branch: `gru/${noClosedAt}`, prNumber: 178, prUrl },
+        { sha: head, merged: false, prOpen: false, mergeableState: 'dirty', ci: null, prNumber: 178, prUrl, mergeCommitSha: null },
+      ),
+    });
+    const { closed_at: _omitted, ...providerWithoutClosedAt } = body.provider;
+    const noClosed = await postJson(port, `/api/jobs/${noClosedAt}/closeout`, 'board-test-token', { ...body, provider: providerWithoutClosedAt });
+    expect(noClosed.status).toBe(200);
+    expect(
+      (noClosed.body as { event: { payload: { provider: { closed_at: unknown } } } }).event.payload.provider.closed_at,
+    ).toBeNull();
   });
 
   it('write endpoints reject bad bodies and missing entities', async () => {

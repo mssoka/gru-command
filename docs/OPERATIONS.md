@@ -159,6 +159,67 @@ To talk to the Gru brain directly with a runtime CLI (pi or claude):
   ledger is the authoritative map job → worktree → branch → processes
   ([WORKTREES.md](./WORKTREES.md)).
 
+## Administrative closeout of a parked PR-backed lane
+
+When a parked lane's PR is confirmed CLOSED on the host (never merged),
+GitHub is terminal but the ledger still holds the parked job: the generic
+status write deliberately refuses `parked → done`. The supported closeout
+is the guarded, audited operation below — it never fakes a
+`working`/`in-review` hop, never infers a merge, and never rewrites
+preservation evidence, directives/re-briefs, worktrees, rounds, agents or
+children (`docs/LEDGER.md` has the record-level contract).
+
+Preconditions (all enforced; every refusal is a loud no-effect failure):
+
+- the job is `parked`, PR-owing, and registers exactly the requested PR url;
+- the poll's own latest `github.branch-state` observation says the PR is
+  CLOSED (`pr_open: false`) and NOT merged (`merged: false`) at the
+  requested head — no observation, an open PR, a merge or a moved head is
+  refused;
+- no target-owned live work: spawning/streaming worker turns, non-terminal
+  tracked child workers, pending/live review rounds or unsettled
+  verification runs.
+
+Request (pairing token in `Authorization: Bearer`):
+
+```bash
+curl -sS -X POST "http://127.0.0.1:<port>/api/jobs/<job-id>/closeout" \
+  -H "Authorization: Bearer $GRU_TOKEN" -H 'content-type: application/json' \
+  -d '{
+    "expected_status": "parked",
+    "expected_pr_url": "https://github.com/<owner>/<repo>/pull/<n>",
+    "provider": {
+      "provider": "github",
+      "state": "closed",
+      "merged": false,
+      "head_sha": "<full PR head sha>",
+      "closed_at": "<ISO-8601 UTC, optional>"
+    },
+    "reason": "<why this administrative closure is authorized>"
+  }'
+```
+
+- `200` — the job is `done`; the response carries the job, the
+  `job.admin-closeout` audit event (seq + payload) and `idempotent: false`.
+  Re-sending the identical request returns the SAME event with
+  `idempotent: true`; a changed request against the closed lane is refused.
+- `409 closeout_refused` — a guard refused (`code` names it: `not-parked`,
+  `not-pr-backed`, `not-pr-owing`, `target-mismatch`, `unconfirmed-pr`,
+  `pr-open`, `pr-merged`, `stale-head`, `live-work`, `already-closed`);
+  nothing changed.
+- `400` malformed body · `401` missing/bad token · `404` unknown job. A
+  wrong `expected_status` **value** is a 400 body error. A lane that has
+  moved off `parked` (or was closed by another path) is refused by the
+  first failing guard in order: `already-closed` for an already-done
+  lane, then `not-pr-backed` / `not-pr-owing` / `target-mismatch`, then
+  `not-parked`.
+
+Read back with the idempotent replay plus `GET /api/board`: the job is
+`done`, `prState` is `null` (never `open`), and the lane no longer appears
+in PR/review work. The operation performs no other side effect — no worker
+spawn, re-brief, review arm, verification launch, worktree release, PR
+write or notification ACK.
+
 ## Backups & restore
 
 The service self-manages:

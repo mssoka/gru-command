@@ -34,6 +34,7 @@ restart produce the same truth without data edits.
 | `GET /api/transcripts/file?file=<rel>[&q=&before=&limit=]` | one transcript: paged entries (`before` = exclusive upper index, newest-first, `nextCursor`) or case-insensitive search — newest-first scan under a bounded cap, `scanned`/`total` disclose truncation |
 | `POST /api/jobs` | `{id, repo, title, baseBranch?}` → job (`dispatched`) |
 | `POST /api/jobs/:id/status` | `{status}` — validated against the [job machine](./LEDGER.md) |
+| `POST /api/jobs/:id/closeout` | `{expected_status, expected_pr_url, provider, reason}` — guarded administrative closeout of a parked PR-backed lane whose recorded provider observation is CLOSED-without-merge; audited, idempotent, refusals are `409 closeout_refused` + `code` ([OPERATIONS.md](./OPERATIONS.md)) |
 | `POST /api/rounds` | `{jobId, lenses? (default 9), targetRef?}` → round (`pending`) |
 | `POST /api/rounds/:id/status` / `:id/verdict` | `{status}` / `{verdict}` |
 | `POST /api/agents` | `{id, role, label?, jobId?, roundId?, sessionFile?}` (upsert) |
@@ -47,7 +48,13 @@ restart produce the same truth without data edits.
 401 without/with a bad token; **503 `not_configured`** when no pairing
 token exists (empty token = locked door, never open). Illegal
 transitions and unknown entities are 400/404 with the reason in
-`detail`. Bodies are capped (200 KB).
+`detail`; a guarded closeout refusal is a typed `409 closeout_refused`
+whose `code` names the refusing guard. Bodies are capped (200 KB).
+
+PR state derives from the record: a `merged` job reports `merged`; a
+terminal `done` job is a closed receipt — its registered PR is never
+presented or counted as open (and closure never infers a merge); any
+other lane with a registered URL reports `open`.
 
 ## Board WebSocket — `/board/ws`
 

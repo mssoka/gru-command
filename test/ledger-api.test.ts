@@ -5,6 +5,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi, DEFAULT_LENSES, type PendingRebriefRecord } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
+import { branchStatePayload } from '../src/dispatch/github-poll.js';
 
 const cleanupDirs: string[] = [];
 afterAll(() => {
@@ -1359,6 +1360,529 @@ describe('report-job closure (issue #220)', () => {
       expect(api.findJobByPrUrl('https://x/pull/7')?.id).toBe('src-pr');
       expect(api.findJobByPrUrl('https://x/pull/999')).toBeNull();
       expect(api.findJobByPrUrl('')).toBeNull();
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('administrative closeout of a parked PR-backed job', () => {
+  const PR_URL = 'https://github.com/acme/gru-command/pull/165';
+  const HEAD = '3c44e87e2e9e64cbc3301d7806540df6273438e6';
+  const CLOSED_AT = '2026-10-05T05:06:52Z';
+
+  function freshDb(): { api: LedgerApi; db: LedgerDb; dir: string } {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-admin-closeout-'));
+    const db = new LedgerDb(dir);
+    const api = new LedgerApi(db.handle, { bus: new EventBus() });
+    return { api, db, dir };
+  }
+
+  /** One recorded provider observation, written through the poll's own
+   * payload producer so a producer-side field rename surfaces here instead
+   * of silently closing on a misread event. */
+  function appendObservation(
+    api: LedgerApi,
+    jobId: string,
+    opts: {
+      prUrl?: string;
+      headSha?: string;
+      prOpen?: boolean | null;
+      merged?: boolean;
+      prNumber?: number;
+      repo?: { host: string; owner: string; repo: string };
+    } = {},
+  ): void {
+    const prUrl = opts.prUrl ?? PR_URL;
+    api.appendCustomEvent({
+      kind: 'github.branch-state',
+      jobId,
+      payload: branchStatePayload(
+        {
+          jobId,
+          repo: opts.repo ?? { host: 'github.com', owner: 'acme', repo: 'gru-command' },
+          branch: `gru/${jobId}`,
+          prNumber: opts.prNumber ?? 165,
+          prUrl,
+        },
+        {
+          sha: opts.headSha ?? HEAD,
+          merged: opts.merged ?? false,
+          prOpen: opts.prOpen === undefined ? false : opts.prOpen,
+          mergeableState: 'dirty',
+          ci: null,
+          prNumber: opts.prNumber ?? 165,
+          prUrl,
+          mergeCommitSha: null,
+        },
+      ),
+    });
+  }
+
+  /** A parked PR-backed lane as the GitHub poll observes it: CLOSED, not
+   * merged. */
+  function parkedPrJob(
+    api: LedgerApi,
+    jobId: string,
+    opts: {
+      prUrl?: string;
+      headSha?: string;
+      prOpen?: boolean | null;
+      merged?: boolean;
+      observe?: boolean;
+      deliverable?: 'review';
+    } = {},
+  ): void {
+    const prUrl = opts.prUrl ?? PR_URL;
+    api.addJob({
+      id: jobId,
+      repo: 'gru-command',
+      title: `t-${jobId}`,
+      briefing: 'b',
+      ...(opts.deliverable !== undefined ? { deliverable: opts.deliverable } : {}),
+    });
+    api.setJobStatus(jobId, 'working');
+    api.setJobPr(jobId, prUrl);
+    api.setJobStatus(jobId, 'in-review');
+    api.setJobStatus(jobId, 'parked');
+    if (opts.observe === false) return;
+    appendObservation(api, jobId, {
+      prUrl,
+      ...(opts.headSha !== undefined ? { headSha: opts.headSha } : {}),
+      ...(opts.prOpen !== undefined ? { prOpen: opts.prOpen } : {}),
+      ...(opts.merged !== undefined ? { merged: opts.merged } : {}),
+    });
+  }
+
+  function closeoutRequest(
+    jobId: string,
+    overrides: { expectedPrUrl?: string; headSha?: string; reason?: string } = {},
+  ) {
+    return {
+      jobId,
+      expectedStatus: 'parked' as const,
+      expectedPrUrl: overrides.expectedPrUrl ?? PR_URL,
+      provider: {
+        provider: 'github' as const,
+        state: 'closed' as const,
+        merged: false as const,
+        headSha: overrides.headSha ?? HEAD,
+        closedAt: CLOSED_AT,
+      },
+      reason: overrides.reason ?? 'GitHub PR165 CLOSED without merge; owner-authorized administrative closeout (j-1115)',
+    };
+  }
+
+  function refusalOf(run: () => unknown): Error & { readonly code?: string } {
+    try {
+      run();
+    } catch (error) {
+      return error as Error & { readonly code?: string };
+    }
+    throw new Error('expected an administrative closeout refusal');
+  }
+
+  it('administrative closeout: the generic parked → done refusal survives, the guarded evidence-bound path closes in one audited hop', () => {
+    const { api, db, dir } = freshDb();
+    try {
+      parkedPrJob(api, 'close-ok');
+      // The previous refusal is the regression baseline: the generic status
+      // write still cannot close a parked lane.
+      expect(() => api.setJobStatus('close-ok', 'done')).toThrow(/illegal transition parked → done/u);
+      expect(api.getJob('close-ok')?.status).toBe('parked');
+
+      const result = api.adminCloseParkedJob(closeoutRequest('close-ok'));
+      expect(result.idempotent).toBe(false);
+      expect(result.job.status).toBe('done');
+      expect(result.event.kind).toBe('job.admin-closeout');
+      const payload = result.event.payload as {
+        disposition: string;
+        expected_status: string;
+        expected_pr_url: string;
+        provider: Record<string, unknown>;
+        observation: { event_seq: number; pr_url: string; pr_number: number; sha: string; pr_open: boolean; merged: boolean };
+        reason: string;
+        request_sha256: string;
+      };
+      expect(payload).toMatchObject({
+        disposition: 'closed-without-merge',
+        expected_status: 'parked',
+        expected_pr_url: PR_URL,
+        provider: { provider: 'github', state: 'closed', merged: false, head_sha: HEAD, closed_at: CLOSED_AT },
+        reason: expect.stringContaining('j-1115'),
+      });
+      expect(payload.request_sha256).toMatch(/^[0-9a-f]{64}$/u);
+      // The recorded provider observation is cited by identity, not trust.
+      const cited = api.getEvent(payload.observation.event_seq);
+      expect(cited?.kind).toBe('github.branch-state');
+      expect(payload.observation).toMatchObject({ pr_url: PR_URL, pr_number: 165, sha: HEAD, pr_open: false, merged: false });
+      // The audit names the observation's own timestamp, so a stale
+      // observation is at least visible in the record.
+      expect((payload.observation as { observed_at?: unknown }).observed_at).toBe(cited?.ts);
+
+      // Direct hop: the newest status event is parked → done; no
+      // intermediate executable/review-eligible state exists.
+      const hops = api.listJobEventsByKinds('close-ok', ['job.status']);
+      expect(hops[0]?.payload).toEqual({ from: 'parked', to: 'done' });
+      expect(hops.map((event) => (event.payload as { to: string }).to)).toEqual(['done', 'parked', 'in-review', 'working']);
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('administrative closeout refuses stale state, target identity, open/unconfirmed/merged providers and stale heads with no effect', () => {
+    const { api, db, dir } = freshDb();
+    try {
+      // Stale expected state: the lane moved past parked.
+      api.addJob({ id: 'stale-status', repo: 'r', title: 't' });
+      api.setJobStatus('stale-status', 'working');
+      api.setJobPr('stale-status', PR_URL);
+      expect(refusalOf(() => api.adminCloseParkedJob(closeoutRequest('stale-status'))).code).toBe('not-parked');
+
+      // Target identity mismatch.
+      parkedPrJob(api, 'target-mismatch');
+      expect(
+        refusalOf(() =>
+          api.adminCloseParkedJob(closeoutRequest('target-mismatch', { expectedPrUrl: 'https://github.com/acme/gru-command/pull/999' })),
+        ).code,
+      ).toBe('target-mismatch');
+
+      // Unconfirmed: no recorded provider observation exists at all.
+      parkedPrJob(api, 'unconfirmed', { observe: false });
+      expect(refusalOf(() => api.adminCloseParkedJob(closeoutRequest('unconfirmed'))).code).toBe('unconfirmed-pr');
+
+      // Still open / merged observations are never closed as non-merge.
+      parkedPrJob(api, 'open-pr', { prOpen: true });
+      expect(refusalOf(() => api.adminCloseParkedJob(closeoutRequest('open-pr'))).code).toBe('pr-open');
+      parkedPrJob(api, 'merged-pr', { merged: true });
+      expect(refusalOf(() => api.adminCloseParkedJob(closeoutRequest('merged-pr'))).code).toBe('pr-merged');
+
+      // Stale head: the request and the recorded observation disagree.
+      parkedPrJob(api, 'stale-head');
+      expect(refusalOf(() => api.adminCloseParkedJob(closeoutRequest('stale-head', { headSha: 'f'.repeat(40) }))).code).toBe('stale-head');
+
+      // The guard binds the LATEST observation: a newer open / merged /
+      // moved-head observation over an older closed one refuses — the whole
+      // ordering property.
+      parkedPrJob(api, 'superseded-open');
+      appendObservation(api, 'superseded-open', { prOpen: true });
+      expect(refusalOf(() => api.adminCloseParkedJob(closeoutRequest('superseded-open'))).code).toBe('pr-open');
+      parkedPrJob(api, 'superseded-merged');
+      appendObservation(api, 'superseded-merged', { merged: true });
+      expect(refusalOf(() => api.adminCloseParkedJob(closeoutRequest('superseded-merged'))).code).toBe('pr-merged');
+      parkedPrJob(api, 'superseded-head');
+      appendObservation(api, 'superseded-head', { headSha: 'a'.repeat(40) });
+      expect(refusalOf(() => api.adminCloseParkedJob(closeoutRequest('superseded-head'))).code).toBe('stale-head');
+
+      // The observation must name the SAME target as the request, even when
+      // the job's registered PR matches: stale evidence never closes.
+      parkedPrJob(api, 'observation-mismatch');
+      appendObservation(api, 'observation-mismatch', { prUrl: 'https://github.com/acme/gru-command/pull/999', prNumber: 999 });
+      expect(refusalOf(() => api.adminCloseParkedJob(closeoutRequest('observation-mismatch'))).code).toBe('target-mismatch');
+
+      // Fail-closed observation fields: an unobserved open/closed state, a
+      // missing merged flag, a null head and a URL/number disagreement are
+      // never read as closed defaults.
+      parkedPrJob(api, 'observation-null-open');
+      appendObservation(api, 'observation-null-open', { prOpen: null });
+      expect(refusalOf(() => api.adminCloseParkedJob(closeoutRequest('observation-null-open'))).code).toBe('unconfirmed-pr');
+      parkedPrJob(api, 'observation-no-merged');
+      api.appendCustomEvent({
+        kind: 'github.branch-state',
+        jobId: 'observation-no-merged',
+        payload: { pr_url: PR_URL, pr_number: 165, sha: HEAD, pr_open: false },
+      });
+      expect(refusalOf(() => api.adminCloseParkedJob(closeoutRequest('observation-no-merged'))).code).toBe('unconfirmed-pr');
+      parkedPrJob(api, 'observation-null-sha');
+      api.appendCustomEvent({
+        kind: 'github.branch-state',
+        jobId: 'observation-null-sha',
+        payload: { pr_url: PR_URL, pr_number: 165, sha: null, pr_open: false, merged: false },
+      });
+      expect(refusalOf(() => api.adminCloseParkedJob(closeoutRequest('observation-null-sha'))).code).toBe('unconfirmed-pr');
+      // The observation's repo field must agree with the URL's repo too.
+      parkedPrJob(api, 'observation-repo-mismatch');
+      appendObservation(api, 'observation-repo-mismatch', { repo: { host: 'github.com', owner: 'other', repo: 'gru-command' } });
+      expect(refusalOf(() => api.adminCloseParkedJob(closeoutRequest('observation-repo-mismatch'))).code).toBe('target-mismatch');
+      parkedPrJob(api, 'number-mismatch');
+      appendObservation(api, 'number-mismatch', { prNumber: 999 });
+      expect(refusalOf(() => api.adminCloseParkedJob(closeoutRequest('number-mismatch'))).code).toBe('target-mismatch');
+
+      // No PR on record / report-only lanes are outside the closeout.
+      api.addJob({ id: 'no-pr', repo: 'r', title: 't' });
+      api.setJobStatus('no-pr', 'working');
+      api.setJobStatus('no-pr', 'parked');
+      expect(refusalOf(() => api.adminCloseParkedJob(closeoutRequest('no-pr'))).code).toBe('not-pr-backed');
+      parkedPrJob(api, 'report-only', { deliverable: 'review' });
+      expect(refusalOf(() => api.adminCloseParkedJob(closeoutRequest('report-only'))).code).toBe('not-pr-owing');
+
+      // Every refusal is a named no-effect failure: the job keeps its
+      // pre-attempt status, and no audit row is minted.
+      for (const [id, status] of [
+        ['stale-status', 'working'],
+        ['target-mismatch', 'parked'],
+        ['unconfirmed', 'parked'],
+        ['open-pr', 'parked'],
+        ['merged-pr', 'parked'],
+        ['stale-head', 'parked'],
+        ['superseded-open', 'parked'],
+        ['superseded-merged', 'parked'],
+        ['superseded-head', 'parked'],
+        ['observation-mismatch', 'parked'],
+        ['observation-null-open', 'parked'],
+        ['observation-no-merged', 'parked'],
+        ['observation-null-sha', 'parked'],
+        ['observation-repo-mismatch', 'parked'],
+        ['number-mismatch', 'parked'],
+        ['no-pr', 'parked'],
+        ['report-only', 'parked'],
+      ] as const) {
+        expect(api.getJob(id)?.status, id).toBe(status);
+        expect(api.latestJobEvent(id, 'job.admin-closeout'), id).toBeNull();
+      }
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('administrative closeout is idempotent for an identical replay and refuses a conflicting retry', () => {
+    const { api, db, dir } = freshDb();
+    try {
+      parkedPrJob(api, 'replay');
+      const first = api.adminCloseParkedJob(closeoutRequest('replay'));
+      expect(first.idempotent).toBe(false);
+
+      const replay = api.adminCloseParkedJob(closeoutRequest('replay'));
+      expect(replay.idempotent).toBe(true);
+      expect(replay.event.seq).toBe(first.event.seq);
+      expect(replay.job.status).toBe('done');
+      expect(api.listJobEventsByKinds('replay', ['job.admin-closeout'])).toHaveLength(1);
+      expect(
+        api.listJobEventsByKinds('replay', ['job.status']).filter((event) => (event.payload as { to: string }).to === 'done'),
+      ).toHaveLength(1);
+
+      // A later PR re-link on the closed lane never changes the idempotent
+      // replay of the SAME request — the recorded event is returned.
+      api.setJobPr('replay', 'https://github.com/acme/gru-command/pull/777');
+      const afterRelink = api.adminCloseParkedJob(closeoutRequest('replay'));
+      expect(afterRelink.idempotent).toBe(true);
+      expect(afterRelink.event.seq).toBe(first.event.seq);
+
+      // A changed request cannot overwrite the recorded closeout.
+      const conflict = refusalOf(() => api.adminCloseParkedJob(closeoutRequest('replay', { reason: 'a different request' })));
+      expect(conflict.name).toBe('AdminCloseoutRefusal');
+      expect(conflict.code).toBe('already-closed');
+      expect(api.listJobEventsByKinds('replay', ['job.admin-closeout'])).toHaveLength(1);
+      expect(api.getJob('replay')?.status).toBe('done');
+
+      // A done lane reached by ANOTHER path (no recorded closeout) refuses
+      // with the same code and never rewrites the record.
+      api.addJob({ id: 'done-other-way', repo: 'r', title: 't' });
+      api.setJobStatus('done-other-way', 'working');
+      api.setJobPr('done-other-way', PR_URL);
+      api.setJobStatus('done-other-way', 'in-review');
+      api.setJobStatus('done-other-way', 'done');
+      const otherWay = refusalOf(() => api.adminCloseParkedJob(closeoutRequest('done-other-way')));
+      expect(otherWay.name).toBe('AdminCloseoutRefusal');
+      expect(otherWay.code).toBe('already-closed');
+      expect(api.latestJobEvent('done-other-way', 'job.admin-closeout')).toBeNull();
+
+      // The replay identity covers the head and closed_at too: a changed
+      // evidence field is a different request, never an idempotent replay.
+      const changedHead = refusalOf(() => api.adminCloseParkedJob(closeoutRequest('replay', { headSha: 'a'.repeat(40) })));
+      expect(changedHead.code).toBe('already-closed');
+      const base = closeoutRequest('replay');
+      const changedClosedAt = refusalOf(() =>
+        api.adminCloseParkedJob({ ...base, provider: { ...base.provider, closedAt: '2026-10-06T00:00:00Z' } }),
+      );
+      expect(changedClosedAt.code).toBe('already-closed');
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('administrative closeout refuses actually live workers, children, rounds and verification with no partial changes', () => {
+    const { api, db, dir } = freshDb();
+    try {
+      // An open worker turn IS live execution (spawning/streaming).
+      parkedPrJob(api, 'live-turn');
+      api.registerAgent({ id: 'worker-live', role: 'minion', jobId: 'live-turn' });
+      api.setAgentState('worker-live', 'streaming');
+
+      // A non-terminal tracked child (the release contract's own fence).
+      parkedPrJob(api, 'live-child');
+      api.registerAgent({ id: 'parent-live', role: 'minion', jobId: 'live-child' });
+      api.admitChildWorker({
+        id: 'child-live',
+        parentAgentId: 'parent-live',
+        jobId: 'live-child',
+        purpose: 'bounded task',
+        authority: 'read-only',
+        task: 'inspect',
+        idempotencyKey: 'child-live-key',
+      });
+
+      // A pending review round is live review work.
+      parkedPrJob(api, 'live-round');
+      api.addRound({ jobId: 'live-round' });
+
+      // An unsettled verification run owns the lane.
+      parkedPrJob(api, 'live-verify');
+      api.appendCustomEvent({ kind: 'verification.started', jobId: 'live-verify', payload: { run_id: 'run-live' } });
+
+      for (const id of ['live-turn', 'live-child', 'live-round', 'live-verify']) {
+        const refused = refusalOf(() => api.adminCloseParkedJob(closeoutRequest(id)));
+        expect(refused.name, id).toBe('AdminCloseoutRefusal');
+        expect(refused.code, id).toBe('live-work');
+        expect(api.getJob(id)?.status, id).toBe('parked');
+        expect(api.latestJobEvent(id, 'job.admin-closeout'), id).toBeNull();
+      }
+      // The refusal names the concrete blockers so an operator can act.
+      expect(refusalOf(() => api.adminCloseParkedJob(closeoutRequest('live-child'))).message).toContain('child-live');
+      expect(refusalOf(() => api.adminCloseParkedJob(closeoutRequest('live-turn'))).message).toContain('worker-live');
+      expect(refusalOf(() => api.adminCloseParkedJob(closeoutRequest('live-round'))).message).toContain('live-round-r1');
+      expect(refusalOf(() => api.adminCloseParkedJob(closeoutRequest('live-verify'))).message).toContain('verification');
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('administrative closeout accepts full-identity variants: 64-char uppercase head, explicit null closed_at', () => {
+    const { api, db, dir } = freshDb();
+    try {
+      const sha64 = 'a1'.repeat(32);
+      parkedPrJob(api, 'variants', { headSha: sha64 });
+      const result = api.adminCloseParkedJob({
+        jobId: 'variants',
+        expectedStatus: 'parked',
+        expectedPrUrl: PR_URL,
+        provider: {
+          provider: 'github',
+          state: 'closed',
+          merged: false,
+          headSha: sha64.toUpperCase(),
+          closedAt: null,
+        },
+        reason: 'variant closeout',
+      });
+      expect(result.idempotent).toBe(false);
+      expect(result.job.status).toBe('done');
+      const payload = result.event.payload as { provider: { head_sha: string; closed_at: unknown } };
+      expect(payload.provider.head_sha).toBe(sha64);
+      expect(payload.provider.closed_at).toBeNull();
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('administrative closeout leaves control rows and the lane worktree untouched (no release, no re-brief retirement)', () => {
+    const { api, db, dir } = freshDb();
+    try {
+      parkedPrJob(api, 'control-rows');
+      api.registerWorktree({
+        id: 'control-rows-lane',
+        kind: 'job',
+        repoPath: '/tmp/control-rows-repo',
+        repoName: 'gru-command',
+        path: '/tmp/control-rows-lane',
+        branch: 'gru/control-rows',
+        sha: HEAD,
+        baseSource: 'origin',
+        jobId: 'control-rows',
+      });
+      const markers = api.beginPendingRebrief({ jobId: 'control-rows', note: 'stalled', briefing: 'b' });
+      expect(markers.length).toBeGreaterThan(0);
+      const laneBefore = api.listWorktrees({ jobId: 'control-rows' });
+
+      const result = api.adminCloseParkedJob(closeoutRequest('control-rows'));
+      expect(result.job.status).toBe('done');
+      // Re-brief/directive control rows are owned by their own reconcilers:
+      // the closeout neither retires nor rewrites them.
+      expect(api.listPendingRebriefs({ jobId: 'control-rows' })).toHaveLength(markers.length);
+      // The lane worktree is untouched — release belongs to the sweep, never
+      // to the closeout.
+      expect(api.listWorktrees({ jobId: 'control-rows' })).toEqual(laneBefore);
+      expect(
+        api.listJobEventsByKinds('control-rows', ['worktree.swept', 'silas.lane-released']),
+      ).toHaveLength(0);
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('administrative closeout closes through non-live history: idle/disposed workers, terminal children, concluded rounds and settled verification', () => {
+    const { api, db, dir } = freshDb();
+    try {
+      parkedPrJob(api, 'history-lane');
+      // Idle and disposed worker rows are bookkeeping, not execution.
+      api.registerAgent({ id: 'worker-idle', role: 'minion', jobId: 'history-lane' });
+      api.setAgentState('worker-idle', 'idle');
+      api.registerAgent({ id: 'worker-disposed', role: 'minion', jobId: 'history-lane' });
+      api.setAgentState('worker-disposed', 'disposed');
+      // A terminal child (result recorded, worker disposed) is history.
+      const admitted = api.admitChildWorker({
+        id: 'child-done',
+        parentAgentId: 'worker-idle',
+        jobId: 'history-lane',
+        purpose: 'bounded task',
+        authority: 'read-only',
+        task: 'inspect',
+        idempotencyKey: 'child-done-key',
+      });
+      api.recordChildResult(admitted.record.id, { state: 'done', summary: 'ok', ref: null });
+      if (admitted.record.agentId !== null) api.setAgentState(admitted.record.agentId, 'disposed');
+      // A verdict-posted round is concluded review history.
+      const round = api.addRound({ jobId: 'history-lane' });
+      api.setRoundStatus(round.id, 'live');
+      api.setRoundVerdict(round.id, 'approved');
+      // A settled verification run is settled, not live.
+      api.appendCustomEvent({ kind: 'verification.started', jobId: 'history-lane', payload: { run_id: 'run-done' } });
+      api.appendCustomEvent({ kind: 'verification.completed', jobId: 'history-lane', payload: { run_id: 'run-done', ok: true, exit_code: 0 } });
+
+      const result = api.adminCloseParkedJob(closeoutRequest('history-lane'));
+      expect(result.idempotent).toBe(false);
+      expect(result.job.status).toBe('done');
+      expect(result.event.kind).toBe('job.admin-closeout');
+      expect(api.latestJobEvent('history-lane', 'job.admin-closeout')?.seq).toBe(result.event.seq);
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('administrative closeout validates the request edges: real timestamps, https target, bounded reason and hex head', () => {
+    const { api, db, dir } = freshDb();
+    try {
+      parkedPrJob(api, 'edges');
+      const attempt = (overrides: Record<string, unknown>) => () =>
+        (api.adminCloseParkedJob as unknown as (input: Record<string, unknown>) => unknown)({
+          ...closeoutRequest('edges'),
+          ...overrides,
+        });
+      // A shape-valid but impossible calendar timestamp never enters the audit.
+      expect(
+        attempt({ provider: { provider: 'github', state: 'closed', merged: false, headSha: HEAD, closedAt: '2026-13-45T99:99:99Z' } }),
+      ).toThrow(/real ISO-8601 UTC/u);
+      expect(
+        attempt({ provider: { provider: 'github', state: 'closed', merged: false, headSha: HEAD, closedAt: 'not-a-time' } }),
+      ).toThrow(/real ISO-8601 UTC/u);
+      // The target must be an absolute https url.
+      expect(attempt({ expectedPrUrl: 'not-a-url' })).toThrow(/absolute https url/u);
+      expect(attempt({ expectedPrUrl: 'http://github.com/acme/gru-command/pull/165' })).toThrow(/absolute https url/u);
+      // Bounded reason / hex head (full 40- or 64-character identity).
+      expect(attempt({ reason: 'x'.repeat(2_001) })).toThrow(/bounded printable text/u);
+      expect(attempt({ provider: { provider: 'github', state: 'closed', merged: false, headSha: 'abc123' } })).toThrow(/full 40- or 64-character hex commit sha/u);
+      expect(attempt({ provider: { provider: 'github', state: 'closed', merged: false, headSha: 'a'.repeat(39) } })).toThrow(/full 40- or 64-character hex commit sha/u);
+      // Every edge refusal is a no-effect failure.
+      expect(api.getJob('edges')?.status).toBe('parked');
+      expect(api.latestJobEvent('edges', 'job.admin-closeout')).toBeNull();
     } finally {
       db.close();
       rmSync(dir, { recursive: true, force: true });

@@ -5,7 +5,7 @@ import { hashToken, tokenConfigured, tokenMatches } from '../auth.js';
 import { ROLES, type GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { EventBus } from '../events/bus.js';
-import { LedgerApi, RecordNotFound, type DecisionActor, type DecisionKind, type NotificationRecord } from '../ledger/api.js';
+import { LedgerApi, RecordNotFound, AdminCloseoutRefusal, type DecisionActor, type DecisionKind, type NotificationRecord } from '../ledger/api.js';
 import { isDecisionActor, isDecisionKind } from '../ledger/decision-memory.js';
 import { isJobStatus, isRoundStatus, isRoundVerdict } from '../ledger/states.js';
 import { isAgentState } from '../runtime/types.js';
@@ -479,6 +479,70 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
           json(res, 200, ledger.setJobStatus(id, status));
           return;
         }
+        // Administrative closeout (owner ruling j-1115): the guarded path for
+        // a parked PR-backed lane whose provider PR is recorded CLOSED
+        // without merge. Refusals are typed 409s; malformed input stays 400
+        // and the authenticated gate runs before any body work.
+        if (req.method === 'POST' && path.startsWith('/api/jobs/') && path.endsWith('/closeout')) {
+          if (!authed(req, res)) return;
+          const id = decodeURIComponent(path.slice('/api/jobs/'.length, -'/closeout'.length));
+          if (id === '') {
+            json(res, 400, { error: 'bad_request', detail: 'job id path segment is required' });
+            return;
+          }
+          const body = (await readBody(req)) as Record<string, unknown>;
+          if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+            throw new Error('request body must be a JSON object');
+          }
+          const expectedStatus = strField(body, 'expected_status');
+          if (expectedStatus !== 'parked') {
+            throw new Error(`expected_status must be "parked" (got "${expectedStatus}")`);
+          }
+          const expectedPrUrl = strField(body, 'expected_pr_url');
+          const providerRaw = body['provider'];
+          if (typeof providerRaw !== 'object' || providerRaw === null || Array.isArray(providerRaw)) {
+            throw new Error('field "provider" must be an object');
+          }
+          const provider = providerRaw as Record<string, unknown>;
+          const providerName = strField(provider, 'provider');
+          if (providerName !== 'github') {
+            throw new Error(`provider.provider must be "github" (got "${providerName}")`);
+          }
+          const providerState = strField(provider, 'state');
+          if (providerState !== 'closed') {
+            throw new Error(`provider.state must be "closed" (got "${providerState}")`);
+          }
+          if (provider['merged'] !== false) {
+            throw new Error('field "provider.merged" must be exactly false');
+          }
+          const headSha = strField(provider, 'head_sha');
+          // Present-but-empty is a loud 400, never silent omission (same
+          // doctrine as decisionOptStrField).
+          const closedAtRaw = provider['closed_at'];
+          if (closedAtRaw !== undefined && (typeof closedAtRaw !== 'string' || closedAtRaw === '')) {
+            throw new Error('field "provider.closed_at" must be a non-empty string when present');
+          }
+          const closedAt = typeof closedAtRaw === 'string' ? closedAtRaw : undefined;
+          const reason = strField(body, 'reason');
+          json(
+            res,
+            200,
+            ledger.adminCloseParkedJob({
+              jobId: id,
+              expectedStatus: 'parked',
+              expectedPrUrl,
+              provider: {
+                provider: 'github',
+                state: 'closed',
+                merged: false,
+                headSha,
+                ...(closedAt !== undefined ? { closedAt } : {}),
+              },
+              reason,
+            }),
+          );
+          return;
+        }
         if (req.method === 'POST' && path.startsWith('/api/rounds/') && (path.endsWith('/status') || path.endsWith('/verdict'))) {
           if (!authed(req, res)) return;
           const suffix = path.endsWith('/status') ? '/status' : '/verdict';
@@ -557,11 +621,16 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
         const message = String(error instanceof Error ? error.message : error);
         // Typed mapping: the ledger and transcript layers throw
         // RecordNotFound for missing entities; a missing/unreadable
-        // transcript FILE is also a not-found. Everything else is a 400.
+        // transcript FILE is also a not-found. Everything else is a 400
+        // except a guarded closeout refusal, which is a typed 409.
+        const refused = error instanceof AdminCloseoutRefusal;
         const notFound =
-          error instanceof RecordNotFound ||
-          (error instanceof Error && error.message.includes('transcript unreadable'));
-        json(res, notFound ? 404 : 400, { error: notFound ? 'not_found' : 'bad_request', detail: message });
+          !refused &&
+          (error instanceof RecordNotFound ||
+            (error instanceof Error && error.message.includes('transcript unreadable')));
+        json(res, refused ? 409 : notFound ? 404 : 400, refused
+          ? { error: 'closeout_refused', code: error.code, detail: message }
+          : { error: notFound ? 'not_found' : 'bad_request', detail: message });
       }
     })().catch((error: unknown) => {
       log('error', 'board api handler failed', { error: String(error) });
