@@ -175,6 +175,12 @@ export interface ChatConfig {
   /** Local-time quiet window (empty/off by default). Inside it, wakes
    * defer to the window's end. */
   readonly wakeQuietHours: QuietHours | null;
+  /** Issue #219 kill switch: when true (default), an incident covered by
+   * an active, basis-matched decision (issue #218) DEFERS its wake to the
+   * decision's recheck instead of opening a turn; hard floors (breakers,
+   * provider walls, needs-owner) always wake regardless. false restores
+   * pre-#219 behavior. */
+  readonly wakeDeferCovered: boolean;
   /** Morning digest gap (ms): the first delivered block after this much
    * quiet time carries a "while you were away" digest (fires, actions,
    * merges, staged PRs) so the chief catches up without the owner
@@ -253,6 +259,12 @@ export interface SilasConfig {
   readonly pollIntervalMs: number;
   /** A working job whose minion shows no activity for this long is stalled. */
   readonly stallThresholdMs: number;
+  /** Sweep wake gate (issue #217): a sweep whose digest fingerprint is
+   * unchanged does not re-wake Silas until this much time has passed
+   * since the last delivered wake (a bounded safety re-look). 0 = never
+   * re-wake on an unchanged digest; a changed digest, an event trigger
+   * or a passed decision recheck always wakes. */
+  readonly unchangedRewakeMs: number;
   /** Consecutive same-blocker rounds before a fix directive is advised. */
   readonly directiveAt: number;
   /** Consecutive same-blocker rounds before a fresh-minion re-brief. */
@@ -266,6 +278,7 @@ export const DEFAULT_SILAS_CONFIG: SilasConfig = {
   sweepIntervalMs: 300_000,
   pollIntervalMs: 60_000,
   stallThresholdMs: 1_800_000,
+  unchangedRewakeMs: 21_600_000,
   directiveAt: 2,
   rebriefAt: 3,
   escalateAt: 4,
@@ -951,6 +964,7 @@ export function loadConfig(
     wakeMinIntervalMs: 300_000,
     wakeMinSeverity: 'info',
     wakeQuietHours: null,
+    wakeDeferCovered: true,
     morningDigestGapMs: 28_800_000,
   };
   let worktrees: WorktreesConfig | null = null;
@@ -1183,6 +1197,7 @@ export function loadConfig(
         'wake_min_interval_ms',
         'wake_min_severity',
         'wake_quiet_hours',
+        'wake_defer_covered',
         'morning_digest_gap_ms',
       ];
       for (const key of Object.keys(table)) {
@@ -1213,6 +1228,10 @@ export function loadConfig(
           table['wake_quiet_hours'] !== undefined
             ? requireQuietHours(table['wake_quiet_hours'], file, 'chat.wake_quiet_hours')
             : chat.wakeQuietHours,
+        wakeDeferCovered:
+          table['wake_defer_covered'] !== undefined
+            ? requireBool(table['wake_defer_covered'], file, 'chat.wake_defer_covered')
+            : chat.wakeDeferCovered,
         morningDigestGapMs:
           table['morning_digest_gap_ms'] !== undefined
             ? requireNonNegativeInt(table['morning_digest_gap_ms'], file, 'chat.morning_digest_gap_ms')
@@ -1302,7 +1321,7 @@ export function loadConfig(
     }
     if (raw['silas'] !== undefined) {
       const table = requireTable(raw['silas'], file, 'silas');
-      const VALID = ['enabled', 'sweep_interval_ms', 'poll_interval_ms', 'stall_threshold_ms', 'directive_at', 'rebrief_at', 'escalate_at'];
+      const VALID = ['enabled', 'sweep_interval_ms', 'unchanged_rewake_ms', 'poll_interval_ms', 'stall_threshold_ms', 'directive_at', 'rebrief_at', 'escalate_at'];
       for (const key of Object.keys(table)) {
         if (!VALID.includes(key)) {
           throw new ConfigError(
@@ -1336,6 +1355,7 @@ export function loadConfig(
         sweepIntervalMs: table['sweep_interval_ms'] !== undefined ? requireNonNegativeInt(table['sweep_interval_ms'], file, 'silas.sweep_interval_ms') : silas.sweepIntervalMs,
         pollIntervalMs: table['poll_interval_ms'] !== undefined ? requireNonNegativeInt(table['poll_interval_ms'], file, 'silas.poll_interval_ms') : silas.pollIntervalMs,
         stallThresholdMs: table['stall_threshold_ms'] !== undefined ? requirePositiveInt(table['stall_threshold_ms'], file, 'silas.stall_threshold_ms') : silas.stallThresholdMs,
+        unchangedRewakeMs: table['unchanged_rewake_ms'] !== undefined ? requireNonNegativeInt(table['unchanged_rewake_ms'], file, 'silas.unchanged_rewake_ms') : silas.unchangedRewakeMs,
         directiveAt,
         rebriefAt,
         escalateAt,

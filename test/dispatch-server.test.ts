@@ -67,6 +67,8 @@ async function boot(opts: {
   fallbackGate?: ConstructorParameters<typeof WaveRunner>[0]['fallbackGate'];
   /** false = boot without the silas ops surface (endpoints answer 503). */
   silasOps?: boolean;
+  /** Wired digest computation for GET /api/silas/digest (issue #217). */
+  silasDigest?: () => Promise<import('../src/dispatch/silas-driver.js').SilasOpsDigest>;
   /** Gate selected minion turns before they settle (in-flight assertions). */
   minionPromptGate?: (text: string) => Promise<void> | undefined;
   /** Capture service log lines (with their fields) for operator-surface assertions. */
@@ -190,6 +192,7 @@ async function boot(opts: {
             },
             worktrees,
             notifications,
+            ...(opts.silasDigest !== undefined ? { digest: opts.silasDigest } : {}),
           },
         }),
   });
@@ -549,6 +552,54 @@ describe('dispatch server (E8)', () => {
     }
   });
 
+  it('carries claimed-fixed prior indexes through the review endpoint into the queued handoff', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const h = await boot({
+      minionPromptGate: () => gate,
+      reviewPreflight: async () => ({
+        ok: true, failures: [],
+        reviewModel: { role: 'perkins', modelRef: 'fixture-model-v1', settings: {}, authEnv: {}, routingSha256: 'fixture-safe-route' },
+      }),
+    });
+    const repo = makeFixtureRepo('fixture-http-claims');
+    cleanupRepos.push(repo);
+    try {
+      const dispatch = await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'http-claims', repo_path: repo.path, title: 'reviewable', briefing: 'ship it',
+      }, TOKEN);
+      expect(dispatch.status).toBe(202);
+      const review = await call(h.port, 'POST', '/api/dispatch/review', {
+        job_id: 'http-claims', by: 'minion', claimed_fixed_priors: [2, 5],
+      }, TOKEN);
+      expect(review.status).toBe(202);
+      expect(review.json).toMatchObject({ route: 'queued', job_id: 'http-claims' });
+      // The durable queued input carries the claims: a replay after a crash
+      // re-verifies exactly the priors the minion claimed fixed.
+      const queued = h.ledger.latestJobEvent('http-claims', 'job.review-handoff-queued')?.payload as
+        { input?: { claimedFixedPriors?: unknown } } | undefined;
+      expect(queued?.input?.claimedFixedPriors).toEqual([2, 5]);
+      // A second queued request with DIFFERENT claims keeps first-wins but
+      // is never silent: the conflict record names the folded claims.
+      const conflicting = await call(h.port, 'POST', '/api/dispatch/review', {
+        job_id: 'http-claims', by: 'minion', claimed_fixed_priors: [7],
+      }, TOKEN);
+      expect(conflicting.status).toBe(202);
+      const conflict = h.ledger.latestJobEvent('http-claims', 'job.review-handoff-conflict')?.payload as
+        { folded?: { claimedFixedPriors?: unknown } } | undefined;
+      expect(conflict?.folded?.claimedFixedPriors).toEqual([7]);
+      expect(queued?.input?.claimedFixedPriors).toEqual([2, 5]);
+      // A malformed list is refused at the boundary, never silently dropped.
+      const invalid = await call(h.port, 'POST', '/api/dispatch/review', {
+        job_id: 'http-claims', by: 'minion', claimed_fixed_priors: ['nope'],
+      }, TOKEN);
+      expect(invalid.status).not.toBe(202);
+    } finally {
+      release();
+      await h.close();
+    }
+  });
+
   it('records the PR link and kicks a review wave', async () => {
     const h = await boot();
     const repo = makeFixtureRepo('fixture-http-review');
@@ -777,6 +828,70 @@ describe('dispatch server (E8)', () => {
       expect(field<string>(review.json, 'round_id')).toBe('http-route-perkins-r1');
     } finally {
       await h.close();
+    }
+  });
+
+  it('GET /api/silas/digest: read-only, authenticated, 503 unhosted or unwired, 500 on compute failure (issue #217)', async () => {
+    const unhosted = await boot({ silasOps: false });
+    try {
+      const res = await call(unhosted.port, 'GET', '/api/silas/digest', undefined, TOKEN);
+      expect(res.status).toBe(503);
+      expect(field<string>(res.json, 'error')).toBe('silas_ops_not_hosted');
+    } finally {
+      await unhosted.close();
+    }
+    const unwired = await boot();
+    try {
+      const res = await call(unwired.port, 'GET', '/api/silas/digest', undefined, TOKEN);
+      expect(res.status).toBe(503);
+      expect(field<string>(res.json, 'error')).toBe('silas_digest_not_hosted');
+    } finally {
+      await unwired.close();
+    }
+    let computeCalls = 0;
+    const h = await boot({
+      silasDigest: async () => {
+        computeCalls += 1;
+        return {
+          computedAt: '2026-10-05T00:00:00.000Z',
+          trigger: 'api',
+          deliveredWithoutPr: [{ jobId: 'job-api', repo: 'fixture-app', branch: null, lanePath: null, minionSessionFile: null, deliveredAt: null }],
+          prWithoutReview: [],
+          verdictsAwaitingDirective: [],
+          stalledWorking: [],
+          minionErrors: [],
+          verificationFailures: [],
+          verificationWaits: [],
+          providerRecoveryPending: [],
+          conflictingPrs: [],
+        };
+      },
+    });
+    try {
+      const anon = await call(h.port, 'GET', '/api/silas/digest');
+      expect(anon.status).toBe(401);
+      const wrong = await call(h.port, 'GET', '/api/silas/digest', undefined, 'nope');
+      expect(wrong.status).toBe(401);
+      const res = await call(h.port, 'GET', '/api/silas/digest', undefined, TOKEN);
+      expect(res.status).toBe(200);
+      expect(computeCalls).toBe(1);
+      const digest = res.json as Record<string, unknown>;
+      expect(digest['trigger']).toBe('api');
+      expect((digest['deliveredWithoutPr'] as { jobId: string }[])[0]?.jobId).toBe('job-api');
+    } finally {
+      await h.close();
+    }
+    const failing = await boot({
+      silasDigest: async () => {
+        throw new Error('ledger locked');
+      },
+    });
+    try {
+      const res = await call(failing.port, 'GET', '/api/silas/digest', undefined, TOKEN);
+      expect(res.status).toBe(500);
+      expect(field<string>(res.json, 'error')).toBe('digest_failed');
+    } finally {
+      await failing.close();
     }
   });
 

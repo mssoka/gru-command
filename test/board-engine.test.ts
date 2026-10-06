@@ -676,13 +676,25 @@ describe('board engine — liveness-first rail and job trackers', () => {
 
   it('tracks autonomous wakes from the durable gru.wake events', () => {
     const { api, engine } = fresh();
-    expect(engine.snapshot().wakes).toEqual({ count: 0, lastAt: null });
+    expect(engine.snapshot().wakes).toEqual({ count: 0, lastAt: null, deferred: { count: 0, reasons: {}, truncated: false } });
     api.appendCustomEvent({ kind: 'gru.wake', payload: { notification_ids: ['n1'], count: 1 } });
     const first = engine.snapshot().wakes;
     expect(first.count).toBe(1);
     expect(first.lastAt).not.toBeNull();
     api.appendCustomEvent({ kind: 'gru.wake', payload: { notification_ids: ['n2'], count: 1 } });
     expect(engine.snapshot().wakes.count).toBe(2);
+  });
+
+  it('tallies deferred wakes by reason from the avoidance stream (issue #219)', () => {
+    const { api, engine } = fresh();
+    api.appendCustomEvent({ kind: 'gru.wake-deferred', payload: { reason: 'duplicate', notification_id: 'n1', incident_key: 'k1' } });
+    api.appendCustomEvent({ kind: 'gru.wake-deferred', payload: { reason: 'covered', notification_id: 'n2', incident_key: 'k2', decision_id: 'd1' } });
+    api.appendCustomEvent({ kind: 'gru.wake-deferred', payload: { reason: 'covered', notification_id: 'n3', incident_key: 'k3', decision_id: 'd1' } });
+    api.appendCustomEvent({ kind: 'gru.wake-deferred', payload: { reason: 'failed', notification_id: 'n4', incident_key: 'k4' } });
+    expect(engine.snapshot().wakes.deferred).toEqual({ count: 4, reasons: { duplicate: 1, covered: 2, failed: 1 }, truncated: false });
+    // Unknown reasons tally honestly instead of vanishing.
+    api.appendCustomEvent({ kind: 'gru.wake-deferred', payload: { notification_id: 'n5', incident_key: 'k5' } });
+    expect(engine.snapshot().wakes.deferred).toEqual({ count: 5, reasons: { duplicate: 1, covered: 2, failed: 1, unknown: 1 }, truncated: false });
   });
 });
 
@@ -760,6 +772,51 @@ describe('board engine — FOR YOU owner-PR projection on the snapshot', () => {
       },
     });
     expect(engine.snapshot().ownerPrs).toEqual([]);
+  });
+
+  it('keeps a delta READY gated until its final whole-change pass closes', () => {
+    const { api, engine } = fresh();
+    // (a) ONLY the pre-commit marker exists: a crash between the verdict
+    // commit and the review event must not expose owner-ready.
+    stageReadyJob(api, 'job-marker-only');
+    api.appendCustomEvent({
+      kind: 'round.final-pass-required',
+      jobId: 'job-marker-only',
+      roundId: api.listRounds('job-marker-only').at(-1)!.id,
+      payload: { targetSha: SHA, reviewScope: 'delta' },
+    });
+    expect(engine.snapshot().ownerPrs).toEqual([]);
+
+    // (b) ONLY the review-event flag exists (legacy/post-commit shape).
+    stageReadyJob(api, 'job-event-only');
+    api.appendCustomEvent({
+      kind: 'round.perkins-review',
+      jobId: 'job-event-only',
+      roundId: api.listRounds('job-event-only').at(-1)!.id,
+      payload: { canonicalVerdict: 'READY TO MERGE', reviewScope: 'delta', finalPassRequired: true },
+    });
+    expect(engine.snapshot().ownerPrs).toEqual([]);
+
+    // (c) The whole-scope round closes and its review event carries no
+    // pending flag: the newest round is whole and owner-ready.
+    stageReadyJob(api, 'job-final-pass');
+    api.appendCustomEvent({
+      kind: 'round.final-pass-required',
+      jobId: 'job-final-pass',
+      roundId: api.listRounds('job-final-pass').at(-1)!.id,
+      payload: { targetSha: SHA, reviewScope: 'delta' },
+    });
+    expect(engine.snapshot().ownerPrs).toEqual([]);
+    const finalRound = api.addRound({ jobId: 'job-final-pass', targetRef: SHA });
+    api.setRoundStatus(finalRound.id, 'live');
+    api.setRoundVerdict(finalRound.id, 'approved');
+    api.appendCustomEvent({
+      kind: 'round.perkins-review',
+      jobId: 'job-final-pass',
+      roundId: finalRound.id,
+      payload: { canonicalVerdict: 'READY TO MERGE', reviewScope: 'whole' },
+    });
+    expect(engine.snapshot().ownerPrs.map((row) => row.id)).toEqual(['owner-pr:job-final-pass']);
   });
 
   it('drops the row when the job takes a hold (blocked) or a newer round is changes-requested', () => {

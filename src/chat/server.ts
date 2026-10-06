@@ -896,7 +896,17 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
               return;
             }
             if (wake && options.awareness?.admitWake?.() === false) return;
-            const injection = wake ? wakeInjection : awarenessPrepare();
+            // Issue #102: the pre-spawn wakeInjection is STALE here — rows
+            // may have closed or become covered across the awaited spawn.
+            // Re-read the bounded batch immediately before the prompt;
+            // admitWake() revalidated the active batch, so this renders
+            // exactly the still-eligible IDs. A null block (nothing left)
+            // cancels the turn — no wake without eligible IDs.
+            const injection = wake ? awarenessPrepare('wake') : awarenessPrepare();
+            if (wake && injection === null) {
+              options.awareness?.noteWakeOutcome?.(false, 'no awareness context to inject');
+              return;
+            }
             const baseText =
               injection === null
                 ? text

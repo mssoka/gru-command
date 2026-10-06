@@ -267,7 +267,17 @@ export interface BoardSnapshot {
    * class that rings the bell. */
   readonly unackedNeedsOwner: number;
   /** Autonomous Gru turns recorded as durable `gru.wake` events. */
-  readonly wakes: { readonly count: number; readonly lastAt: string | null };
+  readonly wakes: {
+    readonly count: number;
+    readonly lastAt: string | null;
+    /** Issue #219: wakes that did NOT open (avoidance), with per-reason
+     * counts. Reasons: 'duplicate' (incident already woken), 'covered'
+     * (hold-covered deferral, #218), 'failed' (bounded retries spent; the
+     * truthful owner escalation replaced the autonomous path, #115).
+     * `truncated` flags a tally that hit the scan cap — the counts are a
+     * lower bound, never silently presented as the total. */
+    readonly deferred: { readonly count: number; readonly reasons: Readonly<Record<string, number>>; readonly truncated: boolean };
+  };
   /** Running build vs origin/main (null when the tracker is unwired). */
   readonly build: DeployDriftView | null;
   /** Silas ops health, derived from the ledger event stream. */
@@ -778,6 +788,7 @@ export class BoardEngine {
       wakes: {
         count: this.ledger.countEvents('gru.wake'),
         lastAt: this.ledger.latestEventOfKind('gru.wake')?.ts ?? null,
+        deferred: this.deferredWakes(),
       },
       build: this.buildDrift(),
       children: {
@@ -812,6 +823,38 @@ export class BoardEngine {
     }));
   }
 
+  /** Deferred-wake tally (issue #219): per-reason counts over the durable
+   * `gru.wake-deferred` avoidance stream. Paged and capped — the stream
+   * grows once per suppressed wake, never per notification event. */
+  private deferredWakes(): { readonly count: number; readonly reasons: Readonly<Record<string, number>>; readonly truncated: boolean } {
+    const MAX_SCAN = 20_000;
+    const reasons: Record<string, number> = {};
+    let count = 0;
+    let cursor = 0;
+    let scanned = 0;
+    let truncated = false;
+    for (;;) {
+      const page = this.ledger.listEventsAfter(cursor, { kinds: ['gru.wake-deferred'], limit: 500 });
+      for (const event of page) {
+        cursor = event.seq;
+        scanned += 1;
+        const reason =
+          typeof event.payload === 'object' && event.payload !== null
+            ? (event.payload as Record<string, unknown>)['reason']
+            : undefined;
+        const key = typeof reason === 'string' && reason !== '' ? reason : 'unknown';
+        reasons[key] = (reasons[key] ?? 0) + 1;
+        count += 1;
+      }
+      if (page.length < 500) break;
+      if (scanned >= MAX_SCAN) {
+        truncated = true;
+        break;
+      }
+    }
+    return { count, reasons, truncated };
+  }
+
   /** The FOR YOU PR projection: one authoritative, evidence-bound ready
    * list over the snapshot's own job views (deterministic job-id order —
    * a stable row order across pushes). Only in-review jobs with a PR
@@ -822,7 +865,25 @@ export class BoardEngine {
     return repos
       .flatMap((repo) => repo.jobs)
       .filter((job) => job.status === 'in-review' && job.prUrl !== null)
-      .map((job) => ownerReadyPr(job, readBranchEvidence(this.ledger, job.id)))
+      .map((job) => {
+        // Stage-5 convergence: a delta round that posted READY still owes
+        // the final whole-change pass. Until that whole-scope round closes
+        // at this target, the delta approval is NOT owner-ready (the flag
+        // survives a crash between the two rounds).
+        const newest = job.rounds.at(-1);
+        if (newest !== undefined) {
+          // The pre-commit marker is the durable obligation (written before
+          // the verdict commit), so an approved delta round can never be
+          // owner-ready without it; the review-event field is a second,
+          // post-commit disclosure.
+          if (this.ledger.latestRoundEvent(newest.id, 'round.final-pass-required') !== null) return null;
+          const review = this.ledger.latestRoundEvent(newest.id, 'round.perkins-review');
+          const payload = review === null || typeof review.payload !== 'object' || review.payload === null
+            ? null : review.payload as { readonly finalPassRequired?: unknown };
+          if (payload?.finalPassRequired === true) return null;
+        }
+        return ownerReadyPr(job, readBranchEvidence(this.ledger, job.id));
+      })
       .filter((row): row is OwnerPrView => row !== null)
       .sort((left, right) => left.jobId.localeCompare(right.jobId));
   }

@@ -68,7 +68,7 @@ function snapshot(): BoardSnapshot {
     },
     unackedActionRequired: 0,
     unackedNeedsOwner: 0,
-    wakes: { count: 0, lastAt: null },
+    wakes: { count: 0, lastAt: null, deferred: { count: 0, reasons: {}, truncated: false } },
   };
 }
 
@@ -165,6 +165,18 @@ describe('board server-frame validator', () => {
     for (const lastAt of [1, {}, false]) {
       expect(isValidSnapshot({ ...snapshot(), wakes: { count: 1, lastAt } })).toBe(false);
     }
+  });
+
+  it('issue #219 deferred wakes: valid present block accepted, malformed block rejected, absent tolerated', () => {
+    const valid = snapshot();
+    expect(isValidSnapshot(valid)).toBe(true);
+    expect(isValidSnapshot({ ...valid, wakes: { count: 2, lastAt: null, deferred: { count: 5, reasons: { covered: 3, duplicate: 2 }, truncated: false } } })).toBe(true);
+    // Absent deferred block: pre-upgrade server, tolerated.
+    expect(isValidSnapshot({ ...valid, wakes: { count: 2, lastAt: null } })).toBe(true);
+    // Malformed when present: negative count, non-numeric reason count, bad truncated type.
+    expect(isValidSnapshot({ ...valid, wakes: { count: 2, lastAt: null, deferred: { count: -1, reasons: {} } } })).toBe(false);
+    expect(isValidSnapshot({ ...valid, wakes: { count: 2, lastAt: null, deferred: { count: 1, reasons: { covered: 'many' } } } })).toBe(false);
+    expect(isValidSnapshot({ ...valid, wakes: { count: 2, lastAt: null, deferred: { count: 1, reasons: {}, truncated: 'yes' } } })).toBe(false);
   });
 
   it('tolerates absent v4 blocks (pre-v4 servers) and validates present ones', () => {

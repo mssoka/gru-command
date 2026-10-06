@@ -599,7 +599,26 @@ the judgment; the dispatch surface is the mechanical hand.
   `job.minion-error`, `round.verdict`) plus a periodic sweep
   (`[silas] sweep_interval_ms`, default 5 min). A trigger arriving while a
   silas turn is open queues ONE latest trigger (the decisions runtime's
-  one-slot replay) — never dropped, never stacked.
+  one-slot replay) — never dropped, never stacked. A sweep wakes only
+  when the digest's decision-relevant fingerprint CHANGED (issue #217):
+  rows projected to identity + actionable fields (volatile timestamps,
+  ages and session/lane paths excluded) so an identical operational
+  state never re-wakes Silas — 88 % of sweep wakes used to carry a
+  digest identical to the previous one. Rows appear when a lane crosses
+  a due threshold (stall, queue timeout, recovery), so threshold
+  crossings wake by construction. A recorded decision `recheck_at`
+  passing since the last delivered wake also wakes (#218) — exactly
+  once, and even when the digest is empty — and
+  `[silas] unchanged_rewake_ms` (default 6 h; 0 = never) bounds a safety
+  re-look at unchanged state. The fingerprint of the last DELIVERED wake
+  persists in the `silas.wake-delivered` event (the `silas.wake`
+  attempt marker still lands before the prompt, so #214's yield
+  telemetry attributes Silas's in-turn actions to the wake that
+  prompted them), and driver start seeds the gate from the newest
+  delivered event, so a restart never re-wakes what Silas has already
+  seen. A queued event trigger is never displaced by a later sweep —
+  only a newer event supersedes it. Event triggers always deliver,
+  whatever the gate says.
 - **The GitHub signal poll (POLL-ONLY; owner ruling 2026-09-23)** rides
   the same driver on its own faster interval (`[silas] poll_interval_ms`,
   default 60 s; 0 disables) and needs no model turn: every tracked job
@@ -620,7 +639,12 @@ the judgment; the dispatch surface is the mechanical hand.
   budget keeps the poll under 40 % of the authenticated GitHub rate
   limit; a rate-limit response aborts the tick instead of hammering.
   Webhooks are not built (no inbound tunnel). The tier ladder is
-  unchanged: no new autonomy.
+  unchanged: no new autonomy. On the wake side (issue #219) a
+  re-detected failing head under a fresh notification id is ONE incident
+  (`github.ci-failed:<job>:<sha>` is the incident key) — the wake policy
+  opens no second turn for it; a hold recorded through
+  `POST /api/decisions` (issue #218) with a matching basis defers the
+  wake to the hold's recheck instead.
 - **The digest** handed to every wake carries the actionable states,
   computed from the ledger: delivered jobs with no PR registered; PRs
   whose follow-up delivery proves the lane head moved past the newest
@@ -651,7 +675,20 @@ the judgment; the dispatch surface is the mechanical hand.
   verification owns the lane, and never a Gru wake. NEEDS CHANGES
   verdicts awaiting follow-through, with per-blocker recurrence analysis;
   working lanes whose minion has been silent past `stall_threshold_ms`;
-  plus recent minion errors for context.
+  plus recent minion errors for context. Since issue #217 a wake prompt
+  carries the digest DELTA — added, changed and resolved rows keyed by
+  category + identity since the last delivered wake — plus the
+  authenticated pointer `GET /api/silas/digest` (read-only, computes the
+  current digest with the same seams the driver uses) and a
+  `Digest fingerprint:` line so yield telemetry can attribute every
+  wake to a stable digest identity. The first wake after a restart
+  sends the full digest once; a failed wake never advances the delta
+  baseline. The static operating brief — authority orders, ops surface,
+  capture helper, recurrence policy, provider recovery and the skills
+  pack — is injected ONCE per session (re-injected only when the brief
+  hash changes, the session handle changes, or a compaction may have
+  dropped it, including one that fired mid-turn); later wakes carry
+  only the marker line `Operating brief unchanged (hash …)`.
 - **The loop closes without a human ping**: on a delivered job, Silas
   finds the PR (transcript/`gh`), registers it
   (`POST /api/dispatch/pr … by=silas`), and triggers the wave
@@ -706,10 +743,16 @@ the judgment; the dispatch surface is the mechanical hand.
   surface — the pairing token is read from the instance config at call
   time, never echoed.
 - **Skills** — `ops-dispatch` and `ledger-closeout` ship in-repo under
-  `resources/silas-skills/` and are injected into every wake prompt (the
+  `resources/silas-skills/` and are injected into the wake prompt (the
   delivery mechanism: Silas hosts at the workspace root, so plain project
   skill discovery does not apply; a clean install needs nothing else on
-  disk). The files are the source of truth.
+  disk). The files are the source of truth. Since issue #217 the whole
+  static operating brief (orders, ops surface, capture helper, policies
+  and the skills pack) is injected ONCE per session — a wake whose brief
+  hash, session handle and compaction boundary are unchanged carries
+  only the marker line `Operating brief unchanged (hash …)`; a brief
+  change, a new session handle, or a `compaction_end` that may have
+  dropped it re-injects exactly once.
 - **Off switch** — `[silas] enabled = false` hosts no slot and fires no
   wakes; the `/api/silas/*` surface answers 503. Model and thinking come
   from config (`[models.roles] silas` / `[thinking.roles] silas`), never

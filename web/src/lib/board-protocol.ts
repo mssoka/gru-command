@@ -308,7 +308,18 @@ export interface BoardSnapshot {
   /** FOR YOU: needs-owner rows awaiting a human ack (the bell class). */
   readonly unackedNeedsOwner: number;
   /** Autonomous Gru wakes fired by the policy (`gru.wake` events). */
-  readonly wakes: { readonly count: number; readonly lastAt: string | null };
+  readonly wakes: {
+    readonly count: number;
+    readonly lastAt: string | null;
+    /** Issue #219: avoidance counts with reasons; absent on pre-upgrade
+     * servers (validator tolerates). `truncated` = the server tally hit
+     * its scan cap (counts are a lower bound). */
+    readonly deferred?: {
+      readonly count: number;
+      readonly reasons: Readonly<Record<string, number>>;
+      readonly truncated?: boolean;
+    } | null;
+  };
   /** Absent on pre-v4 servers (validator tolerates; consumers render n/a). */
   readonly build?: BuildView | null;
   readonly silas?: SilasView | null;
@@ -696,13 +707,30 @@ function isOwnerPrView(value: unknown): value is OwnerPrView {
 }
 
 function isWakesView(value: unknown): boolean {
-  return (
-    isRecord(value) &&
-    typeof value.count === 'number' &&
-    Number.isSafeInteger(value.count) &&
-    value.count >= 0 &&
-    (value.lastAt === null || typeof value.lastAt === 'string')
-  );
+  if (
+    !(
+      isRecord(value) &&
+      typeof value.count === 'number' &&
+      Number.isSafeInteger(value.count) &&
+      value.count >= 0 &&
+      (value.lastAt === null || typeof value.lastAt === 'string')
+    )
+  ) {
+    return false;
+  }
+  // Issue #219 deferred block: optional (pre-upgrade servers) but strictly
+  // typed when present.
+  if (value.deferred !== undefined && value.deferred !== null) {
+    const deferred = value.deferred;
+    if (!isRecord(deferred)) return false;
+    if (typeof deferred.count !== 'number' || !Number.isSafeInteger(deferred.count) || deferred.count < 0) return false;
+    if (!isRecord(deferred.reasons)) return false;
+    for (const count of Object.values(deferred.reasons)) {
+      if (typeof count !== 'number' || !Number.isSafeInteger(count) || count < 0) return false;
+    }
+    if (deferred.truncated !== undefined && typeof deferred.truncated !== 'boolean') return false;
+  }
+  return true;
 }
 
 export function isValidSnapshot(value: unknown): value is BoardSnapshot {

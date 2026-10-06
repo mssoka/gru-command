@@ -202,7 +202,7 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       ts.forEachChild(node, visit);
     };
     visit(file);
-    // 22 of 25 sites carry the bounded context; the three null rows are the
+    // 27 of 30 sites carry the bounded context; the three null rows are the
     // sanctioned residuals (shutdown deadline, live-process pause, sweep
     // error) that stay deliberately context-free and live (A7 rejection
     // stands; a worktree id is never coerced into a round identity).
@@ -222,6 +222,7 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       ['`bmad-review gate BLOCKED for job ${jobId}`', '{ jobId }'],
       ['`bmad-review gate ABORTED for job ${jobId}`', '{ jobId }'],
       ['`Perkins review for job ${job.id} refused admission before any specialist started`', '{ jobId: job.id, roundId: round.id }'],
+      ['`Perkins delta READY for job ${input.jobId} still owes its final whole-change pass`', '{ jobId: input.jobId, roundId: round.id }'],
       ['`Perkins review for job ${input.job.id} was blocked before any round: the PR head could not be verified`', '{ jobId: input.job.id }'],
       ['`Review round ${round.id} disposal failed after completion`', '{ jobId: job.id, roundId: round.id }'],
       ['`Review round ${round.id} is INCOMPLETE`', '{ jobId: job.id, roundId: round.id }'],
@@ -229,6 +230,7 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       ['`Perkins report for round ${round.id} was recorded but NOT posted safely to the pull request`', '{ jobId: round.jobId, roundId: round.id }'],
       ['`Perkins report for round ${round.id} was recorded but has NO pull request to publish to`', '{ jobId: round.jobId, roundId: round.id }'],
       ['`Perkins report for round ${round.id} was recorded but NOT posted to the pull request`', '{ jobId: round.jobId, roundId: round.id }'],
+      ['`Perkins review for job ${job.id} deferred ${followupTitles.length} follow-up finding(s)`', '{ jobId: job.id, roundId: round.id }'],
       ['`Review round ${round.id} INCOMPLETE record event could not be persisted`', '{ jobId: job.id, roundId: round.id }'],
       ['`Review round ${round.id} is INCOMPLETE`', '{ jobId: job.id, roundId: round.id }'],
       ['`Review round ${round.id} finalization artifact failed after its verdict committed`', '{ jobId: job.id, roundId: round.id }'],
@@ -237,7 +239,7 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       ['`Review worktree for round ${worktreeId} could not be swept`', null],
     ];
     expect(sites.map((site) => [site.title, site.context])).toEqual(expected);
-    expect(sites).toHaveLength(28);
-    expect(sites.filter((site) => site.context !== null)).toHaveLength(25);
+    expect(sites).toHaveLength(30);
+    expect(sites.filter((site) => site.context !== null)).toHaveLength(27);
   });
 });

@@ -15,7 +15,7 @@ import { flipJobToWorking, rebriefFreshMinion, recordFollowUpDelivery, routeFixD
 import { checkRebriefTurn, finalizeRebriefRequest, RebriefTurnCancelled } from './rebrief-recovery.js';
 import type { LessonsReferencePort } from '../lessons/types.js';
 import { BranchBusyError } from './branch-idle.js';
-import { deliveredTargetSha } from './silas-driver.js';
+import { deliveredTargetSha, type SilasOpsDigest } from './silas-driver.js';
 import type { WorktreePort } from './worktree-port.js';
 import type { PacingGate, RetrySettlement } from '../runtime/pacing.js';
 import { childRefusalStatus, type ChildWorkerService } from './child-workers.js';
@@ -46,6 +46,10 @@ export interface SilasOpsSurface {
   };
   /** The supervisor's guarded owned re-arm for the silas slot. */
   readonly slotReArm?: { ownedProviderReArm(agentId: string, waitId: string): boolean };
+  /** Read-only digest computation for GET /api/silas/digest (issue #217):
+   * returns the digest a wake prompt's delta points at. Absent = the
+   * endpoint answers 503. */
+  readonly digest?: () => Promise<SilasOpsDigest>;
 }
 
 export interface DispatchServerOptions {
@@ -476,6 +480,15 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           throw new Error(`clean-abort round ${sourceRoundId} was already re-armed`);
         }
       }
+      const rawClaimedFixed = body['claimed_fixed_priors'];
+      let claimedFixedPriors: number[] | undefined;
+      if (rawClaimedFixed !== undefined) {
+        if (!Array.isArray(rawClaimedFixed) || rawClaimedFixed.length > 500 ||
+            rawClaimedFixed.some((value) => !Number.isSafeInteger(value) || (value as number) < 0)) {
+          throw new Error('claimed_fixed_priors must be an array of at most 500 non-negative integer prior indexes');
+        }
+        claimedFixedPriors = rawClaimedFixed as number[];
+      }
       const input = {
         jobId,
         ...(boundTargetRef !== undefined ? { targetRef: boundTargetRef } : {}),
@@ -486,6 +499,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         ...(optBoolField(body, 'no_spec') !== undefined ? { noSpec: optBoolField(body, 'no_spec') } : {}),
         ...(force !== undefined ? { force } : {}),
         ...(evidenceRefs !== undefined ? { evidence: evidenceRefs } : {}),
+        ...(claimedFixedPriors !== undefined ? { claimedFixedPriors } : {}),
         ...(by === 'minion' ? { handoff: true } : {}),
       };
       // The fallback gate can append a terminal phase BEFORE this handler
@@ -1419,6 +1433,26 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         payload: { title, notification_id: notification.id },
       });
       json(res, 200, { notification_id: notification.id });
+      return true;
+    }
+    if (req.method === 'GET' && path === '/api/silas/digest') {
+      if (!authed(req, res)) return true;
+      const ops = silasOpsOr503(res);
+      if (ops === null) return true;
+      if (ops.digest === undefined) {
+        json(res, 503, {
+          error: 'silas_digest_not_hosted',
+          detail: 'the silas digest computation is not wired on this service',
+        });
+        return true;
+      }
+      try {
+        const digest = await ops.digest();
+        json(res, 200, digest as unknown as Record<string, unknown>);
+      } catch (error) {
+        options.log?.('error', 'silas digest computation failed', { error: String(error).slice(0, 300) });
+        json(res, 500, { error: 'digest_failed', detail: String(error).slice(0, 300) });
+      }
       return true;
     }
     if (req.method === 'POST' && path === '/api/silas/provider-recovery/claim') {

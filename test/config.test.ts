@@ -559,6 +559,7 @@ describe('supervision / logging / chat tables (E7)', () => {
       wakeMinIntervalMs: 300_000,
       wakeMinSeverity: 'info',
       wakeQuietHours: null,
+      wakeDeferCovered: true,
       morningDigestGapMs: 28_800_000,
     });
   });
@@ -584,6 +585,7 @@ describe('supervision / logging / chat tables (E7)', () => {
         'wake_min_interval_ms = 60000',
         'wake_min_severity = "error"',
         'wake_quiet_hours = "22:30-07:15"',
+        'wake_defer_covered = false',
         'morning_digest_gap_ms = 0',
         '',
       ].join('\n'),
@@ -605,6 +607,7 @@ describe('supervision / logging / chat tables (E7)', () => {
       wakeMinIntervalMs: 60_000,
       wakeMinSeverity: 'error',
       wakeQuietHours: { startMinute: 22 * 60 + 30, endMinute: 7 * 60 + 15 },
+      wakeDeferCovered: false,
       morningDigestGapMs: 0,
     });
   });
@@ -755,6 +758,7 @@ describe('dispatch config (E8)', () => {
       sweepIntervalMs: 300_000,
       pollIntervalMs: 60_000,
       stallThresholdMs: 1_800_000,
+      unchangedRewakeMs: 21_600_000,
       directiveAt: 2,
       rebriefAt: 3,
       escalateAt: 4,
@@ -763,12 +767,13 @@ describe('dispatch config (E8)', () => {
 
   it('a full [silas] section parses; garbage and non-ascending thresholds refuse boot', () => {
     const home = tmpHome();
-    writeConfig(home, '[silas]\nenabled = false\nsweep_interval_ms = 0\npoll_interval_ms = 45000\nstall_threshold_ms = 600000\ndirective_at = 1\nrebrief_at = 2\nescalate_at = 3\n');
+    writeConfig(home, '[silas]\nenabled = false\nsweep_interval_ms = 0\npoll_interval_ms = 45000\nstall_threshold_ms = 600000\nunchanged_rewake_ms = 0\ndirective_at = 1\nrebrief_at = 2\nescalate_at = 3\n');
     expect(loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester').silas).toEqual({
       enabled: false,
       sweepIntervalMs: 0,
       pollIntervalMs: 45_000,
       stallThresholdMs: 600_000,
+      unchangedRewakeMs: 0,
       directiveAt: 1,
       rebriefAt: 2,
       escalateAt: 3,
@@ -782,6 +787,8 @@ describe('dispatch config (E8)', () => {
       '[silas]\ndirective_at = 3\nrebrief_at = 3\n',
       '[silas]\ndirective_at = 2\nrebrief_at = 4\nescalate_at = 4\n',
       '[silas]\nenabled = "yes"\n',
+      '[silas]\nunchanged_rewake_ms = -1\n',
+      '[silas]\nunchanged_rewake_ms = 1.5\n',
     ];
     for (const text of bad) {
       const h2 = tmpHome();

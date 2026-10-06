@@ -40,6 +40,10 @@ export interface VerifiedFinding extends ReviewFinding {
   };
   readonly sources: readonly PerkinsFindingSource[];
   readonly roundOrigin: number;
+  /** Stage-5 convergence rule: this finding lies outside its round's delta
+   * hunks, so it was deferred as a follow-up (recorded and disclosed, never
+   * dropped) and cannot hold the PR. */
+  readonly deferredFollowup?: true;
 }
 
 export interface LensEnvelope {
@@ -339,6 +343,13 @@ export function parseFindingsSubmission(input: unknown, expectedLens: PerkinsLen
 
 function normalize(value: string): string {
   return value.toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+/** The exact dedupe key used by dedupeVerifiedFindings, exported for the
+ * host to recognize a restatement of an already-retained prior finding
+ * (Stage-5 convergence: a rediscovery is never a NEW finding). */
+export function findingDedupeKey(title: string, location: string): string {
+  return `${normalize(title)}\0${normalize(location)}`;
 }
 
 export function dedupeVerifiedFindings(findings: readonly VerifiedFinding[]): readonly VerifiedFinding[] {

@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -303,6 +304,15 @@ export interface DigestLedger {
   hasUnsettledVerificationRun(jobId: string): boolean;
   listProviderWaits?(opts?: { status?: string }): readonly unknown[];
   listPendingProviderRecoveries?(): readonly unknown[];
+  /** Active decision rows (issue #218): the sweep gate wakes on a passed
+   * `recheckAt` even when the digest fingerprint is unchanged. Optional
+   * because the digest itself never reads decisions. */
+  listDecisions?(opts?: {
+    readonly subject?: string;
+    readonly activeOnly?: boolean;
+    readonly limit?: number;
+    readonly offset?: number;
+  }): readonly { readonly recheckAt: string | null }[];
 }
 
 /** Blockers of one round, with an explicit loud note instead of a silent
@@ -337,8 +347,11 @@ export function consolidatedBlockersFor(ledger: DigestLedger): BlockersForRound 
         return Promise.resolve({ blockers: [], note: `consolidated report ${file} has no findings array` });
       }
       const blockers = (parsed.findings as unknown[])
-        .map((finding) => finding as Partial<RoundBlocker> & { severity?: unknown; detail?: unknown })
-        .filter((finding) => finding.severity === 'blocker')
+        .map((finding) => finding as Partial<RoundBlocker> & { severity?: unknown; detail?: unknown; deferredFollowup?: unknown })
+        // A finding deferred by the Stage-5 convergence rule is a recorded
+        // follow-up that cannot hold the PR; it must not feed the blocker
+        // recurrence ladder or a release-blocker fix directive.
+        .filter((finding) => finding.severity === 'blocker' && finding.deferredFollowup !== true)
         .map((finding) => ({
           category: String(finding.category ?? ''),
           title: String(finding.title ?? ''),
@@ -502,6 +515,292 @@ export function digestActionCount(digest: SilasOpsDigest): number {
     digest.providerRecoveryPending.length +
     digest.conflictingPrs.length
   );
+}
+
+// ------------------------------------------------------------------
+// Wake gate: digest fingerprint and delta (issue #217)
+// ------------------------------------------------------------------
+
+/** The digest's row categories, canonical order. */
+const DIGEST_ROW_CATEGORIES = [
+  'deliveredWithoutPr',
+  'prWithoutReview',
+  'verdictsAwaitingDirective',
+  'stalledWorking',
+  'minionErrors',
+  'verificationFailures',
+  'verificationWaits',
+  'providerRecoveryPending',
+  'conflictingPrs',
+] as const;
+
+export type DigestRowCategory = (typeof DIGEST_ROW_CATEGORIES)[number];
+
+/** One row of any category (the delta's row payloads). */
+export type DigestRow =
+  | DeliveredWithoutPrRow
+  | PrWithoutReviewRow
+  | VerdictAwaitingDirectiveRow
+  | StalledWorkingRow
+  | MinionErrorRow
+  | VerificationFailureRow
+  | VerificationWaitingRow
+  | ProviderRecoveryPendingRow
+  | ConflictingPrRow;
+
+/**
+ * Decision-relevant projection of a digest row (issue #217): identity and
+ * actionable fields only. Volatile fields — timestamps, ages, session and
+ * lane paths — are dropped so an identical operational state fingerprints
+ * identically no matter when it was computed. Pure per-category picks,
+ * never a generic key sweep: a new row field is a DELIBERATE decision
+ * about whether it wakes Silas.
+ */
+export function digestRowProjection(category: DigestRowCategory, row: DigestRow): Record<string, unknown> {
+  switch (category) {
+    case 'deliveredWithoutPr': {
+      const r = row as DeliveredWithoutPrRow;
+      return { jobId: r.jobId, repo: r.repo, branch: r.branch };
+    }
+    case 'prWithoutReview': {
+      const r = row as PrWithoutReviewRow;
+      return {
+        jobId: r.jobId,
+        repo: r.repo,
+        prUrl: r.prUrl,
+        priorRounds: r.priorRounds,
+        ...(r.cleanAbort !== undefined ? { cleanAbort: r.cleanAbort } : {}),
+      };
+    }
+    case 'verdictsAwaitingDirective': {
+      const r = row as VerdictAwaitingDirectiveRow;
+      return {
+        jobId: r.jobId,
+        repo: r.repo,
+        roundId: r.roundId,
+        roundSeq: r.roundSeq,
+        verdict: r.verdict,
+        blockerCount: r.blockerCount,
+        // The loud note (e.g. "consolidated report unreadable") is
+        // decision-relevant evidence: a note appearing or changing on an
+        // otherwise identical row must wake Silas (review r1).
+        blockersNote: r.blockersNote,
+        recurringBlockers: r.recurringBlockers
+          .map((b) => ({ fingerprint: b.fingerprint, advice: b.advice, consecutiveRounds: b.consecutiveRounds }))
+          .sort((a, b) => a.fingerprint.localeCompare(b.fingerprint)),
+      };
+    }
+    case 'stalledWorking': {
+      const r = row as StalledWorkingRow;
+      return { jobId: r.jobId, repo: r.repo, minionId: r.minionId, minionState: r.minionState };
+    }
+    case 'minionErrors': {
+      const r = row as MinionErrorRow;
+      return { jobId: r.jobId, repo: r.repo, error: r.error };
+    }
+    case 'verificationFailures': {
+      const r = row as VerificationFailureRow;
+      return { jobId: r.jobId, repo: r.repo, scope: r.scope, runId: r.runId, head: r.head, detail: r.detail };
+    }
+    case 'verificationWaits': {
+      const r = row as VerificationWaitingRow;
+      return { jobId: r.jobId, repo: r.repo, scope: r.scope, requestId: r.requestId, head: r.head };
+    }
+    case 'providerRecoveryPending': {
+      const r = row as ProviderRecoveryPendingRow;
+      return { waitId: r.waitId, jobId: r.jobId, slotId: r.slotId, route: r.route };
+    }
+    case 'conflictingPrs': {
+      // Every field (#215): firstSeenAt is part of the row's identity — a
+      // NEW clean→dirty transition starts a fresh conflict stretch.
+      const r = row as ConflictingPrRow;
+      return {
+        jobId: r.jobId,
+        repo: r.repo,
+        branch: r.branch,
+        prNumber: r.prNumber,
+        prUrl: r.prUrl,
+        headSha: r.headSha,
+        firstSeenAt: r.firstSeenAt,
+      };
+    }
+  }
+}
+
+/** Stable identity of a row within its category: two digests carry the
+ * "same" row when this key matches — content differences are then
+ * reported as `changed`, not as a remove+add pair. */
+export function digestRowKey(category: DigestRowCategory, row: DigestRow): string {
+  switch (category) {
+    case 'deliveredWithoutPr':
+      return (row as DeliveredWithoutPrRow).jobId;
+    case 'prWithoutReview':
+      return `${(row as PrWithoutReviewRow).jobId} ${(row as PrWithoutReviewRow).prUrl}`;
+    case 'verdictsAwaitingDirective':
+      return `${(row as VerdictAwaitingDirectiveRow).jobId} ${(row as VerdictAwaitingDirectiveRow).roundId}`;
+    case 'stalledWorking':
+      return `${(row as StalledWorkingRow).jobId} ${(row as StalledWorkingRow).minionId ?? 'none'}`;
+    case 'minionErrors':
+      return `${(row as MinionErrorRow).jobId} ${(row as MinionErrorRow).error}`;
+    case 'verificationFailures':
+      return `${(row as VerificationFailureRow).jobId} ${(row as VerificationFailureRow).scope ?? ''} ${(row as VerificationFailureRow).runId ?? ''}`;
+    case 'verificationWaits':
+      return `${(row as VerificationWaitingRow).jobId} ${(row as VerificationWaitingRow).scope ?? ''} ${(row as VerificationWaitingRow).requestId ?? ''}`;
+    case 'providerRecoveryPending':
+      return (row as ProviderRecoveryPendingRow).waitId;
+    case 'conflictingPrs':
+      return `${(row as ConflictingPrRow).jobId} ${(row as ConflictingPrRow).prUrl ?? ''} ${(row as ConflictingPrRow).branch ?? ''}`;
+  }
+}
+
+function digestRowsOf(digest: SilasOpsDigest, category: DigestRowCategory): readonly DigestRow[] {
+  return digest[category] as readonly DigestRow[];
+}
+
+/** The sha256 of the digest's decision-relevant content: rows by
+ * category, each projected to identity+actionable fields and sorted, so
+ * an unchanged operational state is byte-stable regardless of when it
+ * was computed or which volatile field moved (issue #217). A threshold
+ * crossing manifests as a row change — rows APPEAR when a lane crosses
+ * stall/timeout/recovery thresholds — so the fingerprint covers due
+ * thresholds by construction. */
+export function digestFingerprint(digest: SilasOpsDigest): string {
+  const byCategory: Record<string, string[]> = {};
+  for (const category of DIGEST_ROW_CATEGORIES) {
+    byCategory[category] = digestRowsOf(digest, category)
+      .map((row) => JSON.stringify(digestRowProjection(category, row)))
+      .sort();
+  }
+  return createHash('sha256').update(JSON.stringify(byCategory), 'utf8').digest('hex');
+}
+
+/** One delta entry: a full row for added/changed, the identity key for
+ * resolved (the row no longer exists to carry). */
+export interface DigestDeltaEntry {
+  readonly category: DigestRowCategory;
+  readonly key: string;
+  readonly row?: DigestRow;
+}
+
+/** Rows added, changed and resolved between two digests, keyed by
+ * category + identity (issue #217): the delta a wake prompt carries
+ * instead of the full digest. */
+export interface DigestDelta {
+  readonly added: readonly DigestDeltaEntry[];
+  readonly changed: readonly DigestDeltaEntry[];
+  readonly resolved: readonly DigestDeltaEntry[];
+}
+
+export function digestDelta(previous: SilasOpsDigest, current: SilasOpsDigest): DigestDelta {
+  const added: DigestDeltaEntry[] = [];
+  const changed: DigestDeltaEntry[] = [];
+  const resolved: DigestDeltaEntry[] = [];
+  for (const category of DIGEST_ROW_CATEGORIES) {
+    const before = new Map(
+      digestRowsOf(previous, category).map(
+        (row) => [digestRowKey(category, row), JSON.stringify(digestRowProjection(category, row))] as const,
+      ),
+    );
+    const after = new Map(
+      digestRowsOf(current, category).map(
+        (row) => [digestRowKey(category, row), { row, projection: JSON.stringify(digestRowProjection(category, row)) }] as const,
+      ),
+    );
+    for (const [key, { row, projection }] of after) {
+      const prior = before.get(key);
+      if (prior === undefined) added.push({ category, key, row });
+      else if (prior !== projection) changed.push({ category, key, row });
+    }
+    for (const [key] of before) {
+      if (!after.has(key)) resolved.push({ category, key });
+    }
+  }
+  return { added, changed, resolved };
+}
+
+/** The static operating brief (issue #217): authority orders, ops surface,
+ * verification capture helper, skills pack, recurrence policy and provider
+ * recovery — every section that does not change between wakes. Injected
+ * once per session so it stays stable and cacheable; the wake itself
+ * carries only the trigger and the digest (delta) it exists to deliver. */
+export function silasBriefSections(input: {
+  skills: readonly SkillModule[];
+  ops: { readonly baseUrl: string; readonly configPath: string };
+}): string[] {
+  return [
+    'You are the operations layer. Work inside your authority: dispatch,',
+    'track, close. Never write product code; never merge. Perkins owns',
+    'verdict authority. The owner holds every merge, everywhere — this',
+    'repository included: a merge is presented only after the',
+    'exact-final-head Perkins gate, and fallback PASS is not that',
+    'clearance. Preserve before remove; escalate novel failures to the',
+    'chief with pointers, not prose. Never act on the Gru chat session',
+    'itself.',
+    '',
+    '## Ops surface',
+    '',
+    `The service API is at ${input.ops.baseUrl}. Authenticate EVERY call with`,
+    `the pairing token stored in ${input.ops.configPath} (the [auth] token).`,
+    'Read it WITHOUT echoing it, for example:',
+    '',
+    '  TOKEN=$(sed -n \'s/^token = "\\(.*\\)"/\\1/p\' ' + input.ops.configPath + ')',
+    '  curl -sf -X POST ' + input.ops.baseUrl + '/api/dispatch/pr \\',
+    '    -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" \\',
+    '    -d \'{"job_id":"...","url":"...","by":"silas"}\'',
+    '',
+    'A 401 means re-read the token. A 4xx carries a detail message — fix the',
+    'request, never retry blind. Pass "by":"silas" so the ledger records the',
+    'action as yours.',
+    '',
+    '## Verification capture helper',
+    '',
+    'Every verification submission uses the shipped helper (never a',
+    'hand-rolled background watcher). It opens a unique exclusive sink',
+    'BEFORE the POST, streams every NDJSON frame to EOF, and writes a',
+    'receipt binding run id, head/dirty state, exit/outcome and output',
+    'length/hash. A lost connection is `unknown`, reconciled by request',
+    'identity — never replayed blind:',
+    '',
+    `  node ${CAPTURE_HELPER_PATH} run --job <job> --scope <scope> \\`,
+    `    --sink <data-dir>/captures/<job>-<scope>-<head>.ndjson \\`,
+    `    --request-id <stable-id> --expected-head <head-to-verify> \\`,
+    `    --url ${input.ops.baseUrl} --config ${input.ops.configPath}`,
+    '',
+    '## Operating skills',
+    '',
+    ...input.skills.flatMap((skill) => [`### skill: ${skill.name}`, '', skill.body, '']),
+    '## Recurrence policy (the ladder — no hard round cap)',
+    '',
+    'While blockers evolve, the loop continues: fix rounds re-enter review',
+    'without limit. A changes-requested verdict awaiting follow-through gets',
+    'at least the first fix directive per blocker; when the SAME canonical',
+    'blocker (same fingerprint) recurs across consecutive verdict rounds,',
+    'follow the advice named per blocker: directive → re-brief a fresh',
+    'minion → escalate. Escalation always beats an endless loop.',
+    '',
+    '## Provider recovery (guarded continuation claims)',
+    '',
+    'Digest rows under providerRecoveryPending name lanes whose provider',
+    'limit recovered — the sensor already verified fresh completed producer',
+    'evidence on the exact route. Claim ONE continuation per wait through',
+    'the ops surface (POST /api/silas/provider-recovery/claim with',
+    '{"wait_id":"...","by":"silas"}); the service rechecks approval,',
+    'incident currency, blockers, actor cessation, and lane state, then',
+    'resumes the interrupted session. Fan out to further waits only after',
+    'the first continuation shows actual model progress. Never ack or',
+    'dispose provider-wall notifications on the owner’s behalf — those',
+    'stay owner-held.',
+  ];
+}
+
+/** Sha256 of the rendered operating brief (issue #217): the wake prompt
+ * re-injects the brief only when this hash, the session handle, or a
+ * compaction boundary says the session may no longer hold it. */
+export function silasBriefHash(input: {
+  skills: readonly SkillModule[];
+  ops: { readonly baseUrl: string; readonly configPath: string };
+}): string {
+  return createHash('sha256').update(silasBriefSections(input).join('\n'), 'utf8').digest('hex');
 }
 
 /** Job lane record as the digest needs it (registry worktree shape).
@@ -1621,7 +1920,11 @@ export function supervisionLookup(
 
 export interface SilasDriverOptions {
   readonly slot: SilasSlot;
-  readonly ledger: DigestLedger & Pick<LedgerApi, 'appendCustomEvent'>;
+  readonly ledger: DigestLedger &
+    Pick<LedgerApi, 'appendCustomEvent'> &
+    /** Restart seeding of the wake gate (issue #217): the newest
+     * `silas.wake` event's persisted fingerprint and timestamp. */
+    Partial<Pick<LedgerApi, 'listEventsAfter'>>;
   readonly worktrees?: WorktreeListPort;
   readonly config: SilasConfig;
   /** The ops surface Silas acts through: base URL + where the pairing token lives. */
@@ -1731,6 +2034,21 @@ export class SilasDriver {
   private passRequeued = false;
   private lastPassOutcome: DeterministicPassOutcome | null = null;
   private disposed = false;
+  // Wake gate state (issue #217): the fingerprint/digest of the last
+  // DELIVERED wake, the timestamp of the newest persisted delivered event,
+  // and the { handleId, briefHash } of the last operating-brief injection.
+  // All are seeded at construction so a restart never re-wakes unchanged
+  // state.
+  private lastDeliveredFingerprint: string | null = null;
+  private lastDeliveredAt: number | null = null;
+  private lastDeliveredDigest: SilasOpsDigest | null = null;
+  private lastBriefInjection: { readonly handleId: string; readonly briefHash: string } | null = null;
+  /** Monotonic compaction counter: a compaction_end during an open wake
+   * invalidates the injection the wake is about to record, so completion
+   * must not write the marker back over the invalidation. */
+  private compactionEpoch = 0;
+  private briefWatchHandleId: string | null = null;
+  private briefUnsubscribe: (() => void) | null = null;
 
   constructor(opts: SilasDriverOptions) {
     this.opts = opts;
@@ -1739,10 +2057,44 @@ export class SilasDriver {
     this.now = opts.now ?? Date.now;
     this.setIntervalImpl = opts.setInterval ?? setInterval;
     this.clearIntervalImpl = opts.clearInterval ?? clearInterval;
+    this.seedWakeGate();
     if (opts.bus !== undefined) {
       this.unsubscribe = opts.bus.subscribe((event) => {
         if (!silasWakeEvent(event)) return;
         void this.trigger({ kind: event.kind as SilasTriggerKind, jobId: event.jobId ?? undefined });
+      });
+    }
+  }
+
+  /** Seed the wake gate from the newest persisted `silas.wake-delivered`
+   * event (issue #217): a restart must not re-wake a digest Silas already
+   * saw. The fingerprint comes from the event payload (wakes written before
+   * this change carry none — then only the delivery timestamp seeds, and
+   * the bounded safety re-look covers the gap). A read failure must never
+   * take the driver down: the gate stays unseeded, which can only wake
+   * once more, never skip forever. */
+  private seedWakeGate(): void {
+    if (this.opts.ledger.listEventsAfter === undefined) return;
+    try {
+      const [newest] = this.opts.ledger.listEventsAfter(0, {
+        order: 'desc',
+        kinds: ['silas.wake-delivered'],
+        limit: 1,
+      });
+      if (newest === undefined) return;
+      const payload =
+        newest.payload !== null && typeof newest.payload === 'object'
+          ? (newest.payload as Record<string, unknown>)
+          : {};
+      const fingerprint = payload['digest_fingerprint'];
+      if (typeof fingerprint === 'string' && fingerprint !== '') {
+        this.lastDeliveredFingerprint = fingerprint;
+      }
+      const deliveredAt = Date.parse(newest.ts);
+      if (Number.isFinite(deliveredAt)) this.lastDeliveredAt = deliveredAt;
+    } catch (error) {
+      this.log('error', 'silas wake gate could not read its seed event', {
+        error: String(error).slice(0, 300),
       });
     }
   }
@@ -1818,6 +2170,9 @@ export class SilasDriver {
       this.clearIntervalImpl(this.pollTimer);
       this.pollTimer = null;
     }
+    this.briefUnsubscribe?.();
+    this.briefUnsubscribe = null;
+    this.briefWatchHandleId = null;
     this.unsubscribe?.();
     this.disposed = true;
   }
@@ -1883,6 +2238,13 @@ export class SilasDriver {
     await this.runDeterministicPass(trigger.kind, wakeInFlight);
     if (this.disposed) return;
     if (this.wakeInFlight !== null) {
+      // A sweep never displaces a queued EVENT trigger (issue #217): the
+      // event is context Silas must see, and a sweep that then finds an
+      // unchanged digest would otherwise swallow it silently. A newer
+      // event still supersedes an older queued one (latest wins).
+      if (this.queuedTrigger !== null && this.queuedTrigger.kind !== 'sweep' && trigger.kind === 'sweep') {
+        return;
+      }
       this.queuedTrigger = trigger;
       return;
     }
@@ -2007,9 +2369,73 @@ export class SilasDriver {
     }
   }
 
-  /** Compute the digest; wake the slot only when there is something to do
-   * (sweeps skip empty digests; event wakes always deliver — the event
-   * itself is context Silas should see). */
+  /** True when an active decision's `recheckAt` passed since the last
+   * DELIVERED wake (issue #218): the decision stopped covering, so an
+   * unchanged fingerprint still warrants one look — exactly one, because
+   * the delivered wake's timestamp then postdates every already-passed
+   * recheck. Bounded paged read; a failing read is logged and answers
+   * false — the gate can over-wake, never skip forever. */
+  private decisionRecheckDue(): boolean {
+    const listDecisions = this.opts.ledger.listDecisions;
+    if (listDecisions === undefined) return false;
+    try {
+      const now = this.now();
+      const pageSize = 500;
+      for (let offset = 0; offset < 10_000; offset += pageSize) {
+        const page = listDecisions.call(this.opts.ledger, { activeOnly: true, limit: pageSize, offset });
+        for (const decision of page) {
+          if (decision.recheckAt === null) continue;
+          const due = Date.parse(decision.recheckAt);
+          if (!Number.isFinite(due) || due > now) continue;
+          if (this.lastDeliveredAt === null || due > this.lastDeliveredAt) return true;
+        }
+        if (page.length < pageSize) return false;
+      }
+      return false;
+    } catch (error) {
+      this.log('error', 'silas recheck gate could not read decisions', {
+        error: String(error).slice(0, 300),
+      });
+      return false;
+    }
+  }
+
+  /** Watch one session handle for compaction boundaries: a compacted
+   * session may no longer hold the operating brief, so the next wake must
+   * re-inject it (issue #217). One subscription per handle id; the epoch
+   * also invalidates any injection a concurrently open wake is about to
+   * record, so a compaction during a turn can never be overwritten by
+   * that turn's completion. */
+  private watchBriefCompaction(handle: AgentHandle): void {
+    if (this.briefWatchHandleId === handle.id) return;
+    this.briefUnsubscribe?.();
+    this.briefUnsubscribe = null;
+    this.briefWatchHandleId = null;
+    try {
+      this.briefUnsubscribe = handle.subscribe((event) => {
+        if (event.type === 'compaction_end') {
+          this.compactionEpoch += 1;
+          // Clear the marker: the next wake re-injects the full brief.
+          this.lastBriefInjection = null;
+        }
+      });
+      this.briefWatchHandleId = handle.id;
+    } catch (error) {
+      this.log('error', 'silas brief compaction watch could not subscribe', {
+        handleId: handle.id,
+        error: String(error).slice(0, 300),
+      });
+    }
+  }
+
+  /** Compute the digest; wake the slot only when there is something to
+   * do. Sweeps skip empty digests AND digests whose decision-relevant
+   * fingerprint is unchanged (issue #217) — unless the bounded safety
+   * re-look elapsed (`[silas] unchanged_rewake_ms`) or a recorded
+   * decision recheck passed since the last delivered wake (#218; a due
+   * recheck wakes even when the digest is empty, because the decision
+   * that stopped covering may be re-suppressing rows). Event wakes
+   * always deliver — the event itself is context Silas should see. */
   private async runWake(trigger: SilasTrigger): Promise<void> {
     let digest: SilasOpsDigest;
     try {
@@ -2030,10 +2456,35 @@ export class SilasDriver {
       return;
     }
     const actionable = digestActionCount(digest);
-    if (trigger.kind === 'sweep' && actionable === 0) {
-      this.log('info', 'silas sweep found nothing actionable', {});
-      return;
+    const fingerprint = digestFingerprint(digest);
+    if (trigger.kind === 'sweep') {
+      const recheckDue = this.decisionRecheckDue();
+      if (actionable === 0 && !recheckDue) {
+        this.log('info', 'silas sweep found nothing actionable', {});
+        return;
+      }
+      const unchanged = this.lastDeliveredFingerprint === fingerprint;
+      if (unchanged && !recheckDue) {
+        const sinceDelivered =
+          this.lastDeliveredAt === null ? Number.POSITIVE_INFINITY : Math.max(0, this.now() - this.lastDeliveredAt);
+        // unchanged_rewake_ms = 0: never re-wake an unchanged digest.
+        if (this.opts.config.unchangedRewakeMs === 0 || sinceDelivered < this.opts.config.unchangedRewakeMs) {
+          this.log('info', 'silas sweep unchanged', {
+            fingerprint: fingerprint.slice(0, 12),
+            sinceDeliveredMs: Number.isFinite(sinceDelivered) ? sinceDelivered : null,
+          });
+          return;
+        }
+      }
     }
+    // Delta rows since the last delivered wake (issue #217): null when
+    // no previous digest is held — the first wake after a restart sends
+    // the full digest once.
+    const delta = this.lastDeliveredDigest === null ? null : digestDelta(this.lastDeliveredDigest, digest);
+    // The wake marker lands BEFORE the prompt (attempt semantics — the
+    // #214 yield telemetry attributes Silas's in-turn actions to the
+    // wake that prompted them, and the board's last-wake display reads
+    // it); the DELIVERED marker with the gate fingerprint lands after.
     try {
       this.opts.ledger.appendCustomEvent({
         kind: 'silas.wake',
@@ -2043,22 +2494,70 @@ export class SilasDriver {
     } catch (error) {
       this.log('error', 'silas wake event could not be persisted', { error: String(error) });
     }
+    let handle: AgentHandle;
+    try {
+      handle = await this.opts.slot.ensure();
+    } catch (error) {
+      this.log('error', 'silas wake failed', { trigger: trigger.kind, error: String(error) });
+      return;
+    }
+    this.watchBriefCompaction(handle);
+    const briefHash = silasBriefHash({ skills: this.skills, ops: this.opts.ops });
+    const injectBrief =
+      this.lastBriefInjection === null ||
+      this.lastBriefInjection.handleId !== handle.id ||
+      this.lastBriefInjection.briefHash !== briefHash;
     const prompt = buildWakePrompt({
       digest,
       trigger,
       skills: this.skills,
       ops: this.opts.ops,
+      digestFingerprint: fingerprint,
+      ...(delta !== null ? { delta } : {}),
+      briefInjection: injectBrief ? 'full' : { hash: briefHash },
     });
+    const epochAtPrompt = this.compactionEpoch;
     try {
-      const handle = await this.opts.slot.ensure();
       await handle.prompt(prompt, { owner: 'silas-driver' });
-      this.log('info', 'silas wake delivered', { trigger: trigger.kind, actionable });
     } catch (error) {
       // A failed wake must never take the service down (unhandled
       // rejections are fatal in main): log loud; the next sweep or event
-      // retries, and the digest recomputes from the ledger anyway.
+      // retries, and the digest recomputes from the ledger anyway. The
+      // gate markers stay untouched — only a DELIVERED wake may advance
+      // them (issue #217).
       this.log('error', 'silas wake failed', { trigger: trigger.kind, error: String(error) });
+      return;
     }
+    // Delivered marker + gate seed AFTER delivery (issue #217): the event
+    // carries the fingerprint of the last DELIVERED wake, so a restart
+    // seeds exactly what Silas has already seen.
+    try {
+      this.opts.ledger.appendCustomEvent({
+        kind: 'silas.wake-delivered',
+        ...(trigger.jobId !== undefined ? { jobId: trigger.jobId } : {}),
+        payload: { trigger: trigger.kind, actionable, digest_fingerprint: fingerprint },
+      });
+    } catch (error) {
+      this.log('error', 'silas delivered-wake event could not be persisted', { error: String(error) });
+    }
+    this.lastDeliveredFingerprint = fingerprint;
+    this.lastDeliveredAt = this.now();
+    this.lastDeliveredDigest = digest;
+    // A compaction that fired during the prompt invalidated this
+    // injection before it could be recorded — leave the marker clear so
+    // the next wake re-injects the brief (the epoch guard, not the
+    // null-check race).
+    if (injectBrief && this.compactionEpoch === epochAtPrompt) {
+      this.lastBriefInjection = { handleId: handle.id, briefHash };
+    }
+    this.log('info', 'silas wake delivered', {
+      trigger: trigger.kind,
+      actionable,
+      ...(delta !== null
+        ? { delta: { added: delta.added.length, changed: delta.changed.length, resolved: delta.resolved.length } }
+        : {}),
+      brief: injectBrief ? 'injected' : 'unchanged',
+    });
   }
 }
 
@@ -2071,80 +2570,88 @@ export function buildWakePrompt(input: {
   trigger: SilasTrigger;
   skills: readonly SkillModule[];
   ops: { readonly baseUrl: string; readonly configPath: string };
+  /** Fingerprint of the digest's decision-relevant content (issue #217):
+   * rendered as its own line so telemetry can attribute every wake — full
+   * or delta — to a stable digest identity. */
+  readonly digestFingerprint?: string;
+  /** Delta rows since the last delivered wake (issue #217): when present,
+   * the prompt carries added/changed/resolved rows plus the authenticated
+   * pointer to the full digest instead of the full digest JSON. Omitted =
+   * the full digest (first wake of a session, or any caller predating the
+   * delta path). */
+  readonly delta?: DigestDelta;
+  /** Brief injection mode (issue #217): 'full' inlines the static
+   * operating brief (orders, ops surface, skills); a hash replaces the
+   * whole brief with the single unchanged-marker line (the session
+   * already holds it; the hash proves which version). Omitted = 'full'. */
+  readonly briefInjection?: 'full' | { readonly hash: string };
 }): string {
   const digestJson = JSON.stringify(input.digest, null, 2);
+  const briefSection =
+    typeof input.briefInjection === 'object' && input.briefInjection !== null
+      ? [
+          '## Operating brief unchanged',
+          '',
+          `Operating brief unchanged (hash ${input.briefInjection.hash.slice(0, 16)}) — the orders,`,
+          'ops surface, capture helper and skills injected earlier in this',
+          'session still apply. Assess ALL outstanding work through the full',
+          'digest (the pointer in the digest section below) before acting on',
+          'a delta.',
+        ]
+      : silasBriefSections(input);
+  const digestIntro =
+    input.delta === undefined
+      ? [
+          'The digest below lists every lane awaiting ops follow-through,',
+          'computed from the ledger moments ago.',
+        ]
+      : [
+          'The delta below lists the rows that changed since your last',
+          'delivered wake — added, changed and resolved. It is NOT the full',
+          'picture: assess all outstanding work through the full digest the',
+          'pointer names before acting.',
+        ];
+  const fingerprintLine =
+    input.digestFingerprint === undefined ? [] : [`Digest fingerprint: ${input.digestFingerprint}`];
+  const digestSection =
+    input.delta === undefined
+      ? ['## Digest (actionable states, JSON)', '', ...fingerprintLine, fingerprintLine.length > 0 ? [''] : [], '```json', digestJson, '```'].flat()
+      : [
+          '## Digest delta (since the last delivered wake)',
+          '',
+          ...fingerprintLine,
+          '',
+          ...(input.delta.added.length > 0
+            ? ['Added rows:', '', '```json', JSON.stringify(input.delta.added.map((e) => ({ category: e.category, ...e.row })), null, 2), '```', '']
+            : []),
+          ...(input.delta.changed.length > 0
+            ? ['Changed rows:', '', '```json', JSON.stringify(input.delta.changed.map((e) => ({ category: e.category, ...e.row })), null, 2), '```', '']
+            : []),
+          ...(input.delta.resolved.length > 0
+            ? [
+                'Resolved rows (no longer in the digest):',
+                '',
+                '```json',
+                JSON.stringify(input.delta.resolved.map((e) => ({ category: e.category, key: e.key })), null, 2),
+                '```',
+                '',
+              ]
+            : []),
+          ...(input.delta.added.length + input.delta.changed.length + input.delta.resolved.length === 0
+            ? ['No digest rows changed since the last delivered wake — this is a', 'bounded re-look or a recheck that came due.', '']
+            : []),
+          `Full digest: GET ${input.ops.baseUrl}/api/silas/digest — authenticate like`,
+          'every ops call (the same pairing token); the response is the',
+          'current computed digest JSON.',
+        ];
   return [
     `Silas ops wake — trigger: ${input.trigger.kind}${input.trigger.jobId !== undefined ? ` (job ${input.trigger.jobId})` : ''}`,
     '',
-    'You are the operations layer. The digest below lists every lane awaiting',
-    'ops follow-through, computed from the ledger moments ago. Work inside',
-    'your authority: dispatch, track, close. Never write product code; never',
-    'merge. Perkins owns verdict authority. The owner holds every merge,',
-    'everywhere — this repository included: a merge is presented only after',
-    'the exact-final-head Perkins gate, and fallback PASS is not that',
-    'clearance. Preserve before',
-    'remove; escalate novel failures to the chief with pointers, not prose.',
-    'Never act on the Gru chat session itself.',
+    ...digestIntro,
     '',
-    '## Ops surface',
+    ...briefSection,
     '',
-    `The service API is at ${input.ops.baseUrl}. Authenticate EVERY call with`,
-    `the pairing token stored in ${input.ops.configPath} (the [auth] token).`,
-    'Read it WITHOUT echoing it, for example:',
-    '',
-    '  TOKEN=$(sed -n \'s/^token = "\\(.*\\)"/\\1/p\' ' + input.ops.configPath + ')',
-    '  curl -sf -X POST ' + input.ops.baseUrl + '/api/dispatch/pr \\',
-    '    -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" \\',
-    '    -d \'{"job_id":"...","url":"...","by":"silas"}\'',
-    '',
-    'A 401 means re-read the token. A 4xx carries a detail message — fix the',
-    'request, never retry blind. Pass "by":"silas" so the ledger records the',
-    'action as yours.',
-    '',
-    '## Verification capture helper',
-    '',
-    'Every verification submission uses the shipped helper (never a',
-    'hand-rolled background watcher). It opens a unique exclusive sink',
-    'BEFORE the POST, streams every NDJSON frame to EOF, and writes a',
-    'receipt binding run id, head/dirty state, exit/outcome and output',
-    'length/hash. A lost connection is `unknown`, reconciled by request',
-    'identity — never replayed blind:',
-    '',
-    `  node ${CAPTURE_HELPER_PATH} run --job <job> --scope <scope> \\`,
-    `    --sink <data-dir>/captures/<job>-<scope>-<head>.ndjson \\`,
-    `    --request-id <stable-id> --expected-head <head-to-verify> \\`,
-    `    --url ${input.ops.baseUrl} --config ${input.ops.configPath}`,
-    '',
-    '## Operating skills',
-    '',
-    ...input.skills.flatMap((skill) => [`### skill: ${skill.name}`, '', skill.body, '']),
-    '## Digest (actionable states, JSON)',
-    '',
-    '```json',
-    digestJson,
-    '```',
-    '',
-    '## Recurrence policy (the ladder — no hard round cap)',
-    '',
-    'While blockers evolve, the loop continues: fix rounds re-enter review',
-    'without limit. A changes-requested verdict awaiting follow-through gets',
-    'at least the first fix directive per blocker; when the SAME canonical',
-    'blocker (same fingerprint) recurs across consecutive verdict rounds,',
-    'follow the advice named per blocker: directive → re-brief a fresh',
-    'minion → escalate. Escalation always beats an endless loop.',
-    '',
-    '## Provider recovery (guarded continuation claims)',
-    '',
-    'Digest rows under providerRecoveryPending name lanes whose provider',
-    'limit recovered — the sensor already verified fresh completed producer',
-    'evidence on the exact route. Claim ONE continuation per wait through',
-    'the ops surface (POST /api/silas/provider-recovery/claim with',
-    '{"wait_id":"...","by":"silas"}); the service rechecks approval,',
-    'incident currency, blockers, actor cessation, and lane state, then',
-    'resumes the interrupted session. Fan out to further waits only after',
-    'the first continuation shows actual model progress. Never ack or',
-    'dispose provider-wall notifications on the owner’s behalf — those',
-    'stay owner-held.',
+    ...digestSection,
     '',
     'Reply with a short completion note: what you did per lane, or why you',
     'left it untouched.',

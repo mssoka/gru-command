@@ -52,7 +52,12 @@ mode (never written, never migrated) and session JSONL is only streamed.
   `notifications.kind`: per-kind wake counts, conflict-only wakes (every
   notification a mechanical `github.pr-conflict*` alert — the GH-215
   target), and repeat incidents (the same notification ID waking Gru more
-  than once).
+  than once). Issue #219 adds the cost headline: wakes per day over the
+  window, and the avoided share — `gru.wake-deferred` events with reason
+  `duplicate` (the incident was already woken) or `covered` (an active
+  decision, GH-218, held the subject) over all wake demands in the
+  window. A `failed` deferral is not avoidance: the demand stayed
+  unserved and escalated.
 - **M0 (north star).** Heists finished in the window (`job.status` moving to
   `merged|done`), created→terminal lead times, non-terminal WIP at the
   window end (replayed from events, by status with age), and cost per

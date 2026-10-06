@@ -14,12 +14,15 @@ import {
   consolidatedBlockersFor,
   deliveredTargetSha,
   digestActionCount,
+  digestDelta,
+  digestFingerprint,
   followUpChangedTarget,
   loadSilasSkills,
   roundBlockerKeys,
   SAME_BLOCKER_PAIR_CAP,
   sameBlockerPairs,
   SilasDriver,
+  silasBriefHash,
   supervisionLookup,
   type BlockersForRound,
   type DeterministicPassHook,
@@ -41,7 +44,7 @@ import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb, MIGRATIONS } from '../src/ledger/db.js';
 import { BRANCH_STATE_EVENT } from '../src/dispatch/github-poll.js';
 import { DEFAULT_SILAS_CONFIG } from '../src/config.js';
-import type { AgentCapabilities, AgentHandle } from '../src/runtime/types.js';
+import type { AgentCapabilities, AgentHandle, RuntimeEvent } from '../src/runtime/types.js';
 import type { AgentSupervisionView } from '../src/supervision/supervisor.js';
 import type { EventRecord, JobDeliverable, JobRecord, RoundRecord } from '../src/ledger/api.js';
 import type { Role } from '../src/config.js';
@@ -2683,6 +2686,10 @@ describe('consolidated blockers port', () => {
             { severity: 'warning', category: 'style', title: 'meh', location: 'src/b.ts' },
             { severity: 'blocker', category: 'security', location: 'src/c.ts' },
             { severity: 'blocker', category: 'security', title: 'injection', location: 'src/d.ts:12', evidence: 'exec(userInput)' },
+            // A deferred Stage-5 follow-up is still a blocker finding in the
+            // record, but it cannot hold the PR and must not feed the
+            // recurrence ladder or a release-blocker directive.
+            { severity: 'blocker', category: 'convergence', title: 'deferred', location: 'src/d2.ts', deferredFollowup: true },
           ],
         }),
       );
@@ -2821,10 +2828,15 @@ interface DriverHarness {
   prompts: { text: string; owner?: string }[];
   bus: EventBus;
   ledger: LedgerApi & DigestLedger;
+  /** Raw handle for deterministic test-seam row timestamps. */
+  db: LedgerDb;
   /** Make every subsequent prompt hold its turn open until settle(). */
   hold: () => void;
   settle: () => void;
   failNext: (error: Error) => void;
+  /** Feed a RuntimeEvent to the session handle's subscribers (the driver
+   * watches compaction_end for the skills-once marker, issue #217). */
+  emitRuntime: (event: RuntimeEvent) => void;
   cleanup(): void;
 }
 
@@ -2832,6 +2844,7 @@ function makeDriver(opts: {
   enabled?: boolean;
   sweepIntervalMs?: number;
   pollIntervalMs?: number;
+  unchangedRewakeMs?: number;
   githubPoll?: GitHubPollPort;
   bus?: boolean;
   skills?: readonly SkillModule[];
@@ -2849,10 +2862,14 @@ function makeDriver(opts: {
   readyForSurface?: (surface: string) => boolean;
   modeForSurface?: (surface: string) => 'off' | 'shadow' | 'enforce' | null;
   blockersForRound?: BlockersForRound;
+  /** Reuse an existing ledger+harness (restart tests construct a second
+   * driver over the SAME durable state, issue #217). */
+  harness?: Harness;
 } = {}): DriverHarness {
-  const h = makeLedger();
+  const h = opts.harness ?? makeLedger();
   const prompts: { text: string; owner?: string }[] = [];
   const state: { hold?: () => Promise<void>; failWith?: Error } = {};
+  const runtimeListeners: ((event: RuntimeEvent) => void)[] = [];
   let heldResolve: (() => void) | null = null;
   const handle: AgentHandle = {
     role: 'silas' as Role,
@@ -2871,8 +2888,12 @@ function makeDriver(opts: {
     },
     async steer() {},
     async followUp() {},
-    subscribe() {
-      return () => {};
+    subscribe(listener: (event: RuntimeEvent) => void) {
+      runtimeListeners.push(listener);
+      return () => {
+        const index = runtimeListeners.indexOf(listener);
+        if (index >= 0) runtimeListeners.splice(index, 1);
+      };
     },
     health() {
       return { state: 'idle' as const, lastActivity: null, sessionFile: null };
@@ -2888,6 +2909,7 @@ function makeDriver(opts: {
       enabled: opts.enabled ?? true,
       sweepIntervalMs: opts.sweepIntervalMs ?? 0,
       pollIntervalMs: opts.pollIntervalMs ?? DEFAULT_SILAS_CONFIG.pollIntervalMs,
+      ...(opts.unchangedRewakeMs !== undefined ? { unchangedRewakeMs: opts.unchangedRewakeMs } : {}),
     },
     ops: { baseUrl: 'http://127.0.0.1:7665', configPath: '/instance/config.toml' },
     ...(opts.bus === false ? {} : { bus: h.bus }),
@@ -2908,6 +2930,7 @@ function makeDriver(opts: {
     prompts,
     bus: h.bus,
     ledger: h.ledger,
+    db: h.db,
     hold: () => {
       state.hold = () =>
         new Promise<void>((resolve) => {
@@ -2921,6 +2944,9 @@ function makeDriver(opts: {
     },
     failNext: (error: Error) => {
       state.failWith = error;
+    },
+    emitRuntime: (event: RuntimeEvent) => {
+      for (const listener of [...runtimeListeners]) listener(event);
     },
     cleanup: h.cleanup,
   };
@@ -3124,6 +3150,550 @@ describe('silas driver wakes', () => {
 // Sweep timer + bus subscription surface (injected seams)
 // ------------------------------------------------------------------
 
+// ------------------------------------------------------------------
+// Wake gate: fingerprint, delta, skills-once (issue #217)
+// ------------------------------------------------------------------
+
+describe('silas digest fingerprint (issue #217)', () => {
+  const baseDigest = (over: Partial<import('../src/dispatch/silas-driver.js').SilasOpsDigest> = {}) => ({
+    computedAt: '2026-10-05T00:00:00.000Z',
+    trigger: 'sweep',
+    deliveredWithoutPr: [
+      { jobId: 'job-a', repo: 'r', branch: 'b', lanePath: '/lane', minionSessionFile: '/sess.json', deliveredAt: '2026-10-04T00:00:00.000Z' },
+    ],
+    prWithoutReview: [],
+    verdictsAwaitingDirective: [
+      {
+        jobId: 'job-v',
+        repo: 'r',
+        roundId: 'job-v-r1',
+        roundSeq: 1,
+        verdict: 'NEEDS CHANGES',
+        blockerCount: 1,
+        blockersNote: null,
+        recurringBlockers: [
+          { category: 'correctness', title: 't', location: 'src/a.ts', fingerprint: 'correctness::src/a.ts::t', consecutiveRounds: 2, advice: 'directive' as const },
+        ],
+      },
+    ],
+    stalledWorking: [],
+    minionErrors: [],
+    verificationFailures: [],
+    verificationWaits: [],
+    providerRecoveryPending: [],
+    conflictingPrs: [],
+    ...over,
+  });
+
+  it('volatile fields never change the fingerprint; actionable fields do', () => {
+    const before = digestFingerprint(baseDigest());
+    // every volatile field moves — the fingerprint must not
+    const volatile = baseDigest({
+      computedAt: '2026-10-06T12:00:00.000Z',
+      trigger: 'job.delivered',
+      deliveredWithoutPr: [
+        { jobId: 'job-a', repo: 'r', branch: 'b', lanePath: '/other', minionSessionFile: '/other.json', deliveredAt: '2026-10-05T09:00:00.000Z' },
+      ],
+    });
+    expect(digestFingerprint(volatile)).toBe(before);
+    // identity + actionable content is what the gate compares
+    const newPr = baseDigest({
+      prWithoutReview: [{ jobId: 'job-p', repo: 'r', prUrl: 'https://example.invalid/9', priorRounds: 0 }],
+    });
+    expect(digestFingerprint(newPr)).not.toBe(before);
+  });
+
+  it('a new row, a changed verdict, or changed blocker advice each change the fingerprint', () => {
+    const before = digestFingerprint(baseDigest());
+    // a new row in any category
+    expect(
+      digestFingerprint(
+        baseDigest({
+          stalledWorking: [{ jobId: 'job-s', repo: 'r', minionId: 'm1', minionState: 'idle', lastActivity: '2026-10-01T00:00:00.000Z', idleMs: 9_999_999 }],
+        }),
+      ),
+    ).not.toBe(before);
+    // a changed verdict on the same round
+    expect(
+      digestFingerprint(
+        baseDigest({
+          verdictsAwaitingDirective: [
+            {
+              jobId: 'job-v',
+              repo: 'r',
+              roundId: 'job-v-r1',
+              roundSeq: 1,
+              verdict: 'APPROVED',
+              blockerCount: 0,
+              blockersNote: null,
+              recurringBlockers: [],
+            },
+          ],
+        }),
+      ),
+    ).not.toBe(before);
+    // changed advice / recurrence on the same blocker
+    expect(
+      digestFingerprint(
+        baseDigest({
+          verdictsAwaitingDirective: [
+            {
+              jobId: 'job-v',
+              repo: 'r',
+              roundId: 'job-v-r1',
+              roundSeq: 1,
+              verdict: 'NEEDS CHANGES',
+              blockerCount: 1,
+              blockersNote: null,
+              recurringBlockers: [
+                { category: 'correctness', title: 't', location: 'src/a.ts', fingerprint: 'correctness::src/a.ts::t', consecutiveRounds: 3, advice: 'rebrief' as const },
+              ],
+            },
+          ],
+        }),
+      ),
+    ).not.toBe(before);
+    // a longer idle on the SAME stalled row is volatile: no change
+    const stalled = (over: { idleMs: number }) =>
+      baseDigest({
+        stalledWorking: [{ jobId: 'job-s', repo: 'r', minionId: 'm1', minionState: 'idle', lastActivity: '2026-10-01T00:00:00.000Z', idleMs: over.idleMs }],
+      });
+    expect(digestFingerprint(stalled({ idleMs: 1 }))).toBe(digestFingerprint(stalled({ idleMs: 2 })));  
+  });
+
+  it('a changed blockersNote wakes: loud evidence is decision-relevant (review r1)', () => {
+    const row = (blockersNote: string | null) =>
+      baseDigest({
+        verdictsAwaitingDirective: [
+          {
+            jobId: 'job-v',
+            repo: 'r',
+            roundId: 'job-v-r1',
+            roundSeq: 1,
+            verdict: 'NEEDS CHANGES',
+            blockerCount: 1,
+            blockersNote,
+            recurringBlockers: [
+              { category: 'correctness', title: 't', location: 'src/a.ts', fingerprint: 'correctness::src/a.ts::t', consecutiveRounds: 2, advice: 'directive' as const },
+            ],
+          },
+        ],
+      });
+    expect(digestFingerprint(row(null))).not.toBe(digestFingerprint(row('consolidated report unreadable')));
+    expect(digestFingerprint(row('consolidated report unreadable'))).not.toBe(
+      digestFingerprint(row('report recovered: zero blockers parsed')),
+    );
+  });
+
+  it('every conflictingPrs field participates; a new conflict stretch is a new fingerprint', () => {
+    const row = (firstSeenAt: string, headSha: string) =>
+      baseDigest({
+        conflictingPrs: [{ jobId: 'job-c', repo: 'r', branch: 'gru/x', prNumber: 7, prUrl: 'https://example.invalid/7', headSha, firstSeenAt }],
+      });
+    expect(digestFingerprint(row('2026-10-01T00:00:00.000Z', 'aaa'))).not.toBe(
+      digestFingerprint(row('2026-10-02T00:00:00.000Z', 'aaa')),
+    );
+    expect(digestFingerprint(row('2026-10-01T00:00:00.000Z', 'aaa'))).not.toBe(
+      digestFingerprint(row('2026-10-01T00:00:00.000Z', 'bbb')),
+    );
+  });
+});
+
+describe('silas digest delta (issue #217)', () => {
+  it('reports added, changed and resolved rows keyed by category + identity', () => {
+    const previous: import('../src/dispatch/silas-driver.js').SilasOpsDigest = {
+      computedAt: '2026-10-05T00:00:00.000Z',
+      trigger: 'sweep',
+      deliveredWithoutPr: [
+        { jobId: 'job-kept', repo: 'r', branch: null, lanePath: null, minionSessionFile: null, deliveredAt: null },
+        { jobId: 'job-gone', repo: 'r', branch: null, lanePath: null, minionSessionFile: null, deliveredAt: null },
+      ],
+      prWithoutReview: [{ jobId: 'job-p', repo: 'r', prUrl: 'https://example.invalid/1', priorRounds: 1 }],
+      verdictsAwaitingDirective: [],
+      stalledWorking: [],
+      minionErrors: [],
+      verificationFailures: [],
+      verificationWaits: [],
+      providerRecoveryPending: [],
+      conflictingPrs: [],
+    };
+    const current: import('../src/dispatch/silas-driver.js').SilasOpsDigest = {
+      ...previous,
+      computedAt: '2026-10-05T00:05:00.000Z',
+      deliveredWithoutPr: [
+        // job-kept stays; job-gone resolved; job-new added
+        { jobId: 'job-kept', repo: 'r', branch: null, lanePath: null, minionSessionFile: null, deliveredAt: '2026-10-05T00:04:00.000Z' },
+        { jobId: 'job-new', repo: 'r', branch: null, lanePath: null, minionSessionFile: null, deliveredAt: null },
+      ],
+      prWithoutReview: [{ jobId: 'job-p', repo: 'r', prUrl: 'https://example.invalid/1', priorRounds: 2 }],
+    };
+    const delta = digestDelta(previous, current);
+    expect(delta.added.map((e) => `${e.category}:${e.key}`)).toEqual(['deliveredWithoutPr:job-new']);
+    expect(delta.changed.map((e) => `${e.category}:${e.key}`)).toEqual(['prWithoutReview:job-p https://example.invalid/1']);
+    expect(delta.resolved.map((e) => `${e.category}:${e.key}`)).toEqual(['deliveredWithoutPr:job-gone']);
+    // the added entry carries the full row; the resolved entry only identity
+    expect(delta.added[0]?.row).toMatchObject({ jobId: 'job-new' });
+    expect(delta.resolved[0]?.row).toBeUndefined();
+    // a volatile-only difference is NO delta at all (job-kept's deliveredAt moved)
+    expect(delta.changed.some((e) => e.key === 'job-kept')).toBe(false);
+  });
+});
+
+describe('silas sweep wake gate (issue #217)', () => {
+  it('an identical second digest produces no sweep wake; a new row produces exactly one', async () => {
+    const h = makeDriver();
+    try {
+      addJobWithDelivery(h.ledger, 'job-g1');
+      await h.driver.trigger({ kind: 'sweep' });
+      expect(h.prompts).toHaveLength(1);
+      // the identical digest (only computedAt/volatile fields moved) — no wake
+      await h.driver.trigger({ kind: 'sweep' });
+      await h.driver.trigger({ kind: 'sweep' });
+      expect(h.prompts).toHaveLength(1);
+      // a new row wakes exactly once more
+      addJobWithDelivery(h.ledger, 'job-g2');
+      await h.driver.trigger({ kind: 'sweep' });
+      expect(h.prompts).toHaveLength(2);
+      // and the new baseline also sticks
+      await h.driver.trigger({ kind: 'sweep' });
+      expect(h.prompts).toHaveLength(2);
+      // exactly two DELIVERED wake records, each with its fingerprint; the
+      // attempt markers (silas.wake) exist for telemetry, the delivered
+      // markers (silas.wake-delivered) seed the gate (review r1)
+      const delivered = h.ledger
+        .listEvents({ limit: 100 })
+        .filter((event) => event.kind === 'silas.wake-delivered');
+      expect(delivered).toHaveLength(2);
+      for (const wake of delivered) {
+        const payload = wake.payload as Record<string, unknown>;
+        expect(typeof payload['digest_fingerprint']).toBe('string');
+        expect(payload['digest_fingerprint']).toMatch(/^[0-9a-f]{64}$/u);
+      }
+      // every wake carries the prompt's fingerprint line (telemetry, r1)
+      expect(h.prompts[0]?.text).toMatch(/^Digest fingerprint: [0-9a-f]{64}$/m);
+      expect(h.prompts[1]?.text).toMatch(/^Digest fingerprint: [0-9a-f]{64}$/m);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('an event trigger with an identical digest still wakes — events are context', async () => {
+    const h = makeDriver();
+    try {
+      addJobWithDelivery(h.ledger, 'job-e1');
+      await h.driver.trigger({ kind: 'sweep' });
+      expect(h.prompts).toHaveLength(1);
+      await h.driver.trigger({ kind: 'job.minion-error', jobId: 'job-e1' });
+      expect(h.prompts).toHaveLength(2);
+      expect(h.prompts[1]?.text).toContain('trigger: job.minion-error');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('the bounded safety re-look: an unchanged digest wakes again after unchanged_rewake_ms, and 0 means never', async () => {
+    let clock = 1_750_000_000_000;
+    const h = makeDriver({ now: () => clock });
+    try {
+      addJobWithDelivery(h.ledger, 'job-r1');
+      await h.driver.trigger({ kind: 'sweep' });
+      expect(h.prompts).toHaveLength(1);
+      // well inside the 6 h window: no wake
+      clock += 60_000;
+      await h.driver.trigger({ kind: 'sweep' });
+      expect(h.prompts).toHaveLength(1);
+      // past unchanged_rewake_ms: the safety re-look fires once
+      clock += DEFAULT_SILAS_CONFIG.unchangedRewakeMs + 1;
+      await h.driver.trigger({ kind: 'sweep' });
+      expect(h.prompts).toHaveLength(2);
+      // and the window re-arms from the new delivery
+      clock += 60_000;
+      await h.driver.trigger({ kind: 'sweep' });
+      expect(h.prompts).toHaveLength(2);
+    } finally {
+      h.cleanup();
+    }
+    const never = makeDriver({ unchangedRewakeMs: 0, now: () => clock });
+    try {
+      addJobWithDelivery(never.ledger, 'job-r2');
+      await never.driver.trigger({ kind: 'sweep' });
+      expect(never.prompts).toHaveLength(1);
+      clock += 100 * DEFAULT_SILAS_CONFIG.unchangedRewakeMs;
+      await never.driver.trigger({ kind: 'sweep' });
+      expect(never.prompts).toHaveLength(1);
+    } finally {
+      never.cleanup();
+    }
+  });
+
+  it('a passed decision recheck wakes exactly once even on an unchanged digest (#218 seam)', async () => {
+    let clock = 1_750_000_000_000;
+    const h = makeDriver({ now: () => clock });
+    try {
+      addJobWithDelivery(h.ledger, 'job-d1');
+      await h.driver.trigger({ kind: 'sweep' });
+      expect(h.prompts).toHaveLength(1);
+      // a hold whose recheck is still in the future: no wake
+      h.ledger.recordDecision({
+        subject: 'job:job-d1',
+        decision: 'hold',
+        covers: ['pr-conflict'],
+        reason: 'waiting on the owner',
+        by: 'silas',
+        recheckAt: new Date(clock + 3_600_000).toISOString(),
+      });
+      clock += 60_000;
+      await h.driver.trigger({ kind: 'sweep' });
+      expect(h.prompts).toHaveLength(1);
+      // the recheck comes due AFTER the last delivered wake: one wake
+      clock += 3_600_000;
+      await h.driver.trigger({ kind: 'sweep' });
+      expect(h.prompts).toHaveLength(2);
+      // and exactly one — the passage is no longer new information
+      clock += 60_000;
+      await h.driver.trigger({ kind: 'sweep' });
+      expect(h.prompts).toHaveLength(2);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a failed wake does not advance the gate: the retry still wakes', async () => {
+    const h = makeDriver();
+    try {
+      addJobWithDelivery(h.ledger, 'job-f1');
+      h.failNext(new Error('model unreachable'));
+      await h.driver.trigger({ kind: 'sweep' });
+      expect(h.prompts).toHaveLength(0);
+      // the attempt marker exists (telemetry), the delivered marker does
+      // not (gate seed), and nothing advanced
+      const kinds = (kind: string): number =>
+        h.ledger.listEvents({ limit: 50 }).filter((event) => event.kind === kind).length;
+      expect(kinds('silas.wake')).toBe(1);
+      expect(kinds('silas.wake-delivered')).toBe(0);
+      // the digest is unchanged, but nothing was delivered — retry
+      await h.driver.trigger({ kind: 'sweep' });
+      expect(h.prompts).toHaveLength(1);
+      expect(kinds('silas.wake-delivered')).toBe(1);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a sweep never displaces a queued event trigger (review r1)', async () => {
+    const h = makeDriver();
+    try {
+      addJobWithDelivery(h.ledger, 'job-q1');
+      h.hold();
+      const first = h.driver.trigger({ kind: 'job.delivered', jobId: 'job-q1' });
+      await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
+      // the event queues mid-turn; a sweep ticks after it — the sweep must
+      // NOT replace the queued event (it could find an unchanged digest and
+      // swallow the event's context)
+      await h.driver.trigger({ kind: 'round.verdict', jobId: 'job-q1' });
+      await h.driver.trigger({ kind: 'sweep' });
+      h.settle();
+      await first;
+      await vi.waitFor(() => expect(h.prompts).toHaveLength(2));
+      expect(h.prompts[1]?.text).toContain('trigger: round.verdict');
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(h.prompts).toHaveLength(2);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a due decision recheck wakes even when the digest is empty (review r1)', async () => {
+    let clock = 1_750_000_000_000;
+    const h = makeDriver({ now: () => clock });
+    try {
+      // nothing actionable at all; a hold's recheck comes due
+      h.ledger.addJob({ id: 'job-empty', repo: 'fixture-app', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('job-empty', 'working');
+      h.ledger.recordDecision({
+        subject: 'job:job-empty',
+        decision: 'hold',
+        covers: ['pr-conflict'],
+        reason: 'waiting on the owner',
+        by: 'silas',
+        recheckAt: new Date(clock + 1_000).toISOString(),
+      });
+      await h.driver.trigger({ kind: 'sweep' });
+      expect(h.prompts).toHaveLength(0);
+      clock += 2_000;
+      await h.driver.trigger({ kind: 'sweep' });
+      expect(h.prompts).toHaveLength(1);
+      // and exactly once
+      clock += 60_000;
+      await h.driver.trigger({ kind: 'sweep' });
+      expect(h.prompts).toHaveLength(1);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe('silas wake gate restart seeding (issue #217)', () => {
+  it('a second driver over the same ledger does not re-wake the delivered digest', async () => {
+    const first = makeDriver();
+    try {
+      addJobWithDelivery(first.ledger, 'job-s1');
+      await first.driver.trigger({ kind: 'sweep' });
+      expect(first.prompts).toHaveLength(1);
+      // share the durable state; cleanup stays with `first`
+      const harness: Harness = { ledger: first.ledger, bus: first.bus, db: first.db, cleanup: () => {} };
+      const second = makeDriver({ harness });
+      try {
+        // same durable state, same fingerprint: the restart stays quiet
+        await second.driver.trigger({ kind: 'sweep' });
+        expect(second.prompts).toHaveLength(0);
+        // a row change still wakes the restarted driver
+        addJobWithDelivery(second.ledger, 'job-s2');
+        await second.driver.trigger({ kind: 'sweep' });
+        expect(second.prompts).toHaveLength(1);
+      } finally {
+        second.driver.stop();
+      }
+    } finally {
+      first.cleanup();
+    }
+  });
+
+  it('an old-format wake event (no fingerprint) re-baselines once, then the gate holds', async () => {
+    let clock = 1_750_000_000_000;
+    const h = makeDriver({ now: () => clock });
+    try {
+      // a pre-#217 wake record: payload has no digest_fingerprint, so the
+      // seed carries only the delivery timestamp — the gate cannot prove
+      // the digest unchanged and the first sweep re-baselines ONCE
+      h.ledger.appendCustomEvent({ kind: 'silas.wake', payload: { trigger: 'sweep', actionable: 3 } });
+      addJobWithDelivery(h.ledger, 'job-o1');
+      await h.driver.trigger({ kind: 'sweep' });
+      expect(h.prompts).toHaveLength(1);
+      // the NEW event carries the fingerprint: subsequent sweeps stay quiet
+      clock += 60_000;
+      await h.driver.trigger({ kind: 'sweep' });
+      expect(h.prompts).toHaveLength(1);
+      // and the safety re-look still applies from the new baseline
+      clock += DEFAULT_SILAS_CONFIG.unchangedRewakeMs + 1;
+      await h.driver.trigger({ kind: 'sweep' });
+      expect(h.prompts).toHaveLength(2);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe('silas operating brief once per session (issue #217)', () => {
+  it('injected on the first wake, a marker line afterwards, re-injected after compaction and on a brief change', async () => {
+    const skills: SkillModule[] = [{ name: 'test-skill', body: 'SKILL MARKER ONE' }];
+    const h = makeDriver({ skills });
+    try {
+      addJobWithDelivery(h.ledger, 'job-sk1');
+      await h.driver.trigger({ kind: 'job.delivered', jobId: 'job-sk1' });
+      expect(h.prompts[0]?.text).toContain('SKILL MARKER ONE');
+      // the whole static brief — orders included — is in the first wake
+      expect(h.prompts[0]?.text).toContain('## Ops surface');
+      expect(h.prompts[0]?.text).toContain('## Recurrence policy');
+      // second wake, changed digest, same handle and hash: marker only
+      addJobWithDelivery(h.ledger, 'job-sk2');
+      await h.driver.trigger({ kind: 'job.delivered', jobId: 'job-sk2' });
+      expect(h.prompts[1]?.text).not.toContain('SKILL MARKER ONE');
+      expect(h.prompts[1]?.text).not.toContain('## Ops surface');
+      expect(h.prompts[1]?.text).toContain('Operating brief unchanged (hash');
+      expect(h.prompts[1]?.text).toContain(
+        silasBriefHash({ skills, ops: { baseUrl: 'http://127.0.0.1:7665', configPath: '/instance/config.toml' } }).slice(0, 16),
+      );
+      // a compaction may have dropped the brief: the next wake re-injects
+      h.emitRuntime({ type: 'compaction_end', success: true });
+      addJobWithDelivery(h.ledger, 'job-sk3');
+      await h.driver.trigger({ kind: 'job.delivered', jobId: 'job-sk3' });
+      expect(h.prompts[2]?.text).toContain('SKILL MARKER ONE');
+      expect(h.prompts[2]?.text).toContain('## Ops surface');
+      // and exactly once: the wake after that is a marker again
+      addJobWithDelivery(h.ledger, 'job-sk4');
+      await h.driver.trigger({ kind: 'job.delivered', jobId: 'job-sk4' });
+      expect(h.prompts[3]?.text).not.toContain('SKILL MARKER ONE');
+      // a skills body change re-injects exactly once
+      skills[0] = { name: 'test-skill', body: 'SKILL MARKER TWO' };
+      addJobWithDelivery(h.ledger, 'job-sk5');
+      await h.driver.trigger({ kind: 'job.delivered', jobId: 'job-sk5' });
+      expect(h.prompts[4]?.text).toContain('SKILL MARKER TWO');
+      addJobWithDelivery(h.ledger, 'job-sk6');
+      await h.driver.trigger({ kind: 'job.delivered', jobId: 'job-sk6' });
+      expect(h.prompts[5]?.text).not.toContain('SKILL MARKER TWO');
+      expect(h.prompts[5]?.text).toContain('Operating brief unchanged (hash');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a compaction DURING an injecting wake does not record the marker (epoch guard, review r1)', async () => {
+    const skills: SkillModule[] = [{ name: 'test-skill', body: 'EPOCH SKILL MARKER' }];
+    const h = makeDriver({ skills });
+    try {
+      addJobWithDelivery(h.ledger, 'job-ep1');
+      // hold the first (brief-injecting) turn open, compact mid-turn, settle
+      h.hold();
+      const first = h.driver.trigger({ kind: 'job.delivered', jobId: 'job-ep1' });
+      await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
+      h.emitRuntime({ type: 'compaction_end', success: true });
+      h.settle();
+      await first;
+      // the completion must NOT overwrite the compaction invalidation
+      addJobWithDelivery(h.ledger, 'job-ep2');
+      await h.driver.trigger({ kind: 'job.delivered', jobId: 'job-ep2' });
+      expect(h.prompts[1]?.text).toContain('EPOCH SKILL MARKER');
+      expect(h.prompts[1]?.text).toContain('## Ops surface');
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe('silas wake prompt delta (issue #217)', () => {
+  it('the second wake carries delta rows and the digest pointer, not the full digest; a restart sends the full digest once', async () => {
+    const first = makeDriver();
+    try {
+      addJobWithDelivery(first.ledger, 'job-p1');
+      await first.driver.trigger({ kind: 'sweep' });
+      expect(first.prompts[0]?.text).toContain('## Digest (actionable states, JSON)');
+      expect(first.prompts[0]?.text).not.toContain('Digest delta');
+      // state change: job-p1 resolves (PR registered), job-p2 added
+      first.ledger.setJobPr('job-p1', 'https://git.example.invalid/o/r/pull/1');
+      addJobWithDelivery(first.ledger, 'job-p2');
+      await first.driver.trigger({ kind: 'sweep' });
+      expect(first.prompts[1]?.text).toContain('## Digest delta (since the last delivered wake)');
+      expect(first.prompts[1]?.text).toContain('Added rows:');
+      expect(first.prompts[1]?.text).toContain('job-p2');
+      expect(first.prompts[1]?.text).toContain('Resolved rows');
+      expect(first.prompts[1]?.text).toContain('job-p1');
+      expect(first.prompts[1]?.text).toContain('GET http://127.0.0.1:7665/api/silas/digest');
+      // the full digest JSON is NOT embedded anymore
+      expect(first.prompts[1]?.text).not.toContain('## Digest (actionable states, JSON)');
+      expect(first.prompts[1]?.text).not.toContain('"computedAt"');
+      // a restarted driver (no in-memory baseline) sends the full digest once
+      // share the durable state; cleanup stays with `first`
+      const harness: Harness = { ledger: first.ledger, bus: first.bus, db: first.db, cleanup: () => {} };
+      const second = makeDriver({ harness });
+      try {
+        addJobWithDelivery(second.ledger, 'job-p3');
+        await second.driver.trigger({ kind: 'sweep' });
+        expect(second.prompts[0]?.text).toContain('## Digest (actionable states, JSON)');
+        expect(second.prompts[0]?.text).not.toContain('Digest delta');
+        // and the next wake from the same process is a delta again
+        addJobWithDelivery(second.ledger, 'job-p4');
+        await second.driver.trigger({ kind: 'sweep' });
+        expect(second.prompts[1]?.text).toContain('## Digest delta (since the last delivered wake)');
+      } finally {
+        second.driver.stop();
+      }
+    } finally {
+      first.cleanup();
+    }
+  });
+});
+
 describe('silas driver sweep timer and wake kinds', () => {
   it('start schedules the configured sweep; a tick wakes actionable lanes; stop clears and unsubscribes', async () => {
     const ticks: Array<() => void> = [];
@@ -3325,13 +3895,15 @@ describe('silas deterministic pass observation (issue #163)', () => {
       const first = h.driver.trigger({ kind: 'job.delivered', jobId: 'job-open' });
       await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
 
-      // Two sweep ticks land while the prompt is unresolved. The pass runs
-      // for each (there is no in-flight pass to coalesce onto), the wake is
-      // not stacked, and no second prompt exists.
+      // Two ticks land while the prompt is unresolved — the second an
+      // event, so the queued trigger survives the unchanged-digest gate
+      // (issue #217) and the coalescing under test stays observable. The
+      // pass runs for each (there is no in-flight pass to coalesce onto),
+      // the wake is not stacked, and no second prompt exists.
       await h.driver.trigger({ kind: 'sweep' });
-      await h.driver.trigger({ kind: 'sweep' });
+      await h.driver.trigger({ kind: 'job.minion-error', jobId: 'job-open' });
       expect(h.prompts).toHaveLength(1);
-      expect(passes.map((p) => p.trigger)).toEqual(['job.delivered', 'sweep', 'sweep']);
+      expect(passes.map((p) => p.trigger)).toEqual(['job.delivered', 'sweep', 'job.minion-error']);
       expect(passes[1]?.wakeInFlight).toBe(true);
       // Every tick left a durable observation and every pass a completed
       // reconciliation; the open turn cannot hide either.
@@ -3342,7 +3914,8 @@ describe('silas deterministic pass observation (issue #163)', () => {
       expect(reconciles).toHaveLength(3);
       expect(reconciles.every((event) => (event.payload as { ok?: unknown }).ok === true)).toBe(true);
       expect((reconciles[1]?.payload as { counts?: unknown }).counts).toEqual({ examined: 1, advanced: 1 });
-      // The wake marker still means "wake start": only the first wake exists.
+      // The wake marker means wake START (issue #217 keeps the attempt
+      // marker pre-prompt for telemetry; the delivered marker lands after).
       expect(kinds(h, 'silas.wake')).toHaveLength(1);
 
       h.settle();
@@ -3374,7 +3947,9 @@ describe('silas deterministic pass observation (issue #163)', () => {
       addJobWithDelivery(h.ledger, 'job-overlap');
       const first = h.driver.trigger({ kind: 'job.delivered', jobId: 'job-overlap' });
       await vi.waitFor(() => expect(kinds(h, 'silas.tick')).toHaveLength(1));
-      const second = h.driver.trigger({ kind: 'sweep' });
+      // An event trigger (not a sweep): it must survive the unchanged-digest
+      // gate (issue #217) so the coalescing under test stays observable.
+      const second = h.driver.trigger({ kind: 'round.verdict', jobId: 'job-overlap' });
       await vi.waitFor(() => expect(kinds(h, 'silas.tick')).toHaveLength(2));
       // Both triggers are blocked on the SAME pass: one execution, zero
       // wake markers, zero completed reconciliations yet.
