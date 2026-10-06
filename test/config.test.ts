@@ -559,6 +559,7 @@ describe('supervision / logging / chat tables (E7)', () => {
       wakeMinIntervalMs: 300_000,
       wakeMinSeverity: 'info',
       wakeQuietHours: null,
+      wakeDeferCovered: true,
       morningDigestGapMs: 28_800_000,
     });
   });
@@ -584,6 +585,7 @@ describe('supervision / logging / chat tables (E7)', () => {
         'wake_min_interval_ms = 60000',
         'wake_min_severity = "error"',
         'wake_quiet_hours = "22:30-07:15"',
+        'wake_defer_covered = false',
         'morning_digest_gap_ms = 0',
         '',
       ].join('\n'),
@@ -605,6 +607,7 @@ describe('supervision / logging / chat tables (E7)', () => {
       wakeMinIntervalMs: 60_000,
       wakeMinSeverity: 'error',
       wakeQuietHours: { startMinute: 22 * 60 + 30, endMinute: 7 * 60 + 15 },
+      wakeDeferCovered: false,
       morningDigestGapMs: 0,
     });
   });

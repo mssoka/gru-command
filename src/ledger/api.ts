@@ -6267,7 +6267,16 @@ export class LedgerApi {
         }
       }
       const id = randomUUID();
-      const ts = nowIso();
+      // Monotonic created_at: two decisions inside one millisecond still
+      // order newest-first (created_at DESC, id ASC tie-breaks on random
+      // uuids) — the trigger query's "newest matching decision wins" must
+      // be deterministic, and the bounded-retry backlog must not invert.
+      const latest = this.db.prepare('SELECT MAX(created_at) AS ts FROM decisions').get() as Row | undefined;
+      const latestTs = latest?.ts === undefined || latest.ts === null ? null : str(latest.ts);
+      let ts = nowIso();
+      if (latestTs !== null && ts <= latestTs) {
+        ts = new Date(Date.parse(latestTs) + 1).toISOString();
+      }
       this.db
         .prepare(
           `INSERT INTO decisions

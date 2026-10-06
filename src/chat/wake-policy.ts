@@ -37,11 +37,15 @@ export type WakeSeverity = 'info' | 'error';
 /** Minimal routing shape the policy consumes (the ledger's union). */
 export interface WakeCandidate {
   readonly id: string;
+  /** Issue #219: the incident identity (alert kind + subject + head SHA
+   * where applicable) — a re-detected incident under a NEW notification ID
+   * carries the SAME key and must not open a second wake. */
+  readonly incidentKey: string;
   readonly routing: 'fyi' | 'action-required' | 'needs-owner';
   readonly severity: WakeSeverity;
 }
 
-export type WakeSkipReason = 'mode' | 'routing' | 'severity' | 'dedupe';
+export type WakeSkipReason = 'mode' | 'routing' | 'severity' | 'dedupe' | 'duplicate-incident';
 
 export type WakeDecision =
   | { readonly action: 'wake' }
@@ -65,7 +69,17 @@ export interface WakePolicyState {
   readonly lastFiredAt: number | null;
   /** Epoch ms of the newest attempted turn, including failed spawns/prompts. */
   readonly lastAttemptAt?: number | null;
+  /** Issue #219: incident keys already woken. Unlike `woken` IDs (pruned
+   * when the row closes), keys PERSIST across resolutions — a re-detected
+   * incident under a fresh row ID stays a duplicate. Bounded by
+   * WOKEN_INCIDENT_CAP with oldest-first eviction; a key evicted after a
+   * long quiet period may wake once more, which is honest (the incident
+   * is old) rather than harmful. */
+  readonly wokenIncidents?: readonly string[];
 }
+
+/** Maximum remembered incident keys (insertion-ordered eviction). */
+export const WOKEN_INCIDENT_CAP = 512;
 
 const SEVERITY_RANK: Readonly<Record<WakeSeverity, number>> = { info: 0, error: 1 };
 
@@ -135,6 +149,7 @@ function candidateGate(
   config: WakePolicyConfig,
   candidate: WakeCandidate,
   woken: ReadonlySet<string>,
+  wokenIncidents: { readonly has: (key: string) => boolean },
 ): WakeDecision {
   if (config.mode === 'never') return { action: 'skip', reason: 'mode' };
   const routingWakes =
@@ -143,19 +158,29 @@ function candidateGate(
   if (SEVERITY_RANK[candidate.severity] < SEVERITY_RANK[config.minSeverity]) {
     return { action: 'skip', reason: 'severity' };
   }
+  // ID dedupe (a repeated event for the same row) and incident dedupe
+  // (issue #219: a re-detected incident under a new row ID) both hold.
   if (woken.has(candidate.id)) return { action: 'skip', reason: 'dedupe' };
+  if (wokenIncidents.has(candidate.incidentKey)) {
+    return { action: 'skip', reason: 'duplicate-incident' };
+  }
   return { action: 'wake' };
 }
 
 export class WakePolicy {
   private readonly config: WakePolicyConfig;
   private readonly woken: Set<string>;
+  /** Insertion-ordered incident keys (issue #219); oldest evicted at cap. */
+  private readonly wokenIncidents: Map<string, null>;
   private lastFiredAt: number | null;
   private lastAttemptAt: number | null;
 
   constructor(config: WakePolicyConfig, state: WakePolicyState = { woken: [], lastFiredAt: null }) {
     this.config = config;
     this.woken = new Set(state.woken);
+    this.wokenIncidents = new Map(
+      (state.wokenIncidents ?? []).slice(-WOKEN_INCIDENT_CAP).map((key) => [key, null as never]),
+    );
     this.lastFiredAt = state.lastFiredAt;
     this.lastAttemptAt = state.lastAttemptAt ?? null;
   }
@@ -163,7 +188,7 @@ export class WakePolicy {
   /** Full decision for one candidate at one instant (candidate gate +
    * schedule). Does not mutate — callers claim ids with `fired()`. */
   decide(candidate: WakeCandidate, atMs: number): WakeDecision {
-    const gate = candidateGate(this.config, candidate, this.woken);
+    const gate = candidateGate(this.config, candidate, this.woken, this.wokenIncidents);
     if (gate.action !== 'wake') return gate;
     return this.scheduleDecision(atMs);
   }
@@ -193,18 +218,42 @@ export class WakePolicy {
     this.lastAttemptAt = atMs;
   }
 
-  /** Claim only IDs delivered in a successful turn. */
-  fired(ids: readonly string[], atMs: number): void {
+  /** Claim only IDs delivered in a successful turn, plus their incident
+   * keys (issue #219) so the re-detected incident cannot wake again. */
+  fired(ids: readonly string[], atMs: number, incidentKeys: readonly string[] = []): void {
     for (const id of ids) this.woken.add(id);
+    for (const key of incidentKeys) {
+      this.wokenIncidents.delete(key); // re-insert to keep recency order honest
+      this.wokenIncidents.set(key, null as never);
+      if (this.wokenIncidents.size > WOKEN_INCIDENT_CAP) {
+        const oldest = this.wokenIncidents.keys().next().value;
+        if (oldest !== undefined) this.wokenIncidents.delete(oldest);
+      }
+    }
     this.lastFiredAt = atMs;
   }
 
-  /** Terminal rows no longer need dedupe memory; live IDs never age out. */
+  /** Terminal rows no longer need ID dedupe memory; live IDs never age
+   * out. Incident keys deliberately persist (issue #219) — a resolved row
+   * does not spend its incident's key. */
   forget(id: string): boolean {
     return this.woken.delete(id);
   }
 
+  /** Issue #115: a failed accepted turn rolls its bounded-retry incidents
+   * back OUT of the dedupe state so the retry can re-claim them. The
+   * `gru.wake` receipt stays on the ledger (the turn DID open — board
+   * truth); only the wake-eligibility claim is released. */
+  forgetIncident(key: string): boolean {
+    return this.wokenIncidents.delete(key);
+  }
+
   snapshot(): WakePolicyState {
-    return { woken: [...this.woken], lastFiredAt: this.lastFiredAt, lastAttemptAt: this.lastAttemptAt };
+    return {
+      woken: [...this.woken],
+      wokenIncidents: [...this.wokenIncidents.keys()],
+      lastFiredAt: this.lastFiredAt,
+      lastAttemptAt: this.lastAttemptAt,
+    };
   }
 }

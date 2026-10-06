@@ -24,6 +24,7 @@ const BASE: WakePolicyConfig = {
 
 const candidate = (overrides: Partial<WakeCandidate> = {}): WakeCandidate => ({
   id: 'n1',
+  incidentKey: 'test.incident:subject',
   routing: 'action-required',
   severity: 'error',
   ...overrides,
@@ -198,5 +199,43 @@ describe('wake policy — quiet hours', () => {
   it('localMinuteOfDay reads the local clock', () => {
     const at = new Date('2026-09-23T14:05:00').getTime();
     expect(localMinuteOfDay(at)).toBe(14 * 60 + 5);
+  });
+
+  it('skips a re-detected incident under a NEW id: the incident key was already woken (issue #219)', () => {
+    const policy = new WakePolicy({ ...BASE, minIntervalMs: 0 });
+    expect(policy.decide(candidate({ id: 'n1', incidentKey: 'github.ci-failed:j-1:abc' }), 1_000).action).toBe('wake');
+    policy.fired(['n1'], 1_000, ['github.ci-failed:j-1:abc']);
+    // Same incident, fresh row id: no second wake.
+    expect(policy.decide(candidate({ id: 'n2', incidentKey: 'github.ci-failed:j-1:abc' }), 2_000)).toEqual({
+      action: 'skip',
+      reason: 'duplicate-incident',
+    });
+    // A different incident under the same wake still admits.
+    expect(policy.decide(candidate({ id: 'n3', incidentKey: 'github.ci-failed:j-1:def' }), 2_000).action).toBe('wake');
+  });
+
+  it('incident keys persist across restarts and across row resolution (issue #219)', () => {
+    const policy = new WakePolicy({ ...BASE, minIntervalMs: 0 });
+    policy.fired(['n1'], 1_000, ['github.ci-failed:j-1:abc']);
+    const restored = new WakePolicy(BASE, policy.snapshot());
+    expect(restored.snapshot().wokenIncidents).toEqual(['github.ci-failed:j-1:abc']);
+    expect(restored.decide(candidate({ id: 'n2', incidentKey: 'github.ci-failed:j-1:abc' }), 2_000)).toEqual({
+      action: 'skip',
+      reason: 'duplicate-incident',
+    });
+  });
+
+  it('evicts the oldest incident keys at the bounded cap (issue #219)', () => {
+    const policy = new WakePolicy({ ...BASE, minIntervalMs: 0 });
+    const keys: string[] = [];
+    for (let i = 0; i < 513; i += 1) {
+      const key = `incident:${i}`;
+      keys.push(key);
+      policy.fired([`n${i}`], 1_000 + i, [key]);
+    }
+    const snapshot = policy.snapshot();
+    expect(snapshot.wokenIncidents).toHaveLength(512);
+    expect(snapshot.wokenIncidents).not.toContain('incident:0'); // oldest evicted
+    expect(snapshot.wokenIncidents).toContain('incident:512'); // newest kept
   });
 });

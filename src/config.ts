@@ -174,6 +174,12 @@ export interface ChatConfig {
   /** Local-time quiet window (empty/off by default). Inside it, wakes
    * defer to the window's end. */
   readonly wakeQuietHours: QuietHours | null;
+  /** Issue #219 kill switch: when true (default), an incident covered by
+   * an active, basis-matched decision (issue #218) DEFERS its wake to the
+   * decision's recheck instead of opening a turn; hard floors (breakers,
+   * provider walls, needs-owner) always wake regardless. false restores
+   * pre-#219 behavior. */
+  readonly wakeDeferCovered: boolean;
   /** Morning digest gap (ms): the first delivered block after this much
    * quiet time carries a "while you were away" digest (fires, actions,
    * merges, staged PRs) so the chief catches up without the owner
@@ -939,6 +945,7 @@ export function loadConfig(
     wakeMinIntervalMs: 300_000,
     wakeMinSeverity: 'info',
     wakeQuietHours: null,
+    wakeDeferCovered: true,
     morningDigestGapMs: 28_800_000,
   };
   let worktrees: WorktreesConfig | null = null;
@@ -1171,6 +1178,7 @@ export function loadConfig(
         'wake_min_interval_ms',
         'wake_min_severity',
         'wake_quiet_hours',
+        'wake_defer_covered',
         'morning_digest_gap_ms',
       ];
       for (const key of Object.keys(table)) {
@@ -1201,6 +1209,10 @@ export function loadConfig(
           table['wake_quiet_hours'] !== undefined
             ? requireQuietHours(table['wake_quiet_hours'], file, 'chat.wake_quiet_hours')
             : chat.wakeQuietHours,
+        wakeDeferCovered:
+          table['wake_defer_covered'] !== undefined
+            ? requireBool(table['wake_defer_covered'], file, 'chat.wake_defer_covered')
+            : chat.wakeDeferCovered,
         morningDigestGapMs:
           table['morning_digest_gap_ms'] !== undefined
             ? requireNonNegativeInt(table['morning_digest_gap_ms'], file, 'chat.morning_digest_gap_ms')

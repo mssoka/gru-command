@@ -611,6 +611,29 @@ describe('computeLedgerMeasures', () => {
     ]);
   });
 
+  it('reports wakes/day and the avoided share from the avoidance stream (issue #219, #214)', () => {
+    // SINCE..UNTIL spans exactly one day (2026-10-01, see the constants).
+    const measures = computeLedgerMeasures(
+      measureInput([
+        event('gru.wake', '2026-10-01T01:00:00.000Z', { payload: { notification_ids: ['error-1'] } }),
+        event('gru.wake', '2026-10-01T05:00:00.000Z', { payload: { notification_ids: ['error-1'] } }),
+        event('gru.wake-deferred', '2026-10-01T02:00:00.000Z', { payload: { reason: 'duplicate', notification_id: 'dup-1', incident_key: 'k1' } }),
+        event('gru.wake-deferred', '2026-10-01T03:00:00.000Z', { payload: { reason: 'covered', notification_id: 'cov-1', incident_key: 'k2', decision_id: 'd1' } }),
+        event('gru.wake-deferred', '2026-10-01T04:00:00.000Z', { payload: { reason: 'failed', notification_id: 'fail-1', incident_key: 'k3' } }),
+        event('gru.wake-deferred', '2026-09-30T23:00:00.000Z', { payload: { reason: 'covered', notification_id: 'pre-window', incident_key: 'k4' } }),
+      ]),
+      [],
+    );
+    expect(measures.gruWakeCauses.wakesPerDay).toBeCloseTo(2, 9);
+    expect(measures.gruWakeCauses.avoided).toEqual({ duplicates: 1, covered: 1, share: 2 / 4 });
+  });
+
+  it('an empty window reports a null avoided share and zero wakes/day', () => {
+    const measures = computeLedgerMeasures(measureInput([]), []);
+    expect(measures.gruWakeCauses.wakesPerDay).toBe(0);
+    expect(measures.gruWakeCauses.avoided).toEqual({ duplicates: 0, covered: 0, share: null });
+  });
+
   it('counts finished heists in the window, lead times, and replays WIP to until', () => {
     const measures = computeLedgerMeasures(
       measureInput([

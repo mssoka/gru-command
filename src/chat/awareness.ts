@@ -4,8 +4,15 @@ import { join } from 'node:path';
 import type { NotifyWakeMode, QuietHours, WakeMinSeverity } from '../config.js';
 import type { BusEvent, EventBus } from '../events/bus.js';
 import type { LogLevel } from '../logger.js';
-import type { EventRecord, LedgerApi, NotificationRecord } from '../ledger/api.js';
-import { WakePolicy, type WakeCandidate } from './wake-policy.js';
+import type { DecisionRecord, EventRecord, LedgerApi, NotificationRecord } from '../ledger/api.js';
+import {
+  incidentBasisOf,
+  incidentKeyOf,
+  incidentSignalOf,
+  incidentSubjectOf,
+  isHardFloorRow,
+} from './incident.js';
+import { WakePolicy, type WakeCandidate, type WakeDecision } from './wake-policy.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -38,6 +45,28 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  *      Every opened wake is logged and appended to the ledger as
  *      `gru.wake` so the board / self-heal trackers can count them.
  *
+ *      Issue #219 reworks the wake on three axes. INCIDENT DEDUPE: the
+ *      policy claims incident KEYS (see incident.ts), so a re-detected
+ *      incident under a new notification ID opens no second wake; the
+ *      avoidance is recorded as a `gru.wake-deferred` event (reason
+ *      'duplicate'). HOLD-COVERED DEFERRAL: when the decision-memory
+ *      trigger query (#218 `coveringDecision`) reports the incident
+ *      covered by an active, basis-matched decision, the wake DEFERS —
+ *      the notification stays visible exactly as today, the deferral
+ *      records the decision id and a recheck (durable in the decision
+ *      row; the timer bound is 60 min), and the incident becomes
+ *      wake-eligible again when the recheck passes or the basis changes.
+ *      Hard floors (breakers, provider walls, `needs-owner`) never defer;
+ *      `[chat] wake_defer_covered = false` restores today's behavior.
+ *      RECEIPT-FIRST (#112): the `gru.wake` ledger append commits BEFORE
+ *      the dedupe state; a failed append parks the delivered batch as
+ *      unreceipted (never re-prompted, never re-woken) and boot
+ *      reconciliation re-appends the missing receipt exactly once.
+ *      BOUNDED FAILURE RECOVERY (#115): an accepted turn that fails later
+ *      re-arms its incidents as pending with at most two retries on the
+ *      existing backoff; persistent failure produces exactly one
+ *      truthful `needs-owner` escalation per incident.
+ *
  * The event cursor and the owner-directed morning watermark are separately
  * durable under the chat dir; wake turns never consume the owner's digest.
  * Content is derived from the ledger only — an acked or resolved notification is
@@ -59,7 +88,10 @@ export const AWARENESS_WAKE_INSTRUCTION =
   'prompt delivery alone never clears it. When the right outcome is a hold or "needs no ' +
   'action", record that decision FIRST with POST /api/decisions (subject, covers, ' +
   'basis_fingerprint, recheck_at, by: "gru") and then disposition the alert — a hold ' +
-  'recorded as state keeps the incident from re-waking you; prose does not. In all mode, ' +
+  'recorded as state keeps the incident from re-waking you; prose does not. Use the ' +
+  'subject the wake path consults: for job-scoped alert kinds (github.ci-failed:<job>:<sha>, ' +
+  'github.pr-conflict:<job>) that is "job:<job id>" with the head SHA as basis_fingerprint, ' +
+  'covers naming the signal family ("ci-failed", "pr-conflict"). In all mode, ' +
   'FYI and needs-owner rows can also wake you; do not act on or Ack an owner-only stop on the ' +
   'owner’s behalf. Escalate decisions that are theirs; if nothing is actionable, say so briefly.';
 
@@ -123,6 +155,7 @@ export type GruAwarenessLedger = Pick<
   | 'resolveNotificationById'
   | 'listJobs'
   | 'listAgents'
+  | 'coveringDecision'
 >;
 
 export interface GruAwarenessOptions {
@@ -140,6 +173,10 @@ export interface GruAwarenessOptions {
   readonly wakeMinSeverity?: WakeMinSeverity;
   /** Local-time quiet window (null/off). */
   readonly wakeQuietHours?: QuietHours | null;
+  /** Issue #219 kill switch: hold-covered deferral (`[chat]
+   * wake_defer_covered`, default ON per the #213 machine-wake ruling).
+   * false restores pre-#219 behavior: a covered incident wakes anyway. */
+  readonly wakeDeferCovered?: boolean;
   /** First-block-after-gap morning digest threshold; 0 disables. */
   readonly morningDigestGapMs?: number;
   readonly limits?: Partial<AwarenessLimits>;
@@ -157,6 +194,14 @@ interface AwarenessState {
     readonly version?: 2;
     readonly woken: readonly string[];
     readonly pending?: readonly string[];
+    /** Issue #112: wake batches whose `gru.wake` receipt append failed.
+     * The turn happened — these are NEVER re-prompted; only the receipt
+     * is owed, retried on flush and reconciled exactly once on boot. */
+    readonly unreceipted?: readonly { readonly ids: readonly string[]; readonly at: number }[];
+    /** Issue #115: failed accepted-wake attempts per notification ID.
+     * At WAKE_FAILURE_RETRIES the truthful owner escalation replaces the
+     * autonomous path for that incident. */
+    readonly wakeFailures?: Readonly<Record<string, number>>;
     /** Legacy sidecars may contain retired timeout follow-ups; never re-arm them. */
     readonly followUp?: readonly { readonly id: string; readonly dueAtMs: number }[];
     readonly lastFiredAt: number | null;
@@ -189,6 +234,20 @@ export const DEFAULT_MORNING_DIGEST_GAP_MS = 28_800_000;
 const MORNING_ACTION_KINDS = ['job.delivered', 'job.status', 'round.verdict'] as const;
 /** Bounded morning-digest lines (fires/actions/merges/staged PRs). */
 const MAX_MORNING_LINES = 6;
+/** Issue #219: an uncovered-later recheck for a hold-covered deferral is
+ * clamped to this bound even when the decision names no recheck_at — a
+ * held incident must come back on its own within bounded time. */
+export const WAKE_COVERED_RECHECK_BOUND_MS = 3_600_000;
+/** Issue #219: retries for an accepted-but-failed wake turn before the
+ * truthful owner escalation replaces the autonomous path (#115). */
+export const WAKE_FAILURE_RETRIES = 2;
+/** Issue #219: retry delay for a wake whose ledger receipt failed to
+ * append (#112) — the turn happened; only the receipt is owed. */
+const WAKE_RECEIPT_RETRY_MS = 5_000;
+/** Issue #219: cap on parked unreceipted wake batches (#112). One wake
+ * batch exists per turn, so reaching this means the ledger has been down
+ * across many turns — fail loud instead of growing the sidecar forever. */
+const MAX_UNRECEIPTED_BATCHES = 8;
 
 function payloadOf(event: EventRecord | BusEvent): Record<string, unknown> {
   const payload = event.payload;
@@ -329,6 +388,8 @@ export class GruAwareness {
   private readonly wakePolicy: WakePolicy;
   private readonly wakeMode: NotifyWakeMode;
   private readonly morningDigestGapMs: number;
+  /** Issue #219 kill switch: hold-covered deferral (default ON). */
+  private readonly coveredDeferralEnabled: boolean;
   private readonly log: Log;
   private readonly onFollowUpPosted: (row: NotificationRecord) => void;
   private readonly now: () => number;
@@ -351,6 +412,26 @@ export class GruAwareness {
   private wakeSink: (() => void) | null = null;
   /** Candidate ids waiting to be released as ONE coalesced wake. */
   private readonly pendingWakeIds: Set<string>;
+  /** Issue #112: delivered wake batches whose ledger receipt failed to
+   * append. Never re-prompted; retried on flush, reconciled once on boot. */
+  private readonly unreceipted: { readonly ids: readonly string[]; readonly at: number }[];
+  /** Issue #115: accepted-turn failure counts per notification ID. */
+  private readonly wakeFailures: Map<string, number>;
+  /** Issue #219: hold-covered deferrals awaiting their recheck, by
+   * incident key. Recomputed from the decision rows after a restart (the
+   * coverage query re-derives the same answer), so this stays memory-only. */
+  private readonly deferredRechecks = new Map<
+    string,
+    { readonly atMs: number; readonly decisionId: string; readonly notificationId: string }
+  >();
+  /** In-memory de-duplication for the `gru.wake-deferred` event stream:
+   * one avoidance event per (reason, notification id) per process — the
+   * bus can deliver created + triaged for the same row. */
+  private readonly deferredRecorded = new Set<string>();
+  private deferredTimer: ReturnType<typeof setTimeout> | null = null;
+  private deferredTimerAt: number | null = null;
+  /** Issue #112: pending retry timer for the unreceipted receipt appends. */
+  private receiptTimer: ReturnType<typeof setTimeout> | null = null;
   /** One in-flight bounded batch. Its IDs stay pending until prompt receipt. */
   private activeWakeIds: readonly string[] | null = null;
   private failedRetryAtMs = 0;
@@ -366,6 +447,7 @@ export class GruAwareness {
       throw new Error('awareness maxActionNotes must be a positive integer');
     }
     this.wakeMode = opts.wakeMode ?? 'action-required';
+    this.coveredDeferralEnabled = opts.wakeDeferCovered ?? true;
     this.morningDigestGapMs = opts.morningDigestGapMs ?? DEFAULT_MORNING_DIGEST_GAP_MS;
     this.log = opts.log ?? (() => {});
     this.onFollowUpPosted = opts.onFollowUpPosted ?? (() => {});
@@ -380,6 +462,8 @@ export class GruAwareness {
     this.lastOwnerAt = state.digest?.lastOwnerAt !== undefined ? state.digest.lastOwnerAt : this.lastDeliveredAt;
     this.lastOwnerSeq = state.digest?.lastOwnerSeq ?? state.coveredThroughSeq;
     this.pendingWakeIds = new Set(state.wake?.pending ?? []);
+    this.unreceipted = (state.wake?.unreceipted ?? []).map((batch) => ({ ids: [...batch.ids], at: batch.at }));
+    this.wakeFailures = new Map(Object.entries(state.wake?.wakeFailures ?? {}));
     this.wakePolicy = new WakePolicy(
       {
         mode: this.wakeMode,
@@ -438,10 +522,31 @@ export class GruAwareness {
     const followUp = wakeRecord['followUp'];
     const version = wakeRecord['version'];
     const lastAttemptAt = wakeRecord['lastAttemptAt'];
+    const unreceipted = wakeRecord['unreceipted'];
+    const wakeFailures = wakeRecord['wakeFailures'];
+    const validUnreceipted =
+      unreceipted === undefined ||
+      (Array.isArray(unreceipted) &&
+        unreceipted.every(
+          (batch): batch is { readonly ids: string[]; readonly at: number } =>
+            typeof batch === 'object' && batch !== null &&
+            Array.isArray((batch as { ids?: unknown }).ids) &&
+            ((batch as { ids: unknown[] }).ids).every((id) => typeof id === 'string' && id !== '') &&
+            Number.isSafeInteger((batch as { at?: unknown }).at) &&
+            (batch as { at: number }).at >= 0,
+        ));
+    const validWakeFailures =
+      wakeFailures === undefined ||
+      (typeof wakeFailures === 'object' && wakeFailures !== null && !Array.isArray(wakeFailures) &&
+        Object.entries(wakeFailures).every(
+          ([id, count]) => id !== '' && typeof count === 'number' && Number.isSafeInteger(count) && count > 0,
+        ));
     if (
       !Array.isArray(woken) ||
       !woken.every((id): id is string => typeof id === 'string' && id !== '') ||
       !(pending === undefined || (Array.isArray(pending) && pending.every((id): id is string => typeof id === 'string' && id !== ''))) ||
+      !validUnreceipted ||
+      !validWakeFailures ||
       !(followUp === undefined || (Array.isArray(followUp) && followUp.every((entry): entry is { id: string; dueAtMs: number } =>
         typeof entry === 'object' && entry !== null && typeof (entry as { id?: unknown }).id === 'string' &&
         (entry as { id: string }).id !== '' && Number.isSafeInteger((entry as { dueAtMs?: unknown }).dueAtMs) &&
@@ -511,6 +616,8 @@ export class GruAwareness {
       lastFiredAt: version === 2 ? lastFiredAt : null,
       lastAttemptAt: version === 2 && typeof lastAttemptAt === 'number' ? lastAttemptAt : null,
       ...(pending !== undefined ? { pending: pending as string[] } : {}),
+      ...(unreceipted !== undefined ? { unreceipted: unreceipted as { ids: string[]; at: number }[] } : {}),
+      ...(wakeFailures !== undefined ? { wakeFailures: wakeFailures as Record<string, number> } : {}),
       ...(followUp !== undefined ? { followUp: followUp as { id: string; dueAtMs: number }[] } : {}),
     }, ...(digest !== undefined ? { digest } : {}),
     ...(attention !== undefined ? { attention } : {}) };
@@ -520,6 +627,7 @@ export class GruAwareness {
    * Existing machine-routed rows remain Gru's backlog, not owner bell items. */
   setWakeSink(sink: () => void): void {
     this.wakeSink = sink;
+    this.reconcileUnreceiptedReceipts();
     this.reconcileWakeReceipts();
     this.seedBacklog();
     this.flushPendingWakes();
@@ -529,6 +637,11 @@ export class GruAwareness {
   dispose(): void {
     this.disposed = true;
     this.cancelWakeTimer();
+    if (this.deferredTimer !== null) clearTimeout(this.deferredTimer);
+    this.deferredTimer = null;
+    this.deferredTimerAt = null;
+    if (this.receiptTimer !== null) clearTimeout(this.receiptTimer);
+    this.receiptTimer = null;
   }
 
   /**
@@ -731,9 +844,37 @@ export class GruAwareness {
   }
 
   /** If chat/spawn barriers crossed into quiet hours, release the batch
-   * back to its durable pending set and arm the policy's future deadline. */
+   * back to its durable pending set and arm the policy's future deadline.
+   * Issue #102: this is ALSO the admission boundary — it runs after every
+   * awaited spawn, so every batch member is re-checked against the row
+   * state and the hold coverage HERE, not only when the batch was
+   * composed. Rows that closed during the spawn drop out silently; rows a
+   * decision now covers move to a covered deferral (with its recheck);
+   * a batch with no eligible member left cancels the turn. */
   admitWake(): boolean {
     if (this.activeWakeIds === null) return false;
+    const stillEligible: string[] = [];
+    for (const id of this.activeWakeIds) {
+      const row = this.ledger.getNotification(id);
+      if (row === null || row.ackedAt !== null || row.resolvedAt !== null || this.isReceiptNotification(row.agentId)) {
+        continue;
+      }
+      const covering = this.coverageFor(row);
+      if (covering !== null) {
+        this.deferCoveredWake(row, covering);
+        continue;
+      }
+      stillEligible.push(id);
+    }
+    if (stillEligible.length === 0) {
+      // Nothing survived revalidation: no wake without eligible IDs
+      // (issue #102). The batch members are already durably pending
+      // (closed ones are dropped by the next prune), so nothing strands.
+      this.activeWakeIds = null;
+      this.persistWakeState();
+      return false;
+    }
+    this.activeWakeIds = stillEligible;
     const decision = this.wakePolicy.scheduleDecision(this.now());
     if (decision.action !== 'defer') return true;
     this.activeWakeIds = null;
@@ -749,7 +890,11 @@ export class GruAwareness {
   }
 
   /** Wake receipt at accepted turn_start: `gru.wake` records delivery, not
-   * action or resolution. A pre-acceptance failure retains pending IDs. */
+   * action or resolution. A pre-acceptance failure retains pending IDs.
+   * Issue #112: the receipt commits BEFORE the dedupe state — a failed
+   * append parks the delivered batch as unreceipted (never re-prompted;
+   * the append is retried, and boot reconciliation repairs the gap) so
+   * board truth and the sidecar can never disagree silently. */
   noteWakeOutcome(ok: boolean, detail?: string, injection?: AwarenessInjection): void {
     if (this.disposed) return;
     const active = this.activeWakeIds ?? [];
@@ -757,16 +902,37 @@ export class GruAwareness {
     this.activeWakeIds = null;
     this.prunePending();
     if (ok && delivered.length > 0) {
-      for (const id of delivered) this.pendingWakeIds.delete(id);
       const at = this.now();
-      this.wakePolicy.fired(delivered, at);
+      const batch = { ids: delivered, at };
+      if (!this.appendWakeReceipt(batch, false)) {
+        if (this.unreceipted.length >= MAX_UNRECEIPTED_BATCHES) {
+          throw new Error(
+            `gru wake receipt appends keep failing — ${this.unreceipted.length} unreconciled wake batches exceed the sidecar cap; inspect the ledger`,
+          );
+        }
+        this.unreceipted.push(batch);
+        this.log('error', 'gru wake receipt append failed — parked as unreceipted, retrying', {
+          notification_ids: delivered,
+        });
+        this.persistWakeState();
+        this.scheduleReceiptRetry();
+        return;
+      }
+      // NOTE: wakeFailures deliberately survives acceptance (issue #115):
+      // acceptance fires at turn START, before the turn body can fail —
+      // clearing here would reset the bounded-retry count every cycle.
+      // The debt dies when the row resolves (onBusEvent), when pruning
+      // drops a closed row, or when the escalation spends it.
+      for (const id of delivered) {
+        this.pendingWakeIds.delete(id);
+      }
+      const keys = delivered
+        .map((id) => this.ledger.getNotification(id))
+        .filter((row): row is NotificationRecord => row !== null)
+        .map((row) => incidentKeyOf(row));
+      this.wakePolicy.fired(delivered, at, keys);
       this.failedRetryAtMs = 0;
       this.log('info', 'gru wake opened', { notification_ids: delivered, count: delivered.length, mode: this.wakeMode });
-      try {
-        this.ledger.appendCustomEvent({ kind: 'gru.wake', payload: { notification_ids: delivered, count: delivered.length, mode: this.wakeMode } });
-      } catch (error) {
-        this.log('error', 'gru wake ledger event failed', { error: String(error) });
-      }
       this.persistWakeState();
       this.flushPendingWakes();
       return;
@@ -784,10 +950,41 @@ export class GruAwareness {
   }
 
   /** The block already reached Gru: retain its receipt and deadline even
-   * when the remainder of the turn fails. Never re-wake the same ID. */
+   * when the remainder of the turn fails. Issue #115: the incidents go
+   * back to the pending set with a BOUNDED retry on the existing backoff
+   * — their wake claim (id + incident key) rolls back so the retry can
+   * re-claim; the receipt stays (the turn DID open). Once the bound is
+   * spent, exactly one truthful needs-owner escalation per incident
+   * replaces the autonomous path (owner stops are never self-armed by
+   * machines — the escalation is a notice, not a breaker). */
   noteWakeTurnFailure(detail: string, injection: AwarenessInjection): void {
     if (this.disposed) return;
-    this.recordWakeFailure(detail, injection.notificationIds ?? []);
+    const ids = injection.notificationIds ?? [];
+    this.recordWakeFailure(detail, ids);
+    const retried: string[] = [];
+    const escalated: string[] = [];
+    for (const id of ids) {
+      const count = (this.wakeFailures.get(id) ?? 0) + 1;
+      if (count > WAKE_FAILURE_RETRIES) {
+        this.wakeFailures.delete(id);
+        escalated.push(id);
+      } else {
+        this.wakeFailures.set(id, count);
+        retried.push(id);
+      }
+    }
+    if (retried.length > 0) {
+      for (const id of retried) {
+        this.pendingWakeIds.add(id);
+        const row = this.ledger.getNotification(id);
+        this.wakePolicy.forget(id);
+        if (row !== null) this.wakePolicy.forgetIncident(incidentKeyOf(row));
+      }
+      this.persistWakeState();
+      this.failedRetryAtMs = this.now() + 5_000;
+      this.flushPendingWakes();
+    }
+    for (const id of escalated) this.escalateFailedWake(id, detail);
   }
 
   /** Unsafe recovery cannot open a Gru turn. Preserve the pending batch,
@@ -831,6 +1028,151 @@ export class GruAwareness {
     } catch (error) {
       this.log('error', 'gru wake failure event failed', { error: String(error) });
     }
+  }
+
+  /** Issue #115 terminal path: exactly one truthful needs-owner escalation
+   * per incident whose bounded retries are spent. Idempotent by
+   * escalation notification id — a repeat failure never spams the bell. */
+  private escalateFailedWake(id: string, detail: string): void {
+    const row = this.ledger.getNotification(id);
+    if (row === null || row.ackedAt !== null || row.resolvedAt !== null) return;
+    if (this.pendingWakeIds.delete(id)) this.persistWakeState();
+    this.recordDeferred(
+      { id, incidentKey: incidentKeyOf(row), routing: row.routing, severity: row.severity },
+      'failed',
+      null,
+    );
+    const escalationId = `gru-wake-failed:${id}`;
+    try {
+      const existing = this.ledger.getNotification(escalationId);
+      if (existing !== null && (existing.kind !== `gru.wake-failed-escalation.${id}` || existing.routing !== 'needs-owner')) {
+        throw new Error(`Gru failed-wake id ${escalationId} is already assigned to another notification`);
+      }
+      if (existing === null) {
+        const posted = this.ledger.recordNotification({
+          id: escalationId,
+          kind: `gru.wake-failed-escalation.${id}`,
+          routing: 'needs-owner',
+          severity: 'error',
+          title: `Gru wake turn failed repeatedly: ${row.title}`,
+          detail:
+            `Autonomous wake retries (${WAKE_FAILURE_RETRIES}) for notification ${id} failed; last error: ${detail}. ` +
+            'The machine alert remains open — this stop replaces the autonomous path until you act.',
+        });
+        try { this.onFollowUpPosted(posted); } catch (error) {
+          this.log('error', 'gru failed-wake chat notice failed', { notification_id: id, error: String(error) });
+        }
+      }
+    } catch (error) {
+      this.log('error', 'gru failed-wake owner escalation failed; the machine alert stays open for retry', {
+        notification_id: id,
+        error: String(error),
+      });
+    }
+  }
+
+  /** Issue #112: append ONE wake receipt. Never throws — the boolean tells
+   * the caller whether the ledger took it. `reconciled` marks a boot-time
+   * repair so the board can tell the two apart. */
+  private appendWakeReceipt(batch: { readonly ids: readonly string[]; readonly at: number }, reconciled: boolean): boolean {
+    try {
+      this.ledger.appendCustomEvent({
+        kind: 'gru.wake',
+        payload: {
+          notification_ids: batch.ids,
+          count: batch.ids.length,
+          mode: this.wakeMode,
+          ...(reconciled ? { reconciled: true } : {}),
+          wake_at: new Date(batch.at).toISOString(),
+        },
+      });
+      return true;
+    } catch (error) {
+      this.log('error', 'gru wake ledger event failed', { error: String(error) });
+      return false;
+    }
+  }
+
+  private scheduleReceiptRetry(): void {
+    if (this.disposed || this.receiptTimer !== null) return;
+    const timer = setTimeout(() => {
+      this.receiptTimer = null;
+      this.retryUnreceiptedReceipts();
+    }, WAKE_RECEIPT_RETRY_MS);
+    (timer as { unref?: () => void }).unref?.();
+    this.receiptTimer = timer;
+  }
+
+  /** Retry the parked receipt appends (issue #112). On success the batch
+   * graduates to the normal claimed state — the delivery timestamp stays
+   * the ORIGINAL wake time, never the retry. */
+  private retryUnreceiptedReceipts(): void {
+    if (this.disposed) return;
+    let changed = false;
+    while (this.unreceipted.length > 0) {
+      const batch = this.unreceipted[0] as { readonly ids: readonly string[]; readonly at: number };
+      if (!this.appendWakeReceipt(batch, false)) break;
+      this.unreceipted.shift();
+      this.claimDeliveredBatch(batch);
+      changed = true;
+    }
+    if (changed) this.persistWakeState();
+  }
+
+  /** Issue #112 boot reconciliation: a wake batch parked as unreceipted is
+   * repaired exactly once — if the ledger provably holds the receipt
+   * (same id set at/after the wake), the parked copy is dropped; if not,
+   * the receipt is appended here. Either way the ids are claimed: never a
+   * duplicate turn, never a lost board total. */
+  private reconcileUnreceiptedReceipts(): void {
+    if (this.unreceipted.length === 0) return;
+    const receipts = this.wakeReceiptsSince(this.unreceipted[0]?.at ?? 0);
+    let changed = false;
+    while (this.unreceipted.length > 0) {
+      const batch = this.unreceipted[0] as { readonly ids: readonly string[]; readonly at: number };
+      const delivered = receipts.find(
+        (ids) => ids.length === batch.ids.length && [...ids].sort().join('\u0000') === [...batch.ids].sort().join('\u0000'),
+      );
+      if (delivered === undefined && !this.appendWakeReceipt(batch, true)) break;
+      this.unreceipted.shift();
+      this.claimDeliveredBatch(batch);
+      changed = true;
+    }
+    if (changed) this.persistWakeState();
+  }
+
+  /** Claim a delivered batch in the dedupe state (ids + incident keys).
+   * wakeFailures survives here too (see noteWakeOutcome). */
+  private claimDeliveredBatch(batch: { readonly ids: readonly string[]; readonly at: number }): void {
+    for (const id of batch.ids) {
+      this.pendingWakeIds.delete(id);
+    }
+    const keys = batch.ids
+      .map((id) => this.ledger.getNotification(id))
+      .filter((row): row is NotificationRecord => row !== null)
+      .map((row) => incidentKeyOf(row));
+    this.wakePolicy.fired(batch.ids, batch.at, keys);
+  }
+
+  /** The id sets of `gru.wake` events at/after `sinceMs` (issue #112
+   * reconciliation probe). */
+  private wakeReceiptsSince(sinceMs: number): readonly string[][] {
+    const sinceIso = new Date(Math.max(0, sinceMs - 60_000)).toISOString();
+    const receipts: string[][] = [];
+    let cursor = 0;
+    for (;;) {
+      const page = this.ledger.listEventsAfter(cursor, { kinds: ['gru.wake'], limit: 500 });
+      for (const event of page) {
+        cursor = event.seq;
+        if (event.ts < sinceIso) continue;
+        const ids = payloadOf(event)['notification_ids'];
+        if (Array.isArray(ids) && ids.every((id) => typeof id === 'string' && id !== '')) {
+          receipts.push(ids as string[]);
+        }
+      }
+      if (page.length < 500) break;
+    }
+    return receipts;
   }
 
   private render(
@@ -1031,7 +1373,13 @@ export class GruAwareness {
   private persist(): void {
     const state: AwarenessState = {
       coveredThroughSeq: this.cursor,
-      wake: { version: 2, ...this.wakePolicy.snapshot(), pending: [...this.pendingWakeIds] },
+      wake: {
+        version: 2,
+        ...this.wakePolicy.snapshot(),
+        pending: [...this.pendingWakeIds],
+        ...(this.unreceipted.length > 0 ? { unreceipted: this.unreceipted.map((batch) => ({ ids: [...batch.ids], at: batch.at })) } : {}),
+        ...(this.wakeFailures.size > 0 ? { wakeFailures: Object.fromEntries(this.wakeFailures) } : {}),
+      },
       digest: { lastDeliveredAt: this.lastDeliveredAt, lastOwnerAt: this.lastOwnerAt, lastOwnerSeq: this.lastOwnerSeq },
       attention: { machineOffset: this.attentionRotation.machine, ownerOffset: this.attentionRotation.owner },
     };
@@ -1059,8 +1407,15 @@ export class GruAwareness {
       const closedId = textOf(payloadOf(event)['id']);
       if (closedId !== null) {
         const row = this.ledger.getNotification(closedId);
+        // Issue #115: a closed row needs no failure bookkeeping, and its
+        // recorded deferrals/escalations must not re-fire stale guards.
+        // (Mutate BEFORE the persist so the sidecar never keeps a spent debt.)
+        const hadFailure = this.wakeFailures.delete(closedId);
+        for (const [key, entry] of this.deferredRechecks) {
+          if (entry.notificationId === closedId) this.deferredRechecks.delete(key);
+        }
         const wasDelivered = this.wakePolicy.forget(closedId);
-        if (wasDelivered) this.persistWakeState();
+        if (wasDelivered || hadFailure) this.persistWakeState();
         // Close any historical timeout follow-up on explicit Gru disposition.
         if (row?.routing === 'action-required') {
           const followUp = this.ledger.getNotification(this.followUpId(closedId));
@@ -1085,29 +1440,192 @@ export class GruAwareness {
       if (this.pendingWakeIds.delete(row.id)) this.persistWakeState();
       return;
     }
-    this.considerCandidate({ id: row.id, routing: row.routing, severity: row.severity });
+    this.considerCandidate({
+      id: row.id,
+      incidentKey: incidentKeyOf(row),
+      routing: row.routing,
+      severity: row.severity,
+    });
   }
 
-  /** Route/severity/dedupe gate, then claim or defer — never fire twice for
-   * the same id, never fire through the cap of the rate limit. */
-  private considerCandidate(candidate: WakeCandidate): void {
+  /** The shared admission path (issue #219): the policy gates (mode,
+   * routing, severity, ID + incident dedupe), then the hold-coverage
+   * query. 'skip' and 'deferred' end the candidate; 'admit' carries the
+   * schedule decision for the caller's batching (bus events flush
+   * immediately; the boot backlog flushes once). */
+  private admitPath(
+    candidate: WakeCandidate,
+  ): { readonly action: 'skip' | 'deferred' } | { readonly action: 'admit'; readonly decision: WakeDecision } {
+    // An unreceipted wake (issue #112) already delivered these IDs — a
+    // replayed event must not open a duplicate turn while the receipt is
+    // still owed.
+    if (this.unreceipted.some((batch) => batch.ids.includes(candidate.id))) {
+      this.log('debug', 'gru wake suppressed — delivered batch awaits its receipt', {
+        notification_id: candidate.id,
+      });
+      return { action: 'skip' };
+    }
     const decision = this.wakePolicy.decide(candidate, this.now());
     if (decision.action === 'skip') {
+      // Issue #219: a re-detected incident under a NEW row id is the
+      // avoidance signal the board reports — record it once per row.
+      if (decision.reason === 'duplicate-incident') this.recordDeferred(candidate, 'duplicate', null);
       this.log('debug', 'gru wake suppressed', {
         notification_id: candidate.id,
+        incident_key: candidate.incidentKey,
         routing: candidate.routing,
         severity: candidate.severity,
         reason: decision.reason,
       });
-      return;
+      return { action: 'skip' };
     }
+    const row = this.ledger.getNotification(candidate.id);
+    const covering = row !== null ? this.coverageFor(row) : null;
+    if (covering !== null) {
+      this.deferCoveredWake(row as NotificationRecord, covering);
+      return { action: 'deferred' };
+    }
+    return { action: 'admit', decision };
+  }
+
+  /** Route/severity/dedupe gate, then cover/claim or defer — never fire
+   * twice for the same id or incident, never fire through the cap of the
+   * rate limit, and never wake an incident a current decision covers
+   * (issue #219 hold-covered deferral; hard floors never defer). */
+  private considerCandidate(candidate: WakeCandidate): void {
+    const path = this.admitPath(candidate);
+    if (path.action !== 'admit') return;
     this.pendingWakeIds.add(candidate.id);
     this.persistWakeState();
-    if (decision.action === 'wake') {
+    if (path.decision.action === 'wake') {
       this.flushPendingWakes();
       return;
     }
-    this.scheduleWake(decision.retryAtMs, decision.reason);
+    if (path.decision.action === 'defer') {
+      this.scheduleWake(path.decision.retryAtMs, path.decision.reason);
+    }
+  }
+
+  /** The hold-coverage query for one open row (issue #218 + #219): null
+   * when the row may wake — deferral disabled, a hard floor, or no active
+   * basis-matched decision covers its (subject, signal). */
+  private coverageFor(row: NotificationRecord): DecisionRecord | null {
+    if (!this.coveredDeferralEnabled) return null;
+    if (isHardFloorRow(row)) return null;
+    try {
+      return this.ledger.coveringDecision({
+        subject: incidentSubjectOf(row),
+        signal: incidentSignalOf(row),
+        basis: incidentBasisOf(row),
+      });
+    } catch (error) {
+      // A malformed decision row must not take the wake path down: treat
+      // coverage as absent (fail toward waking) and leave the failure loud.
+      this.log('error', 'gru wake coverage query failed — waking', {
+        notification_id: row.id,
+        error: String(error),
+      });
+      return null;
+    }
+  }
+
+  /** Hold-covered deferral (issue #219): the notification stays visible
+   * exactly as today; the wake is deferred to the decision's recheck (or
+   * the 60-minute bound) and recorded once on the board's avoidance
+   * stream. When the recheck passes or the basis changes, the coverage
+   * query stops answering and the incident is wake-eligible again. */
+  private deferCoveredWake(row: NotificationRecord, covering: DecisionRecord): void {
+    this.recordDeferred(
+      { id: row.id, incidentKey: incidentKeyOf(row), routing: row.routing, severity: row.severity },
+      'covered',
+      covering.id,
+    );
+    const recheckFromDecision =
+      covering.recheckAt !== null ? Date.parse(covering.recheckAt) : Number.NaN;
+    const recheckAtMs =
+      Number.isFinite(recheckFromDecision)
+        ? Math.min(recheckFromDecision, this.now() + WAKE_COVERED_RECHECK_BOUND_MS)
+        : this.now() + WAKE_COVERED_RECHECK_BOUND_MS;
+    this.deferredRechecks.set(incidentKeyOf(row), {
+      atMs: Math.max(recheckAtMs, this.now() + 1),
+      decisionId: covering.id,
+      notificationId: row.id,
+    });
+    this.log('info', 'gru wake deferred — covered by an active decision', {
+      notification_id: row.id,
+      incident_key: incidentKeyOf(row),
+      decision_id: covering.id,
+      recheck_at: new Date(recheckAtMs).toISOString(),
+    });
+    this.armDeferredRecheck();
+  }
+
+  /** Append the board's avoidance record (issue #219): one
+   * `gru.wake-deferred` event per (reason, notification id) per process —
+   * the bus can deliver created + triaged for the same row. */
+  private recordDeferred(
+    candidate: Pick<WakeCandidate, 'id' | 'incidentKey' | 'routing' | 'severity'>,
+    reason: 'covered' | 'duplicate' | 'failed',
+    decisionId: string | null,
+  ): void {
+    const guard = `${reason}:${candidate.id}`;
+    if (this.deferredRecorded.has(guard)) return;
+    this.deferredRecorded.add(guard);
+    try {
+      this.ledger.appendCustomEvent({
+        kind: 'gru.wake-deferred',
+        payload: {
+          reason,
+          notification_id: candidate.id,
+          incident_key: candidate.incidentKey,
+          ...(decisionId !== null ? { decision_id: decisionId } : {}),
+        },
+      });
+    } catch (error) {
+      this.deferredRecorded.delete(guard);
+      this.log('error', 'gru wake-deferred event failed', { error: String(error) });
+    }
+  }
+
+  /** Release the earliest covered-deferral recheck: re-run the incident
+   * through the ordinary admission path. The coverage query decides — a
+   * re-hold defers again, a passed recheck or changed basis wakes. */
+  private armDeferredRecheck(): void {
+    if (this.disposed) return;
+    let earliest: number | null = null;
+    for (const entry of this.deferredRechecks.values()) {
+      if (earliest === null || entry.atMs < earliest) earliest = entry.atMs;
+    }
+    if (earliest === null) return;
+    if (this.deferredTimer !== null && this.deferredTimerAt !== null && this.deferredTimerAt <= earliest) return;
+    if (this.deferredTimer !== null) clearTimeout(this.deferredTimer);
+    const delay = Math.min(MAX_TIMER_DELAY_MS, Math.max(0, earliest - this.now()));
+    this.deferredTimerAt = earliest;
+    const timer = setTimeout(() => {
+      this.deferredTimer = null;
+      this.deferredTimerAt = null;
+      this.releaseCoveredRechecks();
+    }, delay);
+    (timer as { unref?: () => void }).unref?.();
+    this.deferredTimer = timer;
+  }
+
+  private releaseCoveredRechecks(): void {
+    const now = this.now();
+    const due = [...this.deferredRechecks.entries()].filter(([, entry]) => entry.atMs <= now);
+    for (const [key, entry] of due) {
+      this.deferredRechecks.delete(key);
+      const row = this.ledger.getNotification(entry.notificationId);
+      if (row === null || row.ackedAt !== null || row.resolvedAt !== null) continue;
+      if (this.isReceiptNotification(row.agentId)) continue;
+      this.considerCandidate({
+        id: row.id,
+        incidentKey: incidentKeyOf(row),
+        routing: row.routing,
+        severity: row.severity,
+      });
+    }
+    this.armDeferredRecheck();
   }
 
   private followUpId(id: string): string {
@@ -1120,7 +1638,12 @@ export class GruAwareness {
 
   /** Ledger receipts survive a torn or failed awareness.json write. Replay
    * every successful delivery before backlog admission so restart cannot
-   * open a second autonomous turn for an already-delivered open ID. */
+   * open a second autonomous turn for an already-delivered open ID. The
+   * replay claims incident keys too (issue #219): a receipt for a row
+   * spends its incident's key exactly as a live wake would. One deliberate
+   * exception (issue #115): ids sitting in bounded failed-turn retry are
+   * unclaimed ON PURPOSE — their receipt records the failed turn, the
+   * retry still owes an autonomous attempt. */
   private reconcileWakeReceipts(): void {
     let cursor = 0;
     let changed = false;
@@ -1132,12 +1655,21 @@ export class GruAwareness {
         const ids = payloadOf(event)['notification_ids'];
         if (!Array.isArray(ids) || !ids.every((id) => typeof id === 'string' && id !== '')) continue;
         const missing = (ids as string[]).filter((id) => {
+          // Issue #115: an id in bounded failed-turn retry is unclaimed ON
+          // PURPOSE while it waits in pending — its receipt records the
+          // failed turn, the retry still owes an autonomous attempt. A
+          // debt WITHOUT a pending id is a recovered turn; claim normally.
+          if (this.wakeFailures.has(id) && this.pendingWakeIds.has(id)) return false;
           const row = this.ledger.getNotification(id);
           return row !== null && row.ackedAt === null && row.resolvedAt === null && !known.has(id);
         });
         if (missing.length === 0) continue;
         for (const id of missing) known.add(id);
-        this.wakePolicy.fired(missing, Math.max(this.wakePolicy.snapshot().lastFiredAt ?? 0, Date.parse(event.ts) || 0));
+        const keys = missing
+          .map((id) => this.ledger.getNotification(id))
+          .filter((row): row is NotificationRecord => row !== null)
+          .map((row) => incidentKeyOf(row));
+        this.wakePolicy.fired(missing, Math.max(this.wakePolicy.snapshot().lastFiredAt ?? 0, Date.parse(event.ts) || 0), keys);
         changed = true;
       }
       if (page.length < 500) break;
@@ -1146,7 +1678,10 @@ export class GruAwareness {
   }
 
   /** Seed unresolved rows that predate boot. The normal mode filters
-   * machine routing in SQL; explicit all mode includes FYI/owner rows. */
+   * machine routing in SQL; explicit all mode includes FYI/owner rows.
+   * Seeding goes through the ordinary admission path (issue #219): a seed
+   * whose incident is a duplicate or whose subject a decision covers
+   * defers exactly as a fresh bus-event candidate would. */
   private seedBacklog(): void {
     if (this.wakeMode === 'never' || this.disposed) return;
     let seeded = false;
@@ -1159,6 +1694,7 @@ export class GruAwareness {
         seeded = true;
       }
     }
+    const before = this.pendingWakeIds.size;
     try {
       // Filter in SQL BEFORE LIMIT in machine-only mode and page every
       // matching row. Unrelated owner/FYI rows may outnumber this page.
@@ -1170,13 +1706,19 @@ export class GruAwareness {
         const { receipts, live } = this.classifyNotifications(rows);
         // A closed receipt is never a wake seed; a stored seed for one is
         // dropped (owner decision D1, code review 2026-10-04).
-        for (const row of receipts) {
-          if (this.pendingWakeIds.delete(row)) seeded = true;
+        for (const id of receipts) {
+          if (this.pendingWakeIds.delete(id)) seeded = true;
         }
         for (const row of live) {
-          if (this.wakePolicy.decide({ id: row.id, routing: row.routing, severity: row.severity }, this.now()).action === 'skip') continue;
-          this.pendingWakeIds.add(row.id);
-          seeded = true;
+          const candidate = {
+            id: row.id,
+            incidentKey: incidentKeyOf(row),
+            routing: row.routing,
+            severity: row.severity,
+          } as const;
+          // ONE coalesced backlog wake (the migration rule): admission
+          // gates run per row, the flush happens once after the scan.
+          if (this.admitPath(candidate).action === 'admit') this.pendingWakeIds.add(row.id);
         }
         if (rows.length < MAX_BACKLOG_SEED) break;
       }
@@ -1184,7 +1726,7 @@ export class GruAwareness {
       this.log('error', 'gru wake backlog scan failed', { error: String(error) });
       return;
     }
-    if (seeded) this.persistWakeState();
+    if (seeded || this.pendingWakeIds.size !== before) this.persistWakeState();
     this.flushPendingWakes();
   }
 
@@ -1264,8 +1806,9 @@ export class GruAwareness {
     for (const id of this.pendingWakeIds) {
       const row = this.ledger.getNotification(id);
       if (row !== null && row.ackedAt === null && row.resolvedAt === null &&
-          this.wakePolicy.decide({ id, routing: row.routing, severity: row.severity }, this.now()).action !== 'skip') continue;
+          this.wakePolicy.decide({ id, incidentKey: incidentKeyOf(row), routing: row.routing, severity: row.severity }, this.now()).action !== 'skip') continue;
       this.pendingWakeIds.delete(id);
+      this.wakeFailures.delete(id);
       changed = true;
     }
     if (changed) this.persistWakeState();

@@ -545,3 +545,10 @@ production wiring lands in the lanes it unblocks — hold suppression in
 #215, the `recheck_at` re-look sweep in #217, and the #219/#220/#117
 lanes stacking on this branch. Until those land, the table is the
 readable state they build on; recording through the API is live now.
+
+**Wake side (issue #219):** every wake the decision layer avoids is on
+the ledger as `gru.wake-deferred` — `reason: 'covered'` names the
+decision id that held the incident, `duplicate` the incident key already
+woken, `failed` the bounded-retry exhaustion that escalated. The board
+wakes tracker and the #214 yield report (wakes/day, avoided share) read
+this stream; nothing avoids a wake silently.

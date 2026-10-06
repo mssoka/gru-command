@@ -676,13 +676,25 @@ describe('board engine — liveness-first rail and job trackers', () => {
 
   it('tracks autonomous wakes from the durable gru.wake events', () => {
     const { api, engine } = fresh();
-    expect(engine.snapshot().wakes).toEqual({ count: 0, lastAt: null });
+    expect(engine.snapshot().wakes).toEqual({ count: 0, lastAt: null, deferred: { count: 0, reasons: {} } });
     api.appendCustomEvent({ kind: 'gru.wake', payload: { notification_ids: ['n1'], count: 1 } });
     const first = engine.snapshot().wakes;
     expect(first.count).toBe(1);
     expect(first.lastAt).not.toBeNull();
     api.appendCustomEvent({ kind: 'gru.wake', payload: { notification_ids: ['n2'], count: 1 } });
     expect(engine.snapshot().wakes.count).toBe(2);
+  });
+
+  it('tallies deferred wakes by reason from the avoidance stream (issue #219)', () => {
+    const { api, engine } = fresh();
+    api.appendCustomEvent({ kind: 'gru.wake-deferred', payload: { reason: 'duplicate', notification_id: 'n1', incident_key: 'k1' } });
+    api.appendCustomEvent({ kind: 'gru.wake-deferred', payload: { reason: 'covered', notification_id: 'n2', incident_key: 'k2', decision_id: 'd1' } });
+    api.appendCustomEvent({ kind: 'gru.wake-deferred', payload: { reason: 'covered', notification_id: 'n3', incident_key: 'k3', decision_id: 'd1' } });
+    api.appendCustomEvent({ kind: 'gru.wake-deferred', payload: { reason: 'failed', notification_id: 'n4', incident_key: 'k4' } });
+    expect(engine.snapshot().wakes.deferred).toEqual({ count: 4, reasons: { duplicate: 1, covered: 2, failed: 1 } });
+    // Unknown reasons tally honestly instead of vanishing.
+    api.appendCustomEvent({ kind: 'gru.wake-deferred', payload: { notification_id: 'n5', incident_key: 'k5' } });
+    expect(engine.snapshot().wakes.deferred).toEqual({ count: 5, reasons: { duplicate: 1, covered: 2, failed: 1, unknown: 1 } });
   });
 });
 

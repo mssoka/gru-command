@@ -529,6 +529,20 @@ export interface GruWakeCauses {
   readonly repeatIncidentIds: number;
   /** Wakes containing at least one repeat incident ID. */
   readonly wakesWithRepeatIncident: number;
+  /** Issue #219 / #214: autonomous Gru wakes per day over the window —
+   * the headline cost number the decision-cost program tracks. */
+  readonly wakesPerDay: number;
+  /** Issue #219 / #214: wakes avoided inside the window because the
+   * incident was a duplicate (already-woken incident re-detected under a
+   * new row id) or hold-covered (an active decision, issue #218), with
+   * their share of (opened + avoided) wake demands. */
+  readonly avoided: {
+    readonly duplicates: number;
+    readonly covered: number;
+    /** (duplicates + covered) / (gru.wake count + duplicates + covered);
+     * null when nothing was demanded in the window. */
+    readonly share: number | null;
+  };
 }
 
 export interface M0Measures {
@@ -718,6 +732,25 @@ export function computeLedgerMeasures(
   const repeatSet = new Set(repeatIds);
   const wakesWithRepeatIncident = wakeIds.filter((ids) => ids.some((id) => repeatSet.has(id))).length;
 
+  // Issue #219 / #214: the avoidance stream — `gru.wake-deferred` events
+  // with reason 'duplicate' (incident-key dedupe) or 'covered' (hold-
+  // covered deferral) are wakes that never opened. Failed escalations
+  // ('failed') are NOT avoidance — the demand stays unserved.
+  let duplicates = 0;
+  let covered = 0;
+  for (const event of events) {
+    if (event.kind !== 'gru.wake-deferred' || !inWindow(event.ts, since, until)) continue;
+    const reason =
+      event.payload !== null && typeof event.payload === 'object'
+        ? (event.payload as Record<string, unknown>)['reason']
+        : undefined;
+    if (reason === 'duplicate') duplicates += 1;
+    else if (reason === 'covered') covered += 1;
+  }
+  const windowMs = Math.max(1, Date.parse(until) - Date.parse(since));
+  const wakesPerDay = (gruWakes.length / windowMs) * 86_400_000;
+  const demanded = gruWakes.length + duplicates + covered;
+
   const gruWakeCauses: GruWakeCauses = {
     wakesWithNotificationIds,
     perKind: [...perKind.entries()]
@@ -726,6 +759,12 @@ export function computeLedgerMeasures(
     conflictOnlyWakes,
     repeatIncidentIds: repeatIds.length,
     wakesWithRepeatIncident,
+    wakesPerDay,
+    avoided: {
+      duplicates,
+      covered,
+      share: demanded === 0 ? null : (duplicates + covered) / demanded,
+    },
   };
 
   // M0 — heists finished in the window and WIP replayed to `until`.
@@ -925,6 +964,7 @@ export function renderTextReport(report: YieldReport): string {
   push('Gru wake causes');
   push(`  wakes with notification ids ${fmtNum(report.gruWakeCauses.wakesWithNotificationIds)}, conflict-only ${fmtNum(report.gruWakeCauses.conflictOnlyWakes)}`);
   push(`  repeat-incident ids ${fmtNum(report.gruWakeCauses.repeatIncidentIds)} across ${fmtNum(report.gruWakeCauses.wakesWithRepeatIncident)} wakes`);
+  push(`  wakes/day ${report.gruWakeCauses.wakesPerDay.toFixed(2)}, avoided ${fmtNum(report.gruWakeCauses.avoided.duplicates)} duplicate(s) + ${fmtNum(report.gruWakeCauses.avoided.covered)} covered (${fmtPct(report.gruWakeCauses.avoided.share)})`);
   for (const kind of report.gruWakeCauses.perKind.slice(0, 10)) {
     push(`  kind ${kind.kind}: ${fmtNum(kind.wakes)} wakes`);
   }
