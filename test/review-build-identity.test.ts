@@ -37,22 +37,7 @@ afterAll(() => {
   if (packageBuildRoot !== null) rmSync(packageBuildRoot, { recursive: true, force: true });
 });
 
-/** Copy a directory tree; on darwin try APFS clonefile first (the fixture
- * copies ~150MB of installed dependency per identity, and cloning is
- * near-instant while still giving each caller a private tree). */
-function copyTree(source: string, destination: string): void {
-  if (process.platform === 'darwin') {
-    try {
-      execFileSync('cp', ['-cR', source, destination], { stdio: 'ignore' });
-      return;
-    } catch {
-      // Clone unsupported (different volume/filesystem) — portable copy.
-    }
-  }
-  cpSync(source, destination, { recursive: true });
-}
-
-function packageTarball(): { tarballPath: string; files: readonly string[] } {
+function packageTarball(): { tarballPath: string } {
   if (packageTarballCache !== null) return packageTarballCache;
   // Standalone test: compile in an isolated tree rather than assuming npm
   // test already populated dist or racing another suite's shared build.
@@ -120,7 +105,11 @@ function packageIdentity(): { root: string; identity: string } {
   for (const directory of packageClosure(source)) {
     const destination = join(installed, directory.slice(source.length + 1));
     mkdirSync(dirname(destination), { recursive: true });
-    copyTree(directory, destination);
+    // `cpSync` (never a clone shorthand): its default symlink resolution
+    // is part of the installed-tree contract `reviewRuntimeVersion`
+    // walks, and clonefile/`cp -R` would leave relative `.bin` targets
+    // the walk rejects.
+    cpSync(directory, destination, { recursive: true });
   }
   expect(existsSync(join(installed, 'node_modules', '@earendil-works', 'pi-ai'))).toBe(true);
   return { root: installed, identity: reviewRuntimeVersion(installed) };
