@@ -63,7 +63,8 @@ export function collectJobs(snapshot: BoardSnapshot): readonly JobView[] {
 }
 
 /** The PR state the board acts on: the wire field when a producer set it,
- * else derived (`merged` status ⇒ merged, a registered URL ⇒ open). */
+ * else derived (`merged` status ⇒ merged, a terminal `done` lane ⇒ no
+ * claim, a registered URL on any other lane ⇒ open). */
 export function derivedPrState(job: JobView): JobPrState | null {
   if (job.prState !== null && job.prState !== undefined) return job.prState;
   if (job.status === 'merged') return 'merged';

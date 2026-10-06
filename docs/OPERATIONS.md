@@ -204,9 +204,12 @@ curl -sS -X POST "http://127.0.0.1:<port>/api/jobs/<job-id>/closeout" \
   Re-sending the identical request returns the SAME event with
   `idempotent: true`; a changed request against the closed lane is refused.
 - `409 closeout_refused` — a guard refused (`code` names it: `not-parked`,
-  `target-mismatch`, `unconfirmed-pr`, `pr-open`, `pr-merged`,
-  `stale-head`, `live-work`, `already-closed`, …); nothing changed.
-- `400` malformed body · `401` missing/bad token · `404` unknown job.
+  `not-pr-backed`, `not-pr-owing`, `target-mismatch`, `unconfirmed-pr`,
+  `pr-open`, `pr-merged`, `stale-head`, `live-work`, `already-closed`);
+  nothing changed.
+- `400` malformed body · `401` missing/bad token · `404` unknown job. A
+  wrong `expected_status` **value** is a 400 body error; a job that has
+  moved off `parked` is the 409 `not-parked` refusal.
 
 Read back with the idempotent replay plus `GET /api/board`: the job is
 `done`, `prState` is `null` (never `open`), and the lane no longer appears

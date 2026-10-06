@@ -289,7 +289,9 @@ describe('board server — HTTP API', () => {
       { ...validBody, provider: { ...validBody.provider, state: 'open' } },
       { ...validBody, provider: { ...validBody.provider, merged: true } },
       { ...validBody, provider: { ...validBody.provider, head_sha: 'nope' } },
+      { ...validBody, provider: { ...validBody.provider, closed_at: 'not-a-time' } },
       { ...validBody, expected_pr_url: '' },
+      { ...validBody, expected_pr_url: 'not-a-url' },
       { ...validBody, reason: '' },
     ]) {
       const bad = await postJson(port, '/api/jobs/x/closeout', 'board-test-token', body);
@@ -317,6 +319,29 @@ describe('board server — HTTP API', () => {
     expect(refused.body).toMatchObject({ error: 'closeout_refused', code: 'pr-open' });
     expect(api.getJob('open-pr-http')?.status).toBe('parked');
     expect(api.latestJobEvent('open-pr-http', 'job.admin-closeout')).toBeNull();
+
+    // Target-identity refusals ride the same typed 409 mapping: the request
+    // names a different PR than the registered / recorded target.
+    api.addJob({ id: 'target-http', repo: 'demo-repo', title: 'Target' });
+    api.setJobStatus('target-http', 'working');
+    api.setJobPr('target-http', prUrl);
+    api.setJobStatus('target-http', 'in-review');
+    api.setJobStatus('target-http', 'parked');
+    api.appendCustomEvent({
+      kind: 'github.branch-state',
+      jobId: 'target-http',
+      payload: branchStatePayload(
+        { jobId: 'target-http', repo: { host: 'github.com', owner: 'mssoka', repo: 'gru-command' }, branch: 'gru/target-http', prNumber: 165, prUrl },
+        { sha: head, merged: false, prOpen: false, mergeableState: 'dirty', ci: null, prNumber: 165, prUrl, mergeCommitSha: null },
+      ),
+    });
+    const mismatch = await postJson(port, '/api/jobs/target-http/closeout', 'board-test-token', {
+      ...validBody,
+      expected_pr_url: 'https://github.com/mssoka/gru-command/pull/999',
+    });
+    expect(mismatch.status).toBe(409);
+    expect(mismatch.body).toMatchObject({ error: 'closeout_refused', code: 'target-mismatch' });
+    expect(api.getJob('target-http')?.status).toBe('parked');
   });
 
   it('closeout endpoint: the guarded success is audited, idempotent, and the board stops presenting the lane as an open PR', async () => {

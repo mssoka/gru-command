@@ -892,6 +892,17 @@ function parseCloseoutObservation(payload: unknown): CloseoutObservation | null 
   };
 }
 
+/** True for the canonical ISO-8601 UTC form (or the same without the
+ * millisecond fraction) of a REAL calendar timestamp. A shape regex alone
+ * would accept impossible dates such as 2026-13-45T99:99:99Z into the
+ * audit; the Date round-trip rejects them. */
+function isRealIsoUtcTimestamp(value: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/u.test(value)) return false;
+  const normalized = value.includes('.') ? value : value.replace(/Z$/u, '.000Z');
+  const ms = new Date(normalized).getTime();
+  return Number.isFinite(ms) && new Date(ms).toISOString() === normalized;
+}
+
 export class LedgerApi {
   private readonly db: DatabaseSync;
   private readonly bus: EventBus | null;
@@ -1566,6 +1577,25 @@ export class LedgerApi {
     if (expectedPrUrl === '' || expectedPrUrl.length > 2_000 || /[\p{Cc}]/u.test(expectedPrUrl)) {
       throw new Error('expected_pr_url must be a bounded non-empty PR url');
     }
+    // Shape: an absolute https URL with no credentials, query or fragment.
+    // The recorded provider observation below still binds the exact
+    // identity; this only rejects junk that could never be a PR target.
+    let parsedPrUrl: URL;
+    try {
+      parsedPrUrl = new URL(expectedPrUrl);
+    } catch {
+      throw new Error('expected_pr_url must be an absolute https url');
+    }
+    if (
+      parsedPrUrl.protocol !== 'https:' ||
+      parsedPrUrl.host === '' ||
+      parsedPrUrl.username !== '' ||
+      parsedPrUrl.password !== '' ||
+      parsedPrUrl.search !== '' ||
+      parsedPrUrl.hash !== ''
+    ) {
+      throw new Error('expected_pr_url must be an absolute https url without credentials, query or fragment');
+    }
     const evidence = input.provider;
     if (typeof evidence !== 'object' || evidence === null) {
       throw new Error('provider evidence must be an object');
@@ -1584,8 +1614,8 @@ export class LedgerApi {
       throw new Error(`provider head_sha must be a hex commit sha (got ${JSON.stringify(evidence.headSha)})`);
     }
     const closedAt = evidence.closedAt ?? null;
-    if (closedAt !== null && (typeof closedAt !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/u.test(closedAt))) {
-      throw new Error(`provider closed_at must be an ISO-8601 UTC timestamp when present (got ${JSON.stringify(closedAt)})`);
+    if (closedAt !== null && (typeof closedAt !== 'string' || !isRealIsoUtcTimestamp(closedAt))) {
+      throw new Error(`provider closed_at must be a real ISO-8601 UTC timestamp when present (got ${JSON.stringify(closedAt)})`);
     }
     const reason = input.reason.trim();
     if (reason === '' || reason.length > 2_000 || /[\p{Cc}]/u.test(reason.replaceAll('\n', '').replaceAll('\t', ''))) {

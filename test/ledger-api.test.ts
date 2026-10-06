@@ -1379,10 +1379,42 @@ describe('administrative closeout of a parked PR-backed job', () => {
     return { api, db, dir };
   }
 
+  /** One recorded provider observation, written through the poll's own
+   * payload producer so a producer-side field rename surfaces here instead
+   * of silently closing on a misread event. */
+  function appendObservation(
+    api: LedgerApi,
+    jobId: string,
+    opts: { prUrl?: string; headSha?: string; prOpen?: boolean | null; merged?: boolean; prNumber?: number } = {},
+  ): void {
+    const prUrl = opts.prUrl ?? PR_URL;
+    api.appendCustomEvent({
+      kind: 'github.branch-state',
+      jobId,
+      payload: branchStatePayload(
+        {
+          jobId,
+          repo: { host: 'github.com', owner: 'mssoka', repo: 'gru-command' },
+          branch: `gru/${jobId}`,
+          prNumber: opts.prNumber ?? 165,
+          prUrl,
+        },
+        {
+          sha: opts.headSha ?? HEAD,
+          merged: opts.merged ?? false,
+          prOpen: opts.prOpen === undefined ? false : opts.prOpen,
+          mergeableState: 'dirty',
+          ci: null,
+          prNumber: opts.prNumber ?? 165,
+          prUrl,
+          mergeCommitSha: null,
+        },
+      ),
+    });
+  }
+
   /** A parked PR-backed lane as the GitHub poll observes it: CLOSED, not
-   * merged. The observation rides the poll's own payload producer so a
-   * producer-side field rename surfaces here instead of silently closing
-   * on a misread event. */
+   * merged. */
   function parkedPrJob(
     api: LedgerApi,
     jobId: string,
@@ -1408,28 +1440,11 @@ describe('administrative closeout of a parked PR-backed job', () => {
     api.setJobStatus(jobId, 'in-review');
     api.setJobStatus(jobId, 'parked');
     if (opts.observe === false) return;
-    api.appendCustomEvent({
-      kind: 'github.branch-state',
-      jobId,
-      payload: branchStatePayload(
-        {
-          jobId,
-          repo: { host: 'github.com', owner: 'mssoka', repo: 'gru-command' },
-          branch: `gru/${jobId}`,
-          prNumber: 165,
-          prUrl,
-        },
-        {
-          sha: opts.headSha ?? HEAD,
-          merged: opts.merged ?? false,
-          prOpen: opts.prOpen === undefined ? false : opts.prOpen,
-          mergeableState: 'dirty',
-          ci: null,
-          prNumber: 165,
-          prUrl,
-          mergeCommitSha: null,
-        },
-      ),
+    appendObservation(api, jobId, {
+      prUrl,
+      ...(opts.headSha !== undefined ? { headSha: opts.headSha } : {}),
+      ...(opts.prOpen !== undefined ? { prOpen: opts.prOpen } : {}),
+      ...(opts.merged !== undefined ? { merged: opts.merged } : {}),
     });
   }
 
@@ -1538,6 +1553,25 @@ describe('administrative closeout of a parked PR-backed job', () => {
       parkedPrJob(api, 'stale-head');
       expect(refusalOf(() => api.adminCloseParkedJob(closeoutRequest('stale-head', { headSha: 'f'.repeat(40) }))).code).toBe('stale-head');
 
+      // The guard binds the LATEST observation: a newer open / merged /
+      // moved-head observation over an older closed one refuses — the whole
+      // ordering property.
+      parkedPrJob(api, 'superseded-open');
+      appendObservation(api, 'superseded-open', { prOpen: true });
+      expect(refusalOf(() => api.adminCloseParkedJob(closeoutRequest('superseded-open'))).code).toBe('pr-open');
+      parkedPrJob(api, 'superseded-merged');
+      appendObservation(api, 'superseded-merged', { merged: true });
+      expect(refusalOf(() => api.adminCloseParkedJob(closeoutRequest('superseded-merged'))).code).toBe('pr-merged');
+      parkedPrJob(api, 'superseded-head');
+      appendObservation(api, 'superseded-head', { headSha: 'a'.repeat(40) });
+      expect(refusalOf(() => api.adminCloseParkedJob(closeoutRequest('superseded-head'))).code).toBe('stale-head');
+
+      // The observation must name the SAME target as the request, even when
+      // the job's registered PR matches: stale evidence never closes.
+      parkedPrJob(api, 'observation-mismatch');
+      appendObservation(api, 'observation-mismatch', { prUrl: 'https://github.com/mssoka/gru-command/pull/999', prNumber: 999 });
+      expect(refusalOf(() => api.adminCloseParkedJob(closeoutRequest('observation-mismatch'))).code).toBe('target-mismatch');
+
       // No PR on record / report-only lanes are outside the closeout.
       api.addJob({ id: 'no-pr', repo: 'r', title: 't' });
       api.setJobStatus('no-pr', 'working');
@@ -1555,6 +1589,10 @@ describe('administrative closeout of a parked PR-backed job', () => {
         ['open-pr', 'parked'],
         ['merged-pr', 'parked'],
         ['stale-head', 'parked'],
+        ['superseded-open', 'parked'],
+        ['superseded-merged', 'parked'],
+        ['superseded-head', 'parked'],
+        ['observation-mismatch', 'parked'],
         ['no-pr', 'parked'],
         ['report-only', 'parked'],
       ] as const) {
@@ -1589,6 +1627,18 @@ describe('administrative closeout of a parked PR-backed job', () => {
       expect(conflict.code).toBe('already-closed');
       expect(api.listJobEventsByKinds('replay', ['job.admin-closeout'])).toHaveLength(1);
       expect(api.getJob('replay')?.status).toBe('done');
+
+      // A done lane reached by ANOTHER path (no recorded closeout) refuses
+      // with the same code and never rewrites the record.
+      api.addJob({ id: 'done-other-way', repo: 'r', title: 't' });
+      api.setJobStatus('done-other-way', 'working');
+      api.setJobPr('done-other-way', PR_URL);
+      api.setJobStatus('done-other-way', 'in-review');
+      api.setJobStatus('done-other-way', 'done');
+      const otherWay = refusalOf(() => api.adminCloseParkedJob(closeoutRequest('done-other-way')));
+      expect(otherWay.name).toBe('AdminCloseoutRefusal');
+      expect(otherWay.code).toBe('already-closed');
+      expect(api.latestJobEvent('done-other-way', 'job.admin-closeout')).toBeNull();
     } finally {
       db.close();
       rmSync(dir, { recursive: true, force: true });
@@ -1636,6 +1686,77 @@ describe('administrative closeout of a parked PR-backed job', () => {
       expect(refusalOf(() => api.adminCloseParkedJob(closeoutRequest('live-turn'))).message).toContain('worker-live');
       expect(refusalOf(() => api.adminCloseParkedJob(closeoutRequest('live-round'))).message).toContain('live-round-r1');
       expect(refusalOf(() => api.adminCloseParkedJob(closeoutRequest('live-verify'))).message).toContain('verification');
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('administrative closeout closes through non-live history: idle/disposed workers, terminal children, concluded rounds and settled verification', () => {
+    const { api, db, dir } = freshDb();
+    try {
+      parkedPrJob(api, 'history-lane');
+      // Idle and disposed worker rows are bookkeeping, not execution.
+      api.registerAgent({ id: 'worker-idle', role: 'minion', jobId: 'history-lane' });
+      api.setAgentState('worker-idle', 'idle');
+      api.registerAgent({ id: 'worker-disposed', role: 'minion', jobId: 'history-lane' });
+      api.setAgentState('worker-disposed', 'disposed');
+      // A terminal child (result recorded, worker disposed) is history.
+      const admitted = api.admitChildWorker({
+        id: 'child-done',
+        parentAgentId: 'worker-idle',
+        jobId: 'history-lane',
+        purpose: 'bounded task',
+        authority: 'read-only',
+        task: 'inspect',
+        idempotencyKey: 'child-done-key',
+      });
+      api.recordChildResult(admitted.record.id, { state: 'done', summary: 'ok', ref: null });
+      if (admitted.record.agentId !== null) api.setAgentState(admitted.record.agentId, 'disposed');
+      // A verdict-posted round is concluded review history.
+      const round = api.addRound({ jobId: 'history-lane' });
+      api.setRoundStatus(round.id, 'live');
+      api.setRoundVerdict(round.id, 'approved');
+      // A settled verification run is settled, not live.
+      api.appendCustomEvent({ kind: 'verification.started', jobId: 'history-lane', payload: { run_id: 'run-done' } });
+      api.appendCustomEvent({ kind: 'verification.completed', jobId: 'history-lane', payload: { run_id: 'run-done', ok: true, exit_code: 0 } });
+
+      const result = api.adminCloseParkedJob(closeoutRequest('history-lane'));
+      expect(result.idempotent).toBe(false);
+      expect(result.job.status).toBe('done');
+      expect(result.event.kind).toBe('job.admin-closeout');
+      expect(api.latestJobEvent('history-lane', 'job.admin-closeout')?.seq).toBe(result.event.seq);
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('administrative closeout validates the request edges: real timestamps, https target, bounded reason and hex head', () => {
+    const { api, db, dir } = freshDb();
+    try {
+      parkedPrJob(api, 'edges');
+      const attempt = (overrides: Record<string, unknown>) => () =>
+        (api.adminCloseParkedJob as unknown as (input: Record<string, unknown>) => unknown)({
+          ...closeoutRequest('edges'),
+          ...overrides,
+        });
+      // A shape-valid but impossible calendar timestamp never enters the audit.
+      expect(
+        attempt({ provider: { provider: 'github', state: 'closed', merged: false, headSha: HEAD, closedAt: '2026-13-45T99:99:99Z' } }),
+      ).toThrow(/real ISO-8601 UTC/u);
+      expect(
+        attempt({ provider: { provider: 'github', state: 'closed', merged: false, headSha: HEAD, closedAt: 'not-a-time' } }),
+      ).toThrow(/real ISO-8601 UTC/u);
+      // The target must be an absolute https url.
+      expect(attempt({ expectedPrUrl: 'not-a-url' })).toThrow(/absolute https url/u);
+      expect(attempt({ expectedPrUrl: 'http://github.com/mssoka/gru-command/pull/165' })).toThrow(/absolute https url/u);
+      // Bounded reason / hex head.
+      expect(attempt({ reason: 'x'.repeat(2_001) })).toThrow(/bounded printable text/u);
+      expect(attempt({ provider: { provider: 'github', state: 'closed', merged: false, headSha: 'abc123' } })).toThrow(/hex commit sha/u);
+      // Every edge refusal is a no-effect failure.
+      expect(api.getJob('edges')?.status).toBe('parked');
+      expect(api.latestJobEvent('edges', 'job.admin-closeout')).toBeNull();
     } finally {
       db.close();
       rmSync(dir, { recursive: true, force: true });
