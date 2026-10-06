@@ -34,8 +34,10 @@ function copyTree(source: string, destination: string): void {
   mkdirSync(destination, { recursive: true });
   if (process.platform === 'darwin') {
     try {
-      // `source/.` copies the directory CONTENTS into the existing dest.
-      execFileSync('cp', ['-cR', join(source, '.'), destination], { stdio: 'ignore' });
+      // `source/.` copies the directory CONTENTS into the existing dest
+      // (a literal suffix: path.join would normalize the `/.` away and
+      // turn this into copy-INTO, nesting the tree).
+      execFileSync('cp', ['-cR', `${source}/.`, destination], { stdio: 'ignore' });
       return;
     } catch {
       // Clone unsupported (different volume/filesystem) — portable copy.
