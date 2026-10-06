@@ -1,6 +1,6 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { filteredState } from '../questions.js';
+import { fileOfLocation, filteredState } from '../questions.js';
 import { caseHash } from './escalation-triage-extract.js';
 import type { LabelledCase } from './registry.js';
 
@@ -157,10 +157,6 @@ export function extractSameBlockerCases(artifactRoot: string): LabelledCase[] {
     }
   }
   return cases;
-}
-
-function fileOfLocation(location: string): string {
-  return location.trim().replace(/:\d+(?::\d+)?$/u, '');
 }
 
 function pairState(prior: FindingBrief, current: FindingBrief): string {

@@ -362,6 +362,15 @@ export class DecisionRuntime implements DecisionService {
     return this.profileServices.get(name) instanceof ProfileDecisionService;
   }
 
+  /** The configured mode for a surface (issue #223): 'off' | 'shadow' |
+   * 'enforce', or null for the pre-#223 legacy behavior. Shadow-only
+   * callers (issue #224) gate their asks on this so a legacy or enforce
+   * surface never receives an ask that would either go unrecorded or be
+   * spent on a path that ignores the answer. */
+  surfaceMode(surface: string): SurfaceMode | null {
+    return this.modeFor(surface);
+  }
+
   async decide<Q extends QuestionSet>(
     request: DecisionRequest<Q>,
     opts?: DecisionSurface,

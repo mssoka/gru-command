@@ -538,6 +538,15 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           throw new Error(`clean-abort round ${sourceRoundId} was already re-armed`);
         }
       }
+      const rawClaimedFixed = body['claimed_fixed_priors'];
+      let claimedFixedPriors: number[] | undefined;
+      if (rawClaimedFixed !== undefined) {
+        if (!Array.isArray(rawClaimedFixed) || rawClaimedFixed.length > 500 ||
+            rawClaimedFixed.some((value) => !Number.isSafeInteger(value) || (value as number) < 0)) {
+          throw new Error('claimed_fixed_priors must be an array of at most 500 non-negative integer prior indexes');
+        }
+        claimedFixedPriors = rawClaimedFixed as number[];
+      }
       const input = {
         jobId,
         ...(boundTargetRef !== undefined ? { targetRef: boundTargetRef } : {}),
@@ -548,6 +557,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         ...(optBoolField(body, 'no_spec') !== undefined ? { noSpec: optBoolField(body, 'no_spec') } : {}),
         ...(force !== undefined ? { force } : {}),
         ...(evidenceRefs !== undefined ? { evidence: evidenceRefs } : {}),
+        ...(claimedFixedPriors !== undefined ? { claimedFixedPriors } : {}),
         ...(by === 'minion' ? { handoff: true } : {}),
       };
       // The fallback gate can append a terminal phase BEFORE this handler

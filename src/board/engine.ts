@@ -865,7 +865,25 @@ export class BoardEngine {
     return repos
       .flatMap((repo) => repo.jobs)
       .filter((job) => job.status === 'in-review' && job.prUrl !== null)
-      .map((job) => ownerReadyPr(job, readBranchEvidence(this.ledger, job.id)))
+      .map((job) => {
+        // Stage-5 convergence: a delta round that posted READY still owes
+        // the final whole-change pass. Until that whole-scope round closes
+        // at this target, the delta approval is NOT owner-ready (the flag
+        // survives a crash between the two rounds).
+        const newest = job.rounds.at(-1);
+        if (newest !== undefined) {
+          // The pre-commit marker is the durable obligation (written before
+          // the verdict commit), so an approved delta round can never be
+          // owner-ready without it; the review-event field is a second,
+          // post-commit disclosure.
+          if (this.ledger.latestRoundEvent(newest.id, 'round.final-pass-required') !== null) return null;
+          const review = this.ledger.latestRoundEvent(newest.id, 'round.perkins-review');
+          const payload = review === null || typeof review.payload !== 'object' || review.payload === null
+            ? null : review.payload as { readonly finalPassRequired?: unknown };
+          if (payload?.finalPassRequired === true) return null;
+        }
+        return ownerReadyPr(job, readBranchEvidence(this.ledger, job.id));
+      })
       .filter((row): row is OwnerPrView => row !== null)
       .sort((left, right) => left.jobId.localeCompare(right.jobId));
   }

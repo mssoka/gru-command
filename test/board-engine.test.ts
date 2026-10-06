@@ -774,6 +774,51 @@ describe('board engine — FOR YOU owner-PR projection on the snapshot', () => {
     expect(engine.snapshot().ownerPrs).toEqual([]);
   });
 
+  it('keeps a delta READY gated until its final whole-change pass closes', () => {
+    const { api, engine } = fresh();
+    // (a) ONLY the pre-commit marker exists: a crash between the verdict
+    // commit and the review event must not expose owner-ready.
+    stageReadyJob(api, 'job-marker-only');
+    api.appendCustomEvent({
+      kind: 'round.final-pass-required',
+      jobId: 'job-marker-only',
+      roundId: api.listRounds('job-marker-only').at(-1)!.id,
+      payload: { targetSha: SHA, reviewScope: 'delta' },
+    });
+    expect(engine.snapshot().ownerPrs).toEqual([]);
+
+    // (b) ONLY the review-event flag exists (legacy/post-commit shape).
+    stageReadyJob(api, 'job-event-only');
+    api.appendCustomEvent({
+      kind: 'round.perkins-review',
+      jobId: 'job-event-only',
+      roundId: api.listRounds('job-event-only').at(-1)!.id,
+      payload: { canonicalVerdict: 'READY TO MERGE', reviewScope: 'delta', finalPassRequired: true },
+    });
+    expect(engine.snapshot().ownerPrs).toEqual([]);
+
+    // (c) The whole-scope round closes and its review event carries no
+    // pending flag: the newest round is whole and owner-ready.
+    stageReadyJob(api, 'job-final-pass');
+    api.appendCustomEvent({
+      kind: 'round.final-pass-required',
+      jobId: 'job-final-pass',
+      roundId: api.listRounds('job-final-pass').at(-1)!.id,
+      payload: { targetSha: SHA, reviewScope: 'delta' },
+    });
+    expect(engine.snapshot().ownerPrs).toEqual([]);
+    const finalRound = api.addRound({ jobId: 'job-final-pass', targetRef: SHA });
+    api.setRoundStatus(finalRound.id, 'live');
+    api.setRoundVerdict(finalRound.id, 'approved');
+    api.appendCustomEvent({
+      kind: 'round.perkins-review',
+      jobId: 'job-final-pass',
+      roundId: finalRound.id,
+      payload: { canonicalVerdict: 'READY TO MERGE', reviewScope: 'whole' },
+    });
+    expect(engine.snapshot().ownerPrs.map((row) => row.id)).toEqual(['owner-pr:job-final-pass']);
+  });
+
   it('drops the row when the job takes a hold (blocked) or a newer round is changes-requested', () => {
     const { api, engine } = fresh();
     stageReadyJob(api, 'job-hold');

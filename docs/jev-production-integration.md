@@ -27,6 +27,51 @@ Jev classifies exactly two surfaces:
 Perkins wave/findings triage and worktree sweep/disposal preflight are
 deliberately OUT of scope and are not wired.
 
+## Shadow surfaces (issue #224)
+
+Three further surfaces exist for the labelled-history backtest harness
+(#223). They ask ONLY in explicit `mode = "shadow"` — a surface with no
+mode key never receives their asks (an unrecorded provider call serves
+nothing; `off` needs no asks; `enforce` is a future host change) — and
+shadow asks RECORD the provider answer next to the deterministic
+baseline while still serving the deterministic answer: behavior cannot
+change until the #223 enforce gate is met AND the owner records a
+decision per surface.
+
+| Surface | Question | Fires at | Deterministic baseline |
+|---|---|---|---|
+| `escalation_triage` | choice `triage` (`needs_ruling`, `needs_owner`, `status_report`, `covered_by_open_item`) + noul `needs_decision` | the awareness layer's wake-delivery receipt, for Silas-authored escalation rows (`silas.escalation`, `silas.escalated:<jobId>`) inside the delivered batch — the exact point the labelled extractor links on | every escalation reaches Gru (`needs_ruling`, noul 1 — fail toward a wake) |
+| `same_blocker` | noul `same_defect` over two findings | the Silas digest's recurrence block, when two blockers' #216 fingerprints differ but file and category overlap (digest-wide cap of 8 pairs, deduped per process) | different fingerprints are different blockers (noul 0 — fail toward the new blocker) |
+| `report_conclusion` | choice `conclusion` (`clean_pass`, `findings_need_action`, `inconclusive`) | BACKTEST-ONLY until #220's report-handback host exists (its question set, builder, summarisation and enforce-gate registration are live) | every delivered report still owes the commissioner a review (`findings_need_action` — never a silent clean pass; the issue's draft table named `inconclusive`, but the reviewed #223 measurement contract pins the baseline to today's behavior) |
+
+Escalation-triage requests carry the escalated subjects' open decisions
+and recent dispositions from decision memory (#218) when any exist —
+with each row's `covers` and basis fingerprint so a hold scoped to
+another signal cannot read as applicable. The labelled extractor
+reconstructs the same memory as of each historical wake, so backtest
+states measure the memory-enriched behavior.
+
+Known measurement limits (recorded deliberately, issue #224 review):
+
+- `same_blocker` labelled positives are carry-key pairs (the lead's own
+  carry), which share a #216 base fingerprint — production only asks
+  about fingerprint-DIFFERING pairs, so the labelled positive population
+  under-covers exactly the cases enforce would act on. Current history
+  yields zero pairable cases (every reviewed head seen once); grow the
+  labelled set from real differing-fingerprint history before taking
+  `same_blocker` anywhere near enforce.
+- The extractor groups review rounds by identical target SHA, while
+  production compares a job's verdict rounds across moved heads —
+  recurrences across edits are outside the labelled population for the
+  same reason.
+
+Enforcement preconditions: recorded backtest evidence meeting its
+threshold (#223 gate) AND a recorded owner decision per surface — the
+gate enforces the evidence; the owner decision is a process
+precondition the gate cannot read. `escalation_triage` enforcement
+additionally needs #219's deferral mechanism (defer, never drop; hard
+floors bypass).
+
 ## Configuration
 
 Add the generated fragment to `$GRU_COMMAND_HOME/config.toml` (default:

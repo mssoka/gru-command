@@ -1,6 +1,6 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { filteredState } from '../questions.js';
+import { filteredState, summariseReportBody } from '../questions.js';
 import { reportLabelFromCanonicalVerdict } from './report-conclusion.js';
 import type { LabelledCase } from './registry.js';
 
@@ -51,8 +51,10 @@ export function extractReportConclusionCases(artifactRoot: string): LabelledCase
     const label = reportLabelFromCanonicalVerdict(text);
     if (label === null) continue;
     // The verdict is ground truth, not part of the question. Remove other
-    // explicit verdict lines too if a report format later adds them.
-    const body = lines.filter((_, index) => index !== verdict.index).join('\n').trim();
+    // explicit verdict lines too if a report format later adds them, then
+    // summarise with the SAME bounded function production uses so a long
+    // report is summarised, never tail-truncated, on both sides.
+    const body = summariseReportBody(lines.filter((_, index) => index !== verdict.index).join('\n').trim());
     if (body === '') continue;
     cases.push({
       id: `reportconclusion-${handback['jobId']}`,
