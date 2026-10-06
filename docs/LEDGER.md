@@ -77,7 +77,9 @@ lens:   pending → live → done | error               (terminal: the last two)
 - **Administrative closeout** (`adminCloseParkedJob`, owner ruling
   j-1115) is the ONE exception path that closes a parked PR-backed lane
   without faking a hop: the generic machine still refuses parked → done,
-  and only this guarded operation admits `parked → done`. It requires an
+  and only this guarded operation admits the direct `parked → done` edge.
+  (A lane resumed through its normal lifecycle still reaches `done` by
+  the ordinary route — this edge exists for a lane that never resumes.) It requires an
   explicit expected status + PR url + head, the job's LATEST recorded
   `github.branch-state` observation to say the PR is CLOSED and not
   merged at exactly that url/head, and no target-owned live work

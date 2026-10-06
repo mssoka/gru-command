@@ -1610,8 +1610,8 @@ export class LedgerApi {
       throw new Error('provider merged must be exactly false — a merged PR is never an administrative closeout');
     }
     const headSha = typeof evidence.headSha === 'string' ? evidence.headSha.trim().toLowerCase() : '';
-    if (!/^[0-9a-f]{7,64}$/u.test(headSha)) {
-      throw new Error(`provider head_sha must be a hex commit sha (got ${JSON.stringify(evidence.headSha)})`);
+    if (!/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/u.test(headSha)) {
+      throw new Error(`provider head_sha must be a full 40- or 64-character hex commit sha (got ${JSON.stringify(evidence.headSha)})`);
     }
     const closedAt = evidence.closedAt ?? null;
     if (closedAt !== null && (typeof closedAt !== 'string' || !isRealIsoUtcTimestamp(closedAt))) {
@@ -1625,29 +1625,11 @@ export class LedgerApi {
     return this.transaction(() => {
       const job = this.getJob(input.jobId);
       if (job === null) throw new RecordNotFound(`job "${input.jobId}" not found`);
-      // Target identity first: a request about another PR/lane never
-      // matches, whatever the current status.
-      if (job.prUrl === null) {
-        throw new AdminCloseoutRefusal(
-          'not-pr-backed',
-          `job "${job.id}" has no registered PR — administrative closeout closes PR-backed lanes only`,
-        );
-      }
-      if (job.deliverable !== null && job.deliverable !== 'pr') {
-        throw new AdminCloseoutRefusal(
-          'not-pr-owing',
-          `job "${job.id}" is a ${job.deliverable} lane — report-only lanes are outside the administrative closeout`,
-        );
-      }
-      if (job.prUrl !== expectedPrUrl) {
-        throw new AdminCloseoutRefusal(
-          'target-mismatch',
-          `job "${job.id}" registers PR "${job.prUrl}", not "${expectedPrUrl}" — stale target identity`,
-        );
-      }
       // Replay identity covers every validated request field in a fixed
       // order: a changed request is a different identity, never a silent
-      // overwrite of the recorded closeout.
+      // overwrite of the recorded closeout. It is checked BEFORE the
+      // current-row target guards so an identical retry still returns the
+      // recorded event even if the lane's pr_url was later re-pointed.
       const requestSha256 = createHash('sha256')
         .update(
           JSON.stringify({
@@ -1676,6 +1658,26 @@ export class LedgerApi {
             : `job "${job.id}" is already done under a DIFFERENT administrative closeout request (event ${recorded.seq}); a changed request never overwrites the recorded one`,
         );
       }
+      // Target identity next: a request about another PR/lane never
+      // matches, whatever the current status.
+      if (job.prUrl === null) {
+        throw new AdminCloseoutRefusal(
+          'not-pr-backed',
+          `job "${job.id}" has no registered PR — administrative closeout closes PR-backed lanes only`,
+        );
+      }
+      if (job.deliverable !== null && job.deliverable !== 'pr') {
+        throw new AdminCloseoutRefusal(
+          'not-pr-owing',
+          `job "${job.id}" is a ${job.deliverable} lane — report-only lanes are outside the administrative closeout`,
+        );
+      }
+      if (job.prUrl !== expectedPrUrl) {
+        throw new AdminCloseoutRefusal(
+          'target-mismatch',
+          `job "${job.id}" registers PR "${job.prUrl}", not "${expectedPrUrl}" — stale target identity`,
+        );
+      }
       if (job.status !== 'parked') {
         throw new AdminCloseoutRefusal(
           'not-parked',
@@ -1698,6 +1700,15 @@ export class LedgerApi {
         throw new AdminCloseoutRefusal(
           'target-mismatch',
           `the recorded provider observation names "${observation.prUrl ?? 'no url'}", not "${expectedPrUrl}" — stale target identity`,
+        );
+      }
+      // Defense in depth: when the observation carries a PR number it must
+      // agree with the number the recorded URL names.
+      const urlPrNumber = /\/pull\/(\d+)\/?$/u.exec(parsedPrUrl.pathname)?.[1] ?? null;
+      if (observation.prNumber !== null && urlPrNumber !== null && String(observation.prNumber) !== urlPrNumber) {
+        throw new AdminCloseoutRefusal(
+          'target-mismatch',
+          `the recorded provider observation cites PR #${String(observation.prNumber)} for "${expectedPrUrl}" — inconsistent target identity`,
         );
       }
       if (observation.prOpen === true) {
@@ -1753,6 +1764,7 @@ export class LedgerApi {
           provider: { provider: 'github', state: 'closed', merged: false, head_sha: headSha, closed_at: closedAt },
           observation: {
             event_seq: observationEvent.seq,
+            observed_at: observationEvent.ts,
             pr_url: observation.prUrl,
             pr_number: observation.prNumber,
             sha: observation.sha,

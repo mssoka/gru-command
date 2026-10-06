@@ -603,6 +603,63 @@ describe('obligations — park/terminal act only on APPLICABLE rows; history sur
     expect(rows.find((row) => row.incidentKey === 'r1')?.state).toBe('settled');
     expect(rows.find((row) => row.incidentKey === 'r1')?.settlement?.kind).toBe('executed-action');
   });
+
+  it('administrative closeout closes OPEN and WAITING obligations too, as job-terminal abandonment', () => {
+    api = new LedgerApi(new LedgerDb(tmpDir()).handle, { bus: new EventBus() });
+    api.addJob({ id: 'job-closeout-states', repo: 'r', title: 'Job closeout states' });
+    api.setJobStatus('job-closeout-states', 'working');
+    api.setJobStatus('job-closeout-states', 'blocked', ownerHoldContext(api.latestEventSeq()));
+    api.setJobStatus('job-closeout-states', 'parked');
+    // A new incident recorded while parked opens a fresh row (parking only
+    // suspended the rows that existed at the transition).
+    const openRow = api.recordBlockedObservation('job-closeout-states', {
+      logicalStep: 'verification',
+      category: { kind: 'known', category: 'quality-gate' },
+      incidentKey: 'gate-after-park',
+      observedAtSeq: api.latestEventSeq(),
+    });
+    expect(openRow.state).toBe('open');
+    // A delegated receipt expectation is the `waiting` state.
+    api.armReceiptExpectation({
+      obligationId: openRow.id,
+      receiptKind: 'job.delivered',
+      deadlineAt: '2099-01-01T00:00:00.000Z',
+    });
+    expect(api.getObligation(openRow.id)?.state).toBe('waiting');
+    // A separate open row stays open alongside it.
+    const secondOpen = api.recordBlockedObservation('job-closeout-states', {
+      logicalStep: 'review',
+      category: { kind: 'known', category: 'review-verdict' },
+      incidentKey: 'review-after-park',
+      observedAtSeq: api.latestEventSeq(),
+    });
+    expect(secondOpen.state).toBe('open');
+
+    const prUrl = 'https://github.com/mssoka/gru-command/pull/165';
+    const sha = '3c44e87e2e9e64cbc3301d7806540df6273438e6';
+    api.setJobPr('job-closeout-states', prUrl);
+    api.appendCustomEvent({
+      kind: 'github.branch-state',
+      jobId: 'job-closeout-states',
+      payload: branchStatePayload(
+        { jobId: 'job-closeout-states', repo: { host: 'github.com', owner: 'mssoka', repo: 'gru-command' }, branch: 'gru/job-closeout-states', prNumber: 165, prUrl },
+        { sha, merged: false, prOpen: false, mergeableState: 'dirty', ci: null, prNumber: 165, prUrl, mergeCommitSha: null },
+      ),
+    });
+    api.adminCloseParkedJob({
+      jobId: 'job-closeout-states',
+      expectedStatus: 'parked',
+      expectedPrUrl: prUrl,
+      provider: { provider: 'github', state: 'closed', merged: false, headSha: sha, closedAt: '2026-10-05T05:06:52Z' },
+      reason: 'owner-authorized administrative closeout (j-1115)',
+    });
+
+    const rows = api.listObligations({ jobId: 'job-closeout-states' });
+    expect(rows.every((row) => row.state === 'closed' || row.state === 'settled')).toBe(true);
+    for (const row of rows) {
+      if (row.state === 'closed') expect(row.settlement).toEqual({ kind: 'job-terminal', jobStatus: 'done' });
+    }
+  });
 });
 
 describe('obligations — restart persistence, reclassification, authority validation', () => {

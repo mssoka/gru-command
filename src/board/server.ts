@@ -491,6 +491,9 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
             return;
           }
           const body = (await readBody(req)) as Record<string, unknown>;
+          if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+            throw new Error('request body must be a JSON object');
+          }
           const expectedStatus = strField(body, 'expected_status');
           if (expectedStatus !== 'parked') {
             throw new Error(`expected_status must be "parked" (got "${expectedStatus}")`);
@@ -513,7 +516,13 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
             throw new Error('field "provider.merged" must be exactly false');
           }
           const headSha = strField(provider, 'head_sha');
-          const closedAt = optStrField(provider, 'closed_at');
+          // Present-but-empty is a loud 400, never silent omission (same
+          // doctrine as decisionOptStrField).
+          const closedAtRaw = provider['closed_at'];
+          if (closedAtRaw !== undefined && (typeof closedAtRaw !== 'string' || closedAtRaw === '')) {
+            throw new Error('field "provider.closed_at" must be a non-empty string when present');
+          }
+          const closedAt = typeof closedAtRaw === 'string' ? closedAtRaw : undefined;
           const reason = strField(body, 'reason');
           json(
             res,
@@ -614,11 +623,12 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
         // RecordNotFound for missing entities; a missing/unreadable
         // transcript FILE is also a not-found. Everything else is a 400
         // except a guarded closeout refusal, which is a typed 409.
-        const notFound =
-          error instanceof RecordNotFound ||
-          (error instanceof Error && error.message.includes('transcript unreadable'));
         const refused = error instanceof AdminCloseoutRefusal;
-        json(res, notFound ? 404 : refused ? 409 : 400, refused
+        const notFound =
+          !refused &&
+          (error instanceof RecordNotFound ||
+            (error instanceof Error && error.message.includes('transcript unreadable')));
+        json(res, refused ? 409 : notFound ? 404 : 400, refused
           ? { error: 'closeout_refused', code: error.code, detail: message }
           : { error: notFound ? 'not_found' : 'bad_request', detail: message });
       }

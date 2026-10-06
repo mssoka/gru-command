@@ -290,6 +290,7 @@ describe('board server — HTTP API', () => {
       { ...validBody, provider: { ...validBody.provider, merged: true } },
       { ...validBody, provider: { ...validBody.provider, head_sha: 'nope' } },
       { ...validBody, provider: { ...validBody.provider, closed_at: 'not-a-time' } },
+      { ...validBody, provider: { ...validBody.provider, closed_at: '' } },
       { ...validBody, expected_pr_url: '' },
       { ...validBody, expected_pr_url: 'not-a-url' },
       { ...validBody, reason: '' },
@@ -297,6 +298,10 @@ describe('board server — HTTP API', () => {
       const bad = await postJson(port, '/api/jobs/x/closeout', 'board-test-token', body);
       expect(bad.status, JSON.stringify(body)).toBe(400);
     }
+    // A literal JSON null body is a named 400, never a raw TypeError detail.
+    const nullBody = await postJson(port, '/api/jobs/x/closeout', 'board-test-token', null);
+    expect(nullBody.status).toBe(400);
+    expect((nullBody.body as { detail: string }).detail).toContain('JSON object');
     expect((await postJson(port, '/api/jobs/ghost/closeout', 'board-test-token', validBody)).status).toBe(404);
 
     // A parked lane whose recorded provider observation is still OPEN is
@@ -342,6 +347,35 @@ describe('board server — HTTP API', () => {
     expect(mismatch.status).toBe(409);
     expect(mismatch.body).toMatchObject({ error: 'closeout_refused', code: 'target-mismatch' });
     expect(api.getJob('target-http')?.status).toBe('parked');
+
+    // A refusal message that happens to contain the transcript sentinel
+    // still maps to the typed 409, never the transcript 404.
+    const sentinel = await postJson(port, '/api/jobs/target-http/closeout', 'board-test-token', {
+      ...validBody,
+      expected_pr_url: 'https://github.com/mssoka/gru-command/transcript unreadable/pull/165',
+    });
+    expect(sentinel.status).toBe(409);
+    expect(sentinel.body).toMatchObject({ error: 'closeout_refused', code: 'target-mismatch' });
+
+    // Live work rides the same typed 409 mapping.
+    api.addJob({ id: 'live-http', repo: 'demo-repo', title: 'Live' });
+    api.setJobStatus('live-http', 'working');
+    api.setJobPr('live-http', prUrl);
+    api.setJobStatus('live-http', 'in-review');
+    api.setJobStatus('live-http', 'parked');
+    api.appendCustomEvent({
+      kind: 'github.branch-state',
+      jobId: 'live-http',
+      payload: branchStatePayload(
+        { jobId: 'live-http', repo: { host: 'github.com', owner: 'mssoka', repo: 'gru-command' }, branch: 'gru/live-http', prNumber: 165, prUrl },
+        { sha: head, merged: false, prOpen: false, mergeableState: 'dirty', ci: null, prNumber: 165, prUrl, mergeCommitSha: null },
+      ),
+    });
+    api.registerAgent({ id: 'live-http-worker', role: 'minion', jobId: 'live-http' });
+    api.setAgentState('live-http-worker', 'streaming');
+    const liveRefused = await postJson(port, '/api/jobs/live-http/closeout', 'board-test-token', validBody);
+    expect(liveRefused.status).toBe(409);
+    expect(liveRefused.body).toMatchObject({ error: 'closeout_refused', code: 'live-work' });
   });
 
   it('closeout endpoint: the guarded success is audited, idempotent, and the board stops presenting the lane as an open PR', async () => {
@@ -383,6 +417,12 @@ describe('board server — HTTP API', () => {
     const replay = await postJson(port, `/api/jobs/${jobId}/closeout`, 'board-test-token', body);
     expect(replay.status).toBe(200);
     expect(replay.body).toMatchObject({ idempotent: true, event: { seq: acceptedBody.event.seq }, job: { status: 'done' } });
+    expect(api.listJobEventsByKinds(jobId, ['job.admin-closeout'])).toHaveLength(1);
+
+    // A changed request against the closed lane is the typed 409.
+    const changed = await postJson(port, `/api/jobs/${jobId}/closeout`, 'board-test-token', { ...body, reason: 'a different request' });
+    expect(changed.status).toBe(409);
+    expect(changed.body).toMatchObject({ error: 'closeout_refused', code: 'already-closed' });
     expect(api.listJobEventsByKinds(jobId, ['job.admin-closeout'])).toHaveLength(1);
 
     const snapshot = (await getJson(port, '/api/board', 'board-test-token')).body as {
