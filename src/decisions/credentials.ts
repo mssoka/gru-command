@@ -82,7 +82,9 @@ function resolveFile(instanceDir: string, slot: CredentialSlot): CredentialResol
     if (!fileInfo.isFile() || !unixOwnershipSafe(file, 0o600)) {
       return { state: 'unsafe', source: 'file' };
     }
-    const key = readFileSync(file, 'utf8');
+    // An editor save appends a final newline (vim's fixeol); that must not
+    // turn a valid single-line key into credential_invalid.
+    const key = withoutFinalNewline(readFileSync(file, 'utf8'));
     if (!validKey(key)) return { state: 'invalid', source: 'file' };
     return { state: 'present', source: 'file', key };
   } catch (error) {
@@ -110,8 +112,14 @@ export function resolveCredential(
   return resolveFile(instanceDir, slot as CredentialSlot);
 }
 
+/** One final line terminator is a file/stdin convention (editors and `echo`
+ * add it), not a second line. Anything else stays the caller's to reject. */
+function withoutFinalNewline(raw: string): string {
+  return raw.endsWith('\r\n') ? raw.slice(0, -2) : raw.endsWith('\n') ? raw.slice(0, -1) : raw;
+}
+
 export function parseCredentialStdin(input: string): string {
-  const key = input.endsWith('\r\n') ? input.slice(0, -2) : input.endsWith('\n') ? input.slice(0, -1) : input;
+  const key = withoutFinalNewline(input);
   if (!validKey(key)) {
     throw new Error('credential must be one non-empty line with no leading/trailing whitespace');
   }
