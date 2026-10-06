@@ -56,8 +56,15 @@ export function incidentKeyOf(row: IncidentRow): string {
  * `incident:<kind>:<normalized title>`. Decision writers recording a hold
  * against a machine alert must use the SAME derivation — the awareness
  * layer consults exactly this subject.
+ *
+ * Job-scoped kinds are colon-scoped (`github.ci-failed:<job>:<sha>`)
+ * plus the one dot-scoped producer that names its lane,
+ * `silas.rebrief-unreconciled.<job>` — a job hold must defer that row,
+ * so it maps to the same job subject.
  */
 export function incidentSubjectOf(row: IncidentRow): string {
+  const rebrief = /^silas\.rebrief-unreconciled\.([^.]+)$/.exec(row.kind);
+  if (rebrief !== null) return `job:${rebrief[1] ?? ''}`;
   const colon = row.kind.indexOf(':');
   if (colon > 0 && colon < row.kind.length - 1) {
     const scope = row.kind.slice(colon + 1);
@@ -73,9 +80,12 @@ export function incidentSubjectOf(row: IncidentRow): string {
  * The signal family the row raises — the token a decision's `covers` list
  * names (`pr-conflict`, `ci-failed`, …). Producer namespacing
  * (`github.`, `silas.`) is stripped and the scope suffix dropped;
- * unscoped kinds are their own signal.
+ * unscoped kinds are their own signal. The dot-scoped rebrief producer
+ * maps to its family token like the colon-scoped ones.
  */
 export function incidentSignalOf(row: IncidentRow): string {
+  const rebrief = /^silas\.rebrief-unreconciled\./.exec(row.kind);
+  if (rebrief !== null) return 'rebrief-unreconciled';
   const withoutNamespace = row.kind.replace(/^(github|silas)\./, '');
   const colon = withoutNamespace.indexOf(':');
   const family = colon > 0 ? withoutNamespace.slice(0, colon) : withoutNamespace;

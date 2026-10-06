@@ -193,6 +193,19 @@ export class WakePolicy {
     return this.scheduleDecision(atMs);
   }
 
+  /** Routing/severity/mode eligibility WITHOUT dedupe or schedule — the
+   * admission boundary re-check (issue #102) runs this for an
+   * already-claimed batch, whose members are by then in the dedupe state
+   * by design. Returns the skip reason, or null when still eligible. */
+  gate(candidate: WakeCandidate): WakeSkipReason | null {
+    if (this.config.mode === 'never') return 'mode';
+    const routingWakes =
+      candidate.routing === 'action-required' || this.config.mode === 'all';
+    if (!routingWakes) return 'routing';
+    if (SEVERITY_RANK[candidate.severity] < SEVERITY_RANK[this.config.minSeverity]) return 'severity';
+    return null;
+  }
+
   /** Rate-limit + quiet-hours decision for a pending batch at one instant
    * (no candidate gates; the batch members already passed them). */
   scheduleDecision(atMs: number): WakeDecision {
@@ -246,6 +259,13 @@ export class WakePolicy {
    * truth); only the wake-eligibility claim is released. */
   forgetIncident(key: string): boolean {
     return this.wokenIncidents.delete(key);
+  }
+
+  /** Is this notification id already claimed by a delivered wake? The
+   * pending-set prune uses this: an id claimed by receipt replay is DONE
+   * and must not sit in pending waiting to re-prompt. */
+  claimed(id: string): boolean {
+    return this.woken.has(id);
   }
 
   snapshot(): WakePolicyState {

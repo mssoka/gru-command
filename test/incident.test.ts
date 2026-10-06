@@ -76,3 +76,22 @@ describe('incident identity (issue #219)', () => {
     expect(isHardFloorRow({ kind: 'supervision.turn-orphaned.a2', title: 'x', routing: 'action-required' })).toBe(false);
   });
 });
+
+describe('incident identity — review additions (issue #219)', () => {
+  it('maps the dot-scoped rebrief producer onto its job subject and family signal', () => {
+    const row = { kind: 'silas.rebrief-unreconciled.j-42', title: 'Re-brief unreconciled', routing: 'action-required' as const };
+    expect(incidentSubjectOf(row)).toBe('job:j-42');
+    expect(incidentSignalOf(row)).toBe('rebrief-unreconciled');
+    // Key + basis remain the stable incident identity (no sha in the kind;
+    // the unscoped title normalization applies).
+    expect(incidentKeyOf(row)).toBe('silas.rebrief-unreconciled.j-42:re-brief-unreconciled');
+    expect(incidentBasisOf(row)).toBe('silas.rebrief-unreconciled.j-42:re-brief-unreconciled');
+  });
+
+  it('does not mistake other dot-scoped kinds for job subjects', () => {
+    const row = { kind: 'supervision.provider-wall.a1.quota_wall', title: 'Agent a1 stopped: quota wall', routing: 'action-required' as const };
+    expect(incidentSubjectOf(row)).toBe(
+      'incident:supervision.provider-wall.a1.quota_wall:agent-a1-stopped-quota-wall',
+    );
+  });
+});

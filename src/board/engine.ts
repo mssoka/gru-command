@@ -273,8 +273,10 @@ export interface BoardSnapshot {
     /** Issue #219: wakes that did NOT open (avoidance), with per-reason
      * counts. Reasons: 'duplicate' (incident already woken), 'covered'
      * (hold-covered deferral, #218), 'failed' (bounded retries spent; the
-     * truthful owner escalation replaced the autonomous path, #115). */
-    readonly deferred: { readonly count: number; readonly reasons: Readonly<Record<string, number>> };
+     * truthful owner escalation replaced the autonomous path, #115).
+     * `truncated` flags a tally that hit the scan cap — the counts are a
+     * lower bound, never silently presented as the total. */
+    readonly deferred: { readonly count: number; readonly reasons: Readonly<Record<string, number>>; readonly truncated: boolean };
   };
   /** Running build vs origin/main (null when the tracker is unwired). */
   readonly build: DeployDriftView | null;
@@ -824,12 +826,13 @@ export class BoardEngine {
   /** Deferred-wake tally (issue #219): per-reason counts over the durable
    * `gru.wake-deferred` avoidance stream. Paged and capped — the stream
    * grows once per suppressed wake, never per notification event. */
-  private deferredWakes(): { readonly count: number; readonly reasons: Readonly<Record<string, number>> } {
+  private deferredWakes(): { readonly count: number; readonly reasons: Readonly<Record<string, number>>; readonly truncated: boolean } {
     const MAX_SCAN = 20_000;
     const reasons: Record<string, number> = {};
     let count = 0;
     let cursor = 0;
     let scanned = 0;
+    let truncated = false;
     for (;;) {
       const page = this.ledger.listEventsAfter(cursor, { kinds: ['gru.wake-deferred'], limit: 500 });
       for (const event of page) {
@@ -843,9 +846,13 @@ export class BoardEngine {
         reasons[key] = (reasons[key] ?? 0) + 1;
         count += 1;
       }
-      if (page.length < 500 || scanned >= MAX_SCAN) break;
+      if (page.length < 500) break;
+      if (scanned >= MAX_SCAN) {
+        truncated = true;
+        break;
+      }
     }
-    return { count, reasons };
+    return { count, reasons, truncated };
   }
 
   /** The FOR YOU PR projection: one authoritative, evidence-bound ready

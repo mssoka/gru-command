@@ -657,13 +657,28 @@ export class BoardView {
     this.unackedChip.title = `${needsGru} live machine-attention notification${needsGru === 1 ? '' : 's'} awaiting a Gru disposition — the live queue clears itself; closed receipts stay in the record and the owner bell is not rung.`;
     // Wake tracker: every autonomous wake is a durable `gru.wake` event;
     // the count/last fire stamp makes the wake path visible on the board.
+    // Issue #219: deferred (avoided) wakes render here too — counts and
+    // reasons — so suppression is as visible as firing.
     const wakes = snapshot.wakes;
-    this.wakesChip.hidden = wakes.count === 0;
-    this.wakesChip.textContent = `⚡ ${wakes.count} wake${wakes.count === 1 ? '' : 's'}`;
+    const deferred = wakes.deferred;
+    const deferredCount = deferred?.count ?? 0;
+    this.wakesChip.hidden = wakes.count === 0 && deferredCount === 0;
+    this.wakesChip.textContent =
+      `⚡ ${wakes.count} wake${wakes.count === 1 ? '' : 's'}` +
+      (deferredCount > 0 ? ` · ${deferredCount} deferred` : '') +
+      (deferred?.truncated === true ? '+' : '');
     this.wakesChip.title =
-      wakes.count === 0
+      wakes.count === 0 && deferredCount === 0
         ? 'No autonomous Gru wakes yet.'
-        : `${wakes.count} autonomous Gru wake turn${wakes.count === 1 ? '' : 's'} opened; last ${wakes.lastAt !== null ? formatTs(wakes.lastAt) : '—'}.`;
+        : `${wakes.count} autonomous Gru wake turn${wakes.count === 1 ? '' : 's'} opened; last ${wakes.lastAt !== null ? formatTs(wakes.lastAt) : '—'}.` +
+          (deferredCount > 0
+            ? ` ${deferredCount}${deferred?.truncated === true ? '+' : ''} wake demand${deferredCount === 1 ? '' : 's'} deferred (avoided): ` +
+              Object.entries(deferred?.reasons ?? {})
+                .sort(([a], [b]) => b.localeCompare(a))
+                .map(([reason, n]) => `${n} ${reason}`)
+                .join(', ') +
+              (deferred?.truncated === true ? ' — tally truncated at the scan cap' : '')
+            : '');
   }
 
   // ------------------------------------------------------------------

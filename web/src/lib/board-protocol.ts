@@ -312,8 +312,13 @@ export interface BoardSnapshot {
     readonly count: number;
     readonly lastAt: string | null;
     /** Issue #219: avoidance counts with reasons; absent on pre-upgrade
-     * servers (validator tolerates). */
-    readonly deferred?: { readonly count: number; readonly reasons: Readonly<Record<string, number>> } | null;
+     * servers (validator tolerates). `truncated` = the server tally hit
+     * its scan cap (counts are a lower bound). */
+    readonly deferred?: {
+      readonly count: number;
+      readonly reasons: Readonly<Record<string, number>>;
+      readonly truncated?: boolean;
+    } | null;
   };
   /** Absent on pre-v4 servers (validator tolerates; consumers render n/a). */
   readonly build?: BuildView | null;
@@ -723,6 +728,7 @@ function isWakesView(value: unknown): boolean {
     for (const count of Object.values(deferred.reasons)) {
       if (typeof count !== 'number' || !Number.isSafeInteger(count) || count < 0) return false;
     }
+    if (deferred.truncated !== undefined && typeof deferred.truncated !== 'boolean') return false;
   }
   return true;
 }

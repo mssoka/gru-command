@@ -712,6 +712,10 @@ describe('buildYieldReport and renderTextReport', () => {
     expect(text).toContain('non-terminal WIP 4');
     expect(text).toContain('cost per finished heist $5.00');
     expect(text).toContain('unparsable lines');
+    // Issue #219 / #214: the cost headline renders (deleting the line must
+    // fail this test, not just the measures assertions above).
+    expect(text).toMatch(/wakes\/day [\d.]+/);
+    expect(text).toMatch(/avoided \d+ duplicate\(s\) \+ \d+ covered \(\d+(\.\d+)?%|n\/a\)/);
   });
 
   it('never prints prompt or transcript text — counts and bounded identifiers only', async () => {
