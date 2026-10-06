@@ -7,6 +7,7 @@ import type { AgentHandle, NativeAgentTool, PromptOptions } from '../../runtime/
 import type { PacingGate, PacingLease, PacingEventRecorder, RateLimitBackoffPolicy } from '../../runtime/pacing.js';
 import { withRateLimitRetries, type RateLimitRetryOptions } from '../../runtime/rate-limit-retry.js';
 import { assertFrozenPromptBounds, compatibleReviewIdentity, proveRecoveredBaseMergeability, publishedReportMatches, readReviewArtifact, readReviewCheckpoint, sourceMovementSinceFreeze, SPECIALIST_CHECKPOINT_MAX_BYTES, writeReviewArtifact, type FrozenReview, type SourceMovement, type SourceMovementOptions } from './artifacts.js';
+import { classifyPriorFindings, convergedVerdict, deltaSince, partitionConvergedFindings, type DeltaSince, type PriorCarryClassification } from './convergence.js';
 import { readFrozenEvidenceBytes, renderEvidencePromptSection } from '../../review-inputs/evidence.js';
 import { finalAssistantText } from './session-output.js';
 import { PERKINS_FINDING_SOURCES, PERKINS_LENSES, type PerkinsFindingSource, type PerkinsLens, type PerkinsPolicy } from './policy.js';
@@ -175,6 +176,14 @@ export interface RunWholeReviewInput {
     readonly lens: PerkinsLens; readonly attempt: 1 | 2; readonly directory: string;
     readonly manifestSha256: string; readonly sha256?: string;
   }[];
+  /** Stage-5 review scope: 'delta' reviews the change since the last
+   * reviewed SHA with host carry-forward of untouched priors; 'whole' is
+   * the standing whole-change authority (a job's first review and the
+   * final pass at a READY candidate). Default 'whole'. */
+  readonly reviewScope?: 'whole' | 'delta';
+  /** Prior indexes the implementing minion claimed fixed (fix-directive
+   * receipt); claimed priors are always re-verified by the lead. */
+  readonly claimedFixedPriors?: readonly number[];
   /** Service shutdown or caller cancellation. Cancellation is always INCOMPLETE. */
   readonly signal?: AbortSignal;
 }
@@ -211,6 +220,31 @@ export interface RoundBudgetRefusal {
   readonly accountedRuns: number;
 }
 
+/** The durable Stage-5 convergence record of one completed round (present
+ * whenever a prior round existed). Disclosed in consolidated.json and the
+ * publication appendix; every field is deterministic host output. */
+export interface ReviewConvergence {
+  readonly reviewScope: 'whole' | 'delta';
+  /** Set when the delta could not be read and the round fell back to the
+   * whole-change authority — disclosed, never silent. */
+  readonly deltaUnavailable?: string;
+  readonly deltaFromSha?: string;
+  /** Prior indexes carried forward without lead re-verification. */
+  readonly carriedPriors?: readonly number[];
+  /** Prior indexes the lead had to disposition. */
+  readonly reverifyPriors?: readonly number[];
+  /** New findings deferred as follow-ups by the convergence rule. */
+  readonly deferredFollowups?: readonly {
+    readonly title: string;
+    readonly location: string;
+    readonly severity: 'blocker' | 'warning' | 'note';
+    readonly reason: string;
+  }[];
+  /** Set only when the host recomputed the canonical verdict because a
+   * deferred blocker changed the converged blocker set. */
+  readonly verdictRecomputed?: { readonly from: CanonicalReviewVerdict; readonly to: CanonicalReviewVerdict };
+}
+
 export interface PerkinsWholeResult {
   readonly canonicalVerdict: CanonicalReviewVerdict;
   readonly findings: readonly VerifiedFinding[];
@@ -224,6 +258,9 @@ export interface PerkinsWholeResult {
   readonly sourceMovement?: SourceMovement;
   readonly lensEnvelopes: readonly LensEnvelope[];
   readonly budgetRefusals?: readonly RoundBudgetRefusal[];
+  /** Present whenever the round ran with a prior (delta or final whole
+   * pass): the durable Stage-5 convergence record. */
+  readonly convergence?: ReviewConvergence;
 }
 
 interface SpecialistResult extends SpecialistRun {
@@ -359,6 +396,9 @@ interface SubmissionValidationContext {
   readonly movementRef: string;
   readonly prior: readonly VerifiedFinding[];
   readonly priorTargetSha: string | null;
+  /** Host-carried prior indexes (delta rounds): still-present without a
+   * lead disposition; a lead disposition on one is a violation. */
+  readonly carriedPriors: ReadonlySet<number>;
   /** Lenses with a committed VALID specialist result; a lead finding may
    * never be attributed to a lens that did not actually run. */
   readonly validLenses: ReadonlySet<PerkinsLens>;
@@ -727,6 +767,7 @@ function renderSpecialistPrompt(
   lens: PerkinsLens,
   output: ChildOutputMode,
   retry?: { readonly attempt: 1 | 2; readonly previous: SpecialistAttemptFailure },
+  deltaSection?: string,
 ): string {
   const contracts = policy.portableContract.outputContracts;
   const rawContract = lens === 'blind'
@@ -754,7 +795,8 @@ function renderSpecialistPrompt(
       '{{SPEC_CONTEXT}}': review.specContext,
       '{{LENS_BRIEF}}': policy.portableContract.lenses[lens],
       '{{LENS}}': lens,
-    })) + (evidenceSection === '' ? '' : `\n\n${evidenceSection}`);
+    })) + (evidenceSection === '' ? '' : `\n\n${evidenceSection}`)
+    + (deltaSection === undefined || deltaSection === '' ? '' : `\n\n${deltaSection}`);
   // A retry is corrective, not a blind repeat: the host delivers the previous
   // attempt's exact failure class and reason in the child's own contract.
   if (retry === undefined || retry.attempt <= 1) return prompt;
@@ -1004,6 +1046,40 @@ export class PerkinsWholeReview {
       : this.policy.portableContract.rules.fullLenses;
     const priorReview = loadPriorReview(input.priorConsolidatedFile);
     const prior = priorReview.findings;
+    // Stage-5 convergence plan (issue #225): the round's review scope and,
+    // for a delta round, the deterministic carry-forward classification of
+    // every prior finding. The whole-change scope never carries: it is the
+    // standing authority (a job's first review, or the final pass at a
+    // READY candidate). An unreadable delta degrades DISCLOSED to whole
+    // authority (every prior re-verified) — never silently.
+    const convergenceRules = this.policy.portableContract.rules.convergence;
+    // A delta round requires a prior target to delta FROM; the caller's
+    // scope decision (nextReviewScope) owns the round-number policy.
+    const reviewScope = input.reviewScope === 'delta' && priorReview.targetSha !== null
+      ? 'delta' as const
+      : 'whole' as const;
+    let delta: DeltaSince | null = null;
+    let deltaUnavailable: string | null = null;
+    if (reviewScope === 'delta') {
+      try {
+        delta = deltaSince(review.manifest.repoPath, priorReview.targetSha!, review.manifest.targetSha);
+      } catch (error) {
+        deltaUnavailable = sanitizeError(error);
+      }
+    }
+    const classifications: readonly PriorCarryClassification[] = reviewScope === 'delta'
+      ? delta === null || convergenceRules.carryForwardUntouchedPriors !== true
+        ? prior.map((_finding, priorIndex) => ({ priorIndex, status: 'reverify' as const, reason: deltaUnavailable !== null ? `delta since the last reviewed SHA unavailable (${deltaUnavailable}) — whole-change re-verification` : 'carry-forward disabled by policy' }))
+        : classifyPriorFindings({
+          prior,
+          touchedPaths: delta.touchedPaths,
+          ...(input.claimedFixedPriors !== undefined ? { claimedFixedPriors: input.claimedFixedPriors } : {}),
+          frozenBlobContains: (path, evidence) => frozenBlobContains(review, path, evidence),
+        })
+      : [];
+    const carriedPriors = classifications.filter((classification) => classification.status === 'carried');
+    const reverifyPriors = classifications.filter((classification) => classification.status === 'reverify');
+    const carriedIndexes = new Set(carriedPriors.map((classification) => classification.priorIndex));
     const attempts = new Map<string, number>();
     const results = new Map<string, SpecialistResult>();
     const envelopes: LensEnvelope[] = [];
@@ -1296,6 +1372,7 @@ export class PerkinsWholeReview {
           renderSpecialistPrompt(
             this.policy, review, lens, nativeSubmit ? 'nativeTool' : 'text',
             attempt > 1 && previous !== undefined ? { attempt, previous } : undefined,
+            deltaPromptSection === '' ? undefined : deltaPromptSection,
           ),
           null, `lens:${lens}#${attempt}`,
           [signal, input.signal],
@@ -1963,6 +2040,7 @@ export class PerkinsWholeReview {
       movementRef: input.movementRef,
       prior,
       priorTargetSha: priorReview.targetSha,
+      carriedPriors: carriedIndexes,
       get validLenses() {
         const valid = new Set<PerkinsLens>();
         for (const result of results.values()) {
@@ -2112,6 +2190,28 @@ export class PerkinsWholeReview {
             sources: [finding.source],
             roundOrigin: input.roundNumber,
           }));
+          // Stage-5 convergence rule (delta rounds, from the policy round):
+          // new findings outside this round's delta hunks are deferred as
+          // follow-ups — recorded and disclosed, never dropped — and a
+          // deferred blocker cannot hold the PR. Applied before dedupe so
+          // the flag survives merging into an older finding.
+          const partition = delta !== null && reviewScope === 'delta' && submission.verdict !== 'INCOMPLETE'
+            ? partitionConvergedFindings({
+              roundNumber: input.roundNumber,
+              fromRound: convergenceRules.convergenceRuleFromRound,
+              findings: leadFindings,
+              hunks: delta.hunks,
+            })
+            : { converged: leadFindings, deferred: [] as readonly { readonly finding: VerifiedFinding; readonly reason: string }[] };
+          const deferredLead = partition.deferred.map(({ finding, reason }) => ({
+            ...finding,
+            deferredFollowup: true as const,
+            verification: {
+              disposition: finding.verification.disposition,
+              evidence: finding.verification.evidence,
+              reason: `${finding.verification.reason}; ${reason}`,
+            },
+          }));
           // Still-present prior findings carry their original round marker so
           // a fresh rediscovery merges INTO the original, never replaces it.
           // An optional refresh updates the CURRENT citation/severity for
@@ -2139,7 +2239,50 @@ export class PerkinsWholeReview {
                 : {}),
             });
           }
-          const findings = dedupeVerifiedFindings([...carried, ...leadFindings]);
+          // Host-carried priors (delta-round carry-forward): still-present
+          // WITHOUT a lead disposition — the host re-verified them
+          // deterministically (quoted evidence unchanged, cited file
+          // untouched by the delta).
+          const hostCarried: VerifiedFinding[] = carriedPriors.map(({ priorIndex }) => {
+            const original = prior[priorIndex]!;
+            const { chunks: _legacyChunks, ...clean } = original as VerifiedFinding & { chunks?: unknown };
+            return clean;
+          });
+          const hostCarriedDispositions: PriorDisposition[] = carriedPriors.map(({ priorIndex, reason }) => ({
+            prior_index: priorIndex,
+            status: 'still-present' as const,
+            note: `carried forward by the host (Stage-5 carry-forward): ${reason}`,
+          }));
+          const findings = dedupeVerifiedFindings([...hostCarried, ...carried, ...partition.converged, ...deferredLead]);
+          // Convergence verdict: when a deferred blocker exists, the
+          // converged blocker set — everything except deferred blockers —
+          // determines the canonical verdict by the SAME deterministic
+          // mapping the lead is guided by. A divergence is disclosed, never
+          // silent; INCOMPLETE is never rewritten.
+          let canonicalVerdict: CanonicalReviewVerdict = submission.verdict;
+          let verdictRecomputed: ReviewConvergence['verdictRecomputed'];
+          if (deferredLead.some((finding) => finding.severity === 'blocker') && submission.verdict !== 'INCOMPLETE') {
+            const blockingBlockers = findings.filter((finding) => finding.severity === 'blocker' && finding.deferredFollowup !== true).length;
+            const expected = convergedVerdict(blockingBlockers);
+            if (expected !== submission.verdict) {
+              verdictRecomputed = { from: submission.verdict, to: expected };
+              canonicalVerdict = expected;
+            }
+          }
+          const convergence: ReviewConvergence = {
+            reviewScope,
+            ...(deltaUnavailable !== null ? { deltaUnavailable } : {}),
+            ...(delta !== null ? { deltaFromSha: delta.fromSha } : {}),
+            ...(carriedPriors.length > 0 ? { carriedPriors: carriedPriors.map((classification) => classification.priorIndex).sort((left, right) => left - right) } : {}),
+            ...(reviewScope === 'delta' ? { reverifyPriors: reverifyPriors.map((classification) => classification.priorIndex).sort((left, right) => left - right) } : {}),
+            ...(deferredLead.length > 0 ? {
+              deferredFollowups: deferredLead.map((finding) => ({
+                title: finding.title, location: finding.location, severity: finding.severity,
+                reason: finding.verification.reason,
+              })),
+            } : {}),
+            ...(verdictRecomputed !== undefined ? { verdictRecomputed } : {}),
+          };
           const specialistRuns = [...results.values()].map((result) => ({
             lens: result.lens, attempt: result.attempt, status: result.status,
             ...(result.failureKind !== undefined ? { failureKind: result.failureKind } : {}),
@@ -2153,24 +2296,27 @@ export class PerkinsWholeReview {
           writeReviewArtifact(review, 'consolidated.json', {
             schemaVersion: 3,
             architecture: 'perkins-whole-pr',
-            canonicalVerdict: submission.verdict,
-            complete: submission.verdict !== 'INCOMPLETE' && !headMoved,
+            canonicalVerdict,
+            submittedVerdict: submission.verdict,
+            complete: canonicalVerdict !== 'INCOMPLETE' && !headMoved,
             headMoved,
             findings,
-            priorDispositions: submission.prior_dispositions,
+            priorDispositions: [...hostCarriedDispositions, ...submission.prior_dispositions],
+            convergence,
             frozen: review.manifest,
             specialistRuns,
           });
           accepted = {
-            canonicalVerdict: submission.verdict, findings, priorDispositions: submission.prior_dispositions,
+            canonicalVerdict, findings, priorDispositions: [...hostCarriedDispositions, ...submission.prior_dispositions],
             specialistRuns, artifactDirectory: review.directory, reportFile,
             targetSha: review.manifest.targetSha, diffBaseSha: review.manifest.diffBaseSha,
             headMoved, ...(headMovedAtSubmit !== null ? { sourceMovement: headMovedAtSubmit } : {}), lensEnvelopes: [...envelopes],
             ...(budgetRefusals.length > 0 ? { budgetRefusals: [...budgetRefusals] } : {}),
+            convergence,
           };
           return {
-            text: JSON.stringify({ accepted: true, canonicalVerdict: submission.verdict, findingCount: findings.length }),
-            details: { accepted: true, canonicalVerdict: submission.verdict, findingCount: findings.length },
+            text: JSON.stringify({ accepted: true, canonicalVerdict, findingCount: findings.length, deferredFollowups: deferredLead.length }),
+            details: { accepted: true, canonicalVerdict, findingCount: findings.length, deferredFollowups: deferredLead.length },
             terminate: true,
           };
         } catch (error) {
@@ -2211,7 +2357,23 @@ export class PerkinsWholeReview {
       `--- CHARGED SPECIALIST BUDGET ---\n${specialistsStarted}/${MAX_SPECIALISTS_PER_ROUND} round runs spent; ` +
       catalog.map((lens) => `${lens}: ${attempts.get(lens) ?? 0}/2 attempts`).join(', ') +
       '. These ledger starts remain spent even when their output cannot be authenticated. No previous verdict or clearance is inherited.';
-    const initialPrompt = [this.leadPrompt(review, prior, priorReview.targetSha),
+    const deltaPromptSection = delta === null ? '' : [
+      '--- DELTA SINCE LAST REVIEWED SHA (this round\'s review unit) ---',
+      `From: ${delta.fromSha}`,
+      `To: ${delta.toSha}`,
+      `Touched paths (${delta.touchedPaths.size}): ${[...delta.touchedPaths].sort().join(', ')}`,
+      'Everything below is part of the complete frozen diff; this is the subset this delta round reviews first.',
+      delta.diff,
+    ].join('\n');
+    const initialPrompt = [this.leadPrompt(review, prior, priorReview.targetSha, {
+      reviewScope,
+      delta,
+      deltaUnavailable,
+      carriedPriors,
+      reverifyPriors,
+      roundNumber: input.roundNumber,
+      fromRound: convergenceRules.convergenceRuleFromRound,
+    }),
       ...(input.recoveredBaseTips === undefined || input.recoveredBaseTips.length === 0 ? [] : [
         '--- BASE ADVANCED SINCE RECOVERED SPECIALIST WORK ---',
         `Earlier frozen base tip(s): ${input.recoveredBaseTips.join(', ')}; current frozen ${review.manifest.baseRef} tip: ${review.manifest.baseRefSha}.`,
@@ -2486,9 +2648,18 @@ export class PerkinsWholeReview {
         list.push(disposition);
         byIndex.set(disposition.prior_index, list);
       });
-      // Honest accounting: every prior finding is revisited exactly once.
+      // Honest accounting: every prior finding is revisited exactly once —
+      // by the LEAD for reverify priors, by the HOST for carried priors
+      // (Stage-5 carry-forward: a lead disposition on a carried prior is a
+      // violation, the host's judgment stands).
       for (let priorIndex = 0; priorIndex < context.prior.length; priorIndex += 1) {
         const list = byIndex.get(priorIndex) ?? [];
+        if (context.carriedPriors.has(priorIndex)) {
+          if (list.length > 0) {
+            push(`prior disposition ${priorIndex}`, 'prior-coverage', `prior finding ${priorIndex} is carried forward by the host (quoted evidence unchanged, cited file untouched); do not disposition it`);
+          }
+          continue;
+        }
         if (list.length === 0) push(`prior disposition ${priorIndex}`, 'prior-coverage', `prior finding ${priorIndex} has no disposition`);
         else if (list.length > 1) push(`prior disposition ${priorIndex}`, 'prior-coverage', `prior finding ${priorIndex} is dispositioned more than once`);
       }
@@ -2513,6 +2684,9 @@ export class PerkinsWholeReview {
         ...(dispositions ?? [])
           .filter((disposition) => disposition.status === 'still-present')
           .map((disposition) => context.prior[disposition.prior_index]?.title ?? ''),
+        // Host-carried priors are retained findings too: the report must
+        // account for them even though the lead did not disposition them.
+        ...[...context.carriedPriors].map((priorIndex) => context.prior[priorIndex]?.title ?? ''),
       ].filter((title) => title !== '');
       if (retainedTitles.length > 0) {
         // Hidden HTML comments are not visible prose: titles buried there
@@ -2540,11 +2714,15 @@ export class PerkinsWholeReview {
           ...retainedPriors.map((disposition) => findingPath({
             location: disposition.refresh?.location ?? context.prior[disposition.prior_index]?.location ?? '',
           })),
+          ...[...context.carriedPriors].map((priorIndex) => findingPath({
+            location: context.prior[priorIndex]?.location ?? '',
+          })),
         ].filter((path): path is string => path !== null);
         const retainedBlocker = (findings ?? []).some((finding) => finding.severity === 'blocker') ||
           retainedPriors.some((disposition) =>
-            (disposition.refresh?.severity ?? context.prior[disposition.prior_index]?.severity) === 'blocker');
-        const cleanClaim = findTerminalCleanClaim(visibleReport, retainedLocations, retainedBlocker, retainedPriors.length > 0);
+            (disposition.refresh?.severity ?? context.prior[disposition.prior_index]?.severity) === 'blocker') ||
+          [...context.carriedPriors].some((priorIndex) => context.prior[priorIndex]?.severity === 'blocker');
+        const cleanClaim = findTerminalCleanClaim(visibleReport, retainedLocations, retainedBlocker, retainedPriors.length > 0 || context.carriedPriors.size > 0);
         if (cleanClaim !== null) {
           push(
             'report',
@@ -2569,10 +2747,64 @@ export class PerkinsWholeReview {
     return { ok: true, submission: { verdict, findings, prior_dispositions: dispositions, report_markdown: report! } };
   }
 
-  private leadPrompt(review: FrozenReview, prior: readonly VerifiedFinding[], priorTargetSha: string | null): string {
+  private leadPrompt(
+    review: FrozenReview,
+    prior: readonly VerifiedFinding[],
+    priorTargetSha: string | null,
+    plan: {
+      readonly reviewScope: 'whole' | 'delta';
+      readonly delta: DeltaSince | null;
+      readonly deltaUnavailable: string | null;
+      readonly carriedPriors: readonly PriorCarryClassification[];
+      readonly reverifyPriors: readonly PriorCarryClassification[];
+      readonly roundNumber: number;
+      readonly fromRound: number;
+    },
+  ): string {
     const evidenceSection = renderEvidencePromptSection(review.evidence.attachments, review.manifest.targetSha);
+    const deltaRound = plan.reviewScope === 'delta' && priorTargetSha !== null;
+    // A delta round lists only the priors the lead must disposition; host-
+    // carried priors are listed separately (accounting, never disposition).
+    const revisitIndexes = deltaRound ? plan.reverifyPriors.map((classification) => classification.priorIndex) : prior.map((_finding, index) => index);
+    const revisit = JSON.stringify(revisitIndexes.map((prior_index) => ({ prior_index, ...prior[prior_index]! })), null, 2);
+    const carriedList = deltaRound && plan.carriedPriors.length > 0
+      ? [
+        '--- PRIOR FINDINGS CARRIED FORWARD (host-verified; do NOT disposition) ---',
+        JSON.stringify(plan.carriedPriors.map((classification) => ({
+          prior_index: classification.priorIndex,
+          title: prior[classification.priorIndex]!.title,
+          location: prior[classification.priorIndex]!.location,
+          severity: prior[classification.priorIndex]!.severity,
+          reason: classification.reason,
+        })), null, 2),
+        'The host re-verified each carried finding deterministically: its quoted evidence is unchanged in the frozen tree and its cited file untouched by this round\'s delta. They remain retained findings — account for every carried title in your report — but they need no disposition from you.',
+        '',
+      ].join('\n')
+      : '';
+    const scopeHeader = deltaRound
+      ? `REVIEW SCOPE: DELTA ROUND — the review unit is the delta since the last reviewed SHA (${priorTargetSha}..${review.manifest.targetSha}). Spend specialist lenses only on lenses relevant to this delta or with open carried findings.`
+      : priorTargetSha !== null
+        ? 'REVIEW SCOPE: WHOLE CHANGE — this is the standing whole-change authority pass (the delta convergence rule does not apply here).'
+        : 'REVIEW SCOPE: WHOLE CHANGE.';
+    const deltaSection = plan.delta === null
+      ? (deltaRound && plan.deltaUnavailable !== null
+        ? `--- DELTA SINCE LAST REVIEWED SHA ---\nUNAVAILABLE: ${plan.deltaUnavailable}\nThis round therefore runs as a disclosed whole-change re-verification: every prior finding is listed for revisiting above.`
+        : '')
+      : [
+        '--- DELTA SINCE LAST REVIEWED SHA (this round\'s review unit) ---',
+        `From: ${plan.delta.fromSha}`,
+        `To: ${plan.delta.toSha}`,
+        `Touched paths (${plan.delta.touchedPaths.size}): ${[...plan.delta.touchedPaths].sort().join(', ')}`,
+        'Everything below is part of the complete frozen diff; this is the subset this delta round reviews first.',
+        plan.delta.diff,
+      ].join('\n');
+    const convergenceRule = deltaRound && plan.roundNumber >= plan.fromRound
+      ? `CONVERGENCE RULE (round ${plan.roundNumber}): only a new finding whose location intersects this round's delta hunks can hold the PR. The host defers new findings outside the delta as follow-ups — recorded and disclosed, never dropped — and a deferred blocker cannot block. Submit the verdict the CONVERGED blocker set implies.`
+      : '';
     return [
       'Conduct the complete Perkins review of this whole change as the lead. You own investigation, verification, prior-finding revisiting, the final report, and the verdict. The host owns safety and terminal validation.',
+      '',
+      scopeHeader,
       '',
       `Frozen target SHA: ${review.manifest.targetSha}`,
       `Frozen diff base SHA: ${review.manifest.diffBaseSha}`,
@@ -2589,12 +2821,15 @@ export class PerkinsWholeReview {
       '',
       '--- COMPLETE FROZEN DIFF (the whole change under review) ---',
       review.diff,
+      ...(deltaSection === '' ? [] : ['', deltaSection]),
       '',
+      ...(carriedList === '' ? [] : [carriedList]),
       '--- PRIOR FINDINGS TO REVISIT ---',
-      JSON.stringify(prior.map((finding, prior_index) => ({ prior_index, ...finding })), null, 2),
+      revisit,
       '',
+      ...(convergenceRule === '' ? [] : [convergenceRule, '']),
       'Investigate the frozen tree with your confined read tools (the review worktree you are rooted in IS the frozen snapshot). Decide yourself whether perkins_run_specialists helps; each specialist sees the whole change.',
-      'For the terminal submission call perkins_submit_review with: your verdict, your final verified findings (source may be "lead" or a lens that actually ran), one prior_dispositions entry per prior_index above (fixed or still-present, each with a short grounded note; for a still-present finding whose code moved, optionally refresh {location, evidence, severity} to the truthful current citation), and the coherent report containing `**Verdict: ...**` and both frozen SHAs.',
+      'For the terminal submission call perkins_submit_review with: your verdict, your final verified findings (source may be "lead" or a lens that actually ran), one prior_dispositions entry per listed prior_index above (fixed or still-present, each with a short grounded note; for a still-present finding whose code moved, optionally refresh {location, evidence, severity} to the truthful current citation), and the coherent report containing `**Verdict: ...**` and both frozen SHAs.',
       'Prefer fewer grounded findings; [] findings is honest. Never claim completion from work you could not do — submit INCOMPLETE instead, and remember INCOMPLETE never approves.',
     ].join('\n');
   }

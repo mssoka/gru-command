@@ -220,6 +220,35 @@ export function fakeWholeSpawner(
       }
       return '[]';
     })()) as unknown[];
+    // Stage-5 delta rounds: host-carried priors are listed separately. The
+    // scripted lead does NOT disposition them but accounts for every
+    // carried title in its report, exactly as the policy demands.
+    const carriedPriors = JSON.parse((() => {
+      const header = '--- PRIOR FINDINGS CARRIED FORWARD (host-verified; do NOT disposition) ---';
+      const start = prompt.indexOf(header);
+      if (start === -1) return '[]';
+      const open = prompt.indexOf('[', start + header.length);
+      if (open === -1) return '[]';
+      let depth = 0;
+      let inString = false;
+      let escaped = false;
+      for (let index = open; index < prompt.length; index += 1) {
+        const character = prompt[index]!;
+        if (inString) {
+          if (escaped) escaped = false;
+          else if (character === '\\') escaped = true;
+          else if (character === '"') inString = false;
+          continue;
+        }
+        if (character === '"') inString = true;
+        else if (character === '[') depth += 1;
+        else if (character === ']') {
+          depth -= 1;
+          if (depth === 0) return prompt.slice(open, index + 1);
+        }
+      }
+      return '[]';
+    })()) as ReadonlyArray<{ prior_index: number; title: string; location: string; severity: string; reason: string }>;
 
     if (options.onPriorRevision !== undefined) {
       if (priorRevisionTool === undefined) throw new Error('rereview lead needs perkins_read_prior_revision');
@@ -353,10 +382,13 @@ export function fakeWholeSpawner(
     // dispositions the submission carries feed the verdict).
     for (const disposition of effectiveDispositions) {
       if (disposition.status !== 'still-present') continue;
-      const carried = prior[disposition.prior_index] as { severity: string; title: string; location: string };
+      const carried = prior[disposition.prior_index] as { severity: string; title: string; location: string } | undefined;
+      if (carried === undefined) continue;
       // The scripted lead cites the CURRENT location/severity when the
       // disposition refreshes one, so its finding merges with the carried
-      // prior instead of duplicating it.
+      // prior instead of duplicating it. A disposition naming a prior the
+      // lead was never shown (a host-carried index) is still submitted —
+      // the host's validator, not this double, is what must refuse it.
       retained.push({
         source: 'lead',
         severity: (disposition.refresh?.severity ?? carried.severity) as WholeFindingView['severity'],
@@ -402,9 +434,16 @@ export function fakeWholeSpawner(
       ...(prior.length === 0 ? [] : [
         '## Prior findings revisited',
         ...priorDispositions.map((disposition) => {
-          const finding = prior[disposition.prior_index] as { title: string; location: string };
-          return `- #${disposition.prior_index} ${disposition.status}: ${finding.title} @ ${finding.location} — ${disposition.note}`;
+          const finding = prior[disposition.prior_index] as { title: string; location: string } | undefined;
+          const title = finding?.title ?? '(prior not shown to this lead)';
+          const location = finding?.location ?? 'N/A';
+          return `- #${disposition.prior_index} ${disposition.status}: ${title} @ ${location} — ${disposition.note}`;
         }),
+        '',
+      ]),
+      ...(carriedPriors.length === 0 ? [] : [
+        '## Prior findings carried forward (host-verified)',
+        ...carriedPriors.map((carried) => `- #${carried.prior_index} still-present (carried): ${carried.title} @ ${carried.location} — ${carried.reason}`),
         '',
       ]),
     ].join('\n');

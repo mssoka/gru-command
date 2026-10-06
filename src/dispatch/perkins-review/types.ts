@@ -40,6 +40,10 @@ export interface VerifiedFinding extends ReviewFinding {
   };
   readonly sources: readonly PerkinsFindingSource[];
   readonly roundOrigin: number;
+  /** Stage-5 convergence rule: this finding lies outside its round's delta
+   * hunks, so it was deferred as a follow-up (recorded and disclosed, never
+   * dropped) and cannot hold the PR. */
+  readonly deferredFollowup?: true;
 }
 
 export interface LensEnvelope {
