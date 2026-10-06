@@ -130,3 +130,7 @@
 - Extractor groups review rounds by identical target SHA; production compares per-job rounds across moved heads — same measurement-limit family, documented in docs/jev-production-integration.md.
 - Enforce gate does not machine-check the per-surface owner decision — process precondition; encoding it would change #223's reviewed evidence schema.
 - Live backtests (openrouter-jev + one alternative profile) + recorded owner decisions per surface — owner steps (credentials/spend); labelled inputs staged at ~/.gru-command/decisions/cases/escalation_triage.jsonl (41 cases).
+
+## Deferred from: code review of PR #241 / issue #117 (2026-10-06)
+
+- verificationFailures digest rows with a null scope can never follow the `verification-failure:<scope>@<run_id>` fingerprint discipline: the retirement fingerprints are only built when scope is non-null, so a null-scope failure row can only retire via resubmission (impossible for null scope) or terminality. Pre-existing digest identity gap (unchanged by #117, which only names the pre-existing instruction as the `verification-repair` rule). Fix: give the null-scope row an actionable identity or withhold the rule offer.
