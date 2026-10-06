@@ -39,8 +39,17 @@ import {
   isObligationLogicalStep,
   isPhaseHandoffSource,
   isPhaseHandoffState,
+  isReportDeliverable,
   MAX_COMPLETION_HANDOFF_DECISION,
   obligationId,
+  reportIncidentKey,
+  reportLogicalStep,
+  REPORT_BACKFILL_EVENT,
+  REPORT_DELIVERABLES,
+  REPORT_DISPOSITION_EVENT,
+  REPORT_SUPERSEDED_EVENT,
+  type ReportDeliverable,
+  type ReportDispositionOutcome,
   parseAuthority,
   parseCategory,
   parseClaim,
@@ -179,6 +188,14 @@ export interface JobRecord {
   readonly displayName: string | null;
   /** The deliverable kind (E19). `null` = legacy row, treated as `'pr'`. */
   readonly deliverable: JobDeliverable | null;
+  /** Who commissioned this report-type job and owes its disposition
+   * (issue #220). `null` = legacy row or a PR-owing lane. */
+  readonly commissioner: string | null;
+  /** The target this report reviewed: the PR URL and the exact reviewed
+   * head sha. The auto-supersede pass reads both. `null` = legacy row or
+   * a PR-owing lane (or a target-less artifact/investigation job). */
+  readonly targetRef: string | null;
+  readonly targetSha: string | null;
   readonly status: JobStatus;
   readonly baseBranch: string | null;
   readonly prUrl: string | null;
@@ -1223,6 +1240,11 @@ export class LedgerApi {
     baseBranch?: string | null;
     briefing?: string | null;
     deliverable?: JobDeliverable | null;
+    /** Issue #220 report-job closure: who commissioned the report and
+     * what it reviewed. Persisted verbatim; validated below. */
+    commissioner?: string | null;
+    targetRef?: string | null;
+    targetSha?: string | null;
   }): JobRecord {
     if (input.id === '' || input.repo === '' || input.title === '') {
       throw new Error('job id, repo, and title must be non-empty');
@@ -1242,6 +1264,34 @@ export class LedgerApi {
     const hasDeliverable = this.jobsColumns().has('deliverable');
     if (input.deliverable !== undefined && input.deliverable !== null && !hasDeliverable) {
       throw new Error('job deliverable requires migration job-deliverable (the column is missing on this database)');
+    }
+    // Issue #220 report-job closure columns (commissioner/target_ref/
+    // target_sha): same upgrade-fixture rule as deliverable — a caller
+    // that SUPPLIES the field on an older schema fails loud rather than
+    // silently dropping it.
+    const hasReportColumns = this.jobsColumns().has('commissioner');
+    const suppliedReportFields =
+      (input.commissioner !== undefined && input.commissioner !== null) ||
+      (input.targetRef !== undefined && input.targetRef !== null) ||
+      (input.targetSha !== undefined && input.targetSha !== null);
+    if (suppliedReportFields && !hasReportColumns) {
+      throw new Error('job commissioner/target requires migration job-report-closure (the columns are missing on this database)');
+    }
+    for (const [field, value] of [
+      ['commissioner', input.commissioner],
+      ['target_ref', input.targetRef],
+      ['target_sha', input.targetSha],
+    ] as const) {
+      if (value !== undefined && value !== null && value.trim() === '') {
+        throw new Error(`job ${field} must be a non-empty string when present`);
+      }
+    }
+    // A report target is only meaningful on a report-type job; PR-owing
+    // lanes carry their own PR via setJobPr, never a dispatch target.
+    const isReportKind = input.deliverable !== undefined && input.deliverable !== null &&
+      input.deliverable !== 'pr' && isReportDeliverable(input.deliverable);
+    if (!isReportKind && (input.targetRef !== undefined || input.targetSha !== undefined)) {
+      throw new Error(`job target_ref/target_sha are report-job fields — job "${input.id}" is not a report-type deliverable`);
     }
     if (input.displayName !== undefined && input.displayName !== null && input.displayName.trim() === '') {
       throw new Error('job display name must be a non-empty string');
@@ -1276,17 +1326,34 @@ export class LedgerApi {
       this.db
         .prepare(
           hasDeliverable
-            ? `INSERT INTO jobs (id, repo, title, status, base_branch, pr_url, note, briefing, display_name, deliverable, created_at, updated_at)
-               VALUES (?, ?, ?, 'dispatched', ?, NULL, NULL, ?, ?, ?, ?, ?)`
+            ? hasReportColumns
+              ? `INSERT INTO jobs (id, repo, title, status, base_branch, pr_url, note, briefing, display_name, deliverable, commissioner, target_ref, target_sha, created_at, updated_at)
+                 VALUES (?, ?, ?, 'dispatched', ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?)`
+              : `INSERT INTO jobs (id, repo, title, status, base_branch, pr_url, note, briefing, display_name, deliverable, created_at, updated_at)
+                 VALUES (?, ?, ?, 'dispatched', ?, NULL, NULL, ?, ?, ?, ?, ?)`
             : `INSERT INTO jobs (id, repo, title, status, base_branch, pr_url, note, briefing, display_name, created_at, updated_at)
                VALUES (?, ?, ?, 'dispatched', ?, NULL, NULL, ?, ?, ?, ?)`,
         )
         .run(
           input.id, input.repo, input.title, input.baseBranch ?? null, input.briefing ?? null, displayName,
           ...(hasDeliverable ? [input.deliverable ?? null] : []),
+          ...(hasReportColumns
+            ? [input.commissioner ?? null, input.targetRef ?? null, input.targetSha ?? null]
+            : []),
           ts, ts,
         );
-      this.appendEvent({ kind: 'job.created', jobId: input.id, payload: { repo: input.repo, title: input.title, display_name: displayName } });
+      this.appendEvent({
+        kind: 'job.created',
+        jobId: input.id,
+        payload: {
+          repo: input.repo,
+          title: input.title,
+          display_name: displayName,
+          ...(isReportKind
+            ? { commissioner: input.commissioner ?? null, target_ref: input.targetRef ?? null, target_sha: input.targetSha ?? null }
+            : {}),
+        },
+      });
       return this.getJob(input.id) as JobRecord;
     });
   }
@@ -3780,6 +3847,9 @@ export class LedgerApi {
       title: str(row.title),
       displayName: nstr(row.display_name),
       deliverable: nstr(row.deliverable) as JobDeliverable | null,
+      commissioner: nstr(row.commissioner),
+      targetRef: nstr(row.target_ref),
+      targetSha: nstr(row.target_sha),
       status: str(row.status) as JobStatus,
       baseBranch: nstr(row.base_branch),
       prUrl: nstr(row.pr_url),
@@ -4475,6 +4545,13 @@ export class LedgerApi {
         jobId: row.jobId,
         payload: { id: row.id, from: row.state, to: target, settlement: input.settlement },
       });
+      // A settled report debt answers its handback card HERE, at the one
+      // boundary every closure path rides (disposition, auto-supersede,
+      // terminal status transitions, stale-continuation invalidation) — no
+      // path can close the debt and leave a false outstanding action.
+      if (row.incidentKey === reportIncidentKey(row.jobId)) {
+        this.resolveReportHandbackCard(row.jobId, 'code');
+      }
       return this.getObligation(row.id) as ObligationRecord;
     });
   }
@@ -4931,6 +5008,393 @@ export class LedgerApi {
         settlement: { kind: 'job-terminal', jobStatus: terminal },
       });
     }
+  }
+
+  // ------------------------------------------------------------------
+  // Report-job closure (issue #220): a delivered report-type job owes its
+  // commissioner ONE disposition. The debt is a job_obligations row with
+  // incident key `report:<jobId>`; the dispositions (acted / dismissed /
+  // superseded) and the code auto-supersede settle it and move the job
+  // delivered → done. Everything here rides ONE transaction per action:
+  // status/obligation consistency lives at this boundary (chief ruling A).
+  // ------------------------------------------------------------------
+
+  /** Open the ONE report-closure obligation owed by the commissioner of a
+   * delivered report-type job. Idempotent: the active incarnation of the
+   * `report:<jobId>` incident is returned unchanged (a duplicate delivery
+   * or a replay opens nothing). Fails loud on a missing job, a PR-owing
+   * deliverable, or a non-delivered status — a report obligation is
+   * meaningless anywhere else. */
+  openReportObligation(input: {
+    jobId: string;
+    /** The delivered handback event that proves the report exists. */
+    observedAtSeq: number;
+    note?: string;
+  }): { readonly obligation: ObligationRecord; readonly created: boolean } {
+    return this.transaction(() => {
+      const job = this.getJob(input.jobId);
+      if (job === null) throw new RecordNotFound(`job "${input.jobId}" not found`);
+      if (job.deliverable === null || !isReportDeliverable(job.deliverable)) {
+        throw new Error(
+          `job "${input.jobId}" has deliverable "${String(job.deliverable)}" — report obligations open only on ${REPORT_DELIVERABLES.join('/')} jobs`,
+        );
+      }
+      if (!Number.isSafeInteger(input.observedAtSeq) || input.observedAtSeq < 0) {
+        throw new Error('openReportObligation requires a safe non-negative observedAtSeq');
+      }
+      const incidentKey = reportIncidentKey(job.id);
+      const active = this.activeIncarnation(job.id, reportLogicalStep(job.deliverable), incidentKey);
+      if (active !== null) return { obligation: active, created: false };
+      const step = reportLogicalStep(job.deliverable);
+      const resolved = resolveObligation(
+        {
+          logicalStep: step,
+          category: { kind: 'known', category: 'phase-completion' },
+          incidentKey,
+          observedAtSeq: input.observedAtSeq,
+          nextAction: {
+            kind: 'gru-decision',
+            decision:
+              `commissioner ${job.commissioner ?? 'gru'} owes the ${job.deliverable} report disposition: ` +
+              'acted (route findings as a directive), dismissed (with a reason), or superseded',
+          },
+          description:
+            input.note ??
+            `report handback delivered — commissioner ${job.commissioner ?? 'gru'} owes one disposition ` +
+            `(job ${job.id}${job.targetRef === null ? '' : `, target ${job.targetRef}`})`,
+        },
+        job.id,
+      );
+      const id = this.nextIncarnationId(obligationId(job.id, step, incidentKey));
+      const generation = this.currentJobGeneration(job.id) + 1;
+      this.insertObligationRow({
+        id,
+        jobId: job.id,
+        resolved,
+        generation,
+        observedAtSeq: input.observedAtSeq,
+        now: nowIso(),
+      });
+      this.appendEvent({
+        kind: 'job.obligation-recorded',
+        jobId: job.id,
+        payload: {
+          id,
+          generation,
+          category: categoryKey(resolved.category),
+          next_action: resolved.nextAction,
+          firing_rule: resolved.firingRule,
+          authority: null,
+          commissioner: job.commissioner ?? 'gru',
+          description: resolved.description,
+        },
+      });
+      return { obligation: this.getObligation(id) as ObligationRecord, created: true };
+    });
+  }
+
+  /** The job's report-closure obligation — the live incarnation when one
+   * is open, else the newest row in any state (history for audits), else
+   * null. Direct indexed queries: a long obligation history (page 200+)
+   * must never hide the live debt from a disposition. */
+  findReportObligation(jobId: string): ObligationRecord | null {
+    const incident = reportIncidentKey(jobId);
+    const active = this.db
+      .prepare(
+        `SELECT * FROM job_obligations
+          WHERE job_id = ? AND incident_key = ?
+            AND state IN ('open', 'waiting', 'suspended')
+          ORDER BY rowid DESC LIMIT 1`,
+      )
+      .get(jobId, incident) as Row | undefined;
+    if (active !== undefined) return this.obligationFromRow(active);
+    const newest = this.db
+      .prepare(
+        'SELECT * FROM job_obligations WHERE job_id = ? AND incident_key = ? ORDER BY rowid DESC LIMIT 1',
+      )
+      .get(jobId, incident) as Row | undefined;
+    return newest === undefined ? null : this.obligationFromRow(newest);
+  }
+
+  /** The commissioner settles a delivered report: ONE transaction records
+   * the disposition event, settles the report obligation with the typed
+   * settlement, and moves the job delivered → done (legal per states.ts).
+   * `acted` requires the directive job id the findings were routed to (the
+   * job must exist — routing findings to nothing is not an action);
+   * `dismissed`/`superseded` require a non-empty reason. Idempotence is
+   * NOT attempted: settling twice is a caller bug (the obligation is
+   * terminal after the first call and the second fails loud). */
+  settleReportDisposition(input: {
+    jobId: string;
+    outcome: ReportDispositionOutcome;
+    note?: string;
+    directiveJobId?: string;
+    by?: string;
+  }): { readonly job: JobRecord; readonly obligation: ObligationRecord } {
+    return this.transaction(() => {
+      const job = this.getJob(input.jobId);
+      if (job === null) throw new RecordNotFound(`job "${input.jobId}" not found`);
+      if (job.status !== 'delivered') {
+        throw new Error(
+          `job "${input.jobId}" is ${job.status} — dispositions settle a DELIVERED report (delivered → done)`,
+        );
+      }
+      if (job.deliverable === null || !isReportDeliverable(job.deliverable)) {
+        throw new Error(
+          `job "${input.jobId}" has deliverable "${String(job.deliverable)}" — dispositions apply to ${REPORT_DELIVERABLES.join('/')} jobs`,
+        );
+      }
+      const note = input.note?.trim() ?? '';
+      // The recorded commissioner owes the decision; the chief (gru) may
+      // always close on their behalf. Any other caller is refused: a debt
+      // assigned to silas must not be settled by an unrelated actor.
+      const actor = input.by ?? job.commissioner ?? 'gru';
+      if (job.commissioner !== null && actor !== job.commissioner && actor !== 'gru') {
+        throw new Error(
+          `job "${job.id}" is commissioned by "${job.commissioner}" — only that commissioner (or gru, the chief) may settle it (got "${actor}")`,
+        );
+      }
+      if (input.outcome === 'acted') {
+        if (input.directiveJobId === undefined || input.directiveJobId.trim() === '') {
+          throw new Error('disposition acted requires directive_job_id — findings route as a directive to the target lane');
+        }
+        const directive = this.getJob(input.directiveJobId);
+        if (directive === null) {
+          throw new RecordNotFound(`directive job "${input.directiveJobId}" not found — route findings to a real job`);
+        }
+        if (directive.repo !== job.repo) {
+          throw new Error(
+            `directive job "${directive.id}" belongs to repo "${directive.repo}", but the report reviewed "${job.repo}" — ` +
+              'route findings to the target lane, not another repository',
+          );
+        }
+      } else if (note === '') {
+        throw new Error(`disposition ${input.outcome} requires a non-empty note (the recorded reason)`);
+      }
+      const obligation = this.findReportObligation(input.jobId);
+      if (obligation === null || (obligation.state !== 'open' && obligation.state !== 'waiting' && obligation.state !== 'suspended')) {
+        throw new Error(
+          `job "${input.jobId}" has no open report obligation (incident ${reportIncidentKey(input.jobId)}) — nothing owes a disposition`,
+        );
+      }
+      const event = this.appendEvent({
+        kind: REPORT_DISPOSITION_EVENT,
+        jobId: job.id,
+        payload: {
+          outcome: input.outcome,
+          note: note === '' ? null : note,
+          directive_job_id: input.directiveJobId ?? null,
+          obligation_id: obligation.id,
+          by: input.by ?? job.commissioner ?? 'gru',
+        },
+      });
+      const settlement: ObligationSettlement =
+        input.outcome === 'acted'
+          ? {
+              kind: 'executed-action',
+              action: `report findings routed to directive job ${String(input.directiveJobId)}`,
+              evidenceEventSeq: event.seq,
+              evidenceEventKind: REPORT_DISPOSITION_EVENT,
+            }
+          : input.outcome === 'dismissed'
+            ? { kind: 'cancelled', reason: note }
+            : { kind: 'superseded', byObligationId: null, reason: note };
+      const settled = this.settleObligation({ obligationId: obligation.id, settlement });
+      const done = this.setJobStatus(job.id, 'done');
+      return { job: done, obligation: settled };
+    });
+  }
+
+  /** Code auto-supersede (issue #220): durable proof the report's target
+   * merged or its head moved past the reviewed sha retires the owed
+   * disposition — the findings can no longer apply to the target. ONE
+   * transaction: obligation settles as superseded, `report.superseded`
+   * records the reason, the job moves delivered → done. Fails loud when
+   * the job is not a delivered report-type job or no obligation is open —
+   * a caller scanning stale candidates re-reads the row and moves on. */
+  supersedeReportObligation(input: { jobId: string; reason: string }): {
+    readonly job: JobRecord;
+    readonly obligation: ObligationRecord;
+  } {
+    return this.transaction(() => {
+      const job = this.getJob(input.jobId);
+      if (job === null) throw new RecordNotFound(`job "${input.jobId}" not found`);
+      if (job.status !== 'delivered') {
+        throw new Error(`job "${input.jobId}" is ${job.status} — auto-supersede retires a DELIVERED report`);
+      }
+      const obligation = this.findReportObligation(input.jobId);
+      if (obligation === null || (obligation.state !== 'open' && obligation.state !== 'waiting' && obligation.state !== 'suspended')) {
+        throw new Error(
+          `job "${input.jobId}" has no open report obligation (incident ${reportIncidentKey(input.jobId)}) — nothing to supersede`,
+        );
+      }
+      const settled = this.settleObligation({
+        obligationId: obligation.id,
+        settlement: { kind: 'superseded', byObligationId: null, reason: input.reason },
+      });
+      this.appendEvent({
+        kind: REPORT_SUPERSEDED_EVENT,
+        jobId: job.id,
+        payload: {
+          reason: input.reason,
+          target_ref: job.targetRef,
+          target_sha: job.targetSha,
+          obligation_id: obligation.id,
+        },
+      });
+      const done = this.setJobStatus(job.id, 'done');
+      return { job: done, obligation: settled };
+    });
+  }
+
+  /** Resolve the job's stable-kind handback card, if one was posted and is
+   * still open — called from every settlement path so a closed debt never
+   * leaves a false outstanding action. */
+  private resolveReportHandbackCard(jobId: string, by: string): void {
+    // ACTIVE (unresolved) only: a resolved prior card must never win the
+    // tie-break against its own repost and leave that repost outstanding.
+    const card = this.findNotificationByKind(`silas.report-handback.${jobId}`, 'active');
+    if (card !== null) this.resolveNotificationById(card.id, by);
+  }
+
+  /** One job's rowid (keyset pagination anchor). */
+  jobRowid(id: string): number | null {
+    const row = this.db.prepare('SELECT rowid AS _rowid FROM jobs WHERE id = ?').get(id) as Row | undefined;
+    return row === undefined ? null : Number(row._rowid);
+  }
+
+  /** The auto-supersede scan set, straight from SQL: delivered report-type
+   * jobs carrying a target (the reviewed sha is optional — a merged target
+   * needs only the PR url). Legacy NULL-deliverable rows and PR-owing
+   * lanes never appear — the backfill owns the former, and a PR lane's
+   * merge path is the machine's, not this pass's. Keyset-paged by rowid
+   * (`cursor`) so a persistently unchanged prefix cannot starve the tail:
+   * the caller resumes past the last examined row on its next pass. */
+  listReportClosureCandidates(limit = 200, opts: { cursor?: number } = {}): readonly JobRecord[] {
+    if (!Number.isSafeInteger(limit) || limit < 1) {
+      throw new Error(`listReportClosureCandidates requires a positive integer limit, got ${String(limit)}`);
+    }
+    const placeholders = REPORT_DELIVERABLES.map(() => '?').join(', ');
+    const cursorClause = opts.cursor !== undefined ? 'AND rowid > ?' : '';
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM jobs WHERE status = 'delivered' AND deliverable IN (${placeholders})
+           AND target_ref IS NOT NULL ${cursorClause}
+         ORDER BY rowid LIMIT ?`,
+      )
+      .all(...REPORT_DELIVERABLES, ...(opts.cursor !== undefined ? [opts.cursor] : []), limit) as Row[];
+    return rows.map((row) => this.jobFromRow(row));
+  }
+
+  /** Every delivered report-type job with its kind RECORDED — the
+   * deterministic pass's crash-window backstop set for a lost obligation
+   * open. Legacy NULL rows are excluded by construction: the backfill CLI
+   * owns them and the owner reviews its dry-run first. Same keyset paging
+   * contract as the supersede scan. */
+  listDeliveredReportJobs(limit = 200, opts: { cursor?: number } = {}): readonly JobRecord[] {
+    if (!Number.isSafeInteger(limit) || limit < 1) {
+      throw new Error(`listDeliveredReportJobs requires a positive integer limit, got ${String(limit)}`);
+    }
+    const placeholders = REPORT_DELIVERABLES.map(() => '?').join(', ');
+    const cursorClause = opts.cursor !== undefined ? 'AND rowid > ?' : '';
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM jobs WHERE status = 'delivered' AND deliverable IN (${placeholders}) ${cursorClause}
+         ORDER BY rowid LIMIT ?`,
+      )
+      .all(...REPORT_DELIVERABLES, ...(opts.cursor !== undefined ? [opts.cursor] : []), limit) as Row[];
+    return rows.map((row) => this.jobFromRow(row));
+  }
+
+  /** The job that owns a PR url — the merge/head signals land THERE, and
+   * a report's auto-supersede reads them through this lookup. */
+  findJobByPrUrl(url: string): JobRecord | null {
+    if (url.trim() === '') return null;
+    const row = this.db.prepare('SELECT * FROM jobs WHERE pr_url = ? ORDER BY updated_at DESC, id LIMIT 1').get(url) as Row | undefined;
+    return row === undefined ? null : this.jobFromRow(row);
+  }
+
+  /** Legacy backfill (issue #220): the delivered, PR-less rows whose
+   * deliverable was never recorded (pre-E19 lanes). The backfill CLI
+   * classifies and proposes; only --apply writes. */
+  listLegacyDeliveredJobs(limit = 1000, opts: { cursor?: number } = {}): readonly JobRecord[] {
+    if (!Number.isSafeInteger(limit) || limit < 1) {
+      throw new Error(`listLegacyDeliveredJobs requires a positive integer limit, got ${String(limit)}`);
+    }
+    const cursorClause = opts.cursor !== undefined ? 'AND rowid > ?' : '';
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM jobs WHERE status = 'delivered' AND pr_url IS NULL AND deliverable IS NULL ${cursorClause}
+         ORDER BY rowid LIMIT ?`,
+      )
+      .all(...(opts.cursor !== undefined ? [opts.cursor] : []), limit) as Row[];
+    return rows.map((row) => this.jobFromRow(row));
+  }
+
+  /** Backfill write for ONE legacy row (idempotent): stamp the inferred
+   * deliverable only while the column is still NULL, stamp inferable
+   * target fields, append `report.backfilled`, and open the report
+   * obligation owed by the recorded (or default) commissioner. The
+   * superseded outcome additionally settles the obligation and closes the
+   * job delivered → done. Re-running a proposal that already landed is a
+   * no-op returning the current row. */
+  applyReportBackfill(input: {
+    jobId: string;
+    deliverable: ReportDeliverable;
+    outcome: 'obligation-opened' | 'superseded';
+    reason: string;
+    commissioner?: string | null;
+    targetRef?: string | null;
+    targetSha?: string | null;
+  }): { readonly job: JobRecord; readonly applied: boolean } {
+    return this.transaction(() => {
+      const job = this.getJob(input.jobId);
+      if (job === null) throw new RecordNotFound(`job "${input.jobId}" not found`);
+      if (job.status !== 'delivered') return { job, applied: false }; // already closed — idempotent replay
+      // This row was already backfilled (the whole apply is one transaction:
+      // stamp + obligation + report.backfilled + optional supersede commit
+      // together), so a replayed stale plan is a true no-op — no duplicate
+      // audit event, no second obligation.
+      if (this.latestJobEvent(job.id, REPORT_BACKFILL_EVENT) !== null) return { job, applied: false };
+      // The plan was computed on a changed row: a PR link or an explicit
+      // deliverable stamp (another actor got there first) means this is no
+      // longer a legacy row — never stamp over live truth with a stale plan.
+      if (job.prUrl !== null || job.deliverable !== null) return { job, applied: false };
+      const stamp = (column: 'deliverable' | 'commissioner' | 'target_ref' | 'target_sha', value: string | null): void => {
+        this.db.prepare(`UPDATE jobs SET ${column} = ?, updated_at = ? WHERE id = ? AND ${column} IS NULL`).run(value, nowIso(), job.id);
+      };
+      stamp('deliverable', input.deliverable);
+      stamp('commissioner', input.commissioner ?? null);
+      stamp('target_ref', input.targetRef ?? null);
+      stamp('target_sha', input.targetSha ?? null);
+      const current = this.getJob(job.id) as JobRecord;
+      // A delivered legacy row whose delivery event is missing has no
+      // handback to open an obligation from: fail loud and leave the row in
+      // the scan for the owner instead of stamping it into invisible debt.
+      const latestDelivered = this.latestJobEvent(job.id, 'job.delivered');
+      if (latestDelivered === null) {
+        throw new Error(
+          `job "${job.id}" is delivered with no job.delivered event — its handback is not proven; refusing to backfill`,
+        );
+      }
+      this.openReportObligation({ jobId: job.id, observedAtSeq: latestDelivered.seq });
+      this.appendEvent({
+        kind: REPORT_BACKFILL_EVENT,
+        jobId: job.id,
+        payload: {
+          outcome: input.outcome,
+          reason: input.reason,
+          deliverable: input.deliverable,
+          commissioner: current.commissioner,
+          target_ref: current.targetRef,
+          target_sha: current.targetSha,
+        },
+      });
+      if (input.outcome === 'superseded') {
+        this.supersedeReportObligation({ jobId: job.id, reason: input.reason });
+      }
+      return { job: this.getJob(job.id) as JobRecord, applied: true };
+    });
   }
 
   /**

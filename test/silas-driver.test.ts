@@ -42,6 +42,7 @@ import type { FollowThroughNotifications } from '../src/dispatch/obligations.js'
 import { FIRING_RULES } from '../src/ledger/obligations.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb, MIGRATIONS } from '../src/ledger/db.js';
+import { NotificationCenter } from '../src/notifications/center.js';
 import { BRANCH_STATE_EVENT } from '../src/dispatch/github-poll.js';
 import { DEFAULT_SILAS_CONFIG } from '../src/config.js';
 import type { AgentCapabilities, AgentHandle, RuntimeEvent } from '../src/runtime/types.js';
@@ -4537,6 +4538,280 @@ describe('silas deterministic pass observation (issue #163)', () => {
   });
 });
 
+describe('report-job auto-supersede in the deterministic pass (issue #220)', () => {
+  /** The EXACT production hook: the deterministic pass main.ts wires. */
+  function makeDriverWithProductionPass(
+    h: Harness,
+    opts: { notifications?: FollowThroughNotifications; budget?: { reportLimit?: number; reportMaxPages?: number } } = {},
+  ): ReturnType<typeof makeDriver> {
+    const notifications: FollowThroughNotifications =
+      opts.notifications ?? { postIncident: () => ({ id: 'notice' }) };
+    return makeDriver({
+      harness: h,
+      onDeterministicPass: (context) =>
+        createDurableReconcileHook({
+          ledger: h.ledger,
+          notifications,
+          ...(opts.budget !== undefined ? { budget: opts.budget } : {}),
+        })(context),
+    });
+  }
+
+  /** A delivered report-type job carrying its target + obligation, and a
+   * source job owning the target PR. */
+  function seedReportWithTarget(
+    ledger: LedgerApi,
+    opts: { prUrl: string; reviewedSha: string; deliverable?: 'review' | 'artifact' | 'investigation' },
+  ): { reportJobId: string; sourceJobId: string } {
+    const sourceJobId = `src-${Math.random().toString(36).slice(2, 8)}`;
+    const source = ledger.addJob({ id: sourceJobId, repo: 'fixture-app', title: 't', briefing: 'b' });
+    ledger.setJobStatus(sourceJobId, 'working');
+    ledger.setJobPr(sourceJobId, opts.prUrl);
+    const reportJobId = `report-${Math.random().toString(36).slice(2, 8)}`;
+    ledger.addJob({
+      id: reportJobId, repo: 'fixture-app', title: 't', briefing: 'review brief',
+      deliverable: opts.deliverable ?? 'review', commissioner: 'gru',
+      targetRef: opts.prUrl, targetSha: opts.reviewedSha,
+    });
+    ledger.setJobStatus(reportJobId, 'working');
+    ledger.setJobStatus(reportJobId, 'delivered');
+    const delivered = ledger.appendCustomEvent({ kind: 'job.delivered', jobId: reportJobId, payload: { sha: opts.reviewedSha } });
+    ledger.openReportObligation({ jobId: reportJobId, observedAtSeq: delivered.seq });
+    return { reportJobId, sourceJobId: source.id };
+  }
+
+  it('a MERGED target supersedes the report mechanically: obligation superseded, job done, receipt event', async () => {
+    const h0 = makeLedger();
+    const h = makeDriverWithProductionPass(h0);
+    try {
+      const { reportJobId, sourceJobId } = seedReportWithTarget(h.ledger, {
+        prUrl: 'https://git.example.invalid/o/r/pull/21',
+        reviewedSha: 'reviewed-1',
+      });
+      h.ledger.setJobStatus(sourceJobId, 'in-review');
+      h.ledger.setJobStatus(sourceJobId, 'merged');
+
+      await h.driver.trigger({ kind: 'sweep' });
+
+      expect(h.ledger.getJob(reportJobId)?.status).toBe('done');
+      const obligation = h.ledger.listObligations({ jobId: reportJobId })[0];
+      expect(obligation?.state).toBe('closed');
+      expect(obligation?.settlement).toMatchObject({ kind: 'superseded' });
+      expect(String(obligation?.settlement ? (obligation.settlement as { reason?: string }).reason : '')).toContain('merged');
+      expect(h.ledger.latestJobEvent(reportJobId, 'report.superseded')?.payload).toMatchObject({
+        target_ref: 'https://git.example.invalid/o/r/pull/21',
+        target_sha: 'reviewed-1',
+      });
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a head MOVED past the reviewed sha supersedes; an unchanged or unobserved head does not', async () => {
+    const h0 = makeLedger();
+    const h = makeDriverWithProductionPass(h0);
+    try {
+      // The reviewed sha was observed, then the branch moved.
+      const moved = seedReportWithTarget(h.ledger, {
+        prUrl: 'https://git.example.invalid/o/r/pull/22',
+        reviewedSha: 'reviewed-2',
+      });
+      h.ledger.appendCustomEvent({ kind: 'github.branch-state', jobId: moved.sourceJobId, payload: { sha: 'reviewed-2' } });
+      h.ledger.appendCustomEvent({ kind: 'github.branch-state', jobId: moved.sourceJobId, payload: { sha: 'newer-head' } });
+
+      // The reviewed sha is also the LATEST observation: nothing moved.
+      const unchanged = seedReportWithTarget(h.ledger, {
+        prUrl: 'https://git.example.invalid/o/r/pull/23',
+        reviewedSha: 'reviewed-3',
+      });
+      h.ledger.appendCustomEvent({ kind: 'github.branch-state', jobId: unchanged.sourceJobId, payload: { sha: 'reviewed-3' } });
+
+      // No branch-state observation at all: the ledger proves nothing and
+      // the commissioner keeps the debt.
+      const unobserved = seedReportWithTarget(h.ledger, {
+        prUrl: 'https://git.example.invalid/o/r/pull/24',
+        reviewedSha: 'reviewed-4',
+      });
+
+      await h.driver.trigger({ kind: 'sweep' });
+
+      expect(h.ledger.getJob(moved.reportJobId)?.status).toBe('done');
+      expect(h.ledger.latestJobEvent(moved.reportJobId, 'report.superseded')?.payload).toMatchObject({ target_sha: 'reviewed-2' });
+      expect(h.ledger.getJob(unchanged.reportJobId)?.status).toBe('delivered');
+      expect(h.ledger.getJob(unobserved.reportJobId)?.status).toBe('delivered');
+      expect(h.ledger.listObligations({ jobId: unchanged.reportJobId })[0]?.state).toBe('open');
+      expect(h.ledger.listObligations({ jobId: unobserved.reportJobId })[0]?.state).toBe('open');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('the pass runs BEFORE any LLM wake: a superseded report never reaches the slot prompt', async () => {
+    const h0 = makeLedger();
+    const h = makeDriverWithProductionPass(h0);
+    try {
+      const seeded = seedReportWithTarget(h.ledger, {
+        prUrl: 'https://git.example.invalid/o/r/pull/25',
+        reviewedSha: 'reviewed-5',
+      });
+      h.ledger.setJobStatus(seeded.sourceJobId, 'in-review');
+      h.ledger.setJobStatus(seeded.sourceJobId, 'merged');
+      // An actionable PR lane so the wake would prompt if the digest were
+      // computed after the pass — the ordering proof.
+      addJobWithDelivery(h.ledger, 'job-open-wake-220');
+
+      await h.driver.trigger({ kind: 'job.delivered', jobId: 'job-open-wake-220' });
+
+      expect(h.ledger.getJob(seeded.reportJobId)?.status).toBe('done');
+      expect(h.prompts.length).toBeGreaterThanOrEqual(1);
+      // The wake prompt's digest names the PR lane, never the closed report.
+      expect(h.prompts[0]?.text).toContain('job-open-wake-220');
+      expect(h.prompts[0]?.text).not.toContain(seeded.reportJobId);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('the pass backstops a delivered report whose obligation open was lost — and never touches legacy NULL rows', async () => {
+    const h0 = makeLedger();
+    const h = makeDriverWithProductionPass(h0);
+    try {
+      // A crash window: the delivery landed, the obligation open did not.
+      h.ledger.addJob({
+        id: 'report-lost-open', repo: 'fixture-app', title: 't', briefing: 'review brief',
+        deliverable: 'review', commissioner: 'gru',
+        targetRef: 'https://git.example.invalid/o/r/pull/27', targetSha: 'reviewed-7',
+      });
+      h.ledger.setJobStatus('report-lost-open', 'working');
+      h.ledger.setJobStatus('report-lost-open', 'delivered');
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'report-lost-open', payload: { sha: 'reviewed-7' } });
+      // A legacy NULL-deliverable row: the backfill CLI's domain, NOT the pass's.
+      addJobWithDelivery(h.ledger, 'legacy-null-row');
+      h.ledger.setJobStatus('legacy-null-row', 'delivered');
+
+      await h.driver.trigger({ kind: 'sweep' });
+
+      const obligation = h.ledger.listObligations({ jobId: 'report-lost-open' })[0];
+      expect(obligation?.incidentKey).toBe('report:report-lost-open');
+      expect(obligation?.state).toBe('open');
+      // The pass is idempotent: a second tick opens nothing new.
+      await h.driver.trigger({ kind: 'sweep' });
+      expect(h.ledger.listObligations({ jobId: 'report-lost-open' })).toHaveLength(1);
+      expect(h.ledger.listObligations({ jobId: 'legacy-null-row' })).toHaveLength(0);
+      expect(h.ledger.getJob('legacy-null-row')?.deliverable).toBeNull();
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('the supersede scan keyset-pages under a durable cursor: a tail candidate is reached on the next pass', async () => {
+    const h0 = makeLedger();
+    const h = makeDriverWithProductionPass(h0, { budget: { reportLimit: 2, reportMaxPages: 1 } });
+    try {
+      // Three unresolved report candidates; only the THIRD (newest) has a
+      // merged source. With a two-row page per pass, pass 1 cannot see it —
+      // the durable cursor must resume past the examined prefix.
+      const first = seedReportWithTarget(h.ledger, {
+        prUrl: 'https://git.example.invalid/o/r/pull/41',
+        reviewedSha: 'reviewed-41',
+      });
+      const second = seedReportWithTarget(h.ledger, {
+        prUrl: 'https://git.example.invalid/o/r/pull/42',
+        reviewedSha: 'reviewed-42',
+      });
+      h.ledger.appendCustomEvent({ kind: 'github.branch-state', jobId: first.sourceJobId, payload: { sha: 'reviewed-41' } });
+      h.ledger.appendCustomEvent({ kind: 'github.branch-state', jobId: second.sourceJobId, payload: { sha: 'reviewed-42' } });
+      const third = seedReportWithTarget(h.ledger, {
+        prUrl: 'https://git.example.invalid/o/r/pull/43',
+        reviewedSha: 'reviewed-43',
+      });
+      h.ledger.setJobStatus(third.sourceJobId, 'in-review');
+      h.ledger.setJobStatus(third.sourceJobId, 'merged');
+
+      await h.driver.trigger({ kind: 'sweep' });
+      // Pass 1 examined the first page only: the merged tail survives.
+      expect(h.ledger.getJob(third.reportJobId)?.status).toBe('delivered');
+
+      await h.driver.trigger({ kind: 'sweep' });
+      // Pass 2 resumed past the prefix and retired the tail.
+      expect(h.ledger.getJob(third.reportJobId)?.status).toBe('done');
+      expect(h.ledger.latestJobEvent(third.reportJobId, 'report.superseded')).not.toBeNull();
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a live handback posts ONE action-required card; a backfilled debt posts none; repeats dedupe', async () => {
+    const h0 = makeLedger();
+    const posts: { kind: string; routing: string; title: string }[] = [];
+    const center = new NotificationCenter({ ledger: h0.ledger, bus: h0.bus });
+    const h = makeDriverWithProductionPass(h0, {
+      notifications: {
+        postIncident: (input) => {
+          posts.push({ kind: input.kind, routing: input.routing, title: input.title });
+          return center.postIncident(input);
+        },
+      },
+    });
+    try {
+      const live = seedReportWithTarget(h.ledger, {
+        prUrl: 'https://git.example.invalid/o/r/pull/44',
+        reviewedSha: 'reviewed-44',
+      });
+      // A backfilled debt: delivered + obligation, already surfaced to the
+      // owner in the dry-run list — never carded.
+      const backfilled = seedReportWithTarget(h.ledger, {
+        prUrl: 'https://git.example.invalid/o/r/pull/45',
+        reviewedSha: 'reviewed-45',
+      });
+      h.ledger.appendCustomEvent({
+        kind: 'report.backfilled',
+        jobId: backfilled.reportJobId,
+        payload: { outcome: 'obligation-opened' },
+      });
+
+      await h.driver.trigger({ kind: 'sweep' });
+      await h.driver.trigger({ kind: 'sweep' });
+
+      const cards = posts.filter((post) => post.kind.startsWith('silas.report-handback.'));
+      expect(cards).toHaveLength(1);
+      expect(cards[0]?.kind).toBe(`silas.report-handback.${live.reportJobId}`);
+      expect(cards[0]?.routing).toBe('action-required');
+      expect(h.ledger.findNotificationByKind(`silas.report-handback.${backfilled.reportJobId}`, 'any')).toBeNull();
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('PR-owing lanes are invisible to the report pass and the digest never carries report jobs', async () => {
+    const h0 = makeLedger();
+    const h = makeDriverWithProductionPass(h0);
+    try {
+      // A delivered PR lane (legacy NULL deliverable) and a delivered
+      // report: only the report is a closure candidate, only the PR lane
+      // is digest-owed a PR.
+      addJobWithDelivery(h.ledger, 'pr-lane-220');
+      h.ledger.setJobStatus('pr-lane-220', 'delivered');
+      seedReportWithTarget(h.ledger, { prUrl: 'https://git.example.invalid/o/r/pull/26', reviewedSha: 'reviewed-6' });
+
+      await h.driver.trigger({ kind: 'sweep' });
+
+      expect(h.ledger.getJob('pr-lane-220')?.status).toBe('delivered');
+      expect(h.ledger.listObligations({ jobId: 'pr-lane-220' })).toHaveLength(0);
+
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(digest.deliveredWithoutPr.map((row) => row.jobId)).toEqual(['pr-lane-220']);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
 // ------------------------------------------------------------------
 // Issue #224: same-blocker identity surface (shadow)
 // ------------------------------------------------------------------
@@ -4889,4 +5164,5 @@ describe('same-blocker review fixes (issue #224 review)', () => {
     }
   });
 });
+
 

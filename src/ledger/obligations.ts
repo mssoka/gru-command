@@ -769,3 +769,56 @@ export function phaseHandoffId(jobId: string, source: PhaseHandoffSource, genera
   }
   return `phase-handoff:${jobId}:${source}:${generation}`;
 }
+
+// ------------------------------------------------------------------
+// Report-job closure (issue #220): commissioner obligation on a
+// delivered report-type job, the dispositions that settle it, and the
+// code auto-supersede. One incident per job: `report:<jobId>`.
+// ------------------------------------------------------------------
+
+/** The report-type deliverables — a delivered one owes the commissioner a
+ * disposition, never a PR chase. The E19 `pr` kind (and legacy NULL) are
+ * excluded by definition. */
+export const REPORT_DELIVERABLES = ['review', 'artifact', 'investigation'] as const;
+export type ReportDeliverable = (typeof REPORT_DELIVERABLES)[number];
+
+export function isReportDeliverable(value: string): value is ReportDeliverable {
+  return (REPORT_DELIVERABLES as readonly string[]).includes(value);
+}
+
+/** The logical step the commissioner owes, chosen by the report kind:
+ * a review's findings route as review follow-through, an artifact's
+ * handback owes verification, an investigation's report owes an audit
+ * ruling. The mapping is total over REPORT_DELIVERABLES. */
+export function reportLogicalStep(deliverable: ReportDeliverable): ObligationLogicalStep {
+  switch (deliverable) {
+    case 'review':
+      return 'review';
+    case 'artifact':
+      return 'verification';
+    case 'investigation':
+      return 'audit';
+  }
+}
+
+/** The one report-closure incident key per job — stable across duplicate
+ * deliveries and restarts, so a handback can never mint a second debt. */
+export function reportIncidentKey(jobId: string): string {
+  return `report:${jobId}`;
+}
+
+/** The commissioner's disposition of a delivered report. `acted` routes
+ * the findings as a directive to the target lane (requires the directive
+ * job id); `dismissed` and `superseded` carry a written reason. */
+export const REPORT_DISPOSITION_OUTCOMES = ['acted', 'dismissed', 'superseded'] as const;
+export type ReportDispositionOutcome = (typeof REPORT_DISPOSITION_OUTCOMES)[number];
+
+export function isReportDispositionOutcome(value: string): value is ReportDispositionOutcome {
+  return (REPORT_DISPOSITION_OUTCOMES as readonly string[]).includes(value);
+}
+
+/** The ledger event the disposition and the auto-supersede append — the
+ * durable receipt a stranger can audit. */
+export const REPORT_DISPOSITION_EVENT = 'job.report-disposition';
+export const REPORT_SUPERSEDED_EVENT = 'report.superseded';
+export const REPORT_BACKFILL_EVENT = 'report.backfilled';

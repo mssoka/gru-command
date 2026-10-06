@@ -343,6 +343,8 @@ describe('dispatch server (E8)', () => {
           title: 'read-only review',
           briefing: 'read-only review brief',
           deliverable: 'review',
+          target_ref: 'https://git.example.invalid/o/r/pull/5',
+          target_sha: 'abc123',
         },
         TOKEN,
       );
@@ -2431,6 +2433,217 @@ describe('provider pacing worker-gate pass-through on the silas routes (r4 verif
       expect(field<string>(res.json, 'job_id')).toBe('gate-reb');
       expect(h.ledger.listJobEvents('gate-reb').some((event) => event.kind === 'silas.rebrief')).toBe(true);
       expect(gate.view().worker).toMatchObject({ running: 0, queued: [] });
+    } finally {
+      await h.close();
+    }
+  });
+});
+
+describe('report-job closure over HTTP (issue #220)', () => {
+  it('dispatch accepts commissioner and target on report jobs; a review without a target is a named 400', async () => {
+    const h = await boot();
+    const repo = makeFixtureRepo('fixture-http-report-target');
+    cleanupRepos.push(repo);
+    try {
+      const ok = await call(
+        h.port,
+        'POST',
+        '/api/dispatch',
+        {
+          job_id: 'http-report-job',
+          repo_path: repo.path,
+          title: 'review the PR',
+          briefing: 'review brief',
+          deliverable: 'review',
+          by: 'silas',
+          target_ref: 'https://git.example.invalid/o/r/pull/11',
+          target_sha: 'abc123',
+        },
+        TOKEN,
+      );
+      expect(ok.status).toBe(202);
+      const job = h.ledger.getJob('http-report-job');
+      expect(job?.deliverable).toBe('review');
+      // The commissioner is the request's `by` (explicit field would win).
+      expect(job?.commissioner).toBe('silas');
+      expect(job?.targetRef).toBe('https://git.example.invalid/o/r/pull/11');
+      expect(job?.targetSha).toBe('abc123');
+
+      // An explicit commissioner beats `by`; a PR lane may not carry targets.
+      const explicit = await call(
+        h.port,
+        'POST',
+        '/api/dispatch',
+        {
+          job_id: 'http-report-explicit',
+          repo_path: repo.path,
+          title: 'artifact handback',
+          briefing: 'artifact brief',
+          deliverable: 'artifact',
+          by: 'silas',
+          commissioner: 'gru',
+        },
+        TOKEN,
+      );
+      expect(explicit.status).toBe(202);
+      expect(h.ledger.getJob('http-report-explicit')?.commissioner).toBe('gru');
+
+      const prLane = await call(
+        h.port,
+        'POST',
+        '/api/dispatch',
+        {
+          job_id: 'http-pr-with-target',
+          repo_path: repo.path,
+          title: 'implementation',
+          briefing: 'build it',
+          target_ref: 'https://git.example.invalid/o/r/pull/12',
+        },
+        TOKEN,
+      );
+      expect(prLane.status).toBe(400);
+      expect(h.ledger.getJob('http-pr-with-target')).toBeNull();
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a review dispatch without its target fails loud with the named error and no job row', async () => {
+    const h = await boot();
+    const repo = makeFixtureRepo('fixture-http-review-no-target');
+    cleanupRepos.push(repo);
+    try {
+      const res = await call(
+        h.port,
+        'POST',
+        '/api/dispatch',
+        {
+          job_id: 'http-review-no-target',
+          repo_path: repo.path,
+          title: 'review the PR',
+          briefing: 'review brief',
+          deliverable: 'review',
+        },
+        TOKEN,
+      );
+      expect(res.status).toBe(400);
+      expect(field<string>(res.json, 'detail')).toContain('requires a review target');
+      expect(h.ledger.getJob('http-review-no-target')).toBeNull();
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('the commissioner settles a delivered report: disposition endpoint moves it delivered → done', async () => {
+    const h = await boot();
+    const repo = makeFixtureRepo('fixture-http-report-disposition');
+    cleanupRepos.push(repo);
+    try {
+      const dispatched = await call(
+        h.port,
+        'POST',
+        '/api/dispatch',
+        {
+          job_id: 'http-report-settle',
+          repo_path: repo.path,
+          title: 'review the PR',
+          briefing: 'review brief',
+          deliverable: 'review',
+          target_ref: 'https://git.example.invalid/o/r/pull/13',
+          target_sha: 'head-1',
+        },
+        TOKEN,
+      );
+      expect(dispatched.status).toBe(202);
+      await waitForDelivery(h, 'http-report-settle');
+      // The handback opened exactly one report obligation owed by gru.
+      const obligations = h.ledger.listObligations({ jobId: 'http-report-settle' });
+      expect(obligations).toHaveLength(1);
+      expect(obligations[0]?.incidentKey).toBe('report:http-report-settle');
+      expect(obligations[0]?.logicalStep).toBe('review');
+      expect(h.ledger.getJob('http-report-settle')?.status).toBe('delivered');
+
+      // acted without a directive job: refused.
+      const noDirective = await call(h.port, 'POST', '/api/jobs/http-report-settle/disposition', { outcome: 'acted' }, TOKEN);
+      expect(noDirective.status).toBe(400);
+      // acted with a real directive job: settles and closes.
+      const laneBranch = `gru/http-report-settle`;
+      void laneBranch;
+      await call(
+        h.port,
+        'POST',
+        '/api/dispatch',
+        { job_id: 'http-directive-lane', repo_path: repo.path, title: 'route the findings', briefing: 'apply the findings' },
+        TOKEN,
+      );
+      await waitForDelivery(h, 'http-directive-lane');
+      const acted = await call(
+        h.port,
+        'POST',
+        '/api/jobs/http-report-settle/disposition',
+        { outcome: 'acted', note: 'routed to the fix lane', directive_job_id: 'http-directive-lane', by: 'gru' },
+        TOKEN,
+      );
+      expect(acted.status).toBe(200);
+      expect(field<string>(acted.json, 'status')).toBe('done');
+      expect(field<string>(acted.json, 'obligation_state')).toBe('settled');
+      expect(h.ledger.getJob('http-report-settle')?.status).toBe('done');
+      expect(h.ledger.latestJobEvent('http-report-settle', 'job.report-disposition')?.payload).toMatchObject({
+        outcome: 'acted',
+        directive_job_id: 'http-directive-lane',
+      });
+      // A second disposition is refused — the lane is done.
+      const again = await call(
+        h.port,
+        'POST',
+        '/api/jobs/http-report-settle/disposition',
+        { outcome: 'dismissed', note: 'late attempt' },
+        TOKEN,
+      );
+      expect(again.status).toBe(400);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('disposition endpoint answers 404 for a missing job and 400 for a malformed outcome', async () => {
+    const h = await boot();
+    try {
+      const missing = await call(h.port, 'POST', '/api/jobs/nope/disposition', { outcome: 'dismissed', note: 'x' }, TOKEN);
+      expect(missing.status).toBe(404);
+      const malformed = await call(h.port, 'POST', '/api/jobs/also-nope/disposition', { outcome: 'merge' }, TOKEN);
+      expect(malformed.status).toBe(400);
+      expect(field<string>(malformed.json, 'detail')).toContain('acted|dismissed|superseded');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('PR-owing lanes are untouched by the report machinery: no obligation opens on their delivery', async () => {
+    const h = await boot();
+    const repo = makeFixtureRepo('fixture-http-pr-untouched');
+    cleanupRepos.push(repo);
+    try {
+      const dispatched = await call(
+        h.port,
+        'POST',
+        '/api/dispatch',
+        { job_id: 'http-pr-job', repo_path: repo.path, title: 'implementation', briefing: 'build it' },
+        TOKEN,
+      );
+      expect(dispatched.status).toBe(202);
+      await waitForDelivery(h, 'http-pr-job');
+      expect(h.ledger.listObligations({ jobId: 'http-pr-job' })).toHaveLength(0);
+      expect(h.ledger.getJob('http-pr-job')?.status).toBe('delivered');
+      // And the digest still offers exactly the PR step for it — a report
+      // lane would never appear here.
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(digest.deliveredWithoutPr.map((row) => row.jobId)).toEqual(['http-pr-job']);
     } finally {
       await h.close();
     }

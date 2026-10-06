@@ -338,9 +338,17 @@ function racedPrompt(
  * briefing turn records — carrying the lane head the turn produced. The
  * digest's freshness predicate reads that sha against the round's reviewed
  * target: a moved head warrants the re-review; the same head does not.
+ *
+ * Issue #220: on a report-type job this delivery is the HANDBACK — the
+ * same transaction opens the one `report:<jobId>` obligation owed by the
+ * commissioner (idempotent), so `delivered` never again means "pending
+ * forever": it means a disposition is owed and durable.
  */
 export function recordFollowUpDelivery(input: {
-  readonly ledger: Pick<LedgerApi, 'appendCustomEvent'>;
+  readonly ledger: Pick<
+    LedgerApi,
+    'appendCustomEvent' | 'getJob' | 'openReportObligation'
+  >;
   readonly worktrees: Pick<WorktreePort, 'listWorktrees'>;
   readonly jobId: string;
   readonly agentId: string | null;
@@ -380,6 +388,25 @@ export function recordFollowUpDelivery(input: {
       ...(input.phaseId !== undefined ? { phase_id: input.phaseId } : {}),
     },
   });
+  // Issue #220: the report handback's commissioner obligation. A failure
+  // here must never un-record the delivery — the obligation has its own
+  // recovery (the backfill CLI and the deterministic pass read the same
+  // rows) — but it is logged loud, never swallowed silently.
+  const job = input.ledger.getJob(input.jobId);
+  if (job !== null && job.deliverable !== null && job.deliverable !== 'pr') {
+    try {
+      const opened = input.ledger.openReportObligation({ jobId: input.jobId, observedAtSeq: event.seq });
+      if (opened.created) {
+        input.ledger.appendCustomEvent({
+          kind: 'job.report-handback',
+          jobId: input.jobId,
+          payload: { obligation_id: opened.obligation.id, delivered_seq: event.seq },
+        });
+      }
+    } catch (error) {
+      note = note ?? `report obligation open failed: ${String(error).slice(0, 200)}`;
+    }
+  }
   return { sha, lanePath: lane?.path ?? null, note, eventSeq: event.seq };
 }
 

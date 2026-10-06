@@ -70,7 +70,14 @@ limits, and never substitute untracked reviewers. Mark non-PR dispatches
 by kind: reviewer jobs carry `"deliverable": "review"`, artifact-only and
 investigation lanes carry `"deliverable": "artifact"` / `"investigation"`;
 implementation lanes omit the field (PR-owing) — an unmarked non-PR
-dispatch is chased as a missing PR. Expensive suites go through the
+dispatch is chased as a missing PR. A report-type dispatch also names its
+commissioner and target (issue #220): `"commissioner"` (who owes the
+disposition), `"target_ref"` (the PR url) and `"target_sha"` (the exact
+reviewed head); a review WITHOUT its target is rejected loudly. The
+delivered report then owes exactly one disposition — acted (findings
+routed as a directive to the target lane), dismissed (with a reason), or
+superseded — and the deterministic pass retires it mechanically when the
+target merges or its head moves past the reviewed sha. Expensive suites go through the
 verification scheduler (`/api/verify`) within existing capacity. You do
 not approve each routine phase. NEEDS CHANGES returns to the same
 implementing worker's authorized fix cycle; exact-final-head READY

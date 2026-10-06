@@ -874,4 +874,26 @@ export const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX idx_decisions_subject_active ON decisions(subject, cleared_at);
     `,
   },
+  {
+    // Report-job closure (issue #220): who commissioned a report-type job
+    // (review / artifact / investigation) and what it reviewed. The PR URL
+    // (`target_ref`) plus the exact reviewed head (`target_sha`) are the
+    // facts the auto-supersede pass reads: a merged target or a head that
+    // moved past the reviewed sha retires the owed commissioner decision.
+    // NULL on legacy rows — the backfill CLI infers what the ledger can
+    // prove and lists the rest for the owner; nothing here guesses.
+    // LANDING COLLISION (same convention as migrations 10-20): id 21 is a
+    // branch-local next-contiguous number for an UNSHIPPED feature; if
+    // owner-merged main lands first, re-number ONLY this never-applied
+    // migration (never a hole).
+    id: 21,
+    name: 'job-report-closure',
+    sql: `
+      ALTER TABLE jobs ADD COLUMN commissioner TEXT;
+      ALTER TABLE jobs ADD COLUMN target_ref TEXT;
+      ALTER TABLE jobs ADD COLUMN target_sha TEXT;
+      CREATE INDEX idx_jobs_status ON jobs(status);
+      CREATE INDEX idx_jobs_pr_url ON jobs(pr_url);
+    `,
+  },
 ];

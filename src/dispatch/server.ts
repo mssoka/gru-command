@@ -3,9 +3,9 @@ import { hashToken, tokenConfigured, tokenMatches } from '../auth.js';
 import type { GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { ChildWorkerRecord, JobDeliverable, LedgerApi } from '../ledger/api.js';
-import { JOB_DISPLAY_NAME_MAX_LENGTH, AmbiguousDirectiveError, DirectiveConflictError, PhaseHandoffConflictError, PipelineConflictError } from '../ledger/api.js';
+import { JOB_DISPLAY_NAME_MAX_LENGTH, AmbiguousDirectiveError, DirectiveConflictError, PhaseHandoffConflictError, PipelineConflictError, RecordNotFound } from '../ledger/api.js';
 import { isJobTerminal } from '../ledger/states.js';
-import { parseCompletionHandoffIntent, type CompletionHandoffIntent } from '../ledger/obligations.js';
+import { isReportDispositionOutcome, parseCompletionHandoffIntent, type CompletionHandoffIntent } from '../ledger/obligations.js';
 import { parsePipelinePrerequisites, type PipelinePrerequisite } from '../ledger/pipeline.js';
 import type { PipelineService } from './pipeline.js';
 import type { NotificationCenter } from '../notifications/center.js';
@@ -359,12 +359,23 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       }
       const deliverable = deliverableField(body);
       const completionHandoff = completionHandoffField(body);
+      // Issue #220 report-job closure: the commissioner (the disposition
+      // debtor — explicit field, else the request's `by`, else `gru`) and
+      // the review target (PR url + reviewed head). A present-but-malformed
+      // field is a 400, never a silent drop (same idiom as display_name).
+      const commissioner = optStrFieldStrict(body, 'commissioner');
+      const by = optStrField(body, 'by');
+      const targetRef = optStrFieldStrict(body, 'target_ref');
+      const targetSha = optStrFieldStrict(body, 'target_sha');
       const outcome = await options.dispatch.dispatch({
         jobId: strField(body, 'job_id'),
         repoPath: strField(body, 'repo_path'),
         title: strField(body, 'title'),
         ...(displayName !== undefined ? { displayName } : {}),
         ...(deliverable !== undefined ? { deliverable } : {}),
+        ...(commissioner !== undefined ? { commissioner } : by !== undefined ? { commissioner: by } : {}),
+        ...(targetRef !== undefined ? { targetRef } : {}),
+        ...(targetSha !== undefined ? { targetSha } : {}),
         briefing: strField(body, 'briefing'),
         ...(completionHandoff !== undefined ? { completionHandoff } : {}),
       });
@@ -378,6 +389,53 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         branch: outcome.worktree.branch,
         agent_id: outcome.agentId,
       });
+      return true;
+    }
+    if (req.method === 'POST' && path.startsWith('/api/jobs/') && path.endsWith('/disposition')) {
+      if (!authed(req, res)) return true;
+      // Issue #220: the commissioner settles a delivered report. The whole
+      // action rides one ledger transaction (disposition event + typed
+      // settlement + delivered → done), so a crash can never leave the
+      // obligation settled with the lane still owing, or the reverse.
+      const jobId = decodeURIComponent(path.slice('/api/jobs/'.length, -'/disposition'.length));
+      if (jobId === '') {
+        json(res, 400, { error: 'bad_request', detail: 'job id path segment is required' });
+        return true;
+      }
+      const body = await readBody(req);
+      const rawOutcome = body['outcome'];
+      if (typeof rawOutcome !== 'string' || !isReportDispositionOutcome(rawOutcome)) {
+        json(res, 400, {
+          error: 'bad_request',
+          detail: `outcome must be one of acted|dismissed|superseded (got ${JSON.stringify(rawOutcome ?? null)})`,
+        });
+        return true;
+      }
+      const note = optStrField(body, 'note');
+      const directiveJobId = optStrField(body, 'directive_job_id');
+      const by = optStrField(body, 'by');
+      try {
+        const settled = options.ledger.settleReportDisposition({
+          jobId,
+          outcome: rawOutcome,
+          ...(note !== undefined ? { note } : {}),
+          ...(directiveJobId !== undefined ? { directiveJobId } : {}),
+          ...(by !== undefined ? { by } : {}),
+        });
+        json(res, 200, {
+          job_id: settled.job.id,
+          status: settled.job.status,
+          obligation_id: settled.obligation.id,
+          obligation_state: settled.obligation.state,
+          outcome: rawOutcome,
+        });
+      } catch (error) {
+        if (error instanceof RecordNotFound) {
+          json(res, 404, { error: 'not_found', detail: String(error.message) });
+          return true;
+        }
+        throw error;
+      }
       return true;
     }
     if (req.method === 'POST' && path === '/api/dispatch/pr') {
@@ -1481,7 +1539,11 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
 
   return {
     requestHook(req, res, path): boolean {
-      if (!path.startsWith('/api/dispatch') && !path.startsWith('/api/silas') && !path.startsWith('/api/pipeline')) {
+      // The /api/jobs namespace belongs to the BOARD api except for the
+      // report disposition endpoint this hook adds — claim only that exact
+      // shape, or /api/jobs/{id}/status and friends would 404 here.
+      const isDisposition = path.startsWith('/api/jobs/') && path.endsWith('/disposition');
+      if (!path.startsWith('/api/dispatch') && !path.startsWith('/api/silas') && !path.startsWith('/api/pipeline') && !isDisposition) {
         return false;
       }
       const startedAt = Date.now();
