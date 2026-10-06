@@ -122,8 +122,12 @@ function unquoteGitPath(text: string): string | null {
   return Buffer.from(bytes).toString('utf8');
 }
 
-/** Resolve the two paths of a `diff --git` line, quoted or bare. */
-function parseDiffHeaderPaths(rest: string): { readonly oldPath: string; readonly newPath: string } | null {
+/** Every well-formed `a/<path> b/<path>` split of a `diff --git` line,
+ * quoted or bare. Bare paths may contain ` b/` themselves, so more than one
+ * split can be well-formed; the consumer resolves the ambiguity only after
+ * seeing whether rename/copy metadata or ---/+++ headers name the real
+ * paths. A quoted header (git quotes when the name needs it) is exact. */
+function parseDiffHeaderCandidates(rest: string): { readonly oldPath: string; readonly newPath: string }[] {
   if (rest.startsWith('"')) {
     let cursor = 0;
     let inString = false;
@@ -139,18 +143,11 @@ function parseDiffHeaderPaths(rest: string): { readonly oldPath: string; readonl
       if (character === '"') { inString = true; continue; }
       if (character === ' ' && cursor > 0) break;
     }
-    const first = rest.slice(0, cursor);
-    const second = rest.slice(cursor + 1);
-    const oldPath = unquoteGitPath(first);
-    const newPath = unquoteGitPath(second);
-    if (oldPath === null || newPath === null) return null;
-    return { oldPath, newPath };
+    const oldPath = unquoteGitPath(rest.slice(0, cursor));
+    const newPath = unquoteGitPath(rest.slice(cursor + 1));
+    if (oldPath === null || newPath === null) return [];
+    return [{ oldPath, newPath }];
   }
-  // Git leaves spaces UNQUOTED and separates the two operands with a single
-  // space: `a/<path> b/<path>`. A path may itself contain ` b/`, so every
-  // well-formed split is a candidate; the SAME-PATH pair (the common
-  // mode-only/unchanged case) wins, and otherwise the last candidate is the
-  // separator (a rename's exact sides come from its `rename from/to` lines).
   const candidates: { oldPath: string; newPath: string }[] = [];
   for (let index = 2; index < rest.length; index += 1) {
     if (rest[index] !== ' ') continue;
@@ -158,9 +155,7 @@ function parseDiffHeaderPaths(rest: string): { readonly oldPath: string; readonl
     const right = rest.slice(index + 1);
     if (left.startsWith('a/') && right.startsWith('b/')) candidates.push({ oldPath: left, newPath: right });
   }
-  if (candidates.length === 0) return null;
-  return candidates.find((candidate) =>
-    candidate.oldPath.slice(2) === candidate.newPath.slice(2)) ?? candidates[candidates.length - 1]!;
+  return candidates;
 }
 
 /** Strip the `a/` / `b/` prefix a diff path carries (quoted or bare). */
@@ -188,6 +183,7 @@ export function parseDeltaStructure(diff: string): {
   const unhunked = new Set<string>();
   const hunked = new Set<string>();
   let path: string | null = null;
+  let headerCandidates: { readonly oldPath: string; readonly newPath: string }[] | null = null;
   let newLine = 0;
   let addedStart: number | null = null;
   let inHunk = false;
@@ -201,6 +197,23 @@ export function parseDeltaStructure(diff: string): {
   const notePath = (next: string | null): void => {
     path = next;
     if (next !== null) paths.add(next);
+  };
+  /** A `diff --git` header is authoritative only when nothing better names
+   * the paths: rename/copy metadata DISCARDS it, ---/+++ headers override
+   * it, and a mode-only change (no other lines) falls back to the
+   * same-path pair — the only case where the ambiguous bare split must be
+   * resolved from the header alone. */
+  const resolveHeaderCandidates = (): void => {
+    const candidates = headerCandidates;
+    headerCandidates = null;
+    if (candidates === null || candidates.length === 0) return;
+    const preferred = candidates.find((candidate) =>
+      candidate.oldPath.slice(2) === candidate.newPath.slice(2)) ?? candidates[candidates.length - 1]!;
+    const next = stripDiffPrefix(preferred.newPath, 'b');
+    if (next !== null) {
+      notePath(next);
+      unhunked.add(next);
+    }
   };
   for (const line of diff.split('\n')) {
     // Hunk BODY first: inside a hunk, a line like `+++ foo;` is added
@@ -233,29 +246,42 @@ export function parseDeltaStructure(diff: string): {
     flushAdded();
     inHunk = false;
     if (line.startsWith('diff --git ')) {
-      const header = parseDiffHeaderPaths(line.slice('diff --git '.length));
-      notePath(header === null ? null : stripDiffPrefix(header.newPath, 'b'));
-      if (path !== null) unhunked.add(path);
-      continue;
-    }
-    if (line.startsWith('+++ ')) {
-      // A deletion's `/dev/null` keeps the path from the `---`/diff header
-      // (the deleted file's own path); a real path always wins.
-      const next = stripDiffPrefix(line.slice(4).trimEnd(), 'b');
-      if (next !== null) notePath(next);
+      resolveHeaderCandidates();
+      headerCandidates = parseDiffHeaderCandidates(line.slice('diff --git '.length));
       continue;
     }
     if (line.startsWith('--- ')) {
+      resolveHeaderCandidates();
       const previous = stripDiffPrefix(line.slice(4).trimEnd(), 'a');
       if (previous !== null) notePath(previous);
       continue;
     }
+    if (line.startsWith('+++ ')) {
+      // A deletion's `/dev/null` keeps the path from the rename metadata or
+      // the `---`/diff header (the deleted file's own path).
+      resolveHeaderCandidates();
+      const next = stripDiffPrefix(line.slice(4).trimEnd(), 'b');
+      if (next !== null) notePath(next);
+      continue;
+    }
+    if (line.startsWith('rename from ') || line.startsWith('copy from ')) {
+      // Rename/copy metadata is authoritative: the ambiguous bare header
+      // split must not contribute a bogus destination. The SOURCE stays a
+      // touched path (the file was removed there) without a line span.
+      headerCandidates = null;
+      const source = line.slice(line.indexOf(' from ') + 6);
+      const decoded = source.startsWith('"') ? unquoteGitPath(source) : source;
+      if (decoded !== null && decoded !== '') paths.add(decoded);
+      continue;
+    }
     if (line.startsWith('rename to ') || line.startsWith('copy to ')) {
-      // Rename/copy metadata carries the DESTINATION path (quoted when it
-      // needs quoting); no `---`/`+++` headers exist for a pure rename.
+      headerCandidates = null;
       const destination = line.slice(line.indexOf(' to ') + 4);
-      notePath(destination.startsWith('"') ? unquoteGitPath(destination) : destination);
-      if (path !== null) unhunked.add(path);
+      const decoded = destination.startsWith('"') ? unquoteGitPath(destination) : destination;
+      if (decoded !== null && decoded !== '') {
+        notePath(decoded);
+        unhunked.add(decoded);
+      }
       continue;
     }
     const hunkHeader = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/u.exec(line);
@@ -267,6 +293,7 @@ export function parseDeltaStructure(diff: string): {
     // Any other metadata (index/old mode/new mode/similarity) is ignored.
   }
   flushAdded();
+  resolveHeaderCandidates();
   // A touched path with NO line hunk at all (mode-only or other metadata
   // change) still changed: findings on it can never be proven outside the
   // delta, so the whole file intersects.

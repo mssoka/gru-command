@@ -195,6 +195,27 @@ describe('delta hunk parsing and intersection', () => {
     expect(findingIntersectsDelta('new name.ts:1', parsedRenamed.hunks)).toBe(true);
   });
 
+  it('lets rename metadata override an ambiguous bare header (no bogus touched path)', () => {
+    // Real Git output for renaming `x b/y` (a path containing a space AND
+    // ` b/`) to `y`: the bare header has TWO well-formed splits, and the
+    // equal-pair preference cannot disambiguate it. Rename metadata is
+    // authoritative; the OLD path must not gain a line span (an unrelated
+    // blocker there could otherwise hold the PR).
+    const renamed = [
+      'diff --git a/x b/y b/y',
+      'similarity index 100%',
+      'rename from x b/y',
+      'rename to y',
+    ].join('\n');
+    const parsed = parseDeltaStructure(renamed);
+    expect(parsed.paths.has('y')).toBe(true);
+    // The source is touched (the file was removed there) but carries no
+    // intersection span.
+    expect(parsed.paths.has('x b/y')).toBe(true);
+    expect(findingIntersectsDelta('y:1', parsed.hunks)).toBe(true);
+    expect(findingIntersectsDelta('x b/y:1', parsed.hunks)).toBe(false);
+  });
+
   it('fails closed toward blocking for unanchored findings and unusable line numbers', () => {
     const hunks = parseDeltaHunks(diff);
     expect(findingIntersectsDelta('N/A', hunks)).toBe(true);
