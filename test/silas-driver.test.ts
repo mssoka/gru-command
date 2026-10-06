@@ -1324,10 +1324,20 @@ describe('silas digest (the four actionable states)', () => {
     try {
       // The candidates are OLDER than the verdict job, so the compute visits
       // them only after the history wait resolves — by then the listJobs
-      // snapshot each intake row is computed from is already stale.
+      // snapshot each intake row is computed from still reads the pre-
+      // mutation review-eligible status ('working'; addJobWithDelivery
+      // records the delivery as an event and never flips the status). The
+      // 'z-' id prefix keeps every mutated/control candidate AFTER
+      // 'history-wait' even under a same-millisecond updated_at tie
+      // (listJobs breaks ties by id ascending), so the stale-snapshot path
+      // is structural, not clock luck.
       addJobWithDelivery(h.ledger, 'eligible-offer', { prUrl: 'https://git.example.invalid/pull/7' });
-      addJobWithDelivery(h.ledger, 'parked-offer', { prUrl: 'https://git.example.invalid/pull/8' });
-      addJobWithDelivery(h.ledger, 'blocked-offer', { prUrl: 'https://git.example.invalid/pull/9' });
+      addJobWithDelivery(h.ledger, 'z-parked-offer', { prUrl: 'https://git.example.invalid/pull/8' });
+      addJobWithDelivery(h.ledger, 'z-blocked-offer', { prUrl: 'https://git.example.invalid/pull/9' });
+      // PR-less lanes share the same publish fence (deliveredWithoutPr):
+      // one is flipped to blocked during the wait, one stays untouched.
+      addJobWithDelivery(h.ledger, 'z-blocked-no-pr');
+      addJobWithDelivery(h.ledger, 'z-plain-no-pr');
       addJobWithDelivery(h.ledger, 'history-wait', { prUrl: 'https://git.example.invalid/pull/6' });
       const round = h.ledger.addRound({ jobId: 'history-wait' });
       h.ledger.setRoundStatus(round.id, 'live');
@@ -1340,13 +1350,18 @@ describe('silas digest (the four actionable states)', () => {
         config: DEFAULT_SILAS_CONFIG, trigger: 'sweep' });
       await waiting;
       // The recoverable side-states land DURING the deferred await: intake
-      // still sees `delivered` in the stale snapshot, so only the publish
-      // boundary can retract these two offers.
-      h.ledger.setJobStatus('blocked-offer', 'blocked');
-      h.ledger.setJobStatus('parked-offer', 'parked');
+      // still sees the pre-mutation review-eligible status in the stale
+      // snapshot, so only the publish boundary can retract these offers.
+      h.ledger.setJobStatus('z-blocked-offer', 'blocked');
+      h.ledger.setJobStatus('z-parked-offer', 'parked');
+      h.ledger.setJobStatus('z-blocked-no-pr', 'blocked');
       release();
       const digest = await digestPromise;
       expect(digest.prWithoutReview.map((row) => row.jobId)).toEqual(['eligible-offer']);
+      // The shared fence guards the PR-less projection too: the blocked
+      // lane's PR-registration offer is retracted; the untouched control
+      // remains.
+      expect(digest.deliveredWithoutPr.map((row) => row.jobId)).toEqual(['z-plain-no-pr']);
     } finally { release(); h.cleanup(); }
   });
 
