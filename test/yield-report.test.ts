@@ -389,6 +389,20 @@ describe('digestSignatureFromPrompt', () => {
     expect(digestSignatureFromPrompt('no digest here')).toBeNull();
     expect(digestSignatureFromPrompt('## Digest (actionable states, JSON)\n\n```json\n{broken\n```')).toBeNull();
   });
+
+  it('a fingerprint-bearing wake attributes directly — full and delta prompts alike (issue #217, review r1)', () => {
+    const fp = 'a'.repeat(64);
+    const full = `Silas ops wake — trigger: sweep\n\n## Digest (actionable states, JSON)\n\nDigest fingerprint: ${fp}\n\n\`\`\`json\n${JSON.stringify({ computedAt: 'x', trigger: 'sweep', deliveredWithoutPr: [] })}\n\`\`\``;
+    expect(digestSignatureFromPrompt(full)).toBe(`fp:${fp}`);
+    const delta = `Silas ops wake — trigger: sweep\n\n## Digest delta (since the last delivered wake)\n\nDigest fingerprint: ${fp}\n\nAdded rows:\n\n\`\`\`json\n[]\n\`\`\`\n\nFull digest: GET http://127.0.0.1:1/api/silas/digest`;
+    expect(digestSignatureFromPrompt(delta)).toBe(`fp:${fp}`);
+    // a different fingerprint is a different signature
+    const fp2 = 'b'.repeat(64);
+    const delta2 = delta.replace(fp, fp2);
+    expect(digestSignatureFromPrompt(delta2)).not.toBe(digestSignatureFromPrompt(delta));
+    // a malformed fingerprint line never matches
+    expect(digestSignatureFromPrompt('Digest fingerprint: nothex')).toBeNull();
+  });
 });
 
 // ------------------------------------------------------------------

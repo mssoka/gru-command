@@ -25,7 +25,7 @@ import type { WaveRunner } from './dispatch/perkins.js';
 import { createReviewEscalationNotifier } from './dispatch/escalation-identity.js';
 import { createStartupVerdictPoster } from './dispatch/perkins-github-app.js';
 import { BobScheduler } from './dispatch/bob-scheduler.js';
-import { SilasDriver, supervisionLookup } from './dispatch/silas-driver.js';
+import { SilasDriver, computeSilasDigest, consolidatedBlockersFor, supervisionLookup } from './dispatch/silas-driver.js';
 import { createProductionDeterministicPass } from './dispatch/durable-reconcile.js';
 import { ProviderRecoverySensor, establishProviderWait } from './provider-recovery/sensor.js';
 import { ModelRuntimeProbe } from './provider-recovery/probe.js';
@@ -1382,6 +1382,19 @@ async function main(): Promise<number> {
                   by,
                 ),
             },
+            // Read-only digest endpoint (issue #217): the wake prompt's
+            // delta pointer resolves here, computed with the SAME seams the
+            // driver uses (worktrees, blockers port, supervision stop
+            // truth) so the API can never disagree with what wakes Silas.
+            digest: () =>
+              computeSilasDigest({
+                ledger,
+                worktrees: worktreeManager,
+                blockersForRound: consolidatedBlockersFor(ledger),
+                config: config.silas,
+                trigger: 'api',
+                supervisionFor: supervisionLookup(() => supervisor),
+              }),
           },
         }
       : {}),
