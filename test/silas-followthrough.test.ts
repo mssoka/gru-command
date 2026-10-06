@@ -458,16 +458,26 @@ describe('silas follow-through (no human input)', () => {
 
       // The whole arc completes on its own: round 1 requests changes, the
       // first fix directive lands, the follow-up delivery moves the lane,
-      // the re-review runs, and round 2 approves.
+      // the delta re-review approves, and its Stage-5 final whole-change
+      // pass confirms at the same candidate before approval stands.
       await vi.waitFor(
         () => {
           const rounds = h.ledger.listRounds('pr-651');
-          expect(rounds).toHaveLength(2);
+          expect(rounds).toHaveLength(3);
           expect(rounds[0]?.verdict).toBe('changes-requested');
           expect(rounds[1]?.verdict).toBe('approved');
+          expect(rounds[2]?.verdict).toBe('approved');
+          expect(rounds[2]?.targetRef).toBe(rounds[1]?.targetRef);
         },
         { timeout: 45_000 },
       );
+      {
+        const rounds = h.ledger.listRounds('pr-651');
+        expect(h.ledger.latestRoundEvent(rounds[1]!.id, 'round.perkins-review')?.payload)
+          .toMatchObject({ reviewScope: 'delta', finalPassRequired: true });
+        expect(h.ledger.latestRoundEvent(rounds[2]!.id, 'round.perkins-review')?.payload)
+          .toMatchObject({ reviewScope: 'whole' });
+      }
       await Promise.allSettled(h.silasPrompts);
 
       // The client contract is asserted OUTSIDE the fake-session promise

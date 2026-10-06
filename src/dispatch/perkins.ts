@@ -29,6 +29,7 @@ import type { CanonicalReviewVerdict, VerifiedFinding } from './perkins-review/t
 import { PerkinsWholeReview, verifiedSpecialistCheckpointResults, type PerkinsWholeResult, type RoundBudgetRefusal } from './perkins-review/whole.js';
 import { publicRecoveryModelIdentity } from '../runtime/review-model-identity.js';
 import { loadPerkinsPolicy, type PerkinsLens, type PerkinsPolicy } from './perkins-review/policy.js';
+import { nextReviewScope, readPriorConvergenceMeta } from './perkins-review/convergence.js';
 import {
   freezeReviewInputs,
   compatibleReviewIdentity,
@@ -258,6 +259,13 @@ export function hostDisclosureAppendix(
     readonly specialistRuns: ReadonlyArray<{ readonly lens: string; readonly status: string; readonly findingsDelivered?: boolean; readonly recoveredForLead?: true; readonly cleanupRecordingError?: string; readonly evidenceRecordingError?: string; readonly progressError?: string }>;
     readonly priorDispositions: ReadonlyArray<{ readonly status: string }>;
     readonly budgetRefusals?: ReadonlyArray<RoundBudgetRefusal>;
+    readonly convergence?: {
+      readonly reviewScope: 'whole' | 'delta';
+      readonly deltaUnavailable?: string;
+      readonly carriedPriors?: readonly number[];
+      readonly deferredFollowups?: readonly { readonly title: string; readonly location: string; readonly severity: string }[];
+      readonly verdictRecomputed?: { readonly from: string; readonly to: string };
+    };
   },
   provider: PublicationProviderKind,
   /** The round's APPLICABLE catalog (full or explicit no-spec): the
@@ -347,6 +355,18 @@ export function hostDisclosureAppendix(
     ...(progressGaps.length > 0 ? [`- Specialist progress observer failures: ${progressGaps.map(([lens]) => lens).join(', ')} — the runs stand, but their progress report could not be published; the sealed run record carries the reason`] : []),
     ...(notUsed.length > 0 ? [`- Lenses not used this round: ${notUsed.join(', ')}`]: []),
     ...(prior.length > 0 ? [`- Prior findings revisited: ${prior.length} (${priorFixed} fixed, ${priorStill} still present)`] : []),
+    ...(review.convergence === undefined ? [] : [
+      `- Review scope: ${review.convergence.reviewScope === 'delta' ? `delta since the last reviewed SHA${review.convergence.deltaUnavailable !== undefined ? ` (delta UNAVAILABLE — disclosed whole-change re-verification: ${review.convergence.deltaUnavailable})` : ''}` : 'whole change (standing authority)'}`,
+      ...(review.convergence.carriedPriors !== undefined && review.convergence.carriedPriors.length > 0
+        ? [`- Prior findings carried forward without re-verification: ${review.convergence.carriedPriors.length} (quoted evidence unchanged, cited file untouched)`]
+        : []),
+      ...(review.convergence.deferredFollowups !== undefined && review.convergence.deferredFollowups.length > 0
+        ? [`- Follow-ups deferred by the convergence rule: ${review.convergence.deferredFollowups.length} — new finding(s) outside this round's delta hunks, filed as follow-ups; they are recorded in full and cannot hold the PR (${review.convergence.deferredFollowups.map((followUp) => `${followUp.severity}: "${followUp.title}" at ${followUp.location}`).join('; ')})`]
+        : []),
+      ...(review.convergence.verdictRecomputed !== undefined
+        ? [`- Canonical verdict RECOMPUTED by the host convergence rule: the lead submitted "${review.convergence.verdictRecomputed.from}", the converged blocker set determines "${review.convergence.verdictRecomputed.to}"`]
+        : []),
+    ]),
     publicationLine,
   ].join('\n');
 }
@@ -1392,6 +1412,11 @@ export interface WaveOutcome {
   readonly reportFile: string;
   readonly artifactDirectory: string;
   readonly headMoved: boolean;
+  /** Stage-5 convergence: a delta round that posted READY still owes the
+   * final whole-change pass. The wave chains that pass before returning; a
+   * crash between the two leaves this flag durable so approval stays gated
+   * on the whole-scope round actually running. */
+  readonly finalPass?: { readonly required: true; readonly targetSha: string };
 }
 
 /** Bounded fallback-gate safety refusal: a re-brief request or revoked
@@ -2004,6 +2029,9 @@ export class WaveRunner {
     /** Human escape hatch: arm even while the target branch is busy; the
      * round is tagged in the manifest and the event log. */
     force?: boolean;
+    /** Prior indexes the implementing minion claimed fixed (fix-directive
+     * receipt); Stage-5 carry-forward always re-verifies claimed priors. */
+    claimedFixedPriors?: readonly number[];
   }): Promise<WaveOutcome | FallbackGateOutcome> {
     const outcome = await this.requestReview(input);
     if (outcome.route === 'perkins') return outcome.run;
@@ -2028,6 +2056,9 @@ export class WaveRunner {
     force?: boolean;
     /** Authorized private evidence attachments (service upload identities). */
     evidence?: readonly ReviewEvidenceRequest[];
+    /** Prior indexes the implementing minion claimed fixed (fix-directive
+     * receipt); Stage-5 carry-forward always re-verifies claimed priors. */
+    claimedFixedPriors?: readonly number[];
     /** Worker tool handoff: acknowledge without waiting for its own turn. */
     handoff?: boolean;
     /** Internal replay marker; never accepted from the public HTTP endpoint. */
@@ -2050,6 +2081,8 @@ export class WaveRunner {
           (input.lenses !== undefined && JSON.stringify(input.lenses) !== JSON.stringify((existing.input as { lenses?: readonly string[] }).lenses ?? undefined)) ||
           (input.targetRef !== undefined && input.targetRef !== (existing.input as { targetRef?: string }).targetRef) ||
           (input.noSpec !== undefined && input.noSpec !== (existing.input as { noSpec?: boolean }).noSpec) ||
+          (input.claimedFixedPriors !== undefined && JSON.stringify(input.claimedFixedPriors) !==
+            JSON.stringify((existing.input as { claimedFixedPriors?: readonly number[] }).claimedFixedPriors ?? undefined)) ||
           (input.evidence !== undefined && JSON.stringify(input.evidence) !== JSON.stringify((existing.input as { evidence?: readonly ReviewEvidenceRequest[] }).evidence ?? undefined));
         if (differs) {
           this.opts.ledger.appendCustomEvent({
@@ -2058,6 +2091,7 @@ export class WaveRunner {
               ...(input.lenses !== undefined ? { lenses: input.lenses } : {}),
               ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
               ...(input.noSpec !== undefined ? { noSpec: input.noSpec } : {}),
+              ...(input.claimedFixedPriors !== undefined ? { claimedFixedPriors: input.claimedFixedPriors } : {}),
               ...(input.evidence !== undefined ? { evidence_count: input.evidence.length, evidence_request_sha256: evidenceRequestFingerprint(input.evidence) } : {}),
             } },
           });
@@ -2074,6 +2108,7 @@ export class WaveRunner {
         ...(input.lenses !== undefined ? { lenses: input.lenses } : {}),
         ...(input.noSpec !== undefined ? { noSpec: input.noSpec } : {}),
         ...(input.evidence !== undefined ? { evidence: input.evidence } : {}),
+        ...(input.claimedFixedPriors !== undefined ? { claimedFixedPriors: input.claimedFixedPriors } : {}),
       };
       const event = this.opts.ledger.appendCustomEvent({ kind: 'job.review-handoff-queued', jobId: input.jobId, payload: { input: safeInput } });
       const pending = this.trackHandoff(safeInput, event.seq);
@@ -2178,7 +2213,7 @@ export class WaveRunner {
     return { route: 'perkins', round: begun.round, run: begun.run };
   }
 
-  private trackHandoff(input: { jobId: string; targetRef?: string; lenses?: readonly string[]; noSpec?: boolean; force?: boolean; evidence?: readonly ReviewEvidenceRequest[] }, seq: number) {
+  private trackHandoff(input: { jobId: string; targetRef?: string; lenses?: readonly string[]; noSpec?: boolean; force?: boolean; evidence?: readonly ReviewEvidenceRequest[]; claimedFixedPriors?: readonly number[] }, seq: number) {
     let resolve!: () => void;
     const run = new Promise<void>((done) => { resolve = done; });
     const pending = { input, seq, starting: false, held: false, settlementReplayRequested: false, run, resolve };
@@ -2336,6 +2371,9 @@ export class WaveRunner {
     noSpec?: boolean;
     force?: boolean;
     evidence?: readonly ReviewEvidenceRequest[];
+    /** Prior indexes the implementing minion claimed fixed (fix-directive
+     * receipt); Stage-5 carry-forward always re-verifies claimed priors. */
+    claimedFixedPriors?: readonly number[];
   }): Promise<{ readonly round: RoundRecord; readonly run: Promise<WaveOutcome> }> {
     this.enforceBranchIdleForRequest(input);
     let reviewModel: ReviewPreflightResult['reviewModel'];
@@ -2460,6 +2498,8 @@ export class WaveRunner {
     noSpec?: boolean;
     force?: boolean;
     evidence?: readonly ReviewEvidenceRequest[];
+    /** Prior indexes the implementing minion claimed fixed. */
+    claimedFixedPriors?: readonly number[];
     reviewModel?: ReviewPreflightResult['reviewModel'];
     reviewThinkingLevel?: string;
   }): Promise<{ readonly round: RoundRecord; readonly run: Promise<WaveOutcome> }> {
@@ -3007,6 +3047,8 @@ export class WaveRunner {
     noSpec?: boolean;
     force?: boolean;
     evidence?: readonly ReviewEvidenceRequest[];
+    /** Prior indexes the implementing minion claimed fixed. */
+    claimedFixedPriors?: readonly number[];
     reviewModel?: ReviewPreflightResult['reviewModel'];
     reviewThinkingLevel?: string;
   }, setupSignal: AbortSignal): Promise<{ readonly round: RoundRecord; readonly run: Promise<WaveOutcome> }> {
@@ -3396,18 +3438,58 @@ export class WaveRunner {
     });
     const runController = new AbortController();
     const run = this.track(
-      this.runBuiltInReview(
-        job,
-        round,
-        canonicalLenses,
-        reviewWorktree.id,
-        movementRef,
-        input.noSpec === true,
-        frozenReview,
-        policy,
-        runController.signal,
-        input.reviewModel,
-      ),
+      (async (): Promise<WaveOutcome> => {
+        const outcome = await this.runBuiltInReview(
+          job,
+          round,
+          canonicalLenses,
+          reviewWorktree.id,
+          movementRef,
+          input.noSpec === true,
+          frozenReview,
+          policy,
+          runController.signal,
+          input.reviewModel,
+          input.claimedFixedPriors,
+        );
+        // Stage-5 convergence: a delta round that posted READY still owes
+        // the final whole-change pass. Chain it NOW, after this round's
+        // cleanup, so approval is only ever credited by a whole-scope
+        // round; a crash between the rounds leaves finalPassRequired
+        // durable and the board's owner-ready gate stays closed.
+        if (outcome.finalPass?.required !== true || runController.signal.aborted || this.shuttingDown) return outcome;
+        try {
+          const next = await this.beginPerkinsRound({
+            jobId: input.jobId,
+            targetRef: outcome.finalPass.targetSha,
+            ...(input.noSpec === true ? { noSpec: true } : {}),
+            ...(input.evidence !== undefined ? { evidence: input.evidence } : {}),
+            ...(input.reviewModel !== undefined ? { reviewModel: input.reviewModel } : {}),
+            ...(input.reviewThinkingLevel !== undefined ? { reviewThinkingLevel: input.reviewThinkingLevel } : {}),
+          });
+          return await next.run;
+        } catch (error) {
+          const detail = `final whole-change pass for ${outcome.finalPass.targetSha} could not run: ${String(error)}`
+            .replace(/[\r\n]+/gu, ' ').slice(0, 500);
+          this.log('error', 'the Stage-5 final whole-change pass could not run; approval stays gated', {
+            round: round.id, error: detail,
+          });
+          try {
+            this.opts.ledger.appendCustomEvent({
+              kind: 'round.final-pass-failed', jobId: input.jobId, roundId: round.id,
+              payload: { targetSha: outcome.finalPass.targetSha, error: detail },
+            });
+          } catch {
+            // The escalation below still carries the durable fact.
+          }
+          this.opts.escalate?.(
+            `Perkins delta READY for job ${input.jobId} still owes its final whole-change pass`,
+            `${detail}. The delta round stays recorded, but no approval can be credited until a whole-scope round closes at this target.`,
+            { jobId: input.jobId, roundId: round.id },
+          );
+          return outcome;
+        }
+      })(),
       runController,
     );
     return { round, run };
@@ -3582,6 +3664,7 @@ export class WaveRunner {
     policy: PerkinsPolicy,
     signal: AbortSignal,
     reviewModel?: ReviewPreflightResult['reviewModel'],
+    claimedFixedPriors?: readonly number[],
   ): Promise<WaveOutcome> {
     let reservation: ResidentReviewRound | undefined;
     let settledOutcome: WaveOutcome | null = null;
@@ -3607,7 +3690,7 @@ export class WaveRunner {
           payload: { reason: 'lead and child resident slots admitted' },
         });
       }
-      const outcome = await this.runOwnedReview(job, round, lenses, movementRef, noSpec, frozenReview, policy, signal, reviewModel, beginSpawn, () => spawnInitiated, reservation);
+      const outcome = await this.runOwnedReview(job, round, lenses, movementRef, noSpec, frozenReview, policy, signal, reviewModel, beginSpawn, () => spawnInitiated, reservation, claimedFixedPriors);
       settledOutcome = outcome;
       return outcome;
     } catch (error) {
@@ -3660,6 +3743,7 @@ export class WaveRunner {
     beginSpawn: () => void,
     spawnInitiated: () => boolean,
     reservation?: ResidentReviewRound,
+    claimedFixedPriors?: readonly number[],
   ): Promise<WaveOutcome> {
     // The model-resolution closure belongs to one round. A concurrent
     // preflight cannot replace the proof used by its lead or specialist
@@ -3881,6 +3965,20 @@ export class WaveRunner {
         signal,
         ...(recoveredBaseTips.length > 0 && candidates.length > 0 ? { recoveredBaseTips } : {}),
         ...(priorConsolidatedFile !== undefined ? { priorConsolidatedFile } : {}),
+        // Stage-5 convergence (issue #225): every round after a prior is a
+        // delta round, except the final whole-change pass at a READY
+        // candidate. The scope is planned from the prior round's durable
+        // convergence record, never from wall-clock heuristics.
+        reviewScope: nextReviewScope({
+          prior: priorConsolidatedFile !== undefined && newestPredecessor !== undefined
+            ? readPriorConvergenceMeta(priorConsolidatedFile, newestPredecessor.seq)
+            : null,
+          currentTargetSha: frozenReview.manifest.targetSha,
+          currentDiffBaseSha: frozenReview.manifest.diffBaseSha,
+          deltaRoundsFrom: policy.portableContract.rules.convergence.deltaRoundsFrom,
+          finalWholePassAtReady: policy.portableContract.rules.convergence.finalWholePassAtReady,
+        }),
+        ...(claimedFixedPriors !== undefined ? { claimedFixedPriors } : {}),
       });
     } catch (error) {
       const detail = `Perkins whole-PR workflow failed: ${String(error).replace(/[\r\n]+/gu, ' ').slice(0, 500)}`;
@@ -4263,6 +4361,21 @@ export class WaveRunner {
       ].join('\n'));
     }
     if (recordedVerdict !== null) {
+      // Stage-5: the final-pass obligation is durable BEFORE the verdict
+      // commits. A crash between the two must never leave an approved
+      // delta round without its marker (the board's owner-ready gate reads
+      // this event); a failed marker write therefore fails the round
+      // closed instead of approving.
+      if (recordedVerdict === 'approved' && review.convergence?.finalPassRequired === true && !headMoved) {
+        try {
+          this.opts.ledger.appendCustomEvent({
+            kind: 'round.final-pass-required', jobId: job.id, roundId: round.id,
+            payload: { targetSha: review.targetSha, reviewScope: review.convergence.reviewScope },
+          });
+        } catch (markerError) {
+          throw new Error(`could not record the required final whole-change pass before the verdict commit: ${String(markerError)}`);
+        }
+      }
       // gh-169 round-5 P1: the deferred not-used chips and the verdict
       // transition commit in ONE atomic ledger transaction — a failure
       // anywhere leaves NOTHING committed (round live, deferred chips
@@ -4283,8 +4396,9 @@ export class WaveRunner {
         payload: {
           canonicalVerdict: canonical,
           // Blocker count for the operator-visible record (the awareness
-          // digest renders it as "verdict with N blocker(s)").
-          blockers: review.findings.filter((finding) => finding.severity === 'blocker').length,
+          // digest renders it as "verdict with N blocker(s)"). Deferred
+          // follow-ups cannot hold the PR, so they are not blockers here.
+          blockers: review.findings.filter((finding) => finding.severity === 'blocker' && finding.deferredFollowup !== true).length,
           targetSha: review.targetSha,
           baseRefSha: frozenReview.manifest.baseRefSha,
           diffBaseSha: review.diffBaseSha,
@@ -4292,8 +4406,63 @@ export class WaveRunner {
           reportFile,
           headMoved,
           complete: canonical !== 'INCOMPLETE' && !headMoved,
+          ...(review.convergence !== undefined ? {
+            reviewScope: review.convergence.reviewScope,
+            ...(review.convergence.carriedPriors !== undefined ? { carriedPriors: review.convergence.carriedPriors.length } : {}),
+            ...(review.convergence.carriedLenses !== undefined ? { carriedLenses: review.convergence.carriedLenses } : {}),
+            ...(review.convergence.deferredFollowups !== undefined ? { deferredFollowups: review.convergence.deferredFollowups.length } : {}),
+            ...(review.convergence.verdictRecomputed !== undefined ? { verdictRecomputed: review.convergence.verdictRecomputed } : {}),
+            ...(review.convergence.finalPassRequired === true ? { finalPassRequired: true } : {}),
+          } : {}),
         },
       });
+      // Stage-5: findings deferred by the convergence rule are FILED as
+      // follow-ups — one durable ledger event with the complete finding
+      // payloads, never silently dropped and never another review round.
+      if (review.convergence?.deferredFollowups !== undefined && review.convergence.deferredFollowups.length > 0) {
+        try {
+          writeReviewArtifact(frozenReview, 'followups-deferred.json', {
+            schemaVersion: 1,
+            roundId: round.id,
+            targetSha: review.targetSha,
+            rule: 'stage-5 convergence: new findings outside this round\'s delta hunks are filed as follow-ups and cannot hold the PR',
+            followups: review.findings.filter((finding) => finding.deferredFollowup === true),
+          });
+        } catch (writeError) {
+          this.log('error', 'could not write the deferred follow-ups artifact', { round: round.id, error: String(writeError) });
+        }
+        this.opts.ledger.appendCustomEvent({
+          kind: 'round.followups-deferred',
+          jobId: job.id,
+          roundId: round.id,
+          payload: {
+            targetSha: review.targetSha,
+            followups: review.findings
+              .filter((finding) => finding.deferredFollowup === true)
+              .map((finding) => ({
+                severity: finding.severity, title: finding.title, location: finding.location,
+                category: finding.category, detail: finding.detail, recommended_fix: finding.recommended_fix,
+                source: finding.source, roundOrigin: finding.roundOrigin,
+              })),
+          },
+        });
+        // Follow-ups are review-scoped records, deliberately not tracker
+        // issues: the review surface holds no tracker scopes, creating
+        // issues would duplicate the record below and grow the backlog,
+        // and triage/ownership of tracker work is not the reviewer's call.
+        // The guaranteed handoff is the operator escalation beside the
+        // durable artifact, ledger event and PR appendix — never a silent
+        // drop.
+        const followupTitles = review.findings
+          .filter((finding) => finding.deferredFollowup === true)
+          .map((finding) => `${finding.severity}: ${finding.title} (${finding.location})`);
+        this.opts.escalate?.(
+          `Perkins review for job ${job.id} deferred ${followupTitles.length} follow-up finding(s)`,
+          `Deferred by the Stage-5 convergence rule (outside this round's delta hunks; they cannot hold the PR): ${followupTitles.join('; ')}. ` +
+          `Filed as review follow-ups with full records in ${join(review.artifactDirectory, 'followups-deferred.json')}, the round.followups-deferred ledger event, the round's consolidated record and the PR review appendix — never dropped, and never another review round.`,
+          { jobId: job.id, roundId: round.id },
+        );
+      }
     } else {
       this.opts.ledger.setRoundStatus(round.id, 'aborted');
       // R6-8: the round ABORTED, so the deferred not-used chips never
@@ -4390,6 +4559,9 @@ export class WaveRunner {
       reportFile,
       artifactDirectory: review.artifactDirectory,
       headMoved: headMoved || (deliveryError !== undefined && refMovedSinceFreeze(frozenReview)),
+      ...(recordedVerdict === 'approved' && review.convergence?.finalPassRequired === true && !headMoved
+        ? { finalPass: { required: true as const, targetSha: review.targetSha } }
+        : {}),
     };
     } catch (error) {
       return this.finalizationIncomplete(job, round, lenses, frozenReview, error, provisional);

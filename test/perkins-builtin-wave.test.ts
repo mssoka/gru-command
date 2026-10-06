@@ -2503,9 +2503,16 @@ describe('WaveRunner built-in Perkins production path', () => {
     const thirdSessions = mkdtempSync(join(tmpdir(), 'perkins-prior-third-'));
     const thirdFake = fakeWholeSpawner(thirdSessions, {
       childAnswer: () => '[]', specialists: ['tests'],
-      priorDisposition: () => {
+      // Stage-5: the prior finding's cited file is untouched and its
+      // evidence unchanged at the same head, so the host CARRIES it — the
+      // prompt shows an empty revisit list and the lead dispositions only
+      // what it was shown (the carried blocker still holds the verdict).
+      priorDisposition: (shown) => {
         thirdAuditSeen = true;
-        return [{ prior_index: 0, status: 'still-present', note: 'defect remains: src/main.ts:2 still returns 43' }];
+        return shown.map((entry, index) => {
+          const finding = entry as { title: string; location: string };
+          return { prior_index: index, status: 'still-present' as const, note: `defect remains: ${finding.location}` };
+        });
       },
     });
     const third = asWave(await new WaveRunner({
@@ -2535,6 +2542,127 @@ describe('WaveRunner built-in Perkins production path', () => {
       expect.objectContaining({ title: 'Verified security defect', roundOrigin: 1 }),
     ]);
     for (const directory of [root, artifacts, firstSessions, secondSessions, thirdSessions]) {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }, 180_000);
+
+  it('Stage-5: a delta READY chains the final whole pass; deferred follow-ups are durable', async () => {
+    const repo = makeFixtureRepo('perkins-wave-stage5-final-pass');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/final-pass']);
+    repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-final-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-final-artifacts-'));
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-final-db-')));
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/final-pass', repo.head());
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-final-pass' });
+    const job = ledger.addJob({
+      id: 'job-final-pass', repo: 'fixture', title: 'final pass', baseBranch: 'main', briefing: 'review',
+    });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/38');
+    attachOrigin(repo, 'feature/final-pass', root);
+    const receiptPoster = {
+      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
+        reviewId: '9002', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+        headSha: call.targetSha, baseSha: 'b'.repeat(40),
+        bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
+      })),
+    };
+    const escalations: string[] = [];
+    const recoveryPreflight = async () => ({
+      ok: true as const, failures: [],
+      reviewModel: { role: 'perkins' as const, modelRef: 'fixture-model-v1', settings: {}, authEnv: {}, routingSha256: 'fixture-safe-route' },
+    });
+    const recoveryRuntime = () => ({ id: 'pi', version: 'test-runtime-v1' });
+
+    // Round 1 (whole): one warning; the round concludes READY.
+    const first = asWave(await new WaveRunner({
+      reviewPreflight: recoveryPreflight, reviewRuntimeIdentity: recoveryRuntime,
+      ledger, worktrees: port, poster: receiptPoster,
+      reviewArtifactRoot: artifacts, prHeadProbe: localHeadProbe('feature/final-pass'),
+      spawner: fakeWholeSpawner(mkdtempSync(join(tmpdir(), 'perkins-final-s1-')), {
+        childAnswer: () => '[]', specialists: [],
+        leadFinding: groundedFinding('lead', 'warning', { location: 'src/main.ts:1', evidence: 'export function answer(): number {' }),
+      }).spawner,
+    }).runRound({ jobId: job.id }));
+    expect(first.canonicalVerdict).toBe('READY TO MERGE');
+
+    // Round 2 (delta): a blocker INSIDE the delta holds the PR.
+    repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 44;\n}\n');
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/feature/final-pass']);
+    const secondFake = fakeWholeSpawner(mkdtempSync(join(tmpdir(), 'perkins-final-s2-')), {
+      childAnswer: () => '[]', specialists: [],
+      leadFinding: groundedFinding('lead', 'blocker', { location: 'src/main.ts:2', title: 'delta blocker' }),
+    });
+    const second = asWave(await new WaveRunner({
+      reviewPreflight: recoveryPreflight, reviewRuntimeIdentity: recoveryRuntime,
+      ledger, worktrees: port, spawner: secondFake.spawner, poster: receiptPoster,
+      reviewArtifactRoot: artifacts, prHeadProbe: localHeadProbe('feature/final-pass'),
+    }).runRound({ jobId: job.id }));
+    expect(second.round.seq).toBe(2);
+    expect(second.canonicalVerdict).toBe('NEEDS CHANGES');
+
+    // Round 3 (delta): every prior and the new blocker sit OUTSIDE this
+    // delta, so the convergence rule files them as follow-ups, recomputes
+    // the verdict to READY, and the wave AUTO-CHAINS the final whole pass
+    // (round 4), which re-holds the untouched blocker.
+    repo.commitFile('src/third.ts', 'export const third = 3;\n');
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/feature/final-pass']);
+    const thirdFake = fakeWholeSpawner(mkdtempSync(join(tmpdir(), 'perkins-final-s3-')), {
+      childAnswer: () => '[]', specialists: [],
+      leadFinding: groundedFinding('lead', 'blocker', { location: 'src/main.ts:1', title: 'outside delta blocker' }),
+      verdictOverride: 'NEEDS CHANGES',
+    });
+    const outcome = asWave(await new WaveRunner({
+      reviewPreflight: recoveryPreflight, reviewRuntimeIdentity: recoveryRuntime,
+      reconcileReviewAgent: async () => true,
+      ledger, worktrees: port, spawner: thirdFake.spawner, poster: receiptPoster,
+      reviewArtifactRoot: artifacts, prHeadProbe: localHeadProbe('feature/final-pass'),
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+    }).runRound({ jobId: job.id }));
+
+    const rounds = ledger.listRounds(job.id);
+    expect(rounds).toHaveLength(4);
+    // The wave call returns the CHAINED whole-pass round, not the delta
+    // round whose READY it superseded.
+    expect(outcome.round.seq).toBe(4);
+    expect(outcome.canonicalVerdict).toBe('NEEDS CHANGES');
+
+    // The delta round (seq 3) posted READY, owed the final pass, and
+    // durably filed its deferred follow-ups.
+    const deltaRound = rounds.find((round) => round.seq === 3)!;
+    const deltaReview = ledger.latestRoundEvent(deltaRound.id, 'round.perkins-review')!;
+    expect(deltaReview.payload).toMatchObject({ canonicalVerdict: 'READY TO MERGE', reviewScope: 'delta', finalPassRequired: true, deferredFollowups: 3 });
+    const deferredEvents = ledger.listJobEvents(job.id)
+      .filter((event) => event.kind === 'round.followups-deferred' && event.roundId === deltaRound.id);
+    expect(deferredEvents).toHaveLength(1);
+    expect((deferredEvents[0]!.payload as { followups: unknown[] }).followups).toHaveLength(3);
+    const deferredFile = JSON.parse(readFileSync(join(artifacts, deltaRound.id, 'followups-deferred.json'), 'utf8')) as {
+      followups: Array<{ title: string; deferredFollowup?: true }>;
+    };
+    expect(deferredFile.followups).toHaveLength(3);
+    expect(deferredFile.followups.some((finding) => finding.title === 'outside delta blocker')).toBe(true);
+    expect(escalations.some((entry) => entry.includes('deferred 3 follow-up finding(s)'))).toBe(true);
+
+    // The chained final whole pass carries the whole-change authority: the
+    // untouched blocker counts again and no deferral survives.
+    const finalRound = rounds.find((round) => round.seq === 4)!;
+    const finalReview = ledger.latestRoundEvent(finalRound.id, 'round.perkins-review')!;
+    expect(finalReview.payload).toMatchObject({ canonicalVerdict: 'NEEDS CHANGES', reviewScope: 'whole' });
+    expect((finalReview.payload as { finalPassRequired?: unknown }).finalPassRequired).toBeUndefined();
+    const finalConsolidated = JSON.parse(readFileSync(join(artifacts, finalRound.id, 'consolidated.json'), 'utf8')) as {
+      findings: Array<{ title: string; deferredFollowup?: true }>;
+      convergence: { reviewScope: string; deferredFollowups?: unknown };
+    };
+    expect(finalConsolidated.convergence.reviewScope).toBe('whole');
+    expect(finalConsolidated.convergence.deferredFollowups).toBeUndefined();
+    expect(finalConsolidated.findings.find((finding) => finding.title === 'outside delta blocker')?.deferredFollowup).toBeUndefined();
+
+    for (const directory of [root, artifacts]) {
       rmSync(directory, { recursive: true, force: true });
     }
   }, 180_000);

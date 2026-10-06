@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 
 export const PERKINS_POLICY_ID = 'perkins-code-review';
 export const PERKINS_CANONICAL_SOURCE_SHA256 = 'f38c28ffb10b4e44fa1f87f260a08507bb0a5c8872de2cf47e05a985c5eb92e7';
-export const PERKINS_POLICY_SHA256 = '9b4772cf9d459b887d3b20028639fba204091ec5e1e6ef6510c01a1705055275';
+export const PERKINS_POLICY_SHA256 = '68a39c61d4f27666eb652ff8f61c4957561373639b9cf031cee0be49debfe1de';
 
 export const PERKINS_LENSES = [
   'blind',
@@ -24,6 +24,19 @@ export type PerkinsLens = (typeof PERKINS_LENSES)[number];
  * the lead's own investigation. */
 export const PERKINS_FINDING_SOURCES = [...PERKINS_LENSES, 'lead'] as const;
 export type PerkinsFindingSource = (typeof PERKINS_FINDING_SOURCES)[number];
+
+export interface PerkinsConvergenceRules {
+  /** Delta rounds start at this round sequence (round 1 stays whole). */
+  readonly deltaRoundsFrom: number;
+  /** From this round sequence on a delta round, a new finding blocks only
+   * when its location intersects the round's delta hunks; others are
+   * deferred follow-ups. */
+  readonly convergenceRuleFromRound: number;
+  /** One final whole-change review runs when a delta round posts READY. */
+  readonly finalWholePassAtReady: boolean;
+  /** Untouched, unclaimed priors carry forward without re-verification. */
+  readonly carryForwardUntouchedPriors: boolean;
+}
 
 export interface PerkinsPolicy {
   readonly identity: string;
@@ -54,6 +67,10 @@ export interface PerkinsPolicy {
       readonly verdicts: Readonly<Record<string, string>>;
       readonly dedupeKey: string;
       readonly incompleteNeverApproves: boolean;
+      /** Stage-5 convergence policy (issue #225): delta rounds with
+       * carry-forward, the round-3 convergence rule, and the final
+       * whole-change pass at the READY candidate. */
+      readonly convergence: PerkinsConvergenceRules;
     };
   };
   readonly hostReplacements: readonly string[];
@@ -111,6 +128,20 @@ export function loadPerkinsPolicy(file = PERKINS_POLICY_FILE): PerkinsPolicy {
   ) {
     throw new Error(`bundled ${PERKINS_POLICY_ID} resource failed its identity/provenance/rules contract`);
   }
+  // Stage-5 convergence policy is integrity-pinned with the resource: an
+  // absent or malformed rule set refuses the whole policy (fail loud).
+  const convergence = policy.portableContract?.rules?.convergence;
+  const convergenceKeys = convergence === undefined ? [] : Object.keys(convergence).sort();
+  if (
+    convergence === undefined ||
+    convergenceKeys.join('\0') !== ['carryForwardUntouchedPriors', 'convergenceRuleFromRound', 'deltaRoundsFrom', 'finalWholePassAtReady'].join('\0') ||
+    !Number.isSafeInteger(convergence.deltaRoundsFrom) || convergence.deltaRoundsFrom < 2 ||
+    !Number.isSafeInteger(convergence.convergenceRuleFromRound) || convergence.convergenceRuleFromRound < convergence.deltaRoundsFrom ||
+    convergence.finalWholePassAtReady !== true ||
+    convergence.carryForwardUntouchedPriors !== true
+  ) {
+    throw new Error(`bundled ${PERKINS_POLICY_ID} resource failed its convergence-rule contract`);
+  }
   const rules = policy.portableContract.rules;
   if ('chunkLineThreshold' in rules) {
     throw new Error(`bundled ${PERKINS_POLICY_ID} carries the retired chunk-threshold rule`);
@@ -152,6 +183,13 @@ export function loadPerkinsPolicy(file = PERKINS_POLICY_FILE): PerkinsPolicy {
   }
   if (policy.portableContract.rules.fullLenses.join(',') !== PERKINS_LENSES.join(',')) {
     throw new Error(`bundled ${PERKINS_POLICY_ID} full-lens order drifted`);
+  }
+  // The lead workflow must carry the Stage-5 convergence guidance so a
+  // resource that silently drops it can never ship under the pin.
+  if (!policy.portableContract.leadWorkflow.includes('DELTA ROUND') ||
+    !policy.portableContract.leadWorkflow.includes('CARRIED FORWARD') ||
+    !policy.portableContract.leadWorkflow.includes('convergence rule')) {
+    throw new Error(`bundled ${PERKINS_POLICY_ID} lead workflow is missing the convergence guidance`);
   }
   return policy;
 }
