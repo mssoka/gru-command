@@ -26,7 +26,7 @@ const GIT_TIMEOUT_MS = 30_000;
  * its neighbour — so a finding about deleted code can still intersect. */
 export interface DeltaHunk {
   readonly path: string;
-  readonly kind: 'added' | 'seam';
+  readonly kind: 'added' | 'seam' | 'metadata';
   /** Inclusive 1-based new-file line range. */
   readonly startLine: number;
   readonly endLine: number;
@@ -82,35 +82,38 @@ export function parseFindingLocation(location: string): ParsedFindingLocation | 
 }
 
 /** Decode one Git C-quoted path (the `"..."` form git uses for names with
- * spaces, quotes or control bytes). Unknown escapes keep their literal
- * character; malformed quoting returns null so the caller fails closed. */
+ * spaces, quotes or control bytes). Escapes are BYTES: octal escapes decode
+ * as their byte value and plain characters as UTF-8 bytes, then the whole
+ * sequence decodes as UTF-8 (so `\303\251` is `é`, not `Ã©`). Unknown
+ * escapes keep their literal byte; malformed quoting returns null so the
+ * caller fails closed. */
 function unquoteGitPath(text: string): string | null {
   if (!text.startsWith('"')) return text;
   if (!text.endsWith('"') || text.length < 2) return null;
-  let decoded = '';
+  const bytes: number[] = [];
   for (let index = 1; index < text.length - 1; index += 1) {
     const character = text[index]!;
     if (character !== '\\') {
-      decoded += character;
+      for (const byte of Buffer.from(character, 'utf8')) bytes.push(byte);
       continue;
     }
     index += 1;
     if (index >= text.length - 1) return null;
     const escaped = text[index]!;
-    const simple: Record<string, string> = { a: '\u0007', b: '\b', f: '\f', n: '\n', r: '\r', t: '\t', v: '\v', '\\': '\\', '"': '"' };
+    const simple: Record<string, number> = { a: 7, b: 8, f: 12, n: 10, r: 13, t: 9, v: 11, '\\': 92, '"': 34 };
     if (simple[escaped] !== undefined) {
-      decoded += simple[escaped]!;
+      bytes.push(simple[escaped]!);
       continue;
     }
     const octal = /^[0-7]{1,3}/u.exec(text.slice(index))?.[0];
     if (octal !== undefined) {
-      decoded += String.fromCharCode(Number.parseInt(octal, 8));
+      bytes.push(Number.parseInt(octal, 8) & 0xff);
       index += octal.length - 1;
       continue;
     }
-    decoded += escaped;
+    for (const byte of Buffer.from(escaped, 'utf8')) bytes.push(byte);
   }
-  return decoded;
+  return Buffer.from(bytes).toString('utf8');
 }
 
 /** Resolve the two paths of a `diff --git` line, quoted or bare. */
@@ -137,9 +140,13 @@ function parseDiffHeaderPaths(rest: string): { readonly oldPath: string; readonl
     if (oldPath === null || newPath === null) return null;
     return { oldPath, newPath };
   }
-  const separator = rest.indexOf(' ');
-  if (separator <= 0) return null;
-  return { oldPath: rest.slice(0, separator), newPath: rest.slice(separator + 1) };
+  // Git leaves spaces UNQUOTED and separates the two path operands with a
+  // single space: `a/<path> b/<path>`. The greedy match takes the LAST
+  // ` b/` that leaves a well-formed `a/...` on the left, so a path that
+  // itself contains ` b/` still parses.
+  const match = /^a\/(.*) b\/(.*)$/u.exec(rest);
+  if (match === null) return null;
+  return { oldPath: `a/${match[1]}`, newPath: `b/${match[2]}` };
 }
 
 /** Strip the `a/` / `b/` prefix a diff path carries (quoted or bare). */
@@ -164,66 +171,88 @@ export function parseDeltaStructure(diff: string): {
 } {
   const hunks: DeltaHunk[] = [];
   const paths = new Set<string>();
+  const unhunked = new Set<string>();
+  const hunked = new Set<string>();
   let path: string | null = null;
   let newLine = 0;
   let addedStart: number | null = null;
+  let inHunk = false;
   const flushAdded = (): void => {
     if (addedStart !== null && path !== null) {
       hunks.push({ path, kind: 'added', startLine: addedStart, endLine: newLine - 1 });
+      hunked.add(path);
     }
     addedStart = null;
   };
+  const notePath = (next: string | null): void => {
+    path = next;
+    if (next !== null) paths.add(next);
+  };
   for (const line of diff.split('\n')) {
+    // Hunk BODY first: inside a hunk, a line like `+++ foo;` is added
+    // content (`++ foo;`), never a file header. Only when the parser is
+    // OUTSIDE a hunk may the header spellings be interpreted.
+    if (inHunk && (line.startsWith(' ') || line.startsWith('+') || line.startsWith('-') || line.startsWith('\\'))) {
+      if (line.startsWith('+')) {
+        if (addedStart === null) addedStart = newLine;
+        newLine += 1;
+        continue;
+      }
+      if (line.startsWith('-')) {
+        flushAdded();
+        // The removed lines occupied the position before `newLine`: anchor
+        // the seam at the surviving neighbour and the insertion point.
+        if (path !== null) {
+          hunks.push({ path, kind: 'seam', startLine: Math.max(1, newLine - 1), endLine: Math.max(1, newLine) });
+          hunked.add(path);
+        }
+        continue;
+      }
+      if (line.startsWith(' ')) {
+        flushAdded();
+        newLine += 1;
+        continue;
+      }
+      continue; // `\ No newline at end of file`
+    }
+    // Outside a hunk: any line that is not a structural marker ends it.
+    flushAdded();
+    inHunk = false;
     if (line.startsWith('diff --git ')) {
-      flushAdded();
       const header = parseDiffHeaderPaths(line.slice('diff --git '.length));
-      path = header === null ? null : stripDiffPrefix(header.newPath, 'b');
-      if (path !== null) paths.add(path);
+      notePath(header === null ? null : stripDiffPrefix(header.newPath, 'b'));
+      if (path !== null) unhunked.add(path);
       continue;
     }
     if (line.startsWith('+++ ')) {
-      flushAdded();
-      // A deletion's `/dev/null` keeps the path from the diff header (the
-      // deleted file's own path); a real path wins over it.
+      // A deletion's `/dev/null` keeps the path from the `---`/diff header
+      // (the deleted file's own path); a real path always wins.
       const next = stripDiffPrefix(line.slice(4).trimEnd(), 'b');
-      if (next !== null) {
-        path = next;
-        paths.add(path);
-      }
+      if (next !== null) notePath(next);
       continue;
     }
-    const header = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/u.exec(line);
-    if (header !== null) {
-      flushAdded();
-      const start = boundedLineNumber(header[1]!);
-      newLine = start ?? 1;
+    if (line.startsWith('--- ')) {
+      const previous = stripDiffPrefix(line.slice(4).trimEnd(), 'a');
+      if (previous !== null) notePath(previous);
       continue;
     }
-    if (path === null) continue;
-    if (line.startsWith('+') && !line.startsWith('+++')) {
-      if (addedStart === null) addedStart = newLine;
-      newLine += 1;
+    const hunkHeader = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/u.exec(line);
+    if (hunkHeader !== null) {
+      inHunk = true;
+      newLine = boundedLineNumber(hunkHeader[1]!) ?? 1;
       continue;
     }
-    if (line.startsWith('-') && !line.startsWith('---')) {
-      flushAdded();
-      // The removed lines occupied the position before `newLine`: anchor
-      // the seam at the surviving neighbour and the insertion point.
-      const seamLow = Math.max(1, newLine - 1);
-      const seamHigh = Math.max(1, newLine);
-      if (path !== null) hunks.push({ path, kind: 'seam', startLine: seamLow, endLine: seamHigh });
-      continue;
-    }
-    if (line.startsWith(' ')) {
-      flushAdded();
-      newLine += 1;
-      continue;
-    }
-    if (line.startsWith('\\')) continue; // `\ No newline at end of file`
-    // Any other line (empty separator, file metadata) ends the hunk body.
-    flushAdded();
+    // Any other metadata (index/old mode/new mode/similarity) is ignored.
   }
   flushAdded();
+  // A touched path with NO line hunk at all (mode-only or other metadata
+  // change) still changed: findings on it can never be proven outside the
+  // delta, so the whole file intersects.
+  for (const untouched of unhunked) {
+    if (!hunked.has(untouched)) {
+      hunks.push({ path: untouched, kind: 'metadata', startLine: 0, endLine: Number.MAX_SAFE_INTEGER });
+    }
+  }
   return { hunks, paths };
 }
 
@@ -343,12 +372,11 @@ export function applyConvergenceDeferral(input: {
       findings.push(finding);
       continue;
     }
-    const reason = `outside this round's delta hunks (round ${input.roundNumber} convergence rule): filed as a follow-up, cannot hold the PR`;
-    findings.push({
-      ...finding,
-      deferredFollowup: true,
-      verification: { ...finding.verification, reason: `${finding.verification.reason}; ${reason}` },
-    });
+    const reason = `outside this round's delta hunks (round ${input.roundNumber} convergence rule): filed as a follow-up, cannot hold the PR THIS ROUND`;
+    // The flag and the convergence record carry the deferral; the lead's
+    // original verification reason stays untouched (a later whole pass that
+    // re-activates the finding must not carry a stale "cannot hold" note).
+    findings.push({ ...finding, deferredFollowup: true });
     deferred.push({ finding, reason });
   }
   return { findings, deferred };

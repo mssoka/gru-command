@@ -2105,6 +2105,7 @@ export class WaveRunner {
         ...(input.lenses !== undefined ? { lenses: input.lenses } : {}),
         ...(input.noSpec !== undefined ? { noSpec: input.noSpec } : {}),
         ...(input.evidence !== undefined ? { evidence: input.evidence } : {}),
+        ...(input.claimedFixedPriors !== undefined ? { claimedFixedPriors: input.claimedFixedPriors } : {}),
       };
       const event = this.opts.ledger.appendCustomEvent({ kind: 'job.review-handoff-queued', jobId: input.jobId, payload: { input: safeInput } });
       const pending = this.trackHandoff(safeInput, event.seq);
@@ -4357,6 +4358,21 @@ export class WaveRunner {
       ].join('\n'));
     }
     if (recordedVerdict !== null) {
+      // Stage-5: the final-pass obligation is durable BEFORE the verdict
+      // commits. A crash between the two must never leave an approved
+      // delta round without its marker (the board's owner-ready gate reads
+      // this event); a failed marker write therefore fails the round
+      // closed instead of approving.
+      if (recordedVerdict === 'approved' && review.convergence?.finalPassRequired === true && !headMoved) {
+        try {
+          this.opts.ledger.appendCustomEvent({
+            kind: 'round.final-pass-required', jobId: job.id, roundId: round.id,
+            payload: { targetSha: review.targetSha, reviewScope: review.convergence.reviewScope },
+          });
+        } catch (markerError) {
+          throw new Error(`could not record the required final whole-change pass before the verdict commit: ${String(markerError)}`);
+        }
+      }
       // gh-169 round-5 P1: the deferred not-used chips and the verdict
       // transition commit in ONE atomic ledger transaction — a failure
       // anywhere leaves NOTHING committed (round live, deferred chips

@@ -789,6 +789,11 @@ export class BoardEngine {
         // survives a crash between the two rounds).
         const newest = job.rounds.at(-1);
         if (newest !== undefined) {
+          // The pre-commit marker is the durable obligation (written before
+          // the verdict commit), so an approved delta round can never be
+          // owner-ready without it; the review-event field is a second,
+          // post-commit disclosure.
+          if (this.ledger.latestRoundEvent(newest.id, 'round.final-pass-required') !== null) return null;
           const review = this.ledger.latestRoundEvent(newest.id, 'round.perkins-review');
           const payload = review === null || typeof review.payload !== 'object' || review.payload === null
             ? null : review.payload as { readonly finalPassRequired?: unknown };

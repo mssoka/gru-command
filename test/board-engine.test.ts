@@ -775,6 +775,16 @@ describe('board engine — FOR YOU owner-PR projection on the snapshot', () => {
       payload: { canonicalVerdict: 'READY TO MERGE', reviewScope: 'delta', finalPassRequired: true },
     });
     expect(engine.snapshot().ownerPrs).toEqual([]);
+    // The pre-commit marker alone (no review-event flag) is enough to gate:
+    // a crash between the verdict commit and the review event cannot expose
+    // owner-ready.
+    api.appendCustomEvent({
+      kind: 'round.final-pass-required',
+      jobId: 'job-final-pass',
+      roundId: rounds.at(-1)!.id,
+      payload: { targetSha: SHA, reviewScope: 'delta' },
+    });
+    expect(engine.snapshot().ownerPrs).toEqual([]);
     // The whole-scope round closes and its review event carries no pending
     // flag: the newest round is whole and owner-ready.
     const finalRound = api.addRound({ jobId: 'job-final-pass', targetRef: SHA });

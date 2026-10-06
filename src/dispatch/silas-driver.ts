@@ -217,8 +217,11 @@ export function consolidatedBlockersFor(ledger: DigestLedger): BlockersForRound 
         return Promise.resolve({ blockers: [], note: `consolidated report ${file} has no findings array` });
       }
       const blockers = (parsed.findings as unknown[])
-        .map((finding) => finding as Partial<RoundBlocker> & { severity?: unknown })
-        .filter((finding) => finding.severity === 'blocker')
+        .map((finding) => finding as Partial<RoundBlocker> & { severity?: unknown; deferredFollowup?: unknown })
+        // A finding deferred by the Stage-5 convergence rule is a recorded
+        // follow-up that cannot hold the PR; it must not feed the blocker
+        // recurrence ladder or a release-blocker fix directive.
+        .filter((finding) => finding.severity === 'blocker' && finding.deferredFollowup !== true)
         .map((finding) => ({
           category: String(finding.category ?? ''),
           title: String(finding.title ?? ''),

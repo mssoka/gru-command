@@ -771,9 +771,23 @@ function loadPriorReview(file: string | undefined): PriorReview {
   if (Array.isArray(parsed.specialistRuns)) {
     for (const entry of parsed.specialistRuns) {
       if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) continue;
-      const run = entry as { lens?: unknown; status?: unknown };
-      if (typeof run.lens === 'string' && (PERKINS_LENSES as readonly string[]).includes(run.lens) && run.status === 'valid') {
+      const run = entry as { lens?: unknown; status?: unknown; findingsDelivered?: unknown };
+      // Only a DELIVERED valid run carries coverage forward: an undelivered
+      // run's findings never reached a lead and cannot be credited as that
+      // lens's last result (R17).
+      if (typeof run.lens === 'string' && (PERKINS_LENSES as readonly string[]).includes(run.lens) &&
+        run.status === 'valid' && run.findingsDelivered !== false) {
         validLenses.push(run.lens as PerkinsLens);
+      }
+    }
+  }
+  // Lenses CARRIED by the prior round keep their standing coverage across
+  // consecutive skipped rounds (their run is not in specialistRuns).
+  const priorCarried = (parsed as { convergence?: { carriedLenses?: unknown } }).convergence?.carriedLenses;
+  if (Array.isArray(priorCarried)) {
+    for (const lens of priorCarried) {
+      if (typeof lens === 'string' && (PERKINS_LENSES as readonly string[]).includes(lens) && !validLenses.includes(lens as PerkinsLens)) {
+        validLenses.push(lens as PerkinsLens);
       }
     }
   }
@@ -2873,7 +2887,7 @@ export class PerkinsWholeReview {
         : 'REVIEW SCOPE: WHOLE CHANGE.';
     const carriedLensSection = deltaRound && plan.carriedLenses.length > 0
       ? [
-        `PRIOR LENS RESULTS CARRIED (${plan.carriedLenses.join(', ')}): these lenses completed a valid prior run and have no prior finding at all, so the host records their last result as coverage for this round. Re-run any of them if this delta could affect their lens.`,
+        `PRIOR LENS RESULTS CARRIED (${plan.carriedLenses.join(', ')}): these lenses completed a valid, DELIVERED prior run and have no prior finding at all, so the host records their last result as coverage for this round. The host does not claim delta irrelevance — re-run any lens whose view this delta could change.`,
         '',
       ].join('\n')
       : '';
@@ -2890,7 +2904,7 @@ export class PerkinsWholeReview {
         plan.delta.diff,
       ].join('\n');
     const convergenceRule = deltaRound && plan.roundNumber >= plan.fromRound
-      ? `CONVERGENCE RULE (round ${plan.roundNumber}): only a new finding whose location intersects this round's delta hunks can hold the PR. The host defers new findings outside the delta as follow-ups — recorded and disclosed, never dropped — and a deferred blocker cannot block. Submit the verdict the CONVERGED blocker set implies.`
+      ? `CONVERGENCE RULE (round ${plan.roundNumber}): from this round, only a blocker whose location intersects this round's delta hunks can hold the PR. The host defers findings outside the delta (new or carried) as follow-ups — recorded and disclosed, never dropped — and a deferred blocker cannot hold THIS round; the final whole-change pass is where an untouched blocker holds again. Submit the verdict the CONVERGED blocker set implies.`
       : '';
     return [
       'Conduct the complete Perkins review of this whole change as the lead. You own investigation, verification, prior-finding revisiting, the final report, and the verdict. The host owns safety and terminal validation.',

@@ -77,6 +77,7 @@ describe('delta hunk parsing and intersection', () => {
       { path: 'src/kept.ts', kind: 'added', startLine: 2, endLine: 2 },
       { path: 'src/deleted.ts', kind: 'seam', startLine: 1, endLine: 1 },
       { path: 'src/deleted.ts', kind: 'seam', startLine: 1, endLine: 1 },
+      { path: 'src/mode-only.ts', kind: 'metadata', startLine: 0, endLine: Number.MAX_SAFE_INTEGER },
     ]);
     // Every named path is touched, including a mode-only change with no hunk.
     expect(paths).toEqual(new Set(['src/kept.ts', 'src/deleted.ts', 'src/mode-only.ts']));
@@ -113,6 +114,50 @@ describe('delta hunk parsing and intersection', () => {
       { path: 'src/weird name.ts', kind: 'added', startLine: 1, endLine: 1 },
     ]);
     expect(findingIntersectsDelta('src/weird name.ts:1', hunks)).toBe(true);
+  });
+
+  it('never mistakes hunk BODY content for file headers', () => {
+    const tricky = [
+      'diff --git a/src/real.ts b/src/real.ts',
+      '--- a/src/real.ts',
+      '+++ b/src/real.ts',
+      '@@ -1,2 +1,3 @@',
+      ' keep',
+      '++ ++foo;',
+      '+-- --bar;',
+      '--- --baz;',
+      '+++ ++qux;',
+    ].join('\n');
+    const { hunks, paths } = parseDeltaStructure(tricky);
+    // Every body line above is CONTENT: added lines start with '+'.
+    expect(paths).toEqual(new Set(['src/real.ts']));
+    expect(hunks).toEqual([
+      { path: 'src/real.ts', kind: 'added', startLine: 2, endLine: 3 },
+      { path: 'src/real.ts', kind: 'seam', startLine: 3, endLine: 4 },
+      { path: 'src/real.ts', kind: 'added', startLine: 4, endLine: 4 },
+    ]);
+  });
+
+  it('decodes octal UTF-8 escapes and bare paths with spaces', () => {
+    const quoted = [
+      'diff --git "a/caf\\303\\251.ts" "b/caf\\303\\251.ts"',
+      '--- "a/caf\\303\\251.ts"',
+      '+++ "b/caf\\303\\251.ts"',
+      '@@ -1 +1 @@',
+      '-old',
+      '+new',
+    ].join('\n');
+    expect(parseDeltaStructure(quoted).paths.has('caf\u00e9.ts')).toBe(true);
+
+    // Mode-only changes print BARE headers even when the path has spaces.
+    const bare = [
+      'diff --git a/src/weird name.ts b/src/weird name.ts',
+      'old mode 100644',
+      'new mode 100755',
+    ].join('\n');
+    const parsedBare = parseDeltaStructure(bare);
+    expect(parsedBare.paths.has('src/weird name.ts')).toBe(true);
+    expect(findingIntersectsDelta('src/weird name.ts:1', parsedBare.hunks)).toBe(true);
   });
 
   it('fails closed toward blocking for unanchored findings and unusable line numbers', () => {
@@ -152,10 +197,13 @@ describe('deltaSince (bounded git delta)', () => {
     const second = repo.head();
     const delta = deltaSince(repo.path, first, second);
     expect(delta.touchedPaths.has('src/script.sh')).toBe(true);
-    expect(delta.hunks).toEqual([]);
-    // Mode-only files carry no changed lines: a finding there is not
-    // line-intersecting, but the path is touched (so priors re-verify).
-    expect(findingIntersectsDelta('src/script.sh:1', delta.hunks)).toBe(false);
+    // No line hunks exist, but the file DID change: the parser emits a
+    // metadata span so a finding on it can never be proven outside the
+    // delta (fail-closed toward blocking) and car-ried priors re-verify.
+    expect(delta.hunks).toEqual([
+      { path: 'src/script.sh', kind: 'metadata', startLine: 0, endLine: Number.MAX_SAFE_INTEGER },
+    ]);
+    expect(findingIntersectsDelta('src/script.sh:1', delta.hunks)).toBe(true);
   });
 
   it('refuses non-SHA endpoints and unreadable revisions', () => {
@@ -602,7 +650,10 @@ describe('Stage-5 convergence over whole rounds', () => {
     expect(consolidated3.canonicalVerdict).toBe('READY TO MERGE');
     const deferred = consolidated3.findings.find((finding) => finding.title === 'untouched new defect');
     expect(deferred!.deferredFollowup).toBe(true);
-    expect(deferred!.verification.reason).toContain('cannot hold the PR');
+    // The lead's original verification reason stays untouched: the deferral
+    // is carried by the flag and the convergence record below (a later pass
+    // that re-activates the finding carries no stale "cannot hold" note).
+    expect(deferred!.verification.reason).toBe('retained by the lead after whole-change verification');
     // The published report headline matches the recorded canonical verdict
     // and discloses the host recomputation; the lead's submitted bytes stay
     // preserved in the submission artifact.
@@ -693,6 +744,17 @@ describe('Stage-5 convergence over whole rounds', () => {
       convergence: { carriedLenses?: string[] };
     };
     expect(consolidated2.convergence.carriedLenses).toEqual(['blind', 'edge']);
+
+    // A second skipped round keeps the credit: the carry is re-derived from
+    // the prior convergence record even though the lens has no fresh run.
+    harness.repo.commitFile('src/third.ts', 'export const third = 3;\n');
+    const frozen3 = freeze(harness, { roundId: 'cl-round-3', spec: 'return 43' });
+    const round3 = await runRound(harness, {
+      roundId: 'cl-round-3', roundNumber: 3, frozen: frozen3,
+      reviewScope: 'delta', priorConsolidatedFile: join(round2.artifactDirectory, 'consolidated.json'),
+    });
+    expect(harness.leadCalls.at(-1)!.prompt ?? '').toContain('PRIOR LENS RESULTS CARRIED (blind, edge)');
+    expect(round3.convergence?.carriedLenses).toEqual(['blind', 'edge']);
   });
 
   it('keeps an intersecting round-3 blocker holding the PR', async () => {

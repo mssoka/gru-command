@@ -549,6 +549,44 @@ describe('dispatch server (E8)', () => {
     }
   });
 
+  it('carries claimed-fixed prior indexes through the review endpoint into the queued handoff', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const h = await boot({
+      minionPromptGate: () => gate,
+      reviewPreflight: async () => ({
+        ok: true, failures: [],
+        reviewModel: { role: 'perkins', modelRef: 'fixture-model-v1', settings: {}, authEnv: {}, routingSha256: 'fixture-safe-route' },
+      }),
+    });
+    const repo = makeFixtureRepo('fixture-http-claims');
+    cleanupRepos.push(repo);
+    try {
+      const dispatch = await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'http-claims', repo_path: repo.path, title: 'reviewable', briefing: 'ship it',
+      }, TOKEN);
+      expect(dispatch.status).toBe(202);
+      const review = await call(h.port, 'POST', '/api/dispatch/review', {
+        job_id: 'http-claims', by: 'minion', claimed_fixed_priors: [2, 5],
+      }, TOKEN);
+      expect(review.status).toBe(202);
+      expect(review.json).toMatchObject({ route: 'queued', job_id: 'http-claims' });
+      // The durable queued input carries the claims: a replay after a crash
+      // re-verifies exactly the priors the minion claimed fixed.
+      const queued = h.ledger.latestJobEvent('http-claims', 'job.review-handoff-queued')?.payload as
+        { input?: { claimedFixedPriors?: unknown } } | undefined;
+      expect(queued?.input?.claimedFixedPriors).toEqual([2, 5]);
+      // A malformed list is refused at the boundary, never silently dropped.
+      const invalid = await call(h.port, 'POST', '/api/dispatch/review', {
+        job_id: 'http-claims', by: 'minion', claimed_fixed_priors: ['nope'],
+      }, TOKEN);
+      expect(invalid.status).not.toBe(202);
+    } finally {
+      release();
+      await h.close();
+    }
+  });
+
   it('records the PR link and kicks a review wave', async () => {
     const h = await boot();
     const repo = makeFixtureRepo('fixture-http-review');
