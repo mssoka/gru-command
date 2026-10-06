@@ -1546,9 +1546,19 @@ describe('administrative closeout of a parked PR-backed job', () => {
       parkedPrJob(api, 'report-only', { deliverable: 'review' });
       expect(refusalOf(() => api.adminCloseParkedJob(closeoutRequest('report-only'))).code).toBe('not-pr-owing');
 
-      // Every refusal is a named no-effect failure: parked, no audit row.
-      for (const id of ['stale-status', 'target-mismatch', 'unconfirmed', 'open-pr', 'merged-pr', 'stale-head', 'no-pr', 'report-only']) {
-        expect(api.getJob(id)?.status, id).toBe('parked');
+      // Every refusal is a named no-effect failure: the job keeps its
+      // pre-attempt status, and no audit row is minted.
+      for (const [id, status] of [
+        ['stale-status', 'working'],
+        ['target-mismatch', 'parked'],
+        ['unconfirmed', 'parked'],
+        ['open-pr', 'parked'],
+        ['merged-pr', 'parked'],
+        ['stale-head', 'parked'],
+        ['no-pr', 'parked'],
+        ['report-only', 'parked'],
+      ] as const) {
+        expect(api.getJob(id)?.status, id).toBe(status);
         expect(api.latestJobEvent(id, 'job.admin-closeout'), id).toBeNull();
       }
     } finally {
