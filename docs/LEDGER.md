@@ -490,3 +490,47 @@ cannot alter a CHECK constraint). The migration declares
 rebuild transaction and verifies `PRAGMA foreign_key_check` BEFORE
 COMMIT — a violation rolls the whole migration back loudly. It carries
 the same landing-collision convention as migrations 10-14.
+
+### Decision memory (migration 20, issue #218)
+
+Decisions Gru and Silas make — holds, dismissals, acted dispositions —
+are STATE, not prose. Before this table, "resolved under the existing
+ownership hold" lived only in memory notes, so every re-detection of the
+same signal re-woke the chief to rediscover the hold. The `decisions`
+table makes the hold queryable:
+
+| Column | Purpose |
+|---|---|
+| `id` | uuid |
+| `subject` | `'job:<id>'` \| `'pr:<repo>#<n>'` \| `'incident:<kind>:<key>'` — a kind-prefixed stable key |
+| `decision` | `hold` \| `dismissed` \| `acted` \| `superseded` \| `covered` |
+| `covers` | JSON array of signal kinds, e.g. `["pr-conflict","ci-failed"]` (canonical: deduped, sorted) |
+| `basis_fingerprint` | state hash at decision time (head SHA / incident hash); `NULL` = any basis |
+| `reason` | non-empty, bounded (2000) |
+| `by` | `gru` \| `silas` \| `owner` \| `code` — a CLAIM, never identity proof (#99: the bearer token is shared) |
+| `client_key` | UNIQUE idempotency key — a retry with the same key and content returns the original row; changed content fails loud (`DecisionConflictError`) |
+| `created_at`, `recheck_at` | `recheck_at NULL` = no scheduled re-look (a basis change still re-opens) |
+| `cleared_at`, `cleared_by`, `cleared_reason` | stamped by `clearDecision`; rows are never rewritten or deleted |
+
+**The trigger query** is `LedgerApi.coveringDecision({ subject, signal,
+basis, now })`: it returns a decision only when the row is not cleared,
+its `covers` include the signal, its `basis_fingerprint` is null or
+equals the current basis, and its `recheck_at` is null or in the future.
+A changed basis OR a passed recheck re-opens the subject — suppression
+never outlives its evidence. Trigger paths ask this query before waking
+anyone; a covered signal is quiet BY RECORD, not by forgetting.
+
+**Writes** go through `LedgerApi` (`recordDecision`, `clearDecision`,
+each appending a `decision.recorded` / `decision.cleared` event in the
+same transaction as the row) or the board server's bearer-authed routes
+(`POST /api/decisions`, `POST /api/decisions/{id}/clear`,
+`GET /api/decisions?subject=&active=1`). Both Gru (`roles/gru.md`) and
+Silas (`resources/silas-skills/ops-dispatch`) record holds through this
+API instead of prose: hold a lane → record the decision with covers +
+basis + recheck, then resolve the alert.
+
+**Board visibility:** the snapshot carries `activeDecisions` (subject,
+decision, by, recheck) so the state behind a quiet signal is on the
+board, not buried in prose. No owner-facing notification is ever hidden
+by a decision — decisions suppress re-detection noise, never the
+needs-owner bell.

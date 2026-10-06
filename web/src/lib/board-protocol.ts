@@ -245,6 +245,18 @@ export interface SelfHealView {
   readonly since: string | null;
 }
 
+/** Decision memory (issue #218): one active hold/disposition — the state
+ * behind a suppressed signal, visible instead of prose-only. A UI panel
+ * can follow later; the payload carries the truth today. */
+export interface ActiveDecisionView {
+  readonly id: string;
+  readonly subject: string;
+  readonly decision: string;
+  readonly by: string;
+  readonly recheckAt: string | null;
+  readonly createdAt: string;
+}
+
 /** FOR YOU (owner approval 2026-09-28): one PR genuinely ready for the
  * owner — the SERVER-computed, evidence-bound projection (approved
  * head-bound review round + clean mergeable state + green CI at the
@@ -306,6 +318,9 @@ export interface BoardSnapshot {
   /** Durable pipeline queue; absent on pre-upgrade servers (tolerated). */
   readonly pipeline?: PipelineView | null;
   readonly selfHeal?: SelfHealView | null;
+  /** Decision memory (issue #218): active holds/dispositions; absent on
+  * pre-upgrade servers (validator tolerates). */
+  readonly activeDecisions?: readonly ActiveDecisionView[] | null;
   /** FOR YOU PR rows (owner approval 2026-09-28); absent on pre-upgrade
   * servers (validator tolerates; the band renders ack rows only). */
   readonly ownerPrs?: readonly OwnerPrView[] | null;
@@ -619,6 +634,18 @@ function isSelfHealView(value: unknown): value is SelfHealView {
   );
 }
 
+function isActiveDecisionView(value: unknown): value is ActiveDecisionView {
+  return (
+    isRecord(value) &&
+    typeof value.id === 'string' && value.id !== '' &&
+    typeof value.subject === 'string' && value.subject !== '' &&
+    typeof value.decision === 'string' && value.decision !== '' &&
+    typeof value.by === 'string' && value.by !== '' &&
+    (value.recheckAt === null || typeof value.recheckAt === 'string') &&
+    typeof value.createdAt === 'string' && value.createdAt !== ''
+  );
+}
+
 function isPipelineEntryView(value: unknown): value is PipelineEntryView {
   return (
     isRecord(value) &&
@@ -700,6 +727,10 @@ export function isValidSnapshot(value: unknown): value is BoardSnapshot {
   if (value.pacing !== undefined && value.pacing !== null && !isPacingGateView(value.pacing)) return false;
   if (value.pipeline !== undefined && value.pipeline !== null && !isPipelineView(value.pipeline)) return false;
   if (value.selfHeal !== undefined && value.selfHeal !== null && !isSelfHealView(value.selfHeal)) return false;
+  // Decision memory (issue #218): optional (pre-upgrade servers) but
+  // strictly typed when present.
+  if (value.activeDecisions !== undefined && value.activeDecisions !== null && !Array.isArray(value.activeDecisions)) return false;
+  if (Array.isArray(value.activeDecisions) && !value.activeDecisions.every(isActiveDecisionView)) return false;
   // FOR YOU PR rows: absent on pre-upgrade servers (tolerated), but a
   // present block must match its shape — readiness is server authority.
   if (value.ownerPrs !== undefined && value.ownerPrs !== null && !Array.isArray(value.ownerPrs)) return false;

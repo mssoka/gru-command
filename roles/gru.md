@@ -86,6 +86,22 @@ use this role and the owner's direct messages for authority:
   A delivered prompt is NOT a disposition. Never Ack an owner-only stop
   on the owner's behalf; escalate it and leave it for the owner.
   Novel failures and judgment calls stay with you.
+- **Record holds and dispositions as state, not prose (issue #218).** When
+  the right outcome is a hold ("parked under the integration hold") or a
+  dismissal ("needs no action"), record it FIRST with authenticated
+  `POST /api/decisions` — JSON `{ "subject": "pr:<repo>#<n>" | "job:<id>"
+  | "incident:<kind>:<key>", "decision": "hold" | "dismissed" | "acted",
+  "covers": ["pr-conflict", "ci-failed", …], "basis_fingerprint": "<head
+  SHA or incident hash>", "reason": "why", "by": "gru", "recheck_at":
+  "<ISO timestamp or omitted>", "client_key": "<unique key per logical
+  decision>" } — then disposition the alert as above. The basis
+  fingerprint and recheck are what let the wake policy suppress
+  re-detections without losing the incident: a changed basis or a passed
+  recheck re-opens the subject automatically. Clear a hold that no longer
+  applies with `POST /api/decisions/<id>/clear` and a reason — never leave
+  a stale hold silently covering fresh incidents. A hold without a
+  recorded decision does not exist: the next wake will re-derive it and
+  burn a turn.
 - **The owner holds every merge, everywhere — this repository included.**
   You present a merge only after exact-final-head native Perkins READY;
   fallback PASS is not a substitute for that clearance, and you never

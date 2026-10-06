@@ -5,7 +5,8 @@ import { hashToken, tokenConfigured, tokenMatches } from '../auth.js';
 import { ROLES, type GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { EventBus } from '../events/bus.js';
-import { LedgerApi, RecordNotFound, type NotificationRecord } from '../ledger/api.js';
+import { LedgerApi, RecordNotFound, type DecisionActor, type DecisionKind, type NotificationRecord } from '../ledger/api.js';
+import { isDecisionActor, isDecisionKind } from '../ledger/decision-memory.js';
 import { isJobStatus, isRoundStatus, isRoundVerdict } from '../ledger/states.js';
 import { isAgentState } from '../runtime/types.js';
 import type { NotificationCenter } from '../notifications/center.js';
@@ -249,6 +250,25 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
           json(res, 200, options.decisionsStatus());
           return;
         }
+        if (req.method === 'GET' && path === '/api/decisions') {
+          if (!authed(req, res)) return;
+          // Decision memory listing (issue #218): `subject=` narrows to one
+          // key, `active=1` keeps the not-cleared covering candidates.
+          const url = new URL(req.url ?? '/', 'http://localhost');
+          const subject = url.searchParams.get('subject');
+          const activeOnly = url.searchParams.get('active') === '1';
+          json(
+            res,
+            200,
+            {
+              decisions: ledger.listDecisions({
+                ...(subject !== null && subject !== '' ? { subject } : {}),
+                activeOnly,
+              }),
+            },
+          );
+          return;
+        }
         if (req.method === 'GET' && path === '/api/transcripts') {
           if (!authed(req, res)) return;
           json(res, 200, { transcripts: transcripts.list() });
@@ -298,6 +318,58 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
             return;
           }
           json(res, 200, await options.onDecisionsRecheck());
+          return;
+        }
+        // Decision memory writes (issue #218): record a hold/disposition,
+        // or clear one. Same bearer gate as every other write; `by` is
+        // stored as supplied — a CLAIM, never identity proof (#99).
+        if (req.method === 'POST' && path === '/api/decisions') {
+          if (!authed(req, res)) return;
+          const body = (await readBody(req)) as Record<string, unknown>;
+          const decision = strField(body, 'decision');
+          const by = strField(body, 'by');
+          if (!isDecisionKind(decision)) {
+            json(res, 400, { error: 'bad_request', detail: `unknown decision "${decision}"` });
+            return;
+          }
+          if (!isDecisionActor(by)) {
+            json(res, 400, { error: 'bad_request', detail: `unknown actor "${by}"` });
+            return;
+          }
+          const covers = body['covers'];
+          if (!Array.isArray(covers)) {
+            json(res, 400, { error: 'bad_request', detail: 'field "covers" must be an array of signal kinds' });
+            return;
+          }
+          const record = ledger.recordDecision({
+            subject: strField(body, 'subject'),
+            decision: decision as DecisionKind,
+            covers: covers as readonly string[],
+            ...(optStrField(body, 'basis_fingerprint') !== undefined
+              ? { basisFingerprint: optStrField(body, 'basis_fingerprint') }
+              : {}),
+            reason: strField(body, 'reason'),
+            by: by as DecisionActor,
+            ...(optStrField(body, 'client_key') !== undefined
+              ? { clientKey: optStrField(body, 'client_key') }
+              : {}),
+            ...(optStrField(body, 'recheck_at') !== undefined
+              ? { recheckAt: optStrField(body, 'recheck_at') }
+              : {}),
+          });
+          json(res, 201, record);
+          return;
+        }
+        if (req.method === 'POST' && path.startsWith('/api/decisions/') && path.endsWith('/clear')) {
+          if (!authed(req, res)) return;
+          const id = decodeURIComponent(path.slice('/api/decisions/'.length, -'/clear'.length));
+          const body = (await readBody(req)) as Record<string, unknown>;
+          const by = strField(body, 'by');
+          if (!isDecisionActor(by)) {
+            json(res, 400, { error: 'bad_request', detail: `unknown actor "${by}"` });
+            return;
+          }
+          json(res, 200, ledger.clearDecision({ id, by: by as DecisionActor, reason: strField(body, 'reason') }));
           return;
         }
         if (req.method === 'POST' && (path === '/api/jobs' || path === '/api/rounds' || path === '/api/agents' || path === '/api/agents/state' || path === '/api/lenses/bind' || path === '/api/lenses/outcome')) {

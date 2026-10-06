@@ -17,6 +17,9 @@ import {
   type AgentRecord,
   type ChildWorkerCounts,
   type ChildWorkerRecord,
+  type DecisionActor,
+  type DecisionKind,
+  type DecisionRecord,
   type JobRecord,
   type RoundRecord,
 } from '../ledger/api.js';
@@ -236,6 +239,19 @@ export interface SelfHealView {
   readonly since: string | null;
 }
 
+/** Decision memory on the board (issue #218): active (not cleared)
+ * decisions — the holds and dispositions that currently suppress or
+ * explain a signal. Newest first, bounded. A UI panel can follow later;
+ * the payload carries the truth today. */
+export interface ActiveDecisionView {
+  readonly id: string;
+  readonly subject: string;
+  readonly decision: DecisionKind;
+  readonly by: DecisionActor;
+  readonly recheckAt: string | null;
+  readonly createdAt: string;
+}
+
 export interface BoardSnapshot {
   readonly repos: readonly { readonly name: string; readonly jobs: readonly JobView[] }[];
   readonly agents: readonly AgentView[];
@@ -273,6 +289,10 @@ export interface BoardSnapshot {
   readonly children: ChildWorkerCounts;
   /** Self-healing session stats (null until its producer exists). */
   readonly selfHeal: SelfHealView | null;
+  /** Decision memory (issue #218): active holds and dispositions with
+   * subject, decision, by and recheck — the state behind suppressed
+   * signals, visible instead of prose-only. */
+  readonly activeDecisions: readonly ActiveDecisionView[];
   /** FOR YOU (owner approval 2026-09-28): PRs with exact-head evidence
    * that they are genuinely ready for the owner — approved head-bound
    * review round + clean mergeable state + green CI at the same sha.
@@ -768,8 +788,23 @@ export class BoardEngine {
       pacing: this.pacing(),
       pipeline: this.pipeline(),
       selfHeal: this.selfHeal(),
+      activeDecisions: this.activeDecisions(),
       ownerPrs: this.ownerPrs(repos),
     };
+  }
+
+  /** Decision memory projection (issue #218): bounded active decisions,
+   * newest first (the ledger listing's own deterministic order). */
+  private activeDecisions(): readonly ActiveDecisionView[] {
+    const rows: readonly DecisionRecord[] = this.ledger.listDecisions({ activeOnly: true, limit: 50 });
+    return rows.map((row) => ({
+      id: row.id,
+      subject: row.subject,
+      decision: row.decision,
+      by: row.by,
+      recheckAt: row.recheckAt,
+      createdAt: row.createdAt,
+    }));
   }
 
   /** The FOR YOU PR projection: one authoritative, evidence-bound ready

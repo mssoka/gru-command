@@ -582,3 +582,79 @@ describe('board server — empty token config locks every door', () => {
     }
   });
 });
+
+describe('board server — decision memory (issue #218)', () => {
+  it('decision routes are bearer-authed, create idempotently, list, and clear', async () => {
+    const harness = await boot('board-test-token');
+    try {
+      const decisionBody = {
+        subject: 'pr:mssoka/gru-command#148',
+        decision: 'hold',
+        covers: ['pr-conflict'],
+        basis_fingerprint: 'aaaa',
+        reason: 'existing ownership/integration hold',
+        by: 'gru',
+        client_key: 'http-idem-1',
+      };
+      // Locked door without the bearer.
+      expect((await postJson(harness.port, '/api/decisions', null, decisionBody)).status).toBe(401);
+      expect((await postJson(harness.port, '/api/decisions/whatever/clear', null, { by: 'gru', reason: 'r' })).status).toBe(401);
+      expect((await getJson(harness.port, '/api/decisions', null)).status).toBe(401);
+
+      const first = await postJson(harness.port, '/api/decisions', 'board-test-token', decisionBody);
+      expect(first.status).toBe(201);
+      const created = first.body as { id: string; subject: string; covers: string[]; recheckAt: string | null };
+      expect(created.subject).toBe('pr:mssoka/gru-command#148');
+      expect(created.covers).toEqual(['pr-conflict']);
+
+      // Retry with the same client_key returns the SAME decision — never a second row.
+      const retry = await postJson(harness.port, '/api/decisions', 'board-test-token', decisionBody);
+      expect((retry.body as { id: string }).id).toBe(created.id);
+      expect(((await getJson(harness.port, '/api/decisions', 'board-test-token')).body as { decisions: unknown[] }).decisions).toHaveLength(1);
+
+      // Validation failures are loud 400s.
+      expect(
+        (await postJson(harness.port, '/api/decisions', 'board-test-token', { ...decisionBody, decision: 'maybe', client_key: 'bad-1' })).status,
+      ).toBe(400);
+      expect(
+        (await postJson(harness.port, '/api/decisions', 'board-test-token', { ...decisionBody, by: 'minion', client_key: 'bad-2' })).status,
+      ).toBe(400);
+      expect(
+        (await postJson(harness.port, '/api/decisions', 'board-test-token', { ...decisionBody, covers: 'pr-conflict', client_key: 'bad-3' })).status,
+      ).toBe(400);
+      expect(
+        (await postJson(harness.port, '/api/decisions', 'board-test-token', { ...decisionBody, subject: 'no-colon', client_key: 'bad-4' })).status,
+      ).toBe(400);
+
+      // The board snapshot carries active decisions (subject, decision, by, recheck).
+      const snapshot = (await getJson(harness.port, '/api/board', 'board-test-token')).body as {
+        activeDecisions: { id: string; subject: string; decision: string; by: string; recheckAt: string | null }[];
+      };
+      expect(snapshot.activeDecisions).toHaveLength(1);
+      expect(snapshot.activeDecisions[0]).toMatchObject({
+        id: created.id, subject: created.subject, decision: 'hold', by: 'gru', recheckAt: null,
+      });
+
+      // subject filter + active filter on the listing.
+      const subjectQuery = encodeURIComponent('pr:mssoka/gru-command#148');
+      const listed = (await getJson(harness.port, `/api/decisions?subject=${subjectQuery}&active=1`, 'board-test-token')).body as {
+        decisions: { id: string }[];
+      };
+      expect(listed.decisions.map((d) => d.id)).toEqual([created.id]);
+
+      // Clear: unknown id is a typed 404; the real clear re-opens the subject.
+      expect(
+        (await postJson(harness.port, '/api/decisions/does-not-exist/clear', 'board-test-token', { by: 'gru', reason: 'r' })).status,
+      ).toBe(404);
+      const cleared = await postJson(harness.port, `/api/decisions/${created.id}/clear`, 'board-test-token', { by: 'owner', reason: 'hold lifted' });
+      expect(cleared.status).toBe(200);
+      expect((cleared.body as { clearedAt: string | null }).clearedAt).not.toBeNull();
+      expect(((await getJson(harness.port, '/api/decisions?active=1', 'board-test-token')).body as { decisions: unknown[] }).decisions).toHaveLength(0);
+      expect(((await getJson(harness.port, '/api/decisions', 'board-test-token')).body as { decisions: unknown[] }).decisions).toHaveLength(1);
+      const afterClear = (await getJson(harness.port, '/api/board', 'board-test-token')).body as { activeDecisions: unknown[] };
+      expect(afterClear.activeDecisions).toHaveLength(0);
+    } finally {
+      await harness.close();
+    }
+  });
+});

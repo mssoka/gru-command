@@ -96,10 +96,28 @@ import {
   type PipelinePrerequisite,
   type PipelineState,
 } from './pipeline.js';
+import {
+  canonicalizeDecisionInput,
+  decisionFromRowValues,
+  DECISION_ACTORS,
+  isDecisionActor,
+  validateDecisionReason,
+  validateDecisionSignal,
+  type CanonicalDecisionInput,
+  type DecisionActor,
+  type DecisionKind,
+  type DecisionRecord,
+} from './decision-memory.js';
 
 const VERIFICATION_KIND = 'verification.completed';
 export type { JobStatus, RoundStatus, RoundVerdict, LensState } from './states.js';
 export type { DirectiveRequestRecord, DirectiveState } from './directives.js';
+export type {
+  DecisionActor,
+  DecisionKind,
+  DecisionRecord,
+} from './decision-memory.js';
+export { DECISION_ACTORS, DECISION_KINDS } from './decision-memory.js';
 export type {
   CompletionHandoffIntent,
   PhaseHandoffRecord,
@@ -466,6 +484,16 @@ export class ChildWorkerConflictError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'ChildWorkerConflictError';
+  }
+}
+
+/** A decision client_key was replayed with DIFFERENT canonical content.
+ * The recorded decision is immutable history; a changed decision needs a
+ * new key — never a silent replacement of a hold or disposition. */
+export class DecisionConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'DecisionConflictError';
   }
 }
 
@@ -6206,6 +6234,194 @@ export class LedgerApi {
       phaseId: nstr(row.phase_id),
       requestedAt: str(row.requested_at),
     };
+  }
+
+  // ------------------------------------------------------------------
+  // Decision memory (issue #218) — typed holds and dispositions.
+  // ------------------------------------------------------------------
+
+  /** Record a decision (hold/disposition) on a subject. Idempotent on
+   * `clientKey`: a retry with the same key and the same canonical content
+   * returns the ORIGINAL row (no second row, no second event); the same
+   * key with changed content throws DecisionConflictError — a recorded
+   * decision is history, not a mutable slot. Appends `decision.recorded`. */
+  recordDecision(
+    input: {
+      subject: string;
+      decision: DecisionKind;
+      covers: readonly string[];
+      basisFingerprint?: string | null;
+      reason: string;
+      by: DecisionActor;
+      clientKey?: string;
+      recheckAt?: string | null;
+    },
+  ): DecisionRecord {
+    const canonical: CanonicalDecisionInput = canonicalizeDecisionInput(input);
+    return this.transaction(() => {
+      if (input.clientKey !== undefined) {
+        const existing = this.decisionByClientKey(input.clientKey);
+        if (existing !== null) {
+          this.assertDecisionReplayMatches(existing, canonical, input.clientKey);
+          return existing;
+        }
+      }
+      const id = randomUUID();
+      const ts = nowIso();
+      this.db
+        .prepare(
+          `INSERT INTO decisions
+             (id, subject, decision, covers, basis_fingerprint, reason, by, client_key, created_at, recheck_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          id,
+          canonical.subject,
+          canonical.decision,
+          JSON.stringify(canonical.covers),
+          canonical.basisFingerprint,
+          canonical.reason,
+          canonical.by,
+          input.clientKey ?? null,
+          ts,
+          canonical.recheckAt,
+        );
+      this.appendEvent({
+        kind: 'decision.recorded',
+        payload: {
+          id,
+          subject: canonical.subject,
+          decision: canonical.decision,
+          covers: canonical.covers,
+          basis_fingerprint: canonical.basisFingerprint,
+          by: canonical.by,
+          recheck_at: canonical.recheckAt,
+        },
+      });
+      return this.getDecision(id) as DecisionRecord;
+    });
+  }
+
+  /** Clear a decision (the subject re-opens). Unknown ids throw a typed
+   * RecordNotFound; an already-cleared decision is an idempotent no-op
+   * (the FIRST clearing is history — a repeat never re-stamps it).
+   * Appends `decision.cleared`. */
+  clearDecision(input: { id: string; by: DecisionActor; reason: string }): DecisionRecord {
+    if (!isDecisionActor(input.by)) {
+      throw new Error(`unknown decision actor "${String(input.by)}" — expected one of ${DECISION_ACTORS.join(', ')}`);
+    }
+    validateDecisionReason(input.reason);
+    return this.transaction(() => {
+      const current = this.getDecision(input.id);
+      if (current === null) throw new RecordNotFound(`decision "${input.id}" not found`);
+      if (current.clearedAt !== null) return current;
+      const ts = nowIso();
+      this.db
+        .prepare('UPDATE decisions SET cleared_at = ?, cleared_by = ?, cleared_reason = ? WHERE id = ?')
+        .run(ts, input.by, input.reason, input.id);
+      this.appendEvent({
+        kind: 'decision.cleared',
+        payload: { id: input.id, subject: current.subject, by: input.by, reason: input.reason },
+      });
+      return this.getDecision(input.id) as DecisionRecord;
+    });
+  }
+
+  /** List decisions, newest first. `activeOnly` keeps the covering
+   * candidates (not cleared); `subject` narrows to one key. Bounded.
+   * Same-millisecond creates tie-break by INSERTION order (rowid DESC) —
+   * a random id would make "newest" nondeterministic. */
+  listDecisions(opts: { subject?: string; activeOnly?: boolean; limit?: number } = {}): readonly DecisionRecord[] {
+    const limit = Math.min(Math.max(1, opts.limit ?? 50), 1000);
+    const where: string[] = [];
+    const params: unknown[] = [];
+    if (opts.subject !== undefined) {
+      where.push('subject = ?');
+      params.push(opts.subject);
+    }
+    if (opts.activeOnly === true) where.push('cleared_at IS NULL');
+    const sql = `SELECT * FROM decisions${where.length > 0 ? ` WHERE ${where.join(' AND ')}` : ''} ORDER BY created_at DESC, rowid DESC LIMIT ?`;
+    return (this.db.prepare(sql).all(...(params as never[]), limit) as Row[]).map((row) =>
+      this.decisionFromRow(row),
+    );
+  }
+
+  getDecision(id: string): DecisionRecord | null {
+    const row = this.db.prepare('SELECT * FROM decisions WHERE id = ?').get(id) as Row | undefined;
+    return row === undefined ? null : this.decisionFromRow(row);
+  }
+
+  /** THE trigger query (issue #218): is signal `signal` on `subject`
+   * covered by an active decision whose basis still matches at `now`?
+   * Returns a decision only when ALL of these hold:
+   * - it is not cleared;
+   * - its `covers` includes `signal`;
+   * - its `basis_fingerprint` is null or equals `basis` (a changed basis
+   *   re-opens the subject);
+   * - its `recheck_at` is null or later than `now` (a passed recheck
+   *   re-opens the subject).
+   * Newest matching decision wins (deterministic: created_at DESC, then
+   * insertion order). */
+  coveringDecision(opts: { subject: string; signal: string; basis: string; now?: string }): DecisionRecord | null {
+    if (opts.signal.length === 0) throw new Error('coveringDecision "signal" must be non-empty');
+    if (opts.basis.length === 0) throw new Error('coveringDecision "basis" must be non-empty');
+    const nowMs = Date.parse(opts.now ?? nowIso());
+    if (!Number.isFinite(nowMs)) throw new Error(`coveringDecision "now" must be a parseable timestamp, got "${String(opts.now)}"`);
+    validateDecisionSignal(opts.signal);
+    for (const row of this.listDecisions({ subject: opts.subject, activeOnly: true, limit: 1000 })) {
+      if (!row.covers.includes(opts.signal)) continue;
+      if (row.basisFingerprint !== null && row.basisFingerprint !== opts.basis) continue;
+      if (row.recheckAt !== null) {
+        const recheckMs = Date.parse(row.recheckAt);
+        if (!Number.isFinite(recheckMs)) {
+          throw new Error(`decision "${row.id}" carries an unparseable recheck_at "${row.recheckAt}"`);
+        }
+        if (recheckMs <= nowMs) continue;
+      }
+      return row;
+    }
+    return null;
+  }
+
+  private decisionByClientKey(clientKey: string): DecisionRecord | null {
+    const row = this.db.prepare('SELECT * FROM decisions WHERE client_key = ?').get(clientKey) as Row | undefined;
+    return row === undefined ? null : this.decisionFromRow(row);
+  }
+
+  /** A client_key replay must carry the SAME canonical decision — else it
+   * is a conflict, never a silent replacement of the recorded hold. */
+  private assertDecisionReplayMatches(existing: DecisionRecord, canonical: CanonicalDecisionInput, clientKey: string): void {
+    const same =
+      existing.subject === canonical.subject &&
+      existing.decision === canonical.decision &&
+      existing.covers.join('\u0000') === canonical.covers.join('\u0000') &&
+      existing.basisFingerprint === canonical.basisFingerprint &&
+      existing.reason === canonical.reason &&
+      existing.by === canonical.by &&
+      existing.recheckAt === canonical.recheckAt;
+    if (!same) {
+      throw new DecisionConflictError(
+        `decision client_key "${clientKey}" was already recorded as a different decision (id "${existing.id}") — a recorded decision is history; use a new key`,
+      );
+    }
+  }
+
+  private decisionFromRow(row: Row): DecisionRecord {
+    return decisionFromRowValues({
+      id: str(row.id),
+      subject: str(row.subject),
+      decision: str(row.decision),
+      covers: str(row.covers),
+      basis_fingerprint: nstr(row.basis_fingerprint),
+      reason: str(row.reason),
+      by: str(row.by),
+      client_key: nstr(row.client_key),
+      created_at: str(row.created_at),
+      recheck_at: nstr(row.recheck_at),
+      cleared_at: nstr(row.cleared_at),
+      cleared_by: nstr(row.cleared_by),
+      cleared_reason: nstr(row.cleared_reason),
+    });
   }
 
   private notificationFromRow(row: Row): NotificationRecord {

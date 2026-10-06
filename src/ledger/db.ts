@@ -842,4 +842,36 @@ export const MIGRATIONS: readonly Migration[] = [
     name: 'job-deliverable',
     sql: `ALTER TABLE jobs ADD COLUMN deliverable TEXT;`,
   },
+  {
+    // Decision memory (issue #218): typed holds and dispositions as state
+    // the triggers can read, replacing prose-only memory ("resolved under
+    // the existing hold"). Each row names its subject, the signal kinds it
+    // covers, the basis fingerprint at decision time and the scheduled
+    // re-look; `client_key` makes creates idempotent on retry and `by` is
+    // a stored claim (issue #99), never identity proof. Rows are never
+    // rewritten: clearing stamps cleared_* and the covering query stops
+    // returning the row while history keeps it. Never query this table
+    // directly from callers — go through LedgerApi's decision methods so
+    // validation and event appends stay on one path.
+    id: 20,
+    name: 'decisions',
+    sql: `
+      CREATE TABLE decisions (
+        id                TEXT PRIMARY KEY,
+        subject           TEXT NOT NULL,   -- 'job:<id>' | 'pr:<repo>#<n>' | 'incident:<kind>:<key>'
+        decision          TEXT NOT NULL CHECK (decision IN ('hold','dismissed','acted','superseded','covered')),
+        covers            TEXT NOT NULL,   -- JSON array of signal kinds, e.g. ["pr-conflict","ci-failed"]
+        basis_fingerprint TEXT,            -- head SHA / incident hash at decision time; NULL = any basis
+        reason            TEXT NOT NULL,
+        by                TEXT NOT NULL CHECK (by IN ('gru','silas','owner','code')),
+        client_key        TEXT UNIQUE,     -- idempotency on retry
+        created_at        TEXT NOT NULL,
+        recheck_at        TEXT,            -- NULL = no scheduled re-look (still re-opens on basis change)
+        cleared_at        TEXT,
+        cleared_by        TEXT,
+        cleared_reason    TEXT
+      );
+      CREATE INDEX idx_decisions_subject_active ON decisions(subject, cleared_at);
+    `,
+  },
 ];
