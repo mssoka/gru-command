@@ -8,6 +8,7 @@ import type {
   DirectiveRequestRecord,
   EventRecord,
   JobRecord,
+  JobStatus,
   LedgerApi,
   PendingRebriefRecord,
   RoundRecord,
@@ -707,6 +708,14 @@ function verificationInFlight(ledger: DigestLedger, jobId: string): boolean {
   return ledger.hasUnsettledVerificationRun(jobId);
 }
 
+/** The one review-eligible status predicate, shared by candidate intake and
+ * the publish-boundary recheck: only a live lane (`working`, `delivered`,
+ * `in-review`) owes a review offer. A lane that slid to `blocked`/`parked`
+ * — or terminal — is not offered, at intake or at publish (gh-187). */
+function reviewEligibleStatus(status: JobStatus): boolean {
+  return status === 'working' || status === 'delivered' || status === 'in-review';
+}
+
 /** The newest effective activity stamp for one worker: the ledger stamp or
  * the supervisor's own event clock, whichever is newer, falling back to the
  * registration time when neither is known (NaN only when all are absent). */
@@ -918,7 +927,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     const rebriefPending = pendingRebriefJobIds.has(job.id);
     const liveDirectiveOwns = input.ledger
       .listPendingDirectives({ jobId: job.id, states: LIVE_DIRECTIVE_STATES }).length > 0;
-    const reviewPending = job.status === 'working' || job.status === 'delivered' || job.status === 'in-review';
+    const reviewPending = reviewEligibleStatus(job.status);
 
     // (1) Delivered, no PR yet. Only PR-owing lanes (deliverable
     // null/'pr', E19) belong here: a delivered review/artifact/
@@ -1345,8 +1354,10 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     ];
   }
   // A prior job's blocker history may have awaited after another candidate
-  // was already offered. Recheck every proposed review at the final publish
-  // boundary — not only the jobs visited after an await. No await follows.
+  // was already offered — or after the listJobs snapshot a not-yet-visited
+  // candidate was read from went stale. Recheck every proposed review at
+  // the final publish boundary — not only the jobs visited after an await.
+  // No await follows.
   const phaseUnchanged = (jobId: string): boolean => {
     if (!phaseSeqByJob.has(jobId)) return false;
     const job = input.ledger.getJob(jobId);
@@ -1374,7 +1385,12 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
   };
   const reviewOfferFencesHold = (jobId: string): boolean => {
     const job = input.ledger.getJob(jobId);
-    return job !== null && job.status !== 'merged' && job.status !== 'done' &&
+    // The same review-eligible status predicate as candidate intake: the
+    // intake row was computed from the listJobs snapshot, so a lane that
+    // slid to blocked/parked (the predicate subsumes merged/done) while a
+    // later job's blocker history awaited is not offered for review
+    // (gh-187). The marker fence below is rechecked alongside it.
+    return job !== null && reviewEligibleStatus(job.status) &&
       phaseUnchanged(jobId) &&
       jobSeqUnchanged(jobId) &&
       !verificationInFlight(input.ledger, jobId) &&
