@@ -670,6 +670,11 @@ the judgment; the dispatch surface is the mechanical hand.
   (default 2) → fix directive to the implementing minion; `rebrief_at`
   (default 3) → re-brief a FRESH minion on the same lane; `escalate_at`
   (default 4) → action-required notification that wakes Gru to rule.
+  Distinct defects sharing one file, category and title tie-break on a
+  normalized hash of the finding's evidence — only inside that colliding
+  group, so evidence churn never resets anyone else's streak. A rung marker
+  is read kinds-scoped, so unrelated job traffic cannot age an
+  already-handled verdict back into the digest.
   Escalation always beats an endless loop. Every rung lands as
   `silas.directive-sent`, `silas.rebrief`, or `silas.escalated`.
 - **Restart safety.** A re-brief REQUEST is durable BEFORE any worker
