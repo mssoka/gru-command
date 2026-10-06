@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -6,6 +6,7 @@ import { EventBus } from '../src/events/bus.js';
 import { LedgerApi, DEFAULT_LENSES, type PendingRebriefRecord } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { branchStatePayload } from '../src/dispatch/github-poll.js';
+import { OWNER_CANCELLATION_JOB_IDS } from '../src/ledger/owner-cancellation.js';
 
 const cleanupDirs: string[] = [];
 afterAll(() => {
@@ -1886,6 +1887,271 @@ describe('administrative closeout of a parked PR-backed job', () => {
     } finally {
       db.close();
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('owner-listed administrative cancellation (owner amendment j-1117)', () => {
+  const LISTED = OWNER_CANCELLATION_JOB_IDS[0]!;
+
+  function freshDb(): { api: LedgerApi; db: LedgerDb; dir: string } {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-owner-cancel-'));
+    const db = new LedgerDb(dir);
+    const api = new LedgerApi(db.handle, { bus: new EventBus() });
+    return { api, db, dir };
+  }
+
+  /** A parked legacy lane with the exact listed shape: no PR, NULL report
+   * metadata. */
+  function listedParkedJob(api: LedgerApi, jobId: string = LISTED): void {
+    api.addJob({ id: jobId, repo: 'gru-command', title: `t-${jobId}`, briefing: 'b' });
+    api.setJobStatus(jobId, 'working');
+    api.setJobStatus(jobId, 'parked');
+  }
+
+  function cancelRequest(
+    jobId: string,
+    overrides: { expectedStatus?: 'parked'; authorityReference?: string; reason?: string } = {},
+  ) {
+    return {
+      jobId,
+      expectedStatus: 'parked' as const,
+      authorityReference: overrides.authorityReference ?? 'j-1117 owner-close-seventeen-parked-20261006',
+      reason: overrides.reason ?? 'owner asked to move these away from parked',
+    };
+  }
+
+  function refusalOf(run: () => unknown): Error & { readonly code?: string } {
+    try {
+      run();
+    } catch (error) {
+      return error as Error & { readonly code?: string };
+    }
+    throw new Error('expected an owner-cancellation refusal');
+  }
+
+  it('cancels an exact listed parked legacy lane to done with the owner authority and exact prior/terminal identity audited', () => {
+    const { api, db, dir } = freshDb();
+    try {
+      listedParkedJob(api);
+      // A disposed worker row is bookkeeping, not execution.
+      api.registerAgent({ id: 'cancel-worker', role: 'minion', jobId: LISTED });
+      api.setAgentState('cancel-worker', 'disposed');
+      api.noteJob(LISTED, 'preserved note');
+
+      const result = api.adminCancelListedParkedJob(cancelRequest(LISTED));
+      expect(result.idempotent).toBe(false);
+      expect(result.job.status).toBe('done');
+      expect(result.event.kind).toBe('job.owner-cancellation');
+      const payload = result.event.payload as {
+        disposition: string;
+        expected_status: string;
+        authority: { kind: string; ruling: string; reference: string };
+        prior: Record<string, unknown>;
+        terminal: { status: string };
+        reason: string;
+        request_sha256: string;
+      };
+      expect(payload).toMatchObject({
+        disposition: 'owner-cancelled-abandoned',
+        expected_status: 'parked',
+        authority: { kind: 'owner-cancellation', ruling: 'j-1117', reference: 'j-1117 owner-close-seventeen-parked-20261006' },
+        prior: { status: 'parked', pr_url: null, deliverable: null, commissioner: null, target_ref: null, target_sha: null },
+        terminal: { status: 'done' },
+        reason: expect.stringContaining('parked'),
+      });
+      expect(payload.request_sha256).toMatch(/^[0-9a-f]{64}$/u);
+      expect(payload.prior['updated_at']).toBeTruthy();
+      // Direct hop: parked → done, no intermediate executable state.
+      const hops = api.listJobEventsByKinds(LISTED, ['job.status']);
+      expect(hops[0]?.payload).toEqual({ from: 'parked', to: 'done' });
+      // The audit is not a success claim and the preserved note is untouched.
+      expect(api.getJob(LISTED)?.note).toBe('preserved note');
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses unlisted ids, non-parked state, PR/report shapes and malformed authority with no effect', () => {
+    const { api, db, dir } = freshDb();
+    try {
+      // Unlisted parked job: never cancellable, no batch scan.
+      listedParkedJob(api, 'not-on-the-list');
+      expect(refusalOf(() => api.adminCancelListedParkedJob(cancelRequest('not-on-the-list'))).code).toBe('not-listed');
+
+      // Listed but moved off parked.
+      api.addJob({ id: LISTED, repo: 'gru-command', title: 't', briefing: 'b' });
+      api.setJobStatus(LISTED, 'working');
+      expect(refusalOf(() => api.adminCancelListedParkedJob(cancelRequest(LISTED))).code).toBe('not-parked');
+
+      // Listed but PR-backed: a different disposition owns it.
+      api.setJobPr(LISTED, 'https://github.com/acme/gru-command/pull/9');
+      api.setJobStatus(LISTED, 'parked');
+      expect(refusalOf(() => api.adminCancelListedParkedJob(cancelRequest(LISTED))).code).toBe('not-cancellable-shape');
+
+      // Listed but report-typed: no fabrication, no folding.
+      const reportId = OWNER_CANCELLATION_JOB_IDS[1]!;
+      api.addJob({ id: reportId, repo: 'gru-command', title: 't', briefing: 'b', deliverable: 'review' });
+      api.setJobStatus(reportId, 'working');
+      api.setJobStatus(reportId, 'parked');
+      expect(refusalOf(() => api.adminCancelListedParkedJob(cancelRequest(reportId))).code).toBe('not-cancellable-shape');
+
+      // Malformed authority / reason are plain 400-class input errors.
+      expect(() => api.adminCancelListedParkedJob(cancelRequest(LISTED, { authorityReference: '' }))).toThrow(/authority_reference/u);
+      expect(() => api.adminCancelListedParkedJob(cancelRequest(LISTED, { authorityReference: 'x'.repeat(201) }))).toThrow(/authority_reference/u);
+      expect(() => api.adminCancelListedParkedJob(cancelRequest(LISTED, { reason: '' }))).toThrow(/reason/u);
+
+      // No partial change anywhere.
+      for (const id of ['not-on-the-list', LISTED, reportId]) {
+        expect(api.latestJobEvent(id, 'job.owner-cancellation'), id).toBeNull();
+      }
+      expect(api.getJob('not-on-the-list')?.status).toBe('parked');
+      expect(api.getJob(LISTED)?.status).toBe('parked');
+      expect(api.getJob(reportId)?.status).toBe('parked');
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('binds the authoritative runtime view: ledger idle + openTurn refuses, explicit stops and historical rows do not', () => {
+    const { api, db, dir } = freshDb();
+    try {
+      listedParkedJob(api, OWNER_CANCELLATION_JOB_IDS[2]!);
+      api.registerAgent({ id: 'idle-but-open', role: 'minion', jobId: OWNER_CANCELLATION_JOB_IDS[2]! });
+      api.setAgentState('idle-but-open', 'idle');
+      // The observed false-idle case: ledger `idle`, supervision openTurn:true.
+      const openProbe = {
+        liveHandleIds: new Set<string>(),
+        supervisionFor: (agentId: string) =>
+          agentId === 'idle-but-open'
+            ? { state: 'streaming', breakerOpen: false, openTurn: true, openControl: false, openToolCalls: 0 }
+            : null,
+      };
+      const openRefusal = refusalOf(() =>
+        api.adminCancelListedParkedJob(cancelRequest(OWNER_CANCELLATION_JOB_IDS[2]!), openProbe),
+      );
+      expect(openRefusal.name).toBe('AdminCancellationRefusal');
+      expect(openRefusal.code).toBe('live-work');
+      expect(openRefusal.message).toContain('idle-but-open');
+      expect(api.getJob(OWNER_CANCELLATION_JOB_IDS[2]!)?.status).toBe('parked');
+
+      // Idle + a live registry handle (no supervision view) is live ownership.
+      const ownedProbe = { liveHandleIds: new Set(['idle-but-open']), supervisionFor: () => null };
+      expect(
+        refusalOf(() => api.adminCancelListedParkedJob(cancelRequest(OWNER_CANCELLATION_JOB_IDS[2]!), ownedProbe)).code,
+      ).toBe('live-work');
+
+      // Wired probe, no handle, no open turn: historical bookkeeping — allowed.
+      const historicalProbe = { liveHandleIds: new Set<string>(), supervisionFor: () => null };
+      const closed = api.adminCancelListedParkedJob(cancelRequest(OWNER_CANCELLATION_JOB_IDS[2]!), historicalProbe);
+      expect(closed.job.status).toBe('done');
+
+      // A disposed lane whose supervision stop is explicit is NOT live,
+      // even though a durable-stop union would still call it current.
+      const stoppedId = OWNER_CANCELLATION_JOB_IDS[3]!;
+      listedParkedJob(api, stoppedId);
+      api.registerAgent({ id: 'stopped-worker', role: 'minion', jobId: stoppedId });
+      api.setAgentState('stopped-worker', 'disposed');
+      const stoppedProbe = {
+        liveHandleIds: new Set(['stopped-worker']),
+        supervisionFor: (agentId: string) =>
+          agentId === 'stopped-worker'
+            ? { state: 'stopped', breakerOpen: true, openTurn: false, openControl: false, openToolCalls: 0 }
+            : null,
+      };
+      expect(api.adminCancelListedParkedJob(cancelRequest(stoppedId), stoppedProbe).job.status).toBe('done');
+
+      // A durable streaming row still blocks even with no probe at all.
+      const durableId = OWNER_CANCELLATION_JOB_IDS[4]!;
+      listedParkedJob(api, durableId);
+      api.registerAgent({ id: 'durable-stream', role: 'minion', jobId: durableId });
+      api.setAgentState('durable-stream', 'streaming');
+      expect(refusalOf(() => api.adminCancelListedParkedJob(cancelRequest(durableId), null)).code).toBe('live-work');
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('is idempotent for an identical replay and refuses conflicting retries after cancellation', () => {
+    const { api, db, dir } = freshDb();
+    try {
+      listedParkedJob(api);
+      const first = api.adminCancelListedParkedJob(cancelRequest(LISTED));
+      expect(first.idempotent).toBe(false);
+
+      const replay = api.adminCancelListedParkedJob(cancelRequest(LISTED));
+      expect(replay.idempotent).toBe(true);
+      expect(replay.event.seq).toBe(first.event.seq);
+      expect(replay.job.status).toBe('done');
+      expect(api.listJobEventsByKinds(LISTED, ['job.owner-cancellation'])).toHaveLength(1);
+
+      // A changed authority reference or reason is a different request.
+      const changedReference = refusalOf(() =>
+        api.adminCancelListedParkedJob(cancelRequest(LISTED, { authorityReference: 'j-1117 different-reference' })),
+      );
+      expect(changedReference.code).toBe('already-closed');
+      const changedReason = refusalOf(() => api.adminCancelListedParkedJob(cancelRequest(LISTED, { reason: 'another reason' })));
+      expect(changedReason.code).toBe('already-closed');
+      expect(api.listJobEventsByKinds(LISTED, ['job.owner-cancellation'])).toHaveLength(1);
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('leaves worktrees and control rows untouched and closes open obligations as job-terminal abandonment', () => {
+    const { api, db, dir } = freshDb();
+    try {
+      listedParkedJob(api);
+      api.registerWorktree({
+        id: `${LISTED}-lane`,
+        kind: 'job',
+        repoPath: '/tmp/cancel-repo',
+        repoName: 'gru-command',
+        path: `/tmp/${LISTED}-lane`,
+        branch: `gru/${LISTED}`,
+        sha: 'b'.repeat(40),
+        baseSource: 'origin',
+        jobId: LISTED,
+      });
+      const markers = api.beginPendingRebrief({ jobId: LISTED, note: 'stalled', briefing: 'b' });
+      expect(markers.length).toBeGreaterThan(0);
+      // A fresh incident recorded while parked opens an obligation that the
+      // cancellation must close as abandonment (never success).
+      const row = api.recordBlockedObservation(LISTED, {
+        logicalStep: 'operation',
+        category: { kind: 'unknown' },
+        incidentKey: 'cancel-open-debt',
+        observedAtSeq: api.latestEventSeq(),
+      });
+      expect(row.state).toBe('open');
+      const laneBefore = api.listWorktrees({ jobId: LISTED });
+
+      const result = api.adminCancelListedParkedJob(cancelRequest(LISTED));
+      expect(result.job.status).toBe('done');
+      // Worktree + control rows are untouched; no release/prune side effect.
+      expect(api.listWorktrees({ jobId: LISTED })).toEqual(laneBefore);
+      expect(api.listPendingRebriefs({ jobId: LISTED })).toHaveLength(markers.length);
+      expect(api.listJobEventsByKinds(LISTED, ['worktree.swept', 'silas.lane-released'])).toHaveLength(0);
+      // The debt closed as terminal abandonment, not an accepted execution.
+      const debt = api.getObligation(`${LISTED}:operation:cancel-open-debt`);
+      expect(debt?.state).toBe('closed');
+      expect(debt?.settlement).toEqual({ kind: 'job-terminal', jobStatus: 'done' });
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('pins the exact 17-job owner allowlist and lists every id in the operator runbook', () => {
+    expect(OWNER_CANCELLATION_JOB_IDS).toHaveLength(17);
+    expect(new Set(OWNER_CANCELLATION_JOB_IDS).size).toBe(17);
+    const runbook = readFileSync(join(import.meta.dirname, '..', 'docs', 'OPERATIONS.md'), 'utf8');
+    for (const id of OWNER_CANCELLATION_JOB_IDS) {
+      expect(runbook, id).toContain(`\`${id}\``);
     }
   });
 });

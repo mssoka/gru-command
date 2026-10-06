@@ -1041,6 +1041,25 @@ async function main(): Promise<number> {
     decisionsStatus: () => decisionRuntime.status(),
     onDecisionsRecheck: () => decisionRuntime.recheck(),
     siblingUpgradePaths: ['/ws'],
+    // Authoritative liveness at the closeout commit boundary (issue #171):
+    // live registry handles only (durable stops are not execution), plus
+    // the supervisor's open turn/control/tool-call view, so a ledger `idle`
+    // row with an effective open turn can never be closed out as quiescent.
+    closeoutRuntime: () => ({
+      liveHandleIds: new Set(registry.listHandles().map((handle) => handle.id)),
+      supervisionFor: (agentId) => {
+        const view = supervisorLive.viewFor(agentId);
+        return view === null
+          ? null
+          : {
+              state: view.state,
+              breakerOpen: view.breakerOpen,
+              openTurn: view.openTurn,
+              openControl: view.openControl === true,
+              openToolCalls: view.openToolCalls,
+            };
+      },
+    }),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   state.ledgerDb = ledgerDb;

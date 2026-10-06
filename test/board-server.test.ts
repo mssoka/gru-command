@@ -29,7 +29,7 @@ function tmpDir(): string {
 
 async function boot(
   token: string,
-  overrides: Partial<{ heartbeatMs: number }> = {},
+  overrides: Partial<Parameters<typeof createBoardServer>[0]> = {},
 ): Promise<{
   port: number;
   api: LedgerApi;
@@ -452,6 +452,91 @@ describe('board server — HTTP API', () => {
     expect(
       (noClosed.body as { event: { payload: { provider: { closed_at: unknown } } } }).event.payload.provider.closed_at,
     ).toBeNull();
+  });
+
+  it('owner cancellation endpoint: auth, malformed bodies, unlisted refusals and the audited idempotent success', async () => {
+    const { api, port } = harness;
+    const listed = 'gc-freeze-heat-evidence';
+    const body = {
+      expected_status: 'parked',
+      authority_reference: 'j-1117 owner-close-seventeen-parked-20261006',
+      reason: 'owner asked to move these away from parked',
+    };
+    expect((await postJson(port, `/api/jobs/${listed}/owner-cancellation`, null, body)).status).toBe(401);
+    expect((await postJson(port, `/api/jobs/${listed}/owner-cancellation`, 'wrong-token', body)).status).toBe(401);
+    for (const bad of [
+      {},
+      { ...body, expected_status: 'working' },
+      { ...body, authority_reference: '' },
+      { ...body, reason: '' },
+    ]) {
+      const response = await postJson(port, `/api/jobs/${listed}/owner-cancellation`, 'board-test-token', bad);
+      expect(response.status, JSON.stringify(bad)).toBe(400);
+    }
+    const nullBody = await postJson(port, `/api/jobs/${listed}/owner-cancellation`, 'board-test-token', null);
+    expect(nullBody.status).toBe(400);
+    expect((await postJson(port, '/api/jobs/ghost/owner-cancellation', 'board-test-token', body)).status).toBe(404);
+
+    // An unlisted parked job is refused with the typed code and no effect.
+    api.addJob({ id: 'unlisted-cancel', repo: 'demo-repo', title: 'Unlisted' });
+    api.setJobStatus('unlisted-cancel', 'working');
+    api.setJobStatus('unlisted-cancel', 'parked');
+    const unlisted = await postJson(port, '/api/jobs/unlisted-cancel/owner-cancellation', 'board-test-token', body);
+    expect(unlisted.status).toBe(409);
+    expect(unlisted.body).toMatchObject({ error: 'cancellation_refused', code: 'not-listed' });
+    expect(api.getJob('unlisted-cancel')?.status).toBe('parked');
+
+    // A listed parked legacy lane cancels in one audited, idempotent hop.
+    api.addJob({ id: listed, repo: 'demo-repo', title: 'Listed legacy lane' });
+    api.setJobStatus(listed, 'working');
+    api.setJobStatus(listed, 'parked');
+    const accepted = await postJson(port, `/api/jobs/${listed}/owner-cancellation`, 'board-test-token', body);
+    expect(accepted.status).toBe(200);
+    const acceptedBody = accepted.body as { job: { status: string }; event: { kind: string; seq: number }; idempotent: boolean };
+    expect(acceptedBody.job.status).toBe('done');
+    expect(acceptedBody.event.kind).toBe('job.owner-cancellation');
+    expect(acceptedBody.idempotent).toBe(false);
+    const replay = await postJson(port, `/api/jobs/${listed}/owner-cancellation`, 'board-test-token', body);
+    expect(replay.status).toBe(200);
+    expect(replay.body).toMatchObject({ idempotent: true, event: { seq: acceptedBody.event.seq }, job: { status: 'done' } });
+    const settled = await postJson(port, `/api/jobs/${listed}/owner-cancellation`, 'board-test-token', { ...body, reason: 'a different reason' });
+    expect(settled.status).toBe(409);
+    expect(settled.body).toMatchObject({ error: 'cancellation_refused', code: 'already-closed' });
+    const snapshot = (await getJson(port, '/api/board', 'board-test-token')).body as {
+      repos: { jobs: { id: string; status: string; prState: string | null }[] }[];
+    };
+    const job = snapshot.repos.flatMap((repo) => repo.jobs).find((candidate) => candidate.id === listed);
+    expect(job).toMatchObject({ status: 'done', prState: null });
+  });
+
+  it('owner cancellation endpoint passes the authoritative runtime probe: a ledger idle row with an open turn refuses', async () => {
+    const local = await boot('cancel-probe-token', {
+      closeoutRuntime: () => ({
+        liveHandleIds: new Set<string>(),
+        supervisionFor: (agentId: string) =>
+          agentId === 'probe-idle-open'
+            ? { state: 'streaming', breakerOpen: false, openTurn: true, openControl: false, openToolCalls: 0 }
+            : null,
+      }),
+    });
+    try {
+      const listed = 'silas-context-rotation';
+      local.api.addJob({ id: listed, repo: 'demo-repo', title: 'Probe lane' });
+      local.api.setJobStatus(listed, 'working');
+      local.api.setJobStatus(listed, 'parked');
+      local.api.registerAgent({ id: 'probe-idle-open', role: 'minion', jobId: listed });
+      local.api.setAgentState('probe-idle-open', 'idle');
+      const refused = await postJson(local.port, `/api/jobs/${listed}/owner-cancellation`, 'cancel-probe-token', {
+        expected_status: 'parked',
+        authority_reference: 'j-1117 owner-close-seventeen-parked-20261006',
+        reason: 'owner asked',
+      });
+      expect(refused.status).toBe(409);
+      expect(refused.body).toMatchObject({ error: 'cancellation_refused', code: 'live-work' });
+      expect(local.api.getJob(listed)?.status).toBe('parked');
+    } finally {
+      await local.close();
+    }
   });
 
   it('write endpoints reject bad bodies and missing entities', async () => {
