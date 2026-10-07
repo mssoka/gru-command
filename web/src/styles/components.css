@@ -1131,7 +1131,9 @@ body {
   flex: 1 1 0;
 }
 
-.chat-context__status--busy .chat-context__status-label {
+/* Working only (rotating phrase visible): compacting/resetting are also
+   busy but show no phrase, so their factual label must stay on screen. */
+.chat-context__status--working .chat-context__status-label {
   position: absolute;
   width: 1px;
   height: 1px;
