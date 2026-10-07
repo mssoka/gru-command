@@ -10,6 +10,7 @@ import { describe, expect, it } from 'vitest';
  */
 const PINS: Record<string, number> = {  'rate-limit-retry.test.ts': 6,
   'owner-actions.test.ts': 28,
+  'prune-stale-dist.test.ts': 5,
   'attachments.test.ts': 28,
 
   'awareness.test.ts': 80,
