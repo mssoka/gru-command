@@ -44,6 +44,20 @@ context: []
 
 **Never:** new palette, font dependency, theme selector, or backend/API/schema/credential/model/config change; whole-file replacement of shared newer files by old ones; source-history merge/cherry-pick/reset/rebase/force-push; any write to the original lane or shared checkout; Binned/PR248/KPI-derivation changes; mock preview controls, reference imagery or illustrative counts in product artifacts; test weakening/skips; draft PR; merge/install/deploy/restart/cleanup; fabricating a workflow checkpoint or accepting a changed goal silently.
 
+## I/O & Edge-Case Matrix
+
+| Scenario | Input / State | Expected Output / Behavior | Error Handling |
+|---|---|---|---|
+| COMPLETE | full snapshot: build/silas/verify/cure, children, deferred wakes, owner rows+PRs | every labelled fact + `data-kpi` renders truthfully; 6 pairs + groups stable; wakes count/age independent of Silas | n/a |
+| EMPTY/UNKNOWN | missing build/verify/cure (`n/a`), silas null, wakes 0+null, absent children/deferred | honest n/a text; visible `no wakes yet · 0`; CHILDREN group omitted (never claimed zero); calm empty FOR YOU | n/a |
+| WAKES_SPLIT | count>0 + null/invalid stamp; count 0 + valid stamp; valid stamp + count>0 | "last wake unknown" (never "no wakes yet"); supplied stamp never discarded; terse split age | unparseable stamp = unknown, never fabricated |
+| BOUNDARY | 9/10, 99/100, 999/1000 at 1440/1200/768/360, long labels, both themes | reserved numeric slots; no label/group/row-height jump; no body/component overflow, clipping or masking; ≥4.5:1 contrast | >4-digit values wrap honestly |
+| REVEAL | collapsed ack and PR rows; keyboard Enter/Space | region toggles with `aria-expanded`; NO request, no ack, pending count unchanged; full detail + consequences visible when expanded | long/untrusted text wraps as text |
+| REFRESH | expanded+focused row; settled row removed; row pushed outside older-pending window | state+focus survive by action id + control kind; removal retires only that row; window-hidden row keeps identity | n/a |
+| IDENTITY | colliding action ids (`a_b` vs `a-b`); band + bell PR rows | distinct allocated region ids and focus targets; panel keeps prior presentation, no shared region | n/a |
+| UNSAFE_URL | non-https `prUrl` on a projected row | "PR link unavailable" text; never a link | fail closed |
+| DEFERRED | wakes.deferred present (count/reasons/truncated) or absent | deferred count + reasons in the chip title; absent renders exactly as before | n/a |
+
 </frozen-after-approval>
 
 ## Code Map
