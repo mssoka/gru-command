@@ -1945,6 +1945,7 @@ describe('administrative closeout of a parked PR-backed job', () => {
       expect(attempt({ expectedPrUrl: 'http://github.com/acme/gru-command/pull/165' })).toThrow(/absolute https url/u);
       // Bounded reason / hex head (full 40- or 64-character identity).
       expect(attempt({ reason: 'x'.repeat(2_001) })).toThrow(/bounded printable text/u);
+      expect(attempt({ reason: 'x\u0007y' })).toThrow(/bounded printable text/u);
       expect(attempt({ provider: { provider: 'github', state: 'closed', merged: false, headSha: 'abc123' } })).toThrow(/full 40- or 64-character hex commit sha/u);
       expect(attempt({ provider: { provider: 'github', state: 'closed', merged: false, headSha: 'a'.repeat(39) } })).toThrow(/full 40- or 64-character hex commit sha/u);
       // Every edge refusal is a no-effect failure.
@@ -2140,7 +2141,10 @@ describe('owner-listed administrative cancellation (owner amendment j-1117)', ()
       // Malformed authority / reason are plain 400-class input errors.
       expect(() => api.adminCancelListedParkedJob(cancelRequest(LISTED, { authorityReference: '' }))).toThrow(/authority_reference/u);
       expect(() => api.adminCancelListedParkedJob(cancelRequest(LISTED, { authorityReference: 'x'.repeat(201) }))).toThrow(/authority_reference/u);
+      expect(() => api.adminCancelListedParkedJob(cancelRequest(LISTED, { authorityReference: 'j-1117\u0007' }))).toThrow(/authority_reference/u);
       expect(() => api.adminCancelListedParkedJob(cancelRequest(LISTED, { reason: '' }))).toThrow(/reason/u);
+      expect(() => api.adminCancelListedParkedJob(cancelRequest(LISTED, { reason: 'x'.repeat(2_001) }))).toThrow(/reason/u);
+      expect(() => api.adminCancelListedParkedJob(cancelRequest(LISTED, { reason: 'x\u0007y' }))).toThrow(/reason/u);
 
       // No partial change anywhere.
       for (const id of ['not-on-the-list', LISTED, reportId, ...shapedIds]) {
@@ -2226,6 +2230,84 @@ describe('owner-listed administrative cancellation (owner amendment j-1117)', ()
       api.registerAgent({ id: 'durable-stream', role: 'minion', jobId: durableId });
       api.setAgentState('durable-stream', 'streaming');
       expect(refusalOf(() => api.adminCancelListedParkedJob(cancelRequest(durableId), null)).code).toBe('live-work');
+
+      // The stop short-circuit is pinned per disjunct: a `stopped` view
+      // with the breaker CLOSED closes (reachable when a restart is
+      // refused or an isolated review aborts)...
+      const stoppedOnlyId = OWNER_CANCELLATION_JOB_IDS[5]!;
+      listedParkedJob(api, stoppedOnlyId);
+      api.registerAgent({ id: 'stopped-only', role: 'minion', jobId: stoppedOnlyId });
+      api.setAgentState('stopped-only', 'disposed');
+      const stoppedOnlyProbe: CloseoutRuntimeProbe = {
+        liveHandleIds: new Set<string>(),
+        supervisionFor: (agentId: string) =>
+          agentId === 'stopped-only'
+            ? { state: 'stopped', breakerOpen: false, openTurn: false, openControl: false, openToolCalls: 0 }
+            : null,
+      };
+      expect(api.adminCancelListedParkedJob(cancelRequest(stoppedOnlyId), stoppedOnlyProbe).job.status).toBe('done');
+
+      // ... and a breaker-open view closes without the state saying stopped.
+      const breakerId = OWNER_CANCELLATION_JOB_IDS[6]!;
+      listedParkedJob(api, breakerId);
+      api.registerAgent({ id: 'breaker-only', role: 'minion', jobId: breakerId });
+      api.setAgentState('breaker-only', 'disposed');
+      const breakerProbe: CloseoutRuntimeProbe = {
+        liveHandleIds: new Set<string>(),
+        supervisionFor: (agentId: string) =>
+          agentId === 'breaker-only'
+            ? { state: 'watching', breakerOpen: true, openTurn: false, openControl: false, openToolCalls: 0 }
+            : null,
+      };
+      expect(api.adminCancelListedParkedJob(cancelRequest(breakerId), breakerProbe).job.status).toBe('done');
+
+      // An UNKNOWN openControl on a view that is not explicitly stopped
+      // fails closed (same absence the reclaim probe treats as
+      // non-reclaimable)...
+      const unknownControlId = OWNER_CANCELLATION_JOB_IDS[7]!;
+      listedParkedJob(api, unknownControlId);
+      api.registerAgent({ id: 'unknown-control', role: 'minion', jobId: unknownControlId });
+      api.setAgentState('unknown-control', 'idle');
+      const unknownControlProbe: CloseoutRuntimeProbe = {
+        liveHandleIds: new Set<string>(),
+        supervisionFor: (agentId: string) =>
+          agentId === 'unknown-control'
+            ? { state: 'watching', breakerOpen: false, openTurn: false, openToolCalls: 0 }
+            : null,
+      };
+      expect(
+        refusalOf(() => api.adminCancelListedParkedJob(cancelRequest(unknownControlId), unknownControlProbe)).code,
+      ).toBe('live-work');
+      expect(api.getJob(unknownControlId)?.status).toBe('parked');
+
+      // ... while the same absence on an explicitly stopped view still
+      // short-circuits (stopped views may omit the field).
+      const hydratedStopId = OWNER_CANCELLATION_JOB_IDS[8]!;
+      listedParkedJob(api, hydratedStopId);
+      api.registerAgent({ id: 'hydrated-stop', role: 'minion', jobId: hydratedStopId });
+      api.setAgentState('hydrated-stop', 'disposed');
+      const hydratedStopProbe: CloseoutRuntimeProbe = {
+        liveHandleIds: new Set<string>(),
+        supervisionFor: (agentId: string) =>
+          agentId === 'hydrated-stop' ? { state: 'stopped', breakerOpen: true, openTurn: false, openToolCalls: 0 } : null,
+      };
+      expect(api.adminCancelListedParkedJob(cancelRequest(hydratedStopId), hydratedStopProbe).job.status).toBe('done');
+
+      // A non-null idle view with a lane-bound live handle blocks via the
+      // fall-through ownership clause.
+      const ownedId = OWNER_CANCELLATION_JOB_IDS[9]!;
+      listedParkedJob(api, ownedId);
+      api.registerAgent({ id: 'owned-idle', role: 'minion', jobId: ownedId });
+      api.setAgentState('owned-idle', 'idle');
+      const ownedViewProbe: CloseoutRuntimeProbe = {
+        liveHandleIds: new Set(['owned-idle']),
+        supervisionFor: (agentId: string) =>
+          agentId === 'owned-idle'
+            ? { state: 'watching', breakerOpen: false, openTurn: false, openControl: false, openToolCalls: 0 }
+            : null,
+      };
+      expect(refusalOf(() => api.adminCancelListedParkedJob(cancelRequest(ownedId), ownedViewProbe)).code).toBe('live-work');
+      expect(api.getJob(ownedId)?.status).toBe('parked');
     } finally {
       db.close();
       rmSync(dir, { recursive: true, force: true });

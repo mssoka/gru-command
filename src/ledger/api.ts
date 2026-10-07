@@ -503,7 +503,9 @@ export interface CloseoutSupervisionView {
   readonly state: 'watching' | 'restarting' | 'stopped';
   readonly breakerOpen: boolean;
   readonly openTurn: boolean;
-  readonly openControl: boolean;
+  /** Optional because stopped/remembered views may omit it; an UNKNOWN
+   * value on a view that is not explicitly stopped fails closed (blocks). */
+  readonly openControl?: boolean;
   readonly openToolCalls: number;
 }
 
@@ -1907,9 +1909,14 @@ export class LedgerApi {
       if (view !== null) {
         // The supervisor's state set is watching|restarting|stopped; live
         // execution is an open turn/control/tool call or an active restart.
+        // An UNKNOWN openControl on a view that is not explicitly stopped
+        // fails closed (the reclaim probe treats the same absence as
+        // non-reclaimable).
+        const explicitlyStopped = view.state === 'stopped' || view.breakerOpen === true;
         const openWork =
           view.openTurn === true ||
           view.openControl === true ||
+          (!explicitlyStopped && view.openControl === undefined) ||
           view.openToolCalls > 0 ||
           view.state === 'restarting';
         if (openWork) {
@@ -1918,7 +1925,7 @@ export class LedgerApi {
           );
           continue;
         }
-        if (view.state === 'stopped' || view.breakerOpen === true) continue; // explicitly stopped — not live execution
+        if (explicitlyStopped) continue; // explicitly stopped — not live execution
       }
       if (agent.state === 'spawning' || agent.state === 'streaming') {
         openTurns.push(`${agent.id} (${agent.state})`);

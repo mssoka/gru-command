@@ -1056,7 +1056,7 @@ async function main(): Promise<number> {
               state: view.state,
               breakerOpen: view.breakerOpen,
               openTurn: view.openTurn,
-              openControl: view.openControl === true,
+              openControl: view.openControl,
               openToolCalls: view.openToolCalls,
             };
       },

@@ -605,30 +605,81 @@ describe('board server — HTTP API', () => {
     return out;
   }
 
+  /** Findings from the closeoutRuntime assembly alarm for one source
+   * text: an empty list means the wiring is present, active and correctly
+   * mapped. Exposed for the synthetic-fixture test below so a revert of
+   * the comment-stripping/scoping hardening goes red. */
+  function closeoutWiringFindings(source: string): string[] {
+    const stripped = stripSourceComments(source);
+    const findings: string[] = [];
+    const wiringLines = stripped.split('\n').filter((line) => /^\s*closeoutRuntime:/.test(line));
+    if (wiringLines.length !== 1) findings.push(`wiring count ${String(wiringLines.length)}`);
+    if (wiringLines.length === 1 && !/^\s*closeoutRuntime:\s*\(\)\s*=>\s*\(\{/u.test(wiringLines[0]!)) {
+      findings.push('wiring shape');
+    }
+    const start = stripped.search(/^\s*closeoutRuntime:/mu);
+    const block = start < 0 ? '' : stripped.slice(start, start + 1_500);
+    const expressions: readonly (readonly [string, RegExp])[] = [
+      ['liveHandleIds', /^\s*liveHandleIds:\s*new Set\(registry\.listHandles\(\)\.map\(\(handle\) => handle\.id\)\),/mu],
+      ['supervisionFor', /^\s*supervisionFor:\s*\(agentId\)\s*=>\s*\{/mu],
+      ['viewFor', /^\s*const view = supervisorLive\.viewFor\(agentId\);/mu],
+      ['state', /^\s*state:\s*view\.state,/mu],
+      ['breakerOpen', /^\s*breakerOpen:\s*view\.breakerOpen,/mu],
+      ['openTurn', /^\s*openTurn:\s*view\.openTurn,/mu],
+      ['openControl', /^\s*openControl:\s*view\.openControl,/mu],
+      ['openToolCalls', /^\s*openToolCalls:\s*view\.openToolCalls,/mu],
+    ];
+    for (const [label, expression] of expressions) {
+      if (!expression.test(block)) findings.push(`mapping ${label}`);
+    }
+    return findings;
+  }
+
   it('the main assembly wires the authoritative closeout runtime probe (assembly alarm)', () => {
     // The behavior has unit coverage but the production composition does
     // not: dropping this wiring — or wiring a falsified constant instead
     // of the live view value — would silently fall back to durable markers
     // only and no behavioral test would fail (same alarm pattern as the
-    // supervisor-stop wiring pin). The match is LINE-ANCHORED on purpose:
-    // a commented-out or decoy copy of the same text must not satisfy it.
-    const mainSource = stripSourceComments(readFileSync(join(import.meta.dirname, '..', 'src', 'main.ts'), 'utf8'));
-    const wiringLines = mainSource.split('\n').filter((line) => /^\s*closeoutRuntime:/.test(line));
-    expect(wiringLines, 'exactly one active closeoutRuntime property').toHaveLength(1);
-    expect(wiringLines[0]).toMatch(/^\s*closeoutRuntime:\s*\(\)\s*=>\s*\(\{/u);
-    // Scope the mapping checks to the block that follows the property: the
-    // same `viewFor(agentId)` text also occurs elsewhere in main.ts, and an
-    // unscoped match could satisfy the pin without the wiring.
-    const start = mainSource.search(/^\s*closeoutRuntime:/mu);
-    const block = mainSource.slice(start, start + 1_500);
-    expect(block).toMatch(/^\s*liveHandleIds:\s*new Set\(registry\.listHandles\(\)\.map\(\(handle\) => handle\.id\)\),/mu);
-    expect(block).toMatch(/^\s*supervisionFor:\s*\(agentId\)\s*=>\s*\{/mu);
-    expect(block).toMatch(/^\s*const view = supervisorLive\.viewFor\(agentId\);/mu);
-    expect(block).toMatch(/^\s*state:\s*view\.state,/mu);
-    expect(block).toMatch(/^\s*breakerOpen:\s*view\.breakerOpen,/mu);
-    expect(block).toMatch(/^\s*openTurn:\s*view\.openTurn,/mu);
-    expect(block).toMatch(/^\s*openControl:\s*view\.openControl === true,/mu);
-    expect(block).toMatch(/^\s*openToolCalls:\s*view\.openToolCalls,/mu);
+    // supervisor-stop wiring pin). The alarm strips comments and scopes
+    // the match to the property's block; the synthetic fixtures below keep
+    // that hardening from regressing.
+    const mainSource = readFileSync(join(import.meta.dirname, '..', 'src', 'main.ts'), 'utf8');
+    expect(closeoutWiringFindings(mainSource)).toEqual([]);
+  });
+
+  it('the assembly alarm rejects commented, decoy, removed and falsified wiring (synthetic fixtures)', () => {
+    const goodWiring = [
+      'const x = createBoardServer({',
+      '  closeoutRuntime: () => ({',
+      '    liveHandleIds: new Set(registry.listHandles().map((handle) => handle.id)),',
+      '    supervisionFor: (agentId) => {',
+      '      const view = supervisorLive.viewFor(agentId);',
+      '      return view === null ? null : {',
+      '        state: view.state,',
+      '        breakerOpen: view.breakerOpen,',
+      '        openTurn: view.openTurn,',
+      '        openControl: view.openControl,',
+      '        openToolCalls: view.openToolCalls,',
+      '      };',
+      '    },',
+      '  }),',
+      '});',
+    ].join('\n');
+    expect(closeoutWiringFindings(goodWiring)).toEqual([]);
+    const lines = goodWiring.split('\n');
+    const propertyLines = lines.map((line, index) => (index >= 1 && index <= 13 ? `// ${line}` : line)).join('\n');
+    expect(closeoutWiringFindings(propertyLines), '//-commented wiring').not.toEqual([]);
+    const wrappedLines = [...lines.slice(0, 1), '/*', ...lines.slice(1, 14), '*/', ...lines.slice(14)].join('\n');
+    expect(closeoutWiringFindings(wrappedLines), 'block-commented wiring').not.toEqual([]);
+    const removed = lines.filter((_line, index) => index < 1 || index > 13).join('\n');
+    expect(closeoutWiringFindings(removed), 'removed wiring').not.toEqual([]);
+    const decoy = `${goodWiring}\n  closeoutRuntime: () => ({ liveHandleIds: new Set(), supervisionFor: () => null }),`;
+    expect(closeoutWiringFindings(decoy), 'second closeoutRuntime property').toContain('wiring count 2');
+    const withoutViewFor = lines.filter((_line, index) => index !== 4).join('\n');
+    const unscopedDecoy = `const view = supervisorLive.viewFor(agentId);\n${withoutViewFor}`;
+    expect(closeoutWiringFindings(unscopedDecoy), 'decoy viewFor outside the block').not.toEqual([]);
+    const falsified = lines.map((line) => line.replace('openTurn: view.openTurn,', 'openTurn: false,')).join('\n');
+    expect(closeoutWiringFindings(falsified), 'falsified constant').toContain('mapping openTurn');
   });
 
   it('write endpoints reject bad bodies and missing entities', async () => {
