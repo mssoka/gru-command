@@ -9,6 +9,7 @@ import { JournalStore } from '../src/lessons/journal.js';
 import { BibleStore } from '../src/lessons/bible.js';
 import { createBibleReferences } from '../src/lessons/references.js';
 import { createLessonsServer } from '../src/lessons/server.js';
+import { DreamEngine, LessonProposals } from '../src/lessons/dream.js';
 
 /**
  * Book of Lessons HTTP surface: the journal roundtrip (capture writers),
@@ -27,6 +28,8 @@ interface Harness {
   port: number;
   journal: JournalStore;
   bible: BibleStore;
+  proposals: LessonProposals;
+  resolved: string[];
   close: () => Promise<void>;
 }
 
@@ -65,7 +68,16 @@ async function boot(opts: { token?: string; withChapter?: boolean } = {}): Promi
     );
   }
   const references = createBibleReferences({ bible, maxReferences: 3 });
-  const server = createLessonsServer({ config, journal, bible, references });
+  const resolved: string[] = [];
+  const proposals = new LessonProposals({
+    bible,
+    notifier: {
+      proposed: () => 'notice-1',
+      resolve: (id, by) => resolved.push(`${id}:${by}`),
+      stale: () => {},
+    },
+  });
+  const server = createLessonsServer({ config, journal, bible, references, proposals });
   const http: HttpServer = createServer((req, res) => {
     if (server.requestHook(req, res, new URL(req.url ?? '/', 'http://localhost').pathname)) return;
     res.writeHead(404);
@@ -76,6 +88,8 @@ async function boot(opts: { token?: string; withChapter?: boolean } = {}): Promi
     port: (http.address() as AddressInfo).port,
     journal,
     bible,
+    proposals,
+    resolved,
     close: async () => {
       await new Promise<void>((resolveClose) => http.close(() => resolveClose()));
     },
@@ -211,6 +225,75 @@ describe('lessons server', () => {
       expect(field<unknown[]>(empty.json, 'references')).toEqual([]);
       const unknown = await call(h.port, 'GET', '/api/lessons/nope', undefined, TOKEN);
       expect(unknown.status).toBe(404);
+    } finally {
+      await h.close();
+    }
+  });
+});
+
+describe('lesson proposals over HTTP (owner decision 2026-10-07)', () => {
+  async function propose(h: Harness): Promise<string> {
+    h.journal.append({ kind: 'finding', source: 'gru', body: 'shell hang finding' });
+    const engine = new DreamEngine({
+      journal: h.journal,
+      bible: h.bible,
+      proposals: h.proposals,
+      distiller: {
+        distill: async (input) => ({
+          chapters: [
+            {
+              slug: 'ops-restarts',
+              title: 'Ops restarts',
+              summary: 'Restart discipline.',
+              tags: ['ops'],
+              lessons: [{ slug: 'shell-hang', body: 'Close the shell first.', journalIds: input.entries.map((entry) => entry.id) }],
+            },
+          ],
+        }),
+      },
+    });
+    await engine.run();
+    return h.proposals.review()!.id;
+  }
+
+  it('reviews the pending proposal, refuses a wrong id, and Accept writes it', async () => {
+    const h = await boot();
+    try {
+      expect((await call(h.port, 'GET', '/api/lessons/proposal', undefined, TOKEN)).status).toBe(404);
+      const id = await propose(h);
+      const review = await call(h.port, 'GET', '/api/lessons/proposal', undefined, TOKEN);
+      expect(review.status).toBe(200);
+      expect(review.json).toMatchObject({ id, notificationId: 'notice-1', entries: 1 });
+      expect(field<unknown[]>(review.json, 'chapters')).toHaveLength(1);
+
+      const wrong = await call(h.port, 'POST', '/api/lessons/proposal/not-it/accept', {}, TOKEN);
+      expect(wrong.status).toBe(409);
+      expect(wrong.json).toMatchObject({ error: 'proposal_mismatch' });
+      expect(h.bible.readChapter('ops-restarts')).toBeNull();
+
+      const accepted = await call(h.port, 'POST', `/api/lessons/proposal/${id}/accept`, {}, TOKEN);
+      expect(accepted.status).toBe(200);
+      expect(accepted.json).toMatchObject({ id, decision: 'accepted' });
+      expect(h.bible.readChapter('ops-restarts')?.lessons[0]?.body).toBe('Close the shell first.');
+      expect(h.resolved).toEqual(['notice-1:owner:accepted']);
+      expect((await call(h.port, 'POST', `/api/lessons/proposal/${id}/reject`, {}, TOKEN)).status).toBe(404);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('Reject leaves the book untouched; every proposal route requires the token', async () => {
+    const h = await boot();
+    try {
+      const id = await propose(h);
+      expect((await call(h.port, 'GET', '/api/lessons/proposal')).status).toBe(401);
+      expect((await call(h.port, 'POST', `/api/lessons/proposal/${id}/accept`, {})).status).toBe(401);
+      expect(h.proposals.pending()).not.toBeNull();
+      const rejected = await call(h.port, 'POST', `/api/lessons/proposal/${id}/reject`, {}, TOKEN);
+      expect(rejected.status).toBe(200);
+      expect(rejected.json).toMatchObject({ id, decision: 'rejected', report: null });
+      expect(h.bible.readChapter('ops-restarts')).toBeNull();
+      expect(h.resolved).toEqual(['notice-1:owner:rejected']);
     } finally {
       await h.close();
     }

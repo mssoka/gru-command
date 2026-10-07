@@ -3,15 +3,17 @@ import { hashToken, tokenConfigured, tokenMatches } from '../auth.js';
 import type { GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { BibleStore } from './bible.js';
+import type { LessonProposals } from './dream.js';
 import type { JournalStore } from './journal.js';
-import { JournalError, type JournalKind, type LessonsReferencePort } from './types.js';
+import { JournalError, ProposalError, type JournalKind, type LessonsReferencePort } from './types.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
 /**
  * Book of Lessons HTTP surface: the authenticated journal append/list the
- * hosted agents use (Gru and Silas capture through this door), plus the
- * reference lookup that renders pointer lines from the index. Thin by
+ * hosted agents use (Gru and Silas capture through this door), the
+ * reference lookup that renders pointer lines from the index, and the
+ * owner's Accept/Reject on a pending dream proposal (For You). Thin by
  * design — the store and the dream own the behavior.
  */
 
@@ -20,6 +22,8 @@ export interface LessonsServerOptions {
   readonly journal: JournalStore;
   readonly bible: BibleStore;
   readonly references: LessonsReferencePort;
+  /** The owner's Accept/Reject surface for dream proposals (For You). */
+  readonly proposals?: LessonProposals;
   readonly log?: Log;
 }
 
@@ -27,6 +31,8 @@ export interface LessonsServer {
   /** First-mounted hook: claims /api/journal* and /api/lessons*. */
   requestHook(req: IncomingMessage, res: ServerResponse, path: string): boolean;
 }
+
+const PROPOSAL_DECISION = /^\/api\/lessons\/proposal\/([^/]+)\/(accept|reject)$/;
 
 function json(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
@@ -130,7 +136,35 @@ export function createLessonsServer(options: LessonsServerOptions): LessonsServe
       json(res, 200, { index: options.bible.readIndexText(), references: pointers });
       return true;
     }
+    if (path === '/api/lessons/proposal' && req.method === 'GET') {
+      if (!authed(req, res)) return true;
+      const review = requireProposals().review();
+      if (review === null) {
+        json(res, 404, { error: 'not_found', detail: 'no lesson proposal is pending' });
+        return true;
+      }
+      json(res, 200, review);
+      return true;
+    }
+    const decision = PROPOSAL_DECISION.exec(path);
+    if (decision !== null && req.method === 'POST') {
+      if (!authed(req, res)) return true;
+      const id = decodeURIComponent(decision[1] ?? '');
+      const proposals = requireProposals();
+      try {
+        json(res, 200, decision[2] === 'accept' ? proposals.accept(id) : proposals.reject(id));
+      } catch (error) {
+        if (!(error instanceof ProposalError)) throw error;
+        json(res, error.code === 'none' ? 404 : 409, { error: `proposal_${error.code}`, detail: error.message });
+      }
+      return true;
+    }
     return false;
+  }
+
+  function requireProposals(): LessonProposals {
+    if (options.proposals === undefined) throw new Error('lesson proposals are not configured on this server');
+    return options.proposals;
   }
 
   return {

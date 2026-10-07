@@ -9,10 +9,12 @@
 import {
   BOARD_WS_PATH,
   isValidDecisionStatus,
+  isValidLessonProposal,
   isValidSnapshot,
   parseBoardServerFrame,
   type BoardSnapshot,
   type DecisionStatusView,
+  type LessonProposalView,
   type NotificationView,
   type TranscriptInfo,
   type TranscriptPage,
@@ -323,6 +325,19 @@ export class BoardClient {
     } catch {
       return false; // a lost receipt never blocks rendering
     }
+  }
+
+  /** The pending Book of Lessons proposal, for the owner's review. */
+  async getLessonProposal(): Promise<LessonProposalView> {
+    const proposal = await this.api<unknown>('/api/lessons/proposal');
+    if (!isValidLessonProposal(proposal)) throw new Error('lesson proposal review is malformed');
+    return proposal;
+  }
+
+  /** The owner's decision on a lesson proposal — the ONLY way it closes
+   * (owner decision 2026-10-07); the snapshot then retires the row. */
+  async decideLessonProposal(id: string, decision: 'accept' | 'reject'): Promise<void> {
+    await this.postApi(`/api/lessons/proposal/${encodeURIComponent(id)}/${decision}`, {});
   }
 
   /** E7: human ack (action-required clearance; re-arms an open breaker). */

@@ -706,6 +706,20 @@ describe('board server — empty token config locks every door', () => {
       // Unknown id → 404.
       const missing = await postJson(port, '/api/notifications/nope/ack', 'ack-token', { by: 'web' });
       expect(missing.status).toBe(404);
+      // A Book of Lessons proposal closes only through Accept/Reject (owner
+      // decision 2026-10-07): a plain ack is refused and fires no hook.
+      const proposal = notifications.post({
+        kind: 'lessons.proposal',
+        routing: 'fyi',
+        severity: 'info',
+        title: 'Book of Lessons: 1 lesson change proposed',
+      });
+      expect(proposal.routing).toBe('needs-owner');
+      const refused = await postJson(port, `/api/notifications/${proposal.id}/ack`, 'ack-token', { by: 'web' });
+      expect(refused.status).toBe(409);
+      expect(refused.body).toMatchObject({ error: 'decision_required' });
+      expect(api.getNotification(proposal.id)).toMatchObject({ ackedAt: null, resolvedAt: null });
+      expect(acked).toEqual([row.id]);
     } finally {
       await board.dispose();
       await new Promise<void>((resolveClose) => {

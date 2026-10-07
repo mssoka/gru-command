@@ -2393,6 +2393,79 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(document.getElementById('board-owner')!.querySelector('[data-action-id="owner-ack:ack-me"]')).toBeNull();
   });
 
+  it('lesson proposal row: Review shows the exact text, Accept/Reject decide it, only the snapshot closes it (owner decision 2026-10-07)', async () => {
+    const review = {
+      id: 'prop-1',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      notificationId: 'lp-1',
+      entries: 2,
+      throughSeq: 9,
+      chapters: [
+        {
+          slug: 'ops',
+          title: 'Ops',
+          retired: false,
+          added: [{ slug: 'close-shell', body: 'Close the shell first.\nThen restart.', recurred: 1, previousBody: null }],
+          changed: [{ slug: 'drain', body: 'Drain before a roll.', recurred: 3, previousBody: 'Drain.' }],
+          provenanceTrimmed: 4,
+          bodiesTrimmed: 0,
+          lessonsDropped: 0,
+        },
+      ],
+    };
+    const decide = vi
+      .fn<(id: string, decision: 'accept' | 'reject') => Promise<void>>()
+      .mockRejectedValueOnce(new Error('network ambiguity'))
+      .mockResolvedValue(undefined);
+    const client = {
+      ackNotification: vi.fn(() => Promise.resolve()),
+      markNotificationShown: vi.fn(() => Promise.resolve(true)),
+      getLessonProposal: vi.fn(() => Promise.resolve(review)),
+      decideLessonProposal: decide,
+    } as unknown as import('../lib/board-client.js').BoardClient;
+    const flush = async () => {
+      for (let tick = 0; tick < 10; tick += 1) await Promise.resolve();
+    };
+    const view = new BoardView(() => {}, client);
+    const notice = notification('lp-1', {
+      routing: 'needs-owner',
+      kind: 'lessons.proposal',
+      title: 'Book of Lessons: 2 lesson changes proposed',
+    });
+    view.render(snapshot({ notifications: [notice] }));
+    const band = document.getElementById('board-owner')!;
+    expect(band.querySelector('.board-band__count')?.textContent).toBe('1 pending');
+    expect(band.textContent).toContain('Accept writes these changes into the Book of Lessons');
+    expect(band.querySelector('[data-action-id="owner-ack:lp-1"]')).toBeNull();
+
+    const details = band.querySelector<HTMLDetailsElement>('.board-owner__review')!;
+    details.open = true;
+    details.dispatchEvent(new Event('toggle'));
+    await flush();
+    expect(band.textContent).toContain('Close the shell first.\nThen restart.');
+    expect(band.textContent).toContain('updated · recurred 3 · drain');
+    expect(band.textContent).toContain('4 oldest journal handle(s) released to fit');
+
+    const accept = band.querySelector<HTMLButtonElement>('[data-action-id="owner-proposal:lp-1"]')!;
+    const reject = band.querySelector<HTMLButtonElement>('.board-owner__reject')!;
+    accept.click();
+    expect(accept.textContent).toBe('accepting…');
+    expect(reject.disabled).toBe(true);
+    await flush();
+    expect(decide).toHaveBeenCalledWith('prop-1', 'accept');
+    // Failed HTTP → the decision is still owed and both controls return.
+    expect(accept.textContent).toBe('Accept');
+    expect(reject.disabled).toBe(false);
+    accept.click();
+    await flush();
+    expect(decide).toHaveBeenCalledTimes(2);
+    // Success is NOT completion: the row closes only on the resolved snapshot.
+    expect(band.querySelector('[data-action-id="owner-proposal:lp-1"]')).not.toBeNull();
+    view.render(snapshot({ notifications: [{ ...notice, resolvedAt: '2026-01-01T00:09:00.000Z' }] }));
+    expect(document.getElementById('board-owner')!.querySelector('[data-action-id="owner-proposal:lp-1"]')).toBeNull();
+    expect(client.getLessonProposal).toHaveBeenCalledTimes(1);
+  });
+
   it('ready PR row: affected heist + exact-head reason + OPEN PR external link; non-https URLs fail closed', () => {
     const view = new BoardView(() => {});
     view.render(snapshot({ ownerPrs: [ownerPr('job-ready')] }));

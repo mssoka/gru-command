@@ -32,9 +32,12 @@ import {
   jobStatusTone,
   lensChipState,
   lensChipTone,
+  LESSONS_PROPOSAL_KIND,
   type AgentView,
   type BoardSnapshot,
   type JobView,
+  type LessonChangeView,
+  type LessonProposalView,
   type NotificationView,
   type PipelineEntryView,
   type RoundView,
@@ -81,6 +84,7 @@ import {
   safePrUrl,
   type OwnerAckRow,
   type OwnerPrRow,
+  type OwnerProposalRow,
 } from '../lib/owner-band.js';
 
 /** Truthful lens progress for whole-PR rounds: show what actually ran —
@@ -454,6 +458,8 @@ export class BoardView {
       for (const row of window.rows) {
         if (row.kind === 'ack') {
           list.append(this.ownerAckRow(row, bandVisible));
+        } else if (row.kind === 'proposal') {
+          list.append(this.ownerProposalRow(row, bandVisible));
         } else {
           list.append(this.ownerPrRow(row));
         }
@@ -524,6 +530,93 @@ export class BoardView {
     node.append(ack);
     // Display receipt for what the band actually displayed (shown:true
     // doctrine) — a receipt is proof of display, never of completion.
+    if (bandVisible) this.sendShown(item, 'web-board');
+    return node;
+  }
+
+  /** A Book of Lessons proposal (owner decision 2026-10-07): the owner
+   * reviews the exact lesson text, then Accept writes it or Reject discards
+   * it. Like Ack, the row stays pending on any HTTP ambiguity — only the
+   * authoritative snapshot (the notification resolved) closes it. */
+  private ownerProposalRow(row: OwnerProposalRow, bandVisible: boolean): HTMLElement {
+    const item = row.notification;
+    const node = el('article', 'board-owner__row board-owner__row--proposal');
+    node.append(
+      el('div', 'board-owner__title', `📖 ${item.title}`),
+      el(
+        'div',
+        'board-owner__meta lbl',
+        `${formatTs(item.ts)} · owner decision owed${item.detail !== null && item.detail !== '' ? ` — ${item.detail}` : ''}`,
+      ),
+      el('div', 'lbl board-owner__consequence', row.consequence),
+    );
+    const review = document.createElement('details');
+    review.className = 'board-owner__review';
+    const summary = document.createElement('summary');
+    summary.textContent = 'Review changes';
+    const body = el('div', 'board-owner__review-body lbl', 'loading…');
+    review.append(summary, body);
+    let loaded: Promise<LessonProposalView> | null = null;
+    const load = (): Promise<LessonProposalView> => {
+      if (loaded !== null) return loaded;
+      const client = this.boardClient;
+      const pending: Promise<LessonProposalView> =
+        client === null
+          ? Promise.reject(new Error('board is not connected'))
+          : client.getLessonProposal().then((proposal) => {
+            if (proposal.notificationId !== item.id) {
+              throw new Error('this notice belongs to an older proposal — the next snapshot retires it');
+            }
+            return proposal;
+          });
+      loaded = pending.then(
+        (proposal) => {
+          body.replaceChildren(renderProposalReview(proposal));
+          return proposal;
+        },
+        (error: unknown) => {
+          loaded = null; // a later open/decision retries the fetch
+          body.replaceChildren(
+            el('div', 'lbl', `could not load the proposal: ${error instanceof Error ? error.message : String(error)}`),
+          );
+          throw error;
+        },
+      );
+      return loaded;
+    };
+    review.addEventListener('toggle', () => {
+      if (review.open) void load().catch(() => {});
+    });
+    const actions = el('div', 'board-owner__actions');
+    const accept = document.createElement('button');
+    accept.type = 'button';
+    accept.className = 'board-owner__ack board-owner__accept';
+    accept.textContent = 'Accept';
+    accept.dataset.actionId = row.actionId;
+    const reject = document.createElement('button');
+    reject.type = 'button';
+    reject.className = 'board-owner__ack board-owner__reject';
+    reject.textContent = 'Reject';
+    const decide = (decision: 'accept' | 'reject', control: HTMLButtonElement, label: string): void => {
+      accept.disabled = true;
+      reject.disabled = true;
+      control.textContent = decision === 'accept' ? 'accepting…' : 'rejecting…';
+      void load()
+        .then((proposal) => this.boardClient!.decideLessonProposal(proposal.id, decision))
+        .then(() => {
+          /* Success is NOT completion — the row closes only when the
+           * authoritative snapshot carries the resolution (any device). */
+        })
+        .catch(() => {
+          accept.disabled = false;
+          reject.disabled = false;
+          control.textContent = label;
+        });
+    };
+    accept.addEventListener('click', () => decide('accept', accept, 'Accept'));
+    reject.addEventListener('click', () => decide('reject', reject, 'Reject'));
+    actions.append(accept, reject);
+    node.append(review, actions);
     if (bandVisible) this.sendShown(item, 'web-board');
     return node;
   }
@@ -1620,7 +1713,13 @@ export class BoardView {
       forYou.append(el('div', 'board-notification-section__empty lbl', 'nothing needs you'));
     } else {
       for (const row of ownerRowsForBell) {
-        forYou.append(row.kind === 'ack' ? this.notificationRow(row.notification) : this.ownerPrRow(row));
+        forYou.append(
+          row.kind === 'ack'
+            ? this.notificationRow(row.notification)
+            : row.kind === 'proposal'
+              ? this.ownerProposalRow(row, false)
+              : this.ownerPrRow(row),
+        );
       }
     }
     list.append(forYou);
@@ -1716,7 +1815,14 @@ export class BoardView {
     // Gru records a machine disposition through the authenticated API
     // after acting; a human click must not silently clear NEEDS GRU.
     // A closed receipt is machine-attention history: same rule, no Ack.
-    if (item.routing !== 'action-required' && item.ackedAt === null && item.resolvedAt === null) {
+    // A lesson proposal closes only through Accept/Reject (its own row);
+    // the server refuses a plain ack for it.
+    if (
+      item.routing !== 'action-required' &&
+      item.kind !== LESSONS_PROPOSAL_KIND &&
+      item.ackedAt === null &&
+      item.resolvedAt === null
+    ) {
       const ack = document.createElement('button');
       ack.type = 'button';
       ack.className = 'board-notification__ack';
@@ -1987,4 +2093,49 @@ function formatTs(iso: string): string {
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return iso;
   return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+/** The owner's review of a lesson proposal: every new and changed lesson
+ * with its exact text (the prior text one click away), per chapter. */
+function renderProposalReview(proposal: LessonProposalView): HTMLElement {
+  const root = el('div', 'board-owner__review-list');
+  root.append(
+    el(
+      'div',
+      'lbl',
+      `distilled from ${proposal.entries} journal entr${proposal.entries === 1 ? 'y' : 'ies'} (through #${proposal.throughSeq})`,
+    ),
+  );
+  if (proposal.chapters.length === 0) root.append(el('div', 'lbl', 'no chapter changes'));
+  for (const chapter of proposal.chapters) {
+    const section = el('section', 'board-owner__review-chapter');
+    section.append(
+      el('div', 'board-owner__review-heading', chapter.retired ? `${chapter.title} — chapter retired` : chapter.title),
+    );
+    for (const lesson of chapter.added) section.append(reviewLesson('new', lesson));
+    for (const lesson of chapter.changed) section.append(reviewLesson(`updated · recurred ${lesson.recurred}`, lesson));
+    const notes: string[] = [];
+    if (chapter.provenanceTrimmed > 0) notes.push(`${chapter.provenanceTrimmed} oldest journal handle(s) released to fit`);
+    if (chapter.bodiesTrimmed > 0) notes.push(`${chapter.bodiesTrimmed} lesson(s) trimmed to fit`);
+    if (chapter.lessonsDropped > 0) notes.push(`${chapter.lessonsDropped} lesson(s) dropped to fit`);
+    if (notes.length > 0) section.append(el('div', 'lbl', notes.join(' · ')));
+    root.append(section);
+  }
+  return root;
+}
+
+function reviewLesson(label: string, lesson: LessonChangeView): HTMLElement {
+  const node = el('div', 'board-owner__review-lesson');
+  node.append(
+    el('div', 'lbl board-owner__review-label', `${label} · ${lesson.slug}`),
+    el('div', 'board-owner__review-text', lesson.body),
+  );
+  if (lesson.previousBody !== null) {
+    const before = document.createElement('details');
+    const toggle = document.createElement('summary');
+    toggle.textContent = 'before';
+    before.append(toggle, el('div', 'board-owner__review-text board-owner__review-text--before', lesson.previousBody));
+    node.append(before);
+  }
+  return node;
 }

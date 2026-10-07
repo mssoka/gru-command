@@ -275,6 +275,39 @@ export interface OwnerPrView {
   readonly checkedAt: string;
 }
 
+/** The For You notification kind for a Book of Lessons proposal (owner
+ * decision 2026-10-07): nothing is written until the owner accepts. */
+export const LESSONS_PROPOSAL_KIND = 'lessons.proposal';
+
+/** One lesson as the owner reviews it (previousBody null = new lesson). */
+export interface LessonChangeView {
+  readonly slug: string;
+  readonly body: string;
+  readonly recurred: number;
+  readonly previousBody: string | null;
+}
+
+export interface LessonChapterChangeView {
+  readonly slug: string;
+  readonly title: string;
+  readonly retired: boolean;
+  readonly added: readonly LessonChangeView[];
+  readonly changed: readonly LessonChangeView[];
+  readonly provenanceTrimmed: number;
+  readonly bodiesTrimmed: number;
+  readonly lessonsDropped: number;
+}
+
+/** GET /api/lessons/proposal — the pending proposal's review payload. */
+export interface LessonProposalView {
+  readonly id: string;
+  readonly createdAt: string;
+  readonly notificationId: string | null;
+  readonly entries: number;
+  readonly throughSeq: number;
+  readonly chapters: readonly LessonChapterChangeView[];
+}
+
 /** Durable pipeline queue (owner approvals j-239/j-1064): one active
  * entry as the SERVER evaluated it — waiting/ready/admitting/failed
  * with the exact wait reason. Admitted/cancelled entries are excluded
@@ -521,6 +554,38 @@ function str(value: unknown): string {
 
 function nstr(value: unknown): string | null {
   return typeof value === 'string' ? value : null;
+}
+
+function isCount(value: unknown): boolean {
+  return Number.isSafeInteger(value) && Number(value) >= 0;
+}
+
+function isLessonChange(value: unknown, added: boolean): boolean {
+  return isRecord(value) &&
+    typeof value.slug === 'string' &&
+    typeof value.body === 'string' &&
+    isCount(value.recurred) &&
+    (added ? value.previousBody === null : typeof value.previousBody === 'string');
+}
+
+export function isValidLessonProposal(value: unknown): value is LessonProposalView {
+  return isRecord(value) &&
+    typeof value.id === 'string' && value.id !== '' &&
+    typeof value.createdAt === 'string' &&
+    (value.notificationId === null || typeof value.notificationId === 'string') &&
+    isCount(value.entries) &&
+    isCount(value.throughSeq) &&
+    Array.isArray(value.chapters) &&
+    value.chapters.every((chapter: unknown) =>
+      isRecord(chapter) &&
+      typeof chapter.slug === 'string' &&
+      typeof chapter.title === 'string' &&
+      typeof chapter.retired === 'boolean' &&
+      Array.isArray(chapter.added) && chapter.added.every((lesson: unknown) => isLessonChange(lesson, true)) &&
+      Array.isArray(chapter.changed) && chapter.changed.every((lesson: unknown) => isLessonChange(lesson, false)) &&
+      isCount(chapter.provenanceTrimmed) &&
+      isCount(chapter.bodiesTrimmed) &&
+      isCount(chapter.lessonsDropped));
 }
 
 export function isValidDecisionStatus(value: unknown): value is DecisionStatusView {

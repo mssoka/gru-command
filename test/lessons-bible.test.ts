@@ -856,3 +856,52 @@ describe('second review round of #253 (bmad-code-review, 2026-10-07)', () => {
     expect(readFileSync(join(home, 'bible', 'chapters', 'ops.md'), 'utf-8')).toBe(chapter);
   });
 });
+
+describe('plan, then apply only onto the planned book (owner decision 2026-10-07)', () => {
+  it('planUpdates writes nothing and describes exactly what Accept would change', () => {
+    const bible = tmpBible();
+    bible.ensureSeeded();
+    bible.applyUpdates([proposal()], PROVENANCE);
+    const index = bible.readIndexText();
+    const chapter = readFileSync(join(bible.dir, 'chapters', 'ops-restarts.md'), 'utf-8');
+    const plan = bible.planUpdates(
+      [
+        proposal({
+          lessons: [
+            { slug: 'shell-hang', body: 'A live shell holds the session open; close it first.', journalIds: ['j-2'] },
+            { slug: 'new-lesson', body: 'Something new to keep.', journalIds: ['j-3'] },
+          ],
+        }),
+      ],
+      PROVENANCE,
+    );
+    expect(bible.readIndexText()).toBe(index);
+    expect(readFileSync(join(bible.dir, 'chapters', 'ops-restarts.md'), 'utf-8')).toBe(chapter);
+    expect(plan.base).not.toBe(plan.after);
+    expect(plan.changes).toEqual([
+      expect.objectContaining({
+        slug: 'ops-restarts',
+        added: [{ slug: 'new-lesson', body: 'Something new to keep.', recurred: 1, previousBody: null }],
+        changed: [
+          expect.objectContaining({ slug: 'shell-hang', recurred: 2, body: 'A live shell holds the session open; close it first.' }),
+        ],
+      }),
+    ]);
+    expect(plan.report).toMatchObject({ chaptersWritten: 1, lessonsAdded: 1, lessonsMerged: 1 });
+  });
+
+  it('applyPlan refuses a book that moved since planning, and is a no-op once applied', () => {
+    const bible = tmpBible();
+    bible.ensureSeeded();
+    const plan = bible.planUpdates([proposal()], PROVENANCE);
+    writeFileSync(join(bible.dir, 'INDEX.md'), `${bible.readIndexText() ?? ''}\n`);
+    expect(() => bible.applyPlan(plan)).toThrowError(expect.objectContaining({ name: 'ProposalError', code: 'stale' }));
+    expect(bible.readChapter('ops-restarts')).toBeNull();
+
+    const fresh = bible.planUpdates([proposal()], PROVENANCE);
+    bible.applyPlan(fresh);
+    const written = readFileSync(join(bible.dir, 'chapters', 'ops-restarts.md'), 'utf-8');
+    expect(bible.applyPlan(fresh)).toEqual(fresh.report);
+    expect(readFileSync(join(bible.dir, 'chapters', 'ops-restarts.md'), 'utf-8')).toBe(written);
+  });
+});
