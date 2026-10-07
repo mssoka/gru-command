@@ -75,9 +75,10 @@ export class RepoOverviewPanel {
       this.lastScrollTop = previousScroll;
     }
     const active = document.activeElement;
+    const hadFocus = active instanceof HTMLElement && this.mount.contains(active);
     let focusKey: string | null = null;
     let focusIndex = 0;
-    if (active instanceof HTMLElement && this.mount.contains(active) && active.dataset.focusKey !== undefined) {
+    if (hadFocus && active.dataset.focusKey !== undefined) {
       focusKey = active.dataset.focusKey;
       focusIndex = Math.max(
         0,
@@ -88,8 +89,8 @@ export class RepoOverviewPanel {
     if (view === null || view === undefined) {
       // The section is going away (feature off / pre-upgrade): hand
       // keyboard focus back to the CREW tab that owns it rather than
-      // dropping it to <body>.
-      if (focusKey !== null) document.getElementById('rail-tab-agents')?.focus();
+      // dropping it to <body> — including when the module itself held it.
+      if (hadFocus) document.getElementById('rail-tab-agents')?.focus();
       return;
     }
     const head = el('div', 'repo-overview__head');
@@ -189,7 +190,11 @@ export class RepoOverviewPanel {
     const count = el('strong', 'repo-row__metric-count', value === null ? '—' : String(value));
     count.title = value === null ? `${title}: not proven` : `${value} ${title}`;
     const caption = el('span', 'repo-row__metric-label', label);
-    if (subLabel !== undefined) caption.append(el('em', 'repo-row__metric-sub', subLabel));
+    if (subLabel !== undefined) {
+      // A separator keeps copied/serialized text readable ("OPEN issues
+      // excl. PRs"); the sub-label still stacks visually.
+      caption.append(document.createTextNode(' '), el('em', 'repo-row__metric-sub', subLabel));
+    }
     metric.append(count, caption);
     return metric;
   }
@@ -200,8 +205,8 @@ export class RepoOverviewPanel {
     const ciNode = el('span', 'repo-row__ci');
     ciNode.append(el('b', 'repo-row__ci-label', 'CI: '));
     const href = safeHref(ci.url, row.host);
-    if (href !== null && ci.workflow !== null) {
-      const workflow = el('a', 'repo-row__ci-link', ci.workflow);
+    if (href !== null) {
+      const workflow = el('a', 'repo-row__ci-link', ci.label);
       workflow.href = href;
       workflow.target = '_blank';
       workflow.rel = 'noopener noreferrer';

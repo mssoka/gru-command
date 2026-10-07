@@ -204,7 +204,7 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   Actions run on the repository's discovered default branch as
   `workflow · branch` plus a status badge (passed/failed/timed-out/
   startup-failure/cancelled/skipped/neutral/action-required/stale-run/
-  running/queued/no-workflow/no-runs/no-branch/unknown; Actions-disabled
+  running/queued/no-workflow/never-run/no-branch/unknown; Actions-disabled
   rows read unavailable — text and glyph, never colour alone) with a
   safe run link and the checked age. This is default-branch CI context,
   never deployment health, aggregate CI or merge readiness. The server

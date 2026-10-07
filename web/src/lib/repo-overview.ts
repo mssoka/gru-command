@@ -97,13 +97,15 @@ export function repoCiView(row: RepoOverviewRowView): RepoCiView {
   const run = row.run;
   if (!row.linked || run === null) return { label: '—', workflow: null, url: null, branch: null };
   const noWorkflow = run.state === 'no-workflow';
+  const hasUrl = run.url !== null && !noWorkflow;
   return {
-    // No workflow name from the provider is disclosed as a dash — never a
-    // fabricated "workflow" label on a row whose contract is "missing is
-    // never manufactured".
-    label: noWorkflow ? 'none' : (run.workflow ?? '—'),
+    // A missing workflow name is never fabricated; when a validated run
+    // URL exists the link is still offered under a run-number label.
+    label: noWorkflow
+      ? 'none'
+      : (run.workflow ?? (hasUrl ? (run.runNumber !== null ? `run #${run.runNumber}` : 'run') : '—')),
     workflow: noWorkflow ? null : run.workflow,
-    url: run.url !== null && run.workflow !== null && !noWorkflow ? run.url : null,
+    url: hasUrl ? run.url : null,
     branch: run.branch,
   };
 }

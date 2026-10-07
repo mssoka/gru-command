@@ -115,7 +115,14 @@ function overview(): RepoOverviewView {
         error: 'HTTP 403: Resource not accessible by personal access token',
       }),
       row({ key: 'demo-scripts', displayName: 'demo-scripts', openPrs: 3, openIssues: 1, run: run({ state: 'cancelled', conclusion: 'cancelled' }) }),
-      row({ key: 'demo-sandbox', displayName: 'demo-sandbox', openPrs: 0, openIssues: 2, run: run({ state: 'no-workflow', workflow: null, url: null }) }),
+      row({
+        key: 'demo-sandbox',
+        displayName: 'demo-sandbox',
+        openPrs: 0,
+        openIssues: 2,
+        // The exact server absence shape: no provider strings at all.
+        run: run({ state: 'no-workflow', status: null, conclusion: null, workflow: null, url: null }),
+      }),
       row({ key: 'demo-lab', displayName: 'demo-lab', linked: false, host: null, link: null, linkReason: 'non-GitHub remote', fullName: null, openPrs: null, openIssues: null, run: null, freshness: 'unchecked', checkedAt: null, lastAttemptAt: null }),
       row({ key: 'demo-lab-2', displayName: 'demo-lab-2', linked: false, host: null, link: null, linkReason: 'no usable origin remote', fullName: null, openPrs: null, openIssues: null, run: null, freshness: 'unchecked', checkedAt: null, lastAttemptAt: null }),
       row({
@@ -125,7 +132,13 @@ function overview(): RepoOverviewView {
         openIssues: 340,
         run: run({ workflow: 'nightly-release-verification-and-cross-platform-packaging', url: 'https://github.com/example/demo-long/actions/runs/777' }),
       }),
-      row({ key: 'demo-never-run', displayName: 'demo-never-run', openPrs: 0, openIssues: 0, run: run({ state: 'never-run', workflow: null, url: null }) }),
+      row({
+        key: 'demo-never-run',
+        displayName: 'demo-never-run',
+        openPrs: 0,
+        openIssues: 0,
+        run: run({ state: 'never-run', status: null, conclusion: null, workflow: null, url: null }),
+      }),
     ],
   };
 }
@@ -265,7 +278,10 @@ test('compact rows: states, exact counts, safe links, light/dark desktop and nar
   const workBg = await badgeBg(0);
   const alertBg = await badgeBg(1);
   const doneBg = await badgeBg(2);
-  expect(new Set([workBg, alertBg, doneBg]).size, `${workBg} / ${alertBg} / ${doneBg}`).toBe(3);
+  // The park tone carries every overlay badge (NOT LINKED / STALE / …):
+  // it must render distinctly too, or the whole overlay class is unstyled.
+  const parkBg = await badgeBg(4);
+  expect(new Set([workBg, alertBg, doneBg, parkBg]).size, `${workBg} / ${alertBg} / ${doneBg} / ${parkBg}`).toBe(4);
   expect(doneBg).not.toBe('rgba(0, 0, 0, 0)');
 
   // Exact counts, including a real zero and an unknown (never a fake 0).

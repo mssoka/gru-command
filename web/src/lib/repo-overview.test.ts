@@ -147,11 +147,19 @@ describe('managed repository overview — meta and notes', () => {
       url: null,
       branch: 'main',
     });
-    // A missing workflow name is a dash, never a fabricated "workflow".
+    // A missing workflow name is never fabricated; with a validated run
+    // URL the link is offered under a run-number label, without one it is
+    // a dash.
     expect(repoCiView(row({ run: { ...row().run!, workflow: null, url: null } }))).toEqual({
       label: '—',
       workflow: null,
       url: null,
+      branch: 'main',
+    });
+    expect(repoCiView(row({ run: { ...row().run!, workflow: null } }))).toEqual({
+      label: 'run #12',
+      workflow: null,
+      url: 'https://github.com/acme/alpha/actions/runs/12',
       branch: 'main',
     });
     expect(

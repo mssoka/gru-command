@@ -897,7 +897,9 @@ function isRepoOverviewRowView(value: unknown): value is RepoOverviewRowView {
       value.host === null &&
       value.openPrs === null &&
       value.openIssues === null &&
-      value.run === null
+      value.run === null &&
+      // The server always emits an unlinked row as never-observed.
+      value.freshness === 'unchecked'
     );
   }
   if (value.link === null || value.linkReason !== null || value.host === null) return false;

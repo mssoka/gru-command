@@ -467,13 +467,19 @@ describe('board server-frame validator', () => {
       { ...row, freshness: 'unavailable', checkedAt: null, run: null, error: 'HTTP 500' },
       { ...row, freshness: 'unavailable', checkedAt: null, openPrs: null, openIssues: null, run, error: 'HTTP 500' },
       { ...row, freshness: 'fresh', lastAttemptAt: null },
+      { ...row, freshness: 'stale', lastAttemptAt: null },
       { ...row, freshness: 'unavailable', checkedAt: null, run: null, error: 'HTTP 500', lastAttemptAt: null },
+      // Only the attempt-stamp guard rejects this one (counts/run/error
+      // are all coherent).
+      { ...row, freshness: 'unavailable', checkedAt: null, openPrs: null, openIssues: null, run: null, error: 'HTTP 500', lastAttemptAt: null },
       { ...row, linkReason: '' },
       { ...row, error: '' },
       { ...unlinked, openPrs: 2 },
       { ...unlinked, run },
       // unchecked must not carry observed data (only the data guard rejects).
       { ...row, freshness: 'unchecked', checkedAt: null, lastAttemptAt: null, run: null, error: null, openPrs: 2 },
+      // An unlinked row is always never-observed.
+      { ...unlinked, freshness: 'unavailable', error: 'HTTP 500', lastAttemptAt: '2026-01-01T00:06:00.000Z' },
     ]) {
       expect(
         isValidSnapshot({ ...snapshot(), repoOverview: { rows: [broken] } } as unknown),

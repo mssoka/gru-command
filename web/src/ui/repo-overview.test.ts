@@ -97,7 +97,7 @@ describe('managed repository overview panel', () => {
     expect(counts).toEqual(['2', '3']);
     expect([...article.querySelectorAll('.repo-row__metric-label')].map((node) => node.textContent)).toEqual([
       'OPEN PRs',
-      'OPEN issuesexcl. PRs',
+      'OPEN issues excl. PRs',
     ]);
     const ciLink = article.querySelector<HTMLAnchorElement>('.repo-row__ci-link')!;
     expect(ciLink.textContent).toBe('checks');
@@ -292,5 +292,22 @@ describe('managed repository overview panel', () => {
     mount.querySelector<HTMLAnchorElement>('a.repo-row__name')!.focus();
     view.render(null);
     expect(document.activeElement).toBe(tab);
+
+    // The module itself can own focus (nearest-survivor fallback); that
+    // case must hand back too.
+    tab.blur();
+    view.render({ rows: [row()] });
+    mount.focus();
+    expect(document.activeElement).toBe(mount);
+    view.render(null);
+    expect(document.activeElement).toBe(tab);
+  });
+
+  it('links an unnamed workflow run under its run-number label', () => {
+    const { mount, view } = panel();
+    view.render({ rows: [row({ run: { ...row().run!, workflow: null } })] });
+    const link = mount.querySelector<HTMLAnchorElement>('.repo-row__ci-link');
+    expect(link?.textContent).toBe('run #12');
+    expect(link?.href).toBe('https://github.com/acme/alpha/actions/runs/12');
   });
 });

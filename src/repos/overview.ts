@@ -212,10 +212,6 @@ function strOrNull(value: unknown): string | null {
   return typeof value === 'string' && value !== '' ? value : null;
 }
 
-function numOrNull(value: unknown): number | null {
-  return typeof value === 'number' && Number.isFinite(value) ? value : null;
-}
-
 function countOrNull(value: unknown): number | null {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
@@ -350,7 +346,9 @@ export function safeDisplayName(name: string): string {
  * host/segments cannot form a safe link (not-linked, never guessed). */
 export function githubRepoLink(ref: RepoRef): string | null {
   if (!isGitHubRemote(ref.host)) return null;
-  if (!SAFE_HOST.test(ref.host) || !/^[A-Za-z0-9].*[A-Za-z0-9]$/.test(ref.host)) return null;
+  if (!SAFE_HOST.test(ref.host) || !/^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$/.test(ref.host)) return null;
+  // No empty label, anywhere: `foo..github` must stay unlinked.
+  if (ref.host.includes('..')) return null;
   if (!SAFE_REMOTE_SEGMENT.test(ref.owner) || !SAFE_REMOTE_SEGMENT.test(ref.repo)) return null;
   if (ref.owner === '.' || ref.owner === '..' || ref.repo === '.' || ref.repo === '..') return null;
   let url: URL;
@@ -462,7 +460,7 @@ function mapRun(value: unknown): RepoOverviewRunRaw | null {
   const raw = record(value);
   if (raw === null) return null;
   return {
-    id: numOrNull(raw['id']),
+    id: countOrNull(raw['id']),
     name: strOrNull(raw['name']),
     status: strOrNull(raw['status']),
     conclusion: strOrNull(raw['conclusion']),
@@ -490,9 +488,9 @@ export class GhRepoOverviewApi implements RepoOverviewApiPort {
     // repository; any OTHER type is a malformed response and fails loud
     // instead of manufacturing the empty state.
     const branch = raw['default_branch'];
-    if (branch === undefined || branch === null || branch === '') return { defaultBranch: null };
-    if (typeof branch !== 'string') {
-      throw new GhApiError(`${label}: default_branch must be a string (got ${typeof branch})`);
+    if (branch === undefined || branch === null) return { defaultBranch: null };
+    if (typeof branch !== 'string' || branch === '') {
+      throw new GhApiError(`${label}: default_branch must be a non-empty string (got ${JSON.stringify(branch)})`);
     }
     return { defaultBranch: branch };
   }
@@ -691,12 +689,13 @@ export interface ManagedRepoOverviewOptions {
 interface ObserveOutcome {
   /** Fatal global condition (rate limit/auth) — stop the refresh. */
   readonly aborted: boolean;
-  /** Budget ran out before a complete observation — nothing was recorded
-   * and rotation advances past this repository so no single entry can
-   * starve the rest of the registry. */
+  /** Budget (call count or wall clock) ran out before a complete
+   * observation — nothing was recorded and rotation advances past this
+   * repository so no single entry can starve the rest of the registry. */
   readonly retry: boolean;
-  /** The classified failure detail when the pass aborts (null otherwise),
-   * disclosed on the repositories the abort left unchecked. */
+  /** The abort/failure detail: the classified failure when the pass
+   * aborts fatally, the exhausted budget's own message on `retry`, and
+   * null otherwise. */
   readonly detail: string | null;
 }
 
@@ -827,7 +826,10 @@ export class ManagedRepoOverviewTracker {
     // mount can never starve the tail of the registry forever.
     const classifyStart = repos.length === 0 ? 0 : this.classifyCursor % repos.length;
     const classifyOrder = [...repos.slice(classifyStart), ...repos.slice(0, classifyStart)];
-    let classified = 0;
+    // Advances by ATTEMPTED resolutions (successes AND failures), so a
+    // prefix of slow-failing origins also rotates away and can never pin
+    // the cursor to the same index every pass.
+    let attemptedResolutions = 0;
     for (const name of classifyOrder) {
       const previous = this.states.get(name);
       const base = previous ?? emptySourceState();
@@ -859,8 +861,9 @@ export class ManagedRepoOverviewTracker {
       let resolved: RepoRef | null;
       try {
         resolved = await this.resolveRemote(join(this.opts.workspaceRoot, name));
-        classified += 1;
+        attemptedResolutions += 1;
       } catch (error) {
+        attemptedResolutions += 1;
         this.log('warn', 'repo overview: origin resolution failed — keeping the previous classification', {
           repo: name,
           error: messageOf(error).slice(0, 300),
@@ -892,7 +895,7 @@ export class ManagedRepoOverviewTracker {
         }
       }
     }
-    this.classifyCursor = repos.length === 0 ? 0 : (classifyStart + classified) % repos.length;
+    this.classifyCursor = repos.length === 0 ? 0 : (classifyStart + attemptedResolutions) % repos.length;
     this.registry = repos.filter((name) => nextStates.has(name));
     this.states.clear();
     for (const [name, state] of nextStates) this.states.set(name, state);
@@ -908,8 +911,11 @@ export class ManagedRepoOverviewTracker {
     // classification keeps the section hidden (null), never a half-built
     // view.
     this.refreshedOnce = true;
-    const budget = { used: 0, limit: this.maxCallsPerRefresh };
-    const fetchDeadline = this.now() + REPO_OVERVIEW_FETCH_BUDGET_MS;
+    const budget = {
+      used: 0,
+      limit: this.maxCallsPerRefresh,
+      deadlineMs: this.now() + REPO_OVERVIEW_FETCH_BUDGET_MS,
+    };
     let nextIndex = 0;
     let failures = 0;
     let aborted: string | null = null;
@@ -920,7 +926,7 @@ export class ManagedRepoOverviewTracker {
         nextIndex = index;
         break;
       }
-      if (this.now() > fetchDeadline) {
+      if (this.now() > budget.deadlineMs) {
         aborted = 'deadline';
         nextIndex = index;
         break;
@@ -928,9 +934,10 @@ export class ManagedRepoOverviewTracker {
       const outcome = await this.observe(fetchable[index] as string, budget);
       if (outcome.retry) {
         // A partial observation is discarded and rotation moves on: a
-        // budget smaller than one observation must degrade fairly across
-        // the registry, never re-spend every cycle on the same entry.
-        aborted = 'budget';
+        // budget smaller than one observation (or a call outliving the
+        // wall-clock bound) must degrade fairly across the registry,
+        // never re-spend every cycle on the same entry.
+        aborted = outcome.detail !== null && outcome.detail.includes('wall-clock') ? 'deadline' : 'budget';
         nextIndex = index + 1;
         break;
       }
@@ -977,9 +984,14 @@ export class ManagedRepoOverviewTracker {
   /** Observe one repository atomically: every call must succeed for the
    * observation to count (Actions-permanently-unavailable is a state).
    * Attempt timestamps are written at COMPLETION only, so a view taken
-   * while a fetch is in flight never claims the row failed or aged.
+   * while a fetch is in flight never claims the row failed or aged. The
+   * fetch wall-clock budget is enforced per CALL, so one stalled
+   * observation cannot run far past the pass bound.
    */
-  private async observe(name: string, budget: { used: number; limit: number }): Promise<ObserveOutcome> {
+  private async observe(
+    name: string,
+    budget: { used: number; limit: number; deadlineMs: number },
+  ): Promise<ObserveOutcome> {
     const state = this.states.get(name) as RepoSourceState;
     const ref = state.ref as RepoRef;
     try {
@@ -1054,11 +1066,14 @@ export class ManagedRepoOverviewTracker {
     } catch (error) {
       if (error instanceof GhBudgetExceededError) {
         // Not a failure: nothing was observed and nothing is recorded.
-        return { aborted: true, retry: true, detail: null };
+        return { aborted: true, retry: true, detail: error.message };
       }
       const kind = classifyGhError(error);
       state.lastAttemptAt = new Date(this.now()).toISOString();
-      state.error = messageOf(error).slice(0, 300);
+      // A thrown error with an empty message must never become an empty
+      // disclosure string (the web validator rejects it and drops the
+      // whole board snapshot).
+      state.error = (messageOf(error).trim() || 'observation failed without a message').slice(0, 300);
       this.log('warn', 'repo overview: repository observation failed', {
         repo: name,
         kind,
@@ -1072,7 +1087,7 @@ export class ManagedRepoOverviewTracker {
   /** Spend one Search call, paced to GitHub's sustained search quota (a
    * self-inflicted 403 would abort the pass mid-registry). */
   private async spendSearch<T>(
-    budget: { used: number; limit: number },
+    budget: { used: number; limit: number; deadlineMs?: number },
     work: () => Promise<T>,
   ): Promise<T> {
     return this.spend(budget, async () => {
@@ -1086,11 +1101,14 @@ export class ManagedRepoOverviewTracker {
   }
 
   private async spend<T>(
-    budget: { used: number; limit: number },
+    budget: { used: number; limit: number; deadlineMs?: number },
     work: () => Promise<T>,
   ): Promise<T> {
     if (budget.used >= budget.limit) {
       throw new GhBudgetExceededError('repo overview call budget exceeded');
+    }
+    if (budget.deadlineMs !== undefined && this.now() > budget.deadlineMs) {
+      throw new GhBudgetExceededError('repo overview fetch wall-clock budget exceeded');
     }
     budget.used += 1;
     return work();

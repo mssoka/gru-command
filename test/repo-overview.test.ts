@@ -598,6 +598,7 @@ describe('managed repo overview — pure helpers', () => {
     expect(githubRepoLink({ host: 'github.com', owner: '..', repo: 'alpha' })).toBeNull();
     // The client validator's safe-host contract is enforced here too.
     expect(githubRepoLink({ host: 'foo_bar.github', owner: 'acme', repo: 'alpha' })).toBeNull();
+    expect(githubRepoLink({ host: 'foo..bar.github', owner: 'acme', repo: 'alpha' })).toBeNull();
     expect(githubRepoLink({ host: '..', owner: 'acme', repo: 'alpha' })).toBeNull();
     expect(githubRepoLink({ host: '.github', owner: 'acme', repo: 'alpha' })).toBeNull();
     expect(githubRepoLink({ host: 'github.com.', owner: 'acme', repo: 'alpha' })).toBeNull();
@@ -776,6 +777,8 @@ describe('managed repo overview — gh adapter', () => {
     await expect(badWorkflowTotal.countWorkflows({ repo: githubRef('alpha') })).rejects.toThrow(/total_count/);
     const nonStringBranch = new GhRepoOverviewApi(ghRunner([ok(JSON.stringify({ default_branch: 123 }))]).runner);
     await expect(nonStringBranch.fetchRepo({ repo: githubRef('alpha') })).rejects.toThrow(/default_branch/);
+    const emptyBranch = new GhRepoOverviewApi(ghRunner([ok(JSON.stringify({ default_branch: '' }))]).runner);
+    await expect(emptyBranch.fetchRepo({ repo: githubRef('alpha') })).rejects.toThrow(/default_branch/);
     const badJson = new GhRepoOverviewApi(ghRunner([ok('not-json')]).runner);
     await expect(badJson.fetchRepo({ repo: githubRef('alpha') })).rejects.toThrow(/invalid JSON/);
   });
@@ -933,6 +936,14 @@ describe('managed repo overview tracker — review-round guarantees', () => {
     expect(result.value[0]?.runNumber).toBeNull();
     expect(result.value[0]?.createdAt).toBeNull();
     expect(result.value[0]?.updatedAt).toBeNull();
+    // A malformed run id never participates in the newest-run tie-break.
+    expect(result.value[0]?.id).toBe(7);
+    const badId = new GhRepoOverviewApi(
+      ghRunner([ok(JSON.stringify({ workflow_runs: [{ id: -2, status: 'completed', conclusion: 'success' }] }))]).runner,
+    );
+    const badIdResult = await badId.latestRuns({ repo: githubRef('alpha'), branch: 'main', limit: 3 });
+    if (badIdResult.kind !== 'ok') throw new Error('expected ok');
+    expect(badIdResult.value[0]?.id).toBeNull();
     expect(result.value[1]?.runNumber).toBeNull();
     expect(result.value[1]?.createdAt).toBe('2026-10-07T10:00:00.000Z');
     expect(result.value[1]?.updatedAt).toBe('2026-10-07T10:05:00.000Z');
@@ -1219,16 +1230,59 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
     expect(row(third, 'beta').linked).toBe(true);
   });
 
-  it('defers the fetch remainder when the provider stalls past the fetch wall-clock budget', async () => {
+  it('rotates the classification start when leading resolutions fail slowly', async () => {
+    const api = new FakeApi().set('alpha', {}).set('beta', {}).set('gamma', {});
+    const clock = { ms: T0 };
+    const attempted: string[] = [];
+    const tracker = new ManagedRepoOverviewTracker({
+      workspaceRoot: '/ws',
+      api,
+      scanRepos: () => ['alpha', 'beta', 'gamma'],
+      resolveRemote: async (repoPath) => {
+        attempted.push(repoPath.split('/').pop() as string);
+        clock.ms += REPO_OVERVIEW_RESOLVE_BUDGET_MS + 1;
+        throw new Error('git hung');
+      },
+      now: () => clock.ms,
+      sleep: async () => {},
+      log: () => {},
+    });
+    await tracker.refresh();
+    await tracker.refresh();
+    // Failures count as attempts: the second pass starts at beta instead
+    // of re-burning the budget on the same failing entry forever.
+    expect(attempted).toEqual(['alpha', 'beta']);
+    expect(row(tracker.view(), 'gamma').linkReason).toBe('origin remote could not be read yet');
+  });
+
+  it('never lets one stalled observation run past the fetch wall-clock budget', async () => {
     const h = harness({ names: ['alpha', 'beta'] });
     const original = h.api.fetchRepo.bind(h.api);
+    // The first call of the observation burns the whole pass budget; the
+    // per-call deadline then aborts the partial observation — nothing is
+    // recorded and the pass defers instead of stretching the cadence.
     h.api.fetchRepo = async (input) => {
+      const result = await original(input);
       h.clock.ms += REPO_OVERVIEW_FETCH_BUDGET_MS + 1;
-      return original(input);
+      return result;
+    };
+    const view = await h.tracker.refresh();
+    expect(row(view, 'alpha').freshness).toBe('unchecked');
+    expect(row(view, 'alpha').lastAttemptAt).toBeNull();
+    expect(row(view, 'beta').lastAttemptAt).toBeNull();
+    expect(h.failure).toContain('fetch wall-clock budget');
+  });
+
+  it('defers the remainder when the wall-clock budget is spent between completed observations', async () => {
+    const h = harness({ names: ['alpha', 'beta'] });
+    const original = h.api.latestRuns.bind(h.api);
+    h.api.latestRuns = async (input) => {
+      const result = await original(input);
+      h.clock.ms += REPO_OVERVIEW_FETCH_BUDGET_MS + 1;
+      return result;
     };
     const view = await h.tracker.refresh();
     expect(row(view, 'alpha').freshness).toBe('fresh');
-    expect(row(view, 'beta').lastAttemptAt).toBeNull();
     expect(row(view, 'beta').freshness).toBe('unchecked');
     expect(h.failure).toContain('fetch wall-clock budget');
   });
@@ -1249,5 +1303,15 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
     await tracker.refresh();
     clock.ms += 1_000;
     expect(row(tracker.view(), 'alpha').freshness).toBe('fresh');
+  });
+
+  it('never emits an empty error disclosure that would fail the web validator', async () => {
+    const api = new FakeApi().set('alpha', { errors: { fetchRepo: new Error('') } });
+    const h = harness({ api });
+    const view = await h.tracker.refresh();
+    const entry = row(view, 'alpha');
+    expect(entry.error).not.toBe('');
+    expect(entry.error).not.toBeNull();
+    expect(isValidSnapshot(validBoardSnapshot(view))).toBe(true);
   });
 });
