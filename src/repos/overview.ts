@@ -512,7 +512,9 @@ export class GhRepoOverviewApi implements RepoOverviewApiPort {
     if (total === null) {
       throw new GhApiError(`${label}: response carries no valid total_count`);
     }
-    if (raw?.['incomplete_results'] === true) {
+    // Fail closed: only an EXPLICIT boolean false proves the aggregate is
+    // complete. A missing or non-boolean flag cannot be read as exactness.
+    if (raw?.['incomplete_results'] !== false) {
       throw new GhApiError(`${label}: search results are incomplete (count not exact)`);
     }
     return total;
@@ -966,11 +968,13 @@ export class ManagedRepoOverviewTracker {
     if (aborted === 'budget') {
       this.log('warn', 'repo overview refresh: call budget exhausted — remaining repositories defer', {
         budget: this.maxCallsPerRefresh,
+        calls: budget.used,
         repos: repos.length,
       });
     } else if (aborted === 'deadline') {
       this.log('warn', 'repo overview refresh: fetch wall-clock budget spent — remaining repositories defer', {
         budgetMs: REPO_OVERVIEW_FETCH_BUDGET_MS,
+        calls: budget.used,
         repos: repos.length,
       });
     } else if (aborted === 'fatal') {
@@ -1084,19 +1088,30 @@ export class ManagedRepoOverviewTracker {
     }
   }
 
+  /** The ONE pre-call bounds guard shared by search and non-search calls:
+   * call-count limit first, then the fetch wall-clock deadline. Throwing
+   * before the caller consumes a budget unit keeps `used` an exact record
+   * of provider calls issued. */
+  private assertSpendable(budget: { used: number; limit: number; deadlineMs?: number }): void {
+    if (budget.used >= budget.limit) {
+      throw new GhBudgetExceededError('repo overview call budget exceeded');
+    }
+    if (budget.deadlineMs !== undefined && this.now() > budget.deadlineMs) {
+      throw new GhBudgetExceededError('repo overview fetch wall-clock budget exceeded');
+    }
+  }
+
   /** Spend one Search call, paced to GitHub's sustained search quota (a
    * self-inflicted 403 would abort the pass mid-registry). The wait is
    * clamped to one interval so a backward clock step can never turn
-   * pacing into an unbounded sleep; both bounds are checked BEFORE the
-   * call is issued and BEFORE a budget unit is consumed, so a deferred
-   * call is never booked as provider spend. */
+   * pacing into an unbounded sleep; both bounds are checked BEFORE and
+   * AFTER the wait, and the call/unit are only consumed once the call is
+   * actually issued. */
   private async spendSearch<T>(
     budget: { used: number; limit: number; deadlineMs?: number },
     work: () => Promise<T>,
   ): Promise<T> {
-    if (budget.used >= budget.limit) {
-      throw new GhBudgetExceededError('repo overview call budget exceeded');
-    }
+    this.assertSpendable(budget);
     if (this.lastSearchAtMs !== null) {
       const elapsed = this.now() - this.lastSearchAtMs;
       if (elapsed < REPO_OVERVIEW_SEARCH_MIN_INTERVAL_MS) {
@@ -1105,9 +1120,7 @@ export class ManagedRepoOverviewTracker {
         );
       }
     }
-    if (budget.deadlineMs !== undefined && this.now() > budget.deadlineMs) {
-      throw new GhBudgetExceededError('repo overview fetch wall-clock budget exceeded');
-    }
+    this.assertSpendable(budget);
     budget.used += 1;
     this.lastSearchAtMs = this.now();
     return work();
@@ -1117,12 +1130,7 @@ export class ManagedRepoOverviewTracker {
     budget: { used: number; limit: number; deadlineMs?: number },
     work: () => Promise<T>,
   ): Promise<T> {
-    if (budget.used >= budget.limit) {
-      throw new GhBudgetExceededError('repo overview call budget exceeded');
-    }
-    if (budget.deadlineMs !== undefined && this.now() > budget.deadlineMs) {
-      throw new GhBudgetExceededError('repo overview fetch wall-clock budget exceeded');
-    }
+    this.assertSpendable(budget);
     budget.used += 1;
     return work();
   }

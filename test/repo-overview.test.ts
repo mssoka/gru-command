@@ -131,6 +131,7 @@ interface Harness {
   readonly clock: { ms: number };
   readonly sleeps: number[];
   failure: string | null;
+  failureFields: Record<string, unknown> | null;
 }
 
 const T0 = Date.parse('2026-10-07T12:00:00.000Z');
@@ -160,6 +161,7 @@ function harness(options: {
     clock,
     sleeps,
     failure: null,
+    failureFields: null,
   };
   state.tracker = new ManagedRepoOverviewTracker({
     workspaceRoot: '/ws',
@@ -181,8 +183,11 @@ function harness(options: {
       sleeps.push(ms);
       state.clock.ms += ms;
     },
-    log: (level, msg) => {
-      if (level === 'warn') state.failure = msg;
+    log: (level, msg, fields) => {
+      if (level === 'warn') {
+        state.failure = msg;
+        state.failureFields = fields ?? null;
+      }
     },
   });
   return state;
@@ -763,6 +768,14 @@ describe('managed repo overview — gh adapter', () => {
       ghRunner([ok(JSON.stringify({ total_count: 3, incomplete_results: true }))]).runner,
     );
     await expect(api.countOpenPulls({ repo: githubRef('alpha') })).rejects.toThrow(/incomplete/);
+    // Only an explicit `false` proves exactness: a truthy non-boolean or a
+    // missing flag fails closed.
+    const truthyFlag = new GhRepoOverviewApi(
+      ghRunner([ok(JSON.stringify({ total_count: 3, incomplete_results: 1 }))]).runner,
+    );
+    await expect(truthyFlag.countOpenPulls({ repo: githubRef('alpha') })).rejects.toThrow(/incomplete/);
+    const missingFlag = new GhRepoOverviewApi(ghRunner([ok(JSON.stringify({ total_count: 3 }))]).runner);
+    await expect(missingFlag.countOpenPulls({ repo: githubRef('alpha') })).rejects.toThrow(/incomplete/);
   });
 
   it('fails loud on malformed provider shapes', async () => {
@@ -1381,5 +1394,44 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
       'fetchRepo:acme/beta',
       'countOpenPulls:acme/beta',
     ]);
+    // The deferred call also did NOT consume a budget unit: `calls` is the
+    // exact provider-call record (alpha 5 + beta fetch + beta pull = 7; a
+    // phantom-unit build books 8).
+    expect(h.failureFields?.calls).toBe(7);
+  });
+
+  it('fast-fails an already-crossed fetch deadline before any pacing wait', async () => {
+    const h = harness({ names: ['alpha', 'beta'] });
+    const original = h.api.fetchRepo.bind(h.api);
+    h.api.fetchRepo = async (input) => {
+      const result = await original(input);
+      if (input.repo.repo === 'beta') h.clock.ms = Number.POSITIVE_INFINITY;
+      return result;
+    };
+    const view = await h.tracker.refresh();
+    // Alpha's observation is intact (the jump only makes it age-stale).
+    expect(row(view, 'alpha').checkedAt).not.toBeNull();
+    // beta: fetch issued, then the FIRST search is refused with no wait.
+    expect(h.api.calls.filter((call) => call.endsWith('acme/beta'))).toEqual(['fetchRepo:acme/beta']);
+    // Exactly one pacing wait happened — alpha's second search. A build
+    // that sleeps before checking the deadline would add a second wait
+    // for beta's refused call.
+    expect(h.sleeps.length).toBe(1);
+    expect(h.failure).toContain('fetch wall-clock budget');
+  });
+
+  it('withholds a search call when the per-refresh call budget is already exhausted', async () => {
+    const api = new FakeApi().set('alpha', {}).set('beta', {});
+    const h = harness({ names: ['alpha', 'beta'], api, maxCallsPerRefresh: 7 });
+    const view = await h.tracker.refresh();
+    expect(row(view, 'alpha').freshness).toBe('fresh');
+    expect(row(view, 'beta').lastAttemptAt).toBeNull();
+    // alpha 5 + beta fetch + beta pull = 7; the next search is refused
+    // BEFORE it goes out (a guard-less build records the extra call).
+    expect(h.api.calls.filter((call) => call.endsWith('acme/beta'))).toEqual([
+      'fetchRepo:acme/beta',
+      'countOpenPulls:acme/beta',
+    ]);
+    expect(h.failure).toContain('budget exhausted');
   });
 });
