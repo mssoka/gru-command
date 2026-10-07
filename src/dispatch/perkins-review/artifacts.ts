@@ -626,32 +626,115 @@ export function sourceMovementSinceFreeze(review: FrozenReview, options?: Source
   }
 }
 
+/** A watch tick arriving this much later than scheduled means the process
+ * was suspended (system sleep) — the same evidence the supervisor's wake
+ * detector logs as "wall-clock gap detected". */
+const SUSPENSION_GAP_MS = 2_000;
+const SUSPENSION_TICK_MS = 250;
+
+/** Test seams for the admission probe; production uses the defaults. */
+export interface AdmissionProbeSeams {
+  /** Budget clock (default performance.now). */
+  readonly now?: () => number;
+  /** One bounded git invocation (default execFile, killed at timeoutMs). */
+  readonly exec?: (repoPath: string, args: readonly string[], timeoutMs: number) => Promise<string>;
+  /** Tick lateness that counts as a suspension (default 2 s). */
+  readonly suspensionGapMs?: number;
+}
+
+/** Whole milliseconds left for the next git step, or null once the budget
+ * is spent. execFile rejects a fractional timeout (ERR_OUT_OF_RANGE), and
+ * rounding down could pass 0, which disables the kill — so round up. */
+export function remainingTimeoutMs(deadline: number, now: number): number | null {
+  const remaining = deadline - now;
+  return remaining > 0 ? Math.ceil(remaining) : null;
+}
+
+const defaultProbeExec = async (repoPath: string, args: readonly string[], timeoutMs: number): Promise<string> =>
+  (await execFileAsPromised('git', ['-C', repoPath, ...args], {
+    encoding: 'utf8', timeout: timeoutMs, maxBuffer: 1024 * 1024,
+  })).stdout;
+
+/** Observe whether the process was suspended while the watch ran. Timer
+ * lateness is measured on the budget clock; sampling on demand catches a
+ * suspension that ended moments before the decision. */
+function watchSuspension(now: () => number, gapMs: number): { suspended(): boolean; stop(): void } {
+  let last = now();
+  let seen = false;
+  const sample = (): void => {
+    const current = now();
+    if (current - last > SUSPENSION_TICK_MS + gapMs) seen = true;
+    last = current;
+  };
+  const timer = setInterval(sample, SUSPENSION_TICK_MS);
+  timer.unref();
+  return {
+    suspended: () => {
+      sample();
+      return seen;
+    },
+    stop: () => clearInterval(timer),
+  };
+}
+
 /** Async advertised-tip probe (gh-169 R4-6): the SAME fail-closed
  * comparison `sourceMovementSinceFreeze` performs, executed with the
  * non-blocking execFile so a stalled remote never blocks the service
  * event loop at request-time admission. Null = no movement; errors and
  * timeouts return an explicit check-failed movement (fail-closed,
- * retryable), never silence and never a stall. */
+ * retryable), never silence and never a stall.
+ *
+ * System sleep (owner incident 2026-10-07): on macOS every Node clock —
+ * performance.now() and the timers that kill a git step — keeps counting
+ * through sleep (libuv uses mach_continuous_time), so a 51 s sleep spent
+ * the whole budget and refused a healthy review. (Linux's CLOCK_MONOTONIC
+ * pauses during suspend, so there the budget never pays for it.) When a
+ * suspension overlapped a failed probe, the probe re-runs ONCE with a
+ * fresh budget; a genuine stall without suspension is still refused
+ * within the single deadline (R7-3). */
 export async function probeAdvertisedTipMovementAsync(
   review: FrozenReview,
   timeoutMs: number,
+  seams: AdmissionProbeSeams = {},
+): Promise<SourceMovement | null> {
+  const now = seams.now ?? (() => performance.now());
+  const exec = seams.exec ?? defaultProbeExec;
+  const watch = watchSuspension(now, seams.suspensionGapMs ?? SUSPENSION_GAP_MS);
+  try {
+    const first = await probeAdvertisedTipOnce(review, timeoutMs, now, exec);
+    if (first === null || first.cause !== 'check-failed' || !watch.suspended()) return first;
+    return await probeAdvertisedTipOnce(review, timeoutMs, now, exec);
+  } finally {
+    watch.stop();
+  }
+}
+
+async function probeAdvertisedTipOnce(
+  review: FrozenReview,
+  timeoutMs: number,
+  now: () => number,
+  exec: NonNullable<AdmissionProbeSeams['exec']>,
 ): Promise<SourceMovement | null> {
   const { targetRef, targetSha } = review.manifest;
   // R6-4: ONE cumulative admission budget across every async step — each
-  // call gets only the remaining time and exhaustion fails closed. The
-  // budget runs on the monotonic clock, which stops while the machine
-  // sleeps: a wall-clock budget spent a 51 s system sleep and refused a
-  // healthy admission (owner incident 2026-10-07).
-  const deadline = performance.now() + timeoutMs;
+  // call gets only the remaining time, and exhaustion fails closed both
+  // before a step starts and after it settles (a step that finishes past
+  // the deadline proves nothing, success or git rejection alike).
+  const deadline = now() + timeoutMs;
   const run = async (args: readonly string[]): Promise<string> => {
-    const remaining = deadline - performance.now();
-    if (remaining <= 0) {
+    const timeout = remainingTimeoutMs(deadline, now());
+    if (timeout === null) {
       throw new Error(`admission remote-probe budget exhausted before: git ${args.join(' ')}`);
     }
-    const { stdout } = await execFileAsPromised('git', ['-C', review.manifest.repoPath, ...args], {
-      // execFile rejects a fractional timeout (ERR_OUT_OF_RANGE).
-      encoding: 'utf8', timeout: Math.ceil(remaining), maxBuffer: 1024 * 1024,
-    });
+    const late = (): Error => new Error(`admission remote-probe budget exhausted after: git ${args.join(' ')}`);
+    let stdout: string;
+    try {
+      stdout = await exec(review.manifest.repoPath, args, timeout);
+    } catch (error) {
+      if (now() >= deadline) throw late();
+      throw error;
+    }
+    if (now() >= deadline) throw late();
     return stdout;
   };
   // R6-3: only an ESTABLISHED non-zero exit (git itself answered

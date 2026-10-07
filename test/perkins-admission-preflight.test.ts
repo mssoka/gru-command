@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { admissionPreflight, ReviewAdmissionError } from '../src/dispatch/perkins-review/admission.js';
-import { probeAdvertisedTipMovementAsync } from '../src/dispatch/perkins-review/artifacts.js';
+import { probeAdvertisedTipMovementAsync, remainingTimeoutMs } from '../src/dispatch/perkins-review/artifacts.js';
 import {
   freezeReviewInputs,
   type FrozenReview,
@@ -435,9 +435,9 @@ describe('Perkins admission preflight (gh-169)', () => {
     const oldPath = process.env.PATH;
     process.env.PATH = `${shimDir}:${oldPath ?? ''}`;
     try {
-      const startedAt = Date.now();
+      const startedAt = performance.now();
       const result = admissionPreflight(review, 'origin/feature/stalled', { remoteProbeTimeoutMs: 1_000 });
-      const elapsed = Date.now() - startedAt;
+      const elapsed = performance.now() - startedAt;
       expect(elapsed).toBeLessThan(10_000);
       expect(result.missing.map((entry) => entry.input)).toEqual(['head-binding']);
       expect(result.missing[0]!.detail).toContain('check-failed');
@@ -537,9 +537,9 @@ describe('Perkins admission preflight (gh-169)', () => {
     const oldPath = process.env.PATH;
     process.env.PATH = `${shimDir}:${oldPath ?? ''}`;
     try {
-      const startedAt = Date.now();
+      const startedAt = performance.now();
       const movement = await probeAdvertisedTipMovementAsync(review, 1_500);
-      const elapsed = Date.now() - startedAt;
+      const elapsed = performance.now() - startedAt;
       expect(movement?.cause).toBe('check-failed');
       // R8-5: DISCRIMINATING bound — under the cumulative budget the probe
       // refuses at ~1.5 s; a reverted per-call timeout (0.6+0.6+1.5 s)
@@ -551,38 +551,56 @@ describe('Perkins admission preflight (gh-169)', () => {
     }
   });
 
-  it('a system sleep mid-probe does not spend the admission budget (owner incident 2026-10-07)', async () => {
-    // The Mac slept 51 s between two probe steps; a wall-clock budget
-    // counted the sleep and refused admission before any reviewer started.
-    // Simulate it: every Date.now() after the first read jumps 60 s ahead.
-    const repo = makeFixtureRepo('admission-sleep-budget');
+  /** A frozen review whose target is a pushed branch, so admission runs
+   * the full identification + advertised-tip probe against a real remote. */
+  function branchTargetReview(name: string) {
+    const repo = makeFixtureRepo(`admission-${name}`);
     repos.push(repo);
-    repo.git(['checkout', '-b', 'feature/sleep']);
-    const target = repo.commitFile('src/main.ts', 'export const s = 1;\n');
+    repo.git(['checkout', '-b', `feature/${name}`]);
+    const target = repo.commitFile('src/main.ts', `export const s = '${name}';\n`);
     attachBareOrigin(repo);
     repo.git(['push', '--quiet', 'origin', 'refs/heads/main']);
-    repo.git(['push', '--quiet', 'origin', 'refs/heads/feature/sleep']);
+    repo.git(['push', '--quiet', 'origin', `refs/heads/feature/${name}`]);
     const ci = renderRecordedCiEvidence({
       events: { branchState: null, ciGreen: null, ciFailed: null },
       targetSha: target,
       expectedRepo: 'acme/fixture',
       expectedPr: 14,
     });
-    let spec = appendRecordedVerification({ spec: 'Acceptance: s is 1.', evidence: null });
+    let spec = appendRecordedVerification({ spec: 'Acceptance: s is set.', evidence: null });
     spec = appendCiEvidence({ spec, block: ci.block, maxBytes: 256 * 1024 });
-    const review = freezeReviewInputs({
-      roundId: 'round-sleep',
+    return freezeReviewInputs({
+      roundId: `round-${name}`,
       repoPath: repo.path,
       artifactRoot: temp('admission-artifacts-'),
       baseRef: 'main',
       targetRef: target,
-      movementRef: 'origin/feature/sleep',
+      movementRef: `origin/feature/${name}`,
       spec,
       ciEvidence: ci.record,
     });
+  }
+
+  it('a wall-clock jump mid-probe (clock correction) does not refuse admission', async () => {
+    const review = branchTargetReview('wall-jump');
     const realNow = Date.now.bind(Date);
     let reads = 0;
     const clock = vi.spyOn(Date, 'now').mockImplementation(() => realNow() + (reads++ === 0 ? 0 : 60_000));
+    try {
+      expect(await probeAdvertisedTipMovementAsync(review, 5_000)).toBeNull();
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it('a system sleep between probe steps re-runs the probe once with a fresh budget (owner incident 2026-10-07)', async () => {
+    // macOS: Node's monotonic clock (mach_continuous_time) keeps counting
+    // through sleep. Model the incident's 51 s sleep: after the first read,
+    // the budget clock is 60 s ahead.
+    const review = branchTargetReview('sleep-between');
+    const realNow = performance.now.bind(performance);
+    let reads = 0;
+    const clock = vi.spyOn(performance, 'now').mockImplementation(() => realNow() + (reads++ === 0 ? 0 : 60_000));
     try {
       const movement = await probeAdvertisedTipMovementAsync(review, 5_000);
       expect(movement?.detail ?? '').not.toContain('budget exhausted');
@@ -590,6 +608,67 @@ describe('Perkins admission preflight (gh-169)', () => {
     } finally {
       clock.mockRestore();
     }
+  });
+
+  it('a sleep while a git step is outstanding: its kill fires on wake, the probe re-runs once and admits', async () => {
+    const review = branchTargetReview('sleep-outstanding');
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    const shimDir = temp('admission-sleep-shim-');
+    const marker = join(shimDir, 'stalled-once');
+    const calls = join(shimDir, 'rev-parse-calls');
+    // The first rev-parse outlives the budget (the Mac slept under it); the
+    // retry's rev-parse answers normally.
+    writeFileSync(
+      join(shimDir, 'git'),
+      `#!/bin/sh\ncase " $* " in *"rev-parse"*) echo x >> "${calls}"; if [ ! -f "${marker}" ]; then : > "${marker}"; sleep 3; fi;; esac\nexec "${realGit}" "$@"\n`,
+    );
+    chmodSync(join(shimDir, 'git'), 0o755);
+    const realNow = performance.now.bind(performance);
+    let offset = 0;
+    const clock = vi.spyOn(performance, 'now').mockImplementation(() => realNow() + offset);
+    const sleeping = setTimeout(() => {
+      offset = 60_000; // 60 s of sleep passes while rev-parse is outstanding
+    }, 700);
+    const oldPath = process.env.PATH;
+    process.env.PATH = `${shimDir}:${oldPath ?? ''}`;
+    try {
+      expect(await probeAdvertisedTipMovementAsync(review, 1_500)).toBeNull();
+      expect(readFileSync(calls, 'utf8').trim().split('\n')).toHaveLength(2);
+    } finally {
+      clearTimeout(sleeping);
+      clock.mockRestore();
+      if (oldPath === undefined) delete process.env.PATH;
+      else process.env.PATH = oldPath;
+    }
+  });
+
+  it('a step that settles after the deadline fails closed — late success and late git rejection alike', async () => {
+    const review = branchTargetReview('late-settle');
+    let t = 0;
+    const late = (settle: 'resolve' | 'reject') =>
+      probeAdvertisedTipMovementAsync(review, 1_000, {
+        now: () => t,
+        suspensionGapMs: Number.POSITIVE_INFINITY,
+        exec: async () => {
+          t += 1_500; // event-loop work delayed this completion past the budget
+          if (settle === 'reject') throw Object.assign(new Error('git: not a branch'), { code: 1 });
+          return 'refs/remotes/origin/feature/late-settle\n';
+        },
+      });
+    const success = await late('resolve');
+    expect(success).toMatchObject({ cause: 'check-failed' });
+    expect(success?.detail).toContain('budget exhausted after: git check-ref-format');
+    t = 0;
+    const rejection = await late('reject');
+    expect(rejection).toMatchObject({ cause: 'check-failed' });
+    expect(rejection?.detail).toContain('budget exhausted after: git check-ref-format');
+  });
+
+  it('rounds a fractional remainder up for execFile and refuses a spent budget', () => {
+    expect(remainingTimeoutMs(100, 99.5)).toBe(1);
+    expect(remainingTimeoutMs(100, 0)).toBe(100);
+    expect(remainingTimeoutMs(100, 100)).toBeNull();
+    expect(remainingTimeoutMs(100, 100.2)).toBeNull();
   });
 
   it('is read-only: a pass and a refusal leave every frozen packet byte identical', () => {
