@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -346,6 +346,42 @@ describe('lesson proposals over HTTP (owner decision 2026-10-07)', () => {
       expect(flipped.status).toBe(409);
       expect(flipped.json).toMatchObject({ error: 'proposal_decided' });
       expect(h.bible.readChapter('ops-restarts')).toBeNull();
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a failure after the decision is recorded answers 202 incomplete; the review carries it; only the same decision finishes it', async () => {
+    const h = await boot();
+    try {
+      const { id, notificationId } = await propose(h);
+      const resolve = vi.spyOn(h.ledger, 'resolveNotificationById').mockImplementationOnce(() => {
+        throw new Error('ledger is busy');
+      });
+      const first = await call(h.port, 'POST', `/api/lessons/proposal/${id}/accept`, {}, TOKEN);
+      expect(first.status).toBe(202);
+      expect(first.json).toMatchObject({ id, decision: 'accepted', incomplete: true });
+      expect(field<string>(first.json, 'detail')).toContain('ledger is busy');
+      // The book and cursor already moved; the For You row is still open.
+      expect(h.bible.readChapter('ops-restarts')?.lessons[0]?.body).toBe('Close the shell first.');
+      expect(cursor(h.bible)).toBe(1);
+      expect(h.ledger.getNotification(notificationId)?.resolvedAt).toBeNull();
+
+      const review = await call(h.port, 'GET', '/api/lessons/proposal', undefined, TOKEN);
+      expect(review.status).toBe(200);
+      expect(review.json).toMatchObject({ id, decision: { kind: 'accepted' }, recovery: null });
+
+      const opposite = await call(h.port, 'POST', `/api/lessons/proposal/${id}/reject`, {}, TOKEN);
+      expect(opposite.status).toBe(409);
+      expect(opposite.json).toMatchObject({ error: 'proposal_decided', detail: 'this lesson proposal was already accepted' });
+
+      const again = await call(h.port, 'POST', `/api/lessons/proposal/${id}/accept`, {}, TOKEN);
+      expect(again.status).toBe(200);
+      expect(again.json).toMatchObject({ id, decision: 'accepted', coveredThroughSeq: 1 });
+      expect(resolve).toHaveBeenCalledTimes(2);
+      expect(h.ledger.getNotification(notificationId)?.resolvedBy).toBe('owner:accepted');
+      expect(cursor(h.bible)).toBe(1);
+      expect((await call(h.port, 'GET', '/api/lessons/proposal', undefined, TOKEN)).status).toBe(404);
     } finally {
       await h.close();
     }

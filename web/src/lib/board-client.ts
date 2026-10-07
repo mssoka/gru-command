@@ -10,10 +10,12 @@ import {
   BOARD_WS_PATH,
   isValidDecisionStatus,
   isValidLessonProposal,
+  isValidLessonProposalDecision,
   isValidSnapshot,
   parseBoardServerFrame,
   type BoardSnapshot,
   type DecisionStatusView,
+  type LessonProposalDecisionView,
   type LessonProposalView,
   type NotificationView,
   type TranscriptInfo,
@@ -336,8 +338,10 @@ export class BoardClient {
 
   /** The owner's decision on a lesson proposal — the ONLY way it closes
    * (owner decision 2026-10-07); the snapshot then retires the row. */
-  async decideLessonProposal(id: string, decision: 'accept' | 'reject'): Promise<void> {
-    await this.postApi(`/api/lessons/proposal/${encodeURIComponent(id)}/${decision}`, {});
+  async decideLessonProposal(id: string, decision: 'accept' | 'reject'): Promise<LessonProposalDecisionView> {
+    const result = await this.postApi(`/api/lessons/proposal/${encodeURIComponent(id)}/${decision}`, {});
+    if (!isValidLessonProposalDecision(result)) throw new Error('lesson proposal decision response is malformed');
+    return result;
   }
 
   /** E7: human ack (action-required clearance; re-arms an open breaker). */

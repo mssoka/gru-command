@@ -664,6 +664,10 @@ describe('owner-approved lesson proposals (owner decision 2026-10-07)', () => {
     inform(input: { id: string; title: string; detail: string }): void {
       if (!this.informed.has(input.id)) this.informed.set(input.id, { title: input.title, detail: input.detail });
     }
+    readonly conflicts = new Map<string, { title: string; detail: string }>();
+    conflict(input: { id: string; title: string; detail: string }): void {
+      if (!this.conflicts.has(input.id)) this.conflicts.set(input.id, { title: input.title, detail: input.detail });
+    }
   }
 
   function twoChapters(input: DistillInput): DistillResult {
@@ -866,7 +870,8 @@ describe('owner-approved lesson proposals (owner decision 2026-10-07)', () => {
     h.store({ ...h.stored(), decision: { kind: 'rejected', at: 'now', detail: null } });
     expect(() => h.proposals.accept(id)).toThrowError(expect.objectContaining({ code: 'decided' }));
     expect(book(h.bible)).toEqual(before);
-    expect(h.proposals.review()).toBeNull();
+    // Still reviewable, carrying the recorded decision, so any page can finish it.
+    expect(h.proposals.review()).toMatchObject({ id, decision: { kind: 'rejected', at: 'now' }, recovery: null });
     expect(h.proposals.reject(id)).toMatchObject({ decision: 'rejected', coveredThroughSeq: entry.seq });
     expect(book(h.bible)).toEqual(before);
     expect(existsSync(h.file)).toBe(false);
@@ -900,7 +905,7 @@ describe('owner-approved lesson proposals (owner decision 2026-10-07)', () => {
     expect(() => h.proposals.accept(id)).toThrowError(/notification store down/);
     expect(cursor(h.bible)).toBe(entry.seq);
     expect(existsSync(h.file)).toBe(true);
-    expect(h.proposals.review()).toBeNull();
+    expect(h.proposals.review()).toMatchObject({ id, decision: { kind: 'accepted' } });
     expect(h.proposals.reconcile()).toBeNull();
     expect(h.notifier.resolved).toEqual([{ id: notificationId, by: 'owner:accepted' }]);
     expect(existsSync(h.file)).toBe(false);
@@ -950,6 +955,101 @@ describe('owner-approved lesson proposals (owner decision 2026-10-07)', () => {
     expect(() => h.proposals.reject('another-proposal')).toThrowError(expect.objectContaining({ code: 'mismatch' }));
     expect(h.proposals.review()).not.toBeNull();
     expect(h.notifier.resolved).toEqual([]);
+  });
+
+  it('a recorded Accept blocked by a foreign edit keeps the owner’s intent: no withdrawal, no re-proposal, a conflict notice, and the same decision finishes once restored', async () => {
+    const h = proposalHarness(twoChapters);
+    h.bible.ensureSeeded();
+    const entry = h.journal.append({ kind: 'finding', source: 'gru', body: 'shell hang finding' });
+    await h.engine.run();
+    const { id, notificationId } = h.proposals.review()!;
+    const record = h.stored();
+    const plan = record['plan'] as { writes: { slug: string; text: string }[]; before: { path: string; text: string | null }[] };
+    // Crash mid-Accept, then someone edits INDEX.md before recovery.
+    h.store({ ...record, decision: { kind: 'accepted', at: 'now', detail: null } });
+    writeFileSync(join(h.bible.chaptersDir, `${plan.writes[0]!.slug}.md`), plan.writes[0]!.text);
+    const indexBefore = h.bible.readIndexText() ?? '';
+    writeFileSync(join(h.bible.dir, 'INDEX.md'), `${indexBefore}\n`);
+    expect(h.proposals.reconcile()?.id).toBe(id);
+    expect((h.stored()['decision'] as { kind: string }).kind).toBe('accepted');
+    expect(h.stored()['recovery']).toMatchObject({ conflict: expect.stringContaining('INDEX.md changed') });
+    expect([...h.notifier.conflicts.keys()]).toEqual([`lessons-proposal-conflict:${id}`]);
+    expect((await h.engine.run()).status).toBe('awaiting-owner');
+    expect(h.distiller.calls).toHaveLength(1);
+    expect(cursor(h.bible)).toBe(0);
+    // Restore the edited file; the same decision now finishes exactly once.
+    writeFileSync(join(h.bible.dir, 'INDEX.md'), indexBefore);
+    expect(h.proposals.accept(id)).toMatchObject({ decision: 'accepted', coveredThroughSeq: entry.seq });
+    expect(h.bible.readChapter('ops-restarts')?.lessons[0]?.recurred).toBe(1);
+    expect(h.notifier.resolved).toEqual([
+      { id: notificationId, by: 'owner:accepted' },
+      { id: `lessons-proposal-conflict:${id}`, by: 'recovered' },
+    ]);
+  });
+
+  it('recovery never rewinds the cursor or erases a replay range — a moved cursor is a conflict', async () => {
+    const h = proposalHarness();
+    h.journal.append({ kind: 'finding', source: 'gru', body: 'shell hang finding' });
+    await h.engine.run();
+    const { id } = h.proposals.review()!;
+    h.notifier.failResolve = 1;
+    expect(() => h.proposals.accept(id)).toThrowError(expect.objectContaining({ code: 'incomplete' }));
+    const file = join(h.bible.dir, DREAM_STATE_FILE);
+    const moved = { ...loadDreamState(file), coveredThroughSeq: 50, replay: { afterSeq: 40, throughSeq: 45 } };
+    saveDreamState(file, moved);
+    expect(h.proposals.reconcile()?.id).toBe(id);
+    expect(loadDreamState(file)).toEqual(moved);
+    expect(h.stored()['recovery']).toMatchObject({ conflict: expect.stringContaining('dream cursor moved to 50') });
+  });
+
+  it('integrity is checked before a record is shown or decided: duplicate writes or a forged cursor refuse with nothing recorded', async () => {
+    const h = proposalHarness(twoChapters);
+    h.journal.append({ kind: 'finding', source: 'gru', body: 'shell hang finding' });
+    await h.engine.run();
+    const record = h.stored();
+    const { id } = h.proposals.review()!;
+    const plan = record['plan'] as { writes: unknown[] };
+    h.store({ ...record, plan: { ...plan, writes: [plan.writes[0], plan.writes[0]] } });
+    expect(() => h.proposals.review()).toThrowError(/malformed/);
+    expect(() => h.proposals.accept(id)).toThrowError(/malformed/);
+    expect(h.stored()['decision']).toBeNull();
+    h.store({ ...record, nextState: { ...(record['nextState'] as object), coveredThroughSeq: 1000 } });
+    expect(() => h.proposals.reject(id)).toThrowError(/malformed \(nextState cursor\)/);
+    expect(cursor(h.bible)).toBe(0);
+    expect(h.stored()['decision']).toBeNull();
+  });
+
+  it('the review is derived from what Accept writes — exactly the planned text, nothing stored beside it', async () => {
+    const h = proposalHarness();
+    h.journal.append({ kind: 'finding', source: 'gru', body: 'shell hang finding' });
+    await h.engine.run();
+    const record = h.stored();
+    expect(record['plan']).not.toHaveProperty('changes');
+    const write = (record['plan'] as { writes: { text: string }[] }).writes[0]!;
+    const review = h.proposals.review()!;
+    expect(write.text).toContain(review.chapters[0]!.added[0]!.body);
+  });
+
+  it('a bounded replay keeps its tail: two replayed entries, one per pass, Accept then Reject, cursor never rewinds', async () => {
+    const h = proposalHarness();
+    const e1 = h.journal.append({ kind: 'finding', source: 'gru', body: 'first' });
+    const e2 = h.journal.append({ kind: 'finding', source: 'gru', body: 'second' });
+    await h.engine.run(); // one proposal for both entries
+    const file = join(h.bible.dir, DREAM_STATE_FILE);
+    saveDreamState(file, { ...loadDreamState(file), coveredThroughSeq: 50 }); // the cursor moved elsewhere
+    const oneAtATime = new DreamEngine({ journal: h.journal, bible: h.bible, distiller: h.distiller, proposals: h.proposals, maxEntriesPerDream: 1 });
+    expect((await oneAtATime.run()).status).toBe('proposed'); // the stale one is withdrawn, e1 replayed
+    expect(h.distiller.calls.at(-1)!.entries.map((entry) => entry.id)).toEqual([e1.id]);
+    h.proposals.accept(h.proposals.review()!.id);
+    expect(loadDreamState(file)).toMatchObject({ coveredThroughSeq: 50, replay: { afterSeq: e1.seq, throughSeq: e2.seq } });
+    const before = h.bible.readChapter('ops-restarts');
+    expect((await oneAtATime.run()).status).toBe('proposed');
+    expect(h.distiller.calls.at(-1)!.entries.map((entry) => entry.id)).toEqual([e2.id]);
+    h.proposals.reject(h.proposals.review()!.id);
+    expect(h.bible.readChapter('ops-restarts')).toEqual(before);
+    expect(loadDreamState(file).coveredThroughSeq).toBe(50);
+    expect(loadDreamState(file).replay).toBeUndefined();
+    expect((await oneAtATime.run()).status).toBe('noop');
   });
 
   it('production notifier: the proposal is one owner-held For You row; deciding resolves it; withdrawal posts an FYI', async () => {

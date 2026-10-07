@@ -2414,7 +2414,7 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
       chapters: [
         {
           slug: 'ops',
-          title: 'Ops',
+          title: { before: 'Ops', after: 'Ops' },
           retired: false,
           summary: { before: 'Restart discipline.', after: 'Restart discipline.' },
           tags: { before: ['ops'], after: ['ops'] },
@@ -2427,6 +2427,9 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
           bodiesTrimmed: 0,
         },
       ],
+      index: [],
+      decision: null,
+      recovery: null,
       ...overrides,
     };
   }
@@ -2438,7 +2441,9 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
   const flush = async () => {
     for (let tick = 0; tick < 20; tick += 1) await Promise.resolve();
   };
-  function proposalClient(decide: (id: string, decision: 'accept' | 'reject') => Promise<void>, review = proposalReview()) {
+  const decided = (id: string, decision: 'accept' | 'reject') =>
+    Promise.resolve({ id, decision: decision === 'accept' ? 'accepted' : 'rejected' });
+  function proposalClient(decide: (id: string, decision: 'accept' | 'reject') => Promise<unknown> = decided, review = proposalReview()) {
     return {
       ackNotification: vi.fn(() => Promise.resolve()),
       markNotificationShown: vi.fn(() => Promise.resolve(true)),
@@ -2456,7 +2461,7 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
   }
 
   it('lesson proposal row: Review shows the exact text; a decision stays pending until the snapshot resolves it', async () => {
-    const client = proposalClient(() => Promise.resolve());
+    const client = proposalClient(decided);
     const view = new BoardView(() => {}, client);
     view.render(snapshot({ notifications: [proposalNotice] }));
     const band = document.getElementById('board-owner')!;
@@ -2466,7 +2471,7 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     openReview();
     await flush();
     expect(band.textContent).toContain('Close the shell first.\nThen restart.');
-    expect(band.textContent).toContain('updated · recurred 3 · drain');
+    expect(band.textContent).toContain('updated · recurred 2 → 3 · drain');
     expect(band.textContent).toContain('4 oldest journal handle(s) released to fit');
     band.querySelector<HTMLButtonElement>('[data-action-id="owner-proposal:lp-1"]')!.click();
     await flush();
@@ -2479,7 +2484,9 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
 
   it('a snapshot push keeps the review open, its text loaded, and an in-flight decision locked — band and bell share it', async () => {
     let finish: () => void = () => {};
-    const client = proposalClient(() => new Promise<void>((resolve) => { finish = resolve; }));
+    const client = proposalClient(
+      (id) => new Promise((resolve) => { finish = () => resolve({ id, decision: 'accepted' }); }),
+    );
     const view = new BoardView(() => {}, client);
     view.render(snapshot({ notifications: [proposalNotice] }));
     openReview();
@@ -2531,7 +2538,7 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
       chapters: [
         {
           slug: 'ops',
-          title: 'Ops',
+          title: { before: 'Ops', after: 'Ops' },
           retired: false,
           summary: { before: 'Restart discipline.', after: 'Restart and roll discipline.' },
           tags: { before: ['ops'], after: ['ops', 'roll'] },
@@ -2543,7 +2550,7 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
         },
         {
           slug: 'model-policy',
-          title: 'Model policy',
+          title: { before: 'Model policy', after: 'Model policy' },
           retired: true,
           summary: { before: 'Which model does what.', after: '' },
           tags: { before: ['models'], after: [] },
@@ -2555,7 +2562,7 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
         },
       ],
     });
-    const view = new BoardView(() => {}, proposalClient(() => Promise.resolve(), review));
+    const view = new BoardView(() => {}, proposalClient(decided, review));
     view.render(snapshot({ notifications: [proposalNotice] }));
     openReview();
     await flush();
@@ -2575,7 +2582,10 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     const calls: string[] = [];
     const fetchImpl = (async (path: string, init?: { method?: string }) => {
       if (path.startsWith('/api/lessons/')) calls.push(`${init?.method ?? 'GET'} ${path}`);
-      const body = path === '/api/lessons/proposal' ? proposalReview() : { ok: true };
+      const decision = /\/api\/lessons\/proposal\/([^/]+)\/(accept|reject)$/u.exec(path);
+      const body = path === '/api/lessons/proposal'
+        ? proposalReview()
+        : { id: decision?.[1], decision: decision?.[2] === 'accept' ? 'accepted' : 'rejected' };
       return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
     }) as unknown as typeof fetch;
     const client = new BoardClient({ token: 't', host: 'localhost', fetchImpl }, { connection: () => {}, snapshot: () => {}, fatal: () => {} } as never);
@@ -2595,6 +2605,168 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     document.getElementById('notification-list')!.querySelector<HTMLButtonElement>('.board-owner__reject')!.click();
     await flush();
     expect(calls).toEqual(['GET /api/lessons/proposal', 'POST /api/lessons/proposal/prop-2/reject']);
+  });
+
+  it('the review names renames, new chapters, recurrence moves and every INDEX entry the Accept changes', async () => {
+    const review = proposalReview({
+      chapters: [
+        {
+          slug: 'ops',
+          title: { before: 'Ops', after: 'Operations' },
+          retired: false,
+          summary: { before: 'Restart discipline.', after: 'Restart discipline.' },
+          tags: { before: ['ops'], after: ['ops'] },
+          added: [],
+          changed: [lessonChange('drain', 'Drain first.', { recurred: 4, previousBody: 'Drain first.', previousRecurred: 3, previousTags: [] })],
+          removed: [],
+          provenanceTrimmed: 0,
+          bodiesTrimmed: 0,
+        },
+        {
+          slug: 'fresh',
+          title: { before: null, after: 'Fresh ground' },
+          retired: false,
+          summary: { before: null, after: 'Brand new.' },
+          tags: { before: [], after: ['new'] },
+          added: [lessonChange('first', 'The first lesson.')],
+          changed: [],
+          removed: [],
+          provenanceTrimmed: 0,
+          bodiesTrimmed: 0,
+        },
+      ],
+      index: [
+        { slug: 'fresh', before: null, after: { summary: 'Brand new.', tags: ['new'] } },
+        { slug: 'gone', before: { summary: 'Old chapter.', tags: ['old'] }, after: null },
+        { slug: 'untouched', before: { summary: 'Was this.', tags: ['a'] }, after: { summary: 'Now this.', tags: ['a', 'b'] } },
+      ],
+    });
+    const view = new BoardView(() => {}, proposalClient(decided, review));
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    openReview();
+    await flush();
+    const text = document.getElementById('board-owner')!.textContent ?? '';
+    expect(text).toContain('Ops → Operations (renamed)');
+    expect(text).toContain('Fresh ground — new chapter');
+    expect(text).toContain('summary: Brand new.');
+    expect(text).toContain('updated · recurred 3 → 4 · drain');
+    expect(text).toContain('new · recurred 1 · first');
+    expect(text).toContain('INDEX.md (what briefings see)');
+    expect(text).toContain('+ fresh: Brand new. (tags: new)');
+    expect(text).toContain('− gone: Old chapter.');
+    expect(text).toContain('~ untouched: Was this. (tags: a) → Now this. (tags: a, b)');
+  });
+
+  it('a recorded-but-unfinished decision (202) says so and locks the opposite choice; a conflict does the same', async () => {
+    const { BoardApiError } = await import('../lib/board-client.js');
+    const outcomes: Array<() => Promise<unknown>> = [
+      () => Promise.resolve({ id: 'prop-1', decision: 'accepted', incomplete: true, detail: 'the notice could not be resolved' }),
+      () => Promise.reject(new BoardApiError('/api/lessons/proposal/prop-1/reject', 409, 'proposal_conflict', 'INDEX.md was edited outside the dream')),
+    ];
+    const client = proposalClient(() => outcomes.shift()!());
+    const view = new BoardView(() => {}, client);
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__accept')!.click();
+    await flush();
+    let band = document.getElementById('board-owner')!;
+    expect(band.querySelector('[role="alert"]')?.textContent).toBe(
+      'Your Accept is recorded, but finishing it hit a problem (the notice could not be resolved). Press Accept again to finish it.',
+    );
+    expect([band.querySelector<HTMLButtonElement>('.board-owner__accept')!.disabled, band.querySelector<HTMLButtonElement>('.board-owner__reject')!.disabled])
+      .toEqual([false, true]);
+    expect(band.querySelector('[data-action-id="owner-proposal:lp-1"]')).not.toBeNull();
+    // A second view (fresh state) whose Reject is recorded but blocked by a conflict.
+    const second = new BoardView(() => {}, client);
+    second.render(snapshot({ notifications: [proposalNotice] }));
+    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__reject')!.click();
+    await flush();
+    band = document.getElementById('board-owner')!;
+    expect(band.querySelector('[role="alert"]')?.textContent).toBe(
+      'Recorded, but blocked — INDEX.md was edited outside the dream. See the conflict notice.',
+    );
+    expect([band.querySelector<HTMLButtonElement>('.board-owner__accept')!.disabled, band.querySelector<HTMLButtonElement>('.board-owner__reject')!.disabled])
+      .toEqual([true, false]);
+  });
+
+  it('a decision recorded elsewhere loads locked: only the same choice is offered, and the opposite never posts', async () => {
+    const review = proposalReview({
+      decision: { kind: 'accepted', at: '2026-01-01T00:05:00.000Z' },
+      recovery: { conflict: 'INDEX.md was edited outside the dream', at: '2026-01-01T00:06:00.000Z' },
+    });
+    const client = proposalClient(decided, review);
+    const view = new BoardView(() => {}, client);
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    // The owner presses Reject before the review has loaded.
+    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__reject')!.click();
+    await flush();
+    const band = document.getElementById('board-owner')!;
+    expect(client.decideLessonProposal).not.toHaveBeenCalled();
+    expect(band.querySelector('[role="alert"]')?.textContent).toBe(
+      'Your Accept is recorded but blocked — INDEX.md was edited outside the dream. See the conflict notice, then press Accept again.',
+    );
+    const accept = band.querySelector<HTMLButtonElement>('.board-owner__accept')!;
+    expect([accept.disabled, band.querySelector<HTMLButtonElement>('.board-owner__reject')!.disabled]).toEqual([false, true]);
+    accept.click();
+    await flush();
+    expect(client.decideLessonProposal).toHaveBeenCalledWith('prop-1', 'accept');
+  });
+
+  it('a malformed decision reply is not mistaken for success', async () => {
+    const { BoardClient } = await import('../lib/board-client.js');
+    const fetchImpl = (async (path: string) => {
+      const body = path === '/api/lessons/proposal' ? proposalReview() : { ok: true };
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
+    }) as unknown as typeof fetch;
+    const client = new BoardClient({ token: 't', host: 'localhost', fetchImpl }, { connection: () => {}, snapshot: () => {}, fatal: () => {} } as never);
+    await expect(client.decideLessonProposal('prop-1', 'accept')).rejects.toThrow('lesson proposal decision response is malformed');
+  });
+
+  it('an open "before" disclosure and the focused control survive a snapshot push', async () => {
+    const view = new BoardView(() => {}, proposalClient(decided));
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    openReview();
+    await flush();
+    let band = document.getElementById('board-owner')!;
+    const before = [...band.querySelectorAll<HTMLDetailsElement>('.board-owner__review-lesson details')].find((node) =>
+      node.textContent?.includes('Drain.'),
+    )!;
+    before.open = true;
+    before.dispatchEvent(new Event('toggle'));
+    const toggle = before.querySelector<HTMLElement>('summary')!;
+    toggle.focus();
+    const key = toggle.dataset.ownerFocusKey;
+    expect(key).toContain(':before:ops/drain');
+    view.render(snapshot({ notifications: [proposalNotice, notification('other', { routing: 'fyi' })] }));
+    band = document.getElementById('board-owner')!;
+    const restored = [...band.querySelectorAll<HTMLDetailsElement>('.board-owner__review-lesson details')].find((node) =>
+      node.textContent?.includes('Drain.'),
+    )!;
+    expect(restored).not.toBe(before);
+    expect(restored.open).toBe(true);
+    expect((document.activeElement as HTMLElement | null)?.dataset.ownerFocusKey).toBe(key);
+    expect(document.activeElement).toBe(restored.querySelector('summary'));
+  });
+
+  it('a re-pair while the review is loading never sends the decision through either client', async () => {
+    let release: (review: unknown) => void = () => {};
+    const oldClient = proposalClient();
+    oldClient.getLessonProposal.mockImplementation(() => new Promise((resolve) => { release = resolve; }));
+    const newClient = proposalClient();
+    const view = new BoardView(() => {}, oldClient);
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__accept')!.click();
+    await flush();
+    expect(oldClient.getLessonProposal).toHaveBeenCalledTimes(1);
+    view.bindClient(newClient);
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    release(proposalReview());
+    await flush();
+    expect(oldClient.decideLessonProposal).not.toHaveBeenCalled();
+    expect(newClient.decideLessonProposal).not.toHaveBeenCalled();
+    const band = document.getElementById('board-owner')!;
+    expect(band.querySelector('[role="alert"]')).toBeNull();
+    const accept = band.querySelector<HTMLButtonElement>('.board-owner__accept')!;
+    expect([accept.textContent, accept.disabled]).toEqual(['Accept', false]);
   });
 
   it('the phone layout keeps the proposal review inside the single column', async () => {

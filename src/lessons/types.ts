@@ -67,7 +67,7 @@ export class DreamError extends LessonsError {
  * proposal; `stale` — the book or the dream cursor moved since it was
  * proposed (the proposal is withdrawn and the next dream re-proposes);
  * `decided` — the opposite decision was already recorded. */
-export type ProposalErrorCode = 'none' | 'mismatch' | 'stale' | 'decided';
+export type ProposalErrorCode = 'none' | 'mismatch' | 'stale' | 'decided' | 'conflict' | 'incomplete';
 
 export class ProposalError extends LessonsError {
   readonly code: ProposalErrorCode;

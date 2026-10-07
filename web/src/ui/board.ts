@@ -172,6 +172,9 @@ export class BoardView {
    * fetched review, in-flight decision, last refusal). Pruned when the
    * proposal leaves FOR YOU; cleared on re-pair. */
   private readonly proposalStates = new Map<string, ProposalRowState>();
+  /** Bumped on every re-pair: work started for an older client never
+   * changes state, re-renders, or posts through the new one. */
+  private clientGeneration = 0;
   /** Toast + browser-notification surface (E7). */
   private onToast: ((notification: NotificationView) => void) | null = null;
   private snapshot: BoardSnapshot | null = null;
@@ -266,6 +269,7 @@ export class BoardView {
    * previous server's fetched receipts or resume its pagination cursor. */
   bindClient(client: BoardClient): void {
     this.boardClient = client;
+    this.clientGeneration += 1;
     this.proposalStates.clear();
     this.sentShown.clear();
     this.extraReceipts = [];
@@ -285,6 +289,7 @@ export class BoardView {
     // on keeps its place (stable focus keys), so a snapshot update never
     // steals focus or resets a disclosure mid-interaction.
     const focusKey = this.captureFocusKey();
+    const ownerFocus = captureOwnerFocusKey();
     this.currentSections = null; // one fresh derivation per render
     this.renderOwnerActions(snapshot);
     this.renderRail(snapshot);
@@ -293,6 +298,7 @@ export class BoardView {
     this.restoreFocusKey(focusKey);
     this.renderAgents(snapshot.agents);
     this.renderNotifications(snapshot);
+    restoreOwnerFocusKey(ownerFocus);
     this.surfaceNewNotifications(previous, snapshot.notifications);
   }
 
@@ -470,7 +476,7 @@ export class BoardView {
         if (row.kind === 'ack') {
           list.append(this.ownerAckRow(row, bandVisible));
         } else if (row.kind === 'proposal') {
-          list.append(this.ownerProposalRow(row, bandVisible));
+          list.append(this.ownerProposalRow(row, bandVisible, 'band'));
         } else {
           list.append(this.ownerPrRow(row));
         }
@@ -546,20 +552,22 @@ export class BoardView {
   }
 
   /** A Book of Lessons proposal (owner decision 2026-10-07): the owner
-   * reviews every change — lesson text, metadata, removals — then Accept
-   * writes it or Reject discards it. The row's state lives in
-   * proposalStates, so a snapshot push never closes the review, drops the
-   * fetched text, or re-enables an in-flight decision, and the band and the
-   * bell show one state. Like Ack, only the authoritative snapshot (the
-   * notification resolved) closes the row. */
-  private ownerProposalRow(row: OwnerProposalRow, bandVisible: boolean): HTMLElement {
+   * reviews every change — lesson text, metadata, removals, index entries —
+   * then Accept writes it or Reject discards it. The row's state lives in
+   * proposalStates, shared by the band and the bell, so a snapshot push
+   * never closes a disclosure, drops the fetched text, moves focus, or
+   * re-enables an in-flight decision. Work begun for an older client (before
+   * a re-pair) is dropped. Like Ack, only the authoritative snapshot closes
+   * the row. */
+  private ownerProposalRow(row: OwnerProposalRow, bandVisible: boolean, surface: 'band' | 'bell'): HTMLElement {
     const item = row.notification;
     let state = this.proposalStates.get(item.id);
     if (state === undefined) {
-      state = { open: false, review: null, loading: null, inFlight: null, message: null };
+      state = { open: false, review: null, loading: null, inFlight: null, recorded: null, message: null, nested: new Set() };
       this.proposalStates.set(item.id, state);
     }
     const current = state;
+    const focusBase = `owner-proposal:${surface}:${item.id}`;
     const node = el('article', 'board-owner__row board-owner__row--proposal');
     node.append(
       el('div', 'board-owner__title', `📖 ${item.title}`),
@@ -574,11 +582,14 @@ export class BoardView {
     review.className = 'board-owner__review';
     const summary = document.createElement('summary');
     summary.textContent = 'Review changes';
+    summary.dataset.ownerFocusKey = `${focusBase}:review`;
     const body = el('div', 'board-owner__review-body lbl');
-    if (current.review !== null) body.replaceChildren(renderProposalReview(current.review));
+    if (current.review !== null) body.replaceChildren(renderProposalReview(current.review, current.nested, focusBase));
     else body.textContent = current.loading !== null ? 'loading…' : 'not loaded — close and reopen to retry';
     review.append(summary, body);
     review.open = current.open;
+    const generation = this.clientGeneration;
+    const live = (): boolean => generation === this.clientGeneration;
     const load = (): Promise<LessonProposalView> => {
       if (current.review !== null) return Promise.resolve(current.review);
       if (current.loading !== null) return current.loading;
@@ -594,12 +605,21 @@ export class BoardView {
           });
       current.loading = pending.then(
         (proposal) => {
+          if (!live()) throw new Error('re-paired');
           current.review = proposal;
           current.loading = null;
+          if (proposal.decision !== null) {
+            // Recorded elsewhere (another device, or before a restart): only
+            // the same decision can finish it.
+            const recorded = proposal.decision.kind === 'accepted' ? 'accept' : 'reject';
+            current.recorded = recorded;
+            current.message ??= recordedMessage(recorded, proposal.recovery?.conflict ?? null);
+          }
           this.rerenderOwner();
           return proposal;
         },
         (error: unknown) => {
+          if (!live()) throw error;
           current.loading = null; // a later open/decision retries the fetch
           current.message = `Couldn’t load the proposal: ${describeProposalError(error)}`;
           this.rerenderOwner();
@@ -620,26 +640,54 @@ export class BoardView {
     accept.type = 'button';
     accept.className = 'board-owner__ack board-owner__accept';
     accept.dataset.actionId = row.actionId;
+    accept.dataset.ownerFocusKey = `${focusBase}:accept`;
     const reject = document.createElement('button');
     reject.type = 'button';
     reject.className = 'board-owner__ack board-owner__reject';
+    reject.dataset.ownerFocusKey = `${focusBase}:reject`;
     accept.textContent = current.inFlight === 'accept' ? 'accepting…' : 'Accept';
     reject.textContent = current.inFlight === 'reject' ? 'rejecting…' : 'Reject';
-    accept.disabled = current.inFlight !== null;
-    reject.disabled = current.inFlight !== null;
+    // A recorded decision can only be finished, never flipped.
+    accept.disabled = current.inFlight !== null || current.recorded === 'reject';
+    reject.disabled = current.inFlight !== null || current.recorded === 'accept';
     const decide = (decision: 'accept' | 'reject'): void => {
       if (current.inFlight !== null) return;
+      const client = this.boardClient;
+      if (client === null) return;
       current.inFlight = decision;
       current.message = null;
       this.rerenderOwner();
       void load()
-        .then((proposal) => this.boardClient!.decideLessonProposal(proposal.id, decision))
-        .then(() => {
-          /* Success is NOT completion — the row closes only when the
-           * authoritative snapshot carries the resolution (any device). */
+        .then((proposal) => {
+          if (!live()) throw new Error('re-paired');
+          if (current.recorded !== null && current.recorded !== decision) return null; // never flip a recorded decision
+          return client.decideLessonProposal(proposal.id, decision);
+        })
+        .then((result) => {
+          if (!live()) return;
+          if (result === null) {
+            current.inFlight = null;
+            this.rerenderOwner();
+            return;
+          }
+          if (result.incomplete === true) {
+            current.inFlight = null;
+            current.recorded = decision;
+            current.message =
+              `Your ${decision === 'accept' ? 'Accept' : 'Reject'} is recorded, but finishing it hit a problem` +
+              `${result.detail !== undefined ? ` (${result.detail})` : ''}. Press ${decision === 'accept' ? 'Accept' : 'Reject'} again to finish it.`;
+            this.rerenderOwner();
+          }
+          /* Otherwise success is NOT completion — the row closes only when
+           * the authoritative snapshot carries the resolution (any device). */
         })
         .catch((error: unknown) => {
+          if (!live()) return;
           current.inFlight = null;
+          if (error instanceof BoardApiError && error.code === 'proposal_conflict') current.recorded = decision;
+          // Decided elsewhere: drop the cached review so the next load
+          // brings the recorded decision (and its lock) with it.
+          if (error instanceof BoardApiError && error.code === 'proposal_decided') current.review = null;
           current.message = describeDecisionFailure(error);
           this.rerenderOwner();
         });
@@ -1759,7 +1807,7 @@ export class BoardView {
           row.kind === 'ack'
             ? this.notificationRow(row.notification)
             : row.kind === 'proposal'
-              ? this.ownerProposalRow(row, false)
+              ? this.ownerProposalRow(row, false, 'bell')
               : this.ownerPrRow(row),
         );
       }
@@ -2143,7 +2191,34 @@ interface ProposalRowState {
   review: LessonProposalView | null;
   loading: Promise<LessonProposalView> | null;
   inFlight: 'accept' | 'reject' | null;
+  /** A decision the server recorded but has not finished (202 / conflict). */
+  recorded: 'accept' | 'reject' | null;
   message: string | null;
+  /** Open nested "before" disclosures, by chapter/lesson key. */
+  nested: Set<string>;
+}
+
+/** Owner-surface focus (FOR YOU band + bell): stable keys survive the
+ * re-render a snapshot push causes, so focus never falls to <body>. */
+function captureOwnerFocusKey(): string | null {
+  const active = document.activeElement;
+  return active instanceof HTMLElement ? active.dataset.ownerFocusKey ?? null : null;
+}
+
+function restoreOwnerFocusKey(key: string | null): void {
+  if (key === null) return;
+  const target = [...document.querySelectorAll<HTMLElement>('[data-owner-focus-key]')].find(
+    (node) => node.dataset.ownerFocusKey === key,
+  );
+  if (target !== undefined && document.activeElement !== target) target.focus();
+}
+
+/** A decision the server holds but has not finished: what to press. */
+function recordedMessage(recorded: 'accept' | 'reject', conflict: string | null): string {
+  const label = recorded === 'accept' ? 'Accept' : 'Reject';
+  return conflict === null
+    ? `Your ${label} is recorded but not finished — press ${label} to finish it.`
+    : `Your ${label} is recorded but blocked — ${conflict}. See the conflict notice, then press ${label} again.`;
 }
 
 function describeProposalError(error: unknown): string {
@@ -2151,24 +2226,29 @@ function describeProposalError(error: unknown): string {
 }
 
 /** The owner-facing reason a decision did not land: the server's refusal
- * (stale, already decided, gone) or an ambiguous network failure. */
+ * (stale, already decided, conflict, gone) or an ambiguous network failure. */
 function describeDecisionFailure(error: unknown): string {
   if (error instanceof BoardApiError) {
     if (error.code === 'proposal_stale') {
       return `Not applied — ${error.detail ?? 'the Book of Lessons changed'}. A fresh proposal will follow.`;
     }
     if (error.code === 'proposal_decided') return `Not applied — ${error.detail ?? 'this proposal was already decided'}.`;
+    if (error.code === 'proposal_conflict') {
+      return `Recorded, but blocked — ${error.detail ?? 'the book changed under this decision'}. See the conflict notice.`;
+    }
     if (error.status === 404) return 'Not applied — this proposal is no longer pending.';
     return `Not applied — the server refused (${error.status}${error.detail !== null ? `: ${error.detail}` : ''}).`;
   }
   return `Couldn’t confirm the decision (${describeProposalError(error)}) — it may not have been recorded; check the book or retry.`;
 }
 
+const tagsLine = (tags: readonly string[]): string => tags.join(', ') || '—';
+
 /** The owner's review of a lesson proposal: per chapter, every change the
- * Accept would make — summary and tag changes, new and updated lessons with
- * their exact text (the prior text one click away), and every lesson that
- * would disappear, with its text. */
-function renderProposalReview(proposal: LessonProposalView): HTMLElement {
+ * Accept would make — title, summary and tag changes, new and updated
+ * lessons with their exact text (the prior text one click away), every
+ * lesson that would disappear — and every INDEX entry it changes. */
+function renderProposalReview(proposal: LessonProposalView, nested: Set<string>, focusBase: string): HTMLElement {
   const root = el('div', 'board-owner__review-list');
   root.append(
     el(
@@ -2177,7 +2257,7 @@ function renderProposalReview(proposal: LessonProposalView): HTMLElement {
       `distilled from ${proposal.entries} journal entr${proposal.entries === 1 ? 'y' : 'ies'} (through #${proposal.throughSeq})`,
     ),
   );
-  if (proposal.chapters.length === 0) root.append(el('div', 'lbl', 'no chapter changes'));
+  if (proposal.chapters.length === 0 && proposal.index.length === 0) root.append(el('div', 'lbl', 'no chapter changes'));
   for (const chapter of proposal.chapters) {
     const section = el('section', 'board-owner__review-chapter');
     if (chapter.retired) {
@@ -2185,13 +2265,17 @@ function renderProposalReview(proposal: LessonProposalView): HTMLElement {
         el(
           'div',
           'board-owner__review-heading',
-          `${chapter.title} — chapter retired (${chapter.removed.length} lesson${chapter.removed.length === 1 ? '' : 's'} removed)`,
+          `${chapter.title.after} — chapter retired (${chapter.removed.length} lesson${chapter.removed.length === 1 ? '' : 's'} removed)`,
         ),
       );
     } else {
-      section.append(
-        el('div', 'board-owner__review-heading', chapter.summary.before === null ? `${chapter.title} — new chapter` : chapter.title),
-      );
+      const heading =
+        chapter.title.before === null
+          ? `${chapter.title.after} — new chapter`
+          : chapter.title.before !== chapter.title.after
+            ? `${chapter.title.before} → ${chapter.title.after} (renamed)`
+            : chapter.title.after;
+      section.append(el('div', 'board-owner__review-heading', heading));
       if (chapter.summary.before !== chapter.summary.after) {
         section.append(
           el(
@@ -2203,15 +2287,17 @@ function renderProposalReview(proposal: LessonProposalView): HTMLElement {
           ),
         );
       }
-      const tagsChanged = chapter.tags.before.join('\u0000') !== chapter.tags.after.join('\u0000');
-      if (tagsChanged) {
-        section.append(
-          el('div', 'lbl board-owner__review-meta', `tags: ${chapter.tags.before.join(', ') || '—'} → ${chapter.tags.after.join(', ') || '—'}`),
-        );
+      if (chapter.tags.before.join('\u0000') !== chapter.tags.after.join('\u0000')) {
+        section.append(el('div', 'lbl board-owner__review-meta', `tags: ${tagsLine(chapter.tags.before)} → ${tagsLine(chapter.tags.after)}`));
       }
     }
-    for (const lesson of chapter.added) section.append(reviewLesson('new', lesson));
-    for (const lesson of chapter.changed) section.append(reviewLesson(`updated · recurred ${lesson.recurred}`, lesson));
+    for (const lesson of chapter.added) section.append(reviewLesson(`new · recurred ${lesson.recurred}`, lesson, chapter.slug, nested, focusBase));
+    for (const lesson of chapter.changed) {
+      const recurrence = lesson.previousRecurred !== null && lesson.previousRecurred !== lesson.recurred
+        ? `recurred ${lesson.previousRecurred} → ${lesson.recurred}`
+        : `recurred ${lesson.recurred}`;
+      section.append(reviewLesson(`updated · ${recurrence}`, lesson, chapter.slug, nested, focusBase));
+    }
     for (const lesson of chapter.removed) section.append(reviewRemoved(lesson));
     const notes: string[] = [];
     if (chapter.provenanceTrimmed > 0) notes.push(`${chapter.provenanceTrimmed} oldest journal handle(s) released to fit`);
@@ -2219,10 +2305,24 @@ function renderProposalReview(proposal: LessonProposalView): HTMLElement {
     if (notes.length > 0) section.append(el('div', 'lbl', notes.join(' · ')));
     root.append(section);
   }
+  if (proposal.index.length > 0) {
+    const section = el('section', 'board-owner__review-chapter');
+    section.append(el('div', 'board-owner__review-heading', 'INDEX.md (what briefings see)'));
+    for (const entry of proposal.index) {
+      const line =
+        entry.before === null
+          ? `+ ${entry.slug}: ${entry.after!.summary} (tags: ${tagsLine(entry.after!.tags)})`
+          : entry.after === null
+            ? `− ${entry.slug}: ${entry.before.summary}`
+            : `~ ${entry.slug}: ${entry.before.summary} (tags: ${tagsLine(entry.before.tags)}) → ${entry.after.summary} (tags: ${tagsLine(entry.after.tags)})`;
+      section.append(el('div', 'board-owner__review-text', line));
+    }
+    root.append(section);
+  }
   return root;
 }
 
-function reviewLesson(label: string, lesson: LessonChangeView): HTMLElement {
+function reviewLesson(label: string, lesson: LessonChangeView, chapterSlug: string, nested: Set<string>, focusBase: string): HTMLElement {
   const node = el('div', 'board-owner__review-lesson');
   node.append(
     el('div', 'lbl board-owner__review-label', `${label} · ${lesson.slug}`),
@@ -2231,15 +2331,20 @@ function reviewLesson(label: string, lesson: LessonChangeView): HTMLElement {
   if (lesson.previousTags === null) {
     if (lesson.tags.length > 0) node.append(el('div', 'lbl board-owner__review-meta', `tags: ${lesson.tags.join(', ')}`));
   } else if (lesson.previousTags.join('\u0000') !== lesson.tags.join('\u0000')) {
-    node.append(
-      el('div', 'lbl board-owner__review-meta', `tags: ${lesson.previousTags.join(', ') || '—'} → ${lesson.tags.join(', ') || '—'}`),
-    );
+    node.append(el('div', 'lbl board-owner__review-meta', `tags: ${tagsLine(lesson.previousTags)} → ${tagsLine(lesson.tags)}`));
   }
   if (lesson.previousBody !== null && lesson.previousBody !== lesson.body) {
+    const key = `${chapterSlug}/${lesson.slug}`;
     const before = document.createElement('details');
     const toggle = document.createElement('summary');
     toggle.textContent = 'before';
+    toggle.dataset.ownerFocusKey = `${focusBase}:before:${key}`;
     before.append(toggle, el('div', 'board-owner__review-text board-owner__review-text--before', lesson.previousBody));
+    before.open = nested.has(key);
+    before.addEventListener('toggle', () => {
+      if (before.open) nested.add(key);
+      else nested.delete(key);
+    });
     node.append(before);
   }
   return node;
@@ -2251,7 +2356,7 @@ function reviewRemoved(lesson: RemovedLessonView): HTMLElement {
     el(
       'div',
       'lbl board-owner__review-label',
-      `${lesson.reason === 'retired' ? 'removed with the chapter' : 'removed to fit the cap'} · ${lesson.slug}`,
+      `${lesson.reason === 'retired' ? 'removed with the chapter' : 'removed to fit the cap'} · ${lesson.slug} (recurred ${lesson.recurred})`,
     ),
     el('div', 'board-owner__review-text', lesson.body),
   );

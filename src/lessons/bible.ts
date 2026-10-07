@@ -199,10 +199,12 @@ export interface RemovedLessonView {
 
 /** What an update does to one chapter, for the owner's review (owner
  * decision 2026-10-07: every visible change is shown, metadata and
- * removals included). */
+ * removals included). Derived from the plan's baseline and writes, so it
+ * can never disagree with what Accept writes. */
 export interface ChapterChange {
   readonly slug: string;
-  readonly title: string;
+  /** Title before (null for a new chapter) and after. */
+  readonly title: { readonly before: string | null; readonly after: string };
   readonly retired: boolean;
   /** Chapter summary before (null for a new chapter) and after. */
   readonly summary: { readonly before: string | null; readonly after: string };
@@ -214,6 +216,26 @@ export interface ChapterChange {
   readonly removed: readonly RemovedLessonView[];
   readonly provenanceTrimmed: number;
   readonly bodiesTrimmed: number;
+}
+
+/** One INDEX.md entry as briefings see it. */
+export interface IndexEntryView {
+  readonly summary: string;
+  readonly tags: readonly string[];
+}
+
+/** An INDEX.md line the update changes — including entries of chapters the
+ * update does not otherwise touch (index-cap compaction). */
+export interface IndexEntryChange {
+  readonly slug: string;
+  readonly before: IndexEntryView | null;
+  readonly after: IndexEntryView | null;
+}
+
+/** Everything the owner reviews before Accept. */
+export interface PlanReview {
+  readonly chapters: readonly ChapterChange[];
+  readonly index: readonly IndexEntryChange[];
 }
 
 /** One managed file a plan touches: its content hash before and after
@@ -232,10 +254,12 @@ export interface BiblePlan {
   /** Fingerprint of the book the plan produces. */
   readonly after: string;
   readonly files: readonly PlannedFile[];
+  /** The baseline text of every touched file (null = absent): the review
+   * is derived from it, and it must hash to `files[].before`. */
+  readonly before: readonly { readonly path: string; readonly text: string | null }[];
   readonly writes: readonly { readonly slug: string; readonly text: string }[];
   readonly retired: readonly string[];
   readonly indexText: string;
-  readonly changes: readonly ChapterChange[];
   readonly report: ApplyReport;
 }
 
@@ -547,8 +571,10 @@ export class BibleStore {
     for (const update of updates) {
       validateProposedChapter(update);
       if (update.retire === true) {
-        if (chapters.delete(update.slug)) retired.add(update.slug);
-        touched.add(update.slug);
+        // Retiring a chapter created earlier in this same batch is net
+        // absence: nothing to retire from the book.
+        if (chapters.delete(update.slug) && original.has(update.slug)) retired.add(update.slug);
+        else touched.delete(update.slug);
         continue;
       }
       retired.delete(update.slug);
@@ -564,7 +590,6 @@ export class BibleStore {
 
     const finalChapters: BibleChapter[] = [];
     const writes: { slug: string; text: string }[] = [];
-    const changes: ChapterChange[] = [];
     for (const chapter of chapters.values()) {
       if (!touched.has(chapter.slug)) {
         finalChapters.push(chapter);
@@ -577,26 +602,7 @@ export class BibleStore {
       lessonsDropped += capped.droppedLessons;
       finalChapters.push(capped.chapter);
       writes.push({ slug: chapter.slug, text: capped.text });
-      changes.push(describeChapterChange(original.get(chapter.slug) ?? null, capped));
     }
-    for (const slug of retired) {
-      const before = original.get(slug)!;
-      changes.push({
-        slug,
-        title: before.title,
-        retired: true,
-        summary: { before: before.summary, after: '' },
-        tags: { before: before.tags, after: [] },
-        added: [],
-        changed: [],
-        removed: before.lessons
-          .filter((lesson) => lesson.slug !== ARCHIVED_LESSON_SLUG)
-          .map((lesson) => ({ slug: lesson.slug, body: lesson.body, recurred: lesson.recurred, reason: 'retired' as const })),
-        provenanceTrimmed: 0,
-        bodiesTrimmed: 0,
-      });
-    }
-
     // Render the index BEFORE any write: a cap failure must leave the whole
     // bible untouched (otherwise a retried dream could double-count
     // recurrences over half-applied state).
@@ -620,10 +626,10 @@ export class BibleStore {
         before: contentHash(files.get(path)),
         after: contentHash(after.get(path)),
       })),
+      before: touchedPaths.map((path) => ({ path, text: files.get(path) ?? null })),
       writes,
       retired: [...retired],
       indexText,
-      changes,
       report: {
         chaptersWritten: writes.length,
         chaptersRetired: retired.size,
@@ -773,7 +779,70 @@ function planContent(plan: BiblePlan): Map<string, string | null> {
       throw new BibleError(`the update plan is inconsistent: ${file.path} does not match its planned result; nothing was written`);
     }
   }
+  const slugs = plan.writes.map((write) => write.slug);
+  if (new Set(slugs).size !== slugs.length || plan.retired.some((slug) => slugs.includes(slug)) || new Set(plan.retired).size !== plan.retired.length) {
+    throw new BibleError('the update plan is inconsistent: a chapter is written twice or both written and retired; nothing was written');
+  }
+  const baseline = new Map(plan.before.map((entry) => [entry.path, entry.text]));
+  if (baseline.size !== plan.before.length || baseline.size !== plan.files.length) {
+    throw new BibleError('the update plan is inconsistent: its baseline does not match its file list; nothing was written');
+  }
+  for (const file of plan.files) {
+    if (!baseline.has(file.path) || contentHash(baseline.get(file.path)) !== file.before) {
+      throw new BibleError(`the update plan is inconsistent: ${file.path} baseline does not match its recorded hash; nothing was written`);
+    }
+  }
+  if (plan.report.chaptersWritten !== plan.writes.length || plan.report.chaptersRetired !== plan.retired.length) {
+    throw new BibleError('the update plan is inconsistent: its report does not match its writes; nothing was written');
+  }
   return content;
+}
+
+/** Check a plan's internal consistency without writing anything — run
+ * before a stored proposal is shown or decided. */
+export function checkPlan(plan: BiblePlan): void {
+  planContent(plan);
+}
+
+/** The owner's review of a plan, derived from its baseline and its writes
+ * — never stored separately, so it cannot disagree with what Accept writes. */
+export function describePlan(plan: BiblePlan): PlanReview {
+  const baseline = new Map(plan.before.map((entry) => [entry.path, entry.text]));
+  const chapters: ChapterChange[] = [];
+  for (const write of plan.writes) {
+    const prior = baseline.get(`${BIBLE_CHAPTERS_DIR}/${write.slug}.md`) ?? null;
+    chapters.push(describeChapterChange(prior === null ? null : parseChapter(prior, write.slug), parseChapter(write.text, write.slug)));
+  }
+  for (const slug of plan.retired) {
+    const prior = baseline.get(`${BIBLE_CHAPTERS_DIR}/${slug}.md`) ?? null;
+    if (prior === null) continue;
+    const before = parseChapter(prior, slug);
+    chapters.push({
+      slug,
+      title: { before: before.title, after: before.title },
+      retired: true,
+      summary: { before: before.summary, after: '' },
+      tags: { before: before.tags, after: [] },
+      added: [],
+      changed: [],
+      removed: before.lessons
+        .filter((lesson) => lesson.slug !== ARCHIVED_LESSON_SLUG)
+        .map((lesson) => ({ slug: lesson.slug, body: lesson.body, recurred: lesson.recurred, reason: 'retired' as const })),
+      provenanceTrimmed: 0,
+      bodiesTrimmed: 0,
+    });
+  }
+  const entries = (text: string | null) =>
+    new Map(parseIndex(text ?? '').map((entry) => [entry.slug, { summary: entry.summary, tags: entry.tags }]));
+  const beforeIndex = entries(baseline.get(BIBLE_INDEX_FILE) ?? null);
+  const afterIndex = entries(plan.indexText);
+  const index: IndexEntryChange[] = [];
+  for (const slug of [...new Set([...beforeIndex.keys(), ...afterIndex.keys()])].sort()) {
+    const before = beforeIndex.get(slug) ?? null;
+    const after = afterIndex.get(slug) ?? null;
+    if (JSON.stringify(before) !== JSON.stringify(after)) index.push({ slug, before, after });
+  }
+  return { chapters, index };
 }
 
 /** sha256 of one file's content; null when the file is absent. */
@@ -786,15 +855,20 @@ function contentHash(text: string | undefined | null): string | null {
 function assertReadsBack(text: string, planned: BibleChapter): void {
   const reread = parseChapter(text, planned.slug);
   const shape = (chapter: BibleChapter) =>
-    JSON.stringify(chapter.lessons.map((lesson) => [lesson.slug, lesson.body, lesson.recurred, lesson.provenance, lesson.tags]));
+    JSON.stringify([
+      chapter.title,
+      chapter.summary,
+      chapter.tags,
+      chapter.lessons.map((lesson) => [lesson.slug, lesson.body, lesson.recurred, lesson.provenance, lesson.tags]),
+    ]);
   if (shape(reread) !== shape(planned)) {
     throw new BibleError(
-      `chapter ${planned.slug} would not read back as planned — a lesson body is being parsed as metadata or structure; reword it`,
+      `chapter ${planned.slug} would not read back as planned — its title, summary, tags or a lesson body would be parsed as other structure; reword it`,
     );
   }
 }
 
-function describeChapterChange(before: BibleChapter | null, capped: ChapterCapResult): ChapterChange {
+function describeChapterChange(before: BibleChapter | null, after: BibleChapter): ChapterChange {
   const previous = new Map(
     (before?.lessons ?? [])
       .filter((lesson) => lesson.slug !== ARCHIVED_LESSON_SLUG)
@@ -803,10 +877,17 @@ function describeChapterChange(before: BibleChapter | null, capped: ChapterCapRe
   const added: LessonChangeView[] = [];
   const changed: LessonChangeView[] = [];
   const kept = new Set<string>();
-  for (const lesson of capped.chapter.lessons) {
+  let provenanceTrimmed = 0;
+  let bodiesTrimmed = 0;
+  for (const lesson of after.lessons) {
     if (lesson.slug === ARCHIVED_LESSON_SLUG) continue;
     kept.add(lesson.slug);
     const prior = previous.get(lesson.slug);
+    if (lesson.body.endsWith(TRIM_MARKER) && prior?.body !== lesson.body) bodiesTrimmed += 1;
+    if (prior !== undefined) {
+      const now = new Set(lesson.provenance.map((ref) => ref.id));
+      provenanceTrimmed += prior.provenance.filter((ref) => !now.has(ref.id)).length;
+    }
     const view = {
       slug: lesson.slug,
       body: lesson.body,
@@ -825,16 +906,16 @@ function describeChapterChange(before: BibleChapter | null, capped: ChapterCapRe
     .filter((lesson) => !kept.has(lesson.slug))
     .map((lesson) => ({ slug: lesson.slug, body: lesson.body, recurred: lesson.recurred, reason: 'cap' as const }));
   return {
-    slug: capped.chapter.slug,
-    title: capped.chapter.title,
+    slug: after.slug,
+    title: { before: before?.title ?? null, after: after.title },
     retired: false,
-    summary: { before: before?.summary ?? null, after: capped.chapter.summary },
-    tags: { before: before?.tags ?? [], after: capped.chapter.tags },
+    summary: { before: before?.summary ?? null, after: after.summary },
+    tags: { before: before?.tags ?? [], after: after.tags },
     added,
     changed,
     removed,
-    provenanceTrimmed: capped.provenanceTrimmed,
-    bodiesTrimmed: capped.trimmed,
+    provenanceTrimmed,
+    bodiesTrimmed,
   };
 }
 
@@ -1624,6 +1705,9 @@ function validateProposedChapter(update: ProposedChapter): void {
   }
   if (update.title.trim() === '') throw new BibleError(`proposed chapter ${update.slug} has an empty title`);
   if (update.summary.trim() === '') throw new BibleError(`proposed chapter ${update.slug} has an empty summary`);
+  if (/[\r\n]/u.test(update.title) || /[\r\n]/u.test(update.summary)) {
+    throw new BibleError(`proposed chapter ${update.slug}: the title and summary must be single lines`);
+  }
   validateProposedTags(update.slug, update.tags);
   for (const lesson of update.lessons) validateProposedLesson(update.slug, lesson);
 }
@@ -1669,6 +1753,9 @@ function validateProposedTags(where: string, tags: readonly string[] | undefined
   if (tags === undefined) return;
   if (!Array.isArray(tags) || tags.some((tag) => typeof tag !== 'string' || tag.trim() === '')) {
     throw new BibleError(`${where}: tags must be an array of non-empty strings`);
+  }
+  if (tags.some((tag) => /[\r\n,]/u.test(tag))) {
+    throw new BibleError(`${where}: a tag may not contain a line break or a comma — the chapter format could not store it`);
   }
   if (tags.length > 12) throw new BibleError(`${where}: at most 12 tags`);
 }

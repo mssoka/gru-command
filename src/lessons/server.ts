@@ -151,10 +151,17 @@ export function createLessonsServer(options: LessonsServerOptions): LessonsServe
       if (!authed(req, res)) return true;
       const id = decodeURIComponent(decision[1] ?? '');
       const proposals = requireProposals();
+      const kind = decision[2] === 'accept' ? 'accepted' : 'rejected';
       try {
-        json(res, 200, decision[2] === 'accept' ? proposals.accept(id) : proposals.reject(id));
+        json(res, 200, kind === 'accepted' ? proposals.accept(id) : proposals.reject(id));
       } catch (error) {
         if (!(error instanceof ProposalError)) throw error;
+        if (error.code === 'incomplete') {
+          // The decision IS recorded; finishing it failed and resumes on
+          // retry or at startup — never reported as "not applied".
+          json(res, 202, { id, decision: kind, incomplete: true, detail: error.message });
+          return true;
+        }
         json(res, error.code === 'none' ? 404 : 409, { error: `proposal_${error.code}`, detail: error.message });
       }
       return true;
