@@ -459,6 +459,7 @@ export class BoardView {
     const active = document.activeElement;
     const inBand = active instanceof HTMLElement && mount.contains(active);
     const moreFocused = inBand && active.classList.contains('board-band__more');
+    const headFocused = inBand && active.classList.contains('board-band__head');
     const focusId = inBand ? active.dataset.actionId ?? null : null;
     const focusControl = inBand ? active.dataset.control ?? '' : '';
     const bandVisible = !mount.hidden && mount.closest('[hidden]') === null;
@@ -506,11 +507,15 @@ export class BoardView {
         );
         more.setAttribute('aria-expanded', String(this.ownerExpanded));
         more.addEventListener('click', () => {
+          // The first row beyond the current window is what this reveals;
+          // focus it (the disclosure) so the operator lands on the newly
+          // available content, falling back to an in-band anchor.
+          const rowsNow = this.snapshot === null ? null : ownerRows(this.snapshot);
+          const firstHidden =
+            rowsNow === null ? null : rowsNow[ownerWindow(rowsNow, false).rows.length]?.actionId ?? null;
           this.ownerExpanded = true;
           if (this.snapshot !== null) this.render(this.snapshot);
-          // The control disappeared with the expansion: anchor focus on an
-          // intentional band target (usually the first revealed row).
-          this.focusBandFallback();
+          if (firstHidden === null || !this.refocusAction(firstHidden, 'disclose')) this.focusBandFallback();
         });
         mount.append(more);
       }
@@ -520,9 +525,10 @@ export class BoardView {
       // older-pending window): focus must land on an intentional band
       // target, never fall to <body>.
       if (!this.refocusAction(focusId, focusControl)) this.focusBandFallback();
-    } else if (moreFocused) {
-      // The older-pending control itself was focused: its own activation
-      // re-renders the band, so restore to an intentional target too.
+    } else if (moreFocused || headFocused) {
+      // The older-pending control or the band heading (the fallback anchor
+      // itself) was focused: both are recreated on every render, so
+      // re-anchor to an intentional target on the NEXT push too.
       this.focusBandFallback();
     }
   }

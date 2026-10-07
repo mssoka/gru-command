@@ -1058,15 +1058,18 @@ test('long labels wrap as text; the long notification reveals its COMPLETE origi
   ]);
   expect(ackCalls).toEqual([]);
   // Phone leg: the same long labels must wrap honestly in the ≤560px
-  // stacked band without horizontal overflow (body, band, or detail box).
+  // stacked band without horizontal overflow (body, band, or detail box),
+  // and BOTH long rows must still be revealed there (never vacuous).
   await page.setViewportSize({ width: 360, height: 740 });
+  await expect(band.locator('.board-owner__detail:visible')).toHaveCount(2);
+  await expect(ackDisclose).toHaveAttribute('aria-expanded', 'true');
   const phoneOverflow = await page.evaluate(() => {
-    const band = document.getElementById('board-owner')!;
-    const details = [...band.querySelectorAll<HTMLElement>('.board-owner__detail')];
+    const bandEl = document.getElementById('board-owner')!;
+    const details = [...bandEl.querySelectorAll<HTMLElement>('.board-owner__detail')];
     return {
       body: document.documentElement.scrollWidth > document.documentElement.clientWidth,
-      band: band.scrollWidth > band.clientWidth,
-      detail: details.every((node) => node.scrollWidth <= node.clientWidth + 1),
+      band: bandEl.scrollWidth > bandEl.clientWidth,
+      detail: details.length === 2 && details.every((node) => node.scrollWidth <= node.clientWidth + 1),
     };
   });
   expect(phoneOverflow.body).toBe(false);
@@ -1126,11 +1129,15 @@ test('keyboard reveal on independent Ack and PR rows sends nothing; Ack, OPEN PR
   await waitForCount(page, 'prs.open', 10);
   await expectStripFamilies(page, familyAFamilies(10));
   await expectFocusedControl(page, ackButton, 'owner-ack:pend-0000', 'ack');
+  // Themed keyboard focus ring survives the restore on the explicit Ack
+  // control too (not only on the disclosure).
+  expect(await ackButton.evaluate((el) => getComputedStyle(el).outlineWidth)).toBe('3px');
   // Focused OPEN PR survives the same way (10→99) — focused, never activated.
   await prOpen.focus();
   await send(makeSnapshot({ ...familyA(99), pending: 2 }));
   await waitForCount(page, 'prs.open', 99);
   await expectFocusedControl(page, prOpen, 'owner-pr:synthetic', 'open');
+  expect(await prOpen.evaluate((el) => getComputedStyle(el).outlineWidth)).toBe('3px');
   // Full reconnect (socket close → re-auth → HTTP refetch) with the OPEN PR
   // control focused: the refetched state is genuinely CHANGED (100).
   send.stage(makeSnapshot({ ...familyA(100), pending: 2 }));
@@ -1295,12 +1302,17 @@ test('CHILDREN group appears only when the server reported counters (absent is n
   expect(separators.wrapped.left).toBe('0px');
   expect(separators.wrapped.top).toBe('2px');
   expect(separators.first.padLeft).toBe('0px');
+  expect(separators.second.padLeft).toBe('18px');
   expect(separators.wrapped.padLeft).toBe('0px');
   expect(separators.third.padRight).toBe('0px');
+  expect(separators.wrapped.padRight).toBe('0px');
   // The wrapped layout is auditable too: same reserved-slot geometry across
-  // two 4-group states (zero → non-zero values in the same slots).
+  // two 4-group states (the second push changes all four values).
   const childrenFirst = await geometry(page, { expectedKpis: 17, expectedGroups: 4 });
   await send(makeSnapshot(slotSpec({ gruWakeAgeMs: 300_000, children: { active: 4, queued: 0, finished: 6, lifetimeCreations: 20 } })));
+  await expect(children.locator('[data-kpi="children.active"]')).toHaveText('4');
+  await expect(children.locator('[data-kpi="children.queued"]')).toHaveText('0');
+  await expect(children.locator('[data-kpi="children.finished"]')).toHaveText('6');
   await expect(children.locator('[data-kpi="children.lifetimeCreations"]')).toHaveText('20');
   const childrenNext = await geometry(page, { expectedKpis: 17, expectedGroups: 4 });
   comparePairwise(childrenFirst, childrenNext);

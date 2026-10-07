@@ -5,7 +5,7 @@ created: '2026-10-07'
 status: 'in-review'
 route: 'dispatch'
 baseline_commit: '49b558f243c7bacbfb46c7bc04f749bf131cefea'
-review_loop_iteration: 1
+review_loop_iteration: 2
 context: []
 ---
 
@@ -139,7 +139,22 @@ Follow-ups folded into the same batch (reported, not dropped): silas `FAILED` pu
 
 Deferred (recorded in `deferred-work.md`): baseline failure-kind assertion (build/import RED vs behavioral RED) and narrow-width wake-age/deferred boundary legs.
 
-Round-2 resolution: patches landed in `8c7f4ed` (fix batch), `161109c`/`1f8f363` (e2e geometry parameterization + stamped CHILDREN fixture; two failed strip-browser attempts retained as honest history). Re-verification at `1f8f363`: unit GREEN 137 (run 1ef4b1b6 at 8c7f4ed, unchanged files); strip-browser GREEN 67 (run f7308402); strip-smoke GREEN (run bdea9798; the first attempt run 9e4030da failed with 0 tests started on `http://localhost:8788 is already used` — a port-release race with the preceding run, inspected, no leftover process; one bounded rerun under a fresh request id); strip-themes GREEN (run 73981b71); dashboard-slim-strip-baseline RED (run bfcb4b67, exit 1 under the new guard); strip-browser-baseline RED (run 921acc83); typecheck GREEN (run 1c0468fe); full GREEN (run 153d73ac). Round-3 concluding whole-change review commissioned at the post-fix head; only findings intersecting the delta `ddc42e4..1f8f363` can block (others report as follow-ups).
+Round-2 resolution: patches landed in `8c7f4ed` (fix batch), `161109c`/`1f8f363` (e2e geometry parameterization + stamped CHILDREN fixture; two failed strip-browser attempts retained as honest history). Re-verification at `1f8f363`: unit GREEN **142** (run 1ef4b1b6 at 8c7f4ed — the suite grew to 142 with the round-2 tests; the earlier `137` note was the round-1 suite size and was corrected here per round-3 VG); strip-browser GREEN 67 (run f7308402); strip-smoke GREEN (run bdea9798; the first attempt run 9e4030da failed with 0 tests started on `http://localhost:8788 is already used` — a port-release race with the preceding run, inspected, no leftover process; one bounded rerun under a fresh request id); strip-themes GREEN (run 73981b71); dashboard-slim-strip-baseline RED (run bfcb4b67, exit 1 under the new guard); strip-browser-baseline RED (run 921acc83); typecheck GREEN (run 1c0468fe); full GREEN (run 153d73ac). Round-3 concluding whole-change review commissioned at `ac4fb4b`; only findings intersecting the delta `ddc42e4..ac4fb4b` could block (others report as follow-ups; the scope note here said `..1f8f363` before the spec-record commit and was corrected per round-3 BH).
+
+Round 3 reviewed `ac4fb4bee251b559d03bc9b6190874bd0bf54361` (blind-hunter 12: 7 delta + 5 follow-ups; edge-case 1 delta; verification-gap 3 delta + 3 other). All delta findings were patch; the untouched-code follow-ups are recorded in `deferred-work.md` (one, the pipeline-board coverage question, is answered by running the existing `pipeline-board-browser` scope at the final head).
+
+| # | Finding (surface) | Verdict | Route / evidence |
+|---|---|---|---|
+| R3-1 | The band-head fallback was not re-captured: the next snapshot push after the empty-band fallback replaced the focused `h2` and dropped focus out of the band (BH D1, EC-1, VG-1) | medium | patch: `headFocused` capture routes a focused `.board-band__head` through `focusBandFallback()`; the empty-band unit test now renders twice and asserts in-band focus both times. |
+| R3-2 | The themed focus ring was asserted only on the disclosure; the Ack/OPEN PR selectors in the same rule were unobserved (BH D2, VG-3) | low | patch: computed `outlineWidth === '3px'` asserted after the restored Ack and OPEN PR focus legs. |
+| R3-3 | Wrapped-row flush-right and the in-row 18px spacing were unpinned (BH D3) | low | patch: `wrapped.padRight === '0px'` and `second.padLeft === '18px'` assertions. |
+| R3-4 | The 360 long-label leg could pass vacuously (`[].every` true; no visibility check) (BH D4) | low | patch: both long rows asserted visible at 360 (`:visible` count 2 + `details.length === 2` guard). |
+| R3-5 | Baseline guards collapsed any nonzero to `exit 1`, losing the runner's real code (BH D5, VG-other) | low | patch: both scopes now `exit "$code"` (unexpected green still `exit 2`), so printed code and `outcome.exitCode` agree. |
+| R3-6 | Activating `+N older pending` focused the band top, not the first newly revealed row (BH D6) | low | patch: the click handler captures the first row beyond the window and focuses its disclosure (fallback unchanged); unit test now pins `m-02`. |
+| R3-7 | The second CHILDREN state re-verified only one of four numbers before the pairwise geometry; the comment misstated the states (BH D7) | low | patch: all four values asserted after the second push; comment corrected. |
+| R3-8 | The round-2 spec record quoted a 137-test unit receipt against `8c7f4ed` while the suite was 142 (VG-other) | low | patch: record corrected; the final-head unit re-run evidences the final count. |
+
+Round-3 follow-ups (untouched code, reported not blocking): panel PR layout is flow-adapted vs the base grid (F1); the CHILDREN group tone falls to neutral `park` (F3); group section names use the tooltip enumeration rather than the visible heading (F4); `geometry()` cannot measure unstamped wake states (F5) — all recorded in `deferred-work.md`. The pipeline-board coverage question (F2) is addressed by executing the existing `pipeline-board-browser` scope at the final head. Round-4 delta-scoped review commissioned at the post-fix head (iteration 2); only findings intersecting the round-3 fix delta can block.
 
 ## Design Notes
 

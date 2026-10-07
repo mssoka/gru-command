@@ -2803,6 +2803,11 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(band.querySelector('.board-owner__row')).toBeNull();
     expect(band.contains(document.activeElement)).toBe(true);
     expect(document.activeElement).toBe(band.querySelector('.board-band__head'));
+    // The fallback anchor is itself recreated on every render: the NEXT
+    // push must keep focus in the band too (the head is re-detected).
+    view.render(snapshot({ notifications: [{ ...only, ackedAt: '2026-01-01T00:09:00.000Z' }] }));
+    expect(band.contains(document.activeElement)).toBe(true);
+    expect(document.activeElement).toBe(band.querySelector('.board-band__head'));
   });
 
   it('settling the focused row with rows remaining keeps focus on a remaining band control', () => {
@@ -2830,7 +2835,11 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     view.render(snapshot({ notifications: stops }));
     expect(document.activeElement).toBe(document.getElementById('board-owner')!.querySelector('.board-band__more'));
     document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-band__more')!.click();
-    expect(document.getElementById('board-owner')!.contains(document.activeElement)).toBe(true);
+    // Activating the expander lands focus on the FIRST newly revealed row
+    // (m-02; the six visible before expansion are m-08..m-03).
+    expect(document.activeElement).toBe(
+      document.getElementById('board-owner')!.querySelector('[data-action-id="owner-ack:m-02"][data-control="disclose"]'),
+    );
   });
 
   it('region ids are allocated per action id — `a_b` and `a-b` never collide', () => {

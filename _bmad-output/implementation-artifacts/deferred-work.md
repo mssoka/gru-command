@@ -143,3 +143,15 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
   summary: The wake-age and deferred-count digit-boundary legs (9→10, 99→100, 999→1000) run at 1440 only, while the acceptance names 1440/1200/768/360.
   evidence: The familyA/B/C boundary loops cover all four viewports for the other slots and the reserved-slot CSS is shared, but the age/deferred slots cross their own boundaries at one width only; extend the two long tests with narrow-width legs at the next suite touch (the long-label test now has a 360 leg).
+- source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
+  summary: The bell panel's ready-PR row keeps its prior content and explicit OPEN PR link but flows with a flex override instead of the base grid alignment; no test compares the panel layout to base.
+  evidence: Round-3 blind-hunter follow-up (panel variant added by the port commit, not the review delta). Content/regions/controls are preserved and asserted structurally; revisit only when the notification panel is next touched, with a panel-level visual or computed-style pin.
+- source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
+  summary: The optional CHILDREN group falls through the tone map to the neutral park marker; no tone is assigned or asserted.
+  evidence: Round-3 blind-hunter follow-up. The approved reference defines only HEISTS/PRS/CREW marker tones; decide a CHILDREN tone (or keep neutral) and pin it when the group is next touched.
+- source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
+  summary: Each `.strip-group` section's accessible name is the tooltip enumeration (`working / in-review / …`) rather than the visible heading (HEISTS/PRS/CREW/CHILDREN).
+  evidence: Round-3 blind-hunter follow-up. No test asserts the section name; switch to the visible name or `aria-labelledby` the head when the strip next receives an a11y pass.
+- source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
+  summary: `geometry()` cannot measure wake states without a valid stamp (`no wakes yet` / `last wake unknown`), so those states have text assertions only.
+  evidence: Round-3 blind-hunter follow-up: `need(.board-age-split__num)` throws for unstamped states; add optional-slot handling when the geometry helper is next extended.
