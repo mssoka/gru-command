@@ -29,15 +29,22 @@ afterEach(() => { vi.unstubAllEnvs(); for (const root of roots.splice(0)) rmSync
 /** Copy a directory TREE into `destination` (contents, unambiguously —
  * never `cp`'s copy-into-existing-dir nesting). On darwin APFS clonefile
  * makes this ~13s instead of cpSync's 80-100s per ~150MB identity tree;
- * the portable path copies entry by entry. */
-function copyTree(source: string, destination: string): void {
+ * the portable path copies entry by entry. The clone step is injectable
+ * so the failure/cleanup path is itself testable. */
+function copyTree(
+  source: string,
+  destination: string,
+  clone: (source: string, destination: string) => void = (from, to) => {
+    // `source/.` copies the directory CONTENTS into the existing dest
+    // (a literal suffix: path.join would normalize the `/.` away and
+    // turn this into copy-INTO, nesting the tree).
+    execFileSync('cp', ['-cR', `${from}/.`, to], { stdio: 'ignore' });
+  },
+): void {
   mkdirSync(destination, { recursive: true });
   if (process.platform === 'darwin') {
     try {
-      // `source/.` copies the directory CONTENTS into the existing dest
-      // (a literal suffix: path.join would normalize the `/.` away and
-      // turn this into copy-INTO, nesting the tree).
-      execFileSync('cp', ['-cR', `${source}/.`, destination], { stdio: 'ignore' });
+      clone(source, destination);
       return;
     } catch {
       // Clone unsupported (different volume/filesystem) — portable copy.
@@ -76,6 +83,32 @@ let packageTarballCache: { tarballPath: string } | null = null;
 let packageBuildRoot: string | null = null;
 afterAll(() => {
   if (packageBuildRoot !== null) rmSync(packageBuildRoot, { recursive: true, force: true });
+});
+
+describe('identity fixture reliability (darwin paths)', () => {
+  it.skipIf(process.platform !== 'darwin')('clears a partially written clone destination before the portable fallback', () => {
+    const source = mkdtempSync(join(tmpdir(), 'gru-copytree-src-'));
+    const destination = mkdtempSync(join(tmpdir(), 'gru-copytree-dst-'));
+    try {
+      writeFileSync(join(source, 'keep.txt'), 'source\n');
+      writeFileSync(join(destination, 'stale.txt'), 'stale\n');
+      copyTree(source, destination, (_from, to) => {
+        // Simulate a clone that dies after writing partial output.
+        writeFileSync(join(to, 'partial.tmp'), 'partial\n');
+        throw new Error('clone unsupported on this volume');
+      });
+      expect(existsSync(join(destination, 'stale.txt'))).toBe(false);
+      expect(existsSync(join(destination, 'partial.tmp'))).toBe(false);
+      expect(readFileSync(join(destination, 'keep.txt'), 'utf-8')).toBe('source\n');
+    } finally {
+      rmSync(source, { recursive: true, force: true });
+      rmSync(destination, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(process.platform !== 'darwin')('clearProvenanceXattrs rethrows real failures (only a missing tool is tolerated)', () => {
+    expect(() => clearProvenanceXattrs(join(tmpdir(), 'gru-no-such-tree-for-xattr'))).toThrow();
+  });
 });
 
 function packageTarball(): { tarballPath: string } {

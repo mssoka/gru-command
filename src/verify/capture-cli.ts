@@ -107,13 +107,28 @@ export function nodeStreamFetch(input: string, init?: RequestInit): Promise<Resp
     }
     const request = requestFn(url, { method: init?.method ?? 'GET', headers }, (response) => {
       let cachedBody: ReadableStream<Uint8Array> | null = null;
-      let bodyTouched = false;
+      let bodyAccessed = false;
+      let consumedByText = false;
+      const consumedBodyStream = (): ReadableStream<Uint8Array> =>
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.error(new Error('response body unavailable: text()/json() already consumed it'));
+          },
+        });
       const text = (): Promise<string> => {
-        if (bodyTouched) {
-          // The stream surface allows both styles upstream, but a second
-          // consumer of one live response would hang forever on `end`.
+        // One response, one consumer. Every mixed or repeated consumption
+        // fails loud here: the transport has no idle timeout by design, so
+        // attaching another `end` listener to an already-ended response
+        // would leave the caller hanging forever. Touching the byte-stream
+        // surface claims it too (the narrow FetchLike surface is used with
+        // exactly one style per response).
+        if (consumedByText) {
+          return Promise.reject(new Error('response text()/json() is one-shot; it was already consumed'));
+        }
+        if (bodyAccessed) {
           return Promise.reject(new Error('response body already consumed by the byte stream'));
         }
+        consumedByText = true;
         return new Promise((resolveText, rejectText) => {
           const chunks: Buffer[] = [];
           response.on('data', (chunk: Buffer) => chunks.push(chunk));
@@ -125,7 +140,11 @@ export function nodeStreamFetch(input: string, init?: RequestInit): Promise<Resp
         ok: response.statusCode !== undefined && response.statusCode >= 200 && response.statusCode < 300,
         status: response.statusCode ?? 0,
         get body(): ReadableStream<Uint8Array> | null {
-          bodyTouched = true;
+          if (consumedByText) {
+            cachedBody ??= consumedBodyStream();
+            return cachedBody;
+          }
+          bodyAccessed = true;
           if (cachedBody === null) {
             cachedBody = new ReadableStream<Uint8Array>({
               start(controller) {
@@ -168,19 +187,23 @@ export function nodeStreamFetch(input: string, init?: RequestInit): Promise<Resp
   });
 }
 
-/** Transport errors keep the primary message and add the underlying cause
- * (errno/code) when the runtime attached one, so a severed stream is
- * diagnosable from the receipt instead of a bare "terminated". */
-function describeTransportError(error: unknown): string {
+/** Transport errors keep the primary message and add the underlying code
+ * (the runtime attaches it either on the error itself or on its cause)
+ * so a severed stream is diagnosable from the receipt instead of a bare
+ * "terminated". */
+export function describeTransportError(error: unknown): string {
   if (!(error instanceof Error)) return String(error);
+  const ownCode = (error as NodeJS.ErrnoException).code;
+  const base =
+    ownCode === undefined || ownCode === '' ? error.message : `${error.message} (code ${String(ownCode)})`;
   const cause = error.cause;
-  if (cause === undefined) return error.message;
+  if (cause === undefined) return base;
   const code = (cause as NodeJS.ErrnoException | undefined)?.code;
   const causeText =
     cause instanceof Error
       ? `${cause.name}: ${cause.message}${code === undefined || code === '' ? '' : ` (code ${String(code)})`}`
       : String(cause);
-  return `${error.message} — cause: ${causeText}`;
+  return `${base} — cause: ${causeText}`;
 }
 
 export interface CaptureCliDeps {

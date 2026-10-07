@@ -1778,6 +1778,43 @@ describe('administrative closeout of a parked PR-backed job', () => {
     }
   });
 
+  it('administrative closeout is ONE transaction: a failed obligation closure rolls back the audit and the status hop', () => {
+    const { api, db, dir } = freshDb();
+    try {
+      parkedPrJob(api, 'closeout-atomic');
+      const ts = '2026-10-06T00:00:00.000Z';
+      db.handle
+        .prepare(
+          `INSERT INTO job_obligations
+             (id, job_id, logical_step, incident_key, generation, description, category, next_action, wake_condition,
+              authority, firing_rule, state, recorded_receipts, observations, first_origin_seq, last_origin_seq,
+              created_at, updated_at)
+           VALUES (?, ?, 'operation', 'closeout-atomic', 1, NULL, '{"kind":"known","category":"review-verdict"}',
+                   '{"kind":"gru-decision","decision":"hold"}', '{"kind":"sweep"}',
+                   NULL, 'review-verdict-gru-decision', 'open', '[]', 1, 1, 1, ?, ?)`,
+        )
+        .run('closeout-atomic:operation:closeout-atomic', 'closeout-atomic', ts, ts);
+      db.handle.exec(`CREATE TRIGGER fail_closeout_settlement BEFORE INSERT ON events
+        WHEN NEW.kind = 'job.obligation-settled' BEGIN SELECT RAISE(ABORT, 'obligation blocked'); END`);
+      try {
+        expect(() => api.adminCloseParkedJob(closeoutRequest('closeout-atomic'))).toThrow(/obligation blocked/u);
+        expect(api.getJob('closeout-atomic')?.status).toBe('parked');
+        expect(api.latestJobEvent('closeout-atomic', 'job.admin-closeout')).toBeNull();
+        expect(api.listObligations({ jobId: 'closeout-atomic', state: 'open' })).toHaveLength(1);
+      } finally {
+        db.handle.exec('DROP TRIGGER fail_closeout_settlement');
+      }
+      expect(api.adminCloseParkedJob(closeoutRequest('closeout-atomic')).job.status).toBe('done');
+      expect(api.listObligations({ jobId: 'closeout-atomic', state: 'open' })).toHaveLength(0);
+      const settled = api.listObligations({ jobId: 'closeout-atomic', state: 'settled' });
+      expect(settled).toHaveLength(1);
+      expect(settled[0]?.settlement).toMatchObject({ kind: 'job-terminal', jobStatus: 'done' });
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('administrative closeout accepts full-identity variants: 64-char uppercase head and an omitted closed_at', () => {
     const { api, db, dir } = freshDb();
     try {
@@ -1991,11 +2028,57 @@ describe('owner-listed administrative cancellation (owner amendment j-1117)', ()
       });
       expect(payload.request_sha256).toMatch(/^[0-9a-f]{64}$/u);
       expect(payload.prior['updated_at']).toBeTruthy();
+      // No fabricated provider receipt rides the abandonment audit.
+      expect(payload).not.toHaveProperty('provider');
+      expect(payload.prior).not.toHaveProperty('provider');
       // Direct hop: parked → done, no intermediate executable state.
       const hops = api.listJobEventsByKinds(LISTED, ['job.status']);
       expect(hops[0]?.payload).toEqual({ from: 'parked', to: 'done' });
       // The audit is not a success claim and the preserved note is untouched.
       expect(api.getJob(LISTED)?.note).toBe('preserved note');
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('owner cancellation is ONE transaction: a failed obligation closure rolls back the audit and the status hop', () => {
+    const { api, db, dir } = freshDb();
+    try {
+      listedParkedJob(api, LISTED);
+      const ts = '2026-10-06T00:00:00.000Z';
+      // An open obligation for the lane, shaped exactly like the ledger's
+      // own rows (the closure walks these).
+      db.handle
+        .prepare(
+          `INSERT INTO job_obligations
+             (id, job_id, logical_step, incident_key, generation, description, category, next_action, wake_condition,
+              authority, firing_rule, state, recorded_receipts, observations, first_origin_seq, last_origin_seq,
+              created_at, updated_at)
+           VALUES (?, ?, 'operation', 'cancel-atomic', 1, NULL, '{"kind":"known","category":"review-verdict"}',
+                   '{"kind":"gru-decision","decision":"hold"}', '{"kind":"sweep"}',
+                   NULL, 'review-verdict-gru-decision', 'open', '[]', 1, 1, 1, ?, ?)`,
+        )
+        .run(`${LISTED}:operation:cancel-atomic`, LISTED, ts, ts);
+      // Abort the LAST write of the action (the obligation settlement
+      // event): the audit append and the parked → done hop must roll back
+      // with it — one transaction, never partial state.
+      db.handle.exec(`CREATE TRIGGER fail_cancel_settlement BEFORE INSERT ON events
+        WHEN NEW.kind = 'job.obligation-settled' BEGIN SELECT RAISE(ABORT, 'obligation blocked'); END`);
+      try {
+        expect(() => api.adminCancelListedParkedJob(cancelRequest(LISTED))).toThrow(/obligation blocked/u);
+        expect(api.getJob(LISTED)?.status).toBe('parked');
+        expect(api.latestJobEvent(LISTED, 'job.owner-cancellation')).toBeNull();
+        expect(api.listObligations({ jobId: LISTED, state: 'open' })).toHaveLength(1);
+      } finally {
+        db.handle.exec('DROP TRIGGER fail_cancel_settlement');
+      }
+      // The retry commits once and closes the obligation as terminal debt.
+      expect(api.adminCancelListedParkedJob(cancelRequest(LISTED)).job.status).toBe('done');
+      expect(api.listObligations({ jobId: LISTED, state: 'open' })).toHaveLength(0);
+      const settled = api.listObligations({ jobId: LISTED, state: 'settled' });
+      expect(settled).toHaveLength(1);
+      expect(settled[0]?.settlement).toMatchObject({ kind: 'job-terminal', jobStatus: 'done' });
     } finally {
       db.close();
       rmSync(dir, { recursive: true, force: true });
@@ -2019,12 +2102,30 @@ describe('owner-listed administrative cancellation (owner amendment j-1117)', ()
       api.setJobStatus(LISTED, 'parked');
       expect(refusalOf(() => api.adminCancelListedParkedJob(cancelRequest(LISTED))).code).toBe('not-cancellable-shape');
 
-      // Listed but report-typed: no fabrication, no folding.
+      // Listed but report-typed: no fabrication, no folding. Every report
+      // field on its own is the wrong shape, not just `deliverable`.
       const reportId = OWNER_CANCELLATION_JOB_IDS[1]!;
       api.addJob({ id: reportId, repo: 'gru-command', title: 't', briefing: 'b', deliverable: 'review' });
       api.setJobStatus(reportId, 'working');
       api.setJobStatus(reportId, 'parked');
       expect(refusalOf(() => api.adminCancelListedParkedJob(cancelRequest(reportId))).code).toBe('not-cancellable-shape');
+      const shapedIds: string[] = [];
+      for (const [index, metadata] of [
+        { commissioner: 'gru' },
+        { targetRef: 'https://github.com/acme/gru-command/pull/9' },
+        { targetSha: 'a'.repeat(40) },
+      ].entries()) {
+        const shapedId = OWNER_CANCELLATION_JOB_IDS[5 + index]!;
+        api.addJob({ id: shapedId, repo: 'gru-command', title: 't', briefing: 'b', ...metadata });
+        api.setJobStatus(shapedId, 'working');
+        api.setJobStatus(shapedId, 'parked');
+        expect(
+          refusalOf(() => api.adminCancelListedParkedJob(cancelRequest(shapedId))).code,
+          JSON.stringify(metadata),
+        ).toBe('not-cancellable-shape');
+        expect(api.getJob(shapedId)?.status, JSON.stringify(metadata)).toBe('parked');
+        shapedIds.push(shapedId);
+      }
 
       // Malformed authority / reason are plain 400-class input errors.
       expect(() => api.adminCancelListedParkedJob(cancelRequest(LISTED, { authorityReference: '' }))).toThrow(/authority_reference/u);
@@ -2032,12 +2133,15 @@ describe('owner-listed administrative cancellation (owner amendment j-1117)', ()
       expect(() => api.adminCancelListedParkedJob(cancelRequest(LISTED, { reason: '' }))).toThrow(/reason/u);
 
       // No partial change anywhere.
-      for (const id of ['not-on-the-list', LISTED, reportId]) {
+      for (const id of ['not-on-the-list', LISTED, reportId, ...shapedIds]) {
         expect(api.latestJobEvent(id, 'job.owner-cancellation'), id).toBeNull();
       }
       expect(api.getJob('not-on-the-list')?.status).toBe('parked');
       expect(api.getJob(LISTED)?.status).toBe('parked');
       expect(api.getJob(reportId)?.status).toBe('parked');
+      for (const id of shapedIds) {
+        expect(api.getJob(id)?.status, id).toBe('parked');
+      }
     } finally {
       db.close();
       rmSync(dir, { recursive: true, force: true });
@@ -2060,6 +2164,12 @@ describe('owner-listed administrative cancellation (owner amendment j-1117)', ()
         'open tool call': { state: 'watching', breakerOpen: false, openTurn: false, openControl: false, openToolCalls: 1 },
         'active restart': { state: 'restarting', breakerOpen: false, openTurn: false, openControl: false, openToolCalls: 0 },
       };
+      const clauseTokens: Record<string, string> = {
+        'open turn': 'openTurn',
+        'control phase': 'openControl',
+        'open tool call': 'open tool call',
+        'active restart': 'restarting',
+      };
       for (const [label, view] of Object.entries(clauseScenarios)) {
         const probe = {
           liveHandleIds: new Set<string>(),
@@ -2069,6 +2179,8 @@ describe('owner-listed administrative cancellation (owner amendment j-1117)', ()
         expect(refused.name, label).toBe('AdminCancellationRefusal');
         expect(refused.code, label).toBe('live-work');
         expect(refused.message, label).toContain('idle-but-open');
+        // The refusal detail names the authoritative fact that refused.
+        expect(refused.message, label).toContain(clauseTokens[label]!);
         expect(api.getJob(OWNER_CANCELLATION_JOB_IDS[2]!)?.status, label).toBe('parked');
       }
 

@@ -291,6 +291,9 @@ describe('board server — HTTP API', () => {
       { ...validBody, provider: { ...validBody.provider, head_sha: 'nope' } },
       { ...validBody, provider: { ...validBody.provider, closed_at: 'not-a-time' } },
       { ...validBody, provider: { ...validBody.provider, closed_at: '' } },
+      // Present-but-null is not "omitted": the typed contract accepts a
+      // real timestamp or an absent field, at BOTH boundaries.
+      { ...validBody, provider: { ...validBody.provider, closed_at: null } },
       { ...validBody, expected_pr_url: '' },
       { ...validBody, expected_pr_url: 'not-a-url' },
       { ...validBody, reason: '' },
@@ -454,6 +457,49 @@ describe('board server — HTTP API', () => {
     ).toBeNull();
   });
 
+  it('closeout endpoint passes the authoritative runtime probe: a ledger idle row with an open turn refuses', async () => {
+    const head = '3c44e87e2e9e64cbc3301d7806540df6273438e6';
+    const prUrl = 'https://github.com/acme/gru-command/pull/179';
+    const local = await boot('closeout-probe-token', {
+      closeoutRuntime: () => ({
+        liveHandleIds: new Set<string>(),
+        supervisionFor: (agentId: string) =>
+          agentId === 'closeout-probe-idle-open'
+            ? { state: 'watching', breakerOpen: false, openTurn: true, openControl: false, openToolCalls: 0 }
+            : null,
+      }),
+    });
+    try {
+      const jobId = 'closeout-probe';
+      local.api.addJob({ id: jobId, repo: 'demo-repo', title: 'Closeout probe lane' });
+      local.api.setJobStatus(jobId, 'working');
+      local.api.setJobPr(jobId, prUrl);
+      local.api.setJobStatus(jobId, 'in-review');
+      local.api.setJobStatus(jobId, 'parked');
+      local.api.appendCustomEvent({
+        kind: 'github.branch-state',
+        jobId,
+        payload: branchStatePayload(
+          { jobId, repo: { host: 'github.com', owner: 'acme', repo: 'gru-command' }, branch: `gru/${jobId}`, prNumber: 179, prUrl },
+          { sha: head, merged: false, prOpen: false, mergeableState: 'dirty', ci: null, prNumber: 179, prUrl, mergeCommitSha: null },
+        ),
+      });
+      local.api.registerAgent({ id: 'closeout-probe-idle-open', role: 'minion', jobId });
+      local.api.setAgentState('closeout-probe-idle-open', 'idle');
+      const refused = await postJson(local.port, `/api/jobs/${jobId}/closeout`, 'closeout-probe-token', {
+        expected_status: 'parked',
+        expected_pr_url: prUrl,
+        provider: { provider: 'github', state: 'closed', merged: false, head_sha: head },
+        reason: 'probe forwarding',
+      });
+      expect(refused.status).toBe(409);
+      expect(refused.body).toMatchObject({ error: 'closeout_refused', code: 'live-work' });
+      expect(local.api.getJob(jobId)?.status).toBe('parked');
+    } finally {
+      await local.close();
+    }
+  });
+
   it('owner cancellation endpoint: auth, malformed bodies, unlisted refusals and the audited idempotent success', async () => {
     const { api, port } = harness;
     const listed = 'gc-freeze-heat-evidence';
@@ -541,17 +587,23 @@ describe('board server — HTTP API', () => {
 
   it('the main assembly wires the authoritative closeout runtime probe (assembly alarm)', () => {
     // The behavior has unit coverage but the production composition does
-    // not: dropping this wiring would silently fall back to durable markers
+    // not: dropping this wiring — or wiring a falsified constant instead
+    // of the live view value — would silently fall back to durable markers
     // only and no behavioral test would fail (same alarm pattern as the
-    // supervisor-stop wiring pin).
+    // supervisor-stop wiring pin). This pin therefore matches the exact
+    // mapping expressions, not just their property names.
     const mainSource = readFileSync(join(import.meta.dirname, '..', 'src', 'main.ts'), 'utf8');
     const start = mainSource.indexOf('closeoutRuntime:');
     expect(start, 'main.ts declares closeoutRuntime').toBeGreaterThanOrEqual(0);
-    const block = mainSource.slice(start, start + 900);
-    expect(block).toContain('registry.listHandles()');
-    expect(block).toContain('supervisorLive.viewFor(agentId)');
-    expect(block).toContain('openTurn');
-    expect(block).toContain('openToolCalls');
+    const block = mainSource.slice(start, start + 1200);
+    expect(block).toMatch(/liveHandleIds:\s*new Set\(registry\.listHandles\(\)\.map\(\(handle\) => handle\.id\)\)/u);
+    expect(block).toMatch(/supervisionFor:\s*\(agentId\)\s*=>\s*\{/u);
+    expect(block).toMatch(/const view = supervisorLive\.viewFor\(agentId\);/u);
+    expect(block).toMatch(/state:\s*view\.state,/u);
+    expect(block).toMatch(/breakerOpen:\s*view\.breakerOpen,/u);
+    expect(block).toMatch(/openTurn:\s*view\.openTurn,/u);
+    expect(block).toMatch(/openControl:\s*view\.openControl === true,/u);
+    expect(block).toMatch(/openToolCalls:\s*view\.openToolCalls,/u);
   });
 
   it('write endpoints reject bad bodies and missing entities', async () => {

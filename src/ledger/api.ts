@@ -1911,7 +1911,7 @@ export class LedgerApi {
           view.state === 'restarting';
         if (openWork) {
           openTurns.push(
-            `${agent.id} (supervision ${view.state}${view.openTurn ? ', openTurn' : ''}${view.openToolCalls > 0 ? `, ${view.openToolCalls} open tool call(s)` : ''})`,
+            `${agent.id} (supervision ${view.state}${view.openTurn ? ', openTurn' : ''}${view.openControl ? ', openControl' : ''}${view.openToolCalls > 0 ? `, ${view.openToolCalls} open tool call(s)` : ''})`,
           );
           continue;
         }

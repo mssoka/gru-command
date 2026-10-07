@@ -11,8 +11,11 @@
  * automatic batch apply exists.
  */
 
-/** The owner ruling this allowlist was staged under (recorded in the
- * cancellation audit; the request must name it). */
+/** The owner ruling this allowlist was staged under. The operation
+ * stamps it into the cancellation audit next to the caller's authority
+ * reference, which is recorded verbatim — the reference is evidence
+ * text, not the thing that grants authority; allowlist membership plus
+ * the authenticated endpoint is the executable guard. */
 export const OWNER_CANCELLATION_RULING = 'j-1117';
 
 /** The exact owner-authorized cancellation list, verbatim from the

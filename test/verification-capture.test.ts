@@ -23,6 +23,7 @@ import {
 } from '../src/verify/capture.js';
 import {
   CAPTURE_EXIT,
+  describeTransportError,
   nodeStreamFetch,
   parsePsOutput,
   runCaptureCli,
@@ -477,10 +478,157 @@ describe('capture CLI run: exclusive sink + honest outcome', () => {
       const receipt = JSON.parse(readFileSync(captureReceiptPath(sinkPath), 'utf-8')) as CaptureReceipt;
       expect(receipt.outcome).toBe('unknown');
       expect(captureReceiptSucceeded(receipt)).toBe(false);
+      // The receipt keeps the socket errno, not just "aborted".
+      expect(receipt.error).toContain('ECONNRESET');
     } finally {
       server.closeAllConnections();
       await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
     }
+  });
+
+  it('the raw transport is one-shot: every mixed or repeated consumer fails loud instead of hanging', async () => {
+    const server = createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end('payload\n');
+    });
+    await new Promise<void>((resolveListen) => server.listen(0, '127.0.0.1', resolveListen));
+    try {
+      const port = (server.address() as AddressInfo).port;
+      const url = `http://127.0.0.1:${String(port)}/one-shot`;
+      // text() then text()/json(): the second read rejects (a second
+      // `end` listener on the finished response would never settle).
+      const first = await nodeStreamFetch(url);
+      expect(await first.text()).toBe('payload\n');
+      await expect(first.text()).rejects.toThrow(/one-shot/u);
+      await expect(first.json()).rejects.toThrow(/one-shot/u);
+      // text() then body: the byte stream errors on read, never hangs.
+      await expect(first.body!.getReader().read()).rejects.toThrow(/already consumed/u);
+      // body then text(): the byte stream owns the response.
+      const second = await nodeStreamFetch(url);
+      const reader = second.body!.getReader();
+      await reader.read();
+      await expect(second.text()).rejects.toThrow(/byte stream/u);
+      // Touching the body surface claims the response even without a read.
+      const third = await nodeStreamFetch(url);
+      expect(third.body).not.toBeNull();
+      await expect(third.text()).rejects.toThrow(/byte stream/u);
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+    }
+  });
+
+  it('pauses the socket once the consumer is behind and resumes on read (bounded queue)', async () => {
+    const chunkBytes = 64 * 1024;
+    const totalBytes = 384 * chunkBytes; // 24 MiB
+    let written = 0;
+    let blockedAt: number | null = null;
+    const server = createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/octet-stream' });
+      const chunk = Buffer.alloc(chunkBytes, 7);
+      const pump = (): void => {
+        while (written < totalBytes) {
+          const accepted = res.write(chunk);
+          written += chunkBytes;
+          if (!accepted) {
+            blockedAt ??= written;
+            res.once('drain', pump);
+            return;
+          }
+        }
+        res.end();
+      };
+      pump();
+    });
+    await new Promise<void>((resolveListen) => server.listen(0, '127.0.0.1', resolveListen));
+    try {
+      const port = (server.address() as AddressInfo).port;
+      const response = await nodeStreamFetch(`http://127.0.0.1:${String(port)}/bulk`);
+      const reader = response.body!.getReader();
+      const first = await reader.read();
+      let received = first.value?.byteLength ?? 0;
+      // The consumer stops reading. With the bounded queue the transport
+      // pauses the socket, so the server's write() eventually reports
+      // backpressure; without pause() the whole payload would stream into
+      // the consumer-side queue and write() would stay accepted.
+      const deadline = Date.now() + 15_000;
+      while (blockedAt === null && written < totalBytes && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      expect(blockedAt, 'server never saw backpressure — the consumer queue is not bounded').not.toBeNull();
+      expect(blockedAt!).toBeLessThan(totalBytes);
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        received += value?.byteLength ?? 0;
+      }
+      expect(received).toBe(totalBytes);
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+    }
+  });
+
+  it('capture status reconciles through the raw transport by default (global fetch never used)', async () => {
+    const server = createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ state: 'running', requestId: 'req-status-raw' }));
+    });
+    await new Promise<void>((resolveListen) => server.listen(0, '127.0.0.1', resolveListen));
+    try {
+      const port = (server.address() as AddressInfo).port;
+      const answers: string[] = [];
+      vi.stubGlobal('fetch', () => {
+        throw new Error('global fetch must not carry the status request');
+      });
+      const code = await runCaptureCli(
+        ['status', '--request-id', 'req-status-raw', '--url', `http://127.0.0.1:${String(port)}`, '--token', 't'],
+        { stdout: (text: string) => answers.push(text), stderr: () => {} },
+      );
+      expect(code).toBe(CAPTURE_EXIT.ok);
+      expect(answers.join('')).toContain('running');
+    } finally {
+      vi.unstubAllGlobals();
+      server.closeAllConnections();
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+    }
+  });
+
+  it('rejects an unsupported request body loudly and honors an abort signal', async () => {
+    const server = createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.write('chunk');
+      // Held open: the abort must reject the reader instead of hanging.
+    });
+    await new Promise<void>((resolveListen) => server.listen(0, '127.0.0.1', resolveListen));
+    try {
+      const port = (server.address() as AddressInfo).port;
+      const url = `http://127.0.0.1:${String(port)}/signal`;
+      await expect(
+        nodeStreamFetch(url, { method: 'POST', body: new URLSearchParams('a=b') }),
+      ).rejects.toThrow(/string or Buffer/u);
+      const controller = new AbortController();
+      const response = await nodeStreamFetch(url, { signal: controller.signal });
+      const reader = response.body!.getReader();
+      await reader.read();
+      controller.abort();
+      await expect(reader.read()).rejects.toThrow(/aborted|ECONNRESET|destroyed|reset/i);
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+    }
+  });
+
+  it('transport errors render their own errno and any cause for the receipt', () => {
+    const own = Object.assign(new Error('aborted'), { code: 'ECONNRESET' });
+    expect(describeTransportError(own)).toContain('ECONNRESET');
+    expect(describeTransportError(new Error('plain'))).toBe('plain');
+    const wrapper = new Error('request failed', {
+      cause: Object.assign(new Error('reset by peer'), { code: 'EPIPE' }),
+    });
+    expect(describeTransportError(wrapper)).toContain('cause');
+    expect(describeTransportError(wrapper)).toContain('EPIPE');
+    expect(describeTransportError('boom')).toBe('boom');
   });
 
   it('records an UNKNOWN outcome on a lost connection and never promotes partial data', async () => {
