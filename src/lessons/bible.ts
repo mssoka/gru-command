@@ -1,7 +1,9 @@
+import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import {
   existsSync,
   linkSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
   readdirSync,
@@ -53,6 +55,10 @@ export const BIBLE_WRITE_LOCK = '.write.lock';
 
 interface LockHolder {
   readonly pid: number;
+  /** The holder's process start identity (owner decision 2026-10-07, D2):
+   * a PID now owned by a different process — after a crash or reboot — is
+   * a dead holder. Null for a lock written by an older version (PID only). */
+  readonly identity: string | null;
   readonly token: string;
   readonly action: string;
   readonly at: string;
@@ -64,6 +70,7 @@ function readLockHolder(lock: string): LockHolder | null {
     return typeof parsed['pid'] === 'number' && Number.isSafeInteger(parsed['pid']) && parsed['pid'] > 0
       ? {
         pid: parsed['pid'],
+        identity: typeof parsed['identity'] === 'string' && parsed['identity'] !== '' ? parsed['identity'] : null,
         token: String(parsed['token'] ?? ''),
         action: String(parsed['action'] ?? 'unknown'),
         at: String(parsed['at'] ?? 'unknown'),
@@ -74,12 +81,90 @@ function readLockHolder(lock: string): LockHolder | null {
   }
 }
 
-function processAlive(pid: number): boolean {
+function pidAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+/** A process's start identity, stable for its lifetime and different for
+ * any later process given the same PID: Linux — boot id plus start time in
+ * clock ticks (/proc); macOS — its start time (ps lstart, C locale). Null
+ * when it cannot be read. Tests replace it through setProcessIdentityReader. */
+function readProcessIdentity(pid: number): string | null {
+  try {
+    if (process.platform === 'linux') {
+      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+      // Fields after "(comm)" start at field 3; starttime is field 22.
+      const start = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19];
+      const boot = readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
+      return start === undefined || boot === '' ? null : `linux:${boot}:${start}`;
+    }
+    if (process.platform === 'darwin') {
+      const started = execFileSync('/bin/ps', ['-o', 'lstart=', '-p', String(pid)], {
+        encoding: 'utf8',
+        timeout: 2_000,
+        env: { ...process.env, LC_ALL: 'C' },
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim();
+      return started === '' ? null : `darwin:${started}`;
+    }
+  } catch {
+    /* unknown */
+  }
+  return null;
+}
+
+let processIdentity: (pid: number) => string | null = readProcessIdentity;
+let ownIdentity: { readonly value: string | null } | null = null;
+
+/** Test seam: replace how a process's start identity is read. */
+export function setProcessIdentityReader(reader: ((pid: number) => string | null) | null): void {
+  processIdentity = reader ?? readProcessIdentity;
+  ownIdentity = null;
+}
+
+function myIdentity(): string | null {
+  ownIdentity ??= { value: processIdentity(process.pid) };
+  return ownIdentity.value;
+}
+
+/** Tokens of the locks and reclaim gates THIS process holds right now. */
+const HELD_TOKENS = new Set<string>();
+
+/** Is the recorded holder still the live process that wrote it? This
+ * process's own record counts only while it actually holds it (a release
+ * that failed to remove the file leaves a record nobody holds); another
+ * PID counts unless it is gone or now belongs to a different process. An
+ * identity that cannot be read keeps the holder (never steal a live lock). */
+function holderAlive(holder: LockHolder): boolean {
+  if (holder.pid === process.pid) return HELD_TOKENS.has(holder.token);
+  if (!pidAlive(holder.pid)) return false;
+  if (holder.identity === null) return true;
+  const current = processIdentity(holder.pid);
+  return current === null || current === holder.identity;
+}
+
+/** A reclaim holds its gate only for a few synchronous steps; a gate older
+ * than this is abandoned whoever wrote it (owner decision 2026-10-07, D1). */
+export const RECLAIM_GATE_STALE_MS = 30_000;
+
+/** A lock or gate record: who holds it, from when, and its token. */
+function lockRecord(token: string, action: string): string {
+  return JSON.stringify({ pid: process.pid, identity: myIdentity(), token, action, at: new Date().toISOString() });
+}
+
+/** Hard-link `staging` to `target` — false when `target` exists. */
+function linkExclusive(staging: string, target: string, what: string): boolean {
+  try {
+    linkSync(staging, target);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') return false;
+    throw new BibleError(`cannot take ${what}: ${String(error)}`);
   }
 }
 
@@ -189,12 +274,15 @@ export interface LessonChangeView {
   readonly previousTags: readonly string[] | null;
 }
 
-/** A lesson the update removes, with the text that disappears. */
+/** A lesson the update removes, with the text and tags that disappear:
+ * `cap` — an existing lesson dropped to fit; `retired` — its chapter is
+ * retired; `discarded` — an incoming lesson the cap left out. */
 export interface RemovedLessonView {
   readonly slug: string;
   readonly body: string;
   readonly recurred: number;
-  readonly reason: 'cap' | 'retired';
+  readonly tags: readonly string[];
+  readonly reason: 'cap' | 'retired' | 'discarded';
 }
 
 /** What an update does to one chapter, for the owner's review (owner
@@ -254,12 +342,19 @@ export interface BiblePlan {
   /** Fingerprint of the book the plan produces. */
   readonly after: string;
   readonly files: readonly PlannedFile[];
-  /** The baseline text of every touched file (null = absent): the review
-   * is derived from it, and it must hash to `files[].before`. */
+  /** The COMPLETE managed book the plan was computed against — every file
+   * by path, plus each touched path that was absent (text null). Both
+   * fingerprints are recomputed from it, the review is derived from it,
+   * and an unexpected change is named against it. */
   readonly before: readonly { readonly path: string; readonly text: string | null }[];
-  readonly writes: readonly { readonly slug: string; readonly text: string }[];
+  /** Each written chapter: its text, and the chapter as merged BEFORE the
+   * cap — the cap is re-run on it to prove the text and to report exactly
+   * what the cap released, trimmed or left out. */
+  readonly writes: readonly { readonly slug: string; readonly text: string; readonly uncapped: BibleChapter }[];
   readonly retired: readonly string[];
   readonly indexText: string;
+  /** The chapter cap the plan was computed with. */
+  readonly chapterCapBytes: number;
   readonly report: ApplyReport;
 }
 
@@ -514,9 +609,10 @@ export class BibleStore {
     const staging = `${lock}.${token}`;
     let published = false;
     try {
-      writeFileSync(staging, JSON.stringify({ pid: process.pid, token, action, at: new Date().toISOString() }), { mode: 0o600, flag: 'wx' });
+      writeFileSync(staging, lockRecord(token, action), { mode: 0o600, flag: 'wx' });
       this.publishLock(lock, staging);
       published = true;
+      HELD_TOKENS.add(token);
       rmSync(staging, { force: true });
     } catch (error) {
       // Nothing of this attempt may outlive it: not its staging file, and
@@ -540,14 +636,7 @@ export class BibleStore {
   /** Publish the staged lock: a hard link when the book is free, or —
    * when the holder is dead — an atomic replace under the reclaim gate. */
   private publishLock(lock: string, staging: string): void {
-    try {
-      linkSync(staging, lock);
-      return;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
-        throw new BibleError(`cannot take the book write lock ${lock}: ${String(error)}`);
-      }
-    }
+    if (linkExclusive(staging, lock, `the book write lock ${lock}`)) return;
     const contention = (holder: LockHolder | null): BibleError =>
       new BibleError(
         holder === null
@@ -555,29 +644,90 @@ export class BibleStore {
           : `the Book of Lessons is being written by pid ${holder.pid} (${holder.action}, since ${holder.at}); retry when it finishes`,
       );
     const seen = readLockHolder(lock);
-    if (seen === null || processAlive(seen.pid)) throw contention(seen);
-    const gate = `${lock}.reclaim`;
-    try {
-      mkdirSync(gate);
-    } catch {
-      throw new BibleError(`another process is reclaiming the Book of Lessons write lock ${lock}; retry`);
-    }
-    try {
+    if (seen === null || holderAlive(seen)) throw contention(seen);
+    this.underReclaimGate(lock, () => {
       const holder = readLockHolder(lock);
-      if (holder === null || holder.token !== seen.token || processAlive(holder.pid)) throw contention(holder);
+      if (holder === null || holder.token !== seen.token || holderAlive(holder)) throw contention(holder);
       this.log('warn', 'bible write lock left by a dead process — taking it over', {
         lock,
         holder_pid: holder.pid,
         holder_action: holder.action,
       });
       renameSync(staging, lock); // atomic replace, under the gate
+    });
+  }
+
+  /** Run `fn` holding the reclaim gate (`<lock>.reclaim`), so two
+   * processes can never both replace a dead holder's lock. The gate is
+   * self-healing: a gate whose holder is dead, or older than
+   * RECLAIM_GATE_STALE_MS (a reclaim holds it for milliseconds), is broken
+   * — moved aside, confirmed to be that same gate, then removed — so a
+   * process killed mid-reclaim never blocks the book for good. */
+  private underReclaimGate(lock: string, fn: () => void): void {
+    const gate = `${lock}.reclaim`;
+    const token = randomUUID();
+    const staging = `${gate}.${token}`;
+    const busy = (): BibleError => new BibleError(`another process is reclaiming the Book of Lessons write lock ${lock}; retry`);
+    try {
+      writeFileSync(staging, lockRecord(token, 'reclaim'), { mode: 0o600, flag: 'wx' });
+      if (!linkExclusive(staging, gate, `the reclaim gate ${gate}`)) {
+        if (!this.breakAbandonedGate(gate)) throw busy();
+        if (!linkExclusive(staging, gate, `the reclaim gate ${gate}`)) throw busy();
+      }
+      HELD_TOKENS.add(token);
     } finally {
-      rmSync(gate, { recursive: true, force: true });
+      rmSync(staging, { force: true });
     }
+    try {
+      fn();
+    } finally {
+      HELD_TOKENS.delete(token);
+      if (readLockHolder(gate)?.token === token) unlinkSync(gate);
+    }
+  }
+
+  /** Remove the reclaim gate if — and only if — it is abandoned. True when
+   * the gate is gone afterwards. */
+  private breakAbandonedGate(gate: string): boolean {
+    let judged: ReturnType<typeof lstatSync>;
+    try {
+      judged = lstatSync(gate);
+    } catch {
+      return true; // already gone
+    }
+    const holder = readLockHolder(gate);
+    const old = Date.now() - judged.mtimeMs > RECLAIM_GATE_STALE_MS;
+    if (!old && (holder === null || holderAlive(holder))) return false;
+    const parked = `${gate}.abandoned-${randomUUID()}`;
+    try {
+      renameSync(gate, parked);
+    } catch {
+      return true; // someone else broke it first
+    }
+    if (lstatSync(parked).ino === judged.ino) {
+      this.log('warn', 'bible reclaim gate left by a dead or stalled process — removed', {
+        gate,
+        holder_pid: holder?.pid ?? null,
+      });
+      rmSync(parked, { recursive: true, force: true });
+      return true;
+    }
+    // A newer gate was moved by mistake: put it back (a link never
+    // clobbers a gate made meanwhile), then let the caller retry later.
+    try {
+      linkSync(parked, gate);
+    } catch {
+      /* a gate exists again — whoever holds it carries on */
+    }
+    rmSync(parked, { recursive: true, force: true });
+    return false;
   }
 
   /** Release only THIS acquisition's lock — never one another process now holds. */
   private releaseLock(lock: string, token: string): void {
+    // Not held from here on, even if removing the file fails: the record
+    // left behind is then reclaimable rather than a lock nobody releases.
+    HELD_TOKENS.delete(token);
     const holder = readLockHolder(lock);
     if (holder?.token === token) unlinkSync(lock);
   }
@@ -607,8 +757,10 @@ export class BibleStore {
     let lessonsTrimmed = 0;
     let lessonsDropped = 0;
 
-    for (const update of updates) {
-      validateProposedChapter(update);
+    for (const proposed of updates) {
+      validateProposedChapter(proposed);
+      // Canonical before planning: what the chapter format will read back.
+      const update = normalizeProposedChapter(proposed);
       if (update.retire === true) {
         // Retiring a chapter created earlier in this same batch is net
         // absence: nothing to retire from the book.
@@ -628,7 +780,7 @@ export class BibleStore {
     }
 
     const finalChapters: BibleChapter[] = [];
-    const writes: { slug: string; text: string }[] = [];
+    const writes: { slug: string; text: string; uncapped: BibleChapter }[] = [];
     for (const chapter of chapters.values()) {
       if (!touched.has(chapter.slug)) {
         finalChapters.push(chapter);
@@ -640,7 +792,7 @@ export class BibleStore {
       lessonsTrimmed += capped.trimmed;
       lessonsDropped += capped.droppedLessons;
       finalChapters.push(capped.chapter);
-      writes.push({ slug: chapter.slug, text: capped.text });
+      writes.push({ slug: chapter.slug, text: capped.text, uncapped: chapter });
     }
     // Render the index BEFORE any write: a cap failure must leave the whole
     // bible untouched (otherwise a retried dream could double-count
@@ -657,6 +809,7 @@ export class BibleStore {
       BIBLE_INDEX_FILE,
     ];
 
+    const baselinePaths = [...new Set([...files.keys(), ...touchedPaths])].sort();
     return {
       base: bookFingerprint(files),
       after: bookFingerprint(after),
@@ -665,10 +818,11 @@ export class BibleStore {
         before: contentHash(files.get(path)),
         after: contentHash(after.get(path)),
       })),
-      before: touchedPaths.map((path) => ({ path, text: files.get(path) ?? null })),
+      before: baselinePaths.map((path) => ({ path, text: files.get(path) ?? null })),
       writes,
       retired: [...retired],
       indexText,
+      chapterCapBytes: this.chapterCapBytes,
       report: {
         chaptersWritten: writes.length,
         chaptersRetired: retired.size,
@@ -690,28 +844,21 @@ export class BibleStore {
    * written; a book already equal to the result is a no-op.
    */
   applyPlan(plan: BiblePlan): ApplyReport {
-    const content = planContent(plan);
-    return this.withWriteLock('lesson proposal accept', () => this.applyPlanLocked(plan, content));
+    const verified = verifyPlan(plan);
+    return this.withWriteLock('lesson proposal accept', () => this.applyPlanLocked(plan, verified));
   }
 
-  private applyPlanLocked(plan: BiblePlan, content: ReadonlyMap<string, string | null>): ApplyReport {
+  private applyPlanLocked(plan: BiblePlan, verified: VerifiedPlan): ApplyReport {
     const current = this.snapshotFiles();
     if (bookFingerprint(current) === plan.after) return plan.report;
-    for (const file of plan.files) {
-      const now = contentHash(current.get(file.path));
-      if (now !== file.before && now !== file.after) {
-        throw new ProposalError('stale', `${file.path} changed since this update was planned; nothing was written`);
-      }
-    }
-    const result = new Map(current);
-    for (const [path, text] of content) {
-      if (text === null) result.delete(path);
-      else result.set(path, text);
-    }
-    if (bookFingerprint(result) !== plan.after) {
+    // Every managed file must be exactly as planned before or after (a
+    // crash mid-apply leaves a mixture this resumes); anything else is a
+    // foreign change, named file by file — nothing is written.
+    const unexpected = unexpectedPaths(current, verified.baseline, verified.result);
+    if (unexpected.length > 0) {
       throw new ProposalError(
         'stale',
-        'the Book of Lessons changed since this update was planned (or the plan is corrupt); nothing was written',
+        `the Book of Lessons changed since this update was planned (${unexpected.join(', ')}); nothing was written`,
       );
     }
     for (const write of plan.writes) {
@@ -750,7 +897,7 @@ export class BibleStore {
     // between this plan's read and its write.
     return this.withWriteLock('dream apply', () => {
       const plan = this.planUpdates(updates, provenance);
-      return this.applyPlanLocked(plan, planContent(plan));
+      return this.applyPlanLocked(plan, verifyPlan(plan));
     });
   }
 
@@ -801,56 +948,130 @@ export function bookFingerprint(files: ReadonlyMap<string, string>): string {
   return digest.digest('hex');
 }
 
-/** A plan's intended content per touched path (null = removed), checked
- * against its own file list — an inconsistent plan is refused before the
- * lock is even taken, let alone a write. */
-function planContent(plan: BiblePlan): Map<string, string | null> {
+/** A plan proven consistent: its intended content per touched path (null =
+ * removed), the complete baseline book, and the book it produces. */
+interface VerifiedPlan {
+  readonly content: ReadonlyMap<string, string | null>;
+  readonly baseline: ReadonlyMap<string, string>;
+  readonly result: ReadonlyMap<string, string>;
+}
+
+/** Prove a plan consistent before anything acts on it — a corrupt or
+ * forged plan is refused before the lock is even taken, let alone a write:
+ * its writes match its file list and hashes; its complete baseline
+ * fingerprints to `base` and, with the writes applied, to `after` (so
+ * neither can be forged to skip or redirect a write); every written
+ * chapter is exactly what the cap makes of its pre-cap chapter, and reads
+ * back as planned. */
+function verifyPlan(plan: BiblePlan): VerifiedPlan {
+  const fail = (what: string): never => {
+    throw new BibleError(`the update plan is inconsistent: ${what}; nothing was written`);
+  };
   const content = new Map<string, string | null>();
   for (const write of plan.writes) content.set(`${BIBLE_CHAPTERS_DIR}/${write.slug}.md`, write.text);
   for (const slug of plan.retired) content.set(`${BIBLE_CHAPTERS_DIR}/${slug}.md`, null);
   content.set(BIBLE_INDEX_FILE, plan.indexText);
   const listed = new Set(plan.files.map((file) => file.path));
   if (plan.files.length !== content.size || [...content.keys()].some((path) => !listed.has(path))) {
-    throw new BibleError('the update plan is inconsistent: its file list does not match its writes; nothing was written');
+    fail('its file list does not match its writes');
   }
   for (const file of plan.files) {
-    if (contentHash(content.get(file.path)) !== file.after) {
-      throw new BibleError(`the update plan is inconsistent: ${file.path} does not match its planned result; nothing was written`);
-    }
+    if (contentHash(content.get(file.path)) !== file.after) fail(`${file.path} does not match its planned result`);
   }
   const slugs = plan.writes.map((write) => write.slug);
   if (new Set(slugs).size !== slugs.length || plan.retired.some((slug) => slugs.includes(slug)) || new Set(plan.retired).size !== plan.retired.length) {
-    throw new BibleError('the update plan is inconsistent: a chapter is written twice or both written and retired; nothing was written');
+    fail('a chapter is written twice or both written and retired');
   }
-  const baseline = new Map(plan.before.map((entry) => [entry.path, entry.text]));
-  if (baseline.size !== plan.before.length || baseline.size !== plan.files.length) {
-    throw new BibleError('the update plan is inconsistent: its baseline does not match its file list; nothing was written');
-  }
+  const before = new Map(plan.before.map((entry) => [entry.path, entry.text]));
+  if (before.size !== plan.before.length) fail('its baseline lists a path twice');
   for (const file of plan.files) {
-    if (!baseline.has(file.path) || contentHash(baseline.get(file.path)) !== file.before) {
-      throw new BibleError(`the update plan is inconsistent: ${file.path} baseline does not match its recorded hash; nothing was written`);
+    if (!before.has(file.path) || contentHash(before.get(file.path)) !== file.before) {
+      fail(`${file.path} baseline does not match its recorded hash`);
     }
   }
-  if (plan.report.chaptersWritten !== plan.writes.length || plan.report.chaptersRetired !== plan.retired.length) {
-    throw new BibleError('the update plan is inconsistent: its report does not match its writes; nothing was written');
+  for (const [path, text] of before) if (text === null && !listed.has(path)) fail(`its baseline marks untouched ${path} absent`);
+  const baseline = new Map([...before].filter((entry): entry is [string, string] => entry[1] !== null));
+  if (bookFingerprint(baseline) !== plan.base) fail('its baseline does not fingerprint to its base');
+  const result = new Map(baseline);
+  for (const [path, text] of content) {
+    if (text === null) result.delete(path);
+    else result.set(path, text);
   }
-  return content;
+  if (bookFingerprint(result) !== plan.after) fail('its writes do not produce its planned book');
+  if (plan.report.chaptersWritten !== plan.writes.length || plan.report.chaptersRetired !== plan.retired.length) {
+    fail('its report does not match its writes');
+  }
+  if (!Number.isSafeInteger(plan.chapterCapBytes) || plan.chapterCapBytes <= 0) fail('its chapter cap');
+  for (const write of plan.writes) {
+    assertChapterModel(write.uncapped, write.slug);
+    const capped = enforceChapterCap(write.uncapped, plan.chapterCapBytes);
+    if (capped.text !== write.text) fail(`chapter ${write.slug} is not what the cap makes of its merged chapter`);
+    assertReadsBack(write.text, capped.chapter);
+  }
+  return { content, baseline, result };
+}
+
+/** Every managed path whose current content is neither the planned
+ * baseline nor the planned result — described as changed, added or deleted. */
+function unexpectedPaths(
+  current: ReadonlyMap<string, string>,
+  baseline: ReadonlyMap<string, string>,
+  result: ReadonlyMap<string, string>,
+): string[] {
+  const out: string[] = [];
+  for (const path of [...new Set([...current.keys(), ...baseline.keys(), ...result.keys()])].sort()) {
+    const now = current.get(path);
+    if (now === baseline.get(path) || now === result.get(path)) continue;
+    out.push(`${path} ${now === undefined ? 'deleted' : baseline.has(path) || result.has(path) ? 'changed' : 'added'}`);
+  }
+  return out;
+}
+
+/** A stored pre-cap chapter must be a well-formed chapter model. */
+function assertChapterModel(value: unknown, slug: string): void {
+  const bad = (what: string): never => {
+    throw new BibleError(`the update plan is inconsistent: chapter ${slug} pre-cap ${what}; nothing was written`);
+  };
+  const isStrings = (input: unknown): boolean => Array.isArray(input) && input.every((item) => typeof item === 'string');
+  if (typeof value !== 'object' || value === null) bad('is not a chapter');
+  const chapter = value as Record<string, unknown>;
+  if (chapter['slug'] !== slug) bad('slug');
+  if (typeof chapter['title'] !== 'string' || typeof chapter['summary'] !== 'string' || !isStrings(chapter['tags'])) bad('metadata');
+  if (!Array.isArray(chapter['lessons'])) bad('lessons');
+  for (const item of chapter['lessons'] as unknown[]) {
+    const lesson = (typeof item === 'object' && item !== null ? item : bad('lesson')) as Record<string, unknown>;
+    if (typeof lesson['slug'] !== 'string' || !isLessonsSlug(lesson['slug'])) bad('lesson slug');
+    if (typeof lesson['body'] !== 'string' || !isStrings(lesson['tags'])) bad('lesson text');
+    if (typeof lesson['recurred'] !== 'number' || !Number.isSafeInteger(lesson['recurred']) || lesson['recurred'] < 1) bad('lesson recurrence');
+    if (!Array.isArray(lesson['provenance'])) bad('lesson provenance');
+    for (const ref of lesson['provenance'] as unknown[]) {
+      const handle = (typeof ref === 'object' && ref !== null ? ref : bad('handle')) as Record<string, unknown>;
+      if (typeof handle['id'] !== 'string' || typeof handle['ts'] !== 'string') bad('handle');
+    }
+  }
 }
 
 /** Check a plan's internal consistency without writing anything — run
  * before a stored proposal is shown or decided. */
 export function checkPlan(plan: BiblePlan): void {
-  planContent(plan);
+  verifyPlan(plan);
 }
 
 /** The owner's review of a plan, derived from its baseline and its writes
- * — never stored separately, so it cannot disagree with what Accept writes. */
+ * — never stored separately, so it cannot disagree with what Accept writes.
+ * Cap effects come from re-running the cap on each pre-cap chapter. */
 export function describePlan(plan: BiblePlan): PlanReview {
   const baseline = new Map(plan.before.map((entry) => [entry.path, entry.text]));
   const chapters: ChapterChange[] = [];
   for (const write of plan.writes) {
     const prior = baseline.get(`${BIBLE_CHAPTERS_DIR}/${write.slug}.md`) ?? null;
-    chapters.push(describeChapterChange(prior === null ? null : parseChapter(prior, write.slug), parseChapter(write.text, write.slug)));
+    chapters.push(
+      describeChapterChange(
+        prior === null ? null : parseChapter(prior, write.slug),
+        write.uncapped,
+        enforceChapterCap(write.uncapped, plan.chapterCapBytes),
+      ),
+    );
   }
   for (const slug of plan.retired) {
     const prior = baseline.get(`${BIBLE_CHAPTERS_DIR}/${slug}.md`) ?? null;
@@ -866,7 +1087,7 @@ export function describePlan(plan: BiblePlan): PlanReview {
       changed: [],
       removed: before.lessons
         .filter((lesson) => lesson.slug !== ARCHIVED_LESSON_SLUG)
-        .map((lesson) => ({ slug: lesson.slug, body: lesson.body, recurred: lesson.recurred, reason: 'retired' as const })),
+        .map((lesson) => ({ slug: lesson.slug, body: lesson.body, recurred: lesson.recurred, tags: lesson.tags, reason: 'retired' as const })),
       provenanceTrimmed: 0,
       bodiesTrimmed: 0,
     });
@@ -907,7 +1128,8 @@ function assertReadsBack(text: string, planned: BibleChapter): void {
   }
 }
 
-function describeChapterChange(before: BibleChapter | null, after: BibleChapter): ChapterChange {
+function describeChapterChange(before: BibleChapter | null, uncapped: BibleChapter, cap: ChapterCapResult): ChapterChange {
+  const after = cap.chapter;
   const previous = new Map(
     (before?.lessons ?? [])
       .filter((lesson) => lesson.slug !== ARCHIVED_LESSON_SLUG)
@@ -916,17 +1138,10 @@ function describeChapterChange(before: BibleChapter | null, after: BibleChapter)
   const added: LessonChangeView[] = [];
   const changed: LessonChangeView[] = [];
   const kept = new Set<string>();
-  let provenanceTrimmed = 0;
-  let bodiesTrimmed = 0;
   for (const lesson of after.lessons) {
     if (lesson.slug === ARCHIVED_LESSON_SLUG) continue;
     kept.add(lesson.slug);
     const prior = previous.get(lesson.slug);
-    if (lesson.body.endsWith(TRIM_MARKER) && prior?.body !== lesson.body) bodiesTrimmed += 1;
-    if (prior !== undefined) {
-      const now = new Set(lesson.provenance.map((ref) => ref.id));
-      provenanceTrimmed += prior.provenance.filter((ref) => !now.has(ref.id)).length;
-    }
     const view = {
       slug: lesson.slug,
       body: lesson.body,
@@ -941,9 +1156,20 @@ function describeChapterChange(before: BibleChapter | null, after: BibleChapter)
       changed.push(view);
     }
   }
-  const removed: RemovedLessonView[] = [...previous.values()]
-    .filter((lesson) => !kept.has(lesson.slug))
-    .map((lesson) => ({ slug: lesson.slug, body: lesson.body, recurred: lesson.recurred, reason: 'cap' as const }));
+  const removedView = (lesson: BibleLesson, reason: RemovedLessonView['reason']): RemovedLessonView => ({
+    slug: lesson.slug,
+    body: lesson.body,
+    recurred: lesson.recurred,
+    tags: lesson.tags,
+    reason,
+  });
+  const removed: RemovedLessonView[] = [
+    ...[...previous.values()].filter((lesson) => !kept.has(lesson.slug)).map((lesson) => removedView(lesson, 'cap')),
+    // Incoming lessons the cap left out never reach the book: say so.
+    ...uncapped.lessons
+      .filter((lesson) => lesson.slug !== ARCHIVED_LESSON_SLUG && !previous.has(lesson.slug) && !kept.has(lesson.slug))
+      .map((lesson) => removedView(lesson, 'discarded')),
+  ];
   return {
     slug: after.slug,
     title: { before: before?.title ?? null, after: after.title },
@@ -953,8 +1179,26 @@ function describeChapterChange(before: BibleChapter | null, after: BibleChapter)
     added,
     changed,
     removed,
-    provenanceTrimmed,
-    bodiesTrimmed,
+    // Every handle the cap released — existing, incoming and archived alike.
+    provenanceTrimmed: cap.provenanceTrimmed,
+    bodiesTrimmed: cap.trimmed,
+  };
+}
+
+/** A proposed chapter in the form the chapter format reads back: trimmed
+ * title, trimmed and de-duplicated tags, LF line endings in bodies. Run
+ * after validation (which keeps the injection guards strict). */
+function normalizeProposedChapter(update: ProposedChapter): ProposedChapter {
+  const tags = (list: readonly string[]) => [...new Set(list.map((tag) => tag.trim()))];
+  return {
+    ...update,
+    title: update.title.trim(),
+    ...(update.tags !== undefined ? { tags: tags(update.tags) } : {}),
+    lessons: update.lessons.map((lesson) => ({
+      ...lesson,
+      body: lesson.body.replace(/\r\n/gu, '\n').trim(),
+      ...(lesson.tags !== undefined ? { tags: tags(lesson.tags) } : {}),
+    })),
   };
 }
 

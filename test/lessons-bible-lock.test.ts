@@ -1,10 +1,10 @@
 import * as fs from 'node:fs';
-import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { BibleLockReleaseError, BibleStore, BIBLE_WRITE_LOCK } from '../src/lessons/bible.js';
-import { DREAM_STATE_FILE, DreamEngine, loadDreamState } from '../src/lessons/dream.js';
+import { DREAM_STATE_FILE, DreamEngine, LessonProposals, loadDreamState, PROPOSAL_FILE, type ProposalNotifier } from '../src/lessons/dream.js';
 import { JournalStore } from '../src/lessons/journal.js';
 import { DreamError, type ProposedChapter } from '../src/lessons/types.js';
 
@@ -113,7 +113,7 @@ describe('Book of Lessons write lock under filesystem faults', () => {
     const bible = new BibleStore(join(dir, 'bible'));
     const entry = journal.append({ kind: 'finding', source: 'gru', body: 'shell hang' });
     const distill = vi.fn(async () => ({ chapters: [{ ...UPDATE, lessons: [{ ...UPDATE.lessons[0]!, journalIds: [entry.id] }] }] }));
-    const engine = new DreamEngine({ journal, bible, distiller: { distill } });
+    const engine = new DreamEngine({ journal, bible, distiller: { distill }, autoApply: true });
     let failures = 0;
     vi.mocked(fs.unlinkSync).mockImplementation((path) => {
       if (isLock(path) && failures === 0) {
@@ -127,5 +127,39 @@ describe('Book of Lessons write lock under filesystem faults', () => {
     expect(loadDreamState(join(bible.dir, DREAM_STATE_FILE)).coveredThroughSeq).toBe(entry.seq);
     expect(bible.readChapter('ops')?.lessons[0]?.recurred).toBe(1);
     expect(distill).toHaveBeenCalledTimes(1);
+  });
+  it('an Accept that was written but whose lock release failed is a finished Accept — cursor advanced, notice resolved', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-accept-lock-'));
+    cleanupDirs.push(dir);
+    const journal = new JournalStore(join(dir, 'journal'));
+    const bible = new BibleStore(join(dir, 'bible'));
+    const resolved: string[] = [];
+    const notifier: ProposalNotifier = {
+      ensure: () => {},
+      resolve: (id) => {
+        resolved.push(id);
+      },
+      inform: () => {},
+      conflict: () => {},
+    };
+    const proposals = new LessonProposals({ bible, notifier });
+    const entry = journal.append({ kind: 'finding', source: 'gru', body: 'shell hang' });
+    const distill = async () => ({ chapters: [{ ...UPDATE, lessons: [{ ...UPDATE.lessons[0]!, journalIds: [entry.id] }] }] });
+    await new DreamEngine({ journal, bible, distiller: { distill }, proposals }).run();
+    const { id, notificationId } = proposals.review()!;
+    let failures = 0;
+    vi.mocked(fs.unlinkSync).mockImplementation((path) => {
+      if (isLock(path) && failures === 0) {
+        failures += 1;
+        throw Object.assign(new Error('EPERM: operation not permitted'), { code: 'EPERM' });
+      }
+      return real.unlinkSync(path);
+    });
+    expect(proposals.accept(id)).toMatchObject({ decision: 'accepted', report: { chaptersWritten: 1 } });
+    expect(loadDreamState(join(bible.dir, DREAM_STATE_FILE)).coveredThroughSeq).toBe(entry.seq);
+    expect(resolved).toEqual([notificationId]);
+    expect(existsSync(join(bible.dir, PROPOSAL_FILE))).toBe(false);
+    // The record the failed release left behind blocks nothing.
+    expect(bible.applyUpdates([UPDATE], PROVENANCE).chaptersWritten).toBe(1);
   });
 });

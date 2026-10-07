@@ -72,7 +72,7 @@ const REVIEW: LessonProposalView = {
           previousTags: [],
         },
       ],
-      removed: [{ slug: 'old-restart-note', body: 'Restart twice if unsure.', recurred: 1, reason: 'cap' }],
+      removed: [{ slug: 'old-restart-note', body: 'Restart twice if unsure.', recurred: 1, tags: [], reason: 'cap' }],
       provenanceTrimmed: 2,
       bodiesTrimmed: 0,
     },

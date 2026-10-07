@@ -341,11 +341,36 @@ describe('lesson proposals over HTTP (owner decision 2026-10-07)', () => {
       const second = h.proposals.review()!;
       const file = join(h.bible.dir, PROPOSAL_FILE);
       // A Reject recorded just before a crash: Accept may never flip it.
-      writeFileSync(file, JSON.stringify({ ...JSON.parse(readFileSync(file, 'utf-8')), decision: { kind: 'rejected', at: 'now', detail: null } }));
+      writeFileSync(file, JSON.stringify({ ...JSON.parse(readFileSync(file, 'utf-8')), decision: { kind: 'rejected', at: '2026-10-07T12:00:00.000Z', detail: null } }));
       const flipped = await call(h.port, 'POST', `/api/lessons/proposal/${second.id}/accept`, {}, TOKEN);
       expect(flipped.status).toBe(409);
       expect(flipped.json).toMatchObject({ error: 'proposal_decided' });
       expect(h.bible.readChapter('ops-restarts')).toBeNull();
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a recorded Accept blocked by a changed book answers 202 recorded-but-blocked; the opposite choice is still 409', async () => {
+    const h = await boot();
+    try {
+      const { id } = await propose(h);
+      const file = join(h.bible.dir, PROPOSAL_FILE);
+      writeFileSync(file, JSON.stringify({ ...JSON.parse(readFileSync(file, 'utf-8')), decision: { kind: 'accepted', at: '2026-10-07T12:00:00.000Z', detail: null } }));
+      const index = h.bible.readIndexText()!;
+      writeFileSync(join(h.bible.dir, 'INDEX.md'), `${index}\n`);
+      const blocked = await call(h.port, 'POST', `/api/lessons/proposal/${id}/accept`, {}, TOKEN);
+      expect(blocked.status).toBe(202);
+      expect(blocked.json).toMatchObject({ id, decision: 'accepted', incomplete: true });
+      expect(field<string>(blocked.json, 'detail')).toContain('recorded but blocked');
+      expect(field<string>(blocked.json, 'detail')).toContain('INDEX.md changed');
+      const opposite = await call(h.port, 'POST', `/api/lessons/proposal/${id}/reject`, {}, TOKEN);
+      expect(opposite.status).toBe(409);
+      expect(opposite.json).toMatchObject({ error: 'proposal_decided' });
+      writeFileSync(join(h.bible.dir, 'INDEX.md'), index);
+      const finished = await call(h.port, 'POST', `/api/lessons/proposal/${id}/accept`, {}, TOKEN);
+      expect(finished.status).toBe(200);
+      expect(cursor(h.bible)).toBe(1);
     } finally {
       await h.close();
     }

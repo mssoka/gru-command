@@ -2449,9 +2449,11 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
       markNotificationShown: vi.fn(() => Promise.resolve(true)),
       getLessonProposal: vi.fn(() => Promise.resolve(review)),
       decideLessonProposal: vi.fn(decide),
+      wake: vi.fn(),
     } as unknown as import('../lib/board-client.js').BoardClient & {
       getLessonProposal: ReturnType<typeof vi.fn>;
       decideLessonProposal: ReturnType<typeof vi.fn>;
+      wake: ReturnType<typeof vi.fn>;
     };
   }
   function openReview(): void {
@@ -2544,7 +2546,7 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
           tags: { before: ['ops'], after: ['ops', 'roll'] },
           added: [],
           changed: [lessonChange('drain', 'Drain before a roll.', { recurred: 2, tags: ['roll'], previousBody: 'Drain before a roll.', previousRecurred: 1, previousTags: [] })],
-          removed: [{ slug: 'drop-me', body: 'A lesson the cap removes.', recurred: 1, reason: 'cap' }],
+          removed: [{ slug: 'drop-me', body: 'A lesson the cap removes.', recurred: 1, tags: [], reason: 'cap' }],
           provenanceTrimmed: 0,
           bodiesTrimmed: 0,
         },
@@ -2556,7 +2558,7 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
           tags: { before: ['models'], after: [] },
           added: [],
           changed: [],
-          removed: [{ slug: 'sol-for-silas', body: 'Silas runs on Sol.', recurred: 1, reason: 'retired' }],
+          removed: [{ slug: 'sol-for-silas', body: 'Silas runs on Sol.', recurred: 1, tags: [], reason: 'retired' }],
           provenanceTrimmed: 0,
           bodiesTrimmed: 0,
         },
@@ -2657,11 +2659,16 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(text).toContain('~ untouched: Was this. (tags: a) → Now this. (tags: a, b)');
   });
 
-  it('a recorded-but-unfinished decision (202) says so and locks the opposite choice; a conflict does the same', async () => {
-    const { BoardApiError } = await import('../lib/board-client.js');
+  it('a recorded-but-unfinished decision (202) says so and locks the opposite choice — a blocked one too', async () => {
     const outcomes: Array<() => Promise<unknown>> = [
       () => Promise.resolve({ id: 'prop-1', decision: 'accepted', incomplete: true, detail: 'the notice could not be resolved' }),
-      () => Promise.reject(new BoardApiError('/api/lessons/proposal/prop-1/reject', 409, 'proposal_conflict', 'INDEX.md was edited outside the dream')),
+      // A recovery conflict after recording is "recorded but blocked" (202), never a refusal.
+      () => Promise.resolve({
+        id: 'prop-1',
+        decision: 'rejected',
+        incomplete: true,
+        detail: 'the Reject is recorded but blocked: INDEX.md changed',
+      }),
     ];
     const client = proposalClient(() => outcomes.shift()!());
     const view = new BoardView(() => {}, client);
@@ -2675,40 +2682,74 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect([band.querySelector<HTMLButtonElement>('.board-owner__accept')!.disabled, band.querySelector<HTMLButtonElement>('.board-owner__reject')!.disabled])
       .toEqual([false, true]);
     expect(band.querySelector('[data-action-id="owner-proposal:lp-1"]')).not.toBeNull();
-    // A second view (fresh state) whose Reject is recorded but blocked by a conflict.
+    // A second view (fresh state) whose Reject is recorded but blocked.
     const second = new BoardView(() => {}, client);
     second.render(snapshot({ notifications: [proposalNotice] }));
     document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__reject')!.click();
     await flush();
     band = document.getElementById('board-owner')!;
     expect(band.querySelector('[role="alert"]')?.textContent).toBe(
-      'Recorded, but blocked — INDEX.md was edited outside the dream. See the conflict notice.',
+      'Your Reject is recorded, but finishing it hit a problem (the Reject is recorded but blocked: INDEX.md changed). Press Reject again to finish it.',
     );
     expect([band.querySelector<HTMLButtonElement>('.board-owner__accept')!.disabled, band.querySelector<HTMLButtonElement>('.board-owner__reject')!.disabled])
       .toEqual([true, false]);
   });
 
-  it('a decision recorded elsewhere loads locked: only the same choice is offered, and the opposite never posts', async () => {
-    const review = proposalReview({
-      decision: { kind: 'accepted', at: '2026-01-01T00:05:00.000Z' },
-      recovery: { conflict: 'INDEX.md was edited outside the dream', at: '2026-01-01T00:06:00.000Z' },
-    });
-    const client = proposalClient(decided, review);
+  it('a decision that finds the proposal gone is an unknown outcome — never "Not applied" — and the board refreshes', async () => {
+    const { BoardApiError } = await import('../lib/board-client.js');
+    const client = proposalClient(() => Promise.reject(new BoardApiError('/api/lessons/proposal/prop-1/accept', 404, 'proposal_none', 'no lesson proposal is pending')));
     const view = new BoardView(() => {}, client);
     view.render(snapshot({ notifications: [proposalNotice] }));
-    // The owner presses Reject before the review has loaded.
-    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__reject')!.click();
+    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__accept')!.click();
     await flush();
-    const band = document.getElementById('board-owner')!;
-    expect(client.decideLessonProposal).not.toHaveBeenCalled();
-    expect(band.querySelector('[role="alert"]')?.textContent).toBe(
-      'Your Accept is recorded but blocked — INDEX.md was edited outside the dream. See the conflict notice, then press Accept again.',
-    );
-    const accept = band.querySelector<HTMLButtonElement>('.board-owner__accept')!;
-    expect([accept.disabled, band.querySelector<HTMLButtonElement>('.board-owner__reject')!.disabled]).toEqual([false, true]);
-    accept.click();
+    const alert = document.getElementById('board-owner')!.querySelector('[role="alert"]')?.textContent ?? '';
+    expect(alert).toContain('This proposal is no longer pending — it may already have been decided');
+    expect(alert).not.toContain('Not applied');
+    expect(client.wake).toHaveBeenCalledTimes(1);
+  });
+
+  it('the review names what removals take away: tags, a retired chapter’s summary and tags, INDEX tags, left-out lessons', async () => {
+    const review = proposalReview({
+      chapters: [
+        {
+          slug: 'model-policy',
+          title: { before: 'Model policy', after: 'Model policy' },
+          retired: true,
+          summary: { before: 'Which model does what.', after: '' },
+          tags: { before: ['models', 'routing'], after: [] },
+          added: [],
+          changed: [],
+          removed: [{ slug: 'sol-for-silas', body: 'Silas runs on Sol.', recurred: 2, tags: ['silas'], reason: 'retired' }],
+          provenanceTrimmed: 0,
+          bodiesTrimmed: 0,
+        },
+        {
+          slug: 'ops',
+          title: { before: null, after: 'Ops' },
+          retired: false,
+          summary: { before: null, after: 'Ops.' },
+          tags: { before: [], after: ['ops'] },
+          added: [lessonChange('kept', 'Kept lesson.')],
+          changed: [],
+          removed: [{ slug: 'left-out', body: 'An incoming lesson the cap left out.', recurred: 1, tags: ['cap'], reason: 'discarded' }],
+          provenanceTrimmed: 21,
+          bodiesTrimmed: 0,
+        },
+      ],
+      index: [{ slug: 'model-policy', before: { summary: 'Which model does what.', tags: ['models', 'routing'] }, after: null }],
+    });
+    const view = new BoardView(() => {}, proposalClient(decided, review));
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    openReview();
     await flush();
-    expect(client.decideLessonProposal).toHaveBeenCalledWith('prop-1', 'accept');
+    const text = document.getElementById('board-owner')!.textContent ?? '';
+    expect(text).toContain('summary removed: Which model does what.');
+    expect(text).toContain('tags removed: models, routing');
+    expect(text).toContain('removed with the chapter · sol-for-silas (recurred 2)');
+    expect(text).toContain('tags: silas');
+    expect(text).toContain('new, but left out to fit the cap · left-out (recurred 1)');
+    expect(text).toContain('21 oldest journal handle(s) released to fit');
+    expect(text).toContain('− model-policy: Which model does what. (tags: models, routing)');
   });
 
   it('a malformed decision reply is not mistaken for success', async () => {

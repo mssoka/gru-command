@@ -325,4 +325,39 @@ describe('board client', () => {
     // …and reopens the silent socket so the board resumes without a reload.
     await waitFor(() => seen.some((id) => id.startsWith('initial-2')), 'wake reopen');
   });
+  it('a stopped (re-paired) client never calls back: no late 401 unpairs its successor, no late snapshot renders', async () => {
+    let answer: (response: Response) => void = () => {};
+    const fetchImpl = vi.fn(() => new Promise<Response>((resolve) => { answer = resolve; })) as unknown as typeof fetch;
+    const events = { connection: vi.fn(), snapshot: vi.fn(), fatal: vi.fn() };
+    const old = new BoardClient({ token: TOKEN, host: '127.0.0.1:9', fetchImpl, webSocketCtor: class { close() {} } as unknown as new (url: string) => WebSocket }, events);
+    const loading = old.getLessonProposal();
+    old.stop(); // the owner re-paired; the old client's request is still in flight
+    answer(new Response('{"error":"unauthorized"}', { status: 401 }));
+    await expect(loading).rejects.toThrow();
+    const refetch = old.refetchSnapshot();
+    answer(new Response(JSON.stringify({
+      repos: [],
+      agents: [],
+      notifications: [],
+      decisions: {
+        enabled: false,
+        status: 'disabled',
+        reason: 'disabled',
+        model: '~typesafe/jev-latest',
+        endpoint: 'https://openrouter.ai/api/alpha/decisions',
+        credentialPresent: false,
+        credentialSource: 'none',
+        checkedAt: null,
+        incarnation: 'old-pairing',
+        generation: 0,
+      },
+      unackedActionRequired: 0,
+      unackedNeedsOwner: 0,
+      wakes: { count: 0, lastAt: null },
+      pipeline: { entries: [], pending: 0 },
+    }), { status: 200 }));
+    await refetch;
+    expect(events.fatal).not.toHaveBeenCalled();
+    expect(events.snapshot).not.toHaveBeenCalled();
+  });
 });

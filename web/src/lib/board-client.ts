@@ -267,7 +267,9 @@ export class BoardClient {
       headers: { authorization: `Bearer ${this.options.token}` },
     });
     if (!res.ok) {
-      if (res.status === 401) {
+      // A stopped client's late 401 must never unpair the session that
+      // replaced it — it belongs to the old pairing.
+      if (res.status === 401 && !this.stopped) {
         this.events.fatal('unauthorized (board api)');
       }
       throw new Error(`board api ${path} → ${res.status}`);
@@ -280,7 +282,8 @@ export class BoardClient {
     try {
       const snapshot = await this.api<unknown>('/api/board');
       if (!isValidSnapshot(snapshot)) throw new Error('board api returned a malformed snapshot');
-      this.events.snapshot(snapshot);
+      // A stopped (re-paired) client's late answer never reaches the board.
+      if (!this.stopped) this.events.snapshot(snapshot);
     } catch {
       /* connection state carries the error surface */
     }
@@ -360,7 +363,9 @@ export class BoardClient {
       body: JSON.stringify(body),
     });
     if (!res.ok) {
-      if (res.status === 401) {
+      // A stopped client's late 401 must never unpair the session that
+      // replaced it — it belongs to the old pairing.
+      if (res.status === 401 && !this.stopped) {
         this.events.fatal('unauthorized (board api)');
       }
       let code: string | null = null;

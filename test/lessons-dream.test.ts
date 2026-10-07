@@ -19,6 +19,7 @@ import {
   loadDreamState,
   PROPOSAL_FILE,
   repairCommand,
+  coalesceReplay,
   saveDreamState,
   type DreamDistiller,
   type DistillInput,
@@ -904,11 +905,11 @@ describe('owner-approved lesson proposals (owner decision 2026-10-07)', () => {
     await h.engine.run();
     const { id } = h.proposals.review()!;
     // Crash after the Reject was recorded, before the cursor moved.
-    h.store({ ...h.stored(), decision: { kind: 'rejected', at: 'now', detail: null } });
+    h.store({ ...h.stored(), decision: { kind: 'rejected', at: '2026-10-07T12:00:00.000Z', detail: null } });
     expect(() => h.proposals.accept(id)).toThrowError(expect.objectContaining({ code: 'decided' }));
     expect(book(h.bible)).toEqual(before);
     // Still reviewable, carrying the recorded decision, so any page can finish it.
-    expect(h.proposals.review()).toMatchObject({ id, decision: { kind: 'rejected', at: 'now' }, recovery: null });
+    expect(h.proposals.review()).toMatchObject({ id, decision: { kind: 'rejected', at: '2026-10-07T12:00:00.000Z' }, recovery: null });
     expect(h.proposals.reject(id)).toMatchObject({ decision: 'rejected', coveredThroughSeq: entry.seq });
     expect(book(h.bible)).toEqual(before);
     expect(existsSync(h.file)).toBe(false);
@@ -922,7 +923,7 @@ describe('owner-approved lesson proposals (owner decision 2026-10-07)', () => {
     const record = h.stored();
     const plan = record['plan'] as { writes: { slug: string; text: string }[] };
     // Crash mid-Accept: decision recorded, first chapter written, the rest not.
-    h.store({ ...record, decision: { kind: 'accepted', at: 'now', detail: null } });
+    h.store({ ...record, decision: { kind: 'accepted', at: '2026-10-07T12:00:00.000Z', detail: null } });
     writeFileSync(join(h.bible.chaptersDir, `${plan.writes[0]!.slug}.md`), plan.writes[0]!.text);
     expect(() => h.proposals.reject(id)).toThrowError(expect.objectContaining({ code: 'decided' }));
     expect(h.proposals.reconcile()).toBeNull();
@@ -1003,7 +1004,7 @@ describe('owner-approved lesson proposals (owner decision 2026-10-07)', () => {
     const record = h.stored();
     const plan = record['plan'] as { writes: { slug: string; text: string }[]; before: { path: string; text: string | null }[] };
     // Crash mid-Accept, then someone edits INDEX.md before recovery.
-    h.store({ ...record, decision: { kind: 'accepted', at: 'now', detail: null } });
+    h.store({ ...record, decision: { kind: 'accepted', at: '2026-10-07T12:00:00.000Z', detail: null } });
     writeFileSync(join(h.bible.chaptersDir, `${plan.writes[0]!.slug}.md`), plan.writes[0]!.text);
     const indexBefore = h.bible.readIndexText() ?? '';
     writeFileSync(join(h.bible.dir, 'INDEX.md'), `${indexBefore}\n`);
@@ -1024,19 +1025,21 @@ describe('owner-approved lesson proposals (owner decision 2026-10-07)', () => {
     ]);
   });
 
-  it('recovery never rewinds the cursor or erases a replay range — a moved cursor is a conflict', async () => {
+  it('recovery never rewinds the cursor or erases a replay range — once committed, only cleanup remains', async () => {
     const h = proposalHarness();
     h.journal.append({ kind: 'finding', source: 'gru', body: 'shell hang finding' });
     await h.engine.run();
-    const { id } = h.proposals.review()!;
+    const { id, notificationId } = h.proposals.review()!;
     h.notifier.failResolve = 1;
     expect(() => h.proposals.accept(id)).toThrowError(expect.objectContaining({ code: 'incomplete' }));
+    expect(h.stored()['committed']).toMatchObject({ at: expect.any(String) });
     const file = join(h.bible.dir, DREAM_STATE_FILE);
-    const moved = { ...loadDreamState(file), coveredThroughSeq: 50, replay: { afterSeq: 40, throughSeq: 45 } };
+    const moved = { ...loadDreamState(file), coveredThroughSeq: 50, replay: [{ afterSeq: 40, throughSeq: 45 }] };
     saveDreamState(file, moved);
-    expect(h.proposals.reconcile()?.id).toBe(id);
+    expect(h.proposals.reconcile()).toBeNull();
     expect(loadDreamState(file)).toEqual(moved);
-    expect(h.stored()['recovery']).toMatchObject({ conflict: expect.stringContaining('dream cursor moved to 50') });
+    expect(existsSync(h.file)).toBe(false);
+    expect(h.notifier.resolved).toEqual([{ id: notificationId, by: 'owner:accepted' }]);
   });
 
   it('integrity is checked before a record is shown or decided: duplicate writes or a forged cursor refuse with nothing recorded', async () => {
@@ -1078,7 +1081,7 @@ describe('owner-approved lesson proposals (owner decision 2026-10-07)', () => {
     expect((await oneAtATime.run()).status).toBe('proposed'); // the stale one is withdrawn, e1 replayed
     expect(h.distiller.calls.at(-1)!.entries.map((entry) => entry.id)).toEqual([e1.id]);
     h.proposals.accept(h.proposals.review()!.id);
-    expect(loadDreamState(file)).toMatchObject({ coveredThroughSeq: 50, replay: { afterSeq: e1.seq, throughSeq: e2.seq } });
+    expect(loadDreamState(file)).toMatchObject({ coveredThroughSeq: 50, replay: [{ afterSeq: e1.seq, throughSeq: e2.seq }] });
     const before = h.bible.readChapter('ops-restarts');
     expect((await oneAtATime.run()).status).toBe('proposed');
     expect(h.distiller.calls.at(-1)!.entries.map((entry) => entry.id)).toEqual([e2.id]);
@@ -1120,5 +1123,188 @@ describe('owner-approved lesson proposals (owner decision 2026-10-07)', () => {
     } finally {
       db.close();
     }
+  });
+  describe('third review round of #254 (bmad-code-review, 2026-10-07)', () => {
+    const stateFile = (bible: BibleStore) => join(bible.dir, DREAM_STATE_FILE);
+    const at = '2026-10-07T12:00:00.000Z';
+
+    it('replay ranges stay disjoint: rejecting the first never re-proposes entries consumed between them', async () => {
+      const h = proposalHarness();
+      h.bible.ensureSeeded();
+      for (let seq = 1; seq <= 45; seq += 1) h.journal.append({ kind: 'finding', source: 'gru', body: `finding ${seq}` });
+      saveDreamState(stateFile(h.bible), { version: 1, coveredThroughSeq: 45, lastDreamAt: null, cycles: 3, replay: [{ afterSeq: 0, throughSeq: 1 }, { afterSeq: 40, throughSeq: 45 }] });
+      expect((await h.engine.run()).status).toBe('proposed');
+      expect(h.distiller.calls.at(-1)!.entries.map((entry) => entry.seq)).toEqual([1]);
+      h.proposals.reject(h.proposals.review()!.id);
+      expect(loadDreamState(stateFile(h.bible)).replay).toEqual([{ afterSeq: 40, throughSeq: 45 }]);
+      expect((await h.engine.run()).status).toBe('proposed');
+      expect(h.distiller.calls.at(-1)!.entries.map((entry) => entry.seq)).toEqual([41, 42, 43, 44, 45]);
+      // Only ranges that overlap or touch are joined; the single-range format still reads.
+      expect(coalesceReplay([{ afterSeq: 40, throughSeq: 45 }, { afterSeq: 0, throughSeq: 1 }])).toEqual([{ afterSeq: 0, throughSeq: 1 }, { afterSeq: 40, throughSeq: 45 }]);
+      expect(coalesceReplay([{ afterSeq: 0, throughSeq: 1 }, { afterSeq: 1, throughSeq: 3 }])).toEqual([{ afterSeq: 0, throughSeq: 3 }]);
+      writeFileSync(stateFile(h.bible), JSON.stringify({ version: 1, coveredThroughSeq: 9, lastDreamAt: null, cycles: 1, replay: { afterSeq: 2, throughSeq: 4 } }));
+      expect(loadDreamState(stateFile(h.bible)).replay).toEqual([{ afterSeq: 2, throughSeq: 4 }]);
+    });
+
+    it('an exhausted replay range is dropped and new entries are proposed in the same pass', async () => {
+      const h = proposalHarness();
+      h.bible.ensureSeeded();
+      for (let seq = 1; seq <= 3; seq += 1) h.journal.append({ kind: 'finding', source: 'gru', body: `finding ${seq}` });
+      saveDreamState(stateFile(h.bible), { version: 1, coveredThroughSeq: 3, lastDreamAt: null, cycles: 1, replay: [{ afterSeq: 10, throughSeq: 12 }] });
+      const fresh = h.journal.append({ kind: 'finding', source: 'gru', body: 'new work' });
+      expect((await h.engine.run()).status).toBe('proposed');
+      expect(h.distiller.calls.at(-1)!.entries.map((entry) => entry.id)).toEqual([fresh.id]);
+      expect(loadDreamState(stateFile(h.bible)).replay).toBeUndefined();
+    });
+
+    it('once the decision is committed, recovery is cleanup only — a later legitimate book edit is no conflict', async () => {
+      const h = proposalHarness();
+      h.journal.append({ kind: 'finding', source: 'gru', body: 'shell hang finding' });
+      await h.engine.run();
+      const { id, notificationId } = h.proposals.review()!;
+      h.notifier.failResolve = 1; // the crash lands right after the book and cursor are durable
+      expect(() => h.proposals.accept(id)).toThrowError(expect.objectContaining({ code: 'incomplete' }));
+      const edited = `${readFileSync(join(h.bible.chaptersDir, 'ops-restarts.md'), 'utf-8')}\nA later, legitimate edit.\n`;
+      writeFileSync(join(h.bible.chaptersDir, 'ops-restarts.md'), edited);
+      expect(h.proposals.reconcile()).toBeNull();
+      expect(h.notifier.conflicts.size).toBe(0);
+      expect(readFileSync(join(h.bible.chaptersDir, 'ops-restarts.md'), 'utf-8')).toBe(edited);
+      expect(h.notifier.resolved).toEqual([{ id: notificationId, by: 'owner:accepted' }]);
+      expect(existsSync(h.file)).toBe(false);
+    });
+
+    it('a malformed timestamp in a stored proposal is refused before review or decision — nothing changes', async () => {
+      const h = proposalHarness();
+      h.journal.append({ kind: 'finding', source: 'gru', body: 'shell hang finding' });
+      await h.engine.run();
+      const record = h.stored();
+      const { id } = h.proposals.review()!;
+      const before = book(h.bible);
+      h.store({ ...record, nextState: { ...(record['nextState'] as object), lastDreamAt: 'invalid' } });
+      expect(() => h.proposals.review()).toThrowError(/malformed/);
+      expect(() => h.proposals.accept(id)).toThrowError(/malformed/);
+      expect(h.stored()['decision']).toBeNull();
+      expect(book(h.bible)).toEqual(before);
+      expect(cursor(h.bible)).toBe(0);
+      writeFileSync(stateFile(h.bible), JSON.stringify({ version: 1, coveredThroughSeq: 0, lastDreamAt: 'invalid', cycles: 0 }));
+      expect(() => loadDreamState(stateFile(h.bible))).toThrowError(/invalid lastDreamAt/);
+    });
+
+    it('a dream state that changed only its schedule timestamp is a changed state — before and after a decision', async () => {
+      const h = proposalHarness();
+      h.journal.append({ kind: 'finding', source: 'gru', body: 'shell hang finding' });
+      await h.engine.run();
+      const pending = h.proposals.review()!;
+      saveDreamState(stateFile(h.bible), { ...loadDreamState(stateFile(h.bible)), lastDreamAt: at });
+      expect(() => h.proposals.accept(pending.id)).toThrowError(expect.objectContaining({ code: 'stale' }));
+
+      h.journal.append({ kind: 'finding', source: 'gru', body: 'second finding' });
+      await h.engine.run();
+      const second = h.stored();
+      h.store({ ...second, decision: { kind: 'rejected', at, detail: null } });
+      saveDreamState(stateFile(h.bible), { ...loadDreamState(stateFile(h.bible)), lastDreamAt: '2026-10-08T00:00:00.000Z' });
+      expect(h.proposals.reconcile()?.id).toBe(second['id']);
+      expect(h.stored()['recovery']).toMatchObject({ conflict: expect.stringContaining('dream cursor state changed') });
+    });
+
+    it('a recorded Reject meets a changed book with a conflict, and finishes once the book is restored', async () => {
+      const h = proposalHarness();
+      h.journal.append({ kind: 'finding', source: 'gru', body: 'shell hang finding' });
+      await h.engine.run();
+      h.store({ ...h.stored(), decision: { kind: 'rejected', at, detail: null } });
+      const index = h.bible.readIndexText()!;
+      writeFileSync(join(h.bible.dir, 'INDEX.md'), `${index}\n`);
+      expect(h.proposals.reconcile()).not.toBeNull();
+      expect(cursor(h.bible)).toBe(0);
+      expect(h.stored()).toMatchObject({ decision: { kind: 'rejected' }, recovery: { conflict: expect.stringContaining('changed since this proposal was rejected') } });
+      writeFileSync(join(h.bible.dir, 'INDEX.md'), index);
+      expect(h.proposals.reconcile()).toBeNull();
+      expect(cursor(h.bible)).toBe(1);
+    });
+
+    it('a cursor conflict names the state file and both expected states; the label follows the recorded decision', async () => {
+      for (const kind of ['accepted', 'rejected'] as const) {
+        const h = proposalHarness();
+        h.journal.append({ kind: 'finding', source: 'gru', body: 'shell hang finding' });
+        await h.engine.run();
+        const record = h.stored();
+        h.store({ ...record, decision: { kind, at, detail: null } });
+        saveDreamState(stateFile(h.bible), { ...loadDreamState(stateFile(h.bible)), coveredThroughSeq: 99 });
+        expect(h.proposals.reconcile()).not.toBeNull();
+        const notice = h.notifier.conflicts.get(`lessons-proposal-conflict:${String(record['id'])}`)!;
+        const label = kind === 'accepted' ? 'Accept' : 'Reject';
+        expect(notice.title).toContain(`Your ${label} of the lesson proposal could not finish`);
+        expect(notice.detail).toContain(stateFile(h.bible));
+        expect(notice.detail).toContain(JSON.stringify(record['fromState']));
+        expect(notice.detail).toContain(JSON.stringify(record['nextState']));
+        expect(notice.detail).toContain(`press ${label} again`);
+        expect(notice.detail).not.toContain('plan.writes');
+      }
+    });
+
+    it('the conflict notice always says what blocks NOW — refreshed in place through the real notifier and ledger', async () => {
+      const root = tmpDir('gru-command-conflict-refresh-');
+      const db = new LedgerDb(root);
+      try {
+        const bus = new EventBus();
+        const ledger = new LedgerApi(db.handle, { bus });
+        const notifications = new NotificationCenter({ ledger, bus });
+        const journal = new JournalStore(join(root, 'journal'));
+        const bible = new BibleStore(join(root, 'bible'));
+        const proposals = new LessonProposals({ bible, notifier: lessonProposalNotifier({ notifications, ledger }) });
+        const engine = new DreamEngine({ journal, bible, distiller: new FakeDistiller(), proposals });
+        journal.append({ kind: 'finding', source: 'gru', body: 'shell hang finding' });
+        await engine.run();
+        const file = join(bible.dir, PROPOSAL_FILE);
+        const record = JSON.parse(readFileSync(file, 'utf-8')) as Record<string, unknown>;
+        writeFileSync(file, JSON.stringify({ ...record, decision: { kind: 'accepted', at, detail: null } }));
+        const index = bible.readIndexText()!;
+        writeFileSync(join(bible.dir, 'INDEX.md'), `${index}\n`);
+        expect(proposals.reconcile()).not.toBeNull();
+        const id = `lessons-proposal-conflict:${String(record['id'])}`;
+        expect(ledger.getNotification(id)?.detail).toContain('INDEX.md changed');
+        // INDEX restored, a chapter edited instead: the same notice, the new cause.
+        writeFileSync(join(bible.dir, 'INDEX.md'), index);
+        writeFileSync(join(bible.chaptersDir, 'ops-restarts.md'), '# Foreign\n');
+        expect(proposals.reconcile()).not.toBeNull();
+        const refreshed = ledger.getNotification(id)!;
+        expect(refreshed.detail).toContain('chapters/ops-restarts.md');
+        expect(refreshed.detail).not.toContain('INDEX.md changed');
+        expect(refreshed).toMatchObject({ routing: 'needs-owner', resolvedAt: null });
+        expect(ledger.listNotifications({ limit: 50 }).filter((row) => row.kind === 'lessons.proposal-conflict')).toHaveLength(1);
+      } finally {
+        db.close();
+      }
+    });
+
+    it('a partial Accept blocked by an edit to an UNTOUCHED chapter names it, changes nothing, and finishes once restored', async () => {
+      const h = proposalHarness(twoChapters);
+      h.bible.ensureSeeded();
+      h.bible.applyUpdates(
+        [{ slug: 'model-policy', title: 'Model policy', summary: 'Which model does what.', tags: ['models'], lessons: [{ slug: 'sol', body: 'Silas runs on Sol.', journalIds: ['j-0'] }] }],
+        new Map([['j-0', at]]),
+      );
+      h.journal.append({ kind: 'finding', source: 'gru', body: 'shell hang finding' });
+      await h.engine.run();
+      const record = h.stored();
+      const plan = record['plan'] as { writes: { slug: string; text: string }[] };
+      // Crash mid-Accept: the decision is recorded and the first chapter written.
+      h.store({ ...record, decision: { kind: 'accepted', at, detail: null } });
+      writeFileSync(join(h.bible.chaptersDir, `${plan.writes[0]!.slug}.md`), plan.writes[0]!.text);
+      const untouched = join(h.bible.chaptersDir, 'model-policy.md');
+      const original = readFileSync(untouched, 'utf-8');
+      writeFileSync(untouched, `${original}\nAn unrelated edit.\n`);
+      const partial = book(h.bible);
+      expect(h.proposals.reconcile()).not.toBeNull();
+      expect(h.stored()['recovery']).toMatchObject({ conflict: expect.stringContaining('chapters/model-policy.md changed') });
+      expect(book(h.bible)).toEqual(partial);
+      expect(cursor(h.bible)).toBe(0);
+      expect(h.stored()['decision']).toMatchObject({ kind: 'accepted' });
+      writeFileSync(untouched, original);
+      expect(h.proposals.reconcile()).toBeNull();
+      expect(h.bible.readChapter('ops-restarts')?.lessons[0]?.recurred).toBe(1);
+      expect(h.bible.readChapter('review-rounds')?.lessons[0]?.recurred).toBe(1);
+      expect(cursor(h.bible)).toBe(1);
+    });
   });
 });

@@ -684,10 +684,12 @@ export class BoardView {
         .catch((error: unknown) => {
           if (!live()) return;
           current.inFlight = null;
-          if (error instanceof BoardApiError && error.code === 'proposal_conflict') current.recorded = decision;
           // Decided elsewhere: drop the cached review so the next load
           // brings the recorded decision (and its lock) with it.
           if (error instanceof BoardApiError && error.code === 'proposal_decided') current.review = null;
+          // Gone: maybe decided here (a lost reply) or on another device —
+          // refresh, so the snapshot shows what actually happened.
+          if (error instanceof BoardApiError && error.status === 404) client.wake();
           current.message = describeDecisionFailure(error);
           this.rerenderOwner();
         });
@@ -2226,17 +2228,19 @@ function describeProposalError(error: unknown): string {
 }
 
 /** The owner-facing reason a decision did not land: the server's refusal
- * (stale, already decided, conflict, gone) or an ambiguous network failure. */
+ * (stale, already decided, mismatched), a proposal that is gone — whose
+ * outcome is unknown, not refused — or an ambiguous network failure. A
+ * decision that is recorded but blocked arrives as 202 incomplete instead. */
 function describeDecisionFailure(error: unknown): string {
   if (error instanceof BoardApiError) {
     if (error.code === 'proposal_stale') {
       return `Not applied — ${error.detail ?? 'the Book of Lessons changed'}. A fresh proposal will follow.`;
     }
     if (error.code === 'proposal_decided') return `Not applied — ${error.detail ?? 'this proposal was already decided'}.`;
-    if (error.code === 'proposal_conflict') {
-      return `Recorded, but blocked — ${error.detail ?? 'the book changed under this decision'}. See the conflict notice.`;
+    if (error.status === 404) {
+      return 'This proposal is no longer pending — it may already have been decided, here or on another device. ' +
+        'The board is refreshing; check the Book of Lessons or the receipt for what happened.';
     }
-    if (error.status === 404) return 'Not applied — this proposal is no longer pending.';
     return `Not applied — the server refused (${error.status}${error.detail !== null ? `: ${error.detail}` : ''}).`;
   }
   return `Couldn’t confirm the decision (${describeProposalError(error)}) — it may not have been recorded; check the book or retry.`;
@@ -2268,6 +2272,13 @@ function renderProposalReview(proposal: LessonProposalView, nested: Set<string>,
           `${chapter.title.after} — chapter retired (${chapter.removed.length} lesson${chapter.removed.length === 1 ? '' : 's'} removed)`,
         ),
       );
+      // What the retirement takes away beyond the lessons.
+      if (chapter.summary.before !== null && chapter.summary.before !== '') {
+        section.append(el('div', 'lbl board-owner__review-meta', `summary removed: ${chapter.summary.before}`));
+      }
+      if (chapter.tags.before.length > 0) {
+        section.append(el('div', 'lbl board-owner__review-meta', `tags removed: ${tagsLine(chapter.tags.before)}`));
+      }
     } else {
       const heading =
         chapter.title.before === null
@@ -2313,7 +2324,7 @@ function renderProposalReview(proposal: LessonProposalView, nested: Set<string>,
         entry.before === null
           ? `+ ${entry.slug}: ${entry.after!.summary} (tags: ${tagsLine(entry.after!.tags)})`
           : entry.after === null
-            ? `− ${entry.slug}: ${entry.before.summary}`
+            ? `− ${entry.slug}: ${entry.before.summary} (tags: ${tagsLine(entry.before.tags)})`
             : `~ ${entry.slug}: ${entry.before.summary} (tags: ${tagsLine(entry.before.tags)}) → ${entry.after.summary} (tags: ${tagsLine(entry.after.tags)})`;
       section.append(el('div', 'board-owner__review-text', line));
     }
@@ -2350,15 +2361,22 @@ function reviewLesson(label: string, lesson: LessonChangeView, chapterSlug: stri
   return node;
 }
 
+const REMOVED_LABEL: Readonly<Record<RemovedLessonView['reason'], string>> = {
+  cap: 'removed to fit the cap',
+  retired: 'removed with the chapter',
+  discarded: 'new, but left out to fit the cap',
+};
+
 function reviewRemoved(lesson: RemovedLessonView): HTMLElement {
   const node = el('div', 'board-owner__review-lesson board-owner__review-lesson--removed');
   node.append(
     el(
       'div',
       'lbl board-owner__review-label',
-      `${lesson.reason === 'retired' ? 'removed with the chapter' : 'removed to fit the cap'} · ${lesson.slug} (recurred ${lesson.recurred})`,
+      `${REMOVED_LABEL[lesson.reason]} · ${lesson.slug} (recurred ${lesson.recurred})`,
     ),
     el('div', 'board-owner__review-text', lesson.body),
   );
+  if (lesson.tags.length > 0) node.append(el('div', 'lbl board-owner__review-meta', `tags: ${tagsLine(lesson.tags)}`));
   return node;
 }

@@ -4168,14 +4168,15 @@ export class LedgerApi {
   }
 
   /** Resolve one exact incident ID without acknowledging it for the owner. */
-  /** Replace an OPEN notification's detail in place — id, acknowledgement
+  /** Replace an OPEN notification's detail (and, when given, title) in place — id, acknowledgement
    * and routing unchanged (a long-running incident refreshing its latest
    * cause). A resolved or missing row is left as-is and returned (or null). */
-  updateNotificationDetail(id: string, detail: string): NotificationRecord | null {
+  updateNotificationDetail(id: string, detail: string, title?: string): NotificationRecord | null {
     return this.transaction(() => {
       const current = this.getNotification(id);
-      if (current === null || current.resolvedAt !== null || current.detail === detail) return current;
-      this.db.prepare('UPDATE notifications SET detail = ? WHERE id = ?').run(detail, id);
+      const nextTitle = title ?? current?.title;
+      if (current === null || current.resolvedAt !== null || (current.detail === detail && current.title === nextTitle)) return current;
+      this.db.prepare('UPDATE notifications SET detail = ?, title = ? WHERE id = ?').run(detail, nextTitle ?? current.title, id);
       this.appendEvent({ kind: 'notification.updated', agentId: current.agentId, payload: { id } });
       return this.getNotification(id);
     });

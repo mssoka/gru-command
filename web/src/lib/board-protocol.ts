@@ -290,12 +290,15 @@ export interface LessonChangeView {
   readonly previousTags: readonly string[] | null;
 }
 
-/** A lesson the proposal removes, with the text that disappears. */
+/** A lesson the proposal removes, with the text and tags that disappear:
+ * `cap` — an existing lesson dropped to fit; `retired` — its chapter is
+ * retired; `discarded` — an incoming lesson the cap left out. */
 export interface RemovedLessonView {
   readonly slug: string;
   readonly body: string;
   readonly recurred: number;
-  readonly reason: 'cap' | 'retired';
+  readonly tags: readonly string[];
+  readonly reason: 'cap' | 'retired' | 'discarded';
 }
 
 export interface LessonChapterChangeView {
@@ -615,7 +618,8 @@ function isRemovedLesson(value: unknown): boolean {
     typeof value.slug === 'string' &&
     typeof value.body === 'string' &&
     isCount(value.recurred) &&
-    (value.reason === 'cap' || value.reason === 'retired');
+    isStringList(value.tags) &&
+    (value.reason === 'cap' || value.reason === 'retired' || value.reason === 'discarded');
 }
 
 /** POST /api/lessons/proposal/:id/(accept|reject) — 200 finished, or 202

@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, it } from 'vitest';
-import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { tmpdir } from 'node:os';
@@ -9,8 +9,11 @@ import {
   enforceChapterCap,
   parseChapter,
   BIBLE_WRITE_LOCK,
+  checkPlan,
   compareProvenance,
   describePlan,
+  RECLAIM_GATE_STALE_MS,
+  setProcessIdentityReader,
   PROVENANCE_FLOOR,
   RepairWriteError,
   repairChapterProvenance,
@@ -19,7 +22,7 @@ import {
   serializeChapter,
 } from '../src/lessons/bible.js';
 import { JournalStore } from '../src/lessons/journal.js';
-import { BibleError, type BibleChapter, type ProposedChapter, type ProvenanceRef } from '../src/lessons/types.js';
+import { ARCHIVED_LESSON_SLUG, BibleError, type BibleChapter, type ProposedChapter, type ProvenanceRef } from '../src/lessons/types.js';
 
 /**
  * Bible (Book of Lessons memory): stable anchors, semantic-dedupe merge
@@ -685,7 +688,8 @@ describe('repair and cap review fixes (bmad-code-review of #253, 2026-10-07)', (
   it('repair and the dream share the write lock: contention fails loud; a dead holder is taken over', () => {
     const bible = bibleWith({ 'a.md': brokenA });
     const lock = join(bible.dir, BIBLE_WRITE_LOCK);
-    writeFileSync(lock, JSON.stringify({ pid: process.pid, action: 'dream apply', at: 'now' }));
+    // A live process other than this one (a record from an older version: PID only).
+    writeFileSync(lock, JSON.stringify({ pid: process.ppid, action: 'dream apply', at: 'now' }));
     expect(() => bible.repairProvenance(JOURNAL, { write: true })).toThrowError(/being written by pid \d+ \(dream apply/);
     expect(() => bible.applyUpdates([proposal()], PROVENANCE)).toThrowError(/being written by pid/);
     expect(readFileSync(join(bible.chaptersDir, 'a.md'), 'utf-8')).toBe(brokenA);
@@ -1146,5 +1150,159 @@ describe('second review round of #254 — plans and their review (bmad-code-revi
     expect(() => bible.planUpdates([proposal({ tags: ['a, b'] })], PROVENANCE)).toThrowError(/line break or a comma/);
     expect(() => bible.planUpdates([proposal({ title: 'Ops\n## injected' })], PROVENANCE)).toThrowError(/single lines/);
     expect(bible.readChapter('ops-restarts')).toBeNull();
+  });
+});
+
+describe('third review round of #254 — plan integrity, cap effects, canonical input, lock recovery (2026-10-07)', () => {
+  const at = (minute: number): string => new Date(Date.UTC(2026, 9, 1, 0, minute)).toISOString();
+  const journal = (count: number, from = 1) => new Map(Array.from({ length: count }, (_, index) => [`j-${from + index}`, at(from + index)] as const));
+  const ARCHIVE_BODY = 'Lessons trimmed at the chapter cap; provenance retained so the journal remains the ground truth.';
+  const model = { slug: 'model-policy', title: 'Model policy', summary: 'Which model does what.', tags: ['models'], lessons: [{ slug: 'sol', body: 'Silas runs on Sol.', tags: ['silas'], journalIds: ['j-2'] }] };
+
+  it('a plan with a forged fingerprint — to skip its writes or to redirect them — is refused before anything acts', () => {
+    const bible = tmpBible();
+    bible.ensureSeeded();
+    const plan = bible.planUpdates([proposal()], PROVENANCE);
+    expect(() => checkPlan({ ...plan, after: plan.base })).toThrowError(/writes do not produce its planned book/);
+    expect(() => bible.applyPlan({ ...plan, after: plan.base })).toThrowError(/writes do not produce its planned book/);
+    expect(bible.readChapter('ops-restarts')).toBeNull();
+    expect(() => checkPlan({ ...plan, base: 'f'.repeat(64) })).toThrowError(/does not fingerprint to its base/);
+    expect(() => checkPlan({ ...plan, before: plan.before.filter((entry) => entry.path !== 'INDEX.md') })).toThrowError(/inconsistent/);
+  });
+
+  it('applying onto a changed book names every unexpected path — changed, added, deleted — and writes nothing', () => {
+    const bible = tmpBible();
+    bible.ensureSeeded();
+    bible.applyUpdates([model, { ...model, slug: 'gone-soon', title: 'Gone soon' }], PROVENANCE);
+    const plan = bible.planUpdates([proposal()], PROVENANCE);
+    writeFileSync(join(bible.chaptersDir, 'model-policy.md'), `${readFileSync(join(bible.chaptersDir, 'model-policy.md'), 'utf-8')}\nEdited.\n`);
+    writeFileSync(join(bible.chaptersDir, 'stray.md'), '# Stray\n');
+    rmSync(join(bible.chaptersDir, 'gone-soon.md'));
+    expect(() => bible.applyPlan(plan)).toThrowError(
+      /chapters\/gone-soon\.md deleted, chapters\/model-policy\.md changed, chapters\/stray\.md added/,
+    );
+    expect(bible.readChapter('ops-restarts')).toBeNull();
+  });
+
+  it('the review counts every handle the cap released — an incoming lesson’s too — and names incoming lessons it left out', () => {
+    const many = journal(40);
+    const bible = tmpBible(1_200);
+    bible.ensureSeeded();
+    const plan = bible.planUpdates([{ slug: 'ops', title: 'Ops', summary: 'Ops.', tags: ['ops'], lessons: [{ slug: 'many', body: 'A lesson cited forty times.', journalIds: [...many.keys()] }] }], many);
+    const written = parseChapter(plan.writes[0]!.text, 'ops').lessons[0]!;
+    expect(written.provenance.length).toBeLessThan(40);
+    expect(describePlan(plan).chapters[0]!.provenanceTrimmed).toBe(40 - written.provenance.length);
+
+    // Two incoming lessons, room for one plus the archive of the other.
+    const keep = { slug: 'keep', body: 'K'.repeat(150), recurred: 1, provenance: [{ id: 'j-2', ts: at(2) }], tags: [] as string[] };
+    const archived = { slug: ARCHIVED_LESSON_SLUG, body: ARCHIVE_BODY, recurred: 1, provenance: [{ id: 'j-1', ts: at(1) }], tags: ['archived'] };
+    const cap = Buffer.byteLength(serializeChapter({ slug: 'two', title: 'Two', summary: 'Two.', tags: [], lessons: [keep, archived] }), 'utf8');
+    const tight = tmpBible(cap);
+    tight.ensureSeeded();
+    const dropped = tight.planUpdates([{
+      slug: 'two',
+      title: 'Two',
+      summary: 'Two.',
+      lessons: [
+        { slug: 'left-out', body: 'L'.repeat(150), journalIds: ['j-1'] },
+        { slug: 'keep', body: 'K'.repeat(150), journalIds: ['j-2'] },
+      ],
+    }], journal(2));
+    const change = describePlan(dropped).chapters[0]!;
+    expect(change.added.map((lesson) => lesson.slug)).toEqual(['keep']);
+    expect(change.removed).toEqual([{ slug: 'left-out', body: 'L'.repeat(150), recurred: 1, tags: [], reason: 'discarded' }]);
+  });
+
+  it('the review counts handles the cap released from the archive record', () => {
+    const archive = { slug: ARCHIVED_LESSON_SLUG, body: ARCHIVE_BODY, recurred: 1, provenance: [...journal(60).entries()].map(([id, ts]) => ({ id, ts })), tags: ['archived'] };
+    const existing = { slug: 'keep', body: 'Keep this lesson.', recurred: 1, provenance: [{ id: 'j-61', ts: at(61) }], tags: [] as string[] };
+    const text = serializeChapter({ slug: 'ops', title: 'Ops', summary: 'Ops.', tags: ['ops'], lessons: [existing, archive] });
+    const bible = tmpBible(Buffer.byteLength(text, 'utf8') + 40);
+    bible.ensureSeeded();
+    writeFileSync(join(bible.chaptersDir, 'ops.md'), text);
+    const plan = bible.planUpdates([{ slug: 'ops', title: 'Ops', summary: 'Ops.', tags: ['ops'], lessons: [{ slug: 'fresh', body: 'A new lesson that needs room.', journalIds: ['j-62'] }] }], journal(1, 62));
+    const after = parseChapter(plan.writes[0]!.text, 'ops').lessons.find((lesson) => lesson.slug === ARCHIVED_LESSON_SLUG)!;
+    expect(after.provenance.length).toBeLessThan(60);
+    expect(describePlan(plan).chapters[0]!.provenanceTrimmed).toBe(60 - after.provenance.length);
+  });
+
+  it('removals carry their tags — a retired chapter’s lessons, summary and tags alike', () => {
+    const bible = tmpBible();
+    bible.ensureSeeded();
+    bible.applyUpdates([model], PROVENANCE);
+    const plan = bible.planUpdates([{ ...model, lessons: [], retire: true }], PROVENANCE);
+    const change = describePlan(plan).chapters[0]!;
+    expect(change).toMatchObject({ retired: true, summary: { before: 'Which model does what.', after: '' }, tags: { before: ['models'], after: [] } });
+    expect(change.removed).toEqual([{ slug: 'sol', body: 'Silas runs on Sol.', recurred: 1, tags: ['silas'], reason: 'retired' }]);
+    expect(describePlan(plan).index).toEqual([{ slug: 'model-policy', before: { summary: 'Which model does what.', tags: ['models'] }, after: null }]);
+  });
+
+  it('plans what the format reads back: padded title and tags, duplicate tags and CRLF bodies are canonicalized', () => {
+    const bible = tmpBible();
+    bible.ensureSeeded();
+    const plan = bible.planUpdates([{
+      slug: 'ops',
+      title: ' Ops ',
+      summary: 'Ops.',
+      tags: [' ops ', 'ops'],
+      lessons: [{ slug: 'crlf', body: 'Line one.\r\nLine two.', tags: [' shell ', 'shell'], journalIds: ['j-1'] }],
+    }], PROVENANCE);
+    bible.applyPlan(plan);
+    const chapter = bible.readChapter('ops')!;
+    expect([chapter.title, chapter.tags]).toEqual(['Ops', ['ops']]);
+    expect([chapter.lessons[0]!.body, chapter.lessons[0]!.tags]).toEqual(['Line one.\nLine two.', ['shell']]);
+  });
+
+  it('a lock whose PID now belongs to another process is dead; one held by the same process — or unknowable — stays held', () => {
+    const bible = tmpBible();
+    bible.ensureSeeded();
+    const lock = join(bible.dir, BIBLE_WRITE_LOCK);
+    const live = process.ppid;
+    const holder = (fields: Record<string, unknown>) => writeFileSync(lock, JSON.stringify({ pid: live, token: 'held', action: 'dream apply', at: 'then', ...fields }));
+    setProcessIdentityReader((pid) => (pid === live ? 'test:current-incarnation' : `test:${pid}`));
+    try {
+      holder({ identity: 'test:earlier-incarnation' }); // the PID was reused after a crash or reboot
+      expect(bible.applyUpdates([proposal()], PROVENANCE).chaptersWritten).toBe(1);
+      expect(existsSync(lock)).toBe(false);
+      holder({ identity: 'test:current-incarnation' });
+      expect(() => bible.applyUpdates([proposal()], PROVENANCE)).toThrowError(/being written by pid/);
+      holder({}); // written by an older version: PID only
+      expect(() => bible.applyUpdates([proposal()], PROVENANCE)).toThrowError(/being written by pid/);
+      setProcessIdentityReader(() => null); // cannot tell: never steal
+      holder({ identity: 'test:earlier-incarnation' });
+      expect(() => bible.applyUpdates([proposal()], PROVENANCE)).toThrowError(/being written by pid/);
+      // This process's own record that nothing holds (a release that failed to remove it).
+      writeFileSync(lock, JSON.stringify({ pid: process.pid, identity: null, token: 'released', action: 'x', at: 'then' }));
+      expect(bible.applyUpdates([proposal()], PROVENANCE).chaptersWritten).toBe(1);
+    } finally {
+      setProcessIdentityReader(null);
+      rmSync(lock, { force: true });
+    }
+  });
+
+  it('the reclaim gate heals itself: a dead or stale gate is broken; a live reclaimer’s fresh gate is respected', () => {
+    const bible = tmpBible();
+    bible.ensureSeeded();
+    const lock = join(bible.dir, BIBLE_WRITE_LOCK);
+    const gate = `${lock}.reclaim`;
+    const dead = () => spawnSync(process.execPath, ['-e', '']).pid!;
+    const deadLock = () => writeFileSync(lock, JSON.stringify({ pid: dead(), token: 'old', action: 'dream apply', at: 'then' }));
+    const apply = () => bible.applyUpdates([proposal()], PROVENANCE);
+    const old = new Date(Date.now() - RECLAIM_GATE_STALE_MS - 5_000);
+    deadLock();
+    writeFileSync(gate, JSON.stringify({ pid: dead(), token: 'gate-of-the-dead', action: 'reclaim', at: 'then' }));
+    expect(apply().chaptersWritten).toBe(1); // a reclaimer killed mid-reclaim no longer blocks the book
+    expect(existsSync(gate)).toBe(false);
+    deadLock();
+    writeFileSync(gate, JSON.stringify({ pid: process.ppid, token: 'live-reclaimer', action: 'reclaim', at: 'now' }));
+    expect(apply).toThrowError(/another process is reclaiming/);
+    expect(JSON.parse(readFileSync(lock, 'utf-8')).token).toBe('old');
+    utimesSync(gate, old, old); // the same reclaimer, frozen for longer than a reclaim can take
+    expect(apply().chaptersWritten).toBe(1);
+    deadLock();
+    mkdirSync(gate); // an older version's gate directory, abandoned
+    utimesSync(gate, old, old);
+    expect(apply().chaptersWritten).toBe(1);
+    expect(existsSync(gate)).toBe(false);
   });
 });
