@@ -2,7 +2,7 @@
 title: 'Dashboard slim strip — current-main continuation (approved Sample2 port)'
 type: 'feature'
 created: '2026-10-07'
-status: 'in-progress'
+status: 'in-review'
 route: 'dispatch'
 baseline_commit: '49b558f243c7bacbfb46c7bc04f749bf131cefea'
 review_loop_iteration: 0
@@ -95,6 +95,7 @@ Port map (source `4de42d9` → destination current main `49b558f`):
 - Merges recorded: wakes chip = lane count/age split + main #219 deferred (count/reasons/truncated), number rendered once on the ALERTS pair with the tracker chip hidden but text/title-complete; silas splits re-derived for main's #163 headline branches (pass failed / turn open / reconciled / wake / no wakes yet) with `FAILED` as pure text (no numeric part); CHILDREN preserved as an additional group only when the server reported counters; Binned KPI preserved; bell panel keeps its prior PR presentation via `ownerPrRow(row, 'panel')`; all six sections/previews/cold-binned behavior untouched.
 - e2e suite refreshed for the current-main protocol: complete SilasView fixtures (no `undefined !== null` branches), 13 data-kpi slots (binned added), CHILDREN present/absent and deferred-wake cases added, reserved-slot geometry kept at 1440/1200/768/360 ± themes.
 - Verification scopes unioned in `.gru-command/worktree.toml`; both baselines pin `49b558f…` (the recorded execution base), not the obsolete 84aec28 planning pin.
+- 2026-10-07 verification round at head `a8847055e3d0c11eddb282458e67c7e6b88a359a` (all through the authenticated scheduler + shipped capture helper; complete NDJSON sinks + receipts under `_bmad-output/verify-captures/current-main-20261007/`): `dashboard-slim-strip-unit` GREEN run 73255daf (137/137); `strip-browser` GREEN run 5d3bc3d2 (67/67, captures inspected at 1440/1200/768/360 light+dark); `dashboard-slim-strip-baseline` RED run e7bf5e64 (24 behavioral feature-absence failures, no suite/collection error); `strip-browser-baseline` RED run 6bda4166 (67/67 fail on the missing strip DOM, baseline app builds); `typecheck` GREEN run 4cbd19a1; `full` GREEN run 19589690 (lint/typecheck/build + backend 2291 passed + heavy 925 passed + web 537 passed, exit 0). Independent whole-change review is commissioned via `POST /api/dispatch` (`deliverable: review`, three lenses) at this exact head as part of this round.
 ## Spec Change Log
 
 ## Review Triage Log
