@@ -1008,35 +1008,43 @@ describe('gru awareness — morning digest (owner ruling 2026-09-23)', () => {
   });
 
   it('a terminal-bound machine row is a labeled receipt, never machine attention or a wake seed (D1)', () => {
-    const dir = tmpDir();
-    let receiptId = '';
-    {
-      const first = boot({ dir, wakeMode: 'never' });
-      first.api.addJob({ id: 'job-terminal', repo: 'r', title: 'Terminal job', briefing: 'b' });
-      first.api.setJobStatus('job-terminal', 'working');
-      first.api.registerAgent({ id: 'minion-terminal', role: 'minion', jobId: 'job-terminal' });
-      const row = first.notifications.post({
-        kind: 'review-escalation',
-        routing: 'action-required',
-        severity: 'error',
-        title: 'Round INCOMPLETE',
-        agentId: 'minion-terminal',
-      });
-      receiptId = row.id;
-        first.api.setJobStatus('job-terminal', 'delivered');
-      first.api.setJobStatus('job-terminal', 'in-review');
-      first.api.setJobStatus('job-terminal', 'merged');
+    // BOTH terminal recipes — merged (the succeeded close) and binned (the
+    // discarded close) — are closed receipts for every Gru-facing reader.
+    for (const terminal of ['merged', 'binned'] as const) {
+      const dir = tmpDir();
+      let receiptId = '';
+      {
+        const first = boot({ dir, wakeMode: 'never' });
+        first.api.addJob({ id: 'job-terminal', repo: 'r', title: 'Terminal job', briefing: 'b' });
+        first.api.setJobStatus('job-terminal', 'working');
+        first.api.registerAgent({ id: 'minion-terminal', role: 'minion', jobId: 'job-terminal' });
+        const row = first.notifications.post({
+          kind: 'review-escalation',
+          routing: 'action-required',
+          severity: 'error',
+          title: 'Round INCOMPLETE',
+          agentId: 'minion-terminal',
+        });
+        receiptId = row.id;
+        if (terminal === 'merged') {
+          first.api.setJobStatus('job-terminal', 'delivered');
+          first.api.setJobStatus('job-terminal', 'in-review');
+          first.api.setJobStatus('job-terminal', 'merged');
+        } else {
+          first.api.setJobStatus('job-terminal', 'binned');
+        }
+      }
+      const rig = boot({ dir, wakeMode: 'action-required', wakeMinIntervalMs: 0 });
+      const injection = rig.awareness.prepare('chat');
+      // Labeled as a receipt under its own section, never as machine
+      // attention that reads like live work.
+      expect(injection?.text, terminal).toContain('Closed receipts (no action required; kept for reference):');
+      expect(injection?.text, terminal).toContain(`[${receiptId}]`);
+      expect(injection?.text, terminal).not.toContain('Action required (unacknowledged):');
+      // The boot backlog never seeded it: with a zero interval a seeded row
+      // would have fired a wake turn through the sink.
+      expect(rig.woke, terminal).toHaveLength(0);
     }
-    const rig = boot({ dir, wakeMode: 'action-required', wakeMinIntervalMs: 0 });
-    const injection = rig.awareness.prepare('chat');
-    // Labeled as a receipt under its own section, never as machine
-    // attention that reads like live work.
-    expect(injection?.text).toContain('Closed receipts (no action required; kept for reference):');
-    expect(injection?.text).toContain(`[${receiptId}]`);
-    expect(injection?.text).not.toContain('Action required (unacknowledged):');
-    // The boot backlog never seeded it: with a zero interval a seeded row
-    // would have fired a wake turn through the sink.
-    expect(rig.woke).toHaveLength(0);
   });
 });
 

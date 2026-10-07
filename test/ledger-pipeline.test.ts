@@ -376,6 +376,18 @@ describe('pipeline ledger — evaluation, order and projection', () => {
     ledger.setJobStatus('pipe-a', 'in-review');
     ledger.setJobStatus('pipe-a', 'merged');
     expect(view().entries.find((entry) => entry.id === 'pipe-b')?.reason).toBeNull();
+
+    // A DISCARDED (binned) entry releases its exclusive scope too — the
+    // stall clears instead of blocking same-scope entries forever.
+    enqueue(ledger, 'pipe-bin', { exclusiveScopes: ['repo:bin'] });
+    enqueue(ledger, 'pipe-bin-next', { exclusiveScopes: ['repo:bin'] });
+    ledger.claimPipelineEntry({ id: 'pipe-bin', holder: 'silas' });
+    ledger.addJob({ id: 'pipe-bin', repo: 'demo', title: 'Entry pipe-bin', briefing: 'Briefing for pipe-bin' });
+    ledger.markPipelineAdmitted({ id: 'pipe-bin', jobId: 'pipe-bin' });
+    ledger.setJobStatus('pipe-bin', 'working');
+    expect(view().entries.find((entry) => entry.id === 'pipe-bin-next')?.reason).toContain('held by pipe-bin');
+    ledger.setJobStatus('pipe-bin', 'binned');
+    expect(view().entries.find((entry) => entry.id === 'pipe-bin-next')?.reason).toBeNull();
     db.close();
   });
 

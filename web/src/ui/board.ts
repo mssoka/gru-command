@@ -376,7 +376,11 @@ export class BoardView {
     // shortcut — one gesture away, never an unrelated section.
     const sectionKey = /^section:([a-z-]+)$/u.exec(key);
     if (sectionKey !== null) {
-      this.boardNav.querySelector<HTMLElement>(`.board-nav__link[data-nav="${sectionKey[1]}"]`)?.focus();
+      // The binned disclosure lives INSIDE COLD but carries its own focus
+      // key; if it vanished mid-render, focus falls back to the COLD
+      // shortcut, never <body>.
+      const navId = sectionKey[1] === 'cold-binned' ? 'cold' : sectionKey[1];
+      this.boardNav.querySelector<HTMLElement>(`.board-nav__link[data-nav="${navId}"]`)?.focus();
       return;
     }
     let jobId: string | null = null;

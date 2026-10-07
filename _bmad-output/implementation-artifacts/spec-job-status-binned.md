@@ -79,6 +79,8 @@ context: []
 - Workflow state: lane-local BMAD `bmad-build` render `_bmad/render/bmad-build/job-job-status-binned-continuation-20261006-0e52e101bc06/f76b749a098f5191ee57/`. Step-02 was executed against base `84aec28b04ddc406f26c458383452318f8cb7ed1` (equals observed remote main). Checkpoint 1 is auto-resolved under the dispatch briefing's explicit authority (`job-status-binned-continuation-20261006` is the sole owner of investigation/spec, implementation, built-in independent review, fixes, authenticated verification and PR as one complete build); no human is present in the lane. Status set `in-progress`, baseline pinned.
 - No subagent runtime is exposed to this lane's tool surface, so implementation is done directly from the spec (step-03's documented fallback); the built-in review runs as fresh tracked review jobs through `POST /api/dispatch` per the playbook.
 - Implementation commit `6cd0dd2c5a6e05b236a6a256d7c2fac3d79a0054` (spec `472d0f9`). `binned-static` PASS at 6cd0dd2 (lint/typecheck/build/web tsc, exit 0, capture `_bmad-output/binned-verify/binned-static-6cd0dd2.ndjson`, receipt sha256 1b8d5df7…). `binned-focused` PASS at 6cd0dd2 (backend 144 tests, 5 files; web 179 tests, 5 files; exit 0; capture `_bmad-output/binned-verify/binned-focused-6cd0dd2.ndjson`, receipt sha256 f0542a55…). `binned-baseline` RED at both legs as designed (backend 5 failed/137 passed; web 5 failed/174 passed; exit 1; capture `_bmad-output/binned-verify/binned-baseline-6cd0dd2.ndjson`, receipt sha256 b1a33a4c…) — failures are the new assertions at the pre-change base (unknown status "binned", assertion mismatches), never setup/compile failures.
+- Round-1 fix head `2bdfc4973aff53564b1bb6797a9d01036d203f47`, test repairs `d24551af308113a2e1d3bbab4d1da3d2ec344f82`. Gates at `d24551a`: `binned-static` PASS; `binned-focused` PASS (backend 16 files / 627 tests, web 5 files / 180 tests; full capture `_bmad-output/binned-verify/binned-focused-d24551af308113a2e1d3bbab4d1da3d2ec344f82-a4.ndjson`); `binned-heavy` PASS (4 targeted cases; capture `…-heavy-…-a5.ndjson`); `binned-baseline` RED both legs (5 backend + 6 web assertion failures; capture `…-baseline-…-a1.ndjson`). Queue waits beyond the capture helper's transport bound were handled by re-attaching under the SAME durable request id; the terminated attempts are preserved (admission-failed / UNKNOWN receipts) and are not PASS evidence.
+- Round-2 review fixes (head follows) close the second round's terminal-consumer gaps (child workers, branch idle, worktrees release, phase-handoff reconcile, ledger re-brief boundaries, pipeline exclusive scopes, awareness receipts), collapse the terminal declaration to ONE list feeding set/union/predicate, make the provider-recovery skip reason truthful for a discard, fix the binned disclosure focus fallback, and refresh the stale doc/role/skill enumerations.
 - Closed-receipt projections are deliberate: binned → `prState` null on both server and web (never an open-PR claim), needs-Gru suppressed, bound notification rows are receipts, obligations settle `{kind:'job-terminal', jobStatus:'binned'}`. Terminal fences in dispatch/provider-recovery/chat/telemetry now route through `isJobTerminal` so a binned lane can never be re-briefed, amended, directed, reviewed, re-dispatched or resurrected by a later merge signal.
 - Board filter: binned rows stay in COLD (complete count) and render only inside the expanded Cold section behind a second explicit `Show N binned records` disclosure; the badge is a dashed muted chip + dot with the visible word `binned`; the binned body keeps ALL rounds (merged/done stay quiescent).
 
@@ -111,6 +113,33 @@ Round 1 — three fresh tracked review jobs at `e4f3f64481afae6288fee23a79a0611c
 
 All round-1 findings are verified real (none false/rejected); every one is patched in the fix commit. No intent_gap/bad_spec loopback: the frozen intent already names the terminal contract, and the fixes are code/test/doc completions inside it. Round 2 (fresh whole-change review at the fix head) follows before any READY claim.
 
+Round 2 — three fresh tracked review jobs at `d24551af308113a2e1d3bbab4d1da3d2ec344f82`, read-only, trees verified unmodified. Reports: `_bmad-output/binned-verify/reviews/r2-{blind-hunter,edge-case-hunter,verification-gap}.md` (+ provenance). Blind hunter 13, verification gap 7, edge case 1. All verified real; all patched.
+
+| ID | Layer | Finding (short) | Verdict | Evidence / disposition |
+|---|---|---|---|---|
+| R2B1 | blind | spec's Verification block listed the pre-fix scopes | low | Real artifact drift. Patched: block now names the committed focused/heavy/static/baseline scopes and the fix-head receipts. |
+| R2B2 | blind | baseline scope claimed wider overlay than its file list | low | Real. Patched: overlay extended to every fast suite the change touches (plus the shared fixture); the comment now scopes the claim and points heavy fail-before at `binned-heavy`. |
+| R2B3 | blind | shipped Silas skill still said terminal = merged/done (re-brief bullet) | low | Real. Patched. |
+| R2B4 | blind | `docs/FLOW.md` two stale enumerations | low | Real. Patched (both). |
+| R2B5 | blind | `docs/LEDGER.md` re-brief-marker section contradicted its terminal bullet | low | Real. Patched (both lines). |
+| R2B6 | blind | provider-recovery skip recorded a discard as "completed" | medium | Real truthfulness defect. Patched: `why` now names the actual terminal status (`job is binned — no continuation`); pinned in the resume test. |
+| R2B7 | blind | terminal set declared four times; predicate could go unsound | medium | Real drift surface. Patched: ONE `TERMINAL_JOB_STATUS_LIST` declaration feeds the set, the union, the predicate and `isTerminalJobStatus`; api/obligations/silas-driver consume the shared type; the web cross-build alarm parses the single declaration. |
+| R2B8 | blind | three stale terminal comments on/next to changed code | low | Real. Patched (board.ts x2, dispatch/service.ts). |
+| R2B9/R2E1 | blind + edge | `section:cold-binned` cannot resolve through the focus fallback | low | Real a11y gap. Patched: the restore path maps the binned disclosure to the COLD shortcut so focus never drops to `<body>`. |
+| R2B10 | blind | report-backfill discard exclusion unrecorded | low | Real. Patched: explicit decision comment (a discarded newer report never supersedes older debt). |
+| R2B11 | blind | `docs/YIELD-REPORT.md` M0 doc not updated | low | Real. Patched: documents binned = terminal (leaves WIP) but not finished. |
+| R2B12 | blind | `roles/silas.md` transition enumeration omitted binned | low | Real. Patched. |
+| R2B13 | blind | `docs/BOARD.md` reflow artifact | low | Real. Patched. |
+| R2V1 | verification-gap | awareness receipt classification unpinned for binned | medium | Real. Patched: the D1 receipt test now runs both merged and binned recipes (receipt section, no wake seed). |
+| R2V2 | verification-gap | child-worker admission/spawn fences unpinned for binned | medium | Real. Patched: binned `parent_expired` admission + queued-child spawn fence arms added. |
+| R2V3 | verification-gap | branch-idle terminal short-circuit unpinned for binned | medium | Real. Patched: synthetic busy test + HTTP canonical-refusal loop include binned (filtered heavy case). |
+| R2V4 | verification-gap | sweep-ack release endpoint unpinned for binned rows | medium | Real. Patched: a binned lane now releases through `/api/dispatch/release` with the receipt (filtered heavy case). |
+| R2V5 | verification-gap | boot reconcile close for terminal phase handoffs untested | medium | Real. Patched: binned awaiting intent closed by `reconcilePhaseHandoffs`. |
+| R2V6 | verification-gap | ledger in-transaction re-brief boundaries unpinned for binned | medium | Real. Patched: begin + retire boundary tests parameterized with binned arms (audited `job_status: 'binned'`). |
+| R2V7 | verification-gap | pipeline exclusive-scope release unpinned for binned | medium | Real. Patched: a binned entry releases its scope and the same-scope entry clears. |
+
+No intent_gap/bad_spec loopback in either round. Round 3 (fresh whole-change review at the round-2 fix head) is the concluding pass before any READY claim.
+
 ## Design Notes
 
 - Binned rows classify into COLD (the existing sink for terminal/discarded lanes): the six-section hierarchy and previews stay untouched, and the Cold head count already carries the complete count. The binned rows render only inside an explicitly expanded Cold section AND behind a second explicit "binned records" disclosure; the control's label carries the count so the filter can never silently lose them.
@@ -119,9 +148,10 @@ All round-1 findings are verified real (none false/rejected); every one is patch
 
 ## Verification
 
-**Commands:** all via the authenticated `/api/verify` scheduler with the committed scopes below (plus the shipped capture helper for complete captures):
-- `binned-focused` -- `node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/ledger-api.test.ts test/ledger-obligations.test.ts test/board-engine-v4.test.ts test/board-server.test.ts test/suite-shape.test.ts && cd web && ../node_modules/.bin/vitest run src/lib/board-signals.test.ts src/lib/board-kpi.test.ts src/lib/board-bands.test.ts src/lib/board-sections.test.ts src/ui/board.test.ts`
+**Commands:** all via the authenticated `/api/verify` scheduler with the committed scopes in `.gru-command/worktree.toml` (plus the shipped capture helper for complete captures):
+- `binned-focused` -- the fast suites: ledger machine/obligations/API audit, board engine v4 + shared live/receipt fixture, pipeline milestones + exclusive scopes, amendments, directive intents, provider recovery, phase handoffs, chat awareness, GitHub merge polling, Silas release rows, yield telemetry, child workers, suite pins, plus the web board suites.
+- `binned-heavy` -- the filtered process-heavy cases the change touches under `vitest.heavy.config.ts`: perkins `runRound`/handoff-skip, dispatch directive/re-brief refusals, branch-idle terminal refusals, worktrees-server sweep-ack release.
 - `binned-static` -- `node tools/patch-vitest-rpc-timeout.mjs && npm run lint && npm run typecheck && npm run build && cd web && node ../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json`
-- `binned-baseline` -- isolated pre-change snapshot (base `84aec28b04ddc406f26c458383452318f8cb7ed1`) with the FINAL behavioral tests overlaid; expected RED on the new assertions.
+- `binned-baseline` -- isolated pre-change snapshot (base `84aec28b04ddc406f26c458383452318f8cb7ed1`) with the FINAL fast-suite test bytes (and the shared fixture) overlaid; expected RED on the new assertions. The heavy suites' fail-before is covered by `binned-heavy` at the fix head, not re-hosted on the base.
 
 **Manual checks:** board DOM fixture tests cover the badge/disclosure/count/accessibility behavior; the tracked review jobs verify the whole change at the immutable head.

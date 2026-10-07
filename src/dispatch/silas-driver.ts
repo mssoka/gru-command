@@ -15,7 +15,7 @@ import type {
   RoundRecord,
 } from '../ledger/api.js';
 import { LIVE_DIRECTIVE_STATES, type DirectiveState } from '../ledger/directives.js';
-import { isJobTerminal } from '../ledger/states.js';
+import { isJobTerminal, type TerminalJobStatus } from '../ledger/states.js';
 import type { LogLevel } from '../logger.js';
 import { DECISION_SURFACE_SAME_BLOCKER, fileOfLocation, sameBlockerDecisionRequest } from '../decisions/questions.js';
 import type { DecisionService } from '../decisions/types.js';
@@ -508,7 +508,7 @@ export interface ReleaseEligibleRow {
   readonly jobId: string;
   readonly repo: string;
   /** The terminal state the close-out rule releases on. */
-  readonly status: 'merged' | 'done' | 'binned';
+  readonly status: TerminalJobStatus;
   readonly branch: string | null;
 }
 

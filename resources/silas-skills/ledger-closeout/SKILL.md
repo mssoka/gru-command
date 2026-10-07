@@ -45,7 +45,7 @@ close-out: a ledger-visible end state a stranger can audit.
    per-phase call ceiling can hold a delivery open as noncompliant,
    quarantine a lane, or block acceptance — the gate is the work being
    verified and reviewed. A re-brief whose
-   job reached terminal (`merged`/`done`) before the request was honored
+   job reached terminal (`merged`/`done`/`binned`) before the request was honored
    is closed administratively instead — whether the stale markers surface
    at boot with no live turn at all, or a settling turn or re-dispatch
    boundary meets the terminal job: the pending markers are retired with

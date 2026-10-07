@@ -317,7 +317,7 @@ describe('guarded claim — every recheck fails visible', () => {
     const binnedWaitId = await discarded.recoveredMinionWait({ jobId: binnedJobId });
     discarded.ledger.setJobStatus(binnedJobId, 'binned');
     const binnedResult = await claimProviderRecoveryContinuation(discarded.deps(), binnedWaitId, 'silas');
-    expect(binnedResult).toMatchObject({ outcome: 'skipped' });
+    expect(binnedResult).toMatchObject({ outcome: 'skipped', why: 'job is binned — no continuation' });
     expect(discarded.ledger.getProviderWait(binnedWaitId)?.status).toBe('cancelled');
     expect(discarded.registry.spawnCalls).toHaveLength(0);
   });

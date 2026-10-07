@@ -587,11 +587,15 @@ describe('pending re-brief terminal retirement (ledger boundary)', () => {
   });
   afterAll(() => db.close());
 
-  function mergedJob(id: string): void {
+  function terminalJob(id: string, terminal: 'merged' | 'binned'): void {
     api.addJob({ id, repo: 'terminal-retirement', title: 'terminal retirement fixture' });
     api.setJobStatus(id, 'working');
-    api.setJobStatus(id, 'in-review');
-    api.setJobStatus(id, 'merged');
+    if (terminal === 'merged') {
+      api.setJobStatus(id, 'in-review');
+      api.setJobStatus(id, 'merged');
+    } else {
+      api.setJobStatus(id, 'binned');
+    }
   }
 
   function candidatesOf(markers: readonly PendingRebriefRecord[]): readonly {
@@ -609,10 +613,15 @@ describe('pending re-brief terminal retirement (ledger boundary)', () => {
   }
 
   it('beginPendingRebrief refuses a terminal job inside its own transaction (the HTTP guard is not the only boundary)', () => {
-    mergedJob('intake-terminal');
+    terminalJob('intake-terminal', 'merged');
     expect(() => api.beginPendingRebrief({ jobId: 'intake-terminal', note: 'n', briefing: 'b' }))
       .toThrow(/terminal lanes are never re-briefed/u);
     expect(api.listPendingRebriefs({ jobId: 'intake-terminal' })).toHaveLength(0);
+    // A binned (discarded) lane is terminal at the same boundary.
+    terminalJob('intake-terminal-binned', 'binned');
+    expect(() => api.beginPendingRebrief({ jobId: 'intake-terminal-binned', note: 'n', briefing: 'b' }))
+      .toThrow(/terminal lanes are never re-briefed/u);
+    expect(api.listPendingRebriefs({ jobId: 'intake-terminal-binned' })).toHaveLength(0);
   });
 
   it('retirePendingRebriefs commits audit + identity-checked deletion together; a replay is a no-op', () => {
@@ -635,6 +644,21 @@ describe('pending re-brief terminal retirement (ledger boundary)', () => {
     const replay = api.retirePendingRebriefs({ jobId, reason: 'job terminal', candidates });
     expect(replay.retired).toHaveLength(0);
     expect(api.listJobEvents(jobId).filter((event) => event.kind === 'silas.rebrief-retired')).toHaveLength(1);
+
+    // A binned (discarded) lane retires its markers through the same
+    // identity-checked path, auditing the terminal status truthfully.
+    const binnedId = 'retire-binned';
+    api.addJob({ id: binnedId, repo: 'terminal-retirement', title: 'binned retirement' });
+    api.setJobStatus(binnedId, 'working');
+    const binnedMarkers = api.beginPendingRebrief({ jobId: binnedId, note: 'n', briefing: 'b' });
+    const binnedCandidates = candidatesOf(binnedMarkers);
+    api.setJobStatus(binnedId, 'binned');
+    const binnedRetire = api.retirePendingRebriefs({ jobId: binnedId, reason: 'job terminal', candidates: binnedCandidates });
+    expect(binnedRetire.refused).toBeNull();
+    expect(binnedRetire.retired).toHaveLength(binnedMarkers.length);
+    expect(api.listPendingRebriefs({ jobId: binnedId })).toHaveLength(0);
+    expect((api.latestJobEvent(binnedId, 'silas.rebrief-retired')?.payload as { job_status?: string }).job_status)
+      .toBe('binned');
   });
 
   it('refuses direct retirement of a fully landed terminal request without an audit', () => {

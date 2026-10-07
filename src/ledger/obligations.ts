@@ -23,6 +23,8 @@
  *   never establishes an accepted product gate or heist completion.
  */
 
+import { isTerminalJobStatus, type TerminalJobStatus } from './states.js';
+
 // ------------------------------------------------------------------
 // Identity vocabulary
 // ------------------------------------------------------------------
@@ -135,7 +137,7 @@ export type ObligationSettlement =
     }
   | { readonly kind: 'superseded'; readonly byObligationId: string | null; readonly reason: string }
   | { readonly kind: 'cancelled'; readonly reason: string }
-  | { readonly kind: 'job-terminal'; readonly jobStatus: 'done' | 'merged' | 'binned' };
+  | { readonly kind: 'job-terminal'; readonly jobStatus: TerminalJobStatus };
 
 /** The delegated phase's identity an armed receipt expectation may pin
  * itself to. Present ⇒ a receipt event whose payload lacks the matching
@@ -573,8 +575,8 @@ export function parseSettlement(raw: string): ObligationSettlement {
       return { kind, reason: reqStr(record, 'reason', 'cancelled settlement') };
     case 'job-terminal': {
       const jobStatus = reqStr(record, 'jobStatus', 'job-terminal settlement');
-      if (jobStatus !== 'done' && jobStatus !== 'merged' && jobStatus !== 'binned') {
-        throw new Error(`job-terminal settlement jobStatus "${jobStatus}" must be done, merged or binned`);
+      if (!isTerminalJobStatus(jobStatus)) {
+        throw new Error(`job-terminal settlement jobStatus "${jobStatus}" is not a terminal job status`);
       }
       return { kind, jobStatus };
     }

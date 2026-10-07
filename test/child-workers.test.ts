@@ -482,6 +482,11 @@ describe('tracked child workers: admission (issue #161)', () => {
     // A terminal lane is an expired parent (checked before the fanout cap).
     h.ledger.setJobStatus('job-1', 'done');
     expect(refusalOf(() => h.request({ idempotencyKey: 'k-expired' })).code).toBe('parent_expired');
+    // A binned (discarded) lane is an expired parent too.
+    const discarded = makeHarness();
+    discarded.ledger.setJobStatus('job-1', 'binned');
+    expect(refusalOf(() => discarded.request({ idempotencyKey: 'k-expired-binned' })).code).toBe('parent_expired');
+    discarded.close();
     h.close();
   });
 
@@ -580,6 +585,19 @@ describe('tracked child workers: admission (issue #161)', () => {
       () => h.worktrees.getWorktree(admission.record.id)?.status === 'swept',
       'the fenced writer lane to be swept',
     );
+
+    // A binned (discarded) lane fences the queued child the same way.
+    const discarded = makeHarness();
+    const releaseDiscarded = discarded.setSpawnGate();
+    const discardedAdmission = discarded.request({ authority: 'writer', idempotencyKey: 'key-binned' });
+    await waitForChild(discarded, discardedAdmission.record.id, (state) => state === 'admitted');
+    discarded.ledger.setJobStatus('job-1', 'binned');
+    releaseDiscarded();
+    await waitForChild(discarded, discardedAdmission.record.id, (state) => state === 'error');
+    const discardedRecord = discarded.ledger.getChildWorker(discardedAdmission.record.id)!;
+    expect(discardedRecord.resultSummary).toContain('binned');
+    expect(discardedRecord.resultSummary).toContain('expired');
+    discarded.close();
     h.close();
   });
 

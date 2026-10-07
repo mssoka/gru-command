@@ -286,7 +286,7 @@ describe('unackedByJob', () => {
       fileURLToPath(new URL('../../../src/ledger/states.ts', import.meta.url)),
       'utf-8',
     );
-    const declaration = /JOB_TERMINAL\s*(?::[^=]*)?=\s*new Set[^(]*\(\s*\[([^\]]*)\]\s*\)/.exec(statesSource);
+    const declaration = /TERMINAL_JOB_STATUS_LIST\s*(?::[^=]*)?=\s*\[([^\]]*)\]\s*as const/.exec(statesSource);
     expect(declaration, 'the ledger terminal declaration moved or changed shape').not.toBeNull();
     const terminal = [...declaration![1]!.matchAll(/'([^']+)'/g)].map((match) => match[1]!);
     expect(terminal.length).toBeGreaterThan(0);

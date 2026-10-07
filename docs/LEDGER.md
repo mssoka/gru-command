@@ -211,13 +211,14 @@ the request `payload` (note + briefing) and its sha256 `payload_hash`,
 the `baseline_seq` event watermark the request must post-date, the bound
 worker (`agent_id`, `session_file`), and `requested_at`. The marker pair
 is written BEFORE any worker spawns and cleared when its events land — or
-retired administratively when the job is already `merged`/`done` (below);
+retired administratively when the job is already `merged`/`done`/`binned`
+(below);
 `UNIQUE (job_id, kind)` means a newer request supersedes an older
 marker. Boot reconciliation (`src/dispatch/rebrief-recovery.ts`)
 consumes leftovers: resume the interrupted session (or re-dispatch fresh
 on the same lane), record the missing events, or escalate
 action-required when recovery fails. A leftover whose job has since
-reached `merged`/`done` is instead retired administratively: the
+reached `merged`/`done`/`binned` is instead retired administratively: the
 identity-checked marker deletion and a single `silas.rebrief-retired`
 audit commit in one transaction, with no spawn and no escalation.
 Retirement fires wherever the terminal state is met — the boot scan, a

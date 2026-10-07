@@ -20,7 +20,16 @@ export const JOB_STATUSES = [
 ] as const;
 export type JobStatus = (typeof JOB_STATUSES)[number];
 
-const JOB_TERMINAL: ReadonlySet<JobStatus> = new Set(['merged', 'done', 'binned']);
+/**
+ * The terminal job statuses, declared ONCE: the union type, the Set and
+ * the `isJobTerminal` predicate all derive from this list, so a future
+ * terminal status cannot land in the Set while the predicate's union
+ * narrows to something else (the web cross-build alarm reads this
+ * declaration too).
+ */
+const TERMINAL_JOB_STATUS_LIST = ['merged', 'done', 'binned'] as const;
+export type TerminalJobStatus = (typeof TERMINAL_JOB_STATUS_LIST)[number];
+const JOB_TERMINAL: ReadonlySet<JobStatus> = new Set(TERMINAL_JOB_STATUS_LIST);
 
 /**
  * dispatched → working → delivered → in-review → merged|done;
@@ -113,10 +122,14 @@ function assertTransition<T extends string>(
   }
 }
 
-export type TerminalJobStatus = 'merged' | 'done' | 'binned';
-
 export function isJobTerminal(status: JobStatus): status is TerminalJobStatus {
   return JOB_TERMINAL.has(status);
+}
+
+/** Raw-string form of the predicate (parsers validating persisted values
+ * use the SAME declaration instead of re-typing the terminal names). */
+export function isTerminalJobStatus(value: string): value is TerminalJobStatus {
+  return (TERMINAL_JOB_STATUS_LIST as readonly string[]).includes(value);
 }
 
 /** The terminal statuses as a list — the one source every SQL IN-list (and

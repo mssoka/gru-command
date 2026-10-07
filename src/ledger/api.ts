@@ -17,6 +17,7 @@ import {
   isRoundVerdict,
   TERMINAL_JOB_STATUSES,
   type JobStatus,
+  type TerminalJobStatus,
   type LensState,
   type ObligationState,
   type RoundStatus,
@@ -5413,7 +5414,7 @@ export class LedgerApi {
 
   /** Close the job's applicable obligations (open/waiting/suspended) on a
    * terminal transition — settled rows and history stay untouched. */
-  private closeApplicableObligations(jobId: string, terminal: 'done' | 'merged' | 'binned'): void {
+  private closeApplicableObligations(jobId: string, terminal: TerminalJobStatus): void {
     for (const row of this.listApplicableObligations(jobId, ['open', 'waiting', 'suspended'])) {
       this.settleObligation({
         obligationId: row.id,

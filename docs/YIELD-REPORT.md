@@ -58,10 +58,13 @@ mode (never written, never migrated) and session JSONL is only streamed.
   decision, GH-218, held the subject) over all wake demands in the
   window. A `failed` deferral is not avoidance: the demand stayed
   unserved and escalated.
-- **M0 (north star).** Heists finished in the window (`job.status` moving to
+- **M0 (north star).** Heists FINISHED in the window (`job.status` moving to
   `merged|done`), created→terminal lead times, non-terminal WIP at the
   window end (replayed from events, by status with age), and cost per
-  finished heist.
+  finished heist. A DISCARDED lane (`binned`) leaves neither side: it is
+  terminal, so it is no longer WIP, but a discard is not a finished
+  success, so it never joins the finished count, the lead-time sample or
+  the cost-per-finished denominator.
 
 ## Reproducing the GH-213 baseline
 

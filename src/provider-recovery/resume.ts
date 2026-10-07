@@ -135,8 +135,11 @@ async function claimJobMinion(
   // provider blocker's settlement and must not strand the recovery.
   const job = wait.jobId !== null ? deps.ledger.getJob(wait.jobId) : null;
   if (job === null || isJobTerminal(job.status)) {
-    deps.ledger.setProviderWaitStatus(wait.id, 'cancelled', { why: 'job completed or missing', by });
-    return { outcome: 'skipped', waitId: wait.id, why: 'job completed or missing' };
+    // Truthful reason per terminal state: a discarded (`binned`) lane is
+    // cancelled, never reported as completed.
+    const why = job === null ? 'job missing' : `job is ${job.status} — no continuation`;
+    deps.ledger.setProviderWaitStatus(wait.id, 'cancelled', { why, by });
+    return { outcome: 'skipped', waitId: wait.id, why };
   }
   if (job.status === 'parked') {
     deps.ledger.setProviderWaitStatus(wait.id, 'cancelled', { why: 'job parked (owner/ops hold)', by });
