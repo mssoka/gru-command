@@ -27,7 +27,7 @@ handoff-wave = "npx vitest run --config vitest.heavy.config.ts test/perkins-buil
 # exact-target CI receipts, audited canonical amendments. Invoked only via
 # the authenticated /api/verify scheduler at unchanged budgets/thresholds —
 # a plain vitest invocation with the approved RPC patch prerequisite.
-review-inputs = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/review-evidence-intake.test.ts test/review-ci-evidence.test.ts test/job-amendments.test.ts test/review-inputs-handoff.test.ts test/review-inputs-wave.test.ts test/dispatch-review-inputs.test.ts test/verification-evidence.test.ts test/github-poll.test.ts test/ledger-api.test.ts test/ledger-db.test.ts"
+review-inputs = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/review-inputs-wave.test.ts && npx vitest run test/review-evidence-intake.test.ts test/review-ci-evidence.test.ts test/job-amendments.test.ts test/review-inputs-handoff.test.ts test/dispatch-review-inputs.test.ts test/verification-evidence.test.ts test/github-poll.test.ts test/ledger-api.test.ts test/ledger-db.test.ts"
 
 # Review-input handoff lane regression + full-run failure isolation: the
 # seam-adjacent suites, plus the exact files whose timing-sensitive tests
