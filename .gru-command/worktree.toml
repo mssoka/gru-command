@@ -568,7 +568,7 @@ working-flavor-catalog-baseline = 'set -e; base=9bb51b05af5d8f0a0cd389788d1d3f19
 # the authenticated /api/verify scheduler at unchanged budgets/thresholds,
 # approved RPC patch first, exits never masked. The static scope carries the
 # lint/typecheck product checks for the same change.
-parked-closeout = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/ledger-api.test.ts test/ledger-obligations.test.ts test/board-server.test.ts test/board-engine-v4.test.ts test/suite-shape.test.ts && cd web && ../node_modules/.bin/vitest run src/lib/board-kpi.test.ts"
+parked-closeout = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/ledger-api.test.ts test/ledger-obligations.test.ts test/board-server.test.ts test/board-engine-v4.test.ts test/suite-shape.test.ts test/verification-capture.test.ts test/test-budgets.test.ts && cd web && ../node_modules/.bin/vitest run src/lib/board-kpi.test.ts"
 parked-closeout-static = "node tools/patch-vitest-rpc-timeout.mjs && npm run lint && npm run typecheck && cd web && node ../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json"
 
 # Owner-correction verification repair (2026-10-06): the long-running
