@@ -1,7 +1,9 @@
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   CAPTURE_OWNER_VERSION,
   CAPTURE_RECEIPT_VERSION,
@@ -21,6 +23,8 @@ import {
 } from '../src/verify/capture.js';
 import {
   CAPTURE_EXIT,
+  describeTransportError,
+  nodeStreamFetch,
   parsePsOutput,
   runCaptureCli,
   type CaptureCliDeps,
@@ -386,6 +390,259 @@ describe('capture CLI run: exclusive sink + honest outcome', () => {
     // The raw sink is a complete capture, streamed to EOF.
     expect(readFileSync(sinkPath, 'utf-8')).toBe(completedNdjson());
     expect(out.join('')).toContain('run-capture-1');
+  });
+
+  it('streams the production transport through a quiet stall with no client idle timeout (raw HTTP, never fetch)', async () => {
+    const dir = tempDir();
+    const sinkPath = join(dir, 'stalled.ndjson');
+    const frame = completedNdjson();
+    const cut = frame.indexOf('{"type":"output"');
+    const server = createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+      res.write(frame.slice(0, cut));
+      // A quiet stretch longer than any test would assert on: the raw
+      // transport has no response idle timeout, so the stream survives
+      // until the scheduler actually produces the terminal frame.
+      setTimeout(() => res.end(frame.slice(cut)), 150);
+    });
+    await new Promise<void>((resolveListen) => server.listen(0, '127.0.0.1', resolveListen));
+    try {
+      const port = (server.address() as AddressInfo).port;
+      // Discriminator: if the run path fell back to global fetch, this
+      // stub throws and the capture would not come back OK.
+      vi.stubGlobal('fetch', () => {
+        throw new Error('global fetch must not carry the verify stream');
+      });
+      const code = await runCaptureCli(
+        [...BASE_ARGS, '--sink', sinkPath, '--request-id', 'req-cli-stall', '--url', `http://127.0.0.1:${String(port)}`, '--token', 't'],
+        deps({ stdout: () => {} }),
+      );
+      expect(code).toBe(CAPTURE_EXIT.ok);
+      const receipt = JSON.parse(readFileSync(captureReceiptPath(sinkPath), 'utf-8')) as CaptureReceipt;
+      expect(receipt.outcome).toBe('completed');
+      expect(receipt.reconciled).toBe(false);
+      expect(receipt.error).toBeNull();
+      expect(captureReceiptSucceeded(receipt)).toBe(true);
+      expect(readFileSync(sinkPath, 'utf-8')).toBe(frame);
+    } finally {
+      vi.unstubAllGlobals();
+      server.closeAllConnections();
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+    }
+  });
+
+  it('the raw transport reads a chunked body through a stall and keeps a bounded consumer queue', async () => {
+    const server = createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+      res.write('first\n');
+      setTimeout(() => res.end('second\n'), 200);
+    });
+    await new Promise<void>((resolveListen) => server.listen(0, '127.0.0.1', resolveListen));
+    try {
+      const port = (server.address() as AddressInfo).port;
+      const response = await nodeStreamFetch(`http://127.0.0.1:${String(port)}/stream`);
+      expect(response.ok).toBe(true);
+      const reader = response.body!.getReader();
+      const decoder = new TextDecoder();
+      let text = '';
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        text += decoder.decode(value, { stream: true });
+      }
+      expect(text).toBe('first\nsecond\n');
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+    }
+  });
+
+  it('records UNKNOWN and never promotes when the real transport socket is severed mid-stream', async () => {
+    const dir = tempDir();
+    const sinkPath = join(dir, 'severed.ndjson');
+    const server = createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+      // A completed-looking frame, then a hard reset without a clean end:
+      // the reader must not treat the parsed outcome as a finished stream.
+      res.write(completedNdjson());
+      setTimeout(() => res.destroy(), 50);
+    });
+    await new Promise<void>((resolveListen) => server.listen(0, '127.0.0.1', resolveListen));
+    try {
+      const port = (server.address() as AddressInfo).port;
+      const code = await runCaptureCli(
+        [...BASE_ARGS, '--sink', sinkPath, '--request-id', 'req-cli-severed', '--url', `http://127.0.0.1:${String(port)}`, '--token', 't'],
+        deps({ stdout: () => {} }),
+      );
+      expect(code).toBe(CAPTURE_EXIT.unknown);
+      const receipt = JSON.parse(readFileSync(captureReceiptPath(sinkPath), 'utf-8')) as CaptureReceipt;
+      expect(receipt.outcome).toBe('unknown');
+      expect(captureReceiptSucceeded(receipt)).toBe(false);
+      // The receipt keeps the socket errno, not just "aborted".
+      expect(receipt.error).toContain('ECONNRESET');
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+    }
+  });
+
+  it('the raw transport is one-shot: every mixed or repeated consumer fails loud instead of hanging', async () => {
+    const server = createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end('payload\n');
+    });
+    await new Promise<void>((resolveListen) => server.listen(0, '127.0.0.1', resolveListen));
+    try {
+      const port = (server.address() as AddressInfo).port;
+      const url = `http://127.0.0.1:${String(port)}/one-shot`;
+      // text() then text()/json(): the second read rejects (a second
+      // `end` listener on the finished response would never settle).
+      const first = await nodeStreamFetch(url);
+      expect(await first.text()).toBe('payload\n');
+      await expect(first.text()).rejects.toThrow(/one-shot/u);
+      await expect(first.json()).rejects.toThrow(/one-shot/u);
+      // text() then body: the byte stream errors on read, never hangs.
+      await expect(first.body!.getReader().read()).rejects.toThrow(/already consumed/u);
+      // body then text(): the byte stream owns the response.
+      const second = await nodeStreamFetch(url);
+      const reader = second.body!.getReader();
+      await reader.read();
+      await expect(second.text()).rejects.toThrow(/byte stream/u);
+      // Touching the body surface claims the response even without a read.
+      const third = await nodeStreamFetch(url);
+      expect(third.body).not.toBeNull();
+      await expect(third.text()).rejects.toThrow(/byte stream/u);
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+    }
+  });
+
+  it('pauses the socket once the consumer is behind and resumes on read (bounded queue)', async () => {
+    const chunkBytes = 64 * 1024;
+    const totalBytes = 128 * chunkBytes; // 8 MiB
+    let written = 0;
+    let releasePump: () => void = () => {};
+    const pumpGate = new Promise<void>((resolve) => {
+      releasePump = resolve;
+    });
+    const server = createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/octet-stream' });
+      const chunk = Buffer.alloc(chunkBytes, 7);
+      res.write(chunk); // the first chunk resolves the consumer's first read
+      written += chunkBytes;
+      // The bulk starts only AFTER the consumer's first read: backpressure
+      // observed from here on is the consumer stalling, never the pre-read
+      // attach window (a server that pumps before the consumer attaches
+      // would record backpressure for either transport shape).
+      void pumpGate.then(() => {
+        const pump = (): void => {
+          while (written < totalBytes) {
+            const accepted = res.write(chunk);
+            written += chunkBytes;
+            if (!accepted) {
+              res.once('drain', pump);
+              return;
+            }
+          }
+          res.end();
+        };
+        pump();
+      });
+    });
+    await new Promise<void>((resolveListen) => server.listen(0, '127.0.0.1', resolveListen));
+    try {
+      const port = (server.address() as AddressInfo).port;
+      const response = await nodeStreamFetch(`http://127.0.0.1:${String(port)}/bulk`);
+      const reader = response.body!.getReader();
+      const first = await reader.read();
+      releasePump();
+      // While the consumer stays stalled, the bounded queue stops reading
+      // the socket, so the server can NEVER finish the transfer; an
+      // unbounded queue would drain the whole payload and finish.
+      const deadline = Date.now() + 10_000;
+      let lastWritten = -1;
+      let stableChecks = 0;
+      while (written < totalBytes && stableChecks < 4 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        stableChecks = written === lastWritten ? stableChecks + 1 : 0;
+        lastWritten = written;
+      }
+      expect(written, 'the server finished a transfer the stalled consumer never drained').toBeLessThan(totalBytes);
+      let received = first.value?.byteLength ?? 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        received += value?.byteLength ?? 0;
+      }
+      expect(received).toBe(totalBytes);
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+    }
+  });
+
+
+  it('capture status reconciles through the raw transport by default (global fetch never used)', async () => {
+    const server = createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ state: 'running', requestId: 'req-status-raw' }));
+    });
+    await new Promise<void>((resolveListen) => server.listen(0, '127.0.0.1', resolveListen));
+    try {
+      const port = (server.address() as AddressInfo).port;
+      const answers: string[] = [];
+      vi.stubGlobal('fetch', () => {
+        throw new Error('global fetch must not carry the status request');
+      });
+      const code = await runCaptureCli(
+        ['status', '--request-id', 'req-status-raw', '--url', `http://127.0.0.1:${String(port)}`, '--token', 't'],
+        { stdout: (text: string) => answers.push(text), stderr: () => {} },
+      );
+      expect(code).toBe(CAPTURE_EXIT.ok);
+      expect(answers.join('')).toContain('running');
+    } finally {
+      vi.unstubAllGlobals();
+      server.closeAllConnections();
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+    }
+  });
+
+  it('rejects an unsupported request body loudly and honors an abort signal', async () => {
+    const server = createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.write('chunk');
+      // Held open: the abort must reject the reader instead of hanging.
+    });
+    await new Promise<void>((resolveListen) => server.listen(0, '127.0.0.1', resolveListen));
+    try {
+      const port = (server.address() as AddressInfo).port;
+      const url = `http://127.0.0.1:${String(port)}/signal`;
+      await expect(
+        nodeStreamFetch(url, { method: 'POST', body: new URLSearchParams('a=b') }),
+      ).rejects.toThrow(/string or Buffer/u);
+      const controller = new AbortController();
+      const response = await nodeStreamFetch(url, { signal: controller.signal });
+      const reader = response.body!.getReader();
+      await reader.read();
+      controller.abort();
+      await expect(reader.read()).rejects.toThrow(/aborted|ECONNRESET|destroyed|reset/i);
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+    }
+  });
+
+  it('transport errors render their own errno and any cause for the receipt', () => {
+    const own = Object.assign(new Error('aborted'), { code: 'ECONNRESET' });
+    expect(describeTransportError(own)).toContain('ECONNRESET');
+    expect(describeTransportError(new Error('plain'))).toBe('plain');
+    const wrapper = new Error('request failed', {
+      cause: Object.assign(new Error('reset by peer'), { code: 'EPIPE' }),
+    });
+    expect(describeTransportError(wrapper)).toContain('cause');
+    expect(describeTransportError(wrapper)).toContain('EPIPE');
+    expect(describeTransportError('boom')).toBe('boom');
   });
 
   it('records an UNKNOWN outcome on a lost connection and never promotes partial data', async () => {

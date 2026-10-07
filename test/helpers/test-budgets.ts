@@ -85,10 +85,18 @@ export const HEAVY_TESTS: readonly HeavyTestEntry[] = Object.freeze([
     workload: 'fetch/freeze resolution over real git remotes',
   },
   {
+    file: 'perkins-review-convergence.test.ts',
+    workload: 'whole review rounds over real git fixtures; observed 32.8s (over the 30s fast ceiling) under full-run co-tenant load vs 12.0-19.6s in the other preserved full runs',
+  },
+  {
     file: 'perkins-whole-review.test.ts',
     workload: 'whole-review engine over real worktrees and git',
   },
   { file: 'rehearsal.test.ts', workload: 'package/build/install rehearsal with real npm' },
+  {
+    file: 'review-inputs-wave.test.ts',
+    workload: 'real git fixture repos and review worktrees across three wave freezes',
+  },
   { file: 'service-port-guard.test.ts', workload: 'real service spawns and port behavior' },
   { file: 'shutdown.test.ts', workload: 'real service signal lifecycle' },
   {

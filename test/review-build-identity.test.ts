@@ -1,12 +1,12 @@
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { request } from 'node:http';
 import { dirname, join, sep } from 'node:path';
 import { transpileModule, ModuleKind, ScriptTarget } from 'typescript';
 import { pathToFileURL } from 'node:url';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { defaultPackageRoot } from '../src/build-info.js';
 import { reviewRuntimeVersion, reviewServiceRuntimeIdentity } from '../src/runtime/review-build-identity.js';
 import { reviewPythonExecutable } from '../src/runtime/review-directory-entries.js';
@@ -26,10 +26,97 @@ const fixture = (prefix: string): string => {
 };
 afterEach(() => { vi.unstubAllEnvs(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
-function packageIdentity(): { root: string; identity: string } {
-  const root = fixture('gru-review-pack-');
+/** Copy a directory TREE into `destination` (contents, unambiguously —
+ * never `cp`'s copy-into-existing-dir nesting). On darwin APFS clonefile
+ * makes this ~13s instead of cpSync's 80-100s per ~150MB identity tree;
+ * the portable path copies entry by entry. The clone step is injectable
+ * so the failure/cleanup path is itself testable. */
+function copyTree(
+  source: string,
+  destination: string,
+  clone: (source: string, destination: string) => void = (from, to) => {
+    // `source/.` copies the directory CONTENTS into the existing dest
+    // (a literal suffix: path.join would normalize the `/.` away and
+    // turn this into copy-INTO, nesting the tree).
+    execFileSync('cp', ['-cR', `${from}/.`, to], { stdio: 'ignore' });
+  },
+): void {
+  mkdirSync(destination, { recursive: true });
+  if (process.platform === 'darwin') {
+    try {
+      clone(source, destination);
+      return;
+    } catch {
+      // Clone unsupported (different volume/filesystem) — portable copy.
+      // A partially-written clone must not be re-copied into (that is
+      // exactly the copy-into/nesting ambiguity this helper avoids).
+      rmSync(destination, { recursive: true, force: true });
+      mkdirSync(destination, { recursive: true });
+    }
+  }
+  for (const entry of readdirSync(source)) {
+    cpSync(join(source, entry), join(destination, entry), { recursive: true });
+  }
+}
+
+/** macOS marks every npm-installed file with a provenance xattr whose
+ * per-file verification makes tree walks an order of magnitude slower on
+ * this host; the identity walk only hashes file bytes and metadata, so
+ * clearing them on the private copy changes nothing it verifies. A
+ * missing xattr tool is tolerable; any other failure is loud. */
+function clearProvenanceXattrs(destination: string): void {
+  if (process.platform !== 'darwin') return;
+  try {
+    execFileSync('xattr', ['-cr', destination], { stdio: 'ignore' });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return; // tool absent
+    throw error;
+  }
+}
+
+/** The build+packed tarball is the same bytes for every identity fixture
+ * in this file, so it is built and packed ONCE and reused: the four
+ * `packageIdentity()` calls used to rebuild and repack the whole source,
+ * which dominated this file's runtime under load. Lives outside `roots`
+ * (cleared after each test) and is removed after the file. */
+let packageTarballCache: { tarballPath: string } | null = null;
+let packageBuildRoot: string | null = null;
+afterAll(() => {
+  if (packageBuildRoot !== null) rmSync(packageBuildRoot, { recursive: true, force: true });
+});
+
+describe('identity fixture reliability (darwin paths)', () => {
+  it.skipIf(process.platform !== 'darwin')('clears a partially written clone destination before the portable fallback', () => {
+    const source = mkdtempSync(join(tmpdir(), 'gru-copytree-src-'));
+    const destination = mkdtempSync(join(tmpdir(), 'gru-copytree-dst-'));
+    try {
+      writeFileSync(join(source, 'keep.txt'), 'source\n');
+      writeFileSync(join(destination, 'stale.txt'), 'stale\n');
+      copyTree(source, destination, (_from, to) => {
+        // Simulate a clone that dies after writing partial output.
+        writeFileSync(join(to, 'partial.tmp'), 'partial\n');
+        throw new Error('clone unsupported on this volume');
+      });
+      expect(existsSync(join(destination, 'stale.txt'))).toBe(false);
+      expect(existsSync(join(destination, 'partial.tmp'))).toBe(false);
+      expect(readFileSync(join(destination, 'keep.txt'), 'utf-8')).toBe('source\n');
+    } finally {
+      rmSync(source, { recursive: true, force: true });
+      rmSync(destination, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(process.platform !== 'darwin')('clearProvenanceXattrs rethrows real failures (only a missing tool is tolerated)', () => {
+    expect(() => clearProvenanceXattrs(join(tmpdir(), 'gru-no-such-tree-for-xattr'))).toThrow();
+  });
+});
+
+function packageTarball(): { tarballPath: string } {
+  if (packageTarballCache !== null) return packageTarballCache;
   // Standalone test: compile in an isolated tree rather than assuming npm
   // test already populated dist or racing another suite's shared build.
+  const root = mkdtempSync(join(tmpdir(), 'gru-review-pack-build-'));
+  packageBuildRoot = root;
   const source = defaultPackageRoot();
   const build = join(root, 'build');
   for (const path of ['src', 'tools', 'resources', 'roles', 'package.json', 'package-lock.json', 'tsconfig.json']) {
@@ -42,12 +129,21 @@ function packageIdentity(): { root: string; identity: string } {
   })) as [{ filename: string; files: Array<{ path: string }> }];
   expect(manifest[0]!.files.some((entry) => entry.path === 'package-lock.json')).toBe(false);
   expect(manifest[0]!.files.some((entry) => entry.path === 'dist/review-dependency-identity.json')).toBe(true);
-  execFileSync('tar', ['-xzf', join(root, manifest[0]!.filename), '-C', root]);
-  const installed = join(root, 'package');
-  // Copy precisely the installed dependency closure from this npm-ci tree.
-  // This is offline and also avoids npm adding a lock to the unpacked tarball.
+  packageTarballCache = {
+    tarballPath: join(root, manifest[0]!.filename),
+  };
+  return packageTarballCache;
+}
+
+/** The installed dependency closure paths (source-relative) resolved from
+ * this npm-ci tree. Deterministic for the whole run; the metadata walk is
+ * cached, while each caller still copies its own tree. */
+let packageClosureCache: readonly string[] | null = null;
+function packageClosure(source: string): readonly string[] {
+  if (packageClosureCache !== null) return packageClosureCache;
   const visited = new Set<string>();
-  const copyDependency = (name: string, parent: string): void => {
+  const ordered: string[] = [];
+  const walk = (name: string, parent: string): void => {
     let base = parent;
     let directory: string | null = null;
     while (base === source || base.startsWith(`${source}${sep}`)) {
@@ -57,19 +153,34 @@ function packageIdentity(): { root: string; identity: string } {
     }
     if (directory === null || visited.has(directory)) return;
     visited.add(directory);
-    const destination = join(installed, directory.slice(source.length + 1));
-    mkdirSync(dirname(destination), { recursive: true });
-    cpSync(directory, destination, { recursive: true });
+    ordered.push(directory);
     const metadata = JSON.parse(readFileSync(join(directory, 'package.json'), 'utf8')) as {
       dependencies?: Record<string, string>; optionalDependencies?: Record<string, string>;
       peerDependencies?: Record<string, string>;
     };
     for (const dependency of Object.keys({ ...metadata.dependencies, ...metadata.optionalDependencies, ...metadata.peerDependencies })) {
-      copyDependency(dependency, directory);
+      walk(dependency, directory);
     }
   };
   const project = JSON.parse(readFileSync(join(source, 'package.json'), 'utf8')) as { dependencies: Record<string, string> };
-  for (const name of Object.keys(project.dependencies)) copyDependency(name, source);
+  for (const name of Object.keys(project.dependencies)) walk(name, source);
+  packageClosureCache = ordered;
+  return ordered;
+}
+
+function packageIdentity(): { root: string; identity: string } {
+  const tarball = packageTarball();
+  const root = fixture('gru-review-pack-');
+  execFileSync('tar', ['-xzf', tarball.tarballPath, '-C', root]);
+  const installed = join(root, 'package');
+  // Copy precisely the installed dependency closure from this npm-ci tree.
+  // This is offline and also avoids npm adding a lock to the unpacked tarball.
+  const source = defaultPackageRoot();
+  for (const directory of packageClosure(source)) {
+    const destination = join(installed, directory.slice(source.length + 1));
+    copyTree(directory, destination);
+  }
+  clearProvenanceXattrs(installed);
   expect(existsSync(join(installed, 'node_modules', '@earendil-works', 'pi-ai'))).toBe(true);
   return { root: installed, identity: reviewRuntimeVersion(installed) };
 }

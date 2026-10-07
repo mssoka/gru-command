@@ -87,6 +87,10 @@ import {
   type DirectiveState,
 } from './directives.js';
 import {
+  isOwnerCancellationListed,
+  OWNER_CANCELLATION_RULING,
+} from './owner-cancellation.js';
+import {
   evaluatePipelineEntry,
   isPipelineState,
   isSafePipelineRecordId,
@@ -463,7 +467,7 @@ export interface AdminCloseoutProviderEvidence {
   readonly headSha: string;
   /** The provider's close timestamp when the caller has one (recorded
    * verbatim; never compared — the observation event is the binding). */
-  readonly closedAt?: string | null;
+  readonly closedAt?: string;
 }
 
 export interface AdminCloseoutInput {
@@ -480,6 +484,77 @@ export interface AdminCloseoutInput {
 export interface AdminCloseoutResult {
   readonly job: JobRecord;
   /** The `job.admin-closeout` audit event (the ORIGINAL on a replay). */
+  readonly event: EventRecord;
+  readonly idempotent: boolean;
+}
+
+// ------------------------------------------------------------------
+// Authoritative runtime facts (issue #171) for closeout live-work
+// guards. The ledger cannot infer execution from its own rows: a real
+// observed row was ledger `idle` while effective status was `streaming`
+// with an open turn. The service supplies the live registry handle set
+// and the supervisor's per-agent view at the commit boundary.
+// ------------------------------------------------------------------
+
+/** The supervisor's view for one agent, reduced to liveness facts. The
+ * state union mirrors the supervisor's real set (watching/restarting/
+ * stopped) so a new state cannot silently pass through the guard. */
+export interface CloseoutSupervisionView {
+  readonly state: 'watching' | 'restarting' | 'stopped';
+  readonly breakerOpen: boolean;
+  readonly openTurn: boolean;
+  /** Optional because stopped/remembered views may omit it; an UNKNOWN
+   * value on a view that is not explicitly stopped fails closed (blocks). */
+  readonly openControl?: boolean;
+  readonly openToolCalls: number;
+}
+
+/** Authoritative liveness facts at the commit boundary. `liveHandleIds`
+ * is null when the caller cannot answer ownership; durable supervision
+ * stops are deliberately NOT ownership (a stopped lane stays current in
+ * the board's union, but it is not live execution). */
+export interface CloseoutRuntimeProbe {
+  readonly liveHandleIds: ReadonlySet<string> | null;
+  readonly supervisionFor: (agentId: string) => CloseoutSupervisionView | null;
+}
+
+/** Why an owner-listed administrative cancellation was refused. Each
+ * refusal is a loud no-effect failure. */
+export type AdminCancellationRefusalCode =
+  | 'not-listed'
+  | 'not-parked'
+  | 'not-cancellable-shape'
+  | 'live-work'
+  | 'already-closed';
+
+/** A guarded owner-cancellation refused by a durable-state fact. */
+export class AdminCancellationRefusal extends Error {
+  constructor(
+    readonly code: AdminCancellationRefusalCode,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'AdminCancellationRefusal';
+  }
+}
+
+/** The owner-cancellation form (owner amendment j-1117): administrative
+ * abandonment of an EXACT allowlisted parked legacy lane that carries no
+ * registered PR and no report metadata. */
+export interface AdminCancellationInput {
+  readonly jobId: string;
+  /** Optimistic concurrency: the only admitted source state. */
+  readonly expectedStatus: 'parked';
+  /** The explicit owner authority this request stands on (recorded
+   * verbatim; the allowlist membership is the executable guard). */
+  readonly authorityReference: string;
+  /** Why the cancellation is requested (recorded verbatim; bounded). */
+  readonly reason: string;
+}
+
+export interface AdminCancellationResult {
+  readonly job: JobRecord;
+  /** The `job.owner-cancellation` audit event (the ORIGINAL on a replay). */
   readonly event: EventRecord;
   readonly idempotent: boolean;
 }
@@ -1569,7 +1644,7 @@ export class LedgerApi {
    * silently folded into the recorded one. Directive/re-brief rows,
    * worktrees, rounds, agents and children are never rewritten — historical
    * uncertain-control rows stay truthful history. */
-  adminCloseParkedJob(input: AdminCloseoutInput): AdminCloseoutResult {
+  adminCloseParkedJob(input: AdminCloseoutInput, runtime: CloseoutRuntimeProbe | null = null): AdminCloseoutResult {
     if (input.expectedStatus !== 'parked') {
       throw new Error(
         `administrative closeout admits expected_status "parked" only (got ${JSON.stringify(input.expectedStatus)})`,
@@ -1615,8 +1690,8 @@ export class LedgerApi {
     if (!/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/u.test(headSha)) {
       throw new Error(`provider head_sha must be a full 40- or 64-character hex commit sha (got ${JSON.stringify(evidence.headSha)})`);
     }
-    const closedAt = evidence.closedAt ?? null;
-    if (closedAt !== null && (typeof closedAt !== 'string' || !isRealIsoUtcTimestamp(closedAt))) {
+    const closedAt = evidence.closedAt;
+    if (closedAt !== undefined && (typeof closedAt !== 'string' || !isRealIsoUtcTimestamp(closedAt))) {
       throw new Error(`provider closed_at must be a real ISO-8601 UTC timestamp when present (got ${JSON.stringify(closedAt)})`);
     }
     const reason = input.reason.trim();
@@ -1638,7 +1713,7 @@ export class LedgerApi {
             job_id: job.id,
             expected_status: 'parked',
             expected_pr_url: expectedPrUrl,
-            provider: { provider: 'github', state: 'closed', merged: false, head_sha: headSha, closed_at: closedAt },
+            provider: { provider: 'github', state: 'closed', merged: false, head_sha: headSha, closed_at: closedAt ?? null },
             reason,
           }),
         )
@@ -1769,7 +1844,7 @@ export class LedgerApi {
       }
 
       // Live-work fence: refusal names every durable execution blocker.
-      const blockers = this.closeoutLiveWorkBlockers(job.id);
+      const blockers = this.closeoutLiveWorkBlockers(job.id, runtime);
       if (blockers.length > 0) {
         throw new AdminCloseoutRefusal(
           'live-work',
@@ -1787,7 +1862,7 @@ export class LedgerApi {
           disposition: 'closed-without-merge',
           expected_status: 'parked',
           expected_pr_url: expectedPrUrl,
-          provider: { provider: 'github', state: 'closed', merged: false, head_sha: headSha, closed_at: closedAt },
+          provider: { provider: 'github', state: 'closed', merged: false, head_sha: headSha, closed_at: closedAt ?? null },
           observation: {
             event_seq: observationEvent.seq,
             observed_at: observationEvent.ts,
@@ -1808,20 +1883,64 @@ export class LedgerApi {
     });
   }
 
-  /** Durable execution blockers for a would-be administrative closeout:
-   * open worker turns, non-terminal tracked children, live review rounds
-   * and unsettled verification runs. Idle/disposed/historical bookkeeping
-   * rows are NOT execution evidence (issue #171 ownership classifies
-   * leftovers at the runtime boundary; a historical gap must not block a
-   * truthful closure) and directive/re-brief control rows are owned by
-   * their own reconcilers — neither is read here. */
-  private closeoutLiveWorkBlockers(jobId: string): readonly string[] {
+  /** The authoritative live-work fence for both closeout forms. Durable
+   * execution markers (open worker turns, non-terminal tracked children,
+   * live review rounds, unsettled verification runs) block. With the
+   * runtime probe wired, the supervisor's open turn/control/tool activity
+   * and openControl block even when the ledger row reads `idle` (the
+   * observed false-idle case), and a LIVE registry handle for a job-bound
+   * agent blocks as live task ownership. An explicit supervision stop
+   * (state stopped or breaker open) SHORT-CIRCUITS the agent's remaining
+   * clauses: the recorded stop is the runtime's own cessation signal, so
+   * a durable `streaming` row or a not-yet-disposed handle behind it is
+   * stale bookkeeping, not execution (disposal after a stop is
+   * best-effort; the stop precedence is documented in docs/LEDGER.md).
+   * Without a probe, only the durable markers answer. Idle/disposed/
+   * historical bookkeeping rows are never execution evidence; directive/
+   * re-brief control rows are owned by their own reconcilers and are
+   * neither read nor rewritten. */
+  private closeoutLiveWorkBlockers(jobId: string, runtime: CloseoutRuntimeProbe | null): readonly string[] {
     const blockers: string[] = [];
-    const openTurns = this.listAgents().filter(
-      (agent) => agent.jobId === jobId && (agent.state === 'spawning' || agent.state === 'streaming'),
-    );
+    const openTurns: string[] = [];
+    const ownedSessions: string[] = [];
+    for (const agent of this.listAgents()) {
+      if (agent.jobId !== jobId) continue;
+      const view = runtime?.supervisionFor(agent.id) ?? null;
+      if (view !== null) {
+        // The supervisor's state set is watching|restarting|stopped; live
+        // execution is an open turn/control/tool call or an active restart.
+        // An UNKNOWN openControl on a view that is not explicitly stopped
+        // fails closed (the reclaim probe treats the same absence as
+        // non-reclaimable).
+        const explicitlyStopped = view.state === 'stopped' || view.breakerOpen === true;
+        const openWork =
+          view.openTurn === true ||
+          view.openControl === true ||
+          (!explicitlyStopped && view.openControl === undefined) ||
+          view.openToolCalls > 0 ||
+          view.state === 'restarting';
+        if (openWork) {
+          openTurns.push(
+            `${agent.id} (supervision ${view.state}${view.openTurn ? ', openTurn' : ''}${view.openControl ? ', openControl' : ''}${view.openToolCalls > 0 ? `, ${view.openToolCalls} open tool call(s)` : ''})`,
+          );
+          continue;
+        }
+        if (explicitlyStopped) continue; // explicitly stopped — not live execution
+      }
+      if (agent.state === 'spawning' || agent.state === 'streaming') {
+        openTurns.push(`${agent.id} (${agent.state})`);
+        continue;
+      }
+      const liveHandles = runtime?.liveHandleIds ?? null;
+      if (liveHandles !== null && liveHandles.has(agent.id)) {
+        ownedSessions.push(`${agent.id} (${agent.state})`);
+      }
+    }
     if (openTurns.length > 0) {
-      blockers.push(`open worker turn(s): ${openTurns.map((agent) => `${agent.id} (${agent.state})`).join(', ')}`);
+      blockers.push(`open worker turn(s): ${openTurns.join(', ')}`);
+    }
+    if (ownedSessions.length > 0) {
+      blockers.push(`runtime-owned live session(s): ${ownedSessions.join(', ')}`);
     }
     const children = this.listChildWorkers({ jobId }).filter((child) => child.resultState === null);
     if (children.length > 0) {
@@ -1835,6 +1954,152 @@ export class LedgerApi {
       blockers.push('unsettled verification run(s) hold the lane');
     }
     return blockers;
+  }
+
+  /** Owner cancellation (owner amendment j-1117): the ONE audited path
+   * that administratively abandons an EXACT allowlisted parked legacy
+   * lane. Unlike the PR closeout it requires no provider receipt — these
+   * lanes have no registered PR and NULL legacy report metadata, and the
+   * amendment forbids inventing those values — but it is narrower: the
+   * job id must be on the frozen owner list, the lane must be parked,
+   * PR-free and report-metadata-free, and no target-owned work may be
+   * live. The audit records the owner authority reference, the exact
+   * prior identity, and the terminal disposition
+   * (`owner-cancelled-abandoned` → `done`); obligations close with
+   * `job-terminal` abandonment semantics. History, control rows, report
+   * evidence, worktrees and preservation holds are never rewritten, and
+   * cancellation is never a passing review, successful implementation or
+   * merge receipt. */
+  adminCancelListedParkedJob(
+    input: AdminCancellationInput,
+    runtime: CloseoutRuntimeProbe | null = null,
+  ): AdminCancellationResult {
+    if (input.expectedStatus !== 'parked') {
+      throw new Error(
+        `owner cancellation admits expected_status "parked" only (got ${JSON.stringify(input.expectedStatus)})`,
+      );
+    }
+    const authorityReference =
+      typeof input.authorityReference === 'string' ? input.authorityReference.trim() : '';
+    if (
+      authorityReference === '' ||
+      authorityReference.length > 200 ||
+      /[\p{Cc}]/u.test(authorityReference.replaceAll('\n', '').replaceAll('\t', ''))
+    ) {
+      throw new Error('authority_reference must be bounded printable text (1-200 characters)');
+    }
+    const reason = input.reason.trim();
+    if (reason === '' || reason.length > 2_000 || /[\p{Cc}]/u.test(reason.replaceAll('\n', '').replaceAll('\t', ''))) {
+      throw new Error('reason must be bounded printable text (1-2000 characters)');
+    }
+
+    return this.transaction(() => {
+      const job = this.getJob(input.jobId);
+      if (job === null) throw new RecordNotFound(`job "${input.jobId}" not found`);
+      // Exact allowlist first: an unlisted batch target never reaches any
+      // other guard, whatever its state.
+      if (!isOwnerCancellationListed(job.id)) {
+        throw new AdminCancellationRefusal(
+          'not-listed',
+          `job "${job.id}" is not on the owner-authorized cancellation list (ruling ${OWNER_CANCELLATION_RULING}) — no batch scan applies`,
+        );
+      }
+      // Replay identity covers every validated request field in a fixed
+      // order; it is checked before the current-row shape guards so an
+      // identical retry still returns the recorded event.
+      const requestSha256 = createHash('sha256')
+        .update(
+          JSON.stringify({
+            job_id: job.id,
+            form: 'owner-cancellation',
+            expected_status: 'parked',
+            authority_reference: authorityReference,
+            reason,
+          }),
+        )
+        .digest('hex');
+      if (job.status === 'done') {
+        const recorded = this.latestJobEvent(job.id, 'job.owner-cancellation');
+        const recordedSha =
+          recorded !== null && typeof recorded.payload === 'object' && recorded.payload !== null
+            ? (recorded.payload as { request_sha256?: unknown }).request_sha256
+            : undefined;
+        if (recorded !== null && recordedSha === requestSha256) {
+          return { job, event: recorded, idempotent: true };
+        }
+        const prCloseout = this.latestJobEvent(job.id, 'job.admin-closeout');
+        throw new AdminCancellationRefusal(
+          'already-closed',
+          recorded === null
+            ? `job "${job.id}" is already done${prCloseout === null ? '' : ` (PR closeout event ${prCloseout.seq})`} — not by this cancellation request; re-read the record`
+            : typeof recordedSha !== 'string'
+              ? `job "${job.id}" is already cancelled and its recorded event (${recorded.seq}) carries no readable request identity — inspect the recorded event before retrying`
+              : `job "${job.id}" is already cancelled under a DIFFERENT request (event ${recorded.seq}); a changed request never overwrites the recorded one`,
+        );
+      }
+      if (job.status !== 'parked') {
+        throw new AdminCancellationRefusal(
+          'not-parked',
+          `job "${job.id}" is ${job.status} — owner cancellation admits only a parked lane (expected_status "parked")`,
+        );
+      }
+      // The cancellation form is for the named legacy lanes' exact shape:
+      // no registered PR and no report metadata. Anything else is a
+      // different disposition and stays with its own form.
+      if (job.prUrl !== null) {
+        throw new AdminCancellationRefusal(
+          'not-cancellable-shape',
+          `job "${job.id}" registers PR "${job.prUrl}" — a PR-backed lane uses the provider closeout form, never owner cancellation`,
+        );
+      }
+      if (job.deliverable !== null || job.commissioner !== null || job.targetRef !== null || job.targetSha !== null) {
+        throw new AdminCancellationRefusal(
+          'not-cancellable-shape',
+          `job "${job.id}" carries report metadata (deliverable ${JSON.stringify(job.deliverable)}, commissioner ${JSON.stringify(job.commissioner)}) — report lanes are outside owner cancellation`,
+        );
+      }
+
+      const blockers = this.closeoutLiveWorkBlockers(job.id, runtime);
+      if (blockers.length > 0) {
+        throw new AdminCancellationRefusal(
+          'live-work',
+          `job "${job.id}" has target-owned live work — cancellation would orphan or conceal it: ${blockers.join('; ')}`,
+        );
+      }
+
+      // ONE transaction: audit first (owner authority + exact prior and
+      // terminal identity), then the direct parked → done hop, then
+      // obligation closure as terminal abandonment.
+      assertAdminCloseoutTransition(job.status, 'done');
+      const event = this.appendEvent({
+        kind: 'job.owner-cancellation',
+        jobId: job.id,
+        payload: {
+          disposition: 'owner-cancelled-abandoned',
+          expected_status: 'parked',
+          authority: {
+            kind: 'owner-cancellation',
+            ruling: OWNER_CANCELLATION_RULING,
+            reference: authorityReference,
+          },
+          prior: {
+            status: job.status,
+            pr_url: job.prUrl,
+            deliverable: job.deliverable,
+            commissioner: job.commissioner,
+            target_ref: job.targetRef,
+            target_sha: job.targetSha,
+            updated_at: job.updatedAt,
+          },
+          terminal: { status: 'done' },
+          reason,
+          request_sha256: requestSha256,
+        },
+      });
+      this.writeJobStatus(job.id, 'parked', 'done');
+      this.closeApplicableObligations(job.id, 'done');
+      return { job: this.getJob(job.id) as JobRecord, event, idempotent: false };
+    });
   }
 
   noteJob(id: string, note: string): JobRecord {

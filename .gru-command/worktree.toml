@@ -27,7 +27,7 @@ handoff-wave = "npx vitest run --config vitest.heavy.config.ts test/perkins-buil
 # exact-target CI receipts, audited canonical amendments. Invoked only via
 # the authenticated /api/verify scheduler at unchanged budgets/thresholds —
 # a plain vitest invocation with the approved RPC patch prerequisite.
-review-inputs = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/review-evidence-intake.test.ts test/review-ci-evidence.test.ts test/job-amendments.test.ts test/review-inputs-handoff.test.ts test/review-inputs-wave.test.ts test/dispatch-review-inputs.test.ts test/verification-evidence.test.ts test/github-poll.test.ts test/ledger-api.test.ts test/ledger-db.test.ts"
+review-inputs = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/review-inputs-wave.test.ts && npx vitest run test/review-evidence-intake.test.ts test/review-ci-evidence.test.ts test/job-amendments.test.ts test/review-inputs-handoff.test.ts test/dispatch-review-inputs.test.ts test/verification-evidence.test.ts test/github-poll.test.ts test/ledger-api.test.ts test/ledger-db.test.ts"
 
 # Review-input handoff lane regression + full-run failure isolation: the
 # seam-adjacent suites, plus the exact files whose timing-sensitive tests
@@ -562,11 +562,19 @@ working-flavor-browser = "cd web && node ../node_modules/typescript/bin/tsc --no
 # records the latest snapshot location.
 working-flavor-catalog-baseline = 'set -e; base=9bb51b05af5d8f0a0cd389788d1d3f19607d5361; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-working-flavor-catalog.XXXXXX"); git archive "$base" | tar -x -C "$d"; git show "$headrev":web/src/lib/working-flavor.test.ts > "$d/web/src/lib/working-flavor.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; ln -s "$root/web/node_modules" "$d/web/node_modules"; printf "%s base=%s head=%s\n" "$d" "$base" "$headrev" > "$prep/working-flavor-catalog-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; cd web; set +e; npx vitest run src/lib/working-flavor.test.ts; code=$?; set -e; echo "working-flavor-catalog-baseline vitest exit=$code (EXPECTED-NONZERO: new catalog assertions vs pre-change base)"; if [ "$code" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: baseline passed unexpectedly"; fi; exit 1'
 
-# Parked PR administrative-closeout lane (owner stop exception j-1115/j-1116):
+# Parked PR administrative-closeout + owner-cancellation lane (owner stop
+# exception j-1115, continuation j-1116, owner amendment j-1117):
 # the touched ledger machine, the authenticated closeout endpoint, the
 # terminal PR projection and the recomputed suite pins — invoked only via
 # the authenticated /api/verify scheduler at unchanged budgets/thresholds,
 # approved RPC patch first, exits never masked. The static scope carries the
 # lint/typecheck product checks for the same change.
-parked-closeout = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/ledger-api.test.ts test/ledger-obligations.test.ts test/board-server.test.ts test/board-engine-v4.test.ts test/suite-shape.test.ts && cd web && ../node_modules/.bin/vitest run src/lib/board-kpi.test.ts"
+parked-closeout = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/ledger-api.test.ts test/ledger-obligations.test.ts test/board-server.test.ts test/board-engine-v4.test.ts test/suite-shape.test.ts test/verification-capture.test.ts test/test-budgets.test.ts && cd web && ../node_modules/.bin/vitest run src/lib/board-kpi.test.ts"
 parked-closeout-static = "node tools/patch-vitest-rpc-timeout.mjs && npm run lint && npm run typecheck && cd web && node ../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json"
+
+# Owner-correction verification repair (2026-10-06): the long-running
+# files whose fixture cost starved the full gate's fast phase, plus the
+# whole fast phase for wall-time measurement. Committed scheduler scopes;
+# plain vitest invocations at unchanged budgets, RPC patch first.
+parked-closeout-repair = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/review-inputs-wave.test.ts && npx vitest run test/review-build-identity.test.ts test/review-inputs-handoff.test.ts"
+repair-fast-phase = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run"

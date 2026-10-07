@@ -2,6 +2,8 @@
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { readFileSync, readlinkSync, rmSync, writeFileSync } from 'node:fs';
+import { request as httpRequest } from 'node:http';
+import { request as httpsRequest } from 'node:https';
 import { pathToFileURL } from 'node:url';
 import { pidAlive } from './scheduler.js';
 import {
@@ -61,6 +63,148 @@ export const CAPTURE_EXIT = {
 export type CaptureExitCode = (typeof CAPTURE_EXIT)[keyof typeof CAPTURE_EXIT];
 
 type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
+
+/**
+ * The production streaming transport. Deliberately NOT global fetch:
+ * undici's default 5-minute body inactivity timeout can abort a verify
+ * stream while the scheduler run is still alive (a long quiet fixture),
+ * severing the capture before the terminal frame and leaving an UNKNOWN
+ * receipt for a run that later settles. A raw HTTP request has no
+ * response idle timeout — the scheduler's run deadline is the only bound
+ * — and real socket errors reach the receipt with their errno/cause.
+ * The surface matches the FetchLike seam the tests inject: `ok`,
+ * `status`, `body` (a byte stream) and `text()`.
+ */
+export function nodeStreamFetch(input: string, init?: RequestInit): Promise<Response> {
+  return new Promise((resolve, reject) => {
+    const url = new URL(input);
+    const requestFn = url.protocol === 'https:' ? httpsRequest : httpRequest;
+    const headers: Record<string, string> = {};
+    // Structural narrowing, deliberately avoiding DOM-only type names
+    // (the project compiles without the DOM lib).
+    const initHeaders: unknown = init?.headers;
+    if (initHeaders instanceof Headers) {
+      for (const [name, value] of initHeaders.entries()) headers[name] = value;
+    } else if (Array.isArray(initHeaders)) {
+      for (const entry of initHeaders as readonly (readonly [unknown, unknown])[]) {
+        const name = entry[0];
+        const value = entry[1];
+        if (typeof name === 'string' && typeof value === 'string') headers[name] = value;
+      }
+    } else if (typeof initHeaders === 'object' && initHeaders !== null) {
+      for (const [name, value] of Object.entries(initHeaders)) {
+        if (value !== undefined) headers[name] = String(value);
+      }
+    }
+    const body = init?.body;
+    const bodyText: string | Buffer | null =
+      typeof body === 'string' || Buffer.isBuffer(body) ? body : null;
+    if (body !== undefined && body !== null && bodyText === null) {
+      // The FetchLike surface is narrower than the DOM BodyInit union; a
+      // body this transport cannot send is rejected loudly, never dropped.
+      reject(new Error('nodeStreamFetch supports only string or Buffer request bodies'));
+      return;
+    }
+    const request = requestFn(url, { method: init?.method ?? 'GET', headers }, (response) => {
+      let cachedBody: ReadableStream<Uint8Array> | null = null;
+      let bodyAccessed = false;
+      let consumedByText = false;
+      const consumedBodyStream = (): ReadableStream<Uint8Array> =>
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.error(new Error('response body unavailable: text()/json() already consumed it'));
+          },
+        });
+      const text = (): Promise<string> => {
+        // One response, one consumer. Every mixed or repeated consumption
+        // fails loud here: the transport has no idle timeout by design, so
+        // attaching another `end` listener to an already-ended response
+        // would leave the caller hanging forever. Touching the byte-stream
+        // surface claims it too (the narrow FetchLike surface is used with
+        // exactly one style per response).
+        if (consumedByText) {
+          return Promise.reject(new Error('response text()/json() is one-shot; it was already consumed'));
+        }
+        if (bodyAccessed) {
+          return Promise.reject(new Error('response body already consumed by the byte stream'));
+        }
+        consumedByText = true;
+        return new Promise((resolveText, rejectText) => {
+          const chunks: Buffer[] = [];
+          response.on('data', (chunk: Buffer) => chunks.push(chunk));
+          response.on('end', () => resolveText(Buffer.concat(chunks).toString('utf-8')));
+          response.on('error', rejectText);
+        });
+      };
+      const result = {
+        ok: response.statusCode !== undefined && response.statusCode >= 200 && response.statusCode < 300,
+        status: response.statusCode ?? 0,
+        get body(): ReadableStream<Uint8Array> | null {
+          if (consumedByText) {
+            cachedBody ??= consumedBodyStream();
+            return cachedBody;
+          }
+          bodyAccessed = true;
+          if (cachedBody === null) {
+            cachedBody = new ReadableStream<Uint8Array>({
+              start(controller) {
+                response.on('data', (chunk: Buffer) => {
+                  controller.enqueue(new Uint8Array(chunk));
+                  // Bounded queue: stop reading the socket while the
+                  // consumer is behind; pull() resumes it.
+                  if (controller.desiredSize !== null && controller.desiredSize <= 0) response.pause();
+                });
+                response.on('end', () => controller.close());
+                response.on('error', (error: Error) => controller.error(error));
+              },
+              pull() {
+                response.resume();
+              },
+              cancel() {
+                request.destroy();
+                response.destroy();
+              },
+            });
+          }
+          return cachedBody;
+        },
+        text,
+        json: async (): Promise<unknown> => JSON.parse(await text()) as unknown,
+      };
+      resolve(result as unknown as Response);
+    });
+    request.on('error', (error: Error) => reject(error));
+    const signal = init?.signal;
+    if (signal !== undefined && signal !== null) {
+      if (signal.aborted) {
+        request.destroy(new Error('request aborted'));
+      } else {
+        signal.addEventListener('abort', () => request.destroy(new Error('request aborted')), { once: true });
+      }
+    }
+    if (bodyText !== null) request.write(bodyText);
+    request.end();
+  });
+}
+
+/** Transport errors keep the primary message and add the underlying code
+ * (the runtime attaches it either on the error itself or on its cause)
+ * so a severed stream is diagnosable from the receipt instead of a bare
+ * "terminated". */
+export function describeTransportError(error: unknown): string {
+  if (!(error instanceof Error)) return String(error);
+  const ownCode = (error as NodeJS.ErrnoException).code;
+  const base =
+    ownCode === undefined || ownCode === '' ? error.message : `${error.message} (code ${String(ownCode)})`;
+  const cause = error.cause;
+  if (cause === undefined) return base;
+  const code = (cause as NodeJS.ErrnoException | undefined)?.code;
+  const causeText =
+    cause instanceof Error
+      ? `${cause.name}: ${cause.message}${code === undefined || code === '' ? '' : ` (code ${String(code)})`}`
+      : String(cause);
+  return `${base} — cause: ${causeText}`;
+}
 
 export interface CaptureCliDeps {
   readonly fetchImpl?: FetchLike;
@@ -244,7 +388,7 @@ async function commandRun(
   const expectedHead = flags.get('expected-head') ?? null;
   const { baseUrl, token } = resolveOps(flags);
   const probe = deps.probe ?? systemProcessProbe;
-  const fetchImpl: FetchLike = deps.fetchImpl ?? fetch;
+  const fetchImpl: FetchLike = deps.fetchImpl ?? nodeStreamFetch;
   const now = deps.now ?? Date.now;
   const ownerPath = captureOwnerPath(sinkPath);
 
@@ -335,7 +479,7 @@ async function commandRun(
       }
     }
   } catch (error) {
-    transportError = String(error instanceof Error ? error.message : error);
+    transportError = describeTransportError(error);
   }
   const digest = sink.close();
   const parsed = captureReader.finish();
@@ -426,7 +570,7 @@ async function commandStatus(
 ): Promise<CaptureExitCode> {
   const requestId = required(flags, 'request-id');
   const { baseUrl, token } = resolveOps(flags);
-  const fetchImpl: FetchLike = deps.fetchImpl ?? fetch;
+  const fetchImpl: FetchLike = deps.fetchImpl ?? nodeStreamFetch;
   let response: Response;
   try {
     response = await fetchImpl(

@@ -1,9 +1,10 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer, type Server as HttpServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { WebSocket, type RawData } from 'ws';
+import { createScanner, ScriptTarget, SyntaxKind } from 'typescript';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { EventBus } from '../src/events/bus.js';
 import { BoardEngine } from '../src/board/engine.js';
@@ -29,7 +30,7 @@ function tmpDir(): string {
 
 async function boot(
   token: string,
-  overrides: Partial<{ heartbeatMs: number }> = {},
+  overrides: Partial<Parameters<typeof createBoardServer>[0]> = {},
 ): Promise<{
   port: number;
   api: LedgerApi;
@@ -291,6 +292,9 @@ describe('board server — HTTP API', () => {
       { ...validBody, provider: { ...validBody.provider, head_sha: 'nope' } },
       { ...validBody, provider: { ...validBody.provider, closed_at: 'not-a-time' } },
       { ...validBody, provider: { ...validBody.provider, closed_at: '' } },
+      // Present-but-null is not "omitted": the typed contract accepts a
+      // real timestamp or an absent field, at BOTH boundaries.
+      { ...validBody, provider: { ...validBody.provider, closed_at: null } },
       { ...validBody, expected_pr_url: '' },
       { ...validBody, expected_pr_url: 'not-a-url' },
       { ...validBody, reason: '' },
@@ -452,6 +456,230 @@ describe('board server — HTTP API', () => {
     expect(
       (noClosed.body as { event: { payload: { provider: { closed_at: unknown } } } }).event.payload.provider.closed_at,
     ).toBeNull();
+  });
+
+  it('closeout endpoint passes the authoritative runtime probe: a ledger idle row with an open turn refuses', async () => {
+    const head = '3c44e87e2e9e64cbc3301d7806540df6273438e6';
+    const prUrl = 'https://github.com/acme/gru-command/pull/179';
+    const local = await boot('closeout-probe-token', {
+      closeoutRuntime: () => ({
+        liveHandleIds: new Set<string>(),
+        supervisionFor: (agentId: string) =>
+          agentId === 'closeout-probe-idle-open'
+            ? { state: 'watching', breakerOpen: false, openTurn: true, openControl: false, openToolCalls: 0 }
+            : null,
+      }),
+    });
+    try {
+      const jobId = 'closeout-probe';
+      local.api.addJob({ id: jobId, repo: 'demo-repo', title: 'Closeout probe lane' });
+      local.api.setJobStatus(jobId, 'working');
+      local.api.setJobPr(jobId, prUrl);
+      local.api.setJobStatus(jobId, 'in-review');
+      local.api.setJobStatus(jobId, 'parked');
+      local.api.appendCustomEvent({
+        kind: 'github.branch-state',
+        jobId,
+        payload: branchStatePayload(
+          { jobId, repo: { host: 'github.com', owner: 'acme', repo: 'gru-command' }, branch: `gru/${jobId}`, prNumber: 179, prUrl },
+          { sha: head, merged: false, prOpen: false, mergeableState: 'dirty', ci: null, prNumber: 179, prUrl, mergeCommitSha: null },
+        ),
+      });
+      local.api.registerAgent({ id: 'closeout-probe-idle-open', role: 'minion', jobId });
+      local.api.setAgentState('closeout-probe-idle-open', 'idle');
+      const refused = await postJson(local.port, `/api/jobs/${jobId}/closeout`, 'closeout-probe-token', {
+        expected_status: 'parked',
+        expected_pr_url: prUrl,
+        provider: { provider: 'github', state: 'closed', merged: false, head_sha: head },
+        reason: 'probe forwarding',
+      });
+      expect(refused.status).toBe(409);
+      expect(refused.body).toMatchObject({ error: 'closeout_refused', code: 'live-work' });
+      expect(local.api.getJob(jobId)?.status).toBe('parked');
+    } finally {
+      await local.close();
+    }
+  });
+
+  it('owner cancellation endpoint: auth, malformed bodies, unlisted refusals and the audited idempotent success', async () => {
+    const { api, port } = harness;
+    const listed = 'gc-freeze-heat-evidence';
+    const body = {
+      expected_status: 'parked',
+      authority_reference: 'j-1117 owner-close-seventeen-parked-20261006',
+      reason: 'owner asked to move these away from parked',
+    };
+    expect((await postJson(port, `/api/jobs/${listed}/owner-cancellation`, null, body)).status).toBe(401);
+    expect((await postJson(port, `/api/jobs/${listed}/owner-cancellation`, 'wrong-token', body)).status).toBe(401);
+    for (const bad of [
+      {},
+      { ...body, expected_status: 'working' },
+      { ...body, authority_reference: '' },
+      { ...body, reason: '' },
+    ]) {
+      const response = await postJson(port, `/api/jobs/${listed}/owner-cancellation`, 'board-test-token', bad);
+      expect(response.status, JSON.stringify(bad)).toBe(400);
+    }
+    const nullBody = await postJson(port, `/api/jobs/${listed}/owner-cancellation`, 'board-test-token', null);
+    expect(nullBody.status).toBe(400);
+    expect((await postJson(port, '/api/jobs/ghost/owner-cancellation', 'board-test-token', body)).status).toBe(404);
+
+    // An unlisted parked job is refused with the typed code and no effect.
+    api.addJob({ id: 'unlisted-cancel', repo: 'demo-repo', title: 'Unlisted' });
+    api.setJobStatus('unlisted-cancel', 'working');
+    api.setJobStatus('unlisted-cancel', 'parked');
+    const unlisted = await postJson(port, '/api/jobs/unlisted-cancel/owner-cancellation', 'board-test-token', body);
+    expect(unlisted.status).toBe(409);
+    expect(unlisted.body).toMatchObject({ error: 'cancellation_refused', code: 'not-listed' });
+    expect(api.getJob('unlisted-cancel')?.status).toBe('parked');
+
+    // A listed parked legacy lane cancels in one audited, idempotent hop.
+    api.addJob({ id: listed, repo: 'demo-repo', title: 'Listed legacy lane' });
+    api.setJobStatus(listed, 'working');
+    api.setJobStatus(listed, 'parked');
+    const accepted = await postJson(port, `/api/jobs/${listed}/owner-cancellation`, 'board-test-token', body);
+    expect(accepted.status).toBe(200);
+    const acceptedBody = accepted.body as { job: { status: string }; event: { kind: string; seq: number }; idempotent: boolean };
+    expect(acceptedBody.job.status).toBe('done');
+    expect(acceptedBody.event.kind).toBe('job.owner-cancellation');
+    expect(acceptedBody.idempotent).toBe(false);
+    const replay = await postJson(port, `/api/jobs/${listed}/owner-cancellation`, 'board-test-token', body);
+    expect(replay.status).toBe(200);
+    expect(replay.body).toMatchObject({ idempotent: true, event: { seq: acceptedBody.event.seq }, job: { status: 'done' } });
+    const settled = await postJson(port, `/api/jobs/${listed}/owner-cancellation`, 'board-test-token', { ...body, reason: 'a different reason' });
+    expect(settled.status).toBe(409);
+    expect(settled.body).toMatchObject({ error: 'cancellation_refused', code: 'already-closed' });
+    const snapshot = (await getJson(port, '/api/board', 'board-test-token')).body as {
+      repos: { jobs: { id: string; status: string; prState: string | null }[] }[];
+    };
+    const job = snapshot.repos.flatMap((repo) => repo.jobs).find((candidate) => candidate.id === listed);
+    expect(job).toMatchObject({ status: 'done', prState: null });
+  });
+
+  it('owner cancellation endpoint passes the authoritative runtime probe: a ledger idle row with an open turn refuses', async () => {
+    const local = await boot('cancel-probe-token', {
+      closeoutRuntime: () => ({
+        liveHandleIds: new Set<string>(),
+        supervisionFor: (agentId: string) =>
+          agentId === 'probe-idle-open'
+            ? { state: 'watching', breakerOpen: false, openTurn: true, openControl: false, openToolCalls: 0 }
+            : null,
+      }),
+    });
+    try {
+      const listed = 'silas-context-rotation';
+      local.api.addJob({ id: listed, repo: 'demo-repo', title: 'Probe lane' });
+      local.api.setJobStatus(listed, 'working');
+      local.api.setJobStatus(listed, 'parked');
+      local.api.registerAgent({ id: 'probe-idle-open', role: 'minion', jobId: listed });
+      local.api.setAgentState('probe-idle-open', 'idle');
+      const refused = await postJson(local.port, `/api/jobs/${listed}/owner-cancellation`, 'cancel-probe-token', {
+        expected_status: 'parked',
+        authority_reference: 'j-1117 owner-close-seventeen-parked-20261006',
+        reason: 'owner asked',
+      });
+      expect(refused.status).toBe(409);
+      expect(refused.body).toMatchObject({ error: 'cancellation_refused', code: 'live-work' });
+      expect(local.api.getJob(listed)?.status).toBe('parked');
+    } finally {
+      await local.close();
+    }
+  });
+
+  /** Strip line and block comments with the TypeScript scanner (never a
+   * regex over raw text), keeping the newlines so line anchors stay
+   * meaningful. A commented-out wiring must not satisfy the assembly
+   * alarm below. */
+  function stripSourceComments(text: string): string {
+    const scanner = createScanner(ScriptTarget.Latest, false, undefined, text);
+    let out = '';
+    let last = 0;
+    for (let kind = scanner.scan(); kind !== SyntaxKind.EndOfFileToken; kind = scanner.scan()) {
+      if (kind === SyntaxKind.SingleLineCommentTrivia || kind === SyntaxKind.MultiLineCommentTrivia) {
+        out += text.slice(last, scanner.getTokenPos());
+        out += text.slice(scanner.getTokenPos(), scanner.getTextPos()).replace(/[^\n]/gu, ' ');
+        last = scanner.getTextPos();
+      }
+    }
+    out += text.slice(last);
+    return out;
+  }
+
+  /** Findings from the closeoutRuntime assembly alarm for one source
+   * text: an empty list means the wiring is present, active and correctly
+   * mapped. Exposed for the synthetic-fixture test below so a revert of
+   * the comment-stripping/scoping hardening goes red. */
+  function closeoutWiringFindings(source: string): string[] {
+    const stripped = stripSourceComments(source);
+    const findings: string[] = [];
+    const wiringLines = stripped.split('\n').filter((line) => /^\s*closeoutRuntime:/.test(line));
+    if (wiringLines.length !== 1) findings.push(`wiring count ${String(wiringLines.length)}`);
+    if (wiringLines.length === 1 && !/^\s*closeoutRuntime:\s*\(\)\s*=>\s*\(\{/u.test(wiringLines[0]!)) {
+      findings.push('wiring shape');
+    }
+    const start = stripped.search(/^\s*closeoutRuntime:/mu);
+    const block = start < 0 ? '' : stripped.slice(start, start + 1_500);
+    const expressions: readonly (readonly [string, RegExp])[] = [
+      ['liveHandleIds', /^\s*liveHandleIds:\s*new Set\(registry\.listHandles\(\)\.map\(\(handle\) => handle\.id\)\),/mu],
+      ['supervisionFor', /^\s*supervisionFor:\s*\(agentId\)\s*=>\s*\{/mu],
+      ['viewFor', /^\s*const view = supervisorLive\.viewFor\(agentId\);/mu],
+      ['state', /^\s*state:\s*view\.state,/mu],
+      ['breakerOpen', /^\s*breakerOpen:\s*view\.breakerOpen,/mu],
+      ['openTurn', /^\s*openTurn:\s*view\.openTurn,/mu],
+      ['openControl', /^\s*openControl:\s*view\.openControl,/mu],
+      ['openToolCalls', /^\s*openToolCalls:\s*view\.openToolCalls,/mu],
+    ];
+    for (const [label, expression] of expressions) {
+      if (!expression.test(block)) findings.push(`mapping ${label}`);
+    }
+    return findings;
+  }
+
+  it('the main assembly wires the authoritative closeout runtime probe (assembly alarm)', () => {
+    // The behavior has unit coverage but the production composition does
+    // not: dropping this wiring — or wiring a falsified constant instead
+    // of the live view value — would silently fall back to durable markers
+    // only and no behavioral test would fail (same alarm pattern as the
+    // supervisor-stop wiring pin). The alarm strips comments and scopes
+    // the match to the property's block; the synthetic fixtures below keep
+    // that hardening from regressing.
+    const mainSource = readFileSync(join(import.meta.dirname, '..', 'src', 'main.ts'), 'utf8');
+    expect(closeoutWiringFindings(mainSource)).toEqual([]);
+  });
+
+  it('the assembly alarm rejects commented, decoy, removed and falsified wiring (synthetic fixtures)', () => {
+    const goodWiring = [
+      'const x = createBoardServer({',
+      '  closeoutRuntime: () => ({',
+      '    liveHandleIds: new Set(registry.listHandles().map((handle) => handle.id)),',
+      '    supervisionFor: (agentId) => {',
+      '      const view = supervisorLive.viewFor(agentId);',
+      '      return view === null ? null : {',
+      '        state: view.state,',
+      '        breakerOpen: view.breakerOpen,',
+      '        openTurn: view.openTurn,',
+      '        openControl: view.openControl,',
+      '        openToolCalls: view.openToolCalls,',
+      '      };',
+      '    },',
+      '  }),',
+      '});',
+    ].join('\n');
+    expect(closeoutWiringFindings(goodWiring)).toEqual([]);
+    const lines = goodWiring.split('\n');
+    const propertyLines = lines.map((line, index) => (index >= 1 && index <= 13 ? `// ${line}` : line)).join('\n');
+    expect(closeoutWiringFindings(propertyLines), '//-commented wiring').not.toEqual([]);
+    const wrappedLines = [...lines.slice(0, 1), '/*', ...lines.slice(1, 14), '*/', ...lines.slice(14)].join('\n');
+    expect(closeoutWiringFindings(wrappedLines), 'block-commented wiring').not.toEqual([]);
+    const removed = lines.filter((_line, index) => index < 1 || index > 13).join('\n');
+    expect(closeoutWiringFindings(removed), 'removed wiring').not.toEqual([]);
+    const decoy = `${goodWiring}\n  closeoutRuntime: () => ({ liveHandleIds: new Set(), supervisionFor: () => null }),`;
+    expect(closeoutWiringFindings(decoy), 'second closeoutRuntime property').toContain('wiring count 2');
+    const withoutViewFor = lines.filter((_line, index) => index !== 4).join('\n');
+    const unscopedDecoy = `const view = supervisorLive.viewFor(agentId);\n${withoutViewFor}`;
+    expect(closeoutWiringFindings(unscopedDecoy), 'decoy viewFor outside the block').not.toEqual([]);
+    const falsified = lines.map((line) => line.replace('openTurn: view.openTurn,', 'openTurn: false,')).join('\n');
+    expect(closeoutWiringFindings(falsified), 'falsified constant').toContain('mapping openTurn');
   });
 
   it('write endpoints reject bad bodies and missing entities', async () => {

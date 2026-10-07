@@ -5,7 +5,7 @@ import { hashToken, tokenConfigured, tokenMatches } from '../auth.js';
 import { ROLES, type GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { EventBus } from '../events/bus.js';
-import { LedgerApi, RecordNotFound, AdminCloseoutRefusal, type DecisionActor, type DecisionKind, type NotificationRecord } from '../ledger/api.js';
+import { LedgerApi, RecordNotFound, AdminCloseoutRefusal, AdminCancellationRefusal, type CloseoutRuntimeProbe, type DecisionActor, type DecisionKind, type NotificationRecord } from '../ledger/api.js';
 import { isDecisionActor, isDecisionKind } from '../ledger/decision-memory.js';
 import { isJobStatus, isRoundStatus, isRoundVerdict } from '../ledger/states.js';
 import { isAgentState } from '../runtime/types.js';
@@ -40,6 +40,11 @@ export interface BoardServerOptions {
   readonly decisionsStatus?: () => DecisionRuntimeStatus;
   readonly onDecisionsRecheck?: () => Promise<DecisionRuntimeStatus>;
   readonly log?: Log;
+  /** Owned by main for the closeout forms: authoritative runtime facts
+   * (live registry handles + the supervisor's per-agent view) read at the
+   * commit boundary. Absent = the ledger falls back to its durable
+   * execution markers alone. */
+  readonly closeoutRuntime?: () => CloseoutRuntimeProbe | null;
   /** First-frame-must-be-auth deadline (chat parity: 5 s). */
   readonly authDeadlineMs?: number;
   /** Upgrade paths owned by SIBLING ws surfaces (the chat /ws) — the board
@@ -527,19 +532,59 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
           json(
             res,
             200,
-            ledger.adminCloseParkedJob({
-              jobId: id,
-              expectedStatus: 'parked',
-              expectedPrUrl,
-              provider: {
-                provider: 'github',
-                state: 'closed',
-                merged: false,
-                headSha,
-                ...(closedAt !== undefined ? { closedAt } : {}),
+            ledger.adminCloseParkedJob(
+              {
+                jobId: id,
+                expectedStatus: 'parked',
+                expectedPrUrl,
+                provider: {
+                  provider: 'github',
+                  state: 'closed',
+                  merged: false,
+                  headSha,
+                  ...(closedAt !== undefined ? { closedAt } : {}),
+                },
+                reason,
               },
-              reason,
-            }),
+              options.closeoutRuntime?.() ?? null,
+            ),
+          );
+          return;
+        }
+        // Owner cancellation (owner amendment j-1117): administrative
+        // abandonment of an EXACT allowlisted parked legacy lane with no
+        // registered PR and NULL report metadata. Same authenticated
+        // boundary; typed 409 refusals; never a fabricated provider
+        // receipt and never a batch scan.
+        if (req.method === 'POST' && path.startsWith('/api/jobs/') && path.endsWith('/owner-cancellation')) {
+          if (!authed(req, res)) return;
+          const id = decodeURIComponent(path.slice('/api/jobs/'.length, -'/owner-cancellation'.length));
+          if (id === '') {
+            json(res, 400, { error: 'bad_request', detail: 'job id path segment is required' });
+            return;
+          }
+          const body = (await readBody(req)) as Record<string, unknown>;
+          if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+            throw new Error('request body must be a JSON object');
+          }
+          const expectedStatus = strField(body, 'expected_status');
+          if (expectedStatus !== 'parked') {
+            throw new Error(`expected_status must be "parked" (got "${expectedStatus}")`);
+          }
+          const authorityReference = strField(body, 'authority_reference');
+          const reason = strField(body, 'reason');
+          json(
+            res,
+            200,
+            ledger.adminCancelListedParkedJob(
+              {
+                jobId: id,
+                expectedStatus: 'parked',
+                authorityReference,
+                reason,
+              },
+              options.closeoutRuntime?.() ?? null,
+            ),
           );
           return;
         }
@@ -622,15 +667,21 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
         // Typed mapping: the ledger and transcript layers throw
         // RecordNotFound for missing entities; a missing/unreadable
         // transcript FILE is also a not-found. Everything else is a 400
-        // except a guarded closeout refusal, which is a typed 409.
-        const refused = error instanceof AdminCloseoutRefusal;
+        // except a guarded closeout/cancellation refusal, a typed 409.
+        const closeoutRefused = error instanceof AdminCloseoutRefusal;
+        const cancellationRefused = error instanceof AdminCancellationRefusal;
+        if (closeoutRefused) {
+          json(res, 409, { error: 'closeout_refused', code: error.code, detail: message });
+          return;
+        }
+        if (cancellationRefused) {
+          json(res, 409, { error: 'cancellation_refused', code: error.code, detail: message });
+          return;
+        }
         const notFound =
-          !refused &&
-          (error instanceof RecordNotFound ||
-            (error instanceof Error && error.message.includes('transcript unreadable')));
-        json(res, refused ? 409 : notFound ? 404 : 400, refused
-          ? { error: 'closeout_refused', code: error.code, detail: message }
-          : { error: notFound ? 'not_found' : 'bad_request', detail: message });
+          error instanceof RecordNotFound ||
+          (error instanceof Error && error.message.includes('transcript unreadable'));
+        json(res, notFound ? 404 : 400, { error: notFound ? 'not_found' : 'bad_request', detail: message });
       }
     })().catch((error: unknown) => {
       log('error', 'board api handler failed', { error: String(error) });
