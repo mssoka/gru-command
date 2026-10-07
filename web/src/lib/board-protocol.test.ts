@@ -425,6 +425,44 @@ describe('board server-frame validator', () => {
       lastAttemptAt: null,
     };
     expect(isValidSnapshot({ ...snapshot(), repoOverview: { rows: [unlinked] } } as unknown)).toBe(true);
+    // Positive shapes the server emits that a fixture-light suite can
+    // miss: a linked but never-observed row (first pass / rotation
+    // window) and an aged stale row with no failure marker.
+    expect(
+      isValidSnapshot({
+        ...snapshot(),
+        repoOverview: {
+          rows: [
+            {
+              ...row,
+              freshness: 'unchecked',
+              checkedAt: null,
+              lastAttemptAt: null,
+              openPrs: null,
+              openIssues: null,
+              run: null,
+              error: null,
+            },
+          ],
+        },
+      } as unknown),
+    ).toBe(true);
+    expect(
+      isValidSnapshot({
+        ...snapshot(),
+        repoOverview: {
+          rows: [
+            {
+              ...row,
+              freshness: 'stale',
+              checkedAt: '2026-01-01T00:05:00.000Z',
+              lastAttemptAt: '2026-01-01T00:05:00.000Z',
+              error: null,
+            },
+          ],
+        },
+      } as unknown),
+    ).toBe(true);
 
     // Strictness: an unknown state/freshness, a negative or fractional count,
     // a non-https or malformed URL, inconsistent link coherence or an

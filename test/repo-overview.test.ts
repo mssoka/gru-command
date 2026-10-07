@@ -344,6 +344,11 @@ describe('managed repo overview tracker — exact counts and runs', () => {
   it('breaks an equal created_at by run id and falls back to id for unparseable stamps', () => {
     expect(selectLatestRun([rawRun({ id: 1 }), rawRun({ id: 7 })])?.id).toBe(7);
     expect(selectLatestRun([rawRun({ id: 2, createdAt: null }), rawRun({ id: 5, createdAt: null })])?.id).toBe(5);
+    // Mixed pairs: a datable run always beats an undatable one, in either
+    // list order, whatever the ids.
+    expect(selectLatestRun([rawRun({ id: 9, createdAt: null }), rawRun({ id: 1 })])?.id).toBe(1);
+    expect(selectLatestRun([rawRun({ id: 1 }), rawRun({ id: 9, createdAt: null })])?.id).toBe(1);
+    expect(selectLatestRun([rawRun({ id: 9, createdAt: 'not-a-date' }), rawRun({ id: 1 })])?.id).toBe(1);
     expect(selectLatestRun([])).toBeNull();
   });
 
@@ -1313,5 +1318,60 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
     expect(entry.error).not.toBe('');
     expect(entry.error).not.toBeNull();
     expect(isValidSnapshot(validBoardSnapshot(view))).toBe(true);
+  });
+
+  it('never turns a backward clock step into an unbounded pacing sleep', async () => {
+    const h = harness({ names: ['alpha', 'beta'] });
+    const original = h.api.countOpenPulls.bind(h.api);
+    let steppedBack = false;
+    h.api.countOpenPulls = async (input) => {
+      const result = await original(input);
+      if (!steppedBack) {
+        steppedBack = true;
+        h.clock.ms -= 3_600_000;
+      }
+      return result;
+    };
+    await h.tracker.refresh();
+    expect(steppedBack).toBe(true);
+    expect(h.sleeps.every((ms) => ms <= 2000)).toBe(true);
+    expect(row(h.tracker.view(), 'beta').freshness).toBe('fresh');
+  });
+
+  it('paces searches even when the clock epoch starts at zero', async () => {
+    const api = new FakeApi().set('alpha', {}).set('beta', {});
+    const sleeps: number[] = [];
+    const tracker = new ManagedRepoOverviewTracker({
+      workspaceRoot: '/ws',
+      api,
+      scanRepos: () => ['alpha', 'beta'],
+      resolveRemote: (repoPath) => githubRef(repoPath.split('/').pop() as string),
+      now: () => 0,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+      log: () => {},
+    });
+    await tracker.refresh();
+    expect(api.calls.filter((call) => call.startsWith('countOpenPulls')).length).toBe(2);
+    expect(api.calls.filter((call) => call.startsWith('countOpenIssues')).length).toBe(2);
+    // First search is free, the remaining three are paced: a `0` sentinel
+    // would silently disable pacing on an epoch-0 clock.
+    expect(sleeps).toEqual([2000, 2000, 2000]);
+  });
+
+  it('defers when the pacing sleep itself crosses the fetch wall-clock budget', async () => {
+    const h = harness({ names: ['alpha', 'beta'] });
+    const start = h.clock.ms;
+    const original = h.api.fetchRepo.bind(h.api);
+    h.api.fetchRepo = async (input) => {
+      const result = await original(input);
+      if (input.repo.repo === 'beta') h.clock.ms = start + REPO_OVERVIEW_FETCH_BUDGET_MS - 500;
+      return result;
+    };
+    const view = await h.tracker.refresh();
+    expect(row(view, 'alpha').freshness).toBe('fresh');
+    expect(row(view, 'beta').lastAttemptAt).toBeNull();
+    expect(h.failure).toContain('fetch wall-clock budget');
   });
 });

@@ -713,7 +713,7 @@ export class ManagedRepoOverviewTracker {
   private registry: readonly string[] = [];
   private cursor = 0;
   private classifyCursor = 0;
-  private lastSearchAtMs = 0;
+  private lastSearchAtMs: number | null = null;
   private refreshedOnce = false;
   private started = false;
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -1085,15 +1085,26 @@ export class ManagedRepoOverviewTracker {
   }
 
   /** Spend one Search call, paced to GitHub's sustained search quota (a
-   * self-inflicted 403 would abort the pass mid-registry). */
+   * self-inflicted 403 would abort the pass mid-registry). The wait is
+   * clamped to one interval so a backward clock step can never turn
+   * pacing into an unbounded sleep, and the pass deadline is re-checked
+   * after the sleep because it may have been crossed while waiting. */
   private async spendSearch<T>(
     budget: { used: number; limit: number; deadlineMs?: number },
     work: () => Promise<T>,
   ): Promise<T> {
     return this.spend(budget, async () => {
       const nowMs = this.now();
-      if (this.lastSearchAtMs > 0 && nowMs - this.lastSearchAtMs < REPO_OVERVIEW_SEARCH_MIN_INTERVAL_MS) {
-        await this.sleep(REPO_OVERVIEW_SEARCH_MIN_INTERVAL_MS - (nowMs - this.lastSearchAtMs));
+      if (this.lastSearchAtMs !== null) {
+        const elapsed = nowMs - this.lastSearchAtMs;
+        if (elapsed < REPO_OVERVIEW_SEARCH_MIN_INTERVAL_MS) {
+          await this.sleep(
+            REPO_OVERVIEW_SEARCH_MIN_INTERVAL_MS - Math.max(0, Math.min(elapsed, REPO_OVERVIEW_SEARCH_MIN_INTERVAL_MS)),
+          );
+        }
+      }
+      if (budget.deadlineMs !== undefined && this.now() > budget.deadlineMs) {
+        throw new GhBudgetExceededError('repo overview fetch wall-clock budget exceeded');
       }
       this.lastSearchAtMs = this.now();
       return work();
