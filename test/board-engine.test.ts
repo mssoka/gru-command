@@ -525,7 +525,7 @@ describe('board engine — liveness-first rail and job trackers', () => {
     expect(engine.snapshot().unackedActionRequired).toBe(0);
   });
 
-  it('unackedActionRequired counts LIVE rows only — rows bound to merged/done jobs are closed receipts', () => {
+  it('unackedActionRequired counts LIVE rows only — rows bound to terminal (merged/done/binned) jobs are closed receipts', () => {
     const { api, engine } = fresh();
     // An unbound row stays global (no job → cannot be terminal).
     api.recordNotification({ id: 'n-global', kind: 'test.notice', routing: 'action-required', severity: 'error', title: 'Global' });

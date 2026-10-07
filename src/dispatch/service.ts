@@ -579,8 +579,8 @@ export class DispatchService {
 
   /** Record the PR link (the minion's lane artifact; merging is review's).
    * A registered PR opens the review window: working|delivered → in-review.
-   * Later states (blocked/parked/merged/done) are left as-is — a link
-   * never resurrects a lane. Merge DETECTION is not here: nothing in this
+   * Later states (blocked/parked/merged/done/binned) are left as-is — a
+   * link never resurrects a lane. Merge DETECTION is not here: nothing in this
    * service writes 'merged'; that stays the external sweep's (Silas's)
    * call — the remaining external caller of the job machine. */
   recordPr(jobId: string, url: string): JobRecord {

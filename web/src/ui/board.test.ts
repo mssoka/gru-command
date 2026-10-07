@@ -1282,6 +1282,9 @@ describe('board v6 — bands', () => {
     expect(badge?.textContent).toBe('binned');
     expect(badge?.classList.contains('pp-chip--binned')).toBe(true);
     expect(badge?.classList.contains('pp-chip--park')).toBe(false);
+    // A discarded lane is a closed receipt: even with an aborted newest
+    // round it never carries the live alert accent.
+    expect(binnedRow?.classList.contains('board-job--alert')).toBe(false);
     // Complete history stays inspectable on the discarded lane.
     binnedRow?.querySelector<HTMLButtonElement>('.board-job__toggle')?.click();
     expect(binnedRow?.querySelectorAll('.board-round')).toHaveLength(2);
@@ -1321,6 +1324,30 @@ describe('board v6 — bands', () => {
     expect(document.querySelectorAll('.board-band--cold [data-job-id^="binned-"]')).toHaveLength(0);
     expect(document.querySelector<HTMLButtonElement>('.board-band--cold .board-band__more--binned')?.textContent)
       .toBe('Show 3 binned records');
+    // Session persistence is the COLD/FOR GRU convention: a snapshot that
+    // drops every binned row removes the control, and a later binned lane
+    // returns under the state the operator last chose (collapsed here).
+    view.render(snapshot({ jobs: [baseJob({ id: 'parked-3', status: 'parked' })] }));
+    expect(document.querySelector('.board-band__more--binned')).toBeNull();
+    view.render(snapshot({ jobs: [baseJob({ id: 'binned-d', status: 'binned' })] }));
+    expect(document.querySelector<HTMLButtonElement>('.board-band--cold .board-band__more--binned')?.textContent)
+      .toBe('Show 1 binned record');
+  });
+
+  it('focus falls to the COLD shortcut when the binned disclosure disappears from a push', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({ jobs: [baseJob({ id: 'binned-focus', status: 'binned' })] }));
+    expandCold();
+    const toggle = document.querySelector<HTMLElement>('.board-band--cold .board-band__more--binned');
+    expect(toggle?.dataset.focusKey).toBe('section:cold-binned');
+    toggle?.focus();
+    expect(document.activeElement).toBe(toggle);
+    // The next snapshot has no binned rows: the disclosure is gone.
+    view.render(snapshot({ jobs: [baseJob({ id: 'parked-focus', status: 'parked' })] }));
+    const active = document.activeElement;
+    expect(active).toBeInstanceOf(HTMLElement);
+    expect((active as HTMLElement).classList.contains('board-nav__link')).toBe(true);
+    expect((active as HTMLElement).getAttribute('data-nav')).toBe('cold');
   });
 
   it('renders no binned disclosure when the snapshot has no binned rows', () => {

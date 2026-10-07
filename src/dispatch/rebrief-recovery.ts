@@ -48,7 +48,7 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  * `silas.rebrief-settled` publication (the queued-review release signal)
  * commit in ONE transaction, so a settlement failure can never leave a
  * handoff stranded behind already-cleared markers. A marker whose job has since
- * reached terminal (`merged`/`done`) is the exception: the request can
+ * reached terminal (`merged`/`done`/`binned`) is the exception: the request can
  * never be honored, so boot retires it administratively — one
  * `silas.rebrief-retired` audit committed with the marker deletion —
  * instead of re-dispatching or escalating forever. Spent markers (both

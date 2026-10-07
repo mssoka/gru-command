@@ -1197,9 +1197,10 @@ export class BoardView {
   }
 
   /** Expanded detail (the v2/v3 surface): lane strip, note, condensed
-   * rounds. Concluded jobs (merged/done) suppress their round history
-   * here — a merged job's aborted round is noise, not live state
-   * (v4.1 stale-pill suppression). */
+   * rounds. merged/done suppress their round history here — a merged
+   * job's aborted round is noise, not live state (v4.1 stale-pill
+   * suppression); a binned (discarded) lane deliberately keeps its full
+   * history inspectable. */
   private jobBody(job: JobView): HTMLElement {
     const body = el('div', 'board-job__body');
     this.nextRegionId += 1;
@@ -1847,8 +1848,9 @@ export class BoardView {
 /** A row is "failing" when the record itself says so: blocked/error
  * status, an aborted newest round, or errored lenses in a round that has
  * not posted a verdict. Conflicting-PR-only rows stay calm — the band
- * already shouts. A CONCLUDED job (merged/done) is a closed receipt: its
- * history renders quiescent and never carries the alert accent. */
+ * already shouts. A CONCLUDED job (merged/done/binned) is a closed
+ * receipt: its history renders quiescent and never carries the alert
+ * accent. */
 export function jobFailing(job: JobView): boolean {
   if (isJobConcluded(job.status)) return false;
   if (job.status === 'blocked' || job.status === 'error') return true;

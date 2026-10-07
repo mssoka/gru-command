@@ -252,8 +252,9 @@ curl -sS -X POST "http://127.0.0.1:<port>/api/jobs/<job-id>/status" \
 ```
 
 - `200` — the job is `binned`; the ordinary `job.status` event records
-  `<prior> → binned` and the board shows the row in COLD behind the
-  “Show N binned records” disclosure.
+  `<prior> → binned`. On the board, COLD is count-only by default:
+  expand COLD (“Show records”), then the “Show N binned records”
+  disclosure inside it reveals the discarded row.
 - `400` — illegal transition (from `merged`/`done`, or any DIFFERENT
   status after `binned`) or unknown status; nothing changed. Re-sending
   `{"status":"binned"}` to an already-binned lane is an idempotent

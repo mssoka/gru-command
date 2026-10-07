@@ -134,3 +134,13 @@
 ## Deferred from: code review of PR #241 / issue #117 (2026-10-06)
 
 - verificationFailures digest rows with a null scope can never follow the `verification-failure:<scope>@<run_id>` fingerprint discipline: the retirement fingerprints are only built when scope is non-null, so a null-scope failure row can only retire via resubmission (impossible for null scope) or terminality. Pre-existing digest identity gap (unchanged by #117, which only names the pre-existing instruction as the `verification-repair` rule). Fix: give the null-scope row an actionable identity or withhold the rule offer.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-job-status-binned.md`
+  summary: A merge observed for a terminal (binned) lane is skipped by the GitHub poll with no durable trace; decide whether to record a no-effect `github.pr-merged` observation.
+  evidence: Round-3 blind hunter (R3B4): `src/dispatch/github-poll.ts` `applyMerged` returns silently for `isJobTerminal`; a binned lane is not poll-tracked, so the merge fact is never recorded. Untouched dispatch behavior; a design choice, not a bug.
+- source_spec: `_bmad-output/implementation-artifacts/spec-job-status-binned.md`
+  summary: Report-debt supersede can never fire when the newer report's target lane was discarded (binned) and the PR later merges.
+  evidence: Round-3 blind hunter (R3B5): `src/dispatch/durable-reconcile.ts:reportSupersedeReason` and `src/ledger/report-backfill.ts` recognize only merged siblings / `github.pr-merged`; untouched code, blocked on the R3B4 decision.
+- source_spec: `_bmad-output/implementation-artifacts/spec-job-status-binned.md`
+  summary: The TRACKERS KPI breakdown has no binned bucket, so a discarded lane inflates the board total without appearing in the strip.
+  evidence: Round-3 blind hunter (R3B6): `web/src/lib/board-kpi.ts` `jobStatusCounts` + `web/src/lib/board-rail.ts` breakdown. The strip is the concurrently-running dashboard-slim-strip lane's surface; deliberately not touched to avoid absorbing sibling work.

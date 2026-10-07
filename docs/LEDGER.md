@@ -54,7 +54,7 @@ coerced and no event is written for a rejected change.
 ```text
 job:    dispatched → working → delivered → in-review → merged | done
         (any non-terminal ⇄ blocked / parked as recoverable side-states;
-         merged/done are terminal; a PR registered before the turn
+         merged/done/binned are terminal; a PR registered before the turn
          settles keeps working → in-review legal)
         discard: ANY non-terminal → binned (terminal, no outbound edges;
          merged/done can NOT be binned)

@@ -40,7 +40,7 @@ context: []
 
 ## Code Map
 
-- `src/ledger/states.ts` -- `JOB_STATUSES`, `JOB_TERMINAL`, `JOB_TRANSITIONS`; `TERMINAL_JOB_STATUSES` derives from `JOB_TERMINAL`. Keep the existing declaration shapes (the web cross-build alarm parses `JOB_TERMINAL`).
+- `src/ledger/states.ts` -- `JOB_STATUSES`, `JOB_TRANSITIONS`, and the ONE terminal declaration `TERMINAL_JOB_STATUS_LIST` feeding `type TerminalJobStatus`, the `JOB_TERMINAL` set, `isJobTerminal` and `isTerminalJobStatus`; `TERMINAL_JOB_STATUSES` derives from the same predicate. The web cross-build alarm parses `TERMINAL_JOB_STATUS_LIST`.
 - `src/ledger/api.ts` -- `setJobStatus` calls `closeApplicableObligations(id, status)` for terminal targets; amendment/directive guards refuse terminal lanes (`isJobTerminal`).
 - `src/ledger/obligations.ts` -- `job-terminal` settlement kind/parse: `jobStatus: 'done' | 'merged' | 'binned'`.
 - `src/board/engine.ts` -- `prStateOf` (binned = closed receipt, null), `concludedJobs` receipt set, `isClosedReceipt`.
@@ -80,6 +80,7 @@ context: []
 - No subagent runtime is exposed to this lane's tool surface, so implementation is done directly from the spec (step-03's documented fallback); the built-in review runs as fresh tracked review jobs through `POST /api/dispatch` per the playbook.
 - Implementation commit `6cd0dd2c5a6e05b236a6a256d7c2fac3d79a0054` (spec `472d0f9`). `binned-static` PASS at 6cd0dd2 (lint/typecheck/build/web tsc, exit 0, capture `_bmad-output/binned-verify/binned-static-6cd0dd2.ndjson`, receipt sha256 1b8d5df7…). `binned-focused` PASS at 6cd0dd2 (backend 144 tests, 5 files; web 179 tests, 5 files; exit 0; capture `_bmad-output/binned-verify/binned-focused-6cd0dd2.ndjson`, receipt sha256 f0542a55…). `binned-baseline` RED at both legs as designed (backend 5 failed/137 passed; web 5 failed/174 passed; exit 1; capture `_bmad-output/binned-verify/binned-baseline-6cd0dd2.ndjson`, receipt sha256 b1a33a4c…) — failures are the new assertions at the pre-change base (unknown status "binned", assertion mismatches), never setup/compile failures.
 - Round-1 fix head `2bdfc4973aff53564b1bb6797a9d01036d203f47`, test repairs `d24551af308113a2e1d3bbab4d1da3d2ec344f82`. Gates at `d24551a`: `binned-static` PASS; `binned-focused` PASS (backend 16 files / 627 tests, web 5 files / 180 tests; full capture `_bmad-output/binned-verify/binned-focused-d24551af308113a2e1d3bbab4d1da3d2ec344f82-a4.ndjson`); `binned-heavy` PASS (4 targeted cases; capture `…-heavy-…-a5.ndjson`); `binned-baseline` RED both legs (5 backend + 6 web assertion failures; capture `…-baseline-…-a1.ndjson`). Queue waits beyond the capture helper's transport bound were handled by re-attaching under the SAME durable request id; the terminated attempts are preserved (admission-failed / UNKNOWN receipts) and are not PASS evidence.
+- Round-3 review (concluding pass) at `38a1d45`: edge-case 0; blind 13, verification-gap 2+1. The blocking round-2-hunk/artifact findings are repaired in the round-3 fix commit (comment repairs the round-2 log claimed but did not apply, spec Code Map, baseline pin-only exclusion disclosure, focus-fallback regression, delivered-then-binned supersession pin, plus the trivial comment/doc items); findings on untouched code are recorded in `_bmad-output/implementation-artifacts/deferred-work.md` as follow-ups (terminal merge-skip trace, durable-reconcile report debt, KPI binned bucket — the last also the sibling slim-strip surface).
 - Round-2 review fixes (head follows) close the second round's terminal-consumer gaps (child workers, branch idle, worktrees release, phase-handoff reconcile, ledger re-brief boundaries, pipeline exclusive scopes, awareness receipts), collapse the terminal declaration to ONE list feeding set/union/predicate, make the provider-recovery skip reason truthful for a discard, fix the binned disclosure focus fallback, and refresh the stale doc/role/skill enumerations.
 - Closed-receipt projections are deliberate: binned → `prState` null on both server and web (never an open-PR claim), needs-Gru suppressed, bound notification rows are receipts, obligations settle `{kind:'job-terminal', jobStatus:'binned'}`. Terminal fences in dispatch/provider-recovery/chat/telemetry now route through `isJobTerminal` so a binned lane can never be re-briefed, amended, directed, reviewed, re-dispatched or resurrected by a later merge signal.
 - Board filter: binned rows stay in COLD (complete count) and render only inside the expanded Cold section behind a second explicit `Show N binned records` disclosure; the badge is a dashed muted chip + dot with the visible word `binned`; the binned body keeps ALL rounds (merged/done stay quiescent).
@@ -139,6 +140,27 @@ Round 2 — three fresh tracked review jobs at `d24551af308113a2e1d3bbab4d1da3d2
 | R2V7 | verification-gap | pipeline exclusive-scope release unpinned for binned | medium | Real. Patched: a binned entry releases its scope and the same-scope entry clears. |
 
 No intent_gap/bad_spec loopback in either round. Round 3 (fresh whole-change review at the round-2 fix head) is the concluding pass before any READY claim.
+
+Round 3 — three fresh tracked review jobs at `38a1d452c6947205449de44f92e22d6af5f90700`, read-only, trees clean. Reports: `_bmad-output/binned-verify/reviews/r3-*.md` (+ provenance). Edge case 0 findings. Convergence classification per the review-convergence rule: blocking findings are those intersecting the round-2 fix hunks/decisions; new findings on untouched code are follow-ups (recorded in `deferred-work.md`, never dropped, no further review round).
+
+| ID | Layer | Finding (short) | Verdict | Evidence / disposition |
+|---|---|---|---|---|
+| R3B1 | blind | round-2 log claimed comment repairs that were never applied | low | Real (my log overstated the disposition; the stale comments remained). Patched: service.ts + board.ts comments actually repaired now; log row stands as made true. |
+| R3B2/R3VG-other | blind + VG | spec Code Map described the pre-R2B7 alarm shape | low | Real artifact drift. Patched: Code Map names `TERMINAL_JOB_STATUS_LIST` and its consumers. |
+| R3B3 | blind | baseline omitted the pin-only suite without disclosure | low | Real. Patched: the scope comment names the deliberate pin-only exclusion (a base overlay would fail on final pin counts, not behavior). |
+| R3VG1/R3B7 | VG + blind | the round-2 focus fallback had no regression test | medium | Real (revert ships green). Patched: DOM test focuses the binned disclosure, pushes a binned-free snapshot, asserts focus lands on the COLD shortcut. |
+| R3VG2 | VG | delivered-then-binned report non-supersession unpinned | medium | Real. Patched: backfill test delivers findings, bins the lane, asserts the older debt stays `obligation-opened`. |
+| R3B8 | blind | `jobFailing`'s binned arm unpinned | low | Real. Patched: the DOM binned row asserts no `board-job--alert` even with an aborted newest round. |
+| R3B9 | blind | `binnedExpanded` vanish/reappear behavior undecided | low | Real ambiguity. Decided and pinned as the existing session-disclosure convention (state survives pushes; collapse survives vanish/reappear). |
+| R3B10 | blind | board-engine test title no longer described the contract | low | Real. Patched (title names merged/done/binned). |
+| R3B11 | blind | `docs/LEDGER.md` machine block taught two terminal sets | low | Real. Patched. |
+| R3B12 | blind | OPERATIONS 200 bullet omitted the COLD count-only precondition | low | Real. Patched. |
+| R3B13 | blind | terminal comments in rebrief-recovery/branch-idle stale | low | Follow-up on untouched code; fixed opportunistically in the same commit (comment-only). |
+| R3B4 | blind | terminal merge-skip records no durable trace of the observed merge | low | Follow-up (untouched dispatch behavior — the binned lane is not poll-tracked; a recorded no-effect observation is a design choice): recorded in `deferred-work.md`. |
+| R3B5 | blind | report-debt supersede can never fire for a discarded target | low | Follow-up on untouched code (`durable-reconcile.ts`): recorded in `deferred-work.md`. |
+| R3B6 | blind | TRACKERS KPI strip has no binned bucket | low | Follow-up: the KPI strip is the concurrently-running slim-strip sibling's surface; deliberately not touched here. Recorded in `deferred-work.md`. |
+
+No intent_gap/bad_spec loopback in any round. The round-3 fixes (all inside the round-2 hunks or the spec/artifact) are re-verified at the new head; no further review round is run for the recorded follow-ups per the convergence rule.
 
 ## Design Notes
 

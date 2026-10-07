@@ -596,7 +596,11 @@ binned-static = "node tools/patch-vitest-rpc-timeout.mjs && npm run lint && npm 
 # compilation/import/setup failure would not be RED evidence. The
 # process-heavy suites the change touches are covered by `binned-heavy`
 # (the base cannot host their suite bytes without the heavy config
-# partition); this scope owns the fast-suite fail-before proof. The vitest
+# partition); this scope owns the fast-suite fail-before proof. The
+# PIN-ONLY suite-shape.test.ts is deliberately excluded: its overlain pin
+# counts describe the FINAL suite shape, so a base overlay fails on counts
+# rather than the new behavior — the behavioral fail-before evidence is
+# complete without it. The vitest
 # exits are echoed intact and never masked; a baseline leg that passes
 # unexpectedly is called out as a broken fail-before claim. The snapshot
 # directory and ignored pointer file are preserved for inspection; nothing
