@@ -626,11 +626,15 @@ export function sourceMovementSinceFreeze(review: FrozenReview, options?: Source
   }
 }
 
-/** A watch tick arriving this much later than scheduled means the process
- * was suspended (system sleep) — the same evidence the supervisor's wake
- * detector logs as "wall-clock gap detected". */
-const SUSPENSION_GAP_MS = 2_000;
-const SUSPENSION_TICK_MS = 250;
+/** Where a probe started, on every clock the OS suspend evidence needs. */
+export interface ProbeStart {
+  /** Wall clock (epoch ms) — compared with macOS's kernel wake time. */
+  readonly wallMs: number;
+  /** The budget clock. */
+  readonly monoMs: number;
+  /** Linux boot clock (ms, counts suspend), when available. */
+  readonly bootMs: number | null;
+}
 
 /** Test seams for the admission probe; production uses the defaults. */
 export interface AdmissionProbeSeams {
@@ -638,8 +642,8 @@ export interface AdmissionProbeSeams {
   readonly now?: () => number;
   /** One bounded git invocation (default execFile, killed at timeoutMs). */
   readonly exec?: (repoPath: string, args: readonly string[], timeoutMs: number) => Promise<string>;
-  /** Tick lateness that counts as a suspension (default 2 s). */
-  readonly suspensionGapMs?: number;
+  /** Did the OS really suspend after `start`? (default: kernel evidence). */
+  readonly suspendedSince?: (start: ProbeStart) => Promise<boolean>;
 }
 
 /** Whole milliseconds left for the next git step, or null once the budget
@@ -650,31 +654,50 @@ export function remainingTimeoutMs(deadline: number, now: number): number | null
   return remaining > 0 ? Math.ceil(remaining) : null;
 }
 
-const defaultProbeExec = async (repoPath: string, args: readonly string[], timeoutMs: number): Promise<string> =>
+export const defaultProbeExec = async (repoPath: string, args: readonly string[], timeoutMs: number): Promise<string> =>
   (await execFileAsPromised('git', ['-C', repoPath, ...args], {
     encoding: 'utf8', timeout: timeoutMs, maxBuffer: 1024 * 1024,
   })).stdout;
 
-/** Observe whether the process was suspended while the watch ran. Timer
- * lateness is measured on the budget clock; sampling on demand catches a
- * suspension that ended moments before the decision. */
-function watchSuspension(now: () => number, gapMs: number): { suspended(): boolean; stop(): void } {
-  let last = now();
-  let seen = false;
-  const sample = (): void => {
-    const current = now();
-    if (current - last > SUSPENSION_TICK_MS + gapMs) seen = true;
-    last = current;
-  };
-  const timer = setInterval(sample, SUSPENSION_TICK_MS);
-  timer.unref();
-  return {
-    suspended: () => {
-      sample();
-      return seen;
-    },
-    stop: () => clearInterval(timer),
-  };
+/** Linux CLOCK_BOOTTIME via /proc/uptime (it keeps counting through
+ * suspend, unlike Node's CLOCK_MONOTONIC). Null where unavailable. */
+function linuxBootClockMs(): number | null {
+  if (process.platform !== 'linux') return null;
+  try {
+    const seconds = Number.parseFloat(readFileSync('/proc/uptime', 'utf8').split(' ')[0] ?? '');
+    return Number.isFinite(seconds) ? seconds * 1000 : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Parse `sysctl -n kern.waketime` ("{ sec = 1790944289, usec = 208542 } …"). */
+export function parseKernWaketime(output: string): number | null {
+  const match = /sec\s*=\s*(\d+),\s*usec\s*=\s*(\d+)/u.exec(output);
+  return match === null ? null : Number(match[1]) * 1000 + Math.floor(Number(match[2]) / 1000);
+}
+
+/** Real OS evidence that the machine suspended after `start` — never a
+ * timer-lateness guess, so a long event-loop stall is not mistaken for
+ * sleep and a short sleep is not missed. macOS: the kernel's last wake is
+ * after the start. Linux: the boot clock ran ahead of the monotonic clock
+ * by more than a second. Anything unreadable is "no evidence" (fail closed:
+ * no retry). */
+async function osSuspendedSince(start: ProbeStart, now: () => number): Promise<boolean> {
+  try {
+    if (process.platform === 'darwin') {
+      const { stdout } = await execFileAsPromised('sysctl', ['-n', 'kern.waketime'], { encoding: 'utf8', timeout: 1_000 });
+      const wakeMs = parseKernWaketime(stdout);
+      return wakeMs !== null && wakeMs > start.wallMs;
+    }
+    if (start.bootMs !== null) {
+      const bootNow = linuxBootClockMs();
+      return bootNow !== null && (bootNow - start.bootMs) - (now() - start.monoMs) > 1_000;
+    }
+  } catch {
+    /* no evidence */
+  }
+  return false;
 }
 
 /** Async advertised-tip probe (gh-169 R4-6): the SAME fail-closed
@@ -684,13 +707,14 @@ function watchSuspension(now: () => number, gapMs: number): { suspended(): boole
  * timeouts return an explicit check-failed movement (fail-closed,
  * retryable), never silence and never a stall.
  *
- * System sleep (owner incident 2026-10-07): on macOS every Node clock —
- * performance.now() and the timers that kill a git step — keeps counting
- * through sleep (libuv uses mach_continuous_time), so a 51 s sleep spent
- * the whole budget and refused a healthy review. (Linux's CLOCK_MONOTONIC
- * pauses during suspend, so there the budget never pays for it.) When a
- * suspension overlapped a failed probe, the probe re-runs ONCE with a
- * fresh budget; a genuine stall without suspension is still refused
+ * Suspend (owner incident 2026-10-07, owner decision "retry once on real
+ * sleep evidence"): on macOS every Node clock — performance.now() and the
+ * timers that kill a git step — keeps counting through sleep (libuv uses
+ * mach_continuous_time); on Linux the clock pauses but a suspend can still
+ * break a git step's connection. When the OS proves it suspended during a
+ * probe that failed, the probe re-runs ONCE with a fresh budget and that
+ * second outcome is final. Without that evidence — a genuine stall, or an
+ * event loop blocked by the service's own work — the probe is refused
  * within the single deadline (R7-3). */
 export async function probeAdvertisedTipMovementAsync(
   review: FrozenReview,
@@ -699,14 +723,12 @@ export async function probeAdvertisedTipMovementAsync(
 ): Promise<SourceMovement | null> {
   const now = seams.now ?? (() => performance.now());
   const exec = seams.exec ?? defaultProbeExec;
-  const watch = watchSuspension(now, seams.suspensionGapMs ?? SUSPENSION_GAP_MS);
-  try {
-    const first = await probeAdvertisedTipOnce(review, timeoutMs, now, exec);
-    if (first === null || first.cause !== 'check-failed' || !watch.suspended()) return first;
-    return await probeAdvertisedTipOnce(review, timeoutMs, now, exec);
-  } finally {
-    watch.stop();
-  }
+  const suspendedSince = seams.suspendedSince ?? ((start: ProbeStart) => osSuspendedSince(start, now));
+  const start: ProbeStart = { wallMs: Date.now(), monoMs: now(), bootMs: linuxBootClockMs() };
+  const first = await probeAdvertisedTipOnce(review, timeoutMs, now, exec);
+  if (first === null || first.cause !== 'check-failed') return first;
+  if (!(await suspendedSince(start))) return first;
+  return probeAdvertisedTipOnce(review, timeoutMs, now, exec);
 }
 
 async function probeAdvertisedTipOnce(

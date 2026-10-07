@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { admissionPreflight, ReviewAdmissionError } from '../src/dispatch/perkins-review/admission.js';
-import { probeAdvertisedTipMovementAsync, remainingTimeoutMs } from '../src/dispatch/perkins-review/artifacts.js';
+import { defaultProbeExec, parseKernWaketime, probeAdvertisedTipMovementAsync, remainingTimeoutMs } from '../src/dispatch/perkins-review/artifacts.js';
 import {
   freezeReviewInputs,
   type FrozenReview,
@@ -593,75 +593,120 @@ describe('Perkins admission preflight (gh-169)', () => {
     }
   });
 
-  it('a system sleep between probe steps re-runs the probe once with a fresh budget (owner incident 2026-10-07)', async () => {
-    // macOS: Node's monotonic clock (mach_continuous_time) keeps counting
-    // through sleep. Model the incident's 51 s sleep: after the first read,
-    // the budget clock is 60 s ahead.
+  /** A scripted git for a branch-target probe: answers every step, records
+   * each call, and can run a hook (a clock jump, a failure) per call. */
+  function scriptedGit(targetSha: string, hook: (args: readonly string[], call: number) => void = () => {}) {
+    const calls: string[] = [];
+    const exec = async (_repo: string, args: readonly string[]): Promise<string> => {
+      calls.push(args[0]!);
+      hook(args, calls.length);
+      if (args[0] === 'rev-parse') return `refs/remotes/origin/${String(args.at(-1)).replace(/^origin\//u, '')}\n`;
+      if (args[0] === 'remote') return 'origin\n';
+      if (args[0] === 'ls-remote') return `${targetSha}\trefs/heads/feature\n`;
+      return '';
+    };
+    return { calls, exec };
+  }
+
+  it('a suspend between probe steps (OS evidence) restarts identification exactly once with a fresh budget', async () => {
     const review = branchTargetReview('sleep-between');
-    const realNow = performance.now.bind(performance);
-    let reads = 0;
-    const clock = vi.spyOn(performance, 'now').mockImplementation(() => realNow() + (reads++ === 0 ? 0 : 60_000));
-    try {
-      const movement = await probeAdvertisedTipMovementAsync(review, 5_000);
-      expect(movement?.detail ?? '').not.toContain('budget exhausted');
-      expect(movement).toBeNull();
-    } finally {
-      clock.mockRestore();
+    for (const evidence of [true, false]) {
+      let t = 0;
+      // The machine suspends right after the first step: the budget clock is
+      // 60 s further on when that step settles (macOS clocks count sleep).
+      const git = scriptedGit(review.manifest.targetSha, (args, call) => {
+        if (call === 1) t += 60_000;
+      });
+      const movement = await probeAdvertisedTipMovementAsync(review, 5_000, {
+        now: () => t,
+        exec: git.exec,
+        suspendedSince: async () => evidence,
+      });
+      if (evidence) {
+        expect(movement).toBeNull();
+        expect(git.calls).toEqual(['check-ref-format', 'check-ref-format', 'rev-parse', 'remote', 'ls-remote']);
+      } else {
+        expect(movement?.cause).toBe('check-failed');
+        expect(movement?.detail).toContain('budget exhausted after: git check-ref-format');
+        expect(git.calls).toEqual(['check-ref-format']);
+      }
     }
   });
 
-  it('a sleep while a git step is outstanding: its kill fires on wake, the probe re-runs once and admits', async () => {
+  it('a suspend while a real git step is outstanding: its kill lands on wake, the one retry admits', async () => {
     const review = branchTargetReview('sleep-outstanding');
     const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
     const shimDir = temp('admission-sleep-shim-');
     const marker = join(shimDir, 'stalled-once');
     const calls = join(shimDir, 'rev-parse-calls');
-    // The first rev-parse outlives the budget (the Mac slept under it); the
-    // retry's rev-parse answers normally.
     writeFileSync(
       join(shimDir, 'git'),
       `#!/bin/sh\ncase " $* " in *"rev-parse"*) echo x >> "${calls}"; if [ ! -f "${marker}" ]; then : > "${marker}"; sleep 3; fi;; esac\nexec "${realGit}" "$@"\n`,
     );
     chmodSync(join(shimDir, 'git'), 0o755);
-    const realNow = performance.now.bind(performance);
     let offset = 0;
-    const clock = vi.spyOn(performance, 'now').mockImplementation(() => realNow() + offset);
-    const sleeping = setTimeout(() => {
-      offset = 60_000; // 60 s of sleep passes while rev-parse is outstanding
-    }, 700);
     const oldPath = process.env.PATH;
     process.env.PATH = `${shimDir}:${oldPath ?? ''}`;
     try {
-      expect(await probeAdvertisedTipMovementAsync(review, 1_500)).toBeNull();
+      const movement = await probeAdvertisedTipMovementAsync(review, 1_500, {
+        now: () => performance.now() + offset,
+        // Barrier: the moment the first rev-parse is launched, the machine
+        // "sleeps" 60 s — the real execFile kill then fires on wake.
+        exec: (repo, args, timeoutMs) => {
+          const running = defaultProbeExec(repo, args, timeoutMs);
+          if (args[0] === 'rev-parse' && offset === 0) offset = 60_000;
+          return running;
+        },
+        suspendedSince: async () => true,
+      });
+      expect(movement).toBeNull();
       expect(readFileSync(calls, 'utf8').trim().split('\n')).toHaveLength(2);
     } finally {
-      clearTimeout(sleeping);
-      clock.mockRestore();
       if (oldPath === undefined) delete process.env.PATH;
       else process.env.PATH = oldPath;
     }
   });
 
-  it('a step that settles after the deadline fails closed — late success and late git rejection alike', async () => {
-    const review = branchTargetReview('late-settle');
+  it('a failed retry is final: its own check-failed detail, and never a third attempt', async () => {
+    const review = branchTargetReview('retry-fails');
     let t = 0;
-    const late = (settle: 'resolve' | 'reject') =>
-      probeAdvertisedTipMovementAsync(review, 1_000, {
-        now: () => t,
-        suspensionGapMs: Number.POSITIVE_INFINITY,
-        exec: async () => {
-          t += 1_500; // event-loop work delayed this completion past the budget
-          if (settle === 'reject') throw Object.assign(new Error('git: not a branch'), { code: 1 });
-          return 'refs/remotes/origin/feature/late-settle\n';
-        },
-      });
-    const success = await late('resolve');
-    expect(success).toMatchObject({ cause: 'check-failed' });
-    expect(success?.detail).toContain('budget exhausted after: git check-ref-format');
-    t = 0;
-    const rejection = await late('reject');
-    expect(rejection).toMatchObject({ cause: 'check-failed' });
-    expect(rejection?.detail).toContain('budget exhausted after: git check-ref-format');
+    const git = scriptedGit(review.manifest.targetSha, (args, call) => {
+      if (call === 1) t += 60_000; // suspend during the first attempt
+      if (call >= 2 && args[0] === 'rev-parse') throw new Error('fatal: unable to access the remote');
+    });
+    const movement = await probeAdvertisedTipMovementAsync(review, 5_000, {
+      now: () => t,
+      exec: git.exec,
+      suspendedSince: async () => true, // evidence even after the retry
+    });
+    expect(movement?.cause).toBe('check-failed');
+    expect(movement?.detail).toContain('unable to access the remote');
+    expect(git.calls.filter((call) => call === 'check-ref-format')).toHaveLength(2);
+  });
+
+  it('without OS suspend evidence a blocked event loop earns no retry — refused within the single deadline', async () => {
+    const review = branchTargetReview('stall-no-evidence');
+    let t = 0;
+    const git = scriptedGit(review.manifest.targetSha, (_args, call) => {
+      if (call === 1) t += 5_500; // the service's own work blocked the loop
+    });
+    let asked = 0;
+    const movement = await probeAdvertisedTipMovementAsync(review, 5_000, {
+      now: () => t,
+      exec: git.exec,
+      suspendedSince: async () => {
+        asked += 1;
+        return false;
+      },
+    });
+    expect(movement?.cause).toBe('check-failed');
+    expect(git.calls).toEqual(['check-ref-format']);
+    expect(asked).toBe(1);
+  });
+
+  it('reads macOS kernel wake evidence exactly', () => {
+    expect(parseKernWaketime('{ sec = 1790944289, usec = 208542 } Fri Oct  2 13:31:29 2026\n')).toBe(1_790_944_289_208);
+    expect(parseKernWaketime('sysctl: unknown oid')).toBeNull();
   });
 
   it('rounds a fractional remainder up for execFile and refuses a spent budget', () => {
