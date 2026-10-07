@@ -503,12 +503,18 @@ body {
     border-left: 2px solid var(--line);
   }
 
-  /* A 4th group (CHILDREN) wraps to a second grid row: the row's first
-     item gets a row separator instead of a stray left border at the
-     container edge (3-column grid; items 4, 7, … start a new row). */
+  /* Row-edge alignment for a 4th group (CHILDREN) wrapping to a second
+     grid row: the row's first item gets the row separator and no in-row
+     left padding (flush with the first column), the row's last item is
+     flush right — matching the 1-row layout's edges. */
+  .strip-group:nth-child(3n) {
+    padding-right: 0;
+  }
+
   .strip-group:nth-child(3n + 1):not(:first-child) {
     border-left: 0;
     border-top: 2px solid var(--line);
+    padding-left: 0;
   }
 }
 
@@ -1981,6 +1987,15 @@ body {
 
 .board-owner__disclose[aria-expanded='true'] {
   background: var(--accent-soft, var(--soft));
+}
+
+/* Themed focus ring for the band's controls (the UA default is not the
+   app's language; the disclosure is new, Ack/OPEN PR share the gap). */
+.board-owner__disclose:focus-visible,
+.board-owner__ack:focus-visible,
+.board-owner__open:focus-visible {
+  outline: 3px solid var(--work);
+  outline-offset: 2px;
 }
 
 /* Expanded region: metadata, verbatim detail, full consequence. All text

@@ -5,7 +5,7 @@ created: '2026-10-07'
 status: 'in-review'
 route: 'dispatch'
 baseline_commit: '49b558f243c7bacbfb46c7bc04f749bf131cefea'
-review_loop_iteration: 0
+review_loop_iteration: 1
 context: []
 ---
 
@@ -110,7 +110,7 @@ Round 1 (whole-change, three tracked lenses) reviewed `6e48023cfba4eade8130548cd
 | 4 | BH4 — wrapped CHILDREN group takes a stray left border / loses its row separator (`components.css`) | low | patch: `:nth-child(3n+1):not(:first-child)` row-separator rule in the 640px container; e2e computed-border assertions on the 4-group layout. |
 | 5 | BH5 — deferred-count slot not covered by geometry | medium | patch: `.board-wakes__deferred` added to the measured slot set; 999→1000 pairwise geometry case added to the deferred e2e test. |
 | 6 | BH6 — "one font, two floors" rationale mismatch (`4ch+1px` vs `4ch+1em`) | false | The claimed bad outcome (undetected 999→1000 growth in the sans strip slots, or user-visible dead space) is disproven at the reviewed head: every boundary pair, including those sans slots, measured equal boxes at 1440/1200/768/360; the band floor is invisible block padding. No shipped behavior follows from the comment wording. |
-| 7 | BH7 — A1 scoping probe skips `min-width` | low | patch: `expect(probe.minWidth).toBe('auto')` — the probe now fails on a global min-width leak too. |
+| 7 | BH7 — A1 scoping probe skips `min-width` | low | patch: probe now asserts `parseFloat(styles.probe.minWidth) || 0 === 0` (the first attempt asserted `toBe('auto')`; corrected in `e5ae13e` because Chromium resolves the unset value to `0px`). The probe now fails on both a global display leak and a global reservation leak. |
 | 8 | BH8 — contrast targets omit flag pills / group labels / detail meta | medium | patch: targets extended (flag text, group name+unit, detail meta+notice). Offline WCAG check of the actual tokens: flag 7.81/6.08, unit 5.04/5.82, detail meta 4.98/5.50 (light/dark) — the scheduled run re-verifies in-browser. |
 | 9 | BH9 + VG2 — mock smoke assertions pass on hidden collapse content | medium | patch: the smoke FOR YOU test now asserts collapsed-first, reveals each row, asserts `aria-expanded`, visible detail and visible consequence/evidence. |
 | 10 | BH10 — duplicate nested `aria-label`, h3-before-h2 group heads, N identical disclosure names | low | patch: inner `aria-label` removed (the rail already carries it); group heads are `h2` (as in the approved reference); each disclosure gets `aria-label="Review decision: <row title>"`. |
@@ -123,7 +123,21 @@ Round 1 (whole-change, three tracked lenses) reviewed `6e48023cfba4eade8130548cd
 
 Named checks (not findings): the two baselines overlay final test bytes on base `49b558f` and leave exits unmasked — both RED by feature absence (23 assertion-level failures + 1 missing-export TypeError inside a test; recorded as the honest consequence of the feature's absence, matching the original lane's accepted baseline shape). Dark-theme geometry runs light-only in the boundary loop; the dark coverage is the contrast assertions plus the inspected dark captures at all four widths.
 
-Round-1 resolution: all patch entries landed in commits `b030831` (main fixes + test hardening), `e5ae13e` (A1 probe zero-reservation), `64ab947` (real theme golden refresh for the CHILDREN separator fix, inspected). Re-verification at the fix head `64ab947`: `dashboard-slim-strip-unit` GREEN 137 (run 803e9f62); `strip-browser` GREEN 67 (run 041a281b); `strip-smoke` GREEN (run f9e4f0bf); `strip-themes` GREEN (run 734295fb); `dashboard-slim-strip-baseline` RED (run f5976535); `strip-browser-baseline` RED (run a0cf1b64); `typecheck` GREEN (run 371b6da9); `full` GREEN (run 3f23f291). Round-2 whole-change review commissioned at the fix head; its blocking scope is the fix delta `6e48023..<fix head>` (untouched-code findings report as follow-ups).
+Round-1 resolution: all patch entries landed in commits `b030831` (main fixes + test hardening), `e5ae13e` (A1 probe zero-reservation), `64ab947` (real theme golden refresh for the CHILDREN separator fix, inspected). Re-verification at the fix head `64ab947`: `dashboard-slim-strip-unit` GREEN 137 (run 803e9f62); `strip-browser` GREEN 67 (run 041a281b); `strip-smoke` GREEN (run f9e4f0bf); `strip-themes` GREEN (run 734295fb); `dashboard-slim-strip-baseline` RED (run f5976535); `strip-browser-baseline` RED (run a0cf1b64); `typecheck` GREEN (run 371b6da9); `full` GREEN (run 3f23f291). Round-2 whole-change review commissioned at `ddc42e4`; its blocking scope was the fix delta `6e48023..ddc42e4` (untouched-code findings reported as follow-ups).
+
+Round 2 reviewed `ddc42e431347443411158aeff50b8f9070c76f9d` (blind-hunter 13: 5 blocking + 8 follow-ups; edge-case 4: 3 blocking + 1 follow-up; verification-gap 6: 3 blocking + 3 follow-ups; plus other observations). Blocking entries were all patch; the cheap follow-ups were folded into the same batch; two breadth items are deferred (deferred-work.md).
+
+| # | Finding (surface) | Verdict | Route / evidence |
+|---|---|---|---|
+| R2-1 | Empty-band focus residual: the round-1 fallback has no target when the last row settles (both queries null) — focus still reaches `<body>`; the older-pending button itself was never captured across pushes (BH#1, EC#1, VG#3, VG-other) | medium | patch: `focusBandFallback()` prefers the older-pending control → first band control → the band heading (now `tabIndex=-1`); the capture also treats a focused `.board-band__more` as a band target; the click handler re-anchors focus after its own re-render. Unit tests: empty band, settle-with-remaining-row, more-push/activation. |
+| R2-2 | Round-1 a11y fixes unobserved: disclosure `aria-label` and `h2` heading level had no assertions; labels collide when titles repeat (BH#2, VG#1, EC#2) | medium | patch: the label now embeds the stable action id (`Review decision: <title> (<actionId>)`); unit assertions for both labels, the duplicate-title case, and the H2 tag; e2e label assertion. |
+| R2-3 | Wrapped 4th group kept 18px left padding and the row's last item lost its flush-right edge (BH#3, EC#3) | low | patch: row-edge padding rules in the 640px container; e2e computed padding assertions alongside the border assertions. |
+| R2-4 | `.strip-kpi__num--alert` contrast never rendered/measured (the fixture pinned `conflicting: 0` and the target list lacked the class) (BH#4) | medium | patch: contrast fixture now renders `conflicting: 3`; `alertKpi` target added. |
+| R2-5 | Spec triage row 7 quoted the pre-fix assertion; the shipped assertion read a resolved value (BH#5, EC note) | low | patch: row corrected; shipped assertion hardened to `parseFloat(...) || 0` and re-run. |
+
+Follow-ups folded into the same batch (reported, not dropped): silas `FAILED` pure-text split pinned and every chip's split completeness asserted (BH#6, BH#8); per-group/per-KPI tooltip+aria assertions (VG follow-up); baseline scopes now `exit 2` on an unexpected GREEN (`FAILS-BEFORE CLAIM BROKEN` marker, the sibling convention) (BH#7, VG#2); 4-group (CHILDREN) slot geometry parameterized and compared pairwise (BH#10); `board-rail.ts` module docs reconciled with the v7 strip (BH#11); spec head/iteration recorded (BH#12); themed `:focus-visible` ring for the band controls + e2e outline assertion (BH#13); long-label phone leg at 360 (VG#3).
+
+Deferred (recorded in `deferred-work.md`): baseline failure-kind assertion (build/import RED vs behavioral RED) and narrow-width wake-age/deferred boundary legs.
 
 ## Design Notes
 

@@ -458,12 +458,16 @@ export class BoardView {
     // vs Ack vs OPEN PR are distinct targets, never lookalikes).
     const active = document.activeElement;
     const inBand = active instanceof HTMLElement && mount.contains(active);
+    const moreFocused = inBand && active.classList.contains('board-band__more');
     const focusId = inBand ? active.dataset.actionId ?? null : null;
     const focusControl = inBand ? active.dataset.control ?? '' : '';
     const bandVisible = !mount.hidden && mount.closest('[hidden]') === null;
     mount.replaceChildren();
     const head = el('h2', 'board-band__head');
     head.id = 'board-owner-head';
+    // Programmatically focusable so the fallback path can anchor focus on
+    // the band itself when no control remains (never <body>).
+    head.tabIndex = -1;
     const count = el('span', 'board-band__count lbl');
     count.append(el('span', 'num board-band__count-num', String(rows.length)), document.createTextNode(' pending'));
     head.append(el('span', 'board-band__label', 'FOR YOU'), count);
@@ -504,6 +508,9 @@ export class BoardView {
         more.addEventListener('click', () => {
           this.ownerExpanded = true;
           if (this.snapshot !== null) this.render(this.snapshot);
+          // The control disappeared with the expansion: anchor focus on an
+          // intentional band target (usually the first revealed row).
+          this.focusBandFallback();
         });
         mount.append(more);
       }
@@ -511,13 +518,23 @@ export class BoardView {
     if (focusId !== null) {
       // The exact control is gone (row settled, or pushed outside the
       // older-pending window): focus must land on an intentional band
-      // target, never fall to <body> — the +N older-pending control when
-      // present, else the first remaining band control.
-      if (!this.refocusAction(focusId, focusControl)) {
-        (mount.querySelector<HTMLElement>('.board-band__more') ??
-          mount.querySelector<HTMLElement>('[data-action-id]'))?.focus();
-      }
+      // target, never fall to <body>.
+      if (!this.refocusAction(focusId, focusControl)) this.focusBandFallback();
+    } else if (moreFocused) {
+      // The older-pending control itself was focused: its own activation
+      // re-renders the band, so restore to an intentional target too.
+      this.focusBandFallback();
     }
+  }
+
+  /** Focus target inside the owner band when the previously focused
+   * control is gone: the older-pending control when it still exists, else
+   * the first remaining control, else the band heading (programmatically
+   * focusable) — never <body>. */
+  private focusBandFallback(): void {
+    (this.ownerMount.querySelector<HTMLElement>('.board-band__more') ??
+      this.ownerMount.querySelector<HTMLElement>('[data-action-id]') ??
+      this.ownerMount.querySelector<HTMLElement>('.board-band__head'))?.focus();
   }
 
   /** Collision-free DOM identity: region ids are ALLOCATED per action id
@@ -551,8 +568,9 @@ export class BoardView {
     disclose.className = 'board-owner__disclose';
     disclose.textContent = 'Review decision';
     // Unique accessible name per row: N indistinguishable "Review decision"
-    // buttons are not usable in a screen reader's control list.
-    disclose.setAttribute('aria-label', `Review decision: ${label}`);
+    // buttons are not usable in a screen reader's control list; the action
+    // id disambiguates rows that share a title.
+    disclose.setAttribute('aria-label', `Review decision: ${label} (${actionId})`);
     disclose.dataset.actionId = actionId;
     disclose.dataset.control = 'disclose';
     disclose.setAttribute('aria-controls', this.ownerRegionId(actionId));

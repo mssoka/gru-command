@@ -489,6 +489,11 @@ describe('board v7 — slim status strip (pill rail replaced)', () => {
     expect(groups).toHaveLength(3);
     const names = [...groups].map((node) => node.querySelector('.strip-group__name')?.textContent);
     expect(names).toEqual(['HEISTS', 'PRS', 'CREW']);
+    // Group heads are h2 (approved reference heading level, fixes the
+    // h3-before-h2 document order).
+    for (const head of document.querySelectorAll('.strip-group__head')) {
+      expect(head.tagName).toBe('H2');
+    }
   });
 
   it('renders deploy drift with the restart-pending flag when behind', () => {
@@ -613,6 +618,12 @@ describe('board v7 — slim status strip (pill rail replaced)', () => {
     expect(groupNames.some((text) => text.includes('MINIONS'))).toBe(false);
     // The trackers chip's long-form explanation survives the re-face.
     expect(document.querySelector<HTMLElement>('.strip-groups')?.title).toContain('Jev decision routing');
+    // Per-group and per-KPI explanations (title/AT text) survive too.
+    const firstPairs = document.querySelector<HTMLElement>('.strip-group__pairs');
+    expect(firstPairs?.getAttribute('title')).toBeTruthy();
+    const firstKpi = firstPairs?.querySelector<HTMLElement>('.strip-kpi');
+    expect(firstKpi?.querySelector('.strip-kpi__k')?.getAttribute('title')).toBeTruthy();
+    expect(firstKpi?.querySelector('.strip-kpi__num')?.getAttribute('title')).toBeTruthy();
   });
 
   it('keeps the Jev chip; the needs-Gru number renders once, on the ALERTS pair', () => {
@@ -2710,6 +2721,29 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     // The disclosure is a real button with aria wiring (native Enter/Space).
     expect(discloseA.tagName).toBe('BUTTON');
     expect(discloseA.getAttribute('aria-controls')).toMatch(/^fy-detail-\d+$/);
+    // Unique accessible name per row (row title + stable action id).
+    expect(discloseA.getAttribute('aria-label')).toBe('Review decision: Notice row-a (owner-ack:row-a)');
+    expect(discloseB.getAttribute('aria-label')).toBe('Review decision: Notice row-b (owner-ack:row-b)');
+  });
+
+  it('rows that share a title still get distinct disclosure names (unique per action id)', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        notifications: [
+          notification('dup-1', { routing: 'needs-owner', title: 'Repeated notice' }),
+          notification('dup-2', { routing: 'needs-owner', title: 'Repeated notice' }),
+        ],
+      }),
+    );
+    const labels = [...document.getElementById('board-owner')!.querySelectorAll<HTMLElement>('[data-control="disclose"]')].map(
+      (node) => node.getAttribute('aria-label'),
+    );
+    expect(labels).toEqual([
+      'Review decision: Repeated notice (owner-ack:dup-1)',
+      'Review decision: Repeated notice (owner-ack:dup-2)',
+    ]);
+    expect(new Set(labels).size).toBe(2);
   });
 
   it('the collapsed face stays short: title as Problem + typed Next step; full detail and consequence live expanded', () => {
@@ -2750,8 +2784,53 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(prFace.textContent).toContain('ready for you');
     expect(prFace.textContent).toContain('Open the pull request on GitHub');
     expect(prFace.textContent).not.toContain('CI green');
+    expect(prRow.querySelector('[data-control="disclose"]')?.getAttribute('aria-label')).toBe(
+      'Review decision: Heist face-pr (owner-pr:face-pr)',
+    );
     prRow.querySelector<HTMLButtonElement>('[data-control="disclose"]')!.click();
     expect(prRow.querySelector<HTMLElement>('.board-owner__detail')?.textContent).toContain('CI green');
+  });
+
+  it('an emptied band keeps focus inside the band (never <body>) when the focused row settles', () => {
+    const view = new BoardView(() => {});
+    const only = notification('only-row', { routing: 'needs-owner' });
+    view.render(snapshot({ notifications: [only] }));
+    const disclose = document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('[data-action-id="owner-ack:only-row"][data-control="disclose"]')!;
+    disclose.focus();
+    expect(document.activeElement).toBe(disclose);
+    view.render(snapshot({ notifications: [{ ...only, ackedAt: '2026-01-01T00:09:00.000Z' }] }));
+    const band = document.getElementById('board-owner')!;
+    expect(band.querySelector('.board-owner__row')).toBeNull();
+    expect(band.contains(document.activeElement)).toBe(true);
+    expect(document.activeElement).toBe(band.querySelector('.board-band__head'));
+  });
+
+  it('settling the focused row with rows remaining keeps focus on a remaining band control', () => {
+    const view = new BoardView(() => {});
+    const stay = notification('stay', { routing: 'needs-owner' });
+    const leave = notification('leave', { routing: 'needs-owner' });
+    view.render(snapshot({ notifications: [stay, leave] }));
+    const leaveDisclose = document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('[data-action-id="owner-ack:leave"][data-control="disclose"]')!;
+    leaveDisclose.focus();
+    view.render(snapshot({ notifications: [stay, { ...leave, ackedAt: '2026-01-01T00:09:00.000Z' }] }));
+    const band = document.getElementById('board-owner')!;
+    expect(band.querySelector('.board-band__more')).toBeNull();
+    expect(document.activeElement).toBe(
+      band.querySelector('[data-action-id="owner-ack:stay"][data-control="disclose"]'),
+    );
+  });
+
+  it('keeps focus intentional when the older-pending control itself re-renders or disappears', () => {
+    const view = new BoardView(() => {});
+    const stops = Array.from({ length: 9 }, (_, i) =>
+      notification(`m-${String(i).padStart(2, '0')}`, { routing: 'needs-owner', ts: `2026-01-01T00:${String(i).padStart(2, '0')}:00.000Z` }),
+    );
+    view.render(snapshot({ notifications: stops }));
+    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-band__more')!.focus();
+    view.render(snapshot({ notifications: stops }));
+    expect(document.activeElement).toBe(document.getElementById('board-owner')!.querySelector('.board-band__more'));
+    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-band__more')!.click();
+    expect(document.getElementById('board-owner')!.contains(document.activeElement)).toBe(true);
   });
 
   it('region ids are allocated per action id — `a_b` and `a-b` never collide', () => {

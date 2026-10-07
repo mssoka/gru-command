@@ -407,9 +407,9 @@ interface Geometry {
  * neighboring a measured numeric slot is captured beside its geometry.
  * The mutable numbers themselves are asserted by the tests BEFORE each
  * measurement — never folded into this comparison. */
-async function geometry(page: Page, opts: { expectOlder?: boolean } = {}): Promise<Geometry> {
+async function geometry(page: Page, opts: { expectOlder?: boolean; expectedKpis?: number } = {}): Promise<Geometry> {
   return page.evaluate(
-    ({ expectOlder }) => {
+    ({ expectOlder, expectedKpis }) => {
       const rail = document.getElementById('chip-rail');
       if (!rail) throw new Error('missing #chip-rail');
       const box = (el: Element): { x: number; y: number; w: number; h: number } => {
@@ -433,7 +433,7 @@ async function geometry(page: Page, opts: { expectOlder?: boolean } = {}): Promi
       if (rail.querySelectorAll('.strip-pair').length !== 6) throw new Error('expected 6 status pairs');
       if (rail.querySelectorAll('.strip-group').length !== 3) throw new Error('expected 3 count groups');
       if (rail.querySelectorAll('.strip-key').length !== 6) throw new Error('expected 6 status keys');
-      if (rail.querySelectorAll('[data-kpi]').length !== 13) throw new Error('expected 13 data-kpi slots');
+      if (rail.querySelectorAll('[data-kpi]').length !== expectedKpis) throw new Error(`expected ${expectedKpis} data-kpi slots`);
       const strip = need(rail, '.strip-status');
       positive(strip, '.strip-status');
       const band = document.getElementById('board-owner');
@@ -498,7 +498,7 @@ async function geometry(page: Page, opts: { expectOlder?: boolean } = {}): Promi
         },
       };
     },
-    { expectOlder: opts.expectOlder ?? false },
+    { expectOlder: opts.expectOlder ?? false, expectedKpis: opts.expectedKpis ?? 13 },
   );
 }
 
@@ -1057,6 +1057,21 @@ test('long labels wrap as text; the long notification reveals its COMPLETE origi
     ACK_CONSEQUENCE,
   ]);
   expect(ackCalls).toEqual([]);
+  // Phone leg: the same long labels must wrap honestly in the ≤560px
+  // stacked band without horizontal overflow (body, band, or detail box).
+  await page.setViewportSize({ width: 360, height: 740 });
+  const phoneOverflow = await page.evaluate(() => {
+    const band = document.getElementById('board-owner')!;
+    const details = [...band.querySelectorAll<HTMLElement>('.board-owner__detail')];
+    return {
+      body: document.documentElement.scrollWidth > document.documentElement.clientWidth,
+      band: band.scrollWidth > band.clientWidth,
+      detail: details.every((node) => node.scrollWidth <= node.clientWidth + 1),
+    };
+  });
+  expect(phoneOverflow.body).toBe(false);
+  expect(phoneOverflow.band).toBe(false);
+  expect(phoneOverflow.detail).toBe(true);
 });
 
 test('keyboard reveal on independent Ack and PR rows sends nothing; Ack, OPEN PR, and disclosure focus survive refresh and full reconnect', async ({ page }) => {
@@ -1084,6 +1099,11 @@ test('keyboard reveal on independent Ack and PR rows sends nothing; Ack, OPEN PR
   await ackDisclose.focus();
   await page.keyboard.press('Enter');
   await expect(ackDisclose).toHaveAttribute('aria-expanded', 'true');
+  // Unique accessible name per disclosure (row identity in the AT list).
+  await expect(ackDisclose).toHaveAttribute('aria-label', /^Review decision: .+\(owner-ack:pend-0000\)$/);
+  // Themed keyboard focus ring on the new control (:focus-visible after a
+  // keyboard interaction).
+  expect(await ackDisclose.evaluate((el) => getComputedStyle(el).outlineWidth)).toBe('3px');
   // The button is literally labeled Ack; the FULL consequence and the
   // complete original detail sit in the same row's visible region,
   // beside the control, BEFORE any activation.
@@ -1163,7 +1183,9 @@ test('keyboard reveal on independent Ack and PR rows sends nothing; Ack, OPEN PR
 
 test('essential text and numbers hold >=4.5:1 contrast in both themes', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
-  await harness(page, makeSnapshot(familyA(4)));
+  // conflicting > 0 so the loudest KPI ink (`.strip-kpi__num--alert`) is
+  // actually rendered and measured, not merely listed as a target.
+  await harness(page, makeSnapshot(slotSpec({ ...familyA(4), conflicting: 3 })));
   await expectStripFamilies(page, familyAFamilies(4));
   const measure = (): Promise<Record<string, number>> =>
     page.evaluate(() => {
@@ -1199,6 +1221,7 @@ test('essential text and numbers hold >=4.5:1 contrast in both themes', async ({
         kpiNum: '.strip-kpi__num',
         groupName: '.strip-group__name',
         groupUnit: '.strip-group__unit',
+        alertKpi: '.strip-kpi__num--alert',
         wakeCount: '.board-wakes__count',
         ownerTitle: '.board-owner__title',
         ownerNext: '.board-owner__next',
@@ -1255,21 +1278,32 @@ test('CHILDREN group appears only when the server reported counters (absent is n
   await expect(children.locator('[data-kpi="children.queued"]')).toHaveText('3');
   await expect(children.locator('[data-kpi="children.finished"]')).toHaveText('5');
   await expect(children.locator('[data-kpi="children.lifetimeCreations"]')).toHaveText('10');
-  // The wrapped 4th group gets a row separator, not a stray left border
-  // at the container edge; the in-row separator stays on its neighbours.
+  // The wrapped 4th group gets a row separator, no stray left border, and
+  // row-edge alignment (left flush with the first column; the row's last
+  // item flush right) — matching the 1-row layout's edges.
   const separators = await page.evaluate(() => {
     const groups = [...document.querySelectorAll<HTMLElement>('#chip-rail .strip-group')];
-    const read = (el: Element | undefined): { left: string; top: string } => {
+    const read = (el: Element | undefined): { left: string; top: string; padLeft: string; padRight: string } => {
       if (!el) throw new Error('missing group');
       const s = getComputedStyle(el);
-      return { left: s.borderLeftWidth, top: s.borderTopWidth };
+      return { left: s.borderLeftWidth, top: s.borderTopWidth, padLeft: s.paddingLeft, padRight: s.paddingRight };
     };
-    return { first: read(groups[0]), second: read(groups[1]), wrapped: read(groups[3]) };
+    return { first: read(groups[0]), second: read(groups[1]), third: read(groups[2]), wrapped: read(groups[3]) };
   });
   expect(separators.first.left).toBe('0px');
   expect(separators.second.left).toBe('2px');
   expect(separators.wrapped.left).toBe('0px');
   expect(separators.wrapped.top).toBe('2px');
+  expect(separators.first.padLeft).toBe('0px');
+  expect(separators.wrapped.padLeft).toBe('0px');
+  expect(separators.third.padRight).toBe('0px');
+  // The wrapped layout is auditable too: same reserved-slot geometry across
+  // two 4-group states (zero → non-zero values in the same slots).
+  const childrenZero = await geometry(page, { expectedKpis: 17 });
+  await send(makeSnapshot(slotSpec({ children: { active: 4, queued: 0, finished: 6, lifetimeCreations: 20 } })));
+  await expect(children.locator('[data-kpi="children.lifetimeCreations"]')).toHaveText('20');
+  const childrenNext = await geometry(page, { expectedKpis: 17 });
+  comparePairwise(childrenZero, childrenNext);
   // The extra group wraps honestly: no body or rail overflow at phone width.
   await page.setViewportSize({ width: 360, height: 800 });
   const overflow = await page.evaluate(
@@ -1370,5 +1404,5 @@ test('A1: the reserved numeric slot is scoped — an unrelated surface keeps the
   // unscoped baseline the global rule would have made it inline-block and
   // reserved ~4ch.
   expect(styles.probe.display).toBe('inline');
-  expect(parseFloat(styles.probe.minWidth)).toBe(0);
+  expect(parseFloat(styles.probe.minWidth) || 0).toBe(0);
 });

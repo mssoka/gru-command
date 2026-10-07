@@ -384,4 +384,44 @@ describe('board rail — numeric part splits for the slim strip', () => {
     expect(none.value).toBe('no wakes yet');
     expect(none.valueSplit).toEqual({ lead: '', num: null, unit: 'no wakes yet' });
   });
+
+  it('carries a reserved-slot split contract on every chip: FAILED stays pure text, no split is left empty', () => {
+    const failed = railChips(
+      base({
+        silas: silasIdle({
+          reconcileFailedNewer: true,
+          lastReconcileFailedAt: new Date(Date.now() - 5 * 60_000).toISOString(),
+        }),
+      }),
+    ).find((c) => c.id === 'silas')!;
+    // A text-only flag (no numeric part) never fabricates a reserved slot.
+    expect(failed.flag).toBe('FAILED');
+    expect(failed.flagSplit).toBeNull();
+    // Every health card's presentation split is populated from its own
+    // derivation — a new card that forgot the split would be caught here
+    // before the DOM fallback could silently print a bare value.
+    const chips = railChips(
+      base({
+        build: {
+          buildRev: 'a'.repeat(40),
+          buildCommittedAt: '2026-01-01T00:00:00.000Z',
+          originMainRev: 'b'.repeat(40),
+          originMainCommittedAt: '2026-01-01T00:00:00.000Z',
+          commitsBehind: 0,
+          checkedAt: '2026-01-01T00:00:00.000Z',
+          checkError: null,
+        },
+        silas: silasIdle({ lastWakeAt: new Date(Date.now() - 60_000).toISOString() }),
+        verify: { lockInUse: false, activeRuns: 0, queuedRuns: 0, workerBudget: 8, workersPerRun: 4 },
+        selfHeal: { sessionsResumed: 0, sessionsOrphaned: 0, since: null },
+      }),
+    ).filter((chip) => chip.id !== 'trackers');
+    expect(chips).toHaveLength(6);
+    for (const chip of chips) {
+      expect(
+        chip.valueSplit.lead !== '' || chip.valueSplit.num !== null || chip.valueSplit.unit !== '',
+        `${chip.id} value split populated`,
+      ).toBe(true);
+    }
+  });
 });

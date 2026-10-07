@@ -134,3 +134,12 @@
 ## Deferred from: code review of PR #241 / issue #117 (2026-10-06)
 
 - verificationFailures digest rows with a null scope can never follow the `verification-failure:<scope>@<run_id>` fingerprint discipline: the retirement fingerprints are only built when scope is non-null, so a null-scope failure row can only retire via resubmission (impossible for null scope) or terminality. Pre-existing digest identity gap (unchanged by #117, which only names the pre-existing instruction as the `verification-repair` rule). Fix: give the null-scope row an actionable identity or withhold the rule offer.
+
+## Deferred from: bmad-build review of dashboard-slim-strip-current-main (2026-10-07)
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
+  summary: The two fail-before baseline scopes guard an unexpected GREEN but cannot distinguish a behavioral feature-absence RED from a build/import/collection failure.
+  evidence: The scopes now terminate exit 2 on an unexpected pass (`FAILS-BEFORE CLAIM BROKEN`) and keep the real exit otherwise; adding the binned-baseline failure-kind assertion (`tools/assert-binned-baseline.mjs` pattern: per-leg JSON reporter + named-behavioral-failure check) needs a lane helper and a re-verified run. The recorded REDs (runs e7bf5e64/f5976535, 6bda4166/a0cf1b64) are behavioral today.
+- source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
+  summary: The wake-age and deferred-count digit-boundary legs (9→10, 99→100, 999→1000) run at 1440 only, while the acceptance names 1440/1200/768/360.
+  evidence: The familyA/B/C boundary loops cover all four viewports for the other slots and the reserved-slot CSS is shared, but the age/deferred slots cross their own boundaries at one width only; extend the two long tests with narrow-width legs at the next suite touch (the long-label test now has a 360 leg).

@@ -1,15 +1,17 @@
 /**
- * Status chip rail (board UX v6): the v4 health row RELOCATED to a
- * full-width rail under the command bar — one glance = whole-system
- * state, on every view (chat or board). Seven chips in a fixed order:
- * deploy, reviews, silas, alerts, verify, cure, trackers.
+ * Status derivation rail (board UX v7): the v4 health row + folded counts
+ * rendered as the slim strip's status pairs and count groups (see
+ * `board.ts` for the DOM). Seven chips in a fixed order: deploy, reviews,
+ * silas, alerts, verify, cure, trackers.
  *
  * The heist/PR/minion counts folded into the TRACKERS chip come from the
- * SAME `boardKpis` derivation the v4 KPI strip used, so the rail can
+ * SAME `boardKpis` derivation the v4 KPI strip used, so the strip can
  * never disagree with the numbers it replaced. Each number carries its
- * v4 KPI key (`data-kpi`) — the rail's contract with the rest of the
- * board — and v6.1 gives every number its own visible field label (no
- * bare slash counters; owner ruling 5).
+ * v4 KPI key (`data-kpi`) — the strip's contract with the rest of the
+ * board — and v6.1's rule survives: every number has its own visible
+ * field label (no bare slash counters; owner ruling 5). The presentation
+ * splits (`valueSplit`/`flagSplit`) are reserved-slot hints only; `value`
+ * keeps the exact derived string.
  */
 
 import { healthCards, type FlagSplit, type HealthTone, type ValueSplit } from './board-health.js';
