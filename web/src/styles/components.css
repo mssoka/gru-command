@@ -2113,6 +2113,56 @@ body {
   color: var(--ink);
 }
 
+/* Megaminions: the specialists a heist's minion commissioned nest under
+   it — a family chip on the parent's meta line, live specialists as
+   indented sub-rows hung off one guide line (├/└ ticks), concluded ones
+   inside the expanded body. A nested row is a quieter, single-indent
+   twin of the parent row. */
+.board-job__family-chip,
+.board-job__parent {
+  font-weight: 800;
+  color: var(--ink);
+}
+
+.board-job__family {
+  display: grid;
+  margin: 2px 0 0 42px;
+  border-left: 1px solid color-mix(in srgb, var(--line) 55%, transparent);
+  cursor: auto;
+}
+
+.board-job__family--concluded {
+  margin-left: 0;
+  border-top: 1px solid color-mix(in srgb, var(--line) 30%, transparent);
+  padding-top: 8px;
+}
+
+.board-job__family-label {
+  padding-left: 12px;
+  font-size: 10px;
+  color: var(--faint);
+  text-transform: uppercase;
+}
+
+.board-job--child {
+  position: relative;
+  padding: 4px 6px 5px 12px;
+  border-bottom: 0;
+}
+
+.board-job--child::before {
+  content: '';
+  position: absolute;
+  top: 15px;
+  left: 0;
+  width: 8px;
+  border-top: 1px solid color-mix(in srgb, var(--line) 55%, transparent);
+}
+
+.board-job--child .board-job__meta {
+  padding-left: 30px;
+}
+
 /* The expanded row: the v3 detail in one box — the only card allowed. */
 .board-job__body {
   display: grid;

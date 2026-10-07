@@ -86,6 +86,13 @@ export default defineConfig({
       use: { baseURL: `http://localhost:${PREVIEW_PORT}` },
     },
     {
+      // Megaminion nesting proof: synthetic WebSocket-seeded snapshots;
+      // specialists nest under their heist and never count as heists.
+      name: 'megaminions',
+      testMatch: 'megaminions.spec.ts',
+      use: { baseURL: `http://localhost:${PREVIEW_PORT}` },
+    },
+    {
       name: 'real',
       testMatch: 'real-server.spec.ts',
       use: { baseURL: `http://localhost:${REAL_PORT}` },

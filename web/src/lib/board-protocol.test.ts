@@ -109,6 +109,22 @@ describe('board server-frame validator', () => {
     expect(isValidSnapshot(board)).toBe(true);
   });
 
+  it('accepts an absent or null parent job (top-level heist), rejects a malformed one', () => {
+    const board = snapshot();
+    const job = board.repos[0]!.jobs[0]! as { id: string; parentJobId?: unknown };
+    expect(isValidSnapshot(board)).toBe(true); // older server: no field
+    job.parentJobId = null;
+    expect(isValidSnapshot(board)).toBe(true);
+    job.parentJobId = 'impl';
+    expect(isValidSnapshot(board)).toBe(true);
+    job.parentJobId = '  ';
+    expect(isValidSnapshot(board)).toBe(false);
+    job.parentJobId = 7;
+    expect(isValidSnapshot(board)).toBe(false);
+    job.parentJobId = job.id; // a job is never its own megaminion
+    expect(isValidSnapshot(board)).toBe(false);
+  });
+
   it('rejects malformed frames (wrong shapes, missing fields, non-objects)', () => {
     expect(parseBoardServerFrame(null)).toBeNull();
     expect(parseBoardServerFrame('board')).toBeNull();

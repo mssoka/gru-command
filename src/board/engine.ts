@@ -104,6 +104,9 @@ export interface JobView {
   readonly lane: LaneView | null;
   /** Newest lastActivity across the job's bound agents (null when none). */
   readonly lastAgentActivity: string | null;
+  /** The commissioning job when this one is a megaminion (a specialist a
+   * minion dispatched); null for a top-level heist. */
+  readonly parentJobId: string | null;
 }
 
 /** Issue #171 runtime ownership: the agent ids the LIVE process owns
@@ -1043,6 +1046,7 @@ export class BoardEngine {
           ? null
           : { branch: lane.branch, sha: lane.sha, status: lane.status, createdAt: lane.createdAt },
       lastAgentActivity,
+      parentJobId: job.parentJobId,
     };
   }
 

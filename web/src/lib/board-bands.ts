@@ -24,6 +24,7 @@ import {
   type BoardSnapshot,
   type JobView,
 } from './board-protocol.js';
+import { isLiveMegaminion, jobFamilies, type JobFamilies } from './board-family.js';
 import { derivedPrState } from './board-kpi.js';
 import { isSameLocalDay } from './board-time.js';
 
@@ -346,10 +347,9 @@ export interface BandedJobs {
 export function bucketJobs(jobs: readonly JobView[], opts: BucketOptions = {}): readonly BandedJobs[] {
   const byBand = new Map<BandId, BandedJob[]>();
   for (const job of jobs) {
-    const band = bandForJob(job, opts);
-    const entry: BandedJob = { job, band, stale: isStalledWorking(job, opts) };
-    const group = byBand.get(band);
-    if (group === undefined) byBand.set(band, [entry]);
+    const entry = bandedJob(job, opts);
+    const group = byBand.get(entry.band);
+    if (group === undefined) byBand.set(entry.band, [entry]);
     else group.push(entry);
   }
   return BAND_ORDER.filter((band) => (byBand.get(band)?.length ?? 0) > 0).map((band) => ({
@@ -361,13 +361,31 @@ export function bucketJobs(jobs: readonly JobView[], opts: BucketOptions = {}): 
   }));
 }
 
-/** Bucket a whole snapshot (all repos flattened — a repo's jobs can land
- * in different bands; the UI re-groups by repo inside each band). */
-export function bucketSnapshot(snapshot: BoardSnapshot, opts: BucketOptions = {}): readonly BandedJobs[] {
-  return bucketJobs(
+/** One job's band entry (band + stall flag) under the bucket options. */
+export function bandedJob(job: JobView, opts: BucketOptions = {}): BandedJob {
+  return { job, band: bandForJob(job, opts), stale: isStalledWorking(job, opts) };
+}
+
+/** Megaminion nesting for a whole snapshot. A child nests under its
+ * present parent unless it is surfaced as its own top-level row:
+ *   - its own cause is NEEDS-YOU (the cascade promoter outranks nesting);
+ *   - it is still running while its heist is NOT in flight — a settled,
+ *     cold or machine-queue parent sits behind a preview window or a
+ *     collapsed disclosure, and running work must never hide there. */
+export function snapshotFamilies(snapshot: BoardSnapshot, opts: BucketOptions = {}): JobFamilies {
+  return jobFamilies(
     snapshot.repos.flatMap((repo) => repo.jobs),
-    opts,
+    (job, parent) =>
+      jobNeedsYou(job, opts.unackedByJob?.get(job.id) ?? 0) ||
+      (isLiveMegaminion(job) && bandForJob(parent, opts) !== 'in-flight'),
   );
+}
+
+/** Bucket a whole snapshot's heists (all repos flattened — a repo's jobs
+ * can land in different bands; the UI re-groups by repo inside each
+ * band). Nested megaminions ride their parent heist, never a band. */
+export function bucketSnapshot(snapshot: BoardSnapshot, opts: BucketOptions = {}): readonly BandedJobs[] {
+  return bucketJobs(snapshotFamilies(snapshot, opts).topLevel, opts);
 }
 
 /** Board UX v5: the SETTLED band is a rolling window — the latest N

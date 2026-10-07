@@ -403,6 +403,7 @@ function jobRecord(id: string, status: JobStatus): JobRecord {
     commissioner: null,
     targetRef: null,
     targetSha: null,
+    parentJobId: null,
     status,
     baseBranch: 'main',
     prUrl: null,

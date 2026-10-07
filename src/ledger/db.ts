@@ -896,4 +896,46 @@ export const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX idx_jobs_pr_url ON jobs(pr_url);
     `,
   },
+  {
+    // Job family (megaminions): a job commissioned by another job's minion
+    // — the build workflow's specialist reviewers — records the commissioning
+    // job as its parent so the board nests it under that heist instead of
+    // counting it as a peer. One level deep: a child never parents a child.
+    // The backfill links only what the ledger proves exactly, and only
+    // report-type children under PR-owing parents (so no row can become a
+    // grandchild): (1) a commissioner that names a job in the same repo, and
+    // (2) a target_ref equal to exactly ONE PR-owing job's pr_url in the
+    // same repo. Ambiguous or unmatched rows stay top-level — nothing guessed.
+    // LANDING COLLISION (same convention as migrations 10-21): id 22 is a
+    // branch-local next-contiguous number for an UNSHIPPED feature; if
+    // owner-merged main lands first, re-number ONLY this never-applied
+    // migration (never a hole).
+    id: 22,
+    name: 'job-parent',
+    sql: `
+      ALTER TABLE jobs ADD COLUMN parent_job_id TEXT REFERENCES jobs(id);
+      CREATE INDEX idx_jobs_parent ON jobs(parent_job_id);
+      UPDATE jobs SET parent_job_id = commissioner
+       WHERE deliverable IN ('review', 'artifact', 'investigation')
+         AND commissioner IS NOT NULL AND commissioner <> id
+         AND EXISTS (
+           SELECT 1 FROM jobs parent
+            WHERE parent.id = jobs.commissioner AND parent.repo = jobs.repo
+              AND (parent.deliverable IS NULL OR parent.deliverable = 'pr')
+         );
+      UPDATE jobs SET parent_job_id = (
+           SELECT parent.id FROM jobs parent
+            WHERE parent.pr_url = jobs.target_ref AND parent.repo = jobs.repo
+              AND (parent.deliverable IS NULL OR parent.deliverable = 'pr')
+         )
+       WHERE parent_job_id IS NULL
+         AND deliverable IN ('review', 'artifact', 'investigation')
+         AND target_ref IS NOT NULL
+         AND (
+           SELECT COUNT(*) FROM jobs parent
+            WHERE parent.pr_url = jobs.target_ref AND parent.repo = jobs.repo
+              AND (parent.deliverable IS NULL OR parent.deliverable = 'pr')
+         ) = 1;
+    `,
+  },
 ];
