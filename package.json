@@ -12,6 +12,7 @@
     "roles/",
     "tools/verify-perkins-resource.mjs",
     "tools/patch-vitest-rpc-timeout.mjs",
+    "tools/unshare-review-hardlinks.mjs",
     "install/",
     "install.sh",
     "docs/REVIEW-INPUTS.md",
@@ -31,7 +32,8 @@
   },
   "scripts": {
     "build": "tsc && node tools/prune-stale-dist.mjs . && node -e \"const fs=require('node:fs'); fs.mkdirSync('dist/runtime',{recursive:true}); fs.copyFileSync('src/runtime/review-mcp-server.mjs', 'dist/runtime/review-mcp-server.mjs')\" && node tools/verify-perkins-resource.mjs . && node tools/write-build-rev.mjs && node tools/write-review-dependency-identity.mjs",
-    "prepack": "node -e \"const fs=require('node:fs'); for (const path of ['dist','web/dist']) fs.rmSync(path,{recursive:true,force:true})\" && npm run build:web && npm run build",
+    "postinstall": "node tools/unshare-review-hardlinks.mjs",
+    "prepack":"node -e \"const fs=require('node:fs'); for (const path of ['dist','web/dist']) fs.rmSync(path,{recursive:true,force:true})\" && npm run build:web && npm run build",
     "typecheck": "tsc --noEmit -p tsconfig.test.json",
     "lint": "eslint .",
     "pretest": "node tools/patch-vitest-rpc-timeout.mjs",
