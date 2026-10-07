@@ -1516,6 +1516,15 @@ export class LedgerApi {
       if (current === null) throw new RecordNotFound(`job "${id}" not found`);
       if (current.status !== status) {
         assertJobTransition(current.status, status);
+        if (status === 'binned') {
+          // A discard closes debt but does NOT stop its producers. Refuse
+          // atomically until the owner/chief has stopped target-owned work;
+          // a bare status write must never conceal a live worker or review.
+          const blockers = this.terminalLiveWorkBlockers(id);
+          if (blockers.length > 0) {
+            throw new Error(`job "${id}" has target-owned live work — stop it before binning: ${blockers.join('; ')}`);
+          }
+        }
         const event = this.writeJobStatus(id, current.status, status);
         // Status/obligation consistency lives AT this transactional boundary
         // (chief ruling A): every writer — dispatch, HTTP API, future hooks —
@@ -1770,7 +1779,7 @@ export class LedgerApi {
       }
 
       // Live-work fence: refusal names every durable execution blocker.
-      const blockers = this.closeoutLiveWorkBlockers(job.id);
+      const blockers = this.terminalLiveWorkBlockers(job.id);
       if (blockers.length > 0) {
         throw new AdminCloseoutRefusal(
           'live-work',
@@ -1809,14 +1818,14 @@ export class LedgerApi {
     });
   }
 
-  /** Durable execution blockers for a would-be administrative closeout:
+  /** Durable execution blockers for an irreversible terminal disposition:
    * open worker turns, non-terminal tracked children, live review rounds
    * and unsettled verification runs. Idle/disposed/historical bookkeeping
    * rows are NOT execution evidence (issue #171 ownership classifies
    * leftovers at the runtime boundary; a historical gap must not block a
    * truthful closure) and directive/re-brief control rows are owned by
    * their own reconcilers — neither is read here. */
-  private closeoutLiveWorkBlockers(jobId: string): readonly string[] {
+  private terminalLiveWorkBlockers(jobId: string): readonly string[] {
     const blockers: string[] = [];
     const openTurns = this.listAgents().filter(
       (agent) => agent.jobId === jobId && (agent.state === 'spawning' || agent.state === 'streaming'),

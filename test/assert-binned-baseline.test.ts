@@ -12,9 +12,24 @@ const report = (...assertions: ReturnType<typeof assertion>[]) => ({
 describe('binned fail-before receipt classifier', () => {
   it('accepts both named behavioral assertions only when they actually fail', () => {
     for (const [label, title] of Object.entries(EXPECTED_BASELINE_ASSERTIONS)) {
-      expect(assertBinnedBaselineLeg(label, report(assertion(title, 'failed', ['expected binned behavior'])), title))
+      expect(assertBinnedBaselineLeg(label, report(assertion(title, 'failed', ['AssertionError: expected binned behavior'])), title))
         .toContain('assertion RED');
     }
+  });
+
+  it('rejects mixed collection failures and a named test that fails before its assertion', () => {
+    const title = EXPECTED_BASELINE_ASSERTIONS.backend;
+    const named = assertion(title, 'failed', ['AssertionError: expected 400 to be 200']);
+    expect(() => assertBinnedBaselineLeg('backend', {
+      numFailedTests: 1,
+      testResults: [
+        { status: 'failed', message: '', assertionResults: [named] },
+        { status: 'failed', message: 'Failed to import missing module', assertionResults: [] },
+      ],
+    }, title)).toThrow(/collection|setup|import/u);
+    expect(() => assertBinnedBaselineLeg('backend', report(
+      assertion(title, 'failed', ['Error: missing fixture from test setup']),
+    ), title)).toThrow(/assertion|setup/u);
   });
 
   it('rejects setup/collection errors, green tests, and unrelated failures', () => {

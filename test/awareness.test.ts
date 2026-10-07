@@ -1031,6 +1031,7 @@ describe('gru awareness — morning digest (owner ruling 2026-09-23)', () => {
           first.api.setJobStatus('job-terminal', 'in-review');
           first.api.setJobStatus('job-terminal', 'merged');
         } else {
+          first.api.setAgentState('minion-terminal', 'idle'); // discard requires no live producer
           first.api.setJobStatus('job-terminal', 'binned');
         }
       }

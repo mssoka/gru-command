@@ -983,6 +983,14 @@ export class GitHubSignalPoll {
   // ------------------------------------------------------------------
 
   private applySignal(signal: GitHubSignal): void {
+    // A lane can be discarded while the provider request is in flight.
+    // Only a genuinely observed merge has independent evidence worth a
+    // no-effect receipt; conflict/CI alerts must not wake anyone about
+    // work that is already terminal, particularly an unbound job.
+    if (signal.kind !== 'pr-merged') {
+      const job = this.ledger.getJob(signal.jobId);
+      if (job !== null && isJobTerminal(job.status)) return;
+    }
     switch (signal.kind) {
       case 'pr-merged':
         this.applyMerged(signal);

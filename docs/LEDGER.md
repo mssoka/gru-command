@@ -78,8 +78,13 @@ lens:   pending → live → done | error               (terminal: the last two)
   machine. Nothing in the ledger infers a merge.
 - **`binned` is the terminal DISCARDED state** (owner/chief cancelled a
   lane): every non-terminal status may be binned through the ordinary
-  authenticated `POST /api/jobs/<id>/status` write, and `binned` never
-  leaves — it shares the terminal contract with `merged`/`done`
+  authenticated `POST /api/jobs/<id>/status` write WHEN no target-owned
+  producer remains. The same status transaction refuses open worker turns,
+  non-terminal children, pending/live rounds and unsettled verification
+  runs; an idle `working` job can still be binned. Gru's shipped role
+  teaches this intentional action through its permitted shell and the
+  configured service token; no background process automatically bins
+  work. `binned` never leaves — it shares the terminal contract with `merged`/`done`
   (`isJobTerminal`, `TERMINAL_JOB_STATUSES`). The transition appends the
   ordinary `job.status` `{from, to}` event (the prior status and every
   earlier event stay on the record) and settles the lane's applicable

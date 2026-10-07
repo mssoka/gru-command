@@ -627,6 +627,31 @@ describe('github signal poll tick', () => {
     }
   });
 
+  it('a binned lane in an in-flight poll never posts a stale judgment CI alert', async () => {
+    const h = makeLedger();
+    try {
+      addTrackedJob(h.ledger, 'job-binned-ci', 'https://github.com/acme/app/pull/14');
+      const api = new FakeGhApi();
+      api.pulls.set('acme/app', [pull({ number: 14, headRef: 'gru/job-binned-ci', headSha: 'sha-14' })]);
+      api.details.set('acme/app#14', pull({ number: 14, headRef: 'gru/job-binned-ci', headSha: 'sha-14', mergeableState: 'clean' }));
+      api.checks.set('acme/app@sha-14', [{ name: 'Perkins review', status: 'completed', conclusion: 'failure', url: 'https://runs/14' }]);
+      const originalList = api.listPulls.bind(api);
+      api.listPulls = async (input) => {
+        const pulls = await originalList(input);
+        h.ledger.setJobStatus('job-binned-ci', 'binned');
+        return pulls;
+      };
+      const notifications = new FakeNotifications();
+      const result = await makePoll({ ledger: h.ledger, api, notifications }).pollOnce();
+      expect(result.signals.map((signal) => signal.kind)).toContain('ci-failed');
+      expect(h.ledger.getJob('job-binned-ci')?.status).toBe('binned');
+      expect(eventCount(h.ledger, 'job-binned-ci', 'github.ci-failed')).toBe(0);
+      expect(notifications.posts).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it('one tick applies the merged and conflict mappings against a real ledger, with one cursor event per change', async () => {
     const h = makeLedger();
     try {

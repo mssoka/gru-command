@@ -260,6 +260,7 @@ describe('board engine — v4 snapshot blocks', () => {
     api.setJobStatus('discard-receipt', 'working');
     api.setJobPr('discard-receipt', 'https://github.com/acme/demo/pull/9');
     api.registerAgent({ id: 'minion-discard', role: 'minion', jobId: 'discard-receipt', sessionFile: '/s.jsonl' });
+    api.setAgentState('minion-discard', 'idle'); // stopped before the intentional discard
     api.setJobStatus('discard-receipt', 'binned');
     const job = engine
       .snapshot()

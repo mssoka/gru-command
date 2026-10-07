@@ -233,15 +233,19 @@ applicable obligations close as `job-terminal` abandonment in the same
 transaction — binning is a disposition, never a success or cleanup
 claim.
 
-Preconditions (operator check — the write itself is the ordinary status
-surface):
+Preconditions (Gru's shipped role teaches this same action; no new endpoint
+or automatic binning — the write itself is the ordinary status surface):
 
 - confirm the lane is genuinely discarded and will not be resumed;
 - inspect live ownership first (`GET /api/board`, `/health`): binning
   does NOT stop a running worker, cancel a queue entry, release a
-  worktree, delete artifacts or ack notifications. A lane with live
-  work must be stopped through its own surfaces first — the board keeps
-  showing the live producer and the worktree stays on the record.
+  worktree, delete artifacts or ack notifications. The status transaction
+  refuses target-owned open worker turns, unfinished child workers,
+  pending/live review rounds and unsettled verification runs, with no
+  status or event mutation. Stop live work through its own authorized
+  surfaces first — the board keeps showing the live producer and the
+  worktree stays on the record. A `working` label alone is not proof of
+  a live producer; idle `working` jobs remain bin-eligible.
 
 Request (pairing token in `Authorization: Bearer`):
 
@@ -256,7 +260,7 @@ curl -sS -X POST "http://127.0.0.1:<port>/api/jobs/<job-id>/status" \
   expand COLD (“Show records”), then the “Show N binned records”
   disclosure inside it reveals the discarded row.
 - `400` — illegal transition (from `merged`/`done`, or any DIFFERENT
-  status after `binned`) or unknown status; nothing changed. Re-sending
+  status after `binned`), live-work refusal, or unknown status; nothing changed. Re-sending
   `{"status":"binned"}` to an already-binned lane is an idempotent
   200 no-op (the generic same-status write never mints a duplicate
   event) — a timed-out retry is safe.

@@ -315,6 +315,7 @@ describe('guarded claim — every recheck fails visible', () => {
     const discarded = new ClaimHarness();
     const binnedJobId = 'j-binned';
     const binnedWaitId = await discarded.recoveredMinionWait({ jobId: binnedJobId });
+    discarded.ledger.setAgentState('agent-j-binned', 'idle'); // no live producer at discard
     discarded.ledger.setJobStatus(binnedJobId, 'binned');
     const binnedResult = await claimProviderRecoveryContinuation(discarded.deps(), binnedWaitId, 'silas');
     expect(binnedResult).toMatchObject({ outcome: 'skipped', why: 'job is binned — no continuation' });

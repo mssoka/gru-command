@@ -15,6 +15,7 @@ import { NotificationCenter } from '../src/notifications/center.js';
 import { TranscriptService } from '../src/transcripts/service.js';
 import { loadConfig } from '../src/config.js';
 import { DecisionRuntime } from '../src/decisions/runtime.js';
+import { ROLE_DEFINITIONS } from '../src/roles.js';
 
 const cleanupDirs: string[] = [];
 afterAll(() => {
@@ -318,6 +319,60 @@ describe('board server — HTTP API', () => {
     const row = snapshot.repos.flatMap((repo) => repo.jobs).find((job) => job.id === 'audit-binned');
     expect(row?.status).toBe('binned');
     expect(row?.prState).toBeNull();
+  });
+
+  it('Gru loaded action bins a named abandoned heist through auth with truthful history and no revival', async () => {
+    const { api, port } = harness;
+    const prompt = ROLE_DEFINITIONS.gru.systemPrompt;
+    expect(ROLE_DEFINITIONS.gru.tools).toContain('bash');
+    // This test reads the actual shipped Gru prompt, extracts its action,
+    // then executes that path against the real HTTP write surface (never a
+    // live instance). A status enum or operator-only manual cannot pass.
+    const action = prompt.match(/authenticated `POST (\/api\/jobs\/<job-id>\/status)` with JSON `(\{ "status": "binned" \})`/u);
+    expect(action, 'Gru must be taught the precise authenticated discard action').not.toBeNull();
+    if (action === null) return;
+    expect(prompt).toContain('Do not automatically bin');
+    expect(prompt).toContain('live worker');
+    const jobId = 'gru-bin-heist';
+    const path = action[1]!.replace('<job-id>', jobId);
+    const body = JSON.parse(action[2]!) as { status: string };
+    const liveId = 'gru-bin-live';
+    const livePath = action[1]!.replace('<job-id>', liveId);
+    api.addJob({ id: liveId, repo: 'demo-repo', title: 'Still running' });
+    api.setJobStatus(liveId, 'working');
+    api.registerAgent({ id: 'live-gru-worker', role: 'minion', jobId: liveId });
+    api.setAgentState('live-gru-worker', 'streaming');
+    const liveBefore = api.listJobEvents(liveId);
+    const refused = await postJson(port, livePath, 'board-test-token', body);
+    expect(refused.status).toBe(400);
+    expect((refused.body as { detail: string }).detail).toMatch(/live work|open worker/u);
+    expect(api.getJob(liveId)?.status).toBe('working');
+    expect(api.listJobEvents(liveId)).toEqual(liveBefore);
+    api.setAgentState('live-gru-worker', 'idle');
+    expect((await postJson(port, livePath, 'board-test-token', body)).status).toBe(200);
+
+    api.addJob({ id: jobId, repo: 'demo-repo', title: 'Discarded by Gru' });
+    api.setJobStatus(jobId, 'working');
+    api.setJobStatus(jobId, 'blocked');
+    const before = api.listJobEvents(jobId);
+    expect(api.listObligations({ jobId }).some((row) => row.state === 'open')).toBe(true);
+    expect((await postJson(port, path, null, body)).status).toBe(401);
+    expect(api.listJobEvents(jobId)).toEqual(before);
+    const accepted = await postJson(port, path, 'board-test-token', body);
+    expect(accepted.status).toBe(200);
+    expect(accepted.body).toMatchObject({ id: jobId, status: 'binned' });
+    const after = api.listJobEvents(jobId);
+    expect(after.slice(-before.length)).toEqual(before);
+    expect(after.filter((event) => event.kind === 'job.status' &&
+      (event.payload as { to?: string }).to === 'binned'))
+      .toHaveLength(1);
+    expect(api.latestJobEvent(jobId, 'job.status')?.payload).toEqual({ from: 'blocked', to: 'binned' });
+    expect(api.listObligations({ jobId }).every((row) => row.state === 'closed')).toBe(true);
+    expect(api.listObligations({ jobId }).some((row) =>
+      row.settlement?.kind === 'job-terminal' && row.settlement.jobStatus === 'binned')).toBe(true);
+    expect((await postJson(port, path, 'board-test-token', { status: 'working' })).status).toBe(400);
+    expect(api.getJob(jobId)?.status).toBe('binned');
+    expect(api.listJobEvents(jobId)).toEqual(after);
   });
 
   it('closeout endpoint: auth, malformed bodies, missing jobs and guard refusals fail loud without changes', async () => {
