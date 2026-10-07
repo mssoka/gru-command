@@ -7,6 +7,7 @@ import { LedgerApi, DEFAULT_LENSES, type PendingRebriefRecord } from '../src/led
 import { LedgerDb } from '../src/ledger/db.js';
 import { branchStatePayload } from '../src/dispatch/github-poll.js';
 import { OWNER_CANCELLATION_JOB_IDS, OWNER_CANCELLATION_RULING } from '../src/ledger/owner-cancellation.js';
+import type { CloseoutRuntimeProbe } from '../src/ledger/api.js';
 
 const cleanupDirs: string[] = [];
 afterAll(() => {
@@ -1753,6 +1754,30 @@ describe('administrative closeout of a parked PR-backed job', () => {
     }
   });
 
+  it('the PR closeout form shares the authoritative runtime fence (ledger idle + open turn refuses)', () => {
+    const { api, db, dir } = freshDb();
+    try {
+      parkedPrJob(api, 'probe-closeout');
+      api.registerAgent({ id: 'closeout-idle-open', role: 'minion', jobId: 'probe-closeout' });
+      api.setAgentState('closeout-idle-open', 'idle');
+      const probe: CloseoutRuntimeProbe = {
+        liveHandleIds: new Set<string>(),
+        supervisionFor: (agentId: string) =>
+          agentId === 'closeout-idle-open'
+            ? { state: 'watching', breakerOpen: false, openTurn: true, openControl: false, openToolCalls: 0 }
+            : null,
+      };
+      const refused = refusalOf(() => api.adminCloseParkedJob(closeoutRequest('probe-closeout'), probe));
+      expect(refused.name).toBe('AdminCloseoutRefusal');
+      expect(refused.code).toBe('live-work');
+      expect(refused.message).toContain('closeout-idle-open');
+      expect(api.getJob('probe-closeout')?.status).toBe('parked');
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('administrative closeout accepts full-identity variants: 64-char uppercase head and an omitted closed_at', () => {
     const { api, db, dir } = freshDb();
     try {
@@ -2064,7 +2089,7 @@ describe('owner-listed administrative cancellation (owner amendment j-1117)', ()
       listedParkedJob(api, stoppedId);
       api.registerAgent({ id: 'stopped-worker', role: 'minion', jobId: stoppedId });
       api.setAgentState('stopped-worker', 'disposed');
-      const stoppedProbe = {
+      const stoppedProbe: CloseoutRuntimeProbe = {
         liveHandleIds: new Set(['stopped-worker']),
         supervisionFor: (agentId: string) =>
           agentId === 'stopped-worker'
@@ -2085,29 +2110,6 @@ describe('owner-listed administrative cancellation (owner amendment j-1117)', ()
     }
   });
 
-  it('the PR closeout form shares the authoritative runtime fence (ledger idle + open turn refuses)', () => {
-    const { api, db, dir } = freshDb();
-    try {
-      parkedPrJob(api, 'probe-closeout');
-      api.registerAgent({ id: 'closeout-idle-open', role: 'minion', jobId: 'probe-closeout' });
-      api.setAgentState('closeout-idle-open', 'idle');
-      const probe = {
-        liveHandleIds: new Set<string>(),
-        supervisionFor: (agentId: string) =>
-          agentId === 'closeout-idle-open'
-            ? { state: 'watching', breakerOpen: false, openTurn: true, openControl: false, openToolCalls: 0 }
-            : null,
-      };
-      const refused = refusalOf(() => api.adminCloseParkedJob(closeoutRequest('probe-closeout'), probe));
-      expect(refused.name).toBe('AdminCloseoutRefusal');
-      expect(refused.code).toBe('live-work');
-      expect(refused.message).toContain('closeout-idle-open');
-      expect(api.getJob('probe-closeout')?.status).toBe('parked');
-    } finally {
-      db.close();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
 
   it('is idempotent for an identical replay and refuses conflicting retries after cancellation', () => {
     const { api, db, dir } = freshDb();
