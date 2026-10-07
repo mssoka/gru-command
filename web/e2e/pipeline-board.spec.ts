@@ -366,8 +366,12 @@ async function hitTarget(page: Page, selector: string): Promise<HitTarget> {
     const topmost = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
     return {
       found: true,
+      // Containment tolerance of 1px absorbs sub-pixel scroll rounding
+      // (an element scrolled to the fold can end <1px past it); real
+      // clipping/off-screen states are far larger, and occlusion is the
+      // separate strict `hit` check below.
       inViewport:
-        rect.left >= 0 && rect.top >= 0 && rect.right <= window.innerWidth && rect.bottom <= window.innerHeight,
+        rect.left >= -1 && rect.top >= -1 && rect.right <= window.innerWidth + 1 && rect.bottom <= window.innerHeight + 1,
       hit: topmost !== null && (topmost === element || element.contains(topmost)),
     };
   }, selector);
@@ -733,9 +737,15 @@ test.describe('compact owner-first board — synthetic geometry proof', () => {
     // its container edge).
     await page.locator('#board-section-settled').scrollIntoViewIfNeeded();
     const navBox = await page.locator('#board-nav').boundingBox();
+    const railBox = await page.locator('#chip-rail').boundingBox();
     expect(navBox).not.toBeNull();
+    expect(railBox).not.toBeNull();
     expect(navBox!.y).toBeGreaterThanOrEqual(0);
-    expect(navBox!.y).toBeLessThan(140); // pinned under the measured chrome
+    // Pinned under the measured chrome: the nav's sticky top follows the
+    // globally measured chrome height, so it sits at (or above) the strip's
+    // bottom edge — the slim strip is taller than the old pill rail and
+    // this bound tracks the measurement instead of a fixed constant.
+    expect(navBox!.y).toBeLessThanOrEqual(railBox!.y + railBox!.height + 1);
 
     // A shortcut jump lands the target in view and never under the strip.
     const coldLink = page.locator('#board-nav .board-nav__link[data-nav="cold"]');
