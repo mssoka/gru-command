@@ -304,24 +304,30 @@ export interface PipelineView {
  * Counts are repo-wide exact totals (issues excluding PRs); the run is
  * the newest Actions run on the repository's discovered default branch,
  * never deployment health. */
-export type RepoOverviewRunState =
-  | 'passed'
-  | 'failed'
-  | 'timed-out'
-  | 'startup-failure'
-  | 'action-required'
-  | 'cancelled'
-  | 'skipped'
-  | 'neutral'
-  | 'stale-run'
-  | 'running'
-  | 'queued'
-  | 'no-workflow'
-  | 'never-run'
-  | 'unavailable'
-  | 'unknown';
+export const REPO_OVERVIEW_RUN_STATES = [
+  'passed',
+  'failed',
+  'timed-out',
+  'startup-failure',
+  'action-required',
+  'cancelled',
+  'skipped',
+  'neutral',
+  'stale-run',
+  'running',
+  'queued',
+  'no-workflow',
+  'never-run',
+  'no-branch',
+  'unavailable',
+  'unknown',
+] as const;
 
-export type RepoOverviewFreshness = 'unchecked' | 'fresh' | 'stale' | 'unavailable';
+export type RepoOverviewRunState = (typeof REPO_OVERVIEW_RUN_STATES)[number];
+
+export const REPO_OVERVIEW_FRESHNESS = ['unchecked', 'fresh', 'stale', 'unavailable'] as const;
+
+export type RepoOverviewFreshness = (typeof REPO_OVERVIEW_FRESHNESS)[number];
 
 /** One observed run. `status`/`conclusion` are raw provider strings
  * (untrusted display text); `url` is https on the repository host only. */
@@ -342,6 +348,8 @@ export interface RepoOverviewRowView {
   readonly key: string;
   readonly displayName: string;
   readonly linked: boolean;
+  /** The GitHub host the identity was read from (null when not linked). */
+  readonly host: string | null;
   readonly link: string | null;
   readonly linkReason: string | null;
   readonly fullName: string | null;
@@ -779,26 +787,6 @@ function isOwnerPrView(value: unknown): value is OwnerPrView {
 
 /** Managed repository overview: known run states and freshness classes —
  * an unknown string is a server bug, never a silently tolerated value. */
-const REPO_OVERVIEW_RUN_STATES = [
-  'passed',
-  'failed',
-  'timed-out',
-  'startup-failure',
-  'action-required',
-  'cancelled',
-  'skipped',
-  'neutral',
-  'stale-run',
-  'running',
-  'queued',
-  'no-workflow',
-  'never-run',
-  'unavailable',
-  'unknown',
-] as const;
-
-const REPO_OVERVIEW_FRESHNESS = ['unchecked', 'fresh', 'stale', 'unavailable'] as const;
-
 function isRepoOverviewRunState(value: unknown): value is RepoOverviewRunState {
   return typeof value === 'string' && (REPO_OVERVIEW_RUN_STATES as readonly string[]).includes(value);
 }
@@ -826,14 +814,18 @@ function isHttpsUrlOrNull(value: unknown): value is string | null {
   }
 }
 
+function isNonEmptyOrNull(value: unknown): value is string | null {
+  return value === null || (typeof value === 'string' && value !== '');
+}
+
 function isRepoOverviewRunView(value: unknown): value is RepoOverviewRunView {
   return (
     isRecord(value) &&
     isRepoOverviewRunState(value.state) &&
-    (value.status === null || typeof value.status === 'string') &&
-    (value.conclusion === null || typeof value.conclusion === 'string') &&
-    (value.workflow === null || typeof value.workflow === 'string') &&
-    (value.branch === null || typeof value.branch === 'string') &&
+    isNonEmptyOrNull(value.status) &&
+    isNonEmptyOrNull(value.conclusion) &&
+    isNonEmptyOrNull(value.workflow) &&
+    isNonEmptyOrNull(value.branch) &&
     (value.runNumber === null ||
       (typeof value.runNumber === 'number' && Number.isSafeInteger(value.runNumber) && value.runNumber >= 0)) &&
     isHttpsUrlOrNull(value.url) &&
@@ -842,14 +834,19 @@ function isRepoOverviewRunView(value: unknown): value is RepoOverviewRunView {
   );
 }
 
+function isSafeHost(value: unknown): value is string {
+  return typeof value === 'string' && value !== '' && /^[A-Za-z0-9.-]+$/u.test(value);
+}
+
 function isRepoOverviewRowView(value: unknown): value is RepoOverviewRowView {
   if (
     !isRecord(value) ||
     typeof value.key !== 'string' ||
     value.key === '' ||
     typeof value.displayName !== 'string' ||
-    value.displayName === '' ||
+    !hasVisibleCharacters(value.displayName) ||
     typeof value.linked !== 'boolean' ||
+    !(value.host === null || isSafeHost(value.host)) ||
     !isHttpsUrlOrNull(value.link) ||
     (value.linkReason !== null && typeof value.linkReason !== 'string') ||
     (value.fullName !== null && typeof value.fullName !== 'string') ||
@@ -863,12 +860,32 @@ function isRepoOverviewRowView(value: unknown): value is RepoOverviewRowView {
   ) {
     return false;
   }
+  // Freshness coherence: fresh/stale REQUIRE a successful observation, the
+  // pre-observation classes may not carry one, and an unlinked row carries
+  // no counts or run at all (unproven data never renders as fact).
+  if ((value.freshness === 'fresh' || value.freshness === 'stale') && value.checkedAt === null) return false;
+  if (value.freshness === 'unchecked' && (value.checkedAt !== null || value.lastAttemptAt !== null)) return false;
+  if (value.freshness === 'unavailable' && value.checkedAt !== null) return false;
+  // A successful observation always carries a run context; the pre-success
+  // classes never do.
+  const observed = value.freshness === 'fresh' || value.freshness === 'stale';
+  if (observed && value.run === null) return false;
+  if (!observed && value.run !== null) return false;
   // Coherence: a linked row has a link and no reason; an unlinked row has
   // a reason and no link. A linked row must also carry a safe full name
   // that the link path actually addresses — a row can never validate as a
   // guessed or mismatched identity.
-  if (!value.linked) return value.link === null && value.linkReason !== null;
-  if (value.link === null || value.linkReason !== null) return false;
+  if (!value.linked) {
+    return (
+      value.link === null &&
+      value.linkReason !== null &&
+      value.host === null &&
+      value.openPrs === null &&
+      value.openIssues === null &&
+      value.run === null
+    );
+  }
+  if (value.link === null || value.linkReason !== null || value.host === null) return false;
   if (typeof value.fullName !== 'string' || value.fullName === '') return false;
   const segments = value.fullName.split('/');
   if (
@@ -881,7 +898,15 @@ function isRepoOverviewRowView(value: unknown): value is RepoOverviewRowView {
     return false;
   }
   try {
-    return new URL(value.link).pathname === `/${value.fullName}`;
+    const link = new URL(value.link);
+    if (link.pathname !== `/${value.fullName}`) return false;
+    // The link and any run link must live on the host the identity was
+    // read from — an off-host URL can never present as this repository.
+    if (link.hostname.toLowerCase() !== value.host.toLowerCase()) return false;
+    if (value.run !== null && value.run.url !== null) {
+      if (new URL(value.run.url).hostname.toLowerCase() !== value.host.toLowerCase()) return false;
+    }
+    return true;
   } catch {
     return false;
   }

@@ -12,7 +12,7 @@ import {
   type RepoRef,
 } from '../dispatch/github-poll.js';
 import { isGitHubRemote, parseRepoRemote } from '../dispatch/review-path.js';
-import { discoverManagedRepos } from './discovery.js';
+import { discoverManagedReposAsync } from './discovery.js';
 
 /**
  * Managed repository overview (owner-approved compact rows A): a
@@ -52,28 +52,34 @@ import { discoverManagedRepos } from './discovery.js';
 // Public view model (mirrored by web/src/lib/board-protocol.ts)
 // ------------------------------------------------------------------
 
-export type RepoOverviewRunState =
-  | 'passed'
-  | 'failed'
-  | 'timed-out'
-  | 'startup-failure'
-  | 'action-required'
-  | 'cancelled'
-  | 'skipped'
-  | 'neutral'
-  | 'stale-run'
-  | 'running'
-  | 'queued'
-  | 'no-workflow'
-  | 'never-run'
-  | 'unavailable'
-  | 'unknown';
+export const REPO_OVERVIEW_RUN_STATES = [
+  'passed',
+  'failed',
+  'timed-out',
+  'startup-failure',
+  'action-required',
+  'cancelled',
+  'skipped',
+  'neutral',
+  'stale-run',
+  'running',
+  'queued',
+  'no-workflow',
+  'never-run',
+  'no-branch',
+  'unavailable',
+  'unknown',
+] as const;
+
+export type RepoOverviewRunState = (typeof REPO_OVERVIEW_RUN_STATES)[number];
 
 /** Row freshness: `unchecked` (never attempted), `fresh` (last successful
  * fetch inside the freshness window and no failed re-attempt after it),
  * `stale` (cached data kept past a failed re-attempt or beyond the
  * window), `unavailable` (attempted, no successful data yet). */
-export type RepoOverviewFreshness = 'unchecked' | 'fresh' | 'stale' | 'unavailable';
+export const REPO_OVERVIEW_FRESHNESS = ['unchecked', 'fresh', 'stale', 'unavailable'] as const;
+
+export type RepoOverviewFreshness = (typeof REPO_OVERVIEW_FRESHNESS)[number];
 
 export interface RepoOverviewRunView {
   readonly state: RepoOverviewRunState;
@@ -94,6 +100,9 @@ export interface RepoOverviewRowView {
   readonly key: string;
   readonly displayName: string;
   readonly linked: boolean;
+  /** The GitHub host the identity was read from (null when not linked) —
+   * lets the web validator pin the link and run URLs to that host. */
+  readonly host: string | null;
   /** Validated https repository URL (null when not linked). */
   readonly link: string | null;
   /** Why the repository is not linked (null when linked). */
@@ -106,7 +115,8 @@ export interface RepoOverviewRowView {
   readonly freshness: RepoOverviewFreshness;
   /** Completion time of the last successful complete observation (ISO). */
   readonly checkedAt: string | null;
-  /** Start of the last GitHub observation attempt (ISO). */
+  /** Completion time of the last observation attempt (success or failure,
+   * ISO) — null when no attempt has completed. */
   readonly lastAttemptAt: string | null;
   /** Last failed attempt detail (provider text, bounded); null when clean. */
   readonly error: string | null;
@@ -140,8 +150,9 @@ export const REPO_OVERVIEW_SEARCH_MIN_INTERVAL_MS = 2_000;
 // ------------------------------------------------------------------
 
 export interface RepoOverviewMeta {
-  /** The repository's actual default branch (discovered, never assumed). */
-  readonly defaultBranch: string;
+  /** The repository's actual default branch (discovered, never assumed);
+   * null when the provider reports none (an empty repository). */
+  readonly defaultBranch: string | null;
 }
 
 export interface RepoOverviewRunRaw {
@@ -432,11 +443,12 @@ export class GhRepoOverviewApi implements RepoOverviewApiPort {
     const label = `repo ${repoFullName(input.repo)}`;
     const parsed = await ghApiJson(this.run, this.binary, label, input.repo.host, repoPathOf(input.repo));
     const raw = record(parsed);
-    const defaultBranch = raw !== null ? strOrNull(raw['default_branch']) : null;
-    if (defaultBranch === null) {
-      throw new GhApiError(`${label}: response carries no default_branch`);
+    if (raw === null) {
+      throw new GhApiError(`${label}: response is not a JSON object`);
     }
-    return { defaultBranch };
+    // A provider-reported null/absent default branch is a legitimate empty
+    // repository, not a malformed response.
+    return { defaultBranch: strOrNull(raw['default_branch']) };
   }
 
   async countOpenPulls(input: { readonly repo: RepoRef }): Promise<number> {
@@ -533,13 +545,24 @@ export type RemoteResolver = (repoPath: string) => RepoRef | null | Promise<Repo
  * deploy-drift precedent): a registry-wide refresh must never stall the
  * board/WS timers on a slow mount or a large repo count. */
 async function gitOriginUrl(repoPath: string): Promise<string | null> {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     execFile(
       'git',
       ['-C', repoPath, 'remote', 'get-url', 'origin'],
       { encoding: 'utf8', timeout: 10_000, maxBuffer: 64 * 1024 },
       (error, stdout) => {
         if (error !== null) {
+          const code = (error as NodeJS.ErrnoException).code;
+          const killed = (error as { killed?: boolean }).killed === true;
+          if (killed || typeof code === 'string') {
+            // Spawn failure or timeout — a transient read failure, NOT
+            // evidence the remote changed: reject so the tracker keeps the
+            // previous classification.
+            reject(error);
+            return;
+          }
+          // git ran and reported no usable origin remote (exit code, e.g.
+          // `error: No such remote 'origin'`) — a real unlinked state.
           resolve(null);
           return;
         }
@@ -551,7 +574,8 @@ async function gitOriginUrl(repoPath: string): Promise<string | null> {
 }
 
 /** Default resolver: the repo's origin remote parsed by the same seam the
- * tracked-lane poll uses. Missing/unparseable → null. */
+ * tracked-lane poll uses. A missing/unparseable remote resolves null; a
+ * git failure rejects (the caller keeps the previous classification). */
 export async function defaultRemoteResolver(repoPath: string): Promise<RepoRef | null> {
   const url = await gitOriginUrl(repoPath);
   if (url === null) return null;
@@ -601,8 +625,9 @@ export interface ManagedRepoOverviewOptions {
   /** Configured workspace root holding the managed repositories. */
   readonly workspaceRoot: string;
   readonly api: RepoOverviewApiPort;
-  /** Test seams; default: canonical discovery + origin-remote resolver. */
-  readonly scanRepos?: (workspaceRoot: string) => readonly string[];
+  /** Test seams; default: canonical discovery + origin-remote resolver.
+   * Both may be async; the tracker awaits them. */
+  readonly scanRepos?: (workspaceRoot: string) => readonly string[] | Promise<readonly string[]>;
   readonly resolveRemote?: RemoteResolver;
   /** Refresh cadence; default {@link REPO_OVERVIEW_REFRESH_MS}. */
   readonly intervalMs?: number;
@@ -624,11 +649,14 @@ interface ObserveOutcome {
    * and rotation advances past this repository so no single entry can
    * starve the rest of the registry. */
   readonly retry: boolean;
+  /** The classified failure detail when the pass aborts (null otherwise),
+   * disclosed on the repositories the abort left unchecked. */
+  readonly detail: string | null;
 }
 
 export class ManagedRepoOverviewTracker {
   private readonly opts: ManagedRepoOverviewOptions;
-  private readonly scanRepos: (workspaceRoot: string) => readonly string[];
+  private readonly scanRepos: (workspaceRoot: string) => readonly string[] | Promise<readonly string[]>;
   private readonly resolveRemote: RemoteResolver;
   private readonly intervalMs: number;
   private readonly staleAfterMs: number;
@@ -647,7 +675,7 @@ export class ManagedRepoOverviewTracker {
 
   constructor(opts: ManagedRepoOverviewOptions) {
     this.opts = opts;
-    this.scanRepos = opts.scanRepos ?? (() => discoverManagedRepos(opts.workspaceRoot));
+    this.scanRepos = opts.scanRepos ?? (() => discoverManagedReposAsync(opts.workspaceRoot));
     this.resolveRemote = opts.resolveRemote ?? defaultRemoteResolver;
     this.intervalMs = opts.intervalMs ?? REPO_OVERVIEW_REFRESH_MS;
     this.staleAfterMs = opts.staleAfterMs ?? Math.max(1, this.intervalMs * 3);
@@ -655,7 +683,8 @@ export class ManagedRepoOverviewTracker {
     this.sleep = opts.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.now = opts.now ?? Date.now;
     this.log = opts.log ?? (() => {});
-    this.registry = [...this.scanRepos(this.opts.workspaceRoot)];
+    // The registry is scanned on each refresh; the view stays null (the
+    // section hidden) until the first pass has classified it.
   }
 
   /** Start the boot refresh and the re-check cadence; idempotent. */
@@ -695,6 +724,7 @@ export class ManagedRepoOverviewTracker {
         key: name,
         displayName: name,
         linked,
+        host: state.ref !== null ? state.ref.host : null,
         link: state.ref !== null ? githubRepoLink(state.ref) : null,
         linkReason: state.ref !== null ? null : state.linkReason,
         fullName: state.ref !== null ? repoFullName(state.ref) : null,
@@ -725,44 +755,65 @@ export class ManagedRepoOverviewTracker {
   }
 
   private async runRefresh(): Promise<RepoOverviewView | null> {
-    const repos = [...new Set(this.scanRepos(this.opts.workspaceRoot))].sort();
-    this.registry = repos;
-    const present = new Set(repos);
-    for (const name of [...this.states.keys()]) {
-      if (!present.has(name)) this.states.delete(name);
-    }
+    const repos = [...new Set(await this.scanRepos(this.opts.workspaceRoot))].sort();
+    // Classification is built into a LOCAL map and published only once
+    // every remote has been resolved: `view()` (called by board pushes and
+    // heartbeats DURING this refresh) must never observe a half-classified
+    // entry as `linked:false` without a reason. A changed identity (or a
+    // remote that stopped being a safe GitHub link) drops the old
+    // repository's cached observation — stale data must never attach to a
+    // different identity. A resolver ERROR keeps the previous
+    // classification and cached observation (a transient git failure is
+    // not evidence the remote changed).
+    const nextStates = new Map<string, RepoSourceState>();
     for (const name of repos) {
-      if (!this.states.has(name)) this.states.set(name, emptySourceState());
-    }
-    // Classify every repository's remote locally BEFORE any GitHub call:
-    // a row is never mislabeled not-linked just because its fetch has not
-    // been reached yet this cycle. A changed identity (or a remote that
-    // stopped being a safe GitHub link) drops the old repository's cached
-    // observation — stale data must never attach to a different identity.
-    for (const name of repos) {
-      const state = this.states.get(name) as RepoSourceState;
-      const resolved = await this.resolveRemote(join(this.opts.workspaceRoot, name));
+      const previous = this.states.get(name);
+      const base = previous ?? emptySourceState();
+      let resolved: RepoRef | null;
+      try {
+        resolved = await this.resolveRemote(join(this.opts.workspaceRoot, name));
+      } catch (error) {
+        if (previous !== undefined) {
+          // A transient git failure is not evidence the remote changed:
+          // keep the previous classification and cached observation.
+          this.log('warn', 'repo overview: origin resolution failed — keeping the previous classification', {
+            repo: name,
+            error: messageOf(error).slice(0, 300),
+          });
+          nextStates.set(name, previous);
+        }
+        // A never-classified entry stays unpublished until a pass can
+        // classify it — the view must never emit `linked:false` without a
+        // reason. It reappears on the next cadence.
+        continue;
+      }
       const classification = classifyRemoteValue(resolved);
       if (classification.kind === 'unlinked') {
-        if (state.ref !== null || state.linkReason !== classification.reason) {
+        if (base.ref !== null || base.linkReason !== classification.reason) {
           const reset = emptySourceState();
           reset.linkReason = classification.reason;
-          this.states.set(name, reset);
+          nextStates.set(name, reset);
+        } else {
+          nextStates.set(name, base);
         }
       } else {
         const sameIdentity =
-          state.ref !== null &&
-          state.ref.host === classification.ref.host &&
-          repoFullName(state.ref) === repoFullName(classification.ref);
-        if (!sameIdentity) {
+          base.ref !== null &&
+          base.ref.host === classification.ref.host &&
+          repoFullName(base.ref) === repoFullName(classification.ref);
+        if (sameIdentity) {
+          base.linkReason = null;
+          nextStates.set(name, base);
+        } else {
           const reset = emptySourceState();
           reset.ref = classification.ref;
-          this.states.set(name, reset);
-        } else {
-          state.linkReason = null;
+          nextStates.set(name, reset);
         }
       }
     }
+    this.registry = repos.filter((name) => nextStates.has(name));
+    this.states.clear();
+    for (const [name, state] of nextStates) this.states.set(name, state);
     const start = repos.length === 0 ? 0 : this.cursor % repos.length;
     const order = [...repos.slice(start), ...repos.slice(0, start)];
     const fetchable = order.filter((name) => this.states.get(name)?.ref !== null);
@@ -776,6 +827,7 @@ export class ManagedRepoOverviewTracker {
     let nextIndex = 0;
     let failures = 0;
     let aborted: string | null = null;
+    let abortDetail: string | null = null;
     for (let index = 0; index < fetchable.length; index += 1) {
       if (budget.used >= budget.limit) {
         aborted = 'budget';
@@ -787,15 +839,29 @@ export class ManagedRepoOverviewTracker {
         // A partial observation is discarded and rotation moves on: a
         // budget smaller than one observation must degrade fairly across
         // the registry, never re-spend every cycle on the same entry.
+        aborted = 'budget';
         nextIndex = index + 1;
         break;
       }
       nextIndex = index + 1;
       if (outcome.aborted) {
         aborted = 'fatal';
+        abortDetail = outcome.detail;
         break;
       }
       if (this.states.get(fetchable[index] as string)?.error !== null) failures += 1;
+    }
+    if (aborted === 'fatal' && abortDetail !== null) {
+      // A global outage (auth/rate limit) aborted the pass: every
+      // unattempted linked repository is disclosed as unchecked-for-this-
+      // pass rather than silently keeping a fresh-looking age.
+      const rest = fetchable.slice(nextIndex);
+      for (const name of rest) {
+        const state = this.states.get(name);
+        if (state === undefined || state.ref === null) continue;
+        state.lastAttemptAt = new Date(this.now()).toISOString();
+        state.error = `refresh aborted before this repository was checked: ${abortDetail}`.slice(0, 300);
+      }
     }
     const resumeName = fetchable[nextIndex] ?? null;
     this.cursor = resumeName === null ? 0 : Math.max(0, repos.indexOf(resumeName));
@@ -824,44 +890,62 @@ export class ManagedRepoOverviewTracker {
       const meta = await this.spend(budget, () => this.opts.api.fetchRepo({ repo: ref }));
       const openPrs = await this.spendSearch(budget, () => this.opts.api.countOpenPulls({ repo: ref }));
       const openIssues = await this.spendSearch(budget, () => this.opts.api.countOpenIssues({ repo: ref }));
-      const workflows = await this.spend(budget, () => this.opts.api.countWorkflows({ repo: ref }));
       let run: RepoOverviewRunView;
-      if (workflows.kind === 'actions-unavailable') {
-        run = runUnavailableView(meta.defaultBranch);
-      } else if (workflows.value === 0) {
+      if (meta.defaultBranch === null) {
+        // An empty repository has no default branch: the exact counts are
+        // still real observations and the run context is honestly absent
+        // instead of degrading the whole row into a fetch failure.
         run = {
-          state: 'no-workflow',
+          state: 'no-branch',
           status: null,
           conclusion: null,
           workflow: null,
-          branch: meta.defaultBranch,
+          branch: null,
           runNumber: null,
           url: null,
           runStartedAt: null,
           runUpdatedAt: null,
         };
       } else {
-        const runs = await this.spend(budget, () =>
-          this.opts.api.latestRuns({ repo: ref, branch: meta.defaultBranch, limit: REPO_OVERVIEW_RUNS_PER_FETCH }),
-        );
-        if (runs.kind === 'actions-unavailable') {
-          run = runUnavailableView(meta.defaultBranch);
+        const branch = meta.defaultBranch;
+        const workflows = await this.spend(budget, () => this.opts.api.countWorkflows({ repo: ref }));
+        if (workflows.kind === 'actions-unavailable') {
+          run = runUnavailableView(branch);
+        } else if (workflows.value === 0) {
+          run = {
+            state: 'no-workflow',
+            status: null,
+            conclusion: null,
+            workflow: null,
+            branch,
+            runNumber: null,
+            url: null,
+            runStartedAt: null,
+            runUpdatedAt: null,
+          };
         } else {
-          const latest = selectLatestRun(runs.value);
-          run =
-            latest === null
-              ? {
-                  state: 'never-run',
-                  status: null,
-                  conclusion: null,
-                  workflow: null,
-                  branch: meta.defaultBranch,
-                  runNumber: null,
-                  url: null,
-                  runStartedAt: null,
-                  runUpdatedAt: null,
-                }
-              : runViewOf(latest, ref.host, meta.defaultBranch);
+          const runs = await this.spend(budget, () =>
+            this.opts.api.latestRuns({ repo: ref, branch, limit: REPO_OVERVIEW_RUNS_PER_FETCH }),
+          );
+          if (runs.kind === 'actions-unavailable') {
+            run = runUnavailableView(branch);
+          } else {
+            const latest = selectLatestRun(runs.value);
+            run =
+              latest === null
+                ? {
+                    state: 'never-run',
+                    status: null,
+                    conclusion: null,
+                    workflow: null,
+                    branch,
+                    runNumber: null,
+                    url: null,
+                    runStartedAt: null,
+                    runUpdatedAt: null,
+                  }
+                : runViewOf(latest, ref.host, branch);
+          }
         }
       }
       state.counts = { openPrs, openIssues };
@@ -870,11 +954,11 @@ export class ManagedRepoOverviewTracker {
       state.checkedAt = completedAt;
       state.lastAttemptAt = completedAt;
       state.error = null;
-      return { aborted: false, retry: false };
+      return { aborted: false, retry: false, detail: null };
     } catch (error) {
       if (error instanceof GhBudgetExceededError) {
         // Not a failure: nothing was observed and nothing is recorded.
-        return { aborted: true, retry: true };
+        return { aborted: true, retry: true, detail: null };
       }
       const kind = classifyGhError(error);
       state.lastAttemptAt = new Date(this.now()).toISOString();
@@ -884,7 +968,8 @@ export class ManagedRepoOverviewTracker {
         kind,
         error: state.error,
       });
-      return { aborted: kind === 'rate-limit' || kind === 'auth', retry: false };
+      const fatal = kind === 'rate-limit' || kind === 'auth';
+      return { aborted: fatal, retry: false, detail: fatal ? `${kind}: ${state.error}` : null };
     }
   }
 

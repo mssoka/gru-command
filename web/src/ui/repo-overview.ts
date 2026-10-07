@@ -8,10 +8,12 @@
 import type { RepoOverviewRowView, RepoOverviewView } from '../lib/board-protocol.js';
 import {
   repoAgeParts,
+  repoBadgeTitle,
   repoCiView,
   repoRowAriaLabel,
   repoRowBadge,
   repoRowNote,
+  repoRunContextTitle,
 } from '../lib/repo-overview.js';
 import { el } from './dom.js';
 
@@ -33,6 +35,8 @@ function safeHref(raw: string | null): string | null {
 export class RepoOverviewPanel {
   private readonly mount: HTMLElement;
   private readonly deps: RepoOverviewPanelDeps;
+  /** Last observable list scroll offset (survives hidden-tab pushes). */
+  private lastScrollTop = 0;
 
   constructor(mount: HTMLElement, deps: RepoOverviewPanelDeps) {
     this.mount = mount;
@@ -45,6 +49,12 @@ export class RepoOverviewPanel {
   render(view: RepoOverviewView | null | undefined): void {
     const previousList = this.mount.querySelector<HTMLElement>('.repo-overview__list');
     const previousScroll = previousList?.scrollTop ?? 0;
+    // A hidden panel ([hidden] on the TRANSCRIPTS tab) reports scrollTop 0
+    // in a real browser: remember the last observable offset so a push
+    // received while hidden restores the operator's place on return.
+    if (previousList !== null && (previousList.offsetHeight > 0 || previousScroll > 0)) {
+      this.lastScrollTop = previousScroll;
+    }
     const active = document.activeElement;
     const focusKey =
       active instanceof HTMLElement && this.mount.contains(active) ? (active.dataset.focusKey ?? null) : null;
@@ -68,12 +78,19 @@ export class RepoOverviewPanel {
     }
     const list = el('div', 'repo-overview__list');
     for (const row of view.rows) list.append(this.row(row));
+    // User scrolls are the authoritative offset (renders capture it too,
+    // but a hidden panel reports 0 — the listener preserves the real one).
+    list.addEventListener('scroll', () => {
+      this.lastScrollTop = list.scrollTop;
+    });
     this.mount.append(list);
-    list.scrollTop = previousScroll;
+    list.scrollTop = this.lastScrollTop;
     if (focusKey !== null) {
-      [...this.mount.querySelectorAll<HTMLElement>('[data-focus-key]')]
-        .find((node) => node.dataset.focusKey === focusKey)
-        ?.focus();
+      const controls = [...this.mount.querySelectorAll<HTMLElement>('[data-focus-key]')];
+      // The exact row may have disappeared between pushes: keep the
+      // keyboard position inside the module on the nearest survivor
+      // instead of dropping focus to the body.
+      (controls.find((node) => node.dataset.focusKey === focusKey) ?? controls[0])?.focus();
     }
   }
 
@@ -85,7 +102,7 @@ export class RepoOverviewPanel {
     article.setAttribute('aria-label', repoRowAriaLabel(row, badge));
 
     const top = el('div', 'repo-row__top');
-    top.append(this.repoName(row), this.badgeNode(badge));
+    top.append(this.repoName(row), this.badgeNode(row, badge));
     article.append(top, this.metrics(row), this.meta(row));
 
     const note = repoRowNote(row);
@@ -110,11 +127,13 @@ export class RepoOverviewPanel {
     return link;
   }
 
-  private badgeNode(badge: ReturnType<typeof repoRowBadge>): HTMLElement {
+  private badgeNode(row: RepoOverviewRowView, badge: ReturnType<typeof repoRowBadge>): HTMLElement {
     // The established tone contract (pp-chip--<tone>) is the ONLY chip
     // colour mechanism in the loaded stylesheets; emitting it here keeps
     // status colour visible in both themes and pinned by the browser spec.
     const node = el('span', `pp-chip pp-chip--${badge.tone} repo-row__badge`);
+    const provider = repoBadgeTitle(row);
+    if (provider !== null) node.title = `provider: ${provider}`;
     const glyph = el('span', 'repo-row__badge-glyph', badge.glyph);
     glyph.setAttribute('aria-hidden', 'true');
     node.append(glyph, el('span', 'repo-row__badge-text', badge.text));
@@ -156,7 +175,9 @@ export class RepoOverviewPanel {
     } else {
       ciNode.append(document.createTextNode(ci.label));
     }
-    ciNode.append(document.createTextNode(` · ${ci.branch ?? '—'}`));
+    if (ci.branch !== null) ciNode.append(document.createTextNode(` · ${ci.branch}`));
+    const context = repoRunContextTitle(row);
+    if (context !== null) ciNode.title = context;
     meta.append(ciNode);
 
     const age = el('span', 'repo-row__age');

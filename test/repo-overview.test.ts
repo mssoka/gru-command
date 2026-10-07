@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { isValidSnapshot } from '../web/src/lib/board-protocol.js';
 import {
   GhApiError,
   GhRateLimitedError,
@@ -54,7 +55,7 @@ function rawRun(over: Partial<RepoOverviewRunRaw> = {}): RepoOverviewRunRaw {
 type CallName = 'fetchRepo' | 'countOpenPulls' | 'countOpenIssues' | 'countWorkflows' | 'latestRuns';
 
 interface FakeFacts {
-  readonly defaultBranch?: string;
+  readonly defaultBranch?: string | null;
   readonly openPrs?: number;
   readonly openIssues?: number;
   readonly workflows?: ActionsAvailability<number>;
@@ -86,7 +87,7 @@ class FakeApi implements RepoOverviewApiPort {
 
   async fetchRepo(input: { readonly repo: RepoRef }): Promise<RepoOverviewMeta> {
     const facts = this.record('fetchRepo', input.repo);
-    return { defaultBranch: facts.defaultBranch ?? 'main' };
+    return { defaultBranch: facts.defaultBranch === undefined ? 'main' : facts.defaultBranch };
   }
 
   async countOpenPulls(input: { readonly repo: RepoRef }): Promise<number> {
@@ -119,6 +120,9 @@ interface Harness {
   readonly api: FakeApi;
   readonly names: string[];
   readonly refs: Map<string, RepoRef | null>;
+  /** Per-repo gates that postpone (or fail) remote resolution. */
+  readonly resolveGates: Map<string, Promise<void>>;
+  resolveError: boolean;
   readonly clock: { ms: number };
   readonly sleeps: number[];
   failure: string | null;
@@ -145,6 +149,8 @@ function harness(options: {
     api,
     names,
     refs,
+    resolveGates: new Map<string, Promise<void>>(),
+    resolveError: false,
     clock,
     sleeps,
     failure: null,
@@ -153,7 +159,13 @@ function harness(options: {
     workspaceRoot: '/ws',
     api,
     scanRepos: () => state.names,
-    resolveRemote: (repoPath) => state.refs.get(repoPath.split('/').pop() as string) ?? null,
+    resolveRemote: async (repoPath) => {
+      const name = repoPath.split('/').pop() as string;
+      const gate = state.resolveGates.get(name);
+      if (gate !== undefined) await gate;
+      if (state.resolveError) throw new Error('git origin lookup exploded');
+      return state.refs.get(name) ?? null;
+    },
     intervalMs: 300_000,
     ...(options.maxCallsPerRefresh !== undefined ? { maxCallsPerRefresh: options.maxCallsPerRefresh } : {}),
     ...(options.staleAfterMs !== undefined ? { staleAfterMs: options.staleAfterMs } : {}),
@@ -718,8 +730,12 @@ describe('managed repo overview — gh adapter', () => {
   it('fails loud on malformed provider shapes', async () => {
     const badTotal = new GhRepoOverviewApi(ghRunner([ok('{}')]).runner);
     await expect(badTotal.countOpenPulls({ repo: githubRef('alpha') })).rejects.toThrow(/total_count/);
-    const badBranch = new GhRepoOverviewApi(ghRunner([ok('{}')]).runner);
-    await expect(badBranch.fetchRepo({ repo: githubRef('alpha') })).rejects.toThrow(/default_branch/);
+    // A JSON object without default_branch is an empty repository (null
+    // branch), not a malformed response; a non-object response is malformed.
+    const emptyRepo = new GhRepoOverviewApi(ghRunner([ok('{}')]).runner);
+    expect(await emptyRepo.fetchRepo({ repo: githubRef('alpha') })).toEqual({ defaultBranch: null });
+    const badBranch = new GhRepoOverviewApi(ghRunner([ok('null')]).runner);
+    await expect(badBranch.fetchRepo({ repo: githubRef('alpha') })).rejects.toThrow(/JSON object/);
     const badRuns = new GhRepoOverviewApi(ghRunner([ok('{}')]).runner);
     await expect(badRuns.latestRuns({ repo: githubRef('alpha'), branch: 'main', limit: 3 })).rejects.toThrow(
       /workflow_runs/,
@@ -768,6 +784,9 @@ describe('managed repo overview tracker — review-round guarantees', () => {
     await h.tracker.refresh();
     await h.tracker.refresh();
     await h.tracker.refresh();
+    // The more likely truncation mode (budget runs out mid-observation)
+    // leaves an operator-visible trace, not just the loop pre-check.
+    expect(h.failure).toContain('budget exhausted');
     const touched = new Set(api.calls.map((call) => call.split(':')[1]));
     expect(touched).toEqual(new Set(['acme/alpha', 'acme/beta', 'acme/gamma']));
     for (const key of ['alpha', 'beta', 'gamma']) {
@@ -888,19 +907,151 @@ describe('managed repo overview tracker — review-round guarantees', () => {
     try {
       execFileSync('git', ['init', '-q', join(root, 'alpha')]);
       execFileSync('git', ['-C', join(root, 'alpha'), 'remote', 'add', 'origin', 'https://github.com/acme/alpha.git']);
+      execFileSync('git', ['init', '-q', join(root, 'no-origin')]);
+      execFileSync('git', ['init', '-q', join(root, 'gitlab-repo')]);
+      execFileSync('git', ['-C', join(root, 'gitlab-repo'), 'remote', 'add', 'origin', 'https://gitlab.com/acme/gl.git']);
       mkdirSync(join(root, 'plain'));
       const api = new FakeApi().set('alpha', { openPrs: 1, openIssues: 2, workflows: { kind: 'ok', value: 0 } });
       const tracker = new ManagedRepoOverviewTracker({ workspaceRoot: root, api, now: () => T0, sleep: async () => {} });
       const view = await tracker.refresh();
-      expect(view?.rows.map((entry) => entry.key)).toEqual(['alpha']);
+      // The production default scan discovers only real `.git` entries.
+      expect(view?.rows.map((entry) => entry.key)).toEqual(['alpha', 'gitlab-repo', 'no-origin']);
       const entry = row(view, 'alpha');
       expect(entry.linked).toBe(true);
       expect(entry.fullName).toBe('acme/alpha');
       expect(entry.link).toBe('https://github.com/acme/alpha');
       expect(entry.openPrs).toBe(1);
       expect(entry.run?.state).toBe('no-workflow');
+      // The default resolver's failure paths through the REAL seam:
+      expect(row(view, 'no-origin').linkReason).toBe('no usable origin remote');
+      expect(row(view, 'gitlab-repo').linkReason).toBe('non-GitHub remote');
+      expect(api.calls.every((call) => call.endsWith('acme/alpha'))).toBe(true);
     } finally {
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+// ------------------------------------------------------------------
+// Round-2 review fixes: interleaving, disclosure and edge states
+// ------------------------------------------------------------------
+
+function validBoardSnapshot(repoOverview: unknown): unknown {
+  return {
+    repos: [],
+    agents: [],
+    notifications: [],
+    decisions: {
+      enabled: false,
+      status: 'disabled',
+      reason: 'disabled',
+      model: '~typesafe/jev-latest',
+      endpoint: 'https://openrouter.ai/api/alpha/decisions',
+      credentialPresent: false,
+      credentialSource: 'none',
+      checkedAt: null,
+      incarnation: 'test-incarnation',
+      generation: 0,
+    },
+    unackedActionRequired: 0,
+    unackedNeedsOwner: 0,
+    wakes: { count: 0, lastAt: null },
+    repoOverview,
+  };
+}
+
+describe('managed repo overview tracker — round-2 guarantees', () => {
+  it('renders an empty repository as exact counts + NO BRANCH, not a fetch failure', async () => {
+    const api = new FakeApi().set('empty', { defaultBranch: null, openPrs: 0, openIssues: 2 });
+    const h = harness({ names: ['empty'], api });
+    const entry = row(await h.tracker.refresh(), 'empty');
+    expect(entry.freshness).toBe('fresh');
+    expect(entry.openPrs).toBe(0);
+    expect(entry.openIssues).toBe(2);
+    expect(entry.run?.state).toBe('no-branch');
+    expect(entry.run?.branch).toBeNull();
+    // Without a branch there is nothing to query runs/workflows for.
+    expect(api.calls).not.toContain('countWorkflows:acme/empty');
+    expect(api.calls).not.toContain('latestRuns:acme/empty');
+  });
+
+  it('never exposes a half-classified registry entry to the web validator mid-refresh', async () => {
+    const h = harness({ names: ['alpha'] });
+    await h.tracker.refresh();
+
+    h.names.push('beta');
+    h.refs.set('beta', githubRef('beta'));
+    let release!: () => void;
+    h.resolveGates.set('beta', new Promise<void>((resolve) => { release = resolve; }));
+
+    const pending = h.tracker.refresh();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const mid = h.tracker.view();
+    // The view a board push/heartbeat can take during classification must
+    // satisfy the production web validator, and the unclassified entry is
+    // not published early.
+    expect(isValidSnapshot(validBoardSnapshot(mid))).toBe(true);
+    expect(mid?.rows.map((entry) => entry.key)).toEqual(['alpha']);
+
+    release();
+    await pending;
+    expect(row(h.tracker.view(), 'beta').linked).toBe(true);
+  });
+
+  it('keeps the previous classification and cached observation when origin resolution fails transiently', async () => {
+    const h = harness({ names: ['alpha'] });
+    await h.tracker.refresh();
+    const before = row(h.tracker.view(), 'alpha');
+    h.resolveError = true;
+    h.api.set('alpha', { errors: { fetchRepo: new GhApiError('alpha: HTTP 500: server error', 'HTTP 500: server error') } });
+    const after = row(await h.tracker.refresh(), 'alpha');
+    expect(after.linked).toBe(true);
+    expect(after.link).toBe(before.link);
+    expect(after.fullName).toBe(before.fullName);
+    expect(after.linkReason).toBeNull();
+    expect(after.openPrs).toBe(before.openPrs);
+    expect(after.freshness).toBe('stale');
+  });
+
+  it('discloses a global abort on every repository the pass never reached', async () => {
+    const api = new FakeApi()
+      .set('alpha', {
+        errors: { fetchRepo: new GhRateLimitedError('alpha: GitHub rate limit', 'HTTP 403: API rate limit exceeded') },
+      })
+      .set('beta', { openPrs: 5 })
+      .set('gamma', { openPrs: 6 });
+    const h = harness({ names: ['alpha', 'beta', 'gamma'], api });
+    const view = await h.tracker.refresh();
+    expect(row(view, 'alpha').error).toContain('rate limit');
+    for (const key of ['beta', 'gamma']) {
+      expect(row(view, key).freshness).toBe('unavailable');
+      expect(row(view, key).error).toContain('refresh aborted before this repository was checked');
+      expect(row(view, key).lastAttemptAt).not.toBeNull();
+    }
+  });
+
+  it('start() schedules background refreshes and stop() clears the timer', async () => {
+    const api = new FakeApi().set('alpha', { openPrs: 1 });
+    const tracker = new ManagedRepoOverviewTracker({
+      workspaceRoot: '/ws',
+      api,
+      scanRepos: () => ['alpha'],
+      resolveRemote: () => githubRef('alpha'),
+      intervalMs: 25,
+      now: () => T0,
+      sleep: async () => {},
+      log: () => {},
+    });
+    tracker.start();
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 90));
+      const calls = api.calls.filter((call) => call.startsWith('fetchRepo')).length;
+      expect(calls).toBeGreaterThanOrEqual(2);
+      tracker.stop();
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      expect(api.calls.filter((call) => call.startsWith('fetchRepo')).length).toBe(calls);
+    } finally {
+      tracker.stop();
     }
   });
 });

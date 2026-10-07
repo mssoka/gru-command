@@ -1,4 +1,5 @@
 import { existsSync, readdirSync, statSync } from 'node:fs';
+import { access, readdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 
 /**
@@ -33,4 +34,39 @@ export function discoverManagedRepos(workspaceRoot: string): string[] {
     .filter((entry) => existsSync(join(workspaceRoot, entry.name, '.git')))
     .map((entry) => entry.name)
     .sort();
+}
+
+/**
+ * Async twin of {@link discoverManagedRepos} with IDENTICAL semantics
+ * (depth-1 `.git` entries, dot-dirs skipped, symlinks followed, sorted);
+ * the runtime tracker uses it so a refresh never blocks the shared event
+ * loop on a slow mount. Kept beside the sync rule so they cannot drift.
+ */
+export async function discoverManagedReposAsync(workspaceRoot: string): Promise<string[]> {
+  let entries;
+  try {
+    entries = await readdir(workspaceRoot, { withFileTypes: true });
+  } catch {
+    return []; // missing/unreadable workspace root: no repos yet, not an error
+  }
+  const names: string[] = [];
+  for (const entry of entries) {
+    if (entry.name.startsWith('.')) continue;
+    if (entry.isSymbolicLink()) {
+      try {
+        if (!(await stat(join(workspaceRoot, entry.name))).isDirectory()) continue;
+      } catch {
+        continue; // broken symlink — skip
+      }
+    } else if (!entry.isDirectory()) {
+      continue;
+    }
+    try {
+      await access(join(workspaceRoot, entry.name, '.git'));
+    } catch {
+      continue;
+    }
+    names.push(entry.name);
+  }
+  return names.sort();
 }

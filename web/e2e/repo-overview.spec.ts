@@ -74,6 +74,7 @@ function overview(): RepoOverviewView {
     key: 'demo',
     displayName: 'demo',
     linked: true,
+    host: 'github.com',
     link: 'https://github.com/example/demo',
     linkReason: null,
     fullName: 'example/demo',
@@ -115,8 +116,8 @@ function overview(): RepoOverviewView {
       }),
       row({ key: 'demo-scripts', displayName: 'demo-scripts', openPrs: 3, openIssues: 1, run: run({ state: 'cancelled', conclusion: 'cancelled' }) }),
       row({ key: 'demo-sandbox', displayName: 'demo-sandbox', openPrs: 0, openIssues: 2, run: run({ state: 'no-workflow', workflow: null, url: null }) }),
-      row({ key: 'demo-lab', displayName: 'demo-lab', linked: false, link: null, linkReason: 'non-GitHub remote', fullName: null, openPrs: null, openIssues: null, run: null, freshness: 'unchecked', checkedAt: null, lastAttemptAt: null }),
-      row({ key: 'demo-lab-2', displayName: 'demo-lab-2', linked: false, link: null, linkReason: 'no usable origin remote', fullName: null, openPrs: null, openIssues: null, run: null, freshness: 'unchecked', checkedAt: null, lastAttemptAt: null }),
+      row({ key: 'demo-lab', displayName: 'demo-lab', linked: false, host: null, link: null, linkReason: 'non-GitHub remote', fullName: null, openPrs: null, openIssues: null, run: null, freshness: 'unchecked', checkedAt: null, lastAttemptAt: null }),
+      row({ key: 'demo-lab-2', displayName: 'demo-lab-2', linked: false, host: null, link: null, linkReason: 'no usable origin remote', fullName: null, openPrs: null, openIssues: null, run: null, freshness: 'unchecked', checkedAt: null, lastAttemptAt: null }),
       row({
         key: 'demo-long-name-with-an-unbreakable-token-abcdefghijklmnopqrstuvwxyz-0123456789',
         displayName: 'demo-long-name-with-an-unbreakable-token-abcdefghijklmnopqrstuvwxyz-0123456789',

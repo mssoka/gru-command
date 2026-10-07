@@ -12,6 +12,7 @@ function row(over: Partial<RepoOverviewRowView> = {}): RepoOverviewRowView {
     key: 'alpha',
     displayName: 'alpha',
     linked: true,
+    host: 'github.com',
     link: 'https://github.com/acme/alpha',
     linkReason: null,
     fullName: 'acme/alpha',
@@ -122,6 +123,7 @@ describe('managed repository overview panel', () => {
       rows: [
         row({
           linked: false,
+          host: null,
           link: null,
           linkReason: 'no usable origin remote',
           fullName: null,
@@ -212,5 +214,52 @@ describe('managed repository overview panel', () => {
     expect(mount.querySelectorAll('.repo-row')).toHaveLength(2);
     view.render({ rows: [] });
     expect(mount.querySelectorAll('.repo-row')).toHaveLength(0);
+  });
+
+  it('restores the remembered scroll when a push lands while the panel is hidden', () => {
+    const { mount, view } = panel();
+    view.render({ rows: [row()] });
+    const list = mount.querySelector<HTMLElement>('.repo-overview__list')!;
+    list.scrollTop = 240;
+    list.dispatchEvent(new Event('scroll'));
+    // Simulate the browser's hidden-panel semantics: [hidden] removes the
+    // box and the element reports scrollTop 0.
+    mount.hidden = true;
+    list.scrollTop = 0;
+    view.render({ rows: [row(), row({ key: 'beta', displayName: 'beta' })] });
+    mount.hidden = false;
+    expect(mount.querySelector<HTMLElement>('.repo-overview__list')?.scrollTop).toBe(240);
+  });
+
+  it('keeps keyboard position inside the module when the focused row disappears', () => {
+    const { mount, view } = panel();
+    view.render({ rows: [row()] });
+    mount.querySelector<HTMLAnchorElement>('a.repo-row__name')!.focus();
+    // The focused row is gone; focus lands on the nearest surviving link
+    // rather than dropping to the body.
+    view.render({ rows: [row({ key: 'beta', displayName: 'beta', link: 'https://github.com/acme/beta', fullName: 'acme/beta' })] });
+    expect(document.activeElement).toBe(mount.querySelector('a.repo-row__name'));
+  });
+
+  it('carries the raw provider context as accessible titles', () => {
+    const { mount, view } = panel();
+    view.render({ rows: [row()] });
+    expect(mount.querySelector('.repo-row__badge')?.getAttribute('title')).toBe('provider: completed / success');
+    const ci = mount.querySelector('.repo-row__ci')!;
+    expect(ci.getAttribute('title')).toContain('run #12');
+    expect(ci.textContent).toBe('CI: checks · main');
+  });
+
+  it('renders a branchless row without an invented branch suffix', () => {
+    const { mount, view } = panel();
+    view.render({
+      rows: [
+        row({
+          run: { ...row().run!, state: 'no-branch', workflow: null, url: null, branch: null, status: null, conclusion: null },
+        }),
+      ],
+    });
+    expect(mount.querySelector('.repo-row__ci')?.textContent).toBe('CI: —');
+    expect(mount.querySelector('.repo-row__note')?.textContent).toContain('No default branch exists');
   });
 });

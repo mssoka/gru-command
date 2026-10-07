@@ -5,7 +5,7 @@ created: '2026-10-07'
 status: 'in-progress'
 route: 'dispatch'
 baseline_commit: '49b558f243c7bacbfb46c7bc04f749bf131cefea'
-review_loop_iteration: 1
+review_loop_iteration: 2
 context: []
 ---
 
@@ -82,7 +82,9 @@ context: []
 - No subagent runtime in this lane's tool surface: implementation runs directly from this spec (step-03 fallback); the built-in independent review runs as fresh tracked read-only review jobs via `POST /api/dispatch` (`"deliverable": "review"`) per the playbook.
 - Verification: scopes `repo-overview-focused`, `repo-overview-static`, `repo-overview-browser`, `repo-overview-baseline` added to `.gru-command/worktree.toml`; all runs through the authenticated `/api/verify` scheduler via the shipped complete-capture helper, exact-head receipts recorded below.
 - Implementation commit `c3f3b3519a429c6032d114d74490abc28dc84d4a` (PR #257). Round-1 schedule receipts at that head — `repo-overview-focused` PASS (backend 5 files/116 tests + web 6 files/177 tests; run `c40dcd58-a6ef-4074-80cf-2942e8680051`, capture sha256 `cf66fb9e…`), `repo-overview-static` PASS (lint/typecheck/build/web tsc; run `6718115f-4d1f-4c0a-b85b-0c6a322c5161`, capture sha256 `bf54d1c5…`), `repo-overview-browser` PASS (3 tests; run `149dd9a1-d800-46d5-8e22-843a758d15e4`, capture sha256 `2dd02ec5…`), `repo-overview-baseline` RED by design (backend 4 + web 4 named assertion failures; run `32152c83-a895-45f0-b632-13a4ea047396`, capture sha256 `e7e85033…`, snapshot `/var/folders/…/gru-baseline-repo-overview.x912Sv`). The `full` request (`full-c3f3b35-1`, run `4489163b…`) queued behind a foreign run past the capture helper's wait bound and was left accepted for re-attach at the same durable request id; it is not PASS evidence.
-- Round-1 independent review (three fresh tracked read-only jobs via `POST /api/dispatch`, deliverable `review`, target PR #257 + head `c3f3b35`, commissioner this lane): `repo-overview-review-{blind,edge,verify}-20261007`, all delivered; reviewer trees verified clean at base, findings collected from their transcripts into the ignored `_bmad-output/managed-repo-overview/reviews/r1/`. Findings and dispositions in the Review Triage Log; all valid ones are fixed in the round-2 commit (see below). Reports retained; no reviewer tree was modified.
+- Round-1 independent review (three fresh tracked read-only jobs via `POST /api/dispatch`, deliverable `review`, target PR #257 + head `c3f3b35`, commissioner this lane): `repo-overview-review-{blind,edge,verify}-20261007`, all delivered; reviewer trees verified clean at base, findings collected from their transcripts into the ignored `_bmad-output/managed-repo-overview/reviews/r1/`. Findings and dispositions in the Review Triage Log; all valid ones are fixed in the round-2 commit `77643e6ee54e91c8b8bdf968341bc5da296006da` (pushed; PR #257). Reports retained; no reviewer tree was modified. Round-1 report dispositions: blind routed as `acted` by the ops layer; edge + verify settled `acted` by this lane (directive job = this lane).
+- Round-1 fix-head schedule receipts at `77643e6`: `repo-overview-focused` PASS (backend 5 files/124 tests + web 6 files/179 tests; run `950f6510-a522-45f7-b93d-68f3fc2fb03e`, capture sha256 `7455b656…`), `repo-overview-static` PASS (run `30c43cb6-8eb5-4513-9f97-b6132e3c76dc`, capture sha256 `369b19f4…`), `repo-overview-browser` PASS (3 tests; run `744c29d7-2fea-4524-a2d2-fc93dd6ff026`, capture sha256 `d97d76c7…`), `repo-overview-baseline` RED by design (4+4 named assertion failures; run `6fffb503-6a88-4e8e-b8df-e80ebe0d6896`, capture sha256 `b55166b0…`, snapshot `…/gru-baseline-repo-overview.SnwfiW`), `full` PASS (exit 0, 587648 ms, trackedDirty false; run `e0b29ec8-266e-43d3-ac4e-28268e697052`, capture sha256 `ab651403…`; fast backend 120 files/2339 tests, heavy 30 files/925 tests, web 47 files/548 tests, lint/typecheck/build included). The earlier `full-c3f3b35-1` request (run `4489163b…`) is preserved as a contaminated attempt: it was admitted while this lane was mid-edit (`trackedDirty: true`) and failed typecheck on a transient in-progress signature — never PASS evidence, never rerun for logs.
+- Round-2 independent review (same three lenses, fresh tracked jobs at the round-1 fix head `77643e6`): `repo-overview-review-{blind,edge,verify}-r2-20261007`, all delivered, reviewer trees clean; findings in `_bmad-output/managed-repo-overview/reviews/r2/`. All valid findings fixed in the round-3 commit (atomic classification publishing, host-pinned links, hidden-panel scroll memory, no-branch state, budget/abort disclosure, async scan, validator hardening, cadence test, drift alarm, raw-context tooltips); dispositions in the Review Triage Log. Process note: the r2 briefs' READ block still named the parent diff range while the TARGET named the fix head; all three reviewers resolved it correctly (they reviewed base→head and the repair delta) — the round-3 briefs carry corrected ranges.
 
 ## Design Notes
 
@@ -107,6 +109,7 @@ Run-state → badge text/glyph/tone (one table, server state, web-rendered; text
 | queued | QUEUED | ⋯ | work |
 | no-workflow | NO WORKFLOW | ∅ | park |
 | never-run | NO RUNS | — | park |
+| no-branch | NO BRANCH | — | park |
 | unknown | UNKNOWN | ? | park |
 | unavailable (run) | UNAVAILABLE | ! | park |
 
@@ -139,6 +142,27 @@ Round-1 whole-change review at `c3f3b3519a429c6032d114d74490abc28dc84d4a` (base 
 | B13 | blind | low | `repoCiView` fell back to a fabricated `workflow` label. Fixed: missing workflow renders `—`. Pinned. |
 | B14 | blind | low | Coverage gaps for the above. Fixed by the new tests (in-flight, label contamination, tiny budget, pacing, malformed runs, normalization, default seams, panel scroll/focus, push-to-empty, computed tone colours). |
 | E4 | edge | false | `.github`-suffixed hosts are accepted by the repository's own `isGitHubRemote` policy (the same seam the tracked-lane poll and Perkins use); tightening it in this lane would change sibling behavior outside the approved scope. Inherited policy, not a defect here. Reported as a follow-up rather than patched. |
+
+Round-2 whole-change review at `77643e6ee54e91c8b8bdf968341bc5da296006da` (`repo-overview-review-{blind,edge,verify}-r2-20261007`, same three tracked read-only lenses; reviewer trees verified clean).
+
+| ID | Layer | Verdict | Evidence / disposition |
+|---|---|---|---|
+| R2-1 (verify F1, edge 1, blind) | verify+edge | high | Async remote classification published `registry` before classifying, so a mid-pass `view()` could emit a newly added row as `linked:false` with `linkReason:null` — the web validator then rejected the WHOLE snapshot. Fixed: classification builds a local map and publishes registry+states atomically after every remote resolves; never-classified entries stay unpublished and a resolver error keeps the previous row. Pinned with a gated cross-validator mid-pass test. |
+| R2-2 (blind 1-2) | blind | medium | Link/run URLs were not host-pinned client-side. Fixed: rows carry `host`; the validator requires the https link hostname and any run URL hostname to equal it. Pinned. |
+| R2-3 | blind | medium | Scroll memory failed while the panel was hidden (`scrollTop` reads 0 under `[hidden]`). Fixed: panel remembers the last observed offset (render capture + scroll listener) and restores it. Pinned. |
+| R2-4 | blind | medium | A repo with no default branch degraded the whole observation. Fixed: new `no-branch` run state keeps exact counts and skips runs/workflows calls. Pinned across server + web. |
+| R2-5 | blind | low | Budget exhaustion mid-observation left no log. Fixed: the retry path sets the budget abort so the operator-visible warning fires. Pinned. |
+| R2-6 | blind | medium | A persistent global outage left unreached rows undisclosed. Fixed: a fatal abort marks every unattempted linked repo with the abort detail (stale/unavailable + error), matching the spec's AUTH_ABSENT row. Pinned. |
+| R2-7..R2-10 | blind | low | Empty provider strings, invisible display names, freshness/checkedAt+run incoherence, and the stale `lastAttemptAt` comment. Fixed in the validator/comments. Pinned. |
+| R2-11 | verify | medium | The refresh cadence/stop had no executing test. Fixed: `start() schedules background refreshes and stop() clears the timer` (mirrors deploy-drift). |
+| R2-12 | blind | low | Default-resolver failure paths untested. Fixed: the real-workspace test now drives no-origin, non-GitHub and git-error semantics (git-reported no-remote resolves null; spawn/timeout rejects and keeps the prior classification). |
+| R2-13 | blind | low | Five transported run fields were validated but never rendered. Fixed: raw provider status/conclusion/run number/timestamps render as badge and CI tooltips, with DOM assertions. |
+| R2-14 | blind | low | Registry scan stayed synchronous each refresh. Fixed: `discoverManagedReposAsync` (identical rule) is the tracker default; the wizard keeps the sync twin. |
+| R2-15 | blind | low | Hand-mirrored run-state/freshness unions had no drift alarm. Fixed: both sides export runtime lists and `test/board-frames.test.ts` pins them equal. |
+| R2-E2 | edge | medium | A resolver error became `null` and was classified as remote-less, dropping cached data. Fixed: git-reported no-remote resolves null; spawn/timeout rejects and the previous classification is kept. Pinned. |
+| R2-E3 | edge | low | Unlinked rows could validate carrying counts/run. Fixed: unlinked rows require null host/counts/run. Pinned. |
+| R2-E4 | edge | low | Focus dropped to body when the focused row vanished. Fixed: focus lands on the nearest surviving control in the module. Pinned. |
+| R2-brief | process | — | The r2 briefs named the parent commit as the diff endpoint; reviewers resolved it locally. Round-3 briefs corrected; no code impact. |
 
 ## Verification
 

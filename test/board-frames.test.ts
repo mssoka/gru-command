@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import * as web from '../web/src/lib/board-protocol.js';
 import { BOARD_WS_PATH, parseBoardClientFrame } from '../src/board/frames.js';
+import {
+  REPO_OVERVIEW_FRESHNESS,
+  REPO_OVERVIEW_RUN_STATES,
+} from '../src/repos/overview.js';
 
 /**
  * Board-frame parity (chat-frames pattern): the web validator
@@ -89,6 +93,7 @@ const SNAPSHOT_VALID = {
         key: 'demo',
         displayName: 'demo',
         linked: true,
+        host: 'github.com',
         link: 'https://github.com/example/demo',
         linkReason: null,
         fullName: 'example/demo',
@@ -134,6 +139,15 @@ const SERVER_CORPUS: readonly unknown[] = [
   42,
   'str',
 ];
+
+describe('managed repo overview cross-build drift alarm', () => {
+  it('run-state and freshness lists are identical on both builds', () => {
+    // The mirrored unions gate every snapshot; a one-sided addition would
+    // make the web reject the WHOLE board. Fail here instead of at runtime.
+    expect([...web.REPO_OVERVIEW_RUN_STATES]).toEqual([...REPO_OVERVIEW_RUN_STATES]);
+    expect([...web.REPO_OVERVIEW_FRESHNESS]).toEqual([...REPO_OVERVIEW_FRESHNESS]);
+  });
+});
 
 describe('board frame parity (server parser ↔ web validator)', () => {
   it('client-frame corpus: identical accept/reject verdicts', () => {

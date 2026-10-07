@@ -31,6 +31,7 @@ const RUN_BADGES: Readonly<Record<RepoOverviewRunState, RepoBadge>> = {
   queued: { text: 'QUEUED', glyph: '⋯', tone: 'work' },
   'no-workflow': { text: 'NO WORKFLOW', glyph: '∅', tone: 'park' },
   'never-run': { text: 'NO RUNS', glyph: '—', tone: 'park' },
+  'no-branch': { text: 'NO BRANCH', glyph: '—', tone: 'park' },
   unavailable: { text: 'UNAVAILABLE', glyph: '!', tone: 'park' },
   unknown: { text: 'UNKNOWN', glyph: '?', tone: 'park' },
 };
@@ -135,6 +136,8 @@ export function repoRowNote(row: RepoOverviewRowView): string | null {
       return 'Run cancelled — neither pass nor failure.';
     case 'never-run':
       return `No workflow run on ${run.branch ?? 'the default branch'} yet.`;
+    case 'no-branch':
+      return 'No default branch exists on this repository yet.';
     case 'unknown':
       return 'The provider returned a run state that could not be classified.';
     case 'unavailable':
@@ -142,6 +145,28 @@ export function repoRowNote(row: RepoOverviewRowView): string | null {
     default:
       return null;
   }
+}
+
+/** The raw provider context transported with a run, rendered as the
+ * badge/meta title so the exact status/conclusion/run timestamps are
+ * visible (never validated-but-hidden). */
+export function repoRunContextTitle(row: RepoOverviewRowView): string | null {
+  const run = row.run;
+  if (run === null || run.status === null) return null;
+  const parts = [`provider status: ${run.status}`];
+  if (run.conclusion !== null) parts.push(`conclusion: ${run.conclusion}`);
+  if (run.runNumber !== null) parts.push(`run #${run.runNumber}`);
+  if (run.runStartedAt !== null) parts.push(`started ${run.runStartedAt}`);
+  if (run.runUpdatedAt !== null) parts.push(`updated ${run.runUpdatedAt}`);
+  return parts.join(' · ');
+}
+
+/** Raw provider status/conclusion for the badge tooltip (null when the
+ * row has no run context). */
+export function repoBadgeTitle(row: RepoOverviewRowView): string | null {
+  const run = row.run;
+  if (run === null || run.status === null) return null;
+  return run.conclusion === null ? run.status : `${run.status} / ${run.conclusion}`;
 }
 
 /** Accessible row summary: identity, the status word, the exact counts

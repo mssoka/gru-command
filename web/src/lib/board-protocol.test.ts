@@ -385,6 +385,7 @@ describe('board server-frame validator', () => {
       key: 'demo',
       displayName: 'demo',
       linked: true,
+      host: 'github.com',
       link: 'https://github.com/example/demo',
       linkReason: null,
       fullName: 'example/demo',
@@ -402,6 +403,7 @@ describe('board server-frame validator', () => {
     const unlinked = {
       ...row,
       linked: false,
+      host: null,
       link: null,
       linkReason: 'non-GitHub remote',
       fullName: null,
@@ -433,6 +435,19 @@ describe('board server-frame validator', () => {
       { ...row, fullName: '../evil' },
       { ...row, link: 'https://github.com/other/repo' },
       { ...row, link: 'https://github.com/example/demo/extra' },
+      // r2 hardening: off-host links/run URLs, empty provider strings,
+      // invisible names and incoherent freshness claims never validate.
+      { ...row, host: 'evil.example' },
+      { ...row, run: { ...run, url: 'https://evil.example/actions/runs/42' } },
+      { ...row, run: { ...run, status: '' } },
+      { ...row, run: { ...run, workflow: '' } },
+      { ...row, run: { ...run, branch: '' } },
+      { ...row, displayName: '\u200b' },
+      { ...row, freshness: 'fresh', checkedAt: null },
+      { ...row, freshness: 'unchecked' },
+      { ...row, freshness: 'fresh', run: null },
+      { ...unlinked, openPrs: 2 },
+      { ...unlinked, run },
     ]) {
       expect(
         isValidSnapshot({ ...snapshot(), repoOverview: { rows: [broken] } } as unknown),

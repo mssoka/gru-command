@@ -2,11 +2,13 @@ import { describe, expect, it } from 'vitest';
 import type { RepoOverviewRowView, RepoOverviewRunState } from './board-protocol.js';
 import {
   repoAgeParts,
+  repoBadgeTitle,
   repoCiView,
   repoRowAriaLabel,
   repoRowBadge,
   repoRowNote,
   repoRunBadge,
+  repoRunContextTitle,
 } from './repo-overview.js';
 
 const CHECKED = '2026-10-07T12:00:00.000Z';
@@ -16,6 +18,7 @@ function row(over: Partial<RepoOverviewRowView> = {}): RepoOverviewRowView {
     key: 'alpha',
     displayName: 'alpha',
     linked: true,
+    host: 'github.com',
     link: 'https://github.com/acme/alpha',
     linkReason: null,
     fullName: 'acme/alpha',
@@ -56,6 +59,7 @@ describe('managed repository overview — badge model', () => {
       ['queued', 'QUEUED', '⋯', 'work'],
       ['no-workflow', 'NO WORKFLOW', '∅', 'park'],
       ['never-run', 'NO RUNS', '—', 'park'],
+      ['no-branch', 'NO BRANCH', '—', 'park'],
       ['unavailable', 'UNAVAILABLE', '!', 'park'],
       ['unknown', 'UNKNOWN', '?', 'park'],
     ];
@@ -85,6 +89,7 @@ describe('managed repository overview — badge model', () => {
       repoRowBadge(
         row({
           linked: false,
+          host: null,
           link: null,
           linkReason: 'no usable origin remote',
           fullName: null,
@@ -156,6 +161,7 @@ describe('managed repository overview — meta and notes', () => {
       repoCiView(
         row({
           linked: false,
+          host: null,
           link: null,
           linkReason: 'non-GitHub remote',
           fullName: null,
@@ -185,6 +191,11 @@ describe('managed repository overview — meta and notes', () => {
       repoRowNote(row({ run: { ...row().run!, state: 'never-run', workflow: null, url: null, branch: 'trunk' } })),
     ).toBe('No workflow run on trunk yet.');
     expect(repoRowNote(row({ run: { ...row().run!, state: 'unavailable' } }))).toContain('Actions is unavailable');
+    expect(
+      repoRowNote(
+        row({ run: { ...row().run!, state: 'no-branch', workflow: null, url: null, branch: null } }),
+      ),
+    ).toBe('No default branch exists on this repository yet.');
     expect(repoRowNote(row({ run: { ...row().run!, state: 'unknown' } }))).toContain('could not be classified');
     expect(repoRowNote(row({ freshness: 'stale', error: null, lastAttemptAt: null }))).toBe(
       'Cached result — not current health; the last check is older than the refresh cadence.',
@@ -197,6 +208,7 @@ describe('managed repository overview — meta and notes', () => {
     );
     const unlinked = row({
       linked: false,
+      host: null,
       link: null,
       linkReason: 'non-GitHub remote',
       fullName: null,
@@ -215,5 +227,13 @@ describe('managed repository overview — meta and notes', () => {
     expect(repoRowAriaLabel(row(), badge)).toBe('alpha — PASSED — 2 open pull requests, 3 open issues excluding pull requests');
     const unknown = row({ openPrs: null, openIssues: null });
     expect(repoRowAriaLabel(unknown, repoRowBadge(unknown))).toContain('unknown open pull requests, unknown open issues');
+  });
+  it('renders the raw provider context that the protocol validates', () => {
+    expect(repoBadgeTitle(row())).toBe('completed / success');
+    expect(repoRunContextTitle(row())).toContain('provider status: completed');
+    expect(repoRunContextTitle(row())).toContain('run #12');
+    expect(repoRunContextTitle(row())).toContain('started 2026-10-07T12:00:00.000Z');
+    expect(repoRunContextTitle(row({ run: { ...row().run!, status: null } }))).toBeNull();
+    expect(repoRunContextTitle(row({ run: null }))).toBeNull();
   });
 });
