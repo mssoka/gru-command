@@ -2231,15 +2231,17 @@ describe('owner-listed administrative cancellation (owner amendment j-1117)', ()
       api.setAgentState('durable-stream', 'streaming');
       expect(refusalOf(() => api.adminCancelListedParkedJob(cancelRequest(durableId), null)).code).toBe('live-work');
 
-      // The stop short-circuit is pinned per disjunct: a `stopped` view
-      // with the breaker CLOSED closes (reachable when a restart is
-      // refused or an isolated review aborts)...
+      // The stop short-circuit is pinned per disjunct WITH the evidence it
+      // must suppress: a durable `streaming` row AND a lingering live
+      // handle both sit behind the recorded stop and must not block.
+      // Dropping the state disjunct, the breaker disjunct, or making the
+      // short-circuit row-aware turns a case red.
       const stoppedOnlyId = OWNER_CANCELLATION_JOB_IDS[5]!;
       listedParkedJob(api, stoppedOnlyId);
       api.registerAgent({ id: 'stopped-only', role: 'minion', jobId: stoppedOnlyId });
-      api.setAgentState('stopped-only', 'disposed');
+      api.setAgentState('stopped-only', 'streaming');
       const stoppedOnlyProbe: CloseoutRuntimeProbe = {
-        liveHandleIds: new Set<string>(),
+        liveHandleIds: new Set(['stopped-only']),
         supervisionFor: (agentId: string) =>
           agentId === 'stopped-only'
             ? { state: 'stopped', breakerOpen: false, openTurn: false, openControl: false, openToolCalls: 0 }
@@ -2247,13 +2249,14 @@ describe('owner-listed administrative cancellation (owner amendment j-1117)', ()
       };
       expect(api.adminCancelListedParkedJob(cancelRequest(stoppedOnlyId), stoppedOnlyProbe).job.status).toBe('done');
 
-      // ... and a breaker-open view closes without the state saying stopped.
+      // ... and the same behind-the-stop evidence under a breaker-open
+      // view whose state does not say stopped.
       const breakerId = OWNER_CANCELLATION_JOB_IDS[6]!;
       listedParkedJob(api, breakerId);
       api.registerAgent({ id: 'breaker-only', role: 'minion', jobId: breakerId });
-      api.setAgentState('breaker-only', 'disposed');
+      api.setAgentState('breaker-only', 'streaming');
       const breakerProbe: CloseoutRuntimeProbe = {
-        liveHandleIds: new Set<string>(),
+        liveHandleIds: new Set(['breaker-only']),
         supervisionFor: (agentId: string) =>
           agentId === 'breaker-only'
             ? { state: 'watching', breakerOpen: true, openTurn: false, openControl: false, openToolCalls: 0 }
@@ -2285,9 +2288,9 @@ describe('owner-listed administrative cancellation (owner amendment j-1117)', ()
       const hydratedStopId = OWNER_CANCELLATION_JOB_IDS[8]!;
       listedParkedJob(api, hydratedStopId);
       api.registerAgent({ id: 'hydrated-stop', role: 'minion', jobId: hydratedStopId });
-      api.setAgentState('hydrated-stop', 'disposed');
+      api.setAgentState('hydrated-stop', 'streaming');
       const hydratedStopProbe: CloseoutRuntimeProbe = {
-        liveHandleIds: new Set<string>(),
+        liveHandleIds: new Set(['hydrated-stop']),
         supervisionFor: (agentId: string) =>
           agentId === 'hydrated-stop' ? { state: 'stopped', breakerOpen: true, openTurn: false, openToolCalls: 0 } : null,
       };
