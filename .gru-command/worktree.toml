@@ -630,6 +630,20 @@ strip-browser = "(cd web && npm run e2e -- --project=mock e2e/dashboard-strip.sp
 # pre-existing working-flavor failures stay outside this diff).
 strip-smoke = "node tools/patch-vitest-rpc-timeout.mjs && cd web && node ../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json && node node_modules/vite/bin/vite.js build && node ../node_modules/@playwright/test/cli.js test --project=mock smoke.spec.ts"
 
+# Deliberate theme-baseline regeneration (PR148 snapshot-repair precedent):
+# the approved slim strip changes the pixels above the chat pane, so the
+# four committed whole-page theme goldens (mock chat-light/dark + real
+# real-chat-light/dark) are regenerated DELIBERATELY, the new PNGs are
+# inspected and committed, and the un-updated `strip-themes` scope re-runs
+# as the acceptance check. Scheduler-only; never invoked after a freeze;
+# never cited as acceptance evidence by itself.
+strip-themes-update = "cd web && node ../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json && node node_modules/vite/bin/vite.js build && node ../node_modules/@playwright/test/cli.js test --update-snapshots=changed --grep 'dark toggle persists'"
+
+# Acceptance check for the regenerated theme goldens: the same two theme
+# tests (mock + hermetic real-service project) with NO update flag; both
+# must pass against the committed PNGs at the exact head.
+strip-themes = "cd web && node ../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json && node node_modules/vite/bin/vite.js build && node ../node_modules/@playwright/test/cli.js test --grep 'dark toggle persists'"
+
 # Focused iteration/debug subset for this lane's FINAL source: the three web
 # unit files that carry the slim-strip regressions, run against the
 # committed head in the lane's own web workspace with the same vitest bin
