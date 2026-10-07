@@ -55,7 +55,7 @@ import { uploadsDirNeedsHardening } from './attachments/resolver.js';
 import { JournalStore } from './lessons/journal.js';
 import { BibleStore } from './lessons/bible.js';
 import { createBibleReferences } from './lessons/references.js';
-import { DreamEngine, DreamScheduler, DREAM_STATE_FILE, loadDreamState } from './lessons/dream.js';
+import { DreamEngine, DreamScheduler, DREAM_FAILED_KIND, DREAM_STATE_FILE, loadDreamState } from './lessons/dream.js';
 import { AgentLessonsDistiller } from './lessons/distiller.js';
 import { createSessionLessonsCapture } from './lessons/capture.js';
 import { createReviewOutcomeCapture } from './lessons/review-capture.js';
@@ -1345,6 +1345,25 @@ async function main(): Promise<number> {
         }),
         log: (level, msg, fields) => logger.log(level, msg, fields),
       }).run(),
+    // A failing dream is an incident, not just a log line: it failed every
+    // pass for days unnoticed (owner incident 2026-10-07). One open incident
+    // per failure streak; the next completed pass resolves it.
+    onFailure: (error) => {
+      const repairTool = join(repoRoot, 'tools', 'repair-bible-provenance.mjs');
+      notifications.postIncident({
+        kind: DREAM_FAILED_KIND,
+        routing: 'action-required',
+        severity: 'error',
+        title: 'Lesson dream is failing — the Book of Lessons is not being updated',
+        detail:
+          `${String(error)}\n\nThe journal cursor is unchanged; the next beat retries. If a chapter's ` +
+          `provenance is malformed, rebuild it from the journal: node ${repairTool} (dry run), then add --write.`,
+        dedupe: 'active',
+      });
+    },
+    onSuccess: () => {
+      notifications.resolveIncidents(DREAM_FAILED_KIND, 'dream');
+    },
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   state.dream = dream;

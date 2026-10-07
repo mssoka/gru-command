@@ -22,6 +22,8 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  */
 
 export const DREAM_STATE_FILE = '.dream-state.json';
+/** Incident kind raised while dream passes keep failing. */
+export const DREAM_FAILED_KIND = 'lessons.dream-failed';
 export const DEFAULT_MAX_ENTRIES_PER_DREAM = 100;
 
 export interface DreamState {
@@ -183,6 +185,11 @@ export interface DreamSchedulerOptions {
    * counts as due immediately. */
   readonly lastDreamAt?: () => string | null;
   readonly run: () => Promise<DreamOutcome>;
+  /** A failed pass, beyond the log line — production raises an incident so
+   * a broken dream cannot stay silent for days (owner incident 2026-10-07). */
+  readonly onFailure?: (error: unknown) => void;
+  /** A pass that completed (including noop) — production resolves that incident. */
+  readonly onSuccess?: (outcome: DreamOutcome) => void;
   readonly log?: Log;
   readonly setInterval?: typeof setInterval;
   readonly clearInterval?: typeof clearInterval;
@@ -277,6 +284,15 @@ export class DreamScheduler {
     }
   }
 
+  /** A throwing hook is logged, never allowed to break the beat. */
+  private notify(hook: 'onFailure' | 'onSuccess', call: () => void): void {
+    try {
+      call();
+    } catch (error) {
+      this.log('warn', `dream ${hook} hook threw`, { error: String(error) });
+    }
+  }
+
   /** One dream beat. A busy engine skips the beat (returns null). */
   async tick(): Promise<DreamOutcome | null> {
     if (this.busy) {
@@ -289,11 +305,13 @@ export class DreamScheduler {
       if (outcome.status === 'noop') {
         this.log('debug', 'dream beat: no new journal entries', {});
       }
+      this.notify('onSuccess', () => this.opts.onSuccess?.(outcome));
       return outcome;
     } catch (error) {
       this.log('error', 'dream pass failed — journal cursor unchanged, next beat retries', {
         error: String(error),
       });
+      this.notify('onFailure', () => this.opts.onFailure?.(error));
       return null;
     } finally {
       this.busy = false;

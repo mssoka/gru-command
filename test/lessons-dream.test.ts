@@ -331,6 +331,56 @@ describe('dream scheduler', () => {
       vi.useRealTimers();
     }
   });
+
+  it('a failed pass is raised through onFailure (owner incident 2026-10-07), and a throwing hook never breaks the beat', async () => {
+    const failure = new DreamError('chapter completion-contract.md lesson x: provenance "j-878" must be "<journal-id>@<iso-date>"');
+    const seen: unknown[] = [];
+    const logged: string[] = [];
+    const scheduler = new DreamScheduler({
+      intervalMs: 0,
+      dreamOnBoot: false,
+      run: async () => {
+        throw failure;
+      },
+      onFailure: (error) => {
+        seen.push(error);
+        throw new Error('incident store down');
+      },
+      onSuccess: () => {
+        throw new Error('onSuccess must not fire for a failed pass');
+      },
+      log: (_level, msg) => logged.push(msg),
+    });
+    await expect(scheduler.tick()).resolves.toBeNull();
+    expect(seen).toEqual([failure]);
+    expect(logged).toContain('dream pass failed — journal cursor unchanged, next beat retries');
+    expect(logged).toContain('dream onFailure hook threw');
+  });
+
+  it('a completed pass (noop included) resolves through onSuccess with its outcome', async () => {
+    const outcomes: DreamOutcome[] = [];
+    const noop: DreamOutcome = {
+      status: 'noop',
+      entries: 0,
+      coveredThroughSeq: 7,
+      chaptersTouched: 0,
+      lessonsAdded: 0,
+      lessonsMerged: 0,
+      lessonsTrimmed: 0,
+      lessonsDropped: 0,
+    };
+    const scheduler = new DreamScheduler({
+      intervalMs: 0,
+      dreamOnBoot: false,
+      run: async () => noop,
+      onFailure: () => {
+        throw new Error('onFailure must not fire for a completed pass');
+      },
+      onSuccess: (outcome) => outcomes.push(outcome),
+    });
+    await expect(scheduler.tick()).resolves.toEqual(noop);
+    expect(outcomes).toEqual([noop]);
+  });
 });
 
 describe('due-based dream cadence (issue #221)', () => {

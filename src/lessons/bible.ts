@@ -42,6 +42,12 @@ export const DEFAULT_INDEX_CAP_BYTES = 1_024;
  * shortens bodies down to it, then starts dropping least-valuable lessons. */
 const MIN_LESSON_BODY_CHARS = 160;
 
+/** Cap enforcement keeps at least this many of a lesson's NEWEST journal
+ * handles. Older handles go first, before any lesson text is touched:
+ * `recurred` keeps the true count and the journal remains the ground truth
+ * (owner decision 2026-10-07 — full provenance had outgrown the 4 KB cap). */
+export const PROVENANCE_FLOOR = 3;
+
 export const BIBLE_README = `# Book of Lessons — how this directory works
 
 The book is the operation's long-term memory: a concise, deduplicated
@@ -54,12 +60,16 @@ record of lessons worth keeping. It is NOT a log — the journal
   observations) with provenance. Gru and Silas append through the
   service's authenticated API; a minion's delivery report may end with an
   optional \`lessons\` block the host extracts.
-- The **dream** (Bob, on a cadence) reads journal entries newer than the
-  last dream, merges repeats into existing lessons (bumping
-  \`recurred\`), and rewrites only the affected chapters. It never pastes
-  journal text verbatim and never invents events.
-- This directory is machine-managed: **do not hand-edit chapters or
-  INDEX.md**. Corrections go through the journal and the next dream.
+- The **dream** (on a cadence) has Bob distill journal entries newer than
+  the last dream into an output file; the service validates it, merges
+  repeats into existing lessons (bumping \`recurred\`), and rewrites only
+  the affected chapters. It never pastes journal text verbatim and never
+  invents events.
+- This directory is machine-managed: **nobody hand-edits chapters,
+  INDEX.md or .dream-state.json** — Bob included. A hand edit breaks every
+  later dream. Corrections go through the journal and the next dream;
+  malformed provenance is rebuilt from the journal by
+  \`tools/repair-bible-provenance.mjs\`.
 
 ## Format
 
@@ -114,9 +124,29 @@ export interface ApplyReport {
 export interface ChapterCapResult {
   readonly chapter: BibleChapter;
   readonly text: string;
+  /** Oldest provenance handles released from surviving lessons. */
+  readonly provenanceTrimmed: number;
   readonly trimmed: number;
   readonly droppedLessons: number;
   readonly droppedProvenance: readonly ProvenanceRef[];
+}
+
+export interface ChapterRepairReport {
+  readonly slug: string;
+  readonly changed: boolean;
+  readonly linesRewritten: number;
+  readonly lessonsBefore: number;
+  readonly lessonsAfter: number;
+  readonly provenanceTrimmed: number;
+  readonly bodiesTrimmed: number;
+  readonly lessonsDropped: number;
+  readonly bytes: number;
+}
+
+export interface ProvenanceRepairReport {
+  readonly chapters: readonly ChapterRepairReport[];
+  /** Where the replaced originals were saved; null when nothing was written. */
+  readonly backupDir: string | null;
 }
 
 export class BibleStore {
@@ -185,6 +215,69 @@ export class BibleStore {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
       throw error;
     }
+  }
+
+  /**
+   * Owner-run provenance repair (owner incident 2026-10-07): rebuild every
+   * chapter's provenance from the journal, re-apply the chapter cap, and —
+   * only with `write` — back the originals up under
+   * `.repair-backup-<stamp>/chapters/` before replacing them atomically.
+   * Idempotent: a repaired book reports nothing to change. Any id missing
+   * from the journal aborts before a single file is written.
+   */
+  repairProvenance(
+    journalTs: ReadonlyMap<string, string>,
+    opts: { readonly write: boolean; readonly now?: Date },
+  ): ProvenanceRepairReport {
+    let names: string[];
+    try {
+      names = readdirSync(this.chaptersDir).filter((name) => name.endsWith('.md')).sort();
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { chapters: [], backupDir: null };
+      throw new BibleError(`bible chapters dir ${this.chaptersDir} is unreadable: ${String(error)}`);
+    }
+    const planned: { readonly slug: string; readonly original: string; readonly text: string }[] = [];
+    const chapters: ChapterRepairReport[] = [];
+    for (const name of names) {
+      const slug = name.slice(0, -'.md'.length);
+      if (!isLessonsSlug(slug)) {
+        throw new BibleError(`bible chapter file ${join(this.chaptersDir, name)} has an invalid slug filename`);
+      }
+      const original = readFileSync(join(this.chaptersDir, name), 'utf-8');
+      const repaired = repairChapterProvenance(original, slug, journalTs);
+      const capped = enforceChapterCap(repaired.chapter, this.chapterCapBytes);
+      const changed = capped.text !== original;
+      const count = (chapter: BibleChapter): number =>
+        chapter.lessons.filter((lesson) => lesson.slug !== ARCHIVED_LESSON_SLUG).length;
+      chapters.push({
+        slug,
+        changed,
+        linesRewritten: repaired.linesRewritten,
+        lessonsBefore: count(repaired.chapter),
+        lessonsAfter: count(capped.chapter),
+        provenanceTrimmed: capped.provenanceTrimmed,
+        bodiesTrimmed: capped.trimmed,
+        lessonsDropped: capped.droppedLessons,
+        bytes: Buffer.byteLength(capped.text, 'utf8'),
+      });
+      if (changed) planned.push({ slug, original, text: capped.text });
+    }
+    if (!opts.write || planned.length === 0) return { chapters, backupDir: null };
+
+    const stamp = (opts.now ?? new Date()).toISOString().replace(/[:.]/gu, '-');
+    const backupDir = join(this.dir, `.repair-backup-${stamp}`);
+    mkdirSync(join(backupDir, BIBLE_CHAPTERS_DIR), { recursive: true, mode: 0o700 });
+    for (const write of planned) {
+      this.writeAtomic(join(backupDir, BIBLE_CHAPTERS_DIR, `${write.slug}.md`), write.original);
+    }
+    for (const write of planned) {
+      this.writeAtomic(join(this.chaptersDir, `${write.slug}.md`), write.text);
+    }
+    this.log('info', 'bible provenance repaired', {
+      chapters_written: planned.length,
+      backup_dir: backupDir,
+    });
+    return { chapters, backupDir };
   }
 
   /**
@@ -445,6 +538,54 @@ function splitProvenance(value: string, chapterSlug: string, lessonSlug: string)
   return refs;
 }
 
+/**
+ * Rebuild every lesson `provenance:` line as canonical `<id>@<journal ts>`
+ * from the journal, the ground truth. Recovers hand-edited shapes the
+ * strict parser rejects (`…; earlier: j-869, j-878`, `j-907,<ts>`) without
+ * guessing: every cited `j-<seq>` must exist in the journal, or this throws.
+ * Handles are deduped and ordered oldest → newest, the order the dream
+ * appends in. Only lesson metadata lines are touched — never body text.
+ */
+export function repairChapterProvenance(
+  text: string,
+  slug: string,
+  journalTs: ReadonlyMap<string, string>,
+): { readonly chapter: BibleChapter; readonly linesRewritten: number } {
+  let linesRewritten = 0;
+  let inMeta = false;
+  const lines = text.split(/\r?\n/).map((line) => {
+    // Mirrors parseChapter/parseLesson: a `## ` anchor opens a lesson's
+    // metadata block; the first non-blank, non-metadata line closes it.
+    if (line.startsWith('## ')) {
+      inMeta = true;
+      return line;
+    }
+    if (!inMeta) return line;
+    const meta = LESSON_META_LINE.exec(line);
+    if (meta === null) {
+      if (line.trim() !== '') inMeta = false;
+      return line;
+    }
+    if (meta[1] !== 'provenance') return line;
+    const ids = [...new Set((meta[2] ?? '').match(/\bj-\d+\b/gu) ?? [])];
+    const refs = ids
+      .map((id) => {
+        const ts = journalTs.get(id);
+        if (ts === undefined) {
+          throw new BibleError(
+            `chapter ${slug}.md cites journal id ${id}, which is not in the journal — refusing to invent provenance`,
+          );
+        }
+        return { id, ts };
+      })
+      .sort((left, right) => left.ts.localeCompare(right.ts) || left.id.localeCompare(right.id));
+    const canonical = `provenance: ${refs.map((ref) => `${ref.id}@${ref.ts}`).join(', ')}`;
+    if (canonical !== line) linesRewritten += 1;
+    return canonical;
+  });
+  return { chapter: parseChapter(lines.join('\n'), slug), linesRewritten };
+}
+
 // ------------------------------------------------------------------
 // Index rendering / parsing
 // ------------------------------------------------------------------
@@ -631,14 +772,16 @@ function applyLessonUpdates(
 }
 
 /**
- * Enforce the chapter byte cap: trim lesson bodies toward the bone, then
- * drop the least-valuable lessons (lowest `recurred`, oldest provenance)
- * into an `archived-provenance` record so nothing vanishes without a
- * journal handle. Deterministic and total: the returned text is <= cap or
- * the function throws.
+ * Enforce the chapter byte cap: release the oldest provenance handles of
+ * the most-cited lessons (never below the newest PROVENANCE_FLOOR), then
+ * trim lesson bodies toward the bone, then drop the least-valuable lessons
+ * (lowest `recurred`, oldest provenance) into an `archived-provenance`
+ * record so nothing vanishes without a journal handle. Deterministic and
+ * total: the returned text is <= cap or the function throws.
  */
 export function enforceChapterCap(chapter: BibleChapter, capBytes: number): ChapterCapResult {
   const lessons = chapter.lessons.map((lesson) => ({ ...lesson }));
+  let provenanceTrimmed = 0;
   let trimmed = 0;
   let droppedLessons = 0;
   const droppedProvenance: ProvenanceRef[] = [];
@@ -651,8 +794,33 @@ export function enforceChapterCap(chapter: BibleChapter, capBytes: number): Chap
   };
   rebuild();
 
-  for (let guard = 0; guard < 1_000; guard += 1) {
+  // One step per iteration; a chapter may release hundreds of handles.
+  for (let guard = 0; guard < 10_000; guard += 1) {
     if (size(current) <= capBytes) break;
+    // (0) provenance is elastic first, before any lesson text: the archive
+    // record's handles go first (down to one), then the OLDEST handle of the
+    // lesson citing the most, keeping its newest PROVENANCE_FLOOR handles.
+    let widest = lessons.findIndex(
+      (lesson) => lesson.slug === ARCHIVED_LESSON_SLUG && lesson.provenance.length > 1,
+    );
+    if (widest === -1) {
+      for (let index = 0; index < lessons.length; index += 1) {
+        const lesson = lessons[index]!;
+        if (lesson.slug === ARCHIVED_LESSON_SLUG || lesson.provenance.length <= PROVENANCE_FLOOR) continue;
+        if (widest === -1 || lesson.provenance.length > lessons[widest]!.provenance.length) widest = index;
+      }
+    }
+    if (widest !== -1) {
+      const lesson = lessons[widest]!;
+      let oldest = 0;
+      for (let index = 1; index < lesson.provenance.length; index += 1) {
+        if (lesson.provenance[index]!.ts < lesson.provenance[oldest]!.ts) oldest = index;
+      }
+      lessons[widest] = { ...lesson, provenance: lesson.provenance.filter((_, index) => index !== oldest) };
+      provenanceTrimmed += 1;
+      rebuild();
+      continue;
+    }
     // (1) shorten the longest trimmable body by the overshoot.
     let longest = -1;
     for (let index = 0; index < lessons.length; index += 1) {
@@ -727,7 +895,14 @@ export function enforceChapterCap(chapter: BibleChapter, capBytes: number): Chap
       `chapter ${chapter.slug} cannot fit ${capBytes} bytes even after trimming and dropping — raise lessons.chapter_cap_bytes`,
     );
   }
-  return { chapter: current, text: serializeChapter(current), trimmed, droppedLessons, droppedProvenance };
+  return {
+    chapter: current,
+    text: serializeChapter(current),
+    provenanceTrimmed,
+    trimmed,
+    droppedLessons,
+    droppedProvenance,
+  };
 }
 
 function withArchive(
