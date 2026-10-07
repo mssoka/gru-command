@@ -1806,9 +1806,9 @@ describe('administrative closeout of a parked PR-backed job', () => {
       }
       expect(api.adminCloseParkedJob(closeoutRequest('closeout-atomic')).job.status).toBe('done');
       expect(api.listObligations({ jobId: 'closeout-atomic', state: 'open' })).toHaveLength(0);
-      const settled = api.listObligations({ jobId: 'closeout-atomic', state: 'settled' });
-      expect(settled).toHaveLength(1);
-      expect(settled[0]?.settlement).toMatchObject({ kind: 'job-terminal', jobStatus: 'done' });
+      const closed = api.listObligations({ jobId: 'closeout-atomic', state: 'closed' });
+      expect(closed).toHaveLength(1);
+      expect(closed[0]?.settlement).toMatchObject({ kind: 'job-terminal', jobStatus: 'done' });
     } finally {
       db.close();
       rmSync(dir, { recursive: true, force: true });
@@ -2076,9 +2076,10 @@ describe('owner-listed administrative cancellation (owner amendment j-1117)', ()
       // The retry commits once and closes the obligation as terminal debt.
       expect(api.adminCancelListedParkedJob(cancelRequest(LISTED)).job.status).toBe('done');
       expect(api.listObligations({ jobId: LISTED, state: 'open' })).toHaveLength(0);
-      const settled = api.listObligations({ jobId: LISTED, state: 'settled' });
-      expect(settled).toHaveLength(1);
-      expect(settled[0]?.settlement).toMatchObject({ kind: 'job-terminal', jobStatus: 'done' });
+      // Terminal administrative closure = `closed` (no settlement claim).
+      const closed = api.listObligations({ jobId: LISTED, state: 'closed' });
+      expect(closed).toHaveLength(1);
+      expect(closed[0]?.settlement).toMatchObject({ kind: 'job-terminal', jobStatus: 'done' });
     } finally {
       db.close();
       rmSync(dir, { recursive: true, force: true });
@@ -2110,22 +2111,31 @@ describe('owner-listed administrative cancellation (owner amendment j-1117)', ()
       api.setJobStatus(reportId, 'parked');
       expect(refusalOf(() => api.adminCancelListedParkedJob(cancelRequest(reportId))).code).toBe('not-cancellable-shape');
       const shapedIds: string[] = [];
-      for (const [index, metadata] of [
-        { commissioner: 'gru' },
-        { targetRef: 'https://github.com/acme/gru-command/pull/9' },
-        { targetSha: 'a'.repeat(40) },
-      ].entries()) {
+      const shapeCase = (index: number, apply: (id: string) => void): void => {
         const shapedId = OWNER_CANCELLATION_JOB_IDS[5 + index]!;
-        api.addJob({ id: shapedId, repo: 'gru-command', title: 't', briefing: 'b', ...metadata });
+        api.addJob({ id: shapedId, repo: 'gru-command', title: 't', briefing: 'b' });
         api.setJobStatus(shapedId, 'working');
         api.setJobStatus(shapedId, 'parked');
-        expect(
-          refusalOf(() => api.adminCancelListedParkedJob(cancelRequest(shapedId))).code,
-          JSON.stringify(metadata),
-        ).toBe('not-cancellable-shape');
-        expect(api.getJob(shapedId)?.status, JSON.stringify(metadata)).toBe('parked');
+        apply(shapedId);
+        expect(refusalOf(() => api.adminCancelListedParkedJob(cancelRequest(shapedId))).code, shapedId).toBe(
+          'not-cancellable-shape',
+        );
+        expect(api.getJob(shapedId)?.status, shapedId).toBe('parked');
         shapedIds.push(shapedId);
-      }
+      };
+      // Legacy rows may carry report fields without a deliverable: each is
+      // the wrong shape on its own, never folded into abandonment.
+      shapeCase(0, (id) => {
+        db.handle.prepare('UPDATE jobs SET commissioner = ? WHERE id = ?').run('gru', id);
+      });
+      shapeCase(1, (id) => {
+        db.handle
+          .prepare('UPDATE jobs SET target_ref = ? WHERE id = ?')
+          .run('https://github.com/acme/gru-command/pull/9', id);
+      });
+      shapeCase(2, (id) => {
+        db.handle.prepare('UPDATE jobs SET target_sha = ? WHERE id = ?').run('a'.repeat(40), id);
+      });
 
       // Malformed authority / reason are plain 400-class input errors.
       expect(() => api.adminCancelListedParkedJob(cancelRequest(LISTED, { authorityReference: '' }))).toThrow(/authority_reference/u);
