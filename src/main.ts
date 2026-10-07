@@ -1041,7 +1041,8 @@ async function main(): Promise<number> {
     decisionsStatus: () => decisionRuntime.status(),
     onDecisionsRecheck: () => decisionRuntime.recheck(),
     siblingUpgradePaths: ['/ws'],
-    // Authoritative liveness at the closeout commit boundary (issue #171):
+    // Authoritative liveness sampled immediately before the closeout commit,
+    // in the same macrotask (issue #171):
     // live registry handles only (durable stops are not execution), plus
     // the supervisor's open turn/control/tool-call view, so a ledger `idle`
     // row with an effective open turn can never be closed out as quiescent.

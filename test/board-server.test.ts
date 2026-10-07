@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { createServer, type Server as HttpServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { WebSocket, type RawData } from 'ws';
+import { createScanner, ScriptTarget, SyntaxKind } from 'typescript';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { EventBus } from '../src/events/bus.js';
 import { BoardEngine } from '../src/board/engine.js';
@@ -585,6 +586,25 @@ describe('board server — HTTP API', () => {
     }
   });
 
+  /** Strip line and block comments with the TypeScript scanner (never a
+   * regex over raw text), keeping the newlines so line anchors stay
+   * meaningful. A commented-out wiring must not satisfy the assembly
+   * alarm below. */
+  function stripSourceComments(text: string): string {
+    const scanner = createScanner(ScriptTarget.Latest, false, undefined, text);
+    let out = '';
+    let last = 0;
+    for (let kind = scanner.scan(); kind !== SyntaxKind.EndOfFileToken; kind = scanner.scan()) {
+      if (kind === SyntaxKind.SingleLineCommentTrivia || kind === SyntaxKind.MultiLineCommentTrivia) {
+        out += text.slice(last, scanner.getTokenPos());
+        out += text.slice(scanner.getTokenPos(), scanner.getTextPos()).replace(/[^\n]/gu, ' ');
+        last = scanner.getTextPos();
+      }
+    }
+    out += text.slice(last);
+    return out;
+  }
+
   it('the main assembly wires the authoritative closeout runtime probe (assembly alarm)', () => {
     // The behavior has unit coverage but the production composition does
     // not: dropping this wiring — or wiring a falsified constant instead
@@ -592,18 +612,23 @@ describe('board server — HTTP API', () => {
     // only and no behavioral test would fail (same alarm pattern as the
     // supervisor-stop wiring pin). The match is LINE-ANCHORED on purpose:
     // a commented-out or decoy copy of the same text must not satisfy it.
-    const mainSource = readFileSync(join(import.meta.dirname, '..', 'src', 'main.ts'), 'utf8');
+    const mainSource = stripSourceComments(readFileSync(join(import.meta.dirname, '..', 'src', 'main.ts'), 'utf8'));
     const wiringLines = mainSource.split('\n').filter((line) => /^\s*closeoutRuntime:/.test(line));
     expect(wiringLines, 'exactly one active closeoutRuntime property').toHaveLength(1);
     expect(wiringLines[0]).toMatch(/^\s*closeoutRuntime:\s*\(\)\s*=>\s*\(\{/u);
-    expect(mainSource).toMatch(/^\s*liveHandleIds:\s*new Set\(registry\.listHandles\(\)\.map\(\(handle\) => handle\.id\)\),/mu);
-    expect(mainSource).toMatch(/^\s*supervisionFor:\s*\(agentId\)\s*=>\s*\{/mu);
-    expect(mainSource).toMatch(/^\s*const view = supervisorLive\.viewFor\(agentId\);/mu);
-    expect(mainSource).toMatch(/^\s*state:\s*view\.state,/mu);
-    expect(mainSource).toMatch(/^\s*breakerOpen:\s*view\.breakerOpen,/mu);
-    expect(mainSource).toMatch(/^\s*openTurn:\s*view\.openTurn,/mu);
-    expect(mainSource).toMatch(/^\s*openControl:\s*view\.openControl === true,/mu);
-    expect(mainSource).toMatch(/^\s*openToolCalls:\s*view\.openToolCalls,/mu);
+    // Scope the mapping checks to the block that follows the property: the
+    // same `viewFor(agentId)` text also occurs elsewhere in main.ts, and an
+    // unscoped match could satisfy the pin without the wiring.
+    const start = mainSource.search(/^\s*closeoutRuntime:/mu);
+    const block = mainSource.slice(start, start + 1_500);
+    expect(block).toMatch(/^\s*liveHandleIds:\s*new Set\(registry\.listHandles\(\)\.map\(\(handle\) => handle\.id\)\),/mu);
+    expect(block).toMatch(/^\s*supervisionFor:\s*\(agentId\)\s*=>\s*\{/mu);
+    expect(block).toMatch(/^\s*const view = supervisorLive\.viewFor\(agentId\);/mu);
+    expect(block).toMatch(/^\s*state:\s*view\.state,/mu);
+    expect(block).toMatch(/^\s*breakerOpen:\s*view\.breakerOpen,/mu);
+    expect(block).toMatch(/^\s*openTurn:\s*view\.openTurn,/mu);
+    expect(block).toMatch(/^\s*openControl:\s*view\.openControl === true,/mu);
+    expect(block).toMatch(/^\s*openToolCalls:\s*view\.openToolCalls,/mu);
   });
 
   it('write endpoints reject bad bodies and missing entities', async () => {

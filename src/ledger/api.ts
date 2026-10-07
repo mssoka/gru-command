@@ -1883,13 +1883,16 @@ export class LedgerApi {
 
   /** The authoritative live-work fence for both closeout forms. Durable
    * execution markers (open worker turns, non-terminal tracked children,
-   * live review rounds, unsettled verification runs) always block. With
-   * the runtime probe wired, the supervisor's open turn/control/tool
-   * activity and openControl block even when the ledger row reads `idle`
-   * (the observed false-idle case), a LIVE registry handle for a
-   * job-bound agent blocks as live task ownership, and an explicit
-   * supervision stop (stopped / breaker open) is NOT live work — durable
-   * stops stay `current` in the board's union but are not execution.
+   * live review rounds, unsettled verification runs) block. With the
+   * runtime probe wired, the supervisor's open turn/control/tool activity
+   * and openControl block even when the ledger row reads `idle` (the
+   * observed false-idle case), and a LIVE registry handle for a job-bound
+   * agent blocks as live task ownership. An explicit supervision stop
+   * (state stopped or breaker open) SHORT-CIRCUITS the agent's remaining
+   * clauses: the recorded stop is the runtime's own cessation signal, so
+   * a durable `streaming` row or a not-yet-disposed handle behind it is
+   * stale bookkeeping, not execution (disposal after a stop is
+   * best-effort; the stop precedence is documented in docs/LEDGER.md).
    * Without a probe, only the durable markers answer. Idle/disposed/
    * historical bookkeeping rows are never execution evidence; directive/
    * re-brief control rows are owned by their own reconcilers and are

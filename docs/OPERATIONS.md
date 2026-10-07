@@ -178,7 +178,10 @@ Preconditions (all enforced; every refusal is a loud no-effect failure):
   refused;
 - no target-owned live work: spawning/streaming worker turns, non-terminal
   tracked child workers, pending/live review rounds or unsettled
-  verification runs.
+  verification runs. A supervisor-recorded stop (state stopped or breaker
+  open) is not live work: it short-circuits that agent's remaining clauses
+  (disposal after a stop is best-effort), and a live handle behind a stop
+  does not block.
 
 Request (pairing token in `Authorization: Bearer`):
 
@@ -249,7 +252,8 @@ request, anything else is refused (`not-listed`), and there is no batch
 apply. The guard also requires the lane to be `parked`, PR-free and
 report-metadata-free, and refuses when any target-owned work is actually
 live — including a ledger-`idle` worker with an open supervisor turn, or
-a live registry-owned session. Cancellation is an abandonment record,
+a live registry-owned session. A supervisor-recorded stop (stopped or
+breaker open) is not live work, as above. Cancellation is an abandonment record,
 never a passing review or successful implementation: it does not touch
 branches, worktrees, transcripts, report findings, directives, UNKNOWN
 producer/admission evidence or preservation holds, and it mints no owner
