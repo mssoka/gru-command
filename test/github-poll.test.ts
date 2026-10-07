@@ -568,18 +568,30 @@ function eventCount(ledger: LedgerApi, jobId: string, kind: string): number {
 }
 
 describe('github signal poll tick', () => {
-  it('a merge signal for a binned lane is skipped cleanly — terminal lanes never resurrect', async () => {
+  it('a merge signal that arrives after the lane was binned is skipped — terminal lanes never resurrect', async () => {
     const h = makeLedger();
     try {
+      // The lane is trackable when the tick starts and is DISCARDED (binned)
+      // during the fetch — the apply-time race the defensive skip owns.
       addTrackedJob(h.ledger, 'job-binned', 'https://github.com/acme/app/pull/12');
-      h.ledger.setJobStatus('job-binned', 'binned');
       const api = new FakeGhApi();
       api.pulls.set('acme/app', [
         pull({ number: 12, headRef: 'gru/job-binned', headSha: 'sha-12', merged: true, mergeCommitSha: 'mc-12', url: 'https://github.com/acme/app/pull/12' }),
       ]);
+      const originalList = api.listPulls.bind(api);
+      let discarded = false;
+      api.listPulls = async (input) => {
+        const pulls = await originalList(input);
+        if (!discarded) {
+          discarded = true;
+          h.ledger.setJobStatus('job-binned', 'binned');
+        }
+        return pulls;
+      };
       const logs: string[] = [];
       const poll = makePoll({ ledger: h.ledger, api, logs });
       const result = await poll.pollOnce();
+      expect(discarded).toBe(true);
       expect(result.signals.map((signal) => signal.kind)).toEqual(['pr-merged']);
       // The discarded lane stays binned: no in-review resurrection attempt,
       // no "applied:false" failure record and no error log.

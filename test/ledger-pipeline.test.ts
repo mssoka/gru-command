@@ -287,18 +287,29 @@ describe('pipeline ledger — evaluation, order and projection', () => {
     ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'pipe-a', payload: {} });
     expect(ready('pipe-b')).toBe(true); // delivered milestone satisfied
     expect(ready('pipe-c')).toBe(false); // done is NOT merged/other
-    // A DISCARDED prerequisite deliberately does NOT release the dependent:
-    // the premise was cancelled, so the dependent stalls with the discard
-    // named in its reason for the operator — never a silent release.
-    ledger.setJobStatus('pipe-a', 'binned');
-    expect(ready('pipe-b')).toBe(false);
-    expect(ledger.pipelineBoardView(FULL_CAPACITY).entries.find((entry) => entry.id === 'pipe-b')?.reason)
-      .toBe('waiting for pipe-a to be delivered (now binned)');
     ledger.setJobStatus('pipe-a', 'in-review');
     expect(ready('pipe-b')).toBe(true);
     ledger.setJobStatus('pipe-a', 'merged');
     expect(ready('pipe-b')).toBe(true);
     expect(ready('pipe-c')).toBe(false);
+
+    // A DISCARDED prerequisite deliberately does NOT release the
+    // dependent: the premise was cancelled, so the dependent stalls with
+    // the discard named in its reason for the operator — never a silent
+    // release of approved work.
+    enqueue(ledger, 'pipe-disc');
+    enqueue(ledger, 'pipe-disc-child', { prerequisites: [{ id: 'pipe-disc', milestone: 'delivered' }] });
+    ledger.claimPipelineEntry({ id: 'pipe-disc', holder: 'silas' });
+    ledger.addJob({ id: 'pipe-disc', repo: 'demo', title: 'Entry pipe-disc', briefing: 'Briefing for pipe-disc' });
+    ledger.markPipelineAdmitted({ id: 'pipe-disc', jobId: 'pipe-disc' });
+    ledger.setJobStatus('pipe-disc', 'working');
+    ledger.setJobStatus('pipe-disc', 'delivered');
+    ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'pipe-disc', payload: {} });
+    expect(ready('pipe-disc-child')).toBe(true);
+    ledger.setJobStatus('pipe-disc', 'binned');
+    expect(ready('pipe-disc-child')).toBe(false);
+    expect(ledger.pipelineBoardView(FULL_CAPACITY).entries.find((entry) => entry.id === 'pipe-disc-child')?.reason)
+      .toBe('waiting for pipe-disc to be delivered (now binned)');
     db.close();
   });
 

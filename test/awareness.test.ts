@@ -922,8 +922,9 @@ describe('gru awareness — morning digest (owner ruling 2026-09-23)', () => {
       expect(morning?.text).toContain('- fires: 1 wake delivered');
       expect(morning?.text).toContain('- actions:');
       expect(morning?.text).toContain('- merges: j-merge');
-      expect(morning?.text).toContain('- staged PRs: j-staged');
-      expect(morning?.text).not.toContain('j-discard');
+      const stagedLine = morning?.text.split('\n').find((line) => line.startsWith('- staged PRs:')) ?? '';
+      expect(stagedLine).toContain('j-staged');
+      expect(stagedLine).not.toContain('j-discard'); // a discard is not staged work
 
       // Committing consumes the digest: the next nearby block has none.
       rig.awareness.commit(morning!);
