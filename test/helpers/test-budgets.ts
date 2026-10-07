@@ -89,6 +89,10 @@ export const HEAVY_TESTS: readonly HeavyTestEntry[] = Object.freeze([
     workload: 'whole-review engine over real worktrees and git',
   },
   { file: 'rehearsal.test.ts', workload: 'package/build/install rehearsal with real npm' },
+  {
+    file: 'review-inputs-wave.test.ts',
+    workload: 'real git fixture repos and review worktrees across three wave freezes',
+  },
   { file: 'service-port-guard.test.ts', workload: 'real service spawns and port behavior' },
   { file: 'shutdown.test.ts', workload: 'real service signal lifecycle' },
   {

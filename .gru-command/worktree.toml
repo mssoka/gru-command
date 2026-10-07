@@ -575,7 +575,7 @@ parked-closeout-static = "node tools/patch-vitest-rpc-timeout.mjs && npm run lin
 # files whose fixture cost starved the full gate's fast phase, plus the
 # whole fast phase for wall-time measurement. Committed scheduler scopes;
 # plain vitest invocations at unchanged budgets, RPC patch first.
-parked-closeout-repair = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/review-build-identity.test.ts test/review-inputs-wave.test.ts test/review-inputs-handoff.test.ts"
+parked-closeout-repair = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/review-inputs-wave.test.ts && npx vitest run test/review-build-identity.test.ts test/review-inputs-handoff.test.ts"
 repair-fast-phase = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run"
 
 # Verification-repair diagnostics for the identity fixture's build
