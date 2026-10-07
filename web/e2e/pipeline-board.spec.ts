@@ -376,17 +376,45 @@ async function hitTarget(page: Page, selector: string): Promise<HitTarget> {
   }, selector);
 }
 
-/** Bring a content control fully into view before the strict containment
- * probe. Centering is deterministic across sub-pixel scroll offsets — the
- * minimal-scroll path could leave a control's edge 0<1px past the fold and
- * was the observed cause of the b86af16 pipeline failures (runs
- * f6998e40/52b744fa). The probe itself stays strict; this only fixes the
- * interaction precondition. */
+/** Make a control actually reachable before the strict containment probe:
+ * keep the browser's minimal placement, then iteratively correct residual
+ * edge overflow (the sub-pixel sliver that caused the b86af16 failures,
+ * runs f6998e40/52b744fa) and sticky-chrome occlusion with explicit
+ * scrolls — the scroll a real user would perform. Bounded; if the control
+ * cannot be cleared, the strict probe below still fails truthfully. The
+ * oracle admits nothing off-viewport. */
 async function scrollFullyIntoView(page: Page, selector: string): Promise<void> {
   await page
     .locator(selector)
     .first()
-    .evaluate((el) => el.scrollIntoView({ block: 'center', inline: 'nearest' }));
+    .evaluate((el) => {
+      el.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+      const pad = 8;
+      for (let i = 0; i < 6; i += 1) {
+        const rect = el.getBoundingClientRect();
+        const top = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+        const covered = !(top !== null && (top === el || el.contains(top)));
+        if (covered) {
+          // Move the control down (scroll the document up) just enough to
+          // clear the covering sticky element, never past the fold.
+          const coverBottom = top === null ? 0 : top.getBoundingClientRect().bottom;
+          const roomDown = Math.max(0, window.innerHeight - pad - rect.bottom);
+          const move = Math.min(Math.max(0, coverBottom + pad - rect.top), roomDown);
+          if (move <= 0.5) break;
+          window.scrollBy(0, -move);
+          continue;
+        }
+        if (rect.bottom > window.innerHeight - pad) {
+          window.scrollBy(0, rect.bottom - (window.innerHeight - pad));
+          continue;
+        }
+        if (rect.top < pad) {
+          window.scrollBy(0, rect.top - pad);
+          continue;
+        }
+        break;
+      }
+    });
 }
 
 async function expectReachable(page: Page, selector: string): Promise<void> {
