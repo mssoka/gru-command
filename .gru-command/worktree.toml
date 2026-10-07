@@ -621,6 +621,15 @@ binned-baseline = 'set -e; base=84aec28b04ddc406f26c458383452318f8cb7ed1; headre
 # stays as-is.
 strip-browser = "(cd web && npm run e2e -- --project=mock e2e/dashboard-strip.spec.ts)"
 
+# Focused smoke migration proof (this lane edits web/e2e/smoke.spec.ts: the
+# rail assertions move to the slim-strip DOM, so the mock project's smoke
+# suite must be exercised at the final head). Same runner discipline as the
+# sibling focused browser scopes: web typecheck + production web build +
+# the existing mock project filtered to smoke.spec.ts only; serial/retry/
+# 30s settings unchanged; never the unfiltered mock roster (its unrelated
+# pre-existing working-flavor failures stay outside this diff).
+strip-smoke = "node tools/patch-vitest-rpc-timeout.mjs && cd web && node ../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json && node node_modules/vite/bin/vite.js build && node ../node_modules/@playwright/test/cli.js test --project=mock smoke.spec.ts"
+
 # Focused iteration/debug subset for this lane's FINAL source: the three web
 # unit files that carry the slim-strip regressions, run against the
 # committed head in the lane's own web workspace with the same vitest bin
