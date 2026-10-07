@@ -291,6 +291,11 @@ describe('board server — HTTP API', () => {
     expect((legal.body as { status: string }).status).toBe('binned');
     // The ordinary audit event preserves the truthful prior status.
     expect(api.latestJobEvent('audit-binned', 'job.status')?.payload).toEqual({ from: 'dispatched', to: 'binned' });
+    // A repeated identical write is an idempotent 200 no-op (no event).
+    const rebinEvents = api.listJobEvents('audit-binned').length;
+    const rebin = await postJson(port, '/api/jobs/audit-binned/status', 'board-test-token', { status: 'binned' });
+    expect(rebin.status).toBe(200);
+    expect(api.listJobEvents('audit-binned').length).toBe(rebinEvents);
 
     // Terminal: no resumption, and a closed merged lane refuses binning.
     const resume = await postJson(port, '/api/jobs/audit-binned/status', 'board-test-token', { status: 'working' });

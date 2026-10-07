@@ -578,7 +578,15 @@ parked-closeout-static = "node tools/patch-vitest-rpc-timeout.mjs && npm run lin
 # thresholds, approved RPC patch first, exits never masked. The static
 # scope carries lint/typecheck/build plus the web compiler for the changed
 # web surface.
-binned-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/ledger-api.test.ts test/ledger-obligations.test.ts test/board-engine-v4.test.ts test/board-server.test.ts test/suite-shape.test.ts && cd web && ../node_modules/.bin/vitest run src/lib/board-signals.test.ts src/lib/board-kpi.test.ts src/lib/board-bands.test.ts src/lib/board-sections.test.ts src/ui/board.test.ts"
+# Round-1 review repairs expanded the pinned consumer set: the ledger
+# machine/obligations/API audit, the board projections (engine v4 + shared
+# live/receipt fixture), their no-resume consumers (pipeline milestones,
+# amendments, directive intents, provider recovery, phase handoffs, chat
+# awareness, GitHub merge polling, Silas release rows, yield telemetry),
+# and the suite pins. The two process-heavy suites the repairs touch run
+# as filtered cases under the classified heavy config in `binned-heavy`.
+binned-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/ledger-api.test.ts test/ledger-obligations.test.ts test/board-engine-v4.test.ts test/board-server.test.ts test/board-engine.test.ts test/ledger-pipeline.test.ts test/job-amendments.test.ts test/directive-markers.test.ts test/provider-recovery-resume.test.ts test/provider-recovery-sensor.test.ts test/phase-handoffs.test.ts test/awareness.test.ts test/github-poll.test.ts test/silas-driver.test.ts test/yield-report.test.ts test/suite-shape.test.ts && cd web && ../node_modules/.bin/vitest run src/lib/board-signals.test.ts src/lib/board-kpi.test.ts src/lib/board-bands.test.ts src/lib/board-sections.test.ts src/ui/board.test.ts"
+binned-heavy = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/perkins-builtin-wave.test.ts -t \"rejects terminal jobs and lane-less jobs|skips replay for a terminal job\" && npx vitest run --config vitest.heavy.config.ts test/dispatch-server.test.ts -t \"terminal jobs refuse|refuses unknown and terminal jobs\""
 binned-static = "node tools/patch-vitest-rpc-timeout.mjs && npm run lint && npm run typecheck && npm run build && cd web && node ../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json"
 
 # Fails-before evidence (acceptance: preserve a meaningful fail-before

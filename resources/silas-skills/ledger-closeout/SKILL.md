@@ -55,7 +55,8 @@ close-out: a ledger-visible end state a stranger can audit.
    After escalating, leave the lane exactly as it is and say so in your
    completion note. Do not re-escalate the same state on every sweep: the
    digest stops listing a verdict once your rung lands.
-5. **Lanes.** A lane releases only when the job is terminal (merged/done)
+5. **Lanes.** A lane releases only when the job is terminal
+   (merged/done/binned)
    or explicitly abandoned by the chief. The digest's `releaseEligible`
    rows are the terminal lanes still held: release with `by:silas` +
    `rule_id:sweep-ack` so the `silas.lane-released` receipt lands (issue

@@ -1291,6 +1291,38 @@ describe('board v6 — bands', () => {
     expect(document.querySelector('.board-band--cold [data-job-id="binned-1"]')).toBeNull();
   });
 
+  it('labels the binned disclosure with its count and preserves it across snapshot pushes', () => {
+    const view = new BoardView(() => {});
+    const first = snapshot({
+      jobs: [
+        baseJob({ id: 'binned-a', status: 'binned' }),
+        baseJob({ id: 'binned-b', status: 'binned' }),
+      ],
+    });
+    view.render(first);
+    expandCold();
+    const toggle = document.querySelector<HTMLButtonElement>('.board-band--cold .board-band__more--binned');
+    expect(toggle?.textContent).toBe('Show 2 binned records');
+    toggle?.click();
+    expect(document.querySelectorAll('.board-band--cold [data-job-id^="binned-"]')).toHaveLength(2);
+    // Disclosures are session state: a live snapshot push never reopens or
+    // force-closes the operator's view (the COLD disclosure convention).
+    view.render(
+      snapshot({
+        jobs: [...first.repos[0]!.jobs, baseJob({ id: 'binned-c', status: 'binned' })],
+      }),
+    );
+    const reopened = document.querySelector<HTMLButtonElement>('.board-band--cold .board-band__more--binned');
+    expect(reopened?.textContent).toBe('Hide binned');
+    expect(reopened?.getAttribute('aria-expanded')).toBe('true');
+    expect(document.querySelectorAll('.board-band--cold [data-job-id^="binned-"]')).toHaveLength(3);
+    // ... and the disclosure stays reversible.
+    reopened?.click();
+    expect(document.querySelectorAll('.board-band--cold [data-job-id^="binned-"]')).toHaveLength(0);
+    expect(document.querySelector<HTMLButtonElement>('.board-band--cold .board-band__more--binned')?.textContent)
+      .toBe('Show 3 binned records');
+  });
+
   it('renders no binned disclosure when the snapshot has no binned rows', () => {
     const view = new BoardView(() => {});
     view.render(snapshot({ jobs: [] }));

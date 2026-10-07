@@ -254,8 +254,11 @@ curl -sS -X POST "http://127.0.0.1:<port>/api/jobs/<job-id>/status" \
 - `200` — the job is `binned`; the ordinary `job.status` event records
   `<prior> → binned` and the board shows the row in COLD behind the
   “Show N binned records” disclosure.
-- `400` — illegal transition (from `merged`/`done`, or any status after
-  `binned`) or unknown status; nothing changed.
+- `400` — illegal transition (from `merged`/`done`, or any DIFFERENT
+  status after `binned`) or unknown status; nothing changed. Re-sending
+  `{"status":"binned"}` to an already-binned lane is an idempotent
+  200 no-op (the generic same-status write never mints a duplicate
+  event) — a timed-out retry is safe.
 - `401` missing/bad token · `404` unknown job.
 
 There is no unbin: a mistaken bin is corrected by recording the honest

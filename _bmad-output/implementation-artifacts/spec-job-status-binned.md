@@ -82,12 +82,34 @@ context: []
 - Closed-receipt projections are deliberate: binned → `prState` null on both server and web (never an open-PR claim), needs-Gru suppressed, bound notification rows are receipts, obligations settle `{kind:'job-terminal', jobStatus:'binned'}`. Terminal fences in dispatch/provider-recovery/chat/telemetry now route through `isJobTerminal` so a binned lane can never be re-briefed, amended, directed, reviewed, re-dispatched or resurrected by a later merge signal.
 - Board filter: binned rows stay in COLD (complete count) and render only inside the expanded Cold section behind a second explicit `Show N binned records` disclosure; the badge is a dashed muted chip + dot with the visible word `binned`; the binned body keeps ALL rounds (merged/done stay quiescent).
 
-- Workflow state: lane-local BMAD `bmad-build` render `_bmad/render/bmad-build/job-job-status-binned-continuation-20261006-0e52e101bc06/f76b749a098f5191ee57/`. Step-02 was executed against base `84aec28b04ddc406f26c458383452318f8cb7ed1` (equals observed remote main). Checkpoint 1 is auto-resolved under the dispatch briefing's explicit authority (`job-status-binned-continuation-20261006` is the sole owner of investigation/spec, implementation, built-in independent review, fixes, authenticated verification and PR as one complete build); no human is present in the lane. Status set `in-progress`, baseline pinned.
-- No subagent runtime is exposed to this lane's tool surface, so implementation is done directly from the spec (step-03's documented fallback); the built-in review runs as fresh tracked review jobs through `POST /api/dispatch` per the playbook.
 
 ## Spec Change Log
 
 ## Review Triage Log
+
+Round 1 — three fresh tracked review jobs at `e4f3f64481afae6288fee23a79a0611ce2a92aa9` (PR #247), read-only, trees verified unmodified. Reports: `_bmad-output/binned-verify/reviews/{blind-hunter,edge-case-hunter,verification-gap}.md` (+ `.provenance.json` with session sha256). Edge-case hunter: 0 findings.
+
+| ID | Layer | Finding (short) | Verdict | Evidence / disposition |
+|---|---|---|---|---|
+| B1 | blind | `yield.ts` books discards as finished throughput and can deflate cost-per-finished | medium | Real: terminal set made `binned` count in `finishedJobs`. Patched: WIP-terminal keeps the shared declaration; finished-throughput stays merged/done; deterministic binned case added. |
+| B2 | blind | a binned prerequisite stalls its pipeline dependents | low | Real and deliberate: releasing approved work off a cancelled premise would infer progress. Pinned with the stall + named reason in `ledger-pipeline`. |
+| B3 | blind | `derivedPrState` hardcodes done/binned instead of the concluded twin | low | Real drift surface. Patched to ride `isJobConcluded` (future terminal statuses cannot present as open claims). |
+| B4 | blind | shared live/receipt fixture lacks a binned row | low | Real verification gap (same as V4). Patched: fixture + SQL/engine/web assertions. |
+| B5 | blind | obligation test covers only the open case | low | Real. Patched: a parked-suspended debt now pinned closing `job-terminal`/binned. |
+| B6 | blind | four docs still say terminal = merged/done | low | Real. Patched: CHAT/SUPERVISION/UI/BOARD now say merged/done/binned. |
+| B7 | blind | shipped Silas skill text says terminal = merged/done | low | Real shipped-prompt drift. Patched: both skill lines updated. |
+| B8 | blind | terminal-contract comments adjacent to changed code are stale | low | Real. Patched: the cited comments updated to the three-status contract. |
+| B9 | blind + VG-other | spec Implementation Notes duplicated two bullets | low | Real (my artifact). Patched: duplicate removed. |
+| B10 | blind | repeat-binning behavior undocumented/unpinned; docs implied 400 | low | Real. Patched: docs now state the idempotent 200 no-op; ledger + HTTP tests pin it. |
+| B11 | blind | plural binned disclosure label untested | low | Real. Patched: DOM test pins `Show 2 binned records`. |
+| B12 | blind | `binnedExpanded` persistence across pushes undecided/uncovered | low | Real. Resolved as the existing session-disclosure convention (like COLD/FOR GRU); DOM test pins open-across-push and reversibility. |
+| V1 | verification-gap | amendment / directive / re-brief / review-round admission fences unpinned for binned | medium | Real: reverting any guard shipped green. Patched: binned refusals added in amendments, directive intents, dispatch endpoints (filtered heavy case) and the wave `runRound` loop (filtered heavy case). |
+| V2 | verification-gap | provider-recovery + phase-handoff + queued-handoff fences unpinned for binned | medium | Real. Patched: binned variants added in resume/sensor/phase-handoffs plus the handoff-skip loop (filtered heavy case). |
+| V3 | verification-gap | Silas release-eligible + GitHub merge-skip unpinned for binned | medium | Real. Patched: binned release row test + binned merge-signal clean-skip test. |
+| V4 | verification-gap | board/chat live-vs-receipt classification and yield M0 unpinned for binned | medium | Real. Patched: shared fixture extended (SQL + engine + web), awareness staged-PR exclusion, yield M0 binned case. |
+| E0 | edge-case | (no findings) | — | Clean: 0 edge, 0 deletion, 0 claims findings; read-only honored. |
+
+All round-1 findings are verified real (none false/rejected); every one is patched in the fix commit. No intent_gap/bad_spec loopback: the frozen intent already names the terminal contract, and the fixes are code/test/doc completions inside it. Round 2 (fresh whole-change review at the fix head) follows before any READY claim.
 
 ## Design Notes
 

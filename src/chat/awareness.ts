@@ -724,7 +724,8 @@ export class GruAwareness {
     // owner stops remain in subsequent user turns even after the event
     // cursor advanced; only an active wake uses its exclusive bounded batch.
     // Closed receipts (owner decision D1, code review 2026-10-04): machine
-    // rows bound through an agent to a merged/done job are the board's
+    // rows bound through an agent to a terminal (merged/done/binned) job
+    // are the board's
     // receipts. They are LABELED here and rendered under their own
     // section, never counted as machine attention and never wake seeds.
     const owners = exclusiveWake ? null : this.rotatedOwnerQueue();
@@ -1997,7 +1998,8 @@ export class GruAwareness {
   }
 
   /** The ONE receipt rule for every Gru-facing reader (owner decision D1):
-   * a machine row bound through an agent to a merged/done job is a closed
+   * a machine row bound through an agent to a terminal (merged/done/
+   * binned) job is a closed
    * receipt, not live machine attention. The same rule the board renders;
    * unknown/unbound rows stay live. */
   private classifyNotifications<T extends { readonly id: string; readonly agentId: string | null }>(

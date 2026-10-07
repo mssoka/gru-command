@@ -287,6 +287,13 @@ describe('pipeline ledger — evaluation, order and projection', () => {
     ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'pipe-a', payload: {} });
     expect(ready('pipe-b')).toBe(true); // delivered milestone satisfied
     expect(ready('pipe-c')).toBe(false); // done is NOT merged/other
+    // A DISCARDED prerequisite deliberately does NOT release the dependent:
+    // the premise was cancelled, so the dependent stalls with the discard
+    // named in its reason for the operator — never a silent release.
+    ledger.setJobStatus('pipe-a', 'binned');
+    expect(ready('pipe-b')).toBe(false);
+    expect(ledger.pipelineBoardView(FULL_CAPACITY).entries.find((entry) => entry.id === 'pipe-b')?.reason)
+      .toBe('waiting for pipe-a to be delivered (now binned)');
     ledger.setJobStatus('pipe-a', 'in-review');
     expect(ready('pipe-b')).toBe(true);
     ledger.setJobStatus('pipe-a', 'merged');

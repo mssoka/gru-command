@@ -496,7 +496,7 @@ export interface ConflictingPrRow {
   readonly firstSeenAt: string | null;
 }
 
-/** A terminal job (merged/done) still holding its own lane worktree
+/** A terminal job (merged/done/binned) still holding its own lane worktree
  * (issue #117, g21): the sweep-ack rule's firing surface. Swept-only work
  * now APPEARS in the digest — Silas releases the lane through the worktree
  * surface with `by=silas` + `rule_id=sweep-ack`, and the release records

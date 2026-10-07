@@ -444,6 +444,14 @@ describe('eligibility invalidation (acceptance 2)', () => {
     h.ledger.setJobStatus('job-1', 'done');
     await h.sensor.tick();
     expect(h.ledger.listProviderWaits({ status: 'cancelled' })).toHaveLength(1);
+
+    // A binned (discarded) lane retires its wait too — no resurrection.
+    const discarded = new Harness();
+    discarded.makeJob('job-bin');
+    await discarded.establishMinionWait({ jobId: 'job-bin' });
+    discarded.ledger.setJobStatus('job-bin', 'binned');
+    await discarded.sensor.tick();
+    expect(discarded.ledger.listProviderWaits({ status: 'cancelled' })).toHaveLength(1);
   });
 
   it('an already-live replacement minion supersedes the wait', async () => {

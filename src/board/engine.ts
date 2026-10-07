@@ -259,7 +259,8 @@ export interface BoardSnapshot {
   readonly decisions: DecisionRuntimeStatus;
   /** NEEDS GRU: machine-attention rows still awaiting a disposition
    * (self-clearing machine queue; never rings the owner bell). Counted
-   * LIVE: rows bound to a terminal (merged/done) job are closed receipts —
+   * LIVE: rows bound to a terminal (merged/done/binned) job are closed
+   * receipts —
    * the record keeps them, this count (and the banding) does not. Read
    * from the table, not the 30-row feed window, so the tracker is true. */
   readonly unackedActionRequired: number;
@@ -747,7 +748,8 @@ export class BoardEngine {
       attemptsByRound.set(roundId, ledgerLenses);
     }
     // Closed-receipt rule (owner decisions D1/D3): a machine row bound
-    // through an agent to a merged/done job is a receipt, not live work.
+    // through an agent to a terminal (merged/done/binned) job is a
+    // receipt, not live work.
     const concludedJobs = new Set(
       jobs.filter((job) => isJobTerminal(job.status)).map((job) => job.id),
     );
@@ -1133,8 +1135,9 @@ export class BoardEngine {
   /**
    * The closed-receipt rule (owner decisions D1/D3) for out-of-band
    * callers (the paged receipt route): a row bound through an agent to a
-   * merged/done job. The snapshot scan uses a map-built predicate instead
-   * so the unbounded walk stays one query per page.
+   * terminal (merged/done/binned) job. The snapshot scan uses a
+   * map-built predicate instead so the unbounded walk stays one query
+   * per page.
    */
   isClosedReceipt(agentId: string | null): boolean {
     if (agentId === null) return false;

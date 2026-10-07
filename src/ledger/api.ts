@@ -4045,7 +4045,8 @@ export class LedgerApi {
   }
 
   /** The LIVE form of the count above: unacked action-required rows whose
-   * agent binding does NOT belong to a terminal (merged/done) job. A row
+   * agent binding does NOT belong to a terminal (merged/done/binned) job.
+   * A row
    * bound to a terminal job is a closed receipt — the record keeps it
    * (nothing is acked or resolved here), but it is not live Gru work, so
    * the queue count does not count it. Rows with no agent binding stay

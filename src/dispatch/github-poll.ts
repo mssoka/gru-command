@@ -1072,7 +1072,8 @@ export class GitHubSignalPoll {
       detail,
       dedupe: 'unacked',
       // Mechanical (fyi) rows never wake Gru; the binding stays so a
-      // merged/done lane's leftover row is classified as a closed
+      // terminal (merged/done/binned) lane's leftover row is classified
+      // as a closed
       // receipt. The job is already validated by the poll; no bound
       // worker → unbound and live (unknown historical rows are never
       // guessed; tracked-review A4).

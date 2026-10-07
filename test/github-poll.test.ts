@@ -568,6 +568,29 @@ function eventCount(ledger: LedgerApi, jobId: string, kind: string): number {
 }
 
 describe('github signal poll tick', () => {
+  it('a merge signal for a binned lane is skipped cleanly — terminal lanes never resurrect', async () => {
+    const h = makeLedger();
+    try {
+      addTrackedJob(h.ledger, 'job-binned', 'https://github.com/acme/app/pull/12');
+      h.ledger.setJobStatus('job-binned', 'binned');
+      const api = new FakeGhApi();
+      api.pulls.set('acme/app', [
+        pull({ number: 12, headRef: 'gru/job-binned', headSha: 'sha-12', merged: true, mergeCommitSha: 'mc-12', url: 'https://github.com/acme/app/pull/12' }),
+      ]);
+      const logs: string[] = [];
+      const poll = makePoll({ ledger: h.ledger, api, logs });
+      const result = await poll.pollOnce();
+      expect(result.signals.map((signal) => signal.kind)).toEqual(['pr-merged']);
+      // The discarded lane stays binned: no in-review resurrection attempt,
+      // no "applied:false" failure record and no error log.
+      expect(h.ledger.getJob('job-binned')?.status).toBe('binned');
+      expect(h.ledger.latestJobEvent('job-binned', 'github.pr-merged')).toBeNull();
+      expect(logs.filter((line) => line.includes('could not close the lane'))).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it('one tick applies the merged and conflict mappings against a real ledger, with one cursor event per change', async () => {
     const h = makeLedger();
     try {

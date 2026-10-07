@@ -865,7 +865,12 @@ export function computeLedgerMeasures(
   };
 
   // M0 — heists finished in the window and WIP replayed to `until`.
+  // TERMINAL (never WIP) derives from the ledger declaration, so a
+  // discarded `binned` lane leaves the flow. FINISHED throughput stays
+  // merged/done only: a discard is a disposition, not a success, and must
+  // never inflate the finished count or deflate cost-per-finished.
   const terminal = new Set<string>(TERMINAL_JOB_STATUSES);
+  const finished = new Set<string>(['merged', 'done']);
   const statusEvents = events
     .filter((event) => event.kind === 'job.status' && event.jobId !== null)
     .sort((a, b) => a.ts.localeCompare(b.ts) || a.seq - b.seq)
@@ -874,7 +879,7 @@ export function computeLedgerMeasures(
   const finishedJobs = new Set<string>();
   const finishTs = new Map<string, string>();
   for (const event of statusEvents) {
-    if (!terminal.has(event.to) || !inWindow(event.ts, since, until)) continue;
+    if (!finished.has(event.to) || !inWindow(event.ts, since, until)) continue;
     finishedJobs.add(event.jobId);
     if (!finishTs.has(event.jobId)) finishTs.set(event.jobId, event.ts);
   }

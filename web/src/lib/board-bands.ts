@@ -5,7 +5,7 @@
  *   1 NEEDS GRU  — unacked action-required, blocked/error, PR conflicting,
  *                  aborted review, failed lenses in the newest round —
  *                  review-history causes apply only to work that is
- *                  still open: a concluded merged/done job earns NO
+ *                  still open: a concluded merged/done/binned job earns NO
  *                  NEEDS GRU causes at all (closed receipt)
  *   2 IN FLIGHT  — dispatched, fresh working, in-review
  *   3 SETTLED    — delivered, merged today
@@ -284,7 +284,8 @@ export function isStalledWorking(job: JobView, opts: BucketOptions = {}): boolea
 }
 
 /** Every reason a job earns Band 1 (exported for focused tests). A
- * terminal job (merged/done) is a closed receipt: neither stale review
+ * terminal job (merged/done/binned) is a closed receipt: neither stale
+ * review
  * history nor leftover current-state rows may promote it back into NEEDS
  * GRU (section-truth ruling 2026-09-29; the earlier 2026-09-26 guard
  * suppressed only review history and still let current-state causes

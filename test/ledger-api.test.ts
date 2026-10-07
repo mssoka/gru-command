@@ -176,6 +176,11 @@ describe('ledger api — the record of state', () => {
       expect(api.getJob(id)?.status, source).toBe('binned');
       expect(api.listEvents().length, source).toBe(eventsBefore);
     }
+    // Re-binning an already-binned lane is the generic same-status no-op:
+    // no transition, no duplicate event — a timed-out retry is safe.
+    const rebinEvents = api.listEvents().length;
+    expect(api.setJobStatus('binned-from-parked', 'binned').status).toBe('binned');
+    expect(api.listEvents().length).toBe(rebinEvents);
     expect(isJobStatus('binned')).toBe(true);
     expect(isJobTerminal('binned')).toBe(true);
     expect(TERMINAL_JOB_STATUSES).toContain('binned');

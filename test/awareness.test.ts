@@ -910,6 +910,11 @@ describe('gru awareness — morning digest (owner ruling 2026-09-23)', () => {
       rig.api.addJob({ id: 'j-staged', repo: 'demo', title: 'Review me' });
       rig.api.setJobStatus('j-staged', 'working');
       rig.api.setJobPr('j-staged', 'https://example.invalid/pr/2');
+      // A discarded (binned) lane with a registered PR is NOT staged work.
+      rig.api.addJob({ id: 'j-discard', repo: 'demo', title: 'Discard me' });
+      rig.api.setJobStatus('j-discard', 'working');
+      rig.api.setJobPr('j-discard', 'https://example.invalid/pr/3');
+      rig.api.setJobStatus('j-discard', 'binned');
 
       const morning = rig.awareness.prepare();
       expect(morning).not.toBeNull();
@@ -918,6 +923,7 @@ describe('gru awareness — morning digest (owner ruling 2026-09-23)', () => {
       expect(morning?.text).toContain('- actions:');
       expect(morning?.text).toContain('- merges: j-merge');
       expect(morning?.text).toContain('- staged PRs: j-staged');
+      expect(morning?.text).not.toContain('j-discard');
 
       // Committing consumes the digest: the next nearby block has none.
       rig.awareness.commit(morning!);

@@ -309,6 +309,17 @@ describe('guarded claim — every recheck fails visible', () => {
     expect(result).toMatchObject({ outcome: 'skipped' });
     expect(h.ledger.getProviderWait(waitId)?.status).toBe('cancelled');
     expect(h.registry.spawnCalls).toHaveLength(0);
+
+    // A binned (discarded) lane cancels the continuation the same way —
+    // recovery never resurrects a discarded lane.
+    const discarded = new ClaimHarness();
+    const binnedJobId = 'j-binned';
+    const binnedWaitId = await discarded.recoveredMinionWait({ jobId: binnedJobId });
+    discarded.ledger.setJobStatus(binnedJobId, 'binned');
+    const binnedResult = await claimProviderRecoveryContinuation(discarded.deps(), binnedWaitId, 'silas');
+    expect(binnedResult).toMatchObject({ outcome: 'skipped' });
+    expect(discarded.ledger.getProviderWait(binnedWaitId)?.status).toBe('cancelled');
+    expect(discarded.registry.spawnCalls).toHaveLength(0);
   });
 
   it('an owner hold placed JUST before admission cancels the continuation', async () => {

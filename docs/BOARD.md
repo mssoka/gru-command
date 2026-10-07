@@ -199,7 +199,8 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   bounded latest feed: owner-only decisions and stops whose ack re-arms
   supervision), NEEDS GRU (all pending machine rows, including those older
   than the recent feed; it wakes Gru once and refuses human Ack. Rows bound
-  to a terminal merged/done lane are CLOSED RECEIPTS: they render under
+  to a terminal merged/done/binned lane are CLOSED RECEIPTS: they render
+  under
   FEED, never as live queue entries, and the live unacked chip does not
   count them), and FEED (FYI rows plus closed receipts). The bell
   is the alert/history surface: it shares the SAME authoritative owner

@@ -2169,6 +2169,15 @@ describe('dispatch server (E8)', () => {
         job_id: 'done-job', directive: 'fix it',
       }, TOKEN);
       expect(done.status).toBe(400);
+      // A binned (discarded) lane is terminal too — no directive intent.
+      h.ledger.addJob({ id: 'binned-job', repo: 'nowhere', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('binned-job', 'working');
+      h.ledger.setJobStatus('binned-job', 'binned');
+      const discarded = await call(h.port, 'POST', '/api/silas/directive', {
+        job_id: 'binned-job', directive: 'fix it',
+      }, TOKEN);
+      expect(discarded.status).toBe(400);
+      expect(field<string>(discarded.json, 'detail')).toMatch(/terminal lanes take no directives/u);
       // unknown job id fails loud
       const unknown = await call(h.port, 'POST', '/api/silas/directive', {
         job_id: 'no-such-job', directive: 'fix it',
@@ -2303,6 +2312,13 @@ describe('dispatch server (E8)', () => {
       const terminal = await call(h.port, 'POST', '/api/silas/rebrief', { job_id: 'done-rebrief', note: 'x' }, TOKEN);
       expect(terminal.status).toBe(400);
       expect(field<string>(terminal.json, 'detail')).toContain('terminal lanes are never re-briefed');
+      // A binned (discarded) lane refuses the re-brief the same way.
+      h.ledger.addJob({ id: 'binned-rebrief', repo: 'nowhere', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('binned-rebrief', 'working');
+      h.ledger.setJobStatus('binned-rebrief', 'binned');
+      const discardedRebrief = await call(h.port, 'POST', '/api/silas/rebrief', { job_id: 'binned-rebrief', note: 'x' }, TOKEN);
+      expect(discardedRebrief.status).toBe(400);
+      expect(field<string>(discardedRebrief.json, 'detail')).toContain('terminal lanes are never re-briefed');
 
       // No job lane in the registry: the re-brief must fail loud instead of
       // spawning a fresh worker with nowhere to work.

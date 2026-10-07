@@ -590,6 +590,23 @@ describe('obligations — park/terminal act only on APPLICABLE rows; history sur
     // A terminal lane never resumes its debt through the resume surface.
     expect(() => api.resumeObligation('job-discard:operation:quota-exhausted', 'no')).toThrow();
     expect(api.getObligation('job-discard:operation:quota-exhausted')?.state).toBe('closed');
+
+    // A SUSPENDED debt (a parked owner hold) closes on binning the same
+    // way — the suspended arm of closeApplicableObligations is pinned.
+    api.addJob({ id: 'job-discard-susp', repo: 'r', title: 'Suspended then discarded' });
+    api.setJobStatus('job-discard-susp', 'working');
+    api.setJobStatus('job-discard-susp', 'blocked', ownerHoldContext(api.latestEventSeq()));
+    api.setJobStatus('job-discard-susp', 'parked'); // suspends applicable rows
+    expect(
+      api.listObligations({ jobId: 'job-discard-susp' }).every((row) => row.state === 'suspended'),
+    ).toBe(true);
+    api.setJobStatus('job-discard-susp', 'binned');
+    const suspended = api.listObligations({ jobId: 'job-discard-susp' });
+    expect(suspended.every((row) => row.state === 'closed')).toBe(true);
+    expect(suspended.find((row) => row.incidentKey === 'quota-exhausted')?.settlement).toEqual({
+      kind: 'job-terminal',
+      jobStatus: 'binned',
+    });
   });
 
   it('administrative closeout closes suspended obligations as job-terminal and preserves settled history', () => {
