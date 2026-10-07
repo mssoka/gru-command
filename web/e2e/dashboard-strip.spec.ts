@@ -1273,7 +1273,7 @@ test('CHILDREN group appears only when the server reported counters (absent is n
   await expect(children.locator('[data-kpi="children.finished"]')).toHaveText('0');
   await expect(children.locator('[data-kpi="children.lifetimeCreations"]')).toHaveText('0');
   // Present non-zero counts render truthfully.
-  await send(makeSnapshot(slotSpec({ children: { active: 2, queued: 3, finished: 5, lifetimeCreations: 10 } })));
+  await send(makeSnapshot(slotSpec({ gruWakeAgeMs: 300_000, children: { active: 2, queued: 3, finished: 5, lifetimeCreations: 10 } })));
   await expect(children.locator('[data-kpi="children.active"]')).toHaveText('2');
   await expect(children.locator('[data-kpi="children.queued"]')).toHaveText('3');
   await expect(children.locator('[data-kpi="children.finished"]')).toHaveText('5');
@@ -1299,11 +1299,11 @@ test('CHILDREN group appears only when the server reported counters (absent is n
   expect(separators.third.padRight).toBe('0px');
   // The wrapped layout is auditable too: same reserved-slot geometry across
   // two 4-group states (zero → non-zero values in the same slots).
-  const childrenZero = await geometry(page, { expectedKpis: 17, expectedGroups: 4 });
-  await send(makeSnapshot(slotSpec({ children: { active: 4, queued: 0, finished: 6, lifetimeCreations: 20 } })));
+  const childrenFirst = await geometry(page, { expectedKpis: 17, expectedGroups: 4 });
+  await send(makeSnapshot(slotSpec({ gruWakeAgeMs: 300_000, children: { active: 4, queued: 0, finished: 6, lifetimeCreations: 20 } })));
   await expect(children.locator('[data-kpi="children.lifetimeCreations"]')).toHaveText('20');
   const childrenNext = await geometry(page, { expectedKpis: 17, expectedGroups: 4 });
-  comparePairwise(childrenZero, childrenNext);
+  comparePairwise(childrenFirst, childrenNext);
   // The extra group wraps honestly: no body or rail overflow at phone width.
   await page.setViewportSize({ width: 360, height: 800 });
   const overflow = await page.evaluate(
