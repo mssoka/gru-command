@@ -67,23 +67,30 @@ if (positional[0] !== undefined && resolve(positional[0]) !== dataDir) {
 }
 
 const journal = new JournalStore(join(dataDir, 'journal'));
+// The journal is the ground truth only if it is consistent. Every physical
+// record is checked from ONE complete read — no paging, so a duplicate
+// can't hide past a page boundary — before any chapter is planned: each id
+// must be its own sequence, each timestamp a valid instant the provenance
+// format can hold, and no id may carry two different timestamps.
+let records;
+try {
+  records = journal.entries();
+} catch (error) {
+  fail(`the journal is unreadable (${error instanceof Error ? error.message : String(error)}) — nothing was written`);
+}
 const journalTs = new Map();
-// The journal is the ground truth only if it is consistent: every id must
-// be its own sequence, and no id may carry two different timestamps.
-for (let after = 0; ; ) {
-  const page = journal.list({ after, limit: 10_000 });
-  if (page.length === 0) break;
-  for (const entry of page) {
-    if (entry.id !== `j-${entry.seq}`) {
-      fail(`journal entry seq ${entry.seq} is recorded as ${entry.id} — fix the journal first; nothing was written`);
-    }
-    const seen = journalTs.get(entry.id);
-    if (seen !== undefined && seen !== entry.ts) {
-      fail(`journal id ${entry.id} appears twice with different timestamps (${seen}, ${entry.ts}) — fix the journal first; nothing was written`);
-    }
-    journalTs.set(entry.id, entry.ts);
+for (const entry of records) {
+  if (entry.id !== `j-${entry.seq}`) {
+    fail(`journal entry seq ${entry.seq} is recorded as ${entry.id} — fix the journal first; nothing was written`);
   }
-  after = page[page.length - 1].seq;
+  if (/[\s,@]/u.test(entry.ts) || Number.isNaN(Date.parse(entry.ts))) {
+    fail(`journal entry ${entry.id} has an invalid timestamp ${JSON.stringify(entry.ts)} — fix the journal first; nothing was written`);
+  }
+  const seen = journalTs.get(entry.id);
+  if (seen !== undefined && seen !== entry.ts) {
+    fail(`journal id ${entry.id} appears twice with different timestamps (${seen}, ${entry.ts}) — fix the journal first; nothing was written`);
+  }
+  journalTs.set(entry.id, entry.ts);
 }
 
 const bible = new BibleStore(join(dataDir, 'bible'), {
@@ -107,8 +114,7 @@ for (const chapter of report.chapters) {
   out(
     `  ${chapter.changed ? 'CHANGE' : 'ok    '} ${chapter.slug}: lessons ${chapter.lessonsBefore}→${chapter.lessonsAfter}, ` +
       `provenance lines rewritten ${chapter.linesRewritten}, oldest handles released ${chapter.provenanceTrimmed}, ` +
-      `bodies trimmed ${chapter.bodiesTrimmed}, lessons dropped ${chapter.lessonsDropped}, ${chapter.bytes} B, ` +
-      `formatting ${chapter.formatting}`,
+      `bodies trimmed ${chapter.bodiesTrimmed}, lessons dropped ${chapter.lessonsDropped}, ${chapter.bytes} B`,
   );
 }
 const changed = report.chapters.filter((chapter) => chapter.changed).length;

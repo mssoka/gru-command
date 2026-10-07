@@ -15,6 +15,7 @@ import { NotificationCenter } from '../src/notifications/center.js';
 import { TranscriptService } from '../src/transcripts/service.js';
 import { loadConfig } from '../src/config.js';
 import { DecisionRuntime } from '../src/decisions/runtime.js';
+import { DREAM_FAILED_KIND, dreamFailureIncidents } from '../src/lessons/dream.js';
 
 const cleanupDirs: string[] = [];
 afterAll(() => {
@@ -566,6 +567,37 @@ describe('board server — WS push', () => {
       .at(-1) as unknown as { snapshot: { repos: { jobs: { id: string }[] }[] } };
     expect(last.snapshot.repos.some((r) => r.jobs.some((j) => j.id === 'push-job'))).toBe(true);
     await client.close();
+  });
+
+  it('a refreshed incident detail reaches a connected board at once — same id, first failure kept, no heartbeat needed', async () => {
+    const quiet = await boot('ws-refresh-token', { heartbeatMs: 0 });
+    try {
+      const notifications = new NotificationCenter({ ledger: quiet.api, bus: quiet.bus });
+      const times = ['2026-10-07T09:00:00.000Z', '2026-10-07T21:00:00.000Z'];
+      let tick = 0;
+      const hooks = dreamFailureIncidents(notifications, 'REPAIR', () => new Date(times[tick++]!));
+      hooks.onFailure(new Error('first outage'));
+      const client = new BoardClient(quiet.port);
+      await client.open();
+      client.send({ type: 'auth', token: 'ws-refresh-token' });
+      await client.waitFor((f) => f.type === 'board', 'initial snapshot');
+      type Row = { id: string; kind: string; detail: string | null };
+      const incident = (frame: { type: string }): Row | undefined =>
+        frame.type === 'board'
+          ? (frame as unknown as { snapshot: { notifications: Row[] } }).snapshot.notifications.find((row) => row.kind === DREAM_FAILED_KIND)
+          : undefined;
+      const initial = incident(client.frames.filter((f) => f.type === 'board').at(-1)!)!;
+      expect(initial.detail).toContain('failed pass 1');
+      hooks.onFailure(new Error('second outage'));
+      await client.waitFor((f) => (incident(f)?.detail ?? '').includes('failed pass 2'), 'refreshed incident detail');
+      const refreshed = client.frames.map(incident).filter((row): row is Row => row !== undefined).at(-1)!;
+      expect(refreshed.id).toBe(initial.id);
+      expect(refreshed.detail).toContain(`First failure (${times[0]}): Error: first outage`);
+      expect(refreshed.detail).toContain(`Latest failure (${times[1]}, failed pass 2): Error: second outage`);
+      await client.close();
+    } finally {
+      await quiet.close();
+    }
   });
 
   it('a bad token is a fatal error + close; a non-auth first frame likewise', async () => {

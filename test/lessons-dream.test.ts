@@ -615,6 +615,43 @@ describe('failing-dream incident, production wiring (owner incident 2026-10-07)'
     }
   });
 
+  it('counts every failed pass on the same incident — even identical failures under a fixed clock', () => {
+    const dir = tmpDir('gru-command-dream-incident-fixed-');
+    const db = new LedgerDb(dir);
+    try {
+      const bus = new EventBus();
+      const ledger = new LedgerApi(db.handle, { bus });
+      const notifications = new NotificationCenter({ ledger, bus });
+      const hooks = dreamFailureIncidents(notifications, 'REPAIR', () => new Date('2026-10-07T09:44:26.000Z'));
+      const open = () => ledger.listNotifications({ limit: 50 }).filter((row) => row.kind === DREAM_FAILED_KIND && row.resolvedAt === null);
+      hooks.onFailure(new Error('same failure'));
+      const id = open()[0]!.id;
+      hooks.onFailure(new Error('same failure'));
+      expect(open().map((row) => row.id)).toEqual([id]);
+      expect(open()[0]!.detail).toContain('Latest failure (2026-10-07T09:44:26.000Z, failed pass 2): Error: same failure');
+    } finally {
+      db.close();
+    }
+  });
+
+  it('a failure spanning lines of any kind stays whole in the first and latest failure', () => {
+    const dir = tmpDir('gru-command-dream-incident-eol-');
+    const db = new LedgerDb(dir);
+    try {
+      const bus = new EventBus();
+      const ledger = new LedgerApi(db.handle, { bus });
+      const notifications = new NotificationCenter({ ledger, bus });
+      const hooks = dreamFailureIncidents(notifications, 'REPAIR');
+      hooks.onFailure(new Error('part1\rpart2\u2028part3\u2029part4\r\npart5'));
+      hooks.onFailure(new Error('later\rstill whole'));
+      const detail = ledger.listNotifications({ limit: 50 }).find((row) => row.kind === DREAM_FAILED_KIND)!.detail ?? '';
+      expect(detail).toMatch(/^First failure \([^)]*\): Error: part1 part2 part3 part4 part5$/mu);
+      expect(detail).toMatch(/^Latest failure \([^)]*, failed pass 2\): Error: later still whole$/mu);
+    } finally {
+      db.close();
+    }
+  });
+
   it('the repair command selects this instance and survives spaces and quotes in every path', () => {
     const root = tmpDir("gru-command-repair cmd 'q' ");
     const instanceDir = join(root, "instance dir's");

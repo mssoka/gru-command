@@ -184,9 +184,6 @@ export interface ChapterRepairReport {
   readonly provenanceTrimmed: number;
   readonly bodiesTrimmed: number;
   readonly lessonsDropped: number;
-  /** `preserved`: original bytes kept apart from provenance and explicit cap
-   * edits; `canonical`: re-serialized (only when in place would not fit). */
-  readonly formatting: 'preserved' | 'canonical';
   readonly bytes: number;
 }
 
@@ -288,26 +285,37 @@ export class BibleStore {
         if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { chapters: [], backupDir: null };
         throw new BibleError(`bible chapters dir ${this.chaptersDir} is unreadable: ${String(error)}`);
       }
-      const planned: { readonly slug: string; readonly original: string; readonly text: string }[] = [];
+      const planned: { readonly slug: string; readonly original: Buffer; readonly text: string }[] = [];
       const chapters: ChapterRepairReport[] = [];
       for (const name of names) {
         const slug = name.slice(0, -'.md'.length);
+        const file = join(this.chaptersDir, name);
         if (!isLessonsSlug(slug)) {
-          throw new BibleError(`bible chapter file ${join(this.chaptersDir, name)} has an invalid slug filename`);
+          throw new BibleError(`bible chapter file ${file} has an invalid slug filename`);
         }
-        const original = readFileSync(join(this.chaptersDir, name), 'utf-8');
+        // The original bytes are what the backup keeps — exactly; text that
+        // is not valid UTF-8 cannot be repaired without guessing.
+        const raw = readFileSync(file);
+        let original: string;
+        try {
+          original = STRICT_UTF8.decode(raw);
+        } catch {
+          throw new BibleError(`bible chapter ${file} is not valid UTF-8 — fix it by hand`);
+        }
         const repaired = repairChapterProvenance(original, slug, journalTs);
         // Already fits as repaired: the bytes stay exactly as they are.
-        // Otherwise every cap decision is measured on the in-place file, so
-        // references still go before any text and nothing is re-serialized.
-        const capped = Buffer.byteLength(repaired.text, 'utf8') <= this.chapterCapBytes
-          ? { chapter: repaired.chapter, text: repaired.text, provenanceTrimmed: 0, trimmed: 0, droppedLessons: 0, droppedProvenance: [] }
-          : enforceChapterCap(repaired.chapter, this.chapterCapBytes, (candidate) =>
-            Buffer.byteLength(renderCappedInPlace(repaired.text, candidate) ?? serializeChapter(candidate), 'utf8'));
-        const capActed = capped.provenanceTrimmed + capped.trimmed + capped.droppedLessons > 0;
-        const inPlace = capActed ? renderCappedInPlace(repaired.text, capped.chapter) : repaired.text;
-        const fits = inPlace !== null && Buffer.byteLength(inPlace, 'utf8') <= this.chapterCapBytes;
-        const text = fits ? inPlace : capped.text;
+        // Otherwise every cap decision is measured — and written — on the
+        // in-place file: references go before any text, nothing is ever
+        // re-serialized, and a cap that cannot be met faithfully aborts.
+        let text = repaired.text;
+        let capped: ChapterCapResult = {
+          chapter: repaired.chapter, text, provenanceTrimmed: 0, trimmed: 0, droppedLessons: 0, droppedProvenance: [],
+        };
+        if (Buffer.byteLength(text, 'utf8') > this.chapterCapBytes) {
+          capped = enforceChapterCap(repaired.chapter, this.chapterCapBytes, (candidate) =>
+            Buffer.byteLength(renderFaithfully(repaired.text, candidate), 'utf8'));
+          text = renderFaithfully(repaired.text, capped.chapter);
+        }
         const count = (chapter: BibleChapter): number =>
           chapter.lessons.filter((lesson) => lesson.slug !== ARCHIVED_LESSON_SLUG).length;
         chapters.push({
@@ -319,10 +327,9 @@ export class BibleStore {
           provenanceTrimmed: capped.provenanceTrimmed,
           bodiesTrimmed: capped.trimmed,
           lessonsDropped: capped.droppedLessons,
-          formatting: fits ? 'preserved' : 'canonical',
           bytes: Buffer.byteLength(text, 'utf8'),
         });
-        if (text !== original) planned.push({ slug, original, text });
+        if (text !== original) planned.push({ slug, original: raw, text });
       }
       if (!opts.write || planned.length === 0) return { chapters, backupDir: null };
 
@@ -396,8 +403,17 @@ export class BibleStore {
       }
       throw error;
     }
-    // After a successful write a release failure is reported, never hidden.
-    this.releaseLock(lock, token);
+    // After a successful write a release failure is reported, never hidden
+    // — and it carries the completed result, so a caller can tell "written,
+    // cleanup failed" from "not written".
+    try {
+      this.releaseLock(lock, token);
+    } catch (error) {
+      throw new BibleLockReleaseError(
+        `${action} completed, but releasing the book write lock ${lock} failed: ${error instanceof Error ? error.message : String(error)}`,
+        result,
+      );
+    }
     return result;
   }
 
@@ -408,44 +424,67 @@ export class BibleStore {
    * never both reclaim and both write. */
   private acquireLock(lock: string, token: string, action: string): void {
     const staging = `${lock}.${token}`;
-    writeFileSync(staging, JSON.stringify({ pid: process.pid, token, action, at: new Date().toISOString() }), { mode: 0o600 });
+    let published = false;
     try {
+      writeFileSync(staging, JSON.stringify({ pid: process.pid, token, action, at: new Date().toISOString() }), { mode: 0o600, flag: 'wx' });
+      this.publishLock(lock, staging);
+      published = true;
+      rmSync(staging, { force: true });
+    } catch (error) {
+      // Nothing of this attempt may outlive it: not its staging file, and
+      // not a lock it published — the primary error is what surfaces.
       try {
-        linkSync(staging, lock);
-        return;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
-          throw new BibleError(`cannot take the book write lock ${lock}: ${String(error)}`);
+        rmSync(staging, { force: true });
+      } catch {
+        /* the primary error wins */
+      }
+      if (published) {
+        try {
+          this.releaseLock(lock, token);
+        } catch {
+          /* the primary error wins */
         }
       }
-      const contention = (holder: LockHolder | null): BibleError =>
-        new BibleError(
-          holder === null
-            ? `the Book of Lessons write lock ${lock} is unreadable; if no dream or repair is running, remove it and retry`
-            : `the Book of Lessons is being written by pid ${holder.pid} (${holder.action}, since ${holder.at}); retry when it finishes`,
-        );
-      const seen = readLockHolder(lock);
-      if (seen === null || processAlive(seen.pid)) throw contention(seen);
-      const gate = `${lock}.reclaim`;
-      try {
-        mkdirSync(gate);
-      } catch {
-        throw new BibleError(`another process is reclaiming the Book of Lessons write lock ${lock}; retry`);
+      throw error;
+    }
+  }
+
+  /** Publish the staged lock: a hard link when the book is free, or —
+   * when the holder is dead — an atomic replace under the reclaim gate. */
+  private publishLock(lock: string, staging: string): void {
+    try {
+      linkSync(staging, lock);
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+        throw new BibleError(`cannot take the book write lock ${lock}: ${String(error)}`);
       }
-      try {
-        const holder = readLockHolder(lock);
-        if (holder === null || holder.token !== seen.token || processAlive(holder.pid)) throw contention(holder);
-        this.log('warn', 'bible write lock left by a dead process — taking it over', {
-          lock,
-          holder_pid: holder.pid,
-          holder_action: holder.action,
-        });
-        renameSync(staging, lock); // atomic replace, under the gate
-      } finally {
-        rmSync(gate, { recursive: true, force: true });
-      }
+    }
+    const contention = (holder: LockHolder | null): BibleError =>
+      new BibleError(
+        holder === null
+          ? `the Book of Lessons write lock ${lock} is unreadable; if no dream or repair is running, remove it and retry`
+          : `the Book of Lessons is being written by pid ${holder.pid} (${holder.action}, since ${holder.at}); retry when it finishes`,
+      );
+    const seen = readLockHolder(lock);
+    if (seen === null || processAlive(seen.pid)) throw contention(seen);
+    const gate = `${lock}.reclaim`;
+    try {
+      mkdirSync(gate);
+    } catch {
+      throw new BibleError(`another process is reclaiming the Book of Lessons write lock ${lock}; retry`);
+    }
+    try {
+      const holder = readLockHolder(lock);
+      if (holder === null || holder.token !== seen.token || processAlive(holder.pid)) throw contention(holder);
+      this.log('warn', 'bible write lock left by a dead process — taking it over', {
+        lock,
+        holder_pid: holder.pid,
+        holder_action: holder.action,
+      });
+      renameSync(staging, lock); // atomic replace, under the gate
     } finally {
-      rmSync(staging, { force: true });
+      rmSync(gate, { recursive: true, force: true });
     }
   }
 
@@ -547,10 +586,10 @@ export class BibleStore {
     };
   }
 
-  private writeAtomic(file: string, text: string): void {
+  private writeAtomic(file: string, data: string | Buffer): void {
     const staging = `${file}.tmp-${process.pid}-${randomUUID()}`;
     try {
-      writeFileSync(staging, text, 'utf-8');
+      writeFileSync(staging, data);
       renameSync(staging, file);
     } catch (error) {
       try {
@@ -849,6 +888,15 @@ export function repairChapterProvenance(
   journalTs: ReadonlyMap<string, string>,
 ): { readonly chapter: BibleChapter; readonly text: string; readonly linesRewritten: number } {
   const { header, sections } = splitSections(text);
+  const anchors = new Set<string>();
+  for (const section of sections) {
+    if (anchors.has(section.slug)) {
+      throw new BibleError(
+        `chapter ${slug}.md has more than one lesson anchored "## ${section.slug}" — the repair cannot tell them apart; fix it by hand`,
+      );
+    }
+    anchors.add(section.slug);
+  }
   let linesRewritten = 0;
   const repaired = sections.map((section) => {
     const where = `chapter ${slug}.md lesson ${section.slug}`;
@@ -928,18 +976,39 @@ function renderCappedInPlace(text: string, capped: BibleChapter): string | null 
     if (originalBody !== lesson.body) {
       let trailing = 0;
       while (trailing < section.body.length && section.body[section.body.length - 1 - trailing]!.text.trim() === '') trailing += 1;
-      body = [...lines(lesson.body.trim()), ...section.body.slice(section.body.length - trailing)];
+      // The parsed body starts at its first non-blank character; the file's
+      // first body line keeps its own indentation, so an indented line that
+      // reads like metadata stays body text.
+      const indent = /^[ \t]*/u.exec(section.body[0]?.text ?? '')![0];
+      body = [...lines(`${indent}${lesson.body.trim()}`), ...section.body.slice(section.body.length - trailing)];
     }
     out.push({ ...section, meta, body });
   }
   const rendered = joinSections(header, out);
   try {
     const reparsed = parseChapter(rendered, capped.slug);
-    return sameLessons(reparsed.lessons, capped.lessons) ? rendered : null;
+    const same = reparsed.title === capped.title && reparsed.summary === capped.summary &&
+      reparsed.tags.join('\u0000') === capped.tags.join('\u0000') && sameLessons(reparsed.lessons, capped.lessons);
+    return same ? rendered : null;
   } catch {
     return null;
   }
 }
+
+/** The capped chapter written into the file in place — or a refusal: the
+ * repair never falls back to re-serializing (that loses formatting and can
+ * turn body text into metadata). */
+function renderFaithfully(text: string, capped: BibleChapter): string {
+  const rendered = renderCappedInPlace(text, capped);
+  if (rendered === null) {
+    throw new BibleError(
+      `chapter ${capped.slug}.md cannot be fitted to the cap in place without changing what it says — fix it by hand`,
+    );
+  }
+  return rendered;
+}
+
+const STRICT_UTF8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 
 /** One write that failed mid-repair: names what was replaced and where the
  * originals are, because the book may now be partially repaired. */
@@ -952,6 +1021,19 @@ export class RepairWriteError extends BibleError {
     this.name = 'RepairWriteError';
     this.backupDir = backupDir;
     this.written = written;
+  }
+}
+
+/** The locked work COMPLETED, but releasing the write lock afterwards
+ * failed. Carries the completed result, so no caller can mistake it for
+ * "nothing was written" (and, say, replay a dream batch). */
+export class BibleLockReleaseError extends BibleError {
+  readonly result: unknown;
+
+  constructor(message: string, result: unknown) {
+    super(message);
+    this.name = 'BibleLockReleaseError';
+    this.result = result;
   }
 }
 
@@ -1237,7 +1319,10 @@ export function enforceChapterCap(
     if (longest !== -1) {
       const lesson = lessons[longest]!;
       const body = untrimmed(lesson.body);
-      const nextLength = Math.max(MIN_LESSON_BODY_CHARS, body.length - (size - capBytes) - TRIM_MARKER.length);
+      let nextLength = Math.max(MIN_LESSON_BODY_CHARS, body.length - (size - capBytes) - TRIM_MARKER.length);
+      // Never split a surrogate pair: the cut lands on a code-point boundary.
+      const last = body.charCodeAt(nextLength - 1);
+      if (last >= 0xd800 && last <= 0xdbff) nextLength -= 1;
       lessons[longest] = { ...lesson, body: `${body.slice(0, nextLength).trimEnd()}${TRIM_MARKER}` };
       trimmed += 1;
       size = serialized();
@@ -1251,7 +1336,9 @@ export function enforceChapterCap(
     droppedLessons += 1;
     mergeProvenance(droppedProvenance, dropped!.provenance);
     const archiveIndex = lessons.findIndex((lesson) => lesson.slug === ARCHIVED_LESSON_SLUG);
-    if (archiveIndex === -1) {
+    if (dropped!.provenance.length === 0) {
+      // Nothing to keep: an archive record would only cost bytes.
+    } else if (archiveIndex === -1) {
       lessons.push(buildArchivedLesson([...dropped!.provenance].sort(compareProvenance)));
       released.push(0);
     } else {

@@ -490,7 +490,6 @@ describe('provenance repair and the elastic cap (owner incident 2026-10-07)', ()
         linesRewritten: 3,
         lessonsBefore: 3,
         lessonsAfter: 3,
-        formatting: 'preserved',
       }),
     ]);
     expect(readFileSync(file, 'utf-8')).toBe(HAND_EDITED);
@@ -632,7 +631,7 @@ describe('repair and cap review fixes (bmad-code-review of #253, 2026-10-07)', (
   it('keeps body bytes exactly below the cap — only the provenance line changes', () => {
     const bible = bibleWith({ 'a.md': brokenA });
     const report = bible.repairProvenance(JOURNAL, { write: true });
-    expect(report.chapters).toEqual([expect.objectContaining({ slug: 'a', changed: true, bodiesTrimmed: 0, formatting: 'preserved' })]);
+    expect(report.chapters).toEqual([expect.objectContaining({ slug: 'a', changed: true, bodiesTrimmed: 0 })]);
     expect(readFileSync(join(bible.chaptersDir, 'a.md'), 'utf-8')).toBe(
       brokenA.replace('provenance: j-2; earlier: j-1', `provenance: j-1@${at(1)}, j-2@${at(2)}`),
     );
@@ -773,7 +772,9 @@ describe('second review round of #253 (bmad-code-review, 2026-10-07)', () => {
       caught = error;
     }
     expect(caught).toBeInstanceOf(RepairWriteError);
-    expect((caught as RepairWriteError).message).toContain('repair replaced all 1 chapter(s) (a), then failed: unlink failed');
+    expect((caught as RepairWriteError).message).toContain('repair replaced all 1 chapter(s) (a), then failed: ');
+    expect((caught as RepairWriteError).message).toContain('releasing the book write lock');
+    expect((caught as RepairWriteError).message).toContain('unlink failed');
     expect(existsSync((caught as RepairWriteError).backupDir)).toBe(true);
   });
 
@@ -784,7 +785,7 @@ describe('second review round of #253 (bmad-code-review, 2026-10-07)', () => {
     const repaired = repairChapterProvenance(text, 'a', JOURNAL).text;
     const bible = bibleWith({ 'a.md': text }, Buffer.byteLength(repaired, 'utf8'));
     const report = bible.repairProvenance(JOURNAL, { write: true });
-    expect(report.chapters[0]).toMatchObject({ lessonsAfter: 1, lessonsDropped: 0, bodiesTrimmed: 0, formatting: 'preserved' });
+    expect(report.chapters[0]).toMatchObject({ lessonsAfter: 1, lessonsDropped: 0, bodiesTrimmed: 0 });
     expect(readFileSync(join(bible.chaptersDir, 'a.md'), 'utf-8')).toBe(repaired);
   });
 
@@ -795,7 +796,7 @@ describe('second review round of #253 (bmad-code-review, 2026-10-07)', () => {
     const text = `# A\n\n## busy\n\nrecurred: 5\n${handlesLine([1, 2, 3, 4, 5])}\n\n${' '.repeat(40)}keep();\n      this();\n`;
     const bible = bibleWith({ 'a.md': text }, Buffer.byteLength(text, 'utf8') - 20);
     const report = bible.repairProvenance(JOURNAL, { write: true });
-    expect(report.chapters[0]).toMatchObject({ provenanceTrimmed: 1, bodiesTrimmed: 0, lessonsDropped: 0, formatting: 'preserved' });
+    expect(report.chapters[0]).toMatchObject({ provenanceTrimmed: 1, bodiesTrimmed: 0, lessonsDropped: 0 });
     const written = readFileSync(join(bible.chaptersDir, 'a.md'), 'utf-8');
     expect(written).toBe(text.replace(handlesLine([1, 2, 3, 4, 5]), handlesLine([2, 3, 4, 5])));
     expect(Buffer.byteLength(written, 'utf8')).toBeLessThanOrEqual(bible.chapterCapBytes);
@@ -854,5 +855,119 @@ describe('second review round of #253 (bmad-code-review, 2026-10-07)', () => {
     expect(ran.status).toBe(1);
     expect(ran.stderr).toMatch(/journal entry seq 2 is recorded as j-1|journal id j-1 appears twice/);
     expect(readFileSync(join(home, 'bible', 'chapters', 'ops.md'), 'utf-8')).toBe(chapter);
+  });
+});
+
+describe('third review round of #253 (bmad-code-review, 2026-10-07)', () => {
+  const at = (minute: number): string => new Date(Date.UTC(2026, 9, 1, 0, minute)).toISOString();
+  const JOURNAL = new Map(Array.from({ length: 30 }, (_, index) => [`j-${index + 1}`, at(index + 1)] as const));
+  const TOOL = resolve(import.meta.dirname, '..', 'tools', 'repair-bible-provenance.mjs');
+  const backups = (bibleDir: string): string[] => readdirSync(bibleDir).filter((name) => name.startsWith('.repair-backup-'));
+  const lessonOf = (slug: string, provenance: ProvenanceRef[], body: string) => ({ slug, body, recurred: 1, provenance, tags: [] as string[] });
+  const chapterOf = (lessons: BibleChapter['lessons']): BibleChapter => ({ slug: 'fix', title: 'Fix', summary: '', tags: [], lessons });
+
+  /** An instance whose chapter cites j-1, with raw journal lines appended. */
+  function toolHome(extraLines: (template: Record<string, unknown>) => readonly Record<string, unknown>[]) {
+    const home = mkdtempSync(join(tmpdir(), 'gru-command-repair-r3-'));
+    cleanupDirs.push(home);
+    const journal = new JournalStore(join(home, 'journal'));
+    const first = journal.append({ kind: 'finding', source: 'gru', body: 'first' });
+    const file = join(home, 'journal', readdirSync(join(home, 'journal')).find((name) => name.endsWith('.jsonl'))!);
+    const template = JSON.parse(readFileSync(file, 'utf-8').trim().split('\n')[0]!) as Record<string, unknown>;
+    appendFileSync(file, extraLines(template).map((line) => `${JSON.stringify(line)}\n`).join(''));
+    mkdirSync(join(home, 'bible', 'chapters'), { recursive: true });
+    const chapter = `# Ops\n\n## a\n\nrecurred: 1\nprovenance: ${first.id}\n\nBody.\n`;
+    writeFileSync(join(home, 'bible', 'chapters', 'ops.md'), chapter);
+    const run = (...args: string[]) =>
+      spawnSync(process.execPath, [TOOL, ...args], { encoding: 'utf-8', env: { ...process.env, GRU_COMMAND_HOME: home } });
+    return { home, chapter, run };
+  }
+
+  it('the tool checks every journal record from one read — a conflict past a page boundary still refuses', () => {
+    const { home, chapter, run } = toolHome((template) => [
+      ...Array.from({ length: 9_999 }, (_, index) => ({ ...template, seq: index + 2, id: `j-${index + 2}` })),
+      { ...template, seq: 10_000, id: 'j-10000', ts: '2026-01-01T00:00:00.000Z' }, // the same id, a second time
+    ]);
+    const ran = run('--write');
+    expect(ran.status).toBe(1);
+    expect(ran.stderr).toContain('journal id j-10000 appears twice with different timestamps');
+    expect(readFileSync(join(home, 'bible', 'chapters', 'ops.md'), 'utf-8')).toBe(chapter);
+    expect(backups(join(home, 'bible'))).toEqual([]);
+  });
+
+  it('the tool refuses an invalid timestamp on any journal record, cited or not, in a dry run and with --write', () => {
+    const { home, chapter, run } = toolHome((template) => [{ ...template, seq: 2, id: 'j-2', ts: 'not-a-timestamp' }]);
+    for (const args of [[], ['--write']]) {
+      const ran = run(...args);
+      expect(ran.status).toBe(1);
+      expect(ran.stderr).toContain('journal entry j-2 has an invalid timestamp "not-a-timestamp"');
+    }
+    expect(readFileSync(join(home, 'bible', 'chapters', 'ops.md'), 'utf-8')).toBe(chapter);
+    expect(backups(join(home, 'bible'))).toEqual([]);
+  });
+
+  it('refuses a chapter with two lessons on the same anchor — nothing is guessed or rewritten', () => {
+    const bible = tmpBible(4_096);
+    bible.ensureSeeded();
+    const file = join(bible.chaptersDir, 'dup.md');
+    const text = `# Dup\n\n## a\n\nrecurred: 1\nprovenance: j-1\n\n    First body.\n\n## a\n\nrecurred: 1\nprovenance: j-2\n\nSecond body.\n`;
+    writeFileSync(file, text);
+    expect(() => bible.repairProvenance(JOURNAL, { write: true })).toThrowError(/more than one lesson anchored "## a"/);
+    expect(readFileSync(file, 'utf-8')).toBe(text);
+    expect(backups(bible.dir)).toEqual([]);
+  });
+
+  it('trimming an indented body line that reads like metadata keeps it body text, in place', () => {
+    const body = `    tags: not metadata — an indented body line\n${'Restart with care. '.repeat(30).trim()}`;
+    const text = `# Ops\n\n## a\n\nrecurred: 1\nprovenance: j-1@${at(1)}\n\n${body}\n`;
+    const bible = tmpBible(Buffer.byteLength(text, 'utf8') - 60);
+    bible.ensureSeeded();
+    const file = join(bible.chaptersDir, 'ops.md');
+    writeFileSync(file, text);
+    const report = bible.repairProvenance(JOURNAL, { write: true });
+    expect(report.chapters[0]).toMatchObject({ lessonsDropped: 0 });
+    expect(report.chapters[0]!.bodiesTrimmed).toBeGreaterThan(0);
+    const written = readFileSync(file, 'utf-8');
+    expect(written).toContain('\n\n    tags: not metadata — an indented body line\n');
+    const lesson = bible.readChapter('ops')!.lessons[0]!;
+    expect(lesson.tags).toEqual([]);
+    expect(lesson.body.startsWith('tags: not metadata')).toBe(true);
+    expect(lesson.body.endsWith('[trimmed to fit the chapter cap]')).toBe(true);
+  });
+
+  it('dropping a lesson without journal handles creates no archive, so the lessons that fit stay', () => {
+    const backed = lessonOf('backed', [{ id: 'j-1', ts: at(1) }], 'A journal-backed lesson worth keeping.');
+    const uncited = lessonOf('uncited', [], 'A lesson nobody cited.');
+    const result = enforceChapterCap(chapterOf([uncited, backed]), Buffer.byteLength(serializeChapter(chapterOf([backed])), 'utf8'));
+    expect(result.chapter.lessons.map((lesson) => lesson.slug)).toEqual(['backed']);
+    expect(result.droppedLessons).toBe(1);
+    // An uncited-only chapter fits its cap once one lesson goes — no empty archive pushes it over.
+    const other = lessonOf('other', [], 'Another uncited lesson.');
+    const onlyUncited = enforceChapterCap(chapterOf([uncited, other]), Buffer.byteLength(serializeChapter(chapterOf([other])), 'utf8'));
+    expect(onlyUncited.chapter.lessons.map((lesson) => lesson.slug)).toEqual(['other']);
+  });
+
+  it('body trimming never splits a surrogate pair', () => {
+    const body = '😀'.repeat(200);
+    const loneSurrogate = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u;
+    const full = Buffer.byteLength(serializeChapter(chapterOf([lessonOf('emoji', [{ id: 'j-1', ts: at(1) }], body)])), 'utf8');
+    for (let over = 100; over < 108; over += 1) {
+      const result = enforceChapterCap(chapterOf([lessonOf('emoji', [{ id: 'j-1', ts: at(1) }], body)]), full - over);
+      const trimmed = result.chapter.lessons[0]!.body;
+      expect(result.trimmed).toBeGreaterThan(0);
+      expect(loneSurrogate.test(trimmed), `cap overshoot ${over}`).toBe(false);
+      expect(Buffer.from(trimmed, 'utf8').toString('utf8')).toBe(trimmed);
+    }
+  });
+
+  it('refuses a chapter that is not valid UTF-8 before any backup or write', () => {
+    const bible = tmpBible(4_096);
+    bible.ensureSeeded();
+    const file = join(bible.chaptersDir, 'bad.md');
+    const bytes = Buffer.concat([Buffer.from('# Bad\n\n## a\n\nrecurred: 1\nprovenance: j-1\n\nBody '), Buffer.from([0xff, 0xfe]), Buffer.from('.\n')]);
+    writeFileSync(file, bytes);
+    expect(() => bible.repairProvenance(JOURNAL, { write: true })).toThrowError(/is not valid UTF-8/);
+    expect(readFileSync(file).equals(bytes)).toBe(true);
+    expect(backups(bible.dir)).toEqual([]);
   });
 });

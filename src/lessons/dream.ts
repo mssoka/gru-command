@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { LogLevel } from '../logger.js';
-import type { BibleStore } from './bible.js';
+import { BibleLockReleaseError, type ApplyReport, type BibleStore } from './bible.js';
 import { DreamError, type JournalEntry, type ProposedChapter } from './types.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
@@ -55,14 +55,15 @@ export function repairCommand(input: {
 /** The notification surface a failing dream reports through
  * (NotificationCenter in production). */
 export interface DreamIncidentPort {
-  postIncident(input: {
+  /** Post — or reuse the open — incident, saying which it was. */
+  openIncident(input: {
     kind: string;
     routing: 'action-required';
     severity: 'error';
     title: string;
     detail: string;
     dedupe: 'active';
-  }): { readonly id: string; readonly detail: string | null };
+  }): { readonly record: { readonly id: string; readonly detail: string | null }; readonly created: boolean };
   updateDetail(id: string, detail: string): unknown;
   resolveIncidents(kindPrefix: string, by: string): unknown;
 }
@@ -81,17 +82,20 @@ export function dreamFailureIncidents(
   command: string,
   now: () => Date = () => new Date(),
 ): { onFailure(error: unknown): void; onSuccess(): void } {
-  const oneLine = (error: unknown) => String(error).replace(/\s*\n\s*/gu, ' ');
+  // Every line terminator — CR, LF, U+2028, U+2029 — folds to a space, so
+  // each failure is exactly one line of the detail and parses back whole.
+  const oneLine = (error: unknown) => String(error).replace(/\s*[\r\n\u2028\u2029]\s*/gu, ' ');
   const render = (first: { at: string; error: string }, latest: { at: string; error: string }, pass: number) =>
     `First failure (${first.at}): ${first.error}\n` +
     `Latest failure (${latest.at}, failed pass ${pass}): ${latest.error}\n\n` +
-    "The journal cursor is unchanged; the next beat retries. If a chapter's provenance is malformed, rebuild it " +
+    "A failed pass leaves the journal cursor where it was (a failure that moved it says so) and the next beat retries. " +
+    "If a chapter's provenance is malformed, rebuild it " +
     `from the journal (dry run first, then add --write):\n${command}`;
   return {
     onFailure: (error) => {
       const latest = { at: now().toISOString(), error: oneLine(error) };
       const fresh = render(latest, latest, 1);
-      const row = port.postIncident({
+      const { record, created } = port.openIncident({
         kind: DREAM_FAILED_KIND,
         routing: 'action-required',
         severity: 'error',
@@ -99,11 +103,11 @@ export function dreamFailureIncidents(
         detail: fresh,
         dedupe: 'active',
       });
-      if (row.detail === fresh) return; // a new streak
-      const first = FIRST_FAILURE.exec(row.detail ?? '');
-      const pass = Number(LATEST_FAILURE.exec(row.detail ?? '')?.[1] ?? '1') + 1;
+      if (created) return; // a new streak starts at pass 1
+      const first = FIRST_FAILURE.exec(record.detail ?? '');
+      const pass = Number(LATEST_FAILURE.exec(record.detail ?? '')?.[1] ?? '1') + 1;
       port.updateDetail(
-        row.id,
+        record.id,
         render(first === null ? latest : { at: first[1]!, error: first[2]! }, latest, pass),
       );
     },
@@ -216,7 +220,17 @@ export class DreamEngine {
       }
     }
 
-    const report = this.bible.applyUpdates(result.chapters, tsById);
+    let report: ApplyReport;
+    let cleanupFailure: BibleLockReleaseError | null = null;
+    try {
+      report = this.bible.applyUpdates(result.chapters, tsById);
+    } catch (error) {
+      // Written, then only the lock release failed: the batch IS applied,
+      // so the cursor must still advance — a replay would double-count.
+      if (!(error instanceof BibleLockReleaseError)) throw error;
+      report = error.result as ApplyReport;
+      cleanupFailure = error;
+    }
     const last = pending[pending.length - 1]!;
     saveDreamState(this.stateFile, {
       version: 1,
@@ -224,6 +238,11 @@ export class DreamEngine {
       lastDreamAt: this.now().toISOString(),
       cycles: state.cycles + 1,
     });
+    if (cleanupFailure !== null) {
+      throw new DreamError(
+        `the dream pass wrote its update and advanced the journal cursor to ${last.seq}, but ${cleanupFailure.message}`,
+      );
+    }
     this.log('info', 'dream pass completed', {
       entries: pending.length,
       covered_through_seq: last.seq,

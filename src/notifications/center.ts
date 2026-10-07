@@ -86,6 +86,17 @@ export interface NotificationCenterOptions {
   readonly log?: Log;
 }
 
+/** An incident post (see NotificationCenter.postIncident). */
+export interface IncidentInput {
+  readonly kind: string;
+  readonly routing: NotificationRouting;
+  readonly severity: NotificationSeverity;
+  readonly title: string;
+  readonly detail?: string | null;
+  readonly agentId?: string | null;
+  readonly dedupe: 'unacked' | 'active' | 'all';
+}
+
 export class NotificationCenter {
   private readonly ledger: LedgerApi;
   private readonly onActionRequired: (notification: NotificationRecord) => void;
@@ -141,15 +152,16 @@ export class NotificationCenter {
   }
 
   /** Incident post with durable restart-safe deduplication. */
-  postIncident(input: {
-    kind: string;
-    routing: NotificationRouting;
-    severity: NotificationSeverity;
-    title: string;
-    detail?: string | null;
-    agentId?: string | null;
-    dedupe: 'unacked' | 'active' | 'all';
-  }): NotificationRecord {
+  postIncident(input: IncidentInput): NotificationRecord {
+    return this.openIncident(input).record;
+  }
+
+  /** postIncident, also saying whether THIS call created the row (false:
+   * an open row of the kind was reused) — so a producer counting a streak
+   * never has to infer it from the row's content. */
+  openIncident(input: IncidentInput): { readonly record: NotificationRecord; readonly created: boolean } {
+    const created = (record: NotificationRecord) => ({ record, created: true });
+    const reused = (record: NotificationRecord) => ({ record, created: false });
     const existing = this.ledger.findNotificationByKind(
       input.kind,
       input.dedupe === 'all' ? 'any' : input.dedupe,
@@ -176,14 +188,14 @@ export class NotificationCenter {
           'needs-owner',
           input.dedupe === 'all' ? 'any' : input.dedupe,
         );
-        if (openOwnerRow !== null) return openOwnerRow;
-        return this.post(input);
+        if (openOwnerRow !== null) return reused(openOwnerRow);
+        return created(this.post(input));
       }
       // Do not grandfather an old machine row into FOR YOU merely because
       // a newer post of the same kind is owner-held. Gru triages the old ID.
-      return existing;
+      return reused(existing);
     }
-    return this.post(input);
+    return created(this.post(input));
   }
 
   /** Refresh an open incident's detail (same id, same ack state). */
