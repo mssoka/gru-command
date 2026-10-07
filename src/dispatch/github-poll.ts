@@ -921,6 +921,16 @@ export class GitHubSignalPoll {
     checkRunCache: Map<string, CiState | null>,
   ): Promise<BranchObservation | null> {
     let pull = byBranch.get(lane.branch) ?? null;
+    // The tick's lane snapshot may outlive an awaited provider call. A
+    // binned lane cannot start another request; a merge already returned
+    // by THAT request is independent evidence for the no-effect receipt.
+    const terminalObservation = (): BranchObservation | null | undefined => {
+      const job = this.ledger.getJob(lane.jobId);
+      if (job !== null && !isJobTerminal(job.status)) return undefined;
+      return job?.status === 'binned' && pull?.merged === true ? { pull, ci: null } : null;
+    };
+    const atStart = terminalObservation();
+    if (atStart !== undefined) return atStart;
     let detailed = false;
     if (pull === null && lane.prNumber !== null) {
       // The batched window (100 most recently updated PRs) missed the
@@ -930,6 +940,8 @@ export class GitHubSignalPoll {
         this.api.getPull({ repo: lane.repo, number }),
       );
       detailed = true;
+      const afterLookup = terminalObservation();
+      if (afterLookup !== undefined) return afterLookup;
     }
     // The list endpoint returns mergeable_state as null; the single-PR
     // endpoint is the only place GitHub computes it. One detail call per
@@ -939,6 +951,8 @@ export class GitHubSignalPoll {
       pull = await this.call(budget, `get pull ${repoFullName(lane.repo)}#${number}`, () =>
         this.api.getPull({ repo: lane.repo, number }),
       );
+      const afterDetail = terminalObservation();
+      if (afterDetail !== undefined) return afterDetail;
     }
     let ci: CiState | null = null;
     const sha = pull?.headSha ?? null;
@@ -950,6 +964,8 @@ export class GitHubSignalPoll {
         const runs = await this.call(budget, `check runs ${repoFullName(lane.repo)}@${sha.slice(0, 12)}`, () =>
           this.api.listCheckRuns({ repo: lane.repo, sha }),
         );
+        const afterChecks = terminalObservation();
+        if (afterChecks !== undefined) return afterChecks;
         ci = summarizeCheckRuns(sha, runs);
         checkRunCache.set(cacheKey, ci);
       }

@@ -241,8 +241,9 @@ or automatic binning — the write itself is the ordinary status surface):
   does NOT stop a running worker, cancel a queue entry, release a
   worktree, delete artifacts or ack notifications. The status transaction
   refuses target-owned open worker turns, unfinished child workers,
-  pending/live review rounds and unsettled verification runs, with no
-  status or event mutation. Stop live work through its own authorized
+  pending/live review rounds, unsettled verification runs and an in-flight
+  provider-recovery continuation, with no status or event mutation. A
+  historical claimed wait does not hold the lane after its turn settles. Stop live work through its own authorized
   surfaces first — the board keeps showing the live producer and the
   worktree stays on the record. A `working` label alone is not proof of
   a live producer; idle `working` jobs remain bin-eligible.

@@ -28,7 +28,7 @@ context: []
 | Scenario | Input / State | Expected Output / Behavior | Error Handling |
 |----------|--------------|---------------------------|----------------|
 | LEGAL_TRANSITION | any of `dispatched`,`working`,`delivered`,`in-review`,`blocked`,`parked` with no target-owned live producer | transition to `binned` lands; row `binned`; `job.status` event `{from: prior, to: binned}`; prior hops preserved | N/A |
-| LIVE_PRODUCER | open worker turn, unfinished child, pending/live round, or unsettled verification | refused atomically: no status/event/obligation change; stop via own authorized control first | HTTP 400 names live work |
+| LIVE_PRODUCER | open worker turn, unfinished child, pending/live round, unsettled verification, or in-flight provider continuation | refused atomically: no status/event/obligation change; stop via own authorized control first | HTTP 400 names live work |
 | ILLEGAL_SOURCE | `merged` or `done` | request refused, no row/event/obligation change | throw `illegal transition <from> → binned`; HTTP 400 `bad_request` |
 | ILLEGAL_RESUME | `binned` | any other status refused, no mutation | throw `illegal transition binned → <to>` |
 | OBLIGATIONS | lane with open/waiting/suspended obligations → `binned` | same transaction settles applicable obligations `{kind:'job-terminal', jobStatus:'binned'}`; settled history untouched | N/A |
@@ -42,7 +42,7 @@ context: []
 ## Code Map
 
 - `src/ledger/states.ts` -- `JOB_STATUSES`, `JOB_TRANSITIONS`, and the ONE terminal declaration `TERMINAL_JOB_STATUS_LIST` feeding `type TerminalJobStatus`, the `JOB_TERMINAL` set, `isJobTerminal` and `isTerminalJobStatus`; `TERMINAL_JOB_STATUSES` derives from the same predicate. The web cross-build alarm parses `TERMINAL_JOB_STATUS_LIST`.
-- `src/ledger/api.ts` -- `setJobStatus` refuses binned while target-owned producers remain live in the same transaction, then calls `closeApplicableObligations(id, status)` for terminal targets; amendment/directive guards refuse terminal lanes (`isJobTerminal`).
+- `src/ledger/api.ts` -- `setJobStatus` refuses binned while target-owned producers (including an in-flight provider continuation) remain live in the same transaction, then calls `closeApplicableObligations(id, status)` for terminal targets; amendment/directive guards refuse terminal lanes (`isJobTerminal`).
 - `src/ledger/obligations.ts` -- `job-terminal` settlement kind/parse: `jobStatus: 'done' | 'merged' | 'binned'`.
 - `src/board/engine.ts` -- `prStateOf` (binned = closed receipt, null), `concludedJobs` receipt set, `isClosedReceipt`.
 - `web/src/lib/board-protocol.ts` -- `jobStatusTone`/`jobChipTone`, `isJobConcluded` (binned terminal; alarms read the ledger declaration).
@@ -70,7 +70,7 @@ context: []
 - [x] operator clarification: Gru's shipped role instructs the intentional authenticated status action; live producers refuse binning transactionally; deterministic loaded-prompt → HTTP → history/debt/no-revival test fails before and passes after. No new endpoint or bulk binning.
 
 **Acceptance Criteria:**
-- Given each non-terminal status with no target-owned live producer, when `setJobStatus(id, 'binned')` runs, then the row is `binned`, the `job.status` event records `<prior> → binned`, and prior events remain.
+- Given each non-terminal status with no target-owned live producer or in-flight provider continuation, when `setJobStatus(id, 'binned')` runs, then the row is `binned`, the `job.status` event records `<prior> → binned`, and prior events remain.
 - Given `merged` or `done`, when `binned` is requested, then it throws `illegal transition` and neither the row, the events nor obligations change.
 - Given `binned`, when any resume/terminal-hop status is requested, then it throws and nothing changes.
 - Given the shipped Gru role and an authorized deliberate discard of a named heist, when Gru uses its permitted shell and configured auth token to call the existing status surface, then 200 + audit event, closed debt as abandonment and no revival; an open producer is refused before mutation and must be stopped by its own control. Given the authenticated HTTP status surface, when a binned transition is requested validly, then 200 + audit event; unauthenticated (even with `by`) → 401; malformed → 400; illegal → 400 — all with no partial mutation.
@@ -207,6 +207,18 @@ Read-only workflow `637af248-014f-4758-adbc-c5cfa42cd155` examined the entire 76
 | `board-rail.test.ts` omitted from focused and baseline scopes | **REPAIRED**. Both web command lists and the baseline overlay include it; focused web suite and fail-before scope re-executed. |
 
 The binned live-producer guard made five old fixture setups invalid; those fixtures now mark historical agents idle before discarding, or assert that a queued child must finish and its producer be disposed BEFORE binning. Earlier `npm test` returned nonzero solely at the installed-layout gate because `roles/gru.md` was uncommitted; no source-test failure is concealed. Commit the new immutable candidate, then rerun full static, fast, heavy, web and E2E evidence. The first earlier full E2E attempt remains a real failed run (72 passed / 3 failed: two theme snapshots plus one epoch assertion); the isolated epoch rerun passed, four baseline images were updated and visually checked, and the following full E2E run passed 75. Before/after light and dark mock/real PNGs are preserved under external `bmad-pr247-final-e85c24b56a70-2UOOjc/snapshot-evidence/{before,after}/`. The mock pair adds the binned TRACKERS bucket and reflows a chip line without clipping; the real pair also updates an already-shipped six-section layout whose stale baseline still showed the old empty-board placeholder. The masked magenta deploy region is existing test masking; no visual-test tolerance was relaxed. This evidence is local and cannot be called native Perkins READY.
+
+### Immutable 8849d3e full-change review dispositions
+
+Workflow `a17f5cc7-bc9f-4a26-93a0-993caf078863` again reviewed the COMPLETE 77-file `84aec28..8849d3e` candidate: fresh read-only explicit `openai-codex/gpt-6-sol` blind `0dd80e62-bb6a-4509-9eda-70e165f60900`, edge `818e6ba8-cca9-43cf-857e-e2b4783996e8`, verification `4d2d2fb3-021e-48c1-b0fb-2e02b7836208`, acceptance `fb0c3071-30c0-4ebb-9189-f7295f433c1f`. Reports: external `bmad-pr247-final-8849d3e3645c-anlfFs/{blind-hunter,edge-case-hunter,verification-gap,acceptance-auditor}.md`; the edge and acceptance lenses found no defects and the blind lens did not pad its finding floor. Verification notes/results of immutable `8849d3e`: `npm test` 2275 backend/908 heavy/525 web and full E2E 75, logs `/tmp/pr247-npm-test-8849d3e.log` and `/tmp/pr247-e2e-8849d3e.log` (local only).
+
+| Finding | Decision / repair |
+|---|---|
+| Blind P1: provider recovery claimed before awaited spawn could prompt after binning | **REPAIRED.** The post-claim in-flight producer reserves runtime ownership before asynchronous spawn/turn, so binning refuses while that owner is active. The continuation's last-side-effect guard rechecks terminal/hold before spawn and before prompt, disposing a spawned handle on refusal. The reservation releases in finally after success/failure and a historical durable claimed wait remains auditable without permanently blocking a later authorized discard. A deterministic spawn gate proved `binned` formerly succeeded mid-claim (RED), now refuses without mutation and permits discard after the turn settles; an owner hold during spawn also prevents prompt delivery. |
+| Blind P2: a tick's saved lane could make fresh provider calls after binning | **REPAIRED.** The poll rechecks terminality before each additional detail/checks call and after each awaited response; open/CI observations on a discarded lane do not apply. A genuine merged result already fetched before/while binning still records deduplicated no-effect evidence; no fresh binned polling, provider budget or limit changes. Deterministic tests captured fresh detail/CI calls on discarded lanes before the patch (RED), and assert zero such calls after. |
+| Verification gap: Gru's HTTP guard only directly tested live worker and child, not pending review or unsettled verification | **REPAIRED test coverage.** New authenticated HTTP fixture checks both producer classes yield 400 and retain identical status, event history and obligation rows. No implementation defect was found in the existing guard. |
+
+The same last-side-effect and runtime marker are scoped to active recovery claims; they neither poll binned PRs nor turn historical provider waits into a permanent binning veto. The initial E2E epoch failure and all four before/after theme image artifacts remain preserved as described above. New code/test changes require a new immutable candidate, repeated verification and full-change review before a normal push.
 
 ## Design Notes
 

@@ -283,6 +283,11 @@ describe('guarded claim — happy path', () => {
     expect(events.some((event) => event.kind === 'job.delivered')).toBe(false);
     expect(h.ledger.getProviderWait(waitId)?.status).toBe('claimed');
     expect(h.ledger.getJob(jobId)?.status).toBe('blocked');
+    // A durable claimed receipt is NOT perpetual runtime ownership: the
+    // spawn failed and its reservation was released on the error path.
+    h.ledger.setAgentState(`agent-${jobId}`, 'idle');
+    h.ledger.setJobStatus(jobId, 'binned');
+    expect(h.ledger.getJob(jobId)?.status).toBe('binned');
   });
 
   it('a missing session file falls back to a fresh worker on the same lane', async () => {
@@ -300,6 +305,61 @@ describe('guarded claim — happy path', () => {
 });
 
 describe('guarded claim — every recheck fails visible', () => {
+  it('an admitted provider continuation blocks a concurrent bin until its spawn and turn settle', async () => {
+    const h = new ClaimHarness();
+    const jobId = 'j-inflight-claim';
+    const waitId = await h.recoveredMinionWait({ jobId });
+    h.ledger.setAgentState(`agent-${jobId}`, 'idle'); // the old worker has ceased
+    let enterSpawn!: () => void;
+    let releaseSpawn!: () => void;
+    const entered = new Promise<void>((resolve) => { enterSpawn = resolve; });
+    const gate = new Promise<void>((resolve) => { releaseSpawn = resolve; });
+    h.registry.spawn = async () => {
+      enterSpawn();
+      await gate;
+      const handle = new FakeHandle('minion', 'new-provider-minion', null);
+      h.registry.handles.set(handle.id, handle);
+      return handle;
+    };
+    const claiming = claimProviderRecoveryContinuation(h.deps(), waitId, 'silas');
+    await entered;
+    try {
+      const before = h.ledger.listJobEvents(jobId);
+      expect(() => h.ledger.setJobStatus(jobId, 'binned')).toThrow(/live work|continuation/u);
+      expect(h.ledger.listJobEvents(jobId)).toEqual(before);
+      expect(h.ledger.getJob(jobId)?.status).toBe('working');
+    } finally {
+      releaseSpawn();
+    }
+    const result = await claiming;
+    expect(result).toMatchObject({ outcome: 'continued', minionId: 'new-provider-minion' });
+    expect(h.registry.handles.get('new-provider-minion')?.promptCount).toBe(1);
+    h.ledger.setAgentState('new-provider-minion', 'idle');
+    h.ledger.setJobStatus(jobId, 'binned');
+    expect(h.ledger.getJob(jobId)?.status).toBe('binned');
+    expect(await claimProviderRecoveryContinuation(h.deps(), waitId, 'silas'))
+      .toMatchObject({ outcome: 'not-recovered', status: 'claimed' });
+  });
+
+  it('an owner hold during the asynchronous spawn refuses the continuation before prompt delivery', async () => {
+    const h = new ClaimHarness();
+    const jobId = 'j-held-during-spawn';
+    const waitId = await h.recoveredMinionWait({ jobId });
+    h.ledger.setAgentState(`agent-${jobId}`, 'idle');
+    const spawned = new FakeHandle('minion', 'held-replacement', null);
+    h.registry.spawnImpl = () => {
+      h.ledger.setJobStatus(jobId, 'parked');
+      h.registry.handles.set(spawned.id, spawned);
+      return spawned;
+    };
+    const result = await claimProviderRecoveryContinuation(h.deps(), waitId, 'silas');
+    expect(result).toMatchObject({ outcome: 'skipped', why: 'continuation spawn failed after atomic claim (recorded; no automatic replay)' });
+    expect(spawned.disposed).toBe(true);
+    expect(spawned.promptCount).toBe(0);
+    expect(h.ledger.getJob(jobId)?.status).toBe('parked');
+    expect(h.ledger.latestJobEvent(jobId, 'provider.continuation-admitted')).toBeNull();
+  });
+
   it('a cancelled/terminal job skips the claim and retires the wait', async () => {
     const h = new ClaimHarness();
     const jobId = 'j-done';

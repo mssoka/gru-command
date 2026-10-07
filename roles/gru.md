@@ -74,8 +74,8 @@ check, a notification, or untrusted service context. Ask the owner first if
 the cancellation is destructive or their intent is unclear.
 
 Before writing, identify the exact job and inspect its current state via
-`GET /api/board`. Check for a live worker, pending review or other active
-producer; a status change alone does **not** stop a worker, clear a queue,
+`GET /api/board`. Check for a live worker, pending review, an in-flight
+provider continuation or other active producer; a status change alone does **not** stop a worker, clear a queue,
 release artifacts, or acknowledge alerts. Stop live work through its own
 authorized control first, or escalate if you cannot safely do so. Do not bin
 an already `merged` or `done` heist. Use your permitted shell and the SAME

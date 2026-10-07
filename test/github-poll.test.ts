@@ -588,6 +588,63 @@ describe('github signal poll tick', () => {
     }
   });
 
+  it('an in-flight batched fetch never starts fresh detail/CI calls for a now-binned lane', async () => {
+    const h = makeLedger();
+    try {
+      addTrackedJob(h.ledger, 'job-binned-before-detail', 'https://github.com/acme/app/pull/15');
+      const api = new FakeGhApi();
+      api.pulls.set('acme/app', [pull({ number: 15, headRef: 'gru/job-binned-before-detail', headSha: 'sha-15' })]);
+      const originalList = api.listPulls.bind(api);
+      api.listPulls = async (input) => {
+        const pulls = await originalList(input);
+        h.ledger.setJobStatus('job-binned-before-detail', 'binned');
+        return pulls;
+      };
+      const result = await makePoll({ ledger: h.ledger, api }).pollOnce();
+      expect(result.tracked).toBe(1); // the lane was live at tick start
+      expect(result.calls).toBe(1); // the already-running batched fetch only
+      expect(api.calls.map((call) => call.kind)).toEqual(['listPulls']);
+      expect(result.signals).toEqual([]);
+      expect(h.ledger.latestJobEvent('job-binned-before-detail', 'github.branch-state')).toBeNull();
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('binning during an in-flight detail request stops subsequent CI calls but retains an observed merge', async () => {
+    for (const merged of [false, true]) {
+      const h = makeLedger();
+      try {
+        const id = `job-detail-${String(merged)}`;
+        addTrackedJob(h.ledger, id, 'https://github.com/acme/app/pull/16');
+        const api = new FakeGhApi();
+        api.pulls.set('acme/app', [pull({ number: 16, headRef: `gru/${id}`, headSha: 'sha-16' })]);
+        api.details.set('acme/app#16', pull({ number: 16, headRef: `gru/${id}`, headSha: 'sha-16',
+          merged, mergeCommitSha: merged ? 'real-mc-16' : null }));
+        const originalGet = api.getPull.bind(api);
+        api.getPull = async (input) => {
+          const detail = await originalGet(input);
+          h.ledger.setJobStatus(id, 'binned');
+          return detail;
+        };
+        const result = await makePoll({ ledger: h.ledger, api }).pollOnce();
+        expect(api.calls.map((call) => call.kind)).toEqual(['listPulls', 'getPull']);
+        expect(result.calls).toBe(2);
+        expect(result.signals.map((signal) => signal.kind))
+          .toEqual(merged ? ['pr-merged'] : []);
+        expect(h.ledger.getJob(id)?.status).toBe('binned');
+        if (merged) {
+          expect(h.ledger.latestJobEvent(id, 'github.pr-merged')?.payload)
+            .toMatchObject({ applied: false, merge_commit_sha: 'real-mc-16' });
+        } else {
+          expect(h.ledger.latestJobEvent(id, 'github.pr-merged')).toBeNull();
+        }
+      } finally {
+        h.cleanup();
+      }
+    }
+  });
+
   it('a merge genuinely observed in-flight after binning records one no-effect receipt without resurrecting the lane', async () => {
     const h = makeLedger();
     try {
@@ -627,7 +684,7 @@ describe('github signal poll tick', () => {
     }
   });
 
-  it('a binned lane in an in-flight poll never posts a stale judgment CI alert', async () => {
+  it('a check-run result arriving after binning never posts a stale judgment CI alert', async () => {
     const h = makeLedger();
     try {
       addTrackedJob(h.ledger, 'job-binned-ci', 'https://github.com/acme/app/pull/14');
@@ -635,15 +692,16 @@ describe('github signal poll tick', () => {
       api.pulls.set('acme/app', [pull({ number: 14, headRef: 'gru/job-binned-ci', headSha: 'sha-14' })]);
       api.details.set('acme/app#14', pull({ number: 14, headRef: 'gru/job-binned-ci', headSha: 'sha-14', mergeableState: 'clean' }));
       api.checks.set('acme/app@sha-14', [{ name: 'Perkins review', status: 'completed', conclusion: 'failure', url: 'https://runs/14' }]);
-      const originalList = api.listPulls.bind(api);
-      api.listPulls = async (input) => {
-        const pulls = await originalList(input);
+      const originalChecks = api.listCheckRuns.bind(api);
+      api.listCheckRuns = async (input) => {
+        const runs = await originalChecks(input);
         h.ledger.setJobStatus('job-binned-ci', 'binned');
-        return pulls;
+        return runs;
       };
       const notifications = new FakeNotifications();
       const result = await makePoll({ ledger: h.ledger, api, notifications }).pollOnce();
-      expect(result.signals.map((signal) => signal.kind)).toContain('ci-failed');
+      expect(api.calls.map((call) => call.kind)).toEqual(['listPulls', 'getPull', 'listCheckRuns']);
+      expect(result.signals).toEqual([]);
       expect(h.ledger.getJob('job-binned-ci')?.status).toBe('binned');
       expect(eventCount(h.ledger, 'job-binned-ci', 'github.ci-failed')).toBe(0);
       expect(notifications.posts).toEqual([]);

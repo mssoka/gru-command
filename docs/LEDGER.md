@@ -80,8 +80,10 @@ lens:   pending → live → done | error               (terminal: the last two)
   lane): every non-terminal status may be binned through the ordinary
   authenticated `POST /api/jobs/<id>/status` write WHEN no target-owned
   producer remains. The same status transaction refuses open worker turns,
-  non-terminal children, pending/live rounds and unsettled verification
-  runs; an idle `working` job can still be binned. Gru's shipped role
+  non-terminal children, pending/live rounds, unsettled verification
+  runs and a currently spawning provider-recovery continuation; an idle
+  `working` job can still be binned. A historical claimed provider wait
+  is not a perpetual runtime blocker after its spawn/turn settles. Gru's shipped role
   teaches this intentional action through its permitted shell and the
   configured service token; no background process automatically bins
   work. `binned` never leaves — it shares the terminal contract with `merged`/`done`

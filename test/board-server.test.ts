@@ -375,6 +375,29 @@ describe('board server — HTTP API', () => {
     expect(api.listJobEvents(jobId)).toEqual(after);
   });
 
+  it('Gru bin refuses pending review and unsettled verification with no partial status or debt mutation', async () => {
+    const { api, port } = harness;
+    for (const [id, kind] of [
+      ['gru-bin-round', 'round'],
+      ['gru-bin-verify', 'verification'],
+    ] as const) {
+      api.addJob({ id, repo: 'demo-repo', title: 'Active producer' });
+      api.setJobStatus(id, 'working');
+      api.setJobStatus(id, 'blocked');
+      if (kind === 'round') api.addRound({ jobId: id });
+      else api.appendCustomEvent({ kind: 'verification.started', jobId: id, payload: { run_id: 'ongoing' } });
+      const beforeEvents = api.listJobEvents(id);
+      const beforeDebts = api.listObligations({ jobId: id });
+      const refusal = await postJson(port, `/api/jobs/${id}/status`, 'board-test-token', { status: 'binned' });
+      expect(refusal.status, kind).toBe(400);
+      expect((refusal.body as { detail: string }).detail, kind)
+        .toMatch(kind === 'round' ? /live review round/u : /unsettled verification/u);
+      expect(api.getJob(id)?.status).toBe('blocked');
+      expect(api.listJobEvents(id)).toEqual(beforeEvents);
+      expect(api.listObligations({ jobId: id })).toEqual(beforeDebts);
+    }
+  });
+
   it('closeout endpoint: auth, malformed bodies, missing jobs and guard refusals fail loud without changes', async () => {
     const { api, port } = harness;
     const head = '3c44e87e2e9e64cbc3301d7806540df6273438e6';

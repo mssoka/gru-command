@@ -230,6 +230,9 @@ async function claimJobMinion(
     deps.ledger.setJobStatus(job.id, 'working');
     deps.ledger.noteJob(job.id, 'provider recovery: lane re-opened after a wall-settled block');
   }
+  // This reservation fences binning during asynchronous spawn/turn work;
+  // the durable claimed wait itself remains historical after settlement.
+  const releaseContinuation = deps.ledger.beginProviderContinuation(wait.id, job.id);
   const admitted = { recorded: false };
   let result: Awaited<ReturnType<typeof rebriefFreshMinion>>;
   try {
@@ -241,6 +244,15 @@ async function claimJobMinion(
       note,
       briefing: continuationPrompt ?? job.briefing,
       ...(resumeFile !== null ? { resumeFile } : {}),
+      beforeTurnSideEffect: () => {
+        // A hold or terminal disposition may land during the awaited
+        // worker gate/spawn. Never prompt the replacement against it;
+        // rebriefFreshMinion disposes a spawned handle on refusal.
+        const current = deps.ledger.getJob(job.id);
+        if (current === null || isJobTerminal(current.status) || current.status === 'parked' || current.status === 'blocked') {
+          throw new Error(`provider continuation refused — job "${job.id}" is ${current?.status ?? 'missing'}`);
+        }
+      },
       onSpawned: (worker) => {
         // Record ACTUAL admission (the turn really starting) separately from
         // this claim/delivery — a delivered event alone is not proof.
@@ -285,6 +297,8 @@ async function claimJobMinion(
       error: String(error),
     });
     return { outcome: 'skipped', waitId: wait.id, why: 'continuation spawn failed after atomic claim (recorded; no automatic replay)' };
+  } finally {
+    releaseContinuation();
   }
   // Guarded continuation turn truth (#160): a prompt that settles with an
   // in-band runtime error was admitted but is NOT a continuation. The atomic
