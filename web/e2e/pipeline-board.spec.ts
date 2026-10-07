@@ -366,14 +366,27 @@ async function hitTarget(page: Page, selector: string): Promise<HitTarget> {
     const topmost = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
     return {
       found: true,
-      // Vertical tolerance of 1px absorbs sub-pixel scroll rounding (an
-      // element scrolled to the fold can end <1px past it); the horizontal
-      // axes stay exact, and occlusion is the separate strict `hit` check.
+      // Strict full-viewport containment (unchanged acceptance): negative
+      // top/left or any coordinate past the right/bottom edge fails, and
+      // occlusion is the separate strict `hit` check.
       inViewport:
-        rect.left >= 0 && rect.top >= -1 && rect.right <= window.innerWidth && rect.bottom <= window.innerHeight + 1,
+        rect.left >= 0 && rect.top >= 0 && rect.right <= window.innerWidth && rect.bottom <= window.innerHeight,
       hit: topmost !== null && (topmost === element || element.contains(topmost)),
     };
   }, selector);
+}
+
+/** Bring a content control fully into view before the strict containment
+ * probe. Centering is deterministic across sub-pixel scroll offsets — the
+ * minimal-scroll path could leave a control's edge 0<1px past the fold and
+ * was the observed cause of the b86af16 pipeline failures (runs
+ * f6998e40/52b744fa). The probe itself stays strict; this only fixes the
+ * interaction precondition. */
+async function scrollFullyIntoView(page: Page, selector: string): Promise<void> {
+  await page
+    .locator(selector)
+    .first()
+    .evaluate((el) => el.scrollIntoView({ block: 'center', inline: 'nearest' }));
 }
 
 async function expectReachable(page: Page, selector: string): Promise<void> {
@@ -556,10 +569,11 @@ async function viewportProof(browser: Browser, viewportCase: ViewportCase, theme
     await expect(page.locator('.board-band--pipeline .board-pipeline')).toHaveCount(6);
     await page.locator('.board-band--cold .board-band__more').click();
     await expect(page.locator('.board-band--cold .board-job')).toHaveCount(4);
-    await page.locator('.board-band--cold .board-job').first().scrollIntoViewIfNeeded();
+    await scrollFullyIntoView(page, '.board-band--cold .board-job');
     await expectReachable(page, '.board-band--cold .board-job');
     await page.locator('.board-band--cold .board-band__more').focus();
     await expect(page.locator('.board-band--cold .board-band__more')).toBeFocused();
+    await scrollFullyIntoView(page, '.board-band--cold .board-band__more');
     await expectReachable(page, '.board-band--cold .board-band__more');
     // Every section disclosure control, focused in turn: a focused target
     // that a sticky chrome/drawer covered would fail its hit test.
@@ -573,6 +587,7 @@ async function viewportProof(browser: Browser, viewportCase: ViewportCase, theme
       const selector = `${band} .board-band__more`;
       await page.locator(selector).focus();
       await expect(page.locator(selector), `${label} toggle focus`).toBeFocused();
+      await scrollFullyIntoView(page, selector);
       await expectReachable(page, selector);
     }
     await captureViewport(page, `${name}-${theme}-expanded-focus`, 'expanded + focused-target viewport');
