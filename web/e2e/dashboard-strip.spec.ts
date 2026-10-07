@@ -1105,8 +1105,13 @@ test('keyboard reveal on independent Ack and PR rows sends nothing; Ack, OPEN PR
   // Unique accessible name per disclosure (row identity in the AT list).
   await expect(ackDisclose).toHaveAttribute('aria-label', /^Review decision: .+\(owner-ack:pend-0000\)$/);
   // Themed keyboard focus ring on the new control (:focus-visible after a
-  // keyboard interaction).
-  expect(await ackDisclose.evaluate((el) => getComputedStyle(el).outlineWidth)).toBe('3px');
+  // keyboard interaction) — width, token colour and offset all pinned.
+  const ringOf = (locator: Locator) =>
+    locator.evaluate((el) => {
+      const s = getComputedStyle(el);
+      return { width: s.outlineWidth, color: s.outlineColor, offset: s.outlineOffset };
+    });
+  expect(await ringOf(ackDisclose)).toEqual({ width: '3px', color: 'rgb(255, 213, 74)', offset: '2px' });
   // The button is literally labeled Ack; the FULL consequence and the
   // complete original detail sit in the same row's visible region,
   // beside the control, BEFORE any activation.
@@ -1131,13 +1136,13 @@ test('keyboard reveal on independent Ack and PR rows sends nothing; Ack, OPEN PR
   await expectFocusedControl(page, ackButton, 'owner-ack:pend-0000', 'ack');
   // Themed keyboard focus ring survives the restore on the explicit Ack
   // control too (not only on the disclosure).
-  expect(await ackButton.evaluate((el) => getComputedStyle(el).outlineWidth)).toBe('3px');
+  expect(await ringOf(ackButton)).toEqual({ width: '3px', color: 'rgb(255, 213, 74)', offset: '2px' });
   // Focused OPEN PR survives the same way (10→99) — focused, never activated.
   await prOpen.focus();
   await send(makeSnapshot({ ...familyA(99), pending: 2 }));
   await waitForCount(page, 'prs.open', 99);
   await expectFocusedControl(page, prOpen, 'owner-pr:synthetic', 'open');
-  expect(await prOpen.evaluate((el) => getComputedStyle(el).outlineWidth)).toBe('3px');
+  expect(await ringOf(prOpen)).toEqual({ width: '3px', color: 'rgb(255, 213, 74)', offset: '2px' });
   // Full reconnect (socket close → re-auth → HTTP refetch) with the OPEN PR
   // control focused: the refetched state is genuinely CHANGED (100).
   send.stage(makeSnapshot({ ...familyA(100), pending: 2 }));

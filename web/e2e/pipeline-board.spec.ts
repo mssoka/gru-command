@@ -366,12 +366,11 @@ async function hitTarget(page: Page, selector: string): Promise<HitTarget> {
     const topmost = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
     return {
       found: true,
-      // Containment tolerance of 1px absorbs sub-pixel scroll rounding
-      // (an element scrolled to the fold can end <1px past it); real
-      // clipping/off-screen states are far larger, and occlusion is the
-      // separate strict `hit` check below.
+      // Vertical tolerance of 1px absorbs sub-pixel scroll rounding (an
+      // element scrolled to the fold can end <1px past it); the horizontal
+      // axes stay exact, and occlusion is the separate strict `hit` check.
       inViewport:
-        rect.left >= -1 && rect.top >= -1 && rect.right <= window.innerWidth + 1 && rect.bottom <= window.innerHeight + 1,
+        rect.left >= 0 && rect.top >= -1 && rect.right <= window.innerWidth && rect.bottom <= window.innerHeight + 1,
       hit: topmost !== null && (topmost === element || element.contains(topmost)),
     };
   }, selector);
@@ -742,10 +741,12 @@ test.describe('compact owner-first board — synthetic geometry proof', () => {
     expect(railBox).not.toBeNull();
     expect(navBox!.y).toBeGreaterThanOrEqual(0);
     // Pinned under the measured chrome: the nav's sticky top follows the
-    // globally measured chrome height, so it sits at (or above) the strip's
-    // bottom edge — the slim strip is taller than the old pill rail and
-    // this bound tracks the measurement instead of a fixed constant.
-    expect(navBox!.y).toBeLessThanOrEqual(railBox!.y + railBox!.height + 1);
+    // globally measured chrome height, so its top sits at the strip's
+    // bottom edge — bounded on BOTH sides so neither an under-measured
+    // chrome (nav overlapping the strip) nor a larger gap passes.
+    const railBottom = railBox!.y + railBox!.height;
+    expect(navBox!.y).toBeGreaterThanOrEqual(railBottom - 1);
+    expect(navBox!.y).toBeLessThanOrEqual(railBottom + 1);
 
     // A shortcut jump lands the target in view and never under the strip.
     const coldLink = page.locator('#board-nav .board-nav__link[data-nav="cold"]');

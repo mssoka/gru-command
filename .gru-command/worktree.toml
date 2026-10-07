@@ -652,6 +652,14 @@ strip-themes = "cd web && node ../node_modules/typescript/bin/tsc --noEmit -p ts
 # against complete, scheduler-captured output instead of an ad-hoc rerun.
 dashboard-slim-strip-unit = "cd web && node ../node_modules/vitest/vitest.mjs run src/ui/board.test.ts src/lib/board-rail.test.ts src/lib/owner-band.test.ts"
 
+# Baseline exit semantics (both slim-strip baselines): the scope passes the
+# runner's real code through; behavioral feature-absence RED is normally 1.
+# An UNEXPECTED PASS exits 2 with the FAILS-BEFORE CLAIM BROKEN marker, so a
+# tooling-chain failure that itself exits 2 (e.g. tsc) shares that code —
+# both mean "not usable fail-before evidence", and the echoed runner code
+# plus the marker line distinguish them in the capture. The deferred
+# failure-kind assertion (JSON reporter, tools/assert-binned-baseline.mjs
+# pattern) stays recorded in deferred-work.md.
 # Dashboard slim-strip baseline comparison (the dashboard-specific baseline
 # this continuation's acceptance requires). The lane's FINAL web unit test
 # files (board.test.ts / board-rail.test.ts / owner-band.test.ts, fetched

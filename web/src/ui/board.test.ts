@@ -2808,6 +2808,12 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     view.render(snapshot({ notifications: [{ ...only, ackedAt: '2026-01-01T00:09:00.000Z' }] }));
     expect(band.contains(document.activeElement)).toBe(true);
     expect(document.activeElement).toBe(band.querySelector('.board-band__head'));
+    // And when rows RETURN while the head holds focus, focus moves to the
+    // live control (the head is not a resting place once rows exist).
+    view.render(snapshot({ notifications: [only] }));
+    expect(document.activeElement).toBe(
+      band.querySelector('[data-action-id="owner-ack:only-row"][data-control="disclose"]'),
+    );
   });
 
   it('settling the focused row with rows remaining keeps focus on a remaining band control', () => {
