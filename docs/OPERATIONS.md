@@ -199,6 +199,11 @@ curl -sS -X POST "http://127.0.0.1:<port>/api/jobs/<job-id>/closeout" \
   }'
 ```
 
+`closed_at` may be omitted entirely — the audit then records `null`.
+An explicit JSON `null` is refused (`400`) at both the HTTP and ledger
+boundaries: the typed contract accepts a real ISO-8601 UTC timestamp or
+an absent field.
+
 - `200` — the job is `done`; the response carries the job, the
   `job.admin-closeout` audit event (seq + payload) and `idempotent: false`.
   Re-sending the identical request returns the SAME event with

@@ -76,9 +76,10 @@ lens:   pending → live → done | error               (terminal: the last two)
   external sweep (Silas) — the remaining external caller of the job
   machine. Nothing in the ledger infers a merge.
 - **Administrative closeout** (`adminCloseParkedJob`, owner ruling
-  j-1115) is the ONE exception path that closes a parked PR-backed lane
-  without faking a hop: the generic machine still refuses parked → done,
-  and only this guarded operation admits the direct `parked → done` edge.
+  j-1115) is the first of the guarded exception paths that close a parked
+  PR-backed lane without faking a hop: the generic machine still refuses
+  parked → done, and only these guarded operations admit the direct
+  `parked → done` edge (the owner-cancellation form below is the other).
   (A lane resumed through its normal lifecycle still reaches `done` by
   the ordinary route — this edge exists for a lane that never resumes.)
   It requires an explicit expected status + PR url + head, the job's
@@ -103,9 +104,12 @@ lens:   pending → live → done | error               (terminal: the last two)
   authoritative live-work fence: durable execution markers plus (when
   wired) the live registry handle set and the supervisor's open
   turn/control/tool view, so a ledger `idle` row with an effective open
-  turn refuses. An explicit supervision stop is not live execution.
-  Directive/re-brief/report/verification history and worktrees are never
-  rewritten by either form.
+  turn refuses. An explicit supervision stop is not live execution —
+  the recorded stop wins over a lingering live handle (disposal after a
+  stop is best-effort), so a stopped/breaker-open lane can be closed
+  even if its process has not exited yet; the registry's handle ids bind
+  through the lane's ledger agent rows. Directive/re-brief/report/
+  verification history and worktrees are never rewritten by either form.
 - `setRoundVerdict` also transitions the round to `verdict-posted` — a
   posted verdict IS that state (and a verdict on a still-`pending` round
   fails loud, machine and all, leaving no trace).
