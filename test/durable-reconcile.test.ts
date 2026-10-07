@@ -225,6 +225,36 @@ describe('durable reconciliation pass (issue #163)', () => {
     expect(api.listEvents({ limit: 200 }).filter((event) => event.jobId === 'job-busy' && event.seq > before)).toEqual([]);
   });
 
+  it('a binned target keeps report debt until an independently observed real PR merge', () => {
+    const { api } = freshLedger();
+    const posts: Post[] = [];
+    const url = 'https://github.com/acme/app/pull/77';
+    api.addJob({ id: 'discarded-target', repo: 'demo', title: 'Target', briefing: 'b' });
+    api.setJobPr('discarded-target', url);
+    api.setJobStatus('discarded-target', 'binned');
+    api.addJob({ id: 'report-on-discard', repo: 'demo', title: 'Review', briefing: 'b',
+      deliverable: 'review', commissioner: 'gru', targetRef: url, targetSha: 'reviewed-sha' });
+    api.setJobStatus('report-on-discard', 'working');
+    api.setJobStatus('report-on-discard', 'delivered');
+    const receipt = api.appendCustomEvent({ kind: 'job.delivered', jobId: 'report-on-discard', payload: { sha: 'reviewed-sha' } });
+    api.openReportObligation({ jobId: 'report-on-discard', observedAtSeq: receipt.seq });
+
+    const unproven = reconcileDurableWork({ ledger: api, notifications: fakeNotifications(posts) });
+    expect(unproven.reports.superseded).toBe(0);
+    expect(api.getJob('report-on-discard')?.status).toBe('delivered');
+    expect(api.findReportObligation('report-on-discard')?.state).toBe('open');
+    // This event is only emitted by an existing in-flight GitHub observation;
+    // binning and URL alone did not produce it.
+    api.appendCustomEvent({ kind: 'github.pr-merged', jobId: 'discarded-target',
+      payload: { pr: 77, merge_commit_sha: 'real-merge-sha', applied: false, reason: 'job is binned' } });
+    const proven = reconcileDurableWork({ ledger: api, notifications: fakeNotifications(posts) });
+    expect(proven.reports.superseded).toBe(1);
+    expect(api.getJob('discarded-target')?.status).toBe('binned');
+    expect(api.getJob('report-on-discard')?.status).toBe('done');
+    expect(api.latestJobEvent('report-on-discard', 'report.superseded')?.payload)
+      .toMatchObject({ target_ref: url });
+  });
+
   it('an uncorrelated or stale-head delivery never advances an awaiting phase', () => {
     const { api } = freshLedger();
     const posts: Post[] = [];

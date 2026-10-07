@@ -3,9 +3,18 @@ import { createHash, randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { admissionPreflight, ReviewAdmissionError } from '../src/dispatch/perkins-review/admission.js';
-import { probeAdvertisedTipMovementAsync } from '../src/dispatch/perkins-review/artifacts.js';
+import {
+  defaultProbeExec,
+  parseKernWaketime,
+  probeAdvertisedTipMovementAsync,
+  readKernWaketime,
+  remainingTimeoutMs,
+  sourceMovementSinceFreeze,
+  SUSPEND_EVIDENCE_ALLOWANCE_MS,
+  type SuspendEvidenceIo,
+} from '../src/dispatch/perkins-review/artifacts.js';
 import {
   freezeReviewInputs,
   type FrozenReview,
@@ -435,9 +444,9 @@ describe('Perkins admission preflight (gh-169)', () => {
     const oldPath = process.env.PATH;
     process.env.PATH = `${shimDir}:${oldPath ?? ''}`;
     try {
-      const startedAt = Date.now();
+      const startedAt = performance.now();
       const result = admissionPreflight(review, 'origin/feature/stalled', { remoteProbeTimeoutMs: 1_000 });
-      const elapsed = Date.now() - startedAt;
+      const elapsed = performance.now() - startedAt;
       expect(elapsed).toBeLessThan(10_000);
       expect(result.missing.map((entry) => entry.input)).toEqual(['head-binding']);
       expect(result.missing[0]!.detail).toContain('check-failed');
@@ -537,9 +546,9 @@ describe('Perkins admission preflight (gh-169)', () => {
     const oldPath = process.env.PATH;
     process.env.PATH = `${shimDir}:${oldPath ?? ''}`;
     try {
-      const startedAt = Date.now();
+      const startedAt = performance.now();
       const movement = await probeAdvertisedTipMovementAsync(review, 1_500);
-      const elapsed = Date.now() - startedAt;
+      const elapsed = performance.now() - startedAt;
       expect(movement?.cause).toBe('check-failed');
       // R8-5: DISCRIMINATING bound — under the cumulative budget the probe
       // refuses at ~1.5 s; a reverted per-call timeout (0.6+0.6+1.5 s)
@@ -549,6 +558,340 @@ describe('Perkins admission preflight (gh-169)', () => {
       if (oldPath === undefined) delete process.env.PATH;
       else process.env.PATH = oldPath;
     }
+  });
+
+  /** A frozen review whose target is a pushed branch, so admission runs
+   * the full identification + advertised-tip probe against a real remote. */
+  function branchTargetReview(name: string) {
+    const repo = makeFixtureRepo(`admission-${name}`);
+    repos.push(repo);
+    repo.git(['checkout', '-b', `feature/${name}`]);
+    const target = repo.commitFile('src/main.ts', `export const s = '${name}';\n`);
+    attachBareOrigin(repo);
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/main']);
+    repo.git(['push', '--quiet', 'origin', `refs/heads/feature/${name}`]);
+    const ci = renderRecordedCiEvidence({
+      events: { branchState: null, ciGreen: null, ciFailed: null },
+      targetSha: target,
+      expectedRepo: 'acme/fixture',
+      expectedPr: 14,
+    });
+    let spec = appendRecordedVerification({ spec: 'Acceptance: s is set.', evidence: null });
+    spec = appendCiEvidence({ spec, block: ci.block, maxBytes: 256 * 1024 });
+    return freezeReviewInputs({
+      roundId: `round-${name}`,
+      repoPath: repo.path,
+      artifactRoot: temp('admission-artifacts-'),
+      baseRef: 'main',
+      targetRef: target,
+      movementRef: `origin/feature/${name}`,
+      spec,
+      ciEvidence: ci.record,
+    });
+  }
+
+  /** OS suspend evidence as macOS reports it: the kernel's last wake,
+   * `wakeOffsetMs` after the probe started (null: sysctl unreadable). */
+  const WALL0 = 1_790_000_000_000;
+  function macWake(wakeOffsetMs: number | null, reads: { count: number } = { count: 0 }): SuspendEvidenceIo {
+    return {
+      platform: 'darwin',
+      wallNow: () => WALL0,
+      kernWaketime: async () => {
+        reads.count += 1;
+        if (wakeOffsetMs === null) throw new Error('sysctl: unknown oid');
+        const wake = WALL0 + wakeOffsetMs;
+        return `{ sec = ${Math.floor(wake / 1000)}, usec = ${(wake % 1000) * 1000} } Wed Oct  7 09:56:48 2026\n`;
+      },
+      bootClockMs: () => null,
+    };
+  }
+  /** The last wake predates the probe: no suspend. */
+  const NO_SUSPEND = macWake(-3_600_000);
+
+  it('a wall-clock jump mid-probe (clock correction) does not refuse admission', async () => {
+    const review = branchTargetReview('wall-jump');
+    const realNow = Date.now.bind(Date);
+    let offset = 0;
+    const steps: string[] = [];
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => realNow() + offset);
+    try {
+      const movement = await probeAdvertisedTipMovementAsync(review, 5_000, {
+        // Real git; the wall clock is corrected 60 s forward once the first
+        // step has settled — a wall-clock budget would now be spent.
+        exec: async (repo, args, timeoutMs) => {
+          const stdout = await defaultProbeExec(repo, args, timeoutMs);
+          steps.push(args[0]!);
+          offset = 60_000;
+          return stdout;
+        },
+        evidence: NO_SUSPEND,
+      });
+      expect(steps[0]).toBe('check-ref-format');
+      expect(steps).toContain('ls-remote');
+      expect(movement).toBeNull();
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  /** A scripted git for a branch-target probe: answers every step, records
+   * each call, and can run a hook (a clock jump, a failure) per call. */
+  function scriptedGit(targetSha: string, hook: (args: readonly string[], call: number) => void = () => {}) {
+    const calls: string[] = [];
+    const exec = async (_repo: string, args: readonly string[]): Promise<string> => {
+      calls.push(args[0]!);
+      hook(args, calls.length);
+      if (args[0] === 'rev-parse') return `refs/remotes/origin/${String(args.at(-1)).replace(/^origin\//u, '')}\n`;
+      if (args[0] === 'remote') return 'origin\n';
+      if (args[0] === 'ls-remote') return `${targetSha}\trefs/heads/feature\n`;
+      return '';
+    };
+    return { calls, exec };
+  }
+
+  it('a suspend between probe steps (OS evidence) restarts identification exactly once with a fresh budget', async () => {
+    const review = branchTargetReview('sleep-between');
+    for (const evidence of [true, false]) {
+      let t = 0;
+      // The machine suspends right after the first step: the budget clock is
+      // 60 s further on when that step settles (macOS clocks count sleep).
+      const git = scriptedGit(review.manifest.targetSha, (args, call) => {
+        if (call === 1) t += 60_000;
+      });
+      const movement = await probeAdvertisedTipMovementAsync(review, 5_000, {
+        now: () => t,
+        exec: git.exec,
+        evidence: evidence ? macWake(30_000) : NO_SUSPEND,
+      });
+      if (evidence) {
+        expect(movement).toBeNull();
+        expect(git.calls).toEqual(['check-ref-format', 'check-ref-format', 'rev-parse', 'remote', 'ls-remote']);
+      } else {
+        expect(movement?.cause).toBe('check-failed');
+        expect(movement?.detail).toContain('budget exhausted after: git check-ref-format');
+        expect(git.calls).toEqual(['check-ref-format']);
+      }
+    }
+  });
+
+  it('a suspend while a real git step is outstanding: its kill lands on wake, the one retry admits', async () => {
+    const review = branchTargetReview('sleep-outstanding');
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    const shimDir = temp('admission-sleep-shim-');
+    const marker = join(shimDir, 'stalled-once');
+    const calls = join(shimDir, 'rev-parse-calls');
+    writeFileSync(
+      join(shimDir, 'git'),
+      `#!/bin/sh\ncase " $* " in *"rev-parse"*) echo x >> "${calls}"; if [ ! -f "${marker}" ]; then : > "${marker}"; sleep 3; fi;; esac\nexec "${realGit}" "$@"\n`,
+    );
+    chmodSync(join(shimDir, 'git'), 0o755);
+    let offset = 0;
+    const oldPath = process.env.PATH;
+    process.env.PATH = `${shimDir}:${oldPath ?? ''}`;
+    try {
+      const movement = await probeAdvertisedTipMovementAsync(review, 1_500, {
+        now: () => performance.now() + offset,
+        // Barrier: the moment the first rev-parse is launched, the machine
+        // "sleeps" 60 s — the real execFile kill then fires on wake.
+        exec: (repo, args, timeoutMs) => {
+          const running = defaultProbeExec(repo, args, timeoutMs);
+          if (args[0] === 'rev-parse' && offset === 0) offset = 60_000;
+          return running;
+        },
+        evidence: macWake(30_000),
+      });
+      expect(movement).toBeNull();
+      expect(readFileSync(calls, 'utf8').trim().split('\n')).toHaveLength(2);
+    } finally {
+      if (oldPath === undefined) delete process.env.PATH;
+      else process.env.PATH = oldPath;
+    }
+  });
+
+  it('a failed retry is final: its own check-failed detail, and never a third attempt', async () => {
+    const review = branchTargetReview('retry-fails');
+    let t = 0;
+    const git = scriptedGit(review.manifest.targetSha, (args, call) => {
+      if (call === 1) t += 60_000; // suspend during the first attempt
+      if (call >= 2 && args[0] === 'rev-parse') throw new Error('fatal: unable to access the remote');
+    });
+    const movement = await probeAdvertisedTipMovementAsync(review, 5_000, {
+      now: () => t,
+      exec: git.exec,
+      evidence: macWake(30_000), // evidence even after the retry
+    });
+    expect(movement?.cause).toBe('check-failed');
+    expect(movement?.detail).toContain('unable to access the remote');
+    expect(git.calls.filter((call) => call === 'check-ref-format')).toHaveLength(2);
+  });
+
+  it('without OS suspend evidence a blocked event loop earns no retry — refused within the single deadline', async () => {
+    const review = branchTargetReview('stall-no-evidence');
+    let t = 0;
+    const git = scriptedGit(review.manifest.targetSha, (_args, call) => {
+      if (call === 1) t += 5_500; // the service's own work blocked the loop
+    });
+    const asked = { count: 0 };
+    const movement = await probeAdvertisedTipMovementAsync(review, 5_000, {
+      now: () => t,
+      exec: git.exec,
+      evidence: macWake(-3_600_000, asked),
+    });
+    expect(movement?.cause).toBe('check-failed');
+    expect(git.calls).toEqual(['check-ref-format']);
+    expect(asked.count).toBe(1);
+  });
+
+  it('the production detector decides the one retry from the OS inputs alone (macOS wake, Linux boot clock)', async () => {
+    const review = branchTargetReview('evidence-table');
+    const cases: Array<{ readonly name: string; readonly retry: boolean; readonly linuxAheadMs?: number | 'unreadable'; readonly mac?: number | null; readonly platform?: NodeJS.Platform }> = [
+      { name: 'macOS woke after the start', retry: true, mac: 30_000 },
+      { name: 'macOS woke at the start instant', retry: false, mac: 0 },
+      { name: 'macOS last wake is stale', retry: false, mac: -3_600_000 },
+      { name: 'macOS wake unreadable', retry: false, mac: null },
+      { name: 'Linux boot clock ran 60 s ahead', retry: true, linuxAheadMs: 60_000 },
+      { name: 'Linux boot clock ran exactly 1 s ahead', retry: false, linuxAheadMs: 1_000 },
+      { name: 'Linux boot clock unreadable on wake', retry: false, linuxAheadMs: 'unreadable' },
+      { name: 'no evidence source on this platform', retry: false, platform: 'win32' },
+    ];
+    for (const c of cases) {
+      let t = 0;
+      let boot = 500_000;
+      let bootReads = 0;
+      const linux = c.linuxAheadMs !== undefined;
+      // The first step is broken by the suspend: on macOS the budget clock
+      // jumped; on Linux it paused and the connection dropped.
+      const git = scriptedGit(review.manifest.targetSha, (_args, call) => {
+        if (call !== 1) return;
+        if (linux) {
+          boot += c.linuxAheadMs === 'unreadable' ? 60_000 : c.linuxAheadMs!;
+          throw new Error('fatal: the remote end hung up unexpectedly');
+        }
+        t += 60_000;
+      });
+      const evidence: SuspendEvidenceIo = linux
+        ? {
+          platform: 'linux',
+          wallNow: () => WALL0,
+          kernWaketime: async () => { throw new Error('not macOS'); },
+          bootClockMs: () => (c.linuxAheadMs === 'unreadable' && bootReads++ > 0 ? null : boot),
+        }
+        : c.platform !== undefined
+          ? { ...macWake(30_000), platform: c.platform }
+          : macWake(c.mac ?? null);
+      const movement = await probeAdvertisedTipMovementAsync(review, 5_000, { now: () => t, exec: git.exec, evidence });
+      expect({ name: c.name, admitted: movement === null, attempts: git.calls.filter((call) => call === 'check-ref-format').length })
+        .toEqual({ name: c.name, admitted: c.retry, attempts: c.retry ? 2 : 1 });
+    }
+  });
+
+  it('a failed probe waits at most the separate evidence allowance for a stalled evidence read, then refuses', async () => {
+    const review = branchTargetReview('evidence-stall');
+    let t = 0;
+    const git = scriptedGit(review.manifest.targetSha, (_args, call) => {
+      if (call === 1) t += 60_000;
+    });
+    const asked: number[] = [];
+    const startedAt = performance.now();
+    const movement = await probeAdvertisedTipMovementAsync(review, 5_000, {
+      now: () => t,
+      exec: git.exec,
+      evidence: {
+        ...macWake(30_000),
+        kernWaketime: (timeoutMs) => {
+          asked.push(timeoutMs);
+          return new Promise<string>(() => {}); // never answers
+        },
+      },
+    });
+    const elapsed = performance.now() - startedAt;
+    expect(movement?.cause).toBe('check-failed');
+    expect(git.calls).toEqual(['check-ref-format']);
+    expect(asked).toEqual([SUSPEND_EVIDENCE_ALLOWANCE_MS]);
+    expect(elapsed).toBeGreaterThanOrEqual(SUSPEND_EVIDENCE_ALLOWANCE_MS - 50);
+    expect(elapsed).toBeLessThan(SUSPEND_EVIDENCE_ALLOWANCE_MS + 1_500);
+  });
+
+  it.skipIf(process.platform !== 'darwin')('reads the real kernel wake by absolute path, even when PATH lacks /usr/sbin', async () => {
+    const review = branchTargetReview('sysctl-path');
+    let t = 0;
+    const git = scriptedGit(review.manifest.targetSha, (_args, call) => {
+      if (call === 1) t += 60_000;
+    });
+    const oldPath = process.env.PATH;
+    process.env.PATH = '/nonexistent';
+    try {
+      // The probe "started" at the epoch, so the machine's real last wake
+      // is positive evidence — if, and only if, sysctl can be run.
+      const movement = await probeAdvertisedTipMovementAsync(review, 5_000, {
+        now: () => t,
+        exec: git.exec,
+        evidence: { platform: 'darwin', wallNow: () => 0, kernWaketime: readKernWaketime, bootClockMs: () => null },
+      });
+      expect(movement).toBeNull();
+      expect(git.calls.filter((call) => call === 'check-ref-format')).toHaveLength(2);
+    } finally {
+      if (oldPath === undefined) delete process.env.PATH;
+      else process.env.PATH = oldPath;
+    }
+  });
+
+  it('a git that ignores SIGTERM still ends at its bound — async admission step and sync remote probe alike', async () => {
+    const review = branchTargetReview('sigterm-ignored');
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    const shimDir = temp('admission-sigterm-shim-');
+    writeFileSync(
+      join(shimDir, 'git'),
+      `#!/bin/sh\ncase " $* " in *"ls-remote"*) trap '' TERM; exec sleep 4;; esac\nexec "${realGit}" "$@"\n`,
+    );
+    chmodSync(join(shimDir, 'git'), 0o755);
+    const oldPath = process.env.PATH;
+    process.env.PATH = `${shimDir}:${oldPath ?? ''}`;
+    try {
+      let startedAt = performance.now();
+      await expect(defaultProbeExec(review.manifest.repoPath, ['ls-remote', 'origin'], 250)).rejects.toThrow();
+      expect(performance.now() - startedAt).toBeLessThan(2_000);
+      startedAt = performance.now();
+      const movement = sourceMovementSinceFreeze(review, { remoteProbeTimeoutMs: 250 });
+      expect(performance.now() - startedAt).toBeLessThan(2_000);
+      expect(movement?.cause).toBe('check-failed');
+    } finally {
+      if (oldPath === undefined) delete process.env.PATH;
+      else process.env.PATH = oldPath;
+    }
+  });
+
+  it('a git rejection that settles past the deadline is refused, never read as "not a branch"', async () => {
+    const review = branchTargetReview('late-rejection');
+    for (const late of [true, false]) {
+      let t = 0;
+      const git = scriptedGit(review.manifest.targetSha, (args, call) => {
+        if (call !== 1) return;
+        if (late) t = 5_001;
+        throw Object.assign(new Error(`fatal: '${String(args.at(-1))}' is not a valid branch name`), { code: 128 });
+      });
+      const movement = await probeAdvertisedTipMovementAsync(review, 5_000, { now: () => t, exec: git.exec, evidence: NO_SUSPEND });
+      expect(git.calls).toEqual(['check-ref-format']);
+      if (late) {
+        expect(movement?.cause).toBe('check-failed');
+        expect(movement?.detail).toContain('budget exhausted after: git check-ref-format');
+      } else {
+        expect(movement).toBeNull(); // an in-time rejection: not a branch spelling, nothing to probe
+      }
+    }
+  });
+
+  it('reads macOS kernel wake evidence exactly', () => {
+    expect(parseKernWaketime('{ sec = 1790944289, usec = 208542 } Fri Oct  2 13:31:29 2026\n')).toBe(1_790_944_289_208);
+    expect(parseKernWaketime('sysctl: unknown oid')).toBeNull();
+  });
+
+  it('rounds a fractional remainder up for execFile and refuses a spent budget', () => {
+    expect(remainingTimeoutMs(100, 99.5)).toBe(1);
+    expect(remainingTimeoutMs(100, 0)).toBe(100);
+    expect(remainingTimeoutMs(100, 100)).toBeNull();
+    expect(remainingTimeoutMs(100, 100.2)).toBeNull();
   });
 
   it('is read-only: a pass and a refusal leave every frozen packet byte identical', () => {

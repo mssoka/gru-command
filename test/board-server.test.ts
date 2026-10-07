@@ -16,6 +16,7 @@ import { TranscriptService } from '../src/transcripts/service.js';
 import { loadConfig } from '../src/config.js';
 import { DecisionRuntime } from '../src/decisions/runtime.js';
 import { DREAM_FAILED_KIND, dreamFailureIncidents } from '../src/lessons/dream.js';
+import { ROLE_DEFINITIONS } from '../src/roles.js';
 
 const cleanupDirs: string[] = [];
 afterAll(() => {
@@ -272,6 +273,132 @@ describe('board server — HTTP API', () => {
     expect(snapshot.repos.find((r) => r.name === 'demo-repo')?.jobs.some((j) => j.id === 'api-job')).toBe(true);
   });
 
+  it('a binned discard is audited end-to-end; auth/malformed/illegal attempts never mutate', async () => {
+    const { api, port } = harness;
+    api.addJob({ id: 'audit-binned', repo: 'demo-repo', title: 'Audit the discard' });
+    const eventsBefore = api.listJobEvents('audit-binned').length;
+    // A caller-provided `by` is NOT authentication.
+    const unauth = await postJson(port, '/api/jobs/audit-binned/status', null, { status: 'binned', by: 'gru' });
+    expect(unauth.status).toBe(401);
+    expect(api.getJob('audit-binned')?.status).toBe('dispatched');
+    expect(api.listJobEvents('audit-binned').length).toBe(eventsBefore);
+
+    const malformed = await postJson(port, '/api/jobs/audit-binned/status', 'board-test-token', { status: 'discarded' });
+    expect(malformed.status).toBe(400);
+    expect(api.getJob('audit-binned')?.status).toBe('dispatched');
+    expect(api.listJobEvents('audit-binned').length).toBe(eventsBefore);
+
+    const legal = await postJson(port, '/api/jobs/audit-binned/status', 'board-test-token', { status: 'binned' });
+    expect(legal.status).toBe(200);
+    expect((legal.body as { status: string }).status).toBe('binned');
+    // The ordinary audit event preserves the truthful prior status.
+    expect(api.latestJobEvent('audit-binned', 'job.status')?.payload).toEqual({ from: 'dispatched', to: 'binned' });
+    // A repeated identical write is an idempotent 200 no-op (no event).
+    const rebinEvents = api.listJobEvents('audit-binned').length;
+    const rebin = await postJson(port, '/api/jobs/audit-binned/status', 'board-test-token', { status: 'binned' });
+    expect(rebin.status).toBe(200);
+    expect(api.listJobEvents('audit-binned').length).toBe(rebinEvents);
+
+    // Terminal: no resumption, and a closed merged lane refuses binning.
+    const resume = await postJson(port, '/api/jobs/audit-binned/status', 'board-test-token', { status: 'working' });
+    expect(resume.status).toBe(400);
+    expect((resume.body as { detail: string }).detail).toMatch(/illegal transition binned → working/u);
+    expect(api.getJob('audit-binned')?.status).toBe('binned');
+    api.addJob({ id: 'audit-merged', repo: 'demo-repo', title: 'Already merged' });
+    api.setJobStatus('audit-merged', 'working');
+    api.setJobStatus('audit-merged', 'in-review');
+    api.setJobStatus('audit-merged', 'merged');
+    const refuse = await postJson(port, '/api/jobs/audit-merged/status', 'board-test-token', { status: 'binned' });
+    expect(refuse.status).toBe(400);
+    expect((refuse.body as { detail: string }).detail).toMatch(/illegal transition merged → binned/u);
+    expect(api.getJob('audit-merged')?.status).toBe('merged');
+
+    // The board snapshot carries the discarded lane as a closed receipt.
+    const snapshot = (await getJson(port, '/api/board', 'board-test-token')).body as {
+      repos: { name: string; jobs: { id: string; status: string; prState: string | null }[] }[];
+    };
+    const row = snapshot.repos.flatMap((repo) => repo.jobs).find((job) => job.id === 'audit-binned');
+    expect(row?.status).toBe('binned');
+    expect(row?.prState).toBeNull();
+  });
+
+  it('Gru loaded action bins a named abandoned heist through auth with truthful history and no revival', async () => {
+    const { api, port } = harness;
+    const prompt = ROLE_DEFINITIONS.gru.systemPrompt;
+    expect(ROLE_DEFINITIONS.gru.tools).toContain('bash');
+    // This test reads the actual shipped Gru prompt, extracts its action,
+    // then executes that path against the real HTTP write surface (never a
+    // live instance). A status enum or operator-only manual cannot pass.
+    const action = prompt.match(/authenticated `POST (\/api\/jobs\/<job-id>\/status)` with JSON `(\{ "status": "binned" \})`/u);
+    expect(action, 'Gru must be taught the precise authenticated discard action').not.toBeNull();
+    if (action === null) return;
+    expect(prompt).toContain('Do not automatically bin');
+    expect(prompt).toContain('live worker');
+    const jobId = 'gru-bin-heist';
+    const path = action[1]!.replace('<job-id>', jobId);
+    const body = JSON.parse(action[2]!) as { status: string };
+    const liveId = 'gru-bin-live';
+    const livePath = action[1]!.replace('<job-id>', liveId);
+    api.addJob({ id: liveId, repo: 'demo-repo', title: 'Still running' });
+    api.setJobStatus(liveId, 'working');
+    api.registerAgent({ id: 'live-gru-worker', role: 'minion', jobId: liveId });
+    api.setAgentState('live-gru-worker', 'streaming');
+    const liveBefore = api.listJobEvents(liveId);
+    const refused = await postJson(port, livePath, 'board-test-token', body);
+    expect(refused.status).toBe(400);
+    expect((refused.body as { detail: string }).detail).toMatch(/live work|open worker/u);
+    expect(api.getJob(liveId)?.status).toBe('working');
+    expect(api.listJobEvents(liveId)).toEqual(liveBefore);
+    api.setAgentState('live-gru-worker', 'idle');
+    expect((await postJson(port, livePath, 'board-test-token', body)).status).toBe(200);
+
+    api.addJob({ id: jobId, repo: 'demo-repo', title: 'Discarded by Gru' });
+    api.setJobStatus(jobId, 'working');
+    api.setJobStatus(jobId, 'blocked');
+    const before = api.listJobEvents(jobId);
+    expect(api.listObligations({ jobId }).some((row) => row.state === 'open')).toBe(true);
+    expect((await postJson(port, path, null, body)).status).toBe(401);
+    expect(api.listJobEvents(jobId)).toEqual(before);
+    const accepted = await postJson(port, path, 'board-test-token', body);
+    expect(accepted.status).toBe(200);
+    expect(accepted.body).toMatchObject({ id: jobId, status: 'binned' });
+    const after = api.listJobEvents(jobId);
+    expect(after.slice(-before.length)).toEqual(before);
+    expect(after.filter((event) => event.kind === 'job.status' &&
+      (event.payload as { to?: string }).to === 'binned'))
+      .toHaveLength(1);
+    expect(api.latestJobEvent(jobId, 'job.status')?.payload).toEqual({ from: 'blocked', to: 'binned' });
+    expect(api.listObligations({ jobId }).every((row) => row.state === 'closed')).toBe(true);
+    expect(api.listObligations({ jobId }).some((row) =>
+      row.settlement?.kind === 'job-terminal' && row.settlement.jobStatus === 'binned')).toBe(true);
+    expect((await postJson(port, path, 'board-test-token', { status: 'working' })).status).toBe(400);
+    expect(api.getJob(jobId)?.status).toBe('binned');
+    expect(api.listJobEvents(jobId)).toEqual(after);
+  });
+
+  it('Gru bin refuses pending review and unsettled verification with no partial status or debt mutation', async () => {
+    const { api, port } = harness;
+    for (const [id, kind] of [
+      ['gru-bin-round', 'round'],
+      ['gru-bin-verify', 'verification'],
+    ] as const) {
+      api.addJob({ id, repo: 'demo-repo', title: 'Active producer' });
+      api.setJobStatus(id, 'working');
+      api.setJobStatus(id, 'blocked');
+      if (kind === 'round') api.addRound({ jobId: id });
+      else api.appendCustomEvent({ kind: 'verification.started', jobId: id, payload: { run_id: 'ongoing' } });
+      const beforeEvents = api.listJobEvents(id);
+      const beforeDebts = api.listObligations({ jobId: id });
+      const refusal = await postJson(port, `/api/jobs/${id}/status`, 'board-test-token', { status: 'binned' });
+      expect(refusal.status, kind).toBe(400);
+      expect((refusal.body as { detail: string }).detail, kind)
+        .toMatch(kind === 'round' ? /live review round/u : /unsettled verification/u);
+      expect(api.getJob(id)?.status).toBe('blocked');
+      expect(api.listJobEvents(id)).toEqual(beforeEvents);
+      expect(api.listObligations({ jobId: id })).toEqual(beforeDebts);
+    }
+  });
+
   it('closeout endpoint: auth, malformed bodies, missing jobs and guard refusals fail loud without changes', async () => {
     const { api, port } = harness;
     const head = '3c44e87e2e9e64cbc3301d7806540df6273438e6';
@@ -453,6 +580,17 @@ describe('board server — HTTP API', () => {
     expect(
       (noClosed.body as { event: { payload: { provider: { closed_at: unknown } } } }).event.payload.provider.closed_at,
     ).toBeNull();
+  });
+
+  it('authenticated round creation refuses binned jobs without creating an event', async () => {
+    const jobId = 'binned-round-http';
+    harness.api.addJob({ id: jobId, repo: 'demo-repo', title: 'Discarded review' });
+    harness.api.setJobStatus(jobId, 'binned');
+    const before = harness.api.listJobEvents(jobId);
+    const refused = await postJson(harness.port, '/api/rounds', 'board-test-token', { jobId });
+    expect(refused.status).toBe(400);
+    expect(harness.api.listRounds(jobId)).toEqual([]);
+    expect(harness.api.listJobEvents(jobId)).toEqual(before);
   });
 
   it('write endpoints reject bad bodies and missing entities', async () => {

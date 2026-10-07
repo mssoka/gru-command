@@ -64,6 +64,10 @@ body {
 /* A lens the lead did not use is settled, not a pass: the same neutral
    gray as a pending chip, and never the success fill. */
 .pp-chip--unused { background: var(--park); color: var(--ink); }
+/* A binned lane is DISCARDED (terminal, never resuming): a dashed muted
+   receipt, distinct from the parked fill (resumable) and the success
+   fill (merged/done). Existing tokens only — no palette addition. */
+.pp-chip--binned { background: var(--paper); color: var(--muted); border-style: dashed; }
 .pp-chip--perkins { background: var(--perkins); color: var(--on-state); }
 
 .pp-btn {
@@ -2109,6 +2113,7 @@ body {
 .board-job__dot--done { background: var(--done); }
 .board-job__dot--alert { background: var(--alert); }
 .board-job__dot--park { background: var(--park); }
+.board-job__dot--binned { background: var(--muted); }
 
 .board-job__name {
   font-weight: 800;

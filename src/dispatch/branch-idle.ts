@@ -34,8 +34,9 @@ import type { WorktreeLane } from './worktree-port.js';
  *    request; the marker clears only when the request genuinely settles
  *    (`finalizeRebriefRequest` / boot reconciliation).
  *
- * Terminal (`merged`/`done`) jobs are never busy: a stale marker left on a
- * terminal job must not block an unrelated review or resurrect the job.
+ * Terminal (`merged`/`done`/`binned`) jobs are never busy: a stale marker
+ * left on a terminal job must not block an unrelated review or resurrect
+ * the job.
  */
 
 export const BRANCH_BUSY_HINT = 'wait for lane delivery or re-brief request settlement, or dispatch with force';

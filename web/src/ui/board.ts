@@ -203,6 +203,9 @@ export class BoardView {
   private pipelineExpanded = false;
   private forGruExpanded = false;
   private coldExpanded = false;
+  /** Binned rows inside COLD stay behind their own explicit disclosure
+   * (default view hides them; the head count still carries them). */
+  private binnedExpanded = false;
   /** v5: job ids already on screen (new rows slide in; old ones do not). */
   private readonly knownJobIds = new Set<string>();
   private firstJobsRender = true;
@@ -394,7 +397,11 @@ export class BoardView {
     // shortcut — one gesture away, never an unrelated section.
     const sectionKey = /^section:([a-z-]+)$/u.exec(key);
     if (sectionKey !== null) {
-      this.boardNav.querySelector<HTMLElement>(`.board-nav__link[data-nav="${sectionKey[1]}"]`)?.focus();
+      // The binned disclosure lives INSIDE COLD but carries its own focus
+      // key; if it vanished mid-render, focus falls back to the COLD
+      // shortcut, never <body>.
+      const navId = sectionKey[1] === 'cold-binned' ? 'cold' : sectionKey[1];
+      this.boardNav.querySelector<HTMLElement>(`.board-nav__link[data-nav="${navId}"]`)?.focus();
       return;
     }
     let jobId: string | null = null;
@@ -1181,7 +1188,11 @@ export class BoardView {
 
   /** Cold: COUNT ONLY by default — zero job rows render until the
    * operator deliberately expands; expansion shows the retained records
-   * and can be collapsed again. Never a deletion or a completion. */
+   * and can be collapsed again. Binned rows are terminal DISCARDED lanes:
+   * they stay in this band (and in its complete count) but their rows sit
+   * behind their own explicit disclosure — the default view never shows
+   * them, and opening the disclosure is inspection only (no ACK, no
+   * transition, no approval). Never a deletion or a completion. */
   private coldSection(
     jobs: readonly BandedJob[],
     unacked: ReadonlyMap<string, number>,
@@ -1207,13 +1218,45 @@ export class BoardView {
       body.hidden = true;
       return section;
     }
-    const rows = el('div', 'board-band__rows');
-    for (const entry of jobs) {
-      rows.append(
-        this.jobRow(entry.job, unacked.get(entry.job.id) ?? 0, entry.stale, 'cold', stoppedWorkers.get(entry.job.id) ?? null),
-      );
+    const binned = jobs.filter((entry) => entry.job.status === 'binned');
+    const visible = jobs.filter((entry) => entry.job.status !== 'binned');
+    if (visible.length > 0) {
+      const rows = el('div', 'board-band__rows');
+      for (const entry of visible) {
+        rows.append(
+          this.jobRow(entry.job, unacked.get(entry.job.id) ?? 0, entry.stale, 'cold', stoppedWorkers.get(entry.job.id) ?? null),
+        );
+      }
+      body.append(rows);
     }
-    body.append(rows);
+    if (binned.length > 0) {
+      this.nextRegionId += 1;
+      const binnedBodyId = `${bodyId}-binned-${this.nextRegionId}`;
+      const binnedToggle = el('button', 'board-band__more board-band__more--binned');
+      binnedToggle.type = 'button';
+      binnedToggle.dataset.focusKey = 'section:cold-binned';
+      binnedToggle.setAttribute('aria-expanded', String(this.binnedExpanded));
+      binnedToggle.setAttribute('aria-controls', binnedBodyId);
+      binnedToggle.textContent = this.binnedExpanded
+        ? 'Hide binned'
+        : `Show ${binned.length} binned ${binned.length === 1 ? 'record' : 'records'}`;
+      binnedToggle.addEventListener('click', () => {
+        this.binnedExpanded = !this.binnedExpanded;
+        this.rerender();
+      });
+      body.append(binnedToggle);
+      const binnedRows = el('div', 'board-band__rows board-band__rows--binned');
+      binnedRows.id = binnedBodyId;
+      binnedRows.hidden = !this.binnedExpanded;
+      if (this.binnedExpanded) {
+        for (const entry of binned) {
+          binnedRows.append(
+            this.jobRow(entry.job, unacked.get(entry.job.id) ?? 0, entry.stale, 'cold', stoppedWorkers.get(entry.job.id) ?? null),
+          );
+        }
+      }
+      body.append(binnedRows);
+    }
     return section;
   }
 
@@ -1315,6 +1358,9 @@ export class BoardView {
       `pp-chip board-job__status ${waiting ? 'pp-chip--park' : jobChipTone(job.status)}`,
       waiting ? workerStopLabel(workerStop) : job.status,
     );
+    if (job.status === 'binned') {
+      status.title = 'discarded — terminal and never resuming; not a merge, a completion or a passed gate';
+    }
     if (waiting && workerStop !== null) {
       status.title =
         `worker stopped by supervision` +
@@ -1378,9 +1424,10 @@ export class BoardView {
   }
 
   /** Expanded detail (the v2/v3 surface): lane strip, note, condensed
-   * rounds. Concluded jobs (merged/done) suppress their round history
-   * here — a merged job's aborted round is noise, not live state
-   * (v4.1 stale-pill suppression). */
+   * rounds. merged/done suppress their round history here — a merged
+   * job's aborted round is noise, not live state (v4.1 stale-pill
+   * suppression); a binned (discarded) lane deliberately keeps its full
+   * history inspectable. */
   private jobBody(job: JobView): HTMLElement {
     const body = el('div', 'board-job__body');
     this.nextRegionId += 1;
@@ -1399,10 +1446,13 @@ export class BoardView {
       body.append(lane);
     }
     if (job.note !== null && job.note !== '') body.append(el('div', 'board-job__note', job.note));
-    const concluded = isJobConcluded(job.status);
-    const rounds = concluded ? job.rounds.slice(-1) : job.rounds;
-    for (const round of rounds) body.append(this.roundRow(round, concluded));
-    if (concluded && rounds.length > 0) {
+    // merged/done are quiescent: only their newest round is glanceable
+    // (older review noise). A binned lane is DISCARDED history the
+    // operator may still need to inspect in full — it keeps every round.
+    const quiescent = job.status === 'merged' || job.status === 'done';
+    const rounds = quiescent ? job.rounds.slice(-1) : job.rounds;
+    for (const round of rounds) body.append(this.roundRow(round, quiescent));
+    if (quiescent && rounds.length > 0) {
       body.append(el('div', 'lbl board-job__reviewed', 'review history on the ledger'));
     }
     return body;
@@ -2038,8 +2088,9 @@ export class BoardView {
 /** A row is "failing" when the record itself says so: blocked/error
  * status, an aborted newest round, or errored lenses in a round that has
  * not posted a verdict. Conflicting-PR-only rows stay calm — the band
- * already shouts. A CONCLUDED job (merged/done) is a closed receipt: its
- * history renders quiescent and never carries the alert accent. */
+ * already shouts. A CONCLUDED job (merged/done/binned) is a closed
+ * receipt: its history renders quiescent and never carries the alert
+ * accent. */
 export function jobFailing(job: JobView): boolean {
   if (isJobConcluded(job.status)) return false;
   if (job.status === 'blocked' || job.status === 'error') return true;

@@ -8,6 +8,7 @@ import { rebriefFreshMinion } from '../dispatch/fix-directive.js';
 import type { DirectiveRegistry } from '../dispatch/fix-directive.js';
 import type { WorktreePort } from '../dispatch/worktree-port.js';
 import { blockedByOwnWallSettle } from './settle-attribution.js';
+import { isJobTerminal } from '../ledger/states.js';
 import type { SlotReArmPort } from './sensor.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
@@ -133,9 +134,12 @@ async function claimJobMinion(
   // (the dispatch settle raced the wait — r4 directive): that block IS this
   // provider blocker's settlement and must not strand the recovery.
   const job = wait.jobId !== null ? deps.ledger.getJob(wait.jobId) : null;
-  if (job === null || job.status === 'merged' || job.status === 'done') {
-    deps.ledger.setProviderWaitStatus(wait.id, 'cancelled', { why: 'job completed or missing', by });
-    return { outcome: 'skipped', waitId: wait.id, why: 'job completed or missing' };
+  if (job === null || isJobTerminal(job.status)) {
+    // Truthful reason per terminal state: a discarded (`binned`) lane is
+    // cancelled, never reported as completed.
+    const why = job === null ? 'job missing' : `job is ${job.status} — no continuation`;
+    deps.ledger.setProviderWaitStatus(wait.id, 'cancelled', { why, by });
+    return { outcome: 'skipped', waitId: wait.id, why };
   }
   if (job.status === 'parked') {
     deps.ledger.setProviderWaitStatus(wait.id, 'cancelled', { why: 'job parked (owner/ops hold)', by });
@@ -226,6 +230,9 @@ async function claimJobMinion(
     deps.ledger.setJobStatus(job.id, 'working');
     deps.ledger.noteJob(job.id, 'provider recovery: lane re-opened after a wall-settled block');
   }
+  // This reservation fences binning during asynchronous spawn/turn work;
+  // the durable claimed wait itself remains historical after settlement.
+  const releaseContinuation = deps.ledger.beginProviderContinuation(wait.id, job.id);
   const admitted = { recorded: false };
   let result: Awaited<ReturnType<typeof rebriefFreshMinion>>;
   try {
@@ -237,6 +244,15 @@ async function claimJobMinion(
       note,
       briefing: continuationPrompt ?? job.briefing,
       ...(resumeFile !== null ? { resumeFile } : {}),
+      beforeTurnSideEffect: () => {
+        // A hold or terminal disposition may land during the awaited
+        // worker gate/spawn. Never prompt the replacement against it;
+        // rebriefFreshMinion disposes a spawned handle on refusal.
+        const current = deps.ledger.getJob(job.id);
+        if (current === null || isJobTerminal(current.status) || current.status === 'parked' || current.status === 'blocked') {
+          throw new Error(`provider continuation refused — job "${job.id}" is ${current?.status ?? 'missing'}`);
+        }
+      },
       onSpawned: (worker) => {
         // Record ACTUAL admission (the turn really starting) separately from
         // this claim/delivery — a delivered event alone is not proof.
@@ -281,6 +297,8 @@ async function claimJobMinion(
       error: String(error),
     });
     return { outcome: 'skipped', waitId: wait.id, why: 'continuation spawn failed after atomic claim (recorded; no automatic replay)' };
+  } finally {
+    releaseContinuation();
   }
   // Guarded continuation turn truth (#160): a prompt that settles with an
   // in-band runtime error was admitted but is NOT a continuation. The atomic

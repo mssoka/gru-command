@@ -5468,10 +5468,11 @@ describe('WaveRunner request guards', () => {
     const wave = new WaveRunner({
       ledger, worktrees: port, spawner: makeSpawner(sessions, []), reviewArtifactRoot: artifacts,
     });
-    for (const status of ['merged', 'done'] as const) {
+    for (const status of ['merged', 'done', 'binned'] as const) {
       await port.createJobWorktree({ repoPath: repo.path, jobId: `job-${status}` });
       const job = ledger.addJob({ id: `job-${status}`, repo: 'fixture', title: status, baseBranch: 'main', briefing: 'b' });
-      // Legal path into the terminal states is via in-review.
+      // Legal path into the terminal states is via in-review (binned is
+      // also directly reachable from working).
       ledger.setJobStatus(job.id, 'working');
       ledger.setJobStatus(job.id, 'in-review');
       ledger.setJobStatus(job.id, status);
@@ -7643,24 +7644,27 @@ describe('durable handoff admission: perkins route, re-busy re-queue, crash/term
   }, 120_000);
 
   it('skips replay for a terminal job truthfully, without failure or escalation', async () => {
-    const f = await handoffFixture('handoff-terminal', 'job-handoff-terminal');
-    f.ledger.setJobStatus('job-handoff-terminal', 'in-review');
-    f.ledger.setJobStatus('job-handoff-terminal', 'merged');
-    f.ledger.appendCustomEvent({
-      kind: 'job.review-handoff-queued', jobId: 'job-handoff-terminal',
-      payload: { input: { jobId: 'job-handoff-terminal' } },
-    });
-    const spawner = vi.fn() as unknown as AgentSpawner;
-    const escalate = vi.fn();
-    const wave = new WaveRunner({ ledger: f.ledger, worktrees: f.port, spawner, bus: f.bus, escalate });
-    wave.resumeQueuedHandoffs();
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    const skipped = f.ledger.latestJobEvent('job-handoff-terminal', 'job.review-handoff-skipped');
-    expect(skipped?.payload).toMatchObject({ reason: 'terminal-job', status: 'merged' });
-    expect(f.ledger.latestJobEvent('job-handoff-terminal', 'job.review-handoff-failed')).toBeNull();
-    expect(escalate).not.toHaveBeenCalled();
-    expect(spawner).not.toHaveBeenCalled();
-    await wave.shutdown();
+    // merged and binned are both terminal: neither may admit a handoff.
+    for (const status of ['merged', 'binned'] as const) {
+      const f = await handoffFixture(`handoff-terminal-${status}`, `job-handoff-terminal-${status}`);
+      f.ledger.setJobStatus(`job-handoff-terminal-${status}`, 'in-review');
+      f.ledger.setJobStatus(`job-handoff-terminal-${status}`, status);
+      f.ledger.appendCustomEvent({
+        kind: 'job.review-handoff-queued', jobId: `job-handoff-terminal-${status}`,
+        payload: { input: { jobId: `job-handoff-terminal-${status}` } },
+      });
+      const spawner = vi.fn() as unknown as AgentSpawner;
+      const escalate = vi.fn();
+      const wave = new WaveRunner({ ledger: f.ledger, worktrees: f.port, spawner, bus: f.bus, escalate });
+      wave.resumeQueuedHandoffs();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      const skipped = f.ledger.latestJobEvent(`job-handoff-terminal-${status}`, 'job.review-handoff-skipped');
+      expect(skipped?.payload).toMatchObject({ reason: 'terminal-job', status });
+      expect(f.ledger.latestJobEvent(`job-handoff-terminal-${status}`, 'job.review-handoff-failed')).toBeNull();
+      expect(escalate).not.toHaveBeenCalled();
+      expect(spawner).not.toHaveBeenCalled();
+      await wave.shutdown();
+    }
   }, 120_000);
 });
 

@@ -1137,7 +1137,7 @@ export function lensChipTone(state: string): string {
 
 /** One status → tone mapping for every surface that renders it (chip
  * fills, job-row dots): a status can never be two colors in one view. */
-export type JobTone = 'work' | 'rev' | 'done' | 'alert' | 'park' | 'none';
+export type JobTone = 'work' | 'rev' | 'done' | 'alert' | 'park' | 'binned' | 'none';
 
 export function jobStatusTone(status: string): JobTone {
   switch (status) {
@@ -1155,6 +1155,10 @@ export function jobStatusTone(status: string): JobTone {
       return 'alert';
     case 'parked':
       return 'park';
+    case 'binned':
+      // Discarded terminal lane: a distinct badge, never the parked fill
+      // (resumable) or the success fill (merged/done).
+      return 'binned';
     default:
       return 'none';
   }
@@ -1180,13 +1184,15 @@ export function agentStateTone(state: string): string {
   }
 }
 
-/** A terminal job (merged/done) is a closed receipt: it can never be live
- * Gru work, so no leftover unacked escalation row, aborted historical
- * round, or stale lens noise may promote it back into NEEDS YOU. Shared
- * by the banding and signal derivations — the web twin of the ledger's
- * `isJobTerminal` (separate builds; keep the two in step). */
+/** A terminal job (merged/done/binned) is a closed receipt: it can never
+ * be live Gru work, so no leftover unacked escalation row, aborted
+ * historical round, or stale lens noise may promote it back into NEEDS
+ * YOU. Shared by the banding and signal derivations — the web twin of the
+ * ledger's `isJobTerminal` (separate builds; keep the two in step; the
+ * `board-signals` cross-build alarm fails when the ledger terminal set
+ * changes without this mirror). */
 export function isJobConcluded(status: string): boolean {
-  return status === 'merged' || status === 'done';
+  return status === 'merged' || status === 'done' || status === 'binned';
 }
 
 export { str as boardStr, nstr as boardNstr };

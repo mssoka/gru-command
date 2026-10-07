@@ -359,7 +359,10 @@ describe('trusted Jev provider', () => {
       cloneConfig(true).thresholds,
     );
     const outcome = await service.decide(eventDecisionRequest(EVENT));
-    expect(outcome.provenance).toMatchObject({ source: 'deterministic', fallbackReason: 'malformed_response' });
+    expect(outcome.provenance).toMatchObject({
+      source: 'deterministic', fallbackReason: 'malformed_response',
+      diagnostics: { phase: 'response_headers', httpStatus: 200, bodyMs: null },
+    });
     service.dispose();
   });
 
@@ -1546,7 +1549,7 @@ describe('decision provider profiles (issue #222)', () => {
         fetchImpl: (async () => new Response('{}', { status: 200 })) as typeof fetch,
       });
       expect(missing).toMatchObject({ profile: 'typesafe-direct', ok: false, status: 'degraded', reason: 'credential_missing' });
-      expect(() => checkDecisionProfile(config, 'nonexistent', {
+      await expect(() => checkDecisionProfile(config, 'nonexistent', {
         instanceDir: temp('gru-decisions-222-check-unknown-'),
         env: {},
       })).rejects.toThrow(/unknown decision profile/);

@@ -111,6 +111,13 @@ describe('directive requests — durable ledger contract', () => {
     expect(() =>
       api.beginDirectiveIntent({ jobId: 'job-done', directive: 'x', holder: 'silas-ops', requestId: 'req-nope' }),
     ).toThrow(/terminal lanes/u);
+    // A binned (discarded) lane is terminal on the same contract.
+    api.addJob({ id: 'job-binned', repo: 'r', title: 'Binned' });
+    api.setJobStatus('job-binned', 'working');
+    api.setJobStatus('job-binned', 'binned');
+    expect(() =>
+      api.beginDirectiveIntent({ jobId: 'job-binned', directive: 'x', holder: 'silas-ops', requestId: 'req-nope-2' }),
+    ).toThrow(/terminal lanes/u);
   });
 
   it('fails CLOSED while a live request exists — identity-less AND a fresh different id (named)', () => {

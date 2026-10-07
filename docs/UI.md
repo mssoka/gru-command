@@ -311,8 +311,8 @@ pointer).
 
 Two section-truth rules keep the bands honest (2026-09-29):
 
-- **Closed receipts stay closed.** A terminal job (merged/done) never
-  re-enters NEEDS YOU, whatever is left over — leftover unacked
+- **Closed receipts stay closed.** A terminal job (merged/done/binned)
+  never re-enters NEEDS YOU, whatever is left over — leftover unacked
   escalation rows keep living in the notification record as closed
   receipts (they clear through a Gru disposition, never a human Ack),
   but they no longer promote the lane, alert its row, or count into the

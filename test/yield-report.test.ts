@@ -692,22 +692,24 @@ describe('computeLedgerMeasures', () => {
   });
 
   it('counts finished heists in the window, lead times, and replays WIP to until', () => {
-    const measures = computeLedgerMeasures(
-      measureInput([
-        event('job.created', '2026-09-30T00:00:00.000Z', { jobId: 'finished-1' }),
-        event('job.status', '2026-10-01T09:00:00.000Z', { jobId: 'finished-1', payload: { from: 'in-review', to: 'merged' } }),
-        event('job.status', '2026-10-01T18:00:00.000Z', { jobId: 'finished-2', payload: { from: 'working', to: 'done' } }),
-        event('job.status', '2026-10-01T12:00:00.000Z', { jobId: 'wip-1', payload: { from: 'dispatched', to: 'working' } }),
-        // A terminal transition before the window must not count as finished.
-        event('job.status', '2026-09-02T00:00:00.000Z', { jobId: 'old-done', payload: { from: 'working', to: 'done' } }),
-      ]),
-      [],
-    );
-    expect(measures.m0.finishedJobs).toBe(2);
+    const input = measureInput([
+      event('job.created', '2026-09-30T00:00:00.000Z', { jobId: 'finished-1' }),
+      event('job.status', '2026-10-01T09:00:00.000Z', { jobId: 'finished-1', payload: { from: 'in-review', to: 'merged' } }),
+      event('job.status', '2026-10-01T18:00:00.000Z', { jobId: 'finished-2', payload: { from: 'working', to: 'done' } }),
+      event('job.status', '2026-10-01T12:00:00.000Z', { jobId: 'wip-1', payload: { from: 'dispatched', to: 'working' } }),
+      // A terminal transition before the window must not count as finished.
+      event('job.status', '2026-09-02T00:00:00.000Z', { jobId: 'old-done', payload: { from: 'working', to: 'done' } }),
+      // A discard (binned) leaves the flow: it must neither inflate the
+      // finished-success count nor linger as WIP.
+      event('job.status', '2026-10-01T15:00:00.000Z', { jobId: 'discard-1', payload: { from: 'working', to: 'binned' } }),
+    ]);
+    input.jobs = [...input.jobs, { id: 'discard-1', createdAt: '2026-09-30T12:00:00.000Z' }];
+    const measures = computeLedgerMeasures(input, []);
+    expect(measures.m0.finishedJobs).toBe(2); // the discard is not a finished success
     // finished-1: 09-30T00:00 → 10-01T09:00 = 33h; finished-2: 10-01T06:00 → 18:00 = 12h.
     expect(measures.m0.leadTimeHours).toEqual({ median: 22.5, max: 33 });
     expect(measures.m0.costPerFinishedUsd).toBeNull(); // filled by buildYieldReport
-    expect(measures.m0.wipTotal).toBe(2);
+    expect(measures.m0.wipTotal).toBe(2); // and the discard is not WIP either
     // wip-1: 09-15T00:00 → window end = 408h; wip-2: 10-01T12:00 → 12h.
     // Equal counts tie-break alphabetically: dispatched before working.
     expect(measures.m0.wipByStatus).toEqual([

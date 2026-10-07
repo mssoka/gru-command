@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { Role } from '../config.js';
 import type { LedgerApi } from '../ledger/api.js';
+import { isJobTerminal } from '../ledger/states.js';
 import type { AgentHandle, NativeAgentTool, SpawnOptions } from '../runtime/types.js';
 import { WorkerDisposalInProgressError } from '../runtime/worker-errors.js';
 import { requireSpawnCwd } from '../roles.js';
@@ -81,6 +82,13 @@ function verdictFields(verdict: PromptTurnVerdict): { readonly outcome: 'complet
     : { outcome: 'error', error: verdict.error ?? 'runtime settled the turn with an in-band error' };
 }
 
+function assertDirectiveJobActive(ledger: Pick<LedgerApi, 'getJob'>, jobId: string): void {
+  const job = ledger.getJob(jobId);
+  if (job === null || isJobTerminal(job.status)) {
+    throw new Error(`directive refused — job "${jobId}" is ${job?.status ?? 'missing'}`);
+  }
+}
+
 /** Route a directive to the implementing minion: the live job minion
  * first; otherwise a fresh minion on the job lane. */
 export async function routeFixDirectiveToMinion(
@@ -148,9 +156,15 @@ export async function routeFixDirectiveToMinion(
       let promptError: unknown = null;
       let verdict: PromptTurnVerdict | null = null;
       try {
-        verdict = await racedPrompt(handle, directive, input.signal, owner);
-      } catch (error) {
-        promptError = error;
+        // A refusal before prompt is positive no-admission proof, not a
+        // prompt error eligible for retry recovery. It must still release
+        // the pacing lease acquired after the asynchronous wait above.
+        assertDirectiveJobActive(input.ledger, input.jobId);
+        try {
+          verdict = await racedPrompt(handle, directive, input.signal, owner);
+        } catch (error) {
+          promptError = error;
+        }
       } finally {
         // Release before the settlement wait: the retry reacquires the slot.
         lease?.release();
@@ -234,6 +248,7 @@ export async function routeFixDirectiveToMinion(
     const identity = parentIdentitySpawnOptions(input, resumeFile);
     let prompt = directive;
     try {
+      assertDirectiveJobActive(input.ledger, input.jobId);
       handle = await input.registry.spawn('minion', {
         cwd: lane.path, signal: input.signal,
         ...(resumeFile !== null ? { resumeFile } : {}),
@@ -245,9 +260,11 @@ export async function routeFixDirectiveToMinion(
       if (job == null || job.briefing == null) {
         throw new Error(`cannot resume prior minion session for job ${input.jobId} and no original briefing is available to re-brief: ${String(error)}`);
       }
+      assertDirectiveJobActive(input.ledger, input.jobId);
       handle = await input.registry.spawn('minion', { cwd: lane.path, signal: input.signal, ...identity });
       prompt = `Fresh minion re-brief for job ${input.jobId}. Original contract:\n${job.briefing}\n\nCurrent fix directive:\n${directive}`;
     }
+    assertDirectiveJobActive(input.ledger, input.jobId);
     let promptError: unknown = null;
     let verdict: PromptTurnVerdict | null = null;
     const spawnedHandle = handle;
@@ -274,6 +291,7 @@ export async function routeFixDirectiveToMinion(
       });
       throw error;
     }
+    assertDirectiveJobActive(input.ledger, input.jobId);
     try {
       verdict = await racedPrompt(handle, prompt, input.signal, owner);
     } catch (error) {

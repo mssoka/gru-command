@@ -5196,7 +5196,7 @@ describe('silas digest releaseEligible rows (issue #117/g21)', () => {
       config: DEFAULT_SILAS_CONFIG,
       trigger: 'sweep',
     });
-  const addTerminalJob = (h: Harness, jobId: string, status: 'merged' | 'done'): void => {
+  const addTerminalJob = (h: Harness, jobId: string, status: 'merged' | 'done' | 'binned'): void => {
     h.ledger.addJob({ id: jobId, repo: 'fixture-app', title: `t-${jobId}`, briefing: 'b' });
     h.ledger.setJobStatus(jobId, 'working');
     h.ledger.setJobStatus(jobId, 'in-review');
@@ -5230,6 +5230,25 @@ describe('silas digest releaseEligible rows (issue #117/g21)', () => {
         branch: lane.branch,
       });
       expect(digestActionCount(d)).toBe(1);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a binned (discarded) job still holding its lane is release-eligible on the same rule', async () => {
+    const h = makeLedger();
+    const worktrees = new InMemoryWorktreePort(mkdtempSync(join(tmpdir(), 'gru-command-silas-release-wt-')));
+    try {
+      addTerminalJob(h, 'job-binned', 'binned');
+      const lane = await worktrees.createJobWorktree({ repoPath: makeRepo(), jobId: 'job-binned' });
+      const d = await digestOf(h, worktrees);
+      expect(d.releaseEligible).toHaveLength(1);
+      expect(d.releaseEligible[0]).toMatchObject({
+        jobId: 'job-binned',
+        repo: 'fixture-app',
+        status: 'binned',
+        branch: lane.branch,
+      });
     } finally {
       h.cleanup();
     }

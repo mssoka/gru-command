@@ -210,6 +210,14 @@ describe('canonical job amendments', () => {
     expect(terminal.status).toBe('rejected');
     if (terminal.status !== 'rejected') throw new Error('unreachable');
     expect(terminal.code).toBe('job-terminal');
+    // A binned (discarded) lane is terminal on the same contract.
+    api.addJob({ id: 'job-3', repo: 'repo', title: 'discarded', briefing: BRIEFING });
+    api.setJobStatus('job-3', 'working');
+    api.setJobStatus('job-3', 'binned');
+    const discarded = amendment(api, sha256(BRIEFING), 'too late', { jobId: 'job-3' });
+    expect(discarded.status).toBe('rejected');
+    if (discarded.status !== 'rejected') throw new Error('unreachable');
+    expect(discarded.code).toBe('job-terminal');
     api.addJob({ id: 'job-2', repo: 'repo', title: 'no briefing' });
     const noBriefing = api.addJobAmendment({
       jobId: 'job-2',

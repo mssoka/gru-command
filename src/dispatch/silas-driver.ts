@@ -15,6 +15,7 @@ import type {
   RoundRecord,
 } from '../ledger/api.js';
 import { LIVE_DIRECTIVE_STATES, type DirectiveState } from '../ledger/directives.js';
+import { isJobTerminal, type TerminalJobStatus } from '../ledger/states.js';
 import type { LogLevel } from '../logger.js';
 import { DECISION_SURFACE_SAME_BLOCKER, fileOfLocation, sameBlockerDecisionRequest } from '../decisions/questions.js';
 import type { DecisionService } from '../decisions/types.js';
@@ -495,7 +496,7 @@ export interface ConflictingPrRow {
   readonly firstSeenAt: string | null;
 }
 
-/** A terminal job (merged/done) still holding its own lane worktree
+/** A terminal job (merged/done/binned) still holding its own lane worktree
  * (issue #117, g21): the sweep-ack rule's firing surface. Swept-only work
  * now APPEARS in the digest — Silas releases the lane through the worktree
  * surface with `by=silas` + `rule_id=sweep-ack`, and the release records
@@ -507,7 +508,7 @@ export interface ReleaseEligibleRow {
   readonly jobId: string;
   readonly repo: string;
   /** The terminal state the close-out rule releases on. */
-  readonly status: 'merged' | 'done';
+  readonly status: TerminalJobStatus;
   readonly branch: string | null;
 }
 
@@ -1300,7 +1301,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     // release endpoint's own durable-record refusal (issue #161): a lane
     // with a non-terminal child is never offered, so the row can always be
     // acted on. Terminal jobs reach no other row — this replaces the skip.
-    if (job.status === 'merged' || job.status === 'done') {
+    if (isJobTerminal(job.status)) {
       const lane = (input.worktrees?.listWorktrees({ jobId: job.id }) ?? []).find(
         (candidate) => candidate.kind === 'job' && candidate.status !== 'swept',
       );
@@ -1830,7 +1831,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     // is exactly as live as an in-review lane's — substituting zero here
     // would retract every delivered-lane row (issue #215 review). A phase
     // that opened during an await still retracts the offer.
-    return job !== null && job.status !== 'merged' && job.status !== 'done' &&
+    return job !== null && !isJobTerminal(job.status) &&
       currentPhaseStart(input.ledger, jobId).seq === phaseSeqByJob.get(jobId) &&
       jobSeqUnchanged(jobId) &&
       !verificationInFlight(input.ledger, jobId) &&

@@ -132,11 +132,17 @@ export interface FrozenReview {
   };
 }
 
-function gitRaw(repoPath: string, args: readonly string[], timeoutMs = 30_000): string {
+function gitRaw(
+  repoPath: string,
+  args: readonly string[],
+  timeoutMs = 30_000,
+  killSignal: 'SIGTERM' | 'SIGKILL' = 'SIGTERM',
+): string {
   return execFileSync('git', ['-C', repoPath, ...args], {
     encoding: 'utf8',
     maxBuffer: GIT_MAX_BUFFER,
     timeout: timeoutMs,
+    killSignal,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 }
@@ -600,10 +606,13 @@ export function sourceMovementSinceFreeze(review: FrozenReview, options?: Source
     } else {
       const remoteTarget = advertisedRemoteBranch(repoPath, targetRef);
       if (remoteTarget !== null) {
+      // SIGKILL: a read-only probe whose git (or wrapper) ignores SIGTERM
+      // must still end at its bound — this call blocks the event loop.
       const advertised = gitRaw(
         repoPath,
         ['ls-remote', '--exit-code', remoteTarget.remote, `refs/heads/${remoteTarget.branch}`],
           options?.remoteProbeTimeoutMs,
+          'SIGKILL',
         ).trim();
         const tip = advertised.split(/\s+/u)[0] ?? '';
         if (tip !== targetSha) return movement('target-moved', `advertised ${remoteTarget.remote}/${remoteTarget.branch} is ${tip}, frozen at ${targetSha}`);
@@ -626,28 +635,198 @@ export function sourceMovementSinceFreeze(review: FrozenReview, options?: Source
   }
 }
 
+/** Where a probe started, on every clock the OS suspend evidence needs. */
+export interface ProbeStart {
+  /** Wall clock (epoch ms) — compared with macOS's kernel wake time. */
+  readonly wallMs: number;
+  /** The budget clock. */
+  readonly monoMs: number;
+  /** Linux boot clock (ms, counts suspend), when available. */
+  readonly bootMs: number | null;
+}
+
+/** The OS boundary the suspend evidence is read from. Production reads
+ * the real kernel; tests substitute only these inputs, so the evidence
+ * logic itself always runs. */
+export interface SuspendEvidenceIo {
+  readonly platform: NodeJS.Platform;
+  /** Wall clock (epoch ms). */
+  readonly wallNow: () => number;
+  /** `sysctl -n kern.waketime` output (macOS), bounded by `timeoutMs`. */
+  readonly kernWaketime: (timeoutMs: number) => Promise<string>;
+  /** Linux boot clock in ms (keeps counting through suspend), or null. */
+  readonly bootClockMs: () => number | null;
+}
+
+/** Test seams for the admission probe; production uses the defaults. */
+export interface AdmissionProbeSeams {
+  /** Budget clock (default performance.now). */
+  readonly now?: () => number;
+  /** One bounded git invocation (default execFile, killed at timeoutMs). */
+  readonly exec?: (repoPath: string, args: readonly string[], timeoutMs: number) => Promise<string>;
+  /** Where suspend evidence is read (default: the real OS). */
+  readonly evidence?: SuspendEvidenceIo;
+}
+
+/** How long a FAILED probe may spend reading suspend evidence (owner
+ * decision 2026-10-07, round 3: a separate, bounded allowance — the probe's
+ * own budget is usually what the suspend spent, so the evidence cannot be
+ * made to fit inside it). Git never gets a renewed budget without positive
+ * evidence. */
+export const SUSPEND_EVIDENCE_ALLOWANCE_MS = 1_000;
+
+/** Whole milliseconds left for the next git step, or null once the budget
+ * is spent. execFile rejects a fractional timeout (ERR_OUT_OF_RANGE), and
+ * rounding down could pass 0, which disables the kill — so round up. */
+export function remainingTimeoutMs(deadline: number, now: number): number | null {
+  const remaining = deadline - now;
+  return remaining > 0 ? Math.ceil(remaining) : null;
+}
+
+/** Every admission git step is read-only (check-ref-format, rev-parse,
+ * remote, ls-remote), so a step past its bound is SIGKILLed: a git or
+ * wrapper that ignores SIGTERM can never hold admission open. */
+export const defaultProbeExec = async (repoPath: string, args: readonly string[], timeoutMs: number): Promise<string> =>
+  (await execFileAsPromised('git', ['-C', repoPath, ...args], {
+    encoding: 'utf8', timeout: timeoutMs, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024,
+  })).stdout;
+
+/** `sysctl -n kern.waketime` by absolute path — the service's PATH need
+ * not include /usr/sbin. */
+export const readKernWaketime = async (timeoutMs: number): Promise<string> =>
+  (await execFileAsPromised('/usr/sbin/sysctl', ['-n', 'kern.waketime'], {
+    encoding: 'utf8', timeout: timeoutMs, killSignal: 'SIGKILL',
+  })).stdout;
+
+/** Linux CLOCK_BOOTTIME via /proc/uptime (it keeps counting through
+ * suspend, unlike Node's CLOCK_MONOTONIC). Null where unavailable. */
+function linuxBootClockMs(): number | null {
+  try {
+    const seconds = Number.parseFloat(readFileSync('/proc/uptime', 'utf8').split(' ')[0] ?? '');
+    return Number.isFinite(seconds) ? seconds * 1000 : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Parse `sysctl -n kern.waketime` ("{ sec = 1790944289, usec = 208542 } …"). */
+export function parseKernWaketime(output: string): number | null {
+  const match = /sec\s*=\s*(\d+),\s*usec\s*=\s*(\d+)/u.exec(output);
+  return match === null ? null : Number(match[1]) * 1000 + Math.floor(Number(match[2]) / 1000);
+}
+
+const OS_EVIDENCE: SuspendEvidenceIo = {
+  platform: process.platform,
+  wallNow: () => Date.now(),
+  kernWaketime: readKernWaketime,
+  bootClockMs: linuxBootClockMs,
+};
+
+/** `work`, or a rejection once the evidence allowance is spent — whatever
+ * the reader does, a failed probe waits at most the allowance. */
+function withinEvidenceAllowance<T>(work: Promise<T>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`suspend evidence unavailable within ${SUSPEND_EVIDENCE_ALLOWANCE_MS} ms`)),
+      SUSPEND_EVIDENCE_ALLOWANCE_MS,
+    );
+    work.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+/** Real OS evidence that the machine suspended after `start` — never a
+ * timer-lateness guess, so a long event-loop stall is not mistaken for
+ * sleep and a short sleep is not missed. macOS: the kernel's last wake is
+ * after the start. Linux: the boot clock ran ahead of the monotonic clock
+ * by more than a second. Anything unreadable, or not read within the
+ * allowance, is "no evidence" (fail closed: no retry). */
+async function osSuspendedSince(start: ProbeStart, now: () => number, io: SuspendEvidenceIo): Promise<boolean> {
+  try {
+    if (io.platform === 'darwin') {
+      const wakeMs = parseKernWaketime(await withinEvidenceAllowance(io.kernWaketime(SUSPEND_EVIDENCE_ALLOWANCE_MS)));
+      return wakeMs !== null && wakeMs > start.wallMs;
+    }
+    if (io.platform === 'linux' && start.bootMs !== null) {
+      const bootNow = io.bootClockMs();
+      return bootNow !== null && (bootNow - start.bootMs) - (now() - start.monoMs) > 1_000;
+    }
+  } catch {
+    /* no evidence */
+  }
+  return false;
+}
+
 /** Async advertised-tip probe (gh-169 R4-6): the SAME fail-closed
  * comparison `sourceMovementSinceFreeze` performs, executed with the
  * non-blocking execFile so a stalled remote never blocks the service
  * event loop at request-time admission. Null = no movement; errors and
  * timeouts return an explicit check-failed movement (fail-closed,
- * retryable), never silence and never a stall. */
+ * retryable), never silence and never a stall.
+ *
+ * Suspend (owner incident 2026-10-07, owner decision "retry once on real
+ * sleep evidence"): on macOS every Node clock — performance.now() and the
+ * timers that kill a git step — keeps counting through sleep (libuv uses
+ * mach_continuous_time); on Linux the clock pauses but a suspend can still
+ * break a git step's connection. When the OS proves it suspended during a
+ * probe that failed, the probe re-runs ONCE with a fresh budget and that
+ * second outcome is final. Without that evidence — a genuine stall, or an
+ * event loop blocked by the service's own work — the probe is refused
+ * within the single deadline (R7-3), plus at most the bounded evidence
+ * allowance (SUSPEND_EVIDENCE_ALLOWANCE_MS) spent looking for a suspend. */
 export async function probeAdvertisedTipMovementAsync(
   review: FrozenReview,
   timeoutMs: number,
+  seams: AdmissionProbeSeams = {},
+): Promise<SourceMovement | null> {
+  const now = seams.now ?? (() => performance.now());
+  const exec = seams.exec ?? defaultProbeExec;
+  const io = seams.evidence ?? OS_EVIDENCE;
+  const start: ProbeStart = {
+    wallMs: io.wallNow(),
+    monoMs: now(),
+    bootMs: io.platform === 'linux' ? io.bootClockMs() : null,
+  };
+  const first = await probeAdvertisedTipOnce(review, timeoutMs, now, exec);
+  if (first === null || first.cause !== 'check-failed') return first;
+  if (!(await osSuspendedSince(start, now, io))) return first;
+  return probeAdvertisedTipOnce(review, timeoutMs, now, exec);
+}
+
+async function probeAdvertisedTipOnce(
+  review: FrozenReview,
+  timeoutMs: number,
+  now: () => number,
+  exec: NonNullable<AdmissionProbeSeams['exec']>,
 ): Promise<SourceMovement | null> {
   const { targetRef, targetSha } = review.manifest;
   // R6-4: ONE cumulative admission budget across every async step — each
-  // call gets only the remaining time and exhaustion fails closed.
-  const deadline = Date.now() + timeoutMs;
+  // call gets only the remaining time, and exhaustion fails closed both
+  // before a step starts and after it settles (a step that finishes past
+  // the deadline proves nothing, success or git rejection alike).
+  const deadline = now() + timeoutMs;
   const run = async (args: readonly string[]): Promise<string> => {
-    const remaining = deadline - Date.now();
-    if (remaining <= 0) {
+    const timeout = remainingTimeoutMs(deadline, now());
+    if (timeout === null) {
       throw new Error(`admission remote-probe budget exhausted before: git ${args.join(' ')}`);
     }
-    const { stdout } = await execFileAsPromised('git', ['-C', review.manifest.repoPath, ...args], {
-      encoding: 'utf8', timeout: remaining, maxBuffer: 1024 * 1024,
-    });
+    const late = (): Error => new Error(`admission remote-probe budget exhausted after: git ${args.join(' ')}`);
+    let stdout: string;
+    try {
+      stdout = await exec(review.manifest.repoPath, args, timeout);
+    } catch (error) {
+      if (now() >= deadline) throw late();
+      throw error;
+    }
+    if (now() >= deadline) throw late();
     return stdout;
   };
   // R6-3: only an ESTABLISHED non-zero exit (git itself answered

@@ -359,6 +359,29 @@ describe('legacy report backfill plan and apply (issue #220)', () => {
     }
   });
 
+  it('a delivered-then-binned newer report is NOT supersession evidence — the discard voids the coverage claim', async () => {
+    const h = freshLedger();
+    try {
+      seedLegacyJob(h.api, 'job-pr61-review-lens');
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      h.api.addJob({
+        id: 'review-pr61-discarded', repo: 'fixture-app', title: 't', briefing: 're-review',
+        deliverable: 'review', commissioner: 'gru', targetRef: 'https://github.com/o/fixture-app/pull/61', targetSha: 'h',
+      });
+      // The re-review genuinely DELIVERED findings, then the lane was
+      // discarded — the delivery receipt alone must not erase the older
+      // report's owed disposition.
+      h.api.setJobStatus('review-pr61-discarded', 'working');
+      h.api.setJobStatus('review-pr61-discarded', 'delivered');
+      h.api.appendCustomEvent({ kind: 'job.delivered', jobId: 'review-pr61-discarded', payload: { sha: 'h' } });
+      h.api.setJobStatus('review-pr61-discarded', 'binned');
+      const plan = planLegacyReportBackfill(h.api);
+      expect(plan.proposals.find((p) => p.job.id === 'job-pr61-review-lens')?.outcome).toBe('obligation-opened');
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it('the compiled CLI refuses --data-dir when the instance config redirects data_dir', () => {
     const dir = mkdtempSync(join(tmpdir(), 'gru-backfill-override-'));
     const elsewhere = mkdtempSync(join(tmpdir(), 'gru-backfill-elsewhere-'));

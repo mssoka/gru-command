@@ -24,7 +24,7 @@ import {
   type RoundRecord,
 } from '../ledger/api.js';
 import { LIVE_DIRECTIVE_STATES } from '../ledger/directives.js';
-import type { JobStatus } from '../ledger/states.js';
+import { isJobTerminal, type JobStatus } from '../ledger/states.js';
 import type { EventRecord } from '../ledger/api.js';
 
 /** Newest closed receipts kept in every snapshot (D3): older ones are
@@ -259,7 +259,8 @@ export interface BoardSnapshot {
   readonly decisions: DecisionRuntimeStatus;
   /** NEEDS GRU: machine-attention rows still awaiting a disposition
    * (self-clearing machine queue; never rings the owner bell). Counted
-   * LIVE: rows bound to a terminal (merged/done) job are closed receipts —
+   * LIVE: rows bound to a terminal (merged/done/binned) job are closed
+   * receipts —
    * the record keeps them, this count (and the banding) does not. Read
    * from the table, not the 30-row feed window, so the tracker is true. */
   readonly unackedActionRequired: number;
@@ -406,10 +407,11 @@ interface MutableChildCounts {
 
 function prStateOf(job: Pick<JobRecord, 'status' | 'prUrl'>): JobView['prState'] {
   if (job.status === 'merged') return 'merged';
-  // A terminal `done` lane (including a closed-without-merge administrative
-  // closeout) is a closed receipt: its registered PR is never presented as
-  // open, and closure never infers a merge.
-  if (job.status === 'done') return null;
+  // A terminal non-merge lane — `done` (including a closed-without-merge
+  // administrative closeout) or `binned` (discarded, never resuming) — is
+  // a closed receipt: its registered PR is never presented as open, and
+  // closure never infers a merge.
+  if (isJobTerminal(job.status)) return null;
   if (job.prUrl !== null) return 'open';
   return null;
 }
@@ -746,9 +748,10 @@ export class BoardEngine {
       attemptsByRound.set(roundId, ledgerLenses);
     }
     // Closed-receipt rule (owner decisions D1/D3): a machine row bound
-    // through an agent to a merged/done job is a receipt, not live work.
+    // through an agent to a terminal (merged/done/binned) job is a
+    // receipt, not live work.
     const concludedJobs = new Set(
-      jobs.filter((job) => job.status === 'merged' || job.status === 'done').map((job) => job.id),
+      jobs.filter((job) => isJobTerminal(job.status)).map((job) => job.id),
     );
     const agentJob = new Map(
       agentRows.filter((agent) => agent.jobId !== null).map((agent) => [agent.id, agent.jobId as string]),
@@ -1132,15 +1135,16 @@ export class BoardEngine {
   /**
    * The closed-receipt rule (owner decisions D1/D3) for out-of-band
    * callers (the paged receipt route): a row bound through an agent to a
-   * merged/done job. The snapshot scan uses a map-built predicate instead
-   * so the unbounded walk stays one query per page.
+   * terminal (merged/done/binned) job. The snapshot scan uses a
+   * map-built predicate instead so the unbounded walk stays one query
+   * per page.
    */
   isClosedReceipt(agentId: string | null): boolean {
     if (agentId === null) return false;
     const agent = this.ledger.getAgent(agentId);
     if (agent === null || agent.jobId === null) return false;
     const job = this.ledger.getJob(agent.jobId);
-    return job !== null && (job.status === 'merged' || job.status === 'done');
+    return job !== null && isJobTerminal(job.status);
   }
 
   /**

@@ -525,7 +525,7 @@ describe('board engine — liveness-first rail and job trackers', () => {
     expect(engine.snapshot().unackedActionRequired).toBe(0);
   });
 
-  it('unackedActionRequired counts LIVE rows only — rows bound to merged/done jobs are closed receipts', () => {
+  it('unackedActionRequired counts LIVE rows only — rows bound to terminal (merged/done/binned) jobs are closed receipts', () => {
     const { api, engine } = fresh();
     // An unbound row stays global (no job → cannot be terminal).
     api.recordNotification({ id: 'n-global', kind: 'test.notice', routing: 'action-required', severity: 'error', title: 'Global' });
@@ -604,9 +604,9 @@ describe('board engine — liveness-first rail and job trackers', () => {
         readonly routing: string;
         readonly agentId: string | null;
       }[];
-      readonly expected: { readonly liveCount: number };
+      readonly expected: { readonly liveCount: number; readonly receiptIds: readonly string[] };
     };
-    const { api } = fresh();
+    const { api, engine } = fresh();
     for (const job of fixture.jobs) {
       api.addJob({ id: job.id, repo: 'fixture', title: job.id, briefing: 'b' });
       if (job.status === 'working') api.setJobStatus(job.id, 'working');
@@ -619,6 +619,10 @@ describe('board engine — liveness-first rail and job trackers', () => {
         api.setJobStatus(job.id, 'delivered');
         api.setJobStatus(job.id, 'in-review');
         api.setJobStatus(job.id, 'merged');
+      }
+      if (job.status === 'binned') {
+        api.setJobStatus(job.id, 'working');
+        api.setJobStatus(job.id, 'binned');
       }
     }
     for (const agent of fixture.agents) {
@@ -635,8 +639,12 @@ describe('board engine — liveness-first rail and job trackers', () => {
       });
     }
     expect(api.countLivePendingActionRequired()).toBe(fixture.expected.liveCount);
-    // The durable record keeps the terminal-bound receipts: live + 2.
-    expect(api.countPendingActionRequiredIncludingReceipts()).toBe(fixture.expected.liveCount + 2);
+    // The snapshot classification rides the same rule (SQL + engine agree).
+    expect(engine.snapshot().unackedActionRequired).toBe(fixture.expected.liveCount);
+    // The durable record keeps the terminal-bound receipts.
+    expect(api.countPendingActionRequiredIncludingReceipts()).toBe(
+      fixture.expected.liveCount + fixture.expected.receiptIds.length,
+    );
   });
 
   it('counts needs-owner rows separately (the FOR YOU band never borrows the machine queue)', () => {

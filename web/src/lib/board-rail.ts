@@ -117,8 +117,9 @@ function trackersChip(snapshot: BoardSnapshot, kpis: ReturnType<typeof boardKpis
           kpi('jobs.merged', kpis.jobs.merged, 'merged', `${kpis.jobs.merged} merged`),
           kpi('jobs.done', kpis.jobs.done, 'done', `${kpis.jobs.done} done`),
           kpi('jobs.parked', kpis.jobs.parked, 'parked', `${kpis.jobs.parked} parked`),
+          kpi('jobs.binned', kpis.jobs.binned, 'binned', `${kpis.jobs.binned} binned`),
         ],
-        title: 'working / in-review / merged / done / parked',
+        title: 'working / in-review / merged / done / parked / binned',
       },
       {
         label: 'PRS',

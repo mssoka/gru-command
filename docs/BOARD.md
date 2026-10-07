@@ -33,7 +33,7 @@ restart produce the same truth without data edits.
 | `GET /api/transcripts` | session transcript list (newest first; ledger-bound agents carry ids/labels) |
 | `GET /api/transcripts/file?file=<rel>[&q=&before=&limit=]` | one transcript: paged entries (`before` = exclusive upper index, newest-first, `nextCursor`) or case-insensitive search — newest-first scan under a bounded cap, `scanned`/`total` disclose truncation |
 | `POST /api/jobs` | `{id, repo, title, baseBranch?}` → job (`dispatched`) |
-| `POST /api/jobs/:id/status` | `{status}` — validated against the [job machine](./LEDGER.md) |
+| `POST /api/jobs/:id/status` | `{status}` — validated against the [job machine](./LEDGER.md); `binned` is the terminal discard (any non-terminal source; never resumable) |
 | `POST /api/jobs/:id/closeout` | `{expected_status, expected_pr_url, provider, reason}` — guarded administrative closeout of a parked PR-backed lane whose recorded provider observation is CLOSED-without-merge; audited, idempotent, refusals are `409 closeout_refused` + `code` ([OPERATIONS.md](./OPERATIONS.md)) |
 | `POST /api/rounds` | `{jobId, lenses? (default 9), targetRef?}` → round (`pending`) |
 | `POST /api/rounds/:id/status` / `:id/verdict` | `{status}` / `{verdict}` |
@@ -52,9 +52,16 @@ transitions and unknown entities are 400/404 with the reason in
 whose `code` names the refusing guard. Bodies are capped (200 KB).
 
 PR state derives from the record: a `merged` job reports `merged`; a
-terminal `done` job is a closed receipt — its registered PR is never
-presented or counted as open (and closure never infers a merge); any
-other lane with a registered URL reports `open`.
+terminal non-merge job (`done`, including a closed-without-merge
+administrative closeout, and `binned`, a discarded lane) is a closed
+receipt — its registered PR is never presented or counted as open (and
+closure never infers a merge); any other lane with a registered URL
+reports `open`. A binned row renders with the distinct dashed muted
+`binned` badge and stays in COLD behind an explicit “Show N binned
+records” disclosure (the band's complete count includes it; opening the
+disclosure is inspection only — never an ACK, a transition or an
+approval). Binned rows keep their full round history in the expanded
+body: the discard is inspected, not erased.
 
 ## Board WebSocket — `/board/ws`
 
@@ -192,9 +199,9 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   bounded latest feed: owner-only decisions and stops whose ack re-arms
   supervision), NEEDS GRU (all pending machine rows, including those older
   than the recent feed; it wakes Gru once and refuses human Ack. Rows bound
-  to a terminal merged/done lane are CLOSED RECEIPTS: they render under
-  FEED, never as live queue entries, and the live unacked chip does not
-  count them), and FEED (FYI rows plus closed receipts). The bell
+  to a terminal merged/done/binned lane are CLOSED RECEIPTS: they render
+  under FEED, never as live queue entries, and the live unacked chip does
+  not count them), and FEED (FYI rows plus closed receipts). The bell
   is the alert/history surface: it shares the SAME authoritative owner
   projection as the board's permanent FOR YOU band — pending acks AND
   ready PRs, so the two surfaces never disagree about what the owner

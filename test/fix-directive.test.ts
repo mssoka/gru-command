@@ -100,6 +100,91 @@ function laneAt(path: string, status: WorktreeLane['status'] = 'active'): Worktr
 }
 
 describe('fresh fix worker association', () => {
+  it('releases a paced existing-handle directive when job is binned while queued', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-fix-pacing-bin-'));
+    cleanupDirs.push(dir);
+    const db = new LedgerDb(dir);
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    let holder: Awaited<ReturnType<typeof gate.acquireWorkerTurn>> | null = null;
+    try {
+      const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+      ledger.addJob({ id: 'job-1', repo: 'fixture', title: 'Paced lane' });
+      ledger.setJobStatus('job-1', 'working');
+      ledger.registerAgent({ id: 'idle-implementer', role: 'minion', jobId: 'job-1' });
+      ledger.setAgentState('idle-implementer', 'idle');
+      let prompted = false;
+      const handle = {
+        id: 'idle-implementer', role: 'minion', sessionFile: null,
+        async prompt() { prompted = true; },
+        capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
+        async steer() {}, async followUp() {},
+        subscribe() { return () => {}; },
+        health() { return { state: 'idle' as const, lastActivity: null, sessionFile: null }; },
+        async dispose() {},
+      } satisfies AgentHandle;
+      holder = await gate.acquireWorkerTurn({ id: 'another-job', label: 'holder' });
+      const routing = routeFixDirectiveToMinion({
+        jobId: 'job-1', directive: 'now obsolete', signal: new AbortController().signal,
+        ledger, worktrees: { listWorktrees: () => [laneAt(dir)] } as unknown as WorktreePort,
+        registry: { getHandle: () => handle, spawn: async () => handle, disposeHandle: async () => {} },
+        workerGate: gate,
+      });
+      await vi.waitFor(() => expect(gate.view().worker.queued).toHaveLength(1));
+      ledger.setJobStatus('job-1', 'binned');
+      holder.release();
+      holder = null;
+      await expect(routing).rejects.toThrow(/directive refused.*binned/u);
+      expect(prompted).toBe(false);
+      expect(gate.view().worker).toMatchObject({ running: 0, queued: [] });
+      const next = await gate.acquireWorkerTurn({ id: 'next-job', label: 'not stranded' });
+      next.release();
+      expect(gate.view().worker.running).toBe(0);
+    } finally {
+      holder?.release();
+      db.close();
+    }
+  });
+
+  it('refuses a freshly binned lane after asynchronous spawn, disposing before prompt', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-fix-bin-race-'));
+    cleanupDirs.push(dir);
+    const db = new LedgerDb(dir);
+    try {
+      const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+      ledger.addJob({ id: 'job-1', repo: 'fixture', title: 'Lane to discard' });
+      ledger.setJobStatus('job-1', 'working');
+      let prompted = false;
+      let disposed = false;
+      const handle = {
+        id: 'late-directive-worker', role: 'minion', sessionFile: null,
+        async prompt() { prompted = true; },
+        capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
+        async steer() {}, async followUp() {},
+        subscribe() { return () => {}; },
+        health() { return { state: 'idle' as const, lastActivity: null, sessionFile: null }; },
+        async dispose() { disposed = true; },
+      } satisfies AgentHandle;
+      await expect(routeFixDirectiveToMinion({
+        jobId: 'job-1', directive: 'obsolete directive', signal: new AbortController().signal,
+        ledger, worktrees: { listWorktrees: () => [laneAt(dir)] } as unknown as WorktreePort,
+        registry: {
+          getHandle: () => null,
+          spawn: async () => {
+            ledger.setJobStatus('job-1', 'binned');
+            return handle;
+          },
+          disposeHandle: async () => {},
+        },
+      })).rejects.toThrow(/directive refused.*binned/u);
+      expect(prompted).toBe(false);
+      expect(disposed).toBe(true);
+      expect(ledger.getJob('job-1')?.status).toBe('binned');
+      expect(ledger.getAgent(handle.id)).toBeNull();
+    } finally {
+      db.close();
+    }
+  });
+
   it('binds the owning job before a failed prompt and keeps it after disposal', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'gru-command-fix-binding-'));
     cleanupDirs.push(dir);
@@ -468,6 +553,10 @@ describe('the non-draft PR rule on follow-up directives', () => {
   });
 });
 
+function activeJobRecord(id: string): NonNullable<ReturnType<LedgerApi['getJob']>> {
+  return { ...fakeLedger().getJob('job-1')!, id, status: 'working' };
+}
+
 describe('cancelled retry settlement on directive consumers (r4 verification#3)', () => {
   const CAPS = { streaming: false, steer: 'queued' as const, resume: 'file' as const, images: false, thinking: false, thinkingLevelControl: false, followUp: false };
   const lane = {
@@ -490,7 +579,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
         listImplementerMinions: () => [minionRecord('minion-live', 'job-cancel', '/sessions/live.jsonl')],
         listAgents: () => [],
         registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
-        getJob: () => null,
+        getJob: () => activeJobRecord('job-cancel'),
         getAgent: () => null,
       },
       worktrees: { listWorktrees: () => [lane] } as never,
@@ -529,7 +618,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
         listImplementerMinions: () => [],
         listAgents: () => [],
         registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
-        getJob: () => null,
+        getJob: () => activeJobRecord('job-cancel'),
         getAgent: () => null,
       },
       worktrees: { listWorktrees: () => [lane] } as never,
@@ -562,7 +651,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
           listImplementerMinions: () => [],
           listAgents: () => [],
           registerAgent: () => { throw registrationError; },
-          getJob: () => null,
+          getJob: () => activeJobRecord('job-regfail'),
           getAgent: () => null,
         },
         worktrees: { listWorktrees: () => [lane] } as never,
@@ -751,7 +840,7 @@ describe('per-prompt terminal verdict capture (r5 blocker 1)', () => {
           listAgents: () => [{ id: 'inner-queued', jobId: 'job-queued', role: 'minion', sessionFile: null }],
           listImplementerMinions: () => [{ id: 'inner-queued', jobId: 'job-queued', role: 'minion', sessionFile: null }],
           registerAgent: () => {},
-          getJob: () => null,
+          getJob: () => activeJobRecord('job-queued'),
         } as never,
         worktrees: {} as never,
         jobId: 'job-queued',

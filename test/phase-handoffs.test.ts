@@ -494,6 +494,45 @@ describe('phase-handoff reconciliation, guards and disposition', () => {
     expect(h.ledger.getPhaseHandoff(pt.phaseId)?.state).toBe('closed');
     expect(h.ledger.getObligation(res!.obligationId!)?.state).toBe('closed'); // job-terminal settlement
 
+    // A binned (discarded) lane closes the stale intent the same way: no
+    // live card, job-terminal abandonment.
+    seedJob(h.ledger, 'job-ph-bin', 'working');
+    h.ledger.beginPhaseHandoff({
+      jobId: 'job-ph-bin',
+      source: 'dispatch',
+      intent: { kind: 'gru-decision', decision: 'b' },
+    });
+    const pb = h.ledger.listPhaseHandoffs({ jobId: 'job-ph-bin' })[0]!;
+    h.ledger.bindPhaseHandoffMinion({ phaseId: pb.phaseId, minionId: 'mb' });
+    h.ledger.setJobStatus('job-ph-bin', 'binned');
+    const dbEvent = h.ledger.appendCustomEvent({
+      kind: 'job.delivered',
+      jobId: 'job-ph-bin',
+      payload: { source: 'dispatch', agentId: 'mb', phase_id: pb.phaseId },
+    });
+    const resB = observePhaseCompletion({ ledger: h.ledger, notifications: h.notifications }, dbEvent);
+    expect(resB).not.toBeNull();
+    expect(resB?.notificationId).toBeNull();
+    expect(h.ledger.getPhaseHandoff(pb.phaseId)?.state).toBe('closed');
+    expect(h.ledger.getObligation(resB!.obligationId!)?.state).toBe('closed');
+    expect(h.ledger.getObligation(resB!.obligationId!)?.settlement).toEqual({
+      kind: 'job-terminal', jobStatus: 'binned',
+    });
+
+    // The BOOT RECONCILE closes a discarded lane's awaiting intent with no
+    // delivery evidence (job-terminal abandonment), same as done/merged.
+    seedJob(h.ledger, 'job-ph-recon', 'working');
+    h.ledger.beginPhaseHandoff({
+      jobId: 'job-ph-recon',
+      source: 'dispatch',
+      intent: { kind: 'gru-decision', decision: 'r' },
+    });
+    const preconcile = h.ledger.listPhaseHandoffs({ jobId: 'job-ph-recon' })[0]!;
+    h.ledger.setJobStatus('job-ph-recon', 'binned');
+    const reconcile = reconcilePhaseHandoffs({ ledger: h.ledger, notifications: h.notifications });
+    expect(reconcile.closed).toBeGreaterThanOrEqual(1);
+    expect(h.ledger.getPhaseHandoff(preconcile.phaseId)?.state).toBe('closed');
+
     // Parked + owner hold: the debt suspends, no wake, no auto-ACK.
     seedJob(h.ledger, 'job-ph-park', 'working');
     const ownerCard = h.notifications.post({

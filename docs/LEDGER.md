@@ -54,8 +54,10 @@ coerced and no event is written for a rejected change.
 ```text
 job:    dispatched → working → delivered → in-review → merged | done
         (any non-terminal ⇄ blocked / parked as recoverable side-states;
-         merged/done are terminal; a PR registered before the turn
+         merged/done/binned are terminal; a PR registered before the turn
          settles keeps working → in-review legal)
+        discard: ANY non-terminal → binned (terminal, no outbound edges;
+         merged/done can NOT be binned)
         administrative closeout: parked → done ONLY through
          `adminCloseParkedJob` (audited, evidence-bound — never the
          generic status write)
@@ -74,6 +76,29 @@ lens:   pending → live → done | error               (terminal: the last two)
 - `merged` has **no internal writer**: merge detection belongs to the
   external sweep (Silas) — the remaining external caller of the job
   machine. Nothing in the ledger infers a merge.
+- **`binned` is the terminal DISCARDED state** (owner/chief cancelled a
+  lane): every non-terminal status may be binned through the ordinary
+  authenticated `POST /api/jobs/<id>/status` write WHEN no target-owned
+  producer remains. The same status transaction refuses open worker turns,
+  non-terminal children, pending/live rounds, unsettled verification
+  runs, and active initial dispatch, directive or provider-recovery
+  admissions that have not registered their worker yet; an idle `working`
+  job can still be binned. Historical directive intents and claimed
+  provider waits are not perpetual runtime blockers after the attempt
+  settles; last-side-effect guards also refuse late prompts if a job
+  became terminal during an asynchronous boundary. Gru's shipped role
+  teaches this intentional action through its permitted shell and the
+  configured service token; no background process automatically bins
+  work. `binned` never leaves — it shares the terminal contract with `merged`/`done`
+  (`isJobTerminal`, `TERMINAL_JOB_STATUSES`). The transition appends the
+  ordinary `job.status` `{from, to}` event (the prior status and every
+  earlier event stay on the record) and settles the lane's applicable
+  obligations as `job-terminal` abandonment in the SAME transaction.
+  Binning is a disposition, NOT evidence: it never means the work
+  succeeded, a PR merged, a gate passed, an obligation was satisfied, a
+  worktree was destroyed or a live process stopped. `merged`/`done`
+  lanes cannot be binned (their history is closed), and a binned lane
+  can never resume, be re-briefed, amended, directed or re-reviewed.
 - **Administrative closeout** (`adminCloseParkedJob`, owner ruling
   j-1115) is the ONE exception path that closes a parked PR-backed lane
   without faking a hop: the generic machine still refuses parked → done,
@@ -117,7 +142,7 @@ publishes it on the in-process event bus (`src/events/bus.ts`).
 | Kind | Payload (essentials) |
 |---|---|
 | `job.created` | repo, title, display_name |
-| `job.status` / `job.note` / `job.pr` / `job.target` | from→to / note / url / ref |
+| `job.status` / `job.note` / `job.pr` / `job.target` | from→to / note / url / ref (`binned` uses the ordinary from→to event) |
 | `job.admin-closeout` | disposition (`closed-without-merge`), expected status/url, provider evidence (state/merged/head/closed_at), the cited `github.branch-state` observation (event seq + identity), reason, request sha256 |
 | `round.created` / `round.status` / `round.verdict` / `round.target` | seq, lenses / from→to / verdict / ref |
 | `lens.bound` / `lens.status` | agentId / from→to (+note) |
@@ -196,13 +221,14 @@ the request `payload` (note + briefing) and its sha256 `payload_hash`,
 the `baseline_seq` event watermark the request must post-date, the bound
 worker (`agent_id`, `session_file`), and `requested_at`. The marker pair
 is written BEFORE any worker spawns and cleared when its events land — or
-retired administratively when the job is already `merged`/`done` (below);
+retired administratively when the job is already `merged`/`done`/`binned`
+(below);
 `UNIQUE (job_id, kind)` means a newer request supersedes an older
 marker. Boot reconciliation (`src/dispatch/rebrief-recovery.ts`)
 consumes leftovers: resume the interrupted session (or re-dispatch fresh
 on the same lane), record the missing events, or escalate
 action-required when recovery fails. A leftover whose job has since
-reached `merged`/`done` is instead retired administratively: the
+reached `merged`/`done`/`binned` is instead retired administratively: the
 identity-checked marker deletion and a single `silas.rebrief-retired`
 audit commit in one transaction, with no spawn and no escalation.
 Retirement fires wherever the terminal state is met — the boot scan, a

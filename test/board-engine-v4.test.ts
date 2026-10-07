@@ -253,4 +253,33 @@ describe('board engine — v4 snapshot blocks', () => {
     });
     expect(waitEngine.snapshot().silas.nextAction).toBeNull();
   });
+
+  it('a binned lane is a terminal closed receipt: prState null and bound machine rows are receipts', () => {
+    const { api, engine } = fresh();
+    api.addJob({ id: 'discard-receipt', repo: 'demo', title: 'Discarded lane', briefing: 'b' });
+    api.setJobStatus('discard-receipt', 'working');
+    api.setJobPr('discard-receipt', 'https://github.com/acme/demo/pull/9');
+    api.registerAgent({ id: 'minion-discard', role: 'minion', jobId: 'discard-receipt', sessionFile: '/s.jsonl' });
+    api.setAgentState('minion-discard', 'idle'); // stopped before the intentional discard
+    api.setJobStatus('discard-receipt', 'binned');
+    const job = engine
+      .snapshot()
+      .repos.flatMap((repo) => repo.jobs)
+      .find((candidate) => candidate.id === 'discard-receipt');
+    expect(job?.status).toBe('binned');
+    // A discarded lane is a closed receipt exactly like done: never an
+    // open-PR claim (and no fabricated merge either).
+    expect(job?.prState).toBeNull();
+    expect(engine.isClosedReceipt('minion-discard')).toBe(true);
+    // The record keeps the full history: the PR registration and the
+    // working hop are still on the event stream.
+    expect(api.latestJobEvent('discard-receipt', 'job.pr')?.payload).toMatchObject({
+      url: 'https://github.com/acme/demo/pull/9',
+    });
+    const hops = api
+      .listJobEvents('discard-receipt')
+      .filter((event) => event.kind === 'job.status')
+      .map((event) => (event.payload as { to: string }).to);
+    expect(hops).toEqual(['binned', 'working']); // newest first
+  });
 });

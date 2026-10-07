@@ -105,8 +105,8 @@ emit no branch-idle audit rows: at admission a replay whose job is
 blocked/parked is HELD (`job.review-handoff-held` plus escalation,
 requiring a new validated request), while after admission the gate stops
 as `job.fallback-review` phase `aborted` with a free-text reason and no
-held identity. Terminal (`merged`/`done`) jobs take the canonical
-terminal refusal before any busy check — a stale marker never answers
+held identity. Terminal (`merged`/`done`/`binned`) jobs take the
+canonical terminal refusal before any busy check — a stale marker never answers
 `branch_busy` and never resurrects the job. The reviewed job's OWN
 unresolved request fences the review regardless of an explicit
 `target_ref` naming another lane; unrelated foreign lanes keep their own
@@ -725,8 +725,8 @@ the judgment; the dispatch surface is the mechanical hand.
   events when that turn settles; a failed recovery escalates
   action-required and keeps the markers for the next boot, so the lane
   can never stall silently on a lost turn. A leftover marker whose job
-  has since reached terminal (`merged`/`done`) before the request was
-  honored cannot be served: the boot scan — or a settling turn or
+  has since reached terminal (`merged`/`done`/`binned`) before the request
+  was honored cannot be served: the boot scan — or a settling turn or
   re-dispatch boundary that meets the terminal job — retires it
   administratively (the identity-checked deletion and one
   `silas.rebrief-retired` audit commit together, with no spawn and no

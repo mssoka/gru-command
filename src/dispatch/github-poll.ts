@@ -8,6 +8,7 @@ import type {
   WorktreeRecord,
 } from '../ledger/api.js';
 import { isGitHubRemote } from './review-path.js';
+import { isJobTerminal } from '../ledger/states.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -22,7 +23,9 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  * `repos/{owner}/{repo}/commits/{sha}/check-runs` — and mechanically applies
  * the state-change mappings:
  *
- *   PR merged            -> job in-review -> merged transition + `github.pr-merged`
+ *   PR merged            -> live job in-review -> merged + `github.pr-merged`;
+ *                           an in-flight observation after binning records
+ *                           only a no-effect receipt, never a status hop
  *   PR conflicting       -> `github.pr-conflict` + fyi notification
  *                           (mechanical tier: Silas owns the rebase within
  *                           his existing mandate — the conflict lands in his
@@ -918,6 +921,16 @@ export class GitHubSignalPoll {
     checkRunCache: Map<string, CiState | null>,
   ): Promise<BranchObservation | null> {
     let pull = byBranch.get(lane.branch) ?? null;
+    // The tick's lane snapshot may outlive an awaited provider call. A
+    // binned lane cannot start another request; a merge already returned
+    // by THAT request is independent evidence for the no-effect receipt.
+    const terminalObservation = (): BranchObservation | null | undefined => {
+      const job = this.ledger.getJob(lane.jobId);
+      if (job !== null && !isJobTerminal(job.status)) return undefined;
+      return job?.status === 'binned' && pull?.merged === true ? { pull, ci: null } : null;
+    };
+    const atStart = terminalObservation();
+    if (atStart !== undefined) return atStart;
     let detailed = false;
     if (pull === null && lane.prNumber !== null) {
       // The batched window (100 most recently updated PRs) missed the
@@ -927,6 +940,8 @@ export class GitHubSignalPoll {
         this.api.getPull({ repo: lane.repo, number }),
       );
       detailed = true;
+      const afterLookup = terminalObservation();
+      if (afterLookup !== undefined) return afterLookup;
     }
     // The list endpoint returns mergeable_state as null; the single-PR
     // endpoint is the only place GitHub computes it. One detail call per
@@ -936,6 +951,8 @@ export class GitHubSignalPoll {
       pull = await this.call(budget, `get pull ${repoFullName(lane.repo)}#${number}`, () =>
         this.api.getPull({ repo: lane.repo, number }),
       );
+      const afterDetail = terminalObservation();
+      if (afterDetail !== undefined) return afterDetail;
     }
     let ci: CiState | null = null;
     const sha = pull?.headSha ?? null;
@@ -947,6 +964,8 @@ export class GitHubSignalPoll {
         const runs = await this.call(budget, `check runs ${repoFullName(lane.repo)}@${sha.slice(0, 12)}`, () =>
           this.api.listCheckRuns({ repo: lane.repo, sha }),
         );
+        const afterChecks = terminalObservation();
+        if (afterChecks !== undefined) return afterChecks;
         ci = summarizeCheckRuns(sha, runs);
         checkRunCache.set(cacheKey, ci);
       }
@@ -980,6 +999,14 @@ export class GitHubSignalPoll {
   // ------------------------------------------------------------------
 
   private applySignal(signal: GitHubSignal): void {
+    // A lane can be discarded while the provider request is in flight.
+    // Only a genuinely observed merge has independent evidence worth a
+    // no-effect receipt; conflict/CI alerts must not wake anyone about
+    // work that is already terminal, particularly an unbound job.
+    if (signal.kind !== 'pr-merged') {
+      const job = this.ledger.getJob(signal.jobId);
+      if (job !== null && isJobTerminal(job.status)) return;
+    }
     switch (signal.kind) {
       case 'pr-merged':
         this.applyMerged(signal);
@@ -1000,8 +1027,9 @@ export class GitHubSignalPoll {
    * The merge map: bring the lane to `in-review` when the hop is legal
    * (merged is terminal truth — a lane whose PR landed while it sat blocked
    * or delivered must not stay open), then `in-review -> merged`, then the
-   * `github.pr-merged` event. An unappliable transition is recorded loud,
-   * never coerced.
+   * `github.pr-merged` event. An unappliable live transition is recorded
+   * loud, never coerced; a binned lane stays terminal even if a request
+   * already in flight independently observes its PR merge.
    */
   private applyMerged(signal: PrMergedSignal): void {
     const job = this.ledger.getJob(signal.jobId);
@@ -1009,7 +1037,6 @@ export class GitHubSignalPoll {
       this.log('warn', 'github poll: merged PR for an unknown job', { job: signal.jobId });
       return;
     }
-    if (job.status === 'merged' || job.status === 'done') return;
     const payload = {
       repo: repoFullName(signal.repo),
       branch: signal.branch,
@@ -1018,6 +1045,20 @@ export class GitHubSignalPoll {
       sha: signal.sha,
       merge_commit_sha: signal.mergeCommitSha,
     };
+    if (isJobTerminal(job.status)) {
+      // A PR observed by an already-running poll may merge while its job
+      // is being discarded. Record the REAL observation once, but neither
+      // resurrect the lane nor call its abandonment a successful closeout.
+      // A job binned before this tick was never tracked, so no extra GitHub
+      // calls are made to discover future merges of discarded work.
+      if (job.status === 'binned' && this.ledger.latestJobEvent(signal.jobId, 'github.pr-merged') === null) {
+        this.ledger.appendCustomEvent({
+          kind: 'github.pr-merged', jobId: signal.jobId,
+          payload: { ...payload, applied: false, reason: 'job is binned' },
+        });
+      }
+      return;
+    }
     try {
       if (job.status !== 'in-review') this.ledger.setJobStatus(signal.jobId, 'in-review');
       this.ledger.setJobStatus(signal.jobId, 'merged');
@@ -1071,7 +1112,8 @@ export class GitHubSignalPoll {
       detail,
       dedupe: 'unacked',
       // Mechanical (fyi) rows never wake Gru; the binding stays so a
-      // merged/done lane's leftover row is classified as a closed
+      // terminal (merged/done/binned) lane's leftover row is classified
+      // as a closed
       // receipt. The job is already validated by the poll; no bound
       // worker → unbound and live (unknown historical rows are never
       // guessed; tracked-review A4).
