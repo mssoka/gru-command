@@ -2,7 +2,7 @@
 title: 'Terminal Binned job status (replacement execution for job-status-binned)'
 type: 'feature'
 created: '2026-10-07'
-status: 'in-progress'
+status: 'in-review'
 route: 'dispatch'
 baseline_commit: '84aec28b04ddc406f26c458383452318f8cb7ed1'
 review_loop_iteration: 0
@@ -57,14 +57,14 @@ context: []
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `src/ledger/states.ts` -- add `binned` to `JOB_STATUSES`, `JOB_TERMINAL`; add `binned` to every non-terminal transition list; `binned: []`; update the machine comment -- one terminal contract for merged/done/binned.
-- [ ] `src/ledger/api.ts` -- close applicable obligations for `binned` terminal transitions; use the terminal predicate in amendment/directive guards -- truthful abandonment, no resumable offers.
-- [ ] `src/ledger/obligations.ts` -- accept `binned` in `job-terminal` settlement type/parse.
-- [ ] `src/board/engine.ts` + `web/src/lib/{board-protocol,board-bands,board-kpi}.ts` -- terminal projections: prState null, concluded receipts, band cold, no needs-you promotion.
-- [ ] `web/src/ui/board.ts` + `web/src/styles/components.css` -- accessible Binned badge + Cold disclosure/filter; full-history body for binned.
-- [ ] no-resume consumers (dispatch/provider-recovery/chat/telemetry) -- include `binned` in terminal checks.
-- [ ] `docs/LEDGER.md`, `docs/BOARD.md`, `docs/OPERATIONS.md` -- record the contract, badge/filter behavior and the operator procedure.
-- [ ] tests + `test/suite-shape.test.ts` pins + `.gru-command/worktree.toml` scopes -- deterministic matrix/API/board coverage and the fail-before baseline.
+- [x] `src/ledger/states.ts` -- add `binned` to `JOB_STATUSES`, `JOB_TERMINAL`; add `binned` to every non-terminal transition list; `binned: []`; update the machine comment -- one terminal contract for merged/done/binned.
+- [x] `src/ledger/api.ts` -- close applicable obligations for `binned` terminal transitions; use the terminal predicate in amendment/directive guards -- truthful abandonment, no resumable offers.
+- [x] `src/ledger/obligations.ts` -- accept `binned` in `job-terminal` settlement type/parse.
+- [x] `src/board/engine.ts` + `web/src/lib/{board-protocol,board-bands,board-kpi}.ts` -- terminal projections: prState null, concluded receipts, band cold, no needs-you promotion.
+- [x] `web/src/ui/board.ts` + `web/src/styles/components.css` -- accessible Binned badge + Cold disclosure/filter; full-history body for binned.
+- [x] no-resume consumers (dispatch/provider-recovery/chat/telemetry) -- include `binned` in terminal checks.
+- [x] `docs/LEDGER.md`, `docs/BOARD.md`, `docs/OPERATIONS.md` -- record the contract, badge/filter behavior and the operator procedure.
+- [x] tests + `test/suite-shape.test.ts` pins + `.gru-command/worktree.toml` scopes -- deterministic matrix/API/board coverage and the fail-before baseline.
 
 **Acceptance Criteria:**
 - Given each non-terminal status, when `setJobStatus(id, 'binned')` runs, then the row is `binned`, the `job.status` event records `<prior> → binned`, and prior events remain.
@@ -75,6 +75,12 @@ context: []
 - Given empty or binned-free snapshots, when the board renders, then no binned control appears and ordinary parked/done/merged projections are unchanged.
 
 ## Implementation Notes
+
+- Workflow state: lane-local BMAD `bmad-build` render `_bmad/render/bmad-build/job-job-status-binned-continuation-20261006-0e52e101bc06/f76b749a098f5191ee57/`. Step-02 was executed against base `84aec28b04ddc406f26c458383452318f8cb7ed1` (equals observed remote main). Checkpoint 1 is auto-resolved under the dispatch briefing's explicit authority (`job-status-binned-continuation-20261006` is the sole owner of investigation/spec, implementation, built-in independent review, fixes, authenticated verification and PR as one complete build); no human is present in the lane. Status set `in-progress`, baseline pinned.
+- No subagent runtime is exposed to this lane's tool surface, so implementation is done directly from the spec (step-03's documented fallback); the built-in review runs as fresh tracked review jobs through `POST /api/dispatch` per the playbook.
+- Implementation commit `6cd0dd2c5a6e05b236a6a256d7c2fac3d79a0054` (spec `472d0f9`). `binned-static` PASS at 6cd0dd2 (lint/typecheck/build/web tsc, exit 0, capture `_bmad-output/binned-verify/binned-static-6cd0dd2.ndjson`, receipt sha256 1b8d5df7…). `binned-focused` PASS at 6cd0dd2 (backend 144 tests, 5 files; web 179 tests, 5 files; exit 0; capture `_bmad-output/binned-verify/binned-focused-6cd0dd2.ndjson`, receipt sha256 f0542a55…). `binned-baseline` RED at both legs as designed (backend 5 failed/137 passed; web 5 failed/174 passed; exit 1; capture `_bmad-output/binned-verify/binned-baseline-6cd0dd2.ndjson`, receipt sha256 b1a33a4c…) — failures are the new assertions at the pre-change base (unknown status "binned", assertion mismatches), never setup/compile failures.
+- Closed-receipt projections are deliberate: binned → `prState` null on both server and web (never an open-PR claim), needs-Gru suppressed, bound notification rows are receipts, obligations settle `{kind:'job-terminal', jobStatus:'binned'}`. Terminal fences in dispatch/provider-recovery/chat/telemetry now route through `isJobTerminal` so a binned lane can never be re-briefed, amended, directed, reviewed, re-dispatched or resurrected by a later merge signal.
+- Board filter: binned rows stay in COLD (complete count) and render only inside the expanded Cold section behind a second explicit `Show N binned records` disclosure; the badge is a dashed muted chip + dot with the visible word `binned`; the binned body keeps ALL rounds (merged/done stay quiescent).
 
 - Workflow state: lane-local BMAD `bmad-build` render `_bmad/render/bmad-build/job-job-status-binned-continuation-20261006-0e52e101bc06/f76b749a098f5191ee57/`. Step-02 was executed against base `84aec28b04ddc406f26c458383452318f8cb7ed1` (equals observed remote main). Checkpoint 1 is auto-resolved under the dispatch briefing's explicit authority (`job-status-binned-continuation-20261006` is the sole owner of investigation/spec, implementation, built-in independent review, fixes, authenticated verification and PR as one complete build); no human is present in the lane. Status set `in-progress`, baseline pinned.
 - No subagent runtime is exposed to this lane's tool surface, so implementation is done directly from the spec (step-03's documented fallback); the built-in review runs as fresh tracked review jobs through `POST /api/dispatch` per the playbook.
