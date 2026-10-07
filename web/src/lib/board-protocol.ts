@@ -860,17 +860,28 @@ function isRepoOverviewRowView(value: unknown): value is RepoOverviewRowView {
   ) {
     return false;
   }
-  // Freshness coherence: fresh/stale REQUIRE a successful observation, the
-  // pre-observation classes may not carry one, and an unlinked row carries
-  // no counts or run at all (unproven data never renders as fact).
-  if ((value.freshness === 'fresh' || value.freshness === 'stale') && value.checkedAt === null) return false;
-  if (value.freshness === 'unchecked' && (value.checkedAt !== null || value.lastAttemptAt !== null)) return false;
-  if (value.freshness === 'unavailable' && value.checkedAt !== null) return false;
-  // A successful observation always carries a run context; the pre-success
-  // classes never do.
+  // Empty strings on the disclosure fields would render dangling
+  // punctuation; the server normalizes them to null.
+  if (typeof value.linkReason === 'string' && value.linkReason === '') return false;
+  if (typeof value.error === 'string' && value.error === '') return false;
+  // Freshness coherence mirrors the server's one-atomic-observation rule:
+  // fresh/stale REQUIRE a successful observation (checkedAt, a run and
+  // exact counts, and a clean error for fresh); the pre-success classes
+  // never carry observed data, and unavailable MUST name its failure.
   const observed = value.freshness === 'fresh' || value.freshness === 'stale';
+  if (observed && value.checkedAt === null) return false;
+  if (observed && (value.openPrs === null || value.openIssues === null)) return false;
   if (observed && value.run === null) return false;
-  if (!observed && value.run !== null) return false;
+  if (value.freshness === 'fresh' && value.error !== null) return false;
+  if (value.freshness === 'unchecked') {
+    if (value.checkedAt !== null || value.lastAttemptAt !== null) return false;
+    if (value.openPrs !== null || value.openIssues !== null || value.run !== null || value.error !== null) return false;
+  }
+  if (value.freshness === 'unavailable') {
+    if (value.checkedAt !== null) return false;
+    if (value.openPrs !== null || value.openIssues !== null || value.run !== null) return false;
+    if (value.error === null) return false;
+  }
   // Coherence: a linked row has a link and no reason; an unlinked row has
   // a reason and no link. A linked row must also carry a safe full name
   // that the link path actually addresses — a row can never validate as a

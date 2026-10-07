@@ -203,8 +203,9 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   zero is a real count and unknown is never shown as zero), and the newest
   Actions run on the repository's discovered default branch as
   `workflow · branch` plus a status badge (passed/failed/timed-out/
-  cancelled/skipped/neutral/action-required/stale-run/running/queued/
-  no-workflow/no-runs/unknown — text and glyph, never colour alone) with a
+  startup-failure/cancelled/skipped/neutral/action-required/stale-run/
+  running/queued/no-workflow/no-runs/no-branch/unknown; Actions-disabled
+  rows read unavailable — text and glyph, never colour alone) with a
   safe run link and the checked age. This is default-branch CI context,
   never deployment health, aggregate CI or merge readiness. The server
   tracker refreshes every 5 minutes (bounded per-refresh call budget,

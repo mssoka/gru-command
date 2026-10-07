@@ -382,3 +382,23 @@ test('a live push replaces the overview rows without duplicating them', async ({
   await expect(page.locator('#board-repos .repo-row')).toHaveCount(2);
   await expect(page.locator('#board-repos .repo-row__badge-text')).toHaveText(['RUNNING', 'FAILED']);
 });
+
+test('a snapshot without the overview (absent or null) keeps the module hidden', async ({ page }) => {
+  const seed = await pairAndSeed(page);
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await expect(page.locator('#board-repos .repo-row')).toHaveCount(13);
+
+  // Pre-upgrade/not-yet-refreshed servers omit the field entirely; a
+  // null field means the same. Both must leave the section invisible.
+  const { repoOverview: _omitted, ...withoutField } = seededSnapshot();
+  seed.push(withoutField as BoardSnapshot);
+  await expect(page.locator('#board-repos .repo-row')).toHaveCount(0);
+  await expect(page.locator('#board-repos')).toBeHidden();
+
+  seed.push({ ...seededSnapshot(), repoOverview: null });
+  await expect(page.locator('#board-repos')).toBeHidden();
+
+  // And a real overview brings the module back on the same socket.
+  seed.push(seededSnapshot());
+  await expect(page.locator('#board-repos .repo-row')).toHaveCount(13);
+});

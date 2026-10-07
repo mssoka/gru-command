@@ -1,8 +1,8 @@
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { isValidSnapshot } from '../web/src/lib/board-protocol.js';
 import {
   GhApiError,
@@ -15,6 +15,7 @@ import {
 import {
   GhRepoOverviewApi,
   ManagedRepoOverviewTracker,
+  REPO_OVERVIEW_RESOLVE_BUDGET_MS,
   REPO_OVERVIEW_STALE_AFTER_MS,
   classifyGhError,
   classifyRemote,
@@ -28,7 +29,9 @@ import {
   type RepoOverviewMeta,
   type RepoOverviewRunRaw,
   type RepoOverviewRowView,
+  defaultRemoteResolver,
 } from '../src/repos/overview.js';
+import { discoverManagedRepos, discoverManagedReposAsync } from '../src/repos/discovery.js';
 
 // ------------------------------------------------------------------
 // Fixtures
@@ -123,6 +126,7 @@ interface Harness {
   /** Per-repo gates that postpone (or fail) remote resolution. */
   readonly resolveGates: Map<string, Promise<void>>;
   resolveError: boolean;
+  resolveDelayMs: number;
   readonly clock: { ms: number };
   readonly sleeps: number[];
   failure: string | null;
@@ -151,6 +155,7 @@ function harness(options: {
     refs,
     resolveGates: new Map<string, Promise<void>>(),
     resolveError: false,
+    resolveDelayMs: 0,
     clock,
     sleeps,
     failure: null,
@@ -164,6 +169,7 @@ function harness(options: {
       const gate = state.resolveGates.get(name);
       if (gate !== undefined) await gate;
       if (state.resolveError) throw new Error('git origin lookup exploded');
+      if (state.resolveDelayMs > 0) state.clock.ms += state.resolveDelayMs;
       return state.refs.get(name) ?? null;
     },
     intervalMs: 300_000,
@@ -910,12 +916,14 @@ describe('managed repo overview tracker — review-round guarantees', () => {
       execFileSync('git', ['init', '-q', join(root, 'no-origin')]);
       execFileSync('git', ['init', '-q', join(root, 'gitlab-repo')]);
       execFileSync('git', ['-C', join(root, 'gitlab-repo'), 'remote', 'add', 'origin', 'https://gitlab.com/acme/gl.git']);
+      mkdirSync(join(root, 'broken'));
+      writeFileSync(join(root, 'broken', '.git'), 'gitdir: /nonexistent/gru-repo-overview-test\n');
       mkdirSync(join(root, 'plain'));
       const api = new FakeApi().set('alpha', { openPrs: 1, openIssues: 2, workflows: { kind: 'ok', value: 0 } });
       const tracker = new ManagedRepoOverviewTracker({ workspaceRoot: root, api, now: () => T0, sleep: async () => {} });
       const view = await tracker.refresh();
       // The production default scan discovers only real `.git` entries.
-      expect(view?.rows.map((entry) => entry.key)).toEqual(['alpha', 'gitlab-repo', 'no-origin']);
+      expect(view?.rows.map((entry) => entry.key)).toEqual(['alpha', 'broken', 'gitlab-repo', 'no-origin']);
       const entry = row(view, 'alpha');
       expect(entry.linked).toBe(true);
       expect(entry.fullName).toBe('acme/alpha');
@@ -925,6 +933,9 @@ describe('managed repo overview tracker — review-round guarantees', () => {
       // The default resolver's failure paths through the REAL seam:
       expect(row(view, 'no-origin').linkReason).toBe('no usable origin remote');
       expect(row(view, 'gitlab-repo').linkReason).toBe('non-GitHub remote');
+      // A corrupt/unreadable repository is a READ failure, not evidence
+      // the user never configured an origin.
+      expect(row(view, 'broken').linkReason).toBe('origin remote could not be read yet');
       expect(api.calls.every((call) => call.endsWith('acme/alpha'))).toBe(true);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -1030,28 +1041,123 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
     }
   });
 
-  it('start() schedules background refreshes and stop() clears the timer', async () => {
-    const api = new FakeApi().set('alpha', { openPrs: 1 });
-    const tracker = new ManagedRepoOverviewTracker({
-      workspaceRoot: '/ws',
-      api,
-      scanRepos: () => ['alpha'],
-      resolveRemote: () => githubRef('alpha'),
-      intervalMs: 25,
-      now: () => T0,
-      sleep: async () => {},
-      log: () => {},
-    });
-    tracker.start();
+  it('start() schedules background refreshes, stop() clears them, and start() can resume', async () => {
+    vi.useFakeTimers();
     try {
-      await new Promise((resolve) => setTimeout(resolve, 90));
-      const calls = api.calls.filter((call) => call.startsWith('fetchRepo')).length;
-      expect(calls).toBeGreaterThanOrEqual(2);
+      const api = new FakeApi().set('alpha', { openPrs: 1 });
+      const tracker = new ManagedRepoOverviewTracker({
+        workspaceRoot: '/ws',
+        api,
+        scanRepos: () => ['alpha'],
+        resolveRemote: () => githubRef('alpha'),
+        intervalMs: 25,
+        now: () => T0,
+        sleep: async () => {},
+        log: () => {},
+      });
+      const count = (): number => api.calls.filter((call) => call.startsWith('fetchRepo')).length;
+      tracker.start();
+      await vi.advanceTimersByTimeAsync(75);
+      const running = count();
+      expect(running).toBeGreaterThanOrEqual(2);
       tracker.stop();
-      await new Promise((resolve) => setTimeout(resolve, 60));
-      expect(api.calls.filter((call) => call.startsWith('fetchRepo')).length).toBe(calls);
+      await vi.advanceTimersByTimeAsync(75);
+      expect(count()).toBe(running);
+      tracker.start();
+      await vi.advanceTimersByTimeAsync(50);
+      expect(count()).toBeGreaterThan(running);
+      tracker.stop();
     } finally {
-      tracker.stop();
+      vi.useRealTimers();
+    }
+  });
+
+  it('renders an invisible-only registry name as visible escapes the web validator accepts', async () => {
+    const h = harness({ names: ['\u200b'] });
+    const view = await h.tracker.refresh();
+    expect(isValidSnapshot(validBoardSnapshot(view))).toBe(true);
+    const entry = row(view, '\u200b');
+    expect(entry.displayName).not.toBe('\u200b');
+    expect(entry.displayName.length).toBeGreaterThan(0);
+  });
+
+  it('leaves a .github-suffixed host with unsafe characters unlinked instead of freezing the board', async () => {
+    const h = harness({
+      names: ['alpha'],
+      refs: new Map([['alpha', { host: 'foo_bar.github', owner: 'acme', repo: 'alpha' }]]),
+    });
+    const view = await h.tracker.refresh();
+    const entry = row(view, 'alpha');
+    expect(entry.linked).toBe(false);
+    expect(entry.linkReason).toBe('unrecognized remote');
+    expect(isValidSnapshot(validBoardSnapshot(view))).toBe(true);
+    expect(h.api.calls).toEqual([]);
+  });
+
+  it('keeps every managed repo visible with a read-failure reason when resolution fails', async () => {
+    const h = harness({ names: ['alpha', 'beta'] });
+    h.resolveError = true;
+    const view = await h.tracker.refresh();
+    expect(view?.rows.map((entry) => entry.key)).toEqual(['alpha', 'beta']);
+    for (const key of ['alpha', 'beta']) {
+      const entry = row(view, key);
+      expect(entry.linked).toBe(false);
+      expect(entry.linkReason).toBe('origin remote could not be read yet');
+      expect(entry.openPrs).toBeNull();
+      expect(entry.run).toBeNull();
+    }
+    expect(h.api.calls).toEqual([]);
+    expect(isValidSnapshot(validBoardSnapshot(view))).toBe(true);
+  });
+
+  it('bounds the remote-resolution phase by wall clock and keeps prior rows', async () => {
+    const h = harness({ names: ['alpha', 'beta', 'gamma'] });
+    h.resolveDelayMs = REPO_OVERVIEW_RESOLVE_BUDGET_MS + 10_000;
+    const view = await h.tracker.refresh();
+    expect(row(view, 'alpha').linked).toBe(true);
+    for (const key of ['beta', 'gamma']) {
+      expect(row(view, key).linkReason).toBe('origin remote could not be read yet');
+    }
+    expect(h.failure).toContain('origin-resolution budget');
+  });
+
+  it('keeps the async registry scan in exact parity with the sync wizard rule', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gru-repo-overview-parity-'));
+    try {
+      mkdirSync(join(root, 'plain'));
+      mkdirSync(join(root, '.hidden'));
+      writeFileSync(join(root, '.hidden', '.git'), '');
+      mkdirSync(join(root, 'repo-dir'));
+      mkdirSync(join(root, 'repo-dir', '.git'));
+      mkdirSync(join(root, 'repo-file'));
+      writeFileSync(join(root, 'repo-file', '.git'), 'gitdir: ./work\n');
+      mkdirSync(join(root, 'target'));
+      mkdirSync(join(root, 'target', '.git'));
+      symlinkSync(join(root, 'target'), join(root, 'repo-link'));
+      symlinkSync(join(root, 'missing'), join(root, 'broken-link'));
+      const expected = ['repo-dir', 'repo-file', 'repo-link', 'target'];
+      expect(discoverManagedRepos(root)).toEqual(expected);
+      expect(await discoverManagedReposAsync(root)).toEqual(expected);
+      expect(discoverManagedRepos(join(root, 'absent'))).toEqual([]);
+      expect(await discoverManagedReposAsync(join(root, 'absent'))).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects (never nulls) when the production resolver cannot spawn git', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gru-repo-overview-path-'));
+    const emptyPath = mkdtempSync(join(tmpdir(), 'gru-repo-overview-emptypath-'));
+    const savedPath = process.env.PATH;
+    try {
+      execFileSync('git', ['init', '-q', join(root, 'alpha')]);
+      execFileSync('git', ['-C', join(root, 'alpha'), 'remote', 'add', 'origin', 'https://github.com/acme/alpha.git']);
+      process.env.PATH = emptyPath;
+      await expect(defaultRemoteResolver(join(root, 'alpha'))).rejects.toBeInstanceOf(Error);
+    } finally {
+      process.env.PATH = savedPath;
+      rmSync(root, { recursive: true, force: true });
+      rmSync(emptyPath, { recursive: true, force: true });
     }
   });
 });

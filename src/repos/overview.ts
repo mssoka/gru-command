@@ -144,6 +144,14 @@ export const REPO_OVERVIEW_RUNS_PER_FETCH = 3;
  * pass inside the sustained quota instead of self-inflicting a 403 that
  * aborts the refresh mid-registry. */
 export const REPO_OVERVIEW_SEARCH_MIN_INTERVAL_MS = 2_000;
+/** Wall-clock bound for one pass's remote-resolution phase: a slow mount
+ * or a huge registry must not make classification exceed the cadence. */
+export const REPO_OVERVIEW_RESOLVE_BUDGET_MS = 60_000;
+
+/** The unlinked reason used when a repo's origin remote could not be READ
+ * (git failure, timeout, resolution budget) — distinct from a missing
+ * remote, and never a discarded row. */
+const ORIGIN_READ_FAILED_REASON = 'origin remote could not be read yet';
 
 // ------------------------------------------------------------------
 // Outbound port + raw shapes
@@ -307,10 +315,31 @@ export function freshnessOf(input: {
 
 const SAFE_REMOTE_SEGMENT = /^[A-Za-z0-9_.-]+$/;
 
+/** The GitHub host charset the web validator accepts. A host outside it
+ * (e.g. an underscore) must stay unlinked: emitting it would make every
+ * board snapshot fail validation and freeze the whole board. */
+const SAFE_HOST = /^[A-Za-z0-9.-]+$/;
+
+/** A registry directory name is legal on disk but may be invisible-only
+ * (zero-width/format/combining characters). Emitting it verbatim would
+ * fail the mirrored web validator and freeze every snapshot, so an
+ * invisible-only name is disclosed as visible escapes — never dropped,
+ * never used as an identity. */
+const VISIBLE_CHARACTER = /[^\p{Cf}\p{Cc}\p{M}\s]/u;
+
+export function safeDisplayName(name: string): string {
+  if (VISIBLE_CHARACTER.test(name)) return name;
+  const escaped = [...name]
+    .map((char) => (VISIBLE_CHARACTER.test(char) ? char : `\\u{${char.codePointAt(0)?.toString(16) ?? '?'}}`))
+    .join('');
+  return escaped === '' ? 'unnamed repository' : escaped;
+}
+
 /** Build the https repository link from a parsed remote, or null when the
  * host/segments cannot form a safe link (not-linked, never guessed). */
 export function githubRepoLink(ref: RepoRef): string | null {
   if (!isGitHubRemote(ref.host)) return null;
+  if (!SAFE_HOST.test(ref.host) || ref.host.includes('..')) return null;
   if (!SAFE_REMOTE_SEGMENT.test(ref.owner) || !SAFE_REMOTE_SEGMENT.test(ref.repo)) return null;
   if (ref.owner === '.' || ref.owner === '..' || ref.repo === '.' || ref.repo === '..') return null;
   let url: URL;
@@ -550,20 +579,20 @@ async function gitOriginUrl(repoPath: string): Promise<string | null> {
       'git',
       ['-C', repoPath, 'remote', 'get-url', 'origin'],
       { encoding: 'utf8', timeout: 10_000, maxBuffer: 64 * 1024 },
-      (error, stdout) => {
+      (error, stdout, stderr) => {
         if (error !== null) {
           const code = (error as NodeJS.ErrnoException).code;
           const killed = (error as { killed?: boolean }).killed === true;
-          if (killed || typeof code === 'string') {
-            // Spawn failure or timeout — a transient read failure, NOT
-            // evidence the remote changed: reject so the tracker keeps the
-            // previous classification.
-            reject(error);
+          // ONLY git's own "no such remote" verdict is evidence of an
+          // unlinked repo. Every other failure (spawn error, timeout, a
+          // corrupt/unreadable repository, permission failure) is a read
+          // failure and rejects, so the tracker keeps the previous
+          // classification and cached observation.
+          if (!killed && typeof code !== 'string' && /No such remote/i.test(String(stderr))) {
+            resolve(null);
             return;
           }
-          // git ran and reported no usable origin remote (exit code, e.g.
-          // `error: No such remote 'origin'`) — a real unlinked state.
-          resolve(null);
+          reject(error);
           return;
         }
         const url = stdout.trim();
@@ -698,9 +727,13 @@ export class ManagedRepoOverviewTracker {
     }
   }
 
+  /** Stop the cadence; a later start() can resume it. An in-flight pass
+   * is allowed to finish (its own bounds apply) — stop() owns the timer,
+   * not the pass. */
   stop(): void {
     if (this.timer !== null) clearInterval(this.timer);
     this.timer = null;
+    this.started = false;
   }
 
   /** The cached view the board snapshot renders; null until the first
@@ -722,7 +755,7 @@ export class ManagedRepoOverviewTracker {
         : 'unchecked';
       return {
         key: name,
-        displayName: name,
+        displayName: safeDisplayName(name),
         linked,
         host: state.ref !== null ? state.ref.host : null,
         link: state.ref !== null ? githubRepoLink(state.ref) : null,
@@ -766,25 +799,45 @@ export class ManagedRepoOverviewTracker {
     // classification and cached observation (a transient git failure is
     // not evidence the remote changed).
     const nextStates = new Map<string, RepoSourceState>();
+    const resolveDeadline = this.now() + REPO_OVERVIEW_RESOLVE_BUDGET_MS;
+    let resolveBudgetSpent = false;
     for (const name of repos) {
       const previous = this.states.get(name);
       const base = previous ?? emptySourceState();
+      const unreadable = (): void => {
+        // A read failure (or the resolution budget) is not evidence the
+        // remote changed: keep the previous classification and cached
+        // observation when one exists. A never-classified entry is still
+        // PUBLISHED with the explicit read-failure reason — every managed
+        // repo appears, and the row never claims a guessed identity.
+        if (previous !== undefined) {
+          nextStates.set(name, previous);
+          return;
+        }
+        const row = emptySourceState();
+        row.linkReason = ORIGIN_READ_FAILED_REASON;
+        nextStates.set(name, row);
+      };
+      if (this.now() > resolveDeadline) {
+        if (!resolveBudgetSpent) {
+          this.log('warn', 'repo overview: origin-resolution budget spent — remaining repositories keep their prior state', {
+            budgetMs: REPO_OVERVIEW_RESOLVE_BUDGET_MS,
+            repos: repos.length,
+          });
+          resolveBudgetSpent = true;
+        }
+        unreadable();
+        continue;
+      }
       let resolved: RepoRef | null;
       try {
         resolved = await this.resolveRemote(join(this.opts.workspaceRoot, name));
       } catch (error) {
-        if (previous !== undefined) {
-          // A transient git failure is not evidence the remote changed:
-          // keep the previous classification and cached observation.
-          this.log('warn', 'repo overview: origin resolution failed — keeping the previous classification', {
-            repo: name,
-            error: messageOf(error).slice(0, 300),
-          });
-          nextStates.set(name, previous);
-        }
-        // A never-classified entry stays unpublished until a pass can
-        // classify it — the view must never emit `linked:false` without a
-        // reason. It reappears on the next cadence.
+        this.log('warn', 'repo overview: origin resolution failed — keeping the previous classification', {
+          repo: name,
+          error: messageOf(error).slice(0, 300),
+        });
+        unreadable();
         continue;
       }
       const classification = classifyRemoteValue(resolved);
@@ -816,7 +869,10 @@ export class ManagedRepoOverviewTracker {
     for (const [name, state] of nextStates) this.states.set(name, state);
     const start = repos.length === 0 ? 0 : this.cursor % repos.length;
     const order = [...repos.slice(start), ...repos.slice(0, start)];
-    const fetchable = order.filter((name) => this.states.get(name)?.ref !== null);
+    const fetchable = order.filter((name) => {
+      const state = this.states.get(name);
+      return state !== undefined && state.ref !== null;
+    });
     // Every registry row now has a classified identity (linked or an
     // explicit reason), so rows are renderable from here on — even if the
     // fetch phase below fails or is aborted. A refresh that never reached

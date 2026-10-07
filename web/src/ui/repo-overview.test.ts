@@ -216,29 +216,49 @@ describe('managed repository overview panel', () => {
     expect(mount.querySelectorAll('.repo-row')).toHaveLength(0);
   });
 
-  it('restores the remembered scroll when a push lands while the panel is hidden', () => {
+  it('restores the remembered scroll when a push lands while the panel is hidden', async () => {
     const { mount, view } = panel();
     view.render({ rows: [row()] });
     const list = mount.querySelector<HTMLElement>('.repo-overview__list')!;
     list.scrollTop = 240;
     list.dispatchEvent(new Event('scroll'));
     // Simulate the browser's hidden-panel semantics: [hidden] removes the
-    // box and the element reports scrollTop 0.
+    // box, the element reports scrollTop 0, and the render's assignment is
+    // discarded — the reveal restores through the mutation observer.
     mount.hidden = true;
     list.scrollTop = 0;
     view.render({ rows: [row(), row({ key: 'beta', displayName: 'beta' })] });
     mount.hidden = false;
+    await new Promise((resolve) => setTimeout(resolve, 0));
     expect(mount.querySelector<HTMLElement>('.repo-overview__list')?.scrollTop).toBe(240);
   });
 
   it('keeps keyboard position inside the module when the focused row disappears', () => {
     const { mount, view } = panel();
+    view.render({
+      rows: [
+        row(),
+        row({ key: 'beta', displayName: 'beta', link: 'https://github.com/acme/beta', fullName: 'acme/beta' }),
+      ],
+    });
+    const ciLinks = mount.querySelectorAll<HTMLAnchorElement>('.repo-row__ci-link');
+    (ciLinks[1] as HTMLAnchorElement).focus();
+    // The focused (last) row is gone; focus lands on the control nearest
+    // its old position — the first row's CI link — not the first control
+    // and never the body.
     view.render({ rows: [row()] });
-    mount.querySelector<HTMLAnchorElement>('a.repo-row__name')!.focus();
-    // The focused row is gone; focus lands on the nearest surviving link
-    // rather than dropping to the body.
-    view.render({ rows: [row({ key: 'beta', displayName: 'beta', link: 'https://github.com/acme/beta', fullName: 'acme/beta' })] });
-    expect(document.activeElement).toBe(mount.querySelector('a.repo-row__name'));
+    expect(document.activeElement).toBe(mount.querySelector('a.repo-row__ci-link'));
+
+    // When every control disappears focus stays on the module itself.
+    view.render({ rows: [] });
+    expect(document.activeElement).toBe(mount);
+  });
+
+  it('fails closed on a link whose host differs from the row host, even if validation was bypassed', () => {
+    const { mount, view } = panel();
+    view.render({ rows: [row({ link: 'https://evil.example/acme/alpha', host: 'github.com' })] });
+    expect(mount.querySelector('a.repo-row__name')).toBeNull();
+    expect(mount.querySelector('.repo-row__name')?.textContent).toBe('alpha');
   });
 
   it('carries the raw provider context as accessible titles', () => {

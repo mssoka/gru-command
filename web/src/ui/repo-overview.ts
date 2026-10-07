@@ -22,11 +22,15 @@ export interface RepoOverviewPanelDeps {
   readonly ageNode: (className: string, since: string | null, prefix?: string, suffix?: string) => HTMLElement;
 }
 
-/** href assignment is fail-closed: anything but https stays unlinked. */
-function safeHref(raw: string | null): string | null {
+/** href assignment is fail-closed: anything but https — or anything whose
+ * host differs from the row's proven host — stays unlinked. */
+function safeHref(raw: string | null, host: string | null): string | null {
   if (raw === null) return null;
   try {
-    return new URL(raw).protocol === 'https:' ? raw : null;
+    const url = new URL(raw);
+    if (url.protocol !== 'https:') return null;
+    if (host !== null && url.hostname.toLowerCase() !== host.toLowerCase()) return null;
+    return raw;
   } catch {
     return null;
   }
@@ -41,6 +45,21 @@ export class RepoOverviewPanel {
   constructor(mount: HTMLElement, deps: RepoOverviewPanelDeps) {
     this.mount = mount;
     this.deps = deps;
+    // Programmatic focus fallback home (a removed row leaves keyboard
+    // users inside the module, never on <body>).
+    this.mount.tabIndex = -1;
+    // A scrollTop assignment on a display-less ([hidden] tab) list is
+    // discarded by the browser; restore on reveal instead.
+    if (typeof MutationObserver !== 'undefined') {
+      new MutationObserver(() => {
+        if (!this.mount.hidden) this.restoreScroll();
+      }).observe(this.mount, { attributes: true, attributeFilter: ['hidden'] });
+    }
+  }
+
+  private restoreScroll(): void {
+    const list = this.mount.querySelector<HTMLElement>('.repo-overview__list');
+    if (list !== null) list.scrollTop = this.lastScrollTop;
   }
 
   /** `null`/`undefined` (feature not wired or no refresh yet) renders
@@ -56,8 +75,15 @@ export class RepoOverviewPanel {
       this.lastScrollTop = previousScroll;
     }
     const active = document.activeElement;
-    const focusKey =
-      active instanceof HTMLElement && this.mount.contains(active) ? (active.dataset.focusKey ?? null) : null;
+    let focusKey: string | null = null;
+    let focusIndex = 0;
+    if (active instanceof HTMLElement && this.mount.contains(active) && active.dataset.focusKey !== undefined) {
+      focusKey = active.dataset.focusKey;
+      focusIndex = Math.max(
+        0,
+        [...this.mount.querySelectorAll<HTMLElement>('[data-focus-key]')].indexOf(active),
+      );
+    }
     this.mount.replaceChildren();
     if (view === null || view === undefined) return;
     const head = el('div', 'repo-overview__head');
@@ -74,23 +100,26 @@ export class RepoOverviewPanel {
       this.mount.append(
         el('p', 'repo-overview__empty', 'No managed repositories found under the configured workspace root.'),
       );
-      return;
+    } else {
+      const list = el('div', 'repo-overview__list');
+      for (const row of view.rows) list.append(this.row(row));
+      // User scrolls are the authoritative offset (renders capture it too,
+      // but a hidden panel reports 0 — the listener preserves the real one).
+      list.addEventListener('scroll', () => {
+        this.lastScrollTop = list.scrollTop;
+      });
+      this.mount.append(list);
+      list.scrollTop = this.lastScrollTop;
     }
-    const list = el('div', 'repo-overview__list');
-    for (const row of view.rows) list.append(this.row(row));
-    // User scrolls are the authoritative offset (renders capture it too,
-    // but a hidden panel reports 0 — the listener preserves the real one).
-    list.addEventListener('scroll', () => {
-      this.lastScrollTop = list.scrollTop;
-    });
-    this.mount.append(list);
-    list.scrollTop = this.lastScrollTop;
     if (focusKey !== null) {
       const controls = [...this.mount.querySelectorAll<HTMLElement>('[data-focus-key]')];
       // The exact row may have disappeared between pushes: keep the
-      // keyboard position inside the module on the nearest survivor
-      // instead of dropping focus to the body.
-      (controls.find((node) => node.dataset.focusKey === focusKey) ?? controls[0])?.focus();
+      // keyboard position inside the module on the nearest survivor (the
+      // control at the remembered index, else the last one, else the
+      // module itself) instead of dropping focus to the body.
+      const exact = controls.find((node) => node.dataset.focusKey === focusKey);
+      const nearest = controls.length === 0 ? null : controls[Math.min(focusIndex, controls.length - 1)];
+      (exact ?? nearest ?? this.mount).focus();
     }
   }
 
@@ -114,7 +143,7 @@ export class RepoOverviewPanel {
   }
 
   private repoName(row: RepoOverviewRowView): HTMLElement {
-    const href = row.linked ? safeHref(row.link) : null;
+    const href = row.linked ? safeHref(row.link, row.host) : null;
     if (href === null) {
       return el('span', 'repo-row__name', row.displayName);
     }
@@ -164,7 +193,7 @@ export class RepoOverviewPanel {
     const ci = repoCiView(row);
     const ciNode = el('span', 'repo-row__ci');
     ciNode.append(el('b', 'repo-row__ci-label', 'CI: '));
-    const href = safeHref(ci.url);
+    const href = safeHref(ci.url, row.host);
     if (href !== null && ci.workflow !== null) {
       const workflow = el('a', 'repo-row__ci-link', ci.workflow);
       workflow.href = href;
