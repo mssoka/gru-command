@@ -1,4 +1,5 @@
 import { execFile as execFileCallback, execFileSync, spawn, spawnSync } from 'node:child_process';
+import { readFile as readFileAsync } from 'node:fs/promises';
 import { promisify } from 'node:util';
 
 const execFileAsPromised = promisify(execFileCallback);
@@ -164,12 +165,14 @@ function gitFailure(error: unknown): { readonly code: number | null; readonly st
   return { code, stderr };
 }
 
-/** `git check-ref-format --branch <name>` refused the NAME — git's own
- * invalid-name answer (exit 128 with that diagnostic, C locale). Any other
- * failure — an unreadable repository also exits 128 — is operational. */
-export function refusedBranchName(error: unknown): boolean {
+/** `git check-ref-format --branch <name>` refused THIS NAME — git's own
+ * complete invalid-name diagnostic for exactly this spelling (exit 128, C
+ * locale). Any other failure — an unreadable repository also exits 128, and
+ * its path may even contain those words — is operational. */
+export function refusedBranchName(error: unknown, name: string): boolean {
   const { code, stderr } = gitFailure(error);
-  return code === 128 && /is not a valid branch name/u.test(stderr);
+  const refusal = `fatal: '${name}' is not a valid branch name`;
+  return code === 128 && stderr.split(/\r?\n/u).some((line) => line.trim() === refusal);
 }
 
 /** `git check-ref-format <ref>` refused the FORMAT: exit 1 is its only
@@ -184,7 +187,11 @@ const PROBE_MAX_OUTPUT_BYTES = 1024 * 1024;
 /** One read-only git step in its OWN process group: at its bound — and
  * whenever it ends — the whole group is SIGKILLed, so nothing it spawned (a
  * wrapper's children, ssh, a remote helper) outlives it or overlaps a
- * retry. Diagnostics are in the C locale. Rejections carry the numeric exit
+ * retry. Contract (owner decision 2026-10-07, R5-4): cleanup covers the
+ * step's process group; a helper that deliberately detaches into its own
+ * session (ssh ControlPersist, a daemon) is outside it and left alone — and
+ * if it holds the step's output open, the answer is refused as incomplete,
+ * never accepted. Diagnostics are in the C locale. Rejections carry the numeric exit
  * `code` and `stderr`; a timeout, kill or spawn failure has no numeric code. */
 export function runOwnedGit(repoPath: string, args: readonly string[], timeoutMs: number): Promise<string> {
   return new Promise<string>((resolve, reject) => {
@@ -199,6 +206,7 @@ export function runOwnedGit(repoPath: string, args: readonly string[], timeoutMs
     let errBytes = 0;
     let timedOut = false;
     let overflow = false;
+    let incomplete = false;
     let settled = false;
     let fallback: ReturnType<typeof setTimeout> | null = null;
     const killGroup = (): void => {
@@ -236,6 +244,10 @@ export function runOwnedGit(repoPath: string, args: readonly string[], timeoutMs
       if (spawnError !== undefined) return reject(spawnError);
       if (timedOut) return reject(Object.assign(new Error(`${command} timed out after ${timeoutMs} ms`), { killed: true }));
       if (overflow) return reject(new Error(`${command} printed more than ${PROBE_MAX_OUTPUT_BYTES} bytes`));
+      if (incomplete) {
+        // Whatever git printed may be cut short: never an answer, whatever its exit code.
+        return reject(new Error(`${command} exited, but a process outside its group held its output open — the answer is incomplete`));
+      }
       const stderr = Buffer.concat(err).toString('utf8');
       if (code === 0) return resolve(Buffer.concat(out).toString('utf8'));
       reject(Object.assign(new Error(stderr.trim() || `${command} exited ${code ?? signal}`), {
@@ -250,6 +262,7 @@ export function runOwnedGit(repoPath: string, args: readonly string[], timeoutMs
       // Pipes close once the group is dead; a descendant that escaped the
       // group must not hold the step open.
       fallback = setTimeout(() => {
+        incomplete = true;
         child.stdout.destroy();
         child.stderr.destroy();
         finish(code, signal);
@@ -260,28 +273,66 @@ export function runOwnedGit(repoPath: string, args: readonly string[], timeoutMs
 }
 
 /** The same owned-group run for the SYNCHRONOUS movement probe: a tiny
- * Node runner owns the group (spawnSync cannot), kills it at the bound and
- * whenever git ends, and exits with git's status (124 on timeout). */
+ * Node runner owns the group (spawnSync cannot). It publishes the group id
+ * on fd 3 first, captures git's output itself within the probe's bound
+ * (so the runner's own output never overflows), kills the group at the
+ * time bound, on overflow, on an output pipe held open after exit, and
+ * whenever git ends — then reports: git's status, or 124 timeout, 125
+ * killed or incomplete, 126 overflow, 127 spawn failure. */
 const OWNED_GROUP_RUNNER = `
 const { spawn } = require('node:child_process');
-const [limit, file, ...args] = process.argv.slice(1);
-const child = spawn(file, args, { detached: true, stdio: ['ignore', 'inherit', 'inherit'], env: { ...process.env, LC_ALL: 'C' } });
+const { writeSync } = require('node:fs');
+const [limit, maxBytes, file, ...args] = process.argv.slice(1);
+const child = spawn(file, args, { detached: true, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, LC_ALL: 'C' } });
+if (child.pid !== undefined) writeSync(3, String(child.pid));
+const out = []; const err = []; let outBytes = 0; let errBytes = 0; let done = false; let fallback = null;
 const killGroup = () => { try { process.kill(-child.pid, 'SIGKILL'); } catch {} };
-const timer = setTimeout(() => { killGroup(); process.stderr.write(file + ' timed out after ' + limit + ' ms\\n'); process.exit(124); }, Number(limit));
-child.on('error', (error) => { clearTimeout(timer); process.stderr.write(String(error) + '\\n'); process.exit(127); });
-child.on('exit', (code) => { clearTimeout(timer); killGroup(); process.exit(code === null ? 125 : code); });
+const finish = (code, message) => {
+  if (done) return; done = true; clearTimeout(timer); if (fallback !== null) clearTimeout(fallback); killGroup();
+  child.stdout.destroy(); child.stderr.destroy();
+  process.exitCode = code;
+  if (code === 0) process.stdout.write(Buffer.concat(out));
+  process.stderr.write(message !== undefined ? message + '\\n' : Buffer.concat(err));
+};
+const timer = setTimeout(() => finish(124, file + ' timed out after ' + limit + ' ms'), Number(limit));
+child.stdout.on('data', (chunk) => { outBytes += chunk.length; if (outBytes > Number(maxBytes)) finish(126, file + ' printed more than ' + maxBytes + ' bytes'); else out.push(chunk); });
+child.stderr.on('data', (chunk) => { errBytes += chunk.length; if (errBytes <= 65536) err.push(chunk); });
+child.on('error', (error) => finish(127, String(error)));
+child.on('exit', () => { killGroup(); fallback = setTimeout(() => finish(125, file + ' exited, but a process outside its group held its output open — the answer is incomplete'), 500); });
+child.on('close', (code) => finish(code === null ? 125 : code));
 `;
 
-function gitOwnedSync(repoPath: string, args: readonly string[], timeoutMs: number): string {
-  const result = spawnSync(process.execPath, ['-e', OWNED_GROUP_RUNNER, String(timeoutMs), 'git', '-C', repoPath, ...args], {
-    encoding: 'utf8',
-    maxBuffer: GIT_MAX_BUFFER,
-    timeout: timeoutMs + 5_000, // the runner enforces the bound; this only guards the runner
-    killSignal: 'SIGKILL',
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  if (result.error !== undefined) throw result.error;
+/** Run one read-only git step synchronously in an owned process group (see
+ * OWNED_GROUP_RUNNER). The outer bound only guards the runner; should it
+ * fire — or the runner fail any other way — the published group is killed
+ * here before the failure is reported. */
+export function runOwnedGitSync(repoPath: string, args: readonly string[], timeoutMs: number, outerTimeoutMs = timeoutMs + 5_000): string {
+  const result = spawnSync(
+    process.execPath,
+    ['-e', OWNED_GROUP_RUNNER, String(timeoutMs), String(PROBE_MAX_OUTPUT_BYTES), 'git', '-C', repoPath, ...args],
+    {
+      encoding: 'utf8',
+      maxBuffer: PROBE_MAX_OUTPUT_BYTES * 2,
+      timeout: outerTimeoutMs,
+      killSignal: 'SIGKILL',
+      stdio: ['ignore', 'pipe', 'pipe', 'pipe'],
+    },
+  );
+  const group = Number.parseInt(String(result.output?.[3] ?? ''), 10);
+  const killGroup = (): void => {
+    if (!Number.isSafeInteger(group) || group <= 0) return;
+    try {
+      process.kill(-group, 'SIGKILL');
+    } catch {
+      /* the group is already gone */
+    }
+  };
+  if (result.error !== undefined) {
+    killGroup();
+    throw result.error;
+  }
   if (result.status !== 0) {
+    killGroup();
     throw Object.assign(new Error(result.stderr.trim() || `git ${args.join(' ')} exited ${result.status ?? result.signal}`), {
       status: result.status,
       stderr: result.stderr,
@@ -693,7 +744,7 @@ function advertisedRemoteBranch(repoPath: string, ref: string): { remote: string
     try {
       gitRaw(repoPath, ['check-ref-format', '--branch', ref], 30_000, 'SIGTERM', true);
     } catch (error) {
-      if (refusedBranchName(error)) return null; // git refused the name: not a branch spelling
+      if (refusedBranchName(error, ref)) return null; // git refused the name: not a branch spelling
       throw error; // an operational failure proves nothing — fail closed
     }
     // The ref must actually RESOLVE to a remote-tracking ref — a tag whose
@@ -750,7 +801,7 @@ export function sourceMovementSinceFreeze(review: FrozenReview, options?: Source
       // An owned process group, killed at its bound: this call blocks the
       // event loop, so neither a SIGTERM-ignoring git (or wrapper) nor
       // anything it spawned may outlive the bound.
-      const advertised = gitOwnedSync(
+      const advertised = runOwnedGitSync(
         repoPath,
         ['ls-remote', '--exit-code', remoteTarget.remote, `refs/heads/${remoteTarget.branch}`],
         options?.remoteProbeTimeoutMs ?? 30_000,
@@ -796,8 +847,9 @@ export interface SuspendEvidenceIo {
   /** `sysctl -n kern.waketime` output (macOS), bounded by `timeoutMs`. */
   readonly kernWaketime: (timeoutMs: number) => Promise<string>;
   /** Raw `/proc/uptime` text (Linux; its first field keeps counting through
-   * suspend). Throws when unreadable. */
-  readonly procUptime: () => string;
+   * suspend). Rejects when unreadable. Asynchronous, so a stalled read can
+   * never block the evidence allowance's timer. */
+  readonly procUptime: () => Promise<string>;
 }
 
 /** Test seams for the admission probe; production uses the defaults. */
@@ -844,12 +896,16 @@ export const readKernWaketime = async (timeoutMs: number): Promise<string> =>
  * Null when the text is not that. */
 export function parseProcUptimeMs(text: string): number | null {
   const match = /^\s*(\d+(?:\.\d+)?)\s/u.exec(text);
-  return match === null ? null : Number(match[1]) * 1000;
+  if (match === null) return null;
+  const ms = Number(match[1]) * 1000;
+  return Number.isFinite(ms) ? ms : null;
 }
 
-function bootClockMs(io: SuspendEvidenceIo): number | null {
+/** The Linux boot clock, read within the evidence allowance; null when it
+ * cannot be read in time. */
+async function bootClockMs(io: SuspendEvidenceIo, now: () => number): Promise<number | null> {
   try {
-    return parseProcUptimeMs(io.procUptime());
+    return parseProcUptimeMs(await withinEvidenceAllowance(() => io.procUptime(), now));
   } catch {
     return null;
   }
@@ -865,7 +921,7 @@ const OS_EVIDENCE: SuspendEvidenceIo = {
   platform: process.platform,
   wallNow: () => Date.now(),
   kernWaketime: readKernWaketime,
-  procUptime: () => readFileSync('/proc/uptime', 'utf8'),
+  procUptime: () => readFileAsync('/proc/uptime', 'utf8'),
 };
 
 /** The reader's answer only if it arrives inside the evidence allowance:
@@ -905,7 +961,7 @@ async function osSuspendedSince(start: ProbeStart, now: () => number, io: Suspen
       return wakeMs !== null && wakeMs > start.wallMs;
     }
     if (io.platform === 'linux' && start.bootMs !== null) {
-      const bootNow = bootClockMs(io);
+      const bootNow = await bootClockMs(io, now);
       return bootNow !== null && (bootNow - start.bootMs) - (now() - start.monoMs) > 1_000;
     }
   } catch {
@@ -942,7 +998,7 @@ export async function probeAdvertisedTipMovementAsync(
   const start: ProbeStart = {
     wallMs: io.wallNow(),
     monoMs: now(),
-    bootMs: io.platform === 'linux' ? bootClockMs(io) : null,
+    bootMs: io.platform === 'linux' ? await bootClockMs(io, now) : null,
   };
   const first = await probeAdvertisedTipOnce(review, timeoutMs, now, exec);
   if (first === null || first.cause !== 'check-failed') return first;
@@ -994,7 +1050,7 @@ async function probeAdvertisedTipOnce(
       try {
         await run(['check-ref-format', '--branch', targetRef]);
       } catch (error) {
-        if (refusedBranchName(error)) return null; // not a branch spelling (e.g. origin/topic~1)
+        if (refusedBranchName(error, targetRef)) return null; // not a branch spelling (e.g. origin/topic~1)
         throw error; // operational failure, timeout, kill, spawn failure — fail closed
       }
       // A target ref that no longer resolves did not become "unadvertised":

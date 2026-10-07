@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -12,6 +12,7 @@ import {
   parseProcUptimeMs,
   readKernWaketime,
   remainingTimeoutMs,
+  runOwnedGitSync,
   sourceMovementSinceFreeze,
   SUSPEND_EVIDENCE_ALLOWANCE_MS,
   type SuspendEvidenceIo,
@@ -563,7 +564,7 @@ describe('Perkins admission preflight (gh-169)', () => {
 
   /** A frozen review whose target is a pushed branch, so admission runs
    * the full identification + advertised-tip probe against a real remote. */
-  function branchTargetReview(name: string) {
+  function branchTargetReview(name: string, options: { readonly qualified?: boolean } = {}) {
     const repo = makeFixtureRepo(`admission-${name}`);
     repos.push(repo);
     repo.git(['checkout', '-b', `feature/${name}`]);
@@ -585,7 +586,7 @@ describe('Perkins admission preflight (gh-169)', () => {
       artifactRoot: temp('admission-artifacts-'),
       baseRef: 'main',
       targetRef: target,
-      movementRef: `origin/feature/${name}`,
+      movementRef: options.qualified === true ? `refs/remotes/origin/feature/${name}` : `origin/feature/${name}`,
       spec,
       ciEvidence: ci.record,
     });
@@ -604,7 +605,7 @@ describe('Perkins admission preflight (gh-169)', () => {
         const wake = WALL0 + wakeOffsetMs;
         return `{ sec = ${Math.floor(wake / 1000)}, usec = ${(wake % 1000) * 1000} } Wed Oct  7 09:56:48 2026\n`;
       },
-      procUptime: () => {
+      procUptime: async () => {
         throw new Error('ENOENT: /proc/uptime');
       },
     };
@@ -754,7 +755,7 @@ describe('Perkins admission preflight (gh-169)', () => {
       readonly mac?: number | null;
       readonly platform?: NodeJS.Platform;
       /** Linux: how far each clock advances while the first step runs. */
-      readonly linux?: { readonly monoMs: number; readonly bootMs: number; readonly onWake?: 'unreadable' | 'garbled' };
+      readonly linux?: { readonly monoMs: number; readonly bootMs: number; readonly onWake?: 'unreadable' | 'garbled' | 'overflowing' };
     };
     const cases: Case[] = [
       { name: 'macOS woke after the start', retry: true, mac: 30_000 },
@@ -767,6 +768,7 @@ describe('Perkins admission preflight (gh-169)', () => {
       { name: 'Linux boot clock ahead by 1.01 s', retry: true, linux: { monoMs: 5_500, bootMs: 6_510 } },
       { name: 'Linux /proc/uptime unreadable on wake', retry: false, linux: { monoMs: 0, bootMs: 60_000, onWake: 'unreadable' } },
       { name: 'Linux /proc/uptime garbled on wake', retry: false, linux: { monoMs: 0, bootMs: 60_000, onWake: 'garbled' } },
+      { name: 'Linux /proc/uptime overflowing on wake', retry: false, linux: { monoMs: 0, bootMs: 60_000, onWake: 'overflowing' } },
       { name: 'no evidence source on this platform', retry: false, platform: 'win32' },
     ];
     for (const c of cases) {
@@ -786,10 +788,11 @@ describe('Perkins admission preflight (gh-169)', () => {
         t += 60_000;
       });
       // Raw /proc/uptime text — the production parser converts it.
-      const uptime = (): string => {
+      const uptime = async (): Promise<string> => {
         uptimeReads += 1;
         if (uptimeReads > 1 && c.linux?.onWake === 'unreadable') throw new Error('EACCES: /proc/uptime');
         if (uptimeReads > 1 && c.linux?.onWake === 'garbled') return 'not an uptime';
+        if (uptimeReads > 1 && c.linux?.onWake === 'overflowing') return `${'9'.repeat(400)} 1234.56\n`;
         return `${(bootMs / 1000).toFixed(2)} 1234.56\n`;
       };
       const evidence: SuspendEvidenceIo = c.linux !== undefined
@@ -803,6 +806,7 @@ describe('Perkins admission preflight (gh-169)', () => {
     }
     expect(parseProcUptimeMs('560.25 1234.56\n')).toBe(560_250);
     expect(parseProcUptimeMs('')).toBeNull();
+    expect(parseProcUptimeMs(`${'9'.repeat(400)} 0.00`)).toBeNull();
   });
 
   it('evidence that arrives at or past its allowance is no evidence — whether the reader or the loop was slow', async () => {
@@ -882,7 +886,7 @@ describe('Perkins admission preflight (gh-169)', () => {
       expect(git.calls).not.toContain('ls-remote');
     }
     // In time, git's own invalid-name answer is a spelling, not a branch: skip.
-    const named = failing('check-ref-format', git128("fatal: 'origin/topic~1' is not a valid branch name"));
+    const named = failing('check-ref-format', git128(`fatal: '${review.manifest.targetRef}' is not a valid branch name`));
     expect(await probeAdvertisedTipMovementAsync(review, 5_000, { now: () => 0, exec: named.exec, evidence: NO_SUSPEND })).toBeNull();
     // A real unreadable repository, end to end.
     const away = `${review.manifest.repoPath}-away`;
@@ -914,43 +918,213 @@ describe('Perkins admission preflight (gh-169)', () => {
     }
   });
 
-  it('nothing a timed-out probe step spawned outlives it — async admission step and sync remote probe alike', async () => {
-    const review = branchTargetReview('descendants');
-    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
-    const shimDir = temp('admission-descendant-shim-');
-    const pidFile = join(shimDir, 'descendant.pid');
-    writeFileSync(
-      join(shimDir, 'git'),
-      `#!/bin/sh\ncase " $* " in *"ls-remote"*) sleep 30 & echo $! > "${pidFile}"; trap '' TERM; exec sleep 10;; esac\nexec "${realGit}" "$@"\n`,
-    );
-    chmodSync(join(shimDir, 'git'), 0o755);
-    const alive = (pid: number): boolean => {
+  /** Still executing — a zombie (killed, not yet reaped by whatever
+   * adopted it) is not. Linux reads /proc; elsewhere ps. */
+  function processRunning(pid: number): boolean {
+    if (process.platform === 'linux') {
+      let stat: string;
       try {
-        process.kill(pid, 0);
-        return true;
-      } catch {
-        return false;
+        stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+        throw error;
       }
-    };
-    const descendantGone = async (): Promise<boolean> => {
-      const pid = Number(readFileSync(pidFile, 'utf8').trim());
-      for (let attempt = 0; attempt < 20 && alive(pid); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 50));
-      const gone = !alive(pid);
-      if (!gone) process.kill(pid, 'SIGKILL');
-      return gone;
-    };
+      const state = stat.slice(stat.lastIndexOf(')') + 2, stat.lastIndexOf(')') + 3);
+      return state !== 'Z' && state !== 'X';
+    }
+    const state = spawnSync('/bin/ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8' }).stdout.trim();
+    return state !== '' && !state.startsWith('Z');
+  }
+  /** Waits briefly for `pid` to stop; kills it regardless, so no fixture
+   * process outlives the test. */
+  async function stoppedOnItsOwn(pidFile: string): Promise<boolean> {
+    const pid = Number(readFileSync(pidFile, 'utf8').trim());
+    for (let attempt = 0; attempt < 20 && processRunning(pid); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 50));
+    const gone = !processRunning(pid);
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch {
+      /* already gone */
+    }
+    rmSync(pidFile, { force: true });
+    return gone;
+  }
+  /** A git on PATH that runs `script` for the `step` subcommand and the
+   * real git for everything else; returns the restore function. */
+  function gitShim(step: string, script: string): () => void {
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    const shimDir = temp('admission-git-shim-');
+    writeFileSync(join(shimDir, 'git'), `#!/bin/sh\ncase " $* " in *" ${step} "*) ${script};; esac\nexec "${realGit}" "$@"\n`);
+    chmodSync(join(shimDir, 'git'), 0o755);
     const oldPath = process.env.PATH;
     process.env.PATH = `${shimDir}:${oldPath ?? ''}`;
+    return () => {
+      if (oldPath === undefined) delete process.env.PATH;
+      else process.env.PATH = oldPath;
+    };
+  }
+
+  it('nothing a timed-out probe step spawned outlives it — async admission step and sync remote probe alike', async () => {
+    const review = branchTargetReview('descendants');
+    const pidFile = join(temp('admission-descendant-'), 'descendant.pid');
+    const restore = gitShim('ls-remote', `sleep 30 & echo $! > "${pidFile}"; trap '' TERM; exec sleep 10`);
     try {
       // A bound long enough for the wrapper to have spawned its descendant.
       await expect(defaultProbeExec(review.manifest.repoPath, ['ls-remote', 'origin'], 1_500)).rejects.toThrow(/timed out/);
-      expect(await descendantGone()).toBe(true);
-      rmSync(pidFile, { force: true });
+      expect(await stoppedOnItsOwn(pidFile)).toBe(true);
       expect(sourceMovementSinceFreeze(review, { remoteProbeTimeoutMs: 1_500 })?.cause).toBe('check-failed');
-      expect(await descendantGone()).toBe(true);
+      expect(await stoppedOnItsOwn(pidFile)).toBe(true);
     } finally {
-      if (oldPath === undefined) delete process.env.PATH;
-      else process.env.PATH = oldPath;
+      restore();
+    }
+  });
+
+  it('nothing a SUCCESSFUL probe step spawned outlives it either — async admission and sync movement alike', async () => {
+    const review = branchTargetReview('descendants-ok');
+    const pidFile = join(temp('admission-descendant-ok-'), 'descendant.pid');
+    // Starts a background child, then falls through to the real git.
+    const restore = gitShim('ls-remote', `sleep 30 & echo $! > "${pidFile}"`);
+    try {
+      expect(await probeAdvertisedTipMovementAsync(review, 5_000, { evidence: NO_SUSPEND })).toBeNull();
+      expect(await stoppedOnItsOwn(pidFile)).toBe(true);
+      expect(sourceMovementSinceFreeze(review, { remoteProbeTimeoutMs: 5_000 })).toBeNull();
+      expect(await stoppedOnItsOwn(pidFile)).toBe(true);
+    } finally {
+      restore();
+    }
+  });
+
+  it('the synchronous probe kills its group when the wrapper floods its output, and when the runner itself is cut off', async () => {
+    const review = branchTargetReview('flood');
+    const pidFile = join(temp('admission-flood-'), 'descendant.pid');
+    let restore = gitShim('ls-remote', `sleep 30 & echo $! > "${pidFile}"; head -c 3000000 /dev/zero; exec sleep 10`);
+    try {
+      // The runner's own bound fires — not the outer buffer guard.
+      expect(sourceMovementSinceFreeze(review, { remoteProbeTimeoutMs: 5_000 })).toMatchObject({
+        cause: 'check-failed',
+        detail: expect.stringContaining('printed more than'),
+      });
+      expect(await stoppedOnItsOwn(pidFile)).toBe(true);
+    } finally {
+      restore();
+    }
+    restore = gitShim('ls-remote', `sleep 30 & echo $! > "${pidFile}"; exec sleep 20`);
+    try {
+      // The outer guard fires first: the parent must kill the group the runner published.
+      expect(() => runOwnedGitSync(review.manifest.repoPath, ['ls-remote', 'origin'], 10_000, 1_500)).toThrow();
+      expect(await stoppedOnItsOwn(pidFile)).toBe(true);
+    } finally {
+      restore();
+    }
+  });
+
+  it('a step whose output pipe a process outside its group still holds is incomplete — never an answer', async () => {
+    const review = branchTargetReview('held-pipe');
+    const pidFile = join(temp('admission-held-pipe-'), 'escaped.pid');
+    // Prints part of an answer, leaves an escaped (own-session) child holding stdout, exits 0.
+    const escape = `"${process.execPath}" -e "const c = require('node:child_process').spawn('/bin/sleep', ['30'], { detached: true, stdio: 'inherit' }); require('node:fs').writeFileSync('${pidFile}', String(c.pid)); c.unref()"`;
+    let restore = gitShim('rev-parse', `${escape}; printf 'refs/remotes/orig'; exit 0`);
+    try {
+      const movement = await probeAdvertisedTipMovementAsync(review, 5_000, { evidence: NO_SUSPEND });
+      expect(movement?.cause).toBe('check-failed');
+      expect(movement?.detail).toContain('incomplete');
+    } finally {
+      restore();
+      await stoppedOnItsOwn(pidFile);
+    }
+    restore = gitShim('ls-remote', `${escape}; printf '0000'; exit 0`);
+    try {
+      expect(sourceMovementSinceFreeze(review, { remoteProbeTimeoutMs: 5_000 })).toMatchObject({ cause: 'check-failed', detail: expect.stringContaining('incomplete') });
+    } finally {
+      restore();
+      await stoppedOnItsOwn(pidFile);
+    }
+  });
+
+  it('a helper that detaches into its own session and lets go of the output is outside the contract — left alone, the answer stands', async () => {
+    const review = branchTargetReview('detached-daemon');
+    const pidFile = join(temp('admission-daemon-'), 'daemon.pid');
+    // Like ssh ControlPersist: a detached child with its stdio closed, then the real git.
+    const daemon = `"${process.execPath}" -e "const c = require('node:child_process').spawn('/bin/sleep', ['30'], { detached: true, stdio: 'ignore' }); require('node:fs').writeFileSync('${pidFile}', String(c.pid)); c.unref()"`;
+    const restore = gitShim('ls-remote', daemon);
+    try {
+      expect(await probeAdvertisedTipMovementAsync(review, 5_000, { evidence: NO_SUSPEND })).toBeNull();
+      expect(processRunning(Number(readFileSync(pidFile, 'utf8').trim()))).toBe(true); // out of scope by contract
+    } finally {
+      restore();
+      await stoppedOnItsOwn(pidFile);
+    }
+  });
+
+  it('a diagnostic that merely CONTAINS the refusal words is operational — async and sync alike', async () => {
+    const review = branchTargetReview('misleading');
+    const misleading = "fatal: cannot change to '/nonexistent-gru-r5/is not a valid branch name': No such file or directory";
+    const scripted = async (_repo: string, args: readonly string[]): Promise<string> => {
+      if (args[0] === 'check-ref-format') throw Object.assign(new Error(misleading), { code: 128, stderr: misleading });
+      return '';
+    };
+    expect((await probeAdvertisedTipMovementAsync(review, 5_000, { now: () => 0, exec: scripted, evidence: NO_SUSPEND }))?.cause).toBe('check-failed');
+    const unavailable = { ...review, manifest: { ...review.manifest, repoPath: '/nonexistent-gru-r5/is not a valid branch name' } };
+    expect((await probeAdvertisedTipMovementAsync(unavailable, 5_000, { evidence: NO_SUSPEND }))?.cause).toBe('check-failed');
+    const restore = gitShim('check-ref-format', `echo "${misleading}" >&2; exit 128`);
+    try {
+      expect(sourceMovementSinceFreeze(review, { remoteProbeTimeoutMs: 5_000 })?.cause).toBe('check-failed');
+    } finally {
+      restore();
+    }
+  });
+
+  it('a qualified tracking ref: an operational check-ref-format failure fails closed; only exit 1 is a refusal', async () => {
+    const review = branchTargetReview('qualified', { qualified: true });
+    const movementRef = review.manifest.targetRef;
+    expect(movementRef).toBe('refs/remotes/origin/feature/qualified');
+    const scripted = (failure: Error) => async (_repo: string, args: readonly string[]): Promise<string> => {
+      if (args[0] === 'check-ref-format') throw failure;
+      if (args[0] === 'remote') return 'origin\n';
+      if (args[0] === 'ls-remote') return `${review.manifest.targetSha}\trefs/heads/feature/qualified\n`;
+      return '';
+    };
+    const operational = Object.assign(new Error('fatal: not a git repository'), { code: 128, stderr: 'fatal: not a git repository' });
+    const movement = await probeAdvertisedTipMovementAsync(review, 5_000, { now: () => 0, exec: scripted(operational), evidence: NO_SUSPEND });
+    expect(movement?.cause).toBe('check-failed');
+    const preflight = admissionPreflight(review, movementRef, { precomputedRemoteMovement: movement });
+    expect(preflight.checks.find((check) => check.name === 'head-binding')?.ok).toBe(false);
+    const refused = Object.assign(new Error(''), { code: 1, stderr: '' });
+    expect(await probeAdvertisedTipMovementAsync(review, 5_000, { now: () => 0, exec: scripted(refused), evidence: NO_SUSPEND })).toBeNull();
+    const restore = gitShim('check-ref-format', 'echo "fatal: not a git repository" >&2; exit 128');
+    try {
+      expect(sourceMovementSinceFreeze(review, { remoteProbeTimeoutMs: 5_000 })?.cause).toBe('check-failed');
+    } finally {
+      restore();
+    }
+  });
+
+  it('Linux suspend evidence must arrive inside the allowance too', async () => {
+    const review = branchTargetReview('linux-allowance');
+    for (const [delay, retry] of [[999, true], [1_000, false], [1_200, false]] as const) {
+      let t = 0;
+      let reads = 0;
+      const git = scriptedGit(review.manifest.targetSha, (_args, call) => {
+        if (call === 1) throw new Error('fatal: the remote end hung up unexpectedly');
+      });
+      const movement = await probeAdvertisedTipMovementAsync(review, 5_000, {
+        now: () => t,
+        exec: git.exec,
+        evidence: {
+          platform: 'linux',
+          wallNow: () => WALL0,
+          kernWaketime: async () => {
+            throw new Error('not macOS');
+          },
+          procUptime: async () => {
+            reads += 1;
+            if (reads === 1) return '500.00 0.00\n';
+            t += delay; // the wake-time read is slow
+            return '560.00 0.00\n';
+          },
+        },
+      });
+      expect({ delay, admitted: movement === null }).toEqual({ delay, admitted: retry });
     }
   });
 
@@ -999,7 +1173,7 @@ describe('Perkins admission preflight (gh-169)', () => {
           platform: 'darwin',
           wallNow: () => 0,
           kernWaketime: readKernWaketime,
-          procUptime: () => {
+          procUptime: async () => {
             throw new Error('ENOENT: /proc/uptime');
           },
         },
