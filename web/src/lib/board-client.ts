@@ -9,10 +9,14 @@
 import {
   BOARD_WS_PATH,
   isValidDecisionStatus,
+  isValidLessonProposal,
+  isValidLessonProposalDecision,
   isValidSnapshot,
   parseBoardServerFrame,
   type BoardSnapshot,
   type DecisionStatusView,
+  type LessonProposalDecisionView,
+  type LessonProposalView,
   type NotificationView,
   type TranscriptInfo,
   type TranscriptPage,
@@ -325,6 +329,21 @@ export class BoardClient {
     }
   }
 
+  /** The pending Book of Lessons proposal, for the owner's review. */
+  async getLessonProposal(): Promise<LessonProposalView> {
+    const proposal = await this.api<unknown>('/api/lessons/proposal');
+    if (!isValidLessonProposal(proposal)) throw new Error('lesson proposal review is malformed');
+    return proposal;
+  }
+
+  /** The owner's decision on a lesson proposal — the ONLY way it closes
+   * (owner decision 2026-10-07); the snapshot then retires the row. */
+  async decideLessonProposal(id: string, decision: 'accept' | 'reject'): Promise<LessonProposalDecisionView> {
+    const result = await this.postApi(`/api/lessons/proposal/${encodeURIComponent(id)}/${decision}`, {});
+    if (!isValidLessonProposalDecision(result)) throw new Error('lesson proposal decision response is malformed');
+    return result;
+  }
+
   /** E7: human ack (action-required clearance; re-arms an open breaker). */
   async ackNotification(id: string): Promise<void> {
     await this.postApi(`/api/notifications/${encodeURIComponent(id)}/ack`, { by: 'web' });
@@ -344,8 +363,36 @@ export class BoardClient {
       if (res.status === 401) {
         this.events.fatal('unauthorized (board api)');
       }
-      throw new Error(`board api ${path} → ${res.status}`);
+      let code: string | null = null;
+      let detail: string | null = null;
+      try {
+        const body = (await res.json()) as { error?: unknown; detail?: unknown };
+        code = typeof body.error === 'string' ? body.error : null;
+        detail = typeof body.detail === 'string' ? body.detail : null;
+      } catch {
+        /* a non-JSON error body keeps the status alone */
+      }
+      throw new BoardApiError(path, res.status, code, detail);
     }
     return res.json();
+  }
+}
+
+/** A board API refusal with the server's reason: the HTTP status, its
+ * error code and detail. A fetch failure (network ambiguity) is never one
+ * of these — callers can tell "the server said no" from "we don't know". */
+export class BoardApiError extends Error {
+  readonly path: string;
+  readonly status: number;
+  readonly code: string | null;
+  readonly detail: string | null;
+
+  constructor(path: string, status: number, code: string | null, detail: string | null) {
+    super(`board api ${path} → ${status}${detail !== null ? `: ${detail}` : ''}`);
+    this.name = 'BoardApiError';
+    this.path = path;
+    this.status = status;
+    this.code = code;
+    this.detail = detail;
   }
 }

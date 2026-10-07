@@ -604,7 +604,17 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
             json(res, 200, row);
             return;
           }
-          const before = ledger.getNotification(id)?.ackedAt ?? null;
+          const existing = ledger.getNotification(id);
+          if (existing?.kind === 'lessons.proposal') {
+            // A lesson proposal closes only through an owner decision — an
+            // ack would hide it without writing or consuming anything.
+            json(res, 409, {
+              error: 'decision_required',
+              detail: 'lesson proposals are decided with Accept or Reject (POST /api/lessons/proposal/:id/accept|reject)',
+            });
+            return;
+          }
+          const before = existing?.ackedAt ?? null;
           const row = notifications.ack(id, optStrField(body, 'by') ?? 'web');
           if (row === null) {
             json(res, 404, { error: 'not_found', detail: `notification "${id}" not found` });

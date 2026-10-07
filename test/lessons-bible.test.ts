@@ -3,13 +3,14 @@ import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readdirS
 import { spawnSync } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import {
   BibleStore,
   enforceChapterCap,
   parseChapter,
   BIBLE_WRITE_LOCK,
   compareProvenance,
+  describePlan,
   PROVENANCE_FLOOR,
   RepairWriteError,
   repairChapterProvenance,
@@ -969,5 +970,181 @@ describe('third review round of #253 (bmad-code-review, 2026-10-07)', () => {
     expect(() => bible.repairProvenance(JOURNAL, { write: true })).toThrowError(/is not valid UTF-8/);
     expect(readFileSync(file).equals(bytes)).toBe(true);
     expect(backups(bible.dir)).toEqual([]);
+  });
+});
+
+describe('plan, then apply only onto the planned book (owner decision 2026-10-07)', () => {
+  it('planUpdates writes nothing and describes exactly what Accept would change', () => {
+    const bible = tmpBible();
+    bible.ensureSeeded();
+    bible.applyUpdates([proposal()], PROVENANCE);
+    const index = bible.readIndexText();
+    const chapter = readFileSync(join(bible.dir, 'chapters', 'ops-restarts.md'), 'utf-8');
+    const plan = bible.planUpdates(
+      [
+        proposal({
+          lessons: [
+            { slug: 'shell-hang', body: 'A live shell holds the session open; close it first.', journalIds: ['j-2'] },
+            { slug: 'new-lesson', body: 'Something new to keep.', journalIds: ['j-3'] },
+          ],
+        }),
+      ],
+      PROVENANCE,
+    );
+    expect(bible.readIndexText()).toBe(index);
+    expect(readFileSync(join(bible.dir, 'chapters', 'ops-restarts.md'), 'utf-8')).toBe(chapter);
+    expect(plan.base).not.toBe(plan.after);
+    expect(describePlan(plan).chapters).toEqual([
+      expect.objectContaining({
+        slug: 'ops-restarts',
+        added: [
+          {
+            slug: 'new-lesson',
+            body: 'Something new to keep.',
+            recurred: 1,
+            tags: [],
+            previousBody: null,
+            previousRecurred: null,
+            previousTags: null,
+          },
+        ],
+        changed: [
+          expect.objectContaining({ slug: 'shell-hang', recurred: 2, body: 'A live shell holds the session open; close it first.' }),
+        ],
+      }),
+    ]);
+    expect(plan.report).toMatchObject({ chaptersWritten: 1, lessonsAdded: 1, lessonsMerged: 1 });
+  });
+
+  it('applyPlan refuses a book that moved since planning, and is a no-op once applied', () => {
+    const bible = tmpBible();
+    bible.ensureSeeded();
+    const plan = bible.planUpdates([proposal()], PROVENANCE);
+    writeFileSync(join(bible.dir, 'INDEX.md'), `${bible.readIndexText() ?? ''}\n`);
+    expect(() => bible.applyPlan(plan)).toThrowError(expect.objectContaining({ name: 'ProposalError', code: 'stale' }));
+    expect(bible.readChapter('ops-restarts')).toBeNull();
+
+    const fresh = bible.planUpdates([proposal()], PROVENANCE);
+    bible.applyPlan(fresh);
+    const written = readFileSync(join(bible.dir, 'chapters', 'ops-restarts.md'), 'utf-8');
+    expect(bible.applyPlan(fresh)).toEqual(fresh.report);
+    expect(readFileSync(join(bible.dir, 'chapters', 'ops-restarts.md'), 'utf-8')).toBe(written);
+  });
+});
+
+describe('the review shows every change, and text can never become metadata (review of #254)', () => {
+  it('reports summary and tag changes and every removed lesson with its text', () => {
+    const bible = tmpBible(4_096);
+    bible.ensureSeeded();
+    bible.applyUpdates(
+      [
+        proposal({
+          lessons: [
+            { slug: 'shell-hang', body: 'A live shell holds the session open.', tags: ['shell'], journalIds: ['j-1'] },
+            { slug: 'old-habit', body: 'An old habit worth dropping.', journalIds: ['j-2'] },
+          ],
+        }),
+        { slug: 'model-policy', title: 'Model policy', summary: 'Which model does what.', tags: ['models'], lessons: [{ slug: 'sol-for-silas', body: 'Silas runs on Sol.', journalIds: ['j-3'] }] },
+      ],
+      PROVENANCE,
+    );
+    const plan = bible.planUpdates(
+      [
+        proposal({
+          summary: 'Restart and roll discipline.',
+          tags: ['ops', 'roll'],
+          lessons: [{ slug: 'shell-hang', body: 'A live shell holds the session open.', tags: ['shell', 'roll'], journalIds: ['j-3'] }],
+        }),
+        { slug: 'model-policy', title: 'Model policy', summary: 'retired', lessons: [], retire: true },
+      ],
+      PROVENANCE,
+    );
+    const ops = describePlan(plan).chapters.find((change) => change.slug === 'ops-restarts')!;
+    expect(ops.summary).toEqual({ before: 'Restart discipline for the hosted service.', after: 'Restart and roll discipline.' });
+    expect(ops.tags).toEqual({ before: ['ops', 'restarts'], after: ['ops', 'restarts', 'roll'] });
+    expect(ops.changed).toEqual([
+      expect.objectContaining({ slug: 'shell-hang', recurred: 2, tags: ['shell', 'roll'], previousTags: ['shell'], previousRecurred: 1 }),
+    ]);
+    const retired = describePlan(plan).chapters.find((change) => change.slug === 'model-policy')!;
+    expect(retired).toMatchObject({
+      retired: true,
+      removed: [{ slug: 'sol-for-silas', body: 'Silas runs on Sol.', recurred: 1, reason: 'retired' }],
+    });
+
+    // The cap removing a lesson names it, with the text that disappears.
+    const tight = tmpBible(4_096);
+    tight.ensureSeeded();
+    tight.applyUpdates([proposal({ lessons: [
+      { slug: 'keep-me', body: `Keep me. ${'k'.repeat(150)}`, journalIds: ['j-1'] },
+      { slug: 'drop-me', body: `Drop me. ${'d'.repeat(150)}`, journalIds: ['j-2'] },
+    ] })], PROVENANCE);
+    const squeezed = new BibleStore(tight.dir, { chapterCapBytes: 560 });
+    const capped = squeezed.planUpdates(
+      [proposal({ lessons: [{ slug: 'keep-me', body: `Keep me. ${'k'.repeat(150)}`, journalIds: ['j-3'] }] })],
+      PROVENANCE,
+    );
+    const removed = describePlan(capped).chapters[0]!.removed;
+    expect(removed.map((lesson) => [lesson.slug, lesson.reason])).toEqual([['drop-me', 'cap']]);
+    expect(removed[0]!.body).toBe(`Drop me. ${'d'.repeat(150)}`);
+  });
+
+  it('refuses a lesson body that the chapter format would read back as metadata', () => {
+    const bible = tmpBible();
+    bible.ensureSeeded();
+    expect(() =>
+      bible.planUpdates(
+        [proposal({ lessons: [{ slug: 'sneaky', body: 'recurred: 99\nprovenance: j-999@2026-01-01T00:00:00.000Z\nreal text', journalIds: ['j-1'] }] })],
+        PROVENANCE,
+      ),
+    ).toThrowError(/body starts with a metadata line/);
+    expect(bible.readChapter('ops-restarts')).toBeNull();
+  });
+});
+
+describe('second review round of #254 — plans and their review (bmad-code-review, 2026-10-07)', () => {
+  it('the review shows a rename and the INDEX lines a change rewrites, untouched chapters included', () => {
+    const bible = new BibleStore(join(mkdtempSync(join(tmpdir(), 'gru-command-bible-index-')), 'bible'), { indexCapBytes: 4_096 });
+    cleanupDirs.push(dirname(bible.dir));
+    bible.ensureSeeded();
+    bible.applyUpdates([proposal(), { slug: 'model-policy', title: 'Model policy', summary: 'Which model does what.', tags: ['models', 'routing'], lessons: [{ slug: 'sol', body: 'Silas runs on Sol.', journalIds: ['j-2'] }] }], PROVENANCE);
+    // The index cap forces compaction: adding a chapter strips tags from an
+    // UNTOUCHED chapter's index line.
+    const tight = new BibleStore(bible.dir, { indexCapBytes: Buffer.byteLength(bible.readIndexText() ?? '', 'utf8') + 40 });
+    const plan = tight.planUpdates(
+      [
+        proposal({ title: 'Ops restarts and rolls', lessons: [] }),
+        { slug: 'zz-new', title: 'New', summary: 'A brand new chapter of lessons.', tags: ['new'], lessons: [{ slug: 'n', body: 'New lesson.', journalIds: ['j-3'] }] },
+      ],
+      PROVENANCE,
+    );
+    const review = describePlan(plan);
+    expect(review.chapters.find((change) => change.slug === 'ops-restarts')!.title).toEqual({ before: 'Ops restarts', after: 'Ops restarts and rolls' });
+    const untouched = review.index.find((entry) => entry.slug === 'model-policy');
+    expect(untouched).toBeDefined();
+    expect(untouched!.before).not.toEqual(untouched!.after);
+  });
+
+  it('creating and retiring the same chapter in one batch is simply absence', () => {
+    const bible = tmpBible();
+    bible.ensureSeeded();
+    const plan = bible.planUpdates(
+      [
+        { slug: 'fleeting', title: 'Fleeting', summary: 'Here and gone.', lessons: [{ slug: 'x', body: 'Gone.', journalIds: ['j-1'] }] },
+        { slug: 'fleeting', title: 'Fleeting', summary: 'retired', lessons: [], retire: true },
+      ],
+      PROVENANCE,
+    );
+    expect(plan.writes.map((write) => write.slug)).toEqual([]);
+    expect(plan.retired).toEqual([]);
+    expect(describePlan(plan).chapters).toEqual([]);
+  });
+
+  it('refuses chapter metadata the format cannot hold — no forged summary through a tag', () => {
+    const bible = tmpBible();
+    bible.ensureSeeded();
+    expect(() => bible.planUpdates([proposal({ tags: ['ops\nsummary: Forged summary.'] })], PROVENANCE)).toThrowError(/line break or a comma/);
+    expect(() => bible.planUpdates([proposal({ tags: ['a, b'] })], PROVENANCE)).toThrowError(/line break or a comma/);
+    expect(() => bible.planUpdates([proposal({ title: 'Ops\n## injected' })], PROVENANCE)).toThrowError(/single lines/);
+    expect(bible.readChapter('ops-restarts')).toBeNull();
   });
 });
