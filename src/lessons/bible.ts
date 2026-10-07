@@ -1,15 +1,12 @@
-import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
 import {
   existsSync,
-  linkSync,
-  lstatSync,
   mkdirSync,
   readFileSync,
   readdirSync,
   renameSync,
   rmSync,
-  unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
@@ -50,122 +47,37 @@ export const BIBLE_README_FILE = 'README.md';
 export const BIBLE_CHAPTERS_DIR = 'chapters';
 export const DEFAULT_CHAPTER_CAP_BYTES = 4_096;
 export const DEFAULT_INDEX_CAP_BYTES = 1_024;
-/** Cross-process write lock shared by the dream's apply and the repair. */
-export const BIBLE_WRITE_LOCK = '.write.lock';
+/** Cross-process write lock shared by the dream's apply and the repair: an
+ * exclusive SQLite transaction on this file (owner decision 2026-10-07). */
+export const BIBLE_WRITE_LOCK = '.write.lock.sqlite';
+/** Who holds the lock, for the contention message (best effort). */
+export const BIBLE_WRITE_LOCK_HOLDER = '.write.lock.holder';
+/** Files only a book in use has (the dream cursor, a pending proposal). */
+const BOOK_STATE_FILES = ['.dream-state.json', '.proposal.json'] as const;
 
+/** Who holds the write lock (informational — for the contention message
+ * only; the lock itself is the SQLite transaction). */
 interface LockHolder {
   readonly pid: number;
-  /** The holder's process start identity (owner decision 2026-10-07, D2):
-   * a PID now owned by a different process — after a crash or reboot — is
-   * a dead holder. Null for a lock written by an older version (PID only). */
-  readonly identity: string | null;
-  readonly token: string;
   readonly action: string;
   readonly at: string;
 }
 
-function readLockHolder(lock: string): LockHolder | null {
+function readLockHolder(file: string): LockHolder | null {
   try {
-    const parsed = JSON.parse(readFileSync(lock, 'utf-8')) as Record<string, unknown>;
-    return typeof parsed['pid'] === 'number' && Number.isSafeInteger(parsed['pid']) && parsed['pid'] > 0
-      ? {
-        pid: parsed['pid'],
-        identity: typeof parsed['identity'] === 'string' && parsed['identity'] !== '' ? parsed['identity'] : null,
-        token: String(parsed['token'] ?? ''),
-        action: String(parsed['action'] ?? 'unknown'),
-        at: String(parsed['at'] ?? 'unknown'),
-      }
+    const parsed = JSON.parse(readFileSync(file, 'utf-8')) as Record<string, unknown>;
+    return typeof parsed['pid'] === 'number'
+      ? { pid: parsed['pid'], action: String(parsed['action'] ?? 'unknown'), at: String(parsed['at'] ?? 'unknown') }
       : null;
   } catch {
     return null;
   }
 }
 
-function pidAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === 'EPERM';
-  }
-}
-
-/** A process's start identity, stable for its lifetime and different for
- * any later process given the same PID: Linux — boot id plus start time in
- * clock ticks (/proc); macOS — its start time (ps lstart, C locale). Null
- * when it cannot be read. Tests replace it through setProcessIdentityReader. */
-function readProcessIdentity(pid: number): string | null {
-  try {
-    if (process.platform === 'linux') {
-      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
-      // Fields after "(comm)" start at field 3; starttime is field 22.
-      const start = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19];
-      const boot = readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
-      return start === undefined || boot === '' ? null : `linux:${boot}:${start}`;
-    }
-    if (process.platform === 'darwin') {
-      const started = execFileSync('/bin/ps', ['-o', 'lstart=', '-p', String(pid)], {
-        encoding: 'utf8',
-        timeout: 2_000,
-        env: { ...process.env, LC_ALL: 'C' },
-        stdio: ['ignore', 'pipe', 'ignore'],
-      }).trim();
-      return started === '' ? null : `darwin:${started}`;
-    }
-  } catch {
-    /* unknown */
-  }
-  return null;
-}
-
-let processIdentity: (pid: number) => string | null = readProcessIdentity;
-let ownIdentity: { readonly value: string | null } | null = null;
-
-/** Test seam: replace how a process's start identity is read. */
-export function setProcessIdentityReader(reader: ((pid: number) => string | null) | null): void {
-  processIdentity = reader ?? readProcessIdentity;
-  ownIdentity = null;
-}
-
-function myIdentity(): string | null {
-  ownIdentity ??= { value: processIdentity(process.pid) };
-  return ownIdentity.value;
-}
-
-/** Tokens of the locks and reclaim gates THIS process holds right now. */
-const HELD_TOKENS = new Set<string>();
-
-/** Is the recorded holder still the live process that wrote it? This
- * process's own record counts only while it actually holds it (a release
- * that failed to remove the file leaves a record nobody holds); another
- * PID counts unless it is gone or now belongs to a different process. An
- * identity that cannot be read keeps the holder (never steal a live lock). */
-function holderAlive(holder: LockHolder): boolean {
-  if (holder.pid === process.pid) return HELD_TOKENS.has(holder.token);
-  if (!pidAlive(holder.pid)) return false;
-  if (holder.identity === null) return true;
-  const current = processIdentity(holder.pid);
-  return current === null || current === holder.identity;
-}
-
-/** A reclaim holds its gate only for a few synchronous steps; a gate older
- * than this is abandoned whoever wrote it (owner decision 2026-10-07, D1). */
-export const RECLAIM_GATE_STALE_MS = 30_000;
-
-/** A lock or gate record: who holds it, from when, and its token. */
-function lockRecord(token: string, action: string): string {
-  return JSON.stringify({ pid: process.pid, identity: myIdentity(), token, action, at: new Date().toISOString() });
-}
-
-/** Hard-link `staging` to `target` — false when `target` exists. */
-function linkExclusive(staging: string, target: string, what: string): boolean {
-  try {
-    linkSync(staging, target);
-    return true;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'EEXIST') return false;
-    throw new BibleError(`cannot take ${what}: ${String(error)}`);
-  }
+/** SQLITE_BUSY: another connection holds the lock. */
+function sqliteBusy(error: unknown): boolean {
+  const failed = error as { errcode?: unknown; message?: unknown } | null;
+  return failed?.errcode === 5 || (typeof failed?.message === 'string' && /database is locked/u.test(failed.message));
 }
 
 /** Below this a lesson body is "trimmed to the bone" — cap enforcement
@@ -353,8 +265,9 @@ export interface BiblePlan {
   readonly writes: readonly { readonly slug: string; readonly text: string; readonly uncapped: BibleChapter }[];
   readonly retired: readonly string[];
   readonly indexText: string;
-  /** The chapter cap the plan was computed with. */
+  /** The chapter and INDEX caps the plan was computed with. */
   readonly chapterCapBytes: number;
+  readonly indexCapBytes: number;
   readonly report: ApplyReport;
 }
 
@@ -394,10 +307,24 @@ export class BibleStore {
   /** Create the bible tree and seed README + empty index. Existing files
    * are never overwritten — user content is theirs. */
   ensureSeeded(): void {
+    const index = join(this.dir, BIBLE_INDEX_FILE);
+    if (!existsSync(index)) {
+      // Only a pristine book is seeded. A book that already has chapters, a
+      // dream cursor or a proposal but lost INDEX.md is damaged: recreating
+      // an empty index would change it without the owner's approval and
+      // hide the loss — fail loud instead.
+      const chapters = existsSync(this.chaptersDir) && readdirSync(this.chaptersDir).some((name) => name.endsWith('.md'));
+      const state = BOOK_STATE_FILES.filter((name) => existsSync(join(this.dir, name)));
+      if (chapters || state.length > 0) {
+        throw new BibleError(
+          `the Book of Lessons at ${this.dir} has ${chapters ? 'chapters' : state.join(', ')} but no ${BIBLE_INDEX_FILE} — ` +
+            'restore it from a backup (or move the book aside to start fresh); nothing was created',
+        );
+      }
+    }
     mkdirSync(this.chaptersDir, { recursive: true, mode: 0o700 });
     const readme = join(this.dir, BIBLE_README_FILE);
     if (!existsSync(readme)) this.writeAtomic(readme, BIBLE_README);
-    const index = join(this.dir, BIBLE_INDEX_FILE);
     if (!existsSync(index)) this.writeAtomic(index, renderIndex([], this.indexCapBytes));
   }
 
@@ -565,24 +492,58 @@ export class BibleStore {
   }
 
   /**
-   * The book's cross-process write lock (`.write.lock`): the dream's apply
-   * and the owner's repair both hold it across their reads and writes, so
-   * neither can overwrite the other's result. Contention fails loud; a lock
-   * left by a dead process is taken over with a warning.
+   * The book's cross-process write lock (owner decision 2026-10-07): an
+   * EXCLUSIVE transaction on a small SQLite file. The dream's apply and the
+   * owner's repair both hold it across their reads and writes, so neither
+   * can overwrite the other's result. The OS releases it when its process
+   * ends, however it ends — a stale lock cannot exist, so there is nothing
+   * to reclaim and no PID to trust. Contention fails loud at once.
    */
   private withWriteLock<T>(action: string, fn: () => T): T {
     mkdirSync(this.dir, { recursive: true, mode: 0o700 });
     const lock = join(this.dir, BIBLE_WRITE_LOCK);
-    const token = randomUUID();
-    this.acquireLock(lock, token, action);
+    const holderFile = join(this.dir, BIBLE_WRITE_LOCK_HOLDER);
+    let db: DatabaseSync;
+    try {
+      db = new DatabaseSync(lock);
+    } catch (error) {
+      throw new BibleError(`cannot open the book write lock ${lock}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    try {
+      db.exec('PRAGMA busy_timeout = 0');
+      db.exec('BEGIN EXCLUSIVE');
+    } catch (error) {
+      db.close();
+      if (!sqliteBusy(error)) {
+        throw new BibleError(`cannot take the book write lock ${lock}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      const holder = readLockHolder(holderFile);
+      throw new BibleError(
+        holder === null
+          ? 'the Book of Lessons is being written by another process; retry when it finishes'
+          : `the Book of Lessons is being written by pid ${holder.pid} (${holder.action}, since ${holder.at}); retry when it finishes`,
+      );
+    }
+    const release = (): void => {
+      try {
+        db.exec('ROLLBACK');
+      } finally {
+        db.close(); // closing the connection releases the lock, even if the rollback failed
+      }
+    };
     let result: T;
     try {
+      try {
+        writeFileSync(holderFile, JSON.stringify({ pid: process.pid, action, at: new Date().toISOString() }), { mode: 0o600 });
+      } catch {
+        /* informational only */
+      }
       result = fn();
     } catch (error) {
       try {
-        this.releaseLock(lock, token);
-      } catch (release) {
-        this.log('warn', 'bible write lock release failed after an error', { lock, error: String(release) });
+        release();
+      } catch (failure) {
+        this.log('warn', 'bible write lock release failed after an error', { lock, error: String(failure) });
       }
       throw error;
     }
@@ -590,146 +551,15 @@ export class BibleStore {
     // — and it carries the completed result, so a caller can tell "written,
     // cleanup failed" from "not written".
     try {
-      this.releaseLock(lock, token);
+      release();
     } catch (error) {
       throw new BibleLockReleaseError(
-        `${action} completed, but releasing the book write lock ${lock} failed: ${error instanceof Error ? error.message : String(error)}`,
+        `${action} completed, but releasing the book write lock ${lock} failed: ${error instanceof Error ? error.message : String(error)} ` +
+          '(the lock is released when this process ends)',
         result,
       );
     }
     return result;
-  }
-
-  /** Create the lock COMPLETE in one atomic step (a hard link of a fully
-   * written temp file), so no reader ever sees a half-written lock and no
-   * descriptor can leak. A dead holder's lock is replaced only under an
-   * exclusive reclaim gate, after re-reading it there — two processes can
-   * never both reclaim and both write. */
-  private acquireLock(lock: string, token: string, action: string): void {
-    const staging = `${lock}.${token}`;
-    let published = false;
-    try {
-      writeFileSync(staging, lockRecord(token, action), { mode: 0o600, flag: 'wx' });
-      this.publishLock(lock, staging);
-      published = true;
-      HELD_TOKENS.add(token);
-      rmSync(staging, { force: true });
-    } catch (error) {
-      // Nothing of this attempt may outlive it: not its staging file, and
-      // not a lock it published — the primary error is what surfaces.
-      try {
-        rmSync(staging, { force: true });
-      } catch {
-        /* the primary error wins */
-      }
-      if (published) {
-        try {
-          this.releaseLock(lock, token);
-        } catch {
-          /* the primary error wins */
-        }
-      }
-      throw error;
-    }
-  }
-
-  /** Publish the staged lock: a hard link when the book is free, or —
-   * when the holder is dead — an atomic replace under the reclaim gate. */
-  private publishLock(lock: string, staging: string): void {
-    if (linkExclusive(staging, lock, `the book write lock ${lock}`)) return;
-    const contention = (holder: LockHolder | null): BibleError =>
-      new BibleError(
-        holder === null
-          ? `the Book of Lessons write lock ${lock} is unreadable; if no dream or repair is running, remove it and retry`
-          : `the Book of Lessons is being written by pid ${holder.pid} (${holder.action}, since ${holder.at}); retry when it finishes`,
-      );
-    const seen = readLockHolder(lock);
-    if (seen === null || holderAlive(seen)) throw contention(seen);
-    this.underReclaimGate(lock, () => {
-      const holder = readLockHolder(lock);
-      if (holder === null || holder.token !== seen.token || holderAlive(holder)) throw contention(holder);
-      this.log('warn', 'bible write lock left by a dead process — taking it over', {
-        lock,
-        holder_pid: holder.pid,
-        holder_action: holder.action,
-      });
-      renameSync(staging, lock); // atomic replace, under the gate
-    });
-  }
-
-  /** Run `fn` holding the reclaim gate (`<lock>.reclaim`), so two
-   * processes can never both replace a dead holder's lock. The gate is
-   * self-healing: a gate whose holder is dead, or older than
-   * RECLAIM_GATE_STALE_MS (a reclaim holds it for milliseconds), is broken
-   * — moved aside, confirmed to be that same gate, then removed — so a
-   * process killed mid-reclaim never blocks the book for good. */
-  private underReclaimGate(lock: string, fn: () => void): void {
-    const gate = `${lock}.reclaim`;
-    const token = randomUUID();
-    const staging = `${gate}.${token}`;
-    const busy = (): BibleError => new BibleError(`another process is reclaiming the Book of Lessons write lock ${lock}; retry`);
-    try {
-      writeFileSync(staging, lockRecord(token, 'reclaim'), { mode: 0o600, flag: 'wx' });
-      if (!linkExclusive(staging, gate, `the reclaim gate ${gate}`)) {
-        if (!this.breakAbandonedGate(gate)) throw busy();
-        if (!linkExclusive(staging, gate, `the reclaim gate ${gate}`)) throw busy();
-      }
-      HELD_TOKENS.add(token);
-    } finally {
-      rmSync(staging, { force: true });
-    }
-    try {
-      fn();
-    } finally {
-      HELD_TOKENS.delete(token);
-      if (readLockHolder(gate)?.token === token) unlinkSync(gate);
-    }
-  }
-
-  /** Remove the reclaim gate if — and only if — it is abandoned. True when
-   * the gate is gone afterwards. */
-  private breakAbandonedGate(gate: string): boolean {
-    let judged: ReturnType<typeof lstatSync>;
-    try {
-      judged = lstatSync(gate);
-    } catch {
-      return true; // already gone
-    }
-    const holder = readLockHolder(gate);
-    const old = Date.now() - judged.mtimeMs > RECLAIM_GATE_STALE_MS;
-    if (!old && (holder === null || holderAlive(holder))) return false;
-    const parked = `${gate}.abandoned-${randomUUID()}`;
-    try {
-      renameSync(gate, parked);
-    } catch {
-      return true; // someone else broke it first
-    }
-    if (lstatSync(parked).ino === judged.ino) {
-      this.log('warn', 'bible reclaim gate left by a dead or stalled process — removed', {
-        gate,
-        holder_pid: holder?.pid ?? null,
-      });
-      rmSync(parked, { recursive: true, force: true });
-      return true;
-    }
-    // A newer gate was moved by mistake: put it back (a link never
-    // clobbers a gate made meanwhile), then let the caller retry later.
-    try {
-      linkSync(parked, gate);
-    } catch {
-      /* a gate exists again — whoever holds it carries on */
-    }
-    rmSync(parked, { recursive: true, force: true });
-    return false;
-  }
-
-  /** Release only THIS acquisition's lock — never one another process now holds. */
-  private releaseLock(lock: string, token: string): void {
-    // Not held from here on, even if removing the file fails: the record
-    // left behind is then reclaimable rather than a lock nobody releases.
-    HELD_TOKENS.delete(token);
-    const holder = readLockHolder(lock);
-    if (holder?.token === token) unlinkSync(lock);
   }
 
   /**
@@ -758,9 +588,10 @@ export class BibleStore {
     let lessonsDropped = 0;
 
     for (const proposed of updates) {
-      validateProposedChapter(proposed);
-      // Canonical before planning: what the chapter format will read back.
+      // Canonical first — what the chapter format will read back — then
+      // validated, so nothing (a CR-hidden heading) slips past as text.
       const update = normalizeProposedChapter(proposed);
+      validateProposedChapter(update);
       if (update.retire === true) {
         // Retiring a chapter created earlier in this same batch is net
         // absence: nothing to retire from the book.
@@ -823,6 +654,7 @@ export class BibleStore {
       retired: [...retired],
       indexText,
       chapterCapBytes: this.chapterCapBytes,
+      indexCapBytes: this.indexCapBytes,
       report: {
         chaptersWritten: writes.length,
         chaptersRetired: retired.size,
@@ -885,6 +717,14 @@ export class BibleStore {
   /** The current book's fingerprint (what a plan's `base` is compared to). */
   fingerprint(): string {
     return bookFingerprint(this.snapshotFiles());
+  }
+
+  /** Every managed path that differs from the plan's reviewed baseline
+   * (`baselineOnly`) — or from both its baseline and its result — named as
+   * changed, added or deleted. */
+  driftFrom(plan: BiblePlan, baselineOnly: boolean): string[] {
+    const verified = verifyPlan(plan);
+    return unexpectedPaths(this.snapshotFiles(), verified.baseline, baselineOnly ? verified.baseline : verified.result);
   }
 
   /** Plan and write in one step — tests and owner-run tooling only; the
@@ -1002,11 +842,21 @@ function verifyPlan(plan: BiblePlan): VerifiedPlan {
     fail('its report does not match its writes');
   }
   if (!Number.isSafeInteger(plan.chapterCapBytes) || plan.chapterCapBytes <= 0) fail('its chapter cap');
+  if (!Number.isSafeInteger(plan.indexCapBytes) || plan.indexCapBytes <= 0) fail('its index cap');
   for (const write of plan.writes) {
     assertChapterModel(write.uncapped, write.slug);
     const capped = enforceChapterCap(write.uncapped, plan.chapterCapBytes);
     if (capped.text !== write.text) fail(`chapter ${write.slug} is not what the cap makes of its merged chapter`);
+    if (!utf8Exact(write.text)) fail(`chapter ${write.slug} would not survive UTF-8 unchanged`);
     assertReadsBack(write.text, capped.chapter);
+  }
+  // INDEX.md is exactly the index of the book the plan produces — so it can
+  // carry nothing the review does not show.
+  const resultChapters = [...result.entries()]
+    .filter(([path]) => path.startsWith(`${BIBLE_CHAPTERS_DIR}/`) && path.endsWith('.md'))
+    .map(([path, text]) => parseChapter(text, path.slice(BIBLE_CHAPTERS_DIR.length + 1, -'.md'.length)));
+  if (!utf8Exact(plan.indexText) || renderIndex(resultChapters, plan.indexCapBytes) !== plan.indexText) {
+    fail('its INDEX.md is not the index of the book it produces');
   }
   return { content, baseline, result };
 }
@@ -1186,8 +1036,9 @@ function describeChapterChange(before: BibleChapter | null, uncapped: BibleChapt
 }
 
 /** A proposed chapter in the form the chapter format reads back: trimmed
- * title, trimmed and de-duplicated tags, LF line endings in bodies. Run
- * after validation (which keeps the injection guards strict). */
+ * title, trimmed and de-duplicated tags, LF line endings in bodies (CRLF
+ * and bare CR alike). Validation runs on the result, so the injection
+ * guards see exactly what will be written. */
 function normalizeProposedChapter(update: ProposedChapter): ProposedChapter {
   const tags = (list: readonly string[]) => [...new Set(list.map((tag) => tag.trim()))];
   return {
@@ -1196,7 +1047,7 @@ function normalizeProposedChapter(update: ProposedChapter): ProposedChapter {
     ...(update.tags !== undefined ? { tags: tags(update.tags) } : {}),
     lessons: update.lessons.map((lesson) => ({
       ...lesson,
-      body: lesson.body.replace(/\r\n/gu, '\n').trim(),
+      body: lesson.body.replace(/\r\n?/gu, '\n').trim(),
       ...(lesson.tags !== undefined ? { tags: tags(lesson.tags) } : {}),
     })),
   };
@@ -1205,6 +1056,19 @@ function normalizeProposedChapter(update: ProposedChapter): ProposedChapter {
 // ------------------------------------------------------------------
 // Chapter serialization / parsing (the pinned format)
 // ------------------------------------------------------------------
+
+/** At most `length` UTF-16 units of `text`, never ending inside a
+ * surrogate pair. */
+function safeSlice(text: string, length: number): string {
+  if (length >= text.length) return text;
+  const last = text.charCodeAt(length - 1);
+  return text.slice(0, last >= 0xd800 && last <= 0xdbff ? length - 1 : length);
+}
+
+/** Text that survives a UTF-8 round trip unchanged (no lone surrogates). */
+function utf8Exact(text: string): boolean {
+  return Buffer.from(text, 'utf8').toString('utf8') === text;
+}
 
 function collapseLine(text: string): string {
   return text.replace(/\s+/gu, ' ').trim();
@@ -1265,6 +1129,11 @@ export function parseChapter(text: string, slug: string): BibleChapter {
       const sectionSlug = line.slice(3).trim();
       if (!isLessonsSlug(sectionSlug)) {
         throw new BibleError(`chapter ${slug}.md has an invalid lesson anchor: ${JSON.stringify(sectionSlug)}`);
+      }
+      if (sections.some((section) => section.slug === sectionSlug)) {
+        // Two lessons on one anchor cannot be told apart — every merge,
+        // review and repair would pick one arbitrarily.
+        throw new BibleError(`chapter ${slug}.md has more than one lesson anchored "## ${sectionSlug}" — fix it by hand`);
       }
       current = { slug: sectionSlug, lines: [] };
       sections.push(current);
@@ -1448,10 +1317,10 @@ function resolveDamagedProvenance(
       if (ts === undefined) {
         throw new BibleError(`${where} cites journal id ${id}, which is not in the journal — refusing to invent provenance`);
       }
-      if (Number.isNaN(Date.parse(ts))) {
+      if (parseIsoInstant(ts) === null) {
         throw new BibleError(`the journal records ${id} at an invalid timestamp ${JSON.stringify(ts)} — fix the journal first`);
       }
-      if (match[2] !== undefined && Date.parse(match[2]) !== Date.parse(ts)) {
+      if (match[2] !== undefined && compareIsoInstants(match[2], ts) !== 0) {
         throw new BibleError(`${where} cites ${id}@${match[2]}, but the journal records ${id} at ${ts}`);
       }
       refs.push({ id, ts });
@@ -1459,7 +1328,7 @@ function resolveDamagedProvenance(
       continue;
     }
     if (bareId !== null && ISO_TIMESTAMP.test(fragment)) {
-      if (Date.parse(fragment) !== Date.parse(journalTs.get(bareId) ?? '')) {
+      if (compareIsoInstants(fragment, journalTs.get(bareId) ?? '') !== 0) {
         throw new BibleError(`${where} cites ${bareId},${fragment}, but the journal records ${bareId} at ${journalTs.get(bareId)}`);
       }
       bareId = null;
@@ -1571,16 +1440,21 @@ function renderCappedInPlace(text: string, capped: BibleChapter): string | null 
     const meta = section.meta.map((line) =>
       LESSON_META_LINE.exec(line.text)?.[1] === 'provenance' ? { text: provenanceLine(lesson.provenance), eol: line.eol } : line,
     );
+    if (lesson.provenance.length > 0 && !section.meta.some((line) => LESSON_META_LINE.exec(line.text)?.[1] === 'provenance')) {
+      // A section without a provenance line (an uncited archive record) that
+      // now receives handles gets one, right after its last metadata line.
+      let last = -1;
+      meta.forEach((line, index) => {
+        if (LESSON_META_LINE.test(line.text)) last = index;
+      });
+      meta.splice(last + 1, 0, { text: provenanceLine(lesson.provenance), eol: meta[last]?.eol || eol });
+    }
     const originalBody = section.body.map((line) => line.text).join('\n').trim();
     let body = section.body;
     if (originalBody !== lesson.body) {
-      let trailing = 0;
-      while (trailing < section.body.length && section.body[section.body.length - 1 - trailing]!.text.trim() === '') trailing += 1;
-      // The parsed body starts at its first non-blank character; the file's
-      // first body line keeps its own indentation, so an indented line that
-      // reads like metadata stays body text.
-      const indent = /^[ \t]*/u.exec(section.body[0]?.text ?? '')![0];
-      body = [...lines(`${indent}${lesson.body.trim()}`), ...section.body.slice(section.body.length - trailing)];
+      const edited = trimmedBodyLines(section.body, lesson.body);
+      if (edited === null) return null; // not a suffix trim — never rewrite text
+      body = edited;
     }
     out.push({ ...section, meta, body });
   }
@@ -1593,6 +1467,30 @@ function renderCappedInPlace(text: string, capped: BibleChapter): string | null 
   } catch {
     return null;
   }
+}
+
+/** A body trimmed by the cap, edited in place: every retained line keeps
+ * its exact bytes and line ending; only the cut line changes (its prefix
+ * plus the trim marker) and the lines after it go. The first line keeps
+ * its indentation, so an indented line that reads like metadata stays body
+ * text. Null when `trimmed` is not a suffix trim of the file's body. */
+function trimmedBodyLines(raw: readonly RawLine[], trimmed: string): RawLine[] | null {
+  if (!trimmed.endsWith(TRIM_MARKER)) return null;
+  let trailing = 0;
+  while (trailing < raw.length && raw[raw.length - 1 - trailing]!.text.trim() === '') trailing += 1;
+  const content = raw.slice(0, raw.length - trailing);
+  const indent = /^[ \t]*/u.exec(content[0]?.text ?? '')![0];
+  const textOf = (index: number): string => (index === 0 ? content[0]!.text.slice(indent.length) : content[index]!.text);
+  const kept = trimmed.slice(0, -TRIM_MARKER.length).split('\n');
+  const cut = kept.length - 1;
+  if (cut >= content.length) return null;
+  for (let index = 0; index < cut; index += 1) if (textOf(index) !== kept[index]) return null;
+  if (!textOf(cut).startsWith(kept[cut]!)) return null;
+  return [
+    ...content.slice(0, cut),
+    { text: `${cut === 0 ? indent : ''}${kept[cut]}${TRIM_MARKER}`, eol: content[cut]!.eol },
+    ...raw.slice(raw.length - trailing),
+  ];
 }
 
 /** The capped chapter written into the file in place — or a refusal: the
@@ -1663,7 +1561,7 @@ export function renderIndex(
     for (const chapter of sorted) {
       let summary = collapseLine(chapter.summary);
       if (summaryBudget !== null && summary.length > summaryBudget) {
-        summary = `${summary.slice(0, Math.max(1, summaryBudget - 1))}…`;
+        summary = `${safeSlice(summary, Math.max(1, summaryBudget - 1))}…`;
       }
       const tags = includeTags && chapter.tags.length > 0 ? ` (tags: ${chapter.tags.join(', ')})` : '';
       lines.push(`- [${chapter.slug}](chapters/${chapter.slug}.md) — ${summary}${tags}`);
@@ -1813,7 +1711,7 @@ function applyLessonUpdates(
     chapter: {
       slug: chapter.slug,
       title: update.title,
-      summary: collapseLine(update.summary).slice(0, 160),
+      summary: safeSlice(collapseLine(update.summary), 160),
       tags: unionTags(chapter.tags, update.tags),
       lessons,
     },
@@ -1822,15 +1720,48 @@ function applyLessonUpdates(
   };
 }
 
+const ISO_INSTANT = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})$/u;
+
+/** An ISO-8601 instant with a real calendar date and time — any offset,
+ * any fractional precision — as whole UTC seconds plus its fraction digits
+ * (trailing zeros dropped). Null for anything else, including dates
+ * Date.parse would silently normalize (2026-02-30). */
+export function parseIsoInstant(ts: string): { readonly seconds: number; readonly fraction: string } | null {
+  const match = ISO_INSTANT.exec(ts);
+  if (match === null) return null;
+  const [year, month, day, hour, minute, second] = match.slice(1, 7).map(Number) as [number, number, number, number, number, number];
+  const days = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  if (month < 1 || month > 12 || day < 1 || day > days || hour > 23 || minute > 59 || second > 59) return null;
+  let offset = 0;
+  const zone = match[8]!;
+  if (zone !== 'Z') {
+    const hours = Number(zone.slice(1, 3));
+    const minutes = Number(zone.slice(4, 6));
+    if (hours > 23 || minutes > 59) return null;
+    offset = (zone[0] === '-' ? -1 : 1) * (hours * 60 + minutes) * 60;
+  }
+  return { seconds: Date.UTC(year, month - 1, day, hour, minute, second) / 1000 - offset, fraction: (match[7] ?? '').replace(/0+$/u, '') };
+}
+
+/** Order two ISO instants without losing precision (no millisecond
+ * truncation): negative, zero or positive; null when either is invalid. */
+export function compareIsoInstants(left: string, right: string): number | null {
+  const a = parseIsoInstant(left);
+  const b = parseIsoInstant(right);
+  if (a === null || b === null) return null;
+  if (a.seconds !== b.seconds) return a.seconds - b.seconds;
+  const width = Math.max(a.fraction.length, b.fraction.length);
+  return a.fraction.padEnd(width, '0').localeCompare(b.fraction.padEnd(width, '0'));
+}
+
 /** The shared chronological order for journal handles: timestamp, then
  * the numeric journal sequence (`j-<seq>`), so equal timestamps never fall
  * back to insertion order. Oldest first. */
 export function compareProvenance(left: ProvenanceRef, right: ProvenanceRef): number {
-  const leftAt = Date.parse(left.ts);
-  const rightAt = Date.parse(right.ts);
-  // Instants, not spellings: "01:00+02:00" precedes "00:00Z", and equal
-  // instants written differently tie, falling to the journal sequence.
-  const byInstant = Number.isNaN(leftAt) || Number.isNaN(rightAt) ? left.ts.localeCompare(right.ts) : leftAt - rightAt;
+  // Instants, not spellings and not milliseconds: "01:00+02:00" precedes
+  // "00:00Z", .0001Z precedes .0002Z, and equal instants written
+  // differently tie, falling to the journal sequence.
+  const byInstant = compareIsoInstants(left.ts, right.ts) ?? left.ts.localeCompare(right.ts);
   return byInstant || journalSeq(left.id) - journalSeq(right.id) || left.id.localeCompare(right.id);
 }
 
@@ -1919,11 +1850,11 @@ export function enforceChapterCap(
     if (longest !== -1) {
       const lesson = lessons[longest]!;
       const body = untrimmed(lesson.body);
-      let nextLength = Math.max(MIN_LESSON_BODY_CHARS, body.length - (size - capBytes) - TRIM_MARKER.length);
-      // Never split a surrogate pair: the cut lands on a code-point boundary.
-      const last = body.charCodeAt(nextLength - 1);
-      if (last >= 0xd800 && last <= 0xdbff) nextLength -= 1;
-      lessons[longest] = { ...lesson, body: `${body.slice(0, nextLength).trimEnd()}${TRIM_MARKER}` };
+      // Bytes, not characters: keep the longest code-point prefix the
+      // overshoot allows (the marker included), never below the floor.
+      const allowed = Buffer.byteLength(lesson.body, 'utf8') - (size - capBytes) - Buffer.byteLength(TRIM_MARKER, 'utf8');
+      const cut = Math.max(prefixWithinBytes(body, allowed), safeSlice(body, MIN_LESSON_BODY_CHARS).length);
+      lessons[longest] = { ...lesson, body: `${body.slice(0, cut).trimEnd()}${TRIM_MARKER}` };
       trimmed += 1;
       size = serialized();
       return true;
@@ -1965,6 +1896,20 @@ export function enforceChapterCap(
     );
   }
   return { chapter: { ...chapter, lessons }, text, provenanceTrimmed, trimmed, droppedLessons, droppedProvenance };
+}
+
+/** UTF-16 length of the longest code-point prefix of `text` that fits in
+ * `maxBytes` of UTF-8. */
+function prefixWithinBytes(text: string, maxBytes: number): number {
+  let bytes = 0;
+  let length = 0;
+  for (const char of text) {
+    const size = Buffer.byteLength(char, 'utf8');
+    if (bytes + size > maxBytes) break;
+    bytes += size;
+    length += char.length;
+  }
+  return length;
 }
 
 /** A body without the cap's trim marker, so a re-trim never stacks markers. */

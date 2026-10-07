@@ -667,7 +667,8 @@ export function isValidLessonProposal(value: unknown): value is LessonProposalVi
       isRecord(entry) &&
       typeof entry.slug === 'string' &&
       (entry.before === null || isIndexEntry(entry.before)) &&
-      (entry.after === null || isIndexEntry(entry.after)));
+      (entry.after === null || isIndexEntry(entry.after)) &&
+      (entry.before !== null || entry.after !== null));
 }
 
 function isIndexEntry(value: unknown): boolean {

@@ -560,7 +560,14 @@ async function main(): Promise<number> {
     indexCapBytes: config.lessons.indexCapBytes,
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
-  bible.ensureSeeded();
+  // A pristine book is seeded; a damaged one (chapters or state but no
+  // INDEX.md) is never silently recreated — logged here, and every dream
+  // pass fails loudly on it (an action-required incident).
+  try {
+    bible.ensureSeeded();
+  } catch (error) {
+    logger.log('error', 'the Book of Lessons is damaged — not seeded', { error: String(error) });
+  }
   const lessonReferences = createBibleReferences({
     bible,
     maxReferences: config.lessons.maxReferences,

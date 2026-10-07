@@ -22,7 +22,7 @@
  * dream; a failed write names the replaced chapters and the backup.
  */
 import { Buffer } from 'node:buffer';
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import process from 'node:process';
@@ -53,7 +53,7 @@ try {
 } catch (error) {
   fail(`cannot load the built service (${String(error)}) — run npm run build first`);
 }
-const [{ loadConfig }, { BibleStore }, { JournalStore }] = modules;
+const [{ loadConfig }, { BibleStore, parseIsoInstant }, { JournalStore }] = modules;
 
 const config = loadConfig(process.env, homedir());
 const dataDir = resolve(config.dataDir);
@@ -83,7 +83,9 @@ for (const entry of records) {
   if (entry.id !== `j-${entry.seq}`) {
     fail(`journal entry seq ${entry.seq} is recorded as ${entry.id} — fix the journal first; nothing was written`);
   }
-  if (/[\s,@]/u.test(entry.ts) || Number.isNaN(Date.parse(entry.ts))) {
+  // A real calendar instant (Date.parse would silently turn 2026-02-30 into
+  // March 2nd); any offset or fraction precision is fine.
+  if (parseIsoInstant(entry.ts) === null) {
     fail(`journal entry ${entry.id} has an invalid timestamp ${JSON.stringify(entry.ts)} — fix the journal first; nothing was written`);
   }
   const seen = journalTs.get(entry.id);
@@ -91,6 +93,19 @@ for (const entry of records) {
     fail(`journal id ${entry.id} appears twice with different timestamps (${seen}, ${entry.ts}) — fix the journal first; nothing was written`);
   }
   journalTs.set(entry.id, entry.ts);
+}
+
+// The selected instance's book must exist: a mistyped instance must never
+// "repair" an empty, newly created book and report success.
+const chaptersDir = join(dataDir, 'bible', 'chapters');
+let chaptersStat;
+try {
+  chaptersStat = statSync(chaptersDir);
+} catch {
+  chaptersStat = null;
+}
+if (chaptersStat === null || !chaptersStat.isDirectory()) {
+  fail(`${chaptersDir} does not exist — is GRU_COMMAND_HOME (${process.env.GRU_COMMAND_HOME ?? 'unset'}) the right instance? nothing was written`);
 }
 
 const bible = new BibleStore(join(dataDir, 'bible'), {

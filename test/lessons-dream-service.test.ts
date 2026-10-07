@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { BibleStore } from '../src/lessons/bible.js';
 import { JournalStore } from '../src/lessons/journal.js';
 import { pickFreePort, startRealService } from './helpers/real-service.mjs';
 
@@ -63,6 +64,13 @@ describe('compiled service: a successful dream waits for the owner (owner decisi
     const home = mkdtempSync(join(tmpdir(), 'gru-dream-approval-home-'));
     const workspace = mkdtempSync(join(tmpdir(), 'gru-dream-approval-workspace-'));
     cleanup.push(home, workspace);
+    // An existing book: one chapter and its INDEX, written before the service starts.
+    const seeded = new BibleStore(join(home, 'bible'));
+    seeded.ensureSeeded();
+    seeded.applyUpdates(
+      [{ slug: 'model-policy', title: 'Model policy', summary: 'Which model does what.', tags: ['models'], lessons: [{ slug: 'sol', body: 'Silas runs on Sol.', journalIds: ['j-0'] }] }],
+      new Map([['j-0', '2026-10-01T00:00:00.000Z']]),
+    );
     new JournalStore(join(home, 'journal')).append({ kind: 'finding', source: 'gru', body: 'a live shell held the restart' });
     const token = 'dream-approval-token';
     const service = await startRealService({
@@ -83,7 +91,14 @@ describe('compiled service: a successful dream waits for the owner (owner decisi
       return { status: response.status, json: (await response.json()) as Record<string, unknown> };
     };
     const bibleDir = join(home, 'bible');
-    const chapters = (): string[] => (existsSync(join(bibleDir, 'chapters')) ? readdirSync(join(bibleDir, 'chapters')) : []);
+    const chapters = (): string[] => (existsSync(join(bibleDir, 'chapters')) ? readdirSync(join(bibleDir, 'chapters')).sort() : []);
+    /** Every managed byte of the book, plus the dream cursor file. */
+    const managed = (): Record<string, string | null> => ({
+      'INDEX.md': readFileSync(join(bibleDir, 'INDEX.md'), 'utf-8'),
+      ...Object.fromEntries(chapters().map((name) => [`chapters/${name}`, readFileSync(join(bibleDir, 'chapters', name), 'utf-8')])),
+      '.dream-state.json': existsSync(join(bibleDir, '.dream-state.json')) ? readFileSync(join(bibleDir, '.dream-state.json'), 'utf-8') : null,
+    });
+    const before = managed();
     const cursor = (): number =>
       existsSync(join(bibleDir, '.dream-state.json'))
         ? (JSON.parse(readFileSync(join(bibleDir, '.dream-state.json'), 'utf-8')) as { coveredThroughSeq: number }).coveredThroughSeq
@@ -97,7 +112,7 @@ describe('compiled service: a successful dream waits for the owner (owner decisi
         },
         { timeout: 20_000, interval: 250 },
       );
-      expect(chapters()).toEqual([]); // nothing written before the owner decides
+      expect(managed()).toEqual(before); // not one managed byte before the owner decides
       expect(cursor()).toBe(0);
       const reviewed = ((review['chapters'] as { added: { body: string }[] }[])[0]!.added[0]!).body;
       expect(reviewed).toBe('Close the live shell before a restart (test preload).');
@@ -110,11 +125,28 @@ describe('compiled service: a successful dream waits for the owner (owner decisi
       } finally {
         db.close();
       }
+      const plan = (JSON.parse(readFileSync(join(bibleDir, '.proposal.json'), 'utf-8')) as {
+        plan: { writes: { slug: string; text: string }[]; indexText: string };
+      }).plan;
       const accepted = await api('POST', `/api/lessons/proposal/${String(review['id'])}/accept`);
       expect(accepted.status).toBe(200);
-      expect(readFileSync(join(bibleDir, 'chapters', 'ops-restarts.md'), 'utf-8')).toContain(reviewed);
+      // Exactly the planned bytes — the new chapter and INDEX — and nothing else changed.
+      expect(chapters()).toEqual(['model-policy.md', 'ops-restarts.md']);
+      expect(plan.writes.map((write) => write.slug)).toEqual(['ops-restarts']);
+      expect(readFileSync(join(bibleDir, 'chapters', 'ops-restarts.md'), 'utf-8')).toBe(plan.writes[0]!.text);
+      expect(readFileSync(join(bibleDir, 'INDEX.md'), 'utf-8')).toBe(plan.indexText);
+      expect(readFileSync(join(bibleDir, 'chapters', 'model-policy.md'), 'utf-8')).toBe(before['chapters/model-policy.md']);
+      const written = new BibleStore(bibleDir).readChapter('ops-restarts')!;
+      expect(written.lessons.map((lesson) => [lesson.slug, lesson.body, lesson.recurred])).toEqual([['close-the-shell', reviewed, 1]]);
       expect(cursor()).toBe(1);
       expect((await api('GET', '/api/lessons/proposal')).status).toBe(404);
+      const resolvedDb = new DatabaseSync(join(home, 'ledger', 'ledger.db'), { readOnly: true });
+      try {
+        const row = resolvedDb.prepare('SELECT resolved_by FROM notifications WHERE id = ?').get(String(review['notificationId'])) as { resolved_by: string | null };
+        expect(row.resolved_by).toBe('owner:accepted');
+      } finally {
+        resolvedDb.close();
+      }
     } finally {
       await service.stop();
     }

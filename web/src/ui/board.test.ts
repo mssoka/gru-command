@@ -2484,7 +2484,7 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(client.getLessonProposal).toHaveBeenCalledTimes(1);
   });
 
-  it('a snapshot push keeps the review open, its text loaded, and an in-flight decision locked — band and bell share it', async () => {
+  it('a snapshot push keeps the review open, its text loaded, and an in-flight decision locked', async () => {
     let finish: () => void = () => {};
     const client = proposalClient(
       (id) => new Promise((resolve) => { finish = () => resolve({ id, decision: 'accepted' }); }),
@@ -2502,11 +2502,9 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(band.textContent).toContain('Close the shell first.');
     const accept = band.querySelector<HTMLButtonElement>('.board-owner__accept')!;
     expect([accept.textContent, accept.disabled]).toEqual(['accepting…', true]);
-    const bell = document.getElementById('notification-list')!;
-    const bellAccept = bell.querySelector<HTMLButtonElement>('.board-owner__accept')!;
-    const bellReject = bell.querySelector<HTMLButtonElement>('.board-owner__reject')!;
-    expect([bellAccept.disabled, bellReject.disabled]).toEqual([true, true]);
-    bellReject.click();
+    const reject = band.querySelector<HTMLButtonElement>('.board-owner__reject')!;
+    expect(reject.disabled).toBe(true);
+    reject.click();
     expect(client.decideLessonProposal).toHaveBeenCalledTimes(1);
     expect(client.getLessonProposal).toHaveBeenCalledTimes(1);
     finish();
@@ -2579,7 +2577,7 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(text).not.toContain('dropped to fit');
   });
 
-  it('band Accept and bell Reject reach the real client’s exact decision endpoints', async () => {
+  it('band Accept and band Reject reach the real client’s exact decision endpoints', async () => {
     const { BoardClient } = await import('../lib/board-client.js');
     const calls: string[] = [];
     const fetchImpl = (async (path: string, init?: { method?: string }) => {
@@ -2604,7 +2602,7 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
       calls.push('GET /api/lessons/proposal');
       return secondReview;
     };
-    document.getElementById('notification-list')!.querySelector<HTMLButtonElement>('.board-owner__reject')!.click();
+    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__reject')!.click();
     await flush();
     expect(calls).toEqual(['GET /api/lessons/proposal', 'POST /api/lessons/proposal/prop-2/reject']);
   });
@@ -2750,6 +2748,72 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(text).toContain('new, but left out to fit the cap · left-out (recurred 1)');
     expect(text).toContain('21 oldest journal handle(s) released to fit');
     expect(text).toContain('− model-policy: Which model does what. (tags: models, routing)');
+  });
+
+  it('the bell only points to For You — no review, no decision there; "Go to For You" lands on the band row', async () => {
+    const client = proposalClient();
+    const view = new BoardView(() => {}, client);
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    (document.getElementById('notification-bell') as HTMLButtonElement).click();
+    const bell = document.getElementById('notification-list')!;
+    const pointer = bell.querySelector('.board-owner__row--pointer')!;
+    expect(pointer.textContent).toContain('Book of Lessons: 2 lesson changes proposed');
+    expect(pointer.textContent).toContain('waiting for you in For You — review the changes and decide there');
+    expect(bell.querySelector('.board-owner__accept, .board-owner__reject, .board-owner__review')).toBeNull();
+    pointer.querySelector<HTMLButtonElement>('.board-owner__goto')!.click();
+    expect(document.getElementById('notification-panel')!.hidden).toBe(true);
+    expect(document.activeElement).toBe(document.getElementById('board-owner')!.querySelector('.board-owner__review > summary'));
+    expect(client.getLessonProposal).not.toHaveBeenCalled();
+  });
+
+  it('a finished decision asks for the authoritative snapshot at once — no waiting on a silent socket', async () => {
+    const client = proposalClient();
+    const view = new BoardView(() => {}, client);
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__accept')!.click();
+    await flush();
+    expect(client.decideLessonProposal).toHaveBeenCalledTimes(1);
+    expect(client.wake).toHaveBeenCalledTimes(1);
+    expect(document.getElementById('board-owner')!.querySelector('[data-action-id="owner-proposal:lp-1"]')).not.toBeNull(); // the snapshot closes it
+  });
+
+  it('a review that loads on retry clears the earlier failure', async () => {
+    const client = proposalClient();
+    client.getLessonProposal.mockImplementationOnce(() => Promise.reject(new TypeError('fetch failed')));
+    const view = new BoardView(() => {}, client);
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    openReview();
+    await flush();
+    expect(document.getElementById('board-owner')!.querySelector('[role="alert"]')?.textContent).toContain('Couldn’t load the proposal');
+    const details = document.getElementById('board-owner')!.querySelector<HTMLDetailsElement>('.board-owner__review')!;
+    details.open = false;
+    details.dispatchEvent(new Event('toggle'));
+    openReview();
+    await flush();
+    const band = document.getElementById('board-owner')!;
+    expect(band.textContent).toContain('Close the shell first.');
+    expect(band.querySelector('[role="alert"]')).toBeNull();
+  });
+
+  it('a review gone before this page loaded it is an unknown outcome through the real client — and the board refreshes', async () => {
+    const { BoardClient } = await import('../lib/board-client.js');
+    const requests: string[] = [];
+    const fetchImpl = (async (path: string) => {
+      requests.push(path);
+      if (path === '/api/lessons/proposal') {
+        return new Response(JSON.stringify({ error: 'not_found', detail: 'no lesson proposal is pending' }), { status: 404 });
+      }
+      return new Response(JSON.stringify(snapshot({ notifications: [] })), { status: 200 });
+    }) as unknown as typeof fetch;
+    const client = new BoardClient({ token: 't', host: 'localhost', fetchImpl }, { connection: () => {}, snapshot: () => {}, fatal: () => {} } as never);
+    const view = new BoardView(() => {}, client);
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__accept')!.click();
+    await flush();
+    const alert = document.getElementById('board-owner')!.querySelector('[role="alert"]')?.textContent ?? '';
+    expect(alert).toContain('This proposal is no longer pending — it may already have been decided');
+    expect(requests).toContain('/api/board'); // refreshed
+    expect(requests.filter((path) => path.startsWith('/api/lessons/proposal/'))).toEqual([]); // nothing was posted
   });
 
   it('a malformed decision reply is not mistaken for success', async () => {

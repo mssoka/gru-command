@@ -476,7 +476,7 @@ export class BoardView {
         if (row.kind === 'ack') {
           list.append(this.ownerAckRow(row, bandVisible));
         } else if (row.kind === 'proposal') {
-          list.append(this.ownerProposalRow(row, bandVisible, 'band'));
+          list.append(this.ownerProposalRow(row, bandVisible));
         } else {
           list.append(this.ownerPrRow(row));
         }
@@ -559,16 +559,17 @@ export class BoardView {
    * re-enables an in-flight decision. Work begun for an older client (before
    * a re-pair) is dropped. Like Ack, only the authoritative snapshot closes
    * the row. */
-  private ownerProposalRow(row: OwnerProposalRow, bandVisible: boolean, surface: 'band' | 'bell'): HTMLElement {
+  private ownerProposalRow(row: OwnerProposalRow, bandVisible: boolean): HTMLElement {
     const item = row.notification;
     let state = this.proposalStates.get(item.id);
     if (state === undefined) {
-      state = { open: false, review: null, loading: null, inFlight: null, recorded: null, message: null, nested: new Set() };
+      state = { open: false, review: null, loading: null, inFlight: null, recorded: null, message: null, loadFailed: false, nested: new Set() };
       this.proposalStates.set(item.id, state);
     }
     const current = state;
-    const focusBase = `owner-proposal:${surface}:${item.id}`;
+    const focusBase = `owner-proposal:${item.id}`;
     const node = el('article', 'board-owner__row board-owner__row--proposal');
+    node.dataset.proposalId = item.id;
     node.append(
       el('div', 'board-owner__title', `📖 ${item.title}`),
       el(
@@ -608,6 +609,11 @@ export class BoardView {
           if (!live()) throw new Error('re-paired');
           current.review = proposal;
           current.loading = null;
+          if (current.loadFailed) {
+            // A retry that worked: the earlier failure no longer applies.
+            current.loadFailed = false;
+            current.message = null;
+          }
           if (proposal.decision !== null) {
             // Recorded elsewhere (another device, or before a restart): only
             // the same decision can finish it.
@@ -621,7 +627,15 @@ export class BoardView {
         (error: unknown) => {
           if (!live()) throw error;
           current.loading = null; // a later open/decision retries the fetch
-          current.message = `Couldn’t load the proposal: ${describeProposalError(error)}`;
+          current.loadFailed = true;
+          if (error instanceof BoardApiError && error.status === 404) {
+            // Decided elsewhere before this page loaded it: an unknown
+            // outcome, not a failure — refresh to show what happened.
+            current.message = describeDecisionFailure(error);
+            client?.wake();
+          } else {
+            current.message = `Couldn’t load the proposal: ${describeProposalError(error)}`;
+          }
           this.rerenderOwner();
           throw error;
         },
@@ -677,9 +691,12 @@ export class BoardView {
               `Your ${decision === 'accept' ? 'Accept' : 'Reject'} is recorded, but finishing it hit a problem` +
               `${result.detail !== undefined ? ` (${result.detail})` : ''}. Press ${decision === 'accept' ? 'Accept' : 'Reject'} again to finish it.`;
             this.rerenderOwner();
+            return;
           }
-          /* Otherwise success is NOT completion — the row closes only when
-           * the authoritative snapshot carries the resolution (any device). */
+          // Success is NOT completion — the row closes only when the
+          // authoritative snapshot carries the resolution (any device). Ask
+          // for that snapshot now rather than wait for a push.
+          client.wake();
         })
         .catch((error: unknown) => {
           if (!live()) return;
@@ -704,6 +721,31 @@ export class BoardView {
       node.append(message);
     }
     if (bandVisible) this.sendShown(item, 'web-board');
+    return node;
+  }
+
+  /** The bell's copy of a lesson proposal is a pointer, not a control
+   * (owner decision 2026-10-07): the review and the decision live only in
+   * the For You band, so the two can never disagree. */
+  private ownerProposalPointer(row: OwnerProposalRow): HTMLElement {
+    const item = row.notification;
+    const node = el('article', 'board-owner__row board-owner__row--pointer');
+    node.append(
+      el('div', 'board-owner__title', `📖 ${item.title}`),
+      el('div', 'board-owner__meta lbl', `${formatTs(item.ts)} · waiting for you in For You — review the changes and decide there`),
+    );
+    const go = document.createElement('button');
+    go.type = 'button';
+    go.className = 'board-owner__goto';
+    go.textContent = 'Go to For You';
+    go.addEventListener('click', () => {
+      this.notificationPanel.hidden = true;
+      this.notificationBell.dataset.open = 'false';
+      const target = document.querySelector<HTMLElement>(`#board-owner [data-proposal-id="${CSS.escape(item.id)}"]`);
+      target?.scrollIntoView?.({ block: 'center' });
+      target?.querySelector<HTMLElement>('.board-owner__review > summary')?.focus();
+    });
+    node.append(go);
     return node;
   }
 
@@ -1809,7 +1851,7 @@ export class BoardView {
           row.kind === 'ack'
             ? this.notificationRow(row.notification)
             : row.kind === 'proposal'
-              ? this.ownerProposalRow(row, false, 'bell')
+              ? this.ownerProposalPointer(row)
               : this.ownerPrRow(row),
         );
       }
@@ -2193,9 +2235,11 @@ interface ProposalRowState {
   review: LessonProposalView | null;
   loading: Promise<LessonProposalView> | null;
   inFlight: 'accept' | 'reject' | null;
-  /** A decision the server recorded but has not finished (202 / conflict). */
+  /** A decision the server recorded but has not finished (202). */
   recorded: 'accept' | 'reject' | null;
   message: string | null;
+  /** The message is a failed review load (cleared by a successful retry). */
+  loadFailed: boolean;
   /** Open nested "before" disclosures, by chapter/lesson key. */
   nested: Set<string>;
 }

@@ -1,6 +1,8 @@
 import { afterAll, describe, expect, it } from 'vitest';
-import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -9,11 +11,12 @@ import {
   enforceChapterCap,
   parseChapter,
   BIBLE_WRITE_LOCK,
+  BIBLE_WRITE_LOCK_HOLDER,
+  bookFingerprint,
   checkPlan,
   compareProvenance,
   describePlan,
-  RECLAIM_GATE_STALE_MS,
-  setProcessIdentityReader,
+  parseIsoInstant,
   PROVENANCE_FLOOR,
   RepairWriteError,
   repairChapterProvenance,
@@ -39,6 +42,29 @@ function tmpBible(capBytes = 4_096, indexCapBytes = 1_024): BibleStore {
   const dir = mkdtempSync(join(tmpdir(), 'gru-command-bible-'));
   cleanupDirs.push(dir);
   return new BibleStore(join(dir, 'bible'), { chapterCapBytes: capBytes, indexCapBytes });
+}
+
+/** A separate process that takes the book's write lock and holds it until
+ * killed — it never releases it itself. */
+const HOLD_LOCK = `
+const { DatabaseSync } = require('node:sqlite');
+const db = new DatabaseSync(process.argv[1]);
+db.exec('BEGIN EXCLUSIVE');
+require('node:fs').writeFileSync(process.argv[2], JSON.stringify({ pid: process.pid, action: 'dream apply', at: new Date().toISOString() }));
+process.stdout.write('held\\n');
+setInterval(() => {}, 60000);
+`;
+async function holdBookLock(bible: BibleStore): Promise<ChildProcess> {
+  const child = spawn(process.execPath, ['--no-warnings', '-e', HOLD_LOCK, join(bible.dir, BIBLE_WRITE_LOCK), join(bible.dir, BIBLE_WRITE_LOCK_HOLDER)], {
+    stdio: ['ignore', 'pipe', 'inherit'],
+  });
+  await new Promise<void>((resolveHeld, rejectHeld) => {
+    child.stdout!.on('data', (chunk: Buffer) => {
+      if (String(chunk).includes('held')) resolveHeld();
+    });
+    child.once('exit', () => rejectHeld(new Error('the lock holder exited before taking the lock')));
+  });
+  return child;
 }
 
 const PROVENANCE = new Map([
@@ -685,18 +711,19 @@ describe('repair and cap review fixes (bmad-code-review of #253, 2026-10-07)', (
     expect(readFileSync(join(failure.backupDir, 'chapters', 'b.md'), 'utf-8')).toBe(brokenA.replace('# A', '# B'));
   });
 
-  it('repair and the dream share the write lock: contention fails loud; a dead holder is taken over', () => {
+  it('repair and the dream share the write lock: contention fails loud; a holder that dies releases it', async () => {
     const bible = bibleWith({ 'a.md': brokenA });
-    const lock = join(bible.dir, BIBLE_WRITE_LOCK);
-    // A live process other than this one (a record from an older version: PID only).
-    writeFileSync(lock, JSON.stringify({ pid: process.ppid, action: 'dream apply', at: 'now' }));
-    expect(() => bible.repairProvenance(JOURNAL, { write: true })).toThrowError(/being written by pid \d+ \(dream apply/);
-    expect(() => bible.applyUpdates([proposal()], PROVENANCE)).toThrowError(/being written by pid/);
-    expect(readFileSync(join(bible.chaptersDir, 'a.md'), 'utf-8')).toBe(brokenA);
-    const dead = spawnSync(process.execPath, ['-e', '']).pid!;
-    writeFileSync(lock, JSON.stringify({ pid: dead, action: 'provenance repair', at: 'then' }));
+    const holder = await holdBookLock(bible);
+    try {
+      expect(() => bible.repairProvenance(JOURNAL, { write: true })).toThrowError(/being written by pid \d+ \(dream apply/);
+      expect(() => bible.applyUpdates([proposal()], PROVENANCE)).toThrowError(/being written by pid/);
+      expect(readFileSync(join(bible.chaptersDir, 'a.md'), 'utf-8')).toBe(brokenA);
+    } finally {
+      holder.kill('SIGKILL');
+      await once(holder, 'exit');
+    }
+    // Killed without any cleanup of its own: the OS released its lock.
     expect(bible.repairProvenance(JOURNAL, { write: true }).backupDir).not.toBeNull();
-    expect(existsSync(lock)).toBe(false);
   });
 
   it('the tool refuses another instance’s data dir and uses the selected instance’s cap', () => {
@@ -732,25 +759,15 @@ describe('second review round of #253 (bmad-code-review, 2026-10-07)', () => {
     for (const [name, text] of Object.entries(files)) writeFileSync(join(bible.chaptersDir, name), text, 'utf-8');
     return bible;
   }
-  const deadPid = (): number => spawnSync(process.execPath, ['-e', '']).pid!;
 
-  it('a dead holder is reclaimed only through the gate, and a release never removes a lock it does not own', () => {
+  it('leftover files of the old lock design — and a stale holder note — block nothing', () => {
     const chapter = `# A\n\n## a\n\nrecurred: 1\nprovenance: j-2; earlier: j-1\n\nBody.\n`;
     const bible = bibleWith({ 'a.md': chapter });
-    const lock = join(bible.dir, BIBLE_WRITE_LOCK);
-    writeFileSync(lock, JSON.stringify({ pid: deadPid(), token: 'old', action: 'dream apply', at: 'then' }));
-    mkdirSync(`${lock}.reclaim`); // another process is mid-reclaim
-    expect(() => bible.repairProvenance(JOURNAL, { write: true })).toThrowError(/another process is reclaiming/);
-    expect(JSON.parse(readFileSync(lock, 'utf-8')).token).toBe('old');
-    rmSync(`${lock}.reclaim`, { recursive: true });
+    writeFileSync(join(bible.dir, '.write.lock'), JSON.stringify({ pid: process.ppid, token: 'old', action: 'dream apply', at: 'then' }));
+    mkdirSync(join(bible.dir, '.write.lock.reclaim'));
+    writeFileSync(join(bible.dir, BIBLE_WRITE_LOCK_HOLDER), JSON.stringify({ pid: process.ppid, action: 'dream apply', at: 'then' }));
     expect(bible.repairProvenance(JOURNAL, { write: true }).backupDir).not.toBeNull();
-    expect(existsSync(lock)).toBe(false);
-
-    const store = bible as unknown as { withWriteLock<T>(action: string, fn: () => T): T };
-    store.withWriteLock('test', () => {
-      writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'someone-else', action: 'x', at: 'now' }));
-    });
-    expect(JSON.parse(readFileSync(lock, 'utf-8')).token).toBe('someone-else');
+    expect(bible.applyUpdates([proposal()], PROVENANCE).chaptersWritten).toBe(1);
   });
 
   it('a lock that cannot be taken leaves no lock or staging file behind', () => {
@@ -762,25 +779,6 @@ describe('second review round of #253 (bmad-code-review, 2026-10-07)', () => {
       chmodSync(bible.dir, 0o700);
     }
     expect(readdirSync(bible.dir).filter((name) => name.startsWith(BIBLE_WRITE_LOCK))).toEqual([]);
-  });
-
-  it('a cleanup failure after every chapter was written is reported with the backup — never "nothing was written"', () => {
-    const bible = bibleWith({ 'a.md': `# A\n\n## a\n\nrecurred: 1\nprovenance: j-2; earlier: j-1\n\nBody.\n` });
-    const store = bible as unknown as { releaseLock(lock: string, token: string): void };
-    store.releaseLock = () => {
-      throw new Error('unlink failed');
-    };
-    let caught: unknown;
-    try {
-      bible.repairProvenance(JOURNAL, { write: true });
-    } catch (error) {
-      caught = error;
-    }
-    expect(caught).toBeInstanceOf(RepairWriteError);
-    expect((caught as RepairWriteError).message).toContain('repair replaced all 1 chapter(s) (a), then failed: ');
-    expect((caught as RepairWriteError).message).toContain('releasing the book write lock');
-    expect((caught as RepairWriteError).message).toContain('unlink failed');
-    expect(existsSync((caught as RepairWriteError).backupDir)).toBe(true);
   });
 
   it('a chapter that already fits as repaired keeps every byte — even at exactly the cap', () => {
@@ -1252,57 +1250,175 @@ describe('third review round of #254 — plan integrity, cap effects, canonical 
     expect([chapter.title, chapter.tags]).toEqual(['Ops', ['ops']]);
     expect([chapter.lessons[0]!.body, chapter.lessons[0]!.tags]).toEqual(['Line one.\nLine two.', ['shell']]);
   });
+});
 
-  it('a lock whose PID now belongs to another process is dead; one held by the same process — or unknowable — stays held', () => {
+describe('fourth review round of #253 — the whole lessons change (bmad-code-review, 2026-10-07)', () => {
+  const at = (minute: number): string => new Date(Date.UTC(2026, 9, 1, 0, minute)).toISOString();
+  const JOURNAL = new Map(Array.from({ length: 30 }, (_, index) => [`j-${index + 1}`, at(index + 1)] as const));
+  const TOOL = resolve(import.meta.dirname, '..', 'tools', 'repair-bible-provenance.mjs');
+  const backups = (bibleDir: string): string[] => readdirSync(bibleDir).filter((name) => name.startsWith('.repair-backup-'));
+  const lessonOf = (slug: string, provenance: ProvenanceRef[], body: string) => ({ slug, body, recurred: 1, provenance, tags: [] as string[] });
+  const chapterOf = (lessons: BibleChapter['lessons']): BibleChapter => ({ slug: 'fix', title: 'Fix', summary: '', tags: [], lessons });
+  const loneSurrogate = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u;
+
+  it('an uncited archive record that receives handles gains a provenance line, in place', () => {
+    const text = [
+      '# Ops', '', '## keep', '', 'recurred: 1', `provenance: j-2@${at(2)}`, '', 'Keep this lesson.', '',
+      '## cited', '', 'recurred: 1', `provenance: j-1@${at(1)}`, '', 'An older cited lesson.', '',
+      `## ${ARCHIVED_LESSON_SLUG}`, '', 'recurred: 1', 'tags: archived', '', 'Archived lessons.', '',
+    ].join('\n');
+    const bible = tmpBible(Buffer.byteLength(text, 'utf8') - 30);
+    bible.ensureSeeded();
+    writeFileSync(join(bible.chaptersDir, 'ops.md'), text);
+    const report = bible.repairProvenance(JOURNAL, { write: true });
+    expect(report.chapters[0]).toMatchObject({ lessonsDropped: 1 });
+    const archive = bible.readChapter('ops')!.lessons.find((lesson) => lesson.slug === ARCHIVED_LESSON_SLUG)!;
+    expect(archive.provenance).toEqual([{ id: 'j-1', ts: at(1) }]);
+    expect(readFileSync(join(bible.chaptersDir, 'ops.md'), 'utf-8')).toContain('recurred: 1\ntags: archived\nprovenance: j-1@');
+  });
+
+  it('trimming keeps the longest prefix that fits in BYTES — multibyte text is not over-trimmed', () => {
+    const body = `${'a'.repeat(170)}${'😀'.repeat(100)}`;
+    const ref = [{ id: 'j-1', ts: at(1) }];
+    const full = Buffer.byteLength(serializeChapter(chapterOf([lessonOf('emoji', ref, body)])), 'utf8');
+    const cap = full - 150;
+    const result = enforceChapterCap(chapterOf([lessonOf('emoji', ref, body)]), cap);
+    const trimmed = result.chapter.lessons[0]!.body;
+    expect(Buffer.byteLength(serializeChapter(result.chapter), 'utf8')).toBeLessThanOrEqual(cap);
+    const marker = ' … [trimmed to fit the chapter cap]';
+    const prefix = trimmed.slice(0, -marker.length);
+    const next = Array.from(body.slice(prefix.length))[0]!;
+    const oneMore = chapterOf([lessonOf('emoji', ref, `${prefix}${next}${marker}`)]);
+    expect(Buffer.byteLength(serializeChapter(oneMore), 'utf8')).toBeGreaterThan(cap); // nothing more would have fit
+    expect(loneSurrogate.test(trimmed)).toBe(false);
+  });
+
+  it('a trim keeps every retained line byte for byte, CRLF included', () => {
+    const body = ['First retained line.', 'Second retained line.', 'Restart with care. '.repeat(40).trim()].join('\r\n');
+    const text = ['# Ops', '', '## a', '', 'recurred: 1', `provenance: j-1@${at(1)}`, '', body, ''].join('\r\n');
+    const bible = tmpBible(Buffer.byteLength(text, 'utf8') - 200);
+    bible.ensureSeeded();
+    writeFileSync(join(bible.chaptersDir, 'ops.md'), text);
+    expect(bible.repairProvenance(JOURNAL, { write: true }).chapters[0]!.bodiesTrimmed).toBeGreaterThan(0);
+    const written = readFileSync(join(bible.chaptersDir, 'ops.md'), 'utf-8');
+    expect(written.startsWith(['# Ops', '', '## a', '', 'recurred: 1', `provenance: j-1@${at(1)}`, '', 'First retained line.', 'Second retained line.', ''].join('\r\n'))).toBe(true);
+    expect(written.split('\n').slice(0, -1).every((line) => line.endsWith('\r'))).toBe(true);
+  });
+
+  it('instants keep their full precision and real calendar: sub-millisecond order, equal spellings, impossible dates', () => {
+    const refs = [
+      { id: 'j-1', ts: '2026-10-01T00:00:00.0004Z' },
+      { id: 'j-2', ts: '2026-10-01T00:00:00.0003Z' },
+      { id: 'j-3', ts: '2026-10-01T00:00:00.0002Z' },
+      { id: 'j-4', ts: '2026-10-01T00:00:00.0001Z' },
+    ];
+    expect([...refs].sort(compareProvenance).map((ref) => ref.id)).toEqual(['j-4', 'j-3', 'j-2', 'j-1']);
+    expect(compareProvenance({ id: 'j-1', ts: '2026-10-01T02:00:00.5+02:00' }, { id: 'j-2', ts: '2026-10-01T00:00:00.500Z' })).toBeLessThan(0); // same instant → sequence
+    expect(parseIsoInstant('2026-02-30T00:00:00.000Z')).toBeNull();
+    expect(parseIsoInstant('2024-02-29T23:59:59.999999Z')).not.toBeNull();
+    const journal = new Map([['j-1', '2026-10-01T00:00:00.0002Z']]);
+    expect(() => repairChapterProvenance('# A\n\n## a\n\nrecurred: 1\nprovenance: j-1@2026-10-01T00:00:00.0001Z\n\nBody.\n', 'a', journal)).toThrowError(
+      /but the journal records j-1/,
+    );
+  });
+
+  it('the strict reader refuses two lessons on one anchor — no review shows the wrong "before" text', () => {
+    expect(() => parseChapter('# A\n\n## a\n\nrecurred: 1\n\nFirst.\n\n## a\n\nrecurred: 1\n\nSecond.\n', 'a')).toThrowError(/more than one lesson anchored "## a"/);
     const bible = tmpBible();
     bible.ensureSeeded();
-    const lock = join(bible.dir, BIBLE_WRITE_LOCK);
-    const live = process.ppid;
-    const holder = (fields: Record<string, unknown>) => writeFileSync(lock, JSON.stringify({ pid: live, token: 'held', action: 'dream apply', at: 'then', ...fields }));
-    setProcessIdentityReader((pid) => (pid === live ? 'test:current-incarnation' : `test:${pid}`));
-    try {
-      holder({ identity: 'test:earlier-incarnation' }); // the PID was reused after a crash or reboot
-      expect(bible.applyUpdates([proposal()], PROVENANCE).chaptersWritten).toBe(1);
-      expect(existsSync(lock)).toBe(false);
-      holder({ identity: 'test:current-incarnation' });
-      expect(() => bible.applyUpdates([proposal()], PROVENANCE)).toThrowError(/being written by pid/);
-      holder({}); // written by an older version: PID only
-      expect(() => bible.applyUpdates([proposal()], PROVENANCE)).toThrowError(/being written by pid/);
-      setProcessIdentityReader(() => null); // cannot tell: never steal
-      holder({ identity: 'test:earlier-incarnation' });
-      expect(() => bible.applyUpdates([proposal()], PROVENANCE)).toThrowError(/being written by pid/);
-      // This process's own record that nothing holds (a release that failed to remove it).
-      writeFileSync(lock, JSON.stringify({ pid: process.pid, identity: null, token: 'released', action: 'x', at: 'then' }));
-      expect(bible.applyUpdates([proposal()], PROVENANCE).chaptersWritten).toBe(1);
-    } finally {
-      setProcessIdentityReader(null);
-      rmSync(lock, { force: true });
+    writeFileSync(join(bible.chaptersDir, 'ops-restarts.md'), '# Ops\n\n## shell-hang\n\nrecurred: 1\n\nFirst.\n\n## shell-hang\n\nrecurred: 1\n\nSecond.\n');
+    expect(() => bible.planUpdates([proposal()], PROVENANCE)).toThrowError(/more than one lesson anchored/);
+  });
+
+  it('truncation never leaves half a character — summaries and INDEX lines survive UTF-8 unchanged', () => {
+    const bible = tmpBible();
+    bible.ensureSeeded();
+    const plan = bible.planUpdates([proposal({ summary: `${'x'.repeat(159)}😀 and more` })], PROVENANCE);
+    bible.applyPlan(plan);
+    const summary = bible.readChapter('ops-restarts')!.summary;
+    expect(loneSurrogate.test(summary)).toBe(false);
+    expect(summary.startsWith('x'.repeat(159))).toBe(true);
+    const chapters = Array.from({ length: 4 }, (_, index) => ({ slug: `c-${index}`, title: 'C', summary: '😀'.repeat(60), tags: [], lessons: [] }));
+    for (let cap = 400; cap < 520; cap += 7) {
+      let rendered: string;
+      try {
+        rendered = renderIndex(chapters, cap);
+      } catch {
+        continue; // too small for any index: refused, not corrupted
+      }
+      expect(loneSurrogate.test(rendered), `index cap ${cap}`).toBe(false);
     }
   });
 
-  it('the reclaim gate heals itself: a dead or stale gate is broken; a live reclaimer’s fresh gate is respected', () => {
+  it('bare CR line endings are canonicalized before validation — a CR-hidden heading is still refused', () => {
     const bible = tmpBible();
     bible.ensureSeeded();
-    const lock = join(bible.dir, BIBLE_WRITE_LOCK);
-    const gate = `${lock}.reclaim`;
-    const dead = () => spawnSync(process.execPath, ['-e', '']).pid!;
-    const deadLock = () => writeFileSync(lock, JSON.stringify({ pid: dead(), token: 'old', action: 'dream apply', at: 'then' }));
-    const apply = () => bible.applyUpdates([proposal()], PROVENANCE);
-    const old = new Date(Date.now() - RECLAIM_GATE_STALE_MS - 5_000);
-    deadLock();
-    writeFileSync(gate, JSON.stringify({ pid: dead(), token: 'gate-of-the-dead', action: 'reclaim', at: 'then' }));
-    expect(apply().chaptersWritten).toBe(1); // a reclaimer killed mid-reclaim no longer blocks the book
-    expect(existsSync(gate)).toBe(false);
-    deadLock();
-    writeFileSync(gate, JSON.stringify({ pid: process.ppid, token: 'live-reclaimer', action: 'reclaim', at: 'now' }));
-    expect(apply).toThrowError(/another process is reclaiming/);
-    expect(JSON.parse(readFileSync(lock, 'utf-8')).token).toBe('old');
-    utimesSync(gate, old, old); // the same reclaimer, frozen for longer than a reclaim can take
-    expect(apply().chaptersWritten).toBe(1);
-    deadLock();
-    mkdirSync(gate); // an older version's gate directory, abandoned
-    utimesSync(gate, old, old);
-    expect(apply().chaptersWritten).toBe(1);
-    expect(existsSync(gate)).toBe(false);
+    bible.applyPlan(bible.planUpdates([proposal({ lessons: [{ slug: 'cr', body: 'First.\rSecond.', journalIds: ['j-1'] }] })], PROVENANCE));
+    expect(bible.readChapter('ops-restarts')!.lessons[0]!.body).toBe('First.\nSecond.');
+    expect(() => bible.planUpdates([proposal({ lessons: [{ slug: 'hidden', body: 'Text.\r## Smuggled heading', journalIds: ['j-1'] }] })], PROVENANCE)).toThrowError(
+      /heading/,
+    );
+  });
+
+  it('only a pristine book is seeded — a book with chapters or state but no INDEX.md fails loud and gains nothing', () => {
+    const bible = tmpBible();
+    mkdirSync(bible.chaptersDir, { recursive: true });
+    writeFileSync(join(bible.chaptersDir, 'ops.md'), '# Ops\n\n## a\n\nrecurred: 1\n\nBody.\n');
+    expect(() => bible.ensureSeeded()).toThrowError(/has chapters but no INDEX\.md/);
+    expect(existsSync(join(bible.dir, 'INDEX.md'))).toBe(false);
+    const stateOnly = tmpBible();
+    mkdirSync(stateOnly.dir, { recursive: true });
+    writeFileSync(join(stateOnly.dir, '.dream-state.json'), '{}');
+    expect(() => stateOnly.ensureSeeded()).toThrowError(/\.dream-state\.json but no INDEX\.md/);
+    const fresh = tmpBible();
+    fresh.ensureSeeded();
+    expect(existsSync(join(fresh.dir, 'INDEX.md'))).toBe(true);
+  });
+
+  it('a plan whose INDEX.md carries anything beyond the index of its result is refused, hashes notwithstanding', () => {
+    const bible = tmpBible();
+    bible.ensureSeeded();
+    const plan = bible.planUpdates([proposal()], PROVENANCE);
+    const indexText = `${plan.indexText}Smuggled text the review never shows.\n`;
+    const result = new Map(plan.before.filter((entry) => entry.text !== null).map((entry) => [entry.path, entry.text as string]));
+    for (const write of plan.writes) result.set(`chapters/${write.slug}.md`, write.text);
+    result.set('INDEX.md', indexText);
+    const hash = createHash('sha256').update(indexText, 'utf8').digest('hex');
+    const forged = {
+      ...plan,
+      indexText,
+      after: bookFingerprint(result),
+      files: plan.files.map((file) => (file.path === 'INDEX.md' ? { ...file, after: hash } : file)),
+    };
+    expect(() => checkPlan(forged)).toThrowError(/is not the index of the book it produces/);
+  });
+
+  it('the tool refuses an impossible calendar date on any journal record — dry run and --write alike', () => {
+    const home = mkdtempSync(join(tmpdir(), 'gru-command-repair-r4-'));
+    cleanupDirs.push(home);
+    const journal = new JournalStore(join(home, 'journal'));
+    const first = journal.append({ kind: 'finding', source: 'gru', body: 'first' });
+    const file = join(home, 'journal', readdirSync(join(home, 'journal')).find((name) => name.endsWith('.jsonl'))!);
+    const template = JSON.parse(readFileSync(file, 'utf-8').trim().split('\n')[0]!) as Record<string, unknown>;
+    appendFileSync(file, `${JSON.stringify({ ...template, seq: 2, id: 'j-2', ts: '2026-02-30T00:00:00.000Z' })}\n`);
+    mkdirSync(join(home, 'bible', 'chapters'), { recursive: true });
+    const chapter = `# Ops\n\n## a\n\nrecurred: 1\nprovenance: ${first.id}\n\nBody.\n`;
+    writeFileSync(join(home, 'bible', 'chapters', 'ops.md'), chapter);
+    for (const args of [[], ['--write']]) {
+      const ran = spawnSync(process.execPath, [TOOL, ...args], { encoding: 'utf-8', env: { ...process.env, GRU_COMMAND_HOME: home } });
+      expect(ran.status).toBe(1);
+      expect(ran.stderr).toContain('journal entry j-2 has an invalid timestamp "2026-02-30T00:00:00.000Z"');
+    }
+    expect(readFileSync(join(home, 'bible', 'chapters', 'ops.md'), 'utf-8')).toBe(chapter);
+    expect(backups(join(home, 'bible'))).toEqual([]);
+  });
+
+  it('the tool refuses an instance without a book instead of "repairing" a new empty one', () => {
+    const home = mkdtempSync(join(tmpdir(), 'gru-command-repair-typo-'));
+    cleanupDirs.push(home);
+    const ran = spawnSync(process.execPath, [TOOL, '--write'], { encoding: 'utf-8', env: { ...process.env, GRU_COMMAND_HOME: home } });
+    expect(ran.status).toBe(1);
+    expect(ran.stderr).toContain('does not exist');
+    expect(existsSync(join(home, 'bible'))).toBe(false);
   });
 });

@@ -76,6 +76,10 @@ export class BoardClient {
   private readonly options: BoardClientOptions;
   private readonly webSocketCtor: new (url: string) => WebSocket;
   private readonly fetchImpl: typeof fetch;
+  /** Pushed snapshots seen: an HTTP answer asked for before a push is stale. */
+  private snapshotEpoch = 0;
+  /** The newest HTTP snapshot request; older answers are dropped. */
+  private fetchSeq = 0;
 
   constructor(
     options: BoardClientOptions,
@@ -225,6 +229,7 @@ export class BoardClient {
         return;
       }
       if (frame.type === 'board') {
+        this.snapshotEpoch += 1;
         this.events.snapshot(frame.snapshot);
         return;
       }
@@ -266,24 +271,38 @@ export class BoardClient {
     const res = await doFetch(path, {
       headers: { authorization: `Bearer ${this.options.token}` },
     });
-    if (!res.ok) {
-      // A stopped client's late 401 must never unpair the session that
-      // replaced it — it belongs to the old pairing.
-      if (res.status === 401 && !this.stopped) {
-        this.events.fatal('unauthorized (board api)');
-      }
-      throw new Error(`board api ${path} → ${res.status}`);
-    }
+    if (!res.ok) return this.refused(path, res);
     return (await res.json()) as T;
+  }
+
+  /** A non-2xx answer as a BoardApiError with the server's reason. A
+   * stopped client's late 401 never unpairs the session that replaced it —
+   * it belongs to the old pairing. */
+  private async refused(path: string, res: Response): Promise<never> {
+    if (res.status === 401 && !this.stopped) this.events.fatal('unauthorized (board api)');
+    let code: string | null = null;
+    let detail: string | null = null;
+    try {
+      const body = (await res.json()) as { error?: unknown; detail?: unknown };
+      code = typeof body.error === 'string' ? body.error : null;
+      detail = typeof body.detail === 'string' ? body.detail : null;
+    } catch {
+      /* a non-JSON error body keeps the status alone */
+    }
+    throw new BoardApiError(path, res.status, code, detail);
   }
 
   /** One-shot HTTP snapshot fetch (initial load + reconnect catch-up). */
   async refetchSnapshot(): Promise<void> {
+    const request = ++this.fetchSeq;
+    const epoch = this.snapshotEpoch;
     try {
       const snapshot = await this.api<unknown>('/api/board');
       if (!isValidSnapshot(snapshot)) throw new Error('board api returned a malformed snapshot');
+      // Only the newest answer, and only if no pushed snapshot arrived since
+      // it was asked for: an older HTTP answer never overwrites newer truth.
       // A stopped (re-paired) client's late answer never reaches the board.
-      if (!this.stopped) this.events.snapshot(snapshot);
+      if (!this.stopped && request === this.fetchSeq && epoch === this.snapshotEpoch) this.events.snapshot(snapshot);
     } catch {
       /* connection state carries the error surface */
     }
@@ -362,23 +381,7 @@ export class BoardClient {
       },
       body: JSON.stringify(body),
     });
-    if (!res.ok) {
-      // A stopped client's late 401 must never unpair the session that
-      // replaced it — it belongs to the old pairing.
-      if (res.status === 401 && !this.stopped) {
-        this.events.fatal('unauthorized (board api)');
-      }
-      let code: string | null = null;
-      let detail: string | null = null;
-      try {
-        const body = (await res.json()) as { error?: unknown; detail?: unknown };
-        code = typeof body.error === 'string' ? body.error : null;
-        detail = typeof body.detail === 'string' ? body.detail : null;
-      } catch {
-        /* a non-JSON error body keeps the status alone */
-      }
-      throw new BoardApiError(path, res.status, code, detail);
-    }
+    if (!res.ok) return this.refused(path, res);
     return res.json();
   }
 }

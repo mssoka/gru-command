@@ -741,11 +741,15 @@ export class LessonProposals {
     const recorded: LessonProposal = { ...proposal, recovery: { conflict: detail, at: this.now().toISOString() } };
     this.write(recorded);
     const label = proposal.decision?.kind === 'rejected' ? 'Reject' : 'Accept';
-    const repair = blocked === 'book'
-      ? `Restore the listed Book of Lessons files to their state before or after the update (the planned contents ` +
-        `are in ${this.file}: plan.before is the book as reviewed, plan.writes the update)`
-      : `Restore the dream state file ${this.stateFile} to the state this decision started from ` +
-        `(${JSON.stringify(proposal.fromState)}) or the one it produces (${JSON.stringify(proposal.nextState)})`;
+    const repair = blocked === 'cursor'
+      ? `Restore the dream state file ${this.stateFile} to the state this decision started from ` +
+        `(${JSON.stringify(proposal.fromState)}) or the one it produces (${JSON.stringify(proposal.nextState)})`
+      : label === 'Reject'
+        // A Reject writes nothing: only the book as reviewed finishes it.
+        ? `Restore each listed Book of Lessons file to the book as reviewed (plan.before in ${this.file}) — ` +
+          'a Reject writes nothing, so only that state finishes it'
+        : `Restore each listed Book of Lessons file to its state before the update (plan.before in ${this.file}) ` +
+          'or after it (plan.writes and plan.indexText; chapters in plan.retired deleted) — any mix of the two finishes it';
     this.notifier.conflict({
       id: `lessons-proposal-conflict:${proposal.id}`,
       title: `Your ${label} of the lesson proposal could not finish — ${detail.split(/[;(]/u)[0]!.trim()}`,
@@ -782,10 +786,14 @@ export class LessonProposals {
             this.conflict(proposal, error.message.replace(/; nothing was written$/u, ''), 'book');
           }
         }
-      } else if (cursorFresh && this.bible.fingerprint() !== proposal.plan.base) {
+      } else {
         // A Reject consumes the batch the owner reviewed against THIS book;
-        // a book changed since is a conflict, never silently consumed.
-        this.conflict(proposal, 'the Book of Lessons changed since this proposal was rejected', 'book');
+        // a book changed since is a conflict, never silently consumed —
+        // whether or not the cursor already moved.
+        const drift = this.bible.driftFrom(proposal.plan, true);
+        if (drift.length > 0) {
+          this.conflict(proposal, `the Book of Lessons changed since this proposal was rejected (${drift.join(', ')})`, 'book');
+        }
       }
       if (cursorFresh) saveDreamState(this.stateFile, proposal.nextState);
       current = { ...proposal, committed: { at: this.now().toISOString() } };
@@ -800,19 +808,17 @@ export class LessonProposals {
         detail: `${decision.detail ?? 'the proposal went stale'}. Nothing was written; the next dream re-proposes these journal entries.`,
       });
     }
-    rmSync(this.file, { force: true });
+    // Everything that can fail happens BEFORE the record goes: a failure
+    // here leaves it in place, so the same decision (or startup) resumes.
+    const coveredThroughSeq = loadDreamState(this.stateFile).coveredThroughSeq;
     this.log(decision.kind === 'withdrawn' ? 'warn' : 'info', `lesson proposal ${decision.kind}`, {
       proposal_id: current.id,
-      covered_through_seq: loadDreamState(this.stateFile).coveredThroughSeq,
+      covered_through_seq: coveredThroughSeq,
       chapters_written: report?.chaptersWritten ?? 0,
       ...(decision.detail !== null ? { detail: decision.detail } : {}),
     });
-    return {
-      id: current.id,
-      decision: decision.kind,
-      coveredThroughSeq: loadDreamState(this.stateFile).coveredThroughSeq,
-      report,
-    };
+    rmSync(this.file, { force: true });
+    return { id: current.id, decision: decision.kind, coveredThroughSeq, report };
   }
 
   private write(proposal: LessonProposal): void {
@@ -1111,7 +1117,7 @@ export class DreamScheduler {
       this.notify('onSuccess', () => this.opts.onSuccess?.(outcome));
       return outcome;
     } catch (error) {
-      this.log('error', 'dream pass failed — journal cursor unchanged, next beat retries', {
+      this.log('error', 'dream pass failed — the next beat retries', {
         error: String(error),
       });
       this.notify('onFailure', () => this.opts.onFailure?.(error));
@@ -1169,6 +1175,11 @@ function parseDreamState(parsed: unknown, where: string): DreamState {
       typeof throughSeq !== 'number' || !Number.isSafeInteger(throughSeq) || throughSeq <= afterSeq
     ) {
       throw new DreamError(`${where} has an invalid replay range — inspect or remove the file`);
+    }
+    // A replay range is a batch the cursor already passed: one beyond it
+    // would let the cursor jump past entries nobody reviewed.
+    if (throughSeq > covered) {
+      throw new DreamError(`${where} has a replay range beyond its cursor — inspect or remove the file`);
     }
     return { afterSeq, throughSeq };
   });

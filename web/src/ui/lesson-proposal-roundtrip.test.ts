@@ -280,7 +280,7 @@ describe('lesson proposal roundtrip through the real client, servers, ledger and
     expect(id).not.toBe('');
   });
 
-  it('a network failure is unconfirmed, a real 409 is translated, and Reject in the bell finishes with the book byte-identical', async () => {
+  it('a network failure is unconfirmed, a real 409 is translated, and Reject finishes with the book byte-identical', async () => {
     const h = (harness = await boot());
     const { down } = await connect(h);
     const before = bookFiles(h.bible);
@@ -310,14 +310,16 @@ describe('lesson proposal roundtrip through the real client, servers, ledger and
     });
     expect(h.bible.readChapter('ops-restarts')).toBeNull();
 
-    // 3. Reject from the bell refetches the recorded decision and finishes
-    //    it; the snapshot closes the row on both surfaces.
+    // 3. Reject (the band is the only place to decide) refetches the
+    //    recorded decision and finishes it; the snapshot closes the row and
+    //    the bell's pointer to it.
     (document.getElementById('notification-bell') as HTMLButtonElement).click();
-    (await shownRow(notificationId, 'notification-list')).querySelector<HTMLButtonElement>('.board-owner__reject')!.click();
+    expect(document.getElementById('notification-list')!.querySelector('.board-owner__row--pointer')).not.toBeNull();
+    row(notificationId)!.querySelector<HTMLButtonElement>('.board-owner__reject')!.click();
     await waitFor(() => {
       if (row(notificationId) !== null) throw new Error('row still open');
     });
-    expect(row(notificationId, 'notification-list')).toBeNull();
+    expect(document.getElementById('notification-list')!.querySelector('.board-owner__row--pointer')).toBeNull();
     expect(bookFiles(h.bible)).toBe(before);
     expect(h.cursor()).toBe(1);
     expect(h.notification(notificationId)?.resolvedBy).toBe('owner:rejected');
