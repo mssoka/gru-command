@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer, type Server as HttpServer } from 'node:http';
@@ -9,7 +9,11 @@ import { JournalStore } from '../src/lessons/journal.js';
 import { BibleStore } from '../src/lessons/bible.js';
 import { createBibleReferences } from '../src/lessons/references.js';
 import { createLessonsServer } from '../src/lessons/server.js';
-import { DreamEngine, LessonProposals } from '../src/lessons/dream.js';
+import { DREAM_STATE_FILE, DreamEngine, LessonProposals, lessonProposalNotifier, loadDreamState, PROPOSAL_FILE } from '../src/lessons/dream.js';
+import { EventBus } from '../src/events/bus.js';
+import { LedgerApi } from '../src/ledger/api.js';
+import { LedgerDb } from '../src/ledger/db.js';
+import { NotificationCenter } from '../src/notifications/center.js';
 
 /**
  * Book of Lessons HTTP surface: the journal roundtrip (capture writers),
@@ -29,7 +33,7 @@ interface Harness {
   journal: JournalStore;
   bible: BibleStore;
   proposals: LessonProposals;
-  resolved: string[];
+  ledger: LedgerApi;
   close: () => Promise<void>;
 }
 
@@ -68,15 +72,12 @@ async function boot(opts: { token?: string; withChapter?: boolean } = {}): Promi
     );
   }
   const references = createBibleReferences({ bible, maxReferences: 3 });
-  const resolved: string[] = [];
-  const proposals = new LessonProposals({
-    bible,
-    notifier: {
-      proposed: () => 'notice-1',
-      resolve: (id, by) => resolved.push(`${id}:${by}`),
-      stale: () => {},
-    },
-  });
+  // The production notification chain: a real ledger behind the notifier.
+  const db = new LedgerDb(dir);
+  const bus = new EventBus();
+  const ledger = new LedgerApi(db.handle, { bus });
+  const notifications = new NotificationCenter({ ledger, bus });
+  const proposals = new LessonProposals({ bible, notifier: lessonProposalNotifier({ notifications, ledger }) });
   const server = createLessonsServer({ config, journal, bible, references, proposals });
   const http: HttpServer = createServer((req, res) => {
     if (server.requestHook(req, res, new URL(req.url ?? '/', 'http://localhost').pathname)) return;
@@ -89,9 +90,10 @@ async function boot(opts: { token?: string; withChapter?: boolean } = {}): Promi
     journal,
     bible,
     proposals,
-    resolved,
+    ledger,
     close: async () => {
       await new Promise<void>((resolveClose) => http.close(() => resolveClose()));
+      db.close();
     },
   };
 }
@@ -232,7 +234,7 @@ describe('lessons server', () => {
 });
 
 describe('lesson proposals over HTTP (owner decision 2026-10-07)', () => {
-  async function propose(h: Harness): Promise<string> {
+  async function propose(h: Harness): Promise<{ id: string; notificationId: string }> {
     h.journal.append({ kind: 'finding', source: 'gru', body: 'shell hang finding' });
     const engine = new DreamEngine({
       journal: h.journal,
@@ -253,18 +255,23 @@ describe('lesson proposals over HTTP (owner decision 2026-10-07)', () => {
       },
     });
     await engine.run();
-    return h.proposals.review()!.id;
+    return h.proposals.review()!;
   }
 
-  it('reviews the pending proposal, refuses a wrong id, and Accept writes it', async () => {
+  const bookFiles = (bible: BibleStore): string =>
+    JSON.stringify([bible.readIndexText(), ...readdirSync(bible.chaptersDir).sort().map((name) => readFileSync(join(bible.chaptersDir, name), 'utf-8'))]);
+  const cursor = (bible: BibleStore): number => loadDreamState(join(bible.dir, DREAM_STATE_FILE)).coveredThroughSeq;
+
+  it('Accept over HTTP writes the exact reviewed text, consumes the batch and resolves the For You row', async () => {
     const h = await boot();
     try {
       expect((await call(h.port, 'GET', '/api/lessons/proposal', undefined, TOKEN)).status).toBe(404);
-      const id = await propose(h);
+      const { id, notificationId } = await propose(h);
+      expect(h.ledger.getNotification(notificationId)).toMatchObject({ routing: 'needs-owner', resolvedAt: null });
       const review = await call(h.port, 'GET', '/api/lessons/proposal', undefined, TOKEN);
       expect(review.status).toBe(200);
-      expect(review.json).toMatchObject({ id, notificationId: 'notice-1', entries: 1 });
-      expect(field<unknown[]>(review.json, 'chapters')).toHaveLength(1);
+      expect(review.json).toMatchObject({ id, notificationId, entries: 1 });
+      const reviewedBody = (review.json as { chapters: { added: { body: string }[] }[] }).chapters[0]!.added[0]!.body;
 
       const wrong = await call(h.port, 'POST', '/api/lessons/proposal/not-it/accept', {}, TOKEN);
       expect(wrong.status).toBe(409);
@@ -273,27 +280,72 @@ describe('lesson proposals over HTTP (owner decision 2026-10-07)', () => {
 
       const accepted = await call(h.port, 'POST', `/api/lessons/proposal/${id}/accept`, {}, TOKEN);
       expect(accepted.status).toBe(200);
-      expect(accepted.json).toMatchObject({ id, decision: 'accepted' });
-      expect(h.bible.readChapter('ops-restarts')?.lessons[0]?.body).toBe('Close the shell first.');
-      expect(h.resolved).toEqual(['notice-1:owner:accepted']);
+      expect(accepted.json).toMatchObject({ id, decision: 'accepted', coveredThroughSeq: 1 });
+      expect(h.bible.readChapter('ops-restarts')?.lessons[0]?.body).toBe(reviewedBody);
+      expect(cursor(h.bible)).toBe(1);
+      expect(h.ledger.getNotification(notificationId)?.resolvedBy).toBe('owner:accepted');
       expect((await call(h.port, 'POST', `/api/lessons/proposal/${id}/reject`, {}, TOKEN)).status).toBe(404);
     } finally {
       await h.close();
     }
   });
 
-  it('Reject leaves the book untouched; every proposal route requires the token', async () => {
+  it('Reject over HTTP leaves the book byte-identical, consumes the batch, resolves the row; every route needs the token', async () => {
     const h = await boot();
     try {
-      const id = await propose(h);
+      const before = bookFiles(h.bible);
+      const { id, notificationId } = await propose(h);
       expect((await call(h.port, 'GET', '/api/lessons/proposal')).status).toBe(401);
       expect((await call(h.port, 'POST', `/api/lessons/proposal/${id}/accept`, {})).status).toBe(401);
-      expect(h.proposals.pending()).not.toBeNull();
+      expect(h.proposals.review()).not.toBeNull();
       const rejected = await call(h.port, 'POST', `/api/lessons/proposal/${id}/reject`, {}, TOKEN);
       expect(rejected.status).toBe(200);
       expect(rejected.json).toMatchObject({ id, decision: 'rejected', report: null });
+      expect(bookFiles(h.bible)).toBe(before);
+      expect(cursor(h.bible)).toBe(1);
+      expect(h.ledger.getNotification(notificationId)?.resolvedBy).toBe('owner:rejected');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a stale proposal is refused 409 for Reject too (cursor kept), and a recorded decision cannot be flipped', async () => {
+    const h = await boot();
+    try {
+      const first = await propose(h);
+      writeFileSync(join(h.bible.dir, 'INDEX.md'), `${h.bible.readIndexText() ?? ''}\n`);
+      const stale = await call(h.port, 'POST', `/api/lessons/proposal/${first.id}/reject`, {}, TOKEN);
+      expect(stale.status).toBe(409);
+      expect(stale.json).toMatchObject({ error: 'proposal_stale' });
+      expect(cursor(h.bible)).toBe(0);
+
+      const engine = new DreamEngine({
+        journal: h.journal,
+        bible: h.bible,
+        proposals: h.proposals,
+        distiller: {
+          distill: async (input) => ({
+            chapters: [
+              {
+                slug: 'ops-restarts',
+                title: 'Ops restarts',
+                summary: 'Restart discipline.',
+                tags: ['ops'],
+                lessons: [{ slug: 'shell-hang', body: 'Close the shell first.', journalIds: input.entries.map((entry) => entry.id) }],
+              },
+            ],
+          }),
+        },
+      });
+      await engine.run(); // re-proposed against the edited book
+      const second = h.proposals.review()!;
+      const file = join(h.bible.dir, PROPOSAL_FILE);
+      // A Reject recorded just before a crash: Accept may never flip it.
+      writeFileSync(file, JSON.stringify({ ...JSON.parse(readFileSync(file, 'utf-8')), decision: { kind: 'rejected', at: 'now', detail: null } }));
+      const flipped = await call(h.port, 'POST', `/api/lessons/proposal/${second.id}/accept`, {}, TOKEN);
+      expect(flipped.status).toBe(409);
+      expect(flipped.json).toMatchObject({ error: 'proposal_decided' });
       expect(h.bible.readChapter('ops-restarts')).toBeNull();
-      expect(h.resolved).toEqual(['notice-1:owner:rejected']);
     } finally {
       await h.close();
     }

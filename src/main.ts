@@ -60,8 +60,8 @@ import {
   DreamScheduler,
   DREAM_STATE_FILE,
   dreamFailureIncidents,
-  LESSONS_PROPOSAL_KIND,
   LessonProposals,
+  lessonProposalNotifier,
   loadDreamState,
   repairCommand,
 } from './lessons/dream.js';
@@ -684,18 +684,17 @@ async function main(): Promise<number> {
   // proposes, the owner decides in For You, and only Accept writes.
   const lessonProposals = new LessonProposals({
     bible,
-    notifier: {
-      proposed: ({ title, detail }) =>
-        notifications.post({ kind: LESSONS_PROPOSAL_KIND, routing: 'needs-owner', severity: 'info', title, detail }).id,
-      resolve: (id, by) => {
-        ledger.resolveNotificationById(id, by);
-      },
-      stale: ({ title, detail }) => {
-        notifications.post({ kind: 'lessons.proposal-stale', routing: 'fyi', severity: 'info', title, detail });
-      },
-    },
+    notifier: lessonProposalNotifier({ notifications, ledger }),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
+  // A decision interrupted by a crash or restart is finished, a stale
+  // proposal withdrawn, and a pending one's For You notice re-ensured. A
+  // corrupt record is logged here and fails the next dream pass loudly.
+  try {
+    lessonProposals.reconcile();
+  } catch (error) {
+    logger.log('error', 'lesson proposal reconcile failed at startup', { error: String(error) });
+  }
   const lessonsServer = createLessonsServer({
     config,
     journal,

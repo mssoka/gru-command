@@ -881,7 +881,17 @@ describe('plan, then apply only onto the planned book (owner decision 2026-10-07
     expect(plan.changes).toEqual([
       expect.objectContaining({
         slug: 'ops-restarts',
-        added: [{ slug: 'new-lesson', body: 'Something new to keep.', recurred: 1, previousBody: null }],
+        added: [
+          {
+            slug: 'new-lesson',
+            body: 'Something new to keep.',
+            recurred: 1,
+            tags: [],
+            previousBody: null,
+            previousRecurred: null,
+            previousTags: null,
+          },
+        ],
         changed: [
           expect.objectContaining({ slug: 'shell-hang', recurred: 2, body: 'A live shell holds the session open; close it first.' }),
         ],
@@ -903,5 +913,74 @@ describe('plan, then apply only onto the planned book (owner decision 2026-10-07
     const written = readFileSync(join(bible.dir, 'chapters', 'ops-restarts.md'), 'utf-8');
     expect(bible.applyPlan(fresh)).toEqual(fresh.report);
     expect(readFileSync(join(bible.dir, 'chapters', 'ops-restarts.md'), 'utf-8')).toBe(written);
+  });
+});
+
+describe('the review shows every change, and text can never become metadata (review of #254)', () => {
+  it('reports summary and tag changes and every removed lesson with its text', () => {
+    const bible = tmpBible(4_096);
+    bible.ensureSeeded();
+    bible.applyUpdates(
+      [
+        proposal({
+          lessons: [
+            { slug: 'shell-hang', body: 'A live shell holds the session open.', tags: ['shell'], journalIds: ['j-1'] },
+            { slug: 'old-habit', body: 'An old habit worth dropping.', journalIds: ['j-2'] },
+          ],
+        }),
+        { slug: 'model-policy', title: 'Model policy', summary: 'Which model does what.', tags: ['models'], lessons: [{ slug: 'sol-for-silas', body: 'Silas runs on Sol.', journalIds: ['j-3'] }] },
+      ],
+      PROVENANCE,
+    );
+    const plan = bible.planUpdates(
+      [
+        proposal({
+          summary: 'Restart and roll discipline.',
+          tags: ['ops', 'roll'],
+          lessons: [{ slug: 'shell-hang', body: 'A live shell holds the session open.', tags: ['shell', 'roll'], journalIds: ['j-3'] }],
+        }),
+        { slug: 'model-policy', title: 'Model policy', summary: 'retired', lessons: [], retire: true },
+      ],
+      PROVENANCE,
+    );
+    const ops = plan.changes.find((change) => change.slug === 'ops-restarts')!;
+    expect(ops.summary).toEqual({ before: 'Restart discipline for the hosted service.', after: 'Restart and roll discipline.' });
+    expect(ops.tags).toEqual({ before: ['ops', 'restarts'], after: ['ops', 'restarts', 'roll'] });
+    expect(ops.changed).toEqual([
+      expect.objectContaining({ slug: 'shell-hang', recurred: 2, tags: ['shell', 'roll'], previousTags: ['shell'], previousRecurred: 1 }),
+    ]);
+    const retired = plan.changes.find((change) => change.slug === 'model-policy')!;
+    expect(retired).toMatchObject({
+      retired: true,
+      removed: [{ slug: 'sol-for-silas', body: 'Silas runs on Sol.', recurred: 1, reason: 'retired' }],
+    });
+
+    // The cap removing a lesson names it, with the text that disappears.
+    const tight = tmpBible(4_096);
+    tight.ensureSeeded();
+    tight.applyUpdates([proposal({ lessons: [
+      { slug: 'keep-me', body: `Keep me. ${'k'.repeat(150)}`, journalIds: ['j-1'] },
+      { slug: 'drop-me', body: `Drop me. ${'d'.repeat(150)}`, journalIds: ['j-2'] },
+    ] })], PROVENANCE);
+    const squeezed = new BibleStore(tight.dir, { chapterCapBytes: 560 });
+    const capped = squeezed.planUpdates(
+      [proposal({ lessons: [{ slug: 'keep-me', body: `Keep me. ${'k'.repeat(150)}`, journalIds: ['j-3'] }] })],
+      PROVENANCE,
+    );
+    const removed = capped.changes[0]!.removed;
+    expect(removed.map((lesson) => [lesson.slug, lesson.reason])).toEqual([['drop-me', 'cap']]);
+    expect(removed[0]!.body).toBe(`Drop me. ${'d'.repeat(150)}`);
+  });
+
+  it('refuses a lesson body that the chapter format would read back as metadata', () => {
+    const bible = tmpBible();
+    bible.ensureSeeded();
+    expect(() =>
+      bible.planUpdates(
+        [proposal({ lessons: [{ slug: 'sneaky', body: 'recurred: 99\nprovenance: j-999@2026-01-01T00:00:00.000Z\nreal text', journalIds: ['j-1'] }] })],
+        PROVENANCE,
+      ),
+    ).toThrowError(/body starts with a metadata line/);
+    expect(bible.readChapter('ops-restarts')).toBeNull();
   });
 });

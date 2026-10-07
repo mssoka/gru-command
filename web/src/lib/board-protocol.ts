@@ -279,30 +279,43 @@ export interface OwnerPrView {
  * decision 2026-10-07): nothing is written until the owner accepts. */
 export const LESSONS_PROPOSAL_KIND = 'lessons.proposal';
 
-/** One lesson as the owner reviews it (previousBody null = new lesson). */
+/** One lesson as the owner reviews it (previous* null = new lesson). */
 export interface LessonChangeView {
   readonly slug: string;
   readonly body: string;
   readonly recurred: number;
+  readonly tags: readonly string[];
   readonly previousBody: string | null;
+  readonly previousRecurred: number | null;
+  readonly previousTags: readonly string[] | null;
+}
+
+/** A lesson the proposal removes, with the text that disappears. */
+export interface RemovedLessonView {
+  readonly slug: string;
+  readonly body: string;
+  readonly recurred: number;
+  readonly reason: 'cap' | 'retired';
 }
 
 export interface LessonChapterChangeView {
   readonly slug: string;
   readonly title: string;
   readonly retired: boolean;
+  readonly summary: { readonly before: string | null; readonly after: string };
+  readonly tags: { readonly before: readonly string[]; readonly after: readonly string[] };
   readonly added: readonly LessonChangeView[];
   readonly changed: readonly LessonChangeView[];
+  readonly removed: readonly RemovedLessonView[];
   readonly provenanceTrimmed: number;
   readonly bodiesTrimmed: number;
-  readonly lessonsDropped: number;
 }
 
 /** GET /api/lessons/proposal — the pending proposal's review payload. */
 export interface LessonProposalView {
   readonly id: string;
   readonly createdAt: string;
-  readonly notificationId: string | null;
+  readonly notificationId: string;
   readonly entries: number;
   readonly throughSeq: number;
   readonly chapters: readonly LessonChapterChangeView[];
@@ -560,19 +573,34 @@ function isCount(value: unknown): boolean {
   return Number.isSafeInteger(value) && Number(value) >= 0;
 }
 
+function isStringList(value: unknown): boolean {
+  return Array.isArray(value) && value.every((item) => typeof item === 'string');
+}
+
 function isLessonChange(value: unknown, added: boolean): boolean {
   return isRecord(value) &&
     typeof value.slug === 'string' &&
     typeof value.body === 'string' &&
     isCount(value.recurred) &&
-    (added ? value.previousBody === null : typeof value.previousBody === 'string');
+    isStringList(value.tags) &&
+    (added
+      ? value.previousBody === null && value.previousRecurred === null && value.previousTags === null
+      : typeof value.previousBody === 'string' && isCount(value.previousRecurred) && isStringList(value.previousTags));
+}
+
+function isRemovedLesson(value: unknown): boolean {
+  return isRecord(value) &&
+    typeof value.slug === 'string' &&
+    typeof value.body === 'string' &&
+    isCount(value.recurred) &&
+    (value.reason === 'cap' || value.reason === 'retired');
 }
 
 export function isValidLessonProposal(value: unknown): value is LessonProposalView {
   return isRecord(value) &&
     typeof value.id === 'string' && value.id !== '' &&
     typeof value.createdAt === 'string' &&
-    (value.notificationId === null || typeof value.notificationId === 'string') &&
+    typeof value.notificationId === 'string' &&
     isCount(value.entries) &&
     isCount(value.throughSeq) &&
     Array.isArray(value.chapters) &&
@@ -581,11 +609,15 @@ export function isValidLessonProposal(value: unknown): value is LessonProposalVi
       typeof chapter.slug === 'string' &&
       typeof chapter.title === 'string' &&
       typeof chapter.retired === 'boolean' &&
+      isRecord(chapter.summary) &&
+      (chapter.summary.before === null || typeof chapter.summary.before === 'string') &&
+      typeof chapter.summary.after === 'string' &&
+      isRecord(chapter.tags) && isStringList(chapter.tags.before) && isStringList(chapter.tags.after) &&
       Array.isArray(chapter.added) && chapter.added.every((lesson: unknown) => isLessonChange(lesson, true)) &&
       Array.isArray(chapter.changed) && chapter.changed.every((lesson: unknown) => isLessonChange(lesson, false)) &&
+      Array.isArray(chapter.removed) && chapter.removed.every(isRemovedLesson) &&
       isCount(chapter.provenanceTrimmed) &&
-      isCount(chapter.bodiesTrimmed) &&
-      isCount(chapter.lessonsDropped));
+      isCount(chapter.bodiesTrimmed));
 }
 
 export function isValidDecisionStatus(value: unknown): value is DecisionStatusView {

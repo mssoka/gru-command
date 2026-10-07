@@ -15,6 +15,7 @@ import {
   DreamScheduler,
   DREAM_STATE_FILE,
   LessonProposals,
+  lessonProposalNotifier,
   loadDreamState,
   PROPOSAL_FILE,
   repairCommand,
@@ -27,7 +28,7 @@ import {
 } from '../src/lessons/dream.js';
 import { DREAM_PROMPT_BODY_CLAMP, parseDreamOutput, renderDreamPrompt } from '../src/lessons/distiller.js';
 import { JournalStore } from '../src/lessons/journal.js';
-import { DreamError, ProposalError, type JournalEntry, type ProposedChapter } from '../src/lessons/types.js';
+import { DreamError, type JournalEntry, type ProposedChapter } from '../src/lessons/types.js';
 
 /**
  * Dream pass (Book of Lessons distillation): cursor semantics, dedupe
@@ -637,31 +638,62 @@ describe('failing-dream incident, production wiring (owner incident 2026-10-07)'
 });
 
 describe('owner-approved lesson proposals (owner decision 2026-10-07)', () => {
+  /** Idempotent by id, like the production notifier; can fail on demand. */
   class FakeNotifier implements ProposalNotifier {
-    readonly posted: { title: string; detail: string }[] = [];
+    readonly notices = new Map<string, { title: string; detail: string }>();
+    readonly ensured: string[] = [];
     readonly resolved: { id: string; by: string }[] = [];
-    readonly staleNotices: { title: string; detail: string }[] = [];
-    proposed(input: { title: string; detail: string }): string {
-      this.posted.push(input);
-      return `notice-${this.posted.length}`;
+    readonly informed = new Map<string, { title: string; detail: string }>();
+    failEnsure = 0;
+    failResolve = 0;
+    ensure(input: { id: string; title: string; detail: string }): void {
+      this.ensured.push(input.id);
+      if (!this.notices.has(input.id)) this.notices.set(input.id, { title: input.title, detail: input.detail });
+      if (this.failEnsure > 0) {
+        this.failEnsure -= 1;
+        throw new Error('crash after the notice landed');
+      }
     }
     resolve(id: string, by: string): void {
+      if (this.failResolve > 0) {
+        this.failResolve -= 1;
+        throw new Error('notification store down');
+      }
       this.resolved.push({ id, by });
     }
-    stale(input: { title: string; detail: string }): void {
-      this.staleNotices.push(input);
+    inform(input: { id: string; title: string; detail: string }): void {
+      if (!this.informed.has(input.id)) this.informed.set(input.id, { title: input.title, detail: input.detail });
     }
   }
 
-  function proposalHarness() {
+  function twoChapters(input: DistillInput): DistillResult {
+    const ids = input.entries.map((entry) => entry.id);
+    return {
+      chapters: [
+        updateFrom(input.entries),
+        {
+          slug: 'review-rounds',
+          title: 'Review rounds',
+          summary: 'One head per round.',
+          tags: ['review'],
+          lessons: [{ slug: 'one-head', body: 'A round binds one head.', journalIds: ids }],
+        },
+      ],
+    };
+  }
+
+  function proposalHarness(responder?: (input: DistillInput) => DistillResult) {
     const root = tmpDir('gru-command-proposals-');
     const journal = new JournalStore(join(root, 'journal'));
     const bible = new BibleStore(join(root, 'bible'));
-    const distiller = new FakeDistiller();
+    const distiller = new FakeDistiller(responder);
     const notifier = new FakeNotifier();
     const proposals = new LessonProposals({ bible, notifier });
     const engine = new DreamEngine({ journal, bible, distiller, proposals });
-    return { journal, bible, distiller, notifier, proposals, engine };
+    const file = join(bible.dir, PROPOSAL_FILE);
+    const stored = () => JSON.parse(readFileSync(file, 'utf-8')) as Record<string, unknown>;
+    const store = (record: Record<string, unknown>) => writeFileSync(file, JSON.stringify(record));
+    return { journal, bible, distiller, notifier, proposals, engine, file, stored, store };
   }
 
   /** Every managed book file, so "untouched" is byte-exact. */
@@ -677,7 +709,7 @@ describe('owner-approved lesson proposals (owner decision 2026-10-07)', () => {
 
   const cursor = (bible: BibleStore): number => loadDreamState(join(bible.dir, DREAM_STATE_FILE)).coveredThroughSeq;
 
-  it('needs exactly one write path: owner proposals or explicit autoApply', () => {
+  it('needs exactly one write path, and one cursor shared with the proposals', () => {
     const h = proposalHarness();
     expect(() => new DreamEngine({ journal: h.journal, bible: h.bible, distiller: h.distiller })).toThrowError(
       /exactly one write path/,
@@ -685,9 +717,18 @@ describe('owner-approved lesson proposals (owner decision 2026-10-07)', () => {
     expect(
       () => new DreamEngine({ journal: h.journal, bible: h.bible, distiller: h.distiller, proposals: h.proposals, autoApply: true }),
     ).toThrowError(/exactly one write path/);
+    expect(
+      () => new DreamEngine({
+        journal: h.journal,
+        bible: h.bible,
+        distiller: h.distiller,
+        proposals: h.proposals,
+        stateFile: join(h.bible.dir, 'other-state.json'),
+      }),
+    ).toThrowError(/one cursor must govern both/);
   });
 
-  it('a pass proposes: the book and the cursor are untouched and the owner is asked once', async () => {
+  it('a pass proposes: the book and the cursor are untouched and the owner is asked once, under a fixed notice id', async () => {
     const h = proposalHarness();
     h.bible.ensureSeeded();
     const before = book(h.bible);
@@ -696,54 +737,77 @@ describe('owner-approved lesson proposals (owner decision 2026-10-07)', () => {
     expect(outcome).toMatchObject({ status: 'proposed', entries: 1, coveredThroughSeq: 0, lessonsAdded: 1 });
     expect(book(h.bible)).toEqual(before);
     expect(cursor(h.bible)).toBe(0);
-    expect(h.notifier.posted).toEqual([
-      {
-        title: 'Book of Lessons: 1 lesson change proposed',
-        detail: 'From 1 journal entry: 1 new, 0 updated across 1 chapter(s) (ops-restarts). Review the changes, then Accept or Reject.',
-      },
-    ]);
     const review = h.proposals.review()!;
-    expect(review).toMatchObject({ notificationId: 'notice-1', entries: 1, throughSeq: 1 });
+    expect(review.notificationId).toBe(`lessons-proposal:${review.id}`);
+    expect([...h.notifier.notices.entries()]).toEqual([
+      [
+        review.notificationId,
+        {
+          title: 'Book of Lessons: 1 lesson change proposed',
+          detail: 'From 1 journal entry: 1 new, 0 updated across 1 chapter(s) (ops-restarts). Review the changes, then Accept or Reject.',
+        },
+      ],
+    ]);
     expect(review.chapters).toEqual([
       expect.objectContaining({
         slug: 'ops-restarts',
         retired: false,
-        added: [{ slug: 'shell-hang', body: 'the one durable lesson', recurred: 1, previousBody: null }],
+        summary: { before: null, after: 'Restart discipline.' },
+        tags: { before: [], after: ['ops'] },
+        added: [
+          {
+            slug: 'shell-hang',
+            body: 'the one durable lesson',
+            recurred: 1,
+            tags: [],
+            previousBody: null,
+            previousRecurred: null,
+            previousTags: null,
+          },
+        ],
         changed: [],
+        removed: [],
       }),
     ]);
   });
 
-  it('while a proposal waits, a beat neither distills nor proposes again — and re-posts a lost notice', async () => {
+  it('while a proposal waits, a beat neither distills nor proposes again and re-ensures the SAME notice', async () => {
     const h = proposalHarness();
     h.journal.append({ kind: 'finding', source: 'gru', body: 'first' });
     await h.engine.run();
     h.journal.append({ kind: 'finding', source: 'gru', body: 'second' });
-    const waiting = await h.engine.run();
-    expect(waiting.status).toBe('awaiting-owner');
+    expect((await h.engine.run()).status).toBe('awaiting-owner');
+    expect((await h.engine.run()).status).toBe('awaiting-owner');
     expect(h.distiller.calls).toHaveLength(1);
-    expect(h.notifier.posted).toHaveLength(1);
+    expect(h.notifier.notices.size).toBe(1);
+    expect(new Set(h.notifier.ensured).size).toBe(1);
+  });
 
-    // A crash between persisting and posting leaves notificationId null.
-    const file = join(h.bible.dir, PROPOSAL_FILE);
-    writeFileSync(file, JSON.stringify({ ...JSON.parse(readFileSync(file, 'utf-8')), notificationId: null }));
-    await h.engine.run();
-    expect(h.notifier.posted).toHaveLength(2);
-    expect(h.proposals.review()!.notificationId).toBe('notice-2');
-    expect(h.distiller.calls).toHaveLength(1);
+  it('a crash right after the notice landed leaves no orphan: the next beat re-ensures the same id', async () => {
+    const h = proposalHarness();
+    h.journal.append({ kind: 'finding', source: 'gru', body: 'shell hang finding' });
+    h.notifier.failEnsure = 1;
+    await expect(h.engine.run()).rejects.toThrowError(/crash after the notice landed/);
+    expect(existsSync(h.file)).toBe(true);
+    expect((await h.engine.run()).status).toBe('awaiting-owner');
+    expect(h.notifier.notices.size).toBe(1);
+    expect([...h.notifier.notices.keys()]).toEqual([h.proposals.review()!.notificationId]);
   });
 
   it('Accept writes the planned update, advances the cursor and resolves the notice', async () => {
     const h = proposalHarness();
     const entry = h.journal.append({ kind: 'finding', source: 'gru', body: 'shell hang finding' });
     await h.engine.run();
-    const id = h.proposals.review()!.id;
+    const { id, notificationId } = h.proposals.review()!;
     const decision = h.proposals.accept(id);
     expect(decision).toMatchObject({ id, decision: 'accepted', coveredThroughSeq: entry.seq });
-    expect(h.bible.readChapter('ops-restarts')?.lessons[0]?.provenance).toEqual([{ id: entry.id, ts: entry.ts }]);
+    expect(h.bible.readChapter('ops-restarts')?.lessons[0]).toMatchObject({
+      body: 'the one durable lesson',
+      provenance: [{ id: entry.id, ts: entry.ts }],
+    });
     expect(cursor(h.bible)).toBe(entry.seq);
-    expect(h.notifier.resolved).toEqual([{ id: 'notice-1', by: 'owner:accepted' }]);
-    expect(h.proposals.pending()).toBeNull();
+    expect(h.notifier.resolved).toEqual([{ id: notificationId, by: 'owner:accepted' }]);
+    expect(existsSync(h.file)).toBe(false);
     expect((await h.engine.run()).status).toBe('noop');
   });
 
@@ -753,31 +817,129 @@ describe('owner-approved lesson proposals (owner decision 2026-10-07)', () => {
     const before = book(h.bible);
     const entry = h.journal.append({ kind: 'finding', source: 'gru', body: 'not worth keeping' });
     await h.engine.run();
-    const decision = h.proposals.reject(h.proposals.review()!.id);
-    expect(decision).toMatchObject({ decision: 'rejected', coveredThroughSeq: entry.seq, report: null });
+    const { id, notificationId } = h.proposals.review()!;
+    expect(h.proposals.reject(id)).toMatchObject({ decision: 'rejected', coveredThroughSeq: entry.seq, report: null });
     expect(book(h.bible)).toEqual(before);
     expect(cursor(h.bible)).toBe(entry.seq);
-    expect(h.notifier.resolved).toEqual([{ id: 'notice-1', by: 'owner:rejected' }]);
+    expect(h.notifier.resolved).toEqual([{ id: notificationId, by: 'owner:rejected' }]);
     expect((await h.engine.run()).status).toBe('noop');
     expect(h.distiller.calls).toHaveLength(1);
   });
 
-  it('a book that moved makes Accept stale: nothing written, cursor kept, owner told, next pass re-proposes', async () => {
+  it('a moved book makes Accept AND Reject refuse: nothing written, cursor kept, owner told, next pass re-proposes', async () => {
+    for (const decide of ['accept', 'reject'] as const) {
+      const h = proposalHarness();
+      h.journal.append({ kind: 'finding', source: 'gru', body: 'shell hang finding' });
+      await h.engine.run();
+      const { id, notificationId } = h.proposals.review()!;
+      writeFileSync(join(h.bible.dir, 'INDEX.md'), `${h.bible.readIndexText() ?? ''}\n`); // someone edits the book
+      const moved = book(h.bible);
+      expect(() => h.proposals[decide](id)).toThrowError(expect.objectContaining({ code: 'stale' }));
+      expect(book(h.bible)).toEqual(moved);
+      expect(cursor(h.bible)).toBe(0);
+      expect(existsSync(h.file)).toBe(false);
+      expect(h.notifier.resolved).toEqual([{ id: notificationId, by: 'stale' }]);
+      expect([...h.notifier.informed.keys()]).toEqual([`lessons-proposal-withdrawn:${id}`]);
+      expect((await h.engine.run()).status).toBe('proposed');
+      expect(h.distiller.calls).toHaveLength(2);
+    }
+  });
+
+  it('a beat withdraws a stale pending proposal instead of waiting on it forever', async () => {
     const h = proposalHarness();
     h.journal.append({ kind: 'finding', source: 'gru', body: 'shell hang finding' });
     await h.engine.run();
-    const id = h.proposals.review()!.id;
-    // Someone changed the book after the proposal was planned.
     writeFileSync(join(h.bible.dir, 'INDEX.md'), `${h.bible.readIndexText() ?? ''}\n`);
-    const moved = book(h.bible);
-    expect(() => h.proposals.accept(id)).toThrowError(ProposalError);
-    expect(book(h.bible)).toEqual(moved);
-    expect(cursor(h.bible)).toBe(0);
-    expect(h.proposals.pending()).toBeNull();
-    expect(h.notifier.resolved).toEqual([{ id: 'notice-1', by: 'stale' }]);
-    expect(h.notifier.staleNotices).toHaveLength(1);
+    expect((await h.engine.run()).status).toBe('proposed');
+    expect(h.notifier.resolved.map((entry) => entry.by)).toEqual(['stale']);
+    expect(h.distiller.calls).toHaveLength(2);
+  });
+
+  it('a recorded decision never flips: a crashed Reject cannot become an Accept, and its retry resumes it', async () => {
+    const h = proposalHarness();
+    h.bible.ensureSeeded();
+    const before = book(h.bible);
+    const entry = h.journal.append({ kind: 'finding', source: 'gru', body: 'shell hang finding' });
+    await h.engine.run();
+    const { id } = h.proposals.review()!;
+    // Crash after the Reject was recorded, before the cursor moved.
+    h.store({ ...h.stored(), decision: { kind: 'rejected', at: 'now', detail: null } });
+    expect(() => h.proposals.accept(id)).toThrowError(expect.objectContaining({ code: 'decided' }));
+    expect(book(h.bible)).toEqual(before);
+    expect(h.proposals.review()).toBeNull();
+    expect(h.proposals.reject(id)).toMatchObject({ decision: 'rejected', coveredThroughSeq: entry.seq });
+    expect(book(h.bible)).toEqual(before);
+    expect(existsSync(h.file)).toBe(false);
+  });
+
+  it('a crashed Accept cannot be reversed by Reject; the next reconcile finishes it exactly once', async () => {
+    const h = proposalHarness(twoChapters);
+    const entry = h.journal.append({ kind: 'finding', source: 'gru', body: 'shell hang finding' });
+    await h.engine.run();
+    const { id } = h.proposals.review()!;
+    const record = h.stored();
+    const plan = record['plan'] as { writes: { slug: string; text: string }[] };
+    // Crash mid-Accept: decision recorded, first chapter written, the rest not.
+    h.store({ ...record, decision: { kind: 'accepted', at: 'now', detail: null } });
+    writeFileSync(join(h.bible.chaptersDir, `${plan.writes[0]!.slug}.md`), plan.writes[0]!.text);
+    expect(() => h.proposals.reject(id)).toThrowError(expect.objectContaining({ code: 'decided' }));
+    expect(h.proposals.reconcile()).toBeNull();
+    expect(h.bible.readChapter('ops-restarts')?.lessons[0]?.recurred).toBe(1);
+    expect(h.bible.readChapter('review-rounds')?.lessons[0]?.recurred).toBe(1);
+    expect(cursor(h.bible)).toBe(entry.seq);
+    expect(existsSync(h.file)).toBe(false);
+    expect((await h.engine.run()).status).toBe('noop');
+  });
+
+  it('closing keeps the record until the notice is resolved: a failed resolve is finished later, not lost', async () => {
+    const h = proposalHarness();
+    const entry = h.journal.append({ kind: 'finding', source: 'gru', body: 'shell hang finding' });
+    await h.engine.run();
+    const { id, notificationId } = h.proposals.review()!;
+    h.notifier.failResolve = 1;
+    expect(() => h.proposals.accept(id)).toThrowError(/notification store down/);
+    expect(cursor(h.bible)).toBe(entry.seq);
+    expect(existsSync(h.file)).toBe(true);
+    expect(h.proposals.review()).toBeNull();
+    expect(h.proposals.reconcile()).toBeNull();
+    expect(h.notifier.resolved).toEqual([{ id: notificationId, by: 'owner:accepted' }]);
+    expect(existsSync(h.file)).toBe(false);
+  });
+
+  it('a withdrawal after the cursor moved replays the batch: it is still proposed, and the cursor never rewinds', async () => {
+    const h = proposalHarness();
+    const entry = h.journal.append({ kind: 'finding', source: 'gru', body: 'shell hang finding' });
+    await h.engine.run();
+    const state = loadDreamState(join(h.bible.dir, DREAM_STATE_FILE));
+    saveDreamState(join(h.bible.dir, DREAM_STATE_FILE), { ...state, coveredThroughSeq: 50 }); // moved elsewhere
     expect((await h.engine.run()).status).toBe('proposed');
     expect(h.distiller.calls).toHaveLength(2);
+    expect(h.distiller.calls[1]!.entries.map((replayed) => replayed.id)).toEqual([entry.id]);
+    h.proposals.accept(h.proposals.review()!.id);
+    const after = loadDreamState(join(h.bible.dir, DREAM_STATE_FILE));
+    expect(after.coveredThroughSeq).toBe(50);
+    expect(after.replay).toBeUndefined();
+    expect(h.bible.readChapter('ops-restarts')?.lessons[0]?.provenance.map((ref) => ref.id)).toEqual([entry.id]);
+  });
+
+  it('a corrupt or tampered stored plan is refused before a single write', async () => {
+    const h = proposalHarness(twoChapters);
+    h.bible.ensureSeeded();
+    h.journal.append({ kind: 'finding', source: 'gru', body: 'shell hang finding' });
+    await h.engine.run();
+    const before = book(h.bible);
+    const { id } = h.proposals.review()!;
+    const record = h.stored();
+    const plan = record['plan'] as { writes: unknown[] };
+    h.store({ ...record, plan: { ...plan, writes: [plan.writes[0], null] } });
+    expect(() => h.proposals.accept(id)).toThrowError(/malformed \(plan\.writes\[1\]\)/);
+    expect(book(h.bible)).toEqual(before);
+    const tampered = plan.writes.map((write, index) =>
+      index === 1 ? { ...(write as object), text: '# Review rounds\n\n## one-head\n\nrecurred: 9\n\nInjected.\n' } : write,
+    );
+    h.store({ ...record, plan: { ...plan, writes: tampered } });
+    expect(() => h.proposals.accept(id)).toThrowError(/plan is inconsistent/);
+    expect(book(h.bible)).toEqual(before);
   });
 
   it('a decision for no proposal, or for a different one, fails loud and changes nothing', async () => {
@@ -786,7 +948,40 @@ describe('owner-approved lesson proposals (owner decision 2026-10-07)', () => {
     h.journal.append({ kind: 'finding', source: 'gru', body: 'shell hang finding' });
     await h.engine.run();
     expect(() => h.proposals.reject('another-proposal')).toThrowError(expect.objectContaining({ code: 'mismatch' }));
-    expect(h.proposals.pending()).not.toBeNull();
+    expect(h.proposals.review()).not.toBeNull();
     expect(h.notifier.resolved).toEqual([]);
+  });
+
+  it('production notifier: the proposal is one owner-held For You row; deciding resolves it; withdrawal posts an FYI', async () => {
+    const root = tmpDir('gru-command-proposal-ledger-');
+    const db = new LedgerDb(root);
+    try {
+      const bus = new EventBus();
+      const ledger = new LedgerApi(db.handle, { bus });
+      const notifications = new NotificationCenter({ ledger, bus });
+      const journal = new JournalStore(join(root, 'journal'));
+      const bible = new BibleStore(join(root, 'bible'));
+      const proposals = new LessonProposals({ bible, notifier: lessonProposalNotifier({ notifications, ledger }) });
+      const engine = new DreamEngine({ journal, bible, distiller: new FakeDistiller(), proposals });
+      journal.append({ kind: 'finding', source: 'gru', body: 'first' });
+      await engine.run();
+      await engine.run(); // re-ensures; never a second row
+      const { id, notificationId } = proposals.review()!;
+      const rows = () => ledger.listNotifications({ limit: 50 }).filter((row) => row.kind === 'lessons.proposal');
+      expect(rows()).toHaveLength(1);
+      expect(rows()[0]).toMatchObject({ id: notificationId, routing: 'needs-owner', resolvedAt: null });
+      proposals.accept(id);
+      expect(ledger.getNotification(notificationId)?.resolvedBy).toBe('owner:accepted');
+
+      journal.append({ kind: 'finding', source: 'gru', body: 'second' });
+      await engine.run();
+      const second = proposals.review()!;
+      writeFileSync(join(bible.dir, 'INDEX.md'), `${bible.readIndexText() ?? ''}\n`);
+      expect(() => proposals.reject(second.id)).toThrowError(expect.objectContaining({ code: 'stale' }));
+      expect(ledger.getNotification(second.notificationId)?.resolvedBy).toBe('stale');
+      expect(ledger.getNotification(`lessons-proposal-withdrawn:${second.id}`)).toMatchObject({ routing: 'fyi' });
+    } finally {
+      db.close();
+    }
   });
 });

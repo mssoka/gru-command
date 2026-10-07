@@ -1861,7 +1861,17 @@ body {
     'title action'
     'meta action'
     'note action'
-    'review review';
+    'review review'
+    'error error';
+}
+
+.board-owner__error {
+  grid-area: error;
+  margin-top: 6px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--alert);
+  overflow-wrap: anywhere;
 }
 
 .board-owner__actions {
@@ -1936,6 +1946,18 @@ body {
       'note'
       'action';
     row-gap: 6px;
+  }
+
+  /* A proposal row keeps its review area in the single column — without
+     it the review becomes an implicit column and squeezes the title. */
+  .board-owner__row--proposal {
+    grid-template-areas:
+      'title'
+      'meta'
+      'note'
+      'review'
+      'action'
+      'error';
   }
 
   .board-owner__ack,

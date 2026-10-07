@@ -359,8 +359,36 @@ export class BoardClient {
       if (res.status === 401) {
         this.events.fatal('unauthorized (board api)');
       }
-      throw new Error(`board api ${path} → ${res.status}`);
+      let code: string | null = null;
+      let detail: string | null = null;
+      try {
+        const body = (await res.json()) as { error?: unknown; detail?: unknown };
+        code = typeof body.error === 'string' ? body.error : null;
+        detail = typeof body.detail === 'string' ? body.detail : null;
+      } catch {
+        /* a non-JSON error body keeps the status alone */
+      }
+      throw new BoardApiError(path, res.status, code, detail);
     }
     return res.json();
+  }
+}
+
+/** A board API refusal with the server's reason: the HTTP status, its
+ * error code and detail. A fetch failure (network ambiguity) is never one
+ * of these — callers can tell "the server said no" from "we don't know". */
+export class BoardApiError extends Error {
+  readonly path: string;
+  readonly status: number;
+  readonly code: string | null;
+  readonly detail: string | null;
+
+  constructor(path: string, status: number, code: string | null, detail: string | null) {
+    super(`board api ${path} → ${status}${detail !== null ? `: ${detail}` : ''}`);
+    this.name = 'BoardApiError';
+    this.path = path;
+    this.status = status;
+    this.code = code;
+    this.detail = detail;
   }
 }

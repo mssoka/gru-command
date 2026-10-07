@@ -38,6 +38,7 @@ import {
   type JobView,
   type LessonChangeView,
   type LessonProposalView,
+  type RemovedLessonView,
   type NotificationView,
   type PipelineEntryView,
   type RoundView,
@@ -100,7 +101,7 @@ function lensProgressLabel(summary: RoundSummary): string {
   }
   return parts.join(' · ');
 }
-import type { BoardClient } from '../lib/board-client.js';
+import { BoardApiError, type BoardClient } from '../lib/board-client.js';
 import type { StorageLike } from '../theme.js';
 import { DECISION_LABELS, decisionChipTone } from './decisions-status.js';
 import { el, mustGet } from './dom.js';
@@ -166,6 +167,11 @@ export class BoardView {
    * the mock feed carries ack-ready rows without a client; rebound on
    * re-pair). */
   private boardClient: BoardClient | null;
+  /** Lesson proposal rows' UI state by notification id, shared by the band
+   * and the bell and kept across snapshot re-renders (review disclosure,
+   * fetched review, in-flight decision, last refusal). Pruned when the
+   * proposal leaves FOR YOU; cleared on re-pair. */
+  private readonly proposalStates = new Map<string, ProposalRowState>();
   /** Toast + browser-notification surface (E7). */
   private onToast: ((notification: NotificationView) => void) | null = null;
   private snapshot: BoardSnapshot | null = null;
@@ -260,6 +266,7 @@ export class BoardView {
    * previous server's fetched receipts or resume its pagination cursor. */
   bindClient(client: BoardClient): void {
     this.boardClient = client;
+    this.proposalStates.clear();
     this.sentShown.clear();
     this.extraReceipts = [];
     this.receiptsNextOffset = 0;
@@ -270,6 +277,10 @@ export class BoardView {
   render(snapshot: BoardSnapshot): void {
     const previous = this.snapshot;
     this.snapshot = snapshot;
+    const pendingProposals = new Set(
+      ownerRows(snapshot).filter((row) => row.kind === 'proposal').map((row) => row.notification.id),
+    );
+    for (const id of this.proposalStates.keys()) if (!pendingProposals.has(id)) this.proposalStates.delete(id);
     // Focus preservation across live pushes: the control the operator was
     // on keeps its place (stable focus keys), so a snapshot update never
     // steals focus or resets a disclosure mid-interaction.
@@ -535,11 +546,20 @@ export class BoardView {
   }
 
   /** A Book of Lessons proposal (owner decision 2026-10-07): the owner
-   * reviews the exact lesson text, then Accept writes it or Reject discards
-   * it. Like Ack, the row stays pending on any HTTP ambiguity — only the
-   * authoritative snapshot (the notification resolved) closes it. */
+   * reviews every change — lesson text, metadata, removals — then Accept
+   * writes it or Reject discards it. The row's state lives in
+   * proposalStates, so a snapshot push never closes the review, drops the
+   * fetched text, or re-enables an in-flight decision, and the band and the
+   * bell show one state. Like Ack, only the authoritative snapshot (the
+   * notification resolved) closes the row. */
   private ownerProposalRow(row: OwnerProposalRow, bandVisible: boolean): HTMLElement {
     const item = row.notification;
+    let state = this.proposalStates.get(item.id);
+    if (state === undefined) {
+      state = { open: false, review: null, loading: null, inFlight: null, message: null };
+      this.proposalStates.set(item.id, state);
+    }
+    const current = state;
     const node = el('article', 'board-owner__row board-owner__row--proposal');
     node.append(
       el('div', 'board-owner__title', `📖 ${item.title}`),
@@ -554,11 +574,14 @@ export class BoardView {
     review.className = 'board-owner__review';
     const summary = document.createElement('summary');
     summary.textContent = 'Review changes';
-    const body = el('div', 'board-owner__review-body lbl', 'loading…');
+    const body = el('div', 'board-owner__review-body lbl');
+    if (current.review !== null) body.replaceChildren(renderProposalReview(current.review));
+    else body.textContent = current.loading !== null ? 'loading…' : 'not loaded — close and reopen to retry';
     review.append(summary, body);
-    let loaded: Promise<LessonProposalView> | null = null;
+    review.open = current.open;
     const load = (): Promise<LessonProposalView> => {
-      if (loaded !== null) return loaded;
+      if (current.review !== null) return Promise.resolve(current.review);
+      if (current.loading !== null) return current.loading;
       const client = this.boardClient;
       const pending: Promise<LessonProposalView> =
         client === null
@@ -569,56 +592,75 @@ export class BoardView {
             }
             return proposal;
           });
-      loaded = pending.then(
+      current.loading = pending.then(
         (proposal) => {
-          body.replaceChildren(renderProposalReview(proposal));
+          current.review = proposal;
+          current.loading = null;
+          this.rerenderOwner();
           return proposal;
         },
         (error: unknown) => {
-          loaded = null; // a later open/decision retries the fetch
-          body.replaceChildren(
-            el('div', 'lbl', `could not load the proposal: ${error instanceof Error ? error.message : String(error)}`),
-          );
+          current.loading = null; // a later open/decision retries the fetch
+          current.message = `Couldn’t load the proposal: ${describeProposalError(error)}`;
+          this.rerenderOwner();
           throw error;
         },
       );
-      return loaded;
+      return current.loading;
     };
     review.addEventListener('toggle', () => {
-      if (review.open) void load().catch(() => {});
+      // Only the owner opening it fetches: restoring an open disclosure on
+      // re-render (which also fires toggle) must never refetch in a loop.
+      const wasOpen = current.open;
+      current.open = review.open;
+      if (review.open && !wasOpen) void load().catch(() => {});
     });
     const actions = el('div', 'board-owner__actions');
     const accept = document.createElement('button');
     accept.type = 'button';
     accept.className = 'board-owner__ack board-owner__accept';
-    accept.textContent = 'Accept';
     accept.dataset.actionId = row.actionId;
     const reject = document.createElement('button');
     reject.type = 'button';
     reject.className = 'board-owner__ack board-owner__reject';
-    reject.textContent = 'Reject';
-    const decide = (decision: 'accept' | 'reject', control: HTMLButtonElement, label: string): void => {
-      accept.disabled = true;
-      reject.disabled = true;
-      control.textContent = decision === 'accept' ? 'accepting…' : 'rejecting…';
+    accept.textContent = current.inFlight === 'accept' ? 'accepting…' : 'Accept';
+    reject.textContent = current.inFlight === 'reject' ? 'rejecting…' : 'Reject';
+    accept.disabled = current.inFlight !== null;
+    reject.disabled = current.inFlight !== null;
+    const decide = (decision: 'accept' | 'reject'): void => {
+      if (current.inFlight !== null) return;
+      current.inFlight = decision;
+      current.message = null;
+      this.rerenderOwner();
       void load()
         .then((proposal) => this.boardClient!.decideLessonProposal(proposal.id, decision))
         .then(() => {
           /* Success is NOT completion — the row closes only when the
            * authoritative snapshot carries the resolution (any device). */
         })
-        .catch(() => {
-          accept.disabled = false;
-          reject.disabled = false;
-          control.textContent = label;
+        .catch((error: unknown) => {
+          current.inFlight = null;
+          current.message = describeDecisionFailure(error);
+          this.rerenderOwner();
         });
     };
-    accept.addEventListener('click', () => decide('accept', accept, 'Accept'));
-    reject.addEventListener('click', () => decide('reject', reject, 'Reject'));
+    accept.addEventListener('click', () => decide('accept'));
+    reject.addEventListener('click', () => decide('reject'));
     actions.append(accept, reject);
     node.append(review, actions);
+    if (current.message !== null) {
+      const message = el('div', 'board-owner__error', current.message);
+      message.setAttribute('role', 'alert');
+      node.append(message);
+    }
     if (bandVisible) this.sendShown(item, 'web-board');
     return node;
+  }
+
+  /** Re-render the owner surfaces from the last snapshot (proposal state
+   * changed between pushes). */
+  private rerenderOwner(): void {
+    if (this.snapshot !== null) this.render(this.snapshot);
   }
 
   /** One evidence-bound ready PR: affected heist, the exact head every
@@ -2095,8 +2137,37 @@ function formatTs(iso: string): string {
   return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
-/** The owner's review of a lesson proposal: every new and changed lesson
- * with its exact text (the prior text one click away), per chapter. */
+/** UI state of one lesson proposal row (see BoardView.proposalStates). */
+interface ProposalRowState {
+  open: boolean;
+  review: LessonProposalView | null;
+  loading: Promise<LessonProposalView> | null;
+  inFlight: 'accept' | 'reject' | null;
+  message: string | null;
+}
+
+function describeProposalError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** The owner-facing reason a decision did not land: the server's refusal
+ * (stale, already decided, gone) or an ambiguous network failure. */
+function describeDecisionFailure(error: unknown): string {
+  if (error instanceof BoardApiError) {
+    if (error.code === 'proposal_stale') {
+      return `Not applied — ${error.detail ?? 'the Book of Lessons changed'}. A fresh proposal will follow.`;
+    }
+    if (error.code === 'proposal_decided') return `Not applied — ${error.detail ?? 'this proposal was already decided'}.`;
+    if (error.status === 404) return 'Not applied — this proposal is no longer pending.';
+    return `Not applied — the server refused (${error.status}${error.detail !== null ? `: ${error.detail}` : ''}).`;
+  }
+  return `Couldn’t confirm the decision (${describeProposalError(error)}) — it may not have been recorded; check the book or retry.`;
+}
+
+/** The owner's review of a lesson proposal: per chapter, every change the
+ * Accept would make — summary and tag changes, new and updated lessons with
+ * their exact text (the prior text one click away), and every lesson that
+ * would disappear, with its text. */
 function renderProposalReview(proposal: LessonProposalView): HTMLElement {
   const root = el('div', 'board-owner__review-list');
   root.append(
@@ -2109,15 +2180,42 @@ function renderProposalReview(proposal: LessonProposalView): HTMLElement {
   if (proposal.chapters.length === 0) root.append(el('div', 'lbl', 'no chapter changes'));
   for (const chapter of proposal.chapters) {
     const section = el('section', 'board-owner__review-chapter');
-    section.append(
-      el('div', 'board-owner__review-heading', chapter.retired ? `${chapter.title} — chapter retired` : chapter.title),
-    );
+    if (chapter.retired) {
+      section.append(
+        el(
+          'div',
+          'board-owner__review-heading',
+          `${chapter.title} — chapter retired (${chapter.removed.length} lesson${chapter.removed.length === 1 ? '' : 's'} removed)`,
+        ),
+      );
+    } else {
+      section.append(
+        el('div', 'board-owner__review-heading', chapter.summary.before === null ? `${chapter.title} — new chapter` : chapter.title),
+      );
+      if (chapter.summary.before !== chapter.summary.after) {
+        section.append(
+          el(
+            'div',
+            'lbl board-owner__review-meta',
+            chapter.summary.before === null
+              ? `summary: ${chapter.summary.after}`
+              : `summary: ${chapter.summary.before} → ${chapter.summary.after}`,
+          ),
+        );
+      }
+      const tagsChanged = chapter.tags.before.join('\u0000') !== chapter.tags.after.join('\u0000');
+      if (tagsChanged) {
+        section.append(
+          el('div', 'lbl board-owner__review-meta', `tags: ${chapter.tags.before.join(', ') || '—'} → ${chapter.tags.after.join(', ') || '—'}`),
+        );
+      }
+    }
     for (const lesson of chapter.added) section.append(reviewLesson('new', lesson));
     for (const lesson of chapter.changed) section.append(reviewLesson(`updated · recurred ${lesson.recurred}`, lesson));
+    for (const lesson of chapter.removed) section.append(reviewRemoved(lesson));
     const notes: string[] = [];
     if (chapter.provenanceTrimmed > 0) notes.push(`${chapter.provenanceTrimmed} oldest journal handle(s) released to fit`);
     if (chapter.bodiesTrimmed > 0) notes.push(`${chapter.bodiesTrimmed} lesson(s) trimmed to fit`);
-    if (chapter.lessonsDropped > 0) notes.push(`${chapter.lessonsDropped} lesson(s) dropped to fit`);
     if (notes.length > 0) section.append(el('div', 'lbl', notes.join(' · ')));
     root.append(section);
   }
@@ -2130,12 +2228,32 @@ function reviewLesson(label: string, lesson: LessonChangeView): HTMLElement {
     el('div', 'lbl board-owner__review-label', `${label} · ${lesson.slug}`),
     el('div', 'board-owner__review-text', lesson.body),
   );
-  if (lesson.previousBody !== null) {
+  if (lesson.previousTags === null) {
+    if (lesson.tags.length > 0) node.append(el('div', 'lbl board-owner__review-meta', `tags: ${lesson.tags.join(', ')}`));
+  } else if (lesson.previousTags.join('\u0000') !== lesson.tags.join('\u0000')) {
+    node.append(
+      el('div', 'lbl board-owner__review-meta', `tags: ${lesson.previousTags.join(', ') || '—'} → ${lesson.tags.join(', ') || '—'}`),
+    );
+  }
+  if (lesson.previousBody !== null && lesson.previousBody !== lesson.body) {
     const before = document.createElement('details');
     const toggle = document.createElement('summary');
     toggle.textContent = 'before';
     before.append(toggle, el('div', 'board-owner__review-text board-owner__review-text--before', lesson.previousBody));
     node.append(before);
   }
+  return node;
+}
+
+function reviewRemoved(lesson: RemovedLessonView): HTMLElement {
+  const node = el('div', 'board-owner__review-lesson board-owner__review-lesson--removed');
+  node.append(
+    el(
+      'div',
+      'lbl board-owner__review-label',
+      `${lesson.reason === 'retired' ? 'removed with the chapter' : 'removed to fit the cap'} · ${lesson.slug}`,
+    ),
+    el('div', 'board-owner__review-text', lesson.body),
+  );
   return node;
 }
