@@ -1105,7 +1105,7 @@ test('keyboard reveal on independent Ack and PR rows sends nothing; Ack, OPEN PR
   // Unique accessible name per disclosure (row identity in the AT list).
   await expect(ackDisclose).toHaveAttribute('aria-label', /^Review decision: .+\(owner-ack:pend-0000\)$/);
   // Themed keyboard focus ring on the new control (:focus-visible after a
-  // keyboard interaction) — width, token colour and offset all pinned.
+  // keyboard interaction) — width, style, token colour and offset pinned.
   const ringOf = (locator: Locator) =>
     locator.evaluate((el) => {
       const s = getComputedStyle(el);

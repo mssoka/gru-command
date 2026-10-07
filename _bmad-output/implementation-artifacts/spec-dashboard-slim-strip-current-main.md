@@ -5,7 +5,7 @@ created: '2026-10-07'
 status: 'in-review'
 route: 'dispatch'
 baseline_commit: '49b558f243c7bacbfb46c7bc04f749bf131cefea'
-review_loop_iteration: 4
+review_loop_iteration: 5
 context: []
 ---
 
@@ -166,11 +166,15 @@ Round 4 reviewed `560703c5e340d0d813f73254f77623e35230eb23` (blind-hunter 17: 5 
 | R4-2 | The 1px containment tolerance was applied to the horizontal axes without justification (BH A2) | low | patch: tolerance confined to the vertical scroll axis; horizontal containment exact. |
 | R4-3 | `exit "$code"` collides with the marker's `exit 2` space without the kind assertion (BH A3) | low | patch: exit semantics documented beside the scopes (marker line identifies a broken claim; tooling failures land in the exit-1 bucket); the kind assertion stays deferred. |
 | R4-4 | The head-focused → rows-return transition was unpinned (BH A4) | low | patch: the empty-band focus test now renders a third time with rows and asserts focus lands on the live control. |
-| R4-5 | Focus-ring assertions pinned only `outline-width` (BH A5) | low | patch: `ringOf` now asserts width, style, colour (`--work`) and offset. |
+| R4-5 | Focus-ring assertions pinned only `outline-width` (BH A5) | low | patch: `ringOf` now asserts width, colour (`--work`) and offset in `1a3aabd`; the fourth property (`outline-style`) was added by R5-2 in `e98a6d1` (round-6 BH D-1 correction). |
 
 Round-5 review at `1a3aabd` (blind-hunter 15: 3 delta + 12 follow-ups; edge-case 0; verification-gap 5: 1 delta + 4 follow-ups): the delta items (R5-1 pipeline-board runner evidence; R5-2 `outline-style`; R5-3 the comment's `tsc` example) were settled in `e98a6d18aa5b7cdf3d5334f78eacb315c5154d4d` (style pinned, comment corrected) and by the gate receipts below. Dispatch-transcription defect recorded: the round-5 briefs carried a hand-composed full SHA `1a3aabd6ac…` that does not exist; both reviewers resolved the unique short hash `1a3aabd` to the correct commit `1a3aabd37bb…` and reviewed it. Lesson: full SHAs are always copied from `git rev-parse`, never composed.
 
-Exact-head receipts at `1a3aabd` (all through the authenticated scheduler + shipped capture helper; complete sinks + receipts under `_bmad-output/verify-captures/current-main-20261007/`): unit GREEN 142 (run 27e0d0d8); strip-browser GREEN 67 (run 160fa00e); strip-smoke GREEN (run 168b978f); strip-themes GREEN (run 76abf9f9); dashboard-slim-strip-baseline RED exit 1 (run 058ac42e); strip-browser-baseline RED exit 1 (run 17c856ff); typecheck GREEN (run ad1f40e6); pipeline-board-browser GREEN (run a36b4903); full GREEN (run 8b1ba722; backend 2291, heavy 925, web 542 passed). Round-6 delta review commissioned at the post-`e98a6d1` candidate; only findings intersecting `1a3aabd..<candidate>` can block (others report as follow-ups; the whole-change coverage for convergence sits in this concluding round).
+Exact-head receipts at `1a3aabd` (all through the authenticated scheduler + shipped capture helper; complete sinks + receipts under `_bmad-output/verify-captures/current-main-20261007/`): unit GREEN 142 (run 27e0d0d8); strip-browser GREEN 67 (run 160fa00e); strip-smoke GREEN (run 168b978f); strip-themes GREEN (run 76abf9f9); dashboard-slim-strip-baseline RED exit 1 (run 058ac42e); strip-browser-baseline RED exit 1 (run 17c856ff); typecheck GREEN (run ad1f40e6); pipeline-board-browser GREEN (run a36b4903); full GREEN (run 8b1ba722; backend 2291, heavy 925, web 542 passed). Round-6 delta review commissioned at `50f5f9aae20bbd1ea7b52a5abfba7abbe3741d87`; only findings intersecting `1a3aabd..50f5f9a` could block (others report as follow-ups; the whole-change coverage for convergence sits in this concluding round). Round-6 findings were record/comment-only (D-1 attribution wording, D-2 placeholders, D-3 round-count wording, D-4 comment enumeration), fixed in the final record commit; the remaining round-6 follow-ups are recorded below and in `deferred-work.md`.
+
+Exact-final-head receipts at `50f5f9a` (after the round-5 fixes; all through the authenticated scheduler + shipped capture helper): unit GREEN 142 (run ac784b1b; an earlier attempt under request 16eca535 whose run cad0bf07 completed green server-side lost its capture stream to a queue-wait termination and is retained as an honest incomplete capture, never cited); strip-browser GREEN 67 (run 0b3da28a); strip-smoke GREEN (run 01dc594e); strip-themes GREEN (run b1de7e6e); dashboard-slim-strip-baseline RED exit 1 (run cb7d79d3); strip-browser-baseline RED exit 1 (run ecb81559); typecheck GREEN (run 6947d49a); pipeline-board-browser GREEN (run c8eaa1bb); full GREEN (run a66c0d5b; backend 2291, heavy 925, web 542 passed).
+
+Round-6 follow-ups (reported, not blocking; record only unless noted): the band-head fallback anchor has no themed focus ring (F-1); display receipts fire for collapsed rows whose full detail is hidden (F-2, doctrine note); the smoke KPI walk omits `jobs.binned` (F-3); the deploy `unknown` split branch is unexercised (F-4); non-alert pair tones are unpinned (F-5); `::before` KPI separators are exposed to AT (F-6); the capture suite overwrites fixed ignored paths without run-scoping (F-7); re-pairing reuses actionId/region state held from the previous connection (`bindClient` does not clear the band maps — edge-case follow-up); the spec Tasks section still says "union 4 scopes" where seven were added (edge-case claim follow-up, wording now consistent in Verification). The carried records (CHILDREN tone, group aria-label, unstamped geometry, narrow-width age/deferred legs, panel layout, baseline failure-kind) remain in `deferred-work.md`.
 
 ## Design Notes
 
@@ -190,6 +194,6 @@ Exact-head receipts at `1a3aabd` (all through the authenticated scheduler + ship
 - `pipeline-board-browser` — the existing main scope; expected GREEN (slim-strip chrome geometry migration).
 - `dashboard-slim-strip-baseline` / `strip-browser-baseline` — final test bytes over `git archive 49b558f…`; expected RED (feature absence), exits unmasked.
 - `full` (`npm test`) and `typecheck` at the same final head.
-- Independent whole-change review via `POST /api/dispatch` with `"deliverable": "review"` on the exact head (five rounds: 1–2 whole-change with full blocking scope, 3–5 delta-scoped from round 3); then exact-head CI and native Perkins READY on the exact final head.
+- Independent whole-change review via `POST /api/dispatch` with `"deliverable": "review"` on the exact head (six rounds: 1–2 whole-change with full blocking scope, 3–5 delta-scoped from round 3, 6 the concluding whole-change pass); then exact-head CI and native Perkins READY on the exact final head.
 
 **Manual checks:** personally inspect screenshots at 1440/1200/768/360 both themes; verify no overflow masking.

@@ -155,3 +155,12 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
   summary: `geometry()` cannot measure wake states without a valid stamp (`no wakes yet` / `last wake unknown`), so those states have text assertions only.
   evidence: Round-3 blind-hunter follow-up: `need(.board-age-split__num)` throws for unstamped states; add optional-slot handling when the geometry helper is next extended.
+- source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
+  summary: `bindClient` (re-pair) does not clear the owner band's `expandedOwnerRows`/`ownerRegionIds`, so an actionId reused by the new connection can render pre-expanded with a recycled region id.
+  evidence: Round-6 edge-case follow-up; reachable only across re-pair with a server that reuses ids; harden at the next owner-band touch (clear the maps in `bindClient` and pin with a unit test).
+- source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
+  summary: The capture suite overwrites fixed ignored screenshot paths without clearing or run-scoping, so a failed run can leave stale images that satisfy the manual inspection step.
+  evidence: Round-6 blind-hunter follow-up (F-7); clear or run-scope `web/e2e-artifacts/` before capturing at the next suite touch.
+- source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
+  summary: The `.strip-kpi + .strip-kpi::before` separator glyphs are CSS-generated content exposed to assistive technology.
+  evidence: Round-6 blind-hunter follow-up (F-6); replace with a real `aria-hidden` span or non-content separator at the next strip a11y pass.
