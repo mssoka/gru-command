@@ -2,8 +2,8 @@
 /**
  * Owner-run repair of the Book of Lessons' provenance, from the journal:
  *
- *   node tools/repair-bible-provenance.mjs [dataDir]           dry run
- *   node tools/repair-bible-provenance.mjs [dataDir] --write   apply
+ *   GRU_COMMAND_HOME=<instance> node tools/repair-bible-provenance.mjs [dataDir]           dry run
+ *   GRU_COMMAND_HOME=<instance> node tools/repair-bible-provenance.mjs [dataDir] --write   apply
  *
  * Why: the dream parser accepts provenance only as `<journal-id>@<iso-date>`.
  * Hand-edited chapters (`…; earlier: j-869, j-878`, `j-907,<ts>`) made every
@@ -14,10 +14,12 @@
  * provenance handles go first; see PROVENANCE_FLOOR in the bible).
  *
  * Running with --write IS the owner's approval: originals are saved under
- * <bible>/.repair-backup-<stamp>/chapters/ first, every chapter is re-read
- * with the strict parser afterwards, and any failure exits 1. The data dir
- * defaults to the service config's (GRU_COMMAND_HOME honored); the chapter
- * cap always comes from that config, so the repair matches the service.
+ * <bible>/.repair-backup-<stamp>-<nonce>/chapters/ first, every chapter is re-read
+ * with the strict parser afterwards, and any failure exits 1. The
+ * instance is selected by GRU_COMMAND_HOME (its config supplies the data
+ * dir and the chapter cap); a dataDir argument must name that same data
+ * dir. A write holds the book's write lock, so it never interleaves with a
+ * dream; a failed write names the replaced chapters and the backup.
  */
 import { Buffer } from 'node:buffer';
 import { readFileSync } from 'node:fs';
@@ -54,7 +56,15 @@ try {
 const [{ loadConfig }, { BibleStore }, { JournalStore }] = modules;
 
 const config = loadConfig(process.env, homedir());
-const dataDir = resolve(positional[0] ?? config.dataDir);
+const dataDir = resolve(config.dataDir);
+// The cap and every other setting come from ONE instance's config: a data
+// dir belonging to another instance would be repaired under the wrong cap.
+if (positional[0] !== undefined && resolve(positional[0]) !== dataDir) {
+  fail(
+    `${resolve(positional[0])} is not this instance's data dir (${dataDir}); ` +
+      'select the instance with GRU_COMMAND_HOME=<its instance dir> instead — nothing was written',
+  );
+}
 
 const journal = new JournalStore(join(dataDir, 'journal'));
 const journalTs = new Map();
@@ -74,6 +84,9 @@ let report;
 try {
   report = bible.repairProvenance(journalTs, { write });
 } catch (error) {
+  // A write-phase failure names what was replaced and where the originals
+  // are; every earlier failure happens before the first write.
+  if (error instanceof Error && error.name === 'RepairWriteError') fail(error.message);
   fail(`${error instanceof Error ? error.message : String(error)} — nothing was written`);
 }
 
@@ -83,7 +96,8 @@ for (const chapter of report.chapters) {
   out(
     `  ${chapter.changed ? 'CHANGE' : 'ok    '} ${chapter.slug}: lessons ${chapter.lessonsBefore}→${chapter.lessonsAfter}, ` +
       `provenance lines rewritten ${chapter.linesRewritten}, oldest handles released ${chapter.provenanceTrimmed}, ` +
-      `bodies trimmed ${chapter.bodiesTrimmed}, lessons dropped ${chapter.lessonsDropped}, ${chapter.bytes} B`,
+      `bodies trimmed ${chapter.bodiesTrimmed}, lessons dropped ${chapter.lessonsDropped}, ${chapter.bytes} B, ` +
+      `formatting ${chapter.formatting}`,
   );
 }
 const changed = report.chapters.filter((chapter) => chapter.changed).length;

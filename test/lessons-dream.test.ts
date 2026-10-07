@@ -1,9 +1,27 @@
 import { afterAll, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { EventBus } from '../src/events/bus.js';
+import { LedgerApi } from '../src/ledger/api.js';
+import { LedgerDb } from '../src/ledger/db.js';
+import { NotificationCenter } from '../src/notifications/center.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BibleStore } from '../src/lessons/bible.js';
-import { DreamEngine, DreamScheduler, DREAM_STATE_FILE, loadDreamState, saveDreamState, type DreamDistiller, type DistillInput, type DistillResult, type DreamOutcome } from '../src/lessons/dream.js';
+import {
+  dreamFailureIncidents,
+  DREAM_FAILED_KIND,
+  DreamEngine,
+  DreamScheduler,
+  DREAM_STATE_FILE,
+  loadDreamState,
+  repairCommand,
+  saveDreamState,
+  type DreamDistiller,
+  type DistillInput,
+  type DistillResult,
+  type DreamOutcome,
+} from '../src/lessons/dream.js';
 import { DREAM_PROMPT_BODY_CLAMP, parseDreamOutput, renderDreamPrompt } from '../src/lessons/distiller.js';
 import { JournalStore } from '../src/lessons/journal.js';
 import { DreamError, type JournalEntry, type ProposedChapter } from '../src/lessons/types.js';
@@ -336,6 +354,7 @@ describe('dream scheduler', () => {
     const failure = new DreamError('chapter completion-contract.md lesson x: provenance "j-878" must be "<journal-id>@<iso-date>"');
     const seen: unknown[] = [];
     const logged: string[] = [];
+    let successCalls = 0;
     const scheduler = new DreamScheduler({
       intervalMs: 0,
       dreamOnBoot: false,
@@ -347,18 +366,20 @@ describe('dream scheduler', () => {
         throw new Error('incident store down');
       },
       onSuccess: () => {
-        throw new Error('onSuccess must not fire for a failed pass');
+        successCalls += 1;
       },
       log: (_level, msg) => logged.push(msg),
     });
     await expect(scheduler.tick()).resolves.toBeNull();
     expect(seen).toEqual([failure]);
+    expect(successCalls).toBe(0);
     expect(logged).toContain('dream pass failed — journal cursor unchanged, next beat retries');
     expect(logged).toContain('dream onFailure hook threw');
   });
 
   it('a completed pass (noop included) resolves through onSuccess with its outcome', async () => {
     const outcomes: DreamOutcome[] = [];
+    let failureCalls = 0;
     const noop: DreamOutcome = {
       status: 'noop',
       entries: 0,
@@ -374,12 +395,13 @@ describe('dream scheduler', () => {
       dreamOnBoot: false,
       run: async () => noop,
       onFailure: () => {
-        throw new Error('onFailure must not fire for a completed pass');
+        failureCalls += 1;
       },
       onSuccess: (outcome) => outcomes.push(outcome),
     });
     await expect(scheduler.tick()).resolves.toEqual(noop);
     expect(outcomes).toEqual([noop]);
+    expect(failureCalls).toBe(0);
   });
 });
 
@@ -537,5 +559,47 @@ describe('due-based dream cadence (issue #221)', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe('failing-dream incident, production wiring (owner incident 2026-10-07)', () => {
+  it('one open incident per failure streak, resolved by the next completed pass, re-raised by a new failure', () => {
+    const dir = tmpDir('gru-command-dream-incident-');
+    const db = new LedgerDb(dir);
+    try {
+      const bus = new EventBus();
+      const ledger = new LedgerApi(db.handle, { bus });
+      const notifications = new NotificationCenter({ ledger, bus });
+      const hooks = dreamFailureIncidents(notifications, 'REPAIR-COMMAND');
+      const open = () =>
+        ledger.listNotifications({ limit: 50 }).filter((row) => row.kind === DREAM_FAILED_KIND && row.resolvedAt === null);
+      hooks.onFailure(new DreamError('provenance "j-878" must be "<journal-id>@<iso-date>"'));
+      hooks.onFailure(new DreamError('provenance "j-878" must be "<journal-id>@<iso-date>"'));
+      expect(open()).toHaveLength(1);
+      const first = open()[0]!;
+      expect(first).toMatchObject({ routing: 'action-required', severity: 'error' });
+      expect(first.detail).toContain('REPAIR-COMMAND');
+      hooks.onSuccess();
+      expect(open()).toHaveLength(0);
+      hooks.onFailure(new DreamError('model outage'));
+      expect(open()).toHaveLength(1);
+      expect(open()[0]!.id).not.toBe(first.id);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('the repair command selects this instance and survives spaces and quotes in every path', () => {
+    const root = tmpDir("gru-command-repair cmd 'q' ");
+    const instanceDir = join(root, "instance dir's");
+    const dataDir = join(root, 'data dir');
+    mkdirSync(instanceDir, { recursive: true });
+    mkdirSync(dataDir, { recursive: true });
+    const probe = join(root, 'probe tool.mjs');
+    writeFileSync(probe, 'process.stdout.write(JSON.stringify([process.env.GRU_COMMAND_HOME, process.argv[2]]));\n');
+    const command = repairCommand({ nodePath: process.execPath, toolPath: probe, instanceDir, dataDir });
+    const ran = spawnSync('sh', ['-c', command], { encoding: 'utf-8', env: { PATH: process.env.PATH ?? '' } });
+    expect(ran.status, ran.stderr).toBe(0);
+    expect(JSON.parse(ran.stdout)).toEqual([instanceDir, dataDir]);
   });
 });

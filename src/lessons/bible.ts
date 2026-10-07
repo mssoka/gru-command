@@ -1,5 +1,16 @@
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  closeSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+  writeSync,
+} from 'node:fs';
 import { join } from 'node:path';
 import type { LogLevel } from '../logger.js';
 import {
@@ -37,6 +48,28 @@ export const BIBLE_README_FILE = 'README.md';
 export const BIBLE_CHAPTERS_DIR = 'chapters';
 export const DEFAULT_CHAPTER_CAP_BYTES = 4_096;
 export const DEFAULT_INDEX_CAP_BYTES = 1_024;
+/** Cross-process write lock shared by the dream's apply and the repair. */
+export const BIBLE_WRITE_LOCK = '.write.lock';
+
+function readLockHolder(lock: string): { pid: number; action: string; at: string } | null {
+  try {
+    const parsed = JSON.parse(readFileSync(lock, 'utf-8')) as Record<string, unknown>;
+    return typeof parsed['pid'] === 'number' && Number.isSafeInteger(parsed['pid']) && parsed['pid'] > 0
+      ? { pid: parsed['pid'], action: String(parsed['action'] ?? 'unknown'), at: String(parsed['at'] ?? 'unknown') }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
 
 /** Below this a lesson body is "trimmed to the bone" — cap enforcement
  * shortens bodies down to it, then starts dropping least-valuable lessons. */
@@ -140,6 +173,9 @@ export interface ChapterRepairReport {
   readonly provenanceTrimmed: number;
   readonly bodiesTrimmed: number;
   readonly lessonsDropped: number;
+  /** `preserved`: original bytes kept apart from provenance and explicit cap
+   * edits; `canonical`: re-serialized (only when in place would not fit). */
+  readonly formatting: 'preserved' | 'canonical';
   readonly bytes: number;
 }
 
@@ -220,64 +256,132 @@ export class BibleStore {
   /**
    * Owner-run provenance repair (owner incident 2026-10-07): rebuild every
    * chapter's provenance from the journal, re-apply the chapter cap, and —
-   * only with `write` — back the originals up under
-   * `.repair-backup-<stamp>/chapters/` before replacing them atomically.
-   * Idempotent: a repaired book reports nothing to change. Any id missing
-   * from the journal aborts before a single file is written.
+   * only with `write` — back the originals up under a fresh
+   * `.repair-backup-<stamp>-<nonce>/chapters/` before replacing them
+   * atomically. Every chapter is repaired and checked BEFORE any write, so
+   * one bad chapter aborts with the book untouched. A write holds the
+   * book's write lock (the dream takes it too), so a dream can never land
+   * between this repair's read and its write. Chapters below the cap keep
+   * their exact bytes apart from the provenance lines. Idempotent.
    */
   repairProvenance(
     journalTs: ReadonlyMap<string, string>,
     opts: { readonly write: boolean; readonly now?: Date },
   ): ProvenanceRepairReport {
-    let names: string[];
-    try {
-      names = readdirSync(this.chaptersDir).filter((name) => name.endsWith('.md')).sort();
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { chapters: [], backupDir: null };
-      throw new BibleError(`bible chapters dir ${this.chaptersDir} is unreadable: ${String(error)}`);
-    }
-    const planned: { readonly slug: string; readonly original: string; readonly text: string }[] = [];
-    const chapters: ChapterRepairReport[] = [];
-    for (const name of names) {
-      const slug = name.slice(0, -'.md'.length);
-      if (!isLessonsSlug(slug)) {
-        throw new BibleError(`bible chapter file ${join(this.chaptersDir, name)} has an invalid slug filename`);
+    const run = (): ProvenanceRepairReport => {
+      let names: string[];
+      try {
+        names = readdirSync(this.chaptersDir).filter((name) => name.endsWith('.md')).sort();
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { chapters: [], backupDir: null };
+        throw new BibleError(`bible chapters dir ${this.chaptersDir} is unreadable: ${String(error)}`);
       }
-      const original = readFileSync(join(this.chaptersDir, name), 'utf-8');
-      const repaired = repairChapterProvenance(original, slug, journalTs);
-      const capped = enforceChapterCap(repaired.chapter, this.chapterCapBytes);
-      const changed = capped.text !== original;
-      const count = (chapter: BibleChapter): number =>
-        chapter.lessons.filter((lesson) => lesson.slug !== ARCHIVED_LESSON_SLUG).length;
-      chapters.push({
-        slug,
-        changed,
-        linesRewritten: repaired.linesRewritten,
-        lessonsBefore: count(repaired.chapter),
-        lessonsAfter: count(capped.chapter),
-        provenanceTrimmed: capped.provenanceTrimmed,
-        bodiesTrimmed: capped.trimmed,
-        lessonsDropped: capped.droppedLessons,
-        bytes: Buffer.byteLength(capped.text, 'utf8'),
-      });
-      if (changed) planned.push({ slug, original, text: capped.text });
-    }
-    if (!opts.write || planned.length === 0) return { chapters, backupDir: null };
+      const planned: { readonly slug: string; readonly original: string; readonly text: string }[] = [];
+      const chapters: ChapterRepairReport[] = [];
+      for (const name of names) {
+        const slug = name.slice(0, -'.md'.length);
+        if (!isLessonsSlug(slug)) {
+          throw new BibleError(`bible chapter file ${join(this.chaptersDir, name)} has an invalid slug filename`);
+        }
+        const original = readFileSync(join(this.chaptersDir, name), 'utf-8');
+        const repaired = repairChapterProvenance(original, slug, journalTs);
+        const capped = enforceChapterCap(repaired.chapter, this.chapterCapBytes);
+        const capActed = capped.provenanceTrimmed + capped.trimmed + capped.droppedLessons > 0;
+        const inPlace = capActed ? renderCappedInPlace(repaired.text, capped.chapter) : repaired.text;
+        const fits = inPlace !== null && Buffer.byteLength(inPlace, 'utf8') <= this.chapterCapBytes;
+        const text = fits ? inPlace : capped.text;
+        const count = (chapter: BibleChapter): number =>
+          chapter.lessons.filter((lesson) => lesson.slug !== ARCHIVED_LESSON_SLUG).length;
+        chapters.push({
+          slug,
+          changed: text !== original,
+          linesRewritten: repaired.linesRewritten,
+          lessonsBefore: count(repaired.chapter),
+          lessonsAfter: count(capped.chapter),
+          provenanceTrimmed: capped.provenanceTrimmed,
+          bodiesTrimmed: capped.trimmed,
+          lessonsDropped: capped.droppedLessons,
+          formatting: fits ? 'preserved' : 'canonical',
+          bytes: Buffer.byteLength(text, 'utf8'),
+        });
+        if (text !== original) planned.push({ slug, original, text });
+      }
+      if (!opts.write || planned.length === 0) return { chapters, backupDir: null };
 
-    const stamp = (opts.now ?? new Date()).toISOString().replace(/[:.]/gu, '-');
-    const backupDir = join(this.dir, `.repair-backup-${stamp}`);
-    mkdirSync(join(backupDir, BIBLE_CHAPTERS_DIR), { recursive: true, mode: 0o700 });
-    for (const write of planned) {
-      this.writeAtomic(join(backupDir, BIBLE_CHAPTERS_DIR, `${write.slug}.md`), write.original);
+      const stamp = (opts.now ?? new Date()).toISOString().replace(/[:.]/gu, '-');
+      const backupDir = join(this.dir, `.repair-backup-${stamp}-${randomUUID().slice(0, 8)}`);
+      try {
+        mkdirSync(backupDir, { mode: 0o700 }); // exclusive: never reuses a snapshot
+        mkdirSync(join(backupDir, BIBLE_CHAPTERS_DIR), { mode: 0o700 });
+        for (const write of planned) {
+          this.writeAtomic(join(backupDir, BIBLE_CHAPTERS_DIR, `${write.slug}.md`), write.original);
+        }
+      } catch (error) {
+        throw new BibleError(
+          `could not back up the chapters to ${backupDir} (${String(error)}); the book was not changed`,
+        );
+      }
+      const written: string[] = [];
+      for (const write of planned) {
+        try {
+          this.writeAtomic(join(this.chaptersDir, `${write.slug}.md`), write.text);
+        } catch (error) {
+          throw new RepairWriteError(
+            `repair stopped after replacing ${written.length} of ${planned.length} chapter(s)` +
+              `${written.length > 0 ? ` (${written.join(', ')})` : ''} — ${error instanceof Error ? error.message : String(error)}. ` +
+              `The book may be partially repaired; every original is saved in ${backupDir}.`,
+            backupDir,
+            written,
+          );
+        }
+        written.push(write.slug);
+      }
+      this.log('info', 'bible provenance repaired', { chapters_written: written.length, backup_dir: backupDir });
+      return { chapters, backupDir };
+    };
+    return opts.write ? this.withWriteLock('provenance repair', run) : run();
+  }
+
+  /**
+   * The book's cross-process write lock (`.write.lock`): the dream's apply
+   * and the owner's repair both hold it across their reads and writes, so
+   * neither can overwrite the other's result. Contention fails loud; a lock
+   * left by a dead process is taken over with a warning.
+   */
+  private withWriteLock<T>(action: string, fn: () => T): T {
+    mkdirSync(this.dir, { recursive: true, mode: 0o700 });
+    const lock = join(this.dir, BIBLE_WRITE_LOCK);
+    const claim = (): number => openSync(lock, 'wx', 0o600);
+    let fd: number;
+    try {
+      fd = claim();
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+        throw new BibleError(`cannot take the book write lock ${lock}: ${String(error)}`);
+      }
+      const holder = readLockHolder(lock);
+      if (holder === null || processAlive(holder.pid)) {
+        throw new BibleError(
+          holder === null
+            ? `the Book of Lessons write lock ${lock} is held; if no dream or repair is running, remove it and retry`
+            : `the Book of Lessons is being written by pid ${holder.pid} (${holder.action}, since ${holder.at}); retry when it finishes`,
+        );
+      }
+      this.log('warn', 'bible write lock left by a dead process — taking it over', { lock, holder_pid: holder.pid, holder_action: holder.action });
+      rmSync(lock, { force: true });
+      try {
+        fd = claim();
+      } catch (retry) {
+        throw new BibleError(`the Book of Lessons write lock ${lock} was taken concurrently: ${String(retry)}`);
+      }
     }
-    for (const write of planned) {
-      this.writeAtomic(join(this.chaptersDir, `${write.slug}.md`), write.text);
+    try {
+      writeSync(fd, JSON.stringify({ pid: process.pid, action, at: new Date().toISOString() }));
+      closeSync(fd);
+      return fn();
+    } finally {
+      rmSync(lock, { force: true });
     }
-    this.log('info', 'bible provenance repaired', {
-      chapters_written: planned.length,
-      backup_dir: backupDir,
-    });
-    return { chapters, backupDir };
   }
 
   /**
@@ -287,6 +391,13 @@ export class BibleStore {
    * Any validation failure aborts before a single file is written.
    */
   applyUpdates(
+    updates: readonly ProposedChapter[],
+    provenance: ReadonlyMap<string, string>,
+  ): ApplyReport {
+    return this.withWriteLock('dream apply', () => this.applyUpdatesLocked(updates, provenance));
+  }
+
+  private applyUpdatesLocked(
     updates: readonly ProposedChapter[],
     provenance: ReadonlyMap<string, string>,
   ): ApplyReport {
@@ -538,52 +649,209 @@ function splitProvenance(value: string, chapterSlug: string, lessonSlug: string)
   return refs;
 }
 
+interface RawSection {
+  readonly heading: string;
+  readonly slug: string;
+  readonly meta: string[];
+  readonly body: string[];
+}
+
+/** Split a chapter's raw lines exactly as parseChapter/parseLesson read
+ * them: everything before the first `## ` anchor is the header; in each
+ * lesson, leading blank/metadata lines are its metadata block and the rest
+ * is its body. Joining the parts with "\n" reproduces the text verbatim. */
+function splitSections(text: string): { header: string[]; sections: RawSection[] } {
+  const header: string[] = [];
+  const sections: RawSection[] = [];
+  let current: RawSection | null = null;
+  let inMeta = false;
+  for (const line of text.split(/\r?\n/)) {
+    if (line.startsWith('## ')) {
+      current = { heading: line, slug: line.slice(3).trim(), meta: [], body: [] };
+      sections.push(current);
+      inMeta = true;
+      continue;
+    }
+    if (current === null) {
+      header.push(line);
+      continue;
+    }
+    if (inMeta && (line.trim() === '' || LESSON_META_LINE.test(line))) {
+      current.meta.push(line);
+      continue;
+    }
+    inMeta = false;
+    current.body.push(line);
+  }
+  return { header, sections };
+}
+
+function joinSections(header: readonly string[], sections: readonly RawSection[]): string {
+  const lines = [...header];
+  for (const section of sections) lines.push(section.heading, ...section.meta, ...section.body);
+  return lines.join('\n');
+}
+
+function provenanceLine(refs: readonly ProvenanceRef[]): string {
+  return `provenance: ${refs.map((ref) => `${ref.id}@${ref.ts}`).join(', ')}`;
+}
+
+const PROVENANCE_FRAGMENT = /^(j-\d+)(?:@(\S+))?$/u;
+const ISO_TIMESTAMP = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z$/u;
+
+/** Resolve one damaged provenance value against the journal. Only the
+ * shapes found in the hand-edited book are understood — `<id>`,
+ * `<id>@<iso>`, an `earlier:` list label, and `<id>,<iso>` (a timestamp
+ * split off by a comma). Any other fragment, any id the journal lacks, and
+ * any cited timestamp the journal contradicts abort: nothing is erased or
+ * invented silently. */
+function resolveDamagedProvenance(
+  value: string,
+  where: string,
+  journalTs: ReadonlyMap<string, string>,
+): ProvenanceRef[] {
+  const refs: ProvenanceRef[] = [];
+  let bareId: string | null = null;
+  for (const raw of value.split(/[,;]/u)) {
+    const fragment = raw.trim().replace(/^earlier:\s*/u, '').trim();
+    if (fragment === '') continue;
+    const match = PROVENANCE_FRAGMENT.exec(fragment);
+    if (match !== null) {
+      const id = match[1]!;
+      const ts = journalTs.get(id);
+      if (ts === undefined) {
+        throw new BibleError(`${where} cites journal id ${id}, which is not in the journal — refusing to invent provenance`);
+      }
+      if (match[2] !== undefined && match[2] !== ts) {
+        throw new BibleError(`${where} cites ${id}@${match[2]}, but the journal records ${id} at ${ts}`);
+      }
+      refs.push({ id, ts });
+      bareId = match[2] === undefined ? id : null;
+      continue;
+    }
+    if (bareId !== null && ISO_TIMESTAMP.test(fragment)) {
+      if (fragment !== journalTs.get(bareId)) {
+        throw new BibleError(`${where} cites ${bareId},${fragment}, but the journal records ${bareId} at ${journalTs.get(bareId)}`);
+      }
+      bareId = null;
+      continue;
+    }
+    throw new BibleError(
+      `${where} has an unrecognized provenance fragment ${JSON.stringify(fragment)} — the repair understands ` +
+        '<id>, <id>@<iso>, "earlier:" lists and <id>,<iso>; fix it by hand from the journal',
+    );
+  }
+  return refs;
+}
+
 /**
- * Rebuild every lesson `provenance:` line as canonical `<id>@<journal ts>`
- * from the journal, the ground truth. Recovers hand-edited shapes the
- * strict parser rejects (`…; earlier: j-869, j-878`, `j-907,<ts>`) without
- * guessing: every cited `j-<seq>` must exist in the journal, or this throws.
- * Handles are deduped and ordered oldest → newest, the order the dream
- * appends in. Only lesson metadata lines are touched — never body text.
+ * Rebuild every lesson's provenance as ONE canonical `<id>@<journal ts>`
+ * line from the journal, the ground truth, editing the chapter in place:
+ * every handle across the lesson's metadata block is collected, deduped
+ * and ordered oldest → newest (compareProvenance), the first provenance
+ * line is replaced and any others removed. Body text and every other byte
+ * are untouched. Recovers the hand-edited shapes the strict parser rejects
+ * (owner incident 2026-10-07) without guessing.
  */
 export function repairChapterProvenance(
   text: string,
   slug: string,
   journalTs: ReadonlyMap<string, string>,
-): { readonly chapter: BibleChapter; readonly linesRewritten: number } {
+): { readonly chapter: BibleChapter; readonly text: string; readonly linesRewritten: number } {
+  const { header, sections } = splitSections(text);
   let linesRewritten = 0;
-  let inMeta = false;
-  const lines = text.split(/\r?\n/).map((line) => {
-    // Mirrors parseChapter/parseLesson: a `## ` anchor opens a lesson's
-    // metadata block; the first non-blank, non-metadata line closes it.
-    if (line.startsWith('## ')) {
-      inMeta = true;
-      return line;
+  const repaired = sections.map((section) => {
+    const where = `chapter ${slug}.md lesson ${section.slug}`;
+    const refs: ProvenanceRef[] = [];
+    for (const line of section.meta) {
+      const meta = LESSON_META_LINE.exec(line);
+      if (meta?.[1] !== 'provenance') continue;
+      mergeProvenance(refs, resolveDamagedProvenance(meta[2] ?? '', where, journalTs));
     }
-    if (!inMeta) return line;
-    const meta = LESSON_META_LINE.exec(line);
-    if (meta === null) {
-      if (line.trim() !== '') inMeta = false;
-      return line;
+    refs.sort(compareProvenance);
+    const meta: string[] = [];
+    let placed = false;
+    for (const line of section.meta) {
+      if (LESSON_META_LINE.exec(line)?.[1] !== 'provenance') {
+        meta.push(line);
+        continue;
+      }
+      if (placed || refs.length === 0) {
+        linesRewritten += 1; // a duplicate (or empty) provenance line folds away
+        continue;
+      }
+      const canonical = provenanceLine(refs);
+      if (canonical !== line) linesRewritten += 1;
+      meta.push(canonical);
+      placed = true;
     }
-    if (meta[1] !== 'provenance') return line;
-    const ids = [...new Set((meta[2] ?? '').match(/\bj-\d+\b/gu) ?? [])];
-    const refs = ids
-      .map((id) => {
-        const ts = journalTs.get(id);
-        if (ts === undefined) {
-          throw new BibleError(
-            `chapter ${slug}.md cites journal id ${id}, which is not in the journal — refusing to invent provenance`,
-          );
-        }
-        return { id, ts };
-      })
-      .sort((left, right) => left.ts.localeCompare(right.ts) || left.id.localeCompare(right.id));
-    const canonical = `provenance: ${refs.map((ref) => `${ref.id}@${ref.ts}`).join(', ')}`;
-    if (canonical !== line) linesRewritten += 1;
-    return canonical;
+    return { ...section, meta };
   });
-  return { chapter: parseChapter(lines.join('\n'), slug), linesRewritten };
+  const repairedText = joinSections(header, repaired);
+  return { chapter: parseChapter(repairedText, slug), text: repairedText, linesRewritten };
+}
+
+/** Lessons, compared on everything the book stores. */
+function sameLessons(left: readonly BibleLesson[], right: readonly BibleLesson[]): boolean {
+  return JSON.stringify(left.map((lesson) => [lesson.slug, lesson.body, lesson.recurred, lesson.provenance, lesson.tags])) ===
+    JSON.stringify(right.map((lesson) => [lesson.slug, lesson.body, lesson.recurred, lesson.provenance, lesson.tags]));
+}
+
+/** Apply a capped chapter to the repaired text IN PLACE: surviving lessons
+ * keep their exact bytes except a released provenance handle or an
+ * explicitly trimmed body; dropped lessons' sections go; a new archive
+ * record is appended canonically. Null when the in-place result does not
+ * re-parse to exactly the capped chapter. */
+function renderCappedInPlace(text: string, capped: BibleChapter): string | null {
+  const { header, sections } = splitSections(text);
+  const bySlug = new Map(sections.map((section) => [section.slug, section]));
+  const out: RawSection[] = [];
+  for (const lesson of capped.lessons) {
+    const section = bySlug.get(lesson.slug);
+    if (section === undefined) {
+      const last = out.at(-1);
+      if (last !== undefined && (last.body.at(-1) ?? '') !== '') last.body.push('');
+      out.push({
+        heading: `## ${lesson.slug}`,
+        slug: lesson.slug,
+        meta: ['', `recurred: ${lesson.recurred}`, provenanceLine(lesson.provenance), ...(lesson.tags.length > 0 ? [`tags: ${lesson.tags.join(', ')}`] : []), ''],
+        body: [lesson.body.trim(), ''],
+      });
+      continue;
+    }
+    const meta = section.meta.map((line) =>
+      LESSON_META_LINE.exec(line)?.[1] === 'provenance' ? provenanceLine(lesson.provenance) : line,
+    );
+    const originalBody = section.body.join('\n').trim();
+    let body = section.body;
+    if (originalBody !== lesson.body) {
+      let trailing = 0;
+      while (trailing < section.body.length && section.body[section.body.length - 1 - trailing]!.trim() === '') trailing += 1;
+      body = [lesson.body.trim(), ...Array.from({ length: trailing }, () => '')];
+    }
+    out.push({ ...section, meta, body });
+  }
+  const rendered = joinSections(header, out);
+  try {
+    const reparsed = parseChapter(rendered, capped.slug);
+    return sameLessons(reparsed.lessons, capped.lessons) ? rendered : null;
+  } catch {
+    return null;
+  }
+}
+
+/** One write that failed mid-repair: names what was replaced and where the
+ * originals are, because the book may now be partially repaired. */
+export class RepairWriteError extends BibleError {
+  readonly backupDir: string;
+  readonly written: readonly string[];
+
+  constructor(message: string, backupDir: string, written: readonly string[]) {
+    super(message);
+    this.name = 'RepairWriteError';
+    this.backupDir = backupDir;
+    this.written = written;
+  }
 }
 
 // ------------------------------------------------------------------
@@ -771,152 +1039,149 @@ function applyLessonUpdates(
   };
 }
 
+/** The shared chronological order for journal handles: timestamp, then
+ * the numeric journal sequence (`j-<seq>`), so equal timestamps never fall
+ * back to insertion order. Oldest first. */
+export function compareProvenance(left: ProvenanceRef, right: ProvenanceRef): number {
+  return left.ts.localeCompare(right.ts) || journalSeq(left.id) - journalSeq(right.id) || left.id.localeCompare(right.id);
+}
+
+function journalSeq(id: string): number {
+  const match = /^j-(\d+)$/u.exec(id);
+  return match === null ? Number.MAX_SAFE_INTEGER : Number(match[1]);
+}
+
+/** Serialized bytes one handle costs inside a provenance line that keeps
+ * at least one other handle (`<id>@<ts>` plus its ", " separator). */
+function handleBytes(ref: ProvenanceRef): number {
+  return Buffer.byteLength(`${ref.id}@${ref.ts}`, 'utf8') + 2;
+}
+
 /**
- * Enforce the chapter byte cap: release the oldest provenance handles of
- * the most-cited lessons (never below the newest PROVENANCE_FLOOR), then
- * trim lesson bodies toward the bone, then drop the least-valuable lessons
- * (lowest `recurred`, oldest provenance) into an `archived-provenance`
- * record so nothing vanishes without a journal handle. Deterministic and
- * total: the returned text is <= cap or the function throws.
+ * Enforce the chapter byte cap. Journal handles are elastic first (owner
+ * decision 2026-10-07 — old references go before any lesson text): the
+ * archive record's oldest handles go first (down to one), then the oldest
+ * handle of the most-cited lesson (never below the newest
+ * PROVENANCE_FLOOR). Only then are lesson bodies trimmed toward the bone,
+ * and finally the least-valuable lessons (lowest `recurred`, oldest
+ * provenance) dropped — each dropped lesson's handles joining the ONE
+ * archive record at once, so nothing vanishes without a journal handle and
+ * the archive is never counted twice. Every step strictly shrinks something
+ * finite, so the loop runs until the chapter fits or no step applies.
+ * Deterministic and total: the returned text is <= cap or this throws.
  */
 export function enforceChapterCap(chapter: BibleChapter, capBytes: number): ChapterCapResult {
-  const lessons = chapter.lessons.map((lesson) => ({ ...lesson }));
+  let lessons: BibleLesson[] = chapter.lessons.map((lesson) => ({ ...lesson }));
   let provenanceTrimmed = 0;
   let trimmed = 0;
   let droppedLessons = 0;
   const droppedProvenance: ProvenanceRef[] = [];
-  const size = (candidate: BibleChapter): number =>
-    Buffer.byteLength(serializeChapter(candidate), 'utf8');
-  let current: BibleChapter = { ...chapter, lessons };
-
-  const rebuild = (): void => {
-    current = { ...chapter, lessons };
+  const serialized = (): number => Buffer.byteLength(serializeChapter({ ...chapter, lessons }), 'utf8');
+  let size = serialized();
+  if (size <= capBytes) {
+    return { chapter: { ...chapter, lessons }, text: serializeChapter({ ...chapter, lessons }), provenanceTrimmed, trimmed, droppedLessons, droppedProvenance };
+  }
+  // Handles are released from the oldest end of each (sorted) list; the
+  // offsets keep thousands of releases linear instead of re-serializing the
+  // chapter on every one.
+  lessons = lessons.map((lesson) => ({ ...lesson, provenance: [...lesson.provenance].sort(compareProvenance) }));
+  let released = lessons.map(() => 0);
+  const materialize = (): void => {
+    lessons = lessons.map((lesson, index) => ({ ...lesson, provenance: lesson.provenance.slice(released[index]) }));
+    released = lessons.map(() => 0);
   };
-  rebuild();
+  const live = (index: number): number => lessons[index]!.provenance.length - released[index]!;
+  const releaseOldest = (index: number): void => {
+    size -= handleBytes(lessons[index]!.provenance[released[index]!]!);
+    released[index] = released[index]! + 1;
+    provenanceTrimmed += 1;
+  };
 
-  // One step per iteration; a chapter may release hundreds of handles.
-  for (let guard = 0; guard < 10_000; guard += 1) {
-    if (size(current) <= capBytes) break;
-    // (0) provenance is elastic first, before any lesson text: the archive
-    // record's handles go first (down to one), then the OLDEST handle of the
-    // lesson citing the most, keeping its newest PROVENANCE_FLOOR handles.
-    let widest = lessons.findIndex(
-      (lesson) => lesson.slug === ARCHIVED_LESSON_SLUG && lesson.provenance.length > 1,
-    );
-    if (widest === -1) {
-      for (let index = 0; index < lessons.length; index += 1) {
-        const lesson = lessons[index]!;
-        if (lesson.slug === ARCHIVED_LESSON_SLUG || lesson.provenance.length <= PROVENANCE_FLOOR) continue;
-        if (widest === -1 || lesson.provenance.length > lessons[widest]!.provenance.length) widest = index;
-      }
+  const step = (): boolean => {
+    const archive = lessons.findIndex((lesson) => lesson.slug === ARCHIVED_LESSON_SLUG);
+    if (archive !== -1 && live(archive) > 1) {
+      releaseOldest(archive);
+      return true;
+    }
+    let widest = -1;
+    for (let index = 0; index < lessons.length; index += 1) {
+      if (lessons[index]!.slug === ARCHIVED_LESSON_SLUG || live(index) <= PROVENANCE_FLOOR) continue;
+      if (widest === -1 || live(index) > live(widest)) widest = index;
     }
     if (widest !== -1) {
-      const lesson = lessons[widest]!;
-      let oldest = 0;
-      for (let index = 1; index < lesson.provenance.length; index += 1) {
-        if (lesson.provenance[index]!.ts < lesson.provenance[oldest]!.ts) oldest = index;
-      }
-      lessons[widest] = { ...lesson, provenance: lesson.provenance.filter((_, index) => index !== oldest) };
-      provenanceTrimmed += 1;
-      rebuild();
-      continue;
+      releaseOldest(widest);
+      return true;
     }
+    materialize();
     // (1) shorten the longest trimmable body by the overshoot.
     let longest = -1;
     for (let index = 0; index < lessons.length; index += 1) {
       const lesson = lessons[index]!;
       if (lesson.slug === ARCHIVED_LESSON_SLUG) continue;
-      if (lesson.body.length <= MIN_LESSON_BODY_CHARS + TRIM_MARKER.length) continue;
-      if (longest === -1 || lesson.body.length > lessons[longest]!.body.length) longest = index;
+      if (untrimmed(lesson.body).length <= MIN_LESSON_BODY_CHARS) continue;
+      if (longest === -1 || untrimmed(lesson.body).length > untrimmed(lessons[longest]!.body).length) longest = index;
     }
     if (longest !== -1) {
-      const overshoot = size(current) - capBytes;
       const lesson = lessons[longest]!;
-      const nextLength = Math.max(
-        MIN_LESSON_BODY_CHARS,
-        lesson.body.length - overshoot - TRIM_MARKER.length,
-      );
-      lessons[longest] = {
-        ...lesson,
-        body: `${lesson.body.slice(0, nextLength).trimEnd()}${TRIM_MARKER}`,
-      };
+      const body = untrimmed(lesson.body);
+      const nextLength = Math.max(MIN_LESSON_BODY_CHARS, body.length - (size - capBytes) - TRIM_MARKER.length);
+      lessons[longest] = { ...lesson, body: `${body.slice(0, nextLength).trimEnd()}${TRIM_MARKER}` };
       trimmed += 1;
-      rebuild();
-      continue;
+      size = serialized();
+      return true;
     }
-    // (2) drop the least-valuable lesson, keeping its provenance handle.
+    // (2) drop the least-valuable lesson; its handles join the archive now.
     const candidate = pickDropCandidate(lessons);
-    if (candidate === -1) break;
+    if (candidate === -1) return false;
     const [dropped] = lessons.splice(candidate, 1);
-    if (dropped !== undefined) {
-      droppedLessons += 1;
-      mergeProvenance(droppedProvenance, dropped.provenance);
-    }
-    rebuild();
-  }
-
-  if (droppedProvenance.length > 0) {
-    // The archive must fit WITH the surviving lessons: make room by
-    // dropping further low-value lessons before shrinking provenance.
-    let archived = buildArchivedLesson(droppedProvenance);
-    while (
-      size(withArchive(chapter, lessons, archived)) > capBytes &&
-      pickDropCandidate(lessons) !== -1
-    ) {
-      const candidate = pickDropCandidate(lessons);
-      const [dropped] = lessons.splice(candidate, 1);
-      if (dropped === undefined) break;
-      droppedLessons += 1;
-      mergeProvenance(droppedProvenance, dropped.provenance);
-      archived = buildArchivedLesson(droppedProvenance);
-    }
-    const existing = lessons.findIndex((lesson) => lesson.slug === ARCHIVED_LESSON_SLUG);
-    if (existing !== -1) {
-      const merged = [...lessons[existing]!.provenance];
-      mergeProvenance(merged, droppedProvenance);
-      lessons[existing] = { ...archived, provenance: merged };
+    released.splice(candidate, 1);
+    droppedLessons += 1;
+    mergeProvenance(droppedProvenance, dropped!.provenance);
+    const archiveIndex = lessons.findIndex((lesson) => lesson.slug === ARCHIVED_LESSON_SLUG);
+    if (archiveIndex === -1) {
+      lessons.push(buildArchivedLesson([...dropped!.provenance].sort(compareProvenance)));
+      released.push(0);
     } else {
-      lessons.push(archived);
+      const merged = [...lessons[archiveIndex]!.provenance];
+      mergeProvenance(merged, dropped!.provenance);
+      lessons[archiveIndex] = { ...lessons[archiveIndex]!, provenance: merged.sort(compareProvenance) };
     }
-    rebuild();
-  }
+    size = serialized();
+    return true;
+  };
 
-  // Final squeeze: the archived provenance list is the only elastic part.
-  for (let guard = 0; size(current) > capBytes && guard < 100; guard += 1) {
-    const archivedIndex = lessons.findIndex((lesson) => lesson.slug === ARCHIVED_LESSON_SLUG);
-    if (archivedIndex === -1) break;
-    const archived = lessons[archivedIndex]!;
-    if (archived.provenance.length <= 1) break;
-    lessons[archivedIndex] = { ...archived, provenance: archived.provenance.slice(1) };
-    rebuild();
+  while (size > capBytes) {
+    if (!step()) break;
+    if (size <= capBytes) {
+      materialize();
+      size = serialized(); // the incremental count is re-proven exactly
+    }
   }
-  if (size(current) > capBytes) {
+  materialize();
+  const text = serializeChapter({ ...chapter, lessons });
+  if (Buffer.byteLength(text, 'utf8') > capBytes) {
     throw new BibleError(
-      `chapter ${chapter.slug} cannot fit ${capBytes} bytes even after trimming and dropping — raise lessons.chapter_cap_bytes`,
+      `chapter ${chapter.slug} cannot fit ${capBytes} bytes even after releasing provenance, trimming and dropping — raise lessons.chapter_cap_bytes`,
     );
   }
-  return {
-    chapter: current,
-    text: serializeChapter(current),
-    provenanceTrimmed,
-    trimmed,
-    droppedLessons,
-    droppedProvenance,
-  };
+  return { chapter: { ...chapter, lessons }, text, provenanceTrimmed, trimmed, droppedLessons, droppedProvenance };
 }
 
-function withArchive(
-  chapter: BibleChapter,
-  lessons: readonly BibleLesson[],
-  archived: BibleLesson,
-): BibleChapter {
-  return { ...chapter, lessons: [...lessons, archived] };
+/** A body without the cap's trim marker, so a re-trim never stacks markers. */
+function untrimmed(body: string): string {
+  return body.endsWith(TRIM_MARKER) ? body.slice(0, -TRIM_MARKER.length) : body;
 }
 
 function mergeProvenance(target: ProvenanceRef[], incoming: readonly ProvenanceRef[]): void {
   for (const ref of incoming) {
     if (!target.some((candidate) => candidate.id === ref.id)) target.push(ref);
   }
+}
+
+function newestRef(refs: readonly ProvenanceRef[]): ProvenanceRef | null {
+  let newest: ProvenanceRef | null = null;
+  for (const ref of refs) if (newest === null || compareProvenance(ref, newest) > 0) newest = ref;
+  return newest;
 }
 
 /** Lowest recurred first, then oldest newest-provenance — the lesson whose
@@ -931,12 +1196,11 @@ function pickDropCandidate(lessons: readonly BibleLesson[]): number {
       continue;
     }
     const best = lessons[candidate]!;
-    const bestNewest = best.provenance.at(-1)?.ts ?? '';
-    const otherNewest = lesson.provenance.at(-1)?.ts ?? '';
-    if (
-      lesson.recurred < best.recurred ||
-      (lesson.recurred === best.recurred && otherNewest < bestNewest)
-    ) {
+    const bestNewest = newestRef(best.provenance);
+    const otherNewest = newestRef(lesson.provenance);
+    const olderNewest =
+      otherNewest !== null && (bestNewest === null || compareProvenance(otherNewest, bestNewest) < 0);
+    if (lesson.recurred < best.recurred || (lesson.recurred === best.recurred && olderNewest)) {
       candidate = index;
     }
   }

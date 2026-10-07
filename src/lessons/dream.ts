@@ -34,6 +34,65 @@ export interface DreamState {
   readonly cycles: number;
 }
 
+/** POSIX single-quoted shell word. */
+export function shellQuote(word: string): string {
+  return `'${word.replace(/'/gu, `'\\''`)}'`;
+}
+
+/** The exact command that rebuilds a damaged book's provenance for THIS
+ * instance — its GRU_COMMAND_HOME, Node and data dir — pasteable from any
+ * shell, including a launchd service's non-default instance. */
+export function repairCommand(input: {
+  readonly nodePath: string;
+  readonly toolPath: string;
+  readonly instanceDir: string;
+  readonly dataDir: string;
+}): string {
+  return `GRU_COMMAND_HOME=${shellQuote(input.instanceDir)} ${shellQuote(input.nodePath)} ` +
+    `${shellQuote(input.toolPath)} ${shellQuote(input.dataDir)}`;
+}
+
+/** The notification surface a failing dream reports through
+ * (NotificationCenter in production). */
+export interface DreamIncidentPort {
+  postIncident(input: {
+    kind: string;
+    routing: 'action-required';
+    severity: 'error';
+    title: string;
+    detail: string;
+    dedupe: 'active';
+  }): unknown;
+  resolveIncidents(kindPrefix: string, by: string): unknown;
+}
+
+/** Production wiring for DreamScheduler's hooks: a failing dream is ONE
+ * open action-required incident per failure streak (it failed every pass
+ * for days unnoticed — owner incident 2026-10-07), carrying the repair
+ * command; the next completed pass resolves it. */
+export function dreamFailureIncidents(
+  port: DreamIncidentPort,
+  command: string,
+): { onFailure(error: unknown): void; onSuccess(): void } {
+  return {
+    onFailure: (error) => {
+      port.postIncident({
+        kind: DREAM_FAILED_KIND,
+        routing: 'action-required',
+        severity: 'error',
+        title: 'Lesson dream is failing — the Book of Lessons is not being updated',
+        detail:
+          `${String(error)}\n\nThe journal cursor is unchanged; the next beat retries. If a chapter's ` +
+          `provenance is malformed, rebuild it from the journal (dry run first, then add --write):\n${command}`,
+        dedupe: 'active',
+      });
+    },
+    onSuccess: () => {
+      port.resolveIncidents(DREAM_FAILED_KIND, 'dream');
+    },
+  };
+}
+
 export interface DistillInput {
   readonly entries: readonly JournalEntry[];
   /** Current INDEX.md text (null before the first seed). */
