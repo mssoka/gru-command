@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -9,6 +9,7 @@ import {
   defaultProbeExec,
   parseKernWaketime,
   probeAdvertisedTipMovementAsync,
+  parseProcUptimeMs,
   readKernWaketime,
   remainingTimeoutMs,
   sourceMovementSinceFreeze,
@@ -603,7 +604,9 @@ describe('Perkins admission preflight (gh-169)', () => {
         const wake = WALL0 + wakeOffsetMs;
         return `{ sec = ${Math.floor(wake / 1000)}, usec = ${(wake % 1000) * 1000} } Wed Oct  7 09:56:48 2026\n`;
       },
-      bootClockMs: () => null,
+      procUptime: () => {
+        throw new Error('ENOENT: /proc/uptime');
+      },
     };
   }
   /** The last wake predates the probe: no suspend. */
@@ -743,46 +746,211 @@ describe('Perkins admission preflight (gh-169)', () => {
     expect(asked.count).toBe(1);
   });
 
-  it('the production detector decides the one retry from the OS inputs alone (macOS wake, Linux boot clock)', async () => {
+  it('the production detector decides the one retry from the OS inputs alone (macOS wake, raw /proc/uptime)', async () => {
     const review = branchTargetReview('evidence-table');
-    const cases: Array<{ readonly name: string; readonly retry: boolean; readonly linuxAheadMs?: number | 'unreadable'; readonly mac?: number | null; readonly platform?: NodeJS.Platform }> = [
+    type Case = {
+      readonly name: string;
+      readonly retry: boolean;
+      readonly mac?: number | null;
+      readonly platform?: NodeJS.Platform;
+      /** Linux: how far each clock advances while the first step runs. */
+      readonly linux?: { readonly monoMs: number; readonly bootMs: number; readonly onWake?: 'unreadable' | 'garbled' };
+    };
+    const cases: Case[] = [
       { name: 'macOS woke after the start', retry: true, mac: 30_000 },
       { name: 'macOS woke at the start instant', retry: false, mac: 0 },
       { name: 'macOS last wake is stale', retry: false, mac: -3_600_000 },
       { name: 'macOS wake unreadable', retry: false, mac: null },
-      { name: 'Linux boot clock ran 60 s ahead', retry: true, linuxAheadMs: 60_000 },
-      { name: 'Linux boot clock ran exactly 1 s ahead', retry: false, linuxAheadMs: 1_000 },
-      { name: 'Linux boot clock unreadable on wake', retry: false, linuxAheadMs: 'unreadable' },
+      { name: 'Linux suspended 60 s: boot clock ran on, monotonic paused', retry: true, linux: { monoMs: 0, bootMs: 60_000 } },
+      { name: 'Linux 5.5 s stall on both clocks is no suspend', retry: false, linux: { monoMs: 5_500, bootMs: 5_500 } },
+      { name: 'Linux boot clock ahead by exactly 1 s', retry: false, linux: { monoMs: 5_500, bootMs: 6_500 } },
+      { name: 'Linux boot clock ahead by 1.01 s', retry: true, linux: { monoMs: 5_500, bootMs: 6_510 } },
+      { name: 'Linux /proc/uptime unreadable on wake', retry: false, linux: { monoMs: 0, bootMs: 60_000, onWake: 'unreadable' } },
+      { name: 'Linux /proc/uptime garbled on wake', retry: false, linux: { monoMs: 0, bootMs: 60_000, onWake: 'garbled' } },
       { name: 'no evidence source on this platform', retry: false, platform: 'win32' },
     ];
     for (const c of cases) {
       let t = 0;
-      let boot = 500_000;
-      let bootReads = 0;
-      const linux = c.linuxAheadMs !== undefined;
+      let bootMs = 500_000;
+      let uptimeReads = 0;
       // The first step is broken by the suspend: on macOS the budget clock
-      // jumped; on Linux it paused and the connection dropped.
+      // jumped; on Linux the clocks moved as the case says and the
+      // connection dropped.
       const git = scriptedGit(review.manifest.targetSha, (_args, call) => {
         if (call !== 1) return;
-        if (linux) {
-          boot += c.linuxAheadMs === 'unreadable' ? 60_000 : c.linuxAheadMs!;
+        if (c.linux !== undefined) {
+          t += c.linux.monoMs;
+          bootMs += c.linux.bootMs;
           throw new Error('fatal: the remote end hung up unexpectedly');
         }
         t += 60_000;
       });
-      const evidence: SuspendEvidenceIo = linux
-        ? {
-          platform: 'linux',
-          wallNow: () => WALL0,
-          kernWaketime: async () => { throw new Error('not macOS'); },
-          bootClockMs: () => (c.linuxAheadMs === 'unreadable' && bootReads++ > 0 ? null : boot),
-        }
+      // Raw /proc/uptime text — the production parser converts it.
+      const uptime = (): string => {
+        uptimeReads += 1;
+        if (uptimeReads > 1 && c.linux?.onWake === 'unreadable') throw new Error('EACCES: /proc/uptime');
+        if (uptimeReads > 1 && c.linux?.onWake === 'garbled') return 'not an uptime';
+        return `${(bootMs / 1000).toFixed(2)} 1234.56\n`;
+      };
+      const evidence: SuspendEvidenceIo = c.linux !== undefined
+        ? { platform: 'linux', wallNow: () => WALL0, kernWaketime: async () => { throw new Error('not macOS'); }, procUptime: uptime }
         : c.platform !== undefined
           ? { ...macWake(30_000), platform: c.platform }
           : macWake(c.mac ?? null);
       const movement = await probeAdvertisedTipMovementAsync(review, 5_000, { now: () => t, exec: git.exec, evidence });
       expect({ name: c.name, admitted: movement === null, attempts: git.calls.filter((call) => call === 'check-ref-format').length })
         .toEqual({ name: c.name, admitted: c.retry, attempts: c.retry ? 2 : 1 });
+    }
+    expect(parseProcUptimeMs('560.25 1234.56\n')).toBe(560_250);
+    expect(parseProcUptimeMs('')).toBeNull();
+  });
+
+  it('evidence that arrives at or past its allowance is no evidence — whether the reader or the loop was slow', async () => {
+    const review = branchTargetReview('evidence-late');
+    for (const slow of ['before answering', 'while answering'] as const) {
+      let t = 0;
+      const git = scriptedGit(review.manifest.targetSha, (_args, call) => {
+        if (call === 1) t += 60_000;
+      });
+      const wake = macWake(30_000);
+      const movement = await probeAdvertisedTipMovementAsync(review, 5_000, {
+        now: () => t,
+        exec: git.exec,
+        evidence: {
+          ...wake,
+          kernWaketime: (timeoutMs) => {
+            if (slow === 'before answering') t += 1_200; // a synchronous stall inside the reader
+            return wake.kernWaketime(timeoutMs).then((text) => {
+              if (slow === 'while answering') t += 1_200; // the answer lands late
+              return text;
+            });
+          },
+        },
+      });
+      expect({ slow, cause: movement?.cause, attempts: git.calls.filter((call) => call === 'check-ref-format').length })
+        .toEqual({ slow, cause: 'check-failed', attempts: 1 });
+    }
+  });
+
+  it('a retry that finds the advertised tip moved refuses with target-moved — and preflight refuses head-binding', async () => {
+    const review = branchTargetReview('retry-moved');
+    const moved = 'f'.repeat(40);
+    let t = 0;
+    const calls: string[] = [];
+    const exec = async (_repo: string, args: readonly string[]): Promise<string> => {
+      calls.push(args[0]!);
+      if (calls.length === 1) t += 60_000; // suspended during the first attempt
+      if (args[0] === 'rev-parse') return `refs/remotes/origin/feature/retry-moved\n`;
+      if (args[0] === 'remote') return 'origin\n';
+      if (args[0] === 'ls-remote') return `${moved}\trefs/heads/feature/retry-moved\n`; // pushed during the sleep
+      return '';
+    };
+    const movement = await probeAdvertisedTipMovementAsync(review, 5_000, { now: () => t, exec, evidence: macWake(30_000) });
+    expect(movement?.cause).toBe('target-moved');
+    expect(movement?.detail).toContain(moved);
+    expect(movement?.detail).toContain(review.manifest.targetSha);
+    expect(calls.filter((call) => call === 'check-ref-format')).toHaveLength(2);
+    const result = admissionPreflight(review, 'origin/feature/retry-moved', { precomputedRemoteMovement: movement });
+    expect(result.checks.find((check) => check.name === 'head-binding')?.ok).toBe(false);
+    expect(result.missing).toEqual(expect.arrayContaining([expect.objectContaining({ input: 'head-binding' })]));
+    expect(result.missing.find((entry) => entry.input === 'head-binding')?.detail).toContain('target-moved');
+  });
+
+  it('only git’s own refusal of the spelling skips the remote proof — an operational failure fails closed', async () => {
+    const review = branchTargetReview('operational');
+    const failing = (step: string, error: Error) => {
+      const calls: string[] = [];
+      const exec = async (_repo: string, args: readonly string[]): Promise<string> => {
+        calls.push(args[0]!);
+        if (args[0] === step) throw error;
+        if (args[0] === 'rev-parse') return 'refs/remotes/origin/feature/operational\n';
+        if (args[0] === 'remote') return 'origin\n';
+        if (args[0] === 'ls-remote') return `${review.manifest.targetSha}\trefs/heads/feature/operational\n`;
+        return '';
+      };
+      return { calls, exec };
+    };
+    const git128 = (stderr: string) => Object.assign(new Error(stderr), { code: 128, stderr });
+    // An unreadable repository exits 128 too — it proves nothing.
+    for (const [step, error] of [
+      ['check-ref-format', git128("fatal: cannot change to '/repo': No such file or directory")],
+      ['rev-parse', git128('fatal: Needed a single revision')],
+    ] as const) {
+      const git = failing(step, error);
+      const movement = await probeAdvertisedTipMovementAsync(review, 5_000, { now: () => 0, exec: git.exec, evidence: NO_SUSPEND });
+      expect({ step, cause: movement?.cause }).toEqual({ step, cause: 'check-failed' });
+      expect(git.calls).not.toContain('ls-remote');
+    }
+    // In time, git's own invalid-name answer is a spelling, not a branch: skip.
+    const named = failing('check-ref-format', git128("fatal: 'origin/topic~1' is not a valid branch name"));
+    expect(await probeAdvertisedTipMovementAsync(review, 5_000, { now: () => 0, exec: named.exec, evidence: NO_SUSPEND })).toBeNull();
+    // A real unreadable repository, end to end.
+    const away = `${review.manifest.repoPath}-away`;
+    renameSync(review.manifest.repoPath, away);
+    try {
+      const movement = await probeAdvertisedTipMovementAsync(review, 5_000, { evidence: NO_SUSPEND });
+      expect(movement?.cause).toBe('check-failed');
+    } finally {
+      renameSync(away, review.manifest.repoPath);
+    }
+  });
+
+  it('the synchronous movement probe fails closed on an operational check-ref-format failure, not "not a branch"', () => {
+    const review = branchTargetReview('sync-operational');
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    const shimDir = temp('admission-sync-operational-');
+    writeFileSync(
+      join(shimDir, 'git'),
+      `#!/bin/sh\ncase " $* " in *"check-ref-format"*) echo "fatal: cannot change to '/repo': No such file or directory" >&2; exit 128;; esac\nexec "${realGit}" "$@"\n`,
+    );
+    chmodSync(join(shimDir, 'git'), 0o755);
+    const oldPath = process.env.PATH;
+    process.env.PATH = `${shimDir}:${oldPath ?? ''}`;
+    try {
+      expect(sourceMovementSinceFreeze(review, { remoteProbeTimeoutMs: 5_000 })?.cause).toBe('check-failed');
+    } finally {
+      if (oldPath === undefined) delete process.env.PATH;
+      else process.env.PATH = oldPath;
+    }
+  });
+
+  it('nothing a timed-out probe step spawned outlives it — async admission step and sync remote probe alike', async () => {
+    const review = branchTargetReview('descendants');
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    const shimDir = temp('admission-descendant-shim-');
+    const pidFile = join(shimDir, 'descendant.pid');
+    writeFileSync(
+      join(shimDir, 'git'),
+      `#!/bin/sh\ncase " $* " in *"ls-remote"*) sleep 30 & echo $! > "${pidFile}"; trap '' TERM; exec sleep 10;; esac\nexec "${realGit}" "$@"\n`,
+    );
+    chmodSync(join(shimDir, 'git'), 0o755);
+    const alive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const descendantGone = async (): Promise<boolean> => {
+      const pid = Number(readFileSync(pidFile, 'utf8').trim());
+      for (let attempt = 0; attempt < 20 && alive(pid); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 50));
+      const gone = !alive(pid);
+      if (!gone) process.kill(pid, 'SIGKILL');
+      return gone;
+    };
+    const oldPath = process.env.PATH;
+    process.env.PATH = `${shimDir}:${oldPath ?? ''}`;
+    try {
+      // A bound long enough for the wrapper to have spawned its descendant.
+      await expect(defaultProbeExec(review.manifest.repoPath, ['ls-remote', 'origin'], 1_500)).rejects.toThrow(/timed out/);
+      expect(await descendantGone()).toBe(true);
+      rmSync(pidFile, { force: true });
+      expect(sourceMovementSinceFreeze(review, { remoteProbeTimeoutMs: 1_500 })?.cause).toBe('check-failed');
+      expect(await descendantGone()).toBe(true);
+    } finally {
+      if (oldPath === undefined) delete process.env.PATH;
+      else process.env.PATH = oldPath;
     }
   });
 
@@ -827,7 +995,14 @@ describe('Perkins admission preflight (gh-169)', () => {
       const movement = await probeAdvertisedTipMovementAsync(review, 5_000, {
         now: () => t,
         exec: git.exec,
-        evidence: { platform: 'darwin', wallNow: () => 0, kernWaketime: readKernWaketime, bootClockMs: () => null },
+        evidence: {
+          platform: 'darwin',
+          wallNow: () => 0,
+          kernWaketime: readKernWaketime,
+          procUptime: () => {
+            throw new Error('ENOENT: /proc/uptime');
+          },
+        },
       });
       expect(movement).toBeNull();
       expect(git.calls.filter((call) => call === 'check-ref-format')).toHaveLength(2);
