@@ -62,30 +62,50 @@ export interface DreamIncidentPort {
     title: string;
     detail: string;
     dedupe: 'active';
-  }): unknown;
+  }): { readonly id: string; readonly detail: string | null };
+  updateDetail(id: string, detail: string): unknown;
   resolveIncidents(kindPrefix: string, by: string): unknown;
 }
 
+const FIRST_FAILURE = /^First failure \(([^)]*)\): (.*)$/mu;
+const LATEST_FAILURE = /^Latest failure \([^)]*, failed pass (\d+)\): /mu;
+
 /** Production wiring for DreamScheduler's hooks: a failing dream is ONE
  * open action-required incident per failure streak (it failed every pass
- * for days unnoticed — owner incident 2026-10-07), carrying the repair
- * command; the next completed pass resolves it. */
+ * for days unnoticed — owner incident 2026-10-07). Its detail keeps the
+ * FIRST failure (when the streak began) and refreshes the LATEST one on
+ * every failed pass (owner decision 2026-10-07), with the repair command;
+ * the next completed pass resolves it. */
 export function dreamFailureIncidents(
   port: DreamIncidentPort,
   command: string,
+  now: () => Date = () => new Date(),
 ): { onFailure(error: unknown): void; onSuccess(): void } {
+  const oneLine = (error: unknown) => String(error).replace(/\s*\n\s*/gu, ' ');
+  const render = (first: { at: string; error: string }, latest: { at: string; error: string }, pass: number) =>
+    `First failure (${first.at}): ${first.error}\n` +
+    `Latest failure (${latest.at}, failed pass ${pass}): ${latest.error}\n\n` +
+    "The journal cursor is unchanged; the next beat retries. If a chapter's provenance is malformed, rebuild it " +
+    `from the journal (dry run first, then add --write):\n${command}`;
   return {
     onFailure: (error) => {
-      port.postIncident({
+      const latest = { at: now().toISOString(), error: oneLine(error) };
+      const fresh = render(latest, latest, 1);
+      const row = port.postIncident({
         kind: DREAM_FAILED_KIND,
         routing: 'action-required',
         severity: 'error',
         title: 'Lesson dream is failing — the Book of Lessons is not being updated',
-        detail:
-          `${String(error)}\n\nThe journal cursor is unchanged; the next beat retries. If a chapter's ` +
-          `provenance is malformed, rebuild it from the journal (dry run first, then add --write):\n${command}`,
+        detail: fresh,
         dedupe: 'active',
       });
+      if (row.detail === fresh) return; // a new streak
+      const first = FIRST_FAILURE.exec(row.detail ?? '');
+      const pass = Number(LATEST_FAILURE.exec(row.detail ?? '')?.[1] ?? '1') + 1;
+      port.updateDetail(
+        row.id,
+        render(first === null ? latest : { at: first[1]!, error: first[2]! }, latest, pass),
+      );
     },
     onSuccess: () => {
       port.resolveIncidents(DREAM_FAILED_KIND, 'dream');

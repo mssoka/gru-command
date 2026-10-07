@@ -68,10 +68,21 @@ if (positional[0] !== undefined && resolve(positional[0]) !== dataDir) {
 
 const journal = new JournalStore(join(dataDir, 'journal'));
 const journalTs = new Map();
+// The journal is the ground truth only if it is consistent: every id must
+// be its own sequence, and no id may carry two different timestamps.
 for (let after = 0; ; ) {
   const page = journal.list({ after, limit: 10_000 });
   if (page.length === 0) break;
-  for (const entry of page) journalTs.set(entry.id, entry.ts);
+  for (const entry of page) {
+    if (entry.id !== `j-${entry.seq}`) {
+      fail(`journal entry seq ${entry.seq} is recorded as ${entry.id} — fix the journal first; nothing was written`);
+    }
+    const seen = journalTs.get(entry.id);
+    if (seen !== undefined && seen !== entry.ts) {
+      fail(`journal id ${entry.id} appears twice with different timestamps (${seen}, ${entry.ts}) — fix the journal first; nothing was written`);
+    }
+    journalTs.set(entry.id, entry.ts);
+  }
   after = page[page.length - 1].seq;
 }
 

@@ -1,15 +1,14 @@
 import { randomUUID } from 'node:crypto';
 import {
-  closeSync,
   existsSync,
+  linkSync,
   mkdirSync,
-  openSync,
   readFileSync,
   readdirSync,
   renameSync,
   rmSync,
+  unlinkSync,
   writeFileSync,
-  writeSync,
 } from 'node:fs';
 import { join } from 'node:path';
 import type { LogLevel } from '../logger.js';
@@ -51,11 +50,23 @@ export const DEFAULT_INDEX_CAP_BYTES = 1_024;
 /** Cross-process write lock shared by the dream's apply and the repair. */
 export const BIBLE_WRITE_LOCK = '.write.lock';
 
-function readLockHolder(lock: string): { pid: number; action: string; at: string } | null {
+interface LockHolder {
+  readonly pid: number;
+  readonly token: string;
+  readonly action: string;
+  readonly at: string;
+}
+
+function readLockHolder(lock: string): LockHolder | null {
   try {
     const parsed = JSON.parse(readFileSync(lock, 'utf-8')) as Record<string, unknown>;
     return typeof parsed['pid'] === 'number' && Number.isSafeInteger(parsed['pid']) && parsed['pid'] > 0
-      ? { pid: parsed['pid'], action: String(parsed['action'] ?? 'unknown'), at: String(parsed['at'] ?? 'unknown') }
+      ? {
+        pid: parsed['pid'],
+        token: String(parsed['token'] ?? ''),
+        action: String(parsed['action'] ?? 'unknown'),
+        at: String(parsed['at'] ?? 'unknown'),
+      }
       : null;
   } catch {
     return null;
@@ -268,6 +279,7 @@ export class BibleStore {
     journalTs: ReadonlyMap<string, string>,
     opts: { readonly write: boolean; readonly now?: Date },
   ): ProvenanceRepairReport {
+    let completed: { readonly backupDir: string; readonly written: readonly string[] } | null = null;
     const run = (): ProvenanceRepairReport => {
       let names: string[];
       try {
@@ -285,7 +297,13 @@ export class BibleStore {
         }
         const original = readFileSync(join(this.chaptersDir, name), 'utf-8');
         const repaired = repairChapterProvenance(original, slug, journalTs);
-        const capped = enforceChapterCap(repaired.chapter, this.chapterCapBytes);
+        // Already fits as repaired: the bytes stay exactly as they are.
+        // Otherwise every cap decision is measured on the in-place file, so
+        // references still go before any text and nothing is re-serialized.
+        const capped = Buffer.byteLength(repaired.text, 'utf8') <= this.chapterCapBytes
+          ? { chapter: repaired.chapter, text: repaired.text, provenanceTrimmed: 0, trimmed: 0, droppedLessons: 0, droppedProvenance: [] }
+          : enforceChapterCap(repaired.chapter, this.chapterCapBytes, (candidate) =>
+            Buffer.byteLength(renderCappedInPlace(repaired.text, candidate) ?? serializeChapter(candidate), 'utf8'));
         const capActed = capped.provenanceTrimmed + capped.trimmed + capped.droppedLessons > 0;
         const inPlace = capActed ? renderCappedInPlace(repaired.text, capped.chapter) : repaired.text;
         const fits = inPlace !== null && Buffer.byteLength(inPlace, 'utf8') <= this.chapterCapBytes;
@@ -336,10 +354,24 @@ export class BibleStore {
         }
         written.push(write.slug);
       }
+      completed = { backupDir, written };
       this.log('info', 'bible provenance repaired', { chapters_written: written.length, backup_dir: backupDir });
       return { chapters, backupDir };
     };
-    return opts.write ? this.withWriteLock('provenance repair', run) : run();
+    if (!opts.write) return run();
+    try {
+      return this.withWriteLock('provenance repair', run);
+    } catch (error) {
+      const done = completed as { readonly backupDir: string; readonly written: readonly string[] } | null;
+      if (done === null || error instanceof RepairWriteError) throw error;
+      // Every chapter was replaced; only the cleanup after it failed.
+      throw new RepairWriteError(
+        `repair replaced all ${done.written.length} chapter(s) (${done.written.join(', ')}), then failed: ` +
+          `${error instanceof Error ? error.message : String(error)}. The originals are saved in ${done.backupDir}.`,
+        done.backupDir,
+        done.written,
+      );
+    }
   }
 
   /**
@@ -351,37 +383,76 @@ export class BibleStore {
   private withWriteLock<T>(action: string, fn: () => T): T {
     mkdirSync(this.dir, { recursive: true, mode: 0o700 });
     const lock = join(this.dir, BIBLE_WRITE_LOCK);
-    const claim = (): number => openSync(lock, 'wx', 0o600);
-    let fd: number;
+    const token = randomUUID();
+    this.acquireLock(lock, token, action);
+    let result: T;
     try {
-      fd = claim();
+      result = fn();
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
-        throw new BibleError(`cannot take the book write lock ${lock}: ${String(error)}`);
+      try {
+        this.releaseLock(lock, token);
+      } catch (release) {
+        this.log('warn', 'bible write lock release failed after an error', { lock, error: String(release) });
       }
-      const holder = readLockHolder(lock);
-      if (holder === null || processAlive(holder.pid)) {
-        throw new BibleError(
+      throw error;
+    }
+    // After a successful write a release failure is reported, never hidden.
+    this.releaseLock(lock, token);
+    return result;
+  }
+
+  /** Create the lock COMPLETE in one atomic step (a hard link of a fully
+   * written temp file), so no reader ever sees a half-written lock and no
+   * descriptor can leak. A dead holder's lock is replaced only under an
+   * exclusive reclaim gate, after re-reading it there — two processes can
+   * never both reclaim and both write. */
+  private acquireLock(lock: string, token: string, action: string): void {
+    const staging = `${lock}.${token}`;
+    writeFileSync(staging, JSON.stringify({ pid: process.pid, token, action, at: new Date().toISOString() }), { mode: 0o600 });
+    try {
+      try {
+        linkSync(staging, lock);
+        return;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+          throw new BibleError(`cannot take the book write lock ${lock}: ${String(error)}`);
+        }
+      }
+      const contention = (holder: LockHolder | null): BibleError =>
+        new BibleError(
           holder === null
-            ? `the Book of Lessons write lock ${lock} is held; if no dream or repair is running, remove it and retry`
+            ? `the Book of Lessons write lock ${lock} is unreadable; if no dream or repair is running, remove it and retry`
             : `the Book of Lessons is being written by pid ${holder.pid} (${holder.action}, since ${holder.at}); retry when it finishes`,
         );
-      }
-      this.log('warn', 'bible write lock left by a dead process — taking it over', { lock, holder_pid: holder.pid, holder_action: holder.action });
-      rmSync(lock, { force: true });
+      const seen = readLockHolder(lock);
+      if (seen === null || processAlive(seen.pid)) throw contention(seen);
+      const gate = `${lock}.reclaim`;
       try {
-        fd = claim();
-      } catch (retry) {
-        throw new BibleError(`the Book of Lessons write lock ${lock} was taken concurrently: ${String(retry)}`);
+        mkdirSync(gate);
+      } catch {
+        throw new BibleError(`another process is reclaiming the Book of Lessons write lock ${lock}; retry`);
       }
-    }
-    try {
-      writeSync(fd, JSON.stringify({ pid: process.pid, action, at: new Date().toISOString() }));
-      closeSync(fd);
-      return fn();
+      try {
+        const holder = readLockHolder(lock);
+        if (holder === null || holder.token !== seen.token || processAlive(holder.pid)) throw contention(holder);
+        this.log('warn', 'bible write lock left by a dead process — taking it over', {
+          lock,
+          holder_pid: holder.pid,
+          holder_action: holder.action,
+        });
+        renameSync(staging, lock); // atomic replace, under the gate
+      } finally {
+        rmSync(gate, { recursive: true, force: true });
+      }
     } finally {
-      rmSync(lock, { force: true });
+      rmSync(staging, { force: true });
     }
+  }
+
+  /** Release only THIS acquisition's lock — never one another process now holds. */
+  private releaseLock(lock: string, token: string): void {
+    const holder = readLockHolder(lock);
+    if (holder?.token === token) unlinkSync(lock);
   }
 
   /**
@@ -649,25 +720,42 @@ function splitProvenance(value: string, chapterSlug: string, lessonSlug: string)
   return refs;
 }
 
+/** One raw line and the terminator that followed it ("\r\n", "\n", or ""
+ * for an unterminated last line) — kept so edits never change line endings. */
+interface RawLine {
+  readonly text: string;
+  readonly eol: string;
+}
+
 interface RawSection {
-  readonly heading: string;
+  readonly heading: RawLine;
   readonly slug: string;
-  readonly meta: string[];
-  readonly body: string[];
+  readonly meta: RawLine[];
+  readonly body: RawLine[];
+}
+
+function splitRawLines(text: string): RawLine[] {
+  const parts = text.split(/(\r\n|\n)/u);
+  const lines: RawLine[] = [];
+  for (let index = 0; index < parts.length; index += 2) {
+    lines.push({ text: parts[index] ?? '', eol: parts[index + 1] ?? '' });
+  }
+  return lines;
 }
 
 /** Split a chapter's raw lines exactly as parseChapter/parseLesson read
  * them: everything before the first `## ` anchor is the header; in each
  * lesson, leading blank/metadata lines are its metadata block and the rest
- * is its body. Joining the parts with "\n" reproduces the text verbatim. */
-function splitSections(text: string): { header: string[]; sections: RawSection[] } {
-  const header: string[] = [];
+ * is its body. Joining the parts reproduces the text byte for byte. */
+function splitSections(text: string): { header: RawLine[]; sections: RawSection[]; eol: string } {
+  const header: RawLine[] = [];
   const sections: RawSection[] = [];
   let current: RawSection | null = null;
   let inMeta = false;
-  for (const line of text.split(/\r?\n/)) {
-    if (line.startsWith('## ')) {
-      current = { heading: line, slug: line.slice(3).trim(), meta: [], body: [] };
+  const lines = splitRawLines(text);
+  for (const line of lines) {
+    if (line.text.startsWith('## ')) {
+      current = { heading: line, slug: line.text.slice(3).trim(), meta: [], body: [] };
       sections.push(current);
       inMeta = true;
       continue;
@@ -676,20 +764,19 @@ function splitSections(text: string): { header: string[]; sections: RawSection[]
       header.push(line);
       continue;
     }
-    if (inMeta && (line.trim() === '' || LESSON_META_LINE.test(line))) {
+    if (inMeta && (line.text.trim() === '' || LESSON_META_LINE.test(line.text))) {
       current.meta.push(line);
       continue;
     }
     inMeta = false;
     current.body.push(line);
   }
-  return { header, sections };
+  return { header, sections, eol: lines.find((line) => line.eol !== '')?.eol ?? '\n' };
 }
 
-function joinSections(header: readonly string[], sections: readonly RawSection[]): string {
-  const lines = [...header];
-  for (const section of sections) lines.push(section.heading, ...section.meta, ...section.body);
-  return lines.join('\n');
+function joinSections(header: readonly RawLine[], sections: readonly RawSection[]): string {
+  const join = (lines: readonly RawLine[]) => lines.map((line) => `${line.text}${line.eol}`).join('');
+  return join(header) + sections.map((section) => join([section.heading, ...section.meta, ...section.body])).join('');
 }
 
 function provenanceLine(refs: readonly ProvenanceRef[]): string {
@@ -722,7 +809,10 @@ function resolveDamagedProvenance(
       if (ts === undefined) {
         throw new BibleError(`${where} cites journal id ${id}, which is not in the journal — refusing to invent provenance`);
       }
-      if (match[2] !== undefined && match[2] !== ts) {
+      if (Number.isNaN(Date.parse(ts))) {
+        throw new BibleError(`the journal records ${id} at an invalid timestamp ${JSON.stringify(ts)} — fix the journal first`);
+      }
+      if (match[2] !== undefined && Date.parse(match[2]) !== Date.parse(ts)) {
         throw new BibleError(`${where} cites ${id}@${match[2]}, but the journal records ${id} at ${ts}`);
       }
       refs.push({ id, ts });
@@ -730,7 +820,7 @@ function resolveDamagedProvenance(
       continue;
     }
     if (bareId !== null && ISO_TIMESTAMP.test(fragment)) {
-      if (fragment !== journalTs.get(bareId)) {
+      if (Date.parse(fragment) !== Date.parse(journalTs.get(bareId) ?? '')) {
         throw new BibleError(`${where} cites ${bareId},${fragment}, but the journal records ${bareId} at ${journalTs.get(bareId)}`);
       }
       bareId = null;
@@ -764,15 +854,15 @@ export function repairChapterProvenance(
     const where = `chapter ${slug}.md lesson ${section.slug}`;
     const refs: ProvenanceRef[] = [];
     for (const line of section.meta) {
-      const meta = LESSON_META_LINE.exec(line);
+      const meta = LESSON_META_LINE.exec(line.text);
       if (meta?.[1] !== 'provenance') continue;
       mergeProvenance(refs, resolveDamagedProvenance(meta[2] ?? '', where, journalTs));
     }
     refs.sort(compareProvenance);
-    const meta: string[] = [];
+    const meta: RawLine[] = [];
     let placed = false;
     for (const line of section.meta) {
-      if (LESSON_META_LINE.exec(line)?.[1] !== 'provenance') {
+      if (LESSON_META_LINE.exec(line.text)?.[1] !== 'provenance') {
         meta.push(line);
         continue;
       }
@@ -781,8 +871,8 @@ export function repairChapterProvenance(
         continue;
       }
       const canonical = provenanceLine(refs);
-      if (canonical !== line) linesRewritten += 1;
-      meta.push(canonical);
+      if (canonical !== line.text) linesRewritten += 1;
+      meta.push({ text: canonical, eol: line.eol });
       placed = true;
     }
     return { ...section, meta };
@@ -803,31 +893,42 @@ function sameLessons(left: readonly BibleLesson[], right: readonly BibleLesson[]
  * record is appended canonically. Null when the in-place result does not
  * re-parse to exactly the capped chapter. */
 function renderCappedInPlace(text: string, capped: BibleChapter): string | null {
-  const { header, sections } = splitSections(text);
+  const { header, sections, eol } = splitSections(text);
   const bySlug = new Map(sections.map((section) => [section.slug, section]));
   const out: RawSection[] = [];
+  const lines = (body: string): RawLine[] => body.split('\n').map((line) => ({ text: line, eol }));
   for (const lesson of capped.lessons) {
     const section = bySlug.get(lesson.slug);
     if (section === undefined) {
       const last = out.at(-1);
-      if (last !== undefined && (last.body.at(-1) ?? '') !== '') last.body.push('');
+      if (last !== undefined) {
+        const tail = last.body.at(-1);
+        if (tail !== undefined && tail.eol === '') last.body[last.body.length - 1] = { text: tail.text, eol };
+        if ((last.body.at(-1)?.text ?? '') !== '') last.body.push({ text: '', eol });
+      }
       out.push({
-        heading: `## ${lesson.slug}`,
+        heading: { text: `## ${lesson.slug}`, eol },
         slug: lesson.slug,
-        meta: ['', `recurred: ${lesson.recurred}`, provenanceLine(lesson.provenance), ...(lesson.tags.length > 0 ? [`tags: ${lesson.tags.join(', ')}`] : []), ''],
-        body: [lesson.body.trim(), ''],
+        meta: [
+          { text: '', eol },
+          { text: `recurred: ${lesson.recurred}`, eol },
+          { text: provenanceLine(lesson.provenance), eol },
+          ...(lesson.tags.length > 0 ? [{ text: `tags: ${lesson.tags.join(', ')}`, eol }] : []),
+          { text: '', eol },
+        ],
+        body: lines(lesson.body.trim()),
       });
       continue;
     }
     const meta = section.meta.map((line) =>
-      LESSON_META_LINE.exec(line)?.[1] === 'provenance' ? provenanceLine(lesson.provenance) : line,
+      LESSON_META_LINE.exec(line.text)?.[1] === 'provenance' ? { text: provenanceLine(lesson.provenance), eol: line.eol } : line,
     );
-    const originalBody = section.body.join('\n').trim();
+    const originalBody = section.body.map((line) => line.text).join('\n').trim();
     let body = section.body;
     if (originalBody !== lesson.body) {
       let trailing = 0;
-      while (trailing < section.body.length && section.body[section.body.length - 1 - trailing]!.trim() === '') trailing += 1;
-      body = [lesson.body.trim(), ...Array.from({ length: trailing }, () => '')];
+      while (trailing < section.body.length && section.body[section.body.length - 1 - trailing]!.text.trim() === '') trailing += 1;
+      body = [...lines(lesson.body.trim()), ...section.body.slice(section.body.length - trailing)];
     }
     out.push({ ...section, meta, body });
   }
@@ -1043,7 +1144,12 @@ function applyLessonUpdates(
  * the numeric journal sequence (`j-<seq>`), so equal timestamps never fall
  * back to insertion order. Oldest first. */
 export function compareProvenance(left: ProvenanceRef, right: ProvenanceRef): number {
-  return left.ts.localeCompare(right.ts) || journalSeq(left.id) - journalSeq(right.id) || left.id.localeCompare(right.id);
+  const leftAt = Date.parse(left.ts);
+  const rightAt = Date.parse(right.ts);
+  // Instants, not spellings: "01:00+02:00" precedes "00:00Z", and equal
+  // instants written differently tie, falling to the journal sequence.
+  const byInstant = Number.isNaN(leftAt) || Number.isNaN(rightAt) ? left.ts.localeCompare(right.ts) : leftAt - rightAt;
+  return byInstant || journalSeq(left.id) - journalSeq(right.id) || left.id.localeCompare(right.id);
 }
 
 function journalSeq(id: string): number {
@@ -1070,13 +1176,20 @@ function handleBytes(ref: ProvenanceRef): number {
  * finite, so the loop runs until the chapter fits or no step applies.
  * Deterministic and total: the returned text is <= cap or this throws.
  */
-export function enforceChapterCap(chapter: BibleChapter, capBytes: number): ChapterCapResult {
+export function enforceChapterCap(
+  chapter: BibleChapter,
+  capBytes: number,
+  /** Bytes the chapter will occupy as written (default: canonical form).
+   * The repair passes its in-place renderer, so every decision is driven
+   * by the real file size. */
+  measure: (candidate: BibleChapter) => number = (candidate) => Buffer.byteLength(serializeChapter(candidate), 'utf8'),
+): ChapterCapResult {
   let lessons: BibleLesson[] = chapter.lessons.map((lesson) => ({ ...lesson }));
   let provenanceTrimmed = 0;
   let trimmed = 0;
   let droppedLessons = 0;
   const droppedProvenance: ProvenanceRef[] = [];
-  const serialized = (): number => Buffer.byteLength(serializeChapter({ ...chapter, lessons }), 'utf8');
+  const serialized = (): number => measure({ ...chapter, lessons });
   let size = serialized();
   if (size <= capBytes) {
     return { chapter: { ...chapter, lessons }, text: serializeChapter({ ...chapter, lessons }), provenanceTrimmed, trimmed, droppedLessons, droppedProvenance };
@@ -1159,7 +1272,7 @@ export function enforceChapterCap(chapter: BibleChapter, capBytes: number): Chap
   }
   materialize();
   const text = serializeChapter({ ...chapter, lessons });
-  if (Buffer.byteLength(text, 'utf8') > capBytes) {
+  if (measure({ ...chapter, lessons }) > capBytes) {
     throw new BibleError(
       `chapter ${chapter.slug} cannot fit ${capBytes} bytes even after releasing provenance, trimming and dropping — raise lessons.chapter_cap_bytes`,
     );
@@ -1198,8 +1311,11 @@ function pickDropCandidate(lessons: readonly BibleLesson[]): number {
     const best = lessons[candidate]!;
     const bestNewest = newestRef(best.provenance);
     const otherNewest = newestRef(lesson.provenance);
-    const olderNewest =
-      otherNewest !== null && (bestNewest === null || compareProvenance(otherNewest, bestNewest) < 0);
+    // A lesson without any journal handle counts as the oldest: it goes
+    // before every journal-backed lesson of the same recurrence.
+    const olderNewest = otherNewest === null
+      ? bestNewest !== null
+      : bestNewest !== null && compareProvenance(otherNewest, bestNewest) < 0;
     if (lesson.recurred < best.recurred || (lesson.recurred === best.recurred && olderNewest)) {
       candidate = index;
     }

@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, it } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { tmpdir } from 'node:os';
@@ -9,6 +9,7 @@ import {
   enforceChapterCap,
   parseChapter,
   BIBLE_WRITE_LOCK,
+  compareProvenance,
   PROVENANCE_FLOOR,
   RepairWriteError,
   repairChapterProvenance,
@@ -714,5 +715,144 @@ describe('repair and cap review fixes (bmad-code-review of #253, 2026-10-07)', (
     const own = run(b, b);
     expect(own.status, own.stderr).toBe(0);
     expect(own.stdout).toContain('cap 8192 B');
+  });
+});
+
+describe('second review round of #253 (bmad-code-review, 2026-10-07)', () => {
+  const at = (minute: number): string => new Date(Date.UTC(2026, 9, 1, 0, minute)).toISOString();
+  const JOURNAL = new Map(Array.from({ length: 30 }, (_, index) => [`j-${index + 1}`, at(index + 1)] as const));
+  const handlesLine = (ids: number[]) => `provenance: ${ids.map((id) => `j-${id}@${at(id)}`).join(', ')}`;
+  function bibleWith(files: Record<string, string>, cap = 4_096): BibleStore {
+    const bible = tmpBible(cap);
+    bible.ensureSeeded();
+    for (const [name, text] of Object.entries(files)) writeFileSync(join(bible.chaptersDir, name), text, 'utf-8');
+    return bible;
+  }
+  const deadPid = (): number => spawnSync(process.execPath, ['-e', '']).pid!;
+
+  it('a dead holder is reclaimed only through the gate, and a release never removes a lock it does not own', () => {
+    const chapter = `# A\n\n## a\n\nrecurred: 1\nprovenance: j-2; earlier: j-1\n\nBody.\n`;
+    const bible = bibleWith({ 'a.md': chapter });
+    const lock = join(bible.dir, BIBLE_WRITE_LOCK);
+    writeFileSync(lock, JSON.stringify({ pid: deadPid(), token: 'old', action: 'dream apply', at: 'then' }));
+    mkdirSync(`${lock}.reclaim`); // another process is mid-reclaim
+    expect(() => bible.repairProvenance(JOURNAL, { write: true })).toThrowError(/another process is reclaiming/);
+    expect(JSON.parse(readFileSync(lock, 'utf-8')).token).toBe('old');
+    rmSync(`${lock}.reclaim`, { recursive: true });
+    expect(bible.repairProvenance(JOURNAL, { write: true }).backupDir).not.toBeNull();
+    expect(existsSync(lock)).toBe(false);
+
+    const store = bible as unknown as { withWriteLock<T>(action: string, fn: () => T): T };
+    store.withWriteLock('test', () => {
+      writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'someone-else', action: 'x', at: 'now' }));
+    });
+    expect(JSON.parse(readFileSync(lock, 'utf-8')).token).toBe('someone-else');
+  });
+
+  it('a lock that cannot be taken leaves no lock or staging file behind', () => {
+    const bible = bibleWith({ 'a.md': `# A\n\n## a\n\nrecurred: 1\nprovenance: j-1\n\nBody.\n` });
+    chmodSync(bible.dir, 0o500);
+    try {
+      expect(() => bible.repairProvenance(JOURNAL, { write: true })).toThrowError();
+    } finally {
+      chmodSync(bible.dir, 0o700);
+    }
+    expect(readdirSync(bible.dir).filter((name) => name.startsWith(BIBLE_WRITE_LOCK))).toEqual([]);
+  });
+
+  it('a cleanup failure after every chapter was written is reported with the backup — never "nothing was written"', () => {
+    const bible = bibleWith({ 'a.md': `# A\n\n## a\n\nrecurred: 1\nprovenance: j-2; earlier: j-1\n\nBody.\n` });
+    const store = bible as unknown as { releaseLock(lock: string, token: string): void };
+    store.releaseLock = () => {
+      throw new Error('unlink failed');
+    };
+    let caught: unknown;
+    try {
+      bible.repairProvenance(JOURNAL, { write: true });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(RepairWriteError);
+    expect((caught as RepairWriteError).message).toContain('repair replaced all 1 chapter(s) (a), then failed: unlink failed');
+    expect(existsSync((caught as RepairWriteError).backupDir)).toBe(true);
+  });
+
+  it('a chapter that already fits as repaired keeps every byte — even at exactly the cap', () => {
+    // Compact (no blank lines): the canonical form is LARGER than this file,
+    // so measuring canonical text would wrongly see it over the cap.
+    const text = `# A\n## only\nrecurred: 1\nprovenance: j-2; earlier: j-1\nShort body.\n`;
+    const repaired = repairChapterProvenance(text, 'a', JOURNAL).text;
+    const bible = bibleWith({ 'a.md': text }, Buffer.byteLength(repaired, 'utf8'));
+    const report = bible.repairProvenance(JOURNAL, { write: true });
+    expect(report.chapters[0]).toMatchObject({ lessonsAfter: 1, lessonsDropped: 0, bodiesTrimmed: 0, formatting: 'preserved' });
+    expect(readFileSync(join(bible.chaptersDir, 'a.md'), 'utf-8')).toBe(repaired);
+  });
+
+  it('over the cap, references are released on the real file and the body bytes stay untouched', () => {
+    // Deep indentation: the canonical form drops it and would "fit", while
+    // the real file is over — measuring canonical text kept all five handles
+    // and threw the indentation away.
+    const text = `# A\n\n## busy\n\nrecurred: 5\n${handlesLine([1, 2, 3, 4, 5])}\n\n${' '.repeat(40)}keep();\n      this();\n`;
+    const bible = bibleWith({ 'a.md': text }, Buffer.byteLength(text, 'utf8') - 20);
+    const report = bible.repairProvenance(JOURNAL, { write: true });
+    expect(report.chapters[0]).toMatchObject({ provenanceTrimmed: 1, bodiesTrimmed: 0, lessonsDropped: 0, formatting: 'preserved' });
+    const written = readFileSync(join(bible.chaptersDir, 'a.md'), 'utf-8');
+    expect(written).toBe(text.replace(handlesLine([1, 2, 3, 4, 5]), handlesLine([2, 3, 4, 5])));
+    expect(Buffer.byteLength(written, 'utf8')).toBeLessThanOrEqual(bible.chapterCapBytes);
+    expect(readFileSync(join(report.backupDir!, 'chapters', 'a.md'), 'utf-8')).toBe(text);
+  });
+
+  it('keeps CRLF and mixed line endings byte for byte', () => {
+    const crlf = '# A\r\n\r\n## a\r\n\r\nrecurred: 1\r\nprovenance: j-2; earlier: j-1\r\n\r\nLine one.\r\nLine two.\r\n';
+    const mixed = '# B\n\r\n## b\r\n\nrecurred: 1\nprovenance: j-1\r\n\nMixed.\r\nEndings.\n';
+    const canonical = `provenance: j-1@${at(1)}, j-2@${at(2)}`;
+    expect(repairChapterProvenance(crlf, 'a', JOURNAL).text).toBe(crlf.replace('provenance: j-2; earlier: j-1', canonical));
+    expect(repairChapterProvenance(mixed, 'b', JOURNAL).text).toBe(mixed.replace('provenance: j-1', `provenance: j-1@${at(1)}`));
+  });
+
+  it('a lesson without journal handles is evicted before a journal-backed one, in either order', () => {
+    const backed = { slug: 'backed', body: `backed ${'x'.repeat(153)}`, recurred: 1, provenance: [{ id: 'j-1', ts: at(1) }], tags: [] };
+    const bare = { slug: 'bare', body: `bare ${'y'.repeat(155)}`, recurred: 1, provenance: [] as ProvenanceRef[], tags: [] };
+    for (const lessons of [[backed, bare], [bare, backed]]) {
+      const chapter: BibleChapter = { slug: 'fix', title: 'Fix', summary: '', tags: [], lessons };
+      const smaller = enforceChapterCap(chapter, Buffer.byteLength(serializeChapter(chapter), 'utf8') - 1);
+      expect(smaller.chapter.lessons.map((lesson) => lesson.slug)).toContain('backed');
+      expect(smaller.chapter.lessons.map((lesson) => lesson.slug)).not.toContain('bare');
+    }
+  });
+
+  it('equal recurrence evicts the chronologically older lesson, ties broken by journal sequence', () => {
+    const newer = { slug: 'newer', body: `newer ${'n'.repeat(154)}`, recurred: 2, provenance: [{ id: 'j-10', ts: at(5) }], tags: [] };
+    const older = { slug: 'older', body: `older ${'o'.repeat(154)}`, recurred: 2, provenance: [{ id: 'j-9', ts: at(5) }], tags: [] };
+    const chapter: BibleChapter = { slug: 'fix', title: 'Fix', summary: '', tags: [], lessons: [newer, older] };
+    const cap = Buffer.byteLength(serializeChapter(chapter), 'utf8') - 1;
+    const result = enforceChapterCap(chapter, cap);
+    expect(result.chapter.lessons.map((lesson) => lesson.slug)).toEqual(['newer', 'archived-provenance']);
+  });
+
+  it('orders handles by instant, not spelling', () => {
+    const offset = { id: 'j-2', ts: '2026-10-01T01:00:00+02:00' }; // 2026-09-30T23:00Z
+    const zulu = { id: 'j-1', ts: '2026-10-01T00:00:00Z' };
+    expect(compareProvenance(offset, zulu)).toBeLessThan(0);
+    expect(compareProvenance({ id: 'j-3', ts: '2026-10-01T00:00:00.5Z' }, { id: 'j-4', ts: '2026-10-01T00:00:00.500Z' })).toBeLessThan(0);
+    expect(compareProvenance({ id: 'j-4', ts: '2026-10-01T00:00:00.5Z' }, { id: 'j-3', ts: '2026-10-01T00:00:00.500Z' })).toBeGreaterThan(0);
+  });
+
+  it('the tool refuses an inconsistent journal before any write', () => {
+    const home = mkdtempSync(join(tmpdir(), 'gru-command-repair-journal-'));
+    cleanupDirs.push(home);
+    const journal = new JournalStore(join(home, 'journal'));
+    const first = journal.append({ kind: 'finding', source: 'gru', body: 'first' });
+    mkdirSync(join(home, 'bible', 'chapters'), { recursive: true });
+    const chapter = `# Ops\n\n## a\n\nrecurred: 1\nprovenance: ${first.id}\n\nBody.\n`;
+    writeFileSync(join(home, 'bible', 'chapters', 'ops.md'), chapter);
+    const file = join(home, 'journal', readdirSync(join(home, 'journal')).find((name) => name.endsWith('.jsonl'))!);
+    const duplicate = { ...JSON.parse(readFileSync(file, 'utf-8').trim().split('\n')[0]!), seq: 2, ts: '2026-01-01T00:00:00.000Z' };
+    appendFileSync(file, `${JSON.stringify(duplicate)}\n`);
+    const tool = resolve(import.meta.dirname, '..', 'tools', 'repair-bible-provenance.mjs');
+    const ran = spawnSync(process.execPath, [tool, '--write'], { encoding: 'utf-8', env: { ...process.env, GRU_COMMAND_HOME: home } });
+    expect(ran.status).toBe(1);
+    expect(ran.stderr).toMatch(/journal entry seq 2 is recorded as j-1|journal id j-1 appears twice/);
+    expect(readFileSync(join(home, 'bible', 'chapters', 'ops.md'), 'utf-8')).toBe(chapter);
   });
 });

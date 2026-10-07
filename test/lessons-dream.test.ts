@@ -589,6 +589,32 @@ describe('failing-dream incident, production wiring (owner incident 2026-10-07)'
     }
   });
 
+  it('keeps the first failure and refreshes the latest on the same open incident (owner decision 2026-10-07)', () => {
+    const dir = tmpDir('gru-command-dream-incident-latest-');
+    const db = new LedgerDb(dir);
+    try {
+      const bus = new EventBus();
+      const ledger = new LedgerApi(db.handle, { bus });
+      const notifications = new NotificationCenter({ ledger, bus });
+      const times = ['2026-10-07T09:44:26.000Z', '2026-10-07T21:44:26.000Z', '2026-10-08T09:44:26.000Z'];
+      let tick = 0;
+      const hooks = dreamFailureIncidents(notifications, 'REPAIR', () => new Date(times[tick++]!));
+      const open = () => ledger.listNotifications({ limit: 50 }).filter((row) => row.kind === DREAM_FAILED_KIND && row.resolvedAt === null);
+      hooks.onFailure(new DreamError('provenance "j-878" must be "<journal-id>@<iso-date>"'));
+      const id = open()[0]!.id;
+      hooks.onFailure(new Error('provider outage'));
+      hooks.onFailure(new Error('provider still out'));
+      expect(open()).toHaveLength(1);
+      expect(open()[0]!.id).toBe(id);
+      const detail = open()[0]!.detail ?? '';
+      expect(detail).toContain(`First failure (${times[0]}): DreamError: provenance "j-878" must be "<journal-id>@<iso-date>"`);
+      expect(detail).toContain(`Latest failure (${times[2]}, failed pass 3): Error: provider still out`);
+      expect(detail).toContain('REPAIR');
+    } finally {
+      db.close();
+    }
+  });
+
   it('the repair command selects this instance and survives spaces and quotes in every path', () => {
     const root = tmpDir("gru-command-repair cmd 'q' ");
     const instanceDir = join(root, "instance dir's");

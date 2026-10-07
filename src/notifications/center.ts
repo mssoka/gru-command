@@ -186,6 +186,11 @@ export class NotificationCenter {
     return this.post(input);
   }
 
+  /** Refresh an open incident's detail (same id, same ack state). */
+  updateDetail(id: string, detail: string): NotificationRecord | null {
+    return this.ledger.updateNotificationDetail(id, detail);
+  }
+
   resolveIncidents(kindPrefix: string, by: string): readonly NotificationRecord[] {
     return this.ledger.resolveNotificationsByKindPrefix(kindPrefix, by);
   }

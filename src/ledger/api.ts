@@ -4166,6 +4166,19 @@ export class LedgerApi {
   }
 
   /** Resolve one exact incident ID without acknowledging it for the owner. */
+  /** Replace an OPEN notification's detail in place — id, acknowledgement
+   * and routing unchanged (a long-running incident refreshing its latest
+   * cause). A resolved or missing row is left as-is and returned (or null). */
+  updateNotificationDetail(id: string, detail: string): NotificationRecord | null {
+    return this.transaction(() => {
+      const current = this.getNotification(id);
+      if (current === null || current.resolvedAt !== null || current.detail === detail) return current;
+      this.db.prepare('UPDATE notifications SET detail = ? WHERE id = ?').run(detail, id);
+      this.appendEvent({ kind: 'notification.updated', agentId: current.agentId, payload: { id } });
+      return this.getNotification(id);
+    });
+  }
+
   resolveNotificationById(id: string, by: string): NotificationRecord | null {
     if (by.trim() === '') throw new Error('resolution by must be non-empty');
     return this.transaction(() => {
