@@ -3,6 +3,7 @@ import type { BoardSnapshot, NotificationView, OwnerPrView } from './board-proto
 import {
   OWNER_WINDOW_SIZE,
   ackConsequence,
+  ackNextStep,
   ownerPendingCount,
   ownerRows,
   ownerWindow,
@@ -171,5 +172,18 @@ describe('safePrUrl', () => {
     expect(safePrUrl('https://')).toBeNull(); // no host — never a real target
     expect(safePrUrl('')).toBeNull();
     expect(safePrUrl('github.com/x/y/pull/1')).toBeNull();
+  });
+});
+
+describe('ackNextStep (short typed face phrases)', () => {
+  it('stays static per kind family, short, and never echoes prose', () => {
+    expect(ackNextStep('supervision.provider-wall.a1.quota_exceeded')).toBe('Ack re-arms this worker.');
+    expect(ackNextStep('supervision.breaker')).toBe('Ack re-arms this worker.');
+    expect(ackNextStep('decisions.degraded.model')).toBe('Ack records that you saw this.');
+    expect(ackNextStep('worktree-sweep-paused')).toBe('Check the worktree, then ack.');
+    expect(ackNextStep('port-squat')).toBe('Stop the foreign process, then ack.');
+    expect(ackNextStep('roll-port-squat')).toBe('Stop the foreign process, then ack.');
+    // An ordinary unsupported free-form notice gets the neutral truthful step.
+    expect(ackNextStep('some.free-form.notice')).toBe('Ack clears this notice.');
   });
 });

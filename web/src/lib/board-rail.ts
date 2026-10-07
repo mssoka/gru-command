@@ -12,7 +12,7 @@
  * bare slash counters; owner ruling 5).
  */
 
-import { healthCards, type HealthTone } from './board-health.js';
+import { healthCards, type FlagSplit, type HealthTone, type ValueSplit } from './board-health.js';
 import { boardKpis } from './board-kpi.js';
 import type { BoardSnapshot } from './board-protocol.js';
 import { BOARD_WORDS, heistCount } from './board-vocabulary.js';
@@ -45,6 +45,10 @@ export interface RailChip {
   readonly titleAttr: string;
   /** Folded KPI counts (TRACKERS only). */
   readonly kpis?: readonly RailKpiGroup[];
+  /** Numeric-part split of `value` for the slim strip's reserved slot. */
+  readonly valueSplit: ValueSplit;
+  /** Numeric-part split of `flag`; null when there is no flag. */
+  readonly flagSplit: FlagSplit | null;
 }
 
 function kpi(key: string, value: number, label: string, title: string): RailKpi {
@@ -65,6 +69,8 @@ export function railChips(snapshot: BoardSnapshot, now = Date.now()): readonly R
         tone: card.tone,
         flag: card.flag,
         titleAttr: card.titleAttr,
+        valueSplit: card.valueSplit,
+        flagSplit: card.flagSplit,
       }),
     )
     .concat(trackersChip(snapshot, kpis));
@@ -107,6 +113,10 @@ function trackersChip(snapshot: BoardSnapshot, kpis: ReturnType<typeof boardKpis
     tone,
     flag: null,
     titleAttr: `Heists, PRs, and minions across the board · Jev decision routing: ${decisions.status}`,
+    // Contract-complete RailChip: the trackers chip renders through the
+    // groups (RailKpi numbers), so its value/flag carry no split.
+    valueSplit: { lead: '', num: null, unit: '' },
+    flagSplit: null,
     kpis: [
       {
         label: BOARD_WORDS.heists.toUpperCase(),

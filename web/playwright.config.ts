@@ -55,7 +55,9 @@ export default defineConfig({
   projects: [
     {
       name: 'mock',
-      testMatch: ['smoke.spec.ts', 'working-flavor.spec.ts'],
+      // The slim-strip synthetic proof suite runs in this isolated mock
+      // project too (same dev mock + preview, no real service).
+      testMatch: ['smoke.spec.ts', 'working-flavor.spec.ts', 'dashboard-strip.spec.ts'],
       use: { baseURL: `http://localhost:${PREVIEW_PORT}` },
     },
     {

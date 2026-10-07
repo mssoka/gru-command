@@ -9,6 +9,7 @@ coverage/
 web/playwright-report/
 web/test-results/
 web/test-results-crew/
+web/e2e-artifacts/
 # Logs
 *.log
 # Local env — never commit secrets

@@ -607,3 +607,53 @@ binned-static = "node tools/patch-vitest-rpc-timeout.mjs && npm run lint && npm 
 # directory and ignored pointer file are preserved for inspection; nothing
 # is deleted or checked out and no branch/worktree holds the sha.
 binned-baseline = 'set -e; base=84aec28b04ddc406f26c458383452318f8cb7ed1; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-binned.XXXXXX"); git archive "$base" | tar -x -C "$d"; for f in test/ledger-api.test.ts test/ledger-obligations.test.ts test/board-engine-v4.test.ts test/board-server.test.ts test/board-engine.test.ts test/ledger-pipeline.test.ts test/job-amendments.test.ts test/directive-markers.test.ts test/provider-recovery-resume.test.ts test/provider-recovery-sensor.test.ts test/phase-handoffs.test.ts test/awareness.test.ts test/github-poll.test.ts test/silas-driver.test.ts test/yield-report.test.ts test/child-workers.test.ts test/report-jobs-backfill.test.ts test/durable-reconcile.test.ts test/fixtures/live-receipt-classification.json web/src/lib/board-signals.test.ts web/src/lib/board-kpi.test.ts web/src/lib/board-rail.test.ts web/src/lib/board-bands.test.ts web/src/lib/board-sections.test.ts web/src/ui/board.test.ts; do mkdir -p "$d/$(dirname "$f")"; git show "$headrev:$f" > "$d/$f"; done; ln -s "$root/node_modules" "$d/node_modules"; ln -s "$root/web/node_modules" "$d/web/node_modules"; printf "binned-baseline base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/binned-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; set +e; npx vitest run --reporter=json --outputFile="$d/backend-results.json" test/ledger-api.test.ts test/ledger-obligations.test.ts test/board-engine-v4.test.ts test/board-server.test.ts test/board-engine.test.ts test/ledger-pipeline.test.ts test/job-amendments.test.ts test/directive-markers.test.ts test/provider-recovery-resume.test.ts test/provider-recovery-sensor.test.ts test/phase-handoffs.test.ts test/awareness.test.ts test/github-poll.test.ts test/silas-driver.test.ts test/yield-report.test.ts test/child-workers.test.ts test/report-jobs-backfill.test.ts test/durable-reconcile.test.ts; a=$?; cd web; ../node_modules/.bin/vitest run --reporter=json --outputFile="$d/web-results.json" src/lib/board-signals.test.ts src/lib/board-kpi.test.ts src/lib/board-rail.test.ts src/lib/board-bands.test.ts src/lib/board-sections.test.ts src/ui/board.test.ts; b=$?; set -e; echo "binned-baseline vitest exits: backend=$a web=$b"; if [ "$a" -eq 0 ] || [ "$b" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: a baseline leg passed unexpectedly"; exit 2; fi; node "$root/tools/assert-binned-baseline.mjs" "$d/backend-results.json" "$d/web-results.json"; echo "EXPECTED-NONZERO: both legs failed named behavioral assertions against the pre-change base"; exit 1'
+
+# Scheduler-only browser proof for the slim-strip synthetic suite (job
+# dashboard-slim-strip-current-main-20261007): the scheduler's cwd is the
+# LANE ROOT, where no Playwright config exists — the mock project, its safe
+# ports, and the vite preview that serves web/dist live in
+# web/playwright.config.ts. So run the EXISTING web workspace e2e script
+# from web/: it builds the web artifacts (npm run build inside web/) and
+# invokes Playwright with the web config selected, filtered to ONLY the
+# isolated mock project's dashboard-strip spec (scripted auth/board
+# fixtures; the real service scope is untouched; reuseExistingServer:false;
+# workers 1 / retries 0 / default 30s). Union scope — every scope above
+# stays as-is.
+strip-browser = "(cd web && npm run e2e -- --project=mock e2e/dashboard-strip.spec.ts)"
+
+# Focused iteration/debug subset for this lane's FINAL source: the three web
+# unit files that carry the slim-strip regressions, run against the
+# committed head in the lane's own web workspace with the same vitest bin
+# form as the baseline scope. The `full` scope still covers the whole suite;
+# this only narrows a scheduled debug/iteration run so failures are diagnosed
+# against complete, scheduler-captured output instead of an ad-hoc rerun.
+dashboard-slim-strip-unit = "cd web && node ../node_modules/vitest/vitest.mjs run src/ui/board.test.ts src/lib/board-rail.test.ts src/lib/owner-band.test.ts"
+
+# Dashboard slim-strip baseline comparison (the dashboard-specific baseline
+# this continuation's acceptance requires). The lane's FINAL web unit test
+# files (board.test.ts / board-rail.test.ts / owner-band.test.ts, fetched
+# with git show from the exact head) run against an isolated baseline
+# snapshot (git archive of the RECORDED current-main execution base
+# 49b558f243c7bacbfb46c7bc04f749bf131cefea — WITHOUT any slim-strip source)
+# with the existing node_modules bound by symlink: no worktree/branch
+# mutation, no install, no dependency change. Expected result is RED by
+# behavioral assertion (missing strip DOM / splits / ackNextStep — the base
+# lacks the feature), not a fixture/protocol failure; exit codes are left
+# intact so the scheduler captures a real nested outcome.exitCode and are
+# never masked into a PASS. This scope never deletes snapshot material; the
+# ignored pointer file
+# _bmad-output/gate-prep/dashboard-slim-strip-baseline.last-snapshot.txt
+# records the latest snapshot location, preserved for inspection.
+dashboard-slim-strip-baseline = 'set -e; base=49b558f243c7bacbfb46c7bc04f749bf131cefea; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-dashboard-slim-strip-current-main.XXXXXX"); git archive "$base" | tar -x -C "$d"; for f in web/src/ui/board.test.ts web/src/lib/board-rail.test.ts web/src/lib/owner-band.test.ts; do git show "$headrev:$f" > "$d/$f"; done; ln -s "$root/node_modules" "$d/node_modules"; printf "%s base=%s head=%s\n" "$d" "$base" "$headrev" > "$prep/dashboard-slim-strip-baseline.last-snapshot.txt"; cd "$d/web"; node ../node_modules/vitest/vitest.mjs run src/ui/board.test.ts src/lib/board-rail.test.ts src/lib/owner-band.test.ts'
+
+# Dashboard slim-strip BROWSER baseline: the lane's final strip spec and
+# playwright config (git show from the exact head) over the same isolated
+# baseline snapshot of the recorded current-main base, with web+root deps
+# bound by symlink; builds the BASELINE web app (tsc + vite from the
+# archived tree) and runs ONLY the mock project's dashboard-strip spec with
+# the unchanged serial/retry/30s settings. Expected result is RED by
+# behavioral assertion: the spec's harness asserts the slim-strip DOM the
+# baseline app never renders. Exit status left intact for the scheduler's
+# real outcome.exitCode; never masked into PASS.
+# Snapshot pointer: _bmad-output/gate-prep/strip-browser-baseline.last-snapshot.txt.
+strip-browser-baseline = 'set -e; base=49b558f243c7bacbfb46c7bc04f749bf131cefea; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-dashboard-strip-browser-current-main.XXXXXX"); git archive "$base" | tar -x -C "$d"; git show "$headrev":web/e2e/dashboard-strip.spec.ts > "$d/web/e2e/dashboard-strip.spec.ts"; git show "$headrev":web/playwright.config.ts > "$d/web/playwright.config.ts"; ln -s "$root/node_modules" "$d/node_modules"; ln -s "$root/web/node_modules" "$d/web/node_modules"; printf "%s base=%s head=%s\n" "$d" "$base" "$headrev" > "$prep/strip-browser-baseline.last-snapshot.txt"; cd "$d/web"; npm run e2e -- --project=mock e2e/dashboard-strip.spec.ts'

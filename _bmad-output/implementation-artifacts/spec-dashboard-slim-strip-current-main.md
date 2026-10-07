@@ -73,13 +73,13 @@ Port map (source `4de42d9` → destination current main `49b558f`):
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `web/src/lib/board-health.ts` + `web/src/lib/board-rail.ts` + `web/src/lib/owner-band.ts` — additive splits + `ackNextStep`; no derivation changes.
-- [ ] `web/src/ui/board.ts` — slim strip + merged wakes chip + compact owner band (disclosure, allocated regions, focus, panel surface).
-- [ ] `web/src/styles/components.css` — slim-strip and compact band styles with reserved numeric slots and 640px container groups.
-- [ ] `web/src/ui/board.test.ts`, `web/src/lib/board-rail.test.ts`, `web/src/lib/owner-band.test.ts` — re-face existing rail assertions, append the lane's deterministic regressions.
-- [ ] `web/e2e/dashboard-strip.spec.ts` — port the synthetic suite; extend silas fixtures to main's protocol; add CHILDREN present/absent and deferred-wakes cases; keep 1440/1200/768/360 × light/dark captures.
-- [ ] `web/e2e/smoke.spec.ts`, `web/playwright.config.ts` — selector migration + mock testMatch union.
-- [ ] `.gru-command/worktree.toml`, `.gitignore` — union scopes (`strip-browser`, `dashboard-slim-strip-unit`, `dashboard-slim-strip-baseline` base-pinned, `strip-browser-baseline` base-pinned) + `web/e2e-artifacts/`.
+- [x] `web/src/lib/board-health.ts` + `web/src/lib/board-rail.ts` + `web/src/lib/owner-band.ts` — additive splits + `ackNextStep`; no derivation changes.
+- [x] `web/src/ui/board.ts` — slim strip + merged wakes chip + compact owner band (disclosure, allocated regions, focus, panel surface).
+- [x] `web/src/styles/components.css` — slim-strip and compact band styles with reserved numeric slots and 640px container groups.
+- [x] `web/src/ui/board.test.ts`, `web/src/lib/board-rail.test.ts`, `web/src/lib/owner-band.test.ts` — re-face existing rail assertions, append the lane's deterministic regressions.
+- [x] `web/e2e/dashboard-strip.spec.ts` — port the synthetic suite; extend silas fixtures to main's protocol; add CHILDREN present/absent and deferred-wakes cases; keep 1440/1200/768/360 × light/dark captures.
+- [x] `web/e2e/smoke.spec.ts`, `web/playwright.config.ts` — selector migration + mock testMatch union.
+- [x] `.gru-command/worktree.toml`, `.gitignore` — union scopes (`strip-browser`, `dashboard-slim-strip-unit`, `dashboard-slim-strip-baseline` base-pinned, `strip-browser-baseline` base-pinned) + `web/e2e-artifacts/`.
 - [ ] Commit, then built-in independent whole-change review via `POST /api/dispatch` (`deliverable: review`) on the exact head; fix findings; re-verify.
 
 **Acceptance Criteria:**
@@ -90,6 +90,11 @@ Port map (source `4de42d9` → destination current main `49b558f`):
 
 ## Implementation Notes
 
+<!-- Appended during implementation. -->
+- 2026-10-07 (job dashboard-slim-strip-current-main-20261007): ported the lane's presentation hunks onto current main by hand (no merge/cherry-pick; per-file provenance from `4de42d9` blobs recorded in the ignored preservation manifest). Base 49b558f; branch `gru/dashboard-slim-strip-current-main-20261007`.
+- Merges recorded: wakes chip = lane count/age split + main #219 deferred (count/reasons/truncated), number rendered once on the ALERTS pair with the tracker chip hidden but text/title-complete; silas splits re-derived for main's #163 headline branches (pass failed / turn open / reconciled / wake / no wakes yet) with `FAILED` as pure text (no numeric part); CHILDREN preserved as an additional group only when the server reported counters; Binned KPI preserved; bell panel keeps its prior PR presentation via `ownerPrRow(row, 'panel')`; all six sections/previews/cold-binned behavior untouched.
+- e2e suite refreshed for the current-main protocol: complete SilasView fixtures (no `undefined !== null` branches), 13 data-kpi slots (binned added), CHILDREN present/absent and deferred-wake cases added, reserved-slot geometry kept at 1440/1200/768/360 ± themes.
+- Verification scopes unioned in `.gru-command/worktree.toml`; both baselines pin `49b558f…` (the recorded execution base), not the obsolete 84aec28 planning pin.
 ## Spec Change Log
 
 ## Review Triage Log

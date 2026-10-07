@@ -631,7 +631,8 @@ test.describe('board (E6, mock feed)', () => {
     const signal = job.locator('.board-job__signal');
     await expect(signal).toContainText('live');
     await expect(signal).toContainText('1 blocker');
-    await expect(page.locator('#board-unacked')).toContainText('needs Gru');
+    // The global NEEDS GRU number lives on the ALERTS pair of the strip.
+    await expect(page.locator('.strip-pair[data-chip="alerts"]')).toContainText('NEEDS GRU');
 
     // Expand the row, then the round row: all 9 lens chips appear.
     await job.locator('.board-job__toggle').click();
@@ -738,15 +739,17 @@ test.describe('board (E6, mock feed)', () => {
     await capturePrNumberRow(row, 'pr-number-phone-dark');
   });
 
-  test('v6: the chip rail carries the v4 health row + folded KPI counts, bands stay ordered', async ({ page }) => {
+  test('v7: the slim strip carries the v4 health row + folded KPI counts, bands stay ordered', async ({ page }) => {
     await pair(page);
     await expect(page.locator('#board-view')).toBeVisible();
 
-    // The global rail replaces the old KPI strip + health row: seven chips.
+    // The slim strip replaces the pill rail: six status pairs + three
+    // stable count groups (Heists / PRs / Crew).
     await expect(page.locator('#chip-rail')).toBeVisible();
-    await expect(page.locator('#chip-rail .rail-chip')).toHaveCount(7);
+    await expect(page.locator('#chip-rail .strip-pair')).toHaveCount(6);
+    await expect(page.locator('#chip-rail .strip-group')).toHaveCount(3);
     const railText = (await page.locator('#chip-rail').textContent()) ?? '';
-    for (const label of ['DEPLOY', 'REVIEWS', 'SILAS', 'ALERTS', 'VERIFY', 'CURE', 'TRACKERS']) {
+    for (const label of ['DEPLOY', 'REVIEWS', 'SILAS', 'ALERTS', 'VERIFY', 'CURE', 'HEISTS', 'PRS', 'CREW']) {
       expect(railText).toContain(label);
     }
     // The folded counts are the v4 KPI values (data-kpi keys).
@@ -768,11 +771,11 @@ test.describe('board (E6, mock feed)', () => {
     }
 
     // Deploy drift is mandatory and reads the mock's 3-behind build.
-    const deploy = page.locator('.rail-chip[data-chip="deploy"]');
+    const deploy = page.locator('.strip-pair[data-chip="deploy"]');
     await expect(deploy).toContainText('3 behind');
-    await expect(deploy.locator('.rail-chip__flag')).toHaveText('RESTART PENDING');
-    await expect(page.locator('.rail-chip[data-chip="verify"]')).toContainText('lock free');
-    await expect(page.locator('.rail-chip[data-chip="cure"] .rail-chip__value')).toHaveText('n/a');
+    await expect(deploy.locator('.strip-flag__txt')).toHaveText('RESTART PENDING');
+    await expect(page.locator('.strip-pair[data-chip="verify"]')).toContainText('lock free');
+    await expect(page.locator('.strip-pair[data-chip="cure"] .strip-value')).toHaveText('n/a');
 
     // Bands in priority order, headers sticky separators with counts: the
     // permanent FOR YOU owner band first (owner approval 2026-09-28), then
@@ -845,7 +848,7 @@ test.describe('board (E6, mock feed)', () => {
       await expect(silent.locator('.board-job__status')).toHaveText('working');
 
       // Chip and bands agree: only the live machine row (mock-n5) counts.
-      await expect(page.locator('#board-unacked')).toContainText('1 needs Gru');
+      await expect(page.locator('.strip-pair[data-chip="alerts"] .strip-value__num')).toHaveText('1');
       // Scoped acceptance clips (tracked-review A10): the full-page capture
       // is taken under sticky chrome that can occlude the IN FLIGHT band,
       // so the NEEDS GRU band and the waiting row get their own clips — the
@@ -909,6 +912,8 @@ test.describe('board (E6, mock feed)', () => {
         await expect(clear.locator('.board-band__clear-text')).toHaveText('nothing needs Gru');
         await expect(clear.locator('.board-band__clear-hint')).toHaveText('the crew is on it');
         await expect(page.locator('#board-unacked')).toBeHidden();
+        // The strip's ALERTS pair carries the (zero) live machine count.
+        await expect(page.locator('.strip-pair[data-chip="alerts"] .strip-value__num')).toHaveText('0');
         await page.screenshot({ path: testInfo.outputPath(`board-truth-empty-${theme}.png`), fullPage: true });
       }
     } finally {
@@ -980,9 +985,11 @@ test.describe('board (E6, mock feed)', () => {
     await expect(page.locator('.board-lens', { hasText: 'blind ×2' })).toBeVisible();
     await expect(page.locator('.board-lens--blocker')).toHaveCount(1);
 
-    // Jev decisions chip + unacked action-required badge stay global in the rail.
+    // Jev decisions chip stays global; the needs-Gru number renders once
+    // (on the ALERTS pair), so the tracker chip keeps its id but stays hidden.
     await expect(page.locator('#board-decisions')).toContainText('Jev: READY');
-    await expect(page.locator('#board-unacked')).toBeVisible();
+    await expect(page.locator('#board-unacked')).toBeHidden();
+    await expect(page.locator('.strip-pair[data-chip="alerts"]')).toBeVisible();
 
     // Disposed rows collapse by default behind the toggle on the CREW tab.
     const rail = page.locator('#board-agents');
@@ -1115,7 +1122,9 @@ test.describe('board (E6, mock feed)', () => {
     await expect(card.locator('.board-lane__age')).toBeVisible();
     await page.setViewportSize({ width: 390, height: 844 });
     await expect(page.locator('#chip-rail')).toBeVisible();
-    await expect(page.locator('#board-unacked')).toBeVisible();
+    await expect(page.locator('#board-decisions')).toBeVisible();
+    // The GRU wake pair is always visible now — an honest empty state.
+    await expect(page.locator('#board-wakes')).toBeVisible();
     await expect(page.locator('#board-agents .board-agent').first()).toBeVisible();
     const fits = await page.evaluate(
       () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,

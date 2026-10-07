@@ -112,6 +112,7 @@ function snapshot(
     wakes?: { readonly count: number; readonly lastAt: string | null };
     ownerPrs?: NonNullable<BoardSnapshot['ownerPrs']>;
     pipeline?: NonNullable<BoardSnapshot['pipeline']>;
+    children?: BoardSnapshot['children'];
   } = {},
 ): BoardSnapshot {
   return {
@@ -140,6 +141,7 @@ function snapshot(
     wakes: options.wakes ?? { count: 0, lastAt: null },
     ownerPrs: options.ownerPrs,
     pipeline: options.pipeline,
+    children: options.children,
   };
 }
 
@@ -472,20 +474,24 @@ describe('board view resolved-notification rendering', () => {
   });
 });
 
-describe('board v6 — status chip rail (v4 health row relocated)', () => {
+describe('board v7 — slim status strip (pill rail replaced)', () => {
   beforeEach(mountBoardDom);
 
-  it('renders the seven chips and discloses the rail on the first snapshot', () => {
+  it('renders the slim status pairs and the three stable groups, disclosing the rail on the first snapshot', () => {
     const view = new BoardView(() => {});
     expect(document.getElementById('chip-rail')?.hidden).toBe(true);
     view.render(snapshot());
     const rail = document.getElementById('chip-rail');
     expect(rail?.hidden).toBe(false);
-    const chips = [...(rail?.querySelectorAll('.rail-chip') ?? [])].map((node) => node.getAttribute('data-chip'));
-    expect(chips).toEqual(['deploy', 'reviews', 'silas', 'alerts', 'verify', 'cure', 'trackers']);
+    const pairs = [...(rail?.querySelectorAll('.strip-pair') ?? [])].map((node) => node.getAttribute('data-chip'));
+    expect(pairs).toEqual(['deploy', 'reviews', 'silas', 'alerts', 'verify', 'cure']);
+    const groups = rail?.querySelectorAll('.strip-group') ?? [];
+    expect(groups).toHaveLength(3);
+    const names = [...groups].map((node) => node.querySelector('.strip-group__name')?.textContent);
+    expect(names).toEqual(['HEISTS', 'PRS', 'CREW']);
   });
 
-  it('renders the deploy-drift chip with the restart-pending flag when behind', () => {
+  it('renders deploy drift with the restart-pending flag when behind', () => {
     const view = new BoardView(() => {});
     view.render(
       snapshot({
@@ -500,37 +506,43 @@ describe('board v6 — status chip rail (v4 health row relocated)', () => {
         },
       }),
     );
-    const deploy = document.querySelector<HTMLElement>('.rail-chip[data-chip="deploy"]');
-    expect(deploy?.querySelector('.rail-chip__value')?.textContent).toBe('43 behind');
-    expect(deploy?.querySelector('.rail-chip__flag')?.textContent).toBe('RESTART PENDING');
-    expect(deploy?.classList.contains('rail-chip--alert')).toBe(true);
+    const deploy = document.querySelector<HTMLElement>('.strip-pair[data-chip="deploy"]');
+    expect(deploy?.classList.contains('strip-pair--alert')).toBe(true);
+    // The mutable number rides its own reserved slot, split from the unit.
+    expect(deploy?.querySelector('.strip-value__num')?.textContent).toBe('43');
+    expect(deploy?.querySelector('.strip-value')?.textContent?.replace(/\s+/g, ' ').trim()).toBe('43 behind');
+    expect(deploy?.querySelector('.strip-flag__txt')?.textContent).toBe('RESTART PENDING');
   });
 
   it('renders n/a honestly for unwired sources (verify queue, cure efficacy)', () => {
     const view = new BoardView(() => {});
     view.render(snapshot());
-    const valueOf = (chip: string): string | undefined =>
-      document.querySelector<HTMLElement>(`.rail-chip[data-chip="${chip}"] .rail-chip__value`)?.textContent ?? undefined;
-    expect(valueOf('deploy')).toBe('n/a');
-    expect(valueOf('verify')).toBe('n/a');
-    expect(valueOf('cure')).toBe('n/a');
-    expect(valueOf('alerts')).toBe('0');
-    expect(valueOf('reviews')).toBe('1 active'); // the base job carries a live round
+    const textOf = (chip: string): string =>
+      document
+        .querySelector<HTMLElement>(`.strip-pair[data-chip="${chip}"] .strip-value`)
+        ?.textContent?.replace(/\s+/g, ' ')
+        .trim() ?? '';
+    expect(textOf('deploy')).toBe('n/a');
+    expect(textOf('verify')).toBe('n/a');
+    expect(textOf('cure')).toBe('n/a');
+    expect(textOf('alerts')).toBe('0');
+    expect(textOf('reviews')).toBe('1 active'); // the base job carries a live round
   });
 
-  it('renders the verify queue from the snapshot when the scheduler is wired', () => {
+  it('renders the verify queue from the snapshot with its queued flag split into numeric parts', () => {
     const view = new BoardView(() => {});
     view.render(
       snapshot({
         verify: { lockInUse: true, activeRuns: 1, queuedRuns: 2, workerBudget: 8, workersPerRun: 4 },
       }),
     );
-    const verify = document.querySelector<HTMLElement>('.rail-chip[data-chip="verify"]');
-    expect(verify?.querySelector('.rail-chip__value')?.textContent).toBe('lock held');
-    expect(verify?.querySelector('.rail-chip__flag')?.textContent).toBe('2 QUEUED');
+    const verify = document.querySelector<HTMLElement>('.strip-pair[data-chip="verify"]');
+    expect(verify?.querySelector('.strip-value')?.textContent?.replace(/\s+/g, ' ').trim()).toBe('lock held');
+    expect(verify?.querySelector('.strip-flag__num')?.textContent).toBe('2');
+    expect(verify?.querySelector('.strip-flag__txt')?.textContent).toBe(' QUEUED');
   });
 
-  it('folds the v4 KPI counts into the rail as data-kpi numbers matching boardKpis', () => {
+  it('folds the v4 KPI counts into the groups as data-kpi numbers matching boardKpis', () => {
     const jobs = [
       baseJob({ id: 'w1', status: 'working' }),
       baseJob({ id: 'w2', status: 'working' }),
@@ -562,6 +574,7 @@ describe('board v6 — status chip rail (v4 health row relocated)', () => {
     expect(values.get('jobs.merged')).toBe(kpis.jobs.merged);
     expect(values.get('jobs.done')).toBe(kpis.jobs.done);
     expect(values.get('jobs.parked')).toBe(kpis.jobs.parked);
+    expect(values.get('jobs.binned')).toBe(kpis.jobs.binned);
     expect(values.get('prs.open')).toBe(kpis.prs.open);
     expect(values.get('prs.conflicting')).toBe(kpis.prs.conflicting);
     expect(values.get('prs.mergedToday')).toBe(kpis.prs.mergedToday);
@@ -576,29 +589,27 @@ describe('board v6 — status chip rail (v4 health row relocated)', () => {
     expect(values.get('lanes.disposed')).toBe(1);
     // A conflict is the loudest PR state: the number carries the alert ink.
     const conflicting = [...document.querySelectorAll<HTMLElement>('[data-kpi="prs.conflicting"]')][0];
-    expect(conflicting?.classList.contains('rail-kpi__num--alert')).toBe(true);
+    expect(conflicting?.classList.contains('strip-kpi__num--alert')).toBe(true);
 
-    // v6.1 ruling 5: every rendered number carries its visible label —
-    // adjacency in the DOM, not a tooltip promise.
-    const fields = [...document.querySelectorAll<HTMLElement>('.rail-kpi__field')];
+    // v6.1 ruling 5 survives the re-face: every rendered number carries its
+    // visible label — adjacency in the DOM, not a tooltip promise.
+    const fields = [...document.querySelectorAll<HTMLElement>('.strip-kpi')];
     expect(fields.length).toBeGreaterThan(0);
     for (const field of fields) {
-      const label = field.querySelector<HTMLElement>('.rail-kpi__field-label');
+      const label = field.querySelector<HTMLElement>('.strip-kpi__k');
       const num = field.querySelector<HTMLElement>('[data-kpi]');
       expect(label?.textContent, `${num?.dataset.kpi} label text`).toBeTruthy();
       expect(num, `${label?.textContent} number`).not.toBeNull();
       expect(label?.nextElementSibling).toBe(num);
     }
-    const groupLabels = [...document.querySelectorAll<HTMLElement>('.rail-kpi__label')].map(
+    const groupNames = [...document.querySelectorAll<HTMLElement>('.strip-group__name')].map(
       (node) => node.textContent ?? '',
     );
-    expect(groupLabels.some((text) => text.startsWith('HEISTS'))).toBe(true);
-    expect(groupLabels.some((text) => text.startsWith('PRS'))).toBe(true);
-    expect(groupLabels.some((text) => text.startsWith('CREW'))).toBe(true);
-    expect(groupLabels.some((text) => text.includes('MINIONS'))).toBe(false);
+    expect(groupNames).toEqual(['HEISTS', 'PRS', 'CREW']);
+    expect(groupNames.some((text) => text.includes('MINIONS'))).toBe(false);
   });
 
-  it('keeps the Jev decisions chip and unacked badge inside the TRACKERS chip', () => {
+  it('keeps the Jev chip; the needs-Gru number renders once, on the ALERTS pair', () => {
     const view = new BoardView(() => {});
     view.render(
       snapshot({
@@ -614,39 +625,95 @@ describe('board v6 — status chip rail (v4 health row relocated)', () => {
         unackedActionRequired: 2,
       }),
     );
-    const trackers = document.querySelector<HTMLElement>('.rail-chip[data-chip="trackers"]');
-    expect(trackers).not.toBeNull();
-    const chip = trackers?.querySelector<HTMLElement>('#board-decisions');
+    const chip = document.querySelector<HTMLElement>('#board-decisions');
     expect(chip?.textContent).toBe('Jev: READY');
     expect(chip?.dataset.state).toBe('ready');
     expect(chip?.classList.contains('pp-chip--done')).toBe(true);
-    const unacked = trackers?.querySelector<HTMLElement>('#board-unacked');
-    expect(unacked?.hidden).toBe(false);
+    // Single visible instance: the tracker chip keeps id/text/title but
+    // stays hidden — the number renders once, on the ALERTS pair.
+    const unacked = document.querySelector<HTMLElement>('#board-unacked');
+    expect(unacked?.hidden).toBe(true);
     expect(unacked?.textContent).toContain('2 needs Gru');
     // The count is the LIVE machine queue: the copy says so (A4).
     expect(unacked?.title).toContain('2 live machine-attention notifications awaiting a Gru disposition');
     expect(unacked?.title).toContain('closed receipts stay in the record');
+    const alerts = document.querySelector<HTMLElement>('.strip-pair[data-chip="alerts"]');
+    expect(alerts?.querySelector('.strip-value__num')?.textContent).toBe('2');
+    expect(alerts?.querySelector('.strip-flag__txt')?.textContent).toBe('NEEDS GRU');
+    expect(alerts?.classList.contains('strip-pair--alert')).toBe(true);
   });
 
-  it('shows the NEEDS GRU machine-queue chip only when the table has pending rows', () => {
+  it('renders the four GRU wake truths, independent of Silas', () => {
+    const silasAt = (iso: string | null): SilasView => ({
+      lastWakeAt: iso,
+      lastTickAt: null,
+      lastReconcileAt: null,
+      lastReconcileFailedAt: null,
+      reconcileFailedNewer: false,
+      lastUsefulActionAt: null,
+      nextAction: null,
+      openTurnSince: null,
+      reconciliationsToday: 2,
+      checkedAt: '2026-01-01T00:00:00.000Z',
+    });
     const view = new BoardView(() => {});
-    view.render(snapshot({ unackedActionRequired: 0 }));
-    const chip = document.querySelector<HTMLElement>('.rail-chip[data-chip="trackers"] #board-unacked');
-    expect(chip?.hidden).toBe(true);
-    view.render(snapshot({ unackedActionRequired: 2 }));
-    expect(chip?.hidden).toBe(false);
-    expect(chip?.textContent).toContain('2 needs Gru');
-  });
-
-  it('shows the wake tracker inside TRACKERS with the durable count and last-fire stamp', () => {
-    const view = new BoardView(() => {});
-    view.render(snapshot({ wakes: { count: 0, lastAt: null } }));
-    expect(document.querySelector<HTMLElement>('.rail-chip[data-chip="trackers"] #board-wakes')?.hidden).toBe(true);
+    const wakes = document.querySelector<HTMLElement>('#board-wakes');
+    // 0 + null: the honest no-wakes state, count still visible.
+    view.render(
+      snapshot({ wakes: { count: 0, lastAt: null }, silas: silasAt('2026-01-01T00:00:00.000Z') }),
+    );
+    expect(wakes?.hidden).toBe(false);
+    expect(wakes?.textContent).toContain('no wakes yet');
+    expect(wakes?.querySelector('.board-wakes__count')?.textContent).toBe('0');
+    // count > 0 + null stamp: last wake UNKNOWN — never "no wakes yet".
+    view.render(snapshot({ wakes: { count: 3, lastAt: null } }));
+    expect(wakes?.textContent).toContain('3');
+    expect(wakes?.textContent).toContain('last wake unknown');
+    expect(wakes?.textContent).not.toContain('no wakes yet');
+    // count 0 + a supplied valid stamp: the timestamp is NOT discarded —
+    // only 0 + no stamp is the no-wakes state.
+    view.render(snapshot({ wakes: { count: 0, lastAt: '2026-01-01T00:00:00.000Z' } }));
+    expect(wakes?.textContent).not.toContain('no wakes yet');
+    expect(wakes?.querySelector('.board-wakes__count')?.textContent).toBe('0');
+    expect(wakes?.querySelector('.board-age-split__num')).not.toBeNull();
+    expect(wakes?.title).toContain('last');
+    // count > 0 + valid stamp: terse wake-age pair, digits in their slot.
     view.render(snapshot({ wakes: { count: 3, lastAt: '2026-01-01T00:00:00.000Z' } }));
-    const chip = document.querySelector<HTMLElement>('.rail-chip[data-chip="trackers"] #board-wakes');
-    expect(chip?.hidden).toBe(false);
-    expect(chip?.textContent).toContain('3 wakes');
-    expect(chip?.title).toContain('wake turn');
+    expect(wakes?.querySelector('.board-age-split__num')?.textContent).toBeTruthy();
+    expect(wakes?.querySelector('.board-wakes__unknown')).toBeNull();
+    expect(wakes?.title).toContain('wake turn');
+    // invalid stamp: unknown again — never a fabricated time.
+    view.render(snapshot({ wakes: { count: 3, lastAt: 'not-a-timestamp' } }));
+    expect(wakes?.textContent).toContain('last wake unknown');
+    expect(wakes?.title).toContain('last wake time unknown');
+    // Silas stays independent: its pair shows its own wake, never Gru's.
+    view.render(
+      snapshot({
+        wakes: { count: 0, lastAt: null },
+        silas: silasAt('2026-01-01T00:00:00.000Z'),
+      }),
+    );
+    const silas = document.querySelector<HTMLElement>('.strip-pair[data-chip="silas"]');
+    expect(silas?.textContent).toContain('wake');
+    expect(silas?.textContent).not.toContain('last wake unknown');
+    expect(silas?.querySelector('.strip-value__num')?.textContent).not.toBe('0');
+  });
+
+  it('includes the CHILDREN group when the server reported counters and omits it when absent', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot());
+    expect(document.querySelectorAll('#chip-rail .strip-group')).toHaveLength(3);
+    view.render(
+      snapshot({
+        // Present-but-zero is a real report; absent is unknown and omits
+        // the group (never a claimed zero) — issue #161.
+        children: { queued: 1, active: 2, finished: 3, lifetimeCreations: 6 },
+      }),
+    );
+    const groups = [...document.querySelectorAll<HTMLElement>('#chip-rail .strip-group')];
+    expect(groups).toHaveLength(4);
+    expect(groups[3]?.querySelector('.strip-group__name')?.textContent).toBe('CHILDREN');
+    expect(groups[3]?.querySelector('[data-kpi="children.active"]')?.textContent).toBe('2');
   });
 });
 
@@ -2074,8 +2141,11 @@ describe('board v6 — section truth: closed receipts never queue, stopped lanes
     expandForGru();
     expandCold();
     const unacked = document.querySelector<HTMLElement>('#board-unacked');
-    expect(unacked?.hidden).toBe(false);
+    // The number renders once, on the ALERTS pair; the tracker chip keeps
+    // its id/text but stays hidden (no duplicate instance).
+    expect(unacked?.hidden).toBe(true);
     expect(unacked?.textContent).toContain('1 needs Gru');
+    expect(document.querySelector<HTMLElement>('.strip-pair[data-chip="alerts"] .strip-value__num')?.textContent).toBe('1');
     // The record keeps BOTH durable rows. Machine rows clear through a Gru
     // disposition, not a human Ack, so neither carries an ack control.
     const rows = [...document.querySelectorAll('.board-notification')];
@@ -2456,8 +2526,12 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(band.hidden).toBe(false);
     expect(band.querySelector('.board-band__label')?.textContent).toBe('FOR YOU');
     expect(band.querySelector('.board-band__count')?.textContent).toBe('1 pending');
-    const actionIds = [...band.querySelectorAll('[data-action-id]')].map((node) => (node as HTMLElement).dataset.actionId);
-    expect(actionIds).toEqual(['owner-ack:owner-stop']);
+    const controls = [...band.querySelectorAll<HTMLElement>('[data-action-id]')].map(
+      (node) => `${node.dataset.actionId}/${node.dataset.control}`,
+    );
+    // One action, two explicit controls (reveal-only disclosure + Ack); the
+    // machine incident contributes neither, and no other action leaks in.
+    expect(controls.sort()).toEqual(['owner-ack:owner-stop/ack', 'owner-ack:owner-stop/disclose']);
     // The machine row is in the bell panel's NEEDS GRU section, never in the band.
     expect(document.getElementById('notification-list')?.textContent).toContain('Notice machine');
     expect(band.textContent).not.toContain('Notice machine');
@@ -2494,8 +2568,12 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     const stop = notification('ack-me', { routing: 'needs-owner', kind: 'supervision.provider-wall.a1.quota_exceeded' });
     view.render(snapshot({ notifications: [stop] }));
     const band = document.getElementById('board-owner')!;
-    const button = band.querySelector<HTMLButtonElement>('[data-action-id="owner-ack:ack-me"]')!;
-    // Honest consequence copy rides the row (quota ack scope).
+    // The Ack control lives in the expanded region: reveal first — the
+    // reveal itself must not touch the client (asserted below).
+    const disclose = band.querySelector<HTMLButtonElement>('[data-control="disclose"]')!;
+    disclose.click();
+    const button = band.querySelector<HTMLButtonElement>('[data-action-id="owner-ack:ack-me"][data-control="ack"]')!;
+    // Honest consequence copy rides the expanded region (quota ack scope).
     expect(band.textContent).toContain('does NOT clear code/test/review holds');
     button.click();
     expect(button.textContent).toBe('acking…');
@@ -2507,12 +2585,13 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(button.textContent).toBe('Ack');
     expect(button.disabled).toBe(false);
     view.render(snapshot({ notifications: [stop] }));
-    expect(band.querySelector('[data-action-id="owner-ack:ack-me"]')).not.toBeNull();
+    expect(band.querySelector('[data-action-id="owner-ack:ack-me"][data-control="ack"]')).not.toBeNull();
     // Success → STILL pending until the authoritative snapshot lands.
     const okClient = stubClient();
     const view2 = new BoardView(() => {}, okClient);
     view2.render(snapshot({ notifications: [stop] }));
-    const button2 = document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__ack')!;
+    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('[data-control="disclose"]')!.click();
+    const button2 = document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('[data-control="ack"]')!;
     button2.click();
     await Promise.resolve();
     await Promise.resolve();
@@ -2550,6 +2629,8 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     const band = document.getElementById('board-owner')!;
     expect(band.querySelectorAll('.board-owner__row')).toHaveLength(6);
     const more = band.querySelector<HTMLButtonElement>('.board-band__more')!;
+    // The older-pending count rides its own reserved numeric subpart.
+    expect(more.querySelector<HTMLElement>('.board-band__more-num')?.textContent).toBe('3');
     expect(more.textContent).toBe('+3 older pending');
     more.click();
     expect(document.getElementById('board-owner')!.querySelectorAll('.board-owner__row')).toHaveLength(9);
@@ -2561,16 +2642,248 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     view.setToastHandler(toast);
     const stop = notification('focus-me', { routing: 'needs-owner' });
     view.render(snapshot({ notifications: [stop] }));
-    const button = document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('[data-action-id="owner-ack:focus-me"]')!;
+    const button = document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('[data-action-id="owner-ack:focus-me"][data-control="disclose"]')!;
     button.focus();
     expect(document.activeElement).toBe(button);
     // A refresh of the SAME data re-renders the band: no new arrival, so
-    // no toast — and the focused control keeps its place.
+    // no toast — and the focused control keeps its place (same action id
+    // AND same control kind, never a lookalike).
     view.render(snapshot({ notifications: [stop] }));
     expect(toast).not.toHaveBeenCalled();
-    const refocused = document.getElementById('board-owner')!.querySelector<HTMLElement>('[data-action-id="owner-ack:focus-me"]');
+    const refocused = document.getElementById('board-owner')!.querySelector<HTMLElement>('[data-action-id="owner-ack:focus-me"][data-control="disclose"]');
     expect(document.activeElement).toBe(refocused);
     expect((document.activeElement as HTMLElement)?.dataset.actionId).toBe('owner-ack:focus-me');
+    expect((document.activeElement as HTMLElement)?.dataset.control).toBe('disclose');
+  });
+
+  it('rows disclose independently; reveal sends no request and changes no pending count', () => {
+    const client = stubClient();
+    const view = new BoardView(() => {}, client);
+    const stops = [
+      notification('row-a', { routing: 'needs-owner', kind: 'supervision.breaker' }),
+      notification('row-b', { routing: 'needs-owner' }),
+    ];
+    view.render(snapshot({ notifications: stops }));
+    // The mounted band starts hidden, so the FIRST render sees no visible
+    // surface; the upgrade render below is the first that receives the
+    // display receipt (pre-existing shown:true behavior — see the visible-
+    // band receipt test above). Reveal itself must never add one.
+    view.render(snapshot({ notifications: stops }));
+    const band = document.getElementById('board-owner')!;
+    const rows = [...band.querySelectorAll<HTMLElement>('.board-owner__row')];
+    const discloseA = rows[0]!.querySelector<HTMLButtonElement>('[data-control="disclose"]')!;
+    const discloseB = rows[1]!.querySelector<HTMLButtonElement>('[data-control="disclose"]')!;
+    // Collapsed by default: details hidden, aria-expanded false.
+    for (const row of rows) {
+      expect(row.querySelector<HTMLElement>('.board-owner__detail')?.hidden).toBe(true);
+    }
+    expect(discloseA.getAttribute('aria-expanded')).toBe('false');
+    // Reveal row A only; rows disclose independently.
+    discloseA.click();
+    expect(discloseA.getAttribute('aria-expanded')).toBe('true');
+    expect(rows[0]!.querySelector<HTMLElement>('.board-owner__detail')?.hidden).toBe(false);
+    expect(rows[1]!.querySelector<HTMLElement>('.board-owner__detail')?.hidden).toBe(true);
+    expect(discloseB.getAttribute('aria-expanded')).toBe('false');
+    // Reveal is local only: no ack, no extra receipt, no count change.
+    expect(client.ackNotification).not.toHaveBeenCalled();
+    expect(client.markNotificationShown).toHaveBeenCalledTimes(2); // one web-board receipt per row, unchanged by reveal
+    expect(band.querySelector('.board-band__count')?.textContent).toBe('2 pending');
+    // The disclosure is a real button with aria wiring (native Enter/Space).
+    expect(discloseA.tagName).toBe('BUTTON');
+    expect(discloseA.getAttribute('aria-controls')).toMatch(/^fy-detail-\d+$/);
+  });
+
+  it('the collapsed face stays short: title as Problem + typed Next step; full detail and consequence live expanded', () => {
+    const view = new BoardView(() => {});
+    const stop = notification('short-face', {
+      routing: 'needs-owner',
+      kind: 'supervision.provider-wall.a1.quota_exceeded',
+      detail: 'the long original notice body',
+    });
+    view.render(snapshot({ notifications: [stop] }));
+    const row = document.getElementById('board-owner')!.querySelector<HTMLElement>('.board-owner__row')!;
+    const face = row.querySelector<HTMLElement>('.board-owner__face')!;
+    // Face: supplied title + SHORT typed next step — no duplication, no
+    // full consequence paragraph.
+    expect(face.querySelector('.board-owner__title')?.textContent).toBe('Notice short-face');
+    expect(face.textContent).toContain('Next step:');
+    expect(face.textContent).toContain('Ack re-arms this worker.');
+    expect(face.textContent).not.toContain('does NOT clear code/test/review holds');
+    expect(face.textContent).not.toContain('the long original notice body');
+    expect(face.textContent).not.toContain('owner ack owed');
+    // Expanded: verbatim detail, timestamp/kind metadata, full consequence.
+    row.querySelector<HTMLButtonElement>('[data-control="disclose"]')!.click();
+    const detail = row.querySelector<HTMLElement>('.board-owner__detail')!;
+    expect(detail.textContent).toContain('the long original notice body');
+    expect(detail.textContent).toContain('does NOT clear code/test/review holds');
+    expect(detail.textContent).toContain('kind supervision.provider-wall.a1.quota_exceeded');
+    expect(detail.textContent).toContain('Reviewing never acks or approves');
+    // PR face: title + readiness + OPEN PR + short next step; evidence expanded.
+    view.render(
+      snapshot({
+        notifications: [],
+        ownerPrs: [ownerPr('face-pr')],
+      }),
+    );
+    const prRow = document.getElementById('board-owner')!.querySelector<HTMLElement>('.board-owner__row--pr')!;
+    const prFace = prRow.querySelector<HTMLElement>('.board-owner__face')!;
+    expect(prFace.querySelector('.board-owner__title')?.textContent).toBe('Heist face-pr');
+    expect(prFace.textContent).toContain('ready for you');
+    expect(prFace.textContent).toContain('Open the pull request on GitHub');
+    expect(prFace.textContent).not.toContain('CI green');
+    prRow.querySelector<HTMLButtonElement>('[data-control="disclose"]')!.click();
+    expect(prRow.querySelector<HTMLElement>('.board-owner__detail')?.textContent).toContain('CI green');
+  });
+
+  it('region ids are allocated per action id — `a_b` and `a-b` never collide', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        notifications: [
+          notification('a_b', { routing: 'needs-owner' }),
+          notification('a-b', { routing: 'needs-owner' }),
+        ],
+      }),
+    );
+    const rows = [...document.getElementById('board-owner')!.querySelectorAll<HTMLElement>('.board-owner__row')];
+    const controls = rows.map((row) => row.querySelector<HTMLButtonElement>('[data-control="disclose"]')!);
+    const ids = controls.map((control) => control.getAttribute('aria-controls'));
+    expect(ids[0]).not.toBe(ids[1]);
+    expect(new Set(ids).size).toBe(2);
+    // Distinct focus targets and independent regions.
+    controls[0]!.click();
+    controls[1]!.click();
+    expect(rows[0]!.querySelector('.board-owner__detail')?.id).toBe(ids[0]);
+    expect(rows[1]!.querySelector('.board-owner__detail')?.id).toBe(ids[1]);
+    expect(rows[0]!.querySelector('.board-owner__detail')?.id).not.toBe(rows[1]!.querySelector('.board-owner__detail')?.id);
+  });
+
+  it('disclosure state and focus survive a snapshot push; a settled row retires without disturbing the others', () => {
+    const view = new BoardView(() => {});
+    const stopA = notification('keep-a', { routing: 'needs-owner' });
+    const stopB = notification('keep-b', { routing: 'needs-owner' });
+    view.render(snapshot({ notifications: [stopA, stopB] }));
+    const rowsBefore = [...document.getElementById('board-owner')!.querySelectorAll<HTMLElement>('.board-owner__row')];
+    const discloseA = rowsBefore[0]!.querySelector<HTMLButtonElement>('[data-control="disclose"]')!;
+    const discloseB = rowsBefore[1]!.querySelector<HTMLButtonElement>('[data-control="disclose"]')!;
+    discloseA.click();
+    discloseB.click();
+    discloseA.focus();
+    const idA = discloseA.getAttribute('aria-controls');
+    const idB = discloseB.getAttribute('aria-controls');
+    // A new snapshot re-renders: both stay expanded, A keeps focus, ids stable.
+    view.render(snapshot({ notifications: [stopA, stopB] }));
+    const rowsAfter = [...document.getElementById('board-owner')!.querySelectorAll<HTMLElement>('.board-owner__row')];
+    const afterA = rowsAfter[0]!.querySelector<HTMLButtonElement>('[data-control="disclose"]')!;
+    const afterB = rowsAfter[1]!.querySelector<HTMLButtonElement>('[data-control="disclose"]')!;
+    expect(afterA.getAttribute('aria-expanded')).toBe('true');
+    expect(afterB.getAttribute('aria-expanded')).toBe('true');
+    expect(afterA.getAttribute('aria-controls')).toBe(idA);
+    expect(afterB.getAttribute('aria-controls')).toBe(idB);
+    expect(rowsAfter[0]!.querySelector<HTMLElement>('.board-owner__detail')?.hidden).toBe(false);
+    expect(document.activeElement).toBe(afterA);
+    // B settles (acked) and leaves the owner list while A STAYS pending:
+    // A's identity, state and region survive; B's retire.
+    view.render(
+      snapshot({ notifications: [stopA, { ...stopB, ackedAt: '2026-01-01T00:09:00.000Z' }] }),
+    );
+    const rowsFinal = [...document.getElementById('board-owner')!.querySelectorAll<HTMLElement>('.board-owner__row')];
+    expect(rowsFinal).toHaveLength(1);
+    const finalA = rowsFinal[0]!.querySelector<HTMLButtonElement>('[data-control="disclose"]')!;
+    expect(finalA.getAttribute('aria-controls')).toBe(idA);
+    expect(finalA.getAttribute('aria-expanded')).toBe('true');
+    expect(rowsFinal[0]!.querySelector<HTMLElement>('.board-owner__detail')?.hidden).toBe(false);
+  });
+
+  it('a row pushed OUTSIDE the older-pending window keeps its identity and disclosure state', () => {
+    const view = new BoardView(() => {});
+    const stops = Array.from({ length: 6 }, (_, i) =>
+      notification(`win-${String(i).padStart(2, '0')}`, { routing: 'needs-owner', ts: `2026-01-01T00:0${i}:00.000Z` }),
+    );
+    view.render(snapshot({ notifications: stops }));
+    const band = document.getElementById('board-owner')!;
+    expect(band.querySelectorAll('.board-owner__row')).toHaveLength(6);
+    const target = band.querySelector<HTMLButtonElement>('[data-action-id="owner-ack:win-00"][data-control="disclose"]')!;
+    const hiddenId = target.getAttribute('aria-controls');
+    target.click();
+    expect(target.getAttribute('aria-expanded')).toBe('true');
+    // Newer obligations arrive: win-00 falls OUTSIDE the visible six.
+    const newer = Array.from({ length: 3 }, (_, i) =>
+      notification(`new-${i}`, { routing: 'needs-owner', ts: `2026-01-01T01:0${i}:00.000Z` }),
+    );
+    view.render(snapshot({ notifications: [...newer, ...stops] }));
+    const bandAfter = document.getElementById('board-owner')!;
+    expect(bandAfter.querySelectorAll('.board-owner__row')).toHaveLength(6);
+    expect(bandAfter.querySelector('[data-action-id="owner-ack:win-00"]')).toBeNull(); // hidden by the window, not retired
+    // Reveal the older tail: the same row returns with retained id AND state.
+    bandAfter.querySelector<HTMLButtonElement>('.board-band__more')!.click();
+    const rows = [...document.getElementById('board-owner')!.querySelectorAll<HTMLElement>('.board-owner__row')];
+    expect(rows).toHaveLength(9);
+    const again = document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('[data-action-id="owner-ack:win-00"][data-control="disclose"]')!;
+    expect(again.getAttribute('aria-controls')).toBe(hiddenId);
+    expect(again.getAttribute('aria-expanded')).toBe('true');
+  });
+
+  it('explicit Ack and OPEN PR controls restore focus across a snapshot push', () => {
+    const view = new BoardView(() => {});
+    const ackNotice = notification('ack-focus', { routing: 'needs-owner' });
+    // COMPLETE authoritative snapshots: both rows stay pending throughout —
+    // no refresh drops the PR row.
+    const state = () =>
+      snapshot({
+        notifications: [ackNotice],
+        ownerPrs: [ownerPr('open-focus')],
+      });
+    view.render(state());
+    const q = (sel: string): HTMLElement => document.getElementById('board-owner')!.querySelector<HTMLElement>(sel)!;
+    // Reveal each row separately; capture ACTION-SPECIFIC region identities.
+    q('[data-action-id="owner-ack:ack-focus"][data-control="disclose"]').click();
+    q('[data-action-id="owner-pr:open-focus"][data-control="disclose"]').click();
+    const ackRegion = q('[data-action-id="owner-ack:ack-focus"][data-control="disclose"]').closest('.board-owner__row')!.querySelector<HTMLElement>('.board-owner__detail')!;
+    const prRegion = q('[data-action-id="owner-pr:open-focus"][data-control="disclose"]').closest('.board-owner__row')!.querySelector<HTMLElement>('.board-owner__detail')!;
+    const ackId = ackRegion.id;
+    const prId = prRegion.id;
+    expect(ackId).not.toBe(prId);
+    // Ack focus survives a complete-snapshot refresh.
+    q('[data-action-id="owner-ack:ack-focus"][data-control="ack"]').focus();
+    view.render(state());
+    expect(document.activeElement).toBe(q('[data-action-id="owner-ack:ack-focus"][data-control="ack"]'));
+    // OPEN PR focus survives too, and BOTH regions keep their stable,
+    // distinct, still-revealed identities.
+    q('[data-action-id="owner-pr:open-focus"][data-control="open"]').focus();
+    view.render(state());
+    expect(document.activeElement).toBe(q('[data-action-id="owner-pr:open-focus"][data-control="open"]'));
+    const bandNow = document.getElementById('board-owner')!;
+    expect(bandNow.querySelector<HTMLElement>(`#${ackId}`)?.hidden).toBe(false);
+    expect(bandNow.querySelector<HTMLElement>(`#${prId}`)?.hidden).toBe(false);
+    expect(bandNow.querySelectorAll(`#${ackId}`)).toHaveLength(1);
+    expect(bandNow.querySelectorAll(`#${prId}`)).toHaveLength(1);
+  });
+
+  it('band and bell PR rows are surface-scoped: one region id, no disclosure in the panel', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({ notifications: [], ownerPrs: [ownerPr('dual-surface')] }));
+    const band = document.getElementById('board-owner')!;
+    const bandRegion = band.querySelector<HTMLElement>('.board-owner__row--pr .board-owner__detail')!;
+    const bandDisclose = band.querySelector<HTMLButtonElement>('[data-action-id="owner-pr:dual-surface"][data-control="disclose"]')!;
+    expect(bandDisclose.getAttribute('aria-controls')).toBe(bandRegion.id);
+    // Bell panel: same projection, PRIOR presentation, no second region.
+    (document.getElementById('notification-bell') as HTMLButtonElement).click();
+    const panelRow = document.getElementById('notification-list')!.querySelector<HTMLElement>('.board-owner__row--pr')!;
+    expect(panelRow.classList.contains('board-owner__row--panel')).toBe(true);
+    expect(panelRow.querySelector('.board-owner__disclose')).toBeNull();
+    expect(panelRow.querySelector('.board-owner__detail')).toBeNull();
+    expect(panelRow.textContent).toContain('CI green'); // prior inline evidence
+    expect(panelRow.querySelector<HTMLAnchorElement>('[data-control="open"]')?.dataset.actionId).toBe('owner-pr:dual-surface');
+    // Exactly ONE region with that id exists in the whole document.
+    expect(document.querySelectorAll(`#${bandRegion.id}`)).toHaveLength(1);
+    // No cross-surface ambiguity: the band refocus path only ever searches
+    // the band mount, and the panel row carries no region target.
+    bandDisclose.focus();
+    view.render(snapshot({ notifications: [], ownerPrs: [ownerPr('dual-surface')] }));
+    expect(document.activeElement).toBe(
+      document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('[data-action-id="owner-pr:dual-surface"][data-control="disclose"]'),
+    );
   });
 
   it('g10: an owner row already acked on another device arrives with no toast and no web-toast receipt', () => {

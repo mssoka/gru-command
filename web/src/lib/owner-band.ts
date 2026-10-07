@@ -35,6 +35,28 @@ export function ackConsequence(kind: string): string {
   return 'Ack clears this notice from your queue; it does not by itself prove the underlying operation ran.';
 }
 
+/** SHORT typed next step for the collapsed For-you face (approved
+ * clarification: the face stays concise — the supplied title is the
+ * Problem and this is the whole Next step; the full consequence still
+ * travels with the Ack control in the expanded region). Same kind
+ * families as `ackConsequence`; static per kind — never parsed from
+ * notification prose. */
+export function ackNextStep(kind: string): string {
+  if (kind.startsWith('supervision.provider-wall.') || kind === 'supervision.breaker') {
+    return 'Ack re-arms this worker.';
+  }
+  if (kind.startsWith('decisions.degraded.')) {
+    return 'Ack records that you saw this.';
+  }
+  if (kind === 'worktree-sweep-paused') {
+    return 'Check the worktree, then ack.';
+  }
+  if (kind === 'port-squat' || kind === 'roll-port-squat') {
+    return 'Stop the foreign process, then ack.';
+  }
+  return 'Ack clears this notice.';
+}
+
 export interface OwnerAckRow {
   readonly kind: 'ack';
   readonly actionId: string;
