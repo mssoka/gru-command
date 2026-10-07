@@ -1373,5 +1373,13 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
     expect(row(view, 'alpha').freshness).toBe('fresh');
     expect(row(view, 'beta').lastAttemptAt).toBeNull();
     expect(h.failure).toContain('fetch wall-clock budget');
+    // Discriminator: the search whose pacing sleep crossed the deadline is
+    // WITHHELD — beta stops after its countOpenPulls call, and the
+    // countOpenIssues call that a pre-fix build issues post-deadline never
+    // goes out.
+    expect(h.api.calls.filter((call) => call.endsWith('acme/beta'))).toEqual([
+      'fetchRepo:acme/beta',
+      'countOpenPulls:acme/beta',
+    ]);
   });
 });

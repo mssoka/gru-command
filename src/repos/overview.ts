@@ -1087,28 +1087,30 @@ export class ManagedRepoOverviewTracker {
   /** Spend one Search call, paced to GitHub's sustained search quota (a
    * self-inflicted 403 would abort the pass mid-registry). The wait is
    * clamped to one interval so a backward clock step can never turn
-   * pacing into an unbounded sleep, and the pass deadline is re-checked
-   * after the sleep because it may have been crossed while waiting. */
+   * pacing into an unbounded sleep; both bounds are checked BEFORE the
+   * call is issued and BEFORE a budget unit is consumed, so a deferred
+   * call is never booked as provider spend. */
   private async spendSearch<T>(
     budget: { used: number; limit: number; deadlineMs?: number },
     work: () => Promise<T>,
   ): Promise<T> {
-    return this.spend(budget, async () => {
-      const nowMs = this.now();
-      if (this.lastSearchAtMs !== null) {
-        const elapsed = nowMs - this.lastSearchAtMs;
-        if (elapsed < REPO_OVERVIEW_SEARCH_MIN_INTERVAL_MS) {
-          await this.sleep(
-            REPO_OVERVIEW_SEARCH_MIN_INTERVAL_MS - Math.max(0, Math.min(elapsed, REPO_OVERVIEW_SEARCH_MIN_INTERVAL_MS)),
-          );
-        }
+    if (budget.used >= budget.limit) {
+      throw new GhBudgetExceededError('repo overview call budget exceeded');
+    }
+    if (this.lastSearchAtMs !== null) {
+      const elapsed = this.now() - this.lastSearchAtMs;
+      if (elapsed < REPO_OVERVIEW_SEARCH_MIN_INTERVAL_MS) {
+        await this.sleep(
+          REPO_OVERVIEW_SEARCH_MIN_INTERVAL_MS - Math.max(0, Math.min(elapsed, REPO_OVERVIEW_SEARCH_MIN_INTERVAL_MS)),
+        );
       }
-      if (budget.deadlineMs !== undefined && this.now() > budget.deadlineMs) {
-        throw new GhBudgetExceededError('repo overview fetch wall-clock budget exceeded');
-      }
-      this.lastSearchAtMs = this.now();
-      return work();
-    });
+    }
+    if (budget.deadlineMs !== undefined && this.now() > budget.deadlineMs) {
+      throw new GhBudgetExceededError('repo overview fetch wall-clock budget exceeded');
+    }
+    budget.used += 1;
+    this.lastSearchAtMs = this.now();
+    return work();
   }
 
   private async spend<T>(
