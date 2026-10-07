@@ -77,6 +77,11 @@ describe('managed repository overview panel', () => {
   it('renders one row per repository with identity, counts, CI context, checked age and safe links', () => {
     const { mount, view } = panel();
     view.render({ rows: [row()] });
+    // The approved disclosure is pinned: default-branch CI only, never a
+    // deployment-health claim.
+    const caption = mount.querySelector('.repo-overview__sub')?.textContent ?? '';
+    expect(caption).toContain('default-branch CI only');
+    expect(caption).toContain('not deployment health');
     const article = mount.querySelector<HTMLElement>('.repo-row')!;
     expect(article.dataset.runState).toBe('passed');
     expect(article.dataset.freshness).toBe('fresh');

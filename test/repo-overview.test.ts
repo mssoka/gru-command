@@ -17,6 +17,7 @@ import {
   ManagedRepoOverviewTracker,
   REPO_OVERVIEW_FETCH_BUDGET_MS,
   REPO_OVERVIEW_RESOLVE_BUDGET_MS,
+  REPO_OVERVIEW_RUNS_PER_FETCH,
   REPO_OVERVIEW_STALE_AFTER_MS,
   classifyGhError,
   classifyRemote,
@@ -70,6 +71,7 @@ interface FakeFacts {
 /** Deterministic in-memory port: every call is recorded by repo name. */
 class FakeApi implements RepoOverviewApiPort {
   readonly calls: string[] = [];
+  readonly runQueries: { repo: string; branch: string; limit: number }[] = [];
   readonly facts = new Map<string, FakeFacts>();
 
   set(repo: string, facts: FakeFacts): this {
@@ -115,6 +117,7 @@ class FakeApi implements RepoOverviewApiPort {
     readonly limit: number;
   }): Promise<ActionsAvailability<readonly RepoOverviewRunRaw[]>> {
     const facts = this.record('latestRuns', input.repo);
+    this.runQueries.push({ repo: repoFullName(input.repo), branch: input.branch, limit: input.limit });
     return facts.runs ?? { kind: 'ok', value: [rawRun()] };
   }
 }
@@ -1402,20 +1405,35 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
 
   it('fast-fails an already-crossed fetch deadline before any pacing wait', async () => {
     const h = harness({ names: ['alpha', 'beta'] });
-    const original = h.api.fetchRepo.bind(h.api);
+    const start = h.clock.ms;
+    const originalFetch = h.api.fetchRepo.bind(h.api);
+    const originalPulls = h.api.countOpenPulls.bind(h.api);
     h.api.fetchRepo = async (input) => {
-      const result = await original(input);
-      if (input.repo.repo === 'beta') h.clock.ms = Number.POSITIVE_INFINITY;
+      const result = await originalFetch(input);
+      // Park beta's first search 500 ms before the deadline so its entry
+      // check passes.
+      if (input.repo.repo === 'beta') h.clock.ms = start + REPO_OVERVIEW_FETCH_BUDGET_MS - 500;
+      return result;
+    };
+    h.api.countOpenPulls = async (input) => {
+      const result = await originalPulls(input);
+      // ...then let that call finish just PAST the deadline, 100 ms after
+      // the last search: the next search enters with a crossed deadline
+      // AND would be pacing-eligible (elapsed < 2 s).
+      if (input.repo.repo === 'beta') h.clock.ms = start + REPO_OVERVIEW_FETCH_BUDGET_MS + 100;
       return result;
     };
     const view = await h.tracker.refresh();
     // Alpha's observation is intact (the jump only makes it age-stale).
     expect(row(view, 'alpha').checkedAt).not.toBeNull();
-    // beta: fetch issued, then the FIRST search is refused with no wait.
-    expect(h.api.calls.filter((call) => call.endsWith('acme/beta'))).toEqual(['fetchRepo:acme/beta']);
+    // beta: fetch and its first search go out, the second is refused.
+    expect(h.api.calls.filter((call) => call.endsWith('acme/beta'))).toEqual([
+      'fetchRepo:acme/beta',
+      'countOpenPulls:acme/beta',
+    ]);
     // Exactly one pacing wait happened — alpha's second search. A build
-    // that sleeps before checking the deadline would add a second wait
-    // for beta's refused call.
+    // that only checks the deadline after pacing would add a ~1.9 s wait
+    // for beta's refused call (elapsed 100 ms).
     expect(h.sleeps.length).toBe(1);
     expect(h.failure).toContain('fetch wall-clock budget');
   });
@@ -1433,5 +1451,52 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
       'countOpenPulls:acme/beta',
     ]);
     expect(h.failure).toContain('budget exhausted');
+    // The exact unit count is a round-9-only observable: 5 (alpha) + 2
+    // (beta) = 7; a guard-less or phantom-unit build books 8.
+    expect(h.failureFields?.calls).toBe(7);
+  });
+
+  it('queries the port for the branch it discovered, including after a default-branch move', async () => {
+    const api = new FakeApi().set('alpha', {
+      defaultBranch: 'main',
+      workflows: { kind: 'ok', value: 1 },
+      runs: { kind: 'ok', value: [rawRun({ name: 'CI' })] },
+    });
+    const h = harness({ names: ['alpha'], api });
+    await h.tracker.refresh();
+    expect(api.runQueries).toEqual([{ repo: 'acme/alpha', branch: 'main', limit: REPO_OVERVIEW_RUNS_PER_FETCH }]);
+
+    api.set('alpha', {
+      defaultBranch: 'trunk',
+      workflows: { kind: 'ok', value: 1 },
+      runs: { kind: 'ok', value: [rawRun({ name: 'CI', id: 22, url: 'https://github.com/acme/alpha/actions/runs/22' })] },
+    });
+    const moved = await h.tracker.refresh();
+    expect(api.runQueries.at(-1)).toEqual({ repo: 'acme/alpha', branch: 'trunk', limit: REPO_OVERVIEW_RUNS_PER_FETCH });
+    expect(row(moved, 'alpha').run?.branch).toBe('trunk');
+    expect(row(moved, 'alpha').run?.url).toContain('/runs/22');
+  });
+
+  it('selects the newest run at the tracker call site even from an out-of-order page', async () => {
+    const older = rawRun({
+      id: 3,
+      status: 'completed',
+      conclusion: 'failure',
+      createdAt: '2026-10-07T09:00:00.000Z',
+      url: 'https://github.com/acme/alpha/actions/runs/3',
+    });
+    const newer = rawRun({
+      id: 9,
+      status: 'completed',
+      conclusion: 'success',
+      createdAt: '2026-10-07T11:00:00.000Z',
+      url: 'https://github.com/acme/alpha/actions/runs/9',
+    });
+    // Provider page ascending: the tracker must not trust page order.
+    const api = new FakeApi().set('alpha', { workflows: { kind: 'ok', value: 1 }, runs: { kind: 'ok', value: [older, newer] } });
+    const h = harness({ names: ['alpha'], api });
+    const entry = row(await h.tracker.refresh(), 'alpha');
+    expect(entry.run?.state).toBe('passed');
+    expect(entry.run?.url).toContain('/runs/9');
   });
 });
