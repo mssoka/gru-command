@@ -5,7 +5,7 @@ created: '2026-10-07'
 status: 'in-progress'
 route: 'dispatch'
 baseline_commit: '49b558f243c7bacbfb46c7bc04f749bf131cefea'
-review_loop_iteration: 0
+review_loop_iteration: 1
 context: []
 ---
 
@@ -53,20 +53,20 @@ context: []
 - `web/src/lib/repo-overview.ts` (new) -- pure presentation model (badge label/glyph/tone, freshness overlay, notes, counts, safe link).
 - `web/src/ui/repo-overview.ts` (new) -- `RepoOverviewPanel` rendering rows; uses the shared age ticker via an injected `ageNode` factory.
 - `web/src/ui/board.ts` -- minimal hookup: construct panel on `#board-repos`, render after `renderAgents`; `web/index.html` -- new sibling panel `data-rail-panel="agents"`; `web/src/styles/components.css` -- `.repo-overview*` styles on existing tokens (independent bounded list scroll).
-- `web/mock/server.ts` -- generic sample `repoOverview` rows; `web/playwright.config.ts` -- new `repo-overview` project; `web/e2e/repo-overview.spec.ts` (new) -- light/dark + desktop/narrow geometry, glyph/text, zero side effects.
+- `web/playwright.config.ts` -- new `repo-overview` project; `web/e2e/repo-overview.spec.ts` (new) -- light/dark + desktop/narrow geometry, glyph/text, zero side effects, synthetic WebSocket-seeded snapshots. `web/mock/server.ts` is deliberately NOT modified: the committed smoke/real theme baselines stay bit-identical and the module still gets a full browser proof through the established synthetic-seed pattern (lens-pills/pipeline-board); the mock's absent-field path doubles as the hidden-section compatibility check.
 - Backend tests `test/repo-overview.test.ts` (new; fakes only, fast) + `test/board-engine.test.ts`/`test/board-server.test.ts` additions + `test/suite-shape.test.ts` pin; web tests `web/src/lib/repo-overview.test.ts`, `web/src/ui/repo-overview.test.ts` (new), `web/src/lib/board-protocol.test.ts`, `web/src/ui/board.test.ts` plus the two other DOM shims (`board-merged-attention.test.ts`, `owner-chime.test.ts`).
 - `docs/BOARD.md` -- document the read-only module, data semantics and freshness rule; `.gru-command/worktree.toml` -- committed focused/static/browser/baseline scopes.
 
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `src/repos/discovery.ts` + `src/wizard/steps.ts` -- one canonical managed-repo registry rule -- rows and wizard can never drift.
-- [ ] `src/repos/overview.ts` -- tracker, exact counts, run selection/mapping, freshness/stale policy, budget/rotation, remote classification, gh adapter -- the whole server data path.
-- [ ] `src/board/engine.ts` + `src/main.ts` -- additive snapshot field + service wiring/lifecycle -- the board can render it and nothing else changes.
-- [ ] `web/src/lib/board-protocol.ts` + `web/src/lib/repo-overview.ts` -- mirrored types, strict validator, pure badge/notes model -- server truth renders deterministically.
-- [ ] `web/src/ui/repo-overview.ts` + `web/src/ui/board.ts` + `web/index.html` + `web/src/styles/components.css` -- dedicated compact-row panel below the crew list -- approved A fidelity with independent scrolling.
-- [ ] `web/mock/server.ts` + `web/playwright.config.ts` + `web/e2e/repo-overview.spec.ts` -- generic sample + browser geometry/theme proof -- inspected evidence.
-- [ ] tests + suite pin + docs + scopes -- full deterministic matrix, exact fail-before capture.
+- [x] `src/repos/discovery.ts` + `src/wizard/steps.ts` -- one canonical managed-repo registry rule -- rows and wizard can never drift.
+- [x] `src/repos/overview.ts` -- tracker, exact counts, run selection/mapping, freshness/stale policy, budget/rotation, remote classification, gh adapter -- the whole server data path.
+- [x] `src/board/engine.ts` + `src/main.ts` -- additive snapshot field + service wiring/lifecycle -- the board can render it and nothing else changes.
+- [x] `web/src/lib/board-protocol.ts` + `web/src/lib/repo-overview.ts` -- mirrored types, strict validator, pure badge/notes model -- server truth renders deterministically.
+- [x] `web/src/ui/repo-overview.ts` + `web/src/ui/board.ts` + `web/index.html` + `web/src/styles/components.css` -- dedicated compact-row panel below the crew list -- approved A fidelity with independent scrolling.
+- [x] `web/playwright.config.ts` + `web/e2e/repo-overview.spec.ts` + `web/e2e/repo-overview.spec.ts` -- generic sample + browser geometry/theme proof -- inspected evidence.
+- [x] tests + suite pin + docs + scopes -- full deterministic matrix, exact fail-before capture.
 
 **Acceptance Criteria:**
 - Given the configured registry, when the board renders, then each managed repo appears once in stable order with identity/link-or-not-linked, exact open-PR and open-issue-excl-PR counts, latest default-branch run state/context/freshness, and no hard-coded/sample facts; empty registry renders the explicit empty note and config changes never duplicate rows or disturb the crew list.
@@ -81,12 +81,14 @@ context: []
 - Fixed decisions (owner briefing + mockup cannot settle implementation-level choices; none are user-visible surprises): cadence 300 s; `freshness` = fresh within 3× cadence of the last SUCCESSFUL fetch, else stale; checkedAt = successful fetch completion on the server clock; newest run = max by (createdAt, id); per-refresh call budget 100 with rotation; unsupported/absent remotes spend no GitHub call; not-linked rows carry a reason.
 - No subagent runtime in this lane's tool surface: implementation runs directly from this spec (step-03 fallback); the built-in independent review runs as fresh tracked read-only review jobs via `POST /api/dispatch` (`"deliverable": "review"`) per the playbook.
 - Verification: scopes `repo-overview-focused`, `repo-overview-static`, `repo-overview-browser`, `repo-overview-baseline` added to `.gru-command/worktree.toml`; all runs through the authenticated `/api/verify` scheduler via the shipped complete-capture helper, exact-head receipts recorded below.
+- Implementation commit `c3f3b3519a429c6032d114d74490abc28dc84d4a` (PR #257). Round-1 schedule receipts at that head — `repo-overview-focused` PASS (backend 5 files/116 tests + web 6 files/177 tests; run `c40dcd58-a6ef-4074-80cf-2942e8680051`, capture sha256 `cf66fb9e…`), `repo-overview-static` PASS (lint/typecheck/build/web tsc; run `6718115f-4d1f-4c0a-b85b-0c6a322c5161`, capture sha256 `bf54d1c5…`), `repo-overview-browser` PASS (3 tests; run `149dd9a1-d800-46d5-8e22-843a758d15e4`, capture sha256 `2dd02ec5…`), `repo-overview-baseline` RED by design (backend 4 + web 4 named assertion failures; run `32152c83-a895-45f0-b632-13a4ea047396`, capture sha256 `e7e85033…`, snapshot `/var/folders/…/gru-baseline-repo-overview.x912Sv`). The `full` request (`full-c3f3b35-1`, run `4489163b…`) queued behind a foreign run past the capture helper's wait bound and was left accepted for re-attach at the same durable request id; it is not PASS evidence.
+- Round-1 independent review (three fresh tracked read-only jobs via `POST /api/dispatch`, deliverable `review`, target PR #257 + head `c3f3b35`, commissioner this lane): `repo-overview-review-{blind,edge,verify}-20261007`, all delivered; reviewer trees verified clean at base, findings collected from their transcripts into the ignored `_bmad-output/managed-repo-overview/reviews/r1/`. Findings and dispositions in the Review Triage Log; all valid ones are fixed in the round-2 commit (see below). Reports retained; no reviewer tree was modified.
 
 ## Design Notes
 
 - Counts: REST search `total_count` is GitHub's exact aggregate; `open_issues_count` is deliberately NOT used (it includes PRs and cannot exclude them). `incomplete_results: true` degrades the attempt, never presented as exact.
 - Server data path is one attempt per repo (all calls must succeed, except permanent Actions-unavailable) so a row's counts/run share one `checkedAt` and freshness label; the atomicity keeps the UI honest without a second freshness field.
-- Shared `gh` auth budget: tracked-PR poll worst case 50 calls/min; overview ≤ 100 calls per 5 min = 20/min → combined ≤ 70/min ≤ 5 000/h with headroom; search quota ≤ 6/min of 30/min.
+- Shared `gh` auth budget: tracked-PR poll worst case 50 calls/min; overview ≤ 100 calls per 5 min = 20/min → combined ≤ 70/min ≤ 5 000/h with headroom. Search calls are PACED to one per 2 s (≤30/min sustained), because each repository costs two search calls and a 20-repo pass would otherwise burst past GitHub's 30/min Search quota and self-inflict a 403 that aborts the pass.
 
 Run-state → badge text/glyph/tone (one table, server state, web-rendered; text carries meaning, color is never the only cue):
 
@@ -109,6 +111,34 @@ Run-state → badge text/glyph/tone (one table, server state, web-rendered; text
 | unavailable (run) | UNAVAILABLE | ! | park |
 
 Freshness overlays replace the state badge when the row is not fresh: `NOT CHECKED` (?), `UNAVAILABLE` (!, fetch failed, no cache), `STALE · last <state text lowercased>` (⌛, cached after failure or older than 3× cadence), `NOT LINKED` (!). Notes disclose: cached-result/no-health-claim, fetch-failed age, newest-run-in-progress/queued precedence, cancelled-neither, no-run-yet, actions-unavailable, not-linked reason.
+
+## Spec Change Log
+
+- Round-1 review (independent tracked jobs at `c3f3b35`): the frozen intent was not changed. The Code Map's `web/mock/server.ts` deliverable was corrected to the deliberate decision (synthetic-seed browser proof; committed baselines untouched) and the Design Notes' search-quota arithmetic was replaced with the implemented 2 s pacing rule. No intent renegotiation.
+
+## Review Triage Log
+
+Round-1 whole-change review at `c3f3b3519a429c6032d114d74490abc28dc84d4a` (base `49b558f243c7bacbfb46c7bc04f749bf131cefea`), three fresh tracked read-only jobs (blind / edge-case / verification-gap), all findings independently triaged against the code before grouping.
+
+| ID | Layer | Verdict | Evidence / disposition |
+|---|---|---|---|
+| B1/E2 | blind+edge | medium | `classifyGhError` and `isActionsUnavailableError` matched the annotated label, so a repo named `authentication-service`/`actions-disabled-*` could flip a per-repo failure into a global abort or a fake Actions state. Fixed: `GhApiError.causeText` (gh stderr / spawn detail) is the ONLY classification input for structured errors; adapter/shape errors are per-repo `other`. Pinned by label-contamination tests. |
+| B2/E6 | blind+edge | medium | Attempt timestamps were written at attempt START, so an in-flight fetch rendered STALE/"fetch failed" on every cadence. Fixed: `lastAttemptAt` is written at completion (success or failure) only; a partial budget attempt records nothing. Pinned by a gated in-flight view test. |
+| B3 | blind | medium | Panel rebuilt unconditionally on the 30 s snapshot push, resetting list scroll and focused links. Fixed: the panel preserves `scrollTop` and restores focus through per-row `data-focus-key` values. Pinned by a DOM test. |
+| B4 | blind | medium | Remote resolution used `spawnSync git` per repo per refresh (event-loop stall). Fixed: the default resolver is async (`execFile`, 10 s timeout); the tracker awaits it. |
+| B7/E5 | blind+edge | medium | Non-object `workflow_runs` entries were silently dropped, manufacturing `never-run`. Fixed: `latestRuns` fails loud on a malformed entry; the tracker keeps the previous observation stale. Pinned. |
+| B8 | blind | low | A per-refresh budget smaller than one observation pinned the cursor and starved later repos. Fixed: rotation advances past a partial observation (nothing recorded). Pinned. |
+| B9 | blind | low | Two Search calls per repo could burst past GitHub's 30/min Search quota. Fixed: search calls paced to 2 s (≤30/min sustained). Pinned; spec arithmetic corrected. |
+| E1 | edge | high | Provider `run_number`/timestamp garbage could reach the snapshot, fail the web validator and freeze the whole board. Fixed server-side normalization (`countOrNull`/`isoOrNull`); validator coherence also hardened (fullName non-empty, safe segments, link pathname must match). Pinned adapter + protocol tests. |
+| E3 | edge | low | A `gh` timeout was classified like a missing `gh` and aborted the pass. Fixed via structured causes: timeout/output-cap are per-repo `other`. Pinned. |
+| V1 | verify | high | Badge tone classes had no stylesheet rules — every chip rendered neutral; the DOM test only asserted a class name. Fixed: emit the established `pp-chip--<tone>` contract; browser spec now asserts distinct computed backgrounds. |
+| V2 | verify | medium | Production default scan/remote-resolver seams were never exercised (every test injected them). Fixed: a real-workspace test drives both defaults over a temp `git init` repo + a non-repo directory. |
+| B5/E7 | blind+edge | low (claim) | Spec Code Map named `web/mock/server.ts` sample rows that were deliberately not implemented. Resolved as a spec correction: committed mock/theme baselines stay bit-identical; browser proof uses the established synthetic-seed pattern. Recorded in the Spec Change Log. |
+| B10 | blind | low | Parity corpus not extended. Fixed: `test/board-frames.test.ts` valid exemplar now carries `repoOverview` (plus a malformed variant). |
+| B12 | blind | low | The module joined the CREW tab without the tabpanel a11y contract. Fixed: `role="tabpanel"`/`aria-labelledby` on the section, `aria-controls` includes both panels; browser spec asserts. |
+| B13 | blind | low | `repoCiView` fell back to a fabricated `workflow` label. Fixed: missing workflow renders `—`. Pinned. |
+| B14 | blind | low | Coverage gaps for the above. Fixed by the new tests (in-flight, label contamination, tiny budget, pacing, malformed runs, normalization, default seams, panel scroll/focus, push-to-empty, computed tone colours). |
+| E4 | edge | false | `.github`-suffixed hosts are accepted by the repository's own `isGitHubRemote` policy (the same seam the tracked-lane poll and Perkins use); tightening it in this lane would change sibling behavior outside the approved scope. Inherited policy, not a defect here. Reported as a follow-up rather than patched. |
 
 ## Verification
 

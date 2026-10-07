@@ -83,6 +83,35 @@ const SNAPSHOT_VALID = {
   unackedActionRequired: 0,
   unackedNeedsOwner: 0,
   wakes: { count: 0, lastAt: null },
+  repoOverview: {
+    rows: [
+      {
+        key: 'demo',
+        displayName: 'demo',
+        linked: true,
+        link: 'https://github.com/example/demo',
+        linkReason: null,
+        fullName: 'example/demo',
+        openPrs: 0,
+        openIssues: 3,
+        run: {
+          state: 'queued',
+          status: 'queued',
+          conclusion: null,
+          workflow: 'CI',
+          branch: 'main',
+          runNumber: 12,
+          url: 'https://github.com/example/demo/actions/runs/12',
+          runStartedAt: '2026-01-01T00:00:00.000Z',
+          runUpdatedAt: '2026-01-01T00:01:00.000Z',
+        },
+        freshness: 'fresh',
+        checkedAt: '2026-01-01T00:02:00.000Z',
+        lastAttemptAt: '2026-01-01T00:02:00.000Z',
+        error: null,
+      },
+    ],
+  },
 };
 
 const SERVER_CORPUS: readonly unknown[] = [
@@ -96,6 +125,7 @@ const SERVER_CORPUS: readonly unknown[] = [
   { type: 'error', fatal: true },
   { type: 'board' },
   { type: 'board', snapshot: { repos: [], agents: [], notifications: 'nope' } },
+  { type: 'board', snapshot: { ...SNAPSHOT_VALID, repoOverview: { rows: [{ linked: true }] } } },
   { type: 'board', snapshot: null },
   { type: 'nope' },
   {},

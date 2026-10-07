@@ -465,16 +465,22 @@ export function trackedLanes(input: {
 // ------------------------------------------------------------------
 
 export class GhApiError extends Error {
-  constructor(message: string) {
+  /** The raw failure detail the message was composed from (gh stderr or a
+   * spawn/timeout detail), kept separate from the annotated label so
+   * classification can never read repository names as provider semantics. */
+  readonly causeText: string | null;
+
+  constructor(message: string, causeText: string | null = null) {
     super(message);
     this.name = 'GhApiError';
+    this.causeText = causeText;
   }
 }
 
 /** A rate-limit response — the tick must stop calling, never hammer. */
 export class GhRateLimitedError extends GhApiError {
-  constructor(message: string) {
-    super(message);
+  constructor(message: string, causeText: string | null = null) {
+    super(message, causeText);
     this.name = 'GhRateLimitedError';
   }
 }
@@ -560,12 +566,12 @@ export async function ghApiJson(
   if (result.status !== 0) {
     const stderr = result.stderr.trim().slice(0, 300);
     if (result.error !== undefined && result.error !== '') {
-      throw new GhApiError(`${label}: gh is unavailable (${result.error})`);
+      throw new GhApiError(`${label}: gh is unavailable (${result.error})`, result.error);
     }
     if (/rate limit/i.test(stderr)) {
-      throw new GhRateLimitedError(`${label}: GitHub rate limit (${stderr})`);
+      throw new GhRateLimitedError(`${label}: GitHub rate limit (${stderr})`, stderr);
     }
-    throw new GhApiError(`${label}: ${binary} exited ${result.status}: ${stderr}`);
+    throw new GhApiError(`${label}: ${binary} exited ${result.status}: ${stderr}`, stderr);
   }
   try {
     return JSON.parse(result.stdout) as unknown;

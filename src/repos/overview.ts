@@ -1,3 +1,4 @@
+import { execFile } from 'node:child_process';
 import { join } from 'node:path';
 import type { LogLevel } from '../logger.js';
 import {
@@ -10,7 +11,7 @@ import {
   type GhCommandRunner,
   type RepoRef,
 } from '../dispatch/github-poll.js';
-import { isGitHubRemote, repoRemote } from '../dispatch/review-path.js';
+import { isGitHubRemote, parseRepoRemote } from '../dispatch/review-path.js';
 import { discoverManagedRepos } from './discovery.js';
 
 /**
@@ -128,6 +129,11 @@ export const REPO_OVERVIEW_STALE_AFTER_MS = REPO_OVERVIEW_REFRESH_MS * 3;
 export const REPO_OVERVIEW_MAX_CALLS_PER_REFRESH = 100;
 /** Runs read per repository so the newest is selectable robustly. */
 export const REPO_OVERVIEW_RUNS_PER_FETCH = 3;
+/** Sustained search-API pacing: GitHub allows 30 Search requests/minute,
+ * and every repository costs two. One search call every 2 s keeps the
+ * pass inside the sustained quota instead of self-inflicting a 403 that
+ * aborts the refresh mid-registry. */
+export const REPO_OVERVIEW_SEARCH_MIN_INTERVAL_MS = 2_000;
 
 // ------------------------------------------------------------------
 // Outbound port + raw shapes
@@ -189,6 +195,14 @@ function numOrNull(value: unknown): number | null {
 
 function countOrNull(value: unknown): number | null {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+/** A provider timestamp is usable only when it is a parseable ISO string;
+ * anything else becomes null so the snapshot can never fail the web
+ * validator's date check and freeze the whole board. */
+function isoOrNull(value: unknown): string | null {
+  if (typeof value !== 'string' || value === '' || !Number.isFinite(Date.parse(value))) return null;
+  return value;
 }
 
 /** Map a completed/incomplete run's raw status+conclusion to the fixed
@@ -317,25 +331,44 @@ export function safeRunUrl(raw: string | null, host: string): string | null {
 
 export type RepoFetchErrorKind = 'rate-limit' | 'auth' | 'permission' | 'not-found' | 'other';
 
-/** Classify a failed observation. `rate-limit` and `auth` are global
- * conditions: the refresh aborts instead of hammering every repository. */
-export function classifyGhError(error: unknown): RepoFetchErrorKind {
-  if (error instanceof GhRateLimitedError) return 'rate-limit';
-  const message = error instanceof Error ? error.message : String(error);
-  if (/rate limit/i.test(message)) return 'rate-limit';
-  if (/HTTP 401|not logged in|authentication|gh auth login|gh is unavailable/i.test(message)) {
-    return 'auth';
-  }
-  if (/HTTP 403|forbidden|permission/i.test(message)) return 'permission';
-  if (/HTTP 404|not found/i.test(message)) return 'not-found';
+/** The structured failure detail when the error carries one. Classifying
+ * against the annotated label instead would read repository/owner names
+ * (e.g. `authentication-service`) as provider semantics. */
+function failureText(error: unknown): string {
+  if (error instanceof GhApiError && error.causeText !== null) return error.causeText;
+  return error instanceof Error ? error.message : String(error);
+}
+
+function classifyFailureText(text: string): RepoFetchErrorKind {
+  // A timed-out or capped call is ONE repository's slow/fat response, not
+  // a global provider condition: it must not abort the rest of the pass.
+  if (/timed out|output exceeds/i.test(text)) return 'other';
+  if (/rate limit/i.test(text)) return 'rate-limit';
+  if (/HTTP 401|not logged in|authentication|bad credentials/i.test(text)) return 'auth';
+  if (/HTTP 403|forbidden|permission/i.test(text)) return 'permission';
+  if (/HTTP 404|not found/i.test(text)) return 'not-found';
+  if (/spawn|ENOENT|EACCES|gh is unavailable/i.test(text)) return 'auth';
   return 'other';
 }
 
+/** Classify a failed observation. `rate-limit` and `auth` are global
+ * conditions: the refresh aborts instead of hammering every repository. A
+ * structured `GhApiError` without a cause is an adapter/shape failure —
+ * per-repository, never global. */
+export function classifyGhError(error: unknown): RepoFetchErrorKind {
+  if (error instanceof GhRateLimitedError) return 'rate-limit';
+  if (error instanceof GhApiError && error.causeText === null) return 'other';
+  return classifyFailureText(failureText(error));
+}
+
 /** Actions endpoints permanently unavailable (404/409/actions-disabled):
- * a state to disclose, not a retry-worthy failure. */
+ * a state to disclose, not a retry-worthy failure. Classification reads
+ * the structured cause only; a label that merely contains the word
+ * "actions" can never convert a real failure into a state. */
 export function isActionsUnavailableError(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error);
-  return /HTTP 404|HTTP 409|actions.*disabled|disabled.*actions/i.test(message);
+  if (error instanceof GhApiError && error.causeText === null) return false;
+  const text = failureText(error);
+  return /HTTP 404|HTTP 409|actions.*disabled|disabled.*actions/i.test(text);
 }
 
 function runViewOf(raw: RepoOverviewRunRaw, host: string, branch: string): RepoOverviewRunView {
@@ -383,9 +416,9 @@ function mapRun(value: unknown): RepoOverviewRunRaw | null {
     status: strOrNull(raw['status']),
     conclusion: strOrNull(raw['conclusion']),
     url: strOrNull(raw['html_url']),
-    runNumber: numOrNull(raw['run_number']),
-    createdAt: strOrNull(raw['run_started_at']) ?? strOrNull(raw['created_at']),
-    updatedAt: strOrNull(raw['updated_at']),
+    runNumber: countOrNull(raw['run_number']),
+    createdAt: isoOrNull(raw['run_started_at']) ?? isoOrNull(raw['created_at']),
+    updatedAt: isoOrNull(raw['updated_at']),
   };
 }
 
@@ -476,7 +509,13 @@ export class GhRepoOverviewApi implements RepoOverviewApiPort {
     if (!Array.isArray(runs)) {
       throw new GhApiError(`${label}: response carries no workflow_runs array`);
     }
-    return { kind: 'ok', value: runs.flatMap((entry) => mapRun(entry) ?? []) };
+    const mapped = runs.map((entry) => mapRun(entry));
+    // An unreadable entry must fail the observation, never silently shrink
+    // the page into a manufactured "no runs" claim.
+    if (mapped.includes(null)) {
+      throw new GhApiError(`${label}: response carries a malformed workflow_runs entry`);
+    }
+    return { kind: 'ok', value: mapped as RepoOverviewRunRaw[] };
   }
 }
 
@@ -488,22 +527,48 @@ export type RemoteClassification =
   | { readonly kind: 'linked'; readonly ref: RepoRef }
   | { readonly kind: 'unlinked'; readonly reason: string };
 
-export type RemoteResolver = (repoPath: string) => RepoRef | null;
+export type RemoteResolver = (repoPath: string) => RepoRef | null | Promise<RepoRef | null>;
+
+/** Read one repo's origin URL without blocking the event loop (the
+ * deploy-drift precedent): a registry-wide refresh must never stall the
+ * board/WS timers on a slow mount or a large repo count. */
+async function gitOriginUrl(repoPath: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    execFile(
+      'git',
+      ['-C', repoPath, 'remote', 'get-url', 'origin'],
+      { encoding: 'utf8', timeout: 10_000, maxBuffer: 64 * 1024 },
+      (error, stdout) => {
+        if (error !== null) {
+          resolve(null);
+          return;
+        }
+        const url = stdout.trim();
+        resolve(url === '' ? null : url);
+      },
+    );
+  });
+}
 
 /** Default resolver: the repo's origin remote parsed by the same seam the
  * tracked-lane poll uses. Missing/unparseable → null. */
-export function defaultRemoteResolver(repoPath: string): RepoRef | null {
-  const remote = repoRemote(repoPath);
+export async function defaultRemoteResolver(repoPath: string): Promise<RepoRef | null> {
+  const url = await gitOriginUrl(repoPath);
+  if (url === null) return null;
+  const remote = parseRepoRemote(url);
   if (remote === null) return null;
   return { host: remote.host, owner: remote.owner, repo: remote.repo };
 }
 
-export function classifyRemote(repoPath: string, resolveRemote: RemoteResolver): RemoteClassification {
-  const ref = resolveRemote(repoPath);
+function classifyRemoteValue(ref: RepoRef | null): RemoteClassification {
   if (ref === null) return { kind: 'unlinked', reason: 'no usable origin remote' };
   if (!isGitHubRemote(ref.host)) return { kind: 'unlinked', reason: 'non-GitHub remote' };
   if (githubRepoLink(ref) === null) return { kind: 'unlinked', reason: 'unrecognized remote' };
   return { kind: 'linked', ref };
+}
+
+export function classifyRemote(repoPath: string, resolveRemote: (path: string) => RepoRef | null): RemoteClassification {
+  return classifyRemoteValue(resolveRemote(repoPath));
 }
 
 // ------------------------------------------------------------------
@@ -545,6 +610,9 @@ export interface ManagedRepoOverviewOptions {
   readonly staleAfterMs?: number;
   /** `gh` calls per refresh; default {@link REPO_OVERVIEW_MAX_CALLS_PER_REFRESH}. */
   readonly maxCallsPerRefresh?: number;
+  /** Sleep seam for search pacing; default a real timer (tests advance a
+   * fake clock instead of waiting). */
+  readonly sleep?: (ms: number) => Promise<void>;
   readonly now?: () => number;
   readonly log?: (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 }
@@ -552,7 +620,9 @@ export interface ManagedRepoOverviewOptions {
 interface ObserveOutcome {
   /** Fatal global condition (rate limit/auth) — stop the refresh. */
   readonly aborted: boolean;
-  /** Budget exhausted without a recorded attempt — resume here next cycle. */
+  /** Budget ran out before a complete observation — nothing was recorded
+   * and rotation advances past this repository so no single entry can
+   * starve the rest of the registry. */
   readonly retry: boolean;
 }
 
@@ -563,11 +633,13 @@ export class ManagedRepoOverviewTracker {
   private readonly intervalMs: number;
   private readonly staleAfterMs: number;
   private readonly maxCallsPerRefresh: number;
+  private readonly sleep: (ms: number) => Promise<void>;
   private readonly now: () => number;
   private readonly log: (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
   private readonly states = new Map<string, RepoSourceState>();
   private registry: readonly string[] = [];
   private cursor = 0;
+  private lastSearchAtMs = 0;
   private refreshedOnce = false;
   private started = false;
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -580,6 +652,7 @@ export class ManagedRepoOverviewTracker {
     this.intervalMs = opts.intervalMs ?? REPO_OVERVIEW_REFRESH_MS;
     this.staleAfterMs = opts.staleAfterMs ?? Math.max(1, this.intervalMs * 3);
     this.maxCallsPerRefresh = opts.maxCallsPerRefresh ?? REPO_OVERVIEW_MAX_CALLS_PER_REFRESH;
+    this.sleep = opts.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.now = opts.now ?? Date.now;
     this.log = opts.log ?? (() => {});
     this.registry = [...this.scanRepos(this.opts.workspaceRoot)];
@@ -668,7 +741,8 @@ export class ManagedRepoOverviewTracker {
     // observation — stale data must never attach to a different identity.
     for (const name of repos) {
       const state = this.states.get(name) as RepoSourceState;
-      const classification = classifyRemote(join(this.opts.workspaceRoot, name), this.resolveRemote);
+      const resolved = await this.resolveRemote(join(this.opts.workspaceRoot, name));
+      const classification = classifyRemoteValue(resolved);
       if (classification.kind === 'unlinked') {
         if (state.ref !== null || state.linkReason !== classification.reason) {
           const reset = emptySourceState();
@@ -710,7 +784,10 @@ export class ManagedRepoOverviewTracker {
       }
       const outcome = await this.observe(fetchable[index] as string, budget);
       if (outcome.retry) {
-        nextIndex = index;
+        // A partial observation is discarded and rotation moves on: a
+        // budget smaller than one observation must degrade fairly across
+        // the registry, never re-spend every cycle on the same entry.
+        nextIndex = index + 1;
         break;
       }
       nextIndex = index + 1;
@@ -736,17 +813,17 @@ export class ManagedRepoOverviewTracker {
   }
 
   /** Observe one repository atomically: every call must succeed for the
-   * observation to count (Actions-permanently-unavailable is a state). */
+   * observation to count (Actions-permanently-unavailable is a state).
+   * Attempt timestamps are written at COMPLETION only, so a view taken
+   * while a fetch is in flight never claims the row failed or aged.
+   */
   private async observe(name: string, budget: { used: number; limit: number }): Promise<ObserveOutcome> {
     const state = this.states.get(name) as RepoSourceState;
     const ref = state.ref as RepoRef;
-    const attemptedAt = new Date(this.now()).toISOString();
-    const previousAttempt = state.lastAttemptAt;
-    state.lastAttemptAt = attemptedAt;
     try {
       const meta = await this.spend(budget, () => this.opts.api.fetchRepo({ repo: ref }));
-      const openPrs = await this.spend(budget, () => this.opts.api.countOpenPulls({ repo: ref }));
-      const openIssues = await this.spend(budget, () => this.opts.api.countOpenIssues({ repo: ref }));
+      const openPrs = await this.spendSearch(budget, () => this.opts.api.countOpenPulls({ repo: ref }));
+      const openIssues = await this.spendSearch(budget, () => this.opts.api.countOpenIssues({ repo: ref }));
       const workflows = await this.spend(budget, () => this.opts.api.countWorkflows({ repo: ref }));
       let run: RepoOverviewRunView;
       if (workflows.kind === 'actions-unavailable') {
@@ -789,16 +866,18 @@ export class ManagedRepoOverviewTracker {
       }
       state.counts = { openPrs, openIssues };
       state.run = run;
-      state.checkedAt = new Date(this.now()).toISOString();
+      const completedAt = new Date(this.now()).toISOString();
+      state.checkedAt = completedAt;
+      state.lastAttemptAt = completedAt;
       state.error = null;
       return { aborted: false, retry: false };
     } catch (error) {
       if (error instanceof GhBudgetExceededError) {
         // Not a failure: nothing was observed and nothing is recorded.
-        state.lastAttemptAt = previousAttempt;
         return { aborted: true, retry: true };
       }
       const kind = classifyGhError(error);
+      state.lastAttemptAt = new Date(this.now()).toISOString();
       state.error = messageOf(error).slice(0, 300);
       this.log('warn', 'repo overview: repository observation failed', {
         repo: name,
@@ -807,6 +886,22 @@ export class ManagedRepoOverviewTracker {
       });
       return { aborted: kind === 'rate-limit' || kind === 'auth', retry: false };
     }
+  }
+
+  /** Spend one Search call, paced to GitHub's sustained search quota (a
+   * self-inflicted 403 would abort the pass mid-registry). */
+  private async spendSearch<T>(
+    budget: { used: number; limit: number },
+    work: () => Promise<T>,
+  ): Promise<T> {
+    return this.spend(budget, async () => {
+      const nowMs = this.now();
+      if (this.lastSearchAtMs > 0 && nowMs - this.lastSearchAtMs < REPO_OVERVIEW_SEARCH_MIN_INTERVAL_MS) {
+        await this.sleep(REPO_OVERVIEW_SEARCH_MIN_INTERVAL_MS - (nowMs - this.lastSearchAtMs));
+      }
+      this.lastSearchAtMs = this.now();
+      return work();
+    });
   }
 
   private async spend<T>(

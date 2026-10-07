@@ -142,12 +142,16 @@ describe('managed repository overview — meta and notes', () => {
       url: null,
       branch: 'main',
     });
+    // A missing workflow name is a dash, never a fabricated "workflow".
     expect(repoCiView(row({ run: { ...row().run!, workflow: null, url: null } }))).toEqual({
-      label: 'workflow',
+      label: '—',
       workflow: null,
       url: null,
       branch: 'main',
     });
+    expect(
+      repoCiView(row({ run: { ...row().run!, state: 'never-run', workflow: null, url: null, branch: 'trunk' } })),
+    ).toEqual({ label: '—', workflow: null, url: null, branch: 'trunk' });
     expect(
       repoCiView(
         row({

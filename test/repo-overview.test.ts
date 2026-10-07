@@ -1,3 +1,7 @@
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   GhApiError,
@@ -116,6 +120,7 @@ interface Harness {
   readonly names: string[];
   readonly refs: Map<string, RepoRef | null>;
   readonly clock: { ms: number };
+  readonly sleeps: number[];
   failure: string | null;
 }
 
@@ -134,12 +139,14 @@ function harness(options: {
     options.refs ?? names.map((name) => [name, githubRef(name)] as const),
   );
   const clock = { ms: T0 };
+  const sleeps: number[] = [];
   const state: Harness = {
     tracker: null as unknown as ManagedRepoOverviewTracker,
     api,
     names,
     refs,
     clock,
+    sleeps,
     failure: null,
   };
   state.tracker = new ManagedRepoOverviewTracker({
@@ -151,6 +158,10 @@ function harness(options: {
     ...(options.maxCallsPerRefresh !== undefined ? { maxCallsPerRefresh: options.maxCallsPerRefresh } : {}),
     ...(options.staleAfterMs !== undefined ? { staleAfterMs: options.staleAfterMs } : {}),
     now: () => state.clock.ms,
+    sleep: async (ms) => {
+      sleeps.push(ms);
+      state.clock.ms += ms;
+    },
     log: (level, msg) => {
       if (level === 'warn') state.failure = msg;
     },
@@ -470,7 +481,9 @@ describe('managed repo overview tracker — failure, freshness and recovery', ()
   });
 
   it('aborts the refresh when gh is unavailable (auth-level condition), without hammering every repo', async () => {
-    const api = new FakeApi().set('*', { errors: { fetchRepo: new GhApiError('repo: gh is unavailable (spawn failed)') } });
+    const api = new FakeApi().set('*', {
+      errors: { fetchRepo: new GhApiError('repo: gh is unavailable (spawn failed)', 'Error: spawn gh ENOENT') },
+    });
     const h = harness({ names: ['alpha', 'beta', 'gamma'], api });
     const view = await h.tracker.refresh();
     expect(api.calls).toHaveLength(1);
@@ -571,14 +584,22 @@ describe('managed repo overview — pure helpers', () => {
     expect(safeRunUrl(null, 'github.com')).toBeNull();
   });
 
-  it('classifies provider failures by kind, with rate limit and auth as global conditions', () => {
+  it('classifies provider failures from the structured cause, never the annotated label', () => {
     expect(classifyGhError(new GhRateLimitedError('x'))).toBe('rate-limit');
-    expect(classifyGhError(new GhApiError('HTTP 403: API rate limit exceeded'))).toBe('rate-limit');
-    expect(classifyGhError(new GhApiError('gh is unavailable (spawn failed)'))).toBe('auth');
-    expect(classifyGhError(new GhApiError('HTTP 401: Bad credentials'))).toBe('auth');
-    expect(classifyGhError(new GhApiError('HTTP 403: Forbidden'))).toBe('permission');
-    expect(classifyGhError(new GhApiError('HTTP 404: Not Found'))).toBe('not-found');
-    expect(classifyGhError(new GhApiError('HTTP 500: server error'))).toBe('other');
+    expect(classifyGhError(new GhApiError('x', 'HTTP 403: API rate limit exceeded'))).toBe('rate-limit');
+    expect(classifyGhError(new GhApiError('x', 'Error: spawn gh ENOENT'))).toBe('auth');
+    expect(classifyGhError(new GhApiError('x', 'HTTP 401: Bad credentials'))).toBe('auth');
+    expect(classifyGhError(new GhApiError('x', 'HTTP 403: Forbidden'))).toBe('permission');
+    expect(classifyGhError(new GhApiError('x', 'HTTP 404: Not Found'))).toBe('not-found');
+    expect(classifyGhError(new GhApiError('x', 'HTTP 500: server error'))).toBe('other');
+    // A timed-out or capped call is one repository's problem, not a global
+    // provider condition.
+    expect(classifyGhError(new GhApiError('x', 'gh api timed out after 30000 ms'))).toBe('other');
+    expect(classifyGhError(new GhApiError('x', 'gh api output exceeds 100 bytes'))).toBe('other');
+    // Adapter/shape failures carry no cause: per-repository.
+    expect(classifyGhError(new GhApiError('repo authentication-service: response carries no default_branch'))).toBe('other');
+    // Non-GhApiError test fakes still fall back to their own text.
+    expect(classifyGhError(new Error('HTTP 403: Forbidden'))).toBe('permission');
   });
 });
 
@@ -705,5 +726,181 @@ describe('managed repo overview — gh adapter', () => {
     );
     const badJson = new GhRepoOverviewApi(ghRunner([ok('not-json')]).runner);
     await expect(badJson.fetchRepo({ repo: githubRef('alpha') })).rejects.toThrow(/invalid JSON/);
+  });
+});
+
+// ------------------------------------------------------------------
+// Review-round fixes (independent review r1)
+// ------------------------------------------------------------------
+
+describe('managed repo overview tracker — review-round guarantees', () => {
+  it('never claims stale or failed while an observation is actually in flight', async () => {
+    const h = harness({ names: ['alpha'] });
+    await h.tracker.refresh();
+    const before = row(h.tracker.view(), 'alpha');
+
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const original = h.api.fetchRepo.bind(h.api);
+    h.api.fetchRepo = async (input) => {
+      await gate;
+      return original(input);
+    };
+
+    const pending = h.tracker.refresh();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const during = row(h.tracker.view(), 'alpha');
+    expect(during.freshness).toBe('fresh');
+    expect(during.error).toBeNull();
+    expect(during.checkedAt).toBe(before.checkedAt);
+    expect(during.lastAttemptAt).toBe(before.lastAttemptAt);
+
+    release();
+    await pending;
+    expect(row(h.tracker.view(), 'alpha').freshness).toBe('fresh');
+  });
+
+  it('advances rotation past a partial observation when the budget cannot fit one', async () => {
+    const api = new FakeApi().set('alpha', {}).set('beta', {}).set('gamma', {});
+    const h = harness({ names: ['alpha', 'beta', 'gamma'], api, maxCallsPerRefresh: 3 });
+    await h.tracker.refresh();
+    await h.tracker.refresh();
+    await h.tracker.refresh();
+    const touched = new Set(api.calls.map((call) => call.split(':')[1]));
+    expect(touched).toEqual(new Set(['acme/alpha', 'acme/beta', 'acme/gamma']));
+    for (const key of ['alpha', 'beta', 'gamma']) {
+      expect(row(h.tracker.view(), key).lastAttemptAt).toBeNull();
+      expect(row(h.tracker.view(), key).checkedAt).toBeNull();
+    }
+  });
+
+  it('paces search calls to the sustained GitHub search quota', async () => {
+    const api = new FakeApi().set('alpha', {}).set('beta', {});
+    const h = harness({ names: ['alpha', 'beta'], api });
+    await h.tracker.refresh();
+    // Four search calls in one close pass: the first is free, each of the
+    // next three waits out the 2 s pacing interval.
+    expect(h.sleeps).toEqual([2_000, 2_000, 2_000]);
+  });
+
+  it('never reads repository names as provider semantics (auth/actions labels)', async () => {
+    const api = new FakeApi()
+      .set('authentication-service', {
+        errors: {
+          fetchRepo: new GhApiError(
+            'repo acme/authentication-service: gh exited 1: HTTP 500: server error',
+            'HTTP 500: server error',
+          ),
+        },
+      })
+      .set('beta', { openPrs: 2 });
+    const h = harness({ names: ['authentication-service', 'beta'], api });
+    const view = await h.tracker.refresh();
+    expect(row(view, 'authentication-service').freshness).toBe('unavailable');
+    expect(row(view, 'authentication-service').error).toContain('HTTP 500');
+    // The refresh continued: a name containing "authentication" is not a
+    // global auth condition.
+    expect(row(view, 'beta').freshness).toBe('fresh');
+  });
+
+  it('never converts a real failure into Actions-unavailable through a name or a timeout', async () => {
+    const named = new GhRepoOverviewApi(
+      ghRunner([{ status: 1, stdout: '', stderr: 'gh: HTTP 500: server error' }]).runner,
+    );
+    await expect(
+      named.countWorkflows({ repo: { host: 'github.com', owner: 'acme', repo: 'actions-disabled-tests' } }),
+    ).rejects.toThrow(/HTTP 500/);
+
+    const timedOut = new GhRepoOverviewApi(
+      ghRunner([{ status: -1, stdout: '', stderr: '', error: 'gh api timed out after 30000 ms' }]).runner,
+    );
+    await expect(timedOut.countWorkflows({ repo: githubRef('alpha') })).rejects.toThrow(/timed out/);
+  });
+
+  it('fails loud on a malformed runs entry instead of manufacturing never-run', async () => {
+    const adapter = new GhRepoOverviewApi(
+      ghRunner([ok(JSON.stringify({ workflow_runs: [null, { id: 1 }] }))]).runner,
+    );
+    await expect(adapter.latestRuns({ repo: githubRef('alpha'), branch: 'main', limit: 3 })).rejects.toThrow(
+      /malformed workflow_runs/,
+    );
+
+    // Tracker-level: the failed observation retains the previous exact
+    // counts and run rather than presenting a fresh NO RUNS.
+    const api = new FakeApi().set('alpha', { openPrs: 4, runs: { kind: 'ok', value: [rawRun()] } });
+    const h = harness({ api });
+    await h.tracker.refresh();
+    api.set('alpha', {
+      openPrs: 4,
+      errors: { latestRuns: new GhApiError('runs acme/alpha@main: response carries a malformed workflow_runs entry') },
+    });
+    const stale = row(await h.tracker.refresh(), 'alpha');
+    expect(stale.freshness).toBe('stale');
+    expect(stale.run?.state).toBe('passed');
+    expect(stale.openPrs).toBe(4);
+  });
+
+  it('normalizes provider run values so a malformed field can never fail the web validator', async () => {
+    const adapter = new GhRepoOverviewApi(
+      ghRunner([
+        ok(
+          JSON.stringify({
+            workflow_runs: [
+              {
+                id: 7,
+                name: 'CI',
+                status: 'completed',
+                conclusion: 'success',
+                html_url: 'https://github.com/acme/alpha/actions/runs/7',
+                run_number: -3,
+                run_started_at: 'not-a-date',
+                updated_at: 12345,
+              },
+              {
+                id: 8,
+                name: 'CI',
+                status: 'completed',
+                conclusion: 'success',
+                html_url: 'https://github.com/acme/alpha/actions/runs/8',
+                run_number: 2.5,
+                created_at: '2026-10-07T10:00:00.000Z',
+                updated_at: '2026-10-07T10:05:00.000Z',
+              },
+            ],
+          }),
+        ),
+      ]).runner,
+    );
+    const result = await adapter.latestRuns({ repo: githubRef('alpha'), branch: 'main', limit: 3 });
+    if (result.kind !== 'ok') throw new Error('expected ok');
+    expect(result.value[0]?.runNumber).toBeNull();
+    expect(result.value[0]?.createdAt).toBeNull();
+    expect(result.value[0]?.updatedAt).toBeNull();
+    expect(result.value[1]?.runNumber).toBeNull();
+    expect(result.value[1]?.createdAt).toBe('2026-10-07T10:00:00.000Z');
+    expect(result.value[1]?.updatedAt).toBe('2026-10-07T10:05:00.000Z');
+  });
+
+  it('drives the production default registry scan and origin resolver over a real workspace', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gru-repo-overview-defaults-'));
+    try {
+      execFileSync('git', ['init', '-q', join(root, 'alpha')]);
+      execFileSync('git', ['-C', join(root, 'alpha'), 'remote', 'add', 'origin', 'https://github.com/acme/alpha.git']);
+      mkdirSync(join(root, 'plain'));
+      const api = new FakeApi().set('alpha', { openPrs: 1, openIssues: 2, workflows: { kind: 'ok', value: 0 } });
+      const tracker = new ManagedRepoOverviewTracker({ workspaceRoot: root, api, now: () => T0, sleep: async () => {} });
+      const view = await tracker.refresh();
+      expect(view?.rows.map((entry) => entry.key)).toEqual(['alpha']);
+      const entry = row(view, 'alpha');
+      expect(entry.linked).toBe(true);
+      expect(entry.fullName).toBe('acme/alpha');
+      expect(entry.link).toBe('https://github.com/acme/alpha');
+      expect(entry.openPrs).toBe(1);
+      expect(entry.run?.state).toBe('no-workflow');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

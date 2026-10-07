@@ -208,7 +208,8 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   safe run link and the checked age. This is default-branch CI context,
   never deployment health, aggregate CI or merge readiness. The server
   tracker refreshes every 5 minutes (bounded per-refresh call budget,
-  coalesced, server-side `gh` auth only; the browser never polls GitHub)
+  search calls paced to the sustained quota, coalesced, server-side `gh`
+  auth only; the browser never polls GitHub)
   and the row's `checkedAt` is the last SUCCESSFUL fetch: cached data kept
   after a failure or older than three cadences renders as `STALE · last …`
   with the age and the failure, so an old green never reads as current.

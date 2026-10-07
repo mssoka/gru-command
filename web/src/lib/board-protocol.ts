@@ -864,10 +864,27 @@ function isRepoOverviewRowView(value: unknown): value is RepoOverviewRowView {
     return false;
   }
   // Coherence: a linked row has a link and no reason; an unlinked row has
-  // a reason and no link. Server-side guarantee, enforced here so a
-  // malformed row can never render as a guessed identity.
-  if (value.linked) return value.link !== null && value.linkReason === null;
-  return value.link === null && value.linkReason !== null;
+  // a reason and no link. A linked row must also carry a safe full name
+  // that the link path actually addresses — a row can never validate as a
+  // guessed or mismatched identity.
+  if (!value.linked) return value.link === null && value.linkReason !== null;
+  if (value.link === null || value.linkReason !== null) return false;
+  if (typeof value.fullName !== 'string' || value.fullName === '') return false;
+  const segments = value.fullName.split('/');
+  if (
+    segments.length < 2 ||
+    segments.some(
+      (segment) =>
+        segment === '' || segment === '.' || segment === '..' || !/^[A-Za-z0-9_.-]+$/u.test(segment),
+    )
+  ) {
+    return false;
+  }
+  try {
+    return new URL(value.link).pathname === `/${value.fullName}`;
+  } catch {
+    return false;
+  }
 }
 
 function isRepoOverviewView(value: unknown): value is RepoOverviewView {

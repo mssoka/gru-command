@@ -429,6 +429,10 @@ describe('board server-frame validator', () => {
       { ...row, checkedAt: 'not-a-date' },
       { ...row, key: '' },
       { ...row, run: { ...run, runNumber: -2 } },
+      { ...row, fullName: '' },
+      { ...row, fullName: '../evil' },
+      { ...row, link: 'https://github.com/other/repo' },
+      { ...row, link: 'https://github.com/example/demo/extra' },
     ]) {
       expect(
         isValidSnapshot({ ...snapshot(), repoOverview: { rows: [broken] } } as unknown),

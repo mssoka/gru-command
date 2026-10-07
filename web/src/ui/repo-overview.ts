@@ -40,8 +40,14 @@ export class RepoOverviewPanel {
   }
 
   /** `null`/`undefined` (feature not wired or no refresh yet) renders
-   * nothing — the CSS `:empty` rule hides the section. */
+   * nothing — the CSS `:empty` rule hides the section. Scroll position and
+   * the focused row survive the board's periodic full-snapshot rebuilds. */
   render(view: RepoOverviewView | null | undefined): void {
+    const previousList = this.mount.querySelector<HTMLElement>('.repo-overview__list');
+    const previousScroll = previousList?.scrollTop ?? 0;
+    const active = document.activeElement;
+    const focusKey =
+      active instanceof HTMLElement && this.mount.contains(active) ? (active.dataset.focusKey ?? null) : null;
     this.mount.replaceChildren();
     if (view === null || view === undefined) return;
     const head = el('div', 'repo-overview__head');
@@ -63,6 +69,12 @@ export class RepoOverviewPanel {
     const list = el('div', 'repo-overview__list');
     for (const row of view.rows) list.append(this.row(row));
     this.mount.append(list);
+    list.scrollTop = previousScroll;
+    if (focusKey !== null) {
+      [...this.mount.querySelectorAll<HTMLElement>('[data-focus-key]')]
+        .find((node) => node.dataset.focusKey === focusKey)
+        ?.focus();
+    }
   }
 
   private row(row: RepoOverviewRowView): HTMLElement {
@@ -93,12 +105,16 @@ export class RepoOverviewPanel {
     link.href = href;
     link.target = '_blank';
     link.rel = 'noopener noreferrer';
+    link.dataset.focusKey = `repo:${row.key}`;
     link.title = row.fullName !== null ? `${row.fullName} on GitHub` : 'open repository on GitHub';
     return link;
   }
 
   private badgeNode(badge: ReturnType<typeof repoRowBadge>): HTMLElement {
-    const node = el('span', `pp-chip repo-row__badge repo-row__badge--${badge.tone}`);
+    // The established tone contract (pp-chip--<tone>) is the ONLY chip
+    // colour mechanism in the loaded stylesheets; emitting it here keeps
+    // status colour visible in both themes and pinned by the browser spec.
+    const node = el('span', `pp-chip pp-chip--${badge.tone} repo-row__badge`);
     const glyph = el('span', 'repo-row__badge-glyph', badge.glyph);
     glyph.setAttribute('aria-hidden', 'true');
     node.append(glyph, el('span', 'repo-row__badge-text', badge.text));
@@ -135,6 +151,7 @@ export class RepoOverviewPanel {
       workflow.href = href;
       workflow.target = '_blank';
       workflow.rel = 'noopener noreferrer';
+      workflow.dataset.focusKey = `repo-run:${row.key}`;
       ciNode.append(workflow);
     } else {
       ciNode.append(document.createTextNode(ci.label));

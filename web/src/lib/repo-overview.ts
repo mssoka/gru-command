@@ -97,7 +97,10 @@ export function repoCiView(row: RepoOverviewRowView): RepoCiView {
   if (!row.linked || run === null) return { label: '—', workflow: null, url: null, branch: null };
   const noWorkflow = run.state === 'no-workflow';
   return {
-    label: noWorkflow ? 'none' : (run.workflow ?? 'workflow'),
+    // No workflow name from the provider is disclosed as a dash — never a
+    // fabricated "workflow" label on a row whose contract is "missing is
+    // never manufactured".
+    label: noWorkflow ? 'none' : (run.workflow ?? '—'),
     workflow: noWorkflow ? null : run.workflow,
     url: run.url !== null && run.workflow !== null && !noWorkflow ? run.url : null,
     branch: run.branch,

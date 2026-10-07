@@ -253,6 +253,20 @@ test('compact rows: states, exact counts, safe links, light/dark desktop and nar
   expect(glyphs.slice(0, 9)).toEqual(['↻', '✕', '✓', '⋯', '⌛', '?', '!', '⊘', '∅']);
   expect(glyphs.every((glyph) => glyph.trim() !== '')).toBe(true);
 
+  // Tones actually render: the pp-chip--<tone> contract colours the chips,
+  // and a done/alert/work chip must differ in computed background.
+  const badgeBg = async (index: number): Promise<string> =>
+    page
+      .locator('#board-repos .repo-row')
+      .nth(index)
+      .locator('.repo-row__badge')
+      .evaluate((node) => getComputedStyle(node).backgroundColor);
+  const workBg = await badgeBg(0);
+  const alertBg = await badgeBg(1);
+  const doneBg = await badgeBg(2);
+  expect(new Set([workBg, alertBg, doneBg]).size, `${workBg} / ${alertBg} / ${doneBg}`).toBe(3);
+  expect(doneBg).not.toBe('rgba(0, 0, 0, 0)');
+
   // Exact counts, including a real zero and an unknown (never a fake 0).
   const heavy = page.locator('#board-repos .repo-row').nth(11);
   await expect(heavy.locator('.repo-row__metric-count').nth(0)).toHaveText('1287');
@@ -345,6 +359,11 @@ test('the overview follows the CREW tab and never leaks into TRANSCRIPTS', async
   await page.setViewportSize({ width: 1280, height: 900 });
   const repos = page.locator('#board-repos');
   await expect(repos).toBeVisible();
+  // The module is part of the CREW tab's accessibility contract, exactly
+  // like the crew panel it sits under.
+  await expect(page.locator('#rail-tab-agents')).toHaveAttribute('aria-controls', 'board-agents board-repos');
+  await expect(repos).toHaveAttribute('role', 'tabpanel');
+  await expect(repos).toHaveAttribute('aria-labelledby', 'rail-tab-agents');
   await page.locator('#rail-tab-transcripts').click();
   await expect(repos).toBeHidden();
   await expect(page.locator('#board-transcripts')).toBeVisible();

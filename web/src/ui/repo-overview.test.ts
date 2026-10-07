@@ -86,7 +86,10 @@ describe('managed repository overview panel', () => {
     expect(name.rel).toBe('noopener noreferrer');
     expect(name.title).toBe('acme/alpha on GitHub');
     const badge = article.querySelector('.repo-row__badge')!;
-    expect(badge.classList.contains('repo-row__badge--done')).toBe(true);
+    // The established tone contract is what colours the chip (there are no
+    // repo-row__badge--<tone> rules); the browser spec pins the computed
+    // colour difference between tones.
+    expect(badge.classList.contains('pp-chip--done')).toBe(true);
     expect(badge.querySelector('.repo-row__badge-glyph')?.textContent).toBe('✓');
     expect(badge.querySelector('.repo-row__badge-text')?.textContent).toBe('PASSED');
     const counts = [...article.querySelectorAll('.repo-row__metric-count')].map((node) => node.textContent);
@@ -179,5 +182,35 @@ describe('managed repository overview panel', () => {
     expect(rows.map((node) => node.querySelector('.repo-row__name')?.textContent)).toEqual(['alpha', 'beta']);
     expect(rows.map((node) => node.dataset.runState)).toEqual(['running', 'no-workflow']);
     expect(rows[1]?.querySelector('.repo-row__ci')?.textContent).toBe('CI: none · main');
+  });
+
+  it('preserves the list scroll position and focused link across snapshot rebuilds', () => {
+    const { mount, view } = panel();
+    view.render({ rows: [row()] });
+    const list = mount.querySelector<HTMLElement>('.repo-overview__list')!;
+    list.scrollTop = 120;
+    expect(list.scrollTop).toBe(120);
+    const link = mount.querySelector<HTMLAnchorElement>('a.repo-row__name')!;
+    link.focus();
+    expect(document.activeElement).toBe(link);
+
+    view.render({ rows: [row({ openPrs: 9 })] });
+    expect(mount.querySelector<HTMLElement>('.repo-overview__list')?.scrollTop).toBe(120);
+    expect(document.activeElement).toBe(mount.querySelector('a.repo-row__name'));
+
+    // A push that removes the focused row (or the whole feature) never
+    // throws and leaves the section in its honest empty/hidden state.
+    view.render({ rows: [] });
+    expect(mount.textContent).toContain('No managed repositories');
+    view.render(null);
+    expect(mount.childElementCount).toBe(0);
+  });
+
+  it('renders a live push that drops the overview back to empty', () => {
+    const { mount, view } = panel();
+    view.render({ rows: [row(), row({ key: 'beta', displayName: 'beta' })] });
+    expect(mount.querySelectorAll('.repo-row')).toHaveLength(2);
+    view.render({ rows: [] });
+    expect(mount.querySelectorAll('.repo-row')).toHaveLength(0);
   });
 });
