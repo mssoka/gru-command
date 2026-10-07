@@ -139,6 +139,8 @@ Follow-ups folded into the same batch (reported, not dropped): silas `FAILED` pu
 
 Deferred (recorded in `deferred-work.md`): baseline failure-kind assertion (build/import RED vs behavioral RED) and narrow-width wake-age/deferred boundary legs.
 
+Round-2 resolution: patches landed in `8c7f4ed` (fix batch), `161109c`/`1f8f363` (e2e geometry parameterization + stamped CHILDREN fixture; two failed strip-browser attempts retained as honest history). Re-verification at `1f8f363`: unit GREEN 137 (run 1ef4b1b6 at 8c7f4ed, unchanged files); strip-browser GREEN 67 (run f7308402); strip-smoke GREEN (run bdea9798; the first attempt run 9e4030da failed with 0 tests started on `http://localhost:8788 is already used` — a port-release race with the preceding run, inspected, no leftover process; one bounded rerun under a fresh request id); strip-themes GREEN (run 73981b71); dashboard-slim-strip-baseline RED (run bfcb4b67, exit 1 under the new guard); strip-browser-baseline RED (run 921acc83); typecheck GREEN (run 1c0468fe); full GREEN (run 153d73ac). Round-3 concluding whole-change review commissioned at the post-fix head; only findings intersecting the delta `ddc42e4..1f8f363` can block (others report as follow-ups).
+
 ## Design Notes
 
 - Numeric slots: number part only carries `.num` (`font-variant-numeric: tabular-nums; display:inline-block; text-align:right`), scoped to `#chip-rail`/`#board-owner` so unrelated surfaces keep app defaults (probe-tested). The e2e suite measures geometry; CSS only declares.
