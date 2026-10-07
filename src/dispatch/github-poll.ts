@@ -23,7 +23,9 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  * `repos/{owner}/{repo}/commits/{sha}/check-runs` — and mechanically applies
  * the state-change mappings:
  *
- *   PR merged            -> job in-review -> merged transition + `github.pr-merged`
+ *   PR merged            -> live job in-review -> merged + `github.pr-merged`;
+ *                           an in-flight observation after binning records
+ *                           only a no-effect receipt, never a status hop
  *   PR conflicting       -> `github.pr-conflict` + fyi notification
  *                           (mechanical tier: Silas owns the rebase within
  *                           his existing mandate — the conflict lands in his
@@ -1001,8 +1003,9 @@ export class GitHubSignalPoll {
    * The merge map: bring the lane to `in-review` when the hop is legal
    * (merged is terminal truth — a lane whose PR landed while it sat blocked
    * or delivered must not stay open), then `in-review -> merged`, then the
-   * `github.pr-merged` event. An unappliable transition is recorded loud,
-   * never coerced.
+   * `github.pr-merged` event. An unappliable live transition is recorded
+   * loud, never coerced; a binned lane stays terminal even if a request
+   * already in flight independently observes its PR merge.
    */
   private applyMerged(signal: PrMergedSignal): void {
     const job = this.ledger.getJob(signal.jobId);
@@ -1010,7 +1013,6 @@ export class GitHubSignalPoll {
       this.log('warn', 'github poll: merged PR for an unknown job', { job: signal.jobId });
       return;
     }
-    if (isJobTerminal(job.status)) return;
     const payload = {
       repo: repoFullName(signal.repo),
       branch: signal.branch,
@@ -1019,6 +1021,20 @@ export class GitHubSignalPoll {
       sha: signal.sha,
       merge_commit_sha: signal.mergeCommitSha,
     };
+    if (isJobTerminal(job.status)) {
+      // A PR observed by an already-running poll may merge while its job
+      // is being discarded. Record the REAL observation once, but neither
+      // resurrect the lane nor call its abandonment a successful closeout.
+      // A job binned before this tick was never tracked, so no extra GitHub
+      // calls are made to discover future merges of discarded work.
+      if (job.status === 'binned' && this.ledger.latestJobEvent(signal.jobId, 'github.pr-merged') === null) {
+        this.ledger.appendCustomEvent({
+          kind: 'github.pr-merged', jobId: signal.jobId,
+          payload: { ...payload, applied: false, reason: 'job is binned' },
+        });
+      }
+      return;
+    }
     try {
       if (job.status !== 'in-review') this.ledger.setJobStatus(signal.jobId, 'in-review');
       this.ledger.setJobStatus(signal.jobId, 'merged');

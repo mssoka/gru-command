@@ -332,6 +332,8 @@ describe('tracked lanes', () => {
       mkJob('job-no-lane', 'in-review', 'https://github.com/acme/app/pull/8');
       mkJob('job-merged', 'done', 'https://github.com/acme/app/pull/9');
       register('job-merged', 'gru/job-merged', '/repos/app');
+      mkJob('job-binned', 'binned', 'https://github.com/acme/app/pull/10');
+      register('job-binned', 'gru/job-binned', '/repos/app');
 
       const remotes = new Map<string, RepoRef>([
         ['/repos/app', REPO],
@@ -568,7 +570,25 @@ function eventCount(ledger: LedgerApi, jobId: string, kind: string): number {
 }
 
 describe('github signal poll tick', () => {
-  it('a merge signal that arrives after the lane was binned is skipped — terminal lanes never resurrect', async () => {
+  it('a previously binned PR is not polled or assumed merged without independent evidence', async () => {
+    const h = makeLedger();
+    try {
+      addTrackedJob(h.ledger, 'job-no-proof', 'https://github.com/acme/app/pull/13');
+      h.ledger.setJobStatus('job-no-proof', 'binned');
+      const api = new FakeGhApi();
+      api.pulls.set('acme/app', [pull({ number: 13, headRef: 'gru/job-no-proof', merged: true })]);
+      const result = await makePoll({ ledger: h.ledger, api }).pollOnce();
+      expect(result.tracked).toBe(0);
+      expect(result.calls).toBe(0);
+      expect(api.calls).toEqual([]);
+      expect(h.ledger.getJob('job-no-proof')?.status).toBe('binned');
+      expect(h.ledger.latestJobEvent('job-no-proof', 'github.pr-merged')).toBeNull();
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a merge genuinely observed in-flight after binning records one no-effect receipt without resurrecting the lane', async () => {
     const h = makeLedger();
     try {
       // The lane is trackable when the tick starts and is DISCARDED (binned)
@@ -593,11 +613,15 @@ describe('github signal poll tick', () => {
       const result = await poll.pollOnce();
       expect(discarded).toBe(true);
       expect(result.signals.map((signal) => signal.kind)).toEqual(['pr-merged']);
-      // The discarded lane stays binned: no in-review resurrection attempt,
-      // no "applied:false" failure record and no error log.
+      // A real fetched merge is evidence, but never success or a status hop
+      // on a discarded lane. The durable no-effect receipt survives retry.
       expect(h.ledger.getJob('job-binned')?.status).toBe('binned');
-      expect(h.ledger.latestJobEvent('job-binned', 'github.pr-merged')).toBeNull();
+      expect(h.ledger.latestJobEvent('job-binned', 'github.pr-merged')?.payload).toMatchObject({
+        pr: 12, merge_commit_sha: 'mc-12', applied: false, reason: 'job is binned',
+      });
       expect(logs.filter((line) => line.includes('could not close the lane'))).toEqual([]);
+      await poll.pollOnce();
+      expect(eventCount(h.ledger, 'job-binned', 'github.pr-merged')).toBe(1);
     } finally {
       h.cleanup();
     }

@@ -515,6 +515,9 @@ describe('phase-handoff reconciliation, guards and disposition', () => {
     expect(resB?.notificationId).toBeNull();
     expect(h.ledger.getPhaseHandoff(pb.phaseId)?.state).toBe('closed');
     expect(h.ledger.getObligation(resB!.obligationId!)?.state).toBe('closed');
+    expect(h.ledger.getObligation(resB!.obligationId!)?.settlement).toEqual({
+      kind: 'job-terminal', jobStatus: 'binned',
+    });
 
     // The BOOT RECONCILE closes a discarded lane's awaiting intent with no
     // delivery evidence (job-terminal abandonment), same as done/merged.

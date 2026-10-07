@@ -122,19 +122,21 @@ describe('ledger api — the record of state', () => {
   });
 
   it('legal job transitions walk the machine; every hop appends an event', () => {
-    api.setJobStatus('fix-login-flow', 'working');
-    api.setJobStatus('fix-login-flow', 'in-review');
-    const job = api.setJobStatus('fix-login-flow', 'merged');
+    // Keep the separate fix-login-flow fixture reviewable for the round tests.
+    api.addJob({ id: 'merged-machine-path', repo: 'billing-api', title: 'Merged path' });
+    api.setJobStatus('merged-machine-path', 'working');
+    api.setJobStatus('merged-machine-path', 'in-review');
+    const job = api.setJobStatus('merged-machine-path', 'merged');
     expect(job.status).toBe('merged');
-    const hops = api.listEvents().filter((e) => e.kind === 'job.status' && e.jobId === 'fix-login-flow');
+    const hops = api.listEvents().filter((e) => e.kind === 'job.status' && e.jobId === 'merged-machine-path');
     // listEvents is newest-first; reverse for chronological reads.
     expect(hops.map((e) => (e.payload as { to: string }).to).reverse()).toEqual(['working', 'in-review', 'merged']);
   });
 
   it('terminal job states are terminal; illegal transitions throw and change nothing', () => {
-    const before = api.getJob('fix-login-flow');
-    expect(() => api.setJobStatus('fix-login-flow', 'working')).toThrow(/illegal transition merged → working/u);
-    expect(api.getJob('fix-login-flow')).toEqual(before); // untouched
+    const before = api.getJob('merged-machine-path');
+    expect(() => api.setJobStatus('merged-machine-path', 'working')).toThrow(/illegal transition merged → working/u);
+    expect(api.getJob('merged-machine-path')).toEqual(before); // untouched
     api.addJob({ id: 'docs-pass', repo: 'billing-api', title: 'Docs pass' });
     expect(() => api.setJobStatus('docs-pass', 'merged')).toThrow(/illegal transition dispatched → merged/u);
     expect(() => api.setJobStatus('docs-pass', 'not-a-status' as never)).toThrow(/unknown job status/u);
@@ -280,6 +282,25 @@ describe('ledger api — the record of state', () => {
     ]);
     expect(round.lenses.every((chip) => chip.state === 'pending')).toBe(true);
     expect(round.targetRef).toBe('abc123');
+  });
+
+  it('binned, merged and done jobs refuse new review rounds without changing history', () => {
+    const arcs = {
+      binned: [],
+      done: ['working'],
+      merged: ['working', 'in-review'],
+    } as const;
+    for (const [status, hops] of Object.entries(arcs)) {
+      const id = `round-terminal-${status}`;
+      api.addJob({ id, repo: 'billing-api', title: 'Concluded review' });
+      for (const hop of hops) api.setJobStatus(id, hop);
+      api.setJobStatus(id, status);
+      const before = api.listJobEvents(id);
+      expect(() => api.addRound({ jobId: id, targetRef: 'sha-after-close' }))
+        .toThrow(new RegExp(`terminal.*${status}`, 'u'));
+      expect(api.listRounds(id)).toEqual([]);
+      expect(api.listJobEvents(id)).toEqual(before);
+    }
   });
 
   it('custom lens lists are honored but must be unique and non-empty', () => {
@@ -566,7 +587,7 @@ describe('ledger api — the record of state', () => {
     const dataDir = cleanupDirs[0] as string; // the dir from beforeAll
     const db2 = new LedgerDb(dataDir);
     const api2 = new LedgerApi(db2.handle, { bus: new EventBus() });
-    const job = api2.getJob('fix-login-flow');
+    const job = api2.getJob('merged-machine-path');
     expect(job?.status).toBe('merged');
     const rounds = api2.listRounds('fix-login-flow');
     expect(rounds[0]?.lenses.find((chip) => chip.lens === 'blind')?.state).toBe('done');

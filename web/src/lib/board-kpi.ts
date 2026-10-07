@@ -22,6 +22,7 @@ export interface JobStatusCounts {
   readonly merged: number;
   readonly done: number;
   readonly parked: number;
+  readonly binned: number;
   readonly total: number;
 }
 
@@ -80,7 +81,7 @@ export function derivedPrState(job: JobView): JobPrState | null {
 }
 
 export function jobStatusCounts(jobs: readonly JobView[]): JobStatusCounts {
-  const counts = { working: 0, inReview: 0, merged: 0, done: 0, parked: 0 };
+  const counts = { working: 0, inReview: 0, merged: 0, done: 0, parked: 0, binned: 0 };
   for (const job of jobs) {
     switch (job.status) {
       case 'working':
@@ -97,6 +98,9 @@ export function jobStatusCounts(jobs: readonly JobView[]): JobStatusCounts {
         break;
       case 'parked':
         counts.parked += 1;
+        break;
+      case 'binned':
+        counts.binned += 1;
         break;
       default:
         break; // dispatched/delivered/blocked are real but not on this card

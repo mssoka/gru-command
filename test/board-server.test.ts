@@ -503,6 +503,17 @@ describe('board server — HTTP API', () => {
     ).toBeNull();
   });
 
+  it('authenticated round creation refuses binned jobs without creating an event', async () => {
+    const jobId = 'binned-round-http';
+    harness.api.addJob({ id: jobId, repo: 'demo-repo', title: 'Discarded review' });
+    harness.api.setJobStatus(jobId, 'binned');
+    const before = harness.api.listJobEvents(jobId);
+    const refused = await postJson(harness.port, '/api/rounds', 'board-test-token', { jobId });
+    expect(refused.status).toBe(400);
+    expect(harness.api.listRounds(jobId)).toEqual([]);
+    expect(harness.api.listJobEvents(jobId)).toEqual(before);
+  });
+
   it('write endpoints reject bad bodies and missing entities', async () => {
     const badBody = await postJson(harness.port, '/api/jobs', 'board-test-token', { id: 'x' });
     expect(badBody.status).toBe(400);

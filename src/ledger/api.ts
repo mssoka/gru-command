@@ -2351,6 +2351,9 @@ export class LedgerApi {
     return this.transaction(() => {
       const job = this.getJob(input.jobId);
       if (job === null) throw new RecordNotFound(`job "${input.jobId}" not found`);
+      if (isJobTerminal(job.status)) {
+        throw new Error(`cannot create a review round for terminal job "${input.jobId}" (${job.status})`);
+      }
       let seq = input.seq;
       if (seq === undefined) {
         const row = this.db
