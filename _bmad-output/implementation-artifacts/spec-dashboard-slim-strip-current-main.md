@@ -5,7 +5,7 @@ created: '2026-10-07'
 status: 'in-review'
 route: 'dispatch'
 baseline_commit: '49b558f243c7bacbfb46c7bc04f749bf131cefea'
-review_loop_iteration: 2
+review_loop_iteration: 4
 context: []
 ---
 
@@ -95,7 +95,7 @@ Port map (source `4de42d9` → destination current main `49b558f`):
 - Merges recorded: wakes chip = lane count/age split + main #219 deferred (count/reasons/truncated), number rendered once on the ALERTS pair with the tracker chip hidden but text/title-complete; silas splits re-derived for main's #163 headline branches (pass failed / turn open / reconciled / wake / no wakes yet) with `FAILED` as pure text (no numeric part); CHILDREN preserved as an additional group only when the server reported counters; Binned KPI preserved; bell panel keeps its prior PR presentation via `ownerPrRow(row, 'panel')`; all six sections/previews/cold-binned behavior untouched.
 - e2e suite refreshed for the current-main protocol: complete SilasView fixtures (no `undefined !== null` branches), 13 data-kpi slots (binned added), CHILDREN present/absent and deferred-wake cases added, reserved-slot geometry kept at 1440/1200/768/360 ± themes.
 - Verification scopes unioned in `.gru-command/worktree.toml`; both baselines pin `49b558f…` (the recorded execution base), not the obsolete 84aec28 planning pin.
-- 2026-10-07 verification round at head `a8847055e3d0c11eddb282458e67c7e6b88a359a` (all through the authenticated scheduler + shipped capture helper; complete NDJSON sinks + receipts under `_bmad-output/verify-captures/current-main-20261007/`): `dashboard-slim-strip-unit` GREEN run 73255daf (137/137); `strip-browser` GREEN run 5d3bc3d2 (67/67, captures inspected at 1440/1200/768/360 light+dark); `dashboard-slim-strip-baseline` RED run e7bf5e64 (24 behavioral feature-absence failures, no suite/collection error); `strip-browser-baseline` RED run 6bda4166 (67/67 fail on the missing strip DOM, baseline app builds); `typecheck` GREEN run 4cbd19a1; `full` GREEN run 19589690 (lint/typecheck/build + backend 2291 passed + heavy 925 passed + web 537 passed, exit 0). Independent whole-change review is commissioned via `POST /api/dispatch` (`deliverable: review`, three lenses) at this exact head as part of this round.
+- 2026-10-07 verification round at head `a8847055e3d0c11eddb282458e67c7e6b88a359a` (all through the authenticated scheduler + shipped capture helper; complete NDJSON sinks + receipts under `_bmad-output/verify-captures/current-main-20261007/`): `dashboard-slim-strip-unit` GREEN run 73255daf (137/137); `strip-browser` GREEN run 5d3bc3d2 (67/67, captures inspected at 1440/1200/768/360 light+dark); `dashboard-slim-strip-baseline` RED run e7bf5e64 (23 assertion-level feature-absence failures + 1 missing-export TypeError inside a test for the new `ackNextStep` import; no collection/suite-level error); `strip-browser-baseline` RED run 6bda4166 (67/67 fail on the missing strip DOM, baseline app builds); `typecheck` GREEN run 4cbd19a1; `full` GREEN run 19589690 (lint/typecheck/build + backend 2291 passed + heavy 925 passed + web 537 passed, exit 0). Independent whole-change review is commissioned via `POST /api/dispatch` (`deliverable: review`, three lenses) at this exact head as part of this round.
 ## Spec Change Log
 
 ## Review Triage Log
@@ -158,6 +158,20 @@ Round-3 follow-ups (untouched code, reported not blocking): panel PR layout is f
 
 Round-3 resolution: fixes landed in `b86af16` (code + tests + record) and `065bbf6` (pipeline-board migration). Re-verification at `b86af16`: unit GREEN **142** (run 78da62aa, fresh request 7f5d84f2 — an earlier attempt under request a1eb29db whose run 2ec903fe completed green server-side lost its capture stream during a ~6-minute queue wait (`terminated`, started=false) and is retained as an honest incomplete capture, never cited as PASS); strip-browser GREEN 67 (run 88318fcf); strip-smoke GREEN (run dfd6db5a); strip-themes GREEN (run 2b2501fd); dashboard-slim-strip-baseline RED (run f22a5b17, exit 1); strip-browser-baseline RED (run 465be0f2, exit 1); typecheck GREEN (run 58be2719). Round-4 delta-scoped review commissioned at the post-fix candidate; only findings intersecting the round-3 delta `ac4fb4b..<candidate>` can block (others report as follow-ups).
 
+Round 4 reviewed `560703c5e340d0d813f73254f77623e35230eb23` (blind-hunter 17: 5 delta + 12 follow-ups; edge-case 1 delta; verification-gap 0 new delta + 3 carried). The five delta findings were fixed in `1a3aabd37bbaa8745d8dba4e411c8ed533d76965`:
+
+| # | Finding (surface) | Verdict | Route / evidence |
+|---|---|---|---|
+| R4-1 | The migrated sticky bound was one-sided: a nav overlapping the strip (under-measured chrome) passed (BH A1, EC) | medium | patch: the bound is now `railBottom - 1 <= nav.y <= railBottom + 1` (both directions). |
+| R4-2 | The 1px containment tolerance was applied to the horizontal axes without justification (BH A2) | low | patch: tolerance confined to the vertical scroll axis; horizontal containment exact. |
+| R4-3 | `exit "$code"` collides with the marker's `exit 2` space without the kind assertion (BH A3) | low | patch: exit semantics documented beside the scopes (marker line identifies a broken claim; tooling failures land in the exit-1 bucket); the kind assertion stays deferred. |
+| R4-4 | The head-focused → rows-return transition was unpinned (BH A4) | low | patch: the empty-band focus test now renders a third time with rows and asserts focus lands on the live control. |
+| R4-5 | Focus-ring assertions pinned only `outline-width` (BH A5) | low | patch: `ringOf` now asserts width, style, colour (`--work`) and offset. |
+
+Round-5 review at `1a3aabd` (blind-hunter 15: 3 delta + 12 follow-ups; edge-case 0; verification-gap 5: 1 delta + 4 follow-ups): the delta items (R5-1 pipeline-board runner evidence; R5-2 `outline-style`; R5-3 the comment's `tsc` example) were settled in `e98a6d18aa5b7cdf3d5334f78eacb315c5154d4d` (style pinned, comment corrected) and by the gate receipts below. Dispatch-transcription defect recorded: the round-5 briefs carried a hand-composed full SHA `1a3aabd6ac…` that does not exist; both reviewers resolved the unique short hash `1a3aabd` to the correct commit `1a3aabd37bb…` and reviewed it. Lesson: full SHAs are always copied from `git rev-parse`, never composed.
+
+Exact-head receipts at `1a3aabd` (all through the authenticated scheduler + shipped capture helper; complete sinks + receipts under `_bmad-output/verify-captures/current-main-20261007/`): unit GREEN 142 (run 27e0d0d8); strip-browser GREEN 67 (run 160fa00e); strip-smoke GREEN (run 168b978f); strip-themes GREEN (run 76abf9f9); dashboard-slim-strip-baseline RED exit 1 (run 058ac42e); strip-browser-baseline RED exit 1 (run 17c856ff); typecheck GREEN (run ad1f40e6); pipeline-board-browser GREEN (run a36b4903); full GREEN (run 8b1ba722; backend 2291, heavy 925, web 542 passed). Round-6 delta review commissioned at the post-`e98a6d1` candidate; only findings intersecting `1a3aabd..<candidate>` can block (others report as follow-ups; the whole-change coverage for convergence sits in this concluding round).
+
 ## Design Notes
 
 - Numeric slots: number part only carries `.num` (`font-variant-numeric: tabular-nums; display:inline-block; text-align:right`), scoped to `#chip-rail`/`#board-owner` so unrelated surfaces keep app defaults (probe-tested). The e2e suite measures geometry; CSS only declares.
@@ -168,11 +182,14 @@ Round-3 resolution: fixes landed in `b86af16` (code + tests + record) and `065bb
 
 ## Verification
 
-**Commands (through authenticated `/api/verify` + shipped capture helper):**
-- `strip-browser` — `(cd web && npm run e2e -- --project=mock e2e/dashboard-strip.spec.ts)`; expected GREEN at final head; retain + inspect 1440/1200/768/360 light/dark captures.
+**Commands (through authenticated `/api/verify` + shipped capture helper; the union this lane added is seven scopes: `strip-browser`, `strip-smoke`, `strip-themes`, `strip-themes-update`, `dashboard-slim-strip-unit`, `dashboard-slim-strip-baseline`, `strip-browser-baseline` — the latter two pinned to base `49b558f…` and expected RED):**
 - `dashboard-slim-strip-unit` — `cd web && node ../node_modules/vitest/vitest.mjs run src/ui/board.test.ts src/lib/board-rail.test.ts src/lib/owner-band.test.ts`; expected GREEN.
-- `dashboard-slim-strip-baseline` / `strip-browser-baseline` — final test bytes over `git archive 49b558f…`; expected RED (feature absence).
+- `strip-browser` — `(cd web && npm run e2e -- --project=mock e2e/dashboard-strip.spec.ts)`; expected GREEN; retain + inspect 1440/1200/768/360 light/dark captures.
+- `strip-smoke` — `(mock smoke suite)`; expected GREEN (migrated main assertions).
+- `strip-themes` — `(mock + real "dark toggle persists" goldens, no update flag)`; expected GREEN; `strip-themes-update` is the deliberate, inspected regeneration scope (never cited as acceptance).
+- `pipeline-board-browser` — the existing main scope; expected GREEN (slim-strip chrome geometry migration).
+- `dashboard-slim-strip-baseline` / `strip-browser-baseline` — final test bytes over `git archive 49b558f…`; expected RED (feature absence), exits unmasked.
 - `full` (`npm test`) and `typecheck` at the same final head.
-- Independent whole-change review via `POST /api/dispatch` with `"deliverable": "review"` on the exact head; then exact-head CI and native Perkins READY on the exact final head.
+- Independent whole-change review via `POST /api/dispatch` with `"deliverable": "review"` on the exact head (five rounds: 1–2 whole-change with full blocking scope, 3–5 delta-scoped from round 3); then exact-head CI and native Perkins READY on the exact final head.
 
 **Manual checks:** personally inspect screenshots at 1440/1200/768/360 both themes; verify no overflow masking.
