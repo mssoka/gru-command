@@ -100,6 +100,46 @@ function laneAt(path: string, status: WorktreeLane['status'] = 'active'): Worktr
 }
 
 describe('fresh fix worker association', () => {
+  it('refuses a freshly binned lane after asynchronous spawn, disposing before prompt', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-fix-bin-race-'));
+    cleanupDirs.push(dir);
+    const db = new LedgerDb(dir);
+    try {
+      const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+      ledger.addJob({ id: 'job-1', repo: 'fixture', title: 'Lane to discard' });
+      ledger.setJobStatus('job-1', 'working');
+      let prompted = false;
+      let disposed = false;
+      const handle = {
+        id: 'late-directive-worker', role: 'minion', sessionFile: null,
+        async prompt() { prompted = true; },
+        capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
+        async steer() {}, async followUp() {},
+        subscribe() { return () => {}; },
+        health() { return { state: 'idle' as const, lastActivity: null, sessionFile: null }; },
+        async dispose() { disposed = true; },
+      } satisfies AgentHandle;
+      await expect(routeFixDirectiveToMinion({
+        jobId: 'job-1', directive: 'obsolete directive', signal: new AbortController().signal,
+        ledger, worktrees: { listWorktrees: () => [laneAt(dir)] } as unknown as WorktreePort,
+        registry: {
+          getHandle: () => null,
+          spawn: async () => {
+            ledger.setJobStatus('job-1', 'binned');
+            return handle;
+          },
+          disposeHandle: async () => {},
+        },
+      })).rejects.toThrow(/directive refused.*binned/u);
+      expect(prompted).toBe(false);
+      expect(disposed).toBe(true);
+      expect(ledger.getJob('job-1')?.status).toBe('binned');
+      expect(ledger.getAgent(handle.id)).toBeNull();
+    } finally {
+      db.close();
+    }
+  });
+
   it('binds the owning job before a failed prompt and keeps it after disposal', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'gru-command-fix-binding-'));
     cleanupDirs.push(dir);

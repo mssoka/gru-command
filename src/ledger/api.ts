@@ -909,10 +909,10 @@ function isRealIsoUtcTimestamp(value: string): boolean {
 export class LedgerApi {
   private readonly db: DatabaseSync;
   private readonly bus: EventBus | null;
-  /** Runtime ownership only: a claimed recovery has not yet registered its
-   * replacement worker. The durable wait stays claimed after settlement,
-   * so it cannot by itself be used as a permanent binning blocker. */
-  private readonly activeProviderContinuations = new Map<string, string>();
+  /** Process-local ownership across the asynchronous gap BEFORE a worker
+   * has a registered spawning turn. Historical durable requests are NOT a
+   * permanent blocker after their runtime attempt settles or crashes. */
+  private readonly activeJobAdmissions = new Set<{ readonly jobId: string; readonly kind: string }>();
 
   constructor(db: DatabaseSync, opts: { bus?: EventBus } = {}) {
     this.db = db;
@@ -1837,9 +1837,9 @@ export class LedgerApi {
     if (openTurns.length > 0) {
       blockers.push(`open worker turn(s): ${openTurns.map((agent) => `${agent.id} (${agent.state})`).join(', ')}`);
     }
-    const claims = [...this.activeProviderContinuations].filter(([, owner]) => owner === jobId);
-    if (claims.length > 0) {
-      blockers.push(`in-flight provider continuation(s): ${claims.map(([waitId]) => waitId).join(', ')}`);
+    const admissions = [...this.activeJobAdmissions].filter((entry) => entry.jobId === jobId);
+    if (admissions.length > 0) {
+      blockers.push(`in-flight admission(s): ${admissions.map((entry) => entry.kind).join(', ')}`);
     }
     const children = this.listChildWorkers({ jobId }).filter((child) => child.resultState === null);
     if (children.length > 0) {
@@ -3675,25 +3675,27 @@ export class LedgerApi {
     return rows.map((row) => this.providerWaitFromRow(row));
   }
 
-  /** Reserve the in-flight runtime side effect AFTER a durable atomic claim
-   * and BEFORE the first asynchronous spawn. Released in a finally block;
-   * a crash loses this runtime ownership with the process, while the claimed
-   * wait remains durable evidence for explicit recovery, not a fake worker. */
+  /** Reserve one runtime admission BEFORE its first await. The status
+   * transaction sees this ownership until the attempt finishes; a restart
+   * loses only process-local ownership, not historical intent/events. */
+  beginJobAdmission(jobId: string, kind: string): () => void {
+    const job = this.getJob(jobId);
+    if (job === null || isJobTerminal(job.status)) {
+      throw new Error(`cannot admit ${kind} for job "${jobId}" (${job?.status ?? 'missing'})`);
+    }
+    const admission = { jobId, kind };
+    this.activeJobAdmissions.add(admission);
+    return () => { this.activeJobAdmissions.delete(admission); };
+  }
+
+  /** A durable claimed wait is permission to attempt ONE runtime recovery,
+   * not a permanent live producer after its turn settles. */
   beginProviderContinuation(waitId: string, jobId: string): () => void {
     const wait = this.getProviderWait(waitId);
     if (wait === null || wait.status !== 'claimed' || wait.waiterKind !== 'job-minion' || wait.jobId !== jobId) {
       throw new Error(`provider continuation ${waitId} must belong to a claimed job-minion wait for "${jobId}"`);
     }
-    if (this.activeProviderContinuations.has(waitId)) {
-      throw new Error(`provider continuation ${waitId} already owns an in-flight spawn`);
-    }
-    this.activeProviderContinuations.set(waitId, jobId);
-    let released = false;
-    return () => {
-      if (released) return;
-      released = true;
-      this.activeProviderContinuations.delete(waitId);
-    };
+    return this.beginJobAdmission(jobId, `provider continuation ${waitId}`);
   }
 
   /** r1 #10: ATOMIC claim-before-spawn. Compare-and-set

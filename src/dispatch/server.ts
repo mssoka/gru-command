@@ -1053,6 +1053,11 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         });
         return true;
       }
+      // The durable intent proves which request owns the lane; reserve its
+      // in-process admission before the first async wait so an authenticated
+      // bin cannot close the job before any minion row exists. A stale
+      // historical intent after a crash is NOT permanent runtime ownership.
+      const releaseAdmission = options.ledger.beginJobAdmission(jobId, `directive ${intent.requestId}`);
       // The async turn stays owned and tracked by THIS server instance
       // (the existing directiveControllers/inFlight coordinator — no
       // detached helper, no second chief). Late errors surface durably.
@@ -1230,6 +1235,8 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           // The ledger itself failed — the event log already carries what
           // committed; boot reconciliation reads it.
         }
+      }).finally(() => {
+        releaseAdmission();
       });
       track(run);
       // Accepted ≠ admitted: 202 reports the durable INTENT; actual native

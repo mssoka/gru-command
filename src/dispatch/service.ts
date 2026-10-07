@@ -240,6 +240,18 @@ export class DispatchService {
     // evidence already exists (the boot reconciler finishes it instead).
     let deliveredRecorded = false;
     let workerLease: PacingLease | null = null;
+    let releaseAdmission: (() => void) | null = null;
+    const releaseJobAdmission = (): void => {
+      const release = releaseAdmission;
+      releaseAdmission = null;
+      release?.();
+    };
+    const assertAdmissible = (): void => {
+      const current = this.opts.ledger.getJob(job.id);
+      if (current === null || isJobTerminal(current.status) || current.status === 'parked' || current.status === 'blocked') {
+        throw new Error(`initial dispatch refused — job "${job.id}" is ${current?.status ?? 'missing'}`);
+      }
+    };
     const releaseWorker = (): void => {
       const lease = workerLease;
       workerLease = null;
@@ -247,6 +259,10 @@ export class DispatchService {
     };
     try {
       const working = this.opts.ledger.setJobStatus(job.id, 'working');
+      // No registered agent exists yet while worktree/pacing/spawn awaits.
+      // Reserve that runtime side effect so a concurrent bin cannot close
+      // the lane then receive a late briefing.
+      releaseAdmission = this.opts.ledger.beginJobAdmission(job.id, 'initial dispatch');
 
       // (2b) Explicit completion intent BEFORE admission/side effects: the
       // durable guard row exists before any worktree or spawn, so a crash
@@ -296,6 +312,7 @@ export class DispatchService {
       }
       let handle: AgentHandle;
       try {
+        assertAdmissible();
         const cwd = requireSpawnCwd('minion', worktree.path);
         // Issue #161: a dispatched parent gets a product-owned identity and
         // the GC-mediated child tools bound to it — no bearer secret ever
@@ -310,6 +327,12 @@ export class DispatchService {
           ...(parentAgentId !== undefined ? { agentId: parentAgentId } : {}),
           ...(parentNativeTools.length > 0 ? { nativeTools: parentNativeTools } : {}),
         });
+        try {
+          assertAdmissible();
+        } catch (error) {
+          await handle.dispose();
+          throw error;
+        }
       } catch (error) {
         // The lane cannot start — release the pacing slot, sweep the fresh
         // worktree (preserve first, per ruling 18c) and block the job.
@@ -498,6 +521,15 @@ export class DispatchService {
           : {}),
         ...(lessons.length > 0 ? { lessons } : {}),
       });
+      // A synchronous spawn listener can change job state before briefing.
+      // No await separates this last check from actual prompt delivery.
+      try {
+        assertAdmissible();
+      } catch (error) {
+        await handle.dispose();
+        this.opts.ledger.setAgentState(handle.id, 'disposed');
+        throw error;
+      }
       const promptRun: Promise<unknown> =
         handle.promptWithVerdict !== undefined
           ? handle.promptWithVerdict(briefing, { owner: `dispatch:${job.id}` })
@@ -513,13 +545,18 @@ export class DispatchService {
         )
         .finally(() => {
           releaseWorker();
+          releaseJobAdmission();
         });
 
       return { job: working, worktree, agentId: handle.id, settled };
     } catch (error) {
       releaseWorker();
-      this.opts.ledger.setJobStatus(job.id, 'blocked');
-      this.opts.ledger.noteJob(job.id, `dispatch failed: ${String(error)}`);
+      releaseJobAdmission();
+      const current = this.opts.ledger.getJob(job.id);
+      if (current !== null && !isJobTerminal(current.status) && current.status !== 'parked') {
+        this.opts.ledger.setJobStatus(job.id, 'blocked');
+        this.opts.ledger.noteJob(job.id, `dispatch failed: ${String(error)}`);
+      }
       this.closeHandoffQuietly(handoffPhaseId, `dispatch failed before admission: ${String(error)}`);
       throw error;
     }

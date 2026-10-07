@@ -81,9 +81,12 @@ lens:   pending → live → done | error               (terminal: the last two)
   authenticated `POST /api/jobs/<id>/status` write WHEN no target-owned
   producer remains. The same status transaction refuses open worker turns,
   non-terminal children, pending/live rounds, unsettled verification
-  runs and a currently spawning provider-recovery continuation; an idle
-  `working` job can still be binned. A historical claimed provider wait
-  is not a perpetual runtime blocker after its spawn/turn settles. Gru's shipped role
+  runs, and active initial dispatch, directive or provider-recovery
+  admissions that have not registered their worker yet; an idle `working`
+  job can still be binned. Historical directive intents and claimed
+  provider waits are not perpetual runtime blockers after the attempt
+  settles; last-side-effect guards also refuse late prompts if a job
+  became terminal during an asynchronous boundary. Gru's shipped role
   teaches this intentional action through its permitted shell and the
   configured service token; no background process automatically bins
   work. `binned` never leaves — it shares the terminal contract with `merged`/`done`
