@@ -460,6 +460,9 @@ export class ChatView {
     if (working) this.ensureWorkingFlavor();
     else this.stopWorkingFlavor();
     this.contextStatus.classList.toggle('chat-context__status--busy', connected && busy);
+    // Only the phrase-showing state hides the factual label visually;
+    // compacting/resetting have no phrase, so their label IS the status.
+    this.contextStatus.classList.toggle('chat-context__status--working', working);
     this.contextStatus.toggleAttribute('aria-busy', connected && busy);
     if (!connected || snapshot === null) {
       this.setContextStatus('Context unavailable');
