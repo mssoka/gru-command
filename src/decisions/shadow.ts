@@ -56,6 +56,8 @@ export function buildShadowRecord<Q extends QuestionSet>(input: {
     latency_ms: input.providerOutcome.provenance.latencyMs,
     cost: input.providerOutcome.provenance.usage?.costUsd ?? null,
     provenance_source: input.providerOutcome.provenance.source,
+    fallback_reason: input.providerOutcome.provenance.fallbackReason,
+    request_diagnostics: input.providerOutcome.provenance.diagnostics ?? null,
     disagrees: routeDisagreement(
       input.providerOutcome.routes as unknown as Readonly<Record<string, { readonly path: string }>>,
       input.deterministicOutcome.routes as unknown as Readonly<Record<string, { readonly path: string }>>,
