@@ -85,6 +85,10 @@ export const HEAVY_TESTS: readonly HeavyTestEntry[] = Object.freeze([
     workload: 'fetch/freeze resolution over real git remotes',
   },
   {
+    file: 'perkins-review-convergence.test.ts',
+    workload: 'whole review rounds over real git fixtures; observed 32.8s (over the 30s fast ceiling) under full-run co-tenant load vs 12.0-19.6s in the other preserved full runs',
+  },
+  {
     file: 'perkins-whole-review.test.ts',
     workload: 'whole-review engine over real worktrees and git',
   },
