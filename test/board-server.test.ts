@@ -590,20 +590,20 @@ describe('board server — HTTP API', () => {
     // not: dropping this wiring — or wiring a falsified constant instead
     // of the live view value — would silently fall back to durable markers
     // only and no behavioral test would fail (same alarm pattern as the
-    // supervisor-stop wiring pin). This pin therefore matches the exact
-    // mapping expressions, not just their property names.
+    // supervisor-stop wiring pin). The match is LINE-ANCHORED on purpose:
+    // a commented-out or decoy copy of the same text must not satisfy it.
     const mainSource = readFileSync(join(import.meta.dirname, '..', 'src', 'main.ts'), 'utf8');
-    const start = mainSource.indexOf('closeoutRuntime:');
-    expect(start, 'main.ts declares closeoutRuntime').toBeGreaterThanOrEqual(0);
-    const block = mainSource.slice(start, start + 1200);
-    expect(block).toMatch(/liveHandleIds:\s*new Set\(registry\.listHandles\(\)\.map\(\(handle\) => handle\.id\)\)/u);
-    expect(block).toMatch(/supervisionFor:\s*\(agentId\)\s*=>\s*\{/u);
-    expect(block).toMatch(/const view = supervisorLive\.viewFor\(agentId\);/u);
-    expect(block).toMatch(/state:\s*view\.state,/u);
-    expect(block).toMatch(/breakerOpen:\s*view\.breakerOpen,/u);
-    expect(block).toMatch(/openTurn:\s*view\.openTurn,/u);
-    expect(block).toMatch(/openControl:\s*view\.openControl === true,/u);
-    expect(block).toMatch(/openToolCalls:\s*view\.openToolCalls,/u);
+    const wiringLines = mainSource.split('\n').filter((line) => /^\s*closeoutRuntime:/.test(line));
+    expect(wiringLines, 'exactly one active closeoutRuntime property').toHaveLength(1);
+    expect(wiringLines[0]).toMatch(/^\s*closeoutRuntime:\s*\(\)\s*=>\s*\(\{/u);
+    expect(mainSource).toMatch(/^\s*liveHandleIds:\s*new Set\(registry\.listHandles\(\)\.map\(\(handle\) => handle\.id\)\),/mu);
+    expect(mainSource).toMatch(/^\s*supervisionFor:\s*\(agentId\)\s*=>\s*\{/mu);
+    expect(mainSource).toMatch(/^\s*const view = supervisorLive\.viewFor\(agentId\);/mu);
+    expect(mainSource).toMatch(/^\s*state:\s*view\.state,/mu);
+    expect(mainSource).toMatch(/^\s*breakerOpen:\s*view\.breakerOpen,/mu);
+    expect(mainSource).toMatch(/^\s*openTurn:\s*view\.openTurn,/mu);
+    expect(mainSource).toMatch(/^\s*openControl:\s*view\.openControl === true,/mu);
+    expect(mainSource).toMatch(/^\s*openToolCalls:\s*view\.openToolCalls,/mu);
   });
 
   it('write endpoints reject bad bodies and missing entities', async () => {

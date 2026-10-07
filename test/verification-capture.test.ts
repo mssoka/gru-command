@@ -520,25 +520,35 @@ describe('capture CLI run: exclusive sink + honest outcome', () => {
 
   it('pauses the socket once the consumer is behind and resumes on read (bounded queue)', async () => {
     const chunkBytes = 64 * 1024;
-    const totalBytes = 384 * chunkBytes; // 24 MiB
+    const totalBytes = 128 * chunkBytes; // 8 MiB
     let written = 0;
-    let blockedAt: number | null = null;
+    let releasePump: () => void = () => {};
+    const pumpGate = new Promise<void>((resolve) => {
+      releasePump = resolve;
+    });
     const server = createServer((_req, res) => {
       res.writeHead(200, { 'content-type': 'application/octet-stream' });
       const chunk = Buffer.alloc(chunkBytes, 7);
-      const pump = (): void => {
-        while (written < totalBytes) {
-          const accepted = res.write(chunk);
-          written += chunkBytes;
-          if (!accepted) {
-            blockedAt ??= written;
-            res.once('drain', pump);
-            return;
+      res.write(chunk); // the first chunk resolves the consumer's first read
+      written += chunkBytes;
+      // The bulk starts only AFTER the consumer's first read: backpressure
+      // observed from here on is the consumer stalling, never the pre-read
+      // attach window (a server that pumps before the consumer attaches
+      // would record backpressure for either transport shape).
+      void pumpGate.then(() => {
+        const pump = (): void => {
+          while (written < totalBytes) {
+            const accepted = res.write(chunk);
+            written += chunkBytes;
+            if (!accepted) {
+              res.once('drain', pump);
+              return;
+            }
           }
-        }
-        res.end();
-      };
-      pump();
+          res.end();
+        };
+        pump();
+      });
     });
     await new Promise<void>((resolveListen) => server.listen(0, '127.0.0.1', resolveListen));
     try {
@@ -546,17 +556,20 @@ describe('capture CLI run: exclusive sink + honest outcome', () => {
       const response = await nodeStreamFetch(`http://127.0.0.1:${String(port)}/bulk`);
       const reader = response.body!.getReader();
       const first = await reader.read();
-      let received = first.value?.byteLength ?? 0;
-      // The consumer stops reading. With the bounded queue the transport
-      // pauses the socket, so the server's write() eventually reports
-      // backpressure; without pause() the whole payload would stream into
-      // the consumer-side queue and write() would stay accepted.
-      const deadline = Date.now() + 15_000;
-      while (blockedAt === null && written < totalBytes && Date.now() < deadline) {
-        await new Promise((resolve) => setTimeout(resolve, 25));
+      releasePump();
+      // While the consumer stays stalled, the bounded queue stops reading
+      // the socket, so the server can NEVER finish the transfer; an
+      // unbounded queue would drain the whole payload and finish.
+      const deadline = Date.now() + 10_000;
+      let lastWritten = -1;
+      let stableChecks = 0;
+      while (written < totalBytes && stableChecks < 4 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        stableChecks = written === lastWritten ? stableChecks + 1 : 0;
+        lastWritten = written;
       }
-      expect(blockedAt, 'server never saw backpressure — the consumer queue is not bounded').not.toBeNull();
-      expect(blockedAt!).toBeLessThan(totalBytes);
+      expect(written, 'the server finished a transfer the stalled consumer never drained').toBeLessThan(totalBytes);
+      let received = first.value?.byteLength ?? 0;
       for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -568,6 +581,7 @@ describe('capture CLI run: exclusive sink + honest outcome', () => {
       await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
     }
   });
+
 
   it('capture status reconciles through the raw transport by default (global fetch never used)', async () => {
     const server = createServer((_req, res) => {
