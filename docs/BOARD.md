@@ -35,6 +35,7 @@ restart produce the same truth without data edits.
 | `POST /api/jobs` | `{id, repo, title, baseBranch?}` → job (`dispatched`) |
 | `POST /api/jobs/:id/status` | `{status}` — validated against the [job machine](./LEDGER.md) |
 | `POST /api/jobs/:id/closeout` | `{expected_status, expected_pr_url, provider, reason}` — guarded administrative closeout of a parked PR-backed lane whose recorded provider observation is CLOSED-without-merge; audited, idempotent, refusals are `409 closeout_refused` + `code` ([OPERATIONS.md](./OPERATIONS.md)) |
+| `POST /api/jobs/:id/owner-cancellation` | `{expected_status, authority_reference, reason}` — guarded administrative abandonment of an EXACT owner-listed parked legacy lane (no PR/report metadata); audited, idempotent, refusals are `409 cancellation_refused` + `code` ([OPERATIONS.md](./OPERATIONS.md)) |
 | `POST /api/rounds` | `{jobId, lenses? (default 9), targetRef?}` → round (`pending`) |
 | `POST /api/rounds/:id/status` / `:id/verdict` | `{status}` / `{verdict}` |
 | `POST /api/agents` | `{id, role, label?, jobId?, roundId?, sessionFile?}` (upsert) |
@@ -49,7 +50,8 @@ restart produce the same truth without data edits.
 token exists (empty token = locked door, never open). Illegal
 transitions and unknown entities are 400/404 with the reason in
 `detail`; a guarded closeout refusal is a typed `409 closeout_refused`
-whose `code` names the refusing guard. Bodies are capped (200 KB).
+and an owner-cancellation refusal is a typed `409 cancellation_refused`,
+each with a `code` naming the refusing guard. Bodies are capped (200 KB).
 
 PR state derives from the record: a `merged` job reports `merged`; a
 terminal `done` job is a closed receipt — its registered PR is never

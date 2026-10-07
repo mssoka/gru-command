@@ -81,32 +81,31 @@ lens:   pending → live → done | error               (terminal: the last two)
   and only this guarded operation admits the direct `parked → done` edge.
   (A lane resumed through its normal lifecycle still reaches `done` by
   the ordinary route — this edge exists for a lane that never resumes.)
+  It requires an explicit expected status + PR url + head, the job's
+  LATEST recorded `github.branch-state` observation to say the PR is
+  CLOSED and not merged at exactly that url/head, and no target-owned
+  live work. ONE transaction appends the `job.admin-closeout` audit
+  (request evidence + the cited observation seq), records the direct
+  status hop, and closes the applicable obligations `job-terminal`
+  (abandonment, never a success claim). A repeated identical request
+  returns the recorded closeout idempotently; a changed request is
+  refused — the recorded one is never overwritten. Idle/historical
+  bookkeeping rows and the separate directive/re-brief control rows are
+  neither read nor rewritten.
 - **Owner cancellation** (`adminCancelListedParkedJob`, owner amendment
-  j-1117) is the second audited closeout form, narrower and distinct:
-  it admits ONLY the exact frozen allowlist of 17 named parked legacy
-  lanes (`src/ledger/owner-cancellation.ts`), requires no provider
-  receipt (those lanes have no PR and NULL report metadata — no value is
-  ever invented), and records an `owner-cancelled-abandoned` terminal
-  disposition with the owner authority reference and the exact prior
+  j-1117) is the second, narrower audited closeout form: it admits ONLY
+  the exact frozen allowlist of 17 named parked legacy lanes
+  (`src/ledger/owner-cancellation.ts`), requires no provider receipt
+  (those lanes have no PR and NULL report metadata — no value is ever
+  invented), and records an `owner-cancelled-abandoned` terminal
+  disposition carrying the owner authority reference and the exact prior
   identity. There is no scan/batch mode. Both forms share the
-  authoritative live-work fence: durable markers plus (when wired) the
-  live registry handle set and the supervisor's open turn/control/tool
-  view, so a ledger `idle` row with an effective open turn refuses. An
-  explicit supervision stop is not live execution. Directive/re-brief/
-  report/verification history and worktrees are never rewritten by
-  either form. It requires an
-  explicit expected status + PR url + head, the job's LATEST recorded
-  `github.branch-state` observation to say the PR is CLOSED and not
-  merged at exactly that url/head, and no target-owned live work
-  (spawning/streaming worker turns, non-terminal child workers,
-  pending/live rounds, unsettled verification runs). ONE transaction
-  appends the `job.admin-closeout` audit (request evidence + the cited
-  observation seq), records the direct status hop, and closes the
-  applicable obligations `job-terminal` (abandonment, never a success
-  claim). A repeated identical request returns the recorded closeout
-  idempotently; a changed request is refused — the recorded one is never
-  overwritten. Idle/historical bookkeeping rows and the separate
-  directive/re-brief control rows are neither read nor rewritten.
+  authoritative live-work fence: durable execution markers plus (when
+  wired) the live registry handle set and the supervisor's open
+  turn/control/tool view, so a ledger `idle` row with an effective open
+  turn refuses. An explicit supervision stop is not live execution.
+  Directive/re-brief/report/verification history and worktrees are never
+  rewritten by either form.
 - `setRoundVerdict` also transitions the round to `verdict-posted` — a
   posted verdict IS that state (and a verdict on a still-`pending` round
   fails loud, machine and all, leaving no trace).

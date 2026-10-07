@@ -75,7 +75,7 @@ type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
  * The surface matches the FetchLike seam the tests inject: `ok`,
  * `status`, `body` (a byte stream) and `text()`.
  */
-function nodeStreamFetch(input: string, init?: RequestInit): Promise<Response> {
+export function nodeStreamFetch(input: string, init?: RequestInit): Promise<Response> {
   return new Promise((resolve, reject) => {
     const url = new URL(input);
     const requestFn = url.protocol === 'https:' ? httpsRequest : httpRequest;
@@ -96,25 +96,50 @@ function nodeStreamFetch(input: string, init?: RequestInit): Promise<Response> {
         if (value !== undefined) headers[name] = String(value);
       }
     }
+    const body = init?.body;
+    const bodyText: string | Buffer | null =
+      typeof body === 'string' || Buffer.isBuffer(body) ? body : null;
+    if (body !== undefined && body !== null && bodyText === null) {
+      // The FetchLike surface is narrower than the DOM BodyInit union; a
+      // body this transport cannot send is rejected loudly, never dropped.
+      reject(new Error('nodeStreamFetch supports only string or Buffer request bodies'));
+      return;
+    }
     const request = requestFn(url, { method: init?.method ?? 'GET', headers }, (response) => {
       let cachedBody: ReadableStream<Uint8Array> | null = null;
-      const text = (): Promise<string> =>
-        new Promise((resolveText, rejectText) => {
+      let bodyTouched = false;
+      const text = (): Promise<string> => {
+        if (bodyTouched) {
+          // The stream surface allows both styles upstream, but a second
+          // consumer of one live response would hang forever on `end`.
+          return Promise.reject(new Error('response body already consumed by the byte stream'));
+        }
+        return new Promise((resolveText, rejectText) => {
           const chunks: Buffer[] = [];
           response.on('data', (chunk: Buffer) => chunks.push(chunk));
           response.on('end', () => resolveText(Buffer.concat(chunks).toString('utf-8')));
           response.on('error', rejectText);
         });
+      };
       const result = {
         ok: response.statusCode !== undefined && response.statusCode >= 200 && response.statusCode < 300,
         status: response.statusCode ?? 0,
         get body(): ReadableStream<Uint8Array> | null {
+          bodyTouched = true;
           if (cachedBody === null) {
             cachedBody = new ReadableStream<Uint8Array>({
               start(controller) {
-                response.on('data', (chunk: Buffer) => controller.enqueue(new Uint8Array(chunk)));
+                response.on('data', (chunk: Buffer) => {
+                  controller.enqueue(new Uint8Array(chunk));
+                  // Bounded queue: stop reading the socket while the
+                  // consumer is behind; pull() resumes it.
+                  if (controller.desiredSize !== null && controller.desiredSize <= 0) response.pause();
+                });
                 response.on('end', () => controller.close());
                 response.on('error', (error: Error) => controller.error(error));
+              },
+              pull() {
+                response.resume();
               },
               cancel() {
                 request.destroy();
@@ -130,8 +155,15 @@ function nodeStreamFetch(input: string, init?: RequestInit): Promise<Response> {
       resolve(result as unknown as Response);
     });
     request.on('error', (error: Error) => reject(error));
-    const body = init?.body;
-    if (typeof body === 'string' || Buffer.isBuffer(body)) request.write(body);
+    const signal = init?.signal;
+    if (signal !== undefined && signal !== null) {
+      if (signal.aborted) {
+        request.destroy(new Error('request aborted'));
+      } else {
+        signal.addEventListener('abort', () => request.destroy(new Error('request aborted')), { once: true });
+      }
+    }
+    if (bodyText !== null) request.write(bodyText);
     request.end();
   });
 }

@@ -3,7 +3,7 @@ import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   CAPTURE_OWNER_VERSION,
   CAPTURE_RECEIPT_VERSION,
@@ -23,6 +23,7 @@ import {
 } from '../src/verify/capture.js';
 import {
   CAPTURE_EXIT,
+  nodeStreamFetch,
   parsePsOutput,
   runCaptureCli,
   type CaptureCliDeps,
@@ -406,6 +407,11 @@ describe('capture CLI run: exclusive sink + honest outcome', () => {
     await new Promise<void>((resolveListen) => server.listen(0, '127.0.0.1', resolveListen));
     try {
       const port = (server.address() as AddressInfo).port;
+      // Discriminator: if the run path fell back to global fetch, this
+      // stub throws and the capture would not come back OK.
+      vi.stubGlobal('fetch', () => {
+        throw new Error('global fetch must not carry the verify stream');
+      });
       const code = await runCaptureCli(
         [...BASE_ARGS, '--sink', sinkPath, '--request-id', 'req-cli-stall', '--url', `http://127.0.0.1:${String(port)}`, '--token', 't'],
         deps({ stdout: () => {} }),
@@ -417,6 +423,60 @@ describe('capture CLI run: exclusive sink + honest outcome', () => {
       expect(receipt.error).toBeNull();
       expect(captureReceiptSucceeded(receipt)).toBe(true);
       expect(readFileSync(sinkPath, 'utf-8')).toBe(frame);
+    } finally {
+      vi.unstubAllGlobals();
+      server.closeAllConnections();
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+    }
+  });
+
+  it('the raw transport reads a chunked body through a stall and keeps a bounded consumer queue', async () => {
+    const server = createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+      res.write('first\n');
+      setTimeout(() => res.end('second\n'), 200);
+    });
+    await new Promise<void>((resolveListen) => server.listen(0, '127.0.0.1', resolveListen));
+    try {
+      const port = (server.address() as AddressInfo).port;
+      const response = await nodeStreamFetch(`http://127.0.0.1:${String(port)}/stream`);
+      expect(response.ok).toBe(true);
+      const reader = response.body!.getReader();
+      const decoder = new TextDecoder();
+      let text = '';
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        text += decoder.decode(value, { stream: true });
+      }
+      expect(text).toBe('first\nsecond\n');
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+    }
+  });
+
+  it('records UNKNOWN and never promotes when the real transport socket is severed mid-stream', async () => {
+    const dir = tempDir();
+    const sinkPath = join(dir, 'severed.ndjson');
+    const server = createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+      // A completed-looking frame, then a hard reset without a clean end:
+      // the reader must not treat the parsed outcome as a finished stream.
+      res.write(completedNdjson());
+      setTimeout(() => res.destroy(), 50);
+    });
+    await new Promise<void>((resolveListen) => server.listen(0, '127.0.0.1', resolveListen));
+    try {
+      const port = (server.address() as AddressInfo).port;
+      const code = await runCaptureCli(
+        [...BASE_ARGS, '--sink', sinkPath, '--request-id', 'req-cli-severed', '--url', `http://127.0.0.1:${String(port)}`, '--token', 't'],
+        deps({ stdout: () => {} }),
+      );
+      expect(code).toBe(CAPTURE_EXIT.unknown);
+      const receipt = JSON.parse(readFileSync(captureReceiptPath(sinkPath), 'utf-8')) as CaptureReceipt;
+      expect(receipt.outcome).toBe('unknown');
+      expect(captureReceiptSucceeded(receipt)).toBe(false);
     } finally {
       server.closeAllConnections();
       await new Promise<void>((resolveClose) => server.close(() => resolveClose()));

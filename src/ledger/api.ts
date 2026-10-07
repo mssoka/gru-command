@@ -467,7 +467,7 @@ export interface AdminCloseoutProviderEvidence {
   readonly headSha: string;
   /** The provider's close timestamp when the caller has one (recorded
    * verbatim; never compared — the observation event is the binding). */
-  readonly closedAt?: string | null;
+  readonly closedAt?: string;
 }
 
 export interface AdminCloseoutInput {
@@ -496,9 +496,11 @@ export interface AdminCloseoutResult {
 // and the supervisor's per-agent view at the commit boundary.
 // ------------------------------------------------------------------
 
-/** The supervisor's view for one agent, reduced to liveness facts. */
+/** The supervisor's view for one agent, reduced to liveness facts. The
+ * state union mirrors the supervisor's real set (watching/restarting/
+ * stopped) so a new state cannot silently pass through the guard. */
 export interface CloseoutSupervisionView {
-  readonly state: string;
+  readonly state: 'watching' | 'restarting' | 'stopped';
   readonly breakerOpen: boolean;
   readonly openTurn: boolean;
   readonly openControl: boolean;
@@ -1686,8 +1688,8 @@ export class LedgerApi {
     if (!/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/u.test(headSha)) {
       throw new Error(`provider head_sha must be a full 40- or 64-character hex commit sha (got ${JSON.stringify(evidence.headSha)})`);
     }
-    const closedAt = evidence.closedAt ?? null;
-    if (closedAt !== null && (typeof closedAt !== 'string' || !isRealIsoUtcTimestamp(closedAt))) {
+    const closedAt = evidence.closedAt;
+    if (closedAt !== undefined && (typeof closedAt !== 'string' || !isRealIsoUtcTimestamp(closedAt))) {
       throw new Error(`provider closed_at must be a real ISO-8601 UTC timestamp when present (got ${JSON.stringify(closedAt)})`);
     }
     const reason = input.reason.trim();
@@ -1709,7 +1711,7 @@ export class LedgerApi {
             job_id: job.id,
             expected_status: 'parked',
             expected_pr_url: expectedPrUrl,
-            provider: { provider: 'github', state: 'closed', merged: false, head_sha: headSha, closed_at: closedAt },
+            provider: { provider: 'github', state: 'closed', merged: false, head_sha: headSha, closed_at: closedAt ?? null },
             reason,
           }),
         )
@@ -1858,7 +1860,7 @@ export class LedgerApi {
           disposition: 'closed-without-merge',
           expected_status: 'parked',
           expected_pr_url: expectedPrUrl,
-          provider: { provider: 'github', state: 'closed', merged: false, head_sha: headSha, closed_at: closedAt },
+          provider: { provider: 'github', state: 'closed', merged: false, head_sha: headSha, closed_at: closedAt ?? null },
           observation: {
             event_seq: observationEvent.seq,
             observed_at: observationEvent.ts,
@@ -1900,11 +1902,13 @@ export class LedgerApi {
       if (agent.jobId !== jobId) continue;
       const view = runtime?.supervisionFor(agent.id) ?? null;
       if (view !== null) {
+        // The supervisor's state set is watching|restarting|stopped; live
+        // execution is an open turn/control/tool call or an active restart.
         const openWork =
           view.openTurn === true ||
           view.openControl === true ||
           view.openToolCalls > 0 ||
-          view.state === 'streaming';
+          view.state === 'restarting';
         if (openWork) {
           openTurns.push(
             `${agent.id} (supervision ${view.state}${view.openTurn ? ', openTurn' : ''}${view.openToolCalls > 0 ? `, ${view.openToolCalls} open tool call(s)` : ''})`,

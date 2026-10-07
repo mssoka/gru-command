@@ -6,7 +6,7 @@ import { EventBus } from '../src/events/bus.js';
 import { LedgerApi, DEFAULT_LENSES, type PendingRebriefRecord } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { branchStatePayload } from '../src/dispatch/github-poll.js';
-import { OWNER_CANCELLATION_JOB_IDS } from '../src/ledger/owner-cancellation.js';
+import { OWNER_CANCELLATION_JOB_IDS, OWNER_CANCELLATION_RULING } from '../src/ledger/owner-cancellation.js';
 
 const cleanupDirs: string[] = [];
 afterAll(() => {
@@ -1753,7 +1753,7 @@ describe('administrative closeout of a parked PR-backed job', () => {
     }
   });
 
-  it('administrative closeout accepts full-identity variants: 64-char uppercase head, explicit null closed_at', () => {
+  it('administrative closeout accepts full-identity variants: 64-char uppercase head and an omitted closed_at', () => {
     const { api, db, dir } = freshDb();
     try {
       const sha64 = 'a1'.repeat(32);
@@ -1767,7 +1767,6 @@ describe('administrative closeout of a parked PR-backed job', () => {
           state: 'closed',
           merged: false,
           headSha: sha64.toUpperCase(),
-          closedAt: null,
         },
         reason: 'variant closeout',
       });
@@ -1873,6 +1872,11 @@ describe('administrative closeout of a parked PR-backed job', () => {
       ).toThrow(/real ISO-8601 UTC/u);
       expect(
         attempt({ provider: { provider: 'github', state: 'closed', merged: false, headSha: HEAD, closedAt: 'not-a-time' } }),
+      ).toThrow(/real ISO-8601 UTC/u);
+      // Present-but-null is not "omitted": the typed contract accepts only
+      // a real timestamp or an absent field.
+      expect(
+        attempt({ provider: { provider: 'github', state: 'closed', merged: false, headSha: HEAD, closedAt: null } }),
       ).toThrow(/real ISO-8601 UTC/u);
       // The target must be an absolute https url.
       expect(attempt({ expectedPrUrl: 'not-a-url' })).toThrow(/absolute https url/u);
@@ -2015,27 +2019,33 @@ describe('owner-listed administrative cancellation (owner amendment j-1117)', ()
     }
   });
 
-  it('binds the authoritative runtime view: ledger idle + openTurn refuses, explicit stops and historical rows do not', () => {
+  it('binds the authoritative runtime view: every single liveness clause refuses, explicit stops and historical rows do not', () => {
     const { api, db, dir } = freshDb();
     try {
       listedParkedJob(api, OWNER_CANCELLATION_JOB_IDS[2]!);
       api.registerAgent({ id: 'idle-but-open', role: 'minion', jobId: OWNER_CANCELLATION_JOB_IDS[2]! });
       api.setAgentState('idle-but-open', 'idle');
-      // The observed false-idle case: ledger `idle`, supervision openTurn:true.
-      const openProbe = {
-        liveHandleIds: new Set<string>(),
-        supervisionFor: (agentId: string) =>
-          agentId === 'idle-but-open'
-            ? { state: 'streaming', breakerOpen: false, openTurn: true, openControl: false, openToolCalls: 0 }
-            : null,
+      // Per-clause coverage with REAL supervision states
+      // ('watching' | 'restarting' | 'stopped'): any single authoritative
+      // liveness fact refuses on its own.
+      const clauseScenarios: Record<string, { state: 'watching' | 'restarting' | 'stopped'; breakerOpen: boolean; openTurn: boolean; openControl: boolean; openToolCalls: number }> = {
+        // The observed false-idle case: ledger `idle`, supervisor openTurn:true.
+        'open turn': { state: 'watching', breakerOpen: false, openTurn: true, openControl: false, openToolCalls: 0 },
+        'control phase': { state: 'watching', breakerOpen: false, openTurn: false, openControl: true, openToolCalls: 0 },
+        'open tool call': { state: 'watching', breakerOpen: false, openTurn: false, openControl: false, openToolCalls: 1 },
+        'active restart': { state: 'restarting', breakerOpen: false, openTurn: false, openControl: false, openToolCalls: 0 },
       };
-      const openRefusal = refusalOf(() =>
-        api.adminCancelListedParkedJob(cancelRequest(OWNER_CANCELLATION_JOB_IDS[2]!), openProbe),
-      );
-      expect(openRefusal.name).toBe('AdminCancellationRefusal');
-      expect(openRefusal.code).toBe('live-work');
-      expect(openRefusal.message).toContain('idle-but-open');
-      expect(api.getJob(OWNER_CANCELLATION_JOB_IDS[2]!)?.status).toBe('parked');
+      for (const [label, view] of Object.entries(clauseScenarios)) {
+        const probe = {
+          liveHandleIds: new Set<string>(),
+          supervisionFor: (agentId: string) => (agentId === 'idle-but-open' ? view : null),
+        };
+        const refused = refusalOf(() => api.adminCancelListedParkedJob(cancelRequest(OWNER_CANCELLATION_JOB_IDS[2]!), probe));
+        expect(refused.name, label).toBe('AdminCancellationRefusal');
+        expect(refused.code, label).toBe('live-work');
+        expect(refused.message, label).toContain('idle-but-open');
+        expect(api.getJob(OWNER_CANCELLATION_JOB_IDS[2]!)?.status, label).toBe('parked');
+      }
 
       // Idle + a live registry handle (no supervision view) is live ownership.
       const ownedProbe = { liveHandleIds: new Set(['idle-but-open']), supervisionFor: () => null };
@@ -2069,6 +2079,30 @@ describe('owner-listed administrative cancellation (owner amendment j-1117)', ()
       api.registerAgent({ id: 'durable-stream', role: 'minion', jobId: durableId });
       api.setAgentState('durable-stream', 'streaming');
       expect(refusalOf(() => api.adminCancelListedParkedJob(cancelRequest(durableId), null)).code).toBe('live-work');
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('the PR closeout form shares the authoritative runtime fence (ledger idle + open turn refuses)', () => {
+    const { api, db, dir } = freshDb();
+    try {
+      parkedPrJob(api, 'probe-closeout');
+      api.registerAgent({ id: 'closeout-idle-open', role: 'minion', jobId: 'probe-closeout' });
+      api.setAgentState('closeout-idle-open', 'idle');
+      const probe = {
+        liveHandleIds: new Set<string>(),
+        supervisionFor: (agentId: string) =>
+          agentId === 'closeout-idle-open'
+            ? { state: 'watching', breakerOpen: false, openTurn: true, openControl: false, openToolCalls: 0 }
+            : null,
+      };
+      const refused = refusalOf(() => api.adminCloseParkedJob(closeoutRequest('probe-closeout'), probe));
+      expect(refused.name).toBe('AdminCloseoutRefusal');
+      expect(refused.code).toBe('live-work');
+      expect(refused.message).toContain('closeout-idle-open');
+      expect(api.getJob('probe-closeout')?.status).toBe('parked');
     } finally {
       db.close();
       rmSync(dir, { recursive: true, force: true });
@@ -2146,9 +2180,29 @@ describe('owner-listed administrative cancellation (owner amendment j-1117)', ()
     }
   });
 
-  it('pins the exact 17-job owner allowlist and lists every id in the operator runbook', () => {
-    expect(OWNER_CANCELLATION_JOB_IDS).toHaveLength(17);
-    expect(new Set(OWNER_CANCELLATION_JOB_IDS).size).toBe(17);
+  it('pins the exact 17-job owner allowlist, its ruling, and every id in the operator runbook', () => {
+    // The literal list is a drift pin: allowlist edits must update both the
+    // frozen source list and this assertion deliberately.
+    expect(OWNER_CANCELLATION_JOB_IDS).toEqual([
+      'gc-freeze-heat-evidence',
+      'silas-context-rotation',
+      'pr135-r12-review-blind-hunter-7465b69',
+      'repo-status-mockups',
+      'abort-evidence-verification',
+      'abort-evidence-edge',
+      'pr142-verification-bounded-20260930',
+      'dashboard-header-mockups',
+      'pr151-independent-blind-90ab1b4-20261001',
+      'pr142-whole-adversarial-09ed-20261002-admission2',
+      'pr142-whole-adversarial-09ed-fresh-after-length-20261002',
+      'continuous-followthrough-gap-audit-20261002',
+      'perkins-abort-census-20261002',
+      'pr148-whole-adversarial-900-20261003',
+      'pr148-whole-edge-900-20261003',
+      'pr148-whole-verification-900-20261003',
+      'pr144-review-packet-recovery-743b57e-20261003',
+    ]);
+    expect(OWNER_CANCELLATION_RULING).toBe('j-1117');
     const runbook = readFileSync(join(import.meta.dirname, '..', 'docs', 'OPERATIONS.md'), 'utf8');
     for (const id of OWNER_CANCELLATION_JOB_IDS) {
       expect(runbook, id).toContain(`\`${id}\``);

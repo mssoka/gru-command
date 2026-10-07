@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer, type Server as HttpServer } from 'node:http';
@@ -515,7 +515,7 @@ describe('board server — HTTP API', () => {
         liveHandleIds: new Set<string>(),
         supervisionFor: (agentId: string) =>
           agentId === 'probe-idle-open'
-            ? { state: 'streaming', breakerOpen: false, openTurn: true, openControl: false, openToolCalls: 0 }
+            ? { state: 'watching', breakerOpen: false, openTurn: true, openControl: false, openToolCalls: 0 }
             : null,
       }),
     });
@@ -537,6 +537,21 @@ describe('board server — HTTP API', () => {
     } finally {
       await local.close();
     }
+  });
+
+  it('the main assembly wires the authoritative closeout runtime probe (assembly alarm)', () => {
+    // The behavior has unit coverage but the production composition does
+    // not: dropping this wiring would silently fall back to durable markers
+    // only and no behavioral test would fail (same alarm pattern as the
+    // supervisor-stop wiring pin).
+    const mainSource = readFileSync(join(import.meta.dirname, '..', 'src', 'main.ts'), 'utf8');
+    const start = mainSource.indexOf('closeoutRuntime:');
+    expect(start, 'main.ts declares closeoutRuntime').toBeGreaterThanOrEqual(0);
+    const block = mainSource.slice(start, start + 900);
+    expect(block).toContain('registry.listHandles()');
+    expect(block).toContain('supervisorLive.viewFor(agentId)');
+    expect(block).toContain('openTurn');
+    expect(block).toContain('openToolCalls');
   });
 
   it('write endpoints reject bad bodies and missing entities', async () => {

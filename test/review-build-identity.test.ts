@@ -41,6 +41,10 @@ function copyTree(source: string, destination: string): void {
       return;
     } catch {
       // Clone unsupported (different volume/filesystem) — portable copy.
+      // A partially-written clone must not be re-copied into (that is
+      // exactly the copy-into/nesting ambiguity this helper avoids).
+      rmSync(destination, { recursive: true, force: true });
+      mkdirSync(destination, { recursive: true });
     }
   }
   for (const entry of readdirSync(source)) {
@@ -51,13 +55,15 @@ function copyTree(source: string, destination: string): void {
 /** macOS marks every npm-installed file with a provenance xattr whose
  * per-file verification makes tree walks an order of magnitude slower on
  * this host; the identity walk only hashes file bytes and metadata, so
- * clearing them on the private copy changes nothing it verifies. */
+ * clearing them on the private copy changes nothing it verifies. A
+ * missing xattr tool is tolerable; any other failure is loud. */
 function clearProvenanceXattrs(destination: string): void {
   if (process.platform !== 'darwin') return;
   try {
     execFileSync('xattr', ['-cr', destination], { stdio: 'ignore' });
-  } catch {
-    // best effort: absence of the tool is not a test failure
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return; // tool absent
+    throw error;
   }
 }
 

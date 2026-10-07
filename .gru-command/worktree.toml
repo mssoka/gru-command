@@ -562,7 +562,8 @@ working-flavor-browser = "cd web && node ../node_modules/typescript/bin/tsc --no
 # records the latest snapshot location.
 working-flavor-catalog-baseline = 'set -e; base=9bb51b05af5d8f0a0cd389788d1d3f19607d5361; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-working-flavor-catalog.XXXXXX"); git archive "$base" | tar -x -C "$d"; git show "$headrev":web/src/lib/working-flavor.test.ts > "$d/web/src/lib/working-flavor.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; ln -s "$root/web/node_modules" "$d/web/node_modules"; printf "%s base=%s head=%s\n" "$d" "$base" "$headrev" > "$prep/working-flavor-catalog-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; cd web; set +e; npx vitest run src/lib/working-flavor.test.ts; code=$?; set -e; echo "working-flavor-catalog-baseline vitest exit=$code (EXPECTED-NONZERO: new catalog assertions vs pre-change base)"; if [ "$code" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: baseline passed unexpectedly"; fi; exit 1'
 
-# Parked PR administrative-closeout lane (owner stop exception j-1115/j-1116):
+# Parked PR administrative-closeout + owner-cancellation lane (owner stop
+# exception j-1115, continuation j-1116, owner amendment j-1117):
 # the touched ledger machine, the authenticated closeout endpoint, the
 # terminal PR projection and the recomputed suite pins — invoked only via
 # the authenticated /api/verify scheduler at unchanged budgets/thresholds,
@@ -577,9 +578,3 @@ parked-closeout-static = "node tools/patch-vitest-rpc-timeout.mjs && npm run lin
 # plain vitest invocations at unchanged budgets, RPC patch first.
 parked-closeout-repair = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/review-inputs-wave.test.ts && npx vitest run test/review-build-identity.test.ts test/review-inputs-handoff.test.ts"
 repair-fast-phase = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run"
-
-# Verification-repair diagnostics for the identity fixture's build
-# failure (owner correction): the root build itself, and an isolated
-# reproduction of the fixture's build with its cwd/prefix/stderr exposed.
-repair-root-build = "npm run build"
-repair-fixture-diag = "node -e \"const fs=require('node:fs');const path=require('node:path');const os=require('node:os');const cp=require('node:child_process');const source=process.cwd();const root=fs.mkdtempSync(path.join(os.tmpdir(),'diag-build-'));const build=path.join(root,'build');for(const p of ['src','tools','resources','roles','package.json','package-lock.json','tsconfig.json'])fs.cpSync(path.join(source,p),path.join(build,p),{recursive:true});fs.symlinkSync(path.join(source,'node_modules'),path.join(build,'node_modules'),'dir');console.log('BUILD_DIR',build);console.log('NPM_PREFIX',cp.execFileSync('npm',['prefix'],{cwd:build,encoding:'utf8'}).trim());console.log('PWD_ENV',process.env.PWD);console.log('PKG_HASH',require('node:crypto').createHash('sha256').update(fs.readFileSync(path.join(build,'package.json'))).digest('hex'));try{const out=cp.execFileSync('npm',['run','build'],{cwd:build,encoding:'utf8',timeout:180000});console.log('BUILD_OK');console.log(out.split('\\n').slice(-6).join(' | '));}catch(e){console.log('BUILD_FAIL');console.log('stderr:',String(e.stderr||'').slice(-4000));console.log('stdout:',String(e.stdout||'').slice(-1500));}\""
