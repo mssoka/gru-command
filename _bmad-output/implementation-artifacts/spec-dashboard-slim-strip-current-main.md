@@ -100,6 +100,29 @@ Port map (source `4de42d9` → destination current main `49b558f`):
 
 ## Review Triage Log
 
+Round 1 (whole-change, three tracked lenses) reviewed `6e48023cfba4eade8130548cd31e28d5359f3f42`: blind-hunter 12 findings, edge-case-hunter 5, verification-gap 5 + 1 other. Every finding below was verified against the reviewed code; no `intent_gap` or `bad_spec` entry (code/tests carry each correction), so the round proceeds as patch + explicit re-verification at the fix head.
+
+| # | Finding (surface) | Verdict | Route / evidence |
+|---|---|---|---|
+| 1 | BH1 + EC3 + EC4 + VG-other — trackers `titleAttr` no longer rendered (`board.ts` stripGroupsNode) | medium | patch: `groups.title = trackers.titleAttr` + unit assertion. The old chip's aggregate tone class is intentionally retired (its components carry their own tones on the ALERTS pair and the Jev chip); tooltip is restored, so the "existing title text preserved" claim is true again. |
+| 2 | BH2 — deferred-only wakes rendered "last wake unknown" (`board.ts` renderTrackers) | medium | patch: the no-wakes branch now triggers on `count 0 + no/invalid stamp` regardless of deferrals; the deferred tally appends beside it in text and title. Unit case added; e2e expectation corrected. |
+| 3 | BH3 + BH9(scope) + VG1 — migrated smoke suite executed by no scope; frozen theme goldens stale (repo browser gate red) | high | patch done in-loop: `strip-smoke` + `strip-themes(-update)` scopes added; the four goldens regenerated, visually inspected (mock+real, light+dark) and committed at `ee0f24a`; `strip-themes` and `strip-smoke` GREEN at that head. Re-verified at the fix head. |
+| 4 | BH4 — wrapped CHILDREN group takes a stray left border / loses its row separator (`components.css`) | low | patch: `:nth-child(3n+1):not(:first-child)` row-separator rule in the 640px container; e2e computed-border assertions on the 4-group layout. |
+| 5 | BH5 — deferred-count slot not covered by geometry | medium | patch: `.board-wakes__deferred` added to the measured slot set; 999→1000 pairwise geometry case added to the deferred e2e test. |
+| 6 | BH6 — "one font, two floors" rationale mismatch (`4ch+1px` vs `4ch+1em`) | false | The claimed bad outcome (undetected 999→1000 growth in the sans strip slots, or user-visible dead space) is disproven at the reviewed head: every boundary pair, including those sans slots, measured equal boxes at 1440/1200/768/360; the band floor is invisible block padding. No shipped behavior follows from the comment wording. |
+| 7 | BH7 — A1 scoping probe skips `min-width` | low | patch: `expect(probe.minWidth).toBe('auto')` — the probe now fails on a global min-width leak too. |
+| 8 | BH8 — contrast targets omit flag pills / group labels / detail meta | medium | patch: targets extended (flag text, group name+unit, detail meta+notice). Offline WCAG check of the actual tokens: flag 7.81/6.08, unit 5.04/5.82, detail meta 4.98/5.50 (light/dark) — the scheduled run re-verifies in-browser. |
+| 9 | BH9 + VG2 — mock smoke assertions pass on hidden collapse content | medium | patch: the smoke FOR YOU test now asserts collapsed-first, reveals each row, asserts `aria-expanded`, visible detail and visible consequence/evidence. |
+| 10 | BH10 — duplicate nested `aria-label`, h3-before-h2 group heads, N identical disclosure names | low | patch: inner `aria-label` removed (the rail already carries it); group heads are `h2` (as in the approved reference); each disclosure gets `aria-label="Review decision: <row title>"`. |
+| 11 | BH11 + EC2 — duplicate actionIds would collide region ids/focus | false | Not reachable: ack rows are keyed by ledger notification ids (primary keys) and PR rows one per projected jobId, with distinct `owner-ack:`/`owner-pr:` prefixes; the renderer contract assumes the snapshot's key uniqueness, and guards for an unreachable state are the rejected-complexity case. |
+| 12 | BH12 — chained-optional silas assertion passes on `undefined` | low | patch: non-null assertion first, then numeric-content assertion. |
+| 13 | EC1 + EC5 — focus falls to `<body>` when the focused owner control vanishes (settled/window-pushed row) | medium | patch: `refocusAction` returns a boolean; when the exact control is gone, focus moves to the older-pending control, else the first remaining band control; unit assertion on the window-push path. |
+| 14 | VG3 — bell-panel fail-closed URL branch untested | low | patch: unsafe-URL panel render asserted (no anchor, "PR link unavailable") in the surface-scoping test. |
+| 15 | VG4 — retire-on-removal unasserted | medium | patch: re-added same-id row asserts fresh collapsed state and a new region id (no resurrected lookalike). |
+| 16 | VG5 — pair/flag `titleAttr` unasserted | low | patch: deploy pair + flag title assertions added. |
+
+Named checks (not findings): the two baselines overlay final test bytes on base `49b558f` and leave exits unmasked — both RED by feature absence (23 assertion-level failures + 1 missing-export TypeError inside a test; recorded as the honest consequence of the feature's absence, matching the original lane's accepted baseline shape). Dark-theme geometry runs light-only in the boundary loop; the dark coverage is the contrast assertions plus the inspected dark captures at all four widths.
+
 ## Design Notes
 
 - Numeric slots: number part only carries `.num` (`font-variant-numeric: tabular-nums; display:inline-block; text-align:right`), scoped to `#chip-rail`/`#board-owner` so unrelated surfaces keep app defaults (probe-tested). The e2e suite measures geometry; CSS only declares.

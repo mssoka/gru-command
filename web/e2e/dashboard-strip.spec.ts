@@ -465,6 +465,7 @@ async function geometry(page: Page, opts: { expectOlder?: boolean } = {}): Promi
             pick('.strip-flag__num'),
             pick('.strip-flag__txt'),
             positive(need(rail, '.board-wakes__count'), '.board-wakes__count'),
+            pick('.board-wakes__deferred'),
             positive(need(rail, '.board-age-split__num'), '.board-age-split__num'),
             positive(need(rail, '.board-age-split__lead'), '.board-age-split__lead'),
             positive(need(rail, '.board-age-split__unit'), '.board-age-split__unit'),
@@ -1193,11 +1194,16 @@ test('essential text and numbers hold >=4.5:1 contrast in both themes', async ({
       const targets: Record<string, string> = {
         statusKey: '.strip-pair[data-chip="deploy"] .strip-key',
         statusValue: '.strip-pair[data-chip="deploy"] .strip-value__num',
+        flagText: '.strip-flag__txt',
         kpiKey: '.strip-kpi__k',
         kpiNum: '.strip-kpi__num',
+        groupName: '.strip-group__name',
+        groupUnit: '.strip-group__unit',
         wakeCount: '.board-wakes__count',
         ownerTitle: '.board-owner__title',
         ownerNext: '.board-owner__next',
+        detailMeta: '.board-owner__detail-meta',
+        detailNotice: '.board-owner__detail-notice',
         bandCount: '.board-band__count',
       };
       return Object.fromEntries(Object.entries(targets).map(([k, s]) => [k, Math.round(ratioOf(s) * 100) / 100]));
@@ -1249,6 +1255,21 @@ test('CHILDREN group appears only when the server reported counters (absent is n
   await expect(children.locator('[data-kpi="children.queued"]')).toHaveText('3');
   await expect(children.locator('[data-kpi="children.finished"]')).toHaveText('5');
   await expect(children.locator('[data-kpi="children.lifetimeCreations"]')).toHaveText('10');
+  // The wrapped 4th group gets a row separator, not a stray left border
+  // at the container edge; the in-row separator stays on its neighbours.
+  const separators = await page.evaluate(() => {
+    const groups = [...document.querySelectorAll<HTMLElement>('#chip-rail .strip-group')];
+    const read = (el: Element | undefined): { left: string; top: string } => {
+      if (!el) throw new Error('missing group');
+      const s = getComputedStyle(el);
+      return { left: s.borderLeftWidth, top: s.borderTopWidth };
+    };
+    return { first: read(groups[0]), second: read(groups[1]), wrapped: read(groups[3]) };
+  });
+  expect(separators.first.left).toBe('0px');
+  expect(separators.second.left).toBe('2px');
+  expect(separators.wrapped.left).toBe('0px');
+  expect(separators.wrapped.top).toBe('2px');
   // The extra group wraps honestly: no body or rail overflow at phone width.
   await page.setViewportSize({ width: 360, height: 800 });
   const overflow = await page.evaluate(
@@ -1281,12 +1302,21 @@ test('deferred Gru wakes stay visible beside count and age (issue #219)', async 
   await send(makeSnapshot(slotSpec({ wakes: 4, gruWakeAgeMs: 300_000, deferredCount: 3, deferredTruncated: true })));
   await expect(wakes).toContainText('3 deferred+');
   await expect(wakes).toHaveAttribute('title', /tally truncated at the scan cap/);
-  // Deferred-only (zero fired wakes, no stamp): the honest empty still shows
-  // the deferred demand beside an explicit last-wake-unknown.
+  // The deferred number rides the same reserved slot across its own
+  // digit boundaries: nothing in the chip moves at 999→1000.
+  await send(makeSnapshot(slotSpec({ wakes: 4, gruWakeAgeMs: 300_000, deferredCount: 999 })));
+  await expect(wakes.locator('.board-wakes__deferred')).toHaveText('999');
+  const deferred999 = await geometry(page);
+  await send(makeSnapshot(slotSpec({ wakes: 4, gruWakeAgeMs: 300_000, deferredCount: 1000 })));
+  await expect(wakes.locator('.board-wakes__deferred')).toHaveText('1000');
+  const deferred1000 = await geometry(page);
+  comparePairwise(deferred999, deferred1000);
+  // Deferred-only (zero fired wakes, no stamp): the honest no-wakes state
+  // still shows the deferred demand — never a fabricated "unknown" time.
   await send(makeSnapshot(slotSpec({ wakes: 0, gruWakeAgeMs: null, deferredCount: 1 })));
-  await expect(wakes).toContainText('0 wakes');
-  await expect(wakes).toContainText('last wake unknown');
+  await expect(wakes).toContainText('no wakes yet');
   await expect(wakes).toContainText('1 deferred');
+  await expect(wakes).not.toContainText('last wake unknown');
 });
 
 /** Gate F visual evidence: real captures of the synthetic fixture at all
@@ -1335,7 +1365,9 @@ test('A1: the reserved numeric slot is scoped — an unrelated surface keeps the
   // The approved surface DOES reserve the numeric slot.
   expect(styles.strip.display).toBe('inline-block');
   expect(parseFloat(styles.strip.minWidth)).toBeGreaterThan(0);
-  // The unrelated surface keeps its natural inline display — on the
-  // unscoped baseline the global rule would have made it inline-block.
+  // The unrelated surface keeps its natural inline display AND its
+  // default min-width — on the unscoped baseline the global rule would
+  // have made it inline-block and reserved 4ch.
   expect(styles.probe.display).toBe('inline');
+  expect(styles.probe.minWidth).toBe('auto');
 });

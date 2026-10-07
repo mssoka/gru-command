@@ -502,6 +502,14 @@ body {
     border-top: 0;
     border-left: 2px solid var(--line);
   }
+
+  /* A 4th group (CHILDREN) wraps to a second grid row: the row's first
+     item gets a row separator instead of a stray left border at the
+     container edge (3-column grid; items 4, 7, … start a new row). */
+  .strip-group:nth-child(3n + 1):not(:first-child) {
+    border-left: 0;
+    border-top: 2px solid var(--line);
+  }
 }
 
 .app-main {

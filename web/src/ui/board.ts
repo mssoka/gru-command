@@ -508,7 +508,16 @@ export class BoardView {
         mount.append(more);
       }
     }
-    if (focusId !== null) this.refocusAction(focusId, focusControl);
+    if (focusId !== null) {
+      // The exact control is gone (row settled, or pushed outside the
+      // older-pending window): focus must land on an intentional band
+      // target, never fall to <body> — the +N older-pending control when
+      // present, else the first remaining band control.
+      if (!this.refocusAction(focusId, focusControl)) {
+        (mount.querySelector<HTMLElement>('.board-band__more') ??
+          mount.querySelector<HTMLElement>('[data-action-id]'))?.focus();
+      }
+    }
   }
 
   /** Collision-free DOM identity: region ids are ALLOCATED per action id
@@ -523,23 +532,27 @@ export class BoardView {
     return id;
   }
 
-  private refocusAction(actionId: string, control: string): void {
+  private refocusAction(actionId: string, control: string): boolean {
     for (const node of this.ownerMount.querySelectorAll<HTMLElement>('[data-action-id]')) {
       if (node.dataset.actionId === actionId && (node.dataset.control ?? '') === control) {
         node.focus();
-        return;
+        return true;
       }
     }
+    return false;
   }
 
   /** The reveal-only disclosure control: toggles local visibility keyed by
    * stable action id and sends NO request — reviewing never acks,
    * approves, re-arms, or clears a pending count. */
-  private ownerDiscloseNode(actionId: string): HTMLElement {
+  private ownerDiscloseNode(actionId: string, label: string): HTMLElement {
     const disclose = document.createElement('button');
     disclose.type = 'button';
     disclose.className = 'board-owner__disclose';
     disclose.textContent = 'Review decision';
+    // Unique accessible name per row: N indistinguishable "Review decision"
+    // buttons are not usable in a screen reader's control list.
+    disclose.setAttribute('aria-label', `Review decision: ${label}`);
     disclose.dataset.actionId = actionId;
     disclose.dataset.control = 'disclose';
     disclose.setAttribute('aria-controls', this.ownerRegionId(actionId));
@@ -574,7 +587,7 @@ export class BoardView {
       document.createTextNode(` ${ackNextStep(item.kind)}`),
     );
     face.append(next);
-    node.append(face, this.ownerDiscloseNode(row.actionId));
+    node.append(face, this.ownerDiscloseNode(row.actionId, item.title));
     // Expanded region: authoritative metadata, the complete original
     // detail (verbatim, rendered as text), and the full consequence
     // directly beside the Ack control — consequences stay visible before
@@ -670,7 +683,7 @@ export class BoardView {
     );
     face.append(next);
     const actions = el('div', 'board-owner__actions');
-    actions.append(this.ownerDiscloseNode(row.actionId));
+    actions.append(this.ownerDiscloseNode(row.actionId, pr.jobTitle));
     const href = safePrUrl(pr.prUrl);
     if (href !== null) {
       // OPEN PR is an external link, not an in-app merge. Nothing here
@@ -717,7 +730,6 @@ export class BoardView {
     const chips = railChips(snapshot);
     this.chipRail.replaceChildren();
     const row = el('div', 'strip-status');
-    row.setAttribute('aria-label', 'System status');
     for (const chip of chips) {
       if (chip.id !== 'trackers') row.append(this.statusPairNode(chip));
     }
@@ -774,10 +786,13 @@ export class BoardView {
     const groups = el('div', 'strip-groups');
     if (trackers === null) return groups;
     groups.dataset.chip = 'trackers';
+    // The chip's long-form explanation survives the re-face (preserved
+    // title text): hover/AT users keep the Heists/PRs/minions + Jev fact.
+    groups.title = trackers.titleAttr;
     for (const group of trackers.kpis ?? []) {
       const groupNode = el('section', `strip-group strip-group--${STRIP_GROUP_TONE[group.label] ?? 'park'}`);
       groupNode.setAttribute('aria-label', group.title);
-      const head = el('h3', 'strip-group__head');
+      const head = el('h2', 'strip-group__head');
       const mark = el('span', 'strip-group__mark');
       mark.setAttribute('aria-hidden', 'true');
       head.append(mark, el('span', 'strip-group__name', group.label));
@@ -848,9 +863,12 @@ export class BoardView {
     const stamp = wakes.lastAt;
     const parsed =
       stamp !== null && stamp !== '' && !Number.isNaN(Date.parse(stamp)) ? stamp : null;
+    // 0 + no/invalid stamp is the honest no-wakes state even when avoidances
+    // are tallied alongside it: no wake ever fired, so the fire time is not
+    // "unknown" — the deferred demand is an additional, separate fact.
     this.wakesChip.hidden = false;
     this.wakesChip.replaceChildren();
-    if (wakes.count === 0 && parsed === null && deferredCount === 0) {
+    if (wakes.count === 0 && parsed === null) {
       this.wakesChip.append(
         document.createTextNode('⚡ no wakes yet · '),
         el('span', 'num board-wakes__count', '0'),
@@ -869,20 +887,20 @@ export class BoardView {
         this.wakesChip.append(el('span', 'board-wakes__unknown', 'last wake unknown'));
         this.wakesChip.title = `${wakes.count} autonomous Gru wake turn${wakes.count === 1 ? '' : 's'} opened; last wake time unknown.`;
       }
-      if (deferredCount > 0) {
-        this.wakesChip.append(
-          document.createTextNode(' · '),
-          el('span', 'num board-wakes__deferred', String(deferredCount)),
-          document.createTextNode(` deferred${deferred?.truncated === true ? '+' : ''}`),
-        );
-        this.wakesChip.title +=
-          ` ${deferredCount}${deferred?.truncated === true ? '+' : ''} wake demand${deferredCount === 1 ? '' : 's'} deferred (avoided): ` +
-          Object.entries(deferred?.reasons ?? {})
-            .sort(([a], [b]) => b.localeCompare(a))
-            .map(([reason, n]) => `${n} ${reason}`)
-            .join(', ') +
-          (deferred?.truncated === true ? ' — tally truncated at the scan cap' : '');
-      }
+    }
+    if (deferredCount > 0) {
+      this.wakesChip.append(
+        document.createTextNode(' · '),
+        el('span', 'num board-wakes__deferred', String(deferredCount)),
+        document.createTextNode(` deferred${deferred?.truncated === true ? '+' : ''}`),
+      );
+      this.wakesChip.title +=
+        ` ${deferredCount}${deferred?.truncated === true ? '+' : ''} wake demand${deferredCount === 1 ? '' : 's'} deferred (avoided): ` +
+        Object.entries(deferred?.reasons ?? {})
+          .sort(([a], [b]) => b.localeCompare(a))
+          .map(([reason, n]) => `${n} ${reason}`)
+          .join(', ') +
+        (deferred?.truncated === true ? ' — tally truncated at the scan cap' : '');
     }
   }
 

@@ -580,18 +580,35 @@ test.describe('board (E6, mock feed)', () => {
     await expect(band.locator('.board-band__count')).toHaveText('3 pending');
     const providerStop = band.locator('.board-owner__row', { hasText: 'Agent mock-minion-quota stopped: quota wall' });
     await expect(providerStop).toBeVisible();
+    // Rows are collapsed by default: the reveal-only disclosure fronts the
+    // explicit Ack control, and the complete consequence copy rides the
+    // expanded region — never available before reveal.
+    const providerDetail = providerStop.locator('.board-owner__detail');
+    await expect(providerDetail).toBeHidden();
+    await providerStop.locator('[data-control="disclose"]').click();
+    await expect(providerStop.locator('[data-control="disclose"]')).toHaveAttribute('aria-expanded', 'true');
+    await expect(providerDetail).toBeVisible();
+    await expect(providerStop.locator('.board-owner__ack')).toBeVisible();
     await expect(providerStop.locator('.board-owner__ack')).toHaveText('Ack');
-    // The owner stop carries its Ack control and the honest scope copy.
+    // The owner stop carries its Ack control and the honest scope copy —
+    // visible only after the reveal; the disclosure itself never acks.
     const stop = band.locator('.board-owner__row', { hasText: 'Crash-loop breaker tripped' });
     await expect(stop).toBeVisible();
+    await expect(stop.locator('.board-owner__detail')).toBeHidden();
+    await stop.locator('[data-control="disclose"]').click();
+    await expect(stop.locator('.board-owner__detail')).toBeVisible();
+    await expect(stop.locator('.board-owner__ack')).toBeVisible();
     await expect(stop.locator('.board-owner__ack')).toHaveText('Ack');
-    await expect(stop).toContainText('does NOT clear code/test/review holds');
-    // The ready PR row: exact-head reason + OPEN PR as an external link
-    // (never an in-app merge button).
+    await expect(stop.locator('.board-owner__detail')).toContainText('does NOT clear code/test/review holds');
+    // The ready PR row: exact-head evidence behind the disclosure; OPEN PR
+    // stays an external link beside the face (never an in-app merge button).
     const pr = band.locator('.board-owner__row--pr', { hasText: 'Fix the payment retry loop' });
     await expect(pr).toBeVisible();
     await expect(pr).toContainText('ready for you');
-    await expect(pr).toContainText('CI green');
+    await expect(pr.locator('.board-owner__detail')).toBeHidden();
+    await pr.locator('[data-control="disclose"]').click();
+    await expect(pr.locator('.board-owner__detail')).toBeVisible();
+    await expect(pr.locator('.board-owner__detail')).toContainText('CI green');
     const open = pr.locator('.board-owner__open');
     await expect(open).toHaveText('OPEN PR ↗');
     await expect(open).toHaveAttribute('href', 'https://example.invalid/pr/41');

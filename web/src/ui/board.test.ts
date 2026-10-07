@@ -109,7 +109,7 @@ function snapshot(
     selfHeal?: SelfHealView | null;
     repos?: readonly { readonly name: string; readonly jobs: readonly JobView[] }[];
     unackedNeedsOwner?: number;
-    wakes?: { readonly count: number; readonly lastAt: string | null };
+    wakes?: BoardSnapshot['wakes'];
     ownerPrs?: NonNullable<BoardSnapshot['ownerPrs']>;
     pipeline?: NonNullable<BoardSnapshot['pipeline']>;
     children?: BoardSnapshot['children'];
@@ -512,6 +512,10 @@ describe('board v7 — slim status strip (pill rail replaced)', () => {
     expect(deploy?.querySelector('.strip-value__num')?.textContent).toBe('43');
     expect(deploy?.querySelector('.strip-value')?.textContent?.replace(/\s+/g, ' ').trim()).toBe('43 behind');
     expect(deploy?.querySelector('.strip-flag__txt')?.textContent).toBe('RESTART PENDING');
+    // Preserved title text: the pair AND its flag carry the card's full
+    // explanation for hover/AT users.
+    expect(deploy?.title).toContain('rebuild + restart');
+    expect(deploy?.querySelector('.strip-flag')?.getAttribute('title')).toContain('rebuild + restart');
   });
 
   it('renders n/a honestly for unwired sources (verify queue, cure efficacy)', () => {
@@ -607,6 +611,8 @@ describe('board v7 — slim status strip (pill rail replaced)', () => {
     );
     expect(groupNames).toEqual(['HEISTS', 'PRS', 'CREW']);
     expect(groupNames.some((text) => text.includes('MINIONS'))).toBe(false);
+    // The trackers chip's long-form explanation survives the re-face.
+    expect(document.querySelector<HTMLElement>('.strip-groups')?.title).toContain('Jev decision routing');
   });
 
   it('keeps the Jev chip; the needs-Gru number renders once, on the ALERTS pair', () => {
@@ -686,6 +692,16 @@ describe('board v7 — slim status strip (pill rail replaced)', () => {
     view.render(snapshot({ wakes: { count: 3, lastAt: 'not-a-timestamp' } }));
     expect(wakes?.textContent).toContain('last wake unknown');
     expect(wakes?.title).toContain('last wake time unknown');
+    // 0 + no stamp WITH deferred demand: still the honest no-wakes state —
+    // no fire time exists, so it is not "unknown"; the deferred tally is a
+    // separate fact beside it.
+    view.render(
+      snapshot({ wakes: { count: 0, lastAt: null, deferred: { count: 2, reasons: { 'quiet-hours': 2 } } } }),
+    );
+    expect(wakes?.textContent).toContain('no wakes yet');
+    expect(wakes?.textContent).toContain('2 deferred');
+    expect(wakes?.textContent).not.toContain('last wake unknown');
+    expect(wakes?.title).toContain('deferred (avoided)');
     // Silas stays independent: its pair shows its own wake, never Gru's.
     view.render(
       snapshot({
@@ -696,7 +712,10 @@ describe('board v7 — slim status strip (pill rail replaced)', () => {
     const silas = document.querySelector<HTMLElement>('.strip-pair[data-chip="silas"]');
     expect(silas?.textContent).toContain('wake');
     expect(silas?.textContent).not.toContain('last wake unknown');
-    expect(silas?.querySelector('.strip-value__num')?.textContent).not.toBe('0');
+    const silasNum = silas?.querySelector('.strip-value__num');
+    expect(silasNum).not.toBeNull();
+    expect(silasNum?.textContent).not.toBe('0');
+    expect(silas?.querySelector('.strip-value__num')?.textContent).toMatch(/^\d+$/);
   });
 
   it('includes the CHILDREN group when the server reported counters and omits it when absent', () => {
@@ -2793,6 +2812,14 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(finalA.getAttribute('aria-controls')).toBe(idA);
     expect(finalA.getAttribute('aria-expanded')).toBe('true');
     expect(rowsFinal[0]!.querySelector<HTMLElement>('.board-owner__detail')?.hidden).toBe(false);
+    // B returns as a NEW pending row: the retired identity is gone, so the
+    // fresh row starts collapsed and allocates a NEW region id — never a
+    // resurrected lookalike carrying the dead row's state.
+    view.render(snapshot({ notifications: [stopA, stopB] }));
+    const readdedB = document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('[data-action-id="owner-ack:keep-b"][data-control="disclose"]')!;
+    expect(readdedB.getAttribute('aria-controls')).not.toBe(idB);
+    expect(readdedB.getAttribute('aria-expanded')).toBe('false');
+    expect(readdedB.closest('.board-owner__row')?.querySelector<HTMLElement>('.board-owner__detail')?.hidden).toBe(true);
   });
 
   it('a row pushed OUTSIDE the older-pending window keeps its identity and disclosure state', () => {
@@ -2806,6 +2833,7 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     const target = band.querySelector<HTMLButtonElement>('[data-action-id="owner-ack:win-00"][data-control="disclose"]')!;
     const hiddenId = target.getAttribute('aria-controls');
     target.click();
+    target.focus();
     expect(target.getAttribute('aria-expanded')).toBe('true');
     // Newer obligations arrive: win-00 falls OUTSIDE the visible six.
     const newer = Array.from({ length: 3 }, (_, i) =>
@@ -2815,6 +2843,9 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     const bandAfter = document.getElementById('board-owner')!;
     expect(bandAfter.querySelectorAll('.board-owner__row')).toHaveLength(6);
     expect(bandAfter.querySelector('[data-action-id="owner-ack:win-00"]')).toBeNull(); // hidden by the window, not retired
+    // The focused control fell OUT of the rendered window: focus moves to
+    // the older-pending control, never silently to <body>.
+    expect(document.activeElement).toBe(bandAfter.querySelector('.board-band__more'));
     // Reveal the older tail: the same row returns with retained id AND state.
     bandAfter.querySelector<HTMLButtonElement>('.board-band__more')!.click();
     const rows = [...document.getElementById('board-owner')!.querySelectorAll<HTMLElement>('.board-owner__row')];
@@ -2884,6 +2915,13 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(document.activeElement).toBe(
       document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('[data-action-id="owner-pr:dual-surface"][data-control="disclose"]'),
     );
+    // Panel fail-closed branch: an unsafe URL never becomes a link there
+    // either (browser defense-in-depth; the server refuses it first).
+    view.render(snapshot({ notifications: [], ownerPrs: [ownerPr('bad-panel', { prUrl: 'javascript:alert(1)' })] }));
+    const badPanel = document.getElementById('notification-list')!.querySelector<HTMLElement>('.board-owner__row--pr');
+    expect(badPanel?.classList.contains('board-owner__row--panel')).toBe(true);
+    expect(badPanel?.querySelector('a')).toBeNull();
+    expect(badPanel?.textContent).toContain('PR link unavailable');
   });
 
   it('g10: an owner row already acked on another device arrives with no toast and no web-toast receipt', () => {
