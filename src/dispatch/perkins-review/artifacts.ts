@@ -638,15 +638,19 @@ export async function probeAdvertisedTipMovementAsync(
 ): Promise<SourceMovement | null> {
   const { targetRef, targetSha } = review.manifest;
   // R6-4: ONE cumulative admission budget across every async step — each
-  // call gets only the remaining time and exhaustion fails closed.
-  const deadline = Date.now() + timeoutMs;
+  // call gets only the remaining time and exhaustion fails closed. The
+  // budget runs on the monotonic clock, which stops while the machine
+  // sleeps: a wall-clock budget spent a 51 s system sleep and refused a
+  // healthy admission (owner incident 2026-10-07).
+  const deadline = performance.now() + timeoutMs;
   const run = async (args: readonly string[]): Promise<string> => {
-    const remaining = deadline - Date.now();
+    const remaining = deadline - performance.now();
     if (remaining <= 0) {
       throw new Error(`admission remote-probe budget exhausted before: git ${args.join(' ')}`);
     }
     const { stdout } = await execFileAsPromised('git', ['-C', review.manifest.repoPath, ...args], {
-      encoding: 'utf8', timeout: remaining, maxBuffer: 1024 * 1024,
+      // execFile rejects a fractional timeout (ERR_OUT_OF_RANGE).
+      encoding: 'utf8', timeout: Math.ceil(remaining), maxBuffer: 1024 * 1024,
     });
     return stdout;
   };
