@@ -100,6 +100,51 @@ function laneAt(path: string, status: WorktreeLane['status'] = 'active'): Worktr
 }
 
 describe('fresh fix worker association', () => {
+  it('releases a paced existing-handle directive when job is binned while queued', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-fix-pacing-bin-'));
+    cleanupDirs.push(dir);
+    const db = new LedgerDb(dir);
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    let holder: Awaited<ReturnType<typeof gate.acquireWorkerTurn>> | null = null;
+    try {
+      const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+      ledger.addJob({ id: 'job-1', repo: 'fixture', title: 'Paced lane' });
+      ledger.setJobStatus('job-1', 'working');
+      ledger.registerAgent({ id: 'idle-implementer', role: 'minion', jobId: 'job-1' });
+      ledger.setAgentState('idle-implementer', 'idle');
+      let prompted = false;
+      const handle = {
+        id: 'idle-implementer', role: 'minion', sessionFile: null,
+        async prompt() { prompted = true; },
+        capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
+        async steer() {}, async followUp() {},
+        subscribe() { return () => {}; },
+        health() { return { state: 'idle' as const, lastActivity: null, sessionFile: null }; },
+        async dispose() {},
+      } satisfies AgentHandle;
+      holder = await gate.acquireWorkerTurn({ id: 'another-job', label: 'holder' });
+      const routing = routeFixDirectiveToMinion({
+        jobId: 'job-1', directive: 'now obsolete', signal: new AbortController().signal,
+        ledger, worktrees: { listWorktrees: () => [laneAt(dir)] } as unknown as WorktreePort,
+        registry: { getHandle: () => handle, spawn: async () => handle, disposeHandle: async () => {} },
+        workerGate: gate,
+      });
+      await vi.waitFor(() => expect(gate.view().worker.queued).toHaveLength(1));
+      ledger.setJobStatus('job-1', 'binned');
+      holder.release();
+      holder = null;
+      await expect(routing).rejects.toThrow(/directive refused.*binned/u);
+      expect(prompted).toBe(false);
+      expect(gate.view().worker).toMatchObject({ running: 0, queued: [] });
+      const next = await gate.acquireWorkerTurn({ id: 'next-job', label: 'not stranded' });
+      next.release();
+      expect(gate.view().worker.running).toBe(0);
+    } finally {
+      holder?.release();
+      db.close();
+    }
+  });
+
   it('refuses a freshly binned lane after asynchronous spawn, disposing before prompt', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'gru-command-fix-bin-race-'));
     cleanupDirs.push(dir);

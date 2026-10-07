@@ -155,11 +155,16 @@ export async function routeFixDirectiveToMinion(
       }
       let promptError: unknown = null;
       let verdict: PromptTurnVerdict | null = null;
-      assertDirectiveJobActive(input.ledger, input.jobId);
       try {
-        verdict = await racedPrompt(handle, directive, input.signal, owner);
-      } catch (error) {
-        promptError = error;
+        // A refusal before prompt is positive no-admission proof, not a
+        // prompt error eligible for retry recovery. It must still release
+        // the pacing lease acquired after the asynchronous wait above.
+        assertDirectiveJobActive(input.ledger, input.jobId);
+        try {
+          verdict = await racedPrompt(handle, directive, input.signal, owner);
+        } catch (error) {
+          promptError = error;
+        }
       } finally {
         // Release before the settlement wait: the retry reacquires the slot.
         lease?.release();
