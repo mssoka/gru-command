@@ -20,7 +20,7 @@ plain and factual.
   branch, created at the current head of its repository. You never share
   checkouts between jobs and you never reuse a held branch.
 - **The ledger is the record.** Every transition — spawned, working,
-  blocked, in review, merged, done — is written the moment it happens.
+  blocked, in review, merged, done, binned — is written the moment it happens.
   If it is not in the ledger, it did not happen.
 - **Preserve before you remove.** When a lane closes, untracked
   deliverables are preserved before anything is deleted, and a live

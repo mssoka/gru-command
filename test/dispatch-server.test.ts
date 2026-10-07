@@ -2169,6 +2169,15 @@ describe('dispatch server (E8)', () => {
         job_id: 'done-job', directive: 'fix it',
       }, TOKEN);
       expect(done.status).toBe(400);
+      // A binned (discarded) lane is terminal too — no directive intent.
+      h.ledger.addJob({ id: 'binned-job', repo: 'nowhere', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('binned-job', 'working');
+      h.ledger.setJobStatus('binned-job', 'binned');
+      const discarded = await call(h.port, 'POST', '/api/silas/directive', {
+        job_id: 'binned-job', directive: 'fix it',
+      }, TOKEN);
+      expect(discarded.status).toBe(400);
+      expect(field<string>(discarded.json, 'detail')).toMatch(/terminal lanes take no directives/u);
       // unknown job id fails loud
       const unknown = await call(h.port, 'POST', '/api/silas/directive', {
         job_id: 'no-such-job', directive: 'fix it',
@@ -2303,6 +2312,13 @@ describe('dispatch server (E8)', () => {
       const terminal = await call(h.port, 'POST', '/api/silas/rebrief', { job_id: 'done-rebrief', note: 'x' }, TOKEN);
       expect(terminal.status).toBe(400);
       expect(field<string>(terminal.json, 'detail')).toContain('terminal lanes are never re-briefed');
+      // A binned (discarded) lane refuses the re-brief the same way.
+      h.ledger.addJob({ id: 'binned-rebrief', repo: 'nowhere', title: 't', briefing: 'b' });
+      h.ledger.setJobStatus('binned-rebrief', 'working');
+      h.ledger.setJobStatus('binned-rebrief', 'binned');
+      const discardedRebrief = await call(h.port, 'POST', '/api/silas/rebrief', { job_id: 'binned-rebrief', note: 'x' }, TOKEN);
+      expect(discardedRebrief.status).toBe(400);
+      expect(field<string>(discardedRebrief.json, 'detail')).toContain('terminal lanes are never re-briefed');
 
       // No job lane in the registry: the re-brief must fail loud instead of
       // spawning a fresh worker with nowhere to work.
@@ -2356,6 +2372,45 @@ describe('dispatch server (E8)', () => {
 });
 
 describe('provider pacing worker-gate pass-through on the silas routes (r4 verification#2)', () => {
+  it('terminal jobs refuse binning while a directive intent waits at the worker gate', async () => {
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const h = await boot({ workerGate: gate });
+    const repo = makeFixtureRepo('fixture-silas-bin-directive');
+    cleanupRepos.push(repo);
+    let holder: Awaited<ReturnType<typeof gate.acquireWorkerTurn>> | null = null;
+    try {
+      await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'bin-directive-wait', repo_path: repo.path, title: 'directive lane', briefing: 'b',
+      }, TOKEN);
+      await vi.waitFor(() => expect(gate.view().worker.running).toBe(0));
+      for (const agent of h.ledger.listAgents().filter((row) => row.jobId === 'bin-directive-wait')) {
+        h.ledger.setAgentState(agent.id, 'idle');
+      }
+      holder = await gate.acquireWorkerTurn({ id: 'other-job', label: 'slot holder' });
+      const accepted = await call(h.port, 'POST', '/api/silas/directive', {
+        job_id: 'bin-directive-wait', directive: 'Follow up deliberately.',
+      }, TOKEN);
+      expect(accepted.status).toBe(202);
+      await vi.waitFor(() => expect(gate.view().worker.queued).toHaveLength(1));
+      const before = h.ledger.listJobEvents('bin-directive-wait');
+      expect(() => h.ledger.setJobStatus('bin-directive-wait', 'binned'))
+        .toThrow(/live work|directive/u);
+      expect(h.ledger.listJobEvents('bin-directive-wait')).toEqual(before);
+      holder.release();
+      holder = null;
+      const requestId = field<string>(accepted.json, 'request_id');
+      await vi.waitFor(() => expect(h.ledger.getDirective(requestId)?.state).toBe('settled'));
+      for (const agent of h.ledger.listAgents().filter((row) => row.jobId === 'bin-directive-wait')) {
+        h.ledger.setAgentState(agent.id, 'idle');
+      }
+      h.ledger.setJobStatus('bin-directive-wait', 'binned');
+      expect(h.ledger.getJob('bin-directive-wait')?.status).toBe('binned');
+    } finally {
+      holder?.release();
+      await h.close();
+    }
+  });
+
   it('/api/silas/directive queues at the cap and is admitted on release', async () => {
     const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
     const h = await boot({ workerGate: gate });

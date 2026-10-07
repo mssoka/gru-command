@@ -775,6 +775,7 @@ describe('branch-idle guard', () => {
       ['blocked-pending', [start]],
       ['parked-pending', [start]],
       ['done-pending', [start, delivery, toInReview]],
+      ['binned-pending', [start]],
       ['settled', [start, delivery]],
     ]);
     const pending = new Map<string, PendingRebriefRecord[]>([
@@ -788,6 +789,7 @@ describe('branch-idle guard', () => {
       ['blocked-pending', [pendingMarker('blocked-pending')]],
       ['parked-pending', [pendingMarker('parked-pending')]],
       ['done-pending', [pendingMarker('done-pending')]],
+      ['binned-pending', [pendingMarker('binned-pending')]],
     ]);
     const ledger = {
       listJobs: () => [
@@ -798,6 +800,7 @@ describe('branch-idle guard', () => {
         jobRecord('blocked-pending', 'blocked'),
         jobRecord('parked-pending', 'parked'),
         jobRecord('done-pending', 'done'),
+        jobRecord('binned-pending', 'binned'),
         jobRecord('settled', 'delivered'),
       ],
       latestJobEvent: (jobId: string, kind: string): EventRecord | null =>
@@ -824,6 +827,9 @@ describe('branch-idle guard', () => {
     expect(busy('blocked-pending')).toBe(true);
     expect(busy('parked-pending')).toBe(true);
     expect(busy('done-pending')).toBe(false);
+    // A stale marker on a BINNED (discarded) lane must not resurrect it as
+    // a blocker either — terminal on the same contract.
+    expect(busy('binned-pending')).toBe(false);
   });
 
   it('a pending re-brief refuses the arm before preflight; a late delivery and a partial marker set cannot clear it', async () => {
@@ -1791,7 +1797,10 @@ describe('branch-idle guard', () => {
       await createLaneJob(h, repo, { jobId: 'terminal-done', status: 'delivered' });
       h.ledger.beginPendingRebrief({ jobId: 'terminal-done', note: 'n', briefing: 'b' });
       h.ledger.setJobStatus('terminal-done', 'done');
-      for (const [jobId, status] of [['terminal-merged', 'merged'], ['terminal-done', 'done']] as const) {
+      await createLaneJob(h, repo, { jobId: 'terminal-binned', status: 'delivered' });
+      h.ledger.beginPendingRebrief({ jobId: 'terminal-binned', note: 'n', briefing: 'b' });
+      h.ledger.setJobStatus('terminal-binned', 'binned');
+      for (const [jobId, status] of [['terminal-merged', 'merged'], ['terminal-done', 'done'], ['terminal-binned', 'binned']] as const) {
         const refused = await postReview(h, { job_id: jobId });
         expect(refused.status).toBe(400);
         expect((refused.json as { detail?: string }).detail).toContain(

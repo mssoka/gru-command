@@ -104,7 +104,7 @@ describe('board rail — chips (v6)', () => {
     const trackers = chips.find((chip) => chip.id === 'trackers');
     expect(trackers?.kpis?.map((group) => group.label)).toEqual(['HEISTS', 'PRS', 'CREW', 'CHILDREN']);
     expect(trackers?.kpis?.map((group) => group.title)).toEqual([
-      'working / in-review / merged / done / parked',
+      'working / in-review / merged / done / parked / binned',
       'open / conflicting / merged today',
       'live minions / crew mid-turn / crew disposed',
       'child workers active / queued / finished / created (lifetime logical creations)',
@@ -153,6 +153,7 @@ describe('board rail — chips (v6)', () => {
       'merged',
       'done',
       'parked',
+      'binned',
       'open',
       'conflicting',
       'merged today',
@@ -177,6 +178,7 @@ describe('board rail — chips (v6)', () => {
         job('m1', 'merged', { prUrl: 'https://x/1', prState: 'merged', updatedAt: new Date(NOW).toISOString() }),
         job('d1', 'done'),
         job('p1', 'parked'),
+        job('b1', 'binned'),
         job('i1', 'in-review', { prUrl: 'https://x/2', prState: 'conflicting' }),
         job('o1', 'in-review', { prUrl: 'https://x/3', prState: 'open' }),
       ],
@@ -196,6 +198,8 @@ describe('board rail — chips (v6)', () => {
     expect(values.get('jobs.merged')).toBe(kpis.jobs.merged);
     expect(values.get('jobs.done')).toBe(kpis.jobs.done);
     expect(values.get('jobs.parked')).toBe(kpis.jobs.parked);
+    expect(values.get('jobs.binned')).toBe(1);
+    expect(values.get('jobs.binned')).toBe(kpis.jobs.binned);
     expect(values.get('prs.open')).toBe(kpis.prs.open);
     expect(values.get('prs.conflicting')).toBe(kpis.prs.conflicting);
     expect(values.get('prs.mergedToday')).toBe(kpis.prs.mergedToday);
@@ -214,7 +218,7 @@ describe('board rail — chips (v6)', () => {
     expect(values.get('children.lifetimeCreations')).toBe(10);
 
     // Spot-check the derivation itself so the comparison is not vacuous.
-    expect(values.get('jobs.total')).toBe(8);
+    expect(values.get('jobs.total')).toBe(9);
     expect(values.get('jobs.working')).toBe(2);
     expect(values.get('prs.conflicting')).toBe(1);
     expect(values.get('lanes.liveMinions')).toBe(2);

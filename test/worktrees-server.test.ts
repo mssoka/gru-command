@@ -197,6 +197,20 @@ describe('worktree lane release endpoint (r4)', () => {
         by: 'silas',
         branch_disposition: 'deleted',
       });
+      // The same receipt path serves a binned (discarded) lane: the
+      // digest's new releaseEligible rows are actionable, never refused.
+      h.ledger.addJob({ id: 'job-binned-ack', repo: 'fixture-sweep-ack', title: 'x' });
+      h.ledger.setJobStatus('job-binned-ack', 'working');
+      h.ledger.setJobStatus('job-binned-ack', 'binned');
+      await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-binned-ack' });
+      const binnedRelease = await call(h.port, '/api/dispatch/release', {
+        job_id: 'job-binned-ack', by: 'silas', rule_id: 'sweep-ack',
+      }, TOKEN);
+      expect(binnedRelease.status).toBe(200);
+      expect(h.manager.getWorktree('job-binned-ack')?.status).toBe('swept');
+      const binnedReceipts = h.ledger.listJobEvents('job-binned-ack').filter((event) => event.kind === 'silas.lane-released');
+      expect(binnedReceipts).toHaveLength(1);
+      expect(binnedReceipts[0]?.payload).toMatchObject({ rule_id: 'sweep-ack', by: 'silas' });
     } finally {
       await h.close();
     }

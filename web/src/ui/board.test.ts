@@ -1233,6 +1233,134 @@ describe('board v6 — bands', () => {
     expect(document.querySelector('.board-band__grid')).toBeNull();
   });
 
+  it('hides binned rows behind an explicit disclosure, badges them distinctly, and keeps full history inspectable', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        jobs: [
+          baseJob({ id: 'parked-1', status: 'parked' }),
+          baseJob({
+            id: 'binned-1',
+            status: 'binned',
+            note: 'discarded by the owner',
+            rounds: [
+              baseRound({ id: 'binned-1-r1', seq: 1 }),
+              baseRound({ id: 'binned-1-r2', seq: 2, status: 'aborted' }),
+            ],
+          }),
+        ],
+      }),
+    );
+    // Default view: COLD is count-only and its count INCLUDES the binned
+    // row — the filter can never silently lose it.
+    expect(document.querySelector('.board-band--cold .board-job')).toBeNull();
+    expect(document.querySelector('.board-band--cold .board-band__count')?.textContent).toBe('2 heists');
+    expandCold();
+    // Expanding COLD alone still does not expose the discarded row.
+    expect(document.querySelector('.board-band--cold [data-job-id="parked-1"]')).not.toBeNull();
+    expect(document.querySelector('.board-band--cold [data-job-id="binned-1"]')).toBeNull();
+    const binnedToggle = document.querySelector<HTMLButtonElement>('.board-band--cold .board-band__more--binned');
+    expect(binnedToggle).not.toBeNull();
+    expect(binnedToggle?.textContent).toBe('Show 1 binned record');
+    expect(binnedToggle?.getAttribute('aria-expanded')).toBe('false');
+    const collapsedRegionId = binnedToggle?.getAttribute('aria-controls') ?? '';
+    expect(collapsedRegionId).not.toBe('');
+    expect(document.getElementById(collapsedRegionId)?.hidden).toBe(true);
+
+    binnedToggle?.click();
+    const reopened = document.querySelector<HTMLButtonElement>('.board-band--cold .board-band__more--binned');
+    expect(reopened?.textContent).toBe('Hide binned');
+    expect(reopened?.getAttribute('aria-expanded')).toBe('true');
+    const expandedRegionId = reopened?.getAttribute('aria-controls') ?? '';
+    expect(expandedRegionId).not.toBe('');
+    expect(document.getElementById(expandedRegionId)?.hidden).toBe(false);
+    const binnedRow = document.querySelector<HTMLElement>('.board-band--cold [data-job-id="binned-1"]');
+    expect(binnedRow).not.toBeNull();
+    // Accessible distinct badge: the visible chip names the discard and
+    // carries its own tone (never the parked or success fill).
+    const badge = binnedRow?.querySelector('.board-job__status');
+    expect(badge?.textContent).toBe('binned');
+    expect(badge?.classList.contains('pp-chip--binned')).toBe(true);
+    expect(badge?.classList.contains('pp-chip--park')).toBe(false);
+    // A discarded lane is a closed receipt: even with an aborted newest
+    // round it never carries the live alert accent.
+    expect(binnedRow?.classList.contains('board-job--alert')).toBe(false);
+    // Complete history stays inspectable on the discarded lane.
+    binnedRow?.querySelector<HTMLButtonElement>('.board-job__toggle')?.click();
+    expect(binnedRow?.querySelectorAll('.board-round')).toHaveLength(2);
+    expect(binnedRow?.textContent).toContain('discarded by the owner');
+    // Reversible: the disclosure closes again and the rows go back behind it.
+    document.querySelector<HTMLButtonElement>('.board-band--cold .board-band__more--binned')?.click();
+    expect(document.querySelector('.board-band--cold [data-job-id="binned-1"]')).toBeNull();
+  });
+
+  it('labels the binned disclosure with its count and preserves it across snapshot pushes', () => {
+    const view = new BoardView(() => {});
+    const first = snapshot({
+      jobs: [
+        baseJob({ id: 'binned-a', status: 'binned' }),
+        baseJob({ id: 'binned-b', status: 'binned' }),
+      ],
+    });
+    view.render(first);
+    expandCold();
+    const toggle = document.querySelector<HTMLButtonElement>('.board-band--cold .board-band__more--binned');
+    expect(toggle?.textContent).toBe('Show 2 binned records');
+    toggle?.click();
+    expect(document.querySelectorAll('.board-band--cold [data-job-id^="binned-"]')).toHaveLength(2);
+    // Disclosures are session state: a live snapshot push never reopens or
+    // force-closes the operator's view (the COLD disclosure convention).
+    view.render(
+      snapshot({
+        jobs: [...first.repos[0]!.jobs, baseJob({ id: 'binned-c', status: 'binned' })],
+      }),
+    );
+    const reopened = document.querySelector<HTMLButtonElement>('.board-band--cold .board-band__more--binned');
+    expect(reopened?.textContent).toBe('Hide binned');
+    expect(reopened?.getAttribute('aria-expanded')).toBe('true');
+    expect(document.querySelectorAll('.board-band--cold [data-job-id^="binned-"]')).toHaveLength(3);
+    // ... and the disclosure stays reversible.
+    reopened?.click();
+    expect(document.querySelectorAll('.board-band--cold [data-job-id^="binned-"]')).toHaveLength(0);
+    expect(document.querySelector<HTMLButtonElement>('.board-band--cold .board-band__more--binned')?.textContent)
+      .toBe('Show 3 binned records');
+    // Session persistence is the COLD/FOR GRU convention: a snapshot that
+    // drops every binned row removes the control, and a later binned lane
+    // returns under the state the operator last chose (collapsed here).
+    view.render(snapshot({ jobs: [baseJob({ id: 'parked-3', status: 'parked' })] }));
+    expect(document.querySelector('.board-band__more--binned')).toBeNull();
+    view.render(snapshot({ jobs: [baseJob({ id: 'binned-d', status: 'binned' })] }));
+    expect(document.querySelector<HTMLButtonElement>('.board-band--cold .board-band__more--binned')?.textContent)
+      .toBe('Show 1 binned record');
+  });
+
+  it('focus falls to the COLD shortcut when the binned disclosure disappears from a push', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({ jobs: [baseJob({ id: 'binned-focus', status: 'binned' })] }));
+    expandCold();
+    const toggle = document.querySelector<HTMLElement>('.board-band--cold .board-band__more--binned');
+    expect(toggle?.dataset.focusKey).toBe('section:cold-binned');
+    toggle?.focus();
+    expect(document.activeElement).toBe(toggle);
+    // The next snapshot has no binned rows: the disclosure is gone.
+    view.render(snapshot({ jobs: [baseJob({ id: 'parked-focus', status: 'parked' })] }));
+    const active = document.activeElement;
+    expect(active).toBeInstanceOf(HTMLElement);
+    expect((active as HTMLElement).classList.contains('board-nav__link')).toBe(true);
+    expect((active as HTMLElement).getAttribute('data-nav')).toBe('cold');
+  });
+
+  it('renders no binned disclosure when the snapshot has no binned rows', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({ jobs: [] }));
+    expect(document.querySelector('.board-band__more--binned')).toBeNull();
+    view.render(snapshot({ jobs: [baseJob({ id: 'parked-2', status: 'parked' })] }));
+    expandCold();
+    expect(document.querySelector('.board-band__more--binned')).toBeNull();
+    expect(document.querySelector('.board-band--cold [data-job-id="parked-2"]')).not.toBeNull();
+    expect(document.querySelector('.board-band--cold .board-band__count')?.textContent).toBe('1 heist');
+  });
+
   it('promotes a conflicting PR to FOR GRU and demotes a stalled working lane to COLD with a stale flag', () => {
     const view = new BoardView(() => {});
     view.render(

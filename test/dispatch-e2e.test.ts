@@ -94,6 +94,7 @@ function makeHandle(id: string, role: Role, settle: (text: string) => Promise<vo
 
 function makeDispatchHarness(opts: {
   minionSettle?: (text: string, cwd: string) => Promise<void>;
+  beforeMinionSpawn?: () => Promise<void>;
 } = {}): DispatchHarness {
   const repo = makeFixtureRepo('fixture-app');
   attachBareOrigin(repo);
@@ -116,6 +117,7 @@ function makeDispatchHarness(opts: {
       engine.onRuntimeEvent({ agentId: handle.id, role, sessionFile: handle.sessionFile, phase: 'spawned' });
       return handle;
     }
+    if (opts.beforeMinionSpawn !== undefined) await opts.beforeMinionSpawn();
     // Issue #161: product-owned parent ids are honored (production
     // adapters bind the handle id to SpawnOptions.agentId).
     const id = options?.agentId ?? `agent-${++n}`;
@@ -190,6 +192,31 @@ function harness(opts: Parameters<typeof makeDispatchHarness>[0] = {}): Dispatch
 }
 
 describe('end-to-end dispatch (E8 story 4)', () => {
+  it('an in-flight initial dispatch owns its lane before spawn and cannot be binned mid-admission', async () => {
+    let entered!: () => void;
+    let release!: () => void;
+    const spawned = new Promise<void>((resolve) => { entered = resolve; });
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const h = harness({ beforeMinionSpawn: async () => { entered(); await gate; } });
+    const starting = h.dispatch.dispatch({
+      jobId: 'bin-during-dispatch', repoPath: h.repo.path, title: 'keep the lane honest', briefing: 'finish a fixture',
+    });
+    await spawned;
+    try {
+      const before = h.ledger.listJobEvents('bin-during-dispatch');
+      expect(h.ledger.getJob('bin-during-dispatch')?.status).toBe('working');
+      expect(() => h.ledger.setJobStatus('bin-during-dispatch', 'binned')).toThrow(/live work|initial dispatch/u);
+      expect(h.ledger.listJobEvents('bin-during-dispatch')).toEqual(before);
+    } finally {
+      release();
+    }
+    const outcome = await starting;
+    expect(await outcome.settled).toEqual({ ok: true });
+    h.ledger.setAgentState(outcome.agentId, 'idle');
+    h.ledger.setJobStatus('bin-during-dispatch', 'binned');
+    expect(() => h.ledger.setJobStatus('bin-during-dispatch', 'working')).toThrow(/illegal transition/u);
+  });
+
   it('runs the full heist arc on a fixture repo: briefing → minion on a worktree → board → PR → wave → release', async () => {
     const h = harness();
 

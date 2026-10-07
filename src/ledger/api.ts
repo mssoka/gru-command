@@ -17,6 +17,7 @@ import {
   isRoundVerdict,
   TERMINAL_JOB_STATUSES,
   type JobStatus,
+  type TerminalJobStatus,
   type LensState,
   type ObligationState,
   type RoundStatus,
@@ -908,6 +909,10 @@ function isRealIsoUtcTimestamp(value: string): boolean {
 export class LedgerApi {
   private readonly db: DatabaseSync;
   private readonly bus: EventBus | null;
+  /** Process-local ownership across the asynchronous gap BEFORE a worker
+   * has a registered spawning turn. Historical durable requests are NOT a
+   * permanent blocker after their runtime attempt settles or crashes. */
+  private readonly activeJobAdmissions = new Set<{ readonly jobId: string; readonly kind: string }>();
 
   constructor(db: DatabaseSync, opts: { bus?: EventBus } = {}) {
     this.db = db;
@@ -1515,6 +1520,15 @@ export class LedgerApi {
       if (current === null) throw new RecordNotFound(`job "${id}" not found`);
       if (current.status !== status) {
         assertJobTransition(current.status, status);
+        if (status === 'binned') {
+          // A discard closes debt but does NOT stop its producers. Refuse
+          // atomically until the owner/chief has stopped target-owned work;
+          // a bare status write must never conceal a live worker or review.
+          const blockers = this.terminalLiveWorkBlockers(id);
+          if (blockers.length > 0) {
+            throw new Error(`job "${id}" has target-owned live work — stop it before binning: ${blockers.join('; ')}`);
+          }
+        }
         const event = this.writeJobStatus(id, current.status, status);
         // Status/obligation consistency lives AT this transactional boundary
         // (chief ruling A): every writer — dispatch, HTTP API, future hooks —
@@ -1530,7 +1544,7 @@ export class LedgerApi {
           );
         } else if (status === 'parked') {
           this.suspendApplicableObligations(id, 'job parked — obligation suspended by explicit durable state');
-        } else if (status === 'done' || status === 'merged') {
+        } else if (isJobTerminal(status)) {
           this.closeApplicableObligations(id, status);
         }
       } else if (status === 'blocked' && context !== undefined) {
@@ -1769,7 +1783,7 @@ export class LedgerApi {
       }
 
       // Live-work fence: refusal names every durable execution blocker.
-      const blockers = this.closeoutLiveWorkBlockers(job.id);
+      const blockers = this.terminalLiveWorkBlockers(job.id);
       if (blockers.length > 0) {
         throw new AdminCloseoutRefusal(
           'live-work',
@@ -1808,20 +1822,24 @@ export class LedgerApi {
     });
   }
 
-  /** Durable execution blockers for a would-be administrative closeout:
+  /** Durable execution blockers for an irreversible terminal disposition:
    * open worker turns, non-terminal tracked children, live review rounds
    * and unsettled verification runs. Idle/disposed/historical bookkeeping
    * rows are NOT execution evidence (issue #171 ownership classifies
    * leftovers at the runtime boundary; a historical gap must not block a
    * truthful closure) and directive/re-brief control rows are owned by
    * their own reconcilers — neither is read here. */
-  private closeoutLiveWorkBlockers(jobId: string): readonly string[] {
+  private terminalLiveWorkBlockers(jobId: string): readonly string[] {
     const blockers: string[] = [];
     const openTurns = this.listAgents().filter(
       (agent) => agent.jobId === jobId && (agent.state === 'spawning' || agent.state === 'streaming'),
     );
     if (openTurns.length > 0) {
       blockers.push(`open worker turn(s): ${openTurns.map((agent) => `${agent.id} (${agent.state})`).join(', ')}`);
+    }
+    const admissions = [...this.activeJobAdmissions].filter((entry) => entry.jobId === jobId);
+    if (admissions.length > 0) {
+      blockers.push(`in-flight admission(s): ${admissions.map((entry) => entry.kind).join(', ')}`);
     }
     const children = this.listChildWorkers({ jobId }).filter((child) => child.resultState === null);
     if (children.length > 0) {
@@ -1916,7 +1934,7 @@ export class LedgerApi {
         // even when the named job never existed.
         return this.rejectAmendment(input.jobId, 'job-not-found', `job "${input.jobId}" not found`, input);
       }
-      if (job.status === 'merged' || job.status === 'done') {
+      if (isJobTerminal(job.status)) {
         return this.rejectAmendment(input.jobId, 'job-terminal', `job "${input.jobId}" is ${job.status} — terminal lanes take no amendments`, input);
       }
       if (job.briefing === null || job.briefing.trim() === '') {
@@ -2350,6 +2368,9 @@ export class LedgerApi {
     return this.transaction(() => {
       const job = this.getJob(input.jobId);
       if (job === null) throw new RecordNotFound(`job "${input.jobId}" not found`);
+      if (isJobTerminal(job.status)) {
+        throw new Error(`cannot create a review round for terminal job "${input.jobId}" (${job.status})`);
+      }
       let seq = input.seq;
       if (seq === undefined) {
         const row = this.db
@@ -3654,6 +3675,29 @@ export class LedgerApi {
     return rows.map((row) => this.providerWaitFromRow(row));
   }
 
+  /** Reserve one runtime admission BEFORE its first await. The status
+   * transaction sees this ownership until the attempt finishes; a restart
+   * loses only process-local ownership, not historical intent/events. */
+  beginJobAdmission(jobId: string, kind: string): () => void {
+    const job = this.getJob(jobId);
+    if (job === null || isJobTerminal(job.status)) {
+      throw new Error(`cannot admit ${kind} for job "${jobId}" (${job?.status ?? 'missing'})`);
+    }
+    const admission = { jobId, kind };
+    this.activeJobAdmissions.add(admission);
+    return () => { this.activeJobAdmissions.delete(admission); };
+  }
+
+  /** A durable claimed wait is permission to attempt ONE runtime recovery,
+   * not a permanent live producer after its turn settles. */
+  beginProviderContinuation(waitId: string, jobId: string): () => void {
+    const wait = this.getProviderWait(waitId);
+    if (wait === null || wait.status !== 'claimed' || wait.waiterKind !== 'job-minion' || wait.jobId !== jobId) {
+      throw new Error(`provider continuation ${waitId} must belong to a claimed job-minion wait for "${jobId}"`);
+    }
+    return this.beginJobAdmission(jobId, `provider continuation ${waitId}`);
+  }
+
   /** r1 #10: ATOMIC claim-before-spawn. Compare-and-set
    * recovered-pending → claimed; returns true only when THIS caller won —
    * concurrent claimants and replays lose without side effects. */
@@ -4045,7 +4089,8 @@ export class LedgerApi {
   }
 
   /** The LIVE form of the count above: unacked action-required rows whose
-   * agent binding does NOT belong to a terminal (merged/done) job. A row
+   * agent binding does NOT belong to a terminal (merged/done/binned) job.
+   * A row
    * bound to a terminal job is a closed receipt — the record keeps it
    * (nothing is acked or resolved here), but it is not live Gru work, so
    * the queue count does not count it. Rows with no agent binding stay
@@ -5412,7 +5457,7 @@ export class LedgerApi {
 
   /** Close the job's applicable obligations (open/waiting/suspended) on a
    * terminal transition — settled rows and history stay untouched. */
-  private closeApplicableObligations(jobId: string, terminal: 'done' | 'merged'): void {
+  private closeApplicableObligations(jobId: string, terminal: TerminalJobStatus): void {
     for (const row of this.listApplicableObligations(jobId, ['open', 'waiting', 'suspended'])) {
       this.settleObligation({
         obligationId: row.id,
@@ -6335,7 +6380,7 @@ export class LedgerApi {
     if (input.holder.trim() === '') throw new Error('directive intent requires a non-empty holder');
     const job = this.getJob(input.jobId);
     if (job === null) throw new RecordNotFound(`job "${input.jobId}" not found`);
-    if (job.status === 'merged' || job.status === 'done') {
+    if (isJobTerminal(job.status)) {
       throw new Error(`job "${input.jobId}" is ${job.status} — terminal lanes take no directives`);
     }
     const payload = JSON.stringify({ directive: input.directive, blocker_fingerprint: input.blockerFingerprint ?? null });

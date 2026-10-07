@@ -220,6 +220,57 @@ in PR/review work. The operation performs no other side effect — no worker
 spawn, re-brief, review arm, verification launch, worktree release, PR
 write or notification ACK.
 
+## Binning a job (terminal discard)
+
+When the owner/chief discards a lane that will never resume (superseded,
+cancelled, obsolete), close it as **binned** — the terminal discarded
+state, distinct from the resumable `parked` hold. Binning works from any
+non-terminal status (`dispatched`, `working`, `delivered`, `in-review`,
+`blocked`, `parked`); `merged`/`done` lanes refuse it, and a binned lane
+can never move again (no resume, re-brief, amendment, directive or
+review). The prior status and every historical event stay on the record;
+applicable obligations close as `job-terminal` abandonment in the same
+transaction — binning is a disposition, never a success or cleanup
+claim.
+
+Preconditions (Gru's shipped role teaches this same action; no new endpoint
+or automatic binning — the write itself is the ordinary status surface):
+
+- confirm the lane is genuinely discarded and will not be resumed;
+- inspect live ownership first (`GET /api/board`, `/health`): binning
+  does NOT stop a running worker, cancel a queue entry, release a
+  worktree, delete artifacts or ack notifications. The status transaction
+  refuses target-owned open worker turns, unfinished child workers,
+  pending/live review rounds, unsettled verification runs, and in-flight
+  initial dispatch, directive or provider-recovery admission, with no
+  status or event mutation. A historical claimed wait/directive intent
+  does not hold the lane after its runtime attempt settles. Stop live work through its own authorized
+  surfaces first — the board keeps showing the live producer and the
+  worktree stays on the record. A `working` label alone is not proof of
+  a live producer; idle `working` jobs remain bin-eligible.
+
+Request (pairing token in `Authorization: Bearer`):
+
+```bash
+curl -sS -X POST "http://127.0.0.1:<port>/api/jobs/<job-id>/status" \
+  -H "Authorization: Bearer $GRU_TOKEN" -H 'content-type: application/json' \
+  -d '{"status":"binned"}'
+```
+
+- `200` — the job is `binned`; the ordinary `job.status` event records
+  `<prior> → binned`. On the board, COLD is count-only by default:
+  expand COLD (“Show records”), then the “Show N binned records”
+  disclosure inside it reveals the discarded row.
+- `400` — illegal transition (from `merged`/`done`, or any DIFFERENT
+  status after `binned`), live-work refusal, or unknown status; nothing changed. Re-sending
+  `{"status":"binned"}` to an already-binned lane is an idempotent
+  200 no-op (the generic same-status write never mints a duplicate
+  event) — a timed-out retry is safe.
+- `401` missing/bad token · `404` unknown job.
+
+There is no unbin: a mistaken bin is corrected by recording the honest
+next action as a NEW lane/job, never by rewriting the closed record.
+
 ## Backups & restore
 
 The service self-manages:

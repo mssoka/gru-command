@@ -45,7 +45,7 @@ close-out: a ledger-visible end state a stranger can audit.
    per-phase call ceiling can hold a delivery open as noncompliant,
    quarantine a lane, or block acceptance — the gate is the work being
    verified and reviewed. A re-brief whose
-   job reached terminal (`merged`/`done`) before the request was honored
+   job reached terminal (`merged`/`done`/`binned`) before the request was honored
    is closed administratively instead — whether the stale markers surface
    at boot with no live turn at all, or a settling turn or re-dispatch
    boundary meets the terminal job: the pending markers are retired with
@@ -55,7 +55,8 @@ close-out: a ledger-visible end state a stranger can audit.
    After escalating, leave the lane exactly as it is and say so in your
    completion note. Do not re-escalate the same state on every sweep: the
    digest stops listing a verdict once your rung lands.
-5. **Lanes.** A lane releases only when the job is terminal (merged/done)
+5. **Lanes.** A lane releases only when the job is terminal
+   (merged/done/binned)
    or explicitly abandoned by the chief. The digest's `releaseEligible`
    rows are the terminal lanes still held: release with `by:silas` +
    `rule_id:sweep-ack` so the `silas.lane-released` receipt lands (issue

@@ -292,6 +292,24 @@ describe('pipeline ledger — evaluation, order and projection', () => {
     ledger.setJobStatus('pipe-a', 'merged');
     expect(ready('pipe-b')).toBe(true);
     expect(ready('pipe-c')).toBe(false);
+
+    // A DISCARDED prerequisite deliberately does NOT release the
+    // dependent: the premise was cancelled, so the dependent stalls with
+    // the discard named in its reason for the operator — never a silent
+    // release of approved work.
+    enqueue(ledger, 'pipe-disc');
+    enqueue(ledger, 'pipe-disc-child', { prerequisites: [{ id: 'pipe-disc', milestone: 'delivered' }] });
+    ledger.claimPipelineEntry({ id: 'pipe-disc', holder: 'silas' });
+    ledger.addJob({ id: 'pipe-disc', repo: 'demo', title: 'Entry pipe-disc', briefing: 'Briefing for pipe-disc' });
+    ledger.markPipelineAdmitted({ id: 'pipe-disc', jobId: 'pipe-disc' });
+    ledger.setJobStatus('pipe-disc', 'working');
+    ledger.setJobStatus('pipe-disc', 'delivered');
+    ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'pipe-disc', payload: {} });
+    expect(ready('pipe-disc-child')).toBe(true);
+    ledger.setJobStatus('pipe-disc', 'binned');
+    expect(ready('pipe-disc-child')).toBe(false);
+    expect(ledger.pipelineBoardView(FULL_CAPACITY).entries.find((entry) => entry.id === 'pipe-disc-child')?.reason)
+      .toBe('waiting for pipe-disc to be delivered (now binned)');
     db.close();
   });
 
@@ -358,6 +376,18 @@ describe('pipeline ledger — evaluation, order and projection', () => {
     ledger.setJobStatus('pipe-a', 'in-review');
     ledger.setJobStatus('pipe-a', 'merged');
     expect(view().entries.find((entry) => entry.id === 'pipe-b')?.reason).toBeNull();
+
+    // A DISCARDED (binned) entry releases its exclusive scope too — the
+    // stall clears instead of blocking same-scope entries forever.
+    enqueue(ledger, 'pipe-bin', { exclusiveScopes: ['repo:bin'] });
+    enqueue(ledger, 'pipe-bin-next', { exclusiveScopes: ['repo:bin'] });
+    ledger.claimPipelineEntry({ id: 'pipe-bin', holder: 'silas' });
+    ledger.addJob({ id: 'pipe-bin', repo: 'demo', title: 'Entry pipe-bin', briefing: 'Briefing for pipe-bin' });
+    ledger.markPipelineAdmitted({ id: 'pipe-bin', jobId: 'pipe-bin' });
+    ledger.setJobStatus('pipe-bin', 'working');
+    expect(view().entries.find((entry) => entry.id === 'pipe-bin-next')?.reason).toContain('held by pipe-bin');
+    ledger.setJobStatus('pipe-bin', 'binned');
+    expect(view().entries.find((entry) => entry.id === 'pipe-bin-next')?.reason).toBeNull();
     db.close();
   });
 

@@ -1495,7 +1495,7 @@ export class WaveRunner {
       // A terminal job or a swept lane can never admit this handoff: skip
       // truthfully (no failure, no escalation) instead of a spurious retry.
       const jobNow = this.opts.ledger.getJob(job.id);
-      if (jobNow !== null && (jobNow.status === 'merged' || jobNow.status === 'done')) {
+      if (jobNow !== null && isJobTerminal(jobNow.status)) {
         this.opts.ledger.appendCustomEvent({ kind: 'job.review-handoff-skipped', jobId: job.id,
           payload: { requestSeq: queued.seq, reason: 'terminal-job', status: jobNow.status },
         });
@@ -2668,7 +2668,7 @@ export class WaveRunner {
   ): Promise<FallbackGateOutcome> {
     const job = this.opts.ledger.getJob(input.jobId);
     if (job === null || repoPath === null) throw new Error(`job "${input.jobId}" not found — nothing to review`);
-    if (job.status === 'merged' || job.status === 'done') {
+    if (isJobTerminal(job.status)) {
       throw new Error(`job "${input.jobId}" is ${job.status} — terminal lanes do not go back under review`);
     }
     // Validate BEFORE the outcome returns: a failure after the 202 response
@@ -3056,7 +3056,7 @@ export class WaveRunner {
     const policy = (this.opts.reviewPolicyLoader ?? loadPerkinsPolicy)();
     const job = this.opts.ledger.getJob(input.jobId);
     if (job === null) throw new Error(`job "${input.jobId}" not found — nothing to review`);
-    if (job.status === 'merged' || job.status === 'done') {
+    if (isJobTerminal(job.status)) {
       throw new Error(`job "${input.jobId}" is ${job.status} — terminal lanes do not go back under review`);
     }
     const jobWorktree = this.opts.worktrees

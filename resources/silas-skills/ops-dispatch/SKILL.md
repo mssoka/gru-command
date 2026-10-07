@@ -108,7 +108,7 @@ without a named rule is not yours to invent:
   action: your review surface is the wave-level request
   (`POST /api/dispatch/review`), never a per-lens retry.
 - **`sweep-ack` — release swept lanes the digest names.** Fires on a
-  `releaseEligible` row: a terminal (merged/done) job still holding its own
+  `releaseEligible` row: a terminal (merged/done/binned) job still holding its own
   lane. Close it out by releasing with
   `{"job_id":"<job>","by":"silas","rule_id":"sweep-ack"}`; the release
   records `silas.lane-released` with the rule on the job — that receipt is

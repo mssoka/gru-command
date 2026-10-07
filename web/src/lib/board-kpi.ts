@@ -12,6 +12,7 @@ import {
   agentStatusOf,
   hasRuntimeClassification,
   isCountedCrewAgent,
+  isJobConcluded,
 } from './board-protocol.js';
 import { isSameLocalDay } from './board-time.js';
 
@@ -21,6 +22,7 @@ export interface JobStatusCounts {
   readonly merged: number;
   readonly done: number;
   readonly parked: number;
+  readonly binned: number;
   readonly total: number;
 }
 
@@ -68,15 +70,18 @@ export function collectJobs(snapshot: BoardSnapshot): readonly JobView[] {
 export function derivedPrState(job: JobView): JobPrState | null {
   if (job.prState !== null && job.prState !== undefined) return job.prState;
   if (job.status === 'merged') return 'merged';
-  // A terminal done lane is a closed receipt (a closed-without-merge
-  // closeout included): never derive an open claim from its URL.
-  if (job.status === 'done') return null;
+  // Any other concluded lane (done — a closed-without-merge closeout
+  // included — and binned, a discarded lane) is a closed receipt: never
+  // derive an open claim from its URL. This rides the shared concluded
+  // twin so a future terminal status cannot present as an open claim here
+  // while the bands and signals call it concluded.
+  if (isJobConcluded(job.status)) return null;
   if (job.prUrl !== null) return 'open';
   return null;
 }
 
 export function jobStatusCounts(jobs: readonly JobView[]): JobStatusCounts {
-  const counts = { working: 0, inReview: 0, merged: 0, done: 0, parked: 0 };
+  const counts = { working: 0, inReview: 0, merged: 0, done: 0, parked: 0, binned: 0 };
   for (const job of jobs) {
     switch (job.status) {
       case 'working':
@@ -93,6 +98,9 @@ export function jobStatusCounts(jobs: readonly JobView[]): JobStatusCounts {
         break;
       case 'parked':
         counts.parked += 1;
+        break;
+      case 'binned':
+        counts.binned += 1;
         break;
       default:
         break; // dispatched/delivered/blocked are real but not on this card

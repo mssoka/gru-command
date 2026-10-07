@@ -6,6 +6,7 @@ import { EventBus } from '../src/events/bus.js';
 import { LedgerApi, DEFAULT_LENSES, type PendingRebriefRecord } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { branchStatePayload } from '../src/dispatch/github-poll.js';
+import { assertJobTransition, isJobStatus, isJobTerminal, TERMINAL_JOB_STATUSES } from '../src/ledger/states.js';
 
 const cleanupDirs: string[] = [];
 afterAll(() => {
@@ -121,23 +122,88 @@ describe('ledger api — the record of state', () => {
   });
 
   it('legal job transitions walk the machine; every hop appends an event', () => {
-    api.setJobStatus('fix-login-flow', 'working');
-    api.setJobStatus('fix-login-flow', 'in-review');
-    const job = api.setJobStatus('fix-login-flow', 'merged');
+    // Keep the separate fix-login-flow fixture reviewable for the round tests.
+    api.addJob({ id: 'merged-machine-path', repo: 'billing-api', title: 'Merged path' });
+    api.setJobStatus('merged-machine-path', 'working');
+    api.setJobStatus('merged-machine-path', 'in-review');
+    const job = api.setJobStatus('merged-machine-path', 'merged');
     expect(job.status).toBe('merged');
-    const hops = api.listEvents().filter((e) => e.kind === 'job.status' && e.jobId === 'fix-login-flow');
+    const hops = api.listEvents().filter((e) => e.kind === 'job.status' && e.jobId === 'merged-machine-path');
     // listEvents is newest-first; reverse for chronological reads.
     expect(hops.map((e) => (e.payload as { to: string }).to).reverse()).toEqual(['working', 'in-review', 'merged']);
   });
 
   it('terminal job states are terminal; illegal transitions throw and change nothing', () => {
-    const before = api.getJob('fix-login-flow');
-    expect(() => api.setJobStatus('fix-login-flow', 'working')).toThrow(/illegal transition merged → working/u);
-    expect(api.getJob('fix-login-flow')).toEqual(before); // untouched
+    const before = api.getJob('merged-machine-path');
+    expect(() => api.setJobStatus('merged-machine-path', 'working')).toThrow(/illegal transition merged → working/u);
+    expect(api.getJob('merged-machine-path')).toEqual(before); // untouched
     api.addJob({ id: 'docs-pass', repo: 'billing-api', title: 'Docs pass' });
     expect(() => api.setJobStatus('docs-pass', 'merged')).toThrow(/illegal transition dispatched → merged/u);
     expect(() => api.setJobStatus('docs-pass', 'not-a-status' as never)).toThrow(/unknown job status/u);
     expect(() => api.setJobStatus('no-such-job', 'working')).toThrow(/not found/u);
+  });
+
+  it('binned is legal from EVERY non-terminal status and is terminal on the shared contract', () => {
+    // One lane per non-terminal source status; each walks a legal arc to
+    // that status, is discarded, and then refuses every hop out.
+    const arcs: Record<string, readonly string[]> = {
+      dispatched: [],
+      working: ['working'],
+      delivered: ['working', 'delivered'],
+      'in-review': ['working', 'in-review'],
+      blocked: ['working', 'blocked'],
+      parked: ['working', 'parked'],
+    };
+    for (const [source, hops] of Object.entries(arcs)) {
+      const id = `binned-from-${source}`;
+      api.addJob({ id, repo: 'discard-fixture', title: `Discard from ${source}` });
+      for (const hop of hops) api.setJobStatus(id, hop);
+      const priorHop = api.latestJobEvent(id, 'job.status');
+      const discarded = api.setJobStatus(id, 'binned');
+      expect(discarded.status, source).toBe('binned');
+      // The ordinary audit event records the truthful prior status.
+      const hop = api.latestJobEvent(id, 'job.status');
+      expect(hop?.payload, source).toEqual({ from: source, to: 'binned' });
+      if (priorHop !== null) expect(hop?.seq, source).toBeGreaterThan(priorHop.seq);
+      // No outgoing edge survives — and every refusal is mutation-free.
+      const eventsBefore = api.listEvents().length;
+      for (const target of ['dispatched', 'working', 'delivered', 'in-review', 'blocked', 'parked', 'merged', 'done']) {
+        expect(() => api.setJobStatus(id, target), `${source} → ${target}`).toThrow(
+          new RegExp(`illegal transition binned → ${target}`, 'u'),
+        );
+        expect(() => assertJobTransition('binned', target as never), `machine ${target}`).toThrow(
+          new RegExp(`illegal transition binned → ${target}`, 'u'),
+        );
+      }
+      expect(api.getJob(id)?.status, source).toBe('binned');
+      expect(api.listEvents().length, source).toBe(eventsBefore);
+    }
+    // Re-binning an already-binned lane is the generic same-status no-op:
+    // no transition, no duplicate event — a timed-out retry is safe.
+    const rebinEvents = api.listEvents().length;
+    expect(api.setJobStatus('binned-from-parked', 'binned').status).toBe('binned');
+    expect(api.listEvents().length).toBe(rebinEvents);
+    expect(isJobStatus('binned')).toBe(true);
+    expect(isJobTerminal('binned')).toBe(true);
+    expect(TERMINAL_JOB_STATUSES).toContain('binned');
+  });
+
+  it('merged and done cannot be binned — the closed record is never rewritten', () => {
+    const closedArcs: Record<'merged' | 'done', string[]> = {
+      merged: ['working', 'in-review', 'merged'],
+      done: ['working', 'done'],
+    };
+    for (const [terminal, hops] of Object.entries(closedArcs)) {
+      const id = `binned-refused-${terminal}`;
+      api.addJob({ id, repo: 'discard-fixture', title: `Closed ${terminal}` });
+      for (const hop of hops) api.setJobStatus(id, hop);
+      const eventsBefore = api.listEvents().length;
+      expect(() => api.setJobStatus(id, 'binned')).toThrow(
+        new RegExp(`illegal transition ${terminal} → binned`, 'u'),
+      );
+      expect(api.getJob(id)?.status).toBe(terminal);
+      expect(api.listEvents().length).toBe(eventsBefore);
+    }
   });
 
   it('blocked and parked are recoverable side states', () => {
@@ -216,6 +282,25 @@ describe('ledger api — the record of state', () => {
     ]);
     expect(round.lenses.every((chip) => chip.state === 'pending')).toBe(true);
     expect(round.targetRef).toBe('abc123');
+  });
+
+  it('binned, merged and done jobs refuse new review rounds without changing history', () => {
+    const arcs = {
+      binned: [],
+      done: ['working'],
+      merged: ['working', 'in-review'],
+    } as const;
+    for (const [status, hops] of Object.entries(arcs)) {
+      const id = `round-terminal-${status}`;
+      api.addJob({ id, repo: 'billing-api', title: 'Concluded review' });
+      for (const hop of hops) api.setJobStatus(id, hop);
+      api.setJobStatus(id, status);
+      const before = api.listJobEvents(id);
+      expect(() => api.addRound({ jobId: id, targetRef: 'sha-after-close' }))
+        .toThrow(new RegExp(`terminal.*${status}`, 'u'));
+      expect(api.listRounds(id)).toEqual([]);
+      expect(api.listJobEvents(id)).toEqual(before);
+    }
   });
 
   it('custom lens lists are honored but must be unique and non-empty', () => {
@@ -502,7 +587,7 @@ describe('ledger api — the record of state', () => {
     const dataDir = cleanupDirs[0] as string; // the dir from beforeAll
     const db2 = new LedgerDb(dataDir);
     const api2 = new LedgerApi(db2.handle, { bus: new EventBus() });
-    const job = api2.getJob('fix-login-flow');
+    const job = api2.getJob('merged-machine-path');
     expect(job?.status).toBe('merged');
     const rounds = api2.listRounds('fix-login-flow');
     expect(rounds[0]?.lenses.find((chip) => chip.lens === 'blind')?.state).toBe('done');
@@ -523,11 +608,15 @@ describe('pending re-brief terminal retirement (ledger boundary)', () => {
   });
   afterAll(() => db.close());
 
-  function mergedJob(id: string): void {
+  function terminalJob(id: string, terminal: 'merged' | 'binned'): void {
     api.addJob({ id, repo: 'terminal-retirement', title: 'terminal retirement fixture' });
     api.setJobStatus(id, 'working');
-    api.setJobStatus(id, 'in-review');
-    api.setJobStatus(id, 'merged');
+    if (terminal === 'merged') {
+      api.setJobStatus(id, 'in-review');
+      api.setJobStatus(id, 'merged');
+    } else {
+      api.setJobStatus(id, 'binned');
+    }
   }
 
   function candidatesOf(markers: readonly PendingRebriefRecord[]): readonly {
@@ -545,10 +634,15 @@ describe('pending re-brief terminal retirement (ledger boundary)', () => {
   }
 
   it('beginPendingRebrief refuses a terminal job inside its own transaction (the HTTP guard is not the only boundary)', () => {
-    mergedJob('intake-terminal');
+    terminalJob('intake-terminal', 'merged');
     expect(() => api.beginPendingRebrief({ jobId: 'intake-terminal', note: 'n', briefing: 'b' }))
       .toThrow(/terminal lanes are never re-briefed/u);
     expect(api.listPendingRebriefs({ jobId: 'intake-terminal' })).toHaveLength(0);
+    // A binned (discarded) lane is terminal at the same boundary.
+    terminalJob('intake-terminal-binned', 'binned');
+    expect(() => api.beginPendingRebrief({ jobId: 'intake-terminal-binned', note: 'n', briefing: 'b' }))
+      .toThrow(/terminal lanes are never re-briefed/u);
+    expect(api.listPendingRebriefs({ jobId: 'intake-terminal-binned' })).toHaveLength(0);
   });
 
   it('retirePendingRebriefs commits audit + identity-checked deletion together; a replay is a no-op', () => {
@@ -571,6 +665,21 @@ describe('pending re-brief terminal retirement (ledger boundary)', () => {
     const replay = api.retirePendingRebriefs({ jobId, reason: 'job terminal', candidates });
     expect(replay.retired).toHaveLength(0);
     expect(api.listJobEvents(jobId).filter((event) => event.kind === 'silas.rebrief-retired')).toHaveLength(1);
+
+    // A binned (discarded) lane retires its markers through the same
+    // identity-checked path, auditing the terminal status truthfully.
+    const binnedId = 'retire-binned';
+    api.addJob({ id: binnedId, repo: 'terminal-retirement', title: 'binned retirement' });
+    api.setJobStatus(binnedId, 'working');
+    const binnedMarkers = api.beginPendingRebrief({ jobId: binnedId, note: 'n', briefing: 'b' });
+    const binnedCandidates = candidatesOf(binnedMarkers);
+    api.setJobStatus(binnedId, 'binned');
+    const binnedRetire = api.retirePendingRebriefs({ jobId: binnedId, reason: 'job terminal', candidates: binnedCandidates });
+    expect(binnedRetire.refused).toBeNull();
+    expect(binnedRetire.retired).toHaveLength(binnedMarkers.length);
+    expect(api.listPendingRebriefs({ jobId: binnedId })).toHaveLength(0);
+    expect((api.latestJobEvent(binnedId, 'silas.rebrief-retired')?.payload as { job_status?: string }).job_status)
+      .toBe('binned');
   });
 
   it('refuses direct retirement of a fully landed terminal request without an audit', () => {

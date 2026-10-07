@@ -363,6 +363,11 @@ function milestoneReached(
       return dependency.state === 'admitted' && dependency.jobId !== null && ctx.jobStartedOf(dependency.jobId);
     case 'delivered': {
       const status = jobStatusOf(dependency, ctx);
+      // A binned (discarded) dependency deliberately does NOT release the
+      // dependent: the discard invalidates the premise, and releasing
+      // approved work off a cancelled prerequisite would infer progress
+      // the record never claimed. The dependent stays waiting with the
+      // discard named in its reason for the operator to resolve.
       return (status === 'delivered' || status === 'in-review' || status === 'merged' || status === 'done') &&
         dependency.jobId !== null && ctx.jobDeliveredOf(dependency.jobId);
     }
