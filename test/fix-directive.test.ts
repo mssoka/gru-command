@@ -508,6 +508,10 @@ describe('the non-draft PR rule on follow-up directives', () => {
   });
 });
 
+function activeJobRecord(id: string): NonNullable<ReturnType<LedgerApi['getJob']>> {
+  return { ...fakeLedger().getJob('job-1')!, id, status: 'working' };
+}
+
 describe('cancelled retry settlement on directive consumers (r4 verification#3)', () => {
   const CAPS = { streaming: false, steer: 'queued' as const, resume: 'file' as const, images: false, thinking: false, thinkingLevelControl: false, followUp: false };
   const lane = {
@@ -530,7 +534,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
         listImplementerMinions: () => [minionRecord('minion-live', 'job-cancel', '/sessions/live.jsonl')],
         listAgents: () => [],
         registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
-        getJob: () => null,
+        getJob: () => activeJobRecord('job-cancel'),
         getAgent: () => null,
       },
       worktrees: { listWorktrees: () => [lane] } as never,
@@ -569,7 +573,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
         listImplementerMinions: () => [],
         listAgents: () => [],
         registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
-        getJob: () => null,
+        getJob: () => activeJobRecord('job-cancel'),
         getAgent: () => null,
       },
       worktrees: { listWorktrees: () => [lane] } as never,
@@ -602,7 +606,7 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
           listImplementerMinions: () => [],
           listAgents: () => [],
           registerAgent: () => { throw registrationError; },
-          getJob: () => null,
+          getJob: () => activeJobRecord('job-regfail'),
           getAgent: () => null,
         },
         worktrees: { listWorktrees: () => [lane] } as never,
@@ -791,7 +795,7 @@ describe('per-prompt terminal verdict capture (r5 blocker 1)', () => {
           listAgents: () => [{ id: 'inner-queued', jobId: 'job-queued', role: 'minion', sessionFile: null }],
           listImplementerMinions: () => [{ id: 'inner-queued', jobId: 'job-queued', role: 'minion', sessionFile: null }],
           registerAgent: () => {},
-          getJob: () => null,
+          getJob: () => activeJobRecord('job-queued'),
         } as never,
         worktrees: {} as never,
         jobId: 'job-queued',
