@@ -570,3 +570,27 @@ working-flavor-catalog-baseline = 'set -e; base=9bb51b05af5d8f0a0cd389788d1d3f19
 # lint/typecheck product checks for the same change.
 parked-closeout = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/ledger-api.test.ts test/ledger-obligations.test.ts test/board-server.test.ts test/board-engine-v4.test.ts test/suite-shape.test.ts && cd web && ../node_modules/.bin/vitest run src/lib/board-kpi.test.ts"
 parked-closeout-static = "node tools/patch-vitest-rpc-timeout.mjs && npm run lint && npm run typecheck && cd web && node ../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json"
+
+# Terminal Binned status lane (job job-status-binned-continuation-20261006):
+# the ledger machine + obligation closure + authenticated status-surface
+# audit, the board engine/web projections and the suite pins — invoked only
+# via the authenticated /api/verify scheduler at unchanged budgets/
+# thresholds, approved RPC patch first, exits never masked. The static
+# scope carries lint/typecheck/build plus the web compiler for the changed
+# web surface.
+binned-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/ledger-api.test.ts test/ledger-obligations.test.ts test/board-engine-v4.test.ts test/board-server.test.ts test/suite-shape.test.ts && cd web && ../node_modules/.bin/vitest run src/lib/board-signals.test.ts src/lib/board-kpi.test.ts src/lib/board-bands.test.ts src/lib/board-sections.test.ts src/ui/board.test.ts"
+binned-static = "node tools/patch-vitest-rpc-timeout.mjs && npm run lint && npm run typecheck && npm run build && cd web && node ../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json"
+
+# Fails-before evidence (acceptance: preserve a meaningful fail-before
+# result): the FINAL behavioral test bytes are overlaid onto an isolated
+# git-archive snapshot of the pre-change base 84aec28 (BOTH legs run: the
+# backend files and the web files), root+web node_modules symlinked (no
+# download/install), approved RPC patch prerequisite, unchanged Vitest
+# configs/budgets. The base has no `binned` status/edge/badge/filter, so
+# assertion RED is EXPECTED on both legs; compilation/import/setup failure
+# would not be RED evidence. The vitest exits are echoed intact and never
+# masked; a baseline leg that passes unexpectedly is called out as a
+# broken fail-before claim. The snapshot directory and ignored pointer
+# file are preserved for inspection; nothing is deleted or checked out and
+# no branch/worktree holds the sha.
+binned-baseline = 'set -e; base=84aec28b04ddc406f26c458383452318f8cb7ed1; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-binned.XXXXXX"); git archive "$base" | tar -x -C "$d"; for f in test/ledger-api.test.ts test/ledger-obligations.test.ts test/board-engine-v4.test.ts test/board-server.test.ts web/src/lib/board-signals.test.ts web/src/lib/board-kpi.test.ts web/src/lib/board-bands.test.ts web/src/lib/board-sections.test.ts web/src/ui/board.test.ts; do mkdir -p "$d/$(dirname "$f")"; git show "$headrev:$f" > "$d/$f"; done; ln -s "$root/node_modules" "$d/node_modules"; ln -s "$root/web/node_modules" "$d/web/node_modules"; printf "binned-baseline base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/binned-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; set +e; npx vitest run test/ledger-api.test.ts test/ledger-obligations.test.ts test/board-engine-v4.test.ts test/board-server.test.ts; a=$?; cd web; ../node_modules/.bin/vitest run src/lib/board-signals.test.ts src/lib/board-kpi.test.ts src/lib/board-bands.test.ts src/lib/board-sections.test.ts src/ui/board.test.ts; b=$?; set -e; echo "binned-baseline vitest exits: backend=$a web=$b (EXPECTED-NONZERO: new assertions vs pre-change base)"; if [ "$a" -eq 0 ] || [ "$b" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: a baseline leg passed unexpectedly"; fi; exit 1'

@@ -24,7 +24,7 @@ import {
   type RoundRecord,
 } from '../ledger/api.js';
 import { LIVE_DIRECTIVE_STATES } from '../ledger/directives.js';
-import type { JobStatus } from '../ledger/states.js';
+import { isJobTerminal, type JobStatus } from '../ledger/states.js';
 import type { EventRecord } from '../ledger/api.js';
 
 /** Newest closed receipts kept in every snapshot (D3): older ones are
@@ -406,10 +406,11 @@ interface MutableChildCounts {
 
 function prStateOf(job: Pick<JobRecord, 'status' | 'prUrl'>): JobView['prState'] {
   if (job.status === 'merged') return 'merged';
-  // A terminal `done` lane (including a closed-without-merge administrative
-  // closeout) is a closed receipt: its registered PR is never presented as
-  // open, and closure never infers a merge.
-  if (job.status === 'done') return null;
+  // A terminal non-merge lane — `done` (including a closed-without-merge
+  // administrative closeout) or `binned` (discarded, never resuming) — is
+  // a closed receipt: its registered PR is never presented as open, and
+  // closure never infers a merge.
+  if (isJobTerminal(job.status)) return null;
   if (job.prUrl !== null) return 'open';
   return null;
 }
@@ -748,7 +749,7 @@ export class BoardEngine {
     // Closed-receipt rule (owner decisions D1/D3): a machine row bound
     // through an agent to a merged/done job is a receipt, not live work.
     const concludedJobs = new Set(
-      jobs.filter((job) => job.status === 'merged' || job.status === 'done').map((job) => job.id),
+      jobs.filter((job) => isJobTerminal(job.status)).map((job) => job.id),
     );
     const agentJob = new Map(
       agentRows.filter((agent) => agent.jobId !== null).map((agent) => [agent.id, agent.jobId as string]),
@@ -1140,7 +1141,7 @@ export class BoardEngine {
     const agent = this.ledger.getAgent(agentId);
     if (agent === null || agent.jobId === null) return false;
     const job = this.ledger.getJob(agent.jobId);
-    return job !== null && (job.status === 'merged' || job.status === 'done');
+    return job !== null && isJobTerminal(job.status);
   }
 
   /**

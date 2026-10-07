@@ -135,7 +135,7 @@ export type ObligationSettlement =
     }
   | { readonly kind: 'superseded'; readonly byObligationId: string | null; readonly reason: string }
   | { readonly kind: 'cancelled'; readonly reason: string }
-  | { readonly kind: 'job-terminal'; readonly jobStatus: 'done' | 'merged' };
+  | { readonly kind: 'job-terminal'; readonly jobStatus: 'done' | 'merged' | 'binned' };
 
 /** The delegated phase's identity an armed receipt expectation may pin
  * itself to. Present ⇒ a receipt event whose payload lacks the matching
@@ -573,8 +573,8 @@ export function parseSettlement(raw: string): ObligationSettlement {
       return { kind, reason: reqStr(record, 'reason', 'cancelled settlement') };
     case 'job-terminal': {
       const jobStatus = reqStr(record, 'jobStatus', 'job-terminal settlement');
-      if (jobStatus !== 'done' && jobStatus !== 'merged') {
-        throw new Error(`job-terminal settlement jobStatus "${jobStatus}" must be done or merged`);
+      if (jobStatus !== 'done' && jobStatus !== 'merged' && jobStatus !== 'binned') {
+        throw new Error(`job-terminal settlement jobStatus "${jobStatus}" must be done, merged or binned`);
       }
       return { kind, jobStatus };
     }

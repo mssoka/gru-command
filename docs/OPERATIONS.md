@@ -220,6 +220,47 @@ in PR/review work. The operation performs no other side effect — no worker
 spawn, re-brief, review arm, verification launch, worktree release, PR
 write or notification ACK.
 
+## Binning a job (terminal discard)
+
+When the owner/chief discards a lane that will never resume (superseded,
+cancelled, obsolete), close it as **binned** — the terminal discarded
+state, distinct from the resumable `parked` hold. Binning works from any
+non-terminal status (`dispatched`, `working`, `delivered`, `in-review`,
+`blocked`, `parked`); `merged`/`done` lanes refuse it, and a binned lane
+can never move again (no resume, re-brief, amendment, directive or
+review). The prior status and every historical event stay on the record;
+applicable obligations close as `job-terminal` abandonment in the same
+transaction — binning is a disposition, never a success or cleanup
+claim.
+
+Preconditions (operator check — the write itself is the ordinary status
+surface):
+
+- confirm the lane is genuinely discarded and will not be resumed;
+- inspect live ownership first (`GET /api/board`, `/health`): binning
+  does NOT stop a running worker, cancel a queue entry, release a
+  worktree, delete artifacts or ack notifications. A lane with live
+  work must be stopped through its own surfaces first — the board keeps
+  showing the live producer and the worktree stays on the record.
+
+Request (pairing token in `Authorization: Bearer`):
+
+```bash
+curl -sS -X POST "http://127.0.0.1:<port>/api/jobs/<job-id>/status" \
+  -H "Authorization: Bearer $GRU_TOKEN" -H 'content-type: application/json' \
+  -d '{"status":"binned"}'
+```
+
+- `200` — the job is `binned`; the ordinary `job.status` event records
+  `<prior> → binned` and the board shows the row in COLD behind the
+  “Show N binned records” disclosure.
+- `400` — illegal transition (from `merged`/`done`, or any status after
+  `binned`) or unknown status; nothing changed.
+- `401` missing/bad token · `404` unknown job.
+
+There is no unbin: a mistaken bin is corrected by recording the honest
+next action as a NEW lane/job, never by rewriting the closed record.
+
 ## Backups & restore
 
 The service self-manages:

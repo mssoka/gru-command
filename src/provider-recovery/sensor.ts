@@ -16,6 +16,7 @@ import {
 } from './classify.js';
 import type { ProbeRoute, ProviderProbePort } from './probe.js';
 import { blockedByOwnWallSettle } from './settle-attribution.js';
+import { isJobTerminal } from '../ledger/states.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -416,7 +417,7 @@ export class ProviderRecoverySensor {
   private validateWaiter(wait: ProviderWaitRecord): 'eligible' | 'cancel' | 'supersede' | 'hold' {
     if (wait.waiterKind === 'job-minion') {
       const job = wait.jobId !== null ? this.ledger.getJob(wait.jobId) : null;
-      if (job === null || job.status === 'merged' || job.status === 'done') return 'cancel';
+      if (job === null || isJobTerminal(job.status)) return 'cancel';
       if (job.status === 'parked') return 'cancel'; // explicit manual hold
       if (wait.jobId !== null) {
         // Supersession requires a newer IMPLEMENTER (Gru ruling

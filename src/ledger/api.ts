@@ -1530,7 +1530,7 @@ export class LedgerApi {
           );
         } else if (status === 'parked') {
           this.suspendApplicableObligations(id, 'job parked — obligation suspended by explicit durable state');
-        } else if (status === 'done' || status === 'merged') {
+        } else if (isJobTerminal(status)) {
           this.closeApplicableObligations(id, status);
         }
       } else if (status === 'blocked' && context !== undefined) {
@@ -1916,7 +1916,7 @@ export class LedgerApi {
         // even when the named job never existed.
         return this.rejectAmendment(input.jobId, 'job-not-found', `job "${input.jobId}" not found`, input);
       }
-      if (job.status === 'merged' || job.status === 'done') {
+      if (isJobTerminal(job.status)) {
         return this.rejectAmendment(input.jobId, 'job-terminal', `job "${input.jobId}" is ${job.status} — terminal lanes take no amendments`, input);
       }
       if (job.briefing === null || job.briefing.trim() === '') {
@@ -5412,7 +5412,7 @@ export class LedgerApi {
 
   /** Close the job's applicable obligations (open/waiting/suspended) on a
    * terminal transition — settled rows and history stay untouched. */
-  private closeApplicableObligations(jobId: string, terminal: 'done' | 'merged'): void {
+  private closeApplicableObligations(jobId: string, terminal: 'done' | 'merged' | 'binned'): void {
     for (const row of this.listApplicableObligations(jobId, ['open', 'waiting', 'suspended'])) {
       this.settleObligation({
         obligationId: row.id,
@@ -6335,7 +6335,7 @@ export class LedgerApi {
     if (input.holder.trim() === '') throw new Error('directive intent requires a non-empty holder');
     const job = this.getJob(input.jobId);
     if (job === null) throw new RecordNotFound(`job "${input.jobId}" not found`);
-    if (job.status === 'merged' || job.status === 'done') {
+    if (isJobTerminal(job.status)) {
       throw new Error(`job "${input.jobId}" is ${job.status} — terminal lanes take no directives`);
     }
     const payload = JSON.stringify({ directive: input.directive, blocker_fingerprint: input.blockerFingerprint ?? null });

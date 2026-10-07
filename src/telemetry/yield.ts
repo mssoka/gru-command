@@ -13,6 +13,7 @@
 
 import { AWARENESS_BLOCK_HEADER } from '../chat/awareness.js';
 import { BOB_CONSOLIDATION_PROMPT } from '../dispatch/bob-scheduler.js';
+import { TERMINAL_JOB_STATUSES } from '../ledger/states.js';
 
 // ------------------------------------------------------------------
 // Vocabulary
@@ -864,7 +865,7 @@ export function computeLedgerMeasures(
   };
 
   // M0 — heists finished in the window and WIP replayed to `until`.
-  const terminal = new Set(['merged', 'done']);
+  const terminal = new Set<string>(TERMINAL_JOB_STATUSES);
   const statusEvents = events
     .filter((event) => event.kind === 'job.status' && event.jobId !== null)
     .sort((a, b) => a.ts.localeCompare(b.ts) || a.seq - b.seq)

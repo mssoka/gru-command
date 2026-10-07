@@ -8,6 +8,7 @@ import type {
   WorktreeRecord,
 } from '../ledger/api.js';
 import { isGitHubRemote } from './review-path.js';
+import { isJobTerminal } from '../ledger/states.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -1009,7 +1010,7 @@ export class GitHubSignalPoll {
       this.log('warn', 'github poll: merged PR for an unknown job', { job: signal.jobId });
       return;
     }
-    if (job.status === 'merged' || job.status === 'done') return;
+    if (isJobTerminal(job.status)) return;
     const payload = {
       repo: repoFullName(signal.repo),
       branch: signal.branch,

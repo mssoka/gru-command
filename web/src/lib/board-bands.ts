@@ -325,6 +325,10 @@ export function bandForJob(job: JobView, opts: BucketOptions = {}): BandId {
       return 'settled';
     case 'merged':
       return isSameLocalDay(job.updatedAt, new Date(opts.now ?? Date.now())) ? 'settled' : 'cold';
+    case 'binned':
+      // A discarded terminal lane sinks to COLD, where the section's own
+      // disclosure keeps it out of the default view (the row still counts).
+      return 'cold';
     default:
       // parked, done, and anything unknown sink — never outrank live work.
       return 'cold';

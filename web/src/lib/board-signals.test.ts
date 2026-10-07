@@ -269,8 +269,8 @@ describe('unackedByJob', () => {
     // on the ledger side must be mirrored here too; the companion test
     // below reads the ledger declaration and makes drift FAIL instead of
     // relying on this checklist being remembered.
-    const statuses = ['dispatched', 'working', 'delivered', 'in-review', 'blocked', 'parked', 'merged', 'done'];
-    expect(statuses.filter((status) => isJobConcluded(status))).toEqual(['merged', 'done']);
+    const statuses = ['dispatched', 'working', 'delivered', 'in-review', 'blocked', 'parked', 'merged', 'done', 'binned'];
+    expect(statuses.filter((status) => isJobConcluded(status))).toEqual(['merged', 'done', 'binned']);
     expect(isJobConcluded('working')).toBe(false);
   });
 
@@ -297,7 +297,7 @@ describe('unackedByJob', () => {
     // (tracked-review A6): the web twin must conclude EXACTLY the ledger's
     // terminal set. A web-only addition would otherwise keep counting rows
     // the web reclassifies as receipts while every test stayed green.
-    const knownStatuses = ['dispatched', 'working', 'delivered', 'in-review', 'blocked', 'parked', 'merged', 'done'];
+    const knownStatuses = ['dispatched', 'working', 'delivered', 'in-review', 'blocked', 'parked', 'merged', 'done', 'binned'];
     const webConcluded = knownStatuses.filter((status) => isJobConcluded(status)).sort();
     expect(webConcluded).toEqual([...terminal].sort());
   });

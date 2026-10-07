@@ -68,9 +68,10 @@ export function collectJobs(snapshot: BoardSnapshot): readonly JobView[] {
 export function derivedPrState(job: JobView): JobPrState | null {
   if (job.prState !== null && job.prState !== undefined) return job.prState;
   if (job.status === 'merged') return 'merged';
-  // A terminal done lane is a closed receipt (a closed-without-merge
-  // closeout included): never derive an open claim from its URL.
-  if (job.status === 'done') return null;
+  // A terminal non-merge lane (done — a closed-without-merge closeout
+  // included — and binned, a discarded lane) is a closed receipt: never
+  // derive an open claim from its URL.
+  if (job.status === 'done' || job.status === 'binned') return null;
   if (job.prUrl !== null) return 'open';
   return null;
 }

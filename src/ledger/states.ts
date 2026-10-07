@@ -16,10 +16,11 @@ export const JOB_STATUSES = [
   'parked',
   'merged',
   'done',
+  'binned',
 ] as const;
 export type JobStatus = (typeof JOB_STATUSES)[number];
 
-const JOB_TERMINAL: ReadonlySet<JobStatus> = new Set(['merged', 'done']);
+const JOB_TERMINAL: ReadonlySet<JobStatus> = new Set(['merged', 'done', 'binned']);
 
 /**
  * dispatched → working → delivered → in-review → merged|done;
@@ -31,16 +32,23 @@ const JOB_TERMINAL: ReadonlySet<JobStatus> = new Set(['merged', 'done']);
  * lane (`delivered → working`): the fresh attempt supersedes the prior
  * delivery. `merged` has NO internal writer: merge detection belongs to
  * the external sweep (Silas) — the remaining external caller.
+ *
+ * `binned` is the terminal DISCARDED state (owner/chief cancelled a
+ * lane): every non-terminal status may be binned, and `binned` never
+ * leaves — it is terminal on the same contract as merged/done (no
+ * resumption, obligations close as abandonment). merged/done can NOT be
+ * binned: their history is already closed truth.
  */
 const JOB_TRANSITIONS: Readonly<Record<JobStatus, readonly JobStatus[]>> = {
-  dispatched: ['working', 'blocked', 'parked'],
-  working: ['delivered', 'in-review', 'blocked', 'parked', 'done'],
-  delivered: ['working', 'in-review', 'blocked', 'parked', 'done'],
-  'in-review': ['working', 'blocked', 'parked', 'merged', 'done'],
-  blocked: ['dispatched', 'working', 'in-review', 'parked'],
-  parked: ['dispatched', 'working', 'in-review', 'blocked'],
+  dispatched: ['working', 'blocked', 'parked', 'binned'],
+  working: ['delivered', 'in-review', 'blocked', 'parked', 'done', 'binned'],
+  delivered: ['working', 'in-review', 'blocked', 'parked', 'done', 'binned'],
+  'in-review': ['working', 'blocked', 'parked', 'merged', 'done', 'binned'],
+  blocked: ['dispatched', 'working', 'in-review', 'parked', 'binned'],
+  parked: ['dispatched', 'working', 'in-review', 'blocked', 'binned'],
   merged: [],
   done: [],
+  binned: [],
 };
 
 export const ROUND_STATUSES = ['pending', 'live', 'verdict-posted', 'aborted'] as const;
@@ -105,7 +113,9 @@ function assertTransition<T extends string>(
   }
 }
 
-export function isJobTerminal(status: JobStatus): boolean {
+export type TerminalJobStatus = 'merged' | 'done' | 'binned';
+
+export function isJobTerminal(status: JobStatus): status is TerminalJobStatus {
   return JOB_TERMINAL.has(status);
 }
 

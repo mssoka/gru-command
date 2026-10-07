@@ -6,6 +6,7 @@ import { DECISION_SURFACE_ESCALATION_TRIAGE, escalationTriageDecisionRequest } f
 import type { DecisionMemoryFacts, EscalationFacts } from '../decisions/questions.js';
 import type { DecisionService } from '../decisions/types.js';
 import type { BusEvent, EventBus } from '../events/bus.js';
+import { isJobTerminal } from '../ledger/states.js';
 import type { LogLevel } from '../logger.js';
 import type { DecisionRecord, EventRecord, LedgerApi, NotificationRecord } from '../ledger/api.js';
 import {
@@ -1506,7 +1507,7 @@ export class GruAwareness {
     const merges = jobs.filter((job) => job.status === 'merged' && Date.parse(job.updatedAt) > since);
     if (merges.length > 0) push(`- merges: ${list(merges.map((job) => job.id))}`);
     const staged = jobs.filter(
-      (job) => job.prUrl !== null && job.status !== 'merged' && job.status !== 'done',
+      (job) => job.prUrl !== null && !isJobTerminal(job.status),
     );
     if (staged.length > 0) push(`- staged PRs: ${list(staged.map((job) => job.id))}`);
     if (lines.length === 0) return null;
@@ -2005,7 +2006,7 @@ export class GruAwareness {
     const concluded = new Set(
       this.ledger
         .listJobs()
-        .filter((job) => job.status === 'merged' || job.status === 'done')
+        .filter((job) => isJobTerminal(job.status))
         .map((job) => job.id),
     );
     if (concluded.size === 0) return { receipts: new Set(), live: [...rows] };
@@ -2032,7 +2033,7 @@ export class GruAwareness {
     const agent = this.ledger.listAgents().find((candidate) => candidate.id === agentId);
     if (agent === undefined || agent.jobId === null) return false;
     const job = this.ledger.listJobs().find((candidate) => candidate.id === agent.jobId);
-    return job !== undefined && (job.status === 'merged' || job.status === 'done');
+    return job !== undefined && isJobTerminal(job.status);
   }
 
   /** Release the pending batch as ONE turn when the schedule allows; while

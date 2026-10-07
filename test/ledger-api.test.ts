@@ -6,6 +6,7 @@ import { EventBus } from '../src/events/bus.js';
 import { LedgerApi, DEFAULT_LENSES, type PendingRebriefRecord } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { branchStatePayload } from '../src/dispatch/github-poll.js';
+import { assertJobTransition, isJobStatus, isJobTerminal, TERMINAL_JOB_STATUSES } from '../src/ledger/states.js';
 
 const cleanupDirs: string[] = [];
 afterAll(() => {
@@ -138,6 +139,64 @@ describe('ledger api — the record of state', () => {
     expect(() => api.setJobStatus('docs-pass', 'merged')).toThrow(/illegal transition dispatched → merged/u);
     expect(() => api.setJobStatus('docs-pass', 'not-a-status' as never)).toThrow(/unknown job status/u);
     expect(() => api.setJobStatus('no-such-job', 'working')).toThrow(/not found/u);
+  });
+
+  it('binned is legal from EVERY non-terminal status and is terminal on the shared contract', () => {
+    // One lane per non-terminal source status; each walks a legal arc to
+    // that status, is discarded, and then refuses every hop out.
+    const arcs: Record<string, readonly string[]> = {
+      dispatched: [],
+      working: ['working'],
+      delivered: ['working', 'delivered'],
+      'in-review': ['working', 'in-review'],
+      blocked: ['working', 'blocked'],
+      parked: ['working', 'parked'],
+    };
+    for (const [source, hops] of Object.entries(arcs)) {
+      const id = `binned-from-${source}`;
+      api.addJob({ id, repo: 'discard-fixture', title: `Discard from ${source}` });
+      for (const hop of hops) api.setJobStatus(id, hop);
+      const priorHop = api.latestJobEvent(id, 'job.status');
+      const discarded = api.setJobStatus(id, 'binned');
+      expect(discarded.status, source).toBe('binned');
+      // The ordinary audit event records the truthful prior status.
+      const hop = api.latestJobEvent(id, 'job.status');
+      expect(hop?.payload, source).toEqual({ from: source, to: 'binned' });
+      if (priorHop !== null) expect(hop?.seq, source).toBeGreaterThan(priorHop.seq);
+      // No outgoing edge survives — and every refusal is mutation-free.
+      const eventsBefore = api.listEvents().length;
+      for (const target of ['dispatched', 'working', 'delivered', 'in-review', 'blocked', 'parked', 'merged', 'done']) {
+        expect(() => api.setJobStatus(id, target), `${source} → ${target}`).toThrow(
+          new RegExp(`illegal transition binned → ${target}`, 'u'),
+        );
+        expect(() => assertJobTransition('binned', target as never), `machine ${target}`).toThrow(
+          new RegExp(`illegal transition binned → ${target}`, 'u'),
+        );
+      }
+      expect(api.getJob(id)?.status, source).toBe('binned');
+      expect(api.listEvents().length, source).toBe(eventsBefore);
+    }
+    expect(isJobStatus('binned')).toBe(true);
+    expect(isJobTerminal('binned')).toBe(true);
+    expect(TERMINAL_JOB_STATUSES).toContain('binned');
+  });
+
+  it('merged and done cannot be binned — the closed record is never rewritten', () => {
+    const closedArcs: Record<'merged' | 'done', string[]> = {
+      merged: ['working', 'in-review', 'merged'],
+      done: ['working', 'done'],
+    };
+    for (const [terminal, hops] of Object.entries(closedArcs)) {
+      const id = `binned-refused-${terminal}`;
+      api.addJob({ id, repo: 'discard-fixture', title: `Closed ${terminal}` });
+      for (const hop of hops) api.setJobStatus(id, hop);
+      const eventsBefore = api.listEvents().length;
+      expect(() => api.setJobStatus(id, 'binned')).toThrow(
+        new RegExp(`illegal transition ${terminal} → binned`, 'u'),
+      );
+      expect(api.getJob(id)?.status).toBe(terminal);
+      expect(api.listEvents().length).toBe(eventsBefore);
+    }
   });
 
   it('blocked and parked are recoverable side states', () => {

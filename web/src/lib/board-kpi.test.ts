@@ -105,6 +105,12 @@ describe('board KPIs — counts over the live snapshot', () => {
     expect(derivedPrState(job('wire', { prUrl: 'https://x/2', prState: 'conflicting' }))).toBe('conflicting');
   });
 
+  it('a binned (discarded) job with a registered PR is a closed receipt — never an open claim', () => {
+    const discarded = job('binned-url', { status: 'binned', prUrl: 'https://x/7' });
+    expect(derivedPrState(discarded)).toBeNull();
+    expect(prCounts([discarded], NOW)).toEqual({ open: 0, conflicting: 0, mergedToday: 0 });
+  });
+
   it('a terminal done job with a registered PR is a closed receipt — never an open claim', () => {
     const closed = job('done-url', { status: 'done', prUrl: 'https://x/5' });
     expect(derivedPrState(closed)).toBeNull();

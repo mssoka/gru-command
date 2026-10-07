@@ -100,7 +100,7 @@ export const SILAS_RULES: readonly SilasRuleSpec[] = [
     id: 'sweep-ack',
     kind: 'action',
     firesOn:
-      'releaseEligible row: a terminal (merged/done) job still holding its own kind=job lane, with no non-terminal child worker',
+      'releaseEligible row: a terminal (merged/done/binned) job still holding its own kind=job lane, with no non-terminal child worker',
     receipt: ['silas.lane-released'],
     summary:
       'Release the lane through the worktree surface with by=silas + rule_id=sweep-ack; the release records the receipt on the job.',

@@ -995,7 +995,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       const completionHandoff = completionHandoffField(body);
       const job = options.ledger.getJob(jobId);
       if (job === null) throw new Error(`job "${jobId}" not found`);
-      if (job.status === 'merged' || job.status === 'done') {
+      if (isJobTerminal(job.status)) {
         throw new Error(`job "${jobId}" is ${job.status} — terminal lanes take no directives`);
       }
       // Durable intent BEFORE any prompt/spawn side effect (the PR133
@@ -1301,7 +1301,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       const completionHandoff = completionHandoffField(body);
       const job = options.ledger.getJob(jobId);
       if (job === null) throw new Error(`job "${jobId}" not found`);
-      if (job.status === 'merged' || job.status === 'done') {
+      if (isJobTerminal(job.status)) {
         throw new Error(`job "${jobId}" is ${job.status} — terminal lanes are never re-briefed`);
       }
       // Restart-safe by construction: the request markers are durable

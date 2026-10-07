@@ -271,6 +271,50 @@ describe('board server — HTTP API', () => {
     expect(snapshot.repos.find((r) => r.name === 'demo-repo')?.jobs.some((j) => j.id === 'api-job')).toBe(true);
   });
 
+  it('a binned discard is audited end-to-end; auth/malformed/illegal attempts never mutate', async () => {
+    const { api, port } = harness;
+    api.addJob({ id: 'audit-binned', repo: 'demo-repo', title: 'Audit the discard' });
+    const eventsBefore = api.listJobEvents('audit-binned').length;
+    // A caller-provided `by` is NOT authentication.
+    const unauth = await postJson(port, '/api/jobs/audit-binned/status', null, { status: 'binned', by: 'gru' });
+    expect(unauth.status).toBe(401);
+    expect(api.getJob('audit-binned')?.status).toBe('dispatched');
+    expect(api.listJobEvents('audit-binned').length).toBe(eventsBefore);
+
+    const malformed = await postJson(port, '/api/jobs/audit-binned/status', 'board-test-token', { status: 'discarded' });
+    expect(malformed.status).toBe(400);
+    expect(api.getJob('audit-binned')?.status).toBe('dispatched');
+    expect(api.listJobEvents('audit-binned').length).toBe(eventsBefore);
+
+    const legal = await postJson(port, '/api/jobs/audit-binned/status', 'board-test-token', { status: 'binned' });
+    expect(legal.status).toBe(200);
+    expect((legal.body as { status: string }).status).toBe('binned');
+    // The ordinary audit event preserves the truthful prior status.
+    expect(api.latestJobEvent('audit-binned', 'job.status')?.payload).toEqual({ from: 'dispatched', to: 'binned' });
+
+    // Terminal: no resumption, and a closed merged lane refuses binning.
+    const resume = await postJson(port, '/api/jobs/audit-binned/status', 'board-test-token', { status: 'working' });
+    expect(resume.status).toBe(400);
+    expect((resume.body as { detail: string }).detail).toMatch(/illegal transition binned → working/u);
+    expect(api.getJob('audit-binned')?.status).toBe('binned');
+    api.addJob({ id: 'audit-merged', repo: 'demo-repo', title: 'Already merged' });
+    api.setJobStatus('audit-merged', 'working');
+    api.setJobStatus('audit-merged', 'in-review');
+    api.setJobStatus('audit-merged', 'merged');
+    const refuse = await postJson(port, '/api/jobs/audit-merged/status', 'board-test-token', { status: 'binned' });
+    expect(refuse.status).toBe(400);
+    expect((refuse.body as { detail: string }).detail).toMatch(/illegal transition merged → binned/u);
+    expect(api.getJob('audit-merged')?.status).toBe('merged');
+
+    // The board snapshot carries the discarded lane as a closed receipt.
+    const snapshot = (await getJson(port, '/api/board', 'board-test-token')).body as {
+      repos: { name: string; jobs: { id: string; status: string; prState: string | null }[] }[];
+    };
+    const row = snapshot.repos.flatMap((repo) => repo.jobs).find((job) => job.id === 'audit-binned');
+    expect(row?.status).toBe('binned');
+    expect(row?.prState).toBeNull();
+  });
+
   it('closeout endpoint: auth, malformed bodies, missing jobs and guard refusals fail loud without changes', async () => {
     const { api, port } = harness;
     const head = '3c44e87e2e9e64cbc3301d7806540df6273438e6';

@@ -558,6 +558,40 @@ describe('obligations — park/terminal act only on APPLICABLE rows; history sur
     expect(finalRows.find((row) => row.state === 'settled')?.settlement?.kind).toBe('executed-action');
   });
 
+  it('binning a lane closes applicable obligations as job-terminal abandonment and preserves settled history', () => {
+    api = new LedgerApi(new LedgerDb(tmpDir()).handle, { bus: new EventBus() });
+    api.addJob({ id: 'job-discard', repo: 'r', title: 'Job discarded' });
+    api.setJobStatus('job-discard', 'working');
+    api.setJobStatus('job-discard', 'blocked', ownerHoldContext(api.latestEventSeq()));
+    const settledRow = api.recordBlockedObservation('job-discard', {
+      logicalStep: 'review',
+      category: { kind: 'known', category: 'review-verdict' },
+      incidentKey: 'r1',
+      observedAtSeq: api.latestEventSeq(),
+    });
+    const evidence = api.appendCustomEvent({ kind: 'silas.directive-sent', jobId: 'job-discard', payload: { request_id: 'x', minion_id: 'm1' } });
+    api.settleObligation({
+      obligationId: settledRow.id,
+      settlement: { kind: 'executed-action', action: 'request-review', evidenceEventSeq: evidence.seq, evidenceEventKind: 'silas.directive-sent' },
+    });
+
+    api.setJobStatus('job-discard', 'binned');
+    expect(api.getJob('job-discard')?.status).toBe('binned');
+    const rows = api.listObligations({ jobId: 'job-discard' });
+    // The open debt closes as abandonment carrying the terminal status —
+    // never a success claim.
+    expect(rows.find((row) => row.incidentKey === 'quota-exhausted')?.settlement).toEqual({
+      kind: 'job-terminal',
+      jobStatus: 'binned',
+    });
+    expect(rows.find((row) => row.incidentKey === 'quota-exhausted')?.state).toBe('closed');
+    // Settled history is kept verbatim.
+    expect(rows.find((row) => row.state === 'settled')?.settlement?.kind).toBe('executed-action');
+    // A terminal lane never resumes its debt through the resume surface.
+    expect(() => api.resumeObligation('job-discard:operation:quota-exhausted', 'no')).toThrow();
+    expect(api.getObligation('job-discard:operation:quota-exhausted')?.state).toBe('closed');
+  });
+
   it('administrative closeout closes suspended obligations as job-terminal and preserves settled history', () => {
     api = new LedgerApi(new LedgerDb(tmpDir()).handle, { bus: new EventBus() });
     api.addJob({ id: 'job-closeout', repo: 'r', title: 'Job closeout' });

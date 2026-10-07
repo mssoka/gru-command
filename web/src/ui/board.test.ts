@@ -1233,6 +1233,75 @@ describe('board v6 — bands', () => {
     expect(document.querySelector('.board-band__grid')).toBeNull();
   });
 
+  it('hides binned rows behind an explicit disclosure, badges them distinctly, and keeps full history inspectable', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        jobs: [
+          baseJob({ id: 'parked-1', status: 'parked' }),
+          baseJob({
+            id: 'binned-1',
+            status: 'binned',
+            note: 'discarded by the owner',
+            rounds: [
+              baseRound({ id: 'binned-1-r1', seq: 1 }),
+              baseRound({ id: 'binned-1-r2', seq: 2, status: 'aborted' }),
+            ],
+          }),
+        ],
+      }),
+    );
+    // Default view: COLD is count-only and its count INCLUDES the binned
+    // row — the filter can never silently lose it.
+    expect(document.querySelector('.board-band--cold .board-job')).toBeNull();
+    expect(document.querySelector('.board-band--cold .board-band__count')?.textContent).toBe('2 heists');
+    expandCold();
+    // Expanding COLD alone still does not expose the discarded row.
+    expect(document.querySelector('.board-band--cold [data-job-id="parked-1"]')).not.toBeNull();
+    expect(document.querySelector('.board-band--cold [data-job-id="binned-1"]')).toBeNull();
+    const binnedToggle = document.querySelector<HTMLButtonElement>('.board-band--cold .board-band__more--binned');
+    expect(binnedToggle).not.toBeNull();
+    expect(binnedToggle?.textContent).toBe('Show 1 binned record');
+    expect(binnedToggle?.getAttribute('aria-expanded')).toBe('false');
+    const collapsedRegionId = binnedToggle?.getAttribute('aria-controls') ?? '';
+    expect(collapsedRegionId).not.toBe('');
+    expect(document.getElementById(collapsedRegionId)?.hidden).toBe(true);
+
+    binnedToggle?.click();
+    const reopened = document.querySelector<HTMLButtonElement>('.board-band--cold .board-band__more--binned');
+    expect(reopened?.textContent).toBe('Hide binned');
+    expect(reopened?.getAttribute('aria-expanded')).toBe('true');
+    const expandedRegionId = reopened?.getAttribute('aria-controls') ?? '';
+    expect(expandedRegionId).not.toBe('');
+    expect(document.getElementById(expandedRegionId)?.hidden).toBe(false);
+    const binnedRow = document.querySelector<HTMLElement>('.board-band--cold [data-job-id="binned-1"]');
+    expect(binnedRow).not.toBeNull();
+    // Accessible distinct badge: the visible chip names the discard and
+    // carries its own tone (never the parked or success fill).
+    const badge = binnedRow?.querySelector('.board-job__status');
+    expect(badge?.textContent).toBe('binned');
+    expect(badge?.classList.contains('pp-chip--binned')).toBe(true);
+    expect(badge?.classList.contains('pp-chip--park')).toBe(false);
+    // Complete history stays inspectable on the discarded lane.
+    binnedRow?.querySelector<HTMLButtonElement>('.board-job__toggle')?.click();
+    expect(binnedRow?.querySelectorAll('.board-round')).toHaveLength(2);
+    expect(binnedRow?.textContent).toContain('discarded by the owner');
+    // Reversible: the disclosure closes again and the rows go back behind it.
+    document.querySelector<HTMLButtonElement>('.board-band--cold .board-band__more--binned')?.click();
+    expect(document.querySelector('.board-band--cold [data-job-id="binned-1"]')).toBeNull();
+  });
+
+  it('renders no binned disclosure when the snapshot has no binned rows', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({ jobs: [] }));
+    expect(document.querySelector('.board-band__more--binned')).toBeNull();
+    view.render(snapshot({ jobs: [baseJob({ id: 'parked-2', status: 'parked' })] }));
+    expandCold();
+    expect(document.querySelector('.board-band__more--binned')).toBeNull();
+    expect(document.querySelector('.board-band--cold [data-job-id="parked-2"]')).not.toBeNull();
+    expect(document.querySelector('.board-band--cold .board-band__count')?.textContent).toBe('1 heist');
+  });
+
   it('promotes a conflicting PR to FOR GRU and demotes a stalled working lane to COLD with a stale flag', () => {
     const view = new BoardView(() => {});
     view.render(

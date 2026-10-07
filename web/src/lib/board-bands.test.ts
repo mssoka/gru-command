@@ -85,17 +85,19 @@ describe('board bands — deterministic bucketing', () => {
       'parked',
       'merged',
       'done',
+      'binned',
       'error',
     ] as const;
     const prStates: (JobPrState | null)[] = [null, 'open', 'conflicting', 'merged'];
 
     /** Independent re-statement of the rules (never import the target's
      * own helpers here — the point is to pin the behavior). Terminal jobs
-     * (merged/done) are closed receipts: no signal — conflicting PR
+     * (merged/done/binned) are closed receipts: no signal — conflicting PR
      * guesses included — can promote them back into NEEDS YOU. */
     function expected(status: string, fresh: boolean, pr: JobPrState | null): string {
       if (status === 'merged') return fresh ? 'settled' : 'cold';
       if (status === 'done') return 'cold';
+      if (status === 'binned') return 'cold';
       if (pr === 'conflicting') return 'needs-you';
       if (status === 'blocked' || status === 'error') return 'needs-you';
       if (status === 'dispatched' || status === 'in-review') return 'in-flight';
@@ -303,6 +305,22 @@ describe('board bands — concluded jobs ignore stale review history (owner ruli
     expect(bandForJob(job({ status: 'delivered', rounds: abortedHistory }), { now: NOW })).toBe('needs-you');
     expect(bandForJob(job({ status: 'parked', rounds: abortedHistory }), { now: NOW })).toBe('needs-you');
     expect(needsYouReasons(job({ status: 'delivered', rounds: abortedHistory }), 0)).toContain('round aborted');
+  });
+
+  it('a binned (discarded) lane is a closed receipt: cold, never promoted, history retained', () => {
+    const discarded = job({
+      status: 'binned',
+      prState: 'conflicting',
+      prUrl: 'https://example.invalid/pr/1',
+      rounds: abortedHistory,
+    });
+    expect(needsYouReasons(discarded, 0)).toEqual([]);
+    expect(needsYouReasons(discarded, 3)).toEqual([]);
+    expect(bandForJob(discarded, { now: NOW })).toBe('cold');
+    expect(bandForJob(discarded, { now: NOW, unackedByJob: new Map([['job-1', 3]]) })).toBe('cold');
+    const [cold] = bucketJobs([discarded], { now: NOW });
+    expect(cold?.jobs[0]?.job.rounds).toHaveLength(2);
+    expect(cold?.jobs[0]?.job.rounds.at(-1)?.status).toBe('aborted');
   });
 
   it('active work keeps legitimate NEEDS YOU attention — including a job reopened after a prior merge', () => {

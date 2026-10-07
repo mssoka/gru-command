@@ -8,6 +8,7 @@ import { rebriefFreshMinion } from '../dispatch/fix-directive.js';
 import type { DirectiveRegistry } from '../dispatch/fix-directive.js';
 import type { WorktreePort } from '../dispatch/worktree-port.js';
 import { blockedByOwnWallSettle } from './settle-attribution.js';
+import { isJobTerminal } from '../ledger/states.js';
 import type { SlotReArmPort } from './sensor.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
@@ -133,7 +134,7 @@ async function claimJobMinion(
   // (the dispatch settle raced the wait — r4 directive): that block IS this
   // provider blocker's settlement and must not strand the recovery.
   const job = wait.jobId !== null ? deps.ledger.getJob(wait.jobId) : null;
-  if (job === null || job.status === 'merged' || job.status === 'done') {
+  if (job === null || isJobTerminal(job.status)) {
     deps.ledger.setProviderWaitStatus(wait.id, 'cancelled', { why: 'job completed or missing', by });
     return { outcome: 'skipped', waitId: wait.id, why: 'job completed or missing' };
   }
