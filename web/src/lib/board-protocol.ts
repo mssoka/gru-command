@@ -870,6 +870,10 @@ function isRepoOverviewRowView(value: unknown): value is RepoOverviewRowView {
   // never carry observed data, and unavailable MUST name its failure.
   const observed = value.freshness === 'fresh' || value.freshness === 'stale';
   if (observed && value.checkedAt === null) return false;
+  // A completed observation always carries its attempt stamp; so does
+  // `unavailable` (the failed attempt is what makes it unavailable).
+  if (observed && value.lastAttemptAt === null) return false;
+  if (value.freshness === 'unavailable' && value.lastAttemptAt === null) return false;
   if (observed && (value.openPrs === null || value.openIssues === null)) return false;
   if (observed && value.run === null) return false;
   if (value.freshness === 'fresh' && value.error !== null) return false;

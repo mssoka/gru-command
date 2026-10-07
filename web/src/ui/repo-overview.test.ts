@@ -282,4 +282,15 @@ describe('managed repository overview panel', () => {
     expect(mount.querySelector('.repo-row__ci')?.textContent).toBe('CI: —');
     expect(mount.querySelector('.repo-row__note')?.textContent).toContain('No default branch exists');
   });
+
+  it('hands focus back to the CREW tab when the module disappears on a push', () => {
+    const { mount, view } = panel();
+    const tab = document.createElement('button');
+    tab.id = 'rail-tab-agents';
+    document.body.append(tab);
+    view.render({ rows: [row()] });
+    mount.querySelector<HTMLAnchorElement>('a.repo-row__name')!.focus();
+    view.render(null);
+    expect(document.activeElement).toBe(tab);
+  });
 });

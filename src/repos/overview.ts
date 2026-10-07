@@ -147,6 +147,10 @@ export const REPO_OVERVIEW_SEARCH_MIN_INTERVAL_MS = 2_000;
 /** Wall-clock bound for one pass's remote-resolution phase: a slow mount
  * or a huge registry must not make classification exceed the cadence. */
 export const REPO_OVERVIEW_RESOLVE_BUDGET_MS = 60_000;
+/** Wall-clock bound for one pass's provider-fetch phase: even with every
+ * `gh` call stalling to its own timeout, a pass defers under the cadence
+ * instead of stretching it to tens of minutes. */
+export const REPO_OVERVIEW_FETCH_BUDGET_MS = 240_000;
 
 /** The unlinked reason used when a repo's origin remote could not be READ
  * (git failure, timeout, resolution budget) — distinct from a missing
@@ -324,13 +328,20 @@ const SAFE_HOST = /^[A-Za-z0-9.-]+$/;
  * (zero-width/format/combining characters). Emitting it verbatim would
  * fail the mirrored web validator and freeze every snapshot, so an
  * invisible-only name is disclosed as visible escapes — never dropped,
- * never used as an identity. */
+ * never used as an identity. Control/format characters (bidi overrides
+ * included) are escaped even beside visible text, so a name can never
+ * spoof its display; combining marks are escaped only when nothing else
+ * is visible (they are legitimate in many scripts). */
 const VISIBLE_CHARACTER = /[^\p{Cf}\p{Cc}\p{M}\s]/u;
+const CONTROL_OR_FORMAT = /[\p{Cf}\p{Cc}]/u;
 
 export function safeDisplayName(name: string): string {
-  if (VISIBLE_CHARACTER.test(name)) return name;
+  const escape = (char: string): string => `\\u{${char.codePointAt(0)?.toString(16) ?? '?'}}`;
+  if (VISIBLE_CHARACTER.test(name)) {
+    return [...name].map((char) => (CONTROL_OR_FORMAT.test(char) ? escape(char) : char)).join('');
+  }
   const escaped = [...name]
-    .map((char) => (VISIBLE_CHARACTER.test(char) ? char : `\\u{${char.codePointAt(0)?.toString(16) ?? '?'}}`))
+    .map((char) => (VISIBLE_CHARACTER.test(char) ? char : escape(char)))
     .join('');
   return escaped === '' ? 'unnamed repository' : escaped;
 }
@@ -339,7 +350,7 @@ export function safeDisplayName(name: string): string {
  * host/segments cannot form a safe link (not-linked, never guessed). */
 export function githubRepoLink(ref: RepoRef): string | null {
   if (!isGitHubRemote(ref.host)) return null;
-  if (!SAFE_HOST.test(ref.host) || ref.host.includes('..')) return null;
+  if (!SAFE_HOST.test(ref.host) || !/^[A-Za-z0-9].*[A-Za-z0-9]$/.test(ref.host)) return null;
   if (!SAFE_REMOTE_SEGMENT.test(ref.owner) || !SAFE_REMOTE_SEGMENT.test(ref.repo)) return null;
   if (ref.owner === '.' || ref.owner === '..' || ref.repo === '.' || ref.repo === '..') return null;
   let url: URL;
@@ -476,8 +487,14 @@ export class GhRepoOverviewApi implements RepoOverviewApiPort {
       throw new GhApiError(`${label}: response is not a JSON object`);
     }
     // A provider-reported null/absent default branch is a legitimate empty
-    // repository, not a malformed response.
-    return { defaultBranch: strOrNull(raw['default_branch']) };
+    // repository; any OTHER type is a malformed response and fails loud
+    // instead of manufacturing the empty state.
+    const branch = raw['default_branch'];
+    if (branch === undefined || branch === null || branch === '') return { defaultBranch: null };
+    if (typeof branch !== 'string') {
+      throw new GhApiError(`${label}: default_branch must be a string (got ${typeof branch})`);
+    }
+    return { defaultBranch: branch };
   }
 
   async countOpenPulls(input: { readonly repo: RepoRef }): Promise<number> {
@@ -696,6 +713,7 @@ export class ManagedRepoOverviewTracker {
   private readonly states = new Map<string, RepoSourceState>();
   private registry: readonly string[] = [];
   private cursor = 0;
+  private classifyCursor = 0;
   private lastSearchAtMs = 0;
   private refreshedOnce = false;
   private started = false;
@@ -707,7 +725,10 @@ export class ManagedRepoOverviewTracker {
     this.scanRepos = opts.scanRepos ?? (() => discoverManagedReposAsync(opts.workspaceRoot));
     this.resolveRemote = opts.resolveRemote ?? defaultRemoteResolver;
     this.intervalMs = opts.intervalMs ?? REPO_OVERVIEW_REFRESH_MS;
-    this.staleAfterMs = opts.staleAfterMs ?? Math.max(1, this.intervalMs * 3);
+    // A disabled timer (intervalMs 0) must not collapse the freshness
+    // window to nothing: the documented 3× cadence rule stays in force.
+    this.staleAfterMs =
+      opts.staleAfterMs ?? (this.intervalMs > 0 ? this.intervalMs * 3 : REPO_OVERVIEW_STALE_AFTER_MS);
     this.maxCallsPerRefresh = opts.maxCallsPerRefresh ?? REPO_OVERVIEW_MAX_CALLS_PER_REFRESH;
     this.sleep = opts.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.now = opts.now ?? Date.now;
@@ -801,7 +822,13 @@ export class ManagedRepoOverviewTracker {
     const nextStates = new Map<string, RepoSourceState>();
     const resolveDeadline = this.now() + REPO_OVERVIEW_RESOLVE_BUDGET_MS;
     let resolveBudgetSpent = false;
-    for (const name of repos) {
+    // Classification rotates with its own cursor: when the budget cuts a
+    // pass short, the NEXT pass starts where this one stopped, so a slow
+    // mount can never starve the tail of the registry forever.
+    const classifyStart = repos.length === 0 ? 0 : this.classifyCursor % repos.length;
+    const classifyOrder = [...repos.slice(classifyStart), ...repos.slice(0, classifyStart)];
+    let classified = 0;
+    for (const name of classifyOrder) {
       const previous = this.states.get(name);
       const base = previous ?? emptySourceState();
       const unreadable = (): void => {
@@ -832,6 +859,7 @@ export class ManagedRepoOverviewTracker {
       let resolved: RepoRef | null;
       try {
         resolved = await this.resolveRemote(join(this.opts.workspaceRoot, name));
+        classified += 1;
       } catch (error) {
         this.log('warn', 'repo overview: origin resolution failed — keeping the previous classification', {
           repo: name,
@@ -864,6 +892,7 @@ export class ManagedRepoOverviewTracker {
         }
       }
     }
+    this.classifyCursor = repos.length === 0 ? 0 : (classifyStart + classified) % repos.length;
     this.registry = repos.filter((name) => nextStates.has(name));
     this.states.clear();
     for (const [name, state] of nextStates) this.states.set(name, state);
@@ -880,6 +909,7 @@ export class ManagedRepoOverviewTracker {
     // view.
     this.refreshedOnce = true;
     const budget = { used: 0, limit: this.maxCallsPerRefresh };
+    const fetchDeadline = this.now() + REPO_OVERVIEW_FETCH_BUDGET_MS;
     let nextIndex = 0;
     let failures = 0;
     let aborted: string | null = null;
@@ -887,6 +917,11 @@ export class ManagedRepoOverviewTracker {
     for (let index = 0; index < fetchable.length; index += 1) {
       if (budget.used >= budget.limit) {
         aborted = 'budget';
+        nextIndex = index;
+        break;
+      }
+      if (this.now() > fetchDeadline) {
+        aborted = 'deadline';
         nextIndex = index;
         break;
       }
@@ -924,6 +959,11 @@ export class ManagedRepoOverviewTracker {
     if (aborted === 'budget') {
       this.log('warn', 'repo overview refresh: call budget exhausted — remaining repositories defer', {
         budget: this.maxCallsPerRefresh,
+        repos: repos.length,
+      });
+    } else if (aborted === 'deadline') {
+      this.log('warn', 'repo overview refresh: fetch wall-clock budget spent — remaining repositories defer', {
+        budgetMs: REPO_OVERVIEW_FETCH_BUDGET_MS,
         repos: repos.length,
       });
     } else if (aborted === 'fatal') {

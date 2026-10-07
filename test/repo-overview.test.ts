@@ -15,6 +15,7 @@ import {
 import {
   GhRepoOverviewApi,
   ManagedRepoOverviewTracker,
+  REPO_OVERVIEW_FETCH_BUDGET_MS,
   REPO_OVERVIEW_RESOLVE_BUDGET_MS,
   REPO_OVERVIEW_STALE_AFTER_MS,
   classifyGhError,
@@ -379,6 +380,9 @@ describe('managed repo overview tracker — exact counts and runs', () => {
     expect(entry.run?.state).toBe('no-workflow');
     expect(h.api.calls).toContain('countWorkflows:acme/alpha');
     expect(h.api.calls).not.toContain('latestRuns:acme/alpha');
+    // The exact server-emitted absence shape must pass the mirrored web
+    // validator — no GitHub call means no provider strings.
+    expect(isValidSnapshot(validBoardSnapshot(h.tracker.view()))).toBe(true);
   });
 
   it('distinguishes workflows-with-no-run (never-run) from genuinely no workflow', async () => {
@@ -387,6 +391,7 @@ describe('managed repo overview tracker — exact counts and runs', () => {
     const entry = row(await h.tracker.refresh(), 'alpha');
     expect(entry.run?.state).toBe('never-run');
     expect(entry.run?.branch).toBe('main');
+    expect(isValidSnapshot(validBoardSnapshot(h.tracker.view()))).toBe(true);
   });
 
   it('keeps counts fresh when Actions is permanently unavailable, marking only the run unavailable', async () => {
@@ -472,6 +477,7 @@ describe('managed repo overview tracker — failure, freshness and recovery', ()
     expect(freshnessOf({ checkedAt: null, lastAttemptAt: null, nowMs: T0, staleAfterMs: 1000 })).toBe('unchecked');
     expect(freshnessOf({ checkedAt: null, lastAttemptAt: checked, nowMs: T0, staleAfterMs: 1000 })).toBe('unavailable');
     expect(freshnessOf({ checkedAt: checked, lastAttemptAt: checked, nowMs: T0 + 100, staleAfterMs: 1000 })).toBe('fresh');
+    expect(freshnessOf({ checkedAt: checked, lastAttemptAt: checked, nowMs: T0 + 1000, staleAfterMs: 1000 })).toBe('fresh');
     expect(freshnessOf({ checkedAt: checked, lastAttemptAt: checked, nowMs: T0 + 1001, staleAfterMs: 1000 })).toBe('stale');
     expect(
       freshnessOf({ checkedAt: checked, lastAttemptAt: '2026-10-07T12:00:30.000Z', nowMs: T0 + 100, staleAfterMs: 1000 }),
@@ -590,6 +596,11 @@ describe('managed repo overview — pure helpers', () => {
     expect(githubRepoLink({ host: 'gitlab.com', owner: 'acme', repo: 'alpha' })).toBeNull();
     expect(githubRepoLink({ host: 'github.com', owner: 'acme evil', repo: 'alpha' })).toBeNull();
     expect(githubRepoLink({ host: 'github.com', owner: '..', repo: 'alpha' })).toBeNull();
+    // The client validator's safe-host contract is enforced here too.
+    expect(githubRepoLink({ host: 'foo_bar.github', owner: 'acme', repo: 'alpha' })).toBeNull();
+    expect(githubRepoLink({ host: '..', owner: 'acme', repo: 'alpha' })).toBeNull();
+    expect(githubRepoLink({ host: '.github', owner: 'acme', repo: 'alpha' })).toBeNull();
+    expect(githubRepoLink({ host: 'github.com.', owner: 'acme', repo: 'alpha' })).toBeNull();
   });
 
   it('accepts run URLs only on the repository host over https', () => {
@@ -705,6 +716,21 @@ describe('managed repo overview — gh adapter', () => {
     }
   });
 
+  it('carries the spawn failure as a structured cause through the adapter', async () => {
+    const adapter = new GhRepoOverviewApi(
+      ghRunner([{ status: -1, stdout: '', stderr: '', error: 'Error: spawn gh ENOENT' }]).runner,
+    );
+    let captured: unknown = null;
+    try {
+      await adapter.fetchRepo({ repo: githubRef('alpha') });
+    } catch (error) {
+      captured = error;
+    }
+    expect(captured).toBeInstanceOf(GhApiError);
+    expect((captured as GhApiError).causeText).toBe('Error: spawn gh ENOENT');
+    expect(classifyGhError(captured)).toBe('auth');
+  });
+
   it('raises a rate-limit error on a rate-limit stderr and a plain error otherwise', async () => {
     const limited = new GhRepoOverviewApi(ghRunner([{ status: 1, stdout: '', stderr: 'gh: rate limit exceeded (HTTP 403)' }]).runner);
     await expect(limited.countOpenPulls({ repo: githubRef('alpha') })).rejects.toBeInstanceOf(GhRateLimitedError);
@@ -746,6 +772,10 @@ describe('managed repo overview — gh adapter', () => {
     await expect(badRuns.latestRuns({ repo: githubRef('alpha'), branch: 'main', limit: 3 })).rejects.toThrow(
       /workflow_runs/,
     );
+    const badWorkflowTotal = new GhRepoOverviewApi(ghRunner([ok('{}')]).runner);
+    await expect(badWorkflowTotal.countWorkflows({ repo: githubRef('alpha') })).rejects.toThrow(/total_count/);
+    const nonStringBranch = new GhRepoOverviewApi(ghRunner([ok(JSON.stringify({ default_branch: 123 }))]).runner);
+    await expect(nonStringBranch.fetchRepo({ repo: githubRef('alpha') })).rejects.toThrow(/default_branch/);
     const badJson = new GhRepoOverviewApi(ghRunner([ok('not-json')]).runner);
     await expect(badJson.fetchRepo({ repo: githubRef('alpha') })).rejects.toThrow(/invalid JSON/);
   });
@@ -984,6 +1014,7 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
     // Without a branch there is nothing to query runs/workflows for.
     expect(api.calls).not.toContain('countWorkflows:acme/empty');
     expect(api.calls).not.toContain('latestRuns:acme/empty');
+    expect(isValidSnapshot(validBoardSnapshot(h.tracker.view()))).toBe(true);
   });
 
   it('never exposes a half-classified registry entry to the web validator mid-refresh', async () => {
@@ -1079,6 +1110,14 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
     const entry = row(view, '\u200b');
     expect(entry.displayName).not.toBe('\u200b');
     expect(entry.displayName.length).toBeGreaterThan(0);
+    // A bidi override beside visible text is escaped, so the name cannot
+    // spoof its display; combining marks in a visible name survive.
+    h.names.splice(0, h.names.length, 'repo\u202E', 'caf\u0065\u0301');
+    h.refs.set('repo\u202E', githubRef('repo-e'));
+    h.refs.set('caf\u0065\u0301', githubRef('cafe'));
+    const second = await h.tracker.refresh();
+    expect(row(second, 'repo\u202E').displayName).toBe('repo\\u{202e}');
+    expect(row(second, 'caf\u0065\u0301').displayName).toBe('caf\u0065\u0301');
   });
 
   it('leaves a .github-suffixed host with unsafe characters unlinked instead of freezing the board', async () => {
@@ -1159,5 +1198,56 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
       rmSync(root, { recursive: true, force: true });
       rmSync(emptyPath, { recursive: true, force: true });
     }
+  });
+
+  it('rotates the classification start when the resolution budget cuts a pass short', async () => {
+    const h = harness({ names: ['alpha', 'beta', 'gamma'] });
+    h.resolveDelayMs = REPO_OVERVIEW_RESOLVE_BUDGET_MS + 10_000;
+    const first = await h.tracker.refresh();
+    expect(row(first, 'alpha').linked).toBe(true);
+    expect(row(first, 'beta').linkReason).toBe('origin remote could not be read yet');
+    expect(row(first, 'gamma').linkReason).toBe('origin remote could not be read yet');
+
+    const second = await h.tracker.refresh();
+    expect(row(second, 'beta').linked).toBe(true);
+    expect(row(second, 'alpha').linked).toBe(true);
+    expect(row(second, 'gamma').linkReason).toBe('origin remote could not be read yet');
+
+    const third = await h.tracker.refresh();
+    expect(row(third, 'gamma').linked).toBe(true);
+    expect(row(third, 'alpha').linked).toBe(true);
+    expect(row(third, 'beta').linked).toBe(true);
+  });
+
+  it('defers the fetch remainder when the provider stalls past the fetch wall-clock budget', async () => {
+    const h = harness({ names: ['alpha', 'beta'] });
+    const original = h.api.fetchRepo.bind(h.api);
+    h.api.fetchRepo = async (input) => {
+      h.clock.ms += REPO_OVERVIEW_FETCH_BUDGET_MS + 1;
+      return original(input);
+    };
+    const view = await h.tracker.refresh();
+    expect(row(view, 'alpha').freshness).toBe('fresh');
+    expect(row(view, 'beta').lastAttemptAt).toBeNull();
+    expect(row(view, 'beta').freshness).toBe('unchecked');
+    expect(h.failure).toContain('fetch wall-clock budget');
+  });
+
+  it('keeps the documented freshness window when the timer is disabled', async () => {
+    const api = new FakeApi().set('alpha', { openPrs: 1 });
+    const clock = { ms: T0 };
+    const tracker = new ManagedRepoOverviewTracker({
+      workspaceRoot: '/ws',
+      api,
+      scanRepos: () => ['alpha'],
+      resolveRemote: () => githubRef('alpha'),
+      intervalMs: 0,
+      now: () => clock.ms,
+      sleep: async () => {},
+      log: () => {},
+    });
+    await tracker.refresh();
+    clock.ms += 1_000;
+    expect(row(tracker.view(), 'alpha').freshness).toBe('fresh');
   });
 });

@@ -85,7 +85,13 @@ export class RepoOverviewPanel {
       );
     }
     this.mount.replaceChildren();
-    if (view === null || view === undefined) return;
+    if (view === null || view === undefined) {
+      // The section is going away (feature off / pre-upgrade): hand
+      // keyboard focus back to the CREW tab that owns it rather than
+      // dropping it to <body>.
+      if (focusKey !== null) document.getElementById('rail-tab-agents')?.focus();
+      return;
+    }
     const head = el('div', 'repo-overview__head');
     head.append(el('strong', 'repo-overview__title', '📁 Managed repositories'));
     this.mount.append(
