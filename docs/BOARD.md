@@ -193,6 +193,30 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   `silas.directive-sent`, `silas.rebrief`, `silas.escalated`,
   `silas.wake`) — visible in the event stream like every other
   transition.
+- **Managed repository overview (owner-approved compact rows A):** below
+  the CREW list, one read-only module per configured managed repository
+  (the workspace root's depth-1 `.git` registry — the same rule the setup
+  wizard uses). Each compact row shows the repository identity (an https
+  link only when the origin remote proves a safe GitHub identity,
+  otherwise an explicit not-linked reason), exact repo-wide open-PR and
+  open-issue counts (issues EXCLUDING PRs, via GitHub's aggregate search;
+  zero is a real count and unknown is never shown as zero), and the newest
+  Actions run on the repository's discovered default branch as
+  `workflow · branch` plus a status badge (passed/failed/timed-out/
+  cancelled/skipped/neutral/action-required/stale-run/running/queued/
+  no-workflow/no-runs/unknown — text and glyph, never colour alone) with a
+  safe run link and the checked age. This is default-branch CI context,
+  never deployment health, aggregate CI or merge readiness. The server
+  tracker refreshes every 5 minutes (bounded per-refresh call budget,
+  coalesced, server-side `gh` auth only; the browser never polls GitHub)
+  and the row's `checkedAt` is the last SUCCESSFUL fetch: cached data kept
+  after a failure or older than three cadences renders as `STALE · last …`
+  with the age and the failure, so an old green never reads as current.
+  The snapshot field is additive (`repoOverview`; absent/null hides the
+  module). Rows live in their own bounded scroll list under the crew's
+  independent scroll; the module follows the CREW tab and disappears with
+  it on TRANSCRIPTS. Reads and disclosures are display-only — nothing
+  here acks, executes or changes GitHub state.
 - **Notification center (E7; routing split 2026-09-23; section truth
   2026-09-29):** the bell panel renders the durable notification log in
   three bands — FOR YOU (all pending needs-owner rows, even older than the

@@ -1,0 +1,709 @@
+import { describe, expect, it } from 'vitest';
+import {
+  GhApiError,
+  GhRateLimitedError,
+  repoFullName,
+  type GhCommandResult,
+  type GhCommandRunner,
+  type RepoRef,
+} from '../src/dispatch/github-poll.js';
+import {
+  GhRepoOverviewApi,
+  ManagedRepoOverviewTracker,
+  REPO_OVERVIEW_STALE_AFTER_MS,
+  classifyGhError,
+  classifyRemote,
+  freshnessOf,
+  githubRepoLink,
+  runStateOf,
+  safeRunUrl,
+  selectLatestRun,
+  type ActionsAvailability,
+  type RepoOverviewApiPort,
+  type RepoOverviewMeta,
+  type RepoOverviewRunRaw,
+  type RepoOverviewRowView,
+} from '../src/repos/overview.js';
+
+// ------------------------------------------------------------------
+// Fixtures
+// ------------------------------------------------------------------
+
+function githubRef(repo: string, owner = 'acme'): RepoRef {
+  return { host: 'github.com', owner, repo };
+}
+
+function rawRun(over: Partial<RepoOverviewRunRaw> = {}): RepoOverviewRunRaw {
+  return {
+    id: 1,
+    name: 'checks',
+    status: 'completed',
+    conclusion: 'success',
+    url: 'https://github.com/acme/alpha/actions/runs/1',
+    runNumber: 1,
+    createdAt: '2026-10-07T10:00:00.000Z',
+    updatedAt: '2026-10-07T10:05:00.000Z',
+    ...over,
+  };
+}
+
+type CallName = 'fetchRepo' | 'countOpenPulls' | 'countOpenIssues' | 'countWorkflows' | 'latestRuns';
+
+interface FakeFacts {
+  readonly defaultBranch?: string;
+  readonly openPrs?: number;
+  readonly openIssues?: number;
+  readonly workflows?: ActionsAvailability<number>;
+  readonly runs?: ActionsAvailability<readonly RepoOverviewRunRaw[]>;
+  readonly errors?: Partial<Record<CallName, unknown>>;
+}
+
+/** Deterministic in-memory port: every call is recorded by repo name. */
+class FakeApi implements RepoOverviewApiPort {
+  readonly calls: string[] = [];
+  readonly facts = new Map<string, FakeFacts>();
+
+  set(repo: string, facts: FakeFacts): this {
+    this.facts.set(repo, facts);
+    return this;
+  }
+
+  private factsFor(repo: RepoRef): FakeFacts {
+    return this.facts.get(repo.repo) ?? this.facts.get('*') ?? {};
+  }
+
+  private record(name: CallName, repo: RepoRef): FakeFacts {
+    this.calls.push(`${name}:${repoFullName(repo)}`);
+    const facts = this.factsFor(repo);
+    const error = facts.errors?.[name];
+    if (error !== undefined) throw error;
+    return facts;
+  }
+
+  async fetchRepo(input: { readonly repo: RepoRef }): Promise<RepoOverviewMeta> {
+    const facts = this.record('fetchRepo', input.repo);
+    return { defaultBranch: facts.defaultBranch ?? 'main' };
+  }
+
+  async countOpenPulls(input: { readonly repo: RepoRef }): Promise<number> {
+    const facts = this.record('countOpenPulls', input.repo);
+    return facts.openPrs ?? 0;
+  }
+
+  async countOpenIssues(input: { readonly repo: RepoRef }): Promise<number> {
+    const facts = this.record('countOpenIssues', input.repo);
+    return facts.openIssues ?? 0;
+  }
+
+  async countWorkflows(input: { readonly repo: RepoRef }): Promise<ActionsAvailability<number>> {
+    const facts = this.record('countWorkflows', input.repo);
+    return facts.workflows ?? { kind: 'ok', value: 1 };
+  }
+
+  async latestRuns(input: {
+    readonly repo: RepoRef;
+    readonly branch: string;
+    readonly limit: number;
+  }): Promise<ActionsAvailability<readonly RepoOverviewRunRaw[]>> {
+    const facts = this.record('latestRuns', input.repo);
+    return facts.runs ?? { kind: 'ok', value: [rawRun()] };
+  }
+}
+
+interface Harness {
+  tracker: ManagedRepoOverviewTracker;
+  readonly api: FakeApi;
+  readonly names: string[];
+  readonly refs: Map<string, RepoRef | null>;
+  readonly clock: { ms: number };
+  failure: string | null;
+}
+
+const T0 = Date.parse('2026-10-07T12:00:00.000Z');
+
+function harness(options: {
+  names?: readonly string[];
+  refs?: ReadonlyMap<string, RepoRef | null>;
+  api?: FakeApi;
+  maxCallsPerRefresh?: number;
+  staleAfterMs?: number;
+} = {}): Harness {
+  const names = [...(options.names ?? ['alpha'])];
+  const api = options.api ?? new FakeApi();
+  const refs = new Map<string, RepoRef | null>(
+    options.refs ?? names.map((name) => [name, githubRef(name)] as const),
+  );
+  const clock = { ms: T0 };
+  const state: Harness = {
+    tracker: null as unknown as ManagedRepoOverviewTracker,
+    api,
+    names,
+    refs,
+    clock,
+    failure: null,
+  };
+  state.tracker = new ManagedRepoOverviewTracker({
+    workspaceRoot: '/ws',
+    api,
+    scanRepos: () => state.names,
+    resolveRemote: (repoPath) => state.refs.get(repoPath.split('/').pop() as string) ?? null,
+    intervalMs: 300_000,
+    ...(options.maxCallsPerRefresh !== undefined ? { maxCallsPerRefresh: options.maxCallsPerRefresh } : {}),
+    ...(options.staleAfterMs !== undefined ? { staleAfterMs: options.staleAfterMs } : {}),
+    now: () => state.clock.ms,
+    log: (level, msg) => {
+      if (level === 'warn') state.failure = msg;
+    },
+  });
+  return state;
+}
+
+function row(view: ReturnType<ManagedRepoOverviewTracker['view']>, key: string): RepoOverviewRowView {
+  const found = view?.rows.find((entry) => entry.key === key);
+  if (found === undefined) throw new Error(`row ${key} missing`);
+  return found;
+}
+
+// ------------------------------------------------------------------
+// Registry, identity, links
+// ------------------------------------------------------------------
+
+describe('managed repo overview tracker — registry and identity', () => {
+  it('renders no view until the first refresh pass has classified the registry', async () => {
+    const h = harness({ names: ['alpha'] });
+    expect(h.tracker.view()).toBeNull();
+    await h.tracker.refresh();
+    expect(h.tracker.view()?.rows.map((entry) => entry.key)).toEqual(['alpha']);
+  });
+
+  it('derives rows from the registry in stable sorted order and never duplicates', async () => {
+    const h = harness({ names: ['zeta', 'alpha', 'alpha'] });
+    const view = await h.tracker.refresh();
+    expect(view?.rows.map((entry) => entry.key)).toEqual(['alpha', 'zeta']);
+    // A registry change is picked up on the next refresh: additions appear,
+    // removals drop, and no duplicated identity survives a rescan.
+    h.names.splice(0, h.names.length, 'beta', 'alpha');
+    const next = await h.tracker.refresh();
+    expect(next?.rows.map((entry) => entry.key)).toEqual(['alpha', 'beta']);
+  });
+
+  it('handles an empty registry with an explicit empty row set', async () => {
+    const h = harness({ names: [] });
+    expect(h.api.calls).toEqual([]);
+    const view = await h.tracker.refresh();
+    expect(view?.rows).toEqual([]);
+    expect(h.api.calls).toEqual([]);
+  });
+
+  it('classifies missing/non-GitHub/unrecognized remotes as unlinked with a reason and spends no calls', async () => {
+    const h = harness({
+      names: ['missing', 'gitlab', 'weird'],
+      refs: new Map<string, RepoRef | null>([
+        ['missing', null],
+        ['gitlab', { host: 'gitlab.example.com', owner: 'acme', repo: 'gitlab' }],
+        ['weird', { host: 'github.com', owner: 'acme/evil', repo: 'weird' }],
+      ]),
+    });
+    const view = await h.tracker.refresh();
+    expect(h.api.calls).toEqual([]);
+    for (const key of ['missing', 'gitlab', 'weird']) {
+      const entry = row(view, key);
+      expect(entry.linked).toBe(false);
+      expect(entry.link).toBeNull();
+      expect(entry.linkReason).not.toBeNull();
+      expect(entry.openPrs).toBeNull();
+      expect(entry.openIssues).toBeNull();
+      expect(entry.run).toBeNull();
+      expect(entry.checkedAt).toBeNull();
+      expect(entry.freshness).toBe('unchecked');
+    }
+    expect(row(view, 'missing').linkReason).toBe('no usable origin remote');
+    expect(row(view, 'gitlab').linkReason).toBe('non-GitHub remote');
+    expect(row(view, 'weird').linkReason).toBe('unrecognized remote');
+  });
+
+  it('exposes the safe https link and full name for a linked GitHub remote', async () => {
+    const h = harness({ names: ['alpha'] });
+    const view = await h.tracker.refresh();
+    const entry = row(view, 'alpha');
+    expect(entry.linked).toBe(true);
+    expect(entry.link).toBe('https://github.com/acme/alpha');
+    expect(entry.linkReason).toBeNull();
+    expect(entry.fullName).toBe('acme/alpha');
+  });
+
+  it('drops the previous observation when the remote identity changes or disappears', async () => {
+    const api = new FakeApi().set('alpha', { openPrs: 3 });
+    const h = harness({ names: ['alpha'], api });
+    await h.tracker.refresh();
+    expect(row(h.tracker.view(), 'alpha').openPrs).toBe(3);
+
+    // Same directory, different GitHub identity: the new identity is read
+    // fresh — the previous identity's data must not attach to it.
+    api.set('renamed', { openPrs: 9 });
+    h.refs.set('alpha', githubRef('renamed'));
+    const renamed = await h.tracker.refresh();
+    expect(row(renamed, 'alpha').fullName).toBe('acme/renamed');
+    expect(row(renamed, 'alpha').openPrs).toBe(9);
+    expect(row(renamed, 'alpha').freshness).toBe('fresh');
+
+    h.refs.set('alpha', null);
+    const unlinked = await h.tracker.refresh();
+    expect(row(unlinked, 'alpha').linked).toBe(false);
+    expect(row(unlinked, 'alpha').openPrs).toBeNull();
+  });
+});
+
+// ------------------------------------------------------------------
+// Counts and runs
+// ------------------------------------------------------------------
+
+describe('managed repo overview tracker — exact counts and runs', () => {
+  it('passes exact zero counts through as successful observations, never manufacturing data', async () => {
+    const api = new FakeApi().set('alpha', { openPrs: 0, openIssues: 0, runs: { kind: 'ok', value: [rawRun()] } });
+    const h = harness({ api });
+    const view = await h.tracker.refresh();
+    const entry = row(view, 'alpha');
+    expect(entry.openPrs).toBe(0);
+    expect(entry.openIssues).toBe(0);
+    expect(entry.freshness).toBe('fresh');
+    expect(entry.error).toBeNull();
+  });
+
+  it('carries large multi-page totals exactly (search aggregates, not page slices)', async () => {
+    const api = new FakeApi().set('alpha', { openPrs: 313, openIssues: 1002 });
+    const h = harness({ api });
+    const entry = row(await h.tracker.refresh(), 'alpha');
+    expect(entry.openPrs).toBe(313);
+    expect(entry.openIssues).toBe(1002);
+  });
+
+  it('keeps the previous exact counts when an incomplete search degrades the observation', async () => {
+    const api = new FakeApi().set('alpha', { openPrs: 5, openIssues: 4 });
+    const h = harness({ api });
+    await h.tracker.refresh();
+    api.set('alpha', { openPrs: 5, openIssues: 4, errors: { countOpenPulls: new GhApiError('search: incomplete_results') } });
+    const stale = row(await h.tracker.refresh(), 'alpha');
+    expect(stale.openPrs).toBe(5);
+    expect(stale.openIssues).toBe(4);
+    expect(stale.freshness).toBe('stale');
+    expect(stale.error).toContain('incomplete');
+  });
+
+  it('reads the actual discovered default branch, never an assumed one', async () => {
+    const api = new FakeApi().set('alpha', {
+      defaultBranch: 'trunk',
+      runs: { kind: 'ok', value: [rawRun({ url: 'https://github.com/acme/alpha/actions/runs/9', id: 9 })] },
+    });
+    const h = harness({ api });
+    const entry = row(await h.tracker.refresh(), 'alpha');
+    expect(entry.run?.branch).toBe('trunk');
+    expect(h.api.calls).toContain('latestRuns:acme/alpha');
+  });
+
+  it('shows the newest queued/running run instead of an older passed run, independent of list order', () => {
+    const running = rawRun({ id: 2, status: 'in_progress', conclusion: null, createdAt: '2026-10-07T11:00:00.000Z' });
+    const passed = rawRun({ id: 1, status: 'completed', conclusion: 'success', createdAt: '2026-10-07T10:00:00.000Z' });
+    expect(selectLatestRun([running, passed])?.id).toBe(2);
+    expect(selectLatestRun([passed, running])?.id).toBe(2);
+    // A queued run wins the same way.
+    const queued = rawRun({ id: 3, status: 'queued', conclusion: null, createdAt: '2026-10-07T11:30:00.000Z' });
+    expect(selectLatestRun([passed, queued, running])?.id).toBe(3);
+  });
+
+  it('breaks an equal created_at by run id and falls back to id for unparseable stamps', () => {
+    expect(selectLatestRun([rawRun({ id: 1 }), rawRun({ id: 7 })])?.id).toBe(7);
+    expect(selectLatestRun([rawRun({ id: 2, createdAt: null }), rawRun({ id: 5, createdAt: null })])?.id).toBe(5);
+    expect(selectLatestRun([])).toBeNull();
+  });
+
+  it('maps every completed outcome class to its own honest state', () => {
+    const cases: ReadonlyArray<readonly [string | null, string | null, string]> = [
+      ['completed', 'success', 'passed'],
+      ['completed', 'failure', 'failed'],
+      ['completed', 'timed_out', 'timed-out'],
+      ['completed', 'cancelled', 'cancelled'],
+      ['completed', 'skipped', 'skipped'],
+      ['completed', 'neutral', 'neutral'],
+      ['completed', 'action_required', 'action-required'],
+      ['completed', 'stale', 'stale-run'],
+      ['completed', 'startup_failure', 'startup-failure'],
+      ['completed', null, 'unknown'],
+      ['completed', 'mystery', 'unknown'],
+      [null, 'success', 'unknown'],
+      ['in_progress', null, 'running'],
+      ['queued', null, 'queued'],
+      ['waiting', null, 'queued'],
+      ['requested', null, 'queued'],
+      ['pending', null, 'queued'],
+      ['mystery', null, 'unknown'],
+    ];
+    for (const [status, conclusion, expected] of cases) {
+      expect(runStateOf(status, conclusion), `${status}/${conclusion}`).toBe(expected);
+    }
+  });
+
+  it('reports no-workflow only when the workflows endpoint proves there are none, without reading runs', async () => {
+    const api = new FakeApi().set('alpha', { workflows: { kind: 'ok', value: 0 } });
+    const h = harness({ api });
+    const entry = row(await h.tracker.refresh(), 'alpha');
+    expect(entry.run?.state).toBe('no-workflow');
+    expect(h.api.calls).toContain('countWorkflows:acme/alpha');
+    expect(h.api.calls).not.toContain('latestRuns:acme/alpha');
+  });
+
+  it('distinguishes workflows-with-no-run (never-run) from genuinely no workflow', async () => {
+    const api = new FakeApi().set('alpha', { workflows: { kind: 'ok', value: 2 }, runs: { kind: 'ok', value: [] } });
+    const h = harness({ api });
+    const entry = row(await h.tracker.refresh(), 'alpha');
+    expect(entry.run?.state).toBe('never-run');
+    expect(entry.run?.branch).toBe('main');
+  });
+
+  it('keeps counts fresh when Actions is permanently unavailable, marking only the run unavailable', async () => {
+    const workflowsOff = new FakeApi().set('alpha', { openPrs: 2, openIssues: 1, workflows: { kind: 'actions-unavailable' } });
+    const h1 = harness({ api: workflowsOff });
+    const entry1 = row(await h1.tracker.refresh(), 'alpha');
+    expect(entry1.openPrs).toBe(2);
+    expect(entry1.run?.state).toBe('unavailable');
+    expect(entry1.freshness).toBe('fresh');
+
+    const runsOff = new FakeApi().set('alpha', {
+      openPrs: 2,
+      openIssues: 1,
+      workflows: { kind: 'ok', value: 1 },
+      runs: { kind: 'actions-unavailable' },
+    });
+    const h2 = harness({ api: runsOff });
+    const entry2 = row(await h2.tracker.refresh(), 'alpha');
+    expect(entry2.openPrs).toBe(2);
+    expect(entry2.run?.state).toBe('unavailable');
+  });
+
+  it('keeps provider strings as inert data for the render layer to escape', async () => {
+    const api = new FakeApi().set('alpha', {
+      runs: { kind: 'ok', value: [rawRun({ name: '<script>alert(1)</script> & "quotes"' })] },
+    });
+    const h = harness({ api });
+    const entry = row(await h.tracker.refresh(), 'alpha');
+    expect(entry.run?.workflow).toBe('<script>alert(1)</script> & "quotes"');
+  });
+});
+
+// ------------------------------------------------------------------
+// Failure, freshness, recovery
+// ------------------------------------------------------------------
+
+describe('managed repo overview tracker — failure, freshness and recovery', () => {
+  it('degrades only the failing repo: others refresh, the failed one keeps cached data as stale with age and error', async () => {
+    const api = new FakeApi()
+      .set('alpha', { openPrs: 1, openIssues: 1 })
+      .set('beta', { openPrs: 2, openIssues: 2 });
+    const h = harness({ names: ['alpha', 'beta'], api });
+    await h.tracker.refresh();
+    h.clock.ms += 60_000;
+    api.set('beta', { errors: { fetchRepo: new GhApiError('beta: HTTP 403: Resource not accessible') } });
+    const view = await h.tracker.refresh();
+    const alpha = row(view, 'alpha');
+    const beta = row(view, 'beta');
+    expect(alpha.freshness).toBe('fresh');
+    expect(alpha.openPrs).toBe(1);
+    expect(beta.freshness).toBe('stale');
+    expect(beta.openPrs).toBe(2);
+    expect(beta.openIssues).toBe(2);
+    expect(beta.error).toContain('HTTP 403');
+    expect(beta.checkedAt).not.toBeNull();
+    expect(Date.parse(beta.lastAttemptAt as string)).toBeGreaterThan(Date.parse(beta.checkedAt as string));
+    expect(alpha.error).toBeNull();
+  });
+
+  it('recovers to fresh on the next successful refresh and clears the error', async () => {
+    const api = new FakeApi().set('alpha', { errors: { fetchRepo: new GhApiError('alpha: HTTP 500') } });
+    const h = harness({ api });
+    const unavailable = row(await h.tracker.refresh(), 'alpha');
+    expect(unavailable.freshness).toBe('unavailable');
+    expect(unavailable.openPrs).toBeNull();
+    api.set('alpha', { openPrs: 7, openIssues: 8 });
+    const recovered = row(await h.tracker.refresh(), 'alpha');
+    expect(recovered.freshness).toBe('fresh');
+    expect(recovered.openPrs).toBe(7);
+    expect(recovered.error).toBeNull();
+  });
+
+  it('reads a success older than the freshness window as stale even without a recorded failure', async () => {
+    const h = harness({ names: ['alpha'] });
+    await h.tracker.refresh();
+    h.clock.ms += REPO_OVERVIEW_STALE_AFTER_MS + 1;
+    expect(row(h.tracker.view(), 'alpha').freshness).toBe('stale');
+    h.clock.ms += 1;
+  });
+
+  it('computes freshness purely from the fetch completion and attempt ordering', () => {
+    const checked = '2026-10-07T12:00:00.000Z';
+    expect(freshnessOf({ checkedAt: null, lastAttemptAt: null, nowMs: T0, staleAfterMs: 1000 })).toBe('unchecked');
+    expect(freshnessOf({ checkedAt: null, lastAttemptAt: checked, nowMs: T0, staleAfterMs: 1000 })).toBe('unavailable');
+    expect(freshnessOf({ checkedAt: checked, lastAttemptAt: checked, nowMs: T0 + 100, staleAfterMs: 1000 })).toBe('fresh');
+    expect(freshnessOf({ checkedAt: checked, lastAttemptAt: checked, nowMs: T0 + 1001, staleAfterMs: 1000 })).toBe('stale');
+    expect(
+      freshnessOf({ checkedAt: checked, lastAttemptAt: '2026-10-07T12:00:30.000Z', nowMs: T0 + 100, staleAfterMs: 1000 }),
+    ).toBe('stale');
+    // A recorded failure is authoritative even in the same millisecond.
+    expect(freshnessOf({ checkedAt: checked, lastAttemptAt: checked, failed: true, nowMs: T0, staleAfterMs: 1000 })).toBe(
+      'stale',
+    );
+  });
+
+  it('aborts the refresh on a rate limit: the failing repo is recorded, later repos are untouched, next cadence recovers', async () => {
+    const api = new FakeApi()
+      .set('alpha', { errors: { fetchRepo: new GhRateLimitedError('alpha: GitHub rate limit (HTTP 403)') } })
+      .set('beta', { openPrs: 3 });
+    const h = harness({ names: ['alpha', 'beta'], api });
+    const aborted = await h.tracker.refresh();
+    expect(api.calls.some((call) => call.endsWith('acme/beta'))).toBe(false);
+    expect(row(aborted, 'alpha').error).toContain('rate limit');
+    expect(row(aborted, 'beta').checkedAt).toBeNull();
+
+    api.set('alpha', { openPrs: 1 });
+    const recovered = await h.tracker.refresh();
+    expect(row(recovered, 'alpha').freshness).toBe('fresh');
+    expect(row(recovered, 'beta').openPrs).toBe(3);
+  });
+
+  it('aborts the refresh when gh is unavailable (auth-level condition), without hammering every repo', async () => {
+    const api = new FakeApi().set('*', { errors: { fetchRepo: new GhApiError('repo: gh is unavailable (spawn failed)') } });
+    const h = harness({ names: ['alpha', 'beta', 'gamma'], api });
+    const view = await h.tracker.refresh();
+    expect(api.calls).toHaveLength(1);
+    expect(row(view, 'alpha').freshness).toBe('unavailable');
+    expect(row(view, 'beta').checkedAt).toBeNull();
+  });
+
+  it('continues past a per-repo permission failure (not a global condition)', async () => {
+    const api = new FakeApi()
+      .set('alpha', { errors: { countOpenPulls: new GhApiError('alpha: HTTP 403: Forbidden') } })
+      .set('beta', { openPrs: 4 });
+    const h = harness({ names: ['alpha', 'beta'], api });
+    const view = await h.tracker.refresh();
+    expect(row(view, 'alpha').freshness).toBe('unavailable');
+    expect(row(view, 'beta').freshness).toBe('fresh');
+    expect(api.calls.some((call) => call === 'fetchRepo:acme/beta')).toBe(true);
+  });
+
+  it('defers at the per-refresh call budget and rotates fairly across cycles', async () => {
+    const api = new FakeApi()
+      .set('alpha', { openPrs: 1 })
+      .set('beta', { openPrs: 2 })
+      .set('gamma', { openPrs: 3 });
+    const h = harness({ names: ['alpha', 'beta', 'gamma'], api, maxCallsPerRefresh: 5 });
+    const first = await h.tracker.refresh();
+    // One complete 5-call observation fits; beta/gamma wait their turn.
+    expect(row(first, 'alpha').freshness).toBe('fresh');
+    expect(row(first, 'beta').checkedAt).toBeNull();
+    expect(row(first, 'gamma').checkedAt).toBeNull();
+    const second = await h.tracker.refresh();
+    expect(row(second, 'beta').freshness).toBe('fresh');
+    expect(row(second, 'alpha').freshness).toBe('fresh');
+    const third = await h.tracker.refresh();
+    expect(row(third, 'gamma').freshness).toBe('fresh');
+  });
+
+  it('coalesces overlapping refresh calls into one pass', async () => {
+    const h = harness({ names: ['alpha'] });
+    const first = h.tracker.refresh();
+    const second = h.tracker.refresh();
+    expect(second).toBe(first);
+    await Promise.all([first, second]);
+    expect(h.api.calls.filter((call) => call.startsWith('fetchRepo')).length).toBe(1);
+  });
+
+  it('start() is idempotent and never doubles the refresh work', async () => {
+    const h = harness({ names: ['alpha'] });
+    h.tracker.start();
+    h.tracker.start();
+    try {
+      await h.tracker.refresh();
+    } finally {
+      h.tracker.stop();
+    }
+    expect(h.api.calls.filter((call) => call.startsWith('fetchRepo')).length).toBe(1);
+  });
+
+  it('records only the bounded provider detail and never invents a zero on failure', async () => {
+    const api = new FakeApi().set('alpha', { errors: { fetchRepo: new GhApiError(`alpha: ${'x'.repeat(4000)}`) } });
+    const h = harness({ api });
+    const entry = row(await h.tracker.refresh(), 'alpha');
+    expect(entry.openPrs).toBeNull();
+    expect(entry.freshness).toBe('unavailable');
+    expect((entry.error as string).length).toBeLessThanOrEqual(300);
+  });
+});
+
+// ------------------------------------------------------------------
+// Pure helpers
+// ------------------------------------------------------------------
+
+describe('managed repo overview — pure helpers', () => {
+  it('classifies remote reasons without guessing an identity', () => {
+    const resolver = (value: RepoRef | null) => () => value;
+    expect(classifyRemote('/ws/a', resolver(null)).kind).toBe('unlinked');
+    expect(classifyRemote('/ws/a', resolver({ host: 'gitlab.com', owner: 'o', repo: 'r' }))).toEqual({
+      kind: 'unlinked',
+      reason: 'non-GitHub remote',
+    });
+    expect(classifyRemote('/ws/a', resolver({ host: 'github.com', owner: '..', repo: 'r' })).kind).toBe('unlinked');
+    expect(classifyRemote('/ws/a', resolver(githubRef('alpha')))).toEqual({ kind: 'linked', ref: githubRef('alpha') });
+  });
+
+  it('builds safe https links only for safe GitHub identities', () => {
+    expect(githubRepoLink(githubRef('alpha'))).toBe('https://github.com/acme/alpha');
+    expect(githubRepoLink({ host: 'gitlab.com', owner: 'acme', repo: 'alpha' })).toBeNull();
+    expect(githubRepoLink({ host: 'github.com', owner: 'acme evil', repo: 'alpha' })).toBeNull();
+    expect(githubRepoLink({ host: 'github.com', owner: '..', repo: 'alpha' })).toBeNull();
+  });
+
+  it('accepts run URLs only on the repository host over https', () => {
+    expect(safeRunUrl('https://github.com/acme/alpha/actions/runs/1', 'github.com')).toBe(
+      'https://github.com/acme/alpha/actions/runs/1',
+    );
+    expect(safeRunUrl('http://github.com/acme/alpha/actions/runs/1', 'github.com')).toBeNull();
+    expect(safeRunUrl('https://evil.example/actions/runs/1', 'github.com')).toBeNull();
+    expect(safeRunUrl('javascript:alert(1)', 'github.com')).toBeNull();
+    expect(safeRunUrl(null, 'github.com')).toBeNull();
+  });
+
+  it('classifies provider failures by kind, with rate limit and auth as global conditions', () => {
+    expect(classifyGhError(new GhRateLimitedError('x'))).toBe('rate-limit');
+    expect(classifyGhError(new GhApiError('HTTP 403: API rate limit exceeded'))).toBe('rate-limit');
+    expect(classifyGhError(new GhApiError('gh is unavailable (spawn failed)'))).toBe('auth');
+    expect(classifyGhError(new GhApiError('HTTP 401: Bad credentials'))).toBe('auth');
+    expect(classifyGhError(new GhApiError('HTTP 403: Forbidden'))).toBe('permission');
+    expect(classifyGhError(new GhApiError('HTTP 404: Not Found'))).toBe('not-found');
+    expect(classifyGhError(new GhApiError('HTTP 500: server error'))).toBe('other');
+  });
+});
+
+// ------------------------------------------------------------------
+// gh CLI adapter
+// ------------------------------------------------------------------
+
+interface RecordingRunner {
+  readonly calls: string[][];
+  readonly runner: GhCommandRunner;
+}
+
+function ghRunner(results: readonly GhCommandResult[]): RecordingRunner {
+  const calls: string[][] = [];
+  let index = 0;
+  return {
+    calls,
+    runner: async (args) => {
+      calls.push([...args]);
+      const result = results[index];
+      index += 1;
+      return result ?? { status: 1, stdout: '', stderr: 'runner exhausted' };
+    },
+  };
+}
+
+function ok(stdout: string): GhCommandResult {
+  return { status: 0, stdout, stderr: '' };
+}
+
+describe('managed repo overview — gh adapter', () => {
+  it('reads repo metadata, exact search counts, workflows and default-branch runs over the documented paths', async () => {
+    const recorder = ghRunner([
+      ok(JSON.stringify({ default_branch: 'trunk' })),
+      ok(JSON.stringify({ total_count: 3, incomplete_results: false })),
+      ok(JSON.stringify({ total_count: 39, incomplete_results: false })),
+      ok(JSON.stringify({ total_count: 1 })),
+      ok(
+        JSON.stringify({
+          workflow_runs: [
+            {
+              id: 42,
+              name: 'CI',
+              status: 'completed',
+              conclusion: 'success',
+              html_url: 'https://github.com/acme/alpha/actions/runs/42',
+              run_number: 12,
+              run_started_at: '2026-10-07T10:00:00Z',
+              updated_at: '2026-10-07T10:05:00Z',
+            },
+          ],
+        }),
+      ),
+    ]);
+    const api = new GhRepoOverviewApi(recorder.runner);
+    const repo = githubRef('alpha');
+    expect(await api.fetchRepo({ repo })).toEqual({ defaultBranch: 'trunk' });
+    expect(await api.countOpenPulls({ repo })).toBe(3);
+    expect(await api.countOpenIssues({ repo })).toBe(39);
+    expect(await api.countWorkflows({ repo })).toEqual({ kind: 'ok', value: 1 });
+    expect(await api.latestRuns({ repo, branch: 'trunk', limit: 3 })).toEqual({
+      kind: 'ok',
+      value: [
+        {
+          id: 42,
+          name: 'CI',
+          status: 'completed',
+          conclusion: 'success',
+          url: 'https://github.com/acme/alpha/actions/runs/42',
+          runNumber: 12,
+          createdAt: '2026-10-07T10:00:00Z',
+          updatedAt: '2026-10-07T10:05:00Z',
+        },
+      ],
+    });
+    const paths = recorder.calls.map((args) => args[3]);
+    expect(paths[0]).toBe('repos/acme/alpha');
+    expect(paths[1]).toBe('search/issues?q=repo%3Aacme%2Falpha+is%3Aopen+is%3Apr&per_page=1');
+    expect(paths[2]).toBe('search/issues?q=repo%3Aacme%2Falpha+is%3Aopen+is%3Aissue&per_page=1');
+    expect(paths[3]).toBe('repos/acme/alpha/actions/workflows?per_page=1');
+    expect(paths[4]).toBe('repos/acme/alpha/actions/runs?branch=trunk&per_page=3');
+    for (const args of recorder.calls) {
+      expect(args.slice(0, 2)).toEqual(['api', '--hostname']);
+      expect(args[2]).toBe('github.com');
+    }
+  });
+
+  it('raises a rate-limit error on a rate-limit stderr and a plain error otherwise', async () => {
+    const limited = new GhRepoOverviewApi(ghRunner([{ status: 1, stdout: '', stderr: 'gh: rate limit exceeded (HTTP 403)' }]).runner);
+    await expect(limited.countOpenPulls({ repo: githubRef('alpha') })).rejects.toBeInstanceOf(GhRateLimitedError);
+    const refused = new GhRepoOverviewApi(ghRunner([{ status: 1, stdout: '', stderr: 'gh: Not Found (HTTP 404)' }]).runner);
+    await expect(refused.fetchRepo({ repo: githubRef('alpha') })).rejects.toBeInstanceOf(GhApiError);
+  });
+
+  it('treats Actions-disabled (404/409) as an observable state, never as repo metadata failure', async () => {
+    const workflows404 = new GhRepoOverviewApi(
+      ghRunner([{ status: 1, stdout: '', stderr: 'gh: Not Found (HTTP 404)' }]).runner,
+    );
+    expect(await workflows404.countWorkflows({ repo: githubRef('alpha') })).toEqual({ kind: 'actions-unavailable' });
+
+    const runs409 = new GhRepoOverviewApi(
+      ghRunner([{ status: 1, stdout: '', stderr: 'gh: GitHub Actions is disabled for this repository. (HTTP 409)' }]).runner,
+    );
+    expect(await runs409.latestRuns({ repo: githubRef('alpha'), branch: 'main', limit: 3 })).toEqual({
+      kind: 'actions-unavailable',
+    });
+  });
+
+  it('rejects incomplete search aggregates instead of presenting them as exact', async () => {
+    const api = new GhRepoOverviewApi(
+      ghRunner([ok(JSON.stringify({ total_count: 3, incomplete_results: true }))]).runner,
+    );
+    await expect(api.countOpenPulls({ repo: githubRef('alpha') })).rejects.toThrow(/incomplete/);
+  });
+
+  it('fails loud on malformed provider shapes', async () => {
+    const badTotal = new GhRepoOverviewApi(ghRunner([ok('{}')]).runner);
+    await expect(badTotal.countOpenPulls({ repo: githubRef('alpha') })).rejects.toThrow(/total_count/);
+    const badBranch = new GhRepoOverviewApi(ghRunner([ok('{}')]).runner);
+    await expect(badBranch.fetchRepo({ repo: githubRef('alpha') })).rejects.toThrow(/default_branch/);
+    const badRuns = new GhRepoOverviewApi(ghRunner([ok('{}')]).runner);
+    await expect(badRuns.latestRuns({ repo: githubRef('alpha'), branch: 'main', limit: 3 })).rejects.toThrow(
+      /workflow_runs/,
+    );
+    const badJson = new GhRepoOverviewApi(ghRunner([ok('not-json')]).runner);
+    await expect(badJson.fetchRepo({ repo: githubRef('alpha') })).rejects.toThrow(/invalid JSON/);
+  });
+});

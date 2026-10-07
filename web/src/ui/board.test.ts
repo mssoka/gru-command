@@ -111,6 +111,7 @@ function snapshot(
     unackedNeedsOwner?: number;
     wakes?: { readonly count: number; readonly lastAt: string | null };
     ownerPrs?: NonNullable<BoardSnapshot['ownerPrs']>;
+    repoOverview?: NonNullable<BoardSnapshot['repoOverview']>;
     pipeline?: NonNullable<BoardSnapshot['pipeline']>;
   } = {},
 ): BoardSnapshot {
@@ -140,6 +141,7 @@ function snapshot(
     wakes: options.wakes ?? { count: 0, lastAt: null },
     ownerPrs: options.ownerPrs,
     pipeline: options.pipeline,
+    repoOverview: options.repoOverview,
   };
 }
 
@@ -165,6 +167,7 @@ function mountBoardDom(): void {
     <section id="board-owner" hidden></section>
     <div id="board-jobs"></div>
     <div id="board-agents"></div>
+    <section id="board-repos" data-rail-panel="agents"></section>
     <span id="rail-agents-count">0</span>
     <button id="notification-bell"><span id="notification-badge">0</span></button>
     <div id="notification-panel"><div id="notification-list"></div></div>
@@ -2672,7 +2675,7 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     const client2 = stubClient();
     document.body.innerHTML = `<div hidden><section id="board-owner"></section></div>
       <div id="chip-rail" hidden><span id="board-decisions"></span><span id="board-unacked" hidden></span><span id="board-wakes" hidden></span></div>
-      <div id="board-jobs"></div><div id="board-agents"></div><span id="rail-agents-count">0</span>
+      <div id="board-jobs"></div><div id="board-agents"></div><section id="board-repos" data-rail-panel="agents"></section><span id="rail-agents-count">0</span>
       <nav id="board-nav" hidden></nav>
       <button id="notification-bell"><span id="notification-badge">0</span></button>
       <div id="notification-panel"><div id="notification-list"></div></div>`;
@@ -3080,5 +3083,96 @@ describe('board v6 — snapshot-resolved focus fallback (Perkins r2 warning)', (
     expect(active?.tagName).toBe('BUTTON');
     expect((active as HTMLElement).className).toContain('board-band__more');
     expect((active as HTMLElement).closest('.board-band')?.getAttribute('data-section')).toBe('cold');
+  });
+});
+
+describe('managed repository overview in the crew rail', () => {
+  beforeEach(mountBoardDom);
+
+  const checked = '2026-01-01T00:00:00.000Z';
+  const overview = {
+    rows: [
+      {
+        key: 'alpha',
+        displayName: 'alpha',
+        linked: true,
+        link: 'https://github.com/acme/alpha',
+        linkReason: null,
+        fullName: 'acme/alpha',
+        openPrs: 2,
+        openIssues: 3,
+        run: {
+          state: 'running',
+          status: 'in_progress',
+          conclusion: null,
+          workflow: 'checks',
+          branch: 'main',
+          runNumber: 8,
+          url: 'https://github.com/acme/alpha/actions/runs/8',
+          runStartedAt: checked,
+          runUpdatedAt: checked,
+        },
+        freshness: 'fresh',
+        checkedAt: checked,
+        lastAttemptAt: checked,
+        error: null,
+      },
+      {
+        key: 'beta',
+        displayName: 'beta',
+        linked: false,
+        link: null,
+        linkReason: 'non-GitHub remote',
+        fullName: null,
+        openPrs: null,
+        openIssues: null,
+        run: null,
+        freshness: 'unchecked',
+        checkedAt: null,
+        lastAttemptAt: null,
+        error: null,
+      },
+    ],
+  } as const;
+
+  it('renders the read-only overview below the crew list without disturbing the crew', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        agents: [agent('worker-1', { role: 'minion', state: 'idle' })],
+        repoOverview: overview,
+      }),
+    );
+    const crew = document.getElementById('board-agents')!;
+    const repos = document.getElementById('board-repos')!;
+    expect(crew.querySelectorAll('.board-agent')).toHaveLength(1);
+    expect(document.getElementById('rail-agents-count')?.textContent).toBe('1');
+    expect(repos.querySelectorAll('.repo-row')).toHaveLength(2);
+    expect(repos.querySelector('.repo-row__name')?.textContent).toBe('alpha');
+    expect(repos.querySelectorAll('.repo-row__badge-text')[0]?.textContent).toBe('RUNNING');
+    expect(repos.querySelectorAll('.repo-row__badge-text')[1]?.textContent).toBe('NOT LINKED');
+    // The module lives after the crew panel in DOM order under the same rail
+    // panel marker, so the CREW/TRANSCRIPTS toggle can hide it as one unit.
+    expect(crew.compareDocumentPosition(repos) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(repos.dataset.railPanel).toBe('agents');
+  });
+
+  it('renders nothing when the snapshot carries no overview (pre-upgrade or first refresh pending)', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({ agents: [agent('worker-1', { role: 'minion', state: 'idle' })] }));
+    expect(document.getElementById('board-repos')?.childElementCount).toBe(0);
+  });
+
+  it('renders the explicit empty-registry note when the registry is empty', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({ repoOverview: { rows: [] } as unknown as NonNullable<BoardSnapshot['repoOverview']> }));
+    expect(document.getElementById('board-repos')?.textContent).toContain('No managed repositories');
+  });
+
+  it('replaces the previous overview on a live push instead of stacking rows', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({ repoOverview: overview }));
+    view.render(snapshot({ repoOverview: { rows: [overview.rows[0]] } as unknown as NonNullable<BoardSnapshot['repoOverview']> }));
+    expect(document.querySelectorAll('#board-repos .repo-row')).toHaveLength(1);
   });
 });

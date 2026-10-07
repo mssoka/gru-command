@@ -297,6 +297,72 @@ export interface PipelineView {
   readonly pending: number;
 }
 
+/** Managed repository overview (owner-approved compact rows A): one
+ * row per configured managed repository. Server-computed and additive —
+ * absent/null on pre-upgrade servers and until the tracker's first
+ * refresh pass, in which case the board hides the section entirely.
+ * Counts are repo-wide exact totals (issues excluding PRs); the run is
+ * the newest Actions run on the repository's discovered default branch,
+ * never deployment health. */
+export type RepoOverviewRunState =
+  | 'passed'
+  | 'failed'
+  | 'timed-out'
+  | 'startup-failure'
+  | 'action-required'
+  | 'cancelled'
+  | 'skipped'
+  | 'neutral'
+  | 'stale-run'
+  | 'running'
+  | 'queued'
+  | 'no-workflow'
+  | 'never-run'
+  | 'unavailable'
+  | 'unknown';
+
+export type RepoOverviewFreshness = 'unchecked' | 'fresh' | 'stale' | 'unavailable';
+
+/** One observed run. `status`/`conclusion` are raw provider strings
+ * (untrusted display text); `url` is https on the repository host only. */
+export interface RepoOverviewRunView {
+  readonly state: RepoOverviewRunState;
+  readonly status: string | null;
+  readonly conclusion: string | null;
+  readonly workflow: string | null;
+  readonly branch: string | null;
+  readonly runNumber: number | null;
+  readonly url: string | null;
+  readonly runStartedAt: string | null;
+  readonly runUpdatedAt: string | null;
+}
+
+export interface RepoOverviewRowView {
+  /** Stable registry identity (repository directory name). */
+  readonly key: string;
+  readonly displayName: string;
+  readonly linked: boolean;
+  readonly link: string | null;
+  readonly linkReason: string | null;
+  readonly fullName: string | null;
+  /** Exact repo-wide open pull-request count (null = not proven). */
+  readonly openPrs: number | null;
+  /** Exact open-issue count EXCLUDING pull requests (null = not proven). */
+  readonly openIssues: number | null;
+  readonly run: RepoOverviewRunView | null;
+  readonly freshness: RepoOverviewFreshness;
+  /** Last successful complete observation (ISO); null = none yet. */
+  readonly checkedAt: string | null;
+  /** Last observation attempt (ISO); null = never attempted. */
+  readonly lastAttemptAt: string | null;
+  /** Last failed attempt detail; null = clean. */
+  readonly error: string | null;
+}
+
+export interface RepoOverviewView {
+  readonly rows: readonly RepoOverviewRowView[];
+}
+
 export interface BoardSnapshot {
   readonly repos: readonly { readonly name: string; readonly jobs: readonly JobView[] }[];
   readonly agents: readonly AgentView[];
@@ -338,6 +404,11 @@ export interface BoardSnapshot {
   /** FOR YOU PR rows (owner approval 2026-09-28); absent on pre-upgrade
   * servers (validator tolerates; the band renders ack rows only). */
   readonly ownerPrs?: readonly OwnerPrView[] | null;
+  /** Managed repository overview (owner-approved compact rows A); absent
+  * on pre-upgrade servers and null until the tracker's first refresh
+  * pass (the board then hides the section rather than claiming an empty
+  * registry). A present block is validated strictly below. */
+  readonly repoOverview?: RepoOverviewView | null;
   /** Issue #161: tracker-wide child counters; absent on pre-upgrade
   * servers (the strip then renders no child numbers). */
   readonly children?: ChildWorkerCounts | null;
@@ -706,6 +777,103 @@ function isOwnerPrView(value: unknown): value is OwnerPrView {
   }
 }
 
+/** Managed repository overview: known run states and freshness classes —
+ * an unknown string is a server bug, never a silently tolerated value. */
+const REPO_OVERVIEW_RUN_STATES = [
+  'passed',
+  'failed',
+  'timed-out',
+  'startup-failure',
+  'action-required',
+  'cancelled',
+  'skipped',
+  'neutral',
+  'stale-run',
+  'running',
+  'queued',
+  'no-workflow',
+  'never-run',
+  'unavailable',
+  'unknown',
+] as const;
+
+const REPO_OVERVIEW_FRESHNESS = ['unchecked', 'fresh', 'stale', 'unavailable'] as const;
+
+function isRepoOverviewRunState(value: unknown): value is RepoOverviewRunState {
+  return typeof value === 'string' && (REPO_OVERVIEW_RUN_STATES as readonly string[]).includes(value);
+}
+
+function isRepoOverviewFreshness(value: unknown): value is RepoOverviewFreshness {
+  return typeof value === 'string' && (REPO_OVERVIEW_FRESHNESS as readonly string[]).includes(value);
+}
+
+function isNullableIso(value: unknown): value is string | null {
+  return value === null || (typeof value === 'string' && Number.isFinite(Date.parse(value)));
+}
+
+function isSafeCountOrNull(value: unknown): value is number | null {
+  return value === null || (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0);
+}
+
+/** hrefs are https-or-nothing (the same fail-closed rule as ownerPrs). */
+function isHttpsUrlOrNull(value: unknown): value is string | null {
+  if (value === null) return true;
+  if (typeof value !== 'string') return false;
+  try {
+    return new URL(value).protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+function isRepoOverviewRunView(value: unknown): value is RepoOverviewRunView {
+  return (
+    isRecord(value) &&
+    isRepoOverviewRunState(value.state) &&
+    (value.status === null || typeof value.status === 'string') &&
+    (value.conclusion === null || typeof value.conclusion === 'string') &&
+    (value.workflow === null || typeof value.workflow === 'string') &&
+    (value.branch === null || typeof value.branch === 'string') &&
+    (value.runNumber === null ||
+      (typeof value.runNumber === 'number' && Number.isSafeInteger(value.runNumber) && value.runNumber >= 0)) &&
+    isHttpsUrlOrNull(value.url) &&
+    isNullableIso(value.runStartedAt) &&
+    isNullableIso(value.runUpdatedAt)
+  );
+}
+
+function isRepoOverviewRowView(value: unknown): value is RepoOverviewRowView {
+  if (
+    !isRecord(value) ||
+    typeof value.key !== 'string' ||
+    value.key === '' ||
+    typeof value.displayName !== 'string' ||
+    value.displayName === '' ||
+    typeof value.linked !== 'boolean' ||
+    !isHttpsUrlOrNull(value.link) ||
+    (value.linkReason !== null && typeof value.linkReason !== 'string') ||
+    (value.fullName !== null && typeof value.fullName !== 'string') ||
+    !isSafeCountOrNull(value.openPrs) ||
+    !isSafeCountOrNull(value.openIssues) ||
+    (value.run !== null && !isRepoOverviewRunView(value.run)) ||
+    !isRepoOverviewFreshness(value.freshness) ||
+    !isNullableIso(value.checkedAt) ||
+    !isNullableIso(value.lastAttemptAt) ||
+    (value.error !== null && typeof value.error !== 'string')
+  ) {
+    return false;
+  }
+  // Coherence: a linked row has a link and no reason; an unlinked row has
+  // a reason and no link. Server-side guarantee, enforced here so a
+  // malformed row can never render as a guessed identity.
+  if (value.linked) return value.link !== null && value.linkReason === null;
+  return value.link === null && value.linkReason !== null;
+}
+
+function isRepoOverviewView(value: unknown): value is RepoOverviewView {
+  return isRecord(value) && Array.isArray(value.rows) && value.rows.every(isRepoOverviewRowView);
+}
+
 function isWakesView(value: unknown): boolean {
   if (
     !(
@@ -768,6 +936,12 @@ export function isValidSnapshot(value: unknown): value is BoardSnapshot {
   // present block must match its shape — readiness is server authority.
   if (value.ownerPrs !== undefined && value.ownerPrs !== null && !Array.isArray(value.ownerPrs)) return false;
   if (Array.isArray(value.ownerPrs) && !value.ownerPrs.every(isOwnerPrView)) return false;
+  // Managed repository overview: optional (pre-upgrade/not-yet-refreshed)
+  // but strictly typed when present — a malformed row must never render a
+  // guessed identity, count or link.
+  if (value.repoOverview !== undefined && value.repoOverview !== null && !isRepoOverviewView(value.repoOverview)) {
+    return false;
+  }
   // Issue #161: the tracker-wide child counters are optional (pre-upgrade
   // servers) but strictly typed when present.
   if (value.children !== undefined && value.children !== null && !isChildCounts(value.children)) return false;

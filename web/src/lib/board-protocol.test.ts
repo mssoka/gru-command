@@ -366,6 +366,79 @@ describe('board server-frame validator', () => {
     expect(isValidSnapshot({ ...snapshot(), ownerPrs: { not: 'an array' } } as unknown)).toBe(false);
   });
 
+  it('managed repo overview: absent/null tolerated, well-formed accepted, malformed rejected', () => {
+    expect(isValidSnapshot(snapshot())).toBe(true);
+    expect(isValidSnapshot({ ...snapshot(), repoOverview: null } as unknown)).toBe(true);
+
+    const run = {
+      state: 'passed',
+      status: 'completed',
+      conclusion: 'success',
+      workflow: 'CI',
+      branch: 'main',
+      runNumber: 12,
+      url: 'https://github.com/example/demo/actions/runs/42',
+      runStartedAt: '2026-01-01T00:00:00.000Z',
+      runUpdatedAt: '2026-01-01T00:05:00.000Z',
+    };
+    const row = {
+      key: 'demo',
+      displayName: 'demo',
+      linked: true,
+      link: 'https://github.com/example/demo',
+      linkReason: null,
+      fullName: 'example/demo',
+      openPrs: 0,
+      openIssues: 3,
+      run,
+      freshness: 'fresh',
+      checkedAt: '2026-01-01T00:06:00.000Z',
+      lastAttemptAt: '2026-01-01T00:06:00.000Z',
+      error: null,
+    };
+    expect(isValidSnapshot({ ...snapshot(), repoOverview: { rows: [row] } } as unknown)).toBe(true);
+    expect(isValidSnapshot({ ...snapshot(), repoOverview: { rows: [] } } as unknown)).toBe(true);
+
+    const unlinked = {
+      ...row,
+      linked: false,
+      link: null,
+      linkReason: 'non-GitHub remote',
+      fullName: null,
+      openPrs: null,
+      openIssues: null,
+      run: null,
+      freshness: 'unchecked',
+      checkedAt: null,
+      lastAttemptAt: null,
+    };
+    expect(isValidSnapshot({ ...snapshot(), repoOverview: { rows: [unlinked] } } as unknown)).toBe(true);
+
+    // Strictness: an unknown state/freshness, a negative or fractional count,
+    // a non-https or malformed URL, inconsistent link coherence or an
+    // unparseable timestamp must never render.
+    for (const broken of [
+      { ...row, run: { ...run, state: 'vibes' } },
+      { ...row, run: { ...run, url: 'javascript:alert(1)' } },
+      { ...row, freshness: 'maybe' },
+      { ...row, openPrs: -1 },
+      { ...row, openIssues: 1.5 },
+      { ...row, link: 'https://evil.example/demo' , linkReason: 'why' },
+      { ...row, linked: false },
+      { ...unlinked, link: 'https://github.com/example/demo' },
+      { ...row, checkedAt: 'not-a-date' },
+      { ...row, key: '' },
+      { ...row, run: { ...run, runNumber: -2 } },
+    ]) {
+      expect(
+        isValidSnapshot({ ...snapshot(), repoOverview: { rows: [broken] } } as unknown),
+        JSON.stringify(broken),
+      ).toBe(false);
+    }
+    expect(isValidSnapshot({ ...snapshot(), repoOverview: { rows: 'nope' } } as unknown)).toBe(false);
+    expect(isValidSnapshot({ ...snapshot(), repoOverview: { rows: [null] } } as unknown)).toBe(false);
+  });
+
   it('activeDecisions (issue #218): absent/null tolerated, well-formed accepted, malformed rejected', () => {
     expect(isValidSnapshot(snapshot())).toBe(true);
     const nullDecisions = { ...snapshot(), activeDecisions: null, activeDecisionCount: null } as unknown;

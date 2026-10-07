@@ -86,6 +86,17 @@ export default defineConfig({
       use: { baseURL: `http://localhost:${PREVIEW_PORT}` },
     },
     {
+      // Managed repository overview (owner-approved compact rows A):
+      // synthetic WebSocket-seeded snapshots only (the dev mock's default
+      // board is untouched); light/dark desktop+narrow geometry captures
+      // land under the gitignored lane root. Its own output dir, same
+      // reasoning as crew-rail.
+      name: 'repo-overview',
+      testMatch: 'repo-overview.spec.ts',
+      outputDir: 'test-results-repo-overview',
+      use: { baseURL: `http://localhost:${PREVIEW_PORT}` },
+    },
+    {
       name: 'real',
       testMatch: 'real-server.spec.ts',
       use: { baseURL: `http://localhost:${REAL_PORT}` },

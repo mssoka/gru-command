@@ -16,6 +16,7 @@ import { TranscriptService } from '../src/transcripts/service.js';
 import { loadConfig } from '../src/config.js';
 import { DecisionRuntime } from '../src/decisions/runtime.js';
 import { ROLE_DEFINITIONS } from '../src/roles.js';
+import type { RepoOverviewView } from '../src/repos/overview.js';
 
 const cleanupDirs: string[] = [];
 afterAll(() => {
@@ -30,7 +31,10 @@ function tmpDir(): string {
 
 async function boot(
   token: string,
-  overrides: Partial<{ heartbeatMs: number }> = {},
+  overrides: Partial<{
+    heartbeatMs: number;
+    repoOverview: () => RepoOverviewView | null;
+  }> = {},
 ): Promise<{
   port: number;
   api: LedgerApi;
@@ -55,7 +59,12 @@ async function boot(
   const db = new LedgerDb(dir);
   const bus = new EventBus();
   const api = new LedgerApi(db.handle, { bus });
-  const engine = new BoardEngine({ ledger: api, bus });
+  const { repoOverview, ...serverOverrides } = overrides;
+  const engine = new BoardEngine({
+    ledger: api,
+    bus,
+    ...(repoOverview !== undefined ? { repoOverview } : {}),
+  });
   const notifications = new NotificationCenter({ ledger: api, bus });
   const decisions = new DecisionRuntime(cfg.decisions, {
     instanceDir: cfg.instanceDir,
@@ -73,7 +82,7 @@ async function boot(
     decisionsStatus: () => decisions.status(),
     onDecisionsRecheck: () => decisions.recheck(),
     pushDebounceMs: 10,
-    ...overrides,
+    ...serverOverrides,
   });
   const http: HttpServer = createServer((req, res) => {
     if (board.requestHook(req, res, new URL(req.url ?? '/', 'http://localhost').pathname)) return;
@@ -188,6 +197,48 @@ describe('board server — HTTP API', () => {
     expect(ok.body).toHaveProperty('agents');
     expect(ok.body).toHaveProperty('notifications');
     expect(ok.body).toHaveProperty('decisions', expect.objectContaining({ status: 'disabled' }));
+    // Managed repository overview rides the same authenticated snapshot
+    // additively; unwired producers render null (the web hides the section).
+    expect(ok.body).toHaveProperty('repoOverview', null);
+  });
+
+  it('GET /api/board carries the additive repoOverview projection when wired', async () => {
+    const view: RepoOverviewView = {
+      rows: [
+        {
+          key: 'alpha',
+          displayName: 'alpha',
+          linked: true,
+          link: 'https://github.com/acme/alpha',
+          linkReason: null,
+          fullName: 'acme/alpha',
+          openPrs: 2,
+          openIssues: 3,
+          run: {
+            state: 'passed',
+            status: 'completed',
+            conclusion: 'success',
+            workflow: 'CI',
+            branch: 'main',
+            runNumber: 4,
+            url: 'https://github.com/acme/alpha/actions/runs/4',
+            runStartedAt: '2026-10-07T10:00:00.000Z',
+            runUpdatedAt: '2026-10-07T10:05:00.000Z',
+          },
+          freshness: 'fresh',
+          checkedAt: '2026-10-07T10:06:00.000Z',
+          lastAttemptAt: '2026-10-07T10:06:00.000Z',
+          error: null,
+        },
+      ],
+    };
+    const wired = await boot('board-test-token', { repoOverview: () => view });
+    try {
+      const body = (await getJson(wired.port, '/api/board', 'board-test-token')).body as { repoOverview: unknown };
+      expect(body.repoOverview).toEqual(view);
+    } finally {
+      await wired.close();
+    }
   });
 
   it('machine disposition is authenticated, requires an action detail, and never resolves an owner stop', async () => {

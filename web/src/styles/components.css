@@ -2541,6 +2541,198 @@ body {
   font-style: italic;
 }
 
+/* ── Managed repository overview (owner-approved compact rows A) ──
+   A read-only module below the crew list: one shared-border list, rows
+   in the same rhythm (identity + status chip, two exact counts, CI
+   context + checked age, optional disclosure). The list scrolls inside
+   its own bound so a growing registry never displaces the crew list's
+   independent scroll; the section follows the CREW tab's visibility. */
+.repo-overview {
+  display: grid;
+  gap: 7px;
+  align-content: start;
+  min-width: 0;
+}
+
+/* No data (feature unwired or first refresh pending): no section at all. */
+.repo-overview:empty {
+  display: none;
+}
+
+.repo-overview__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.repo-overview__title {
+  font-size: 13px;
+  font-weight: 900;
+  letter-spacing: 0.01em;
+  min-width: 0;
+}
+
+.repo-overview__sub {
+  margin: 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.35;
+}
+
+.repo-overview__empty {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.repo-overview__list {
+  min-width: 0;
+  border: var(--outline-thin);
+  border-radius: var(--radius-sm);
+  background: var(--card);
+  max-height: min(52vh, 460px);
+  overflow-y: auto;
+}
+
+.repo-row {
+  min-width: 0;
+  padding: 8px 9px 9px;
+}
+
+.repo-row + .repo-row {
+  border-top: 1px solid color-mix(in srgb, var(--line) 38%, transparent);
+}
+
+.repo-row__top {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 6px;
+  min-width: 0;
+}
+
+.repo-row__name {
+  font-size: 12px;
+  font-weight: 900;
+  line-height: 1.24;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--ink);
+  text-decoration: none;
+}
+
+a.repo-row__name:hover {
+  text-decoration: underline;
+}
+
+.repo-row__name:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 1px;
+}
+
+.repo-row__badge {
+  flex: none;
+  font-size: 9px;
+  letter-spacing: 0.03em;
+  padding: 1px 7px;
+  gap: 3px;
+  line-height: 1.4;
+}
+
+.repo-row__badge-glyph {
+  font-size: 9.5px;
+}
+
+.repo-row__metrics {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 5px;
+  margin: 6px 0 4px;
+  min-width: 0;
+}
+
+.repo-row__metric {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  min-width: 0;
+}
+
+.repo-row__metric-count {
+  font-size: 15px;
+  font-weight: 900;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  flex: none;
+}
+
+.repo-row__metric-label {
+  font-size: 9.5px;
+  font-weight: 800;
+  color: var(--muted);
+  line-height: 1.15;
+  letter-spacing: 0.02em;
+  min-width: 0;
+}
+
+.repo-row__metric-sub {
+  display: block;
+  font-style: normal;
+  font-weight: 700;
+}
+
+.repo-row__meta {
+  display: flex;
+  flex-wrap: wrap;
+  column-gap: 6px;
+  row-gap: 1px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.3;
+  min-width: 0;
+}
+
+.repo-row__meta b {
+  color: var(--ink);
+  font-weight: 700;
+}
+
+.repo-row__ci {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.repo-row__ci-link {
+  color: var(--ink);
+  font-weight: 700;
+}
+
+.repo-row__ci-link:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 1px;
+}
+
+.repo-row__age {
+  white-space: normal;
+  min-width: 0;
+}
+
+.repo-row__note {
+  margin: 4px 0 0;
+  font-size: 9.5px;
+  line-height: 1.3;
+  font-weight: 700;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+
+.repo-row__note--grey {
+  color: var(--muted);
+}
+
 .board-bell {
   position: relative;
 }

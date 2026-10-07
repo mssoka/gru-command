@@ -1,0 +1,122 @@
+---
+title: 'Managed repository overview — compact rows below the crew list'
+type: 'feature'
+created: '2026-10-07'
+status: 'in-progress'
+route: 'dispatch'
+baseline_commit: '49b558f243c7bacbfb46c7bc04f749bf131cefea'
+review_loop_iteration: 0
+context: []
+---
+
+<frozen-after-approval reason="human-owned intent — do not modify unless human renegotiates">
+
+## Intent
+
+**Problem:** The right crew rail ends in a large quiet zone; the owner has no at-a-glance, read-only view of the managed repositories' GitHub state (open PRs, open issues excluding PRs, latest default-branch Actions run and its freshness). The owner selected compact rows "A" from the resumed mockup (job repo-status-mockups) and ordered immediate implementation (j-1259).
+
+**Approach:** Add a read-only "Managed repositories" module below the crew list inside the existing rail: compact rows (repo identity + link when provable, exact open-PR and open-issue-excluding-PR counts, latest default-branch Actions run as workflow · branch + outcome + safe link, checked age), matching the approved Option A light/dark palette/type/spacing. Server-side: a background tracker derives rows from the configured managed-repo registry (workspace_root + the wizard's depth-1 `.git` discovery rule), resolves each origin remote, and reads GitHub through the existing authenticated `gh` seam on a bounded cadence with per-repo atomic observations, caching, and explicit stale/unavailable labeling. Board snapshot gains one additive typed `repoOverview` field.
+
+## Boundaries & Constraints
+
+**Always:** rows derive from the configured registry only (no hard-coded examples, no arbitrary scans); stable registry order; missing/non-GitHub/malformed remotes stay honestly not-linked — never a guessed identity or manufactured zero; counts are repository-wide exact totals via aggregate endpoints (issues exclude PRs), zero is a successful observed count, loading/failure/missing is never zero; the run shown is the newest run on the repo's actual discovered default branch (queued/running supersedes an older completed result), labeled as default-branch CI only, never deployment health, aggregate CI or merge readiness; `checkedAt` is the last successful server-side fetch completion, never render time; cached data survives errors only with explicit stale/unavailable labels, age and error, and an old green never reads as current; all reads are server-side through the existing `gh` auth seam inside the new tracker's bounded cadence/budget (no browser polling, no credentials in payload/logs, no unbounded fan-out or retry loop); additive optional-field snapshot/protocol compatibility; six board sections, counts/classification, Binned/Pipeline semantics, crew/disposed/history controls, transcript switching, scrolling, notifications/owner controls, slim KPI/For-you presentation and section-collapse behavior all unchanged; light/dark + narrow geometry with visible status text/glyph as well as color, safe focus and links, stable numeric layout, no horizontal overflow; provider strings render as untrusted text.
+
+**Never:** no extra sorting preferences, repo-management UI, workflow selectors, new themes or dashboards; no changes to existing repo actions; overview reads/disclosures never ACK, execute or change GitHub state; no GitHub mutation; no new runtime dependencies, config keys, auth/provider changes, force pushes or source-history merges; no private screenshots, copied comparison HTML, mock controls or sample facts in app/public artifacts; no touching the slim-strip or section-toggle sibling lanes; original repo-status-mockups stays unchanged.
+
+## I/O & Edge-Case Matrix
+
+| Scenario | Input / State | Expected Output / Behavior | Error Handling |
+|----------|--------------|---------------------------|----------------|
+| REGISTRY_ROWS | configured workspace_root with N managed repos | exactly N stable-ordered rows; additions appear unchecked, removals drop; crew list untouched | unreadable root → empty registry, not an error |
+| REMOTE_UNLINKED | repo without origin / non-GitHub host / malformed remote | linked=false, `linkReason`, counts/run null, NOT LINKED badge | no GitHub call spent on it |
+| COUNTS | 0 / nonzero / multi-page (>100) totals; `incomplete_results` | exact `total_count` for `is:open is:pr` and `is:open is:issue`; zero shown as 0 | incomplete/malformed → attempt fails, prior data kept stale |
+| RUN_STATES | success/failure/timed_out/cancelled/skipped/neutral/action_required/stale/startup_failure; completed/in_progress/queued family | mapped to the fixed state list with text+glyph; newest run by (createdAt,id) wins over older passed | unrecognized status/conclusion → `unknown` |
+| RUN_EMPTY | workflows=0; workflows>0 but no run on default branch | `no-workflow`; `never-run` — never inferred from an empty run page alone | N/A |
+| RUN_URL | provider run URL | https link only when hostname equals the repo host; else dropped to null | unsafe URL never rendered as href |
+| FETCH_FAIL | one repo's call fails (permission/not-found/other) | that repo keeps its previous complete observation as `stale` (or `unavailable` with none) + error/age; other repos still refresh | rate-limit/auth aborts the rest of the refresh; next cadence retries |
+| FRESHNESS | success older than 3× cadence without re-attempt; failed re-attempt after success | `stale` with the last outcome label and cached-result note; never implies current health | N/A |
+| ACTIONS_OFF | workflows/runs return 404/409 or actions-disabled | counts still fresh; run state `unavailable` | attempt still succeeds |
+| AUTH_ABSENT | `gh` missing/unauthenticated | rows attempted once per cadence, `unavailable` with the error; service stays up | loud bounded failure, no hammering |
+| EMPTY / MANY | empty registry; many repos (> per-refresh budget) | explicit empty note; all rows present, refresh rotates within budget, rows stay usable via bounded list scroll | N/A |
+| MALICIOUS | markup/hostile workflow names or URLs | rendered as inert text; hrefs only validated https | validator rejects malformed rows |
+
+</frozen-after-approval>
+
+## Code Map
+
+- `src/wizard/steps.ts` -- `discoverManagedRepos` (depth-1 `.git`, dot-dirs skipped, symlinks count, sorted) is the registry rule; extract to shared module and re-export here.
+- `src/repos/discovery.ts` (new) -- canonical `discoverManagedRepos`.
+- `src/repos/overview.ts` (new) -- `ManagedRepoOverviewTracker` (mirror `src/board/deploy-drift.ts`: cached `view()`, coalesced `refresh()`, interval+stale policy, call budget, rotation), pure projections (`runStateOf`, `selectLatestRun`, freshness), `GhRepoOverviewApi` port adapter on `GhCommandRunner`/`defaultGhRunner`/`GhApiError`/`GhRateLimitedError` from `src/dispatch/github-poll.ts`; remote seam `repoRemote`+`isGitHubRemote` from `src/dispatch/review-path.ts`; exact endpoints: `repos/{o}/{r}` (default_branch), `search/issues?q=repo:o/r is:open is:pr` and `...is:issue&per_page=1` (`total_count`), `.../actions/workflows?per_page=1` (`total_count`), `.../actions/runs?branch=<default>&per_page=3`.
+- `src/board/engine.ts` -- additive `repoOverview?: () => RepoOverviewView | null` option, snapshot field `repoOverview: RepoOverviewView | null` (late-bound like `buildDrift`).
+- `src/main.ts` -- construct/start/stop the tracker (`workspaceRoot: config.workspaceRoot`), wire the late-bound view; shutdown stop.
+- `web/src/lib/board-protocol.ts` -- mirrored types + strict optional `repoOverview` validation (absent/null tolerated).
+- `web/src/lib/repo-overview.ts` (new) -- pure presentation model (badge label/glyph/tone, freshness overlay, notes, counts, safe link).
+- `web/src/ui/repo-overview.ts` (new) -- `RepoOverviewPanel` rendering rows; uses the shared age ticker via an injected `ageNode` factory.
+- `web/src/ui/board.ts` -- minimal hookup: construct panel on `#board-repos`, render after `renderAgents`; `web/index.html` -- new sibling panel `data-rail-panel="agents"`; `web/src/styles/components.css` -- `.repo-overview*` styles on existing tokens (independent bounded list scroll).
+- `web/mock/server.ts` -- generic sample `repoOverview` rows; `web/playwright.config.ts` -- new `repo-overview` project; `web/e2e/repo-overview.spec.ts` (new) -- light/dark + desktop/narrow geometry, glyph/text, zero side effects.
+- Backend tests `test/repo-overview.test.ts` (new; fakes only, fast) + `test/board-engine.test.ts`/`test/board-server.test.ts` additions + `test/suite-shape.test.ts` pin; web tests `web/src/lib/repo-overview.test.ts`, `web/src/ui/repo-overview.test.ts` (new), `web/src/lib/board-protocol.test.ts`, `web/src/ui/board.test.ts` plus the two other DOM shims (`board-merged-attention.test.ts`, `owner-chime.test.ts`).
+- `docs/BOARD.md` -- document the read-only module, data semantics and freshness rule; `.gru-command/worktree.toml` -- committed focused/static/browser/baseline scopes.
+
+## Tasks & Acceptance
+
+**Execution:**
+- [ ] `src/repos/discovery.ts` + `src/wizard/steps.ts` -- one canonical managed-repo registry rule -- rows and wizard can never drift.
+- [ ] `src/repos/overview.ts` -- tracker, exact counts, run selection/mapping, freshness/stale policy, budget/rotation, remote classification, gh adapter -- the whole server data path.
+- [ ] `src/board/engine.ts` + `src/main.ts` -- additive snapshot field + service wiring/lifecycle -- the board can render it and nothing else changes.
+- [ ] `web/src/lib/board-protocol.ts` + `web/src/lib/repo-overview.ts` -- mirrored types, strict validator, pure badge/notes model -- server truth renders deterministically.
+- [ ] `web/src/ui/repo-overview.ts` + `web/src/ui/board.ts` + `web/index.html` + `web/src/styles/components.css` -- dedicated compact-row panel below the crew list -- approved A fidelity with independent scrolling.
+- [ ] `web/mock/server.ts` + `web/playwright.config.ts` + `web/e2e/repo-overview.spec.ts` -- generic sample + browser geometry/theme proof -- inspected evidence.
+- [ ] tests + suite pin + docs + scopes -- full deterministic matrix, exact fail-before capture.
+
+**Acceptance Criteria:**
+- Given the configured registry, when the board renders, then each managed repo appears once in stable order with identity/link-or-not-linked, exact open-PR and open-issue-excl-PR counts, latest default-branch run state/context/freshness, and no hard-coded/sample facts; empty registry renders the explicit empty note and config changes never duplicate rows or disturb the crew list.
+- Given zero/nonzero/multi-page counts, mocked GitHub/network failures, unknown values, partial repo failures, cached stale data and recovery, when the tracker refreshes, then zero is a real count; loading/failure/missing is never zero; only the failed repo degrades (stale/unavailable + age/error) and a later successful refresh restores `fresh`.
+- Given completed and incomplete run outcomes, a moved default branch, multiple workflows and an empty run page with/without workflows, when the row renders, then the newest default-branch run is shown with the correct state text/glyph (including failed/timed-out/cancelled/skipped/neutral/action-required/unknown/never-run/no-workflow), labeled as default-branch CI only, linked only to a validated https URL.
+- Given a pre-change snapshot without the field, when the web parses it, then the board renders unchanged (section hidden); a present malformed `repoOverview` is rejected by the validator; hostile labels/URLs never become markup or hrefs.
+- Given light/dark desktop and narrow widths, when the rail renders, then rows keep legible counts/labels, visible status text/glyph, focusable safe links, no horizontal overflow, independent crew scrolling and working transcript switching; overview interactions cause zero GitHub writes/ACKs/executions; `npm test` and the committed scopes stay green.
+
+## Implementation Notes
+
+- Workflow state: lane-local `bmad-build` render `_bmad/render/bmad-build/job-managed-repo-overview-compact-rows-20261007-fcf5e1520d66/a577bd78ee00aae81fc8/`. Step-02 executed against base `49b558f243c7bacbfb46c7bc04f749bf131cefea` (equals observed remote main; clean branch `gru/managed-repo-overview-compact-rows-20261007`). Checkpoint 1 is auto-resolved under the briefing's explicit authority and the owner's settled Option A selection; no human is present in the lane, no Open Questions remain (the briefing settles every mockup-listed semantics question). The spec measures ~4.0k estimated tokens (above the 1600-token proposal); kept full — the briefing's six-part acceptance contract is one cohesive cross-layer deliverable (backend tracker + snapshot + web component + browser proof) that cannot be split into independently shippable PRs, and route is `dispatch`.
+- Fixed decisions (owner briefing + mockup cannot settle implementation-level choices; none are user-visible surprises): cadence 300 s; `freshness` = fresh within 3× cadence of the last SUCCESSFUL fetch, else stale; checkedAt = successful fetch completion on the server clock; newest run = max by (createdAt, id); per-refresh call budget 100 with rotation; unsupported/absent remotes spend no GitHub call; not-linked rows carry a reason.
+- No subagent runtime in this lane's tool surface: implementation runs directly from this spec (step-03 fallback); the built-in independent review runs as fresh tracked read-only review jobs via `POST /api/dispatch` (`"deliverable": "review"`) per the playbook.
+- Verification: scopes `repo-overview-focused`, `repo-overview-static`, `repo-overview-browser`, `repo-overview-baseline` added to `.gru-command/worktree.toml`; all runs through the authenticated `/api/verify` scheduler via the shipped complete-capture helper, exact-head receipts recorded below.
+
+## Design Notes
+
+- Counts: REST search `total_count` is GitHub's exact aggregate; `open_issues_count` is deliberately NOT used (it includes PRs and cannot exclude them). `incomplete_results: true` degrades the attempt, never presented as exact.
+- Server data path is one attempt per repo (all calls must succeed, except permanent Actions-unavailable) so a row's counts/run share one `checkedAt` and freshness label; the atomicity keeps the UI honest without a second freshness field.
+- Shared `gh` auth budget: tracked-PR poll worst case 50 calls/min; overview ≤ 100 calls per 5 min = 20/min → combined ≤ 70/min ≤ 5 000/h with headroom; search quota ≤ 6/min of 30/min.
+
+Run-state → badge text/glyph/tone (one table, server state, web-rendered; text carries meaning, color is never the only cue):
+
+| state | text | glyph | tone |
+|---|---|---|---|
+| passed | PASSED | ✓ | done |
+| failed | FAILED | ✕ | alert |
+| timed-out | TIMED OUT | ⏱ | alert |
+| startup-failure | STARTUP FAILED | ✕ | alert |
+| action-required | ACTION REQUIRED | ! | alert |
+| cancelled | CANCELLED | ⊘ | park |
+| skipped | SKIPPED | — | park |
+| neutral | NEUTRAL | — | park |
+| stale-run | STALE RUN | ⌛ | park |
+| running | RUNNING | ↻ | work |
+| queued | QUEUED | ⋯ | work |
+| no-workflow | NO WORKFLOW | ∅ | park |
+| never-run | NO RUNS | — | park |
+| unknown | UNKNOWN | ? | park |
+| unavailable (run) | UNAVAILABLE | ! | park |
+
+Freshness overlays replace the state badge when the row is not fresh: `NOT CHECKED` (?), `UNAVAILABLE` (!, fetch failed, no cache), `STALE · last <state text lowercased>` (⌛, cached after failure or older than 3× cadence), `NOT LINKED` (!). Notes disclose: cached-result/no-health-claim, fetch-failed age, newest-run-in-progress/queued precedence, cancelled-neither, no-run-yet, actions-unavailable, not-linked reason.
+
+## Verification
+
+**Commands:**
+- `repo-overview-focused` -- expected: PASS (backend tracker/engine/server suites + web protocol/pure/DOM/integration suites); `repo-overview-static` -- expected: PASS (lint/typecheck/build/web tsc).
+- `repo-overview-browser` -- expected: PASS (mock playwright project; captures under a gitignored lane root).
+- `repo-overview-baseline` -- expected: RED both legs by named behavioral assertions against base `49b558f` (import/setup failure is not fail-before evidence).
+
+**Manual checks:**
+- Inspect the light/dark desktop/narrow captures against the approved Option A mockup (row rhythm, badge text+glyph, module under the crew list, no overflow).
+
