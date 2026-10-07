@@ -2393,6 +2393,394 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(document.getElementById('board-owner')!.querySelector('[data-action-id="owner-ack:ack-me"]')).toBeNull();
   });
 
+  // ---- Book of Lessons proposals (owner decision 2026-10-07) ----
+  const lessonChange = (slug: string, body: string, extra: Record<string, unknown> = {}) => ({
+    slug,
+    body,
+    recurred: 1,
+    tags: [] as string[],
+    previousBody: null,
+    previousRecurred: null,
+    previousTags: null,
+    ...extra,
+  });
+  function proposalReview(overrides: Record<string, unknown> = {}) {
+    return {
+      id: 'prop-1',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      notificationId: 'lp-1',
+      entries: 2,
+      throughSeq: 9,
+      chapters: [
+        {
+          slug: 'ops',
+          title: { before: 'Ops', after: 'Ops' },
+          retired: false,
+          summary: { before: 'Restart discipline.', after: 'Restart discipline.' },
+          tags: { before: ['ops'], after: ['ops'] },
+          added: [lessonChange('close-shell', 'Close the shell first.\nThen restart.')],
+          changed: [
+            lessonChange('drain', 'Drain before a roll.', { recurred: 3, previousBody: 'Drain.', previousRecurred: 2, previousTags: [] }),
+          ],
+          removed: [],
+          provenanceTrimmed: 4,
+          bodiesTrimmed: 0,
+        },
+      ],
+      index: [],
+      decision: null,
+      recovery: null,
+      ...overrides,
+    };
+  }
+  const proposalNotice = notification('lp-1', {
+    routing: 'needs-owner',
+    kind: 'lessons.proposal',
+    title: 'Book of Lessons: 2 lesson changes proposed',
+  });
+  const flush = async () => {
+    for (let tick = 0; tick < 20; tick += 1) await Promise.resolve();
+  };
+  const decided = (id: string, decision: 'accept' | 'reject') =>
+    Promise.resolve({ id, decision: decision === 'accept' ? 'accepted' : 'rejected' });
+  function proposalClient(decide: (id: string, decision: 'accept' | 'reject') => Promise<unknown> = decided, review = proposalReview()) {
+    return {
+      ackNotification: vi.fn(() => Promise.resolve()),
+      markNotificationShown: vi.fn(() => Promise.resolve(true)),
+      getLessonProposal: vi.fn(() => Promise.resolve(review)),
+      decideLessonProposal: vi.fn(decide),
+    } as unknown as import('../lib/board-client.js').BoardClient & {
+      getLessonProposal: ReturnType<typeof vi.fn>;
+      decideLessonProposal: ReturnType<typeof vi.fn>;
+    };
+  }
+  function openReview(): void {
+    const details = document.getElementById('board-owner')!.querySelector<HTMLDetailsElement>('.board-owner__review')!;
+    details.open = true;
+    details.dispatchEvent(new Event('toggle'));
+  }
+
+  it('lesson proposal row: Review shows the exact text; a decision stays pending until the snapshot resolves it', async () => {
+    const client = proposalClient(decided);
+    const view = new BoardView(() => {}, client);
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    const band = document.getElementById('board-owner')!;
+    expect(band.querySelector('.board-band__count')?.textContent).toBe('1 pending');
+    expect(band.textContent).toContain('Accept writes these changes into the Book of Lessons');
+    expect(band.querySelector('[data-action-id="owner-ack:lp-1"]')).toBeNull();
+    openReview();
+    await flush();
+    expect(band.textContent).toContain('Close the shell first.\nThen restart.');
+    expect(band.textContent).toContain('updated · recurred 2 → 3 · drain');
+    expect(band.textContent).toContain('4 oldest journal handle(s) released to fit');
+    band.querySelector<HTMLButtonElement>('[data-action-id="owner-proposal:lp-1"]')!.click();
+    await flush();
+    expect(client.decideLessonProposal).toHaveBeenCalledWith('prop-1', 'accept');
+    expect(document.getElementById('board-owner')!.querySelector('[data-action-id="owner-proposal:lp-1"]')).not.toBeNull();
+    view.render(snapshot({ notifications: [{ ...proposalNotice, resolvedAt: '2026-01-01T00:09:00.000Z' }] }));
+    expect(document.getElementById('board-owner')!.querySelector('[data-action-id="owner-proposal:lp-1"]')).toBeNull();
+    expect(client.getLessonProposal).toHaveBeenCalledTimes(1);
+  });
+
+  it('a snapshot push keeps the review open, its text loaded, and an in-flight decision locked — band and bell share it', async () => {
+    let finish: () => void = () => {};
+    const client = proposalClient(
+      (id) => new Promise((resolve) => { finish = () => resolve({ id, decision: 'accepted' }); }),
+    );
+    const view = new BoardView(() => {}, client);
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    openReview();
+    await flush();
+    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__accept')!.click();
+    await flush();
+    // An unrelated push re-renders everything.
+    view.render(snapshot({ notifications: [proposalNotice, notification('other', { routing: 'fyi' })] }));
+    const band = document.getElementById('board-owner')!;
+    expect(band.querySelector<HTMLDetailsElement>('.board-owner__review')!.open).toBe(true);
+    expect(band.textContent).toContain('Close the shell first.');
+    const accept = band.querySelector<HTMLButtonElement>('.board-owner__accept')!;
+    expect([accept.textContent, accept.disabled]).toEqual(['accepting…', true]);
+    const bell = document.getElementById('notification-list')!;
+    const bellAccept = bell.querySelector<HTMLButtonElement>('.board-owner__accept')!;
+    const bellReject = bell.querySelector<HTMLButtonElement>('.board-owner__reject')!;
+    expect([bellAccept.disabled, bellReject.disabled]).toEqual([true, true]);
+    bellReject.click();
+    expect(client.decideLessonProposal).toHaveBeenCalledTimes(1);
+    expect(client.getLessonProposal).toHaveBeenCalledTimes(1);
+    finish();
+  });
+
+  it('a refused decision says why; a network failure says it is unconfirmed; both keep the row and its controls', async () => {
+    const { BoardApiError } = await import('../lib/board-client.js');
+    const failures: unknown[] = [
+      new BoardApiError('/api/lessons/proposal/prop-1/accept', 409, 'proposal_stale', 'the Book of Lessons changed since this proposal was made'),
+      new TypeError('fetch failed'),
+    ];
+    const client = proposalClient(() => Promise.reject(failures.shift()));
+    const view = new BoardView(() => {}, client);
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__accept')!.click();
+    await flush();
+    let band = document.getElementById('board-owner')!;
+    expect(band.querySelector('[role="alert"]')?.textContent).toBe(
+      'Not applied — the Book of Lessons changed since this proposal was made. A fresh proposal will follow.',
+    );
+    expect(band.querySelector<HTMLButtonElement>('.board-owner__accept')!.disabled).toBe(false);
+    band.querySelector<HTMLButtonElement>('.board-owner__reject')!.click();
+    await flush();
+    band = document.getElementById('board-owner')!;
+    expect(band.querySelector('[role="alert"]')?.textContent).toContain('Couldn’t confirm the decision (fetch failed)');
+    expect(band.querySelector('[data-action-id="owner-proposal:lp-1"]')).not.toBeNull();
+  });
+
+  it('the review names summary and tag changes, every removed lesson with its text, and retired chapters plainly', async () => {
+    const review = proposalReview({
+      chapters: [
+        {
+          slug: 'ops',
+          title: { before: 'Ops', after: 'Ops' },
+          retired: false,
+          summary: { before: 'Restart discipline.', after: 'Restart and roll discipline.' },
+          tags: { before: ['ops'], after: ['ops', 'roll'] },
+          added: [],
+          changed: [lessonChange('drain', 'Drain before a roll.', { recurred: 2, tags: ['roll'], previousBody: 'Drain before a roll.', previousRecurred: 1, previousTags: [] })],
+          removed: [{ slug: 'drop-me', body: 'A lesson the cap removes.', recurred: 1, reason: 'cap' }],
+          provenanceTrimmed: 0,
+          bodiesTrimmed: 0,
+        },
+        {
+          slug: 'model-policy',
+          title: { before: 'Model policy', after: 'Model policy' },
+          retired: true,
+          summary: { before: 'Which model does what.', after: '' },
+          tags: { before: ['models'], after: [] },
+          added: [],
+          changed: [],
+          removed: [{ slug: 'sol-for-silas', body: 'Silas runs on Sol.', recurred: 1, reason: 'retired' }],
+          provenanceTrimmed: 0,
+          bodiesTrimmed: 0,
+        },
+      ],
+    });
+    const view = new BoardView(() => {}, proposalClient(decided, review));
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    openReview();
+    await flush();
+    const text = document.getElementById('board-owner')!.textContent ?? '';
+    expect(text).toContain('summary: Restart discipline. → Restart and roll discipline.');
+    expect(text).toContain('tags: ops → ops, roll');
+    expect(text).toContain('tags: — → roll');
+    expect(text).toContain('removed to fit the cap · drop-me');
+    expect(text).toContain('A lesson the cap removes.');
+    expect(text).toContain('Model policy — chapter retired (1 lesson removed)');
+    expect(text).toContain('removed with the chapter · sol-for-silas');
+    expect(text).not.toContain('dropped to fit');
+  });
+
+  it('band Accept and bell Reject reach the real client’s exact decision endpoints', async () => {
+    const { BoardClient } = await import('../lib/board-client.js');
+    const calls: string[] = [];
+    const fetchImpl = (async (path: string, init?: { method?: string }) => {
+      if (path.startsWith('/api/lessons/')) calls.push(`${init?.method ?? 'GET'} ${path}`);
+      const decision = /\/api\/lessons\/proposal\/([^/]+)\/(accept|reject)$/u.exec(path);
+      const body = path === '/api/lessons/proposal'
+        ? proposalReview()
+        : { id: decision?.[1], decision: decision?.[2] === 'accept' ? 'accepted' : 'rejected' };
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
+    }) as unknown as typeof fetch;
+    const client = new BoardClient({ token: 't', host: 'localhost', fetchImpl }, { connection: () => {}, snapshot: () => {}, fatal: () => {} } as never);
+    const first = new BoardView(() => {}, client);
+    first.render(snapshot({ notifications: [proposalNotice] }));
+    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__accept')!.click();
+    await flush();
+    expect(calls).toEqual(['GET /api/lessons/proposal', 'POST /api/lessons/proposal/prop-1/accept']);
+    calls.length = 0;
+    const second = new BoardView(() => {}, client);
+    second.render(snapshot({ notifications: [{ ...proposalNotice, id: 'lp-2' }] }));
+    const secondReview = { ...proposalReview(), id: 'prop-2', notificationId: 'lp-2' };
+    (client as unknown as { getLessonProposal: () => Promise<unknown> }).getLessonProposal = async () => {
+      calls.push('GET /api/lessons/proposal');
+      return secondReview;
+    };
+    document.getElementById('notification-list')!.querySelector<HTMLButtonElement>('.board-owner__reject')!.click();
+    await flush();
+    expect(calls).toEqual(['GET /api/lessons/proposal', 'POST /api/lessons/proposal/prop-2/reject']);
+  });
+
+  it('the review names renames, new chapters, recurrence moves and every INDEX entry the Accept changes', async () => {
+    const review = proposalReview({
+      chapters: [
+        {
+          slug: 'ops',
+          title: { before: 'Ops', after: 'Operations' },
+          retired: false,
+          summary: { before: 'Restart discipline.', after: 'Restart discipline.' },
+          tags: { before: ['ops'], after: ['ops'] },
+          added: [],
+          changed: [lessonChange('drain', 'Drain first.', { recurred: 4, previousBody: 'Drain first.', previousRecurred: 3, previousTags: [] })],
+          removed: [],
+          provenanceTrimmed: 0,
+          bodiesTrimmed: 0,
+        },
+        {
+          slug: 'fresh',
+          title: { before: null, after: 'Fresh ground' },
+          retired: false,
+          summary: { before: null, after: 'Brand new.' },
+          tags: { before: [], after: ['new'] },
+          added: [lessonChange('first', 'The first lesson.')],
+          changed: [],
+          removed: [],
+          provenanceTrimmed: 0,
+          bodiesTrimmed: 0,
+        },
+      ],
+      index: [
+        { slug: 'fresh', before: null, after: { summary: 'Brand new.', tags: ['new'] } },
+        { slug: 'gone', before: { summary: 'Old chapter.', tags: ['old'] }, after: null },
+        { slug: 'untouched', before: { summary: 'Was this.', tags: ['a'] }, after: { summary: 'Now this.', tags: ['a', 'b'] } },
+      ],
+    });
+    const view = new BoardView(() => {}, proposalClient(decided, review));
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    openReview();
+    await flush();
+    const text = document.getElementById('board-owner')!.textContent ?? '';
+    expect(text).toContain('Ops → Operations (renamed)');
+    expect(text).toContain('Fresh ground — new chapter');
+    expect(text).toContain('summary: Brand new.');
+    expect(text).toContain('updated · recurred 3 → 4 · drain');
+    expect(text).toContain('new · recurred 1 · first');
+    expect(text).toContain('INDEX.md (what briefings see)');
+    expect(text).toContain('+ fresh: Brand new. (tags: new)');
+    expect(text).toContain('− gone: Old chapter.');
+    expect(text).toContain('~ untouched: Was this. (tags: a) → Now this. (tags: a, b)');
+  });
+
+  it('a recorded-but-unfinished decision (202) says so and locks the opposite choice; a conflict does the same', async () => {
+    const { BoardApiError } = await import('../lib/board-client.js');
+    const outcomes: Array<() => Promise<unknown>> = [
+      () => Promise.resolve({ id: 'prop-1', decision: 'accepted', incomplete: true, detail: 'the notice could not be resolved' }),
+      () => Promise.reject(new BoardApiError('/api/lessons/proposal/prop-1/reject', 409, 'proposal_conflict', 'INDEX.md was edited outside the dream')),
+    ];
+    const client = proposalClient(() => outcomes.shift()!());
+    const view = new BoardView(() => {}, client);
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__accept')!.click();
+    await flush();
+    let band = document.getElementById('board-owner')!;
+    expect(band.querySelector('[role="alert"]')?.textContent).toBe(
+      'Your Accept is recorded, but finishing it hit a problem (the notice could not be resolved). Press Accept again to finish it.',
+    );
+    expect([band.querySelector<HTMLButtonElement>('.board-owner__accept')!.disabled, band.querySelector<HTMLButtonElement>('.board-owner__reject')!.disabled])
+      .toEqual([false, true]);
+    expect(band.querySelector('[data-action-id="owner-proposal:lp-1"]')).not.toBeNull();
+    // A second view (fresh state) whose Reject is recorded but blocked by a conflict.
+    const second = new BoardView(() => {}, client);
+    second.render(snapshot({ notifications: [proposalNotice] }));
+    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__reject')!.click();
+    await flush();
+    band = document.getElementById('board-owner')!;
+    expect(band.querySelector('[role="alert"]')?.textContent).toBe(
+      'Recorded, but blocked — INDEX.md was edited outside the dream. See the conflict notice.',
+    );
+    expect([band.querySelector<HTMLButtonElement>('.board-owner__accept')!.disabled, band.querySelector<HTMLButtonElement>('.board-owner__reject')!.disabled])
+      .toEqual([true, false]);
+  });
+
+  it('a decision recorded elsewhere loads locked: only the same choice is offered, and the opposite never posts', async () => {
+    const review = proposalReview({
+      decision: { kind: 'accepted', at: '2026-01-01T00:05:00.000Z' },
+      recovery: { conflict: 'INDEX.md was edited outside the dream', at: '2026-01-01T00:06:00.000Z' },
+    });
+    const client = proposalClient(decided, review);
+    const view = new BoardView(() => {}, client);
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    // The owner presses Reject before the review has loaded.
+    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__reject')!.click();
+    await flush();
+    const band = document.getElementById('board-owner')!;
+    expect(client.decideLessonProposal).not.toHaveBeenCalled();
+    expect(band.querySelector('[role="alert"]')?.textContent).toBe(
+      'Your Accept is recorded but blocked — INDEX.md was edited outside the dream. See the conflict notice, then press Accept again.',
+    );
+    const accept = band.querySelector<HTMLButtonElement>('.board-owner__accept')!;
+    expect([accept.disabled, band.querySelector<HTMLButtonElement>('.board-owner__reject')!.disabled]).toEqual([false, true]);
+    accept.click();
+    await flush();
+    expect(client.decideLessonProposal).toHaveBeenCalledWith('prop-1', 'accept');
+  });
+
+  it('a malformed decision reply is not mistaken for success', async () => {
+    const { BoardClient } = await import('../lib/board-client.js');
+    const fetchImpl = (async (path: string) => {
+      const body = path === '/api/lessons/proposal' ? proposalReview() : { ok: true };
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
+    }) as unknown as typeof fetch;
+    const client = new BoardClient({ token: 't', host: 'localhost', fetchImpl }, { connection: () => {}, snapshot: () => {}, fatal: () => {} } as never);
+    await expect(client.decideLessonProposal('prop-1', 'accept')).rejects.toThrow('lesson proposal decision response is malformed');
+  });
+
+  it('an open "before" disclosure and the focused control survive a snapshot push', async () => {
+    const view = new BoardView(() => {}, proposalClient(decided));
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    openReview();
+    await flush();
+    let band = document.getElementById('board-owner')!;
+    const before = [...band.querySelectorAll<HTMLDetailsElement>('.board-owner__review-lesson details')].find((node) =>
+      node.textContent?.includes('Drain.'),
+    )!;
+    before.open = true;
+    before.dispatchEvent(new Event('toggle'));
+    const toggle = before.querySelector<HTMLElement>('summary')!;
+    toggle.focus();
+    const key = toggle.dataset.ownerFocusKey;
+    expect(key).toContain(':before:ops/drain');
+    view.render(snapshot({ notifications: [proposalNotice, notification('other', { routing: 'fyi' })] }));
+    band = document.getElementById('board-owner')!;
+    const restored = [...band.querySelectorAll<HTMLDetailsElement>('.board-owner__review-lesson details')].find((node) =>
+      node.textContent?.includes('Drain.'),
+    )!;
+    expect(restored).not.toBe(before);
+    expect(restored.open).toBe(true);
+    expect((document.activeElement as HTMLElement | null)?.dataset.ownerFocusKey).toBe(key);
+    expect(document.activeElement).toBe(restored.querySelector('summary'));
+  });
+
+  it('a re-pair while the review is loading never sends the decision through either client', async () => {
+    let release: (review: unknown) => void = () => {};
+    const oldClient = proposalClient();
+    oldClient.getLessonProposal.mockImplementation(() => new Promise((resolve) => { release = resolve; }));
+    const newClient = proposalClient();
+    const view = new BoardView(() => {}, oldClient);
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__accept')!.click();
+    await flush();
+    expect(oldClient.getLessonProposal).toHaveBeenCalledTimes(1);
+    view.bindClient(newClient);
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    release(proposalReview());
+    await flush();
+    expect(oldClient.decideLessonProposal).not.toHaveBeenCalled();
+    expect(newClient.decideLessonProposal).not.toHaveBeenCalled();
+    const band = document.getElementById('board-owner')!;
+    expect(band.querySelector('[role="alert"]')).toBeNull();
+    const accept = band.querySelector<HTMLButtonElement>('.board-owner__accept')!;
+    expect([accept.textContent, accept.disabled]).toEqual(['Accept', false]);
+  });
+
+  it('the phone layout keeps the proposal review inside the single column', async () => {
+    const { existsSync, readFileSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const file = [join(process.cwd(), 'src/styles/components.css'), join(process.cwd(), 'web/src/styles/components.css')].find((path) =>
+      existsSync(path),
+    )!;
+    const css = readFileSync(file, 'utf8');
+    const phone = css.slice(css.indexOf('@media (max-width: 560px) {'));
+    const rule = /\.board-owner__row--proposal\s*\{([^}]*)\}/u.exec(phone.slice(0, phone.indexOf('\n}\n')))?.[1] ?? '';
+    expect(rule.replace(/\s+/gu, ' ')).toContain("grid-template-areas: 'title' 'meta' 'note' 'review' 'action' 'error';");
+  });
+
   it('ready PR row: affected heist + exact-head reason + OPEN PR external link; non-https URLs fail closed', () => {
     const view = new BoardView(() => {});
     view.render(snapshot({ ownerPrs: [ownerPr('job-ready')] }));

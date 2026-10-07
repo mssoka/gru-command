@@ -385,8 +385,10 @@ export function isOwnerHeldNotificationKind(kind: string): boolean {
   // — no owner chime, no ACK required, resolved by the wait lifecycle),
   // and every ineligible/failed classification posts `needs-owner` as the
   // conservative fallback (the supervisor passes that routing explicitly).
+  // `lessons.proposal`: a Book of Lessons update the owner alone approves
+  // (owner decision 2026-10-07).
   return kind.startsWith('decisions.degraded.') ||
-    ['supervision.breaker', 'port-squat', 'roll-port-squat', 'worktree-sweep-paused'].includes(kind);
+    ['supervision.breaker', 'port-squat', 'roll-port-squat', 'worktree-sweep-paused', 'lessons.proposal'].includes(kind);
 }
 
 export function isNotificationRouting(value: string): value is NotificationRouting {

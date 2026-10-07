@@ -1,9 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import type { LogLevel } from '../logger.js';
-import type { BibleStore } from './bible.js';
-import { DreamError, type JournalEntry, type ProposedChapter } from './types.js';
+import { checkPlan, describePlan, type BiblePlan, type BibleStore, type PlanReview } from './bible.js';
+import { DreamError, isLessonsSlug, ProposalError, type JournalEntry, type ProposedChapter } from './types.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -12,8 +12,12 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  * one lesson, what merges, how to word it) belongs to the distiller (Bob).
  *
  * Invariants this layer guarantees regardless of distiller behavior:
- *   - the cursor advances ONLY after a successful apply (a failed dream
- *     retries the same entries next cycle — never a silent skip);
+ *   - the owner approves every book update: a pass PROPOSES (For You) and
+ *     nothing is written until Accept; Reject consumes the batch without
+ *     writing (owner decision 2026-10-07);
+ *   - the cursor advances ONLY on an owner decision (or, in tests, a
+ *     successful apply) — a failed dream retries the same entries next
+ *     cycle, never a silent skip;
  *   - a bounded batch per pass (entries beyond the bound wait for the
  *     next pass rather than bloating the prompt);
  *   - invented provenance is a hard error (the distiller may only cite
@@ -26,12 +30,21 @@ export const DREAM_STATE_FILE = '.dream-state.json';
 export const DREAM_FAILED_KIND = 'lessons.dream-failed';
 export const DEFAULT_MAX_ENTRIES_PER_DREAM = 100;
 
+/** Journal seqs in (afterSeq, throughSeq] — a withdrawn proposal's batch. */
+export interface ReplayRange {
+  readonly afterSeq: number;
+  readonly throughSeq: number;
+}
+
 export interface DreamState {
   readonly version: 1;
   /** Journal high-water mark through which the last dream consumed. */
   readonly coveredThroughSeq: number;
   readonly lastDreamAt: string | null;
   readonly cycles: number;
+  /** A withdrawn proposal's batch the cursor already moved past: it is
+   * re-proposed before any new entry, and the cursor never rewinds. */
+  readonly replay?: ReplayRange;
 }
 
 /** POSIX single-quoted shell word. */
@@ -133,7 +146,10 @@ export interface DreamDistiller {
 }
 
 export interface DreamOutcome {
-  readonly status: 'noop' | 'dreamed';
+  /** `proposed`: a book update now waits for the owner in For You;
+   * `awaiting-owner`: an earlier proposal is still undecided, so this pass
+   * did nothing (no distiller call, no model cost). */
+  readonly status: 'noop' | 'dreamed' | 'proposed' | 'awaiting-owner';
   readonly entries: number;
   readonly coveredThroughSeq: number;
   readonly chaptersTouched: number;
@@ -149,7 +165,14 @@ export interface DreamEngineOptions {
   };
   readonly bible: BibleStore;
   readonly distiller: DreamDistiller;
-  /** Defaults to <bible-dir>/.dream-state.json. */
+  /** Owner approval (the service's path): every pass proposes, nothing is
+   * written until the owner accepts in For You (owner decision 2026-10-07). */
+  readonly proposals?: LessonProposals;
+  /** Write each pass directly — tests of the dream mechanics only. Exactly
+   * one of `proposals` / `autoApply` must be chosen; there is no default. */
+  readonly autoApply?: boolean;
+  /** Defaults to <bible-dir>/.dream-state.json. With proposals the engine
+   * always uses THEIR cursor file — a different one is refused. */
   readonly stateFile?: string;
   readonly maxEntriesPerDream?: number;
   readonly log?: Log;
@@ -160,16 +183,29 @@ export class DreamEngine {
   private readonly journal: DreamEngineOptions['journal'];
   private readonly bible: BibleStore;
   private readonly distiller: DreamDistiller;
+  private readonly proposals: LessonProposals | null;
   private readonly stateFile: string;
   private readonly maxEntriesPerDream: number;
   private readonly log: Log;
   private readonly now: () => Date;
 
   constructor(opts: DreamEngineOptions) {
+    if ((opts.proposals === undefined) === (opts.autoApply !== true)) {
+      throw new DreamError(
+        'dream engine needs exactly one write path: proposals (owner approval) or autoApply: true (tests)',
+      );
+    }
     this.journal = opts.journal;
     this.bible = opts.bible;
     this.distiller = opts.distiller;
-    this.stateFile = opts.stateFile ?? join(opts.bible.dir, DREAM_STATE_FILE);
+    this.proposals = opts.proposals ?? null;
+    if (this.proposals !== null && opts.stateFile !== undefined && resolve(opts.stateFile) !== this.proposals.stateFile) {
+      throw new DreamError(
+        `dream engine state file ${opts.stateFile} differs from the proposals' ${this.proposals.stateFile} — ` +
+          'one cursor must govern both, or a decision would consume entries the engine proposes again',
+      );
+    }
+    this.stateFile = this.proposals?.stateFile ?? opts.stateFile ?? join(opts.bible.dir, DREAM_STATE_FILE);
     this.maxEntriesPerDream = opts.maxEntriesPerDream ?? DEFAULT_MAX_ENTRIES_PER_DREAM;
     this.log = opts.log ?? (() => {});
     this.now = opts.now ?? (() => new Date());
@@ -178,19 +214,27 @@ export class DreamEngine {
   /** One dream pass. No new entries = no distiller call = no model cost. */
   async run(): Promise<DreamOutcome> {
     this.bible.ensureSeeded();
+    if (this.proposals !== null) {
+      // Finish any decided-but-unclosed proposal, withdraw a stale one, and
+      // re-ensure the notice of a still-pending one — never a second proposal.
+      const waiting = this.proposals.reconcile();
+      if (waiting !== null) {
+        this.log('info', 'dream beat skipped — a lesson proposal awaits the owner', { proposal_id: waiting.id });
+        return this.idle('awaiting-owner', loadDreamState(this.stateFile));
+      }
+    }
     const state = loadDreamState(this.stateFile);
-    const pending = this.journal.list({ after: state.coveredThroughSeq, limit: this.maxEntriesPerDream });
+    const replay = state.replay;
+    const pending = replay !== undefined
+      ? this.journal.list({ after: replay.afterSeq, limit: this.maxEntriesPerDream }).filter((entry) => entry.seq <= replay.throughSeq)
+      : this.journal.list({ after: state.coveredThroughSeq, limit: this.maxEntriesPerDream });
     if (pending.length === 0) {
-      return {
-        status: 'noop',
-        entries: 0,
-        coveredThroughSeq: state.coveredThroughSeq,
-        chaptersTouched: 0,
-        lessonsAdded: 0,
-        lessonsMerged: 0,
-        lessonsTrimmed: 0,
-        lessonsDropped: 0,
-      };
+      if (replay !== undefined) {
+        // The replayed entries are gone from the journal: nothing to re-propose.
+        const { replay: _done, ...rest } = state;
+        saveDreamState(this.stateFile, rest);
+      }
+      return this.idle('noop', state);
     }
     const index = this.bible.readIndexText();
     const result = await this.distiller.distill({
@@ -216,14 +260,50 @@ export class DreamEngine {
       }
     }
 
-    const report = this.bible.applyUpdates(result.chapters, tsById);
+    const plan = this.bible.planUpdates(result.chapters, tsById);
+    const first = pending[0]!;
     const last = pending[pending.length - 1]!;
-    saveDreamState(this.stateFile, {
+    const remainingReplay = replay !== undefined && last.seq < replay.throughSeq
+      ? { afterSeq: last.seq, throughSeq: replay.throughSeq }
+      : undefined;
+    const nextState: DreamState = {
       version: 1,
-      coveredThroughSeq: last.seq,
+      coveredThroughSeq: Math.max(state.coveredThroughSeq, last.seq),
       lastDreamAt: this.now().toISOString(),
       cycles: state.cycles + 1,
+      ...(remainingReplay !== undefined ? { replay: remainingReplay } : {}),
+    };
+    const outcome = (status: 'dreamed' | 'proposed'): DreamOutcome => ({
+      status,
+      entries: pending.length,
+      coveredThroughSeq: status === 'dreamed' ? nextState.coveredThroughSeq : state.coveredThroughSeq,
+      chaptersTouched: plan.report.chaptersWritten,
+      lessonsAdded: plan.report.lessonsAdded,
+      lessonsMerged: plan.report.lessonsMerged,
+      lessonsTrimmed: plan.report.lessonsTrimmed,
+      lessonsDropped: plan.report.lessonsDropped,
     });
+    if (this.proposals !== null) {
+      const proposal = this.proposals.create({
+        plan,
+        entries: pending.length,
+        fromState: state,
+        batch: { afterSeq: Math.max(first.seq - 1, replay?.afterSeq ?? state.coveredThroughSeq), throughSeq: last.seq },
+        nextState,
+      });
+      this.log('info', 'dream pass proposed — awaiting the owner in For You', {
+        proposal_id: proposal.id,
+        entries: pending.length,
+        through_seq: last.seq,
+        chapters_touched: plan.report.chaptersWritten,
+        lessons_added: plan.report.lessonsAdded,
+        lessons_merged: plan.report.lessonsMerged,
+      });
+      return outcome('proposed');
+    }
+
+    const report = this.bible.applyPlan(plan);
+    saveDreamState(this.stateFile, nextState);
     this.log('info', 'dream pass completed', {
       entries: pending.length,
       covered_through_seq: last.seq,
@@ -233,17 +313,562 @@ export class DreamEngine {
       lessons_trimmed: report.lessonsTrimmed,
       lessons_dropped: report.lessonsDropped,
     });
+    return outcome('dreamed');
+  }
+
+  private idle(status: 'noop' | 'awaiting-owner', state: DreamState): DreamOutcome {
     return {
-      status: 'dreamed',
-      entries: pending.length,
-      coveredThroughSeq: last.seq,
-      chaptersTouched: report.chaptersWritten,
-      lessonsAdded: report.lessonsAdded,
-      lessonsMerged: report.lessonsMerged,
-      lessonsTrimmed: report.lessonsTrimmed,
-      lessonsDropped: report.lessonsDropped,
+      status,
+      entries: 0,
+      coveredThroughSeq: state.coveredThroughSeq,
+      chaptersTouched: 0,
+      lessonsAdded: 0,
+      lessonsMerged: 0,
+      lessonsTrimmed: 0,
+      lessonsDropped: 0,
     };
   }
+}
+
+// ------------------------------------------------------------------
+// Owner-approved lesson proposals (owner decision 2026-10-07)
+// ------------------------------------------------------------------
+
+export const PROPOSAL_FILE = '.proposal.json';
+/** The For You notification kind that carries a lesson proposal. */
+export const LESSONS_PROPOSAL_KIND = 'lessons.proposal';
+/** The FYI kind posted when a proposal is withdrawn as stale. */
+export const LESSONS_PROPOSAL_WITHDRAWN_KIND = 'lessons.proposal-withdrawn';
+
+export type ProposalDecisionKind = 'accepted' | 'rejected' | 'withdrawn';
+
+/** A planned book update waiting for the owner. At most one exists; while
+ * it waits, the dream does not distill (and spends nothing). Its decision
+ * is recorded BEFORE any book or cursor change and never changes; the
+ * record is deleted only after the decision is fully carried out. */
+export interface LessonProposal {
+  readonly version: 1;
+  readonly id: string;
+  readonly createdAt: string;
+  /** Derived from the id before anything is posted: re-posting is a no-op. */
+  readonly notificationId: string;
+  /** Journal entries the proposal was distilled from. */
+  readonly entries: number;
+  /** The complete dream state the proposal was computed from. */
+  readonly fromState: DreamState;
+  /** The journal range distilled. */
+  readonly batch: ReplayRange;
+  /** The dream state after an Accept or Reject (both consume the batch). */
+  readonly nextState: DreamState;
+  readonly plan: BiblePlan;
+  readonly decision: {
+    readonly kind: ProposalDecisionKind;
+    readonly at: string;
+    readonly detail: string | null;
+  } | null;
+  /** Why a recorded decision could not be carried out (the book or the
+   * cursor changed under it). The record — and the owner's intent — stay
+   * until the conflict is cleared; nothing is withdrawn or re-proposed. */
+  readonly recovery: { readonly conflict: string; readonly at: string } | null;
+}
+
+/** The owner-facing review of a pending proposal, derived from the plan's
+ * baseline and writes. */
+export interface LessonProposalReview {
+  readonly id: string;
+  readonly createdAt: string;
+  readonly notificationId: string;
+  readonly entries: number;
+  readonly throughSeq: number;
+  readonly chapters: PlanReview['chapters'];
+  readonly index: PlanReview['index'];
+  /** The owner's decision when it is recorded but not yet finished — the
+   * same decision finishes it; the opposite one is refused. */
+  readonly decision: { readonly kind: 'accepted' | 'rejected'; readonly at: string } | null;
+  /** Why the recorded decision is blocked (see LessonProposal.recovery). */
+  readonly recovery: { readonly conflict: string; readonly at: string } | null;
+}
+
+export interface LessonProposalDecision {
+  readonly id: string;
+  readonly decision: ProposalDecisionKind;
+  readonly coveredThroughSeq: number;
+  readonly report: BiblePlan['report'] | null;
+}
+
+/** How proposals reach the owner. Every call is idempotent by id, so a
+ * crash at any point can simply be retried. */
+export interface ProposalNotifier {
+  /** Ensure the For You decision row with exactly this id exists. */
+  ensure(input: { readonly id: string; readonly title: string; readonly detail: string }): void;
+  /** Resolve a notice (a resolved or missing one is left alone). */
+  resolve(id: string, by: string): void;
+  /** Ensure the FYI with exactly this id exists. */
+  inform(input: { readonly id: string; readonly title: string; readonly detail: string }): void;
+  /** Ensure the owner-held conflict notice with exactly this id exists. */
+  conflict(input: { readonly id: string; readonly title: string; readonly detail: string }): void;
+}
+
+/** The notification surfaces the production notifier writes through
+ * (NotificationCenter + LedgerApi). */
+export interface ProposalNotificationPorts {
+  readonly notifications: {
+    post(input: {
+      id: string;
+      kind: string;
+      routing: 'needs-owner' | 'fyi';
+      severity: 'info' | 'error';
+      title: string;
+      detail: string;
+    }): unknown;
+  };
+  readonly ledger: { resolveNotificationById(id: string, by: string): unknown };
+}
+
+/** The kind of the owner-held notice raised when a recorded decision cannot
+ * be carried out. */
+export const LESSONS_PROPOSAL_CONFLICT_KIND = 'lessons.proposal-conflict';
+
+/** Production wiring: proposals are owner-held For You rows; withdrawals
+ * are FYIs; a decision that cannot be carried out is an owner-held stop. */
+export function lessonProposalNotifier(ports: ProposalNotificationPorts): ProposalNotifier {
+  return {
+    ensure: ({ id, title, detail }) => {
+      ports.notifications.post({ id, kind: LESSONS_PROPOSAL_KIND, routing: 'needs-owner', severity: 'info', title, detail });
+    },
+    resolve: (id, by) => {
+      ports.ledger.resolveNotificationById(id, by);
+    },
+    inform: ({ id, title, detail }) => {
+      ports.notifications.post({ id, kind: LESSONS_PROPOSAL_WITHDRAWN_KIND, routing: 'fyi', severity: 'info', title, detail });
+    },
+    conflict: ({ id, title, detail }) => {
+      ports.notifications.post({ id, kind: LESSONS_PROPOSAL_CONFLICT_KIND, routing: 'needs-owner', severity: 'error', title, detail });
+    },
+  };
+}
+
+export interface LessonProposalsOptions {
+  readonly bible: BibleStore;
+  readonly notifier: ProposalNotifier;
+  /** Defaults to <bible-dir>/.dream-state.json. */
+  readonly stateFile?: string;
+  readonly log?: Log;
+  readonly now?: () => Date;
+}
+
+const sameState = (left: DreamState, right: DreamState): boolean =>
+  left.coveredThroughSeq === right.coveredThroughSeq &&
+  left.cycles === right.cycles &&
+  (left.replay?.afterSeq ?? -1) === (right.replay?.afterSeq ?? -1) &&
+  (left.replay?.throughSeq ?? -1) === (right.replay?.throughSeq ?? -1);
+
+export class LessonProposals {
+  /** The dream cursor these proposals consume; the engine shares it. */
+  readonly stateFile: string;
+  private readonly bible: BibleStore;
+  private readonly notifier: ProposalNotifier;
+  private readonly file: string;
+  private readonly log: Log;
+  private readonly now: () => Date;
+
+  constructor(opts: LessonProposalsOptions) {
+    this.bible = opts.bible;
+    this.notifier = opts.notifier;
+    this.stateFile = resolve(opts.stateFile ?? join(opts.bible.dir, DREAM_STATE_FILE));
+    this.file = join(opts.bible.dir, PROPOSAL_FILE);
+    this.log = opts.log ?? (() => {});
+    this.now = opts.now ?? (() => new Date());
+  }
+
+  /** The stored proposal record (pending or mid-decision), or null. The
+   * record's shape AND integrity — plan consistency, baseline, cursor
+   * bounds — are checked before anything acts on it; a corrupt record
+   * fails loud. */
+  pending(): LessonProposal | null {
+    if (!existsSync(this.file)) return null;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(readFileSync(this.file, 'utf-8'));
+    } catch (error) {
+      throw new DreamError(`lesson proposal ${this.file} is unreadable (${String(error)}) — inspect or remove it`);
+    }
+    const proposal = validateLessonProposal(parsed, this.file);
+    try {
+      checkPlan(proposal.plan);
+    } catch (error) {
+      throw new DreamError(`lesson proposal ${this.file} is malformed (${error instanceof Error ? error.message : String(error)}) — inspect or remove it`);
+    }
+    return proposal;
+  }
+
+  /** The review of the proposal the owner still has to act on — undecided,
+   * or decided but not finished (a restart or another device must still be
+   * able to finish it) — or null when none awaits the owner. */
+  review(): LessonProposalReview | null {
+    const proposal = this.pending();
+    if (proposal === null) return null;
+    const { decision } = proposal;
+    let recorded: LessonProposalReview['decision'] = null;
+    if (decision !== null) {
+      if (decision.kind === 'withdrawn') return null; // the next reconcile finishes it
+      recorded = { kind: decision.kind, at: decision.at };
+    }
+    const review = describePlan(proposal.plan);
+    return {
+      id: proposal.id,
+      createdAt: proposal.createdAt,
+      notificationId: proposal.notificationId,
+      entries: proposal.entries,
+      throughSeq: proposal.batch.throughSeq,
+      chapters: review.chapters,
+      index: review.index,
+      decision: recorded,
+      recovery: proposal.recovery,
+    };
+  }
+
+  /** Persist a new proposal, then put it in front of the owner. */
+  create(input: {
+    readonly plan: BiblePlan;
+    readonly entries: number;
+    readonly fromState: DreamState;
+    readonly batch: ReplayRange;
+    readonly nextState: DreamState;
+  }): LessonProposal {
+    if (this.pending() !== null) throw new DreamError('a lesson proposal is already pending');
+    const id = randomUUID();
+    const proposal: LessonProposal = {
+      version: 1,
+      id,
+      createdAt: this.now().toISOString(),
+      notificationId: `lessons-proposal:${id}`,
+      entries: input.entries,
+      fromState: input.fromState,
+      batch: input.batch,
+      nextState: input.nextState,
+      plan: input.plan,
+      decision: null,
+      recovery: null,
+    };
+    validateLessonProposal(JSON.parse(JSON.stringify(proposal)), 'new proposal');
+    checkPlan(proposal.plan);
+    // Durable first, with the notice id already fixed: a crash before or
+    // after the post leaves a record the next reconcile re-announces under
+    // the SAME id — never an orphan row.
+    this.write(proposal);
+    this.notifier.ensure({ id: proposal.notificationId, ...proposalNotice(proposal) });
+    return proposal;
+  }
+
+  /**
+   * Bring the stored record to a settled state: finish a decided proposal
+   * (a crash may have interrupted it), withdraw an UNDECIDED one that went
+   * stale, and re-ensure the notice of one still awaiting the owner.
+   * Returns the proposal that still blocks the dream (pending, or decided
+   * but in recovery conflict), or null. Run at startup and before every pass.
+   */
+  reconcile(): LessonProposal | null {
+    const proposal = this.pending();
+    if (proposal === null) return null;
+    if (proposal.decision !== null) {
+      try {
+        this.finish(proposal);
+        return null;
+      } catch (error) {
+        if (error instanceof ProposalError && error.code === 'conflict') return this.pending();
+        throw error;
+      }
+    }
+    const stale = this.staleness(proposal);
+    if (stale !== null) {
+      this.withdraw(proposal, stale);
+      return null;
+    }
+    this.notifier.ensure({ id: proposal.notificationId, ...proposalNotice(proposal) });
+    return proposal;
+  }
+
+  /** Owner Accept: write the planned update, then advance the cursor. */
+  accept(id: string): LessonProposalDecision {
+    return this.decide(id, 'accepted');
+  }
+
+  /** Owner Reject: the book is untouched; the batch is consumed anyway. */
+  reject(id: string): LessonProposalDecision {
+    return this.decide(id, 'rejected');
+  }
+
+  private decide(id: string, kind: 'accepted' | 'rejected'): LessonProposalDecision {
+    const proposal = this.pending();
+    if (proposal === null) throw new ProposalError('none', 'no lesson proposal is pending');
+    if (proposal.id !== id) {
+      throw new ProposalError('mismatch', `lesson proposal ${id} is not the pending one (${proposal.id})`);
+    }
+    if (proposal.decision !== null) {
+      // The same decision retried resumes it; the opposite decision can
+      // never undo a recorded one.
+      if (proposal.decision.kind !== kind) {
+        throw new ProposalError('decided', `this lesson proposal was already ${proposal.decision.kind}`);
+      }
+      return this.finishRecorded(proposal);
+    }
+    const stale = this.staleness(proposal);
+    if (stale !== null) {
+      this.withdraw(proposal, stale);
+      throw new ProposalError('stale', `${stale} — the proposal was withdrawn; the next dream re-proposes these journal entries`);
+    }
+    const decided: LessonProposal = { ...proposal, decision: { kind, at: this.now().toISOString(), detail: null } };
+    this.write(decided); // the decision is durable BEFORE the book or cursor changes
+    return this.finishRecorded(decided);
+  }
+
+  /** Carry out a recorded decision for its decider: anything that fails
+   * AFTER the record exists is "recorded, not yet finished" — never "not
+   * applied" (the intent stands, and the same decision resumes it). */
+  private finishRecorded(proposal: LessonProposal): LessonProposalDecision {
+    try {
+      return this.finish(proposal);
+    } catch (error) {
+      if (error instanceof ProposalError) throw error;
+      throw new ProposalError(
+        'incomplete',
+        `the ${proposal.decision!.kind === 'accepted' ? 'Accept' : 'Reject'} is recorded but finishing it failed ` +
+          `(${error instanceof Error ? error.message : String(error)}); it resumes on the next attempt or service start`,
+      );
+    }
+  }
+
+  /** Why a pending proposal can no longer be applied as reviewed, or null. */
+  private staleness(proposal: LessonProposal): string | null {
+    const state = loadDreamState(this.stateFile);
+    if (!sameState(state, proposal.fromState)) {
+      return `the dream cursor moved to ${state.coveredThroughSeq} since this proposal was made at ${proposal.fromState.coveredThroughSeq}`;
+    }
+    if (this.bible.fingerprint() !== proposal.plan.base) return 'the Book of Lessons changed since this proposal was made';
+    return null;
+  }
+
+  /** Withdraw an UNDECIDED proposal (cursor never rewinds; a batch the
+   * cursor already passed is queued for replay so it is still proposed). */
+  private withdraw(proposal: LessonProposal, detail: string): void {
+    const state = loadDreamState(this.stateFile);
+    if (state.coveredThroughSeq > proposal.batch.afterSeq) {
+      const replay: ReplayRange = state.replay === undefined
+        ? proposal.batch
+        : {
+          afterSeq: Math.min(state.replay.afterSeq, proposal.batch.afterSeq),
+          throughSeq: Math.max(state.replay.throughSeq, proposal.batch.throughSeq),
+        };
+      saveDreamState(this.stateFile, { ...state, replay });
+    }
+    const withdrawn: LessonProposal = {
+      ...proposal,
+      decision: { kind: 'withdrawn', at: this.now().toISOString(), detail },
+    };
+    this.write(withdrawn);
+    this.finish(withdrawn);
+  }
+
+  /** Record a recovery conflict: the owner's decision stays, nothing is
+   * withdrawn or re-proposed, and an owner-held notice explains it. */
+  private conflict(proposal: LessonProposal, detail: string): never {
+    const recorded: LessonProposal = { ...proposal, recovery: { conflict: detail, at: this.now().toISOString() } };
+    this.write(recorded);
+    this.notifier.conflict({
+      id: `lessons-proposal-conflict:${proposal.id}`,
+      title: `Accepted lesson update could not finish — ${detail.split(';')[0]}`,
+      detail:
+        `${detail}. Your ${proposal.decision?.kind ?? 'decision'} is kept and nothing will be re-proposed. ` +
+        `Restore the listed files to their state before or after the update (the planned contents are in ` +
+        `${this.file}, plan.before / plan.writes), then press the same decision again to finish it.`,
+    });
+    throw new ProposalError('conflict', `${detail}; your decision is kept — restore the book, then retry the same decision`);
+  }
+
+  /** Carry out a recorded decision. Every step is idempotent, and the
+   * record is deleted only after all of them — so a crash anywhere is
+   * finished by the next reconcile or a retried decision. A book or
+   * cursor that changed under a recorded decision is a conflict: nothing
+   * is overwritten, withdrawn or re-proposed. */
+  private finish(proposal: LessonProposal): LessonProposalDecision {
+    const decision = proposal.decision!;
+    let report: BiblePlan['report'] | null = null;
+    if (decision.kind !== 'withdrawn') {
+      const state = loadDreamState(this.stateFile);
+      const cursorFresh = sameState(state, proposal.fromState);
+      if (!cursorFresh && !sameState(state, proposal.nextState)) {
+        this.conflict(proposal, `the dream cursor moved to ${state.coveredThroughSeq} while this ${decision.kind} decision was being carried out`);
+      }
+      if (decision.kind === 'accepted') {
+        try {
+          report = this.bible.applyPlan(proposal.plan);
+        } catch (error) {
+          if (!(error instanceof ProposalError && error.code === 'stale')) throw error;
+          this.conflict(proposal, `${error.message.replace(/; nothing was written$/u, '')}; the book changed while this accepted update was being written`);
+        }
+      }
+      if (cursorFresh) saveDreamState(this.stateFile, proposal.nextState);
+    }
+    this.notifier.resolve(proposal.notificationId, decision.kind === 'withdrawn' ? 'stale' : `owner:${decision.kind}`);
+    if (proposal.recovery !== null) this.notifier.resolve(`lessons-proposal-conflict:${proposal.id}`, 'recovered');
+    if (decision.kind === 'withdrawn') {
+      this.notifier.inform({
+        id: `lessons-proposal-withdrawn:${proposal.id}`,
+        title: 'Lesson proposal withdrawn — the Book of Lessons changed',
+        detail: `${decision.detail ?? 'the proposal went stale'}. Nothing was written; the next dream re-proposes these journal entries.`,
+      });
+    }
+    rmSync(this.file, { force: true });
+    this.log(decision.kind === 'withdrawn' ? 'warn' : 'info', `lesson proposal ${decision.kind}`, {
+      proposal_id: proposal.id,
+      covered_through_seq: loadDreamState(this.stateFile).coveredThroughSeq,
+      chapters_written: report?.chaptersWritten ?? 0,
+      ...(decision.detail !== null ? { detail: decision.detail } : {}),
+    });
+    return {
+      id: proposal.id,
+      decision: decision.kind,
+      coveredThroughSeq: loadDreamState(this.stateFile).coveredThroughSeq,
+      report,
+    };
+  }
+
+  private write(proposal: LessonProposal): void {
+    const staging = `${this.file}.tmp-${process.pid}-${randomUUID()}`;
+    try {
+      writeFileSync(staging, `${JSON.stringify(proposal, null, 2)}\n`, { encoding: 'utf-8', mode: 0o600 });
+      renameSync(staging, this.file);
+    } catch (error) {
+      rmSync(staging, { force: true });
+      throw new DreamError(`could not write lesson proposal ${this.file}: ${String(error)}`);
+    }
+  }
+}
+
+function proposalNotice(proposal: LessonProposal): { title: string; detail: string } {
+  const review = describePlan(proposal.plan);
+  const count = (pick: (change: PlanReview['chapters'][number]) => number) =>
+    review.chapters.reduce((total, change) => total + pick(change), 0);
+  const added = count((change) => change.added.length);
+  const updated = count((change) => change.changed.length);
+  const removed = count((change) => change.removed.length);
+  const retired = review.chapters.filter((change) => change.retired).length;
+  const changes = added + updated + removed;
+  const chapters = review.chapters.map((change) => change.slug);
+  const parts = [
+    `${added} new`,
+    `${updated} updated`,
+    ...(removed > 0 ? [`${removed} removed`] : []),
+    ...(retired > 0 ? [`${retired} chapter(s) retired`] : []),
+  ];
+  return {
+    title: `Book of Lessons: ${changes} lesson change${changes === 1 ? '' : 's'} proposed`,
+    detail:
+      `From ${proposal.entries} journal entr${proposal.entries === 1 ? 'y' : 'ies'}: ${parts.join(', ')} ` +
+      `across ${chapters.length} chapter(s) (${chapters.join(', ')}). Review the changes, then Accept or Reject.`,
+  };
+}
+
+// ------------------------------------------------------------------
+// Stored-proposal validation: a record is checked completely before
+// anything acts on it, so a corrupt plan can never half-apply.
+// ------------------------------------------------------------------
+
+const SHA256_HEX = /^[0-9a-f]{64}$/u;
+const MANAGED_PATH = /^(?:INDEX\.md|chapters\/[a-z0-9]+(?:-[a-z0-9]+)*\.md)$/u;
+
+function validateLessonProposal(value: unknown, where: string): LessonProposal {
+  const fail = (what: string): never => {
+    throw new DreamError(`lesson proposal ${where} is malformed (${what}) — inspect or remove it`);
+  };
+  const record = (input: unknown, what: string): Record<string, unknown> =>
+    typeof input === 'object' && input !== null && !Array.isArray(input) ? (input as Record<string, unknown>) : fail(what);
+  const count = (input: unknown, what: string): number =>
+    typeof input === 'number' && Number.isSafeInteger(input) && input >= 0 ? input : fail(what);
+  const text = (input: unknown, what: string): string => (typeof input === 'string' ? input : fail(what));
+  const strings = (input: unknown, what: string): string[] =>
+    Array.isArray(input) && input.every((item) => typeof item === 'string') ? (input as string[]) : fail(what);
+  const range = (input: unknown, what: string): ReplayRange => {
+    const row = record(input, what);
+    const afterSeq = count(row['afterSeq'], `${what}.afterSeq`);
+    const throughSeq = count(row['throughSeq'], `${what}.throughSeq`);
+    if (afterSeq >= throughSeq) fail(`${what} is empty`);
+    return { afterSeq, throughSeq };
+  };
+  const state = (input: unknown, what: string): DreamState => {
+    try {
+      return parseDreamState(input, what);
+    } catch {
+      return fail(what);
+    }
+  };
+
+  const row = record(value, 'root');
+  if (row['version'] !== 1) fail('version');
+  const id = text(row['id'], 'id');
+  if (id === '') fail('id');
+  text(row['createdAt'], 'createdAt');
+  if (row['notificationId'] !== `lessons-proposal:${id}`) fail('notificationId');
+  const entries = count(row['entries'], 'entries');
+  const fromState = state(row['fromState'], 'fromState');
+  const batch = range(row['batch'], 'batch');
+  const nextState = state(row['nextState'], 'nextState');
+
+  // The cursor transition must be exactly the one a dream pass produces.
+  const lower = fromState.replay?.afterSeq ?? fromState.coveredThroughSeq;
+  if (batch.afterSeq < lower) fail('batch starts before the cursor');
+  if (fromState.replay !== undefined && batch.throughSeq > fromState.replay.throughSeq) fail('batch overruns the replay range');
+  if (entries < 1 || entries > batch.throughSeq - batch.afterSeq) fail('entries outside the batch');
+  if (nextState.coveredThroughSeq !== Math.max(fromState.coveredThroughSeq, batch.throughSeq)) fail('nextState cursor');
+  if (nextState.cycles !== fromState.cycles + 1) fail('nextState cycles');
+  const remainder = fromState.replay !== undefined && batch.throughSeq < fromState.replay.throughSeq
+    ? { afterSeq: batch.throughSeq, throughSeq: fromState.replay.throughSeq }
+    : undefined;
+  if (JSON.stringify(nextState.replay ?? null) !== JSON.stringify(remainder ?? null)) fail('nextState replay remainder');
+
+  const plan = record(row['plan'], 'plan');
+  if (typeof plan['base'] !== 'string' || !SHA256_HEX.test(plan['base'])) fail('plan.base');
+  if (typeof plan['after'] !== 'string' || !SHA256_HEX.test(plan['after'])) fail('plan.after');
+  text(plan['indexText'], 'plan.indexText');
+  if (!Array.isArray(plan['files'])) fail('plan.files');
+  for (const [index, file] of (plan['files'] as unknown[]).entries()) {
+    const entry = record(file, `plan.files[${index}]`);
+    if (typeof entry['path'] !== 'string' || !MANAGED_PATH.test(entry['path'])) fail(`plan.files[${index}].path`);
+    for (const side of ['before', 'after'] as const) {
+      const hash = entry[side];
+      if (hash !== null && (typeof hash !== 'string' || !SHA256_HEX.test(hash))) fail(`plan.files[${index}].${side}`);
+    }
+  }
+  if (!Array.isArray(plan['before'])) fail('plan.before');
+  for (const [index, file] of (plan['before'] as unknown[]).entries()) {
+    const entry = record(file, `plan.before[${index}]`);
+    if (typeof entry['path'] !== 'string' || !MANAGED_PATH.test(entry['path'])) fail(`plan.before[${index}].path`);
+    if (entry['text'] !== null) text(entry['text'], `plan.before[${index}].text`);
+  }
+  if (!Array.isArray(plan['writes'])) fail('plan.writes');
+  for (const [index, write] of (plan['writes'] as unknown[]).entries()) {
+    const entry = record(write, `plan.writes[${index}]`);
+    if (typeof entry['slug'] !== 'string' || !isLessonsSlug(entry['slug'])) fail(`plan.writes[${index}].slug`);
+    text(entry['text'], `plan.writes[${index}].text`);
+  }
+  for (const slug of strings(plan['retired'], 'plan.retired')) if (!isLessonsSlug(slug)) fail('plan.retired slug');
+  const report = record(plan['report'], 'plan.report');
+  for (const key of ['chaptersWritten', 'chaptersRetired', 'lessonsAdded', 'lessonsMerged', 'lessonsTrimmed', 'lessonsDropped']) {
+    count(report[key], `plan.report.${key}`);
+  }
+  if (row['decision'] !== null) {
+    const decision = record(row['decision'], 'decision');
+    if (decision['kind'] !== 'accepted' && decision['kind'] !== 'rejected' && decision['kind'] !== 'withdrawn') fail('decision.kind');
+    text(decision['at'], 'decision.at');
+    if (decision['detail'] !== null) text(decision['detail'], 'decision.detail');
+  }
+  if (row['recovery'] !== null) {
+    const recovery = record(row['recovery'], 'recovery');
+    text(recovery['conflict'], 'recovery.conflict');
+    text(recovery['at'], 'recovery.at');
+  }
+  return value as LessonProposal;
 }
 
 /**
@@ -410,23 +1035,38 @@ export function loadDreamState(file: string): DreamState {
       `dream state ${file} is unreadable (${String(error)}); refusing to guess — inspect or remove the file`,
     );
   }
+  return parseDreamState(parsed, `dream state ${file}`);
+}
+
+function parseDreamState(parsed: unknown, where: string): DreamState {
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-    throw new DreamError(`dream state ${file} is not an object — inspect or remove the file`);
+    throw new DreamError(`${where} is not an object — inspect or remove the file`);
   }
   const row = parsed as Record<string, unknown>;
   const covered = row['coveredThroughSeq'];
   const lastDreamAt = row['lastDreamAt'];
   const cycles = row['cycles'];
   if (typeof covered !== 'number' || !Number.isSafeInteger(covered) || covered < 0) {
-    throw new DreamError(`dream state ${file} has an invalid coveredThroughSeq — inspect or remove the file`);
+    throw new DreamError(`${where} has an invalid coveredThroughSeq — inspect or remove the file`);
   }
   if (lastDreamAt !== null && typeof lastDreamAt !== 'string') {
-    throw new DreamError(`dream state ${file} has an invalid lastDreamAt — inspect or remove the file`);
+    throw new DreamError(`${where} has an invalid lastDreamAt — inspect or remove the file`);
   }
   if (typeof cycles !== 'number' || !Number.isSafeInteger(cycles) || cycles < 0) {
-    throw new DreamError(`dream state ${file} has an invalid cycles counter — inspect or remove the file`);
+    throw new DreamError(`${where} has an invalid cycles counter — inspect or remove the file`);
   }
-  return { version: 1, coveredThroughSeq: covered, lastDreamAt, cycles };
+  const replay = row['replay'];
+  if (replay === undefined) return { version: 1, coveredThroughSeq: covered, lastDreamAt, cycles };
+  const range = replay as Record<string, unknown> | null;
+  const afterSeq = range?.['afterSeq'];
+  const throughSeq = range?.['throughSeq'];
+  if (
+    typeof afterSeq !== 'number' || !Number.isSafeInteger(afterSeq) || afterSeq < 0 ||
+    typeof throughSeq !== 'number' || !Number.isSafeInteger(throughSeq) || throughSeq <= afterSeq
+  ) {
+    throw new DreamError(`${where} has an invalid replay range — inspect or remove the file`);
+  }
+  return { version: 1, coveredThroughSeq: covered, lastDreamAt, cycles, replay: { afterSeq, throughSeq } };
 }
 
 export function saveDreamState(file: string, state: DreamState): void {

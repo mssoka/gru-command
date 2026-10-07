@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   existsSync,
   linkSync,
@@ -16,6 +16,7 @@ import {
   ARCHIVED_LESSON_SLUG,
   BibleError,
   isLessonsSlug,
+  ProposalError,
   type BibleChapter,
   type BibleLesson,
   type LessonIndexEntry,
@@ -106,9 +107,10 @@ record of lessons worth keeping. It is NOT a log — the journal
   optional \`lessons\` block the host extracts.
 - The **dream** (on a cadence) has Bob distill journal entries newer than
   the last dream into an output file; the service validates it, merges
-  repeats into existing lessons (bumping \`recurred\`), and rewrites only
-  the affected chapters. It never pastes journal text verbatim and never
-  invents events.
+  repeats into existing lessons (bumping \`recurred\`), and PROPOSES the
+  result to the owner (FOR YOU). Only the owner's Accept rewrites the
+  affected chapters; Reject leaves the book untouched. It never pastes
+  journal text verbatim and never invents events.
 - This directory is machine-managed: **nobody hand-edits chapters,
   INDEX.md or .dream-state.json** — Bob included. A hand edit breaks every
   later dream. Corrections go through the journal and the next dream;
@@ -173,6 +175,92 @@ export interface ChapterCapResult {
   readonly trimmed: number;
   readonly droppedLessons: number;
   readonly droppedProvenance: readonly ProvenanceRef[];
+}
+
+/** One lesson as the owner reviews it: what it will read after the update
+ * and what it read before (previous* null for a new lesson). */
+export interface LessonChangeView {
+  readonly slug: string;
+  readonly body: string;
+  readonly recurred: number;
+  readonly tags: readonly string[];
+  readonly previousBody: string | null;
+  readonly previousRecurred: number | null;
+  readonly previousTags: readonly string[] | null;
+}
+
+/** A lesson the update removes, with the text that disappears. */
+export interface RemovedLessonView {
+  readonly slug: string;
+  readonly body: string;
+  readonly recurred: number;
+  readonly reason: 'cap' | 'retired';
+}
+
+/** What an update does to one chapter, for the owner's review (owner
+ * decision 2026-10-07: every visible change is shown, metadata and
+ * removals included). Derived from the plan's baseline and writes, so it
+ * can never disagree with what Accept writes. */
+export interface ChapterChange {
+  readonly slug: string;
+  /** Title before (null for a new chapter) and after. */
+  readonly title: { readonly before: string | null; readonly after: string };
+  readonly retired: boolean;
+  /** Chapter summary before (null for a new chapter) and after. */
+  readonly summary: { readonly before: string | null; readonly after: string };
+  readonly tags: { readonly before: readonly string[]; readonly after: readonly string[] };
+  readonly added: readonly LessonChangeView[];
+  /** Lessons whose text, recurrence or tags change (handle-only changes
+   * are summarized in provenanceTrimmed, not listed). */
+  readonly changed: readonly LessonChangeView[];
+  readonly removed: readonly RemovedLessonView[];
+  readonly provenanceTrimmed: number;
+  readonly bodiesTrimmed: number;
+}
+
+/** One INDEX.md entry as briefings see it. */
+export interface IndexEntryView {
+  readonly summary: string;
+  readonly tags: readonly string[];
+}
+
+/** An INDEX.md line the update changes — including entries of chapters the
+ * update does not otherwise touch (index-cap compaction). */
+export interface IndexEntryChange {
+  readonly slug: string;
+  readonly before: IndexEntryView | null;
+  readonly after: IndexEntryView | null;
+}
+
+/** Everything the owner reviews before Accept. */
+export interface PlanReview {
+  readonly chapters: readonly ChapterChange[];
+  readonly index: readonly IndexEntryChange[];
+}
+
+/** One managed file a plan touches: its content hash before and after
+ * (null = absent). A plan applies — or resumes after a crash — only while
+ * every listed file is in one of those two states. */
+export interface PlannedFile {
+  readonly path: string;
+  readonly before: string | null;
+  readonly after: string | null;
+}
+
+/** A fully computed, not-yet-written book update. */
+export interface BiblePlan {
+  /** Fingerprint of the book the plan was computed against. */
+  readonly base: string;
+  /** Fingerprint of the book the plan produces. */
+  readonly after: string;
+  readonly files: readonly PlannedFile[];
+  /** The baseline text of every touched file (null = absent): the review
+   * is derived from it, and it must hash to `files[].before`. */
+  readonly before: readonly { readonly path: string; readonly text: string | null }[];
+  readonly writes: readonly { readonly slug: string; readonly text: string }[];
+  readonly retired: readonly string[];
+  readonly indexText: string;
+  readonly report: ApplyReport;
 }
 
 export interface ChapterRepairReport {
@@ -456,23 +544,23 @@ export class BibleStore {
   }
 
   /**
-   * Apply distiller updates: dedupe (explicit merge target, stable slug,
-   * or near-identical body), bump `recurred`, union provenance, enforce
-   * the chapter cap, rewrite ONLY touched chapters, regenerate the index.
-   * Any validation failure aborts before a single file is written.
+   * Plan distiller updates WITHOUT writing: dedupe (explicit merge target,
+   * stable slug, or near-identical body), bump `recurred`, union
+   * provenance, enforce the chapter cap, render the index. The plan names
+   * the exact book it was computed against (`base`) and the one it
+   * produces (`after`), each touched file's before/after hash, and a
+   * per-chapter review of everything that changes — the owner decides on
+   * that review before anything is written (owner decision 2026-10-07).
+   * Every planned chapter is re-parsed and must read back exactly as
+   * planned, so lesson text can never turn into metadata on Accept.
    */
-  applyUpdates(
+  planUpdates(
     updates: readonly ProposedChapter[],
     provenance: ReadonlyMap<string, string>,
-  ): ApplyReport {
-    return this.withWriteLock('dream apply', () => this.applyUpdatesLocked(updates, provenance));
-  }
-
-  private applyUpdatesLocked(
-    updates: readonly ProposedChapter[],
-    provenance: ReadonlyMap<string, string>,
-  ): ApplyReport {
-    const chapters = new Map(this.readChapters().map((chapter) => [chapter.slug, chapter]));
+  ): BiblePlan {
+    const files = this.snapshotFiles();
+    const original = new Map(this.readChapters().map((chapter) => [chapter.slug, chapter]));
+    const chapters = new Map(original);
     const touched = new Set<string>();
     const retired = new Set<string>();
     let lessonsAdded = 0;
@@ -483,8 +571,10 @@ export class BibleStore {
     for (const update of updates) {
       validateProposedChapter(update);
       if (update.retire === true) {
-        if (chapters.delete(update.slug)) retired.add(update.slug);
-        touched.add(update.slug);
+        // Retiring a chapter created earlier in this same batch is net
+        // absence: nothing to retire from the book.
+        if (chapters.delete(update.slug) && original.has(update.slug)) retired.add(update.slug);
+        else touched.delete(update.slug);
         continue;
       }
       retired.delete(update.slug);
@@ -498,9 +588,8 @@ export class BibleStore {
       touched.add(update.slug);
     }
 
-    let chaptersWritten = 0;
     const finalChapters: BibleChapter[] = [];
-    const plannedWrites: { slug: string; text: string }[] = [];
+    const writes: { slug: string; text: string }[] = [];
     for (const chapter of chapters.values()) {
       if (!touched.has(chapter.slug)) {
         finalChapters.push(chapter);
@@ -508,43 +597,141 @@ export class BibleStore {
       }
       if (retired.has(chapter.slug)) continue;
       const capped = enforceChapterCap(chapter, this.chapterCapBytes);
+      assertReadsBack(capped.text, capped.chapter);
       lessonsTrimmed += capped.trimmed;
       lessonsDropped += capped.droppedLessons;
       finalChapters.push(capped.chapter);
-      plannedWrites.push({ slug: chapter.slug, text: capped.text });
+      writes.push({ slug: chapter.slug, text: capped.text });
     }
-
     // Render the index BEFORE any write: a cap failure must leave the whole
     // bible untouched (otherwise a retried dream could double-count
     // recurrences over half-applied state).
     const indexText = renderIndex(finalChapters, this.indexCapBytes);
 
-    for (const write of plannedWrites) {
-      this.writeAtomic(join(this.chaptersDir, `${write.slug}.md`), write.text);
-      chaptersWritten += 1;
-    }
-    for (const slug of retired) {
-      rmSync(join(this.chaptersDir, `${slug}.md`), { force: true });
-    }
-    this.writeAtomic(join(this.dir, BIBLE_INDEX_FILE), indexText);
+    const after = new Map(files);
+    for (const write of writes) after.set(`${BIBLE_CHAPTERS_DIR}/${write.slug}.md`, write.text);
+    for (const slug of retired) after.delete(`${BIBLE_CHAPTERS_DIR}/${slug}.md`);
+    after.set(BIBLE_INDEX_FILE, indexText);
+    const touchedPaths = [
+      ...writes.map((write) => `${BIBLE_CHAPTERS_DIR}/${write.slug}.md`),
+      ...[...retired].map((slug) => `${BIBLE_CHAPTERS_DIR}/${slug}.md`),
+      BIBLE_INDEX_FILE,
+    ];
 
-    this.log('info', 'bible updated', {
-      chapters_written: chaptersWritten,
-      chapters_retired: retired.size,
-      lessons_added: lessonsAdded,
-      lessons_merged: lessonsMerged,
-      lessons_trimmed: lessonsTrimmed,
-      lessons_dropped: lessonsDropped,
-      index_bytes: Buffer.byteLength(indexText, 'utf8'),
-    });
     return {
-      chaptersWritten,
-      chaptersRetired: retired.size,
-      lessonsAdded,
-      lessonsMerged,
-      lessonsTrimmed,
-      lessonsDropped,
+      base: bookFingerprint(files),
+      after: bookFingerprint(after),
+      files: touchedPaths.map((path) => ({
+        path,
+        before: contentHash(files.get(path)),
+        after: contentHash(after.get(path)),
+      })),
+      before: touchedPaths.map((path) => ({ path, text: files.get(path) ?? null })),
+      writes,
+      retired: [...retired],
+      indexText,
+      report: {
+        chaptersWritten: writes.length,
+        chaptersRetired: retired.size,
+        lessonsAdded,
+        lessonsMerged,
+        lessonsTrimmed,
+        lessonsDropped,
+      },
     };
+  }
+
+  /**
+   * Write a plan onto the book it was planned against — and only that book.
+   * Under the book's write lock: every file the plan touches must be at its
+   * planned before OR after state (a crash mid-apply leaves a mixture this
+   * resumes), and the whole book the plan would leave must fingerprint to
+   * `plan.after` (any unrelated change, or a corrupt plan, is refused before
+   * the first write). A moved book is ProposalError('stale') with nothing
+   * written; a book already equal to the result is a no-op.
+   */
+  applyPlan(plan: BiblePlan): ApplyReport {
+    const content = planContent(plan);
+    return this.withWriteLock('lesson proposal accept', () => this.applyPlanLocked(plan, content));
+  }
+
+  private applyPlanLocked(plan: BiblePlan, content: ReadonlyMap<string, string | null>): ApplyReport {
+    const current = this.snapshotFiles();
+    if (bookFingerprint(current) === plan.after) return plan.report;
+    for (const file of plan.files) {
+      const now = contentHash(current.get(file.path));
+      if (now !== file.before && now !== file.after) {
+        throw new ProposalError('stale', `${file.path} changed since this update was planned; nothing was written`);
+      }
+    }
+    const result = new Map(current);
+    for (const [path, text] of content) {
+      if (text === null) result.delete(path);
+      else result.set(path, text);
+    }
+    if (bookFingerprint(result) !== plan.after) {
+      throw new ProposalError(
+        'stale',
+        'the Book of Lessons changed since this update was planned (or the plan is corrupt); nothing was written',
+      );
+    }
+    for (const write of plan.writes) {
+      const path = `${BIBLE_CHAPTERS_DIR}/${write.slug}.md`;
+      if (current.get(path) !== write.text) this.writeAtomic(join(this.chaptersDir, `${write.slug}.md`), write.text);
+    }
+    for (const slug of plan.retired) rmSync(join(this.chaptersDir, `${slug}.md`), { force: true });
+    if (current.get(BIBLE_INDEX_FILE) !== plan.indexText) this.writeAtomic(join(this.dir, BIBLE_INDEX_FILE), plan.indexText);
+    if (bookFingerprint(this.snapshotFiles()) !== plan.after) {
+      throw new BibleError('the Book of Lessons does not match the applied plan; inspect it before retrying');
+    }
+    this.log('info', 'bible updated', {
+      chapters_written: plan.report.chaptersWritten,
+      chapters_retired: plan.report.chaptersRetired,
+      lessons_added: plan.report.lessonsAdded,
+      lessons_merged: plan.report.lessonsMerged,
+      lessons_trimmed: plan.report.lessonsTrimmed,
+      lessons_dropped: plan.report.lessonsDropped,
+      index_bytes: Buffer.byteLength(plan.indexText, 'utf8'),
+    });
+    return plan.report;
+  }
+
+  /** The current book's fingerprint (what a plan's `base` is compared to). */
+  fingerprint(): string {
+    return bookFingerprint(this.snapshotFiles());
+  }
+
+  /** Plan and write in one step — tests and owner-run tooling only; the
+   * service's dream proposes and waits for the owner. */
+  applyUpdates(
+    updates: readonly ProposedChapter[],
+    provenance: ReadonlyMap<string, string>,
+  ): ApplyReport {
+    // The lock covers the reads and planning too, so nothing can land
+    // between this plan's read and its write.
+    return this.withWriteLock('dream apply', () => {
+      const plan = this.planUpdates(updates, provenance);
+      return this.applyPlanLocked(plan, planContent(plan));
+    });
+  }
+
+  /** The book's managed files (INDEX.md + chapters/*.md) by relative path. */
+  private snapshotFiles(): Map<string, string> {
+    const files = new Map<string, string>();
+    const index = this.readIndexText();
+    if (index !== null) files.set(BIBLE_INDEX_FILE, index);
+    let names: string[] = [];
+    try {
+      names = readdirSync(this.chaptersDir);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw new BibleError(`bible chapters dir ${this.chaptersDir} is unreadable: ${String(error)}`);
+      }
+    }
+    for (const name of names.filter((candidate) => candidate.endsWith('.md')).sort()) {
+      files.set(`${BIBLE_CHAPTERS_DIR}/${name}`, readFileSync(join(this.chaptersDir, name), 'utf-8'));
+    }
+    return files;
   }
 
   private writeAtomic(file: string, text: string): void {
@@ -561,6 +748,175 @@ export class BibleStore {
       throw new BibleError(`could not write ${file}: ${String(error)}`);
     }
   }
+}
+
+/** sha256 over the book's managed files, path-ordered and length-framed
+ * so no file content can impersonate another path. */
+export function bookFingerprint(files: ReadonlyMap<string, string>): string {
+  const digest = createHash('sha256');
+  digest.update('gru-book-of-lessons-v1\0');
+  for (const path of [...files.keys()].sort()) {
+    const text = files.get(path)!;
+    digest.update(`${path}\0${Buffer.byteLength(text, 'utf8')}\0`).update(text, 'utf8');
+  }
+  return digest.digest('hex');
+}
+
+/** A plan's intended content per touched path (null = removed), checked
+ * against its own file list — an inconsistent plan is refused before the
+ * lock is even taken, let alone a write. */
+function planContent(plan: BiblePlan): Map<string, string | null> {
+  const content = new Map<string, string | null>();
+  for (const write of plan.writes) content.set(`${BIBLE_CHAPTERS_DIR}/${write.slug}.md`, write.text);
+  for (const slug of plan.retired) content.set(`${BIBLE_CHAPTERS_DIR}/${slug}.md`, null);
+  content.set(BIBLE_INDEX_FILE, plan.indexText);
+  const listed = new Set(plan.files.map((file) => file.path));
+  if (plan.files.length !== content.size || [...content.keys()].some((path) => !listed.has(path))) {
+    throw new BibleError('the update plan is inconsistent: its file list does not match its writes; nothing was written');
+  }
+  for (const file of plan.files) {
+    if (contentHash(content.get(file.path)) !== file.after) {
+      throw new BibleError(`the update plan is inconsistent: ${file.path} does not match its planned result; nothing was written`);
+    }
+  }
+  const slugs = plan.writes.map((write) => write.slug);
+  if (new Set(slugs).size !== slugs.length || plan.retired.some((slug) => slugs.includes(slug)) || new Set(plan.retired).size !== plan.retired.length) {
+    throw new BibleError('the update plan is inconsistent: a chapter is written twice or both written and retired; nothing was written');
+  }
+  const baseline = new Map(plan.before.map((entry) => [entry.path, entry.text]));
+  if (baseline.size !== plan.before.length || baseline.size !== plan.files.length) {
+    throw new BibleError('the update plan is inconsistent: its baseline does not match its file list; nothing was written');
+  }
+  for (const file of plan.files) {
+    if (!baseline.has(file.path) || contentHash(baseline.get(file.path)) !== file.before) {
+      throw new BibleError(`the update plan is inconsistent: ${file.path} baseline does not match its recorded hash; nothing was written`);
+    }
+  }
+  if (plan.report.chaptersWritten !== plan.writes.length || plan.report.chaptersRetired !== plan.retired.length) {
+    throw new BibleError('the update plan is inconsistent: its report does not match its writes; nothing was written');
+  }
+  return content;
+}
+
+/** Check a plan's internal consistency without writing anything — run
+ * before a stored proposal is shown or decided. */
+export function checkPlan(plan: BiblePlan): void {
+  planContent(plan);
+}
+
+/** The owner's review of a plan, derived from its baseline and its writes
+ * — never stored separately, so it cannot disagree with what Accept writes. */
+export function describePlan(plan: BiblePlan): PlanReview {
+  const baseline = new Map(plan.before.map((entry) => [entry.path, entry.text]));
+  const chapters: ChapterChange[] = [];
+  for (const write of plan.writes) {
+    const prior = baseline.get(`${BIBLE_CHAPTERS_DIR}/${write.slug}.md`) ?? null;
+    chapters.push(describeChapterChange(prior === null ? null : parseChapter(prior, write.slug), parseChapter(write.text, write.slug)));
+  }
+  for (const slug of plan.retired) {
+    const prior = baseline.get(`${BIBLE_CHAPTERS_DIR}/${slug}.md`) ?? null;
+    if (prior === null) continue;
+    const before = parseChapter(prior, slug);
+    chapters.push({
+      slug,
+      title: { before: before.title, after: before.title },
+      retired: true,
+      summary: { before: before.summary, after: '' },
+      tags: { before: before.tags, after: [] },
+      added: [],
+      changed: [],
+      removed: before.lessons
+        .filter((lesson) => lesson.slug !== ARCHIVED_LESSON_SLUG)
+        .map((lesson) => ({ slug: lesson.slug, body: lesson.body, recurred: lesson.recurred, reason: 'retired' as const })),
+      provenanceTrimmed: 0,
+      bodiesTrimmed: 0,
+    });
+  }
+  const entries = (text: string | null) =>
+    new Map(parseIndex(text ?? '').map((entry) => [entry.slug, { summary: entry.summary, tags: entry.tags }]));
+  const beforeIndex = entries(baseline.get(BIBLE_INDEX_FILE) ?? null);
+  const afterIndex = entries(plan.indexText);
+  const index: IndexEntryChange[] = [];
+  for (const slug of [...new Set([...beforeIndex.keys(), ...afterIndex.keys()])].sort()) {
+    const before = beforeIndex.get(slug) ?? null;
+    const after = afterIndex.get(slug) ?? null;
+    if (JSON.stringify(before) !== JSON.stringify(after)) index.push({ slug, before, after });
+  }
+  return { chapters, index };
+}
+
+/** sha256 of one file's content; null when the file is absent. */
+function contentHash(text: string | undefined | null): string | null {
+  return text === undefined || text === null ? null : createHash('sha256').update(text, 'utf8').digest('hex');
+}
+
+/** A planned chapter must read back exactly as planned — otherwise a
+ * body line would be re-read as metadata (or anchors) after Accept. */
+function assertReadsBack(text: string, planned: BibleChapter): void {
+  const reread = parseChapter(text, planned.slug);
+  const shape = (chapter: BibleChapter) =>
+    JSON.stringify([
+      chapter.title,
+      chapter.summary,
+      chapter.tags,
+      chapter.lessons.map((lesson) => [lesson.slug, lesson.body, lesson.recurred, lesson.provenance, lesson.tags]),
+    ]);
+  if (shape(reread) !== shape(planned)) {
+    throw new BibleError(
+      `chapter ${planned.slug} would not read back as planned — its title, summary, tags or a lesson body would be parsed as other structure; reword it`,
+    );
+  }
+}
+
+function describeChapterChange(before: BibleChapter | null, after: BibleChapter): ChapterChange {
+  const previous = new Map(
+    (before?.lessons ?? [])
+      .filter((lesson) => lesson.slug !== ARCHIVED_LESSON_SLUG)
+      .map((lesson) => [lesson.slug, lesson]),
+  );
+  const added: LessonChangeView[] = [];
+  const changed: LessonChangeView[] = [];
+  const kept = new Set<string>();
+  let provenanceTrimmed = 0;
+  let bodiesTrimmed = 0;
+  for (const lesson of after.lessons) {
+    if (lesson.slug === ARCHIVED_LESSON_SLUG) continue;
+    kept.add(lesson.slug);
+    const prior = previous.get(lesson.slug);
+    if (lesson.body.endsWith(TRIM_MARKER) && prior?.body !== lesson.body) bodiesTrimmed += 1;
+    if (prior !== undefined) {
+      const now = new Set(lesson.provenance.map((ref) => ref.id));
+      provenanceTrimmed += prior.provenance.filter((ref) => !now.has(ref.id)).length;
+    }
+    const view = {
+      slug: lesson.slug,
+      body: lesson.body,
+      recurred: lesson.recurred,
+      tags: lesson.tags,
+      previousBody: prior?.body ?? null,
+      previousRecurred: prior?.recurred ?? null,
+      previousTags: prior?.tags ?? null,
+    };
+    if (prior === undefined) added.push(view);
+    else if (prior.body !== lesson.body || prior.recurred !== lesson.recurred || prior.tags.join('\u0000') !== lesson.tags.join('\u0000')) {
+      changed.push(view);
+    }
+  }
+  const removed: RemovedLessonView[] = [...previous.values()]
+    .filter((lesson) => !kept.has(lesson.slug))
+    .map((lesson) => ({ slug: lesson.slug, body: lesson.body, recurred: lesson.recurred, reason: 'cap' as const }));
+  return {
+    slug: after.slug,
+    title: { before: before?.title ?? null, after: after.title },
+    retired: false,
+    summary: { before: before?.summary ?? null, after: after.summary },
+    tags: { before: before?.tags ?? [], after: after.tags },
+    added,
+    changed,
+    removed,
+    provenanceTrimmed,
+    bodiesTrimmed,
+  };
 }
 
 // ------------------------------------------------------------------
@@ -1349,6 +1705,9 @@ function validateProposedChapter(update: ProposedChapter): void {
   }
   if (update.title.trim() === '') throw new BibleError(`proposed chapter ${update.slug} has an empty title`);
   if (update.summary.trim() === '') throw new BibleError(`proposed chapter ${update.slug} has an empty summary`);
+  if (/[\r\n]/u.test(update.title) || /[\r\n]/u.test(update.summary)) {
+    throw new BibleError(`proposed chapter ${update.slug}: the title and summary must be single lines`);
+  }
   validateProposedTags(update.slug, update.tags);
   for (const lesson of update.lessons) validateProposedLesson(update.slug, lesson);
 }
@@ -1369,6 +1728,13 @@ function validateProposedLesson(chapterSlug: string, lesson: ProposedLesson): vo
   if (body.length > 4_000) {
     throw new BibleError(`chapter ${chapterSlug} lesson ${lesson.slug} body exceeds 4000 characters — trim it`);
   }
+  if (LESSON_META_LINE.test(body.split('\n')[0] ?? '')) {
+    throw new BibleError(
+      `chapter ${chapterSlug} lesson ${lesson.slug} body starts with a metadata line ` +
+        `(${JSON.stringify((body.split('\n')[0] ?? '').slice(0, 40))}) — the chapter format would read it as ` +
+        'recurred/provenance/tags; reword the first line',
+    );
+  }
   for (const line of body.split('\n')) {
     if (HEADING_LINE.test(line)) {
       throw new BibleError(
@@ -1387,6 +1753,9 @@ function validateProposedTags(where: string, tags: readonly string[] | undefined
   if (tags === undefined) return;
   if (!Array.isArray(tags) || tags.some((tag) => typeof tag !== 'string' || tag.trim() === '')) {
     throw new BibleError(`${where}: tags must be an array of non-empty strings`);
+  }
+  if (tags.some((tag) => /[\r\n,]/u.test(tag))) {
+    throw new BibleError(`${where}: a tag may not contain a line break or a comma — the chapter format could not store it`);
   }
   if (tags.length > 12) throw new BibleError(`${where}: at most 12 tags`);
 }

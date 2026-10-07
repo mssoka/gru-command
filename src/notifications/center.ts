@@ -113,8 +113,12 @@ export class NotificationCenter {
     this.decisionsReady = ready;
   }
 
-  /** Direct post — supervisor escalations and product surfaces. */
+  /** Direct post — supervisor escalations and product surfaces. An
+   * explicit `id` makes the post idempotent: a row that already exists is
+   * returned as-is (no second ring), so a crash between posting and saving
+   * the id can never leave an orphan row behind. */
   post(input: {
+    id?: string;
     kind: string;
     routing: NotificationRouting;
     severity: NotificationSeverity;
@@ -122,9 +126,13 @@ export class NotificationCenter {
     detail?: string | null;
     agentId?: string | null;
   }): NotificationRecord {
+    if (input.id !== undefined) {
+      const existing = this.ledger.getNotification(input.id);
+      if (existing !== null) return existing;
+    }
     const record = this.ledger.recordNotification({
-      id: randomUUID(),
       ...input,
+      id: input.id ?? randomUUID(),
       routing: isOwnerHeldNotificationKind(input.kind) ? 'needs-owner' : input.routing,
     });
     this.log(input.severity === 'error' ? 'warn' : 'info', 'notification posted', {

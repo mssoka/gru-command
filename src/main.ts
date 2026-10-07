@@ -60,6 +60,8 @@ import {
   DreamScheduler,
   DREAM_STATE_FILE,
   dreamFailureIncidents,
+  LessonProposals,
+  lessonProposalNotifier,
   loadDreamState,
   repairCommand,
 } from './lessons/dream.js';
@@ -568,13 +570,6 @@ async function main(): Promise<number> {
     journal,
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
-  const lessonsServer = createLessonsServer({
-    config,
-    journal,
-    bible,
-    references: lessonReferences,
-    log: (level, msg, fields) => logger.log(level, msg, fields),
-  });
   // Perkins verdicts are learning inputs (issue #221): every posted round
   // verdict journals its consolidated blockers as deliberate finding
   // entries (source perkins:<round>), so the dream learns from reviews
@@ -683,6 +678,29 @@ async function main(): Promise<number> {
     ledger,
     bus,
     onNeedsOwner: (notification) => surfaceInChat(notification),
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  // Owner-approved Book of Lessons (owner decision 2026-10-07): the dream
+  // proposes, the owner decides in For You, and only Accept writes.
+  const lessonProposals = new LessonProposals({
+    bible,
+    notifier: lessonProposalNotifier({ notifications, ledger }),
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  // A decision interrupted by a crash or restart is finished, a stale
+  // proposal withdrawn, and a pending one's For You notice re-ensured. A
+  // corrupt record is logged here and fails the next dream pass loudly.
+  try {
+    lessonProposals.reconcile();
+  } catch (error) {
+    logger.log('error', 'lesson proposal reconcile failed at startup', { error: String(error) });
+  }
+  const lessonsServer = createLessonsServer({
+    config,
+    journal,
+    bible,
+    references: lessonReferences,
+    proposals: lessonProposals,
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   // Durable follow-through observers: (a) an explicitly marked bounded
@@ -1350,6 +1368,7 @@ async function main(): Promise<number> {
           bibleDir: bible.dir,
           log: (level, msg, fields) => logger.log(level, msg, fields),
         }),
+        proposals: lessonProposals,
         log: (level, msg, fields) => logger.log(level, msg, fields),
       }).run(),
     // A failing dream is an incident, not just a log line (owner incident
