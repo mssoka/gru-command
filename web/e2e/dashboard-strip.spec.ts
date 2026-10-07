@@ -407,9 +407,9 @@ interface Geometry {
  * neighboring a measured numeric slot is captured beside its geometry.
  * The mutable numbers themselves are asserted by the tests BEFORE each
  * measurement — never folded into this comparison. */
-async function geometry(page: Page, opts: { expectOlder?: boolean; expectedKpis?: number } = {}): Promise<Geometry> {
+async function geometry(page: Page, opts: { expectOlder?: boolean; expectedKpis?: number; expectedGroups?: number } = {}): Promise<Geometry> {
   return page.evaluate(
-    ({ expectOlder, expectedKpis }) => {
+    ({ expectOlder, expectedKpis, expectedGroups }) => {
       const rail = document.getElementById('chip-rail');
       if (!rail) throw new Error('missing #chip-rail');
       const box = (el: Element): { x: number; y: number; w: number; h: number } => {
@@ -431,7 +431,7 @@ async function geometry(page: Page, opts: { expectOlder?: boolean; expectedKpis?
       const pick = (sel: string): string =>
         JSON.stringify([...rail.querySelectorAll(sel)].map((el, i) => positive(el, `${sel}[${i}]`)));
       if (rail.querySelectorAll('.strip-pair').length !== 6) throw new Error('expected 6 status pairs');
-      if (rail.querySelectorAll('.strip-group').length !== 3) throw new Error('expected 3 count groups');
+      if (rail.querySelectorAll('.strip-group').length !== expectedGroups) throw new Error(`expected ${expectedGroups} count groups`);
       if (rail.querySelectorAll('.strip-key').length !== 6) throw new Error('expected 6 status keys');
       if (rail.querySelectorAll('[data-kpi]').length !== expectedKpis) throw new Error(`expected ${expectedKpis} data-kpi slots`);
       const strip = need(rail, '.strip-status');
@@ -498,7 +498,7 @@ async function geometry(page: Page, opts: { expectOlder?: boolean; expectedKpis?
         },
       };
     },
-    { expectOlder: opts.expectOlder ?? false, expectedKpis: opts.expectedKpis ?? 13 },
+    { expectOlder: opts.expectOlder ?? false, expectedKpis: opts.expectedKpis ?? 13, expectedGroups: opts.expectedGroups ?? 3 },
   );
 }
 
@@ -1299,10 +1299,10 @@ test('CHILDREN group appears only when the server reported counters (absent is n
   expect(separators.third.padRight).toBe('0px');
   // The wrapped layout is auditable too: same reserved-slot geometry across
   // two 4-group states (zero → non-zero values in the same slots).
-  const childrenZero = await geometry(page, { expectedKpis: 17 });
+  const childrenZero = await geometry(page, { expectedKpis: 17, expectedGroups: 4 });
   await send(makeSnapshot(slotSpec({ children: { active: 4, queued: 0, finished: 6, lifetimeCreations: 20 } })));
   await expect(children.locator('[data-kpi="children.lifetimeCreations"]')).toHaveText('20');
-  const childrenNext = await geometry(page, { expectedKpis: 17 });
+  const childrenNext = await geometry(page, { expectedKpis: 17, expectedGroups: 4 });
   comparePairwise(childrenZero, childrenNext);
   // The extra group wraps honestly: no body or rail overflow at phone width.
   await page.setViewportSize({ width: 360, height: 800 });
