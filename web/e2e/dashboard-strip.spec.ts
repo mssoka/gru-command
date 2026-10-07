@@ -1366,8 +1366,9 @@ test('A1: the reserved numeric slot is scoped — an unrelated surface keeps the
   expect(styles.strip.display).toBe('inline-block');
   expect(parseFloat(styles.strip.minWidth)).toBeGreaterThan(0);
   // The unrelated surface keeps its natural inline display AND its
-  // default min-width — on the unscoped baseline the global rule would
-  // have made it inline-block and reserved 4ch.
+  // default min-width (Chromium resolves the unset value to 0px) — on the
+  // unscoped baseline the global rule would have made it inline-block and
+  // reserved ~4ch.
   expect(styles.probe.display).toBe('inline');
-  expect(styles.probe.minWidth).toBe('auto');
+  expect(parseFloat(styles.probe.minWidth)).toBe(0);
 });
