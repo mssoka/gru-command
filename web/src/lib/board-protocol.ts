@@ -282,6 +282,10 @@ export interface OwnerPrView {
  * decision 2026-10-07): nothing is written until the owner accepts. */
 export const LESSONS_PROPOSAL_KIND = 'lessons.proposal';
 
+/** The slug of a chapter's archive record — the journal handles of lessons
+ * the cap dropped (mirrors ARCHIVED_LESSON_SLUG in src/lessons/types.ts). */
+export const ARCHIVED_LESSON_SLUG = 'archived-provenance';
+
 /** One lesson as the owner reviews it (previous* null = new lesson). */
 export interface LessonChangeView {
   readonly slug: string;

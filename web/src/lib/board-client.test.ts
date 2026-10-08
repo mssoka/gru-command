@@ -423,6 +423,439 @@ describe('board client', () => {
     tracked.stop();
   });
 
+  it('a fresh HTTP answer discarded only because an OLDER queued push won is refetched once — no further push needed (C13)', async () => {
+    const answers: Array<(response: Response) => void> = [];
+    const fetchImpl = vi.fn(() => new Promise<Response>((resolve) => { answers.push(resolve); })) as unknown as typeof fetch;
+    const sockets: { onopen: (() => void) | null; onmessage: ((event: { data: string }) => void) | null }[] = [];
+    class FakeSocket {
+      onopen: (() => void) | null = null;
+      onmessage: ((event: { data: string }) => void) | null = null;
+      onclose: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      constructor() {
+        sockets.push(this);
+      }
+      send(): void {}
+      close(): void {}
+    }
+    const delivered: string[] = [];
+    const ok = (snapshot: BoardSnapshot) => new Response(JSON.stringify(snapshot), { status: 200 });
+    const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+    const client = new BoardClient(
+      { token: TOKEN, host: 'localhost', fetchImpl, webSocketCtor: FakeSocket as unknown as new (url: string) => WebSocket },
+      { connection: () => {}, snapshot: (snapshot) => delivered.push(snapshot.decisions.incarnation), fatal: () => {} },
+    );
+    client.connect();
+    answers[0]!(ok(tagged('boot')));
+    await tick();
+    const socket = sockets.at(-1)!;
+    socket.onopen!();
+    socket.onmessage!({ data: JSON.stringify({ type: 'auth_ok' }) });
+    // A decision finished; the board asks for the authoritative snapshot...
+    const refresh = client.refetchSnapshot();
+    // ...and a push queued BEFORE the decision lands while that is in flight.
+    socket.onmessage!({ data: JSON.stringify({ type: 'board', snapshot: tagged('pre-decision-push') }) });
+    answers[1]!(ok(tagged('resolved')));
+    await refresh;
+    await tick();
+    expect(delivered).toEqual(['boot', 'pre-decision-push']);
+    expect(answers).toHaveLength(3); // exactly one trailing refetch
+    answers[2]!(ok(tagged('resolved')));
+    await tick();
+    await tick();
+    expect(delivered).toEqual(['boot', 'pre-decision-push', 'resolved']);
+    expect(answers).toHaveLength(3);
+    client.stop();
+  });
+
+  it('refresh demand that arrives while the trailing refetch runs is drained after it — two stale pushes, an overlapping wake (R6-04)', async () => {
+    const answers: Array<(response: Response) => void> = [];
+    const fetchImpl = vi.fn(() => new Promise<Response>((resolve) => { answers.push(resolve); })) as unknown as typeof fetch;
+    const sockets: { onopen: (() => void) | null; onmessage: ((event: { data: string }) => void) | null }[] = [];
+    class FakeSocket {
+      onopen: (() => void) | null = null;
+      onmessage: ((event: { data: string }) => void) | null = null;
+      onclose: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      constructor() {
+        sockets.push(this);
+      }
+      send(): void {}
+      close(): void {}
+    }
+    const delivered: string[] = [];
+    const ok = (snapshot: BoardSnapshot) => new Response(JSON.stringify(snapshot), { status: 200 });
+    const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+    const client = new BoardClient(
+      { token: TOKEN, host: 'localhost', fetchImpl, webSocketCtor: FakeSocket as unknown as new (url: string) => WebSocket },
+      { connection: () => {}, snapshot: (snapshot) => delivered.push(snapshot.decisions.incarnation), fatal: () => {} },
+    );
+    client.connect();
+    answers[0]!(ok(tagged('boot')));
+    await tick();
+    const socket = sockets.at(-1)!;
+    socket.onopen!();
+    socket.onmessage!({ data: JSON.stringify({ type: 'auth_ok' }) });
+    const push = (tag: string) => socket.onmessage!({ data: JSON.stringify({ type: 'board', snapshot: tagged(tag) }) });
+    // A refresh; a stale push lands; its answer is discarded -> one trailing refetch.
+    const refresh = client.refetchSnapshot();
+    push('stale-1');
+    answers[1]!(ok(tagged('fresh-1')));
+    await refresh;
+    await tick();
+    expect(answers).toHaveLength(3);
+    // A SECOND stale push lands while the trailing refetch runs: its answer
+    // is discarded too, and the demand is drained once it settles.
+    push('stale-2');
+    answers[2]!(ok(tagged('fresh-2')));
+    await tick();
+    await tick();
+    expect(answers).toHaveLength(4);
+    answers[3]!(ok(tagged('fresh-3')));
+    await tick();
+    await tick();
+    expect(delivered).toEqual(['boot', 'stale-1', 'stale-2', 'fresh-3']);
+    expect(answers).toHaveLength(4); // drained once, nothing more owed
+    // An overlapping wake: its answer is discarded while a trailing refetch
+    // is still in flight — the demand waits for that one, then is drained.
+    const again = client.refetchSnapshot();
+    push('stale-3');
+    answers[4]!(ok(tagged('fresh-4')));
+    await again;
+    await tick();
+    expect(answers).toHaveLength(6); // the trailing refetch
+    const wake = client.refetchSnapshot();
+    push('stale-4');
+    answers[6]!(ok(tagged('wake-answer'))); // discarded: a push landed, a refetch trails
+    await wake;
+    answers[5]!(ok(tagged('older-trailing'))); // superseded by the wake's newer request
+    await tick();
+    await tick();
+    expect(answers).toHaveLength(8); // the owed successor
+    answers[7]!(ok(tagged('fresh-5')));
+    await tick();
+    await tick();
+    expect(delivered.slice(-3)).toEqual(['stale-3', 'stale-4', 'fresh-5']);
+    client.stop();
+  });
+
+  /** A board client over a scripted fetch and a fake socket — every GET
+   * waits for the test, answered with a plain response object (no body
+   * stream), so fake timers alone drive time. */
+  function scriptedClient() {
+    const requests: Array<{ answer: (snapshot: BoardSnapshot) => void; hang: () => void; fail: () => void; refuse: (status: number) => void; refuseHung: (status: number) => void; signal: AbortSignal | undefined }> = [];
+    const fetchImpl = vi.fn((_path: string, init?: RequestInit) => new Promise<Response>((resolve, reject) => {
+      requests.push({
+        answer: (snapshot) => resolve({ ok: true, status: 200, json: async () => snapshot } as unknown as Response),
+        // The headers arrive but the body never finishes.
+        hang: () => resolve({ ok: true, status: 200, json: () => new Promise(() => {}) } as unknown as Response),
+        fail: () => reject(new TypeError('fetch failed')),
+        refuse: (status) => resolve({ ok: false, status, json: async () => ({ error: 'refused' }) } as unknown as Response),
+        // The status arrives; its error body never does.
+        refuseHung: (status) => resolve({ ok: false, status, json: () => new Promise(() => {}) } as unknown as Response),
+        signal: init?.signal ?? undefined,
+      });
+    })) as unknown as typeof fetch;
+    const sockets: { onopen: (() => void) | null; onmessage: ((event: { data: string }) => void) | null }[] = [];
+    class FakeSocket {
+      onopen: (() => void) | null = null;
+      onmessage: ((event: { data: string }) => void) | null = null;
+      onclose: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      constructor() {
+        sockets.push(this);
+      }
+      send(): void {}
+      close(): void {}
+    }
+    const delivered: string[] = [];
+    const fatals: string[] = [];
+    const client = new BoardClient(
+      { token: TOKEN, host: 'localhost', fetchImpl, webSocketCtor: FakeSocket as unknown as new (url: string) => WebSocket },
+      // Like production's failPairing(): it reports, it does not stop the client.
+      { connection: () => {}, snapshot: (snapshot) => delivered.push(snapshot.decisions.incarnation), fatal: (message) => fatals.push(message) },
+    );
+    const settle = () => vi.advanceTimersByTimeAsync(0);
+    const open = async () => {
+      client.connect();
+      requests[0]!.answer(tagged('boot'));
+      await settle();
+      authenticate();
+      return (tag: string) => sockets.at(-1)!.onmessage!({ data: JSON.stringify({ type: 'board', snapshot: tagged(tag) }) });
+    };
+    const authenticate = () => {
+      const socket = sockets.at(-1)!;
+      socket.onopen!();
+      socket.onmessage!({ data: JSON.stringify({ type: 'auth_ok' }) });
+    };
+    return { client, requests, delivered, fatals, settle, open, authenticate };
+  }
+
+  it('sustained pushes with slower HTTP never loop GETs unbounded — a short burst, then capped backoff; the owed answer lands once pushes stop, and stop() cancels the queued one (R7-04)', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const { client, requests, delivered, settle, open, authenticate } = scriptedClient();
+      const push = await open();
+      void client.refetchSnapshot();
+      // 30 s of pushes every 150 ms; every GET is answered only after the
+      // next push landed, so every answer is discarded.
+      let answered = 1;
+      for (let t = 0; t < 30_000; t += 150) {
+        push(`push-${t}`);
+        while (answered < requests.length) requests[answered++]!.answer(tagged(`late-${answered}`));
+        await settle();
+        await vi.advanceTimersByTimeAsync(150);
+      }
+      // Without a bound this is one GET per push (~200); the burst of 2 and
+      // the 1-2-4-8-8… s backoff allow at most a handful.
+      expect(requests.length).toBeGreaterThan(3);
+      expect(requests.length).toBeLessThanOrEqual(10);
+      // Pushes stop: the demand was kept, so the waiting refetch still runs
+      // and its answer — the authoritative one — is delivered.
+      await vi.advanceTimersByTimeAsync(8_000);
+      while (answered < requests.length) requests[answered++]!.answer(tagged('authoritative'));
+      await settle();
+      expect(delivered.at(-1)).toBe('authoritative');
+      const quiet = requests.length;
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(requests).toHaveLength(quiet); // the chain ended: nothing more owed
+      // A fresh chain driven into backoff, then stop(): the queued refetch never runs.
+      void client.refetchSnapshot();
+      for (let i = 0; i < 4; i += 1) {
+        push(`again-${i}`);
+        while (answered < requests.length) requests[answered++]!.answer(tagged(`again-late-${i}`));
+        await settle();
+      }
+      const beforeStop = requests.length;
+      client.stop();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(requests).toHaveLength(beforeStop);
+      // Reconnected after a stop that interrupted a backoff: the old chain
+      // stays dead — only the reconnect's own snapshot request runs.
+      client.connect();
+      requests[answered++]!.answer(tagged('back'));
+      await settle();
+      authenticate();
+      void client.refetchSnapshot();
+      for (let i = 0; i < 4; i += 1) {
+        push(`pre-stop-${i}`);
+        while (answered < requests.length) requests[answered++]!.answer(tagged(`pre-stop-late-${i}`));
+        await settle();
+      }
+      const queued = requests.length;
+      client.stop();
+      client.connect();
+      expect(requests).toHaveLength(queued + 1);
+      requests[queued]!.answer(tagged('reconnected'));
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(requests).toHaveLength(queued + 1);
+      expect(delivered.at(-1)).toBe('reconnected');
+      client.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a hung trailing GET — at the fetch or in the body — is abandoned at its deadline, so newer owed demand drains without the old request ever answering; stop() cancels an in-flight one (R7-05)', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const { client, requests, delivered, settle, open } = scriptedClient();
+      const push = await open();
+      // A refresh discarded by a push -> a trailing refetch, which hangs at the fetch.
+      void client.refetchSnapshot();
+      push('stale-1');
+      requests[1]!.answer(tagged('fresh-1'));
+      await settle();
+      expect(requests).toHaveLength(3); // the trailing refetch, never answered
+      // A newer wake completes, is discarded by another push: demand owed behind the hung one.
+      void client.refetchSnapshot();
+      push('stale-2');
+      requests[3]!.answer(tagged('wake'));
+      await settle();
+      expect(requests).toHaveLength(4);
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(requests[2]!.signal?.aborted).toBe(true); // the hung one was cancelled
+      expect(requests).toHaveLength(5); // and the owed refresh ran
+      // This one gets its headers, then its body hangs: abandoned the same way.
+      requests[4]!.hang();
+      void client.refetchSnapshot();
+      push('stale-3');
+      requests[5]!.answer(tagged('discarded-again'));
+      await settle();
+      expect(requests).toHaveLength(5 + 1);
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(requests[4]!.signal?.aborted).toBe(true);
+      expect(requests).toHaveLength(6); // the chain's third refetch backs off (R7-04)...
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(requests).toHaveLength(7); // ...and then runs
+      requests[6]!.answer(tagged('fresh'));
+      await settle();
+      expect(delivered.at(-1)).toBe('fresh');
+      // stop() cancels an in-flight snapshot request at once.
+      void client.refetchSnapshot();
+      expect(requests).toHaveLength(8);
+      client.stop();
+      expect(requests[7]!.signal?.aborted).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a trailing refetch that fails or times out keeps the owed answer — retried on the bounded schedule with no further push or wake; a delivery cancels a waiting retry (R8-02)', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const { client, requests, delivered, settle, open } = scriptedClient();
+      const push = await open();
+      // A decision's refresh loses to a queued pre-decision push...
+      void client.refetchSnapshot();
+      push('pre-decision');
+      requests[1]!.answer(tagged('discarded'));
+      await settle();
+      expect(requests).toHaveLength(3);
+      // ...its trailing replacement fails on the network: asked again at once.
+      requests[2]!.fail();
+      await settle();
+      expect(requests).toHaveLength(4);
+      // That one times out: the chain backs off, then asks again.
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(requests).toHaveLength(4);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(requests).toHaveLength(5);
+      requests[4]!.answer(tagged('authoritative'));
+      await settle();
+      expect(delivered.at(-1)).toBe('authoritative');
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(requests).toHaveLength(5); // met: the chain ends
+      // A retry waiting out its backoff is cancelled by a delivery from elsewhere.
+      void client.refetchSnapshot();
+      push('stale');
+      requests[5]!.answer(tagged('discarded-again'));
+      await settle();
+      requests[6]!.fail();
+      await settle();
+      requests[7]!.fail();
+      await settle();
+      expect(requests).toHaveLength(8); // the third waits 1 s
+      void client.refetchSnapshot(); // a wake, answered with no push in between
+      requests[8]!.answer(tagged('woken'));
+      await settle();
+      expect(delivered.at(-1)).toBe('woken');
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(requests).toHaveLength(9);
+      client.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('the newest ordinary refresh that times out, hangs in its body or fails — with no push at all — is asked again on the bounded chain; a refused pairing is not (R9-01)', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const { client, requests, delivered, settle, open } = scriptedClient();
+      await open();
+      // An owner decision's wake: its request outlives the deadline at the fetch...
+      void client.refetchSnapshot();
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(requests[1]!.signal?.aborted).toBe(true);
+      expect(requests).toHaveLength(3); // asked again at once
+      // ...its replacement hangs in the body, then the next fails outright.
+      requests[2]!.hang();
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(requests).toHaveLength(4);
+      requests[3]!.fail();
+      await settle();
+      expect(requests).toHaveLength(4); // the burst is spent: it backs off
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(requests).toHaveLength(5);
+      requests[4]!.answer(tagged('after-failures'));
+      await settle();
+      expect(delivered.at(-1)).toBe('after-failures');
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(requests).toHaveLength(5); // met: nothing more
+      // A server error is transient too.
+      void client.refetchSnapshot();
+      requests[5]!.refuse(503);
+      await settle();
+      expect(requests).toHaveLength(7);
+      requests[6]!.answer(tagged('recovered'));
+      await settle();
+      expect(delivered.at(-1)).toBe('recovered');
+      // An OLDER request failing after a newer one was asked owes nothing.
+      void client.refetchSnapshot();
+      void client.refetchSnapshot();
+      requests[7]!.fail();
+      await settle();
+      expect(requests).toHaveLength(9);
+      requests[8]!.answer(tagged('newest'));
+      await settle();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(requests).toHaveLength(9);
+      expect(delivered.at(-1)).toBe('newest');
+      // stop() during a failure-driven backoff: nothing runs, and a reconnect revives nothing.
+      void client.refetchSnapshot();
+      requests[9]!.fail();
+      await settle();
+      requests[10]!.fail();
+      await settle();
+      requests[11]!.fail();
+      await settle();
+      expect(requests).toHaveLength(12); // the next waits 1 s
+      client.stop();
+      client.connect();
+      expect(requests).toHaveLength(13);
+      requests[12]!.answer(tagged('reconnected'));
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(requests).toHaveLength(13);
+      client.stop();
+      // A refused pairing is fatal, never retried.
+      const refused = scriptedClient();
+      await refused.open();
+      void refused.client.refetchSnapshot();
+      refused.requests[1]!.refuse(401);
+      await refused.settle();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(refused.requests).toHaveLength(2);
+      refused.client.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a refused pairing (401) ends the client at once — an established refresh chain and a 401 whose error body hangs alike; nothing polls after it (R10-01)', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      // A refresh chain owes an answer; its trailing request is refused 401.
+      const chain = scriptedClient();
+      const push = await chain.open();
+      void chain.client.refetchSnapshot();
+      push('stale');
+      chain.requests[1]!.answer(tagged('discarded'));
+      await chain.settle();
+      expect(chain.requests).toHaveLength(3);
+      chain.requests[2]!.refuse(401);
+      await chain.settle();
+      expect(chain.fatals).toEqual(['unauthorized (board api)']);
+      expect(chain.client.getState()).toBe('offline');
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(chain.requests).toHaveLength(3); // no successor, no waiting retry
+      // An ordinary refresh refused 401 whose error body never arrives: the
+      // client ends on the status, not after the deadline.
+      const hung = scriptedClient();
+      await hung.open();
+      void hung.client.refetchSnapshot();
+      hung.requests[1]!.refuseHung(401);
+      await hung.settle();
+      expect(hung.fatals).toEqual(['unauthorized (board api)']);
+      expect(hung.client.getState()).toBe('offline');
+      expect(hung.requests[1]!.signal?.aborted).toBe(true);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(hung.requests).toHaveLength(2);
+      expect(hung.fatals).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('a malformed review is refused before anything renders it — a valid one passes', async () => {
     const review = (removed: unknown) => ({
       id: 'prop-1',

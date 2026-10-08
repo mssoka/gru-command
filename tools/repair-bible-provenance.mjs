@@ -14,15 +14,15 @@
  * provenance handles go first; see PROVENANCE_FLOOR in the bible).
  *
  * Running with --write IS the owner's approval: originals are saved under
- * <bible>/.repair-backup-<stamp>-<nonce>/chapters/ first, every chapter is re-read
- * with the strict parser afterwards, and any failure exits 1. The
+ * <bible>/.repair-backup-<stamp>-<nonce>/chapters/ first, and — still under
+ * the write lock — every chapter is re-read with the strict parser and its
+ * stored bytes checked against the cap; any failure exits 1. The
  * instance is selected by GRU_COMMAND_HOME (its config supplies the data
  * dir and the chapter cap); a dataDir argument must name that same data
  * dir. A write holds the book's write lock, so it never interleaves with a
  * dream; a failed write names the replaced chapters and the backup.
  */
-import { Buffer } from 'node:buffer';
-import { readFileSync, statSync } from 'node:fs';
+import { statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import process from 'node:process';
@@ -78,7 +78,16 @@ try {
 } catch (error) {
   fail(`the journal is unreadable (${error instanceof Error ? error.message : String(error)}) — nothing was written`);
 }
+/** A record's content with its keys in a fixed order, so two physical
+ * copies compare by what they say, not by how they were spelled. */
+const canonical = (value) =>
+  Array.isArray(value)
+    ? `[${value.map(canonical).join(',')}]`
+    : value !== null && typeof value === 'object'
+      ? `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonical(value[key])}`).join(',')}}`
+      : JSON.stringify(value);
 const journalTs = new Map();
+const journalRecords = new Map();
 for (const entry of records) {
   if (entry.id !== `j-${entry.seq}`) {
     fail(`journal entry seq ${entry.seq} is recorded as ${entry.id} — fix the journal first; nothing was written`);
@@ -92,6 +101,13 @@ for (const entry of records) {
   if (seen !== undefined && seen !== entry.ts) {
     fail(`journal id ${entry.id} appears twice with different timestamps (${seen}, ${entry.ts}) — fix the journal first; nothing was written`);
   }
+  // Only an identical copy is tolerated (R5-A6): two records that share an
+  // id but say different things leave that handle's ground truth ambiguous.
+  const content = canonical(entry);
+  if (journalRecords.has(entry.id) && journalRecords.get(entry.id) !== content) {
+    fail(`journal id ${entry.id} appears twice with different contents — fix the journal first; nothing was written`);
+  }
+  journalRecords.set(entry.id, content);
   journalTs.set(entry.id, entry.ts);
 }
 
@@ -101,11 +117,16 @@ const chaptersDir = join(dataDir, 'bible', 'chapters');
 let chaptersStat;
 try {
   chaptersStat = statSync(chaptersDir);
-} catch {
-  chaptersStat = null;
+} catch (error) {
+  // Only a missing path means a missing book (R5-A8); anything else is
+  // reported as itself, never as "the wrong instance".
+  if (error?.code === 'ENOENT') {
+    fail(`${chaptersDir} does not exist — is GRU_COMMAND_HOME (${process.env.GRU_COMMAND_HOME ?? 'unset'}) the right instance? nothing was written`);
+  }
+  fail(`${chaptersDir} cannot be read (${error?.code ?? String(error)}: ${error instanceof Error ? error.message : String(error)}) — nothing was written`);
 }
-if (chaptersStat === null || !chaptersStat.isDirectory()) {
-  fail(`${chaptersDir} does not exist — is GRU_COMMAND_HOME (${process.env.GRU_COMMAND_HOME ?? 'unset'}) the right instance? nothing was written`);
+if (!chaptersStat.isDirectory()) {
+  fail(`${chaptersDir} exists but is not a directory — nothing was written`);
 }
 
 const bible = new BibleStore(join(dataDir, 'bible'), {
@@ -138,16 +159,5 @@ if (!write) {
   process.exit(0);
 }
 if (report.backupDir !== null) out(`originals saved under ${report.backupDir}`);
-
-// Prove the result with the same strict reader every dream uses.
-try {
-  for (const chapter of bible.readChapters()) {
-    const text = readFileSync(join(bible.chaptersDir, `${chapter.slug}.md`), 'utf-8');
-    if (Buffer.byteLength(text, 'utf8') > config.lessons.chapterCapBytes) {
-      fail(`chapter ${chapter.slug}.md exceeds the ${config.lessons.chapterCapBytes} B cap after repair`);
-    }
-  }
-} catch (error) {
-  fail(`the repaired book does not parse: ${error instanceof Error ? error.message : String(error)}`);
-}
+// The write was proven inside the lock: every chapter parses and fits.
 out(changed === 0 ? 'nothing to repair' : `repaired ${changed} chapter(s); every chapter parses and fits the cap`);

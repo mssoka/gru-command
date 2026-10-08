@@ -389,6 +389,19 @@ export type NotificationRouting = (typeof NOTIFICATION_ROUTINGS)[number];
 export const NOTIFICATION_SEVERITIES = ['info', 'error'] as const;
 export type NotificationSeverity = (typeof NOTIFICATION_SEVERITIES)[number];
 
+/** Alerts only their producer closes (owner decision 2026-10-08): a failing
+ * lesson dream's incident resolves when a dream pass completes. A Gru
+ * disposition would close it while nothing recovered — and restart the
+ * failure streak at pass 1 on the next failing beat. Value: what closes it. */
+const PRODUCER_RESOLVED_KINDS: Readonly<Record<string, string>> = {
+  'lessons.dream-failed': 'a completed dream pass',
+};
+
+/** What closes a producer-resolved alert kind, or null for any other kind. */
+export function producerResolvedBy(kind: string): string | null {
+  return Object.hasOwn(PRODUCER_RESOLVED_KINDS, kind) ? PRODUCER_RESOLVED_KINDS[kind]! : null;
+}
+
 export function isOwnerHeldNotificationKind(kind: string): boolean {
   // NOTE (provider-recovery machine-ownership amendment, 2026-09-29): the
   // `supervision.provider-wall.*` family is deliberately NOT force-held
@@ -1576,9 +1589,9 @@ export class LedgerApi {
   /** The one jobs-row status write + `job.status` event. Callers assert
    * their own transition first (the generic machine vs. the audited
    * administrative-closeout edge); the write shape lives in one place. */
-  private writeJobStatus(id: string, from: JobStatus, to: JobStatus): EventRecord {
+  private writeJobStatus(id: string, from: JobStatus, to: JobStatus, extra?: Readonly<Record<string, unknown>>): EventRecord {
     this.db.prepare('UPDATE jobs SET status = ?, updated_at = ? WHERE id = ?').run(to, nowIso(), id);
-    return this.appendEvent({ kind: 'job.status', jobId: id, payload: { from, to } });
+    return this.appendEvent({ kind: 'job.status', jobId: id, payload: { ...extra, from, to } });
   }
 
   setJobStatus(id: string, status: string, context?: BlockerContext): JobRecord {
@@ -2497,12 +2510,35 @@ export class LedgerApi {
     });
   }
 
+  /** {@link admitReviewRound}, also returning the round's OWN provisional
+   * status event (null when the job was not flipped) — read inside the
+   * transaction, so a subscriber that writes another status when the flip
+   * is published can never be mistaken for it (R8-10). */
+  admitReviewRoundWithFlip(input: Parameters<LedgerApi['admitReviewRound']>[0]): { readonly round: RoundRecord; readonly flipSeq: number | null } {
+    return this.transaction(() => {
+      const before = this.latestJobEvent(input.jobId, 'job.status')?.seq ?? 0;
+      const round = this.admitReviewRound(input);
+      const flip = this.db.prepare(
+        "SELECT seq FROM events WHERE job_id = ? AND kind = 'job.status' AND seq > ? ORDER BY seq ASC LIMIT 1",
+      ).get(input.jobId, before) as { seq: number } | undefined;
+      return { round, flipSeq: flip === undefined ? null : Number(flip.seq) };
+    });
+  }
+
   /** Undo only this round's provisional status flip. An admitted successor
    * owns the job status now: an older setup failure must not roll it back. */
   restoreReviewSetupStatus(input: {
     readonly jobId: string;
     readonly roundId: string;
     readonly priorStatus: 'working' | 'blocked';
+    /** The open attempt the round interrupted (`openAttemptStartSeq` at its
+     * flip). A restored `working` hop resumes that attempt — it is not a
+     * reopened lane, so its earlier delivery still settles it. */
+    readonly attemptStartSeq?: number;
+    /** This round's own provisional status event (R7-10): restore only
+     * while it is still the job's latest status event — a generation
+     * written since (a reopened attempt) is never undone or concealed. */
+    readonly expectedStatusSeq?: number;
   }): boolean {
     return this.transaction(() => {
       const job = this.getJob(input.jobId);
@@ -2511,7 +2547,16 @@ export class LedgerApi {
         .get(input.jobId) as { id: string } | undefined;
       if (job?.status !== 'in-review' || round?.jobId !== input.jobId ||
         round.status !== 'aborted' || latest?.id !== input.roundId) return false;
-      this.setJobStatus(input.jobId, input.priorStatus);
+      if (input.expectedStatusSeq !== undefined &&
+        this.latestJobEvent(input.jobId, 'job.status')?.seq !== input.expectedStatusSeq) return false;
+      if (input.priorStatus === 'working' && input.attemptStartSeq !== undefined) {
+        assertJobTransition(job.status, 'working');
+        this.writeJobStatus(input.jobId, job.status, 'working', {
+          restoredAfterRound: input.roundId, attemptStartSeq: input.attemptStartSeq,
+        });
+      } else {
+        this.setJobStatus(input.jobId, input.priorStatus);
+      }
       return true;
     });
   }
@@ -4353,6 +4398,10 @@ export class LedgerApi {
       if (current === null) return null;
       if (current.routing !== 'action-required') {
         throw new Error('only action-required notifications accept a Gru disposition; owner stops require owner acknowledgement');
+      }
+      const closer = producerResolvedBy(current.kind);
+      if (closer !== null) {
+        throw new Error(`${current.kind} closes itself on ${closer} — fix its cause and leave the alert open; a disposition is refused`);
       }
       if (current.resolvedAt !== null || current.ackedAt !== null) return current;
       this.db.prepare('UPDATE notifications SET resolved_at = ?, resolved_by = ? WHERE id = ?')

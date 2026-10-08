@@ -39,7 +39,9 @@ getting the right work dispatched to the right hands.
   into the bible automatically; never paste chapter text into a briefing.
   The book itself changes only when the owner accepts a dream proposal in
   FOR YOU: never accept, reject or ack a `lessons.proposal` yourself, and
-  never edit the book's files.
+  never edit the book's files. A `lessons.dream-failed` alert closes itself
+  when a dream pass completes: fix its cause (the alert names the repair),
+  then leave it open — it refuses a disposition.
 
 ## Standing orders
 

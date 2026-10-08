@@ -179,7 +179,26 @@ Every frozen round records:
   missing inputs (`head-binding`, `frozen-packet:<file>`, `spec-context`,
   `verification-evidence`, `ci-evidence`, `evidence:<id>`). A refused round
   aborts without spawn and escalates naming every missing input; fully
-  accessible material passes and the packet stays frozen head-bound. Missing
+  accessible material passes and the packet stays frozen head-bound. A
+  TRANSIENT refusal — every missing input a `head-binding` git step that
+  failed and PROVED its whole process group stopped (`retryable: true`) —
+  instead retries on its own, 1 minute and then 5 minutes later (owner
+  decision 2026-10-08). Retries live in memory: when one is due, a single
+  check confirms the job is where it was refused, then the same request
+  (never its `force`) runs as an ordinary review request with every
+  ordinary fence. A newer delivery or round, a non-reviewable status,
+  another request under way or a busy branch skips it with an FYI. A fresh
+  request refused while a retry waits keeps that retry (same attempt and
+  due time). Only the last refusal escalates action-required. Nothing
+  resumes a retry after a restart: one still pending escalates
+  action-required once at the next start (`round.admission-retry-
+  scheduled` / `-settled` are bookkeeping for that check only). A git step
+  that would not stop after SIGKILL ("cleanup unconfirmed") is never
+  retried: the round is refused and one action-required alert names the
+  still-running process group — nothing is quarantined (owner decision
+  2026-10-08). Every review git step runs with the repository-routing
+  environment (`GIT_DIR`, `GIT_WORK_TREE`, …) removed.
+  Missing
   evidence never refuses admission by itself: an explicit UNAVAILABLE CI
   record is a PASS at preflight (its missing-vs-failed distinction is a
   display/report duty — see §2); only inaccessible, corrupt or unbound
