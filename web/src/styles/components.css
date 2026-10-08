@@ -2066,7 +2066,9 @@ body {
   margin-top: 6px;
   font-size: 12px;
   font-weight: 700;
-  color: var(--alert);
+  color: var(--ink);
+  border-left: 3px solid var(--alert);
+  padding-left: 8px;
   overflow-wrap: anywhere;
 }
 
