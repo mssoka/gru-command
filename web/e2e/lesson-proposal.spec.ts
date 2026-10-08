@@ -196,9 +196,17 @@ for (const width of [360, 375, 390]) {
     expect(geometry.pageOverflow).toBeLessThanOrEqual(0);
 
     // Accept and Reject: on screen and the topmost element at their centres.
+    // The SLIM strip's taller chrome means the minimal scroll may leave the
+    // button behind it — correct with an explicit scroll before the probe.
     for (const selector of ['.board-owner__accept', '.board-owner__reject']) {
       const button = row.locator(selector);
       await button.scrollIntoViewIfNeeded();
+      await button.evaluate((node) => {
+        const pad = 8;
+        const rect = node.getBoundingClientRect();
+        if (rect.bottom > window.innerHeight - pad) window.scrollBy(0, rect.bottom - (window.innerHeight - pad));
+        else if (rect.top < pad) window.scrollBy(0, rect.top - pad);
+      });
       await expect(button).toBeEnabled();
       const hit = await button.evaluate((node) => {
         const rect = node.getBoundingClientRect();
