@@ -26,7 +26,8 @@ import {
 } from '../src/dispatch/perkins.js';
 import { createDispatchServer } from '../src/dispatch/server.js';
 import type { DispatchService } from '../src/dispatch/service.js';
-import { computeSilasDigest } from '../src/dispatch/silas-driver.js';
+import { computeSilasDigest, silasWakeEvent } from '../src/dispatch/silas-driver.js';
+import { MIGRATIONS } from '../src/ledger/db.js';
 import { renderRevisionContinuation } from '../src/dispatch/work-revision.js';
 import type { ResidentReviewRound } from '../src/runtime/registry.js';
 import type { AgentCapabilities, AgentHandle, SpawnOptions } from '../src/runtime/types.js';
@@ -100,6 +101,16 @@ function deliver(ledger: LedgerApi, jobId: string, workRevision?: number): void 
   });
 }
 
+/** A completed scheduler verification of `sha` (the receipt option A
+ * requires before a corrective delivery may be reviewed). */
+function verified(ledger: LedgerApi, jobId: string, sha: string, ok = true): void {
+  ledger.appendCustomEvent({
+    kind: 'verification.completed',
+    jobId,
+    payload: { run_id: `run-${sha}-${String(ok)}`, scope: 'unit', sha, ok, exit_code: ok ? 0 : 1 },
+  });
+}
+
 describe('rule 1 — material vs administrative amendments', () => {
   it('requires an explicit effect, audits the refusal, and records it on acceptance', () => {
     const { ledger } = bootLedger();
@@ -166,8 +177,18 @@ describe('rule 2 — a pending correction prevents review from starting', () => 
     expect(laneIsBusy(ledger, ledger.getJob('job-r2')!)).toBe(true);
     const blockers = findBusyLanes({ ledger, lanes: [], targetBranch: 'gru/job-r2' });
     expect(blockers).toEqual([{ jobId: 'job-r2', status: 'working', branch: 'gru/job-r2', revision: { required: 2, delivered: 1 } }]);
-    // Only a delivery stamped with the required revision releases the fence.
+    // Only a delivery stamped with the required revision releases the fence…
     deliver(ledger, 'job-r2', 2);
+    // …and, being corrective, it is reviewed only on a verified head
+    // (owner decision 2026-10-09, option A).
+    expect(laneIsBusy(ledger, ledger.getJob('job-r2')!)).toBe(true);
+    expect(findBusyLanes({ ledger, lanes: [], targetBranch: 'gru/job-r2' })).toEqual([
+      { jobId: 'job-r2', status: 'working', branch: 'gru/job-r2', verification: { revision: 2, head: 'fixture-settled' } },
+    ]);
+    verified(ledger, 'job-r2', 'other-head');
+    verified(ledger, 'job-r2', 'fixture-settled', false);
+    expect(laneIsBusy(ledger, ledger.getJob('job-r2')!)).toBe(true);
+    verified(ledger, 'job-r2', 'fixture-settled');
     expect(laneIsBusy(ledger, ledger.getJob('job-r2')!)).toBe(false);
   });
 
@@ -620,6 +641,11 @@ describe('the service-enforced sequence over HTTP (R1/R2 replayed)', () => {
       request_id: 'slim-v5-correction', work_revision: 1,
     });
     expect(h.ledger.workRevisionState(h.jobId)).toEqual({ required: 1, delivered: 1 });
+    // Implement → verify → review: the corrective head owes its pass.
+    const correctedHead = (h.ledger.latestJobEvent(h.jobId, 'job.delivered')!.payload as { sha: string }).sha;
+    expect(h.ledger.correctiveVerificationDebt(h.jobId)).toEqual({ revision: 1, head: correctedHead });
+    expect(laneIsBusy(h.ledger, h.ledger.getJob(h.jobId)!)).toBe(true);
+    verified(h.ledger, h.jobId, correctedHead);
     expect(laneIsBusy(h.ledger, h.ledger.getJob(h.jobId)!)).toBe(false);
   });
 
@@ -744,6 +770,10 @@ describe('review round 1 — the fences hold under force, restart and re-proof',
       .rejects.toThrow(ReviewSupersessionUnconfirmedError);
     // Only once the runtime proves the session gone does a writer pass.
     h.liveSessions.clear();
+    // The same stuck stop is reported action-required once; a re-proof
+    // that fails again is an FYI.
+    expect(h.escalations.filter((line) => line.includes('could not be confirmed stopped'))).toHaveLength(1);
+    expect(h.informs.some((title) => title.includes('still not proven stopped'))).toBe(true);
     const proven = await h.wave.clearLaneForWriter({ jobId: h.jobId, writer: 'directive c' });
     expect(proven.confirmed).toBe(true);
     expect(h.wave.activeReview(h.jobId)).toBeNull();
@@ -795,6 +825,7 @@ describe('review round 1 — the fences hold under force, restart and re-proof',
     });
     await h.wave.recoverInterruptedRounds();
     expect(h.ledger.getRound(round.id)?.status).toBe('aborted');
+    expect(h.ledger.latestRoundEvent(round.id, 'round.perkins-incomplete')?.payload).toMatchObject({ reason: 'superseded' });
     expect(h.escalations).toEqual([]);
     expect(h.informs.some((title) => title.includes('(superseded)'))).toBe(true);
   });
@@ -943,6 +974,232 @@ describe('review round 1 — one continuation, never contradictory', () => {
     expect(pending.deliveredWithoutPr).toEqual([]);
     expect(pending.revisionContinuations.map((row) => row.jobId)).toEqual(['job-nopr']);
     deliver(ledger, 'job-nopr', 1);
-    expect((await digest()).deliveredWithoutPr.map((row) => row.jobId)).toEqual(['job-nopr']);
+    // The corrective delivery owes its verification first (option A).
+    const owed = await digest();
+    expect(owed.deliveredWithoutPr).toEqual([]);
+    expect(owed.verificationsOwed).toEqual([{ jobId: 'job-nopr', repo: 'r', revision: 1, head: 'fixture-settled' }]);
+    verified(ledger, 'job-nopr', 'fixture-settled');
+    const cleared = await digest();
+    expect(cleared.verificationsOwed).toEqual([]);
+    expect(cleared.deliveredWithoutPr.map((row) => row.jobId)).toEqual(['job-nopr']);
+  });
+});
+
+describe('review round 2 — durable debts, handoffs and verification (option A)', () => {
+  it('a minion review request for a candidate a material change made obsolete is refused, not queued', async () => {
+    const h = await plainLane('job-handoff-refused');
+    deliver(h.ledger, h.jobId);
+    amend(h.ledger, h.jobId, 'material', 'Approved correction.');
+    await expect(h.wave.requestReview({ jobId: h.jobId, handoff: true })).rejects.toThrow(/is busy/);
+    expect(h.ledger.latestJobEvent(h.jobId, 'job.review-handoff-queued')).toBeNull();
+  });
+
+  it('a queued request older than a material amendment is withdrawn on restart even if the withdrawal was lost', async () => {
+    const h = await plainLane('job-handoff-crash');
+    const queued = await h.wave.requestReview({ jobId: h.jobId, handoff: true });
+    expect(queued.route).toBe('queued');
+    // The amendment commits; the service dies before its supersession pass.
+    amend(h.ledger, h.jobId, 'material', 'Approved correction.');
+    const restarted = new WaveRunner({
+      ledger: h.ledger, worktrees: h.port, bus: new EventBus(),
+      spawner: async () => {
+        throw new Error('no spawn');
+      },
+      reviewArtifactRoot: temp('supersession-crash-artifacts-'),
+    });
+    closers.push(() => restarted.shutdown());
+    restarted.resumeQueuedHandoffs();
+    expect(h.ledger.latestJobEvent(h.jobId, 'job.review-handoff-withdrawn')?.payload)
+      .toMatchObject({ reason: 'an approved material amendment was accepted after this review request' });
+  });
+
+  it('a supersession a restart interrupted (receipt, no confirmation) is re-proven before any writer', async () => {
+    const h = await plainLane('job-unproven-round');
+    const round = h.ledger.addRound({ jobId: h.jobId, lenses: ['blind'] });
+    h.ledger.abortReviewSetupWithoutSpawn(round.id);
+    h.ledger.appendCustomEvent({ kind: 'round.superseded', jobId: h.jobId, roundId: round.id, payload: { reason: 'material' } });
+    expect(h.wave.activeReview(h.jobId)?.roundIds).toEqual([round.id]);
+    expect(() => h.wave.assertWriterAdmissible(h.jobId)).toThrow(ReviewInProgressError);
+    amend(h.ledger, h.jobId, 'material', 'Approved correction.');
+    expect((await h.wave.clearLaneForWriter({ jobId: h.jobId, writer: 'directive r' })).confirmed).toBe(true);
+    expect(h.ledger.latestRoundEvent(round.id, 'round.supersession-confirmed')).not.toBeNull();
+    expect(h.wave.activeReview(h.jobId)).toBeNull();
+  });
+
+  it('an unproven fallback stop is durable on the job until a writer re-proves it', async () => {
+    const h = await plainLane('job-unproven-fallback');
+    h.ledger.appendCustomEvent({ kind: 'job.review-superseded', jobId: h.jobId, payload: { route: 'bmad-review-fallback' } });
+    h.ledger.appendCustomEvent({ kind: 'job.review-supersession-unconfirmed', jobId: h.jobId, payload: { detail: 'session alive' } });
+    expect(h.wave.activeReview(h.jobId)).toEqual({ roundIds: [], operations: 0 });
+    expect(() => h.wave.assertWriterAdmissible(h.jobId)).toThrow(ReviewInProgressError);
+    // The fallback reviewer session is still registered live: unproven.
+    h.ledger.registerAgent({ id: 'fallback-reviewer', role: 'perkins', label: 'fallback-review', jobId: h.jobId, sessionFile: null });
+    amend(h.ledger, h.jobId, 'material', 'Approved correction.');
+    await expect(h.wave.clearLaneForWriter({ jobId: h.jobId, writer: 'directive f' })).rejects.toThrow(/fallback-reviewer/);
+    h.ledger.setAgentState('fallback-reviewer', 'disposed');
+    expect((await h.wave.clearLaneForWriter({ jobId: h.jobId, writer: 'directive f2' })).confirmed).toBe(true);
+    expect(h.wave.activeReview(h.jobId)).toBeNull();
+  });
+
+  it('a pass on the corrective head re-offers a request that waited on its verification', async () => {
+    const h = await plainLane('job-verify-replay');
+    amend(h.ledger, h.jobId, 'material', 'Approved correction.');
+    deliver(h.ledger, h.jobId, 1);
+    expect(h.ledger.correctiveVerificationDebt(h.jobId)).toEqual({ revision: 1, head: 'fixture-settled' });
+    const queued = await h.wave.requestReview({ jobId: h.jobId, handoff: true });
+    expect(queued.route).toBe('queued');
+    verified(h.ledger, h.jobId, 'fixture-settled');
+    for (let spins = 0; spins < 200 && h.ledger.latestJobEvent(h.jobId, 'job.review-handoff-claimed') === null; spins += 1) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    expect(h.ledger.latestJobEvent(h.jobId, 'job.review-handoff-claimed')).not.toBeNull();
+  });
+
+  it('the debt follows the newest delivery until a review admits it, and only the corrective revision owes one', () => {
+    const { ledger } = bootLedger();
+    ledger.addJob({ id: 'job-debt', repo: 'r', title: 't', briefing: BRIEFING });
+    ledger.setJobStatus('job-debt', 'working');
+    deliver(ledger, 'job-debt');
+    expect(ledger.correctiveVerificationDebt('job-debt')).toBeNull(); // ordinary delivery: today's behavior
+    amend(ledger, 'job-debt', 'material', 'Correction.');
+    ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-debt', payload: { sha: 'h1', work_revision: 1 } });
+    verified(ledger, 'job-debt', 'h1', false);
+    // The failed verification is repaired: the repair delivery owes its own pass.
+    ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-debt', payload: { sha: 'h2', work_revision: 1 } });
+    expect(ledger.correctiveVerificationDebt('job-debt')).toEqual({ revision: 1, head: 'h2' });
+    verified(ledger, 'job-debt', 'h2');
+    expect(ledger.correctiveVerificationDebt('job-debt')).toBeNull();
+    // Once a review admitted the corrected work, later ordinary fix
+    // deliveries at the same revision are not corrective.
+    ledger.addRound({ jobId: 'job-debt', lenses: ['blind'] });
+    ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-debt', payload: { sha: 'h3', work_revision: 1 } });
+    expect(ledger.correctiveVerificationDebt('job-debt')).toBeNull();
+  });
+
+  it('accepting a material amendment alone stops a running review — no writer needed', async () => {
+    const h = await heldReview({ mode: 'running' });
+    const { port } = await serve(h);
+    const roundId = h.wave.activeReview(h.jobId)!.roundIds[0]!;
+    const accepted = await post(port, '/api/dispatch/amendment', {
+      job_id: h.jobId, body: 'Approved correction.', effect: 'material',
+      approval: { by: 'gru', reference: 'j-only-amendment' },
+      expected_contract_sha256: h.ledger.effectiveContract(h.jobId)!.contractSha256,
+    });
+    expect(accepted.json).toMatchObject({ review_supersession: 'started' });
+    for (let spins = 0; spins < 2000 && h.ledger.latestRoundEvent(roundId, 'round.supersession-confirmed') === null; spins += 1) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    expect(h.ledger.latestRoundEvent(roundId, 'round.supersession-confirmed')).not.toBeNull();
+    expect(h.ledger.getRound(roundId)?.status).toBe('aborted');
+    expect(h.liveSessions.size).toBe(0);
+    expect(h.ledger.listPendingDirectives({ jobId: h.jobId })).toHaveLength(0);
+  });
+
+  it('a fresh session with nothing to resume is briefed with the effective contract', async () => {
+    const lanePath = temp('supersession-nosession-lane-');
+    const prompts: string[] = [];
+    await routeFixDirectiveToMinion({
+      registry: {
+        getHandle: () => null,
+        spawn: async (): Promise<AgentHandle> => ({
+          role: 'minion', id: 'fresh-2', sessionFile: null, capabilities: CAPABILITIES,
+          async prompt(text: string) {
+            prompts.push(text);
+          },
+          async steer() {},
+          async followUp() {},
+          subscribe: () => () => {},
+          health: () => ({ state: 'idle' as const, lastActivity: null, sessionFile: null }),
+          async dispose() {},
+        }),
+        disposeHandle: async () => {},
+      },
+      ledger: {
+        getAgent: () => null, listAgents: () => [], listImplementerMinions: () => [], registerAgent: () => {},
+        getJob: () => ({ briefing: BRIEFING, status: 'working' }),
+      } as never,
+      worktrees: { listWorktrees: () => [{ id: 'job-n', kind: 'job', path: lanePath, branch: null, jobId: 'job-n', status: 'active' }] } as never,
+      jobId: 'job-n',
+      directive: 'Implement contract revision 1.',
+      contract: `${BRIEFING}\n\nEFFECTIVE-AMENDMENT`,
+      continuation: { block: 'BLOCK EFFECTIVE-AMENDMENT', freshNote: 'FRESH-NOTE' },
+      signal: new AbortController().signal,
+    });
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toContain('Effective contract (original briefing plus accepted amendments)');
+    expect(prompts[0]!.split('EFFECTIVE-AMENDMENT')).toHaveLength(2);
+    expect(prompts[0]).toContain('FRESH-NOTE');
+  });
+
+  it('the fresh contract is fixed at the intent: an amendment accepted while the gate waits travels next time', async () => {
+    const h = await plainLane('job-intent-contract');
+    deliver(h.ledger, h.jobId);
+    amend(h.ledger, h.jobId, 'material', 'FIRST-CORRECTION');
+    const gatedWave = {
+      activeReview: () => null,
+      assertWriterAdmissible: () => undefined,
+      clearLaneForWriter: async (input: { jobId: string }) => {
+        // Accepted while the writer gate waits.
+        amend(h.ledger, input.jobId, 'material', 'SECOND-CORRECTION');
+        return { jobId: input.jobId, roundIds: [], operations: 0, confirmed: true, detail: null };
+      },
+      supersedeReviews: async (input: { jobId: string }) => ({ jobId: input.jobId, roundIds: [], operations: 0, confirmed: true, detail: null }),
+    } as unknown as WaveRunner;
+    const dir = temp('supersession-intent-server-');
+    writeFileSync(join(dir, 'config.toml'), `[auth]\ntoken = "${TOKEN}"\n[server]\nhost = "127.0.0.1"\nport = 0\n`, 'utf-8');
+    const registry = new CapturingMinions();
+    const server = createDispatchServer({
+      pendingProducerBlockers: () => [],
+      config: loadConfig({ GRU_COMMAND_HOME: dir }, '/home/tester'),
+      dispatch: null as unknown as DispatchService,
+      wave: gatedWave,
+      ledger: h.ledger,
+      silasOps: { registry, worktrees: h.port, notifications: new NotificationCenter({ ledger: h.ledger, bus: new EventBus() }) },
+    });
+    const http: HttpServer = createServer((req, res) => {
+      if (server.requestHook(req, res, new URL(req.url ?? '/', 'http://localhost').pathname)) return;
+      res.writeHead(404);
+      res.end();
+    });
+    await new Promise<void>((resolve) => http.listen(0, '127.0.0.1', resolve));
+    closers.push(() => new Promise<void>((resolve) => http.close(() => resolve())));
+    const res = await post((http.address() as AddressInfo).port, '/api/silas/directive', {
+      job_id: h.jobId, directive: 'Implement the correction.', request_id: 'intent-1',
+    });
+    expect(res.json).toMatchObject({ work_revision: 1 });
+    expect(await settledDirective(h.ledger, 'intent-1')).toBe('settled');
+    expect(registry.prompts).toHaveLength(1);
+    expect(registry.prompts[0]).toContain('FIRST-CORRECTION');
+    expect(registry.prompts[0]).not.toContain('SECOND-CORRECTION');
+    expect(h.ledger.workRevisionState(h.jobId)).toEqual({ required: 2, delivered: 1 });
+  });
+
+  it('a pre-revision amendment survives migration 24 unclassified: same contract hash, no review fence', () => {
+    const dir = temp('supersession-migration-');
+    const old = new LedgerDb(dir, { migrations: MIGRATIONS.slice(0, 23) });
+    old.handle.prepare("INSERT INTO jobs (id, repo, title, status, briefing, created_at, updated_at) VALUES ('j', 'r', 't', 'working', ?, 't', 't')").run(BRIEFING);
+    const legacy: JobAmendmentRecord = {
+      id: 'legacy-1', jobId: 'j', version: 1, body: 'A historical clarification.', bodySha256: 'b', supersedes: [],
+      approval: { by: 'owner', reference: 'j-old' }, effect: null, previousContractSha256: 'p', contractSha256: '',
+      requestSha256: 'r', idempotencyKey: null, createdAt: '2026-10-01T00:00:00.000Z',
+    };
+    const contractSha256 = renderEffectiveContract(BRIEFING, [legacy]).contractSha256;
+    old.handle.prepare(
+      `INSERT INTO job_amendments (id, job_id, version, body, body_sha256, supersedes, approval_by, approval_reference,
+         previous_contract_sha256, contract_sha256, request_sha256, idempotency_key, created_at)
+       VALUES ('legacy-1', 'j', 1, 'A historical clarification.', 'b', '[]', 'owner', 'j-old', 'p', ?, 'r', NULL, '2026-10-01T00:00:00.000Z')`,
+    ).run(contractSha256);
+    old.close();
+    const upgraded = new LedgerDb(dir);
+    closers.push(async () => upgraded.close());
+    const api = new LedgerApi(upgraded.handle);
+    expect(api.listJobAmendments('j')[0]?.effect).toBeNull();
+    expect(api.effectiveContract('j')!.contractSha256).toBe(contractSha256);
+    expect(api.workRevisionState('j')).toEqual({ required: 0, delivered: 0 });
+  });
+
+  it('an accepted MATERIAL amendment wakes Silas; an administrative one does not', () => {
+    expect(silasWakeEvent({ kind: 'job.amendment-accepted', payload: { effect: 'material' } })).toBe(true);
+    expect(silasWakeEvent({ kind: 'job.amendment-accepted', payload: { effect: 'administrative' } })).toBe(false);
   });
 });

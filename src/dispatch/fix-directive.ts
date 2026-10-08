@@ -256,7 +256,12 @@ export async function routeFixDirectiveToMinion(
     // (the resumed row's id, else a fresh one) and receives the GC-mediated
     // child tools bound to it — re-briefed parents stay able to commission.
     const identity = parentIdentitySpawnOptions(input, resumeFile);
-    let prompt = directive;
+    // A brand-new session (nothing to resume) has no memory of the contract:
+    // brief it with the effective contract like the resume fallback below
+    // (owner rule 4) — when the caller supplied one.
+    const freshPrompt = (contract: string): string =>
+      `Fresh minion re-brief for job ${input.jobId}. Effective contract (original briefing plus accepted amendments):\n${contract}\n\nCurrent fix directive:\n${compose(input.continuation?.freshNote ?? '')}`;
+    let prompt = resumeFile === null && input.contract != null ? freshPrompt(input.contract) : directive;
     try {
       assertDirectiveJobActive(input.ledger, input.jobId);
       handle = await input.registry.spawn('minion', {
@@ -276,7 +281,7 @@ export async function routeFixDirectiveToMinion(
       // A fresh session has no memory of accepted amendments: brief it with
       // the EFFECTIVE contract (original + amendments), never the original
       // alone (owner rule 4).
-      prompt = `Fresh minion re-brief for job ${input.jobId}. Effective contract (original briefing plus accepted amendments):\n${contract}\n\nCurrent fix directive:\n${compose(input.continuation?.freshNote ?? '')}`;
+      prompt = freshPrompt(contract);
     }
     assertDirectiveJobActive(input.ledger, input.jobId);
     let promptError: unknown = null;

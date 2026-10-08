@@ -505,6 +505,7 @@ describe('branch-idle guard', () => {
       hasUnsettledVerificationRun: (): boolean => false,
       hasOpenDirectiveRecoveryHold: (): boolean => false,
       workRevisionState: () => ({ required: 0, delivered: 0 }),
+      correctiveVerificationDebt: () => null,
     };
     const busy = (id: string): boolean => laneIsBusy(ledger, ledger.listJobs().find((job) => job.id === id)!);
     expect(busy('never-started')).toBe(true);
@@ -577,6 +578,7 @@ describe('branch-idle guard', () => {
       hasUnsettledVerificationRun: (): boolean => false,
       hasOpenDirectiveRecoveryHold: (): boolean => false,
       workRevisionState: () => ({ required: 0, delivered: 0 }),
+      correctiveVerificationDebt: () => null,
     };
     expect(laneIsBusy(paged, paged.listJobs()[0]!)).toBe(false);
 
@@ -600,6 +602,7 @@ describe('branch-idle guard', () => {
       hasUnsettledVerificationRun: (): boolean => false,
       hasOpenDirectiveRecoveryHold: (): boolean => false,
       workRevisionState: () => ({ required: 0, delivered: 0 }),
+      correctiveVerificationDebt: () => null,
     };
     expect(laneIsBusy(capped, capped.listJobs()[0]!)).toBe(false);
   });
@@ -846,6 +849,7 @@ describe('branch-idle guard', () => {
       hasUnsettledVerificationRun: (): boolean => false,
       hasOpenDirectiveRecoveryHold: (): boolean => false,
       workRevisionState: () => ({ required: 0, delivered: 0 }),
+      correctiveVerificationDebt: () => null,
     };
     const busy = (id: string): boolean => laneIsBusy(ledger, ledger.listJobs().find((job) => job.id === id)!);
     expect(busy('working-pending')).toBe(true);
@@ -1457,6 +1461,7 @@ describe('branch-idle guard', () => {
       hasUnsettledVerificationRun: (): boolean => false,
       hasOpenDirectiveRecoveryHold: (): boolean => false,
       workRevisionState: () => ({ required: 0, delivered: 0 }),
+      correctiveVerificationDebt: () => null,
     };
     const lanes = [
       laneRecord('marker-owner', 'marker-owner', 'gru/marker-owner'),

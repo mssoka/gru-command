@@ -159,6 +159,7 @@ publishes it on the in-process event bus (`src/events/bus.ts`).
 | `round.superseded` | reason, by, the round's status/target at supersession, `settled_specialists` (lens, attempt, checkpoint sha256) and `artifact_directory` — written BEFORE the abort; partial findings stay on disk |
 | `round.supersession-confirmed` / `round.supersession-unconfirmed` | by (+ `detail` naming what was not proven stopped: unsettled operations, non-terminal rounds, live review sessions) — an unconfirmed stop also escalates action-required and refuses the writer |
 | `job.review-superseded` / `job.review-supersession-confirmed` / `job.review-supersession-unconfirmed` | the same supersession for a review operation that owns no round (the bmad-review fallback gate) |
+| `job.review-handoff-withdrawn` | requestSeq, reason — a queued review request withdrawn because an approved material change made its candidate obsolete (terminal for restart resume) |
 | `round.review-inputs-frozen` | acceptance version/base+effective hashes/amendment ids, evidence attachment hashes (no pixels, no paths), bound CI record state |
 | `round.admission-preflight` | ok, full check list (`head-binding`, `frozen-packet:<file>`, `spec-context`, `verification-evidence`, `ci-evidence`, `evidence:<id>`), and on refusal the exhaustive named missing-input list — recorded after the freeze receipts and BEFORE any lead/child spawn (gh-169) |
 | `round.parent-incident` | exactly ONE per parent-aborted round: note, startedAttempts, startedLenses, notStartedLenses — a lead disconnect is one parent incident; never-started lenses keep their `pending` chip (not-started ≠ failed execution) (gh-169) |
@@ -189,8 +190,9 @@ row, appends the event, and (with a bus attached) publishes it:
   `silas.rebrief-retired` audit in the same transaction)
 - amendments: `addJobAmendment` (required `effect`) · `listJobAmendments` ·
   `effectiveContract` · `workRevisionState` (required vs delivered work
-  revision) — append-only, expected-contract-hash concurrency, per-refusal
-  audit. Migration 24 adds `job_amendments.effect` (NULL = unclassified
+  revision) · `correctiveVerificationDebt` (the corrective delivery's
+  unpaid exact-head verification, option A) — append-only,
+  expected-contract-hash concurrency, per-refusal audit. Migration 24 adds `job_amendments.effect` (NULL = unclassified
   history) and `pending_directives.work_revision`.
 - reads: `getJob` · `listJobs(repo?)` · `getRound` · `listRounds` ·
   `getAgent` · `listAgents`

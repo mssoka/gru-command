@@ -208,6 +208,16 @@ latest revision → verify → fresh review. The service enforces it centrally.
   an open retirement hold, a pending correction is never an overridable blocker. That holds
   at the arm, at the freeze recheck, and at the fallback gate's admission and iteration
   boundaries.
+- **Corrective deliveries are verified before review (owner decision 2026-10-09, option A).**
+  The first delivery that carries a new work revision owes a passing scheduler verification
+  (`verification.completed` with `ok: true`) on its exact delivered head. Any scope the lane
+  declares counts. Until that pass exists, the lane stays busy: the blocker carries
+  `verification_required_head`, and the digest offers `verificationsOwed` instead of a
+  review row. A repair after a failed run owes its own pass. Once a review round has
+  admitted the corrected work, later ordinary deliveries keep today's behavior (no
+  verification may be in flight). This debt is a busy fact, so owner `force` may override
+  it; it never overrides a pending revision. A pass re-offers a review request that was
+  waiting on it.
 - **Supersession.** Accepting a material amendment supersedes any review that owns the lane.
   A queued round is withdrawn, or a running round and its specialists are cancelled.
   `round.superseded` is recorded first, with the settled specialist checkpoints. Partial
@@ -218,16 +228,21 @@ latest revision → verify → fresh review. The service enforces it centrally.
 
   The stop is proven the same way the next round's setup proves a predecessor stopped: a
   trusted no-spawn receipt, or the runtime proving the round's owner marker and every
-  registered session ceased. The outcome is recorded as `round.supersession-confirmed`, or as
+  registered session ceased. A superseded fallback gate's reviewer sessions are proven too;
+  its debt lives on the job (`job.review-superseded` / `job.review-supersession-*`). The outcome is recorded as `round.supersession-confirmed`, or as
   `round.supersession-unconfirmed` plus one action-required escalation. A round whose stop
   stays unproven keeps owning the lane, even though it is terminal: every later writer
-  re-proves it before prompting. A superseded round records `round.perkins-incomplete` with
+  re-proves it before prompting. A supersession with no newer confirmation (for example
+  after a restart interrupted it) counts as unproven. A failed re-proof of an
+  already-escalated stop is an FYI, not a second alert. A superseded round records `round.perkins-incomplete` with
   reason `superseded`. That is routine FYI, never an Ack, including after a restart that
   interrupted it, and it is never a clean-abort re-arm candidate.
 - **Queued review requests.** A review request queued before the material change (a
   handoff waiting for delivery) asked for the obsolete candidate. It is withdrawn durably
   (`job.review-handoff-withdrawn`), so neither the corrective delivery nor a restart replays
-  it. The corrected candidate is reviewed through the ordinary rows. A superseded fallback
+  it. Any queued request older than an accepted material amendment is treated as withdrawn,
+  even if a crash lost the withdrawal. A new request for a candidate that a pending revision
+  already made obsolete is refused rather than queued. The corrected candidate is reviewed through the ordinary rows. A superseded fallback
   gate stops at its next decision point and records `aborted` with `superseded: true`; it
   never records a late PASS or sends a fix directive.
 - **Writer gate.** Before a directive or re-brief prompts the lane's minion, the service

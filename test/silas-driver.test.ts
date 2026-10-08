@@ -2907,7 +2907,7 @@ describe('silas skills and wake prompt', () => {
       deliveredWithoutPr: [], prWithoutReview: [{ jobId: 'clean', repo: 'gru-command', prUrl: 'https://example.invalid/1',
         priorRounds: 1, cleanAbort: { roundId: 'clean-r1', ruleId: 'clean-abort-service-restart' } }],
       verdictsAwaitingDirective: [], stalledWorking: [], minionErrors: [],
-      verificationFailures: [], verificationWaits: [], providerRecoveryPending: [], conflictingPrs: [], releaseEligible: [], revisionContinuations: [] },
+      verificationFailures: [], verificationWaits: [], providerRecoveryPending: [], conflictingPrs: [], releaseEligible: [], revisionContinuations: [], verificationsOwed: [] },
       trigger: { kind: 'sweep' }, skills: loadSilasSkills(), ops: { baseUrl: 'http://127.0.0.1:1', configPath: '/tmp/test-config' } });
     expect(prompt).toContain('You NEVER merge a pull request');
     expect(prompt).toContain('The owner holds every merge');
@@ -2945,7 +2945,7 @@ describe('silas skills and wake prompt', () => {
         verificationWaits: [],
         providerRecoveryPending: [],
         conflictingPrs: [],
-        releaseEligible: [], revisionContinuations: [],
+        releaseEligible: [], revisionContinuations: [], verificationsOwed: [],
       },
       trigger: { kind: 'job.delivered', jobId: 'job-a' },
       skills,
@@ -3325,7 +3325,7 @@ describe('silas digest fingerprint (issue #217)', () => {
     providerRecoveryPending: [],
     conflictingPrs: [],
     releaseEligible: [],
-    revisionContinuations: [],
+    revisionContinuations: [], verificationsOwed: [],
     ...over,
   });
 
@@ -3460,7 +3460,7 @@ describe('silas digest delta (issue #217)', () => {
       verificationWaits: [],
       providerRecoveryPending: [],
       conflictingPrs: [],
-      releaseEligible: [], revisionContinuations: [],
+      releaseEligible: [], revisionContinuations: [], verificationsOwed: [],
     };
     const current: import('../src/dispatch/silas-driver.js').SilasOpsDigest = {
       ...previous,

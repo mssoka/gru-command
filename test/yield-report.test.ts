@@ -70,7 +70,7 @@ const emptyDigest: SilasOpsDigest = {
   providerRecoveryPending: [],
   conflictingPrs: [],
   releaseEligible: [],
-  revisionContinuations: [],
+  revisionContinuations: [], verificationsOwed: [],
 };
 
 const noSkills: readonly SkillModule[] = [];

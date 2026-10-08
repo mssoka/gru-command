@@ -297,6 +297,8 @@ export interface DigestLedger {
   listPendingRebriefs(opts?: { readonly jobId?: string }): readonly PendingRebriefRecord[];
   /** The job's required vs delivered work revision (owner rule 2). */
   workRevisionState(jobId: string): WorkRevisionState;
+  /** A corrective delivery's unpaid verification (option A), or null. */
+  correctiveVerificationDebt(jobId: string): { readonly revision: number; readonly head: string | null } | null;
   /** Accepted amendments (version order): the revision-continuation row
    * names the material versions its one continuation carries. */
   listJobAmendments(jobId: string): readonly JobAmendmentRecord[];
@@ -544,6 +546,22 @@ export interface RevisionContinuationRow {
   readonly pendingVersions: readonly number[];
 }
 
+/** A CORRECTIVE delivery (the first carrying a new work revision) that
+ * still owes a passing verification on its exact head before review may
+ * arm (owner decision 2026-10-09, option A). Silas schedules that
+ * verification through the capture helper pinned to `head`; a failure
+ * surfaces as the ordinary verificationFailures row. Offered only while no
+ * writer owns the lane and no verification is in flight; retires on a
+ * passing run on the head (or once a review round admitted it). */
+export interface VerificationOwedRow {
+  readonly jobId: string;
+  readonly repo: string;
+  readonly revision: number;
+  /** The delivered head to verify (null: the delivery could not resolve
+   * it — verify the lane's current head). */
+  readonly head: string | null;
+}
+
 export interface SilasOpsDigest {
   readonly computedAt: string;
   readonly trigger: string;
@@ -558,6 +576,7 @@ export interface SilasOpsDigest {
   readonly conflictingPrs: readonly ConflictingPrRow[];
   readonly releaseEligible: readonly ReleaseEligibleRow[];
   readonly revisionContinuations: readonly RevisionContinuationRow[];
+  readonly verificationsOwed: readonly VerificationOwedRow[];
 }
 
 /** Count of actionable rows (event triggers wake even at zero; sweeps do not). */
@@ -573,7 +592,8 @@ export function digestActionCount(digest: SilasOpsDigest): number {
     digest.providerRecoveryPending.length +
     digest.conflictingPrs.length +
     digest.releaseEligible.length +
-    digest.revisionContinuations.length
+    digest.revisionContinuations.length +
+    digest.verificationsOwed.length
   );
 }
 
@@ -594,6 +614,7 @@ const DIGEST_ROW_CATEGORIES = [
   'conflictingPrs',
   'releaseEligible',
   'revisionContinuations',
+  'verificationsOwed',
 ] as const;
 
 export type DigestRowCategory = (typeof DIGEST_ROW_CATEGORIES)[number];
@@ -610,7 +631,8 @@ export type DigestRow =
   | ProviderRecoveryPendingRow
   | ConflictingPrRow
   | ReleaseEligibleRow
-  | RevisionContinuationRow;
+  | RevisionContinuationRow
+  | VerificationOwedRow;
 
 /**
  * Decision-relevant projection of a digest row (issue #217): identity and
@@ -706,6 +728,10 @@ export function digestRowProjection(category: DigestRowCategory, row: DigestRow)
         pendingVersions: [...r.pendingVersions],
       };
     }
+    case 'verificationsOwed': {
+      const r = row as VerificationOwedRow;
+      return { jobId: r.jobId, repo: r.repo, revision: r.revision, head: r.head };
+    }
   }
 }
 
@@ -736,6 +762,8 @@ export function digestRowKey(category: DigestRowCategory, row: DigestRow): strin
       return (row as ReleaseEligibleRow).jobId;
     case 'revisionContinuations':
       return (row as RevisionContinuationRow).jobId;
+    case 'verificationsOwed':
+      return `${(row as VerificationOwedRow).jobId} ${(row as VerificationOwedRow).head ?? ''}`;
   }
 }
 
@@ -1319,6 +1347,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     conflictingPrs: ConflictingPrRow[];
     releaseEligible: ReleaseEligibleRow[];
     revisionContinuations: RevisionContinuationRow[];
+    verificationsOwed: VerificationOwedRow[];
   } = {
     computedAt: new Date(now()).toISOString(),
     trigger: input.trigger,
@@ -1333,6 +1362,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     conflictingPrs: [],
     releaseEligible: [],
     revisionContinuations: [],
+    verificationsOwed: [],
   };
   // One unresolved re-brief request fences the target: a marker exists while
   // a re-brief worker runs (or a restart-recovered request waits for boot
@@ -1440,6 +1470,14 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
           .map((amendment) => amendment.version),
       });
     }
+    // Option A (owner, 2026-10-09): a corrective delivery is reviewed only
+    // on a verified head. While that verification is owed, the PR/review
+    // offers are withheld and the verification itself is the owed action.
+    const verificationDebt = revision === null ? input.ledger.correctiveVerificationDebt(job.id) : null;
+    if (verificationDebt !== null && reviewPending && !rebriefPending && !liveDirectiveOwns &&
+        currentPhaseDelivered && !verificationInFlight(input.ledger, job.id)) {
+      digest.verificationsOwed.push({ jobId: job.id, repo: job.repo, revision: verificationDebt.revision, head: verificationDebt.head });
+    }
 
     // (1) Delivered, no PR yet. Only PR-owing lanes (deliverable
     // null/'pr', E19) belong here: a delivered review/artifact/
@@ -1448,7 +1486,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     // A pending material correction (owner rule 2) withholds the PR/review
     // offer for the outdated candidate until the corrective delivery.
     if (delivered !== null && currentPhaseDelivered && reviewPending && !rebriefPending && !liveDirectiveOwns &&
-        revision === null && job.prUrl === null && rounds.length === 0 &&
+        revision === null && verificationDebt === null && job.prUrl === null && rounds.length === 0 &&
         (job.deliverable === null || job.deliverable === 'pr')) {
       const lane = (input.worktrees?.listWorktrees({ jobId: job.id }) ?? []).find((candidate) => candidate.kind === 'job');
       // ATTRIBUTION, not routing: this pick names the implementer whose
@@ -1476,7 +1514,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     // lane's target-owned work, so an OLDER delivery is never offered for
     // first review, re-review or clean-abort rearm.
     if (currentPhaseDelivered && !liveDirectiveOwns && job.prUrl !== null && reviewPending && !rebriefPending &&
-        revision === null) {
+        revision === null && verificationDebt === null) {
       if (cleanAbort && newestRound !== null) {
         digest.prWithoutReview.push({ jobId: job.id, repo: job.repo, prUrl: job.prUrl,
           priorRounds: rounds.length, cleanAbort: { roundId: newestRound.id, ruleId: 'clean-abort-service-restart' } });
@@ -1935,8 +1973,10 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       jobSeqUnchanged(jobId) &&
       !verificationInFlight(input.ledger, jobId) &&
       // Owner rule 2: a material correction accepted during the compute
-      // withdraws the PR/review offer for the outdated candidate.
+      // withdraws the PR/review offer for the outdated candidate; a
+      // corrective delivery owing its verification (option A) likewise.
       pendingWorkRevision(input.ledger, job) === null &&
+      input.ledger.correctiveVerificationDebt(jobId) === null &&
       input.ledger.listPendingRebriefs({ jobId }).length === 0 &&
       input.ledger.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES }).length === 0 &&
       !input.ledger.hasOpenDirectiveRecoveryHold(jobId);
@@ -1969,6 +2009,12 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       if (!reviewOfferFencesHold(row.jobId)) return false;
       const job = input.ledger.getJob(row.jobId);
       return job !== null && job.prUrl === null;
+    }),
+    verificationsOwed: digest.verificationsOwed.filter((row) => {
+      if (!continuationAllowed(row) || !jobSeqUnchanged(row.jobId) || verificationInFlight(input.ledger, row.jobId) ||
+          input.ledger.listPendingDirectives({ jobId: row.jobId, states: LIVE_DIRECTIVE_STATES }).length > 0 ||
+          input.ledger.listPendingRebriefs({ jobId: row.jobId }).length > 0) return false;
+      return input.ledger.correctiveVerificationDebt(row.jobId) !== null;
     }),
     revisionContinuations: digest.revisionContinuations.filter((row) => {
       if (!continuationAllowed(row) || !jobSeqUnchanged(row.jobId) ||
@@ -2069,6 +2115,7 @@ export type SilasTriggerKind =
   | 'provider.restored'
   | 'verification.completed'
   | 'verification.lock-timeout'
+  | 'job.amendment-accepted'
   | 'sweep';
 
 export interface SilasTrigger {
@@ -2177,6 +2224,12 @@ const SILAS_WAKE_EVENTS: readonly string[] = ['job.delivered', 'job.minion-error
 export function silasWakeEvent(event: { readonly kind: string; readonly payload?: unknown }): boolean {
   if (SILAS_WAKE_EVENTS.includes(event.kind)) return true;
   if (event.kind === 'verification.lock-timeout') return true;
+  // Owner rule 4: an accepted MATERIAL amendment owes one continuation now,
+  // not at the next sweep (administrative ones owe nothing).
+  if (event.kind === 'job.amendment-accepted') {
+    return typeof event.payload === 'object' && event.payload !== null &&
+      (event.payload as Record<string, unknown>)['effect'] === 'material';
+  }
   if (event.kind === 'verification.completed') {
     const payload =
       typeof event.payload === 'object' && event.payload !== null

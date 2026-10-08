@@ -318,6 +318,16 @@ service enforces the rest — you never decide it from a status:
   carries the same attachment, so one directive answers both. The delivery
   of that turn is the revision's receipt; the review then re-arms through
   the ordinary rows.
+- **A corrective delivery is verified before review (owner decision
+  2026-10-09).** The delivery that first carries a new revision owes a
+  passing scheduler verification on its exact head. A `verificationsOwed`
+  row (job, revision, head) names it: schedule ONE verification through
+  the capture helper pinned to that head (`--expected-head <head>`; any
+  scope the lane declares). A failure arrives as the ordinary
+  `verificationFailures` row; repair it, and the repaired delivery owes
+  its own pass. While a verification is owed, the job gets no PR or review
+  row, and review arms answer `409 branch_busy` with
+  `verification_required_head`.
 - **Approved changes supersede a running review.** Accepting a material
   amendment withdraws a queued round or cancels a running one and its
   specialists (settled checkpoints stay in the round artifacts; the round

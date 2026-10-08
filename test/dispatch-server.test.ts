@@ -947,7 +947,7 @@ describe('dispatch server (E8)', () => {
           verificationWaits: [],
           providerRecoveryPending: [],
           conflictingPrs: [],
-          releaseEligible: [], revisionContinuations: [],
+          releaseEligible: [], revisionContinuations: [], verificationsOwed: [],
         };
       },
     });

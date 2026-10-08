@@ -41,7 +41,11 @@ import type { WorktreeLane } from './worktree-port.js';
  *    revision delivers. Verification and active writers are covered by the
  *    fences below, so "review begins only after the latest required
  *    revision delivered, verification complete, no active writer" is one
- *    predicate.
+ *    predicate; or
+ * 4. a CORRECTIVE delivery owes its verification (owner decision
+ *    2026-10-09, option A): the first delivery carrying a new work revision
+ *    may be reviewed only after a passing scheduler verification on its
+ *    exact head. Ordinary deliveries keep the in-flight check only.
  *
  * Terminal (`merged`/`done`/`binned`) jobs are never busy: a stale marker
  * left on a terminal job must not block an unrelated review or resurrect
@@ -49,7 +53,8 @@ import type { WorktreeLane } from './worktree-port.js';
  */
 
 export const BRANCH_BUSY_HINT =
-  'wait for lane delivery, re-brief request settlement, or a continuation delivering the pending contract revision; or dispatch with force';
+  'wait for lane delivery, re-brief request settlement, a continuation delivering the pending contract revision, ' +
+  'or a passing verification of a corrective delivery\'s head; or dispatch with force';
 
 /** Statuses whose lane may be mid-flight (dispatched = the lane is about to
  * be created and pushed; working = the attempt is open; in-review = a PR
@@ -65,6 +70,9 @@ export interface BranchIdleBlocker {
    * pending delivery (owner rule 2): the revision review requires and the
    * revision the newest delivery carried. */
   readonly revision?: WorkRevisionState;
+  /** Present when a corrective delivery still owes its passing
+   * verification on this head (owner decision 2026-10-09, option A). */
+  readonly verification?: { readonly revision: number; readonly head: string | null };
 }
 
 /** The 409 body shape (snake_case: this is the wire contract). */
@@ -76,6 +84,7 @@ export interface BranchBusyResponse {
     readonly branch: string;
     readonly required_revision?: number;
     readonly delivered_revision?: number;
+    readonly verification_required_head?: string | null;
   }[];
   readonly hint: string;
 }
@@ -103,6 +112,7 @@ export function branchBusyPayload(input: {
       ...(blocker.revision !== undefined
         ? { required_revision: blocker.revision.required, delivered_revision: blocker.revision.delivered }
         : {}),
+      ...(blocker.verification !== undefined ? { verification_required_head: blocker.verification.head } : {}),
     })),
     hint: BRANCH_BUSY_HINT,
   };
@@ -155,6 +165,8 @@ export interface BranchIdleLedger {
   hasUnsettledVerificationRun(jobId: string): boolean;
   /** The job's required vs delivered work revision (owner rule 2). */
   workRevisionState(jobId: string): WorkRevisionState;
+  /** A corrective delivery's unpaid verification (option A), or null. */
+  correctiveVerificationDebt(jobId: string): { readonly revision: number; readonly head: string | null } | null;
 }
 
 /** The pending correction, when one fences the lane: required > delivered
@@ -309,6 +321,8 @@ export function laneIsBusy(ledger: BranchIdleLedger, job: JobRecord): boolean {
   // candidate outdated (owner rule 2): no status, delivery or head fact
   // releases this fence — only a delivery carrying the revision does.
   if (pendingWorkRevision(ledger, job) !== null) return true;
+  // A corrective delivery is reviewed only on a verified head (option A).
+  if (ledger.correctiveVerificationDebt(job.id) !== null) return true;
   // An accepted directive request may already be prompting a writer before
   // its admission event lands: review must not arm on that head (issue #162).
   if (ledger.listPendingDirectives({ jobId: job.id, states: LIVE_DIRECTIVE_STATES }).length > 0) return true;
@@ -369,7 +383,14 @@ export function findBusyLanes(input: {
         : laneBranch(job.id);
     if (branch !== target) continue;
     const revision = pendingWorkRevision(input.ledger, job);
-    blockers.push({ jobId: job.id, status, branch, ...(revision !== null ? { revision } : {}) });
+    // A verification debt only matters once no revision is pending: an
+    // outdated head is never verified for review.
+    const verification = revision === null ? input.ledger.correctiveVerificationDebt(job.id) : null;
+    blockers.push({
+      jobId: job.id, status, branch,
+      ...(revision !== null ? { revision } : {}),
+      ...(verification !== null ? { verification } : {}),
+    });
   }
   return blockers;
 }

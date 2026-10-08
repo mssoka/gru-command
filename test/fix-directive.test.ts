@@ -384,7 +384,7 @@ describe('recordFollowUpDelivery (the loop-closing signal)', () => {
     expect(result.sha).toBeNull();
     expect(result.lanePath).toBeNull();
     expect(result.note).toContain('no job lane');
-    expect(ledger.events[0]?.payload).toEqual({ agentId: 'minion-3', source: 'silas-rebrief', sha: null });
+    expect(ledger.events[0]?.payload).toEqual({ agentId: 'minion-3', source: 'silas-rebrief', sha: null, work_revision: 0 });
   });
 });
 

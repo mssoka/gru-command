@@ -1189,6 +1189,10 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       // bin cannot close the job before any minion row exists. A stale
       // historical intent after a crash is NOT permanent runtime ownership.
       const releaseAdmission = options.ledger.beginJobAdmission(jobId, `directive ${intent.requestId}`);
+      // The contract a FRESH fallback session reads is fixed in the same tick
+      // as the intent's revision stamp (owner rule 4): an amendment accepted
+      // while the writer gate waits travels with the NEXT continuation.
+      const contractAtIntent = options.ledger.effectiveContract(jobId)?.text ?? null;
       // The async turn stays owned and tracked by THIS server instance
       // (the existing directiveControllers/inFlight coordinator — no
       // detached helper, no second chief). Late errors surface durably.
@@ -1239,7 +1243,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
             ...(continuation !== ''
               ? { continuation: { block: continuation, freshNote: renderFreshRevisionNote(workRevision) } }
               : {}),
-            contract: options.ledger.effectiveContract(jobId)?.text ?? null,
+            contract: contractAtIntent,
             signal: controller.signal,
             owner: 'silas-ops',
             ...(options.workerGate !== undefined ? { workerGate: options.workerGate } : {}),

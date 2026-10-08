@@ -2262,6 +2262,47 @@ export class LedgerApi {
     return { required, delivered: deliveredWorkRevision(this.latestJobEvent(jobId, 'job.delivered')) };
   }
 
+  /** Owner decision 2026-10-09 (option A): a CORRECTIVE delivery — the
+   * first delivery that carried the job's current work revision (> 0) —
+   * owes a passing scheduler verification on its exact head before any
+   * review arms. The debt follows the newest delivery while it lasts (a
+   * repair of a failed verification owes its own pass) and is discharged
+   * once a review round is created after the corrective delivery. Null =
+   * no debt; otherwise the revision and the head that must be verified
+   * (null when the delivery could not resolve its head: any later pass on
+   * the job counts). */
+  correctiveVerificationDebt(jobId: string): { readonly revision: number; readonly head: string | null } | null {
+    const newest = this.latestJobEvent(jobId, 'job.delivered');
+    if (newest === null) return null;
+    const revision = deliveredWorkRevision(newest);
+    if (revision === 0) return null;
+    const first = this.db.prepare(
+      `SELECT MIN(seq) AS seq FROM events
+        WHERE job_id = ? AND kind = 'job.delivered' AND json_extract(payload, '$.work_revision') = ?`,
+    ).get(jobId, revision) as { seq: number | null } | undefined;
+    const correctiveSeq = first?.seq ?? newest.seq;
+    // Only the delivery that FIRST carried this revision is corrective: an
+    // earlier delivery at the same or a higher revision means the revision
+    // is not new (revisions are monotonic per job).
+    const reviewedSince = this.db.prepare(
+      `SELECT 1 FROM events WHERE job_id = ? AND kind = 'round.created' AND seq > ? LIMIT 1`,
+    ).get(jobId, correctiveSeq) !== undefined;
+    if (reviewedSince) return null;
+    const payload = typeof newest.payload === 'object' && newest.payload !== null
+      ? (newest.payload as { sha?: unknown }) : {};
+    const head = typeof payload.sha === 'string' && payload.sha !== '' ? payload.sha : null;
+    const verified = head !== null
+      ? this.db.prepare(
+        `SELECT 1 FROM events WHERE job_id = ? AND kind = 'verification.completed'
+           AND json_extract(payload, '$.ok') = 1 AND json_extract(payload, '$.sha') = ? LIMIT 1`,
+      ).get(jobId, head) !== undefined
+      : this.db.prepare(
+        `SELECT 1 FROM events WHERE job_id = ? AND kind = 'verification.completed'
+           AND json_extract(payload, '$.ok') = 1 AND seq > ? LIMIT 1`,
+      ).get(jobId, newest.seq) !== undefined;
+    return verified ? null : { revision, head };
+  }
+
   private amendmentFromRow(row: Row): JobAmendmentRecord {
     let supersedes: unknown;
     try {
