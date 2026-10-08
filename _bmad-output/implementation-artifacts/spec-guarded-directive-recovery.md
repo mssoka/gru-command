@@ -5,7 +5,7 @@ created: '2026-10-08'
 status: 'in-review'
 route: 'dispatch'
 baseline_commit: '52ae3f1ce88ccfd0d0095f99fb8f51db67a88a62'
-review_loop_iteration: 1
+review_loop_iteration: 2
 context:
   - '{project-root}/AGENTS.md'
   - '{project-root}/docs/LEDGER.md'
@@ -152,6 +152,31 @@ this change, not a re-derivation; no finding was rejected or dropped.
 
 No deferred entries: every finding was resolvable inside this change's
 scope, and none was dropped.
+
+### Continuation after the quota interruption (2026-10-08)
+
+The original minion and all three round-2 service reviewers stopped at
+`quota_wall` without a completed second-round verdict. Their partial
+transcripts are investigation evidence, not review clearance. The existing
+clean branch and PR #261 were preserved; origin was fetched before continuing.
+
+| # | Verified issue | Verdict | Evidence + disposition |
+|---|---|---|---|
+| C1 | NEEDS CHANGES, verification failure/wait and minion-error channels bypass the recovery hold | high | A real route retirement still published these continuation offers; red regression reproduced the verdict channel. Fixed: filter every continuation channel at the final synchronous digest publish boundary; baseline/held/released and mid-await tests cover it. |
+| C2 | Late provider recovery can claim and resume a held lane | high | Red fixture reached the spawn path and consumed its wait after retirement. Fixed: refuse before atomic provider claim, leaving wait/control evidence unchanged; hide the held lane from provider continuation offers. |
+| C3 | Registered branch tip can remain unchanged while checkout HEAD advances | medium | Detached fixture with an unchanged registered branch incorrectly retired against the old head. Fixed: bind the actual checkout HEAD; stale expected head refuses byte-identically. |
+| C4 | Branch-idle hold assertion was masked by the pre-existing open-attempt fence | medium | The old fixture had no delivery and was busy even without its hold. Fixed: use an otherwise idle delivered lane, explicitly prove the hold-free view is idle, then assert the real hold keeps it busy. |
+| C5 | Review/conflict race tests were masked by event-watermark retraction | medium | Partial second-round reviewer mutation evidence showed missing hold clauses remained green. Fixed: isolate the hold recheck from the independent watermark in those two tests. |
+| C6 | Late admission, changed-payload consumed replay, ambiguous/inaccessible lane and reopened replay were not discriminated | low | Added exact record/hold preservation assertions and replay/refusal cases, plus inconsistent-audit decode checks. |
+
+The isolated shared-scheduler red run is
+`0232bc12-5492-485b-ba4c-0c9cc9a15a2b` (request
+`verify-guarded-continuation-red-20261008`): 4 reproductions failed, 246 tests
+passed; complete capture/receipt at
+`~/.gru-command/captures/guarded-directive-continuation-20261008/red.ndjson`.
+It intentionally binds a dirty test-first tree, not a passing commit.
+All corrections stay within the frozen continuation boundary; no deferred
+work or production activation was created. The matrix now registers 38 tests.
 
 ## Design Notes
 

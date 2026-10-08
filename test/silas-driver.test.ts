@@ -441,6 +441,13 @@ describe('silas digest conflictingPrs rows (issue #215)', () => {
       vi.setSystemTime(new Date('2026-10-04T10:10:01.000Z'));
       addDirtyJob(h, 'job-race-hold');
       vi.useRealTimers();
+      // Isolate the explicit hold recheck from the independent event
+      // watermark fence; otherwise the new retirement event masks a
+      // missing hold clause and this test cannot pin that boundary.
+      const readEvents = h.ledger.listJobEvents.bind(h.ledger);
+      const candidateEvents = readEvents('job-race-hold', { limit: 1 });
+      const events = vi.spyOn(h.ledger, 'listJobEvents').mockImplementation((jobId, opts) =>
+        jobId === 'job-race-hold' && opts?.limit === 1 ? candidateEvents : readEvents(jobId, opts));
       let raced = false;
       const digest = await computeSilasDigest({
         ledger: h.ledger,
@@ -457,6 +464,7 @@ describe('silas digest conflictingPrs rows (issue #215)', () => {
       expect(raced).toBe(true);
       expect(h.ledger.hasOpenDirectiveRecoveryHold('job-race-hold')).toBe(true);
       expect(digest.conflictingPrs).toEqual([]);
+      events.mockRestore();
     } finally {
       h.cleanup();
     }
@@ -676,6 +684,12 @@ describe('silas digest (the four actionable states)', () => {
       addJobWithDelivery(h.ledger, 'job-race-review', { prUrl: 'https://github.com/acme/app/pull/41' });
       h.ledger.setJobStatus('job-race-review', 'in-review');
       vi.useRealTimers();
+      // Keep the independent event watermark fixed so the hold query,
+      // rather than a changed event seq, must retract this review offer.
+      const readEvents = h.ledger.listJobEvents.bind(h.ledger);
+      const candidateEvents = readEvents('job-race-review', { limit: 1 });
+      const events = vi.spyOn(h.ledger, 'listJobEvents').mockImplementation((jobId, opts) =>
+        jobId === 'job-race-review' && opts?.limit === 1 ? candidateEvents : readEvents(jobId, opts));
       let raced = false;
       const digest = await computeSilasDigest({
         ledger: h.ledger,
@@ -692,6 +706,7 @@ describe('silas digest (the four actionable states)', () => {
       expect(raced).toBe(true);
       expect(h.ledger.hasOpenDirectiveRecoveryHold('job-race-review')).toBe(true);
       expect(digest.prWithoutReview).toEqual([]);
+      events.mockRestore();
     } finally {
       h.cleanup();
     }

@@ -1862,8 +1862,20 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       input.ledger.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES }).length === 0 &&
       !input.ledger.hasOpenDirectiveRecoveryHold(jobId);
   };
+  // Retirement closes control, never grants another turn. Every channel
+  // that can wake a continuation must honor the hold, including old
+  // verdict/verification debt and late provider evidence. Recheck after
+  // all awaits; a hold can open after the candidate was computed.
+  const continuationAllowed = (row: { readonly jobId: string }): boolean =>
+    !input.ledger.hasOpenDirectiveRecoveryHold(row.jobId);
   return {
     ...digest,
+    verdictsAwaitingDirective: digest.verdictsAwaitingDirective.filter(continuationAllowed),
+    verificationFailures: digest.verificationFailures.filter(continuationAllowed),
+    verificationWaits: digest.verificationWaits.filter(continuationAllowed),
+    minionErrors: digest.minionErrors.filter(continuationAllowed),
+    providerRecoveryPending: digest.providerRecoveryPending.filter((row) =>
+      row.jobId === null || continuationAllowed({ jobId: row.jobId })),
     deliveredWithoutPr: digest.deliveredWithoutPr.filter((row) => {
       if (!reviewOfferFencesHold(row.jobId)) return false;
       const job = input.ledger.getJob(row.jobId);

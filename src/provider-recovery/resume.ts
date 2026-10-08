@@ -152,6 +152,14 @@ async function claimJobMinion(
     deps.ledger.setProviderWaitStatus(wait.id, 'cancelled', { why: 'job blocked (owner/ops hold)', by });
     return { outcome: 'skipped', waitId: wait.id, why: 'job blocked (owner/ops hold)' };
   }
+  // A recovery receipt is capacity, not fresh authorization. Late
+  // provider evidence must not resume a request whose control was retired
+  // or release its hold through the re-brief machinery below. Leave the
+  // wait intact until a separately accepted directive/re-brief releases it.
+  if (deps.ledger.hasOpenDirectiveRecoveryHold(job.id)) {
+    return { outcome: 'skipped', waitId: wait.id,
+      why: 'directive retirement hold requires a fresh accepted directive or re-brief' };
+  }
   // Guard 2 — this waiter is a member of a still-open recovery BATCH
   // (r1 #7: shared recoveries bind every matching waiter; membership is by
   // the batch id stamped on the wait, not per-generation marker equality).

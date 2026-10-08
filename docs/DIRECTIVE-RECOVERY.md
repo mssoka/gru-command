@@ -24,11 +24,14 @@ is still required to touch the lane again.
 
 ## Supported predicates (server-verified; any unknown/stale/missing evidence refuses)
 
-The service re-derives all of this inside one transaction; the caller
-supplies expectations only:
+The route resolves the lane's checkout HEAD synchronously, then the
+ledger re-checks durable producer facts and the binding expectations in
+one transaction. No await separates the evidence read from the commit;
+the caller supplies expectations only:
 
 - **Lane identity/head**: exactly one non-swept job lane for the job, and
-  its freshly resolved git head must equal the caller's `expected_head`.
+  its freshly resolved checkout `HEAD` must equal the caller's
+  `expected_head` (a registered branch tip is not checkout evidence).
 - **No open worker turn**: no agent of the job in `spawning`/`streaming`.
 - **No queued producer**: no non-terminal child worker; no pace-gate
   worker turn queued for the job.
@@ -114,7 +117,9 @@ Retirement leaves a durable continuation hold on the request row
 attention card:
 
 - branch-idle refuses review arm/freeze on the lane (`409 branch_busy`);
-- the Silas digest offers no review/directive/stall rows for the job;
+- the Silas digest offers no review/directive/stall, verification-repair,
+  minion-error continuation or provider-recovery rows for the job;
+- late provider recovery cannot claim/resume the lane or release the hold;
 - the board's next action names the retirement.
 
 The hold is released **only** by a fresh accepted directive request or

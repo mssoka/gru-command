@@ -108,7 +108,9 @@ export function retireInterruptedDirectiveFromRoute(input: DirectiveRetirementRe
   }
   let resolvedHead: string;
   try {
-    resolvedHead = resolveGitCommit(lane.path, lane.branch !== null && lane.branch !== '' ? lane.branch : 'HEAD');
+    // Bind the checkout that actually holds the work. A detached or
+    // switched lane can leave its registered branch tip unchanged.
+    resolvedHead = resolveGitCommit(lane.path, 'HEAD');
   } catch (error) {
     throw new DirectiveRetirementError(
       'lane_unavailable',
