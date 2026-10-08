@@ -12,6 +12,7 @@ command = "npm ci"
 [verify]
 full = "npm test"
 typecheck = "npm run typecheck"
+directive-recovery = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/directive-retirement.test.ts test/directive-markers.test.ts test/ledger-db.test.ts test/silas-driver.test.ts test/provider-recovery-resume.test.ts test/provider-recovery-sensor.test.ts test/supervisor.test.ts test/board-engine.test.ts test/suite-shape.test.ts && npx vitest run --config vitest.heavy.config.ts test/branch-idle-guard.test.ts"
 
 # Declared focused verification scopes (phase 4; invoked only via the
 # authenticated /api/verify scheduler at the project's documented budgets

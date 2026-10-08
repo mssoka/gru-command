@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { boardKpis } from './board-kpi.js';
+import { boardKpis, collectJobs } from './board-kpi.js';
 import { railChips } from './board-rail.js';
 import type { AgentView, BoardSnapshot, ChildWorkerCounts, JobView } from './board-protocol.js';
 
@@ -189,7 +189,7 @@ describe('board rail — chips (v6)', () => {
         agent('lens', 'streaming', 'perkins'),
       ],
     );
-    const kpis = boardKpis(snap, new Date(NOW));
+    const kpis = boardKpis(snap, new Date(NOW), collectJobs(snap));
     const values = kpiValues(railChips(snap, NOW));
 
     expect(values.get('jobs.total')).toBe(kpis.jobs.total);

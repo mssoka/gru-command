@@ -5,6 +5,8 @@
  * The band renders ONE authoritative pending-owner list:
  *   - ack rows: `needs-owner` notifications still unacked AND unresolved
  *     (pending = action still owed; seen/opened never completes one);
+ *   - proposal rows: a pending Book of Lessons proposal, decided with
+ *     Accept/Reject after reviewing it (never a plain Ack);
  *   - PR rows: the server-computed, evidence-bound `ownerPrs` projection
  *     (the browser never re-derives merge readiness).
  *
@@ -14,7 +16,7 @@
  * snapshot push. No text-based dedupe, no grouping, no bulk actions.
  */
 
-import type { BoardSnapshot, NotificationView, OwnerPrView } from './board-protocol.js';
+import { LESSONS_PROPOSAL_KIND, type BoardSnapshot, type NotificationView, type OwnerPrView } from './board-protocol.js';
 
 /** Consequence copy explains WHAT an ack does and does NOT do. Static
  * per kind — never parsed out of notification prose (prose is display
@@ -72,7 +74,22 @@ export interface OwnerPrRow {
   readonly pr: OwnerPrView;
 }
 
-export type OwnerRow = OwnerAckRow | OwnerPrRow;
+/** What Accept and Reject do for a Book of Lessons proposal — static copy,
+ * never parsed out of notification prose. */
+export const LESSONS_PROPOSAL_CONSEQUENCE =
+  'Accept writes these changes into the Book of Lessons. Reject discards them; those journal entries won’t be proposed again.';
+
+/** A Book of Lessons proposal (owner decision 2026-10-07): reviewed and
+ * decided here — it never closes on a plain Ack. */
+export interface OwnerProposalRow {
+  readonly kind: 'proposal';
+  readonly actionId: string;
+  readonly ts: string;
+  readonly notification: NotificationView;
+  readonly consequence: string;
+}
+
+export type OwnerRow = OwnerAckRow | OwnerPrRow | OwnerProposalRow;
 
 /** Pending owner obligations, newest first (id tiebreak). The snapshot's
  * notification list already carries EVERY unacked needs-owner row — the
@@ -82,6 +99,16 @@ export function ownerRows(snapshot: BoardSnapshot): readonly OwnerRow[] {
   for (const notification of snapshot.notifications) {
     if (notification.routing !== 'needs-owner') continue;
     if (notification.ackedAt !== null || notification.resolvedAt !== null) continue;
+    if (notification.kind === LESSONS_PROPOSAL_KIND) {
+      rows.push({
+        kind: 'proposal',
+        actionId: `owner-proposal:${notification.id}`,
+        ts: notification.ts,
+        notification,
+        consequence: LESSONS_PROPOSAL_CONSEQUENCE,
+      });
+      continue;
+    }
     rows.push({
       kind: 'ack',
       actionId: `owner-ack:${notification.id}`,

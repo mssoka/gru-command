@@ -16,6 +16,7 @@
 
 import { healthCards, type FlagSplit, type HealthTone, type ValueSplit } from './board-health.js';
 import { boardKpis } from './board-kpi.js';
+import { snapshotSections } from './board-sections.js';
 import type { BoardSnapshot } from './board-protocol.js';
 import { BOARD_WORDS, heistCount } from './board-vocabulary.js';
 
@@ -59,7 +60,9 @@ function kpi(key: string, value: number, label: string, title: string): RailKpi 
 
 /** The whole rail, in fixed order derived from the health row. */
 export function railChips(snapshot: BoardSnapshot, now = Date.now()): readonly RailChip[] {
-  const kpis = boardKpis(snapshot, new Date(now));
+  // HEISTS counts the board's own top-level rows (one derivation with the
+  // sections): nested megaminions ride their heist, surfaced ones count.
+  const kpis = boardKpis(snapshot, new Date(now), snapshotSections(snapshot, now).topLevel);
   const cards = healthCards(snapshot, now);
   return cards
     .map(

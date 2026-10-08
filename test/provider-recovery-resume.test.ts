@@ -235,6 +235,9 @@ describe('guarded claim — happy path', () => {
     // The continuation prompt was delivered exactly once.
     const spawned = [...h.registry.handles.values()].find((handle) => handle.promptCount > 0);
     expect(spawned?.promptCount).toBe(1);
+    expect(h.ledger.listJobEvents(jobId, { limit: 20 }).find((event) => event.kind === 'provider.continuation-completed')?.payload)
+      .toMatchObject({ wait_id: waitId });
+    expect(h.ledger.listOpenProviderWaitsForJob(jobId)).toEqual([]);
   });
 
   it('a continuation turn that settles with an in-band error is recorded, never reported as continued (#160)', async () => {
@@ -353,7 +356,7 @@ describe('guarded claim — every recheck fails visible', () => {
       return spawned;
     };
     const result = await claimProviderRecoveryContinuation(h.deps(), waitId, 'silas');
-    expect(result).toMatchObject({ outcome: 'skipped', why: 'continuation spawn failed after atomic claim (recorded; no automatic replay)' });
+    expect(result).toMatchObject({ outcome: 'skipped', why: 'continuation authority changed after atomic claim (recorded; no automatic replay)' });
     expect(spawned.disposed).toBe(true);
     expect(spawned.promptCount).toBe(0);
     expect(h.ledger.getJob(jobId)?.status).toBe('parked');

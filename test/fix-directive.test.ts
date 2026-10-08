@@ -67,6 +67,7 @@ function fakeLedger(job: { deliverable?: 'review' | 'artifact' | 'investigation'
             commissioner: null,
             targetRef: null,
             targetSha: null,
+            parentJobId: null,
             status: 'delivered' as const,
             baseBranch: null,
             prUrl: null,

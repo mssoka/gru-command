@@ -13,6 +13,7 @@
     "tools/verify-perkins-resource.mjs",
     "tools/patch-vitest-rpc-timeout.mjs",
     "tools/unshare-review-hardlinks.mjs",
+    "tools/repair-bible-provenance.mjs",
     "install/",
     "install.sh",
     "docs/REVIEW-INPUTS.md",
