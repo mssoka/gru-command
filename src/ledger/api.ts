@@ -1569,9 +1569,9 @@ export class LedgerApi {
   /** The one jobs-row status write + `job.status` event. Callers assert
    * their own transition first (the generic machine vs. the audited
    * administrative-closeout edge); the write shape lives in one place. */
-  private writeJobStatus(id: string, from: JobStatus, to: JobStatus): EventRecord {
+  private writeJobStatus(id: string, from: JobStatus, to: JobStatus, extra?: Readonly<Record<string, unknown>>): EventRecord {
     this.db.prepare('UPDATE jobs SET status = ?, updated_at = ? WHERE id = ?').run(to, nowIso(), id);
-    return this.appendEvent({ kind: 'job.status', jobId: id, payload: { from, to } });
+    return this.appendEvent({ kind: 'job.status', jobId: id, payload: { ...extra, from, to } });
   }
 
   setJobStatus(id: string, status: string, context?: BlockerContext): JobRecord {
@@ -2490,12 +2490,35 @@ export class LedgerApi {
     });
   }
 
+  /** {@link admitReviewRound}, also returning the round's OWN provisional
+   * status event (null when the job was not flipped) — read inside the
+   * transaction, so a subscriber that writes another status when the flip
+   * is published can never be mistaken for it (R8-10). */
+  admitReviewRoundWithFlip(input: Parameters<LedgerApi['admitReviewRound']>[0]): { readonly round: RoundRecord; readonly flipSeq: number | null } {
+    return this.transaction(() => {
+      const before = this.latestJobEvent(input.jobId, 'job.status')?.seq ?? 0;
+      const round = this.admitReviewRound(input);
+      const flip = this.db.prepare(
+        "SELECT seq FROM events WHERE job_id = ? AND kind = 'job.status' AND seq > ? ORDER BY seq ASC LIMIT 1",
+      ).get(input.jobId, before) as { seq: number } | undefined;
+      return { round, flipSeq: flip === undefined ? null : Number(flip.seq) };
+    });
+  }
+
   /** Undo only this round's provisional status flip. An admitted successor
    * owns the job status now: an older setup failure must not roll it back. */
   restoreReviewSetupStatus(input: {
     readonly jobId: string;
     readonly roundId: string;
     readonly priorStatus: 'working' | 'blocked';
+    /** The open attempt the round interrupted (`openAttemptStartSeq` at its
+     * flip). A restored `working` hop resumes that attempt — it is not a
+     * reopened lane, so its earlier delivery still settles it. */
+    readonly attemptStartSeq?: number;
+    /** This round's own provisional status event (R7-10): restore only
+     * while it is still the job's latest status event — a generation
+     * written since (a reopened attempt) is never undone or concealed. */
+    readonly expectedStatusSeq?: number;
   }): boolean {
     return this.transaction(() => {
       const job = this.getJob(input.jobId);
@@ -2504,7 +2527,16 @@ export class LedgerApi {
         .get(input.jobId) as { id: string } | undefined;
       if (job?.status !== 'in-review' || round?.jobId !== input.jobId ||
         round.status !== 'aborted' || latest?.id !== input.roundId) return false;
-      this.setJobStatus(input.jobId, input.priorStatus);
+      if (input.expectedStatusSeq !== undefined &&
+        this.latestJobEvent(input.jobId, 'job.status')?.seq !== input.expectedStatusSeq) return false;
+      if (input.priorStatus === 'working' && input.attemptStartSeq !== undefined) {
+        assertJobTransition(job.status, 'working');
+        this.writeJobStatus(input.jobId, job.status, 'working', {
+          restoredAfterRound: input.roundId, attemptStartSeq: input.attemptStartSeq,
+        });
+      } else {
+        this.setJobStatus(input.jobId, input.priorStatus);
+      }
       return true;
     });
   }

@@ -40,6 +40,7 @@ export interface HeavyTestEntry {
 }
 
 export const HEAVY_TESTS: readonly HeavyTestEntry[] = Object.freeze([
+  { file: 'admission-retry-service.test.ts', workload: 'real service boot resuming a durable admission retry' },
   {
     file: 'attachments.test.ts',
     workload: 'spawns and reaps a real child process and streams large real files',

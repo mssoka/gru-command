@@ -1245,11 +1245,20 @@ async function main(): Promise<number> {
     // notifier binds the row through the existing agentId field only when
     // that identity is consistent (see src/dispatch/escalation-identity.ts).
     escalate: createReviewEscalationNotifier(ledger, notifications),
+    // A transient admission refusal retries on its own (1 min, then 5 min):
+    // each scheduled or skipped retry is an FYI; only the last refusal
+    // escalates action-required through `escalate`.
+    inform: (title, detail) => {
+      notifications.post({ kind: 'review-admission-retry', routing: 'fyi', severity: 'info', title, detail });
+    },
     log: (level, msg, fields) => logger.log(level, msg, fields),
   } });
   state.wave = wave;
   await wave.recoverInterruptedRounds();
   wave.resumeQueuedHandoffs();
+  // Automatic admission retries live in memory (owner decision 2026-10-08):
+  // one pending when the service stopped escalates now instead of resuming.
+  wave.escalateInterruptedAdmissionRetries();
   // Re-brief restart safety (Silas finding 2026-09-23): a re-brief request
   // mid-flight at restart left no events and no worker. The durable
   // markers written before each worker spawned are consumed here — the

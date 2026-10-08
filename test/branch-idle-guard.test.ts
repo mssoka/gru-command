@@ -456,6 +456,20 @@ describe('branch-idle guard', () => {
       ['repair-delivered', [start, delivery, repairStart, eventRecord(4, 'job.delivered', { sha: 'sha-2' })]],
       ['recovery-claim', [start, delivery, eventRecord(3, 'provider.recovery-claimed', { wait_id: 'w' })]],
       ['dispatch-live', [start, delivery]],
+      // A refused review round flips working → in-review and its setup
+      // restore flips back: the SAME attempt resumes (it settled at 2).
+      ['setup-restored', [start, delivery, eventRecord(3, 'job.status', { from: 'working', to: 'in-review' }),
+        eventRecord(4, 'job.status', { from: 'in-review', to: 'working', restoredAfterRound: 'r1', attemptStartSeq: 1 })]],
+      // ...and the next round's flip resolves through that restore.
+      ['setup-restored-reflipped', [start, delivery, eventRecord(3, 'job.status', { from: 'working', to: 'in-review' }),
+        eventRecord(4, 'job.status', { from: 'in-review', to: 'working', restoredAfterRound: 'r1', attemptStartSeq: 1 }),
+        eventRecord(5, 'job.status', { from: 'working', to: 'in-review' })]],
+      // A restore of an attempt still open before the round stays open.
+      ['setup-restored-open', [start, eventRecord(2, 'job.status', { from: 'working', to: 'in-review' }),
+        eventRecord(3, 'job.status', { from: 'in-review', to: 'working', restoredAfterRound: 'r1', attemptStartSeq: 1 })]],
+      // A marker that does not point behind its hop is not a resume.
+      ['setup-restored-forged', [start, delivery,
+        eventRecord(3, 'job.status', { from: 'in-review', to: 'working', restoredAfterRound: 'r1', attemptStartSeq: 3 })]],
     ]);
     const ledger = {
       listJobs: () => [
@@ -472,6 +486,10 @@ describe('branch-idle guard', () => {
         jobRecord('repair-delivered', 'working'),
         jobRecord('recovery-claim', 'working'),
         jobRecord('dispatch-live', 'working'),
+        jobRecord('setup-restored', 'working'),
+        jobRecord('setup-restored-reflipped', 'in-review'),
+        jobRecord('setup-restored-open', 'working'),
+        jobRecord('setup-restored-forged', 'working'),
       ],
       latestJobEvent: (jobId: string, kind: string): EventRecord | null =>
         (events.get(jobId) ?? []).filter((event) => event.kind === kind).at(-1) ?? null,
@@ -507,6 +525,12 @@ describe('branch-idle guard', () => {
     expect(busy('repair-delivered')).toBe(false);
     // An accepted but not-yet-admitted directive already owns the lane.
     expect(busy('dispatch-live')).toBe(true);
+    // A refused round's setup restore is not a reopened lane (2026-10-08):
+    // the delivery that settled the interrupted attempt still settles it.
+    expect(busy('setup-restored')).toBe(false);
+    expect(busy('setup-restored-reflipped')).toBe(false);
+    expect(busy('setup-restored-open')).toBe(true);
+    expect(busy('setup-restored-forged')).toBe(true);
 
     const lanes = [
       laneRecord('reopened', 'reopened', 'gru/reopened'),

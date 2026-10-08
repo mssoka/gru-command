@@ -190,16 +190,29 @@ export function resolveReviewTargetBranch(input: {
  * flip can only follow the `working` hop that started the attempt, so the
  * newest older status event IS that hop. Paged because the ledger exposes
  * only a limit-bounded newest-first window. */
-function previousStatusSeq(ledger: BranchIdleLedger, jobId: string, flipSeq: number): number | null {
+function previousStatusEvent(ledger: BranchIdleLedger, jobId: string, flipSeq: number): EventRecord | null {
   let limit = 200;
   for (;;) {
     const events = ledger.listJobEvents(jobId, { limit });
     const previous = events.find((event) => event.seq < flipSeq && event.kind === 'job.status');
-    if (previous !== undefined) return previous.seq;
+    if (previous !== undefined) return previous;
     // Fewer rows than requested means the history is exhausted.
     if (events.length < limit || limit >= 12_800) return null;
     limit *= 4;
   }
+}
+
+/** The attempt a `→ working` hop belongs to: its own, unless it is a
+ * refused review round's restore — that resumes the attempt the round
+ * interrupted (nothing ran on the lane, so the delivery that settled it
+ * still does). */
+function workingHopAttemptStart(hop: EventRecord): number {
+  const payload = typeof hop.payload === 'object' && hop.payload !== null
+    ? (hop.payload as { restoredAfterRound?: unknown; attemptStartSeq?: unknown })
+    : {};
+  const resumed = payload.attemptStartSeq;
+  return typeof payload.restoredAfterRound === 'string' && typeof resumed === 'number' &&
+    Number.isSafeInteger(resumed) && resumed < hop.seq ? resumed : hop.seq;
 }
 
 /** Seq of the job's current attempt start (0 when none is open). The
@@ -214,10 +227,10 @@ export function openAttemptStartSeq(ledger: BranchIdleLedger, jobId: string): nu
   const payload = typeof latest.payload === 'object' && latest.payload !== null
     ? (latest.payload as { from?: unknown; to?: unknown })
     : {};
-  if (payload.to === 'working') return latest.seq;
+  if (payload.to === 'working') return workingHopAttemptStart(latest);
   if (payload.to === 'in-review' && payload.from === 'working') {
-    const hop = previousStatusSeq(ledger, jobId, latest.seq);
-    if (hop !== null) return hop;
+    const hop = previousStatusEvent(ledger, jobId, latest.seq);
+    if (hop !== null) return workingHopAttemptStart(hop);
     // The status history is unreachable past the page cap. A delivery newer
     // than the flip settles the attempt the flip belongs to, so the lane
     // clears; otherwise fail closed and treat the attempt as open (a later
