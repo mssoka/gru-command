@@ -955,6 +955,12 @@ export class BoardEngine {
       if (directive !== undefined) {
         return `directive ${directive.requestId}: ${directive.state} (${directive.jobId})`;
       }
+      // A retirement's open continuation hold is durable debt too: the lane
+      // will not self-continue, and the board must say so truthfully.
+      const hold = this.ledger.listDirectiveRecoveryHolds({ openOnly: true })[0];
+      if (hold !== undefined) {
+        return `directive ${hold.requestId}: retired — continuation requires a fresh request (${hold.jobId})`;
+      }
     } catch (error) {
       // One malformed directive row must never take the board down; the
       // malformed debt stays visible to the boot reconciler instead.

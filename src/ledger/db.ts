@@ -938,4 +938,26 @@ export const MIGRATIONS: readonly Migration[] = [
          ) = 1;
     `,
   },
+  {
+    // Guarded interrupted-directive recovery (owner approval j-1348): the
+    // terminal `retired` control closure keeps its audit facts and a
+    // durable continuation hold on the request row. The hold is released
+    // only by a fresh accepted directive/re-brief identity; NULL means
+    // open. Additive and nullable: pre-existing rows keep exact meaning.
+    // LANDING COLLISION (same convention as migrations 10-22): id 23 is a
+    // branch-local next-contiguous number for an UNSHIPPED feature; if
+    // owner-merged main lands first, re-number ONLY this never-applied
+    // migration (never a hole).
+    id: 23,
+    name: 'directive-retirement',
+    sql: `
+      ALTER TABLE pending_directives ADD COLUMN retired_at TEXT;
+      ALTER TABLE pending_directives ADD COLUMN retired_by TEXT;
+      ALTER TABLE pending_directives ADD COLUMN retire_reason TEXT;
+      ALTER TABLE pending_directives ADD COLUMN retire_fingerprint TEXT;
+      ALTER TABLE pending_directives ADD COLUMN hold_released_by TEXT;
+      ALTER TABLE pending_directives ADD COLUMN hold_released_at TEXT;
+      CREATE INDEX idx_pending_directives_hold ON pending_directives(job_id, state, hold_released_by);
+    `,
+  },
 ];

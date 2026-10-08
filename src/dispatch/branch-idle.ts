@@ -124,6 +124,9 @@ export interface BranchIdleLedger {
     readonly jobId?: string;
     readonly states?: readonly DirectiveState[];
   }): readonly DirectiveRequestRecord[];
+  /** True while any retirement continuation hold for the job is unreleased:
+   * the lane stays fenced — no review may freeze, no offer may fire. */
+  hasOpenDirectiveRecoveryHold(jobId: string): boolean;
   /** True while any verification run for the job is unsettled: it owns the
    * checkout and no review may freeze the same head. */
   hasUnsettledVerificationRun(jobId: string): boolean;
@@ -256,6 +259,10 @@ export function laneIsBusy(ledger: BranchIdleLedger, job: JobRecord): boolean {
   // An accepted directive request may already be prompting a writer before
   // its admission event lands: review must not arm on that head (issue #162).
   if (ledger.listPendingDirectives({ jobId: job.id, states: LIVE_DIRECTIVE_STATES }).length > 0) return true;
+  // A retirement's continuation hold is the same runtime fence for a request
+  // whose control ownership was closed without completion: no review may arm
+  // on the lane until a fresh accepted request supersedes the hold.
+  if (ledger.hasOpenDirectiveRecoveryHold(job.id)) return true;
   // A verification run owns the checkout for its whole life; a review must
   // not freeze the head it is verifying.
   if (ledger.hasUnsettledVerificationRun(job.id)) return true;

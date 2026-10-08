@@ -483,6 +483,7 @@ describe('branch-idle guard', () => {
           ? ([{ requestId: 'r-live', jobId: opts.jobId, state: 'dispatching' }] as unknown as readonly DirectiveRequestRecord[])
           : [],
       hasUnsettledVerificationRun: (): boolean => false,
+      hasOpenDirectiveRecoveryHold: (): boolean => false,
     };
     const busy = (id: string): boolean => laneIsBusy(ledger, ledger.listJobs().find((job) => job.id === id)!);
     expect(busy('never-started')).toBe(true);
@@ -547,6 +548,7 @@ describe('branch-idle guard', () => {
       listPendingRebriefs: (): readonly PendingRebriefRecord[] => [],
       listPendingDirectives: (): readonly DirectiveRequestRecord[] => [],
       hasUnsettledVerificationRun: (): boolean => false,
+      hasOpenDirectiveRecoveryHold: (): boolean => false,
     };
     expect(laneIsBusy(paged, paged.listJobs()[0]!)).toBe(false);
 
@@ -568,6 +570,7 @@ describe('branch-idle guard', () => {
       listPendingRebriefs: (): readonly PendingRebriefRecord[] => [],
       listPendingDirectives: (): readonly DirectiveRequestRecord[] => [],
       hasUnsettledVerificationRun: (): boolean => false,
+      hasOpenDirectiveRecoveryHold: (): boolean => false,
     };
     expect(laneIsBusy(capped, capped.listJobs()[0]!)).toBe(false);
   });
@@ -812,6 +815,7 @@ describe('branch-idle guard', () => {
         opts.jobId === undefined ? [...pending.values()].flat() : (pending.get(opts.jobId) ?? []),
       listPendingDirectives: (): readonly DirectiveRequestRecord[] => [],
       hasUnsettledVerificationRun: (): boolean => false,
+      hasOpenDirectiveRecoveryHold: (): boolean => false,
     };
     const busy = (id: string): boolean => laneIsBusy(ledger, ledger.listJobs().find((job) => job.id === id)!);
     expect(busy('working-pending')).toBe(true);
@@ -1421,6 +1425,7 @@ describe('branch-idle guard', () => {
         opts.jobId === undefined ? [...pending.values()].flat() : (pending.get(opts.jobId) ?? []),
       listPendingDirectives: (): readonly DirectiveRequestRecord[] => [],
       hasUnsettledVerificationRun: (): boolean => false,
+      hasOpenDirectiveRecoveryHold: (): boolean => false,
     };
     const lanes = [
       laneRecord('marker-owner', 'marker-owner', 'gru/marker-owner'),

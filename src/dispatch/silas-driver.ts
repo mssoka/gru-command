@@ -300,6 +300,10 @@ export interface DigestLedger {
     readonly jobId?: string;
     readonly states?: readonly DirectiveState[];
   }): readonly DirectiveRequestRecord[];
+  /** True while a retirement's continuation hold is unreleased: the lane is
+   * fenced exactly like a live request — no competing continuation may be
+   * offered, armed or woken until a fresh accepted request supersedes it. */
+  hasOpenDirectiveRecoveryHold(jobId: string): boolean;
   /** Tracked child workers (issue #161/#117): the releaseEligible sweep-ack
    * row fences on non-terminal children exactly like the release endpoint's
    * own refusal — the digest never offers a release that would 409. */
@@ -1159,6 +1163,9 @@ function stallStillEligible(
   if (delivered !== null && delivered.seq > phaseStart.seq) return false;
   if (ledger.listPendingRebriefs({ jobId }).length > 0) return false;
   if (ledger.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES }).length > 0) return false;
+  // A retirement's continuation hold fences exactly like a live request:
+  // no woken offer may duplicate work behind a closed control decision.
+  if (ledger.hasOpenDirectiveRecoveryHold(jobId)) return false;
   if (verificationInFlight(ledger, jobId)) return false;
   const review = latestAnsweringReviewRequest(ledger, jobId);
   if (review !== null && review.seq > phaseStart.seq) return false;
@@ -1357,7 +1364,8 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     // unresolved re-brief owns the lane.
     const rebriefPending = pendingRebriefJobIds.has(job.id);
     const liveDirectiveOwns = input.ledger
-      .listPendingDirectives({ jobId: job.id, states: LIVE_DIRECTIVE_STATES }).length > 0;
+      .listPendingDirectives({ jobId: job.id, states: LIVE_DIRECTIVE_STATES }).length > 0 ||
+      input.ledger.hasOpenDirectiveRecoveryHold(job.id);
     const reviewPending = reviewEligibleStatus(job.status);
 
     // (1) Delivered, no PR yet. Only PR-owing lanes (deliverable
@@ -1836,7 +1844,8 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       jobSeqUnchanged(jobId) &&
       !verificationInFlight(input.ledger, jobId) &&
       input.ledger.listPendingRebriefs({ jobId }).length === 0 &&
-      input.ledger.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES }).length === 0;
+      input.ledger.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES }).length === 0 &&
+      !input.ledger.hasOpenDirectiveRecoveryHold(jobId);
   };
   const reviewOfferFencesHold = (jobId: string): boolean => {
     const job = input.ledger.getJob(jobId);
@@ -1850,7 +1859,8 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       jobSeqUnchanged(jobId) &&
       !verificationInFlight(input.ledger, jobId) &&
       input.ledger.listPendingRebriefs({ jobId }).length === 0 &&
-      input.ledger.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES }).length === 0;
+      input.ledger.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES }).length === 0 &&
+      !input.ledger.hasOpenDirectiveRecoveryHold(jobId);
   };
   return {
     ...digest,
