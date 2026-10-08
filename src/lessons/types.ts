@@ -62,6 +62,23 @@ export class DreamError extends LessonsError {
   }
 }
 
+/** Why an owner decision on a lesson proposal could not be applied:
+ * `none` — nothing is pending; `mismatch` — the decision names a different
+ * proposal; `stale` — the book or the dream cursor moved since it was
+ * proposed (the proposal is withdrawn and the next dream re-proposes);
+ * `decided` — the opposite decision was already recorded. */
+export type ProposalErrorCode = 'none' | 'mismatch' | 'stale' | 'decided' | 'conflict' | 'incomplete';
+
+export class ProposalError extends LessonsError {
+  readonly code: ProposalErrorCode;
+
+  constructor(code: ProposalErrorCode, message: string) {
+    super(message);
+    this.name = 'ProposalError';
+    this.code = code;
+  }
+}
+
 export class LessonCaptureError extends LessonsError {
   constructor(message: string) {
     super(message);

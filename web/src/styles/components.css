@@ -1858,6 +1858,70 @@ body {
   cursor: default;
 }
 
+/* Book of Lessons proposal (owner decision 2026-10-07): the review spans
+   the row under the copy; Accept/Reject sit together in the action slot. */
+.board-owner__row--proposal {
+  grid-template-areas:
+    'title action'
+    'meta action'
+    'note action'
+    'review review'
+    'error error';
+}
+
+.board-owner__error {
+  grid-area: error;
+  margin-top: 6px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--alert);
+  overflow-wrap: anywhere;
+}
+
+.board-owner__actions {
+  grid-area: action;
+  display: flex;
+  gap: 6px;
+  align-self: center;
+}
+
+.board-owner__review {
+  grid-area: review;
+  margin-top: 6px;
+  min-width: 0;
+}
+
+.board-owner__review > summary {
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.board-owner__review-chapter {
+  margin-top: 8px;
+}
+
+.board-owner__review-heading {
+  font-weight: 800;
+  font-size: 12px;
+}
+
+.board-owner__review-lesson {
+  margin-top: 6px;
+  padding-left: 8px;
+  border-left: 2px solid color-mix(in srgb, var(--line) 40%, transparent);
+}
+
+.board-owner__review-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+
+.board-owner__review-text--before {
+  color: var(--muted);
+}
+
 .board-owner__open {
   display: inline-flex;
   align-items: center;
@@ -1886,6 +1950,18 @@ body {
       'note'
       'action';
     row-gap: 6px;
+  }
+
+  /* A proposal row keeps its review area in the single column — without
+     it the review becomes an implicit column and squeezes the title. */
+  .board-owner__row--proposal {
+    grid-template-areas:
+      'title'
+      'meta'
+      'note'
+      'review'
+      'action'
+      'error';
   }
 
   .board-owner__ack,

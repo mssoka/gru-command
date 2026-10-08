@@ -325,4 +325,132 @@ describe('board client', () => {
     // …and reopens the silent socket so the board resumes without a reload.
     await waitFor(() => seen.some((id) => id.startsWith('initial-2')), 'wake reopen');
   });
+  it('a stopped (re-paired) client never calls back: no late 401 unpairs its successor, no late snapshot renders', async () => {
+    let answer: (response: Response) => void = () => {};
+    const fetchImpl = vi.fn(() => new Promise<Response>((resolve) => { answer = resolve; })) as unknown as typeof fetch;
+    const events = { connection: vi.fn(), snapshot: vi.fn(), fatal: vi.fn() };
+    const old = new BoardClient({ token: TOKEN, host: '127.0.0.1:9', fetchImpl, webSocketCtor: class { close() {} } as unknown as new (url: string) => WebSocket }, events);
+    const loading = old.getLessonProposal();
+    old.stop(); // the owner re-paired; the old client's request is still in flight
+    answer(new Response('{"error":"unauthorized"}', { status: 401 }));
+    await expect(loading).rejects.toThrow();
+    const refetch = old.refetchSnapshot();
+    answer(new Response(JSON.stringify({
+      repos: [],
+      agents: [],
+      notifications: [],
+      decisions: {
+        enabled: false,
+        status: 'disabled',
+        reason: 'disabled',
+        model: '~typesafe/jev-latest',
+        endpoint: 'https://openrouter.ai/api/alpha/decisions',
+        credentialPresent: false,
+        credentialSource: 'none',
+        checkedAt: null,
+        incarnation: 'old-pairing',
+        generation: 0,
+      },
+      unackedActionRequired: 0,
+      unackedNeedsOwner: 0,
+      wakes: { count: 0, lastAt: null },
+      pipeline: { entries: [], pending: 0 },
+    }), { status: 200 }));
+    await refetch;
+    expect(events.fatal).not.toHaveBeenCalled();
+    expect(events.snapshot).not.toHaveBeenCalled();
+  });
+  /** A complete, valid board snapshot tagged by its decision incarnation. */
+  const tagged = (tag: string): BoardSnapshot => ({
+    repos: [],
+    agents: [],
+    notifications: [],
+    decisions: {
+      enabled: false,
+      status: 'disabled',
+      reason: 'disabled',
+      model: '~typesafe/jev-latest',
+      endpoint: 'https://openrouter.ai/api/alpha/decisions',
+      credentialPresent: false,
+      credentialSource: 'none',
+      checkedAt: null,
+      incarnation: tag,
+      generation: 0,
+    },
+    unackedActionRequired: 0,
+    unackedNeedsOwner: 0,
+    wakes: { count: 0, lastAt: null },
+    pipeline: { entries: [], pending: 0 },
+  } as unknown as BoardSnapshot);
+
+  it('an older HTTP snapshot never overwrites newer truth — reverse-order replies, and a push that came after the request', async () => {
+    const answers: Array<(response: Response) => void> = [];
+    const fetchImpl = vi.fn(() => new Promise<Response>((resolve) => { answers.push(resolve); })) as unknown as typeof fetch;
+    const sockets: { onopen: (() => void) | null; onmessage: ((event: { data: string }) => void) | null }[] = [];
+    class FakeSocket {
+      onopen: (() => void) | null = null;
+      onmessage: ((event: { data: string }) => void) | null = null;
+      onclose: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      constructor() {
+        sockets.push(this);
+      }
+      send(): void {}
+      close(): void {}
+    }
+    const delivered: string[] = [];
+    const ok = (snapshot: BoardSnapshot) => new Response(JSON.stringify(snapshot), { status: 200 });
+    const tracked = new BoardClient(
+      { token: TOKEN, host: 'localhost', fetchImpl, webSocketCtor: FakeSocket as unknown as new (url: string) => WebSocket },
+      { connection: () => {}, snapshot: (snapshot) => delivered.push(snapshot.decisions.incarnation), fatal: () => {} },
+    );
+    const first = tracked.refetchSnapshot();
+    const second = tracked.refetchSnapshot();
+    answers[1]!(ok(tagged('second')));
+    await second;
+    answers[0]!(ok(tagged('first'))); // answered last, asked first: stale
+    await first;
+    expect(delivered).toEqual(['second']);
+    tracked.connect(); // asks over HTTP, then opens the socket
+    const socket = sockets.at(-1)!;
+    socket.onopen!();
+    socket.onmessage!({ data: JSON.stringify({ type: 'auth_ok' }) });
+    socket.onmessage!({ data: JSON.stringify({ type: 'board', snapshot: tagged('pushed') }) });
+    answers[2]!(ok(tagged('stale-http'))); // requested before the push
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(delivered).toEqual(['second', 'pushed']);
+    tracked.stop();
+  });
+
+  it('a malformed review is refused before anything renders it — a valid one passes', async () => {
+    const review = (removed: unknown) => ({
+      id: 'prop-1',
+      createdAt: '2026-10-07T00:00:00.000Z',
+      notificationId: 'lp-1',
+      entries: 1,
+      throughSeq: 1,
+      decision: null,
+      recovery: null,
+      index: [],
+      chapters: [{
+        slug: 'ops',
+        title: { before: 'Ops', after: 'Ops' },
+        retired: false,
+        summary: { before: 'S.', after: 'S.' },
+        tags: { before: [], after: [] },
+        added: [],
+        changed: [],
+        removed: [removed],
+        provenanceTrimmed: 0,
+        bodiesTrimmed: 0,
+      }],
+    });
+    let body: unknown = review({ slug: 'gone', body: 'Text.', recurred: 1, reason: 'cap' }); // no tags
+    const fetchImpl = (async () => new Response(JSON.stringify(body), { status: 200 })) as unknown as typeof fetch;
+    const reviewing = new BoardClient({ token: TOKEN, host: 'localhost', fetchImpl }, { connection: () => {}, snapshot: () => {}, fatal: () => {} });
+    await expect(reviewing.getLessonProposal()).rejects.toThrow('lesson proposal review is malformed');
+    body = review({ slug: 'gone', body: 'Text.', recurred: 1, tags: ['ops'], reason: 'cap' });
+    await expect(reviewing.getLessonProposal()).resolves.toMatchObject({ id: 'prop-1' });
+  });
 });

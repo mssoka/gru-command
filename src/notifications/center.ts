@@ -86,6 +86,17 @@ export interface NotificationCenterOptions {
   readonly log?: Log;
 }
 
+/** An incident post (see NotificationCenter.postIncident). */
+export interface IncidentInput {
+  readonly kind: string;
+  readonly routing: NotificationRouting;
+  readonly severity: NotificationSeverity;
+  readonly title: string;
+  readonly detail?: string | null;
+  readonly agentId?: string | null;
+  readonly dedupe: 'unacked' | 'active' | 'all';
+}
+
 export class NotificationCenter {
   private readonly ledger: LedgerApi;
   private readonly onActionRequired: (notification: NotificationRecord) => void;
@@ -113,8 +124,12 @@ export class NotificationCenter {
     this.decisionsReady = ready;
   }
 
-  /** Direct post — supervisor escalations and product surfaces. */
+  /** Direct post — supervisor escalations and product surfaces. An
+   * explicit `id` makes the post idempotent: a row that already exists is
+   * returned as-is (no second ring), so a crash between posting and saving
+   * the id can never leave an orphan row behind. */
   post(input: {
+    id?: string;
     kind: string;
     routing: NotificationRouting;
     severity: NotificationSeverity;
@@ -122,9 +137,13 @@ export class NotificationCenter {
     detail?: string | null;
     agentId?: string | null;
   }): NotificationRecord {
+    if (input.id !== undefined) {
+      const existing = this.ledger.getNotification(input.id);
+      if (existing !== null) return existing;
+    }
     const record = this.ledger.recordNotification({
-      id: randomUUID(),
       ...input,
+      id: input.id ?? randomUUID(),
       routing: isOwnerHeldNotificationKind(input.kind) ? 'needs-owner' : input.routing,
     });
     this.log(input.severity === 'error' ? 'warn' : 'info', 'notification posted', {
@@ -141,15 +160,16 @@ export class NotificationCenter {
   }
 
   /** Incident post with durable restart-safe deduplication. */
-  postIncident(input: {
-    kind: string;
-    routing: NotificationRouting;
-    severity: NotificationSeverity;
-    title: string;
-    detail?: string | null;
-    agentId?: string | null;
-    dedupe: 'unacked' | 'active' | 'all';
-  }): NotificationRecord {
+  postIncident(input: IncidentInput): NotificationRecord {
+    return this.openIncident(input).record;
+  }
+
+  /** postIncident, also saying whether THIS call created the row (false:
+   * an open row of the kind was reused) — so a producer counting a streak
+   * never has to infer it from the row's content. */
+  openIncident(input: IncidentInput): { readonly record: NotificationRecord; readonly created: boolean } {
+    const created = (record: NotificationRecord) => ({ record, created: true });
+    const reused = (record: NotificationRecord) => ({ record, created: false });
     const existing = this.ledger.findNotificationByKind(
       input.kind,
       input.dedupe === 'all' ? 'any' : input.dedupe,
@@ -176,14 +196,19 @@ export class NotificationCenter {
           'needs-owner',
           input.dedupe === 'all' ? 'any' : input.dedupe,
         );
-        if (openOwnerRow !== null) return openOwnerRow;
-        return this.post(input);
+        if (openOwnerRow !== null) return reused(openOwnerRow);
+        return created(this.post(input));
       }
       // Do not grandfather an old machine row into FOR YOU merely because
       // a newer post of the same kind is owner-held. Gru triages the old ID.
-      return existing;
+      return reused(existing);
     }
-    return this.post(input);
+    return created(this.post(input));
+  }
+
+  /** Refresh an open incident's detail (same id, same ack state). */
+  updateDetail(id: string, detail: string): NotificationRecord | null {
+    return this.ledger.updateNotificationDetail(id, detail);
   }
 
   resolveIncidents(kindPrefix: string, by: string): readonly NotificationRecord[] {

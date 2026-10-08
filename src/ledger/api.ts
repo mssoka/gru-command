@@ -386,8 +386,10 @@ export function isOwnerHeldNotificationKind(kind: string): boolean {
   // — no owner chime, no ACK required, resolved by the wait lifecycle),
   // and every ineligible/failed classification posts `needs-owner` as the
   // conservative fallback (the supervisor passes that routing explicitly).
+  // `lessons.proposal`: a Book of Lessons update the owner alone approves
+  // (owner decision 2026-10-07).
   return kind.startsWith('decisions.degraded.') ||
-    ['supervision.breaker', 'port-squat', 'roll-port-squat', 'worktree-sweep-paused'].includes(kind);
+    ['supervision.breaker', 'port-squat', 'roll-port-squat', 'worktree-sweep-paused', 'lessons.proposal'].includes(kind);
 }
 
 export function isNotificationRouting(value: string): value is NotificationRouting {
@@ -4211,6 +4213,20 @@ export class LedgerApi {
   }
 
   /** Resolve one exact incident ID without acknowledging it for the owner. */
+  /** Replace an OPEN notification's detail (and, when given, title) in place — id, acknowledgement
+   * and routing unchanged (a long-running incident refreshing its latest
+   * cause). A resolved or missing row is left as-is and returned (or null). */
+  updateNotificationDetail(id: string, detail: string, title?: string): NotificationRecord | null {
+    return this.transaction(() => {
+      const current = this.getNotification(id);
+      const nextTitle = title ?? current?.title;
+      if (current === null || current.resolvedAt !== null || (current.detail === detail && current.title === nextTitle)) return current;
+      this.db.prepare('UPDATE notifications SET detail = ?, title = ? WHERE id = ?').run(detail, nextTitle ?? current.title, id);
+      this.appendEvent({ kind: 'notification.updated', agentId: current.agentId, payload: { id } });
+      return this.getNotification(id);
+    });
+  }
+
   resolveNotificationById(id: string, by: string): NotificationRecord | null {
     if (by.trim() === '') throw new Error('resolution by must be non-empty');
     return this.transaction(() => {

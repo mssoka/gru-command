@@ -275,6 +275,77 @@ export interface OwnerPrView {
   readonly checkedAt: string;
 }
 
+/** The For You notification kind for a Book of Lessons proposal (owner
+ * decision 2026-10-07): nothing is written until the owner accepts. */
+export const LESSONS_PROPOSAL_KIND = 'lessons.proposal';
+
+/** One lesson as the owner reviews it (previous* null = new lesson). */
+export interface LessonChangeView {
+  readonly slug: string;
+  readonly body: string;
+  readonly recurred: number;
+  readonly tags: readonly string[];
+  readonly previousBody: string | null;
+  readonly previousRecurred: number | null;
+  readonly previousTags: readonly string[] | null;
+}
+
+/** A lesson the proposal removes, with the text and tags that disappear:
+ * `cap` — an existing lesson dropped to fit; `retired` — its chapter is
+ * retired; `discarded` — an incoming lesson the cap left out. */
+export interface RemovedLessonView {
+  readonly slug: string;
+  readonly body: string;
+  readonly recurred: number;
+  readonly tags: readonly string[];
+  readonly reason: 'cap' | 'retired' | 'discarded';
+}
+
+export interface LessonChapterChangeView {
+  readonly slug: string;
+  /** Title before (null = new chapter) and after. */
+  readonly title: { readonly before: string | null; readonly after: string };
+  readonly retired: boolean;
+  readonly summary: { readonly before: string | null; readonly after: string };
+  readonly tags: { readonly before: readonly string[]; readonly after: readonly string[] };
+  readonly added: readonly LessonChangeView[];
+  readonly changed: readonly LessonChangeView[];
+  readonly removed: readonly RemovedLessonView[];
+  readonly provenanceTrimmed: number;
+  readonly bodiesTrimmed: number;
+}
+
+/** An INDEX.md entry the proposal changes (including untouched chapters'). */
+export interface LessonIndexChangeView {
+  readonly slug: string;
+  readonly before: { readonly summary: string; readonly tags: readonly string[] } | null;
+  readonly after: { readonly summary: string; readonly tags: readonly string[] } | null;
+}
+
+/** POST …/accept|reject: the recorded outcome. `incomplete` (HTTP 202)
+ * means the decision IS recorded but finishing it hit a problem. */
+export interface LessonProposalDecisionView {
+  readonly id: string;
+  readonly decision: 'accepted' | 'rejected' | 'withdrawn';
+  readonly incomplete?: boolean;
+  readonly detail?: string;
+}
+
+/** GET /api/lessons/proposal — the pending proposal's review payload. */
+export interface LessonProposalView {
+  readonly id: string;
+  readonly createdAt: string;
+  readonly notificationId: string;
+  readonly entries: number;
+  readonly throughSeq: number;
+  readonly chapters: readonly LessonChapterChangeView[];
+  readonly index: readonly LessonIndexChangeView[];
+  /** A decision recorded but not yet finished: only the same one finishes it. */
+  readonly decision: { readonly kind: 'accepted' | 'rejected'; readonly at: string } | null;
+  /** Why that recorded decision is blocked (the conflict notice explains). */
+  readonly recovery: { readonly conflict: string; readonly at: string } | null;
+}
+
 /** Durable pipeline queue (owner approvals j-239/j-1064): one active
  * entry as the SERVER evaluated it — waiting/ready/admitting/failed
  * with the exact wait reason. Admitted/cancelled entries are excluded
@@ -521,6 +592,87 @@ function str(value: unknown): string {
 
 function nstr(value: unknown): string | null {
   return typeof value === 'string' ? value : null;
+}
+
+function isCount(value: unknown): boolean {
+  return Number.isSafeInteger(value) && Number(value) >= 0;
+}
+
+function isStringList(value: unknown): boolean {
+  return Array.isArray(value) && value.every((item) => typeof item === 'string');
+}
+
+function isLessonChange(value: unknown, added: boolean): boolean {
+  return isRecord(value) &&
+    typeof value.slug === 'string' &&
+    typeof value.body === 'string' &&
+    isCount(value.recurred) &&
+    isStringList(value.tags) &&
+    (added
+      ? value.previousBody === null && value.previousRecurred === null && value.previousTags === null
+      : typeof value.previousBody === 'string' && isCount(value.previousRecurred) && isStringList(value.previousTags));
+}
+
+function isRemovedLesson(value: unknown): boolean {
+  return isRecord(value) &&
+    typeof value.slug === 'string' &&
+    typeof value.body === 'string' &&
+    isCount(value.recurred) &&
+    isStringList(value.tags) &&
+    (value.reason === 'cap' || value.reason === 'retired' || value.reason === 'discarded');
+}
+
+/** POST /api/lessons/proposal/:id/(accept|reject) — 200 finished, or 202
+ * recorded-but-incomplete with the reason. */
+export function isValidLessonProposalDecision(value: unknown): value is LessonProposalDecisionView {
+  return isRecord(value) &&
+    typeof value.id === 'string' && value.id !== '' &&
+    (value.decision === 'accepted' || value.decision === 'rejected' || value.decision === 'withdrawn') &&
+    (value.incomplete === undefined || typeof value.incomplete === 'boolean') &&
+    (value.detail === undefined || typeof value.detail === 'string');
+}
+
+export function isValidLessonProposal(value: unknown): value is LessonProposalView {
+  return isRecord(value) &&
+    typeof value.id === 'string' && value.id !== '' &&
+    typeof value.createdAt === 'string' &&
+    typeof value.notificationId === 'string' &&
+    isCount(value.entries) &&
+    isCount(value.throughSeq) &&
+    (value.decision === null ||
+      (isRecord(value.decision) &&
+        (value.decision.kind === 'accepted' || value.decision.kind === 'rejected') &&
+        typeof value.decision.at === 'string')) &&
+    (value.recovery === null ||
+      (isRecord(value.recovery) && typeof value.recovery.conflict === 'string' && typeof value.recovery.at === 'string')) &&
+    Array.isArray(value.chapters) &&
+    value.chapters.every((chapter: unknown) =>
+      isRecord(chapter) &&
+      typeof chapter.slug === 'string' &&
+      isRecord(chapter.title) &&
+      (chapter.title.before === null || typeof chapter.title.before === 'string') &&
+      typeof chapter.title.after === 'string' &&
+      typeof chapter.retired === 'boolean' &&
+      isRecord(chapter.summary) &&
+      (chapter.summary.before === null || typeof chapter.summary.before === 'string') &&
+      typeof chapter.summary.after === 'string' &&
+      isRecord(chapter.tags) && isStringList(chapter.tags.before) && isStringList(chapter.tags.after) &&
+      Array.isArray(chapter.added) && chapter.added.every((lesson: unknown) => isLessonChange(lesson, true)) &&
+      Array.isArray(chapter.changed) && chapter.changed.every((lesson: unknown) => isLessonChange(lesson, false)) &&
+      Array.isArray(chapter.removed) && chapter.removed.every(isRemovedLesson) &&
+      isCount(chapter.provenanceTrimmed) &&
+      isCount(chapter.bodiesTrimmed)) &&
+    Array.isArray(value.index) &&
+    value.index.every((entry: unknown) =>
+      isRecord(entry) &&
+      typeof entry.slug === 'string' &&
+      (entry.before === null || isIndexEntry(entry.before)) &&
+      (entry.after === null || isIndexEntry(entry.after)) &&
+      (entry.before !== null || entry.after !== null));
+}
+
+function isIndexEntry(value: unknown): boolean {
+  return isRecord(value) && typeof value.summary === 'string' && isStringList(value.tags);
 }
 
 export function isValidDecisionStatus(value: unknown): value is DecisionStatusView {

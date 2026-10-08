@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { isValidLessonProposal } from './board-protocol.js';
 import {
   agentStateTone,
   isValidSnapshot,
@@ -538,5 +539,23 @@ describe('provider pacing mirror (server parity)', () => {
     const badQueued = pacingSnapshot();
     (badQueued.pacing as { worker: { queued: unknown } }).worker.queued = 'nope';
     expect(isValidSnapshot(badQueued)).toBe(false);
+  });
+});
+
+describe('lesson proposal review validator', () => {
+  it('an INDEX change must have a side — a both-null entry is refused, one side passes', () => {
+    const review = (entry: unknown) => ({
+      id: 'prop-1',
+      createdAt: '2026-10-07T00:00:00.000Z',
+      notificationId: 'lp-1',
+      entries: 1,
+      throughSeq: 1,
+      decision: null,
+      recovery: null,
+      chapters: [],
+      index: [entry],
+    });
+    expect(isValidLessonProposal(review({ slug: 'ops', before: null, after: null }))).toBe(false);
+    expect(isValidLessonProposal(review({ slug: 'ops', before: null, after: { summary: 'S.', tags: [] } }))).toBe(true);
   });
 });
