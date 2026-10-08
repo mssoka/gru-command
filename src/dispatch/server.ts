@@ -226,6 +226,19 @@ function deliverableField(body: Record<string, unknown>): JobDeliverable | undef
   return value;
 }
 
+/** The optional megaminion parent. Unlike the blank-means-absent idiom of
+ * display_name, a PRESENT parent_job_id must name a job: a blank, null or
+ * non-string value is a 400 — never a reviewer silently filed as an
+ * unrelated top-level heist. */
+function parentJobIdField(body: Record<string, unknown>): string | undefined {
+  if (!Object.hasOwn(body, 'parent_job_id')) return undefined;
+  const raw = body['parent_job_id'];
+  if (typeof raw !== 'string' || raw.trim() === '') {
+    throw new Error(`parent_job_id must be a non-empty job id when present (got ${JSON.stringify(raw)})`);
+  }
+  return raw.trim();
+}
+
 function completionHandoffField(body: Record<string, unknown>): CompletionHandoffIntent | undefined {
   const value = body['completion_handoff'];
   if (value === undefined) return undefined;
@@ -368,6 +381,10 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       const by = optStrField(body, 'by');
       const targetRef = optStrFieldStrict(body, 'target_ref');
       const targetSha = optStrFieldStrict(body, 'target_sha');
+      // Job family: a minion commissioning a specialist (megaminion) names
+      // its own job id so the board nests the child under that heist. The
+      // ledger refuses an unknown, cross-repo, self, or grandchild parent.
+      const parentJobId = parentJobIdField(body);
       const outcome = await options.dispatch.dispatch({
         jobId: strField(body, 'job_id'),
         repoPath: strField(body, 'repo_path'),
@@ -377,6 +394,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         ...(commissioner !== undefined ? { commissioner } : by !== undefined ? { commissioner: by } : {}),
         ...(targetRef !== undefined ? { targetRef } : {}),
         ...(targetSha !== undefined ? { targetSha } : {}),
+        ...(parentJobId !== undefined ? { parentJobId } : {}),
         briefing: strField(body, 'briefing'),
         ...(completionHandoff !== undefined ? { completionHandoff } : {}),
       });

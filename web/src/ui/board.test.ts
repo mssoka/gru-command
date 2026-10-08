@@ -13,7 +13,8 @@ import type {
   VerifyQueueView,
 } from '../lib/board-protocol.js';
 import { memoryStorage } from '../lib/chat-storage.js';
-import { boardKpis } from '../lib/board-kpi.js';
+import { boardKpis, collectJobs } from '../lib/board-kpi.js';
+import { snapshotSections } from '../lib/board-sections.js';
 import { BoardView, RailIdentityError, jobFailing, makeGraphemeSplitter, minionSuffixes, railSuffix, visibleWord } from './board.js';
 
 type DecisionsOverrides = Partial<BoardSnapshot['decisions']>;
@@ -546,7 +547,7 @@ describe('board v6 — status chip rail (v4 health row relocated)', () => {
       agent('lens', { role: 'perkins', state: 'streaming', lastActivity: new Date(Date.now() - 600_000).toISOString() }),
     ];
     const snapshotValue = snapshot({ jobs, agents });
-    const kpis = boardKpis(snapshotValue);
+    const kpis = boardKpis(snapshotValue, new Date(), collectJobs(snapshotValue));
     const view = new BoardView(() => {});
     view.render(snapshotValue);
 
@@ -3636,5 +3637,150 @@ describe('board v6 — snapshot-resolved focus fallback (Perkins r2 warning)', (
     expect(active?.tagName).toBe('BUTTON');
     expect((active as HTMLElement).className).toContain('board-band__more');
     expect((active as HTMLElement).closest('.board-band')?.getAttribute('data-section')).toBe('cold');
+  });
+});
+
+describe('board — megaminions nest under their heist', () => {
+  beforeEach(mountBoardDom);
+
+  /** Two implementation heists; one commissioned three specialist
+   * reviewers (two still working, one delivered). */
+  function familySnapshot(extra: readonly JobView[] = []): BoardSnapshot {
+    const laneAt = (offsetMs: number): JobView['lane'] => ({
+      branch: 'gru/rev',
+      sha: 'c3f3b35deadbeef',
+      status: 'active',
+      createdAt: new Date(Date.now() - offsetMs).toISOString(),
+    });
+    return snapshot({
+      jobs: [
+        baseJob({ id: 'impl', title: 'Managed repositories overview', status: 'working', rounds: [] }),
+        baseJob({ id: 'other', title: 'Dashboard slim strip', status: 'working', rounds: [] }),
+        baseJob({ id: 'rev-blind', title: 'Review (blind)', status: 'working', rounds: [], parentJobId: 'impl', lane: laneAt(300_000) }),
+        baseJob({ id: 'rev-edge', title: 'Review (edge)', status: 'working', rounds: [], parentJobId: 'impl', lane: laneAt(290_000) }),
+        baseJob({ id: 'rev-verify', title: 'Review (verify)', status: 'delivered', rounds: [], parentJobId: 'impl', lane: laneAt(280_000) }),
+        ...extra,
+      ],
+    });
+  }
+
+  function rowOf(id: string): HTMLElement {
+    const row = document.querySelector<HTMLElement>(`.board-job[data-job-id="${id}"]`);
+    if (row === null) throw new Error(`row ${id} missing`);
+    return row;
+  }
+
+  it('counts heists only and hangs live megaminions under the parent row', () => {
+    const view = new BoardView(() => {});
+    view.render(familySnapshot());
+
+    const inFlight = document.querySelector<HTMLElement>('#board-section-in-flight');
+    expect(inFlight?.querySelector('.board-band__count')?.textContent).toBe('2 heists');
+    const topLevel = [...(inFlight?.querySelectorAll<HTMLElement>('.board-band__rows > .board-job') ?? [])];
+    expect(topLevel.map((row) => row.dataset.jobId).sort()).toEqual(['impl', 'other']);
+    // The delivered reviewer is part of its heist, not a Settled heist.
+    expect(document.querySelector('#board-section-settled .board-band__count')?.textContent).toBe('0 heists');
+
+    const parent = rowOf('impl');
+    expect(parent.querySelector(':scope > .board-job__meta .board-job__family-chip')?.textContent).toBe(
+      '↳ 3 megaminions · 2 working · 1 delivered',
+    );
+    const live = [...parent.querySelectorAll<HTMLElement>(':scope > .board-job__family--live > .board-job--child')];
+    expect(live.map((row) => row.dataset.jobId)).toEqual(['rev-blind', 'rev-edge']);
+    const blind = rowOf('rev-blind');
+    expect(blind.dataset.megaminion).toBe('true');
+    expect(blind.querySelector('.board-job__agent-age')?.textContent).toMatch(/^megaminion \d+[smhd]$/);
+    // A specialist is not a heist: no repo, no heist age on its row.
+    expect(blind.querySelector('.board-job__repo')).toBeNull();
+    expect(blind.querySelector('.board-job__lane-age')).toBeNull();
+    expect(blind.textContent).not.toContain('heist ');
+    // The parent keeps its own minion word; the concluded reviewer is
+    // folded away until the heist is expanded.
+    expect(parent.querySelector(':scope > .board-job__meta .board-job__agent-age')?.textContent).toMatch(/^minion /);
+    expect(document.querySelector('.board-job[data-job-id="rev-verify"]')).toBeNull();
+    expect(rowOf('other').querySelector('.board-job__family-chip')).toBeNull();
+  });
+
+  it('shows concluded megaminions inside the expanded heist; a nested row toggles itself, not its parent', () => {
+    const view = new BoardView(() => {});
+    view.render(familySnapshot());
+    const parent = rowOf('impl');
+
+    rowOf('rev-blind').querySelector<HTMLElement>('.board-job__meta')?.click();
+    expect(rowOf('rev-blind').dataset.expanded).toBe('true');
+    expect(parent.dataset.expanded).toBe('false');
+
+    parent.querySelector<HTMLButtonElement>(':scope > .board-job__head .board-job__toggle')?.click();
+    expect(parent.dataset.expanded).toBe('true');
+    const concluded = parent.querySelector<HTMLElement>('.board-job__body .board-job__family--concluded');
+    expect(concluded?.querySelector('.board-job__family-label')?.textContent).toBe('megaminions');
+    const verify = rowOf('rev-verify');
+    expect(concluded?.contains(verify)).toBe(true);
+
+    // A nested row inside the parent's body still flips on a summary click.
+    verify.querySelector<HTMLElement>('.board-job__meta')?.click();
+    expect(verify.dataset.expanded).toBe('true');
+    expect(parent.dataset.expanded).toBe('true');
+  });
+
+  it('a blocked megaminion stays surfaced in For Gru and names its heist', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      familySnapshot([
+        baseJob({ id: 'rev-stuck', title: 'Review (stuck)', status: 'blocked', rounds: [], parentJobId: 'impl' }),
+      ]),
+    );
+    expandForGru();
+    const forGru = document.querySelector<HTMLElement>('#board-section-for-gru');
+    expect(forGru?.querySelector('.board-band__count')?.textContent).toBe('1 heist');
+    const stuck = rowOf('rev-stuck');
+    expect(forGru?.contains(stuck)).toBe(true);
+    const link = stuck.querySelector<HTMLButtonElement>('button.board-job__parent');
+    expect(link?.textContent).toBe('↳ megaminion of Managed repositories overview');
+    expect(stuck.querySelector('.board-job__agent-age')?.textContent).toMatch(/^megaminion /);
+    expect(rowOf('impl').querySelector('.board-job__family-chip')?.textContent).toBe('↳ 3 megaminions · 2 working · 1 delivered');
+    // The ↳ link jumps to the heist: its toggle takes focus; the surfaced
+    // row itself does not flip open.
+    link?.click();
+    expect(document.activeElement).toBe(rowOf('impl').querySelector(':scope > .board-job__head .board-job__toggle'));
+    expect(rowOf('rev-stuck').dataset.expanded).toBe('false');
+  });
+
+  it('a running specialist of a COLD heist stays visible in In flight and its link opens Cold to the heist', () => {
+    const view = new BoardView(() => {});
+    const stale = new Date(Date.now() - 6 * 3_600_000).toISOString();
+    view.render(
+      snapshot({
+        jobs: [
+          baseJob({
+            id: 'impl',
+            title: 'Quiet heist',
+            status: 'working',
+            rounds: [],
+            lastAgentActivity: stale,
+            lane: { branch: 'gru/impl', sha: 'c3f3b35deadbeef', status: 'active', createdAt: stale },
+          }),
+          baseJob({ id: 'rev-live', title: 'Review (live)', status: 'working', rounds: [], parentJobId: 'impl' }),
+        ],
+      }),
+    );
+    const inFlight = document.querySelector<HTMLElement>('#board-section-in-flight');
+    expect(inFlight?.querySelector('.board-band__count')?.textContent).toBe('1 heist');
+    const live = rowOf('rev-live');
+    expect(inFlight?.contains(live)).toBe(true);
+    expect(document.querySelector('#board-section-cold .board-band__body')?.hasAttribute('hidden')).toBe(true);
+    live.querySelector<HTMLButtonElement>('button.board-job__parent')?.click();
+    const cold = document.querySelector<HTMLElement>('#board-section-cold');
+    expect(cold?.querySelector('.board-band__body')?.hasAttribute('hidden')).toBe(false);
+    expect(cold?.contains(rowOf('impl'))).toBe(true);
+    expect(document.activeElement).toBe(rowOf('impl').querySelector(':scope > .board-job__head .board-job__toggle'));
+  });
+
+  it('the HEISTS tracker counts the board\'s top-level rows: parents only while their specialists nest', () => {
+    const value = familySnapshot();
+    expect(boardKpis(value, new Date(), snapshotSections(value).topLevel).jobs.total).toBe(2);
+    const view = new BoardView(() => {});
+    view.render(value);
+    expect(document.querySelector('#chip-rail [data-kpi="jobs.total"]')?.textContent).toContain('2');
   });
 });

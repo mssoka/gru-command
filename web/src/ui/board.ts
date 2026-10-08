@@ -47,7 +47,6 @@ import {
 import { loadExpandedJobs, saveExpandedJobs } from '../lib/board-collapse.js';
 import {
   BAND_LABELS,
-  liveWorkerStampsByJob,
   stoppedWorkersByJob,
   workerStopLabel,
   type BandId,
@@ -63,13 +62,15 @@ import {
   sectionNav,
   settledJobs,
   settledPreview,
+  snapshotSections,
   IN_FLIGHT_PREVIEW_SIZE,
   PIPELINE_PREVIEW_SIZE,
   SETTLED_PREVIEW_SIZE,
   type SectionId,
 } from '../lib/board-sections.js';
 import { railChips, type RailChip } from '../lib/board-rail.js';
-import { BOARD_WORDS, heistCount } from '../lib/board-vocabulary.js';
+import { BOARD_WORDS, heistCount, megaminionCount } from '../lib/board-vocabulary.js';
+import { familyStatusBreakdown, isLiveMegaminion } from '../lib/board-family.js';
 import { formatAge } from '../lib/board-time.js';
 import { prLinkLabel } from '../lib/pr-link.js';
 import {
@@ -183,6 +184,12 @@ export class BoardView {
    * by the shortcut strip and the section bodies — computed from the SAME
    * stopped/live-worker inputs so they can never disagree). */
   private currentSections: ReturnType<typeof boardSections> | null = null;
+  /** The per-render signal maps a nested megaminion row reads (the same
+   * maps its parent's section passed to the parent row). */
+  private jobSignals: {
+    readonly unacked: ReadonlyMap<string, number>;
+    readonly stoppedWorkers: ReadonlyMap<string, WorkerStopView>;
+  } | null = null;
   /** D3: older receipt pages fetched on demand (merged into FEED). */
   private extraReceipts: NotificationView[] = [];
   private receiptsNextOffset = 0;
@@ -983,11 +990,8 @@ export class BoardView {
    * classification — stopped/live-worker truth included — so their counts
    * cannot drift apart between renders. */
   private sectionsFor(snapshot: BoardSnapshot): ReturnType<typeof boardSections> {
-    if (this.currentSections === null) {
-      const stoppedWorkers = stoppedWorkersByJob(snapshot.agents);
-      const liveWorkerStamps = liveWorkerStampsByJob(snapshot.agents);
-      this.currentSections = boardSections(snapshot, Date.now(), { stoppedWorkers, liveWorkerStamps });
-    }
+    // The same snapshot-only derivation the TRACKERS chip counts from.
+    this.currentSections ??= snapshotSections(snapshot, Date.now());
     return this.currentSections;
   }
 
@@ -1003,6 +1007,7 @@ export class BoardView {
     // strip counts and section bodies can never disagree).
     const sections = this.sectionsFor(snapshot);
     const stoppedWorkers = stoppedWorkersByJob(snapshot.agents);
+    this.jobSignals = { unacked, stoppedWorkers };
     this.mount.append(this.jobsSection('in-flight', sections.bands.get('in-flight') ?? [], unacked, stoppedWorkers));
     this.mount.append(this.pipelineSection(sections));
     this.mount.append(this.forGruSection(sections.bands.get('needs-you') ?? [], unacked, stoppedWorkers));
@@ -1010,6 +1015,7 @@ export class BoardView {
     this.mount.append(this.coldSection(sections.bands.get('cold') ?? [], unacked, stoppedWorkers));
     const seenIds = new Set<string>();
     for (const group of sections.bands.values()) for (const entry of group) seenIds.add(entry.job.id);
+    for (const group of sections.children.values()) for (const entry of group) seenIds.add(entry.job.id);
     for (const id of seenIds) this.knownJobIds.add(id);
     this.firstJobsRender = false;
   }
@@ -1323,6 +1329,12 @@ export class BoardView {
    * repo + branch + lane age + agent age + PR link. Clicking anywhere on
    * the summary expands the v3 detail inline — the row is never a card
    * until it is expanded. Error/failing rows carry the alert accent.
+   *
+   * Megaminions: a heist's nested specialists render inside its row — the
+   * live ones as indented sub-rows under the meta line, the concluded ones
+   * inside the expanded body — and the meta line carries the family chip.
+   * A nested row (`child`) drops the repo (its parent's) and its worker
+   * reads `megaminion`, never `minion`.
    */
   private jobRow(
     job: JobView,
@@ -1330,8 +1342,9 @@ export class BoardView {
     stale: boolean,
     band: BandId,
     workerStop: WorkerStopView | null,
+    child = false,
   ): HTMLElement {
-    const row = el('article', 'board-job');
+    const row = el('article', child ? 'board-job board-job--child' : 'board-job');
     row.dataset.jobId = job.id;
     row.dataset.band = band;
     row.dataset.status = job.status;
@@ -1389,12 +1402,37 @@ export class BoardView {
     head.append(toggle);
     row.append(head);
 
+    // A surfaced megaminion (top-level by the NEEDS-YOU exception) still
+    // names the heist it belongs to.
+    const surfacedParent = child ? undefined : this.currentSections?.surfacedParents.get(job.id);
+    const workerWord = child || surfacedParent !== undefined ? BOARD_WORDS.megaminion : BOARD_WORDS.minion;
+    const family = child ? [] : (this.currentSections?.children.get(job.id) ?? []);
+    if (child || surfacedParent !== undefined) row.dataset.megaminion = 'true';
+
     const meta = el('div', 'board-job__meta lbl');
-    meta.append(el('span', 'board-job__repo', `📦 ${job.repo}`));
+    if (!child) meta.append(el('span', 'board-job__repo', `📦 ${job.repo}`));
+    if (surfacedParent !== undefined) {
+      // The ↳ link jumps to the heist this specialist belongs to (opening
+      // the section that holds it), like the crew rail's parent link.
+      const parentName = surfacedParent.displayName ?? surfacedParent.title;
+      const of = el('button', 'board-job__parent', `↳ ${BOARD_WORDS.megaminion} of ${parentName}`);
+      of.type = 'button';
+      of.dataset.focusKey = `job-parent:${job.id}`;
+      of.title = `${BOARD_WORDS.megaminion} of ${surfacedParent.title} (${surfacedParent.id}) — show that ${BOARD_WORDS.heist}`;
+      of.addEventListener('click', (event) => {
+        event.stopPropagation();
+        this.revealJob(surfacedParent.id);
+      });
+      meta.append(of);
+    }
     if (job.lane !== null) {
       meta.append(el('span', 'board-job__branch', `🌿 ${job.lane.branch ?? 'detached'}`));
-      meta.append(this.ageNode('board-job__age board-job__lane-age', job.lane.createdAt, `${BOARD_WORDS.heist} `, ''));
-      meta.append(this.ageNode('board-job__age board-job__agent-age', job.lastAgentActivity, `${BOARD_WORDS.minion} `, ''));
+      // A nested specialist is not a heist: its parent row carries the
+      // heist age, the nested row only its own worker's activity.
+      if (!child) {
+        meta.append(this.ageNode('board-job__age board-job__lane-age', job.lane.createdAt, `${BOARD_WORDS.heist} `, ''));
+      }
+      meta.append(this.ageNode('board-job__age board-job__agent-age', job.lastAgentActivity, `${workerWord} `, ''));
     } else if (job.baseBranch !== null) {
       meta.append(el('span', 'board-job__branch', `⌂ ${job.baseBranch}`));
     }
@@ -1409,13 +1447,17 @@ export class BoardView {
       link.addEventListener('click', (event) => event.stopPropagation());
       meta.append(link);
     }
+    if (family.length > 0) meta.append(this.familyChip(family));
     meta.title = `${job.repo}${job.lane !== null ? ` · ${job.lane.branch ?? 'detached'}` : ''} · ${job.id}`;
     row.append(meta);
+    const liveFamily = family.filter((entry) => isLiveMegaminion(entry.job));
+    const concludedFamily = family.filter((entry) => !isLiveMegaminion(entry.job));
+    if (liveFamily.length > 0) row.append(this.familyRows(liveFamily, 'live'));
 
     let body: HTMLElement | null = null;
     const setExpanded = (expanded: boolean, persist = true): void => {
       if (expanded) {
-        body ??= this.jobBody(job);
+        body ??= this.jobBody(job, concludedFamily, workerWord, child);
         row.append(body);
         toggle.setAttribute('aria-controls', body.id);
       } else if (body !== null) {
@@ -1429,11 +1471,14 @@ export class BoardView {
     const flip = (): void => setExpanded(row.dataset.expanded !== 'true');
     toggle.addEventListener('click', flip);
     // Whole-row click target for the summary face; interactive children
-    // (PR link, controls) and the expanded body keep their own behavior.
+    // (PR link, controls), the expanded body and nested megaminion rows
+    // keep their own behavior. Only matches INSIDE this row count: a
+    // megaminion row nested in its parent's body must still flip itself.
     row.addEventListener('click', (event) => {
       const target = event.target;
       if (!(target instanceof HTMLElement)) return;
-      if (target.closest('a, button, .board-job__body') !== null) return;
+      const inner = target.closest('a, button, .board-job__body, .board-job__family');
+      if (inner !== null && row.contains(inner)) return;
       flip();
     });
     setExpanded(this.expandedJobs.has(job.id), false);
@@ -1445,7 +1490,12 @@ export class BoardView {
    * job's aborted round is noise, not live state (v4.1 stale-pill
    * suppression); a binned (discarded) lane deliberately keeps its full
    * history inspectable. */
-  private jobBody(job: JobView): HTMLElement {
+  private jobBody(
+    job: JobView,
+    concludedFamily: readonly BandedJob[] = [],
+    workerWord: string = BOARD_WORDS.minion,
+    child = false,
+  ): HTMLElement {
     const body = el('div', 'board-job__body');
     this.nextRegionId += 1;
     body.id = `board-job-body-${this.nextRegionId}`;
@@ -1454,9 +1504,9 @@ export class BoardView {
       lane.append(
         el('span', 'pp-chip board-lane__branch', `🌿 ${job.lane.branch ?? 'detached'}`),
         el('span', 'board-lane__base lbl', `⌂ ${job.lane.sha.slice(0, 8)}`),
-        this.ageNode('board-lane__age lbl', job.lane.createdAt, `${BOARD_WORDS.heist} `, ''),
-        this.ageNode('board-lane__activity lbl', job.lastAgentActivity, `${BOARD_WORDS.minion} `, ''),
       );
+      if (!child) lane.append(this.ageNode('board-lane__age lbl', job.lane.createdAt, `${BOARD_WORDS.heist} `, ''));
+      lane.append(this.ageNode('board-lane__activity lbl', job.lastAgentActivity, `${workerWord} `, ''));
       if (job.lane.status !== 'active') {
         lane.append(el('span', 'pp-chip pp-chip--park board-lane__status', job.lane.status));
       }
@@ -1472,7 +1522,39 @@ export class BoardView {
     if (quiescent && rounds.length > 0) {
       body.append(el('div', 'lbl board-job__reviewed', 'review history on the ledger'));
     }
+    if (concludedFamily.length > 0) body.append(this.familyRows(concludedFamily, 'concluded'));
     return body;
+  }
+
+  /** `↳ 3 megaminions · 2 working · 1 delivered` on the parent heist. */
+  private familyChip(family: readonly BandedJob[]): HTMLElement {
+    const breakdown = familyStatusBreakdown(family.map((entry) => entry.job))
+      .map(({ status, count }) => `${count} ${status}`)
+      .join(' · ');
+    const chip = el('span', 'board-job__family-chip', `↳ ${megaminionCount(family.length)} · ${breakdown}`);
+    chip.title = `specialists this heist's minion commissioned: ${family.map((entry) => entry.job.title).join(', ')}`;
+    return chip;
+  }
+
+  /** Nested megaminion rows: the live ones always visible under the
+   * parent's meta line, the concluded ones inside its expanded body. */
+  private familyRows(family: readonly BandedJob[], kind: 'live' | 'concluded'): HTMLElement {
+    const rows = el('div', `board-job__family board-job__family--${kind}`);
+    if (kind === 'concluded') rows.append(el('div', 'lbl board-job__family-label', BOARD_WORDS.megaminions));
+    const signals = this.jobSignals;
+    for (const entry of family) {
+      rows.append(
+        this.jobRow(
+          entry.job,
+          signals?.unacked.get(entry.job.id) ?? 0,
+          entry.stale,
+          entry.band,
+          signals?.stoppedWorkers.get(entry.job.id) ?? null,
+          true,
+        ),
+      );
+    }
+    return rows;
   }
 
   /** One round header row: `round N` chip + status + verdict + lens
@@ -1554,6 +1636,30 @@ export class BoardView {
       chips.append(node);
     }
     return chips;
+  }
+
+  /** Show one heist row: open the section (or preview window) holding
+   * it, re-render, then bring the row into view with its toggle focused.
+   * Opening is the same reversible disclosure the operator would click. */
+  private revealJob(jobId: string): void {
+    const sections = this.currentSections;
+    if (sections === null) return;
+    for (const [band, entries] of sections.bands) {
+      const entry = entries.find((candidate) => candidate.job.id === jobId);
+      if (entry === undefined) continue;
+      if (band === 'in-flight') this.inFlightExpanded = true;
+      if (band === 'settled') this.settledExpanded = true;
+      if (band === 'needs-you') this.forGruExpanded = true;
+      if (band === 'cold') {
+        this.coldExpanded = true;
+        if (entry.job.status === 'binned') this.binnedExpanded = true;
+      }
+      break;
+    }
+    this.rerender();
+    const row = this.mount.querySelector<HTMLElement>(`.board-job[data-job-id="${CSS.escape(jobId)}"]`);
+    row?.scrollIntoView?.({ block: 'nearest' });
+    row?.querySelector<HTMLButtonElement>(':scope > .board-job__head .board-job__toggle')?.focus();
   }
 
   private setJobExpanded(jobId: string, expanded: boolean): void {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { AgentView, BoardSnapshot, JobView } from './board-protocol.js';
-import { boardKpis, derivedPrState, jobStatusCounts, laneCounts, prCounts } from './board-kpi.js';
+import { boardKpis, collectJobs, derivedPrState, jobStatusCounts, laneCounts, prCounts } from './board-kpi.js';
 
 const NOW = new Date(2026, 8, 23, 12, 0, 0); // local noon — day-boundary tests stay timezone-robust
 const ISO = (offsetMs: number): string => new Date(NOW.getTime() + offsetMs).toISOString();
@@ -88,7 +88,7 @@ function fixture(): BoardSnapshot {
 describe('board KPIs — counts over the live snapshot', () => {
   it('counts named statuses including discarded binned jobs (blocked/dispatched stay off the strip)', () => {
     const snapshot = fixture();
-    const kpis = boardKpis(snapshot, NOW);
+    const kpis = boardKpis(snapshot, NOW, collectJobs(snapshot));
     expect(kpis.jobs).toEqual({ working: 2, inReview: 3, merged: 2, done: 1, parked: 1, binned: 0, total: 11 });
     expect(jobStatusCounts([...snapshot.repos.flatMap((repo) => repo.jobs), job('discarded', { status: 'binned' })]))
       .toMatchObject({ binned: 1, parked: 1, total: 12 });
@@ -170,7 +170,7 @@ describe('board KPIs — counts over the live snapshot', () => {
 
   it('counts nothing rather than NaN on an empty board', () => {
     const empty = { ...fixture(), repos: [], agents: [] };
-    const kpis = boardKpis(empty, NOW);
+    const kpis = boardKpis(empty, NOW, collectJobs(empty));
     expect(kpis.jobs).toEqual({ working: 0, inReview: 0, merged: 0, done: 0, parked: 0, binned: 0, total: 0 });
     expect(kpis.prs).toEqual({ open: 0, conflicting: 0, mergedToday: 0 });
     expect(kpis.lanes).toEqual({ liveMinions: 0, midTurn: 0, midTurnOldestAt: null, disposed: 0 });

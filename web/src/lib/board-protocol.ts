@@ -64,6 +64,9 @@ export interface JobView {
   readonly rounds: readonly RoundView[];
   readonly lane: LaneView | null;
   readonly lastAgentActivity: string | null;
+  /** The commissioning job when this one is a megaminion; null for a
+   * top-level heist. Absent on older servers (treated as top-level). */
+  readonly parentJobId?: string | null;
 }
 
 /** Issue #161: one tracked child worker (sub-minion). */
@@ -1016,6 +1019,8 @@ export function isValidSnapshot(value: unknown): value is BoardSnapshot {
           (job.prState === null || job.prState === undefined || isPrState(job.prState)) &&
           (job.lane === null || isLane(job.lane)) &&
           (job.lastAgentActivity === null || typeof job.lastAgentActivity === 'string') &&
+          (job.parentJobId === undefined || job.parentJobId === null ||
+            (typeof job.parentJobId === 'string' && job.parentJobId.trim() !== '' && job.parentJobId !== job.id)) &&
           Array.isArray(job.rounds) &&
           job.rounds.every(
             (round) =>
