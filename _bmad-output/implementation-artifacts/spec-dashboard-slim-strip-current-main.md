@@ -68,7 +68,7 @@ Port map (source `4de42d9` → destination current main `49b558f`):
 - `web/src/lib/owner-band.ts` — additive `ackNextStep(kind)` beside `ackConsequence`; same kind families (supervision → "Ack re-arms this worker.", decisions.degraded → records saw, worktree-sweep-paused, port-squat/roll-port-squat, else neutral).
 - `web/src/ui/board.ts` — slim rail replacement: `strip-status` row of `.strip-pair` (`statusPairNode`/`stripValueNode`/`stripFlagNode`) + `.strip-groups` (`stripGroupsNode`) replacing `railChipNode`/`trackersChipNode`; Jev/unacked/wakes chips move into the row (unacked always hidden — number renders once on ALERTS pair; wakes chip keeps main's deferred count/reasons/truncated title, merged with lane's count/age split; `ageSplitNode` + split mode in `refreshAge`); compact owner band: `expandedOwnerRows` set, `ownerRegionIds` map + `nextOwnerRegionId`, `ownerRegionId()`, `ownerDiscloseNode()`, two-arg `refocusAction(actionId, control)` (call site line ~480), `ownerAckRow` face/detail split with `data-control`, `ownerPrRow(row, surface)` panel variant for the bell (line ~1673 call site); retire-on-removal in `renderOwnerActions`; keep `renderNav`/sections/focus machinery/receipts intact.
 - `web/src/styles/components.css` — replace the `.chip-rail`/`.rail-chip*`/`.rail-kpi*` block (main lines ~257–394) with slim-strip styles; scoped `#chip-rail .num, #board-owner .num` tabular slots (`min-width: calc(4ch + 1px)` / `calc(4ch + 1em)`); `@container (min-width: 640px)` 3-column groups; re-face `.board-owner__*` block (~1754–1898) with face/actions/disclose/detail + panel variant; keep every unrelated main style.
-- Tests: `web/src/ui/board.test.ts` (rail describe ~475–652 re-faced to strip selectors; FOR YOU describe ~2420+ `data-control` updates + lane's new regressions appended: wake truths, independent reveal no-request, short face vs expanded, id collision, push/removal, window keep, ack/open focus, panel surface scoping); `web/src/lib/board-rail.test.ts` (append split describe); `web/src/lib/owner-band.test.ts` (append `ackNextStep` describe); `web/e2e/dashboard-strip.spec.ts` (lane-only, port + silas fixtures for main's `isValidSnapshot`, add children-present and deferred-wake cases); `web/e2e/smoke.spec.ts` (rail assertions to strip DOM; keep six-section suites); `web/playwright.config.ts` (mock `testMatch` union); `.gitignore` (`web/e2e-artifacts/`); `.gru-command/worktree.toml` (union 7 scopes, baselines pinned to `49b558f`).
+- Tests: `web/src/ui/board.test.ts` (rail describe ~475–652 re-faced to strip selectors; FOR YOU describe ~2420+ `data-control` updates + lane's new regressions appended: wake truths, independent reveal no-request, short face vs expanded, id collision, push/removal, window keep, ack/open focus, panel surface scoping); `web/src/lib/board-rail.test.ts` (append split describe); `web/src/lib/owner-band.test.ts` (append `ackNextStep` describe); `web/e2e/dashboard-strip.spec.ts` (lane-only, port + silas fixtures for main's `isValidSnapshot`, add children-present and deferred-wake cases); `web/e2e/smoke.spec.ts` (rail assertions to strip DOM; keep six-section suites); `web/playwright.config.ts` (mock `testMatch` union); `.gitignore` (`web/e2e-artifacts/`); `.gru-command/worktree.toml` (union 9 scopes + directive-recovery scope, baselines pinned to `49b558f`).
 
 ## Tasks & Acceptance
 
@@ -174,7 +174,47 @@ Exact-head receipts at `1a3aabd` (all through the authenticated scheduler + ship
 
 Exact-final-head receipts at `50f5f9a` (after the round-5 fixes; all through the authenticated scheduler + shipped capture helper): unit GREEN 142 (run ac784b1b; an earlier attempt under request 16eca535 whose run cad0bf07 completed green server-side lost its capture stream to a queue-wait termination and is retained as an honest incomplete capture, never cited); strip-browser GREEN 67 (run 0b3da28a); strip-smoke GREEN (run 01dc594e); strip-themes GREEN (run b1de7e6e); dashboard-slim-strip-baseline RED exit 1 (run cb7d79d3); strip-browser-baseline RED exit 1 (run ecb81559); typecheck GREEN (run 6947d49a); pipeline-board-browser GREEN (run c8eaa1bb); full GREEN (run a66c0d5b; backend 2291, heavy 925, web 542 passed).
 
-Round-6 follow-ups (reported, not blocking; record only unless noted): the band-head fallback anchor has no themed focus ring (F-1); display receipts fire for collapsed rows whose full detail is hidden (F-2, doctrine note); the smoke KPI walk omits `jobs.binned` (F-3); the deploy `unknown` split branch is unexercised (F-4); non-alert pair tones are unpinned (F-5); `::before` KPI separators are exposed to AT (F-6); the capture suite overwrites fixed ignored paths without run-scoping (F-7); re-pairing reuses actionId/region state held from the previous connection (`bindClient` does not clear the band maps — edge-case follow-up); the spec Tasks section still says "union 7 scopes" where seven were added (edge-case claim follow-up, wording now consistent in Verification). The carried records (CHILDREN tone, group aria-label, unstamped geometry, narrow-width age/deferred legs, panel layout, baseline failure-kind) remain in `deferred-work.md`.
+Round-6 follow-ups (reported, not blocking; record only unless noted): the band-head fallback anchor has no themed focus ring (F-1); display receipts fire for collapsed rows whose full detail is hidden (F-2, doctrine note); the smoke KPI walk omits `jobs.binned` (F-3); the deploy `unknown` split branch is unexercised (F-4); non-alert pair tones are unpinned (F-5); `::before` KPI separators are exposed to AT (F-6); the capture suite overwrites fixed ignored paths without run-scoping (F-7); re-pairing reuses actionId/region state held from the previous connection (`bindClient` does not clear the band maps — edge-case follow-up); the spec Tasks section still says "union 9 scopes + directive-recovery scope" where seven were added (edge-case claim follow-up, wording now consistent in Verification). The carried records (CHILDREN tone, group aria-label, unstamped geometry, narrow-width age/deferred legs, panel layout, baseline failure-kind) remain in `deferred-work.md`.
+
+### Round 10 — concluding whole-change pass after the scope correction
+
+Reviewed `e740d96` (blind-hunter 10, edge-case 5, verification-gap 2 + 3 observations). All triaged:
+
+| # | Finding | Verdict | Disposition |
+|---|---|---|---|
+| BH-F1 | No exact-head verification receipt; "byte-identical" transitivity claim wrong for unit scope | high | **Fixed**: exact-head receipts recorded below; all 11 scopes ran at `e740d96` |
+| BH-F2 | `bindClient` doesn't clear band maps on re-pair | follow-up | carried (deferred-work.md) |
+| BH-F3 | Baselines can't prove RED kind (missing failure-kind assertion) | follow-up | carried (deferred-work.md) |
+| BH-F4 | `strip-browser`/baseline skip RPC-patch prerequisite | false | the RPC patch targets vitest birpc timeouts; Playwright e2e scopes don't run vitest — the prefix in sibling browser scopes is copy-drift, not a missing prerequisite |
+| BH-F5 | Wake-age boundaries at 1440 only | follow-up | carried (deferred-work.md) |
+| BH-F6 | Unstamped wake states have zero geometry coverage | follow-up | carried (deferred-work.md) |
+| BH-F7 | Group accessible names are tooltip enumerations | follow-up | carried (deferred-work.md) |
+| BH-F8a | `::before` separators AT-audible | follow-up | carried (deferred-work.md) |
+| BH-F8b | Wrapped-line leading dot at phone widths (new aspect of F8a) | follow-up | carried with F8a |
+| BH-F9 | Ack-disclose grid auto-placement fragility | follow-up | recorded |
+| BH-F10 | `ownerFocusKey` document-scoped without surface check | follow-up | recorded |
+| EC-1 | Lesson-proposal GET/POST lacks timeout (absorbed main code) | follow-up | main's board-client.ts; not SLIM scope |
+| EC-2 | POST error-body read can stall (absorbed main code) | follow-up | main's board-client.ts; not SLIM scope |
+| EC-3 | `railChips` and `sectionsFor` use different `Date.now()` samples (absorbed main code) | follow-up | main's board-rail.ts; not SLIM scope |
+| EC-4 | `bucketSnapshot` dead export after main's refactor (absorbed main code, deletion) | follow-up | main's board-bands.ts; not SLIM scope |
+| EC-5 | Spec scope-union arithmetic: 7 vs 9+1 | record | corrected in this commit |
+| VG-1 | Unit baseline fail-before record stale at the final head (fold changed overlay bytes; failure-kind composition mixed) | medium | baselines re-run at `e740d96` (runs `79200bd6`, `5a97c980`) and composition disclosed in the handoff: 23 assertion-level slim feature-absence failures + absorbed-main import errors (expected at the overlay boundary); failure-kind assertion remains deferred |
+| VG-2 | Smoke wake content presence-only at the mock boundary | follow-up | recorded |
+
+Exact-head receipts at `e740d96` (all through the authenticated scheduler + shipped capture helper; complete sinks under `_bmad-output/verify-captures/current-main-20261007/`):
+- `dashboard-slim-strip-unit` GREEN 142/142 (run `db137674-9456-45d6-8533-2affb477d1dd`)
+- `strip-browser` GREEN 67/67 (run `f0ef8869-e700-4382-a6d3-d0056cba3f47`) — screenshots inspected
+- `strip-smoke` GREEN (run `36b79ea1-69d4-4c25-b848-069cf7d99f59`)
+- `strip-themes` GREEN (run `a9ac6aae-7323-4c91-91cd-d66287a9ea7f`)
+- `dashboard-slim-strip-baseline` RED exit 1 (run `79200bd6-5d8b-4fe6-ac8d-208dbe4bf8bd`)
+- `strip-browser-baseline` RED exit 1 (run `5a97c980-3434-4475-8918-3c034f4f3ac3`)
+- `typecheck` GREEN (run `053e118d-07db-480b-9f0f-c91fc17001ca`)
+- `pipeline-board-browser` GREEN 15/15 STRICT (run `1546061b-0412-4cbd-be25-49d0f7cf5f8c`)
+- `megaminions-browser` GREEN (run `f1482ba1-0d82-4fe2-a56e-7d8738c03d31`)
+- `full` GREEN (run `a52e12a8-beca-4574-9b25-8865aa9969c4`)
+
+Exact-head CI: **structurally blocked** — GitHub suppresses `pull_request` runs for conflicted PRs (SLIM replaces code main also carries in `board.ts`/`components.css`). Recorded as the owner-held merge-time resolution. Native Perkins: queued (`request_seq 57658`, route `queued`); arms after delivery.
+
 
 ### Round 7 (corrective whole-change pass, owner A / j-1307) — findings and resolution
 
