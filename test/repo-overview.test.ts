@@ -1417,9 +1417,10 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
     };
     h.api.countOpenPulls = async (input) => {
       const result = await originalPulls(input);
-      // ...then let that call finish just PAST the deadline, 100 ms after
-      // the last search: the next search enters with a crossed deadline
-      // AND would be pacing-eligible (elapsed < 2 s).
+      // ...then let that call finish just PAST the deadline: the next
+      // search enters with a crossed deadline AND is pacing-eligible
+      // (600 ms after the previous search's issue, so a post-wait-only
+      // build would sleep the remaining ~1.4 s).
       if (input.repo.repo === 'beta') h.clock.ms = start + REPO_OVERVIEW_FETCH_BUDGET_MS + 100;
       return result;
     };
@@ -1432,8 +1433,8 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
       'countOpenPulls:acme/beta',
     ]);
     // Exactly one pacing wait happened — alpha's second search. A build
-    // that only checks the deadline after pacing would add a ~1.9 s wait
-    // for beta's refused call (elapsed 100 ms).
+    // that only checks the deadline after pacing would add a ~1.4 s wait
+    // for beta's refused call (elapsed 600 ms).
     expect(h.sleeps.length).toBe(1);
     expect(h.failure).toContain('fetch wall-clock budget');
   });

@@ -614,7 +614,7 @@ binned-baseline = 'set -e; base=84aec28b04ddc406f26c458383452318f8cb7ed1; headre
 # protocol/pure/DOM suites, invoked only via the authenticated /api/verify
 # scheduler at the project's documented budgets (fast files on the root
 # config), approved RPC patch first, exits never masked.
-repo-overview-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/repo-overview.test.ts test/board-engine.test.ts test/board-engine-v4.test.ts test/board-server.test.ts test/suite-shape.test.ts && cd web && ../node_modules/.bin/vitest run src/lib/repo-overview.test.ts src/lib/board-protocol.test.ts src/ui/repo-overview.test.ts src/ui/board.test.ts src/ui/board-merged-attention.test.ts src/ui/owner-chime.test.ts"
+repo-overview-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/repo-overview.test.ts test/board-engine.test.ts test/board-engine-v4.test.ts test/board-server.test.ts test/board-frames.test.ts test/github-poll.test.ts test/suite-shape.test.ts && cd web && ../node_modules/.bin/vitest run src/lib/repo-overview.test.ts src/lib/board-protocol.test.ts src/ui/repo-overview.test.ts src/ui/board.test.ts src/ui/board-merged-attention.test.ts src/ui/owner-chime.test.ts"
 
 # Static product checks for the same change: lint, compiler, full build
 # (the pinned Perkins resource verifier included) and the web compiler; no
