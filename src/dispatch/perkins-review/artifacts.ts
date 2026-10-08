@@ -3,8 +3,8 @@ import { readFile as readFileAsync } from 'node:fs/promises';
 import { promisify } from 'node:util';
 
 const execFileAsPromised = promisify(execFileCallback);
-import { createHash, randomUUID } from 'node:crypto';
-import { closeSync, existsSync, fstatSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, rmSync, unlinkSync, writeFileSync, constants } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { closeSync, existsSync, fstatSync, linkSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, realpathSync, rmSync, unlinkSync, writeFileSync, constants } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { BranchIdleTag } from '../branch-idle.js';
@@ -169,8 +169,11 @@ function gitFailure(error: unknown): { readonly code: number | null; readonly st
 /** `git check-ref-format --branch <name>` refused THIS NAME — git's own
  * complete invalid-name diagnostic for exactly this spelling (exit 128, C
  * locale). Any other failure — an unreadable repository also exits 128, and
- * its path may even contain those words — is operational. */
+ * its path may even contain those words — is operational; so is a
+ * diagnostic cut at its bound (R7-2): the lost tail could be the
+ * operational part. */
 export function refusedBranchName(error: unknown, name: string): boolean {
+  if ((error as { stderrTruncated?: unknown } | null)?.stderrTruncated === true) return false;
   const { code, stderr } = gitFailure(error);
   // The WHOLE diagnostic, with at most its terminal newline: a refusal line
   // embedded in a longer (operational) diagnostic proves nothing.
@@ -185,169 +188,386 @@ export function refusedRefFormat(error: unknown): boolean {
 
 /** Ceiling on what one probe step may print (a ref listing, a name). */
 const PROBE_MAX_OUTPUT_BYTES = 1024 * 1024;
+/** Diagnostics kept per step; anything longer is marked truncated. */
+const STDERR_MAX_BYTES = 64 * 1024;
 
-/** After git exits, how long its output may take to reach a natural end
- * (a same-group child finishing its write). Output still held open after
- * this is incomplete — refused, never accepted. */
+/** After git exits, how long a LIVE member of its own process group may
+ * take to finish the output (a same-group helper still writing). */
 const INCOMPLETE_GRACE_MS = 500;
+/** Once the owned group has no live member, output already buffered in the
+ * pipe is read within a few event-loop turns. The pipes must reach EOF in
+ * these turns; otherwise something outside the group holds — and could
+ * still write — the output (R7-3): the answer is incomplete. */
+const DRAIN_TURNS = 10;
 /** After a SIGKILL, how long cessation of the whole group may take before
  * the step is refused as "cleanup unconfirmed" (owner decision 2026-10-07,
  * R6-5: bounded refusal — never an unbounded wait). */
 const KILL_SETTLE_MS = 1_000;
 
-/** Is any process of this group still alive? */
-function groupAlive(pgid: number): boolean {
+/** The state of every member of process group `pgid`, or null when it
+ * cannot be established. */
+function groupMemberStates(pgid: number): { readonly pid: number; readonly state: string }[] | null {
+  const members: { pid: number; state: string }[] = [];
+  if (process.platform === 'linux') {
+    let entries: string[];
+    try {
+      entries = readdirSync('/proc');
+    } catch {
+      return null;
+    }
+    for (const entry of entries) {
+      if (!/^\d+$/u.test(entry)) continue;
+      let stat: string;
+      try {
+        stat = readFileSync(`/proc/${entry}/stat`, 'utf8');
+      } catch {
+        continue; // ended while listing
+      }
+      const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+      if (Number(fields[2]) === pgid) members.push({ pid: Number(entry), state: fields[0] ?? '' });
+    }
+    return members;
+  }
+  const listed = spawnSync('/bin/ps', ['-A', '-o', 'pid=,pgid=,stat='], { encoding: 'utf8', timeout: 5_000 });
+  if (listed.status !== 0 || typeof listed.stdout !== 'string') return null;
+  for (const line of listed.stdout.split('\n')) {
+    const [pid, group, state] = line.trim().split(/\s+/u);
+    if (Number(group) === pgid) members.push({ pid: Number(pid), state: state ?? '' });
+  }
+  return members;
+}
+
+/** Is a member of group `pgid` (other than `exclude`) still EXECUTING — not
+ * merely a zombie awaiting its reaper (R7-9)? When membership cannot be
+ * established the answer is yes: cleanup is never assumed. */
+export function groupHasLiveMember(pgid: number, exclude?: number): boolean {
+  if (!Number.isSafeInteger(pgid) || pgid <= 0) return false;
   try {
     process.kill(-pgid, 0);
-    return true;
   } catch (error) {
-    return (error as NodeJS.ErrnoException).code === 'EPERM';
+    if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false;
+    return true; // EPERM: a member exists that is not ours to signal
+  }
+  const members = groupMemberStates(pgid);
+  if (members === null) return true;
+  return members.some((member) => member.pid !== exclude && !/^[ZX]/u.test(member.state));
+}
+
+
+/** A process's start time (null when it does not exist): with its pid, an
+ * identity a recycled pid cannot share. */
+function processStartTime(pid: number): string | null {
+  if (process.platform === 'linux') {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+      return stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19] ?? null;
+    } catch {
+      return null;
+    }
+  }
+  const listed = spawnSync('/bin/ps', ['-o', 'lstart=', '-p', String(pid)], { encoding: 'utf8', timeout: 5_000 });
+  return listed.status === 0 && typeof listed.stdout === 'string' && listed.stdout.trim() !== '' ? listed.stdout.trim() : null;
+}
+
+/** A process group a killed git step left running (owner decision
+ * 2026-10-07, R6-5; R7-8): until it is proven gone, no further git step
+ * runs in its repository. The caller persists these across restarts. */
+export interface UnstoppedGroup {
+  readonly pgid: number;
+  /** The repository's shared git directory: every worktree of it is the
+   * same scope (see repoScope). */
+  readonly scope: string;
+  /** Start time of the group's leader when recorded (null: already gone).
+   * A different leader under the same id is a recycled group, not ours. */
+  readonly leaderStart: string | null;
+}
+
+const unstoppedGroups = new Map<number, UnstoppedGroup>();
+
+/** Test seams (R6-5/R7-8): how a group's liveness is read — production
+ * always uses groupHasLiveMember; a test can stand in an unkillable group —
+ * and forgetting the in-memory registry, as a fresh process would. */
+export const OWNED_GIT_SEAMS: {
+  groupHasLiveMember: (pgid: number, exclude?: number) => boolean;
+  forgetUnstoppedGroups: () => void;
+} = { groupHasLiveMember, forgetUnstoppedGroups: () => unstoppedGroups.clear() };
+
+/** The repository a path belongs to, as its shared (common) git directory
+ * — read from the filesystem, never by running git: a review worktree, the
+ * job lane and the clone itself are one scope. */
+export function repoScope(repoPath: string): string {
+  try {
+    const dotGit = join(repoPath, '.git');
+    if (lstatSync(dotGit).isDirectory()) return realpathSync(dotGit);
+    const pointer = /^gitdir:\s*(.+)$/mu.exec(readFileSync(dotGit, 'utf8'));
+    if (pointer !== null) {
+      const gitdir = resolve(repoPath, pointer[1]!.trim());
+      const common = join(gitdir, 'commondir');
+      return realpathSync(existsSync(common) ? resolve(gitdir, readFileSync(common, 'utf8').trim()) : gitdir);
+    }
+  } catch {
+    /* not a readable checkout: the path is its own scope */
+  }
+  return resolve(repoPath);
+}
+
+function recordUnstopped(pgid: number, repoPath: string): UnstoppedGroup {
+  const group: UnstoppedGroup = { pgid, scope: repoScope(repoPath), leaderStart: processStartTime(pgid) };
+  unstoppedGroups.set(pgid, group);
+  return group;
+}
+
+/** Take over groups recorded before a restart: one whose leader id now
+ * belongs to a different process, or with no live member, is dropped. */
+export function adoptUnstoppedGroups(groups: readonly UnstoppedGroup[]): void {
+  for (const group of groups) {
+    if (!Number.isSafeInteger(group.pgid) || group.pgid <= 0 || typeof group.scope !== 'string') continue;
+    if (group.leaderStart !== null) {
+      const leader = processStartTime(group.pgid);
+      if (leader !== null && leader !== group.leaderStart) continue;
+    }
+    if (OWNED_GIT_SEAMS.groupHasLiveMember(group.pgid)) unstoppedGroups.set(group.pgid, group);
   }
 }
 
+/** The repository's recorded groups that are still running (any worktree
+ * of it); the ones now proven gone are forgotten. */
+export function unstoppedGroupsIn(repoPath: string): UnstoppedGroup[] {
+  const scope = repoScope(repoPath);
+  const live: UnstoppedGroup[] = [];
+  for (const group of [...unstoppedGroups.values()]) {
+    if (group.scope !== scope) continue;
+    if (OWNED_GIT_SEAMS.groupHasLiveMember(group.pgid)) live.push(group);
+    else unstoppedGroups.delete(group.pgid);
+  }
+  return live;
+}
+
 /** A git step that was killed but whose group would not stop within
- * KILL_SETTLE_MS: refused, and nothing may retry while it might live. */
-function cleanupUnconfirmed(command: string, reason: Error): Error {
-  return Object.assign(new Error(`${command} did not stop after SIGKILL — cleanup unconfirmed (${reason.message})`), {
-    cleanupUnconfirmed: true,
-  });
+ * KILL_SETTLE_MS — or one never started because an earlier one has not
+ * stopped: refused, and nothing may retry while it might live. */
+function cleanupUnconfirmed(message: string, groups: readonly UnstoppedGroup[]): Error {
+  // The verdict leads: refusal details are cut to a bounded length.
+  return Object.assign(new Error(`cleanup unconfirmed: ${message}`), { cleanupUnconfirmed: true, unstoppedGroups: groups });
+}
+
+/** Refuse to start a step while an earlier one in this repository may
+ * still be running (R7-8). */
+function blockedByUnstopped(command: string, repoPath: string): Error | null {
+  const groups = unstoppedGroupsIn(repoPath);
+  if (groups.length === 0) return null;
+  return cleanupUnconfirmed(
+    `${command} was not started: an earlier git step in this repository (process group ${groups.map((group) => group.pgid).join(', ')}) has not stopped`,
+    groups,
+  );
 }
 
 /** One read-only git step in its OWN process group. Its output counts only
- * when it ends naturally: git exits and both pipes reach EOF within
- * INCOMPLETE_GRACE_MS — then the group is killed (anything that let go of
- * the output). At its time bound, on overflow, or when the output is still
- * held after that grace, the group is SIGKILLed and the step fails; the
- * failure settles once the whole group has stopped, or after
- * KILL_SETTLE_MS as "cleanup unconfirmed" — never an unbounded wait.
- * Contract (owner decision 2026-10-07, R5-4): cleanup covers the step's
- * process group; a helper that deliberately detaches into its own session
- * (ssh ControlPersist, a daemon) is outside it and left alone — and if it
- * holds the step's output open, the answer is refused as incomplete.
- * Diagnostics are in the C locale. Rejections carry the numeric exit `code`
- * and `stderr`; a timeout, kill, spawn failure or incomplete answer has no
- * numeric code. */
+ * when it ends naturally: git exits and both pipes reach EOF — a live
+ * member of the group may finish writing within INCOMPLETE_GRACE_MS, and
+ * once the group is gone only output already buffered may arrive (R7-3).
+ * At its time bound, on overflow, or when the output is still held, the
+ * group is SIGKILLed and the step fails. EVERY outcome (R7-5) settles only
+ * once the whole group has stopped — or, after KILL_SETTLE_MS, as "cleanup
+ * unconfirmed", recorded so no later step runs in the repository while it
+ * might live (R7-8). Contract (owner decision 2026-10-07, R5-4): cleanup
+ * covers the step's process group; a helper that deliberately detaches into
+ * its own session is outside it and left alone — and if it holds the
+ * output, the answer is refused as incomplete. Diagnostics are in the C
+ * locale. Rejections carry the numeric exit `code`, `stderr` (with
+ * `stderrTruncated` when cut), and `ownedStopped` — proof the step's group
+ * stopped; a timeout, kill, spawn failure or incomplete answer has no code. */
 export function runOwnedGit(repoPath: string, args: readonly string[], timeoutMs: number): Promise<string> {
+  const command = `git ${args.join(' ')}`;
+  const blocked = blockedByUnstopped(command, repoPath);
+  if (blocked !== null) return Promise.reject(blocked);
   return new Promise<string>((resolve, reject) => {
-    const command = `git ${args.join(' ')}`;
     const child = spawn('git', ['-C', repoPath, ...args], {
       detached: true,
       stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...process.env, LC_ALL: 'C' },
     });
-    const pid = child.pid;
+    // R7-1: only a real process id names a group; 0 or absent never does.
+    const pid = child.pid !== undefined && Number.isSafeInteger(child.pid) && child.pid > 0 ? child.pid : null;
     const out: Buffer[] = [];
     const err: Buffer[] = [];
     let outBytes = 0;
     let errBytes = 0;
     let failing = false;
     let settled = false;
-    let grace: ReturnType<typeof setTimeout> | null = null;
+    let closed = false;
+    const timers = new Set<ReturnType<typeof setTimeout>>();
+    const later = (task: () => void, ms: number): void => {
+      const timer = setTimeout(() => {
+        timers.delete(timer);
+        task();
+      }, ms);
+      timers.add(timer);
+    };
     const killGroup = (): void => {
-      if (pid === undefined) return;
+      if (pid === null) return;
       try {
         process.kill(-pid, 'SIGKILL');
       } catch {
         /* the group is already gone */
       }
     };
-    const settle = (outcome: () => void): void => {
+    const finish = (outcome: () => void): void => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
-      if (grace !== null) clearTimeout(grace);
+      for (const timer of timers) clearTimeout(timer);
+      timers.clear();
       outcome();
     };
-    /** Kill the group, then fail with `reason` once it has stopped — or as
-     * cleanup-unconfirmed when it will not within KILL_SETTLE_MS. */
-    const failAfterKill = (reason: Error): void => {
-      if (failing || settled) return;
-      failing = true;
+    /** Kill the group, then settle once it has stopped — or as
+     * cleanup-unconfirmed (recorded) after KILL_SETTLE_MS. */
+    const settleStopped = (outcome: () => void, reason: string): void => {
       killGroup();
-      child.stdout.destroy();
-      child.stderr.destroy();
       const until = performance.now() + KILL_SETTLE_MS;
       const check = (): void => {
-        if (pid === undefined || !groupAlive(pid)) return settle(() => reject(reason));
-        if (performance.now() >= until) return settle(() => reject(cleanupUnconfirmed(command, reason)));
+        if (settled) return;
+        if (pid === null || !OWNED_GIT_SEAMS.groupHasLiveMember(pid)) return finish(outcome);
+        if (performance.now() >= until) {
+          return finish(() => reject(cleanupUnconfirmed(`${command} did not stop after SIGKILL (${reason})`, [recordUnstopped(pid, repoPath)])));
+        }
         killGroup();
-        setTimeout(check, 25);
+        later(check, 25);
       };
       check();
     };
-    const timer = setTimeout(
-      () => failAfterKill(Object.assign(new Error(`${command} timed out after ${timeoutMs} ms`), { killed: true })),
-      timeoutMs,
-    );
+    const fail = (reason: Error): void => {
+      if (failing || settled) return;
+      failing = true;
+      // Never wait on an outsider's EOF — and never kill it to make one.
+      child.stdout.destroy();
+      child.stderr.destroy();
+      settleStopped(() => reject(Object.assign(reason, { ownedStopped: true })), reason.message);
+    };
+    const incomplete = (): void => fail(new Error(`${command} exited, but its output was still held open — the answer is incomplete`));
+    later(() => fail(Object.assign(new Error(`${command} timed out after ${timeoutMs} ms`), { killed: true })), timeoutMs);
     child.stdout.on('data', (chunk: Buffer) => {
       outBytes += chunk.length;
-      if (outBytes > PROBE_MAX_OUTPUT_BYTES) failAfterKill(new Error(`${command} printed more than ${PROBE_MAX_OUTPUT_BYTES} bytes`));
+      if (outBytes > PROBE_MAX_OUTPUT_BYTES) fail(new Error(`${command} printed more than ${PROBE_MAX_OUTPUT_BYTES} bytes`));
       else out.push(chunk);
     });
     child.stderr.on('data', (chunk: Buffer) => {
       errBytes += chunk.length;
-      if (errBytes <= 64 * 1024) err.push(chunk);
+      if (errBytes <= STDERR_MAX_BYTES) err.push(chunk);
     });
-    child.on('error', (error) => {
-      if (failing) return;
-      settle(() => {
-        killGroup();
-        reject(error);
-      });
-    });
+    child.on('error', (error) => fail(error));
     child.on('exit', () => {
-      if (failing || settled) return;
-      // Not killed yet: a same-group child may still be finishing the
-      // answer. Only output still held after the grace is incomplete.
-      grace = setTimeout(
-        () => failAfterKill(new Error(`${command} exited, but its output was still held open — the answer is incomplete`)),
-        INCOMPLETE_GRACE_MS,
-      );
+      if (failing || settled || closed) return;
+      const graceUntil = performance.now() + INCOMPLETE_GRACE_MS;
+      const drain = (turns: number, then: () => void): void => {
+        if (failing || settled || closed) return;
+        if (turns === 0) return then();
+        setImmediate(() => drain(turns - 1, then));
+      };
+      // Output still open after the buffered drain: only a LIVE member of
+      // the owned group may still finish it; decided synchronously, so no
+      // outsider can close the pipe while the liveness check runs (R7-3).
+      const ownedWriterOnly = (): void => {
+        if (failing || settled || closed) return;
+        if (pid === null || !OWNED_GIT_SEAMS.groupHasLiveMember(pid)) return incomplete();
+        const poll = (): void => {
+          if (failing || settled || closed) return;
+          if (OWNED_GIT_SEAMS.groupHasLiveMember(pid)) {
+            if (performance.now() >= graceUntil) return incomplete();
+            return later(poll, 25);
+          }
+          drain(DRAIN_TURNS, incomplete); // the owned writer is done: its buffered output, then EOF
+        };
+        later(poll, 25);
+      };
+      drain(DRAIN_TURNS, ownedWriterOnly);
     });
     child.on('close', (code, signal) => {
-      if (failing) return; // a failure already owns the outcome
-      settle(() => {
-        killGroup(); // whatever let go of the output does not outlive the step
-        const stderr = Buffer.concat(err).toString('utf8');
-        if (code === 0) return resolve(Buffer.concat(out).toString('utf8'));
-        reject(Object.assign(new Error(stderr.trim() || `${command} exited ${code ?? signal}`), {
+      closed = true;
+      if (failing || settled) return;
+      const stderr = Buffer.concat(err).toString('utf8');
+      const outcome = code === 0
+        ? () => resolve(Buffer.concat(out).toString('utf8'))
+        : () => reject(Object.assign(new Error(stderr.trim() || `${command} exited ${code ?? signal}`), {
           ...(code !== null ? { code } : {}),
           signal,
           stderr,
+          ...(errBytes > STDERR_MAX_BYTES ? { stderrTruncated: true } : {}),
+          ownedStopped: true,
         }));
-      });
+      settleStopped(outcome, `exit ${code ?? signal}`);
     });
   });
 }
 
-/** The SYNCHRONOUS movement probe's runner. spawnSync starts it detached, so
- * it leads its own process group and git (spawned normally) joins that
- * group. It applies the same rules as runOwnedGit — natural end within the
- * grace, time bound, output bound — writes its outcome to a result file,
- * then SIGKILLs its whole group, itself included. Its stdio is ignored, so
- * nothing git spawned can hold the caller's pipes. */
+/** The SYNCHRONOUS probe's runner. spawnSync starts it detached, so it leads
+ * its own process group and git (spawned normally) joins that group. It
+ * applies runOwnedGit's rules — natural end, a live same-group writer's
+ * grace, the buffered-output drain, time and output bounds — writes its
+ * outcome to a private result file, then SIGKILLs its whole group, itself
+ * included. Its stdio is ignored, so nothing git spawned can hold the
+ * caller's pipes. */
 const OWNED_GROUP_RUNNER = `
-const { spawn } = require('node:child_process');
-const { writeFileSync } = require('node:fs');
-const [resultFile, limit, maxBytes, grace, file, ...args] = process.argv.slice(1);
-try { process.kill(-process.pid, 0); } catch {
-  writeFileSync(resultFile, JSON.stringify({ outcome: 'spawn-error', message: 'the probe runner does not lead its own process group' }));
+const { spawn, spawnSync } = require('node:child_process');
+const { readdirSync, readFileSync, writeFileSync } = require('node:fs');
+const [resultFile, limit, maxBytes, maxErrBytes, grace, drainTurns, file, ...args] = process.argv.slice(1);
+const self = process.pid;
+try { process.kill(-self, 0); } catch {
+  writeFileSync(resultFile, JSON.stringify({ outcome: 'spawn-error', message: 'the probe runner does not lead its own process group' }), { mode: 0o600 });
   process.exit(127);
 }
+const othersLive = () => {
+  const members = [];
+  if (process.platform === 'linux') {
+    let entries;
+    try { entries = readdirSync('/proc'); } catch { return true; }
+    for (const entry of entries) {
+      if (!/^\\d+$/.test(entry)) continue;
+      let stat;
+      try { stat = readFileSync('/proc/' + entry + '/stat', 'utf8'); } catch { continue; }
+      const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+      if (Number(fields[2]) === self) members.push({ pid: Number(entry), state: fields[0] || '' });
+    }
+  } else {
+    const listed = spawnSync('/bin/ps', ['-A', '-o', 'pid=,pgid=,stat='], { encoding: 'utf8', timeout: 5000 });
+    if (listed.status !== 0 || typeof listed.stdout !== 'string') return true;
+    for (const line of listed.stdout.split('\\n')) {
+      const [pid, group, state] = line.trim().split(/\\s+/);
+      // ps itself runs in this group: it is not a writer.
+      if (Number(group) === self && Number(pid) !== listed.pid) members.push({ pid: Number(pid), state: state || '' });
+    }
+  }
+  return members.some((member) => member.pid !== self && !/^[ZX]/.test(member.state));
+};
 const child = spawn(file, args, { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, LC_ALL: 'C' } });
-const out = []; const err = []; let outBytes = 0; let errBytes = 0; let done = false;
+const out = []; const err = []; let outBytes = 0; let errBytes = 0; let done = false; let closed = false;
 const report = (result) => {
   if (done) return; done = true;
-  try { writeFileSync(resultFile, JSON.stringify({ ...result, stderr: Buffer.concat(err).toString('utf8') })); } catch {}
-  try { process.kill(-process.pid, 'SIGKILL'); } catch {}
+  const stderr = Buffer.concat(err).toString('utf8');
+  try { writeFileSync(resultFile, JSON.stringify({ ...result, stderr, stderrTruncated: errBytes > Number(maxErrBytes) }), { mode: 0o600 }); } catch {}
+  try { process.kill(-self, 'SIGKILL'); } catch {}
   process.exit(125);
 };
 setTimeout(() => report({ outcome: 'timeout' }), Number(limit));
 child.stdout.on('data', (chunk) => { outBytes += chunk.length; if (outBytes > Number(maxBytes)) report({ outcome: 'overflow' }); else out.push(chunk); });
-child.stderr.on('data', (chunk) => { errBytes += chunk.length; if (errBytes <= 65536) err.push(chunk); });
+child.stderr.on('data', (chunk) => { errBytes += chunk.length; if (errBytes <= Number(maxErrBytes)) err.push(chunk); });
 child.on('error', (error) => report({ outcome: 'spawn-error', message: String(error) }));
-child.on('exit', () => setTimeout(() => report({ outcome: 'incomplete' }), Number(grace)));
-child.on('close', (code, signal) => report({ outcome: code === 0 ? 'ok' : 'failed', code, signal, stdout: code === 0 ? Buffer.concat(out).toString('utf8') : '' }));
+child.on('exit', () => {
+  const until = performance.now() + Number(grace);
+  const incomplete = () => report({ outcome: 'incomplete' });
+  const drain = (turns, then) => { if (done || closed) return; if (turns === 0) return then(); setImmediate(() => drain(turns - 1, then)); };
+  const ownedWriterOnly = () => {
+    if (done || closed) return;
+    if (!othersLive()) return incomplete();
+    const poll = () => {
+      if (done || closed) return;
+      if (othersLive()) { if (performance.now() >= until) return incomplete(); return setTimeout(poll, 25); }
+      drain(Number(drainTurns), incomplete);
+    };
+    setTimeout(poll, 25);
+  };
+  drain(Number(drainTurns), ownedWriterOnly);
+});
+child.on('close', (code, signal) => { closed = true; report({ outcome: code === 0 ? 'ok' : 'failed', code, signal, stdout: code === 0 ? Buffer.concat(out).toString('utf8') : '' }); });
 `;
 
 /** Block for `ms` without spinning (the sync probe's bounded settle). */
@@ -359,73 +579,93 @@ function sleepSync(ms: number): void {
  * OWNED_GROUP_RUNNER). Whatever happened — success, failure, the runner
  * cut off by the outer guard — the runner's group (git and everything it
  * spawned) is SIGKILLed here, and must stop within KILL_SETTLE_MS or the
- * step is refused as cleanup-unconfirmed. */
+ * step is refused as cleanup-unconfirmed (and recorded, R7-8). The
+ * runner's report can carry raw diagnostics, so it lives in a private 0700
+ * directory as a 0600 file, removed afterwards (R7-4). */
 export function runOwnedGitSync(
   repoPath: string,
   args: readonly string[],
   timeoutMs: number,
   outerTimeoutMs = timeoutMs + INCOMPLETE_GRACE_MS + 5_000,
+  maxBytes = PROBE_MAX_OUTPUT_BYTES,
 ): string {
   const command = `git ${args.join(' ')}`;
-  const resultFile = join(tmpdir(), `gru-probe-${randomUUID()}.json`);
-  // `detached` makes the runner lead its own process group. Node honors it
-  // for spawnSync (libuv UV_PROCESS_DETACHED) although its type definitions
-  // omit it; the runner refuses to run git if it does not lead a group.
-  const options: SpawnSyncOptions & { readonly detached: boolean } = {
-    detached: true,
-    stdio: 'ignore',
-    timeout: outerTimeoutMs,
-    killSignal: 'SIGKILL',
-  };
-  const result = spawnSync(
-    process.execPath,
-    ['-e', OWNED_GROUP_RUNNER, resultFile, String(timeoutMs), String(PROBE_MAX_OUTPUT_BYTES), String(INCOMPLETE_GRACE_MS), 'git', '-C', repoPath, ...args],
-    options,
-  );
-  type RunnerReport = { outcome?: unknown; code?: unknown; signal?: unknown; stdout?: unknown; stderr?: unknown; message?: unknown };
-  const readReport = (): RunnerReport | null => {
+  const blocked = blockedByUnstopped(command, repoPath);
+  if (blocked !== null) throw blocked;
+  const privateDir = mkdtempSync(join(tmpdir(), 'gru-probe-'));
+  const resultFile = join(privateDir, 'result.json');
+  try {
+    // `detached` makes the runner lead its own process group. Node honors
+    // it for spawnSync (libuv UV_PROCESS_DETACHED) although its type
+    // definitions omit it; the runner refuses to run git if it does not
+    // lead a group.
+    const options: SpawnSyncOptions & { readonly detached: boolean } = {
+      detached: true,
+      stdio: 'ignore',
+      timeout: outerTimeoutMs,
+      killSignal: 'SIGKILL',
+    };
+    const result = spawnSync(
+      process.execPath,
+      ['-e', OWNED_GROUP_RUNNER, resultFile, String(timeoutMs), String(maxBytes), String(STDERR_MAX_BYTES),
+        String(INCOMPLETE_GRACE_MS), String(DRAIN_TURNS), 'git', '-C', repoPath, ...args],
+      options,
+    );
+    type RunnerReport = {
+      outcome?: unknown; code?: unknown; signal?: unknown; stdout?: unknown; stderr?: unknown; stderrTruncated?: unknown; message?: unknown;
+    };
+    let report: RunnerReport | null = null;
     try {
-      return JSON.parse(readFileSync(resultFile, 'utf8')) as RunnerReport;
+      report = JSON.parse(readFileSync(resultFile, 'utf8')) as RunnerReport;
     } catch {
-      return null;
-    } finally {
-      rmSync(resultFile, { force: true });
+      report = null;
     }
-  };
-  const report = readReport();
-  if (result.pid !== undefined) {
-    const until = performance.now() + KILL_SETTLE_MS;
-    for (;;) {
-      try {
-        process.kill(-result.pid, 'SIGKILL');
-      } catch {
-        /* the group is already gone */
+    // R7-1: a failed spawn reports pid 0 — never a group to signal.
+    const pid = typeof result.pid === 'number' && Number.isSafeInteger(result.pid) && result.pid > 0 ? result.pid : null;
+    if (pid !== null) {
+      const until = performance.now() + KILL_SETTLE_MS;
+      for (;;) {
+        try {
+          process.kill(-pid, 'SIGKILL');
+        } catch {
+          /* the group is already gone */
+        }
+        if (!OWNED_GIT_SEAMS.groupHasLiveMember(pid)) break;
+        if (performance.now() >= until) {
+          throw cleanupUnconfirmed(`${command} did not stop after SIGKILL (${String(report?.outcome ?? 'runner ended')})`, [recordUnstopped(pid, repoPath)]);
+        }
+        sleepSync(25);
       }
-      if (!groupAlive(result.pid)) break;
-      if (performance.now() >= until) throw cleanupUnconfirmed(command, new Error(String(report?.outcome ?? 'runner ended')));
-      sleepSync(25);
     }
-  }
-  if (report === null) {
-    throw new Error(`${command}: the probe runner ended without a result${result.error !== undefined ? ` (${result.error.message})` : ''}`);
-  }
-  const stderr = typeof report.stderr === 'string' ? report.stderr : '';
-  switch (report.outcome) {
-    case 'ok':
-      return typeof report.stdout === 'string' ? report.stdout : '';
-    case 'failed':
-      throw Object.assign(new Error(stderr.trim() || `${command} exited ${String(report.code ?? report.signal)}`), {
-        status: typeof report.code === 'number' ? report.code : null,
-        stderr,
-      });
-    case 'timeout':
-      throw Object.assign(new Error(`${command} timed out after ${timeoutMs} ms`), { killed: true });
-    case 'overflow':
-      throw new Error(`${command} printed more than ${PROBE_MAX_OUTPUT_BYTES} bytes`);
-    case 'incomplete':
-      throw new Error(`${command} exited, but its output was still held open — the answer is incomplete`);
-    default:
-      throw new Error(`${command}: ${typeof report.message === 'string' ? report.message : 'the probe runner failed'}`);
+    const stopped = { ownedStopped: true };
+    if (report === null) {
+      throw Object.assign(new Error(
+        `${command}: the probe runner ${pid === null ? 'could not be started' : 'ended without a result'}` +
+          `${result.error !== undefined ? ` (${result.error.message})` : ''}`,
+      ), stopped);
+    }
+    const stderr = typeof report.stderr === 'string' ? report.stderr : '';
+    switch (report.outcome) {
+      case 'ok':
+        return typeof report.stdout === 'string' ? report.stdout : '';
+      case 'failed':
+        throw Object.assign(new Error(stderr.trim() || `${command} exited ${String(report.code ?? report.signal)}`), {
+          status: typeof report.code === 'number' ? report.code : null,
+          stderr,
+          ...(report.stderrTruncated === true ? { stderrTruncated: true } : {}),
+          ...stopped,
+        });
+      case 'timeout':
+        throw Object.assign(new Error(`${command} timed out after ${timeoutMs} ms`), { killed: true, ...stopped });
+      case 'overflow':
+        throw Object.assign(new Error(`${command} printed more than ${maxBytes} bytes`), stopped);
+      case 'incomplete':
+        throw Object.assign(new Error(`${command} exited, but its output was still held open — the answer is incomplete`), stopped);
+      default:
+        throw Object.assign(new Error(`${command}: ${typeof report.message === 'string' ? report.message : 'the probe runner failed'}`), stopped);
+    }
+  } finally {
+    rmSync(privateDir, { recursive: true, force: true });
   }
 }
 
@@ -433,9 +673,17 @@ function git(repoPath: string, args: readonly string[], timeoutMs = 30_000): str
   return gitRaw(repoPath, args, timeoutMs).trimEnd();
 }
 
-export function resolveGitCommit(repoPath: string, ref: string): string {
+/** One synchronous git step of a movement check: plain (execFileSync), or
+ * owned (R7-7) — its whole process group proven stopped, so a failure can
+ * carry that proof. Diagnostics in the C locale either way. */
+type MovementGit = (repoPath: string, args: readonly string[]) => string;
+const plainMovementGit: MovementGit = (repoPath, args) => gitRaw(repoPath, args, 30_000, 'SIGTERM', true);
+const ownedMovementGit: MovementGit = (repoPath, args) => runOwnedGitSync(repoPath, args, 30_000, undefined, GIT_MAX_BUFFER);
+
+export function resolveGitCommit(repoPath: string, ref: string, run?: MovementGit): string {
   if (ref.trim() === '') throw new Error('git ref must be non-empty');
-  return git(repoPath, ['rev-parse', '--verify', `${ref}^{commit}`]);
+  const args = ['rev-parse', '--verify', `${ref}^{commit}`];
+  return (run === undefined ? gitRaw(repoPath, args) : run(repoPath, args)).trimEnd();
 }
 
 /** Resolve an explicit base, otherwise use the repository's real default branch. */
@@ -542,8 +790,9 @@ function assertFrozenTreeHasNoSymlinks(repoPath: string, targetSha: string): voi
   }
 }
 
-function assertReviewCheckoutClean(repoPath: string): void {
-  const status = gitRaw(repoPath, ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=matching']);
+function assertReviewCheckoutClean(repoPath: string, run?: MovementGit): void {
+  const args = ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=matching'];
+  const status = run === undefined ? gitRaw(repoPath, args) : run(repoPath, args);
   if (status !== '') {
     const first = status.split('\0').find(Boolean)?.slice(0, 300) ?? 'unknown checkout mutation';
     throw new Error(`detached review checkout is not pristine (tracked/staged/untracked/ignored content: ${first})`);
@@ -760,13 +1009,32 @@ export interface SourceMovement {
   readonly detail: string;
   /** A killed git step would not stop: nothing may retry while it might live. */
   readonly cleanupUnconfirmed?: true;
+  /** The groups that would not stop (R7-8) — to keep refusing later steps,
+   * across restarts too. */
+  readonly unstoppedGroups?: readonly UnstoppedGroup[];
+  /** Proof the failed step's whole process group stopped (owned execution,
+   * R7-7): only such a failure may be retried. */
+  readonly stopped?: true;
+}
+
+function isUnstopped(error: unknown): boolean {
+  return (error as { cleanupUnconfirmed?: unknown } | null)?.cleanupUnconfirmed === true;
 }
 
 /** A failed probe step as fail-closed movement — carrying, when the step
- * would not stop, that nothing may retry while it might live. */
+ * would not stop, that nothing may retry while it might live, and when it
+ * provably stopped, that proof. */
 function failedCheck(error: unknown): SourceMovement {
   const failed = movement('check-failed', gitErrorDetail(error));
-  return (error as { cleanupUnconfirmed?: unknown } | null)?.cleanupUnconfirmed === true ? { ...failed, cleanupUnconfirmed: true } : failed;
+  const facts = error as { cleanupUnconfirmed?: unknown; unstoppedGroups?: unknown; ownedStopped?: unknown } | null;
+  if (facts?.cleanupUnconfirmed === true) {
+    return {
+      ...failed,
+      cleanupUnconfirmed: true,
+      ...(Array.isArray(facts.unstoppedGroups) ? { unstoppedGroups: facts.unstoppedGroups as UnstoppedGroup[] } : {}),
+    };
+  }
+  return facts?.ownedStopped === true ? { ...failed, stopped: true } : failed;
 }
 
 function movement(cause: SourceMovementCause, detail: string): SourceMovement {
@@ -784,17 +1052,19 @@ function gitErrorDetail(error: unknown): string {
 
 /** Only the local base is read: an advance is valid while the frozen
  * merge-base remains reachable; no remote base tip is consulted or fetched. */
-function baseMovementSinceFreeze(review: FrozenReview): SourceMovement | null {
+function baseMovementSinceFreeze(review: FrozenReview, run: MovementGit): SourceMovement | null {
   const { repoPath, baseRef, baseRefSha, diffBaseSha } = review.manifest;
   let live: string;
   try {
-    live = resolveGitCommit(repoPath, baseRef);
+    live = resolveGitCommit(repoPath, baseRef, run);
   } catch (error) {
+    // An unresolvable base must not hide a step that would not stop.
+    if (isUnstopped(error)) throw error;
     return movement('base-unresolvable', `base ${baseRef} cannot resolve: ${gitErrorDetail(error)}`);
   }
   if (live === baseRefSha) return null;
   try {
-    gitRaw(repoPath, ['merge-base', '--is-ancestor', diffBaseSha, live]);
+    run(repoPath, ['merge-base', '--is-ancestor', diffBaseSha, live]);
     return null;
   } catch (error) {
     if ((error as { status?: unknown } | null)?.status === 1) {
@@ -817,7 +1087,7 @@ function baseMovementSinceFreeze(review: FrozenReview): SourceMovement | null {
  * like origin/v1 resolves to refs/tags/… and never names an advertised
  * branch. Both now correctly skip this check; their pins still bind through
  * the local resolution and pristine-checkout proofs. */
-function advertisedRemoteBranch(repoPath: string, ref: string): { remote: string; branch: string } | null {
+function advertisedRemoteBranch(repoPath: string, ref: string, run: MovementGit): { remote: string; branch: string } | null {
   let remoteRef: string;
   if (ref.startsWith('refs/remotes/')) {
     // gh-169 P9: a fully-qualified spelling is not automatically a tracking
@@ -826,7 +1096,7 @@ function advertisedRemoteBranch(repoPath: string, ref: string): { remote: string
     // short spelling. Validate the ref format before treating the prefix
     // as proof; a genuine tracking ref keeps its advertised-tip check.
     try {
-      gitRaw(repoPath, ['check-ref-format', ref], 30_000, 'SIGTERM', true);
+      run(repoPath, ['check-ref-format', ref]);
     } catch (error) {
       if (refusedRefFormat(error)) return null; // git refused the format: an expression, not a tracking ref
       throw error; // an operational failure proves nothing — fail closed
@@ -839,7 +1109,7 @@ function advertisedRemoteBranch(repoPath: string, ref: string): { remote: string
     // A valid branch spelling only: revision operators (~ ^ : .. @{}) make
     // the ref an EXPRESSION, not the branch itself.
     try {
-      gitRaw(repoPath, ['check-ref-format', '--branch', ref], 30_000, 'SIGTERM', true);
+      run(repoPath, ['check-ref-format', '--branch', ref]);
     } catch (error) {
       if (refusedBranchName(error, ref)) return null; // git refused the name: not a branch spelling
       throw error; // an operational failure proves nothing — fail closed
@@ -848,7 +1118,7 @@ function advertisedRemoteBranch(repoPath: string, ref: string): { remote: string
     // name carries a slash (origin/v1) resolves to refs/tags/origin/v1 and
     // never names an advertised branch. A ref that no longer resolves at
     // all is not "unadvertised": the frozen target vanished — fail closed.
-    const fullName = git(repoPath, ['rev-parse', '--symbolic-full-name', '--verify', ref]);
+    const fullName = run(repoPath, ['rev-parse', '--symbolic-full-name', '--verify', ref]).trimEnd();
     if (!fullName.startsWith('refs/remotes/')) return null;
     remoteRef = fullName.slice('refs/remotes/'.length);
   }
@@ -856,7 +1126,7 @@ function advertisedRemoteBranch(repoPath: string, ref: string): { remote: string
   if (slash <= 0 || slash === remoteRef.length - 1) return null;
   const remote = remoteRef.slice(0, slash);
   const branch = remoteRef.slice(slash + 1);
-  return git(repoPath, ['remote']).split('\n').includes(remote) ? { remote, branch } : null;
+  return run(repoPath, ['remote']).trimEnd().split('\n').includes(remote) ? { remote, branch } : null;
 }
 
 /** Compare the locally resolved base ancestry, movement ref (local and
@@ -875,17 +1145,22 @@ export interface SourceMovementOptions {
    * async result — gh-169 R4-6: request-time admission probes the remote
    * OFF the event loop and injects the outcome). */
   readonly skipRemoteProbe?: boolean;
+  /** Run every local step owned (R7-7): admission retries a failure only
+   * with proof its process group stopped. */
+  readonly ownedLocalSteps?: boolean;
 }
 
 export function sourceMovementSinceFreeze(review: FrozenReview, options?: SourceMovementOptions): SourceMovement | null {
   const { repoPath, targetRef, targetSha } = review.manifest;
+  const run = options?.ownedLocalSteps === true ? ownedMovementGit : plainMovementGit;
   try {
-    const base = baseMovementSinceFreeze(review);
+    const base = baseMovementSinceFreeze(review, run);
     if (base !== null) return base;
     let localTarget: string;
     try {
-      localTarget = resolveGitCommit(repoPath, targetRef);
+      localTarget = resolveGitCommit(repoPath, targetRef, run);
     } catch (error) {
+      if (isUnstopped(error)) throw error;
       return movement('target-moved', `target ${targetRef} cannot resolve: ${gitErrorDetail(error)}`);
     }
     if (localTarget !== targetSha) return movement('target-moved', `target ${targetRef} is ${localTarget}, frozen at ${targetSha}`);
@@ -893,7 +1168,7 @@ export function sourceMovementSinceFreeze(review: FrozenReview, options?: Source
     if (options?.skipRemoteProbe === true) {
       // The caller owns the advertised-tip proof (async path).
     } else {
-      const remoteTarget = advertisedRemoteBranch(repoPath, targetRef);
+      const remoteTarget = advertisedRemoteBranch(repoPath, targetRef, run);
       if (remoteTarget !== null) {
       // An owned process group, killed at its bound: this call blocks the
       // event loop, so neither a SIGTERM-ignoring git (or wrapper) nor
@@ -907,11 +1182,11 @@ export function sourceMovementSinceFreeze(review: FrozenReview, options?: Source
         if (tip !== targetSha) return movement('target-moved', `advertised ${remoteTarget.remote}/${remoteTarget.branch} is ${tip}, frozen at ${targetSha}`);
       }
     }
-    if (resolveGitCommit(repoPath, 'HEAD') !== targetSha) {
+    if (resolveGitCommit(repoPath, 'HEAD', run) !== targetSha) {
       return movement('checkout-changed', `review checkout HEAD no longer matches ${targetSha}`);
     }
     try {
-      assertReviewCheckoutClean(repoPath);
+      assertReviewCheckoutClean(repoPath, run);
     } catch (error) {
       if (error instanceof Error && error.message.startsWith('detached review checkout is not pristine')) {
         return movement('checkout-changed', error.message);
@@ -1127,20 +1402,26 @@ async function probeAdvertisedTipOnce(
   const run = async (args: readonly string[]): Promise<string> => {
     const timeout = remainingTimeoutMs(deadline, now());
     if (timeout === null) {
-      throw new Error(`admission remote-probe budget exhausted before: git ${args.join(' ')}`);
+      // Nothing was started, so nothing can still be running.
+      throw Object.assign(new Error(`admission remote-probe budget exhausted before: git ${args.join(' ')}`), { ownedStopped: true });
     }
-    const late = (): Error => new Error(`admission remote-probe budget exhausted after: git ${args.join(' ')}`);
+    const late = (stopped: boolean): Error => Object.assign(
+      new Error(`admission remote-probe budget exhausted after: git ${args.join(' ')}`),
+      stopped ? { ownedStopped: true } : {},
+    );
     let stdout: string;
     try {
       stdout = await exec(review.manifest.repoPath, args, timeout);
     } catch (error) {
       // A step that might still be running keeps saying so (R6-5): the
-      // late-budget message must never launder it into a retryable one.
-      if ((error as { cleanupUnconfirmed?: unknown } | null)?.cleanupUnconfirmed === true) throw error;
-      if (now() >= deadline) throw late();
+      // late-budget message must never launder it into a retryable one —
+      // nor claim a stop the step did not prove.
+      if (isUnstopped(error)) throw error;
+      if (now() >= deadline) throw late((error as { ownedStopped?: unknown } | null)?.ownedStopped === true);
       throw error;
     }
-    if (now() >= deadline) throw late();
+    // The step returned: an owned step returns only once its group stopped.
+    if (now() >= deadline) throw late(true);
     return stdout;
   };
   // R6-3 / round 4: only git's OWN refusal of the spelling may skip the

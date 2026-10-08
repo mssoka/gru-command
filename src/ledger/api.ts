@@ -2436,6 +2436,10 @@ export class LedgerApi {
      * flip). A restored `working` hop resumes that attempt — it is not a
      * reopened lane, so its earlier delivery still settles it. */
     readonly attemptStartSeq?: number;
+    /** This round's own provisional status event (R7-10): restore only
+     * while it is still the job's latest status event — a generation
+     * written since (a reopened attempt) is never undone or concealed. */
+    readonly expectedStatusSeq?: number;
   }): boolean {
     return this.transaction(() => {
       const job = this.getJob(input.jobId);
@@ -2444,6 +2448,8 @@ export class LedgerApi {
         .get(input.jobId) as { id: string } | undefined;
       if (job?.status !== 'in-review' || round?.jobId !== input.jobId ||
         round.status !== 'aborted' || latest?.id !== input.roundId) return false;
+      if (input.expectedStatusSeq !== undefined &&
+        this.latestJobEvent(input.jobId, 'job.status')?.seq !== input.expectedStatusSeq) return false;
       if (input.priorStatus === 'working' && input.attemptStartSeq !== undefined) {
         assertJobTransition(job.status, 'working');
         this.writeJobStatus(input.jobId, job.status, 'working', {
@@ -3240,6 +3246,31 @@ export class LedgerApi {
         payload: fields.payload,
       }),
     );
+  }
+
+  /** Append `fields` unless this job already holds an event of one of
+   * `guard.kinds` naming the same `scheduledSeq` — in ONE transaction, so of
+   * two claimants only one can win (R7-24). Null when it lost. */
+  appendCustomEventUnlessRecorded(
+    fields: Parameters<LedgerApi['appendCustomEvent']>[0],
+    guard: { readonly jobId: string; readonly kinds: readonly string[]; readonly scheduledSeq: number },
+  ): BusEvent | null {
+    if (guard.kinds.length === 0) throw new Error('appendCustomEventUnlessRecorded requires at least one guard kind');
+    return this.transaction(() => {
+      const placeholders = guard.kinds.map(() => '?').join(', ');
+      const taken = this.db.prepare(
+        `SELECT 1 FROM events WHERE job_id = ? AND kind IN (${placeholders}) AND json_extract(payload, '$.scheduledSeq') = ? LIMIT 1`,
+      ).get(guard.jobId, ...(guard.kinds as string[]), guard.scheduledSeq);
+      if (taken !== undefined) return null;
+      return this.appendEvent({
+        kind: fields.kind,
+        agentId: fields.agentId ?? null,
+        jobId: fields.jobId ?? null,
+        roundId: fields.roundId ?? null,
+        lens: fields.lens ?? null,
+        payload: fields.payload,
+      });
+    });
   }
 
   /** Delivery-only crash recovery: check the exact admitted markers and
