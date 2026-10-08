@@ -204,8 +204,19 @@ for (const width of [360, 375, 390]) {
       await button.evaluate((node) => {
         const pad = 8;
         const rect = node.getBoundingClientRect();
-        if (rect.bottom > window.innerHeight - pad) window.scrollBy(0, rect.bottom - (window.innerHeight - pad));
-        else if (rect.top < pad) window.scrollBy(0, rect.top - pad);
+        // Scroll so the control's center is below all sticky chrome and
+        // inside the viewport: measure the chrome bottom from the element's
+        // own offset parent chain (the sticky strip + nav is the topmost
+        // covering element at rect.top when the control is behind it).
+        const center = rect.top + rect.height / 2;
+        const topEl = document.elementFromPoint(rect.left + rect.width / 2, center);
+        const covered = topEl !== null && !(topEl === node || node.contains(topEl));
+        if (covered || rect.bottom > window.innerHeight - pad) {
+          // Move the control below the covering element (or the fold).
+          const coverBottom = covered && topEl ? topEl.getBoundingClientRect().bottom : 0;
+          const target = Math.max(coverBottom + pad, window.innerHeight - pad - rect.height);
+          window.scrollBy(0, rect.top - target);
+        }
       });
       await expect(button).toBeEnabled();
       const hit = await button.evaluate((node) => {
