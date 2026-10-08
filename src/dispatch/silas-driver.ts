@@ -12,7 +12,6 @@ import type {
   JobStatus,
   LedgerApi,
   PendingRebriefRecord,
-  ProviderWaitRecord,
   RoundRecord,
 } from '../ledger/api.js';
 import { LIVE_DIRECTIVE_STATES, type DirectiveState } from '../ledger/directives.js';
@@ -301,13 +300,6 @@ export interface DigestLedger {
     readonly jobId?: string;
     readonly states?: readonly DirectiveState[];
   }): readonly DirectiveRequestRecord[];
-  /** True while a retirement's continuation hold is unreleased: the lane is
-   * fenced exactly like a live request — no competing continuation may be
-   * offered, armed or woken until a fresh accepted request supersedes it. */
-  hasOpenDirectiveRecoveryHold(jobId: string): boolean;
-  listDirectiveRecoveryHolds: LedgerApi['listDirectiveRecoveryHolds'];
-  providerWaitRetirementIdentity: LedgerApi['providerWaitRetirementIdentity'];
-  getProviderWait(id: string): ProviderWaitRecord | null;
   /** Tracked child workers (issue #161/#117): the releaseEligible sweep-ack
    * row fences on non-terminal children exactly like the release endpoint's
    * own refusal — the digest never offers a release that would 409. */
@@ -1167,9 +1159,6 @@ function stallStillEligible(
   if (delivered !== null && delivered.seq > phaseStart.seq) return false;
   if (ledger.listPendingRebriefs({ jobId }).length > 0) return false;
   if (ledger.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES }).length > 0) return false;
-  // A retirement's continuation hold fences exactly like a live request:
-  // no woken offer may duplicate work behind a closed control decision.
-  if (ledger.hasOpenDirectiveRecoveryHold(jobId)) return false;
   if (verificationInFlight(ledger, jobId)) return false;
   const review = latestAnsweringReviewRequest(ledger, jobId);
   if (review !== null && review.seq > phaseStart.seq) return false;
@@ -1368,8 +1357,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     // unresolved re-brief owns the lane.
     const rebriefPending = pendingRebriefJobIds.has(job.id);
     const liveDirectiveOwns = input.ledger
-      .listPendingDirectives({ jobId: job.id, states: LIVE_DIRECTIVE_STATES }).length > 0 ||
-      input.ledger.hasOpenDirectiveRecoveryHold(job.id);
+      .listPendingDirectives({ jobId: job.id, states: LIVE_DIRECTIVE_STATES }).length > 0;
     const reviewPending = reviewEligibleStatus(job.status);
 
     // (1) Delivered, no PR yet. Only PR-owing lanes (deliverable
@@ -1848,8 +1836,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       jobSeqUnchanged(jobId) &&
       !verificationInFlight(input.ledger, jobId) &&
       input.ledger.listPendingRebriefs({ jobId }).length === 0 &&
-      input.ledger.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES }).length === 0 &&
-      !input.ledger.hasOpenDirectiveRecoveryHold(jobId);
+      input.ledger.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES }).length === 0;
   };
   const reviewOfferFencesHold = (jobId: string): boolean => {
     const job = input.ledger.getJob(jobId);
@@ -1863,33 +1850,10 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       jobSeqUnchanged(jobId) &&
       !verificationInFlight(input.ledger, jobId) &&
       input.ledger.listPendingRebriefs({ jobId }).length === 0 &&
-      input.ledger.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES }).length === 0 &&
-      !input.ledger.hasOpenDirectiveRecoveryHold(jobId);
+      input.ledger.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES }).length === 0;
   };
-  // Retirement closes control, never grants another turn. Every channel
-  // that can wake a continuation must honor the hold, including old
-  // verdict/verification debt and late provider evidence. Recheck after
-  // all awaits; a hold can open after the candidate was computed.
-  const continuationAllowed = (row: { readonly jobId: string }): boolean =>
-    !input.ledger.hasOpenDirectiveRecoveryHold(row.jobId) &&
-    (input.ledger.listDirectiveRecoveryHolds({ jobId: row.jobId }).length === 0 ||
-      (jobSeqUnchanged(row.jobId) &&
-       input.ledger.listPendingDirectives({ jobId: row.jobId, states: LIVE_DIRECTIVE_STATES }).length === 0 &&
-       input.ledger.listPendingRebriefs({ jobId: row.jobId }).length === 0));
   return {
     ...digest,
-    verdictsAwaitingDirective: digest.verdictsAwaitingDirective.filter(continuationAllowed),
-    verificationFailures: digest.verificationFailures.filter(continuationAllowed),
-    verificationWaits: digest.verificationWaits.filter(continuationAllowed),
-    minionErrors: digest.minionErrors.filter(continuationAllowed),
-    providerRecoveryPending: digest.providerRecoveryPending.filter((row) => {
-      if (row.jobId === null) return true;
-      if (!continuationAllowed({ jobId: row.jobId }) ||
-          input.ledger.listPendingDirectives({ jobId: row.jobId, states: LIVE_DIRECTIVE_STATES }).length > 0 ||
-          input.ledger.listPendingRebriefs({ jobId: row.jobId }).length > 0) return false;
-      const wait = input.ledger.getProviderWait(row.waitId);
-      return wait !== null && input.ledger.providerWaitRetirementIdentity(wait) === 'current';
-    }),
     deliveredWithoutPr: digest.deliveredWithoutPr.filter((row) => {
       if (!reviewOfferFencesHold(row.jobId)) return false;
       const job = input.ledger.getJob(row.jobId);

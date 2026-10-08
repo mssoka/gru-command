@@ -56,7 +56,6 @@ async function boot(opts: { hosted?: boolean; available?: number } = {}): Promis
     bus,
   });
   const hook = createDispatchServer({
-    pendingProducerBlockers: () => [],
     config,
     dispatch: {} as never,
     wave: {} as never,

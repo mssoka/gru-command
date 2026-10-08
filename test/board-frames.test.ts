@@ -41,8 +41,6 @@ const SNAPSHOT_VALID = {
           id: 'j1',
           repo: 'demo',
           title: 't',
-          // Megaminion family link (job-parent): null = top-level heist.
-          parentJobId: null,
           status: 'working',
           updatedAt: '2026-01-01T00:00:00.000Z',
           prUrl: null,
@@ -62,21 +60,6 @@ const SNAPSHOT_VALID = {
               lenses: [{ lens: 'blind', state: 'pending', agentId: null, note: null, verdict: null }],
             },
           ],
-          lane: null,
-          lastAgentActivity: null,
-        },
-        {
-          // A megaminion: the reviewer j1's minion commissioned.
-          id: 'j1-review-blind',
-          repo: 'demo',
-          title: 'review (blind)',
-          parentJobId: 'j1',
-          status: 'working',
-          updatedAt: '2026-01-01T00:00:00.000Z',
-          prUrl: null,
-          baseBranch: null,
-          note: null,
-          rounds: [],
           lane: null,
           lastAgentActivity: null,
         },
@@ -114,14 +97,6 @@ const SERVER_CORPUS: readonly unknown[] = [
   { type: 'board' },
   { type: 'board', snapshot: { repos: [], agents: [], notifications: 'nope' } },
   { type: 'board', snapshot: null },
-  // A job can never be its own megaminion.
-  {
-    type: 'board',
-    snapshot: {
-      ...SNAPSHOT_VALID,
-      repos: [{ name: 'demo', jobs: [{ ...SNAPSHOT_VALID.repos[0]!.jobs[0]!, parentJobId: 'j1' }] }],
-    },
-  },
   { type: 'nope' },
   {},
   [],
@@ -149,9 +124,6 @@ describe('board frame parity (server parser ↔ web validator)', () => {
       const valid = client !== null;
       if (item === (SERVER_CORPUS[4] as unknown)) {
         expect(valid, 'the valid snapshot exemplar must parse').toBe(true);
-      }
-      if (item === (SERVER_CORPUS[10] as unknown)) {
-        expect(valid, 'a self-parented job must be refused').toBe(false);
       }
       // The server never parses its own outbound frames; the contract here
       // is that the web side accepts exactly the shapes the server sends.

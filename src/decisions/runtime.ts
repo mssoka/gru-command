@@ -229,12 +229,7 @@ export class DecisionRuntime implements DecisionService {
     this.options = options;
     this.env = options.env ?? process.env;
     this.home = options.home ?? homedir();
-    const log = options.log ?? (() => {});
-    this.log = (level, msg, fields) => {
-      // Diagnostic sinks must never block deterministic routing, ledger
-      // recording or lifecycle recovery, including a closed stderr stream.
-      try { log(level, msg, fields); } catch { /* isolated telemetry failure */ }
-    };
+    this.log = options.log ?? (() => {});
     this.configFile = configPathFor(options.instanceDir);
     this.currentConfig = initial;
     this.service = new DeterministicDecisionService(thresholdsOf(initial), 'disabled');
@@ -467,7 +462,6 @@ export class DecisionRuntime implements DecisionService {
     if (this.disposed || generation !== this.generation || selected !== (this.profileServices.get(profileName) ?? this.service)) {
       return deterministicOutcome(request, thresholdsOf(this.currentConfig), 'stale_generation');
     }
-    this.logProviderFallback(outcome, profileName, opts?.surface);
     // A live default-profile call failing degrades the runtime (existing
     // semantics — one health, one incident stream). Failures of any other
     // profile fall back deterministically per call, are logged for the
@@ -478,8 +472,7 @@ export class DecisionRuntime implements DecisionService {
       if (profileName === DEFAULT_DECISION_PROFILE && this.primary !== null) {
         const reason = outcome.provenance.fallbackReason ?? 'provider_degraded';
         if (reason !== 'capacity_limited') this.degrade(reason);
-        // Preserve the attempted request's elapsed time and diagnostics.
-        return outcome;
+        return deterministicOutcome(request, thresholdsOf(this.currentConfig), reason);
       }
       if (profileName !== DEFAULT_DECISION_PROFILE) {
         this.log('warn', 'decision profile fell back; deterministic answer served', {
@@ -527,7 +520,6 @@ export class DecisionRuntime implements DecisionService {
     ) {
       return deterministicOutcome(request, thresholds, 'stale_generation');
     }
-    this.logProviderFallback(providerOutcome, context.profileName, opts?.surface);
     if (providerOutcome.provenance.source === 'deterministic') {
       if (context.profileName === DEFAULT_DECISION_PROFILE && this.primary !== null) {
         const reason = providerOutcome.provenance.fallbackReason ?? 'provider_degraded';
@@ -571,23 +563,6 @@ export class DecisionRuntime implements DecisionService {
       this.log('error', 'decisions.shadow record failed; routing state remains usable', { error: String(error) });
     }
     return deterministic;
-  }
-
-  /** Report attempted failures/refusals even when local capacity does not
-   * degrade provider health. Deterministic stand-ins have no request timing;
-   * their reason remains visible in the shadow record instead. */
-  private logProviderFallback<Q extends QuestionSet>(
-    outcome: DecisionOutcome<Q>,
-    profile: string,
-    surface?: string,
-  ): void {
-    if (outcome.provenance.source !== 'deterministic' || outcome.provenance.diagnostics === undefined) return;
-    this.log('warn', 'decision provider request fell back', {
-      profile, surface: surface ?? null,
-      reason: outcome.provenance.fallbackReason,
-      latency_ms: outcome.provenance.latencyMs,
-      request_diagnostics: outcome.provenance.diagnostics,
-    });
   }
 
   /** Dispose every generation-owned service (idempotent per service;
@@ -736,7 +711,6 @@ export class DecisionRuntime implements DecisionService {
       return this.status();
     }
     if (probe.provenance.source !== 'jev') {
-      this.logProviderFallback(probe, DEFAULT_DECISION_PROFILE);
       candidate.dispose();
       return this.degrade(probe.provenance.fallbackReason ?? 'provider_degraded', credentialSource);
     }
@@ -771,7 +745,6 @@ export class DecisionRuntime implements DecisionService {
       profiles: [...this.profileServices.keys()].sort(),
       credential_source: credentialSource,
       latency_ms: probe.provenance.latencyMs,
-      request_diagnostics: probe.provenance.diagnostics,
       usage: probe.provenance.usage,
     });
     this.signalStatus();

@@ -5,7 +5,7 @@ import { hashToken, tokenConfigured, tokenMatches } from '../auth.js';
 import { ROLES, type GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { EventBus } from '../events/bus.js';
-import { LedgerApi, RecordNotFound, AdminCloseoutRefusal, producerResolvedBy, type DecisionActor, type DecisionKind, type NotificationRecord } from '../ledger/api.js';
+import { LedgerApi, RecordNotFound, AdminCloseoutRefusal, type DecisionActor, type DecisionKind, type NotificationRecord } from '../ledger/api.js';
 import { isDecisionActor, isDecisionKind } from '../ledger/decision-memory.js';
 import { isJobStatus, isRoundStatus, isRoundVerdict } from '../ledger/states.js';
 import { isAgentState } from '../runtime/types.js';
@@ -596,16 +596,6 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
           }
           if (suffix === '/disposition') {
             const detail = strField(body, 'detail');
-            const target = ledger.getNotification(id);
-            const closer = target === null ? null : producerResolvedBy(target.kind);
-            if (target !== null && closer !== null) {
-              // Only its producer closes this alert (owner decision 2026-10-08).
-              json(res, 409, {
-                error: 'producer_resolved',
-                detail: `${target.kind} closes itself on ${closer} — fix its cause and leave the alert open`,
-              });
-              return;
-            }
             const row = ledger.disposeMachineNotification(id, detail);
             if (row === null) {
               json(res, 404, { error: 'not_found', detail: `notification "${id}" not found` });
@@ -614,17 +604,7 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
             json(res, 200, row);
             return;
           }
-          const existing = ledger.getNotification(id);
-          if (existing?.kind === 'lessons.proposal') {
-            // A lesson proposal closes only through an owner decision — an
-            // ack would hide it without writing or consuming anything.
-            json(res, 409, {
-              error: 'decision_required',
-              detail: 'lesson proposals are decided with Accept or Reject (POST /api/lessons/proposal/:id/accept|reject)',
-            });
-            return;
-          }
-          const before = existing?.ackedAt ?? null;
+          const before = ledger.getNotification(id)?.ackedAt ?? null;
           const row = notifications.ack(id, optStrField(body, 'by') ?? 'web');
           if (row === null) {
             json(res, 404, { error: 'not_found', detail: `notification "${id}" not found` });

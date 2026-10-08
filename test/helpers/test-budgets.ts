@@ -40,7 +40,6 @@ export interface HeavyTestEntry {
 }
 
 export const HEAVY_TESTS: readonly HeavyTestEntry[] = Object.freeze([
-  { file: 'admission-retry-service.test.ts', workload: 'real service boot resuming a durable admission retry' },
   {
     file: 'attachments.test.ts',
     workload: 'spawns and reaps a real child process and streams large real files',
@@ -73,7 +72,6 @@ export const HEAVY_TESTS: readonly HeavyTestEntry[] = Object.freeze([
   { file: 'install.test.ts', workload: 'install.sh CLI contracts through real subprocesses' },
   { file: 'lan-phone-raw-client.test.ts', workload: 'real service over sockets with the raw client' },
   { file: 'listener-probe.test.ts', workload: 'real child listeners and service port-guard probes' },
-  { file: 'lessons-dream-service.test.ts', workload: 'real compiled service boots: a failing dream pass, and a proposal accepted over HTTP' },
   {
     file: 'perkins-admission-preflight.test.ts',
     workload: 'real git fixture freezes plus frozen-packet corruption scenarios',

@@ -191,47 +191,6 @@ class FakeProbe implements ProviderProbePort {
 }
 
 describe('wait establishment (acceptance 1) — explicit evidence only', () => {
-  it('keeps held and superseded debt quiet without erasing its wait, then observes a genuinely new waiter', async () => {
-    const h = new Harness();
-    h.makeJob('job-1');
-    const begun = h.ledger.beginDirectiveIntent({ jobId: 'job-1', directive: 'old request', holder: 'silas-ops', requestId: 'sensor-retired' });
-    h.ledger.retireInterruptedDirective({ requestId: begun.record.requestId, expectedJobId: 'job-1', expectedState: 'dispatching',
-      expectedPayloadHash: begun.record.payloadHash, expectedHead: 'a'.repeat(40), lane: { id: 'sensor-fixture-lane', resolvedHead: 'a'.repeat(40) },
-      reason: 'fixture producer ceased', by: 'silas-ops' });
-    const observation = h.minionObservation();
-    const wait = h.sensor.recordWait(observation, { provider: 'zai-coding-cn', model: 'glm-5.3', errorMessage: observation.errorMessage,
-      status: 429, bodyCode: '1302' }, h.probe.endpoint, h.probe.fingerprint);
-    await h.sensor.tick();
-    expect(h.probe.calls).toEqual([]);
-    expect(h.ledger.getProviderWait(wait.id)).toEqual(wait);
-    h.ledger.commitProviderRecoveryBatch({ id: 'sensor-late-batch', routeKey: wait.routeKey, incidentGenerations: [wait.incidentGeneration],
-      evidence: { stopReason: 'stop' }, waiters: [{ id: wait.id, jobId: 'job-1' }] });
-    const recovered = h.ledger.getProviderWait(wait.id);
-    expect(await h.sensor.reconcileAtBoot()).toEqual({ rewoken: 0 });
-    expect(h.ledger.listPendingProviderRecoveries()).toHaveLength(1);
-    h.ledger.beginDirectiveIntent({ jobId: 'job-1', directive: 'new authority', holder: 'silas-ops', requestId: 'sensor-fresh' });
-    h.ledger.failDirective({ requestId: 'sensor-fresh', reason: 'fixture no-effect proof' });
-    expect(await h.sensor.reconcileAtBoot()).toEqual({ rewoken: 0 });
-    await h.sensor.tick();
-    expect(h.ledger.listPendingProviderRecoveries()).toEqual([]);
-    expect(h.ledger.getProviderWait(wait.id)).toEqual(recovered);
-    expect(h.wakes).toEqual([]);
-    expect(h.probe.calls).toEqual([]);
-    const fresh = await h.establishMinionWait({ agentId: 'agent-fresh-waiter', sessionFile: '/tmp/fresh-waiter.jsonl',
-      incidentId: 'supervision.provider-wall.agent-fresh-waiter.quota_wall' });
-    expect(fresh).not.toBeNull();
-    expect(fresh!.id).not.toBe(wait.id);
-    expect(h.ledger.providerWaitRetirementIdentity(fresh!)).toBe('current');
-    // Honor the saved idle cadence; a fresh waiter does not refund it.
-    h.advance(Math.max(0, Date.parse(h.ledger.getProviderRoute(fresh!.routeKey)!.nextCheckAt) - h.now) + 1);
-    h.probe.queueCompleted();
-    await h.sensor.tick();
-    expect(h.probe.calls).toHaveLength(1);
-    expect(h.ledger.getProviderWait(fresh!.id)?.status).toBe('recovered-pending');
-    expect(await h.sensor.reconcileAtBoot()).toEqual({ rewoken: 1 });
-    h.sensor.stop();
-  });
-
   it('a structured 429/GLM-1302 rejection on a supported route establishes a durable wait', async () => {
     const h = new Harness();
     h.makeJob('job-1');

@@ -6,7 +6,7 @@ import type { AgentSpawner } from '../service.js';
 import type { AgentHandle, NativeAgentTool, PromptOptions } from '../../runtime/types.js';
 import type { PacingGate, PacingLease, PacingEventRecorder, RateLimitBackoffPolicy } from '../../runtime/pacing.js';
 import { withRateLimitRetries, type RateLimitRetryOptions } from '../../runtime/rate-limit-retry.js';
-import { assertFrozenPromptBounds, compatibleReviewIdentity, repositoryGitEnv, proveRecoveredBaseMergeability, publishedReportMatches, readReviewArtifact, readReviewCheckpoint, sourceMovementSinceFreeze, SPECIALIST_CHECKPOINT_MAX_BYTES, writeReviewArtifact, type FrozenReview, type SourceMovement, type SourceMovementOptions } from './artifacts.js';
+import { assertFrozenPromptBounds, compatibleReviewIdentity, proveRecoveredBaseMergeability, publishedReportMatches, readReviewArtifact, readReviewCheckpoint, sourceMovementSinceFreeze, SPECIALIST_CHECKPOINT_MAX_BYTES, writeReviewArtifact, type FrozenReview, type SourceMovement, type SourceMovementOptions } from './artifacts.js';
 import { applyConvergenceDeferral, classifyPriorFindings, convergedVerdict, deltaSince, type DeltaSince, type PriorCarryClassification } from './convergence.js';
 import { readFrozenEvidenceBytes, renderEvidencePromptSection } from '../../review-inputs/evidence.js';
 import { finalAssistantText } from './session-output.js';
@@ -549,7 +549,7 @@ function frozenBlob(review: FrozenReview, path: string): string | null {
   let blob: string | null;
   try {
     blob = execFileSync('git', ['-C', review.manifest.repoPath, 'show', `${review.manifest.targetSha}:${path}`], {
-      encoding: 'utf8', env: repositoryGitEnv(false), maxBuffer: 8 * 1024 * 1024, timeout: GIT_PROOF_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'],
+      encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: GIT_PROOF_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'],
     });
   } catch {
     blob = null;
@@ -579,7 +579,7 @@ function frozenPathDiff(review: FrozenReview, path: string): string {
     diff = execFileSync('git', [
       '-C', review.manifest.repoPath, 'diff', '--no-ext-diff', '--no-color', '--unified=3',
       review.manifest.diffBaseSha, review.manifest.targetSha, '--', `:(literal)${path}`,
-    ], { encoding: 'utf8', env: repositoryGitEnv(false), maxBuffer: 8 * 1024 * 1024, timeout: GIT_PROOF_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] });
+    ], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: GIT_PROOF_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] });
   } catch {
     diff = '';
   }
@@ -1996,7 +1996,7 @@ export class PerkinsWholeReview {
           const listing = execFileSync('git', [
             '-C', review.manifest.repoPath, 'diff', '--no-ext-diff', '--no-color', '--find-renames',
             '--name-status', '-z', priorTargetSha, review.manifest.targetSha, '--',
-          ], { encoding: 'utf8', env: repositoryGitEnv(false), maxBuffer: 8 * 1024 * 1024, timeout: GIT_PROOF_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] });
+          ], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: GIT_PROOF_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] });
           // Truthful per-status parsing covers every name-status letter
           // git emits for two committed trees (R33): A/D/M/T are
           // single-path entries (T is a type change at the SAME path,
@@ -2042,14 +2042,14 @@ export class PerkinsWholeReview {
           const selectedPaths = execFileSync('git', [
             '-C', review.manifest.repoPath, 'diff', '--name-only', '-z', '--no-ext-diff', '--no-color',
             priorTargetSha, review.manifest.targetSha, '--', `:(literal)${value.path}`,
-          ], { encoding: 'utf8', env: repositoryGitEnv(false), maxBuffer: 8 * 1024 * 1024, timeout: GIT_PROOF_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] })
+          ], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: GIT_PROOF_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] })
             .split('\0')
             .filter((entry) => entry !== '');
           const blobIn = (revision: string): boolean => {
             try {
               return execFileSync('git', [
                 '-C', review.manifest.repoPath, 'cat-file', '-t', `${revision}:${value.path}`,
-              ], { encoding: 'utf8', env: repositoryGitEnv(false), timeout: GIT_PROOF_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] }).trim() === 'blob';
+              ], { encoding: 'utf8', timeout: GIT_PROOF_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] }).trim() === 'blob';
             } catch {
               return false;
             }
@@ -2068,7 +2068,7 @@ export class PerkinsWholeReview {
           const diff = execFileSync('git', [
             '-C', review.manifest.repoPath, 'diff', '--no-ext-diff', '--no-color', '--no-textconv', '--text',
             '--unified=3', priorTargetSha, review.manifest.targetSha, '--', `:(literal)${value.path}`,
-          ], { encoding: 'utf8', env: repositoryGitEnv(false), maxBuffer: 8 * 1024 * 1024, timeout: GIT_PROOF_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] });
+          ], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: GIT_PROOF_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] });
           payload = JSON.stringify({ priorTargetSha, targetSha: review.manifest.targetSha, path: value.path, diff });
         }
         if (Buffer.byteLength(payload, 'utf8') > MAX_TOOL_RESPONSE_BYTES) {

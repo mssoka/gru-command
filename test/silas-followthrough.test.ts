@@ -307,7 +307,6 @@ async function bootFollowThrough(input: {
   };
 
   const server = createDispatchServer({
-    pendingProducerBlockers: () => [],
     config: cfg,
     dispatch,
     wave,

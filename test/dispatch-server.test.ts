@@ -171,7 +171,6 @@ async function boot(opts: {
     ...(opts.fallbackGate !== undefined ? { fallbackGate: opts.fallbackGate } : {}),
   });
   const server = createDispatchServer({
-    pendingProducerBlockers: () => [],
     config: cfg,
     dispatch,
     wave,
@@ -389,73 +388,6 @@ describe('dispatch server (E8)', () => {
     }
   });
 
-
-  it('records a megaminion\'s parent job from parent_job_id and refuses a bad parent before any job exists', async () => {
-    const h = await boot();
-    const repo = makeFixtureRepo('fixture-http-parent');
-    cleanupRepos.push(repo);
-    try {
-      const parent = await call(
-        h.port,
-        'POST',
-        '/api/dispatch',
-        { job_id: 'http-impl', repo_path: repo.path, title: 'implementation', briefing: 'build it' },
-        TOKEN,
-      );
-      expect(parent.status).toBe(202);
-      const review = {
-        repo_path: repo.path,
-        title: 'review (blind)',
-        briefing: 'read-only review brief',
-        deliverable: 'review',
-        target_ref: 'https://git.example.invalid/o/r/pull/9',
-        target_sha: 'c3f3b35',
-      };
-      const child = await call(h.port, 'POST', '/api/dispatch', { ...review, job_id: 'http-impl-blind', parent_job_id: 'http-impl' }, TOKEN);
-      expect(child.status).toBe(202);
-      expect(h.ledger.getJob('http-impl-blind')?.parentJobId).toBe('http-impl');
-      expect(h.ledger.getJob('http-impl')?.parentJobId).toBeNull();
-      // The parent job owes the megaminion's disposition by default (owner
-      // ruling 2026-10-08); an explicit commissioner still wins.
-      expect(h.ledger.getJob('http-impl-blind')?.commissioner).toBe('http-impl');
-      const named = await call(
-        h.port,
-        'POST',
-        '/api/dispatch',
-        { ...review, job_id: 'http-impl-edge', parent_job_id: 'http-impl', commissioner: 'silas' },
-        TOKEN,
-      );
-      expect(named.status).toBe(202);
-      expect(h.ledger.getJob('http-impl-edge')?.commissioner).toBe('silas');
-      // A PR-owing lane never hides under another heist.
-      const lane = await call(
-        h.port,
-        'POST',
-        '/api/dispatch',
-        { job_id: 'http-sub-lane', repo_path: repo.path, title: 'sub lane', briefing: 'b', parent_job_id: 'http-impl' },
-        TOKEN,
-      );
-      expect(lane.status).toBe(400);
-      expect(String(field<unknown>(lane.json, 'detail'))).toMatch(/not a report-type job/u);
-      expect(h.ledger.getJob('http-sub-lane')).toBeNull();
-      // Unknown parent, non-string parent, and a grandchild all fail loud
-      // with a 400 and leave no job row behind.
-      for (const [id, value, detail] of [
-        ['http-orphan', 'no-such-job', /does not exist/u],
-        ['http-number-parent', 7, /parent_job_id must be a non-empty job id/u],
-        ['http-blank-parent', '  ', /parent_job_id must be a non-empty job id/u],
-        ['http-null-parent', null, /parent_job_id must be a non-empty job id/u],
-        ['http-grandchild', 'http-impl-blind', /one level deep/u],
-      ] as const) {
-        const bad = await call(h.port, 'POST', '/api/dispatch', { ...review, job_id: id, parent_job_id: value }, TOKEN);
-        expect(bad.status).toBe(400);
-        expect(String(field<unknown>(bad.json, 'detail'))).toMatch(detail);
-        expect(h.ledger.getJob(id)).toBeNull();
-      }
-    } finally {
-      await h.close();
-    }
-  });
   it('dispatches a job: 202 with the lane, minion spawned in the worktree, board record lives', async () => {
     const h = await boot();
     const repo = makeFixtureRepo('fixture-http');

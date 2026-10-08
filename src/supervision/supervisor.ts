@@ -4,7 +4,6 @@ import type { LogLevel } from '../logger.js';
 import type { AgentHandle, AgentState, PendingTurn, SpawnOptions } from '../runtime/types.js';
 import type { AgentEventEnvelope } from '../runtime/registry.js';
 import type { LedgerApi } from '../ledger/api.js';
-import { isJobTerminal } from '../ledger/states.js';
 import type { NotificationCenter } from '../notifications/center.js';
 import type { DecisionService } from '../decisions/types.js';
 import {
@@ -225,8 +224,6 @@ interface InterruptedTurn {
    * fresh-mint restart may retire the record's current id, but the job /
    * branch / phase context lives under this one. */
   readonly originAgentId: string;
-  readonly jobId: string | null;
-  readonly authorityEpoch: number | null;
 }
 
 /** Structured provider identity from a runtime error, when the runtime
@@ -1717,9 +1714,6 @@ export class Supervisor {
   private async restartRung(agentRef: SupervisedAgent, reason: string): Promise<void> {
     const agent = agentRef;
     if (this.disposed || !this.cfg.enabled || agent.inRestart || agent.breakerOpen) return;
-    const recovery = agent.pendingRecovery ?? this.captureInterruptedTurn(agent.handle, agent);
-    if (recovery !== null) agent.pendingRecovery = recovery;
-    if (!this.recoveryAuthorityCurrent(agent, recovery)) return;
     if (agent.handle?.reviewIsolation === true) {
       this.abortIsolatedReviewAttempt(agent, reason);
       return;
@@ -1966,34 +1960,7 @@ export class Supervisor {
       }
     }
     if (pending === null && !hadOpenTurn) return null;
-    const jobId = this.ledger.getAgent(agent.agentId)?.jobId ?? null;
-    let authorityEpoch: number | null = null;
-    if (jobId !== null) {
-      try {
-        authorityEpoch = this.ledger.directiveRecoveryEpoch(jobId);
-      } catch (error) {
-        this.log('warn', 'interrupted turn authority unavailable — automatic recovery fenced', { agent_id: agent.agentId, job_id: jobId, error: String(error) });
-      }
-    }
-    return { pending, hadOpenTurn, originAgentId: agent.agentId, jobId, authorityEpoch };
-  }
-
-  /** A notification ACK is not a new job authority handoff. The native
-   * epoch captured with the old turn must survive every restart await. */
-  private recoveryAuthorityCurrent(agent: SupervisedAgent, recovery: InterruptedTurn | null): boolean {
-    const jobId = recovery?.jobId ?? this.ledger.getAgent(agent.agentId)?.jobId ?? null;
-    if (jobId === null) return true;
-    try {
-      const job = this.ledger.getJob(jobId);
-      if (job === null || isJobTerminal(job.status) || this.ledger.hasOpenDirectiveRecoveryHold(jobId)) return false;
-      const epoch = this.ledger.directiveRecoveryEpoch(jobId);
-      const current = recovery?.authorityEpoch === epoch || (epoch === 0 && recovery?.authorityEpoch == null);
-      if (!current) this.log('info', 'interrupted turn superseded — automatic recovery fenced', { agent_id: agent.agentId, job_id: jobId });
-      return current;
-    } catch (error) {
-      this.log('warn', 'interrupted turn authority unavailable — automatic recovery fenced', { agent_id: agent.agentId, job_id: jobId, error: String(error) });
-      return false;
-    }
+    return { pending, hadOpenTurn, originAgentId: agent.agentId };
   }
 
   /**
@@ -2008,7 +1975,7 @@ export class Supervisor {
     reason: string,
   ): void {
     const recovery = agent.pendingRecovery;
-    if (recovery === null || !this.recoveryAuthorityCurrent(agent, recovery)) return;
+    if (recovery === null) return;
     agent.pendingRecovery = null;
     const laneAgentId = recovery.originAgentId;
     const pending = recovery.pending;
@@ -2026,7 +1993,7 @@ export class Supervisor {
         reason,
         owner: pending.owner,
       });
-      void this.deliverRecoveredTurn(agent, handle, laneAgentId, pending, reason, recovery);
+      void this.deliverRecoveredTurn(agent, handle, laneAgentId, pending, reason);
       return;
     }
     this.postOrphanedTurn(
@@ -2052,7 +2019,6 @@ export class Supervisor {
     laneAgentId: string,
     pending: PendingTurn,
     reason: string,
-    recovery: InterruptedTurn,
   ): Promise<void> {
     let lease: PacingLease | null = null;
     const controller = new AbortController();
@@ -2062,10 +2028,8 @@ export class Supervisor {
       !this.disposed &&
       !controller.signal.aborted &&
       this.agents.get(agent.agentId) === agent &&
-      agent.handle === handle &&
-      this.recoveryAuthorityCurrent(agent, recovery);
+      agent.handle === handle;
     try {
-      if (!stillCurrent()) return;
       if (agent.role === 'minion' && this.workerGate !== undefined) {
         lease = await this.workerGate.acquireWorkerTurn({
           id: laneAgentId,
@@ -2270,7 +2234,6 @@ export class Supervisor {
     if (this.disposed || !this.cfg.enabled) return; // off = acks are pure records
     for (const agent of this.agents.values()) {
       if (agent.breakerNotificationId !== notificationId || !agent.breakerOpen) continue;
-      if (!this.recoveryAuthorityCurrent(agent, agent.pendingRecovery)) return;
       agent.breakerOpen = false;
       agent.stopReason = null;
       agent.stoppedAt = null;
@@ -2422,24 +2385,6 @@ export class Supervisor {
       openToolCalls: 0,
       lastEventAt: null,
       lastFileBytes: null,
-    });
-  }
-
-  /** Synchronous cessation evidence for guarded control closure. A timer,
-   * queued retry or undecided recovery is still producer ownership even
-   * while its durable agent row says idle/error/disposed. */
-  pendingProducerBlockers(jobId: string): readonly string[] {
-    return this.ledger.listAgents().filter((row) => row.jobId === jobId).flatMap((row) => {
-      const agent = this.agents.get(row.id);
-      if (agent === undefined) {
-        return this.registry.getHandle(row.id) !== null
-          ? [`supervision ownership unknown: ${row.id}`] : [];
-      }
-      const pending = agent.inRestart || agent.backoffTimer !== null || agent.decisionPending ||
-        agent.queuedRecovery !== null || agent.rateLimitRetry !== null || agent.recoveryAdmission !== null ||
-        (agent.state !== 'stopped' && !agent.breakerOpen && agent.pendingRecovery !== null);
-      const open = agent.openTurn || agent.openControl || agent.openToolCalls.size > 0;
-      return pending || open ? [`supervised producer: ${row.id} (${pending ? 'pending recovery/retry' : 'open turn/control/tool'})`] : [];
     });
   }
 

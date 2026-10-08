@@ -16,7 +16,6 @@ import type {
   DecisionFailureReason,
   DecisionOutcome,
   DecisionRequest,
-  DecisionRequestDiagnostics,
   DecisionService,
   DecisionUsage,
   QuestionSet,
@@ -25,16 +24,10 @@ import type {
 
 export const OPENROUTER_DECISIONS_ENDPOINT = 'https://openrouter.ai/api/alpha/decisions';
 
-interface RequestObservation {
-  readonly latencyMs: number;
-  readonly diagnostics: DecisionRequestDiagnostics;
-}
-
 export class DecisionProviderError extends Error {
   constructor(
     readonly reason: DecisionFailureReason,
     detail?: string,
-    readonly observation?: RequestObservation,
   ) {
     super(`decision provider unavailable (${reason})${detail !== undefined ? `: ${detail}` : ''}`);
     this.name = 'DecisionProviderError';
@@ -82,47 +75,37 @@ function providerReason(error: unknown): DecisionFailureReason {
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const MAX_CONCURRENT_REQUESTS = 4;
 
-/** Cancellation is best effort: an uncooperative cleanup must never hold
- * a caller or an admission slot. Observe rejections without logging bodies. */
-function cancelResponseBody(response: Response): void {
-  try { void response.body?.cancel().catch(() => {}); } catch { /* already locked/closed */ }
-}
-
-async function boundedResponseText(response: Response, signal: AbortSignal): Promise<string> {
+async function boundedResponseText(response: Response): Promise<string> {
+  const declared = Number(response.headers.get('content-length'));
+  if (Number.isFinite(declared) && declared > MAX_RESPONSE_BYTES) {
+    throw new DecisionProviderError('malformed_response');
+  }
   if (response.body === null) return '';
   const reader = response.body.getReader();
-  const cancel = (): void => {
-    try { void reader.cancel().catch(() => {}); } catch { /* already released */ }
-  };
-  signal.addEventListener('abort', cancel, { once: true });
   const decoder = new TextDecoder('utf-8', { fatal: true });
   let total = 0;
   let text = '';
   try {
-    signal.throwIfAborted();
     for (;;) {
       const chunk = await reader.read();
-      signal.throwIfAborted();
       if (chunk.done) break;
       total += chunk.value.byteLength;
       if (total > MAX_RESPONSE_BYTES) {
-        cancel();
+        await reader.cancel();
         throw new DecisionProviderError('malformed_response');
       }
       text += decoder.decode(chunk.value, { stream: true });
     }
     return text + decoder.decode();
   } catch (error) {
-    if (signal.aborted) throw signal.reason;
     if (error instanceof DecisionProviderError) throw error;
+    // The request deadline owns the body stream as well as header receipt.
+    // Preserve timeout semantics when aborting reader.read(); only genuine
+    // decoding/stream corruption is a malformed response.
     if (error instanceof Error && (error.name === 'AbortError' || /abort/i.test(error.message))) {
       throw new DecisionProviderError('timeout');
     }
-    cancel();
     throw new DecisionProviderError('malformed_response');
-  } finally {
-    signal.removeEventListener('abort', cancel);
-    reader.releaseLock();
   }
 }
 
@@ -193,126 +176,89 @@ export class ProfileProvider {
     readonly model: string | null;
     readonly latencyMs: number;
     readonly usage: DecisionUsage | null;
-    readonly diagnostics: DecisionRequestDiagnostics;
   }> {
     if (this.disposed) throw new DecisionProviderError('disposed');
     if (this.active.size >= MAX_CONCURRENT_REQUESTS) {
       // Local backpressure is not evidence that the remote provider failed.
-      throw new DecisionProviderError('capacity_limited', undefined, {
-        latencyMs: 0,
-        diagnostics: {
-          phase: 'not_started', timeoutMs: this.profile.timeoutMs, deadlineExpired: false,
-          headersMs: null, bodyMs: null, httpStatus: null,
-        },
-      });
+      // This call falls back, but the shared ready provider remains usable.
+      throw new DecisionProviderError('capacity_limited');
     }
     validateRequest(request);
-    // The binding check is the last gate before credential-bearing egress.
+    // Validate immediately before constructing credential-bearing headers:
+    // the binding check is the last gate in front of the wire.
     const endpoint = assertEndpointTrusted(this.profile, this.credentialMode).href;
     const controller = new AbortController();
     this.active.add(controller);
-    const started = performance.now();
-    let phase: DecisionRequestDiagnostics['phase'] = 'request';
-    let headersMs: number | null = null;
-    let bodyMs: number | null = null;
-    let httpStatus: number | null = null;
-    let deadlineExpired = false;
-    const elapsed = (): number => Math.max(0, Math.round(performance.now() - started));
-    const observation = (): RequestObservation => ({
-      latencyMs: elapsed(),
-      diagnostics: { phase, timeoutMs: this.profile.timeoutMs, deadlineExpired, headersMs, bodyMs, httpStatus },
-    });
-    const expire = (): void => {
-      if (controller.signal.aborted) return; // disposal/cancellation keeps its own cause
-      deadlineExpired = true;
-      controller.abort(new DecisionProviderError('timeout'));
-    };
-    const ensureLive = (): void => {
-      controller.signal.throwIfAborted();
-      // Timers cannot run while the event loop is blocked. Check the actual
-      // deadline at each milestone too, so a late response never earns an act.
-      if (performance.now() - started >= this.profile.timeoutMs) {
-        expire();
-        controller.signal.throwIfAborted();
-      }
-    };
-    let onAbort!: () => void;
-    const aborted = new Promise<never>((_resolve, reject) => {
-      onAbort = () => reject(controller.signal.reason);
-      controller.signal.addEventListener('abort', onAbort, { once: true });
-    });
-    const timer = setTimeout(expire, this.profile.timeoutMs);
+    const timer = setTimeout(() => controller.abort(), this.profile.timeoutMs);
     timer.unref?.();
-    // Race the ENTIRE exchange, not just fetch/header receipt. A transport
-    // or body that ignores abort must not keep the caller/admission pending.
-    const exchange = (async () => {
-      const headers: Record<string, string> = { 'content-type': 'application/json' };
+    const started = performance.now();
+    try {
+      const headers: Record<string, string> = {
+        'content-type': 'application/json',
+      };
       if (this.key !== null) headers['authorization'] = `Bearer ${this.key}`;
       if (this.profile.protocol === 'openrouter-decisions') {
         headers['http-referer'] = 'https://github.com/mssoka/gru-command';
         headers['x-title'] = 'gru-command';
       }
       const response = await this.fetchImpl(endpoint, {
-        method: 'POST', redirect: 'manual', headers,
-        body: JSON.stringify({ model: this.profile.model, state: request.state, questions: request.questions }),
+        method: 'POST',
+        redirect: 'manual',
+        headers,
+        body: JSON.stringify({
+          model: this.profile.model,
+          state: request.state,
+          questions: request.questions,
+        }),
         signal: controller.signal,
       });
-      // A fetch ignoring abort can arrive after the caller has settled.
-      // Cancel its body without consuming it or changing the recorded phase.
-      if (controller.signal.aborted) {
-        cancelResponseBody(response);
-        controller.signal.throwIfAborted();
-      }
-      headersMs = elapsed();
-      httpStatus = response.status;
-      phase = 'response_headers';
-      try { ensureLive(); } catch (error) { cancelResponseBody(response); throw error; }
       if (!response.ok) {
-        cancelResponseBody(response);
-        if (response.status >= 300 && response.status < 400) throw new DecisionProviderError('endpoint_untrusted');
+        try {
+          await response.body?.cancel();
+        } catch {
+          // The request controller is also aborted in finally; body text is
+          // never read or surfaced on an error response.
+        }
+        if (response.status >= 300 && response.status < 400) {
+          throw new DecisionProviderError('endpoint_untrusted');
+        }
         if (response.status === 401) throw new DecisionProviderError('auth_rejected');
         if (response.status === 403) throw new DecisionProviderError('forbidden');
+        // A structurally rejected request (TypeSafe documents 422) is the
+        // caller's shape, not the provider's health: a distinct reason so
+        // wiring bugs surface as wiring bugs.
         if (response.status === 422) throw new DecisionProviderError('malformed_request');
         throw new DecisionProviderError('provider_degraded');
       }
-      // This refusal is decided from headers, before attempting any body read.
-      const declared = Number(response.headers.get('content-length'));
-      if (Number.isFinite(declared) && declared > MAX_RESPONSE_BYTES) {
-        cancelResponseBody(response);
+      const responseText = await boundedResponseText(response);
+      let envelope: unknown;
+      try {
+        envelope = JSON.parse(responseText) as unknown;
+      } catch {
         throw new DecisionProviderError('malformed_response');
       }
-      phase = 'response_body';
-      const responseText = await boundedResponseText(response, controller.signal);
-      ensureLive();
-      bodyMs = elapsed();
-      phase = 'response_validation';
-      let envelope: unknown;
-      try { envelope = JSON.parse(responseText) as unknown; } catch { throw new DecisionProviderError('malformed_response'); }
-      if (typeof envelope !== 'object' || envelope === null || Array.isArray(envelope)) throw new DecisionProviderError('malformed_response');
+      if (typeof envelope !== 'object' || envelope === null || Array.isArray(envelope)) {
+        throw new DecisionProviderError('malformed_response');
+      }
       const record = envelope as Record<string, unknown>;
       let answers: DecisionOutcome<Q>['answers'];
-      try { answers = validatedAnswers(request.questions, record.answers); } catch { throw new DecisionProviderError('malformed_response'); }
-      const usage = usageOf(record.usage, this.profile);
-      ensureLive();
+      try {
+        answers = validatedAnswers(request.questions, record.answers);
+      } catch {
+        throw new DecisionProviderError('malformed_response');
+      }
       return {
-        answers, model: typeof record.model === 'string' && record.model.trim() !== '' ? record.model : null,
-        usage, ...observation(),
+        answers,
+        model: typeof record.model === 'string' && record.model.trim() !== '' ? record.model : null,
+        latencyMs: Math.max(0, Math.round(performance.now() - started)),
+        usage: usageOf(record.usage, this.profile),
       };
-    })();
-    try {
-      // Promise.race observes the losing exchange too: late failures cannot
-      // become unhandled rejections, and late answers cannot reach routing.
-      return await Promise.race([exchange, aborted]);
     } catch (error) {
-      // Failures can cross the deadline during synchronous validation or
-      // before a delayed timer callback, just as successful responses can.
-      // Never overwrite a prior disposal/cancellation with an expired clock.
-      if (!controller.signal.aborted && performance.now() - started >= this.profile.timeoutMs) expire();
-      const cause = controller.signal.aborted ? controller.signal.reason : error;
-      throw new DecisionProviderError(providerReason(cause), undefined, observation());
+      throw new DecisionProviderError(providerReason(error));
     } finally {
       clearTimeout(timer);
-      controller.signal.removeEventListener('abort', onAbort);
+      // If fetch resolved on headers and an error body is still streaming,
+      // retain ownership long enough to cancel it before releasing the slot.
       controller.abort();
       this.active.delete(controller);
     }
@@ -321,7 +267,7 @@ export class ProfileProvider {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
-    for (const controller of this.active) controller.abort(new DecisionProviderError('disposed'));
+    for (const controller of this.active) controller.abort();
     this.active.clear();
   }
 }
@@ -358,14 +304,11 @@ export class ProfileDecisionService implements DecisionService {
           model: result.model,
           latencyMs: result.latencyMs,
           usage: result.usage,
-          diagnostics: result.diagnostics,
           profile: this.profileName,
         },
       };
     } catch (error) {
-      const fallback = deterministicOutcome(request, this.thresholds, providerReason(error));
-      if (!(error instanceof DecisionProviderError) || error.observation === undefined) return fallback;
-      return { ...fallback, provenance: { ...fallback.provenance, ...error.observation } };
+      return deterministicOutcome(request, this.thresholds, providerReason(error));
     }
   }
 

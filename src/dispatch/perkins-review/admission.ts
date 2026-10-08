@@ -59,14 +59,6 @@ export interface AdmissionMissingInput {
   readonly input: string;
   /** Actionable detail naming exactly what is missing/inaccessible. */
   readonly detail: string;
-  /** Present only on a transient head-binding failure: a git step failed
-   * or timed out AND was confirmed stopped. The same request may be
-   * re-admitted later; every other refusal needs a person. */
-  readonly retryable?: true;
-  /** Present only when a git step that would not stop vetoed head binding:
-   * the refusal escalates naming its process group, is never retried, and
-   * no later check — a branch that turned busy — may mask it (R9-6). */
-  readonly cleanupUnconfirmed?: true;
 }
 
 /** One executed check (pass or fail); `missing` is the failed subset. */
@@ -87,8 +79,7 @@ export interface AdmissionPreflightResult {
  * per-input DETAIL is elided when the bound demands it. */
 export class ReviewAdmissionError extends Error {
   readonly missing: readonly AdmissionMissingInput[];
-  /** `note` (e.g. the scheduled automatic retry) follows the bounded list. */
-  constructor(missing: readonly AdmissionMissingInput[], note?: string) {
+  constructor(missing: readonly AdmissionMissingInput[]) {
     // Names are stable machine identifiers (bounded set, bounded length):
     // they are never cut. Details are bounded per input and elided as a
     // group when the whole message would overflow — the elision marker
@@ -100,7 +91,7 @@ export class ReviewAdmissionError extends Error {
       details = `${details.slice(0, detailBudget)}… (remaining details elided; every missing input name is listed)`;
     }
     super(
-      `review admission preflight refused: ${missing.length} missing input(s): ${names} — ${details}${note === undefined ? '' : ` — ${note}`}`,
+      `review admission preflight refused: ${missing.length} missing input(s): ${names} — ${details}`,
     );
     this.name = 'ReviewAdmissionError';
     this.missing = missing;
@@ -191,13 +182,9 @@ function ciRecordShapeProblem(value: unknown): string | null {
 export function admissionPreflight(review: FrozenReview, movementRef: string, options?: AdmissionPreflightOptions): AdmissionPreflightResult {
   const checks: AdmissionCheck[] = [];
   const missing: AdmissionMissingInput[] = [];
-  const fail = (input: string, detail: string, retryable = false, cleanupVeto = false): void => {
+  const fail = (input: string, detail: string): void => {
     checks.push({ name: input, ok: false, detail: sanitizeDetail(detail) });
-    missing.push({
-      input, detail: sanitizeDetail(detail),
-      ...(retryable ? { retryable: true } : {}),
-      ...(cleanupVeto ? { cleanupUnconfirmed: true } : {}),
-    });
+    missing.push({ input, detail: sanitizeDetail(detail) });
   };
   const pass = (name: string): void => {
     checks.push({ name, ok: true, detail: null });
@@ -217,25 +204,16 @@ export function admissionPreflight(review: FrozenReview, movementRef: string, op
   // R4-6: with a precomputed ASYNC probe result the sync path skips its
   // own remote lookup entirely; the merged outcome keeps the identical
   // fail-closed semantics.
-  // R7-7: every local step runs owned, so a failure can prove it stopped.
-  const local = headMovedSinceFreeze(review, movementRef, options?.precomputedRemoteMovement !== undefined
-    ? { skipRemoteProbe: true, ownedLocalSteps: true }
-    : {
-        ownedLocalSteps: true,
+  const movement = options?.precomputedRemoteMovement !== undefined
+    ? ((): SourceMovement | null => {
+        const local = headMovedSinceFreeze(review, movementRef, { skipRemoteProbe: true });
+        return local ?? options.precomputedRemoteMovement ?? null;
+      })()
+    : headMovedSinceFreeze(review, movementRef, {
         ...(options?.remoteProbeTimeoutMs !== undefined ? { remoteProbeTimeoutMs: options.remoteProbeTimeoutMs } : { remoteProbeTimeoutMs: ADMISSION_REMOTE_PROBE_TIMEOUT_MS }),
       });
-  const remote = options?.precomputedRemoteMovement ?? null;
-  const movement: SourceMovement | null = local ?? remote;
-  // R7-6: a cleanup veto from EITHER probe survives whichever diagnostic
-  // leads — and is the one reported, naming its still-running process
-  // group (owner decision 2026-10-08). Only a failure that PROVED its git
-  // stopped is transient.
-  const probes = [local, remote].filter((entry): entry is SourceMovement => entry !== null);
-  const stuck = probes.find((entry) => entry.cleanupUnconfirmed === true) ?? null;
-  const reported = stuck ?? movement;
-  if (reported === null) pass('head-binding');
-  else fail('head-binding', `${reported.cause}: ${reported.detail}`,
-    stuck === null && reported.cause === 'check-failed' && reported.stopped === true, stuck !== null);
+  if (movement === null) pass('head-binding');
+  else fail('head-binding', `${movement.cause}: ${movement.detail}`);
 
   // 2. Frozen packet completeness: every declared artifact is re-read from
   //    the frozen copy and proven byte-identical to its manifest digest.

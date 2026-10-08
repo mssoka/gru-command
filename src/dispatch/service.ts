@@ -114,10 +114,9 @@ export function renderMinionBriefing(input: {
           '`list_child_workers` to discover its durable result, and',
           '`cancel_child_worker` to stop it. This is NOT the build workflow\'s',
           'independent reviewer: that review runs as its own tracked review job',
-          '(a megaminion) commissioned through `POST /api/dispatch` with',
-          `\`"deliverable": "review"\` and \`"parent_job_id": "${input.jobId}"\` — never as a`,
-          'generic child. Children cannot commission children; never launch',
-          'external or headless agents yourself.',
+          'commissioned through `POST /api/dispatch` with',
+          '`"deliverable": "review"` — never as a generic child. Children cannot',
+          'commission children; never launch external or headless agents yourself.',
           '',
         ]
       : []),
@@ -172,18 +171,13 @@ export class DispatchService {
     deliverable?: JobDeliverable;
     /** Issue #220 report-job closure: who commissioned this report (the
      * disposition debtor) and what it reviewed. The commissioner defaults
-     * to the parent job on a megaminion (the minion that asked for the
-     * review acts on it — owner ruling 2026-10-08), else to `gru` on
-     * report-type jobs; a review job WITHOUT a target fails
+     * to `gru` on report-type jobs; a review job WITHOUT a target fails
      * loud — findings that cannot name what they reviewed are not a
      * commissioned report. Rejected on PR-owing lanes (the lane's own PR
      * is the deliverable, recorded via recordPr). */
     commissioner?: string;
     targetRef?: string;
     targetSha?: string;
-    /** The commissioning job: a minion dispatching a specialist
-     * (megaminion) names its own job so the child nests under that heist. */
-    parentJobId?: string;
     briefing: string;
     /** Explicit completion intent: when present, the phase-handoff guard
      * row is persisted BEFORE any side effect and this exact phase's
@@ -215,11 +209,7 @@ export class DispatchService {
         `job "${input.jobId}" is a PR-owing lane — target_ref/target_sha are report-job fields`,
       );
     }
-    // An explicit commissioner always wins; a megaminion's default debtor
-    // is its parent job (owner ruling 2026-10-08), never Gru by default.
-    const commissioner = isReportKind
-      ? (input.commissioner?.trim() || input.parentJobId?.trim() || 'gru')
-      : undefined;
+    const commissioner = isReportKind ? (input.commissioner?.trim() || 'gru') : undefined;
     const targetRef = isReportKind ? input.targetRef?.trim() : undefined;
     const targetSha = isReportKind ? input.targetSha?.trim() : undefined;
     const repoName = input.repoPath.split('/').filter(Boolean).pop() ?? input.repoPath;
@@ -235,7 +225,6 @@ export class DispatchService {
       ...(commissioner !== undefined ? { commissioner } : {}),
       ...(targetRef !== undefined ? { targetRef } : {}),
       ...(targetSha !== undefined ? { targetSha } : {}),
-      ...(input.parentJobId !== undefined ? { parentJobId: input.parentJobId } : {}),
     });
 
     // (2) Ops handoff: dispatched → working, on the record.

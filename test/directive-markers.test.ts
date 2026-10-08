@@ -471,7 +471,6 @@ describe('directive requests — the real service path (HTTP 202 + readback)', (
     // The directive route touches only the silas ops surface + ledger; the
     // dispatch/wave doubles are never reached on /api/silas/* paths.
     const server = createDispatchServer({
-      pendingProducerBlockers: () => [],
       config: cfg,
       dispatch: null as unknown as DispatchService,
       wave: null as unknown as WaveRunner,

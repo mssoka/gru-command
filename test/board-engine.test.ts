@@ -325,23 +325,6 @@ describe('board engine — liveness-first rail and job trackers', () => {
     expect(engine.snapshot().agents.find((row) => row.id === 'full-worker-uuid-dec9')).toMatchObject({ jobId: job.id, state: 'disposed', sessionFile: '/session' });
   });
 
-  it('projects the parent job of a megaminion (and null for a top-level heist)', () => {
-    const { api, engine } = fresh();
-    api.addJob({ id: 'impl', repo: 'fixture', title: 'Implementation' });
-    api.addJob({
-      id: 'impl-review-blind',
-      repo: 'fixture',
-      title: 'Review (blind)',
-      deliverable: 'review',
-      targetRef: 'https://github.com/acme/fixture/pull/1',
-      targetSha: 'c3f3b35',
-      parentJobId: 'impl',
-    });
-    const jobs = engine.snapshot().repos.flatMap((repo) => repo.jobs);
-    expect(jobs.find((row) => row.id === 'impl')?.parentJobId).toBeNull();
-    expect(jobs.find((row) => row.id === 'impl-review-blind')?.parentJobId).toBe('impl');
-  });
-
   it('sorts the rail by liveness before role: disposed gru BELOW streaming perkins; streaming above idle', () => {
     const { api, engine } = fresh();
     api.registerAgent({ id: 'chat-gru', role: 'gru' });

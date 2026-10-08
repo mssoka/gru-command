@@ -342,7 +342,6 @@ is ADMISSION-UNKNOWN — never read as safe to retry. States:
 | `admitted` | a correlated `silas.directive-sent` event bound an actual awaited turn; terminal receipt pending |
 | `settled` | the correlated `job.delivered` terminal receipt was recorded |
 | `failed` | a durable positive no-effect failure was recorded; resubmit changed work under a NEW request id |
-| `retired` | **control ownership closed** by the guarded, evidence-fenced retirement after server-verified writer cessation; no delivery and no no-effect outcome is claimed, the work remains unfinished, and the request id is consumed |
 
 `POST /api/silas/directive` returns **202** with the stable `request_id`
 once the durable intent is accepted — accepted ≠ admitted. The async
@@ -365,30 +364,6 @@ not permission. The live-request duplicate guard and the boot pass
 both query the LIVE states directly, and the boot pass pages by
 `request_id` cursor — terminal history can never crowd a live request
 out of examination.
-
-**Guarded retirement (migration 23, owner approval j-1348).** When a
-prompt was delivered and the worker ceased mid-turn with no correlated
-terminal receipt, the request's CONTROL ownership can be closed without
-claiming success or no-effect: `POST
-/api/silas/directives/{request_id}/retire` runs one ledger transaction
-that re-verifies every live-ownership mark (open agent turns, child
-workers, in-process admissions, re-brief markers, other live requests,
-provider waits, verification runs, review rounds, live lane processes),
-binds the caller's `expected_job_id` / `expected_state` /
-`expected_payload_hash` / `expected_head` (freshly resolved from the
-lane) and therefore refuses stale or conflicting intent, preserves any
-correlated admission evidence by binding it first
-(`admitted-without-terminal`), refuses a correlated terminal receipt so
-normal settlement owns it, flips the state to `retired`, appends exactly
-one `silas.directive-retired` audit event, and CLOSES (never completes)
-an awaiting phase handoff. The row keeps a durable continuation hold
-(`hold_released_by`/`hold_released_at`): while open it fences review
-arming, digest offers and stall offers exactly like a live request, and
-only a fresh accepted directive/re-brief identity releases it. Unknown,
-stale or missing evidence fails closed; replays of the same canonical
-intent are idempotent with one audit transition. No worker is spawned,
-no job/obligation/approval is rewritten, and activation remains a
-separate owner decision — see [DIRECTIVE-RECOVERY.md](./DIRECTIVE-RECOVERY.md).
 
 ### Explicit phase-completion handoffs (migration 12, pr136-chief-handoff)
 

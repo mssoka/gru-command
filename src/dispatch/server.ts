@@ -4,7 +4,6 @@ import type { GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { ChildWorkerRecord, JobDeliverable, LedgerApi } from '../ledger/api.js';
 import { JOB_DISPLAY_NAME_MAX_LENGTH, AmbiguousDirectiveError, DirectiveConflictError, PhaseHandoffConflictError, PipelineConflictError, RecordNotFound } from '../ledger/api.js';
-import { DirectiveRetirementError, directiveAdmissionClass, type LiveDirectiveState } from '../ledger/directives.js';
 import { isJobTerminal } from '../ledger/states.js';
 import { isReportDispositionOutcome, parseCompletionHandoffIntent, type CompletionHandoffIntent } from '../ledger/obligations.js';
 import { parsePipelinePrerequisites, type PipelinePrerequisite } from '../ledger/pipeline.js';
@@ -14,7 +13,6 @@ import type { DispatchService } from './service.js';
 import type { WaveRunner } from './perkins.js';
 import { flipJobToWorking, rebriefFreshMinion, recordFollowUpDelivery, routeFixDirectiveToMinion, type DirectiveRegistry } from './fix-directive.js';
 import { checkRebriefTurn, finalizeRebriefRequest, RebriefTurnCancelled } from './rebrief-recovery.js';
-import { retireInterruptedDirectiveFromRoute } from './directive-recovery.js';
 import type { LessonsReferencePort } from '../lessons/types.js';
 import { BranchBusyError } from './branch-idle.js';
 import { deliveredTargetSha, type SilasOpsDigest } from './silas-driver.js';
@@ -64,8 +62,6 @@ export interface DispatchServerOptions {
   /** Provider pacing: worker (minion turn) admission gate for directive
    * deliveries and re-briefs. Absent = off. */
   readonly workerGate?: PacingGate;
-  /** Supervisor's fresh queued/backoff producer ownership for retirement. */
-  readonly pendingProducerBlockers: (jobId: string) => readonly string[];
   /** Provider pacing: bounded settlement of an automatic rate-limit retry
    * covering a just-delivered directive/re-brief turn (supervisor-backed
    * in production). The route records delivered only for 'none'/'recovered'. */
@@ -230,19 +226,6 @@ function deliverableField(body: Record<string, unknown>): JobDeliverable | undef
   return value;
 }
 
-/** The optional megaminion parent. Unlike the blank-means-absent idiom of
- * display_name, a PRESENT parent_job_id must name a job: a blank, null or
- * non-string value is a 400 — never a reviewer silently filed as an
- * unrelated top-level heist. */
-function parentJobIdField(body: Record<string, unknown>): string | undefined {
-  if (!Object.hasOwn(body, 'parent_job_id')) return undefined;
-  const raw = body['parent_job_id'];
-  if (typeof raw !== 'string' || raw.trim() === '') {
-    throw new Error(`parent_job_id must be a non-empty job id when present (got ${JSON.stringify(raw)})`);
-  }
-  return raw.trim();
-}
-
 function completionHandoffField(body: Record<string, unknown>): CompletionHandoffIntent | undefined {
   const value = body['completion_handoff'];
   if (value === undefined) return undefined;
@@ -385,10 +368,6 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       const by = optStrField(body, 'by');
       const targetRef = optStrFieldStrict(body, 'target_ref');
       const targetSha = optStrFieldStrict(body, 'target_sha');
-      // Job family: a minion commissioning a specialist (megaminion) names
-      // its own job id so the board nests the child under that heist. The
-      // ledger refuses an unknown, cross-repo, self, or grandchild parent.
-      const parentJobId = parentJobIdField(body);
       const outcome = await options.dispatch.dispatch({
         jobId: strField(body, 'job_id'),
         repoPath: strField(body, 'repo_path'),
@@ -398,7 +377,6 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         ...(commissioner !== undefined ? { commissioner } : by !== undefined ? { commissioner: by } : {}),
         ...(targetRef !== undefined ? { targetRef } : {}),
         ...(targetSha !== undefined ? { targetSha } : {}),
-        ...(parentJobId !== undefined ? { parentJobId } : {}),
         briefing: strField(body, 'briefing'),
         ...(completionHandoff !== undefined ? { completionHandoff } : {}),
       });
@@ -1047,11 +1025,10 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         throw error;
       }
       const intent = begun.record;
-      if (intent.state === 'settled' || intent.state === 'failed' || intent.state === 'retired') {
+      if (intent.state === 'settled' || intent.state === 'failed') {
         // A consumed request id never re-runs (recovered capacity is not
         // permission): report the durable outcome; changed work needs a
-        // NEW request id. A retired id is consumed exactly like settled/
-        // failed — its control closure is not permission to replay it.
+        // NEW request id.
         json(res, 200, {
           request_id: intent.requestId,
           job_id: jobId,
@@ -1059,25 +1036,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           replay: true,
           minion_id: intent.admissionMinion,
           fail_reason: intent.failReason,
-          // A caller who only uses this replay path learns the same
-          // retirement facts the GET readback exposes — the id is consumed
-          // and why/when, never a success or no-effect claim.
-          ...(intent.state === 'retired'
-            ? {
-                admission_class: directiveAdmissionClass(intent),
-                retired_at: intent.retiredAt,
-                retired_by: intent.retiredBy,
-                retire_reason: intent.retireReason,
-                retire_expected_state: intent.retireExpectedState,
-                retire_expected_head: intent.retireExpectedHead,
-                hold_released_by: intent.holdReleasedBy,
-                hold_released_at: intent.holdReleasedAt,
-              }
-            : {}),
-          note:
-            intent.state === 'retired'
-              ? 'this request id was retired after server-verified writer cessation — it never re-runs; submit changed work under a new request id'
-              : 'this request id already reached a terminal state — submit changed work under a new request id',
+          note: 'this request id already reached a terminal state — submit changed work under a new request id',
         });
         return true;
       }
@@ -1291,84 +1250,6 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       });
       return true;
     }
-    const directiveRetirement = /^\/api\/silas\/directives\/([^/]+)\/retire$/.exec(path);
-    if (req.method === 'POST' && directiveRetirement !== null) {
-      if (!authed(req, res)) return true;
-      const ops = silasOpsOr503(res);
-      if (ops === null) return true;
-      const requestId = decodeURIComponent(directiveRetirement[1] ?? '');
-      const body = await readBody(req);
-      const expectedJobId = strField(body, 'expected_job_id');
-      const expectedStateRaw = strField(body, 'expected_state');
-      if (expectedStateRaw !== 'dispatching' && expectedStateRaw !== 'admitted') {
-        throw new Error('expected_state must be "dispatching" or "admitted"');
-      }
-      const expectedState = expectedStateRaw as LiveDirectiveState;
-      // Git object ids and sha256 hex digests are lowercase; normalizing
-      // before the fingerprint/compare keeps a valid uppercase spelling
-      // from failing as a misdirecting `stale_head`/`request_mismatch`.
-      const expectedPayloadHash = strField(body, 'expected_payload_hash').trim().toLowerCase();
-      const expectedHead = strField(body, 'expected_head').trim().toLowerCase();
-      if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/u.test(expectedHead)) {
-        throw new Error('expected_head must be a full git object id (40 or 64 hex characters)');
-      }
-      const reason = strField(body, 'reason');
-      const by = strField(body, 'by');
-      let outcome: ReturnType<typeof retireInterruptedDirectiveFromRoute>;
-      try {
-        outcome = retireInterruptedDirectiveFromRoute({
-          ledger: options.ledger,
-          worktrees: ops.worktrees,
-          ...(options.workerGate !== undefined ? { workerGate: options.workerGate } : {}),
-          pendingProducerBlockers: options.pendingProducerBlockers,
-          requestId,
-          expected: {
-            jobId: expectedJobId,
-            state: expectedState,
-            payloadHash: expectedPayloadHash,
-            head: expectedHead,
-          },
-          reason,
-          by,
-        });
-      } catch (error) {
-        if (error instanceof DirectiveRetirementError) {
-          json(res, 409, {
-            error: error.code,
-            detail: error.message,
-            ...(error.blockers.length > 0 ? { blockers: error.blockers } : {}),
-          });
-          return true;
-        }
-        if (error instanceof RecordNotFound) {
-          json(res, 404, { error: 'not_found', detail: error.message });
-          return true;
-        }
-        throw error;
-      }
-      const record = outcome.record;
-      json(res, 200, {
-        request_id: record.requestId,
-        job_id: record.jobId,
-        state: record.state,
-        idempotent: outcome.idempotent,
-        admission_class: directiveAdmissionClass(record),
-        admission_seq: record.admissionSeq,
-        minion_id: record.admissionMinion,
-        retired_at: record.retiredAt,
-        retired_by: record.retiredBy,
-        retire_reason: record.retireReason,
-        retire_expected_state: record.retireExpectedState,
-        retire_expected_head: record.retireExpectedHead,
-        hold_released_by: record.holdReleasedBy,
-        hold_released_at: record.holdReleasedAt,
-        phase_handoff_closed: outcome.phaseClosed,
-        note:
-          'control ownership closed after server-verified writer cessation — no delivery and no no-effect outcome is claimed; ' +
-          'the work remains unfinished and lane continuation requires a fresh authorized request',
-      });
-      return true;
-    }
     const directiveReadback = /^\/api\/silas\/directives\/([^/]+)$/.exec(path);
     if (req.method === 'GET' && directiveReadback !== null) {
       if (!authed(req, res)) return true;
@@ -1382,7 +1263,6 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         request_id: record.requestId,
         job_id: record.jobId,
         state: record.state,
-        payload_hash: record.payloadHash,
         accepted_at: record.createdAt,
         updated_at: record.updatedAt,
         admission_seq: record.admissionSeq,
@@ -1390,27 +1270,12 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         delivery_seq: record.deliverySeq,
         attempts: record.attempts,
         fail_reason: record.failReason,
-        ...(record.state === 'retired'
-          ? {
-              admission_class: directiveAdmissionClass(record),
-              retired_at: record.retiredAt,
-              retired_by: record.retiredBy,
-              retire_reason: record.retireReason,
-              retire_expected_state: record.retireExpectedState,
-              retire_expected_head: record.retireExpectedHead,
-              hold_released_by: record.holdReleasedBy,
-              hold_released_at: record.holdReleasedAt,
-            }
-          : {}),
         states: {
           dispatching:
             'accepted; a dispatch claim was taken before any side effect — native admission not yet recorded (or unknown after a crash)',
           admitted: 'a correlated silas.directive-sent event bound an actual awaited turn; terminal receipt pending',
           settled: 'the correlated job.delivered terminal receipt was recorded',
           failed: 'a durable positive no-effect failure was recorded; resubmit changed work under a new request id',
-          retired:
-            'control ownership closed after server-verified writer cessation; no delivery and no no-effect outcome is claimed, ' +
-            'the work remains unfinished, and continuation requires a fresh authorized request',
         },
       });
       return true;

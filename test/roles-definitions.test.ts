@@ -59,8 +59,6 @@ describe('role definitions (E8)', () => {
     ]) expect(silas).toContain(clause);
     expect(silas).toContain('never\nmerge');
     expect(silas).toContain('service-restart clean abort');
-    // Silas-dispatched reports on a lane nest under it as megaminions.
-    expect(silas.replace(/\s+/gu, ' ')).toContain('names that lane\'s job id as `"parent_job_id"`');
     expect(silas).toContain('owner-held');
   });
 
@@ -130,14 +128,6 @@ describe('build-workflow playbook (owner ruling 2026-10-02; j-761 capability ame
     expect(minion).toContain('a separate tracked job with its own session and worktree');
     expect(minion).toContain('read-only brief');
     expect(minion).toContain('"deliverable": "review"');
-    // Each reviewer names the commissioning job so the board nests it
-    // under that heist as a megaminion instead of a peer heist.
-    expect(minion.replace(/\s+/gu, ' ')).toContain('name your own job id (the one in your briefing header) as `"parent_job_id"`');
-    expect(minion).toContain('megaminion');
-    // The commissioning minion owes each reviewer's disposition.
-    const flatMinion = minion.replace(/\s+/gu, ' ');
-    expect(flatMinion).toContain("makes your job each reviewer's commissioner");
-    expect(flatMinion).toContain('POST /api/jobs/<review job id>/disposition');
     expect(minion).toContain('an inline self-review is not a substitute');
     // The loud missing-capability stop names the official onboarding path.
     expect(minion).toContain("Project-local BMAD");

@@ -124,9 +124,6 @@ export interface BranchIdleLedger {
     readonly jobId?: string;
     readonly states?: readonly DirectiveState[];
   }): readonly DirectiveRequestRecord[];
-  /** True while any retirement continuation hold for the job is unreleased:
-   * the lane stays fenced — no review may freeze, no offer may fire. */
-  hasOpenDirectiveRecoveryHold(jobId: string): boolean;
   /** True while any verification run for the job is unsettled: it owns the
    * checkout and no review may freeze the same head. */
   hasUnsettledVerificationRun(jobId: string): boolean;
@@ -193,29 +190,16 @@ export function resolveReviewTargetBranch(input: {
  * flip can only follow the `working` hop that started the attempt, so the
  * newest older status event IS that hop. Paged because the ledger exposes
  * only a limit-bounded newest-first window. */
-function previousStatusEvent(ledger: BranchIdleLedger, jobId: string, flipSeq: number): EventRecord | null {
+function previousStatusSeq(ledger: BranchIdleLedger, jobId: string, flipSeq: number): number | null {
   let limit = 200;
   for (;;) {
     const events = ledger.listJobEvents(jobId, { limit });
     const previous = events.find((event) => event.seq < flipSeq && event.kind === 'job.status');
-    if (previous !== undefined) return previous;
+    if (previous !== undefined) return previous.seq;
     // Fewer rows than requested means the history is exhausted.
     if (events.length < limit || limit >= 12_800) return null;
     limit *= 4;
   }
-}
-
-/** The attempt a `→ working` hop belongs to: its own, unless it is a
- * refused review round's restore — that resumes the attempt the round
- * interrupted (nothing ran on the lane, so the delivery that settled it
- * still does). */
-function workingHopAttemptStart(hop: EventRecord): number {
-  const payload = typeof hop.payload === 'object' && hop.payload !== null
-    ? (hop.payload as { restoredAfterRound?: unknown; attemptStartSeq?: unknown })
-    : {};
-  const resumed = payload.attemptStartSeq;
-  return typeof payload.restoredAfterRound === 'string' && typeof resumed === 'number' &&
-    Number.isSafeInteger(resumed) && resumed < hop.seq ? resumed : hop.seq;
 }
 
 /** Seq of the job's current attempt start (0 when none is open). The
@@ -230,10 +214,10 @@ export function openAttemptStartSeq(ledger: BranchIdleLedger, jobId: string): nu
   const payload = typeof latest.payload === 'object' && latest.payload !== null
     ? (latest.payload as { from?: unknown; to?: unknown })
     : {};
-  if (payload.to === 'working') return workingHopAttemptStart(latest);
+  if (payload.to === 'working') return latest.seq;
   if (payload.to === 'in-review' && payload.from === 'working') {
-    const hop = previousStatusEvent(ledger, jobId, latest.seq);
-    if (hop !== null) return workingHopAttemptStart(hop);
+    const hop = previousStatusSeq(ledger, jobId, latest.seq);
+    if (hop !== null) return hop;
     // The status history is unreachable past the page cap. A delivery newer
     // than the flip settles the attempt the flip belongs to, so the lane
     // clears; otherwise fail closed and treat the attempt as open (a later
@@ -272,10 +256,6 @@ export function laneIsBusy(ledger: BranchIdleLedger, job: JobRecord): boolean {
   // An accepted directive request may already be prompting a writer before
   // its admission event lands: review must not arm on that head (issue #162).
   if (ledger.listPendingDirectives({ jobId: job.id, states: LIVE_DIRECTIVE_STATES }).length > 0) return true;
-  // A retirement's continuation hold is the same runtime fence for a request
-  // whose control ownership was closed without completion: no review may arm
-  // on the lane until a fresh accepted request supersedes the hold.
-  if (ledger.hasOpenDirectiveRecoveryHold(job.id)) return true;
   // A verification run owns the checkout for its whole life; a review must
   // not freeze the head it is verifying.
   if (ledger.hasUnsettledVerificationRun(job.id)) return true;

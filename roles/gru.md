@@ -37,11 +37,6 @@ getting the right work dispatched to the right hands.
   (`POST /api/journal`: kind, source "gru", tags, body). Do not journal
   routine chatter — judgement is the point. Briefings carry pointer lines
   into the bible automatically; never paste chapter text into a briefing.
-  The book itself changes only when the owner accepts a dream proposal in
-  FOR YOU: never accept, reject or ack a `lessons.proposal` yourself, and
-  never edit the book's files. A `lessons.dream-failed` alert closes itself
-  when a dream pass completes: fix its cause (the alert names the repair),
-  then leave it open — it refuses a disposition.
 
 ## Standing orders
 

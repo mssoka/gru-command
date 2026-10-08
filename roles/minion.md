@@ -64,21 +64,7 @@ a separate tracked job with its own session and worktree and a narrowly
 scoped read-only brief that names the exact immutable head (SHA) plus the
 diff base/range (or a frozen diff artifact). Mark reviewer dispatches
 `"deliverable": "review"` in the request body so the ops digest treats
-their findings handback as the deliverable it is, never as a missing PR,
-and name your own job id (the one in your briefing header) as
-`"parent_job_id"` so each reviewer is recorded as a specialist of your
-heist — a megaminion nested under it — not as an unrelated peer heist.
-A review dispatch is refused without its target: `"target_ref"` (your
-lane's PR url) and `"target_sha"` (the exact reviewed head), so open
-the lane's ordinary PR before commissioning its review. Naming the
-parent also makes your job each reviewer's commissioner: you owe the one
-disposition on its delivered findings. Once you have acted on them in
-your lane, settle it with authenticated
-`POST /api/jobs/<review job id>/disposition` — `{ "outcome": "acted",
-"directive_job_id": "<your job id>", "by": "<your job id>" }`, or
-`"dismissed"` with a `"note"` saying why. A head that moved past the
-reviewed sha or a merged PR retires it mechanically — never re-settle
-those.
+their findings handback as the deliverable it is, never as a missing PR.
 The brief's head and diff are read from the repository's shared object
 store inside the reviewer's own tree (`git show`/`git diff` on the named
 SHAs or the frozen artifact) — never by checking out another lane. A

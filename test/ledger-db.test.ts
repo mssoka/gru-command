@@ -4,7 +4,6 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { afterAll, describe, expect, it } from 'vitest';
 import { LedgerDb, MIGRATIONS } from '../src/ledger/db.js';
-import { LedgerApi } from '../src/ledger/api.js';
 
 const cleanupDirs: string[] = [];
 afterAll(() => {
@@ -45,47 +44,6 @@ describe('ledger db + migration runner', () => {
     const upgraded = new LedgerDb(dir);
     expect(upgraded.handle.prepare("SELECT title, display_name FROM jobs WHERE id = 'j'").get()).toMatchObject({ title: 'Full legacy title', display_name: null });
     expect(upgraded.handle.prepare("SELECT job_id FROM agents WHERE id = 'a'").get()).toMatchObject({ job_id: 'j' });
-    upgraded.close();
-  });
-
-  it('upgrades a pre-retirement ledger keeping existing directive rows live and readable', () => {
-    const dir = tmpDir();
-    const old = new LedgerDb(dir, { migrations: MIGRATIONS.slice(0, 22) });
-    old.handle.prepare("INSERT INTO jobs (id, repo, title, status, created_at, updated_at) VALUES ('j', 'r', 't', 'working', 't', 't')").run();
-    old.handle
-      .prepare(
-        `INSERT INTO pending_directives (request_id, job_id, payload, payload_hash, state, baseline_seq, claim, attempts, created_at, updated_at)
-         VALUES ('req-legacy', 'j', '{}', 'hash', 'dispatching', 1, NULL, 0, 't', 't')`,
-      )
-      .run();
-    old.close();
-    const upgraded = new LedgerDb(dir);
-    expect(upgraded.handle.prepare("SELECT COUNT(*) AS n FROM schema_migrations WHERE id = 23").get()).toMatchObject({ n: 1 });
-    const columns = upgraded.handle
-      .prepare(
-        `SELECT retired_at, retired_by, retire_reason, retire_fingerprint, retire_expected_state, retire_expected_head,
-                hold_released_by, hold_released_at
-           FROM pending_directives WHERE request_id = 'req-legacy'`,
-      )
-      .get();
-    expect(columns).toMatchObject({
-      retired_at: null,
-      retired_by: null,
-      retire_reason: null,
-      retire_fingerprint: null,
-      retire_expected_state: null,
-      retire_expected_head: null,
-      hold_released_by: null,
-      hold_released_at: null,
-    });
-    const indexes = upgraded.handle.prepare("PRAGMA index_list('pending_directives')").all() as { name: string }[];
-    expect(indexes.map((index) => index.name)).toContain('idx_pending_directives_hold');
-    const api = new LedgerApi(upgraded.handle);
-    const row = api.getDirective('req-legacy');
-    expect(row?.state).toBe('dispatching');
-    expect(row?.retiredAt).toBeNull();
-    expect(row?.holdReleasedBy).toBeNull();
-    expect(api.hasOpenDirectiveRecoveryHold('j')).toBe(false);
     upgraded.close();
   });
 

@@ -2571,7 +2571,6 @@ export const PUBLIC_REVIEW_EXECUTABLE_PATHS: ReadonlySet<string> = new Set([
   "dist/dispatch/bob-scheduler.js",
   "dist/dispatch/branch-idle.js",
   "dist/dispatch/child-workers.js",
-  "dist/dispatch/directive-recovery.js",
   "dist/dispatch/durable-reconcile.js",
   "dist/dispatch/escalation-identity.js",
   "dist/dispatch/fix-directive.js",
