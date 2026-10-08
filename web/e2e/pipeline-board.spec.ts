@@ -378,11 +378,14 @@ async function hitTarget(page: Page, selector: string): Promise<HitTarget> {
 
 /** Make a control actually reachable before the strict containment probe:
  * keep the browser's minimal placement, then iteratively correct residual
- * edge overflow (the sub-pixel sliver that caused the b86af16 failures,
- * runs f6998e40/52b744fa) and sticky-chrome occlusion with explicit
- * scrolls — the scroll a real user would perform. Bounded; if the control
- * cannot be cleared, the strict probe below still fails truthfully. The
- * oracle admits nothing off-viewport. */
+ * edge overflow (three of the four preserved b86af16 RED failures — run
+ * f6998e40 — were this 0<1px bottom sliver; the fourth was the stale fixed
+ * nav bound replaced at 065bbf6; 52b744fa is the later relaxed-green
+ * masking run, never the failure) and sticky-chrome occlusion with
+ * explicit scrolls — the scroll a real user would perform. Handles a cover
+ * above OR below the control. Bounded; if the control cannot be cleared,
+ * the strict probe below still fails truthfully. The oracle admits nothing
+ * off-viewport. */
 async function scrollFullyIntoView(page: Page, selector: string): Promise<void> {
   await page
     .locator(selector)
@@ -394,15 +397,26 @@ async function scrollFullyIntoView(page: Page, selector: string): Promise<void> 
         const rect = el.getBoundingClientRect();
         const top = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
         const covered = !(top !== null && (top === el || el.contains(top)));
-        if (covered) {
-          // Move the control down (scroll the document up) just enough to
-          // clear the covering sticky element, never past the fold.
-          const coverBottom = top === null ? 0 : top.getBoundingClientRect().bottom;
+        if (covered && top !== null) {
+          // Score both escape directions against the covering element and
+          // take the feasible smaller move: down (scroll up) when the cover
+          // sits above the control, up (scroll down) when it sits below.
+          const cover = top.getBoundingClientRect();
+          const downNeed = Math.max(0, cover.bottom + pad - rect.top);
+          const upNeed = Math.max(0, rect.bottom - (cover.top - pad));
           const roomDown = Math.max(0, window.innerHeight - pad - rect.bottom);
-          const move = Math.min(Math.max(0, coverBottom + pad - rect.top), roomDown);
-          if (move <= 0.5) break;
-          window.scrollBy(0, -move);
-          continue;
+          const roomUp = Math.max(0, rect.top - pad);
+          const canDown = downNeed > 0.5 && downNeed <= roomDown;
+          const canUp = upNeed > 0.5 && upNeed <= roomUp;
+          if (canDown && (!canUp || downNeed <= upNeed)) {
+            window.scrollBy(0, -downNeed);
+            continue;
+          }
+          if (canUp) {
+            window.scrollBy(0, upNeed);
+            continue;
+          }
+          break;
         }
         if (rect.bottom > window.innerHeight - pad) {
           window.scrollBy(0, rect.bottom - (window.innerHeight - pad));
