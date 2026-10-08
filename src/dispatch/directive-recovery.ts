@@ -28,11 +28,13 @@ import { resolveGitCommit } from './perkins-review/artifacts.js';
 import type { WorktreeLane, WorktreePort } from './worktree-port.js';
 
 export interface DirectiveRetirementRequest {
-  readonly ledger: Pick<LedgerApi, 'getDirective' | 'retireInterruptedDirective'>;
+  readonly ledger: Pick<LedgerApi, 'getDirective' | 'retireInterruptedDirective' | 'listAgents'>;
   readonly worktrees: Pick<WorktreePort, 'listWorktrees'>;
   /** Pace-gate view (when hosted): a worker turn already queued for this
    * job is live producer evidence. */
   readonly workerGate?: Pick<PacingGate, 'view'>;
+  /** Fresh supervisor ownership, including scheduled backoff/retry turns. */
+  readonly pendingProducerBlockers?: (jobId: string) => readonly string[];
   readonly requestId: string;
   readonly expected: {
     readonly jobId: string;
@@ -60,7 +62,13 @@ function resolveRetirementLane(
   worktrees: Pick<WorktreePort, 'listWorktrees'>,
   jobId: string,
 ): WorktreeLane {
-  const jobLanes = worktrees.listWorktrees({ jobId }).filter((lane) => lane.kind === 'job');
+  let jobLanes: readonly WorktreeLane[];
+  try {
+    jobLanes = worktrees.listWorktrees({ jobId }).filter((lane) => lane.kind === 'job');
+  } catch (error) {
+    throw new DirectiveRetirementError('lane_unavailable',
+      `job "${jobId}" lane registry is unreadable (${String(error).slice(0, 200)}) — cannot bind cessation evidence`);
+  }
   const candidates = jobLanes.filter((lane) => lane.status !== 'swept');
   if (candidates.length !== 1) {
     throw new DirectiveRetirementError(
@@ -96,8 +104,20 @@ export function retireInterruptedDirectiveFromRoute(input: DirectiveRetirementRe
   if (!RETIRABLE_STATES.includes(row.state as LiveDirectiveState)) return callLedger();
 
   const lane = resolveRetirementLane(input.worktrees, row.jobId);
+  let producerBlockers: readonly string[];
+  try {
+    producerBlockers = input.pendingProducerBlockers?.(row.jobId) ?? [];
+  } catch (error) {
+    throw new DirectiveRetirementError('live_work',
+      `job "${row.jobId}" supervisor ownership is unreadable (${String(error).slice(0, 200)}) — cannot prove cessation`,
+      ['supervisor ownership unavailable']);
+  }
+  if (producerBlockers.length > 0) {
+    throw new DirectiveRetirementError('live_work', `job "${row.jobId}" has pending supervised producer ownership`, producerBlockers);
+  }
   if (input.workerGate !== undefined) {
-    const queued = input.workerGate.view().worker.queued.find((entry) => entry.id === row.jobId);
+    const agentIds = new Set(input.ledger.listAgents().filter((agent) => agent.jobId === row.jobId).map((agent) => agent.id));
+    const queued = input.workerGate.view().worker.queued.find((entry) => entry.id === row.jobId || agentIds.has(entry.id));
     if (queued !== undefined) {
       throw new DirectiveRetirementError(
         'live_work',

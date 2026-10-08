@@ -1411,6 +1411,7 @@ async function main(): Promise<number> {
     ledger,
     childWorkers,
     workerGate: pacing.gate,
+    pendingProducerBlockers: (jobId) => supervisorLive.pendingProducerBlockers(jobId),
     retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
     ...(pipeline !== null ? { pipeline } : {}),
     ...(config.silas.enabled && silasSlot !== null

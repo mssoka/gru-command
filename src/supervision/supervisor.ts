@@ -2388,6 +2388,24 @@ export class Supervisor {
     });
   }
 
+  /** Synchronous cessation evidence for guarded control closure. A timer,
+   * queued retry or undecided recovery is still producer ownership even
+   * while its durable agent row says idle/error/disposed. */
+  pendingProducerBlockers(jobId: string): readonly string[] {
+    return this.ledger.listAgents().filter((row) => row.jobId === jobId).flatMap((row) => {
+      const agent = this.agents.get(row.id);
+      if (agent === undefined) {
+        return this.registry.getHandle(row.id) !== null
+          ? [`supervision ownership unknown: ${row.id}`] : [];
+      }
+      const pending = agent.inRestart || agent.backoffTimer !== null || agent.decisionPending ||
+        agent.queuedRecovery !== null || agent.rateLimitRetry !== null || agent.recoveryAdmission !== null ||
+        (agent.state !== 'stopped' && !agent.breakerOpen && agent.pendingRecovery !== null);
+      const open = agent.openTurn || agent.openControl || agent.openToolCalls.size > 0;
+      return pending || open ? [`supervised producer: ${row.id} (${pending ? 'pending recovery/retry' : 'open turn/control/tool'})`] : [];
+    });
+  }
+
   /** Board feed: supervision view for one agent id (or null). */
   viewFor(agentId: string): AgentSupervisionView | null {
     const agent = this.agents.get(agentId);

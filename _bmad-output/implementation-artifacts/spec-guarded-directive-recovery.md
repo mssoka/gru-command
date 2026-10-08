@@ -178,6 +178,48 @@ It intentionally binds a dirty test-first tree, not a passing commit.
 All corrections stay within the frozen continuation boundary; no deferred
 work or production activation was created. The matrix now registers 38 tests.
 
+### Requested Herdr Pi review at `55d70ed` (2026-10-08)
+
+All four independent reviewers completed using Pi `openai-codex/gpt-6-sol`
+(Blind Hunter `wA9:p2Y`, Edge Case Hunter `wA9:p2Z`, Verification Gap
+`wA9:p20`, Acceptance Auditor `wA9:p31`). Reports are in
+`~/.gru-command/captures/guarded-directive-continuation-20261008/`.
+Each raw finding was verified at the reviewed head and receives its own
+verdict below, before root-cause grouping. Verification Gap's sole `Other
+finding` was verified normally, not accepted as a pre-verified test gap.
+All corrections are private boundary patches to demonstrated states; no
+new operator endpoint, frozen-intent change, or deferred work was added.
+
+| # | Raw reviewer claim | Verdict | Evidence + patch disposition |
+|---|---|---|---|
+| H-B1 | Historical claimed waits permanently block later retirement | high | The query included every claimed wait after its awaited turn ended. Keep unproven claims fenced; emit a genuine correlated provider terminal receipt and exclude only proven completed/failed or superseded debt. Real provider happy-path and retirement tests discriminate both cases. |
+| H-B2 | Pending supervisor backoff can restart after retirement | high | The tap adopts lane minions, and failed rungs retain a timer while rows are idle/error. Production retirement now reads the supervisor's pending classification/restart/retry/control ownership synchronously; real failed-rung and rate-limit tests plus route refusal/cessation tests cover it. |
+| H-B3 | Agent-ID-keyed paced retries escape job-ID queue lookup | high | Supervisor retry/recovery gates use agent IDs. Match the subject job's registered agent IDs too; the new queued-agent test refuses without an audit write. |
+| H-B4 | Forced review bypasses an open hold | high | The branch blocker reached the force override. Hold blockers are now unconditionally refused and never audited as forced; real review-route force test proves zero rounds/spawns. |
+| H-B5 | Foreign target bypasses the reviewed job's own hold | high | Only the own-job re-brief was unconditional. Include the own-job hold independently of target resolution; foreign-target and force-plus-target route cases refuse. |
+| H-B6 | Old provider continuation races fresh accepted directive | high | Acceptance clears the hold before the replacement appears; claim did not inspect its live ownership. Check fresh directive/re-brief/admission ownership before claim and immediately before side effects, and bind old waits to the durable accepted handoff sequence. Old waits stay unchanged and cannot resume after the fresh turn ends. |
+| H-B7 | Parked/blocked handling cancels a wait before the hold guard | medium | Those status branches ran first and wrote cancelled status. The hold guard now precedes them; working/parked/blocked cases prove byte-identical wait and event history. |
+| H-B8 | Retire-plus-accept during digest await republishes stale offers | high | At publication only the already-released hold was checked. Recheck fresh producer ownership on retired lanes after all awaits; a retire-plus-accept race now retracts the old verdict. |
+| H-B9 | One malformed hold masks later healthy board debt | medium | Bulk decode threw before projection could inspect the later row. Projection reports malformed audit debt individually, keeps healthy holds visible, and leaves strict control reads throwing; real board test observes the named error and healthy hold. |
+| H-B10 | Throwing registry becomes generic HTTP 400 | medium | Registry lookup escaped the typed lane-evidence boundary. Translate it to 409 lane_unavailable before any write; the exact throwing-port route test preserves row/events. |
+| H-E1 | Late old wait can resume alongside a fresh directive | high | Independently confirmed the live-intent/admission gap in the provider claim. The fresh-owner, ordered supersession and pre-side-effect fences prevent this outcome; old wait remains recorded. |
+| H-E2 | Throwing registry is an untyped refusal | medium | Confirmed thrown listWorktrees reached generic bad_request. The typed registry boundary returns lane_unavailable with no mutation. |
+| H-E3 | Malformed earlier hold hides a later healthy hold | medium | Confirmed one decode error poisoned the bulk projection. Per-row error reporting preserves the healthy board hold and strict fail-closed reads. |
+| H-E4 | Open hold fails to preserve a parked/blocked late wait | medium | Confirmed status cancellation preceded the hold branch. Hold-first refusal preserves the wait on both statuses. |
+| H-V1 | Fresh dispatching intent does not fence old recovered wait claim | high | Confirmed acceptance releases the hold before worker registration and the test offered but never claimed the wait. The test now attempts claim both during and after the fresh request; both refuse old evidence, while a genuinely new post-handoff wait can continue. |
+| H-A1 | Admitted row may audit minion B against sent receipt naming A | high | recordDirectiveAdmission allowed the mismatch and retirement skipped bound-evidence revalidation. Retirement now verifies exact sent sequence/kind/job/request/minion for admitted rows; mismatch refuses with admission_evidence_incomplete and no writes. |
+| H-A2 | Unreadable registry violates typed fail-closed AC | medium | Confirmed the port exception bypassed lane_unavailable mapping. The new typed 409 test covers the registry itself, not merely an inaccessible checkout path. |
+
+After individual verdicts, shared roots are: provider authority/history
+(H-B1/B6/B7, H-E1/E4, H-V1), supervised/paced producer ownership
+(H-B2/B3), review authorization (H-B4/B5), digest publication (H-B8),
+projection isolation (H-B9/H-E3), typed lane evidence (H-B10/H-E2/H-A2),
+and bound admission identity (H-A1). Every real finding is patched here;
+none is deferred or dismissed. The retirement matrix now registers 46
+tests and the supervisor suite 94. Dirty-tree preflights are development
+evidence only, never commit-bound clearance; clean-head focused/full
+receipts are captured separately after the patch commit.
+
 ## Design Notes
 
 **Cessation predicate (server-derived, fail closed).** Blockers: agents of the job in
@@ -185,10 +227,13 @@ work or production activation was created. The matrix now registers 38 tests.
 prompting and every prompt-starting path takes an in-flight admission before its first await);
 non-terminal child workers (`queued`/`admitted`/`active`); `activeJobAdmissions` for the job;
 pending re-brief markers; any live directive other than the subject; open provider waits
-(`waiting`/`recovered-pending`/`claimed`) for the job; `hasUnsettledVerificationRun`; review
-rounds `pending`/`live`; live `worktree_processes` rows for the job's lanes; a queued worker
-pacing-gate entry whose id is the job (when the gate is hosted). Missing lane, unresolvable
-head, unreadable evidence or a sent event without minion identity refuses. The route resolves
+(`waiting`/`recovered-pending`/unproven `claimed`) for the job; `hasUnsettledVerificationRun`; review
+rounds `pending`/`live`; live `worktree_processes` rows for the job's lanes; worker pacing
+entries keyed by job or its agents; supervisor pending classification/restart/backoff,
+retry/recovery admission, or open turn/control/tool ownership. Historical claims need a
+correlated genuine provider terminal receipt; superseded waits need an exact durable
+handoff sequence (unknown evidence stays a blocker). Missing lane, unresolvable
+head, unreadable registry/supervision, or inconsistent sent/admitted identity refuses. The route resolves
 lane + fresh `resolveGitCommit` head; the ledger re-checks and compares inside one transaction.
 
 **Race elimination.** The guarded section is fully synchronous (no await between evidence
@@ -202,7 +247,13 @@ so the in-transaction re-check is authoritative. Late evidence cannot rewrite a 
 **Hold semantics.** The `retired` row keeps its own `hold_released_by`/`hold_released_at`; an
 open hold is a runtime fence (branch-idle + digest + board), NOT attention. It is released
 atomically by the next accepted directive intent or re-brief marker (identity recorded); replay
-of the retired id never releases it.
+of the retired id never releases it. Fresh acceptance on a job with retirement history
+also records `silas.directive-recovery-handoff`, bound to the accepted identity and
+retired request IDs. Native event ordering, never clock age, proves whether a provider
+wait preceded that handoff. Superseded waits remain unchanged, are not continuation
+offers, and do not permanently block later control closure; missing ordered proof stays
+fenced. Forced review and foreign targets cannot waive a hold. A fresh live producer is
+rechecked after every digest await.
 
 ## Verification
 

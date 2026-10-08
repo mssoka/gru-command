@@ -799,6 +799,29 @@ describe('supervisor — watchdog + restart ladder', () => {
 });
 
 describe('supervisor — durable restart association', () => {
+  it('reports failed-restart backoff as producer ownership before any pacing entry exists', async () => {
+    vi.useFakeTimers();
+    const rig = boot();
+    try {
+      rig.api.addJob({ id: 'retirement-backoff', repo: 'fixture', title: 'retirement-backoff' });
+      const original = new FakeHandle('minion', 'retirement-backoff-agent', null);
+      rig.registry.adopt(original);
+      rig.api.registerAgent({ id: original.id, role: 'minion', jobId: 'retirement-backoff' });
+      rig.registry.spawnImpl = async () => { throw new Error('restart transport unavailable'); };
+      expect(rig.supervisor.pendingProducerBlockers('retirement-backoff')).toEqual([]);
+      original.emit({ type: 'error', error: 'session stream died', fatal: true });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(original.disposed).toBe(true);
+      expect(rig.registry.getHandle(original.id)).toBeNull();
+      rig.api.setAgentState(original.id, 'error', 'restart transport unavailable');
+      expect(rig.supervisor.pendingProducerBlockers('retirement-backoff').join(' ')).toContain('pending recovery/retry');
+      expect(rig.supervisor.pendingProducerBlockers('unrelated-job')).toEqual([]);
+    } finally {
+      rig.dispose();
+      vi.useRealTimers();
+    }
+  });
+
   it('carries the known job binding through both fresh-id and same-id minion restarts', async () => {
     for (const sameId of [false, true]) {
       const rig = boot();
@@ -2253,7 +2276,9 @@ describe('supervisor — automatic rate-limit retries (owner heist 2026-09-29, s
       sleep: sleeper.sleep,
       jitter: () => 0,
     });
+    h.api.addJob({ id: 'job-bounded', repo: 'fixture', title: 'job-bounded' });
     const handle = new FakeHandle('minion', 'minion-429-bounded', null);
+    h.api.registerAgent({ id: handle.id, role: 'minion', jobId: 'job-bounded' });
     handle.pendingTurnSnapshot = { text: 'finish the lane', owner: 'dispatch:job-bounded' };
     h.registry.adopt(handle);
     // Every delivery fails in-band (pi-style: the failure event arrives
@@ -2263,6 +2288,7 @@ describe('supervisor — automatic rate-limit retries (owner heist 2026-09-29, s
     };
     emitFailure(handle, '429 too many requests');
     expect(sleeper.delays).toEqual([100]);
+    expect(h.supervisor.pendingProducerBlockers('job-bounded').join(' ')).toContain('pending recovery/retry');
     await sleeper.release(); // attempt 1 fails -> attempt 2 at 200ms
     expect(sleeper.delays).toEqual([100, 200]);
     await sleeper.release(); // attempt 2 fails -> attempt 3 at 400ms

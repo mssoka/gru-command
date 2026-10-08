@@ -34,13 +34,18 @@ the caller supplies expectations only:
   `expected_head` (a registered branch tip is not checkout evidence).
 - **No open worker turn**: no agent of the job in `spawning`/`streaming`.
 - **No queued producer**: no non-terminal child worker; no pace-gate
-  worker turn queued for the job.
+  worker turn queued under the job or one of its agent IDs; no pending
+  supervisor restart/backoff, classification, recovery admission or
+  automatic rate-limit retry (idle/error durable state is not cessation).
 - **No in-flight admission**: no process-local admission reserved for the
   job (the boundary every producer crosses before its first await).
 - **No re-brief**: no `pending_rebriefs` marker.
 - **No other live directive**: no live request other than the subject.
-- **No provider continuation**: no `provider_waits` row for the job in
-  `waiting`/`recovered-pending`/`claimed`.
+- **No provider continuation**: no `waiting`/`recovered-pending` provider
+  wait or unproven `claimed` continuation. A claimed wait remains historical
+  after a correlated `provider.continuation-completed` or
+  `provider.continuation-failed` receipt; active runtime admission and
+  supervisor ownership still refuse. Missing terminal proof remains fenced.
 - **No verification producer**: no unsettled verification run.
 - **No review/source ownership**: no `pending`/`live` review round.
 - **No live lane process**: no `worktree_processes` row in `live` state
@@ -51,7 +56,9 @@ the caller supplies expectations only:
 - **Admission preservation**: a correlated `silas.directive-sent` is bound
   first through the existing validated transition (the row then reads
   `admitted-without-terminal`); an admission event without a minion
-  identity fails closed (`admission_evidence_incomplete`).
+  identity fails closed (`admission_evidence_incomplete`). Already-bound
+  admissions are rechecked against the exact sent sequence/request/minion;
+  mismatched identity is never carried into a retirement audit.
 
 ## Calling it
 
@@ -92,7 +99,7 @@ reports the same `phase_handoff_closed` id.
 | 409 | `stale_head` | lane head moved; re-verify cessation at the new head |
 | 409 | `terminal_receipt_present` | correlated delivery exists; let settlement/reconcile own it |
 | 409 | `admission_evidence_incomplete` | admission event without identity; reconcile the actual turn |
-| 409 | `lane_unavailable` | no single live lane / unresolvable head; fail closed |
+| 409 | `lane_unavailable` | unreadable registry / no single live lane / unresolvable head; fail closed |
 | 409 | `live_work` | blockers list names the live ownership; resolve it first |
 | 409 | `retire_conflict` | already retired under a different intent; the recorded outcome stands |
 
@@ -116,7 +123,8 @@ Retirement leaves a durable continuation hold on the request row
 (`hold_released_by` null). While open, it is a **runtime** fence — not an
 attention card:
 
-- branch-idle refuses review arm/freeze on the lane (`409 branch_busy`);
+- branch-idle refuses review arm/freeze on the lane (`409 branch_busy`),
+  including forced review and a foreign target ref;
 - the Silas digest offers no review/directive/stall, verification-repair,
   minion-error continuation or provider-recovery rows for the job;
 - late provider recovery cannot claim/resume the lane or release the hold;
@@ -124,8 +132,18 @@ attention card:
 
 The hold is released **only** by a fresh accepted directive request or
 re-brief marker (the release record names that request/marker id). The
-retired request id itself never re-runs and never releases the hold. A
-hold on a job that later goes terminal is inert (terminal lanes accept no
+retired request id itself never re-runs and never releases the hold. The
+fresh producer owns its own turn: `silas.directive-recovery-handoff`
+records the accepted identity and retired request IDs in that transaction.
+Exact native event ordering—not clock age—identifies older provider waits.
+They stay recorded and are neither offered nor resumed, even when the
+fresh request later settles; they do not permanently block a later
+retirement. Missing ordered proof stays fenced. A late wait is left byte-identical
+while a hold is open, including on a parked or blocked job. Digest
+publication rechecks current fresh-request ownership after every await.
+A damaged hold is reported as inconsistent audit debt without hiding
+healthy holds on other jobs; strict control callers still fail closed.
+A hold on a job that later goes terminal is inert (terminal lanes accept no
 work): it is not projected as board debt and cannot mask a newer live
 hold.
 
@@ -135,6 +153,8 @@ hold.
   event payload carries `expected_head`, `lane_id`, `admission_class`,
   `admission_seq`, `admission_minion`, `by`, `reason`);
 - event `silas.directive-retired` (exactly one per request);
+- a later accepted `silas.directive-recovery-handoff` when citing fresh
+  authority (never a delivery/retirement receipt);
 - the row's `retired_at`/`retired_by`/`retire_reason`;
 - the phase-handoff `closed` reason when one was attached.
 

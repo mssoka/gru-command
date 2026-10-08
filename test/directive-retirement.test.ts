@@ -73,7 +73,8 @@ interface Harness {
   close(): Promise<void>;
 }
 
-async function boot(opts: { wrapLedger?: (ledger: LedgerApi) => LedgerApi; workerGate?: PacingGate } = {}): Promise<Harness> {
+async function boot(opts: { wrapLedger?: (ledger: LedgerApi) => LedgerApi; workerGate?: PacingGate;
+  pendingProducerBlockers?: (jobId: string) => readonly string[] } = {}): Promise<Harness> {
   const dir = mkdtempSync(join(tmpdir(), 'gru-command-retirement-'));
   cleanupDirs.push(dir);
   writeFileSync(join(dir, 'config.toml'), `[auth]\ntoken = "${TOKEN}"\n[server]\nhost = "127.0.0.1"\nport = 0\n`, 'utf-8');
@@ -154,6 +155,7 @@ async function boot(opts: { wrapLedger?: (ledger: LedgerApi) => LedgerApi; worke
     wave,
     ledger,
     ...(opts.workerGate !== undefined ? { workerGate: opts.workerGate } : {}),
+    ...(opts.pendingProducerBlockers !== undefined ? { pendingProducerBlockers: opts.pendingProducerBlockers } : {}),
     silasOps: {
       registry: {
         getHandle: (id: string) => liveHandles.get(id) ?? null,
@@ -1189,15 +1191,21 @@ describe('directive retirement — continuation boundary and consumers', () => {
       incidentId: 'incident-late', incidentGeneration: 1, reasonClass: 'temporary-limit' });
     h.ledger.commitProviderRecoveryBatch({ id: 'batch-late', routeKey: 'route-late', incidentGenerations: [1],
       evidence: { stopReason: 'stop' }, waiters: [{ id: 'wait-late', jobId: 'job-provider-late' }] });
-    const before = eventKinds(h);
-    const result = await claimProviderRecoveryContinuation({ ledger: h.ledger, worktrees: h.worktrees,
+    const claim = () => claimProviderRecoveryContinuation({ ledger: h.ledger, worktrees: h.worktrees,
       registry: { getHandle: () => null, disposeHandle: async () => {},
         spawn: async () => { throw new Error('must not spawn'); } } }, 'wait-late', 'silas');
-    expect(result.outcome).toBe('skipped');
-    if (result.outcome === 'skipped') expect(result.why).toContain('retirement hold');
+    for (const status of ['working', 'parked', 'blocked'] as const) {
+      h.ledger.setJobStatus('job-provider-late', status);
+      const beforeClaim = eventKinds(h);
+      const result = await claim();
+      expect(result.outcome).toBe('skipped');
+      if (result.outcome === 'skipped') expect(result.why).toContain('retirement hold');
+      expect(h.ledger.getProviderWait('wait-late')?.status).toBe('recovered-pending');
+      expect(eventKinds(h)).toEqual(beforeClaim);
+    }
+    h.ledger.setJobStatus('job-provider-late', 'working');
     expect(h.ledger.getProviderWait('wait-late')?.status).toBe('recovered-pending');
     expect(h.ledger.hasOpenDirectiveRecoveryHold('job-provider-late')).toBe(true);
-    expect(eventKinds(h)).toEqual(before);
     const digest = await computeSilasDigest({ ledger: h.ledger, blockersForRound: async () => ({ blockers: [], note: null }),
       config: DEFAULT_SILAS_CONFIG, trigger: 'sweep' });
     expect(digest.providerRecoveryPending).toEqual([]);
@@ -1206,7 +1214,52 @@ describe('directive retirement — continuation boundary and consumers', () => {
       requestId: 'req-provider-late-next' });
     const released = await computeSilasDigest({ ledger: h.ledger, blockersForRound: async () => ({ blockers: [], note: null }),
       config: DEFAULT_SILAS_CONFIG, trigger: 'sweep' });
-    expect(released.providerRecoveryPending.map((row) => row.waitId)).toEqual(['wait-late']);
+    expect(released.providerRecoveryPending).toEqual([]);
+    const freshOwned = await claim();
+    expect(freshOwned.outcome === 'skipped' ? freshOwned.why : '').toContain('fresh producer');
+    expect(h.ledger.getProviderWait('wait-late')?.status).toBe('recovered-pending');
+    h.ledger.failDirective({ requestId: 'req-provider-late-next', reason: 'fixture no-effect proof' });
+    const oldPrompt = await claim();
+    expect(oldPrompt.outcome === 'skipped' ? oldPrompt.why : '').toContain('predates');
+    const settledDigest = await computeSilasDigest({ ledger: h.ledger, blockersForRound: async () => ({ blockers: [], note: null }),
+      config: DEFAULT_SILAS_CONFIG, trigger: 'sweep' });
+    expect(settledDigest.providerRecoveryPending).toEqual([]);
+    expect(h.ledger.getProviderWait('wait-late')?.status).toBe('recovered-pending');
+    expect(h.spawns).toEqual([]);
+    expect(h.ledger.listOpenProviderWaitsForJob('job-provider-late')).toEqual([]);
+    const oldWait = h.ledger.getProviderWait('wait-late')!;
+    expect(h.ledger.providerWaitRetirementIdentity(oldWait)).toBe('superseded');
+    const latest = h.ledger.latestJobEvent.bind(h.ledger);
+    const missingHandoff = vi.spyOn(h.ledger, 'latestJobEvent').mockImplementation((jobId, kind) =>
+      kind === 'silas.directive-recovery-handoff' ? null : latest(jobId, kind));
+    expect(h.ledger.providerWaitRetirementIdentity(oldWait)).toBe('unknown');
+    expect(h.ledger.listOpenProviderWaitsForJob('job-provider-late').map((wait) => wait.id)).toEqual(['wait-late']);
+    expect((await claim()).outcome).toBe('skipped');
+    missingHandoff.mockRestore();
+
+    // A genuinely NEW wait is ordered after the accepted handoff. Even a
+    // regressed wall clock is irrelevant; authority is the durable sequence.
+    h.ledger.recordProviderWait({ ...oldWait, id: 'wait-fresh-after-handoff', incidentId: 'incident-fresh', incidentGeneration: 2 });
+    h.db.handle.prepare('UPDATE provider_waits SET created_at = ? WHERE id = ?')
+      .run('1970-01-01T00:00:00.000Z', 'wait-fresh-after-handoff');
+    h.ledger.commitProviderRecoveryBatch({ id: 'batch-fresh-after-handoff', routeKey: 'route-late', incidentGenerations: [2],
+      evidence: { stopReason: 'stop' }, waiters: [{ id: 'wait-fresh-after-handoff', jobId: 'job-provider-late' }] });
+    const freshWait = h.ledger.getProviderWait('wait-fresh-after-handoff')!;
+    expect(h.ledger.providerWaitRetirementIdentity(freshWait)).toBe('current');
+    const prompt = vi.fn();
+    const continued = await claimProviderRecoveryContinuation({ ledger: h.ledger, worktrees: h.worktrees,
+      registry: { getHandle: () => null, disposeHandle: async () => {}, spawn: async () => ({
+        id: 'fresh-provider-after-handoff', role: 'minion', sessionFile: null, capabilities: FAKE_CAPABILITIES,
+        prompt: async (text: string) => { prompt(text); }, steer: async () => {}, followUp: async () => {},
+        subscribe: () => () => {}, health: () => ({ state: 'idle', lastActivity: null, sessionFile: null }), dispose: async () => {},
+      }) } }, freshWait.id, 'silas');
+    expect(continued.outcome).toBe('continued');
+    expect(prompt).toHaveBeenCalledOnce();
+    expect(h.ledger.getProviderWait('wait-late')?.status).toBe('recovered-pending');
+    h.ledger.setAgentState('fresh-provider-after-handoff', 'disposed');
+    h.ledger.beginDirectiveIntent({ jobId: 'job-provider-late', directive: 'later interrupted turn', holder: 'silas-ops',
+      requestId: 'req-provider-late-later' });
+    expect((await retire(h, 'req-provider-late-later', laneHead(lane))).status).toBe(200);
   });
 
   it('fails loudly when retired audit facts or expectation state are inconsistent', async () => {
@@ -1312,6 +1365,169 @@ describe('directive retirement — continuation boundary and consumers', () => {
     const decisions = h.ledger.listDecisions({ subject: 'job:job-ae', activeOnly: true });
     expect(decisions).toHaveLength(1);
     expect(decisions[0]?.clearedAt).toBeNull();
+  });
+
+  it('refuses held review jobs with force, a foreign target, or both', async () => {
+    const repo = makeFixtureRepo('retire-review-escape');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    const { lane } = await seededLiveRequest(h, repo, 'job-review-escape', 'req-review-escape');
+    h.ledger.setJobStatus('job-review-escape', 'delivered');
+    h.ledger.setJobPr('job-review-escape', 'https://github.com/example/fixture/pull/1');
+    expect((await retire(h, 'req-review-escape', laneHead(lane))).status).toBe(200);
+    for (const extra of [{ force: true }, { target_ref: 'gru/unrelated' }, { force: true, target_ref: 'gru/unrelated' }]) {
+      const result = await call(h.port, 'POST', '/api/dispatch/review', { job_id: 'job-review-escape', ...extra }, TOKEN);
+      expect(result.status).toBe(409);
+      expect(field<string>(result.json, 'error')).toBe('branch_busy');
+    }
+    expect(h.ledger.listRounds('job-review-escape')).toEqual([]);
+    expect(h.spawns).toEqual([]);
+    expect(countEvents(h, 'branch-idle.forced')).toBe(0);
+    expect(countEvents(h, 'silas.directive-retired')).toBe(1);
+  });
+
+  it('refuses pending supervisor ownership even with an idle durable agent', async () => {
+    const repo = makeFixtureRepo('retire-supervisor-pending');
+    cleanupRepos.push(repo);
+    let pending: 'active' | 'unreadable' | 'ceased' = 'active';
+    const h = await boot({ pendingProducerBlockers: (jobId) => {
+      if (pending === 'unreadable') throw new Error('supervision unavailable');
+      return pending === 'active' ? [`supervised producer: ${jobId}`] : [];
+    } });
+    const { lane } = await seededLiveRequest(h, repo, 'job-supervisor-pending', 'req-supervisor-pending');
+    h.ledger.registerAgent({ id: 'idle-supervised', role: 'minion', jobId: 'job-supervisor-pending' });
+    h.ledger.setAgentState('idle-supervised', 'idle');
+    const before = eventKinds(h);
+    const result = await retire(h, 'req-supervisor-pending', laneHead(lane));
+    expect(result.status).toBe(409);
+    expect(field<string>(result.json, 'error')).toBe('live_work');
+    expect((field<string[]>(result.json, 'blockers') ?? []).join(' ')).toContain('supervised producer');
+    expect(eventKinds(h)).toEqual(before);
+    expect(h.ledger.getDirective('req-supervisor-pending')?.state).toBe('dispatching');
+    pending = 'unreadable';
+    const unknown = await retire(h, 'req-supervisor-pending', laneHead(lane));
+    expect(unknown.status).toBe(409);
+    expect(field<string>(unknown.json, 'error')).toBe('live_work');
+    expect(eventKinds(h)).toEqual(before);
+    pending = 'ceased';
+    expect((await retire(h, 'req-supervisor-pending', laneHead(lane))).status).toBe(200);
+  });
+
+  it('refuses agent-ID-keyed paced retries for the job', async () => {
+    const repo = makeFixtureRepo('retire-agent-paced');
+    cleanupRepos.push(repo);
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 1 });
+    const lease = await gate.acquireWorkerTurn({ id: 'other-job', label: 'other-job', jobId: 'other-job' });
+    const abort = new AbortController();
+    const queued = gate.acquireWorkerTurn({ id: 'paced-agent', label: 'rate-limit retry', agentId: 'paced-agent', jobId: 'job-agent-paced', signal: abort.signal });
+    const observed = queued.catch(() => null);
+    const h = await boot({ workerGate: gate });
+    try {
+      const { lane } = await seededLiveRequest(h, repo, 'job-agent-paced', 'req-agent-paced');
+      h.ledger.registerAgent({ id: 'paced-agent', role: 'minion', jobId: 'job-agent-paced' });
+      const result = await retire(h, 'req-agent-paced', laneHead(lane));
+      expect(result.status).toBe(409);
+      expect(field<string>(result.json, 'error')).toBe('live_work');
+      expect((field<string[]>(result.json, 'blockers') ?? []).join(' ')).toContain('queued worker turn');
+      expect(countEvents(h, 'silas.directive-retired')).toBe(0);
+    } finally {
+      abort.abort();
+      lease.release();
+      await observed;
+    }
+  });
+
+  it('refuses an admitted row whose bound minion disagrees with its sent receipt', async () => {
+    const repo = makeFixtureRepo('retire-admission-mismatch');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    const { lane } = await seededLiveRequest(h, repo, 'job-admission-mismatch', 'req-admission-mismatch');
+    const sent = h.ledger.appendCustomEvent({ kind: 'silas.directive-sent', jobId: 'job-admission-mismatch',
+      payload: { request_id: 'req-admission-mismatch', minion_id: 'actual-minion' } });
+    h.ledger.recordDirectiveAdmission({ requestId: 'req-admission-mismatch', eventSeq: sent.seq, minionId: 'different-minion' });
+    const before = eventKinds(h);
+    const result = await retire(h, 'req-admission-mismatch', laneHead(lane));
+    expect(result.status).toBe(409);
+    expect(field<string>(result.json, 'error')).toBe('admission_evidence_incomplete');
+    expect(eventKinds(h)).toEqual(before);
+    expect(h.ledger.getDirective('req-admission-mismatch')?.state).toBe('admitted');
+  });
+
+  it('returns typed lane_unavailable when the registry itself throws', async () => {
+    const repo = makeFixtureRepo('retire-registry-unreadable');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    const { lane } = await seededLiveRequest(h, repo, 'job-registry-unreadable', 'req-registry-unreadable');
+    const head = laneHead(lane);
+    const before = eventKinds(h);
+    vi.spyOn(h.worktrees, 'listWorktrees').mockImplementation(() => { throw new Error('registry inaccessible'); });
+    const result = await retire(h, 'req-registry-unreadable', head);
+    expect(result.status).toBe(409);
+    expect(field<string>(result.json, 'error')).toBe('lane_unavailable');
+    expect(eventKinds(h)).toEqual(before);
+    expect(h.ledger.getDirective('req-registry-unreadable')?.state).toBe('dispatching');
+  });
+
+  it('keeps unproven claimed waits fenced but permits retirement after a genuine terminal receipt', async () => {
+    const repo = makeFixtureRepo('retire-historical-claim');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    const { lane } = await seededLiveRequest(h, repo, 'job-historical-claim', 'req-historical-claim');
+    h.ledger.recordProviderWait({ id: 'wait-historical', routeKey: 'route-historical', provider: 'p', model: 'm', endpoint: 'e',
+      credentialFingerprint: 'fp', waiterKind: 'job-minion', jobId: 'job-historical-claim', agentId: null, slotId: null,
+      sessionFile: null, continuation: null, jobStatusAtEstablishment: 'working', lineageKey: null,
+      incidentId: 'incident-historical', incidentGeneration: 1, reasonClass: 'temporary-limit' });
+    h.ledger.commitProviderRecoveryBatch({ id: 'batch-historical', routeKey: 'route-historical', incidentGenerations: [1],
+      evidence: { stopReason: 'stop' }, waiters: [{ id: 'wait-historical', jobId: 'job-historical-claim' }] });
+    expect(h.ledger.claimProviderWaitAtomic('wait-historical', { by: 'silas' })).toBe(true);
+    expect((await retire(h, 'req-historical-claim', laneHead(lane))).status).toBe(409);
+    h.ledger.appendCustomEvent({ kind: 'provider.continuation-completed', jobId: 'job-historical-claim', payload: { wait_id: 'some-other-wait' } });
+    expect((await retire(h, 'req-historical-claim', laneHead(lane))).status).toBe(409);
+    h.ledger.appendCustomEvent({ kind: 'provider.continuation-completed', jobId: 'job-historical-claim', payload: { wait_id: 'wait-historical' } });
+    expect((await retire(h, 'req-historical-claim', laneHead(lane))).status).toBe(200);
+    expect(h.ledger.getProviderWait('wait-historical')?.status).toBe('claimed');
+    expect(countEvents(h, 'job.delivered')).toBe(0);
+  });
+
+  it('isolates malformed retired audit debt without hiding a healthy board hold', async () => {
+    const repo = makeFixtureRepo('retire-board-damaged');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    const bad = await seededLiveRequest(h, repo, 'job-board-bad', 'req-board-bad');
+    expect((await retire(h, 'req-board-bad', laneHead(bad.lane))).status).toBe(200);
+    const good = await seededLiveRequest(h, repo, 'job-board-good', 'req-board-good');
+    expect((await retire(h, 'req-board-good', laneHead(good.lane))).status).toBe(200);
+    h.db.handle.prepare('UPDATE pending_directives SET retire_reason = NULL WHERE request_id = ?').run('req-board-bad');
+    const log = vi.fn();
+    const engine = new BoardEngine({ ledger: h.ledger, bus: new EventBus({}), log });
+    expect(engine.snapshot().silas.nextAction).toContain('req-board-good');
+    expect(log).toHaveBeenCalledWith('error', expect.stringContaining('audit is inconsistent'), expect.objectContaining({ requestId: 'req-board-bad' }));
+    expect(() => h.ledger.listDirectiveRecoveryHolds()).toThrow(/missing its audit facts/u);
+    expect(h.ledger.hasOpenDirectiveRecoveryHold('job-board-bad')).toBe(true);
+  });
+
+  it('rechecks fresh producer ownership when retirement and acceptance both occur during a digest await', async () => {
+    const repo = makeFixtureRepo('retire-fresh-owner-race');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    const { lane } = await seededLiveRequest(h, repo, 'job-fresh-owner-race', 'req-fresh-owner-race');
+    h.ledger.setJobStatus('job-fresh-owner-race', 'in-review');
+    const round = h.ledger.addRound({ jobId: 'job-fresh-owner-race', lenses: ['blind'] });
+    h.ledger.setRoundStatus(round.id, 'live');
+    h.ledger.setRoundVerdict(round.id, 'changes-requested');
+    let raced = false;
+    const digest = await computeSilasDigest({ ledger: h.ledger, blockersForRound: async () => {
+      raced = true;
+      expect((await retire(h, 'req-fresh-owner-race', laneHead(lane))).status).toBe(200);
+      h.ledger.beginDirectiveIntent({ jobId: 'job-fresh-owner-race', directive: 'fresh owner', holder: 'silas-ops', requestId: 'req-fresh-owner-race-next' });
+      return { blockers: [], note: null };
+    }, config: DEFAULT_SILAS_CONFIG, trigger: 'sweep' });
+    expect(raced).toBe(true);
+    expect(h.ledger.hasOpenDirectiveRecoveryHold('job-fresh-owner-race')).toBe(false);
+    expect(h.ledger.getDirective('req-fresh-owner-race-next')?.state).toBe('dispatching');
+    expect(digest.verdictsAwaitingDirective).toEqual([]);
+    expect(digest.providerRecoveryPending).toEqual([]);
+    expect(h.spawns).toEqual([]);
   });
 
   it('persists the retirement and hold across a database reopen', async () => {

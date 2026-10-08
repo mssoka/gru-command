@@ -12,6 +12,7 @@ import type {
   JobStatus,
   LedgerApi,
   PendingRebriefRecord,
+  ProviderWaitRecord,
   RoundRecord,
 } from '../ledger/api.js';
 import { LIVE_DIRECTIVE_STATES, type DirectiveState } from '../ledger/directives.js';
@@ -304,6 +305,9 @@ export interface DigestLedger {
    * fenced exactly like a live request — no competing continuation may be
    * offered, armed or woken until a fresh accepted request supersedes it. */
   hasOpenDirectiveRecoveryHold(jobId: string): boolean;
+  listDirectiveRecoveryHolds: LedgerApi['listDirectiveRecoveryHolds'];
+  providerWaitRetirementIdentity: LedgerApi['providerWaitRetirementIdentity'];
+  getProviderWait(id: string): ProviderWaitRecord | null;
   /** Tracked child workers (issue #161/#117): the releaseEligible sweep-ack
    * row fences on non-terminal children exactly like the release endpoint's
    * own refusal — the digest never offers a release that would 409. */
@@ -1867,15 +1871,24 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
   // verdict/verification debt and late provider evidence. Recheck after
   // all awaits; a hold can open after the candidate was computed.
   const continuationAllowed = (row: { readonly jobId: string }): boolean =>
-    !input.ledger.hasOpenDirectiveRecoveryHold(row.jobId);
+    !input.ledger.hasOpenDirectiveRecoveryHold(row.jobId) &&
+    (input.ledger.listDirectiveRecoveryHolds({ jobId: row.jobId }).length === 0 ||
+      (input.ledger.listPendingDirectives({ jobId: row.jobId, states: LIVE_DIRECTIVE_STATES }).length === 0 &&
+       input.ledger.listPendingRebriefs({ jobId: row.jobId }).length === 0));
   return {
     ...digest,
     verdictsAwaitingDirective: digest.verdictsAwaitingDirective.filter(continuationAllowed),
     verificationFailures: digest.verificationFailures.filter(continuationAllowed),
     verificationWaits: digest.verificationWaits.filter(continuationAllowed),
     minionErrors: digest.minionErrors.filter(continuationAllowed),
-    providerRecoveryPending: digest.providerRecoveryPending.filter((row) =>
-      row.jobId === null || continuationAllowed({ jobId: row.jobId })),
+    providerRecoveryPending: digest.providerRecoveryPending.filter((row) => {
+      if (row.jobId === null) return true;
+      if (!continuationAllowed({ jobId: row.jobId }) ||
+          input.ledger.listPendingDirectives({ jobId: row.jobId, states: LIVE_DIRECTIVE_STATES }).length > 0 ||
+          input.ledger.listPendingRebriefs({ jobId: row.jobId }).length > 0) return false;
+      const wait = input.ledger.getProviderWait(row.waitId);
+      return wait !== null && input.ledger.providerWaitRetirementIdentity(wait) === 'current';
+    }),
     deliveredWithoutPr: digest.deliveredWithoutPr.filter((row) => {
       if (!reviewOfferFencesHold(row.jobId)) return false;
       const job = input.ledger.getJob(row.jobId);

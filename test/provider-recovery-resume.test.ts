@@ -235,6 +235,9 @@ describe('guarded claim — happy path', () => {
     // The continuation prompt was delivered exactly once.
     const spawned = [...h.registry.handles.values()].find((handle) => handle.promptCount > 0);
     expect(spawned?.promptCount).toBe(1);
+    expect(h.ledger.listJobEvents(jobId, { limit: 20 }).find((event) => event.kind === 'provider.continuation-completed')?.payload)
+      .toMatchObject({ wait_id: waitId });
+    expect(h.ledger.listOpenProviderWaitsForJob(jobId)).toEqual([]);
   });
 
   it('a continuation turn that settles with an in-band error is recorded, never reported as continued (#160)', async () => {

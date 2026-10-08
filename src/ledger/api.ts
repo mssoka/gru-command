@@ -6953,6 +6953,16 @@ export class LedgerApi {
           }
         }
       }
+      if (current.state === 'admitted') {
+        const sent = current.admissionSeq === null ? null : this.getEvent(current.admissionSeq);
+        const payload = (typeof sent?.payload === 'object' && sent.payload !== null ? sent.payload : {}) as Record<string, unknown>;
+        if (sent === null || sent.kind !== 'silas.directive-sent' || sent.jobId !== current.jobId ||
+            sent.seq <= current.baselineSeq || payload['request_id'] !== current.requestId ||
+            current.admissionMinion === null || payload['minion_id'] !== current.admissionMinion) {
+          throw new DirectiveRetirementError('admission_evidence_incomplete',
+            `directive request "${current.requestId}" has inconsistent bound admission identity — reconcile the actual turn first`);
+        }
+      }
       const admissionClass = directiveAdmissionClass(current);
       const ts = nowIso();
       this.db
@@ -6999,7 +7009,13 @@ export class LedgerApi {
   /** Continuation holds created by retirements, oldest first. An OPEN hold
    * (`releasedBy === null`) fences lane automation until a fresh accepted
    * directive/re-brief identity supersedes it. */
-  listDirectiveRecoveryHolds(opts: { jobId?: string; openOnly?: boolean } = {}): readonly DirectiveRecoveryHold[] {
+  listDirectiveRecoveryHolds(opts: {
+    jobId?: string;
+    openOnly?: boolean;
+    /** Projection-only isolation: report damaged debt loudly, then keep
+     * healthy holds visible. Strict callers still throw on any bad row. */
+    onMalformed?: (requestId: string, jobId: string, error: unknown) => void;
+  } = {}): readonly DirectiveRecoveryHold[] {
     const where: string[] = ["state = 'retired'"];
     const params: unknown[] = [];
     if (opts.jobId !== undefined) {
@@ -7010,24 +7026,30 @@ export class LedgerApi {
     const rows = this.db
       .prepare(`SELECT * FROM pending_directives WHERE ${where.join(' AND ')} ORDER BY retired_at, request_id`)
       .all(...(params as never[])) as Row[];
-    return rows.map((row) => {
-      const record = this.directiveFromRow(row);
-      if (record.retiredAt === null || record.retiredBy === null || record.retireReason === null) {
-        throw new Error(
-          `pending_directives row "${record.requestId}" is retired but is missing its audit facts — ` +
-            'the record is inconsistent and cannot be projected',
-        );
+    return rows.flatMap((row) => {
+      try {
+        const record = this.directiveFromRow(row);
+        if (record.retiredAt === null || record.retiredBy === null || record.retireReason === null) {
+          throw new Error(
+            `pending_directives row "${record.requestId}" is retired but is missing its audit facts — ` +
+              'the record is inconsistent and cannot be projected',
+          );
+        }
+        return [{
+          jobId: record.jobId,
+          requestId: record.requestId,
+          admissionClass: directiveAdmissionClass(record),
+          retiredAt: record.retiredAt,
+          retiredBy: record.retiredBy,
+          reason: record.retireReason,
+          releasedBy: record.holdReleasedBy,
+          releasedAt: record.holdReleasedAt,
+        }];
+      } catch (error) {
+        if (opts.onMalformed === undefined) throw error;
+        opts.onMalformed(str(row.request_id), str(row.job_id), error);
+        return [];
       }
-      return {
-        jobId: record.jobId,
-        requestId: record.requestId,
-        admissionClass: directiveAdmissionClass(record),
-        retiredAt: record.retiredAt,
-        retiredBy: record.retiredBy,
-        reason: record.retireReason,
-        releasedBy: record.holdReleasedBy,
-        releasedAt: record.holdReleasedAt,
-      };
     });
   }
 
@@ -7043,12 +7065,37 @@ export class LedgerApi {
    * producer acceptance (new directive request id or re-brief marker id).
    * Runs inside the accepting transaction; a replay never releases again. */
   private releaseDirectiveRecoveryHolds(jobId: string, byIdentity: string): void {
+    const holds = this.listDirectiveRecoveryHolds({ jobId });
+    if (holds.length === 0) return;
     const ts = nowIso();
     this.db
       .prepare(
         "UPDATE pending_directives SET hold_released_by = ?, hold_released_at = ?, updated_at = ? WHERE job_id = ? AND state = 'retired' AND hold_released_by IS NULL",
       )
       .run(byIdentity, ts, ts, jobId);
+    // Exact durable ordering, not wall-clock age. This is an accepted
+    // authority handoff, never a work-delivery or retirement receipt.
+    this.appendEvent({ kind: 'silas.directive-recovery-handoff', jobId,
+      payload: { request_id: byIdentity, retired_request_ids: holds.map((hold) => hold.requestId) } });
+  }
+
+  /** A wait must not carry its saved prompt across a fresh retirement
+   * handoff. Unknown/missing ordered evidence is NOT permission and stays
+   * a blocker; only proven superseded debt can be ignored. */
+  providerWaitRetirementIdentity(wait: Pick<ProviderWaitRecord, 'jobId' | 'id'>): 'current' | 'superseded' | 'unknown' {
+    if (wait.jobId === null) return 'current';
+    const holds = this.listDirectiveRecoveryHolds({ jobId: wait.jobId });
+    if (holds.length === 0) return 'current';
+    if (holds.some((hold) => hold.releasedBy === null)) return 'unknown';
+    const handoff = this.latestJobEvent(wait.jobId, 'silas.directive-recovery-handoff');
+    const payload = (typeof handoff?.payload === 'object' && handoff.payload !== null ? handoff.payload : {}) as Record<string, unknown>;
+    const retiredIds = payload['retired_request_ids'];
+    if (handoff === null || typeof payload['request_id'] !== 'string' ||
+        !Array.isArray(retiredIds) || !holds.every((hold) => retiredIds.includes(hold.requestId))) return 'unknown';
+    const values = [{ key: 'id', value: wait.id }];
+    if (!this.hasJobEventWithPayloadValues(wait.jobId, ['provider.wait-established'], values, 0)) return 'unknown';
+    return this.hasJobEventWithPayloadValues(wait.jobId, ['provider.wait-established'], values, handoff.seq)
+      ? 'current' : 'superseded';
   }
 
   /** The in-flight process-local admissions for one job (the same registry
@@ -7069,7 +7116,11 @@ export class LedgerApi {
          ORDER BY created_at, id`,
       )
       .all(jobId) as Row[];
-    return rows.map((row) => this.providerWaitFromRow(row));
+    return rows.map((row) => this.providerWaitFromRow(row)).filter((wait) =>
+      this.providerWaitRetirementIdentity(wait) !== 'superseded' &&
+      (wait.status !== 'claimed' || !this.hasJobEventWithPayloadValues(jobId,
+        ['provider.continuation-completed', 'provider.continuation-failed'],
+        [{ key: 'wait_id', value: wait.id }], 0)));
   }
 
   // ------------------------------------------------------------------

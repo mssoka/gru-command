@@ -134,6 +134,12 @@ async function claimJobMinion(
   // (the dispatch settle raced the wait — r4 directive): that block IS this
   // provider blocker's settlement and must not strand the recovery.
   const job = wait.jobId !== null ? deps.ledger.getJob(wait.jobId) : null;
+  // Control closure outranks later capacity evidence, including on parked
+  // or blocked jobs. A refused claim never rewrites this wait.
+  if (job !== null && deps.ledger.hasOpenDirectiveRecoveryHold(job.id)) {
+    return { outcome: 'skipped', waitId: wait.id,
+      why: 'directive retirement hold requires a fresh accepted directive or re-brief' };
+  }
   if (job === null || isJobTerminal(job.status)) {
     // Truthful reason per terminal state: a discarded (`binned`) lane is
     // cancelled, never reported as completed.
@@ -152,13 +158,12 @@ async function claimJobMinion(
     deps.ledger.setProviderWaitStatus(wait.id, 'cancelled', { why: 'job blocked (owner/ops hold)', by });
     return { outcome: 'skipped', waitId: wait.id, why: 'job blocked (owner/ops hold)' };
   }
-  // A recovery receipt is capacity, not fresh authorization. Late
-  // provider evidence must not resume a request whose control was retired
-  // or release its hold through the re-brief machinery below. Leave the
-  // wait intact until a separately accepted directive/re-brief releases it.
-  if (deps.ledger.hasOpenDirectiveRecoveryHold(job.id)) {
-    return { outcome: 'skipped', waitId: wait.id,
-      why: 'directive retirement hold requires a fresh accepted directive or re-brief' };
+  if (deps.ledger.listPendingDirectives({ jobId: job.id, states: ['dispatching', 'admitted'] }).length > 0 ||
+      deps.ledger.listPendingRebriefs({ jobId: job.id }).length > 0 || deps.ledger.listJobAdmissions(job.id).length > 0) {
+    return { outcome: 'skipped', waitId: wait.id, why: 'a fresh producer already owns the lane' };
+  }
+  if (deps.ledger.providerWaitRetirementIdentity(wait) !== 'current') {
+    return { outcome: 'skipped', waitId: wait.id, why: 'provider wait predates or lacks the fresh retirement handoff identity' };
   }
   // Guard 2 — this waiter is a member of a still-open recovery BATCH
   // (r1 #7: shared recoveries bind every matching waiter; membership is by
@@ -257,7 +262,11 @@ async function claimJobMinion(
         // worker gate/spawn. Never prompt the replacement against it;
         // rebriefFreshMinion disposes a spawned handle on refusal.
         const current = deps.ledger.getJob(job.id);
-        if (current === null || isJobTerminal(current.status) || current.status === 'parked' || current.status === 'blocked') {
+        if (current === null || isJobTerminal(current.status) || current.status === 'parked' || current.status === 'blocked' ||
+            deps.ledger.hasOpenDirectiveRecoveryHold(job.id) ||
+            deps.ledger.listPendingDirectives({ jobId: job.id, states: ['dispatching', 'admitted'] }).length > 0 ||
+            deps.ledger.listPendingRebriefs({ jobId: job.id }).length > 0 ||
+            deps.ledger.listJobAdmissions(job.id).some((kind) => kind !== `provider continuation ${wait.id}`)) {
           throw new Error(`provider continuation refused — job "${job.id}" is ${current?.status ?? 'missing'}`);
         }
       },
@@ -339,6 +348,10 @@ async function claimJobMinion(
       why: 'continuation turn settled with an in-band error (recorded; no automatic replay)',
     };
   }
+  // Awaited terminal evidence for this exact claim, not a fabricated job
+  // delivery. Historical claims with this receipt no longer own a writer.
+  deps.ledger.appendCustomEvent({ kind: 'provider.continuation-completed', jobId: wait.jobId,
+    agentId: result.minionId, payload: { wait_id: wait.id, by } });
   deps.log?.('info', 'provider recovery continuation started', {
     wait_id: wait.id,
     job: wait.jobId,

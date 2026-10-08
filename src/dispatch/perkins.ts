@@ -2465,7 +2465,8 @@ export class WaveRunner {
       jobNow !== null &&
       !isJobTerminal(jobNow.status) &&
       !blockers.some((blocker) => blocker.jobId === input.job.id) &&
-      this.opts.ledger.listPendingRebriefs({ jobId: input.job.id }).length > 0
+      (this.opts.ledger.listPendingRebriefs({ jobId: input.job.id }).length > 0 ||
+        this.opts.ledger.hasOpenDirectiveRecoveryHold(input.job.id))
     ) {
       blockers.push({
         jobId: input.job.id,
@@ -2475,14 +2476,18 @@ export class WaveRunner {
           : laneBranch(input.job.id),
       });
     }
+    // A retirement hold is a fresh-authorization boundary, not ordinary
+    // branch activity. Neither force nor a foreign target may waive it.
+    const held = blockers.some((blocker) => this.opts.ledger.hasOpenDirectiveRecoveryHold(blocker.jobId));
     if (blockers.length === 0 && input.force !== true) return { targetBranch, blockers };
+    const forced = input.force === true && !held;
     this.opts.ledger.appendCustomEvent({
-      kind: input.force === true ? 'branch-idle.forced' : 'branch-idle.refused',
+      kind: forced ? 'branch-idle.forced' : 'branch-idle.refused',
       jobId: input.job.id,
       ...(input.roundId !== undefined ? { roundId: input.roundId } : {}),
-      payload: { phase: input.phase, forced: input.force === true, targetBranch, blockers },
+      payload: { phase: input.phase, forced, targetBranch, blockers },
     });
-    if (input.force !== true) throw new BranchBusyError(targetBranch, blockers, input.phase);
+    if (!forced) throw new BranchBusyError(targetBranch, blockers, input.phase);
     return { targetBranch, blockers };
   }
 
