@@ -492,6 +492,16 @@ export class BibleStore {
       // and every replaced one holds exactly the planned bytes (R6-05).
       const plannedBytes = new Map(planned.map((write) => [`${write.slug}.md`, Buffer.from(write.text, 'utf8')]));
       try {
+        // Every planned replacement explicitly — one that vanished is a failure (R7-06).
+        for (const [name, expected] of plannedBytes) {
+          let raw: Buffer;
+          try {
+            raw = readFileSync(join(this.chaptersDir, name));
+          } catch (error) {
+            throw new BibleError(`chapter ${name} cannot be read back (${(error as NodeJS.ErrnoException).code ?? String(error)})`);
+          }
+          if (!raw.equals(expected)) throw new BibleError(`chapter ${name} does not hold the planned bytes`);
+        }
         for (const name of readdirSync(this.chaptersDir).filter((entry) => entry.endsWith('.md')).sort()) {
           const raw = readFileSync(join(this.chaptersDir, name));
           const expected = plannedBytes.get(name);
@@ -894,7 +904,7 @@ function verifyPlan(plan: BiblePlan): VerifiedPlan {
     const capped = enforceChapterCap(write.uncapped, plan.chapterCapBytes, undefined, contract);
     if (capped.text !== write.text) fail(`chapter ${write.slug} is not what the cap makes of its merged chapter`);
     if (!utf8Exact(write.text)) fail(`chapter ${write.slug} would not survive UTF-8 unchanged`);
-    assertReadsBack(write.text, capped.chapter);
+    assertReadsBack(write.text, capped.chapter, contract);
     trimmed += capped.trimmed;
     dropped += capped.droppedLessons;
   }
@@ -906,7 +916,7 @@ function verifyPlan(plan: BiblePlan): VerifiedPlan {
   // carry nothing the review does not show.
   const resultChapters = [...result.entries()]
     .filter(([path]) => path.startsWith(`${BIBLE_CHAPTERS_DIR}/`) && path.endsWith('.md'))
-    .map(([path, text]) => parseChapter(text, path.slice(BIBLE_CHAPTERS_DIR.length + 1, -'.md'.length)));
+    .map(([path, text]) => parseChapter(text, path.slice(BIBLE_CHAPTERS_DIR.length + 1, -'.md'.length), contract));
   const index = contract === 1 ? renderIndexV1(resultChapters, plan.indexCapBytes) : renderIndex(resultChapters, plan.indexCapBytes);
   if (!utf8Exact(plan.indexText) || index !== plan.indexText) {
     fail('its INDEX.md is not the index of the book it produces');
@@ -953,7 +963,7 @@ function assertChapterModel(value: unknown, slug: string, contract: PlanContract
       if (typeof handle['id'] !== 'string' || typeof handle['ts'] !== 'string') bad('handle');
       // Contract 1 planned repeated journal ids as copies; it is checked as it was.
       if (contract !== 1 && ids.has(handle['id'] as string)) bad(`provenance repeats ${String(handle['id'])}`);
-      if (parseIsoInstant(handle['ts'] as string) === null) bad(`provenance ${String(handle['id'])} carries an invalid instant`);
+      if (contract !== 1 && parseIsoInstant(handle['ts'] as string) === null) bad(`provenance ${String(handle['id'])} carries an invalid instant`);
       ids.add(handle['id'] as string);
     }
   }
@@ -975,7 +985,7 @@ export function describePlan(plan: BiblePlan): PlanReview {
     const prior = baseline.get(`${BIBLE_CHAPTERS_DIR}/${write.slug}.md`) ?? null;
     chapters.push(
       describeChapterChange(
-        prior === null ? null : parseChapter(prior, write.slug),
+        prior === null ? null : parseChapter(prior, write.slug, planContract(plan)),
         write.uncapped,
         enforceChapterCap(write.uncapped, plan.chapterCapBytes, undefined, planContract(plan)),
       ),
@@ -984,7 +994,7 @@ export function describePlan(plan: BiblePlan): PlanReview {
   for (const slug of plan.retired) {
     const prior = baseline.get(`${BIBLE_CHAPTERS_DIR}/${slug}.md`) ?? null;
     if (prior === null) continue;
-    const before = parseChapter(prior, slug);
+    const before = parseChapter(prior, slug, planContract(plan));
     chapters.push({
       slug,
       title: { before: before.title, after: before.title },
@@ -1020,8 +1030,8 @@ function contentHash(text: string | undefined | null): string | null {
 
 /** A planned chapter must read back exactly as planned — otherwise a
  * body line would be re-read as metadata (or anchors) after Accept. */
-function assertReadsBack(text: string, planned: BibleChapter): void {
-  const reread = parseChapter(text, planned.slug);
+function assertReadsBack(text: string, planned: BibleChapter, contract: PlanContract = PLAN_CONTRACT): void {
+  const reread = parseChapter(text, planned.slug, contract);
   const shape = (chapter: BibleChapter) =>
     JSON.stringify([
       chapter.title,
@@ -1156,7 +1166,7 @@ const HEADING_LINE = /^#{1,6}\s/;
 /** Marker appended to a body shortened by cap enforcement. */
 const TRIM_MARKER = ' … [trimmed to fit the chapter cap]';
 
-export function parseChapter(text: string, slug: string): BibleChapter {
+export function parseChapter(text: string, slug: string, contract: PlanContract = PLAN_CONTRACT): BibleChapter {
   if (!isLessonsSlug(slug)) throw new BibleError(`invalid chapter slug: ${JSON.stringify(slug)}`);
   // CRLF, LF and a bare CR each end a line (R5-A13): a CR-only chapter is
   // read as its lines, never as one line with nothing in it.
@@ -1216,12 +1226,12 @@ export function parseChapter(text: string, slug: string): BibleChapter {
 
   const lessons: BibleLesson[] = [];
   for (const section of sections) {
-    lessons.push(parseLesson(slug, section.slug, section.lines));
+    lessons.push(parseLesson(contract, slug, section.slug, section.lines));
   }
   return { slug, title, summary, tags: chapterTags, lessons };
 }
 
-function parseLesson(chapterSlug: string, slug: string, lines: readonly string[]): BibleLesson {
+function parseLesson(contract: PlanContract, chapterSlug: string, slug: string, lines: readonly string[]): BibleLesson {
   let recurred = 1;
   let sawRecurred = false;
   const provenance: ProvenanceRef[] = [];
@@ -1240,9 +1250,10 @@ function parseLesson(chapterSlug: string, slug: string, lines: readonly string[]
           recurred = value;
           sawRecurred = true;
         } else if (meta[1] === 'provenance') {
-          // One handle once per LESSON, across every provenance line (R6-02).
-          for (const ref of splitProvenance(meta[2] ?? '', chapterSlug, slug)) {
-            if (provenance.some((seen) => seen.id === ref.id)) {
+          // One handle once per LESSON, across every provenance line (R6-02)
+          // — contract 1 read repeats and impossible instants as written.
+          for (const ref of splitProvenance(meta[2] ?? '', chapterSlug, slug, contract)) {
+            if (contract !== 1 && provenance.some((seen) => seen.id === ref.id)) {
               throw new BibleError(
                 `chapter ${chapterSlug}.md lesson ${slug}: provenance cites ${ref.id} more than once — rebuild it from the journal with the repair tool`,
               );
@@ -1278,7 +1289,7 @@ function splitTags(value: string): string[] {
     .filter((tag) => tag !== '');
 }
 
-function splitProvenance(value: string, chapterSlug: string, lessonSlug: string): ProvenanceRef[] {
+function splitProvenance(value: string, chapterSlug: string, lessonSlug: string, contract: PlanContract = PLAN_CONTRACT): ProvenanceRef[] {
   const refs: ProvenanceRef[] = [];
   for (const item of value.split(',').map((part) => part.trim()).filter((part) => part !== '')) {
     const at = item.lastIndexOf('@');
@@ -1289,13 +1300,13 @@ function splitProvenance(value: string, chapterSlug: string, lessonSlug: string)
         `chapter ${chapterSlug}.md lesson ${lessonSlug}: provenance ${JSON.stringify(item)} must be "<journal-id>@<iso-date>"`,
       );
     }
-    if (parseIsoInstant(ts) === null) {
+    if (contract !== 1 && parseIsoInstant(ts) === null) {
       throw new BibleError(
         `chapter ${chapterSlug}.md lesson ${lessonSlug}: provenance ${JSON.stringify(item)} carries an impossible or malformed instant — ` +
           'it must be "<journal-id>@<iso-date>"',
       );
     }
-    if (refs.some((ref) => ref.id === id)) {
+    if (contract !== 1 && refs.some((ref) => ref.id === id)) {
       throw new BibleError(
         `chapter ${chapterSlug}.md lesson ${lessonSlug}: provenance cites ${id} more than once — rebuild it from the journal with the repair tool`,
       );
@@ -1950,6 +1961,40 @@ export function compareProvenance(left: ProvenanceRef, right: ProvenanceRef): nu
   return byInstant || journalSeq(left.id) - journalSeq(right.id) || left.id.localeCompare(right.id);
 }
 
+type ProvenanceOrder = (left: ProvenanceRef, right: ProvenanceRef) => number;
+
+/** Contract 1's handle order, verbatim (R7-02): Date.UTC's calendar — years
+ * 0–99 read as 1900–1999 — and a lexical fallback for an impossible
+ * instant. Only replaying a first-release plan uses it. */
+function compareProvenanceV1(left: ProvenanceRef, right: ProvenanceRef): number {
+  const parse = (ts: string): { seconds: number; fraction: string } | null => {
+    const match = ISO_INSTANT.exec(ts);
+    if (match === null) return null;
+    const [year, month, day, hour, minute, second] = match.slice(1, 7).map(Number) as [number, number, number, number, number, number];
+    const days = new Date(Date.UTC(year, month, 0)).getUTCDate();
+    if (month < 1 || month > 12 || day < 1 || day > days || hour > 23 || minute > 59 || second > 59) return null;
+    let offset = 0;
+    const zone = match[8]!;
+    if (zone !== 'Z') {
+      const hours = Number(zone.slice(1, 3));
+      const minutes = Number(zone.slice(4, 6));
+      if (hours > 23 || minutes > 59) return null;
+      offset = (zone[0] === '-' ? -1 : 1) * (hours * 60 + minutes) * 60;
+    }
+    return { seconds: Date.UTC(year, month - 1, day, hour, minute, second) / 1000 - offset, fraction: (match[7] ?? '').replace(/0+$/u, '') };
+  };
+  const a = parse(left.ts);
+  const b = parse(right.ts);
+  let byInstant: number;
+  if (a === null || b === null) byInstant = left.ts.localeCompare(right.ts);
+  else if (a.seconds !== b.seconds) byInstant = a.seconds - b.seconds;
+  else {
+    const width = Math.max(a.fraction.length, b.fraction.length);
+    byInstant = a.fraction.padEnd(width, '0').localeCompare(b.fraction.padEnd(width, '0'));
+  }
+  return byInstant || journalSeq(left.id) - journalSeq(right.id) || left.id.localeCompare(right.id);
+}
+
 function journalSeq(id: string): number {
   const match = /^j-(\d+)$/u.exec(id);
   return match === null ? Number.MAX_SAFE_INTEGER : Number(match[1]);
@@ -1985,8 +2030,9 @@ export function enforceChapterCap(
   contract: PlanContract = PLAN_CONTRACT,
 ): ChapterCapResult {
   // R6-03: an impossible instant is refused before anything is measured —
-  // a chapter that already fits included.
-  for (const lesson of chapter.lessons) {
+  // a chapter that already fits included. Contract 1 never checked (R7-02).
+  const order = contract === 1 ? compareProvenanceV1 : compareProvenance;
+  for (const lesson of contract === 1 ? [] : chapter.lessons) {
     for (const ref of lesson.provenance) {
       if (parseIsoInstant(ref.ts) === null) {
         throw new BibleError(`chapter ${chapter.slug} lesson ${lesson.slug}: provenance ${ref.id}@${ref.ts} is not a valid ISO instant`);
@@ -2006,7 +2052,7 @@ export function enforceChapterCap(
   // Handles are released from the oldest end of each (sorted) list; the
   // offsets keep thousands of releases linear instead of re-serializing the
   // chapter on every one.
-  lessons = lessons.map((lesson) => ({ ...lesson, provenance: [...lesson.provenance].sort(compareProvenance) }));
+  lessons = lessons.map((lesson) => ({ ...lesson, provenance: [...lesson.provenance].sort(order) }));
   let released = lessons.map(() => 0);
   const materialize = (): void => {
     lessons = lessons.map((lesson, index) => ({ ...lesson, provenance: lesson.provenance.slice(released[index]) }));
@@ -2097,7 +2143,7 @@ export function enforceChapterCap(
       return true;
     }
     // (2) drop the least-valuable lesson; its handles join the archive now.
-    const candidate = pickDropCandidate(lessons);
+    const candidate = pickDropCandidate(lessons, order);
     if (candidate === -1) return false;
     const [dropped] = lessons.splice(candidate, 1);
     released.splice(candidate, 1);
@@ -2107,12 +2153,12 @@ export function enforceChapterCap(
     if (dropped!.provenance.length === 0) {
       // Nothing to keep: an archive record would only cost bytes.
     } else if (archiveIndex === -1) {
-      lessons.push(buildArchivedLesson([...dropped!.provenance].sort(compareProvenance)));
+      lessons.push(buildArchivedLesson([...dropped!.provenance].sort(order)));
       released.push(0);
     } else {
       const merged = [...lessons[archiveIndex]!.provenance];
       mergeProvenance(merged, dropped!.provenance);
-      lessons[archiveIndex] = { ...lessons[archiveIndex]!, provenance: merged.sort(compareProvenance) };
+      lessons[archiveIndex] = { ...lessons[archiveIndex]!, provenance: merged.sort(order) };
     }
     size = serialized();
     return true;
@@ -2139,7 +2185,9 @@ export function enforceChapterCap(
  * shorter prefix whose text, once its trailing whitespace is trimmed,
  * still keeps at least the floor (R6-06). Ascending. */
 function retainedCuts(body: string): number[] {
-  const floor = safeSlice(body, MIN_LESSON_BODY_CHARS).length;
+  // At least the floor itself is kept — a surrogate pair at the boundary
+  // means one more unit, never one less (R7-09).
+  const floor = MIN_LESSON_BODY_CHARS;
   const cuts: number[] = [];
   let kept = 0; // the trimmed length of body[0, offset)
   for (let offset = 0; offset < body.length;) {
@@ -2162,15 +2210,15 @@ function mergeProvenance(target: ProvenanceRef[], incoming: readonly ProvenanceR
   }
 }
 
-function newestRef(refs: readonly ProvenanceRef[]): ProvenanceRef | null {
+function newestRef(refs: readonly ProvenanceRef[], order: ProvenanceOrder): ProvenanceRef | null {
   let newest: ProvenanceRef | null = null;
-  for (const ref of refs) if (newest === null || compareProvenance(ref, newest) > 0) newest = ref;
+  for (const ref of refs) if (newest === null || order(ref, newest) > 0) newest = ref;
   return newest;
 }
 
 /** Lowest recurred first, then oldest newest-provenance — the lesson whose
  * loss costs the operation least. -1 when nothing is droppable. */
-function pickDropCandidate(lessons: readonly BibleLesson[]): number {
+function pickDropCandidate(lessons: readonly BibleLesson[], order: ProvenanceOrder): number {
   let candidate = -1;
   for (let index = 0; index < lessons.length; index += 1) {
     const lesson = lessons[index]!;
@@ -2180,13 +2228,13 @@ function pickDropCandidate(lessons: readonly BibleLesson[]): number {
       continue;
     }
     const best = lessons[candidate]!;
-    const bestNewest = newestRef(best.provenance);
-    const otherNewest = newestRef(lesson.provenance);
+    const bestNewest = newestRef(best.provenance, order);
+    const otherNewest = newestRef(lesson.provenance, order);
     // A lesson without any journal handle counts as the oldest: it goes
     // before every journal-backed lesson of the same recurrence.
     const olderNewest = otherNewest === null
       ? bestNewest !== null
-      : bestNewest !== null && compareProvenance(otherNewest, bestNewest) < 0;
+      : bestNewest !== null && order(otherNewest, bestNewest) < 0;
     if (lesson.recurred < best.recurred || (lesson.recurred === best.recurred && olderNewest)) {
       candidate = index;
     }

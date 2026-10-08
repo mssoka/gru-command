@@ -63,6 +63,18 @@ export interface BoardClientOptions {
 const BACKOFF_MS = [800, 1_600, 3_200, 6_400, 12_000] as const;
 const DEFAULT_LIVENESS_WINDOW_MS = 75_000;
 const DEFAULT_LIVENESS_CHECK_MS = 5_000;
+/** R7-05: a snapshot request (fetch AND body) that outlives this is abandoned. */
+const SNAPSHOT_DEADLINE_MS = 15_000;
+/** R7-04: trailing refetches run back to back this many times in a chain... */
+const TRAILING_BURST = 2;
+/** ...then wait, capped — owed demand is kept, never dropped. */
+const TRAILING_BACKOFF_MS = [1_000, 2_000, 4_000, 8_000] as const;
+
+/** The wait before trailing refetch number `run + 1` of one chain. */
+function trailingDelay(run: number): number {
+  if (run < TRAILING_BURST) return 0;
+  return TRAILING_BACKOFF_MS[Math.min(run - TRAILING_BURST, TRAILING_BACKOFF_MS.length - 1)] ?? 8_000;
+}
 
 export class BoardClient {
   private socket: WebSocket | null = null;
@@ -80,10 +92,18 @@ export class BoardClient {
   private snapshotEpoch = 0;
   /** The newest HTTP snapshot request; older answers are dropped. */
   private fetchSeq = 0;
-  /** One trailing refetch is in flight (C13); later discards coalesce. */
+  /** One trailing refetch is in flight or waiting (C13); later discards coalesce. */
   private trailingRefetch = false;
   /** A discard happened while it was in flight: one successor is owed. */
   private refreshOwed = false;
+  /** Trailing refetches started in the current chain (R7-04). */
+  private trailingRun = 0;
+  /** A trailing refetch waiting out its backoff (R7-04). */
+  private trailingTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Bumped by stop(): a chain from before it never acts again. */
+  private trailingGeneration = 0;
+  /** In-flight snapshot requests, cancelled by stop() (R7-05). */
+  private readonly snapshotRequests = new Set<AbortController>();
 
   constructor(
     options: BoardClientOptions,
@@ -114,6 +134,15 @@ export class BoardClient {
     this.stopped = true;
     if (this.reconnectTimer !== null) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
+    // Queued and in-flight snapshot work belongs to this session (R7-04/05).
+    if (this.trailingTimer !== null) clearTimeout(this.trailingTimer);
+    this.trailingTimer = null;
+    this.trailingGeneration += 1;
+    this.trailingRefetch = false;
+    this.refreshOwed = false;
+    this.trailingRun = 0;
+    for (const request of this.snapshotRequests) request.abort();
+    this.snapshotRequests.clear();
     this.stopLivenessWatch();
     const socket = this.socket;
     this.socket = null;
@@ -268,12 +297,13 @@ export class BoardClient {
     }, delay);
   }
 
-  private async api<T>(path: string): Promise<T> {
+  private async api<T>(path: string, signal?: AbortSignal): Promise<T> {
     // Relative paths: the API is served from the same origin as the UI in
     // production, and vite's dev proxy carries /api to the mock.
     const doFetch = this.fetchImpl;
     const res = await doFetch(path, {
       headers: { authorization: `Bearer ${this.options.token}` },
+      ...(signal !== undefined ? { signal } : {}),
     });
     if (!res.ok) return this.refused(path, res);
     return (await res.json()) as T;
@@ -301,7 +331,7 @@ export class BoardClient {
     const request = ++this.fetchSeq;
     const epoch = this.snapshotEpoch;
     try {
-      const snapshot = await this.api<unknown>('/api/board');
+      const snapshot = await this.snapshotWithinDeadline();
       if (!isValidSnapshot(snapshot)) throw new Error('board api returned a malformed snapshot');
       // Only the newest answer, and only if no pushed snapshot arrived since
       // it was asked for: an older HTTP answer never overwrites newer truth.
@@ -324,14 +354,48 @@ export class BoardClient {
     }
   }
 
+  /** GET /api/board, fetch and body alike, bounded by a private deadline
+   * (R7-05): a hung request is cancelled and rejects, so the trailing
+   * refetch it holds is released and owed demand drains. */
+  private async snapshotWithinDeadline(): Promise<unknown> {
+    const request = new AbortController();
+    this.snapshotRequests.add(request);
+    const expired = new Promise<never>((_, reject) => {
+      request.signal.addEventListener('abort', () => reject(new Error('board snapshot request abandoned')), { once: true });
+    });
+    const timer = setTimeout(() => request.abort(), SNAPSHOT_DEADLINE_MS);
+    try {
+      return await Promise.race([this.api<unknown>('/api/board', request.signal), expired]);
+    } finally {
+      clearTimeout(timer);
+      this.snapshotRequests.delete(request);
+    }
+  }
+
   private startTrailingRefetch(): void {
+    const generation = this.trailingGeneration;
     this.trailingRefetch = true;
+    this.refreshOwed = false; // this request answers every demand before it
+    this.trailingRun += 1;
     void this.refetchSnapshot().finally(() => {
-      this.trailingRefetch = false;
-      if (this.refreshOwed && !this.stopped) {
-        this.refreshOwed = false;
-        this.startTrailingRefetch();
+      if (generation !== this.trailingGeneration) return; // stop() released the chain
+      if (!this.refreshOwed || this.stopped) {
+        this.trailingRefetch = false;
+        this.trailingRun = 0;
+        return;
       }
+      // R7-04: under sustained pushes every answer is discarded; a short
+      // burst runs back to back, then the chain backs off (capped) while
+      // keeping the demand, so a GET never loops unbounded.
+      const delay = trailingDelay(this.trailingRun);
+      if (delay === 0) {
+        this.startTrailingRefetch();
+        return;
+      }
+      this.trailingTimer = setTimeout(() => {
+        this.trailingTimer = null;
+        if (generation === this.trailingGeneration && !this.stopped) this.startTrailingRefetch();
+      }, delay);
     });
   }
 

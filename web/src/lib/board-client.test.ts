@@ -539,6 +539,162 @@ describe('board client', () => {
     client.stop();
   });
 
+  /** A board client over a scripted fetch and a fake socket — every GET
+   * waits for the test, answered with a plain response object (no body
+   * stream), so fake timers alone drive time. */
+  function scriptedClient() {
+    const requests: Array<{ answer: (snapshot: BoardSnapshot) => void; hang: () => void; signal: AbortSignal | undefined }> = [];
+    const fetchImpl = vi.fn((_path: string, init?: RequestInit) => new Promise<Response>((resolve) => {
+      requests.push({
+        answer: (snapshot) => resolve({ ok: true, status: 200, json: async () => snapshot } as unknown as Response),
+        // The headers arrive but the body never finishes.
+        hang: () => resolve({ ok: true, status: 200, json: () => new Promise(() => {}) } as unknown as Response),
+        signal: init?.signal ?? undefined,
+      });
+    })) as unknown as typeof fetch;
+    const sockets: { onopen: (() => void) | null; onmessage: ((event: { data: string }) => void) | null }[] = [];
+    class FakeSocket {
+      onopen: (() => void) | null = null;
+      onmessage: ((event: { data: string }) => void) | null = null;
+      onclose: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      constructor() {
+        sockets.push(this);
+      }
+      send(): void {}
+      close(): void {}
+    }
+    const delivered: string[] = [];
+    const client = new BoardClient(
+      { token: TOKEN, host: 'localhost', fetchImpl, webSocketCtor: FakeSocket as unknown as new (url: string) => WebSocket },
+      { connection: () => {}, snapshot: (snapshot) => delivered.push(snapshot.decisions.incarnation), fatal: () => {} },
+    );
+    const settle = () => vi.advanceTimersByTimeAsync(0);
+    const open = async () => {
+      client.connect();
+      requests[0]!.answer(tagged('boot'));
+      await settle();
+      authenticate();
+      return (tag: string) => sockets.at(-1)!.onmessage!({ data: JSON.stringify({ type: 'board', snapshot: tagged(tag) }) });
+    };
+    const authenticate = () => {
+      const socket = sockets.at(-1)!;
+      socket.onopen!();
+      socket.onmessage!({ data: JSON.stringify({ type: 'auth_ok' }) });
+    };
+    return { client, requests, delivered, settle, open, authenticate };
+  }
+
+  it('sustained pushes with slower HTTP never loop GETs unbounded — a short burst, then capped backoff; the owed answer lands once pushes stop, and stop() cancels the queued one (R7-04)', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const { client, requests, delivered, settle, open, authenticate } = scriptedClient();
+      const push = await open();
+      void client.refetchSnapshot();
+      // 30 s of pushes every 150 ms; every GET is answered only after the
+      // next push landed, so every answer is discarded.
+      let answered = 1;
+      for (let t = 0; t < 30_000; t += 150) {
+        push(`push-${t}`);
+        while (answered < requests.length) requests[answered++]!.answer(tagged(`late-${answered}`));
+        await settle();
+        await vi.advanceTimersByTimeAsync(150);
+      }
+      // Without a bound this is one GET per push (~200); the burst of 2 and
+      // the 1-2-4-8-8… s backoff allow at most a handful.
+      expect(requests.length).toBeGreaterThan(3);
+      expect(requests.length).toBeLessThanOrEqual(10);
+      // Pushes stop: the demand was kept, so the waiting refetch still runs
+      // and its answer — the authoritative one — is delivered.
+      await vi.advanceTimersByTimeAsync(8_000);
+      while (answered < requests.length) requests[answered++]!.answer(tagged('authoritative'));
+      await settle();
+      expect(delivered.at(-1)).toBe('authoritative');
+      const quiet = requests.length;
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(requests).toHaveLength(quiet); // the chain ended: nothing more owed
+      // A fresh chain driven into backoff, then stop(): the queued refetch never runs.
+      void client.refetchSnapshot();
+      for (let i = 0; i < 4; i += 1) {
+        push(`again-${i}`);
+        while (answered < requests.length) requests[answered++]!.answer(tagged(`again-late-${i}`));
+        await settle();
+      }
+      const beforeStop = requests.length;
+      client.stop();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(requests).toHaveLength(beforeStop);
+      // Reconnected after a stop that interrupted a backoff: the old chain
+      // stays dead — only the reconnect's own snapshot request runs.
+      client.connect();
+      requests[answered++]!.answer(tagged('back'));
+      await settle();
+      authenticate();
+      void client.refetchSnapshot();
+      for (let i = 0; i < 4; i += 1) {
+        push(`pre-stop-${i}`);
+        while (answered < requests.length) requests[answered++]!.answer(tagged(`pre-stop-late-${i}`));
+        await settle();
+      }
+      const queued = requests.length;
+      client.stop();
+      client.connect();
+      expect(requests).toHaveLength(queued + 1);
+      requests[queued]!.answer(tagged('reconnected'));
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(requests).toHaveLength(queued + 1);
+      expect(delivered.at(-1)).toBe('reconnected');
+      client.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a hung trailing GET — at the fetch or in the body — is abandoned at its deadline, so newer owed demand drains without the old request ever answering; stop() cancels an in-flight one (R7-05)', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const { client, requests, delivered, settle, open } = scriptedClient();
+      const push = await open();
+      // A refresh discarded by a push -> a trailing refetch, which hangs at the fetch.
+      void client.refetchSnapshot();
+      push('stale-1');
+      requests[1]!.answer(tagged('fresh-1'));
+      await settle();
+      expect(requests).toHaveLength(3); // the trailing refetch, never answered
+      // A newer wake completes, is discarded by another push: demand owed behind the hung one.
+      void client.refetchSnapshot();
+      push('stale-2');
+      requests[3]!.answer(tagged('wake'));
+      await settle();
+      expect(requests).toHaveLength(4);
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(requests[2]!.signal?.aborted).toBe(true); // the hung one was cancelled
+      expect(requests).toHaveLength(5); // and the owed refresh ran
+      // This one gets its headers, then its body hangs: abandoned the same way.
+      requests[4]!.hang();
+      void client.refetchSnapshot();
+      push('stale-3');
+      requests[5]!.answer(tagged('discarded-again'));
+      await settle();
+      expect(requests).toHaveLength(5 + 1);
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(requests[4]!.signal?.aborted).toBe(true);
+      expect(requests).toHaveLength(6); // the chain's third refetch backs off (R7-04)...
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(requests).toHaveLength(7); // ...and then runs
+      requests[6]!.answer(tagged('fresh'));
+      await settle();
+      expect(delivered.at(-1)).toBe('fresh');
+      // stop() cancels an in-flight snapshot request at once.
+      void client.refetchSnapshot();
+      expect(requests).toHaveLength(8);
+      client.stop();
+      expect(requests[7]!.signal?.aborted).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('a malformed review is refused before anything renders it — a valid one passes', async () => {
     const review = (removed: unknown) => ({
       id: 'prop-1',

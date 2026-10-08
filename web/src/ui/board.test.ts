@@ -2706,6 +2706,66 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(text).not.toContain('dropped to fit');
   });
 
+  it('the archive record is explained wherever it appears — added, changed and removed — with its body and tags (R7-08)', async () => {
+    const ARCHIVE = 'archived-provenance';
+    const archiveBody = 'Lessons trimmed at the chapter cap; provenance retained so the journal remains the ground truth.';
+    const explained = 'archive record (journal handles of dropped lessons)';
+    const review = proposalReview({
+      chapters: [
+        {
+          slug: 'ops',
+          title: { before: 'Ops', after: 'Ops' },
+          retired: false,
+          summary: { before: 'Restart discipline.', after: 'Restart discipline.' },
+          tags: { before: ['ops'], after: ['ops'] },
+          added: [lessonChange(ARCHIVE, archiveBody, { tags: ['archived'] })],
+          changed: [],
+          removed: [{ slug: 'drop-me', body: 'A lesson the cap removes.', recurred: 1, tags: [], reason: 'cap' }],
+          provenanceTrimmed: 0,
+          bodiesTrimmed: 0,
+        },
+        {
+          slug: 'rounds',
+          title: { before: 'Rounds', after: 'Rounds' },
+          retired: false,
+          summary: { before: 'Review rounds.', after: 'Review rounds.' },
+          tags: { before: [], after: [] },
+          added: [],
+          changed: [lessonChange(ARCHIVE, `${archiveBody} Merged.`, { tags: ['archived', 'rounds'], previousBody: archiveBody, previousRecurred: 1, previousTags: ['archived'] })],
+          removed: [],
+          provenanceTrimmed: 0,
+          bodiesTrimmed: 0,
+        },
+        {
+          slug: 'model-policy',
+          title: { before: 'Model policy', after: 'Model policy' },
+          retired: true,
+          summary: { before: 'Which model does what.', after: '' },
+          tags: { before: ['models'], after: [] },
+          added: [],
+          changed: [],
+          removed: [{ slug: ARCHIVE, body: archiveBody, recurred: 2, tags: ['archived'], reason: 'retired' }],
+          provenanceTrimmed: 0,
+          bodiesTrimmed: 0,
+        },
+      ],
+    });
+    const view = new BoardView(() => {}, proposalClient(decided, review));
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    openReview();
+    await flush();
+    const lessons = [...document.getElementById('board-owner')!.querySelectorAll<HTMLElement>('.board-owner__review-lesson')]
+      .map((node) => [...node.children].filter((child) => child.tagName === 'DIV').map((child) => child.textContent));
+    expect(lessons).toEqual([
+      [`new · recurred 1 · ${explained}`, archiveBody, 'tags: archived'],
+      ['removed to fit the cap · drop-me (recurred 1)', 'A lesson the cap removes.'],
+      [`updated · recurred 1 · ${explained}`, `${archiveBody} Merged.`, 'tags: archived → archived, rounds'],
+      [`removed with the chapter · ${explained} (recurred 2)`, archiveBody, 'tags: archived'],
+    ]);
+    // The internal slug never stands alone as a label.
+    expect(document.getElementById('board-owner')!.textContent).not.toMatch(new RegExp(`· ${ARCHIVE}\\b`));
+  });
+
   it('band Accept and band Reject reach the real client’s exact decision endpoints', async () => {
     const { BoardClient } = await import('../lib/board-client.js');
     const calls: string[] = [];

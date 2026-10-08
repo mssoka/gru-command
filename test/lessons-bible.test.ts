@@ -1731,6 +1731,61 @@ describe('fifth review round of #253 — follow-up (bmad-code-review, 2026-10-08
     expect(bible.planUpdates([proposal({ slug: 'ops-new' })], PROVENANCE).contract).toBe(2);
   });
 
+  /** A first-release fixture, its reviewed book laid down in a fresh store. */
+  function firstReleasePlan(name: string): { plan: BiblePlan; bible: BibleStore } {
+    const fixture = JSON.parse(readFileSync(join(import.meta.dirname, 'fixtures', name), 'utf8')) as {
+      chapterCapBytes: number; indexCapBytes: number; plan: BiblePlan;
+    };
+    expect(fixture.plan.contract).toBeUndefined();
+    const bible = tmpBible(fixture.chapterCapBytes, fixture.indexCapBytes);
+    mkdirSync(bible.chaptersDir, { recursive: true });
+    for (const entry of fixture.plan.before) if (entry.text !== null) writeFileSync(join(bible.dir, entry.path), entry.text);
+    return { plan: fixture.plan, bible };
+  }
+
+  it('a first-release plan that repeats a handle — in its reviewed book and in its writes — verifies, reviews and applies byte for byte; today\'s reader still refuses repeats (R7-01)', () => {
+    // Made by the first release (4cc8a83): a lesson citing one journal id
+    // twice was written as two copies, and the owner approved those bytes.
+    const { plan, bible } = firstReleasePlan('lessons-plan-contract-1-duplicates.json');
+    expect(plan.before.find((entry) => entry.path === 'chapters/ops.md')?.text).toContain('j-1@2026-10-01T00:01:00.000Z, j-1@');
+    expect(plan.writes[0]!.text).toContain('j-3@2026-10-01T00:03:00.000Z, j-3@');
+    expect(() => checkPlan(plan)).not.toThrow();
+    const review = describePlan(plan);
+    expect(review.chapters.map((chapter) => [chapter.slug, chapter.added.map((lesson) => lesson.slug)])).toEqual([['ops', ['shell']]]);
+    expect(() => checkPlan({ ...plan, contract: 2 })).toThrowError(/provenance repeats j-1/);
+    bible.applyPlan(plan);
+    for (const write of plan.writes) expect(readFileSync(join(bible.chaptersDir, `${write.slug}.md`), 'utf8')).toBe(write.text);
+    expect(readFileSync(join(bible.dir, 'INDEX.md'), 'utf8')).toBe(plan.indexText);
+    // The book now holds the approved bytes; reading it is still today's
+    // contract, which names the repair tool.
+    expect(() => bible.readChapter('ops')).toThrowError(/provenance cites j-1 more than once — rebuild it from the journal with the repair tool/);
+    expect(() => parseChapter(plan.writes[0]!.text, 'ops')).toThrowError(/more than once/);
+    expect(parseChapter(plan.writes[0]!.text, 'ops', 1).lessons.map((lesson) => lesson.provenance.map((ref) => ref.id)))
+      .toEqual([['j-1', 'j-1', 'j-2'], ['j-3', 'j-3']]);
+  });
+
+  it('a first-release plan over handles dated before year 100 replays that release\'s chronology — handle release, drop choice and archive merge (R7-02)', () => {
+    // The first release ordered instants with Date.UTC, which reads years
+    // 0–99 as 1900–1999: "0026-12" sorted after "1926-07". The owner
+    // approved what THAT order kept.
+    for (const [name, kept] of [
+      ['lessons-plan-contract-1-early-year.json', [['restart', ['j-2', 'j-7', 'j-4', 'j-6']]]],
+      ['lessons-plan-contract-1-early-drops.json', [['alpha', ['j-1', 'j-2']], ['archived-provenance', ['j-6']]]],
+      ['lessons-plan-contract-1-early-archive.json', [['bravo', ['j-3', 'j-4']], ['archived-provenance', ['j-2']]]],
+    ] as const) {
+      const { plan, bible } = firstReleasePlan(name);
+      expect(parseChapter(plan.writes[0]!.text, 'ops', 1).lessons.map((lesson) => [lesson.slug, lesson.provenance.map((ref) => ref.id)]), name)
+        .toEqual(kept);
+      expect(() => checkPlan(plan), name).not.toThrow();
+      expect(describePlan(plan).chapters.map((chapter) => chapter.slug), name).toEqual(['ops']);
+      // Today's chronology keeps other handles and lessons from the same merge.
+      expect(() => checkPlan({ ...plan, contract: 2 }), name).toThrowError(/is not what the cap makes of its merged chapter/);
+      bible.applyPlan(plan);
+      expect(readFileSync(join(bible.chaptersDir, 'ops.md'), 'utf8'), name).toBe(plan.writes[0]!.text);
+      expect(readFileSync(join(bible.dir, 'INDEX.md'), 'utf8'), name).toBe(plan.indexText);
+    }
+  });
+
   it('every provenance line of a lesson counts — a handle repeated across lines is refused (R6-02)', () => {
     expect(() => parseChapter(`# A\n\n## a\n\nrecurred: 1\nprovenance: j-3@${at(3)}\nprovenance: j-3@${at(3)}\nprovenance: j-3@${at(3)}\n\nBody.\n`, 'a'))
       .toThrowError(/provenance cites j-3 more than once/);
@@ -1761,6 +1816,47 @@ describe('fifth review round of #253 — follow-up (bmad-code-review, 2026-10-08
     // A parseable, fitting, WRONG instant lands instead of the journal's.
     store.writeAtomic = (file, data) => real(file, file === join(bible.chaptersDir, 'ops.md') ? String(data).replace(at(1), at(2)) : data);
     expect(() => bible.repairProvenance(JOURNAL_R5, { write: true })).toThrowError(/chapter ops\.md does not hold the planned bytes/);
+  });
+
+  it('a planned chapter that vanishes before verification fails the repair — never a success report without it (R7-06)', () => {
+    const bible = tmpBible();
+    bible.ensureSeeded();
+    const original = `# Ops\n\n## a\n\nrecurred: 1\nprovenance: j-1\n\nBody.\n`;
+    writeFileSync(join(bible.chaptersDir, 'ops.md'), original);
+    const store = bible as unknown as { writeAtomic(file: string, data: string | Buffer): void };
+    const real = store.writeAtomic.bind(bible);
+    // The replacement lands, then is deleted before the read-back.
+    store.writeAtomic = (file, data) => {
+      real(file, data);
+      if (file === join(bible.chaptersDir, 'ops.md')) rmSync(file);
+    };
+    let caught: unknown;
+    try {
+      bible.repairProvenance(JOURNAL_R5, { write: true });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(RepairWriteError);
+    const failure = caught as RepairWriteError;
+    expect(failure.message).toMatch(/chapter ops\.md cannot be read back \(ENOENT\)/);
+    expect(failure.written).toEqual(['ops']);
+    expect(readFileSync(join(failure.backupDir, 'chapters', 'ops.md'), 'utf8')).toBe(original);
+  });
+
+  it('the body floor is 160 code units even when an emoji straddles it — never 159 plus the marker (R7-09)', () => {
+    const marker = ' … [trimmed to fit the chapter cap]';
+    const body = `${'a'.repeat(159)}😀${'b'.repeat(300)}`;
+    const chapter = chapterOf([lessonOf('emoji', [{ id: 'j-1', ts: at(1) }], body)]);
+    const sized = (kept: string) => Buffer.byteLength(serializeChapter(chapterOf([lessonOf('emoji', [{ id: 'j-1', ts: at(1) }], `${kept}${marker}`)])), 'utf8');
+    // Room for 159 units and the marker, not 161: the lesson cannot stay.
+    const tight = enforceChapterCap(chapter, sized('a'.repeat(159)));
+    for (const lesson of tight.chapter.lessons.filter((candidate) => candidate.slug !== ARCHIVED_LESSON_SLUG)) {
+      expect(lesson.body.endsWith(marker) ? lesson.body.length - marker.length : lesson.body.length).toBeGreaterThanOrEqual(160);
+    }
+    expect(tight.chapter.lessons.some((lesson) => lesson.slug === 'emoji')).toBe(false);
+    // Room for the whole emoji: kept at the first boundary past the floor.
+    const roomy = enforceChapterCap(chapter, sized(`${'a'.repeat(159)}😀`));
+    expect(roomy.chapter.lessons.find((lesson) => lesson.slug === 'emoji')?.body).toBe(`${'a'.repeat(159)}😀${marker}`);
   });
 
   it('whitespace a trim drops never counts toward the body floor (R6-06)', () => {
@@ -1816,6 +1912,29 @@ describe('fifth review round of #253 — follow-up (bmad-code-review, 2026-10-08
     expect(lf.length).toBeGreaterThan(0);
     expect(pointersWith('\r\n')).toEqual(lf);
     expect(pointersWith('\r')).toEqual(lf);
+  });
+
+  it('a chapter with invalid bytes is refused by the bulk read, by name, and briefings fall back to index-level pointers (R7-07)', () => {
+    const bible = tmpBible();
+    bible.ensureSeeded();
+    // A replacement character the chapter really holds, then corrupted on disk.
+    bible.applyPlan(bible.planUpdates([proposal({ summary: 'Restart discipline \uFFFD kept.' })], PROVENANCE));
+    const healthy = createBibleReferences({ bible }).referencesFor('restart the shell');
+    expect(healthy.some((pointer) => pointer.lesson !== null)).toBe(true);
+    const file = join(bible.chaptersDir, 'ops-restarts.md');
+    writeFileSync(file, Buffer.from(readFileSync(file).toString('latin1').replace('ï¿½', 'ÿ'), 'latin1'));
+    expect(() => bible.readChapters()).toThrowError(/chapters\/ops-restarts\.md is not valid UTF-8/);
+    const logged: { level: string; message: string; fields: Record<string, unknown> | undefined }[] = [];
+    const pointers = createBibleReferences({
+      bible,
+      log: (level, message, fields) => logged.push({ level, message, fields }),
+    }).referencesFor('restart the shell');
+    expect(pointers.length).toBeGreaterThan(0);
+    expect(pointers.every((pointer) => pointer.lesson === null)).toBe(true);
+    expect(pointers.map((pointer) => pointer.chapter)).toContain('ops-restarts');
+    expect(logged).toHaveLength(1);
+    expect(logged[0]!.level).toBe('warn');
+    expect(String(logged[0]!.fields?.['error'])).toMatch(/ops-restarts\.md is not valid UTF-8/);
   });
 
   it('repeated journal ids never fill the provenance floor with copies — the newest three distinct handles stay (R5-A5, C4)', () => {

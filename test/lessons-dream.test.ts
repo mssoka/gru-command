@@ -1027,6 +1027,121 @@ describe('owner-approved lesson proposals (owner decision 2026-10-07)', () => {
     expect(existsSync(h.file)).toBe(false);
   });
 
+  it('first-release plans with repeated handles or pre-100 dates stay reviewable, and their decisions finish from every durable phase (R7-01/R7-02)', async () => {
+    const phases = ['undecided', 'accepted-nothing-written', 'accepted-half-written', 'accepted-all-written', 'accepted-committed', 'rejected'] as const;
+    for (const name of ['lessons-plan-contract-1-duplicates.json', 'lessons-plan-contract-1-early-year.json', 'lessons-plan-contract-1-early-drops.json', 'lessons-plan-contract-1-early-archive.json']) {
+      const { plan } = JSON.parse(readFileSync(join(import.meta.dirname, 'fixtures', name), 'utf8')) as {
+        plan: { before: { path: string; text: string | null }[]; writes: { slug: string; text: string }[]; indexText: string; contract?: number };
+      };
+      expect(plan.contract).toBeUndefined();
+      for (const phase of phases) {
+        const label = `${name} ${phase}`;
+        const h = proposalHarness();
+        const entry = h.journal.append({ kind: 'finding', source: 'gru', body: 'shell hang finding' });
+        await h.engine.run();
+        const { id, notificationId } = h.proposals.review()!;
+        // The book the first release reviewed, and its stored record.
+        mkdirSync(h.bible.chaptersDir, { recursive: true });
+        for (const before of plan.before) {
+          if (before.text === null) rmSync(join(h.bible.dir, before.path), { force: true });
+          else writeFileSync(join(h.bible.dir, before.path), before.text);
+        }
+        const reviewed = book(h.bible);
+        const record: Record<string, unknown> = { ...h.stored(), plan };
+        const accepted = { kind: 'accepted', at: '2026-10-08T00:00:00.000Z', detail: null };
+        const writeAll = () => {
+          for (const write of plan.writes) writeFileSync(join(h.bible.chaptersDir, `${write.slug}.md`), write.text);
+          writeFileSync(join(h.bible.dir, 'INDEX.md'), plan.indexText);
+        };
+        if (phase === 'undecided') h.store(record);
+        if (phase === 'accepted-nothing-written') h.store({ ...record, decision: accepted });
+        if (phase === 'accepted-half-written') {
+          writeFileSync(join(h.bible.chaptersDir, `${plan.writes[0]!.slug}.md`), plan.writes[0]!.text); // INDEX.md not yet
+          h.store({ ...record, decision: accepted });
+        }
+        if (phase === 'accepted-all-written') {
+          writeAll(); // the cursor not yet advanced
+          h.store({ ...record, decision: accepted });
+        }
+        if (phase === 'accepted-committed') {
+          writeAll();
+          saveDreamState(join(h.bible.dir, DREAM_STATE_FILE), record['nextState'] as never);
+          h.store({ ...record, decision: accepted, committed: { at: '2026-10-08T00:00:01.000Z' } });
+        }
+        if (phase === 'rejected') h.store({ ...record, decision: { kind: 'rejected', at: '2026-10-08T00:00:00.000Z', detail: null } });
+        const notifier = new FakeNotifier();
+        const upgraded = new LessonProposals({ bible: new BibleStore(h.bible.dir), notifier });
+        if (phase === 'undecided') {
+          // Reviewable as stored — then the owner's Accept applies it.
+          expect(upgraded.review()?.chapters.map((chapter) => chapter.slug), label).toEqual(['ops']);
+          expect(upgraded.reconcile()?.id, label).toBe(id);
+          upgraded.accept(id);
+        } else {
+          if (phase !== 'accepted-committed') expect(upgraded.review()?.decision?.kind, label).toBe(phase === 'rejected' ? 'rejected' : 'accepted');
+          expect(upgraded.reconcile(), label).toBeNull();
+        }
+        if (phase === 'rejected') {
+          expect(book(h.bible), label).toEqual(reviewed);
+        } else {
+          for (const write of plan.writes) expect(readFileSync(join(h.bible.chaptersDir, `${write.slug}.md`), 'utf8'), label).toBe(write.text);
+          expect(readFileSync(join(h.bible.dir, 'INDEX.md'), 'utf8'), label).toBe(plan.indexText);
+        }
+        expect(cursor(h.bible), label).toBe(entry.seq);
+        expect(notifier.resolved, label).toEqual([{ id: notificationId, by: phase === 'rejected' ? 'owner:rejected' : 'owner:accepted' }]);
+        expect(existsSync(h.file), label).toBe(false);
+      }
+    }
+  });
+
+  it('an explicit contract 1 is created and loaded like an absent one; an unknown contract is refused as malformed (R7-03)', async () => {
+    const { plan } = JSON.parse(readFileSync(join(import.meta.dirname, 'fixtures', 'lessons-plan-contract-1.json'), 'utf8')) as {
+      plan: { before: { path: string; text: string | null }[]; writes: { slug: string; text: string }[]; indexText: string; contract?: number };
+    };
+    const explicit = { ...plan, contract: 1 };
+    const layDown = (bible: BibleStore) => {
+      mkdirSync(bible.chaptersDir, { recursive: true });
+      for (const before of plan.before) {
+        if (before.text === null) rmSync(join(bible.dir, before.path), { force: true });
+        else writeFileSync(join(bible.dir, before.path), before.text);
+      }
+    };
+    // Loaded: reviewable, and the owner's Accept applies it as approved.
+    const h = proposalHarness();
+    h.journal.append({ kind: 'finding', source: 'gru', body: 'shell hang finding' });
+    await h.engine.run();
+    const { id } = h.proposals.review()!;
+    layDown(h.bible);
+    const record = h.stored();
+    h.store({ ...record, plan: explicit });
+    expect(h.proposals.review()?.id).toBe(id);
+    expect(h.proposals.reconcile()?.id).toBe(id);
+    h.proposals.accept(id);
+    for (const write of plan.writes) expect(readFileSync(join(h.bible.chaptersDir, `${write.slug}.md`), 'utf8')).toBe(write.text);
+    // Created: the same plan, stated explicitly, is accepted at creation.
+    const fresh = proposalHarness();
+    layDown(fresh.bible);
+    const created = fresh.proposals.create({
+      plan: explicit as never,
+      entries: record['entries'] as number,
+      fromState: record['fromState'] as never,
+      batch: record['batch'] as never,
+      nextState: record['nextState'] as never,
+    });
+    expect(fresh.proposals.review()?.id).toBe(created.id);
+    expect(fresh.stored()['plan']).toMatchObject({ contract: 1 });
+    // Anything this build cannot verify is malformed — at load and at creation.
+    fresh.store({ ...fresh.stored(), plan: { ...plan, contract: 3 } });
+    expect(() => fresh.proposals.review()).toThrowError(/malformed \(plan\.contract\)/);
+    rmSync(fresh.file);
+    expect(() => fresh.proposals.create({
+      plan: { ...plan, contract: 3 } as never,
+      entries: record['entries'] as number,
+      fromState: record['fromState'] as never,
+      batch: record['batch'] as never,
+      nextState: record['nextState'] as never,
+    })).toThrowError(/malformed \(plan\.contract\)/);
+  });
+
   it('closing keeps the record until the notice is resolved: a failed resolve is finished later, not lost', async () => {
     const h = proposalHarness();
     const entry = h.journal.append({ kind: 'finding', source: 'gru', body: 'shell hang finding' });
