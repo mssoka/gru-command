@@ -5,7 +5,7 @@ created: '2026-10-07'
 status: 'in-review'
 route: 'dispatch'
 baseline_commit: '49b558f243c7bacbfb46c7bc04f749bf131cefea'
-review_loop_iteration: 7
+review_loop_iteration: 10
 context: []
 ---
 
@@ -213,7 +213,23 @@ Exact-head receipts at `e740d96` (all through the authenticated scheduler + ship
 - `megaminions-browser` GREEN (run `f1482ba1-0d82-4fe2-a56e-7d8738c03d31`)
 - `full` GREEN (run `a52e12a8-beca-4574-9b25-8865aa9969c4`)
 
-Exact-head CI: **structurally blocked** — GitHub suppresses `pull_request` runs for conflicted PRs (SLIM replaces code main also carries in `board.ts`/`components.css`). Recorded as the owner-held merge-time resolution. Native Perkins: queued (`request_seq 57658`, route `queued`); arms after delivery.
+### Post-R2-fix exact-head receipts at `4ab3e7b`
+
+| Scope | Run | Outcome |
+|---|---|---|
+| `dashboard-slim-strip-unit` | `c48c1937` | GREEN 142/142 |
+| `strip-browser` | `f0ef8869` | GREEN 67/67 |
+| `strip-smoke` | `47a12ba7` | GREEN |
+| `strip-themes` | `78ee53f2` | GREEN |
+| `dashboard-slim-strip-baseline` | `79200bd6` | RED exit 1 (expected) |
+| `strip-browser-baseline` | `5a97c980` | RED exit 1 (expected) |
+| `typecheck` | `cee69050` | GREEN |
+| `pipeline-board-browser` | `d40d531c` | GREEN 15/15 STRICT |
+| `megaminions-browser` | `dcb256a0` | GREEN |
+| `lesson-proposal-browser` | `d4043d62` | GREEN at `4ba44f5` |
+| `full` | `96b177a7` | GREEN |
+
+Exact-head CI: **structurally blocked** (PR conflict) — GitHub suppresses `pull_request` runs for conflicted PRs (SLIM replaces code main also carries in `board.ts`/`components.css`). Recorded as the owner-held merge-time resolution. Native Perkins: queued (`request_seq 57658`, route `queued`); arms after delivery.
 
 
 ### Round 7 (corrective whole-change pass, owner A / j-1307) — findings and resolution
@@ -236,7 +252,7 @@ Round-8 delta re-verification at `2a37ffb`: blind-hunter 11 findings (4 delta + 
 ## Protected corrective follow-up (owner A, j-1307) — contract acknowledgment and corrections
 
 ### Effective contract acknowledgment
-Read via `GET /api/dispatch/jobs/dashboard-slim-strip-current-main-20261007/contract`: **version 3**, `contract_sha256` `c72936f62a246731d312d3c46bdd948349a7bc89d0800b7b29c251ac3fddcf19`, `base_sha256` `28e68b34af052c8cd17639380b39dde256fdfdc83ea987b3c58250a0235d4545`; amendments `f63d0c6c-9021-4d7a-8932-eba380bc7342` (capture-contract enforcement, j-1288), `6c8e06e0-470f-4a8b-ada0-d423f76cd084` (pipeline verification integrity / review-pin clarification, j-1295–j-1296), and `b63275b8-…` (same-PR conflict-resolution continuation, j-1389/j-1355/j-1362/j-1387), all EFFECTIVE. The lane explicitly acknowledges and applies both: missing captures are recovered by the SAME request/run identity through the supported status/output surfaces — never by minting a fresh request or a second producer for logs, never fabricating a helper EOF; strict full-viewport containment stands with the measured nav/rail invariant retained; full SHAs come from Git/provider only; the R5 pin discrepancy is preserved as recorded rather than falsified.
+Read via `GET /api/dispatch/jobs/dashboard-slim-strip-current-main-20261007/contract`: **version 6**, `contract_sha256` `d4a8565c47d2480da6f8d3deaf5acf237a018a3dd2f0d50e627d92a80aa81511`, `base_sha256` `28e68b34af052c8cd17639380b39dde256fdfdc83ea987b3c58250a0235d4545`; amendments `f63d0c6c-9021-4d7a-8932-eba380bc7342` (capture-contract enforcement, j-1288), `6c8e06e0-470f-4a8b-ada0-d423f76cd084` (pipeline verification integrity / review-pin clarification, j-1295–j-1296), `b63275b8-…` (same-PR conflict-resolution continuation, j-1389/j-1355/j-1362/j-1387), `37536656-…` (v4 scope enforcement), `6ddf96dd-…` (v5 same-worker corrective continuation), and `a275e7c3-…` (v6, current), all EFFECTIVE. The lane explicitly acknowledges and applies both: missing captures are recovered by the SAME request/run identity through the supported status/output surfaces — never by minting a fresh request or a second producer for logs, never fabricating a helper EOF; strict full-viewport containment stands with the measured nav/rail invariant retained; full SHAs come from Git/provider only; the R5 pin discrepancy is preserved as recorded rather than falsified.
 
 ### Strict viewport containment restored (amendment #2)
 `web/e2e/pipeline-board.spec.ts` `hitTarget.inViewport` is restored to the original strict bounds (`left >= 0 && top >= 0 && right <= innerWidth && bottom <= innerHeight`) — no negative coordinates, no coordinates past the viewport. The observed b86af16 failures (request `86fb1c0f-3fc1-4565-b83f-05111dfbcd13` / run `f6998e40-e371-405f-95a6-7439b80462f1`: exit 1, 4 failed / 11 passed) were one stale fixed bound plus three sub-pixel scroll slivers: the tablet-768 sticky test failed on the old `nav.y < 140` constant (observed 225; replaced by the measured two-sided bound at `065bbf6`), while the desktop-1440 and tablet-768 light/dark viewport proofs failed strict containment by a 0<1px bottom sliver from minimal scrolling (`scrollIntoViewIfNeeded` / focus scrolling). The interaction path is repaired deterministically: `scrollFullyIntoView` performs the browser's minimal placement and then iteratively corrects residual edge overflow and sticky-chrome occlusion with explicit, bounded scrolls (the scroll a real user performs) before the strict probe; the two-sided measured nav/rail alignment invariant is retained; the independent strict hit/occlusion check is unchanged. Historical results are preserved and never relabelled: `86fb1c0f`/`f6998e40` exit 1, 4 failed at `b86af16`; request `2d59bd27-7a14-4278-945b-bc4018580c75` / run `52b744fa-0848-4d4e-8715-0e8d505098a4` exit 0, 15 passed at `065bbf6` under its changed (relaxed) test bytes — the latter is not strict-oracle proof.
@@ -249,6 +265,13 @@ Read via `GET /api/dispatch/jobs/dashboard-slim-strip-current-main-20261007/cont
 
 ### Conflict resolution (owner directive slim-conflict-resolution-continuation-20261008-v1, j-1355/j-1362/j-1387)
 PR #256 was `mergeable_state: dirty` against main `4cc8a83d…` (then `72c73c10…`): the merge-tree probe conflicted in `web/src/styles/components.css` and `web/src/ui/board.ts`. GitHub suppresses `pull_request` workflow runs for conflicted PRs, so correction heads had **no exact-head CI**. The owner directed (j-1355) and the chief authorized (j-1362/j-1387, amendment b63275b8 / contract v3) the resolution via targeted semantic source edits in the existing lane — normal descendant source commits, no merge/rebase/base-switch. The resolution commit `b3e902e` reconciled all 9 overlap files (2 manual conflicts + 7 auto-merges + main's newer code for local self-consistency); PR #256 was registered via `/api/dispatch/pr`; exact-head CI and the native round for the resolution head are recorded in the ignored handoff and the completion report.
+
+### R2 native review findings (INCOMPLETE at `a0ed034`, triaged)
+
+| # | Finding | Verdict | Disposition |
+|---|---|---|---|
+| R2-1 | Remaining unrelated backend/schema import (`src/ledger/db.ts` migration 23) | addressed | already reverted at `e740d96` — `git diff 49b558f..e740d96 -- src/` is empty |
+| R2-2 | Proposal error text fails light-theme contrast (1.57:1 vs required 4.5:1) | high | **Fixed** at `4ab3e7b`: `.board-owner__error` uses `color: var(--ink)` (12.26:1 light / high dark) + `border-left: 3px solid var(--alert)` for visual alert semantics |
 
 ### Correction-cycle receipts at `cb6adbc` (strict oracle; complete captures)
 - `dashboard-slim-strip-unit` GREEN 142/142 (run `cd27a125-b611-423a-b13d-449fea7004ba`, 11 frames).
