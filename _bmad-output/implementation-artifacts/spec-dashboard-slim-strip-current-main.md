@@ -190,6 +190,18 @@ Read via `GET /api/dispatch/jobs/dashboard-slim-strip-current-main-20261007/cont
 - `2fed6a5`: original request `638d125c-8933-4fab-9217-08bb6039bf3a` client capture UNKNOWN (99 bytes, sha256 `b3b63c57…`); its legitimate producer run `50ea0bb8-6258-47e6-957a-157d83fc7658` was recovered through the supported status surface (exit 0, 142 tests, 442 bytes, sha256 `eba106798dde1503…`); the later same-head producer run `6b29445e…` is distinct and separately recorded.
 - Disclosed deviation: the repeat producers (`78da62aa`, `ac784b1b`, `6b29445e`) were launched in the earlier cycle to replace terminated client captures; under amendment #1 that is not repair of the original receipt, and every presence/status distinction above is retained. This correction cycle recovered the outstanding `2fed6a5` UNKNOWN by same identity (no log-only rerun) and minted no replacement producer for missing captures.
 
+### Correction-cycle receipts at `cb6adbc` (strict oracle; complete captures)
+- `dashboard-slim-strip-unit` GREEN 142/142 (run `cd27a125-b611-423a-b13d-449fea7004ba`, 11 frames).
+- `strip-browser` GREEN 67/67 (run `f83ab022-8c69-4783-bc4e-a342bd1065f2`, 85 frames) — the eight final-head screenshots at 1440/1200/768/360 × light/dark were re-inspected at this head.
+- `strip-smoke` GREEN (run `a9a0eadb-7fc4-4b73-bbd9-7a86077e581f`, 56 frames).
+- `strip-themes` GREEN (run `365626c4-5c09-4f83-b22e-0d04f00003dc`, 16 frames).
+- `dashboard-slim-strip-baseline` RED exit 1 (run `52c1a9b5-a7dc-4d32-aa6f-f580d252a526`, 130 frames; expected feature absence).
+- `strip-browser-baseline` RED exit 1 (run `94ff1b92-0cf8-4396-8308-76eb0a6658c6`, 126 frames).
+- `typecheck` GREEN (run `0a0ad71b-bb58-4b03-a530-89da49378e91`, 4 frames).
+- `pipeline-board-browser` GREEN 15/15 under the STRICT containment oracle (run `7ec5f9ca-3f87-46ad-ad71-635efa2edd76`, 37 frames).
+- `full` GREEN (run `e0e346f6-f537-424c-ba02-bc42a7073cb3`, 484 frames).
+- PR #256 registered on the job via `POST /api/dispatch/pr` (200; job status `in-review`). Exact-head CI and the native round for this head are recorded in the ignored handoff and the completion report.
+
 ## Design Notes
 
 - Numeric slots: number part only carries `.num` (`font-variant-numeric: tabular-nums; display:inline-block; text-align:right`), scoped to `#chip-rail`/`#board-owner` so unrelated surfaces keep app defaults (probe-tested). The e2e suite measures geometry; CSS only declares.
