@@ -80,6 +80,8 @@ export class BoardClient {
   private snapshotEpoch = 0;
   /** The newest HTTP snapshot request; older answers are dropped. */
   private fetchSeq = 0;
+  /** One trailing refetch is in flight (C13); later discards coalesce. */
+  private trailingRefetch = false;
 
   constructor(
     options: BoardClientOptions,
@@ -302,7 +304,18 @@ export class BoardClient {
       // Only the newest answer, and only if no pushed snapshot arrived since
       // it was asked for: an older HTTP answer never overwrites newer truth.
       // A stopped (re-paired) client's late answer never reaches the board.
-      if (!this.stopped && request === this.fetchSeq && epoch === this.snapshotEpoch) this.events.snapshot(snapshot);
+      if (this.stopped || request !== this.fetchSeq) return;
+      if (epoch === this.snapshotEpoch) {
+        this.events.snapshot(snapshot);
+      } else if (!this.trailingRefetch) {
+        // C13: the push that won may itself be OLDER (queued before a
+        // decision this answer already shows). Ask once more — one
+        // coalesced trailing refetch — so the newest truth still lands.
+        this.trailingRefetch = true;
+        void this.refetchSnapshot().finally(() => {
+          this.trailingRefetch = false;
+        });
+      }
     } catch {
       /* connection state carries the error surface */
     }
@@ -361,9 +374,16 @@ export class BoardClient {
   /** The owner's decision on a lesson proposal — the ONLY way it closes
    * (owner decision 2026-10-07); the snapshot then retires the row. */
   async decideLessonProposal(id: string, decision: 'accept' | 'reject'): Promise<LessonProposalDecisionView> {
-    const result = await this.postApi(`/api/lessons/proposal/${encodeURIComponent(id)}/${decision}`, {});
-    if (!isValidLessonProposalDecision(result)) throw new Error('lesson proposal decision response is malformed');
-    return result;
+    const { status, body } = await this.postApiWithStatus(`/api/lessons/proposal/${encodeURIComponent(id)}/${decision}`, {});
+    const expected = decision === 'accept' ? 'accepted' : 'rejected';
+    // C9: a reply counts only when it answers THIS request — this proposal,
+    // this choice — in its own phase: 200 finished, 202 recorded but
+    // incomplete. Anything else leaves the outcome unconfirmed.
+    if (!isValidLessonProposalDecision(body) || body.id !== id || body.decision !== expected ||
+      !((status === 200 && body.incomplete !== true) || (status === 202 && body.incomplete === true))) {
+      throw new Error(`the server's reply (HTTP ${status}) does not confirm this ${decision}`);
+    }
+    return body;
   }
 
   /** E7: human ack (action-required clearance; re-arms an open breaker). */
@@ -372,6 +392,10 @@ export class BoardClient {
   }
 
   private async postApi(path: string, body: unknown): Promise<unknown> {
+    return (await this.postApiWithStatus(path, body)).body;
+  }
+
+  private async postApiWithStatus(path: string, body: unknown): Promise<{ readonly status: number; readonly body: unknown }> {
     const doFetch = this.fetchImpl;
     const res = await doFetch(path, {
       method: 'POST',
@@ -382,7 +406,7 @@ export class BoardClient {
       body: JSON.stringify(body),
     });
     if (!res.ok) return this.refused(path, res);
-    return res.json();
+    return { status: res.status, body: await res.json() };
   }
 }
 

@@ -330,13 +330,15 @@ export class BibleStore {
 
   readIndexText(): string | null {
     const file = join(this.dir, BIBLE_INDEX_FILE);
+    let raw: Buffer;
     try {
-      return readFileSync(file, 'utf-8');
+      raw = readFileSync(file);
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       if (code === 'ENOENT') return null;
       throw new BibleError(`bible index ${file} is unreadable: ${String(error)}`);
     }
+    return strictText(raw, file);
   }
 
   /** All chapters, slug order. A malformed chapter file fails loud. */
@@ -355,7 +357,8 @@ export class BibleStore {
       if (!isLessonsSlug(slug)) {
         throw new BibleError(`bible chapter file ${join(this.chaptersDir, name)} has an invalid slug filename`);
       }
-      chapters.push(parseChapter(readFileSync(join(this.chaptersDir, name), 'utf-8'), slug));
+      const file = join(this.chaptersDir, name);
+      chapters.push(parseChapter(strictText(readFileSync(file), file), slug));
     }
     return chapters;
   }
@@ -363,12 +366,14 @@ export class BibleStore {
   readChapter(slug: string): BibleChapter | null {
     if (!isLessonsSlug(slug)) throw new BibleError(`invalid chapter slug: ${JSON.stringify(slug)}`);
     const file = join(this.chaptersDir, `${slug}.md`);
+    let raw: Buffer;
     try {
-      return parseChapter(readFileSync(file, 'utf-8'), slug);
+      raw = readFileSync(file);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
       throw error;
     }
+    return parseChapter(strictText(raw, file), slug);
   }
 
   /**
@@ -470,6 +475,24 @@ export class BibleStore {
           );
         }
         written.push(write.slug);
+      }
+      // Proven while the lock is still held (R5-A7): every chapter, as
+      // stored, is strict UTF-8, parses with the dream's reader and fits.
+      try {
+        for (const name of readdirSync(this.chaptersDir).filter((entry) => entry.endsWith('.md')).sort()) {
+          const raw = readFileSync(join(this.chaptersDir, name));
+          if (raw.length > this.chapterCapBytes) {
+            throw new BibleError(`chapter ${name} is ${raw.length} B, over the ${this.chapterCapBytes} B cap`);
+          }
+          parseChapter(STRICT_UTF8.decode(raw), name.slice(0, -'.md'.length));
+        }
+      } catch (error) {
+        throw new RepairWriteError(
+          `repair replaced ${written.length} chapter(s) (${written.join(', ')}), but the result does not verify: ` +
+            `${error instanceof Error ? error.message : String(error)}. Every original is saved in ${backupDir}.`,
+          backupDir,
+          written,
+        );
       }
       completed = { backupDir, written };
       this.log('info', 'bible provenance repaired', { chapters_written: written.length, backup_dir: backupDir });
@@ -755,7 +778,8 @@ export class BibleStore {
       }
     }
     for (const name of names.filter((candidate) => candidate.endsWith('.md')).sort()) {
-      files.set(`${BIBLE_CHAPTERS_DIR}/${name}`, readFileSync(join(this.chaptersDir, name), 'utf-8'));
+      const file = join(this.chaptersDir, name);
+      files.set(`${BIBLE_CHAPTERS_DIR}/${name}`, strictText(readFileSync(file), file));
     }
     return files;
   }
@@ -843,12 +867,20 @@ function verifyPlan(plan: BiblePlan): VerifiedPlan {
   }
   if (!Number.isSafeInteger(plan.chapterCapBytes) || plan.chapterCapBytes <= 0) fail('its chapter cap');
   if (!Number.isSafeInteger(plan.indexCapBytes) || plan.indexCapBytes <= 0) fail('its index cap');
+  let trimmed = 0;
+  let dropped = 0;
   for (const write of plan.writes) {
     assertChapterModel(write.uncapped, write.slug);
     const capped = enforceChapterCap(write.uncapped, plan.chapterCapBytes);
     if (capped.text !== write.text) fail(`chapter ${write.slug} is not what the cap makes of its merged chapter`);
     if (!utf8Exact(write.text)) fail(`chapter ${write.slug} would not survive UTF-8 unchanged`);
     assertReadsBack(write.text, capped.chapter);
+    trimmed += capped.trimmed;
+    dropped += capped.droppedLessons;
+  }
+  // The counts Accept reports and logs are the cap's own (C6).
+  if (plan.report.lessonsTrimmed !== trimmed || plan.report.lessonsDropped !== dropped) {
+    fail(`its report claims ${plan.report.lessonsTrimmed} trimmed and ${plan.report.lessonsDropped} dropped lesson(s); the cap trims ${trimmed} and drops ${dropped}`);
   }
   // INDEX.md is exactly the index of the book the plan produces — so it can
   // carry nothing the review does not show.
@@ -894,9 +926,12 @@ function assertChapterModel(value: unknown, slug: string): void {
     if (typeof lesson['body'] !== 'string' || !isStrings(lesson['tags'])) bad('lesson text');
     if (typeof lesson['recurred'] !== 'number' || !Number.isSafeInteger(lesson['recurred']) || lesson['recurred'] < 1) bad('lesson recurrence');
     if (!Array.isArray(lesson['provenance'])) bad('lesson provenance');
+    const ids = new Set<string>();
     for (const ref of lesson['provenance'] as unknown[]) {
       const handle = (typeof ref === 'object' && ref !== null ? ref : bad('handle')) as Record<string, unknown>;
       if (typeof handle['id'] !== 'string' || typeof handle['ts'] !== 'string') bad('handle');
+      if (ids.has(handle['id'] as string)) bad(`provenance repeats ${String(handle['id'])}`);
+      ids.add(handle['id'] as string);
     }
   }
 }
@@ -935,8 +970,8 @@ export function describePlan(plan: BiblePlan): PlanReview {
       tags: { before: before.tags, after: [] },
       added: [],
       changed: [],
+      // The archive record goes too — shown like every other record (C5).
       removed: before.lessons
-        .filter((lesson) => lesson.slug !== ARCHIVED_LESSON_SLUG)
         .map((lesson) => ({ slug: lesson.slug, body: lesson.body, recurred: lesson.recurred, tags: lesson.tags, reason: 'retired' as const })),
       provenanceTrimmed: 0,
       bodiesTrimmed: 0,
@@ -980,16 +1015,14 @@ function assertReadsBack(text: string, planned: BibleChapter): void {
 
 function describeChapterChange(before: BibleChapter | null, uncapped: BibleChapter, cap: ChapterCapResult): ChapterChange {
   const after = cap.chapter;
-  const previous = new Map(
-    (before?.lessons ?? [])
-      .filter((lesson) => lesson.slug !== ARCHIVED_LESSON_SLUG)
-      .map((lesson) => [lesson.slug, lesson]),
-  );
+  // The archive record (slug ARCHIVED_LESSON_SLUG) is listed like any
+  // lesson (C5): its arrival, any change to its text or tags, and its
+  // removal are all visible — only handle-only changes stay summarized.
+  const previous = new Map((before?.lessons ?? []).map((lesson) => [lesson.slug, lesson]));
   const added: LessonChangeView[] = [];
   const changed: LessonChangeView[] = [];
   const kept = new Set<string>();
   for (const lesson of after.lessons) {
-    if (lesson.slug === ARCHIVED_LESSON_SLUG) continue;
     kept.add(lesson.slug);
     const prior = previous.get(lesson.slug);
     const view = {
@@ -1017,7 +1050,7 @@ function describeChapterChange(before: BibleChapter | null, uncapped: BibleChapt
     ...[...previous.values()].filter((lesson) => !kept.has(lesson.slug)).map((lesson) => removedView(lesson, 'cap')),
     // Incoming lessons the cap left out never reach the book: say so.
     ...uncapped.lessons
-      .filter((lesson) => lesson.slug !== ARCHIVED_LESSON_SLUG && !previous.has(lesson.slug) && !kept.has(lesson.slug))
+      .filter((lesson) => !previous.has(lesson.slug) && !kept.has(lesson.slug))
       .map((lesson) => removedView(lesson, 'discarded')),
   ];
   return {
@@ -1102,7 +1135,9 @@ const TRIM_MARKER = ' … [trimmed to fit the chapter cap]';
 
 export function parseChapter(text: string, slug: string): BibleChapter {
   if (!isLessonsSlug(slug)) throw new BibleError(`invalid chapter slug: ${JSON.stringify(slug)}`);
-  const lines = text.split(/\r?\n/);
+  // CRLF, LF and a bare CR each end a line (R5-A13): a CR-only chapter is
+  // read as its lines, never as one line with nothing in it.
+  const lines = text.split(/\r\n|\r|\n/u);
   let title: string | null = null;
   let summary = '';
   const chapterTags: string[] = [];
@@ -1223,13 +1258,25 @@ function splitProvenance(value: string, chapterSlug: string, lessonSlug: string)
         `chapter ${chapterSlug}.md lesson ${lessonSlug}: provenance ${JSON.stringify(item)} must be "<journal-id>@<iso-date>"`,
       );
     }
+    if (parseIsoInstant(ts) === null) {
+      throw new BibleError(
+        `chapter ${chapterSlug}.md lesson ${lessonSlug}: provenance ${JSON.stringify(item)} carries an impossible or malformed instant — ` +
+          'it must be "<journal-id>@<iso-date>"',
+      );
+    }
+    if (refs.some((ref) => ref.id === id)) {
+      throw new BibleError(
+        `chapter ${chapterSlug}.md lesson ${lessonSlug}: provenance cites ${id} more than once — rebuild it from the journal with the repair tool`,
+      );
+    }
     refs.push({ id, ts });
   }
   return refs;
 }
 
-/** One raw line and the terminator that followed it ("\r\n", "\n", or ""
- * for an unterminated last line) — kept so edits never change line endings. */
+/** One raw line and the terminator that followed it ("\r\n", "\n", "\r",
+ * or "" for an unterminated last line) — kept so edits never change line
+ * endings. */
 interface RawLine {
   readonly text: string;
   readonly eol: string;
@@ -1243,7 +1290,7 @@ interface RawSection {
 }
 
 function splitRawLines(text: string): RawLine[] {
-  const parts = text.split(/(\r\n|\n)/u);
+  const parts = text.split(/(\r\n|\r|\n)/u);
   const lines: RawLine[] = [];
   for (let index = 0; index < parts.length; index += 2) {
     lines.push({ text: parts[index] ?? '', eol: parts[index + 1] ?? '' });
@@ -1292,7 +1339,6 @@ function provenanceLine(refs: readonly ProvenanceRef[]): string {
 }
 
 const PROVENANCE_FRAGMENT = /^(j-\d+)(?:@(\S+))?$/u;
-const ISO_TIMESTAMP = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z$/u;
 
 /** Resolve one damaged provenance value against the journal. Only the
  * shapes found in the hand-edited book are understood — `<id>`,
@@ -1327,7 +1373,7 @@ function resolveDamagedProvenance(
       bareId = match[2] === undefined ? id : null;
       continue;
     }
-    if (bareId !== null && ISO_TIMESTAMP.test(fragment)) {
+    if (bareId !== null && parseIsoInstant(fragment) !== null) {
       if (compareIsoInstants(fragment, journalTs.get(bareId) ?? '') !== 0) {
         throw new BibleError(`${where} cites ${bareId},${fragment}, but the journal records ${bareId} at ${journalTs.get(bareId)}`);
       }
@@ -1479,7 +1525,10 @@ function trimmedBodyLines(raw: readonly RawLine[], trimmed: string): RawLine[] |
   let trailing = 0;
   while (trailing < raw.length && raw[raw.length - 1 - trailing]!.text.trim() === '') trailing += 1;
   const content = raw.slice(0, raw.length - trailing);
-  const indent = /^[ \t]*/u.exec(content[0]?.text ?? '')![0];
+  // Exactly what the reader's trimStart() removed — NBSP and every other
+  // Unicode space included (R5-A4) — is kept, byte for byte.
+  const first = content[0]?.text ?? '';
+  const indent = first.slice(0, first.length - first.trimStart().length);
   const textOf = (index: number): string => (index === 0 ? content[0]!.text.slice(indent.length) : content[index]!.text);
   const kept = trimmed.slice(0, -TRIM_MARKER.length).split('\n');
   const cut = kept.length - 1;
@@ -1507,6 +1556,17 @@ function renderFaithfully(text: string, capped: BibleChapter): string {
 }
 
 const STRICT_UTF8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+
+/** A managed book file's text, decoded strictly (C2): a lossy decode would
+ * turn different invalid bytes into the same U+FFFD, so a fingerprint could
+ * not see the change. Invalid UTF-8 fails loud, naming the file. */
+function strictText(raw: Buffer, file: string): string {
+  try {
+    return STRICT_UTF8.decode(raw);
+  } catch {
+    throw new BibleError(`bible file ${file} is not valid UTF-8 — fix it by hand`);
+  }
+}
 
 /** One write that failed mid-repair: names what was replaced and where the
  * originals are, because the book may now be partially repaired. */
@@ -1546,6 +1606,8 @@ const INDEX_HEADER = [
 ];
 
 const INDEX_LINE = /^- \[([^\]]+)\]\(chapters\/([^)]+)\.md\) — (.*)$/;
+/** Each compacted INDEX summary keeps at least this many bytes. */
+const MIN_INDEX_SUMMARY_BYTES = 24;
 const INDEX_TAGS_SUFFIX = /(.*) \(tags: (.*)\)$/;
 
 /** Render INDEX.md under a hard byte cap. Summaries compact first, then
@@ -1556,46 +1618,78 @@ export function renderIndex(
   capBytes: number = DEFAULT_INDEX_CAP_BYTES,
 ): string {
   const sorted = [...chapters].sort((a, b) => a.slug.localeCompare(b.slug));
-  const build = (includeTags: boolean, summaryBudget: number | null): string => {
+  const build = (includeTags: boolean, summaryOf: (summary: string) => string) => {
     const lines = [...INDEX_HEADER];
+    const intended = new Map<string, IndexEntryView>();
     for (const chapter of sorted) {
-      let summary = collapseLine(chapter.summary);
-      if (summaryBudget !== null && summary.length > summaryBudget) {
-        summary = `${safeSlice(summary, Math.max(1, summaryBudget - 1))}…`;
-      }
-      const tags = includeTags && chapter.tags.length > 0 ? ` (tags: ${chapter.tags.join(', ')})` : '';
-      lines.push(`- [${chapter.slug}](chapters/${chapter.slug}.md) — ${summary}${tags}`);
+      const summary = summaryOf(collapseLine(chapter.summary));
+      const tags = includeTags ? chapter.tags : [];
+      lines.push(`- [${chapter.slug}](chapters/${chapter.slug}.md) — ${summary}${tags.length > 0 ? ` (tags: ${tags.join(', ')})` : ''}`);
+      intended.set(chapter.slug, { summary, tags });
     }
-    return `${lines.join('\n')}\n`;
+    return { text: `${lines.join('\n')}\n`, intended };
+  };
+  const fits = (text: string): boolean => Buffer.byteLength(text, 'utf8') <= capBytes;
+  // C7: briefings read exactly the metadata meant — a summary that ends
+  // like a tag list would otherwise become fabricated INDEX tags.
+  const readsBack = (candidate: ReturnType<typeof build>): string => {
+    const parsed = new Map(parseIndex(candidate.text).map((entry) => [entry.slug, entry]));
+    for (const [slug, meant] of candidate.intended) {
+      const got = parsed.get(slug);
+      if (got === undefined || got.summary !== meant.summary || got.tags.join('\u0000') !== meant.tags.join('\u0000')) {
+        throw new BibleError(
+          `chapter ${slug}'s INDEX line would read back as different metadata — a summary must not end like ` +
+            'a tag list " (tags: …)"; reword the summary',
+        );
+      }
+    }
+    return candidate.text;
   };
 
-  const full = build(true, null);
-  if (Buffer.byteLength(full, 'utf8') <= capBytes) return full;
-  const withoutTags = build(false, null);
-  if (Buffer.byteLength(withoutTags, 'utf8') <= capBytes) return withoutTags;
+  const full = build(true, (summary) => summary);
+  if (fits(full.text)) return readsBack(full);
+  const withoutTags = build(false, (summary) => summary);
+  if (fits(withoutTags.text)) return readsBack(withoutTags);
 
-  // Even without tags it does not fit: budget the remaining bytes equally
-  // across summaries (the metadata skeleton is fixed).
-  const skeleton = build(false, 0);
-  const skeletonBytes = Buffer.byteLength(skeleton, 'utf8');
-  const available = capBytes - skeletonBytes;
-  const budget = sorted.length === 0 ? 0 : Math.floor(available / sorted.length) - 1;
-  if (sorted.length === 0 || budget < 24) {
+  // Even without tags it does not fit: share the remaining BYTES equally
+  // across summaries (C12) — each cut at a code-point boundary, its
+  // ellipsis included; the metadata skeleton is fixed.
+  const skeletonBytes = Buffer.byteLength(build(false, () => '').text, 'utf8');
+  const perSummary = sorted.length === 0 ? 0 : Math.floor((capBytes - skeletonBytes) / sorted.length);
+  if (sorted.length === 0 || perSummary < MIN_INDEX_SUMMARY_BYTES) {
     throw new BibleError(
       `bible index cap ${capBytes} bytes cannot hold ${sorted.length} chapter(s) — ` +
         'consolidate chapters (or raise lessons.index_cap_bytes)',
     );
   }
-  const compacted = build(false, budget);
-  if (Buffer.byteLength(compacted, 'utf8') > capBytes) {
+  const ellipsis = '…';
+  const compacted = build(false, (summary) =>
+    Buffer.byteLength(summary, 'utf8') <= perSummary
+      ? summary
+      : `${summary.slice(0, prefixWithinBytes(summary, perSummary - Buffer.byteLength(ellipsis, 'utf8')))}${ellipsis}`);
+  if (!fits(compacted.text)) {
     throw new BibleError(`bible index compaction could not fit ${sorted.length} chapter(s) under ${capBytes} bytes`);
   }
-  return compacted;
+  return readsBack(compacted);
+}
+
+/** UTF-16 length of the longest code-point prefix of `text` that fits in
+ * `maxBytes` of UTF-8. */
+function prefixWithinBytes(text: string, maxBytes: number): number {
+  let bytes = 0;
+  let length = 0;
+  for (const char of text) {
+    const size = Buffer.byteLength(char, 'utf8');
+    if (bytes + size > maxBytes) break;
+    bytes += size;
+    length += char.length;
+  }
+  return length;
 }
 
 export function parseIndex(text: string): LessonIndexEntry[] {
   const entries: LessonIndexEntry[] = [];
-  for (const line of text.split(/\r?\n/)) {
+  for (const line of text.split(/\r\n|\r|\n/u)) {
     const match = INDEX_LINE.exec(line);
     if (match === null) continue;
     const slug = match[1] ?? '';
@@ -1662,12 +1756,17 @@ function applyLessonUpdates(
   let added = 0;
   let merged = 0;
   for (const proposed of update.lessons) {
-    const refs = proposed.journalIds.map((id) => {
+    // Each journal handle once: a repeated id would fill the newest-three
+    // provenance floor with copies and release distinct handles instead.
+    const refs = [...new Set(proposed.journalIds)].map((id) => {
       const ts = provenance.get(id);
       if (ts === undefined) {
         throw new BibleError(
           `chapter ${update.slug} lesson ${proposed.slug} cites journal id ${id} which is not part of this dream batch`,
         );
+      }
+      if (parseIsoInstant(ts) === null) {
+        throw new BibleError(`the journal records ${id} at an impossible or malformed instant ${JSON.stringify(ts)} — fix the journal first`);
       }
       return { id, ts };
     });
@@ -1726,12 +1825,26 @@ const ISO_INSTANT = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))
  * any fractional precision — as whole UTC seconds plus its fraction digits
  * (trailing zeros dropped). Null for anything else, including dates
  * Date.parse would silently normalize (2026-02-30). */
+/** Days in a proleptic-Gregorian month (year 0 is a leap year). */
+function daysInMonth(year: number, month: number): number {
+  const leap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+  return [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1]!;
+}
+
+/** Epoch seconds of a UTC civil time, for EVERY four-digit year — never
+ * Date.UTC's 0–99 → 1900–1999 mapping. */
+function utcEpochSeconds(year: number, month: number, day: number, hour: number, minute: number, second: number): number {
+  const date = new Date(0);
+  date.setUTCFullYear(year, month - 1, day);
+  date.setUTCHours(hour, minute, second, 0);
+  return date.getTime() / 1000;
+}
+
 export function parseIsoInstant(ts: string): { readonly seconds: number; readonly fraction: string } | null {
   const match = ISO_INSTANT.exec(ts);
   if (match === null) return null;
   const [year, month, day, hour, minute, second] = match.slice(1, 7).map(Number) as [number, number, number, number, number, number];
-  const days = new Date(Date.UTC(year, month, 0)).getUTCDate();
-  if (month < 1 || month > 12 || day < 1 || day > days || hour > 23 || minute > 59 || second > 59) return null;
+  if (month < 1 || month > 12 || day < 1 || day > daysInMonth(year, month) || hour > 23 || minute > 59 || second > 59) return null;
   let offset = 0;
   const zone = match[8]!;
   if (zone !== 'Z') {
@@ -1740,7 +1853,7 @@ export function parseIsoInstant(ts: string): { readonly seconds: number; readonl
     if (hours > 23 || minutes > 59) return null;
     offset = (zone[0] === '-' ? -1 : 1) * (hours * 60 + minutes) * 60;
   }
-  return { seconds: Date.UTC(year, month - 1, day, hour, minute, second) / 1000 - offset, fraction: (match[7] ?? '').replace(/0+$/u, '') };
+  return { seconds: utcEpochSeconds(year, month, day, hour, minute, second) - offset, fraction: (match[7] ?? '').replace(/0+$/u, '') };
 }
 
 /** Order two ISO instants without losing precision (no millisecond
@@ -1761,7 +1874,11 @@ export function compareProvenance(left: ProvenanceRef, right: ProvenanceRef): nu
   // Instants, not spellings and not milliseconds: "01:00+02:00" precedes
   // "00:00Z", .0001Z precedes .0002Z, and equal instants written
   // differently tie, falling to the journal sequence.
-  const byInstant = compareIsoInstants(left.ts, right.ts) ?? left.ts.localeCompare(right.ts);
+  const byInstant = compareIsoInstants(left.ts, right.ts);
+  if (byInstant === null) {
+    const bad = parseIsoInstant(left.ts) === null ? left : right;
+    throw new BibleError(`provenance ${bad.id}@${bad.ts} is not a valid ISO instant`);
+  }
   return byInstant || journalSeq(left.id) - journalSeq(right.id) || left.id.localeCompare(right.id);
 }
 
@@ -1850,11 +1967,24 @@ export function enforceChapterCap(
     if (longest !== -1) {
       const lesson = lessons[longest]!;
       const body = untrimmed(lesson.body);
-      // Bytes, not characters: keep the longest code-point prefix the
-      // overshoot allows (the marker included), never below the floor.
-      const allowed = Buffer.byteLength(lesson.body, 'utf8') - (size - capBytes) - Buffer.byteLength(TRIM_MARKER, 'utf8');
-      const cut = Math.max(prefixWithinBytes(body, allowed), safeSlice(body, MIN_LESSON_BODY_CHARS).length);
-      lessons[longest] = { ...lesson, body: `${body.slice(0, cut).trimEnd()}${TRIM_MARKER}` };
+      const withCut = (cut: number): BibleLesson[] => lessons.map((other, index) =>
+        index === longest ? { ...lesson, body: `${body.slice(0, cut).trimEnd()}${TRIM_MARKER}` } : other);
+      // Bytes as WRITTEN (the supplied measure: CRLF and in-place
+      // formatting included, R5-A1): the longest code-point prefix that
+      // fits with its marker, never below the floor. Longer prefixes never
+      // measure smaller, so the search is a bisection.
+      const cuts = codePointCuts(body, safeSlice(body, MIN_LESSON_BODY_CHARS).length);
+      let best = 0;
+      for (let low = 1, high = cuts.length - 1; low <= high;) {
+        const mid = (low + high) >> 1;
+        if (measure({ ...chapter, lessons: withCut(cuts[mid]!) }) <= capBytes) {
+          best = mid;
+          low = mid + 1;
+        } else {
+          high = mid - 1;
+        }
+      }
+      lessons = withCut(cuts[best]!);
       trimmed += 1;
       size = serialized();
       return true;
@@ -1898,18 +2028,12 @@ export function enforceChapterCap(
   return { chapter: { ...chapter, lessons }, text, provenanceTrimmed, trimmed, droppedLessons, droppedProvenance };
 }
 
-/** UTF-16 length of the longest code-point prefix of `text` that fits in
- * `maxBytes` of UTF-8. */
-function prefixWithinBytes(text: string, maxBytes: number): number {
-  let bytes = 0;
-  let length = 0;
-  for (const char of text) {
-    const size = Buffer.byteLength(char, 'utf8');
-    if (bytes + size > maxBytes) break;
-    bytes += size;
-    length += char.length;
-  }
-  return length;
+/** Every code-point boundary of `text` from `from` (itself a boundary) up
+ * to, not including, its end — each a strictly shorter prefix. */
+function codePointCuts(text: string, from: number): number[] {
+  const cuts: number[] = [];
+  for (let offset = from; offset < text.length; offset += (text.codePointAt(offset)! > 0xffff ? 2 : 1)) cuts.push(offset);
+  return cuts;
 }
 
 /** A body without the cap's trim marker, so a re-trim never stacks markers. */

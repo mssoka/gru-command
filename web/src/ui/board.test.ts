@@ -2894,6 +2894,26 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(client.getLessonProposal).not.toHaveBeenCalled();
   });
 
+  it('"Go to For You" reveals a proposal six newer obligations hid, and never fetches or decides (C3)', async () => {
+    const client = proposalClient();
+    const view = new BoardView(() => {}, client);
+    const older = { ...proposalNotice, ts: '2026-01-01T00:00:00.000Z' };
+    const newer = Array.from({ length: 6 }, (_, i) =>
+      notification(`newer-${i}`, { routing: 'needs-owner', ts: `2026-01-02T00:0${i}:00.000Z` }));
+    view.render(snapshot({ notifications: [older, ...newer] }));
+    const band = document.getElementById('board-owner')!;
+    expect(band.querySelector('[data-proposal-id="lp-1"]')).toBeNull(); // behind the window
+    (document.getElementById('notification-bell') as HTMLButtonElement).click();
+    document.getElementById('notification-list')!.querySelector<HTMLButtonElement>('.board-owner__goto')!.click();
+    expect(document.getElementById('notification-panel')!.hidden).toBe(true);
+    const row = band.querySelector('[data-proposal-id="lp-1"]');
+    expect(row).not.toBeNull();
+    expect(document.activeElement).toBe(row!.querySelector('.board-owner__review > summary'));
+    await flush();
+    expect(client.getLessonProposal).not.toHaveBeenCalled();
+    expect(client.decideLessonProposal).not.toHaveBeenCalled();
+  });
+
   it('a finished decision asks for the authoritative snapshot at once — no waiting on a silent socket', async () => {
     const client = proposalClient();
     const view = new BoardView(() => {}, client);
@@ -2951,7 +2971,50 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
       return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
     }) as unknown as typeof fetch;
     const client = new BoardClient({ token: 't', host: 'localhost', fetchImpl }, { connection: () => {}, snapshot: () => {}, fatal: () => {} } as never);
-    await expect(client.decideLessonProposal('prop-1', 'accept')).rejects.toThrow('lesson proposal decision response is malformed');
+    await expect(client.decideLessonProposal('prop-1', 'accept')).rejects.toThrow("the server's reply (HTTP 200) does not confirm this accept");
+  });
+
+  it('a decision reply must answer THIS request in its own phase — otherwise the outcome is unconfirmed, never "recorded" (C9)', async () => {
+    const { BoardClient } = await import('../lib/board-client.js');
+    const replying = (status: number, body: unknown) => {
+      const fetchImpl = (async () =>
+        new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })) as unknown as typeof fetch;
+      return new BoardClient({ token: 't', host: 'localhost', fetchImpl }, { connection: () => {}, snapshot: () => {}, fatal: () => {} } as never);
+    };
+    for (const [status, body] of [
+      [202, { id: 'other-proposal', decision: 'rejected', incomplete: true }], // another proposal, the other choice
+      [202, { id: 'prop-1', decision: 'rejected', incomplete: true }], // the other choice
+      [202, { id: 'prop-1', decision: 'accepted' }], // 202 without incomplete
+      [200, { id: 'prop-1', decision: 'accepted', incomplete: true }], // 200 claiming incomplete
+      [200, { id: 'prop-1', decision: 'withdrawn' }], // not an answer to an Accept
+      [201, { id: 'prop-1', decision: 'accepted' }], // an unknown phase
+    ] as const) {
+      await expect(replying(status, body).decideLessonProposal('prop-1', 'accept'), JSON.stringify([status, body])).rejects.toThrow(/does not confirm this accept/);
+    }
+    await expect(replying(200, { id: 'prop-1', decision: 'accepted' }).decideLessonProposal('prop-1', 'accept')).resolves.toMatchObject({ decision: 'accepted' });
+    await expect(replying(202, { id: 'prop-1', decision: 'accepted', incomplete: true, detail: 'x' }).decideLessonProposal('prop-1', 'accept')).resolves.toMatchObject({ incomplete: true });
+  });
+
+  it('only a proven refusal says "Not applied"; a server failure is unconfirmed and keeps the recorded intent (C8)', async () => {
+    const { BoardApiError } = await import('../lib/board-client.js');
+    const failing = (status: number, error: string) => () =>
+      Promise.reject(new BoardApiError('/api/lessons/proposal/lp-1/accept', status, error, 'disk I/O error'));
+    const client = proposalClient(failing(500, 'proposal_unconfirmed'));
+    const view = new BoardView(() => {}, client);
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__accept')!.click();
+    await flush();
+    let band = document.getElementById('board-owner')!;
+    expect(band.textContent).not.toContain('Not applied');
+    expect(band.textContent).toContain('Couldn’t confirm the decision (the server failed (500: disk I/O error))');
+    expect(client.wake).toHaveBeenCalled();
+    const stale = proposalClient(failing(409, 'proposal_stale'));
+    const second = new BoardView(() => {}, stale);
+    second.render(snapshot({ notifications: [proposalNotice] }));
+    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__accept')!.click();
+    await flush();
+    band = document.getElementById('board-owner')!;
+    expect(band.textContent).toContain('Not applied — disk I/O error. A fresh proposal will follow.');
   });
 
   it('an open "before" disclosure and the focused control survive a snapshot push', async () => {

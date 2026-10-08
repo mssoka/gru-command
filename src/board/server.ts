@@ -5,7 +5,7 @@ import { hashToken, tokenConfigured, tokenMatches } from '../auth.js';
 import { ROLES, type GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { EventBus } from '../events/bus.js';
-import { LedgerApi, RecordNotFound, AdminCloseoutRefusal, type DecisionActor, type DecisionKind, type NotificationRecord } from '../ledger/api.js';
+import { LedgerApi, RecordNotFound, AdminCloseoutRefusal, producerResolvedBy, type DecisionActor, type DecisionKind, type NotificationRecord } from '../ledger/api.js';
 import { isDecisionActor, isDecisionKind } from '../ledger/decision-memory.js';
 import { isJobStatus, isRoundStatus, isRoundVerdict } from '../ledger/states.js';
 import { isAgentState } from '../runtime/types.js';
@@ -596,6 +596,16 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
           }
           if (suffix === '/disposition') {
             const detail = strField(body, 'detail');
+            const target = ledger.getNotification(id);
+            const closer = target === null ? null : producerResolvedBy(target.kind);
+            if (target !== null && closer !== null) {
+              // Only its producer closes this alert (owner decision 2026-10-08).
+              json(res, 409, {
+                error: 'producer_resolved',
+                detail: `${target.kind} closes itself on ${closer} — fix its cause and leave the alert open`,
+              });
+              return;
+            }
             const row = ledger.disposeMachineNotification(id, detail);
             if (row === null) {
               json(res, 404, { error: 'not_found', detail: `notification "${id}" not found` });

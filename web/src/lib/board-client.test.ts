@@ -423,6 +423,51 @@ describe('board client', () => {
     tracked.stop();
   });
 
+  it('a fresh HTTP answer discarded only because an OLDER queued push won is refetched once — no further push needed (C13)', async () => {
+    const answers: Array<(response: Response) => void> = [];
+    const fetchImpl = vi.fn(() => new Promise<Response>((resolve) => { answers.push(resolve); })) as unknown as typeof fetch;
+    const sockets: { onopen: (() => void) | null; onmessage: ((event: { data: string }) => void) | null }[] = [];
+    class FakeSocket {
+      onopen: (() => void) | null = null;
+      onmessage: ((event: { data: string }) => void) | null = null;
+      onclose: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      constructor() {
+        sockets.push(this);
+      }
+      send(): void {}
+      close(): void {}
+    }
+    const delivered: string[] = [];
+    const ok = (snapshot: BoardSnapshot) => new Response(JSON.stringify(snapshot), { status: 200 });
+    const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+    const client = new BoardClient(
+      { token: TOKEN, host: 'localhost', fetchImpl, webSocketCtor: FakeSocket as unknown as new (url: string) => WebSocket },
+      { connection: () => {}, snapshot: (snapshot) => delivered.push(snapshot.decisions.incarnation), fatal: () => {} },
+    );
+    client.connect();
+    answers[0]!(ok(tagged('boot')));
+    await tick();
+    const socket = sockets.at(-1)!;
+    socket.onopen!();
+    socket.onmessage!({ data: JSON.stringify({ type: 'auth_ok' }) });
+    // A decision finished; the board asks for the authoritative snapshot...
+    const refresh = client.refetchSnapshot();
+    // ...and a push queued BEFORE the decision lands while that is in flight.
+    socket.onmessage!({ data: JSON.stringify({ type: 'board', snapshot: tagged('pre-decision-push') }) });
+    answers[1]!(ok(tagged('resolved')));
+    await refresh;
+    await tick();
+    expect(delivered).toEqual(['boot', 'pre-decision-push']);
+    expect(answers).toHaveLength(3); // exactly one trailing refetch
+    answers[2]!(ok(tagged('resolved')));
+    await tick();
+    await tick();
+    expect(delivered).toEqual(['boot', 'pre-decision-push', 'resolved']);
+    expect(answers).toHaveLength(3);
+    client.stop();
+  });
+
   it('a malformed review is refused before anything renders it — a valid one passes', async () => {
     const review = (removed: unknown) => ({
       id: 'prop-1',

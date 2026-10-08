@@ -411,4 +411,22 @@ describe('lesson proposals over HTTP (owner decision 2026-10-07)', () => {
       await h.close();
     }
   });
+
+  it('a storage failure is an unconfirmed outcome (500), never a refusal — after a recorded Accept moved the book (C8)', async () => {
+    const h = await boot();
+    try {
+      const { id } = await propose(h);
+      vi.spyOn(h.ledger, 'resolveNotificationById').mockImplementationOnce(() => {
+        throw new Error('ledger is busy');
+      });
+      expect((await call(h.port, 'POST', `/api/lessons/proposal/${id}/accept`, {}, TOKEN)).status).toBe(202);
+      expect(cursor(h.bible)).toBe(1); // applied
+      writeFileSync(join(h.bible.dir, PROPOSAL_FILE), '{ not a record');
+      const retry = await call(h.port, 'POST', `/api/lessons/proposal/${id}/accept`, {}, TOKEN);
+      expect(retry.status).toBe(500);
+      expect(retry.json).toMatchObject({ error: 'proposal_unconfirmed' });
+    } finally {
+      await h.close();
+    }
+  });
 });

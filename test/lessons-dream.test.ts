@@ -600,6 +600,34 @@ describe('failing-dream incident, production wiring (owner incident 2026-10-07)'
     }
   });
 
+  it('only a completed pass closes the incident: a Gru disposition is refused, so the streak keeps its first failure (owner decision 2026-10-08)', () => {
+    const dir = tmpDir('gru-command-dream-incident-producer-');
+    const db = new LedgerDb(dir);
+    try {
+      const bus = new EventBus();
+      const ledger = new LedgerApi(db.handle, { bus });
+      const notifications = new NotificationCenter({ ledger, bus });
+      const times = ['2026-10-08T01:00:00.000Z', '2026-10-08T13:00:00.000Z'];
+      let tick = 0;
+      const hooks = dreamFailureIncidents(notifications, 'REPAIR', () => new Date(times[tick++]!));
+      const open = () => ledger.listNotifications({ limit: 50 }).filter((row) => row.kind === DREAM_FAILED_KIND && row.resolvedAt === null);
+      hooks.onFailure(new DreamError('provenance "j-878" must be "<journal-id>@<iso-date>"'));
+      const incident = open()[0]!;
+      // Gru follows its standard order (a repair lane, then a disposition).
+      expect(() => ledger.disposeMachineNotification(incident.id, 'opened a repair lane'))
+        .toThrowError(/lessons\.dream-failed closes itself on a completed dream pass/);
+      hooks.onFailure(new Error('provider outage'));
+      expect(open().map((row) => row.id)).toEqual([incident.id]);
+      expect(open()[0]!.detail).toContain(`First failure (${times[0]}): DreamError`);
+      expect(open()[0]!.detail).toContain(`Latest failure (${times[1]}, failed pass 2): Error: provider outage`);
+      hooks.onSuccess();
+      expect(open()).toEqual([]);
+      expect(ledger.getNotification(incident.id)).toMatchObject({ resolvedBy: 'dream' });
+    } finally {
+      db.close();
+    }
+  });
+
   it('keeps the first failure and refreshes the latest on the same open incident (owner decision 2026-10-07)', () => {
     const dir = tmpDir('gru-command-dream-incident-latest-');
     const db = new LedgerDb(dir);
@@ -935,6 +963,45 @@ describe('owner-approved lesson proposals (owner decision 2026-10-07)', () => {
     expect(cursor(h.bible)).toBe(entry.seq);
     expect(existsSync(h.file)).toBe(false);
     expect((await h.engine.run()).status).toBe('noop');
+  });
+
+  it('a fresh Accept whose second chapter write fails keeps its recorded intent; a fresh instance finishes it exactly once (C10)', async () => {
+    const h = proposalHarness(twoChapters);
+    const entry = h.journal.append({ kind: 'finding', source: 'gru', body: 'shell hang finding' });
+    await h.engine.run();
+    const { id, notificationId } = h.proposals.review()!;
+    const plan = h.stored()['plan'] as { writes: { slug: string; text: string }[]; indexText: string };
+    expect(plan.writes).toHaveLength(2);
+    // The real write path, interrupted at the second chapter.
+    const store = h.bible as unknown as { writeAtomic(file: string, data: string | Buffer): void };
+    const real = store.writeAtomic.bind(h.bible);
+    let chapterWrites = 0;
+    store.writeAtomic = (file, data) => {
+      if (file.startsWith(h.bible.chaptersDir) && ++chapterWrites === 2) throw new Error('EIO: power lost');
+      real(file, data);
+    };
+    expect(() => h.proposals.accept(id)).toThrowError(expect.objectContaining({ code: 'incomplete' }));
+    // Durable intent, partial book, cursor untouched, notice still open.
+    expect(h.stored()).toMatchObject({ decision: { kind: 'accepted' }, committed: null });
+    expect(readFileSync(join(h.bible.chaptersDir, `${plan.writes[0]!.slug}.md`), 'utf-8')).toBe(plan.writes[0]!.text);
+    expect(existsSync(join(h.bible.chaptersDir, `${plan.writes[1]!.slug}.md`))).toBe(false);
+    expect(cursor(h.bible)).toBe(0);
+    expect(h.notifier.resolved).toEqual([]);
+    // A restart: fresh store and proposals instances on the same book.
+    const bible = new BibleStore(h.bible.dir);
+    const notifier = new FakeNotifier();
+    const fresh = new LessonProposals({ bible, notifier });
+    expect(fresh.reconcile()).toBeNull();
+    for (const write of plan.writes) {
+      expect(readFileSync(join(bible.chaptersDir, `${write.slug}.md`), 'utf-8')).toBe(write.text);
+    }
+    expect(bible.readIndexText()).toBe(plan.indexText);
+    expect(bible.readChapter('ops-restarts')?.lessons[0]?.recurred).toBe(1);
+    expect(cursor(bible)).toBe(entry.seq);
+    expect(notifier.resolved).toEqual([{ id: notificationId, by: 'owner:accepted' }]);
+    expect(existsSync(h.file)).toBe(false);
+    expect(fresh.reconcile()).toBeNull();
+    expect(notifier.resolved).toHaveLength(1);
   });
 
   it('closing keeps the record until the notice is resolved: a failed resolve is finished later, not lost', async () => {

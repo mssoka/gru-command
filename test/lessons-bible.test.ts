@@ -14,6 +14,7 @@ import {
   BIBLE_WRITE_LOCK_HOLDER,
   bookFingerprint,
   checkPlan,
+  compareIsoInstants,
   compareProvenance,
   describePlan,
   parseIsoInstant,
@@ -25,6 +26,7 @@ import {
   serializeChapter,
 } from '../src/lessons/bible.js';
 import { JournalStore } from '../src/lessons/journal.js';
+import { ARCHIVED_LESSON_SLUG as WEB_ARCHIVED_LESSON_SLUG } from '../web/src/lib/board-protocol.js';
 import { ARCHIVED_LESSON_SLUG, BibleError, type BibleChapter, type ProposedChapter, type ProvenanceRef } from '../src/lessons/types.js';
 
 /**
@@ -1207,7 +1209,8 @@ describe('third review round of #254 — plan integrity, cap effects, canonical 
       ],
     }], journal(2));
     const change = describePlan(dropped).chapters[0]!;
-    expect(change.added.map((lesson) => lesson.slug)).toEqual(['keep']);
+    // The archive record the drop creates is reviewed too (#253 round 5, C5).
+    expect(change.added.map((lesson) => lesson.slug)).toEqual(['keep', ARCHIVED_LESSON_SLUG]);
     expect(change.removed).toEqual([{ slug: 'left-out', body: 'L'.repeat(150), recurred: 1, tags: [], reason: 'discarded' }]);
   });
 
@@ -1420,5 +1423,310 @@ describe('fourth review round of #253 — the whole lessons change (bmad-code-re
     expect(ran.status).toBe(1);
     expect(ran.stderr).toContain('does not exist');
     expect(existsSync(join(home, 'bible'))).toBe(false);
+  });
+});
+
+describe('fifth review round of #253 — follow-up (bmad-code-review, 2026-10-08)', () => {
+  const at = (minute: number): string => new Date(Date.UTC(2026, 9, 1, 0, minute)).toISOString();
+  const lessonOf = (slug: string, provenance: ProvenanceRef[], body: string) => ({ slug, body, recurred: 1, provenance, tags: [] as string[] });
+  const chapterOf = (lessons: BibleChapter['lessons']): BibleChapter => ({ slug: 'fix', title: 'Fix', summary: '', tags: [], lessons });
+  const JOURNAL_R5 = new Map(Array.from({ length: 30 }, (_, index) => [`j-${index + 1}`, at(index + 1)] as const));
+  const loneSurrogate = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u;
+
+  it('years 0000–0099 are themselves — never 1900–1999 — and year 0 has its leap day (R5-A2)', () => {
+    expect(compareIsoInstants('0026-10-01T00:00:00Z', '1926-10-01T00:00:00Z')).toBeLessThan(0);
+    expect(compareIsoInstants('0099-12-31T23:59:59Z', '0100-01-01T00:00:00Z')).toBeLessThan(0);
+    expect(compareIsoInstants('0026-10-01T01:00:00+01:00', '0026-10-01T00:00:00Z')).toBe(0);
+    expect(parseIsoInstant('0000-02-29T00:00:00Z')).not.toBeNull();
+    expect(parseIsoInstant('0400-02-29T00:00:00Z')).not.toBeNull();
+    expect(parseIsoInstant('0100-02-29T00:00:00Z')).toBeNull();
+    expect(parseIsoInstant('1900-02-29T00:00:00Z')).toBeNull();
+    const journal = new Map([['j-1', '1926-10-01T00:00:00.000Z']]);
+    expect(() => repairChapterProvenance('# A\n\n## a\n\nrecurred: 1\nprovenance: j-1@0026-10-01T00:00:00.000Z\n\nBody.\n', 'a', journal))
+      .toThrowError(/cites j-1@0026-10-01T00:00:00.000Z, but the journal records j-1 at 1926-10-01T00:00:00.000Z/);
+  });
+
+  it('a timestamp split off by a comma may carry an offset: an equal instant repairs, a different one refuses (R5-A3)', () => {
+    const journal = new Map([['j-1', '2026-10-01T00:00:00.000Z']]);
+    const repaired = repairChapterProvenance('# A\n\n## a\n\nrecurred: 1\nprovenance: j-1,2026-10-01T02:00:00+02:00\n\nBody.\n', 'a', journal).text;
+    expect(repaired).toContain('provenance: j-1@2026-10-01T00:00:00.000Z\n');
+    expect(() => repairChapterProvenance('# A\n\n## a\n\nrecurred: 1\nprovenance: j-1,2026-10-01T02:00:00+01:00\n\nBody.\n', 'a', journal))
+      .toThrowError(/cites j-1,2026-10-01T02:00:00\+01:00, but the journal records j-1 at 2026-10-01T00:00:00.000Z/);
+  });
+
+  it('an impossible instant is refused by the reader, the planner and the cap — never ordered by spelling (R5-A12)', () => {
+    expect(() => parseChapter('# A\n\n## a\n\nrecurred: 1\nprovenance: j-1@2026-02-30T00:00:00.000Z\n\nBody.\n', 'a'))
+      .toThrowError(/provenance "j-1@2026-02-30T00:00:00.000Z" carries an impossible or malformed instant/);
+    const bible = tmpBible();
+    bible.ensureSeeded();
+    const impossible = new Map([...PROVENANCE, ['j-1', '2026-02-30T00:00:00.000Z']]);
+    expect(() => bible.planUpdates([proposal()], impossible)).toThrowError(/records j-1 at an impossible or malformed instant "2026-02-30T00:00:00.000Z"/);
+    expect(() => compareProvenance({ id: 'j-1', ts: '2026-02-30T00:00:00.000Z' }, { id: 'j-2', ts: at(2) }))
+      .toThrowError(/provenance j-1@2026-02-30T00:00:00.000Z is not a valid ISO instant/);
+    const chapter = chapterOf([
+      lessonOf('a', [{ id: 'j-1', ts: '2026-02-30T00:00:00.000Z' }], 'a'.repeat(300)),
+      lessonOf('b', [{ id: 'j-2', ts: at(2) }], 'b'.repeat(300)),
+    ]);
+    expect(() => enforceChapterCap(chapter, 400)).toThrowError(/is not a valid ISO instant/);
+  });
+
+  it('a chapter with bare CR line endings is read line by line: repaired in place, and an unknown id refuses before any write (R5-A13)', () => {
+    const journal = new Map([['j-1', at(1)], ['j-2', at(2)]]);
+    const damaged = ['# Ops', '', '## a', '', 'recurred: 1', 'provenance: j-2; earlier: j-1', '', 'Body.', ''].join('\r');
+    const repaired = repairChapterProvenance(damaged, 'ops', journal).text;
+    expect(repaired).toBe(['# Ops', '', '## a', '', 'recurred: 1', `provenance: j-1@${at(1)}, j-2@${at(2)}`, '', 'Body.', ''].join('\r'));
+    expect(parseChapter(repaired, 'ops').lessons.map((lesson) => lesson.slug)).toEqual(['a']);
+    const bible = tmpBible();
+    bible.ensureSeeded();
+    const unknown = ['# Ops', '', '## a', '', 'recurred: 1', 'provenance: j-999', '', 'Body.', ''].join('\r');
+    writeFileSync(join(bible.chaptersDir, 'ops.md'), unknown);
+    for (const write of [false, true]) {
+      expect(() => bible.repairProvenance(journal, { write })).toThrowError(/cites journal id j-999, which is not in the journal/);
+    }
+    expect(readFileSync(join(bible.chaptersDir, 'ops.md'), 'utf-8')).toBe(unknown);
+    expect(readdirSync(bible.dir).filter((name) => name.startsWith('.repair-backup-'))).toEqual([]);
+  });
+
+  it('a CRLF chapter keeps the longest prefix that fits as WRITTEN — not a CR byte per line less (R5-A1)', () => {
+    const body = Array.from({ length: 24 }, (_, line) => `line ${String(line).padStart(2, '0')} keeps its words`).join('\r\n');
+    const text = ['# Ops', '', '## a', '', 'recurred: 1', `provenance: j-1@${at(1)}`, '', body, ''].join('\r\n');
+    const cap = 512;
+    const bible = tmpBible(cap);
+    bible.ensureSeeded();
+    writeFileSync(join(bible.chaptersDir, 'ops.md'), text);
+    expect(bible.repairProvenance(JOURNAL_R5, { write: true }).chapters[0]!.bodiesTrimmed).toBe(1);
+    const written = readFileSync(join(bible.chaptersDir, 'ops.md'), 'utf-8');
+    expect(Buffer.byteLength(written, 'utf8')).toBeLessThanOrEqual(cap);
+    // Maximal: one more character (or its CRLF) would not have fit.
+    expect(Buffer.byteLength(written, 'utf8')).toBeGreaterThan(cap - 3);
+    expect(written.split('\n').slice(0, -1).every((line) => line.endsWith('\r'))).toBe(true);
+  });
+
+  it('a body indented with Unicode spaces trims in place, its indentation byte for byte (R5-A4)', () => {
+    const indent = '\u00a0\u00a0';
+    const body = `${indent}${'Restart with care and close the shell first. '.repeat(12).trim()}`;
+    const text = ['# Ops', '', '## a', '', 'recurred: 1', `provenance: j-1@${at(1)}`, '', body, ''].join('\n');
+    expect(parseChapter(text, 'ops').lessons[0]!.body.startsWith('Restart')).toBe(true);
+    const cap = 512;
+    const bible = tmpBible(cap);
+    bible.ensureSeeded();
+    writeFileSync(join(bible.chaptersDir, 'ops.md'), text);
+    expect(bible.repairProvenance(JOURNAL_R5, { write: true }).chapters[0]!.bodiesTrimmed).toBe(1);
+    const written = readFileSync(join(bible.chaptersDir, 'ops.md'), 'utf-8');
+    expect(Buffer.byteLength(written, 'utf8')).toBeLessThanOrEqual(cap);
+    expect(written).toContain(`\n\n${indent}Restart with care`);
+    expect(written).toContain(' … [trimmed to fit the chapter cap]\n');
+  });
+
+  const TOOL_R5 = resolve(import.meta.dirname, '..', 'tools', 'repair-bible-provenance.mjs');
+  const backupsOf = (bibleDir: string): string[] => readdirSync(bibleDir).filter((name) => name.startsWith('.repair-backup-'));
+  /** An instance whose journal holds `first` plus raw `extra` records, and
+   * whose book holds one chapter citing `first`. */
+  function toolInstance(extra: (template: Record<string, unknown>) => Record<string, unknown>[]) {
+    const home = mkdtempSync(join(tmpdir(), 'gru-command-repair-r5-'));
+    cleanupDirs.push(home);
+    const journal = new JournalStore(join(home, 'journal'));
+    const first = journal.append({ kind: 'finding', source: 'gru', body: 'first' });
+    const file = join(home, 'journal', readdirSync(join(home, 'journal')).find((name) => name.endsWith('.jsonl'))!);
+    const template = JSON.parse(readFileSync(file, 'utf-8').trim().split('\n')[0]!) as Record<string, unknown>;
+    for (const record of extra(template)) appendFileSync(file, `${JSON.stringify(record)}\n`);
+    mkdirSync(join(home, 'bible', 'chapters'), { recursive: true });
+    const chapter = `# Ops\n\n## a\n\nrecurred: 1\nprovenance: ${first.id}\n\nBody.\n`;
+    writeFileSync(join(home, 'bible', 'chapters', 'ops.md'), chapter);
+    const run = (...args: string[]) => spawnSync(process.execPath, [TOOL_R5, ...args], { encoding: 'utf-8', env: { ...process.env, GRU_COMMAND_HOME: home } });
+    return { home, chapter, run };
+  }
+
+  it('the tool tolerates only identical duplicate journal records — conflicting contents refuse before any write (R5-A6)', () => {
+    const conflicting = toolInstance((template) => [{ ...template, body: 'a different body', source: 'minion' }]);
+    for (const args of [[], ['--write']]) {
+      const ran = conflicting.run(...args);
+      expect(ran.status).toBe(1);
+      expect(ran.stderr).toContain('journal id j-1 appears twice with different contents');
+    }
+    expect(readFileSync(join(conflicting.home, 'bible', 'chapters', 'ops.md'), 'utf-8')).toBe(conflicting.chapter);
+    expect(backupsOf(join(conflicting.home, 'bible'))).toEqual([]);
+    // The same record twice, keys in another order, says the same thing.
+    const identical = toolInstance((template) => [Object.fromEntries(Object.entries(template).reverse())]);
+    const ran = identical.run('--write');
+    expect(ran.stderr).not.toContain('repair-bible-provenance:');
+    expect(ran.status).toBe(0);
+  });
+
+  it('the tool reports an unreadable or non-directory book as itself — never as a missing instance (R5-A8)', () => {
+    const notDir = toolInstance(() => []);
+    rmSync(join(notDir.home, 'bible', 'chapters'), { recursive: true });
+    writeFileSync(join(notDir.home, 'bible', 'chapters'), 'not a directory');
+    const ran = notDir.run();
+    expect(ran.status).toBe(1);
+    expect(ran.stderr).toContain('exists but is not a directory');
+    expect(ran.stderr).not.toContain('right instance');
+    if (process.getuid?.() === 0) return; // root reads through any mode
+    const locked = toolInstance(() => []);
+    chmodSync(join(locked.home, 'bible'), 0o000);
+    try {
+      const refused = locked.run();
+      expect(refused.status).toBe(1);
+      expect(refused.stderr).toContain('cannot be read (EACCES');
+      expect(refused.stderr).not.toContain('right instance');
+    } finally {
+      chmodSync(join(locked.home, 'bible'), 0o755);
+    }
+  });
+
+  it('a written result that does not verify is reported, still under the lock, with what was replaced and the backup (R5-A7)', () => {
+    const bible = tmpBible(512);
+    bible.ensureSeeded();
+    const damaged = `# Ops\n\n## a\n\nrecurred: 1\nprovenance: j-1\n\nBody.\n`;
+    writeFileSync(join(bible.chaptersDir, 'ops.md'), damaged);
+    const store = bible as unknown as { writeAtomic(file: string, data: string | Buffer): void };
+    const real = store.writeAtomic.bind(bible);
+    // The bytes that land are not the bytes planned (a faulty disk, say).
+    store.writeAtomic = (file, data) => real(file, file === join(bible.chaptersDir, 'ops.md') ? `${String(data)}${'x'.repeat(600)}` : data);
+    let caught: unknown;
+    try {
+      bible.repairProvenance(JOURNAL_R5, { write: true });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(RepairWriteError);
+    expect((caught as Error).message).toMatch(/repair replaced 1 chapter\(s\) \(ops\), but the result does not verify: chapter ops\.md is \d+ B, over the 512 B cap/);
+    expect(readFileSync(join((caught as RepairWriteError).backupDir, 'chapters', 'ops.md'), 'utf-8')).toBe(damaged);
+  });
+
+  it('a failed backup aborts before any chapter is replaced, and releases the lock (R5-A10)', () => {
+    const bible = tmpBible();
+    bible.ensureSeeded();
+    const chapters = ['a', 'b'].map((slug) => [slug, `# ${slug.toUpperCase()}\n\n## ${slug}\n\nrecurred: 1\nprovenance: j-1\n\nBody.\n`] as const);
+    for (const [slug, text] of chapters) writeFileSync(join(bible.chaptersDir, `${slug}.md`), text);
+    const store = bible as unknown as { writeAtomic(file: string, data: string | Buffer): void };
+    const real = store.writeAtomic.bind(bible);
+    let backups = 0;
+    store.writeAtomic = (file, data) => {
+      if (file.includes('.repair-backup-') && ++backups === 2) throw new Error('ENOSPC: no space left on device');
+      real(file, data);
+    };
+    expect(() => bible.repairProvenance(JOURNAL_R5, { write: true })).toThrowError(/could not back up the chapters to .*ENOSPC.*the book was not changed/);
+    for (const [slug, text] of chapters) expect(readFileSync(join(bible.chaptersDir, `${slug}.md`), 'utf-8')).toBe(text);
+    store.writeAtomic = real;
+    expect(bible.repairProvenance(JOURNAL_R5, { write: true }).chapters.every((chapter) => chapter.changed)).toBe(true);
+  });
+
+  it('managed reads are strict UTF-8: an invalid baseline refuses, and valid-to-invalid bytes after planning never pass as unchanged (C2)', () => {
+    const bible = tmpBible();
+    bible.ensureSeeded();
+    const file = join(bible.chaptersDir, 'ops-restarts.md');
+    const text = `# Ops restarts\n\n## old\n\nrecurred: 1\nprovenance: j-2@${PROVENANCE.get('j-2')}\n\nA replacement character \uFFFD stays as written.\n`;
+    writeFileSync(file, text);
+    const plan = bible.planUpdates([proposal()], PROVENANCE);
+    const corrupted = Buffer.from(readFileSync(file).toString('latin1').replace('\u00ef\u00bf\u00bd', '\u00ff'), 'latin1');
+    expect(corrupted.includes(Buffer.from([0xef, 0xbf, 0xbd]))).toBe(false);
+    writeFileSync(file, corrupted);
+    expect(() => bible.applyPlan(plan)).toThrowError(/ops-restarts\.md is not valid UTF-8/);
+    expect(readFileSync(file).equals(corrupted)).toBe(true);
+    expect(() => bible.planUpdates([proposal()], PROVENANCE)).toThrowError(/ops-restarts\.md is not valid UTF-8/);
+    expect(() => bible.readChapter('ops-restarts')).toThrowError(/is not valid UTF-8/);
+  });
+
+  it('a plan whose report claims trims or drops the cap did not make is refused before anything is written (C6)', () => {
+    const bible = tmpBible();
+    bible.ensureSeeded();
+    const plan = bible.planUpdates([proposal()], PROVENANCE);
+    expect(plan.report).toMatchObject({ lessonsTrimmed: 0, lessonsDropped: 0 });
+    for (const forged of [{ lessonsTrimmed: 99 }, { lessonsDropped: 88 }]) {
+      const tampered = { ...plan, report: { ...plan.report, ...forged } };
+      expect(() => checkPlan(tampered)).toThrowError(/its report claims .* the cap trims 0 and drops 0/);
+      expect(() => bible.applyPlan(tampered)).toThrowError(/its report claims/);
+    }
+    expect(bible.readChapter('ops-restarts')).toBeNull();
+  });
+
+  it('the archive record is reviewed like any record — its arrival, a change to its text, and its removal (C5)', () => {
+    expect(WEB_ARCHIVED_LESSON_SLUG).toBe(ARCHIVED_LESSON_SLUG);
+    const archiveBody = 'Lessons trimmed at the chapter cap; provenance retained so the journal remains the ground truth.';
+    // The cap drops a lesson: the archive record it creates is listed.
+    const keep = lessonOf('keep', [{ id: 'j-2', ts: at(2) }], 'K'.repeat(150));
+    const archived = { slug: ARCHIVED_LESSON_SLUG, body: archiveBody, recurred: 1, provenance: [{ id: 'j-1', ts: at(1) }], tags: ['archived'] };
+    const cap = Buffer.byteLength(serializeChapter({ slug: 'two', title: 'Two', summary: 'Two.', tags: [], lessons: [keep, archived] }), 'utf8');
+    const tight = tmpBible(cap);
+    tight.ensureSeeded();
+    const plan = tight.planUpdates([{
+      slug: 'two', title: 'Two', summary: 'Two.',
+      lessons: [{ slug: 'left-out', body: 'L'.repeat(150), journalIds: ['j-1'] }, { slug: 'keep', body: 'K'.repeat(150), journalIds: ['j-2'] }],
+    }], JOURNAL_R5);
+    const change = describePlan(plan).chapters[0]!;
+    expect(change.added.map((lesson) => lesson.slug)).toEqual(['keep', ARCHIVED_LESSON_SLUG]);
+    expect(change.added[1]).toMatchObject({ body: archiveBody, tags: ['archived'], previousBody: null });
+    // A plan whose archive text differs from the book's shows the change.
+    tight.applyPlan(plan);
+    const next = tight.planUpdates([{ slug: 'two', title: 'Two', summary: 'Two.', lessons: [{ slug: 'keep', body: 'K'.repeat(150), journalIds: ['j-2'] }] }], JOURNAL_R5);
+    const write = next.writes[0]!;
+    const uncapped = { ...write.uncapped, lessons: write.uncapped.lessons.map((lesson) =>
+      lesson.slug === ARCHIVED_LESSON_SLUG ? { ...lesson, body: 'Rewritten archive text.' } : lesson) };
+    const forged = { ...next, writes: [{ ...write, uncapped, text: enforceChapterCap(uncapped, next.chapterCapBytes).text }] };
+    expect(describePlan(forged).chapters[0]!.changed).toContainEqual(expect.objectContaining({
+      slug: ARCHIVED_LESSON_SLUG, body: 'Rewritten archive text.', previousBody: archiveBody,
+    }));
+    // Retiring the chapter removes the archive record with its text and tags.
+    const retire = tight.planUpdates([{ slug: 'two', title: 'Two', summary: 'Two.', retire: true, lessons: [] }], JOURNAL_R5);
+    expect(describePlan(retire).chapters[0]!.removed).toContainEqual({
+      slug: ARCHIVED_LESSON_SLUG, body: archiveBody, recurred: 1, tags: ['archived'], reason: 'retired',
+    });
+  });
+
+  it('a summary that ends like a tag list never becomes INDEX tags — refused with what to do (C7)', () => {
+    const chapter = (summary: string, tags: string[]): BibleChapter => ({ slug: 'ops', title: 'Ops', summary, tags, lessons: [] });
+    expect(() => renderIndex([chapter('Restart discipline (tags: emergency)', [])]))
+      .toThrowError(/chapter ops's INDEX line would read back as different metadata — a summary must not end like a tag list/);
+    // With real tags the line still reads back exactly — until the cap drops them.
+    const tagged = [chapter('Restart discipline (tags: emergency)', ['ops'])];
+    expect(parseIndex(renderIndex(tagged))).toEqual([{ slug: 'ops', summary: 'Restart discipline (tags: emergency)', tags: ['ops'] }]);
+    const full = Buffer.byteLength(renderIndex(tagged), 'utf8');
+    expect(() => renderIndex(tagged, full - 1)).toThrowError(/would read back as different metadata/);
+    const bible = tmpBible();
+    bible.ensureSeeded();
+    expect(() => bible.planUpdates([proposal({ summary: 'Restart discipline (tags: emergency)', tags: [] })], PROVENANCE))
+      .toThrowError(/a summary must not end like a tag list/);
+  });
+
+  it('INDEX compaction budgets real UTF-8 bytes: feasible emoji and CJK caps succeed, impossible ones refuse (C12)', () => {
+    for (const glyph of ['😀', '漢']) {
+      const chapters = Array.from({ length: 4 }, (_, index) => ({ slug: `c-${index}`, title: 'C', summary: glyph.repeat(60), tags: [], lessons: [] }));
+      const skeleton = Buffer.byteLength(renderIndex(chapters.map((chapter) => ({ ...chapter, summary: 'x'.repeat(24) })), 100_000), 'utf8') - 4 * 24;
+      for (let cap = skeleton + 4 * 24; cap < 1_200; cap += 7) {
+        const rendered = renderIndex(chapters, cap);
+        expect(Buffer.byteLength(rendered, 'utf8'), `${glyph} cap ${cap}`).toBeLessThanOrEqual(cap);
+        expect(loneSurrogate.test(rendered), `${glyph} cap ${cap}`).toBe(false);
+        expect(parseIndex(rendered).map((entry) => entry.slug)).toEqual(['c-0', 'c-1', 'c-2', 'c-3']);
+      }
+      expect(() => renderIndex(chapters, skeleton + 4 * 24 - 4)).toThrowError(/cannot hold 4 chapter\(s\)/);
+    }
+    // The case the review measured: four long emoji summaries under 500 bytes.
+    const emoji = Array.from({ length: 4 }, (_, index) => ({ slug: `c-${index}`, title: 'C', summary: '😀'.repeat(60), tags: [], lessons: [] }));
+    expect(Buffer.byteLength(renderIndex(emoji, 500), 'utf8')).toBeLessThanOrEqual(500);
+  });
+
+  it('repeated journal ids never fill the provenance floor with copies — the newest three distinct handles stay (R5-A5, C4)', () => {
+    const refs = new Map(Array.from({ length: 5 }, (_, index) => [`j-${index + 1}`, at(index + 1)] as const));
+    const body = 'A lesson whose evidence repeats.';
+    const handles = (...seqs: number[]) => seqs.map((seq) => ({ id: `j-${seq}`, ts: at(seq) }));
+    // A cap that holds the lesson with exactly three handles.
+    const three = serializeChapter({ slug: 'ops', title: 'Ops', summary: 'Ops.', tags: ['ops'], lessons: [lessonOf('dup', handles(3, 4, 5), body)] });
+    const bible = tmpBible(Buffer.byteLength(three, 'utf8'));
+    bible.ensureSeeded();
+    const plan = bible.planUpdates([{
+      slug: 'ops', title: 'Ops', summary: 'Ops.', tags: ['ops'],
+      lessons: [{ slug: 'dup', body, journalIds: ['j-1', 'j-2', 'j-3', 'j-4', 'j-5', 'j-5', 'j-5'] }],
+    }], refs);
+    expect(plan.writes[0]!.text).toBe(three);
+    expect(plan.writes[0]!.uncapped.lessons[0]!.provenance.map((ref) => ref.id)).toEqual(['j-1', 'j-2', 'j-3', 'j-4', 'j-5']);
+    expect(describePlan(plan).chapters[0]!.provenanceTrimmed).toBe(2);
+    // A stored lesson cites each handle once; a plan that repeats one is refused.
+    expect(() => parseChapter(`# Ops\n\n## dup\n\nrecurred: 1\nprovenance: j-5@${at(5)}, j-5@${at(5)}\n\n${body}\n`, 'ops'))
+      .toThrowError(/provenance cites j-5 more than once/);
+    const write = plan.writes[0]!;
+    const lesson = write.uncapped.lessons[0]!;
+    const forged = { ...plan, writes: [{ ...write, uncapped: { ...write.uncapped, lessons: [{ ...lesson, provenance: [...lesson.provenance, lesson.provenance.at(-1)!] }] } }] };
+    expect(() => checkPlan(forged)).toThrowError(/pre-cap provenance repeats j-5/);
   });
 });
