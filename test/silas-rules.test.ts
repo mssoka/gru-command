@@ -24,6 +24,7 @@ const EXPECTED_RULE_IDS = [
   'verdict-rung-escalate',
   'verification-repair',
   'pr-conflict-rebase',
+  'revision-continuation',
   'sweep-ack',
   'freeze-r1',
 ] as const;

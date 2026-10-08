@@ -21,6 +21,7 @@ export type SilasActionRuleId =
   | 'verdict-rung-escalate'
   | 'verification-repair'
   | 'pr-conflict-rebase'
+  | 'revision-continuation'
   | 'sweep-ack';
 
 /** Gate rules: standing fences, not triggers. A gate's receipt proves the
@@ -97,6 +98,16 @@ export const SILAS_RULES: readonly SilasRuleSpec[] = [
       'ONE rebase directive with blocker_fingerprint pr-conflict:<head_sha>; the receipt carries rule_id.',
   },
   {
+    id: 'revision-continuation',
+    kind: 'action',
+    firesOn:
+      'revisionContinuations row (accepted material amendments the newest delivery did not carry, no writer owns the lane)',
+    receipt: ['silas.directive-sent'],
+    summary:
+      'ONE continuation directive with blocker_fingerprint contract-revision:<required>; the service attaches every pending ' +
+      'amendment and stamps the revision, and the receipt carries rule_id.',
+  },
+  {
     id: 'sweep-ack',
     kind: 'action',
     firesOn:
@@ -151,7 +162,7 @@ export const SILAS_RULE_ROUTES: Readonly<{
   rebrief: ReadonlySet<string>;
   escalate: ReadonlySet<string>;
 }> = {
-  directive: new Set(['verdict-rung-directive', 'verification-repair', 'pr-conflict-rebase']),
+  directive: new Set(['verdict-rung-directive', 'verification-repair', 'pr-conflict-rebase', 'revision-continuation']),
   rebrief: new Set(['verdict-rung-rebrief']),
   escalate: new Set(['verdict-rung-escalate']),
 };

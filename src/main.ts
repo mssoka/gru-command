@@ -1247,10 +1247,17 @@ async function main(): Promise<number> {
     escalate: createReviewEscalationNotifier(ledger, notifications),
     // A transient admission refusal retries on its own (1 min, then 5 min):
     // each scheduled or skipped retry is an FYI; only the last refusal
-    // escalates action-required through `escalate`.
+    // escalates action-required through `escalate`. A routine review
+    // supersession (owner rule 3) reports here too — never an Ack.
     inform: (title, detail) => {
-      notifications.post({ kind: 'review-admission-retry', routing: 'fyi', severity: 'info', title, detail });
+      notifications.post({ kind: 'review-fyi', routing: 'fyi', severity: 'info', title, detail });
     },
+    // Supersession proof (owner rule 3): a review session is stopped only
+    // when the runtime no longer holds a live handle for it.
+    liveReviewSessions: (agentIds) => agentIds.filter((agentId) => {
+      const handle = registry.getHandle(agentId);
+      return handle !== null && handle.health().state !== 'disposed';
+    }),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   } });
   state.wave = wave;

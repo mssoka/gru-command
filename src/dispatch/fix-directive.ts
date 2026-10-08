@@ -98,6 +98,10 @@ export async function routeFixDirectiveToMinion(
     signal: AbortSignal;
     /** Prompt owner tag (audit); defaults to the shared routing owner. */
     owner?: string;
+    /** The job's effective contract (original briefing plus every accepted
+     * amendment): what a FRESH fallback minion is briefed with. Absent =
+     * the original briefing (no amendment surface at the caller). */
+    contract?: string | null;
   },
 ): Promise<{
   delivered: boolean;
@@ -257,12 +261,16 @@ export async function routeFixDirectiveToMinion(
     } catch (error) {
       if (resumeFile === null || input.signal.aborted) throw error;
       const job = input.ledger.getJob(input.jobId);
-      if (job == null || job.briefing == null) {
+      const contract = input.contract ?? job?.briefing ?? null;
+      if (job == null || contract == null) {
         throw new Error(`cannot resume prior minion session for job ${input.jobId} and no original briefing is available to re-brief: ${String(error)}`);
       }
       assertDirectiveJobActive(input.ledger, input.jobId);
       handle = await input.registry.spawn('minion', { cwd: lane.path, signal: input.signal, ...identity });
-      prompt = `Fresh minion re-brief for job ${input.jobId}. Original contract:\n${job.briefing}\n\nCurrent fix directive:\n${directive}`;
+      // A fresh session has no memory of accepted amendments: brief it with
+      // the EFFECTIVE contract (original + amendments), never the original
+      // alone (owner rule 4).
+      prompt = `Fresh minion re-brief for job ${input.jobId}. Effective contract (original briefing plus accepted amendments):\n${contract}\n\nCurrent fix directive:\n${directive}`;
     }
     assertDirectiveJobActive(input.ledger, input.jobId);
     let promptError: unknown = null;
@@ -379,7 +387,16 @@ export function recordFollowUpDelivery(input: {
    * explicitly marked as owing a completion decision. The completion
    * observer matches on THIS id (never the event sequence). */
   readonly phaseId?: string;
+  /** The required work revision the answered request was composed with
+   * (owner rule 4): the delivery is the service-bound acknowledgement of
+   * that revision. A request that predates revisions passes 0 — it proves
+   * no revision. Review admission compares it against the job's required
+   * revision (owner rule 2). */
+  readonly workRevision: number;
 }): { readonly sha: string | null; readonly lanePath: string | null; readonly note: string | null; readonly eventSeq: number } {
+  if (!Number.isSafeInteger(input.workRevision) || input.workRevision < 0) {
+    throw new Error(`delivery work revision must be a non-negative integer, got ${String(input.workRevision)}`);
+  }
   const jobLanes = input.worktrees.listWorktrees({ jobId: input.jobId }).filter((lane) => lane.kind === 'job');
   const lane = jobLanes.find((candidate) => candidate.status !== 'swept') ?? jobLanes[0];
   let sha: string | null = null;
@@ -404,6 +421,7 @@ export function recordFollowUpDelivery(input: {
       sha,
       ...(input.requestId !== undefined ? { request_id: input.requestId } : {}),
       ...(input.phaseId !== undefined ? { phase_id: input.phaseId } : {}),
+      work_revision: input.workRevision,
     },
   });
   // Issue #220: the report handback's commissioner obligation. A failure
@@ -432,8 +450,13 @@ export function recordFollowUpDelivery(input: {
  * the original briefing (still the contract) plus the re-brief note. */
 export function renderRebriefPrompt(input: {
   jobId: string;
+  /** The effective contract at request time (original briefing plus every
+   * accepted amendment); equals the original briefing when none exist. */
   briefing: string | null;
   note: string;
+  /** The required work revision the request was composed with (owner rule
+   * 4); absent = a request that predates revisions. */
+  workRevision?: number | null;
   /** Progressive-disclosure reference lines (no chapter bodies). */
   lessons?: readonly LessonPointer[];
 }): string {
@@ -447,7 +470,10 @@ export function renderRebriefPrompt(input: {
     'RE-BRIEF NOTE (why you are here, what to do differently):',
     input.note,
     '',
-    'ORIGINAL BRIEFING (still the contract):',
+    input.workRevision === undefined || input.workRevision === null
+      ? 'CONTRACT (the original briefing plus any accepted amendments):'
+      : `CONTRACT — revision ${input.workRevision} (the original briefing plus every accepted amendment; ` +
+        `the service records this turn's delivery as contract revision ${input.workRevision} — name it in your completion report):`,
     input.briefing ?? '(the job row carries no stored briefing — read the job note on the board)',
     ...(lessonsSection === '' ? [] : ['', lessonsSection]),
     ...WORKER_RULE_BLOCKS.flatMap((block) => ['', block]),
@@ -486,6 +512,8 @@ export async function rebriefFreshMinion(
     jobId: string;
     note: string;
     briefing: string | null;
+    /** The required work revision the request was composed with. */
+    workRevision?: number | null;
     /** Resume this session file instead of minting fresh (boot recovery). */
     resumeFile?: string | null;
     /** Service-stopping signal: aborts a QUEUED admission wait and lets the
@@ -573,6 +601,7 @@ export async function rebriefFreshMinion(
         jobId: input.jobId,
         briefing: input.briefing,
         note: input.note,
+        ...(input.workRevision !== undefined ? { workRevision: input.workRevision } : {}),
         ...(input.lessons !== undefined
           ? { lessons: input.lessons.referencesFor(`${input.note}\n${input.briefing ?? ''}`) }
           : {}),

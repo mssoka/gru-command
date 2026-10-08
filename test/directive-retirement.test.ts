@@ -645,7 +645,20 @@ describe('directive retirement — live ownership fails closed', () => {
     cleanupRepos.push(repo);
     const h = await boot();
     const { lane } = await seededLiveRequest(h, repo, 'job-l', 'req-l');
-    const markers = h.ledger.beginPendingRebrief({ jobId: 'job-l', note: 'fold', briefing: 'b' });
+    // A live directive and a re-brief marker can no longer be ACCEPTED
+    // together (owner rule 5: one writer per lane), but rows written before
+    // that fence existed can still coexist: seed the legacy marker pair
+    // directly, to prove retirement still refuses that shape.
+    expect(() => h.ledger.beginPendingRebrief({ jobId: 'job-l', note: 'fold', briefing: 'b' }))
+      .toThrow(/live directive request/);
+    const legacy = h.db.handle.prepare(
+      `INSERT INTO pending_rebriefs (id, job_id, kind, payload, payload_hash, baseline_seq, requested_at, updated_at)
+       VALUES (?, 'job-l', ?, '{"note":"fold","briefing":"b"}', 'legacy-hash', 0, '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z')`,
+    );
+    legacy.run('legacy-rebrief', 'silas.rebrief');
+    legacy.run('legacy-delivered', 'job.delivered');
+    const markers = h.ledger.listPendingRebriefs({ jobId: 'job-l' });
+    expect(markers).toHaveLength(2);
     const refused = await retire(h, 'req-l', laneHead(lane));
     expect(refused.status).toBe(409);
     expect((field<string[]>(refused.json, 'blockers') ?? []).join(' ')).toContain('re-brief');

@@ -66,7 +66,11 @@ freezes one exact target/base/diff/spec set in a detached review worktree. An
 arm may carry private evidence uploads; the frozen round binds the effective
 amended acceptance and the exact-target CI receipt, and the amendment/contract
 endpoints (`POST /api/dispatch/amendment`,
-`GET /api/dispatch/jobs/<id>/contract`) manage that acceptance. See
+`GET /api/dispatch/jobs/<id>/contract`) manage that acceptance. A
+**material** amendment (owner rules 2026-10-08) makes the delivered candidate
+outdated: review stays fenced until a continuation carrying that revision
+delivers, and a review already owning the lane is superseded — proven stopped
+before any directive or re-brief prompts the minion (REVIEW-INPUTS.md §4). See
 [REVIEW-INPUTS.md](./REVIEW-INPUTS.md); a private-evidence arm is refused on
 the bmad-review fallback route rather than silently reviewed without it. The arm
 first passes the **branch-idle guard**: while any lane is actively

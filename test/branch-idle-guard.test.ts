@@ -331,6 +331,7 @@ function pendingMarker(
     sessionFile: null,
     ruleId: null,
     sourceRoundId: null,
+    workRevision: null,
     // Ordinary re-brief (no explicit completion intent): PR136's
     // phase-handoff identity is optional and null here.
     phaseId: null,
@@ -503,6 +504,7 @@ describe('branch-idle guard', () => {
           : [],
       hasUnsettledVerificationRun: (): boolean => false,
       hasOpenDirectiveRecoveryHold: (): boolean => false,
+      workRevisionState: () => ({ required: 0, delivered: 0 }),
     };
     const busy = (id: string): boolean => laneIsBusy(ledger, ledger.listJobs().find((job) => job.id === id)!);
     expect(busy('never-started')).toBe(true);
@@ -574,6 +576,7 @@ describe('branch-idle guard', () => {
       listPendingDirectives: (): readonly DirectiveRequestRecord[] => [],
       hasUnsettledVerificationRun: (): boolean => false,
       hasOpenDirectiveRecoveryHold: (): boolean => false,
+      workRevisionState: () => ({ required: 0, delivered: 0 }),
     };
     expect(laneIsBusy(paged, paged.listJobs()[0]!)).toBe(false);
 
@@ -596,6 +599,7 @@ describe('branch-idle guard', () => {
       listPendingDirectives: (): readonly DirectiveRequestRecord[] => [],
       hasUnsettledVerificationRun: (): boolean => false,
       hasOpenDirectiveRecoveryHold: (): boolean => false,
+      workRevisionState: () => ({ required: 0, delivered: 0 }),
     };
     expect(laneIsBusy(capped, capped.listJobs()[0]!)).toBe(false);
   });
@@ -841,6 +845,7 @@ describe('branch-idle guard', () => {
       listPendingDirectives: (): readonly DirectiveRequestRecord[] => [],
       hasUnsettledVerificationRun: (): boolean => false,
       hasOpenDirectiveRecoveryHold: (): boolean => false,
+      workRevisionState: () => ({ required: 0, delivered: 0 }),
     };
     const busy = (id: string): boolean => laneIsBusy(ledger, ledger.listJobs().find((job) => job.id === id)!);
     expect(busy('working-pending')).toBe(true);
@@ -1451,6 +1456,7 @@ describe('branch-idle guard', () => {
       listPendingDirectives: (): readonly DirectiveRequestRecord[] => [],
       hasUnsettledVerificationRun: (): boolean => false,
       hasOpenDirectiveRecoveryHold: (): boolean => false,
+      workRevisionState: () => ({ required: 0, delivered: 0 }),
     };
     const lanes = [
       laneRecord('marker-owner', 'marker-owner', 'gru/marker-owner'),

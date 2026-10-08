@@ -20,7 +20,8 @@ import { isJobTerminal, type TerminalJobStatus } from '../ledger/states.js';
 import type { LogLevel } from '../logger.js';
 import { DECISION_SURFACE_SAME_BLOCKER, fileOfLocation, sameBlockerDecisionRequest } from '../decisions/questions.js';
 import type { DecisionService } from '../decisions/types.js';
-import { openAttemptStartSeq } from './branch-idle.js';
+import { openAttemptStartSeq, pendingWorkRevision } from './branch-idle.js';
+import type { JobAmendmentRecord, WorkRevisionState } from '../review-inputs/amendments.js';
 import type { AgentHandle, SpawnOptions } from '../runtime/types.js';
 import type { AgentSupervisionView } from '../supervision/supervisor.js';
 import type { GitHubPollTickResult } from './github-poll.js';
@@ -294,6 +295,11 @@ export interface DigestLedger {
   /** Durable re-brief markers; any row for a job is an unresolved request
    * that fences the job's review-eligibility rows (see the digest below). */
   listPendingRebriefs(opts?: { readonly jobId?: string }): readonly PendingRebriefRecord[];
+  /** The job's required vs delivered work revision (owner rule 2). */
+  workRevisionState(jobId: string): WorkRevisionState;
+  /** Accepted amendments (version order): the revision-continuation row
+   * names the material versions its one continuation carries. */
+  listJobAmendments(jobId: string): readonly JobAmendmentRecord[];
   /** Accepted directive requests still owing completion (`dispatching` or
    * `admitted`). Presence is the lane's single-writer fence: no competing
    * continuation may be offered while one may still be driving the lane. */
@@ -520,6 +526,24 @@ export interface ReleaseEligibleRow {
   readonly branch: string | null;
 }
 
+/** A lane whose accepted MATERIAL amendments have not been delivered
+ * (owner rules 2 and 4, 2026-10-08): the candidate is outdated and review
+ * is fenced until a delivery carries the required revision. ONE
+ * continuation directive is owed — the service attaches every pending
+ * amendment's canonical text to it and stamps the revision, so the
+ * directive itself only needs to ask for the implementation. Offered only
+ * while no writer owns the lane (no live directive, no unresolved re-brief,
+ * no open attempt, no in-flight verification); retires when a delivery
+ * carries the revision. */
+export interface RevisionContinuationRow {
+  readonly jobId: string;
+  readonly repo: string;
+  readonly requiredRevision: number;
+  readonly deliveredRevision: number;
+  /** The material amendment versions the continuation will carry. */
+  readonly pendingVersions: readonly number[];
+}
+
 export interface SilasOpsDigest {
   readonly computedAt: string;
   readonly trigger: string;
@@ -533,6 +557,7 @@ export interface SilasOpsDigest {
   readonly providerRecoveryPending: readonly ProviderRecoveryPendingRow[];
   readonly conflictingPrs: readonly ConflictingPrRow[];
   readonly releaseEligible: readonly ReleaseEligibleRow[];
+  readonly revisionContinuations: readonly RevisionContinuationRow[];
 }
 
 /** Count of actionable rows (event triggers wake even at zero; sweeps do not). */
@@ -547,7 +572,8 @@ export function digestActionCount(digest: SilasOpsDigest): number {
     digest.verificationWaits.length +
     digest.providerRecoveryPending.length +
     digest.conflictingPrs.length +
-    digest.releaseEligible.length
+    digest.releaseEligible.length +
+    digest.revisionContinuations.length
   );
 }
 
@@ -567,6 +593,7 @@ const DIGEST_ROW_CATEGORIES = [
   'providerRecoveryPending',
   'conflictingPrs',
   'releaseEligible',
+  'revisionContinuations',
 ] as const;
 
 export type DigestRowCategory = (typeof DIGEST_ROW_CATEGORIES)[number];
@@ -582,7 +609,8 @@ export type DigestRow =
   | VerificationWaitingRow
   | ProviderRecoveryPendingRow
   | ConflictingPrRow
-  | ReleaseEligibleRow;
+  | ReleaseEligibleRow
+  | RevisionContinuationRow;
 
 /**
  * Decision-relevant projection of a digest row (issue #217): identity and
@@ -666,6 +694,18 @@ export function digestRowProjection(category: DigestRowCategory, row: DigestRow)
       const r = row as ReleaseEligibleRow;
       return { jobId: r.jobId, repo: r.repo, status: r.status, branch: r.branch };
     }
+    case 'revisionContinuations': {
+      // Every field: a newer material amendment (or a partial delivery)
+      // changes what the one continuation must carry.
+      const r = row as RevisionContinuationRow;
+      return {
+        jobId: r.jobId,
+        repo: r.repo,
+        requiredRevision: r.requiredRevision,
+        deliveredRevision: r.deliveredRevision,
+        pendingVersions: [...r.pendingVersions],
+      };
+    }
   }
 }
 
@@ -694,6 +734,8 @@ export function digestRowKey(category: DigestRowCategory, row: DigestRow): strin
       return `${(row as ConflictingPrRow).jobId} ${(row as ConflictingPrRow).prUrl ?? ''} ${(row as ConflictingPrRow).branch ?? ''}`;
     case 'releaseEligible':
       return (row as ReleaseEligibleRow).jobId;
+    case 'revisionContinuations':
+      return (row as RevisionContinuationRow).jobId;
   }
 }
 
@@ -1273,6 +1315,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     providerRecoveryPending: ProviderRecoveryPendingRow[];
     conflictingPrs: ConflictingPrRow[];
     releaseEligible: ReleaseEligibleRow[];
+    revisionContinuations: RevisionContinuationRow[];
   } = {
     computedAt: new Date(now()).toISOString(),
     trigger: input.trigger,
@@ -1286,6 +1329,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     providerRecoveryPending: [],
     conflictingPrs: [],
     releaseEligible: [],
+    revisionContinuations: [],
   };
   // One unresolved re-brief request fences the target: a marker exists while
   // a re-brief worker runs (or a restart-recovered request waits for boot
@@ -1344,6 +1388,9 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     const answeringRequest = latestAnsweringReviewRequest(input.ledger, job.id);
     const cleanAbort = newestRound !== null && delivered !== null &&
       newestRound.status === 'aborted' &&
+      // A superseded round reviewed an obsolete candidate (owner rule 3),
+      // even when a restart interrupted its supersession: never re-armed.
+      input.ledger.latestRoundEvent(newestRound.id, 'round.superseded') === null &&
       (abortReason === 'service_restart' || abortReason === 'service_restart_missing_review_lane') &&
       deliveredTargetSha(delivered) !== null && deliveredTargetSha(delivered) === newestRound.targetRef &&
       !(answeringRequest !== null && answeringRequest.seq > (abortProof?.seq ?? 0));
@@ -1371,6 +1418,25 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       .listPendingDirectives({ jobId: job.id, states: LIVE_DIRECTIVE_STATES }).length > 0 ||
       input.ledger.hasOpenDirectiveRecoveryHold(job.id);
     const reviewPending = reviewEligibleStatus(job.status);
+    // Owner rules 2/4: an accepted material amendment the newest delivery
+    // did not carry makes the candidate outdated. Review is fenced (the
+    // shared busy predicate refuses it), so no review row is offered; the
+    // lane owes ONE continuation instead — offered only while no writer
+    // owns the lane.
+    const revision = pendingWorkRevision(input.ledger, job);
+    if (revision !== null && reviewPending && !rebriefPending && !liveDirectiveOwns &&
+        currentPhaseDelivered && !verificationInFlight(input.ledger, job.id)) {
+      digest.revisionContinuations.push({
+        jobId: job.id,
+        repo: job.repo,
+        requiredRevision: revision.required,
+        deliveredRevision: revision.delivered,
+        pendingVersions: input.ledger.listJobAmendments(job.id)
+          .filter((amendment) => amendment.effect === 'material' &&
+            amendment.version > revision.delivered && amendment.version <= revision.required)
+          .map((amendment) => amendment.version),
+      });
+    }
 
     // (1) Delivered, no PR yet. Only PR-owing lanes (deliverable
     // null/'pr', E19) belong here: a delivered review/artifact/
@@ -1404,7 +1470,8 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     // An unresolved re-brief fences every row: the open re-brief turn is the
     // lane's target-owned work, so an OLDER delivery is never offered for
     // first review, re-review or clean-abort rearm.
-    if (currentPhaseDelivered && !liveDirectiveOwns && job.prUrl !== null && reviewPending && !rebriefPending) {
+    if (currentPhaseDelivered && !liveDirectiveOwns && job.prUrl !== null && reviewPending && !rebriefPending &&
+        revision === null) {
       if (cleanAbort && newestRound !== null) {
         digest.prWithoutReview.push({ jobId: job.id, repo: job.repo, prUrl: job.prUrl,
           priorRounds: rounds.length, cleanAbort: { roundId: newestRound.id, ruleId: 'clean-abort-service-restart' } });
@@ -1894,6 +1961,13 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       if (!reviewOfferFencesHold(row.jobId)) return false;
       const job = input.ledger.getJob(row.jobId);
       return job !== null && job.prUrl === null;
+    }),
+    revisionContinuations: digest.revisionContinuations.filter((row) => {
+      if (!continuationAllowed(row) || !jobSeqUnchanged(row.jobId) ||
+          input.ledger.listPendingDirectives({ jobId: row.jobId, states: LIVE_DIRECTIVE_STATES }).length > 0 ||
+          input.ledger.listPendingRebriefs({ jobId: row.jobId }).length > 0) return false;
+      const job = input.ledger.getJob(row.jobId);
+      return job !== null && pendingWorkRevision(input.ledger, job) !== null;
     }),
     prWithoutReview: digest.prWithoutReview.filter((row) => {
       if (!reviewOfferFencesHold(row.jobId)) return false;

@@ -104,6 +104,10 @@ without a named rule is not yours to invent:
   - `pr-conflict-rebase` — fires on a `conflictingPrs` row; the rebase
     directive carries `rule_id` plus `blocker_fingerprint`
     `pr-conflict:<head_sha>`.
+  - `revision-continuation` — fires on a `revisionContinuations` row; ONE
+    continuation directive carries `rule_id` plus `blocker_fingerprint`
+    `contract-revision:<requiredRevision>` (see "Contract revisions and
+    review supersession" below).
   In-round lens retries are Perkins-owned machinery, not a Silas
   action: your review surface is the wave-level request
   (`POST /api/dispatch/review`), never a per-lens retry.
@@ -118,7 +122,8 @@ without a named rule is not yours to invent:
   refusal, never an override.
 - **`freeze-r1` — one standing gate.** Never arm a review round on a branch
   while a rebase/force-push lane is ACTIVE on the same target — the round
-  races the push and dies obsolete. Wait for the lane delivery (and its
+  races the push and dies obsolete — or while the job's contract revision
+  is pending delivery (the candidate is outdated). Wait for the lane delivery (and its
   push) to settle and for any unresolved re-brief request to finalize or
   be recovered (a delivery alone does not clear that fence), then arm. If
   you cannot tell whether the lane is still
@@ -287,6 +292,48 @@ inside your mandate — it routes `fyi` and never wakes the chief:
   digest already withholds those rows, so a missing row means hands off.
 - Escalate only after the rebase directive fails twice. A merged PR, a
   closed PR, or a clean head retires the row on its own.
+
+## Contract revisions and review supersession (owner rules 2026-10-08)
+
+The owner's sequence is implement → verify → review → READY → owner merge.
+An approved change that needs implementation is recorded by the chief as a
+**material** amendment (`effect: "material"`); a clarification, typo or
+bookkeeping update is **administrative** and never restarts work. The
+service enforces the rest — you never decide it from a status:
+
+- **A pending correction fences review.** A material amendment raises the
+  job's required contract revision; the newest delivery carries the
+  revision its request was composed with. While required > delivered the
+  candidate is outdated: review arms answer 409 `branch_busy` with
+  `required_revision`/`delivered_revision` on the job's blocker, and the
+  digest offers no review row for that job.
+- **`revision-continuation`.** A `revisionContinuations` row (job, required
+  and delivered revision, the pending material versions) owes ONE
+  continuation directive:
+  `POST /api/silas/directive {"job_id":"<job>","directive":"Implement contract revision <N> ...","blocker_fingerprint":"contract-revision:<N>","rule_id":"revision-continuation","request_id":"<stable-id>"}`.
+  The service attaches every pending material amendment's canonical text
+  ONCE, in version order, and stamps the request with the revision — do not
+  paste or paraphrase amendment bodies, and never send one continuation per
+  amendment. A verdict or repair directive sent while a revision is pending
+  carries the same attachment, so one directive answers both. The delivery
+  of that turn is the revision's receipt; the review then re-arms through
+  the ordinary rows.
+- **Approved changes supersede a running review.** Accepting a material
+  amendment withdraws a queued round or cancels a running one and its
+  specialists (settled checkpoints stay in the round artifacts; the round
+  records `round.superseded`). Before any directive or re-brief prompts the
+  minion, the service proves the review stopped. A stop it cannot prove
+  refuses the writer (`409 review_supersession_unconfirmed`, or the
+  directive readback shows `failed` with no prompt sent) and escalates to
+  the chief — never both running. A superseded round is routine history:
+  it is never a clean-abort re-arm candidate and needs no Ack.
+- **No writer during a current review.** A directive, re-brief or provider
+  continuation on a lane whose review is running WITHOUT a pending material
+  revision answers `409 review_in_progress`: the delivered branch stays
+  frozen until the verdict. Wait for the verdict; never resend in a loop.
+- **One writer per lane.** A directive while a re-brief request stands (or
+  a re-brief while a directive is live) answers `409 writer_conflict` — wait
+  for the live request to settle.
 
 ## Ops holds are decisions, not prose (decision memory, issue #218)
 

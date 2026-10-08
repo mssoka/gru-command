@@ -2,6 +2,7 @@ import { spawnSync } from 'node:child_process';
 import type { DirectiveRequestRecord, EventRecord, JobRecord, PendingRebriefRecord } from '../ledger/api.js';
 import { isJobTerminal, type JobStatus } from '../ledger/states.js';
 import { LIVE_DIRECTIVE_STATES, type DirectiveState } from '../ledger/directives.js';
+import type { WorkRevisionState } from '../review-inputs/amendments.js';
 import type { WorktreeLane } from './worktree-port.js';
 
 /**
@@ -32,14 +33,23 @@ import type { WorktreeLane } from './worktree-port.js';
  *    reconciled. A status flip to delivered/in-review and a late
  *    `job.delivered` from the pre-re-brief worker cannot clear a newer
  *    request; the marker clears only when the request genuinely settles
- *    (`finalizeRebriefRequest` / boot reconciliation).
+ *    (`finalizeRebriefRequest` / boot reconciliation); or
+ * 3. a CORRECTION is pending (owner rule 2, 2026-10-08): an accepted
+ *    material amendment raised the job's required work revision above the
+ *    revision its newest delivery carried. The delivered candidate is
+ *    outdated — no review may freeze it until a continuation carrying the
+ *    revision delivers. Verification and active writers are covered by the
+ *    fences below, so "review begins only after the latest required
+ *    revision delivered, verification complete, no active writer" is one
+ *    predicate.
  *
  * Terminal (`merged`/`done`/`binned`) jobs are never busy: a stale marker
  * left on a terminal job must not block an unrelated review or resurrect
  * the job.
  */
 
-export const BRANCH_BUSY_HINT = 'wait for lane delivery or re-brief request settlement, or dispatch with force';
+export const BRANCH_BUSY_HINT =
+  'wait for lane delivery, re-brief request settlement, or a continuation delivering the pending contract revision; or dispatch with force';
 
 /** Statuses whose lane may be mid-flight (dispatched = the lane is about to
  * be created and pushed; working = the attempt is open; in-review = a PR
@@ -51,12 +61,22 @@ export interface BranchIdleBlocker {
   readonly jobId: string;
   readonly status: JobStatus;
   readonly branch: string;
+  /** Present when the lane is busy because a material correction is
+   * pending delivery (owner rule 2): the revision review requires and the
+   * revision the newest delivery carried. */
+  readonly revision?: WorkRevisionState;
 }
 
 /** The 409 body shape (snake_case: this is the wire contract). */
 export interface BranchBusyResponse {
   readonly error: 'branch_busy';
-  readonly blockers: readonly { readonly job_id: string; readonly status: JobStatus; readonly branch: string }[];
+  readonly blockers: readonly {
+    readonly job_id: string;
+    readonly status: JobStatus;
+    readonly branch: string;
+    readonly required_revision?: number;
+    readonly delivered_revision?: number;
+  }[];
   readonly hint: string;
 }
 
@@ -80,6 +100,9 @@ export function branchBusyPayload(input: {
       job_id: blocker.jobId,
       status: blocker.status,
       branch: blocker.branch,
+      ...(blocker.revision !== undefined
+        ? { required_revision: blocker.revision.required, delivered_revision: blocker.revision.delivered }
+        : {}),
     })),
     hint: BRANCH_BUSY_HINT,
   };
@@ -130,6 +153,19 @@ export interface BranchIdleLedger {
   /** True while any verification run for the job is unsettled: it owns the
    * checkout and no review may freeze the same head. */
   hasUnsettledVerificationRun(jobId: string): boolean;
+  /** The job's required vs delivered work revision (owner rule 2). */
+  workRevisionState(jobId: string): WorkRevisionState;
+}
+
+/** The pending correction, when one fences the lane: required > delivered
+ * (owner rule 2). Terminal jobs never carry one. */
+export function pendingWorkRevision(
+  ledger: Pick<BranchIdleLedger, 'workRevisionState'>,
+  job: Pick<JobRecord, 'id' | 'status'>,
+): WorkRevisionState | null {
+  if (isJobTerminal(job.status)) return null;
+  const state = ledger.workRevisionState(job.id);
+  return state.required > state.delivered ? state : null;
 }
 
 /** The branch a job lane is created on (worktree manager convention; also
@@ -269,6 +305,10 @@ export function laneIsBusy(ledger: BranchIdleLedger, job: JobRecord): boolean {
   // presence-based — a late delivery event from the previous worker cannot
   // answer a newer request, so it must not release this fence.
   if (ledger.listPendingRebriefs({ jobId: job.id }).length > 0) return true;
+  // A material correction accepted after the newest delivery makes that
+  // candidate outdated (owner rule 2): no status, delivery or head fact
+  // releases this fence — only a delivery carrying the revision does.
+  if (pendingWorkRevision(ledger, job) !== null) return true;
   // An accepted directive request may already be prompting a writer before
   // its admission event lands: review must not arm on that head (issue #162).
   if (ledger.listPendingDirectives({ jobId: job.id, states: LIVE_DIRECTIVE_STATES }).length > 0) return true;
@@ -328,7 +368,8 @@ export function findBusyLanes(input: {
         ? normalizeBranch(lane.branch)
         : laneBranch(job.id);
     if (branch !== target) continue;
-    blockers.push({ jobId: job.id, status, branch });
+    const revision = pendingWorkRevision(input.ledger, job);
+    blockers.push({ jobId: job.id, status, branch, ...(revision !== null ? { revision } : {}) });
   }
   return blockers;
 }

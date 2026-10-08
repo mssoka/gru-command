@@ -154,7 +154,11 @@ publishes it on the in-process event bus (`src/events/bus.ts`).
 | `branch-idle.refused` / `branch-idle.forced` | phase (`arm`/`freeze`), targetBranch, blockers — the review-arm branch-idle guard (forced rounds also carry the tag in their frozen manifest). The fallback route's two RECORD-EMITTING arm checks are the intake guard and the post-pre-flight re-entry, so a forced fallback admission records TWO `arm`-phase override records where the native route records `arm` + `freeze`. The running gate's boundary re-proofs (round intake, default-reviewer worker admission) emit NO branch-idle rows — a stop there is a `job.fallback-review` phase `aborted` |
 | `silas.review-deferred` | target_branch, phase, blockers — Silas defers a refused arm to its next sweep; `reason: fallback_unavailable` + `note` when Perkins pre-flight failed and the fallback gate could not engage, or `reason: fallback_failed` when the gate engaged and already terminated (`blocked`/`aborted`) before the receipt (the clean-abort provenance travels here, non-consuming) |
 | `silas.review-triggered` | route, and `round_id` + `rule_id`/`source_round_id` ONLY when a Perkins round is actually armed — the consuming clean-abort receipt; fallback/queued routes record the route without the provenance |
-| `job.amendment-accepted` / `job.amendment-rejected` | amendment id, version, body sha256+bytes, supersedes, approval by/reference, previous/effective contract hashes, idempotency key / refusal code+reason + current hash/version |
+| `job.amendment-accepted` / `job.amendment-rejected` | amendment id, version, body sha256+bytes, supersedes, approval by/reference, `effect` (`material`/`administrative`), `required_work_revision`, previous/effective contract hashes, idempotency key / refusal code+reason + current hash/version |
+| `job.delivered` `work_revision` | the required work revision the answered request was composed with (dispatch 0; directive intent; re-brief marker) — the service-bound acknowledgement of that revision; review admission requires `work_revision` ≥ the job's highest material amendment version (owner rule 2, 2026-10-08) |
+| `round.superseded` | reason, by, the round's status/target at supersession, `settled_specialists` (lens, attempt, checkpoint sha256) and `artifact_directory` — written BEFORE the abort; partial findings stay on disk |
+| `round.supersession-confirmed` / `round.supersession-unconfirmed` | by (+ `detail` naming what was not proven stopped: unsettled operations, non-terminal rounds, live review sessions) — an unconfirmed stop also escalates action-required and refuses the writer |
+| `job.review-superseded` / `job.review-supersession-confirmed` / `job.review-supersession-unconfirmed` | the same supersession for a review operation that owns no round (the bmad-review fallback gate) |
 | `round.review-inputs-frozen` | acceptance version/base+effective hashes/amendment ids, evidence attachment hashes (no pixels, no paths), bound CI record state |
 | `round.admission-preflight` | ok, full check list (`head-binding`, `frozen-packet:<file>`, `spec-context`, `verification-evidence`, `ci-evidence`, `evidence:<id>`), and on refusal the exhaustive named missing-input list — recorded after the freeze receipts and BEFORE any lead/child spawn (gh-169) |
 | `round.parent-incident` | exactly ONE per parent-aborted round: note, startedAttempts, startedLenses, notStartedLenses — a lead disconnect is one parent incident; never-started lenses keep their `pending` chip (not-started ≠ failed execution) (gh-169) |
@@ -183,8 +187,11 @@ row, appends the event, and (with a bus attached) publishes it:
   `listPendingRebriefs` · `clearPendingRebriefs` · `retirePendingRebriefs`
   (the only cancellation seam: identity-checked deletion + one terminal
   `silas.rebrief-retired` audit in the same transaction)
-- amendments: `addJobAmendment` · `listJobAmendments` · `effectiveContract`
-  (append-only, expected-contract-hash concurrency, per-refusal audit)
+- amendments: `addJobAmendment` (required `effect`) · `listJobAmendments` ·
+  `effectiveContract` · `workRevisionState` (required vs delivered work
+  revision) — append-only, expected-contract-hash concurrency, per-refusal
+  audit. Migration 24 adds `job_amendments.effect` (NULL = unclassified
+  history) and `pending_directives.work_revision`.
 - reads: `getJob` · `listJobs(repo?)` · `getRound` · `listRounds` ·
   `getAgent` · `listAgents`
 
