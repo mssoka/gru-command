@@ -3367,6 +3367,7 @@ export class LedgerApi {
       if (isJobTerminal(job.status)) {
         throw new Error(`job "${input.jobId}" is ${job.status} — terminal lanes are never re-briefed`);
       }
+      this.assertNoProviderProducer(input.jobId);
       let phaseId: string | null = null;
       if (input.handoff !== undefined) {
         for (const prior of this.listPhaseHandoffs({
@@ -6526,6 +6527,7 @@ export class LedgerApi {
             'a different request id never starts a second concurrent turn on the lane',
         );
       }
+      this.assertNoProviderProducer(input.jobId);
       const requestId = input.requestId ?? randomUUID();
       const ts = nowIso();
       this.db
@@ -7096,6 +7098,24 @@ export class LedgerApi {
     if (!this.hasJobEventWithPayloadValues(wait.jobId, ['provider.wait-established'], values, 0)) return 'unknown';
     return this.hasJobEventWithPayloadValues(wait.jobId, ['provider.wait-established'], values, handoff.seq)
       ? 'current' : 'superseded';
+  }
+
+  /** Native control epoch, not clock age or a caller's authority label. */
+  directiveRecoveryEpoch(jobId: string): number {
+    this.listDirectiveRecoveryHolds({ jobId }); // strict audit validation
+    const row = this.db.prepare(`SELECT COALESCE(MAX(seq), 0) AS epoch FROM events
+      WHERE job_id = ? AND kind IN ('silas.directive-retired', 'silas.directive-recovery-handoff')`).get(jobId) as Row;
+    return row['epoch'] as number;
+  }
+
+  private assertNoProviderProducer(jobId: string): void {
+    const admissions = this.listJobAdmissions(jobId).filter((kind) => kind.startsWith('provider '));
+    const claims = this.listOpenProviderWaitsForJob(jobId)
+      .filter((wait) => wait.status === 'claimed')
+      .map((wait) => `claimed provider continuation ${wait.id}`);
+    if (admissions.length > 0 || claims.length > 0) {
+      throw new AmbiguousDirectiveError(`job "${jobId}" still has provider ownership (${[...admissions, ...claims].join(', ')}) — wait for native cessation before a fresh directive or re-brief`);
+    }
   }
 
   /** The in-flight process-local admissions for one job (the same registry

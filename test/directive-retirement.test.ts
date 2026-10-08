@@ -1531,6 +1531,44 @@ describe('directive retirement — continuation boundary and consumers', () => {
     expect(h.spawns).toEqual([]);
   });
 
+  it('refuses fresh directive and re-brief acceptance while a provider observation is pending', async () => {
+    const repo = makeFixtureRepo('provider-observation-exclusive');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    const jobId = 'job-observation-exclusive';
+    const { lane } = await seededLiveRequest(h, repo, jobId, 'req-observation-old');
+    expect((await retire(h, 'req-observation-old', laneHead(lane))).status).toBe(200);
+    h.ledger.beginDirectiveIntent({ jobId, directive: 'first authority', holder: 'silas-ops', requestId: 'req-observation-first' });
+    h.ledger.failDirective({ requestId: 'req-observation-first', reason: 'fixture no-effect proof' });
+    let finish!: (route: { endpoint: string; credentialFingerprint: string }) => void;
+    const route = new Promise<{ endpoint: string; credentialFingerprint: string }>((resolve) => { finish = resolve; });
+    const sensor = new ProviderRecoverySensor({ config: { ...DEFAULT_PROVIDER_RECOVERY_CONFIG, enabled: true, glmGenerationFallback: true },
+      ledger: h.ledger, notifications: h.notifications, wake: { trigger: async () => {} }, silasHosted: () => true,
+      probe: { resolveRoute: () => route, probe: async () => { throw new Error('must not probe'); } } });
+    const pending = establishProviderWait(sensor, { agentId: 'observation-exclusive-agent', role: 'minion', slotId: null, jobId,
+      sessionFile: null, failureClass: 'quota_wall', provider: 'zai-coding-cn', model: 'glm-5.3',
+      typed: { origin: 'provider-message', status: 429, bodyCode: '1302' }, errorMessage: '429 usage window limit', incidentId: null,
+      continuation: { promptText: 'older saved prompt', promptOwner: 'minion-brief', hadOpenTurn: true } });
+    let wait: Awaited<typeof pending> = null;
+    try {
+      const before = eventKinds(h);
+      expect(() => h.ledger.beginDirectiveIntent({ jobId, directive: 'newer authority', holder: 'silas-ops', requestId: 'req-observation-next' })).toThrow(/provider ownership/u);
+      expect(() => h.ledger.beginPendingRebrief({ jobId, note: 'newer authority', briefing: null })).toThrow(/provider ownership/u);
+      expect(h.ledger.getDirective('req-observation-next')).toBeNull();
+      expect(h.ledger.listPendingRebriefs({ jobId })).toEqual([]);
+      expect(eventKinds(h)).toEqual(before);
+    } finally {
+      finish({ endpoint: 'https://fixture.invalid', credentialFingerprint: 'fp' });
+      wait = await pending;
+      sensor.stop();
+    }
+    expect(wait).not.toBeNull();
+    const unchanged = h.ledger.getProviderWait(wait!.id);
+    h.ledger.beginDirectiveIntent({ jobId, directive: 'newer authority', holder: 'silas-ops', requestId: 'req-observation-next' });
+    expect(h.ledger.providerWaitRetirementIdentity(wait!)).toBe('superseded');
+    expect(h.ledger.getProviderWait(wait!.id)).toEqual(unchanged);
+  });
+
   it('fences a real pending provider-wall route lookup before any wait is recorded', async () => {
     const repo = makeFixtureRepo('retire-pending-observation');
     cleanupRepos.push(repo);
@@ -1622,7 +1660,7 @@ describe('directive retirement — continuation boundary and consumers', () => {
     expect(h.ledger.hasOpenDirectiveRecoveryHold('job-terminal-provider')).toBe(true);
   });
 
-  it('declines a superseded post-spawn claim without rewriting the newer delivery and retains unknown cleanup ownership', async () => {
+  it('fences fresh acceptance during spawn and preserves owner holds plus unknown cleanup ownership', async () => {
     const repo = makeFixtureRepo('retire-claim-authority-race');
     cleanupRepos.push(repo);
     for (const cleanupFails of [false, true]) {
@@ -1650,14 +1688,9 @@ describe('directive retirement — continuation boundary and consumers', () => {
         registry: { getHandle: () => null, disposeHandle: async () => {}, spawn: async () => { started(); return spawn; } } }, waitId, 'silas');
       await spawning;
       const nextId = `${oldId}-next`;
-      h.ledger.beginDirectiveIntent({ jobId, directive: 'newer authority', holder: 'silas-ops', requestId: nextId });
-      const sent = h.ledger.appendCustomEvent({ kind: 'silas.directive-sent', jobId,
-        payload: { request_id: nextId, minion_id: 'newer-delivered-minion' } });
-      h.ledger.recordDirectiveAdmission({ requestId: nextId, minionId: 'newer-delivered-minion', eventSeq: sent.seq });
-      const delivered = h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId,
-        payload: { request_id: nextId, minion_id: 'newer-delivered-minion', sha: laneHead(lane) } });
-      h.ledger.recordDirectiveDelivery({ requestId: nextId, eventSeq: delivered.seq });
-      h.ledger.setJobStatus(jobId, 'delivered');
+      expect(() => h.ledger.beginDirectiveIntent({ jobId, directive: 'newer authority', holder: 'silas-ops', requestId: nextId })).toThrow(/provider ownership/u);
+      expect(() => h.ledger.beginPendingRebrief({ jobId, note: 'newer authority', briefing: null })).toThrow(/provider ownership/u);
+      h.ledger.setJobStatus(jobId, 'parked');
       finishSpawn({ id: 'superseded-returned-minion', role: 'minion', sessionFile: null, capabilities: FAKE_CAPABILITIES,
         prompt: async (text) => { prompt(text); }, steer: async () => {}, followUp: async () => {}, subscribe: () => () => {},
         health: () => ({ state: 'idle', lastActivity: null, sessionFile: null }), dispose });
@@ -1665,18 +1698,65 @@ describe('directive retirement — continuation boundary and consumers', () => {
       expect(result.outcome).toBe('skipped');
       expect(prompt).not.toHaveBeenCalled();
       expect(dispose).toHaveBeenCalledOnce();
-      expect(h.ledger.getJob(jobId)?.status).toBe('delivered');
-      expect(h.ledger.getDirective(nextId)?.state).toBe('settled');
+      expect(h.ledger.getJob(jobId)?.status).toBe('parked');
+      expect(h.ledger.getDirective(nextId)).toBeNull();
       expect(countEvents(h, 'job.minion-error')).toBe(0);
       expect(h.ledger.getProviderWait(waitId)?.status).toBe('claimed');
       if (cleanupFails) {
         expect(h.ledger.listJobAdmissions(jobId)).toContain(`provider continuation ${waitId}`);
         expect(h.ledger.listOpenProviderWaitsForJob(jobId).map((wait) => wait.id)).toContain(waitId);
+        expect(() => h.ledger.beginDirectiveIntent({ jobId, directive: 'newer authority', holder: 'silas-ops', requestId: nextId })).toThrow(/provider ownership/u);
       } else {
         expect(h.ledger.listJobAdmissions(jobId)).toEqual([]);
         expect(h.ledger.listOpenProviderWaitsForJob(jobId)).toEqual([]);
+        expect(() => h.ledger.beginDirectiveIntent({ jobId, directive: 'newer authority', holder: 'silas-ops', requestId: nextId })).not.toThrow();
       }
     }
+  });
+
+  it('refuses an HTTP H2 and a re-brief while the provider H1 prompt is actually pending', async () => {
+    const repo = makeFixtureRepo('provider-prompt-exclusive');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    const jobId = 'job-provider-prompt-exclusive';
+    const { lane } = await seededLiveRequest(h, repo, jobId, 'req-prompt-old');
+    expect((await retire(h, 'req-prompt-old', laneHead(lane))).status).toBe(200);
+    h.ledger.beginDirectiveIntent({ jobId, directive: 'first authority', holder: 'silas-ops', requestId: 'req-prompt-first' });
+    h.ledger.failDirective({ requestId: 'req-prompt-first', reason: 'fixture no-effect proof' });
+    h.ledger.recordProviderWait({ id: 'wait-prompt-exclusive', routeKey: 'route-prompt-exclusive', provider: 'p', model: 'm', endpoint: 'e',
+      credentialFingerprint: 'fp', waiterKind: 'job-minion', jobId, agentId: null, slotId: null, sessionFile: null,
+      continuation: { promptText: 'authorized H1', promptOwner: 'first-owner', hadOpenTurn: true }, jobStatusAtEstablishment: 'working',
+      lineageKey: null, incidentId: 'incident-prompt-exclusive', incidentGeneration: 1, reasonClass: 'temporary-limit' });
+    h.ledger.commitProviderRecoveryBatch({ id: 'batch-prompt-exclusive', routeKey: 'route-prompt-exclusive', incidentGenerations: [1],
+      evidence: { stopReason: 'stop' }, waiters: [{ id: 'wait-prompt-exclusive', jobId }] });
+    let finish!: () => void;
+    const turn = new Promise<void>((resolve) => { finish = resolve; });
+    let started!: () => void;
+    const prompting = new Promise<void>((resolve) => { started = resolve; });
+    const pending = claimProviderRecoveryContinuation({ ledger: h.ledger, worktrees: h.worktrees,
+      registry: { getHandle: () => null, disposeHandle: async () => {}, spawn: async () => ({
+        id: 'provider-prompting-minion', role: 'minion', sessionFile: null, capabilities: FAKE_CAPABILITIES,
+        prompt: async () => { started(); await turn; }, steer: async () => {}, followUp: async () => {}, subscribe: () => () => {},
+        health: () => ({ state: 'idle', lastActivity: null, sessionFile: null }), dispose: async () => {},
+      }) } }, 'wait-prompt-exclusive', 'silas');
+    await prompting;
+    let result: Awaited<typeof pending> | null = null;
+    try {
+      const before = eventKinds(h);
+      const refused = await call(h.port, 'POST', '/api/silas/directive', { job_id: jobId, directive: 'H2', request_id: 'req-prompt-h2' }, TOKEN);
+      expect(refused.status).toBe(409);
+      expect(JSON.stringify(refused.json)).toContain('provider ownership');
+      expect(() => h.ledger.beginPendingRebrief({ jobId, note: 'H2', briefing: null })).toThrow(/provider ownership/u);
+      expect(h.ledger.getDirective('req-prompt-h2')).toBeNull();
+      expect(eventKinds(h)).toEqual(before);
+      expect(h.spawns).toEqual([]);
+    } finally {
+      finish();
+      result = await pending;
+    }
+    expect(result?.outcome).toBe('continued');
+    expect(h.ledger.listJobAdmissions(jobId)).toEqual([]);
+    expect((await call(h.port, 'POST', '/api/silas/directive', { job_id: jobId, directive: 'H2', request_id: 'req-prompt-h2' }, TOKEN)).status).toBe(202);
   });
 
   it('persists the retirement and hold across a database reopen', async () => {

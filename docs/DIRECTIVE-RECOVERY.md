@@ -147,7 +147,14 @@ left byte-identical while a live hold is open, including on a parked or
 blocked job. Sensor probes and boot wakes ignore held/superseded debt;
 only its obsolete batch marker closes. Terminal-job wait cancellation is
 passive cleanup, never a hold release or work revival. Observation admission
-covers credential lookup before wait recording. Digest publication rechecks
+covers credential lookup before wait recording. Fresh directive/re-brief
+acceptance refuses while that provider reservation or an unproven claimed
+continuation owns the job; a later handoff cannot overtake its pending
+lookup or prompt. A breaker ACK is an attention record, not fresh job
+authority: supervisor restart and delivery preserve the interrupted turn's
+native recovery epoch and refuse held or superseded snapshots, even after
+a different fresh request releases the hold. A genuinely fresh interrupted
+turn retains its own recovery path. Digest publication rechecks
 live ownership and the captured job event watermark after all awaits;
 fully settled new authority also retracts a stale offer.
 A damaged hold is reported as inconsistent audit debt without hiding

@@ -242,18 +242,21 @@ export class ProviderRecoverySensor {
    * still have this producer pending, so its directive cannot retire yet. */
   async resolveAndRecordWait(observation: ProviderWallObservation, evidence: ProviderRejectionEvidence): Promise<ProviderWaitRecord | null> {
     let release: (() => void) | null = null;
-    if (observation.role === 'minion' && observation.jobId !== null) {
-      const job = this.ledger.getJob(observation.jobId);
+    const authorityJobId = observation.role === 'minion' ? observation.jobId : null;
+    let authorityEpoch: number | null = null;
+    if (authorityJobId !== null) {
+      const job = this.ledger.getJob(authorityJobId);
       if (job === null || isJobTerminal(job.status) || this.ledger.hasOpenDirectiveRecoveryHold(job.id)) {
-        this.debugLog('provider observation has no current job authority — no wait', { agent_id: observation.agentId, job_id: observation.jobId });
+        this.debugLog('provider observation has no current job authority — no wait', { agent_id: observation.agentId, job_id: authorityJobId });
         return null;
       }
+      authorityEpoch = this.ledger.directiveRecoveryEpoch(job.id);
       release = this.ledger.beginJobAdmission(job.id, `provider wait establishment ${observation.agentId}`);
     }
     try {
       const resolved = await this.probeFor(evidence.provider).resolveRoute(evidence.provider, evidence.model);
-      if (resolved === null || this.disposed) {
-        this.debugLog('route/credential unavailable or sensor stopped — no wait', { agent_id: observation.agentId, provider: evidence.provider });
+      if (resolved === null || this.disposed || (authorityJobId !== null && this.ledger.directiveRecoveryEpoch(authorityJobId) !== authorityEpoch)) {
+        this.debugLog('route/credential unavailable, sensor stopped, or authority changed — no wait', { agent_id: observation.agentId, provider: evidence.provider });
         return null;
       }
       return this.recordWait(observation, evidence, resolved.endpoint, resolved.credentialFingerprint);

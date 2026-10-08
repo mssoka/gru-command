@@ -699,6 +699,63 @@ describe('supervisor — watchdog + restart ladder', () => {
     expect(handle.disposed).toBe(true);
   });
 
+  it('a retirement fences breaker ACK even after handoff; a genuinely fresh interrupted turn still resumes', async () => {
+    const db = new LedgerDb(tmpDir());
+    const bus = new EventBus();
+    const api = new LedgerApi(db.handle, { bus });
+    const center = new NotificationCenter({ ledger: api, bus });
+    const registry = new FakeRegistry();
+    let nowMs = 2_000_000;
+    const supervisor = new Supervisor({ config: { enabled: true, turnSilenceMs: 30, restartWindowMs: 600_000,
+      maxRestarts: 1, restartBackoffMs: 1 }, registry, ledger: api, notifications: center, tickMs: 5, now: () => nowMs });
+    api.addJob({ id: 'retired-breaker-job', repo: 'fixture', title: 'retired breaker' });
+    api.setJobStatus('retired-breaker-job', 'working');
+    const intent = api.beginDirectiveIntent({ jobId: 'retired-breaker-job', directive: 'old prompt', holder: 'silas-ops', requestId: 'retired-breaker-request' });
+    api.registerAgent({ id: 'retired-breaker-agent', role: 'minion', jobId: 'retired-breaker-job' });
+    registry.spawnImpl = async () => { throw new Error('fixture failed restart'); };
+    supervisor.start();
+    try {
+      const old = new FakeHandle('minion', 'retired-breaker-agent', null);
+      old.pendingTurnSnapshot = { text: 'old retired prompt', owner: 'silas-directive:retired-breaker-request' };
+      registry.adopt(old);
+      hang(old);
+      nowMs += 60;
+      await sleep(150);
+      expect(supervisor.viewFor(old.id)?.state).toBe('stopped');
+      expect(old.disposed).toBe(true);
+      api.setAgentState(old.id, 'disposed'); // the real fixture disposer acknowledged cessation
+      expect(supervisor.pendingProducerBlockers('retired-breaker-job')).toEqual([]);
+      api.retireInterruptedDirective({ requestId: intent.record.requestId, expectedJobId: 'retired-breaker-job', expectedState: 'dispatching',
+        expectedPayloadHash: intent.record.payloadHash, expectedHead: 'a'.repeat(40), lane: { id: 'breaker-fixture-lane', resolvedHead: 'a'.repeat(40) },
+        reason: 'fixture restart stopped and disposed', by: 'silas-ops' });
+      const stop = api.listNotifications({ limit: 30 }).find((notification) => notification.kind === 'supervision.breaker')!;
+      const before = registry.spawnCalls.length;
+      registry.spawnImpl = async (role) => new FakeHandle(role, 'should-not-replay-retired', null);
+      supervisor.onNotificationAcked(stop.id);
+      await sleep(30);
+      expect(registry.spawnCalls).toHaveLength(before);
+      expect(supervisor.viewFor(old.id)?.breakerOpen).toBe(true);
+      api.beginDirectiveIntent({ jobId: 'retired-breaker-job', directive: 'fresh authority', holder: 'silas-ops', requestId: 'fresh-breaker-request' });
+      supervisor.onNotificationAcked(stop.id);
+      await sleep(30);
+      expect(registry.spawnCalls).toHaveLength(before);
+      expect(api.listEvents({ limit: 100 }).filter((event) => event.kind === 'supervision.rearmed')).toEqual([]);
+      const fresh = new FakeHandle('minion', 'fresh-breaker-agent', null);
+      api.registerAgent({ id: fresh.id, role: 'minion', jobId: 'retired-breaker-job' });
+      fresh.pendingTurnSnapshot = { text: 'new authorized prompt', owner: 'silas-directive:fresh-breaker-request' };
+      registry.spawnImpl = async (role) => new FakeHandle(role, 'fresh-breaker-resumed', null);
+      registry.adopt(fresh);
+      hang(fresh);
+      nowMs += 60;
+      await sleep(80);
+      expect((registry.getHandle('fresh-breaker-resumed') as FakeHandle | null)?.promptCalls).toEqual([{ text: 'new authorized prompt', owner: 'silas-directive:fresh-breaker-request' }]);
+    } finally {
+      supervisor.dispose();
+      for (const handle of registry.handlesById.values()) await registry.disposeHandle(handle);
+      db.close();
+    }
+  });
+
   it('breaker trips after 3 failed rungs in the window: stop + needs-owner + board mark', async () => {
     const dir = tmpDir();
     const db = new LedgerDb(dir);

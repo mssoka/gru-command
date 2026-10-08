@@ -258,6 +258,46 @@ runs are regression/development evidence, not commit-bound clearance.
 No review finding was deferred; final exact-head challenge and receipts
 follow the patch commit.
 
+### Exact-head challenge at `598044b`
+
+All four Pi `openai-codex/gpt-6-sol` sessions completed their read-only
+challenge. Each raw finding below is verified separately before grouping;
+Verification Gap's Other finding is verified normally.
+
+| # | Raw claim | Verdict | Verified evidence + disposition |
+|---|---|---|---|
+| N-B1 | Fresh directive/re-brief overtakes provider observation or already-prompting continuation | high | beginDirectiveIntent/beginPendingRebrief lack the provider admission fence; recording after the newer handoff gives old evidence a misleading birth sequence. Patch both acceptance boundaries and capture native recovery epoch before observer I/O. |
+| N-E1 | Breaker ACK replays a retired prompt | high | onNotificationAcked re-arms a stopped breaker; restart/recovery checks handle currency, not retirement authority. Patch ACK/restart/delivery with hold and captured native epoch fences, preserving the stopped history and never replaying a superseded snapshot. |
+| N-V1 | Fresh H2 starts while provider prompt H1 is pending (Other finding) | high | The real helper awaits prompt after its last authority check; a fresh acceptance currently sees no live directive and ignores the provider reservation. Patch acceptance; add pending-prompt H2 refusal and after-settlement positive counterpart. |
+| N-A1 | Delayed observation gains newer handoff authority | high | Independently traced the same accepted-before-route-resolution sequence. Patch both provider exclusion and pre-I/O epoch capture; preserve normal current observation and post-settlement acceptance. |
+
+After individual verification, N-B1/N-V1/N-A1 share asymmetric provider
+ownership at fresh acceptance; N-E1 is a distinct supervisor replay root.
+All are private boundary patches to demonstrated states; none is deferred.
+Implemented provider reservations plus unproven-claim refusal at both fresh
+acceptance boundaries, pre-I/O native epoch capture, and supervisor
+ACK/restart/delivery epoch fencing. The old post-spawn race now expects H2
+refusal; its reachable owner-park/disposal matrix still exercises the late
+helper guard and retained unknown cleanup ownership. Added observation,
+actually-pending prompt/HTTP H2, and ACK/re-arm regressions with positive
+post-cessation/fresh-turn counterparts. Retirement suite is 52, supervisor
+95, focused total 498. Developmental red v3
+`e345ea69-cdae-49dc-9524-928b655fef50` reproduces all four assertions with the
+acceptance fence deliberately omitted and old supervisor unchanged. Earlier
+red attempts had fixture API mistakes and are not discriminating evidence.
+The mutation is restored. Focused developmental green
+`89502000-15de-4afa-a78d-adc6556eaec1` and typecheck
+`f3442b35-9116-4e4b-88e5-11730e38282a` pass; both are dirty, non-commit-bound
+preflights, not clearance. Final-source review and exact-head gates remain.
+The exact-head full run's unchanged SIGTERM wall-clock assertion failed once
+(3199ms versus 2000ms; it includes local git reads outside the 250ms remote
+probe). No timeout/budget was waived. Unchanged full rerun
+`dd228178-29b8-4afa-8472-d78fa1ff9ed9` passes at clean `598044b`; CI also
+passes at that SHA. The first failed capture remains preserved as failure,
+not clearance. Typecheck `4efc2a02-1460-4381-8176-79080c9edfd1` and
+focused `425a22d6-a246-4c89-b73c-eb7a03a36319` pass at the same clean head.
+These receipts clear that source only, not the next corrections.
+
 ## Design Notes
 
 **Cessation predicate (server-derived, fail closed).** Blockers: agents of the job in
