@@ -468,6 +468,77 @@ describe('board client', () => {
     client.stop();
   });
 
+  it('refresh demand that arrives while the trailing refetch runs is drained after it — two stale pushes, an overlapping wake (R6-04)', async () => {
+    const answers: Array<(response: Response) => void> = [];
+    const fetchImpl = vi.fn(() => new Promise<Response>((resolve) => { answers.push(resolve); })) as unknown as typeof fetch;
+    const sockets: { onopen: (() => void) | null; onmessage: ((event: { data: string }) => void) | null }[] = [];
+    class FakeSocket {
+      onopen: (() => void) | null = null;
+      onmessage: ((event: { data: string }) => void) | null = null;
+      onclose: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      constructor() {
+        sockets.push(this);
+      }
+      send(): void {}
+      close(): void {}
+    }
+    const delivered: string[] = [];
+    const ok = (snapshot: BoardSnapshot) => new Response(JSON.stringify(snapshot), { status: 200 });
+    const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+    const client = new BoardClient(
+      { token: TOKEN, host: 'localhost', fetchImpl, webSocketCtor: FakeSocket as unknown as new (url: string) => WebSocket },
+      { connection: () => {}, snapshot: (snapshot) => delivered.push(snapshot.decisions.incarnation), fatal: () => {} },
+    );
+    client.connect();
+    answers[0]!(ok(tagged('boot')));
+    await tick();
+    const socket = sockets.at(-1)!;
+    socket.onopen!();
+    socket.onmessage!({ data: JSON.stringify({ type: 'auth_ok' }) });
+    const push = (tag: string) => socket.onmessage!({ data: JSON.stringify({ type: 'board', snapshot: tagged(tag) }) });
+    // A refresh; a stale push lands; its answer is discarded -> one trailing refetch.
+    const refresh = client.refetchSnapshot();
+    push('stale-1');
+    answers[1]!(ok(tagged('fresh-1')));
+    await refresh;
+    await tick();
+    expect(answers).toHaveLength(3);
+    // A SECOND stale push lands while the trailing refetch runs: its answer
+    // is discarded too, and the demand is drained once it settles.
+    push('stale-2');
+    answers[2]!(ok(tagged('fresh-2')));
+    await tick();
+    await tick();
+    expect(answers).toHaveLength(4);
+    answers[3]!(ok(tagged('fresh-3')));
+    await tick();
+    await tick();
+    expect(delivered).toEqual(['boot', 'stale-1', 'stale-2', 'fresh-3']);
+    expect(answers).toHaveLength(4); // drained once, nothing more owed
+    // An overlapping wake: its answer is discarded while a trailing refetch
+    // is still in flight — the demand waits for that one, then is drained.
+    const again = client.refetchSnapshot();
+    push('stale-3');
+    answers[4]!(ok(tagged('fresh-4')));
+    await again;
+    await tick();
+    expect(answers).toHaveLength(6); // the trailing refetch
+    const wake = client.refetchSnapshot();
+    push('stale-4');
+    answers[6]!(ok(tagged('wake-answer'))); // discarded: a push landed, a refetch trails
+    await wake;
+    answers[5]!(ok(tagged('older-trailing'))); // superseded by the wake's newer request
+    await tick();
+    await tick();
+    expect(answers).toHaveLength(8); // the owed successor
+    answers[7]!(ok(tagged('fresh-5')));
+    await tick();
+    await tick();
+    expect(delivered.slice(-3)).toEqual(['stale-3', 'stale-4', 'fresh-5']);
+    client.stop();
+  });
+
   it('a malformed review is refused before anything renders it — a valid one passes', async () => {
     const review = (removed: unknown) => ({
       id: 'prop-1',

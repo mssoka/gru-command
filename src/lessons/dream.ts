@@ -924,6 +924,8 @@ function validateLessonProposal(value: unknown, where: string): LessonProposal {
   if (JSON.stringify(nextState.replay ?? []) !== JSON.stringify(remainder)) fail('nextState replay remainder');
 
   const plan = record(row['plan'], 'plan');
+  // Absent: planned under the first release's contract (R6-01); 2: today's.
+  if (plan['contract'] !== undefined && plan['contract'] !== 2) fail('plan.contract');
   if (typeof plan['base'] !== 'string' || !SHA256_HEX.test(plan['base'])) fail('plan.base');
   if (typeof plan['after'] !== 'string' || !SHA256_HEX.test(plan['after'])) fail('plan.after');
   text(plan['indexText'], 'plan.indexText');

@@ -2992,8 +2992,53 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     ] as const) {
       await expect(replying(status, body).decideLessonProposal('prop-1', 'accept'), JSON.stringify([status, body])).rejects.toThrow(/does not confirm this accept/);
     }
+    // R6-08: the right choice and phase, but another proposal — both choices.
+    for (const [status, body] of [
+      [200, { id: 'other-proposal', decision: 'accepted' }],
+      [202, { id: 'other-proposal', decision: 'accepted', incomplete: true }],
+    ] as const) {
+      await expect(replying(status, body).decideLessonProposal('prop-1', 'accept')).rejects.toThrow(/does not confirm this accept/);
+    }
+    for (const [status, body] of [
+      [200, { id: 'other-proposal', decision: 'rejected' }],
+      [202, { id: 'other-proposal', decision: 'rejected', incomplete: true }],
+    ] as const) {
+      await expect(replying(status, body).decideLessonProposal('prop-1', 'reject')).rejects.toThrow(/does not confirm this reject/);
+    }
+    await expect(replying(200, { id: 'prop-1', decision: 'rejected' }).decideLessonProposal('prop-1', 'reject')).resolves.toMatchObject({ decision: 'rejected' });
     await expect(replying(200, { id: 'prop-1', decision: 'accepted' }).decideLessonProposal('prop-1', 'accept')).resolves.toMatchObject({ decision: 'accepted' });
     await expect(replying(202, { id: 'prop-1', decision: 'accepted', incomplete: true, detail: 'x' }).decideLessonProposal('prop-1', 'accept')).resolves.toMatchObject({ incomplete: true });
+  });
+
+  it('a recorded decision whose retry fails stays recorded — its message, its row, and only its own button (R6-09)', async () => {
+    const { BoardApiError } = await import('../lib/board-client.js');
+    for (const choice of ['accept', 'reject'] as const) {
+      const recorded = choice === 'accept' ? 'accepted' : 'rejected';
+      const label = choice === 'accept' ? 'Accept' : 'Reject';
+      let calls = 0;
+      const client = proposalClient(() => {
+        calls += 1;
+        return calls === 1
+          ? Promise.resolve({ id: 'lp-1', decision: recorded, incomplete: true, detail: 'ledger is busy' })
+          : Promise.reject(new BoardApiError(`/api/lessons/proposal/lp-1/${choice}`, 500, 'proposal_unconfirmed', 'disk I/O error'));
+      });
+      const view = new BoardView(() => {}, client);
+      view.render(snapshot({ notifications: [proposalNotice] }));
+      const button = () => document.getElementById('board-owner')!.querySelector<HTMLButtonElement>(`.board-owner__${choice}`)!;
+      const opposite = () => document.getElementById('board-owner')!.querySelector<HTMLButtonElement>(`.board-owner__${choice === 'accept' ? 'reject' : 'accept'}`)!;
+      button().click();
+      await flush();
+      expect(document.getElementById('board-owner')!.textContent, choice).toContain(`Your ${label} is recorded, but finishing it hit a problem`);
+      button().click();
+      await flush();
+      const band = document.getElementById('board-owner')!;
+      expect(band.textContent, choice).toContain(`Your ${label} is recorded, but finishing it could not be confirmed (the server failed (500: disk I/O error))`);
+      expect(band.textContent, choice).not.toContain('Not applied');
+      expect(band.querySelector('[data-action-id="owner-proposal:lp-1"]'), choice).not.toBeNull(); // the snapshot closes it
+      expect(button().disabled, choice).toBe(false); // the same decision may be pressed again
+      expect(opposite().disabled, choice).toBe(true); // a recorded decision never flips
+      expect(calls, choice).toBe(2);
+    }
   });
 
   it('only a proven refusal says "Not applied"; a server failure is unconfirmed and keeps the recorded intent (C8)', async () => {

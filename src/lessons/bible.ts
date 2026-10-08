@@ -269,7 +269,18 @@ export interface BiblePlan {
   readonly chapterCapBytes: number;
   readonly indexCapBytes: number;
   readonly report: ApplyReport;
+  /** The planning contract (cap trimming and INDEX rendering) the plan was
+   * made under (R6-01): absent = 1, the first release's. A stored plan is
+   * verified under ITS contract, so an approved plan survives an upgrade
+   * with its exact bytes. */
+  readonly contract?: PlanContract;
 }
+
+/** 1: the first release (overshoot trimming, character-budget INDEX
+ * compaction). 2: retained-text bisection trimming, UTF-8 byte budgets and
+ * INDEX read-back. */
+export type PlanContract = 1 | 2;
+export const PLAN_CONTRACT: PlanContract = 2;
 
 export interface ChapterRepairReport {
   readonly slug: string;
@@ -477,10 +488,16 @@ export class BibleStore {
         written.push(write.slug);
       }
       // Proven while the lock is still held (R5-A7): every chapter, as
-      // stored, is strict UTF-8, parses with the dream's reader and fits.
+      // stored, is strict UTF-8, parses with the dream's reader and fits —
+      // and every replaced one holds exactly the planned bytes (R6-05).
+      const plannedBytes = new Map(planned.map((write) => [`${write.slug}.md`, Buffer.from(write.text, 'utf8')]));
       try {
         for (const name of readdirSync(this.chaptersDir).filter((entry) => entry.endsWith('.md')).sort()) {
           const raw = readFileSync(join(this.chaptersDir, name));
+          const expected = plannedBytes.get(name);
+          if (expected !== undefined && !raw.equals(expected)) {
+            throw new BibleError(`chapter ${name} does not hold the planned bytes`);
+          }
           if (raw.length > this.chapterCapBytes) {
             throw new BibleError(`chapter ${name} is ${raw.length} B, over the ${this.chapterCapBytes} B cap`);
           }
@@ -678,6 +695,7 @@ export class BibleStore {
       indexText,
       chapterCapBytes: this.chapterCapBytes,
       indexCapBytes: this.indexCapBytes,
+      contract: PLAN_CONTRACT,
       report: {
         chaptersWritten: writes.length,
         chaptersRetired: retired.size,
@@ -831,6 +849,8 @@ function verifyPlan(plan: BiblePlan): VerifiedPlan {
   const fail = (what: string): never => {
     throw new BibleError(`the update plan is inconsistent: ${what}; nothing was written`);
   };
+  if (plan.contract !== undefined && plan.contract !== 1 && plan.contract !== 2) fail(`its planning contract ${String(plan.contract)} is unknown`);
+  const contract = planContract(plan);
   const content = new Map<string, string | null>();
   for (const write of plan.writes) content.set(`${BIBLE_CHAPTERS_DIR}/${write.slug}.md`, write.text);
   for (const slug of plan.retired) content.set(`${BIBLE_CHAPTERS_DIR}/${slug}.md`, null);
@@ -870,8 +890,8 @@ function verifyPlan(plan: BiblePlan): VerifiedPlan {
   let trimmed = 0;
   let dropped = 0;
   for (const write of plan.writes) {
-    assertChapterModel(write.uncapped, write.slug);
-    const capped = enforceChapterCap(write.uncapped, plan.chapterCapBytes);
+    assertChapterModel(write.uncapped, write.slug, contract);
+    const capped = enforceChapterCap(write.uncapped, plan.chapterCapBytes, undefined, contract);
     if (capped.text !== write.text) fail(`chapter ${write.slug} is not what the cap makes of its merged chapter`);
     if (!utf8Exact(write.text)) fail(`chapter ${write.slug} would not survive UTF-8 unchanged`);
     assertReadsBack(write.text, capped.chapter);
@@ -887,7 +907,8 @@ function verifyPlan(plan: BiblePlan): VerifiedPlan {
   const resultChapters = [...result.entries()]
     .filter(([path]) => path.startsWith(`${BIBLE_CHAPTERS_DIR}/`) && path.endsWith('.md'))
     .map(([path, text]) => parseChapter(text, path.slice(BIBLE_CHAPTERS_DIR.length + 1, -'.md'.length)));
-  if (!utf8Exact(plan.indexText) || renderIndex(resultChapters, plan.indexCapBytes) !== plan.indexText) {
+  const index = contract === 1 ? renderIndexV1(resultChapters, plan.indexCapBytes) : renderIndex(resultChapters, plan.indexCapBytes);
+  if (!utf8Exact(plan.indexText) || index !== plan.indexText) {
     fail('its INDEX.md is not the index of the book it produces');
   }
   return { content, baseline, result };
@@ -910,7 +931,7 @@ function unexpectedPaths(
 }
 
 /** A stored pre-cap chapter must be a well-formed chapter model. */
-function assertChapterModel(value: unknown, slug: string): void {
+function assertChapterModel(value: unknown, slug: string, contract: PlanContract = PLAN_CONTRACT): void {
   const bad = (what: string): never => {
     throw new BibleError(`the update plan is inconsistent: chapter ${slug} pre-cap ${what}; nothing was written`);
   };
@@ -930,7 +951,9 @@ function assertChapterModel(value: unknown, slug: string): void {
     for (const ref of lesson['provenance'] as unknown[]) {
       const handle = (typeof ref === 'object' && ref !== null ? ref : bad('handle')) as Record<string, unknown>;
       if (typeof handle['id'] !== 'string' || typeof handle['ts'] !== 'string') bad('handle');
-      if (ids.has(handle['id'] as string)) bad(`provenance repeats ${String(handle['id'])}`);
+      // Contract 1 planned repeated journal ids as copies; it is checked as it was.
+      if (contract !== 1 && ids.has(handle['id'] as string)) bad(`provenance repeats ${String(handle['id'])}`);
+      if (parseIsoInstant(handle['ts'] as string) === null) bad(`provenance ${String(handle['id'])} carries an invalid instant`);
       ids.add(handle['id'] as string);
     }
   }
@@ -954,7 +977,7 @@ export function describePlan(plan: BiblePlan): PlanReview {
       describeChapterChange(
         prior === null ? null : parseChapter(prior, write.slug),
         write.uncapped,
-        enforceChapterCap(write.uncapped, plan.chapterCapBytes),
+        enforceChapterCap(write.uncapped, plan.chapterCapBytes, undefined, planContract(plan)),
       ),
     );
   }
@@ -1217,7 +1240,15 @@ function parseLesson(chapterSlug: string, slug: string, lines: readonly string[]
           recurred = value;
           sawRecurred = true;
         } else if (meta[1] === 'provenance') {
-          provenance.push(...splitProvenance(meta[2] ?? '', chapterSlug, slug));
+          // One handle once per LESSON, across every provenance line (R6-02).
+          for (const ref of splitProvenance(meta[2] ?? '', chapterSlug, slug)) {
+            if (provenance.some((seen) => seen.id === ref.id)) {
+              throw new BibleError(
+                `chapter ${chapterSlug}.md lesson ${slug}: provenance cites ${ref.id} more than once — rebuild it from the journal with the repair tool`,
+              );
+            }
+            provenance.push(ref);
+          }
         } else if (meta[1] === 'tags') {
           tags.push(...splitTags(meta[2] ?? ''));
         }
@@ -1687,6 +1718,43 @@ function prefixWithinBytes(text: string, maxBytes: number): number {
   return length;
 }
 
+/** INDEX.md as planning contract 1 rendered it (R6-01) — kept verbatim so
+ * a plan approved under it verifies after an upgrade. */
+function renderIndexV1(chapters: readonly BibleChapter[], capBytes: number): string {
+  const sorted = [...chapters].sort((a, b) => a.slug.localeCompare(b.slug));
+  const build = (includeTags: boolean, summaryBudget: number | null): string => {
+    const lines = [...INDEX_HEADER];
+    for (const chapter of sorted) {
+      let summary = collapseLine(chapter.summary);
+      if (summaryBudget !== null && summary.length > summaryBudget) {
+        summary = `${safeSlice(summary, Math.max(1, summaryBudget - 1))}…`;
+      }
+      const tags = includeTags && chapter.tags.length > 0 ? ` (tags: ${chapter.tags.join(', ')})` : '';
+      lines.push(`- [${chapter.slug}](chapters/${chapter.slug}.md) — ${summary}${tags}`);
+    }
+    return `${lines.join('\n')}\n`;
+  };
+  const full = build(true, null);
+  if (Buffer.byteLength(full, 'utf8') <= capBytes) return full;
+  const withoutTags = build(false, null);
+  if (Buffer.byteLength(withoutTags, 'utf8') <= capBytes) return withoutTags;
+  const skeletonBytes = Buffer.byteLength(build(false, 0), 'utf8');
+  const budget = sorted.length === 0 ? 0 : Math.floor((capBytes - skeletonBytes) / sorted.length) - 1;
+  if (sorted.length === 0 || budget < 24) {
+    throw new BibleError(`bible index cap ${capBytes} bytes cannot hold ${sorted.length} chapter(s) — consolidate chapters (or raise lessons.index_cap_bytes)`);
+  }
+  const compacted = build(false, budget);
+  if (Buffer.byteLength(compacted, 'utf8') > capBytes) {
+    throw new BibleError(`bible index compaction could not fit ${sorted.length} chapter(s) under ${capBytes} bytes`);
+  }
+  return compacted;
+}
+
+/** The contract a stored plan was made under (absent: the first). */
+function planContract(plan: BiblePlan): PlanContract {
+  return plan.contract ?? 1;
+}
+
 export function parseIndex(text: string): LessonIndexEntry[] {
   const entries: LessonIndexEntry[] = [];
   for (const line of text.split(/\r\n|\r|\n/u)) {
@@ -1913,7 +1981,18 @@ export function enforceChapterCap(
    * The repair passes its in-place renderer, so every decision is driven
    * by the real file size. */
   measure: (candidate: BibleChapter) => number = (candidate) => Buffer.byteLength(serializeChapter(candidate), 'utf8'),
+  /** The planning contract whose trimming applies (R6-01). */
+  contract: PlanContract = PLAN_CONTRACT,
 ): ChapterCapResult {
+  // R6-03: an impossible instant is refused before anything is measured —
+  // a chapter that already fits included.
+  for (const lesson of chapter.lessons) {
+    for (const ref of lesson.provenance) {
+      if (parseIsoInstant(ref.ts) === null) {
+        throw new BibleError(`chapter ${chapter.slug} lesson ${lesson.slug}: provenance ${ref.id}@${ref.ts} is not a valid ISO instant`);
+      }
+    }
+  }
   let lessons: BibleLesson[] = chapter.lessons.map((lesson) => ({ ...lesson }));
   let provenanceTrimmed = 0;
   let trimmed = 0;
@@ -1956,24 +2035,52 @@ export function enforceChapterCap(
       return true;
     }
     materialize();
-    // (1) shorten the longest trimmable body by the overshoot.
+    if (contract === 1) {
+      // Contract 1, exactly as first released: the longest body above the
+      // floor, cut by the overshoot (canonical bytes).
+      let longest = -1;
+      for (let index = 0; index < lessons.length; index += 1) {
+        const lesson = lessons[index]!;
+        if (lesson.slug === ARCHIVED_LESSON_SLUG) continue;
+        if (untrimmed(lesson.body).length <= MIN_LESSON_BODY_CHARS) continue;
+        if (longest === -1 || untrimmed(lesson.body).length > untrimmed(lessons[longest]!.body).length) longest = index;
+      }
+      if (longest !== -1) {
+        const lesson = lessons[longest]!;
+        const body = untrimmed(lesson.body);
+        const allowed = Buffer.byteLength(lesson.body, 'utf8') - (size - capBytes) - Buffer.byteLength(TRIM_MARKER, 'utf8');
+        const cut = Math.max(prefixWithinBytes(body, allowed), safeSlice(body, MIN_LESSON_BODY_CHARS).length);
+        lessons[longest] = { ...lesson, body: `${body.slice(0, cut).trimEnd()}${TRIM_MARKER}` };
+        trimmed += 1;
+        size = serialized();
+        return true;
+      }
+    }
+    // (1) shorten the longest body that can still give something up: its
+    // RETAINED text — after the trailing-whitespace trim — never below the
+    // floor (R6-06).
     let longest = -1;
+    let cuts: number[] = [];
     for (let index = 0; index < lessons.length; index += 1) {
       const lesson = lessons[index]!;
       if (lesson.slug === ARCHIVED_LESSON_SLUG) continue;
-      if (untrimmed(lesson.body).length <= MIN_LESSON_BODY_CHARS) continue;
-      if (longest === -1 || untrimmed(lesson.body).length > untrimmed(lessons[longest]!.body).length) longest = index;
+      const body = untrimmed(lesson.body);
+      if (body.length <= MIN_LESSON_BODY_CHARS) continue;
+      if (longest !== -1 && body.length <= untrimmed(lessons[longest]!.body).length) continue;
+      const candidate = retainedCuts(body);
+      if (candidate.length === 0) continue;
+      longest = index;
+      cuts = candidate;
     }
-    if (longest !== -1) {
+    if (contract !== 1 && longest !== -1) {
       const lesson = lessons[longest]!;
       const body = untrimmed(lesson.body);
       const withCut = (cut: number): BibleLesson[] => lessons.map((other, index) =>
         index === longest ? { ...lesson, body: `${body.slice(0, cut).trimEnd()}${TRIM_MARKER}` } : other);
       // Bytes as WRITTEN (the supplied measure: CRLF and in-place
       // formatting included, R5-A1): the longest code-point prefix that
-      // fits with its marker, never below the floor. Longer prefixes never
-      // measure smaller, so the search is a bisection.
-      const cuts = codePointCuts(body, safeSlice(body, MIN_LESSON_BODY_CHARS).length);
+      // fits with its marker. Longer prefixes never measure smaller, so the
+      // search is a bisection.
       let best = 0;
       for (let low = 1, high = cuts.length - 1; low <= high;) {
         const mid = (low + high) >> 1;
@@ -2028,11 +2135,19 @@ export function enforceChapterCap(
   return { chapter: { ...chapter, lessons }, text, provenanceTrimmed, trimmed, droppedLessons, droppedProvenance };
 }
 
-/** Every code-point boundary of `text` from `from` (itself a boundary) up
- * to, not including, its end — each a strictly shorter prefix. */
-function codePointCuts(text: string, from: number): number[] {
+/** The code-point boundaries a body may be cut at — each a strictly
+ * shorter prefix whose text, once its trailing whitespace is trimmed,
+ * still keeps at least the floor (R6-06). Ascending. */
+function retainedCuts(body: string): number[] {
+  const floor = safeSlice(body, MIN_LESSON_BODY_CHARS).length;
   const cuts: number[] = [];
-  for (let offset = from; offset < text.length; offset += (text.codePointAt(offset)! > 0xffff ? 2 : 1)) cuts.push(offset);
+  let kept = 0; // the trimmed length of body[0, offset)
+  for (let offset = 0; offset < body.length;) {
+    const width = body.codePointAt(offset)! > 0xffff ? 2 : 1;
+    if (offset > 0 && kept >= floor) cuts.push(offset);
+    if (!/^\s$/u.test(body.slice(offset, offset + width))) kept = offset + width;
+    offset += width;
+  }
   return cuts;
 }
 

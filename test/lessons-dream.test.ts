@@ -1004,6 +1004,29 @@ describe('owner-approved lesson proposals (owner decision 2026-10-07)', () => {
     expect(notifier.resolved).toHaveLength(1);
   });
 
+  it('an Accept recorded under the first release finishes after the upgrade with exactly the approved bytes (R6-01)', async () => {
+    const fixture = JSON.parse(readFileSync(join(import.meta.dirname, 'fixtures', 'lessons-plan-contract-1.json'), 'utf8')) as {
+      plan: { before: { path: string; text: string | null }[]; writes: { slug: string; text: string }[]; indexText: string; contract?: number };
+    };
+    expect(fixture.plan.contract).toBeUndefined();
+    const h = proposalHarness();
+    mkdirSync(h.bible.chaptersDir, { recursive: true });
+    for (const entry of fixture.plan.before) if (entry.text !== null) writeFileSync(join(h.bible.dir, entry.path), entry.text);
+    const entry = h.journal.append({ kind: 'finding', source: 'gru', body: 'shell hang finding' });
+    await h.engine.run(); // a proposal on the same baseline book
+    const { notificationId } = h.proposals.review()!;
+    // The stored record, as the first release left it: its plan, its Accept.
+    h.store({ ...h.stored(), plan: fixture.plan, decision: { kind: 'accepted', at: '2026-10-08T00:00:00.000Z', detail: null } });
+    const notifier = new FakeNotifier();
+    const upgraded = new LessonProposals({ bible: new BibleStore(h.bible.dir), notifier });
+    expect(upgraded.reconcile()).toBeNull();
+    for (const write of fixture.plan.writes) expect(readFileSync(join(h.bible.chaptersDir, `${write.slug}.md`), 'utf8')).toBe(write.text);
+    expect(readFileSync(join(h.bible.dir, 'INDEX.md'), 'utf8')).toBe(fixture.plan.indexText);
+    expect(cursor(h.bible)).toBe(entry.seq);
+    expect(notifier.resolved).toEqual([{ id: notificationId, by: 'owner:accepted' }]);
+    expect(existsSync(h.file)).toBe(false);
+  });
+
   it('closing keeps the record until the notice is resolved: a failed resolve is finished later, not lost', async () => {
     const h = proposalHarness();
     const entry = h.journal.append({ kind: 'finding', source: 'gru', body: 'shell hang finding' });

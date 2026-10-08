@@ -264,31 +264,42 @@ describe('compiled service: startup finishes a recorded decision without another
     }
   }
 
-  for (const phase of ['partially-applied', 'cursor-persisted', 'committed-cleanup'] as const) {
-    it(`${phase}: the restart writes exactly the plan, advances the cursor, resolves the row and removes the record`, async () => {
-      const { home, file, record, throughSeq } = await interruptedAccept(phase);
-      const workspace = mkdtempSync(join(tmpdir(), 'gru-dream-restart-workspace-'));
-      cleanup.push(workspace);
-      const service = await startRealService({
-        port: await pickFreePort(), token: 'dream-restart-token', home, workspace, keepHome: true, requireWebDist: false,
-      });
-      try {
-        await vi.waitFor(() => expect(existsSync(file)).toBe(false), { timeout: 20_000, interval: 250 });
-      } finally {
-        await service.stop();
-      }
-      const bibleDir = join(home, 'bible');
-      for (const write of record.plan.writes) {
-        expect(readFileSync(join(bibleDir, 'chapters', `${write.slug}.md`), 'utf-8')).toBe(write.text);
-      }
-      expect(readFileSync(join(bibleDir, 'INDEX.md'), 'utf-8')).toBe(record.plan.indexText);
-      expect(loadDreamState(join(bibleDir, DREAM_STATE_FILE)).coveredThroughSeq).toBe(throughSeq);
-      const db = new DatabaseSync(join(home, 'ledger', 'ledger.db'), { readOnly: true });
-      try {
-        expect(db.prepare('SELECT resolved_by FROM notifications WHERE id = ?').get(record.notificationId)).toEqual({ resolved_by: 'owner:accepted' });
-      } finally {
-        db.close();
-      }
-    }, 60_000);
+  /** One restart case (R6-07: each phase is its own registered test). */
+  async function restartFinishes(phase: 'partially-applied' | 'cursor-persisted' | 'committed-cleanup'): Promise<void> {
+    const { home, file, record, throughSeq } = await interruptedAccept(phase);
+    const workspace = mkdtempSync(join(tmpdir(), 'gru-dream-restart-workspace-'));
+    cleanup.push(workspace);
+    const service = await startRealService({
+      port: await pickFreePort(), token: 'dream-restart-token', home, workspace, keepHome: true, requireWebDist: false,
+    });
+    try {
+      await vi.waitFor(() => expect(existsSync(file)).toBe(false), { timeout: 20_000, interval: 250 });
+    } finally {
+      await service.stop();
+    }
+    const bibleDir = join(home, 'bible');
+    for (const write of record.plan.writes) {
+      expect(readFileSync(join(bibleDir, 'chapters', `${write.slug}.md`), 'utf-8')).toBe(write.text);
+    }
+    expect(readFileSync(join(bibleDir, 'INDEX.md'), 'utf-8')).toBe(record.plan.indexText);
+    expect(loadDreamState(join(bibleDir, DREAM_STATE_FILE)).coveredThroughSeq).toBe(throughSeq);
+    const db = new DatabaseSync(join(home, 'ledger', 'ledger.db'), { readOnly: true });
+    try {
+      expect(db.prepare('SELECT resolved_by FROM notifications WHERE id = ?').get(record.notificationId)).toEqual({ resolved_by: 'owner:accepted' });
+    } finally {
+      db.close();
+    }
   }
+
+  it('partially-applied: the restart writes exactly the plan, advances the cursor, resolves the row and removes the record', async () => {
+    await restartFinishes('partially-applied');
+  }, 60_000);
+
+  it('cursor-persisted: the restart writes exactly the plan, advances the cursor, resolves the row and removes the record', async () => {
+    await restartFinishes('cursor-persisted');
+  }, 60_000);
+
+  it('committed-cleanup: the restart writes exactly the plan, advances the cursor, resolves the row and removes the record', async () => {
+    await restartFinishes('committed-cleanup');
+  }, 60_000);
 });

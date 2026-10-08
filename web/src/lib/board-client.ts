@@ -82,6 +82,8 @@ export class BoardClient {
   private fetchSeq = 0;
   /** One trailing refetch is in flight (C13); later discards coalesce. */
   private trailingRefetch = false;
+  /** A discard happened while it was in flight: one successor is owed. */
+  private refreshOwed = false;
 
   constructor(
     options: BoardClientOptions,
@@ -307,18 +309,30 @@ export class BoardClient {
       if (this.stopped || request !== this.fetchSeq) return;
       if (epoch === this.snapshotEpoch) {
         this.events.snapshot(snapshot);
-      } else if (!this.trailingRefetch) {
+      } else if (this.trailingRefetch) {
+        // R6-04: a refetch is already trailing — remember the demand, so
+        // it is drained once that one settles (never forgotten).
+        this.refreshOwed = true;
+      } else {
         // C13: the push that won may itself be OLDER (queued before a
         // decision this answer already shows). Ask once more — one
         // coalesced trailing refetch — so the newest truth still lands.
-        this.trailingRefetch = true;
-        void this.refetchSnapshot().finally(() => {
-          this.trailingRefetch = false;
-        });
+        this.startTrailingRefetch();
       }
     } catch {
       /* connection state carries the error surface */
     }
+  }
+
+  private startTrailingRefetch(): void {
+    this.trailingRefetch = true;
+    void this.refetchSnapshot().finally(() => {
+      this.trailingRefetch = false;
+      if (this.refreshOwed && !this.stopped) {
+        this.refreshOwed = false;
+        this.startTrailingRefetch();
+      }
+    });
   }
 
   /** Re-run the bounded decision-provider startup check; no credential crosses HTTP. */
