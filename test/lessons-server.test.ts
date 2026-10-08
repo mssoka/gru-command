@@ -411,4 +411,50 @@ describe('lesson proposals over HTTP (owner decision 2026-10-07)', () => {
       await h.close();
     }
   });
+
+  it('a fresh Accept or Reject whose durable intent cannot be saved is unconfirmed (500) — never "recorded" — and nothing moves (R10-05)', async () => {
+    for (const decision of ['accept', 'reject'] as const) {
+      const h = await boot();
+      try {
+        const { id, notificationId } = await propose(h);
+        const file = join(h.bible.dir, PROPOSAL_FILE);
+        const record = readFileSync(file);
+        const book = h.bible.fingerprint();
+        const state = loadDreamState(join(h.bible.dir, DREAM_STATE_FILE));
+        // The decision's own durable write fails, before any intent exists.
+        vi.spyOn(h.proposals as unknown as { write: (proposal: unknown) => void }, 'write').mockImplementationOnce(() => {
+          throw new Error('disk full');
+        });
+        const answer = await call(h.port, 'POST', `/api/lessons/proposal/${id}/${decision}`, {}, TOKEN);
+        expect(answer.status, decision).toBe(500);
+        expect(answer.json, decision).toMatchObject({ error: 'proposal_unconfirmed', detail: expect.stringContaining('disk full') });
+        expect(readFileSync(file).equals(record), decision).toBe(true);
+        expect(h.bible.fingerprint(), decision).toBe(book);
+        expect(loadDreamState(join(h.bible.dir, DREAM_STATE_FILE)), decision).toEqual(state);
+        const review = await call(h.port, 'GET', '/api/lessons/proposal', undefined, TOKEN);
+        expect(review.json, decision).toMatchObject({ id, decision: null, recovery: null });
+        expect(h.ledger.getNotification(notificationId)?.resolvedAt, decision).toBeNull();
+      } finally {
+        await h.close();
+      }
+    }
+  });
+
+  it('a storage failure is an unconfirmed outcome (500), never a refusal — after a recorded Accept moved the book (C8)', async () => {
+    const h = await boot();
+    try {
+      const { id } = await propose(h);
+      vi.spyOn(h.ledger, 'resolveNotificationById').mockImplementationOnce(() => {
+        throw new Error('ledger is busy');
+      });
+      expect((await call(h.port, 'POST', `/api/lessons/proposal/${id}/accept`, {}, TOKEN)).status).toBe(202);
+      expect(cursor(h.bible)).toBe(1); // applied
+      writeFileSync(join(h.bible.dir, PROPOSAL_FILE), '{ not a record');
+      const retry = await call(h.port, 'POST', `/api/lessons/proposal/${id}/accept`, {}, TOKEN);
+      expect(retry.status).toBe(500);
+      expect(retry.json).toMatchObject({ error: 'proposal_unconfirmed' });
+    } finally {
+      await h.close();
+    }
+  });
 });

@@ -21,6 +21,7 @@
 
 import {
   agentActivityOf,
+  ARCHIVED_LESSON_SLUG,
   agentRailBand,
   agentRuntimeOf,
   agentStateTone,
@@ -645,7 +646,7 @@ export class BoardView {
           if (error instanceof BoardApiError && error.status === 404) {
             // Decided elsewhere before this page loaded it: an unknown
             // outcome, not a failure — refresh to show what happened.
-            current.message = describeDecisionFailure(error);
+            current.message = describeDecisionFailure(error, current.recorded);
             client?.wake();
           } else {
             current.message = `Couldn’t load the proposal: ${describeProposalError(error)}`;
@@ -718,10 +719,13 @@ export class BoardView {
           // Decided elsewhere: drop the cached review so the next load
           // brings the recorded decision (and its lock) with it.
           if (error instanceof BoardApiError && error.code === 'proposal_decided') current.review = null;
-          // Gone: maybe decided here (a lost reply) or on another device —
-          // refresh, so the snapshot shows what actually happened.
-          if (error instanceof BoardApiError && error.status === 404) client.wake();
-          current.message = describeDecisionFailure(error);
+          // Gone, or an outcome nobody confirmed: maybe decided here (a
+          // lost reply) or on another device — refresh, so the snapshot
+          // shows what actually happened. A recorded intent is kept.
+          const proven = error instanceof BoardApiError &&
+            ['proposal_stale', 'proposal_decided', 'proposal_mismatch'].includes(error.code ?? '');
+          if (!proven) client.wake();
+          current.message = describeDecisionFailure(error, current.recorded);
           this.rerenderOwner();
         });
     };
@@ -755,9 +759,22 @@ export class BoardView {
     go.addEventListener('click', () => {
       this.notificationPanel.hidden = true;
       this.notificationBell.dataset.open = 'false';
+      // C3: an older proposal can sit behind the band's window — reveal the
+      // whole owner list before looking for it.
+      if (!this.ownerExpanded) {
+        this.ownerExpanded = true;
+        this.rerenderOwner();
+      }
       const target = document.querySelector<HTMLElement>(`#board-owner [data-proposal-id="${CSS.escape(item.id)}"]`);
-      target?.scrollIntoView?.({ block: 'center' });
-      target?.querySelector<HTMLElement>('.board-owner__review > summary')?.focus();
+      const landing = target?.querySelector<HTMLElement>('.board-owner__review > summary') ?? null;
+      if (target === null || landing === null) {
+        // Nothing to land on (already decided): focus never stays inside
+        // the hidden panel.
+        this.notificationBell.focus();
+        return;
+      }
+      target.scrollIntoView?.({ block: 'center' });
+      landing.focus();
     });
     node.append(go);
     return node;
@@ -2432,19 +2449,27 @@ function describeProposalError(error: unknown): string {
  * (stale, already decided, mismatched), a proposal that is gone — whose
  * outcome is unknown, not refused — or an ambiguous network failure. A
  * decision that is recorded but blocked arrives as 202 incomplete instead. */
-function describeDecisionFailure(error: unknown): string {
+function describeDecisionFailure(error: unknown, recorded: 'accept' | 'reject' | null): string {
   if (error instanceof BoardApiError) {
+    // "Not applied" only where the server PROVED nothing happened (C8).
     if (error.code === 'proposal_stale') {
       return `Not applied — ${error.detail ?? 'the Book of Lessons changed'}. A fresh proposal will follow.`;
     }
     if (error.code === 'proposal_decided') return `Not applied — ${error.detail ?? 'this proposal was already decided'}.`;
+    if (error.code === 'proposal_mismatch') return `Not applied — ${error.detail ?? 'this is not the pending proposal'}.`;
     if (error.status === 404) {
       return 'This proposal is no longer pending — it may already have been decided, here or on another device. ' +
         'The board is refreshing; check the Book of Lessons or the receipt for what happened.';
     }
-    return `Not applied — the server refused (${error.status}${error.detail !== null ? `: ${error.detail}` : ''}).`;
   }
-  return `Couldn’t confirm the decision (${describeProposalError(error)}) — it may not have been recorded; check the book or retry.`;
+  const reason = error instanceof BoardApiError
+    ? `the server failed (${error.status}${error.detail !== null ? `: ${error.detail}` : ''})`
+    : describeProposalError(error);
+  if (recorded !== null) {
+    const label = recorded === 'accept' ? 'Accept' : 'Reject';
+    return `Your ${label} is recorded, but finishing it could not be confirmed (${reason}). The board is refreshing; press ${label} again to finish it.`;
+  }
+  return `Couldn’t confirm the decision (${reason}) — it may or may not have been recorded. The board is refreshing; check the book or retry.`;
 }
 
 const tagsLine = (tags: readonly string[]): string => tags.join(', ') || '—';
@@ -2534,10 +2559,15 @@ function renderProposalReview(proposal: LessonProposalView, nested: Set<string>,
   return root;
 }
 
+/** How the review names a record: the archive record says what it is. */
+function reviewName(slug: string): string {
+  return slug === ARCHIVED_LESSON_SLUG ? 'archive record (journal handles of dropped lessons)' : slug;
+}
+
 function reviewLesson(label: string, lesson: LessonChangeView, chapterSlug: string, nested: Set<string>, focusBase: string): HTMLElement {
   const node = el('div', 'board-owner__review-lesson');
   node.append(
-    el('div', 'lbl board-owner__review-label', `${label} · ${lesson.slug}`),
+    el('div', 'lbl board-owner__review-label', `${label} · ${reviewName(lesson.slug)}`),
     el('div', 'board-owner__review-text', lesson.body),
   );
   if (lesson.previousTags === null) {
@@ -2574,7 +2604,7 @@ function reviewRemoved(lesson: RemovedLessonView): HTMLElement {
     el(
       'div',
       'lbl board-owner__review-label',
-      `${REMOVED_LABEL[lesson.reason]} · ${lesson.slug} (recurred ${lesson.recurred})`,
+      `${REMOVED_LABEL[lesson.reason]} · ${reviewName(lesson.slug)} (recurred ${lesson.recurred})`,
     ),
     el('div', 'board-owner__review-text', lesson.body),
   );

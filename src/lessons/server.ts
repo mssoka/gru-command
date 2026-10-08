@@ -155,7 +155,13 @@ export function createLessonsServer(options: LessonsServerOptions): LessonsServe
       try {
         json(res, 200, kind === 'accepted' ? proposals.accept(id) : proposals.reject(id));
       } catch (error) {
-        if (!(error instanceof ProposalError)) throw error;
+        if (!(error instanceof ProposalError)) {
+          // Storage or integrity trouble is not a refusal (C8): the decision
+          // may already be partly applied, so its outcome is unconfirmed.
+          json(res, 500, { error: 'proposal_unconfirmed', detail: error instanceof Error ? error.message : String(error) });
+          log('error', 'lesson proposal decision outcome unconfirmed', { id, decision: kind, detail: String(error) });
+          return true;
+        }
         if (error.code === 'incomplete') {
           // The decision IS recorded; finishing it failed and resumes on
           // retry or at startup — never reported as "not applied".

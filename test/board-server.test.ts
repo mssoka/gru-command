@@ -890,6 +890,18 @@ describe('board server — empty token config locks every door', () => {
       expect(refused.body).toMatchObject({ error: 'decision_required' });
       expect(api.getNotification(proposal.id)).toMatchObject({ ackedAt: null, resolvedAt: null });
       expect(acked).toEqual([row.id]);
+      // A failing dream's incident closes only on a completed pass (owner
+      // decision 2026-10-08): Gru's disposition is refused, the row stays open.
+      const dreamFailed = notifications.post({
+        kind: 'lessons.dream-failed',
+        routing: 'action-required',
+        severity: 'error',
+        title: 'Lesson dream is failing — the Book of Lessons is not being updated',
+      });
+      const disposed = await postJson(port, `/api/notifications/${dreamFailed.id}/disposition`, 'ack-token', { detail: 'opened a repair lane' });
+      expect(disposed.status).toBe(409);
+      expect(disposed.body).toMatchObject({ error: 'producer_resolved', detail: expect.stringContaining('a completed dream pass') });
+      expect(api.getNotification(dreamFailed.id)).toMatchObject({ resolvedAt: null, ackedAt: null });
     } finally {
       await board.dispose();
       await new Promise<void>((resolveClose) => {

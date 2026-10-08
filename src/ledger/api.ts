@@ -382,6 +382,19 @@ export type NotificationRouting = (typeof NOTIFICATION_ROUTINGS)[number];
 export const NOTIFICATION_SEVERITIES = ['info', 'error'] as const;
 export type NotificationSeverity = (typeof NOTIFICATION_SEVERITIES)[number];
 
+/** Alerts only their producer closes (owner decision 2026-10-08): a failing
+ * lesson dream's incident resolves when a dream pass completes. A Gru
+ * disposition would close it while nothing recovered — and restart the
+ * failure streak at pass 1 on the next failing beat. Value: what closes it. */
+const PRODUCER_RESOLVED_KINDS: Readonly<Record<string, string>> = {
+  'lessons.dream-failed': 'a completed dream pass',
+};
+
+/** What closes a producer-resolved alert kind, or null for any other kind. */
+export function producerResolvedBy(kind: string): string | null {
+  return Object.hasOwn(PRODUCER_RESOLVED_KINDS, kind) ? PRODUCER_RESOLVED_KINDS[kind]! : null;
+}
+
 export function isOwnerHeldNotificationKind(kind: string): boolean {
   // NOTE (provider-recovery machine-ownership amendment, 2026-09-29): the
   // `supervision.provider-wall.*` family is deliberately NOT force-held
@@ -4371,6 +4384,10 @@ export class LedgerApi {
       if (current === null) return null;
       if (current.routing !== 'action-required') {
         throw new Error('only action-required notifications accept a Gru disposition; owner stops require owner acknowledgement');
+      }
+      const closer = producerResolvedBy(current.kind);
+      if (closer !== null) {
+        throw new Error(`${current.kind} closes itself on ${closer} — fix its cause and leave the alert open; a disposition is refused`);
       }
       if (current.resolvedAt !== null || current.ackedAt !== null) return current;
       this.db.prepare('UPDATE notifications SET resolved_at = ?, resolved_by = ? WHERE id = ?')
