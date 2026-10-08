@@ -5,7 +5,7 @@ import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'n
 import { basename, join, resolve } from 'node:path';
 import type { LogLevel } from '../logger.js';
 import { DEFAULT_REVIEW_CHILDREN } from '../config.js';
-import type { JobStatus, LedgerApi, RoundRecord, RoundVerdict } from '../ledger/api.js';
+import type { EventRecord, JobStatus, LedgerApi, RoundRecord, RoundVerdict } from '../ledger/api.js';
 import { requireSafeRecordId } from '../ledger/api.js';
 import { isJobTerminal } from '../ledger/states.js';
 import type { WorktreeLane, WorktreePort } from './worktree-port.js';
@@ -15,6 +15,7 @@ import {
   laneIsBusy,
   laneBranch,
   normalizeBranch,
+  openAttemptStartSeq,
   resolveReviewTargetBranch,
   type BranchIdleBlocker,
   type BranchIdlePhase,
@@ -56,7 +57,7 @@ import {
   CI_GREEN_EVENT,
   type CiEvidenceRecord,
 } from '../review-inputs/ci-evidence.js';
-import { admissionPreflight, ADMISSION_REMOTE_PROBE_TIMEOUT_MS, ReviewAdmissionError } from './perkins-review/admission.js';
+import { admissionPreflight, ADMISSION_REMOTE_PROBE_TIMEOUT_MS, ReviewAdmissionError, type AdmissionMissingInput } from './perkins-review/admission.js';
 import { evidenceRequestFingerprint, type ReviewEvidenceRequest } from '../review-inputs/evidence.js';
 import { parseGitHubPrUrl } from './github-poll.js';
 import {
@@ -1376,6 +1377,14 @@ export interface WaveRunnerOptions {
   readonly retrySettlement?: (agentId: string) => Promise<RetrySettlement>;
   readonly poster?: VerdictPoster;
   readonly escalate?: (title: string, detail: string, context?: EscalationContext) => void;
+  /** FYI channel, never action-required: an automatic admission retry was
+   * scheduled or skipped. Absent = the durable ledger trail only. */
+  readonly inform?: (title: string, detail: string, context?: EscalationContext) => void;
+  /** Bounded automatic retry of a TRANSIENT admission refusal (owner
+   * decision 2026-10-08): the wait before each retry, in order. Default
+   * {@link ADMISSION_RETRY_DELAYS_MS}; the action-required escalation
+   * follows only the refusal of the last retry. */
+  readonly admissionRetryDelaysMs?: readonly number[];
   /** Stable service-owned root. Required for every production review. */
   readonly reviewArtifactRoot?: string;
   /** The service uploads dir (`<data_dir>/uploads`): the ONLY namespace an
@@ -1444,6 +1453,61 @@ function fallbackWorkingStartedSince(ledger: LedgerApi, jobId: string, baselineS
     (event.payload as { to?: unknown }).to === 'working');
 }
 
+/** Owner decision 2026-10-08: two automatic retries, one and five minutes
+ * after a transient admission refusal. */
+export const ADMISSION_RETRY_DELAYS_MS: readonly number[] = [60_000, 300_000];
+
+/** The request a scheduled admission retry re-submits — never `force`,
+ * which authorizes only the blockers present at its own arm. */
+interface AdmissionRetryInput {
+  readonly jobId: string;
+  readonly targetRef?: string;
+  readonly lenses?: readonly string[];
+  readonly noSpec?: boolean;
+  readonly evidence?: readonly ReviewEvidenceRequest[];
+  readonly claimedFixedPriors?: readonly number[];
+}
+
+/** One durable `round.admission-retry-scheduled` record: the refused round,
+ * the delivery it reviewed, and when the retry is due. */
+interface AdmissionRetryRecord {
+  readonly scheduledSeq: number;
+  readonly attempt: number;
+  readonly roundId: string;
+  readonly deliverySeq: number;
+  readonly dueAt: string;
+  readonly input: AdmissionRetryInput;
+}
+
+function admissionRetryInput(input: AdmissionRetryInput): AdmissionRetryInput {
+  return {
+    jobId: input.jobId,
+    ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
+    ...(input.lenses !== undefined ? { lenses: input.lenses } : {}),
+    ...(input.noSpec !== undefined ? { noSpec: input.noSpec } : {}),
+    ...(input.evidence !== undefined ? { evidence: input.evidence } : {}),
+    ...(input.claimedFixedPriors !== undefined ? { claimedFixedPriors: input.claimedFixedPriors } : {}),
+  };
+}
+
+/** The durable record behind a `round.admission-retry-scheduled` event, or
+ * null when the event does not carry one this build can re-submit. */
+function admissionRetryRecord(event: EventRecord): AdmissionRetryRecord | null {
+  const payload = event.payload as {
+    readonly attempt?: unknown; readonly dueAt?: unknown; readonly deliverySeq?: unknown; readonly input?: unknown;
+  } | null;
+  const input = payload?.input as { readonly jobId?: unknown } | null | undefined;
+  if (event.jobId === null || event.roundId === null || payload === null ||
+    !Number.isSafeInteger(payload.attempt) || typeof payload.dueAt !== 'string' || Number.isNaN(Date.parse(payload.dueAt)) ||
+    !Number.isSafeInteger(payload.deliverySeq) || typeof input !== 'object' || input === null || input.jobId !== event.jobId) {
+    return null;
+  }
+  return {
+    scheduledSeq: event.seq, attempt: payload.attempt as number, roundId: event.roundId,
+    deliverySeq: payload.deliverySeq as number, dueAt: payload.dueAt, input: admissionRetryInput(input as AdmissionRetryInput),
+  };
+}
+
 export class WaveRunner {
   private readonly opts: WaveRunnerOptions;
   private readonly log: Log;
@@ -1462,10 +1526,18 @@ export class WaveRunner {
   }>();
   private readonly stopHandoffListener: () => void;
   private shuttingDown = false;
+  /** Armed admission retries, one per job; the ledger holds the durable copy. */
+  private readonly admissionRetries = new Map<string, { readonly record: AdmissionRetryRecord; readonly timer: NodeJS.Timeout }>();
+  private readonly admissionRetryDelaysMs: readonly number[];
 
   constructor(opts: WaveRunnerOptions) {
     this.opts = opts;
     this.log = opts.log ?? (() => {});
+    const delays = opts.admissionRetryDelaysMs ?? ADMISSION_RETRY_DELAYS_MS;
+    if (delays.some((delay) => !Number.isSafeInteger(delay) || delay < 0)) {
+      throw new Error(`admissionRetryDelaysMs must be non-negative whole milliseconds, got [${delays.join(', ')}]`);
+    }
+    this.admissionRetryDelaysMs = delays;
     this.stopHandoffListener = opts.bus?.subscribe((event) => {
       if (event.jobId === null) return;
       const pending = this.handoffs.get(event.jobId);
@@ -1556,6 +1628,9 @@ export class WaveRunner {
     for (const pending of this.handoffs.values()) pending.resolve();
     this.handoffs.clear();
     this.shuttingDown = true;
+    // A scheduled admission retry stays durable: the next start resumes it.
+    for (const { timer } of this.admissionRetries.values()) clearTimeout(timer);
+    this.admissionRetries.clear();
     const deadline = Date.now() + 30_000;
     while (this.activeOperations.size > 0) {
       for (const controller of this.activeControllers) controller.abort();
@@ -2063,6 +2138,9 @@ export class WaveRunner {
     handoff?: boolean;
     /** Internal replay marker; never accepted from the public HTTP endpoint. */
     fromHandoff?: boolean;
+    /** Internal: the automatic admission retry this request is (1-based);
+     * never accepted from the public HTTP endpoint. */
+    admissionRetryAttempt?: number;
   }): Promise<ReviewRequestOutcome> {
     if (this.shuttingDown) throw new Error('Perkins review service is shutting down');
     // Branch-idle still gates the freeze. A minion's own busy turn may
@@ -2502,6 +2580,8 @@ export class WaveRunner {
     claimedFixedPriors?: readonly number[];
     reviewModel?: ReviewPreflightResult['reviewModel'];
     reviewThinkingLevel?: string;
+    /** The automatic admission retry this round is (1-based). */
+    admissionRetryAttempt?: number;
   }): Promise<{ readonly round: RoundRecord; readonly run: Promise<WaveOutcome> }> {
     if (this.shuttingDown) throw new Error('Perkins review service is shutting down');
     if (this.roundAdmission.has(input.jobId)) {
@@ -2514,6 +2594,166 @@ export class WaveRunner {
     } finally {
       this.roundAdmission.delete(input.jobId);
     }
+  }
+
+  /** A refused admission (owner decision 2026-10-08). A TRANSIENT refusal —
+   * every missing input a head-binding git step that failed and was
+   * confirmed stopped — schedules the next bounded automatic retry and
+   * informs; any other refusal, or the last retry's, escalates
+   * action-required. The returned error names what happens next. */
+  private refuseAdmission(
+    roundId: string,
+    input: AdmissionRetryInput & { readonly admissionRetryAttempt?: number },
+    missing: readonly AdmissionMissingInput[],
+  ): ReviewAdmissionError {
+    const { jobId } = input;
+    const title = `Perkins review for job ${jobId} refused admission before any specialist started`;
+    const delays = this.admissionRetryDelaysMs;
+    const attempt = (input.admissionRetryAttempt ?? 0) + 1;
+    const transient = missing.every((entry) => entry.retryable === true);
+    if (!transient || attempt > delays.length) {
+      const refusal = new ReviewAdmissionError(missing, transient && delays.length > 0
+        ? `automatic retry ${delays.length} of ${delays.length} was refused too — no retries remain`
+        : undefined);
+      this.opts.escalate?.(
+        `Perkins review for job ${jobId} refused admission before any specialist started`,
+        refusal.message,
+        { jobId, roundId },
+      );
+      return refusal;
+    }
+    const armed = this.admissionRetries.get(jobId);
+    if (armed !== undefined && input.admissionRetryAttempt === undefined) {
+      // A fresh request refused while a retry waits: that retry stands.
+      const refusal = new ReviewAdmissionError(missing,
+        `automatic retry ${armed.record.attempt} of ${delays.length} is already scheduled for ${armed.record.dueAt}`);
+      this.opts.inform?.(title, refusal.message, { jobId, roundId });
+      return refusal;
+    }
+    const dueAt = new Date(Date.now() + delays[attempt - 1]!).toISOString();
+    const refusal = new ReviewAdmissionError(missing, `automatic retry ${attempt} of ${delays.length} is scheduled for ${dueAt}`);
+    const retryInput = admissionRetryInput(input);
+    const deliverySeq = this.opts.ledger.latestJobEvent(jobId, 'job.delivered')?.seq ?? 0;
+    const scheduled = this.opts.ledger.appendCustomEvent({
+      kind: 'round.admission-retry-scheduled', jobId, roundId,
+      payload: { attempt, of: delays.length, dueAt, deliverySeq, input: retryInput, refusal: refusal.message },
+    });
+    this.armAdmissionRetry({ scheduledSeq: scheduled.seq, attempt, roundId, deliverySeq, dueAt, input: retryInput });
+    this.opts.inform?.(title, refusal.message, { jobId, roundId });
+    return refusal;
+  }
+
+  /** Arm one durable retry. A job holds at most one: an older armed retry
+   * is settled as superseded first, so its record never fires late. */
+  private armAdmissionRetry(record: AdmissionRetryRecord): void {
+    const { jobId } = record.input;
+    const previous = this.admissionRetries.get(jobId);
+    if (previous !== undefined && previous.record.scheduledSeq !== record.scheduledSeq) {
+      clearTimeout(previous.timer);
+      this.admissionRetries.delete(jobId);
+      this.settleAdmissionRetry(previous.record, 'skipped', 'superseded');
+    }
+    if (this.shuttingDown) return; // durable; the next start resumes it
+    const timer = setTimeout(() => {
+      this.fireAdmissionRetry(record).catch((error: unknown) => {
+        this.log('error', 'automatic admission retry crashed', { job: jobId, error: String(error) });
+        this.opts.escalate?.(
+          `Automatic review retry for job ${jobId} crashed`,
+          `Retry ${record.attempt} after refused round ${record.roundId}: ${String(error)}`,
+          { jobId, roundId: record.roundId },
+        );
+      });
+    }, Math.max(0, Date.parse(record.dueAt) - Date.now()));
+    timer.unref();
+    this.admissionRetries.set(jobId, { record, timer });
+  }
+
+  private settleAdmissionRetry(record: AdmissionRetryRecord, outcome: 'fired' | 'skipped', reason?: string): void {
+    this.opts.ledger.appendCustomEvent({
+      kind: `round.admission-retry-${outcome}`, jobId: record.input.jobId, roundId: record.roundId,
+      payload: { attempt: record.attempt, scheduledSeq: record.scheduledSeq, ...(reason !== undefined ? { reason } : {}) },
+    });
+  }
+
+  /** Why a due retry is no longer wanted — the job moved on — or null. */
+  private admissionRetrySkipReason(record: AdmissionRetryRecord): string | null {
+    const job = this.opts.ledger.getJob(record.input.jobId);
+    if (job === null) return 'the job no longer exists';
+    if (!WaveRunner.HANDOFF_AUTHORIZED_STATUSES.has(job.status)) return `the job is ${job.status}`;
+    const deliverySeq = this.opts.ledger.latestJobEvent(job.id, 'job.delivered')?.seq ?? 0;
+    if (deliverySeq !== record.deliverySeq) return 'a newer delivery replaced the refused one';
+    const rounds = this.opts.ledger.listRounds(job.id);
+    if (rounds[rounds.length - 1]?.id !== record.roundId) return 'a newer review round already started';
+    return null;
+  }
+
+  private async fireAdmissionRetry(record: AdmissionRetryRecord): Promise<void> {
+    const { jobId } = record.input;
+    if (this.admissionRetries.get(jobId)?.record !== record) return;
+    this.admissionRetries.delete(jobId);
+    if (this.shuttingDown) return; // durable; the next start resumes it
+    const context = { jobId, roundId: record.roundId };
+    const skipped = this.admissionRetrySkipReason(record);
+    if (skipped !== null) {
+      this.settleAdmissionRetry(record, 'skipped', skipped);
+      this.opts.inform?.(`Automatic review retry for job ${jobId} skipped`,
+        `Retry ${record.attempt} after refused round ${record.roundId} did not run: ${skipped}.`, context);
+      return;
+    }
+    this.settleAdmissionRetry(record, 'fired');
+    try {
+      const outcome = await this.requestReview({ ...record.input, admissionRetryAttempt: record.attempt });
+      void outcome.run.catch((error: unknown) => {
+        this.log('error', 'automatic admission retry failed after admission', { job: jobId, error: String(error) });
+      });
+    } catch (error) {
+      // A refusal already scheduled the next retry or escalated; a shutdown
+      // interruption is terminalized by startup recovery.
+      if (error instanceof ReviewAdmissionError || this.shuttingDown) return;
+      if (error instanceof BranchBusyError) {
+        this.settleAdmissionRetry(record, 'skipped', `the branch is busy: ${error.message}`);
+        this.opts.inform?.(`Automatic review retry for job ${jobId} skipped`,
+          `Retry ${record.attempt} after refused round ${record.roundId} did not run: the branch is busy again (${error.message}). Its next delivery requests a review.`, context);
+        return;
+      }
+      this.opts.ledger.appendCustomEvent({
+        kind: 'round.admission-retry-failed', jobId, roundId: record.roundId,
+        payload: { attempt: record.attempt, scheduledSeq: record.scheduledSeq, error: String(error) },
+      });
+      this.opts.escalate?.(
+        `Automatic review retry for job ${jobId} could not start`,
+        `Retry ${record.attempt} after refused round ${record.roundId} failed before admission: ${String(error)}`,
+        { jobId, roundId: record.roundId },
+      );
+    }
+  }
+
+  /** Restart recovery: re-arm each job's latest scheduled admission retry
+   * that neither fired nor was skipped. One already due fires at once. */
+  resumeAdmissionRetries(): number {
+    let resumed = 0;
+    for (const job of this.opts.ledger.listJobs()) {
+      const scheduled = this.opts.ledger.latestJobEvent(job.id, 'round.admission-retry-scheduled');
+      if (scheduled === null || this.admissionRetries.has(job.id)) continue;
+      const settled = this.opts.ledger
+        .listJobEventsByKinds(job.id, ['round.admission-retry-fired', 'round.admission-retry-skipped'], { limit: 20 })
+        .some((event) => (event.payload as { scheduledSeq?: unknown } | null)?.scheduledSeq === scheduled.seq);
+      if (settled) continue;
+      const record = admissionRetryRecord(scheduled);
+      if (record === null) {
+        this.opts.ledger.appendCustomEvent({ kind: 'round.admission-retry-skipped', jobId: job.id, roundId: scheduled.roundId,
+          payload: { scheduledSeq: scheduled.seq, reason: 'unreadable retry record' } });
+        this.opts.escalate?.(
+          `Automatic review retry for job ${job.id} could not resume`,
+          `The scheduled admission retry (event ${scheduled.seq}) is unreadable after restart; request the review again.`,
+          { jobId: job.id },
+        );
+        continue;
+      }
+      this.armAdmissionRetry(record);
+      resumed += 1;
+    }
+    return resumed;
   }
 
   /** Direct, lane-independent re-proof of the CURRENT fallback-admission
@@ -3051,6 +3291,8 @@ export class WaveRunner {
     claimedFixedPriors?: readonly number[];
     reviewModel?: ReviewPreflightResult['reviewModel'];
     reviewThinkingLevel?: string;
+    /** The automatic admission retry this round is (1-based). */
+    admissionRetryAttempt?: number;
   }, setupSignal: AbortSignal): Promise<{ readonly round: RoundRecord; readonly run: Promise<WaveOutcome> }> {
     if (this.shuttingDown || setupSignal.aborted) throw new Error('Perkins review service is shutting down');
     const policy = (this.opts.reviewPolicyLoader ?? loadPerkinsPolicy)();
@@ -3194,6 +3436,8 @@ export class WaveRunner {
       throw new Error('review ownership changed during reconciliation; retry after the active round settles');
     }
     const flippedFrom = job.status === 'working' || job.status === 'blocked' ? job.status : null;
+    // A setup failure restores `working` as the SAME attempt, never a reopen.
+    const attemptStartSeq = flippedFrom === 'working' ? openAttemptStartSeq(this.opts.ledger, job.id) : undefined;
     // The local admission guard covers this runner's awaited setup. The
     // ledger CAS covers other runner instances (or processes) sharing its
     // database: a replaced predecessor or status cannot mint two writers.
@@ -3368,15 +3612,7 @@ export class WaveRunner {
           ...(admission.missing.length > 0 ? { missing: admission.missing } : {}),
         },
       });
-      if (admission.missing.length > 0) {
-        const refusal = new ReviewAdmissionError(admission.missing);
-        this.opts.escalate?.(
-          `Perkins review for job ${job.id} refused admission before any specialist started`,
-          refusal.message,
-          { jobId: job.id, roundId: round.id },
-        );
-        throw refusal;
-      }
+      if (admission.missing.length > 0) throw this.refuseAdmission(round.id, input, admission.missing);
     } catch (error) {
       const failures: unknown[] = [error];
       const interrupted = this.shuttingDown || setupSignal.aborted;
@@ -3414,6 +3650,7 @@ export class WaveRunner {
         try {
           this.opts.ledger.restoreReviewSetupStatus({
             jobId: job.id, roundId: round.id, priorStatus: flippedFrom,
+            ...(attemptStartSeq !== undefined ? { attemptStartSeq } : {}),
           });
         } catch (restoreError) {
           failures.push(restoreError);

@@ -1,10 +1,11 @@
-import { execFile as execFileCallback, execFileSync, spawn, spawnSync } from 'node:child_process';
+import { execFile as execFileCallback, execFileSync, spawn, spawnSync, type SpawnSyncOptions } from 'node:child_process';
 import { readFile as readFileAsync } from 'node:fs/promises';
 import { promisify } from 'node:util';
 
 const execFileAsPromised = promisify(execFileCallback);
-import { createHash } from 'node:crypto';
-import { closeSync, existsSync, fstatSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, unlinkSync, writeFileSync, constants } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import { closeSync, existsSync, fstatSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, rmSync, unlinkSync, writeFileSync, constants } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { BranchIdleTag } from '../branch-idle.js';
 import type { CiEvidenceRecord } from '../../review-inputs/ci-evidence.js';
@@ -171,8 +172,9 @@ function gitFailure(error: unknown): { readonly code: number | null; readonly st
  * its path may even contain those words — is operational. */
 export function refusedBranchName(error: unknown, name: string): boolean {
   const { code, stderr } = gitFailure(error);
-  const refusal = `fatal: '${name}' is not a valid branch name`;
-  return code === 128 && stderr.split(/\r?\n/u).some((line) => line.trim() === refusal);
+  // The WHOLE diagnostic, with at most its terminal newline: a refusal line
+  // embedded in a longer (operational) diagnostic proves nothing.
+  return code === 128 && stderr.replace(/\n$/u, '') === `fatal: '${name}' is not a valid branch name`;
 }
 
 /** `git check-ref-format <ref>` refused the FORMAT: exit 1 is its only
@@ -184,161 +186,247 @@ export function refusedRefFormat(error: unknown): boolean {
 /** Ceiling on what one probe step may print (a ref listing, a name). */
 const PROBE_MAX_OUTPUT_BYTES = 1024 * 1024;
 
-/** One read-only git step in its OWN process group: at its bound — and
- * whenever it ends — the whole group is SIGKILLed, so nothing it spawned (a
- * wrapper's children, ssh, a remote helper) outlives it or overlaps a
- * retry. Contract (owner decision 2026-10-07, R5-4): cleanup covers the
- * step's process group; a helper that deliberately detaches into its own
- * session (ssh ControlPersist, a daemon) is outside it and left alone — and
- * if it holds the step's output open, the answer is refused as incomplete,
- * never accepted. Diagnostics are in the C locale. Rejections carry the numeric exit
- * `code` and `stderr`; a timeout, kill or spawn failure has no numeric code. */
+/** After git exits, how long its output may take to reach a natural end
+ * (a same-group child finishing its write). Output still held open after
+ * this is incomplete — refused, never accepted. */
+const INCOMPLETE_GRACE_MS = 500;
+/** After a SIGKILL, how long cessation of the whole group may take before
+ * the step is refused as "cleanup unconfirmed" (owner decision 2026-10-07,
+ * R6-5: bounded refusal — never an unbounded wait). */
+const KILL_SETTLE_MS = 1_000;
+
+/** Is any process of this group still alive? */
+function groupAlive(pgid: number): boolean {
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+/** A git step that was killed but whose group would not stop within
+ * KILL_SETTLE_MS: refused, and nothing may retry while it might live. */
+function cleanupUnconfirmed(command: string, reason: Error): Error {
+  return Object.assign(new Error(`${command} did not stop after SIGKILL — cleanup unconfirmed (${reason.message})`), {
+    cleanupUnconfirmed: true,
+  });
+}
+
+/** One read-only git step in its OWN process group. Its output counts only
+ * when it ends naturally: git exits and both pipes reach EOF within
+ * INCOMPLETE_GRACE_MS — then the group is killed (anything that let go of
+ * the output). At its time bound, on overflow, or when the output is still
+ * held after that grace, the group is SIGKILLed and the step fails; the
+ * failure settles once the whole group has stopped, or after
+ * KILL_SETTLE_MS as "cleanup unconfirmed" — never an unbounded wait.
+ * Contract (owner decision 2026-10-07, R5-4): cleanup covers the step's
+ * process group; a helper that deliberately detaches into its own session
+ * (ssh ControlPersist, a daemon) is outside it and left alone — and if it
+ * holds the step's output open, the answer is refused as incomplete.
+ * Diagnostics are in the C locale. Rejections carry the numeric exit `code`
+ * and `stderr`; a timeout, kill, spawn failure or incomplete answer has no
+ * numeric code. */
 export function runOwnedGit(repoPath: string, args: readonly string[], timeoutMs: number): Promise<string> {
   return new Promise<string>((resolve, reject) => {
+    const command = `git ${args.join(' ')}`;
     const child = spawn('git', ['-C', repoPath, ...args], {
       detached: true,
       stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...process.env, LC_ALL: 'C' },
     });
+    const pid = child.pid;
     const out: Buffer[] = [];
     const err: Buffer[] = [];
     let outBytes = 0;
     let errBytes = 0;
-    let timedOut = false;
-    let overflow = false;
-    let incomplete = false;
+    let failing = false;
     let settled = false;
-    let fallback: ReturnType<typeof setTimeout> | null = null;
+    let grace: ReturnType<typeof setTimeout> | null = null;
     const killGroup = (): void => {
-      if (child.pid === undefined) return;
+      if (pid === undefined) return;
       try {
-        process.kill(-child.pid, 'SIGKILL');
+        process.kill(-pid, 'SIGKILL');
       } catch {
         /* the group is already gone */
       }
     };
-    const timer = setTimeout(() => {
-      timedOut = true;
+    const settle = (outcome: () => void): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (grace !== null) clearTimeout(grace);
+      outcome();
+    };
+    /** Kill the group, then fail with `reason` once it has stopped — or as
+     * cleanup-unconfirmed when it will not within KILL_SETTLE_MS. */
+    const failAfterKill = (reason: Error): void => {
+      if (failing || settled) return;
+      failing = true;
       killGroup();
-    }, timeoutMs);
+      child.stdout.destroy();
+      child.stderr.destroy();
+      const until = performance.now() + KILL_SETTLE_MS;
+      const check = (): void => {
+        if (pid === undefined || !groupAlive(pid)) return settle(() => reject(reason));
+        if (performance.now() >= until) return settle(() => reject(cleanupUnconfirmed(command, reason)));
+        killGroup();
+        setTimeout(check, 25);
+      };
+      check();
+    };
+    const timer = setTimeout(
+      () => failAfterKill(Object.assign(new Error(`${command} timed out after ${timeoutMs} ms`), { killed: true })),
+      timeoutMs,
+    );
     child.stdout.on('data', (chunk: Buffer) => {
       outBytes += chunk.length;
-      if (outBytes > PROBE_MAX_OUTPUT_BYTES) {
-        overflow = true;
-        killGroup();
-      } else {
-        out.push(chunk);
-      }
+      if (outBytes > PROBE_MAX_OUTPUT_BYTES) failAfterKill(new Error(`${command} printed more than ${PROBE_MAX_OUTPUT_BYTES} bytes`));
+      else out.push(chunk);
     });
     child.stderr.on('data', (chunk: Buffer) => {
       errBytes += chunk.length;
       if (errBytes <= 64 * 1024) err.push(chunk);
     });
-    const finish = (code: number | null, signal: NodeJS.Signals | null, spawnError?: Error): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      if (fallback !== null) clearTimeout(fallback);
-      killGroup(); // nothing of this step survives its outcome
-      const command = `git ${args.join(' ')}`;
-      if (spawnError !== undefined) return reject(spawnError);
-      if (timedOut) return reject(Object.assign(new Error(`${command} timed out after ${timeoutMs} ms`), { killed: true }));
-      if (overflow) return reject(new Error(`${command} printed more than ${PROBE_MAX_OUTPUT_BYTES} bytes`));
-      if (incomplete) {
-        // Whatever git printed may be cut short: never an answer, whatever its exit code.
-        return reject(new Error(`${command} exited, but a process outside its group held its output open — the answer is incomplete`));
-      }
-      const stderr = Buffer.concat(err).toString('utf8');
-      if (code === 0) return resolve(Buffer.concat(out).toString('utf8'));
-      reject(Object.assign(new Error(stderr.trim() || `${command} exited ${code ?? signal}`), {
-        ...(code !== null ? { code } : {}),
-        signal,
-        stderr,
-      }));
-    };
-    child.on('error', (error) => finish(null, null, error));
-    child.on('exit', (code, signal) => {
-      killGroup();
-      // Pipes close once the group is dead; a descendant that escaped the
-      // group must not hold the step open.
-      fallback = setTimeout(() => {
-        incomplete = true;
-        child.stdout.destroy();
-        child.stderr.destroy();
-        finish(code, signal);
-      }, 500);
+    child.on('error', (error) => {
+      if (failing) return;
+      settle(() => {
+        killGroup();
+        reject(error);
+      });
     });
-    child.on('close', (code, signal) => finish(code, signal));
+    child.on('exit', () => {
+      if (failing || settled) return;
+      // Not killed yet: a same-group child may still be finishing the
+      // answer. Only output still held after the grace is incomplete.
+      grace = setTimeout(
+        () => failAfterKill(new Error(`${command} exited, but its output was still held open — the answer is incomplete`)),
+        INCOMPLETE_GRACE_MS,
+      );
+    });
+    child.on('close', (code, signal) => {
+      if (failing) return; // a failure already owns the outcome
+      settle(() => {
+        killGroup(); // whatever let go of the output does not outlive the step
+        const stderr = Buffer.concat(err).toString('utf8');
+        if (code === 0) return resolve(Buffer.concat(out).toString('utf8'));
+        reject(Object.assign(new Error(stderr.trim() || `${command} exited ${code ?? signal}`), {
+          ...(code !== null ? { code } : {}),
+          signal,
+          stderr,
+        }));
+      });
+    });
   });
 }
 
-/** The same owned-group run for the SYNCHRONOUS movement probe: a tiny
- * Node runner owns the group (spawnSync cannot). It publishes the group id
- * on fd 3 first, captures git's output itself within the probe's bound
- * (so the runner's own output never overflows), kills the group at the
- * time bound, on overflow, on an output pipe held open after exit, and
- * whenever git ends — then reports: git's status, or 124 timeout, 125
- * killed or incomplete, 126 overflow, 127 spawn failure. */
+/** The SYNCHRONOUS movement probe's runner. spawnSync starts it detached, so
+ * it leads its own process group and git (spawned normally) joins that
+ * group. It applies the same rules as runOwnedGit — natural end within the
+ * grace, time bound, output bound — writes its outcome to a result file,
+ * then SIGKILLs its whole group, itself included. Its stdio is ignored, so
+ * nothing git spawned can hold the caller's pipes. */
 const OWNED_GROUP_RUNNER = `
 const { spawn } = require('node:child_process');
-const { writeSync } = require('node:fs');
-const [limit, maxBytes, file, ...args] = process.argv.slice(1);
-const child = spawn(file, args, { detached: true, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, LC_ALL: 'C' } });
-if (child.pid !== undefined) writeSync(3, String(child.pid));
-const out = []; const err = []; let outBytes = 0; let errBytes = 0; let done = false; let fallback = null;
-const killGroup = () => { try { process.kill(-child.pid, 'SIGKILL'); } catch {} };
-const finish = (code, message) => {
-  if (done) return; done = true; clearTimeout(timer); if (fallback !== null) clearTimeout(fallback); killGroup();
-  child.stdout.destroy(); child.stderr.destroy();
-  process.exitCode = code;
-  if (code === 0) process.stdout.write(Buffer.concat(out));
-  process.stderr.write(message !== undefined ? message + '\\n' : Buffer.concat(err));
+const { writeFileSync } = require('node:fs');
+const [resultFile, limit, maxBytes, grace, file, ...args] = process.argv.slice(1);
+try { process.kill(-process.pid, 0); } catch {
+  writeFileSync(resultFile, JSON.stringify({ outcome: 'spawn-error', message: 'the probe runner does not lead its own process group' }));
+  process.exit(127);
+}
+const child = spawn(file, args, { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, LC_ALL: 'C' } });
+const out = []; const err = []; let outBytes = 0; let errBytes = 0; let done = false;
+const report = (result) => {
+  if (done) return; done = true;
+  try { writeFileSync(resultFile, JSON.stringify({ ...result, stderr: Buffer.concat(err).toString('utf8') })); } catch {}
+  try { process.kill(-process.pid, 'SIGKILL'); } catch {}
+  process.exit(125);
 };
-const timer = setTimeout(() => finish(124, file + ' timed out after ' + limit + ' ms'), Number(limit));
-child.stdout.on('data', (chunk) => { outBytes += chunk.length; if (outBytes > Number(maxBytes)) finish(126, file + ' printed more than ' + maxBytes + ' bytes'); else out.push(chunk); });
+setTimeout(() => report({ outcome: 'timeout' }), Number(limit));
+child.stdout.on('data', (chunk) => { outBytes += chunk.length; if (outBytes > Number(maxBytes)) report({ outcome: 'overflow' }); else out.push(chunk); });
 child.stderr.on('data', (chunk) => { errBytes += chunk.length; if (errBytes <= 65536) err.push(chunk); });
-child.on('error', (error) => finish(127, String(error)));
-child.on('exit', () => { killGroup(); fallback = setTimeout(() => finish(125, file + ' exited, but a process outside its group held its output open — the answer is incomplete'), 500); });
-child.on('close', (code) => finish(code === null ? 125 : code));
+child.on('error', (error) => report({ outcome: 'spawn-error', message: String(error) }));
+child.on('exit', () => setTimeout(() => report({ outcome: 'incomplete' }), Number(grace)));
+child.on('close', (code, signal) => report({ outcome: code === 0 ? 'ok' : 'failed', code, signal, stdout: code === 0 ? Buffer.concat(out).toString('utf8') : '' }));
 `;
 
+/** Block for `ms` without spinning (the sync probe's bounded settle). */
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
 /** Run one read-only git step synchronously in an owned process group (see
- * OWNED_GROUP_RUNNER). The outer bound only guards the runner; should it
- * fire — or the runner fail any other way — the published group is killed
- * here before the failure is reported. */
-export function runOwnedGitSync(repoPath: string, args: readonly string[], timeoutMs: number, outerTimeoutMs = timeoutMs + 5_000): string {
+ * OWNED_GROUP_RUNNER). Whatever happened — success, failure, the runner
+ * cut off by the outer guard — the runner's group (git and everything it
+ * spawned) is SIGKILLed here, and must stop within KILL_SETTLE_MS or the
+ * step is refused as cleanup-unconfirmed. */
+export function runOwnedGitSync(
+  repoPath: string,
+  args: readonly string[],
+  timeoutMs: number,
+  outerTimeoutMs = timeoutMs + INCOMPLETE_GRACE_MS + 5_000,
+): string {
+  const command = `git ${args.join(' ')}`;
+  const resultFile = join(tmpdir(), `gru-probe-${randomUUID()}.json`);
+  // `detached` makes the runner lead its own process group. Node honors it
+  // for spawnSync (libuv UV_PROCESS_DETACHED) although its type definitions
+  // omit it; the runner refuses to run git if it does not lead a group.
+  const options: SpawnSyncOptions & { readonly detached: boolean } = {
+    detached: true,
+    stdio: 'ignore',
+    timeout: outerTimeoutMs,
+    killSignal: 'SIGKILL',
+  };
   const result = spawnSync(
     process.execPath,
-    ['-e', OWNED_GROUP_RUNNER, String(timeoutMs), String(PROBE_MAX_OUTPUT_BYTES), 'git', '-C', repoPath, ...args],
-    {
-      encoding: 'utf8',
-      maxBuffer: PROBE_MAX_OUTPUT_BYTES * 2,
-      timeout: outerTimeoutMs,
-      killSignal: 'SIGKILL',
-      stdio: ['ignore', 'pipe', 'pipe', 'pipe'],
-    },
+    ['-e', OWNED_GROUP_RUNNER, resultFile, String(timeoutMs), String(PROBE_MAX_OUTPUT_BYTES), String(INCOMPLETE_GRACE_MS), 'git', '-C', repoPath, ...args],
+    options,
   );
-  const group = Number.parseInt(String(result.output?.[3] ?? ''), 10);
-  const killGroup = (): void => {
-    if (!Number.isSafeInteger(group) || group <= 0) return;
+  type RunnerReport = { outcome?: unknown; code?: unknown; signal?: unknown; stdout?: unknown; stderr?: unknown; message?: unknown };
+  const readReport = (): RunnerReport | null => {
     try {
-      process.kill(-group, 'SIGKILL');
+      return JSON.parse(readFileSync(resultFile, 'utf8')) as RunnerReport;
     } catch {
-      /* the group is already gone */
+      return null;
+    } finally {
+      rmSync(resultFile, { force: true });
     }
   };
-  if (result.error !== undefined) {
-    killGroup();
-    throw result.error;
+  const report = readReport();
+  if (result.pid !== undefined) {
+    const until = performance.now() + KILL_SETTLE_MS;
+    for (;;) {
+      try {
+        process.kill(-result.pid, 'SIGKILL');
+      } catch {
+        /* the group is already gone */
+      }
+      if (!groupAlive(result.pid)) break;
+      if (performance.now() >= until) throw cleanupUnconfirmed(command, new Error(String(report?.outcome ?? 'runner ended')));
+      sleepSync(25);
+    }
   }
-  if (result.status !== 0) {
-    killGroup();
-    throw Object.assign(new Error(result.stderr.trim() || `git ${args.join(' ')} exited ${result.status ?? result.signal}`), {
-      status: result.status,
-      stderr: result.stderr,
-    });
+  if (report === null) {
+    throw new Error(`${command}: the probe runner ended without a result${result.error !== undefined ? ` (${result.error.message})` : ''}`);
   }
-  return result.stdout;
+  const stderr = typeof report.stderr === 'string' ? report.stderr : '';
+  switch (report.outcome) {
+    case 'ok':
+      return typeof report.stdout === 'string' ? report.stdout : '';
+    case 'failed':
+      throw Object.assign(new Error(stderr.trim() || `${command} exited ${String(report.code ?? report.signal)}`), {
+        status: typeof report.code === 'number' ? report.code : null,
+        stderr,
+      });
+    case 'timeout':
+      throw Object.assign(new Error(`${command} timed out after ${timeoutMs} ms`), { killed: true });
+    case 'overflow':
+      throw new Error(`${command} printed more than ${PROBE_MAX_OUTPUT_BYTES} bytes`);
+    case 'incomplete':
+      throw new Error(`${command} exited, but its output was still held open — the answer is incomplete`);
+    default:
+      throw new Error(`${command}: ${typeof report.message === 'string' ? report.message : 'the probe runner failed'}`);
+  }
 }
 
 function git(repoPath: string, args: readonly string[], timeoutMs = 30_000): string {
@@ -670,6 +758,15 @@ export type SourceMovementCause = 'target-moved' | 'base-rewritten' | 'base-unre
 export interface SourceMovement {
   readonly cause: SourceMovementCause;
   readonly detail: string;
+  /** A killed git step would not stop: nothing may retry while it might live. */
+  readonly cleanupUnconfirmed?: true;
+}
+
+/** A failed probe step as fail-closed movement — carrying, when the step
+ * would not stop, that nothing may retry while it might live. */
+function failedCheck(error: unknown): SourceMovement {
+  const failed = movement('check-failed', gitErrorDetail(error));
+  return (error as { cleanupUnconfirmed?: unknown } | null)?.cleanupUnconfirmed === true ? { ...failed, cleanupUnconfirmed: true } : failed;
 }
 
 function movement(cause: SourceMovementCause, detail: string): SourceMovement {
@@ -703,7 +800,7 @@ function baseMovementSinceFreeze(review: FrozenReview): SourceMovement | null {
     if ((error as { status?: unknown } | null)?.status === 1) {
       return movement('base-rewritten', `base ${baseRef} no longer descends from ${diffBaseSha}`);
     }
-    return movement('check-failed', gitErrorDetail(error));
+    return failedCheck(error);
   }
 }
 
@@ -823,7 +920,7 @@ export function sourceMovementSinceFreeze(review: FrozenReview, options?: Source
     }
     return null;
   } catch (error) {
-    return movement('check-failed', gitErrorDetail(error));
+    return failedCheck(error);
   }
 }
 
@@ -903,9 +1000,9 @@ export function parseProcUptimeMs(text: string): number | null {
 
 /** The Linux boot clock, read within the evidence allowance; null when it
  * cannot be read in time. */
-async function bootClockMs(io: SuspendEvidenceIo, now: () => number): Promise<number | null> {
+async function bootClockMs(io: SuspendEvidenceIo, now: () => number, deadline?: number): Promise<number | null> {
   try {
-    return parseProcUptimeMs(await withinEvidenceAllowance(() => io.procUptime(), now));
+    return parseProcUptimeMs(await withinEvidenceAllowance(() => io.procUptime(), now, deadline));
   } catch {
     return null;
   }
@@ -928,20 +1025,23 @@ const OS_EVIDENCE: SuspendEvidenceIo = {
  * the deadline and the timer exist BEFORE the reader runs, and an answer
  * that lands at or past the deadline (a slow reader, a stalled event loop)
  * is no evidence. */
-async function withinEvidenceAllowance<T>(read: () => Promise<T>, now: () => number): Promise<T> {
-  const deadline = now() + SUSPEND_EVIDENCE_ALLOWANCE_MS;
+async function withinEvidenceAllowance<T>(
+  read: () => Promise<T>,
+  now: () => number,
+  deadline: number = now() + SUSPEND_EVIDENCE_ALLOWANCE_MS,
+): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const expired = new Promise<never>((_, reject) => {
     timer = setTimeout(
-      () => reject(new Error(`suspend evidence unavailable within ${SUSPEND_EVIDENCE_ALLOWANCE_MS} ms`)),
-      SUSPEND_EVIDENCE_ALLOWANCE_MS,
+      () => reject(new Error('suspend evidence unavailable within its allowance')),
+      Math.max(0, deadline - now()),
     );
   });
   try {
     const reading = read();
     reading.catch(() => {}); // a late failure after the timer won is not unhandled
     const value = await Promise.race([reading, expired]);
-    if (now() >= deadline) throw new Error(`suspend evidence arrived after its ${SUSPEND_EVIDENCE_ALLOWANCE_MS} ms allowance`);
+    if (now() >= deadline) throw new Error('suspend evidence arrived after its allowance');
     return value;
   } finally {
     clearTimeout(timer);
@@ -995,29 +1095,35 @@ export async function probeAdvertisedTipMovementAsync(
   const now = seams.now ?? (() => performance.now());
   const exec = seams.exec ?? defaultProbeExec;
   const io = seams.evidence ?? OS_EVIDENCE;
+  // The first attempt's budget starts NOW: reading the Linux baseline is
+  // charged against it (R6-4), so it can never add to the bound.
+  const firstDeadline = now() + timeoutMs;
   const start: ProbeStart = {
     wallMs: io.wallNow(),
     monoMs: now(),
-    bootMs: io.platform === 'linux' ? await bootClockMs(io, now) : null,
+    bootMs: io.platform === 'linux' ? await bootClockMs(io, now, firstDeadline) : null,
   };
-  const first = await probeAdvertisedTipOnce(review, timeoutMs, now, exec);
+  const first = await probeAdvertisedTipOnce(review, firstDeadline, now, exec);
   if (first === null || first.cause !== 'check-failed') return first;
+  // A git step that would not stop may still be running: never start
+  // another while it might live (owner decision 2026-10-07, R6-5).
+  if (first.cleanupUnconfirmed === true) return first;
   if (!(await osSuspendedSince(start, now, io))) return first;
-  return probeAdvertisedTipOnce(review, timeoutMs, now, exec);
+  return probeAdvertisedTipOnce(review, now() + timeoutMs, now, exec);
 }
 
 async function probeAdvertisedTipOnce(
   review: FrozenReview,
-  timeoutMs: number,
+  deadline: number,
   now: () => number,
   exec: NonNullable<AdmissionProbeSeams['exec']>,
 ): Promise<SourceMovement | null> {
   const { targetRef, targetSha } = review.manifest;
-  // R6-4: ONE cumulative admission budget across every async step — each
-  // call gets only the remaining time, and exhaustion fails closed both
-  // before a step starts and after it settles (a step that finishes past
-  // the deadline proves nothing, success or git rejection alike).
-  const deadline = now() + timeoutMs;
+  // R6-4: ONE cumulative admission budget (an absolute deadline) across
+  // every async step — each call gets only the remaining time, and
+  // exhaustion fails closed both before a step starts and after it settles
+  // (a step that finishes past the deadline proves nothing, success or git
+  // rejection alike).
   const run = async (args: readonly string[]): Promise<string> => {
     const timeout = remainingTimeoutMs(deadline, now());
     if (timeout === null) {
@@ -1028,6 +1134,9 @@ async function probeAdvertisedTipOnce(
     try {
       stdout = await exec(review.manifest.repoPath, args, timeout);
     } catch (error) {
+      // A step that might still be running keeps saying so (R6-5): the
+      // late-budget message must never launder it into a retryable one.
+      if ((error as { cleanupUnconfirmed?: unknown } | null)?.cleanupUnconfirmed === true) throw error;
       if (now() >= deadline) throw late();
       throw error;
     }
@@ -1081,7 +1190,7 @@ async function probeAdvertisedTipOnce(
   try {
     remoteTarget = await identify();
   } catch (error) {
-    return movement('check-failed', gitErrorDetail(error));
+    return failedCheck(error);
   }
   if (remoteTarget === null) return null;
   try {
@@ -1095,7 +1204,7 @@ async function probeAdvertisedTipOnce(
     }
     return null;
   } catch (error) {
-    return movement('check-failed', gitErrorDetail(error));
+    return failedCheck(error);
   }
 }
 

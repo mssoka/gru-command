@@ -1161,12 +1161,15 @@ describe('WaveRunner built-in Perkins production path', () => {
     let ticks = 0;
     const ticker = setInterval(() => { ticks += 1; }, 25);
     try {
-      await expect(wave.runRound({ jobId: job.id })).rejects.toThrow(/head-binding/u);
+      await expect(wave.runRound({ jobId: job.id })).rejects.toThrow(/head-binding.*automatic retry 1 of 2 is scheduled/u);
     } finally {
       clearInterval(ticker);
       if (oldPath === undefined) delete process.env.PATH;
       else process.env.PATH = oldPath;
+      await wave.shutdown(); // the scheduled retry stays durable, never fired here
     }
+    // A stall is transient: one durable retry is scheduled a minute out.
+    expect(ledger.listJobEventsByKinds(job.id, ['round.admission-retry-scheduled'])).toHaveLength(1);
     // Unrelated event-loop work ran THROUGHOUT the stalled probe (the
     // admission probe is off-loop), and the refusal is fail-closed without
     // any spawn.
@@ -7730,5 +7733,162 @@ describe('provider pacing through WaveRunner', () => {
       await wave.shutdown();
       for (const dir of [root, artifacts, sessions]) rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('automatic admission retry (owner decision 2026-10-08)', () => {
+  /** A delivered lane whose advertised-tip probe fails at once while the
+   * shim's flag file exists — git's own failure, so the refusal is the
+   * transient check-failed kind that retries. */
+  async function transientFixture(name: string): Promise<{
+    readonly ledger: LedgerApi; readonly port: GitReviewPort; readonly jobId: string;
+    readonly sessions: string; readonly artifacts: string; readonly flag: string;
+    readonly branch: string; readonly restorePath: () => void;
+  }> {
+    const repo = makeFixtureRepo(`perkins-retry-${name}`);
+    repos.push(repo);
+    const branch = `feature/retry-${name}`;
+    repo.git(['checkout', '-b', branch]);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-retry-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-retry-artifacts-'));
+    const sessions = mkdtempSync(join(tmpdir(), 'perkins-retry-sessions-'));
+    const shimDir = mkdtempSync(join(tmpdir(), 'perkins-retry-shim-'));
+    dirs.push(sessions, shimDir);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-retry-db-')));
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, branch, target);
+    const jobId = `job-retry-${name}`;
+    await port.createJobWorktree({ repoPath: repo.path, jobId });
+    ledger.addJob({ id: jobId, repo: 'fixture', title: 'admission retry', baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(jobId, 'working');
+    settleLane(ledger, jobId);
+    ledger.setJobPr(jobId, 'https://github.com/acme/fixture/pull/61');
+    attachOrigin(repo, branch, root);
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    const flag = join(shimDir, 'remote-down');
+    writeFileSync(flag, '');
+    writeFileSync(join(shimDir, 'git'), `#!/bin/sh\nif [ -e "${flag}" ]; then case " $* " in *" ls-remote "*) echo "fatal: unable to access the remote" >&2; exit 128;; esac; fi\nexec "${realGit}" "$@"\n`);
+    chmodSync(join(shimDir, 'git'), 0o755);
+    const oldPath = process.env.PATH;
+    process.env.PATH = `${shimDir}:${oldPath ?? ''}`;
+    const restorePath = (): void => {
+      if (oldPath === undefined) delete process.env.PATH;
+      else process.env.PATH = oldPath;
+    };
+    return { ledger, port, jobId, sessions, artifacts, flag, branch, restorePath };
+  }
+
+  const kinds = (ledger: LedgerApi, jobId: string, kind: string) =>
+    ledger.listJobEventsByKinds(jobId, [kind], { limit: 50 }).slice().reverse();
+
+  it('retries a transient refusal twice — an FYI per retry, the action-required escalation only after the last refusal', async () => {
+    const fixture = transientFixture('exhausted');
+    const { ledger, port, jobId, sessions, artifacts, branch, restorePath } = await fixture;
+    const informs: string[] = [];
+    const escalations: string[] = [];
+    const wave = new WaveRunner({
+      ledger, worktrees: port, spawner: makeSpawner(sessions, []), reviewArtifactRoot: artifacts,
+      prHeadProbe: localHeadProbe(branch), admissionRetryDelaysMs: [20, 40],
+      inform: (title, detail) => informs.push(`${title}: ${detail}`),
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+    });
+    try {
+      await expect(wave.requestReview({ jobId })).rejects.toThrow(
+        /\[head-binding\].*check-failed.*automatic retry 1 of 2 is scheduled for \d{4}-/u,
+      );
+      expect(escalations).toEqual([]);
+      await vi.waitFor(() => expect(escalations).toHaveLength(1), { timeout: 30_000, interval: 25 });
+    } finally {
+      restorePath();
+      await wave.shutdown();
+    }
+    // Three refused rounds, none spawned: the request and its two retries.
+    const rounds = ledger.listRounds(jobId);
+    expect(rounds.map((round) => round.status)).toEqual(['aborted', 'aborted', 'aborted']);
+    expect(ledger.listAgents().filter((agent) => agent.roundId !== null)).toEqual([]);
+    const scheduled = kinds(ledger, jobId, 'round.admission-retry-scheduled');
+    expect(scheduled.map((event) => [event.roundId, (event.payload as { attempt: number }).attempt]))
+      .toEqual([[rounds[0]!.id, 1], [rounds[1]!.id, 2]]);
+    expect(scheduled[0]!.payload).toMatchObject({ of: 2, input: { jobId } });
+    expect(kinds(ledger, jobId, 'round.admission-retry-fired').map((event) => event.payload))
+      .toEqual([{ attempt: 1, scheduledSeq: scheduled[0]!.seq }, { attempt: 2, scheduledSeq: scheduled[1]!.seq }]);
+    expect(informs).toHaveLength(2);
+    expect(informs[0]).toContain('automatic retry 1 of 2 is scheduled');
+    expect(informs[1]).toContain('automatic retry 2 of 2 is scheduled');
+    expect(escalations[0]).toContain('refused admission before any specialist started');
+    expect(escalations[0]).toContain('automatic retry 2 of 2 was refused too — no retries remain');
+  });
+
+  it('a retry is skipped when the job moved on, and a non-transient refusal escalates at once without one', async () => {
+    const { ledger, port, jobId, sessions, artifacts, branch, restorePath } = await transientFixture('moved-on');
+    const informs: string[] = [];
+    const escalations: string[] = [];
+    let corrupt = false;
+    const wave = new WaveRunner({
+      ledger, worktrees: port, spawner: makeSpawner(sessions, []), reviewArtifactRoot: artifacts,
+      prHeadProbe: localHeadProbe(branch), admissionRetryDelaysMs: [150],
+      reviewFreezeObserver: (frozen) => {
+        if (corrupt) writeFileSync(join(frozen.directory, 'diff.patch'), 'tampered after freeze');
+      },
+      inform: (title, detail) => informs.push(`${title}: ${detail}`),
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+    });
+    try {
+      await expect(wave.requestReview({ jobId })).rejects.toThrow(/automatic retry 1 of 1 is scheduled/u);
+      // A newer delivery replaces the refused one before the retry is due.
+      ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { sha: 'newer-delivery' } });
+      await vi.waitFor(() => expect(kinds(ledger, jobId, 'round.admission-retry-skipped')).toHaveLength(1), { timeout: 10_000, interval: 25 });
+      expect(kinds(ledger, jobId, 'round.admission-retry-skipped')[0]!.payload)
+        .toMatchObject({ attempt: 1, reason: 'a newer delivery replaced the refused one' });
+      expect(kinds(ledger, jobId, 'round.admission-retry-fired')).toEqual([]);
+      expect(ledger.listRounds(jobId)).toHaveLength(1);
+      expect(informs.at(-1)).toContain('skipped');
+      expect(escalations).toEqual([]);
+      // A corrupt packet is not transient: refused, escalated, no retry.
+      corrupt = true;
+      await expect(wave.requestReview({ jobId })).rejects.toThrow(/frozen-packet:diff\.patch/u);
+      expect(kinds(ledger, jobId, 'round.admission-retry-scheduled')).toHaveLength(1);
+      expect(escalations).toHaveLength(1);
+      expect(escalations[0]).not.toContain('automatic retry');
+    } finally {
+      restorePath();
+      await wave.shutdown();
+    }
+  });
+
+  it('a restart resumes the durable retry, which admits once the remote answers', async () => {
+    const { ledger, port, jobId, sessions, artifacts, flag, branch, restorePath } = await transientFixture('resumed');
+    const options = {
+      ledger, worktrees: port, spawner: makeSpawner(sessions, []), reviewArtifactRoot: artifacts,
+      prHeadProbe: localHeadProbe(branch), admissionRetryDelaysMs: [200],
+    };
+    const first = new WaveRunner(options);
+    const second = new WaveRunner(options);
+    try {
+      await expect(first.requestReview({ jobId })).rejects.toThrow(/automatic retry 1 of 1 is scheduled/u);
+      await first.shutdown(); // the armed timer dies with the service; the record does not
+      rmSync(flag); // the remote answers again
+      expect(second.resumeAdmissionRetries()).toBe(1);
+      expect(second.resumeAdmissionRetries()).toBe(0); // armed once
+      await vi.waitFor(() => {
+        expect(ledger.listRounds(jobId)).toHaveLength(2);
+        expect(ledger.listActiveRounds()).toEqual([]);
+      }, { timeout: 60_000, interval: 50 });
+    } finally {
+      restorePath();
+      await second.shutdown();
+    }
+    const [refused, retried] = ledger.listRounds(jobId);
+    expect(refused!.status).toBe('aborted');
+    // The retry reviewed: admitted, then every specialist ran (this fixture
+    // wires no PR poster, so the finished round cannot publish).
+    expect(ledger.listAgents().filter((agent) => agent.roundId === retried!.id).length).toBeGreaterThanOrEqual(9);
+    expect(kinds(ledger, jobId, 'round.admission-retry-fired').map((event) => event.payload))
+      .toEqual([{ attempt: 1, scheduledSeq: kinds(ledger, jobId, 'round.admission-retry-scheduled')[0]!.seq }]);
+    const admitted = ledger.listJobEventsByKinds(jobId, ['round.admission-preflight'], { limit: 10 })
+      .find((event) => event.roundId === retried!.id);
+    expect(admitted?.payload).toMatchObject({ ok: true });
   });
 });

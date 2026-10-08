@@ -40,11 +40,35 @@ import { attachBareOrigin, makeFixtureRepo, type FixtureRepo } from './helpers/f
 
 const repos: FixtureRepo[] = [];
 const dirs: string[] = [];
+/** Pid files of fixture processes (R6-7): whatever an assertion skipped,
+ * each recorded process is killed here BEFORE its file is deleted. */
+const pidFiles: string[] = [];
 
 afterEach(() => {
+  for (const pidFile of pidFiles.splice(0)) {
+    let pid = Number.NaN;
+    try {
+      pid = Number(readFileSync(pidFile, 'utf8').trim());
+    } catch {
+      /* never written */
+    }
+    if (!Number.isSafeInteger(pid) || pid <= 0) continue;
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch {
+      /* already gone */
+    }
+  }
   while (repos.length > 0) repos.pop()?.cleanup();
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
+
+/** A fresh pid-file path the afterEach reaper owns. */
+function pidFileFor(prefix: string, name: string): string {
+  const pidFile = join(temp(prefix), name);
+  pidFiles.push(pidFile);
+  return pidFile;
+}
 
 function temp(prefix: string): string {
   const dir = mkdtempSync(join(tmpdir(), `${prefix}-`));
@@ -966,7 +990,7 @@ describe('Perkins admission preflight (gh-169)', () => {
 
   it('nothing a timed-out probe step spawned outlives it — async admission step and sync remote probe alike', async () => {
     const review = branchTargetReview('descendants');
-    const pidFile = join(temp('admission-descendant-'), 'descendant.pid');
+    const pidFile = pidFileFor('admission-descendant-', 'descendant.pid');
     const restore = gitShim('ls-remote', `sleep 30 & echo $! > "${pidFile}"; trap '' TERM; exec sleep 10`);
     try {
       // A bound long enough for the wrapper to have spawned its descendant.
@@ -981,9 +1005,10 @@ describe('Perkins admission preflight (gh-169)', () => {
 
   it('nothing a SUCCESSFUL probe step spawned outlives it either — async admission and sync movement alike', async () => {
     const review = branchTargetReview('descendants-ok');
-    const pidFile = join(temp('admission-descendant-ok-'), 'descendant.pid');
-    // Starts a background child, then falls through to the real git.
-    const restore = gitShim('ls-remote', `sleep 30 & echo $! > "${pidFile}"`);
+    const pidFile = pidFileFor('admission-descendant-ok-', 'descendant.pid');
+    // Starts a background child that lets go of the output, then falls
+    // through to the real git: a natural end, so the answer stands.
+    const restore = gitShim('ls-remote', `sleep 30 >/dev/null 2>&1 & echo $! > "${pidFile}"`);
     try {
       expect(await probeAdvertisedTipMovementAsync(review, 5_000, { evidence: NO_SUSPEND })).toBeNull();
       expect(await stoppedOnItsOwn(pidFile)).toBe(true);
@@ -996,7 +1021,7 @@ describe('Perkins admission preflight (gh-169)', () => {
 
   it('the synchronous probe kills its group when the wrapper floods its output, and when the runner itself is cut off', async () => {
     const review = branchTargetReview('flood');
-    const pidFile = join(temp('admission-flood-'), 'descendant.pid');
+    const pidFile = pidFileFor('admission-flood-', 'descendant.pid');
     let restore = gitShim('ls-remote', `sleep 30 & echo $! > "${pidFile}"; head -c 3000000 /dev/zero; exec sleep 10`);
     try {
       // The runner's own bound fires — not the outer buffer guard.
@@ -1008,11 +1033,14 @@ describe('Perkins admission preflight (gh-169)', () => {
     } finally {
       restore();
     }
-    restore = gitShim('ls-remote', `sleep 30 & echo $! > "${pidFile}"; exec sleep 20`);
+    const wrapperFile = pidFileFor('admission-flood-wrapper-', 'wrapper.pid');
+    restore = gitShim('ls-remote', `echo $$ > "${wrapperFile}"; sleep 30 & echo $! > "${pidFile}"; exec sleep 20`);
     try {
-      // The outer guard fires first: the parent must kill the group the runner published.
+      // The outer guard cuts the runner off mid-step (R6-2): the runner led
+      // the group from its spawn, so the parent kills git and its child.
       expect(() => runOwnedGitSync(review.manifest.repoPath, ['ls-remote', 'origin'], 10_000, 1_500)).toThrow();
       expect(await stoppedOnItsOwn(pidFile)).toBe(true);
+      expect(await stoppedOnItsOwn(wrapperFile)).toBe(true);
     } finally {
       restore();
     }
@@ -1020,7 +1048,7 @@ describe('Perkins admission preflight (gh-169)', () => {
 
   it('a step whose output pipe a process outside its group still holds is incomplete — never an answer', async () => {
     const review = branchTargetReview('held-pipe');
-    const pidFile = join(temp('admission-held-pipe-'), 'escaped.pid');
+    const pidFile = pidFileFor('admission-held-pipe-', 'escaped.pid');
     // Prints part of an answer, leaves an escaped (own-session) child holding stdout, exits 0.
     const escape = `"${process.execPath}" -e "const c = require('node:child_process').spawn('/bin/sleep', ['30'], { detached: true, stdio: 'inherit' }); require('node:fs').writeFileSync('${pidFile}', String(c.pid)); c.unref()"`;
     let restore = gitShim('rev-parse', `${escape}; printf 'refs/remotes/orig'; exit 0`);
@@ -1043,7 +1071,7 @@ describe('Perkins admission preflight (gh-169)', () => {
 
   it('a helper that detaches into its own session and lets go of the output is outside the contract — left alone, the answer stands', async () => {
     const review = branchTargetReview('detached-daemon');
-    const pidFile = join(temp('admission-daemon-'), 'daemon.pid');
+    const pidFile = pidFileFor('admission-daemon-', 'daemon.pid');
     // Like ssh ControlPersist: a detached child with its stdio closed, then the real git.
     const daemon = `"${process.execPath}" -e "const c = require('node:child_process').spawn('/bin/sleep', ['30'], { detached: true, stdio: 'ignore' }); require('node:fs').writeFileSync('${pidFile}', String(c.pid)); c.unref()"`;
     const restore = gitShim('ls-remote', daemon);
@@ -1069,6 +1097,150 @@ describe('Perkins admission preflight (gh-169)', () => {
     const restore = gitShim('check-ref-format', `echo "${misleading}" >&2; exit 128`);
     try {
       expect(sourceMovementSinceFreeze(review, { remoteProbeTimeoutMs: 5_000 })?.cause).toBe('check-failed');
+    } finally {
+      restore();
+    }
+  });
+
+  it('a refusal line embedded in a longer, multiline diagnostic is operational — async and sync alike (R6-1)', async () => {
+    const review = branchTargetReview('multiline');
+    const name = review.manifest.targetRef;
+    const embedded = `fatal: cannot change to '/nonexistent-gru-r6\nfatal: '${name}' is not a valid branch name\n': No such file or directory\n`;
+    const scripted = async (_repo: string, args: readonly string[]): Promise<string> => {
+      if (args[0] === 'check-ref-format') throw Object.assign(new Error(embedded), { code: 128, stderr: embedded });
+      return '';
+    };
+    expect((await probeAdvertisedTipMovementAsync(review, 5_000, { now: () => 0, exec: scripted, evidence: NO_SUSPEND }))?.cause).toBe('check-failed');
+    // Real git, with a repository path that embeds the refusal line.
+    const unavailable = { ...review, manifest: { ...review.manifest, repoPath: `/nonexistent-gru-r6\nfatal: '${name}' is not a valid branch name\n` } };
+    expect((await probeAdvertisedTipMovementAsync(unavailable, 5_000, { evidence: NO_SUSPEND }))?.cause).toBe('check-failed');
+    const restore = gitShim('check-ref-format', `printf "fatal: cannot change to '/x\\nfatal: '%s' is not a valid branch name\\n': No such file or directory\\n" "${name}" >&2; exit 128`);
+    try {
+      expect(sourceMovementSinceFreeze(review, { remoteProbeTimeoutMs: 5_000 })?.cause).toBe('check-failed');
+    } finally {
+      restore();
+    }
+  });
+
+  it('a same-group writer that finishes inside the grace completes the answer; one still writing after it is refused and killed (R6-3)', async () => {
+    const review = branchTargetReview('late-writer');
+    const repo = review.manifest.repoPath;
+    // git exits 0 after printing a prefix; a same-group child prints the rest.
+    let restore = gitShim('rev-parse', `printf 'refs/remotes/orig'; (sleep 0.2; printf 'in/feature/late-writer\\n') & exit 0`);
+    try {
+      await expect(defaultProbeExec(repo, ['rev-parse', 'x'], 5_000)).resolves.toBe('refs/remotes/origin/feature/late-writer\n');
+      expect(runOwnedGitSync(repo, ['rev-parse', 'x'], 5_000)).toBe('refs/remotes/origin/feature/late-writer\n');
+    } finally {
+      restore();
+    }
+    const writerFile = pidFileFor('admission-late-writer-', 'writer.pid');
+    restore = gitShim('rev-parse', `printf 'refs/remotes/orig'; (sleep 2; printf 'in/feature/late-writer\\n') & echo $! > "${writerFile}"; exit 0`);
+    try {
+      // The truncated prefix is never an answer, and nothing revives it.
+      await expect(defaultProbeExec(repo, ['rev-parse', 'x'], 5_000)).rejects.toThrow(/output was still held open — the answer is incomplete/);
+      expect(await stoppedOnItsOwn(writerFile)).toBe(true);
+      expect(() => runOwnedGitSync(repo, ['rev-parse', 'x'], 5_000)).toThrow(/the answer is incomplete/);
+      expect(await stoppedOnItsOwn(writerFile)).toBe(true);
+    } finally {
+      restore();
+    }
+  });
+
+  it('the Linux baseline read is charged to the first budget: two slow reads and a failed probe stay inside budget + allowance (R6-4)', async () => {
+    const review = branchTargetReview('linux-baseline');
+    let t = 0;
+    let reads = 0;
+    const budgets: number[] = [];
+    const movement = await probeAdvertisedTipMovementAsync(review, 5_000, {
+      now: () => t,
+      exec: async (_repo, _args, timeoutMs) => {
+        budgets.push(timeoutMs);
+        t += timeoutMs; // the step uses all it is given, then fails
+        throw new Error('fatal: the remote end hung up unexpectedly');
+      },
+      evidence: {
+        platform: 'linux',
+        wallNow: () => WALL0,
+        kernWaketime: async () => {
+          throw new Error('not macOS');
+        },
+        procUptime: async () => {
+          reads += 1;
+          t += 999; // each read is slow, inside its allowance
+          return reads === 1 ? '500.00 0.00\n' : '501.00 0.00\n';
+        },
+      },
+    });
+    expect(movement?.cause).toBe('check-failed');
+    expect(reads).toBe(2);
+    expect(budgets).toEqual([5_000 - 999]);
+    expect(t).toBeLessThanOrEqual(5_000 + SUSPEND_EVIDENCE_ALLOWANCE_MS);
+  });
+
+  it('a killed step whose group never confirms cessation is refused as cleanup-unconfirmed within its bound, and earns no retry (R6-5)', async () => {
+    const review = branchTargetReview('unkillable');
+    const countFile = join(temp('admission-unkillable-'), 'ls-remote.count');
+    const restore = gitShim('ls-remote', `echo run >> "${countFile}"; exec sleep 10`);
+    const realKill = process.kill.bind(process);
+    // Uninterruptible I/O, simulated: the kernel never confirms the group
+    // gone. Real signals are still sent.
+    const kill = vi.spyOn(process, 'kill').mockImplementation(((pid: number, signal?: string | number) =>
+      pid < 0 && signal === 0 ? true : realKill(pid, signal)) as typeof process.kill);
+    try {
+      const started = performance.now();
+      // OS evidence says the host slept, which would otherwise earn one retry.
+      const movement = await probeAdvertisedTipMovementAsync(review, 1_500, { evidence: macWake(30_000) });
+      expect(movement).toMatchObject({ cause: 'check-failed', cleanupUnconfirmed: true, detail: expect.stringContaining('cleanup unconfirmed') });
+      expect(performance.now() - started).toBeLessThan(1_500 + 1_000 + 1_500);
+      expect(readFileSync(countFile, 'utf8').trim().split('\n')).toHaveLength(1);
+      const syncStarted = performance.now();
+      expect(() => runOwnedGitSync(review.manifest.repoPath, ['ls-remote', 'origin'], 300)).toThrow(/did not stop after SIGKILL — cleanup unconfirmed/);
+      expect(performance.now() - syncStarted).toBeLessThan(300 + 1_000 + 2_000);
+    } finally {
+      kill.mockRestore();
+      restore();
+    }
+    // Admission keeps the refusal, and never marks it retryable.
+    const unconfirmed = admissionPreflight(review, review.manifest.targetRef, {
+      precomputedRemoteMovement: { cause: 'check-failed', detail: 'git ls-remote did not stop', cleanupUnconfirmed: true },
+    }).missing.find((entry) => entry.input === 'head-binding');
+    expect(unconfirmed).toBeDefined();
+    expect(unconfirmed).not.toHaveProperty('retryable');
+    const transient = admissionPreflight(review, review.manifest.targetRef, {
+      precomputedRemoteMovement: { cause: 'check-failed', detail: 'fatal: the remote end hung up unexpectedly' },
+    }).missing.find((entry) => entry.input === 'head-binding');
+    expect(transient).toMatchObject({ retryable: true });
+  });
+
+  it('a timed-out step leaves no timer behind, and the sync probe returns at its own bound (R6-6)', async () => {
+    const review = branchTargetReview('timer-leak');
+    const restore = gitShim('ls-remote', 'exec sleep 10');
+    const timers = (): number => process.getActiveResourcesInfo().filter((resource) => resource === 'Timeout').length;
+    try {
+      const before = timers();
+      await expect(defaultProbeExec(review.manifest.repoPath, ['ls-remote', 'origin'], 250)).rejects.toThrow(/timed out after 250 ms/);
+      await new Promise((resolve) => setTimeout(resolve, 50)); // let a late 'exit' land
+      expect(timers()).toBeLessThanOrEqual(before);
+      const started = performance.now();
+      expect(() => runOwnedGitSync(review.manifest.repoPath, ['ls-remote', 'origin'], 300)).toThrow(/timed out after 300 ms/);
+      // Far below the outer guard (5.8 s) and the stalled git (10 s).
+      expect(performance.now() - started).toBeLessThan(3_000);
+    } finally {
+      restore();
+    }
+  });
+
+  it('an async step that floods its output is refused even when it leads with the right tip, and its group stops (R6-8)', async () => {
+    const review = branchTargetReview('async-flood');
+    const pidFile = pidFileFor('admission-async-flood-', 'descendant.pid');
+    const restore = gitShim('ls-remote',
+      `sleep 30 >/dev/null 2>&1 & echo $! > "${pidFile}"; printf '%s\\trefs/heads/feature/async-flood\\n' "${review.manifest.targetSha}"; head -c 3000000 /dev/zero; exit 0`);
+    try {
+      expect(await probeAdvertisedTipMovementAsync(review, 5_000, { evidence: NO_SUSPEND })).toMatchObject({
+        cause: 'check-failed',
+        detail: expect.stringContaining('printed more than'),
+      });
+      expect(await stoppedOnItsOwn(pidFile)).toBe(true);
     } finally {
       restore();
     }

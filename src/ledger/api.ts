@@ -1505,9 +1505,9 @@ export class LedgerApi {
   /** The one jobs-row status write + `job.status` event. Callers assert
    * their own transition first (the generic machine vs. the audited
    * administrative-closeout edge); the write shape lives in one place. */
-  private writeJobStatus(id: string, from: JobStatus, to: JobStatus): EventRecord {
+  private writeJobStatus(id: string, from: JobStatus, to: JobStatus, extra?: Readonly<Record<string, unknown>>): EventRecord {
     this.db.prepare('UPDATE jobs SET status = ?, updated_at = ? WHERE id = ?').run(to, nowIso(), id);
-    return this.appendEvent({ kind: 'job.status', jobId: id, payload: { from, to } });
+    return this.appendEvent({ kind: 'job.status', jobId: id, payload: { ...extra, from, to } });
   }
 
   setJobStatus(id: string, status: string, context?: BlockerContext): JobRecord {
@@ -2432,6 +2432,10 @@ export class LedgerApi {
     readonly jobId: string;
     readonly roundId: string;
     readonly priorStatus: 'working' | 'blocked';
+    /** The open attempt the round interrupted (`openAttemptStartSeq` at its
+     * flip). A restored `working` hop resumes that attempt — it is not a
+     * reopened lane, so its earlier delivery still settles it. */
+    readonly attemptStartSeq?: number;
   }): boolean {
     return this.transaction(() => {
       const job = this.getJob(input.jobId);
@@ -2440,7 +2444,14 @@ export class LedgerApi {
         .get(input.jobId) as { id: string } | undefined;
       if (job?.status !== 'in-review' || round?.jobId !== input.jobId ||
         round.status !== 'aborted' || latest?.id !== input.roundId) return false;
-      this.setJobStatus(input.jobId, input.priorStatus);
+      if (input.priorStatus === 'working' && input.attemptStartSeq !== undefined) {
+        assertJobTransition(job.status, 'working');
+        this.writeJobStatus(input.jobId, job.status, 'working', {
+          restoredAfterRound: input.roundId, attemptStartSeq: input.attemptStartSeq,
+        });
+      } else {
+        this.setJobStatus(input.jobId, input.priorStatus);
+      }
       return true;
     });
   }

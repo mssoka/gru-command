@@ -179,7 +179,17 @@ Every frozen round records:
   missing inputs (`head-binding`, `frozen-packet:<file>`, `spec-context`,
   `verification-evidence`, `ci-evidence`, `evidence:<id>`). A refused round
   aborts without spawn and escalates naming every missing input; fully
-  accessible material passes and the packet stays frozen head-bound. Missing
+  accessible material passes and the packet stays frozen head-bound. A
+  TRANSIENT refusal — every missing input a `head-binding` git step that
+  failed or timed out and was confirmed stopped (`retryable: true`) —
+  instead retries on its own, 1 minute and then 5 minutes later (owner
+  decision 2026-10-08). Each retry is durable
+  (`round.admission-retry-scheduled` / `-fired` / `-skipped`, resumed after
+  a restart) and announced as an FYI. It is skipped when the job moved on:
+  a newer delivery or round, a non-reviewable status, or a busy branch.
+  Only the last retry's refusal escalates action-required. A step that
+  would not stop after SIGKILL ("cleanup unconfirmed") is never retried.
+  Missing
   evidence never refuses admission by itself: an explicit UNAVAILABLE CI
   record is a PASS at preflight (its missing-vs-failed distinction is a
   display/report duty — see §2); only inaccessible, corrupt or unbound
