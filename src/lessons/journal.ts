@@ -163,19 +163,21 @@ export class JournalStore {
       } catch (error) {
         throw new JournalError(`journal file ${file} is unreadable: ${String(error)}`);
       }
-      // Fatal decoding (R9-02): invalid bytes are never replaced by U+FFFD,
-      // which would make two differently corrupt records read as identical.
-      let text: string;
-      try {
-        text = JOURNAL_UTF8.decode(raw);
-      } catch {
-        throw new JournalError(`journal file ${file} is not valid UTF-8 — repair or remove the damaged line`);
-      }
-      const lines = text.split('\n');
-      for (let index = 0; index < lines.length; index += 1) {
-        const line = lines[index] ?? '';
-        if (line.trim() === '') continue;
-        entries.push(this.parseEntry(file, index + 1, line));
+      // Line by line, fatally (R9-02, R10-03): invalid bytes are never
+      // replaced by U+FFFD — which would make two differently corrupt
+      // records read as identical — and the damaged line is named. No UTF-8
+      // sequence contains the LF byte, so splitting the bytes first is exact.
+      for (let start = 0, line = 1; start <= raw.length; line += 1) {
+        const newline = raw.indexOf(0x0a, start);
+        const end = newline === -1 ? raw.length : newline;
+        let text: string;
+        try {
+          text = JOURNAL_UTF8.decode(raw.subarray(start, end));
+        } catch {
+          throw new JournalError(`journal file ${file}:${line} is not valid UTF-8 — repair or remove the line`);
+        }
+        if (text.trim() !== '') entries.push(this.parseEntry(file, line, text));
+        start = end + 1;
       }
     }
     entries.sort((a, b) => a.seq - b.seq);

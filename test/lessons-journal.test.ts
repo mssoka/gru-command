@@ -122,7 +122,17 @@ describe('journal store', () => {
       caught = error;
     }
     expect(caught).toBeInstanceOf(JournalError);
-    expect((caught as Error).message).toMatch(/journal file .*2026-09-23\.jsonl is not valid UTF-8/);
+    expect((caught as Error).message).toMatch(/journal file .*2026-09-23\.jsonl:1 is not valid UTF-8/);
+    // R10-03: the damaged PHYSICAL line is named — between valid records, one
+    // of them holding a genuine U+FFFD — and nothing is skipped or rewritten.
+    const valid = (seq: number, body: string) => Buffer.from(`${JSON.stringify({ ...entry, seq, id: `j-${seq}`, body })}\n`);
+    const damaged = Buffer.concat([valid(11, 'kept \uFFFD as written'), Buffer.from(left!), Buffer.from([0xfe]), Buffer.from(`${right}\n`), Buffer.from('\n'), valid(13, 'after')]);
+    writeFileSync(file, damaged);
+    expect(() => journal.list()).toThrowError(/journal file .*2026-09-23\.jsonl:2 is not valid UTF-8 — repair or remove the line/);
+    expect(readFileSync(file).equals(damaged)).toBe(true);
+    // The same records, the bad byte repaired: every line reads, the real U+FFFD intact.
+    writeFileSync(file, Buffer.concat([valid(11, 'kept \uFFFD as written'), valid(12, 'repaired'), Buffer.from('\n'), valid(13, 'after')]));
+    expect(journal.list().map((read) => read.body).slice(-3)).toEqual(['kept \uFFFD as written', 'repaired', 'after']);
   });
 
   it('keeps a single entry with a colon-bearing source (minion:<job>) verbatim', () => {

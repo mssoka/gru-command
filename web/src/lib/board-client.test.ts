@@ -543,7 +543,7 @@ describe('board client', () => {
    * waits for the test, answered with a plain response object (no body
    * stream), so fake timers alone drive time. */
   function scriptedClient() {
-    const requests: Array<{ answer: (snapshot: BoardSnapshot) => void; hang: () => void; fail: () => void; refuse: (status: number) => void; signal: AbortSignal | undefined }> = [];
+    const requests: Array<{ answer: (snapshot: BoardSnapshot) => void; hang: () => void; fail: () => void; refuse: (status: number) => void; refuseHung: (status: number) => void; signal: AbortSignal | undefined }> = [];
     const fetchImpl = vi.fn((_path: string, init?: RequestInit) => new Promise<Response>((resolve, reject) => {
       requests.push({
         answer: (snapshot) => resolve({ ok: true, status: 200, json: async () => snapshot } as unknown as Response),
@@ -551,6 +551,8 @@ describe('board client', () => {
         hang: () => resolve({ ok: true, status: 200, json: () => new Promise(() => {}) } as unknown as Response),
         fail: () => reject(new TypeError('fetch failed')),
         refuse: (status) => resolve({ ok: false, status, json: async () => ({ error: 'refused' }) } as unknown as Response),
+        // The status arrives; its error body never does.
+        refuseHung: (status) => resolve({ ok: false, status, json: () => new Promise(() => {}) } as unknown as Response),
         signal: init?.signal ?? undefined,
       });
     })) as unknown as typeof fetch;
@@ -567,9 +569,11 @@ describe('board client', () => {
       close(): void {}
     }
     const delivered: string[] = [];
+    const fatals: string[] = [];
     const client = new BoardClient(
       { token: TOKEN, host: 'localhost', fetchImpl, webSocketCtor: FakeSocket as unknown as new (url: string) => WebSocket },
-      { connection: () => {}, snapshot: (snapshot) => delivered.push(snapshot.decisions.incarnation), fatal: () => {} },
+      // Like production's failPairing(): it reports, it does not stop the client.
+      { connection: () => {}, snapshot: (snapshot) => delivered.push(snapshot.decisions.incarnation), fatal: (message) => fatals.push(message) },
     );
     const settle = () => vi.advanceTimersByTimeAsync(0);
     const open = async () => {
@@ -584,7 +588,7 @@ describe('board client', () => {
       socket.onopen!();
       socket.onmessage!({ data: JSON.stringify({ type: 'auth_ok' }) });
     };
-    return { client, requests, delivered, settle, open, authenticate };
+    return { client, requests, delivered, fatals, settle, open, authenticate };
   }
 
   it('sustained pushes with slower HTTP never loop GETs unbounded — a short burst, then capped backoff; the owed answer lands once pushes stop, and stop() cancels the queued one (R7-04)', async () => {
@@ -812,6 +816,41 @@ describe('board client', () => {
       await vi.advanceTimersByTimeAsync(60_000);
       expect(refused.requests).toHaveLength(2);
       refused.client.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a refused pairing (401) ends the client at once — an established refresh chain and a 401 whose error body hangs alike; nothing polls after it (R10-01)', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      // A refresh chain owes an answer; its trailing request is refused 401.
+      const chain = scriptedClient();
+      const push = await chain.open();
+      void chain.client.refetchSnapshot();
+      push('stale');
+      chain.requests[1]!.answer(tagged('discarded'));
+      await chain.settle();
+      expect(chain.requests).toHaveLength(3);
+      chain.requests[2]!.refuse(401);
+      await chain.settle();
+      expect(chain.fatals).toEqual(['unauthorized (board api)']);
+      expect(chain.client.getState()).toBe('offline');
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(chain.requests).toHaveLength(3); // no successor, no waiting retry
+      // An ordinary refresh refused 401 whose error body never arrives: the
+      // client ends on the status, not after the deadline.
+      const hung = scriptedClient();
+      await hung.open();
+      void hung.client.refetchSnapshot();
+      hung.requests[1]!.refuseHung(401);
+      await hung.settle();
+      expect(hung.fatals).toEqual(['unauthorized (board api)']);
+      expect(hung.client.getState()).toBe('offline');
+      expect(hung.requests[1]!.signal?.aborted).toBe(true);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(hung.requests).toHaveLength(2);
+      expect(hung.fatals).toHaveLength(1);
     } finally {
       vi.useRealTimers();
     }

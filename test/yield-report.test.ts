@@ -224,6 +224,12 @@ describe('turn attribution follows the real prompt builders', () => {
     expect(classifyTurn('gru', gruHistoricalWakeText)).toEqual({ label: 'service-wake', turnClass: 'machine' });
   });
 
+  it('the wake instruction never orders a disposition of a producer-resolved alert — not even after a recorded hold (R10-02)', () => {
+    expect(AWARENESS_WAKE_INSTRUCTION).toMatch(/A producer-resolved alert \(lessons\.dream-failed\) refuses a disposition: fix its cause and leave it open/u);
+    const hold = AWARENESS_WAKE_INSTRUCTION.slice(AWARENESS_WAKE_INSTRUCTION.indexOf('When the right outcome is a hold'));
+    expect(hold).toMatch(/^When the right outcome is a hold .*then disposition the alert — unless it is producer-resolved, which stays open even under a hold/u);
+  });
+
   it('keeps the service-wake marker a prefix of the live wake instruction', () => {
     expect(AWARENESS_WAKE_INSTRUCTION.startsWith(SERVICE_WAKE_MARKER)).toBe(true);
     expect(HISTORICAL_WAKE_INSTRUCTION.startsWith(SERVICE_WAKE_MARKER)).toBe(true);

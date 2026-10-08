@@ -511,7 +511,7 @@ export class BibleStore {
           if (raw.length > this.chapterCapBytes) {
             throw new BibleError(`chapter ${name} is ${raw.length} B, over the ${this.chapterCapBytes} B cap`);
           }
-          parseChapter(STRICT_UTF8.decode(raw), name.slice(0, -'.md'.length));
+          parseChapter(strictText(raw, join(this.chaptersDir, name)), name.slice(0, -'.md'.length));
         }
       } catch (error) {
         throw new RepairWriteError(
@@ -1254,7 +1254,9 @@ function parseLesson(contract: PlanContract, chapterSlug: string, slug: string, 
         } else if (meta[1] === 'provenance') {
           // One handle once per LESSON, across every provenance line (R6-02)
           // — contract 1 read repeats and impossible instants as written.
-          provenance.push(...splitProvenance(meta[2] ?? '', chapterSlug, slug, contract, cited));
+          // One append per handle (R10-09): a spread would pass every handle
+          // of a huge single line as arguments and overflow the stack.
+          for (const ref of splitProvenance(meta[2] ?? '', chapterSlug, slug, contract, cited)) provenance.push(ref);
         } else if (meta[1] === 'tags') {
           tags.push(...splitTags(meta[2] ?? ''));
         }
@@ -2217,9 +2219,14 @@ function untrimmed(body: string): string {
   return body.endsWith(TRIM_MARKER) ? body.slice(0, -TRIM_MARKER.length) : body;
 }
 
+/** Append each incoming handle not already present (by id) — one Set
+ * lookup per handle, so a 150,000-handle repair stays linear (R10-09). */
 function mergeProvenance(target: ProvenanceRef[], incoming: readonly ProvenanceRef[]): void {
+  const present = new Set(target.map((ref) => ref.id));
   for (const ref of incoming) {
-    if (!target.some((candidate) => candidate.id === ref.id)) target.push(ref);
+    if (present.has(ref.id)) continue;
+    present.add(ref.id);
+    target.push(ref);
   }
 }
 

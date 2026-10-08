@@ -314,7 +314,14 @@ export class BoardClient {
    * stopped client's late 401 never unpairs the session that replaced it —
    * it belongs to the old pairing. */
   private async refused(path: string, res: Response): Promise<never> {
-    if (res.status === 401 && !this.stopped) this.events.fatal('unauthorized (board api)');
+    // A refused pairing ends this client AT ONCE (R10-01) — before its error
+    // body is read (which may never finish): stop() cancels the refresh
+    // chain, its debt, any waiting retry and every in-flight request, so
+    // nothing polls after a fatal answer.
+    if (res.status === 401 && !this.stopped) {
+      this.stop();
+      this.events.fatal('unauthorized (board api)');
+    }
     let code: string | null = null;
     let detail: string | null = null;
     try {

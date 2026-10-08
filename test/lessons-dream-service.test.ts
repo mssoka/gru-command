@@ -302,4 +302,81 @@ describe('compiled service: startup finishes a recorded decision without another
   it('committed-cleanup: the restart writes exactly the plan, advances the cursor, resolves the row and removes the record', async () => {
     await restartFinishes('committed-cleanup');
   }, 60_000);
+
+  /** The same, for a REJECT (R10-06): recorded, and optionally with the
+   * consuming cursor already persisted. The book is never written. */
+  async function restartFinishesReject(phase: 'recorded' | 'cursor-persisted'): Promise<void> {
+    const home = mkdtempSync(join(tmpdir(), `gru-dream-restart-reject-${phase}-`));
+    const workspace = mkdtempSync(join(tmpdir(), 'gru-dream-restart-workspace-'));
+    cleanup.push(home, workspace);
+    const journal = new JournalStore(join(home, 'journal'));
+    const entry = journal.append({ kind: 'finding', source: 'gru', body: 'a live shell held the restart' });
+    const bible = new BibleStore(join(home, 'bible'));
+    bible.ensureSeeded();
+    const stateFile = join(bible.dir, DREAM_STATE_FILE);
+    saveDreamState(stateFile, { ...loadDreamState(stateFile), lastDreamAt: new Date().toISOString() }); // not due
+    const file = join(bible.dir, PROPOSAL_FILE);
+    let record: { notificationId: string; nextState: DreamState };
+    const db = new LedgerDb(home);
+    try {
+      const bus = new EventBus();
+      const ledger = new LedgerApi(db.handle, { bus });
+      const notifications = new NotificationCenter({ ledger, bus });
+      const proposals = new LessonProposals({ bible, notifier: lessonProposalNotifier({ notifications, ledger }) });
+      const distill = async (input: DistillInput) => ({ chapters: twoChapters(input.entries.map((item) => item.id)) });
+      await new DreamEngine({ journal, bible, distiller: { distill }, proposals }).run();
+      const stored = JSON.parse(readFileSync(file, 'utf-8')) as Record<string, unknown> & { notificationId: string; nextState: DreamState };
+      record = stored;
+      if (phase === 'cursor-persisted') saveDreamState(stateFile, stored.nextState);
+      writeFileSync(file, JSON.stringify({ ...stored, decision: { kind: 'rejected', at: new Date().toISOString(), detail: null } }));
+    } finally {
+      db.close();
+    }
+    const book = (): Record<string, string> => Object.fromEntries(
+      ['INDEX.md', ...readdirSync(bible.chaptersDir).map((name) => `chapters/${name}`)].map((path) => [path, readFileSync(join(bible.dir, path), 'utf-8')]),
+    );
+    const before = book();
+    const boot = async (preload?: string) => startRealService({
+      port: await pickFreePort(), token: 'dream-restart-token', home, workspace, keepHome: true, requireWebDist: false,
+      ...(preload !== undefined ? { nodeImport: join(import.meta.dirname, 'helpers', preload) } : {}),
+    });
+    // Restart with no decision POST and no due dream: startup alone finishes it.
+    const first = await boot();
+    try {
+      await vi.waitFor(() => expect(existsSync(file)).toBe(false), { timeout: 20_000, interval: 250 });
+    } finally {
+      await first.stop();
+    }
+    expect(book()).toEqual(before); // a Reject never writes the book
+    expect(loadDreamState(stateFile)).toEqual(record.nextState); // the batch consumed, completely
+    const readRow = (): unknown => {
+      const ledgerDb = new DatabaseSync(join(home, 'ledger', 'ledger.db'), { readOnly: true });
+      try {
+        return ledgerDb.prepare('SELECT resolved_by FROM notifications WHERE id = ?').get(record.notificationId);
+      } finally {
+        ledgerDb.close();
+      }
+    };
+    expect(readRow()).toEqual({ resolved_by: 'owner:rejected' });
+    // A later DUE pass proposes only what is new — never the rejected batch.
+    const later = new JournalStore(join(home, 'journal')).append({ kind: 'finding', source: 'gru', body: 'a later finding' });
+    saveDreamState(stateFile, { ...loadDreamState(stateFile), lastDreamAt: null });
+    const second = await boot('dream-distills.mjs');
+    try {
+      await vi.waitFor(() => expect(existsSync(file)).toBe(true), { timeout: 20_000, interval: 250 });
+    } finally {
+      await second.stop();
+    }
+    const proposed = JSON.parse(readFileSync(file, 'utf-8')) as { entries: number; batch: { afterSeq: number; throughSeq: number } };
+    expect(proposed).toMatchObject({ entries: 1, batch: { afterSeq: entry.seq, throughSeq: later.seq } });
+    expect(book()).toEqual(before);
+  }
+
+  it('reject recorded: the restart consumes the batch, writes nothing, resolves the row and never re-proposes it (R10-06)', async () => {
+    await restartFinishesReject('recorded');
+  }, 90_000);
+
+  it('reject cursor-persisted: the restart writes nothing, keeps the consumed cursor, resolves the row and never re-proposes it (R10-06)', async () => {
+    await restartFinishesReject('cursor-persisted');
+  }, 90_000);
 });
