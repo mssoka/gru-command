@@ -543,12 +543,13 @@ describe('board client', () => {
    * waits for the test, answered with a plain response object (no body
    * stream), so fake timers alone drive time. */
   function scriptedClient() {
-    const requests: Array<{ answer: (snapshot: BoardSnapshot) => void; hang: () => void; signal: AbortSignal | undefined }> = [];
-    const fetchImpl = vi.fn((_path: string, init?: RequestInit) => new Promise<Response>((resolve) => {
+    const requests: Array<{ answer: (snapshot: BoardSnapshot) => void; hang: () => void; fail: () => void; signal: AbortSignal | undefined }> = [];
+    const fetchImpl = vi.fn((_path: string, init?: RequestInit) => new Promise<Response>((resolve, reject) => {
       requests.push({
         answer: (snapshot) => resolve({ ok: true, status: 200, json: async () => snapshot } as unknown as Response),
         // The headers arrive but the body never finishes.
         hang: () => resolve({ ok: true, status: 200, json: () => new Promise(() => {}) } as unknown as Response),
+        fail: () => reject(new TypeError('fetch failed')),
         signal: init?.signal ?? undefined,
       });
     })) as unknown as typeof fetch;
@@ -690,6 +691,53 @@ describe('board client', () => {
       expect(requests).toHaveLength(8);
       client.stop();
       expect(requests[7]!.signal?.aborted).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a trailing refetch that fails or times out keeps the owed answer — retried on the bounded schedule with no further push or wake; a delivery cancels a waiting retry (R8-02)', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const { client, requests, delivered, settle, open } = scriptedClient();
+      const push = await open();
+      // A decision's refresh loses to a queued pre-decision push...
+      void client.refetchSnapshot();
+      push('pre-decision');
+      requests[1]!.answer(tagged('discarded'));
+      await settle();
+      expect(requests).toHaveLength(3);
+      // ...its trailing replacement fails on the network: asked again at once.
+      requests[2]!.fail();
+      await settle();
+      expect(requests).toHaveLength(4);
+      // That one times out: the chain backs off, then asks again.
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(requests).toHaveLength(4);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(requests).toHaveLength(5);
+      requests[4]!.answer(tagged('authoritative'));
+      await settle();
+      expect(delivered.at(-1)).toBe('authoritative');
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(requests).toHaveLength(5); // met: the chain ends
+      // A retry waiting out its backoff is cancelled by a delivery from elsewhere.
+      void client.refetchSnapshot();
+      push('stale');
+      requests[5]!.answer(tagged('discarded-again'));
+      await settle();
+      requests[6]!.fail();
+      await settle();
+      requests[7]!.fail();
+      await settle();
+      expect(requests).toHaveLength(8); // the third waits 1 s
+      void client.refetchSnapshot(); // a wake, answered with no push in between
+      requests[8]!.answer(tagged('woken'));
+      await settle();
+      expect(delivered.at(-1)).toBe('woken');
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(requests).toHaveLength(9);
+      client.stop();
     } finally {
       vi.useRealTimers();
     }

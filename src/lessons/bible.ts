@@ -1011,7 +1011,7 @@ export function describePlan(plan: BiblePlan): PlanReview {
     });
   }
   const entries = (text: string | null) =>
-    new Map(parseIndex(text ?? '').map((entry) => [entry.slug, { summary: entry.summary, tags: entry.tags }]));
+    new Map(parseIndex(text ?? '', planContract(plan)).map((entry) => [entry.slug, { summary: entry.summary, tags: entry.tags }]));
   const beforeIndex = entries(baseline.get(BIBLE_INDEX_FILE) ?? null);
   const afterIndex = entries(plan.indexText);
   const index: IndexEntryChange[] = [];
@@ -1169,8 +1169,9 @@ const TRIM_MARKER = ' … [trimmed to fit the chapter cap]';
 export function parseChapter(text: string, slug: string, contract: PlanContract = PLAN_CONTRACT): BibleChapter {
   if (!isLessonsSlug(slug)) throw new BibleError(`invalid chapter slug: ${JSON.stringify(slug)}`);
   // CRLF, LF and a bare CR each end a line (R5-A13): a CR-only chapter is
-  // read as its lines, never as one line with nothing in it.
-  const lines = text.split(/\r\n|\r|\n/u);
+  // read as its lines, never as one line with nothing in it. Contract 1
+  // read a bare CR as part of its line, and is replayed that way (R8-01).
+  const lines = text.split(lineBreaks(contract));
   let title: string | null = null;
   let summary = '';
   const chapterTags: string[] = [];
@@ -1766,9 +1767,15 @@ function planContract(plan: BiblePlan): PlanContract {
   return plan.contract ?? 1;
 }
 
-export function parseIndex(text: string): LessonIndexEntry[] {
+/** The line terminators of a planning contract: the first release split
+ * on CRLF and LF only; today a bare CR ends a line too (R5-A13, R8-01). */
+function lineBreaks(contract: PlanContract): RegExp {
+  return contract === 1 ? /\r?\n/u : /\r\n|\r|\n/u;
+}
+
+export function parseIndex(text: string, contract: PlanContract = PLAN_CONTRACT): LessonIndexEntry[] {
   const entries: LessonIndexEntry[] = [];
-  for (const line of text.split(/\r\n|\r|\n/u)) {
+  for (const line of text.split(lineBreaks(contract))) {
     const match = INDEX_LINE.exec(line);
     if (match === null) continue;
     const slug = match[1] ?? '';

@@ -1786,6 +1786,53 @@ describe('fifth review round of #253 — follow-up (bmad-code-review, 2026-10-08
     }
   });
 
+  it('first-release plans over bare-CR chapters are read with that release\'s line breaks — a CR inside a kept body, CR-ended metadata (R8-01)', () => {
+    // A kept lesson body holding a bare CR: the first release read it as one line.
+    const kept = firstReleasePlan('lessons-plan-contract-1-cr-body.json');
+    const written = kept.plan.writes[0]!.text;
+    expect(parseChapter(written, 'ops', 1).lessons[0]!.body).toBe('Drain the shell.\rThen restart.');
+    expect(parseChapter(written, 'ops').lessons[0]!.body).toBe('Drain the shell.\nThen restart.'); // today's reader
+    expect(() => checkPlan(kept.plan)).not.toThrow();
+    expect(describePlan(kept.plan).chapters.map((chapter) => chapter.slug)).toEqual(['ops']);
+    expect(() => checkPlan({ ...kept.plan, contract: 2 })).toThrowError(/would not read back as planned/);
+    kept.bible.applyPlan(kept.plan);
+    expect(readFileSync(join(kept.bible.chaptersDir, 'ops.md'), 'utf8')).toBe(written);
+    expect(readFileSync(join(kept.bible.dir, 'INDEX.md'), 'utf8')).toBe(kept.plan.indexText);
+    // An untouched chapter whose lines end in bare CRs: one title line, no summary.
+    const meta = firstReleasePlan('lessons-plan-contract-1-cr-metadata.json');
+    const untouched = meta.plan.before.find((entry) => entry.path === 'chapters/ops.md')!.text!;
+    expect(parseChapter(untouched, 'ops', 1)).toMatchObject({ title: 'Ops\rsummary: Operating.', summary: '' });
+    expect(parseChapter(untouched, 'ops')).toMatchObject({ title: 'Ops', summary: 'Operating.' });
+    expect(() => checkPlan(meta.plan)).not.toThrow();
+    expect(describePlan(meta.plan).chapters.map((chapter) => chapter.slug)).toEqual(['deploy']);
+    expect(() => checkPlan({ ...meta.plan, contract: 2 })).toThrowError(/its INDEX\.md is not the index of the book it produces/);
+    meta.bible.applyPlan(meta.plan);
+    expect(readFileSync(join(meta.bible.chaptersDir, 'deploy.md'), 'utf8')).toBe(meta.plan.writes[0]!.text);
+    expect(readFileSync(join(meta.bible.chaptersDir, 'ops.md'), 'utf8')).toBe(untouched);
+    expect(readFileSync(join(meta.bible.dir, 'INDEX.md'), 'utf8')).toBe(meta.plan.indexText);
+    // The review's INDEX baseline is read the same way.
+    const crIndex = '# Book of Lessons — index\n\n- [ops](chapters/ops.md) — Ops.\r- [deploy](chapters/deploy.md) — Deploy.\n';
+    expect(parseIndex(crIndex, 1)).toEqual([]); // one line to the first release — not an index line
+    expect(parseIndex(crIndex).map((entry) => entry.slug)).toEqual(['ops', 'deploy']);
+    const withCrBaseline = { ...meta.plan, before: meta.plan.before.map((entry) => (entry.path === 'INDEX.md' ? { ...entry, text: crIndex } : entry)) };
+    expect(describePlan(withCrBaseline).index.find((entry) => entry.slug === 'deploy')?.before).toBeNull();
+  });
+
+  it('a first-release plan citing an impossible instant replays that release\'s lexical order under cap pressure; today\'s contract refuses it before any write (R8-03)', () => {
+    const { plan, bible } = firstReleasePlan('lessons-plan-contract-1-impossible-date.json');
+    // 2026-02-30 is not a date; the first release compared it as text, so
+    // j-2 (02-27) was the oldest and was released — j-1 stayed.
+    expect(parseChapter(plan.writes[0]!.text, 'ops', 1).lessons[0]!.provenance.map((ref) => ref.id)).toEqual(['j-1', 'j-3', 'j-4']);
+    expect(() => parseChapter(plan.writes[0]!.text, 'ops')).toThrowError(/impossible or malformed instant/);
+    expect(() => checkPlan(plan)).not.toThrow();
+    expect(describePlan(plan).chapters.map((chapter) => chapter.slug)).toEqual(['ops']);
+    expect(() => bible.applyPlan({ ...plan, contract: 2 })).toThrowError(/pre-cap provenance j-1 carries an invalid instant/);
+    expect(existsSync(join(bible.chaptersDir, 'ops.md'))).toBe(false);
+    bible.applyPlan(plan);
+    expect(readFileSync(join(bible.chaptersDir, 'ops.md'), 'utf8')).toBe(plan.writes[0]!.text);
+    expect(readFileSync(join(bible.dir, 'INDEX.md'), 'utf8')).toBe(plan.indexText);
+  });
+
   it('every provenance line of a lesson counts — a handle repeated across lines is refused (R6-02)', () => {
     expect(() => parseChapter(`# A\n\n## a\n\nrecurred: 1\nprovenance: j-3@${at(3)}\nprovenance: j-3@${at(3)}\nprovenance: j-3@${at(3)}\n\nBody.\n`, 'a'))
       .toThrowError(/provenance cites j-3 more than once/);

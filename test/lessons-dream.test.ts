@@ -1027,9 +1027,10 @@ describe('owner-approved lesson proposals (owner decision 2026-10-07)', () => {
     expect(existsSync(h.file)).toBe(false);
   });
 
-  it('first-release plans with repeated handles or pre-100 dates stay reviewable, and their decisions finish from every durable phase (R7-01/R7-02)', async () => {
+  it('first-release plans — repeated handles, pre-100 or impossible dates, bare CRs — stay reviewable, and their decisions finish from every durable phase (R7-01/R7-02, R8-01/R8-03)', async () => {
     const phases = ['undecided', 'accepted-nothing-written', 'accepted-half-written', 'accepted-all-written', 'accepted-committed', 'rejected'] as const;
-    for (const name of ['lessons-plan-contract-1-duplicates.json', 'lessons-plan-contract-1-early-year.json', 'lessons-plan-contract-1-early-drops.json', 'lessons-plan-contract-1-early-archive.json']) {
+    for (const name of ['lessons-plan-contract-1-duplicates.json', 'lessons-plan-contract-1-early-year.json', 'lessons-plan-contract-1-early-drops.json', 'lessons-plan-contract-1-early-archive.json',
+      'lessons-plan-contract-1-cr-body.json', 'lessons-plan-contract-1-cr-metadata.json', 'lessons-plan-contract-1-impossible-date.json']) {
       const { plan } = JSON.parse(readFileSync(join(import.meta.dirname, 'fixtures', name), 'utf8')) as {
         plan: { before: { path: string; text: string | null }[]; writes: { slug: string; text: string }[]; indexText: string; contract?: number };
       };
@@ -1073,7 +1074,7 @@ describe('owner-approved lesson proposals (owner decision 2026-10-07)', () => {
         const upgraded = new LessonProposals({ bible: new BibleStore(h.bible.dir), notifier });
         if (phase === 'undecided') {
           // Reviewable as stored — then the owner's Accept applies it.
-          expect(upgraded.review()?.chapters.map((chapter) => chapter.slug), label).toEqual(['ops']);
+          expect(upgraded.review()?.chapters.map((chapter) => chapter.slug), label).toEqual(plan.writes.map((write) => write.slug));
           expect(upgraded.reconcile()?.id, label).toBe(id);
           upgraded.accept(id);
         } else {

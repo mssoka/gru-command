@@ -94,7 +94,8 @@ export class BoardClient {
   private fetchSeq = 0;
   /** One trailing refetch is in flight or waiting (C13); later discards coalesce. */
   private trailingRefetch = false;
-  /** A discard happened while it was in flight: one successor is owed. */
+  /** An authoritative answer is owed: set by a discarded answer, met only
+   * by a delivered one (R8-02) or stop(). */
   private refreshOwed = false;
   /** Trailing refetches started in the current chain (R7-04). */
   private trailingRun = 0;
@@ -339,15 +340,14 @@ export class BoardClient {
       if (this.stopped || request !== this.fetchSeq) return;
       if (epoch === this.snapshotEpoch) {
         this.events.snapshot(snapshot);
-      } else if (this.trailingRefetch) {
-        // R6-04: a refetch is already trailing — remember the demand, so
-        // it is drained once that one settles (never forgotten).
-        this.refreshOwed = true;
+        this.demandMet();
       } else {
         // C13: the push that won may itself be OLDER (queued before a
-        // decision this answer already shows). Ask once more — one
-        // coalesced trailing refetch — so the newest truth still lands.
-        this.startTrailingRefetch();
+        // decision this answer already shows). The authoritative answer is
+        // owed until one is delivered (R8-02) — asked for by one coalesced
+        // trailing refetch; a refetch already trailing keeps it (R6-04).
+        this.refreshOwed = true;
+        if (!this.trailingRefetch) this.startTrailingRefetch();
       }
     } catch {
       /* connection state carries the error surface */
@@ -372,10 +372,20 @@ export class BoardClient {
     }
   }
 
+  /** A newest, epoch-matched answer landed: every owed refresh is met, and
+   * a trailing refetch still waiting out its backoff is cancelled (R8-02). */
+  private demandMet(): void {
+    this.refreshOwed = false;
+    if (this.trailingTimer === null) return;
+    clearTimeout(this.trailingTimer);
+    this.trailingTimer = null;
+    this.trailingRefetch = false;
+    this.trailingRun = 0;
+  }
+
   private startTrailingRefetch(): void {
     const generation = this.trailingGeneration;
     this.trailingRefetch = true;
-    this.refreshOwed = false; // this request answers every demand before it
     this.trailingRun += 1;
     void this.refetchSnapshot().finally(() => {
       if (generation !== this.trailingGeneration) return; // stop() released the chain
@@ -384,9 +394,10 @@ export class BoardClient {
         this.trailingRun = 0;
         return;
       }
-      // R7-04: under sustained pushes every answer is discarded; a short
-      // burst runs back to back, then the chain backs off (capped) while
-      // keeping the demand, so a GET never loops unbounded.
+      // Still owed: discarded again, failed, timed out or superseded by a
+      // request that has not delivered (R8-02). R7-04: under sustained
+      // pushes every answer is discarded; a short burst runs back to back,
+      // then the chain backs off (capped), so a GET never loops unbounded.
       const delay = trailingDelay(this.trailingRun);
       if (delay === 0) {
         this.startTrailingRefetch();
