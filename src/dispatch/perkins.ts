@@ -1659,7 +1659,10 @@ export class WaveRunner {
       if (queued === null) continue;
       const started = this.opts.ledger.latestJobEvent(job.id, 'job.review-handoff-started');
       const failed = this.opts.ledger.latestJobEvent(job.id, 'job.review-handoff-failed');
-      if ((started?.seq ?? 0) > queued.seq || (failed?.seq ?? 0) > queued.seq) continue;
+      // A request an approved material change withdrew (owner rule 3) is
+      // terminal: a restart never replays it against the obsolete candidate.
+      const withdrawn = this.opts.ledger.latestJobEvent(job.id, 'job.review-handoff-withdrawn');
+      if ((started?.seq ?? 0) > queued.seq || (failed?.seq ?? 0) > queued.seq || (withdrawn?.seq ?? 0) > queued.seq) continue;
       if (this.handoffs.has(job.id)) continue;
       // A terminal job or a swept lane can never admit this handoff: skip
       // truthfully (no failure, no escalation) instead of a spurious retry.
@@ -1754,7 +1757,10 @@ export class WaveRunner {
    * (owner: routine supersession needs no Ack); an unconfirmed stop still
    * escalates action-required from the supersession itself. */
   private escalate(title: string, detail: string, context?: EscalationContext): void {
-    if (context?.roundId !== undefined && this.supersededRounds.has(context.roundId)) {
+    // Durable too: a round whose supersession a restart interrupted is
+    // recovered as routine history, never an action-required incident.
+    if (context?.roundId !== undefined && (this.supersededRounds.has(context.roundId) ||
+        this.opts.ledger.latestRoundEvent(context.roundId, 'round.superseded') !== null)) {
       this.opts.inform?.(`${title} (superseded)`, detail, context);
       return;
     }
@@ -1791,11 +1797,69 @@ export class WaveRunner {
    * pending/live, plus tracked operations (a setup that has not created its
    * round, a fallback gate). Null when no review owns the lane. */
   activeReview(jobId: string): { readonly roundIds: readonly string[]; readonly operations: number } | null {
+    // A superseded round whose stop was never PROVEN still owns the lane
+    // (owner rule 3): its sessions may run, so a later writer re-proves it
+    // instead of trusting the round's terminal status.
     const roundIds = this.opts.ledger.listRounds(jobId)
-      .filter((round) => !isRoundTerminal(round.status))
+      .filter((round) => !isRoundTerminal(round.status) || this.supersessionUnproven(round.id))
       .map((round) => round.id);
     const operations = this.reviewOperations.get(jobId)?.size ?? 0;
     return roundIds.length === 0 && operations === 0 ? null : { roundIds, operations };
+  }
+
+  /** True while the round's newest supersession receipt is unconfirmed. */
+  private supersessionUnproven(roundId: string): boolean {
+    const unconfirmed = this.opts.ledger.latestRoundEvent(roundId, 'round.supersession-unconfirmed');
+    if (unconfirmed === null) return false;
+    return (this.opts.ledger.latestRoundEvent(roundId, 'round.supersession-confirmed')?.seq ?? 0) < unconfirmed.seq;
+  }
+
+  /** The cessation proof the next round's setup already demands of every
+   * prior round (owner rule 3): a trusted no-spawn receipt, or the runtime
+   * proving the round's owner marker and every registered session ceased.
+   * Null when proven; otherwise what is unproven. */
+  private async roundCessationProblem(roundId: string): Promise<string | null> {
+    const round = this.opts.ledger.getRound(roundId);
+    if (round === null) return `round ${roundId} is missing`;
+    if (!isRoundTerminal(round.status)) return `round ${roundId} is still ${round.status}`;
+    const marker = this.reviewOwnerMarker(round);
+    const agents = this.opts.ledger.listAgents().filter((entry) => entry.roundId === round.id);
+    const receipt = this.opts.ledger.uniqueRoundNoSpawnReceipt(round.id);
+    const proof = receipt?.payload as { roundId?: unknown; generation?: unknown; ownerGeneration?: unknown } | null;
+    const noSpawn = agents.length === 0 && receipt?.jobId === round.jobId && receipt.roundId === round.id &&
+      proof?.roundId === round.id && validReviewOwnerGeneration(proof.generation) &&
+      proof.ownerGeneration === (marker?.generation ?? null) &&
+      (marker !== null || this.opts.ledger.latestRoundEvent(round.id, 'round.review-owner') === null) &&
+      this.opts.ledger.listRoundSpecialistStarts(round.id).length === 0;
+    if (noSpawn) return null;
+    if (marker === null && agents.length === 0) {
+      return `round ${round.id} has neither a no-spawn proof nor an owner marker — a spawn before registration cannot be ruled out`;
+    }
+    if (marker !== null && agents.length === 0 && await this.opts.reconcileReviewAgent?.('', marker) !== true) {
+      return `round ${round.id}'s review owner may still run before agent registration`;
+    }
+    const running: string[] = [];
+    for (const agent of agents) {
+      if (await this.opts.reconcileReviewAgent?.(agent.id, marker) !== true) running.push(agent.id);
+    }
+    return running.length === 0 ? null : `round ${round.id} review session(s) ${running.join(', ')} not proven ceased`;
+  }
+
+  /** Owner rule 3: a queued review request made before an approved
+   * material change asked for a candidate that is now obsolete — withdraw
+   * it (durably, so a restart never replays it). The next review of the
+   * corrected candidate is requested through the ordinary rows. */
+  private withdrawQueuedHandoff(jobId: string, reason: string): boolean {
+    const pending = this.handoffs.get(jobId);
+    if (pending === undefined) return false;
+    this.handoffs.delete(jobId);
+    this.opts.ledger.appendCustomEvent({
+      kind: 'job.review-handoff-withdrawn',
+      jobId,
+      payload: { requestSeq: pending.seq, reason: reason.slice(0, 500) },
+    });
+    pending.resolve();
+    return true;
   }
 
   /** Writer admission (owner rules 3 and 5), checked synchronously in the
@@ -1851,6 +1915,10 @@ export class WaveRunner {
     const deadline = Date.now() + (this.opts.supersessionDeadlineMs ?? REVIEW_SUPERSESSION_DEADLINE_MS);
     const retry = this.admissionRetries.get(input.jobId);
     if (retry !== undefined) this.dropAdmissionRetry(retry, { outcome: 'superseded', reason: input.reason.slice(0, 300) });
+    const jobRow = this.opts.ledger.getJob(input.jobId);
+    if (jobRow !== null && pendingWorkRevision(this.opts.ledger, jobRow) !== null) {
+      this.withdrawQueuedHandoff(input.jobId, input.reason);
+    }
     const roundIds = new Set<string>();
     let operations = 0;
     // A setup that passed its last fence before the writer's intent landed
@@ -1863,7 +1931,11 @@ export class WaveRunner {
         if (roundIds.has(roundId)) continue;
         roundIds.add(roundId);
         this.supersededRounds.add(roundId);
-        this.recordRoundSupersession(input, roundId);
+        // One durable receipt per round: a re-proof of an earlier
+        // unconfirmed stop (or a second caller) does not re-supersede it.
+        if (this.opts.ledger.latestRoundEvent(roundId, 'round.superseded') === null) {
+          this.recordRoundSupersession(input, roundId);
+        }
       }
       const ops = [...(this.reviewOperations.get(input.jobId) ?? [])];
       if (ops.length === 0 && active.roundIds.every((id) => roundIds.has(id)) && pass > 0) break;
@@ -1898,11 +1970,10 @@ export class WaveRunner {
     const problems: string[] = [];
     const leftover = this.reviewOperations.get(input.jobId)?.size ?? 0;
     if (leftover > 0) problems.push(`${leftover} review operation(s) did not settle within the bound`);
-    const nonTerminal = [...roundIds].filter((id) => {
-      const round = this.opts.ledger.getRound(id);
-      return round !== null && !isRoundTerminal(round.status);
-    });
-    if (nonTerminal.length > 0) problems.push(`round(s) ${nonTerminal.join(', ')} still ${nonTerminal.length === 1 ? 'is' : 'are'} not terminal`);
+    for (const roundId of roundIds) {
+      const problem = await this.roundCessationProblem(roundId);
+      if (problem !== null) problems.push(problem);
+    }
     const sessions = this.opts.ledger.listAgents()
       .filter((agent) => agent.role === 'perkins' && agent.roundId !== null && roundIds.has(agent.roundId));
     const live = this.opts.liveReviewSessions !== undefined
@@ -2906,8 +2977,11 @@ export class WaveRunner {
   }): { readonly targetBranch: string; readonly blockers: readonly BranchIdleBlocker[] } {
     const { targetBranch, blockers } = this.branchIdleBlockers(input);
     // A retirement hold is a fresh-authorization boundary, not ordinary
-    // branch activity. Neither force nor a foreign target may waive it.
-    const held = blockers.some((blocker) => this.opts.ledger.hasOpenDirectiveRecoveryHold(blocker.jobId));
+    // branch activity. Neither force nor a foreign target may waive it. A
+    // pending material correction is the same (owner rule 2): the candidate
+    // is outdated by an approved change, and no override reviews it.
+    const held = blockers.some((blocker) =>
+      blocker.revision !== undefined || this.opts.ledger.hasOpenDirectiveRecoveryHold(blocker.jobId));
     if (blockers.length === 0 && input.force !== true) return { targetBranch, blockers };
     const forced = input.force === true && !held;
     this.opts.ledger.appendCustomEvent({
@@ -3183,6 +3257,25 @@ export class WaveRunner {
         }
       }
     }
+    // Owner rule 2: a pending material correction refuses fallback
+    // admission even under force — the candidate is outdated.
+    const jobRow = this.opts.ledger.getJob(input.jobId);
+    const revision = jobRow === null ? null : pendingWorkRevision(this.opts.ledger, jobRow);
+    if (jobRow !== null && revision !== null) {
+      const targetBranch = resolveReviewTargetBranch({
+        jobId: input.jobId,
+        ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
+        lanePath: lane.path,
+        laneBranch: lane.branch,
+      });
+      const blockers: readonly BranchIdleBlocker[] = [{ jobId: input.jobId, status: jobRow.status, branch: targetBranch, revision }];
+      this.opts.ledger.appendCustomEvent({
+        kind: 'branch-idle.refused',
+        jobId: input.jobId,
+        payload: { phase: 'arm', forced: false, targetBranch, blockers },
+      });
+      throw new BranchBusyError(targetBranch, blockers, 'arm');
+    }
     if (input.fromHandoff === true) {
       const pending = this.handoffs.get(input.jobId);
       this.assertHandoffAuthorized(input.jobId, pending?.seq ?? -1);
@@ -3242,6 +3335,13 @@ export class WaveRunner {
         (input.force !== true && markers.length > 0)) {
       throw new FallbackSafetyRefusal(
         `a new or unresolved re-brief request owns job "${input.jobId}" — the fallback gate stops before the next review round`,
+      );
+    }
+    // Owner rule 2: a material correction accepted while the gate runs makes
+    // its diff obsolete — no override carries the gate past it.
+    if (jobNow !== null && pendingWorkRevision(this.opts.ledger, jobNow) !== null) {
+      throw new FallbackSafetyRefusal(
+        `an approved material correction for job "${input.jobId}" is pending delivery — the old diff cannot pass`,
       );
     }
     if (fallbackWorkingStartedSince(this.opts.ledger, input.jobId, admission.statusSeq) ||
@@ -3451,6 +3551,11 @@ export class WaveRunner {
         // A completed review of an older diff is not a PASS on a lane that
         // acquired and possibly settled a newer request while it ran.
         recheckRound();
+        // A reviewer that answers after cancellation (supersession, owner
+        // rule 3, or shutdown) never records a verdict on that diff.
+        if (signal.aborted) {
+          throw new FallbackSafetyRefusal(`the fallback gate for job "${job.id}" was cancelled while its reviewer ran — its findings are not a verdict`);
+        }
       } catch (error) {
         if (existsSync(reportFile)) state.reportFiles.push(reportFile);
         if (error instanceof FallbackSafetyRefusal) {
@@ -3481,6 +3586,11 @@ export class WaveRunner {
       if (iteration === maxRounds) break;
       let delivery: { readonly delivered: boolean; readonly minionId?: string; readonly note?: string };
       try {
+        // No fix directive leaves a cancelled gate: the lane's writer now
+        // belongs to whoever superseded it.
+        if (signal.aborted) {
+          throw new FallbackSafetyRefusal(`the fallback gate for job "${job.id}" was cancelled before its fix directive`);
+        }
         delivery = await gate.fixDirectiveSink({
           jobId: job.id,
           directive: renderFixDirective(triaged.blockers, iteration),
@@ -3489,6 +3599,10 @@ export class WaveRunner {
           signal,
         });
       } catch (error) {
+        if (error instanceof FallbackSafetyRefusal) {
+          this.terminalFallbackAborted(job.id, error.message, iteration, [...state.reportFiles], fallbackEvent, state);
+          return;
+        }
         this.terminalFallbackBlocked(
           job.id,
           `fix directive for round ${iteration} failed: ${sanitizeErrorLog(error)}`,
@@ -4060,7 +4174,10 @@ export class WaveRunner {
         // Unforced: the ordinary refusal (audited). Forced: its audit already
         // stands — only a blocker it never covered is refused (audited below).
         const afterProbe = input.force === true ? this.branchIdleBlockers(recheck) : this.enforceBranchIdle(recheck);
-        const unaudited = afterProbe.blockers.filter((blocker) => !idle.blockers.some((audited) => audited.jobId === blocker.jobId));
+        // A pending material correction is never covered by a force audit
+        // (owner rule 2), even on a job whose other busy fact was audited.
+        const unaudited = afterProbe.blockers.filter((blocker) => blocker.revision !== undefined ||
+          !idle.blockers.some((audited) => audited.jobId === blocker.jobId));
         if (unaudited.length > 0) {
           this.opts.ledger.appendCustomEvent({
             kind: 'branch-idle.refused', jobId: job.id, roundId: round.id,

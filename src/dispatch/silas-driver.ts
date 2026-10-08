@@ -986,6 +986,8 @@ const HANDOFF_UNARMED_KINDS: ReadonlySet<string> = new Set([
   'job.review-handoff-failed',
   'job.review-handoff-held',
   'job.review-handoff-skipped',
+  // Owner rule 3: an approved material change withdrew the queued request.
+  'job.review-handoff-withdrawn',
 ]);
 
 /** The job's latest handoff lifecycle event (null when none was recorded). */
@@ -995,6 +997,7 @@ function latestHandoffEvent(ledger: DigestLedger, jobId: string): EventRecord | 
     'job.review-handoff-failed',
     'job.review-handoff-held',
     'job.review-handoff-skipped',
+    'job.review-handoff-withdrawn',
     'job.review-handoff-requeued',
   ];
   return kinds
@@ -1442,8 +1445,10 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     // null/'pr', E19) belong here: a delivered review/artifact/
     // investigation job completes at its handback, so flagging it as
     // PR-overdue would manufacture ops work and false missing-PR alarms.
+    // A pending material correction (owner rule 2) withholds the PR/review
+    // offer for the outdated candidate until the corrective delivery.
     if (delivered !== null && currentPhaseDelivered && reviewPending && !rebriefPending && !liveDirectiveOwns &&
-        job.prUrl === null && rounds.length === 0 &&
+        revision === null && job.prUrl === null && rounds.length === 0 &&
         (job.deliverable === null || job.deliverable === 'pr')) {
       const lane = (input.worktrees?.listWorktrees({ jobId: job.id }) ?? []).find((candidate) => candidate.kind === 'job');
       // ATTRIBUTION, not routing: this pick names the implementer whose
@@ -1929,6 +1934,9 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       phaseUnchanged(jobId) &&
       jobSeqUnchanged(jobId) &&
       !verificationInFlight(input.ledger, jobId) &&
+      // Owner rule 2: a material correction accepted during the compute
+      // withdraws the PR/review offer for the outdated candidate.
+      pendingWorkRevision(input.ledger, job) === null &&
       input.ledger.listPendingRebriefs({ jobId }).length === 0 &&
       input.ledger.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES }).length === 0 &&
       !input.ledger.hasOpenDirectiveRecoveryHold(jobId);

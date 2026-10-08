@@ -212,6 +212,22 @@ export function validateAmendmentDraft(input: {
   return null;
 }
 
+/** Which accepted amendments a later one superseded: amendment id → the
+ * version of the FIRST later amendment naming `amendment:<id>`. One rule
+ * for the rendered contract and the revision continuation. */
+export function amendmentSupersessions(amendments: readonly JobAmendmentRecord[]): ReadonlyMap<string, number> {
+  const ordered = [...amendments].sort((left, right) => left.version - right.version);
+  const supersededBy = new Map<string, number>();
+  for (const amendment of ordered) {
+    for (const entry of amendment.supersedes) {
+      if (!entry.startsWith('amendment:')) continue;
+      const id = entry.slice('amendment:'.length);
+      if (!supersededBy.has(id)) supersededBy.set(id, amendment.version);
+    }
+  }
+  return supersededBy;
+}
+
 /** Render the effective acceptance. Zero amendments return the original
  * briefing bytes EXACTLY (backward compatibility: existing jobs freeze
  * byte-identical specs). */
@@ -232,14 +248,7 @@ export function renderEffectiveContract(
   }
   // First later amendment naming `amendment:<id>` in its supersedes list owns
   // the supersession marker. History stays visible; effectiveness is explicit.
-  const supersededBy = new Map<string, number>();
-  for (const amendment of ordered) {
-    for (const entry of amendment.supersedes) {
-      if (!entry.startsWith('amendment:')) continue;
-      const id = entry.slice('amendment:'.length);
-      if (!supersededBy.has(id)) supersededBy.set(id, amendment.version);
-    }
-  }
+  const supersededBy = amendmentSupersessions(ordered);
   if (briefing === null) {
     // Unreachable through addJobAmendment (no-briefing jobs take no
     // amendments). A caller bypassing that guard must refuse, never invent

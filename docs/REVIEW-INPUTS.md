@@ -203,8 +203,11 @@ latest revision → verify → fresh review. The service enforces it centrally.
   - fallback admission;
   - automatic admission retry.
 
-  The `409 branch_busy` blocker carries `required_revision`/`delivered_revision`, and a
-  review of an explicit `target_ref` cannot bypass the job's own fence.
+  The `409 branch_busy` blocker carries `required_revision`/`delivered_revision`. A review of
+  an explicit `target_ref` cannot bypass the job's own fence, and neither can `force`: like
+  an open retirement hold, a pending correction is never an overridable blocker. That holds
+  at the arm, at the freeze recheck, and at the fallback gate's admission and iteration
+  boundaries.
 - **Supersession.** Accepting a material amendment supersedes any review that owns the lane.
   A queued round is withdrawn, or a running round and its specialists are cancelled.
   `round.superseded` is recorded first, with the settled specialist checkpoints. Partial
@@ -213,17 +216,29 @@ latest revision → verify → fresh review. The service enforces it centrally.
   - every round is terminal;
   - no review session still holds a live runtime handle.
 
-  The outcome is recorded as `round.supersession-confirmed`, or as
-  `round.supersession-unconfirmed` plus one action-required escalation. A superseded round
-  records `round.perkins-incomplete` with reason `superseded`. That is routine FYI, never an
-  Ack, and it is never a clean-abort re-arm candidate.
+  The stop is proven the same way the next round's setup proves a predecessor stopped: a
+  trusted no-spawn receipt, or the runtime proving the round's owner marker and every
+  registered session ceased. The outcome is recorded as `round.supersession-confirmed`, or as
+  `round.supersession-unconfirmed` plus one action-required escalation. A round whose stop
+  stays unproven keeps owning the lane, even though it is terminal: every later writer
+  re-proves it before prompting. A superseded round records `round.perkins-incomplete` with
+  reason `superseded`. That is routine FYI, never an Ack, including after a restart that
+  interrupted it, and it is never a clean-abort re-arm candidate.
+- **Queued review requests.** A review request queued before the material change (a
+  handoff waiting for delivery) asked for the obsolete candidate. It is withdrawn durably
+  (`job.review-handoff-withdrawn`), so neither the corrective delivery nor a restart replays
+  it. The corrected candidate is reviewed through the ordinary rows. A superseded fallback
+  gate stops at its next decision point and records `aborted` with `superseded: true`; it
+  never records a late PASS or sends a fix directive.
 - **Writer gate.** Before a directive or re-brief prompts the lane's minion, the service
   supersedes and *proves stopped* every review that owns the lane.
   - **Unproven stop.** The writer is refused and nothing is sent. A directive records a
     positive no-effect failure; a re-brief answers `409 review_supersession_unconfirmed`
     before any marker exists.
   - **Review running, no material revision pending.** The branch stays frozen: directives,
-    re-briefs and provider-recovery claims answer `409 review_in_progress`.
+    re-briefs and provider-recovery claims answer `409 review_in_progress`. A
+    provider-recovery claim on a lane whose review a material correction made obsolete
+    takes the same supersede-and-prove gate first.
   - **One writer per lane.** A directive while a re-brief stands, or a re-brief while a
     directive is live, answers `409 writer_conflict`.
 - **Restarts.** Boot recovery terminalizes live rounds. The writer's durable intent (the

@@ -43,6 +43,7 @@ async function boot(): Promise<Harness> {
     shutdown: async () => {},
     // No review owns these lanes: a material amendment supersedes nothing.
     activeReview: () => null,
+    supersedeReviews: async (input: { jobId: string }) => ({ jobId: input.jobId, roundIds: [], operations: 0, confirmed: true, detail: null }),
   } as unknown as WaveRunner;
   const dispatch = { worktreesFor: () => [] } as unknown as DispatchService;
   const server = createDispatchServer({ config: cfg, dispatch, wave, ledger, pendingProducerBlockers: () => [] });

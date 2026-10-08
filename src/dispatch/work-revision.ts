@@ -16,6 +16,10 @@ export function renderRevisionContinuation(input: {
   readonly deliveredRevision: number;
   /** Material amendments in (deliveredRevision, revision], version order. */
   readonly pending: readonly JobAmendmentRecord[];
+  /** Amendment id → the version that superseded it: a superseded pending
+   * amendment is named NOT EFFECTIVE and its body is withheld, so the
+   * minion never receives contradictory instructions. */
+  readonly supersededBy?: ReadonlyMap<string, number>;
 }): string {
   if (input.pending.length === 0) return '';
   const lines: string[] = [
@@ -26,15 +30,19 @@ export function renderRevisionContinuation(input: {
     'a delivery carries this revision.',
   ];
   for (const amendment of input.pending) {
+    const superseder = input.supersededBy?.get(amendment.id);
     lines.push(
       '',
       `## Amendment #${amendment.version} (material) — accepted ${amendment.createdAt}`,
       `approval: ${amendment.approval.by} — ${amendment.approval.reference}`,
       `supersedes: ${amendment.supersedes.length === 0 ? 'none' : amendment.supersedes.join(', ')}`,
       `body_sha256: ${amendment.bodySha256}`,
-      '',
-      amendment.body,
     );
+    if (superseder === undefined) {
+      lines.push('', amendment.body);
+    } else {
+      lines.push(`status: NOT EFFECTIVE — superseded by amendment #${superseder}; do not implement it (body withheld)`);
+    }
   }
   lines.push(
     '',
@@ -43,6 +51,18 @@ export function renderRevisionContinuation(input: {
     `===== END CONTRACT REVISION ${input.revision} =====`,
   );
   return lines.join('\n');
+}
+
+/** The revision line a FRESH session gets instead of the continuation
+ * block: its effective contract already carries every amendment's text, so
+ * repeating the bodies would break the once-only continuation. */
+export function renderFreshRevisionNote(revision: number): string {
+  return [
+    `===== CONTRACT REVISION ${revision} =====`,
+    `The effective contract above is contract revision ${revision}: implement every effective material amendment in it.`,
+    `The service records the delivery of this turn as contract revision ${revision}.`,
+    `Name "contract revision ${revision}" in your completion report.`,
+  ].join('\n');
 }
 
 /** Append the continuation block (when any material amendment is pending)

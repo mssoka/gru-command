@@ -1236,6 +1236,9 @@ async function main(): Promise<number> {
         worktrees: worktreeManager,
         jobId: directiveInput.jobId,
         directive: directiveInput.directive,
+        // A fresh fallback minion is briefed with the effective contract
+        // (original + accepted amendments), never the original alone.
+        contract: ledger.effectiveContract(directiveInput.jobId)?.text ?? null,
         signal: directiveInput.signal,
         owner: 'bmad-review-gate',
         parentTools: parentToolsFor,

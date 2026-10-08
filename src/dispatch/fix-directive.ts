@@ -8,6 +8,7 @@ import { requireSpawnCwd } from '../roles.js';
 import { appendLessonPointers, renderLessonsSection } from '../lessons/references.js';
 import type { LessonPointer, LessonsReferencePort } from '../lessons/types.js';
 import { appendWorkerRules, WORKER_RULE_BLOCKS } from './worker-rules.js';
+import { withRevisionContinuation } from './work-revision.js';
 import { resolveGitCommit } from './perkins-review/artifacts.js';
 import { promptVerdictFromHealth, promptWithTerminalVerdict } from '../runtime/prompt-verdict.js';
 import type { PromptTurnVerdict } from '../runtime/types.js';
@@ -102,6 +103,10 @@ export async function routeFixDirectiveToMinion(
      * amendment): what a FRESH fallback minion is briefed with. Absent =
      * the original briefing (no amendment surface at the caller). */
     contract?: string | null;
+    /** Owner rule 4: the pending material amendments travel ONCE. A live or
+     * resumed session gets `block` (the canonical bodies); a fresh session
+     * already reads them in the effective contract and gets `freshNote`. */
+    continuation?: { readonly block: string; readonly freshNote: string };
   },
 ): Promise<{
   delivered: boolean;
@@ -124,12 +129,13 @@ export async function routeFixDirectiveToMinion(
   // Follow-up turns carry the CURRENT worker rule blocks too (PR creation
   // and the no-call-budget contract): legacy briefing wording must not
   // outrank them on the live/resumed paths.
-  const directive = appendWorkerRules(
+  const compose = (revisionText: string): string => appendWorkerRules(
     appendLessonPointers(
-      input.directive,
+      withRevisionContinuation(input.directive, revisionText),
       input.lessons?.referencesFor(input.directive) ?? [],
     ),
   );
+  const directive = compose(input.continuation?.block ?? '');
   const minions = input.ledger
     .listImplementerMinions(input.jobId)
     // Defense-in-depth for issue #161's writer rule (the ledger pick
@@ -270,7 +276,7 @@ export async function routeFixDirectiveToMinion(
       // A fresh session has no memory of accepted amendments: brief it with
       // the EFFECTIVE contract (original + amendments), never the original
       // alone (owner rule 4).
-      prompt = `Fresh minion re-brief for job ${input.jobId}. Effective contract (original briefing plus accepted amendments):\n${contract}\n\nCurrent fix directive:\n${directive}`;
+      prompt = `Fresh minion re-brief for job ${input.jobId}. Effective contract (original briefing plus accepted amendments):\n${contract}\n\nCurrent fix directive:\n${compose(input.continuation?.freshNote ?? '')}`;
     }
     assertDirectiveJobActive(input.ledger, input.jobId);
     let promptError: unknown = null;

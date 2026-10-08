@@ -10,12 +10,14 @@ import { LedgerDb } from '../src/ledger/db.js';
 import { DEFAULT_SILAS_CONFIG, loadConfig, type Role } from '../src/config.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 import {
+  amendmentSupersessions,
   renderEffectiveContract,
   requiredWorkRevision,
   type JobAmendmentRecord,
 } from '../src/review-inputs/amendments.js';
 import { findBusyLanes, laneIsBusy } from '../src/dispatch/branch-idle.js';
-import { recordFollowUpDelivery, type DirectiveRegistry } from '../src/dispatch/fix-directive.js';
+import { recordFollowUpDelivery, routeFixDirectiveToMinion, type DirectiveRegistry } from '../src/dispatch/fix-directive.js';
+import { reconcilePendingRebriefs } from '../src/dispatch/rebrief-recovery.js';
 import {
   ReviewInProgressError,
   ReviewSupersessionUnconfirmedError,
@@ -224,7 +226,7 @@ describe('rule 5 — one writer per lane', () => {
 
 /** A fake resident review session: prompt never settles on its own (the
  * review is "running"); dispose removes it from the live set. */
-function hangingHandle(id: string, live: Set<string>, sessionDir: string): AgentHandle {
+function hangingHandle(id: string, live: Set<string>, sessionDir: string, leaks = false): AgentHandle {
   live.add(id);
   return {
     role: 'perkins',
@@ -238,7 +240,8 @@ function hangingHandle(id: string, live: Set<string>, sessionDir: string): Agent
     subscribe: () => () => {},
     health: () => ({ state: live.has(id) ? 'streaming' as const : 'disposed' as const, lastActivity: null, sessionFile: null }),
     async dispose() {
-      live.delete(id);
+      // A leaking session reports disposed to its caller but keeps running.
+      if (!leaks) live.delete(id);
     },
   };
 }
@@ -263,6 +266,10 @@ async function heldReview(input: {
    * it (an unproven stop); released in teardown so shutdown completes. */
   readonly closeHangs?: boolean;
   readonly deadlineMs?: number;
+  /** Sessions survive disposal (an unproven stop after the run settled). */
+  readonly leakSessions?: boolean;
+  /** The runtime's owner-cessation proof (default: proven). */
+  readonly ownerCeased?: () => boolean;
 }): Promise<ReviewHarness & { readonly run: Promise<WaveOutcome>; readonly releaseClose: () => void }> {
   const repo = makeFixtureRepo('review-supersession');
   repos.push(repo);
@@ -285,7 +292,8 @@ async function heldReview(input: {
   });
   const sessionDir = temp('supersession-sessions-');
   const reservation: ResidentReviewRound = {
-    spawn: async (_options: SpawnOptions) => hangingHandle(`perkins-${++sessionSeq}`, liveSessions, sessionDir),
+    spawn: async (_options: SpawnOptions) =>
+      hangingHandle(`perkins-${++sessionSeq}`, liveSessions, sessionDir, input.leakSessions === true),
     beginChildren: (maxChildren: number) => ({ concurrency: maxChildren, finish: () => {} }),
     close: () => (input.closeHangs === true ? closeGate : Promise.resolve()),
     reconcileCleanup: () => {},
@@ -298,7 +306,7 @@ async function heldReview(input: {
       throw new Error(`no direct ${role} spawn in the held-review harness`);
     },
     reviewArtifactRoot: temp('supersession-artifacts-'),
-    reconcileReviewAgent: async () => true,
+    reconcileReviewAgent: async () => input.ownerCeased?.() ?? true,
     reserveReviewRound: (signal) => input.mode === 'running'
       ? Promise.resolve(reservation)
       : new Promise<ResidentReviewRound>((_resolve, reject) => {
@@ -425,9 +433,12 @@ describe('rule 3 — the bmad-review fallback gate is a review too', () => {
       fallbackGate: {
         skillPath,
         // The fallback reviewer runs until its signal aborts.
-        runFallbackReview: (input) => new Promise((_resolve, reject) => {
+        runFallbackReview: (input) => new Promise((resolve, reject) => {
           reviewing = true;
-          input.signal?.addEventListener('abort', () => reject(new Error('fallback reviewer cancelled')), { once: true });
+          // A reviewer that ANSWERS (clean, no blockers) after cancellation:
+          // its findings must never become a PASS on the obsolete diff.
+          input.signal?.addEventListener('abort', () => resolve([]), { once: true });
+          void reject;
         }),
         fixDirectiveSink: async () => ({ delivered: true as const }),
       },
@@ -450,6 +461,10 @@ describe('rule 3 — the bmad-review fallback gate is a review too', () => {
     expect(escalations).toEqual([`Perkins gate unavailable for job ${jobId} — the bmad-review gate is engaged`]);
     const terminal = ledger.latestJobEvent(jobId, 'job.fallback-review');
     expect(terminal?.payload).toMatchObject({ phase: 'aborted', superseded: true });
+    const phases = ledger.listJobEvents(jobId, { limit: 50 })
+      .filter((event) => event.kind === 'job.fallback-review')
+      .map((event) => (event.payload as { phase?: string }).phase);
+    expect(phases).not.toContain('pass');
   });
 });
 
@@ -474,15 +489,21 @@ class CapturingMinions implements DirectiveRegistry {
   getHandle(id: string): AgentHandle | null {
     return this.handles.get(id) ?? null;
   }
+  /** A fresh (re-brief) minion: captured like the live one. */
   async spawn(_role: Role): Promise<AgentHandle> {
-    throw new Error('the lane minion is live in this harness');
+    const id = `spawned-${this.handles.size + 1}`;
+    this.register(id);
+    return this.handles.get(id)!;
   }
   async disposeHandle(handle: AgentHandle): Promise<void> {
     this.handles.delete(handle.id);
   }
 }
 
-async function serve(h: ReviewHarness): Promise<{ port: number; registry: CapturingMinions }> {
+async function serve(
+  h: Pick<ReviewHarness, 'ledger' | 'wave' | 'port' | 'jobId'>,
+  extra: { readonly providerClaims?: string[] } = {},
+): Promise<{ port: number; registry: CapturingMinions }> {
   const dir = temp('supersession-server-');
   writeFileSync(join(dir, 'config.toml'), `[auth]\ntoken = "${TOKEN}"\n[server]\nhost = "127.0.0.1"\nport = 0\n`, 'utf-8');
   const registry = new CapturingMinions();
@@ -494,7 +515,21 @@ async function serve(h: ReviewHarness): Promise<{ port: number; registry: Captur
     dispatch: null as unknown as DispatchService,
     wave: h.wave,
     ledger: h.ledger,
-    silasOps: { registry, worktrees: h.port, notifications: new NotificationCenter({ ledger: h.ledger, bus: new EventBus() }) },
+    silasOps: {
+      registry,
+      worktrees: h.port,
+      notifications: new NotificationCenter({ ledger: h.ledger, bus: new EventBus() }),
+      ...(extra.providerClaims !== undefined
+        ? {
+            providerRecovery: {
+              claim: async (waitId: string) => {
+                extra.providerClaims!.push(waitId);
+                return { claimed: true };
+              },
+            } as never,
+          }
+        : {}),
+    },
   });
   const http: HttpServer = createServer((req, res) => {
     if (server.requestHook(req, res, new URL(req.url ?? '/', 'http://localhost').pathname)) return;
@@ -648,5 +683,266 @@ describe('the Silas digest owes ONE continuation while a revision is pending', (
     expect((await digest()).prWithoutReview[0]?.cleanAbort?.roundId).toBe(round.id);
     ledger.appendCustomEvent({ kind: 'round.superseded', jobId: 'job-e', roundId: round.id, payload: { reason: 'material amendment' } });
     expect((await digest()).prWithoutReview.some((row) => row.cleanAbort !== undefined)).toBe(false);
+  });
+});
+
+/** A laned job with a real wave but no review: writer paths, re-briefs and
+ * queued handoffs (bus-backed) without any running round. */
+async function plainLane(jobId = 'job-plain'): Promise<ReviewHarness> {
+  const repo = makeFixtureRepo('review-supersession-plain');
+  repos.push(repo);
+  repo.git(['checkout', '-b', 'feature/review']);
+  const target = repo.commitFile('src/main.ts', 'export const rows = 1;\n');
+  const port = new GitReviewPort(temp('supersession-plain-port-'), 'feature/review', target);
+  const db = new LedgerDb(temp('gru-supersession-plain-db-'));
+  closers.push(async () => db.close());
+  const bus = new EventBus();
+  const ledger = new LedgerApi(db.handle, { bus });
+  await port.createJobWorktree({ repoPath: repo.path, jobId });
+  ledger.addJob({ id: jobId, repo: 'fixture', title: 'plain', baseBranch: 'main', briefing: BRIEFING });
+  ledger.setJobStatus(jobId, 'working');
+  const escalations: string[] = [];
+  const informs: string[] = [];
+  const wave = new WaveRunner({
+    ledger,
+    worktrees: port,
+    bus,
+    spawner: async (role: Role) => {
+      throw new Error(`no ${role} spawn in the plain-lane harness`);
+    },
+    reviewArtifactRoot: temp('supersession-plain-artifacts-'),
+    escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+    inform: (title) => informs.push(title),
+  });
+  closers.push(() => wave.shutdown());
+  return { ledger, wave, repo, port, escalations, informs, liveSessions: new Set(), jobId };
+}
+
+describe('review round 1 — the fences hold under force, restart and re-proof', () => {
+  it('force never reviews a candidate an approved material change made obsolete', async () => {
+    const h = await plainLane('job-forced');
+    deliver(h.ledger, h.jobId);
+    amend(h.ledger, h.jobId, 'material', 'Approved correction.');
+    await expect(h.wave.requestReview({ jobId: h.jobId, force: true })).rejects.toThrow(/is busy/);
+    const refusal = h.ledger.latestJobEvent(h.jobId, 'branch-idle.refused');
+    expect(refusal?.payload).toMatchObject({ forced: false, blockers: [{ jobId: h.jobId, revision: { required: 1, delivered: 0 } }] });
+    expect(h.ledger.latestJobEvent(h.jobId, 'branch-idle.forced')).toBeNull();
+    expect(h.ledger.listRounds(h.jobId)).toHaveLength(0);
+  });
+
+  it('an unproven stop keeps owning the lane until a later writer re-proves it', async () => {
+    const h = await heldReview({ mode: 'running', leakSessions: true, deadlineMs: 2000 });
+    const roundId = h.wave.activeReview(h.jobId)!.roundIds[0]!;
+    amend(h.ledger, h.jobId, 'material', 'Approved correction.');
+    // The run settles and the round terminalizes, but a session survives.
+    await expect(h.wave.clearLaneForWriter({ jobId: h.jobId, writer: 'directive a' }))
+      .rejects.toThrow(/still alive/);
+    expect(h.ledger.getRound(roundId)?.status).toBe('aborted');
+    // The terminal round still owns the lane: the next writer is refused too.
+    expect(h.wave.activeReview(h.jobId)?.roundIds).toEqual([roundId]);
+    await expect(h.wave.clearLaneForWriter({ jobId: h.jobId, writer: 'directive b' }))
+      .rejects.toThrow(ReviewSupersessionUnconfirmedError);
+    // Only once the runtime proves the session gone does a writer pass.
+    h.liveSessions.clear();
+    const proven = await h.wave.clearLaneForWriter({ jobId: h.jobId, writer: 'directive c' });
+    expect(proven.confirmed).toBe(true);
+    expect(h.wave.activeReview(h.jobId)).toBeNull();
+    expect(h.ledger.listEvents().filter((event) => event.roundId === roundId && event.kind === 'round.superseded')).toHaveLength(1);
+    expect(h.ledger.latestRoundEvent(roundId, 'round.supersession-confirmed')).not.toBeNull();
+  });
+
+  it('confirmation demands the runtime owner-cessation proof the next round already requires', async () => {
+    let ceased = false;
+    const h = await heldReview({ mode: 'running', ownerCeased: () => ceased });
+    await expect(h.wave.clearLaneForWriter({ jobId: h.jobId, writer: 'directive o' }))
+      .rejects.toThrow(/not proven ceased/);
+    ceased = true;
+    expect((await h.wave.clearLaneForWriter({ jobId: h.jobId, writer: 'directive o2' })).confirmed).toBe(true);
+  });
+
+  it('a material change withdraws the queued review request, durably — a delivery or restart never replays it', async () => {
+    const h = await plainLane('job-queued-handoff');
+    // The minion asks for review while its own turn is still open.
+    const queued = await h.wave.requestReview({ jobId: h.jobId, handoff: true, targetRef: 'feature/review' });
+    expect(queued.route).toBe('queued');
+    amend(h.ledger, h.jobId, 'material', 'Approved correction.');
+    await h.wave.supersedeReviews({ jobId: h.jobId, reason: 'material amendment #1 accepted', by: 'gru' });
+    expect(h.ledger.latestJobEvent(h.jobId, 'job.review-handoff-withdrawn')?.payload)
+      .toMatchObject({ reason: 'material amendment #1 accepted' });
+    if (queued.route === 'queued') await queued.run;
+    deliver(h.ledger, h.jobId, 1);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(h.ledger.latestJobEvent(h.jobId, 'job.review-handoff-claimed')).toBeNull();
+    const restarted = new WaveRunner({
+      ledger: h.ledger, worktrees: h.port, bus: new EventBus(),
+      spawner: async () => {
+        throw new Error('no spawn');
+      },
+      reviewArtifactRoot: temp('supersession-restart-artifacts-'),
+    });
+    closers.push(() => restarted.shutdown());
+    restarted.resumeQueuedHandoffs();
+    expect(h.ledger.latestJobEvent(h.jobId, 'job.review-handoff-skipped')).toBeNull();
+    expect(h.ledger.latestJobEvent(h.jobId, 'job.review-handoff-claimed')).toBeNull();
+  });
+
+  it('a superseded round that a restart interrupted recovers as routine history', async () => {
+    const h = await plainLane('job-restart');
+    const round = h.ledger.addRound({ jobId: h.jobId, lenses: ['blind'] });
+    h.ledger.setRoundStatus(round.id, 'live');
+    h.ledger.appendCustomEvent({
+      kind: 'round.superseded', jobId: h.jobId, roundId: round.id, payload: { reason: 'material amendment accepted' },
+    });
+    await h.wave.recoverInterruptedRounds();
+    expect(h.ledger.getRound(round.id)?.status).toBe('aborted');
+    expect(h.escalations).toEqual([]);
+    expect(h.informs.some((title) => title.includes('(superseded)'))).toBe(true);
+  });
+});
+
+describe('review round 1 — writer gates over HTTP', () => {
+  it('an unproven stop refuses the directive with positive no-effect proof: no prompt, no delivery', async () => {
+    const h = await heldReview({ mode: 'running', closeHangs: true, deadlineMs: 50 });
+    const { port, registry } = await serve(h);
+    amend(h.ledger, h.jobId, 'material', 'Approved correction.');
+    const accepted = await post(port, '/api/silas/directive', { job_id: h.jobId, directive: 'fix', request_id: 'refused-1' });
+    expect(accepted.status).toBe(202);
+    expect(await settledDirective(h.ledger, 'refused-1')).toBe('failed');
+    expect(h.ledger.getDirective('refused-1')?.failReason).toMatch(/refused before any prompt/);
+    expect(h.ledger.latestJobEvent(h.jobId, 'silas.directive-sent')).toBeNull();
+    expect(registry.prompts).toEqual([]);
+    expect(h.ledger.listEvents().filter((event) => event.kind === 'job.delivered' && event.jobId === h.jobId)).toHaveLength(1);
+    expect(h.escalations.filter((line) => line.includes('could not be confirmed stopped'))).toHaveLength(1);
+  });
+
+  it('a re-brief carries the material amendment to the fresh minion and its delivery acknowledges the revision', async () => {
+    const h = await plainLane('job-rebrief');
+    deliver(h.ledger, h.jobId);
+    amend(h.ledger, h.jobId, 'material', 'CORRECTION-BODY: remove the broad import.');
+    const { port, registry } = await serve(h);
+    const res = await post(port, '/api/silas/rebrief', { job_id: h.jobId, note: 'fresh worker for the correction' });
+    expect(res.status).toBe(200);
+    expect(registry.prompts).toHaveLength(1);
+    expect(registry.prompts[0]).toContain('CONTRACT — revision 1');
+    expect(registry.prompts[0]!.split('CORRECTION-BODY: remove the broad import.')).toHaveLength(2);
+    expect(h.ledger.latestJobEvent(h.jobId, 'job.delivered')?.payload).toMatchObject({ source: 'silas-rebrief', work_revision: 1 });
+    expect(h.ledger.workRevisionState(h.jobId)).toEqual({ required: 1, delivered: 1 });
+  });
+
+  it('a re-brief recovered after a restart re-delivers the durable contract and revision', async () => {
+    const h = await plainLane('job-rebrief-boot');
+    deliver(h.ledger, h.jobId);
+    amend(h.ledger, h.jobId, 'material', 'BOOT-CORRECTION: restore the strict viewport tests.');
+    h.ledger.beginPendingRebrief({ jobId: h.jobId, note: 'fresh worker', briefing: h.ledger.effectiveContract(h.jobId)!.text });
+    const registry = new CapturingMinions();
+    const report = await reconcilePendingRebriefs({
+      registry, ledger: h.ledger, worktrees: h.port,
+      notifications: { postIncident: () => ({}) } as never,
+    }, { bootAt: new Date(Date.now() + 60_000) });
+    await report.settled;
+    expect(registry.prompts).toHaveLength(1);
+    expect(registry.prompts[0]).toContain('BOOT-CORRECTION: restore the strict viewport tests.');
+    expect(registry.prompts[0]).toContain('CONTRACT — revision 1');
+    expect(h.ledger.latestJobEvent(h.jobId, 'job.delivered')?.payload).toMatchObject({ work_revision: 1 });
+  });
+
+  it('provider continuations take the same gate: current review → 409; obsolete review → superseded first', async () => {
+    const h = await heldReview({ mode: 'running' });
+    const claims: string[] = [];
+    const { port } = await serve(h, { providerClaims: claims });
+    h.ledger.recordProviderWait({
+      id: 'wait-p', routeKey: 'route-p', provider: 'p', model: 'm', endpoint: 'e', credentialFingerprint: 'fp',
+      waiterKind: 'job-minion', jobId: h.jobId, agentId: null, slotId: null, sessionFile: null, continuation: null,
+      jobStatusAtEstablishment: 'working', lineageKey: null, incidentId: 'incident-p', incidentGeneration: 1,
+      reasonClass: 'temporary-limit',
+    });
+    const current = await post(port, '/api/silas/provider-recovery/claim', { wait_id: 'wait-p', by: 'silas' });
+    expect(current.status).toBe(409);
+    expect(current.json).toMatchObject({ error: 'review_in_progress' });
+    expect(claims).toEqual([]);
+    amend(h.ledger, h.jobId, 'material', 'Approved correction.');
+    const obsolete = await post(port, '/api/silas/provider-recovery/claim', { wait_id: 'wait-p', by: 'silas' });
+    expect(obsolete.status).toBe(200);
+    expect(claims).toEqual(['wait-p']);
+    expect(h.wave.activeReview(h.jobId)).toBeNull();
+    expect(h.liveSessions.size).toBe(0);
+  });
+});
+
+describe('review round 1 — one continuation, never contradictory', () => {
+  it('a superseded pending amendment is named NOT EFFECTIVE and its body withheld', () => {
+    const { ledger } = bootLedger();
+    ledger.addJob({ id: 'job-sup', repo: 'r', title: 't', briefing: BRIEFING });
+    const first = amend(ledger, 'job-sup', 'material', 'OLD-RULE: render two rows.');
+    const second = accepted(ledger.addJobAmendment({
+      jobId: 'job-sup', body: 'NEW-RULE: render one row.', supersedes: [`amendment:${first.id}`],
+      approval: { by: 'gru', reference: 'j-2' }, expectedContractSha256: ledger.effectiveContract('job-sup')!.contractSha256,
+      effect: 'material',
+    })).amendment;
+    const block = renderRevisionContinuation({
+      jobId: 'job-sup', revision: 2, deliveredRevision: 0, pending: [first, second],
+      supersededBy: amendmentSupersessions(ledger.listJobAmendments('job-sup')),
+    });
+    expect(block).not.toContain('OLD-RULE: render two rows.');
+    expect(block).toContain('status: NOT EFFECTIVE — superseded by amendment #2; do not implement it (body withheld)');
+    expect(block).toContain('NEW-RULE: render one row.');
+  });
+
+  it('a fresh fallback session reads the amendment once (effective contract), not twice', async () => {
+    const lanePath = temp('supersession-fresh-lane-');
+    const prompts: string[] = [];
+    const spawnFresh = async (_role: Role, options: SpawnOptions = {}): Promise<AgentHandle> => {
+      if (options.resumeFile !== undefined && options.resumeFile !== null) throw new Error('session file is gone');
+      return {
+        role: 'minion', id: 'fresh-1', sessionFile: null, capabilities: CAPABILITIES,
+        async prompt(text: string) {
+          prompts.push(text);
+        },
+        async steer() {},
+        async followUp() {},
+        subscribe: () => () => {},
+        health: () => ({ state: 'idle' as const, lastActivity: null, sessionFile: null }),
+        async dispose() {},
+      };
+    };
+    const contract = `${BRIEFING}\n\nAMENDMENT-BODY-ONCE`;
+    const outcome = await routeFixDirectiveToMinion({
+      registry: { getHandle: () => null, spawn: spawnFresh, disposeHandle: async () => {} },
+      ledger: {
+        getAgent: () => null,
+        listAgents: () => [],
+        listImplementerMinions: () => [{ id: 'minion-old', role: 'minion', jobId: 'job-f', sessionFile: '/sessions/old.jsonl' }],
+        registerAgent: () => {},
+        getJob: () => ({ briefing: BRIEFING, status: 'working' }),
+      } as never,
+      worktrees: { listWorktrees: () => [{ id: 'job-f', kind: 'job', path: lanePath, branch: null, jobId: 'job-f', status: 'active' }] } as never,
+      jobId: 'job-f',
+      directive: 'Implement contract revision 1.',
+      contract,
+      continuation: { block: 'CONTINUATION-BLOCK\nAMENDMENT-BODY-ONCE', freshNote: 'FRESH-NOTE revision 1' },
+      signal: new AbortController().signal,
+    });
+    expect(outcome.delivered).toBe(true);
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]!.split('AMENDMENT-BODY-ONCE')).toHaveLength(2);
+    expect(prompts[0]).toContain('FRESH-NOTE revision 1');
+    expect(prompts[0]).not.toContain('CONTINUATION-BLOCK');
+  });
+
+  it('the digest withholds the PR offer for an outdated candidate until the corrective delivery', async () => {
+    const { ledger } = bootLedger();
+    ledger.addJob({ id: 'job-nopr', repo: 'r', title: 't', briefing: BRIEFING });
+    ledger.setJobStatus('job-nopr', 'working');
+    deliver(ledger, 'job-nopr');
+    const digest = () => computeSilasDigest({
+      ledger, blockersForRound: async () => ({ blockers: [], note: null }), config: DEFAULT_SILAS_CONFIG, trigger: 'sweep',
+    });
+    expect((await digest()).deliveredWithoutPr.map((row) => row.jobId)).toEqual(['job-nopr']);
+    amend(ledger, 'job-nopr', 'material', 'Correction.');
+    const pending = await digest();
+    expect(pending.deliveredWithoutPr).toEqual([]);
+    expect(pending.revisionContinuations.map((row) => row.jobId)).toEqual(['job-nopr']);
+    deliver(ledger, 'job-nopr', 1);
+    expect((await digest()).deliveredWithoutPr.map((row) => row.jobId)).toEqual(['job-nopr']);
   });
 });

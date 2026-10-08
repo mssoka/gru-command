@@ -12,8 +12,8 @@ import type { PipelineService } from './pipeline.js';
 import type { NotificationCenter } from '../notifications/center.js';
 import type { DispatchService } from './service.js';
 import { ReviewInProgressError, ReviewSupersessionUnconfirmedError, type WaveRunner } from './perkins.js';
-import { isAmendmentEffect, pendingMaterialAmendments, type AmendmentEffect } from '../review-inputs/amendments.js';
-import { renderRevisionContinuation, withRevisionContinuation } from './work-revision.js';
+import { amendmentSupersessions, isAmendmentEffect, pendingMaterialAmendments, type AmendmentEffect } from '../review-inputs/amendments.js';
+import { renderFreshRevisionNote, renderRevisionContinuation } from './work-revision.js';
 import { flipJobToWorking, rebriefFreshMinion, recordFollowUpDelivery, routeFixDirectiveToMinion, type DirectiveRegistry } from './fix-directive.js';
 import { checkRebriefTurn, finalizeRebriefRequest, RebriefTurnCancelled } from './rebrief-recovery.js';
 import { retireInterruptedDirectiveFromRoute } from './directive-recovery.js';
@@ -993,8 +993,10 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         // continuation is sent. The writer's gate re-proves the stop.
         const revision = options.ledger.workRevisionState(jobId);
         let supersession: 'none' | 'started' = 'none';
-        if (!result.idempotent && result.amendment.effect === 'material' && options.wave.activeReview(jobId) !== null) {
-          supersession = 'started';
+        if (!result.idempotent && result.amendment.effect === 'material') {
+          // The pass also withdraws a queued review request for the obsolete
+          // candidate; `started` reports whether a review owned the lane.
+          if (options.wave.activeReview(jobId) !== null) supersession = 'started';
           track(options.wave.supersedeReviews({
             jobId,
             reason: `material amendment #${result.amendment.version} accepted (${result.amendment.approval.reference.slice(0, 120)})`,
@@ -1218,11 +1220,13 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         // order, stamped with the revision the intent recorded.
         const workRevision = intent.workRevision ?? 0;
         const deliveredRevision = options.ledger.workRevisionState(jobId).delivered;
+        const amendments = options.ledger.listJobAmendments(jobId);
         const continuation = renderRevisionContinuation({
           jobId,
           revision: workRevision,
           deliveredRevision,
-          pending: pendingMaterialAmendments(options.ledger.listJobAmendments(jobId), deliveredRevision, workRevision),
+          pending: pendingMaterialAmendments(amendments, deliveredRevision, workRevision),
+          supersededBy: amendmentSupersessions(amendments),
         });
         let delivery: Awaited<ReturnType<typeof routeFixDirectiveToMinion>>;
         try {
@@ -1231,7 +1235,10 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
             ledger: options.ledger,
             worktrees: ops.worktrees,
             jobId,
-            directive: withRevisionContinuation(directive, continuation),
+            directive,
+            ...(continuation !== ''
+              ? { continuation: { block: continuation, freshNote: renderFreshRevisionNote(workRevision) } }
+              : {}),
             contract: options.ledger.effectiveContract(jobId)?.text ?? null,
             signal: controller.signal,
             owner: 'silas-ops',
@@ -1919,18 +1926,26 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       if (by !== 'silas') {
         throw new Error('provider-recovery claims are recorded as silas actions; pass by: "silas"');
       }
-      // Owner rule 5: a provider continuation is a lane writer too. It
-      // resumes interrupted work and carries no approved correction, so it
-      // never supersedes a review — a lane under review refuses it.
+      // Owner rules 3/5: a provider continuation is a lane writer too, on
+      // the same gate as directives and re-briefs — a current review keeps
+      // the branch frozen (409), an obsolete one (material correction
+      // pending) is superseded and PROVEN stopped before the claim resumes.
       const waitJobId = options.ledger.getProviderWait(waitId)?.jobId ?? null;
-      const underReview = waitJobId === null ? null : options.wave.activeReview(waitJobId);
-      if (waitJobId !== null && underReview !== null) {
-        json(res, 409, {
-          error: 'review_in_progress',
-          detail: `job ${waitJobId} is under review — the provider continuation waits for the verdict`,
-          round_ids: underReview.roundIds,
-        });
-        return true;
+      if (waitJobId !== null) {
+        try {
+          options.wave.assertWriterAdmissible(waitJobId);
+          await options.wave.clearLaneForWriter({ jobId: waitJobId, writer: `provider continuation ${waitId}` });
+        } catch (error) {
+          if (error instanceof ReviewInProgressError) {
+            json(res, 409, { error: 'review_in_progress', detail: error.message, round_ids: error.roundIds });
+            return true;
+          }
+          if (error instanceof ReviewSupersessionUnconfirmedError) {
+            json(res, 409, { error: 'review_supersession_unconfirmed', detail: error.message });
+            return true;
+          }
+          throw error;
+        }
       }
       const result = await ops.providerRecovery.claim(waitId, by);
       json(res, 200, result as Record<string, unknown>);
