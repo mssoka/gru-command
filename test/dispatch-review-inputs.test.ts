@@ -41,6 +41,8 @@ async function boot(): Promise<Harness> {
     },
     resumeQueuedHandoffs: () => {},
     shutdown: async () => {},
+    // No review owns these lanes: a material amendment supersedes nothing.
+    activeReview: () => null,
   } as unknown as WaveRunner;
   const dispatch = { worktreesFor: () => [] } as unknown as DispatchService;
   const server = createDispatchServer({ config: cfg, dispatch, wave, ledger, pendingProducerBlockers: () => [] });
@@ -114,6 +116,7 @@ describe('dispatch review-input surfaces', () => {
         body: 'amendment',
         approval: { by: 'owner', reference: 'j-969' },
         expected_contract_sha256: sha256(BRIEFING),
+        effect: 'material',
       });
       expect(unknownJob.status).toBe(404);
       expect(unknownJob.json['error']).toBe('job-not-found');
@@ -159,13 +162,18 @@ describe('dispatch review-input surfaces', () => {
         supersedes: ['original:Acceptance 1'],
         approval: { by: 'owner', reference: 'epoch12 seq194760' },
         expected_contract_sha256: expected,
+        effect: 'material',
       };
       const accepted = await call(h.port, 'POST', '/api/dispatch/amendment', payload);
       expect(accepted.status).toBe(200);
       expect(accepted.json['status']).toBe('accepted');
       expect(accepted.json['idempotent']).toBe(false);
+      expect(accepted.json['review_supersession']).toBe('none');
+      expect(accepted.json['work_revision']).toEqual({ required: 1, delivered: 0, pending: true });
       const after = await call(h.port, 'GET', '/api/dispatch/jobs/j/contract');
       expect(after.json['version']).toBe(1);
+      expect(after.json['work_revision']).toEqual({ required: 1, delivered: 0, pending: true });
+      expect((after.json['amendments'] as { effect: string }[])[0]!.effect).toBe('material');
       expect(after.json['effective_contract']).toContain('Acceptance 1 is superseded');
       expect(after.json['effective_contract']).toContain(BRIEFING);
       // Stale writer refused with the current hash.
