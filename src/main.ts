@@ -1224,7 +1224,9 @@ async function main(): Promise<number> {
   state.wave = wave;
   await wave.recoverInterruptedRounds();
   wave.resumeQueuedHandoffs();
-  wave.resumeAdmissionRetries();
+  // Automatic admission retries live in memory (owner decision 2026-10-08):
+  // one pending when the service stopped escalates now instead of resuming.
+  wave.escalateInterruptedAdmissionRetries();
   // Re-brief restart safety (Silas finding 2026-09-23): a re-brief request
   // mid-flight at restart left no events and no worker. The durable
   // markers written before each worker spawned are consumed here — the

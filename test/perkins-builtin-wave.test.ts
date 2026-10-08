@@ -1,6 +1,6 @@
 import { PacingGate, type RetrySettlement } from '../src/runtime/pacing.js';
 import { execFileSync, spawn } from 'node:child_process';
-import { createHash, generateKeyPairSync } from 'node:crypto';
+import { createHash, generateKeyPairSync, randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -2664,11 +2664,14 @@ describe('WaveRunner built-in Perkins production path', () => {
       escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
     });
     let outcome: WaveOutcome;
+    let pendingRetry: unknown;
     try {
       outcome = asWave(await third.runRound({ jobId: job.id }));
     } finally {
       if (oldPath === undefined) delete process.env.PATH;
       else process.env.PATH = oldPath;
+      // The in-memory retry (owner decision 2026-10-08), before shutdown drops it.
+      pendingRetry = (third as unknown as { admissionRetries: Map<string, { readonly input: unknown }> }).admissionRetries.get(job.id)?.input;
       await third.shutdown();
     }
     // The delta round's READY stands; the refused final pass retries on its own.
@@ -2679,7 +2682,9 @@ describe('WaveRunner built-in Perkins production path', () => {
     expect(escalations.some((entry) => entry.includes('refused admission before any specialist started'))).toBe(false);
     expect(informs.some((entry) => entry.includes('automatic retry 1 of 1 is scheduled'))).toBe(true);
     const scheduled = ledger.latestJobEvent(job.id, 'round.admission-retry-scheduled');
-    expect(scheduled?.payload).toMatchObject({ attempt: 1, input: { jobId: job.id, targetRef: repo.head() } });
+    expect(scheduled?.payload).toMatchObject({ attempt: 1 });
+    expect(scheduled?.roundId).toBe(ledger.listRounds(job.id).at(-1)!.id);
+    expect(pendingRetry).toMatchObject({ jobId: job.id, targetRef: repo.head() }); // the final pass's own target
   }, 120_000);
 
 
@@ -7870,10 +7875,11 @@ describe('provider pacing through WaveRunner', () => {
   });
 });
 
-describe('automatic admission retry (owner decision 2026-10-08)', () => {
+describe('automatic admission retry (owner decisions 2026-10-08: in memory; a stuck git escalates)', () => {
   /** A delivered lane whose advertised-tip probe fails at once while the
-   * shim's flag file exists — git's own failure, so the refusal is the
-   * transient check-failed kind that retries. */
+   * shim's `remote-down` flag exists — git's own failure, so the refusal is
+   * the transient check-failed kind that retries. With `remote-slow`
+   * instead, the probe marks `slowStarted`, waits, then answers truthfully. */
   async function transientFixture(name: string, opts: { readonly probeDelaySeconds?: number; readonly stuckFile?: string } = {}) {
     const repo = makeFixtureRepo(`perkins-retry-${name}`);
     repos.push(repo);
@@ -7899,13 +7905,21 @@ describe('automatic admission retry (owner decision 2026-10-08)', () => {
     attachOrigin(repo, branch, root);
     const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
     const flag = join(shimDir, 'remote-down');
+    const slow = join(shimDir, 'remote-slow');
+    const slowStarted = join(shimDir, 'slow-started');
     writeFileSync(flag, '');
     const delay = opts.probeDelaySeconds !== undefined ? `sleep ${opts.probeDelaySeconds}; ` : '';
     // stuckFile: the remote step hangs, recording its process group.
     const remoteDown = opts.stuckFile !== undefined
       ? `ps -o pgid= -p $$ | tr -d ' ' >> "${opts.stuckFile}"; exec sleep 30`
       : `${delay}echo "fatal: unable to access the remote" >&2; exit 128`;
-    writeFileSync(join(shimDir, 'git'), `#!/bin/sh\nif [ -e "${flag}" ]; then case " $* " in *" ls-remote "*) ${remoteDown};; esac; fi\nexec "${realGit}" "$@"\n`);
+    writeFileSync(join(shimDir, 'git'), [
+      '#!/bin/sh',
+      `if [ -e "${flag}" ]; then case " $* " in *" ls-remote "*) ${remoteDown};; esac; fi`,
+      `if [ -e "${slow}" ]; then case " $* " in *" ls-remote "*) touch "${slowStarted}"; sleep 1;; esac; fi`,
+      `exec "${realGit}" "$@"`,
+      '',
+    ].join('\n'));
     chmodSync(join(shimDir, 'git'), 0o755);
     const oldPath = process.env.PATH;
     process.env.PATH = `${shimDir}:${oldPath ?? ''}`;
@@ -7913,15 +7927,17 @@ describe('automatic admission retry (owner decision 2026-10-08)', () => {
       if (oldPath === undefined) delete process.env.PATH;
       else process.env.PATH = oldPath;
     };
-    return { repo, ledger, bus, port, jobId, sessions, artifacts, flag, branch, target, restorePath };
+    return { repo, ledger, bus, port, jobId, sessions, artifacts, flag, slow, slowStarted, branch, target, restorePath };
   }
 
   const kinds = (ledger: LedgerApi, jobId: string, kind: string) =>
     ledger.listJobEventsByKinds(jobId, [kind], { limit: 50 }).slice().reverse();
   const payloads = (ledger: LedgerApi, jobId: string, kind: string) => kinds(ledger, jobId, kind).map((event) => event.payload as Record<string, unknown>);
+  const settled = (ledger: LedgerApi, jobId: string) => payloads(ledger, jobId, 'round.admission-retry-settled');
   async function until(predicate: () => boolean, timeoutMs = 30_000): Promise<void> {
     await vi.waitFor(() => expect(predicate()).toBe(true), { timeout: timeoutMs, interval: 20 });
   }
+
   it('retries a transient refusal twice — an FYI per retry, the action-required escalation only after the last; zero delays never race the rollback (R7-15)', async () => {
     const { ledger, port, jobId, sessions, artifacts, branch, restorePath } = await transientFixture('exhausted');
     const informs: string[] = [];
@@ -7938,7 +7954,7 @@ describe('automatic admission retry (owner decision 2026-10-08)', () => {
         /\[head-binding\].*check-failed.*automatic retry 1 of 2 is scheduled for \d{4}-/u,
       );
       expect(escalations).toEqual([]);
-      await until(() => escalations.length === 1 && kinds(ledger, jobId, 'round.admission-retry-outcome').length === 2);
+      await until(() => escalations.length === 1 && settled(ledger, jobId).length === 2);
     } finally {
       restorePath();
       await wave.shutdown();
@@ -7949,9 +7965,10 @@ describe('automatic admission retry (owner decision 2026-10-08)', () => {
     const scheduled = kinds(ledger, jobId, 'round.admission-retry-scheduled');
     expect(scheduled.map((event) => [event.roundId, (event.payload as { attempt: number }).attempt]))
       .toEqual([[rounds[0]!.id, 1], [rounds[1]!.id, 2]]);
-    expect(payloads(ledger, jobId, 'round.admission-retry-claimed'))
-      .toEqual([{ attempt: 1, scheduledSeq: scheduled[0]!.seq }, { attempt: 2, scheduledSeq: scheduled[1]!.seq }]);
-    expect(payloads(ledger, jobId, 'round.admission-retry-outcome').map((outcome) => outcome['kind'])).toEqual(['refused', 'refused']);
+    expect(settled(ledger, jobId)).toEqual([
+      { attempt: 1, scheduledSeq: scheduled[0]!.seq, outcome: 'refused' },
+      { attempt: 2, scheduledSeq: scheduled[1]!.seq, outcome: 'refused' },
+    ]);
     expect(informs).toHaveLength(2);
     expect(escalations[0]).toContain('automatic retry 2 of 2 was refused too — no retries remain');
   });
@@ -7979,8 +7996,7 @@ describe('automatic admission retry (owner decision 2026-10-08)', () => {
         entry.move(f);
         await until(() => informs.some((line) => line.includes('skipped')));
         expect(informs.at(-1), entry.name).toMatch(entry.reason);
-        const settled = [...payloads(f.ledger, f.jobId, 'round.admission-retry-skipped'), ...payloads(f.ledger, f.jobId, 'round.admission-retry-outcome')];
-        expect(settled.some((payload) => entry.reason.test(String(payload['reason'] ?? payload['detail']))), entry.name).toBe(true);
+        expect(settled(f.ledger, f.jobId), entry.name).toEqual([expect.objectContaining({ outcome: 'skipped', reason: expect.stringMatching(entry.reason) })]);
         expect(f.ledger.listRounds(f.jobId).length, entry.name).toBe(roundsBefore + (entry.name === 'successor' ? 1 : 0));
         expect(escalations, entry.name).toEqual([]);
       } finally {
@@ -7990,80 +8006,95 @@ describe('automatic admission retry (owner decision 2026-10-08)', () => {
     }
   });
 
-  it('the job moving on DURING the retry — its pre-flight, its freeze — is a skip, never a review or an escalation (R7-13)', async () => {
-    for (const race of ['delivery-in-preflight', 'blocked-in-preflight', 'delivery-in-setup', 'delivery-before-fallback'] as const) {
-      const f = await transientFixture(`race-${race}`);
+  it('work that makes the branch busy DURING the probe stops the review before any admission effect — a request is refused busy, a forced one too for a blocker its arm never audited, a retry skipped with an FYI (R8-16)', async () => {
+    for (const route of ['request', 'forced', 'retry'] as const) {
+      const f = await transientFixture(`busy-probe-${route}`);
       const informs: string[] = [];
       const escalations: string[] = [];
-      let retrying = false;
-      let preflightCalls = 0;
+      // Armed rounds: the freeze has passed its branch-idle check; the
+      // admission probe (slow, and it would pass) starts next — a repair
+      // directive lands while it runs.
+      let armed = route !== 'retry';
+      let landed = false;
       const wave = new WaveRunner({
         ledger: f.ledger, worktrees: f.port, spawner: makeSpawner(f.sessions, []), reviewArtifactRoot: f.artifacts,
-        prHeadProbe: localHeadProbe(f.branch), admissionRetryDelaysMs: [50],
-        reviewPreflight: async () => {
-          const call = ++preflightCalls;
-          if (call === 2) {
-            retrying = true;
-            if (race === 'delivery-in-preflight' || race === 'delivery-before-fallback') {
-              f.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: f.jobId, payload: { sha: 'newer' } });
-            }
-            if (race === 'blocked-in-preflight') f.ledger.setJobStatus(f.jobId, 'blocked');
-            // The pre-flight now routes the retry to the fallback gate.
-            if (race === 'delivery-before-fallback') return { ok: false as const, failures: [preflightFailure('review-policy', 'disabled')] };
-          }
-          return { ok: true as const, failures: [] };
-        },
+        prHeadProbe: localHeadProbe(f.branch), admissionRetryDelaysMs: [100],
         reviewFreezeObserver: () => {
-          if (retrying && race === 'delivery-in-setup') f.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: f.jobId, payload: { sha: 'newer' } });
+          if (!armed) return;
+          setTimeout(() => {
+            if (route === 'forced') {
+              // Another job's lane on the same branch starts working.
+              const sibling = `${f.jobId}-sibling`;
+              void f.port.createJobWorktree({ repoPath: f.repo.path, jobId: sibling }).then(() => {
+                f.ledger.addJob({ id: sibling, repo: 'fixture', title: 'sibling', baseBranch: 'main', briefing: 'sibling' });
+                f.ledger.setJobStatus(sibling, 'working');
+                landed = true;
+              });
+              return;
+            }
+            f.ledger.appendCustomEvent({ kind: 'silas.directive-sent', jobId: f.jobId, payload: { request_id: 'repair-during-probe' } });
+            landed = true;
+          }, 300);
         },
         inform: (title, detail) => informs.push(`${title}: ${detail}`),
         escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
       });
       try {
-        await expect(wave.requestReview({ jobId: f.jobId })).rejects.toThrow(/automatic retry 1 of 1/u);
-        await until(() => kinds(f.ledger, f.jobId, 'round.admission-retry-outcome').length === 1);
+        if (route !== 'retry') {
+          rmSync(f.flag);
+          writeFileSync(f.slow, '');
+          await expect(wave.requestReview({ jobId: f.jobId, ...(route === 'forced' ? { force: true } : {}) }))
+            .rejects.toThrow(route === 'forced' ? new RegExp(`is busy \\(${f.jobId}-sibling: working\\)`, 'u') : /is busy/u);
+          expect(landed).toBe(true);
+        } else {
+          await expect(wave.requestReview({ jobId: f.jobId })).rejects.toThrow(/automatic retry 1 of 1 is scheduled/u);
+          rmSync(f.flag);
+          writeFileSync(f.slow, '');
+          armed = true;
+          await until(() => settled(f.ledger, f.jobId).length === 1);
+          expect(landed).toBe(true);
+          expect(settled(f.ledger, f.jobId)[0]).toMatchObject({ outcome: 'skipped', reason: expect.stringContaining('the branch is busy again') });
+          expect(informs.at(-1)).toContain('skipped');
+        }
       } finally {
         f.restorePath();
         await wave.shutdown();
       }
-      const outcome = payloads(f.ledger, f.jobId, 'round.admission-retry-outcome')[0]!;
-      expect(outcome['kind'], race).toBe('skipped');
-      expect(String(outcome['detail']), race).toMatch(race === 'blocked-in-preflight' ? /the job is blocked/u : /a newer delivery/u);
-      expect(f.ledger.listJobEventsByKinds(f.jobId, ['job.fallback-review'], { limit: 5 }), race).toEqual([]);
-      expect(informs.at(-1), race).toContain('skipped');
-      expect(escalations, race).toEqual([]);
-      // No review ran: an in-setup skip aborts its round before any spawn.
-      expect(f.ledger.listRounds(f.jobId).every((round) => round.status === 'aborted'), race).toBe(true);
-      expect(f.ledger.listRounds(f.jobId), race).toHaveLength(race === 'delivery-in-setup' ? 2 : 1);
-      expect(f.ledger.listAgents().filter((agent) => agent.roundId !== null), race).toEqual([]);
+      const rounds = f.ledger.listRounds(f.jobId);
+      expect(rounds.every((round) => round.status === 'aborted'), route).toBe(true);
+      expect(f.ledger.listAgents().filter((agent) => agent.roundId !== null), route).toEqual([]);
+      const refused = kinds(f.ledger, f.jobId, 'branch-idle.refused').at(-1);
+      expect(refused?.roundId, route).toBe(rounds.at(-1)!.id);
+      expect(escalations, route).toEqual([]);
     }
   });
 
-  it('a fresh request refused while a retry stands takes it over — same attempt and due time — so neither the retry nor the final escalation is lost (R7-11)', async () => {
+  it('a fresh request refused while a retry waits keeps it — same attempt and due time — so neither the retry nor the final escalation is lost (R7-11)', async () => {
     const { ledger, port, jobId, sessions, artifacts, branch, restorePath } = await transientFixture('takeover');
     const escalations: string[] = [];
     const wave = new WaveRunner({
       ledger, worktrees: port, spawner: makeSpawner(sessions, []), reviewArtifactRoot: artifacts,
-      prHeadProbe: localHeadProbe(branch), admissionRetryDelaysMs: [400, 20],
+      prHeadProbe: localHeadProbe(branch), admissionRetryDelaysMs: [0, 600],
       escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
     });
     try {
       await expect(wave.requestReview({ jobId })).rejects.toThrow(/automatic retry 1 of 2 is scheduled/u);
-      const first = kinds(ledger, jobId, 'round.admission-retry-scheduled')[0]!;
-      await expect(wave.requestReview({ jobId })).rejects.toThrow(/automatic retry 1 of 2 is scheduled/u);
-      const [, second] = kinds(ledger, jobId, 'round.admission-retry-scheduled');
-      const rounds = ledger.listRounds(jobId);
-      expect(second!.roundId).toBe(rounds[1]!.id);
-      expect(second!.payload).toMatchObject({ attempt: 1, dueAt: (first.payload as { dueAt: string }).dueAt });
-      expect(payloads(ledger, jobId, 'round.admission-retry-skipped'))
-        .toEqual([expect.objectContaining({ scheduledSeq: first.seq, reason: `superseded by the refusal of round ${rounds[1]!.id}` })]);
+      // Retry 1 runs at once and is refused: retry 2 now waits.
+      await until(() => kinds(ledger, jobId, 'round.admission-retry-scheduled').length === 2);
+      const waiting = kinds(ledger, jobId, 'round.admission-retry-scheduled')[1]!;
+      expect(waiting.payload).toMatchObject({ attempt: 2 });
+      // A fresh request refused meanwhile keeps THAT retry — attempt 2, same due time.
+      await expect(wave.requestReview({ jobId })).rejects.toThrow(/automatic retry 2 of 2 is scheduled/u);
+      const taken = kinds(ledger, jobId, 'round.admission-retry-scheduled')[2]!;
+      expect(taken.roundId).toBe(ledger.listRounds(jobId)[2]!.id);
+      expect(taken.payload).toMatchObject({ attempt: 2, dueAt: (waiting.payload as { dueAt: string }).dueAt });
       await until(() => escalations.length === 1);
     } finally {
       restorePath();
       await wave.shutdown();
     }
-    expect(ledger.listRounds(jobId)).toHaveLength(4); // two requests, two retries
-    expect(escalations[0]).toContain('no retries remain');
+    expect(ledger.listRounds(jobId)).toHaveLength(4); // request, retry 1, fresh request, retry 2
+    expect(escalations[0]).toContain('automatic retry 2 of 2 was refused too — no retries remain');
   });
 
   it('a retry binds the delivery its round reviewed, never one that landed during the probe (R7-14)', async () => {
@@ -8088,7 +8119,7 @@ describe('automatic admission retry (owner decision 2026-10-08)', () => {
     }
   });
 
-  it('a minion handoff refused transiently is notified once (FYI), and its retry waits the handoff out instead of vanishing into it (R7-15, R7-16)', async () => {
+  it('a minion handoff refused transiently is notified once (FYI), and its retries run after the handoff settles (R7-15, R7-16)', async () => {
     const f = await transientFixture('handoff');
     const informs: string[] = [];
     const escalations: string[] = [];
@@ -8104,7 +8135,7 @@ describe('automatic admission retry (owner decision 2026-10-08)', () => {
       f.ledger.setJobStatus(f.jobId, 'working');
       expect((await wave.requestReview({ jobId: f.jobId, handoff: true })).route).toBe('queued');
       f.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: f.jobId, payload: { sha: f.target } });
-      await until(() => escalations.length === 1);
+      await until(() => escalations.length === 1 && settled(f.ledger, f.jobId).length === 2);
     } finally {
       f.restorePath();
       await wave.shutdown();
@@ -8112,20 +8143,21 @@ describe('automatic admission retry (owner decision 2026-10-08)', () => {
     expect(f.ledger.latestJobEvent(f.jobId, 'job.review-handoff-failed')).not.toBeNull();
     expect(escalations[0]).toContain('no retries remain'); // the only action-required notice
     expect(escalations.some((line) => line.includes('Queued review handoff failed'))).toBe(false);
-    expect(payloads(f.ledger, f.jobId, 'round.admission-retry-outcome').map((outcome) => outcome['kind'])).toEqual(['refused', 'refused']);
+    expect(settled(f.ledger, f.jobId).map((entry) => entry['outcome'])).toEqual(['refused', 'refused']);
     expect(f.ledger.listRounds(f.jobId)).toHaveLength(3);
   });
 
-  it('a shutdown in the middle of a retry starts nothing — no fallback gate — and the next start owes the retry again (R7-12, R7-17)', async () => {
+  it('a shutdown in the middle of a retry starts nothing — no fallback gate — and the next start escalates it instead of resuming (R7-12, R7-17)', async () => {
     const f = await transientFixture('interrupted');
     let release!: () => void;
     const held = new Promise<void>((resolve) => { release = resolve; });
     let entered = false;
-    const fallbackOnRetry = async () => ({ ok: false as const, failures: [preflightFailure('review-policy', 'disabled')] });
     let calls = 0;
+    const escalations: string[] = [];
     const options = {
       ledger: f.ledger, worktrees: f.port, spawner: makeSpawner(f.sessions, []), reviewArtifactRoot: f.artifacts,
       prHeadProbe: localHeadProbe(f.branch), admissionRetryDelaysMs: [50],
+      escalate: (title: string, detail: string) => escalations.push(`${title}: ${detail}`),
     };
     const first = new WaveRunner({
       ...options,
@@ -8134,34 +8166,34 @@ describe('automatic admission retry (owner decision 2026-10-08)', () => {
         if (calls === 1) return { ok: true as const, failures: [] };
         entered = true;
         await held; // the retry's pre-flight is in flight when the service stops
-        return fallbackOnRetry();
+        return { ok: false as const, failures: [preflightFailure('review-policy', 'disabled')] };
       },
     });
     await expect(first.requestReview({ jobId: f.jobId })).rejects.toThrow(/automatic retry 1 of 1/u);
     await until(() => entered);
-    await first.shutdown();
+    const stopping = first.shutdown();
     release();
+    await stopping;
     await new Promise((resolve) => setTimeout(resolve, 100));
     expect(f.ledger.listJobEventsByKinds(f.jobId, ['job.fallback-review'], { limit: 10 })).toEqual([]);
-    expect(kinds(f.ledger, f.jobId, 'round.admission-retry-claimed')).toHaveLength(1);
-    expect(kinds(f.ledger, f.jobId, 'round.admission-retry-outcome')).toEqual([]);
-    // Restart: the interrupted claim is owed again, and admits once the remote answers.
+    expect(settled(f.ledger, f.jobId)).toEqual([]);
+    // Restart: nothing resumes the retry — it escalates, once.
     rmSync(f.flag);
     const second = new WaveRunner(options);
     try {
-      expect(second.resumeAdmissionRetries()).toBe(1);
-      await until(() => f.ledger.listRounds(f.jobId).length === 2 && f.ledger.listActiveRounds().length === 0, 60_000);
+      expect(second.escalateInterruptedAdmissionRetries()).toBe(1);
+      expect(second.escalateInterruptedAdmissionRetries()).toBe(0);
+      await new Promise((resolve) => setTimeout(resolve, 200));
     } finally {
       f.restorePath();
       await second.shutdown();
     }
-    const outcomes = payloads(f.ledger, f.jobId, 'round.admission-retry-outcome').map((outcome) => outcome['kind']);
-    expect(outcomes).toEqual(['interrupted', 'round']);
-    const scheduled = payloads(f.ledger, f.jobId, 'round.admission-retry-scheduled');
-    expect(scheduled[1]).toMatchObject({ attempt: 1, resumes: expect.any(Number) });
+    expect(escalations).toEqual([expect.stringMatching(new RegExp(`^Automatic review retry for job ${f.jobId} was interrupted by a restart: Retry 1 after refused round ${f.ledger.listRounds(f.jobId)[0]!.id} was due at`, 'u'))]);
+    expect(settled(f.ledger, f.jobId)).toEqual([expect.objectContaining({ attempt: 1, outcome: 'interrupted' })]);
+    expect(f.ledger.listRounds(f.jobId)).toHaveLength(1); // never re-run
   });
 
-  it('a retry refused while the service stops is recorded as refused — a restart never runs it again', async () => {
+  it('a retry refused while the service stops is settled as refused — the next start does not escalate it again', async () => {
     const f = await transientFixture('refused-at-shutdown');
     const escalations: string[] = [];
     const options = {
@@ -8174,10 +8206,10 @@ describe('automatic admission retry (owner decision 2026-10-08)', () => {
       await expect(first.requestReview({ jobId: f.jobId })).rejects.toThrow(/automatic retry 1 of 1/u);
       await until(() => escalations.length === 1); // the retry's final refusal, its setup still unwinding
       await first.shutdown();
-      await until(() => kinds(f.ledger, f.jobId, 'round.admission-retry-outcome').length === 1);
-      expect(payloads(f.ledger, f.jobId, 'round.admission-retry-outcome')[0]).toMatchObject({ kind: 'refused' });
+      await until(() => settled(f.ledger, f.jobId).length === 1);
+      expect(settled(f.ledger, f.jobId)[0]).toMatchObject({ outcome: 'refused' });
       const second = new WaveRunner(options);
-      expect(second.resumeAdmissionRetries()).toBe(0);
+      expect(second.escalateInterruptedAdmissionRetries()).toBe(0);
       await second.shutdown();
     } finally {
       f.restorePath();
@@ -8185,64 +8217,80 @@ describe('automatic admission retry (owner decision 2026-10-08)', () => {
     expect(escalations).toHaveLength(1);
   });
 
-  it('two runners on one ledger claim a schedule once — the loser leaves quietly (R7-24)', async () => {
-    const f = await transientFixture('two-runners');
+  it('startup escalates only a retry that was really interrupted: never a settled one, a terminal job’s, or one a newer round already answers', async () => {
+    const f = await transientFixture('startup-check');
     const escalations: string[] = [];
-    const options = {
-      ledger: f.ledger, worktrees: f.port, spawner: makeSpawner(f.sessions, []), reviewArtifactRoot: f.artifacts,
-      prHeadProbe: localHeadProbe(f.branch), admissionRetryDelaysMs: [60_000],
-      escalate: (title: string, detail: string) => escalations.push(`${title}: ${detail}`),
-    };
-    const seed = new WaveRunner(options);
-    await expect(seed.requestReview({ jobId: f.jobId })).rejects.toThrow(/automatic retry 1 of 1/u);
-    await seed.shutdown();
-    // Make the durable schedule due now, then let two runners resume it.
-    const due = kinds(f.ledger, f.jobId, 'round.admission-retry-scheduled')[0]!;
-    f.ledger.appendCustomEvent({ kind: 'round.admission-retry-scheduled', jobId: f.jobId, roundId: due.roundId,
-      payload: { ...(due.payload as object), dueAt: new Date().toISOString() } });
-    f.ledger.appendCustomEvent({ kind: 'round.admission-retry-skipped', jobId: f.jobId, roundId: due.roundId,
-      payload: { attempt: 1, scheduledSeq: due.seq, reason: 'test: replaced by a due copy' } });
-    // Both runners fire before either creates a round (their pre-flights
-    // wait on one barrier): only the ledger claim can keep them apart.
-    const barrier = new Promise<void>((resolve) => { setTimeout(resolve, 300); });
-    const racing = { ...options, reviewPreflight: async () => { await barrier; return { ok: true as const, failures: [] }; } };
-    const a = new WaveRunner(racing);
-    const b = new WaveRunner(racing);
+    const wave = new WaveRunner({ ledger: f.ledger, worktrees: f.port, spawner: makeSpawner(f.sessions, []), escalate: (title) => escalations.push(title) });
+    const schedule = (roundId: string) => f.ledger.appendCustomEvent({ kind: 'round.admission-retry-scheduled', jobId: f.jobId, roundId,
+      payload: { attempt: 1, of: 2, dueAt: new Date().toISOString(), deliverySeq: 0 } });
     try {
-      expect(a.resumeAdmissionRetries() + b.resumeAdmissionRetries()).toBe(2);
-      await until(() => kinds(f.ledger, f.jobId, 'round.admission-retry-outcome').length === 1);
-      await new Promise((resolve) => setTimeout(resolve, 300));
-    } finally {
-      f.restorePath();
-      await a.shutdown();
-      await b.shutdown();
-    }
-    expect(kinds(f.ledger, f.jobId, 'round.admission-retry-claimed')).toHaveLength(1);
-    expect(kinds(f.ledger, f.jobId, 'round.admission-retry-outcome')).toHaveLength(1);
-    expect(escalations.filter((line) => !line.includes('no retries remain'))).toEqual([]);
-  });
-
-  it('timer bounds: an unsupported delay is refused up front; a recovered wait beyond Node’s ceiling never fires early (R7-18)', async () => {
-    const f = await transientFixture('long-wait');
-    expect(() => new WaveRunner({ ledger: f.ledger, worktrees: f.port, spawner: makeSpawner(f.sessions, []), admissionRetryDelaysMs: [2_147_483_648] }))
-      .toThrow(/admissionRetryDelaysMs must be whole milliseconds from 0 to 2147483647/u);
-    const wave = new WaveRunner({ ledger: f.ledger, worktrees: f.port, spawner: makeSpawner(f.sessions, []), reviewArtifactRoot: f.artifacts, prHeadProbe: localHeadProbe(f.branch) });
-    const round = f.ledger.addRound({ jobId: f.jobId, lenses: [...PERKINS_LENSES], targetRef: f.target });
-    f.ledger.appendCustomEvent({ kind: 'round.admission-retry-scheduled', jobId: f.jobId, roundId: round.id, payload: {
-      attempt: 1, of: 2, dueAt: new Date(Date.now() + 30 * 24 * 3_600_000).toISOString(),
-      deliverySeq: f.ledger.latestJobEvent(f.jobId, 'job.delivered')!.seq, input: { jobId: f.jobId },
-    } });
-    try {
-      expect(wave.resumeAdmissionRetries()).toBe(1);
-      await new Promise((resolve) => setTimeout(resolve, 200));
-      expect(kinds(f.ledger, f.jobId, 'round.admission-retry-claimed')).toEqual([]);
+      const refused = f.ledger.addRound({ jobId: f.jobId, lenses: [...PERKINS_LENSES], targetRef: f.target });
+      const first = schedule(refused.id);
+      f.ledger.appendCustomEvent({ kind: 'round.admission-retry-settled', jobId: f.jobId, roundId: refused.id,
+        payload: { attempt: 1, scheduledSeq: first.seq, outcome: 'ran' } });
+      expect(wave.escalateInterruptedAdmissionRetries()).toBe(0); // settled
+      schedule(refused.id);
+      f.ledger.addRound({ jobId: f.jobId, lenses: [...PERKINS_LENSES], targetRef: f.target });
+      expect(wave.escalateInterruptedAdmissionRetries()).toBe(0); // a newer round answers it
+      expect(settled(f.ledger, f.jobId).at(-1)).toMatchObject({ outcome: 'interrupted' });
+      const latest = f.ledger.listRounds(f.jobId).at(-1)!;
+      schedule(latest.id);
+      f.ledger.setJobStatus(f.jobId, 'done');
+      expect(wave.escalateInterruptedAdmissionRetries()).toBe(0); // terminal
+      expect(escalations).toEqual([]);
     } finally {
       f.restorePath();
       await wave.shutdown();
     }
   });
 
-  it('a clean-abort re-arm keeps its delivered-head fence through the retry, durably (R7-23)', async () => {
+  it('production waits: one minute, then five — never earlier; an unsupported delay is refused up front (R8-19, R7-18)', async () => {
+    const f = await transientFixture('default-delays');
+    expect(() => new WaveRunner({ ledger: f.ledger, worktrees: f.port, spawner: makeSpawner(f.sessions, []), admissionRetryDelaysMs: [2_147_483_648] }))
+      .toThrow(/admissionRetryDelaysMs must be whole milliseconds from 0 to 2147483647/u);
+    const timers = vi.spyOn(globalThis, 'setTimeout');
+    const wave = new WaveRunner({
+      ledger: f.ledger, worktrees: f.port, spawner: makeSpawner(f.sessions, []), reviewArtifactRoot: f.artifacts, prHeadProbe: localHeadProbe(f.branch),
+    });
+    /** The retry timer armed since `from`: its callback and delay. */
+    const armed = (from: number): { readonly fire: () => void; readonly ms: number } => {
+      const calls = timers.mock.calls.slice(from).filter(([, ms]) => typeof ms === 'number' && ms > 30_000);
+      expect(calls).toHaveLength(1);
+      return { fire: calls[0]![0] as () => void, ms: calls[0]![1] as number };
+    };
+    try {
+      let mark = timers.mock.calls.length;
+      let refusedAt = Date.now();
+      await expect(wave.requestReview({ jobId: f.jobId })).rejects.toThrow(/automatic retry 1 of 2 is scheduled/u);
+      const first = armed(mark);
+      expect(first.ms).toBeGreaterThan(59_000);
+      expect(first.ms).toBeLessThanOrEqual(60_000);
+      const due1 = Date.parse((payloads(f.ledger, f.jobId, 'round.admission-retry-scheduled')[0] as { dueAt: string }).dueAt);
+      expect(due1 - refusedAt).toBeGreaterThanOrEqual(59_000);
+      expect(due1 - refusedAt).toBeLessThanOrEqual(61_000);
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(f.ledger.listRounds(f.jobId)).toHaveLength(1); // no early dispatch
+      // The minute is up: fire it (standing in for the clock).
+      mark = timers.mock.calls.length;
+      refusedAt = Date.now();
+      first.fire();
+      await until(() => kinds(f.ledger, f.jobId, 'round.admission-retry-scheduled').length === 2);
+      await until(() => timers.mock.calls.slice(mark).some(([, ms]) => typeof ms === 'number' && ms > 30_000));
+      const second = armed(mark);
+      expect(second.ms).toBeGreaterThan(299_000);
+      expect(second.ms).toBeLessThanOrEqual(300_000);
+      const due2 = Date.parse((payloads(f.ledger, f.jobId, 'round.admission-retry-scheduled')[1] as { dueAt: string }).dueAt);
+      expect(due2 - refusedAt).toBeGreaterThanOrEqual(299_000);
+      expect(due2 - refusedAt).toBeLessThanOrEqual(305_000);
+      expect(f.ledger.listRounds(f.jobId)).toHaveLength(2);
+    } finally {
+      timers.mockRestore();
+      f.restorePath();
+      await wave.shutdown();
+    }
+  });
+
+  it('a clean-abort re-arm keeps its delivered-head fence through the retry (R7-23)', async () => {
     const f = await transientFixture('bound-head');
     const wave = new WaveRunner({
       ledger: f.ledger, worktrees: f.port, spawner: makeSpawner(f.sessions, []), reviewArtifactRoot: f.artifacts,
@@ -8253,26 +8301,15 @@ describe('automatic admission retry (owner decision 2026-10-08)', () => {
     try {
       const targetRef = `origin/${f.branch}`; // the tracking branch the re-arm names
       await expect(wave.requestReview({ jobId: f.jobId, targetRef, boundDeliveredSha: f.target })).rejects.toThrow(/automatic retry 1 of 1/u);
-      expect(payloads(f.ledger, f.jobId, 'round.admission-retry-scheduled')[0]).toMatchObject({ input: { jobId: f.jobId, targetRef, boundDeliveredSha: f.target } });
-      await until(() => kinds(f.ledger, f.jobId, 'round.admission-retry-outcome').length === 1);
+      await until(() => settled(f.ledger, f.jobId).length === 1);
       expect(seen.mock.calls[1]![0]).toMatchObject({ targetRef, boundDeliveredSha: f.target, admissionRetry: expect.any(Object) });
     } finally {
       f.restorePath();
       await wave.shutdown();
     }
-    // A record whose fence is not a SHA cannot be re-submitted.
-    const round = f.ledger.listRounds(f.jobId).at(-1)!;
-    f.ledger.appendCustomEvent({ kind: 'round.admission-retry-scheduled', jobId: f.jobId, roundId: round.id, payload: {
-      attempt: 1, of: 1, dueAt: new Date().toISOString(), deliverySeq: 0, input: { jobId: f.jobId, boundDeliveredSha: 'HEAD~1' },
-    } });
-    const escalations: string[] = [];
-    const resumed = new WaveRunner({ ledger: f.ledger, worktrees: f.port, spawner: makeSpawner(f.sessions, []), escalate: (title) => escalations.push(title) });
-    expect(resumed.resumeAdmissionRetries()).toBe(0);
-    expect(escalations).toEqual([`Automatic review retry for job ${f.jobId} could not resume`]);
-    await resumed.shutdown();
   });
 
-  it('a retry carries the request’s private evidence into the round it admits (R7-21)', async () => {
+  it('a retry re-submits the request exactly — private evidence bytes, scope, delivered-head fence — and never its force (R7-21, R8-21)', async () => {
     const f = await transientFixture('evidence');
     const uploads = mkdtempSync(join(tmpdir(), 'retry-evidence-uploads-'));
     dirs.push(uploads);
@@ -8284,72 +8321,109 @@ describe('automatic admission retry (owner decision 2026-10-08)', () => {
       ledger: f.ledger, worktrees: f.port, spawner: fake.spawner, reviewArtifactRoot: f.artifacts, evidenceUploadsDir: uploads,
       prHeadProbe: localHeadProbe(f.branch), admissionRetryDelaysMs: [100],
     });
+    const seen = vi.spyOn(wave, 'requestReview');
     const evidence = [{ uploadPath, purpose: 'owner reference for the retried review', consentRef: 'owner approval j-1001' }];
+    const targetRef = `origin/${f.branch}`;
     try {
-      await expect(wave.requestReview({ jobId: f.jobId, evidence })).rejects.toThrow(/automatic retry 1 of 1/u);
-      expect(payloads(f.ledger, f.jobId, 'round.admission-retry-scheduled')[0]).toMatchObject({ input: { evidence } });
+      // A forced arm: its force covers only the blockers present at ITS arm.
+      await expect(wave.requestReview({ jobId: f.jobId, targetRef, evidence, force: true })).rejects.toThrow(/automatic retry 1 of 1/u);
       rmSync(f.flag); // the remote answers before the retry is due
-      await until(() => kinds(f.ledger, f.jobId, 'round.admission-retry-outcome').length === 1, 60_000);
-      const outcome = payloads(f.ledger, f.jobId, 'round.admission-retry-outcome')[0]!;
-      expect(outcome['kind']).toBe('round');
-      const roundId = String(outcome['roundId']);
+      await until(() => settled(f.ledger, f.jobId).length === 1, 60_000);
+      const outcome = settled(f.ledger, f.jobId)[0]!;
+      expect(outcome).toMatchObject({ outcome: 'ran', route: 'perkins' });
+      const retried = seen.mock.calls[1]![0];
+      expect(retried).not.toHaveProperty('force');
+      expect(retried).toMatchObject({ jobId: f.jobId, targetRef, evidence });
+      const roundId = String(outcome['ranRoundId']);
       const manifest = JSON.parse(readFileSync(join(f.artifacts, roundId, 'manifest.json'), 'utf8')) as {
+        branchIdle?: unknown;
         reviewEvidence: { attachments: Array<{ purpose: string; consentRef: string; sha256: string }> };
       };
+      expect(manifest.branchIdle).toBeUndefined(); // not forced
       expect(manifest.reviewEvidence.attachments).toEqual([expect.objectContaining({
         purpose: 'owner reference for the retried review', consentRef: 'owner approval j-1001',
         sha256: createHash('sha256').update(pixels).digest('hex'),
       })]);
       await until(() => fake.leadCalls.length > 0, 10_000);
       expect(fake.leadCalls[0]!.images).toHaveLength(1);
+      expect(createHash('sha256').update(Buffer.from(fake.leadCalls[0]!.images![0]!.data, 'base64')).digest('hex'))
+        .toBe(createHash('sha256').update(pixels).digest('hex')); // the bytes the lead received
     } finally {
       f.restorePath();
       await wave.shutdown();
     }
   });
 
-  it('a git group that would not stop blocks every later review of its repository — across a restart too (R7-8)', async () => {
+  it('a git group that would not stop refuses its round, escalates ONCE naming the group, is never retried — and quarantines nothing (owner decision 2026-10-08, R8-25)', async () => {
     const stuckFile = join(mkdtempSync(join(tmpdir(), 'perkins-retry-stuck-')), 'groups');
     dirs.push(dirname(stuckFile));
     const f = await transientFixture('stuck-git', { stuckFile });
     const escalations: string[] = [];
-    const real = OWNED_GIT_SEAMS.groupHasLiveMember;
+    const informs: string[] = [];
     const stuck = (pgid: number): boolean => existsSync(stuckFile) && readFileSync(stuckFile, 'utf8').split('\n').includes(String(pgid));
-    const liveness = vi.spyOn(OWNED_GIT_SEAMS, 'groupHasLiveMember').mockImplementation((pgid, exclude) => stuck(pgid) || real(pgid, exclude));
-    const options = {
-      ledger: f.ledger, worktrees: f.port, spawner: makeSpawner(f.sessions, []), reviewArtifactRoot: f.artifacts,
-      prHeadProbe: localHeadProbe(f.branch), escalate: (title: string, detail: string) => escalations.push(`${title}: ${detail}`),
-    };
-    const first = new WaveRunner(options);
+    const realSync = OWNED_GIT_SEAMS.groupHasLiveMember;
+    const realAsync = OWNED_GIT_SEAMS.groupHasLiveMemberAsync;
+    const sync = vi.spyOn(OWNED_GIT_SEAMS, 'groupHasLiveMember').mockImplementation((pgid, budget) => stuck(pgid) || realSync(pgid, budget));
+    const async = vi.spyOn(OWNED_GIT_SEAMS, 'groupHasLiveMemberAsync').mockImplementation(async (pgid, budget) => stuck(pgid) || realAsync(pgid, budget));
+    const wave = new WaveRunner({
+      ledger: f.ledger, worktrees: f.port, spawner: makeSpawner(f.sessions, []), reviewArtifactRoot: f.artifacts, bus: f.bus,
+      prHeadProbe: localHeadProbe(f.branch), admissionRetryDelaysMs: [0, 0],
+      escalate: (title: string, detail: string) => escalations.push(`${title}: ${detail}`),
+      inform: (title: string, detail: string) => informs.push(`${title}: ${detail}`),
+    });
     try {
-      // The hung remote step is killed at its bound but never confirmed gone.
-      await expect(first.requestReview({ jobId: f.jobId })).rejects.toThrow(/cleanup unconfirmed/u);
-      expect(escalations.at(-1)).toContain('refused admission before any specialist started'); // never a retry
-      expect(kinds(f.ledger, f.jobId, 'round.admission-retry-scheduled')).toEqual([]);
-      const recorded = payloads(f.ledger, f.jobId, 'round.admission-cleanup-pending')[0];
-      expect(recorded).toMatchObject({ groups: [expect.objectContaining({ pgid: expect.any(Number), scope: expect.any(String) })] });
-      await first.shutdown();
-      // A restart: a fresh process knows nothing until it reads the ledger.
-      OWNED_GIT_SEAMS.forgetUnstoppedGroups();
-      const second = new WaveRunner(options);
-      second.resumeAdmissionRetries();
-      const rounds = f.ledger.listRounds(f.jobId).length;
-      await expect(second.requestReview({ jobId: f.jobId })).rejects.toThrow(/did not stop after SIGKILL; no review can start here until it is gone/u);
-      expect(escalations.at(-1)).toContain('cannot start: git cleanup unconfirmed');
-      expect(f.ledger.listRounds(f.jobId)).toHaveLength(rounds); // nothing frozen, nothing probed
-      // Once the group is really gone, reviews run again.
-      liveness.mockRestore();
+      // Through a queued minion handoff: its wrapper must not alert a second time.
+      f.ledger.setJobStatus(f.jobId, 'blocked');
+      f.ledger.setJobStatus(f.jobId, 'working');
+      expect((await wave.requestReview({ jobId: f.jobId, handoff: true })).route).toBe('queued');
+      f.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: f.jobId, payload: { sha: f.target } });
+      await until(() => f.ledger.latestJobEvent(f.jobId, 'job.review-handoff-failed') !== null, 60_000);
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(escalations).toHaveLength(1);
+      expect(escalations[0]).toMatch(/refused admission before any specialist started: .*cleanup unconfirmed: process group \d+ still running/u);
+      expect(informs).toEqual([]);
+      expect(kinds(f.ledger, f.jobId, 'round.admission-retry-scheduled')).toEqual([]); // never a retry
+      // No quarantine: once the remote answers, the next request is admitted.
+      sync.mockRestore();
+      async.mockRestore();
       rmSync(f.flag);
-      const admitted = await second.requestReview({ jobId: f.jobId });
+      const admitted = await wave.requestReview({ jobId: f.jobId });
       expect(admitted.route).toBe('perkins');
-      await second.shutdown();
     } finally {
-      liveness.mockRestore();
+      sync.mockRestore();
+      async.mockRestore();
       f.restorePath();
+      await wave.shutdown();
     }
   }, 120_000);
 
-  it('a refused round restores only its own status flip — a reopened attempt in between is never concealed (R7-10)', async () => {
+  it('a review blocked before any round — its PR head unverifiable — through a queued handoff alerts once, never again as a failed handoff (R8-25)', async () => {
+    const f = await transientFixture('blocked-head');
+    const escalations: string[] = [];
+    const wave = new WaveRunner({
+      ledger: f.ledger, worktrees: f.port, spawner: makeSpawner(f.sessions, []), reviewArtifactRoot: f.artifacts, bus: f.bus,
+      // The code host reports a head the fetched branch tip does not match.
+      prHeadProbe: async () => ({ headRefName: f.branch, headSha: '0'.repeat(40) }),
+      escalate: (title: string, detail: string) => escalations.push(`${title}: ${detail}`),
+    });
+    try {
+      f.ledger.setJobStatus(f.jobId, 'blocked');
+      f.ledger.setJobStatus(f.jobId, 'working');
+      expect((await wave.requestReview({ jobId: f.jobId, handoff: true })).route).toBe('queued');
+      f.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: f.jobId, payload: { sha: f.target } });
+      await until(() => f.ledger.latestJobEvent(f.jobId, 'job.review-handoff-failed') !== null);
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    } finally {
+      f.restorePath();
+      await wave.shutdown();
+    }
+    expect(f.ledger.latestJobEvent(f.jobId, 'job.review-freeze-blocked')).not.toBeNull();
+    expect(escalations).toHaveLength(1);
+    expect(escalations[0]).toContain('was blocked before any round: the PR head could not be verified');
+    expect(f.ledger.listRounds(f.jobId)).toEqual([]);
+  });
+
+  it('a refused round restores only its own status flip — a reopened attempt in between is never concealed, even one written as the flip is published (R7-10, R8-10)', async () => {
     const f = await transientFixture('restore-cas');
     const round = f.ledger.admitReviewRound({
       jobId: f.jobId, expectedLatestRoundId: null, expectedJobStatus: 'working', lenses: [...PERKINS_LENSES], targetRef: f.target,
@@ -8364,5 +8438,114 @@ describe('automatic admission retry (owner decision 2026-10-08)', () => {
     expect(f.ledger.latestJobEvent(f.jobId, 'job.status')!.seq).toBe(before);
     expect(laneIsBusy(f.ledger, f.ledger.getJob(f.jobId)!)).toBe(true); // the reopened attempt has not delivered
     f.restorePath();
+
+    // R8-10: a subscriber reopens the lane SYNCHRONOUSLY when the flip is
+    // published — before admission even returns. The token is the flip
+    // itself, read inside the admission transaction.
+    const g = await transientFixture('restore-publication');
+    let reopened = false;
+    const stop = g.bus.subscribe((event) => {
+      const payload = event.payload as { to?: unknown } | null;
+      if (reopened || event.jobId !== g.jobId || event.kind !== 'job.status' || payload?.to !== 'in-review') return;
+      reopened = true;
+      g.ledger.setJobStatus(g.jobId, 'working');
+      g.ledger.setJobStatus(g.jobId, 'in-review');
+    });
+    const wave = new WaveRunner({
+      ledger: g.ledger, worktrees: g.port, spawner: makeSpawner(g.sessions, []), reviewArtifactRoot: g.artifacts,
+      prHeadProbe: localHeadProbe(g.branch), admissionRetryDelaysMs: [],
+    });
+    try {
+      await expect(wave.requestReview({ jobId: g.jobId })).rejects.toThrow();
+      expect(reopened).toBe(true);
+      const statuses = kinds(g.ledger, g.jobId, 'job.status');
+      expect(statuses.some((event) => (event.payload as { restoredAfterRound?: unknown }).restoredAfterRound !== undefined)).toBe(false);
+      expect(g.ledger.getJob(g.jobId)!.status).toBe('in-review');
+      expect(laneIsBusy(g.ledger, g.ledger.getJob(g.jobId)!)).toBe(true);
+    } finally {
+      stop();
+      g.restorePath();
+      await wave.shutdown();
+    }
+  });
+
+  it('a shutdown during freeze-target resolution starts nothing — no round, no review worktree (R8-18)', async () => {
+    const f = await transientFixture('shutdown-resolution');
+    rmSync(f.flag);
+    let entered = false;
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const probe = localHeadProbe(f.branch);
+    const wave = new WaveRunner({
+      ledger: f.ledger, worktrees: f.port, spawner: makeSpawner(f.sessions, []), reviewArtifactRoot: f.artifacts,
+      prHeadProbe: async (input) => {
+        entered = true;
+        await held;
+        return probe(input);
+      },
+    });
+    const created = vi.spyOn(f.port, 'createReviewWorktree');
+    try {
+      const request = wave.requestReview({ jobId: f.jobId });
+      await until(() => entered);
+      const stopping = wave.shutdown();
+      release();
+      await expect(request).rejects.toThrow(/shut down during review setup|shutting down/u);
+      await stopping;
+    } finally {
+      f.restorePath();
+    }
+    expect(f.ledger.listRounds(f.jobId)).toEqual([]);
+    expect(created).not.toHaveBeenCalled();
+    expect(f.ledger.getJob(f.jobId)!.status).toBe('working');
+  });
+
+  it('a shutdown during resolution reconciles no earlier owner; one during that reconciliation still creates no round (R8-18)', async () => {
+    for (const during of ['resolution', 'reconciliation'] as const) {
+      const f = await transientFixture(`shutdown-${during}`);
+      rmSync(f.flag);
+      // An earlier round whose owner marker must be reconciled before a replacement.
+      const old = f.ledger.addRound({ jobId: f.jobId, lenses: [...PERKINS_LENSES], targetRef: f.target });
+      f.ledger.setRoundStatus(old.id, 'aborted');
+      f.ledger.appendCustomEvent({ kind: 'round.review-owner', jobId: f.jobId, roundId: old.id,
+        payload: { roundId: old.id, targetSha: f.target, runtimeId: 'pi', pid: process.pid, generation: randomUUID() } });
+      let entered = false;
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      const reconciled: string[] = [];
+      const probe = localHeadProbe(f.branch);
+      const wave = new WaveRunner({
+        ledger: f.ledger, worktrees: f.port, spawner: makeSpawner(f.sessions, []), reviewArtifactRoot: f.artifacts,
+        prHeadProbe: async (input) => {
+          if (during === 'resolution') {
+            entered = true;
+            await held;
+          }
+          return probe(input);
+        },
+        reconcileReviewAgent: async (agentId) => {
+          reconciled.push(agentId);
+          if (during === 'reconciliation') {
+            entered = true;
+            await held;
+          }
+          return true;
+        },
+      });
+      const created = vi.spyOn(f.port, 'createReviewWorktree');
+      try {
+        const request = wave.requestReview({ jobId: f.jobId });
+        await until(() => entered);
+        const stopping = wave.shutdown();
+        release();
+        await expect(request, during).rejects.toThrow(/shut down during review setup|shutting down/u);
+        await stopping;
+      } finally {
+        f.restorePath();
+      }
+      expect(f.ledger.listRounds(f.jobId).map((round) => round.id), during).toEqual([old.id]);
+      expect(created, during).not.toHaveBeenCalled();
+      expect(reconciled, during).toEqual(during === 'resolution' ? [] : ['']);
+    }
   });
 });

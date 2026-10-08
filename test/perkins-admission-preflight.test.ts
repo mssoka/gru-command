@@ -15,12 +15,13 @@ import {
   runOwnedGitSync,
   sourceMovementSinceFreeze,
   OWNED_GIT_SEAMS,
-  adoptUnstoppedGroups,
+  executingMember,
   groupHasLiveMember,
-  repoScope,
-  unstoppedGroupsIn,
+  procGroupMembers,
+  psGroupMembers,
+  refUnresolved,
+  runOwnedGit,
   type SourceMovement,
-  type UnstoppedGroup,
   SUSPEND_EVIDENCE_ALLOWANCE_MS,
   type SuspendEvidenceIo,
 } from '../src/dispatch/perkins-review/artifacts.js';
@@ -32,6 +33,7 @@ import { appendCiEvidence, renderRecordedCiEvidence } from '../src/review-inputs
 import { appendRecordedVerification } from '../src/verify/evidence.js';
 import { minimalPng } from './helpers/images.js';
 import { attachBareOrigin, makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
+import { discoverOwnGroup, reapShimRegistries } from './helpers/shim-reaper.js';
 
 /**
  * Admission preflight (gh-169 Stage 4): the read-only gate between the
@@ -51,31 +53,14 @@ const dirs: string[] = [];
  * each recorded process is killed here BEFORE its file is deleted. */
 const pidFiles: string[] = [];
 /** R7-19: every git-shim invocation appends "<pid> <pgid>" here, so its
- * wrapper, group and same-group descendants are reaped even when an
- * assertion failed first — never this worker's own group. */
+ * wrapper, group and same-group descendants are reaped — and proven gone —
+ * even when an assertion failed first; never this worker's own group,
+ * which must be known first (R8-23). */
 const shimRegistries: string[] = [];
-const ownGroup = Number(spawnSync('/bin/ps', ['-o', 'pgid=', '-p', String(process.pid)], { encoding: 'utf8' }).stdout.trim());
+const ownGroup = discoverOwnGroup();
 
 afterEach(() => {
-  for (const registry of shimRegistries.splice(0)) {
-    let lines: string[] = [];
-    try {
-      lines = readFileSync(registry, 'utf8').trim().split('\n');
-    } catch {
-      /* never invoked */
-    }
-    for (const line of lines) {
-      const [pid, pgid] = line.trim().split(/\s+/u).map(Number);
-      for (const target of [pgid !== undefined && pgid > 0 && pgid !== ownGroup ? -pgid : null, pid !== undefined && pid > 0 ? pid : null]) {
-        if (target === null) continue;
-        try {
-          process.kill(target, 'SIGKILL');
-        } catch {
-          /* already gone */
-        }
-      }
-    }
-  }
+  const survivors = reapShimRegistries(shimRegistries.splice(0), ownGroup);
   for (const pidFile of pidFiles.splice(0)) {
     let pid = Number.NaN;
     try {
@@ -92,6 +77,7 @@ afterEach(() => {
   }
   while (repos.length > 0) repos.pop()?.cleanup();
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  if (survivors.length > 0) throw new Error(`git-shim fixtures still running after the reaper: ${survivors.join(', ')}`);
 });
 
 /** A fresh pid-file path the afterEach reaper owns. */
@@ -1053,7 +1039,7 @@ describe('Perkins admission preflight (gh-169)', () => {
     }
   });
 
-  it('the synchronous probe kills its group when the wrapper floods its output, and when the runner itself is cut off', async () => {
+  it('the synchronous probe kills its group when the wrapper floods its output; a runner cut off by the outer guard leaves a group it can no longer prove its own — refused, never signalled (R6-2, R8-6)', async () => {
     const review = branchTargetReview('flood');
     const pidFile = pidFileFor('admission-flood-', 'descendant.pid');
     let restore = gitShim('ls-remote', `sleep 30 & echo $! > "${pidFile}"; head -c 3000000 /dev/zero; exec sleep 10`);
@@ -1070,11 +1056,13 @@ describe('Perkins admission preflight (gh-169)', () => {
     const wrapperFile = pidFileFor('admission-flood-wrapper-', 'wrapper.pid');
     restore = gitShim('ls-remote', `echo $$ > "${wrapperFile}"; sleep 30 & echo $! > "${pidFile}"; exec sleep 20`);
     try {
-      // The outer guard cuts the runner off mid-step (R6-2): the runner led
-      // the group from its spawn, so the parent kills git and its child.
-      expect(() => runOwnedGitSync(review.manifest.repoPath, ['ls-remote', 'origin'], 10_000, 1_500)).toThrow();
-      expect(await stoppedOnItsOwn(pidFile)).toBe(true);
-      expect(await stoppedOnItsOwn(wrapperFile)).toBe(true);
+      // The outer guard cuts the runner off mid-step: spawnSync reaps it, so
+      // its group id is no longer provably ours — observed, refused, and
+      // left for the operator the escalation names.
+      expect(() => runOwnedGitSync(review.manifest.repoPath, ['ls-remote', 'origin'], 10_000, 1_500))
+        .toThrow(/cleanup unconfirmed: process group \d+ still running — git ls-remote origin did not stop after SIGKILL \(runner ended\)/);
+      expect(await stoppedOnItsOwn(pidFile)).toBe(false);
+      expect(await stoppedOnItsOwn(wrapperFile)).toBe(false);
     } finally {
       restore();
     }
@@ -1156,27 +1144,21 @@ describe('Perkins admission preflight (gh-169)', () => {
     }
   });
 
-  it('a same-group writer that finishes inside the grace completes the answer; one still writing after it is refused and killed (R6-3)', async () => {
+  it('git exiting with its output still open is never waited out — a same-group writer, fast or slow, makes the answer incomplete and is killed with the group (R8-1)', async () => {
     const review = branchTargetReview('late-writer');
     const repo = review.manifest.repoPath;
-    // git exits 0 after printing a prefix; a same-group child prints the rest.
-    let restore = gitShim('rev-parse', `printf 'refs/remotes/orig'; (sleep 0.2; printf 'in/feature/late-writer\\n') & exit 0`);
-    try {
-      await expect(defaultProbeExec(repo, ['rev-parse', 'x'], 5_000)).resolves.toBe('refs/remotes/origin/feature/late-writer\n');
-      expect(runOwnedGitSync(repo, ['rev-parse', 'x'], 5_000)).toBe('refs/remotes/origin/feature/late-writer\n');
-    } finally {
-      restore();
-    }
-    const writerFile = pidFileFor('admission-late-writer-', 'writer.pid');
-    restore = gitShim('rev-parse', `printf 'refs/remotes/orig'; (sleep 2; printf 'in/feature/late-writer\\n') & echo $! > "${writerFile}"; exit 0`);
-    try {
-      // The truncated prefix is never an answer, and nothing revives it.
-      await expect(defaultProbeExec(repo, ['rev-parse', 'x'], 5_000)).rejects.toThrow(/output was still held open — the answer is incomplete/);
-      expect(await stoppedOnItsOwn(writerFile)).toBe(true);
-      expect(() => runOwnedGitSync(repo, ['rev-parse', 'x'], 5_000)).toThrow(/the answer is incomplete/);
-      expect(await stoppedOnItsOwn(writerFile)).toBe(true);
-    } finally {
-      restore();
+    for (const delay of ['0.2', '2']) {
+      const writerFile = pidFileFor('admission-late-writer-', `writer-${delay}.pid`);
+      // git exits 0 after printing a prefix; a same-group child would print the rest.
+      const restore = gitShim('rev-parse', `printf 'refs/remotes/orig'; (sleep ${delay}; printf 'in/feature/late-writer\\n') & echo $! > "${writerFile}"; exit 0`);
+      try {
+        await expect(defaultProbeExec(repo, ['rev-parse', 'x'], 5_000), delay).rejects.toThrow(/output was still held open — the answer is incomplete/);
+        expect(await stoppedOnItsOwn(writerFile), delay).toBe(true);
+        expect(() => runOwnedGitSync(repo, ['rev-parse', 'x'], 5_000), delay).toThrow(/the answer is incomplete/);
+        expect(await stoppedOnItsOwn(writerFile), delay).toBe(true);
+      } finally {
+        restore();
+      }
     }
   });
 
@@ -1211,49 +1193,41 @@ describe('Perkins admission preflight (gh-169)', () => {
     expect(t).toBeLessThanOrEqual(5_000 + SUSPEND_EVIDENCE_ALLOWANCE_MS);
   });
 
-  it('a killed step whose group never stops is refused within its bound, earns no retry, and blocks its repository until it is gone (R6-5, R7-8)', async () => {
+  it('a killed step whose group never stops is refused within its bound naming the group, earns no retry, and blocks nothing after it (R6-5, owner decision 2026-10-08)', async () => {
     const review = branchTargetReview('unkillable');
-    const other = branchTargetReview('unkillable-other');
     const countFile = join(temp('admission-unkillable-'), 'ls-remote.count');
     const stuckFile = join(temp('admission-unkillable-groups-'), 'groups');
     const count = (): number => readFileSync(countFile, 'utf8').trim().split('\n').length;
     const restore = gitShim('ls-remote', `ps -o pgid= -p $$ | tr -d ' ' >> "${stuckFile}"; echo run >> "${countFile}"; exec sleep 10`);
     // Uninterruptible I/O, simulated: the ls-remote groups are never
-    // confirmed gone; every other group is read for real. Real signals are
-    // still sent.
-    const real = OWNED_GIT_SEAMS.groupHasLiveMember;
+    // confirmed gone; every other group is read for real.
     const stuck = (pgid: number): boolean => existsSync(stuckFile) && readFileSync(stuckFile, 'utf8').split('\n').includes(String(pgid));
-    const liveness = vi.spyOn(OWNED_GIT_SEAMS, 'groupHasLiveMember').mockImplementation((pgid, exclude) => stuck(pgid) || real(pgid, exclude));
-    let groups: readonly UnstoppedGroup[] = [];
+    const realSync = OWNED_GIT_SEAMS.groupHasLiveMember;
+    const realAsync = OWNED_GIT_SEAMS.groupHasLiveMemberAsync;
+    const sync = vi.spyOn(OWNED_GIT_SEAMS, 'groupHasLiveMember').mockImplementation((pgid, budget) => stuck(pgid) || realSync(pgid, budget));
+    const async = vi.spyOn(OWNED_GIT_SEAMS, 'groupHasLiveMemberAsync').mockImplementation(async (pgid, budget) => stuck(pgid) || realAsync(pgid, budget));
     try {
       const started = performance.now();
       // OS evidence says the host slept, which would otherwise earn one retry.
       const movement = await probeAdvertisedTipMovementAsync(review, 1_500, { evidence: macWake(30_000) });
-      expect(movement).toMatchObject({ cause: 'check-failed', cleanupUnconfirmed: true, detail: expect.stringContaining('cleanup unconfirmed') });
+      expect(movement).toMatchObject({ cause: 'check-failed', cleanupUnconfirmed: true });
+      expect(movement!.detail).toMatch(/^cleanup unconfirmed: process group \d+ still running — git ls-remote .* did not stop after SIGKILL \(timeout\)/u);
       expect(movement).not.toHaveProperty('stopped');
-      groups = movement!.unstoppedGroups ?? [];
-      expect(groups).toEqual([expect.objectContaining({ scope: repoScope(review.manifest.repoPath) })]);
       expect(performance.now() - started).toBeLessThan(1_500 + 1_000 + 1_500);
       expect(count()).toBe(1);
-      // R7-8: nothing more runs in that repository — async, sync, any worktree.
-      expect(() => runOwnedGitSync(review.manifest.repoPath, ['ls-remote', 'origin'], 300))
-        .toThrow(/cleanup unconfirmed: git ls-remote origin was not started: an earlier git step in this repository \(process group \d+\) has not stopped/);
-      await expect(defaultProbeExec(review.manifest.repoPath, ['rev-parse', 'HEAD'], 1_000)).rejects.toThrow(/has not stopped/);
-      expect(count()).toBe(1);
-      // Another repository is not blocked; its own stuck step is bounded too.
+      // No quarantine: the next step in the same repository runs — and is
+      // refused on its own account, again within its bound.
       const syncStarted = performance.now();
-      expect(() => runOwnedGitSync(other.manifest.repoPath, ['ls-remote', 'origin'], 300))
-        .toThrow(/cleanup unconfirmed: git ls-remote origin did not stop after SIGKILL \(timeout\)/);
+      expect(() => runOwnedGitSync(review.manifest.repoPath, ['ls-remote', 'origin'], 300))
+        .toThrow(/cleanup unconfirmed: process group \d+ still running — git ls-remote origin did not stop after SIGKILL \(timeout\)/);
       expect(performance.now() - syncStarted).toBeLessThan(300 + 1_000 + 2_000);
+      expect(count()).toBe(2);
+      await expect(defaultProbeExec(review.manifest.repoPath, ['rev-parse', 'HEAD'], 5_000)).resolves.toMatch(/^[0-9a-f]{40}/u);
     } finally {
-      liveness.mockRestore();
+      sync.mockRestore();
+      async.mockRestore();
       restore();
     }
-    // Once the groups are really gone, the repository runs again, and a
-    // restart adopts a recorded group only while it lives.
-    await expect(defaultProbeExec(review.manifest.repoPath, ['rev-parse', 'HEAD'], 5_000)).resolves.toMatch(/^[0-9a-f]{40}/u);
-    adoptUnstoppedGroups(groups);
-    expect(unstoppedGroupsIn(review.manifest.repoPath)).toEqual([]);
     // Admission keeps a cleanup veto from EITHER probe (R7-6), and retries
     // only a failure that proved its git stopped (R7-7).
     const headBinding = (movement: SourceMovement) => admissionPreflight(review, review.manifest.targetRef, { precomputedRemoteMovement: movement })
@@ -1263,7 +1237,7 @@ describe('Perkins admission preflight (gh-169)', () => {
     expect(headBinding({ cause: 'check-failed', detail: 'fatal: the remote end hung up unexpectedly', stopped: true })).toMatchObject({ retryable: true });
   });
 
-  it('a local failure never erases the remote cleanup veto, and an owned local failure proves its helper gone (R7-6, R7-7)', async () => {
+  it('a local failure never erases the remote cleanup veto — the stuck group is what the refusal names — and an owned local failure proves its helper gone (R7-6, R7-7)', async () => {
     const review = branchTargetReview('local-veto');
     const helperFile = pidFileFor('admission-local-helper-', 'helper.pid');
     // `git status` fails and leaves a same-group helper running.
@@ -1274,28 +1248,48 @@ describe('Perkins admission preflight (gh-169)', () => {
       expect(transient).toMatchObject({ detail: expect.stringContaining('check-failed'), retryable: true });
       expect(await stoppedOnItsOwn(helperFile)).toBe(true); // the owned step took its helper down
       const vetoed = admissionPreflight(review, review.manifest.targetRef, {
-        precomputedRemoteMovement: { cause: 'check-failed', detail: 'git ls-remote did not stop', cleanupUnconfirmed: true },
+        precomputedRemoteMovement: { cause: 'check-failed', detail: 'cleanup unconfirmed: process group 4242 still running — git ls-remote did not stop', cleanupUnconfirmed: true },
       }).missing.find((entry) => entry.input === 'head-binding');
-      expect(vetoed?.detail).toContain('index file locked'); // the local diagnostic leads...
-      expect(vetoed).not.toHaveProperty('retryable'); // ...but the remote veto stands
+      expect(vetoed?.detail).toContain('process group 4242 still running'); // the stuck group leads the refusal...
+      expect(vetoed).not.toHaveProperty('retryable'); // ...and is never retried
     } finally {
       restore();
     }
   });
 
-  it('a group of zombies is not executing: only a live member keeps it running (R7-9)', async () => {
+  it('a group of zombies is not executing, but membership that cannot be read completely always is (R7-9, R8-3)', async () => {
     // `sh` forks a short child and execs into `sleep`, which never reaps it.
     const child = spawn('/bin/sh', ['-c', 'sleep 0.1 & exec sleep 30'], { detached: true, stdio: 'ignore' });
     const pgid = child.pid!;
     try {
       await new Promise((resolve) => setTimeout(resolve, 500));
-      expect(groupHasLiveMember(pgid)).toBe(true); // `sleep 30` executes
-      expect(groupHasLiveMember(pgid, pgid)).toBe(false); // the rest is a zombie
+      expect(groupHasLiveMember(pgid, 1_000)).toBe(true); // `sleep 30` executes
     } finally {
       process.kill(-pgid, 'SIGKILL');
     }
-    expect(groupHasLiveMember(0)).toBe(false);
-    expect(groupHasLiveMember(-1)).toBe(false);
+    expect(groupHasLiveMember(0, 1_000)).toBe(false);
+    expect(groupHasLiveMember(-1, 1_000)).toBe(false);
+    // ps listings: zombies alone are not executing; an unreadable line is unknown, so executing.
+    expect(executingMember(psGroupMembers('  10    10 S\n  11    10 Z+\n  12    99 R\n', 10))).toBe(true);
+    expect(executingMember(psGroupMembers('  11    10 Z\n  12    99 R\n', 10))).toBe(false);
+    expect(psGroupMembers('  11    10 Z\ngarbage\n', 10)).toBeNull();
+    expect(executingMember(null)).toBe(true);
+    // /proc: only a process that ENDED while listed may be skipped (R8-3).
+    const stat = (state: string, group: number) => `1 (git) ${state} 1 ${group} ${group} 0 -1`;
+    const proc = (files: Record<string, string | NodeJS.ErrnoException>) => ({
+      list: () => Object.keys(files),
+      read: (path: string) => {
+        const entry = files[path.split('/')[2]!]!;
+        if (typeof entry !== 'string') throw entry;
+        return entry;
+      },
+    });
+    const errno = (code: string) => Object.assign(new Error(code), { code });
+    expect(procGroupMembers(10, proc({ 20: stat('S', 10), 21: errno('ENOENT'), 22: stat('R', 99) }))).toEqual([{ pid: 20, state: 'S' }]);
+    expect(procGroupMembers(10, proc({ 20: stat('Z', 10), 21: errno('EACCES') }))).toBeNull(); // a denied entry might be a live member
+    expect(procGroupMembers(10, proc({ 20: stat('Z', 10), 21: 'malformed' }))).toBeNull();
+    expect(executingMember(procGroupMembers(10, proc({ 20: stat('Z', 10), 21: errno('EACCES') })))).toBe(true);
+    expect(executingMember(procGroupMembers(10, proc({ 20: stat('Z', 10), 21: errno('ESRCH') })))).toBe(false);
   });
 
   it('a runner that cannot be spawned never signals group 0 — the caller’s own group (R7-1)', () => {
@@ -1367,15 +1361,185 @@ describe('Perkins admission preflight (gh-169)', () => {
 
   it('every outcome — success included — settles only once the whole group is confirmed gone (R7-5)', async () => {
     const review = branchTargetReview('settle-success');
-    const liveness = vi.spyOn(OWNED_GIT_SEAMS, 'groupHasLiveMember').mockReturnValue(true);
+    const sync = vi.spyOn(OWNED_GIT_SEAMS, 'groupHasLiveMember').mockReturnValue(true);
+    const async = vi.spyOn(OWNED_GIT_SEAMS, 'groupHasLiveMemberAsync').mockResolvedValue(true);
     try {
       await expect(defaultProbeExec(review.manifest.repoPath, ['rev-parse', 'HEAD'], 5_000))
-        .rejects.toThrow(/cleanup unconfirmed: git rev-parse HEAD did not stop after SIGKILL \(exit 0\)/);
+        .rejects.toThrow(/cleanup unconfirmed: process group \d+ still running — git rev-parse HEAD did not stop after SIGKILL \(ok\)/);
       expect(() => runOwnedGitSync(branchTargetReview('settle-success-sync').manifest.repoPath, ['rev-parse', 'HEAD'], 5_000))
-        .toThrow(/cleanup unconfirmed: git rev-parse HEAD did not stop after SIGKILL \(ok\)/);
+        .toThrow(/cleanup unconfirmed: process group \d+ still running — git rev-parse HEAD did not stop after SIGKILL \(ok\)/);
     } finally {
-      liveness.mockRestore();
+      sync.mockRestore();
+      async.mockRestore();
     }
+  });
+
+  it('cessation is observed within ONE settle deadline — every inspection gets only what is left, and the async side never blocks the event loop (R8-4)', async () => {
+    const review = branchTargetReview('settle-budget');
+    const budgets: number[] = [];
+    // A slow inspection (a stalled ps): each takes what it is given, up to 300 ms.
+    const async = vi.spyOn(OWNED_GIT_SEAMS, 'groupHasLiveMemberAsync').mockImplementation(async (_pgid, budget) => {
+      budgets.push(budget);
+      await new Promise((resolve) => setTimeout(resolve, Math.max(0, Math.min(budget, 300))));
+      return true;
+    });
+    let gap = 0;
+    let last = performance.now();
+    const heartbeat = setInterval(() => {
+      const now = performance.now();
+      gap = Math.max(gap, now - last);
+      last = now;
+    }, 10);
+    try {
+      const started = performance.now();
+      await expect(defaultProbeExec(review.manifest.repoPath, ['rev-parse', 'HEAD'], 5_000)).rejects.toThrow(/cleanup unconfirmed/);
+      const settled = performance.now() - started;
+      expect(budgets.length).toBeGreaterThan(1);
+      expect(budgets.every((budget, index) => budget <= 1_000 && (index === 0 || budget < budgets[index - 1]!))).toBe(true);
+      expect(settled).toBeLessThan(1_000 + 300 + 1_000); // the step itself, plus one inspection past the deadline
+      expect(gap).toBeLessThan(200); // never blocked
+    } finally {
+      clearInterval(heartbeat);
+      async.mockRestore();
+    }
+    const syncBudgets: number[] = [];
+    const sync = vi.spyOn(OWNED_GIT_SEAMS, 'groupHasLiveMember').mockImplementation((_pgid, budget) => {
+      syncBudgets.push(budget);
+      const until = performance.now() + Math.max(0, Math.min(budget, 300));
+      while (performance.now() < until) { /* a stalled ps */ }
+      return true;
+    });
+    try {
+      const started = performance.now();
+      expect(() => runOwnedGitSync(review.manifest.repoPath, ['rev-parse', 'HEAD'], 5_000)).toThrow(/cleanup unconfirmed/);
+      expect(syncBudgets.every((budget, index) => budget <= 1_000 && (index === 0 || budget < syncBudgets[index - 1]!))).toBe(true);
+      expect(performance.now() - started).toBeLessThan(1_000 + 300 + 1_500);
+    } finally {
+      sync.mockRestore();
+    }
+  });
+
+  it('once its runner — the group anchor — is gone, the group is only observed, never signalled: a reused group id is never hit (R8-6)', async () => {
+    const review = branchTargetReview('anchor');
+    const realKill = process.kill.bind(process);
+    const signals: { target: number; signal: string | number | undefined }[] = [];
+    const kill = vi.spyOn(process, 'kill').mockImplementation(((target: number, signal?: string | number) => {
+      signals.push({ target, signal });
+      return realKill(target, signal);
+    }) as typeof process.kill);
+    // The group looks alive after the runner ended (a reused id would too).
+    const sync = vi.spyOn(OWNED_GIT_SEAMS, 'groupHasLiveMember').mockReturnValue(true);
+    const async = vi.spyOn(OWNED_GIT_SEAMS, 'groupHasLiveMemberAsync').mockResolvedValue(true);
+    try {
+      expect(() => runOwnedGitSync(review.manifest.repoPath, ['rev-parse', 'HEAD'], 5_000)).toThrow(/cleanup unconfirmed/);
+      await expect(runOwnedGit(review.manifest.repoPath, ['rev-parse', 'HEAD'], 5_000)).rejects.toThrow(/cleanup unconfirmed/);
+    } finally {
+      kill.mockRestore();
+      sync.mockRestore();
+      async.mockRestore();
+    }
+    // Only the runner signals its own group, while it is alive; this
+    // process sends nothing destructive to any group.
+    expect(signals.filter((entry) => entry.target < 0 && entry.signal !== 0)).toEqual([]);
+  });
+
+  it('base and target resolution: only git’s own "no such commit" is movement; a timeout, spawn or I/O failure is a check failure, retryable once proven stopped (R8-11)', () => {
+    const review = branchTargetReview('resolution');
+    const { baseRef, targetRef } = review.manifest;
+    const local = (shimmed: string, script: string) => {
+      const restore = gitShim('rev-parse', `case " $* " in *" ${shimmed}^{commit} "*) ${script};; esac`);
+      try {
+        return admissionPreflight(review, review.manifest.targetRef, { precomputedRemoteMovement: null })
+          .missing.find((entry) => entry.input === 'head-binding');
+      } finally {
+        restore();
+      }
+    };
+    for (const ref of [baseRef, targetRef]) {
+      expect(local(ref, 'echo "fatal: unable to read 0123abcd: Input/output error" >&2; exit 128'), ref)
+        .toMatchObject({ detail: expect.stringContaining('check-failed: fatal: unable to read'), retryable: true });
+      expect(local(ref, 'echo "fatal: Needed a single revision" >&2; exit 128'), ref).not.toHaveProperty('retryable');
+    }
+    expect(local(baseRef, 'echo "fatal: Needed a single revision" >&2; exit 128')?.detail).toContain('base-unresolvable');
+    expect(local(targetRef, 'echo "fatal: Needed a single revision" >&2; exit 128')?.detail).toContain('target-moved');
+    expect(refUnresolved(Object.assign(new Error('x'), { status: 128, stderr: 'fatal: Needed a single revision\n' }))).toBe(true);
+    expect(refUnresolved(Object.assign(new Error('x'), { status: 128, stderr: 'fatal: Needed a single revision\n', stderrTruncated: true }))).toBe(false);
+    expect(refUnresolved(Object.assign(new Error('timed out'), { killed: true }))).toBe(false);
+  });
+
+  it('git runs in the repository it was given — an inherited GIT_DIR or GIT_WORK_TREE never routes a step elsewhere (R8-22)', async () => {
+    const review = branchTargetReview('routed');
+    const other = makeFixtureRepo('admission-routed-other');
+    repos.push(other);
+    other.commitFile('elsewhere.txt', 'another repository\n');
+    const ours = execFileSync('git', ['-C', review.manifest.repoPath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+    const theirs = execFileSync('git', ['-C', other.path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+    expect(theirs).not.toBe(ours);
+    const saved = { dir: process.env.GIT_DIR, tree: process.env.GIT_WORK_TREE };
+    process.env.GIT_DIR = join(other.path, '.git');
+    process.env.GIT_WORK_TREE = other.path;
+    try {
+      expect(runOwnedGitSync(review.manifest.repoPath, ['rev-parse', 'HEAD'], 5_000).trim()).toBe(ours);
+      expect((await runOwnedGit(review.manifest.repoPath, ['rev-parse', 'HEAD'], 5_000)).trim()).toBe(ours);
+      // The plain (submission-gate) movement check and the admission alike.
+      expect(sourceMovementSinceFreeze(review, { skipRemoteProbe: true })).toBeNull();
+      expect(admissionPreflight(review, review.manifest.targetRef, { precomputedRemoteMovement: null })
+        .missing.find((entry) => entry.input === 'head-binding')).toBeUndefined();
+    } finally {
+      if (saved.dir === undefined) delete process.env.GIT_DIR;
+      else process.env.GIT_DIR = saved.dir;
+      if (saved.tree === undefined) delete process.env.GIT_WORK_TREE;
+      else process.env.GIT_WORK_TREE = saved.tree;
+    }
+  });
+
+  it('the shim reaper knows its own process group or refuses to run, and never signals that group (R8-23)', () => {
+    expect(() => discoverOwnGroup(() => ({ status: 1, stdout: '' }))).toThrow(/cannot establish this worker's process group/);
+    expect(() => discoverOwnGroup(() => ({ status: 0, stdout: '\n' }))).toThrow(/cannot establish/);
+    expect(() => discoverOwnGroup(() => ({ status: 0, stdout: '0\n' }))).toThrow(/cannot establish/);
+    expect(discoverOwnGroup(() => ({ status: 0, stdout: ' 4242\n' }))).toBe(4242);
+    expect(() => reapShimRegistries([], 0)).toThrow(/unknown own group/);
+    const registry = join(temp('admission-reaper-'), 'invocations');
+    // A shim that ran in THIS group (a plain, non-owned step) and one in its own.
+    writeFileSync(registry, `111 ${ownGroup}\n222 333\n`);
+    const sent: number[] = [];
+    const left = reapShimRegistries([registry], ownGroup, {
+      kill: (target) => {
+        sent.push(target);
+      },
+      exists: () => false,
+      sleep: () => {},
+    });
+    expect(left).toEqual([]);
+    expect(sent.sort((a, b) => a - b)).toEqual([-333, 111, 222]);
+    expect(sent).not.toContain(-ownGroup);
+  });
+
+  it('a fixture that fails early is still reaped — wrapper, group and same-group helper proven stopped before its registry goes (R7-19, R8-20)', async () => {
+    const dir = temp('admission-early-failure-');
+    const registry = join(dir, 'invocations');
+    const helperFile = join(dir, 'helper.pid');
+    // A wrapper in its own group (like a runner's git), NOT this process's
+    // child, registers itself and leaves a same-group helper running...
+    const script = `echo "$$ $(ps -o pgid= -p $$ | tr -d ' ')" >> "${registry}"; sleep 30 & echo $! > "${helperFile}"; exec sleep 30`;
+    spawnSync(process.execPath, ['-e', `require('node:child_process').spawn('/bin/sh', ['-c', ${JSON.stringify(script)}], { detached: true, stdio: 'ignore' }).unref()`]);
+    for (let attempt = 0; attempt < 100 && !existsSync(helperFile); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 20));
+    const [wrapper, group] = readFileSync(registry, 'utf8').trim().split(/\s+/u).map(Number);
+    const helper = Number(readFileSync(helperFile, 'utf8').trim());
+    const present = (target: number): boolean => {
+      try {
+        process.kill(target, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    expect([wrapper!, helper, -group!].every(present)).toBe(true);
+    // ...then the test fails at its first assertion; the reaper still runs.
+    expect(() => expect('early assertion').toBe('never reached')).toThrow();
+    expect(reapShimRegistries([registry], ownGroup)).toEqual([]);
+    expect(existsSync(registry)).toBe(true); // the marker outlives the proof
+    expect([wrapper!, helper, -group!].filter(present)).toEqual([]);
   });
 
   it('a timed-out step leaves no timer behind, and the sync probe returns at its own bound (R6-6)', async () => {

@@ -2426,6 +2426,21 @@ export class LedgerApi {
     });
   }
 
+  /** {@link admitReviewRound}, also returning the round's OWN provisional
+   * status event (null when the job was not flipped) — read inside the
+   * transaction, so a subscriber that writes another status when the flip
+   * is published can never be mistaken for it (R8-10). */
+  admitReviewRoundWithFlip(input: Parameters<LedgerApi['admitReviewRound']>[0]): { readonly round: RoundRecord; readonly flipSeq: number | null } {
+    return this.transaction(() => {
+      const before = this.latestJobEvent(input.jobId, 'job.status')?.seq ?? 0;
+      const round = this.admitReviewRound(input);
+      const flip = this.db.prepare(
+        "SELECT seq FROM events WHERE job_id = ? AND kind = 'job.status' AND seq > ? ORDER BY seq ASC LIMIT 1",
+      ).get(input.jobId, before) as { seq: number } | undefined;
+      return { round, flipSeq: flip === undefined ? null : Number(flip.seq) };
+    });
+  }
+
   /** Undo only this round's provisional status flip. An admitted successor
    * owns the job status now: an older setup failure must not roll it back. */
   restoreReviewSetupStatus(input: {
@@ -3246,31 +3261,6 @@ export class LedgerApi {
         payload: fields.payload,
       }),
     );
-  }
-
-  /** Append `fields` unless this job already holds an event of one of
-   * `guard.kinds` naming the same `scheduledSeq` — in ONE transaction, so of
-   * two claimants only one can win (R7-24). Null when it lost. */
-  appendCustomEventUnlessRecorded(
-    fields: Parameters<LedgerApi['appendCustomEvent']>[0],
-    guard: { readonly jobId: string; readonly kinds: readonly string[]; readonly scheduledSeq: number },
-  ): BusEvent | null {
-    if (guard.kinds.length === 0) throw new Error('appendCustomEventUnlessRecorded requires at least one guard kind');
-    return this.transaction(() => {
-      const placeholders = guard.kinds.map(() => '?').join(', ');
-      const taken = this.db.prepare(
-        `SELECT 1 FROM events WHERE job_id = ? AND kind IN (${placeholders}) AND json_extract(payload, '$.scheduledSeq') = ? LIMIT 1`,
-      ).get(guard.jobId, ...(guard.kinds as string[]), guard.scheduledSeq);
-      if (taken !== undefined) return null;
-      return this.appendEvent({
-        kind: fields.kind,
-        agentId: fields.agentId ?? null,
-        jobId: fields.jobId ?? null,
-        roundId: fields.roundId ?? null,
-        lens: fields.lens ?? null,
-        payload: fields.payload,
-      });
-    });
   }
 
   /** Delivery-only crash recovery: check the exact admitted markers and

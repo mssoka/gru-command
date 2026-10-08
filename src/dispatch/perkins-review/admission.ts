@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { SourceMovement, UnstoppedGroup } from './artifacts.js';
+import type { SourceMovement } from './artifacts.js';
 import {
   FROZEN_CHANGED_FILES_MAX_BYTES,
   FROZEN_CONVENTIONS_MAX_BYTES,
@@ -75,9 +75,6 @@ export interface AdmissionCheck {
 export interface AdmissionPreflightResult {
   readonly checks: readonly AdmissionCheck[];
   readonly missing: readonly AdmissionMissingInput[];
-  /** Git process groups a probe could not stop (R7-8): the caller keeps
-   * refusing steps in that repository until they are gone — durably. */
-  readonly unstoppedGroups?: readonly UnstoppedGroup[];
 }
 
 /** Typed refusal carrying every named missing input (never just the
@@ -222,14 +219,15 @@ export function admissionPreflight(review: FrozenReview, movementRef: string, op
   const remote = options?.precomputedRemoteMovement ?? null;
   const movement: SourceMovement | null = local ?? remote;
   // R7-6: a cleanup veto from EITHER probe survives whichever diagnostic
-  // leads; and only a failure that PROVED its git stopped is transient.
+  // leads — and is the one reported, naming its still-running process
+  // group (owner decision 2026-10-08). Only a failure that PROVED its git
+  // stopped is transient.
   const probes = [local, remote].filter((entry): entry is SourceMovement => entry !== null);
-  // One record per group: a blocked local step reports the remote's group too.
-  const unstoppedGroups = [...new Map(probes.flatMap((entry) => entry.unstoppedGroups ?? []).map((group) => [group.pgid, group])).values()];
-  const vetoed = probes.some((entry) => entry.cleanupUnconfirmed === true);
-  if (movement === null) pass('head-binding');
-  else fail('head-binding', `${movement.cause}: ${movement.detail}`,
-    movement.cause === 'check-failed' && movement.stopped === true && !vetoed);
+  const stuck = probes.find((entry) => entry.cleanupUnconfirmed === true) ?? null;
+  const reported = stuck ?? movement;
+  if (reported === null) pass('head-binding');
+  else fail('head-binding', `${reported.cause}: ${reported.detail}`,
+    stuck === null && reported.cause === 'check-failed' && reported.stopped === true);
 
   // 2. Frozen packet completeness: every declared artifact is re-read from
   //    the frozen copy and proven byte-identical to its manifest digest.
@@ -398,5 +396,5 @@ export function admissionPreflight(review: FrozenReview, movementRef: string, op
     } else pass(`evidence:${attachment.id}`);
   }
 
-  return { checks, missing, ...(unstoppedGroups.length > 0 ? { unstoppedGroups } : {}) };
+  return { checks, missing };
 }

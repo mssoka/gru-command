@@ -202,7 +202,7 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       ts.forEachChild(node, visit);
     };
     visit(file);
-    // 31 of 34 sites carry the bounded context; the three null rows are the
+    // 30 of 33 sites carry the bounded context; the three null rows are the
     // sanctioned residuals (shutdown deadline, live-process pause, sweep
     // error) that stay deliberately context-free and live (A7 rejection
     // stands; a worktree id is never coerced into a round identity).
@@ -219,16 +219,15 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       // Owner decision 2026-10-08: a transient refusal retries; only the
       // last refusal, or a retry that cannot run, is action-required.
       ['`Perkins review for job ${jobId} refused admission before any specialist started`', '{ jobId, roundId }'],
-      ['`Automatic review retry for job ${jobId} crashed`', '{ jobId, roundId: record.roundId }'],
-      ['`Automatic review retry for job ${jobId} could not start`', '{ jobId, roundId: record.roundId }'],
-      ['`Automatic review retry for job ${job.id} could not resume`', '{ jobId: job.id }'],
+      ['`Automatic review retry for job ${jobId} crashed`', '{ jobId, roundId: current.roundId }'],
+      ['`Automatic review retry for job ${jobId} could not start`', '{ jobId, roundId: retry.roundId }'],
+      // Retries live in memory: one a restart interrupted escalates once.
+      ['`Automatic review retry for job ${job.id} was interrupted by a restart`', '{ jobId: job.id, roundId: scheduled.roundId }'],
       ['`Review for job ${job.id} cannot gate: Perkins is unavailable and the fallback is not installed`', '{ jobId: job.id }'],
       ['`Perkins gate unavailable for job ${job.id} — the bmad-review gate is engaged`', '{ jobId: job.id }'],
       ['`bmad-review gate PASS for job ${job.id} — review/fix routing cleared (not a Perkins READY; merge stays user-held)`', '{ jobId: job.id }'],
       ['`bmad-review gate BLOCKED for job ${jobId}`', '{ jobId }'],
       ['`bmad-review gate ABORTED for job ${jobId}`', '{ jobId }'],
-      // R7-8: a git group that would not stop blocks every later review here.
-      ['`Perkins review for job ${job.id} cannot start: git cleanup unconfirmed`', '{ jobId: job.id }'],
       ['`Perkins delta READY for job ${input.jobId} still owes its final whole-change pass`', '{ jobId: input.jobId, roundId: round.id }'],
       ['`Perkins review for job ${input.job.id} was blocked before any round: the PR head could not be verified`', '{ jobId: input.job.id }'],
       ['`Review round ${round.id} disposal failed after completion`', '{ jobId: job.id, roundId: round.id }'],
@@ -246,7 +245,7 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       ['`Review worktree for round ${worktreeId} could not be swept`', null],
     ];
     expect(sites.map((site) => [site.title, site.context])).toEqual(expected);
-    expect(sites).toHaveLength(34);
-    expect(sites.filter((site) => site.context !== null)).toHaveLength(31);
+    expect(sites).toHaveLength(33);
+    expect(sites.filter((site) => site.context !== null)).toHaveLength(30);
   });
 });
