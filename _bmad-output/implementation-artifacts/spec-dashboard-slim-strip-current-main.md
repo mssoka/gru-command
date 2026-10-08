@@ -220,7 +220,8 @@ PR #256 was `mergeable_state: dirty` against main `4cc8a83dâ€¦` (then `72c73c10â
 - `typecheck` GREEN (run `0a0ad71b-bb58-4b03-a530-89da49378e91`, 4 frames).
 - `pipeline-board-browser` GREEN 15/15 under the STRICT containment oracle (run `7ec5f9ca-3f87-46ad-ad71-635efa2edd76`, 37 frames).
 - `full` GREEN (run `e0e346f6-f537-424c-ba02-bc42a7073cb3`, 484 frames).
-- PR #256 registered on the job via `POST /api/dispatch/pr` (200; job status `in-review`). Exact-head CI and the native round for this head are recorded in the ignored handoff and the completion report.
+- PR #256 registered on the job via `POST /api/dispatch/pr` (200; job status `in-review`).
+- Post-conflict-resolution corrections: `2a37ffb` (round-7 fixes), `4ba44f5` (lesson-proposal e2e chrome-height fix). Re-verification: `pipeline-board-browser` GREEN 15/15 strict at `2a37ffb` (run `7b2162a7-ee4a-4e8a-a89b-d1ae3a771bda`, request `7f45a99d-54eb-45e2-84ce-846391190913`); `lesson-proposal-browser` GREEN at `4ba44f5` (run `d4043d62-8826-4f64-91e6-87fd02153d37`). All other scopes' consumed test blobs are byte-identical from `cb6adbc` onward (verified by blob hash).
 
 ## Design Notes
 
