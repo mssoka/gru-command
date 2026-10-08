@@ -1555,6 +1555,29 @@ describe('fifth review round of #253 — follow-up (bmad-code-review, 2026-10-08
     expect(ran.status).toBe(0);
   });
 
+  it('the tool refuses a journal with invalid bytes before any backup or write — two differently corrupt copies never pass as identical (R9-02)', () => {
+    const corrupt = toolInstance(() => []);
+    const file = join(corrupt.home, 'journal', readdirSync(join(corrupt.home, 'journal')).find((name) => name.endsWith('.jsonl'))!);
+    const template = JSON.parse(readFileSync(file, 'utf-8').trim().split('\n')[0]!) as Record<string, unknown>;
+    const [left, right] = JSON.stringify({ ...template, body: '@@' }).split('@@');
+    const record = (byte: number) => Buffer.concat([Buffer.from(left!), Buffer.from([byte]), Buffer.from(`${right}\n`)]);
+    writeFileSync(file, Buffer.concat([record(0xff), record(0xfe)])); // the same j-1, different invalid bytes
+    for (const args of [[], ['--write']]) {
+      const ran = corrupt.run(...args);
+      expect(ran.status).toBe(1);
+      expect(ran.stderr).toMatch(/journal file .*\.jsonl is not valid UTF-8/);
+    }
+    expect(readFileSync(join(corrupt.home, 'bible', 'chapters', 'ops.md'), 'utf-8')).toBe(corrupt.chapter);
+    expect(backupsOf(join(corrupt.home, 'bible'))).toEqual([]);
+    // A real U+FFFD, recorded twice identically, is valid ground truth.
+    const valid = toolInstance((template) => [template]);
+    const validFile = join(valid.home, 'journal', readdirSync(join(valid.home, 'journal')).find((name) => name.endsWith('.jsonl'))!);
+    writeFileSync(validFile, readFileSync(validFile, 'utf-8').replaceAll('"first"', '"first �"'));
+    const ran = valid.run('--write');
+    expect(ran.stderr).not.toContain('repair-bible-provenance:');
+    expect(ran.status).toBe(0);
+  });
+
   it('the tool reports an unreadable or non-directory book as itself — never as a missing instance (R5-A8)', () => {
     const notDir = toolInstance(() => []);
     rmSync(join(notDir.home, 'bible', 'chapters'), { recursive: true });
@@ -1702,7 +1725,21 @@ describe('fifth review round of #253 — follow-up (bmad-code-review, 2026-10-08
         expect(parseIndex(rendered).map((entry) => entry.slug)).toEqual(['c-0', 'c-1', 'c-2', 'c-3']);
       }
       expect(() => renderIndex(chapters, skeleton + 4 * 24 - 4)).toThrowError(/cannot hold 4 chapter\(s\)/);
+      // What a compacted summary KEEPS (R9-04): 24 bytes each — the longest
+      // whole-glyph prefix that fits beside its 3-byte ellipsis.
+      expect(parseIndex(renderIndex(chapters, skeleton + 4 * 24)).map((entry) => entry.summary), glyph)
+        .toEqual(Array(4).fill(glyph === '😀' ? '😀😀😀😀😀…' : '漢漢漢漢漢漢漢…'));
     }
+    // A briefing still finds a chapter by the words its compacted summary kept.
+    const misc = { slug: 'misc', title: 'Misc', summary: `Restart ${'😀漢'.repeat(60)}`, tags: [], lessons: [] };
+    const compactedCap = Buffer.byteLength(renderIndex([{ ...misc, summary: '' }]), 'utf8') + 24;
+    const persisted = tmpBible();
+    persisted.ensureSeeded();
+    writeFileSync(join(persisted.chaptersDir, 'misc.md'), serializeChapter(misc));
+    writeFileSync(join(persisted.dir, 'INDEX.md'), renderIndex([misc], compactedCap));
+    expect(parseIndex(readFileSync(join(persisted.dir, 'INDEX.md'), 'utf8'))[0]!.summary).toBe('Restart 😀漢😀…');
+    expect(createBibleReferences({ bible: persisted }).referencesFor('Restart').map((pointer) => [pointer.chapter, pointer.lesson]))
+      .toEqual([['misc', null]]);
     // The case the review measured: four long emoji summaries under 500 bytes.
     const emoji = Array.from({ length: 4 }, (_, index) => ({ slug: `c-${index}`, title: 'C', summary: '😀'.repeat(60), tags: [], lessons: [] }));
     expect(Buffer.byteLength(renderIndex(emoji, 500), 'utf8')).toBeLessThanOrEqual(500);
@@ -1831,6 +1868,48 @@ describe('fifth review round of #253 — follow-up (bmad-code-review, 2026-10-08
     bible.applyPlan(plan);
     expect(readFileSync(join(bible.chaptersDir, 'ops.md'), 'utf8')).toBe(plan.writes[0]!.text);
     expect(readFileSync(join(bible.dir, 'INDEX.md'), 'utf8')).toBe(plan.indexText);
+  });
+
+  it('reading a 10,004-handle chapter visits each handle a bounded number of times — repeats are found by one lookup, not a rescan (R9-03)', () => {
+    /** Elements visited by Array scans (`some`, `find`, `includes`, …)
+     * while `run` executes: an upper bound on comparisons, deterministic. */
+    const visits = (run: () => void): number => {
+      const scans = ['some', 'every', 'find', 'findIndex', 'findLast', 'findLastIndex', 'includes', 'indexOf', 'lastIndexOf', 'filter'] as const;
+      const proto = Array.prototype as unknown as Record<string, unknown>;
+      const originals = scans.map((name) => proto[name]);
+      let visited = 0;
+      scans.forEach((name, index) => {
+        proto[name] = function (this: unknown[], ...args: unknown[]) {
+          visited += this.length;
+          return (originals[index] as (...rest: unknown[]) => unknown).apply(this, args);
+        };
+      });
+      try {
+        run();
+      } finally {
+        scans.forEach((name, index) => {
+          proto[name] = originals[index];
+        });
+      }
+      return visited;
+    };
+    const handles = Array.from({ length: 10_004 }, (_, index) => `j-${index + 1}@${at(index + 1)}`);
+    // Half on one provenance line, half on a second: both the same-line and the cross-line check run.
+    const text = `# Busy\n\n## busy\n\nrecurred: 1\nprovenance: ${handles.slice(0, 5_002).join(', ')}\nprovenance: ${handles.slice(5_002).join(', ')}\n\nBody.\n`;
+    let read: BibleChapter | null = null;
+    expect(visits(() => { read = parseChapter(text, 'busy'); })).toBeLessThan(handles.length * 10);
+    expect(read!.lessons[0]!.provenance).toHaveLength(10_004);
+    // The bulk read briefings and the repair use, from a real file.
+    const bible = tmpBible();
+    bible.ensureSeeded();
+    writeFileSync(join(bible.chaptersDir, 'busy.md'), text);
+    expect(visits(() => { bible.readChapters(); })).toBeLessThan(handles.length * 10);
+    // Still refused: a repeat on the same line, and across lines; contract 1 keeps both.
+    const repeated = (lines: string[]) => `# A\n\n## a\n\nrecurred: 1\n${lines.map((line) => `provenance: ${line}`).join('\n')}\n\nBody.\n`;
+    for (const lines of [[`j-1@${at(1)}, j-2@${at(2)}, j-1@${at(1)}`], [`j-1@${at(1)}, j-2@${at(2)}`, `j-3@${at(3)}, j-2@${at(2)}`]]) {
+      expect(() => parseChapter(repeated(lines), 'a')).toThrowError(/provenance cites j-\d more than once/);
+      expect(parseChapter(repeated(lines), 'a', 1).lessons[0]!.provenance).toHaveLength(lines.join(', ').split(', ').length);
+    }
   });
 
   it('every provenance line of a lesson counts — a handle repeated across lines is refused (R6-02)', () => {

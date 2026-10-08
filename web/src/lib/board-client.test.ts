@@ -543,13 +543,14 @@ describe('board client', () => {
    * waits for the test, answered with a plain response object (no body
    * stream), so fake timers alone drive time. */
   function scriptedClient() {
-    const requests: Array<{ answer: (snapshot: BoardSnapshot) => void; hang: () => void; fail: () => void; signal: AbortSignal | undefined }> = [];
+    const requests: Array<{ answer: (snapshot: BoardSnapshot) => void; hang: () => void; fail: () => void; refuse: (status: number) => void; signal: AbortSignal | undefined }> = [];
     const fetchImpl = vi.fn((_path: string, init?: RequestInit) => new Promise<Response>((resolve, reject) => {
       requests.push({
         answer: (snapshot) => resolve({ ok: true, status: 200, json: async () => snapshot } as unknown as Response),
         // The headers arrive but the body never finishes.
         hang: () => resolve({ ok: true, status: 200, json: () => new Promise(() => {}) } as unknown as Response),
         fail: () => reject(new TypeError('fetch failed')),
+        refuse: (status) => resolve({ ok: false, status, json: async () => ({ error: 'refused' }) } as unknown as Response),
         signal: init?.signal ?? undefined,
       });
     })) as unknown as typeof fetch;
@@ -738,6 +739,79 @@ describe('board client', () => {
       await vi.advanceTimersByTimeAsync(60_000);
       expect(requests).toHaveLength(9);
       client.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('the newest ordinary refresh that times out, hangs in its body or fails — with no push at all — is asked again on the bounded chain; a refused pairing is not (R9-01)', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const { client, requests, delivered, settle, open } = scriptedClient();
+      await open();
+      // An owner decision's wake: its request outlives the deadline at the fetch...
+      void client.refetchSnapshot();
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(requests[1]!.signal?.aborted).toBe(true);
+      expect(requests).toHaveLength(3); // asked again at once
+      // ...its replacement hangs in the body, then the next fails outright.
+      requests[2]!.hang();
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(requests).toHaveLength(4);
+      requests[3]!.fail();
+      await settle();
+      expect(requests).toHaveLength(4); // the burst is spent: it backs off
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(requests).toHaveLength(5);
+      requests[4]!.answer(tagged('after-failures'));
+      await settle();
+      expect(delivered.at(-1)).toBe('after-failures');
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(requests).toHaveLength(5); // met: nothing more
+      // A server error is transient too.
+      void client.refetchSnapshot();
+      requests[5]!.refuse(503);
+      await settle();
+      expect(requests).toHaveLength(7);
+      requests[6]!.answer(tagged('recovered'));
+      await settle();
+      expect(delivered.at(-1)).toBe('recovered');
+      // An OLDER request failing after a newer one was asked owes nothing.
+      void client.refetchSnapshot();
+      void client.refetchSnapshot();
+      requests[7]!.fail();
+      await settle();
+      expect(requests).toHaveLength(9);
+      requests[8]!.answer(tagged('newest'));
+      await settle();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(requests).toHaveLength(9);
+      expect(delivered.at(-1)).toBe('newest');
+      // stop() during a failure-driven backoff: nothing runs, and a reconnect revives nothing.
+      void client.refetchSnapshot();
+      requests[9]!.fail();
+      await settle();
+      requests[10]!.fail();
+      await settle();
+      requests[11]!.fail();
+      await settle();
+      expect(requests).toHaveLength(12); // the next waits 1 s
+      client.stop();
+      client.connect();
+      expect(requests).toHaveLength(13);
+      requests[12]!.answer(tagged('reconnected'));
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(requests).toHaveLength(13);
+      client.stop();
+      // A refused pairing is fatal, never retried.
+      const refused = scriptedClient();
+      await refused.open();
+      void refused.client.refetchSnapshot();
+      refused.requests[1]!.refuse(401);
+      await refused.settle();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(refused.requests).toHaveLength(2);
+      refused.client.stop();
     } finally {
       vi.useRealTimers();
     }

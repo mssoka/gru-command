@@ -1236,6 +1236,7 @@ function parseLesson(contract: PlanContract, chapterSlug: string, slug: string, 
   let recurred = 1;
   let sawRecurred = false;
   const provenance: ProvenanceRef[] = [];
+  const cited = new Set<string>(); // every handle of the lesson, across its lines
   const tags: string[] = [];
   const bodyLines: string[] = [];
   let inMeta = true;
@@ -1253,14 +1254,7 @@ function parseLesson(contract: PlanContract, chapterSlug: string, slug: string, 
         } else if (meta[1] === 'provenance') {
           // One handle once per LESSON, across every provenance line (R6-02)
           // — contract 1 read repeats and impossible instants as written.
-          for (const ref of splitProvenance(meta[2] ?? '', chapterSlug, slug, contract)) {
-            if (contract !== 1 && provenance.some((seen) => seen.id === ref.id)) {
-              throw new BibleError(
-                `chapter ${chapterSlug}.md lesson ${slug}: provenance cites ${ref.id} more than once — rebuild it from the journal with the repair tool`,
-              );
-            }
-            provenance.push(ref);
-          }
+          provenance.push(...splitProvenance(meta[2] ?? '', chapterSlug, slug, contract, cited));
         } else if (meta[1] === 'tags') {
           tags.push(...splitTags(meta[2] ?? ''));
         }
@@ -1290,7 +1284,16 @@ function splitTags(value: string): string[] {
     .filter((tag) => tag !== '');
 }
 
-function splitProvenance(value: string, chapterSlug: string, lessonSlug: string, contract: PlanContract = PLAN_CONTRACT): ProvenanceRef[] {
+/** One provenance line's handles. `cited` holds the lesson's handles so far
+ * (all its lines): a repeat is refused in one Set lookup, so even a
+ * 10,000-handle chapter reads in linear time (R9-03). */
+function splitProvenance(
+  value: string,
+  chapterSlug: string,
+  lessonSlug: string,
+  contract: PlanContract,
+  cited: Set<string>,
+): ProvenanceRef[] {
   const refs: ProvenanceRef[] = [];
   for (const item of value.split(',').map((part) => part.trim()).filter((part) => part !== '')) {
     const at = item.lastIndexOf('@');
@@ -1307,10 +1310,13 @@ function splitProvenance(value: string, chapterSlug: string, lessonSlug: string,
           'it must be "<journal-id>@<iso-date>"',
       );
     }
-    if (contract !== 1 && refs.some((ref) => ref.id === id)) {
-      throw new BibleError(
-        `chapter ${chapterSlug}.md lesson ${lessonSlug}: provenance cites ${id} more than once — rebuild it from the journal with the repair tool`,
-      );
+    if (contract !== 1) {
+      if (cited.has(id)) {
+        throw new BibleError(
+          `chapter ${chapterSlug}.md lesson ${lessonSlug}: provenance cites ${id} more than once — rebuild it from the journal with the repair tool`,
+        );
+      }
+      cited.add(id);
     }
     refs.push({ id, ts });
   }

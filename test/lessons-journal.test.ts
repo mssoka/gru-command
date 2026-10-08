@@ -108,6 +108,23 @@ describe('journal store', () => {
     expect(dir.length).toBeGreaterThan(0);
   });
 
+  it('fails loud on invalid UTF-8, naming the file — invalid bytes are never read as U+FFFD; a real U+FFFD reads back (R9-02)', () => {
+    const { journal } = tmpJournal();
+    const entry = journal.append({ kind: 'finding', source: 'gru', body: 'kept � as written' });
+    expect(journal.list()[0]!.body).toBe('kept � as written');
+    const file = join(journal.dir, '2026-09-23.jsonl');
+    const [left, right] = JSON.stringify({ ...entry, seq: entry.seq + 1, id: 'j-2', body: '@@' }).split('@@');
+    writeFileSync(file, Buffer.concat([Buffer.from(left!), Buffer.from([0xff]), Buffer.from(`${right}\n`)]));
+    let caught: unknown;
+    try {
+      journal.list();
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(JournalError);
+    expect((caught as Error).message).toMatch(/journal file .*2026-09-23\.jsonl is not valid UTF-8/);
+  });
+
   it('keeps a single entry with a colon-bearing source (minion:<job>) verbatim', () => {
     const { journal } = tmpJournal();
     const entry = journal.append({

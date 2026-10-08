@@ -349,8 +349,16 @@ export class BoardClient {
         this.refreshOwed = true;
         if (!this.trailingRefetch) this.startTrailingRefetch();
       }
-    } catch {
-      /* connection state carries the error surface */
+    } catch (error) {
+      // The connection state carries the error surface. The newest request
+      // failing or timing out still owes its answer (R9-01): it is asked
+      // for again through the same bounded trailing chain. A refused
+      // pairing (401) is fatal, never retried; an older request's failure
+      // is covered by the newer one.
+      if (this.stopped || request !== this.fetchSeq) return;
+      if (error instanceof BoardApiError && error.status === 401) return;
+      this.refreshOwed = true;
+      if (!this.trailingRefetch) this.startTrailingRefetch();
     }
   }
 

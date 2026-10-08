@@ -30,6 +30,8 @@ export const JOURNAL_MAX_TAGS = 16;
 export const JOURNAL_MAX_TAG_CHARS = 64;
 
 const SOURCE_PATTERN = /^[a-z0-9][a-z0-9._-]*(?::[A-Za-z0-9][A-Za-z0-9._-]*)?$/;
+/** Strict UTF-8, BOM kept as read (a BOM line stays invalid JSON, as before). */
+const JOURNAL_UTF8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 
 export interface JournalAppendInput {
   readonly kind: JournalKind;
@@ -155,11 +157,19 @@ export class JournalStore {
     const entries: JournalEntry[] = [];
     for (const name of names.filter((candidate) => candidate.endsWith('.jsonl')).sort()) {
       const file = join(this.dir, name);
-      let text: string;
+      let raw: Buffer;
       try {
-        text = readFileSync(file, 'utf-8');
+        raw = readFileSync(file);
       } catch (error) {
         throw new JournalError(`journal file ${file} is unreadable: ${String(error)}`);
+      }
+      // Fatal decoding (R9-02): invalid bytes are never replaced by U+FFFD,
+      // which would make two differently corrupt records read as identical.
+      let text: string;
+      try {
+        text = JOURNAL_UTF8.decode(raw);
+      } catch {
+        throw new JournalError(`journal file ${file} is not valid UTF-8 — repair or remove the damaged line`);
       }
       const lines = text.split('\n');
       for (let index = 0; index < lines.length; index += 1) {
