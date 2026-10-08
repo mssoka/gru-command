@@ -154,6 +154,10 @@ export interface DirectiveRequestRecord {
   readonly retireReason: string | null;
   /** Canonical-input fingerprint of the one retirement decision. */
   readonly retireFingerprint: string | null;
+  /** The binding expectation the decision was made with — exposed so a
+   * lost-response retry can reconstruct the identical canonical intent. */
+  readonly retireExpectedState: LiveDirectiveState | null;
+  readonly retireExpectedHead: string | null;
   /** Continuation hold: set to the identity of the fresh accepted request
    * that superseded this retirement; null while the hold is open. */
   readonly holdReleasedBy: string | null;

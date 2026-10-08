@@ -955,6 +955,8 @@ export const MIGRATIONS: readonly Migration[] = [
       ALTER TABLE pending_directives ADD COLUMN retired_by TEXT;
       ALTER TABLE pending_directives ADD COLUMN retire_reason TEXT;
       ALTER TABLE pending_directives ADD COLUMN retire_fingerprint TEXT;
+      ALTER TABLE pending_directives ADD COLUMN retire_expected_state TEXT;
+      ALTER TABLE pending_directives ADD COLUMN retire_expected_head TEXT;
       ALTER TABLE pending_directives ADD COLUMN hold_released_by TEXT;
       ALTER TABLE pending_directives ADD COLUMN hold_released_at TEXT;
       CREATE INDEX idx_pending_directives_hold ON pending_directives(job_id, state, hold_released_by);

@@ -61,6 +61,25 @@ describe('ledger db + migration runner', () => {
     old.close();
     const upgraded = new LedgerDb(dir);
     expect(upgraded.handle.prepare("SELECT COUNT(*) AS n FROM schema_migrations WHERE id = 23").get()).toMatchObject({ n: 1 });
+    const columns = upgraded.handle
+      .prepare(
+        `SELECT retired_at, retired_by, retire_reason, retire_fingerprint, retire_expected_state, retire_expected_head,
+                hold_released_by, hold_released_at
+           FROM pending_directives WHERE request_id = 'req-legacy'`,
+      )
+      .get();
+    expect(columns).toMatchObject({
+      retired_at: null,
+      retired_by: null,
+      retire_reason: null,
+      retire_fingerprint: null,
+      retire_expected_state: null,
+      retire_expected_head: null,
+      hold_released_by: null,
+      hold_released_at: null,
+    });
+    const indexes = upgraded.handle.prepare("PRAGMA index_list('pending_directives')").all() as { name: string }[];
+    expect(indexes.map((index) => index.name)).toContain('idx_pending_directives_hold');
     const api = new LedgerApi(upgraded.handle);
     const row = api.getDirective('req-legacy');
     expect(row?.state).toBe('dispatching');

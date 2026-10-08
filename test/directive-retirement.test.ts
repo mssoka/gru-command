@@ -23,6 +23,8 @@ import { reconcilePendingDirectives, settleDirectivesFromEvidence } from '../src
 import { findBusyLanes, laneIsBusy } from '../src/dispatch/branch-idle.js';
 import { resolveGitCommit } from '../src/dispatch/perkins-review/artifacts.js';
 import type { WorktreeLane } from '../src/dispatch/worktree-port.js';
+import { PacingGate } from '../src/runtime/pacing.js';
+import { directiveRetirementFingerprint } from '../src/ledger/directives.js';
 import type { AgentCapabilities, AgentHandle, SpawnOptions } from '../src/runtime/types.js';
 
 /**
@@ -69,7 +71,7 @@ interface Harness {
   close(): Promise<void>;
 }
 
-async function boot(opts: { wrapLedger?: (ledger: LedgerApi) => LedgerApi } = {}): Promise<Harness> {
+async function boot(opts: { wrapLedger?: (ledger: LedgerApi) => LedgerApi; workerGate?: PacingGate } = {}): Promise<Harness> {
   const dir = mkdtempSync(join(tmpdir(), 'gru-command-retirement-'));
   cleanupDirs.push(dir);
   writeFileSync(join(dir, 'config.toml'), `[auth]\ntoken = "${TOKEN}"\n[server]\nhost = "127.0.0.1"\nport = 0\n`, 'utf-8');
@@ -149,6 +151,7 @@ async function boot(opts: { wrapLedger?: (ledger: LedgerApi) => LedgerApi } = {}
     dispatch,
     wave,
     ledger,
+    ...(opts.workerGate !== undefined ? { workerGate: opts.workerGate } : {}),
     silasOps: {
       registry: {
         getHandle: (id: string) => liveHandles.get(id) ?? null,
@@ -307,7 +310,13 @@ describe('directive retirement — evidence-fenced control closure', () => {
     expect(after?.deliverySeq).toBeNull();
     expect(after?.retiredBy).toBe('silas-ops');
     expect(after?.retireReason).toBe('writer ceased; no terminal receipt can exist');
+    expect(after?.retireExpectedState).toBe('dispatching');
+    expect(after?.retireExpectedHead).toBe(laneHead(lane));
     expect(after?.holdReleasedBy).toBeNull();
+    // A lost-response retry can reconstruct the canonical intent from the
+    // readback alone: the recorded expectations are exposed.
+    expect(field<string>(result.json, 'retire_expected_state')).toBe('dispatching');
+    expect(field<string>(result.json, 'retire_expected_head')).toBe(laneHead(lane));
     expect(countEvents(h, 'silas.directive-retired')).toBe(1);
     // No fabricated lifecycle event of any other kind.
     expect(countEvents(h, 'silas.directive-sent')).toBe(0);
@@ -324,6 +333,8 @@ describe('directive retirement — evidence-fenced control closure', () => {
     expect(field<string>(readback.json, 'state')).toBe('retired');
     expect(field<string>(readback.json, 'admission_class')).toBe('admission-unknown');
     expect(field<string>(readback.json, 'payload_hash')).toBe(row.payloadHash);
+    expect(field<string>(readback.json, 'retire_expected_state')).toBe('dispatching');
+    expect(field<string>(readback.json, 'retire_expected_head')).toBe(laneHead(lane));
     expect(field<string>(field<Record<string, unknown>>(readback.json, 'states'), 'retired')).toContain(
       'control ownership closed',
     );
@@ -467,9 +478,16 @@ describe('directive retirement — evidence-fenced control closure', () => {
     const badHead = await retire(h, 'req-g', 'zzzz');
     expect(badHead.status).toBe(400);
 
-    expect(h.ledger.getDirective(row.requestId)?.state).toBe('dispatching');
+    // Every refusal above left the row, events and holds untouched.
+    expect(h.ledger.getDirective('req-g')?.state).toBe('dispatching');
     expect(eventKinds(h)).toEqual(before);
     expect(h.ledger.listDirectiveRecoveryHolds({ openOnly: true })).toHaveLength(0);
+
+    // A valid uppercase object id is normalized, never misread as stale.
+    const upper = await retire(h, 'req-g', head.toUpperCase());
+    expect(upper.status).toBe(200);
+    expect(h.ledger.getDirective('req-g')?.retireExpectedHead).toBe(head);
+    expect(h.ledger.getDirective('req-g')?.state).toBe('retired');
   });
 
   it('refuses a head that moved after the caller verified it, then accepts the fresh head', async () => {
@@ -478,9 +496,7 @@ describe('directive retirement — evidence-fenced control closure', () => {
     const h = await boot();
     const { lane } = await seededLiveRequest(h, repo, 'job-h', 'req-h');
     const oldHead = laneHead(lane);
-    repo.commitFile('src/moved.ts', 'export const moved = true;\n', 'advance lane');
-    // The lane worktree follows the branch? No: commit on the repo main does
-    // not move the lane branch. Advance the lane itself.
+    // Advance the lane itself; the fixture repo's main branch never moves it.
     execFileSync('git', ['-C', lane.path, '-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '--allow-empty', '-m', 'lane moved'], { stdio: 'ignore' });
     const refused = await retire(h, 'req-h', oldHead);
     expect(refused.status).toBe(409);
@@ -498,12 +514,17 @@ describe('directive retirement — live ownership fails closed', () => {
     const h = await boot();
     const { lane } = await seededLiveRequest(h, repo, 'job-i', 'req-i');
     h.ledger.registerAgent({ id: 'minion-live', role: 'minion', jobId: 'job-i' });
-    h.ledger.setAgentState('minion-live', 'streaming');
+    h.ledger.setAgentState('minion-live', 'spawning');
 
-    const refused = await retire(h, 'req-i', laneHead(lane));
-    expect(refused.status).toBe(409);
-    expect(field<string>(refused.json, 'error')).toBe('live_work');
-    expect((field<string[]>(refused.json, 'blockers') ?? []).join(' ')).toContain('minion-live');
+    const spawning = await retire(h, 'req-i', laneHead(lane));
+    expect(spawning.status).toBe(409);
+    expect(field<string>(spawning.json, 'error')).toBe('live_work');
+    expect((field<string[]>(spawning.json, 'blockers') ?? []).join(' ')).toContain('minion-live');
+
+    h.ledger.setAgentState('minion-live', 'streaming');
+    const streaming = await retire(h, 'req-i', laneHead(lane));
+    expect(streaming.status).toBe(409);
+    expect(field<string>(streaming.json, 'error')).toBe('live_work');
 
     h.ledger.setAgentState('minion-live', 'disposed');
     const accepted = await retire(h, 'req-i', laneHead(lane));
@@ -550,6 +571,29 @@ describe('directive retirement — live ownership fails closed', () => {
     expect((await retire(h, 'req-k', laneHead(lane))).status).toBe(200);
   });
 
+  it('refuses while a pace-gate worker turn is queued for the job', async () => {
+    const repo = makeFixtureRepo('retire-queued');
+    cleanupRepos.push(repo);
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 1 });
+    const h = await boot({ workerGate: gate });
+    const { lane } = await seededLiveRequest(h, repo, 'job-queued', 'req-queued');
+    // Fill the single slot, then queue a real producer acquisition for the job.
+    const held = await gate.acquireWorkerTurn({ id: 'holder', label: 'other lane', jobId: 'other-job' });
+    const queued = gate.acquireWorkerTurn({ id: 'job-queued', label: 'directive (fresh minion) → job-queued', jobId: 'job-queued' });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(gate.view().worker.queued.some((entry) => entry.id === 'job-queued')).toBe(true);
+
+    const refused = await retire(h, 'req-queued', laneHead(lane));
+    expect(refused.status).toBe(409);
+    expect(field<string>(refused.json, 'error')).toBe('live_work');
+    expect((field<string[]>(refused.json, 'blockers') ?? []).join(' ')).toContain('queued worker turn');
+
+    held.release();
+    (await queued).release();
+    expect(gate.view().worker.queued).toEqual([]);
+    expect((await retire(h, 'req-queued', laneHead(lane))).status).toBe(200);
+  });
+
   it('refuses while a re-brief marker is unresolved', async () => {
     const repo = makeFixtureRepo('retire-rebrief');
     cleanupRepos.push(repo);
@@ -590,8 +634,44 @@ describe('directive retirement — live ownership fails closed', () => {
     const refused = await retire(h, 'req-m', laneHead(lane));
     expect(refused.status).toBe(409);
     expect((field<string[]>(refused.json, 'blockers') ?? []).join(' ')).toContain('wait-m');
-    h.ledger.setProviderWaitStatus('wait-m', 'cancelled', { reason: 'test' });
-    expect((await retire(h, 'req-m', laneHead(lane))).status).toBe(200);
+
+    // Recovered-pending is still a live claimable continuation.
+    h.ledger.setProviderWaitStatus('wait-m', 'recovered-pending');
+    const recovered = await retire(h, 'req-m', laneHead(lane));
+    expect(recovered.status).toBe(409);
+    expect((field<string[]>(recovered.json, 'blockers') ?? []).join(' ')).toContain('recovered-pending');
+
+    // A claimed continuation is a live producer.
+    expect(h.ledger.claimProviderWaitAtomic('wait-m')).toBe(true);
+    const claimed = await retire(h, 'req-m', laneHead(lane));
+    expect(claimed.status).toBe(409);
+    expect((field<string[]>(claimed.json, 'blockers') ?? []).join(' ')).toContain('claimed');
+
+    // A terminal wait releases the lane (same-shape job).
+    seedJob(h, 'job-m2');
+    const laneM2 = await seedLane(h, repo, 'job-m2');
+    h.ledger.beginDirectiveIntent({ jobId: 'job-m2', directive: 'x', holder: 'silas-ops', requestId: 'req-m2' });
+    h.ledger.recordProviderWait({
+      id: 'wait-m2',
+      routeKey: 'route-m2',
+      provider: 'p',
+      model: 'm',
+      endpoint: 'e',
+      credentialFingerprint: 'fp',
+      waiterKind: 'job-minion',
+      jobId: 'job-m2',
+      agentId: null,
+      slotId: null,
+      sessionFile: null,
+      continuation: null,
+      jobStatusAtEstablishment: 'working',
+      lineageKey: null,
+      incidentId: 'incident-m2',
+      incidentGeneration: 1,
+      reasonClass: 'temporary-limit',
+    });
+    h.ledger.setProviderWaitStatus('wait-m2', 'cancelled', { reason: 'test' });
+    expect((await retire(h, 'req-m2', laneHead(laneM2))).status).toBe(200);
   });
 
   it('refuses while an unsettled verification run holds the lane', async () => {
@@ -613,9 +693,13 @@ describe('directive retirement — live ownership fails closed', () => {
     const h = await boot();
     const { lane } = await seededLiveRequest(h, repo, 'job-o', 'req-o');
     const round = h.ledger.addRound({ jobId: 'job-o' });
-    const refused = await retire(h, 'req-o', laneHead(lane));
-    expect(refused.status).toBe(409);
-    expect((field<string[]>(refused.json, 'blockers') ?? []).join(' ')).toContain(round.id);
+    const pending = await retire(h, 'req-o', laneHead(lane));
+    expect(pending.status).toBe(409);
+    expect((field<string[]>(pending.json, 'blockers') ?? []).join(' ')).toContain(`${round.id} (pending)`);
+    h.ledger.setRoundStatus(round.id, 'live');
+    const live = await retire(h, 'req-o', laneHead(lane));
+    expect(live.status).toBe(409);
+    expect((field<string[]>(live.json, 'blockers') ?? []).join(' ')).toContain(`${round.id} (live)`);
     h.ledger.setRoundStatus(round.id, 'aborted');
     expect((await retire(h, 'req-o', laneHead(lane))).status).toBe(200);
   });
@@ -700,6 +784,44 @@ describe('directive retirement — idempotency, conflicts and late evidence', ()
     expect(field<string>(conflictingHead.json, 'error')).toBe('retire_conflict');
     expect(countEvents(h, 'silas.directive-retired')).toBe(1);
     expect(h.ledger.getDirective('req-s')?.state).toBe('retired');
+
+    // A lost-response retry reconstructs the identical canonical intent
+    // from the readback alone and replays idempotently.
+    const readback = await call(h.port, 'GET', '/api/silas/directives/req-s', undefined, TOKEN);
+    const reconstructed = await call(
+      h.port,
+      'POST',
+      '/api/silas/directives/req-s/retire',
+      {
+        expected_job_id: field<string>(readback.json, 'job_id'),
+        expected_state: field<string>(readback.json, 'retire_expected_state'),
+        expected_payload_hash: field<string>(readback.json, 'payload_hash'),
+        expected_head: field<string>(readback.json, 'retire_expected_head'),
+        reason: field<string>(readback.json, 'retire_reason'),
+        by: field<string>(readback.json, 'retired_by'),
+      },
+      TOKEN,
+    );
+    expect(reconstructed.status).toBe(200);
+    expect(field<boolean>(reconstructed.json, 'idempotent')).toBe(true);
+    expect(countEvents(h, 'silas.directive-retired')).toBe(1);
+  });
+
+  it('pins the canonical retirement fingerprint as a durable format constant', () => {
+    // retire_fingerprint is the replay identity persisted for the life of
+    // the record: a future change that reorders or extends the hashed
+    // preimage would silently turn every existing replay into a conflict.
+    // This golden value is the format contract.
+    const fingerprint = directiveRetirementFingerprint({
+      requestId: 'req-golden',
+      expectedJobId: 'job-golden',
+      expectedState: 'dispatching',
+      expectedPayloadHash: '0'.repeat(64),
+      expectedHead: '1'.repeat(40),
+      reason: 'writer ceased',
+      by: 'silas-ops',
+    });
+    expect(fingerprint).toBe('5f3198a42e1724892a714e3508561be919d694a473c41fae73e551c5c2f3a610');
   });
 
   it('never replays a consumed request id as a new turn', async () => {
@@ -722,6 +844,11 @@ describe('directive retirement — idempotency, conflicts and late evidence', ()
     expect(field<string>(replay.json, 'state')).toBe('retired');
     expect(field<boolean>(replay.json, 'replay')).toBe(true);
     expect(field<string>(replay.json, 'note')).toContain('new request id');
+    // The replay path carries the same retirement facts as the readback.
+    expect(field<string>(replay.json, 'admission_class')).toBe('admission-unknown');
+    expect(field<string>(replay.json, 'retired_by')).toBe('silas-ops');
+    expect(field<string>(replay.json, 'retire_reason')).toBe('writer ceased; no terminal receipt can exist');
+    expect(field<string>(replay.json, 'retire_expected_state')).toBe('dispatching');
     expect(countEvents(h, 'silas.directive-sent')).toBe(0);
     expect(h.spawns).toHaveLength(0);
   });
@@ -774,6 +901,21 @@ describe('directive retirement — idempotency, conflicts and late evidence', ()
     expect(h.ledger.getPhaseHandoff(phase!.phaseId)?.closeReason).toContain('retired without completion');
     expect(countEvents(h, 'job.phase-handoff-completed')).toBe(0);
     expect(h.ledger.listObligations({ jobId: 'job-v' })).toHaveLength(0);
+    // The audit event carries the closed phase and the binding expectations
+    // as one durable fact set.
+    const retired = h.ledger.listEvents({ limit: 500 }).find((event) => event.kind === 'silas.directive-retired');
+    const payload = retired?.payload as Record<string, unknown>;
+    expect(payload['phase_handoff_closed']).toBe(phase?.phaseId);
+    expect(payload['expected_state']).toBe('dispatching');
+    expect(payload['expected_head']).toBe(laneHead(lane));
+    // An identical replay reports the same closure (never a lost fact).
+    const replay = await retire(h, 'req-v', laneHead(lane));
+    expect(replay.status).toBe(200);
+    expect(field<boolean>(replay.json, 'idempotent')).toBe(true);
+    expect(field<string>(replay.json, 'phase_handoff_closed')).toBe(phase?.phaseId);
+    // A fresh lane later (the hold release) resolves the phase reference by
+    // request identity, not by re-closing anything.
+    expect(countEvents(h, 'job.phase-handoff-closed')).toBe(1);
   });
 
   it('rolls back the whole retirement when a later step in the transaction throws', async () => {
@@ -976,6 +1118,20 @@ describe('directive retirement — continuation boundary and consumers', () => {
     const result = await retire(h, 'req-ae', laneHead(lane));
     expect(result.status).toBe(200);
     expect(h.ledger.getJob('job-ae')?.status).toBe('binned');
+    // A hold on a terminal job is inert and is never projected as board
+    // debt (terminal lanes can never accept the releasing request).
+    expect(h.ledger.hasOpenDirectiveRecoveryHold('job-ae')).toBe(true);
+    const engine = new BoardEngine({ ledger: h.ledger, bus: new EventBus({}) });
+    expect(engine.snapshot().silas.nextAction ?? '').not.toContain('req-ae');
+
+    // A newer live-lane hold is still surfaced: the inert terminal hold
+    // never masks it.
+    const repoB = makeFixtureRepo('retire-terminal-job-b');
+    cleanupRepos.push(repoB);
+    const { lane: laneB } = await seededLiveRequest(h, repoB, 'job-ag', 'req-ag');
+    expect((await retire(h, 'req-ag', laneHead(laneB))).status).toBe(200);
+    expect(engine.snapshot().silas.nextAction ?? '').toContain('req-ag');
+
     // Terminal-job guard preserved: no fresh directive to a binned lane.
     const refusedDirective = await call(
       h.port,

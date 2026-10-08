@@ -68,9 +68,14 @@ same configured auth boundary as every Silas surface):
 
 `expected_state` is the state the caller verified (`dispatching` or
 `admitted`). Success returns 200 with `state: "retired"`,
-`admission_class`, the preserved admission fields, the hold state and the
-closed phase-handoff id (if one was attached). Replays with the identical
-canonical intent return `idempotent: true` and append nothing.
+`admission_class`, the preserved admission fields, the hold state, the
+recorded `retire_expected_state`/`retire_expected_head`, and the closed
+phase-handoff id (if one was attached). Replays with the identical
+canonical intent return `idempotent: true` and append nothing; a
+lost-response retry reconstructs the identical intent from the readback
+(`retire_expected_state`, `retire_expected_head`, plus the already
+exposed job/payload hash), and a replay of a phase-closing retirement
+reports the same `phase_handoff_closed` id.
 
 ### Refusals (all leave the record byte-identical)
 
@@ -88,6 +93,20 @@ canonical intent return `idempotent: true` and append nothing.
 | 409 | `live_work` | blockers list names the live ownership; resolve it first |
 | 409 | `retire_conflict` | already retired under a different intent; the recorded outcome stands |
 
+## How a candidate surfaces
+
+A retirement is never automatic; the operator side sees a candidate
+through existing surfaces:
+
+- the boot reconciler's action-required escalation for a live request
+  with no terminal receipt (`reconcilePendingDirectives`, card kind
+  `silas.directive-unreconciled.<request_id>`) — the same card the
+  observed incident raised;
+- the board's next action naming the live directive
+  (`directive <id>: <state> (<job>)`), and the authenticated readback
+  `GET /api/silas/directives/{request_id}`;
+- the Silas digest, which suppresses offers while the request is live.
+
 ## After retirement: the continuation hold
 
 Retirement leaves a durable continuation hold on the request row
@@ -100,7 +119,10 @@ attention card:
 
 The hold is released **only** by a fresh accepted directive request or
 re-brief marker (the release record names that request/marker id). The
-retired request id itself never re-runs and never releases the hold.
+retired request id itself never re-runs and never releases the hold. A
+hold on a job that later goes terminal is inert (terminal lanes accept no
+work): it is not projected as board debt and cannot mask a newer live
+hold.
 
 ## Proof identity to cite
 

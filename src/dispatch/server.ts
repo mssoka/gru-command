@@ -1057,6 +1057,21 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           replay: true,
           minion_id: intent.admissionMinion,
           fail_reason: intent.failReason,
+          // A caller who only uses this replay path learns the same
+          // retirement facts the GET readback exposes — the id is consumed
+          // and why/when, never a success or no-effect claim.
+          ...(intent.state === 'retired'
+            ? {
+                admission_class: directiveAdmissionClass(intent),
+                retired_at: intent.retiredAt,
+                retired_by: intent.retiredBy,
+                retire_reason: intent.retireReason,
+                retire_expected_state: intent.retireExpectedState,
+                retire_expected_head: intent.retireExpectedHead,
+                hold_released_by: intent.holdReleasedBy,
+                hold_released_at: intent.holdReleasedAt,
+              }
+            : {}),
           note:
             intent.state === 'retired'
               ? 'this request id was retired after server-verified writer cessation — it never re-runs; submit changed work under a new request id'
@@ -1287,9 +1302,12 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         throw new Error('expected_state must be "dispatching" or "admitted"');
       }
       const expectedState = expectedStateRaw as LiveDirectiveState;
-      const expectedPayloadHash = strField(body, 'expected_payload_hash');
-      const expectedHead = strField(body, 'expected_head');
-      if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/iu.test(expectedHead)) {
+      // Git object ids and sha256 hex digests are lowercase; normalizing
+      // before the fingerprint/compare keeps a valid uppercase spelling
+      // from failing as a misdirecting `stale_head`/`request_mismatch`.
+      const expectedPayloadHash = strField(body, 'expected_payload_hash').trim().toLowerCase();
+      const expectedHead = strField(body, 'expected_head').trim().toLowerCase();
+      if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/u.test(expectedHead)) {
         throw new Error('expected_head must be a full git object id (40 or 64 hex characters)');
       }
       const reason = strField(body, 'reason');
@@ -1337,7 +1355,10 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         retired_at: record.retiredAt,
         retired_by: record.retiredBy,
         retire_reason: record.retireReason,
+        retire_expected_state: record.retireExpectedState,
+        retire_expected_head: record.retireExpectedHead,
         hold_released_by: record.holdReleasedBy,
+        hold_released_at: record.holdReleasedAt,
         phase_handoff_closed: outcome.phaseClosed,
         note:
           'control ownership closed after server-verified writer cessation — no delivery and no no-effect outcome is claimed; ' +
@@ -1372,6 +1393,8 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
               retired_at: record.retiredAt,
               retired_by: record.retiredBy,
               retire_reason: record.retireReason,
+              retire_expected_state: record.retireExpectedState,
+              retire_expected_head: record.retireExpectedHead,
               hold_released_by: record.holdReleasedBy,
               hold_released_at: record.holdReleasedAt,
             }

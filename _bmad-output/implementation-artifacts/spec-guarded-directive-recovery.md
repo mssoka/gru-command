@@ -5,7 +5,7 @@ created: '2026-10-08'
 status: 'in-review'
 route: 'dispatch'
 baseline_commit: '52ae3f1ce88ccfd0d0095f99fb8f51db67a88a62'
-review_loop_iteration: 0
+review_loop_iteration: 1
 context:
   - '{project-root}/AGENTS.md'
   - '{project-root}/docs/LEDGER.md'
@@ -103,6 +103,55 @@ whole build; the step-02 checkpoint's "Approve and continue" is satisfied withou
 halt, per briefing "do not re-interview settled intent". Spec intentionally exceeds the 1600-token
 target: one cohesive goal whose acceptance matrix is fixed by the briefing; scope standard's
 limits are non-gates.)
+
+Implementation fix cycle 1 (post-review): persisted and exposed the recorded
+canonical retirement expectations (replay reconstruction), normalized head/hash
+case, carried the closed phase id on the audit event and on replays, filtered
+inert terminal-job holds from the board projection, added the retirement audit
+facts to the consumed-id replay response, validated the hold row's audit facts
+loudly, and added discriminating tests for the pace-gate queue, the stall fence,
+the two digest publish-boundary races, and every omitted live-ownership filter
+member. Migration 23 gained `retire_expected_state`/`retire_expected_head`
+(never applied outside local test databases).
+
+## Review Triage Log
+
+Round 1 (three tracked review jobs at head `ffb0319`, parent
+`guarded-directive-recovery-20261008`, deliverable `review`): blind
+hunter (15 findings), edge-case hunter (2 findings), verification-gap
+reviewer (4 gap findings + 1 other finding). Every claim was verified
+against the code at the reviewed head; all are real and were fixed in the
+same cycle (commit "fix(directives): review round 1 dispositions"). No
+intent gap, bad-spec or defer entry: each fix is a bounded correction to
+this change, not a re-derivation; no finding was rejected or dropped.
+
+| # | Reviewer / claim | Verdict | Evidence + disposition |
+|---|---|---|---|
+| B1 | Replay cannot be reconstructed from the readback (`expected_state`/head absent) | medium | Real: the canonical intent was fingerprinted but its binding facts were not readable, so a lost-response retry could not reproduce it. Fixed: `retire_expected_state`/`retire_expected_head` persisted and exposed on the readback + retire response; runbook documents replay reconstruction; test replays from readback alone. |
+| B2 | Uppercase `expected_head` passes the route regex but fails the lowercase compare as `stale_head` | low | Real: valid uppercase object ids were misdirected to a stale-head refusal. Fixed: route trims/lowercases head and payload hash before fingerprint/compare; uppercase-success test added. |
+| B3 | Idempotent replay drops `phase_handoff_closed` | low | Real: the replay path returned null even when the original transition closed the phase. Fixed: replay reconstructs the closure by the exact close-reason prefix; replay test asserts the same phase id. |
+| B4 | `silas.directive-retired` payload omits the closed `phase_id` | low | Real: the durable correlation was only a second lookup. Fixed: payload carries `phase_handoff_closed` (and `expected_state`); test asserts it. |
+| B5 | Holds on jobs that later go terminal can never be released and the board advertises them forever | medium | Real: terminal lanes accept no releasing request, so the projection named a dead lane and could mask newer holds. Fixed: the board filters terminal jobs (the hold stays durably inert); test retires on a binned job and proves an inert hold is not projected while a newer live hold still is. |
+| B6 | Retired-id replay through `POST /api/silas/directive` lacks retirement audit fields | low | Real: replay-only callers could not learn why/when the id was consumed. Fixed: the replay response carries the same retirement facts as the readback; test asserts them. |
+| B7 | Queued pace-gate worker refusal is dead code under test | medium | Real (verification gap): the harness never supplied a gate. Fixed: `boot()` accepts a gate; a queued worker turn returns a named `live_work` refusal and the same call succeeds once released. |
+| B8 | Digest `conflictingPrs` hold fence untested | medium | Real (verification gap): no observer existed for the publish-boundary recheck. Fixed: a conflict offer is retracted when a retirement hold opens during the compute await. |
+| B9 | Retirement fingerprint has no pinned/golden value | low | Real: a preimage change would silently turn every replay into a conflict. Fixed: golden-constant test pins the exact format hash. |
+| B10 | `listDirectiveRecoveryHolds` blind-casts nullable audit columns | low | Real: an inconsistent retired row would surface `undefined` text. Fixed: named loud errors on missing audit facts; typed `retireExpectedState` read validated at row decode. |
+| B11 | Migration-upgrade test checks two columns and not the index | low | Real (verification gap). Fixed: all eight new columns asserted null after the v22→v23 upgrade plus the hold index. |
+| B12 | Runbook never says how a retirement candidate surfaces | low | Real: operators had no detection path. Fixed: "How a candidate surfaces" section (boot escalation card, board next action, readback, digest). |
+| B13 | `silas.directive-retired` absent from Silas health action kinds | low | Claimed invisible-to-health is true and deliberate: retirement is an operator/owner control closure that advances no work and must not count as Silas follow-through yield. Fixed by documenting the exclusion at the list; no behavior change. |
+| B14 | Dead line in the stale-head test | low | Real: an unused fixture commit. Fixed: removed; the lane commit is the only head move. |
+| B15 | Retire response omits `hold_released_at` the readback exposes | low | Real asymmetry. Fixed: the retire response carries both hold fields. |
+| V1 | Queued pace-gate refusal never executed under test | medium | Real (pre-verified gap); same root as B7 — fixed with the gate-backed test. |
+| V2 | Stall-fence assertion cannot fail (in-review delivered fixture never proposes a row) | medium | Real (broken-verification gap): the assertion was vacuous. Fixed: a `reopenRepairPhase` lane where the hold is the only fence — suppressed while open, visible after a fresh request fails with no-effect proof. |
+| V3 | Digest publish-boundary rechecks masked by the intake fence; no mid-sweep test | medium | Real: deleting the recheck clauses left the suite green. Fixed: two `blockersForRound` race tests (review offer + conflict offer) that open the hold between intake and publish. |
+| V4 | Live-ownership refusal matrix exercises one status per clause | medium | Real (regression gap): `spawning`, `recovered-pending`, `claimed`, `live` were never created. Fixed: each filter member now has a refusal assertion and a release/success path. |
+| V5 | Idempotent replay of a phase-closing retirement misreports the closure (other finding) | low | Real; same root as B3 — fixed by the replay reconstruction; the phase test now replays. |
+| E1 | Board names a terminal-job hold forever and masks newer holds | medium | Real; same root as B5 — fixed by the terminal-job filter and proven by the binned-job board assertion. |
+| E2 | Replay of a phase-closing retirement returns `phaseClosed` null | low | Real; same root as B3/V5 — fixed and asserted. |
+
+No deferred entries: every finding was resolvable inside this change's
+scope, and none was dropped.
 
 ## Design Notes
 

@@ -425,6 +425,43 @@ describe('silas digest conflictingPrs rows (issue #215)', () => {
     }
   });
 
+  it('a conflict offer is retracted when a retirement hold opens during the compute await', async () => {
+    const h = makeLedger();
+    try {
+      // Same deterministic ordering as the directive-admission race above: 
+      // the await job is created first, the conflict candidate a second later.
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-10-04T10:10:00.000Z'));
+      h.ledger.addJob({ id: 'job-await-hold', repo: 'fixture-app', title: 'other', briefing: 'b' });
+      h.ledger.setJobStatus('job-await-hold', 'working');
+      const round = h.ledger.addRound({ jobId: 'job-await-hold', lenses: ['blind'] });
+      h.ledger.setRoundStatus(round.id, 'live');
+      h.ledger.setRoundVerdict(round.id, 'changes-requested');
+      h.ledger.setJobStatus('job-await-hold', 'in-review');
+      vi.setSystemTime(new Date('2026-10-04T10:10:01.000Z'));
+      addDirtyJob(h, 'job-race-hold');
+      vi.useRealTimers();
+      let raced = false;
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => {
+          if (!raced) {
+            raced = true;
+            retireInterruptedForTest(h.ledger, 'job-race-hold');
+          }
+          return { blockers: [], note: null };
+        },
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(raced).toBe(true);
+      expect(h.ledger.hasOpenDirectiveRecoveryHold('job-race-hold')).toBe(true);
+      expect(digest.conflictingPrs).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it('a pre-#215 dirty stretch (no transition event) still retires on its head directive', async () => {
     const h = makeLedger();
     try {
@@ -563,8 +600,26 @@ function makeLedger(): Harness {
   };
 }
 
-function addJobWithDelivery(ledger: LedgerApi, jobId: string, opts: { prUrl?: string; deliverable?: JobDeliverable } = {}): JobRecord {
-  const job = ledger.addJob({
+/** Drive one interrupted request to the guarded `retired` state on the
+ * ledger seam (no lane port needed: the ledger takes resolved evidence).
+ * Used by the digest fence tests below. */
+function retireInterruptedForTest(ledger: LedgerApi, jobId: string, directive = 'fix it'): string {
+  const intent = ledger.beginDirectiveIntent({ jobId, directive, holder: 'silas-ops' });
+  const head = 'a'.repeat(40);
+  ledger.retireInterruptedDirective({
+    requestId: intent.record.requestId,
+    expectedJobId: jobId,
+    expectedState: 'dispatching',
+    expectedPayloadHash: intent.record.payloadHash,
+    expectedHead: head,
+    lane: { id: `lane-${jobId}`, resolvedHead: head },
+    reason: 'writer ceased; verification race',
+    by: 'silas-ops',
+  });
+  return intent.record.requestId;
+}
+
+function addJobWithDelivery(ledger: LedgerApi, jobId: string, opts: { prUrl?: string; deliverable?: JobDeliverable } = {}): JobRecord {  const job = ledger.addJob({
     id: jobId, repo: 'fixture-app', title: `t-${jobId}`, briefing: 'b',
     ...(opts.deliverable !== undefined ? { deliverable: opts.deliverable } : {}),
   });
@@ -599,6 +654,44 @@ describe('silas digest (the four actionable states)', () => {
       expect(after.deliveredWithoutPr).toEqual([]);
       // registration alone flips the state to review-due
       expect(after.prWithoutReview.map((row) => row.jobId)).toEqual(['job-a']);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a review offer is retracted when a retirement hold opens during the compute await', async () => {
+    const h = makeLedger();
+    try {
+      // Deterministic ordering: the await job is created first, the review
+      // candidate a second later, so the candidate is visited first.
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-10-04T12:00:00.000Z'));
+      h.ledger.addJob({ id: 'job-await-review', repo: 'fixture-app', title: 'other', briefing: 'b' });
+      h.ledger.setJobStatus('job-await-review', 'working');
+      const round = h.ledger.addRound({ jobId: 'job-await-review', lenses: ['blind'] });
+      h.ledger.setRoundStatus(round.id, 'live');
+      h.ledger.setRoundVerdict(round.id, 'changes-requested');
+      h.ledger.setJobStatus('job-await-review', 'in-review');
+      vi.setSystemTime(new Date('2026-10-04T12:00:01.000Z'));
+      addJobWithDelivery(h.ledger, 'job-race-review', { prUrl: 'https://github.com/acme/app/pull/41' });
+      h.ledger.setJobStatus('job-race-review', 'in-review');
+      vi.useRealTimers();
+      let raced = false;
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => {
+          if (!raced) {
+            raced = true;
+            retireInterruptedForTest(h.ledger, 'job-race-review');
+          }
+          return { blockers: [], note: null };
+        },
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(raced).toBe(true);
+      expect(h.ledger.hasOpenDirectiveRecoveryHold('job-race-review')).toBe(true);
+      expect(digest.prWithoutReview).toEqual([]);
     } finally {
       h.cleanup();
     }
@@ -2139,6 +2232,30 @@ describe('silas digest: stalled current phases (issue #162)', () => {
       // A durable failure with positive no-effect proof releases the fence.
       h.ledger.failDirective({ requestId: intent.record.requestId, reason: 'no lane and no minion' });
       expect((await digestAt(h, at)).stalledWorking.map((row) => row.jobId)).toEqual(['job-directive']);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('an open retirement hold fences the stall channel until a fresh request supersedes it', async () => {
+    const h = makeLedger();
+    try {
+      reopenRepairPhase(h, 'job-retire-hold');
+      const at = farFuture();
+      // The guarded control closure leaves a hold open with NO live request;
+      // the lane is still fenced (removing the hold clause makes this row
+      // appear while the retired request sits in the past).
+      retireInterruptedForTest(h.ledger, 'job-retire-hold');
+      expect((await digestAt(h, at)).stalledWorking).toEqual([]);
+      // A fresh accepted request releases the hold; once that request fails
+      // with positive no-effect proof, the stall channel owns the lane again.
+      const next = h.ledger.beginDirectiveIntent({
+        jobId: 'job-retire-hold',
+        directive: 'fresh repair',
+        holder: 'silas-ops',
+      });
+      h.ledger.failDirective({ requestId: next.record.requestId, reason: 'no lane and no minion' });
+      expect((await digestAt(h, at)).stalledWorking.map((row) => row.jobId)).toEqual(['job-retire-hold']);
     } finally {
       h.cleanup();
     }

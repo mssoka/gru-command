@@ -6863,7 +6863,15 @@ export class LedgerApi {
               'a retirement is one exact logical operation; the recorded outcome stands',
           );
         }
-        return { record: row, idempotent: true, phaseClosed: null };
+        // The original call may have closed an awaiting phase handoff;
+        // the replay reports the same closure it produced (never null when
+        // THIS retirement closed it).
+        const phase = this.findPhaseHandoffByRequest({ jobId: row.jobId, requestId: row.requestId });
+        const phaseClosed = phase !== null && phase.state === 'closed' &&
+          phase.closeReason !== null && phase.closeReason.startsWith('directive request retired without completion')
+          ? phase.phaseId
+          : null;
+        return { record: row, idempotent: true, phaseClosed };
       }
       if (row.state === 'settled' || row.state === 'failed') {
         throw new DirectiveRetirementError(
@@ -6950,10 +6958,24 @@ export class LedgerApi {
       this.db
         .prepare(
           `UPDATE pending_directives
-              SET state = 'retired', retired_at = ?, retired_by = ?, retire_reason = ?, retire_fingerprint = ?, updated_at = ?
+              SET state = 'retired', retired_at = ?, retired_by = ?, retire_reason = ?, retire_fingerprint = ?,
+                  retire_expected_state = ?, retire_expected_head = ?, updated_at = ?
             WHERE request_id = ?`,
         )
-        .run(ts, input.by, input.reason, fingerprint, ts, row.requestId);
+        .run(ts, input.by, input.reason, fingerprint, input.expectedState, input.expectedHead, ts, row.requestId);
+      // An awaiting phase handoff attached to this request can never
+      // complete from it: close it (never complete it) with the truthful
+      // reason, in the same transaction — and carry the closed id on the
+      // audit event so the durable correlation is one fact, not a lookup.
+      const phase = this.findPhaseHandoffByRequest({ jobId: row.jobId, requestId: row.requestId });
+      let phaseClosed: string | null = null;
+      if (phase !== null && phase.state === 'awaiting') {
+        this.closePhaseHandoff({
+          phaseId: phase.phaseId,
+          reason: `directive request retired without completion: ${input.reason}`,
+        });
+        phaseClosed = phase.phaseId;
+      }
       this.appendEvent({
         kind: 'silas.directive-retired',
         jobId: row.jobId,
@@ -6964,22 +6986,12 @@ export class LedgerApi {
           admission_class: admissionClass,
           admission_seq: current.admissionSeq,
           admission_minion: current.admissionMinion,
+          expected_state: input.expectedState,
           expected_head: input.expectedHead,
           lane_id: input.lane.id,
+          phase_handoff_closed: phaseClosed,
         },
       });
-      // An awaiting phase handoff attached to this request can never
-      // complete from it: close it (never complete it) with the truthful
-      // reason, in the same transaction.
-      const phase = this.findPhaseHandoffByRequest({ jobId: row.jobId, requestId: row.requestId });
-      let phaseClosed: string | null = null;
-      if (phase !== null && phase.state === 'awaiting') {
-        this.closePhaseHandoff({
-          phaseId: phase.phaseId,
-          reason: `directive request retired without completion: ${input.reason}`,
-        });
-        phaseClosed = phase.phaseId;
-      }
       return { record: this.getDirective(row.requestId) as DirectiveRequestRecord, idempotent: false, phaseClosed };
     });
   }
@@ -7000,13 +7012,19 @@ export class LedgerApi {
       .all(...(params as never[])) as Row[];
     return rows.map((row) => {
       const record = this.directiveFromRow(row);
+      if (record.retiredAt === null || record.retiredBy === null || record.retireReason === null) {
+        throw new Error(
+          `pending_directives row "${record.requestId}" is retired but is missing its audit facts — ` +
+            'the record is inconsistent and cannot be projected',
+        );
+      }
       return {
         jobId: record.jobId,
         requestId: record.requestId,
         admissionClass: directiveAdmissionClass(record),
-        retiredAt: record.retiredAt as string,
-        retiredBy: record.retiredBy as string,
-        reason: record.retireReason as string,
+        retiredAt: record.retiredAt,
+        retiredBy: record.retiredBy,
+        reason: record.retireReason,
         releasedBy: record.holdReleasedBy,
         releasedAt: record.holdReleasedAt,
       };
@@ -7552,6 +7570,12 @@ export class LedgerApi {
       }
       claim = { holder, since };
     }
+    const retireExpectedStateRaw = nstr(row.retire_expected_state);
+    if (retireExpectedStateRaw !== null && retireExpectedStateRaw !== 'dispatching' && retireExpectedStateRaw !== 'admitted') {
+      throw new Error(
+        `pending_directives row "${str(row.request_id)}" has unknown retirement expected state "${retireExpectedStateRaw}"`,
+      );
+    }
     return {
       requestId: str(row.request_id),
       jobId: str(row.job_id),
@@ -7571,6 +7595,8 @@ export class LedgerApi {
       retiredBy: nstr(row.retired_by),
       retireReason: nstr(row.retire_reason),
       retireFingerprint: nstr(row.retire_fingerprint),
+      retireExpectedState: retireExpectedStateRaw,
+      retireExpectedHead: nstr(row.retire_expected_head),
       holdReleasedBy: nstr(row.hold_released_by),
       holdReleasedAt: nstr(row.hold_released_at),
     };
