@@ -100,6 +100,12 @@ export class JournalStore {
       .slice(0, limit);
   }
 
+  /** Every physical record in ONE read, oldest first — unpaged, so a
+   * consistency check sees every record, duplicates included. */
+  entries(): readonly JournalEntry[] {
+    return this.readAll();
+  }
+
   /** The current high-water sequence (0 for an empty journal). */
   latestSeq(): number {
     if (this.seq === null) {

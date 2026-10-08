@@ -9,10 +9,14 @@
 import {
   BOARD_WS_PATH,
   isValidDecisionStatus,
+  isValidLessonProposal,
+  isValidLessonProposalDecision,
   isValidSnapshot,
   parseBoardServerFrame,
   type BoardSnapshot,
   type DecisionStatusView,
+  type LessonProposalDecisionView,
+  type LessonProposalView,
   type NotificationView,
   type TranscriptInfo,
   type TranscriptPage,
@@ -72,6 +76,10 @@ export class BoardClient {
   private readonly options: BoardClientOptions;
   private readonly webSocketCtor: new (url: string) => WebSocket;
   private readonly fetchImpl: typeof fetch;
+  /** Pushed snapshots seen: an HTTP answer asked for before a push is stale. */
+  private snapshotEpoch = 0;
+  /** The newest HTTP snapshot request; older answers are dropped. */
+  private fetchSeq = 0;
 
   constructor(
     options: BoardClientOptions,
@@ -221,6 +229,7 @@ export class BoardClient {
         return;
       }
       if (frame.type === 'board') {
+        this.snapshotEpoch += 1;
         this.events.snapshot(frame.snapshot);
         return;
       }
@@ -262,21 +271,38 @@ export class BoardClient {
     const res = await doFetch(path, {
       headers: { authorization: `Bearer ${this.options.token}` },
     });
-    if (!res.ok) {
-      if (res.status === 401) {
-        this.events.fatal('unauthorized (board api)');
-      }
-      throw new Error(`board api ${path} → ${res.status}`);
-    }
+    if (!res.ok) return this.refused(path, res);
     return (await res.json()) as T;
+  }
+
+  /** A non-2xx answer as a BoardApiError with the server's reason. A
+   * stopped client's late 401 never unpairs the session that replaced it —
+   * it belongs to the old pairing. */
+  private async refused(path: string, res: Response): Promise<never> {
+    if (res.status === 401 && !this.stopped) this.events.fatal('unauthorized (board api)');
+    let code: string | null = null;
+    let detail: string | null = null;
+    try {
+      const body = (await res.json()) as { error?: unknown; detail?: unknown };
+      code = typeof body.error === 'string' ? body.error : null;
+      detail = typeof body.detail === 'string' ? body.detail : null;
+    } catch {
+      /* a non-JSON error body keeps the status alone */
+    }
+    throw new BoardApiError(path, res.status, code, detail);
   }
 
   /** One-shot HTTP snapshot fetch (initial load + reconnect catch-up). */
   async refetchSnapshot(): Promise<void> {
+    const request = ++this.fetchSeq;
+    const epoch = this.snapshotEpoch;
     try {
       const snapshot = await this.api<unknown>('/api/board');
       if (!isValidSnapshot(snapshot)) throw new Error('board api returned a malformed snapshot');
-      this.events.snapshot(snapshot);
+      // Only the newest answer, and only if no pushed snapshot arrived since
+      // it was asked for: an older HTTP answer never overwrites newer truth.
+      // A stopped (re-paired) client's late answer never reaches the board.
+      if (!this.stopped && request === this.fetchSeq && epoch === this.snapshotEpoch) this.events.snapshot(snapshot);
     } catch {
       /* connection state carries the error surface */
     }
@@ -325,6 +351,21 @@ export class BoardClient {
     }
   }
 
+  /** The pending Book of Lessons proposal, for the owner's review. */
+  async getLessonProposal(): Promise<LessonProposalView> {
+    const proposal = await this.api<unknown>('/api/lessons/proposal');
+    if (!isValidLessonProposal(proposal)) throw new Error('lesson proposal review is malformed');
+    return proposal;
+  }
+
+  /** The owner's decision on a lesson proposal — the ONLY way it closes
+   * (owner decision 2026-10-07); the snapshot then retires the row. */
+  async decideLessonProposal(id: string, decision: 'accept' | 'reject'): Promise<LessonProposalDecisionView> {
+    const result = await this.postApi(`/api/lessons/proposal/${encodeURIComponent(id)}/${decision}`, {});
+    if (!isValidLessonProposalDecision(result)) throw new Error('lesson proposal decision response is malformed');
+    return result;
+  }
+
   /** E7: human ack (action-required clearance; re-arms an open breaker). */
   async ackNotification(id: string): Promise<void> {
     await this.postApi(`/api/notifications/${encodeURIComponent(id)}/ack`, { by: 'web' });
@@ -340,12 +381,26 @@ export class BoardClient {
       },
       body: JSON.stringify(body),
     });
-    if (!res.ok) {
-      if (res.status === 401) {
-        this.events.fatal('unauthorized (board api)');
-      }
-      throw new Error(`board api ${path} → ${res.status}`);
-    }
+    if (!res.ok) return this.refused(path, res);
     return res.json();
+  }
+}
+
+/** A board API refusal with the server's reason: the HTTP status, its
+ * error code and detail. A fetch failure (network ambiguity) is never one
+ * of these — callers can tell "the server said no" from "we don't know". */
+export class BoardApiError extends Error {
+  readonly path: string;
+  readonly status: number;
+  readonly code: string | null;
+  readonly detail: string | null;
+
+  constructor(path: string, status: number, code: string | null, detail: string | null) {
+    super(`board api ${path} → ${status}${detail !== null ? `: ${detail}` : ''}`);
+    this.name = 'BoardApiError';
+    this.path = path;
+    this.status = status;
+    this.code = code;
+    this.detail = detail;
   }
 }
