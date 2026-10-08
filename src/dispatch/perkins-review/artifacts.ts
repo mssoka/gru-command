@@ -330,12 +330,20 @@ export async function groupHasLiveMemberAsync(pgid: number, budgetMs: number): P
   }
 }
 
-/** Test seam: how a finished step's group is observed — production always
- * uses the two functions above; a test can stand in an unkillable group. */
+/** Test seam: how a finished step's group is observed and its private
+ * directory removed — production always uses the functions here; a test
+ * can stand in an unkillable group or a failing removal. */
 export const OWNED_GIT_SEAMS: {
   groupHasLiveMember: (pgid: number, budgetMs: number) => boolean;
   groupHasLiveMemberAsync: (pgid: number, budgetMs: number) => Promise<boolean>;
-} = { groupHasLiveMember, groupHasLiveMemberAsync };
+  removePrivateDir: (dir: string) => void;
+} = {
+  groupHasLiveMember,
+  groupHasLiveMemberAsync,
+  removePrivateDir: (dir) => {
+    rmSync(dir, { recursive: true, force: true });
+  },
+};
 
 /** A git step whose process group was still running after KILL_SETTLE_MS:
  * refused, never retried, and escalated naming the group (owner decision
@@ -452,6 +460,29 @@ function runnerAnswer(
   }
 }
 
+type StepOutcome<T> = { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: unknown };
+
+/** Removes a step's private directory, then publishes its outcome (R9-14).
+ * A removal failure never replaces a failure — a cleanup-unconfirmed
+ * verdict keeps its group — and is attached to it instead; after a
+ * success it fails the step, whose group was already proven stopped. */
+function afterPrivateDirRemoved<T>(privateDir: string, command: string, outcome: StepOutcome<T>): T {
+  let removal: string | null = null;
+  try {
+    OWNED_GIT_SEAMS.removePrivateDir(privateDir);
+  } catch (error) {
+    removal = error instanceof Error ? error.message : String(error);
+  }
+  if (!outcome.ok) {
+    if (removal !== null && outcome.error instanceof Error) Object.assign(outcome.error, { privateDirRemovalError: removal });
+    throw outcome.error;
+  }
+  if (removal !== null) {
+    throw Object.assign(new Error(`${command}: its private directory ${privateDir} could not be removed (${removal})`), { ownedStopped: true });
+  }
+  return outcome.value;
+}
+
 /** One read-only git step in its OWN process group, led by the runner (see
  * OWNED_GROUP_RUNNER), without blocking the event loop. The runner ends
  * every outcome by SIGKILLing its group; this side only OBSERVES the group
@@ -488,7 +519,10 @@ export function runOwnedGit(repoPath: string, args: readonly string[], timeoutMs
       if (ended) return;
       ended = true;
       clearTimeout(guard);
-      void (async () => {
+      // R9-14: the private directory is removed BEFORE the outcome is
+      // published, inside the one observed settlement — a removal failure
+      // can never surface as an unhandled rejection.
+      const answer = async (): Promise<StepOutcome<string>> => {
         try {
           const report = readRunnerReport(launch.resultFile);
           if (pid !== null) {
@@ -502,15 +536,20 @@ export function runOwnedGit(repoPath: string, args: readonly string[], timeoutMs
               await new Promise((wait) => setTimeout(wait, 25));
             }
           }
-          resolve(runnerAnswer(report, command, timeoutMs, maxBytes, {
+          return { ok: true, value: runnerAnswer(report, command, timeoutMs, maxBytes, {
             started: pid !== null, ...(spawnError !== undefined ? { error: spawnError } : {}),
-          }));
+          }) };
+        } catch (error) {
+          return { ok: false, error };
+        }
+      };
+      void answer().then((outcome) => {
+        try {
+          resolve(afterPrivateDirRemoved(launch.privateDir, command, outcome));
         } catch (error) {
           reject(error);
-        } finally {
-          rmSync(launch.privateDir, { recursive: true, force: true });
         }
-      })();
+      });
     };
     runner.on('error', (error) => {
       spawnError = error.message;
@@ -535,6 +574,7 @@ export function runOwnedGitSync(
 ): string {
   const command = `git ${args.join(' ')}`;
   const launch = runnerLaunch(repoPath, args, timeoutMs, maxBytes);
+  let outcome: StepOutcome<string>;
   try {
     // `detached` makes the runner lead its own process group. Node honors
     // it for spawnSync (libuv UV_PROCESS_DETACHED) although its type
@@ -561,12 +601,13 @@ export function runOwnedGitSync(
         sleepSync(25);
       }
     }
-    return runnerAnswer(report, command, timeoutMs, maxBytes, {
+    outcome = { ok: true, value: runnerAnswer(report, command, timeoutMs, maxBytes, {
       started: pid !== null, ...(result.error !== undefined ? { error: result.error.message } : {}),
-    });
-  } finally {
-    rmSync(launch.privateDir, { recursive: true, force: true });
+    }) };
+  } catch (error) {
+    outcome = { ok: false, error };
   }
+  return afterPrivateDirRemoved(launch.privateDir, command, outcome);
 }
 
 function git(repoPath: string, args: readonly string[], timeoutMs = 30_000): string {

@@ -1443,6 +1443,52 @@ describe('Perkins admission preflight (gh-169)', () => {
     expect(signals.filter((entry) => entry.target < 0 && entry.signal !== 0)).toEqual([]);
   });
 
+  it('a private directory that cannot be removed fails the step through its one observed settlement — never an unhandled rejection, never hiding a stuck group (R9-14)', async () => {
+    const review = branchTargetReview('private-dir-removal');
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason);
+    };
+    process.on('unhandledRejection', onUnhandled);
+    const removal = vi.spyOn(OWNED_GIT_SEAMS, 'removePrivateDir').mockImplementation((dir) => {
+      rmSync(dir, { recursive: true, force: true });
+      throw Object.assign(new Error('EIO: i/o error, rmdir'), { code: 'EIO' });
+    });
+    try {
+      // A successful answer: the step fails loud, its group already proven stopped.
+      await expect(runOwnedGit(review.manifest.repoPath, ['rev-parse', 'HEAD'], 5_000)).rejects.toMatchObject({
+        message: expect.stringMatching(/^git rev-parse HEAD: its private directory .*gru-probe-.* could not be removed \(EIO: i\/o error, rmdir\)$/u),
+        ownedStopped: true,
+      });
+      expect(() => runOwnedGitSync(review.manifest.repoPath, ['rev-parse', 'HEAD'], 5_000)).toThrow(/could not be removed \(EIO/);
+      // A stuck group: the cleanup-unconfirmed verdict and its group survive the removal failure.
+      const sync = vi.spyOn(OWNED_GIT_SEAMS, 'groupHasLiveMember').mockReturnValue(true);
+      const async = vi.spyOn(OWNED_GIT_SEAMS, 'groupHasLiveMemberAsync').mockResolvedValue(true);
+      try {
+        await expect(runOwnedGit(review.manifest.repoPath, ['rev-parse', 'HEAD'], 5_000)).rejects.toMatchObject({
+          message: expect.stringMatching(/^cleanup unconfirmed: process group \d+ still running/u),
+          cleanupUnconfirmed: true, pgid: expect.any(Number), privateDirRemovalError: 'EIO: i/o error, rmdir',
+        });
+        let syncError: unknown;
+        try {
+          runOwnedGitSync(review.manifest.repoPath, ['rev-parse', 'HEAD'], 5_000);
+        } catch (error) {
+          syncError = error;
+        }
+        expect(syncError).toMatchObject({ cleanupUnconfirmed: true, pgid: expect.any(Number), privateDirRemovalError: 'EIO: i/o error, rmdir' });
+      } finally {
+        sync.mockRestore();
+        async.mockRestore();
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(unhandled).toEqual([]);
+      expect(removal).toHaveBeenCalledTimes(4);
+    } finally {
+      removal.mockRestore();
+      process.off('unhandledRejection', onUnhandled);
+    }
+  });
+
   it('base and target resolution: only git’s own "no such commit" is movement; a timeout, spawn or I/O failure is a check failure, retryable once proven stopped (R8-11)', () => {
     const review = branchTargetReview('resolution');
     const { baseRef, targetRef } = review.manifest;

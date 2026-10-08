@@ -2682,9 +2682,14 @@ export class WaveRunner {
       kind: 'round.admission-retry-scheduled', jobId, roundId,
       payload: { attempt, of: delays.length, dueAt: new Date(dueAt).toISOString(), deliverySeq: reviewedDeliverySeq },
     });
+    // R9-8: the replacement keeps the waiting retry's attempt and due time,
+    // never its timer — that timer could come due while this refusal is
+    // still rolling back. Setup's finally arms the replacement afterwards
+    // (immediately, if it is already due).
+    if (waiting?.timer != null) clearTimeout(waiting.timer);
     this.admissionRetries.set(jobId, {
       input: admissionRetryInput(input), roundId, deliverySeq: reviewedDeliverySeq, attempt, dueAt,
-      scheduledSeq: scheduled.seq, timer: waiting?.timer ?? null, running: false,
+      scheduledSeq: scheduled.seq, timer: null, running: false,
     });
     this.opts.inform?.(title, refusal.message, { jobId, roundId });
     return refusal;
@@ -3669,29 +3674,6 @@ export class WaveRunner {
       const precomputedRemoteMovement = await probeAdvertisedTipMovementAsync(
         frozenReview, ADMISSION_REMOTE_PROBE_TIMEOUT_MS,
       );
-      // R8-16: work that made the branch busy DURING the probe stops the
-      // review before any admission effect — the same shared predicate as
-      // the freeze. A forced round's audited blockers stay authorized; a new
-      // one never is.
-      const recheck = {
-        job,
-        jobLane: jobWorktree,
-        ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
-        phase: 'freeze' as const,
-        roundId: round.id,
-        ...(flippedFrom !== null ? { reviewedStatus: { jobId: job.id, status: flippedFrom } } : {}),
-      };
-      // Unforced: the ordinary refusal (audited). Forced: its audit already
-      // stands — only a blocker it never covered is refused (audited below).
-      const afterProbe = input.force === true ? this.branchIdleBlockers(recheck) : this.enforceBranchIdle(recheck);
-      const unaudited = afterProbe.blockers.filter((blocker) => !idle.blockers.some((audited) => audited.jobId === blocker.jobId));
-      if (unaudited.length > 0) {
-        this.opts.ledger.appendCustomEvent({
-          kind: 'branch-idle.refused', jobId: job.id, roundId: round.id,
-          payload: { phase: 'freeze', forced: false, targetBranch: afterProbe.targetBranch, blockers: unaudited },
-        });
-        throw new BranchBusyError(afterProbe.targetBranch, unaudited, 'freeze');
-      }
       // R8-3: the UNIQUE freeze receipt with full identity validation — a
       // duplicate or conflicting receipt refuses under the manifest's name
       // instead of trusting whichever the latest-event lookup returned.
@@ -3700,11 +3682,42 @@ export class WaveRunner {
       const receiptValid = uniqueReceipt !== null && uniqueReceipt.jobId === job.id &&
         uniqueReceipt.roundId === round.id && typeof receiptPayload?.sha256 === 'string' &&
         /^[a-f0-9]{64}$/u.test(receiptPayload.sha256);
+      // The read-only preflight runs synchronously, so nothing in this
+      // service can change between it and the branch recheck below.
       const admission = admissionPreflight(frozenReview, movementRef, {
         precomputedRemoteMovement,
         frozenManifestReceiptRequired: true,
         ...(receiptValid ? { frozenManifestSha256: (uniqueReceipt!.payload as { sha256: string }).sha256 } : {}),
       });
+      // R9-6: a git step that would not stop is refused and escalated
+      // naming its group FIRST — a branch that turned busy meanwhile never
+      // masks it. Any other outcome takes the busy check before admission
+      // records anything.
+      if (!admission.missing.some((entry) => entry.cleanupUnconfirmed === true)) {
+        // R8-16: work that made the branch busy DURING the probe stops the
+        // review before any admission effect — the same shared predicate as
+        // the freeze. A forced round's audited blockers stay authorized; a new
+        // one never is.
+        const recheck = {
+          job,
+          jobLane: jobWorktree,
+          ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
+          phase: 'freeze' as const,
+          roundId: round.id,
+          ...(flippedFrom !== null ? { reviewedStatus: { jobId: job.id, status: flippedFrom } } : {}),
+        };
+        // Unforced: the ordinary refusal (audited). Forced: its audit already
+        // stands — only a blocker it never covered is refused (audited below).
+        const afterProbe = input.force === true ? this.branchIdleBlockers(recheck) : this.enforceBranchIdle(recheck);
+        const unaudited = afterProbe.blockers.filter((blocker) => !idle.blockers.some((audited) => audited.jobId === blocker.jobId));
+        if (unaudited.length > 0) {
+          this.opts.ledger.appendCustomEvent({
+            kind: 'branch-idle.refused', jobId: job.id, roundId: round.id,
+            payload: { phase: 'freeze', forced: false, targetBranch: afterProbe.targetBranch, blockers: unaudited },
+          });
+          throw new BranchBusyError(afterProbe.targetBranch, unaudited, 'freeze');
+        }
+      }
       this.opts.ledger.appendCustomEvent({
         kind: 'round.admission-preflight',
         jobId: job.id,

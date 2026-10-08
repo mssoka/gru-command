@@ -63,6 +63,10 @@ export interface AdmissionMissingInput {
    * or timed out AND was confirmed stopped. The same request may be
    * re-admitted later; every other refusal needs a person. */
   readonly retryable?: true;
+  /** Present only when a git step that would not stop vetoed head binding:
+   * the refusal escalates naming its process group, is never retried, and
+   * no later check — a branch that turned busy — may mask it (R9-6). */
+  readonly cleanupUnconfirmed?: true;
 }
 
 /** One executed check (pass or fail); `missing` is the failed subset. */
@@ -187,9 +191,13 @@ function ciRecordShapeProblem(value: unknown): string | null {
 export function admissionPreflight(review: FrozenReview, movementRef: string, options?: AdmissionPreflightOptions): AdmissionPreflightResult {
   const checks: AdmissionCheck[] = [];
   const missing: AdmissionMissingInput[] = [];
-  const fail = (input: string, detail: string, retryable = false): void => {
+  const fail = (input: string, detail: string, retryable = false, cleanupVeto = false): void => {
     checks.push({ name: input, ok: false, detail: sanitizeDetail(detail) });
-    missing.push({ input, detail: sanitizeDetail(detail), ...(retryable ? { retryable: true } : {}) });
+    missing.push({
+      input, detail: sanitizeDetail(detail),
+      ...(retryable ? { retryable: true } : {}),
+      ...(cleanupVeto ? { cleanupUnconfirmed: true } : {}),
+    });
   };
   const pass = (name: string): void => {
     checks.push({ name, ok: true, detail: null });
@@ -227,7 +235,7 @@ export function admissionPreflight(review: FrozenReview, movementRef: string, op
   const reported = stuck ?? movement;
   if (reported === null) pass('head-binding');
   else fail('head-binding', `${reported.cause}: ${reported.detail}`,
-    stuck === null && reported.cause === 'check-failed' && reported.stopped === true);
+    stuck === null && reported.cause === 'check-failed' && reported.stopped === true, stuck !== null);
 
   // 2. Frozen packet completeness: every declared artifact is re-read from
   //    the frozen copy and proven byte-identical to its manifest digest.

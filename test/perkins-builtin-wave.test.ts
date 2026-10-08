@@ -131,6 +131,41 @@ class SlowReleasePort implements WorktreePort {
   }
 }
 
+/** A review port whose release can be held (R9-8): while `hold` is set, a
+ * sweep records that it entered and waits for `open()`. */
+class GatedReleasePort implements WorktreePort {
+  hold = false;
+  entered = 0;
+  private gate: (() => void) | null = null;
+  constructor(private readonly delegate: WorktreePort) {}
+  createJobWorktree(input: { repoPath: string; jobId: string }): Promise<WorktreeLane> { return this.delegate.createJobWorktree(input); }
+  resolveReviewTarget(input: { repoPath: string; ref: string }): Promise<{ readonly sha: string; readonly baseSource: WorktreeBaseSource | null }> {
+    return this.delegate.resolveReviewTarget(input);
+  }
+  createReviewWorktree(input: { repoPath: string; roundId: string; ref: string; jobId?: string }): Promise<WorktreeLane> {
+    return this.delegate.createReviewWorktree(input);
+  }
+  createChildWorktree(input: { repoPath: string; jobId: string; childId: string; parentPath: string; authority: 'read-only' | 'writer' }): Promise<WorktreeLane> {
+    return this.delegate.createChildWorktree(input);
+  }
+  getWorktree(id: string): WorktreeLane | null { return this.delegate.getWorktree(id); }
+  listWorktrees(options: { jobId?: string } = {}): readonly WorktreeLane[] { return this.delegate.listWorktrees(options); }
+  async release(input: { worktreeId: string }): Promise<WorktreeSweepResult> {
+    if (this.hold) {
+      this.entered += 1;
+      await new Promise<void>((resolve) => {
+        this.gate = resolve;
+      });
+    }
+    return this.delegate.release(input);
+  }
+  open(): void {
+    this.hold = false;
+    this.gate?.();
+    this.gate = null;
+  }
+}
+
 /** Attach a fetchable bare origin inside the test's port root and push the
  * reviewed branch: the fresh-head freeze reads THIS tip, never the local
  * ref left behind by the fixture. `opts.batched` (T4 only) replaces
@@ -8097,6 +8132,46 @@ describe('automatic admission retry (owner decisions 2026-10-08: in memory; a st
     expect(escalations[0]).toContain('automatic retry 2 of 2 was refused too — no retries remain');
   });
 
+  it('a waiting retry that comes due while a fresh refusal is still rolling back is kept, and runs once the rollback ends (R9-8)', async () => {
+    const { ledger, port, jobId, sessions, artifacts, branch, restorePath } = await transientFixture('rebind-rollback');
+    const gated = new GatedReleasePort(port);
+    const escalations: string[] = [];
+    const informs: string[] = [];
+    const delay = 3_000;
+    const wave = new WaveRunner({
+      ledger, worktrees: gated, spawner: makeSpawner(sessions, []), reviewArtifactRoot: artifacts,
+      prHeadProbe: localHeadProbe(branch), admissionRetryDelaysMs: [delay],
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      inform: (title, detail) => informs.push(`${title}: ${detail}`),
+    });
+    try {
+      await expect(wave.requestReview({ jobId })).rejects.toThrow(/automatic retry 1 of 1 is scheduled/u);
+      const dueAt = Date.parse((payloads(ledger, jobId, 'round.admission-retry-scheduled')[0] as { dueAt: string }).dueAt);
+      // A fresh request is refused while the retry waits; its rollback is held.
+      gated.hold = true;
+      const fresh = wave.requestReview({ jobId });
+      fresh.catch(() => undefined);
+      await until(() => gated.entered === 1, delay);
+      expect(Date.now(), 'the fresh refusal must reach its rollback before the retry is due').toBeLessThan(dueAt);
+      expect(kinds(ledger, jobId, 'round.admission-retry-scheduled')).toHaveLength(2); // the fresh refusal took the retry over
+      // The retry comes due while the rollback is still held.
+      await until(() => Date.now() > dueAt + 300, delay + 2_000);
+      expect(settled(ledger, jobId)).toEqual([]);
+      gated.open();
+      await expect(fresh).rejects.toThrow(/automatic retry 1 of 1 is scheduled/u);
+      // Armed after the rollback (already due): it runs — and, the remote still down, is refused for the last time.
+      await until(() => escalations.length === 1);
+    } finally {
+      gated.open();
+      restorePath();
+      await wave.shutdown();
+    }
+    expect(informs.filter((line) => line.includes('skipped'))).toEqual([]);
+    expect(settled(ledger, jobId)).toEqual([expect.objectContaining({ attempt: 1, outcome: 'refused' })]);
+    expect(ledger.listRounds(jobId)).toHaveLength(3); // request, fresh request, the retry
+    expect(escalations[0]).toContain('automatic retry 1 of 1 was refused too — no retries remain');
+  }, 60_000);
+
   it('a retry binds the delivery its round reviewed, never one that landed during the probe (R7-14)', async () => {
     const { ledger, port, jobId, sessions, artifacts, branch, restorePath } = await transientFixture('probe-delivery', { probeDelaySeconds: 0.4 });
     const informs: string[] = [];
@@ -8394,6 +8469,65 @@ describe('automatic admission retry (owner decisions 2026-10-08: in memory; a st
       async.mockRestore();
       f.restorePath();
       await wave.shutdown();
+    }
+  }, 120_000);
+
+  it('a git group that would not stop is escalated naming it even when the branch turned busy during the probe — a busy refusal never masks it (R9-6)', async () => {
+    for (const route of ['request', 'forced'] as const) {
+      const stuckFile = join(mkdtempSync(join(tmpdir(), 'perkins-retry-stuck-')), 'groups');
+      dirs.push(dirname(stuckFile));
+      const f = await transientFixture(`stuck-busy-${route}`, { stuckFile });
+      const escalations: string[] = [];
+      const informs: string[] = [];
+      const stuck = (pgid: number): boolean => existsSync(stuckFile) && readFileSync(stuckFile, 'utf8').split('\n').includes(String(pgid));
+      const realSync = OWNED_GIT_SEAMS.groupHasLiveMember;
+      const realAsync = OWNED_GIT_SEAMS.groupHasLiveMemberAsync;
+      const sync = vi.spyOn(OWNED_GIT_SEAMS, 'groupHasLiveMember').mockImplementation((pgid, budget) => stuck(pgid) || realSync(pgid, budget));
+      const async = vi.spyOn(OWNED_GIT_SEAMS, 'groupHasLiveMemberAsync').mockImplementation(async (pgid, budget) => stuck(pgid) || realAsync(pgid, budget));
+      let landed = false;
+      const wave = new WaveRunner({
+        ledger: f.ledger, worktrees: f.port, spawner: makeSpawner(f.sessions, []), reviewArtifactRoot: f.artifacts,
+        prHeadProbe: localHeadProbe(f.branch), admissionRetryDelaysMs: [0, 0],
+        // New work lands while the stuck remote probe runs.
+        reviewFreezeObserver: () => {
+          setTimeout(() => {
+            if (route === 'forced') {
+              const sibling = `${f.jobId}-sibling`;
+              void f.port.createJobWorktree({ repoPath: f.repo.path, jobId: sibling }).then(() => {
+                f.ledger.addJob({ id: sibling, repo: 'fixture', title: 'sibling', baseBranch: 'main', briefing: 'sibling' });
+                f.ledger.setJobStatus(sibling, 'working');
+                landed = true;
+              });
+              return;
+            }
+            f.ledger.appendCustomEvent({ kind: 'silas.directive-sent', jobId: f.jobId, payload: { request_id: 'repair-during-stuck-probe' } });
+            landed = true;
+          }, 300);
+        },
+        escalate: (title: string, detail: string) => escalations.push(`${title}: ${detail}`),
+        inform: (title: string, detail: string) => informs.push(`${title}: ${detail}`),
+      });
+      try {
+        await expect(wave.requestReview({ jobId: f.jobId, ...(route === 'forced' ? { force: true } : {}) }))
+          .rejects.toThrow(/cleanup unconfirmed: process group \d+ still running/u);
+        expect(landed, route).toBe(true);
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      } finally {
+        sync.mockRestore();
+        async.mockRestore();
+        f.restorePath();
+        await wave.shutdown();
+      }
+      const round = f.ledger.listRounds(f.jobId).at(-1)!;
+      expect(round.status, route).toBe('aborted');
+      expect(escalations, route).toHaveLength(1);
+      expect(escalations[0], route).toMatch(/refused admission before any specialist started: .*cleanup unconfirmed: process group \d+ still running/u);
+      expect(informs, route).toEqual([]);
+      expect(kinds(f.ledger, f.jobId, 'round.admission-retry-scheduled'), route).toEqual([]);
+      expect(payloads(f.ledger, f.jobId, 'round.admission-preflight').at(-1), route).toMatchObject({
+        ok: false, missing: [expect.objectContaining({ input: 'head-binding', cleanupUnconfirmed: true })],
+      });
+      expect(kinds(f.ledger, f.jobId, 'branch-idle.refused').filter((event) => event.roundId === round.id), route).toEqual([]);
     }
   }, 120_000);
 
