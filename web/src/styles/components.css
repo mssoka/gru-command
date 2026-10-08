@@ -2070,7 +2070,7 @@ body {
   overflow-wrap: anywhere;
 }
 
-.board-owner__actions {
+.board-owner__row--proposal .board-owner__actions {
   grid-area: action;
   display: flex;
   gap: 6px;
@@ -2185,7 +2185,6 @@ body {
   .board-owner__actions {
     justify-items: start;
     grid-auto-flow: column;
-  }
   }
 }
 

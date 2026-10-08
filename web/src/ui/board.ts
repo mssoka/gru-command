@@ -1171,10 +1171,12 @@ export class BoardView {
       );
       this.wakesChip.title +=
         ` ${deferredCount}${deferred?.truncated === true ? '+' : ''} wake demand${deferredCount === 1 ? '' : 's'} deferred (avoided): ` +
-        Object.entries(deferred?.reasons ?? {})
-          .sort(([a], [b]) => b.localeCompare(a))
-          .map(([reason, n]) => `${n} ${reason}`)
-          .join(', ') +
+        (Object.entries(deferred?.reasons ?? {}).length === 0
+          ? 'reasons unavailable'
+          : Object.entries(deferred?.reasons ?? {})
+              .sort(([a], [b]) => b.localeCompare(a))
+              .map(([reason, n]) => `${n} ${reason}`)
+              .join(', ')) +
         (deferred?.truncated === true ? ' — tally truncated at the scan cap' : '');
     }
   }
