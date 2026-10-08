@@ -171,6 +171,7 @@ async function boot(opts: {
     ...(opts.fallbackGate !== undefined ? { fallbackGate: opts.fallbackGate } : {}),
   });
   const server = createDispatchServer({
+    pendingProducerBlockers: () => [],
     config: cfg,
     dispatch,
     wave,

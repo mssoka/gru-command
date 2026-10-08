@@ -1084,6 +1084,7 @@ describe('tracked child workers: board and API surfaces', () => {
     );
     const config = loadConfig({ GRU_COMMAND_HOME: h.dir }, '/home/tester');
     const server = createDispatchServer({
+      pendingProducerBlockers: () => [],
       config,
       dispatch: {} as DispatchService,
       wave: {} as WaveRunner,

@@ -374,6 +374,10 @@ const SILAS_ACTION_KINDS = [
   // it actually advanced durable work (a generic phase-completion or
   // obligation event from an unrelated lane is deliberately NOT counted).
   'silas.reconcile-advanced',
+  // `silas.directive-retired` is deliberately NOT counted here: retirement
+  // is an operator/owner control closure (no work was advanced, no turn
+  // ran) — counting it as Silas follow-through yield would misattribute
+  // activity the record explicitly declines to claim as progress.
 ] as const;
 
 /** PR state from the record: a terminal `merged` job is merged; a
@@ -955,6 +959,25 @@ export class BoardEngine {
       if (directive !== undefined) {
         return `directive ${directive.requestId}: ${directive.state} (${directive.jobId})`;
       }
+      // A retirement's open continuation hold is durable debt too: the lane
+      // will not self-continue, and the board must say so truthfully. A
+      // hold on a terminal job is inert (terminal lanes take no work and
+      // can never accept the releasing request) — showing it would name a
+      // dead lane forever and mask newer live holds.
+      const damaged: string[] = [];
+      const hold = this.ledger.listDirectiveRecoveryHolds({ openOnly: true,
+        onMalformed: (requestId, jobId, error) => {
+          this.log?.('error', 'silas health: retired directive audit is inconsistent', { requestId, jobId, error: String(error) });
+          damaged.push(`directive ${requestId}: inconsistent retirement audit requires repair (${jobId})`);
+        },
+      }).find((candidate) => {
+        const job = this.ledger.getJob(candidate.jobId);
+        return job !== null && !isJobTerminal(job.status);
+      });
+      if (hold !== undefined) {
+        return `directive ${hold.requestId}: retired — continuation requires a fresh request (${hold.jobId})`;
+      }
+      if (damaged.length > 0) return damaged[0] ?? null;
     } catch (error) {
       // One malformed directive row must never take the board down; the
       // malformed debt stays visible to the boot reconciler instead.

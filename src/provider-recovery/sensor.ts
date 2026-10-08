@@ -194,15 +194,7 @@ export async function establishProviderWait(
   }
   // Single route-truth source: the shared runtime catalog + auth snapshot
   // resolves BOTH the exact endpoint and the credential fingerprint (r1 #3).
-  const resolved = await sensor.probeFor(evidence.provider).resolveRoute(evidence.provider, evidence.model);
-  if (resolved === null) {
-    sensor.debugLog('route/credential could not be resolved for the binding — no wait', {
-      agent_id: observation.agentId,
-      provider: evidence.provider,
-    });
-    return null;
-  }
-  return sensor.recordWait(observation, evidence, resolved.endpoint, resolved.credentialFingerprint);
+  return sensor.resolveAndRecordWait(observation, evidence);
 }
 
 /** Rolling budget window (1 h, per the approval's 12/hour pin). */
@@ -244,6 +236,42 @@ export class ProviderRecoverySensor {
 
   debugLog(msg: string, fields: Record<string, unknown>): void {
     this.log('info', msg, fields);
+  }
+
+  /** Reserve the observation BEFORE credential I/O: a stopped actor can
+   * still have this producer pending, so its directive cannot retire yet. */
+  async resolveAndRecordWait(observation: ProviderWallObservation, evidence: ProviderRejectionEvidence): Promise<ProviderWaitRecord | null> {
+    let release: (() => void) | null = null;
+    const authorityJobId = observation.role === 'minion' ? observation.jobId : null;
+    let authorityEpoch: number | null = null;
+    if (authorityJobId !== null) {
+      const job = this.ledger.getJob(authorityJobId);
+      if (job === null || isJobTerminal(job.status) || this.ledger.hasOpenDirectiveRecoveryHold(job.id)) {
+        this.debugLog('provider observation has no current job authority — no wait', { agent_id: observation.agentId, job_id: authorityJobId });
+        return null;
+      }
+      authorityEpoch = this.ledger.directiveRecoveryEpoch(job.id);
+      release = this.ledger.beginJobAdmission(job.id, `provider wait establishment ${observation.agentId}`);
+    }
+    try {
+      const resolved = await this.probeFor(evidence.provider).resolveRoute(evidence.provider, evidence.model);
+      if (resolved === null || this.disposed || (authorityJobId !== null && this.ledger.directiveRecoveryEpoch(authorityJobId) !== authorityEpoch)) {
+        this.debugLog('route/credential unavailable, sensor stopped, or authority changed — no wait', { agent_id: observation.agentId, provider: evidence.provider });
+        return null;
+      }
+      return this.recordWait(observation, evidence, resolved.endpoint, resolved.credentialFingerprint);
+    } finally {
+      release?.();
+    }
+  }
+
+  private retirementIdentity(wait: ProviderWaitRecord): 'current' | 'superseded' | 'unknown' {
+    try {
+      return this.ledger.providerWaitRetirementIdentity(wait);
+    } catch (error) {
+      this.log('error', 'provider retirement identity unreadable — wait held', { wait_id: wait.id, job_id: wait.jobId, error: String(error) });
+      return 'unknown';
+    }
   }
 
   /** The readiness port for a provider: a non-generation metadata reader
@@ -418,6 +446,8 @@ export class ProviderRecoverySensor {
     if (wait.waiterKind === 'job-minion') {
       const job = wait.jobId !== null ? this.ledger.getJob(wait.jobId) : null;
       if (job === null || isJobTerminal(job.status)) return 'cancel';
+      // Preserve retired debt; capacity checks cannot recreate authority.
+      if (this.retirementIdentity(wait) !== 'current') return 'hold';
       if (job.status === 'parked') return 'cancel'; // explicit manual hold
       if (wait.jobId !== null) {
         // Supersession requires a newer IMPLEMENTER (Gru ruling
@@ -721,16 +751,19 @@ export class ProviderRecoverySensor {
     });
   }
 
-  /** Retire delivery markers whose every waiter settled. */
+  /** Retire delivery markers whose every waiter settled or was superseded. */
   private async settlePendingRecoveries(): Promise<void> {
     for (const pending of this.ledger.listPendingProviderRecoveries()) {
-      const open = this.ledger
-        .listProviderWaits({ routeKey: pending.routeKey })
-        .filter((wait) => wait.status === 'recovered-pending');
-      if (open.length === 0) {
+      const open = this.pendingBatchWaits(pending);
+      if (open.every((wait) => wait.recoveryBatchId !== null && this.retirementIdentity(wait) === 'superseded')) {
         this.ledger.clearPendingProviderRecovery(pending.id);
       }
     }
+  }
+
+  private pendingBatchWaits(pending: PendingProviderRecoveryRecord): readonly ProviderWaitRecord[] {
+    return this.ledger.listProviderWaits({ routeKey: pending.routeKey }).filter((wait) =>
+      wait.status === 'recovered-pending' && (wait.recoveryBatchId === pending.id || wait.recoveryBatchId === null));
   }
 
   /** Boot/restart reconciliation: never silently re-baseline away an
@@ -740,13 +773,12 @@ export class ProviderRecoverySensor {
     if (!this.enabled) return { rewoken: 0 };
     let rewoken = 0;
     for (const pending of this.ledger.listPendingProviderRecoveries()) {
-      const open = this.ledger
-        .listProviderWaits({ routeKey: pending.routeKey })
-        .filter((wait) => wait.status === 'recovered-pending');
-      if (open.length === 0) {
+      const open = this.pendingBatchWaits(pending);
+      if (open.every((wait) => wait.recoveryBatchId !== null && this.retirementIdentity(wait) === 'superseded')) {
         this.ledger.clearPendingProviderRecovery(pending.id);
         continue;
       }
+      if (!open.some((wait) => wait.recoveryBatchId === pending.id && this.retirementIdentity(wait) === 'current')) continue;
       // The durable `provider.restored` event predates the restart; the ONE
       // delivery path is re-armed here — a single wake per open batch per
       // boot (request identity = the batch marker; the coalescer dedupes).

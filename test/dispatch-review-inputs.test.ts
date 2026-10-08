@@ -43,7 +43,7 @@ async function boot(): Promise<Harness> {
     shutdown: async () => {},
   } as unknown as WaveRunner;
   const dispatch = { worktreesFor: () => [] } as unknown as DispatchService;
-  const server = createDispatchServer({ config: cfg, dispatch, wave, ledger });
+  const server = createDispatchServer({ config: cfg, dispatch, wave, ledger, pendingProducerBlockers: () => [] });
   const http: HttpServer = createServer((req, res) => {
     if (server.requestHook(req, res, new URL(req.url ?? '/', 'http://localhost').pathname)) return;
     res.writeHead(404);
