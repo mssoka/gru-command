@@ -198,6 +198,10 @@ export interface JobRecord {
    * a PR-owing lane (or a target-less artifact/investigation job). */
   readonly targetRef: string | null;
   readonly targetSha: string | null;
+  /** The job whose minion commissioned this one (a megaminion's parent
+   * heist). One level deep. `null` = a top-level job, or a ledger older
+   * than migration job-parent. */
+  readonly parentJobId: string | null;
   readonly status: JobStatus;
   readonly baseBranch: string | null;
   readonly prUrl: string | null;
@@ -543,6 +547,16 @@ export class PhaseHandoffConflictError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'PhaseHandoffConflictError';
+  }
+}
+
+/** A job named a parent (the megaminion family link) the ledger cannot
+ * accept: unknown, itself, another repo's, a child itself, or a child
+ * that is not a report-type specialist. Thrown before any row is written. */
+export class JobParentError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'JobParentError';
   }
 }
 
@@ -1358,6 +1372,11 @@ export class LedgerApi {
     commissioner?: string | null;
     targetRef?: string | null;
     targetSha?: string | null;
+    /** The commissioning job (a megaminion's parent heist). Only a
+     * report-type job (review/artifact/investigation) may name one, and
+     * the parent must exist, share the repo, and itself be top-level;
+     * every refusal is a JobParentError. */
+    parentJobId?: string | null;
   }): JobRecord {
     if (input.id === '' || input.repo === '' || input.title === '') {
       throw new Error('job id, repo, and title must be non-empty');
@@ -1406,6 +1425,28 @@ export class LedgerApi {
     if (!isReportKind && (input.targetRef !== undefined || input.targetSha !== undefined)) {
       throw new Error(`job target_ref/target_sha are report-job fields — job "${input.id}" is not a report-type deliverable`);
     }
+    // Job family (migration job-parent): same upgrade-fixture rule — a
+    // caller that SUPPLIES a parent on an older schema fails loud.
+    const parentJobId = input.parentJobId ?? null;
+    if (parentJobId !== null) {
+      if (!this.jobsColumns().has('parent_job_id')) {
+        throw new JobParentError('job parent requires migration job-parent (the column is missing on this database)');
+      }
+      if (parentJobId.trim() === '') {
+        throw new JobParentError('job parent_job_id must be a non-empty string when present');
+      }
+      if (parentJobId === input.id) {
+        throw new JobParentError(`job "${input.id}" cannot name itself as its parent job`);
+      }
+      // A megaminion is a specialist handing back a report; a PR-owing
+      // lane is a heist in its own right and never hides under another.
+      if (input.deliverable === undefined || input.deliverable === null || !isReportDeliverable(input.deliverable)) {
+        throw new JobParentError(
+          `job "${input.id}" names parent job "${parentJobId}" but is not a report-type job — ` +
+            'only review/artifact/investigation specialists nest under a heist',
+        );
+      }
+    }
     if (input.displayName !== undefined && input.displayName !== null && input.displayName.trim() === '') {
       throw new Error('job display name must be a non-empty string');
     }
@@ -1435,6 +1476,23 @@ export class LedgerApi {
           `job id "${input.id}" is reserved by an accepted pipeline entry (${reserved.state}) — a direct job cannot take it`,
         );
       }
+      if (parentJobId !== null) {
+        const parent = this.getJob(parentJobId);
+        if (parent === null) {
+          throw new JobParentError(`job "${input.id}" names parent job "${parentJobId}", which does not exist`);
+        }
+        if (parent.repo !== input.repo) {
+          throw new JobParentError(
+            `job "${input.id}" (repo ${input.repo}) names parent job "${parentJobId}" from another repo (${parent.repo})`,
+          );
+        }
+        if (parent.parentJobId !== null) {
+          throw new JobParentError(
+            `job "${input.id}" names parent job "${parentJobId}", which is itself a child of "${parent.parentJobId}" — ` +
+              'job families are one level deep; commission it from the top-level job instead',
+          );
+        }
+      }
       const ts = nowIso();
       this.db
         .prepare(
@@ -1455,6 +1513,9 @@ export class LedgerApi {
             : []),
           ts, ts,
         );
+      if (parentJobId !== null) {
+        this.db.prepare('UPDATE jobs SET parent_job_id = ? WHERE id = ?').run(parentJobId, input.id);
+      }
       this.appendEvent({
         kind: 'job.created',
         jobId: input.id,
@@ -1465,6 +1526,7 @@ export class LedgerApi {
           ...(isReportKind
             ? { commissioner: input.commissioner ?? null, target_ref: input.targetRef ?? null, target_sha: input.targetSha ?? null }
             : {}),
+          ...(parentJobId !== null ? { parent_job_id: parentJobId } : {}),
         },
       });
       return this.getJob(input.id) as JobRecord;
@@ -4322,6 +4384,7 @@ export class LedgerApi {
       commissioner: nstr(row.commissioner),
       targetRef: nstr(row.target_ref),
       targetSha: nstr(row.target_sha),
+      parentJobId: nstr(row.parent_job_id),
       status: str(row.status) as JobStatus,
       baseBranch: nstr(row.base_branch),
       prUrl: nstr(row.pr_url),

@@ -86,6 +86,13 @@ export default defineConfig({
       use: { baseURL: `http://localhost:${PREVIEW_PORT}` },
     },
     {
+      // Megaminion nesting proof: synthetic WebSocket-seeded snapshots;
+      // specialists nest under their heist and never count as heists.
+      name: 'megaminions',
+      testMatch: 'megaminions.spec.ts',
+      use: { baseURL: `http://localhost:${PREVIEW_PORT}` },
+    },
+    {
       // Book of Lessons proposal on a phone (owner decision 2026-10-07):
       // the open review's real layout at 360/375/390 px. Synthetic
       // WebSocket-seeded snapshot + review fetch; no decision is clicked.
