@@ -2,7 +2,7 @@
 title: 'Guarded interrupted-directive recovery'
 type: 'feature'
 created: '2026-10-08'
-status: 'in-progress'
+status: 'in-review'
 route: 'dispatch'
 baseline_commit: '52ae3f1ce88ccfd0d0095f99fb8f51db67a88a62'
 review_loop_iteration: 0
@@ -76,14 +76,14 @@ retirement or migration execution as part of development. No merge, deploy or re
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `src/ledger/directives.ts` — add `retired` state, terminal/admission-class helpers, record fields, hold record, `DirectiveRetirementError` — one shared vocabulary.
-- [ ] `src/ledger/db.ts` — migration 23 with the six nullable columns + hold index — additive, boot-applied, never executed against production here.
-- [ ] `src/ledger/api.ts` — `retireInterruptedDirective` (single transaction: expected-field checks, blocker re-check, admission preservation, state flip, ONE event, hold write, awaiting-phase close), hold queries, job-scoped provider-wait query, admission accessor, release-on-acceptance, terminal guards on `failDirective`/`recordDirectiveReconcile` — atomic audit truth.
-- [ ] `src/dispatch/directive-recovery.ts` — lane/head evidence orchestration + replay path — route stays thin.
-- [ ] `src/dispatch/server.ts` — POST route + readback fields — authenticated boundary.
-- [ ] `src/dispatch/branch-idle.ts`, `src/dispatch/silas-driver.ts`, `src/board/engine.ts` — enforce the hold — no automatic follow-through.
-- [ ] `test/directive-retirement.test.ts`, `test/ledger-db.test.ts` — deterministic fail-before/pass-after matrix (below).
-- [ ] `docs/LEDGER.md`, `docs/DIRECTIVE-RECOVERY.md` — readback truth + activation/runbook.
+- [x] `src/ledger/directives.ts` — add `retired` state, terminal/admission-class helpers, record fields, hold record, `DirectiveRetirementError` — one shared vocabulary.
+- [x] `src/ledger/db.ts` — migration 23 with the six nullable columns + hold index — additive, boot-applied, never executed against production here.
+- [x] `src/ledger/api.ts` — `retireInterruptedDirective` (single transaction: expected-field checks, blocker re-check, admission preservation, state flip, ONE event, hold write, awaiting-phase close), hold queries, job-scoped provider-wait query, admission accessor, release-on-acceptance, terminal guards on `failDirective`/`recordDirectiveReconcile` — atomic audit truth.
+- [x] `src/dispatch/directive-recovery.ts` — lane/head evidence orchestration + replay path — route stays thin.
+- [x] `src/dispatch/server.ts` — POST route + readback fields — authenticated boundary.
+- [x] `src/dispatch/branch-idle.ts`, `src/dispatch/silas-driver.ts`, `src/board/engine.ts` — enforce the hold — no automatic follow-through.
+- [x] `test/directive-retirement.test.ts`, `test/ledger-db.test.ts` — deterministic fail-before/pass-after matrix (below).
+- [x] `docs/LEDGER.md`, `docs/DIRECTIVE-RECOVERY.md` — readback truth + activation/runbook.
 
 **Acceptance Criteria:**
 - Given a live `dispatching` request with a ceased writer and an existing lane, when the retirement route is called with matching expectations, then state becomes `retired`, exactly one `silas.directive-retired` event exists, admission class is `admission-unknown`, a hold is open, and no sent/delivered/settled/failed/job/obligation/other-request evidence changed.
@@ -95,6 +95,8 @@ retirement or migration execution as part of development. No merge, deploy or re
 - Given a retirement, when consumers run, then the lane stays fenced (branch-idle review arm refuses, digest offers/stall suppressed, board shows the open hold), no spawn/review/phase event occurs; a fresh accepted directive or re-brief releases the hold by its own identity, and boot/tick reconcilers and a re-opened database read the same truth.
 
 ## Implementation Notes
+
+Implementation status 2026-10-08: all tasks complete; focused verification green (new matrix 30 tests; ledger-db upgrade 9; directive-markers 14; durable-reconcile 13; branch-idle-guard heavy 46; dispatch-server heavy 61; board suites 90; typecheck + lint clean). No I/O matrix row exists in this spec; the acceptance criteria are covered by the named suite. Review commissioned as tracked dispatch review jobs at the pushed head; full `/api/verify` capture follows the exact final head.
 
 (Autonomous lane note, 2026-10-08: owner approval j-1348 + this dispatch already approve the
 whole build; the step-02 checkpoint's "Approve and continue" is satisfied without a live human
