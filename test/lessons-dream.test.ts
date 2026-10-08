@@ -884,6 +884,55 @@ describe('owner-approved lesson proposals (owner decision 2026-10-07)', () => {
     expect((await h.engine.run()).status).toBe('noop');
   });
 
+  it('a beat that only waits on the owner never closes a failure streak — only a completed pass does (R11-06, owner decision 2026-10-08)', async () => {
+    const h = proposalHarness();
+    h.journal.append({ kind: 'finding', source: 'gru', body: 'shell hang finding' });
+    expect((await h.engine.run()).status).toBe('proposed');
+    const db = new LedgerDb(tmpDir('gru-command-dream-awaiting-incident-'));
+    try {
+      const bus = new EventBus();
+      const ledger = new LedgerApi(db.handle, { bus });
+      const notifications = new NotificationCenter({ ledger, bus });
+      const times = ['2026-10-08T01:00:00.000Z', '2026-10-08T13:00:00.000Z'];
+      let tick = 0;
+      const hooks = dreamFailureIncidents(notifications, 'REPAIR', () => new Date(times[tick++]!));
+      const open = () => ledger.listNotifications({ limit: 50 }).filter((row) => row.kind === DREAM_FAILED_KIND && row.resolvedAt === null);
+      let failNext = true;
+      const scheduler = new DreamScheduler({
+        intervalMs: 0,
+        dreamOnBoot: false,
+        run: async () => {
+          if (failNext) {
+            failNext = false;
+            throw new DreamError('model outage');
+          }
+          return h.engine.run();
+        },
+        onFailure: hooks.onFailure,
+        onSuccess: hooks.onSuccess,
+      });
+      await expect(scheduler.tick()).resolves.toBeNull();
+      const incident = open()[0]!;
+      // The waiting proposal: no journal read, no distiller — the incident stays open.
+      await expect(scheduler.tick()).resolves.toMatchObject({ status: 'awaiting-owner' });
+      expect(h.distiller.calls).toHaveLength(1);
+      expect(open().map((row) => row.id)).toEqual([incident.id]);
+      // The next failure continues the SAME streak: its first failure kept, pass 2.
+      failNext = true;
+      await expect(scheduler.tick()).resolves.toBeNull();
+      expect(open().map((row) => row.id)).toEqual([incident.id]);
+      expect(open()[0]!.detail).toContain(`First failure (${times[0]}): DreamError: model outage`);
+      expect(open()[0]!.detail).toContain(`Latest failure (${times[1]}, failed pass 2)`);
+      // The owner decides; the next beat is a completed pass, which closes it.
+      h.proposals.reject(h.proposals.review()!.id);
+      await expect(scheduler.tick()).resolves.toMatchObject({ status: 'noop' });
+      expect(open()).toEqual([]);
+      expect(ledger.getNotification(incident.id)).toMatchObject({ resolvedBy: 'dream' });
+    } finally {
+      db.close();
+    }
+  });
+
   it('Reject leaves the book untouched and consumes the batch: it is never proposed again', async () => {
     const h = proposalHarness();
     h.bible.ensureSeeded();

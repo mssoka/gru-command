@@ -1000,7 +1000,8 @@ export interface DreamSchedulerOptions {
   /** A failed pass, beyond the log line — production raises an incident so
    * a broken dream cannot stay silent for days (owner incident 2026-10-07). */
   readonly onFailure?: (error: unknown) => void;
-  /** A pass that completed (including noop) — production resolves that incident. */
+  /** A pass that completed (including noop; never a beat that only waited
+   * on the owner's decision) — production resolves that incident. */
   readonly onSuccess?: (outcome: DreamOutcome) => void;
   readonly log?: Log;
   readonly setInterval?: typeof setInterval;
@@ -1117,7 +1118,10 @@ export class DreamScheduler {
       if (outcome.status === 'noop') {
         this.log('debug', 'dream beat: no new journal entries', {});
       }
-      this.notify('onSuccess', () => this.opts.onSuccess?.(outcome));
+      // R11-06: a beat that only waited on the owner's decision read no
+      // journal and ran no distiller — it is not a completed pass, so it
+      // never closes a failure streak (owner decision: only success closes it).
+      if (outcome.status !== 'awaiting-owner') this.notify('onSuccess', () => this.opts.onSuccess?.(outcome));
       return outcome;
     } catch (error) {
       this.log('error', 'dream pass failed — the next beat retries', {
