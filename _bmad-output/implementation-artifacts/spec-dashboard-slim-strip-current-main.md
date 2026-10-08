@@ -213,6 +213,30 @@ Exact-head receipts at `e740d96` (all through the authenticated scheduler + ship
 - `megaminions-browser` GREEN (run `f1482ba1-0d82-4fe2-a56e-7d8738c03d31`)
 - `full` GREEN (run `a52e12a8-beca-4574-9b25-8865aa9969c4`)
 
+### R3 native Perkins findings (INCOMPLETE at `2061e59`, triaged and fixed)
+
+| # | Finding | Severity | Verdict | Fix |
+|---|---|---|---|---|
+| R3-1 | Lesson-proposal backend dependency: `GET /api/lessons/proposal` routes absent from frozen backend | blocker | **Dependency-boundary escalation** — the proposal controls came from current main; the backend routes are out of SLIM scope. Frontend controls preserved (not deleted); the backend routes require owner/ops-authorized integration. Synthetic interception tests cover the frontend rendering. |
+| R3-2 | Keyboard focus falls to body when Accept/Reject disables its own focused control | blocker | **Fixed** at `1c8753c`: after `rerenderOwner()` during a decision, focus moves to the proposal disclosure (always present, always enabled); restored to the enabled button on completion. |
+| R3-3 | Proposal GET/POST/body-read lack a deadline | warning | **Fixed** at `1c8753c`: `AbortSignal.timeout(SNAPSHOT_DEADLINE_MS)` bounds proposal GET and all POST body reads; timeout is unconfirmed (never auto-replayed); authoritative snapshot reconciles. |
+| R3-4 | Proposal review headings/meta lack overflow-wrap | warning | **Fixed** at `1c8753c`: `overflow-wrap: anywhere` on `.board-owner__review-list` (inherited by all children) and `.board-owner__review-heading`. |
+| R3-5 | Baseline RED kind not mechanically classified | warning | Confirmed; recorded as deferred (deferred-work.md: failure-kind assertion). |
+
+### R3-fix exact-head receipts at `1c8753c`
+
+| Scope | Run | Outcome |
+|---|---|---|
+| `lesson-proposal-browser` | `eedf4c08` | GREEN |
+| `dashboard-slim-strip-unit` | `043cf1cb` | GREEN 142/142 |
+| `strip-browser` | `61201a9d` | GREEN 67/67 |
+| `strip-smoke` | `49263282` | GREEN |
+| `strip-themes` | `b5afe48f` | GREEN |
+| `typecheck` | `3a76670c` | GREEN |
+| `pipeline-board-browser` | `878a9c24` | GREEN 15/15 STRICT |
+| `megaminions-browser` | `c83e144f` | GREEN |
+| `full` | `f91bca9d` | GREEN |
+
 ### Post-R2-fix exact-head receipts at `4ab3e7b`
 
 | Scope | Run | Outcome |
