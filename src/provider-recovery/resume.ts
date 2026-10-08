@@ -13,6 +13,10 @@ import type { SlotReArmPort } from './sensor.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
+class ProviderContinuationIneligibleError extends Error {
+  override readonly name = 'ProviderContinuationIneligibleError';
+}
+
 /**
  * The GUARDED eligible-state transition (briefing acceptance 7): how a
  * recovered wait becomes one actual continuation. This is deliberately NOT
@@ -134,18 +138,18 @@ async function claimJobMinion(
   // (the dispatch settle raced the wait — r4 directive): that block IS this
   // provider blocker's settlement and must not strand the recovery.
   const job = wait.jobId !== null ? deps.ledger.getJob(wait.jobId) : null;
-  // Control closure outranks later capacity evidence, including on parked
-  // or blocked jobs. A refused claim never rewrites this wait.
-  if (job !== null && deps.ledger.hasOpenDirectiveRecoveryHold(job.id)) {
-    return { outcome: 'skipped', waitId: wait.id,
-      why: 'directive retirement hold requires a fresh accepted directive or re-brief' };
-  }
+  // Terminal housekeeping is not a continuation or a hold releaser.
   if (job === null || isJobTerminal(job.status)) {
     // Truthful reason per terminal state: a discarded (`binned`) lane is
     // cancelled, never reported as completed.
     const why = job === null ? 'job missing' : `job is ${job.status} — no continuation`;
     deps.ledger.setProviderWaitStatus(wait.id, 'cancelled', { why, by });
     return { outcome: 'skipped', waitId: wait.id, why };
+  }
+  // A live hold preserves parked/blocked evidence without permitting work.
+  if (deps.ledger.hasOpenDirectiveRecoveryHold(job.id)) {
+    return { outcome: 'skipped', waitId: wait.id,
+      why: 'directive retirement hold requires a fresh accepted directive or re-brief' };
   }
   if (job.status === 'parked') {
     deps.ledger.setProviderWaitStatus(wait.id, 'cancelled', { why: 'job parked (owner/ops hold)', by });
@@ -247,6 +251,7 @@ async function claimJobMinion(
   // the durable claimed wait itself remains historical after settlement.
   const releaseContinuation = deps.ledger.beginProviderContinuation(wait.id, job.id);
   const admitted = { recorded: false };
+  let releaseAllowed = true;
   let result: Awaited<ReturnType<typeof rebriefFreshMinion>>;
   try {
     result = await rebriefFreshMinion({
@@ -264,10 +269,11 @@ async function claimJobMinion(
         const current = deps.ledger.getJob(job.id);
         if (current === null || isJobTerminal(current.status) || current.status === 'parked' || current.status === 'blocked' ||
             deps.ledger.hasOpenDirectiveRecoveryHold(job.id) ||
+            deps.ledger.providerWaitRetirementIdentity(wait) !== 'current' ||
             deps.ledger.listPendingDirectives({ jobId: job.id, states: ['dispatching', 'admitted'] }).length > 0 ||
             deps.ledger.listPendingRebriefs({ jobId: job.id }).length > 0 ||
             deps.ledger.listJobAdmissions(job.id).some((kind) => kind !== `provider continuation ${wait.id}`)) {
-          throw new Error(`provider continuation refused — job "${job.id}" is ${current?.status ?? 'missing'}`);
+          throw new ProviderContinuationIneligibleError(`provider continuation refused — authority changed for job "${job.id}" (${current?.status ?? 'missing'})`);
         }
       },
       onSpawned: (worker) => {
@@ -289,6 +295,22 @@ async function claimJobMinion(
       },
     });
   } catch (error) {
+    const authorityChanged = error instanceof ProviderContinuationIneligibleError;
+    const cleanupUnknown = error instanceof Error && error.cause instanceof ProviderContinuationIneligibleError;
+    if (authorityChanged || cleanupUnknown) {
+      // Refusal is not a failure of the newer job. A disposal exception
+      // leaves genuine unknown ownership: retain both its reservation and
+      // unproven claimed debt rather than inventing a cessation receipt.
+      releaseAllowed = !cleanupUnknown;
+      deps.ledger.appendCustomEvent({ kind: 'provider.continuation-failed', jobId: wait.jobId, agentId: wait.agentId,
+        payload: { wait_id: wait.id, by, stage: cleanupUnknown ? 'cleanup' : 'authorization', error: String(error).slice(0, 300) } });
+      deps.log?.(cleanupUnknown ? 'error' : 'info', cleanupUnknown
+        ? 'provider continuation cleanup unknown — ownership retained; stop the returned minion before reconciliation'
+        : 'provider continuation authority changed — saved prompt not delivered', { wait_id: wait.id, job: wait.jobId, error: String(error) });
+      return { outcome: 'skipped', waitId: wait.id, why: cleanupUnknown
+        ? 'continuation cleanup unknown after atomic claim (ownership retained; no automatic replay)'
+        : 'continuation authority changed after atomic claim (recorded; no automatic replay)' };
+    }
     // The claim won but the spawn/continuation failed DETERMINISTICALLY.
     // Never blind-retry (crash/ambiguous delivery must be reconciled, not
     // replayed): keep the claim as the durable record and surface it.
@@ -315,7 +337,7 @@ async function claimJobMinion(
     });
     return { outcome: 'skipped', waitId: wait.id, why: 'continuation spawn failed after atomic claim (recorded; no automatic replay)' };
   } finally {
-    releaseContinuation();
+    if (releaseAllowed) releaseContinuation();
   }
   // Guarded continuation turn truth (#160): a prompt that settles with an
   // in-band runtime error was admitted but is NOT a continuation. The atomic

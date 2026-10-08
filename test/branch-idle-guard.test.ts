@@ -205,6 +205,7 @@ async function boot(opts: {
       : {}),
   });
   const server = createDispatchServer({
+    pendingProducerBlockers: () => [],
     config: cfg,
     dispatch,
     wave,

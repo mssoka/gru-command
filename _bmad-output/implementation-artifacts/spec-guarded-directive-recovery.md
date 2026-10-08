@@ -220,6 +220,44 @@ tests and the supervisor suite 94. Dirty-tree preflights are development
 evidence only, never commit-bound clearance; clean-head focused/full
 receipts are captured separately after the patch commit.
 
+### Follow-up challenge at `8e747ab`
+
+All four requested Pi reviewers completed the correction challenge. Original
+findings are resolved on their reported paths, except H-B8's narrower
+fully-settled race. Every new raw finding below is verified independently
+before grouping; none is deferred. Reports and native model/session
+identities are captured as `*-followup-8e747ab.md` and
+`followup-8e747ab-results.json` in the same capture directory.
+
+| # | Raw follow-up claim | Verdict | Evidence + correction route |
+|---|---|---|---|
+| F-B1 | A fresh turn can fully settle during the digest await, leaving the old verdict offer | high | The answering check precedes the await and only live ownership is checked afterward. Patch: apply the existing per-job event watermark to continuation rows on retired lanes, so a settled handoff also invalidates the captured offer. |
+| F-B2 | Superseded waits still drive sensor probing and boot wake batches | medium | validateWaiter and pending-batch reconciliation did not consult ordered retirement identity. Patch: preserve wait/audit rows, suppress held/unknown/superseded candidates, and close only batches whose bound debt is proven superseded/terminal. |
+| F-B3 | An inert terminal-job hold prevents terminal provider-wait cleanup | medium | Hold-first claim returned before the terminal guard on a job that cannot accept a releaser. Patch: terminal cancellation precedes the runtime hold, while parked/blocked holds still preserve waits; no terminal job is revived. |
+| F-E1 | Asynchronous old route lookup can establish its wait after the fresh handoff | high | Supervisor hands wall recording to an untracked async credential lookup after stopping; establishment had no admission before its first await. Patch: reserve job admission for the real observation until route resolution and wait recording finish, so retirement cannot cross that interval. |
+| F-V1 | Production supervisor-to-route connection can be omitted without a failing check | medium | The real supervisor and route-stub tests are independent, and the server field was optional. Pre-verified coverage finding. Patch: require the proof port at both server and orchestration boundaries; removing the production wiring must fail typecheck, with explicit no-supervisor fixture ports. |
+| F-A1 | A claimed continuation can deliver after a newer completed handoff | high | Wait identity was checked only before awaited spawn. Fixed: recheck exact handoff identity at the continuation setup/prompt fences after awaited spawn; changed authority is a declined attempt, not a fresh-job minion error or status rewrite. Unknown disposal retains producer ownership, even if the wait's permission was superseded. |
+
+All six route to private boundary patches to demonstrated states. Sensor
+observation admission and post-spawn authority have different roots; the
+latter's corrective refusal must also preserve the newer job's status and
+receipts. No frozen intent or operator endpoint changes are needed.
+
+All six corrections are implemented. The retirement matrix now registers
+50 tests and the sensor suite 52, with both in `directive-recovery`.
+Test-first dirty captures `followup-red-8e747ab.ndjson` and
+`followup-red-v2-8e747ab.ndjson` reproduce the five behavioral findings
+(the initial two invalid incident fixtures were corrected before their
+reproductions). `required-port-mutation-v2-8e747ab.ndjson`, run
+`5b5388e1-3414-4703-a83a-7184e01cdee6`, fails solely when main's actual
+supervisor connection is omitted: TS2345 requires
+`pendingProducerBlockers`. The connection is restored; normal typecheck
+passes. Focused preflight run `7b962f6c-009b-4725-afd4-d25385cae7bd`
+passes all 495 checks with the same declared budgets. These dirty-tree
+runs are regression/development evidence, not commit-bound clearance.
+No review finding was deferred; final exact-head challenge and receipts
+follow the patch commit.
+
 ## Design Notes
 
 **Cessation predicate (server-derived, fail closed).** Blockers: agents of the job in
@@ -231,8 +269,9 @@ pending re-brief markers; any live directive other than the subject; open provid
 rounds `pending`/`live`; live `worktree_processes` rows for the job's lanes; worker pacing
 entries keyed by job or its agents; supervisor pending classification/restart/backoff,
 retry/recovery admission, or open turn/control/tool ownership. Historical claims need a
-correlated genuine provider terminal receipt; superseded waits need an exact durable
-handoff sequence (unknown evidence stays a blocker). Missing lane, unresolvable
+correlated genuine closed-turn or acknowledged-disposal receipt; spawn/cleanup
+errors remain unproven even after supersession. Unclaimed superseded waits need an
+exact durable handoff sequence (unknown evidence stays a blocker). Missing lane, unresolvable
 head, unreadable registry/supervision, or inconsistent sent/admitted identity refuses. The route resolves
 lane + fresh `resolveGitCommit` head; the ledger re-checks and compares inside one transaction.
 
@@ -251,9 +290,10 @@ of the retired id never releases it. Fresh acceptance on a job with retirement h
 also records `silas.directive-recovery-handoff`, bound to the accepted identity and
 retired request IDs. Native event ordering, never clock age, proves whether a provider
 wait preceded that handoff. Superseded waits remain unchanged, are not continuation
-offers, and do not permanently block later control closure; missing ordered proof stays
-fenced. Forced review and foreign targets cannot waive a hold. A fresh live producer is
-rechecked after every digest await.
+offers, and unclaimed stale debt does not permanently block later control closure;
+missing ordered proof stays fenced. Forced review and foreign targets cannot waive
+a hold. Fresh live ownership and the captured event watermark are rechecked at
+digest publication, including a fresh turn that fully settled during an await.
 
 ## Verification
 

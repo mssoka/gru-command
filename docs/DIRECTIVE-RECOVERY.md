@@ -38,14 +38,17 @@ the caller supplies expectations only:
   supervisor restart/backoff, classification, recovery admission or
   automatic rate-limit retry (idle/error durable state is not cessation).
 - **No in-flight admission**: no process-local admission reserved for the
-  job (the boundary every producer crosses before its first await).
+  job (the boundary every producer crosses before its first await), including
+  a pending provider-wall route lookup. The supervisor proof port is a
+  required server dependency, never an optional empty fallback.
 - **No re-brief**: no `pending_rebriefs` marker.
 - **No other live directive**: no live request other than the subject.
 - **No provider continuation**: no `waiting`/`recovered-pending` provider
-  wait or unproven `claimed` continuation. A claimed wait remains historical
-  after a correlated `provider.continuation-completed` or
-  `provider.continuation-failed` receipt; active runtime admission and
-  supervisor ownership still refuse. Missing terminal proof remains fenced.
+  wait or unproven `claimed` continuation. A correlated
+  `provider.continuation-completed`, or failed receipt with a closed `turn`
+  or acknowledged `authorization` disposal, ends claim ownership. Generic
+  spawn/cleanup errors do not prove cessation, even after a new handoff.
+  Active runtime admission and supervisor ownership still refuse.
 - **No verification producer**: no unsettled verification run.
 - **No review/source ownership**: no `pending`/`live` review round.
 - **No live lane process**: no `worktree_processes` row in `live` state
@@ -136,11 +139,17 @@ retired request id itself never re-runs and never releases the hold. The
 fresh producer owns its own turn: `silas.directive-recovery-handoff`
 records the accepted identity and retired request IDs in that transaction.
 Exact native event ordering—not clock age—identifies older provider waits.
-They stay recorded and are neither offered nor resumed, even when the
-fresh request later settles; they do not permanently block a later
-retirement. Missing ordered proof stays fenced. A late wait is left byte-identical
-while a hold is open, including on a parked or blocked job. Digest
-publication rechecks current fresh-request ownership after every await.
+Unclaimed superseded waits stay recorded and are neither offered nor
+resumed, even when the fresh request later settles; proven stale debt
+cannot permanently block a later retirement. Claimed producers still need
+actual terminal proof. Missing ordered proof stays fenced. A late wait is
+left byte-identical while a live hold is open, including on a parked or
+blocked job. Sensor probes and boot wakes ignore held/superseded debt;
+only its obsolete batch marker closes. Terminal-job wait cancellation is
+passive cleanup, never a hold release or work revival. Observation admission
+covers credential lookup before wait recording. Digest publication rechecks
+live ownership and the captured job event watermark after all awaits;
+fully settled new authority also retracts a stale offer.
 A damaged hold is reported as inconsistent audit debt without hiding
 healthy holds on other jobs; strict control callers still fail closed.
 A hold on a job that later goes terminal is inert (terminal lanes accept no

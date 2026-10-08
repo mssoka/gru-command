@@ -65,7 +65,7 @@ export interface DispatchServerOptions {
    * deliveries and re-briefs. Absent = off. */
   readonly workerGate?: PacingGate;
   /** Supervisor's fresh queued/backoff producer ownership for retirement. */
-  readonly pendingProducerBlockers?: (jobId: string) => readonly string[];
+  readonly pendingProducerBlockers: (jobId: string) => readonly string[];
   /** Provider pacing: bounded settlement of an automatic rate-limit retry
    * covering a just-delivered directive/re-brief turn (supervisor-backed
    * in production). The route records delivered only for 'none'/'recovered'. */
@@ -1320,7 +1320,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           ledger: options.ledger,
           worktrees: ops.worktrees,
           ...(options.workerGate !== undefined ? { workerGate: options.workerGate } : {}),
-          ...(options.pendingProducerBlockers !== undefined ? { pendingProducerBlockers: options.pendingProducerBlockers } : {}),
+          pendingProducerBlockers: options.pendingProducerBlockers,
           requestId,
           expected: {
             jobId: expectedJobId,

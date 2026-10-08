@@ -356,7 +356,7 @@ describe('guarded claim — every recheck fails visible', () => {
       return spawned;
     };
     const result = await claimProviderRecoveryContinuation(h.deps(), waitId, 'silas');
-    expect(result).toMatchObject({ outcome: 'skipped', why: 'continuation spawn failed after atomic claim (recorded; no automatic replay)' });
+    expect(result).toMatchObject({ outcome: 'skipped', why: 'continuation authority changed after atomic claim (recorded; no automatic replay)' });
     expect(spawned.disposed).toBe(true);
     expect(spawned.promptCount).toBe(0);
     expect(h.ledger.getJob(jobId)?.status).toBe('parked');

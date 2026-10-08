@@ -1873,7 +1873,8 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
   const continuationAllowed = (row: { readonly jobId: string }): boolean =>
     !input.ledger.hasOpenDirectiveRecoveryHold(row.jobId) &&
     (input.ledger.listDirectiveRecoveryHolds({ jobId: row.jobId }).length === 0 ||
-      (input.ledger.listPendingDirectives({ jobId: row.jobId, states: LIVE_DIRECTIVE_STATES }).length === 0 &&
+      (jobSeqUnchanged(row.jobId) &&
+       input.ledger.listPendingDirectives({ jobId: row.jobId, states: LIVE_DIRECTIVE_STATES }).length === 0 &&
        input.ledger.listPendingRebriefs({ jobId: row.jobId }).length === 0));
   return {
     ...digest,

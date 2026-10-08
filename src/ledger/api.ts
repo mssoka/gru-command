@@ -7116,11 +7116,15 @@ export class LedgerApi {
          ORDER BY created_at, id`,
       )
       .all(jobId) as Row[];
-    return rows.map((row) => this.providerWaitFromRow(row)).filter((wait) =>
-      this.providerWaitRetirementIdentity(wait) !== 'superseded' &&
-      (wait.status !== 'claimed' || !this.hasJobEventWithPayloadValues(jobId,
-        ['provider.continuation-completed', 'provider.continuation-failed'],
-        [{ key: 'wait_id', value: wait.id }], 0)));
+    return rows.map((row) => this.providerWaitFromRow(row)).filter((wait) => {
+      if (wait.status !== 'claimed') return this.providerWaitRetirementIdentity(wait) !== 'superseded';
+      // Superseding permission cannot prove a spawned producer ceased.
+      // Only a closed turn or acknowledged pre-turn disposal is terminal;
+      // spawn/cleanup errors remain unknown even after a newer handoff.
+      return !this.hasJobEventWithPayloadValues(jobId, ['provider.continuation-completed'], [{ key: 'wait_id', value: wait.id }], 0) &&
+        !['turn', 'authorization'].some((stage) => this.hasJobEventWithPayloadValues(jobId, ['provider.continuation-failed'],
+          [{ key: 'wait_id', value: wait.id }, { key: 'stage', value: stage }], 0));
+    });
   }
 
   // ------------------------------------------------------------------

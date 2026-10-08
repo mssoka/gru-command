@@ -34,7 +34,7 @@ export interface DirectiveRetirementRequest {
    * job is live producer evidence. */
   readonly workerGate?: Pick<PacingGate, 'view'>;
   /** Fresh supervisor ownership, including scheduled backoff/retry turns. */
-  readonly pendingProducerBlockers?: (jobId: string) => readonly string[];
+  readonly pendingProducerBlockers: (jobId: string) => readonly string[];
   readonly requestId: string;
   readonly expected: {
     readonly jobId: string;
@@ -106,7 +106,7 @@ export function retireInterruptedDirectiveFromRoute(input: DirectiveRetirementRe
   const lane = resolveRetirementLane(input.worktrees, row.jobId);
   let producerBlockers: readonly string[];
   try {
-    producerBlockers = input.pendingProducerBlockers?.(row.jobId) ?? [];
+    producerBlockers = input.pendingProducerBlockers(row.jobId);
   } catch (error) {
     throw new DirectiveRetirementError('live_work',
       `job "${row.jobId}" supervisor ownership is unreadable (${String(error).slice(0, 200)}) — cannot prove cessation`,

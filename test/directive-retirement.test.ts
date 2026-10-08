@@ -9,7 +9,7 @@ import { EventBus } from '../src/events/bus.js';
 import { LedgerApi, type DirectiveRequestRecord, type JobRecord } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { NotificationCenter } from '../src/notifications/center.js';
-import { loadConfig, DEFAULT_SILAS_CONFIG, type Role } from '../src/config.js';
+import { loadConfig, DEFAULT_SILAS_CONFIG, DEFAULT_PROVIDER_RECOVERY_CONFIG, type Role } from '../src/config.js';
 import { createDispatchServer, type DispatchServer } from '../src/dispatch/server.js';
 import { DispatchService } from '../src/dispatch/service.js';
 import { WaveRunner } from '../src/dispatch/perkins.js';
@@ -26,6 +26,7 @@ import type { WorktreeLane } from '../src/dispatch/worktree-port.js';
 import { PacingGate } from '../src/runtime/pacing.js';
 import { directiveRetirementFingerprint } from '../src/ledger/directives.js';
 import { claimProviderRecoveryContinuation } from '../src/provider-recovery/resume.js';
+import { establishProviderWait, ProviderRecoverySensor } from '../src/provider-recovery/sensor.js';
 import type { AgentCapabilities, AgentHandle, SpawnOptions } from '../src/runtime/types.js';
 
 /**
@@ -155,7 +156,7 @@ async function boot(opts: { wrapLedger?: (ledger: LedgerApi) => LedgerApi; worke
     wave,
     ledger,
     ...(opts.workerGate !== undefined ? { workerGate: opts.workerGate } : {}),
-    ...(opts.pendingProducerBlockers !== undefined ? { pendingProducerBlockers: opts.pendingProducerBlockers } : {}),
+    pendingProducerBlockers: opts.pendingProducerBlockers ?? (() => []),
     silasOps: {
       registry: {
         getHandle: (id: string) => liveHandles.get(id) ?? null,
@@ -1528,6 +1529,154 @@ describe('directive retirement — continuation boundary and consumers', () => {
     expect(digest.verdictsAwaitingDirective).toEqual([]);
     expect(digest.providerRecoveryPending).toEqual([]);
     expect(h.spawns).toEqual([]);
+  });
+
+  it('fences a real pending provider-wall route lookup before any wait is recorded', async () => {
+    const repo = makeFixtureRepo('retire-pending-observation');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    const { lane } = await seededLiveRequest(h, repo, 'job-pending-observation', 'req-pending-observation');
+    h.ledger.registerAgent({ id: 'stopped-observation-agent', role: 'minion', jobId: 'job-pending-observation' });
+    h.ledger.setAgentState('stopped-observation-agent', 'error');
+    let resolveRoute!: (route: { endpoint: string; credentialFingerprint: string }) => void;
+    const route = new Promise<{ endpoint: string; credentialFingerprint: string }>((resolve) => { resolveRoute = resolve; });
+    const sensor = new ProviderRecoverySensor({ config: { ...DEFAULT_PROVIDER_RECOVERY_CONFIG, enabled: true, glmGenerationFallback: true },
+      ledger: h.ledger, notifications: h.notifications, wake: { trigger: async () => {} }, silasHosted: () => true,
+      probe: { resolveRoute: () => route, probe: async () => { throw new Error('must not probe'); } } });
+    const pending = establishProviderWait(sensor, { agentId: 'stopped-observation-agent', role: 'minion', slotId: null,
+      jobId: 'job-pending-observation', sessionFile: null, failureClass: 'quota_wall', provider: 'zai-coding-cn', model: 'glm-5.3',
+      typed: { origin: 'provider-message', status: 429, bodyCode: '1302' }, errorMessage: '429 usage window limit', incidentId: null,
+      continuation: { promptText: 'old interrupted prompt', promptOwner: 'minion-brief', hadOpenTurn: true } });
+    let wait: Awaited<typeof pending> = null;
+    try {
+      expect(h.ledger.listProviderWaits()).toEqual([]);
+      const before = eventKinds(h);
+      const result = await retire(h, 'req-pending-observation', laneHead(lane));
+      expect(result.status).toBe(409);
+      expect(field<string>(result.json, 'error')).toBe('live_work');
+      expect((field<string[]>(result.json, 'blockers') ?? []).join(' ')).toContain('provider wait establishment');
+      expect(eventKinds(h)).toEqual(before);
+    } finally {
+      resolveRoute({ endpoint: 'https://fixture.invalid', credentialFingerprint: 'fixture-fingerprint' });
+      wait = await pending;
+      sensor.stop();
+    }
+    expect(wait).not.toBeNull();
+    expect(h.ledger.listJobAdmissions('job-pending-observation')).toEqual([]);
+    h.ledger.setProviderWaitStatus(wait!.id, 'cancelled', { why: 'fixture writer ceased; no continuation' });
+    expect((await retire(h, 'req-pending-observation', laneHead(lane))).status).toBe(200);
+  });
+
+  it('retracts the old verdict when a fresh accepted directive fully settles during the await', async () => {
+    const repo = makeFixtureRepo('retire-settled-owner-race');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    const { lane } = await seededLiveRequest(h, repo, 'job-settled-owner-race', 'req-settled-owner-race');
+    h.ledger.setJobStatus('job-settled-owner-race', 'in-review');
+    const round = h.ledger.addRound({ jobId: 'job-settled-owner-race', lenses: ['blind'] });
+    h.ledger.setRoundStatus(round.id, 'live');
+    h.ledger.setRoundVerdict(round.id, 'changes-requested');
+    const digest = await computeSilasDigest({ ledger: h.ledger, blockersForRound: async () => {
+      expect((await retire(h, 'req-settled-owner-race', laneHead(lane))).status).toBe(200);
+      h.ledger.beginDirectiveIntent({ jobId: 'job-settled-owner-race', directive: 'fresh repair', holder: 'silas-ops', requestId: 'req-settled-owner-next' });
+      const sent = h.ledger.appendCustomEvent({ kind: 'silas.directive-sent', jobId: 'job-settled-owner-race',
+        payload: { request_id: 'req-settled-owner-next', minion_id: 'fresh-settled-minion' } });
+      h.ledger.recordDirectiveAdmission({ requestId: 'req-settled-owner-next', minionId: 'fresh-settled-minion', eventSeq: sent.seq });
+      const delivered = h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-settled-owner-race',
+        payload: { request_id: 'req-settled-owner-next', minion_id: 'fresh-settled-minion', sha: laneHead(lane) } });
+      h.ledger.recordDirectiveDelivery({ requestId: 'req-settled-owner-next', eventSeq: delivered.seq });
+      return { blockers: [], note: null };
+    }, config: DEFAULT_SILAS_CONFIG, trigger: 'sweep' });
+    expect(h.ledger.getDirective('req-settled-owner-next')?.state).toBe('settled');
+    expect(h.ledger.hasOpenDirectiveRecoveryHold('job-settled-owner-race')).toBe(false);
+    expect(digest.verdictsAwaitingDirective).toEqual([]);
+  });
+
+  it('keeps terminal holds inert while cancelling terminal provider debt and closing its wake batch', async () => {
+    const repo = makeFixtureRepo('retire-terminal-provider-debt');
+    cleanupRepos.push(repo);
+    const h = await boot();
+    const { lane } = await seededLiveRequest(h, repo, 'job-terminal-provider', 'req-terminal-provider');
+    h.ledger.setJobStatus('job-terminal-provider', 'binned');
+    expect((await retire(h, 'req-terminal-provider', laneHead(lane))).status).toBe(200);
+    h.ledger.recordProviderWait({ id: 'wait-terminal-provider', routeKey: 'route-terminal-provider', provider: 'p', model: 'm', endpoint: 'e',
+      credentialFingerprint: 'fp', waiterKind: 'job-minion', jobId: 'job-terminal-provider', agentId: null, slotId: null,
+      sessionFile: null, continuation: null, jobStatusAtEstablishment: 'working', lineageKey: null,
+      incidentId: 'incident-terminal-provider', incidentGeneration: 1, reasonClass: 'temporary-limit' });
+    h.ledger.commitProviderRecoveryBatch({ id: 'batch-terminal-provider', routeKey: 'route-terminal-provider', incidentGenerations: [1],
+      evidence: { stopReason: 'stop' }, waiters: [{ id: 'wait-terminal-provider', jobId: 'job-terminal-provider' }] });
+    const result = await claimProviderRecoveryContinuation({ ledger: h.ledger, worktrees: h.worktrees,
+      registry: { getHandle: () => null, disposeHandle: async () => {}, spawn: async () => { throw new Error('must not spawn'); } } },
+      'wait-terminal-provider', 'silas');
+    expect(result.outcome).toBe('skipped');
+    expect(h.ledger.getProviderWait('wait-terminal-provider')?.status).toBe('cancelled');
+    const wake = vi.fn();
+    const sensor = new ProviderRecoverySensor({ config: { ...DEFAULT_PROVIDER_RECOVERY_CONFIG, enabled: true },
+      ledger: h.ledger, notifications: h.notifications, wake: { trigger: async () => { wake(); } }, silasHosted: () => true,
+      probe: { resolveRoute: async () => null, probe: async () => { throw new Error('must not probe'); } } });
+    expect(await sensor.reconcileAtBoot()).toEqual({ rewoken: 0 });
+    sensor.stop();
+    expect(h.ledger.listPendingProviderRecoveries()).toEqual([]);
+    expect(wake).not.toHaveBeenCalled();
+    expect(h.ledger.getJob('job-terminal-provider')?.status).toBe('binned');
+    expect(h.ledger.hasOpenDirectiveRecoveryHold('job-terminal-provider')).toBe(true);
+  });
+
+  it('declines a superseded post-spawn claim without rewriting the newer delivery and retains unknown cleanup ownership', async () => {
+    const repo = makeFixtureRepo('retire-claim-authority-race');
+    cleanupRepos.push(repo);
+    for (const cleanupFails of [false, true]) {
+      const h = await boot();
+      const jobId = `job-claim-authority-${cleanupFails}`;
+      const oldId = `req-claim-authority-${cleanupFails}`;
+      const { lane } = await seededLiveRequest(h, repo, jobId, oldId);
+      expect((await retire(h, oldId, laneHead(lane))).status).toBe(200);
+      h.ledger.beginDirectiveIntent({ jobId, directive: 'first fresh authority', holder: 'silas-ops', requestId: `${oldId}-first` });
+      h.ledger.failDirective({ requestId: `${oldId}-first`, reason: 'fixture no-effect proof' });
+      const waitId = `wait-claim-authority-${cleanupFails}`;
+      h.ledger.recordProviderWait({ id: waitId, routeKey: 'route-claim-authority', provider: 'p', model: 'm', endpoint: 'e',
+        credentialFingerprint: 'fp', waiterKind: 'job-minion', jobId, agentId: null, slotId: null,
+        sessionFile: null, continuation: { promptText: 'saved older prompt', promptOwner: 'old-owner', hadOpenTurn: true },
+        jobStatusAtEstablishment: 'working', lineageKey: null, incidentId: waitId, incidentGeneration: 1, reasonClass: 'temporary-limit' });
+      h.ledger.commitProviderRecoveryBatch({ id: 'batch-claim-authority', routeKey: 'route-claim-authority', incidentGenerations: [1],
+        evidence: { stopReason: 'stop' }, waiters: [{ id: waitId, jobId }] });
+      let started!: () => void;
+      const spawning = new Promise<void>((resolve) => { started = resolve; });
+      let finishSpawn!: (handle: AgentHandle) => void;
+      const spawn = new Promise<AgentHandle>((resolve) => { finishSpawn = resolve; });
+      const prompt = vi.fn();
+      const dispose = vi.fn(async () => { if (cleanupFails) throw new Error('fixture disposal unavailable'); });
+      const pending = claimProviderRecoveryContinuation({ ledger: h.ledger, worktrees: h.worktrees,
+        registry: { getHandle: () => null, disposeHandle: async () => {}, spawn: async () => { started(); return spawn; } } }, waitId, 'silas');
+      await spawning;
+      const nextId = `${oldId}-next`;
+      h.ledger.beginDirectiveIntent({ jobId, directive: 'newer authority', holder: 'silas-ops', requestId: nextId });
+      const sent = h.ledger.appendCustomEvent({ kind: 'silas.directive-sent', jobId,
+        payload: { request_id: nextId, minion_id: 'newer-delivered-minion' } });
+      h.ledger.recordDirectiveAdmission({ requestId: nextId, minionId: 'newer-delivered-minion', eventSeq: sent.seq });
+      const delivered = h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId,
+        payload: { request_id: nextId, minion_id: 'newer-delivered-minion', sha: laneHead(lane) } });
+      h.ledger.recordDirectiveDelivery({ requestId: nextId, eventSeq: delivered.seq });
+      h.ledger.setJobStatus(jobId, 'delivered');
+      finishSpawn({ id: 'superseded-returned-minion', role: 'minion', sessionFile: null, capabilities: FAKE_CAPABILITIES,
+        prompt: async (text) => { prompt(text); }, steer: async () => {}, followUp: async () => {}, subscribe: () => () => {},
+        health: () => ({ state: 'idle', lastActivity: null, sessionFile: null }), dispose });
+      const result = await pending;
+      expect(result.outcome).toBe('skipped');
+      expect(prompt).not.toHaveBeenCalled();
+      expect(dispose).toHaveBeenCalledOnce();
+      expect(h.ledger.getJob(jobId)?.status).toBe('delivered');
+      expect(h.ledger.getDirective(nextId)?.state).toBe('settled');
+      expect(countEvents(h, 'job.minion-error')).toBe(0);
+      expect(h.ledger.getProviderWait(waitId)?.status).toBe('claimed');
+      if (cleanupFails) {
+        expect(h.ledger.listJobAdmissions(jobId)).toContain(`provider continuation ${waitId}`);
+        expect(h.ledger.listOpenProviderWaitsForJob(jobId).map((wait) => wait.id)).toContain(waitId);
+      } else {
+        expect(h.ledger.listJobAdmissions(jobId)).toEqual([]);
+        expect(h.ledger.listOpenProviderWaitsForJob(jobId)).toEqual([]);
+      }
+    }
   });
 
   it('persists the retirement and hold across a database reopen', async () => {
