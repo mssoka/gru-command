@@ -470,7 +470,7 @@ export class BoardClient {
 
   /** The pending Book of Lessons proposal, for the owner's review. */
   async getLessonProposal(): Promise<LessonProposalView> {
-    const proposal = await this.api<unknown>('/api/lessons/proposal');
+    const proposal = await this.api<unknown>('/api/lessons/proposal', AbortSignal.timeout(SNAPSHOT_DEADLINE_MS));
     if (!isValidLessonProposal(proposal)) throw new Error('lesson proposal review is malformed');
     return proposal;
   }
@@ -508,6 +508,7 @@ export class BoardClient {
         'content-type': 'application/json',
       },
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(SNAPSHOT_DEADLINE_MS),
     });
     if (!res.ok) return this.refused(path, res);
     return { status: res.status, body: await res.json() };

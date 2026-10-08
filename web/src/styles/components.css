@@ -2091,6 +2091,10 @@ body {
   font-weight: 700;
 }
 
+.board-owner__review-list {
+  overflow-wrap: anywhere;
+}
+
 .board-owner__review-chapter {
   margin-top: 8px;
 }
@@ -2098,6 +2102,7 @@ body {
 .board-owner__review-heading {
   font-weight: 800;
   font-size: 12px;
+  overflow-wrap: anywhere;
 }
 
 .board-owner__review-lesson {

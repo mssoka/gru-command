@@ -808,6 +808,9 @@ export class BoardView {
       current.inFlight = decision;
       current.message = null;
       this.rerenderOwner();
+      // Focus a stable enabled target while both choices are disabled:
+      // the proposal disclosure is always present and focusable.
+      this.ownerMount.querySelector<HTMLElement>(`[data-owner-focus-key="${focusBase}:review"]`)?.focus();
       void load()
         .then((proposal) => {
           if (!live()) throw new Error('re-paired');
