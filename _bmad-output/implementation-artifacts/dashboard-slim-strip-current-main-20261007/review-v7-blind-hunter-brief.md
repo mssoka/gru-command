@@ -2,11 +2,11 @@
 
 You are a context-free specialist reviewer: a tracked, workflow-owned, READ-ONLY review job commissioned by the implementing parent job `dashboard-slim-strip-current-main-20261007` (PR https://github.com/mssoka/gru-command/pull/256). Commit nothing and modify nothing — an unmodified tree is the expected terminal state.
 
-REVIEWED CANDIDATE (immutable): `e3a9f441048ddb83bec56ab90a258a8f6d84cfe3` — branch `gru/dashboard-slim-strip-current-main-20261007`.
+REVIEWED CANDIDATE (immutable): the exact full head named as target_sha in your dispatch briefing (your worktree is checked out at it) — branch `gru/dashboard-slim-strip-current-main-20261007`.
 DIFF BASE: `49b558f243c7bacbfb46c7bc04f749bf131cefea` (the recorded execution/fail-before base).
 Produce the diff in YOUR OWN worktree and read it there:
-    git diff 49b558f243c7bacbfb46c7bc04f749bf131cefea..e3a9f441048ddb83bec56ab90a258a8f6d84cfe3 -- web/ tools/ .gru-command/
-(`git show e3a9f441048ddb83bec56ab90a258a8f6d84cfe3:<path>` for any full file).
+    git diff 49b558f243c7bacbfb46c7bc04f749bf131cefea..HEAD -- web/ tools/ .gru-command/
+(`git show HEAD:<path>` for any full file).
 
 YOUR RUBRIC (resolved workflow instruction, pinned immutable artifact — read it before reviewing):
     /Users/moses/.gru-command/captures/gru-slim-review-rubric-20261009/blind-hunter.md
